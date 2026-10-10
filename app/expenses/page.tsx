@@ -31,10 +31,10 @@ import {
   Td,
   Tr,
   PageHeader,
-  toast,
+  toast, toastError,
   useGridKeys,
 } from '@/components/ui';
-import { api, ApiError } from '@/lib/client';
+import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { useNewParam } from '@/lib/useFocusParam';
@@ -154,7 +154,7 @@ function ExpensesPageContent() {
       const data = await api.get<{ expenses: Expense[] }>('/api/expenses?includeVoided=true');
       setExpenses(data.expenses);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load expenses', 'danger');
+      toastError(err, 'Failed to load expenses');
     }
   }, []);
 
@@ -175,7 +175,7 @@ function ExpensesPageContent() {
         setClasses(classData);
         setCustomers(customerData);
       } catch (err) {
-        toast(err instanceof ApiError ? err.message : 'Failed to load data', 'danger');
+        toastError(err, 'Failed to load data');
       } finally {
         setLoading(false);
       }
@@ -310,7 +310,7 @@ function ExpensesPageContent() {
       resetForm();
       await fetchExpenses();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to save expense.', 'danger');
+      toastError(err, 'Failed to save expense.');
     } finally {
       setSubmitting(false);
     }
@@ -326,7 +326,7 @@ function ExpensesPageContent() {
       setPendingVoid(null);
       await fetchExpenses();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to void expense.', 'danger');
+      toastError(err, 'Failed to void expense.');
     } finally {
       setVoidingId(null);
     }
@@ -380,7 +380,7 @@ function ExpensesPageContent() {
         {/* Payee + payment account + date */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
-            <Label htmlFor="exp-payee">Pay to the Order of *</Label>
+            <Label htmlFor="exp-payee" required>Pay to the Order of</Label>
             <Select id="exp-payee" value={payeeSel} onChange={(e) => setPayeeSel(e.target.value)}>
               <option value="">Select payee…</option>
               {vendors.map((v) => (
@@ -423,7 +423,7 @@ function ExpensesPageContent() {
           </div>
 
           <div>
-            <Label htmlFor="exp-date">Date *</Label>
+            <Label htmlFor="exp-date" required>Date</Label>
             <DateInput id="exp-date" value={date} onChange={(e) => setDate(e.target.value)} />
           </div>
         </div>
@@ -595,7 +595,7 @@ function ExpensesPageContent() {
           <EmptyState
             icon={Banknote}
             title="No checks or expenses yet"
-            message="Record your first check, cash, or credit-card transaction using the form above."
+            message="Paid for something right away (check, debit card, cash or credit card)? Record it here. For bills you will pay later, use Enter Bills."
           />
         ) : (
           <Table>

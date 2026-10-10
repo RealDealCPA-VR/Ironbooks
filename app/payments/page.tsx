@@ -20,8 +20,9 @@ import {
   Modal,
   PageHeader,
   Spinner,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
@@ -163,7 +164,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
         setApplicationAmounts({});
       })
       .catch((err) => {
-        toast(err.message ?? 'Failed to load invoices', 'danger');
+        toastError(err, 'Failed to load invoices.');
         setInvoices([]);
       })
       .finally(() => setInvoicesLoading(false));
@@ -198,8 +199,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
       onSaved();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to save payment';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to save payment');
     } finally {
       setSaving(false);
     }
@@ -225,7 +225,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
       <div className="space-y-4">
         {/* Customer */}
         <div>
-          <Label htmlFor="pm-customer">Customer</Label>
+          <Label htmlFor="pm-customer" required>Customer</Label>
           <Select
             id="pm-customer"
             value={customerId}
@@ -244,7 +244,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
         {/* Date + Method row */}
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <Label htmlFor="pm-date">Payment Date</Label>
+            <Label htmlFor="pm-date" required>Payment Date</Label>
             <DateInput
               id="pm-date"
               value={date}
@@ -271,7 +271,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
         {/* Amount + Reference row */}
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <Label htmlFor="pm-amount">Total Amount Received</Label>
+            <Label htmlFor="pm-amount" required>Total Amount Received</Label>
             <AmountInput
               id="pm-amount"
               placeholder="0.00"
@@ -294,7 +294,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
         {/* Open invoices */}
         {customerId && (
           <div>
-            <Label>Apply to Open Invoices</Label>
+            <Label>Apply to Open Invoices <Help term="ar" /></Label>
             {invoicesLoading ? (
               <div className="flex items-center gap-2 py-2 text-sm text-navy/50">
                 <Spinner className="h-4 w-4" /> Loading invoices…
@@ -417,8 +417,7 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
       onApplied();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to apply payment.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to apply payment.');
     } finally {
       setSaving(false);
     }
@@ -548,8 +547,7 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
       onRefunded();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to record refund.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to record refund.');
     } finally {
       setSaving(false);
     }
@@ -578,7 +576,7 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
         )}
 
         <div>
-          <Label htmlFor="rf-bank">Refund From (Bank Account) *</Label>
+          <Label htmlFor="rf-bank" required>Refund From (Bank Account)</Label>
           <Select
             id="rf-bank"
             value={bankAccountId}
@@ -595,7 +593,7 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
         </div>
 
         <div>
-          <Label htmlFor="rf-amount">Refund Amount *</Label>
+          <Label htmlFor="rf-amount" required>Refund Amount</Label>
           <AmountInput
             id="rf-amount"
             placeholder="0.00"
@@ -632,8 +630,7 @@ function PaymentsPageContent() {
       const list = Array.isArray(data) ? data : (data as { payments: Payment[] }).payments ?? [];
       setPayments(list);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load payments';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load payments');
     } finally {
       setLoading(false);
     }
@@ -679,8 +676,7 @@ function PaymentsPageContent() {
       setVoidTarget(null);
       fetchPayments();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void payment.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void payment.');
     } finally {
       setVoiding(false);
     }
@@ -708,7 +704,7 @@ function PaymentsPageContent() {
           <EmptyState
             icon={HandCoins}
             title="No payments recorded yet"
-            message="Record your first customer payment to get started."
+            message="When a customer pays an invoice, record it here. The money waits in Undeposited Funds until you record the bank deposit."
             action={
               <Button onClick={() => setModalOpen(true)}>
                 <Plus className="h-4 w-4" /> Receive Payment

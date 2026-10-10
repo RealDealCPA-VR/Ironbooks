@@ -16,9 +16,9 @@ import {
   Tr,
   Modal,
   PageHeader,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
-import { api, ApiError } from '@/lib/client';
+import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 
@@ -94,8 +94,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
       onCreated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof ApiError ? err.message : 'Failed to create transfer.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to create transfer.');
     } finally {
       setSaving(false);
     }
@@ -118,7 +117,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
       <div className="space-y-4">
         {/* Date */}
         <div>
-          <Label htmlFor="tr-date">Date *</Label>
+          <Label htmlFor="tr-date" required>Date</Label>
           <Input
             id="tr-date"
             type="date"
@@ -131,7 +130,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
         {/* From / To accounts */}
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <Label htmlFor="tr-from">From Account *</Label>
+            <Label htmlFor="tr-from" required>From Account</Label>
             <Select
               id="tr-from"
               value={fromAccountId}
@@ -146,7 +145,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
             </Select>
           </div>
           <div>
-            <Label htmlFor="tr-to">To Account *</Label>
+            <Label htmlFor="tr-to" required>To Account</Label>
             <Select
               id="tr-to"
               value={toAccountId}
@@ -164,7 +163,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
 
         {/* Amount */}
         <div>
-          <Label htmlFor="tr-amount">Amount *</Label>
+          <Label htmlFor="tr-amount" required>Amount</Label>
           <Input
             id="tr-amount"
             type="number"
@@ -216,8 +215,7 @@ export default function TransfersPage() {
       setTransfers(trList);
       setAccounts(acctList);
     } catch (err: unknown) {
-      const msg = err instanceof ApiError ? err.message : 'Failed to load transfers.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load transfers.');
     } finally {
       setLoading(false);
     }
@@ -248,7 +246,7 @@ export default function TransfersPage() {
           <EmptyState
             icon={ArrowLeftRight}
             title="No transfers yet"
-            message="Record one to move money between accounts."
+            message="Moved money between your own accounts (for example, checking to savings)? Record it here. It is not income or an expense."
             action={
               <Button onClick={() => setShowNew(true)}>
                 <Plus className="h-4 w-4" /> New Transfer

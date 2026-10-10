@@ -9,6 +9,7 @@ import {
   FilePlus2,
   FileText,
   HandCoins,
+  LifeBuoy,
   PackageSearch,
   PenLine,
   TrendingUp,
@@ -16,6 +17,11 @@ import {
 } from 'lucide-react';
 import { getPageContext } from '@/lib/context';
 import { getDashboardInsights, type DashboardInsights } from '@/lib/services/dashboard';
+import { listAccounts } from '@/lib/services/accounts';
+import { trialBalance } from '@/lib/services/reports';
+import { buildAccountBalances } from '@/lib/homeWorkflow';
+import HomeWorkflow from '@/components/HomeWorkflow';
+import { Help } from '@/components/Help';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { PageHeader } from '@/components/ui';
@@ -37,19 +43,30 @@ export default async function DashboardPage() {
   const ctx = await getPageContext('/dashboard');
   // Single aggregated read model (also served as GET /api/dashboard). KPI cards keep
   // the fiscal-YTD scoping from lib/ytd.ts (settings.fiscalYearEnd; defaults Jan 1).
-  const d = await getDashboardInsights(ctx);
+  const [d, accountRows, tb] = await Promise.all([
+    getDashboardInsights(ctx),
+    listAccounts(ctx),
+    trialBalance(ctx),
+  ]);
+  // QB "Account Balances" panel: bank + credit card balances straight from the ledger.
+  const balances = buildAccountBalances(accountRows, tb.rows);
 
   const kpiCards = [
     { icon: DollarSign, label: 'Revenue (YTD)', value: d.kpis.revenueYtd },
     { icon: TrendingUp, label: 'Net Profit (YTD)', value: d.kpis.netProfitYtd },
     { icon: Wallet, label: 'Cash on Hand', value: d.kpis.cash },
-    { icon: FileText, label: 'Accounts Receivable', value: d.kpis.accountsReceivable },
-    { icon: BookOpen, label: 'Accounts Payable', value: d.kpis.accountsPayable },
+    { icon: FileText, label: 'Accounts Receivable', value: d.kpis.accountsReceivable, help: 'ar' as const },
+    { icon: BookOpen, label: 'Accounts Payable', value: d.kpis.accountsPayable, help: 'ap' as const },
   ];
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Executive Dashboard" action={<QuickActions />} />
+      <PageHeader title="Home" action={<QuickActions />} />
+
+      {/* QuickBooks-style workflow diagram: click any step to start that task. */}
+      <HomeWorkflow balances={balances} />
+
+      <h2 className="mt-10 mb-4 text-xl font-extrabold text-navy">Insights</h2>
 
       {/* KPI tiles */}
       <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-5 gap-6">
@@ -64,7 +81,10 @@ export default async function DashboardPage() {
               <span className="text-2xl font-semibold text-navy tabular-nums">
                 {formatCurrency(c.value)}
               </span>
-              <span className="mt-1 text-sm text-navy/50 font-medium">{c.label}</span>
+              <span className="mt-1 text-sm text-navy/50 font-medium inline-flex items-center gap-1">
+                {c.label}
+                {'help' in c && c.help && <Help term={c.help} />}
+              </span>
             </div>
           );
         })}
@@ -92,10 +112,11 @@ export default async function DashboardPage() {
 
 function QuickActions() {
   const actions = [
-    { href: '/invoices', label: 'New Invoice', icon: FilePlus2 },
-    { href: '/expenses', label: 'Write Check', icon: PenLine },
-    { href: '/payments', label: 'Receive Payment', icon: HandCoins },
-    { href: '/deposits', label: 'Make Deposit', icon: Banknote },
+    // ?new=1 opens each page's create form directly (same deep links as the command palette).
+    { href: '/invoices?new=1', label: 'New Invoice', icon: FilePlus2 },
+    { href: '/expenses?new=1', label: 'Write Check', icon: PenLine },
+    { href: '/payments?new=1', label: 'Receive Payment', icon: HandCoins },
+    { href: '/deposits?new=1', label: 'Make Deposit', icon: Banknote },
   ];
   return (
     <div className="flex flex-wrap gap-2">
@@ -105,13 +126,20 @@ function QuickActions() {
           <Link
             key={a.href}
             href={a.href}
-            className="inline-flex items-center gap-2 rounded-lg bg-electric text-white text-sm font-semibold px-4 py-2 shadow hover:bg-electric/90 transition-colors"
+            className="inline-flex items-center gap-2 rounded-lg bg-electric text-white text-sm font-semibold px-4 py-2 shadow hover:bg-electric/90 transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1"
           >
-            <Icon className="h-4 w-4" />
+            <Icon className="h-4 w-4" aria-hidden="true" />
             {a.label}
           </Link>
         );
       })}
+      <Link
+        href="/help"
+        className="inline-flex items-center gap-2 rounded-lg bg-white border border-slate-200 text-navy text-sm font-semibold px-4 py-2 hover:bg-slate-50 transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1"
+      >
+        <LifeBuoy className="h-4 w-4" aria-hidden="true" />
+        Help
+      </Link>
     </div>
   );
 }
@@ -224,7 +252,7 @@ function ArAgingCard({ aging }: { aging: DashboardInsights['arAging'] }) {
 function StatusCard({ d }: { d: DashboardInsights }) {
   const rec = d.lastReconciliation;
   return (
-    <div className="rounded-2xl p-6 bg-white shadow-xl border-b-4 border-navy space-y-4">
+    <div id="reminders" className="rounded-2xl p-6 bg-white shadow-xl border-b-4 border-navy space-y-4 scroll-mt-6">
       <h2 className="text-sm font-bold text-navy/70 uppercase tracking-wide">Reminders</h2>
 
       <Link href="/bills" className="flex items-center gap-3 group">

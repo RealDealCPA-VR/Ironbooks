@@ -20,8 +20,9 @@ import {
   Tr,
   Modal,
   PageHeader,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
@@ -227,8 +228,7 @@ function MakeDepositModal({
       onCreated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to create deposit.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to create deposit.');
     } finally {
       setSaving(false);
     }
@@ -261,7 +261,7 @@ function MakeDepositModal({
       <div className="space-y-5">
         {/* Bank account */}
         <div>
-          <Label htmlFor="dep-account">Deposit To *</Label>
+          <Label htmlFor="dep-account" required>Deposit To</Label>
           <Select
             id="dep-account"
             autoFocus
@@ -279,7 +279,7 @@ function MakeDepositModal({
 
         {/* Date */}
         <div>
-          <Label htmlFor="dep-date">Date *</Label>
+          <Label htmlFor="dep-date" required>Date</Label>
           <DateInput
             id="dep-date"
             value={date}
@@ -301,7 +301,7 @@ function MakeDepositModal({
         {/* Undeposited items list */}
         <div>
           <div className="flex items-center justify-between mb-2 gap-2">
-            <Label className="mb-0">Payments in Undeposited Funds</Label>
+            <Label className="mb-0">Payments in Undeposited Funds <Help term="undeposited-funds" /></Label>
             <span className="flex items-center gap-3">
               {methods.length > 1 && (
                 <select
@@ -526,8 +526,7 @@ function DepositsPageContent() {
       const rows = await api.get<Deposit[]>('/api/deposits');
       setDeposits(rows);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load deposits.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load deposits.');
     } finally {
       setLoading(false);
     }
@@ -547,8 +546,7 @@ function DepositsPageContent() {
       setAccounts(accts);
       setUndepositedItems(items);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load data.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load data.');
       setLoadingItems(false);
     }
   }, []);
@@ -579,8 +577,7 @@ function DepositsPageContent() {
       toast('Deposit voided — items returned to Undeposited Funds.', 'success');
       await Promise.all([fetchDeposits(), fetchSupportingData()]);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void deposit.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void deposit.');
     } finally {
       setVoidingId(null);
       setPendingVoid(null);
@@ -636,7 +633,7 @@ function DepositsPageContent() {
           <EmptyState
             icon={Landmark}
             title="No deposits yet"
-            message='Use "Make Deposit" to move funds from Undeposited Funds.'
+            message="After you receive payments, take them to the bank and record the deposit here so your books match your bank statement."
             action={
               <Button onClick={openModal}>
                 <Plus className="h-4 w-4" /> Make Deposit

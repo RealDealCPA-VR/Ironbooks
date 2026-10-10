@@ -20,9 +20,10 @@ import {
   Modal,
   PageHeader,
   Spinner,
-  toast,
+  toast, toastError,
   useGridKeys,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
@@ -235,8 +236,7 @@ function NewReceiptModal({
       onCreated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to create sales receipt.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to create sales receipt.');
     } finally {
       setSaving(false);
     }
@@ -275,7 +275,7 @@ function NewReceiptModal({
             </Select>
           </div>
           <div>
-            <Label htmlFor="sr-date">Sale Date *</Label>
+            <Label htmlFor="sr-date" required>Sale Date</Label>
             <DateInput
               id="sr-date"
               value={date}
@@ -307,7 +307,7 @@ function NewReceiptModal({
 
         {/* Deposit to */}
         <div>
-          <Label htmlFor="sr-deposit">Deposit To</Label>
+          <Label htmlFor="sr-deposit">Deposit To <Help term="undeposited-funds" /></Label>
           <Select
             id="sr-deposit"
             value={depositAccountId}
@@ -480,8 +480,7 @@ export default function SalesReceiptsPage() {
       setAccounts(acctList);
       setTaxRates(taxList);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load sales receipts.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load sales receipts.');
     } finally {
       setLoading(false);
     }
@@ -500,8 +499,7 @@ export default function SalesReceiptsPage() {
       setVoidTarget(null);
       fetchData();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void sales receipt.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void sales receipt.');
     } finally {
       setVoiding(false);
     }
@@ -530,7 +528,7 @@ export default function SalesReceiptsPage() {
           <EmptyState
             icon={Receipt}
             title="No sales receipts yet"
-            message="Record your first cash sale to get started."
+            message="Use a sales receipt when a customer pays at the time of sale. If they will pay later, create an invoice instead."
             action={
               <Button onClick={() => setShowNew(true)}>
                 <Plus className="h-4 w-4" /> New Sales Receipt

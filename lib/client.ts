@@ -11,11 +11,25 @@
  *
  * File-lock handling: a 403 "company file is locked" response (stale unlock cookie after an
  * app relaunch — see isFileLockError below) redirects the browser to /unlock before throwing.
+ *
+ * Friendly errors: ApiError.friendly (and toastError in components/ui.tsx) translate the
+ * server's ServiceError code into plain language with a next step — see lib/friendlyErrors.ts.
  */
+import { describeError, type FriendlyError } from '@/lib/friendlyErrors';
+
 export class ApiError extends Error {
   constructor(public status: number, message: string, public code?: string) {
     super(message);
     this.name = 'ApiError';
+  }
+
+  /**
+   * Plain-language version of this error (headline, what happened, what to do next), mapped
+   * from the ServiceError code by lib/friendlyErrors.ts. `message` stays the raw server text
+   * for callers that match on it; UI should prefer toastError(err) / this.friendly.
+   */
+  get friendly(): FriendlyError {
+    return describeError(this);
   }
 }
 

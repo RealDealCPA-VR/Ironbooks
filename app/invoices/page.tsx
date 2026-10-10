@@ -21,8 +21,9 @@ import {
   Modal,
   PageHeader,
   Spinner,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
@@ -680,8 +681,7 @@ function InvoiceModal({
       onSaved();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to save invoice.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to save invoice.');
     } finally {
       setSaving(false);
     }
@@ -733,7 +733,7 @@ function InvoiceModal({
 
         {/* Customer */}
         <div>
-          <Label htmlFor="inv-customer">Customer *</Label>
+          <Label htmlFor="inv-customer" required>Customer</Label>
           <Select
             id="inv-customer"
             value={customerId}
@@ -750,7 +750,7 @@ function InvoiceModal({
         {/* Dates */}
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <Label htmlFor="inv-date">Invoice Date *</Label>
+            <Label htmlFor="inv-date" required>Invoice Date</Label>
             <DateInput
               id="inv-date"
               value={date}
@@ -785,7 +785,7 @@ function InvoiceModal({
             </Select>
           </div>
           <div>
-            <Label htmlFor="inv-class">Class</Label>
+            <Label htmlFor="inv-class">Class <Help term="class" /></Label>
             <Select
               id="inv-class"
               value={classId}
@@ -1199,8 +1199,7 @@ function InvoicesPageContent() {
       setClasses(classList);
       setJobs(jobList);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load invoices.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load invoices.');
     } finally {
       setLoading(false);
     }
@@ -1238,8 +1237,7 @@ function InvoicesPageContent() {
       const detail = await api.get<InvoiceDetail>(`/api/invoices/${inv.id}`);
       setEditTarget(detail);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load invoice.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load invoice.');
     } finally {
       setLoadingEditId(null);
     }
@@ -1254,8 +1252,7 @@ function InvoicesPageContent() {
       setVoidTarget(null);
       fetchData();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void invoice.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void invoice.');
     } finally {
       setVoiding(false);
     }
@@ -1270,8 +1267,7 @@ function InvoicesPageContent() {
       setPostTarget(null);
       fetchData();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to post invoice.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to post invoice.');
     } finally {
       setPosting(false);
     }
@@ -1286,8 +1282,7 @@ function InvoicesPageContent() {
       setEmailTarget(null);
       setEmailTo('');
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to send email.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to send email.');
     } finally {
       setEmailing(false);
     }
@@ -1335,7 +1330,7 @@ function InvoicesPageContent() {
             title={statusFilter === 'all' ? 'No invoices yet' : `No ${statusLabel(statusFilter as InvoiceStatus).toLowerCase()} invoices`}
             message={
               statusFilter === 'all'
-                ? 'Create your first invoice to get started.'
+                ? 'An invoice bills a customer who will pay you later. Create one, then use Receive Payments when the money arrives.'
                 : 'Try a different status filter.'
             }
             action={

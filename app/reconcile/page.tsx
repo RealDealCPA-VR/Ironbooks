@@ -18,9 +18,10 @@ import {
   Td,
   Th,
   Tr,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
-import { api, ApiError } from '@/lib/client';
+import { Help } from '@/components/Help';
+import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
 import { formatDate as fmtDate } from '@/lib/dates';
 
@@ -160,7 +161,7 @@ function StartForm({
         if (!cancelled) setInfo(i);
       })
       .catch((err) => {
-        toast(err instanceof ApiError ? err.message : 'Failed to load account info.', 'danger');
+        toastError(err, 'Failed to load account info.');
       });
     return () => {
       cancelled = true;
@@ -182,7 +183,7 @@ function StartForm({
       toast('Reconciliation started.', 'success');
       onStarted(recon);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to start reconciliation.', 'danger');
+      toastError(err, 'Failed to start reconciliation.');
     } finally {
       setSaving(false);
     }
@@ -201,7 +202,7 @@ function StartForm({
       setInfo(refreshed);
       onUndone();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to undo reconciliation.', 'danger');
+      toastError(err, 'Failed to undo reconciliation.');
     } finally {
       setUndoing(false);
       setConfirmUndo(false);
@@ -212,10 +213,16 @@ function StartForm({
 
   return (
     <Card className="p-6 max-w-lg">
-      <h2 className="text-lg font-bold text-navy mb-4">Start New Reconciliation</h2>
+      <h2 className="text-lg font-bold text-navy mb-1 flex items-center gap-1.5">
+        Start New Reconciliation <Help term="reconcile" side="bottom" />
+      </h2>
+      <p className="text-sm text-navy/50 mb-4">
+        Have your bank statement handy. Enter its date and ending balance, then tick each
+        transaction that appears on it until the difference is 0.00.
+      </p>
       <div className="space-y-4">
         <div>
-          <Label htmlFor="recon-bank-account">Bank Account</Label>
+          <Label htmlFor="recon-bank-account" required>Bank Account</Label>
           <Select
             id="recon-bank-account"
             value={bankAccountId}
@@ -269,7 +276,7 @@ function StartForm({
         )}
 
         <div>
-          <Label htmlFor="recon-statement-date">Statement Date</Label>
+          <Label htmlFor="recon-statement-date" required>Statement Date</Label>
           <Input
             id="recon-statement-date"
             type="date"
@@ -278,7 +285,9 @@ function StartForm({
           />
         </div>
         <div>
-          <Label htmlFor="recon-statement-balance">Statement Ending Balance</Label>
+          <Label htmlFor="recon-statement-balance" required>
+            Statement Ending Balance <Help term="statement-ending-balance" />
+          </Label>
           <Input
             id="recon-statement-balance"
             type="number"
@@ -369,7 +378,7 @@ function ReconcileSession({
       setLines(fetchedLines);
       setProgress(fetchedProgress);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load reconciliation data.', 'danger');
+      toastError(err, 'Failed to load reconciliation data.');
     } finally {
       setLoadingLines(false);
     }
@@ -397,7 +406,7 @@ function ReconcileSession({
       );
       setProgress(updatedProgress);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to toggle line.', 'danger');
+      toastError(err, 'Failed to toggle line.');
     } finally {
       setToggling(null);
     }
@@ -416,7 +425,7 @@ function ReconcileSession({
         onComplete();
       }
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to complete reconciliation.', 'danger');
+      toastError(err, 'Failed to complete reconciliation.');
     } finally {
       setCompleting(false);
     }
@@ -454,7 +463,7 @@ function ReconcileSession({
       toast('Adjustments posted and cleared.', 'success');
       await loadLines();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to post adjustments.', 'danger');
+      toastError(err, 'Failed to post adjustments.');
     } finally {
       setApplyingAdjustments(false);
     }
@@ -480,7 +489,7 @@ function ReconcileSession({
       setShowPayCC(false);
       onComplete();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to record payment.', 'danger');
+      toastError(err, 'Failed to record payment.');
     } finally {
       setPaying(false);
     }
@@ -493,7 +502,7 @@ function ReconcileSession({
       toast('Reconciliation cancelled.', 'success');
       onComplete();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to cancel reconciliation.', 'danger');
+      toastError(err, 'Failed to cancel reconciliation.');
     } finally {
       setCancelling(false);
       setConfirmCancel(false);
@@ -515,10 +524,7 @@ function ReconcileSession({
       setEditBalance('');
       toast('Statement balance updated.', 'success');
     } catch (err) {
-      toast(
-        err instanceof ApiError ? err.message : 'Failed to update statement balance.',
-        'danger',
-      );
+      toastError(err, 'Failed to update statement balance.');
     } finally {
       setSavingBalance(false);
     }
@@ -933,7 +939,7 @@ export default function ReconcilePage() {
         setActiveRecon(inProgress);
       }
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load data.', 'danger');
+      toastError(err, 'Failed to load data.');
     } finally {
       setLoading(false);
     }
