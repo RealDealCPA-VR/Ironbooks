@@ -3,7 +3,8 @@ import * as React from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import CommandPalette from './CommandPalette';
-import { navGroups, paletteDestinations } from '@/lib/nav';
+import { filterNavGroups, navGroups, paletteDestinations } from '@/lib/nav';
+import { useMe } from '@/lib/usePermissions';
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
@@ -282,6 +283,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() || '';
   const bare = BARE.some((p) => pathname === p || pathname.startsWith(p + '/'));
   const [company, setCompany] = React.useState<CompanyRow | null>(null);
+  // Users & Roles: hide sidebar entries the user's roles can't use (cosmetic; server enforces).
+  const { me } = useMe(!bare);
+  const visibleGroups = React.useMemo(
+    () => filterNavGroups(navGroups, me?.permissions),
+    [me?.permissions],
+  );
 
   if (bare) return <>{children}</>;
 
@@ -305,7 +312,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </h1>
         </div>
         <nav className="flex flex-col gap-0.5 w-full flex-1 min-h-0 overflow-y-auto overscroll-contain pr-1 -mr-1">
-          {navGroups.map((group) => (
+          {visibleGroups.map((group) => (
             <div key={group.heading || 'home'} className="mb-2">
               {group.heading && (
                 <>

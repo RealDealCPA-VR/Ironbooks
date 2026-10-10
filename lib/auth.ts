@@ -44,8 +44,44 @@ function sign(payload: string): string {
 /** Token audience: a main-app user session vs. an employee self-service portal session. */
 export type TokenKind = 'user' | 'portal';
 
+/**
+ * Stable random identifier of the active company FILE (one PGlite data dir), persisted as
+ * `.file-id` next to `.auth-secret`. Session tokens carry it (signed), so a session minted for
+ * company file A is rejected by company file B — even when both share a signing secret
+ * (BKA_AUTH_SECRET) and the browser presents the same 127.0.0.1 cookie to whichever file the
+ * desktop shell currently has open. Falls back to a hash of the directory path if the dir is
+ * not writable.
+ */
+const fileIdCache = new Map<string, string>();
+export function companyFileId(): string {
+  const dir = resolveDataDir();
+  const cached = fileIdCache.get(dir);
+  if (cached) return cached;
+  let id: string;
+  const file = path.join(dir, '.file-id');
+  try {
+    if (fs.existsSync(file)) {
+      id = fs.readFileSync(file, 'utf8').trim();
+    } else {
+      fs.mkdirSync(dir, { recursive: true });
+      id = crypto.randomUUID();
+      fs.writeFileSync(file, id, { mode: 0o600 });
+    }
+    if (!id) throw new Error('empty .file-id');
+  } catch {
+    id = 'dir:' + crypto.createHash('sha256').update(dir).digest('hex').slice(0, 32);
+  }
+  fileIdCache.set(dir, id);
+  return id;
+}
+
 export function createSessionToken(userId: string, kind: TokenKind = 'user'): string {
-  const payload = JSON.stringify({ userId, kind, exp: Date.now() + SESSION_TTL_MS });
+  const payload = JSON.stringify({
+    userId,
+    kind,
+    fid: companyFileId(),
+    exp: Date.now() + SESSION_TTL_MS,
+  });
   const body = Buffer.from(payload).toString('base64url');
   return `${body}.${sign(body)}`;
 }
@@ -70,6 +106,9 @@ export function verifySessionToken(
     // session (and vice versa). Legacy tokens with no `kind` are treated as 'user'.
     const kind: TokenKind = data.kind === 'portal' ? 'portal' : 'user';
     if (kind !== expectedKind) return null;
+    // Bind the token to the company file it was issued by (legacy tokens without `fid` are
+    // rejected → one re-login after upgrading).
+    if (data.fid !== companyFileId()) return null;
     return { userId: data.userId };
   } catch {
     return null;

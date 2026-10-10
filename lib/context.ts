@@ -13,12 +13,18 @@ import { and, eq } from 'drizzle-orm';
 import { getDb, type DB } from '@/lib/db';
 import { ensureDevCompany, verifyClosingDatePassword } from '@/lib/services/company';
 import { getFileLockStatus } from '@/lib/services/fileLock';
-import { getRole } from '@/lib/services/rbac';
+import { resolveAccess, PERMISSION_DENIED_PREFIX } from '@/lib/services/access';
+import { fullAccess, legacyRoleFor } from '@/lib/permissions/model';
+import { enforceRequestPermission } from '@/lib/permissions/enforce';
 import { companies, userCompanies, users } from '@/lib/db/schema';
 import { getSessionUserId, hasValidUnlockCookie } from '@/lib/auth';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 
 export const COMPANY_COOKIE = 'bka_company';
+
+/** FORBIDDEN message for a deactivated member (login route + lib/client.ts match it). */
+export const DEACTIVATED_MESSAGE =
+  'Your user account has been deactivated for this company. Contact your administrator.';
 
 /** Header carrying the closing-date password for this request (QB Set Closing Date override). */
 export const CLOSING_PASSWORD_HEADER = 'x-closing-password';
@@ -66,24 +72,32 @@ export async function getServerContext(): Promise<ServiceContext> {
   const userId = await getSessionUserId();
 
   if (userId) {
+    // Only ACTIVE memberships select a company (deactivated users are locked out).
+    const active = and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true));
     const sel = await selectedCompanyCookie();
     let companyId: string | undefined;
     if (sel) {
       const [m] = await db
         .select({ companyId: userCompanies.companyId })
         .from(userCompanies)
-        .where(and(eq(userCompanies.userId, userId), eq(userCompanies.companyId, sel)));
+        .where(and(active, eq(userCompanies.companyId, sel)));
       if (m) companyId = sel;
     }
     if (!companyId) {
       const [m] = await db
         .select({ companyId: userCompanies.companyId })
         .from(userCompanies)
-        .where(eq(userCompanies.userId, userId))
+        .where(active)
         .limit(1);
       companyId = m?.companyId;
     }
     if (!companyId) {
+      const [anyMembership] = await db
+        .select({ companyId: userCompanies.companyId })
+        .from(userCompanies)
+        .where(eq(userCompanies.userId, userId))
+        .limit(1);
+      if (anyMembership) throw new ServiceError('FORBIDDEN', DEACTIVATED_MESSAGE);
       const [owned] = await db
         .select({ id: companies.id })
         .from(companies)
@@ -92,11 +106,21 @@ export async function getServerContext(): Promise<ServiceContext> {
       companyId = owned?.id;
     }
     if (companyId) {
-      // RBAC: load the member's role so the service layer can reject viewer mutations
-      // centrally (writeAudit/inTransaction in lib/services/_base.ts).
-      const role = (await getRole({ db, companyId, userId })) ?? undefined;
-      const closingDateOverride = await resolveClosingDateOverride(db, companyId);
-      return { db, companyId, userId, role, closingDateOverride };
+      // Enterprise roles & permissions: resolve the member's effective permissions (union of
+      // their roles) and authorize THIS request against the declarative route map
+      // (lib/permissions/routes.ts). Every API route obtains its context here, so enforcement
+      // can't be skipped by forgetting a check in a handler.
+      const resolved = await resolveAccess(db, companyId, userId);
+      if (!resolved.active) throw new ServiceError('FORBIDDEN', DEACTIVATED_MESSAGE);
+      const access = resolved.access;
+      await enforceRequestPermission(access);
+      // Legacy 4-level role, still read by the view-only guard in _base.ts and a few services.
+      const role = legacyRoleFor(access, resolved.isOwner);
+      // The closing-date password only unlocks closed periods for users whose roles allow
+      // modifying transactions on/before the closing date (QB Enterprise parity).
+      const closingDateOverride =
+        access.flags.closedPeriod && (await resolveClosingDateOverride(db, companyId));
+      return { db, companyId, userId, role, closingDateOverride, access };
     }
   }
 
@@ -117,9 +141,19 @@ export async function getServerContext(): Promise<ServiceContext> {
     }
   }
   const fb = await ensureDevCompany(db);
-  // First-run/dev fallback acts as the company owner.
+  // First-run/dev fallback acts as the company owner (Admin). The route map still applies, so
+  // an unmapped API route is refused even here.
+  const access = fullAccess();
+  await enforceRequestPermission(access);
   const closingDateOverride = await resolveClosingDateOverride(db, fb.companyId);
-  return { db, companyId: fb.companyId, userId: fb.userId, role: 'owner', closingDateOverride };
+  return {
+    db,
+    companyId: fb.companyId,
+    userId: fb.userId,
+    role: 'owner',
+    closingDateOverride,
+    access,
+  };
 }
 
 /**
@@ -140,8 +174,12 @@ export async function getPageContext(nextPath: string): Promise<ServiceContext> 
       if (/company file is locked/i.test(err.message)) {
         redirect('/unlock?next=' + encodeURIComponent(nextPath));
       }
-      if (err.message === 'Authentication required.') {
+      if (err.message === 'Authentication required.' || err.message === DEACTIVATED_MESSAGE) {
         redirect('/login?next=' + encodeURIComponent(nextPath));
+      }
+      // Role lacks access to this page (lib/permissions/routes.ts PAGE_AREAS).
+      if (err.message.startsWith(PERMISSION_DENIED_PREFIX)) {
+        redirect('/forbidden?from=' + encodeURIComponent(nextPath));
       }
     }
     throw err;

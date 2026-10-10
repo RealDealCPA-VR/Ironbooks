@@ -17,6 +17,8 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { statePerPeriod, SUPPORTED_STATE_CODES } from '@/lib/services/statePayrollTax';
+import { getServerContext } from '@/lib/context';
+import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status });
@@ -24,6 +26,18 @@ function errorResponse(message: string, status = 400) {
 
 export async function POST(req: NextRequest) {
   try {
+    // Authorize (session + Employees & Payroll permission via the central route map).
+    try {
+      await getServerContext();
+    } catch (err) {
+      if (err instanceof ServiceError) {
+        return NextResponse.json(
+          { error: err.message, code: err.code },
+          { status: err.code === 'FORBIDDEN' ? 403 : 400 },
+        );
+      }
+      throw err;
+    }
     const body = await req.json();
 
     const { grossPerPeriod, periodsPerYear, state } = body as {

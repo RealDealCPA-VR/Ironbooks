@@ -46,7 +46,10 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ rows });
   } catch (err) {
     if (err instanceof ServiceError) {
-      return NextResponse.json({ error: err.message, code: err.code }, { status: 400 });
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: err.code === 'FORBIDDEN' ? 403 : 400 },
+      );
     }
     console.error('[GET /api/inventory/worksheet]', err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

@@ -4,7 +4,8 @@
  *  POST /api/file-lock { action: 'set' | 'remove', password?, currentPassword? }
  *
  * Requires the file to be open (getServerContext enforces the lock + any login), so only someone
- * already inside the file can set, change, or remove its password.
+ * already inside the file can set, change, or remove its password — and, via the central
+ * permission map, only roles with Users & Roles 'modify' (Admin). Changes are audited.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -13,7 +14,7 @@ import {
   setFilePassword,
   removeFilePassword,
 } from '@/lib/services/fileLock';
-import { ServiceError } from '@/lib/services/_base';
+import { ServiceError, writeAudit } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -62,7 +63,14 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    return NextResponse.json(await getFileLockStatus(ctx.db));
+    const status = await getFileLockStatus(ctx.db);
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'file_password',
+      entityId: ctx.companyId,
+      newValues: { action, enabled: status.enabled }, // never the password itself
+    });
+    return NextResponse.json(status);
   } catch (err) {
     return errorResponse(err);
   }

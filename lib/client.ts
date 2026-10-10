@@ -62,6 +62,20 @@ export function isFileLockError(status: number, message: string): boolean {
   return status === 403 && /company file is locked/i.test(message);
 }
 
+/**
+ * True when a failed response means there is no valid session for THIS company file (expired,
+ * minted by another company file, or the user was deactivated). Coupled to the messages thrown by
+ * getServerContext in lib/context.ts ('Authentication required.' / DEACTIVATED_MESSAGE).
+ */
+export function isAuthError(status: number, message: string): boolean {
+  return (
+    (status === 401 || status === 403) &&
+    (message === 'Authentication required.' || /account has been deactivated/i.test(message))
+  );
+}
+
+const AUTH_PAGES = ['/login', '/signup', '/unlock', '/reset-password'];
+
 async function handle<T>(res: Response): Promise<T> {
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
@@ -79,6 +93,16 @@ async function handle<T>(res: Response): Promise<T> {
     ) {
       window.location.assign(
         '/unlock?next=' + encodeURIComponent(window.location.pathname + window.location.search),
+      );
+    }
+    // Session not valid for this company file (e.g. after switching files): back to sign-in.
+    else if (
+      isAuthError(res.status, message) &&
+      typeof window !== 'undefined' &&
+      !AUTH_PAGES.includes(window.location.pathname)
+    ) {
+      window.location.assign(
+        '/login?next=' + encodeURIComponent(window.location.pathname + window.location.search),
       );
     }
     throw new ApiError(res.status, message, data?.code);

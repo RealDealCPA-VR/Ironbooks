@@ -11,6 +11,21 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { runGlobalSearch } from './queries';
 import { buildResults } from './results';
+import { can, type Area } from '@/lib/permissions/model';
+
+/** Result type → the area whose 'view' it needs (Users & Roles). Unknown types are dropped. */
+const RESULT_AREA: Record<string, Area> = {
+  Customer: 'customers',
+  Invoice: 'customers',
+  Payment: 'customers',
+  Vendor: 'vendors',
+  Bill: 'vendors',
+  Item: 'lists',
+  Account: 'lists',
+  Employee: 'payroll',
+  'Journal Entry': 'accounting',
+  Expense: 'banking',
+};
 
 export async function GET(req: NextRequest) {
   const q = (new URL(req.url).searchParams.get('q') ?? '').trim();
@@ -18,7 +33,12 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const hits = await runGlobalSearch(ctx.db, ctx.companyId, q);
-    return NextResponse.json({ results: buildResults(hits) });
+    // Only show hits from areas the caller's roles can view.
+    const results = buildResults(hits).filter((r) => {
+      const area = RESULT_AREA[r.type];
+      return area ? !ctx.access || can(ctx.access, area, 'view') : false;
+    });
+    return NextResponse.json({ results });
   } catch (err) {
     if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
       return NextResponse.json({ error: err.message, code: err.code }, { status: 403 });

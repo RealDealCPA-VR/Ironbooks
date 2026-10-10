@@ -18,7 +18,8 @@ import { getPageContext } from '@/lib/context';
 import { getDashboardInsights, type DashboardInsights } from '@/lib/services/dashboard';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
-import { PageHeader } from '@/components/ui';
+import { Card, PageHeader } from '@/components/ui';
+import { can } from '@/lib/permissions/model';
 
 export const dynamic = 'force-dynamic';
 
@@ -35,6 +36,9 @@ const CHART = {
 
 export default async function DashboardPage() {
   const ctx = await getPageContext('/dashboard');
+  // Users & Roles: the financial snapshot needs Reports — Financial (QB Company Snapshot parity).
+  // Everyone else lands on a plain home page instead of an error.
+  if (ctx.access && !can(ctx.access, 'reports_financial', 'view')) return <LimitedHome />;
   // Single aggregated read model (also served as GET /api/dashboard). KPI cards keep
   // the fiscal-YTD scoping from lib/ytd.ts (settings.fiscalYearEnd; defaults Jan 1).
   const d = await getDashboardInsights(ctx);
@@ -89,6 +93,20 @@ export default async function DashboardPage() {
 // ---------------------------------------------------------------------------
 // Quick actions
 // ---------------------------------------------------------------------------
+
+function LimitedHome() {
+  return (
+    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+      <PageHeader title="Home" />
+      <Card className="p-6 max-w-xl">
+        <p className="text-navy/70 text-sm">
+          Welcome! Use the menu on the left to get to the parts of the company file your role
+          gives you access to. Ask your administrator if you need access to something else.
+        </p>
+      </Card>
+    </main>
+  );
+}
 
 function QuickActions() {
   const actions = [

@@ -12,6 +12,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { exchangePublicToken } from '@/lib/services/plaid';
 import { ServiceError } from '@/lib/services/_base';
+import { getServerContext } from '@/lib/context';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -19,6 +20,7 @@ function errorResponse(err: unknown) {
       err.code === 'NOT_FOUND' ? 404
       : err.code === 'VALIDATION' ? 400
       : err.code === 'FORBIDDEN' ? 403
+      : err.code === 'CONFLICT' ? 409
       : 500;
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
@@ -28,6 +30,7 @@ function errorResponse(err: unknown) {
 
 export async function POST(req: NextRequest) {
   try {
+    await getServerContext(); // session + Banking permission (central route map)
     const body = await req.json();
     const { publicToken } = body as { publicToken?: string };
     if (!publicToken || typeof publicToken !== 'string') {

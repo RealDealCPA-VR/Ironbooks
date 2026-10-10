@@ -1,0 +1,539 @@
+/**
+ * Declarative permission map: every API route path + HTTP method → the permission it needs.
+ *
+ * ENFORCEMENT is central and automatic: middleware.ts stamps each request with its pathname and
+ * method (ROUTE_PATH_HEADER / ROUTE_METHOD_HEADER, overwriting any client-supplied value), and
+ * `getServerContext` (lib/context.ts) looks the pair up here and throws FORBIDDEN unless the
+ * caller's effective permissions allow it. A route can't "forget" — calling getServerContext is
+ * how a route gets a context at all, and lib/permissions/routes.test.ts walks every
+ * app/api/**\/route.ts and FAILS if any exported HTTP method is missing from this map (or if an
+ * area-mapped route never calls getServerContext). Unmapped API paths are denied (fail closed).
+ *
+ * Rule kinds:
+ *  - { area, action }  checked against the caller's effective permissions.
+ *  - 'member'          any active member of the company (no specific area); still requires a
+ *                      valid session + unlocked file via getServerContext.
+ *  - 'self'            the handler authenticates itself without getServerContext (company-file
+ *                      management scoped by its own membership checks, employee portal session,
+ *                      the caller's own 2FA settings). Never put data routes here.
+ *  - 'public'          no authentication at all (login, signup, unlock, status probes).
+ *
+ * Pure module (no Node/DB imports): also used client-side to filter navigation.
+ */
+import type { Action, Area } from './model';
+
+export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
+export type HttpMethod = (typeof HTTP_METHODS)[number];
+
+export type AreaRule = { area: Area; action: Action };
+export type RouteRule = AreaRule | 'member' | 'self' | 'public';
+export type MethodRules = Partial<Record<HttpMethod, RouteRule>>;
+
+/** Request headers stamped by middleware.ts (never trusted from the client — always overwritten). */
+export { ROUTE_PATH_HEADER, ROUTE_METHOD_HEADER } from './headers';
+
+const DEFAULT_ACTION: Record<HttpMethod, Action> = {
+  GET: 'view',
+  POST: 'create',
+  PUT: 'modify',
+  PATCH: 'modify',
+  DELETE: 'delete',
+};
+
+/**
+ * Map methods to an area. `spec` lists methods, each optionally with an explicit action:
+ * 'GET POST' → GET view, POST create; 'GET POST:modify DELETE' → POST mapped to modify.
+ */
+function r(area: Area, spec: string): MethodRules {
+  const out: MethodRules = {};
+  for (const tok of spec.trim().split(/\s+/)) {
+    const [m, a] = tok.split(':') as [HttpMethod, Action | undefined];
+    out[m] = { area, action: a ?? DEFAULT_ACTION[m] };
+  }
+  return out;
+}
+function kind(k: 'member' | 'self' | 'public', spec: string): MethodRules {
+  const out: MethodRules = {};
+  for (const m of spec.trim().split(/\s+/) as HttpMethod[]) out[m] = k;
+  return out;
+}
+
+export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
+  // ---- Auth / session / file lock ----
+  '/api/auth/login': kind('public', 'POST'),
+  '/api/auth/logout': kind('public', 'POST'),
+  '/api/auth/signup': kind('public', 'POST'),
+  '/api/auth/request-reset': kind('public', 'POST'),
+  '/api/auth/reset': kind('public', 'POST'),
+  '/api/auth/me': kind('public', 'GET'), // returns null without a valid session
+  '/api/auth/2fa/setup': kind('self', 'POST'),
+  '/api/auth/2fa/enable': kind('self', 'POST'),
+  '/api/auth/2fa/disable': kind('self', 'POST'),
+  '/api/unlock': kind('public', 'POST'),
+  '/api/file-lock': { GET: 'member', ...r('users', 'POST:modify') },
+  '/api/portal/login': kind('public', 'POST'),
+  '/api/portal/logout': kind('public', 'POST'),
+  '/api/portal/me': kind('self', 'GET'),
+  '/api/email/status': kind('public', 'GET'),
+  '/api/plaid/status': kind('public', 'GET'),
+
+  // ---- Company files / company settings ----
+  '/api/companies': kind('self', 'GET POST'),
+  '/api/companies/[id]': kind('self', 'PATCH DELETE'),
+  '/api/companies/select': kind('self', 'POST'),
+  '/api/company': { GET: 'member', ...r('company', 'PATCH') },
+  '/api/company/closing-date': r('closing', 'GET PATCH'),
+  '/api/custom-fields': r('lists', 'GET PATCH'),
+  '/api/custom-fields/values': r('lists', 'POST:modify'),
+  '/api/currencies': r('lists', 'GET POST'),
+  '/api/currencies/fx-adjustment': r('accounting', 'POST'),
+  '/api/budgets': r('company', 'GET POST'),
+  '/api/budgets/[id]': r('company', 'GET PATCH'),
+  '/api/budgets/[id]/vs-actual': r('reports_financial', 'GET'),
+  '/api/fiscal-periods': r('closing', 'GET POST:modify'),
+  '/api/fiscal-periods/[id]': r('closing', 'PATCH'),
+  '/api/year-end-close': r('closing', 'POST:modify'),
+  '/api/dashboard': r('reports_financial', 'GET'),
+  '/api/search': kind('member', 'GET'), // results filtered per area in the route
+  '/api/memorized-reports': kind('member', 'GET POST'),
+
+  // ---- Users & Roles ----
+  '/api/users': r('users', 'GET POST'),
+  '/api/users/[id]': r('users', 'GET PATCH'),
+  '/api/users/[id]/reset-password': r('users', 'POST:modify'),
+  '/api/roles': r('users', 'GET POST'),
+  '/api/roles/[id]': r('users', 'GET PATCH DELETE'),
+
+  // ---- File utilities ----
+  '/api/backup': r('file_utilities', 'GET:create POST:delete'),
+  '/api/backup/company': r('file_utilities', 'GET:create POST:delete'),
+  '/api/dashboard/auto-backup': r('file_utilities', 'POST'),
+  '/api/condense': r('file_utilities', 'POST:delete'),
+  '/api/integrity': r('file_utilities', 'GET'),
+  '/api/import': r('file_utilities', 'POST'),
+  '/api/import/csv-preview': r('file_utilities', 'POST'),
+  '/api/import/qb': r('file_utilities', 'POST'),
+  '/api/import/rebuild': r('file_utilities', 'GET POST:modify'),
+  '/api/qb-import': r('file_utilities', 'POST'),
+  '/api/export/[list]': r('file_utilities', 'GET:print'),
+  '/api/export/reports': r('reports_financial', 'POST:print'),
+  '/api/export/statements/batch': r('customers', 'GET:print'),
+  '/api/export/statements/open-item': r('customers', 'GET:print'),
+  '/api/export/statements/open-item/pdf': r('customers', 'GET:print'),
+
+  // ---- Lists ----
+  '/api/accounts': { ...r('lists', 'GET'), ...r('accounting', 'POST') },
+  '/api/accounts/[id]': { ...r('lists', 'GET'), ...r('accounting', 'PATCH DELETE') },
+  '/api/classes': r('lists', 'GET POST'),
+  '/api/classes/[id]': r('lists', 'PATCH'),
+  '/api/locations': r('lists', 'GET POST'),
+  '/api/locations/[id]': r('lists', 'PATCH'),
+  '/api/items': r('lists', 'GET POST'),
+  '/api/items/[id]': r('lists', 'GET PATCH DELETE'),
+  '/api/items/[id]/components': r('lists', 'GET'),
+  '/api/sales-reps': r('lists', 'GET POST'),
+  '/api/sales-reps/[id]': r('lists', 'GET PATCH DELETE'),
+  '/api/sales-reps/assign': r('customers', 'POST:modify'),
+  '/api/attachments': r('lists', 'GET POST'),
+  '/api/attachments/[id]': r('lists', 'GET DELETE'),
+  '/api/recurring': r('lists', 'GET POST'),
+  '/api/recurring/run': r('accounting', 'POST'),
+  '/api/merge': r('lists', 'POST:delete'),
+  '/api/fixed-assets': r('lists', 'GET POST'),
+  '/api/fixed-assets/[id]': { ...r('lists', 'GET'), ...r('accounting', 'POST') },
+
+  // ---- Customers & Receivables ----
+  '/api/customers': r('customers', 'GET POST'),
+  '/api/customers/[id]': r('customers', 'GET PATCH DELETE'),
+  '/api/jobs': r('customers', 'GET POST'),
+  '/api/jobs/[id]': r('customers', 'GET PATCH DELETE'),
+  '/api/customer-prices': r('customers', 'GET POST'),
+  '/api/customer-prices/[id]': r('customers', 'DELETE'),
+  '/api/invoices': r('customers', 'GET POST'),
+  '/api/invoices/[id]': r('customers', 'GET PUT PATCH DELETE'),
+  '/api/invoices/[id]/email': r('customers', 'POST:print'),
+  '/api/invoices/[id]/packing-slip': r('customers', 'GET:print'),
+  '/api/invoices/[id]/pdf': r('customers', 'GET:print'),
+  '/api/invoices/[id]/post': r('customers', 'POST:modify'),
+  '/api/invoices/custom-fields': r('customers', 'GET'),
+  '/api/estimates': r('customers', 'GET POST'),
+  '/api/estimates/[id]': r('customers', 'GET PATCH POST:modify'),
+  '/api/estimates/[id]/pdf': r('customers', 'GET:print'),
+  '/api/estimates/expire': r('customers', 'POST:modify'),
+  '/api/sales-orders': r('customers', 'GET POST'),
+  '/api/sales-orders/[id]': r('customers', 'GET POST:modify'),
+  '/api/sales-orders/backorders': r('customers', 'GET'),
+  '/api/sales-receipts': r('customers', 'GET POST'),
+  '/api/sales-receipts/[id]': r('customers', 'GET DELETE'),
+  '/api/payments': r('customers', 'GET POST'),
+  '/api/payments/[id]': r('customers', 'GET POST:modify DELETE'),
+  '/api/credit-memos': r('customers', 'GET POST'),
+  '/api/credit-memos/[id]': r('customers', 'GET POST:modify DELETE'),
+  '/api/finance-charges': r('customers', 'POST'),
+  '/api/finance-charges/preview': r('customers', 'GET'),
+  '/api/finance-charges/settings': r('company', 'GET PUT PATCH'),
+  '/api/billables': r('customers', 'GET'),
+  '/api/time-entries/bill': r('customers', 'POST'),
+
+  // ---- Vendors & Payables ----
+  '/api/vendors': r('vendors', 'GET POST'),
+  '/api/vendors/[id]': r('vendors', 'GET PATCH DELETE'),
+  '/api/bills': r('vendors', 'GET POST'),
+  '/api/bills/[id]': r('vendors', 'GET PATCH DELETE'),
+  '/api/bill-payments': r('vendors', 'GET POST'),
+  '/api/bill-payments/[id]': r('vendors', 'GET DELETE'),
+  '/api/vendor-credits': r('vendors', 'GET POST'),
+  '/api/vendor-credits/[id]': r('vendors', 'GET POST:modify DELETE'),
+  '/api/purchase-orders': r('vendors', 'GET POST'),
+  '/api/purchase-orders/[id]': r('vendors', 'GET POST:modify'),
+  '/api/purchase-orders/[id]/pdf': r('vendors', 'GET:print'),
+  '/api/expense-reports': r('vendors', 'GET POST'),
+  '/api/expense-reports/[id]': r('vendors', 'GET POST:modify'),
+  '/api/reports/1099/mapping': r('vendors', 'GET PATCH'),
+
+  // ---- Banking ----
+  '/api/bank-accounts': r('banking', 'GET POST'),
+  '/api/bank-transactions': r('banking', 'GET'),
+  '/api/bank-transactions/[id]/matches': r('banking', 'GET'),
+  '/api/bank-transactions/bulk': r('banking', 'POST:modify'),
+  '/api/bank-transactions/categorize': r('banking', 'POST'),
+  '/api/bank-transactions/exclude': r('banking', 'POST:modify'),
+  '/api/bank-transactions/match': r('banking', 'POST:modify'),
+  '/api/bank-transactions/unmatch': r('banking', 'POST:modify'),
+  '/api/rules': r('banking', 'GET POST'),
+  '/api/demo-feed': r('banking', 'POST'),
+  '/api/plaid/exchange': r('banking', 'POST'),
+  '/api/plaid/link-token': r('banking', 'POST'),
+  '/api/plaid/sync': r('banking', 'POST'),
+  '/api/deposits': r('banking', 'GET POST'),
+  '/api/deposits/[id]': r('banking', 'GET DELETE'),
+  '/api/deposits/undeposited': r('banking', 'GET'),
+  '/api/expenses': r('banking', 'GET POST'),
+  '/api/expenses/[id]': r('banking', 'GET DELETE'),
+  '/api/expenses/[id]/print': r('banking', 'POST:print'),
+  '/api/checks/pdf': r('banking', 'POST:print'),
+  '/api/check-numbers/next': r('banking', 'GET'),
+  '/api/registers': r('banking', 'GET'),
+  '/api/registers/[accountId]': r('banking', 'GET'),
+
+  // ---- Sensitive accounting ----
+  '/api/journal-entries': r('accounting', 'GET POST'),
+  '/api/journal-entries/[id]': r('accounting', 'GET PATCH DELETE'),
+  '/api/journal-entries/[id]/history': r('accounting', 'GET'),
+  '/api/journal-entries/[id]/reverse': r('accounting', 'POST'),
+  '/api/transfers': r('accounting', 'GET POST'),
+  '/api/reconciliations': r('accounting', 'GET POST'),
+  '/api/reconciliations/[id]': r('accounting', 'GET PATCH DELETE'),
+  '/api/reconciliations/[id]/clearable': r('accounting', 'GET'),
+  '/api/reconciliations/[id]/pay': r('accounting', 'POST'),
+  '/api/reconciliations/[id]/report': r('accounting', 'GET:print'),
+  '/api/reconciliations/discrepancies': r('accounting', 'GET'),
+  '/api/reconciliations/info': r('accounting', 'GET'),
+  '/api/reconciliations/undo': r('accounting', 'POST:delete'),
+  '/api/errors': r('accounting', 'GET POST'),
+  '/api/errors/[id]/analyze': r('accounting', 'POST'),
+  '/api/errors/[id]/apply': r('accounting', 'POST:modify'),
+  '/api/audit-trail': r('reports_financial', 'GET'),
+  '/api/audit-trail/[id]': r('reports_financial', 'GET'),
+
+  // ---- Inventory ----
+  '/api/inventory': r('inventory', 'GET POST'),
+  '/api/inventory/batch-count': r('inventory', 'POST:modify'),
+  '/api/inventory/physical-count': r('inventory', 'POST:modify'),
+  '/api/inventory/reorder': r('inventory', 'GET'),
+  '/api/inventory/value-adjust': r('inventory', 'POST:modify'),
+  '/api/inventory/stock-status': r('reports_inventory', 'GET'),
+  '/api/inventory/worksheet': r('reports_inventory', 'GET'),
+  '/api/item-receipts': r('inventory', 'GET POST'),
+  '/api/item-receipts/[id]': r('inventory', 'GET POST:modify'),
+  '/api/assemblies': r('inventory', 'GET PUT PATCH'),
+  '/api/assemblies/build': r('inventory', 'POST'),
+  '/api/assemblies/pending': r('inventory', 'GET POST'),
+  '/api/assemblies/pending/[id]': r('inventory', 'POST:modify'),
+  '/api/fifo': r('inventory', 'GET POST'),
+
+  // ---- Sales tax ----
+  '/api/tax-agencies': r('sales_tax', 'GET POST'),
+  '/api/tax-rates': r('sales_tax', 'GET POST'),
+  '/api/tax-rates/[id]/components': r('sales_tax', 'GET PATCH'),
+  '/api/pay-liabilities/sales-tax': r('sales_tax', 'GET'),
+
+  // ---- Time & mileage ----
+  '/api/time-entries': r('time', 'GET POST'),
+  '/api/time-entries/[id]': r('time', 'PATCH DELETE'),
+  '/api/mileage': r('time', 'GET POST'),
+  '/api/mileage/[id]': r('time', 'DELETE'),
+
+  // ---- Employees & payroll ----
+  '/api/employees': r('payroll', 'GET POST'),
+  '/api/employees/[id]': r('payroll', 'GET PATCH'),
+  '/api/employees/[id]/portal-password': r('payroll', 'POST:modify'),
+  '/api/payroll-items': r('payroll', 'GET POST'),
+  '/api/payroll-items/[id]': r('payroll', 'GET PATCH'),
+  '/api/payroll': r('payroll', 'GET POST'),
+  '/api/payroll/[id]': r('payroll', 'DELETE'),
+  '/api/payroll/accruals': r('payroll', 'GET PUT'),
+  '/api/payroll/calc': r('payroll', 'POST:view'),
+  '/api/payroll/state-tax': r('payroll', 'POST:view'),
+  '/api/payroll/pay-runs': r('payroll', 'GET POST'),
+  '/api/payroll/paystub': r('payroll', 'GET:print'),
+  '/api/payroll/unpaid-time': r('payroll', 'GET'),
+  '/api/pay-liabilities': r('payroll', 'GET POST'),
+  '/api/pay-liabilities/by-item': r('payroll', 'GET POST'),
+  '/api/payroll/940': r('reports_payroll', 'GET'),
+  '/api/payroll/941': r('reports_payroll', 'GET'),
+  '/api/payroll/reports': r('reports_payroll', 'GET'),
+  '/api/payroll/w2': r('reports_payroll', 'GET'),
+  '/api/payroll/w3': r('reports_payroll', 'GET'),
+
+  // ---- Reports ----
+  '/api/report-builder': r('reports_financial', 'POST:view'),
+  '/api/reports/balance-sheet': r('reports_financial', 'GET'),
+  '/api/reports/balance-sheet-cash': r('reports_financial', 'GET'),
+  '/api/reports/balance-sheet-classified': r('reports_financial', 'GET'),
+  '/api/reports/budget-vs-actual': r('reports_financial', 'GET'),
+  '/api/reports/budget-vs-actual-class': r('reports_financial', 'GET'),
+  '/api/reports/cash-flow': r('reports_financial', 'GET'),
+  '/api/reports/check-detail': r('reports_financial', 'GET'),
+  '/api/reports/consolidated': r('reports_financial', 'GET'),
+  '/api/reports/deposit-detail': r('reports_financial', 'GET'),
+  '/api/reports/general-ledger': r('reports_financial', 'GET'),
+  '/api/reports/missing-checks': r('reports_financial', 'GET'),
+  '/api/reports/pl-by-class': r('reports_financial', 'GET'),
+  '/api/reports/pl-comparative': r('reports_financial', 'GET'),
+  '/api/reports/pl-monthly': r('reports_financial', 'GET'),
+  '/api/reports/pl-percent': r('reports_financial', 'GET'),
+  '/api/reports/profit-loss': r('reports_financial', 'GET'),
+  '/api/reports/profit-loss-cash': r('reports_financial', 'GET'),
+  '/api/reports/transaction-detail': r('reports_financial', 'GET'),
+  '/api/reports/trial-balance': r('reports_financial', 'GET'),
+  '/api/reports/ar-aging': r('reports_sales', 'GET'),
+  '/api/reports/ar-aging-detail': r('reports_sales', 'GET'),
+  '/api/reports/collections': r('reports_sales', 'GET'),
+  '/api/reports/commissions': r('reports_sales', 'GET'),
+  '/api/reports/customer-statement': r('reports_sales', 'GET'),
+  '/api/reports/customer-statement/pdf': r('reports_sales', 'GET:print'),
+  '/api/reports/open-invoices': r('reports_sales', 'GET'),
+  '/api/reports/sales-by-customer': r('reports_sales', 'GET'),
+  '/api/reports/sales-by-item': r('reports_sales', 'GET'),
+  '/api/reports/sales-tax-by-agency': r('sales_tax', 'GET'),
+  '/api/reports/ap-aging': r('reports_purchases', 'GET'),
+  '/api/reports/ap-aging-detail': r('reports_purchases', 'GET'),
+  '/api/reports/purchases-by-item': r('reports_purchases', 'GET'),
+  '/api/reports/purchases-by-vendor': r('reports_purchases', 'GET'),
+  '/api/reports/1099': r('reports_purchases', 'GET'),
+  '/api/reports/1099-pdf': r('reports_purchases', 'GET:print'),
+  '/api/reports/1099-xml': r('reports_purchases', 'GET:print'),
+  '/api/reports/inventory-valuation': r('reports_inventory', 'GET'),
+  '/api/reports/inventory-valuation/detail': r('reports_inventory', 'GET'),
+};
+
+const ANY_REPORT: Area[] = [
+  'reports_financial',
+  'reports_sales',
+  'reports_purchases',
+  'reports_payroll',
+  'reports_inventory',
+];
+
+/**
+ * Page (navigation) prefixes → the area whose 'view' they need (an array = any of them). Used to
+ * (a) hide sidebar entries the user can't use (cosmetic) and (b) gate server-rendered pages
+ * through getServerContext. Longest prefix wins; paths not listed are open to every member
+ * (their data still flows through the API map above).
+ */
+export const PAGE_AREAS: Record<string, Area | Area[]> = {
+  '/invoices': 'customers',
+  '/sales-receipts': 'customers',
+  '/estimates': 'customers',
+  '/estimates-followup': 'customers',
+  '/sales-orders': 'customers',
+  '/payments': 'customers',
+  '/credit-memos': 'customers',
+  '/customers': 'customers',
+  '/finance-charges': 'customers',
+  '/customer-pricing': 'customers',
+  '/jobs': 'customers',
+  '/items': 'lists',
+  '/sales-reps': 'lists',
+  '/tracking': 'lists',
+  '/recurring': 'lists',
+  '/attachments': 'lists',
+  '/merge': 'lists',
+  '/fixed-assets': 'lists',
+  '/currencies': 'lists',
+  '/purchase-orders': 'vendors',
+  '/item-receipts': 'inventory',
+  '/bills': 'vendors',
+  '/pay-bills': 'vendors',
+  '/vendor-credits': 'vendors',
+  '/vendors': 'vendors',
+  '/expense-reports': 'vendors',
+  '/expenses': 'banking',
+  '/print-checks': 'banking',
+  '/banking': 'banking',
+  '/registers': 'banking',
+  '/bank-feeds': 'banking',
+  '/bank-review': 'banking',
+  '/deposits': 'banking',
+  '/transactions': 'banking',
+  '/reconcile': 'accounting',
+  '/transfers': 'accounting',
+  '/journal': 'accounting',
+  '/accounts': 'lists',
+  '/errors': 'accounting',
+  '/pay-liabilities': 'payroll',
+  '/employees': 'payroll',
+  '/pay-runs': 'payroll',
+  '/pay-stubs': 'payroll',
+  '/payroll-forms': 'reports_payroll',
+  '/payroll-tax': 'payroll',
+  '/sales-tax-components': 'sales_tax',
+  '/fiscal-periods': 'closing',
+  '/year-end': 'closing',
+  '/budgets': 'company',
+  '/settings': 'company',
+  '/time-tracking': 'time',
+  '/mileage': 'time',
+  '/assemblies': 'inventory',
+  '/inventory-ops': 'inventory',
+  '/fifo': 'inventory',
+  '/audit-trail': 'reports_financial',
+  '/integrity': 'file_utilities',
+  '/backup': 'file_utilities',
+  '/qb-import': 'file_utilities',
+  '/users': 'users',
+  '/reports': ANY_REPORT, // the Report Center lists whatever the user may run
+  '/reports/builder': 'reports_financial',
+  '/reports/balance-sheet': 'reports_financial',
+  '/reports/balance-sheet-cash': 'reports_financial',
+  '/reports/balance-sheet-classified': 'reports_financial',
+  '/reports/cash-flow': 'reports_financial',
+  '/reports/check-detail': 'reports_financial',
+  '/reports/consolidated': 'reports_financial',
+  '/reports/deposit-detail': 'reports_financial',
+  '/reports/general-ledger': 'reports_financial',
+  '/reports/missing-checks': 'reports_financial',
+  '/reports/pl-by-class': 'reports_financial',
+  '/reports/pl-comparative': 'reports_financial',
+  '/reports/pl-monthly': 'reports_financial',
+  '/reports/pl-percent': 'reports_financial',
+  '/reports/profit-loss': 'reports_financial',
+  '/reports/profit-loss-cash': 'reports_financial',
+  '/reports/transaction-detail': 'reports_financial',
+  '/reports/trial-balance': 'reports_financial',
+  '/reports/sales-by-rep': 'reports_sales',
+  '/reports/statements': 'reports_sales',
+  '/reports/ar-aging': 'reports_sales',
+  '/reports/ar-aging-detail': 'reports_sales',
+  '/reports/collections': 'reports_sales',
+  '/reports/commissions': 'reports_sales',
+  '/reports/customer-statement': 'reports_sales',
+  '/reports/open-invoices': 'reports_sales',
+  '/reports/sales-by-customer': 'reports_sales',
+  '/reports/sales-by-item': 'reports_sales',
+  '/reports/ap-aging': 'reports_purchases',
+  '/reports/ap-aging-detail': 'reports_purchases',
+  '/reports/purchases-by-item': 'reports_purchases',
+  '/reports/purchases-by-vendor': 'reports_purchases',
+  '/reports/1099': 'reports_purchases',
+  '/reports/1099-efile': 'reports_purchases',
+  '/reports/payroll-summary': 'reports_payroll',
+  '/reports/inventory-valuation': 'reports_inventory',
+  '/reports/sales-tax': 'sales_tax',
+  '/reports/reconciliation': 'accounting',
+};
+
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
+
+/** Convert an app/api file path (…/app/api/x/[id]/route.ts) to its route pattern (/api/x/[id]). */
+export function routePatternFromFile(relPath: string): string {
+  const norm = relPath.replace(/\\/g, '/');
+  const idx = norm.indexOf('app/api/');
+  const tail = norm.slice(idx + 'app/'.length).replace(/\/route\.(ts|tsx|js)$/, '');
+  // Drop route groups "(group)" — they don't appear in URLs.
+  return '/' + tail.split('/').filter((s) => !/^\(.*\)$/.test(s)).join('/');
+}
+
+const isDynamic = (seg: string) => seg.startsWith('[') && seg.endsWith(']');
+const isCatchAll = (seg: string) => seg.startsWith('[...') || seg.startsWith('[[...');
+
+/**
+ * Find the route pattern matching a concrete pathname. Static segments beat dynamic ones at the
+ * same position (Next.js precedence), so /api/estimates/expire never matches /api/estimates/[id].
+ */
+export function matchRoutePattern(
+  pathname: string,
+  patterns: Iterable<string> = Object.keys(API_ROUTE_PERMISSIONS),
+): string | null {
+  const segs = pathname.replace(/\/+$/, '').split('/').filter(Boolean);
+  let best: { pattern: string; score: number[] } | null = null;
+  for (const pattern of patterns) {
+    const psegs = pattern.split('/').filter(Boolean);
+    const score: number[] = [];
+    let ok = true;
+    for (let i = 0; i < psegs.length; i++) {
+      const p = psegs[i];
+      if (isCatchAll(p)) {
+        if (i >= segs.length && !p.startsWith('[[')) ok = false;
+        score.push(0);
+        i = psegs.length; // consumes the rest
+        break;
+      }
+      if (i >= segs.length) {
+        ok = false;
+        break;
+      }
+      if (isDynamic(p)) score.push(1);
+      else if (p === segs[i]) score.push(2);
+      else {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    const hasCatchAll = psegs.some(isCatchAll);
+    if (!hasCatchAll && psegs.length !== segs.length) continue;
+    if (!best || compareScore(score, best.score) > 0) best = { pattern, score };
+  }
+  return best?.pattern ?? null;
+}
+
+function compareScore(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? -1) - (b[i] ?? -1);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/**
+ * The rule for a concrete API request, or null when the path/method is unmapped (callers must
+ * treat null as DENY).
+ */
+export function apiRuleFor(pathname: string, method: string): RouteRule | null {
+  const pattern = matchRoutePattern(pathname);
+  if (!pattern) return null;
+  const m = method.toUpperCase() as HttpMethod;
+  // HEAD is answered by GET handlers.
+  const rules = API_ROUTE_PERMISSIONS[pattern];
+  return rules[m] ?? (m === ('HEAD' as HttpMethod) ? (rules.GET ?? null) : null);
+}
+
+/**
+ * The areas a page path needs 'view' of (ANY one suffices), or null when the page is open to
+ * every member.
+ */
+export function pageAreasFor(pathname: string): Area[] | null {
+  let best: string | null = null;
+  for (const prefix of Object.keys(PAGE_AREAS)) {
+    if (pathname === prefix || pathname.startsWith(prefix + '/')) {
+      if (!best || prefix.length > best.length) best = prefix;
+    }
+  }
+  if (!best) return null;
+  const v = PAGE_AREAS[best];
+  return Array.isArray(v) ? v : [v];
+}
