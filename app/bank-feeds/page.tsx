@@ -38,6 +38,9 @@ import { format, parseISO } from 'date-fns';
 
 interface PlaidStatusResponse {
   configured: boolean;
+  /** Privacy & Network policy verdict for the 'bank-feeds' purpose (cloud opt-in). */
+  allowed?: boolean;
+  reason?: string;
 }
 
 interface BankAccount {
@@ -121,6 +124,7 @@ function loadPlaidScript(): Promise<void> {
 
 export default function BankFeedsPage() {
   const [configured, setConfigured] = useState<boolean | null>(null);
+  const [policyBlock, setPolicyBlock] = useState<string | null>(null);
   const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
   const [selectedBankAccountId, setSelectedBankAccountId] = useState('');
   const [connecting, setConnecting] = useState(false);
@@ -131,7 +135,10 @@ export default function BankFeedsPage() {
   useEffect(() => {
     api
       .get<PlaidStatusResponse>('/api/plaid/status')
-      .then((data) => setConfigured(data.configured))
+      .then((data) => {
+        if (data.allowed === false) setPolicyBlock(data.reason ?? 'Bank feeds are turned off.');
+        setConfigured(data.configured);
+      })
       .catch(() => setConfigured(false));
   }, []);
 
@@ -236,6 +243,32 @@ export default function BankFeedsPage() {
       <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
         <PageHeader title="Live Bank Feeds" icon={Rss} />
         <Card className="p-8 text-center text-navy/40">Checking Plaid configuration…</Card>
+      </main>
+    );
+  }
+
+  // ---- Render: blocked by the Privacy & Network policy ---------------------
+  if (policyBlock) {
+    return (
+      <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+        <PageHeader title="Live Bank Feeds" icon={Rss} />
+        <Card className="p-8 max-w-2xl">
+          <h2 className="text-xl font-bold text-navy mb-2">Bank feeds are off for this company</h2>
+          <p className="text-navy/60 text-sm mb-4">{policyBlock}</p>
+          <p className="text-navy/60 text-sm mb-6">
+            Live bank feeds connect to Plaid over the internet. BookKeeper AI keeps your books on this
+            computer, so cloud bank feeds stay off until an admin opts in. You can always import bank
+            files (OFX/QFX/CSV) instead — nothing leaves this machine.
+          </p>
+          <div className="flex gap-2">
+            <Link href="/privacy">
+              <Button variant="secondary">Privacy &amp; Network settings</Button>
+            </Link>
+            <Link href="/banking">
+              <Button>Import a bank file</Button>
+            </Link>
+          </div>
+        </Card>
       </main>
     );
   }

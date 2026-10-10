@@ -14,6 +14,17 @@ import { ServiceError } from './_base';
 import { isConfigured, createLinkToken, exchangePublicToken } from './plaid';
 import type { ServiceContext } from './_base';
 
+// The network policy is enforced on every Plaid call (lib/net/guard.ts). These tests stub the
+// company's policy so they never touch a database: tests below opt in to cloud bank feeds
+// explicitly, and the 'blocked by default' test flips it back.
+const policyState = vi.hoisted(() => ({ optIn: true }));
+vi.mock('./networkPolicy', () => ({
+  getNetworkPolicy: async () => ({
+    mode: policyState.optIn ? 'allow-cloud' : 'tailnet-only',
+    cloudOptIn: { ai: false, email: false, 'bank-feeds': policyState.optIn, updates: false },
+  }),
+}));
+
 // ---------------------------------------------------------------------------
 // Helpers to temporarily set / clear env vars
 // ---------------------------------------------------------------------------
@@ -112,7 +123,7 @@ describe('Plaid service — exchangePublicToken() when not configured', () => {
   afterEach(() => clearPlaidEnv());
 
   it('throws a ServiceError with code VALIDATION', async () => {
-    await expect(exchangePublicToken('public-token-fake')).rejects.toMatchObject({
+    await expect(exchangePublicToken(stubCtx, 'public-token-fake')).rejects.toMatchObject({
       name: 'ServiceError',
       code: 'VALIDATION',
     });
@@ -170,5 +181,33 @@ describe('Plaid service — createLinkToken() when configured (fetch mock)', () 
       code: 'INTERNAL',
       message: 'INVALID_REQUEST',
     });
+  });
+});
+
+describe('Plaid service — network policy', () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    clearPlaidEnv();
+    process.env.PLAID_CLIENT_ID = 'cid_mock';
+    process.env.PLAID_SECRET = 'secret_mock';
+    originalFetch = globalThis.fetch;
+    fetchSpy = vi.fn();
+    // @ts-ignore — intentional global mock
+    globalThis.fetch = fetchSpy;
+  });
+
+  afterEach(() => {
+    // @ts-ignore
+    globalThis.fetch = originalFetch;
+    policyState.optIn = true;
+    clearPlaidEnv();
+  });
+
+  it('blocks Plaid (no request leaves the machine) under the default tailnet-only policy', async () => {
+    policyState.optIn = false;
+    await expect(createLinkToken(stubCtx)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

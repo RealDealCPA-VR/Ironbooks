@@ -14,6 +14,8 @@ import bcrypt from 'bcryptjs';
 import { eq } from 'drizzle-orm';
 import { getDb, resolveDataDir } from '@/lib/db';
 import { users } from '@/lib/db/schema';
+import { touchSession } from '@/lib/services/sessions';
+import { getRequestOrigin } from '@/lib/net/requestInfo';
 
 export const SESSION_COOKIE = 'bka_session';
 export const PORTAL_COOKIE = 'bka_portal'; // employee self-service session
@@ -44,8 +46,12 @@ function sign(payload: string): string {
 /** Token audience: a main-app user session vs. an employee self-service portal session. */
 export type TokenKind = 'user' | 'portal';
 
-export function createSessionToken(userId: string, kind: TokenKind = 'user'): string {
-  const payload = JSON.stringify({ userId, kind, exp: Date.now() + SESSION_TTL_MS });
+/**
+ * `sid` (multi-user hosting) binds the cookie to a server-side `user_sessions` row so an admin
+ * can see who is logged in and sign a session out; see getSessionInfo below.
+ */
+export function createSessionToken(userId: string, kind: TokenKind = 'user', sid?: string): string {
+  const payload = JSON.stringify({ userId, kind, exp: Date.now() + SESSION_TTL_MS, ...(sid ? { sid } : {}) });
   const body = Buffer.from(payload).toString('base64url');
   return `${body}.${sign(body)}`;
 }
@@ -53,7 +59,7 @@ export function createSessionToken(userId: string, kind: TokenKind = 'user'): st
 export function verifySessionToken(
   token: string | undefined | null,
   expectedKind: TokenKind = 'user',
-): { userId: string } | null {
+): { userId: string; sid?: string } | null {
   if (!token) return null;
   const [body, sig] = token.split('.');
   if (!body || !sig) return null;
@@ -70,7 +76,7 @@ export function verifySessionToken(
     // session (and vice versa). Legacy tokens with no `kind` are treated as 'user'.
     const kind: TokenKind = data.kind === 'portal' ? 'portal' : 'user';
     if (kind !== expectedKind) return null;
-    return { userId: data.userId };
+    return typeof data.sid === 'string' ? { userId: data.userId, sid: data.sid } : { userId: data.userId };
   } catch {
     return null;
   }
@@ -146,14 +152,35 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
   }
 }
 
-/** Resolve the current authenticated user id from the session cookie (verified). */
-export async function getSessionUserId(): Promise<string | null> {
+/**
+ * Resolve the current authenticated session from the cookie (signature verified), plus the
+ * server-side session check used by multi-user hosting:
+ *  - a cookie carrying a session id must match a live `user_sessions` row (logout and
+ *    "sign out" by an admin revoke it immediately);
+ *  - a legacy cookie WITHOUT a session id is still honored from this machine, but never for a
+ *    request that arrived over the network through the multi-user host.
+ */
+export async function getSessionInfo(): Promise<{ userId: string; sessionId?: string } | null> {
+  let token: { userId: string; sid?: string } | null;
   try {
     const store = await cookies();
-    return verifySessionToken(store.get(SESSION_COOKIE)?.value)?.userId ?? null;
+    token = verifySessionToken(store.get(SESSION_COOKIE)?.value);
   } catch {
     return null;
   }
+  if (!token) return null;
+  if (token.sid) {
+    const db = await getDb();
+    if (!(await touchSession(db, token.sid, token.userId))) return null;
+    return { userId: token.userId, sessionId: token.sid };
+  }
+  if ((await getRequestOrigin()).remote) return null;
+  return { userId: token.userId };
+}
+
+/** Resolve the current authenticated user id from the session cookie (verified). */
+export async function getSessionUserId(): Promise<string | null> {
+  return (await getSessionInfo())?.userId ?? null;
 }
 
 export async function getCurrentUser() {

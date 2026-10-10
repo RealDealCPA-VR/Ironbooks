@@ -15,7 +15,9 @@ import { ensureDevCompany, verifyClosingDatePassword } from '@/lib/services/comp
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { getRole } from '@/lib/services/rbac';
 import { companies, userCompanies, users } from '@/lib/db/schema';
-import { getSessionUserId, hasValidUnlockCookie } from '@/lib/auth';
+import { getSessionInfo, hasValidUnlockCookie } from '@/lib/auth';
+import { assertSessionAllowed } from '@/lib/services/sessions';
+import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 
 export const COMPANY_COOKIE = 'bka_company';
@@ -63,7 +65,9 @@ export async function getServerContext(): Promise<ServiceContext> {
     throw new ServiceError('FORBIDDEN', 'This company file is locked. Unlock it to continue.');
   }
 
-  const userId = await getSessionUserId();
+  // Verified cookie + live server-side session (multi-user hosting: revocable, see lib/auth).
+  const session = await getSessionInfo();
+  const userId = session?.userId ?? null;
 
   if (userId) {
     const sel = await selectedCompanyCookie();
@@ -92,11 +96,13 @@ export async function getServerContext(): Promise<ServiceContext> {
       companyId = owned?.id;
     }
     if (companyId) {
+      // Multi-user: while an admin holds single-user mode, every other session is refused.
+      await assertSessionAllowed(db, session?.sessionId);
       // RBAC: load the member's role so the service layer can reject viewer mutations
       // centrally (writeAudit/inTransaction in lib/services/_base.ts).
       const role = (await getRole({ db, companyId, userId })) ?? undefined;
       const closingDateOverride = await resolveClosingDateOverride(db, companyId);
-      return { db, companyId, userId, role, closingDateOverride };
+      return { db, companyId, userId, role, closingDateOverride, sessionId: session?.sessionId };
     }
   }
 
@@ -109,6 +115,12 @@ export async function getServerContext(): Promise<ServiceContext> {
   // The only legitimate session-less path is genuine first-run/seed, before any account
   // exists, so onboarding can boot. Once any user exists, fail closed (HTTP 403 via the
   // route error handlers). An explicit BKA_ALLOW_DEV_FALLBACK=1 re-opens the old dev behavior.
+  //
+  // Requests from OTHER machines (through the multi-user host proxy) never get the first-run /
+  // dev fallback — the host must be set up locally, with a real account, before it is shared.
+  if ((await getRequestOrigin()).remote) {
+    throw new ServiceError('FORBIDDEN', 'Authentication required.');
+  }
   const allowDevFallback = process.env.BKA_ALLOW_DEV_FALLBACK === '1';
   if (!allowDevFallback) {
     const [anyUser] = await db.select({ id: users.id }).from(users).limit(1);

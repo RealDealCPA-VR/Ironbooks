@@ -64,7 +64,7 @@ describe('email service — configuration guards', () => {
   it('sendMail throws VALIDATION ServiceError when not configured', async () => {
     const { sendMail } = await import('./email');
     await expect(
-      sendMail({ to: 'test@example.com', subject: 'Hi', text: 'body' }),
+      sendMail({ to: 'test@example.com', subject: 'Hi', text: 'body' }, { db: {} as never, companyId: 'c', userId: null }),
     ).rejects.toSatisfy((err: unknown) => {
       return (
         err instanceof ServiceError &&

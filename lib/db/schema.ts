@@ -1167,3 +1167,36 @@ export const memorizedReports = pgTable('memorized_reports', {
   config: jsonb('config').$type<Record<string, unknown>>().notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+// ---- team hosting ----
+// Multi-user hosting (QB Enterprise "multi-user mode" parity). These are housekeeping tables
+// for the company FILE (not per-company business data), so they carry no FKs: a session row
+// must never block deleting/merging a user, and restore swaps the whole file anyway.
+
+/** One row per sign-in. The session id is embedded (signed) in the bka_session cookie. */
+export const userSessions = pgTable('user_sessions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull(),
+  companyId: uuid('company_id'),
+  /** Client address as seen by the multi-user host proxy ('local' for this machine). */
+  remoteAddr: varchar('remote_addr', { length: 100 }),
+  userAgent: text('user_agent'),
+  /** True when the session arrived over the network through the multi-user host. */
+  viaHost: boolean('via_host').notNull().default(false),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  lastSeenAt: timestamp('last_seen_at').defaultNow().notNull(),
+  endedAt: timestamp('ended_at'),
+  /** 'logout' | 'signed_out_by_admin' | 'expired' */
+  endReason: varchar('end_reason', { length: 50 }),
+});
+
+/**
+ * Single-user mode holder (at most one row, id = 'file'). While set, every other session is
+ * refused so admin utilities (condense, restore, rebuild, import) can run exclusively.
+ */
+export const singleUserMode = pgTable('single_user_mode', {
+  id: varchar('id', { length: 20 }).primaryKey(),
+  sessionId: uuid('session_id').notNull(),
+  userId: uuid('user_id').notNull(),
+  enabledAt: timestamp('enabled_at').defaultNow().notNull(),
+});

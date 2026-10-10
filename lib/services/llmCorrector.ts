@@ -24,6 +24,7 @@ import {
 } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
+import { assertOutboundAllowed } from '@/lib/net/guard';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,6 +121,9 @@ ${lines
     suggestion = buildStubSuggestion(detection.errorType, detection.description);
     llmReasoningText = 'Offline stub: ANTHROPIC_API_KEY not set.';
   } else {
+    // Network policy: cloud AI stays off unless the company opted in (Privacy & Network).
+    // Throws FORBIDDEN with a plain-English reason before any data leaves the machine.
+    await assertOutboundAllowed(anthropicBaseUrl(), 'ai', ctx);
     const result = await callClaude(detection, entryContext);
     suggestion = result.suggestion;
     llmReasoningText = result.rawContent;
@@ -215,12 +219,18 @@ export async function applyCorrection(
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/** The endpoint the SDK will contact (honors ANTHROPIC_BASE_URL, e.g. a LAN/tailnet gateway). */
+function anthropicBaseUrl(): string {
+  return process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+}
+
 /** Call the Claude API with a cached system preamble. */
 async function callClaude(
   detection: typeof errorDetections.$inferSelect,
   entryContext: string,
 ): Promise<{ suggestion: LlmSuggestion; rawContent: string }> {
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  // baseURL pinned to the exact URL the network policy just approved.
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, baseURL: anthropicBaseUrl() });
 
   // Stable accounting-system preamble — placed in a cached block so repeated
   // calls (e.g. analysing multiple errors in one session) share the cache hit.

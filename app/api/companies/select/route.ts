@@ -7,6 +7,7 @@ import { companies, userCompanies } from '@/lib/db/schema';
 import { and, eq } from 'drizzle-orm';
 import { getSessionUserId } from '@/lib/auth';
 import { COMPANY_COOKIE } from '@/lib/context';
+import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { stampLastOpened } from '../[id]/manage';
 
 export async function POST(req: NextRequest) {
@@ -38,7 +39,7 @@ export async function POST(req: NextRequest) {
   const res = NextResponse.json({ ok: true, company: c });
   res.cookies.set(COMPANY_COOKIE, companyId, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: cookieSecure(originFromHeaders(req.headers)),
     sameSite: 'lax',
     path: '/',
     maxAge: 60 * 60 * 24 * 365,
