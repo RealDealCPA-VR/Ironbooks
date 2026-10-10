@@ -56,3 +56,6 @@ scripts/launch-dev.cmd
 
 # NOTE: /drizzle (generated SQL migrations) IS tracked on purpose — it is the DB source of
 # truth and is bundled into the desktop build.
+
+# team worktrees
+/.wt/
