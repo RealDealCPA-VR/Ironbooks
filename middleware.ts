@@ -6,7 +6,9 @@ import type { NextRequest } from 'next/server';
  * verified in the Node runtime by lib/auth). Unauthenticated page requests are redirected to /login.
  * API routes are not gated here (the UI always carries the cookie; full checks live server-side).
  */
-const PUBLIC_PREFIXES = ['/login', '/signup', '/onboarding', '/reset-password'];
+// '/unlock' must be public: it renders before login (the file-password gate below skips it),
+// so the session gate must never bounce it to /login — that would loop on a fresh install.
+const PUBLIC_PREFIXES = ['/login', '/signup', '/onboarding', '/reset-password', '/unlock'];
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;

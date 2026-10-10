@@ -8,7 +8,7 @@
  */
 import { Scale } from 'lucide-react';
 import { Badge, Button, Card, Input, Label, PageHeader } from '@/components/ui';
-import { getServerContext } from '@/lib/context';
+import { getPageContext } from '@/lib/context';
 import { balanceSheetCashBasis, type BalanceSheetCashBasis } from '@/lib/services/balanceSheetCashBasis';
 import { formatCurrency, Money } from '@/lib/money';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
@@ -120,7 +120,7 @@ export default async function BalanceSheetCashPage({
 }: {
   searchParams: Promise<{ asOf?: string }>;
 }) {
-  const ctx = await getServerContext();
+  const ctx = await getPageContext('/reports/balance-sheet-cash');
   const params = await searchParams;
   const asOf = parseParamDate(params.asOf) ?? new Date();
   const asOfStr = toInputDate(asOf);

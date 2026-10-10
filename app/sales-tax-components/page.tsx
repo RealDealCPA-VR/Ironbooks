@@ -355,8 +355,8 @@ export default function SalesTaxComponentsPage() {
   const [loadingRates, setLoadingRates] = useState(true);
 
   // Load tax rates and agencies on mount. The two fetches are independent so a
-  // failed agencies lookup (no /api/tax-agencies route yet) must not discard the
-  // tax rates — agencies just degrade to "— None —" in the component editor.
+  // failed agencies lookup must not discard the tax rates — agencies just
+  // degrade to "— None —" in the component editor.
   useEffect(() => {
     api
       .get<TaxRate[]>('/api/tax-rates')
@@ -374,7 +374,7 @@ export default function SalesTaxComponentsPage() {
       .get<TaxAgency[]>('/api/tax-agencies')
       .then(setAgencies)
       .catch(() => {
-        // Non-fatal — the agency picker simply offers no agencies.
+        // Non-fatal — if the lookup fails the agency picker simply offers no agencies.
         setAgencies([]);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps

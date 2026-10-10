@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { BookOpen } from 'lucide-react';
 import { Badge, Button, Card, Input, Label, PageHeader, Table, Td, Th, Tr } from '@/components/ui';
-import { getServerContext } from '@/lib/context';
+import { getPageContext } from '@/lib/context';
 import { trialBalance } from '@/lib/services/reports';
 import { formatCurrency } from '@/lib/money';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
@@ -25,7 +25,7 @@ export default async function TrialBalancePage({
 }: {
   searchParams: Promise<{ asOf?: string }>;
 }) {
-  const ctx = await getServerContext();
+  const ctx = await getPageContext('/reports/trial-balance');
   const params = await searchParams;
   const asOf = parseParamDate(params.asOf) ?? new Date();
   const asOfStr = toInputDate(asOf);

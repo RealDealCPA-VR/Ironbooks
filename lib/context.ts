@@ -8,6 +8,7 @@
  *     company cookie if present.
  */
 import { cookies, headers } from 'next/headers';
+import { redirect } from 'next/navigation';
 import { and, eq } from 'drizzle-orm';
 import { getDb, type DB } from '@/lib/db';
 import { ensureDevCompany, verifyClosingDatePassword } from '@/lib/services/company';
@@ -57,6 +58,8 @@ export async function getServerContext(): Promise<ServiceContext> {
   // navigation is additionally redirected to /unlock by middleware for a friendly prompt.
   const lock = await getFileLockStatus(db);
   if (lock.enabled && !(await hasValidUnlockCookie())) {
+    // lib/client.ts isFileLockError and getPageContext below string-match this exact message —
+    // don't reword it without updating both.
     throw new ServiceError('FORBIDDEN', 'This company file is locked. Unlock it to continue.');
   }
 
@@ -117,4 +120,30 @@ export async function getServerContext(): Promise<ServiceContext> {
   // First-run/dev fallback acts as the company owner.
   const closingDateOverride = await resolveClosingDateOverride(db, fb.companyId);
   return { db, companyId: fb.companyId, userId: fb.userId, role: 'owner', closingDateOverride };
+}
+
+/**
+ * `getServerContext` for server-component pages. Middleware only checks cookie PRESENCE, so a
+ * present-but-invalid cookie (e.g. a stale bka_unlock cookie after an Electron relaunch, or an
+ * expired bka_session) reaches SSR, where the FORBIDDEN throw would land in the generic error
+ * boundary with no way to re-prompt. Client-component pages recover via lib/client.ts
+ * (isFileLockError → /unlock); this wrapper gives server-rendered pages the same friendly
+ * redirect to /unlock (file lock) or /login (auth), preserving the requested path in ?next=.
+ * Any other error is rethrown. Note redirect() throws NEXT_REDIRECT, so it must escape the catch.
+ */
+export async function getPageContext(nextPath: string): Promise<ServiceContext> {
+  try {
+    return await getServerContext();
+  } catch (err) {
+    if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
+      // Same message coupling as lib/client.ts isFileLockError — keep the three in sync.
+      if (/company file is locked/i.test(err.message)) {
+        redirect('/unlock?next=' + encodeURIComponent(nextPath));
+      }
+      if (err.message === 'Authentication required.') {
+        redirect('/login?next=' + encodeURIComponent(nextPath));
+      }
+    }
+    throw err;
+  }
 }

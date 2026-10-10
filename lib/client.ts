@@ -8,6 +8,9 @@
  * Pages can also register a window-level prompt (setClosingPasswordPrompt or
  * window.__bkaClosingPasswordPrompt); when a mutation fails with code PERIOD_CLOSED the client
  * invokes the prompt once and retries with the supplied password.
+ *
+ * File-lock handling: a 403 "company file is locked" response (stale unlock cookie after an
+ * app relaunch — see isFileLockError below) redirects the browser to /unlock before throwing.
  */
 export class ApiError extends Error {
   constructor(public status: number, message: string, public code?: string) {
@@ -50,11 +53,35 @@ function resolvePrompt(): ClosingPasswordPrompt | null {
   return null;
 }
 
+/**
+ * True when a failed response means the company file is locked. Coupled to the exact message
+ * getServerContext throws in lib/context.ts ("This company file is locked. Unlock it to
+ * continue.") — keep the two in sync.
+ */
+export function isFileLockError(status: number, message: string): boolean {
+  return status === 403 && /company file is locked/i.test(message);
+}
+
 async function handle<T>(res: Response): Promise<T> {
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
-    throw new ApiError(res.status, data?.error || res.statusText, data?.code);
+    const message = data?.error || res.statusText;
+    // Stale unlock cookie: after an app relaunch the 12h bka_unlock cookie is still present
+    // (so middleware's presence-only check renders pages) but its token no longer matches the
+    // fresh per-launch nonce, so EVERY API call 403s. Send the user back to /unlock to re-enter
+    // the file password instead of soft-locking them behind failing toasts. Still throw so
+    // callers' catch blocks run while the navigation proceeds.
+    if (
+      isFileLockError(res.status, message) &&
+      typeof window !== 'undefined' &&
+      window.location.pathname !== '/unlock'
+    ) {
+      window.location.assign(
+        '/unlock?next=' + encodeURIComponent(window.location.pathname + window.location.search),
+      );
+    }
+    throw new ApiError(res.status, message, data?.code);
   }
   return data as T;
 }

@@ -1,3 +1,8 @@
+> **⚠️ HISTORICAL DOCUMENT — December 2025 planning; do NOT follow these setup steps.**
+> The instructions below target a cloud Neon/NextAuth stack that was never built.
+> The app shipped instead as an offline **Electron + PGlite** desktop application.
+> For actual setup see [README.md](README.md) and [INSTALL.md](INSTALL.md); for the roadmap see [TODO.md](TODO.md).
+
 # Getting Started with BookKeeper AI
 
 ## 🎉 Welcome!

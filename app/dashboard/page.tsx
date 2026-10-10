@@ -14,7 +14,7 @@ import {
   TrendingUp,
   Wallet,
 } from 'lucide-react';
-import { getServerContext } from '@/lib/context';
+import { getPageContext } from '@/lib/context';
 import { getDashboardInsights, type DashboardInsights } from '@/lib/services/dashboard';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -34,7 +34,7 @@ const CHART = {
 } as const;
 
 export default async function DashboardPage() {
-  const ctx = await getServerContext();
+  const ctx = await getPageContext('/dashboard');
   // Single aggregated read model (also served as GET /api/dashboard). KPI cards keep
   // the fiscal-YTD scoping from lib/ytd.ts (settings.fiscalYearEnd; defaults Jan 1).
   const d = await getDashboardInsights(ctx);

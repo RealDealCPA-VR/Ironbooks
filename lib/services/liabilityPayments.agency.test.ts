@@ -5,17 +5,20 @@
  *    combined-rate components and nets payments stamped "tax_agency:<id>".
  *  - paySalesTax debits the agency's own liabilityAccountId when set, falling
  *    back to the company-wide 2200 otherwise.
+ *  - createTaxAgency rejects viewer contexts without persisting a row, and
+ *    rejects a liabilityAccountId owned by another company.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   companies,
   customers,
   invoices,
   journalEntryLines,
+  taxAgencies,
   users,
 } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
@@ -184,5 +187,40 @@ describe('Pay Sales Tax — per-agency liability tracking', () => {
     });
     expect(collectedOnly.totalCollected).toBe('80.00');
     expect(collectedOnly.totalPaid).toBe('0.00');
+  });
+
+  it('createTaxAgency rejects viewer contexts without persisting a row (RBAC choke-point)', async () => {
+    await expect(
+      createTaxAgency({ ...ctx, role: 'viewer' }, { name: 'Viewer Agency' }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+
+    // The 403 must not leave an orphaned agency behind.
+    const rows = await db
+      .select()
+      .from(taxAgencies)
+      .where(and(eq(taxAgencies.companyId, ctx.companyId), eq(taxAgencies.name, 'Viewer Agency')));
+    expect(rows).toHaveLength(0);
+  });
+
+  it("createTaxAgency rejects a liabilityAccountId owned by another company", async () => {
+    const [otherUser] = await db
+      .insert(users)
+      .values({ email: 'other-agency@test.local', name: 'Other Owner', passwordHash: 'x' })
+      .returning();
+    const [otherCompany] = await db
+      .insert(companies)
+      .values({ name: 'Other Agency Co', ownerId: otherUser.id })
+      .returning();
+    const otherCtx: ServiceContext = { db, companyId: otherCompany.id, userId: otherUser.id };
+    const foreign = await createAccount(otherCtx, {
+      code: '2290',
+      name: 'Foreign Sales Tax Payable',
+      type: 'liability' as never,
+      subtype: 'long_term_liability',
+    });
+
+    await expect(
+      createTaxAgency(ctx, { name: 'Cross-Tenant Agency', liabilityAccountId: foreign.id }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 });

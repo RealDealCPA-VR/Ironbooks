@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { Scale } from 'lucide-react';
 import { Badge, Button, Card, Input, Label, PageHeader } from '@/components/ui';
-import { getServerContext } from '@/lib/context';
+import { getPageContext } from '@/lib/context';
 import { balanceSheet } from '@/lib/services/reports';
 import { balanceSheetComparative } from '@/lib/services/reportsExtra';
 import { formatCurrency, Money } from '@/lib/money';
@@ -149,7 +149,7 @@ export default async function BalanceSheetPage({
 }: {
   searchParams: Promise<{ asOf?: string; compareTo?: string }>;
 }) {
-  const ctx = await getServerContext();
+  const ctx = await getPageContext('/reports/balance-sheet');
   const params = await searchParams;
 
   const asOf = parseParamDate(params.asOf) ?? new Date();

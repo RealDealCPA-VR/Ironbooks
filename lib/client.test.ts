@@ -5,14 +5,17 @@
  *  - a PERIOD_CLOSED failure triggers the registered prompt and retries once
  *  - a cancelled prompt (null) rethrows the original ApiError
  *  - GET/POST happy paths and ApiError mapping still behave as before
+ *  - isFileLockError recognizes the 403 file-lock message thrown by getServerContext
  *
- * global.fetch is stubbed with real Response objects (Node 18+).
+ * global.fetch is stubbed with real Response objects (Node 18+). These tests run in the node
+ * environment (no window), so the /unlock redirect side effect itself is not exercised here.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   api,
   ApiError,
   CLOSING_PASSWORD_HEADER,
+  isFileLockError,
   setClosingPasswordPrompt,
 } from '@/lib/client';
 
@@ -143,5 +146,19 @@ describe('api client', () => {
     expect(calls[0].init?.body).toBeUndefined();
     expect(headerOf(calls[0], 'content-type')).toBeUndefined();
     expect(headerOf(calls[0], 'x-test')).toBe('yes');
+  });
+});
+
+describe('isFileLockError', () => {
+  it('matches a 403 carrying the file-lock message from lib/context.ts', () => {
+    expect(isFileLockError(403, 'This company file is locked. Unlock it to continue.')).toBe(true);
+  });
+
+  it('is false for a 403 with an unrelated message', () => {
+    expect(isFileLockError(403, 'Authentication required.')).toBe(false);
+  });
+
+  it('is false for non-403 statuses even with a matching message', () => {
+    expect(isFileLockError(200, 'This company file is locked. Unlock it to continue.')).toBe(false);
   });
 });

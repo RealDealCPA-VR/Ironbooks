@@ -1,3 +1,8 @@
+> **⚠️ HISTORICAL DOCUMENT — December 2025 planning, NOT the current architecture.**
+> This spec describes a cloud SaaS design (Vercel/Neon, NextAuth, multi-tenant) that was never built.
+> The app shipped instead as an offline **Electron + PGlite** desktop application.
+> See [README.md](README.md) for the current architecture, [INSTALL.md](INSTALL.md) for setup, and [TODO.md](TODO.md) for the roadmap.
+
 # BookKeeper AI - White Label Accounting SaaS
 
 ## Project Overview

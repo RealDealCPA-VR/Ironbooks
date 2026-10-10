@@ -4,9 +4,9 @@
  * and a sales-tax liability summary.
  */
 import { and, eq, sql } from 'drizzle-orm';
-import { creditMemos, taxAgencies, taxRates, invoices } from '@/lib/db/schema';
+import { accounts, creditMemos, taxAgencies, taxRates, invoices } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 
 export async function listTaxAgencies(ctx: ServiceContext) {
   return ctx.db.select().from(taxAgencies).where(eq(taxAgencies.companyId, ctx.companyId));
@@ -17,16 +17,26 @@ export async function createTaxAgency(
   input: { name: string; liabilityAccountId?: string | null },
 ) {
   if (!input.name?.trim()) throw validation('Agency name is required.');
-  const [row] = await ctx.db
-    .insert(taxAgencies)
-    .values({
-      companyId: ctx.companyId,
-      name: input.name.trim(),
-      liabilityAccountId: input.liabilityAccountId ?? null,
-    })
-    .returning();
-  await writeAudit(ctx, { action: 'create', entityType: 'tax_agency', entityId: row.id, newValues: row });
-  return row;
+  // The liability account, when given, must belong to this company.
+  if (input.liabilityAccountId) {
+    const [acct] = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(eq(accounts.id, input.liabilityAccountId), eq(accounts.companyId, ctx.companyId)));
+    if (!acct) throw notFound('Liability account');
+  }
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .insert(taxAgencies)
+      .values({
+        companyId: tx.companyId,
+        name: input.name.trim(),
+        liabilityAccountId: input.liabilityAccountId ?? null,
+      })
+      .returning();
+    await writeAudit(tx, { action: 'create', entityType: 'tax_agency', entityId: row.id, newValues: row });
+    return row;
+  });
 }
 
 export async function listTaxRates(ctx: ServiceContext, opts?: { includeInactive?: boolean }) {

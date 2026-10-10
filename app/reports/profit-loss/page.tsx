@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { BarChart2 } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, Select } from '@/components/ui';
-import { getServerContext } from '@/lib/context';
+import { getPageContext } from '@/lib/context';
 import { profitAndLoss } from '@/lib/services/reports';
 import { listClasses } from '@/lib/services/dimensions';
 import { getCompany } from '@/lib/services/company';
@@ -77,7 +77,7 @@ export default async function ProfitLossPage({
 }: {
   searchParams: Promise<{ from?: string; to?: string; classId?: string }>;
 }) {
-  const ctx = await getServerContext();
+  const ctx = await getPageContext('/reports/profit-loss');
   const params = await searchParams;
 
   // Default to the company's fiscal year-to-date (settings.fiscalYearEnd, else Jan 1).
