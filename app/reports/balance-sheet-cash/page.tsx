@@ -131,7 +131,7 @@ export default async function BalanceSheetCashPage({
     {
       accountId: 're',
       code: '3900',
-      name: 'Net Income / Retained Earnings',
+      name: 'Net Income / Retained Earnings (cash basis)',
       amount: bs.retainedEarnings,
     },
   ];
@@ -183,8 +183,8 @@ export default async function BalanceSheetCashPage({
           </span>
         )}
         <span className="text-xs text-navy/40">
-          AR (1200) and AP (2000) excluded — equity adjusted by{' '}
-          {formatCurrency(bs.adjustments.equityAdjustment)}
+          Accounts receivable &amp; payable excluded — earnings reduced by{' '}
+          {formatCurrency(bs.adjustments.equityAdjustment)} not yet received/paid in cash
         </span>
       </div>
 

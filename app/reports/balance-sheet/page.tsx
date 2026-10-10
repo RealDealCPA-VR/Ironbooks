@@ -37,8 +37,8 @@ function Group({ title, lines, total, asOfQs }: { title: string; lines: Line[]; 
         </td>
       </tr>
       {lines.map((l) => {
-        // The synthetic Retained Earnings line has no real account to drill into.
-        const linkable = l.accountId !== 're';
+        // The synthetic Retained Earnings / Net Income lines have no real account to drill into.
+        const linkable = l.accountId !== 're' && l.accountId !== 're-prior';
         return (
           <tr key={l.accountId} className="border-b border-slate-100 hover:bg-electric/5">
             <td className="py-2 px-3 pl-8">
@@ -268,9 +268,14 @@ export default async function BalanceSheetPage({
 
   // ---- Standard single-date mode ----
   const bs = await balanceSheet(ctx, asOf);
+  // QB presentation: unclosed prior-year earnings as "Retained Earnings", this fiscal year's
+  // earnings as "Net Income" — both derived from the same posted rows as every other line.
   const equityLines = [
     ...bs.equity,
-    { accountId: 're', code: '3900', name: 'Net Income / Retained Earnings', amount: bs.retainedEarnings },
+    ...(Money.isZero(bs.priorYearsEarnings)
+      ? []
+      : [{ accountId: 're-prior', code: '3900', name: 'Retained Earnings', amount: bs.priorYearsEarnings }]),
+    { accountId: 're', code: '3999', name: 'Net Income', amount: bs.currentYearNetIncome },
   ];
 
   const exportTable: ExportTable = {

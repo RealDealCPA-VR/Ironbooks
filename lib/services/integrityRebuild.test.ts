@@ -10,7 +10,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   accounts,
@@ -79,11 +79,17 @@ describe('integrity — Rebuild Data', () => {
   // -------------------------------------------------------------------------
 
   it('account_balances: preview reports drift without writing, apply repairs it', async () => {
-    // Corrupt the cached balance (GL says 500.00).
-    await db
-      .update(accounts)
-      .set({ balance: '123.45' })
-      .where(eq(accounts.id, acct['1000']));
+    // Since 0017 the database refuses a corrupted cached balance outright…
+    await expect(
+      db.update(accounts).set({ balance: '123.45' }).where(eq(accounts.id, acct['1000'])),
+    ).rejects.toThrow(/derived from the ledger/);
+
+    // …so simulate LEGACY drift (a file written before the guard existed) by bypassing
+    // triggers for one transaction (replica mode — test-only; the app never does this).
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL session_replication_role = replica`);
+      await tx.update(accounts).set({ balance: '123.45' }).where(eq(accounts.id, acct['1000']));
+    });
 
     const preview = await previewRebuild(ctx, 'account_balances');
     expect(preview.count).toBe(1);

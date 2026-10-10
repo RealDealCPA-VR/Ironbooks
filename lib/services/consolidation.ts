@@ -13,6 +13,7 @@ import { profitAndLoss, balanceSheet } from '@/lib/services/reports';
 import type { ProfitAndLoss, BalanceSheet } from '@/lib/services/reports';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { assertBalanceSheetBalanced } from './ledgerAssert';
 
 // ---------------------------------------------------------------------------
 // Per-company wrapper types
@@ -126,6 +127,8 @@ export async function consolidatedBalanceSheet(
   let totalLiabilities = Money.zero();
   let totalEquity = Money.zero();
   let totalRetainedEarnings = Money.zero();
+  let totalPriorYears = Money.zero();
+  let totalCurrentYear = Money.zero();
 
   for (const c of companies) {
     totalAssets = totalAssets.plus(Money.of(c.report.totalAssets));
@@ -133,7 +136,11 @@ export async function consolidatedBalanceSheet(
     // totalEquity from balanceSheet already includes retained earnings (see reports.ts).
     totalEquity = totalEquity.plus(Money.of(c.report.totalEquity));
     totalRetainedEarnings = totalRetainedEarnings.plus(Money.of(c.report.retainedEarnings));
+    totalPriorYears = totalPriorYears.plus(Money.of(c.report.priorYearsEarnings));
+    totalCurrentYear = totalCurrentYear.plus(Money.of(c.report.currentYearNetIncome));
   }
+  // Each company's sheet already balances (asserted in balanceSheet), so the sum must too.
+  assertBalanceSheetBalanced('Consolidated balance sheet', totalAssets, totalLiabilities, totalEquity);
 
   const consolidated: BalanceSheet = {
     assets: [],
@@ -143,7 +150,9 @@ export async function consolidatedBalanceSheet(
     totalLiabilities: toAmountString(totalLiabilities),
     totalEquity: toAmountString(totalEquity),
     retainedEarnings: toAmountString(totalRetainedEarnings),
-    balanced: Money.equalWithinCent(totalAssets, totalLiabilities.plus(totalEquity)),
+    priorYearsEarnings: toAmountString(totalPriorYears),
+    currentYearNetIncome: toAmountString(totalCurrentYear),
+    balanced: Money.eq(totalAssets, totalLiabilities.plus(totalEquity)),
     asOf: asOf?.toISOString(),
   };
 

@@ -14,7 +14,7 @@
  * reference the correct A/R / A/P accounts; only the customer/vendor FK on the
  * sub-ledger documents is updated. The GL and trial balance remain balanced.
  */
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import {
   customers,
   vendors,
@@ -35,7 +35,6 @@ import {
   timeEntries,
   mileageLogs,
   accounts,
-  journalEntries,
   journalEntryLines,
   bankAccounts,
   items,
@@ -58,7 +57,7 @@ import {
 } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, inTransaction, writeAudit } from './_base';
-import { balanceDelta } from './posting';
+import { allowLedgerRewrite } from './posting';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -406,8 +405,10 @@ export interface MergeAccountsResult {
  * an account FK — the journal lines themselves (the GL history), item account
  * mappings, bank-account links, bank rules, budgets, document lines, transfers,
  * fixed-asset mappings, tax agencies, and accountIds embedded in recurring
- * templates / memorized-report configs — then recomputes the survivor's cached
- * balance from the posted ledger, zeroes + deactivates the source, and audits.
+ * templates / memorized-report configs — then deactivates the source and audits.
+ * Cached balances follow the re-pointed lines automatically (DB trigger, see
+ * drizzle/0017_team_ledger.sql): the survivor ends with the full ledger balance
+ * and the source with zero.
  *
  * Tenancy note: several line tables (journal_entry_lines, invoice_lines, …)
  * have no companyId column. `fromId` is a UUID primary key verified above to
@@ -450,6 +451,9 @@ export async function mergeAccounts(
     };
 
     // --- The GL itself: journal entry lines (posted, draft AND void history). ---
+    // Re-pointing lines of posted entries is a sanctioned ledger rewrite (same-type accounts,
+    // so every entry stays balanced; the DB trigger moves the balance with the lines).
+    await allowLedgerRewrite(tx, 'merge');
     await count(
       'journalEntryLines',
       tx.db
@@ -739,34 +743,18 @@ export async function mergeAccounts(
     }
     reassigned['memorizedReports'] = memorizedCount;
 
-    // --- Recompute the survivor's cached balance from the posted ledger (the
-    // authoritative source the posting engine maintains it from), and zero +
-    // deactivate the source — its entire ledger history now lives on the survivor. ---
-    const [sums] = await tx.db
-      .select({
-        debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
-        credit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
-      })
-      .from(journalEntryLines)
-      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-      .where(
-        and(
-          eq(journalEntryLines.accountId, toId),
-          eq(journalEntries.companyId, tx.companyId),
-          eq(journalEntries.status, 'posted'),
-        ),
-      );
-    const newBalance = toAmountString(
-      balanceDelta(toRow.type, sums?.debit ?? 0, sums?.credit ?? 0),
-    );
-    await tx.db
-      .update(accounts)
-      .set({ balance: newBalance, updatedAt: new Date() })
+    // --- Cached balances: the DB trigger already moved the balance along with the
+    // re-pointed lines (survivor = full ledger, source = 0). Read the survivor's
+    // balance back and deactivate the source — its history now lives on the survivor. ---
+    const [survivor] = await tx.db
+      .select({ balance: accounts.balance })
+      .from(accounts)
       .where(eq(accounts.id, toId));
+    const newBalance = toAmountString(survivor?.balance ?? 0);
 
     await tx.db
       .update(accounts)
-      .set({ balance: '0.00', isActive: false, updatedAt: new Date() })
+      .set({ isActive: false, updatedAt: new Date() })
       .where(eq(accounts.id, fromId));
 
     // Audit: deactivation of the source account.

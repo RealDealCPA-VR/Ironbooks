@@ -10,6 +10,10 @@
  *  2. Each account's cached `balance` column matches the GL-derived balance.
  *  3. A/R control account (code 1200) balance equals sum of open invoices' balanceDue.
  *  4. No journal_entry_lines reference an account belonging to another company.
+ *  5. The database ledger guards (drizzle/0017_team_ledger.sql) are installed and enabled.
+ *
+ * `booksInBalance` is the live "Books in balance" status shown on the Integrity page: trial
+ * balance, accrual + cash-basis balance sheets, cached balances and the DB guards in one call.
  */
 import { randomUUID } from 'node:crypto';
 import { and, eq, inArray, isNull, ne, notInArray, sql } from 'drizzle-orm';
@@ -32,6 +36,9 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { ServiceError, inTransaction, writeAudit } from './_base';
+import { balanceSheetCashBasis } from './balanceSheetCashBasis';
+import { LedgerIntegrityError } from './ledgerAssert';
+import { balanceSheet, trialBalance } from './reports';
 
 export interface IntegrityCheck {
   name: string;
@@ -56,6 +63,7 @@ async function checkEntriesBalanced(ctx: ServiceContext): Promise<IntegrityCheck
   const rows = await ctx.db
     .select({
       entryId: journalEntryLines.journalEntryId,
+      lineCount: sql<number>`COUNT(*)::int`,
       totalDebit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
       totalCredit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
     })
@@ -71,7 +79,8 @@ async function checkEntriesBalanced(ctx: ServiceContext): Promise<IntegrityCheck
 
   const unbalanced: string[] = [];
   for (const row of rows) {
-    if (!Money.equalWithinCent(row.totalDebit, row.totalCredit)) {
+    // Exact: ledger amounts are 2dp, so any difference at all is an imbalance.
+    if (!Money.eq(row.totalDebit, row.totalCredit) || Number(row.lineCount) < 2) {
       unbalanced.push(row.entryId);
     }
   }
@@ -132,7 +141,7 @@ async function computeAccountBalanceDrifts(
     const debitNet = derivedDebit.minus(derivedCredit);
     // Natural balance: debit-normal types use debitNet, credit-normal use negated.
     const glBalance = DEBIT_NORMAL.has(acct.type) ? debitNet : debitNet.negated();
-    if (!Money.equalWithinCent(glBalance, acct.balance)) {
+    if (!Money.eq(glBalance, acct.balance)) {
       drifts.push({
         accountId: acct.id,
         code: acct.code,
@@ -252,9 +261,157 @@ export async function verifyIntegrity(ctx: ServiceContext): Promise<IntegrityRes
     checkCachedBalances(ctx),
     checkARControl(ctx),
     checkCrossCompanyLines(ctx),
+    checkLedgerGuards(ctx),
   ]);
 
   return { checks, allOk: checks.every((c) => c.ok) };
+}
+
+// ---------------------------------------------------------------------------
+// Check 5: the database-level ledger guards are installed and enabled.
+// ---------------------------------------------------------------------------
+
+/** Triggers installed by drizzle/0017_team_ledger.sql, keyed by name → what they guarantee. */
+export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
+  bka_jel_balanced: 'Posted entries must balance (checked at commit, lines)',
+  bka_je_balanced: 'Posted entries must balance (checked at commit, headers)',
+  bka_jel_guard: 'Posted journal lines are immutable',
+  bka_je_guard: 'Posted journal entries cannot be deleted, re-dated or un-voided',
+  bka_jel_sync_ins: 'Account balances follow new journal lines',
+  bka_jel_sync_upd: 'Account balances follow changed journal lines',
+  bka_jel_sync_del: 'Account balances follow removed journal lines',
+  bka_je_sync_upd: 'Account balances follow post / void transitions',
+  bka_accounts_guard: 'Account balances cannot be edited directly',
+};
+
+async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string[]; total: number }> {
+  // tgenabled 'D' = disabled; anything else fires in normal (origin) sessions.
+  const res = await ctx.db.execute(
+    sql`SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgenabled <> 'D' AND tgname LIKE 'bka%'`,
+  );
+  const rows = (res as unknown as { rows: Array<{ tgname: string }> }).rows ?? [];
+  const present = new Set(rows.map((r) => r.tgname));
+  const expected = Object.keys(LEDGER_GUARD_TRIGGERS);
+  return { missing: expected.filter((t) => !present.has(t)), total: expected.length };
+}
+
+async function checkLedgerGuards(ctx: ServiceContext): Promise<IntegrityCheck> {
+  const name = 'Database ledger guards active';
+  const { missing, total } = await ledgerGuardStatus(ctx);
+  if (missing.length === 0) {
+    return {
+      name,
+      ok: true,
+      detail: `All ${total} database guards are active: unbalanced or altered posted entries and hand-edited balances are refused.`,
+    };
+  }
+  return {
+    name,
+    ok: false,
+    detail: `${missing.length} database guard${missing.length === 1 ? ' is' : 's are'} missing or disabled: ${missing.join(', ')}. Reopen the company file to re-run migrations.`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Live "Books in balance" status
+// ---------------------------------------------------------------------------
+
+export interface BooksInBalanceSection {
+  ok: boolean;
+  /** Human-readable totals, e.g. "Debits 1,000.00 = Credits 1,000.00". */
+  detail: string;
+}
+
+export interface BooksInBalance {
+  inBalance: boolean;
+  checkedAt: string;
+  trialBalance: BooksInBalanceSection & { totalDebit: string; totalCredit: string };
+  balanceSheet: BooksInBalanceSection & { totalAssets: string; totalLiabilitiesAndEquity: string };
+  cashBasisBalanceSheet: BooksInBalanceSection & { totalAssets: string; totalLiabilitiesAndEquity: string };
+  accountBalances: BooksInBalanceSection & { drifted: number };
+  guards: BooksInBalanceSection & { missing: string[] };
+}
+
+/** Run a report; an INTEGRITY failure becomes a failed section instead of an exception. */
+async function safely<T>(fn: () => Promise<T>): Promise<{ value?: T; error?: string }> {
+  try {
+    return { value: await fn() };
+  } catch (err) {
+    if (err instanceof LedgerIntegrityError) return { error: err.message };
+    throw err;
+  }
+}
+
+/**
+ * The live "Books in balance" check: trial balance debits = credits, accrual and cash-basis
+ * balance sheets balance, every cached account balance equals its ledger-derived balance, and
+ * the database guards that make all of this impossible to break are in place.
+ */
+export async function booksInBalance(ctx: ServiceContext): Promise<BooksInBalance> {
+  const [tb, bs, cash, drifts, guards] = await Promise.all([
+    safely(() => trialBalance(ctx)),
+    safely(() => balanceSheet(ctx)),
+    safely(() => balanceSheetCashBasis(ctx)),
+    computeAccountBalanceDrifts(ctx),
+    ledgerGuardStatus(ctx),
+  ]);
+
+  const tbSection = tb.value
+    ? {
+        ok: tb.value.balanced,
+        detail: `Debits ${tb.value.totalDebit} = Credits ${tb.value.totalCredit}`,
+        totalDebit: tb.value.totalDebit,
+        totalCredit: tb.value.totalCredit,
+      }
+    : { ok: false, detail: tb.error ?? 'Trial balance failed', totalDebit: '', totalCredit: '' };
+
+  const bsSection = bs.value
+    ? {
+        ok: bs.value.balanced,
+        detail: `Assets ${bs.value.totalAssets} = Liabilities + Equity ${toAmountString(
+          Money.add(bs.value.totalLiabilities, bs.value.totalEquity),
+        )}`,
+        totalAssets: bs.value.totalAssets,
+        totalLiabilitiesAndEquity: toAmountString(Money.add(bs.value.totalLiabilities, bs.value.totalEquity)),
+      }
+    : { ok: false, detail: bs.error ?? 'Balance sheet failed', totalAssets: '', totalLiabilitiesAndEquity: '' };
+
+  const cashSection = cash.value
+    ? {
+        ok: cash.value.balanced,
+        detail: `Assets ${cash.value.totals.totalAssets} = Liabilities + Equity ${cash.value.totals.totalLiabilitiesAndEquity}`,
+        totalAssets: cash.value.totals.totalAssets,
+        totalLiabilitiesAndEquity: cash.value.totals.totalLiabilitiesAndEquity,
+      }
+    : { ok: false, detail: cash.error ?? 'Cash-basis balance sheet failed', totalAssets: '', totalLiabilitiesAndEquity: '' };
+
+  const balSection = {
+    ok: drifts.length === 0,
+    detail:
+      drifts.length === 0
+        ? 'Every account balance equals the sum of its posted journal lines.'
+        : `${drifts.length} account balance${drifts.length === 1 ? '' : 's'} differ from the ledger.`,
+    drifted: drifts.length,
+  };
+
+  const guardSection = {
+    ok: guards.missing.length === 0,
+    detail:
+      guards.missing.length === 0
+        ? `All ${guards.total} database guards active.`
+        : `Missing or disabled: ${guards.missing.join(', ')}.`,
+    missing: guards.missing,
+  };
+
+  return {
+    inBalance: tbSection.ok && bsSection.ok && cashSection.ok && balSection.ok && guardSection.ok,
+    checkedAt: new Date().toISOString(),
+    trialBalance: tbSection,
+    balanceSheet: bsSection,
+    cashBasisBalanceSheet: cashSection,
+    accountBalances: balSection,
+    guards: guardSection,
+  };
 }
 
 // ===========================================================================
