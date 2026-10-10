@@ -11,6 +11,7 @@
  */
 import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
+import { logTransaction } from './transactionLog';
 
 export interface ServiceContext {
   db: DB;
@@ -68,7 +69,11 @@ function assertNotViewer(ctx: ServiceContext): void {
   }
 }
 
-/** Record a mutation in the audit trail. Call inside the same transaction as the mutation. */
+/**
+ * Record a mutation in the audit trail. Call inside the same transaction as the mutation.
+ * Also queues the change for the running transaction log (transactions.bktlg), which is
+ * appended only after the enclosing transaction commits (see lib/services/transactionLog.ts).
+ */
 export async function writeAudit(
   ctx: ServiceContext,
   params: {
@@ -90,6 +95,18 @@ export async function writeAudit(
     oldValues: params.oldValues ?? null,
     newValues: params.newValues ?? null,
     llmReasoning: params.llmReasoning ?? null,
+  });
+  await logTransaction(ctx.db, {
+    companyId: ctx.companyId,
+    userId: ctx.userId,
+    action: params.action,
+    entityType: params.entityType,
+    entityId: params.entityId,
+    data: {
+      old: params.oldValues ?? null,
+      new: params.newValues ?? null,
+      ...(params.llmReasoning ? { llmReasoning: params.llmReasoning } : {}),
+    },
   });
 }
 

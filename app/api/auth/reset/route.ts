@@ -7,6 +7,7 @@ import { and, eq, gt } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { hashPassword } from '@/lib/auth';
+import { logTransaction } from '@/lib/services/transactionLog';
 
 export async function POST(req: NextRequest) {
   const { token, password } = await req.json();
@@ -28,5 +29,14 @@ export async function POST(req: NextRequest) {
     .update(users)
     .set({ passwordHash: await hashPassword(password), resetToken: null, resetExpires: null })
     .where(eq(users.id, user.id));
+  // Running transaction log: user/security changes are logged (never the password itself).
+  await logTransaction(db, {
+    userId: user.id,
+    action: 'update',
+    entityType: 'user',
+    entityId: user.id,
+    summary: `Reset the password for user "${user.name}"`,
+    data: { new: { email: user.email, passwordChanged: true } },
+  });
   return NextResponse.json({ ok: true });
 }

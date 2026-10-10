@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { FolderOpen, FilePlus2, Lock, Unlock, HardDrive } from 'lucide-react';
 import { Button, Card, Input, Label, Modal, PageHeader, Badge, toast } from '@/components/ui';
+import ShareCompanyFileCard from './ShareCompanyFileCard';
 
 interface CurrentFile {
   dir: string;
@@ -121,6 +122,9 @@ export default function CompanyFilePage() {
           )}
         </Card>
       )}
+
+      {/* Portable company file, shareable ledger, transaction log. */}
+      <ShareCompanyFileCard />
 
       {/* Password protection — works in every build; enforced server-side. */}
       <Card className="p-6">

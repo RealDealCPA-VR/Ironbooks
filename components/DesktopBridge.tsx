@@ -8,6 +8,8 @@
  *  - File > Import Bank File -> /banking (import flow lives there)
  *  - File > Backup Company   -> /backup
  *  - File > New/Open Company -> /companies (company management/switcher)
+ *  - File > Create Portable Company File / Export Shareable Ledger -> fetch + native Save
+ *  - File > View Transaction Log -> /transaction-log
  *  - auto-updater 'update-ready' -> an actionable "Restart & install now" banner
  *
  * Renders nothing in the browser (window.bookkeeper is absent outside Electron) and
@@ -17,6 +19,7 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { RefreshCw, X } from 'lucide-react';
 import { Button, toast } from '@/components/ui';
+import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
 
 type Unsubscribe = (() => void) | void;
 interface DesktopBridgeApi {
@@ -35,6 +38,14 @@ function bridge(): DesktopBridgeApi | undefined {
 const MENU_ROUTES: Record<string, string> = {
   import: '/banking',
   backup: '/backup',
+  'transaction-log': '/transaction-log',
+};
+
+/** File-menu exports that fetch from the local server (with the session) and save natively. */
+const MENU_EXPORTS: Record<string, { run: () => Promise<string | null>; done: string }> = {
+  'portable-create': { run: savePortableCompanyFile, done: 'Portable company file saved' },
+  'shareable-xlsx': { run: () => saveShareableLedger('xlsx'), done: 'Shareable ledger (Excel) saved' },
+  'shareable-pdf': { run: () => saveShareableLedger('pdf'), done: 'Shareable ledger (PDF) saved' },
 };
 
 export default function DesktopBridge() {
@@ -59,6 +70,15 @@ export default function DesktopBridge() {
       }
       if (action === 'open-company') {
         b.company?.open?.();
+        return;
+      }
+      const exp = MENU_EXPORTS[action];
+      if (exp) {
+        toast('Preparing the file…', 'info');
+        exp
+          .run()
+          .then((saved) => saved && toast(`${exp.done}: ${saved}`, 'success'))
+          .catch((err) => toast(err instanceof Error ? err.message : 'Export failed.', 'danger'));
         return;
       }
       const route = MENU_ROUTES[action];

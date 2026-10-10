@@ -5,6 +5,7 @@ import { getDb } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { getSessionUserId } from '@/lib/auth';
 import { verifyTotp } from '@/lib/totp';
+import { logTransaction } from '@/lib/services/transactionLog';
 
 export async function POST(req: NextRequest) {
   const userId = await getSessionUserId();
@@ -19,5 +20,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid code', code: 'FORBIDDEN' }, { status: 400 });
   }
   await db.update(users).set({ totpEnabled: true }).where(eq(users.id, userId));
+  await logTransaction(db, {
+    userId,
+    action: 'update',
+    entityType: 'user',
+    entityId: userId,
+    summary: `Turned on two-factor sign-in for user "${user.name}"`,
+    data: { old: { totpEnabled: false }, new: { totpEnabled: true } },
+  });
   return NextResponse.json({ ok: true, enabled: true });
 }

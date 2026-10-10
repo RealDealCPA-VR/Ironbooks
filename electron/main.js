@@ -23,6 +23,8 @@ let serverUrl = null;
 let quittingAfterBackup = false;
 /** A .bka file the OS asked us to open (double-click / "Open with" / argv). */
 let pendingBkaPath = null;
+/** A .bkp portable company file the OS asked us to open. */
+let pendingBkpPath = null;
 
 // Per-launch secret shared with the local Next server so the main process can make
 // authenticated "system" calls (e.g. the launch-time recurring run). The server is bound to
@@ -64,8 +66,35 @@ function deliverPendingBka() {
 
 pendingBkaPath = extractBkaPath(process.argv);
 
+// .bkp (Portable Company File) association: same OS entry points as .bka, but the file is
+// restored into a NEW company file (see openPortableFlow) instead of the backup page.
+function extractBkpPath(argv) {
+  for (const arg of argv.slice(1)) {
+    if (typeof arg === 'string' && !arg.startsWith('-') && arg.toLowerCase().endsWith('.bkp')) {
+      return arg;
+    }
+  }
+  return null;
+}
+
+function deliverPendingBkp() {
+  if (!pendingBkpPath || !mainWindow) return;
+  const filePath = pendingBkpPath;
+  pendingBkpPath = null;
+  openPortableFlow(filePath);
+}
+
+pendingBkpPath = extractBkpPath(process.argv);
+
 app.on('open-file', (event, filePath) => {
-  if (!filePath || !filePath.toLowerCase().endsWith('.bka')) return;
+  const lower = (filePath || '').toLowerCase();
+  if (lower.endsWith('.bkp')) {
+    event.preventDefault();
+    pendingBkpPath = filePath;
+    deliverPendingBkp();
+    return;
+  }
+  if (!filePath || !lower.endsWith('.bka')) return;
   event.preventDefault();
   pendingBkaPath = filePath;
   deliverPendingBka();
@@ -398,6 +427,86 @@ async function openCompanyFlow() {
   openCompanyDir(dir);
 }
 
+// Open/Restore Portable Company File: pick the .bkp (unless the OS handed us one), pick where
+// the NEW company file goes, have the local server restore + verify it (authenticated with the
+// per-launch internal token — the main process has no session), then offer to open it.
+// Entirely local: the file is read from disk and posted to 127.0.0.1.
+async function openPortableFlow(filePath) {
+  if (isDev) {
+    // `next dev` was not spawned by us and does not know the internal token — use the in-app
+    // upload flow on the Company File page instead.
+    navigate('/company-file?restore=portable');
+    return;
+  }
+  if (!filePath) {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Open Portable Company File',
+      filters: [{ name: 'BookKeeper Portable Company File', extensions: ['bkp'] }],
+      properties: ['openFile'],
+      defaultPath: app.getPath('documents'),
+    });
+    if (res.canceled || !res.filePaths[0]) return;
+    filePath = res.filePaths[0];
+  }
+  let bytes;
+  try {
+    bytes = fs.readFileSync(filePath);
+  } catch (e) {
+    dialog.showErrorBox('Could not read the portable company file', String((e && e.message) || e));
+    return;
+  }
+  const base = path.basename(filePath).replace(/\.bkp$/i, '');
+  const save = await dialog.showSaveDialog(mainWindow, {
+    title: 'Restore Portable Company File',
+    message: 'Choose a name and location for the restored company file',
+    buttonLabel: 'Restore',
+    defaultPath: path.join(app.getPath('documents'), `${base}.bookkeeper`),
+    filters: [{ name: 'BookKeeper Company', extensions: ['bookkeeper'] }],
+    properties: ['createDirectory', 'showOverwriteConfirmation'],
+  });
+  if (save.canceled || !save.filePath) return;
+  const target = save.filePath;
+  try {
+    if (fs.existsSync(target) && fs.readdirSync(target).length > 0) {
+      dialog.showErrorBox(
+        'Folder not empty',
+        'That location already contains files. Choose a new name or an empty folder for the restored company file.',
+      );
+      return;
+    }
+  } catch {
+    /* unreadable target — let the server report it */
+  }
+  try {
+    const res = await fetch(`${serverUrl}/api/portable/restore?target=${encodeURIComponent(target)}`, {
+      method: 'POST',
+      headers: { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' },
+      body: bytes,
+      signal: AbortSignal.timeout(30 * 60 * 1000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      dialog.showErrorBox('Could not open the portable company file', data.error || `HTTP ${res.status}`);
+      return;
+    }
+    rememberRecentCompany(target);
+    const choice = await dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      buttons: ['Open it now', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      message: `"${data.companyName}" was restored and verified.`,
+      detail:
+        `Location: ${target}\n\nEvery table, the trial balance, attachments and the transaction log ` +
+        'match the original file. Sign in with the user names and passwords from that file.',
+    });
+    if (choice.response === 0) openCompanyDir(target);
+    else buildMenu(); // refresh Recent Companies
+  } catch (e) {
+    dialog.showErrorBox('Could not open the portable company file', String((e && e.message) || e));
+  }
+}
+
 function buildMenu() {
   const cfg = loadConfig();
   const current = activeCompanyDir();
@@ -425,6 +534,17 @@ function buildMenu() {
         { type: 'separator' },
         { label: 'Import Bank File…', click: () => mainWindow?.webContents.send('menu', 'import') },
         { label: 'Backup Company…', click: () => mainWindow?.webContents.send('menu', 'backup') },
+        { type: 'separator' },
+        { label: 'Create Portable Company File…', click: () => mainWindow?.webContents.send('menu', 'portable-create') },
+        { label: 'Open/Restore Portable Company File…', click: () => { openPortableFlow(); } },
+        {
+          label: 'Export Shareable Ledger',
+          submenu: [
+            { label: 'Excel Workbook (.xlsx)…', click: () => mainWindow?.webContents.send('menu', 'shareable-xlsx') },
+            { label: 'PDF Summary (.pdf)…', click: () => mainWindow?.webContents.send('menu', 'shareable-pdf') },
+          ],
+        },
+        { label: 'View Transaction Log', click: () => navigate('/transaction-log') },
         { type: 'separator' },
         { role: 'quit' },
       ],
@@ -495,6 +615,7 @@ async function createWindow() {
   // Deliver a double-clicked .bka after the renderer has had a moment to mount the
   // DesktopBridge listener (loadURL resolves at load, React hydrates just after).
   if (pendingBkaPath) setTimeout(deliverPendingBka, 1200);
+  if (pendingBkpPath) setTimeout(deliverPendingBkp, 1200);
 }
 
 // Generate any due recurring/memorized transactions on launch (best-effort, but loudly logged).
@@ -538,6 +659,21 @@ ipcMain.handle('dialog:saveFile', async (_e, { defaultName, content }) => {
   return res.filePath;
 });
 
+// Binary save (portable company file, shareable ledger): native Save dialog with a file-type
+// filter; the renderer fetched the bytes from the local server with its session.
+ipcMain.handle('file:saveBytes', async (_e, opts) => {
+  const { defaultName, filters, data } = opts || {};
+  const res = await dialog.showSaveDialog(mainWindow, {
+    defaultPath: path.join(app.getPath('documents'), path.basename(String(defaultName || 'export'))),
+    filters: Array.isArray(filters) ? filters : [],
+  });
+  if (res.canceled || !res.filePath) return null;
+  fs.writeFileSync(res.filePath, Buffer.from(new Uint8Array(data)));
+  return res.filePath;
+});
+
+ipcMain.handle('portable:open', () => { openPortableFlow(); return true; });
+
 ipcMain.handle('app:dataDir', () => activeCompanyDir());
 
 // ---------------------------------------------------------------------------
@@ -579,6 +715,11 @@ app.on('second-instance', (_event, argv) => {
   if (bka) {
     pendingBkaPath = bka;
     deliverPendingBka();
+  }
+  const bkp = extractBkpPath(argv || []);
+  if (bkp) {
+    pendingBkpPath = bkp;
+    deliverPendingBkp();
   }
 });
 

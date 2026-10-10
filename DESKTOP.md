@@ -51,3 +51,12 @@ On boot the DB migrator runs `drizzle/` against the local company file.
 - Company files: `app.getPath('userData')/companies/<name>/` (one PGlite directory per company).
 - `BKA_DATA_DIR` overrides the active company dir (used by the main process + tests).
 - Backup/restore packages a company directory into a single `.bka` archive (see Phase 10).
+- Every committed change is appended to a hash-chained running transaction log,
+  `<company dir>/transactions.bktlg` (QB .TLG parity; File > View Transaction Log).
+- File > Create Portable Company File writes `<Company>.bkp` (QB .QBM parity): a checksummed
+  logical export of every table, attachments and the transaction log. Opening one (File menu or
+  double-click — `.bkp` is a registered file type) restores it into a NEW company folder and
+  refuses unless every table hash and trial balance matches the original.
+- File > Export Shareable Ledger writes an .xlsx workbook / PDF summary readable without the app.
+- Condense writes and verifies a full archive `.bka` (sibling `archives/` folder) first; the
+  Backup page lists these archive copies and can restore one.

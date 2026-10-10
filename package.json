@@ -92,6 +92,12 @@
         "name": "BookKeeper AI Company Backup",
         "description": "BookKeeper AI Company Backup",
         "role": "Editor"
+      },
+      {
+        "ext": "bkp",
+        "name": "BookKeeper AI Portable Company File",
+        "description": "BookKeeper AI Portable Company File",
+        "role": "Editor"
       }
     ],
     "files": [
