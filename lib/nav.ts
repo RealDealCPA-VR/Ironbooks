@@ -14,6 +14,7 @@ import {
   ListChecks, GitMerge, FileX, Clock, Timer, Boxes, Wallet, Percent, Combine,
   GitCompareArrows, CalendarRange, PackageSearch, Scale, BadgePercent, Car, HardDrive,
 } from 'lucide-react';
+import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -138,6 +139,7 @@ export const navGroups: NavGroup[] = [
       { icon: HardDrive, label: 'Company File', path: '/company-file' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security' },
       { icon: Settings, label: 'Settings', path: '/settings' },
+      { icon: Sparkles, label: 'AI & Automation', path: '/ai-settings' },
     ],
   },
 ];

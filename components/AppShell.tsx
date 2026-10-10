@@ -3,6 +3,7 @@ import * as React from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import CommandPalette from './CommandPalette';
+import AssistantPanel from './AssistantPanel';
 import { navGroups, paletteDestinations } from '@/lib/nav';
 import {
   AMOUNT_KEY_HELP,
@@ -12,7 +13,7 @@ import {
   isEditableTarget,
 } from '@/lib/shortcuts';
 import { Modal, toast } from '@/components/ui';
-import { Briefcase, Building2, ChevronDown, LogOut } from 'lucide-react';
+import { Briefcase, Building2, ChevronDown, LogOut, Sparkles } from 'lucide-react';
 
 // Routes that render without the app chrome (full-screen).
 const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock'];
@@ -282,6 +283,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() || '';
   const bare = BARE.some((p) => pathname === p || pathname.startsWith(p + '/'));
   const [company, setCompany] = React.useState<CompanyRow | null>(null);
+  const [assistantOpen, setAssistantOpen] = React.useState(false);
+  const closeAssistant = React.useCallback(() => setAssistantOpen(false), []);
 
   if (bare) return <>{children}</>;
 
@@ -354,11 +357,21 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       </aside>
       <main className="flex-1 flex flex-col min-w-0">
         <header className="flex items-center justify-end gap-3 px-6 pt-4 -mb-2">
+          <button
+            type="button"
+            onClick={() => setAssistantOpen(true)}
+            title="Ask about your books"
+            className="flex items-center gap-1.5 rounded-full bg-white border border-slate-200 px-3 py-1 text-sm font-semibold text-navy shadow-sm hover:border-electric/50 hover:text-electric transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+          >
+            <Sparkles className="h-4 w-4 text-electric" />
+            Ask AI
+          </button>
           <CompanyChip company={company} onCompany={setCompany} />
         </header>
         {children}
       </main>
       <CommandPalette />
+      <AssistantPanel open={assistantOpen} onClose={closeAssistant} />
       <GlobalShortcuts />
       <TitleSync company={company?.name ?? null} />
     </div>
