@@ -30,6 +30,8 @@ import { trialBalance } from './reports';
 import { createPurchaseOrder, getPurchaseOrder } from './purchaseOrders';
 import { voidBill, getBill } from './bills';
 import { createInvoice } from './invoices';
+import { createSalesReceipt } from './salesReceipts';
+import { physicalCount } from './inventoryOps';
 import { createItemReceipt, getItemReceipt, voidItemReceipt, ITEM_RECEIPT_ACCRUAL_CODE } from './itemReceipts';
 import {
   enterBillForReceivedItems,
@@ -368,5 +370,129 @@ describe('Enhanced receiving (QA)', () => {
     await expect(
       enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-06-07'), lines: [{ receiptLineId: l2, quantity: 1, unitCost: '0' }] }),
     ).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
+  // ---- QA re-test round 1 ----
+  async function freshItem(name: string) {
+    const [row] = await db
+      .insert(items)
+      .values({ companyId: ctx.companyId, name, type: 'inventory', salesPrice: '20.00', assetAccountId: acct['1300'], expenseAccountId: acct['5000'], quantityOnHand: '0', averageCost: '0' })
+      .returning();
+    return row;
+  }
+  async function receiveAndBill(name: string, day: string) {
+    const it0 = await freshItem(name);
+    const r = await createItemReceipt(ctx, { vendorId, date: new Date(`${day}T00:00:00Z`), lines: [{ itemId: it0.id, quantity: 10, unitCost: '5.00' }] });
+    const [l] = await lineIds(r.id);
+    const bill = await enterBillForReceivedItems(ctx, { vendorId, date: new Date(`${day}T00:00:00Z`), lines: [{ receiptLineId: l, quantity: 10, unitCost: '6.00' }] });
+    return { it0, r, bill };
+  }
+
+  it('re-test: original repro (sell 5 after a +10 variance) is refused and the failed void rolls back completely', async () => {
+    await updateReceivingSettings(ctx, { varianceMode: 'inventory' });
+    const { it0, bill } = await receiveAndBill('Retest repro', '2026-07-01');
+    await createInvoice(ctx, { customerId, date: new Date('2026-07-02'), lines: [{ itemId: it0.id, quantity: 5, rate: '20.00' }] });
+    const inv0 = await balanceOf('1300');
+    const ap0 = await balanceOf('2000');
+    const cogs0 = await balanceOf('5000');
+    const accr0 = await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE);
+    await expect(voidBill(ctx, bill.id)).rejects.toMatchObject({ code: 'CONFLICT' });
+    const b = await getBill(ctx, bill.id);
+    expect(b.status).not.toBe('void');
+    const row = await itemRow(it0.id);
+    expect(row.averageCost).toBe('6.0000');
+    expect(row.quantityOnHand).toBe('5.0000');
+    expect(await balanceOf('1300')).toBe(inv0);
+    expect(await balanceOf('2000')).toBe(ap0);
+    expect(await balanceOf('5000')).toBe(cogs0);
+    expect(await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE)).toBe(accr0);
+    await expectBalanced();
+  });
+
+  it('re-test: a SALES RECEIPT sale masked by a restock to the same quantity still blocks the void', async () => {
+    const { it0, bill } = await receiveAndBill('Retest SR', '2026-07-03');
+    await createSalesReceipt(ctx, { customerId, date: new Date('2026-07-04'), depositAccountId: acct['1000'], lines: [{ itemId: it0.id, quantity: 3, rate: '20.00' }] });
+    await createItemReceipt(ctx, { vendorId, date: new Date('2026-07-05'), lines: [{ itemId: it0.id, quantity: 3, unitCost: '6.00' }] });
+    expect((await itemRow(it0.id)).quantityOnHand).toBe('10.0000');
+    await expect(voidBill(ctx, bill.id)).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expectBalanced();
+  });
+
+  it('re-test: a physical-count SHRINKAGE masked by a restock still blocks the void', async () => {
+    const { it0, bill } = await receiveAndBill('Retest count', '2026-07-06');
+    await physicalCount(ctx, { itemId: it0.id, countedQty: 8, date: new Date('2026-07-07'), adjustmentAccountId: acct['5000'] });
+    await createItemReceipt(ctx, { vendorId, date: new Date('2026-07-08'), lines: [{ itemId: it0.id, quantity: 2, unitCost: '6.00' }] });
+    expect((await itemRow(it0.id)).quantityOnHand).toBe('10.0000');
+    await expect(voidBill(ctx, bill.id)).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expectBalanced();
+  });
+
+  it('re-test: void of an untouched average-cost variance bill restores receipt cost, accrual and AP exactly', async () => {
+    const accr0 = await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE);
+    const ap0 = await balanceOf('2000');
+    const inv0 = await balanceOf('1300');
+    const { it0, r, bill } = await receiveAndBill('Retest clean void', '2026-07-09');
+    expect((await itemRow(it0.id)).averageCost).toBe('6.0000');
+    await voidBill(ctx, bill.id);
+    expect((await itemRow(it0.id)).averageCost).toBe('5.0000');
+    // Accrual is a liability: 10 x 5.00 received and not billed again.
+    expect(Math.abs(Number(await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE)) - Number(accr0))).toBeCloseTo(50, 2);
+    expect(await balanceOf('2000')).toBe(ap0);
+    expect(Number(await balanceOf('1300')) - Number(inv0)).toBeCloseTo(50, 2);
+    expect((await getItemReceipt(ctx, r.id)).status).toBe('open');
+    await expectBalanced();
+  });
+
+  it('re-test: voiding a $0 write-off bill re-opens the receipt and restores accrual + item cost', async () => {
+    const it0 = await freshItem('Retest WO void');
+    const accr0 = await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE);
+    const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-07-10'), lines: [{ itemId: it0.id, quantity: 4, unitCost: '5.00' }] });
+    const accrAfterReceipt = await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE);
+    const [l] = await lineIds(r.id);
+    const bill = await enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-07-11'), lines: [{ receiptLineId: l, quantity: 0, unitCost: '5.00', closeLine: true }] });
+    expect(bill.total).toBe('0.00');
+    expect(await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE)).toBe(accr0);
+    await voidBill(ctx, bill.id);
+    expect((await getBill(ctx, bill.id)).status).toBe('void');
+    expect((await getItemReceipt(ctx, r.id)).status).toBe('open');
+    expect((await itemRow(it0.id)).averageCost).toBe('5.0000');
+    expect(await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE)).toBe(accrAfterReceipt);
+    // The receipt line is billable again afterwards.
+    const again = await enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-07-12'), lines: [{ receiptLineId: l, quantity: 4, unitCost: '5.00' }] });
+    expect(again.total).toBe('20.00');
+    expect(await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE)).toBe(accr0);
+    await expectBalanced();
+  });
+
+  it('re-test: write-off after part of the stock was sold splits the credit between inventory and COGS', async () => {
+    const it0 = await freshItem('Retest WO sold');
+    const inv0 = await balanceOf('1300');
+    const cogs0 = await balanceOf('5000');
+    const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-07-13'), lines: [{ itemId: it0.id, quantity: 4, unitCost: '5.00' }] });
+    await createInvoice(ctx, { customerId, date: new Date('2026-07-14'), lines: [{ itemId: it0.id, quantity: 2, rate: '20.00' }] });
+    const [l] = await lineIds(r.id);
+    await enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-07-15'), lines: [{ receiptLineId: l, quantity: 0, unitCost: '5.00', closeLine: true }] });
+    // +20 received, -10 sold, -10 write-off on the 2 on hand -> inventory back to start; COGS +10 -10.
+    expect(await balanceOf('1300')).toBe(inv0);
+    expect(await balanceOf('5000')).toBe(cogs0);
+    const row = await itemRow(it0.id);
+    expect(row.quantityOnHand).toBe('2.0000');
+    expect(row.averageCost).toBe('0.0000');
+    await expectBalanced();
+  });
+
+  it('re-test: a write-off with negative quantity or on a foreign line is rejected', async () => {
+    const it0 = await freshItem('Retest WO bad');
+    const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-07-16'), lines: [{ itemId: it0.id, quantity: 4, unitCost: '5.00' }] });
+    const [l] = await lineIds(r.id);
+    const bills0 = await billCount();
+    await expect(
+      enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-07-16'), lines: [{ receiptLineId: l, quantity: -1, unitCost: '5.00', closeLine: true }] }),
+    ).rejects.toBeTruthy();
+    await expect(
+      enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-07-16'), lines: [{ receiptLineId: foreignLine, quantity: 0, unitCost: '9.00', closeLine: true }] }),
+    ).rejects.toBeTruthy();
+    expect(await billCount()).toBe(bills0);
+    await expectBalanced();
   });
 });

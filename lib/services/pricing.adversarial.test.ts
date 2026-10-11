@@ -503,4 +503,140 @@ describe('Advanced pricing (QA) — integration', () => {
     expect(row.name).toBe('Keep me');
     await deletePriceRule(ctx, r.id);
   });
+
+  // ---- QA re-test round 1 ----
+  it('re-test: a level with explicit rounding "none" is NOT rounded by the company default', async () => {
+    await updatePricingSettings(ctx, { defaultRounding: 'nearest_1.00' });
+    const level = await createPriceLevel(ctx, { name: 'Minus 5 exact', type: 'fixed_percent', percent: '-5', rounding: 'none' });
+    await assignCustomerPricing(ctx, ids.bob, { priceLevelId: level.id });
+    try {
+      const [quote] = await quotePrices(ctx, { customerId: ids.bob, date: d() }, [{ itemId: ids.widget, quantity: 1 }]);
+      expect(quote.source).toBe('price_level');
+      expect(quote.price).toBe('31.66');
+    } finally {
+      await assignCustomerPricing(ctx, ids.bob, { priceLevelId: null });
+      await deletePriceLevel(ctx, level.id);
+      await updatePricingSettings(ctx, { defaultRounding: 'none' });
+    }
+  });
+
+  it('re-test: clearing a level rounding back to null reverts it to the company default', async () => {
+    await updatePricingSettings(ctx, { defaultRounding: 'nearest_1.00' });
+    const level = await createPriceLevel(ctx, { name: 'Minus 5 nickel', type: 'fixed_percent', percent: '-5', rounding: 'nearest_0.05' });
+    await assignCustomerPricing(ctx, ids.bob, { priceLevelId: level.id });
+    try {
+      let [quote] = await quotePrices(ctx, { customerId: ids.bob, date: d() }, [{ itemId: ids.widget, quantity: 1 }]);
+      expect(quote.price).toBe('31.65'); // 31.6635 -> nearest .05
+      await updatePriceLevel(ctx, level.id, { name: 'Minus 5 nickel', type: 'fixed_percent', percent: '-5', rounding: null });
+      const [row] = await db.select().from(priceLevels).where(eq(priceLevels.id, level.id));
+      expect(row.rounding).toBeNull();
+      [quote] = await quotePrices(ctx, { customerId: ids.bob, date: d() }, [{ itemId: ids.widget, quantity: 1 }]);
+      expect(quote.price).toBe('32.00');
+      // An unknown rounding string is still rejected.
+      await expect(
+        updatePriceLevel(ctx, level.id, { name: 'Minus 5 nickel', type: 'fixed_percent', percent: '-5', rounding: 'nearest_0.07' as never }),
+      ).rejects.toMatchObject({ code: 'VALIDATION' });
+    } finally {
+      await assignCustomerPricing(ctx, ids.bob, { priceLevelId: null });
+      await deletePriceLevel(ctx, level.id);
+      await updatePricingSettings(ctx, { defaultRounding: 'none' });
+    }
+  });
+
+  it('re-test: invoicing a no-cost item under a matching cost-plus rule bills base price, not $0, and balances', async () => {
+    const [noCost] = await db
+      .insert(items)
+      .values({ companyId: ctx.companyId, name: 'NoCost service', type: 'service', salesPrice: '100.00' })
+      .returning();
+    const r = await createPriceRule(ctx, {
+      name: 'NoCost cost-plus',
+      conditions: { itemIds: [noCost.id] },
+      adjustment: { basis: 'cost', method: 'percent', direction: 'increase', value: '20' },
+    });
+    try {
+      const [q] = await quotePrices(ctx, { customerId: ids.bob, date: d() }, [{ itemId: noCost.id, quantity: 2 }]);
+      expect(q.price).toBe('100.00');
+      expect(q.source).toBe('base');
+      const inv = await createInvoice(ctx, { customerId: ids.bob, date: d(), lines: [{ itemId: noCost.id, quantity: 2 }] });
+      expect(inv.total).toBe('200.00');
+      const [l] = await db.select().from(invoiceLines).where(eq(invoiceLines.invoiceId, inv.id));
+      expect(Number(l.rate).toFixed(2)).toBe('100.00');
+      const applied = l.pricing as unknown as AppliedPricing | null;
+      if (applied) expect(applied.overridden).toBe(false);
+      // A client that types a different price is treated as an override (allowed), and flagged.
+      const inv0 = await createInvoice(ctx, { customerId: ids.bob, date: d(), lines: [{ itemId: noCost.id, quantity: 1, rate: '50' }] });
+      const [l0] = await db.select().from(invoiceLines).where(eq(invoiceLines.invoiceId, inv0.id));
+      expect((l0.pricing as unknown as AppliedPricing).overridden).toBe(true);
+      expect((await trialBalance(ctx)).balanced).toBe(true);
+    } finally {
+      await deletePriceRule(ctx, r.id);
+    }
+  });
+
+  it('re-test: type cycle check terminates on pre-existing corrupt data and still rejects self-parenting', async () => {
+    const [x] = await db.insert(customerTypes).values({ companyId: ctx.companyId, name: 'Corrupt X' }).returning();
+    const [y] = await db.insert(customerTypes).values({ companyId: ctx.companyId, name: 'Corrupt Y', parentId: x.id }).returning();
+    await db.update(customerTypes).set({ parentId: y.id }).where(eq(customerTypes.id, x.id)); // X <-> Y already cyclic
+    const z = await createType(ctx, 'customer', { name: 'Corrupt Z' });
+    // Must finish (no infinite loop); Z is not in the X/Y cycle so placing it under X is allowed.
+    await expect(updateType(ctx, 'customer', z.id, { name: 'Corrupt Z', parentId: x.id })).resolves.toMatchObject({ parentId: x.id });
+    await expect(updateType(ctx, 'customer', z.id, { name: 'Corrupt Z', parentId: z.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // A four-deep chain: root cannot go under its great-grandchild.
+    const a = await createType(ctx, 'customer', { name: 'Deep A' });
+    const b = await createType(ctx, 'customer', { name: 'Deep B', parentId: a.id });
+    const c = await createType(ctx, 'customer', { name: 'Deep C', parentId: b.id });
+    const e = await createType(ctx, 'customer', { name: 'Deep D', parentId: c.id });
+    await expect(updateType(ctx, 'customer', a.id, { name: 'Deep A', parentId: e.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(updateType(ctx, 'customer', b.id, { name: 'Deep B', parentId: e.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // Moving a leaf to the root (no parent) is fine.
+    await expect(updateType(ctx, 'customer', e.id, { name: 'Deep D', parentId: null })).resolves.toMatchObject({ parentId: null });
+  });
+});
+
+describe('Advanced pricing (QA) — re-test round 1, pure engine', () => {
+  const noCostItem: EngineItem = { id: 'i1', type: 'service', salesPrice: '100.00', cost: null, customFields: null };
+
+  it('priority mode: a top-priority cost rule on a no-cost item is skipped and the next rule wins', () => {
+    const d0 = data({
+      settings: { ...DEFAULT_PRICING_SETTINGS, conflictMode: 'priority' },
+      rules: [
+        rule({ id: 'top', name: 'Cost +10', priority: 1, adjustment: { basis: 'cost', method: 'percent', direction: 'increase', value: '10' } }),
+        rule({ id: 'next', name: 'Price -10%', priority: 5 }),
+      ],
+    });
+    const q = evaluateLinePrice(noCostItem, d0, line());
+    expect(q.ruleId).toBe('next');
+    expect(q.price).toBe('90.00');
+  });
+
+  it('cost-basis AMOUNT adjustments (increase and decrease) on a no-cost item are skipped, not priced from 0', () => {
+    for (const direction of ['increase', 'decrease'] as const) {
+      const q = evaluateLinePrice(
+        noCostItem,
+        data({ rules: [rule({ adjustment: { basis: 'cost', method: 'amount', direction, value: '5' } })] }),
+        line(),
+      );
+      expect(q.price).toBe('100.00');
+      expect(q.source).toBe('base');
+    }
+  });
+
+  it('a cost-based quantity tier on a no-cost item never yields a $0 price', () => {
+    const r = rule({
+      adjustment: { basis: 'price', method: 'percent', direction: 'decrease', value: '5' },
+      tiers: [{ minQuantity: '10', adjustment: { basis: 'cost', method: 'percent', direction: 'increase', value: '25' } }],
+    });
+    expect(evaluateLinePrice(noCostItem, data({ rules: [r] }), line(5)).price).toBe('95.00');
+    const big = evaluateLinePrice(noCostItem, data({ rules: [r] }), line(10));
+    expect(Number(big.price)).toBeGreaterThan(0);
+  });
+
+  it('level rounding: null uses the company default, an explicit mode overrides it', () => {
+    const item: EngineItem = { id: 'i1', type: 'service', salesPrice: '33.33', cost: null, customFields: null };
+    const lvl = { id: 'L', name: 'L', type: 'fixed_percent' as const, percent: '-5', isActive: true };
+    const settings = { ...DEFAULT_PRICING_SETTINGS, defaultRounding: 'nearest_1.00' as const };
+    expect(evaluateLinePrice(item, data({ settings, level: { ...lvl, rounding: null } }), line()).price).toBe('32.00');
+    expect(evaluateLinePrice(item, data({ settings, level: { ...lvl, rounding: 'none' } }), line()).price).toBe('31.66');
+    expect(evaluateLinePrice(item, data({ settings, level: { ...lvl, rounding: 'down_0.99' } }), line()).price).toBe('30.99');
+  });
 });
