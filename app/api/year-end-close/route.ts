@@ -23,7 +23,9 @@ function errorResponse(err: unknown) {
           ? 400
           : err.code === 'PERIOD_CLOSED'
             ? 409
-            : 500;
+            : err.code === 'FORBIDDEN'
+              ? 403
+              : 500;
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[year-end-close] error:', err);

@@ -1,11 +1,18 @@
 /**
- * Role-based access control. Roles live on `user_companies` (owner/admin/accountant/viewer).
- * Services that mutate sensitive data can call `requireRole(ctx, ['owner','admin'])` to enforce.
- * The owner of a company always passes.
+ * Legacy 4-level role API (owner/admin/accountant/viewer), kept for older call sites.
+ *
+ * Since the Enterprise roles & permissions work (lib/permissions, lib/services/access.ts,
+ * lib/services/users.ts) the source of truth is the member's assigned roles; `getRole` collapses
+ * their effective permissions to the closest legacy level (Admin → admin/owner, no write access →
+ * viewer, otherwise accountant). Fine-grained checks belong in the route map
+ * (lib/permissions/routes.ts) or `requirePermission` (lib/services/access.ts).
  */
 import { and, eq } from 'drizzle-orm';
 import { companies, userCompanies, users } from '@/lib/db/schema';
-import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, ServiceError, notFound, validation } from './_base';
+import { requireEffectivePermission, resolveAccess } from './access';
+import { LEGACY_ROLE_MAP, legacyRoleFor } from '@/lib/permissions/model';
+import { setUserRoles } from './users';
 
 export type Role = 'owner' | 'admin' | 'accountant' | 'viewer';
 
@@ -14,18 +21,9 @@ const RANK: Record<Role, number> = { viewer: 0, accountant: 1, admin: 2, owner: 
 
 export async function getRole(ctx: ServiceContext): Promise<Role | null> {
   if (!ctx.userId) return null;
-  // Company owner is always 'owner'.
-  const [company] = await ctx.db
-    .select({ ownerId: companies.ownerId })
-    .from(companies)
-    .where(eq(companies.id, ctx.companyId));
-  if (company?.ownerId === ctx.userId) return 'owner';
-
-  const [m] = await ctx.db
-    .select({ role: userCompanies.role })
-    .from(userCompanies)
-    .where(and(eq(userCompanies.userId, ctx.userId), eq(userCompanies.companyId, ctx.companyId)));
-  return (m?.role as Role) ?? null;
+  const r = await resolveAccess(ctx.db, ctx.companyId, ctx.userId);
+  if (!r.member || !r.active) return null;
+  return legacyRoleFor(r.access, r.isOwner);
 }
 
 /** Throw FORBIDDEN unless the current user's role meets the minimum (or is in the allowed set). */
@@ -98,7 +96,8 @@ export async function listMembers(ctx: ServiceContext): Promise<CompanyMember[]>
 const ALL_ROLES: Role[] = ['owner', 'admin', 'accountant', 'viewer'];
 
 /**
- * Change a member's role. Requires admin+; granting 'owner' requires being the owner.
+ * Change a member's role. Requires Users & Roles: modify; granting 'owner' requires being the
+ * owner.
  * The company owner's own role can never be changed (it derives from companies.ownerId).
  */
 export async function setMemberRole(
@@ -106,7 +105,10 @@ export async function setMemberRole(
   targetUserId: string,
   role: Role,
 ): Promise<CompanyMember> {
-  const actorRole = await requireRole(ctx, 'admin');
+  // Enterprise roles: Users & Roles — modify (setUserRoles below adds the escalation and
+  // last-Admin guards).
+  await requireEffectivePermission(ctx, 'users', 'modify');
+  const actorRole = await getRole(ctx);
   if (!ALL_ROLES.includes(role)) {
     throw validation(`role must be one of: ${ALL_ROLES.join(', ')}.`);
   }
@@ -130,20 +132,9 @@ export async function setMemberRole(
     );
   if (!membership) throw notFound('Company member');
 
-  await ctx.db
-    .update(userCompanies)
-    .set({ role })
-    .where(
-      and(eq(userCompanies.userId, targetUserId), eq(userCompanies.companyId, ctx.companyId)),
-    );
-
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'user_company',
-    entityId: targetUserId,
-    oldValues: { role: membership.role },
-    newValues: { role },
-  });
+  // Map to the equivalent built-in role (Enterprise roles), which also updates the legacy column
+  // and enforces the last-active-Admin rule + writes the audit row.
+  await setUserRoles(ctx, targetUserId, [LEGACY_ROLE_MAP[role]]);
 
   const [user] = await ctx.db
     .select({ email: users.email, name: users.name })

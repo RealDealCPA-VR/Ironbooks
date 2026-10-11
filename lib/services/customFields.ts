@@ -16,7 +16,7 @@
 import { and, eq } from 'drizzle-orm';
 import { companies, customers, vendors, items, invoices } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
-import { requireRole } from './rbac';
+import { requireEffectivePermission } from './access';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -127,7 +127,8 @@ export async function setCustomFieldDefinitions(
   ctx: ServiceContext,
   input: Partial<Record<CustomFieldEntity, CustomFieldDefinition[]>>,
 ): Promise<CustomFieldDefinitions> {
-  await requireRole(ctx, 'admin');
+  // Enterprise roles: Lists / Centers — modify (same rule as PATCH /api/custom-fields).
+  await requireEffectivePermission(ctx, 'lists', 'modify');
 
   const [company] = await ctx.db
     .select()

@@ -1,7 +1,8 @@
 /**
  * Integration tests for company-file management (app/api/companies/[id]/manage.ts):
- *  - rename: owner/admin allowed, accountant/viewer/non-member rejected, validation.
- *  - archive (soft delete): owner only, typed-name confirm, only-company guard,
+ *  - access: EFFECTIVE permissions (Enterprise roles), not the legacy role / ownerId.
+ *  - rename: Company & Preferences modify (owner/admin/accountant); non-member NOT_FOUND.
+ *  - archive (soft delete): Company & Preferences delete, typed-name confirm, only-company guard,
  *    already-archived conflict, audit rows written.
  *  - stampLastOpened: merges settings.lastOpenedAt without clobbering other keys.
  */
@@ -14,7 +15,7 @@ import { auditLogs, companies, userCompanies, users } from '@/lib/db/schema';
 import { ServiceError } from '@/lib/services/_base';
 import {
   archiveCompany,
-  getRoleInCompany,
+  getAccessInCompany,
   isArchived,
   renameCompany,
   stampLastOpened,
@@ -74,12 +75,15 @@ describe('Company management (integration)', () => {
     fs.rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
-  describe('getRoleInCompany', () => {
-    it('resolves owner via companies.ownerId, members via user_companies', async () => {
-      expect((await getRoleInCompany(db, ownerId, companyA)).role).toBe('owner');
-      expect((await getRoleInCompany(db, adminId, companyA)).role).toBe('admin');
-      expect((await getRoleInCompany(db, accountantId, companyA)).role).toBe('accountant');
-      expect((await getRoleInCompany(db, outsiderId, companyA)).role).toBeNull();
+  describe('getAccessInCompany', () => {
+    it('resolves effective access (legacy memberships map to built-in roles)', async () => {
+      expect((await getAccessInCompany(db, ownerId, companyA)).access.isAdmin).toBe(true);
+      expect((await getAccessInCompany(db, adminId, companyA)).access.isAdmin).toBe(true);
+      const acc = (await getAccessInCompany(db, accountantId, companyA)).access;
+      expect(acc.isAdmin).toBe(false);
+      expect(acc.permissions.company).toContain('modify');
+      expect(acc.permissions.company).not.toContain('delete');
+      await expectServiceError(getAccessInCompany(db, outsiderId, companyA), 'NOT_FOUND');
     });
   });
 
@@ -100,8 +104,9 @@ describe('Company management (integration)', () => {
       expect(updated.name).toBe('Alpha Books LLC');
     });
 
-    it('accountant cannot rename (FORBIDDEN)', async () => {
-      await expectServiceError(renameCompany(db, accountantId, companyA, 'Nope'), 'FORBIDDEN');
+    it('accountant (Company & Preferences: modify) can rename', async () => {
+      const updated = await renameCompany(db, accountantId, companyA, 'Alpha Books LLC');
+      expect(updated.name).toBe('Alpha Books LLC');
     });
 
     it('non-member gets NOT_FOUND (no existence leak)', async () => {
@@ -114,9 +119,9 @@ describe('Company management (integration)', () => {
   });
 
   describe('archiveCompany (soft delete)', () => {
-    it('non-owner admin cannot archive', async () => {
+    it('accountant (no Company & Preferences: delete) cannot archive', async () => {
       await expectServiceError(
-        archiveCompany(db, adminId, companyA, 'Alpha Books LLC'),
+        archiveCompany(db, accountantId, companyA, 'Alpha Books LLC'),
         'FORBIDDEN',
       );
     });

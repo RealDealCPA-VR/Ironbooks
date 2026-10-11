@@ -1,13 +1,23 @@
 /**
  * POST /api/auth/signup — create the first owner user + their company, then start a session.
  * Body: { name, email, password, companyName }
+ *
+ * Users live inside the company file, and only its Admin adds more (Users & Roles), so self
+ * sign-up is only open while the file has no real user yet (the seeded demo user, whose
+ * password hash is the sentinel 'dev', doesn't count). The file password still applies.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { eq } from 'drizzle-orm';
+import { eq, ne } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { createCompany } from '@/lib/services/company';
-import { hashPassword, createSessionToken, SESSION_COOKIE } from '@/lib/auth';
+import {
+  hashPassword,
+  createSessionToken,
+  hasValidUnlockCookie,
+  SESSION_COOKIE,
+} from '@/lib/auth';
+import { getFileLockStatus } from '@/lib/services/fileLock';
 import { COMPANY_COOKIE } from '@/lib/context';
 import { logTransaction } from '@/lib/services/transactionLog';
 import { startSession } from '@/lib/services/sessions';
@@ -29,6 +39,28 @@ export async function POST(req: NextRequest) {
   if (origin.remote) {
     return NextResponse.json(
       { error: 'Ask an administrator of this company file to add you as a user.', code: 'FORBIDDEN' },
+      { status: 403 },
+    );
+  }
+  const lock = await getFileLockStatus(db);
+  if (lock.enabled && !(await hasValidUnlockCookie())) {
+    return NextResponse.json(
+      { error: 'This company file is locked. Unlock it to continue.', code: 'FORBIDDEN' },
+      { status: 403 },
+    );
+  }
+  const [realUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(ne(users.passwordHash, 'dev'))
+    .limit(1);
+  if (realUser) {
+    return NextResponse.json(
+      {
+        error:
+          'This company file already has users. Ask your administrator to add you in Users & Roles.',
+        code: 'FORBIDDEN',
+      },
       { status: 403 },
     );
   }

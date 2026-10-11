@@ -1,5 +1,10 @@
-import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
+  companyFileId,
   createSessionToken,
   verifySessionToken,
   createUnlockToken,
@@ -28,6 +33,49 @@ describe('auth sessions', () => {
     expect(verifySessionToken('')).toBeNull();
     expect(verifySessionToken('not-a-token')).toBeNull();
     expect(verifySessionToken(undefined)).toBeNull();
+  });
+});
+
+describe('session tokens are bound to the company file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bka-auth-'));
+  const dirA = path.join(root, 'Company A.bookkeeper');
+  const dirB = path.join(root, 'Company B.bookkeeper');
+
+  afterEach(() => vi.unstubAllEnvs());
+  afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  it('gives each company file its own persistent id', () => {
+    vi.stubEnv('BKA_DATA_DIR', dirA);
+    const a = companyFileId();
+    expect(fs.readFileSync(path.join(dirA, '.file-id'), 'utf8')).toBe(a);
+    vi.stubEnv('BKA_DATA_DIR', dirB);
+    expect(companyFileId()).not.toBe(a);
+  });
+
+  it('rejects a session minted for company A when company B is open (same secret)', () => {
+    vi.stubEnv('BKA_DATA_DIR', dirA);
+    const token = createSessionToken('user-1');
+    expect(verifySessionToken(token)).toEqual({ userId: 'user-1' });
+    vi.stubEnv('BKA_DATA_DIR', dirB);
+    expect(verifySessionToken(token)).toBeNull();
+    vi.stubEnv('BKA_DATA_DIR', dirA);
+    expect(verifySessionToken(token)).toEqual({ userId: 'user-1' });
+  });
+
+  it('binds portal tokens too', () => {
+    vi.stubEnv('BKA_DATA_DIR', dirA);
+    const token = createSessionToken('emp-1', 'portal');
+    vi.stubEnv('BKA_DATA_DIR', dirB);
+    expect(verifySessionToken(token, 'portal')).toBeNull();
+  });
+
+  it('rejects legacy (unbound) tokens even with a valid signature', () => {
+    vi.stubEnv('BKA_DATA_DIR', dirA);
+    const body = Buffer.from(
+      JSON.stringify({ userId: 'user-1', kind: 'user', exp: Date.now() + 60_000 }),
+    ).toString('base64url');
+    const sig = crypto.createHmac('sha256', 'test-secret-fixed').update(body).digest('base64url');
+    expect(verifySessionToken(`${body}.${sig}`)).toBeNull();
   });
 });
 

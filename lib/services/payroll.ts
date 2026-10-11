@@ -40,6 +40,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
+import { maskForContext } from './access';
 import {
   computeEmployerTaxes,
   computeWithholding,
@@ -184,17 +185,19 @@ export async function listEmployees(ctx: ServiceContext, opts?: { includeInactiv
     .where(eq(employees.companyId, ctx.companyId))
     .orderBy(employees.lastName, employees.firstName);
 
-  if (opts?.includeInactive) return rows;
-  return rows.filter((e) => e.isActive);
+  // SSNs leave this service masked unless the caller may view sensitive payroll data.
+  if (opts?.includeInactive) return maskForContext(ctx, rows);
+  return maskForContext(ctx, rows.filter((e) => e.isActive));
 }
 
+/** One employee; the SSN is masked unless the caller may view sensitive payroll data. */
 export async function getEmployee(ctx: ServiceContext, id: string) {
   const [row] = await ctx.db
     .select()
     .from(employees)
     .where(and(eq(employees.companyId, ctx.companyId), eq(employees.id, id)));
   if (!row) throw notFound('Employee');
-  return row;
+  return maskForContext(ctx, row);
 }
 
 export async function createEmployee(ctx: ServiceContext, input: CreateEmployeeInput) {
@@ -282,7 +285,7 @@ export async function updateEmployee(
   if (input.address !== undefined) updates.address = input.address;
   if (input.isActive !== undefined) updates.isActive = input.isActive;
 
-  if (Object.keys(updates).length === 0) return existing;
+  if (Object.keys(updates).length === 0) return existing; // already masked by getEmployee
   updates.updatedAt = new Date();
 
   const [row] = await ctx.db
@@ -310,7 +313,7 @@ export async function updateEmployee(
     newValues: auditNew,
   });
 
-  return row;
+  return maskForContext(ctx, row);
 }
 
 // ---------------------------------------------------------------------------

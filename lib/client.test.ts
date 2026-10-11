@@ -15,9 +15,11 @@ import {
   api,
   ApiError,
   CLOSING_PASSWORD_HEADER,
+  isAuthError,
   isFileLockError,
   setClosingPasswordPrompt,
 } from '@/lib/client';
+import { DEACTIVATED_MESSAGE } from '@/lib/context';
 
 type FetchArgs = { url: string; init?: RequestInit };
 
@@ -160,5 +162,18 @@ describe('isFileLockError', () => {
 
   it('is false for non-403 statuses even with a matching message', () => {
     expect(isFileLockError(200, 'This company file is locked. Unlock it to continue.')).toBe(false);
+  });
+});
+
+describe('isAuthError', () => {
+  it('matches the session-required and deactivated messages from lib/context.ts', () => {
+    expect(isAuthError(403, 'Authentication required.')).toBe(true);
+    expect(isAuthError(403, DEACTIVATED_MESSAGE)).toBe(true);
+  });
+
+  it('does not treat permission denials or the file lock as auth errors', () => {
+    expect(isAuthError(403, 'You do not have permission to view Banking.')).toBe(false);
+    expect(isAuthError(403, 'This company file is locked. Unlock it to continue.')).toBe(false);
+    expect(isAuthError(500, 'Authentication required.')).toBe(false);
   });
 });

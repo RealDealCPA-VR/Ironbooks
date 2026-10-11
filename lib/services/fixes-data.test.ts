@@ -15,7 +15,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import AdmZip from 'adm-zip';
 import { getDb, closeDb } from '@/lib/db';
-import { users, companies, accounts } from '@/lib/db/schema';
+import { users, companies, accounts, userCompanies } from '@/lib/db/schema';
 import { and, eq, inArray } from 'drizzle-orm';
 import type { ServiceContext } from './_base';
 import { createBackup, restoreBackup, BACKUP_MANIFEST_ENTRY } from './backup';
@@ -312,7 +312,25 @@ describe('route auth — /api/companies and /api/backup', () => {
     expect(post.status).toBe(403);
   });
 
+  it('a whole-file restore by an Admin of only ONE company in the file is refused (403)', async () => {
+    session.userId = userBId; // Admin of B Co only; A Co and the demo company share the file
+    const post = await backupPOST(
+      new Request('http://localhost/api/backup', {
+        method: 'POST',
+        body: 'junk bytes pretending to be a .bka',
+      }) as never,
+    );
+    expect(post.status).toBe(403);
+  });
+
   it('authenticated restore of a junk body returns 400 VALIDATION (data dir untouched)', async () => {
+    // Whole-file restore needs an active Admin of every company in the file.
+    const db = await getDb();
+    const all = await db.select({ id: companies.id, ownerId: companies.ownerId }).from(companies);
+    for (const c of all) {
+      if (c.ownerId === userBId) continue;
+      await db.insert(userCompanies).values({ userId: userBId, companyId: c.id, role: 'admin' });
+    }
     session.userId = userBId;
     const post = await backupPOST(
       new Request('http://localhost/api/backup', {

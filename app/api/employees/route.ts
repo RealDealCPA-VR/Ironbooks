@@ -9,6 +9,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listEmployees, createEmployee } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
+import { hasFlag } from '@/lib/services/access';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createEmployeeSchema } from '@/lib/validation/employees';
 
@@ -26,12 +27,15 @@ function errorResponse(err: unknown) {
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
 }
 
-/** Never send the full SSN to the browser — mask to the last 4 digits. */
-function maskEmployee<T extends { ssn?: string | null }>(emp: T) {
+/**
+ * Never send the full SSN to the browser unless the caller's roles grant "view sensitive
+ * payroll data" (Users & Roles); everyone else gets the last 4 digits only.
+ */
+function maskEmployee<T extends { ssn?: string | null }>(emp: T, showSsn: boolean) {
   const digits = (emp.ssn ?? '').replace(/\D/g, '');
   return {
     ...emp,
-    ssn: undefined,
+    ssn: showSsn ? (emp.ssn ?? null) : undefined,
     ssnLast4: digits.length >= 4 ? digits.slice(-4) : null,
   };
 }
@@ -42,7 +46,8 @@ export async function GET(req: NextRequest) {
     const { searchParams } = req.nextUrl;
     const includeInactive = searchParams.get('includeInactive') === 'true';
     const list = await listEmployees(ctx, { includeInactive });
-    return NextResponse.json(list.map(maskEmployee));
+    const showSsn = hasFlag(ctx, 'sensitivePayroll');
+    return NextResponse.json(list.map((e) => maskEmployee(e, showSsn)));
   } catch (err) {
     return errorResponse(err);
   }
@@ -57,7 +62,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
     const employee = await createEmployee(ctx, parsed.data);
-    return NextResponse.json(employee, { status: 201 });
+    return NextResponse.json(maskEmployee(employee, hasFlag(ctx, 'sensitivePayroll')), {
+      status: 201,
+    });
   } catch (err) {
     return errorResponse(err);
   }

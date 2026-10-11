@@ -24,6 +24,8 @@ function errorResponse(err: unknown) {
 export async function GET() {
   try {
     const ctx = await getServerContext();
+    // Account numbers are masked by the service for roles without the 'view full bank/account
+    // numbers' flag (lib/services/bankAccounts.ts).
     return NextResponse.json(await listBankAccounts(ctx));
   } catch (err) {
     return errorResponse(err);

@@ -9,7 +9,11 @@ import { ServiceError } from '@/lib/services/_base';
 
 function err(e: unknown) {
   if (e instanceof ServiceError) {
-    const s = e.code === 'NOT_FOUND' ? 404 : e.code === 'VALIDATION' ? 400 : 500;
+    const s =
+      e.code === 'NOT_FOUND' ? 404
+      : e.code === 'VALIDATION' ? 400
+      : e.code === 'FORBIDDEN' ? 403
+      : 500;
     return NextResponse.json({ error: e.message, code: e.code }, { status: s });
   }
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

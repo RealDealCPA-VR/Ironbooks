@@ -10,7 +10,11 @@ import { ServiceError } from '@/lib/services/_base';
 
 function errResponse(e: unknown) {
   if (e instanceof ServiceError) {
-    const status = e.code === 'NOT_FOUND' ? 404 : e.code === 'VALIDATION' ? 400 : 500;
+    const status =
+      e.code === 'NOT_FOUND' ? 404
+      : e.code === 'VALIDATION' ? 400
+      : e.code === 'FORBIDDEN' ? 403
+      : 500;
     return NextResponse.json({ error: e.message, code: e.code }, { status });
   }
   console.error('[report-builder]', e);

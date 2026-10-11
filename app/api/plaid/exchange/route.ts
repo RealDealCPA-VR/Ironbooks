@@ -20,6 +20,7 @@ function errorResponse(err: unknown) {
       err.code === 'NOT_FOUND' ? 404
       : err.code === 'VALIDATION' ? 400
       : err.code === 'FORBIDDEN' ? 403
+      : err.code === 'CONFLICT' ? 409
       : 500;
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
@@ -29,8 +30,8 @@ function errorResponse(err: unknown) {
 
 export async function POST(req: NextRequest) {
   try {
-    // Auth first (this route previously had no session check), then the network policy is
-    // enforced inside the service.
+    // Auth first (session + Banking permission via the central route map), then the network
+    // policy is enforced inside the service.
     const ctx = await getServerContext();
     const body = await req.json();
     const { publicToken } = body as { publicToken?: string };

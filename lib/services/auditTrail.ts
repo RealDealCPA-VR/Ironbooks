@@ -8,6 +8,7 @@
 import { and, asc, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { auditLogs, users } from '@/lib/db/schema';
 import { type ServiceContext, notFound } from './_base';
+import { maskForContext } from './access';
 
 export interface AuditLogRow {
   id: string;
@@ -114,8 +115,9 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     actorId: row.actorId ?? null,
     actorName: row.actorName ?? null,
     createdAt: row.createdAt.toISOString(),
-    oldValues: row.oldValues,
-    newValues: row.newValues,
+    // Snapshots can hold SSNs, tax IDs and account numbers -- mask per the caller's flags.
+    oldValues: maskForContext(ctx, row.oldValues),
+    newValues: maskForContext(ctx, row.newValues),
     llmReasoning: row.llmReasoning ?? null,
   };
 }

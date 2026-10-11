@@ -12,6 +12,7 @@
 import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
 import { logTransaction } from './transactionLog';
+import type { EffectiveAccess } from '@/lib/permissions/model';
 
 export interface ServiceContext {
   db: DB;
@@ -36,6 +37,12 @@ export interface ServiceContext {
    * (lib/services/sessions.ts). Absent for system jobs / first-run.
    */
   sessionId?: string;
+  /**
+   * Enterprise roles & permissions (team users): the member's effective permissions (union of
+   * their roles), loaded by `getServerContext`, which also enforces the API route map
+   * (lib/permissions/routes.ts). Absent = trusted internal context — no restriction.
+   */
+  access?: EffectiveAccess;
 }
 
 export type ServiceErrorCode =

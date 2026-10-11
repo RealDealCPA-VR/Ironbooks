@@ -31,6 +31,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry } from './posting';
+import { accountNumberFor, maskForContext } from './access';
 import { payCreditCard } from './liabilityPayments';
 
 // ---------------------------------------------------------------------------
@@ -182,7 +183,8 @@ export async function listReconciliations(ctx: ServiceContext) {
     .innerJoin(bankAccounts, eq(reconciliations.bankAccountId, bankAccounts.id))
     .where(eq(bankAccounts.companyId, ctx.companyId))
     .orderBy(desc(reconciliations.createdAt));
-  return rows;
+  // Full account numbers only for roles with "view full bank / account numbers".
+  return maskForContext(ctx, rows);
 }
 
 /**
@@ -719,7 +721,7 @@ export async function getReconcileInfo(
   return {
     bankAccountId: ba.id,
     bankName: ba.bankName,
-    accountNumber: ba.accountNumber,
+    accountNumber: accountNumberFor(ctx, ba.accountNumber),
     glAccountId: ba.glAccountId,
     glAccountName: ba.glAccountName,
     glAccountCode: ba.glAccountCode,
@@ -1078,7 +1080,7 @@ export async function getReconciliationReport(
     id: recon.id,
     bankAccountId: recon.bankAccountId,
     bankName: meta.bankName,
-    accountNumber: meta.accountNumber,
+    accountNumber: accountNumberFor(ctx, meta.accountNumber),
     glAccountName: meta.glAccountName,
     glAccountCode: meta.glAccountCode,
     glType: meta.glType,
@@ -1166,7 +1168,7 @@ export async function reconciliationDiscrepancies(
     statementDate: r.statementDate,
     bankAccountId: r.bankAccountId,
     bankName: r.bankName,
-    accountNumber: r.accountNumber,
+    accountNumber: accountNumberFor(ctx, r.accountNumber),
     journalEntryId: r.journalEntryId,
     entryNumber: r.entryNumber,
     date: r.date,

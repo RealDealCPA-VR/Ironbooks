@@ -15,6 +15,8 @@ import {
   GitCompareArrows, CalendarRange, PackageSearch, Scale, BadgePercent, Car, HardDrive,
   ScrollText,
 } from 'lucide-react';
+import { pageAreasFor } from '@/lib/permissions/routes';
+import type { Area } from '@/lib/permissions/model';
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -138,6 +140,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: Building2, label: 'Companies', path: '/companies' },
       { icon: HardDrive, label: 'Company File', path: '/company-file' },
+      { icon: Users, label: 'Users & Roles', path: '/users' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security' },
       { icon: Network, label: 'Privacy & Network', path: '/privacy' },
       { icon: Users, label: 'Multi-user', path: '/multi-user' },
@@ -145,6 +148,28 @@ export const navGroups: NavGroup[] = [
     ],
   },
 ];
+
+/**
+ * Hide links the signed-in user's roles can't use (Users & Roles). COSMETIC ONLY — every API
+ * route is enforced server-side (getServerContext + lib/permissions/routes.ts). A link needs
+ * 'view' of (one of) the area(s) its path maps to in PAGE_AREAS; unmapped paths are always shown, and a
+ * null permission set (not loaded yet / first run) shows everything.
+ */
+export function filterNavGroups(
+  groups: NavGroup[],
+  permissions: Partial<Record<Area, readonly string[]>> | null | undefined,
+): NavGroup[] {
+  if (!permissions) return groups;
+  return groups
+    .map((g) => ({
+      ...g,
+      links: g.links.filter((l) => {
+        const areas = pageAreasFor(l.path);
+        return !areas || areas.some((a) => permissions[a]?.includes('view') ?? false);
+      }),
+    }))
+    .filter((g) => g.links.length > 0);
+}
 
 /** Pages that exist but are intentionally not in the sidebar. */
 export const EXTRA_DESTINATIONS: { label: string; href: string }[] = [

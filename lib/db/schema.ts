@@ -56,6 +56,8 @@ export const userCompanies = pgTable('user_companies', {
   userId: uuid('user_id').references(() => users.id).notNull(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   role: userRoleEnum('role').notNull().default('viewer'),
+  /** Deactivated members cannot sign in to / act in this company (team users, 0021). */
+  isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1213,4 +1215,29 @@ export const singleUserMode = pgTable('single_user_mode', {
   sessionId: uuid('session_id').notNull(),
   userId: uuid('user_id').notNull(),
   enabledAt: timestamp('enabled_at').defaultNow().notNull(),
+});
+
+// ---- team users ----
+// Enterprise roles & permissions (lib/permissions/model.ts). Built-in roles are defined in code;
+// only CUSTOM roles are stored here. permissions = { [area]: ('view'|'create'|'modify'|'delete'|
+// 'print'|'full')[] }, flags = { sensitivePayroll?, fullAccountNumbers?, closedPeriod? }.
+export const companyRoles = pgTable('company_roles', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  description: text('description'),
+  permissions: jsonb('permissions').$type<Record<string, string[]>>().notNull(),
+  flags: jsonb('flags').$type<Record<string, boolean>>().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+// A user's roles in a company (union = effective permissions). role_key is a built-in role key
+// ('admin', 'bookkeeper', …) or a company_roles.id. The SQL migration declares
+// PRIMARY KEY (company_id, user_id, role_key).
+export const userRoleAssignments = pgTable('user_role_assignments', {
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+  roleKey: varchar('role_key', { length: 64 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });

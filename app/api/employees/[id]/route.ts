@@ -10,6 +10,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getEmployee, updateEmployee } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
+import { hasFlag } from '@/lib/services/access';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateEmployeeSchema } from '@/lib/validation/employees';
 
@@ -27,12 +28,15 @@ function errorResponse(err: unknown) {
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
 }
 
-/** Never send the full SSN to the browser — mask to the last 4 digits. */
-function maskEmployee<T extends { ssn?: string | null }>(emp: T) {
+/**
+ * Never send the full SSN to the browser unless the caller's roles grant "view sensitive
+ * payroll data" (Users & Roles); everyone else gets the last 4 digits only.
+ */
+function maskEmployee<T extends { ssn?: string | null }>(emp: T, showSsn: boolean) {
   const digits = (emp.ssn ?? '').replace(/\D/g, '');
   return {
     ...emp,
-    ssn: undefined,
+    ssn: showSsn ? (emp.ssn ?? null) : undefined,
     ssnLast4: digits.length >= 4 ? digits.slice(-4) : null,
   };
 }
@@ -45,7 +49,7 @@ export async function GET(
     const ctx = await getServerContext();
     const { id } = await params;
     const employee = await getEmployee(ctx, id);
-    return NextResponse.json(maskEmployee(employee));
+    return NextResponse.json(maskEmployee(employee, hasFlag(ctx, 'sensitivePayroll')));
   } catch (err) {
     return errorResponse(err);
   }
@@ -67,7 +71,7 @@ export async function PATCH(
 
     const updated = await updateEmployee(ctx, id, parsed.data);
 
-    return NextResponse.json(maskEmployee(updated));
+    return NextResponse.json(maskEmployee(updated, hasFlag(ctx, 'sensitivePayroll')));
   } catch (err) {
     return errorResponse(err);
   }
