@@ -187,7 +187,7 @@ export async function getCalendar(
     for (const t of tpl) {
       if (t.mode === 'never' || t.frequency === 'never') continue;
       const limit = t.remaining === null ? 100 : t.remaining;
-      for (const occ of projectOccurrences(t.nextRunDate, t.frequency as Frequency, fromD, toD, limit)) {
+      for (const occ of projectOccurrences(t.nextRunDate, t.frequency as Frequency, fromD, toD, limit, t.anchorDay)) {
         add(day(occ), {
           id: t.id,
           kind: 'memorized',

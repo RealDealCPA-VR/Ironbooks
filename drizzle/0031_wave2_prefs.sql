@@ -8,6 +8,8 @@ ALTER TABLE "recurring_templates" ADD COLUMN IF NOT EXISTS "days_in_advance" int
 --> statement-breakpoint
 ALTER TABLE "recurring_templates" ADD COLUMN IF NOT EXISTS "last_run_at" timestamp;
 --> statement-breakpoint
+ALTER TABLE "recurring_templates" ADD COLUMN IF NOT EXISTS "anchor_day" integer;
+--> statement-breakpoint
 UPDATE "recurring_templates" SET "mode" = 'remind' WHERE "mode" = 'automatic' AND ("template" -> '__options' ->> 'autoEnter') = 'false';
 --> statement-breakpoint
 ALTER TABLE "attachments" ALTER COLUMN "entity_type" DROP NOT NULL;

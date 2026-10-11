@@ -168,8 +168,35 @@ function addMonthsClamped(date: Date, months: number): Date {
   return d;
 }
 
-/** Next occurrence after `date` for a frequency ('never' returns null). */
-export function advanceDate(date: Date, frequency: Frequency): Date | null {
+function lastDayOfMonth(y: number, m: number): number {
+  return new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+}
+
+function validAnchor(anchorDay: number | null | undefined): number | null {
+  return anchorDay != null && Number.isInteger(anchorDay) && anchorDay >= 1 && anchorDay <= 15 ? anchorDay : null;
+}
+
+/**
+ * The first-half day (1-15) of the twice-a-month pair a date belongs to. A first-half date is its
+ * own anchor; a second-half date is day - 15, capped at 15 (the 31st pairs with the 15th). A
+ * month-end date in February is read as the clamped half of a 15th/last-day pair — the only
+ * ambiguous case (13th/28th and 14th/28th-29th pairs look the same there), which is why
+ * templates store the anchor (recurring_templates.anchor_day) when their date is set.
+ */
+export function semimonthlyAnchor(date: Date): number {
+  const y = date.getUTCFullYear();
+  const m = date.getUTCMonth();
+  const dayOfMonth = date.getUTCDate();
+  if (dayOfMonth <= 15) return dayOfMonth;
+  if (dayOfMonth === lastDayOfMonth(y, m) && dayOfMonth < 30) return 15;
+  return Math.min(dayOfMonth - 15, 15);
+}
+
+/**
+ * Next occurrence after `date` for a frequency ('never' returns null). `anchorDay` (semimonthly
+ * only) is the pair's first-half day; without it the anchor is derived from the date.
+ */
+export function advanceDate(date: Date, frequency: Frequency, anchorDay?: number | null): Date | null {
   const d = new Date(date);
   switch (frequency) {
     case 'never':
@@ -186,17 +213,17 @@ export function advanceDate(date: Date, frequency: Frequency): Date | null {
     case 'every_four_weeks':
       d.setUTCDate(d.getUTCDate() + 28);
       break;
-    case 'semimonthly':
-      // Twice a month: the 1st/15th rhythm — before the 15th jump 15 days, else to next month's 1st
-      // offset by the same day-of-half (keeps e.g. 5th/20th pairs).
-      if (d.getUTCDate() <= 15) d.setUTCDate(d.getUTCDate() + 15);
-      else {
-        const dayInHalf = d.getUTCDate() - 15;
-        d.setUTCDate(1);
-        d.setUTCMonth(d.getUTCMonth() + 1);
-        d.setUTCDate(Math.min(Math.max(1, dayInHalf), 15));
-      }
-      break;
+    case 'semimonthly': {
+      // Twice a month on a fixed pair of days: the anchor day (1st-15th) and anchor + 15, the
+      // second one clamped to the month's last day (15th/30th, and 15th/28th in February). From
+      // the second date the schedule returns to the anchor day next month, never the clamped day.
+      const y = d.getUTCFullYear();
+      const m = d.getUTCMonth();
+      const dayOfMonth = d.getUTCDate();
+      if (dayOfMonth <= 15) return new Date(Date.UTC(y, m, Math.min(dayOfMonth + 15, lastDayOfMonth(y, m))));
+      const anchor = validAnchor(anchorDay) ?? semimonthlyAnchor(d);
+      return new Date(Date.UTC(y, m + 1, anchor));
+    }
     case 'monthly':
       return addMonthsClamped(d, 1);
     case 'bimonthly':
@@ -226,13 +253,15 @@ export function projectOccurrences(
   from: Date,
   to: Date,
   limit = 100,
+  anchorDay?: number | null,
 ): Date[] {
   if (!start) return [];
+  const anchor = validAnchor(anchorDay) ?? semimonthlyAnchor(start);
   const out: Date[] = [];
   let d: Date | null = new Date(start);
   while (d && d.getTime() <= to.getTime() && out.length < limit) {
     if (d.getTime() >= from.getTime()) out.push(new Date(d));
-    d = advanceDate(d, frequency);
+    d = advanceDate(d, frequency, anchor);
   }
   return out;
 }
@@ -374,6 +403,7 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
         docType: input.docType,
         frequency: input.frequency,
         nextRunDate,
+        anchorDay: nextRunDate ? semimonthlyAnchor(nextRunDate) : null,
         template,
         isActive: true,
         mode,
@@ -414,7 +444,10 @@ export async function updateTemplate(ctx: ServiceContext, id: string, input: Upd
       patch.name = input.name.trim();
     }
     if (input.frequency !== undefined) patch.frequency = input.frequency;
-    if (input.nextRunDate !== undefined) patch.nextRunDate = parseRunDate(input.nextRunDate);
+    if (input.nextRunDate !== undefined) {
+      patch.nextRunDate = parseRunDate(input.nextRunDate);
+      patch.anchorDay = patch.nextRunDate ? semimonthlyAnchor(patch.nextRunDate) : null;
+    }
     if (input.groupName !== undefined) patch.groupName = input.groupName?.trim() || null;
     if (input.remaining !== undefined) patch.remaining = input.remaining;
     if (input.daysInAdvance !== undefined) patch.daysInAdvance = input.daysInAdvance;
@@ -592,9 +625,10 @@ async function recordRun(
 ): Promise<void> {
   const frequency = template.frequency as Frequency;
   // Catch up so a template several periods overdue fires once, not on every subsequent run.
-  let nextRun = advanceDate(fromDate, frequency);
+  const anchor = template.anchorDay ?? semimonthlyAnchor(fromDate);
+  let nextRun = advanceDate(fromDate, frequency, anchor);
   while (nextRun && nextRun.getTime() <= now.getTime()) {
-    nextRun = advanceDate(nextRun, frequency);
+    nextRun = advanceDate(nextRun, frequency, anchor);
   }
   const remaining = template.remaining === null ? null : Math.max(0, template.remaining - 1);
   const finished = remaining === 0;

@@ -825,6 +825,8 @@ export const recurringTemplates = pgTable('recurring_templates', {
   /** Enter (or remind) this many days before the scheduled date. */
   daysInAdvance: integer('days_in_advance').notNull().default(0),
   lastRunAt: timestamp('last_run_at'),
+  /** Twice-a-month schedules: the pair's first-half day (1-15), so 15th/30th survives February. */
+  anchorDay: integer('anchor_day'),
 });
 
 // ---- Attachments / document store ----
