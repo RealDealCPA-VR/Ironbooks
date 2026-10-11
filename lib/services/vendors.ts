@@ -11,7 +11,7 @@
  *  - Soft-delete only: deactivateVendor sets isActive = false.
  *  - ServiceError codes: NOT_FOUND, VALIDATION, CONFLICT.
  */
-import { and, asc, eq, ne } from 'drizzle-orm';
+import { and, asc, eq, ne, sql } from 'drizzle-orm';
 import { vendors } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { maskForContext } from './access';
@@ -59,7 +59,7 @@ async function assertUniqueDisplayName(
   }
   const conds = [
     eq(vendors.companyId, ctx.companyId),
-    eq(vendors.displayName, displayName.trim()),
+    sql`lower(${vendors.displayName}) = lower(${displayName.trim()})`, // QB names are case-insensitive
   ];
   if (excludeId) {
     conds.push(ne(vendors.id, excludeId));

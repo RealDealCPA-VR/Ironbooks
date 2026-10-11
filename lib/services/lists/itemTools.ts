@@ -46,7 +46,9 @@ export interface PriceChangeRow {
 function roundPrice(v: Decimal, mode: PriceRounding): Decimal {
   switch (mode) {
     case 'none':
-      return v.toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+      // No extra rounding — but items.sales_price is numeric(15,2), so the price is still kept to
+      // the cent: what the preview shows is exactly what gets saved.
+      return v.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
     case 'dime':
       return v.times(10).toDecimalPlaces(0, Decimal.ROUND_HALF_UP).dividedBy(10);
     case 'dollar':
@@ -105,7 +107,7 @@ export async function changeItemPrices(ctx: ServiceContext, input: ChangeItemPri
         row.skipped = 'The new price would be below zero';
         return row;
       }
-      row.newPrice = np.toFixed(np.decimalPlaces() > 2 ? 4 : 2);
+      row.newPrice = np.toFixed(2); // the column's scale
       return row;
     });
 

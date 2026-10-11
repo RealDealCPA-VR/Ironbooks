@@ -262,11 +262,11 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
   const name = input.name?.trim();
   if (!name) throw validation('Item name is required.');
 
-  // Enforce unique name per company (case-sensitive match on stored value).
+  // Enforce unique name per company (case-insensitive, like QB).
   const [dup] = await ctx.db
     .select({ id: items.id })
     .from(items)
-    .where(and(eq(items.companyId, ctx.companyId), eq(items.name, name)));
+    .where(and(eq(items.companyId, ctx.companyId), sql`lower(${items.name}) = lower(${name})`));
   if (dup) throw validation(`An item named "${name}" already exists.`);
 
   // ── Validate type rules + account links ──────────────────────────────────
@@ -333,7 +333,7 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
         .where(
           and(
             eq(items.companyId, ctx.companyId),
-            eq(items.name, newName),
+            sql`lower(${items.name}) = lower(${newName})`,
             ne(items.id, id),
           ),
         );

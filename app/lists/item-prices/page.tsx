@@ -127,7 +127,7 @@ export default function ChangeItemPricesPage() {
               <option value="dime">Nearest 10¢</option>
               <option value="dollar">Nearest dollar</option>
               <option value="up_99">Up to .99</option>
-              <option value="none">No rounding</option>
+              <option value="none">No rounding (to the cent)</option>
             </Select>
           </div>
         </div>

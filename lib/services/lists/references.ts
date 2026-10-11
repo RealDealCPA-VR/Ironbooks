@@ -44,6 +44,8 @@ interface CatalogColumns {
   uuidCols: ColumnRef[];
   refCols: ColumnRef[];
   jsonCols: ColumnRef[];
+  /** Legacy free-text `terms` columns (customers, vendors, invoices, bills...) in company-scoped tables. */
+  termsTextCols: ColumnRef[];
 }
 
 async function catalogColumns(db: Db): Promise<CatalogColumns> {
@@ -58,7 +60,8 @@ async function catalogColumns(db: Db): Promise<CatalogColumns> {
            AND c.table_name NOT LIKE '\\_\\_%'
          ORDER BY c.table_name, c.ordinal_position`,
   );
-  const out: CatalogColumns = { uuidCols: [], refCols: [], jsonCols: [] };
+  const out: CatalogColumns = { uuidCols: [], refCols: [], jsonCols: [], termsTextCols: [] };
+  const companyScoped = new Set(cols.filter((c) => c.column_name === 'company_id').map((c) => c.table_name));
   for (const c of cols) {
     if (IGNORED_TABLES.has(c.table_name)) continue;
     const ref = { table: c.table_name, column: c.column_name };
@@ -67,6 +70,12 @@ async function catalogColumns(db: Db): Promise<CatalogColumns> {
       out.uuidCols.push(ref);
     } else if ((c.data_type === 'character varying' || c.data_type === 'text') && /_ref$/.test(c.column_name)) {
       out.refCols.push(ref);
+    } else if (
+      (c.data_type === 'character varying' || c.data_type === 'text') &&
+      c.column_name === 'terms' &&
+      companyScoped.has(c.table_name)
+    ) {
+      out.termsTextCols.push(ref);
     } else if (c.data_type === 'jsonb' || c.data_type === 'json') {
       out.jsonCols.push(ref);
     }
@@ -113,6 +122,37 @@ export async function findReferences(
       ),
     );
     for (const f of found) add(f.id, { ...col, count: Number(f.n) });
+  }
+  // Terms entries are also used through the legacy text code/name kept in `terms` varchar columns
+  // (a customer created without a terms id stores 'net_30'; documents copy the text). A match in
+  // the same company counts as a use, so such an entry is deactivated, never deleted.
+  if (ownTable === 'payment_terms' && cat.termsTextCols.length > 0) {
+    const terms = await rows<{
+      id: string; company_id: string; code: string | null; name: string;
+      kind: string; net_days: number | null; discount_percent: string | null;
+    }>(
+      ctx.db,
+      sql.raw(
+        `SELECT id::text AS id, company_id::text AS company_id, code, name, kind, net_days, discount_percent ` +
+          `FROM payment_terms WHERE id = ANY('${idArray}'::uuid[])`,
+      ),
+    );
+    for (const t of terms) {
+      const labels = [t.code, t.name].filter((v): v is string => !!v).map((v) => v.toLowerCase());
+      // resolveTermsRef maps a never-listed legacy 'net_N' onto a plain standard "Net N" entry.
+      if (t.kind === 'standard' && t.net_days != null && t.discount_percent == null) labels.push(`net_${t.net_days}`);
+      if (labels.length === 0) continue;
+      for (const col of cat.termsTextCols) {
+        const found = await rows<{ n: string | number }>(
+          ctx.db,
+          sql`SELECT count(*) AS n FROM ${sql.raw(qi(col.table))}
+               WHERE company_id = ${t.company_id}::uuid
+                 AND lower(${sql.raw(qi(col.column))}) IN (${sql.join(labels.map((l) => sql`${l}`), sql`, `)})`,
+        );
+        const n = Number(found[0]?.n ?? 0);
+        if (n > 0) add(t.id.toLowerCase(), { ...col, count: n });
+      }
+    }
   }
   return result;
 }

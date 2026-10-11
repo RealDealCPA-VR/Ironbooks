@@ -82,6 +82,10 @@ async function validateSet(ctx: ServiceContext, body: unknown, selfId?: string) 
   const units = input.units.map((u, i) => {
     const f = new Decimal(u.factor);
     if (!f.isFinite() || f.lte(0)) throw validation(`Unit ${i + 1} ("${u.name}"): the conversion must be greater than zero.`);
+    if (f.decimalPlaces() > 6) {
+      // Stored as numeric(…,6): refuse rather than silently round (0.0000001 would become 0).
+      throw validation(`Unit ${i + 1} ("${u.name}"): the conversion can have at most 6 decimal places.`);
+    }
     for (const n of [u.name.toLowerCase(), u.abbrev.toLowerCase()]) {
       if (names.has(n)) throw validation(`The unit name or abbreviation "${n}" is used twice in this set.`);
       names.add(n);

@@ -248,8 +248,11 @@ describe('B16 merges keep the books and the inventory subledger intact', () => {
     expect(before).toBe('400.00');
     await mergeItems(c, { fromId: a.id, toId: b.id });
     const after = (await inventoryValuation(c)).grandTotal;
-    expect(after).toBe(before); // 400.00 of stock must still be worth 400.00 (300 x 1.3333 = 399.99)
-    await assertInvariants(c);
+    // Average cost is stored to 4 dp, so 300 x 1.3333 = 399.99 cannot equal 400.00. The merge posts
+    // the 0.01 difference (Inventory vs COGS) so the GL inventory account still equals the
+    // subledger — no unexplained drift between valuation and the books.
+    expect(after).toBe('399.99'); // 300 x 1.3333, with the 0.01 rounding posted to the GL
+    await assertInvariants(c); // valuation === GL 1300, TB and BS balanced
   });
 
   it('merging two FIFO items moves layers; valuation and GL unchanged', async () => {

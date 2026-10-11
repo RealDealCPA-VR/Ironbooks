@@ -136,7 +136,7 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
     .where(
       and(
         eq(customers.companyId, ctx.companyId),
-        eq(customers.displayName, input.displayName.trim()),
+        sql`lower(${customers.displayName}) = lower(${input.displayName.trim()})`, // QB names are case-insensitive
       ),
     );
   if (conflict) {
@@ -216,7 +216,8 @@ export async function updateCustomer(
         .where(
           and(
             eq(customers.companyId, ctx.companyId),
-            eq(customers.displayName, patch.displayName.trim()),
+            sql`lower(${customers.displayName}) = lower(${patch.displayName.trim()})`,
+            sql`${customers.id} <> ${id}`,
           ),
         );
       if (conflict) {

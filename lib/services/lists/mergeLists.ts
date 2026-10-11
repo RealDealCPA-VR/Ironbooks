@@ -33,6 +33,8 @@ import {
   recurringTemplates,
 } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
+import { Money, toAmountString } from '@/lib/money';
+import { postJournalEntry } from '../posting';
 import { moveNotesAndTodos } from './notes';
 import { repointForeignKeys } from './references';
 
@@ -102,6 +104,7 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
   }
   const fromQty = new Decimal(from.quantityOnHand ?? 0);
   const toQty = new Decimal(to.quantityOnHand ?? 0);
+  let averageCosted = false; // both items valued at quantity x average cost (no FIFO layers)
   if (from.type === 'inventory') {
     const [a, b] = [await inventoryAccountId(ctx, from), await inventoryAccountId(ctx, to)];
     if (a !== b) {
@@ -110,6 +113,7 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
       );
     }
     const [fFifo, tFifo] = [await hasLayers(ctx, fromId), await hasLayers(ctx, toId)];
+    averageCosted = !fFifo && !tFifo;
     if (fFifo !== tFifo) {
       const avgSideQty = fFifo ? toQty : fromQty;
       if (!avgSideQty.isZero()) {
@@ -181,9 +185,47 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
     const newQty = fromQty.plus(toQty);
     const fromAvg = new Decimal(from.averageCost ?? 0);
     const toAvg = new Decimal(to.averageCost ?? 0);
-    const newAvg = newQty.isZero()
+    const newAvg = (newQty.isZero()
       ? (toQty.isZero() && !fromAvg.isZero() ? fromAvg : toAvg)
-      : fromQty.times(fromAvg).plus(toQty.times(toAvg)).dividedBy(newQty);
+      : fromQty.times(fromAvg).plus(toQty.times(toAvg)).dividedBy(newQty)
+    ).toDecimalPlaces(4, Decimal.ROUND_HALF_UP); // the column's scale: what is stored is what is valued
+    let roundingEntryId: string | null = null;
+    if (from.type === 'inventory' && averageCosted) {
+      // Average cost is stored to 4 decimals, so quantity x average cost of the merged item can
+      // differ from the two items' combined value by a few cents (100 @ 2.00 + 200 @ 1.00 = 400.00,
+      // but 300 x 1.3333 = 399.99). Post that difference so the inventory asset account keeps
+      // matching the inventory subledger (inventory valuation) exactly.
+      const before = Money.round2(fromQty.times(fromAvg)).plus(Money.round2(toQty.times(toAvg)));
+      const after = Money.round2(newQty.times(newAvg));
+      const diff = after.minus(before);
+      if (!diff.isZero()) {
+        const invAcct = await inventoryAccountId(tx, to);
+        const [cogs] = to.expenseAccountId
+          ? [{ id: to.expenseAccountId }]
+          : await tx.db
+              .select({ id: accounts.id })
+              .from(accounts)
+              .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.code, '5000')));
+        if (!invAcct || !cogs) throw validation('Set up an inventory asset and cost of goods sold account before merging these items.');
+        const amount = toAmountString(diff.abs());
+        const memo = `Rounding from merging item "${from.name}" into "${to.name}"`;
+        const entry = await postJournalEntry(tx, {
+          date: new Date(),
+          description: memo,
+          sourceRef: `item:${toId}`,
+          lines: diff.isPositive()
+            ? [
+                { accountId: invAcct, debit: amount, memo },
+                { accountId: cogs.id, credit: amount, memo },
+              ]
+            : [
+                { accountId: cogs.id, debit: amount, memo },
+                { accountId: invAcct, credit: amount, memo },
+              ],
+        });
+        roundingEntryId = entry.id;
+      }
+    }
     await tx.db
       .update(items)
       .set({
@@ -209,7 +251,7 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
       entityType: 'item',
       entityId: toId,
       oldValues: { quantityOnHand: to.quantityOnHand, averageCost: to.averageCost },
-      newValues: { mergedFrom: fromId, quantityOnHand: newQty.toFixed(4), averageCost: newAvg.toFixed(4), reassigned },
+      newValues: { mergedFrom: fromId, quantityOnHand: newQty.toFixed(4), averageCost: newAvg.toFixed(4), reassigned, roundingEntryId },
     });
     return { reassigned, deactivatedId: fromId };
   });
