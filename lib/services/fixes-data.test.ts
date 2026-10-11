@@ -53,9 +53,13 @@ const jsonRequest = (url: string, body: unknown) =>
 const BK_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-fixes-data-backup');
 
 describe('backup service — restore validation and atomic swap', () => {
+  // Start clean: a dir left behind by an earlier interrupted run would fail the "nothing created" asserts.
+  beforeAll(() => {
+    fs.rmSync(BK_DIR, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
   afterAll(async () => {
     await closeDb(BK_DIR);
-    fs.rmSync(BK_DIR, { recursive: true, force: true });
+    fs.rmSync(BK_DIR, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('rejects junk bytes with VALIDATION before touching the data dir', async () => {

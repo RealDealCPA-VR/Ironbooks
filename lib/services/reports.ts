@@ -3,9 +3,11 @@
  * Start with Trial Balance, P&L, and Balance Sheet — the foundation set.
  */
 import { and, eq, lte, sql } from 'drizzle-orm';
-import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import { accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { fiscalYearWindow } from './fiscalClose';
+import { assertBalanceSheetBalanced, assertTrialBalanceBalanced } from './ledgerAssert';
 
 export interface TrialBalanceRow {
   accountId: string;
@@ -29,14 +31,19 @@ export function notFiscalCloseEntry() {
   return sql`(${journalEntries.sourceRef} IS NULL OR ${journalEntries.sourceRef} NOT LIKE 'fiscal-close:%')`;
 }
 
-/** Aggregate posted debits/credits per account up to an optional date. */
-async function accountActivity(ctx: ServiceContext, asOf?: Date) {
+/**
+ * Aggregate posted debits/credits per account up to an optional date. When `since` is given,
+ * the same scan also returns the debits/credits dated on/after it (`debitSince`/`creditSince`),
+ * so a split such as current-year vs prior-years earnings comes from the IDENTICAL rows.
+ */
+async function accountActivity(ctx: ServiceContext, asOf?: Date, since?: Date) {
   // Only include posted entries — explicitly exclude draft and void.
   const conds = [
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
   ];
   if (asOf) conds.push(lte(journalEntries.date, asOf));
+  const sinceCond = since ? sql`${journalEntries.date} >= ${since}` : sql`FALSE`;
 
   const rows = await ctx.db
     .select({
@@ -46,6 +53,8 @@ async function accountActivity(ctx: ServiceContext, asOf?: Date) {
       type: accounts.type,
       debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
       credit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
+      debitSince: sql<string>`COALESCE(SUM(${journalEntryLines.debit}) FILTER (WHERE ${sinceCond}), 0)`,
+      creditSince: sql<string>`COALESCE(SUM(${journalEntryLines.credit}) FILTER (WHERE ${sinceCond}), 0)`,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
@@ -82,11 +91,13 @@ export async function trialBalance(
     });
   }
   rows.sort((x, y) => x.code.localeCompare(y.code));
+  // Unreachable while the DB ledger guards hold — throws a loud INTEGRITY error otherwise.
+  assertTrialBalanceBalanced('Trial balance', totalDebit, totalCredit);
   return {
     rows,
     totalDebit: toAmountString(totalDebit),
     totalCredit: toAmountString(totalCredit),
-    balanced: Money.equalWithinCent(totalDebit, totalCredit),
+    balanced: Money.eq(totalDebit, totalCredit),
   };
 }
 
@@ -182,15 +193,47 @@ export interface BalanceSheet {
   totalAssets: string;
   totalLiabilities: string;
   totalEquity: string;
-  /** Retained earnings (net income to date) folded into equity for the equation to hold. */
+  /**
+   * All not-yet-closed earnings to date (revenue − expenses over every posted row up to asOf),
+   * folded into equity so the equation holds. Always = priorYearsEarnings + currentYearNetIncome.
+   */
   retainedEarnings: string;
+  /** Unclosed earnings dated before the current fiscal year (QB "Retained Earnings" line). */
+  priorYearsEarnings: string;
+  /** Net income of the fiscal year containing asOf, up to asOf (QB "Net Income" line). */
+  currentYearNetIncome: string;
+  /** Start of the fiscal year used for the split above (ISO; absent on consolidated sums). */
+  fiscalYearStart?: string;
   balanced: boolean;
   asOf?: string;
 }
 
-/** Balance Sheet as of a date. Equity includes computed net income (retained earnings). */
+/** Start of the company's fiscal year containing `date` (honours settings.fiscalYearEnd). */
+export async function fiscalYearStartFor(ctx: ServiceContext, date: Date): Promise<Date> {
+  const [row] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId))
+    .limit(1);
+  const fye = row?.settings?.fiscalYearEnd;
+  // The fiscal year containing `date` ends in its calendar year or the next one.
+  for (const year of [date.getUTCFullYear(), date.getUTCFullYear() + 1]) {
+    const { yearStart, yearEnd } = fiscalYearWindow(year, fye);
+    if (date >= yearStart && date < yearEnd) return yearStart;
+  }
+  return fiscalYearWindow(date.getUTCFullYear(), fye).yearStart;
+}
+
+/**
+ * Balance Sheet as of a date. BALANCED BY CONSTRUCTION: every account's balance comes from the
+ * same posted ledger rows, and revenue/expense balances (net income not yet closed) are folded
+ * into equity — split into prior-years earnings and current-year net income from those same rows.
+ * Because every posted entry balances (enforced by the database), Σ assets = Σ liabilities +
+ * Σ equity + net income identically; `assertBalanceSheetBalanced` guards that invariant loudly.
+ */
 export async function balanceSheet(ctx: ServiceContext, asOf?: Date): Promise<BalanceSheet> {
-  const activity = await accountActivity(ctx, asOf);
+  const fyStart = await fiscalYearStartFor(ctx, asOf ?? new Date());
+  const activity = await accountActivity(ctx, asOf, fyStart);
   const assets: ReportLine[] = [];
   const liabilities: ReportLine[] = [];
   const equity: ReportLine[] = [];
@@ -198,10 +241,15 @@ export async function balanceSheet(ctx: ServiceContext, asOf?: Date): Promise<Ba
   let totalLiabilities = Money.zero();
   let totalEquity = Money.zero();
   let netIncome = Money.zero();
+  let currentYearNetIncome = Money.zero();
 
   for (const a of activity) {
     const debitNet = Money.sub(a.debit, a.credit);
     const naturalBalance = DEBIT_NORMAL.has(a.type) ? debitNet : debitNet.negated();
+    if (a.type === 'revenue' || a.type === 'expense') {
+      // Net income = credits − debits on P&L accounts; current year = same rows, FILTERed.
+      currentYearNetIncome = currentYearNetIncome.minus(Money.sub(a.debitSince, a.creditSince));
+    }
     const line: ReportLine = {
       accountId: a.accountId,
       code: a.code,
@@ -226,6 +274,8 @@ export async function balanceSheet(ctx: ServiceContext, asOf?: Date): Promise<Ba
 
   const totalEquityWithRE = totalEquity.plus(netIncome);
   [assets, liabilities, equity].forEach((g) => g.sort((a, b) => a.code.localeCompare(b.code)));
+  // Unreachable while the DB ledger guards hold — throws a loud INTEGRITY error otherwise.
+  assertBalanceSheetBalanced('Balance sheet', totalAssets, totalLiabilities, totalEquityWithRE);
 
   return {
     assets,
@@ -235,7 +285,10 @@ export async function balanceSheet(ctx: ServiceContext, asOf?: Date): Promise<Ba
     totalLiabilities: toAmountString(totalLiabilities),
     totalEquity: toAmountString(totalEquityWithRE),
     retainedEarnings: toAmountString(netIncome),
-    balanced: Money.equalWithinCent(totalAssets, totalLiabilities.plus(totalEquityWithRE)),
+    priorYearsEarnings: toAmountString(netIncome.minus(currentYearNetIncome)),
+    currentYearNetIncome: toAmountString(currentYearNetIncome),
+    fiscalYearStart: fyStart.toISOString(),
+    balanced: Money.eq(totalAssets, totalLiabilities.plus(totalEquityWithRE)),
     asOf: asOf?.toISOString(),
   };
 }

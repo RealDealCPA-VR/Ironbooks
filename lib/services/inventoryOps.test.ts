@@ -17,6 +17,7 @@ import { getDb, closeDb, type DB } from '@/lib/db';
 import { users, companies, accounts, items } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
+import { postJournalEntry } from './posting';
 import { trialBalance } from './reports';
 import { reorderReport, physicalCount, lowStockCount } from './inventoryOps';
 
@@ -79,15 +80,16 @@ describe('inventoryOps service (end-to-end)', () => {
 
     // Seed the Inventory Asset account balance to match the item's opening state
     // so the trial balance will be balanced after we post adjustment entries.
-    // We do this by inserting a synthetic journal entry (Dr Inventory, Cr Equity).
-    await db
-      .update(accounts)
-      .set({ balance: '50.00' })
-      .where(eq(accounts.id, acct['1300']));
-    await db
-      .update(accounts)
-      .set({ balance: '50.00' })
-      .where(eq(accounts.id, acct['3000']));
+    // We do this by posting a real opening entry (Dr Inventory, Cr Equity) —
+    // accounts.balance is ledger-derived and cannot be written directly.
+    await postJournalEntry(ctx, {
+      date: new Date('2026-01-01'),
+      description: 'Opening inventory',
+      lines: [
+        { accountId: acct['1300'], debit: '50.00' },
+        { accountId: acct['3000'], credit: '50.00' },
+      ],
+    });
   });
 
   afterAll(async () => {

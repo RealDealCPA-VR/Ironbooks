@@ -93,11 +93,32 @@ export async function writeAudit(
   });
 }
 
+/**
+ * Ledger invariants enforced by the database (drizzle/0017_team_ledger.sql) raise custom
+ * SQLSTATEs. Translate them into ServiceErrors so API routes answer 400/409 with the real
+ * reason instead of a generic 500. Anything else is returned unchanged.
+ */
+export function translateLedgerDbError(err: unknown): unknown {
+  if (err instanceof ServiceError || !err || typeof err !== 'object') return err;
+  const code = (err as { code?: unknown }).code;
+  const message = String((err as { message?: unknown }).message ?? '');
+  if (code === 'BK001') return new ServiceError('UNBALANCED', message, { sqlstate: code });
+  if (code === 'BK002' || code === 'BK003') {
+    return new ServiceError('CONFLICT', message, { sqlstate: code });
+  }
+  return err;
+}
+
 /** Run a function inside a DB transaction, returning its result. */
 export async function inTransaction<T>(
   ctx: ServiceContext,
   fn: (txCtx: ServiceContext) => Promise<T>,
 ): Promise<T> {
   assertNotViewer(ctx); // RBAC: viewers cannot mutate (see assertNotViewer above)
-  return ctx.db.transaction(async (tx) => fn({ ...ctx, db: tx as unknown as DB }));
+  try {
+    return await ctx.db.transaction(async (tx) => fn({ ...ctx, db: tx as unknown as DB }));
+  } catch (err) {
+    // Deferred ledger checks fire at COMMIT, i.e. here — surface them as ServiceErrors.
+    throw translateLedgerDbError(err);
+  }
 }

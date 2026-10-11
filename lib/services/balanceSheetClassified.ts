@@ -18,6 +18,7 @@ import { and, eq, lte, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { assertBalanceSheetBalanced } from './ledgerAssert';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -187,6 +188,9 @@ export async function balanceSheetClassified(
   const totalEquityWithRE = totalEquity.plus(netIncome);
 
   equityLines.sort((a, b) => a.code.localeCompare(b.code));
+  // Balanced by construction (all accounts from the same posted rows, net income folded into
+  // equity); unreachable while the DB ledger guards hold — throws a loud INTEGRITY error.
+  assertBalanceSheetBalanced('Classified balance sheet', totalAssets, totalLiabilities, totalEquityWithRE);
 
   return {
     currentAssets: makeSection(currentAssetLines, totalCurrentAssets),
@@ -201,7 +205,7 @@ export async function balanceSheetClassified(
     retainedEarnings: toAmountString(netIncome),
     totalEquity: toAmountString(totalEquityWithRE),
 
-    balanced: Money.equalWithinCent(totalAssets, totalLiabilities.plus(totalEquityWithRE)),
+    balanced: Money.eq(totalAssets, totalLiabilities.plus(totalEquityWithRE)),
     asOf: asOf?.toISOString(),
   };
 }

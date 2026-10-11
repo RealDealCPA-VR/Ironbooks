@@ -62,7 +62,7 @@ describe('listExport service (integration)', () => {
         name: 'Checking',
         type: 'asset',
         subtype: 'checking',
-        balance: '1500.00',
+        // accounts.balance is ledger-derived (DB trigger) — new accounts start at zero.
       })
       .returning();
     await db.insert(accounts).values({

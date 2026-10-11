@@ -67,6 +67,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { allowLedgerRewrite } from './posting';
 import { assertWrite } from './rbac';
 import { createBackup, ensurePreOpBackup } from './backup';
 
@@ -452,6 +453,11 @@ export async function condensePeriod(
   const deletedIds = [...plan.postedIds, ...plan.voidIds];
 
   await inTransaction(ctx, async (tx) => {
+    // Condense is a sanctioned ledger rewrite: it deletes posted lines/entries and replaces
+    // them with summaries. The DB still verifies every summary balances at COMMIT, and the
+    // balance triggers net the deletes against the inserts (zero change per account).
+    await allowLedgerRewrite(tx, 'condense');
+
     // a) Completed-reconciliation detail rows pointing at removed lines.
     //    (In-progress reconciliations protected their entries in computePlan.)
     for (const idChunk of chunks(plan.lineIds)) {
@@ -502,9 +508,8 @@ export async function condensePeriod(
     }
 
     // e) Insert the monthly summary entries DIRECTLY (not via postJournalEntry):
-    //    the period is closed by design, and the cached account balances must
-    //    NOT be re-applied — the summaries replace exactly what was deleted, so
-    //    the net change to every account (and to accounts.balance) is zero.
+    //    the period is closed by design. The summaries replace exactly what was
+    //    deleted, so the trigger-maintained accounts.balance nets to zero change.
     const [maxRow] = await tx.db
       .select({ max: sql<number>`COALESCE(MAX(${journalEntries.entryNumber}), 0)` })
       .from(journalEntries)

@@ -28,6 +28,7 @@ import {
   vendorCredits, vendors,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
+import { allowLedgerRewrite } from './posting';
 
 /** Name of the manifest entry embedded at the root of every .bka archive. */
 export const BACKUP_MANIFEST_ENTRY = 'bookkeeper-manifest.json';
@@ -703,6 +704,11 @@ export async function restoreCompanyBackup(
   if (clash.length) name = `${name} (Restored ${new Date().toISOString().slice(0, 10)})`;
 
   return db.transaction(async (tx) => {
+    // Re-inserting a backup's posted ledger is a sanctioned rewrite (lines are added to
+    // entries that were not created "now"). Every restored posted entry is still verified
+    // balanced at COMMIT, so a corrupt archive cannot restore unbalanced books.
+    await allowLedgerRewrite({ db: tx as unknown as DB }, 'restore');
+
     const [company] = await tx
       .insert(companies)
       .values({
@@ -720,6 +726,9 @@ export async function restoreCompanyBackup(
       let rows = data.tables[spec.name] ?? [];
       if (spec.selfParentKey) rows = topoSortByParent(rows, spec.selfParentKey);
       const revived = rows.map((r) => reviveRow(spec, r, idMap, company.id, opts.ownerId));
+      // Cached balances are never restored verbatim: accounts start at zero and the DB
+      // balance triggers rebuild them from the restored posted journal lines.
+      if (spec.name === 'accounts') for (const r of revived) r.balance = '0.00';
       // Chunked inserts keep parameter counts well under PG limits.
       for (let i = 0; i < revived.length; i += 200) {
         await tx.insert(spec.table).values(revived.slice(i, i + 200) as never);

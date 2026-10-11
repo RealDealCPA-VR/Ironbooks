@@ -1,8 +1,17 @@
 /**
  * Posting engine — the single, validated path that turns business events into balanced
  * double-entry journal entries. Invoices, bills, payments, deposits, payroll, etc. all post
- * through `postJournalEntry`. This is the one place that enforces debits == credits and keeps
- * cached account balances correct.
+ * through `postJournalEntry`. This is the one place that validates debits == credits up front.
+ *
+ * Defence in depth (drizzle/0017_team_ledger.sql): the DATABASE independently enforces the same
+ * invariants, so no code path can leave the books out of balance:
+ *  - a deferred constraint trigger rejects, at COMMIT, any posted entry that is unbalanced, has
+ *    fewer than two lines, or has a malformed line;
+ *  - `accounts.balance` is maintained ONLY by triggers from posted journal lines and entry status
+ *    transitions (this module no longer applies balance deltas itself), and direct writes of it
+ *    are refused unless they equal the ledger-derived value;
+ *  - lines of posted/void entries are immutable except inside a sanctioned rewrite
+ *    (`allowLedgerRewrite`, used only by condense, account merge and company restore).
  */
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
@@ -103,7 +112,7 @@ async function nextEntryNumber(ctx: ServiceContext): Promise<number> {
   return (row?.max ?? 0) + 1;
 }
 
-/** Create a balanced journal entry and (if posted) update cached account balances. */
+/** Create a balanced journal entry. If posted, the DB trigger updates cached account balances. */
 export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEntryInput) {
   assertBalanced(input.lines);
   await assertPeriodOpen(ctx, input.date); // refuse to post into a closed period
@@ -136,9 +145,8 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       })
       .returning();
 
-    // Canonical 2dp line values. Use this SAME array for the row insert AND the cached
-    // balance deltas, so account.balance is derived from the identical rounded amounts that
-    // are stored on the journal lines (no sub-cent drift between cache and ledger truth).
+    // Canonical 2dp line values. accounts.balance is updated by the database trigger from
+    // exactly these stored rows (no TypeScript-side delta, so nothing can be applied twice).
     const normalizedLines = input.lines.map((l) => ({
       accountId: l.accountId,
       debit: l.debit != null && Money.gt(l.debit, 0) ? toAmountString(l.debit) : null,
@@ -151,10 +159,6 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       normalizedLines.map((l) => ({ journalEntryId: entry.id, ...l })),
     );
 
-    if (status === 'posted') {
-      await applyBalanceDeltas(tx, normalizedLines, typeById, 1);
-    }
-
     await writeAudit(tx, {
       action: 'create',
       entityType: 'journal_entry',
@@ -166,7 +170,7 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
   });
 }
 
-/** Void a posted entry: mark void and reverse its balance impact. */
+/** Void a posted entry: mark void (the DB trigger reverses its balance impact). */
 export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
   return inTransaction(ctx, async (tx) => {
     const [entry] = await tx.db
@@ -211,17 +215,8 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       }
     }
 
-    const accountIds = [...new Set(lines.map((l) => l.accountId))];
-    const accountRows = await tx.db
-      .select({ id: accounts.id, type: accounts.type })
-      .from(accounts)
-      .where(inArray(accounts.id, accountIds));
-    const typeById = new Map(accountRows.map((a) => [a.id, a.type]));
-
-    if (entry.status === 'posted') {
-      await applyBalanceDeltas(tx, lines, typeById, -1);
-    }
-
+    // Flipping the status to 'void' reverses the entry's balance impact via the database
+    // trigger (bka_je_sync_balances) — no TypeScript balance arithmetic here.
     const [updated] = await tx.db
       .update(journalEntries)
       .set({ status: 'void', voidedAt: new Date(), updatedAt: new Date() })
@@ -239,29 +234,27 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
   });
 }
 
-async function applyBalanceDeltas(
-  ctx: ServiceContext,
-  lines: Array<{ accountId: string; debit?: string | number | null; credit?: string | number | null }>,
-  typeById: Map<string, string>,
-  sign: 1 | -1,
-) {
-  // Aggregate per account so we issue one UPDATE per account.
-  const deltas = new Map<string, ReturnType<typeof balanceDelta>>();
-  for (const line of lines) {
-    const type = typeById.get(line.accountId);
-    if (!type) continue;
-    const delta = balanceDelta(type, line.debit, line.credit).times(sign);
-    const prev = deltas.get(line.accountId);
-    deltas.set(line.accountId, prev ? prev.plus(delta) : delta);
-  }
-  for (const [accountId, delta] of deltas) {
-    if (delta.isZero()) continue;
-    await ctx.db
-      .update(accounts)
-      .set({
-        balance: sql`${accounts.balance} + ${toAmountString(delta)}`,
-        updatedAt: new Date(),
-      })
-      .where(eq(accounts.id, accountId));
-  }
+/**
+ * Sanctioned ledger rewrite. Sets the transaction-local flag `bka.allow_ledger_rewrite` that
+ * lets the current transaction delete / re-point / back-fill lines of posted entries (see the
+ * immutability guards in drizzle/0017_team_ledger.sql). The deferred balance check still runs
+ * at COMMIT for every entry whose header or lines the rewrite touched, so a rewrite can never
+ * leave an unbalanced entry behind. It does NOT exempt moving an account with journal lines to
+ * another company (that is refused unconditionally, since it touches no entry).
+ *
+ * WHITELIST — only these flows may call it: condense (summarize closed history), account merge
+ * (re-point lines between same-type accounts) and company restore (re-insert a backup's ledger).
+ * Must be called inside a transaction (`SET LOCAL` semantics: it ends with the transaction).
+ */
+export async function allowLedgerRewrite(
+  ctx: Pick<ServiceContext, 'db'>,
+  reason: 'condense' | 'merge' | 'restore',
+): Promise<void> {
+  await ctx.db.execute(
+    // The txid binds the flag to THIS transaction: the guards ignore it anywhere else, even if a
+    // session-level set_config were left behind.
+    sql`SELECT set_config('bka.allow_ledger_rewrite', 'on', true),
+               set_config('bka.ledger_rewrite_txid', txid_current()::text, true),
+               set_config('bka.ledger_rewrite_reason', ${reason}, true)`,
+  );
 }
