@@ -19,6 +19,9 @@
  *     inventory portion. The per-layer increments are recorded so a void backs them out exactly.
  *   - Average-cost items: the on-hand share is min(on hand, received) / received (an average
  *     pool cannot tell which units were sold); averageCost absorbs the inventory portion.
+ *   - Unit costs are stored at 4dp, so the inventory debit is the item's actual book-value change
+ *     (to the cent, as inventoryValuation measures it) and any sub-cent-per-unit remainder goes to
+ *     COGS. FIFO layers split off one unit to carry the remainder, so integer layers stay exact.
  *
  * Voiding reverses the entries and the cost changes, but only while the affected stock is
  * untouched since the allocation (FIFO layers still hold the same quantity; average items still
@@ -39,6 +42,7 @@ import {
   landedCostAllocations,
   vendors,
 } from '@/lib/db/schema';
+import Decimal from 'decimal.js';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -103,6 +107,84 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
+}
+
+/**
+ * An item's book value exactly as inventoryValuation reports it (FIFO: remaining layers;
+ * average: QOH × average cost; rounded to the cent per item). Landed cost posts the change in
+ * this figure so the inventory GL can never drift from valuation through 4dp unit-cost rounding.
+ */
+async function itemBookValue(ctx: ServiceContext, itemId: string, fifo: boolean): Promise<Dec> {
+  if (fifo) {
+    const [row] = await ctx.db
+      .select({
+        value: sql<string>`COALESCE(SUM(${inventoryLayers.quantityRemaining} * ${inventoryLayers.unitCost}), 0)`,
+      })
+      .from(inventoryLayers)
+      .where(and(eq(inventoryLayers.companyId, ctx.companyId), eq(inventoryLayers.itemId, itemId)));
+    return Money.round2(row?.value ?? '0');
+  }
+  const [item] = await ctx.db
+    .select({ qoh: items.quantityOnHand, avg: items.averageCost })
+    .from(items)
+    .where(eq(items.id, itemId));
+  return Money.round2(Money.of(item?.qoh ?? '0').times(Money.of(item?.avg ?? '0')));
+}
+
+/**
+ * Raise a FIFO layer's value by exactly `part`. Unit cost is stored at 4dp, so the per-unit
+ * increment is rounded down and, when that leaves a remainder, one unit is split off into its
+ * own layer carrying the remainder (same date/source, so FIFO order is unchanged). Returns the
+ * per-layer increments a void backs out.
+ */
+async function revalueLayer(
+  ctx: ServiceContext,
+  layer: typeof inventoryLayers.$inferSelect,
+  part: Dec,
+): Promise<Array<{ layerId: string; quantity: string; unitCostDelta: string }>> {
+  const qty = Money.of(layer.quantityRemaining);
+  const cost = Money.of(layer.unitCost);
+  const delta = part.dividedBy(qty).toDecimalPlaces(4, Decimal.ROUND_DOWN);
+  const remainder = part.minus(qty.times(delta));
+  const splittable =
+    remainder.greaterThan(0) && qty.greaterThan(1) && remainder.toDecimalPlaces(4).equals(remainder);
+  if (!splittable) {
+    // Exact already, or a fractional layer that cannot carry the remainder exactly — the caller
+    // expenses whatever the rounded cost does not capture.
+    await ctx.db
+      .update(inventoryLayers)
+      .set({ unitCost: cost.plus(delta).toFixed(4) })
+      .where(eq(inventoryLayers.id, layer.id));
+    return [{ layerId: layer.id, quantity: qty.toFixed(4), unitCostDelta: delta.toFixed(4) }];
+  }
+  const rest = qty.minus(1);
+  await ctx.db
+    .update(inventoryLayers)
+    .set({ quantityRemaining: rest.toFixed(4), unitCost: cost.plus(delta).toFixed(4) })
+    .where(eq(inventoryLayers.id, layer.id));
+  const unitDelta = delta.plus(remainder);
+  const [split] = await ctx.db
+    .insert(inventoryLayers)
+    .values({
+      companyId: layer.companyId,
+      itemId: layer.itemId,
+      date: layer.date,
+      quantityRemaining: '1.0000',
+      unitCost: cost.plus(unitDelta).toFixed(4),
+      sourceRef: layer.sourceRef,
+    })
+    .returning();
+  return [
+    { layerId: layer.id, quantity: rest.toFixed(4), unitCostDelta: delta.toFixed(4) },
+    { layerId: split.id, quantity: '1.0000', unitCostDelta: unitDelta.toFixed(4) },
+  ];
+}
+
+/** A posting line for a signed amount: positive debits, negative credits. */
+function signedLine(accountId: string, amount: Dec, memo: string) {
+  return amount.isNegative()
+    ? { accountId, credit: toAmountString(amount.negated()), memo }
+    : { accountId, debit: toAmountString(amount), memo };
 }
 
 /** Sum of active (non-void) allocations per bill line. */
@@ -304,7 +386,15 @@ async function computeAllocation(ctx: ServiceContext, input: AllocateLandedCostI
 
   const already = (await allocatedByBillLine(ctx, [billLine.id])).get(billLine.id) ?? Money.zero();
   const remaining = Money.of(billLine.amount).minus(already);
-  const amount = input.amount != null && input.amount !== '' ? Money.round2(input.amount) : remaining;
+  let amount = remaining;
+  if (input.amount != null && input.amount !== '') {
+    try {
+      amount = Money.round2(input.amount);
+    } catch {
+      throw validation('Landed cost amount must be a number.');
+    }
+    if (!amount.isFinite()) throw validation('Landed cost amount must be a number.');
+  }
   if (!amount.greaterThan(0)) throw validation('Nothing left to allocate on this bill line.');
   if (amount.greaterThan(remaining)) {
     throw validation(
@@ -503,10 +593,11 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
       // Shares are recomputed per line so earlier lines' layer revaluations are visible.
       const [share] = await onHandShares(tx, [t, ...c.targets.filter((o, j) => j !== i && o.itemId === t.itemId)]);
       const invPortion = Money.round2(amount.times(share.share));
-      const cogsPortion = amount.minus(invPortion);
 
       // --- Cost subledger ---
       const [item] = await tx.db.select().from(items).where(eq(items.id, t.itemId));
+      const fifoTracked = share.fifo;
+      const valueBefore = await itemBookValue(tx, t.itemId, fifoTracked);
       let quantityAtAllocation = Money.zero();
       let layerAdjustments: Array<{ layerId: string; quantity: string; unitCostDelta: string }> | null = null;
       if (invPortion.greaterThan(0)) {
@@ -518,17 +609,18 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
             const layer = share.layers[k];
             const qty = Money.of(layer.quantityRemaining);
             if (!parts[k].greaterThan(0) || !qty.greaterThan(0)) continue;
-            const delta = parts[k].dividedBy(qty);
-            await tx.db
-              .update(inventoryLayers)
-              .set({ unitCost: Money.of(layer.unitCost).plus(delta).toFixed(4) })
-              .where(eq(inventoryLayers.id, layer.id));
-            layerAdjustments.push({ layerId: layer.id, quantity: qty.toFixed(4), unitCostDelta: delta.toFixed(4) });
+            layerAdjustments.push(...(await revalueLayer(tx, layer, parts[k])));
             quantityAtAllocation = quantityAtAllocation.plus(qty);
           }
         } else {
           const qoh = Money.of(item.quantityOnHand ?? '0');
-          const newAvg = qoh.times(Money.of(item.averageCost ?? '0')).plus(invPortion).dividedBy(qoh);
+          // Rounded DOWN to the stored 4dp so the pool never gains more than the charge; the
+          // sub-cent remainder is expensed below.
+          const newAvg = qoh
+            .times(Money.of(item.averageCost ?? '0'))
+            .plus(invPortion)
+            .dividedBy(qoh)
+            .toDecimalPlaces(4, Decimal.ROUND_DOWN);
           await tx.db
             .update(items)
             .set({ averageCost: newAvg.toFixed(4), updatedAt: new Date() })
@@ -536,6 +628,11 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
           quantityAtAllocation = qoh;
         }
       }
+      // The GL follows the subledger to the cent: the inventory debit is the change in the item's
+      // book value as inventoryValuation reports it, and any rounding remainder that the 4dp unit
+      // cost could not hold goes to COGS — so inventory GL == valuation always holds.
+      const capitalised = (await itemBookValue(tx, t.itemId, fifoTracked)).minus(valueBefore);
+      const cogsPortion = amount.minus(capitalised);
 
       // --- GL ---
       let inventoryAccountId = item.assetAccountId;
@@ -545,11 +642,11 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
       }
       const memo = `${label} — ${t.itemName}`;
       const postingLines = [];
-      if (invPortion.greaterThan(0)) {
-        postingLines.push({ accountId: inventoryAccountId, debit: toAmountString(invPortion), memo });
+      if (!capitalised.isZero()) {
+        postingLines.push(signedLine(inventoryAccountId, capitalised, memo));
       }
-      if (cogsPortion.greaterThan(0)) {
-        postingLines.push({ accountId: cogsAccountId, debit: toAmountString(cogsPortion), memo: `${memo} (units already sold)` });
+      if (!cogsPortion.isZero()) {
+        postingLines.push(signedLine(cogsAccountId, cogsPortion, `${memo} (units already sold / rounding)`));
       }
       postingLines.push({ accountId: c.billLine.accountId, credit: toAmountString(amount), memo });
       const entry = await postJournalEntry(tx, {
@@ -569,7 +666,7 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
           itemId: t.itemId,
           basis: c.bases[i].toFixed(4),
           amount: toAmountString(amount),
-          inventoryAmount: toAmountString(invPortion),
+          inventoryAmount: toAmountString(capitalised),
           cogsAmount: toAmountString(cogsPortion),
           quantityAtAllocation: quantityAtAllocation.toFixed(4),
           layerAdjustments,
@@ -663,18 +760,22 @@ export async function voidLandedCostAllocation(ctx: ServiceContext, id: string) 
     const allocation = await getLandedCostAllocation(tx, id);
     if (allocation.status === 'void') return allocation;
 
+    let cogsAccountId: string | null = null;
     for (const line of allocation.lines) {
       const inv = Money.of(line.inventoryAmount);
+      const fifoLine = Boolean(line.layerAdjustments && line.layerAdjustments.length > 0);
+      let valueChange = Money.zero();
+      const [item] = await tx.db.select().from(items).where(eq(items.id, line.itemId));
       if (inv.greaterThan(0)) {
-        const [item] = await tx.db.select().from(items).where(eq(items.id, line.itemId));
         const moved = () =>
           new ServiceError(
             'CONFLICT',
             `Stock of "${line.itemName}" has moved since this landed cost was applied, so it cannot be ` +
               'reversed exactly. Record an inventory value adjustment instead.',
           );
-        if (line.layerAdjustments && line.layerAdjustments.length > 0) {
-          for (const adj of line.layerAdjustments) {
+        const valueBefore = await itemBookValue(tx, line.itemId, fifoLine);
+        if (fifoLine) {
+          for (const adj of line.layerAdjustments!) {
             const [layer] = await tx.db.select().from(inventoryLayers).where(eq(inventoryLayers.id, adj.layerId));
             if (!layer || !Money.of(layer.quantityRemaining).equals(Money.of(adj.quantity))) throw moved();
             const restored = Money.of(layer.unitCost).minus(Money.of(adj.unitCostDelta));
@@ -694,8 +795,26 @@ export async function voidLandedCostAllocation(ctx: ServiceContext, id: string) 
             .set({ averageCost: value.dividedBy(qoh).toFixed(4), updatedAt: new Date() })
             .where(eq(items.id, item.id));
         }
+        valueChange = (await itemBookValue(tx, line.itemId, fifoLine)).minus(valueBefore);
       }
       if (line.entryId) await voidJournalEntry(tx, line.entryId);
+
+      // The reversal takes `inv` back out of the inventory GL. When restoring a 4dp average cost
+      // does not move the book value by exactly that much, true up the difference against COGS
+      // so inventory GL == valuation still holds.
+      const residual = valueChange.plus(inv);
+      if (!residual.isZero()) {
+        cogsAccountId ??= await accountIdByCode(tx, '5000');
+        const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
+        const memo = `Landed cost void rounding — ${line.itemName}`;
+        await postJournalEntry(tx, {
+          date: allocation.date,
+          description: memo,
+          reference: `landed-cost:${allocation.id}`,
+          sourceRef: `item:${line.itemId}`,
+          lines: [signedLine(inventoryAccountId, residual, memo), signedLine(cogsAccountId, residual.negated(), memo)],
+        });
+      }
     }
 
     const [updated] = await tx.db

@@ -16,6 +16,7 @@ import {
 } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
+import { assertPeriodOpen } from './fiscalPeriods';
 import { type MovementRequest, getSite, normalizeSerials, recordMovements, reverseSourceMovements } from './inventorySites';
 
 export interface InventoryTransferLineInput {
@@ -48,6 +49,9 @@ export async function createInventoryTransfer(ctx: ServiceContext, input: Create
   if (input.fromSiteId === input.toSiteId) throw validation('Choose two different sites to transfer between.');
 
   return inTransaction(ctx, async (tx) => {
+    // No GL, so posting.ts never checks the period — a transfer is still a dated transaction
+    // the closing date locks (QB parity).
+    await assertPeriodOpen(tx, input.date);
     const from = await getSite(tx, input.fromSiteId);
     const to = await getSite(tx, input.toSiteId);
     if (!from.isActive || !to.isActive) throw validation('Transfers require active sites.');
@@ -63,8 +67,15 @@ export async function createInventoryTransfer(ctx: ServiceContext, input: Create
       const item = itemById.get(l.itemId);
       if (!item) throw notFound(`Item ${l.itemId}`);
       if (item.type !== 'inventory') throw validation(`Line ${i + 1}: "${item.name}" is not an inventory item.`);
-      const qty = Money.of(l.quantity);
-      if (!qty.greaterThan(0)) throw validation(`Line ${i + 1}: quantity must be greater than zero.`);
+      let qty;
+      try {
+        // Quantities are stored at 4dp — round first so a sub-precision quantity cannot slip
+        // through as a zero-quantity line.
+        qty = Money.of(l.quantity).toDecimalPlaces(4);
+      } catch {
+        throw validation(`Line ${i + 1}: quantity must be a number.`);
+      }
+      if (!qty.isFinite() || !qty.greaterThan(0)) throw validation(`Line ${i + 1}: quantity must be greater than zero.`);
       return { ...l, qty, serials: normalizeSerials(l.serialNumbers), lot: l.lotNumber?.trim() || null, lineOrder: i };
     });
 
@@ -197,6 +208,7 @@ export async function voidInventoryTransfer(ctx: ServiceContext, id: string) {
   return inTransaction(ctx, async (tx) => {
     const transfer = await getInventoryTransfer(tx, id);
     if (transfer.status === 'void') return transfer;
+    await assertPeriodOpen(tx, transfer.date);
     try {
       await reverseSourceMovements(tx, 'transfer', id);
     } catch (err) {

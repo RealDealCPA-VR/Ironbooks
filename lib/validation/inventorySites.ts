@@ -54,7 +54,8 @@ export const siteReorderPointSchema = z.object({
 
 export const inventoryTransferLineSchema = z.object({
   itemId: zUuid,
-  quantity: zDecimalPositive,
+  // Quantities are stored at 4dp: a sub-precision value would round to zero.
+  quantity: zDecimalPositive.refine((v) => Number(v) >= 0.00005, { message: 'must be at least 0.0001' }),
   fromBinId: zUuid.nullish(),
   toBinId: zUuid.nullish(),
   serialNumbers: z.array(z.string().max(100)).max(10000).nullish(),

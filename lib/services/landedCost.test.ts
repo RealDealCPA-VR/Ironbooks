@@ -18,6 +18,7 @@ import { createItemReceipt, voidItemReceipt } from './itemReceipts';
 import { createInvoice } from './invoices';
 import { receiveStock } from './fifo';
 import { inventoryValuation } from './inventory';
+import { Money } from '@/lib/money';
 import {
   allocateLandedCost,
   listLandedCostSources,
@@ -239,5 +240,80 @@ describe('Landed cost', () => {
     );
     const inv = await verifySiteInvariants(rctx);
     expect(inv.checks.filter((c) => !c.ok)).toEqual([]);
+  });
+
+  // Unit costs are stored at 4dp but the GL posts to the cent: the subledger must still capture
+  // the charge exactly (FIFO splits off one unit for the remainder) or expense the sub-cent
+  // remainder (average cost), and a void must put both sides back exactly.
+  describe('4dp unit-cost rounding', () => {
+    async function seedBulk(name: string) {
+      return (
+        await db
+          .insert(items)
+          .values({ companyId: ctx.companyId, name, type: 'inventory', quantityOnHand: '0', averageCost: '0' } as never)
+          .returning()
+      )[0].id;
+    }
+    async function freight(amount: number, billNumber: string) {
+      const b = await createBill(ctx, {
+        vendorId,
+        billNumber,
+        date: new Date('2026-05-10'),
+        lines: [{ accountId: acct['6100'], description: 'Freight', amount }],
+      });
+      return { id: b.id, line: (await getBill(ctx, b.id)).lines[0].id };
+    }
+    async function layerValue(itemId: string) {
+      const rows = await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, itemId));
+      return rows
+        .reduce((s, l) => s.plus(Money.of(l.quantityRemaining).times(Money.of(l.unitCost))), Money.zero())
+        .toFixed(4);
+    }
+
+    it('FIFO: $250 over 1,200 units is capitalised to the cent and voids back exactly', async () => {
+      const bulk = await seedBulk('Bulk FIFO');
+      await receiveStock(ctx, { itemId: bulk, quantity: 1, unitCost: 2.5, date: new Date('2026-05-09') });
+      const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-05-09'), lines: [{ itemId: bulk, quantity: 1200, unitCost: 2.5 }] });
+      const bill = await freight(250, 'FRT-BULK');
+      const freightBefore = await balance('6100');
+      const alloc = await allocateLandedCost(ctx, { billId: bill.id, billLineId: bill.line, method: 'quantity', itemReceiptIds: [r.id] });
+      expect(alloc.lines.map((l) => [l.inventoryAmount, l.cogsAmount])).toEqual([['250.00', '0.00']]);
+      expect(await layerValue(bulk)).toBe('3252.5000');
+      await assertBooksTie();
+
+      await voidLandedCostAllocation(ctx, alloc.id);
+      expect(await layerValue(bulk)).toBe('3002.5000');
+      expect(await balance('6100')).toBe(freightBefore);
+      await assertBooksTie();
+    });
+
+    it('FIFO: a charge far below a cent per unit is not lost from valuation', async () => {
+      const bulk = await seedBulk('Bulk FIFO Tiny');
+      await receiveStock(ctx, { itemId: bulk, quantity: 1, unitCost: 1, date: new Date('2026-05-09') });
+      const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-05-09'), lines: [{ itemId: bulk, quantity: 30000, unitCost: 1 }] });
+      const bill = await freight(1, 'FRT-TINY');
+      const alloc = await allocateLandedCost(ctx, { billId: bill.id, billLineId: bill.line, method: 'quantity', itemReceiptIds: [r.id] });
+      expect(alloc.lines.map((l) => [l.inventoryAmount, l.cogsAmount])).toEqual([['1.00', '0.00']]);
+      expect(await layerValue(bulk)).toBe('30002.0000');
+      await assertBooksTie();
+    });
+
+    it('average cost: the sub-cent remainder goes to COGS and a void trues up exactly', async () => {
+      const bulk = await seedBulk('Bulk AVG');
+      const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-05-09'), lines: [{ itemId: bulk, quantity: 3000, unitCost: 10 }] });
+      const bill = await freight(10, 'FRT-AVGB');
+      const freightBefore = await balance('6100');
+      const cogsBefore = await balance('5000');
+      const alloc = await allocateLandedCost(ctx, { billId: bill.id, billLineId: bill.line, method: 'quantity', itemReceiptIds: [r.id] });
+      expect(alloc.lines.map((l) => [l.inventoryAmount, l.cogsAmount])).toEqual([['9.90', '0.10']]);
+      expect((await item(bulk)).averageCost).toBe('10.0033');
+      await assertBooksTie();
+
+      await voidLandedCostAllocation(ctx, alloc.id);
+      expect((await item(bulk)).averageCost).toBe('10.0000');
+      expect(await balance('6100')).toBe(freightBefore);
+      expect(await balance('5000')).toBe(cogsBefore);
+      await assertBooksTie();
+    });
   });
 });

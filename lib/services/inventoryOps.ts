@@ -632,26 +632,34 @@ export async function batchPhysicalCount(
     seen.add(c.itemId);
   }
 
-  const applied: PhysicalCountResult[] = [];
-  const skipped: Array<{ itemId: string; reason: string }> = [];
+  // One outer transaction: each item's count runs in its own savepoint, so an item refused
+  // for a per-item reason (bad input, missing item, or a site guard CONFLICT) is rolled back and
+  // reported as skipped, while any other failure aborts the whole batch — never half-applied.
+  return inTransaction(ctx, async (tx) => {
+    const applied: PhysicalCountResult[] = [];
+    const skipped: Array<{ itemId: string; reason: string }> = [];
 
-  for (const c of input.counts) {
-    try {
-      const result = await physicalCount(ctx, {
-        itemId: c.itemId,
-        countedQty: c.countedQty,
-        date: input.date,
-        adjustmentAccountId: input.adjustmentAccountId ?? null,
-      });
-      applied.push(result);
-    } catch (err) {
-      if (err instanceof ServiceError && (err.code === 'VALIDATION' || err.code === 'NOT_FOUND')) {
-        skipped.push({ itemId: c.itemId, reason: err.message });
-      } else {
-        throw err;
+    for (const c of input.counts) {
+      try {
+        const result = await physicalCount(tx, {
+          itemId: c.itemId,
+          countedQty: c.countedQty,
+          date: input.date,
+          adjustmentAccountId: input.adjustmentAccountId ?? null,
+        });
+        applied.push(result);
+      } catch (err) {
+        if (
+          err instanceof ServiceError &&
+          (err.code === 'VALIDATION' || err.code === 'NOT_FOUND' || err.code === 'CONFLICT')
+        ) {
+          skipped.push({ itemId: c.itemId, reason: err.message });
+        } else {
+          throw err;
+        }
       }
     }
-  }
 
-  return { applied, skipped };
+    return { applied, skipped };
+  });
 }

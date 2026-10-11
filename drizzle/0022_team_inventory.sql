@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS "inventory_transfers" (
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "inventory_transfers_company_number_uq" ON "inventory_transfers" ("company_id", "transfer_number");--> statement-breakpoint
 CREATE TABLE IF NOT EXISTS "inventory_transfer_lines" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"transfer_id" uuid NOT NULL REFERENCES "inventory_transfers"("id"),
