@@ -47,6 +47,7 @@ import {
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
+import { type AppliedPricing, resolveLinePricing } from './pricing';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -76,7 +77,8 @@ export interface SalesReceiptLineInput {
   accountId?: string | null;
   description?: string | null;
   quantity: string | number;
-  rate: string | number;
+  /** Unit price; omit on item lines to price server-side (lib/services/pricing.ts). */
+  rate?: string | number | null;
   /** Whether this line participates in tax calculation. Defaults true. */
   taxable?: boolean;
   /** Per-line tax rate override (UUID of a taxRates row). */
@@ -260,14 +262,22 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
     taxable: boolean;
     taxRateId: string | null;
     lineOrder: number;
+    pricing: AppliedPricing | null;
   };
+
+  // Advanced pricing: fill omitted item rates and record rule/level provenance.
+  const pricedLines = await resolveLinePricing(
+    ctx,
+    { customerId: input.customerId ?? null, date: input.date, classId: input.classId ?? null },
+    input.lines,
+  );
 
   let subtotal = Money.zero();
   let taxableSubtotal = Money.zero();
   const computedLines: ComputedLine[] = [];
 
-  for (let i = 0; i < input.lines.length; i++) {
-    const l = input.lines[i];
+  for (let i = 0; i < pricedLines.length; i++) {
+    const l = pricedLines[i];
     const qty = Money.of(l.quantity);
     const rate = Money.of(l.rate);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
@@ -309,6 +319,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
       taxable,
       taxRateId: l.taxRateId ?? null,
       lineOrder: i,
+      pricing: l.pricing,
     });
   }
 
@@ -362,6 +373,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
           classId: input.classId ?? null,
           taxRateId: cl.taxRateId,
           lineOrder: cl.lineOrder,
+          pricing: cl.pricing as Record<string, unknown> | null,
         })),
       )
       .returning();

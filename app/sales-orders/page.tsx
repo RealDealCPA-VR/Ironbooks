@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { FileCheck, Plus, ArrowRight, PlusCircle, MinusCircle, Printer } from 'lucide-react';
+import { FileCheck, Plus, ArrowRight, Printer, PackageCheck } from 'lucide-react';
+import Link from 'next/link';
 import {
   Button,
   Card,
@@ -22,6 +23,12 @@ import {
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
+import {
+  PricedLinesEditor,
+  emptyPricedLine,
+  type PricedLineItem,
+  type PricedLineValue,
+} from '@/components/PricedLinesEditor';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -55,11 +62,6 @@ interface SalesOrderDetail extends SalesOrder {
   lines: SalesOrderLine[];
 }
 
-interface LineRow {
-  description: string;
-  quantity: string;
-  rate: string;
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -83,15 +85,9 @@ function statusLabel(status: string): string {
   return status;
 }
 
-function computeLineTotal(line: LineRow): number {
-  return (parseFloat(line.quantity) || 0) * (parseFloat(line.rate) || 0);
+function computeTotal(lines: PricedLineValue[]): number {
+  return lines.reduce((sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0), 0);
 }
-
-function computeTotal(lines: LineRow[]): number {
-  return lines.reduce((sum, l) => sum + computeLineTotal(l), 0);
-}
-
-const EMPTY_LINE: LineRow = { description: '', quantity: '', rate: '' };
 
 // ---------------------------------------------------------------------------
 // New Sales Order Modal
@@ -101,14 +97,15 @@ interface NewOrderModalProps {
   open: boolean;
   onClose: () => void;
   customers: Customer[];
+  items: PricedLineItem[];
   onCreated: () => void;
 }
 
-function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalProps) {
+function NewOrderModal({ open, onClose, customers, items, onCreated }: NewOrderModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
-  const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
+  const [lines, setLines] = useState<PricedLineValue[]>([emptyPricedLine()]);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -116,40 +113,24 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setMemo('');
-      setLines([{ ...EMPTY_LINE }]);
+      setLines([emptyPricedLine()]);
     }
   }, [open]);
-
-  function updateLine(idx: number, field: keyof LineRow, value: string) {
-    setLines((prev) => {
-      const next = [...prev];
-      next[idx] = { ...next[idx], [field]: value };
-      return next;
-    });
-  }
-
-  function addLine() {
-    setLines((prev) => [...prev, { ...EMPTY_LINE }]);
-  }
-
-  function removeLine(idx: number) {
-    setLines((prev) => prev.filter((_, i) => i !== idx));
-  }
 
   const liveTotal = computeTotal(lines);
 
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter an order date.', 'danger'); return; }
-    const validLines = lines.filter((l) => l.description || l.quantity || l.rate);
+    const validLines = lines.filter((l) => l.itemId || l.description || l.rate);
     if (validLines.length === 0) { toast('Add at least one line item.', 'danger'); return; }
     for (let i = 0; i < validLines.length; i++) {
       const l = validLines[i];
       if (!l.quantity || parseFloat(l.quantity) <= 0) {
         toast(`Line ${i + 1}: quantity must be a positive number.`, 'danger'); return;
       }
-      if (l.rate === '' || parseFloat(l.rate) < 0) {
-        toast(`Line ${i + 1}: rate cannot be negative.`, 'danger'); return;
+      if ((l.rate === '' && !l.itemId) || parseFloat(l.rate) < 0) {
+        toast(`Line ${i + 1}: enter a rate (it cannot be negative).`, 'danger'); return;
       }
     }
 
@@ -160,9 +141,11 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
         date,
         memo: memo || undefined,
         lines: validLines.map((l) => ({
+          itemId: l.itemId || null,
           description: l.description || null,
           quantity: l.quantity,
-          rate: l.rate,
+          // Blank rate on an item line: the server prices it (advanced pricing).
+          rate: l.rate === '' ? null : l.rate,
         })),
       });
       toast('Sales order created.', 'success');
@@ -181,6 +164,7 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
       open={open}
       onClose={onClose}
       title="New Sales Order"
+      size="xl"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
@@ -229,65 +213,15 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
           />
         </div>
 
-        {/* Line items */}
+        {/* Line items (item pick -> server-side pricing) */}
         <div>
-          <div className="flex items-center justify-between mb-2">
-            <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
-              <PlusCircle className="h-4 w-4" /> Add line
-            </button>
-          </div>
-
-          <div className="rounded-lg border border-slate-200 overflow-hidden">
-            <div className="grid grid-cols-[1fr_80px_90px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
-              <span>Description</span>
-              <span>Qty</span>
-              <span>Rate</span>
-              <span />
-            </div>
-
-            {lines.map((line, idx) => (
-              <div
-                key={idx}
-                className="grid grid-cols-[1fr_80px_90px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
-              >
-                <Input
-                  placeholder="Description"
-                  value={line.description}
-                  onChange={(e) => updateLine(idx, 'description', e.target.value)}
-                />
-                <Input
-                  placeholder="1"
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={line.quantity}
-                  onChange={(e) => updateLine(idx, 'quantity', e.target.value)}
-                />
-                <Input
-                  placeholder="0.00"
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={line.rate}
-                  onChange={(e) => updateLine(idx, 'rate', e.target.value)}
-                />
-                <button
-                  type="button"
-                  onClick={() => removeLine(idx)}
-                  disabled={lines.length === 1}
-                  className="text-navy/30 hover:text-red-500 disabled:opacity-20 transition-colors flex items-center justify-center"
-                  aria-label="Remove line"
-                >
-                  <MinusCircle className="h-4 w-4" />
-                </button>
-              </div>
-            ))}
-          </div>
+          <Label className="mb-2">Line Items</Label>
+          <PricedLinesEditor
+            items={items}
+            lines={lines}
+            onChange={setLines}
+            header={{ customerId: customerId || null, date }}
+          />
         </div>
 
         {/* Live total */}
@@ -506,6 +440,7 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
 export default function SalesOrdersPage() {
   const [orders, setOrders] = useState<SalesOrder[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [items, setItems] = useState<PricedLineItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
 
@@ -523,6 +458,12 @@ export default function SalesOrdersPage() {
       ]);
       setOrders(orderList);
       setCustomers(custList);
+      api
+        .get<{ items: PricedLineItem[] }>('/api/items')
+        .then((r) => setItems(r.items ?? []))
+        .catch(() => {
+          // Non-fatal; lines can still be typed without an item.
+        });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to load sales orders.';
       toast(msg, 'danger');
@@ -541,9 +482,16 @@ export default function SalesOrdersPage() {
         title="Sales Orders"
         icon={FileCheck}
         action={
-          <Button onClick={() => setShowNew(true)}>
-            <Plus className="h-4 w-4" /> New Sales Order
-          </Button>
+          <div className="flex items-center gap-2">
+            <Link href="/so-fulfillment">
+              <Button variant="secondary">
+                <PackageCheck className="h-4 w-4" /> Fulfillment Worksheet
+              </Button>
+            </Link>
+            <Button onClick={() => setShowNew(true)}>
+              <Plus className="h-4 w-4" /> New Sales Order
+            </Button>
+          </div>
         }
       />
 
@@ -667,6 +615,7 @@ export default function SalesOrdersPage() {
         open={showNew}
         onClose={() => setShowNew(false)}
         customers={customers}
+        items={items}
         onCreated={fetchData}
       />
 

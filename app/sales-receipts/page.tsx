@@ -26,6 +26,8 @@ import {
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
+import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
+import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -76,6 +78,8 @@ interface LineRow {
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** Advanced pricing: the user typed the rate (automatic prices leave it alone). */
+  rateManual?: boolean;
 }
 
 const EMPTY_LINE: LineRow = { itemId: '', description: '', quantity: '', rate: '', taxable: true };
@@ -177,12 +181,31 @@ function NewReceiptModal({
         ...next[idx],
         itemId,
         description: next[idx].description || item?.name || '',
-        rate: next[idx].rate || (item?.salesPrice ?? ''),
+        rate: item?.salesPrice ?? next[idx].rate,
         quantity: next[idx].quantity || '1',
+        rateManual: false,
       };
       return next;
     });
   }
+
+  // Advanced pricing: server-side price rules / price levels / customer prices per line.
+  const quotes = usePriceQuotes(
+    { customerId: customerId || null, date },
+    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1' })),
+  );
+  useEffect(() => {
+    setLines((prev) => {
+      let changed = false;
+      const next = prev.map((l, i) => {
+        const qt = quotes[i];
+        if (!qt || l.rateManual || l.itemId !== qt.itemId || samePrice(l.rate, qt.price)) return l;
+        changed = true;
+        return { ...l, rate: String(Number(qt.price)) };
+      });
+      return changed ? next : prev;
+    });
+  }, [quotes]);
 
   function addLine() {
     setLines((prev) => [...prev, { ...EMPTY_LINE }]);
@@ -353,7 +376,7 @@ function NewReceiptModal({
               <div
                 key={idx}
                 data-grid-row
-                className="grid grid-cols-[150px_1fr_60px_80px_44px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
+                className="grid grid-cols-[150px_1fr_60px_80px_44px_32px] gap-2 items-start px-3 py-2 border-b border-slate-100 last:border-b-0"
               >
                 <Select
                   value={line.itemId}
@@ -375,11 +398,18 @@ function NewReceiptModal({
                   value={line.quantity}
                   onChange={(e) => updateLine(idx, { quantity: e.target.value })}
                 />
-                <AmountInput
-                  placeholder="0.00"
-                  value={line.rate}
-                  onChange={(e) => updateLine(idx, { rate: e.target.value })}
-                />
+                <div>
+                  <AmountInput
+                    placeholder="0.00"
+                    value={line.rate}
+                    onChange={(e) => updateLine(idx, { rate: e.target.value, rateManual: true })}
+                  />
+                  <PriceSourceBadge
+                    quote={quotes[idx]}
+                    rate={line.rate}
+                    onUseQuoted={(price) => updateLine(idx, { rate: String(Number(price)), rateManual: false })}
+                  />
+                </div>
                 <input
                   type="checkbox"
                   checked={line.taxable}

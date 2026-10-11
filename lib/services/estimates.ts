@@ -23,6 +23,7 @@ import {
   writeAudit,
 } from './_base';
 import { createInvoice } from './invoices';
+import { type AppliedPricing, resolveLinePricing } from './pricing';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,7 +33,8 @@ export interface EstimateLineInput {
   itemId?: string | null;
   description?: string | null;
   quantity: string | number;
-  rate: string | number;
+  /** Unit price; omit on item lines to price server-side (lib/services/pricing.ts). */
+  rate?: string | number | null;
   /** Defaults to true. */
   taxable?: boolean;
 }
@@ -114,14 +116,22 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
     amount: string;
     taxable: boolean;
     lineOrder: number;
+    pricing: AppliedPricing | null;
   };
+
+  // Advanced pricing: fill omitted item rates and record rule/level provenance.
+  const pricedLines = await resolveLinePricing(
+    ctx,
+    { customerId: input.customerId, date: input.date },
+    input.lines,
+  );
 
   let subtotal = Money.zero();
   let taxableSubtotal = Money.zero();
   const computedLines: ComputedLine[] = [];
 
-  for (let i = 0; i < input.lines.length; i++) {
-    const l = input.lines[i];
+  for (let i = 0; i < pricedLines.length; i++) {
+    const l = pricedLines[i];
     const qty = Money.of(l.quantity);
     const rate = Money.of(l.rate);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
@@ -139,6 +149,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
       amount: toAmountString(amount),
       taxable: l.taxable !== false,
       lineOrder: i,
+      pricing: l.pricing,
     });
   }
 
@@ -175,6 +186,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         amount: cl.amount,
         taxable: cl.taxable,
         lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
       })),
     );
 
@@ -311,6 +323,7 @@ export async function convertToInvoice(ctx: ServiceContext, estimateId: string) 
       quantity: l.quantity,
       rate: l.rate,
       taxable: l.taxable,
+      pricing: { origin: 'estimate' },
     }));
 
     // createInvoice posts the GL entry; its internal inTransaction nests as a

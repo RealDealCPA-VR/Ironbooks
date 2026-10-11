@@ -51,7 +51,7 @@ interface Item {
   type: string;
 }
 
-type ReceiptStatus = 'open' | 'billed' | 'void';
+type ReceiptStatus = 'open' | 'partial' | 'billed' | 'void';
 
 interface ItemReceipt {
   id: string;
@@ -96,14 +96,16 @@ interface LineRow {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function statusTone(status: ReceiptStatus): 'info' | 'success' | 'neutral' {
+function statusTone(status: ReceiptStatus): 'info' | 'success' | 'neutral' | 'warning' {
   if (status === 'open') return 'info';
+  if (status === 'partial') return 'warning';
   if (status === 'billed') return 'success';
   return 'neutral';
 }
 
 function statusLabel(status: ReceiptStatus): string {
   if (status === 'open') return 'Awaiting Bill';
+  if (status === 'partial') return 'Partly Billed';
   if (status === 'billed') return 'Billed';
   return 'Void';
 }
@@ -649,9 +651,14 @@ export default function ItemReceiptsPage() {
         title="Item Receipts"
         icon={PackageCheck}
         action={
-          <Button onClick={() => setShowNew(true)}>
-            <Plus className="h-4 w-4" /> Receive Items
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" onClick={() => window.location.assign('/receive-bill')} title="Bill received items with quantity / price variances">
+              <ArrowRight className="h-4 w-4" /> Enter Bill for Received Items
+            </Button>
+            <Button onClick={() => setShowNew(true)}>
+              <Plus className="h-4 w-4" /> Receive Items
+            </Button>
+          </div>
         }
       />
 
@@ -730,6 +737,11 @@ export default function ItemReceiptsPage() {
                       )}
                       {r.status === 'billed' && (
                         <span className="text-xs text-navy/30 italic">Bill created</span>
+                      )}
+                      {r.status === 'partial' && (
+                        <Button variant="ghost" size="sm" onClick={() => window.location.assign('/receive-bill')} title="Bill the rest of this receipt">
+                          <ArrowRight className="h-3.5 w-3.5" /> Bill the rest
+                        </Button>
                       )}
                     </div>
                   </Td>

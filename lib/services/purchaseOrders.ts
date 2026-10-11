@@ -33,6 +33,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { getReceivingSettings, poStatusFromLines } from './receivingLinks';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -447,17 +448,18 @@ export async function convertToBill(
       lines: billLineInputs,
     });
 
-    // Recompute PO status from the post-claim line quantities.
+    // Recompute PO status from the post-claim line quantities. With enhanced receiving on, a
+    // PO that still has received-but-unbilled item-receipt quantity stays 'partial'.
     const refreshed = await tx.db
       .select({
         quantity: purchaseOrderLines.quantity,
         quantityBilled: purchaseOrderLines.quantityBilled,
+        quantityReceivedUnbilled: purchaseOrderLines.quantityReceivedUnbilled,
       })
       .from(purchaseOrderLines)
       .where(eq(purchaseOrderLines.purchaseOrderId, poId));
-    const fullyBilled = refreshed.every(
-      (l) => !Money.of(l.quantity).minus(Money.of(l.quantityBilled ?? '0')).greaterThan(0),
-    );
+    const { enhancedReceiving } = await getReceivingSettings(tx);
+    const fullyBilled = poStatusFromLines(refreshed, enhancedReceiving) === 'closed';
     const newStatus = fullyBilled ? ('closed' as const) : ('partial' as const);
 
     await tx.db
@@ -531,15 +533,14 @@ async function recomputePoStatusFromLines(
     .select({
       quantity: purchaseOrderLines.quantity,
       quantityBilled: purchaseOrderLines.quantityBilled,
+      quantityReceivedUnbilled: purchaseOrderLines.quantityReceivedUnbilled,
     })
     .from(purchaseOrderLines)
     .where(eq(purchaseOrderLines.purchaseOrderId, poId));
 
-  const anyBilled = refreshed.some((l) => Money.of(l.quantityBilled ?? '0').greaterThan(0));
-  const fullyBilled = refreshed.every(
-    (l) => !Money.of(l.quantity).minus(Money.of(l.quantityBilled ?? '0')).greaterThan(0),
-  );
-  const newStatus = fullyBilled ? ('closed' as const) : anyBilled ? ('partial' as const) : ('open' as const);
+  // Enhanced receiving keeps a fully received PO 'partial' until its receipts are billed.
+  const { enhancedReceiving } = await getReceivingSettings(ctx);
+  const newStatus = poStatusFromLines(refreshed, enhancedReceiving);
 
   if (newStatus !== prevStatus) {
     await ctx.db
@@ -620,6 +621,8 @@ export async function claimReceiptQuantities(
         .update(purchaseOrderLines)
         .set({
           quantityBilled: sql`${purchaseOrderLines.quantityBilled} + ${takeStr}::numeric`,
+          // Enhanced receiving: received on a receipt, not yet vendor-billed.
+          quantityReceivedUnbilled: sql`${purchaseOrderLines.quantityReceivedUnbilled} + ${takeStr}::numeric`,
         })
         .where(
           and(
@@ -697,6 +700,8 @@ export async function releaseReceiptQuantities(
         .update(purchaseOrderLines)
         .set({
           quantityBilled: sql`${purchaseOrderLines.quantityBilled} - ${giveStr}::numeric`,
+          // Clamped: receipts entered before enhanced receiving carry no counter.
+          quantityReceivedUnbilled: sql`GREATEST(${purchaseOrderLines.quantityReceivedUnbilled} - ${giveStr}::numeric, 0)`,
         })
         .where(
           and(

@@ -43,6 +43,7 @@ import {
   jobs,
   journalEntries,
   journalEntryLines,
+  salesReps,
   taxRates,
 } from '@/lib/db/schema';
 import {
@@ -56,6 +57,7 @@ import {
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
+import { type AppliedPricing, resolveLinePricing } from './pricing';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -68,7 +70,14 @@ export interface InvoiceLineInput {
   accountId?: string | null;
   description?: string | null;
   quantity: string | number;
-  rate: string | number;
+  /**
+   * Unit price. Omit on item lines to have the server price the line (price rules / price
+   * levels / customer price / base price — lib/services/pricing.ts). A supplied rate that differs
+   * from the computed price is kept as a manual override and flagged in the line's provenance.
+   */
+  rate?: string | number | null;
+  /** Internal: where a carried-over price came from (conversions). Never sent by the UI. */
+  pricing?: { origin?: string | null } | null;
   /** Whether this line participates in tax calculation. Defaults true. */
   taxable?: boolean;
   /** Per-line tax rate override (UUID of a taxRates row). When set, this line is taxed at this
@@ -91,6 +100,8 @@ export interface CreateInvoiceInput {
   classId?: string | null;
   /** Invoice-level Customer:Job (job costing); inherited by lines without their own jobId. */
   jobId?: string | null;
+  /** Sales rep credited with the sale (commissions; also a price-rule condition). */
+  salesRepId?: string | null;
   /**
    * Discount value. Interpretation depends on discountType:
    *   'amount'  (default) — flat dollar subtracted from subtotal.
@@ -251,6 +262,8 @@ type ComputedLine = {
   jobId: string | null;
   lineOrder: number;
   kind: LineKind;
+  /** Advanced-pricing provenance (null for lines without a priceable item). */
+  pricing: AppliedPricing | null;
 };
 
 interface PreparedInvoice {
@@ -296,6 +309,29 @@ async function prepareInvoice(
   // --- Validate inputs ---
   if (!input.lines || input.lines.length === 0) {
     throw validation('An invoice must have at least one line.');
+  }
+
+  // Advanced pricing: fill omitted item rates server-side and record which rule/level priced
+  // each line (or that the user overrode it). Every later step works on the priced lines.
+  const pricedLines = await resolveLinePricing(
+    ctx,
+    {
+      customerId: input.customerId,
+      date: input.date,
+      classId: input.classId ?? null,
+      salesRepId: input.salesRepId ?? null,
+      jobId: input.jobId ?? null,
+    },
+    input.lines,
+  );
+  input = { ...input, lines: pricedLines };
+
+  if (input.salesRepId) {
+    const [rep] = await ctx.db
+      .select({ id: salesReps.id })
+      .from(salesReps)
+      .where(and(eq(salesReps.companyId, ctx.companyId), eq(salesReps.id, input.salesRepId)));
+    if (!rep) throw notFound('Sales rep');
   }
 
   // Validate exchange rate.
@@ -459,6 +495,7 @@ async function prepareInvoice(
         jobId: l.jobId ?? headerJobId,
         lineOrder: i,
         kind,
+        pricing: null,
       });
       runningBody = Money.zero(); // QB: a subtotal item resets the running group
       continue;
@@ -523,6 +560,7 @@ async function prepareInvoice(
       jobId: l.jobId ?? headerJobId,
       lineOrder: i,
       kind,
+      pricing: kind === 'income' ? pricedLines[i].pricing : null,
     });
   }
 
@@ -1057,6 +1095,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         taxRateId: input.taxRateId ?? null,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
+        salesRepId: input.salesRepId ?? null,
         currency,
         exchangeRate: exchangeRateStr,
         discountType: prep.discountType,
@@ -1089,6 +1128,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         classId: cl.classId,
         jobId: cl.jobId,
         lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
       })),
     );
 
@@ -1174,6 +1214,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
     taxRateId: existing.taxRateId,
     classId: existing.classId,
     jobId: existing.jobId,
+    salesRepId: existing.salesRepId,
     discount: existing.discount,
     discountType: 'amount',
     retainagePercent: existing.retainagePercent,
@@ -1191,6 +1232,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
       taxRateId: l.taxRateId,
       classId: l.classId,
       jobId: l.jobId,
+      pricing: { origin: (l.pricing as { origin?: string | null } | null)?.origin ?? null },
     })),
   };
 
@@ -1280,6 +1322,10 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     );
   }
 
+  // An edit that does not mention the sales rep keeps the current one (it was usually set
+  // via assignInvoiceRep, and it is also a price-rule condition).
+  if (input.salesRepId === undefined) input = { ...input, salesRepId: existing.salesRepId };
+
   // Validate + compute the new document (read-only). Exclude this invoice's own
   // current balance from the credit-limit exposure — it is being replaced.
   const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
@@ -1311,6 +1357,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           classId: cl.classId,
           jobId: cl.jobId,
           lineOrder: cl.lineOrder,
+          pricing: cl.pricing as Record<string, unknown> | null,
         })),
       );
 
@@ -1324,6 +1371,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           taxRateId: input.taxRateId ?? null,
           classId: prep.headerClassId,
           jobId: prep.headerJobId,
+          salesRepId: input.salesRepId ?? null,
           currency: input.currency ?? null,
           exchangeRate: toAmountString(prep.exchangeRate),
           discountType: prep.discountType,
@@ -1403,6 +1451,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         classId: cl.classId,
         jobId: cl.jobId,
         lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
       })),
     );
 
@@ -1420,6 +1469,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         taxRateId: input.taxRateId ?? null,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
+        salesRepId: input.salesRepId ?? null,
         currency: input.currency ?? null,
         exchangeRate: toAmountString(prep.exchangeRate),
         discountType: prep.discountType,

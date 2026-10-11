@@ -39,6 +39,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { billHasReceiptLinks, releaseReceiptBilling } from './receivingLinks';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -600,6 +601,12 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
       'Cannot edit a bill that has vendor credits applied. Unapply vendor credits first.',
     );
   }
+  if (await billHasReceiptLinks(ctx, id)) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This bill was entered against item receipts. Void it and enter the bill for the received items again.',
+    );
+  }
 
   // Validate + resolve the new document (read-only).
   const prep = await prepareBill(ctx, input);
@@ -816,6 +823,10 @@ export async function voidBill(ctx: ServiceContext, id: string) {
     // already restored the GL (Dr A/P / Cr Inventory at the bill's cost); this
     // step pulls the quantity/cost back out of the subledger.
     await reverseReceivedStock(tx, id, 'bill_void');
+
+    // Bills entered against item receipts: put the received quantities back to "awaiting bill"
+    // and unwind any inventory cost adjustments made by price variances (GL reversed above).
+    await releaseReceiptBilling(tx, id);
 
     // Flip bill status to void and zero balanceDue.
     const [updated] = await tx.db

@@ -336,6 +336,9 @@ export const customers = pgTable('customers', {
   isActive: boolean('is_active').notNull().default(true),
   /** Values for company-defined custom fields ({ [fieldName]: value }). */
   customFields: jsonb('custom_fields').$type<Record<string, string>>(),
+  /** Advanced pricing (team pricing): customer type list + assigned price level. */
+  customerTypeId: uuid('customer_type_id'),
+  priceLevelId: uuid('price_level_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -357,6 +360,8 @@ export const vendors = pgTable('vendors', {
   isActive: boolean('is_active').notNull().default(true),
   /** Values for company-defined custom fields ({ [fieldName]: value }). */
   customFields: jsonb('custom_fields').$type<Record<string, string>>(),
+  /** Vendor type list (team pricing). */
+  vendorTypeId: uuid('vendor_type_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -436,6 +441,8 @@ export const estimateLines = pgTable('estimate_lines', {
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
   taxable: boolean('taxable').notNull().default(true),
   lineOrder: integer('line_order').notNull().default(0),
+  /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
+  pricing: jsonb('pricing').$type<Record<string, unknown>>(),
 });
 
 // ---- Invoices (A/R) ----
@@ -486,6 +493,8 @@ export const invoiceLines = pgTable('invoice_lines', {
   jobId: uuid('job_id').references(() => jobs.id),
   taxRateId: uuid('tax_rate_id').references(() => taxRates.id), // per-line tax override
   lineOrder: integer('line_order').notNull().default(0),
+  /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
+  pricing: jsonb('pricing').$type<Record<string, unknown>>(),
 });
 
 // ---- Payments received (A/R) ----
@@ -541,6 +550,8 @@ export const salesReceiptLines = pgTable('sales_receipt_lines', {
   jobId: uuid('job_id').references(() => jobs.id),
   taxRateId: uuid('tax_rate_id').references(() => taxRates.id),
   lineOrder: integer('line_order').notNull().default(0),
+  /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
+  pricing: jsonb('pricing').$type<Record<string, unknown>>(),
 });
 
 export const paymentApplications = pgTable('payment_applications', {
@@ -905,6 +916,8 @@ export const salesOrderLines = pgTable('sales_order_lines', {
   /** Quantity already pulled onto invoices — enables partial invoicing/backorders. */
   quantityInvoiced: decimal('quantity_invoiced', { precision: 15, scale: 4 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
+  /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
+  pricing: jsonb('pricing').$type<Record<string, unknown>>(),
 });
 
 // ---- Jobs / Projects (job costing) ----
@@ -991,6 +1004,13 @@ export const purchaseOrderLines = pgTable('purchase_order_lines', {
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
   /** Quantity already pulled onto bills — enables partial billing/receipt of a PO. */
   quantityBilled: decimal('quantity_billed', { precision: 15, scale: 4 }).notNull().default('0'),
+  /**
+   * Enhanced receiving: portion of quantityBilled that was RECEIVED on item receipts but has
+   * not yet been vendor-billed (received = quantityBilled; billed = quantityBilled - this).
+   */
+  quantityReceivedUnbilled: decimal('quantity_received_unbilled', { precision: 15, scale: 4 })
+    .notNull()
+    .default('0'),
   lineOrder: integer('line_order').notNull().default(0),
 });
 
@@ -1020,6 +1040,8 @@ export const itemReceiptLines = pgTable('item_receipt_lines', {
   quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull().default('1'),
   unitCost: decimal('unit_cost', { precision: 15, scale: 4 }).notNull().default('0'),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Enhanced receiving: quantity already vendor-billed (or written off) from this line. */
+  quantityBilled: decimal('quantity_billed', { precision: 15, scale: 4 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
 });
 
@@ -1165,5 +1187,109 @@ export const memorizedReports = pgTable('memorized_reports', {
   name: varchar('name', { length: 255 }).notNull(),
   reportType: varchar('report_type', { length: 100 }).notNull(),
   config: jsonb('config').$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- team pricing ----
+// Advanced Pricing (price levels, price rules, customer/vendor types) and Enhanced Receiving
+// (bill-vs-receipt links carrying quantity/price variances). See lib/services/pricing.ts and
+// lib/services/receiving.ts.
+
+/** QB "Customer Type" list (used by price rules and reports). */
+export const customerTypes = pgTable('customer_types', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  parentId: uuid('parent_id'),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** QB "Vendor Type" list. */
+export const vendorTypes = pgTable('vendor_types', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  parentId: uuid('parent_id'),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * Price levels: 'fixed_percent' (every item's base price +/- percent) or 'per_item'
+ * (explicit per-item prices in price_level_items). Assigned via customers.priceLevelId.
+ */
+export const priceLevels = pgTable('price_levels', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  type: varchar('type', { length: 20 }).notNull().default('fixed_percent'),
+  /** Signed percent for fixed_percent levels: -10 = 10% below base, 5 = 5% above. */
+  percent: decimal('percent', { precision: 9, scale: 4 }).notNull().default('0'),
+  rounding: varchar('rounding', { length: 20 }).notNull().default('none'),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const priceLevelItems = pgTable('price_level_items', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  priceLevelId: uuid('price_level_id').references(() => priceLevels.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  price: decimal('price', { precision: 15, scale: 4 }).notNull(),
+});
+
+/** QB Enterprise Advanced Pricing price rules (conditions + adjustment + quantity tiers). */
+export const priceRules = pgTable('price_rules', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  description: text('description'),
+  isActive: boolean('is_active').notNull().default(true),
+  /** Lower number = higher priority (used when the conflict mode is 'priority'). */
+  priority: integer('priority').notNull().default(100),
+  conditions: jsonb('conditions').$type<Record<string, unknown>>().notNull(),
+  adjustment: jsonb('adjustment').$type<Record<string, unknown>>().notNull(),
+  tiers: jsonb('tiers').$type<Array<Record<string, unknown>>>(),
+  rounding: varchar('rounding', { length: 20 }),
+  /** Inclusive YYYY-MM-DD bounds compared against the document date. */
+  startDate: varchar('start_date', { length: 10 }),
+  endDate: varchar('end_date', { length: 10 }),
+  minQuantity: decimal('min_quantity', { precision: 15, scale: 4 }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/**
+ * Enhanced receiving: one row per (bill, item-receipt line) billed or written off. Carries the
+ * receipt cost, the vendor's billed cost, and how the price variance was posted so that voiding
+ * the bill can unwind it exactly.
+ */
+export const itemReceiptBillLines = pgTable('item_receipt_bill_lines', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  billId: uuid('bill_id').references(() => bills.id).notNull(),
+  itemReceiptId: uuid('item_receipt_id').references(() => itemReceipts.id).notNull(),
+  itemReceiptLineId: uuid('item_receipt_line_id').references(() => itemReceiptLines.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  /** Quantity billed (or written off, when writtenOff = true). */
+  quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull(),
+  receiptUnitCost: decimal('receipt_unit_cost', { precision: 15, scale: 4 }).notNull(),
+  billUnitCost: decimal('bill_unit_cost', { precision: 15, scale: 4 }).notNull(),
+  /** quantity x receipt cost relieved from the 2050 accrual. */
+  accrualAmount: decimal('accrual_amount', { precision: 15, scale: 2 }).notNull(),
+  /** Amount owed to the vendor for this line (0 for a write-off). */
+  billAmount: decimal('bill_amount', { precision: 15, scale: 2 }).notNull(),
+  /** billAmount - accrualAmount (signed). */
+  variance: decimal('variance', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** 'inventory' | 'ppv' | 'expense' | 'none' — where the variance was posted. */
+  varianceMode: varchar('variance_mode', { length: 20 }).notNull().default('none'),
+  /** Portion capitalized into on-hand inventory and portion expensed (COGS / PPV / expense). */
+  inventoryVariance: decimal('inventory_variance', { precision: 15, scale: 2 }).notNull().default('0'),
+  expensedVariance: decimal('expensed_variance', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** FIFO layer cost adjustments made for inventoryVariance ([{ layerId, quantity, unitDelta }]). */
+  layerAdjustments: jsonb('layer_adjustments').$type<Array<Record<string, string>>>(),
+  writtenOff: boolean('written_off').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
