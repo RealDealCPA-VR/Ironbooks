@@ -24,7 +24,9 @@ import {
   setIncomeTaxForm,
   updateAccount,
 } from './accounts';
-import { createCustomer, customerBalanceSummary } from './customers';
+import { createCustomer, customerBalanceSummary, deactivateCustomer } from './customers';
+import { mergeCustomers } from './merge';
+import { createCreditMemo } from './creditMemos';
 import { createVendor } from './vendors';
 import { postJournalEntry } from './posting';
 import {
@@ -40,7 +42,7 @@ import { apAging, arAging, arAgingDetail, cashFlow } from './reportsExtra';
 import { createInvoice } from './invoices';
 import { createPurchaseOrder } from './purchaseOrders';
 import { approveProposal, createJournalProposal } from './aiAssistant';
-import { customerStatement } from './statements';
+import { customerStatement, openItemStatement } from './statements';
 import { trialBalance } from './reports';
 import { verifyIntegrity } from './integrity';
 import { getDashboardInsights } from './dashboard';
@@ -569,5 +571,108 @@ describe('alphanumeric document numbers', () => {
     });
     expect(po.refNumber).toBe('PO-A7');
     expect(await nextDocNumber(ctx, 'purchase_order')).toBe('PO-A8');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 2 — inactive / merged-away names; typed numbers where users see them
+// ---------------------------------------------------------------------------
+
+describe('fix round 2: inactive names and typed numbers on reports, statements and the GL', () => {
+  it('a manual journal entry refuses an inactive customer, but an edit may keep a name already on it', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'FR2 Soon Inactive' })).id;
+    const entry = await createManualEntry(ctx, {
+      date: new Date(2026, 6, 1),
+      description: 'FR2 charge',
+      lines: [
+        { accountId: code['1200'], debit: '12.00', entityType: 'customer', entityId: cust },
+        { accountId: code['4000'], credit: '12.00' },
+      ],
+    });
+    await deactivateCustomer(ctx, cust);
+    await expect(
+      createManualEntry(ctx, {
+        date: new Date(2026, 6, 2),
+        description: 'FR2 charge 2',
+        lines: [
+          { accountId: code['1200'], debit: '5.00', entityType: 'customer', entityId: cust },
+          { accountId: code['4000'], credit: '5.00' },
+        ],
+      }),
+    ).rejects.toThrow(/inactive/);
+    const edited = await updateEntry(ctx, entry.id, {
+      date: new Date(2026, 6, 1),
+      description: 'FR2 charge (edited)',
+      lines: [
+        { accountId: code['1200'], debit: '13.00', entityType: 'customer', entityId: cust },
+        { accountId: code['4000'], credit: '13.00' },
+      ],
+    });
+    expect(edited.id).toBeTruthy();
+  });
+
+  it('an AI proposal refuses a customer that is inactive when the proposal is made', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'FR2 Inactive For AI' })).id;
+    await deactivateCustomer(ctx, cust);
+    await expect(
+      createJournalProposal(ctx, {
+        type: 'journal_entry',
+        date: '2026-07-03',
+        description: 'FR2 AI fee',
+        lines: [
+          { accountCode: '1200', debit: '9.00', name: 'FR2 Inactive For AI' },
+          { accountCode: '4000', credit: '9.00' },
+        ],
+      }),
+    ).rejects.toThrow(/inactive/);
+  });
+
+  it('an AI proposal approved after its customer was merged posts to the customer that was kept', async () => {
+    const dup = (await createCustomer(ctx, { displayName: 'FR2 Merge Dup' })).id;
+    const keep = (await createCustomer(ctx, { displayName: 'FR2 Merge Keep' })).id;
+    const proposal = await createJournalProposal(ctx, {
+      type: 'journal_entry',
+      date: '2026-07-04',
+      description: 'FR2 AI fee',
+      lines: [
+        { accountCode: '1200', debit: '21.00', name: 'FR2 Merge Dup' },
+        { accountCode: '4000', credit: '21.00' },
+      ],
+    });
+    await mergeCustomers(ctx, { fromId: dup, toId: keep });
+    await approveProposal(ctx, proposal.id);
+    const items = await journalOpenItems(ctx, 'ar', { entityId: keep });
+    expect(items.reduce((t, i) => t + Number(i.amount), 0)).toBeCloseTo(21, 2);
+    expect(await journalOpenItems(ctx, 'ar', { entityId: dup })).toHaveLength(0);
+  });
+
+  it('typed invoice / credit memo numbers show on aging detail, statements, open items and the GL', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'FR2 Typed Number Customer' })).id;
+    const inv = await createInvoice(ctx, {
+      customerId: cust,
+      date: new Date(2026, 6, 5),
+      refNumber: 'FR2-JOB',
+      lines: [{ quantity: 1, rate: '40.00' }],
+    });
+    const cm = await createCreditMemo(ctx, {
+      customerId: cust,
+      date: new Date(2026, 6, 6),
+      refNumber: 'FR2-CM',
+      lines: [{ quantity: 1, rate: '5.00' }],
+    });
+    const detail = await arAgingDetail(ctx, new Date(2026, 11, 31));
+    expect(detail.rows.find((r) => r.docId === inv.id)?.docNumber).toBe('Invoice #FR2-JOB');
+    expect(detail.rows.find((r) => r.docId === cm.id)?.docNumber).toBe('Credit Memo #FR2-CM');
+    const stmt = await customerStatement(ctx, cust);
+    expect(stmt.lines.find((l) => l.type === 'invoice')?.ref).toBe('FR2-JOB');
+    expect(stmt.lines.find((l) => l.type === 'credit_memo')?.ref).toBe('FR2-CM');
+    const open = await openItemStatement(ctx, cust, new Date(2026, 11, 31));
+    expect(open.lines.find((l) => l.invoiceNumber === inv.invoiceNumber)?.refNumber).toBe('FR2-JOB');
+    const [je] = await db
+      .select({ description: journalEntries.description, reference: journalEntries.reference })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `invoice:${inv.id}`)));
+    expect(je.description).toBe('Invoice #FR2-JOB');
+    expect(je.reference).toBe('FR2-JOB');
   });
 });

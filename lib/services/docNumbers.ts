@@ -48,6 +48,16 @@ export const DOC_TYPE_LABELS: Record<DocType, string> = {
   purchase_order: 'Purchase Order',
 };
 
+/**
+ * The number the user sees for a document: its typed ref number ("JOB-ALPHA", "INV-1001"),
+ * falling back to the legacy integer for rows written before ref numbers existed.
+ */
+export function docRef(refNumber: string | null | undefined, legacyNumber: number | string | null | undefined): string {
+  const typed = refNumber?.trim();
+  if (typed) return typed;
+  return legacyNumber === null || legacyNumber === undefined ? '' : String(legacyNumber);
+}
+
 /** Longest document number accepted (column is varchar(50)). */
 export const MAX_DOC_NUMBER_LENGTH = 50;
 

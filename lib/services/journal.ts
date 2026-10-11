@@ -230,7 +230,97 @@ export async function resolveEntityNames(
  * a vendor — otherwise the amount could never appear in that customer's / vendor's balance or
  * aging. Names on other lines are optional but must exist in this company.
  */
-export async function assertJournalNames(ctx: ServiceContext, lines: PostingLine[]): Promise<void> {
+/**
+ * Ids (as `type:id` keys) of named customers / vendors / employees that are inactive. Merged-away
+ * names are inactive too (merge.ts deactivates the record it folds away).
+ */
+async function inactiveNames(
+  ctx: ServiceContext,
+  refs: Array<{ entityType: string | null; entityId: string | null }>,
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  const ids = (t: string) => [
+    ...new Set(
+      refs.filter((r) => r.entityType === t && r.entityId && UUID_RE.test(r.entityId)).map((r) => r.entityId!),
+    ),
+  ];
+  const cust = ids('customer');
+  const vend = ids('vendor');
+  const emp = ids('employee');
+  if (cust.length) {
+    const rows = await ctx.db
+      .select({ id: customers.id })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, cust), eq(customers.isActive, false)));
+    for (const r of rows) out.add(`customer:${r.id}`);
+  }
+  if (vend.length) {
+    const rows = await ctx.db
+      .select({ id: vendors.id })
+      .from(vendors)
+      .where(and(eq(vendors.companyId, ctx.companyId), inArray(vendors.id, vend), eq(vendors.isActive, false)));
+    for (const r of rows) out.add(`vendor:${r.id}`);
+  }
+  if (emp.length) {
+    const rows = await ctx.db
+      .select({ id: employees.id })
+      .from(employees)
+      .where(and(eq(employees.companyId, ctx.companyId), inArray(employees.id, emp), eq(employees.isActive, false)));
+    for (const r of rows) out.add(`employee:${r.id}`);
+  }
+  return out;
+}
+
+/**
+ * Follow customer / vendor merges: a name that was merged away (merge.ts records
+ * `mergedInto` in the audit log when it deactivates the duplicate) is replaced by the record
+ * that was kept, following chains of merges. Names that were not merged are returned as is.
+ * Used where a stored draft (e.g. an AI proposal) is posted later, after the list may have
+ * changed.
+ */
+export async function followMergedNames<L extends { entityType?: string | null; entityId?: string | null }>(
+  ctx: ServiceContext,
+  lines: L[],
+): Promise<L[]> {
+  const inactive = await inactiveNames(
+    ctx,
+    lines.map((l) => ({ entityType: l.entityType ?? null, entityId: l.entityId ?? null })),
+  );
+  if (inactive.size === 0) return lines;
+  const target = new Map<string, string>();
+  for (const key of inactive) {
+    const [type, startId] = key.split(':');
+    if (type !== 'customer' && type !== 'vendor') continue;
+    let cur = startId;
+    const seen = new Set<string>([cur]);
+    for (let hop = 0; hop < 10; hop++) {
+      const res = await ctx.db.execute(
+        sql`SELECT new_values->>'mergedInto' AS to_id FROM audit_logs
+            WHERE company_id = ${ctx.companyId} AND entity_type = ${type} AND entity_id = ${cur}
+              AND new_values->>'mergedInto' IS NOT NULL
+            ORDER BY created_at DESC LIMIT 1`,
+      );
+      const toId = (res.rows[0] as { to_id?: string } | undefined)?.to_id;
+      if (!toId || !UUID_RE.test(toId) || seen.has(toId)) break;
+      seen.add(toId);
+      cur = toId;
+      if (!(await inactiveNames(ctx, [{ entityType: type, entityId: cur }])).size) {
+        target.set(key, cur);
+        break;
+      }
+    }
+  }
+  return lines.map((l) => {
+    const to = l.entityType && l.entityId ? target.get(`${l.entityType}:${l.entityId}`) : undefined;
+    return to ? { ...l, entityId: to } : l;
+  });
+}
+
+export async function assertJournalNames(
+  ctx: ServiceContext,
+  lines: PostingLine[],
+  opts: { allowInactive?: Set<string> } = {},
+): Promise<void> {
   const accountIds = [...new Set(lines.map((l) => l.accountId).filter(Boolean))];
   if (accountIds.length === 0) return;
   const acctRows = await ctx.db
@@ -239,6 +329,10 @@ export async function assertJournalNames(ctx: ServiceContext, lines: PostingLine
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, accountIds)));
   const byId = new Map(acctRows.map((a) => [a.id, a]));
   const names = await resolveEntityNames(
+    ctx,
+    lines.map((l) => ({ entityType: l.entityType ?? null, entityId: l.entityId ?? null })),
+  );
+  const inactive = await inactiveNames(
     ctx,
     lines.map((l) => ({ entityType: l.entityType ?? null, entityId: l.entityId ?? null })),
   );
@@ -255,6 +349,14 @@ export async function assertJournalNames(ctx: ServiceContext, lines: PostingLine
         );
       }
       throw validation(`Line ${i + 1}: that ${l.entityType} was not found.`);
+    }
+    if (l.entityType && l.entityId) {
+      const key = `${l.entityType}:${l.entityId}`;
+      if (inactive.has(key) && !opts.allowInactive?.has(key)) {
+        throw validation(
+          `Line ${i + 1}: "${names.get(key)}" is inactive (or was merged into another ${l.entityType}). Pick an active name, or make this one active again first.`,
+        );
+      }
     }
     if (acct.type === 'asset' && acct.subtype === 'accounts_receivable' && l.entityType !== 'customer') {
       throw validation(
@@ -412,7 +514,13 @@ export async function updateEntry(ctx: ServiceContext, id: string, input: Update
   // before any work begins.)
   await assertPeriodOpen(ctx, before.date);
   await assertPeriodOpen(ctx, input.date);
-  await assertJournalNames(ctx, input.lines);
+  // Names already on the entry may stay even if they were made inactive since (QB lets you
+  // edit an old entry without re-picking its names); new names must be active.
+  await assertJournalNames(ctx, input.lines, {
+    allowInactive: new Set(
+      before.lines.filter((l) => l.entityType && l.entityId).map((l) => `${l.entityType}:${l.entityId}`),
+    ),
+  });
   const isAdjusting = input.isAdjusting ?? before.isAdjusting;
 
   return inTransaction(ctx, async (tx) => {

@@ -36,6 +36,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { notFound, validation, writeAudit, type ServiceContext } from './_base';
 import { taxIdFor } from './access';
 import { journalOpenItems } from './journal';
+import { docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Customer Statement
@@ -170,6 +171,7 @@ export async function customerStatement(
     .select({
       date: invoices.date,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       total: invoices.total,
     })
     .from(invoices)
@@ -210,6 +212,7 @@ export async function customerStatement(
     .select({
       date: creditMemos.date,
       memoNumber: creditMemos.memoNumber,
+      refNumber: creditMemos.refNumber,
       total: creditMemos.total,
     })
     .from(creditMemos)
@@ -226,7 +229,7 @@ export async function customerStatement(
     ...invoiceRows.map((r) => ({
       kind: 'invoice' as const,
       date: r.date,
-      ref: String(r.invoiceNumber),
+      ref: docRef(r.refNumber, r.invoiceNumber),
       amount: r.total,
     })),
     ...paymentRows.map((r) => ({
@@ -238,7 +241,7 @@ export async function customerStatement(
     ...creditMemoRows.map((r) => ({
       kind: 'credit_memo' as const,
       date: r.date,
-      ref: String(r.memoNumber),
+      ref: docRef(r.refNumber, r.memoNumber),
       amount: r.total,
     })),
     ...journalInRange.map((j) => ({
@@ -296,6 +299,8 @@ export interface OpenItemLine {
   /** ISO invoice date (YYYY-MM-DD). */
   date: string;
   invoiceNumber: number;
+  /** The number the user sees (typed ref number, else the legacy integer). */
+  refNumber: string;
   /** ISO due date; falls back to the invoice date when no due date was set. */
   dueDate: string;
   total: string;
@@ -367,6 +372,7 @@ export async function openItemStatement(
       date: invoices.date,
       dueDate: invoices.dueDate,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       total: invoices.total,
       amountPaid: invoices.amountPaid,
       balanceDue: invoices.balanceDue,
@@ -403,6 +409,7 @@ export async function openItemStatement(
       invoiceId: r.id,
       date: r.date.toISOString().slice(0, 10),
       invoiceNumber: r.invoiceNumber,
+      refNumber: docRef(r.refNumber, r.invoiceNumber),
       dueDate: effDue.toISOString().slice(0, 10),
       total: toAmountString(r.total),
       amountPaid: toAmountString(r.amountPaid),

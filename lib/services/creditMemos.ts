@@ -70,7 +70,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { allocateDocNumber } from './docNumbers';
+import { allocateDocNumber, docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -314,6 +314,8 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
     const { refNumber, number: memoNumber } = await allocateDocNumber(tx, 'credit_memo', input.refNumber, {
       allowDuplicate: input.allowDuplicateNumber === true,
     });
+    // The number shown on the GL: the typed ref number, else the legacy integer.
+    const shownNumber = docRef(refNumber, memoNumber);
 
     // 1) Insert credit memo header
     const [memo] = await tx.db
@@ -376,21 +378,21 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
       debitSpecs.push({
         accountId: acctId,
         weight: amount,
-        memo: `Credit Memo #${memoNumber} — income reversal`,
+        memo: `Credit Memo #${shownNumber} — income reversal`,
       });
     }
     if (taxAmount.greaterThan(0) && taxPayableId) {
       debitSpecs.push({
         accountId: taxPayableId,
         weight: taxAmount,
-        memo: `Credit Memo #${memoNumber} — sales tax reversal`,
+        memo: `Credit Memo #${shownNumber} — sales tax reversal`,
       });
     }
     const creditSpecs: Array<{
       accountId: string;
       weight: ReturnType<typeof Money.zero>;
       memo: string;
-    }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${memoNumber}` }];
+    }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${shownNumber}` }];
 
     const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
     const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
@@ -414,8 +416,8 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: `Credit Memo #${memoNumber}`,
-      reference: String(memoNumber),
+      description: `Credit Memo #${shownNumber}`,
+      reference: shownNumber,
       sourceRef: `credit_memo:${memo.id}`,
       lines: postingLines,
     });
@@ -448,19 +450,19 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         const cogsAccountId = await accountIdByCode(tx, '5000');
         const restockEntry = await postJournalEntry(tx, {
           date: input.date,
-          description: `Credit Memo #${memoNumber} — COGS reversal (${meta.name})`,
+          description: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
           reference: line.id,
           sourceRef: `creditmemo-cogs:${memo.id}`,
           lines: [
             {
               accountId: inventoryAccountId,
               debit: toAmountString(cost),
-              memo: `Credit Memo #${memoNumber} — restock (${meta.name})`,
+              memo: `Credit Memo #${shownNumber} — restock (${meta.name})`,
             },
             {
               accountId: cogsAccountId,
               credit: toAmountString(cost),
-              memo: `Credit Memo #${memoNumber} — COGS reversal (${meta.name})`,
+              memo: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
             },
           ],
         });
@@ -509,7 +511,7 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         };
       }),
       movingLineOrders: computedLines.filter((cl) => cl.restock).map((cl) => cl.lineOrder),
-      memo: `Credit Memo #${memoNumber}`,
+      memo: `Credit Memo #${shownNumber}`,
     });
 
     // 5) Stamp postedEntryId
@@ -735,19 +737,19 @@ export async function refundCreditMemo(ctx: ServiceContext, input: RefundCreditM
     // 1. Post the refund check.
     const entry = await postJournalEntry(tx, {
       date: refundDate,
-      description: input.memo ?? `Refund — Credit Memo #${memo.memoNumber}`,
-      reference: String(memo.memoNumber),
+      description: input.memo ?? `Refund — Credit Memo #${docRef(memo.refNumber, memo.memoNumber)}`,
+      reference: docRef(memo.refNumber, memo.memoNumber),
       sourceRef: `refund:${input.creditMemoId}`,
       lines: [
         {
           accountId: arAccountId,
           debit: toAmountString(amount),
-          memo: `Credit Memo #${memo.memoNumber} refunded`,
+          memo: `Credit Memo #${docRef(memo.refNumber, memo.memoNumber)} refunded`,
         },
         {
           accountId: input.bankAccountId,
           credit: toAmountString(amount),
-          memo: `Refund check — Credit Memo #${memo.memoNumber}`,
+          memo: `Refund check — Credit Memo #${docRef(memo.refNumber, memo.memoNumber)}`,
         },
       ],
     });

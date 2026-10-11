@@ -33,6 +33,7 @@ import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/serv
 import type { ServiceContext } from './_base';
 import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
 import { journalOpenItems, resolveEntityNames } from './journal';
+import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
 
 /** Detail-report variant of addJournalItemsToAging: one 'General Journal' row per line. */
@@ -887,6 +888,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     .select({
       invoiceId: invoices.id,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       customerId: invoices.customerId,
       customerName: customers.displayName,
       total: invoices.total,
@@ -936,7 +938,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
       docId: row.invoiceId,
-      docNumber: `Invoice #${row.invoiceNumber}`,
+      docNumber: `Invoice #${docRef(row.refNumber, row.invoiceNumber)}`,
       docType: 'invoice',
       entityId: row.customerId,
       entityName: row.customerName,
@@ -953,6 +955,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     .select({
       id: creditMemos.id,
       memoNumber: creditMemos.memoNumber,
+      refNumber: creditMemos.refNumber,
       customerId: creditMemos.customerId,
       customerName: customers.displayName,
       date: creditMemos.date,
@@ -971,7 +974,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
   for (const m of memoRows) {
     detail.push({
       docId: m.id,
-      docNumber: `Credit Memo #${m.memoNumber}`,
+      docNumber: `Credit Memo #${docRef(m.refNumber, m.memoNumber)}`,
       docType: 'credit_memo',
       entityId: m.customerId,
       entityName: m.customerName,
@@ -1104,6 +1107,8 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
 export interface OpenInvoiceRow {
   invoiceId: string;
   invoiceNumber: number;
+  /** The number the user sees (typed ref number, else the legacy integer). */
+  refNumber: string;
   customerId: string;
   customerName: string;
   date: string;
@@ -1131,6 +1136,7 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
     .select({
       invoiceId: invoices.id,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       customerId: invoices.customerId,
       customerName: customers.displayName,
       date: invoices.date,
@@ -1158,6 +1164,7 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
     return {
       invoiceId: r.invoiceId,
       invoiceNumber: r.invoiceNumber,
+      refNumber: docRef(r.refNumber, r.invoiceNumber),
       customerId: r.customerId,
       customerName: r.customerName,
       date: r.date.toISOString(),
@@ -1179,6 +1186,8 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
 export interface CollectionsInvoice {
   invoiceId: string;
   invoiceNumber: number;
+  /** The number the user sees (typed ref number, else the legacy integer). */
+  refNumber: string;
   date: string;
   dueDate: string | null;
   daysOverdue: number;
@@ -1212,6 +1221,7 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
     .select({
       invoiceId: invoices.id,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       customerId: invoices.customerId,
       customerName: customers.displayName,
       email: customers.email,
@@ -1254,6 +1264,7 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
     cust.invoices.push({
       invoiceId: r.invoiceId,
       invoiceNumber: r.invoiceNumber,
+      refNumber: docRef(r.refNumber, r.invoiceNumber),
       date: r.date.toISOString(),
       dueDate: r.dueDate ? r.dueDate.toISOString() : null,
       daysOverdue,

@@ -747,7 +747,7 @@ function InvoiceModal({
     try {
       if (editing) {
         await api.patch(`/api/invoices/${editing.id}`, payload);
-        toast(`Invoice #${editing.invoiceNumber} updated.`, 'success');
+        toast(`Invoice #${editing.refNumber || editing.invoiceNumber} updated.`, 'success');
       } else {
         await api.post('/api/invoices', payload);
         toast(saveAsPending ? 'Pending invoice saved (not posted).' : 'Invoice created.', 'success');
@@ -773,7 +773,7 @@ function InvoiceModal({
       onClose={onClose}
       title={
         editing
-          ? `Edit Invoice #${editing.invoiceNumber}${editing.status === 'draft' ? ' (Pending)' : ''}`
+          ? `Edit Invoice #${editing.refNumber || editing.invoiceNumber}${editing.status === 'draft' ? ' (Pending)' : ''}`
           : 'New Invoice'
       }
       footer={
@@ -1374,7 +1374,7 @@ function InvoicesPageContent() {
     setVoiding(true);
     try {
       await api.del(`/api/invoices/${voidTarget.id}`);
-      toast(`Invoice #${voidTarget.invoiceNumber} voided.`, 'success');
+      toast(`Invoice #${voidTarget.refNumber || voidTarget.invoiceNumber} voided.`, 'success');
       setVoidTarget(null);
       fetchData();
     } catch (err: unknown) {
@@ -1389,7 +1389,7 @@ function InvoicesPageContent() {
     setPosting(true);
     try {
       await api.post(`/api/invoices/${postTarget.id}/post`, {});
-      toast(`Invoice #${postTarget.invoiceNumber} posted to the GL.`, 'success');
+      toast(`Invoice #${postTarget.refNumber || postTarget.invoiceNumber} posted to the GL.`, 'success');
       setPostTarget(null);
       fetchData();
     } catch (err: unknown) {
@@ -1404,7 +1404,7 @@ function InvoicesPageContent() {
     setEmailing(true);
     try {
       await api.post(`/api/invoices/${emailTarget.id}/email`, emailTo ? { to: emailTo } : {});
-      toast(`Invoice #${emailTarget.invoiceNumber} emailed successfully.`, 'success');
+      toast(`Invoice #${emailTarget.refNumber || emailTarget.invoiceNumber} emailed successfully.`, 'success');
       setEmailTarget(null);
       setEmailTo('');
     } catch (err: unknown) {
@@ -1634,13 +1634,13 @@ function InvoicesPageContent() {
         message={
           voidTarget?.status === 'draft' ? (
             <>
-              Discard pending <strong>Invoice #{voidTarget?.invoiceNumber}</strong>? Nothing was
+              Discard pending <strong>Invoice #{voidTarget?.refNumber || voidTarget?.invoiceNumber}</strong>? Nothing was
               posted to the GL, so this just marks the draft void.
             </>
           ) : (
             <>
               Are you sure you want to void{' '}
-              <strong>Invoice #{voidTarget?.invoiceNumber}</strong>? This will reverse the GL
+              <strong>Invoice #{voidTarget?.refNumber || voidTarget?.invoiceNumber}</strong>? This will reverse the GL
               entry and cannot be undone.
             </>
           )
@@ -1657,7 +1657,7 @@ function InvoicesPageContent() {
         title="Post Pending Invoice"
         message={
           <>
-            Post <strong>Invoice #{postTarget?.invoiceNumber}</strong> to the general ledger? This
+            Post <strong>Invoice #{postTarget?.refNumber || postTarget?.invoiceNumber}</strong> to the general ledger? This
             records A/R and income (and relieves inventory) as of the invoice date. The fiscal
             period is checked now.
           </>
@@ -1672,7 +1672,7 @@ function InvoicesPageContent() {
       <Modal
         open={!!emailTarget}
         onClose={() => { setEmailTarget(null); setEmailTo(''); }}
-        title={`Email Invoice #${emailTarget?.invoiceNumber ?? ''}`}
+        title={`Email Invoice #${emailTarget?.refNumber || emailTarget?.invoiceNumber || ''}`}
         footer={
           <>
             <Button variant="secondary" onClick={() => { setEmailTarget(null); setEmailTo(''); }} disabled={emailing}>

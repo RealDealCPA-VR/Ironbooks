@@ -54,7 +54,7 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { allocateDocNumber } from './docNumbers';
+import { allocateDocNumber, docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -342,6 +342,8 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
     const { refNumber, number: receiptNumber } = await allocateDocNumber(tx, 'sales_receipt', input.refNumber, {
       allowDuplicate: input.allowDuplicateNumber === true,
     });
+    // The number shown on the GL: the typed ref number, else the legacy integer.
+    const shownNumber = docRef(refNumber, receiptNumber);
 
     // 1) Insert receipt header (already fully paid by definition).
     const [receipt] = await tx.db
@@ -404,17 +406,17 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
     }
 
     const debitSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [
-      { accountId: depositAccountId, weight: total, memo: `Sales Receipt #${receiptNumber}` },
+      { accountId: depositAccountId, weight: total, memo: `Sales Receipt #${shownNumber}` },
     ];
     const creditSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [];
     for (const [acctId, amount] of incomeCredits) {
-      creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${receiptNumber} — income` });
+      creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — income` });
     }
     if (taxAmount.greaterThan(0)) {
       creditSpecs.push({
         accountId: taxPayableId,
         weight: taxAmount,
-        memo: `Sales Receipt #${receiptNumber} — sales tax`,
+        memo: `Sales Receipt #${shownNumber} — sales tax`,
       });
     }
 
@@ -435,8 +437,8 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: `Sales Receipt #${receiptNumber}`,
-      reference: String(receiptNumber),
+      description: `Sales Receipt #${shownNumber}`,
+      reference: shownNumber,
       sourceRef: `salesreceipt:${receipt.id}`,
       lines: postingLines,
     });
@@ -454,7 +456,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
       const meta = itemMap.get(line.itemId);
       if (!meta || meta.type !== 'inventory') continue;
 
-      const memo = `Sales Receipt #${receiptNumber} — COGS (${meta.name})`;
+      const memo = `Sales Receipt #${shownNumber} — COGS (${meta.name})`;
       let entryId: string;
       let cogs: string;
       if (await isFifoTracked(tx, line.itemId)) {
@@ -505,7 +507,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
           lotExpiration: src?.lotExpiration,
         };
       }),
-      memo: `Sales Receipt #${receiptNumber}`,
+      memo: `Sales Receipt #${shownNumber}`,
     });
 
     // 5) Stamp postedEntryId on the receipt.

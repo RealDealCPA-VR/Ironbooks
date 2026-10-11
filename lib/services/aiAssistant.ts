@@ -23,7 +23,7 @@ import { type ServiceContext, ServiceError, inTransaction, notFound, validation,
 import { balanceSheet, profitAndLoss, trialBalance } from './reports';
 import { apAging, arAging } from './reportsExtra';
 import { assertBalanced } from './posting';
-import { createManualEntry } from './journal';
+import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { AiError } from '@/lib/ai/types';
 
@@ -322,19 +322,21 @@ async function resolveProposalName(
 ): Promise<{ entityType: 'customer' | 'vendor'; entityId: string; entityName: string }> {
   const findCustomer = async () => {
     const [r] = await ctx.db
-      .select({ id: customers.id, name: customers.displayName })
+      .select({ id: customers.id, name: customers.displayName, isActive: customers.isActive })
       .from(customers)
       .where(and(eq(customers.companyId, ctx.companyId), sql`lower(${customers.displayName}) = lower(${name})`))
+      .orderBy(desc(customers.isActive))
       .limit(1);
-    return r ? { entityType: 'customer' as const, entityId: r.id, entityName: r.name } : null;
+    return r ? { entityType: 'customer' as const, entityId: r.id, entityName: r.name, isActive: r.isActive } : null;
   };
   const findVendor = async () => {
     const [r] = await ctx.db
-      .select({ id: vendors.id, name: vendors.displayName })
+      .select({ id: vendors.id, name: vendors.displayName, isActive: vendors.isActive })
       .from(vendors)
       .where(and(eq(vendors.companyId, ctx.companyId), sql`lower(${vendors.displayName}) = lower(${name})`))
+      .orderBy(desc(vendors.isActive))
       .limit(1);
-    return r ? { entityType: 'vendor' as const, entityId: r.id, entityName: r.name } : null;
+    return r ? { entityType: 'vendor' as const, entityId: r.id, entityName: r.name, isActive: r.isActive } : null;
   };
   const isAR = acct.type === 'asset' && acct.subtype === 'accounts_receivable';
   const isAP = acct.type === 'liability' && acct.subtype === 'accounts_payable';
@@ -343,7 +345,10 @@ async function resolveProposalName(
     const kind = isAR ? 'customer' : isAP ? 'vendor' : 'customer or vendor';
     throw validation(`Line ${i + 1}: no ${kind} named "${name}" was found.`);
   }
-  return found;
+  if (!found.isActive) {
+    throw validation(`Line ${i + 1}: "${found.entityName}" is inactive. Pick an active name, or make this one active again first.`);
+  }
+  return { entityType: found.entityType, entityId: found.entityId, entityName: found.entityName };
 }
 
 /**
@@ -483,20 +488,27 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
     // a vendor, otherwise A/R / A/P aging would stop matching the GL. Proposals that hit those
     // accounts without a name are refused here with a plain-language message.
     // TODO(ai team): let the assistant pick the customer / vendor so such proposals can carry it.
+    // The customer / vendor named in the proposal may have been merged away since it was made:
+    // follow the merge to the record that was kept. Any other inactive name is refused by the
+    // name rule in createManualEntry.
+    const lines = await followMergedNames(
+      tx,
+      p.lines.map((l) => ({
+        accountId: l.accountId,
+        debit: l.debit,
+        credit: l.credit,
+        memo: l.memo,
+        entityType: l.entityType ?? null,
+        entityId: l.entityId ?? null,
+      })),
+    );
     let entry: Awaited<ReturnType<typeof createManualEntry>>;
     try {
       entry = await createManualEntry(tx, {
         date,
         description: p.description,
         reference: p.reference,
-        lines: p.lines.map((l) => ({
-          accountId: l.accountId,
-          debit: l.debit,
-          credit: l.credit,
-          memo: l.memo,
-          entityType: l.entityType ?? null,
-          entityId: l.entityId ?? null,
-        })),
+        lines,
       });
     } catch (e) {
       if (e instanceof ServiceError && /needs a (customer|vendor) in the Name column/.test(e.message)) {

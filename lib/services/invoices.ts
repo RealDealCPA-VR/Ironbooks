@@ -66,7 +66,7 @@ import {
   saveDocumentInventoryDetails,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { allocateDocNumber } from './docNumbers';
+import { allocateDocNumber, docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -704,7 +704,8 @@ async function postInvoiceGL(
   tx: ServiceContext,
   prep: PreparedInvoice,
   invoiceId: string,
-  invoiceNumber: number,
+  /** The number shown on the GL (typed ref number, else the legacy integer). */
+  invoiceNumber: number | string,
   date: Date,
 ) {
   const {
@@ -872,7 +873,8 @@ async function postInvoiceCOGS(
   tx: ServiceContext,
   prep: PreparedInvoice,
   invoiceId: string,
-  invoiceNumber: number,
+  /** The number shown on the GL (typed ref number, else the legacy integer). */
+  invoiceNumber: number | string,
   date: Date,
 ) {
   const { computedLines, itemMap } = prep;
@@ -1192,7 +1194,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
     }
 
     // 3) Build and post the journal entry.
-    const entry = await postInvoiceGL(tx, prep, invoice.id, invoiceNumber, input.date);
+    const entry = await postInvoiceGL(tx, prep, invoice.id, docRef(refNumber, invoiceNumber), input.date);
 
     // 4) Stamp postedEntryId on the invoice.
     const [updated] = await tx.db
@@ -1203,14 +1205,14 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
 
     // 5) Perpetual inventory: relieve stock + post COGS for inventory-item lines,
     //    then record which site/bin/serial/lot the stock left from.
-    await postInvoiceCOGS(tx, prep, invoice.id, invoiceNumber, input.date);
+    await postInvoiceCOGS(tx, prep, invoice.id, docRef(refNumber, invoiceNumber), input.date);
     await postDocumentInventory(tx, {
       sourceType: 'invoice',
       sourceId: invoice.id,
       date: input.date,
       direction: 'out',
       lines: inventoryLinesOf(input.lines, prep),
-      memo: `Invoice #${invoiceNumber}`,
+      memo: `Invoice #${docRef(refNumber, invoiceNumber)}`,
     });
 
     // 6) Audit trail.
@@ -1302,7 +1304,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
     }
 
     // 1) Post the GL entry (assertPeriodOpen runs here, on the invoice date).
-    const entry = await postInvoiceGL(tx, prep, id, invoice.invoiceNumber, invoice.date);
+    const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
 
     // 2) Flip the header to its posted state.
     const [updated] = await tx.db
@@ -1324,14 +1326,14 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
 
     // 3) Perpetual inventory: relieve stock + post COGS now that it is real, using the
     //    site/serial/lot detail saved with the draft.
-    await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, invoice.date);
+    await postInvoiceCOGS(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
     await postDocumentInventory(tx, {
       sourceType: 'invoice',
       sourceId: id,
       date: invoice.date,
       direction: 'out',
       lines: inventoryLinesOf(input.lines, prep),
-      memo: `Invoice #${invoice.invoiceNumber}`,
+      memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
       carryForward: true,
     });
 
@@ -1528,7 +1530,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
 
     // 4) Re-post the GL entry from the new document, then update the header in
     //    place — invoiceNumber and createdAt are intentionally NOT touched.
-    const entry = await postInvoiceGL(tx, prep, id, invoice.invoiceNumber, input.date);
+    const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
 
     const [updated] = await tx.db
       .update(invoices)
@@ -1563,14 +1565,14 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
 
     // 5) Re-post perpetual inventory COGS for the new lines (site detail carried forward
     //    for lines the edit did not touch).
-    await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, input.date);
+    await postInvoiceCOGS(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
     await postDocumentInventory(tx, {
       sourceType: 'invoice',
       sourceId: id,
       date: input.date,
       direction: 'out',
       lines: inventoryLinesOf(input.lines, prep),
-      memo: `Invoice #${invoice.invoiceNumber}`,
+      memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
       carryForward: true,
     });
 
