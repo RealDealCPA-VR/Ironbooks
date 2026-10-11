@@ -723,6 +723,11 @@ export const employees = pgTable('employees', {
   address: jsonb('address').$type<Record<string, unknown>>(),
   /** Sick/vacation accrual policy + running balances (hours). */
   accruals: jsonb('accruals').$type<Record<string, unknown>>(),
+  /** wave2 payroll: employment dates, phone and default workers-comp class code. */
+  hireDate: timestamp('hire_date'),
+  releaseDate: timestamp('release_date'),
+  phone: varchar('phone', { length: 50 }),
+  workersCompCodeId: uuid('workers_comp_code_id'),
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -742,6 +747,13 @@ export const paychecks = pgTable('paychecks', {
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   /** Batch pay run this paycheck was created in (optional). */
   payRunId: uuid('pay_run_id').references(() => payRuns.id),
+  /**
+   * wave2 payroll: 'paycheck' (a real check), 'ytd_adjustment' (historical YTD amounts entered
+   * at mid-year setup) or 'liability_adjustment' (Adjust Payroll Liabilities). Adjustments may
+   * be non-posting (postedEntryId null) — they still count in W-2/941/940/YTD.
+   */
+  entryType: varchar('entry_type', { length: 30 }).notNull().default('paycheck'),
+  memo: text('memo'),
   voidedAt: timestamp('voided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
@@ -1625,5 +1637,40 @@ export const itemReceiptBillLines = pgTable('item_receipt_bill_lines', {
   /** FIFO layer cost adjustments made for inventoryVariance ([{ layerId, quantity, unitDelta }]); average-cost items store [{ kind: 'average', onHand }] (stock the variance was spread over). */
   layerAdjustments: jsonb('layer_adjustments').$type<Array<Record<string, string>>>(),
   writtenOff: boolean('written_off').notNull().default(false),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- wave2 payroll ----
+// Employer state payroll taxes (SUI employer rate + wage base, SDI employee rate + wage base)
+// per company, state and calendar year; workers' compensation class codes (rate per $100 of
+// wages). See lib/services/payrollAdjustments.ts.
+
+export const payrollStateSettings = pgTable('payroll_state_settings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  state: varchar('state', { length: 2 }).notNull(),
+  year: integer('year').notNull(),
+  /** Employer state unemployment (SUI/SUTA) rate as a fraction, e.g. 0.034000 = 3.4%. */
+  suiRate: decimal('sui_rate', { precision: 9, scale: 6 }).notNull().default('0'),
+  /** SUI taxable wage base per employee per year (0 = no cap). */
+  suiWageBase: decimal('sui_wage_base', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Employee state disability (SDI) withholding rate as a fraction (0 = none). */
+  sdiRate: decimal('sdi_rate', { precision: 9, scale: 6 }).notNull().default('0'),
+  /** SDI wage base per employee per year (0 = no cap). */
+  sdiWageBase: decimal('sdi_wage_base', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** State unemployment account number (printed on the quarterly wage worksheet). */
+  accountNumber: varchar('account_number', { length: 50 }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const workersCompCodes = pgTable('workers_comp_codes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  code: varchar('code', { length: 20 }).notNull(),
+  description: varchar('description', { length: 255 }),
+  /** Premium per $100 of wages, e.g. 1.2500. */
+  ratePer100: decimal('rate_per_100', { precision: 9, scale: 4 }).notNull().default('0'),
+  isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

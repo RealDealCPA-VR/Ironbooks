@@ -1,6 +1,6 @@
 /** GET /api/portal/me — the signed-in employee's profile + their paychecks. */
 import { NextResponse } from 'next/server';
-import { desc, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { employees, paychecks } from '@/lib/db/schema';
 import { getPortalEmployeeId } from '@/lib/auth';
@@ -14,7 +14,8 @@ export async function GET() {
   const checks = await db
     .select()
     .from(paychecks)
-    .where(eq(paychecks.employeeId, employeeId))
+    // Real paychecks only — historical YTD / liability adjustments are bookkeeping entries.
+    .where(and(eq(paychecks.employeeId, employeeId), eq(paychecks.entryType, 'paycheck')))
     .orderBy(desc(paychecks.payDate));
   return NextResponse.json({
     employee: { id: emp.id, name: `${emp.firstName} ${emp.lastName}`, email: emp.email, payType: emp.payType },

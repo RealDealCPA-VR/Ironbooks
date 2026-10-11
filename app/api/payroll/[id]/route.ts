@@ -1,40 +1,54 @@
 /**
+ * GET    /api/payroll/[id] — one paycheck with its lines (for the edit form).
+ * PATCH  /api/payroll/[id] — edit a paycheck (QB "Edit Paycheck"): the old GL entry is voided
+ *                            and a corrected one posted in the same transaction. Refused when
+ *                            the check was cleared in a completed bank reconciliation or its
+ *                            period is closed.
  * DELETE /api/payroll/[id] — void a paycheck.
  *
- * Voids the underlying GL journal entry (blocked when a line was cleared in a
- * completed reconciliation, or the period is closed) and stamps
- * paychecks.voided_at so W-2 / 941 / pay-stub aggregations exclude the check.
+ * Voiding voids the underlying GL journal entry (blocked when a line was cleared in a
+ * completed reconciliation, or the period is closed) and stamps paychecks.voided_at so
+ * W-2 / 941 / pay-stub aggregations exclude the check.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { voidPaycheck } from '@/lib/services/payroll';
-import { ServiceError } from '@/lib/services/_base';
+import { editPaycheck, getPaycheck, voidPaycheck } from '@/lib/services/payroll';
+import { routeError } from '@/lib/routeErrors';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { editPaycheckSchema } from '@/lib/validation/payroll';
 
-function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : err.code === 'PERIOD_CLOSED' ? 409
-      : 500;
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
-  }
-  console.error('[payroll/[id]] unexpected error:', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-}
+type Params = { params: Promise<{ id: string }> };
 
-export async function DELETE(
-  _req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function GET(_req: NextRequest, { params }: Params) {
   try {
     const ctx = await getServerContext();
     const { id } = await params;
-    const voided = await voidPaycheck(ctx, id);
-    return NextResponse.json(voided);
+    return NextResponse.json(await getPaycheck(ctx, id));
   } catch (err) {
-    return errorResponse(err);
+    return routeError(err, 'payroll/[id]');
+  }
+}
+
+export async function PATCH(req: NextRequest, { params }: Params) {
+  try {
+    const ctx = await getServerContext();
+    const { id } = await params;
+    const body = await req.json().catch(() => ({}));
+    const parsed = editPaycheckSchema.safeParse(body);
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    const updated = await editPaycheck(ctx, id, { ...parsed.data, deductions: parsed.data.deductions ?? [] });
+    return NextResponse.json(updated);
+  } catch (err) {
+    return routeError(err, 'payroll/[id]');
+  }
+}
+
+export async function DELETE(_req: NextRequest, { params }: Params) {
+  try {
+    const ctx = await getServerContext();
+    const { id } = await params;
+    return NextResponse.json(await voidPaycheck(ctx, id));
+  } catch (err) {
+    return routeError(err, 'payroll/[id]');
   }
 }

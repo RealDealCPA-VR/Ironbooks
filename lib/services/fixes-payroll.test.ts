@@ -294,7 +294,7 @@ describe('payroll audit fixes', () => {
       // Check 1 — YTD 0: full SS on 160k, FUTA on first 7k only.
       const c1 = await runPaycheck(ctx, {
         employeeId: emp.id,
-        payDate: new Date('2022-01-10'),
+        payDate: new Date('2024-01-10'), // 2024 tables: SS wage base 168,600
         grossPay: '160000.00',
       });
       const l1 = Object.fromEntries((await linesFor(c1.id)).map((l) => [`${l.kind}:${l.name}`, l.amount]));
@@ -306,7 +306,7 @@ describe('payroll audit fixes', () => {
       // Check 2 — YTD 160,000: only 8,600 fits under the 168,600 wage base; no FUTA left.
       const c2 = await runPaycheck(ctx, {
         employeeId: emp.id,
-        payDate: new Date('2022-02-10'),
+        payDate: new Date('2024-02-10'),
         grossPay: '20000.00',
       });
       const lines2 = await linesFor(c2.id);
@@ -319,7 +319,7 @@ describe('payroll audit fixes', () => {
       // Check 3 — YTD 180,000: SS fully exhausted; Additional Medicare on 10k over 200k.
       const c3 = await runPaycheck(ctx, {
         employeeId: emp.id,
-        payDate: new Date('2022-03-10'),
+        payDate: new Date('2024-03-10'),
         grossPay: '30000.00',
       });
       const lines3 = await linesFor(c3.id);

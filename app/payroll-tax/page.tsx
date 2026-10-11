@@ -2,8 +2,9 @@
 /**
  * Payroll Tax Calculator — federal + state withholding estimator.
  *
- * Uses 2024 IRS Publication 15-T percentage-method brackets (approximation)
- * and ~2024 state income-tax public rates (approximation).
+ * Federal: IRS Publication 15-T percentage-method tables for the chosen tax year
+ * (lib/services/payrollTax.ts keeps one table per year). State: ~2024 public income-tax rates
+ * (approximation). State unemployment / disability rates are set on Payroll setup.
  * Results are for estimation purposes only; verify before filing.
  */
 import { useState } from 'react';
@@ -19,6 +20,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { taxYearTable } from '@/lib/services/payrollTax';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -146,7 +148,8 @@ function ResultRow({
 export default function PayrollTaxPage() {
   const [grossPerPeriod, setGrossPerPeriod] = useState('');
   const [frequencyIndex, setFrequencyIndex] = useState(1); // biweekly default
-  const [filingStatus, setFilingStatus] = useState<'single' | 'married'>('single');
+  const [filingStatus, setFilingStatus] = useState<'single' | 'married' | 'head_of_household'>('single');
+  const [taxYear, setTaxYear] = useState(String(new Date().getFullYear()));
   const [selectedState, setSelectedState] = useState('TX'); // default no-tax state
   const [result, setResult] = useState<WithholdingResult | null>(null);
   const [stateResult, setStateResult] = useState<StateTaxResult | null>(null);
@@ -170,6 +173,7 @@ export default function PayrollTaxPage() {
           grossPerPeriod: gross,
           periodsPerYear: selectedFrequency.periodsPerYear,
           filingStatus,
+          year: Number(taxYear),
         }),
         api.post<StateTaxResult>('/api/payroll/state-tax', {
           grossPerPeriod: gross,
@@ -207,8 +211,8 @@ export default function PayrollTaxPage() {
 
       {/* Disclaimer banner */}
       <div className="mb-6 rounded-xl border border-gold/30 bg-gold/10 px-5 py-4 text-sm text-navy/80 leading-relaxed">
-        <span className="font-bold">Disclaimer:</span> This calculator uses approximated 2024 IRS
-        Publication 15-T percentage-method withholding brackets. It is provided for estimation
+        <span className="font-bold">Disclaimer:</span> This calculator uses the IRS Publication 15-T
+        percentage-method withholding tables for the tax year you choose. It is provided for estimation
         purposes only. Results may differ from actual withholding depending on W-4 elections,
         state taxes, pre-tax deductions, and other factors.{' '}
         <span className="font-semibold">Always verify against official IRS guidance before
@@ -261,10 +265,23 @@ export default function PayrollTaxPage() {
             <Select
               id="pt-filing"
               value={filingStatus}
-              onChange={(e) => setFilingStatus(e.target.value as 'single' | 'married')}
+              onChange={(e) => setFilingStatus(e.target.value as 'single' | 'married' | 'head_of_household')}
             >
               <option value="single">Single</option>
               <option value="married">Married Filing Jointly</option>
+              <option value="head_of_household">Head of Household</option>
+            </Select>
+          </div>
+
+          {/* Tax year (federal tables are kept per year) */}
+          <div>
+            <Label htmlFor="pt-year">Tax year</Label>
+            <Select id="pt-year" value={taxYear} onChange={(e) => setTaxYear(e.target.value)}>
+              {[2026, 2025, 2024, 2023, 2022].map((y) => (
+                <option key={y} value={y}>
+                  {y}
+                </option>
+              ))}
             </Select>
           </div>
 
@@ -319,7 +336,7 @@ export default function PayrollTaxPage() {
                 </p>
                 <p>
                   <span className="font-medium">Status:</span>{' '}
-                  {filingStatus === 'married' ? 'Married Filing Jointly' : 'Single'}
+                  {filingStatus === 'married' ? 'Married Filing Jointly' : filingStatus === 'head_of_household' ? 'Head of Household' : 'Single'}
                 </p>
                 <p>
                   <span className="font-medium">State:</span>{' '}
@@ -368,7 +385,7 @@ export default function PayrollTaxPage() {
 
               <p className="mt-4 text-xs text-navy/40 leading-relaxed">
                 * Additional Medicare Tax of 0.9% applies to wages exceeding $200,000/year.
-                Social Security capped at $168,600 annual wages (2024).
+                Social Security capped at {formatCurrency(String(taxYearTable(Number(taxYear)).ssWageBase))} of wages ({taxYearTable(Number(taxYear)).year}).
               </p>
 
               <p className="mt-3 text-xs text-gold leading-relaxed font-semibold">
@@ -384,48 +401,50 @@ export default function PayrollTaxPage() {
         </Card>
       </div>
 
-      {/* Reference card */}
-      <Card className="mt-6 p-6">
-        <h2 className="font-bold text-navy text-base mb-3">2024 Federal Tax Reference</h2>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-sm text-navy/70">
-          <div>
-            <h3 className="font-semibold text-navy mb-2">FICA Rates</h3>
-            <ul className="space-y-1">
-              <li>Social Security: <span className="font-medium">6.2%</span> (up to $168,600)</li>
-              <li>Medicare: <span className="font-medium">1.45%</span> (all wages)</li>
-              <li>Addl. Medicare: <span className="font-medium">+0.9%</span> over $200,000</li>
-            </ul>
-          </div>
-          <div>
-            <h3 className="font-semibold text-navy mb-2">Single Brackets (2024)</h3>
-            <ul className="space-y-1 font-mono text-xs">
-              <li>10% up to $11,600</li>
-              <li>12% up to $47,150</li>
-              <li>22% up to $100,525</li>
-              <li>24% up to $191,950</li>
-              <li>32% up to $243,725</li>
-              <li>35% up to $609,350</li>
-              <li>37% over $609,350</li>
-            </ul>
-          </div>
-          <div>
-            <h3 className="font-semibold text-navy mb-2">Married (MFJ) Brackets (2024)</h3>
-            <ul className="space-y-1 font-mono text-xs">
-              <li>10% up to $23,200</li>
-              <li>12% up to $94,300</li>
-              <li>22% up to $201,050</li>
-              <li>24% up to $383,900</li>
-              <li>32% up to $487,450</li>
-              <li>35% up to $731,200</li>
-              <li>37% over $731,200</li>
-            </ul>
-          </div>
-        </div>
-        <p className="mt-4 text-xs text-navy/40">
-          Source: IRS Publication 15-T (2024) — Percentage Method Tables for Automated Payroll Systems.
-          Figures are approximate; consult a qualified tax professional or the current IRS publication.
-        </p>
-      </Card>
+      {/* Reference card — straight from the year-keyed tables in payrollTax.ts */}
+      {(() => {
+        const table = taxYearTable(Number(taxYear));
+        const rates = [10, 12, 22, 24, 32, 35, 37];
+        const list = (edges: number[]) =>
+          rates.map((r, i) =>
+            i < edges.length ? `${r}% up to ${formatCurrency(String(edges[i]))}` : `${r}% over ${formatCurrency(String(edges[edges.length - 1]))}`,
+          );
+        const cols: Array<[string, number[]]> = [
+          ['Single', table.bracketEdges.single],
+          ['Married (MFJ)', table.bracketEdges.married],
+          ['Head of Household', table.bracketEdges.head_of_household],
+        ];
+        return (
+          <Card className="mt-6 p-6">
+            <h2 className="font-bold text-navy text-base mb-3">{table.year} Federal Tax Reference</h2>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-6 text-sm text-navy/70">
+              <div>
+                <h3 className="font-semibold text-navy mb-2">FICA Rates</h3>
+                <ul className="space-y-1">
+                  <li>Social Security: <span className="font-medium">6.2%</span> (up to {formatCurrency(String(table.ssWageBase))})</li>
+                  <li>Medicare: <span className="font-medium">1.45%</span> (all wages)</li>
+                  <li>Addl. Medicare: <span className="font-medium">+0.9%</span> over $200,000</li>
+                </ul>
+              </div>
+              {cols.map(([label, edges]) => (
+                <div key={label}>
+                  <h3 className="font-semibold text-navy mb-2">{label} brackets</h3>
+                  <ul className="space-y-1 font-mono text-xs">
+                    {list(edges).map((l) => (
+                      <li key={l}>{l}</li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+            <p className="mt-4 text-xs text-navy/40">
+              Brackets apply after the standard deduction ({formatCurrency(String(table.standardDeduction.single))} single,{' '}
+              {formatCurrency(String(table.standardDeduction.married))} married, {formatCurrency(String(table.standardDeduction.head_of_household))}{' '}
+              head of household). Source: IRS Publication 15-T ({table.year}). Consult the current IRS publication before filing.
+            </p>
+          </Card>
+        );
+      })()}
     </main>
   );
 }

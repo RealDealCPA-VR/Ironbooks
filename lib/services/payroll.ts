@@ -21,7 +21,7 @@
  * and unpaidTimeForPayroll + the [payroll:<id>] description tag link time entries
  * to paychecks (time_entries has no paycheck FK — see timeTracking.ts).
  */
-import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or, type SQL } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -30,10 +30,13 @@ import {
   paychecks,
   paycheckLines,
   payRuns,
+  payrollStateSettings,
   timeEntries,
+  workersCompCodes,
 } from '@/lib/db/schema';
 import {
   type ServiceContext,
+  ServiceError,
   inTransaction,
   notFound,
   validation,
@@ -44,7 +47,10 @@ import { maskForContext } from './access';
 import {
   computeEmployerTaxes,
   computeWithholding,
+  normalizeFilingStatus,
+  taxableUnderBase,
   type FilingStatus,
+  type W4Data,
 } from '@/lib/services/payrollTax';
 import { getPayrollItemsByIds, type PayrollItem } from './payrollItems';
 import { sickVacationBalances } from './payrollReports';
@@ -79,6 +85,11 @@ export interface UpdateEmployeeInput {
   address?: Record<string, unknown> | null;
   /** Deactivate (false) / reactivate (true). Inactive employees cannot be paid. */
   isActive?: boolean;
+  phone?: string | null;
+  hireDate?: Date | null;
+  releaseDate?: Date | null;
+  /** Default workers' comp class code (null clears it). */
+  workersCompCodeId?: string | null;
 }
 
 export interface PaycheckLineInput {
@@ -148,7 +159,8 @@ export interface RunPaycheckInput {
   /** Itemized deductions (e.g. 401k, health insurance). */
   deductions?: PaycheckLineInput[];
   /**
-   * Filing status used for auto-computed taxes (default: 'single').
+   * Filing status override for auto-computed taxes. Default: the employee's W-4
+   * (employees.w4.filingStatus, else 'single'); the rest of the W-4 (Steps 2-4) still applies.
    * Ignored when taxes are explicitly supplied.
    */
   filingStatus?: FilingStatus;
@@ -172,6 +184,20 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
+}
+
+/**
+ * SQL predicate (use with a LEFT JOIN of journal_entries on paychecks.posted_entry_id): the
+ * paycheck row counts toward payroll totals (W-2, 941, 940, YTD, wage-base limits, reports).
+ *  - posted rows whose GL entry is still 'posted' and that were not voided, or
+ *  - non-posting historical YTD / liability adjustments ("does not affect accounts") that were
+ *    not voided.
+ */
+export function paycheckCountsCondition(): SQL {
+  return or(
+    and(eq(journalEntries.status, 'posted'), isNull(paychecks.voidedAt)),
+    and(isNull(paychecks.postedEntryId), ne(paychecks.entryType, 'paycheck'), isNull(paychecks.voidedAt)),
+  )!;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +310,29 @@ export async function updateEmployee(
   if (input.w4 !== undefined) updates.w4 = input.w4;
   if (input.address !== undefined) updates.address = input.address;
   if (input.isActive !== undefined) updates.isActive = input.isActive;
+  if (input.phone !== undefined) updates.phone = input.phone?.trim() || null;
+  for (const key of ['hireDate', 'releaseDate'] as const) {
+    const v = input[key];
+    if (v === undefined) continue;
+    if (v !== null && (!(v instanceof Date) || isNaN(v.getTime()))) throw validation(`${key === 'hireDate' ? 'Hire' : 'Release'} date is not a valid date.`);
+    updates[key] = v;
+  }
+  if (input.workersCompCodeId !== undefined) {
+    if (input.workersCompCodeId) {
+      const [code] = await ctx.db
+        .select({ id: workersCompCodes.id })
+        .from(workersCompCodes)
+        .where(and(eq(workersCompCodes.id, input.workersCompCodeId), eq(workersCompCodes.companyId, ctx.companyId)));
+      if (!code) throw notFound("Workers' comp code");
+    }
+    updates.workersCompCodeId = input.workersCompCodeId;
+  }
+  if (updates.w4 && typeof updates.w4 === 'object') {
+    const fs = (updates.w4 as Record<string, unknown>).filingStatus;
+    if (fs !== undefined && fs !== null && !['single', 'married', 'head_of_household'].includes(String(fs))) {
+      throw validation('W-4 filing status must be single, married or head_of_household.');
+    }
+  }
 
   if (Object.keys(updates).length === 0) return existing; // already masked by getEmployee
   updates.updatedAt = new Date();
@@ -324,6 +373,8 @@ export interface ListPaychecksOptions {
   employeeId?: string;
   /** Include voided paychecks (flagged `isVoid: true`). Default: excluded. */
   includeVoided?: boolean;
+  /** Include historical YTD / liability adjustments (entryType != 'paycheck'). Default: excluded. */
+  includeAdjustments?: boolean;
 }
 
 /**
@@ -344,7 +395,9 @@ export async function listPaychecks(ctx: ServiceContext, opts?: ListPaychecksOpt
     ...r.paycheck,
     isVoid:
       r.paycheck.voidedAt != null ||
-      (r.paycheck.postedEntryId != null && r.jeStatus !== 'posted'),
+      (r.paycheck.postedEntryId != null && r.jeStatus !== 'posted') ||
+      // A real paycheck always has a GL entry; one without is not a live check.
+      (r.paycheck.postedEntryId == null && r.paycheck.entryType === 'paycheck'),
   }));
 
   // Cumulative YTD per employee per UTC calendar year over NON-VOID checks,
@@ -377,6 +430,7 @@ export async function listPaychecks(ctx: ServiceContext, opts?: ListPaychecksOpt
   }));
 
   if (!opts?.includeVoided) list = list.filter((p) => !p.isVoid);
+  if (!opts?.includeAdjustments) list = list.filter((p) => p.entryType === 'paycheck');
   if (opts?.employeeId) list = list.filter((p) => p.employeeId === opts.employeeId);
   return list;
 }
@@ -480,13 +534,13 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
       netPay: paychecks.netPay,
     })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .where(
       and(
         eq(paychecks.companyId, ctx.companyId),
         eq(paychecks.employeeId, pc.employeeId),
-        eq(journalEntries.status, 'posted'),
-        isNull(paychecks.voidedAt),
+        // Live checks + historical YTD amounts entered at mid-year setup.
+        paycheckCountsCondition(),
         gte(paychecks.payDate, yearStart),
         lte(paychecks.payDate, pc.payDate),
       ),
@@ -544,50 +598,102 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
 }
 
 /**
- * Sum gross wages already paid to an employee in the given UTC calendar year
- * (paychecks whose GL entry is still posted; voided checks don't count toward the
- * SS / FUTA wage bases or the Additional Medicare threshold).
+ * Sum gross wages already paid to an employee in the given UTC calendar year: posted
+ * paychecks plus historical YTD / liability adjustments (non-posting adjustments count too —
+ * QB's YTD setup amounts drive the wage-base limits). Voided checks don't count toward the
+ * SS / FUTA / SUI wage bases or the Additional Medicare threshold. `excludePaycheckId` leaves
+ * out the check being edited.
  */
 async function ytdGrossPaid(
   ctx: ServiceContext,
   employeeId: string,
   payDate: Date,
+  excludePaycheckId?: string | null,
 ): Promise<string> {
   const year = payDate.getUTCFullYear();
   const yearStart = new Date(Date.UTC(year, 0, 1));
   const yearEnd   = new Date(Date.UTC(year + 1, 0, 1));
 
   const rows = await ctx.db
-    .select({ grossPay: paychecks.grossPay })
+    .select({ id: paychecks.id, grossPay: paychecks.grossPay })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .where(
       and(
         eq(paychecks.companyId, ctx.companyId),
         eq(paychecks.employeeId, employeeId),
-        eq(journalEntries.status, 'posted'),
+        paycheckCountsCondition(),
         gte(paychecks.payDate, yearStart),
         lt(paychecks.payDate, yearEnd),
       ),
     );
 
-  return toAmountString(rows.reduce((s, r) => s.plus(Money.of(r.grossPay)), Money.zero()));
+  return toAmountString(
+    rows
+      .filter((r) => r.id !== excludePaycheckId)
+      .reduce((s, r) => s.plus(Money.of(r.grossPay)), Money.zero()),
+  );
 }
 
-export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) {
+/** Two-letter work state of an employee: W-4 `state` (state withholding) else address state. */
+export function employeeWorkState(employee: {
+  w4?: Record<string, unknown> | null;
+  address?: Record<string, unknown> | null;
+}): string | null {
+  const w4State = (employee.w4 ?? {})['state'];
+  const addrState = (employee.address ?? {})['state'];
+  for (const v of [w4State, addrState]) {
+    if (typeof v === 'string' && /^[A-Za-z]{2}$/.test(v.trim())) return v.trim().toUpperCase();
+  }
+  return null;
+}
+
+type Dec = ReturnType<typeof Money.zero>;
+type PersistLine = {
+  kind: string;
+  name: string;
+  amount: string;
+  payrollItemId: string | null;
+};
+
+/** Everything runPaycheck / editPaycheck need to persist + post one check. */
+interface PreparedPaycheck {
+  employee: Awaited<ReturnType<typeof getEmployee>>;
+  gross: Dec;
+  totalTaxes: Dec;
+  totalDeductions: Dec;
+  totalEmployerTaxes: Dec;
+  netPay: Dec;
+  earningLines: PersistLine[];
+  taxLines: PaycheckLineInput[];
+  deductionLines: PaycheckLineInput[];
+  employerTaxLines: PaycheckLineInput[];
+  itemFor: (id: string | null | undefined) => PayrollItem | null;
+  accountsUsed: { payrollExpenseId: string; payrollTaxExpenseId: string; payrollLiabId: string; checkingId: string };
+}
+
+/**
+ * Validate + compute a paycheck (read-only). Shared by runPaycheck and editPaycheck so an edit
+ * recomputes exactly like a new check (with the edited check excluded from YTD).
+ */
+async function preparePaycheck(
+  ctx: ServiceContext,
+  input: RunPaycheckInput,
+  opts: { excludePaycheckId?: string | null; allowInactive?: boolean } = {},
+): Promise<PreparedPaycheck> {
   // --- Validate employee ---
   const employee = await getEmployee(ctx, input.employeeId);
-  if (!employee.isActive) throw validation('Cannot run paycheck for an inactive employee.');
+  if (!employee.isActive && !opts.allowInactive) {
+    throw validation('Cannot run paycheck for an inactive employee.');
+  }
+  if (!(input.payDate instanceof Date) || isNaN(input.payDate.getTime())) {
+    throw validation('A valid pay date is required.');
+  }
 
   // --- Compute gross from itemized earnings (or the legacy single amount) ---
   const earningsInput = input.earnings ?? [];
-  const earningLines: Array<{
-    kind: 'earning';
-    name: string;
-    amount: string;
-    payrollItemId: string | null;
-  }> = [];
-  let gross: ReturnType<typeof Money.zero>;
+  const earningLines: PersistLine[] = [];
+  let gross: Dec;
 
   if (earningsInput.length > 0) {
     let total = Money.zero();
@@ -698,16 +804,20 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
   if (callerSuppliedTaxes) {
     taxLines = input.taxes!;
   } else {
-    // Derive taxes automatically from the TAXABLE gross (gross minus pre-tax deductions)
-    // using 2024 IRS tables. The SS wage base and Additional Medicare threshold are
-    // applied against ACTUAL YTD wages (not an annualized projection of this period),
-    // so bonuses and wage-base crossovers withhold correctly.
-    const ytdGrossBefore = await ytdGrossPaid(ctx, input.employeeId, input.payDate);
+    // Derive taxes from the TAXABLE gross using the PAY DATE's tax-year tables and the
+    // employee's W-4 (unless the caller overrides the filing status). The SS wage base and
+    // Additional Medicare threshold apply against ACTUAL YTD wages, which include historical
+    // YTD amounts entered at mid-year setup.
+    const year = input.payDate.getUTCFullYear();
+    const ytdGrossBefore = await ytdGrossPaid(ctx, input.employeeId, input.payDate, opts.excludePaycheckId);
+    const w4 = (employee.w4 ?? {}) as W4Data;
     const withholding = computeWithholding({
       grossPerPeriod: taxableGross.toNumber(),
       periodsPerYear: input.periodsPerYear ?? 26,
-      filingStatus: input.filingStatus ?? 'single',
+      filingStatus: input.filingStatus ?? normalizeFilingStatus(w4.filingStatus),
       ytdGrossBefore,
+      year,
+      w4: input.filingStatus ? { ...w4, filingStatus: input.filingStatus } : w4,
     });
     taxLines = [
       { kind: 'tax' as const, name: 'Federal Income Tax', amount: withholding.federalIncomeTax },
@@ -715,18 +825,47 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
       { kind: 'tax' as const, name: 'Medicare',            amount: withholding.medicare },
     ].filter((t) => parseFloat(t.amount) > 0);
 
-    // Employer payroll taxes (employer FICA match + FUTA) — auto-computed alongside
-    // the employee withholdings unless the caller supplied them explicitly below.
+    // State payroll taxes configured for the employee's work state (employee SDI).
+    const state = employeeWorkState(employee);
+    const stateSettings = state ? await stateSettingsFor(ctx, state, year) : null;
+    if (state && stateSettings && Money.gt(stateSettings.sdiRate, 0)) {
+      const sdiTaxable = taxableUnderBase(taxableGross, ytdGrossBefore, stateSettings.sdiWageBase);
+      const sdi = Money.round2(sdiTaxable.times(Money.of(stateSettings.sdiRate)));
+      if (sdi.greaterThan(0)) {
+        taxLines.push({ kind: 'tax', name: `State Disability (${state})`, amount: toAmountString(sdi) });
+      }
+    }
+
+    // Employer payroll taxes (employer FICA match + FUTA + SUI + workers comp) — auto-computed
+    // alongside the employee withholdings unless the caller supplied them explicitly.
     if (!callerSuppliedEmployerTaxes) {
       const employer = computeEmployerTaxes({
         grossPerPeriod: taxableGross.toNumber(),
         ytdGrossBefore,
+        year,
       });
       employerTaxLines = [
         { kind: 'employer_contribution' as const, name: 'Employer Social Security',     amount: employer.socialSecurity },
         { kind: 'employer_contribution' as const, name: 'Employer Medicare',            amount: employer.medicare },
         { kind: 'employer_contribution' as const, name: 'Federal Unemployment (FUTA)',  amount: employer.futa },
-      ].filter((t) => parseFloat(t.amount) > 0);
+      ];
+      if (state && stateSettings && Money.gt(stateSettings.suiRate, 0)) {
+        const suiTaxable = taxableUnderBase(taxableGross, ytdGrossBefore, stateSettings.suiWageBase);
+        employerTaxLines.push({
+          kind: 'employer_contribution',
+          name: `State Unemployment (${state})`,
+          amount: toAmountString(Money.round2(suiTaxable.times(Money.of(stateSettings.suiRate)))),
+        });
+      }
+      const wc = await workersCompFor(ctx, employee.workersCompCodeId ?? null);
+      if (wc && Money.gt(wc.ratePer100, 0)) {
+        employerTaxLines.push({
+          kind: 'employer_contribution',
+          name: `Workers Compensation (${wc.code})`,
+          amount: toAmountString(Money.round2(gross.times(Money.of(wc.ratePer100)).dividedBy(100))),
+        });
+      }
+      employerTaxLines = employerTaxLines.filter((t) => parseFloat(String(t.amount)) > 0);
     }
   }
 
@@ -777,6 +916,144 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
     }
   }
 
+  return {
+    employee,
+    gross,
+    totalTaxes,
+    totalDeductions,
+    totalEmployerTaxes,
+    netPay,
+    earningLines,
+    taxLines,
+    deductionLines,
+    employerTaxLines,
+    itemFor,
+    accountsUsed: { payrollExpenseId, payrollTaxExpenseId, payrollLiabId, checkingId },
+  };
+}
+
+/** The paycheck_lines rows for a prepared check. */
+function paycheckLineRows(prep: PreparedPaycheck, paycheckId: string) {
+  // Garnishment-item lines persist as kind 'deduction' (the ITEM's kind carries the
+  // garnishment semantics) so stubs / W-2 / YTD groupings keep working.
+  return [
+    ...prep.earningLines.map((e) => ({ paycheckId, ...e })),
+    ...prep.taxLines.map((t) => ({
+      paycheckId,
+      kind: 'tax' as const,
+      name: t.name,
+      amount: toAmountString(Money.of(t.amount)),
+      payrollItemId: t.payrollItemId ?? null,
+    })),
+    ...prep.deductionLines.map((d) => ({
+      paycheckId,
+      kind: 'deduction' as const,
+      name: d.name,
+      amount: toAmountString(Money.of(d.amount)),
+      payrollItemId: d.payrollItemId ?? null,
+    })),
+    ...prep.employerTaxLines.map((t) => ({
+      paycheckId,
+      kind: 'employer_contribution' as const,
+      name: t.name,
+      amount: toAmountString(Money.of(t.amount)),
+      payrollItemId: t.payrollItemId ?? null,
+    })),
+  ];
+}
+
+/**
+ * Build and post the balanced journal entry for a prepared check. Each line posts to its
+ * payroll item's mapped account when set, otherwise to the legacy defaults:
+ *
+ *   Dr item.expense ?? 6500       = earning amounts (sum = grossPay)
+ *   Dr item.expense ?? 6510/6500  = employer taxes               (only if > 0)
+ *   Cr item.liability ?? 2300     = taxes + deductions           (only if > 0)
+ *   Cr item.liability ?? 2300     = employer taxes               (only if > 0)
+ *   Cr 1000 Checking              = netPay
+ *
+ * Proof: grossPay = netPay + totalTaxes + totalDeductions, and employer taxes appear once as
+ * a debit and once as a credit.
+ */
+async function postPaycheckEntry(
+  tx: ServiceContext,
+  prep: PreparedPaycheck,
+  paycheckId: string,
+  payDate: Date,
+  bankAccountId?: string | null,
+) {
+  const { employee, itemFor } = prep;
+  const { payrollExpenseId, payrollTaxExpenseId, payrollLiabId, checkingId } = prep.accountsUsed;
+  const fullName = `${employee.firstName} ${employee.lastName}`;
+  const payDateStr = payDate.toISOString().slice(0, 10);
+
+  const sumInto = (map: Map<string, Dec>, key: string, amt: Dec) =>
+    map.set(key, (map.get(key) ?? Money.zero()).plus(amt));
+
+  const wageDebits = new Map<string, Dec>();
+  for (const e of prep.earningLines) {
+    const item = itemFor(e.payrollItemId);
+    sumInto(wageDebits, item?.expenseAccountId ?? payrollExpenseId, Money.of(e.amount));
+  }
+  const withholdingCredits = new Map<string, Dec>();
+  for (const t of prep.taxLines) {
+    const item = itemFor(t.payrollItemId);
+    sumInto(withholdingCredits, item?.liabilityAccountId ?? payrollLiabId, Money.of(t.amount));
+  }
+  for (const d of prep.deductionLines) {
+    const item = itemFor(d.payrollItemId);
+    sumInto(withholdingCredits, item?.liabilityAccountId ?? payrollLiabId, Money.of(d.amount));
+  }
+  const employerDebits = new Map<string, Dec>();
+  const employerCredits = new Map<string, Dec>();
+  for (const t of prep.employerTaxLines) {
+    const item = itemFor(t.payrollItemId);
+    const amt = Money.of(t.amount);
+    sumInto(employerDebits, item?.expenseAccountId ?? payrollTaxExpenseId, amt);
+    sumInto(employerCredits, item?.liabilityAccountId ?? payrollLiabId, amt);
+  }
+
+  const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [];
+  for (const [accountId, amt] of wageDebits) {
+    if (amt.greaterThan(0)) {
+      postingLines.push({ accountId, debit: toAmountString(amt), memo: `Payroll — ${fullName} (${payDateStr})` });
+    }
+  }
+  for (const [accountId, amt] of withholdingCredits) {
+    if (amt.greaterThan(0)) {
+      postingLines.push({ accountId, credit: toAmountString(amt), memo: `Taxes & deductions — ${fullName}` });
+    }
+  }
+  for (const [accountId, amt] of employerDebits) {
+    if (amt.greaterThan(0)) {
+      postingLines.push({ accountId, debit: toAmountString(amt), memo: `Employer payroll taxes — ${fullName}` });
+    }
+  }
+  for (const [accountId, amt] of employerCredits) {
+    if (amt.greaterThan(0)) {
+      postingLines.push({ accountId, credit: toAmountString(amt), memo: `Employer payroll taxes payable — ${fullName}` });
+    }
+  }
+  if (prep.netPay.greaterThan(0)) {
+    postingLines.push({
+      accountId: bankAccountId ?? checkingId,
+      credit: toAmountString(prep.netPay),
+      memo: `Net pay — ${fullName}`,
+    });
+  }
+
+  return postJournalEntry(tx, {
+    date: payDate,
+    description: `Payroll — ${fullName}`,
+    reference: paycheckId.slice(0, 8),
+    sourceRef: `paycheck:${paycheckId}`,
+    lines: postingLines,
+  });
+}
+
+export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) {
+  const prep = await preparePaycheck(ctx, input);
+
   // --- Persist in a single transaction ---
   return inTransaction(ctx, async (tx) => {
     // 1) Insert paycheck header.
@@ -788,150 +1065,24 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
         payDate: input.payDate,
         periodStart: input.periodStart ?? null,
         periodEnd: input.periodEnd ?? null,
-        grossPay: toAmountString(gross),
-        totalTaxes: toAmountString(totalTaxes),
-        totalDeductions: toAmountString(totalDeductions),
-        netPay: toAmountString(netPay),
+        grossPay: toAmountString(prep.gross),
+        totalTaxes: toAmountString(prep.totalTaxes),
+        totalDeductions: toAmountString(prep.totalDeductions),
+        netPay: toAmountString(prep.netPay),
         payRunId: input.payRunId ?? null,
+        entryType: 'paycheck',
         // postedEntryId set below
       })
       .returning();
 
-    // 2) Insert paycheck lines (itemized earnings + taxes + deductions).
-    //    Garnishment-item lines persist as kind 'deduction' (the ITEM's kind carries
-    //    the garnishment semantics) so stubs / W-2 / YTD groupings keep working.
-    const lineValues: Array<{
-      paycheckId: string;
-      kind: string;
-      name: string;
-      amount: string;
-      payrollItemId: string | null;
-    }> = [
-      ...earningLines.map((e) => ({ paycheckId: paycheck.id, ...e })),
-      ...taxLines.map((t) => ({
-        paycheckId: paycheck.id,
-        kind: 'tax' as const,
-        name: t.name,
-        amount: toAmountString(Money.of(t.amount)),
-        payrollItemId: t.payrollItemId ?? null,
-      })),
-      ...deductionLines.map((d) => ({
-        paycheckId: paycheck.id,
-        kind: 'deduction' as const,
-        name: d.name,
-        amount: toAmountString(Money.of(d.amount)),
-        payrollItemId: d.payrollItemId ?? null,
-      })),
-      ...employerTaxLines.map((t) => ({
-        paycheckId: paycheck.id,
-        kind: 'employer_contribution' as const,
-        name: t.name,
-        amount: toAmountString(Money.of(t.amount)),
-        payrollItemId: t.payrollItemId ?? null,
-      })),
-    ];
-
+    // 2) Insert paycheck lines (itemized earnings + taxes + deductions + employer taxes).
+    const lineValues = paycheckLineRows(prep, paycheck.id);
     if (lineValues.length > 0) {
       await tx.db.insert(paycheckLines).values(lineValues);
     }
 
-    // 3) Build and post the balanced journal entry. Each line posts to its payroll
-    //    item's mapped account when set, otherwise to the legacy defaults:
-    //
-    //   Dr item.expense ?? 6500       = earning amounts (sum = grossPay)
-    //   Dr item.expense ?? 6510/6500  = employer taxes               (only if > 0)
-    //   Cr item.liability ?? 2300     = taxes + deductions           (only if > 0)
-    //   Cr item.liability ?? 2300     = employer taxes               (only if > 0)
-    //   Cr 1000 Checking              = netPay
-    //
-    // Proof: grossPay = netPay + totalTaxes + totalDeductions, and employer taxes
-    // appear once as a debit and once as a credit  ✓
-    const fullName = `${employee.firstName} ${employee.lastName}`;
-    const payDateStr = input.payDate.toISOString().slice(0, 10);
-
-    // Aggregate amounts per account (insertion-ordered) so multi-line checks stay compact.
-    const sumInto = (map: Map<string, ReturnType<typeof Money.zero>>, key: string, amt: ReturnType<typeof Money.zero>) =>
-      map.set(key, (map.get(key) ?? Money.zero()).plus(amt));
-
-    const wageDebits = new Map<string, ReturnType<typeof Money.zero>>();
-    for (const e of earningLines) {
-      const item = itemFor(e.payrollItemId);
-      sumInto(wageDebits, item?.expenseAccountId ?? payrollExpenseId, Money.of(e.amount));
-    }
-
-    const withholdingCredits = new Map<string, ReturnType<typeof Money.zero>>();
-    for (const t of taxLines) {
-      const item = itemFor(t.payrollItemId);
-      sumInto(withholdingCredits, item?.liabilityAccountId ?? payrollLiabId, Money.of(t.amount));
-    }
-    for (const d of deductionLines) {
-      const item = itemFor(d.payrollItemId);
-      sumInto(withholdingCredits, item?.liabilityAccountId ?? payrollLiabId, Money.of(d.amount));
-    }
-
-    const employerDebits = new Map<string, ReturnType<typeof Money.zero>>();
-    const employerCredits = new Map<string, ReturnType<typeof Money.zero>>();
-    for (const t of employerTaxLines) {
-      const item = itemFor(t.payrollItemId);
-      const amt = Money.of(t.amount);
-      sumInto(employerDebits, item?.expenseAccountId ?? payrollTaxExpenseId, amt);
-      sumInto(employerCredits, item?.liabilityAccountId ?? payrollLiabId, amt);
-    }
-
-    const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [];
-
-    for (const [accountId, amt] of wageDebits) {
-      if (amt.greaterThan(0)) {
-        postingLines.push({
-          accountId,
-          debit: toAmountString(amt),
-          memo: `Payroll — ${fullName} (${payDateStr})`,
-        });
-      }
-    }
-
-    for (const [accountId, amt] of withholdingCredits) {
-      if (amt.greaterThan(0)) {
-        postingLines.push({
-          accountId,
-          credit: toAmountString(amt),
-          memo: `Taxes & deductions — ${fullName}`,
-        });
-      }
-    }
-
-    for (const [accountId, amt] of employerDebits) {
-      if (amt.greaterThan(0)) {
-        postingLines.push({
-          accountId,
-          debit: toAmountString(amt),
-          memo: `Employer payroll taxes — ${fullName}`,
-        });
-      }
-    }
-    for (const [accountId, amt] of employerCredits) {
-      if (amt.greaterThan(0)) {
-        postingLines.push({
-          accountId,
-          credit: toAmountString(amt),
-          memo: `Employer payroll taxes payable — ${fullName}`,
-        });
-      }
-    }
-
-    postingLines.push({
-      accountId: checkingId,
-      credit: toAmountString(netPay),
-      memo: `Net pay — ${fullName}`,
-    });
-
-    const entry = await postJournalEntry(tx, {
-      date: input.payDate,
-      description: `Payroll — ${fullName}`,
-      reference: paycheck.id.slice(0, 8),
-      sourceRef: `paycheck:${paycheck.id}`,
-      lines: postingLines,
-    });
+    // 3) Post the balanced journal entry.
+    const entry = await postPaycheckEntry(tx, prep, paycheck.id, input.payDate);
 
     // 4) Stamp postedEntryId.
     const [updated] = await tx.db
@@ -948,14 +1099,153 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
       newValues: {
         employeeId: input.employeeId,
         payDate: input.payDate,
-        grossPay: toAmountString(gross),
-        netPay: toAmountString(netPay),
+        grossPay: toAmountString(prep.gross),
+        netPay: toAmountString(prep.netPay),
         postedEntryId: entry.id,
       },
     });
 
     return { ...updated, lines: lineValues };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Edit a paycheck (sanctioned void + repost)
+// ---------------------------------------------------------------------------
+
+export type EditPaycheckInput = Omit<RunPaycheckInput, 'employeeId' | 'payRunId'>;
+
+/**
+ * Edit a posted paycheck in place (QB "Edit Paycheck"). Same sanctioned pattern as
+ * updateBill / updateInvoice, all inside ONE transaction:
+ *   1. Void the check's current journal entry — voidJournalEntry refuses (CONFLICT) when a
+ *      line was cleared in a COMPLETED bank reconciliation, and PERIOD_CLOSED when the old
+ *      date is in a closed period.
+ *   2. Replace the paycheck lines and header amounts (id, employee, pay run kept).
+ *   3. Post a fresh balanced entry (the new date's period must be open) and re-stamp
+ *      postedEntryId.
+ *   4. Audit old → new values.
+ * The recomputation excludes the check itself from YTD, so wage-base limits stay correct.
+ * Only real paychecks are edited here; YTD / liability adjustments have their own editor.
+ */
+export async function editPaycheck(ctx: ServiceContext, paycheckId: string, input: EditPaycheckInput) {
+  const [existing] = await ctx.db
+    .select()
+    .from(paychecks)
+    .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, ctx.companyId)));
+  if (!existing) throw notFound('Paycheck');
+  if (existing.voidedAt) throw new ServiceError('CONFLICT', 'A voided paycheck cannot be edited.');
+  if (existing.entryType !== 'paycheck') {
+    throw validation('This is a payroll adjustment, not a paycheck. Edit it from the adjustments list.');
+  }
+
+  const prep = await preparePaycheck(
+    ctx,
+    { ...input, employeeId: existing.employeeId, payRunId: existing.payRunId },
+    { excludePaycheckId: paycheckId, allowInactive: true },
+  );
+
+  return inTransaction(ctx, async (tx) => {
+    const [pc] = await tx.db
+      .select()
+      .from(paychecks)
+      .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, tx.companyId)));
+    if (!pc) throw notFound('Paycheck');
+    if (pc.voidedAt) throw new ServiceError('CONFLICT', 'A voided paycheck cannot be edited.');
+
+    const oldLines = await tx.db
+      .select()
+      .from(paycheckLines)
+      .where(eq(paycheckLines.paycheckId, paycheckId));
+
+    // 1) Void the old posting (reconciliation + closed-period guards live here).
+    if (pc.postedEntryId) await voidJournalEntry(tx, pc.postedEntryId);
+
+    // 2) Replace lines + header.
+    await tx.db.delete(paycheckLines).where(eq(paycheckLines.paycheckId, paycheckId));
+    const lineValues = paycheckLineRows(prep, paycheckId);
+    if (lineValues.length > 0) await tx.db.insert(paycheckLines).values(lineValues);
+
+    // 3) Re-post.
+    const entry = await postPaycheckEntry(tx, prep, paycheckId, input.payDate);
+    const [updated] = await tx.db
+      .update(paychecks)
+      .set({
+        payDate: input.payDate,
+        periodStart: input.periodStart ?? null,
+        periodEnd: input.periodEnd ?? null,
+        grossPay: toAmountString(prep.gross),
+        totalTaxes: toAmountString(prep.totalTaxes),
+        totalDeductions: toAmountString(prep.totalDeductions),
+        netPay: toAmountString(prep.netPay),
+        postedEntryId: entry.id,
+      })
+      .where(eq(paychecks.id, paycheckId))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'paycheck',
+      entityId: paycheckId,
+      oldValues: {
+        payDate: pc.payDate,
+        grossPay: pc.grossPay,
+        netPay: pc.netPay,
+        postedEntryId: pc.postedEntryId,
+        lines: oldLines.map((l) => ({ kind: l.kind, name: l.name, amount: l.amount })),
+      },
+      newValues: {
+        payDate: input.payDate,
+        grossPay: updated.grossPay,
+        netPay: updated.netPay,
+        postedEntryId: entry.id,
+        lines: lineValues.map((l) => ({ kind: l.kind, name: l.name, amount: l.amount })),
+      },
+    });
+
+    return { ...updated, lines: lineValues };
+  });
+}
+
+/** One paycheck with its lines (for the edit form). */
+export async function getPaycheck(ctx: ServiceContext, paycheckId: string) {
+  const [pc] = await ctx.db
+    .select()
+    .from(paychecks)
+    .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, ctx.companyId)));
+  if (!pc) throw notFound('Paycheck');
+  const lines = await ctx.db.select().from(paycheckLines).where(eq(paycheckLines.paycheckId, paycheckId));
+  return { ...pc, lines };
+}
+
+// ---------------------------------------------------------------------------
+// State payroll tax settings + workers comp lookups (rows managed in payrollAdjustments.ts)
+// ---------------------------------------------------------------------------
+
+/** The company's SUI/SDI settings for a state and year (latest earlier year as fallback). */
+export async function stateSettingsFor(ctx: ServiceContext, state: string, year: number) {
+  const rows = await ctx.db
+    .select()
+    .from(payrollStateSettings)
+    .where(
+      and(
+        eq(payrollStateSettings.companyId, ctx.companyId),
+        eq(payrollStateSettings.state, state.toUpperCase()),
+        lte(payrollStateSettings.year, year),
+      ),
+    )
+    .orderBy(desc(payrollStateSettings.year))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+async function workersCompFor(ctx: ServiceContext, id: string | null) {
+  if (!id) return null;
+  const [row] = await ctx.db
+    .select()
+    .from(workersCompCodes)
+    .where(and(eq(workersCompCodes.id, id), eq(workersCompCodes.companyId, ctx.companyId)));
+  return row && row.isActive ? row : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,9 +1428,8 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
         throw validation('Commission employees need an explicit amount.');
       }
 
-      const w4 = (employee.w4 ?? {}) as { filingStatus?: string };
-      const filingStatus: FilingStatus = w4.filingStatus === 'married' ? 'married' : 'single';
-
+      // Withholding follows the employee's W-4 (filing status incl. head of household,
+      // Steps 2-4 or pre-2020 allowances) — runPaycheck reads it from the employee row.
       const paycheck = await runPaycheck(ctx, {
         employeeId: employee.id,
         payDate: input.payDate,
@@ -1148,7 +1437,6 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
         periodEnd: input.periodEnd ?? null,
         earnings,
         deductions: empInput.deductions ?? [],
-        filingStatus,
         periodsPerYear,
         payRunId: run.id,
       });

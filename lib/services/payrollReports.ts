@@ -13,30 +13,38 @@
  * Also home to the sick/vacation accrual reads (employees.accruals jsonb) and
  * the per-item liability balances powering the QB-style Pay Liabilities screen.
  */
-import { and, eq, gte, inArray, isNull, lt, lte } from 'drizzle-orm';
-import { accounts, employees, journalEntries, journalEntryLines, paychecks, paycheckLines } from '@/lib/db/schema';
+import { and, asc, eq, gte, inArray, isNull, lt, lte, notLike, or } from 'drizzle-orm';
+import {
+  accounts,
+  employees,
+  journalEntries,
+  journalEntryLines,
+  paychecks,
+  paycheckLines,
+  payrollStateSettings,
+  workersCompCodes,
+} from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
-import { getEmployee } from './payroll';
+import { employeeWorkState, getEmployee, paycheckCountsCondition } from './payroll';
+import { FUTA_NET_RATE, FUTA_WAGE_BASE, ssWageBaseFor } from './payrollTax';
 import { getCompany } from './company';
 
 // ---------------------------------------------------------------------------
-// Wage-base constants (2024).
-// NOTE: SS_WAGE_BASE / FUTA_WAGE_BASE mirror the private constants in
-// lib/services/payrollTax.ts (not exported there — overlap reported).
+// Wage bases: the Social Security wage base is YEAR-KEYED data in payrollTax.ts
+// (ssWageBaseFor); FUTA's $7,000 base and 0.6% net rate are not indexed.
 // ---------------------------------------------------------------------------
-
-/** Social Security wage base for 2024 — caps W-2 Box 3 / W-3 Box 3. */
-const SS_WAGE_BASE = 168600;
-/** FUTA wage base — the first $7,000 of wages paid to each employee per year. */
-const FUTA_WAGE_BASE = 7000;
-/** FUTA net rate (after the full 5.4% state credit): 0.6%. */
-const FUTA_NET_RATE = '0.006';
 
 /** Matches the FUTA employer-accrual line name emitted by runPaycheck. */
 const FUTA_NAME_RE = /futa|federal unemployment/i;
-/** Matches state income-tax withholding lines (e.g. "State Income Tax (CA)"). */
-const STATE_TAX_RE = /state/i;
+/** Matches state unemployment (SUI/SUTA) employer lines, e.g. "State Unemployment (CA)". */
+const SUI_NAME_RE = /state unemployment|suta?|sui/i;
+/** State lines that are NOT state income tax withholding (SDI/SUI/workers comp). */
+const NOT_STATE_INCOME_RE = /unemploy|disab|sdi|sui|suta|workers/i;
+/** State income-tax withholding lines (e.g. "State Income Tax (CA)"), excluding SDI/SUI. */
+const STATE_TAX_RE = {
+  test: (name: string) => /state/i.test(name) && !NOT_STATE_INCOME_RE.test(name),
+};
 
 /** Pull the employer name/address/EIN out of companies.settings.
  * EIN and address live in settings (`settings.ein`, `settings.address`) because the
@@ -117,12 +125,12 @@ export async function w2Data(
   const yearPaychecks = await ctx.db
     .select({ id: paychecks.id, grossPay: paychecks.grossPay })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .where(
       and(
         eq(paychecks.companyId, ctx.companyId),
         eq(paychecks.employeeId, input.employeeId),
-        eq(journalEntries.status, 'posted'),
+        paycheckCountsCondition(),
         gte(paychecks.payDate, yearStart),
         lt(paychecks.payDate, yearEnd), // half-open [start, end): exclude Jan-1 of next year
       ),
@@ -173,7 +181,7 @@ export async function w2Data(
     .from(paycheckLines)
     .where(and(eq(paycheckLines.kind, 'tax'), inArray(paycheckLines.paycheckId, paycheckIds)));
 
-  function sumByName(pattern: RegExp): string {
+  function sumByName(pattern: { test(s: string): boolean }): string {
     return toAmountString(
       relevantTaxLines
         .filter((l) => pattern.test(l.name))
@@ -198,9 +206,8 @@ export async function w2Data(
 
   // Box 3: SS wages are Box 1 capped at the annual SS wage base.
   const grossDec = Money.of(wages);
-  const ssWages = toAmountString(
-    grossDec.greaterThan(SS_WAGE_BASE) ? Money.of(SS_WAGE_BASE) : grossDec,
-  );
+  const ssBase = ssWageBaseFor(input.year);
+  const ssWages = toAmountString(grossDec.greaterThan(ssBase) ? Money.of(ssBase) : grossDec);
 
   return {
     company: employerInfo,
@@ -290,11 +297,11 @@ export async function form941Data(
   const quarterPaychecks = await ctx.db
     .select({ id: paychecks.id, grossPay: paychecks.grossPay })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .where(
       and(
         eq(paychecks.companyId, ctx.companyId),
-        eq(journalEntries.status, 'posted'),
+        paycheckCountsCondition(),
         gte(paychecks.payDate, start),
         lt(paychecks.payDate, end), // exclusive upper bound (quarterRange.end is exclusive)
       ),
@@ -438,12 +445,11 @@ export async function form940Data(
       payDate: paychecks.payDate,
     })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .where(
       and(
         eq(paychecks.companyId, ctx.companyId),
-        eq(journalEntries.status, 'posted'),
-        isNull(paychecks.voidedAt),
+        paycheckCountsCondition(),
         gte(paychecks.payDate, yearStart),
         lt(paychecks.payDate, yearEnd),
       ),
@@ -572,12 +578,11 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
   const yearChecks = await ctx.db
     .select({ id: paychecks.id, employeeId: paychecks.employeeId, grossPay: paychecks.grossPay })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .where(
       and(
         eq(paychecks.companyId, ctx.companyId),
-        eq(journalEntries.status, 'posted'),
-        isNull(paychecks.voidedAt),
+        paycheckCountsCondition(),
         gte(paychecks.payDate, yearStart),
         lt(paychecks.payDate, yearEnd),
       ),
@@ -595,9 +600,10 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
   }
 
   // Box 3: cap per employee at the SS wage base, then sum.
+  const ssBase = ssWageBaseFor(input.year);
   let ssWages = Money.zero();
   for (const total of grossByEmployee.values()) {
-    ssWages = ssWages.plus(total.greaterThan(SS_WAGE_BASE) ? Money.of(SS_WAGE_BASE) : total);
+    ssWages = ssWages.plus(total.greaterThan(ssBase) ? Money.of(ssBase) : total);
   }
 
   const ids = yearChecks.map((c) => c.id);
@@ -612,7 +618,7 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
         .where(and(eq(paycheckLines.kind, 'tax'), inArray(paycheckLines.paycheckId, ids)))
     : [];
 
-  const sumByName = (pattern: RegExp) =>
+  const sumByName = (pattern: { test(s: string): boolean }) =>
     taxLines
       .filter((l) => pattern.test(l.name))
       .reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero());
@@ -674,8 +680,7 @@ async function loadRangePaychecks(
 
   const conditions = [
     eq(paychecks.companyId, ctx.companyId),
-    eq(journalEntries.status, 'posted'),
-    isNull(paychecks.voidedAt),
+    paycheckCountsCondition(),
     gte(paychecks.payDate, from),
     lte(paychecks.payDate, to),
   ];
@@ -688,7 +693,7 @@ async function loadRangePaychecks(
       lastName: employees.lastName,
     })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .innerJoin(employees, eq(paychecks.employeeId, employees.id))
     .where(and(...conditions))
     .orderBy(paychecks.payDate);
@@ -970,20 +975,23 @@ export async function payrollLiabilityBalances(
   const asOf = opts?.asOf ?? new Date();
   if (isNaN(asOf.getTime())) throw validation('Invalid asOf date.');
 
-  // 1) Accruals from paycheck lines (posted, non-void checks, payDate <= asOf).
+  // 1) Accruals from paycheck lines (posted, non-void checks, payDate <= asOf) plus liability
+  //    adjustments. Historical YTD amounts entered WITHOUT affecting accounts are excluded:
+  //    their liabilities were settled before the cutover (the GL import carries any balance).
   const checks = await ctx.db
-    .select({ id: paychecks.id })
+    .select({ id: paychecks.id, entryType: paychecks.entryType, postedEntryId: paychecks.postedEntryId })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .where(
       and(
         eq(paychecks.companyId, ctx.companyId),
-        eq(journalEntries.status, 'posted'),
-        isNull(paychecks.voidedAt),
+        paycheckCountsCondition(),
         lte(paychecks.payDate, asOf),
       ),
     );
-  const ids = checks.map((c) => c.id);
+  const ids = checks
+    .filter((c) => c.postedEntryId != null || c.entryType === 'liability_adjustment')
+    .map((c) => c.id);
 
   const lines = ids.length
     ? await ctx.db
@@ -1031,6 +1039,9 @@ export async function payrollLiabilityBalances(
           eq(journalEntries.status, 'posted'),
           eq(journalEntryLines.accountId, liabAccount.id),
           lte(journalEntries.date, asOf),
+          // Paycheck / payroll-adjustment entries are accruals (already counted from their
+          // lines above), never payments — even a negative liability adjustment's debit.
+          or(isNull(journalEntries.sourceRef), notLike(journalEntries.sourceRef, 'paycheck:%')),
         ),
       );
     for (const p of paymentLines) {
@@ -1150,15 +1161,16 @@ export async function sickVacationBalances(
 
   const checkConditions = [
     eq(paychecks.companyId, ctx.companyId),
-    eq(journalEntries.status, 'posted'),
-    isNull(paychecks.voidedAt),
+    paycheckCountsCondition(),
+    // Leave accrues per real paycheck — historical YTD / liability adjustments do not accrue.
+    eq(paychecks.entryType, 'paycheck'),
   ];
   if (opts?.employeeId) checkConditions.push(eq(paychecks.employeeId, opts.employeeId));
 
   const checks = await ctx.db
     .select({ id: paychecks.id, employeeId: paychecks.employeeId, payDate: paychecks.payDate })
     .from(paychecks)
-    .innerJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
     .where(and(...checkConditions));
 
   // Hours per paycheck from earning line names (hourly accrual basis).
@@ -1296,4 +1308,454 @@ export async function setEmployeeAccrualPolicy(
 
   const [row] = await sickVacationBalances(ctx, { employeeId });
   return row;
+}
+
+// ---------------------------------------------------------------------------
+// wave2 payroll reports — Employee Earnings Summary, Payroll Item Detail,
+// Payroll Transactions by Payee, State quarterly wage worksheet, Workers comp summary.
+// All read the same population as the rest of this module: posted, non-void paychecks plus
+// historical YTD / liability adjustments (paycheckCountsCondition).
+// ---------------------------------------------------------------------------
+
+const KIND_ORDER = ['earning', 'deduction', 'tax', 'employer_contribution'];
+const KIND_LABEL: Record<string, string> = {
+  earning: 'Earnings',
+  deduction: 'Deductions from gross pay',
+  tax: 'Taxes withheld',
+  employer_contribution: 'Employer taxes and contributions',
+};
+const ENTRY_TYPE_LABEL: Record<string, string> = {
+  paycheck: 'Paycheck',
+  ytd_adjustment: 'YTD Adjustment',
+  liability_adjustment: 'Liability Adjustment',
+};
+const kindRank = (k: string) => {
+  const i = KIND_ORDER.indexOf(k);
+  return i < 0 ? 99 : i;
+};
+
+export interface EarningsSummaryRow {
+  section: string;
+  kind: string;
+  item: string;
+  /** employeeId -> amount */
+  amounts: Record<string, string>;
+  total: string;
+}
+
+export interface EmployeeEarningsSummaryResult {
+  from: string;
+  to: string;
+  employees: Array<{ id: string; name: string }>;
+  rows: EarningsSummaryRow[];
+  /** Gross pay / net pay per employee. */
+  gross: Record<string, string>;
+  net: Record<string, string>;
+  totalGross: string;
+  totalNet: string;
+}
+
+/**
+ * QB "Employee Earnings Summary": one row per payroll item (grouped by earnings, deductions,
+ * taxes, employer items), one column per employee, plus totals.
+ */
+export async function employeeEarningsSummary(
+  ctx: ServiceContext,
+  input: PayrollRangeInput,
+): Promise<EmployeeEarningsSummaryResult> {
+  const { rows, lines } = await loadRangePaychecks(ctx, input.from, input.to, input.employeeId);
+  const empOf = new Map(rows.map((r) => [r.paycheck.id, r.paycheck.employeeId]));
+  const empNames = new Map<string, string>();
+  const gross = new Map<string, Dec>();
+  const net = new Map<string, Dec>();
+  for (const r of rows) {
+    const id = r.paycheck.employeeId;
+    empNames.set(id, `${r.firstName} ${r.lastName}`);
+    gross.set(id, (gross.get(id) ?? Money.zero()).plus(Money.of(r.paycheck.grossPay)));
+    net.set(id, (net.get(id) ?? Money.zero()).plus(Money.of(r.paycheck.netPay)));
+  }
+  const cells = new Map<string, Map<string, Dec>>(); // kind|item -> emp -> amount
+  for (const l of lines) {
+    const key = `${l.kind}|${baseName(l.name)}`;
+    const emp = empOf.get(l.paycheckId)!;
+    const m = cells.get(key) ?? new Map<string, Dec>();
+    m.set(emp, (m.get(emp) ?? Money.zero()).plus(Money.of(l.amount)));
+    cells.set(key, m);
+  }
+  const outRows: EarningsSummaryRow[] = [...cells.entries()]
+    .map(([key, m]) => {
+      const [kind, item] = key.split('|');
+      const amounts: Record<string, string> = {};
+      let total = Money.zero();
+      for (const [emp, v] of m) {
+        amounts[emp] = toAmountString(v);
+        total = total.plus(v);
+      }
+      return { section: KIND_LABEL[kind] ?? kind, kind, item, amounts, total: toAmountString(total) };
+    })
+    .sort((a, b) => kindRank(a.kind) - kindRank(b.kind) || a.item.localeCompare(b.item));
+  const rec = (m: Map<string, Dec>) => Object.fromEntries([...m].map(([k, v]) => [k, toAmountString(v)]));
+  const sum = (m: Map<string, Dec>) => toAmountString([...m.values()].reduce((s, v) => s.plus(v), Money.zero()));
+  return {
+    from: input.from.toISOString().slice(0, 10),
+    to: input.to.toISOString().slice(0, 10),
+    employees: [...empNames.entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    rows: outRows,
+    gross: rec(gross),
+    net: rec(net),
+    totalGross: sum(gross),
+    totalNet: sum(net),
+  };
+}
+
+export interface PayrollItemDetailLine {
+  paycheckId: string;
+  date: string;
+  type: string;
+  employeeId: string;
+  employeeName: string;
+  kind: string;
+  item: string;
+  /** Full line name (incl. hours @ rate detail). */
+  detail: string;
+  amount: string;
+}
+
+export interface PayrollItemDetailResult {
+  from: string;
+  to: string;
+  groups: Array<{ item: string; kind: string; lines: PayrollItemDetailLine[]; total: string }>;
+}
+
+/** QB "Payroll Item Detail": every paycheck line grouped by payroll item, with subtotals. */
+export async function payrollItemDetail(
+  ctx: ServiceContext,
+  input: PayrollRangeInput & { item?: string },
+): Promise<PayrollItemDetailResult> {
+  const { rows, lines } = await loadRangePaychecks(ctx, input.from, input.to, input.employeeId);
+  const pcById = new Map(rows.map((r) => [r.paycheck.id, r]));
+  const groups = new Map<string, { item: string; kind: string; lines: PayrollItemDetailLine[]; total: Dec }>();
+  for (const l of lines) {
+    const item = baseName(l.name);
+    if (input.item && item.toLowerCase() !== input.item.toLowerCase()) continue;
+    const r = pcById.get(l.paycheckId)!;
+    const key = `${l.kind}|${item}`;
+    const g = groups.get(key) ?? { item, kind: l.kind, lines: [], total: Money.zero() };
+    g.lines.push({
+      paycheckId: l.paycheckId,
+      date: r.paycheck.payDate.toISOString().slice(0, 10),
+      type: ENTRY_TYPE_LABEL[r.paycheck.entryType] ?? r.paycheck.entryType,
+      employeeId: r.paycheck.employeeId,
+      employeeName: `${r.firstName} ${r.lastName}`,
+      kind: l.kind,
+      item,
+      detail: l.name,
+      amount: toAmountString(l.amount),
+    });
+    g.total = g.total.plus(Money.of(l.amount));
+    groups.set(key, g);
+  }
+  return {
+    from: input.from.toISOString().slice(0, 10),
+    to: input.to.toISOString().slice(0, 10),
+    groups: [...groups.values()]
+      .sort((a, b) => kindRank(a.kind) - kindRank(b.kind) || a.item.localeCompare(b.item))
+      .map((g) => ({
+        item: g.item,
+        kind: g.kind,
+        lines: g.lines.sort((a, b) => a.date.localeCompare(b.date)),
+        total: toAmountString(g.total),
+      })),
+  };
+}
+
+export interface PayeeTransaction {
+  paycheckId: string;
+  date: string;
+  type: string;
+  reference: string;
+  memo: string | null;
+  gross: string;
+  taxes: string;
+  deductions: string;
+  net: string;
+}
+
+export interface PayrollTransactionsByPayeeResult {
+  from: string;
+  to: string;
+  payees: Array<{
+    employeeId: string;
+    employeeName: string;
+    transactions: PayeeTransaction[];
+    totalGross: string;
+    totalNet: string;
+  }>;
+  totalGross: string;
+  totalNet: string;
+}
+
+/** QB "Payroll Transactions by Payee": every paycheck / adjustment grouped by employee. */
+export async function payrollTransactionsByPayee(
+  ctx: ServiceContext,
+  input: PayrollRangeInput,
+): Promise<PayrollTransactionsByPayeeResult> {
+  const { rows } = await loadRangePaychecks(ctx, input.from, input.to, input.employeeId);
+  const byEmp = new Map<string, { employeeId: string; employeeName: string; transactions: PayeeTransaction[]; g: Dec; n: Dec }>();
+  let tg = Money.zero();
+  let tn = Money.zero();
+  for (const r of rows) {
+    const pc = r.paycheck;
+    const e = byEmp.get(pc.employeeId) ?? {
+      employeeId: pc.employeeId,
+      employeeName: `${r.firstName} ${r.lastName}`,
+      transactions: [],
+      g: Money.zero(),
+      n: Money.zero(),
+    };
+    e.transactions.push({
+      paycheckId: pc.id,
+      date: pc.payDate.toISOString().slice(0, 10),
+      type: ENTRY_TYPE_LABEL[pc.entryType] ?? pc.entryType,
+      reference: pc.id.slice(0, 8),
+      memo: pc.memo ?? null,
+      gross: pc.grossPay,
+      taxes: pc.totalTaxes,
+      deductions: pc.totalDeductions,
+      net: pc.netPay,
+    });
+    e.g = e.g.plus(Money.of(pc.grossPay));
+    e.n = e.n.plus(Money.of(pc.netPay));
+    tg = tg.plus(Money.of(pc.grossPay));
+    tn = tn.plus(Money.of(pc.netPay));
+    byEmp.set(pc.employeeId, e);
+  }
+  return {
+    from: input.from.toISOString().slice(0, 10),
+    to: input.to.toISOString().slice(0, 10),
+    payees: [...byEmp.values()]
+      .sort((a, b) => a.employeeName.localeCompare(b.employeeName))
+      .map((e) => ({
+        employeeId: e.employeeId,
+        employeeName: e.employeeName,
+        transactions: e.transactions,
+        totalGross: toAmountString(e.g),
+        totalNet: toAmountString(e.n),
+      })),
+    totalGross: toAmountString(tg),
+    totalNet: toAmountString(tn),
+  };
+}
+
+export interface StateWageWorksheetRow {
+  employeeId: string;
+  employeeName: string;
+  ssnLast4: string | null;
+  /** Gross wages paid in the quarter. */
+  quarterWages: string;
+  /** Wages above the SUI wage base (excess wages) in the quarter. */
+  excessWages: string;
+  /** SUI-taxable wages in the quarter. */
+  taxableWages: string;
+  /** SUI accrued on paychecks in the quarter (employer). */
+  suiAccrued: string;
+  /** SDI withheld from the employee in the quarter. */
+  sdiWithheld: string;
+  /** State income tax withheld in the quarter. */
+  stateWithheld: string;
+}
+
+export interface StateWageWorksheetResult {
+  state: string;
+  year: number;
+  quarter: 1 | 2 | 3 | 4;
+  company: { name: string; address: string | null; ein: string | null };
+  accountNumber: string | null;
+  suiRate: string;
+  suiWageBase: string;
+  employees: StateWageWorksheetRow[];
+  totals: {
+    quarterWages: string;
+    excessWages: string;
+    taxableWages: string;
+    suiAccrued: string;
+    sdiWithheld: string;
+    stateWithheld: string;
+    /** Worksheet computation: taxable wages x SUI rate. */
+    suiCalculated: string;
+  };
+}
+
+/**
+ * State quarterly wage worksheet (the data behind a state unemployment wage report): per
+ * employee working in `state`, quarter wages, excess over the SUI wage base (based on YTD
+ * wages before the quarter), taxable wages, and SUI / SDI / state income tax amounts.
+ */
+export async function stateWageWorksheet(
+  ctx: ServiceContext,
+  input: { state: string; year: number; quarter: 1 | 2 | 3 | 4 },
+): Promise<StateWageWorksheetResult> {
+  const state = (input.state ?? '').trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(state)) throw validation('State must be a two-letter code.');
+  if (!Number.isInteger(input.year)) throw validation('year must be an integer.');
+  if (![1, 2, 3, 4].includes(input.quarter)) throw validation('quarter must be 1-4.');
+  const company = await getCompany(ctx);
+  if (!company) throw notFound('Company');
+
+  const allSettings = await ctx.db
+    .select()
+    .from(payrollStateSettings)
+    .where(and(eq(payrollStateSettings.companyId, ctx.companyId), eq(payrollStateSettings.state, state)))
+    .orderBy(asc(payrollStateSettings.year));
+  const eff = allSettings.filter((r) => r.year <= input.year).pop() ?? null;
+  const wageBase = eff ? Money.of(eff.suiWageBase) : Money.zero();
+  const rate = eff ? Money.of(eff.suiRate) : Money.zero();
+
+  const yearStart = new Date(Date.UTC(input.year, 0, 1));
+  const { start, end } = quarterRange(input.quarter, input.year);
+  const endInclusive = new Date(end.getTime() - 1);
+  const { rows, lines } = await loadRangePaychecks(ctx, yearStart, endInclusive);
+
+  const emps = await ctx.db.select().from(employees).where(eq(employees.companyId, ctx.companyId));
+  const inState = new Map(emps.filter((e) => employeeWorkState(e) === state).map((e) => [e.id, e]));
+
+  const linesByCheck = new Map<string, typeof lines>();
+  for (const l of lines) {
+    const arr = linesByCheck.get(l.paycheckId) ?? [];
+    arr.push(l);
+    linesByCheck.set(l.paycheckId, arr);
+  }
+
+  interface Acc { before: Dec; q: Dec; sui: Dec; sdi: Dec; st: Dec }
+  const acc = new Map<string, Acc>();
+  for (const r of rows) {
+    const pc = r.paycheck;
+    if (!inState.has(pc.employeeId)) continue;
+    const a = acc.get(pc.employeeId) ?? {
+      before: Money.zero(), q: Money.zero(), sui: Money.zero(), sdi: Money.zero(), st: Money.zero(),
+    };
+    const g = Money.of(pc.grossPay);
+    if (pc.payDate.getTime() < start.getTime()) {
+      a.before = a.before.plus(g);
+    } else {
+      a.q = a.q.plus(g);
+      for (const l of linesByCheck.get(pc.id) ?? []) {
+        if (l.kind === 'employer_contribution' && SUI_NAME_RE.test(l.name)) a.sui = a.sui.plus(Money.of(l.amount));
+        else if (l.kind === 'tax' && /disab|\bsdi\b/i.test(l.name)) a.sdi = a.sdi.plus(Money.of(l.amount));
+        else if (l.kind === 'tax' && STATE_TAX_RE.test(l.name)) a.st = a.st.plus(Money.of(l.amount));
+      }
+    }
+    acc.set(pc.employeeId, a);
+  }
+
+  const out: StateWageWorksheetRow[] = [];
+  const t = { q: Money.zero(), ex: Money.zero(), tx: Money.zero(), sui: Money.zero(), sdi: Money.zero(), st: Money.zero() };
+  for (const [empId, a] of acc) {
+    if (a.q.isZero() && a.sui.isZero()) continue;
+    const emp = inState.get(empId)!;
+    let taxable = a.q;
+    if (wageBase.greaterThan(0)) {
+      const room = wageBase.minus(a.before);
+      taxable = room.lessThanOrEqualTo(0) ? Money.zero() : room.lessThan(a.q) ? room : a.q;
+    }
+    const excess = a.q.minus(taxable);
+    const ssn = typeof emp.ssn === 'string' ? emp.ssn.replace(/\D/g, '') : '';
+    out.push({
+      employeeId: empId,
+      employeeName: `${emp.firstName} ${emp.lastName}`,
+      ssnLast4: ssn.length >= 4 ? ssn.slice(-4) : null,
+      quarterWages: toAmountString(a.q),
+      excessWages: toAmountString(excess),
+      taxableWages: toAmountString(taxable),
+      suiAccrued: toAmountString(a.sui),
+      sdiWithheld: toAmountString(a.sdi),
+      stateWithheld: toAmountString(a.st),
+    });
+    t.q = t.q.plus(a.q);
+    t.ex = t.ex.plus(excess);
+    t.tx = t.tx.plus(taxable);
+    t.sui = t.sui.plus(a.sui);
+    t.sdi = t.sdi.plus(a.sdi);
+    t.st = t.st.plus(a.st);
+  }
+  out.sort((a, b) => a.employeeName.localeCompare(b.employeeName));
+  return {
+    state,
+    year: input.year,
+    quarter: input.quarter,
+    company: companyProfile(company),
+    accountNumber: eff?.accountNumber ?? null,
+    suiRate: eff ? eff.suiRate : '0',
+    suiWageBase: eff ? toAmountString(eff.suiWageBase) : '0.00',
+    employees: out,
+    totals: {
+      quarterWages: toAmountString(t.q),
+      excessWages: toAmountString(t.ex),
+      taxableWages: toAmountString(t.tx),
+      suiAccrued: toAmountString(t.sui),
+      sdiWithheld: toAmountString(t.sdi),
+      stateWithheld: toAmountString(t.st),
+      suiCalculated: toAmountString(Money.round2(t.tx.times(rate))),
+    },
+  };
+}
+
+export interface WorkersCompSummaryRow {
+  code: string;
+  description: string | null;
+  ratePer100: string;
+  /** Wages of the checks that accrued this code's premium. */
+  wages: string;
+  premium: string;
+  employees: number;
+}
+
+/** Workers compensation summary by class code for a date range. */
+export async function workersCompSummary(
+  ctx: ServiceContext,
+  input: PayrollRangeInput,
+): Promise<{ from: string; to: string; rows: WorkersCompSummaryRow[]; totalWages: string; totalPremium: string }> {
+  const { rows, lines } = await loadRangePaychecks(ctx, input.from, input.to, input.employeeId);
+  const codes = await ctx.db.select().from(workersCompCodes).where(eq(workersCompCodes.companyId, ctx.companyId));
+  const byCode = new Map(codes.map((c) => [c.code.toUpperCase(), c]));
+  const pcById = new Map(rows.map((r) => [r.paycheck.id, r.paycheck]));
+  const agg = new Map<string, { wages: Dec; premium: Dec; emps: Set<string> }>();
+  for (const l of lines) {
+    if (l.kind !== 'employer_contribution') continue;
+    const m = /workers comp(?:ensation)?\s*\(([^)]+)\)/i.exec(l.name);
+    if (!m) continue;
+    const code = m[1].trim().toUpperCase();
+    const pc = pcById.get(l.paycheckId)!;
+    const a = agg.get(code) ?? { wages: Money.zero(), premium: Money.zero(), emps: new Set<string>() };
+    a.wages = a.wages.plus(Money.of(pc.grossPay));
+    a.premium = a.premium.plus(Money.of(l.amount));
+    a.emps.add(pc.employeeId);
+    agg.set(code, a);
+  }
+  let tw = Money.zero();
+  let tp = Money.zero();
+  const out: WorkersCompSummaryRow[] = [...agg.entries()]
+    .map(([code, a]) => {
+      tw = tw.plus(a.wages);
+      tp = tp.plus(a.premium);
+      const def = byCode.get(code);
+      return {
+        code,
+        description: def?.description ?? null,
+        ratePer100: def ? def.ratePer100 : '',
+        wages: toAmountString(a.wages),
+        premium: toAmountString(a.premium),
+        employees: a.emps.size,
+      };
+    })
+    .sort((a, b) => a.code.localeCompare(b.code));
+  return {
+    from: input.from.toISOString().slice(0, 10),
+    to: input.to.toISOString().slice(0, 10),
+    rows: out,
+    totalWages: toAmountString(tw),
+    totalPremium: toAmountString(tp),
+  };
 }
