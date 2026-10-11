@@ -5,6 +5,7 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zMoney, zUuid } from './helpers';
+import { inventoryLineFields } from './inventorySites';
 
 export const billLineSchema = z.object({
   accountId: zUuid.nullish(),
@@ -16,6 +17,8 @@ export const billLineSchema = z.object({
   classId: zUuid.nullish(),
   customerId: zUuid.nullish(),
   jobId: zUuid.nullish(),
+  /** Advanced Inventory: receiving site/bin/serial/lot (inventory item lines only). */
+  ...inventoryLineFields,
 });
 
 export const createBillSchema = z.object({

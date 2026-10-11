@@ -53,6 +53,9 @@ interface Item {
   incomeAccountId: string | null;
   expenseAccountId: string | null;
   assetAccountId: string | null;
+  barcode?: string | null;
+  trackingMode?: string | null;
+  weight?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -77,6 +80,10 @@ interface FormState {
   incomeAccountId: string;
   expenseAccountId: string;
   assetAccountId: string;
+  // Advanced Inventory
+  barcode: string;
+  trackingMode: 'none' | 'serial' | 'lot';
+  weight: string;
 }
 
 const EMPTY_FORM: FormState = {
@@ -92,6 +99,9 @@ const EMPTY_FORM: FormState = {
   incomeAccountId: '',
   expenseAccountId: '',
   assetAccountId: '',
+  barcode: '',
+  trackingMode: 'none',
+  weight: '',
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -190,6 +200,9 @@ function ItemsPageContent() {
       incomeAccountId: item.incomeAccountId ?? '',
       expenseAccountId: item.expenseAccountId ?? '',
       assetAccountId: item.assetAccountId ?? '',
+      barcode: item.barcode ?? '',
+      trackingMode: (item.trackingMode as FormState['trackingMode']) ?? 'none',
+      weight: item.weight != null ? String(Number(item.weight)) : '',
     });
     setModalOpen(true);
   }
@@ -232,6 +245,9 @@ function ItemsPageContent() {
       expenseAccountId: noAccounts ? null : form.expenseAccountId || null,
       assetAccountId:
         form.type === 'inventory' ? form.assetAccountId || null : null,
+      barcode: form.barcode.trim() || null,
+      trackingMode: form.type === 'inventory' ? form.trackingMode : 'none',
+      weight: form.weight.trim() || null,
     };
 
     setSaving(true);
@@ -469,14 +485,29 @@ function ItemsPageContent() {
             </p>
           )}
 
-          <div>
-            <Label htmlFor="item-sku">SKU / Product Code</Label>
-            <Input
-              id="item-sku"
-              value={form.sku}
-              onChange={(e) => setField('sku', e.target.value)}
-              placeholder="Optional"
-            />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="item-sku">SKU / Product Code</Label>
+              <Input
+                id="item-sku"
+                value={form.sku}
+                onChange={(e) => setField('sku', e.target.value)}
+                placeholder="Optional"
+              />
+            </div>
+            <div>
+              <Label htmlFor="item-barcode">Barcode</Label>
+              <Input
+                id="item-barcode"
+                value={form.barcode}
+                onChange={(e) => setField('barcode', e.target.value)}
+                onKeyDown={(e) => {
+                  // A keyboard-wedge scanner ends with Enter — keep it from submitting the form.
+                  if (e.key === 'Enter') e.preventDefault();
+                }}
+                placeholder="Scan or type (optional)"
+              />
+            </div>
           </div>
 
           <div>
@@ -584,6 +615,39 @@ function ItemsPageContent() {
                   value={form.reorderPoint}
                   onChange={(e) => setField('reorderPoint', e.target.value)}
                   placeholder="e.g. 10"
+                />
+              </div>
+            </div>
+          )}
+
+          {form.type === 'inventory' && (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="item-tracking">Serial / Lot Tracking</Label>
+                <Select
+                  id="item-tracking"
+                  value={form.trackingMode}
+                  disabled={!!editingItem && Number(editingItem.quantityOnHand ?? 0) !== 0}
+                  onChange={(e) => setField('trackingMode', e.target.value as FormState['trackingMode'])}
+                >
+                  <option value="none">None</option>
+                  <option value="serial">Serial numbers (one per unit)</option>
+                  <option value="lot">Lot numbers (with expiration)</option>
+                </Select>
+                {!!editingItem && Number(editingItem.quantityOnHand ?? 0) !== 0 && (
+                  <p className="mt-1 text-xs text-navy/50">Can only change while nothing is on hand.</p>
+                )}
+              </div>
+              <div>
+                <Label htmlFor="item-weight">Unit Weight</Label>
+                <Input
+                  id="item-weight"
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={form.weight}
+                  onChange={(e) => setField('weight', e.target.value)}
+                  placeholder="For landed cost by weight"
                 />
               </div>
             </div>

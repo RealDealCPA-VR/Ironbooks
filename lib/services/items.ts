@@ -11,9 +11,10 @@
  * document is created and calls postJournalEntry. This service only manages
  * the item record and validates the linked account references.
  */
-import { and, asc, eq, ilike, ne } from 'drizzle-orm';
+import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, items } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,12 @@ export interface CreateItemInput {
   taxable?: boolean;
   /** Unit of measure shown on line grids / printed docs (e.g. "hr", "box", "ea"). */
   unitOfMeasure?: string | null;
+  /** Advanced Inventory: scan code (unique per company). */
+  barcode?: string | null;
+  /** Advanced Inventory: serial/lot tracking (inventory items only). Defaults to 'none'. */
+  trackingMode?: TrackingMode;
+  /** Unit weight — used to allocate landed cost by weight. */
+  weight?: string | number | null;
 }
 
 export interface UpdateItemInput {
@@ -54,6 +61,9 @@ export interface UpdateItemInput {
   taxable?: boolean;
   unitOfMeasure?: string | null;
   isActive?: boolean;
+  barcode?: string | null;
+  trackingMode?: TrackingMode;
+  weight?: string | number | null;
 }
 
 /** A bundle (group item) component, joined with the component item's details. */
@@ -163,6 +173,38 @@ function validateTypeRules(
   }
 }
 
+/** Normalise a barcode ('' → null) and enforce per-company uniqueness. */
+async function resolveBarcode(
+  ctx: ServiceContext,
+  barcode: string | null | undefined,
+  exceptItemId?: string,
+): Promise<string | null> {
+  const code = barcode?.trim() || null;
+  if (!code) return null;
+  if (code.length > 100) throw validation('Barcode cannot be longer than 100 characters.');
+  const conds = [eq(items.companyId, ctx.companyId), eq(items.barcode, code)];
+  if (exceptItemId) conds.push(ne(items.id, exceptItemId));
+  const [dup] = await ctx.db.select({ name: items.name }).from(items).where(and(...conds));
+  if (dup) throw validation(`Barcode "${code}" is already assigned to item "${dup.name}".`);
+  return code;
+}
+
+function resolveTracking(type: ItemType, mode: TrackingMode | undefined): TrackingMode {
+  const m = mode ?? 'none';
+  if (!TRACKING_MODES.includes(m)) throw validation(`Invalid tracking mode "${m}".`);
+  if (m !== 'none' && type !== 'inventory') {
+    throw validation('Serial/lot tracking is only available for inventory items.');
+  }
+  return m;
+}
+
+function resolveWeight(weight: string | number | null | undefined): string | null {
+  if (weight == null || weight === '') return null;
+  const n = Number(weight);
+  if (!Number.isFinite(n) || n < 0) throw validation('Weight must be a non-negative number.');
+  return String(weight);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /** Return all items for the company, with optional filtering. */
@@ -217,6 +259,9 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
   // ── Validate type rules + account links ──────────────────────────────────
   validateTypeRules((input.type ?? 'service') as ItemType, input);
   await resolveAccountLinks(ctx, input);
+  const barcode = await resolveBarcode(ctx, input.barcode);
+  const trackingMode = resolveTracking((input.type ?? 'service') as ItemType, input.trackingMode);
+  const weight = resolveWeight(input.weight);
 
   // ── Insert ───────────────────────────────────────────────────────────────
   const [row] = await ctx.db
@@ -234,6 +279,9 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
       assetAccountId: input.assetAccountId ?? null,
       taxable: input.taxable ?? true,
       unitOfMeasure: input.unitOfMeasure?.trim() || null,
+      barcode,
+      trackingMode,
+      weight,
     })
     .returning();
 
@@ -298,6 +346,16 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
       patch.assetAccountId !== undefined ? patch.assetAccountId : undefined,
   });
 
+  // ── Advanced Inventory fields ───────────────────────────────────────────
+  const barcode =
+    patch.barcode !== undefined ? await resolveBarcode(ctx, patch.barcode, id) : before.barcode;
+  let trackingMode = before.trackingMode as TrackingMode;
+  if (patch.trackingMode !== undefined || patch.type !== undefined) {
+    trackingMode = resolveTracking(effectiveType, patch.trackingMode ?? trackingMode);
+    await assertTrackingModeChangeAllowed(ctx, before, trackingMode);
+  }
+  const weight = patch.weight !== undefined ? resolveWeight(patch.weight) : before.weight;
+
   // ── Update ───────────────────────────────────────────────────────────────
   const [row] = await ctx.db
     .update(items)
@@ -337,6 +395,9 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
           ? (patch.unitOfMeasure?.trim() || null)
           : before.unitOfMeasure,
       isActive: patch.isActive !== undefined ? patch.isActive : before.isActive,
+      barcode,
+      trackingMode,
+      weight,
       updatedAt: new Date(),
     })
     .where(eq(items.id, id))
@@ -401,4 +462,32 @@ export async function getBundleComponents(
     .orderBy(asc(items.name));
 
   return rows as BundleComponent[];
+}
+
+/**
+ * Look up an active item by scanned code (keyboard-wedge barcode scanners type the code and
+ * press Enter). Matches the barcode exactly first, then falls back to an exact,
+ * case-insensitive SKU match when exactly one item has that SKU. Returns null when nothing
+ * matches.
+ */
+export async function findItemByBarcode(ctx: ServiceContext, code: string) {
+  const value = code?.trim();
+  if (!value) return null;
+  const [byBarcode] = await ctx.db
+    .select()
+    .from(items)
+    .where(and(eq(items.companyId, ctx.companyId), eq(items.barcode, value), eq(items.isActive, true)));
+  if (byBarcode) return byBarcode;
+  const bySku = await ctx.db
+    .select()
+    .from(items)
+    .where(
+      and(
+        eq(items.companyId, ctx.companyId),
+        eq(items.isActive, true),
+        sql`lower(${items.sku}) = lower(${value})`,
+      ),
+    )
+    .limit(2);
+  return bySku.length === 1 ? bySku[0] : null;
 }

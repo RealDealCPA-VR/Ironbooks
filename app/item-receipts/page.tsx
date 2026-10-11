@@ -33,6 +33,13 @@ import {
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -49,6 +56,8 @@ interface Item {
   id: string;
   name: string;
   type: string;
+  purchaseCost?: string | null;
+  trackingMode?: string | null;
 }
 
 type ReceiptStatus = 'open' | 'billed' | 'void';
@@ -90,6 +99,8 @@ interface LineRow {
   description: string;
   quantity: string;
   unitCost: string;
+  /** Advanced Inventory: receiving site / bin / serials / lot. */
+  inv?: InvDetail;
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +158,18 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
   const [poLoading, setPoLoading] = useState(false);
 
   const itemMap = Object.fromEntries(items.map((it) => [it.id, it.name]));
+  const itemById = new Map(items.map((it) => [it.id, it]));
+  const adv = useAdvancedInventory(open);
+
+  // Scan-to-add: a scanned item fills the first empty line or appends one (qty 1, last cost).
+  function addScannedItem(it: { id: string; name: string; purchaseCost?: string | null }) {
+    setLines((prev) => {
+      const row: LineRow = { itemId: it.id, description: '', quantity: '1', unitCost: it.purchaseCost ?? '' };
+      const emptyIdx = prev.findIndex((l) => !l.itemId && !l.quantity && !l.unitCost);
+      if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
+      return [...prev, row];
+    });
+  }
 
   // Reset the form when the modal opens.
   useEffect(() => {
@@ -215,7 +238,11 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
     }
   }
 
-  function updateLine(idx: number, field: keyof LineRow, value: string) {
+  function updateLineInv(idx: number, inv: InvDetail) {
+    setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, inv } : l)));
+  }
+
+  function updateLine(idx: number, field: Exclude<keyof LineRow, 'inv'>, value: string) {
     setLines((prev) => {
       const next = [...prev];
       next[idx] = { ...next[idx], [field]: value };
@@ -265,6 +292,7 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
           description: l.description || null,
           quantity: l.quantity,
           unitCost: l.unitCost,
+          ...inventoryLinePayload(l.inv),
         })),
       });
       toast('Item receipt recorded — stock received.', 'success');
@@ -365,9 +393,12 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Items Received</Label>
-            <Button type="button" variant="ghost" size="sm" onClick={addLine} disabled={poLoading}>
-              <PlusCircle className="h-4 w-4" /> Add line
-            </Button>
+            <div className="flex items-center gap-2">
+              {!poId && <BarcodeScanInput onItem={addScannedItem} />}
+              <Button type="button" variant="ghost" size="sm" onClick={addLine} disabled={poLoading}>
+                <PlusCircle className="h-4 w-4" /> Add line
+              </Button>
+            </div>
           </div>
 
           {poLoading ? (
@@ -444,6 +475,15 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
                     >
                       <MinusCircle className="h-4 w-4" />
                     </button>
+                    <InventoryLineFields
+                      className="col-span-full"
+                      adv={adv}
+                      item={itemById.get(line.itemId)}
+                      quantity={line.quantity}
+                      direction="in"
+                      value={line.inv}
+                      onChange={(inv) => updateLineInv(idx, inv)}
+                    />
                   </div>
                 );
               })}

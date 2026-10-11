@@ -27,6 +27,15 @@ import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  type ScannedItem,
+  invFromLine,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,6 +59,7 @@ interface Item {
   taxable: boolean;
   quantityOnHand: string | null;
   unitOfMeasure: string | null;
+  trackingMode?: string | null;
 }
 
 interface BundleComponent {
@@ -114,6 +124,12 @@ interface InvoiceDetail extends Invoice {
     itemName: string | null;
     itemType: ItemType | null;
     unitOfMeasure: string | null;
+    // Advanced Inventory detail (present only when stored for the line)
+    siteId?: string | null;
+    binId?: string | null;
+    serialNumbers?: string[] | null;
+    lotNumber?: string | null;
+    lotExpiration?: string | null;
   }>;
 }
 
@@ -130,6 +146,8 @@ interface LineRow {
   jobId: string;
   /** Discount items only: interpret `rate` as a % of the preceding body lines. */
   discountPercent: boolean;
+  /** Advanced Inventory: site / bin / serials / lot the stock is sold from. */
+  inv?: InvDetail;
 }
 
 /** Unbilled billable time & costs (GET /api/billables?customerId=). */
@@ -381,6 +399,7 @@ function InvoiceModal({
           taxable: l.taxable,
           jobId: l.jobId ?? '',
           discountPercent: false,
+          inv: invFromLine(l),
         })),
       );
     } else {
@@ -541,6 +560,27 @@ function InvoiceModal({
   // Ctrl+Insert adds a line, Ctrl+Delete removes the focused row, Enter moves down.
   const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
 
+  // Advanced Inventory: sites/bins for item lines + scan-to-add (fills an empty line or
+  // appends one, then runs the normal item lookup so prices/bundles behave as if typed).
+  const adv = useAdvancedInventory(open);
+  const [pendingScanIdx, setPendingScanIdx] = useState<number | null>(null);
+  function addScannedItem(it: ScannedItem) {
+    const emptyIdx = lines.findIndex((l) => !l.itemId && !l.itemName && !l.description && !l.quantity && !l.rate);
+    if (emptyIdx >= 0) {
+      handleItemInput(emptyIdx, it.name);
+      return;
+    }
+    setLines((prev) => [...prev, { ...EMPTY_LINE, itemName: it.name }]);
+    setPendingScanIdx(lines.length);
+  }
+  useEffect(() => {
+    if (pendingScanIdx == null || !lines[pendingScanIdx]) return;
+    const name = lines[pendingScanIdx].itemName;
+    setPendingScanIdx(null);
+    handleItemInput(pendingScanIdx, name);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingScanIdx, lines]);
+
   function toggleCost(id: string) {
     setSelectedCostIds((prev) => {
       const next = new Set(prev);
@@ -647,6 +687,7 @@ function InvoiceModal({
           rate: l.rate,
           taxable: l.taxable,
           jobId: l.jobId || null,
+          ...inventoryLinePayload(l.inv),
         };
       }),
     };
@@ -822,13 +863,16 @@ function InvoiceModal({
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
-              <PlusCircle className="h-4 w-4" /> Add line
-            </button>
+            <div className="flex items-center gap-3">
+              <BarcodeScanInput onItem={addScannedItem} />
+              <button
+                type="button"
+                onClick={addLine}
+                className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
+              >
+                <PlusCircle className="h-4 w-4" /> Add line
+              </button>
+            </div>
           </div>
 
           {/* Find-as-you-type item options shared by all line rows */}
@@ -922,6 +966,17 @@ function InvoiceModal({
                     {formatCurrency((totals.amounts[idx] ?? 0).toFixed(2))}
                   </span>
                 </div>
+                {/* Advanced Inventory: site / bin / serial / lot for inventory items */}
+                {kind === 'income' && line.itemId && (
+                  <InventoryLineFields
+                    adv={adv}
+                    item={items.find((it) => it.id === line.itemId)}
+                    quantity={line.quantity}
+                    direction="out"
+                    value={line.inv}
+                    onChange={(inv) => updateLine(idx, { inv })}
+                  />
+                )}
                 {/* Row 3 (special types / UoM): badge + helpers */}
                 {(badge || line.unitOfMeasure) && (
                   <div className="flex items-center gap-2 text-xs text-navy/50">

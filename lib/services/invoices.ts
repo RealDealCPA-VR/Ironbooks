@@ -56,12 +56,20 @@ import {
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
+import {
+  type DocumentInventoryLine,
+  type InventoryLineDetail,
+  attachInventoryDetails,
+  postDocumentInventory,
+  reverseDocumentInventory,
+  saveDocumentInventoryDetails,
+} from './inventorySites';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export interface InvoiceLineInput {
+export interface InvoiceLineInput extends InventoryLineDetail {
   /** Optional product/service item; supplies incomeAccountId as fallback. */
   itemId?: string | null;
   /** Direct income account override; takes priority over item.incomeAccountId. */
@@ -1016,6 +1024,33 @@ async function reverseInvoiceCOGS(
 }
 
 // ---------------------------------------------------------------------------
+// Advanced Inventory: per-line site / bin / serial / lot
+// ---------------------------------------------------------------------------
+
+/**
+ * Pair each computed line with the site/bin/serial/lot fields of its input line (lineOrder =
+ * input index). Absent keys stay undefined so edits can carry stored detail forward.
+ */
+function inventoryLinesOf(
+  lines: InvoiceLineInput[],
+  prep: PreparedInvoice,
+): DocumentInventoryLine[] {
+  return prep.computedLines.map((cl) => {
+    const src = lines[cl.lineOrder];
+    return {
+      lineOrder: cl.lineOrder,
+      itemId: cl.itemId,
+      quantity: cl.quantity,
+      siteId: src?.siteId,
+      binId: src?.binId,
+      serialNumbers: src?.serialNumbers,
+      lotNumber: src?.lotNumber,
+      lotExpiration: src?.lotExpiration,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // createInvoice
 // ---------------------------------------------------------------------------
 
@@ -1093,7 +1128,13 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
     );
 
     if (isDraft) {
-      // Pending invoice: no journal entry, no COGS, no stock relief.
+      // Pending invoice: no journal entry, no COGS, no stock relief — but keep any
+      // site/serial/lot the user picked so posting later relieves the right stock.
+      await saveDocumentInventoryDetails(tx, {
+        sourceType: 'invoice',
+        sourceId: invoice.id,
+        lines: inventoryLinesOf(input.lines, prep),
+      });
       await writeAudit(tx, {
         action: 'create',
         entityType: 'invoice',
@@ -1118,8 +1159,17 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       .where(eq(invoices.id, invoice.id))
       .returning();
 
-    // 5) Perpetual inventory: relieve stock + post COGS for inventory-item lines.
+    // 5) Perpetual inventory: relieve stock + post COGS for inventory-item lines,
+    //    then record which site/bin/serial/lot the stock left from.
     await postInvoiceCOGS(tx, prep, invoice.id, invoiceNumber, input.date);
+    await postDocumentInventory(tx, {
+      sourceType: 'invoice',
+      sourceId: invoice.id,
+      date: input.date,
+      direction: 'out',
+      lines: inventoryLinesOf(input.lines, prep),
+      memo: `Invoice #${invoiceNumber}`,
+    });
 
     // 6) Audit trail.
     await writeAudit(tx, {
@@ -1228,8 +1278,18 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
       .where(eq(invoices.id, id))
       .returning();
 
-    // 3) Perpetual inventory: relieve stock + post COGS now that it is real.
+    // 3) Perpetual inventory: relieve stock + post COGS now that it is real, using the
+    //    site/serial/lot detail saved with the draft.
     await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, invoice.date);
+    await postDocumentInventory(tx, {
+      sourceType: 'invoice',
+      sourceId: id,
+      date: invoice.date,
+      direction: 'out',
+      lines: inventoryLinesOf(input.lines, prep),
+      memo: `Invoice #${invoice.invoiceNumber}`,
+      carryForward: true,
+    });
 
     // 4) Audit trail.
     await writeAudit(tx, {
@@ -1314,6 +1374,13 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         })),
       );
 
+      await saveDocumentInventoryDetails(tx, {
+        sourceType: 'invoice',
+        sourceId: id,
+        lines: inventoryLinesOf(input.lines, prep),
+        carryForward: true,
+      });
+
       const [updated] = await tx.db
         .update(invoices)
         .set({
@@ -1384,8 +1451,10 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       await voidJournalEntry(tx, invoice.postedEntryId);
     }
 
-    // 2) Void COGS entries + restore stock (reads old lines — must precede delete).
+    // 2) Void COGS entries + restore stock (reads old lines — must precede delete),
+    //    and put the stock back at the site/bin/serial it left from.
     await reverseInvoiceCOGS(tx, { id, date: invoice.date });
+    await reverseDocumentInventory(tx, 'invoice', id);
 
     // 3) Replace lines.
     await tx.db.delete(invoiceLines).where(eq(invoiceLines.invoiceId, id));
@@ -1440,8 +1509,18 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       .where(eq(invoices.id, id))
       .returning();
 
-    // 5) Re-post perpetual inventory COGS for the new lines.
+    // 5) Re-post perpetual inventory COGS for the new lines (site detail carried forward
+    //    for lines the edit did not touch).
     await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, input.date);
+    await postDocumentInventory(tx, {
+      sourceType: 'invoice',
+      sourceId: id,
+      date: input.date,
+      direction: 'out',
+      lines: inventoryLinesOf(input.lines, prep),
+      memo: `Invoice #${invoice.invoiceNumber}`,
+      carryForward: true,
+    });
 
     // 6) Audit trail with old + new values.
     await writeAudit(tx, {
@@ -1547,7 +1626,7 @@ export async function getInvoice(ctx: ServiceContext, id: string) {
     .where(eq(invoiceLines.invoiceId, id))
     .orderBy(invoiceLines.lineOrder);
 
-  return { ...invoice, lines };
+  return { ...invoice, lines: await attachInventoryDetails(ctx, 'invoice', id, lines) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,8 +1661,9 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
     }
 
     // Reverse perpetual-inventory effects: void each COGS entry created by
-    // createInvoice and put the relieved stock back on hand.
+    // createInvoice and put the relieved stock back on hand (and at its site).
     await reverseInvoiceCOGS(tx, { id, date: invoice.date });
+    await reverseDocumentInventory(tx, 'invoice', id);
 
     // Mark invoice void.
     const [updated] = await tx.db

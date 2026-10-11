@@ -5,10 +5,14 @@
  * POST body shapes:
  *   { action: 'adjust', itemId, quantityChange, unitCost?, date, memo? }
  *   { action: 'cogs',   itemId, quantity, date, memo? }
+ * Both run through adjustQuantityAtSite so the quantity change is recorded at a site (optional
+ * { siteId?, binId?, serialNumbers?, lotNumber?, lotExpiration? }; default site otherwise) and
+ * serial/lot rules are enforced. FIFO-tracked items are costed through their layers.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { adjustInventory, recordCOGS, inventoryValuation } from '@/lib/services/inventory';
+import { inventoryValuation } from '@/lib/services/inventory';
+import { adjustQuantityAtSite } from '@/lib/services/inventorySiteOps';
 import { ServiceError } from '@/lib/services/_base';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
@@ -24,6 +28,17 @@ function serviceErrorToResponse(err: ServiceError): NextResponse {
   };
   const status = statusMap[err.code] ?? 500;
   return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+/** Optional Advanced Inventory fields from the raw body. */
+function siteFields(body: Record<string, unknown>) {
+  return {
+    siteId: typeof body.siteId === 'string' ? body.siteId : null,
+    binId: typeof body.binId === 'string' ? body.binId : null,
+    serialNumbers: Array.isArray(body.serialNumbers) ? body.serialNumbers.map(String) : null,
+    lotNumber: typeof body.lotNumber === 'string' ? body.lotNumber : null,
+    lotExpiration: typeof body.lotExpiration === 'string' ? new Date(body.lotExpiration) : null,
+  };
 }
 
 // ── GET /api/inventory ────────────────────────────────────────────────────────
@@ -77,7 +92,8 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
 
-      const result = await adjustInventory(ctx, {
+      const result = await adjustQuantityAtSite(ctx, {
+        ...siteFields(body),
         itemId,
         quantityChange,
         unitCost: unitCost ?? null,
@@ -109,11 +125,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
 
-      const result = await recordCOGS(ctx, {
+      // COGS relief = a removal valued at cost (Dr COGS / Cr Inventory).
+      const result = await adjustQuantityAtSite(ctx, {
+        ...siteFields(body),
         itemId,
-        quantity,
+        quantityChange: `-${String(quantity).replace(/^-/, '')}`,
         date: new Date(date),
-        memo: memo ?? null,
+        memo: memo ?? 'Cost of goods sold',
       });
 
       return NextResponse.json(result, { status: 201 });

@@ -21,6 +21,12 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
+import {
+  InventoryLineFields,
+  type InvDetail,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 
 /** Display a decimal quantity without trailing-zero noise (max 4dp). */
 function formatQty(value: string | number | null | undefined): string {
@@ -39,6 +45,7 @@ interface Item {
   quantityOnHand: string | null;
   averageCost: string | null;
   isActive: boolean;
+  trackingMode?: string | null;
 }
 
 interface BomRow {
@@ -265,6 +272,9 @@ export default function AssembliesPage() {
   const [buildQty, setBuildQty] = useState('1');
   const [buildAction, setBuildAction] = useState<'build' | 'unbuild'>('build');
   const [building, setBuilding] = useState(false);
+  // Advanced Inventory: build site (+ bin / serials / lot of the finished assemblies).
+  const adv = useAdvancedInventory(true);
+  const [buildInv, setBuildInv] = useState<InvDetail>({});
 
   // Pending builds
   const [pendingRefresh, setPendingRefresh] = useState(0);
@@ -390,6 +400,7 @@ export default function AssembliesPage() {
         assemblyItemId: selectedAssemblyId,
         quantity: buildQty,
         action: buildAction,
+        ...inventoryLinePayload(buildInv),
       });
       const verb = buildAction === 'build' ? 'Built' : 'Unbuilt';
       toast(`${verb} ${buildQty} unit(s) of ${selectedAssembly?.name ?? 'assembly'}.`, 'success');
@@ -397,6 +408,7 @@ export default function AssembliesPage() {
       // Also refresh component quantities shown in BOM table
       await fetchBom(selectedAssemblyId);
       setBuildQty('1');
+      setBuildInv((p) => ({ siteId: p.siteId }));
     } catch (err) {
       toast(err instanceof ApiError ? err.message : `${buildAction} failed.`, 'danger');
     } finally {
@@ -644,6 +656,18 @@ export default function AssembliesPage() {
                   onChange={(e) => setBuildQty(e.target.value)}
                 />
               </div>
+
+              {selectedAssembly && (
+                <InventoryLineFields
+                  className="w-full"
+                  adv={adv}
+                  item={selectedAssembly}
+                  quantity={buildQty}
+                  direction={buildAction === 'build' ? 'in' : 'out'}
+                  value={buildInv}
+                  onChange={setBuildInv}
+                />
+              )}
 
               <Button onClick={handleBuildAction} loading={building} disabled={bom.length === 0}>
                 <Hammer className="h-4 w-4" />

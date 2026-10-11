@@ -4,6 +4,7 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zMoney, zUuid } from './helpers';
+import { inventoryLineFields } from './inventorySites';
 
 export const invoiceLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -16,6 +17,8 @@ export const invoiceLineSchema = z.object({
   taxRateId: zUuid.nullish(),
   classId: zUuid.nullish(),
   jobId: zUuid.nullish(),
+  /** Advanced Inventory: site/bin/serial/lot the stock is sold from. */
+  ...inventoryLineFields,
 });
 
 /** Optional billable time & costs pulled onto the invoice (route-level concern). */

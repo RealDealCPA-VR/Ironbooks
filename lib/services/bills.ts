@@ -32,6 +32,14 @@ import { accounts, bills, billLines, inventoryLayers, items, vendors } from '@/l
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import {
+  type DocumentInventoryLine,
+  type InventoryLineDetail,
+  attachInventoryDetails,
+  postDocumentInventory,
+  reverseDocumentInventory,
+} from './inventorySites';
+import { assertNoActiveLandedCost } from './landedCost';
+import {
   type ServiceContext,
   ServiceError,
   inTransaction,
@@ -44,7 +52,7 @@ import {
 // Input / output types
 // ---------------------------------------------------------------------------
 
-export interface BillLineInput {
+export interface BillLineInput extends InventoryLineDetail {
   /** GL account to debit (expense or asset). Required unless itemId is set. */
   accountId?: string | null;
   /** Item being purchased; routes the debit and (for inventory items) receives stock. */
@@ -319,6 +327,7 @@ async function receiveResolvedStock(
         date,
         quantityRemaining: qty.toFixed(4),
         unitCost: line.unitCost.toFixed(4),
+        sourceRef: `bill:${billId}`,
       });
       await tx.db
         .update(items)
@@ -466,6 +475,23 @@ async function reverseReceivedStock(tx: ServiceContext, billId: string, reason: 
   }
 }
 
+/** Advanced Inventory lines (site/bin/serial/lot) for a bill — lineOrder = input index. */
+function billInventoryLines(input: CreateBillInput, prep: PreparedBill): DocumentInventoryLine[] {
+  return prep.resolvedLines.map((line, idx) => {
+    const src = input.lines[idx];
+    return {
+      lineOrder: idx,
+      itemId: line.isInventory ? line.itemId : null,
+      quantity: line.quantity,
+      siteId: src?.siteId,
+      binId: src?.binId,
+      serialNumbers: src?.serialNumbers,
+      lotNumber: src?.lotNumber,
+      lotExpiration: src?.lotExpiration,
+    };
+  });
+}
+
 /** Build the GL posting lines for a prepared bill: Dr per line, Cr A/P total. */
 function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId: string) {
   return [
@@ -547,6 +573,14 @@ export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
 
     // --- Receive stock for inventory item lines (same transaction) ---
     await receiveResolvedStock(tx, bill.id, input.date, resolvedLines, 'bill_receipt');
+    await postDocumentInventory(tx, {
+      sourceType: 'bill',
+      sourceId: bill.id,
+      date: input.date,
+      direction: 'in',
+      lines: billInventoryLines(input, prep),
+      memo: `Bill ${input.billNumber ?? ''}`.trim(),
+    });
 
     await writeAudit(tx, {
       action: 'create',
@@ -627,6 +661,9 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
       );
     }
 
+    // Landed cost allocated from this bill's charge lines must be voided first.
+    await assertNoActiveLandedCost(tx, { billId: id });
+
     // Snapshot old lines for the audit trail BEFORE replacing them.
     const oldLines = await tx.db
       .select()
@@ -642,6 +679,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
     // 2) Reverse stock received from the OLD item lines (reads old lines — must
     //    precede the delete).
     await reverseReceivedStock(tx, id, 'bill_edit');
+    await reverseDocumentInventory(tx, 'bill', id);
 
     // 3) Replace lines.
     await tx.db.delete(billLines).where(eq(billLines.billId, id));
@@ -692,6 +730,15 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
 
     // 5) Re-receive stock for the NEW inventory item lines.
     await receiveResolvedStock(tx, id, input.date, prep.resolvedLines, 'bill_edit_receipt');
+    await postDocumentInventory(tx, {
+      sourceType: 'bill',
+      sourceId: id,
+      date: input.date,
+      direction: 'in',
+      lines: billInventoryLines(input, prep),
+      memo: `Bill ${input.billNumber ?? ''}`.trim(),
+      carryForward: true,
+    });
 
     // 6) Audit trail with old + new values.
     await writeAudit(tx, {
@@ -772,7 +819,7 @@ export async function getBill(ctx: ServiceContext, id: string) {
     .where(eq(billLines.billId, id))
     .orderBy(asc(billLines.lineOrder));
 
-  return { ...bill, lines };
+  return { ...bill, lines: await attachInventoryDetails(ctx, 'bill', id, lines) };
 }
 
 // ---------------------------------------------------------------------------
@@ -807,6 +854,9 @@ export async function voidBill(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
+    // Landed cost allocated from this bill's charge lines must be voided first.
+    await assertNoActiveLandedCost(tx, { billId: id });
+
     // Reverse the GL entry.
     if (bill.postedEntryId) {
       await voidJournalEntry(tx, bill.postedEntryId);
@@ -814,8 +864,9 @@ export async function voidBill(ctx: ServiceContext, id: string) {
 
     // Reverse any stock received via inventory item lines. The JE void above
     // already restored the GL (Dr A/P / Cr Inventory at the bill's cost); this
-    // step pulls the quantity/cost back out of the subledger.
+    // step pulls the quantity/cost back out of the subledger (and out of its site).
     await reverseReceivedStock(tx, id, 'bill_void');
+    await reverseDocumentInventory(tx, 'bill', id);
 
     // Flip bill status to void and zero balanceDue.
     const [updated] = await tx.db

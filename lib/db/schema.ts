@@ -385,6 +385,11 @@ export const items = pgTable('items', {
   isActive: boolean('is_active').notNull().default(true),
   /** Values for company-defined custom fields ({ [fieldName]: value }). */
   customFields: jsonb('custom_fields').$type<Record<string, string>>(),
+  // Advanced Inventory (team inventory): scan code (unique per company), serial/lot
+  // tracking mode ('none' | 'serial' | 'lot'), and unit weight for landed-cost allocation.
+  barcode: varchar('barcode', { length: 100 }),
+  trackingMode: varchar('tracking_mode', { length: 10 }).notNull().default('none'),
+  weight: decimal('weight', { precision: 15, scale: 4 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -931,6 +936,8 @@ export const inventoryLayers = pgTable('inventory_layers', {
   date: timestamp('date').notNull(),
   quantityRemaining: decimal('quantity_remaining', { precision: 15, scale: 4 }).notNull(),
   unitCost: decimal('unit_cost', { precision: 15, scale: 4 }).notNull(),
+  /** Originating document (e.g. "item_receipt:<id>") — lets landed cost find the receipt's layers. */
+  sourceRef: varchar('source_ref', { length: 100 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1326,4 +1333,170 @@ export const qbGlImports = pgTable('qb_gl_imports', {
   proof: jsonb('proof').$type<Record<string, unknown>>().notNull(),
   createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- team inventory ----
+// Advanced Inventory (QB Desktop Enterprise parity): inventory sites, bins, serial/lot
+// tracking, inventory transfers, per-site reorder points and landed cost.
+//
+// Quantity model (see lib/services/inventorySites.ts for the full rationale):
+//  - items.quantityOnHand stays the company-wide total that every costing path maintains.
+//  - inventory_movements is an append-only, site-tagged quantity ledger written by every
+//    site-aware document (invoices, sales receipts, credit memos, bills, item receipts,
+//    adjustments, builds, transfers). A non-default site's quantity is the sum of its
+//    movements; the default site holds the remainder (total - other sites), so the sum of
+//    site quantities ALWAYS equals quantityOnHand by construction.
+//  - Bins, serial numbers and lots are always movement-derived.
+
+export const inventorySites = pgTable('inventory_sites', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  code: varchar('code', { length: 50 }),
+  address: jsonb('address').$type<Record<string, string>>(),
+  /** Exactly one active default site per company; un-sited lines land here. */
+  isDefault: boolean('is_default').notNull().default(false),
+  isActive: boolean('is_active').notNull().default(true),
+  notes: text('notes'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const inventoryBins = pgTable('inventory_bins', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  siteId: uuid('site_id').references(() => inventorySites.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const inventoryMovements = pgTable('inventory_movements', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  siteId: uuid('site_id').references(() => inventorySites.id).notNull(),
+  binId: uuid('bin_id').references(() => inventoryBins.id),
+  /** Signed quantity: + into the site/bin, - out of it. Serial rows are always +/-1. */
+  quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull(),
+  serialNumber: varchar('serial_number', { length: 100 }),
+  lotNumber: varchar('lot_number', { length: 100 }),
+  date: timestamp('date').notNull(),
+  /** invoice | sales_receipt | credit_memo | bill | item_receipt | adjustment | build | unbuild | transfer | site_rebalance */
+  sourceType: varchar('source_type', { length: 40 }).notNull(),
+  sourceId: uuid('source_id'),
+  /** Line index on the source document (lineOrder). */
+  sourceLine: integer('source_line'),
+  /** Set on a reversing row: the movement it cancels. */
+  reversalOfId: uuid('reversal_of_id'),
+  /** Set on an original row once it has been reversed (void/edit). */
+  reversedAt: timestamp('reversed_at'),
+  memo: text('memo'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Site/bin/serial/lot captured per document line (kept for drafts and edits). */
+export const inventoryLineDetails = pgTable('inventory_line_details', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  sourceType: varchar('source_type', { length: 40 }).notNull(),
+  sourceId: uuid('source_id').notNull(),
+  lineOrder: integer('line_order').notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  siteId: uuid('site_id').references(() => inventorySites.id),
+  binId: uuid('bin_id').references(() => inventoryBins.id),
+  serialNumbers: jsonb('serial_numbers').$type<string[]>(),
+  lotNumber: varchar('lot_number', { length: 100 }),
+  lotExpiration: timestamp('lot_expiration'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Lot master: one row per (item, lot) carrying the expiration date. */
+export const inventoryLots = pgTable('inventory_lots', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  lotNumber: varchar('lot_number', { length: 100 }).notNull(),
+  expirationDate: timestamp('expiration_date'),
+  notes: text('notes'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Per-site item settings (QB Enterprise per-site reorder points). */
+export const itemSiteSettings = pgTable('item_site_settings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  siteId: uuid('site_id').references(() => inventorySites.id).notNull(),
+  reorderPoint: decimal('reorder_point', { precision: 15, scale: 4 }),
+  /** Optional max / reorder-up-to level used for the suggested order quantity. */
+  maxQuantity: decimal('max_quantity', { precision: 15, scale: 4 }),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Transfer Inventory between sites (quantity only; no GL impact). */
+export const inventoryTransfers = pgTable('inventory_transfers', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  transferNumber: integer('transfer_number').notNull(),
+  date: timestamp('date').notNull(),
+  fromSiteId: uuid('from_site_id').references(() => inventorySites.id).notNull(),
+  toSiteId: uuid('to_site_id').references(() => inventorySites.id).notNull(),
+  /** posted | void */
+  status: varchar('status', { length: 20 }).notNull().default('posted'),
+  memo: text('memo'),
+  voidedAt: timestamp('voided_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const inventoryTransferLines = pgTable('inventory_transfer_lines', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  transferId: uuid('transfer_id').references(() => inventoryTransfers.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull(),
+  fromBinId: uuid('from_bin_id').references(() => inventoryBins.id),
+  toBinId: uuid('to_bin_id').references(() => inventoryBins.id),
+  serialNumbers: jsonb('serial_numbers').$type<string[]>(),
+  lotNumber: varchar('lot_number', { length: 100 }),
+  lineOrder: integer('line_order').notNull().default(0),
+});
+
+/** Landed cost: a bill charge line (freight/duty/...) allocated onto item receipt lines. */
+export const landedCostAllocations = pgTable('landed_cost_allocations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  billId: uuid('bill_id').references(() => bills.id).notNull(),
+  /** Source charge line on the bill (no FK: bill lines are replaced on edit, which is blocked while allocated). */
+  billLineId: uuid('bill_line_id').notNull(),
+  /** The account the charge was expensed to — credited when the cost moves into inventory. */
+  chargeAccountId: uuid('charge_account_id').references(() => accounts.id).notNull(),
+  /** quantity | value | weight */
+  method: varchar('method', { length: 20 }).notNull(),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  date: timestamp('date').notNull(),
+  /** posted | void */
+  status: varchar('status', { length: 20 }).notNull().default('posted'),
+  memo: text('memo'),
+  voidedAt: timestamp('voided_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const landedCostAllocationLines = pgTable('landed_cost_allocation_lines', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  allocationId: uuid('allocation_id').references(() => landedCostAllocations.id).notNull(),
+  itemReceiptId: uuid('item_receipt_id').references(() => itemReceipts.id).notNull(),
+  itemReceiptLineId: uuid('item_receipt_line_id').references(() => itemReceiptLines.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  /** Allocation basis for this line (qty, value or weight). */
+  basis: decimal('basis', { precision: 15, scale: 4 }).notNull(),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  /** Portion capitalised into inventory (units still on hand). */
+  inventoryAmount: decimal('inventory_amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Portion expensed to COGS (units already sold). */
+  cogsAmount: decimal('cogs_amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Quantity still on hand when applied (FIFO: receipt layers; average: item QOH). */
+  quantityAtAllocation: decimal('quantity_at_allocation', { precision: 15, scale: 4 }).notNull().default('0'),
+  /** FIFO only: per-layer unit-cost increments applied, so a void can back them out exactly. */
+  layerAdjustments: jsonb('layer_adjustments').$type<Array<{ layerId: string; quantity: string; unitCostDelta: string; splitFrom?: string }>>(),
+  entryId: uuid('entry_id').references(() => journalEntries.id),
+  lineOrder: integer('line_order').notNull().default(0),
 });

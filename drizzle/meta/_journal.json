@@ -157,6 +157,13 @@
       "breakpoints": true
     },
     {
+      "idx": 22,
+      "version": "7",
+      "when": 1781100022000,
+      "tag": "0022_team_inventory",
+      "breakpoints": true
+    },
+    {
       "idx": 24,
       "version": "7",
       "when": 1781100024000,
