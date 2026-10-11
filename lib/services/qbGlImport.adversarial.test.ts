@@ -27,7 +27,7 @@ import {
 import { Money } from '@/lib/money';
 import { ServiceError, type ServiceContext } from './_base';
 import { createAccount } from './accounts';
-import { voidJournalEntry } from './posting';
+import { postJournalEntry, voidJournalEntry } from './posting';
 import { previewGlImport, runGlImport, QB_SUSPENSE } from './qbGlImport';
 import { columnIndex, excelSerialToDate, loadGrid, readXlsx } from './qbGlFiles';
 import { analyzeGl, parseAmount, parseGlSheets, parseQbDate } from './qbGlParse';
@@ -453,6 +453,206 @@ describe('qbGlImport — adversarial QA', () => {
         r.warnings.some((w) => /trial balance/i.test(w));
       expect(flagged).toBe(true);
     }
+  });
+
+  // ---- re-test round 1: verify the Split-contradiction and Trial Balance fixes ----
+
+  const CONTRA_ACCOUNTS: GlFixture['accounts'] = [
+    { number: '1000', name: 'Checking', type: 'Bank', begin: '1000.00' },
+    { number: '1010', name: 'Savings', type: 'Bank', begin: '0.00' },
+    { number: '3000', name: 'Owner Equity', type: 'Equity', begin: '-1000.00' },
+    { number: '6000', name: 'Rent', type: 'Expense', begin: '0.00' },
+    { number: '6100', name: 'Supplies', type: 'Expense', begin: '0.00' },
+    { number: '6200', name: 'Utilities', type: 'Expense', begin: '0.00' },
+  ];
+
+  it('round1: contradicted Split lines go to review in full; the import refuses (or suspends) and never posts them as an entry', async () => {
+    const fx: GlFixture = {
+      company: 'Contra Run Co',
+      periodLabel: 'January 1 through January 31, 2024',
+      accounts: CONTRA_ACCOUNTS,
+      txns: [
+        { type: 'Check', date: '01/05/2024', name: '', lines: [
+          { acct: '1000', amount: '-100.00', name: 'Landlord' },
+          { acct: '6100', amount: '100.00', name: 'Staples' },
+        ] },
+        // A clean transaction in the same file still posts.
+        { type: 'Check', date: '01/09/2024', num: '501', name: 'Power Co', lines: [
+          { acct: '1000', amount: '-40.00' },
+          { acct: '6200', amount: '40.00' },
+        ] },
+      ],
+    };
+    const csv = csvWithSplit(fx, [
+      { match: (r) => r.includes('Landlord'), split: '6000 · Rent' },
+      { match: (r) => r.includes('Staples'), split: '1010 · Savings' },
+    ]);
+    const file = upload('gl.csv', csv);
+    const a = analyzeGl(parseGlSheets((await loadGrid(new TextEncoder().encode(csv), 'gl.csv')).sheets));
+    expect(a.transactions.length).toBe(1);
+    expect(a.review.length).toBe(1);
+    expect(a.review[0].lines.length).toBe(2);
+    expect(a.review[0].reason).toMatch(/Split/);
+    // Without acceptance: nothing saved at all.
+    const ctx = await newCompany('Contra Run Co');
+    const r = await runGlImport(ctx, { file });
+    expect(r.ok).toBe(false);
+    expect(r.rolledBack).toBe(true);
+    expect(await counts(ctx)).toEqual({ entries: 0, accounts: 0, classes: 0, customers: 0, vendors: 0, imports: 0 });
+    // With acceptance: the difference sits in suspense, not in a fabricated Checking/Supplies entry.
+    const ok = await runGlImport(ctx, { file, acceptVariance: true });
+    expect(ok.ok).toBe(true);
+    expect(ok.variancePosted).not.toBeNull();
+    expect(ok.counts.entriesPosted).toBe(1); // only check 501
+    const bal = await balancesByCode(ctx);
+    expect(bal.get('6100') ?? '0.00').toBe('100.00'); // ending matches the report via suspense
+    expect(bal.get('1000')).toBe('860.00');
+    const suppliesLines = await db
+      .select({ src: journalEntries.sourceRef })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(accounts.code, '6100')));
+    // The only posting into Supplies is the reviewed variance, not a rebuilt Check.
+    expect(suppliesLines.length).toBe(1);
+    await assertLedgerInvariants(ctx);
+  });
+
+  it('round1: per-payee balanced lines whose Splits point elsewhere are not posted per payee either', async () => {
+    const fx: GlFixture = {
+      company: 'Contra Payee Co',
+      periodLabel: 'January 1 through January 31, 2024',
+      accounts: CONTRA_ACCOUNTS,
+      txns: [
+        { type: 'Check', date: '01/05/2024', name: '', lines: [
+          { acct: '1000', amount: '-100.00', name: 'Landlord', memo: 'mA' },
+          { acct: '6100', amount: '100.00', name: 'Landlord', memo: 'mB' },
+          { acct: '1010', amount: '-30.00', name: 'Staples', memo: 'mC' },
+          { acct: '6200', amount: '30.00', name: 'Staples', memo: 'mD' },
+        ] },
+      ],
+    };
+    const csv = csvWithSplit(fx, [
+      { match: (r) => r.includes('mA') || r.includes('mB'), split: '6000 · Rent' },
+      { match: (r) => r.includes('mC') || r.includes('mD'), split: '3000 · Owner Equity' },
+    ]);
+    const a = analyzeGl(parseGlSheets((await loadGrid(new TextEncoder().encode(csv), 'gl.csv')).sheets));
+    expect(a.transactions.length).toBe(0);
+    expect(a.review.reduce((n, x) => n + x.lines.length, 0)).toBe(4);
+  });
+
+  it('round1: no false positives - leftover lines whose Splits agree (or are blank/unknown) still post', async () => {
+    // Checking -100 says Rent; Rent +60 and +40 both say Checking. Pairs fail (amounts differ), but
+    // the Split column fully agrees with the grouping, so it is one balanced entry.
+    const fx: GlFixture = {
+      company: 'Agree Co',
+      periodLabel: 'January 1 through January 31, 2024',
+      accounts: CONTRA_ACCOUNTS,
+      txns: [
+        { type: 'Check', date: '01/05/2024', num: '77', name: 'Landlord', lines: [
+          { acct: '1000', amount: '-100.00', memo: 'x1' },
+          { acct: '6000', amount: '60.00', memo: 'x2' },
+          { acct: '6000', amount: '40.00', memo: 'x3' },
+        ] },
+        { type: 'Check', date: '01/06/2024', num: '78', name: 'Staples', lines: [
+          { acct: '1000', amount: '-25.00', memo: 'y1' },
+          { acct: '6100', amount: '25.00', memo: 'y2' },
+        ] },
+        { type: 'Check', date: '01/07/2024', num: '79', name: 'Power Co', lines: [
+          { acct: '1000', amount: '-15.00', memo: 'z1' },
+          { acct: '6200', amount: '15.00', memo: 'z2' },
+        ] },
+      ],
+    };
+    const csv = csvWithSplit(fx, [
+      { match: (r) => r.includes('x1'), split: '6000 · Rent' },
+      { match: (r) => r.includes('x2') || r.includes('x3'), split: '1000 · Checking' },
+      { match: (r) => r.includes('y1') || r.includes('y2'), split: '' },
+      { match: (r) => r.includes('z1'), split: '9999 · Not In This Report' },
+      { match: (r) => r.includes('z2'), split: 'Some Unknown Account' },
+    ]);
+    const file = upload('gl.csv', csv);
+    const a = analyzeGl(parseGlSheets((await loadGrid(new TextEncoder().encode(csv), 'gl.csv')).sheets));
+    expect(a.review).toEqual([]);
+    expect(a.transactions.length).toBe(3);
+    const ctx = await newCompany('Agree Co');
+    const r = await runGlImport(ctx, { file });
+    expect([r.ok, r.message]).toEqual([true, r.message]);
+    expect(r.proof.allMatch).toBe(true);
+    await assertLedgerInvariants(ctx);
+  });
+
+  it('round1: a Trial Balance mismatch with acceptVariance rolls back everything (no suspense, names or import record)', async () => {
+    const ctx = await newCompany('TB Strict Co');
+    const badTb = () => [upload('tb.csv', trialBalanceCsv(SAMPLE_GL, { acct: '64000', by: '1.00' }))];
+    const r = await runGlImport(ctx, { file: upload('gl.csv', glCsv(SAMPLE_GL)), references: badTb(), acceptVariance: true });
+    expect(r.ok).toBe(false);
+    expect(r.rolledBack).toBe(true);
+    expect(r.variancePosted).toBeNull();
+    expect(r.proof.trialBalanceMatches).toBe(false);
+    expect(r.message).toMatch(/Trial Balance/);
+    expect(r.message).not.toMatch(/Every account matches the QuickBooks report/);
+    expect(await counts(ctx)).toEqual({ entries: 0, accounts: 0, classes: 0, customers: 0, vendors: 0, imports: 0 });
+    // Without acceptance, and as a dry run, the result is the same refusal.
+    const plain = await runGlImport(ctx, { file: upload('gl.csv', glCsv(SAMPLE_GL)), references: badTb() });
+    expect(plain.ok).toBe(false);
+    const dry = await runGlImport(
+      ctx,
+      { file: upload('gl.csv', glCsv(SAMPLE_GL)), references: badTb(), acceptVariance: true },
+      { dryRun: true },
+    );
+    expect(dry.ok).toBe(false);
+    expect(dry.proof.trialBalanceMatches).toBe(false);
+    expect(await counts(ctx)).toEqual({ entries: 0, accounts: 0, classes: 0, customers: 0, vendors: 0, imports: 0 });
+    // And the same GL with a correct TB imports cleanly.
+    const good = await runGlImport(ctx, {
+      file: upload('gl.csv', glCsv(SAMPLE_GL)),
+      references: [upload('tb.csv', trialBalanceCsv(SAMPLE_GL))],
+    });
+    expect(good.ok).toBe(true);
+    expect(good.proof.trialBalanceMatches).toBe(true);
+    await assertLedgerInvariants(ctx);
+  });
+
+  it('round1: GL variance accepted + a TB that disagrees -> still rolled back; no suspense account left behind', async () => {
+    const ctx = await newCompany('TB Both Co');
+    const idx = SAMPLE_GL.txns.findIndex((t) => t.memo === 'Interest');
+    const r = await runGlImport(ctx, {
+      file: upload('gl.csv', glCsv(SAMPLE_GL, { dropLine: { txn: idx, line: 1 } })),
+      references: [upload('tb.csv', trialBalanceCsv(SAMPLE_GL, { acct: '64000', by: '1.00' }))],
+      acceptVariance: true,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.rolledBack).toBe(true);
+    expect(r.variancePosted).toBeNull();
+    expect(await counts(ctx)).toEqual({ entries: 0, accounts: 0, classes: 0, customers: 0, vendors: 0, imports: 0 });
+    const susp = await db
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, QB_SUSPENSE.code)));
+    expect(susp).toEqual([]);
+  });
+
+  it('round1: pre-existing non-imported postings in a mapped account are reported in a warning', async () => {
+    const ctx = await newCompany('Drift Co');
+    const rent = await createAccount(ctx, { code: '62000', name: 'Rent Expense', type: 'expense', subtype: 'operating_expenses' });
+    const petty = await createAccount(ctx, { code: '19999', name: 'Petty Cash', type: 'asset', subtype: 'checking' });
+    await postJournalEntry(ctx, {
+      date: new Date('2024-02-10T00:00:00Z'),
+      description: 'manual rent before migration',
+      lines: [
+        { accountId: rent.id, debit: '50.00' },
+        { accountId: petty.id, credit: '50.00' },
+      ],
+    });
+    const file = upload('gl.csv', glCsv(SAMPLE_GL));
+    const preview = await previewGlImport(ctx, { file });
+    const key = preview.accounts.find((a) => a.number === '62000')!.key;
+    const r = await runGlImport(ctx, { file, accounts: { [key]: { mapTo: rent.id } } });
+    expect([r.ok, r.message]).toEqual([true, r.message]);
+    expect(r.proof.allMatch).toBe(true);
+    expect(r.warnings.some((w) => /weren't part of this import/.test(w) && w.includes('62000'))).toBe(true);
+    await assertLedgerInvariants(ctx);
   });
 });
 
