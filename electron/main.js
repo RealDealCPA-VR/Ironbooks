@@ -424,6 +424,7 @@ function buildMenu() {
         },
         { type: 'separator' },
         { label: 'Import Bank File…', click: () => mainWindow?.webContents.send('menu', 'import') },
+        { label: 'Migrate from QuickBooks…', click: () => navigate('/qb-import') },
         { label: 'Backup Company…', click: () => mainWindow?.webContents.send('menu', 'backup') },
         { type: 'separator' },
         { role: 'quit' },

@@ -109,6 +109,41 @@ Order matters: each step references records created by the previous one.
 10. **Set the closing date** to the cutover date (Settings) so nobody back-posts
     into the migrated period, and take a **backup** (Backup & Restore page).
 
+## 3a. Bring over your full history from the General Ledger (recommended)
+
+Instead of (or after) opening balances, you can migrate **every transaction** from
+QuickBooks' General Ledger report. Open **Migrate from QuickBooks** (sidebar → Setup, or
+File → Migrate from QuickBooks…):
+
+1. **Lists (optional)** — import your IIF lists first so contact details and items come over.
+2. **Upload** the General Ledger: `Reports → Accountant & Taxes → General Ledger`, date range
+   *All* (or the years you want), no filters, then `Excel → Create New Worksheet` (.xlsx),
+   `Excel → Create .CSV file`, or `File → Save as PDF`. Optionally add the **Account Listing**
+   (`Reports → List → Account Listing`, or your IIF chart of accounts) so every account type is
+   exact, and a **Trial Balance** as of the last day for a second check.
+3. **Preview** — accounts, transaction count, date range, totals, and anything that needs review.
+4. **Account types** — a GL doesn't say what kind each account is; BookKeeper works it out from
+   QB's section order, account numbers, names, running-balance direction and how each account is
+   used. Confirm or change them, and map accounts onto ones that already exist (no duplicates).
+5. **Dry run** — the whole import runs and is proven, then rolled back.
+6. **Import** — one database transaction: accounts (numbers and `Parent:Child` hierarchy),
+   classes, customers/vendors/employees (by transaction type), one opening entry dated the day
+   before the period for the beginning balances, and every rebuilt transaction (each verified
+   to balance, posted through the normal posting engine).
+7. **Proof** — every account's balance as of the period end must equal the report's ending
+   balance (and the Trial Balance, if supplied), and debits must equal credits. If anything
+   differs, **nothing is saved** — unless you explicitly choose to post the difference to a
+   `QB Import Suspense` account to sort out later. The proof is stored with the import.
+
+Notes:
+
+- Re-importing the same report (or an overlapping one) never duplicates: each transaction has a
+  stable fingerprint (`qbgl:` source reference). Import consecutive periods oldest first.
+- Lines that can't be matched into a balanced transaction (usually a filtered report or a
+  missing page) are listed for review and never posted.
+- If you use this path, **skip** the opening-balance entry in step 8 above — the GL import
+  creates it.
+
 ## 4. Verify-your-data checklist
 
 Run these checks in BookKeeper AI against the same reports from QuickBooks

@@ -14,7 +14,9 @@ const nextConfig = {
     },
   },
   // PGlite ships a wasm/native asset; keep it external so Next traces it for standalone.
-  serverExternalPackages: ['@electric-sql/pglite'],
+  // pdfjs-dist (QuickBooks PDF report import) loads its worker module at runtime; bundling it
+  // breaks that lookup, so it is required from node_modules as-is.
+  serverExternalPackages: ['@electric-sql/pglite', 'pdfjs-dist'],
 }
 
 module.exports = nextConfig

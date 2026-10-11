@@ -136,6 +136,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: Building2, label: 'Companies', path: '/companies' },
       { icon: HardDrive, label: 'Company File', path: '/company-file' },
+      { icon: FileSpreadsheet, label: 'Migrate from QuickBooks', path: '/qb-import' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security' },
       { icon: Settings, label: 'Settings', path: '/settings' },
     ],

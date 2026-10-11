@@ -1167,3 +1167,25 @@ export const memorizedReports = pgTable('memorized_reports', {
   config: jsonb('config').$type<Record<string, unknown>>().notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+// ---- team glimport ----
+/**
+ * One row per completed QuickBooks General Ledger migration (lib/services/qbGlImport.ts):
+ * the source file, period, counts, and the account-by-account reconciliation proof that was
+ * shown to the user — kept so the proof stays part of the record.
+ */
+export const qbGlImports = pgTable('qb_gl_imports', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  fileName: varchar('file_name', { length: 255 }).notNull(),
+  periodStart: timestamp('period_start'),
+  periodEnd: timestamp('period_end'),
+  entriesPosted: integer('entries_posted').notNull().default(0),
+  entriesSkipped: integer('entries_skipped').notNull().default(0),
+  accountsCreated: integer('accounts_created').notNull().default(0),
+  /** Total posted to 'QB Import Suspense' when the user accepted a variance (null = none). */
+  varianceAmount: decimal('variance_amount', { precision: 15, scale: 2 }),
+  proof: jsonb('proof').$type<Record<string, unknown>>().notNull(),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});

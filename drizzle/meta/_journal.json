@@ -120,6 +120,13 @@
       "when": 1781044152358,
       "tag": "0016_low_leopardon",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1781100020000,
+      "tag": "0020_team_glimport",
+      "breakpoints": true
     }
   ]
 }
