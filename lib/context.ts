@@ -96,8 +96,8 @@ export async function getServerContext(): Promise<ServiceContext> {
       companyId = owned?.id;
     }
     if (companyId) {
-      // Multi-user: while an admin holds single-user mode, every other session is refused.
-      await assertSessionAllowed(db, session?.sessionId);
+      // Multi-user: while an admin holds single-user mode for this company, other sessions are refused.
+      await assertSessionAllowed(db, session?.sessionId, companyId);
       // RBAC: load the member's role so the service layer can reject viewer mutations
       // centrally (writeAudit/inTransaction in lib/services/_base.ts).
       const role = (await getRole({ db, companyId, userId })) ?? undefined;

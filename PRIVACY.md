@@ -41,8 +41,8 @@ name can resolve anywhere. Link-local and cloud-metadata addresses (`169.254.0.0
 `fe80::/10`), multicast and other special ranges are never contacted.
 
 An administrator can cap a machine with the `BKA_NETWORK_MODE` environment variable
-(`offline`, `tailnet-only` or `allow-cloud`). The effective mode is the stricter of that cap and
-the company setting.
+(`offline`, `tailnet-only` or `allow-cloud`, any letter case). The effective mode is the stricter
+of that cap and the company setting. A value that is set but not recognised counts as `offline`.
 
 ## How it is enforced
 
@@ -76,7 +76,8 @@ User actions that open your system browser are not data transfers by the app. Th
 
 ## Multi-user hosting (tailnet only)
 
-Like QuickBooks Enterprise, one computer can **host** a company file for up to about 40 people.
+Like QuickBooks Enterprise, one computer can **host** a company file for up to 40 people logged in
+at once (further sign-ins over the network are refused until someone logs out).
 
 - **File > Host multi-user access** keeps the app server on `127.0.0.1`. It adds a small
   forwarding service on this computer's **Tailscale address** only (detected with
@@ -87,15 +88,19 @@ Like QuickBooks Enterprise, one computer can **host** a company file for up to a
   serves HTTPS. Otherwise traffic is plain HTTP inside the tailnet, which Tailscale already
   encrypts end to end.
 - Every request needs a sign-in with a personal user account. Sign-in is rate-limited per
-  account, per address and overall, and the company-file password and employee portal sign-in
-  are limited the same way. Remote devices cannot use the no-account first-run mode. They
+  account, per address and overall (attempts still being checked count too), and the
+  company-file password and employee portal sign-in are limited the same way. Failed attempts
+  from other computers never lock out sign-in on the host computer itself. Remote devices cannot use the no-account first-run mode. They
   cannot create accounts, and they never receive password-reset tokens.
 - The host is the only computer that writes to the company file. If two people edit the same
   invoice, bill, journal entry, customer, vendor or item, the second save is refused with
   *"This record was changed by … at …. Reload to see the latest."*
-- **Settings → Multi-user** shows who is logged in and lets an admin sign people out. It also
-  switches the file to **single-user mode**. Condense Data, Restore, Rebuild Data and Import
-  require single-user mode while anyone else is connected.
+- **Settings → Multi-user** shows who is logged in to your company and lets an admin sign them
+  out. It also switches the company to **single-user mode**. Condense Data, Rebuild Data and
+  Import require single-user mode while anyone else in the company is connected. When one file
+  holds several companies, each company's admins see and control only their own company's
+  users. Restore replaces the whole file, so it also needs every other company's users to log
+  out (they are counted, not named). Idle sessions are ended before these utilities run.
 - On another computer, **File > Open company on host…** accepts only tailnet or LAN addresses.
   The company data stays on the host. A client never backs up, hosts or updates on the host's
   behalf.

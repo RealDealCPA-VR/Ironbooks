@@ -166,8 +166,8 @@ describe('policyFetch — redirect abuse', () => {
     await policyFetch(
       'http://100.64.0.9/start',
       {
-        method: 'POST',
-        body: '{}',
+        // GET: a cross-origin 307/308 never replays a request BODY at all (see guard.ts).
+        method: 'GET',
         headers: [
           ['Authorization', 'Bearer s3cret'],
           ['Cookie', 'sid=abc'],

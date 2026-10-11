@@ -154,17 +154,53 @@ export async function withVersionCheck<T>(
   return inTransaction(ctx, async (tx) => {
     await assertCurrentVersion(tx, entity, id, want);
     const result = await fn(tx);
-    await bumpVersion(tx, entity, id, want);
-    return result;
+    const version = await bumpVersion(tx, entity, id, want);
+    // The client caches the version in the returned record as its next expected version, so
+    // it must be the bumped one — otherwise the user's next save is a false 409 naming themselves.
+    return version ? withReturnedVersion(result, id, version) : result;
   });
 }
 
-async function bumpVersion(ctx: ServiceContext, entity: VersionedEntity, id: string, previous: Date) {
+/** The record's version after the save (bumped when the service didn't move it forward). */
+async function bumpVersion(
+  ctx: ServiceContext,
+  entity: VersionedEntity,
+  id: string,
+  previous: Date,
+): Promise<Date | null> {
   const t = table(entity);
   const row = await loadVersion(ctx, entity, id);
-  if (!row) return;
+  if (!row) return null;
   const floor = Math.max(previous.getTime(), row.updatedAt.getTime());
-  if (row.updatedAt.getTime() > previous.getTime() && row.updatedAt.getTime() <= Date.now()) return;
+  if (row.updatedAt.getTime() > previous.getTime() && row.updatedAt.getTime() <= Date.now()) return row.updatedAt;
   const next = new Date(Math.max(Date.now(), floor + 1));
   await ctx.db.update(t).set({ updatedAt: next }).where(and(eq(t.id, id), eq(t.companyId, ctx.companyId)));
+  return next;
+}
+
+/**
+ * Patch `updatedAt` on the record the service returned — top level ({ id, updatedAt, ... }) or
+ * one level down for wrapped results ({ invoice: {...} }, { entry: {...} }). Returns a shallow
+ * copy; anything without a matching record is passed through untouched.
+ */
+function withReturnedVersion<T>(result: T, id: string, version: Date): T {
+  const isRecord = (v: unknown): v is Record<string, unknown> =>
+    typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Date);
+  const patch = (rec: Record<string, unknown>) =>
+    'updatedAt' in rec && (rec.id === undefined || rec.id === id) ? { ...rec, updatedAt: version } : null;
+  if (!isRecord(result)) return result;
+  const top = patch(result);
+  if (top) return top as T;
+  const out: Record<string, unknown> = { ...result };
+  let changed = false;
+  for (const [k, v] of Object.entries(result)) {
+    if (isRecord(v) && v.id === id) {
+      const p = patch(v);
+      if (p) {
+        out[k] = p;
+        changed = true;
+      }
+    }
+  }
+  return (changed ? out : result) as T;
 }

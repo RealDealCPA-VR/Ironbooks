@@ -69,6 +69,32 @@ describe('LoginRateLimiter', () => {
     expect(rl.check(['k'], 3).allowed).toBe(true);
   });
 
+  it('counts attempts in flight: a parallel burst cannot all pass the gate before failures land', () => {
+    const rl = new LoginRateLimiter(opts);
+    const keys = attemptKeys('login', 'boss@co.com', '100.64.0.7');
+    const tickets = Array.from({ length: 10 }, () => rl.begin(keys, 0));
+    expect(tickets.filter((t) => t.allowed)).toHaveLength(3); // maxFailures
+    // Each admitted guess fails -> the account locks; releasing doesn't reopen it.
+    for (const t of tickets.filter((t) => t.allowed)) {
+      rl.recordFailure(keys, 1);
+      t.release();
+      t.release(); // idempotent
+    }
+    expect(rl.begin(keys, 2).allowed).toBe(false);
+    // A finished attempt frees its slot.
+    const rl2 = new LoginRateLimiter(opts);
+    const t1 = rl2.begin(['k'], 0);
+    t1.release();
+    expect([rl2.begin(['k'], 0), rl2.begin(['k'], 0), rl2.begin(['k'], 0)].every((t) => t.allowed)).toBe(true);
+  });
+
+  it('network peers cannot lock out sign-in on the host machine itself', () => {
+    const rl = new LoginRateLimiter(opts);
+    for (let i = 0; i < 5; i++) rl.recordFailure(attemptKeys('login', 'owner@co.com', `100.64.1.${i}`), i, {});
+    expect(rl.check(attemptKeys('login', 'owner@co.com', '100.64.9.9'), 10).allowed).toBe(false);
+    expect(rl.check(attemptKeys('login', 'owner@co.com', 'local'), 10).allowed).toBe(true);
+  });
+
   it('formats a friendly 429 body', () => {
     expect(tooManyAttempts(30_000).retryAfter).toBe('30');
     expect(tooManyAttempts(30_000).body.error).toMatch(/30 seconds/);

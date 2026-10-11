@@ -44,7 +44,8 @@ describe('effectiveMode / env ceiling', () => {
   });
   it('reads BKA_NETWORK_MODE and ignores junk', () => {
     expect(envModeCeiling({ BKA_NETWORK_MODE: 'offline' })).toBe('offline');
-    expect(envModeCeiling({ BKA_NETWORK_MODE: 'nope' })).toBeUndefined();
+    expect(envModeCeiling({ BKA_NETWORK_MODE: 'nope' })).toBe('offline'); // typo fails closed
+    expect(envModeCeiling({ BKA_NETWORK_MODE: '  ' })).toBeUndefined();
     expect(envModeCeiling({})).toBeUndefined();
   });
 });
@@ -161,7 +162,7 @@ describe('guard — assertOutboundAllowed / policyFetch', () => {
       .mockResolvedValueOnce(new Response('ok', { status: 200 }));
     const res = await policyFetch(
       'http://100.100.1.2/start',
-      { method: 'POST', body: 'x', headers: { authorization: 'Bearer secret', 'content-type': 'text/plain' } },
+      { method: 'GET', headers: { authorization: 'Bearer secret', 'content-type': 'text/plain' } },
       { purpose: 'ai', ctx },
     );
     expect(await res.text()).toBe('ok');
@@ -170,6 +171,23 @@ describe('guard — assertOutboundAllowed / policyFetch', () => {
     const h = new Headers(secondInit.headers);
     expect(h.get('authorization')).toBeNull();
     expect(h.get('content-type')).toBe('text/plain');
-    expect(secondInit.method).toBe('POST'); // 307 keeps method + body
+  });
+
+  it('307/308 keep method + body on the same origin, but never resend a body to another origin', async () => {
+    stored.policy = policy('tailnet-only');
+    fetchSpy
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { location: '/next' } }))
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+    await policyFetch('http://100.100.1.2/start', { method: 'POST', body: 'x' }, { purpose: 'bank-feeds', ctx });
+    const [, sameInit] = fetchSpy.mock.calls[1] as [string, RequestInit];
+    expect(sameInit.method).toBe('POST');
+    expect(sameInit.body).toBe('x');
+
+    fetchSpy.mockReset();
+    fetchSpy.mockResolvedValueOnce(new Response(null, { status: 308, headers: { location: 'http://100.100.1.3/x' } }));
+    await expect(
+      policyFetch('http://100.100.1.2/start', { method: 'POST', body: '{"secret":"s"}' }, { purpose: 'bank-feeds', ctx }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });

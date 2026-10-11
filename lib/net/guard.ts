@@ -104,7 +104,17 @@ export async function policyFetch(
       throw new ServiceError('FORBIDDEN', 'Too many redirects from an outbound request.');
     }
     const next = new URL(location, url);
-    if (next.origin !== url.origin && reqInit.headers) {
+    const method = (reqInit.method ?? 'GET').toUpperCase();
+    const crossOrigin = next.origin !== url.origin;
+    // A 307/308 replays the method AND body. Bodies can carry credentials (Plaid's client_id /
+    // secret travel in the JSON body), so never replay one to a different origin.
+    if (crossOrigin && (status === 307 || status === 308) && method !== 'GET' && method !== 'HEAD') {
+      throw new ServiceError(
+        'FORBIDDEN',
+        `Refused to resend a ${method} request body to a different site (${next.host}) after a redirect.`,
+      );
+    }
+    if (crossOrigin && reqInit.headers) {
       // Never forward credentials to a different origin.
       const h = new Headers(reqInit.headers);
       h.delete('authorization');
@@ -114,7 +124,6 @@ export async function policyFetch(
     }
     url = next;
     // 303 (and 301/302 after a non-GET) become a bodyless GET, as browsers do.
-    const method = (reqInit.method ?? 'GET').toUpperCase();
     if (status === 303 || ((status === 301 || status === 302) && method !== 'GET' && method !== 'HEAD')) {
       reqInit = { ...reqInit, method: 'GET', body: undefined };
     }

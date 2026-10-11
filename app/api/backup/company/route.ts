@@ -90,7 +90,7 @@ export async function POST(req: NextRequest) {
       throw new ServiceError('FORBIDDEN', 'Your role is view-only. This action requires write access.');
     }
     if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
-    await assertExclusiveAccess(ctx, 'Restore');
+    await assertExclusiveAccess(ctx, 'Restore'); // adds a NEW company: other companies untouched
 
     const arrayBuffer = await req.arrayBuffer();
     if (!arrayBuffer.byteLength) {

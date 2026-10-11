@@ -1191,11 +1191,12 @@ export const userSessions = pgTable('user_sessions', {
 });
 
 /**
- * Single-user mode holder (at most one row, id = 'file'). While set, every other session is
- * refused so admin utilities (condense, restore, rebuild, import) can run exclusively.
+ * Single-user mode holder: at most one row per company (id = the company id). While set, every
+ * other session working in that company is refused so admin utilities (condense, restore,
+ * rebuild, import) can run exclusively.
  */
 export const singleUserMode = pgTable('single_user_mode', {
-  id: varchar('id', { length: 20 }).primaryKey(),
+  id: varchar('id', { length: 40 }).primaryKey(),
   sessionId: uuid('session_id').notNull(),
   userId: uuid('user_id').notNull(),
   enabledAt: timestamp('enabled_at').defaultNow().notNull(),

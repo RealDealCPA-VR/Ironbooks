@@ -14,8 +14,12 @@ CREATE TABLE IF NOT EXISTS "user_sessions" (
 CREATE INDEX IF NOT EXISTS "user_sessions_active_idx" ON "user_sessions" ("ended_at", "last_seen_at");
 --> statement-breakpoint
 CREATE TABLE IF NOT EXISTS "single_user_mode" (
-	"id" varchar(20) PRIMARY KEY NOT NULL,
+	"id" varchar(40) PRIMARY KEY NOT NULL,
 	"session_id" uuid NOT NULL,
 	"user_id" uuid NOT NULL,
 	"enabled_at" timestamp DEFAULT now() NOT NULL
 );
+--> statement-breakpoint
+ALTER TABLE "single_user_mode" ALTER COLUMN "id" TYPE varchar(40);
+--> statement-breakpoint
+DELETE FROM "single_user_mode" WHERE "id" = 'file';

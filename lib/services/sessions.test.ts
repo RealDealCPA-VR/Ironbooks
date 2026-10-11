@@ -19,6 +19,7 @@ import {
   getSingleUserMode,
   listActiveSessions,
   listSessionsForAdmin,
+  MAX_CONCURRENT_USERS,
   signOutOtherSessions,
   signOutSession,
   startSession,
@@ -177,6 +178,70 @@ describe('multi-user sessions + single-user mode', () => {
     expect(row.endReason).toBe('signed_out_by_admin');
     await endSession(db, admin.id);
   });
+
+  it('idle sessions are ended before a utility runs, so they cannot come back mid-operation', async () => {
+    const admin = await startSession(db, { userId: adminId, companyId });
+    const idle = await startSession(db, { userId: clerkId, companyId });
+    await db
+      .update(userSessions)
+      .set({ lastSeenAt: new Date(Date.now() - ACTIVE_WINDOW_MS - 1000) })
+      .where(eq(userSessions.id, idle.id));
+    await assertExclusiveAccess(ctxFor(adminId, admin.id, 'owner'), 'Condense Data');
+    expect(await touchSession(db, idle.id, clerkId)).toBe(false);
+    const [row] = await db.select().from(userSessions).where(eq(userSessions.id, idle.id));
+    expect(row.endReason).toBe('expired');
+    expect(await touchSession(db, admin.id, adminId)).toBe(true);
+    await endSession(db, admin.id);
+  });
+
+  it('enforces the 40-user limit for network sign-ins (the host machine always gets in)', async () => {
+    await db.update(userSessions).set({ endedAt: new Date() }); // start from an empty file
+    const extra: string[] = [];
+    for (let i = 0; i < MAX_CONCURRENT_USERS; i++) {
+      const [u] = await db.insert(users).values({ email: `seat${i}@test.local`, name: `Seat ${i}`, passwordHash: 'x' }).returning();
+      extra.push((await startSession(db, { userId: u.id, viaHost: true })).id);
+    }
+    await expect(startSession(db, { userId: clerkId, viaHost: true })).rejects.toMatchObject({ code: 'CONFLICT' });
+    const local = await startSession(db, { userId: adminId }); // over the limit, but local
+    await endSession(db, extra.pop()!);
+    // The host machine's own session takes a seat too, so one more must leave.
+    await expect(startSession(db, { userId: clerkId, viaHost: true })).rejects.toMatchObject({ code: 'CONFLICT' });
+    await endSession(db, extra.pop()!);
+    const clerk = await startSession(db, { userId: clerkId, viaHost: true });
+    for (const id of [...extra, local.id, clerk.id]) await endSession(db, id);
+  });
+
+describe('several companies in one file', () => {
+  let otherCo: string;
+  let otherAdmin: string;
+  beforeAll(async () => {
+    const [u] = await db.insert(users).values({ email: 'other@test.local', name: 'Olga Other', passwordHash: 'x' }).returning();
+    const [c] = await db.insert(companies).values({ name: 'Other Co', ownerId: u.id }).returning();
+    await db.insert(userCompanies).values({ userId: u.id, companyId: c.id, role: 'owner' });
+    otherCo = c.id;
+    otherAdmin = u.id;
+  });
+
+  it('per-company utilities ignore other companies; Restore (whole file) counts them without naming them', async () => {
+    await db.update(userSessions).set({ endedAt: new Date() });
+    const admin = await startSession(db, { userId: adminId, companyId });
+    const other = await startSession(db, { userId: otherAdmin, companyId: otherCo });
+    const adminCtx = ctxFor(adminId, admin.id, 'owner');
+    await expect(assertExclusiveAccess(adminCtx, 'Condense Data')).resolves.toBeUndefined();
+    const err = await assertExclusiveAccess(adminCtx, 'Restore', { scope: 'file' }).catch((e) => e);
+    expect(err.code).toBe('CONFLICT');
+    expect(err.message).toMatch(/1 from other companies/);
+    expect(err.message).not.toMatch(/Olga/);
+    // Single-user mode for this company doesn't excuse other companies' users from a file restore.
+    await enterSingleUserMode(adminCtx);
+    await expect(assertSessionAllowed(db, other.id, otherCo)).resolves.toBeUndefined();
+    await expect(assertExclusiveAccess(adminCtx, 'Restore', { scope: 'file' })).rejects.toMatchObject({ code: 'CONFLICT' });
+    await endSession(db, other.id);
+    await expect(assertExclusiveAccess(adminCtx, 'Restore', { scope: 'file' })).resolves.toBeUndefined();
+    await exitSingleUserMode(adminCtx);
+    await endSession(db, admin.id);
+  });
+});
 
 describe('Privacy & Network policy persistence', () => {
   it('defaults to tailnet-only, saves (owner/admin only) and audits', async () => {

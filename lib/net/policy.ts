@@ -89,10 +89,15 @@ export function normalizePolicy(raw: unknown): NetworkPolicy {
   return { mode: isNetworkMode(r.mode) ? r.mode : DEFAULT_NETWORK_POLICY.mode, cloudOptIn };
 }
 
-/** The machine-wide ceiling from BKA_NETWORK_MODE (undefined = no ceiling). */
+/**
+ * The machine-wide ceiling from BKA_NETWORK_MODE (unset/blank = no ceiling). Case-insensitive.
+ * The ceiling only ever restricts, so it fails CLOSED: a value that is set but not recognised
+ * (a typo) means 'offline', never "no ceiling".
+ */
 export function envModeCeiling(env: Record<string, string | undefined> = process.env): NetworkMode | undefined {
-  const v = env.BKA_NETWORK_MODE?.trim();
-  return isNetworkMode(v) ? v : undefined;
+  const v = env.BKA_NETWORK_MODE?.trim().toLowerCase();
+  if (!v) return undefined;
+  return isNetworkMode(v) ? v : 'offline';
 }
 
 /** The more restrictive of the company mode and the machine ceiling. */

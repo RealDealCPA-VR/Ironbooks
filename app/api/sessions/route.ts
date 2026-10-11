@@ -1,9 +1,9 @@
 /**
- * GET  /api/sessions — multi-user status: who is logged in (owner/admin see everyone; others
- *                      only their own session plus a head count), the single-user-mode holder,
- *                      and this request's session id.
+ * GET  /api/sessions — multi-user status for the caller's company: who is logged in
+ *                      (owner/admin see everyone; others only their own session plus a head
+ *                      count), the single-user-mode holder, and this request's session id.
  * POST /api/sessions { action: 'sign-out-others' } — owner/admin: sign out every other session
- *                      (e.g. before switching to single-user mode).
+ *                      in this company (e.g. before switching to single-user mode).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -34,8 +34,9 @@ export async function GET() {
   try {
     const ctx = await getServerContext();
     const isAdmin = isAdminRole(ctx.role);
-    const all = await listActiveSessions(ctx.db, { currentSessionId: ctx.sessionId });
-    const singleUser = await getSingleUserMode(ctx.db);
+    // Scoped to members of the caller's company — other companies in the file are never shown.
+    const all = await listActiveSessions(ctx.db, { currentSessionId: ctx.sessionId, companyId: ctx.companyId });
+    const singleUser = await getSingleUserMode(ctx.db, ctx.companyId);
     return NextResponse.json({
       isAdmin,
       currentSessionId: ctx.sessionId ?? null,

@@ -16,27 +16,33 @@ export async function POST(req: NextRequest) {
   const origin = originFromHeaders(req.headers);
   const limiter = loginLimiter();
   const keys = attemptKeys('portal', email, origin.addr);
-  const gate = limiter.check(keys);
+  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
+  // Admitted before the slow password hash, released after (parallel guesses count).
+  const gate = limiter.begin(keys, Date.now(), weights);
   if (!gate.allowed) {
     const { body, retryAfter } = tooManyAttempts(gate.retryAfterMs);
     return NextResponse.json(body, { status: 429, headers: { 'Retry-After': retryAfter } });
   }
-  const db = await getDb();
-  const matches = await db.select().from(employees).where(eq(employees.email, email.trim().toLowerCase()));
-  for (const emp of matches) {
-    if (emp.portalPasswordHash && emp.isActive && (await verifyPassword(password, emp.portalPasswordHash))) {
-      limiter.recordSuccess(keys.slice(0, -1));
-      const res = NextResponse.json({ id: emp.id, name: `${emp.firstName} ${emp.lastName}` });
-      res.cookies.set(PORTAL_COOKIE, createSessionToken(emp.id, 'portal'), {
-        httpOnly: true,
-        secure: cookieSecure(origin),
-        sameSite: 'lax',
-        path: '/',
-        maxAge: 60 * 60 * 24 * 30,
-      });
-      return res;
+  try {
+    const db = await getDb();
+    const matches = await db.select().from(employees).where(eq(employees.email, email.trim().toLowerCase()));
+    for (const emp of matches) {
+      if (emp.portalPasswordHash && emp.isActive && (await verifyPassword(password, emp.portalPasswordHash))) {
+        limiter.recordSuccess(keys.slice(0, -1));
+        const res = NextResponse.json({ id: emp.id, name: `${emp.firstName} ${emp.lastName}` });
+        res.cookies.set(PORTAL_COOKIE, createSessionToken(emp.id, 'portal'), {
+          httpOnly: true,
+          secure: cookieSecure(origin),
+          sameSite: 'lax',
+          path: '/',
+          maxAge: 60 * 60 * 24 * 30,
+        });
+        return res;
+      }
     }
+    limiter.recordFailure(keys, Date.now(), weights);
+    return NextResponse.json({ error: 'Invalid email or password.', code: 'FORBIDDEN' }, { status: 401 });
+  } finally {
+    gate.release();
   }
-  limiter.recordFailure(keys, Date.now(), { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT });
-  return NextResponse.json({ error: 'Invalid email or password.', code: 'FORBIDDEN' }, { status: 401 });
 }

@@ -82,7 +82,7 @@ export async function POST(req: NextRequest) {
     // the whole company file, so it is owner/admin only and needs single-user mode while
     // anyone else is connected.
     const ctx = await getServerContext();
-    await assertExclusiveAccess(ctx, 'Restore');
+    await assertExclusiveAccess(ctx, 'Restore', { scope: 'file' });
 
     const arrayBuffer = await req.arrayBuffer();
     if (!arrayBuffer.byteLength) {

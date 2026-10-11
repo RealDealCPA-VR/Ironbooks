@@ -30,16 +30,23 @@ export async function POST(req: NextRequest) {
   const origin = originFromHeaders(req.headers);
   const limiter = loginLimiter();
   const keys = attemptKeys('unlock', status.enabled ? 'file' : null, origin.addr);
+  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
+  let ok = !status.enabled;
   if (status.enabled) {
-    const gate = limiter.check(keys);
+    // Admitted before the slow password hash, released after (parallel guesses count).
+    const gate = limiter.begin(keys, Date.now(), weights);
     if (!gate.allowed) {
       const { body, retryAfter } = tooManyAttempts(gate.retryAfterMs);
       return NextResponse.json({ ok: false, enabled: true, ...body }, { status: 429, headers: { 'Retry-After': retryAfter } });
     }
+    try {
+      ok = await verifyFilePassword(db, password);
+      if (!ok) limiter.recordFailure(keys, Date.now(), weights);
+    } finally {
+      gate.release();
+    }
   }
-  const ok = !status.enabled || (await verifyFilePassword(db, password));
   if (!ok) {
-    limiter.recordFailure(keys, Date.now(), { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT });
     return NextResponse.json(
       { ok: false, enabled: true, companyName: status.companyName },
       { status: 401 },

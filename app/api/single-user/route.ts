@@ -25,7 +25,7 @@ function errorResponse(err: unknown) {
 export async function GET() {
   try {
     const ctx = await getServerContext();
-    const holder = await getSingleUserMode(ctx.db);
+    const holder = await getSingleUserMode(ctx.db, ctx.companyId);
     return NextResponse.json({
       singleUser: holder ? { ...holder, isYou: holder.sessionId === ctx.sessionId } : null,
     });

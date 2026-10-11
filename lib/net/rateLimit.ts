@@ -8,6 +8,14 @@
  * password guessing even when the attacker rotates addresses; the global key caps password
  * spraying across many accounts.
  *
+ * Attempts are admitted with begin() BEFORE the slow password hash and released after it, and
+ * an attempt in flight counts against the limit like a failure would — so a burst of parallel
+ * guesses can't all slip past the gate before the first failure is recorded.
+ *
+ * Remote-triggered lockouts never reach this machine: account and global keys are kept apart
+ * for local (on the host itself) and network (through the multi-user host) sign-ins, so a
+ * tailnet peer guessing the owner's password can't lock the owner out at the host.
+ *
  * In-memory by design: the host server is a single process, and a restart clearing the
  * counters is acceptable (it does not reset faster than a lockout would).
  */
@@ -31,8 +39,14 @@ interface Bucket {
   lockouts: number;
 }
 
+export interface RateLimitTicket extends RateLimitVerdict {
+  /** Call once the attempt has finished (success or failure); idempotent. */
+  release(): void;
+}
+
 export class LoginRateLimiter {
   private buckets = new Map<string, Bucket>();
+  private inflight = new Map<string, number>();
   constructor(private opts: RateLimitOptions) {}
 
   private bucket(key: string): Bucket {
@@ -52,6 +66,39 @@ export class LoginRateLimiter {
       if (b && b.lockedUntil > now) wait = Math.max(wait, b.lockedUntil - now);
     }
     return { allowed: wait === 0, retryAfterMs: wait };
+  }
+
+  /**
+   * Admit one attempt: refused while any key is locked, or while failures in the window plus
+   * attempts still in flight would reach the limit. When allowed, the caller MUST release().
+   */
+  begin(keys: string[], now = Date.now(), weights: Record<string, number> = {}): RateLimitTicket {
+    const verdict = this.check(keys, now);
+    if (!verdict.allowed) return { ...verdict, release: () => {} };
+    for (const k of keys) {
+      const max = this.opts.maxFailures * (weights[k] ?? 1);
+      const b = this.buckets.get(k);
+      const recent = b ? b.failures.filter((t) => now - t < this.opts.windowMs).length : 0;
+      if (recent + (this.inflight.get(k) ?? 0) >= max) {
+        // Too many guesses already pending: retry once they have resolved.
+        return { allowed: false, retryAfterMs: 1000, release: () => {} };
+      }
+    }
+    for (const k of keys) this.inflight.set(k, (this.inflight.get(k) ?? 0) + 1);
+    let released = false;
+    return {
+      allowed: true,
+      retryAfterMs: 0,
+      release: () => {
+        if (released) return;
+        released = true;
+        for (const k of keys) {
+          const n = (this.inflight.get(k) ?? 1) - 1;
+          if (n <= 0) this.inflight.delete(k);
+          else this.inflight.set(k, n);
+        }
+      },
+    };
   }
 
   /** Record a failed attempt against every key; returns the verdict for the NEXT attempt. */
@@ -104,10 +151,16 @@ export function loginLimiter(): LoginRateLimiter {
   return (g.__bkaLoginLimiter ??= new LoginRateLimiter(DEFAULTS));
 }
 
-/** Keys for one sign-in attempt. `scope` separates login / unlock / portal counters. */
+/**
+ * Keys for one sign-in attempt. `scope` separates login / unlock / portal counters; `addr` is
+ * the peer address, or 'local' for this machine. Local sign-ins get their own account and
+ * global keys, so failures arriving over the network can never lock out the host itself.
+ * The global key is always last (callers weight it with GLOBAL_KEY_WEIGHT).
+ */
 export function attemptKeys(scope: string, account: string | null, addr: string): string[] {
-  const keys = [`${scope}:addr:${addr}`, `${scope}:global`];
-  if (account) keys.unshift(`${scope}:acct:${account.trim().toLowerCase()}`);
+  const realm = addr === 'local' ? ':local' : '';
+  const keys = [`${scope}:addr:${addr}`, `${scope}:global${realm}`];
+  if (account) keys.unshift(`${scope}:acct${realm}:${account.trim().toLowerCase()}`);
   return keys;
 }
 
