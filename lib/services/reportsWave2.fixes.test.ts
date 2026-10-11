@@ -15,6 +15,9 @@ import { isStandardReport, runStandardReport } from './reportRegistry';
 import { eq } from 'drizzle-orm';
 import {
   createReportSchedule,
+  deleteReportSchedule,
+  listReportSchedules,
+  runDueSchedules,
   updateMemorizedReport,
   updateReportSchedule,
   deleteMemorizedReport,
@@ -162,5 +165,24 @@ describe('memorized report permissions', () => {
       expect(isStandardReport(k)).toBe(false);
       await expect(saveMemorizedReport(ctx, { name: k, reportType: k, config: {} })).rejects.toMatchObject({ code: 'VALIDATION' });
     }
+  });
+});
+
+describe('report schedule services enforce file_utilities in the service', () => {
+  it('a user without file_utilities cannot list, create, change, delete or run schedules', async () => {
+    const m = await saveMemorizedReport(ctx, { name: 'Perm TB', reportType: 'trial-balance', config: {} });
+    const s = await createReportSchedule(ctx, { name: 'Perm sched', memorizedReportId: m.id, frequency: 'daily', startDate: '2026-01-05' });
+    const noFile = fullAccess();
+    noFile.permissions.file_utilities = [];
+    const c = { ...ctx, access: noFile };
+    await expect(listReportSchedules(c)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(createReportSchedule(c, { name: 'x', memorizedReportId: m.id, frequency: 'daily' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(updateReportSchedule(c, s.id, { isActive: false })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(deleteReportSchedule(c, s.id)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(runDueSchedules(c, { now: new Date('2026-01-06T00:00:00.000Z'), outDir: path.join(TEST_DIR, 'out') })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // Untouched.
+    const still = (await listReportSchedules(ctx)).find((x) => x.id === s.id);
+    expect(still?.isActive).toBe(true);
+    await deleteReportSchedule(ctx, s.id);
   });
 });

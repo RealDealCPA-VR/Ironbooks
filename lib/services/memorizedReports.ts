@@ -368,6 +368,7 @@ function safeSegment(s: string, fallback: string): string {
 }
 
 export async function listReportSchedules(ctx: ServiceContext) {
+  requirePermission(ctx, 'file_utilities', 'view');
   return ctx.db
     .select()
     .from(reportSchedules)
@@ -388,6 +389,7 @@ export async function createReportSchedule(
     isActive?: boolean;
   },
 ) {
+  requirePermission(ctx, 'file_utilities', 'create');
   if (!!input.memorizedReportId === !!input.groupId) throw validation('Choose either one memorized report or one report group.');
   if (input.memorizedReportId) await getMemorized(ctx, input.memorizedReportId);
   if (input.groupId) await getGroup(ctx, input.groupId);
@@ -420,6 +422,7 @@ export async function updateReportSchedule(
   id: string,
   patch: { name?: string; frequency?: ScheduleFrequency; isActive?: boolean; format?: 'csv' | 'xlsx' },
 ) {
+  requirePermission(ctx, 'file_utilities', 'modify');
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
   // Monthly schedules run on an anchor day of month. Keep it when frequency is unchanged (and set);
@@ -445,6 +448,7 @@ export async function updateReportSchedule(
 }
 
 export async function deleteReportSchedule(ctx: ServiceContext, id: string) {
+  requirePermission(ctx, 'file_utilities', 'delete');
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
   return inTransaction(ctx, async (tx) => {
@@ -472,6 +476,7 @@ export async function runDueSchedules(
   ctx: ServiceContext,
   opts: { now?: Date; outDir?: string } = {},
 ): Promise<ScheduleRunResult[]> {
+  requirePermission(ctx, 'file_utilities', 'create');
   const now = opts.now ?? new Date();
   const root = opts.outDir ?? reportExportRoot();
   const due = await ctx.db
