@@ -158,6 +158,31 @@ export const GLOSSARY = {
       'The final balance printed on your bank or credit card statement for the period you are reconciling.',
     aliases: ['ending balance', 'statement balance'],
   },
+  // ---- wave2 sales ----
+  'statement-charge': {
+    term: 'Statement charge',
+    short:
+      'A charge you add straight to the balance a customer owes instead of sending a separate invoice. It shows up on their next statement and in A/R aging.',
+    long:
+      'Example: you bill a monthly $50 service fee. Enter it as a statement charge, and it appears on their monthly statement with everything else they owe.',
+    aliases: ['statement charges', 'customer register charge'],
+  },
+  'bounced-check': {
+    term: 'Bounced check (NSF)',
+    short:
+      'A customer check the bank returned unpaid, usually for "non-sufficient funds". Recording it takes the money back out of your bank and puts the amount back on what the customer owes.',
+    long:
+      'Example: a customer pays a $200 invoice by check and you deposit it. A week later the bank returns it. Record Bounced Check reopens the invoice, takes $200 out of the bank, and can add the bank fee as an expense and charge the customer a returned-check fee.',
+    aliases: ['nsf', 'nsf check', 'returned check', 'bounced checks'],
+  },
+  'early-payment-discount': {
+    term: 'Early-payment discount',
+    short:
+      'A reduction you give a customer for paying before a set date, such as 2% off if paid within 10 days ("2% 10, Net 30").',
+    long:
+      'Example: an invoice of $1,000 has terms 2% 10, Net 30. If the customer pays within 10 days they pay $980; in Receive Payments you apply $980 of cash plus a $20 discount, and the invoice is paid in full.',
+    aliases: ['early payment discount', 'sales discount', 'payment discount', 'discount terms'],
+  },
 } satisfies Record<string, GlossaryEntry>;
 
 export type GlossaryKey = keyof typeof GLOSSARY;

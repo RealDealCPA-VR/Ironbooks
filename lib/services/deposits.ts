@@ -25,6 +25,7 @@
 import { and, eq, inArray, isNull, like, ne, notInArray } from 'drizzle-orm';
 import {
   accounts,
+  bouncedChecks,
   customers,
   deposits,
   depositLines,
@@ -534,6 +535,21 @@ export async function voidDeposit(ctx: ServiceContext, id: string) {
     .where(and(eq(deposits.id, id), eq(deposits.companyId, ctx.companyId)));
   if (!deposit) throw notFound('Deposit');
   if (deposit.voidedAt) return deposit; // idempotent
+
+  // wave2 sales (F2): a bounced check already took its money back out of this bank account.
+  // Voiding the deposit would take it out a second time.
+  const [bounced] = await ctx.db
+    .select({ id: bouncedChecks.id })
+    .from(bouncedChecks)
+    .innerJoin(depositLines, eq(depositLines.paymentId, bouncedChecks.paymentId))
+    .where(and(eq(bouncedChecks.companyId, ctx.companyId), eq(depositLines.depositId, id)))
+    .limit(1);
+  if (bounced) {
+    throw new ServiceError(
+      'CONFLICT',
+      'A check in this deposit was recorded as bounced, and the bank already took that money back. This deposit can no longer be voided.',
+    );
+  }
 
   return inTransaction(ctx, async (tx) => {
     if (deposit.postedEntryId) {

@@ -25,6 +25,13 @@ export const paymentCreditSchema = z.object({
   amount: zMoneyPositive,
 });
 
+/** wave2 sales (C4): an earlier unapplied payment used on an invoice inside Receive Payments. */
+export const paymentCreditFromPaymentSchema = z.object({
+  paymentId: zUuid,
+  invoiceId: zUuid,
+  amount: zMoneyPositive,
+});
+
 export const receivePaymentSchema = z.object({
   customerId: zUuid,
   date: zDate,
@@ -43,6 +50,7 @@ export const receivePaymentSchema = z.object({
     invalid_type_error: 'applications must be an array',
   }),
   credits: z.array(paymentCreditSchema).nullish(),
+  paymentCredits: z.array(paymentCreditFromPaymentSchema).nullish(),
   discountAccountId: zUuid.nullish(),
   memo: z.string().nullish(),
   currency: z.string().trim().length(3, 'currency must be a 3-letter ISO 4217 code').nullish(),

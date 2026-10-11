@@ -228,7 +228,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           .map((inv) => ({ ...inv, balanceDue: (Number(inv.balanceDue) + (giveBack.get(inv.id) ?? 0)).toFixed(2) }))
           .filter((inv) => inv.status !== 'void' && inv.status !== 'draft' && Number(inv.balanceDue) > 0);
         setInvoices(open);
-        const memoCredits = (cred.credits ?? []).filter((c) => c.kind === 'credit_memo');
+        // Earlier unapplied payments can be used on a NEW payment only (not while editing).
+        const memoCredits = (cred.credits ?? []).filter((c) => c.kind === 'credit_memo' || (!mine && c.kind === 'payment'));
         // Add back credit used by this payment so it can be re-applied when editing.
         const usedByMe = new Map<string, number>();
         for (const c of mine?.credits ?? []) usedByMe.set(c.creditMemoId, (usedByMe.get(c.creditMemoId) ?? 0) + Number(c.amount));
@@ -273,13 +274,19 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       discountAmount: discountAmounts[inv.id] && Number(discountAmounts[inv.id]) > 0 ? discountAmounts[inv.id] : null,
     }))
     .filter((a) => Number(a.amountApplied) > 0 || Number(a.discountAmount ?? 0) > 0);
-  const creditApps = Object.entries(creditUse)
-    .filter(([, u]) => u.invoiceId && Number(u.amount) > 0)
+  const paymentCreditIds = new Set(credits.filter((c) => c.kind === 'payment').map((c) => c.id));
+  const usedCredits = Object.entries(creditUse).filter(([, u]) => u.invoiceId && Number(u.amount) > 0);
+  const creditApps = usedCredits
+    .filter(([id]) => !paymentCreditIds.has(id))
     .map(([creditMemoId, u]) => ({ creditMemoId, invoiceId: u.invoiceId, amount: u.amount }));
+  const paymentCreditApps = usedCredits
+    .filter(([id]) => paymentCreditIds.has(id))
+    .map(([paymentId, u]) => ({ paymentId, invoiceId: u.invoiceId, amount: u.amount }));
+  const allCreditApps = [...creditApps, ...paymentCreditApps];
 
   const appliedTotal = applications.reduce((s, a) => s + Number(a.amountApplied), 0);
   const discountTotal = applications.reduce((s, a) => s + Number(a.discountAmount ?? 0), 0);
-  const creditTotal = creditApps.reduce((s, c) => s + Number(c.amount), 0);
+  const creditTotal = allCreditApps.reduce((s, c) => s + Number(c.amount), 0);
   const anyDiscount = discountTotal > 0;
 
   /** "Pay in full": fill cash for every invoice up to its balance (after discount/credits). */
@@ -287,7 +294,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     const next: Record<string, string> = {};
     let left = Number(amount) || 0;
     for (const inv of invoices) {
-      const credit = creditApps.filter((c) => c.invoiceId === inv.id).reduce((s, c) => s + Number(c.amount), 0);
+      const credit = allCreditApps.filter((c) => c.invoiceId === inv.id).reduce((s, c) => s + Number(c.amount), 0);
       const due = Math.max(0, Number(inv.balanceDue) - Number(discountAmounts[inv.id] || 0) - credit);
       const take = amount ? Math.min(due, left) : due;
       if (take > 0) next[inv.id] = take.toFixed(2);
@@ -313,7 +320,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     for (const inv of invoices) {
       const cash = Number(applicationAmounts[inv.id] || 0);
       const disc = Number(discountAmounts[inv.id] || 0);
-      const cred = creditApps.filter((c) => c.invoiceId === inv.id).reduce((s, c) => s + Number(c.amount), 0);
+      const cred = allCreditApps.filter((c) => c.invoiceId === inv.id).reduce((s, c) => s + Number(c.amount), 0);
       if (cash + disc + cred > Number(inv.balanceDue) + 0.005) {
         toast(`Invoice #${inv.invoiceNumber ?? ''}: cash, discount and credits add up to more than it owes.`, 'danger');
         return;
@@ -331,6 +338,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       discountAccountId: anyDiscount && discountAccountId ? discountAccountId : null,
       applications,
       credits: creditApps,
+      ...(editing ? {} : { paymentCredits: paymentCreditApps }),
     };
     setSaving(true);
     try {
@@ -465,7 +473,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                       <Th>Invoice</Th>
                       <Th>Date</Th>
                       <Th numeric>Balance Due</Th>
-                      <Th numeric>Early-pay discount</Th>
+                      <Th numeric>Early-pay discount <Help term="early-payment-discount" side="bottom" /></Th>
                       <Th numeric>Payment</Th>
                     </tr>
                   </thead>
@@ -677,7 +685,7 @@ function BouncedCheckModal({
         <p className="text-navy/70">
           The bank returned the <strong>{formatCurrency(payment?.amount ?? '0')}</strong> payment from{' '}
           <strong>{customerName}</strong>. We&apos;ll take the money back out of your bank account and
-          reopen the invoices it paid, so the customer owes them again.
+          reopen the invoices it paid, so the customer owes them again. <Help term="bounced-check" side="bottom" />
         </p>
         <div>
           <Label htmlFor="nsf-date">Date the bank returned it</Label>

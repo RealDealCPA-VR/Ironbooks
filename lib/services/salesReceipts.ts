@@ -221,12 +221,14 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
   let depositAccountId: string;
   if (input.depositAccountId) {
     const [acct] = await ctx.db
-      .select({ id: accounts.id, type: accounts.type })
+      .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.depositAccountId)));
     if (!acct) throw notFound('Deposit account');
-    if (acct.type !== 'asset') {
-      throw validation('Deposit account must be an asset (bank or Undeposited Funds) account.');
+    // Same rule as Receive Payments: A/R and Inventory are subledger control accounts,
+    // so money can never be "deposited" into them (A/R would stop matching open invoices).
+    if (acct.type !== 'asset' || acct.subtype === 'accounts_receivable' || acct.subtype === 'inventory') {
+      throw validation('Deposit account must be a bank account or Undeposited Funds.');
     }
     depositAccountId = acct.id;
   } else {
@@ -297,8 +299,10 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
 
   for (let i = 0; i < pricedLines.length; i++) {
     const l = pricedLines[i];
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
 
@@ -332,8 +336,8 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
       itemId: l.itemId ?? null,
       accountId: resolvedAccountId,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       taxable,
       taxRateId: l.taxRateId ?? null,

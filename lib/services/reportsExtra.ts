@@ -3,9 +3,10 @@
  * customer/vendor summary views. None of these touch the GL; they are pure
  * read-only projections over the invoices, bills, and journal_entry_lines tables.
  */
-import { and, asc, eq, gte, inArray, isNotNull, lte, ne, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, gte, inArray, isNotNull, lte, ne, sql } from 'drizzle-orm';
 import {
   accounts,
+  bouncedChecks,
   billLines,
   billPaymentApplications,
   billPayments,
@@ -95,6 +96,33 @@ function ms_to_days(ms: number): number {
   return Math.floor(ms / (1000 * 60 * 60 * 24));
 }
 
+/**
+ * wave2 sales (F2): a bounced check deletes its payment's application rows and keeps a
+ * snapshot on the bounced_checks record. As of a date ON/AFTER the payment but BEFORE the
+ * bounce, that payment still paid those invoices — add the snapshot back so past aging
+ * does not change after the fact.
+ */
+async function addBouncedApplicationsAsOf(ctx: ServiceContext, upTo: Date, map: Map<string, string>) {
+  const rows = await ctx.db
+    .select({ applications: bouncedChecks.applications })
+    .from(bouncedChecks)
+    .innerJoin(paymentsReceived, eq(bouncedChecks.paymentId, paymentsReceived.id))
+    .where(
+      and(
+        eq(bouncedChecks.companyId, ctx.companyId),
+        lte(paymentsReceived.date, upTo),
+        gt(bouncedChecks.date, upTo),
+      ),
+    );
+  for (const r of rows) {
+    for (const a of r.applications ?? []) {
+      if (!a.invoiceId) continue;
+      const add = Money.of(a.amountApplied ?? 0).plus(Money.of(a.discountAmount ?? 0));
+      map.set(a.invoiceId, toAmountString(Money.of(map.get(a.invoiceId) ?? 0).plus(add)));
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // A/R Aging
 // ---------------------------------------------------------------------------
@@ -154,7 +182,9 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
       .where(and(...conds))
       .groupBy(paymentApplications.invoiceId);
-    return new Map(appRows.map((r) => [r.invoiceId, r.applied]));
+    const map = new Map(appRows.map((r) => [r.invoiceId, r.applied]));
+    if (upTo) await addBouncedApplicationsAsOf(ctx, upTo, map);
+    return map;
   }
 
   const [appliedAsOf, appliedAllTime] = await Promise.all([
@@ -796,7 +826,9 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
       .where(and(...conds))
       .groupBy(paymentApplications.invoiceId);
-    return new Map(appRows.map((r) => [r.invoiceId, r.applied]));
+    const map = new Map(appRows.map((r) => [r.invoiceId, r.applied]));
+    if (upTo) await addBouncedApplicationsAsOf(ctx, upTo, map);
+    return map;
   }
 
   const [appliedAsOf, appliedAllTime] = await Promise.all([

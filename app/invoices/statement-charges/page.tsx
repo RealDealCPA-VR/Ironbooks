@@ -178,7 +178,7 @@ export default function StatementChargesPage() {
       />
       <Card className="p-4 mb-4 space-y-3">
         <p className="text-sm text-navy/60">
-          A statement charge adds an amount to what a customer owes <Help term="ar" /> without sending an
+          A statement charge <Help term="statement-charge" /> adds an amount to what a customer owes <Help term="ar" /> without sending an
           invoice. It appears on their next statement and can be paid in Receive Payments.
         </p>
         <div className="grid grid-cols-1 sm:grid-cols-6 gap-3">

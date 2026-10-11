@@ -16,7 +16,7 @@
  * Read-only except the notes and the batch actions (which go through the normal services, so
  * posting, permissions and the audit trail behave exactly as when done one at a time).
  */
-import { and, asc, desc, eq, gte, inArray, isNull, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import {
   collectionNotes,
   customers,
@@ -170,12 +170,15 @@ export async function incomeTracker(
   }
 
   // --- Paid in the last 30 days ---
+  // The 30 days up to and including asOf (nothing received after asOf counts).
   const since = new Date(today.getTime() - 30 * DAY_MS);
+  const until = new Date(today.getTime() + DAY_MS);
   const payConds = [
     eq(paymentsReceived.companyId, ctx.companyId),
     isNull(paymentsReceived.voidedAt),
     isNull(paymentsReceived.bouncedAt),
     gte(paymentsReceived.date, since),
+    lt(paymentsReceived.date, until),
   ];
   if (custFilter) payConds.push(eq(paymentsReceived.customerId, custFilter));
   for (const p of await ctx.db
@@ -189,7 +192,7 @@ export async function incomeTracker(
       status: p.method, daysOverdue: null,
     });
   }
-  const srConds = [eq(salesReceipts.companyId, ctx.companyId), ne(salesReceipts.status, 'void'), gte(salesReceipts.date, since)];
+  const srConds = [eq(salesReceipts.companyId, ctx.companyId), ne(salesReceipts.status, 'void'), gte(salesReceipts.date, since), lt(salesReceipts.date, until)];
   if (custFilter) srConds.push(eq(salesReceipts.customerId, custFilter));
   for (const r of await ctx.db
     .select({ id: salesReceipts.id, customerId: salesReceipts.customerId, num: salesReceipts.receiptNumber, date: salesReceipts.date, total: salesReceipts.total, method: salesReceipts.method })

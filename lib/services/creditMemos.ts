@@ -274,8 +274,10 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
 
   for (let i = 0; i < input.lines.length; i++) {
     const l = input.lines[i];
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
 
@@ -303,8 +305,8 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
       itemId: l.itemId ?? null,
       accountId: resolvedAccountId,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       taxable,
       restock: l.restock !== false, // default true (returned to stock)
@@ -669,6 +671,9 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
   if (!invoice) throw notFound('Invoice');
   if (invoice.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot apply credit to a voided invoice.');
+  }
+  if (invoice.status === 'draft') {
+    throw new ServiceError('VALIDATION', 'This invoice is still a draft. Post it before applying a credit to it.');
   }
   if (invoice.customerId !== memo.customerId) {
     throw new ServiceError(

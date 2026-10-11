@@ -117,8 +117,10 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
 
   for (let i = 0; i < pricedLines.length; i++) {
     const l = pricedLines[i];
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
 
@@ -128,8 +130,8 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
     computedLines.push({
       itemId: l.itemId ?? null,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       lineOrder: i,
       pricing: l.pricing,

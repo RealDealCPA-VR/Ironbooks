@@ -568,6 +568,93 @@ describe('wave2 sales', () => {
     await expect(addCollectionNote(ctx, { customerId: custB, note: '   ' })).rejects.toMatchObject({ code: 'VALIDATION' });
   });
 
+  // ---------------------------------------------------------------- C4 earlier unapplied payments
+  it('applies an earlier unapplied payment inside Receive Payments, with or without new money', async () => {
+    const [c] = await db.insert(customers).values({ companyId: ctx.companyId, displayName: 'Overpayer' }).returning();
+    const [other] = await db.insert(customers).values({ companyId: ctx.companyId, displayName: 'Someone Else' }).returning();
+    const i1 = await newInvoice(c.id, 100, '2026-06-01');
+    const i2 = await newInvoice(c.id, 50, '2026-06-02');
+    // Overpay i1 by 40 -> 40 left as customer credit.
+    const over = await receivePayment(ctx, {
+      customerId: c.id, date: new Date('2026-06-05'), method: 'check', amount: '140',
+      applications: [{ invoiceId: i1.id, amountApplied: '100' }],
+    });
+    expect(over.payment.unapplied).toBe('40.00');
+    expect((await listAvailableCredits(ctx, c.id)).some((x) => x.kind === 'payment' && x.id === over.payment.id)).toBe(true);
+    await assertBooks();
+
+    // Cannot be used for another customer, nor more than is left.
+    const iOther = await newInvoice(other.id, 30, '2026-06-02');
+    await expect(
+      receivePayment(ctx, { customerId: other.id, date: new Date('2026-06-06'), method: 'cash', amount: '0', applications: [],
+        paymentCredits: [{ paymentId: over.payment.id, invoiceId: iOther.id, amount: '10' }] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(
+      receivePayment(ctx, { customerId: c.id, date: new Date('2026-06-06'), method: 'cash', amount: '0', applications: [],
+        paymentCredits: [{ paymentId: over.payment.id, invoiceId: i2.id, amount: '41' }] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    // Earlier credit + new cash together can't exceed the invoice balance (whole thing rolls back).
+    await expect(
+      receivePayment(ctx, { customerId: c.id, date: new Date('2026-06-06'), method: 'cash', amount: '20',
+        applications: [{ invoiceId: i2.id, amountApplied: '20' }],
+        paymentCredits: [{ paymentId: over.payment.id, invoiceId: i2.id, amount: '40' }] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect((await getPayment(ctx, over.payment.id)).unapplied).toBe('40.00');
+    expect((await getInvoice(ctx, i2.id)).balanceDue).toBe('50.00');
+    await assertBooks();
+
+    // 30 of the earlier credit + 20 new cash pays i2 off.
+    const jeBefore = (await db.select().from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))).length;
+    const mixed = await receivePayment(ctx, {
+      customerId: c.id, date: new Date('2026-06-07'), method: 'cash', amount: '20',
+      applications: [{ invoiceId: i2.id, amountApplied: '20' }],
+      paymentCredits: [{ paymentId: over.payment.id, invoiceId: i2.id, amount: '30' }],
+    });
+    expect(mixed.payment.id).not.toBe(over.payment.id);
+    expect((await getInvoice(ctx, i2.id)).balanceDue).toBe('0.00');
+    expect((await getPayment(ctx, over.payment.id)).unapplied).toBe('10.00');
+    // Only the new 20 of cash posts a journal entry.
+    expect((await db.select().from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))).length).toBe(jeBefore + 1);
+    await assertBooks();
+
+    // Only earlier credit (no new money): no new payment is created.
+    const i3 = await newInvoice(c.id, 10, '2026-06-08');
+    const countBefore = (await db.select().from(paymentsReceived).where(eq(paymentsReceived.customerId, c.id))).length;
+    const onlyCredit = await receivePayment(ctx, {
+      customerId: c.id, date: new Date('2026-06-09'), method: 'other', amount: '0', applications: [],
+      paymentCredits: [{ paymentId: over.payment.id, invoiceId: i3.id, amount: '10' }],
+    });
+    expect(onlyCredit.entry).toBeNull();
+    expect(onlyCredit.payment.id).toBe(over.payment.id);
+    expect(onlyCredit.payment.unapplied).toBe('0.00');
+    expect((await db.select().from(paymentsReceived).where(eq(paymentsReceived.customerId, c.id))).length).toBe(countBefore);
+    expect((await getInvoice(ctx, i3.id)).status).toBe('paid');
+    await assertBooks();
+
+    // Editing a payment can't pull in earlier payments.
+    await expect(
+      updatePayment(ctx, mixed.payment.id, { customerId: c.id, date: new Date('2026-06-07'), method: 'cash', amount: '20',
+        applications: [{ invoiceId: i2.id, amountApplied: '20' }],
+        paymentCredits: [{ paymentId: over.payment.id, invoiceId: i2.id, amount: '1' }] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
+  // ---------------------------------------------------------------- line precision
+  it('keeps 4-decimal quantities and rates so stored lines re-price exactly', async () => {
+    const est = await createEstimate(ctx, {
+      customerId: custB, date: new Date('2026-06-10'),
+      lines: [{ description: 'Fractional', quantity: '0.125', rate: '8' }, { description: 'Sub-cent', quantity: 3, rate: '33.335' }],
+    });
+    expect(est.total).toBe('101.01');
+    const inv = await convertEstimate(ctx, est.id);
+    const full = await getInvoice(ctx, inv.id);
+    expect(full.total).toBe('101.01');
+    for (const l of full.lines) {
+      expect(Money.round2(Money.mul(l.quantity, l.rate)).toFixed(2)).toBe(Money.of(l.amount).toFixed(2));
+    }
+    await assertBooks();
+  });
+
   // ---------------------------------------------------------------- C2 route mapping
   it('maps credit-limit warnings to code CREDIT_LIMIT and FORBIDDEN to 403', async () => {
     const warn = routeErrorWithWarnings(

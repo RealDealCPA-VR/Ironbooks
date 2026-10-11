@@ -41,6 +41,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertPeriodOpen } from './fiscalPeriods';
 import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
 
@@ -103,6 +104,18 @@ export interface ReceivePaymentInput {
    * Defaults to 1 (base currency).
    */
   exchangeRate?: string | number | null;
+  /**
+   * wave2 sales (C4): earlier unapplied payments (customer credit left over from a previous
+   * overpayment) applied to invoices from inside Receive Payments. New payments only.
+   */
+  paymentCredits?: PaymentCreditFromPaymentInput[] | null;
+}
+
+export interface PaymentCreditFromPaymentInput {
+  /** The earlier payment that still has an unapplied balance. */
+  paymentId: string;
+  invoiceId: string;
+  amount: string | number;
 }
 
 // ---- Helpers ----------------------------------------------------------------
@@ -340,7 +353,49 @@ export async function listAvailableCredits(ctx: ServiceContext, customerId: stri
  * balance due.
  */
 export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentInput) {
-  return inTransaction(ctx, (tx) => postPayment(tx, input, null));
+  return inTransaction(ctx, async (tx) => {
+    const paymentCredits = input.paymentCredits ?? [];
+    if (paymentCredits.length === 0) return postPayment(tx, input, null);
+
+    // C4: apply earlier unapplied payments first (no new GL — that money already credited A/R
+    // when it was received). postPayment then re-reads invoice balances, so cash + discounts +
+    // credits + earlier payments together can never exceed what an invoice owes.
+    const byPayment = new Map<string, Array<{ invoiceId: string; amountApplied: string }>>();
+    for (const pc of paymentCredits) {
+      const amt = Money.round2(pc.amount);
+      if (!amt.greaterThan(0)) throw validation('Each earlier payment used must be greater than zero.');
+      const list = byPayment.get(pc.paymentId) ?? [];
+      const same = list.find((l) => l.invoiceId === pc.invoiceId);
+      if (same) same.amountApplied = toAmountString(Money.of(same.amountApplied).plus(amt));
+      else list.push({ invoiceId: pc.invoiceId, amountApplied: toAmountString(amt) });
+      byPayment.set(pc.paymentId, list);
+    }
+    let lastApplied: Awaited<ReturnType<typeof applyPayment>> | null = null;
+    for (const [paymentId, applications] of byPayment) {
+      const [earlier] = await tx.db
+        .select({ customerId: paymentsReceived.customerId, bouncedAt: paymentsReceived.bouncedAt })
+        .from(paymentsReceived)
+        .where(and(eq(paymentsReceived.id, paymentId), eq(paymentsReceived.companyId, tx.companyId)));
+      if (!earlier) throw notFound('Earlier payment');
+      if (earlier.customerId !== input.customerId) {
+        throw validation('An earlier payment you tried to use belongs to a different customer.');
+      }
+      if (earlier.bouncedAt) throw validation('An earlier payment you tried to use bounced, so it has no credit left.');
+      lastApplied = await applyPayment(tx, { paymentId, applications });
+    }
+
+    const hasNewMoney =
+      Money.round2(input.amount).greaterThan(0) ||
+      input.applications.length > 0 ||
+      (input.credits ?? []).length > 0;
+    if (hasNewMoney) return postPayment(tx, { ...input, paymentCredits: null }, null);
+    // Only earlier payments were used: no new payment is recorded (as in QuickBooks).
+    const [payment] = await tx.db
+      .select()
+      .from(paymentsReceived)
+      .where(eq(paymentsReceived.id, lastApplied!.id));
+    return { payment, entry: null };
+  });
 }
 
 /**
@@ -440,6 +495,11 @@ async function postPayment(
     }
     if (inv.status === 'void') {
       throw validation(`Invoice ${invoiceId} is voided and cannot receive payments.`);
+    }
+    if (inv.status === 'draft') {
+      // A draft (pending) invoice has not been posted to A/R yet, so paying it would take
+      // money off A/R that was never put there.
+      throw validation(`Invoice #${inv.invoiceNumber} is still a draft. Post it before receiving a payment against it.`);
     }
     return inv;
   };
@@ -558,6 +618,10 @@ async function postPayment(
   } else if (fxAccountId && fxDiff.lessThan(0)) {
     postingLines.push({ accountId: fxAccountId, debit: toAmountString(Money.abs(fxDiff)), memo: 'Realized exchange loss' });
   }
+
+  // A payment that only applies credits posts no journal entry, so the closing-date check
+  // inside postJournalEntry never runs. Check it here so it cannot be dated in a closed period.
+  if (postingLines.length < 2) await assertPeriodOpen(tx, input.date);
 
   const entry =
     postingLines.length >= 2
@@ -800,7 +864,7 @@ async function assertPaymentReversible(
  */
 async function reversePaymentEffects(
   tx: ServiceContext,
-  payment: { id: string; postedEntryId: string | null },
+  payment: { id: string; postedEntryId: string | null; date: Date },
 ) {
   const applications = await tx.db
     .select()
@@ -810,6 +874,9 @@ async function reversePaymentEffects(
   // 1. Reverse the GL entry (includes any FX gain/loss and discount lines posted with it).
   if (payment.postedEntryId) {
     await voidJournalEntry(tx, payment.postedEntryId);
+  } else {
+    // Credits-only payment: no entry to void, so check the closing date here.
+    await assertPeriodOpen(tx, payment.date);
   }
   // FX plugs posted by later apply/unapply of this payment.
   const fxEntries = await tx.db
@@ -914,6 +981,9 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
   if (!payment) throw notFound('Payment');
   if (payment.voidedAt) throw new ServiceError('CONFLICT', 'Cannot edit a voided payment.');
   await assertPaymentReversible(ctx, payment, 'edited');
+  if ((input.paymentCredits ?? []).length > 0) {
+    throw validation('Earlier payments can only be used when receiving a new payment, not while editing one.');
+  }
 
   return inTransaction(ctx, async (tx) => {
     const oldCredits = await tx.db
@@ -1006,7 +1076,7 @@ export async function recordBouncedCheck(ctx: ServiceContext, input: RecordBounc
   // Which bank did the money reach? Directly, or through a (non-void) deposit.
   const ufId = await getUndepositedFundsId(ctx).catch(() => null);
   const [dep] = await ctx.db
-    .select({ bankAccountId: deposits.depositAccountId })
+    .select({ bankAccountId: deposits.depositAccountId, depositDate: deposits.date })
     .from(depositLines)
     .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
     .where(and(eq(depositLines.paymentId, payment.id), isNull(deposits.voidedAt)))
@@ -1030,6 +1100,14 @@ export async function recordBouncedCheck(ctx: ServiceContext, input: RecordBounc
 
   const arAccountId = await getArAccountId(ctx);
   const date = input.date ?? new Date();
+  // A check cannot come back before it was received (or before the deposit that carried it).
+  const day = (d: Date) => d.toISOString().slice(0, 10);
+  if (day(date) < day(payment.date)) {
+    throw validation(`The bounce date can't be before the payment date (${day(payment.date)}).`);
+  }
+  if (dep?.depositDate && day(date) < day(dep.depositDate)) {
+    throw validation(`The bounce date can't be before the check was deposited (${day(dep.depositDate)}).`);
+  }
 
   return inTransaction(ctx, async (tx) => {
     const applications = await tx.db
@@ -1345,6 +1423,9 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
     }
     if (inv.status === 'void') {
       throw validation(`Invoice ${app.invoiceId} is voided and cannot receive payments.`);
+    }
+    if (inv.status === 'draft') {
+      throw validation('That invoice is still a draft. Post it before applying a payment to it.');
     }
     if ((inv.currency ?? null) !== (payment.currency ?? null)) {
       throw validation(
