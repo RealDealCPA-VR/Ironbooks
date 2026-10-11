@@ -13,6 +13,7 @@ import {
   Layers, ShieldCheck, Network, Landmark, FileClock, Paperclip, BadgeCheck,
   ListChecks, GitMerge, FileX, Clock, Timer, Boxes, Wallet, Percent, Combine,
   GitCompareArrows, CalendarRange, PackageSearch, Scale, BadgePercent, Car, HardDrive,
+  ScrollText,
 } from 'lucide-react';
 
 export interface NavLink {
@@ -110,6 +111,7 @@ export const navGroups: NavGroup[] = [
     heading: 'Admin',
     links: [
       { icon: FileClock, label: 'Audit Trail', path: '/audit-trail' },
+      { icon: ScrollText, label: 'Transaction Log', path: '/transaction-log' },
       { icon: Paperclip, label: 'Attachments', path: '/attachments' },
       { icon: BadgeCheck, label: 'Data Integrity', path: '/integrity' },
       { icon: GitMerge, label: 'Merge Records', path: '/merge' },

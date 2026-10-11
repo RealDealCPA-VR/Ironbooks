@@ -29,6 +29,7 @@ import {
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
+import { logTransaction, resetTransactionLogCache } from './transactionLog';
 
 /** Name of the manifest entry embedded at the root of every .bka archive. */
 export const BACKUP_MANIFEST_ENTRY = 'bookkeeper-manifest.json';
@@ -316,6 +317,8 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
       if (preRestoreDir) fs.renameSync(preRestoreDir, dir);
       throw err;
     }
+    // The running transaction log came back with the restored files — drop cached chain state.
+    resetTransactionLogCache(dir);
     if (preRestoreDir) {
       // Best-effort cleanup of the safety copy; a leftover dir is harmless.
       try {
@@ -744,6 +747,21 @@ export async function restoreCompanyBackup(
       entityType: 'company_restore',
       entityId: company.id,
       newValues: { restoredFrom: data.company.name, tableCounts },
+    });
+    // Running transaction log: one bulk record covering every restored posted entry, so
+    // verifyTransactionLog can account for them.
+    const journalEntryIds = (data.tables.journalEntries ?? [])
+      .filter((r) => r.status === 'posted' && typeof r.id === 'string')
+      .map((r) => idMap.get(r.id as string)!)
+      .filter(Boolean);
+    await logTransaction(tx as unknown as DB, {
+      companyId: company.id,
+      userId: opts.ownerId,
+      action: 'create',
+      entityType: 'company_restore',
+      entityId: company.id,
+      summary: `Restored company "${name}" from a company backup of "${data.company.name}" (${journalEntryIds.length} posted journal entries)`,
+      data: { new: { restoredFrom: data.company.name, tableCounts }, journalEntryIds },
     });
 
     return { companyId: company.id, name, tableCounts };

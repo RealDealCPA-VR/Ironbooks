@@ -7,6 +7,12 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   openFile: (filters) => ipcRenderer.invoke('dialog:openFile', filters),
   /** Save content to a user-chosen path; returns the path or null. */
   saveFile: (opts) => ipcRenderer.invoke('dialog:saveFile', opts),
+  /** Save binary data (ArrayBuffer) to a user-chosen path; returns the path or null. */
+  saveBytes: (opts) => ipcRenderer.invoke('file:saveBytes', opts),
+  /** Portable Company File (.bkp): open/restore flow runs in the main process. */
+  portable: {
+    open: () => ipcRenderer.invoke('portable:open'),
+  },
   /** Active company data directory. */
   dataDir: () => ipcRenderer.invoke('app:dataDir'),
   /** Subscribe to main->renderer messages (menu actions, navigation). Returns an unsubscribe. */

@@ -127,6 +127,13 @@
       "when": 1781100017000,
       "tag": "0017_team_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1781100018000,
+      "tag": "0018_team_companyfile",
+      "breakpoints": true
     }
   ]
 }

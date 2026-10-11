@@ -9,6 +9,7 @@ import { users } from '@/lib/db/schema';
 import { createCompany } from '@/lib/services/company';
 import { hashPassword, createSessionToken, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE } from '@/lib/context';
+import { logTransaction } from '@/lib/services/transactionLog';
 
 export async function POST(req: NextRequest) {
   const { name, email, password, companyName } = await req.json();
@@ -28,6 +29,14 @@ export async function POST(req: NextRequest) {
     .insert(users)
     .values({ name: name.trim(), email: email.trim().toLowerCase(), passwordHash: await hashPassword(password) })
     .returning();
+  await logTransaction(db, {
+    userId: user.id,
+    action: 'create',
+    entityType: 'user',
+    entityId: user.id,
+    summary: `Created user "${user.name}" (${user.email})`,
+    data: { new: { name: user.name, email: user.email } },
+  });
 
   const company = await createCompany(db, { name: (companyName?.trim() || `${name}'s Company`), ownerId: user.id });
 

@@ -15,6 +15,7 @@ import { PGlite } from '@electric-sql/pglite';
 import path from 'node:path';
 import fs from 'node:fs';
 import * as schema from './schema';
+import { instrumentDb } from './txHooks';
 
 export type DB = PgliteDatabase<typeof schema>;
 
@@ -48,6 +49,8 @@ export function openDb(dataDir?: string): DbHandle {
   fs.mkdirSync(dir, { recursive: true });
   const client = new PGlite(dir);
   const db = drizzle(client, { schema });
+  // Commit tracking for the running transaction log (appends only after COMMIT).
+  instrumentDb(db, dir);
 
   const migrated = (async () => {
     // Only migrate if a migrations folder has been generated. In early dev before

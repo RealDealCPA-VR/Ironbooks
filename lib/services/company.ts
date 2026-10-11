@@ -10,6 +10,7 @@ import { notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import { assertWrite, requireRole } from './rbac';
 import type { DB } from '@/lib/db';
+import { logTransaction } from './transactionLog';
 
 type AccountSeed = { code: string; name: string; type: string; subtype: string };
 
@@ -92,6 +93,27 @@ export async function createCompany(
       })),
     );
   }
+  // Running transaction log: company creation + owner permission (+ seeded chart of accounts).
+  await logTransaction(db, {
+    companyId: company.id,
+    userId: input.ownerId,
+    action: 'create',
+    entityType: 'company',
+    entityId: company.id,
+    summary:
+      `Created company "${company.name}"` +
+      (input.seedCoa !== false ? ` with the default chart of accounts (${DEFAULT_COA.length} accounts)` : ''),
+    data: { new: { name: company.name, seededAccounts: input.seedCoa !== false ? DEFAULT_COA.length : 0 } },
+  });
+  await logTransaction(db, {
+    companyId: company.id,
+    userId: input.ownerId,
+    action: 'create',
+    entityType: 'user_company',
+    entityId: input.ownerId,
+    summary: `Gave the company owner full ('owner') access to "${company.name}"`,
+    data: { new: { role: 'owner' } },
+  });
   return company;
 }
 
@@ -109,6 +131,14 @@ export async function ensureDevCompany(db: DB): Promise<{ companyId: string; use
     .insert(users)
     .values({ email: 'demo@bookkeeper.local', name: 'Demo User', passwordHash: 'dev' })
     .returning();
+  await logTransaction(db, {
+    userId: user.id,
+    action: 'create',
+    entityType: 'user',
+    entityId: user.id,
+    summary: 'Created the first-run user "Demo User"',
+    data: { new: { name: user.name, email: user.email } },
+  });
   const company = await createCompany(db, { name: 'Demo Company', ownerId: user.id });
   return { companyId: company.id, userId: user.id };
 }
