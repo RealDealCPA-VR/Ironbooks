@@ -24,7 +24,7 @@ import {
   toast, toastError,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
-import { api } from '@/lib/client';
+import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
@@ -98,6 +98,8 @@ type InvoiceStatus = 'draft' | 'open' | 'partial' | 'paid' | 'void';
 interface Invoice {
   id: string;
   invoiceNumber: number;
+  /** Alphanumeric number shown to users (e.g. "INV-1001"); null on very old rows. */
+  refNumber?: string | null;
   customerId: string;
   date: string;
   dueDate: string | null;
@@ -370,6 +372,9 @@ function InvoiceModal({
   const [selectedCostIds, setSelectedCostIds] = useState<Set<string>>(new Set());
   const [selectedTimeIds, setSelectedTimeIds] = useState<Set<string>>(new Set());
   const [markupPercent, setMarkupPercent] = useState('');
+  // Invoice # typed by the user (blank = next number); duplicate-number confirm prompt.
+  const [refNumber, setRefNumber] = useState('');
+  const [dupNumberPrompt, setDupNumberPrompt] = useState<string | null>(null);
 
   const itemNameById = new Map(items.map((it) => [it.id, it.name]));
 
@@ -421,6 +426,7 @@ function InvoiceModal({
       setExchangeRate('');
       setMemo('');
       setSaveAsPending(false);
+      setRefNumber('');
       setCustomValues({});
       setLines([{ ...EMPTY_LINE }]);
     }
@@ -648,7 +654,7 @@ function InvoiceModal({
     billablesAmount,
   );
 
-  async function handleSubmit() {
+  async function handleSubmit(allowDuplicateNumber = false) {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter an invoice date.', 'danger'); return; }
 
@@ -720,6 +726,8 @@ function InvoiceModal({
 
     if (!editing) {
       payload.status = saveAsPending ? 'draft' : 'open';
+      if (refNumber.trim()) payload.refNumber = refNumber.trim();
+      if (allowDuplicateNumber) payload.allowDuplicateNumber = true;
     }
 
     if (!editing && hasBillablesSelected && billables) {
@@ -747,6 +755,10 @@ function InvoiceModal({
       onSaved();
       onClose();
     } catch (err: unknown) {
+      if (!editing && err instanceof ApiError && err.status === 409 && /already used/.test(err.message)) {
+        setDupNumberPrompt(err.message);
+        return;
+      }
       toastError(err, 'Failed to save invoice.');
     } finally {
       setSaving(false);
@@ -754,6 +766,7 @@ function InvoiceModal({
   }
 
   return (
+    <>
     <Modal
       size="lg"
       open={open}
@@ -777,7 +790,7 @@ function InvoiceModal({
             </label>
           )}
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSubmit} loading={saving}>
+          <Button onClick={() => handleSubmit()} loading={saving}>
             {editing ? 'Save Changes' : saveAsPending ? 'Save Pending' : 'Create Invoice'}
           </Button>
         </>
@@ -812,6 +825,20 @@ function InvoiceModal({
             ))}
           </Select>
         </div>
+
+        {/* Invoice number (QB "Invoice #"): blank = next number, letters allowed */}
+        {!editing && (
+          <div>
+            <Label htmlFor="inv-number">Invoice #</Label>
+            <Input
+              id="inv-number"
+              value={refNumber}
+              maxLength={50}
+              placeholder="Leave blank for the next number"
+              onChange={(e) => setRefNumber(e.target.value)}
+            />
+          </div>
+        )}
 
         {/* Dates */}
         <div className="grid grid-cols-2 gap-3">
@@ -1226,6 +1253,18 @@ function InvoiceModal({
         </div>
       </div>
     </Modal>
+    <ConfirmDialog
+      open={dupNumberPrompt !== null}
+      title="Number already used"
+      message={dupNumberPrompt ?? undefined}
+      confirmLabel="Keep this number"
+      onClose={() => setDupNumberPrompt(null)}
+      onConfirm={() => {
+        setDupNumberPrompt(null);
+        void handleSubmit(true);
+      }}
+    />
+    </>
   );
 }
 
@@ -1454,7 +1493,7 @@ function InvoicesPageContent() {
                   id={`invoice-row-${inv.id}`}
                   className={inv.id === focusedId ? 'bg-electric/10' : undefined}
                 >
-                  <Td className="font-semibold text-navy">#{inv.invoiceNumber}</Td>
+                  <Td className="font-semibold text-navy">#{inv.refNumber ?? inv.invoiceNumber}</Td>
                   <Td>{customerMap[inv.customerId] ?? '—'}</Td>
                   <Td className="text-navy/70">{formatDate(inv.date)}</Td>
                   <Td className="text-navy/70">{formatDate(inv.dueDate)}</Td>

@@ -186,17 +186,17 @@ UPDATE "sales_orders" SET "ref_number" = "order_number"::text WHERE "ref_number"
 --> statement-breakpoint
 UPDATE "purchase_orders" SET "ref_number" = "po_number"::text WHERE "ref_number" IS NULL;
 --> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "invoices_ref_number_idx" ON "invoices" ("company_id", "ref_number");
+CREATE INDEX IF NOT EXISTS "invoices_ref_number_idx" ON "invoices" ("company_id", lower("ref_number"));
 --> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "estimates_ref_number_idx" ON "estimates" ("company_id", "ref_number");
+CREATE INDEX IF NOT EXISTS "estimates_ref_number_idx" ON "estimates" ("company_id", lower("ref_number"));
 --> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "sales_receipts_ref_number_idx" ON "sales_receipts" ("company_id", "ref_number");
+CREATE INDEX IF NOT EXISTS "sales_receipts_ref_number_idx" ON "sales_receipts" ("company_id", lower("ref_number"));
 --> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "credit_memos_ref_number_idx" ON "credit_memos" ("company_id", "ref_number");
+CREATE INDEX IF NOT EXISTS "credit_memos_ref_number_idx" ON "credit_memos" ("company_id", lower("ref_number"));
 --> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "sales_orders_ref_number_idx" ON "sales_orders" ("company_id", "ref_number");
+CREATE INDEX IF NOT EXISTS "sales_orders_ref_number_idx" ON "sales_orders" ("company_id", lower("ref_number"));
 --> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "purchase_orders_ref_number_idx" ON "purchase_orders" ("company_id", "ref_number");
+CREATE INDEX IF NOT EXISTS "purchase_orders_ref_number_idx" ON "purchase_orders" ("company_id", lower("ref_number"));
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION docnum_fill_ref_number() RETURNS trigger
 LANGUAGE plpgsql AS $$

@@ -3,7 +3,7 @@
  * (lib/services/invoices.ts) and BillableSelection (lib/services/billables.ts).
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zLines, zMoney, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLines, zMoney, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
 
 export const invoiceLineSchema = z.object({

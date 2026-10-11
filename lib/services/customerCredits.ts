@@ -21,7 +21,7 @@ export interface UnappliedCustomerPayment {
   customerId: string;
   date: Date;
   reference: string | null;
-  /** Positive amount of credit the customer holds (reduces what they owe). */
+  /** Positive amount of credit the customer holds, in base currency (reduces what they owe). */
   amount: string;
 }
 
@@ -39,6 +39,7 @@ export async function unappliedCustomerPayments(
       date: paymentsReceived.date,
       reference: paymentsReceived.reference,
       unapplied: paymentsReceived.unapplied,
+      exchangeRate: paymentsReceived.exchangeRate,
     })
     .from(paymentsReceived)
     .where(and(...conds));
@@ -69,7 +70,10 @@ export async function unappliedCustomerPayments(
 
   const out: UnappliedCustomerPayment[] = [];
   for (const r of rows) {
-    const amount = Money.of(r.unapplied).plus(Money.of(laterRefunds.get(r.id) ?? '0'));
+    // `unapplied` is in the payment's currency; A/R was credited at the payment's settlement
+    // rate (payments.ts receivePayment), and refunds debit A/R at that same rate (base amounts).
+    const unappliedBase = Money.round2(Money.mul(Money.of(r.unapplied), Money.of(r.exchangeRate ?? 1)));
+    const amount = unappliedBase.plus(Money.of(laterRefunds.get(r.id) ?? '0'));
     if (!amount.greaterThan(0)) continue;
     out.push({
       paymentId: r.id,

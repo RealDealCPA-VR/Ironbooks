@@ -37,6 +37,8 @@ import {
   updateEntry,
 } from './journal';
 import { apAging, arAging, arAgingDetail, cashFlow } from './reportsExtra';
+import { createInvoice } from './invoices';
+import { createPurchaseOrder } from './purchaseOrders';
 import { customerStatement } from './statements';
 import { trialBalance } from './reports';
 import { verifyIntegrity } from './integrity';
@@ -250,10 +252,8 @@ describe('QuickBooks account types', () => {
       await db.insert(accounts).values({ companyId: ctx.companyId, code: c, name, type, subtype: subtype as never });
     }
     const file = fs.readFileSync(path.resolve(process.cwd(), 'drizzle', '0025_wave2_foundation.sql'), 'utf8');
-    const updates = file
-      .split('--> statement-breakpoint')
-      .map((s) => s.trim())
-      .filter((s) => s.startsWith('UPDATE "accounts"'));
+    // The reclassification runs once, inside the migration's guarded DO block.
+    const updates = (file.match(/UPDATE "accounts" SET "subtype"[\s\S]*?;/g) ?? []).map((s) => s.trim());
     expect(updates.length).toBe(5);
     for (const stmt of updates) await db.execute(sql.raw(stmt));
     const rows = await listAccounts(ctx);
@@ -508,5 +508,37 @@ describe('alphanumeric document numbers', () => {
     const settings = await getDocNumberSettings(ctx);
     expect(settings.find((s) => s.docType === 'estimate')).toMatchObject({ startingNumber: null, nextNumber: 'EST-0101' });
     expect(settings.find((s) => s.docType === 'invoice')!.nextNumber).toBe('1');
+  });
+
+  it('document create paths take a typed number, auto-increment it and warn on duplicates', async () => {
+    const line = [{ quantity: 1, rate: '10.00' }];
+    const a = await createInvoice(ctx, { customerId, date: new Date(2026, 5, 1), refNumber: ' INV-1001 ', lines: line });
+    expect(a.refNumber).toBe('INV-1001');
+    expect(a.invoiceNumber).toBe(1001);
+    // Blank = the last number with its trailing digits + 1 (QB).
+    const b = await createInvoice(ctx, { customerId, date: new Date(2026, 5, 2), lines: line });
+    expect(b.refNumber).toBe('INV-1002');
+    // Duplicate (any case) is refused with a CONFLICT the form turns into a confirm prompt...
+    await expect(
+      createInvoice(ctx, { customerId, date: new Date(2026, 5, 3), refNumber: 'inv-1001', lines: line }),
+    ).rejects.toMatchObject({ code: 'CONFLICT', details: { duplicateDocNumber: true } });
+    // ...and kept once the user confirms.
+    const c = await createInvoice(ctx, {
+      customerId,
+      date: new Date(2026, 5, 3),
+      refNumber: 'INV-1001',
+      allowDuplicateNumber: true,
+      lines: line,
+    });
+    expect(c.refNumber).toBe('INV-1001');
+    // Each document type has its own sequence.
+    const po = await createPurchaseOrder(ctx, {
+      vendorId,
+      date: new Date(2026, 5, 1),
+      refNumber: 'PO-A7',
+      lines: [{ accountId: code['6000'], quantity: '1', rate: '5.00' }],
+    });
+    expect(po.refNumber).toBe('PO-A7');
+    expect(await nextDocNumber(ctx, 'purchase_order')).toBe('PO-A8');
   });
 });

@@ -226,10 +226,30 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
       detail: `A/R balance ${toAmountString(arBalance)} matches open invoice balanceDue ${toAmountString(invoicesDue)}.`,
     };
   }
+  // Journal entries made before names were required can hit A/R with no customer. Those amounts
+  // are in the GL but in no customer's balance; tell the user how to fix it.
+  const [unnamed] = await ctx.db
+    .select({ n: sql<number>`COUNT(*)` })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        eq(journalEntryLines.accountId, arAccount.id),
+        sql`(${journalEntries.sourceRef} = 'manual' OR ${journalEntries.sourceRef} LIKE 'reversal:%')`,
+        sql`${journalEntryLines.entityId} IS NULL`,
+      ),
+    );
+  const unnamedCount = Number(unnamed?.n ?? 0);
+  const hint =
+    unnamedCount > 0
+      ? ` ${unnamedCount} journal entry line(s) on Accounts Receivable have no customer name (entered before names were required). Reverse each one and re-enter it with the customer in the Name column so it shows in that customer's balance.`
+      : '';
   return {
     name,
     ok: false,
-    detail: `A/R cached balance ${toAmountString(arBalance)} != open invoice balanceDue ${toAmountString(invoicesDue)} (diff ${toAmountString(arBalance.minus(invoicesDue))}).`,
+    detail: `A/R cached balance ${toAmountString(arBalance)} != open invoice balanceDue ${toAmountString(invoicesDue)} (diff ${toAmountString(arBalance.minus(invoicesDue))}).${hint}`,
   };
 }
 
