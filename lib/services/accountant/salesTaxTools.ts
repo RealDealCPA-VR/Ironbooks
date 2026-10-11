@@ -28,6 +28,7 @@ import {
   bills,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
+import { controlAccountIds } from './reclassify';
 import {
   type ServiceContext,
   ServiceError,
@@ -36,7 +37,7 @@ import {
   validation,
   writeAudit,
 } from '../_base';
-import { postJournalEntry } from '../posting';
+import { postJournalEntry, voidJournalEntry } from '../posting';
 import { salesTaxActivity, salesTaxLiabilityAccounts, SALES_TAX_PAYABLE_CODE } from './salesTaxLedger';
 
 async function loadAgency(ctx: ServiceContext, agencyId: string) {
@@ -118,6 +119,14 @@ export async function createSalesTaxAdjustment(ctx: ServiceContext, input: Sales
   if (liabAccts.some((a) => a.id === adj.id)) {
     throw validation('Choose an income or expense account for the other side, not a sales tax liability account.');
   }
+  // Sub-ledger control accounts (A/R, A/P, bank, credit card, inventory, payroll liabilities…) can only
+  // move through their own documents — a bare journal line there would break the subledger tie-out.
+  const control = await controlAccountIds(ctx);
+  if (control.has(adj.id)) {
+    throw validation(
+      'Choose an income or expense account for the other side. Accounts like Accounts Receivable, Accounts Payable, bank, credit card, inventory or payroll accounts cannot be used here.',
+    );
+  }
 
   const amount = toAmountString(amt);
   const description =
@@ -164,8 +173,10 @@ export async function createSalesTaxAdjustment(ctx: ServiceContext, input: Sales
 
 export interface MisrecordedTaxLine {
   /** 'liability_unattributed' = on a sales-tax account but not via a sales doc / Pay Sales Tax;
-   *  'expense_payment' = a payment to a tax agency posted to an expense account. */
-  issue: 'liability_unattributed' | 'expense_payment';
+   *  'expense_payment' = a payment to a tax agency posted to an expense account;
+   *  'orphaned_fix' = a "count as tax payment" correction whose original check/bill was voided
+   *  afterwards (entryId = the correcting entry; undo it with undoOrphanedSalesTaxFix). */
+  issue: 'liability_unattributed' | 'expense_payment' | 'orphaned_fix';
   lineId: string;
   entryId: string;
   entryNumber: number;
@@ -307,7 +318,126 @@ export async function findMisrecordedSalesTax(ctx: ServiceContext): Promise<Misr
       }
     }
   }
+  // (c) correcting entries left behind after their original payment was voided.
+  for (const o of await orphanedSalesTaxFixes(ctx)) {
+    out.push({
+      issue: 'orphaned_fix',
+      lineId: o.lineId,
+      entryId: o.entryId,
+      entryNumber: o.entryNumber,
+      date: o.date.toISOString(),
+      description: o.description,
+      sourceRef: o.sourceRef,
+      accountId: o.accountId,
+      accountName: acctName.get(o.accountId) ?? '',
+      amount: o.amount,
+      suggestedAgencyId: o.agencyId,
+      explanation:
+        'The payment this correction was made for has since been voided, so the correction now counts a tax payment that never happened. Undo the correction.',
+    });
+  }
   return out.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+interface OrphanedFix {
+  entryId: string;
+  entryNumber: number;
+  date: Date;
+  description: string;
+  sourceRef: string | null;
+  /** The liability (debit) line of the correcting entry. */
+  lineId: string;
+  accountId: string;
+  amount: string;
+  agencyId: string | null;
+}
+
+/** Posted "fix-line:<lineId>" correcting entries whose original line now sits on a voided entry. */
+export async function orphanedSalesTaxFixes(ctx: ServiceContext): Promise<OrphanedFix[]> {
+  const fixes = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      entryNumber: journalEntries.entryNumber,
+      date: journalEntries.date,
+      description: journalEntries.description,
+      sourceRef: journalEntries.sourceRef,
+      reference: journalEntries.reference,
+    })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        sql`${journalEntries.sourceRef} LIKE 'tax_agency:%'`,
+        sql`${journalEntries.reference} LIKE 'fix-line:%'`,
+      ),
+    );
+  if (fixes.length === 0) return [];
+  const refOf = (f: { reference: string | null }) => (f.reference ?? '').slice('fix-line:'.length);
+  const originalIds = fixes.map(refOf).filter((x) => /^[0-9a-f-]{36}$/i.test(x));
+  if (originalIds.length === 0) return [];
+  const originals = await ctx.db
+    .select({ lineId: journalEntryLines.id, status: journalEntries.status })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntryLines.id, originalIds)));
+  const voided = new Set(originals.filter((o) => o.status === 'void').map((o) => o.lineId));
+  const orphans = fixes.filter((f) => voided.has(refOf(f)));
+  if (orphans.length === 0) return [];
+  const lines = await ctx.db
+    .select({
+      id: journalEntryLines.id,
+      entryId: journalEntryLines.journalEntryId,
+      accountId: journalEntryLines.accountId,
+      debit: journalEntryLines.debit,
+    })
+    .from(journalEntryLines)
+    .where(
+      inArray(
+        journalEntryLines.journalEntryId,
+        orphans.map((o) => o.entryId),
+      ),
+    );
+  return orphans.map((o) => {
+    const dr = lines.find((l) => l.entryId === o.entryId && Money.of(l.debit ?? 0).greaterThan(0));
+    return {
+      entryId: o.entryId,
+      entryNumber: o.entryNumber,
+      date: o.date,
+      description: o.description,
+      sourceRef: o.sourceRef,
+      lineId: dr?.id ?? o.entryId,
+      accountId: dr?.accountId ?? '',
+      amount: toAmountString(Money.of(dr?.debit ?? 0)),
+      agencyId: o.sourceRef ? o.sourceRef.slice('tax_agency:'.length) : null,
+    };
+  });
+}
+
+/** Void one orphaned correcting entry (only entries orphanedSalesTaxFixes reports qualify). */
+export async function undoOrphanedSalesTaxFix(ctx: ServiceContext, entryId: string) {
+  const orphan = (await orphanedSalesTaxFixes(ctx)).find((o) => o.entryId === entryId);
+  if (!orphan) {
+    throw new ServiceError('CONFLICT', 'That correction is still needed because its original payment is not voided.');
+  }
+  return voidJournalEntry(ctx, entryId);
+}
+
+/**
+ * Void every orphaned correcting entry (called after Batch Void). Best effort: an entry in a closed
+ * period is left in place and keeps showing on the Fix Incorrectly Recorded Sales Tax screen.
+ */
+export async function voidOrphanedSalesTaxFixes(ctx: ServiceContext): Promise<number> {
+  let n = 0;
+  for (const o of await orphanedSalesTaxFixes(ctx)) {
+    try {
+      await voidJournalEntry(ctx, o.entryId);
+      n++;
+    } catch {
+      // closed period or reconciled: surfaced on the Fix Incorrectly Recorded Sales Tax screen
+    }
+  }
+  return n;
 }
 
 export interface LinkSalesTaxLineInput {

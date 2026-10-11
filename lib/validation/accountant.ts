@@ -27,6 +27,7 @@ export const fixSalesTaxSchema = z.discriminatedUnion('action', [
   }),
   z.object({ action: z.literal('unlink'), lineId: zUuid }),
   z.object({ action: z.literal('reclassify'), lineId: zUuid, agencyId: zUuid, date: zDate.nullish() }),
+  z.object({ action: z.literal('undo_fix'), entryId: zUuid }),
 ]);
 
 export const reclassifySchema = z

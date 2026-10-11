@@ -34,6 +34,7 @@
 import { and, eq, inArray, lte, sql } from 'drizzle-orm';
 import {
   accounts,
+  auditLogs,
   creditMemoLines,
   creditMemos,
   customers,
@@ -103,6 +104,21 @@ export async function salesTaxLiabilityAccounts(
     .from(taxAgencies)
     .where(eq(taxAgencies.companyId, ctx.companyId));
   const ids = new Set(agencyRows.map((r) => r.id).filter((x): x is string => Boolean(x)));
+  // Accounts an agency USED to point at stay in scope: any liability account debited by a Pay Sales
+  // Tax payment (sourceRef tax_agency:<id>). Otherwise re-pointing an agency at a new account would
+  // drop its earlier payments (and the tax they cleared) out of the report and the GL tie-out.
+  const historic = await ctx.db
+    .selectDistinct({ id: journalEntryLines.accountId })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        sql`${journalEntries.sourceRef} LIKE 'tax_agency:%'`,
+        sql`COALESCE(${journalEntryLines.debit}, 0) > 0`,
+      ),
+    );
+  for (const h of historic) ids.add(h.id);
   const rows = await ctx.db
     .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type, subtype: accounts.subtype })
     .from(accounts)
@@ -543,6 +559,42 @@ async function toCashBasis(ctx: ServiceContext, rows: SalesTaxActivity[]): Promi
         sql`${paymentsReceived.voidedAt} IS NULL`,
       ),
     );
+  // Credit memos applied to an invoice settle it just like a payment (QB cash basis). applyToInvoice
+  // records the edge only in the audit trail (newValues.appliedToInvoice / amountApplied), so read
+  // it from there. The settlement date is the later of the memo date and the invoice date, so the
+  // invoice tax recognised by the credit lands in the same period as the memo's credited tax.
+  const creditRows = await ctx.db
+    .select({ memoId: auditLogs.entityId, newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'credit_memo'),
+        sql`${auditLogs.newValues}->>'appliedToInvoice' IS NOT NULL`,
+      ),
+    );
+  const relevant = creditRows.filter((c) =>
+    invoiceIds.includes(String((c.newValues as { appliedToInvoice?: string } | null)?.appliedToInvoice ?? '')),
+  );
+  if (relevant.length > 0) {
+    const memoIds = [...new Set(relevant.map((c) => c.memoId))];
+    const memoHeads = await ctx.db
+      .select({ id: creditMemos.id, date: creditMemos.date, status: creditMemos.status })
+      .from(creditMemos)
+      .where(and(eq(creditMemos.companyId, ctx.companyId), inArray(creditMemos.id, memoIds)));
+    const memoById = new Map(memoHeads.map((m) => [m.id, m]));
+    const invDate = new Map(
+      rows.filter((r) => r.docType === 'invoice' && r.docId).map((r) => [r.docId!, r.date] as const),
+    );
+    for (const c of relevant) {
+      const nv = c.newValues as { appliedToInvoice: string; amountApplied?: string };
+      const m = memoById.get(c.memoId);
+      if (!m || m.status === 'void') continue;
+      const id = invDate.get(nv.appliedToInvoice);
+      const date = id && id.getTime() > m.date.getTime() ? id : m.date;
+      apps.push({ invoiceId: nv.appliedToInvoice, amount: nv.amountApplied ?? '0', date, paymentId: c.memoId });
+    }
+  }
   const out: SalesTaxActivity[] = [];
   for (const r of rows) {
     if (r.docType !== 'invoice' || !r.docId) {

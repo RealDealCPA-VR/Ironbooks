@@ -8,8 +8,9 @@ import { api } from '@/lib/client';
 import { type NamedOpt, BackToCenter, money, useList } from '../_shared';
 
 interface Issue {
-  issue: 'liability_unattributed' | 'expense_payment';
+  issue: 'liability_unattributed' | 'expense_payment' | 'orphaned_fix';
   lineId: string;
+  entryId: string;
   entryNumber: number;
   date: string;
   description: string;
@@ -101,7 +102,16 @@ export default function FixSalesTaxPage() {
                       </Select>
                     </Td>
                     <Td className="whitespace-nowrap">
-                      {i.issue === 'expense_payment' ? (
+                      {i.issue === 'orphaned_fix' ? (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          loading={busy === i.lineId}
+                          onClick={() => fix(i, { action: 'undo_fix', entryId: i.entryId }, 'Correction undone.')}
+                        >
+                          Undo correction
+                        </Button>
+                      ) : i.issue === 'expense_payment' ? (
                         <Button
                           size="sm"
                           disabled={!agencyId}

@@ -272,7 +272,20 @@ export async function voidedDeletedTransactions(
   const rows: VoidedDeletedRow[] = logs.map((l) => {
     const snap = { ...((l.oldValues ?? {}) as Record<string, unknown>), ...((l.newValues ?? {}) as Record<string, unknown>) };
     const i = info.get(l.entityId);
-    const amountRaw = i?.amount ?? pickStr(snap, ['total', 'amount', 'netPay']);
+    let amountRaw = i?.amount ?? pickStr(snap, ['total', 'amount', 'netPay']);
+    if (amountRaw == null && Array.isArray(snap.lines)) {
+      // Deleted journal entries (older audit rows) carry only their lines — the amount is the debit side.
+      try {
+        amountRaw = toAmountString(
+          (snap.lines as Array<{ debit?: string | number | null }>).reduce(
+            (sum, ln) => sum.plus(Money.of(ln?.debit ?? '0')),
+            Money.zero(),
+          ),
+        );
+      } catch {
+        amountRaw = null;
+      }
+    }
     let amount: string | null = null;
     try {
       amount = amountRaw == null ? null : toAmountString(Money.of(amountRaw));

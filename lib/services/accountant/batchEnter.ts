@@ -26,6 +26,8 @@ import { createCreditMemo } from '../creditMemos';
 import { createBill } from '../bills';
 import { createVendorCredit } from '../vendorCredits';
 import { createManualEntry } from '../journal';
+import { requirePermission } from '../access';
+import type { Area } from '@/lib/permissions/model';
 import {
   BATCH_ENTER_TYPES,
   type BatchEnterRow,
@@ -299,8 +301,23 @@ function msg(err: unknown): string {
   return err instanceof Error ? err.message : 'Could not save this row.';
 }
 
+const BATCH_ENTER_AREA: Record<BatchEnterType, Area> = {
+  check: 'banking',
+  deposit: 'banking',
+  cc_charge: 'banking',
+  cc_credit: 'banking',
+  invoice: 'customers',
+  credit_memo: 'customers',
+  bill: 'vendors',
+  bill_credit: 'vendors',
+  journal: 'accounting',
+};
+
 export async function batchEnterTransactions(ctx: ServiceContext, input: BatchEnterInput): Promise<BatchEnterResult> {
   if (!BATCH_ENTER_TYPES.includes(input.type)) throw validation('Unknown transaction type.');
+  // The route only guarantees accounting:create — each document type also needs its own area's
+  // create right, so Batch Enter can never be a side door around Customers / Vendors / Banking.
+  requirePermission(ctx, BATCH_ENTER_AREA[input.type], 'create');
   if (!Array.isArray(input.rows) || input.rows.length === 0) throw validation('Enter at least one row.');
   if (input.rows.length > 1000) throw validation('Enter at most 1,000 rows per batch.');
   if (input.bankAccountId) {

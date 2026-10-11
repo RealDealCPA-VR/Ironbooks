@@ -20,8 +20,9 @@ import {
   journalEntryLines,
   paychecks,
   paymentsReceived,
+  salesReceipts,
 } from '@/lib/db/schema';
-import { toAmountString } from '@/lib/money';
+import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, writeAudit } from '../_base';
 import { voidInvoice } from '../invoices';
 import { voidSalesReceipt } from '../salesReceipts';
@@ -34,6 +35,25 @@ import { voidDeposit } from '../deposits';
 import { voidVendorCredit } from '../vendorCredits';
 import { voidPaycheck } from '../payroll';
 import { voidJournalEntry } from '../posting';
+import { requirePermission } from '../access';
+import { voidOrphanedSalesTaxFixes } from './salesTaxTools';
+import type { Area } from '@/lib/permissions/model';
+
+/** The area that owns each document type — voiding needs that area's delete right too (the route
+ *  only guarantees accounting:delete). */
+const VOID_AREA: Record<BatchTxnType, Area> = {
+  invoice: 'customers',
+  sales_receipt: 'customers',
+  credit_memo: 'customers',
+  payment: 'customers',
+  bill: 'vendors',
+  bill_payment: 'vendors',
+  vendor_credit: 'vendors',
+  check: 'banking',
+  deposit: 'banking',
+  paycheck: 'payroll',
+  journal: 'accounting',
+};
 
 export const BATCH_TXN_TYPES = [
   'invoice',
@@ -107,7 +127,9 @@ export async function listBatchTransactions(
       description: journalEntries.description,
       sourceRef: journalEntries.sourceRef,
       status: journalEntries.status,
-      amount: sql<string>`COALESCE((SELECT SUM(${journalEntryLines.debit}) FROM ${journalEntryLines} WHERE ${journalEntryLines.journalEntryId} = ${journalEntries.id}), 0)`,
+      // Fully qualified: drizzle renders bare column names here, and an unqualified "id" inside the
+      // subquery would bind to journal_entry_lines.id (always 0).
+      amount: sql<string>`COALESCE((SELECT SUM(jel.debit) FROM journal_entry_lines jel WHERE jel.journal_entry_id = "journal_entries"."id"), 0)`,
     })
     .from(journalEntries)
     .where(and(...conds))
@@ -180,7 +202,28 @@ export async function listBatchTransactions(
       status: e.status === 'draft' ? 'draft' : 'posted',
     });
   }
-  return out;
+  // A document can own several entries that share its sourceRef (a sales receipt's COGS entry reuses
+  // salesreceipt:<id>). List each document once, on the entry the document itself points to.
+  const dupKeys = new Set<string>();
+  const seenKeys = new Set<string>();
+  for (const r of out) (seenKeys.has(r.key) ? dupKeys : seenKeys).add(r.key);
+  if (dupKeys.size === 0) return out;
+  const receiptIds = out.filter((r) => dupKeys.has(r.key) && r.type === 'sales_receipt').map((r) => r.docId);
+  const primary = new Map<string, string>();
+  if (receiptIds.length > 0) {
+    const heads = await ctx.db
+      .select({ id: salesReceipts.id, entryId: salesReceipts.postedEntryId })
+      .from(salesReceipts)
+      .where(and(eq(salesReceipts.companyId, ctx.companyId), inArray(salesReceipts.id, [...new Set(receiptIds)])));
+    for (const h of heads) if (h.entryId) primary.set(`sales_receipt:${h.id}`, h.entryId);
+  }
+  const chosen = new Map<string, BatchTxnRow>();
+  for (const r of out) {
+    const cur = chosen.get(r.key);
+    if (!cur) chosen.set(r.key, r);
+    else if (primary.get(r.key) === r.entryId) chosen.set(r.key, r);
+  }
+  return out.filter((r) => chosen.get(r.key) === r);
 }
 
 export interface BatchVoidResult {
@@ -191,6 +234,7 @@ export interface BatchVoidResult {
 }
 
 async function voidOne(ctx: ServiceContext, type: BatchTxnType, id: string): Promise<'void' | 'delete'> {
+  requirePermission(ctx, VOID_AREA[type] ?? 'accounting', 'delete');
   switch (type) {
     case 'invoice':
       await voidInvoice(ctx, id);
@@ -231,17 +275,27 @@ async function voidOne(ctx: ServiceContext, type: BatchTxnType, id: string): Pro
       if (entry.sourceRef && !['manual', 'tax_agency', 'sales_tax_adj', 'adjusting'].includes(entry.sourceRef.split(':')[0])) {
         throw new ServiceError('CONFLICT', 'This entry belongs to a document — void the document instead.');
       }
+      const srcKind = entry.sourceRef?.split(':')[0];
+      if (srcKind === 'tax_agency' || srcKind === 'sales_tax_adj') requirePermission(ctx, 'sales_tax', 'delete');
       if (entry.status === 'draft') {
         // Never posted → no ledger impact; deleting it is safe (QB "delete").
         await inTransaction(ctx, async (tx) => {
           const lines = await tx.db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, id));
+          const total = lines.reduce((sum, l) => sum.plus(Money.of(l.debit ?? '0')), Money.zero());
           await tx.db.delete(journalEntryLines).where(eq(journalEntryLines.journalEntryId, id));
           await tx.db.delete(journalEntries).where(eq(journalEntries.id, id));
           await writeAudit(tx, {
             action: 'delete',
             entityType: 'journal_entry',
             entityId: id,
-            oldValues: { entryNumber: entry.entryNumber, description: entry.description, status: 'draft', lines },
+            oldValues: {
+              entryNumber: entry.entryNumber,
+              date: entry.date,
+              description: entry.description,
+              status: 'draft',
+              total: toAmountString(total),
+              lines,
+            },
           });
         });
         return 'delete';
@@ -283,6 +337,9 @@ export async function batchVoidTransactions(
   }
   const succeeded = results.filter((r) => r.ok).length;
   if (succeeded > 0) {
+    // A voided check/bill that had been "counted as a tax payment" (Fix Sales Tax) must take its
+    // correcting entry with it, or the agency would show a payment that never happened.
+    await voidOrphanedSalesTaxFixes(ctx);
     await inTransaction(ctx, (tx) =>
       writeAudit(tx, {
         action: 'void',

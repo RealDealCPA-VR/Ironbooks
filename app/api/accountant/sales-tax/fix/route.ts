@@ -1,7 +1,7 @@
 /**
  * Fix Incorrectly Recorded Sales Tax.
  * GET  /api/accountant/sales-tax/fix → issues found
- * POST /api/accountant/sales-tax/fix → { action: 'link' | 'unlink' | 'reclassify', ... }
+ * POST /api/accountant/sales-tax/fix → { action: 'link' | 'unlink' | 'reclassify' | 'undo_fix', ... }
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -10,6 +10,7 @@ import {
   findMisrecordedSalesTax,
   linkSalesTaxLine,
   reclassifySalesTaxPayment,
+  undoOrphanedSalesTaxFix,
   unlinkSalesTaxLine,
 } from '@/lib/services/accountant/salesTaxTools';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -35,6 +36,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(await linkSalesTaxLine(ctx, { lineId: b.lineId, agencyId: b.agencyId, kind: b.kind, note: b.note }));
     }
     if (b.action === 'unlink') return NextResponse.json(await unlinkSalesTaxLine(ctx, b.lineId));
+    if (b.action === 'undo_fix') return NextResponse.json(await undoOrphanedSalesTaxFix(ctx, b.entryId));
     return NextResponse.json(
       await reclassifySalesTaxPayment(ctx, { lineId: b.lineId, agencyId: b.agencyId, date: b.date ?? null }),
       { status: 201 },

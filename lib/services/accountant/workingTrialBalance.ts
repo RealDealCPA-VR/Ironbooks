@@ -10,12 +10,18 @@
  * ("Make adjustments", sourceRef 'adjusting:wtb') and any entry whose sourceRef starts with
  * 'adjusting'. TODO(wave2 foundation): when the foundation package's journal-entry "adjusting"
  * flag lands, also treat entries with that flag as adjustments (isAdjustingSql below).
+ *
+ * Beginning balances follow QB: income and expense accounts start the fiscal year (containing
+ * `from`) at zero — their prior-year history is rolled into Retained Earnings (subtype
+ * retained_earnings / code 3900; a synthetic row if the file has none), exactly like the balance
+ * sheet's prior-years earnings. Balance-sheet accounts carry their full history.
  */
 import { and, eq, gte, lt, lte, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines, workingTbNotes } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { postJournalEntry, type PostingLine } from '../posting';
+import { fiscalYearStartFor } from '../reports';
 
 /** SQL predicate: the entry is an adjusting entry. */
 const isAdjustingSql = sql`COALESCE(${journalEntries.sourceRef}, '') LIKE 'adjusting%'`;
@@ -36,10 +42,14 @@ export interface WtbRow {
 export interface WorkingTrialBalance {
   from: string;
   to: string;
+  /** Start of the fiscal year containing `from` (income/expense beginning balances reset here). */
+  fiscalYearStart: string;
   rows: WtbRow[];
   totals: { beginning: string; transactions: string; adjustments: string; ending: string };
   balanced: boolean;
 }
+
+type Dec = ReturnType<typeof Money.zero>;
 
 export function isoDay(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -68,7 +78,10 @@ export async function workingTrialBalance(
   if (!(range.from instanceof Date) || !(range.to instanceof Date) || range.from > range.to) {
     throw validation('Choose a valid period (from must be on or before to).');
   }
+  const fyStart = await fiscalYearStartFor(ctx, range.from);
   const begin = await sums(ctx, [lt(journalEntries.date, range.from)]);
+  // P&L activity dated before the fiscal year start — closed into Retained Earnings.
+  const priorYears = await sums(ctx, [lt(journalEntries.date, fyStart)]);
   const txns = await sums(ctx, [
     gte(journalEntries.date, range.from),
     lte(journalEntries.date, range.to),
@@ -77,7 +90,14 @@ export async function workingTrialBalance(
   const adj = await sums(ctx, [gte(journalEntries.date, range.from), lte(journalEntries.date, range.to), isAdjustingSql]);
 
   const acctRows = await ctx.db
-    .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type, isActive: accounts.isActive })
+    .select({
+      id: accounts.id,
+      code: accounts.code,
+      name: accounts.name,
+      type: accounts.type,
+      subtype: accounts.subtype,
+      isActive: accounts.isActive,
+    })
     .from(accounts)
     .where(eq(accounts.companyId, ctx.companyId));
   const notes = await ctx.db
@@ -87,21 +107,53 @@ export async function workingTrialBalance(
   const noteBy = new Map(notes.map((n) => [n.accountId, n]));
 
   const z = Money.zero();
+  const isPL = (type: string) => type === 'revenue' || type === 'expense';
+  let priorEarnings = z; // debit-positive: a profit is a negative (credit) amount
+  for (const a of acctRows) if (isPL(a.type)) priorEarnings = priorEarnings.plus(priorYears.get(a.id) ?? z);
+  const reAccount =
+    acctRows.find((a) => a.type === 'equity' && (a.subtype as string | null) === 'retained_earnings') ??
+    acctRows.find((a) => a.type === 'equity' && a.code === '3900');
+
   let tb = z, tt = z, ta = z, te = z;
   const rows: WtbRow[] = [];
+  const pushRow = (row: WtbRow, b: Dec, t: Dec, j: Dec, e: Dec) => {
+    tb = tb.plus(b);
+    tt = tt.plus(t);
+    ta = ta.plus(j);
+    te = te.plus(e);
+    rows.push(row);
+  };
+  if (!reAccount && !priorEarnings.isZero()) {
+    pushRow(
+      {
+        accountId: '',
+        code: '3900',
+        name: 'Retained Earnings (prior years, not yet closed)',
+        type: 'equity',
+        beginning: toAmountString(priorEarnings),
+        transactions: '0.00',
+        adjustments: '0.00',
+        ending: toAmountString(priorEarnings),
+        workpaperRef: null,
+        note: null,
+      },
+      priorEarnings,
+      z,
+      z,
+      priorEarnings,
+    );
+  }
   for (const a of acctRows) {
-    const b = begin.get(a.id) ?? z;
+    let b = begin.get(a.id) ?? z;
+    if (isPL(a.type)) b = b.minus(priorYears.get(a.id) ?? z);
+    if (reAccount && a.id === reAccount.id) b = b.plus(priorEarnings);
     const t = txns.get(a.id) ?? z;
     const j = adj.get(a.id) ?? z;
     const e = b.plus(t).plus(j);
     const n = noteBy.get(a.id);
     if (b.isZero() && t.isZero() && j.isZero() && !n && !a.isActive) continue;
     if (b.isZero() && t.isZero() && j.isZero() && !n) continue;
-    tb = tb.plus(b);
-    tt = tt.plus(t);
-    ta = ta.plus(j);
-    te = te.plus(e);
-    rows.push({
+    pushRow({
       accountId: a.id,
       code: a.code,
       name: a.name,
@@ -112,12 +164,13 @@ export async function workingTrialBalance(
       ending: toAmountString(e),
       workpaperRef: n?.workpaperRef ?? null,
       note: n?.note ?? null,
-    });
+    }, b, t, j, e);
   }
   rows.sort((x, y) => x.code.localeCompare(y.code));
   return {
     from: isoDay(range.from),
     to: isoDay(range.to),
+    fiscalYearStart: isoDay(fyStart),
     rows,
     totals: {
       beginning: toAmountString(tb),

@@ -19,6 +19,11 @@
  *  - when ALL of an entry's lines on the old account are moved, the source document's lines on
  *    that account are re-pointed too (invoice, sales receipt, credit memo, bill, check/expense),
  *    so editing the document later re-posts to the new account instead of undoing the fix.
+ *    KNOWN LIMIT: a partial move (only some of an entry's lines on the old account) leaves the
+ *    document lines alone, and a document line whose account is re-derived from its ITEM on save
+ *    (the item's income/expense account) will follow the item again on the next edit. In both cases
+ *    re-saving the document can undo the reclassification; reclassify again or change the item's
+ *    account. TODO(wave2 sales/purchases): honour an explicit per-line account override on re-save.
  *
  * Class-only changes need no rewrite flag (class is not a guarded ledger column).
  */

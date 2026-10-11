@@ -160,16 +160,22 @@ export default function WorkingTrialBalancePage() {
                   <Td numeric>{money(r.transactions)}</Td>
                   <Td numeric className={Number(r.adjustments) !== 0 ? 'font-semibold text-electric' : undefined}>{money(r.adjustments)}</Td>
                   <Td numeric>{money(r.ending)}</Td>
-                  <Td className="min-w-[110px]">
-                    <Input
-                      aria-label={`Workpaper reference for ${r.name}`}
-                      defaultValue={r.workpaperRef ?? ''}
-                      onBlur={(e) => saveNote(r, { workpaperRef: e.target.value })}
-                    />
-                  </Td>
-                  <Td className="min-w-[220px]">
-                    <Input aria-label={`Notes for ${r.name}`} defaultValue={r.note ?? ''} onBlur={(e) => saveNote(r, { note: e.target.value })} />
-                  </Td>
+                  {r.accountId ? (
+                    <>
+                      <Td className="min-w-[110px]">
+                        <Input
+                          aria-label={`Workpaper reference for ${r.name}`}
+                          defaultValue={r.workpaperRef ?? ''}
+                          onBlur={(e) => saveNote(r, { workpaperRef: e.target.value })}
+                        />
+                      </Td>
+                      <Td className="min-w-[220px]">
+                        <Input aria-label={`Notes for ${r.name}`} defaultValue={r.note ?? ''} onBlur={(e) => saveNote(r, { note: e.target.value })} />
+                      </Td>
+                    </>
+                  ) : (
+                    <Td colSpan={2} className="text-sm text-navy/60">Earlier years&apos; profit or loss, carried into equity.</Td>
+                  )}
                 </Tr>
               ))}
             </tbody>
