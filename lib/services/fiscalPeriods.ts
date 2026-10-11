@@ -66,12 +66,22 @@ export async function reopenPeriod(ctx: ServiceContext, id: string) {
   return row;
 }
 
+/** Result of assertPeriodOpen: set when the closing-date password override was what let it pass. */
+export interface PeriodCheck {
+  /** The company closing date ('YYYY-MM-DD') this request bypassed with the password, else null. */
+  closingDateException: string | null;
+}
+
 /**
  * Throw PERIOD_CLOSED if `date` falls within a closed period for this company, or on/before
  * the company closing date without a valid closing-date password for this request.
  * Called by the posting engine before posting or voiding.
+ *
+ * When the request's closing-date password (ctx.closingDateOverride) is what allows a date on or
+ * before the closing date, the result carries `closingDateException` so the caller can record it
+ * with `recordClosingDateException` inside its transaction (Closing Date Exception report, J11).
  */
-export async function assertPeriodOpen(ctx: ServiceContext, date: Date): Promise<void> {
+export async function assertPeriodOpen(ctx: ServiceContext, date: Date): Promise<PeriodCheck> {
   const closed = await ctx.db
     .select({ id: fiscalPeriods.id })
     .from(fiscalPeriods)
@@ -93,20 +103,55 @@ export async function assertPeriodOpen(ctx: ServiceContext, date: Date): Promise
 
   // Company-level closing date (QB Set Closing Date). A verified closing-date password for
   // this request (ctx.closingDateOverride) bypasses the lock, exactly like QBD's password prompt.
-  if (!ctx.closingDateOverride) {
-    const [company] = await ctx.db
-      .select({ settings: companies.settings })
-      .from(companies)
-      .where(eq(companies.id, ctx.companyId));
-    const closingDate = (company?.settings as Record<string, unknown> | null)?.closingDate;
-    if (typeof closingDate === 'string' && closingDate) {
-      const dateStr = date.toISOString().slice(0, 10);
-      if (dateStr <= closingDate) {
+  const [company] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  const closingDate = (company?.settings as Record<string, unknown> | null)?.closingDate;
+  if (typeof closingDate === 'string' && closingDate) {
+    const dateStr = date.toISOString().slice(0, 10);
+    if (dateStr <= closingDate) {
+      if (!ctx.closingDateOverride) {
         throw new ServiceError(
           'PERIOD_CLOSED',
           `The books are closed through ${closingDate}. Transactions dated on or before the closing date require the closing-date password (or clear the closing date in Settings).`,
         );
       }
+      return { closingDateException: closingDate };
     }
   }
+  return { closingDateException: null };
+}
+
+/**
+ * Audit a closing-date password override (QB Closing Date Exception report). Call inside the
+ * same transaction as the change, after it succeeded, with the result of assertPeriodOpen.
+ * No-op when no exception occurred.
+ */
+export async function recordClosingDateException(
+  ctx: ServiceContext,
+  check: PeriodCheck,
+  info: {
+    entryId: string;
+    operation: 'post' | 'void' | 'reclassify' | string;
+    transactionDate: Date;
+    entryNumber?: number | null;
+    description?: string | null;
+    sourceRef?: string | null;
+  },
+): Promise<void> {
+  if (!check.closingDateException) return;
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'closing_date_exception',
+    entityId: info.entryId,
+    newValues: {
+      operation: info.operation,
+      closingDate: check.closingDateException,
+      transactionDate: info.transactionDate.toISOString().slice(0, 10),
+      entryNumber: info.entryNumber ?? null,
+      description: info.description ?? null,
+      sourceRef: info.sourceRef ?? null,
+    },
+  });
 }

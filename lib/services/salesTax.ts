@@ -77,7 +77,12 @@ export async function getTaxRate(ctx: ServiceContext, id: string) {
   return row;
 }
 
-/** Total sales tax charged on invoices in a date range (liability owed to agencies). */
+/**
+ * Total sales tax charged on invoices in a date range.
+ * @deprecated Invoice headers only (misses sales receipts, credit memos, edits). Use
+ * salesTaxLiabilityReport / salesTaxRevenueSummary in lib/services/accountant/salesTaxLedger.ts,
+ * which read the Sales Tax Payable ledger and tie to it exactly.
+ */
 export async function salesTaxLiability(ctx: ServiceContext, range?: { from?: Date; to?: Date }) {
   const conds = [eq(invoices.companyId, ctx.companyId)];
   if (range?.from) conds.push(sql`${invoices.date} >= ${range.from}`);
@@ -97,6 +102,11 @@ export async function salesTaxLiability(ctx: ServiceContext, range?: { from?: Da
  * tax credited back on live credit memos (credit memos post Dr Sales Tax
  * Payable, reversing the invoice's tax direction). This is the figure that
  * matches the 2200 GL movement once credit memos carry tax.
+ *
+ * @deprecated Not used by the app (wave2 accountant reconciled it): it ignores sales receipts,
+ * per-line rates and agency attribution. The GL-driven engine
+ * (lib/services/accountant/salesTaxLedger.ts → salesTaxLiabilityReport) supersedes it; kept only
+ * for backwards compatibility of existing callers/tests.
  */
 export async function salesTaxLiabilityNet(
   ctx: ServiceContext,

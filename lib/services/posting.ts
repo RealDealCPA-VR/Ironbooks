@@ -30,7 +30,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { assertPeriodOpen } from './fiscalPeriods';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 
 export interface PostingLine {
   accountId: string;
@@ -128,7 +128,7 @@ async function nextEntryNumber(ctx: ServiceContext): Promise<number> {
 /** Create a balanced journal entry. If posted, the DB trigger updates cached account balances. */
 export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEntryInput) {
   assertBalanced(input.lines);
-  await assertPeriodOpen(ctx, input.date); // refuse to post into a closed period
+  const periodCheck = await assertPeriodOpen(ctx, input.date); // refuse to post into a closed period
   const status = input.status ?? 'posted';
 
   // Verify every referenced account belongs to this company and load its type.
@@ -178,6 +178,15 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       entityId: entry.id,
       newValues: { entryNumber, description: input.description, lines: input.lines },
     });
+    // Closing-date password override used → Closing Date Exception report (no-op otherwise).
+    await recordClosingDateException(tx, periodCheck, {
+      entryId: entry.id,
+      operation: 'post',
+      transactionDate: input.date,
+      entryNumber,
+      description: input.description,
+      sourceRef: input.sourceRef ?? null,
+    });
 
     return entry;
   });
@@ -192,7 +201,7 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, tx.companyId)));
     if (!entry) throw notFound('Journal entry');
     if (entry.status === 'void') return entry;
-    await assertPeriodOpen(tx, entry.date); // cannot void an entry in a closed period
+    const periodCheck = await assertPeriodOpen(tx, entry.date); // cannot void an entry in a closed period
 
     const lines = await tx.db
       .select()
@@ -243,6 +252,14 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       oldValues: { status: entry.status },
       newValues: { status: 'void' },
     });
+    await recordClosingDateException(tx, periodCheck, {
+      entryId,
+      operation: 'void',
+      transactionDate: entry.date,
+      entryNumber: entry.entryNumber,
+      description: entry.description,
+      sourceRef: entry.sourceRef,
+    });
     return updated;
   });
 }
@@ -256,12 +273,14 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
  * another company (that is refused unconditionally, since it touches no entry).
  *
  * WHITELIST — only these flows may call it: condense (summarize closed history), account merge
- * (re-point lines between same-type accounts) and company restore (re-insert a backup's ledger).
+ * (re-point lines between same-type accounts), company restore (re-insert a backup's ledger) and
+ * Reclassify Transactions (lib/services/accountant/reclassify.ts: re-point selected posted lines
+ * to another account, each change audited; debits/credits are never altered).
  * Must be called inside a transaction (`SET LOCAL` semantics: it ends with the transaction).
  */
 export async function allowLedgerRewrite(
   ctx: Pick<ServiceContext, 'db'>,
-  reason: 'condense' | 'merge' | 'restore',
+  reason: 'condense' | 'merge' | 'restore' | 'reclassify',
 ): Promise<void> {
   await ctx.db.execute(
     // The txid binds the flag to THIS transaction: the guards ignore it anywhere else, even if a

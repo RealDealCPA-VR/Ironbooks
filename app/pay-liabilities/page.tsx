@@ -13,6 +13,7 @@
  * post one 2300 debit line per item (memo = item name) so they reconcile against
  * the specific tax.
  */
+import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { Landmark, ListChecks, Receipt } from 'lucide-react';
 import {
@@ -48,6 +49,8 @@ interface AgencyLiabilityRow {
   agencyName: string | null;
   liabilityAccountId: string | null;
   collected: string;
+  /** Sales tax adjustments (discounts, penalties…) — signed. */
+  adjusted?: string;
   paid: string;
   balance: string;
 }
@@ -57,6 +60,9 @@ interface AgencyLiabilities {
   totalCollected: string;
   totalPaid: string;
   totalBalance: string;
+  /** Sales tax liability accounts' balance in the books; tiesToGl = the grid matches it. */
+  glBalance?: string;
+  tiesToGl?: boolean;
 }
 
 interface LiabilityItem {
@@ -639,9 +645,20 @@ export default function PayLiabilitiesPage() {
                   </div>
                 </div>
                 <p className="text-xs text-navy/50 mt-2">
-                  Tax collected is allocated to agencies through combined-rate components. Payments
-                  post against the agency&apos;s own liability account when one is set (otherwise 2200).
+                  Tax from invoices, sales receipts and credit memos is split to agencies by each tax
+                  rate (and its combined-rate parts). Payments post against the agency&apos;s own liability
+                  account when one is set (otherwise 2200).
+                  {agencyData?.tiesToGl !== undefined && (
+                    <span className={`ml-1 font-semibold ${agencyData.tiesToGl ? 'text-emerald' : 'text-red-600'}`}>
+                      {agencyData.tiesToGl ? 'Matches your Sales Tax Payable balance.' : 'Does not match Sales Tax Payable — run Fix Incorrectly Recorded Sales Tax.'}
+                    </span>
+                  )}
                 </p>
+                <div className="mt-2 flex flex-wrap gap-4 text-xs">
+                  <Link href="/accountant/sales-tax-adjustment" className="text-electric hover:underline">Adjust sales tax due</Link>
+                  <Link href="/accountant/fix-sales-tax" className="text-electric hover:underline">Fix incorrectly recorded sales tax</Link>
+                  <Link href="/reports/sales-tax" className="text-electric hover:underline">Sales tax liability report</Link>
+                </div>
               </div>
 
               {!agencyData || agencyData.rows.length === 0 ? (
@@ -665,7 +682,7 @@ export default function PayLiabilitiesPage() {
                       <Tr key={row.agencyId ?? '__unassigned__'}>
                         <Td className="font-semibold text-navy">
                           {row.agencyName ?? (
-                            <span className="italic text-navy/50">Unassigned (no agency on rate)</span>
+                            <Link href="/accountant/fix-sales-tax" className="italic text-navy/50 hover:text-electric hover:underline">Not tied to an agency — fix</Link>
                           )}
                           {row.agencyId && !row.liabilityAccountId && (
                             <span className="ml-2 text-[11px] font-normal text-navy/40">

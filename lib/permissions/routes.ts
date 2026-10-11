@@ -301,6 +301,17 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/ai/proposals/[id]': r('accounting', 'POST'),
   '/api/audit-trail': r('reports_financial', 'GET'),
   '/api/audit-trail/[id]': r('reports_financial', 'GET'),
+  // wave2 accountant: Accountant Center tools.
+  '/api/accountant/center': r('accounting', 'GET'),
+  '/api/accountant/reclassify': r('accounting', 'GET POST:modify'),
+  '/api/accountant/write-off': r('customers', 'GET POST'),
+  '/api/accountant/batch-enter': r('accounting', 'POST'),
+  '/api/accountant/batch-void': r('accounting', 'GET POST:delete'),
+  '/api/accountant/working-trial-balance': { GET: { area: 'reports_financial', action: 'view' }, ...r('accounting', 'PUT:modify POST') },
+  '/api/accountant/list-changes': r('accounting', 'GET POST:modify'),
+  '/api/accountant/client-data-review': r('accounting', 'GET POST:modify'),
+  '/api/accountant/closing-date-exceptions': r('closing', 'GET'),
+  '/api/accountant/voided-deleted': r('reports_financial', 'GET'),
 
   // ---- Inventory ----
   '/api/inventory': r('inventory', 'GET POST'),
@@ -336,6 +347,11 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/tax-rates': r('sales_tax', 'GET POST'),
   '/api/tax-rates/[id]/components': r('sales_tax', 'GET PATCH'),
   '/api/pay-liabilities/sales-tax': r('sales_tax', 'GET'),
+  // wave2 accountant: sales tax liability engine, adjustments, fix incorrectly recorded tax.
+  '/api/accountant/sales-tax/liability': r('sales_tax', 'GET'),
+  '/api/accountant/sales-tax/revenue-summary': r('sales_tax', 'GET'),
+  '/api/accountant/sales-tax/adjustments': r('sales_tax', 'POST'),
+  '/api/accountant/sales-tax/fix': r('sales_tax', 'GET POST:modify'),
 
   // ---- Time & mileage ----
   '/api/time-entries': r('time', 'GET POST'),
@@ -487,6 +503,12 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/privacy': 'company',
   '/transaction-log': 'reports_financial',
   '/audit-trail': 'reports_financial',
+  // wave2 accountant
+  '/accountant': 'accounting',
+  '/accountant/write-off': 'customers',
+  '/accountant/working-trial-balance': 'reports_financial',
+  '/accountant/fix-sales-tax': 'sales_tax',
+  '/accountant/sales-tax-adjustment': 'sales_tax',
   '/integrity': 'file_utilities',
   '/backup': 'file_utilities',
   '/qb-import': 'file_utilities',
@@ -530,6 +552,8 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/reports/inventory-valuation': 'reports_inventory',
   '/reports/inventory-sites': 'reports_inventory',
   '/reports/sales-tax': 'sales_tax',
+  '/reports/closing-date-exceptions': 'closing',
+  '/reports/voided-deleted': 'reports_financial',
   '/reports/reconciliation': 'accounting',
 };
 

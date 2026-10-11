@@ -16,7 +16,6 @@ import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   companies,
   customers,
-  invoices,
   journalEntryLines,
   taxAgencies,
   users,
@@ -27,6 +26,7 @@ import { trialBalance } from './reports';
 import { createTaxAgency, createTaxRate } from './salesTax';
 import { setComponents } from './combinedTax';
 import { paySalesTax, salesTaxLiabilityByAgency } from './liabilityPayments';
+import { createInvoice } from './invoices';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-liability-agency');
 let ctx: ServiceContext;
@@ -52,6 +52,7 @@ describe('Pay Sales Tax — per-agency liability tracking', () => {
     const defs: Array<[string, string, string, string]> = [
       ['1000', 'Checking', 'asset', 'checking'],
       ['2200', 'Sales Tax Payable', 'liability', 'long_term_liability'],
+      ['1200', 'Accounts Receivable', 'asset', 'accounts_receivable'],
       ['2210', 'State Sales Tax Payable', 'liability', 'long_term_liability'],
       ['4000', 'Sales', 'revenue', 'sales'],
     ];
@@ -76,23 +77,17 @@ describe('Pay Sales Tax — per-agency liability tracking', () => {
       { name: 'City 2%', agencyId: cityAgencyId, rate: '0.02' },
     ]);
 
-    // One live invoice carrying $80 of tax on the combined rate. The collected
-    // allocation reads invoices directly, so a direct insert is sufficient.
+    // One live invoice carrying $80 of tax on the combined rate, posted through the invoice
+    // service (the liability engine reads the Sales Tax Payable ledger, not invoice headers).
     const [customer] = await db
       .insert(customers)
       .values({ companyId: company.id, displayName: 'Taxed Customer' })
       .returning();
-    await db.insert(invoices).values({
-      companyId: company.id,
+    await createInvoice(ctx, {
       customerId: customer.id,
-      invoiceNumber: 1,
       date: new Date('2026-04-01T12:00:00.000Z'),
-      status: 'open',
       taxRateId: rate.id,
-      subtotal: '1000.00',
-      taxAmount: '80.00',
-      total: '1080.00',
-      balanceDue: '1080.00',
+      lines: [{ description: 'Taxable sale', quantity: 1, rate: '1000.00' }],
     });
   });
 
@@ -169,6 +164,9 @@ describe('Pay Sales Tax — per-agency liability tracking', () => {
     expect(result.totalCollected).toBe('80.00');
     expect(result.totalPaid).toBe('60.00');
     expect(result.totalBalance).toBe('20.00');
+    // 2200 (+80 −20) and the State's own 2210 (−40) together: owed == GL.
+    expect(result.glBalance).toBe('20.00');
+    expect(result.tiesToGl).toBe(true);
   });
 
   it('respects the date range for both collected and paid', async () => {

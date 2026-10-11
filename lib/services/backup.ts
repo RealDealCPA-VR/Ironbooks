@@ -30,6 +30,8 @@ import {
   inventoryBins, inventoryLineDetails, inventoryLots, inventoryMovements, inventorySites,
   inventoryTransferLines, inventoryTransfers, itemReceiptLines, itemReceipts, itemSiteSettings,
   landedCostAllocationLines, landedCostAllocations, pendingBuilds,
+  // wave2 accountant
+  clientReviewTasks, listChangeReviews, salesTaxLineLinks, workingTbNotes,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
@@ -554,6 +556,12 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
     name: 'landedCostAllocationLines', table: landedCostAllocationLines, companyCol: landedCostAllocations.companyId,
     joins: [{ table: landedCostAllocations, on: [landedCostAllocationLines.allocationId, landedCostAllocations.id] }],
   },
+  // ---- wave2 accountant (client_review_snapshots is NOT exported: its balances are keyed by
+  // account id, which restore remaps, so an old snapshot would misreport every account) ----
+  { name: 'salesTaxLineLinks', table: salesTaxLineLinks, joins: [], companyCol: salesTaxLineLinks.companyId },
+  { name: 'workingTbNotes', table: workingTbNotes, joins: [], companyCol: workingTbNotes.companyId },
+  { name: 'listChangeReviews', table: listChangeReviews, joins: [], companyCol: listChangeReviews.companyId },
+  { name: 'clientReviewTasks', table: clientReviewTasks, joins: [], companyCol: clientReviewTasks.companyId },
 ];
 
 /**
