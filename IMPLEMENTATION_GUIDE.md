@@ -53,8 +53,14 @@ npm install -D drizzle-kit
 DATABASE_URL="postgresql://user:password@host/database?sslmode=require"
 NEXTAUTH_URL="http://localhost:3000"
 NEXTAUTH_SECRET="run: openssl rand -base64 32"
-ANTHROPIC_API_KEY="your-key-here"
 ```
+
+AI providers are not configured with environment variables. Each company configures its own
+models under **AI & Automation** (Settings): by default a local model server on this computer,
+your LAN or your Tailscale tailnet (Ollama, LM Studio, vLLM, llama.cpp). Cloud providers
+(Anthropic, OpenAI-compatible APIs) are optional, need an API key entered there (stored
+encrypted in the company file), and are used only when the company opts in to cloud AI on both
+AI & Automation and **Privacy & Network** (data sent to a cloud model is redacted first).
 
 ### 1.3 Push Schema to Database
 ```bash
@@ -484,6 +490,11 @@ export class ErrorDetector {
 ```
 
 ### 4.2 Create LLM Corrector (`lib/llm/corrector.ts`)
+
+> **Historical sketch.** The shipped corrector (`lib/services/llmCorrector.ts`) does not read an
+> API key from the environment: it calls the per-company AI router (`lib/ai/router.ts`), whose
+> providers are configured in AI & Automation (local tailnet models by default) and whose every
+> HTTP call is checked against the network policy (`lib/net/guard.ts`).
 ```typescript
 import Anthropic from '@anthropic-ai/sdk';
 import { db } from '@/lib/db';
@@ -695,8 +706,8 @@ To white-label this application:
 - Check error logs in database
 
 **LLM corrections not working**
-- Verify ANTHROPIC_API_KEY is set
-- Check API quota/limits
+- In AI & Automation, run Test Connection on the provider (local tailnet models are the default)
+- For a cloud provider, check its API key there and that cloud AI is allowed on Privacy & Network
 - Review error logs
 
 ## 📞 Support

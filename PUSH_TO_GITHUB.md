@@ -121,8 +121,8 @@ After pushing, configure these in GitHub settings:
 
 3. **Secrets** (for GitHub Actions):
    - `DATABASE_URL`
-   - `ANTHROPIC_API_KEY`
    - `NEXTAUTH_SECRET`
+   (AI provider keys are not secrets of the build: they are entered per company in AI & Automation.)
 
 ## Next Steps After Pushing
 

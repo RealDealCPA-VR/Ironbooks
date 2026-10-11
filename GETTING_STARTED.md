@@ -57,8 +57,14 @@ Edit `.env.local`:
 DATABASE_URL="your-neon-connection-string"
 NEXTAUTH_URL="http://localhost:3000"
 NEXTAUTH_SECRET="run: openssl rand -base64 32"
-ANTHROPIC_API_KEY="your-anthropic-key"
 ```
+
+AI providers are not configured with environment variables. Each company configures its own
+models under **AI & Automation** (Settings): by default a local model server on this computer,
+your LAN or your Tailscale tailnet (Ollama, LM Studio, vLLM, llama.cpp). Cloud providers
+(Anthropic, OpenAI-compatible APIs) are optional, need an API key entered there (stored
+encrypted in the company file), and are used only when the company opts in to cloud AI on both
+AI & Automation and **Privacy & Network** (data sent to a cloud model is redacted first).
 
 ### Step 4: Initialize Database
 ```bash
@@ -289,7 +295,8 @@ Set in Vercel dashboard:
 - `DATABASE_URL`
 - `NEXTAUTH_URL`
 - `NEXTAUTH_SECRET`
-- `ANTHROPIC_API_KEY`
+
+(No AI key here: AI providers are configured per company in AI & Automation.)
 
 ## 📈 Performance Tips
 
@@ -311,10 +318,11 @@ Set in Vercel dashboard:
 - Check file size limits
 - Review error logs in database
 
-### LLM Not Working
-- Verify `ANTHROPIC_API_KEY`
-- Check API quota
-- Review prompt format
+### AI Not Working
+- Open **AI & Automation** and use **Test Connection** on the configured provider
+- For a local/tailnet model: check the model server is running and reachable (Tailscale up)
+- For a cloud provider: check the API key there and that cloud AI is allowed on **Privacy & Network**
+- The Privacy & Network page lists recent outbound attempts and why any was blocked
 
 ## 📞 Getting Help
 
