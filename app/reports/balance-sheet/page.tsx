@@ -226,7 +226,7 @@ export default async function BalanceSheetPage({
         <div className="max-w-4xl">
           <PageHeader
             title="Balance Sheet — Comparative"
-            icon={Scale}
+            iconNode={<Scale className="text-electric h-8 w-8" />}
             action={
               <Badge tone={comp.balanced ? 'success' : 'danger'}>
                 {comp.balanced ? 'Assets = Liabilities + Equity' : 'OUT OF BALANCE'}
@@ -304,7 +304,7 @@ export default async function BalanceSheetPage({
       <div className="max-w-4xl">
         <PageHeader
           title="Balance Sheet"
-          icon={Scale}
+          iconNode={<Scale className="text-electric h-8 w-8" />}
           action={
             <div className="flex items-center gap-3">
               <span className="text-sm text-navy/50">

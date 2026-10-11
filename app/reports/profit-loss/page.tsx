@@ -124,7 +124,7 @@ export default async function ProfitLossPage({
       <div className="max-w-3xl">
         <PageHeader
           title="Profit & Loss"
-          icon={BarChart2}
+          iconNode={<BarChart2 className="text-electric h-8 w-8" />}
           action={
             <span className="text-sm text-navy/60">
               {from.toLocaleDateString('en-US')} – {to.toLocaleDateString('en-US')}

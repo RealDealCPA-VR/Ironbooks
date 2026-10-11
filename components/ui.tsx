@@ -517,16 +517,20 @@ export function PageSkeleton({ rows = 6 }: { rows?: number }) {
 export function PageHeader({
   title,
   icon: Icon,
+  iconNode,
   action,
 }: {
   title: string;
+  /** Icon component — client components only (a function can't cross the RSC boundary). */
   icon?: React.ComponentType<{ className?: string }>;
+  /** Pre-rendered icon element — use this from server components. */
+  iconNode?: React.ReactNode;
   action?: React.ReactNode;
 }) {
   return (
     <div className="flex items-center justify-between mb-6">
       <h1 className="text-3xl font-extrabold text-navy flex items-center gap-3">
-        {Icon && <Icon className="text-electric h-8 w-8" />}
+        {Icon ? <Icon className="text-electric h-8 w-8" /> : iconNode}
         {title}
       </h1>
       {action}

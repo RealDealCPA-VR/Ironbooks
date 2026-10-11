@@ -164,7 +164,7 @@ export default async function BalanceSheetCashPage({
       {/* Header */}
       <PageHeader
         title="Balance Sheet — Cash Basis"
-        icon={Scale}
+        iconNode={<Scale className="text-electric h-8 w-8" />}
         action={
           <Badge tone={bs.balanced ? 'success' : 'danger'}>
             {bs.balanced ? 'Assets = Liabilities + Equity' : 'OUT OF BALANCE'}

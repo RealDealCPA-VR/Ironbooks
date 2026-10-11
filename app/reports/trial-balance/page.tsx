@@ -53,7 +53,7 @@ export default async function TrialBalancePage({
       <div className="max-w-3xl">
         <PageHeader
           title="Trial Balance"
-          icon={BookOpen}
+          iconNode={<BookOpen className="text-electric h-8 w-8" />}
           action={
             <div className="flex items-center gap-3">
               <span className="text-sm text-navy/50">
