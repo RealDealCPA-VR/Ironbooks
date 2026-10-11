@@ -630,3 +630,94 @@ describe('re-test round 1', () => {
     await expect(createCustomer(other, { displayName: 'rename one qa' })).resolves.toBeTruthy();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Re-test round 1 (resumed run): stricter checks on the fixes.
+describe('re-test round 1 (strict)', () => {
+  async function freshCompany(name: string): Promise<ServiceContext> {
+    const [u] = await db.select().from(users).where(eq(users.email, 'qa@wave2.local'));
+    const co = await createCompany(db, { name, ownerId: u.id });
+    return { db, companyId: co.id, userId: u.id };
+  }
+
+  it('B16 rounding merge with a future closing date is refused PERIOD_CLOSED and rolls back completely', async () => {
+    const c = await freshCompany('Drift Closed Strict Co');
+    const [inv] = await db.select().from(accounts).where(and(eq(accounts.companyId, c.companyId), eq(accounts.code, '1300')));
+    const a = await createItem(c, { name: 'CS A', type: 'inventory', assetAccountId: inv.id });
+    const b = await createItem(c, { name: 'CS B', type: 'inventory', assetAccountId: inv.id });
+    await adjustInventory(c, { itemId: a.id, quantityChange: 100, unitCost: 2, date: d('2026-02-01') });
+    await adjustInventory(c, { itemId: b.id, quantityChange: 200, unitCost: 1, date: d('2026-02-01') });
+    const jeBefore = (await db.select().from(journalEntries).where(eq(journalEntries.companyId, c.companyId))).length;
+    const future = new Date(Date.now() + 5 * 86400_000).toISOString().slice(0, 10);
+    await setClosingDate(c, { closingDate: future });
+    const auditBefore = (await db.select().from(auditLogs).where(eq(auditLogs.companyId, c.companyId))).length;
+    try {
+      await expect(mergeItems(c, { fromId: a.id, toId: b.id })).rejects.toMatchObject({ code: 'PERIOD_CLOSED' });
+      const [ra] = await db.select().from(items).where(eq(items.id, a.id));
+      const [rb] = await db.select().from(items).where(eq(items.id, b.id));
+      expect(ra.isActive).toBe(true);
+      expect(ra.quantityOnHand && Number(ra.quantityOnHand)).toBe(100);
+      expect(rb.quantityOnHand && Number(rb.quantityOnHand)).toBe(200);
+      expect(Number(rb.averageCost)).toBe(1);
+      expect((await db.select().from(journalEntries).where(eq(journalEntries.companyId, c.companyId))).length).toBe(jeBefore);
+      expect((await db.select().from(auditLogs).where(eq(auditLogs.companyId, c.companyId))).length).toBe(auditBefore);
+      expect((await inventoryValuation(c)).grandTotal).toBe('400.00');
+      await assertInvariants(c);
+    } finally {
+      await setClosingDate(c, { closingDate: null });
+    }
+  });
+
+  it('B16 rounding entry is a balanced 2-line posted entry of exactly 0.01 between Inventory and COGS, linked to the item', async () => {
+    const c = await freshCompany('Drift Shape Co');
+    const [inv] = await db.select().from(accounts).where(and(eq(accounts.companyId, c.companyId), eq(accounts.code, '1300')));
+    const a = await createItem(c, { name: 'Sh A', type: 'inventory', assetAccountId: inv.id });
+    const b = await createItem(c, { name: 'Sh B', type: 'inventory', assetAccountId: inv.id });
+    await adjustInventory(c, { itemId: a.id, quantityChange: 100, unitCost: 2, date: d('2026-02-01') });
+    await adjustInventory(c, { itemId: b.id, quantityChange: 200, unitCost: 1, date: d('2026-02-01') });
+    await mergeItems(c, { fromId: a.id, toId: b.id });
+    const roundingOnly = and(
+      eq(journalEntries.companyId, c.companyId),
+      eq(journalEntries.sourceRef, `item:${b.id}`),
+      sql`${journalEntries.description} LIKE 'Rounding from merging%'`,
+    );
+    const [je] = await db.select().from(journalEntries).where(roundingOnly);
+    expect(je).toBeDefined();
+    expect(je.status).toBe('posted');
+    const lines = await db.execute(sql`SELECT account_id::text AS account_id, debit, credit FROM journal_entry_lines WHERE journal_entry_id = ${je.id}::uuid`);
+    const rows = ((lines as unknown as { rows?: unknown[] }).rows ?? (lines as unknown as unknown[])) as Array<{ account_id: string; debit: string | null; credit: string | null }>;
+    expect(rows.length).toBe(2);
+    const invLine = rows.find((r) => r.account_id === inv.id)!;
+    expect(invLine).toBeDefined();
+    expect(Number(invLine.credit)).toBe(0.01); // 399.99 < 400.00: inventory credited
+    const other = rows.find((r) => r.account_id !== inv.id)!;
+    expect(Number(other.debit)).toBe(0.01);
+    // merging again (retry / double click) must be idempotent: refused or a no-op, never a second rounding entry
+    const val1 = (await inventoryValuation(c)).grandTotal;
+    await mergeItems(c, { fromId: a.id, toId: b.id }).catch(() => undefined);
+    expect((await inventoryValuation(c)).grandTotal).toBe(val1);
+    const [rb2] = await db.select().from(items).where(eq(items.id, b.id));
+    expect(Number(rb2.quantityOnHand)).toBe(300);
+    const all = await db.select().from(journalEntries).where(roundingOnly);
+    expect(all.length).toBe(1);
+    await assertInvariants(c);
+  });
+
+  it('B5/J1 legacy text terms match is company-scoped and case-insensitive; Clean Up of an unused inactive entry still deletes', async () => {
+    const a = await freshCompany('Terms Strict A');
+    await createCustomer(a, { displayName: 'Legacy Upper', terms: 'net_15' });
+    // force the legacy shape: text code only, no termsId, upper-case code
+    await db.update(customers).set({ termsId: null, terms: 'NET_15' })
+      .where(and(eq(customers.companyId, a.companyId), eq(customers.displayName, 'Legacy Upper')));
+    const net15 = (await listEntries(a, 'terms')).find((t) => t.name === 'Net 15')!;
+    expect(net15).toBeDefined();
+    expect((await removeEntry(a, 'terms', net15.id)).deleted).toBe(false);
+    // an unused entry that is inactive is still cleaned up
+    const t = await createEntry(a, 'terms', { name: 'Net 77 QA', kind: 'standard', netDays: 77 });
+    await updateEntry(a, 'terms', t.id, { isActive: false });
+    const preview = await previewCleanup(a, ['terms']);
+    const ids = preview.lists[0].entries.map((e) => e.id);
+    expect(ids).toContain(t.id);
+    expect(ids).not.toContain(net15.id);
+  });
+});
