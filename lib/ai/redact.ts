@@ -100,9 +100,10 @@ const DETECTORS: Detector[] = [
   {
     // Labeled tax ids: "SSN 123456789", "EIN: 12-3456789", "Tax ID #123-45-6789"
     kind: 'TAXID',
-    re: /\b(?:SSN|ITIN|TIN|EIN|FEIN|tax\s*id|social\s+security(?:\s+(?:no\.?|number|#))?)\b\s*(?:#|no\.?|number)?\s*[:#]?\s*(\d[\d -]{7,12}\d)/gi,
+    re: /\b(?:SSN|ITIN|TIN|EIN|FEIN|tax\s*id|social\s+security(?:\s+(?:no\.?|number|#))?)\b\s*(?:#|no\.?|number)?\s*[:#]?\s*(\d[\d .-]{7,12}\d)/gi,
     group: 1,
-    accept: (v) => onlyDigits(v).length === 9,
+    // Exactly 9 digits, and never a money amount ("EIN 1234567.89").
+    accept: (v) => onlyDigits(v).length === 9 && !/[.,]\d{1,2}$/.test(v),
   },
   { kind: 'IBAN', re: /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b/g, accept: (v) => v.replace(/\s/g, '').length >= 15 },
   {
@@ -118,6 +119,8 @@ const DETECTORS: Detector[] = [
   // Only a single plain space joins digit groups; a tab or newline next to a digit (TSV
   // columns, line breaks) is a field boundary, not part of the number.
   { kind: 'SSN', re: /(?<![\d.,]|\d )\d{3} \d{2} \d{4}(?!\d|[.,]\d| \d)/g },
+  // Unlabeled SSN written with dots: "123.45.6789" (not part of a longer dotted number).
+  { kind: 'SSN', re: /(?<![\d.,])\d{3}\.\d{2}\.\d{4}(?!\d|[.,]\d)/g },
   { kind: 'EIN', re: /(?<![\d-])\d{2}-\d{7}(?![\d-])/g },
   {
     kind: 'PHONE',
@@ -193,11 +196,12 @@ export class Redactor {
     this.entities = cleaned.map((e) => ({
       kind: e.kind,
       numeric: !!e.digits,
-      // Only phones are commonly written with dots ("555.0100"); for tax ids / account
-      // numbers a '.' would let the entity swallow a money amount ("$1234567.89").
+      // Digits may be joined by spaces, dots, dashes or parens ("123.45.6789"). Money amounts
+      // stay safe through the boundary guards plus the post-match check in redact() that
+      // rejects a match ending in a decimal fraction ("$1234567.89").
       re: e.digits
         ? new RegExp(
-            `(?<![\\d.,])${e.digits.split('').join(e.kind === 'PHONE' ? '[\\s.()-]*' : '[\\s()-]*')}(?![\\d]|[.,]\\d)`,
+            `(?<![\\d.,])${e.digits.split('').join('[\\s.()-]*')}(?![\\d]|[.,]\\d)`,
             'g',
           )
         : new RegExp(
@@ -225,8 +229,13 @@ export class Redactor {
   }
 
   /** Replace sensitive values in `text` with placeholders. */
-  redact(text: string): string {
-    if (!text) return text;
+  redact(input: string): string {
+    if (!input) return input;
+    // Detection runs on a same-length copy in which non-breaking / figure / thin / narrow
+    // no-break spaces (common in text pasted from PDFs or the web) are plain spaces, so the
+    // detectors' literal ' ' matches them. Offsets carry over 1:1; replaced values and the
+    // untouched text are always sliced from `input`.
+    const text = input.replace(/[\u00A0\u2007\u2009\u202F]/g, ' ');
     const taken: Array<[number, number]> = [];
     const overlaps = (s: number, e: number) => taken.some(([a, b]) => s < b && e > a);
 
@@ -238,7 +247,7 @@ export class Redactor {
     const add = (start: number, end: number, kind: RedactionKind) => {
       if (end <= start || overlaps(start, end)) return;
       taken.push([start, end]);
-      spans.push({ start, end, kind, original: text.slice(start, end) });
+      spans.push({ start, end, kind, original: input.slice(start, end) });
     };
 
     // Values this instance already replaced are re-redacted verbatim (longest first), whatever
@@ -257,7 +266,7 @@ export class Redactor {
           const end = start + m[0].length;
           if (end <= start || overlaps(start, end)) continue;
           taken.push([start, end]);
-          spans.push({ start, end, kind: 'PERSON', original: m[0], placeholder });
+          spans.push({ start, end, kind: 'PERSON', original: input.slice(start, end), placeholder });
         }
       }
     }
@@ -282,22 +291,22 @@ export class Redactor {
         if (!idx) continue;
         // Trim trailing separators captured by greedy digit groups.
         let [s, e] = idx;
-        while (e > s && /[\s-]/.test(text[e - 1])) e--;
+        while (e > s && /[\s.-]/.test(text[e - 1])) e--;
         const v = text.slice(s, e);
         if (det.accept && !det.accept(v)) continue;
         add(s, e, det.kind);
       }
     }
 
-    if (spans.length === 0) return text;
+    if (spans.length === 0) return input;
     spans.sort((a, b) => a.start - b.start);
     let out = '';
     let pos = 0;
     for (const sp of spans) {
-      out += text.slice(pos, sp.start) + (sp.placeholder ?? this.placeholderFor(sp.kind, sp.original));
+      out += input.slice(pos, sp.start) + (sp.placeholder ?? this.placeholderFor(sp.kind, sp.original));
       pos = sp.end;
     }
-    return out + text.slice(pos);
+    return out + input.slice(pos);
   }
 
   /** Put the original values back. Tolerates a model dropping the brackets. */

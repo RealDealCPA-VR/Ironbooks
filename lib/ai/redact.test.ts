@@ -175,3 +175,50 @@ describe('Redactor — values already redacted stay redacted without their conte
     expect(new Redactor().redact('9 123 45 6789')).toContain('123 45 6789');
   });
 });
+
+describe('dotted and non-breaking-space identifiers (round 3)', () => {
+  it('redacts known SSNs in dotted form and restores the original spelling', () => {
+    const r = new Redactor([{ text: '123-45-6789', kind: 'SSN' }]);
+    const out = r.redact('ID 123.45.6789 on file');
+    expect(out).toBe('ID [SSN_1] on file');
+    expect(r.restore(out)).toBe('ID 123.45.6789 on file');
+  });
+
+  it('known numeric entities with dots still never swallow money amounts', () => {
+    const r = new Redactor([
+      { text: '555-0100', kind: 'PHONE' },
+      { text: '12-3456789', kind: 'EIN' },
+      { text: '123456', kind: 'ACCOUNT' },
+    ]);
+    for (const amt of ['55501.00', '$1234567.89', '123456.78', '123456789.00', '1,234,567.89']) {
+      expect(r.redact(`Paid ${amt} today`)).toContain(amt);
+    }
+  });
+
+  it('redacts labeled and unlabeled dotted SSNs but not dotted amounts', () => {
+    expect(new Redactor().redact('SSN: 123.45.6789')).toBe('SSN: [TAXID_1]');
+    expect(new Redactor().redact('see 123.45.6789.')).toBe('see [SSN_1].');
+    expect(new Redactor().redact('EIN 1234567.89')).toContain('1234567.89');
+    expect(new Redactor().redact('Total 123.45')).toBe('Total 123.45');
+  });
+
+  it('treats NBSP, narrow NBSP, thin and figure spaces as spaces', () => {
+    for (const sp of ['\u00A0', '\u202F', '\u2009', '\u2007']) {
+      const ssn = `123${sp}45${sp}6789`;
+      const r = new Redactor();
+      const out = r.redact(`Employee SSN ${ssn} and ${ssn}`);
+      expect(out).not.toContain(ssn);
+      expect(out).not.toMatch(/6789/);
+      // Restores the exact original characters.
+      expect(r.restore(out)).toBe(`Employee SSN ${ssn} and ${ssn}`);
+    }
+    // Card numbers with NBSP group separators.
+    const card = '4111\u00A01111\u00A01111\u00A01111';
+    expect(new Redactor().redact(`card ${card}`)).toBe('card [CARD_1]');
+  });
+
+  it('keeps the rest of the text (including its NBSPs) byte-identical', () => {
+    const text = 'Total\u00A0$1,234.56 for Acme';
+    expect(new Redactor().redact(text)).toBe(text);
+  });
+});
