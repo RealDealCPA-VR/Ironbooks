@@ -280,7 +280,17 @@ interface StoredJournalProposal {
   date: string;
   description: string;
   reference: string | null;
-  lines: { accountId: string; accountCode: string; accountName: string; debit: string | null; credit: string | null; memo: string | null }[];
+  lines: {
+    accountId: string;
+    accountCode: string;
+    accountName: string;
+    debit: string | null;
+    credit: string | null;
+    memo: string | null;
+    /** QB "Name" column. Optional: proposals that hit A/R or A/P must carry one to be approved. */
+    entityType?: 'customer' | 'vendor' | 'employee' | 'other' | null;
+    entityId?: string | null;
+  }[];
   totalDebit: string;
   rationale: string | null;
 }
@@ -415,12 +425,33 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       if (!a.isActive) throw validation(`Account ${a.code} ${a.name} is inactive; the proposal cannot be posted.`);
     }
 
-    const entry = await createManualEntry(tx, {
-      date,
-      description: p.description,
-      reference: p.reference,
-      lines: p.lines.map((l) => ({ accountId: l.accountId, debit: l.debit, credit: l.credit, memo: l.memo })),
-    }, { skipNameRule: true }); // TODO(ai team): proposals do not carry customer/vendor names yet
+    // The QB name rule applies to AI proposals too: an A/R line needs a customer and an A/P line
+    // a vendor, otherwise A/R / A/P aging would stop matching the GL. Proposals that hit those
+    // accounts without a name are refused here with a plain-language message.
+    // TODO(ai team): let the assistant pick the customer / vendor so such proposals can carry it.
+    let entry: Awaited<ReturnType<typeof createManualEntry>>;
+    try {
+      entry = await createManualEntry(tx, {
+        date,
+        description: p.description,
+        reference: p.reference,
+        lines: p.lines.map((l) => ({
+          accountId: l.accountId,
+          debit: l.debit,
+          credit: l.credit,
+          memo: l.memo,
+          entityType: l.entityType ?? null,
+          entityId: l.entityId ?? null,
+        })),
+      });
+    } catch (e) {
+      if (e instanceof ServiceError && /needs a (customer|vendor) in the Name column/.test(e.message)) {
+        throw validation(
+          `This suggestion can't be posted as is: ${e.message} Enter it yourself in Make Journal Entries and pick the name.`,
+        );
+      }
+      throw e;
+    }
     const [updated] = await tx.db
       .update(aiProposals)
       .set({ status: 'approved', resultRef: `journal_entry:${entry.id}`, decidedBy: tx.userId, decidedAt: new Date() })

@@ -145,14 +145,6 @@ export interface GLOptions {
 export async function createManualEntry(
   ctx: ServiceContext,
   input: ManualEntryInput,
-  opts: {
-    /**
-     * Skip the QB rule that A/R lines name a customer and A/P lines a vendor. ONLY for callers
-     * that cannot collect a name yet (AI journal proposals — TODO(ai team): carry the vendor /
-     * customer on proposal lines and drop this). User-entered entries always enforce it.
-     */
-    skipNameRule?: boolean;
-  } = {},
 ) {
   if (!input.description?.trim()) {
     throw validation('Description is required.');
@@ -160,7 +152,7 @@ export async function createManualEntry(
   if (!input.date || isNaN(input.date.getTime())) {
     throw validation('A valid date is required.');
   }
-  if (!opts.skipNameRule) await assertJournalNames(ctx, input.lines);
+  await assertJournalNames(ctx, input.lines);
   return postJournalEntry(ctx, {
     date: input.date,
     description: input.description.trim(),
@@ -257,6 +249,11 @@ export async function assertJournalNames(ctx: ServiceContext, lines: PostingLine
       throw validation(`Line ${i + 1}: pick a name from the list (or leave it blank).`);
     }
     if (l.entityType && l.entityId && !names.has(`${l.entityType}:${l.entityId}`)) {
+      if (l.entityType === 'other') {
+        throw validation(
+          `Line ${i + 1}: that name was not found in the Other Names list. Pick a customer, vendor or employee, or add the name first.`,
+        );
+      }
       throw validation(`Line ${i + 1}: that ${l.entityType} was not found.`);
     }
     if (acct.type === 'asset' && acct.subtype === 'accounts_receivable' && l.entityType !== 'customer') {

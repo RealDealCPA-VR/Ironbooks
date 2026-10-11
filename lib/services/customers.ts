@@ -17,6 +17,7 @@ import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { customers, invoices } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { unappliedPaymentsByCustomer } from './customerCredits';
 import { journalBalancesByEntity } from './journal';
 
 // ---------------------------------------------------------------------------
@@ -342,8 +343,12 @@ export async function customerBalanceSummary(
     openInvoiceCount: Number(r.openInvoiceCount),
   }));
 
-  // Named General Journal lines on A/R are part of the customer's balance (QB parity).
+  // Named General Journal lines on A/R are part of the customer's balance (QB parity), and
+  // unapplied payments are credits against it (the whole payment was credited to A/R).
   const journal = await journalBalancesByEntity(ctx, 'ar');
+  for (const [id, credit] of await unappliedPaymentsByCustomer(ctx)) {
+    journal.set(id, toAmountString(Money.of(journal.get(id) ?? '0').minus(Money.of(credit))));
+  }
   if (journal.size > 0) {
     const byId = new Map(result.map((r) => [r.customerId, r]));
     const missing = [...journal.keys()].filter((id) => !byId.has(id));

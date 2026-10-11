@@ -100,9 +100,15 @@ const IIF_TYPE_MAP: Record<string, { type: string; subtype: string }> = {
   PAYROLL: { type: 'expense', subtype: 'payroll' },
 };
 
-function mapIifType(iifType: string): { type: string; subtype: string } {
+function mapIifType(iifType: string, name?: string): { type: string; subtype: string } {
   const key = iifType.trim().toUpperCase();
-  return IIF_TYPE_MAP[key] ?? { type: 'expense', subtype: 'operating_expenses' };
+  const mapped = IIF_TYPE_MAP[key] ?? { type: 'expense', subtype: 'operating_expenses' };
+  // QB keeps Undeposited Funds as an Other Current Asset, but it holds cash waiting to be
+  // deposited — same special case as qbGlParse.toBookkeeperType.
+  if (mapped.subtype === 'other_current_asset' && name && /undeposited/i.test(name)) {
+    return { type: 'asset', subtype: 'undeposited_funds' };
+  }
+  return mapped;
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +571,7 @@ export async function importIIF(
 
   // ---- Accounts ----
   for (const acc of parsed.accounts) {
-    const { type, subtype } = mapIifType(acc.accntType);
+    const { type, subtype } = mapIifType(acc.accntType, acc.name);
     await importAccountRow(ctx, counts, {
       name: acc.name,
       code: acc.accnum,

@@ -66,6 +66,7 @@ import {
   saveDocumentInventoryDetails,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { allocateDocNumber } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -98,6 +99,13 @@ export interface InvoiceLineInput extends InventoryLineDetail {
 }
 
 export interface CreateInvoiceInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   customerId: string;
   date: Date;
   dueDate?: Date | null;
@@ -229,15 +237,6 @@ async function hasExternalPayments(
   if (!invoice.amountPaid || !Money.gt(invoice.amountPaid, 0)) return false;
   const paymentLines = await storedPaymentLineTotal(ctx, invoice.id);
   return Money.of(invoice.amountPaid).greaterThan(paymentLines);
-}
-
-/** Return the next invoice number for the company (max + 1, 1 if none). */
-async function nextInvoiceNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${invoices.invoiceNumber}), 0)` })
-    .from(invoices)
-    .where(eq(invoices.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,7 +1107,9 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
   // Persist everything in a single transaction.
   // ---------------------------------------------------------------------------
   return inTransaction(ctx, async (tx) => {
-    const invoiceNumber = await nextInvoiceNumber(tx);
+    const { refNumber, number: invoiceNumber } = await allocateDocNumber(tx, 'invoice', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     // Resolve currency fields.
     const currency = input.currency ?? null;
@@ -1124,6 +1125,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         companyId: tx.companyId,
         customerId: input.customerId,
         invoiceNumber,
+        refNumber,
         date: input.date,
         dueDate: input.dueDate ?? null,
         status: isDraft ? 'draft' : postedStatus(prep),

@@ -19,34 +19,46 @@
 --     they can never reach the trial balance, balance sheet or P&L.
 -- ===========================================================================
 
-ALTER TABLE "accounts" ALTER COLUMN "subtype" TYPE text;
+-- One-time: rebuild the enum and reclassify ONLY if the new values are not there yet, so a
+-- re-run never re-applies the name heuristics to accounts the user has since re-typed, and
+-- never trips the bka_accounts_non_posting trigger (it is dropped first and recreated below).
+DROP TRIGGER IF EXISTS bka_accounts_non_posting ON accounts;
 --> statement-breakpoint
-DROP TYPE IF EXISTS "public"."account_subtype";
---> statement-breakpoint
-CREATE TYPE "public"."account_subtype" AS ENUM('checking', 'savings', 'accounts_receivable', 'inventory', 'fixed_assets', 'accounts_payable', 'credit_card', 'long_term_liability', 'owners_equity', 'retained_earnings', 'sales', 'service_revenue', 'other_income', 'cost_of_goods_sold', 'operating_expenses', 'payroll', 'taxes', 'other_current_asset', 'undeposited_funds', 'other_asset', 'other_current_liability', 'other_expense', 'non_posting');
---> statement-breakpoint
-UPDATE "accounts" SET "subtype" = 'undeposited_funds'
-WHERE "type" = 'asset' AND "subtype" IN ('checking', 'savings') AND "name" ~* 'undeposited';
---> statement-breakpoint
-UPDATE "accounts" SET "subtype" = 'other_current_asset'
-WHERE "type" = 'asset' AND "subtype" IN ('checking', 'savings')
-  AND "name" ~* '(prepaid|prepayment|\madvances?\M|employee loan|loans? to )';
---> statement-breakpoint
-UPDATE "accounts" SET "subtype" = 'other_asset'
-WHERE "type" = 'asset' AND "subtype" IN ('checking', 'savings', 'fixed_assets')
-  AND "name" ~* '(security deposit|goodwill|organi[sz]ation costs?)';
---> statement-breakpoint
-UPDATE "accounts" SET "subtype" = 'other_current_liability'
-WHERE "type" = 'liability' AND "subtype" = 'accounts_payable'
-  AND "code" <> '2000'
-  AND "name" !~* '(accounts\s*payable|^a/?p\M|trade payables?)';
---> statement-breakpoint
-UPDATE "accounts" SET "subtype" = 'other_current_liability'
-WHERE "type" = 'liability' AND "subtype" = 'long_term_liability'
-  AND "name" ~* '(sales tax|payroll|withholding|accrued|wages payable|\mvat\M|\mgst\M|\mhst\M|customer deposits?)'
-  AND "name" !~* '(loan|note|mortgage|long[- ]?term|lease)';
---> statement-breakpoint
-ALTER TABLE "accounts" ALTER COLUMN "subtype" TYPE "public"."account_subtype" USING "subtype"::"public"."account_subtype";
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+    WHERE t.typname = 'account_subtype' AND e.enumlabel = 'non_posting'
+  ) THEN
+    ALTER TABLE "accounts" ALTER COLUMN "subtype" TYPE text;
+    DROP TYPE IF EXISTS "public"."account_subtype";
+    CREATE TYPE "public"."account_subtype" AS ENUM('checking', 'savings', 'accounts_receivable', 'inventory', 'fixed_assets', 'accounts_payable', 'credit_card', 'long_term_liability', 'owners_equity', 'retained_earnings', 'sales', 'service_revenue', 'other_income', 'cost_of_goods_sold', 'operating_expenses', 'payroll', 'taxes', 'other_current_asset', 'undeposited_funds', 'other_asset', 'other_current_liability', 'other_expense', 'non_posting');
+
+    UPDATE "accounts" SET "subtype" = 'undeposited_funds'
+    WHERE "type" = 'asset' AND "subtype" IN ('checking', 'savings') AND "name" ~* 'undeposited';
+
+    UPDATE "accounts" SET "subtype" = 'other_current_asset'
+    WHERE "type" = 'asset' AND "subtype" IN ('checking', 'savings')
+      AND "name" ~* '(prepaid|prepayment|\madvances?\M|employee loan|loans? to )';
+
+    UPDATE "accounts" SET "subtype" = 'other_asset'
+    WHERE "type" = 'asset' AND "subtype" IN ('checking', 'savings', 'fixed_assets')
+      AND "name" ~* '(security deposit|goodwill|organi[sz]ation costs?)';
+
+    UPDATE "accounts" SET "subtype" = 'other_current_liability'
+    WHERE "type" = 'liability' AND "subtype" = 'accounts_payable'
+      AND "code" <> '2000'
+      AND "name" !~* '(accounts\s*payable|^a/?p\M|trade payables?)';
+
+    UPDATE "accounts" SET "subtype" = 'other_current_liability'
+    WHERE "type" = 'liability' AND "subtype" = 'long_term_liability'
+      AND "name" ~* '(sales tax|payroll|withholding|accrued|wages payable|\mvat\M|\mgst\M|\mhst\M|customer deposits?)'
+      AND "name" !~* '(loan|note|mortgage|long[- ]?term|lease)';
+
+    ALTER TABLE "accounts" ALTER COLUMN "subtype" TYPE "public"."account_subtype" USING "subtype"::"public"."account_subtype";
+  END IF;
+END
+$$;
 --> statement-breakpoint
 
 -- ---- tax lines ------------------------------------------------------------------

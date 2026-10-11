@@ -54,6 +54,7 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { allocateDocNumber } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -92,6 +93,13 @@ export interface SalesReceiptLineInput extends InventoryLineDetail {
 }
 
 export interface CreateSalesReceiptInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   /** Optional — walk-in / counter sales have no customer. */
   customerId?: string | null;
   date: Date;
@@ -144,15 +152,6 @@ async function getOrCreateAccountByCode(
     })
     .returning();
   return created.id;
-}
-
-/** Return the next receipt number for the company (max + 1, 1 if none). */
-async function nextReceiptNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${salesReceipts.receiptNumber}), 0)` })
-    .from(salesReceipts)
-    .where(eq(salesReceipts.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
 }
 
 /**
@@ -340,7 +339,9 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
   // Persist everything in a single transaction.
   // ---------------------------------------------------------------------------
   return inTransaction(ctx, async (tx) => {
-    const receiptNumber = await nextReceiptNumber(tx);
+    const { refNumber, number: receiptNumber } = await allocateDocNumber(tx, 'sales_receipt', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     // 1) Insert receipt header (already fully paid by definition).
     const [receipt] = await tx.db
@@ -349,6 +350,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
         companyId: tx.companyId,
         customerId: input.customerId ?? null,
         receiptNumber,
+        refNumber,
         date: input.date,
         method,
         reference: input.reference ?? null,

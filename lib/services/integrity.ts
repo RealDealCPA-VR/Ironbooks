@@ -36,6 +36,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { journalOpenItems } from './journal';
+import { unappliedCustomerPayments } from './customerCredits';
 import { ServiceError, inTransaction, writeAudit } from './_base';
 import { balanceSheetCashBasis } from './balanceSheetCashBasis';
 import { LedgerIntegrityError } from './ledgerAssert';
@@ -209,9 +210,14 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
   const arBalance = Money.of(arAccount.balance);
   // Named General Journal lines on A/R are customer open items too (journal.ts journalOpenItems).
   const journalItems = (await journalOpenItems(ctx, 'ar')).filter((j) => j.accountId === arAccount.id);
-  const invoicesDue = Money.of(invRow?.totalDue ?? 0).plus(
-    journalItems.reduce((sum, j) => sum.plus(Money.of(j.amount)), Money.zero()),
+  // Unapplied customer payments were credited to A/R in full, so they are credits here too.
+  const unappliedCredits = (await unappliedCustomerPayments(ctx)).reduce(
+    (sum, p) => sum.plus(Money.of(p.amount)),
+    Money.zero(),
   );
+  const invoicesDue = Money.of(invRow?.totalDue ?? 0)
+    .plus(journalItems.reduce((sum, j) => sum.plus(Money.of(j.amount)), Money.zero()))
+    .minus(unappliedCredits);
 
   if (Money.equalWithinCent(arBalance, invoicesDue)) {
     return {

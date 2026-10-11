@@ -320,7 +320,18 @@ export async function updateAccount(
   } else if (patch.subtype !== undefined && patch.subtype !== null) {
     subtype = normalizeSubtype(patch.subtype, before.type);
   }
-  if (type !== before.type || (subtype === 'non_posting') !== (before.subtype === 'non_posting')) {
+  // A/R and A/P are subledger control accounts: every line on them carries a customer/vendor
+  // name. Turning an account with history into (or out of) A/R or A/P would leave unnamed
+  // amounts in the control account (or orphan the named open items), so aging would stop
+  // matching the GL. QB refuses this for accounts with transactions; so do we.
+  const isSubledger = (s: string) => s === 'accounts_receivable' || s === 'accounts_payable';
+  const subledgerChange =
+    subtype !== before.subtype && (isSubledger(subtype) || isSubledger(before.subtype));
+  if (
+    type !== before.type ||
+    subledgerChange ||
+    (subtype === 'non_posting') !== (before.subtype === 'non_posting')
+  ) {
     // Moving between debit- and credit-normal classes (or in/out of non-posting) changes how
     // every posted line is read. QB refuses it for accounts with history; so do we.
     const [used] = await ctx.db

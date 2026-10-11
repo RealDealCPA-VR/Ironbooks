@@ -205,6 +205,12 @@ export async function allocateDocNumber(
   opts: { allowDuplicate?: boolean; excludeId?: string } = {},
 ): Promise<{ refNumber: string; number: number; duplicate: boolean }> {
   const typed = normalizeDocNumber(userRef);
+  // Serialize number allocation per company + document type for the rest of the caller's
+  // transaction, so two concurrent saves cannot both pass the duplicate check with the same
+  // number (call this inside the create transaction, as the sales/purchase services do).
+  await ctx.db.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtext(${`docnum:${ctx.companyId}:${docType}`}))`,
+  );
   const refNumber = typed ?? (await nextDocNumber(ctx, docType));
   const { duplicate } = await assertUniqueDocNumber(ctx, docType, refNumber, opts);
   let number = docNumberToInt(refNumber);

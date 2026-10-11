@@ -58,6 +58,7 @@ import {
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, inTransaction, writeAudit } from './_base';
 import { allowLedgerRewrite } from './posting';
+import { qbAccountTypeOf } from '@/lib/accountTypes';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -227,6 +228,11 @@ export async function mergeCustomers(
       )
       .returning({ id: expenseLines.id });
 
+    // Named General Journal lines (QB "Name" column): the duplicate's A/R open items and any
+    // other customer-named lines follow the customer. Only the name changes — amounts and
+    // accounts stay put — but posted lines are immutable outside a sanctioned rewrite.
+    const jelRows = await repointJournalNames(tx, 'customer', fromId, toId);
+
     // Deactivate the from-customer.
     await tx.db
       .update(customers)
@@ -261,6 +267,7 @@ export async function mergeCustomers(
           customerPrices: priceRows.length,
           billLines: billLineRows.length,
           expenseLines: expenseLineRows.length,
+          journalEntryLines: jelRows,
         },
       },
     });
@@ -337,6 +344,9 @@ export async function mergeVendors(
       .where(and(eq(purchaseOrders.vendorId, fromId), eq(purchaseOrders.companyId, tx.companyId)))
       .returning({ id: purchaseOrders.id });
 
+    // Named General Journal lines follow the vendor (A/P open items from journal entries).
+    const jelRows = await repointJournalNames(tx, 'vendor', fromId, toId);
+
     // Deactivate the from-vendor.
     await tx.db
       .update(vendors)
@@ -363,6 +373,7 @@ export async function mergeVendors(
           expenses: expRows.length,
           vendorCredits: vcRows.length,
           purchaseOrders: poRows.length,
+          journalEntryLines: jelRows,
         },
       },
     });
@@ -378,6 +389,32 @@ export async function mergeVendors(
       deactivatedId: fromId,
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Named journal lines
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-point the QB "Name" on journal entry lines from one customer/vendor to another. The
+ * entity id is a UUID already verified to belong to this company, so the match is tenant-safe
+ * even though journal_entry_lines has no companyId column. Posted lines are immutable outside
+ * a sanctioned rewrite, so this runs under allowLedgerRewrite('merge') in the caller's
+ * transaction. Accounts and amounts are untouched, so every entry stays balanced.
+ */
+async function repointJournalNames(
+  tx: ServiceContext,
+  entityType: 'customer' | 'vendor',
+  fromId: string,
+  toId: string,
+): Promise<number> {
+  await allowLedgerRewrite(tx, 'merge');
+  const rows = await tx.db
+    .update(journalEntryLines)
+    .set({ entityId: toId })
+    .where(and(eq(journalEntryLines.entityType, entityType), eq(journalEntryLines.entityId, fromId)))
+    .returning({ id: journalEntryLines.id });
+  return rows.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +476,18 @@ export async function mergeAccounts(
     throw validation(
       `Accounts must be the same type to merge (${fromRow.type} vs ${toRow.type}).`,
     );
+  }
+  // QuickBooks only merges accounts of the same account type (Bank with Bank, Other Current
+  // Asset with Other Current Asset, ...). This also keeps A/R and A/P clean: every line on them
+  // carries a customer/vendor name, so unnamed lines from another type can never land there,
+  // and non-posting accounts can never receive posted history.
+  if (qbAccountTypeOf(fromRow) !== qbAccountTypeOf(toRow)) {
+    throw validation(
+      `"${fromRow.name}" and "${toRow.name}" are different kinds of account, so they can't be merged. Only accounts of the same type can be merged.`,
+    );
+  }
+  if (fromRow.subtype === 'non_posting' || toRow.subtype === 'non_posting') {
+    throw validation('Non-posting accounts (estimates, purchase orders) cannot be merged.');
   }
 
   return inTransaction(ctx, async (tx) => {

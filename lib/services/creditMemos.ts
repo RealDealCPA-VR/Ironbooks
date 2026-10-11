@@ -70,6 +70,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { allocateDocNumber } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -97,6 +98,13 @@ export interface CreditMemoLineInput extends InventoryLineDetail {
 }
 
 export interface CreateCreditMemoInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   customerId: string;
   date: Date;
   lines: CreditMemoLineInput[];
@@ -124,15 +132,6 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
-}
-
-/** Return the next memo number for the company (max + 1, 1 if none). */
-async function nextMemoNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${creditMemos.memoNumber}), 0)` })
-    .from(creditMemos)
-    .where(eq(creditMemos.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
 }
 
 /**
@@ -312,7 +311,9 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
   }
 
   return inTransaction(ctx, async (tx) => {
-    const memoNumber = await nextMemoNumber(tx);
+    const { refNumber, number: memoNumber } = await allocateDocNumber(tx, 'credit_memo', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     // 1) Insert credit memo header
     const [memo] = await tx.db
@@ -321,6 +322,7 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         companyId: tx.companyId,
         customerId: input.customerId,
         memoNumber,
+        refNumber,
         date: input.date,
         status: 'open',
         subtotal: toAmountString(subtotal),

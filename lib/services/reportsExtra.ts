@@ -33,6 +33,7 @@ import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/serv
 import type { ServiceContext } from './_base';
 import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
 import { journalOpenItems, resolveEntityNames } from './journal';
+import { unappliedCustomerPayments } from './customerCredits';
 
 /** Detail-report variant of addJournalItemsToAging: one 'General Journal' row per line. */
 async function addJournalItemsToAgingDetail(
@@ -58,6 +59,61 @@ async function addJournalItemsToAgingDetail(
       daysPastDue: amount.isNegative() ? 0 : Math.max(0, raw),
       bucket: amount.isNegative() ? 'current' : agingKey(raw),
       openBalance: toAmountString(amount),
+    });
+  }
+}
+
+/**
+ * Unapplied customer payments (customerCredits.ts) are credits in the A/R subledger: the full
+ * payment was credited to A/R, so the unapplied part must reduce what the customer owes —
+ * e.g. a payment received against a General Journal charge, which has no invoice to apply to.
+ */
+async function addUnappliedPaymentsToAging(
+  ctx: ServiceContext,
+  cutoff: Date,
+  byCustomer: Map<string, { name: string; buckets: BucketAccum }>,
+): Promise<void> {
+  const credits = await unappliedCustomerPayments(ctx, { asOf: cutoff });
+  if (credits.length === 0) return;
+  const names = await resolveEntityNames(
+    ctx,
+    credits.map((c) => ({ entityType: 'customer', entityId: c.customerId })),
+  );
+  for (const c of credits) {
+    if (!byCustomer.has(c.customerId)) {
+      byCustomer.set(c.customerId, {
+        name: names.get(`customer:${c.customerId}`) ?? '(unknown)',
+        buckets: blankBuckets(),
+      });
+    }
+    const b = byCustomer.get(c.customerId)!.buckets;
+    b.current = b.current.minus(Money.of(c.amount));
+  }
+}
+
+async function addUnappliedPaymentsToAgingDetail(
+  ctx: ServiceContext,
+  cutoff: Date,
+  detail: AgingDetailRow[],
+): Promise<void> {
+  const credits = await unappliedCustomerPayments(ctx, { asOf: cutoff });
+  if (credits.length === 0) return;
+  const names = await resolveEntityNames(
+    ctx,
+    credits.map((c) => ({ entityType: 'customer', entityId: c.customerId })),
+  );
+  for (const c of credits) {
+    detail.push({
+      docId: c.paymentId,
+      docNumber: c.reference ? `Payment ${c.reference}` : 'Payment',
+      docType: 'payment',
+      entityId: c.customerId,
+      entityName: names.get(`customer:${c.customerId}`) ?? '(unknown)',
+      date: c.date.toISOString(),
+      dueDate: null,
+      daysPastDue: 0,
+      bucket: 'current',
+      openBalance: toAmountString(Money.of(c.amount).negated()),
     });
   }
 }
@@ -276,6 +332,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
   }
 
   await addJournalItemsToAging(ctx, 'ar', cutoff, byCustomer);
+  await addUnappliedPaymentsToAging(ctx, cutoff, byCustomer);
 
   return buildAgingReport(byCustomer, cutoff);
 }
@@ -771,7 +828,7 @@ export interface AgingDetailRow {
   docId: string;
   /** Human-readable document label, e.g. "Invoice #12" or "Credit Memo #3". */
   docNumber: string;
-  docType: 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit' | 'journal_entry';
+  docType: 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit' | 'journal_entry' | 'payment';
   entityId: string;
   entityName: string;
   date: string;
@@ -927,6 +984,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
   }
 
   await addJournalItemsToAgingDetail(ctx, 'ar', cutoff, detail);
+  await addUnappliedPaymentsToAgingDetail(ctx, cutoff, detail);
   return buildAgingDetailReport(detail, cutoff);
 }
 

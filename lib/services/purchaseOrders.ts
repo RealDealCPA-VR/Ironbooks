@@ -34,6 +34,7 @@ import {
   writeAudit,
 } from './_base';
 import { getReceivingSettings, poStatusFromLines } from './receivingLinks';
+import { allocateDocNumber } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -53,6 +54,13 @@ export interface PurchaseOrderLineInput {
 }
 
 export interface CreatePurchaseOrderInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   vendorId: string;
   date: Date;
   expectedDate?: Date | null;
@@ -63,14 +71,6 @@ export interface CreatePurchaseOrderInput {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-async function nextPoNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${purchaseOrders.poNumber}), 0)` })
-    .from(purchaseOrders)
-    .where(eq(purchaseOrders.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
-}
 
 // ---------------------------------------------------------------------------
 // createPurchaseOrder
@@ -132,7 +132,9 @@ export async function createPurchaseOrder(
   const totalStr = toAmountString(total);
 
   return inTransaction(ctx, async (tx) => {
-    const poNumber = await nextPoNumber(tx);
+    const { refNumber, number: poNumber } = await allocateDocNumber(tx, 'purchase_order', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     const [po] = await tx.db
       .insert(purchaseOrders)
@@ -140,6 +142,7 @@ export async function createPurchaseOrder(
         companyId: tx.companyId,
         vendorId: input.vendorId,
         poNumber,
+        refNumber,
         date: input.date,
         expectedDate: input.expectedDate ?? null,
         status: 'open',

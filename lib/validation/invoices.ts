@@ -65,6 +65,9 @@ export const createInvoiceBodySchema = z
   .object({
     ...invoiceCoreFields,
     status: z.enum(['draft', 'open']).nullish(),
+    /** Typed invoice number (alphanumeric, e.g. "INV-1001"); blank = next number. */
+    refNumber: zDocNumber,
+    allowDuplicateNumber: z.boolean().nullish(),
     lines: z.array(invoiceLineSchema, {
       required_error: 'lines are required',
       invalid_type_error: 'lines must be an array',
