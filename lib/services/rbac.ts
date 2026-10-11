@@ -10,7 +10,7 @@
 import { and, eq } from 'drizzle-orm';
 import { companies, userCompanies, users } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, notFound, validation } from './_base';
-import { resolveAccess } from './access';
+import { requireEffectivePermission, resolveAccess } from './access';
 import { LEGACY_ROLE_MAP, legacyRoleFor } from '@/lib/permissions/model';
 import { setUserRoles } from './users';
 
@@ -96,7 +96,8 @@ export async function listMembers(ctx: ServiceContext): Promise<CompanyMember[]>
 const ALL_ROLES: Role[] = ['owner', 'admin', 'accountant', 'viewer'];
 
 /**
- * Change a member's role. Requires admin+; granting 'owner' requires being the owner.
+ * Change a member's role. Requires Users & Roles: modify; granting 'owner' requires being the
+ * owner.
  * The company owner's own role can never be changed (it derives from companies.ownerId).
  */
 export async function setMemberRole(
@@ -104,7 +105,10 @@ export async function setMemberRole(
   targetUserId: string,
   role: Role,
 ): Promise<CompanyMember> {
-  const actorRole = await requireRole(ctx, 'admin');
+  // Enterprise roles: Users & Roles — modify (setUserRoles below adds the escalation and
+  // last-Admin guards).
+  await requireEffectivePermission(ctx, 'users', 'modify');
+  const actorRole = await getRole(ctx);
   if (!ALL_ROLES.includes(role)) {
     throw validation(`role must be one of: ${ALL_ROLES.join(', ')}.`);
   }

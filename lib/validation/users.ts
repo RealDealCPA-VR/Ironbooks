@@ -36,6 +36,13 @@ export const updateUserSchema = z
 
 export const resetPasswordSchema = z.object({ password: passwordSchema });
 
+/** POST /api/auth/login body. `email` is the login (an email address or a plain user name). */
+export const loginSchema = z.object({
+  email: z.string().trim().min(1, 'is required').max(255),
+  password: z.string().min(1, 'is required').max(200),
+  totp: z.union([z.string(), z.number()]).optional().nullable(),
+});
+
 const grantAction = z.enum([...ACTIONS, 'full'] as [string, ...string[]]);
 export const permissionGrantSchema = z
   .record(z.string(), z.array(grantAction))

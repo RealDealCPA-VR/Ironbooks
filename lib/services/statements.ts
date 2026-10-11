@@ -34,6 +34,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { notFound, validation, writeAudit, type ServiceContext } from './_base';
+import { taxIdFor } from './access';
 
 // ---------------------------------------------------------------------------
 // Customer Statement
@@ -577,7 +578,8 @@ export async function vendor1099Report(
       result.push({
         vendorId,
         vendorName,
-        taxId,
+        // Masked unless the caller may view sensitive data (also covers the 1099 PDF/e-file).
+        taxId: taxIdFor(ctx, taxId),
         total: toAmountString(total),
       });
     }
@@ -896,7 +898,7 @@ export async function vendor1099Worksheet(
     rows.push({
       vendorId,
       vendorName: acc.vendorName,
-      taxId: acc.taxId,
+      taxId: taxIdFor(ctx, acc.taxId),
       nec1: toAmountString(nec1),
       misc1: toAmountString(misc1),
       misc3: toAmountString(misc3),

@@ -5,9 +5,13 @@
 import { and, eq } from 'drizzle-orm';
 import { accounts, bankAccounts } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { maskForContext } from './access';
+
+// Account numbers leave this service masked (last 4 only) unless the caller's roles grant
+// "view full bank / account numbers" (Users & Roles); see maskForContext.
 
 export async function listBankAccounts(ctx: ServiceContext) {
-  return ctx.db
+  const rows = await ctx.db
     .select({
       id: bankAccounts.id,
       accountId: bankAccounts.accountId,
@@ -21,6 +25,7 @@ export async function listBankAccounts(ctx: ServiceContext) {
     .from(bankAccounts)
     .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
     .where(eq(bankAccounts.companyId, ctx.companyId));
+  return maskForContext(ctx, rows);
 }
 
 export async function getBankAccount(ctx: ServiceContext, id: string) {
@@ -29,7 +34,7 @@ export async function getBankAccount(ctx: ServiceContext, id: string) {
     .from(bankAccounts)
     .where(and(eq(bankAccounts.id, id), eq(bankAccounts.companyId, ctx.companyId)));
   if (!row) throw notFound('Bank account');
-  return row;
+  return maskForContext(ctx, row);
 }
 
 export async function createBankAccount(
@@ -63,5 +68,5 @@ export async function createBankAccount(
     entityId: row.id,
     newValues: { bankName: row.bankName, accountId: row.accountId },
   });
-  return row;
+  return maskForContext(ctx, row);
 }

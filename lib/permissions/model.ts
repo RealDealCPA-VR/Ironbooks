@@ -432,7 +432,8 @@ export function hasAnyWrite(access: EffectiveAccess): boolean {
 
 /**
  * Collapse effective access to the legacy 4-level role still read by older code paths
- * (ctx.role view-only guard in _base.ts, requireRole('admin') in a few services).
+ * (ctx.role view-only guard in _base.ts, rbac.ts getRole). Services check fine-grained
+ * permissions with requirePermission / requireEffectivePermission (lib/services/access.ts).
  */
 export function legacyRoleFor(
   access: EffectiveAccess,

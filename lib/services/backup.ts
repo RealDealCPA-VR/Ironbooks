@@ -52,6 +52,15 @@ interface BackupManifest {
 // createBackup
 // ---------------------------------------------------------------------------
 
+/**
+ * Files at the root of a company data dir that identify/secure THIS file location and must
+ * never travel inside a backup: `.auth-secret` (HMAC key that signs session + unlock cookies)
+ * and `.file-id` (the company-file id session tokens are bound to; lib/auth.ts). A restore
+ * keeps the target directory's own copies, so sessions stay bound to the file they were
+ * issued for.
+ */
+export const FILE_LOCAL_SECRETS = ['.auth-secret', '.file-id'];
+
 export interface BackupResult {
   buffer: Buffer;
   filename: string;
@@ -74,8 +83,11 @@ export function createBackup(companyName?: string, dataDir?: string): BackupResu
 
   const zip = new AdmZip();
   // addLocalFolder adds all files/dirs recursively under dir into the root of
-  // the zip, preserving the internal directory tree.
-  zip.addLocalFolder(dir);
+  // the zip, preserving the internal directory tree — EXCEPT the per-file
+  // secrets (FILE_LOCAL_SECRETS): a backup may be downloaded by any role with
+  // File Utilities, and the session signing secret would let them forge an
+  // Admin session.
+  zip.addLocalFolder(dir, '', (p: string) => !FILE_LOCAL_SECRETS.includes(p.replace(/\\/g, '/')));
 
   // Embed a manifest so restoreBackup can verify the archive is really a
   // BookKeeper backup (and reject backups from a newer, incompatible format).
@@ -298,6 +310,14 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
     }
     // The manifest is archive metadata, not a database file — keep it out of the data dir.
     fs.rmSync(path.join(tmpDir, BACKUP_MANIFEST_ENTRY), { force: true });
+    // Keep THIS file's signing secret + file id (FILE_LOCAL_SECRETS); never adopt ones from the
+    // archive (older backups included them).
+    for (const name of FILE_LOCAL_SECRETS) {
+      const restored = path.join(tmpDir, name);
+      const live = path.join(dir, name);
+      fs.rmSync(restored, { force: true });
+      if (fs.existsSync(live)) fs.copyFileSync(live, restored);
+    }
 
     // (3) Flush + release the live handle so it cannot checkpoint over the restored files.
     await closeDb(dir);

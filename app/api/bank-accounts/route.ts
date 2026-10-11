@@ -6,7 +6,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listBankAccounts, createBankAccount } from '@/lib/services/bankAccounts';
 import { ServiceError } from '@/lib/services/_base';
-import { maskSensitive } from '@/lib/permissions/mask';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -25,8 +24,9 @@ function errorResponse(err: unknown) {
 export async function GET() {
   try {
     const ctx = await getServerContext();
-    // Full account numbers only for roles with the 'view full bank/account numbers' flag.
-    return NextResponse.json(maskSensitive(await listBankAccounts(ctx), ctx.access));
+    // Account numbers are masked by the service for roles without the 'view full bank/account
+    // numbers' flag (lib/services/bankAccounts.ts).
+    return NextResponse.json(await listBankAccounts(ctx));
   } catch (err) {
     return errorResponse(err);
   }
@@ -36,9 +36,7 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await req.json();
-    return NextResponse.json(maskSensitive(await createBankAccount(ctx, body), ctx.access), {
-      status: 201,
-    });
+    return NextResponse.json(await createBankAccount(ctx, body), { status: 201 });
   } catch (err) {
     return errorResponse(err);
   }

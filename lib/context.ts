@@ -15,7 +15,7 @@ import { ensureDevCompany, verifyClosingDatePassword } from '@/lib/services/comp
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { resolveAccess, PERMISSION_DENIED_PREFIX } from '@/lib/services/access';
 import { fullAccess, legacyRoleFor } from '@/lib/permissions/model';
-import { enforceRequestPermission } from '@/lib/permissions/enforce';
+import { enforceRequestPermission, enforceSelfRoute } from '@/lib/permissions/enforce';
 import { companies, userCompanies, users } from '@/lib/db/schema';
 import { getSessionUserId, hasValidUnlockCookie } from '@/lib/auth';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
@@ -55,19 +55,62 @@ async function resolveClosingDateOverride(db: DB, companyId: string): Promise<bo
   return verifyClosingDatePassword(db, companyId, supplied);
 }
 
-export async function getServerContext(): Promise<ServiceContext> {
-  const db = await getDb();
-
-  // File-open password (QB-style company file lock). Enforced here so it covers EVERY API route
-  // and server render — even when the file has no user accounts (the standalone-file-password
-  // model, where getServerContext would otherwise fall open for first-run seeding). Page
-  // navigation is additionally redirected to /unlock by middleware for a friendly prompt.
+/**
+ * File-open password (QB-style company file lock). Enforced by getServerContext AND
+ * getSessionGate so it covers EVERY API route and server render — even when the file has no
+ * user accounts (the standalone-file-password model, where getServerContext would otherwise
+ * fall open for first-run seeding). Page navigation is additionally redirected to /unlock by
+ * middleware for a friendly prompt.
+ */
+async function assertFileUnlocked(db: DB): Promise<void> {
   const lock = await getFileLockStatus(db);
   if (lock.enabled && !(await hasValidUnlockCookie())) {
     // lib/client.ts isFileLockError and getPageContext below string-match this exact message —
     // don't reword it without updating both.
     throw new ServiceError('FORBIDDEN', 'This company file is locked. Unlock it to continue.');
   }
+}
+
+export interface SessionGate {
+  db: DB;
+  /** Verified session user (token bound to THIS company file), or null without a session. */
+  userId: string | null;
+}
+
+/**
+ * The central gate for API routes mapped 'self' in lib/permissions/routes.ts (company-file
+ * management, the caller's own 2FA settings) — routes that act on the USER rather than on the
+ * active company, so they can't take a company-scoped getServerContext. It still applies every
+ * file-level check getServerContext does:
+ *  - the request must be mapped 'self'/'public' in the route map (unmapped → denied);
+ *  - the company-file password (file lock);
+ *  - the session token's file binding (verifySessionToken rejects other files' sessions);
+ *  - a user deactivated in every company of this file is refused (DEACTIVATED_MESSAGE).
+ * Per-company authorization (e.g. rename needs company:modify) stays with the handler, which
+ * resolves the caller's effective permissions in the company named by the URL.
+ */
+export async function getSessionGate(): Promise<SessionGate> {
+  await enforceSelfRoute();
+  const db = await getDb();
+  await assertFileUnlocked(db);
+  const userId = await getSessionUserId();
+  if (!userId) return { db, userId: null };
+  const [user] = await db.select({ id: users.id }).from(users).where(eq(users.id, userId));
+  if (!user) throw new ServiceError('FORBIDDEN', 'Authentication required.');
+  const memberships = await db
+    .select({ isActive: userCompanies.isActive })
+    .from(userCompanies)
+    .where(eq(userCompanies.userId, userId));
+  if (memberships.length && !memberships.some((m) => m.isActive !== false)) {
+    throw new ServiceError('FORBIDDEN', DEACTIVATED_MESSAGE);
+  }
+  return { db, userId };
+}
+
+export async function getServerContext(): Promise<ServiceContext> {
+  const db = await getDb();
+
+  await assertFileUnlocked(db);
 
   const userId = await getSessionUserId();
 

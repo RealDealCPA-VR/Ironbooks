@@ -1,7 +1,8 @@
 /**
  * Sensitive-field masking for API responses (QB Enterprise "view sensitive data" permissions).
  *
- *  - SSNs (employee `ssn`, payroll form `ssn`/`employeeSsn`) are masked to the last 4 digits
+ *  - SSNs / tax IDs (employee `ssn`, payroll form `ssn`/`employeeSsn`, vendor `taxId` -- a sole
+ *    proprietor's TIN is their SSN) are masked to the last 4 digits
  *    unless the caller's roles grant `sensitivePayroll`.
  *  - Bank / account numbers (`accountNumber`, `routingNumber`) are masked to the last 4 unless
  *    the caller's roles grant `fullAccountNumbers`.
@@ -11,7 +12,7 @@
  */
 import type { EffectiveAccess } from './model';
 
-const SSN_KEYS = new Set(['ssn', 'employeeSsn']);
+const SSN_KEYS = new Set(['ssn', 'employeeSsn', 'taxId']);
 const ACCOUNT_KEYS = new Set(['accountNumber', 'routingNumber', 'bankAccountNumber']);
 
 /** "123-45-6789" → "***-**-6789"; anything with < 4 digits → "****". */

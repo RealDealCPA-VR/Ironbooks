@@ -3,12 +3,13 @@
  * A "company file" maps to a PGlite data directory (see lib/db). For now we operate on the
  * active database; multi-file management is layered on in the Electron shell.
  */
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { accounts, companies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
-import { assertWrite, requireRole } from './rbac';
+import { assertWrite } from './rbac';
+import { requireEffectivePermission } from './access';
 import type { DB } from '@/lib/db';
 
 type AccountSeed = { code: string; name: string; type: string; subtype: string };
@@ -47,8 +48,9 @@ export async function listCompanies(db: DB) {
 }
 
 /**
- * Companies the given user is a member of (via user_companies). Used by the API layer so an
- * authenticated caller only ever sees their own company files — never other tenants' rows.
+ * Companies the given user is an ACTIVE member of (via user_companies). Used by the API layer so
+ * an authenticated caller only ever sees their own company files — never other tenants' rows,
+ * nor companies they were deactivated in (Users & Roles).
  * Pass excludeArchived to hide soft-deleted files (settings.archived === true).
  */
 export async function listCompaniesForUser(
@@ -60,7 +62,7 @@ export async function listCompaniesForUser(
     .select({ company: companies })
     .from(companies)
     .innerJoin(userCompanies, eq(userCompanies.companyId, companies.id))
-    .where(eq(userCompanies.userId, userId));
+    .where(and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true)));
   const list = rows.map((r) => r.company);
   if (!opts?.excludeArchived) return list;
   return list.filter(
@@ -303,7 +305,9 @@ export async function setClosingDate(
   ctx: ServiceContext,
   input: SetClosingDateInput,
 ): Promise<ClosingDateSettings> {
-  await requireRole(ctx, 'admin');
+  // Enterprise roles: Closing Date / Periods — modify (Admin, Accountant, External Accountant,
+  // custom roles), same rule as the route map for PATCH /api/company/closing-date.
+  await requireEffectivePermission(ctx, 'closing', 'modify');
   const existing = await getCompany(ctx);
   if (!existing) throw notFound('company');
 

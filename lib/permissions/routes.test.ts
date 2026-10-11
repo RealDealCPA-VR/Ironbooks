@@ -106,6 +106,23 @@ describe('API permission map coverage', () => {
     expect(problems).toEqual([]);
   });
 
+  it("every 'self' route passes the central session gate (file lock, file-bound session, deactivation)", () => {
+    // The employee portal authenticates with its own portal-session cookie instead.
+    const exempt = new Set(['/api/portal/me']);
+    const problems: string[] = [];
+    for (const f of files) {
+      const rules = API_ROUTE_PERMISSIONS[f.pattern] ?? {};
+      if (!Object.values(rules).some((r) => r === 'self') || exempt.has(f.pattern)) continue;
+      if (!/getSessionGate\s*\(|getServerContext\s*\(/.test(f.src)) {
+        problems.push(`${f.rel}: never calls getSessionGate() / getServerContext()`);
+      }
+      if (/getSessionUserId\s*\(/.test(f.src)) {
+        problems.push(`${f.rel}: reads the session directly — use getSessionGate()`);
+      }
+    }
+    expect(problems).toEqual([]);
+  });
+
   it('keeps data routes out of the public/self allowlist', () => {
     const open = Object.entries(API_ROUTE_PERMISSIONS)
       .filter(([, rules]) => Object.values(rules).some((r) => r === 'public' || r === 'self'))

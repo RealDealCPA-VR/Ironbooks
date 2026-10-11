@@ -72,3 +72,21 @@ export async function enforceRequestPermission(access: EffectiveAccess): Promise
   if (!info) return;
   authorizeRequest(info, access);
 }
+
+/**
+ * getSessionGate hook (routes mapped 'self'): the in-flight API request must be mapped 'self'
+ * or 'public'. Unmapped → denied; an area/member-mapped route calling the gate instead of
+ * getServerContext is a programming error and is denied too (it would skip the area check).
+ */
+export async function enforceSelfRoute(): Promise<void> {
+  const info = await currentRequestInfo();
+  if (!info?.path) return; // outside a request scope (tests, scripts)
+  const { path, method } = info;
+  if (path !== '/api' && !path.startsWith('/api/')) return;
+  const rule = apiRuleFor(path, method);
+  if (rule === 'self' || rule === 'public') return;
+  if (rule === null) {
+    throw new ServiceError('FORBIDDEN', `No permission mapping exists for ${method} ${path}. Access denied.`);
+  }
+  throw new ServiceError('FORBIDDEN', `${method} ${path} must be authorized through getServerContext.`);
+}

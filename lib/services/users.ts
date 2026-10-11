@@ -9,6 +9,8 @@
  *  - The last ACTIVE Admin of a company can never be deactivated or lose the Admin role.
  *  - No privilege escalation: a non-Admin user manager can only grant roles / edit roles /
  *    manage users whose permissions are a subset of their own; only an Admin grants Admin.
+ *  - A login shared with other companies of the file can only be renamed / have its password
+ *    reset by an Admin of all of them (no cross-company account takeover).
  *  - Every change writes an audit row (passwords are never logged).
  */
 import { and, eq } from 'drizzle-orm';
@@ -181,6 +183,39 @@ async function assertCanManageUser(ctx: ServiceContext, targetUserId: string): P
   }
 }
 
+/**
+ * A login (users row: name, login, password) is SHARED by every company of this file the user
+ * belongs to, so changing it from company A also changes how they sign in to company B. Only
+ * the user themself, or a caller who is an ACTIVE Admin of every OTHER company the user belongs
+ * to (or created), may change it — otherwise an Admin of A could attach B's Admin login
+ * (addUser) and then reset its password: a cross-company account takeover. Trusted contexts
+ * (no `access`) pass.
+ */
+async function assertCanChangeSharedLogin(ctx: ServiceContext, targetUserId: string): Promise<void> {
+  if (!ctx.access) return;
+  if (ctx.userId && ctx.userId === targetUserId) return;
+  const memberOf = await ctx.db
+    .select({ companyId: userCompanies.companyId })
+    .from(userCompanies)
+    .where(eq(userCompanies.userId, targetUserId));
+  const created = await ctx.db
+    .select({ companyId: companies.id })
+    .from(companies)
+    .where(eq(companies.ownerId, targetUserId));
+  const others = new Set(
+    [...memberOf, ...created].map((r) => r.companyId).filter((id) => id !== ctx.companyId),
+  );
+  for (const companyId of others) {
+    const caller = ctx.userId ? await resolveAccess(ctx.db, companyId, ctx.userId) : null;
+    if (!caller || !caller.active || !caller.access.isAdmin) {
+      throw new ServiceError(
+        'FORBIDDEN',
+        "This login is also used in another company of this file. Only an Admin of every company the user belongs to can change the user's login or password.",
+      );
+    }
+  }
+}
+
 async function assertNotLastAdmin(
   ctx: ServiceContext,
   targetUserId: string,
@@ -328,6 +363,11 @@ export async function updateUser(
     assertCanGrant(ctx, unionRoles(defs), 'assign roles');
   }
 
+  const changesLogin =
+    (input.name !== undefined && input.name.trim() !== before.name) ||
+    (input.login !== undefined && normLogin(input.login) !== before.login);
+  if (changesLogin) await assertCanChangeSharedLogin(ctx, userId);
+
   await inTransaction(ctx, async (tx) => {
     await assertNotLastAdmin(tx, userId, {
       deactivate: input.isActive === false,
@@ -409,6 +449,7 @@ export async function resetUserPassword(
   requirePermission(ctx, 'users', 'modify');
   if (!(await getMembership(ctx, userId))) throw notFound('User');
   await assertCanManageUser(ctx, userId);
+  await assertCanChangeSharedLogin(ctx, userId);
   if (typeof password !== 'string' || password.length < 8) {
     throw validation('Password must be at least 8 characters.');
   }

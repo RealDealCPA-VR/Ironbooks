@@ -172,9 +172,9 @@ describe('RBAC enforcement + closing date', () => {
   });
 
   describe('closing date + password', () => {
-    it('sets a closing date with a password (admin/owner only)', async () => {
+    it('sets a closing date with a password (roles with Closing Date: modify only)', async () => {
       await expect(
-        setClosingDate(accountantCtx, { closingDate: '2026-03-31', password: 'lock123' }),
+        setClosingDate(viewerCtx, { closingDate: '2026-03-31', password: 'lock123' }),
       ).rejects.toMatchObject({ code: 'FORBIDDEN' });
 
       const result = await setClosingDate(ownerCtx, {

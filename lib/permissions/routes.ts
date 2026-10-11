@@ -13,9 +13,13 @@
  *  - { area, action }  checked against the caller's effective permissions.
  *  - 'member'          any active member of the company (no specific area); still requires a
  *                      valid session + unlocked file via getServerContext.
- *  - 'self'            the handler authenticates itself without getServerContext (company-file
- *                      management scoped by its own membership checks, employee portal session,
- *                      the caller's own 2FA settings). Never put data routes here.
+ *  - 'self'            acts on the signed-in USER rather than the active company (company-file
+ *                      list/create/select/rename/archive, the caller's own 2FA settings). These
+ *                      call getSessionGate (lib/context.ts), which still enforces the file lock,
+ *                      the session's file binding and deactivation; per-company checks (e.g.
+ *                      rename needs company:modify in the company named by the URL) are in the
+ *                      handler. The employee portal uses its own portal session. Never put data
+ *                      routes here (routes.test.ts checks every 'self' route uses the gate).
  *  - 'public'          no authentication at all (login, signup, unlock, status probes).
  *
  * Pure module (no Node/DB imports): also used client-side to filter navigation.

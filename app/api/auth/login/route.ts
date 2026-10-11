@@ -19,12 +19,14 @@ import {
 import { verifyTotp } from '@/lib/totp';
 import { COMPANY_COOKIE, DEACTIVATED_MESSAGE } from '@/lib/context';
 import { getFileLockStatus } from '@/lib/services/fileLock';
+import { loginSchema } from '@/lib/validation/users';
 
 export async function POST(req: NextRequest) {
-  const { email, password, totp } = await req.json();
-  if (!email?.trim() || !password) {
+  const parsed = loginSchema.safeParse(await req.json().catch(() => null));
+  if (!parsed.success) {
     return NextResponse.json({ error: 'Email and password are required.', code: 'VALIDATION' }, { status: 400 });
   }
+  const { email, password, totp } = parsed.data;
   const db = await getDb();
   // The company-file password gates the file BEFORE any user login (QB order). Same message as
   // getServerContext so lib/client.ts sends the browser to /unlock.
@@ -35,7 +37,7 @@ export async function POST(req: NextRequest) {
       { status: 403 },
     );
   }
-  const [user] = await db.select().from(users).where(eq(users.email, email.trim().toLowerCase()));
+  const [user] = await db.select().from(users).where(eq(users.email, email.toLowerCase()));
   if (!user || !(await verifyPassword(password, user.passwordHash))) {
     return NextResponse.json({ error: 'Invalid email or password.', code: 'FORBIDDEN' }, { status: 401 });
   }

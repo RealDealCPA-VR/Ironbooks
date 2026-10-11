@@ -25,6 +25,7 @@ import {
   type RoleDefinition,
   type RoleFlags,
 } from '@/lib/permissions/model';
+import { maskAccountNumber, maskSensitive, maskSsn } from '@/lib/permissions/mask';
 import { ServiceError, type ServiceContext } from './_base';
 
 export interface ResolvedAccess {
@@ -152,6 +153,31 @@ export function requirePermission(ctx: ServiceContext, area: Area, action: Actio
   if (!can(ctx.access, area, action)) throw permissionDenied(area, action);
 }
 
+/**
+ * Async service-level guard for services that must hold even for contexts built WITHOUT
+ * `access` (replaces the legacy `requireRole(ctx, 'admin')`): uses ctx.access when present,
+ * otherwise resolves the user's effective permissions from the company file. A context with
+ * neither access nor a user id is refused (same as the legacy guard), and so is an inactive or
+ * non-member user.
+ */
+export async function requireEffectivePermission(
+  ctx: ServiceContext,
+  area: Area,
+  action: Action,
+): Promise<EffectiveAccess> {
+  let access = ctx.access;
+  if (!access) {
+    if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'You do not have access to this company.');
+    const r = await resolveAccess(ctx.db, ctx.companyId, ctx.userId);
+    if (!r.member || !r.active) {
+      throw new ServiceError('FORBIDDEN', 'You do not have access to this company.');
+    }
+    access = r.access;
+  }
+  if (!can(access, area, action)) throw permissionDenied(area, action);
+  return access;
+}
+
 /** True when the context may see the given sensitive flag (trusted contexts: yes). */
 export function hasFlag(
   ctx: Pick<ServiceContext, 'access'>,
@@ -159,4 +185,24 @@ export function hasFlag(
 ): boolean {
   if (!ctx.access) return true;
   return ctx.access.flags[flag] === true;
+}
+
+/**
+ * Mask sensitive fields (SSNs / tax IDs, bank & account numbers) in a service's return value for
+ * the context's effective permissions (lib/permissions/mask.ts). Services that return such data
+ * to callers apply it at their boundary, so every route and export built on them is covered.
+ * Trusted contexts (no `access`) see everything.
+ */
+export function maskForContext<T>(ctx: Pick<ServiceContext, 'access'>, data: T): T {
+  return maskSensitive(data, ctx.access);
+}
+
+/** An SSN / taxpayer id as this context may see it (full, or "***-**-6789"). */
+export function taxIdFor(ctx: Pick<ServiceContext, 'access'>, value: string | null): string | null {
+  return hasFlag(ctx, 'sensitivePayroll') ? value : maskSsn(value);
+}
+
+/** A bank / account number as this context may see it (full, or "••••6789"). */
+export function accountNumberFor(ctx: Pick<ServiceContext, 'access'>, value: string): string {
+  return hasFlag(ctx, 'fullAccountNumbers') ? value : (maskAccountNumber(value) ?? '');
 }
