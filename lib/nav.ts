@@ -21,6 +21,8 @@ import type { Area } from '@/lib/permissions/model';
 import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
 // team pricing: advanced pricing, SO fulfillment worksheet, enhanced receiving
 import { PackageCheck, FileInput, SlidersHorizontal } from 'lucide-react';
+// wave-2 lists: Lists hub, To Do, Add/Edit Multiple, Clean Up, Inventory Center
+import { ClipboardCheck, Table2, Eraser } from 'lucide-react';
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -125,6 +127,7 @@ export const navGroups: NavGroup[] = [
       { icon: Paperclip, label: 'Attachments', path: '/attachments' },
       { icon: BadgeCheck, label: 'Data Integrity', path: '/integrity' },
       { icon: GitMerge, label: 'Merge Records', path: '/merge' },
+      { icon: Eraser, label: 'Clean Up Lists', path: '/lists/cleanup' },
       { icon: FileX, label: '1099 E-File', path: '/reports/1099-efile' },
       { icon: Clock, label: 'Estimate Follow-up', path: '/estimates-followup' },
     ],
@@ -137,6 +140,7 @@ export const navGroups: NavGroup[] = [
       { icon: Car, label: 'Mileage', path: '/mileage' },
       { icon: Boxes, label: 'Fixed Assets', path: '/fixed-assets' },
       { icon: Combine, label: 'Assemblies', path: '/assemblies' },
+      { icon: Warehouse, label: 'Inventory Center', path: '/inventory-center' },
       { icon: PackageSearch, label: 'Inventory Ops', path: '/inventory-ops' },
       { icon: Layers, label: 'FIFO Inventory', path: '/fifo' },
       { icon: Warehouse, label: 'Inventory Sites', path: '/inventory-sites' },
@@ -144,6 +148,9 @@ export const navGroups: NavGroup[] = [
       { icon: Ship, label: 'Landed Cost', path: '/landed-cost' },
       { icon: HandCoins, label: 'Customer Pricing', path: '/customer-pricing' },
       { icon: FileSpreadsheet, label: 'Expense Reports', path: '/expense-reports' },
+      { icon: ListChecks, label: 'Lists', path: '/lists' },
+      { icon: ClipboardCheck, label: 'To Do', path: '/lists/todos' },
+      { icon: Table2, label: 'Add/Edit Multiple', path: '/lists/multiple' },
     ],
   },
   {

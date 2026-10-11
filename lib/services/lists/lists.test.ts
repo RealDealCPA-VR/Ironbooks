@@ -49,6 +49,10 @@ import { bulkSave } from './bulk';
 import { changeItemPrices, createPurchaseOrdersFromReorder, stockStatusByVendor } from './itemTools';
 import { inventoryCenterList, inventoryItemDetail } from './inventoryCenter';
 import { findReferences } from './references';
+import { resolvePaymentMethod } from './paymentMethods';
+import { assignJobType } from './jobTypes';
+import { jobs as jobsTable } from '@/lib/db/schema';
+import { setComponents } from '../combinedTax';
 import { parseTsv, pastedRowsToRecords, parseAmount } from '@/lib/lists/bulk';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-wave2-lists-q7m2');
@@ -147,6 +151,23 @@ describe('simple lists + Terms list', () => {
     expect(audits.map((a) => a.action).sort()).toEqual(['create', 'delete']);
   });
 
+  it('assigns a job type to a job', async () => {
+    const jt = await createEntry(ctx, 'job-types', { name: 'Remodel' });
+    const cust = await createCustomer(ctx, { displayName: 'Job Owner' });
+    const [job] = await db.insert(jobsTable).values({ companyId: ctx.companyId, customerId: cust.id, name: 'Kitchen' }).returning();
+    expect((await assignJobType(ctx, job.id, jt.id)).jobTypeId).toBe(jt.id);
+    expect(await removeEntry(ctx, 'job-types', jt.id)).toEqual({ deleted: false, deactivated: true });
+    expect((await assignJobType(ctx, job.id, null)).jobTypeId).toBeNull();
+  });
+
+  it('maps payment method list entries to the payment enum', async () => {
+    expect(await resolvePaymentMethod(ctx, 'Visa')).toMatchObject({ type: 'credit_card' });
+    const custom = await createEntry(ctx, 'payment-methods', { name: 'Venmo', type: 'other' });
+    expect(await resolvePaymentMethod(ctx, custom.id)).toMatchObject({ id: custom.id, type: 'other' });
+    expect(await resolvePaymentMethod(ctx, 'check')).toMatchObject({ type: 'check' });
+    await expect(resolvePaymentMethod(ctx, 'Bitcoin')).rejects.toThrow(/not found/i);
+  });
+
   it('customers and items follow their sales tax code; resale number is kept', async () => {
     const codes = await listEntries(ctx, 'sales-tax-codes');
     const non = codes.find((c) => c.code === 'Non')!;
@@ -220,6 +241,10 @@ describe('notes, to-dos, billing rates, U/M, tax rate edit, vehicles', () => {
     expect(upd.rate).toBe('0.062500');
     expect(upd.name).toBe('City tax');
     await expect(updateTaxRate(ctx, rate.id, { rate: '2' })).rejects.toThrow(/between 0 and 1/);
+    const combined = await createTaxRate(ctx, { name: 'Combined', rate: '0' });
+    await setComponents(ctx, combined.id, [{ name: 'State', rate: '0.05' }, { name: 'County', rate: '0.01' }]);
+    await expect(updateTaxRate(ctx, combined.id, { rate: '0.07' })).rejects.toThrow(/components/);
+    expect((await updateTaxRate(ctx, combined.id, { name: 'Combined 6%', isActive: true })).rate).toBe('0.060000');
   });
 
   it('logs mileage against a vehicle and checks odometer readings', async () => {

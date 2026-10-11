@@ -212,6 +212,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/customers/bulk': r('customers', 'GET POST'), // Add/Edit Multiple (edits also need modify)
   '/api/jobs': r('customers', 'GET POST'),
   '/api/jobs/[id]': r('customers', 'GET PATCH DELETE'),
+  '/api/job-type-assign': r('customers', 'POST:modify'), // wave-2 lists: a job's Job Type
   '/api/customer-prices': r('customers', 'GET POST'),
   '/api/customer-prices/[id]': r('customers', 'DELETE'),
   '/api/pricing/customers/[id]': r('customers', 'PATCH'),

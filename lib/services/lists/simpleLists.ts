@@ -305,7 +305,7 @@ export async function ensureSeeded(ctx: ServiceContext, key: SimpleListKey): Pro
     const taken = new Set(existing.map((r) => String(r[def.nameField]).toLowerCase()));
     for (const entry of def.seed!) {
       if (taken.has(String(entry[def.nameField]).toLowerCase())) continue;
-      const [row] = await sys.db.insert(t).values({ companyId: ctx.companyId, ...entry }).returning();
+      const row = ((await sys.db.insert(t).values({ companyId: ctx.companyId, ...entry }).returning()) as Row[])[0];
       await writeAudit(sys, {
         action: 'create',
         entityType: def.entityType,
@@ -374,10 +374,11 @@ export async function createEntry(ctx: ServiceContext, key: SimpleListKey, body:
   if (def.finalize) data = await def.finalize(ctx, data);
   await assertUniqueName(ctx, def, String(data[def.nameField]));
   return inTransaction(ctx, async (tx) => {
-    const [row] = await tx.db
+    const inserted = (await tx.db
       .insert(def.table)
       .values({ ...data, companyId: tx.companyId, isActive: data.isActive ?? true })
-      .returning();
+      .returning()) as Row[];
+    const row = inserted[0];
     await writeAudit(tx, { action: 'create', entityType: def.entityType, entityId: row.id, newValues: row });
     return row as Row;
   });

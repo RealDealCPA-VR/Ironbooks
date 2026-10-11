@@ -19,5 +19,6 @@ export async function handleBulkPost(ctx: ServiceContext, list: BulkList, area: 
     requirePermission(ctx, area, 'modify');
   }
   const result = await bulkSave(ctx, list, parsed.data.rows, { dryRun: parsed.data.dryRun });
-  return NextResponse.json(result, { status: result.errors.length ? 422 : 200 });
+  // Row problems are a normal outcome of checking a grid: 200 with per-row errors (saved=false).
+  return NextResponse.json(result);
 }
