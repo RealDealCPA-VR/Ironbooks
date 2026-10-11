@@ -174,10 +174,11 @@ describe('journal form: canSave implies the server accepts the entry', () => {
   });
 
   it('large amounts keep cent precision (no float drift)', () => {
+    // Largest totals that still fit the ledger's numeric(15,2) (13 integer digits).
     const bal = computeJournalBalance([
-      { accountId: 'a', debit: '9999999999999.99', credit: '' },
+      { accountId: 'a', debit: '9999999999998.99', credit: '' },
       { accountId: 'b', debit: '0.01', credit: '' },
-      { accountId: 'c', debit: '', credit: '10000000000000.00' },
+      { accountId: 'c', debit: '', credit: '9999999999999.00' },
     ]);
     expect(bal.difference).toBe('0.00');
     expect(bal.canSave).toBe(true);

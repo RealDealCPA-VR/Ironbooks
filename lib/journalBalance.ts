@@ -35,14 +35,21 @@ export interface JournalBalance {
 }
 
 const AMOUNT_RE = /^\d+(\.\d{1,2})?$/;
+/** Commas are accepted only as thousands separators in groups of three ("1,250.00"). */
+const GROUPED_RE = /^\d{1,3}(,\d{3})+(\.\d{1,2})?$/;
+/** Ledger columns are numeric(15,2): at most 13 digits before the decimal point. */
+const MAX_AMOUNT = new Decimal('9999999999999.99');
 
 /**
  * Canonical form of a typed amount: trimmed, thousands separators removed ("1,250.00 " ->
  * "1250.00"). The Save gate validates THIS string and the page must send THIS string (see
  * journalPayloadAmount) — otherwise the form could show "Balanced" for text the API rejects.
+ * Any other comma (e.g. "12,50" typed with a comma as the decimal mark) is left in place so
+ * the amount stays invalid instead of silently becoming 1250.
  */
 export function normalizeAmount(raw: string | null | undefined): string {
-  return (raw ?? '').trim().replace(/,/g, '');
+  const s = (raw ?? '').trim();
+  return GROUPED_RE.test(s) ? s.replace(/,/g, '') : s;
 }
 
 /** Amount as sent to /api/journal-entries: normalized, or undefined when blank. */
@@ -51,11 +58,12 @@ export function journalPayloadAmount(raw: string | null | undefined): string | u
   return s ? s : undefined;
 }
 
-function parseAmount(raw: string): Decimal | null | 'invalid' {
+function parseAmount(raw: string): Decimal | null | 'invalid' | 'tooLarge' {
   const s = normalizeAmount(raw);
   if (!s) return null;
   if (!AMOUNT_RE.test(s)) return 'invalid';
-  return new Decimal(s);
+  const d = new Decimal(s);
+  return d.greaterThan(MAX_AMOUNT) ? 'tooLarge' : d;
 }
 
 export function computeJournalBalance(lines: JournalLineInput[]): JournalBalance {
@@ -64,6 +72,7 @@ export function computeJournalBalance(lines: JournalLineInput[]): JournalBalance
   const invalidLines: number[] = [];
   const incompleteLines: number[] = [];
   const twoSidedLines: number[] = [];
+  const tooLargeLines: number[] = [];
   let accountLines = 0;
 
   lines.forEach((l, i) => {
@@ -72,7 +81,9 @@ export function computeJournalBalance(lines: JournalLineInput[]): JournalBalance
     // postJournalEntry rejects a line carrying both a debit and a credit.
     const twoSided = d instanceof Decimal && !d.isZero() && c instanceof Decimal && !c.isZero();
     if (twoSided) twoSidedLines.push(i + 1);
-    if (d === 'invalid' || c === 'invalid' || twoSided) invalidLines.push(i + 1);
+    const tooLarge = d === 'tooLarge' || c === 'tooLarge';
+    if (tooLarge) tooLargeLines.push(i + 1);
+    if (d === 'invalid' || c === 'invalid' || tooLarge || twoSided) invalidLines.push(i + 1);
     if (d instanceof Decimal) debits = debits.plus(d);
     if (c instanceof Decimal) credits = credits.plus(c);
     const hasAmount =
@@ -90,7 +101,11 @@ export function computeJournalBalance(lines: JournalLineInput[]): JournalBalance
     const bothSides = twoSidedLines.includes(n);
     blocker = bothSides
       ? `Line ${n} has both a debit and a credit. Use one side per line (split it into two lines).`
-      : `Line ${n} has an amount that isn’t a number (use digits like 125.50).`;
+      : tooLargeLines.includes(n)
+        ? `Line ${n} has an amount that is too large (the most one entry can hold is 9,999,999,999,999.99).`
+        : `Line ${n} has an amount that isn’t a number (use digits like 1250.50 or 1,250.50; commas only between thousands).`;
+  } else if (debits.greaterThan(MAX_AMOUNT) || credits.greaterThan(MAX_AMOUNT)) {
+    blocker = 'The total of this entry is too large to record (over 9,999,999,999,999.99). Split it into smaller entries.';
   } else if (accountLines < 2) {
     blocker = 'Choose an account on at least two lines.';
   } else if (incompleteLines.length) {
