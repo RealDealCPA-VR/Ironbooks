@@ -386,6 +386,8 @@ describe('ledger invariants — adversarial QA, re-test round 1', () => {
     acct['6840'] = acc.id;
     await post('3.00', '6840', '1000');
     await expectRejected(db.execute(sql`UPDATE accounts SET company_id = ${otherCtx.companyId} WHERE id = ${acc.id}`));
+    // Bundling a type change (which re-derives the balance) must not skip the check.
+    await expectRejected(db.execute(sql`UPDATE accounts SET company_id = ${otherCtx.companyId}, type = 'asset' WHERE id = ${acc.id}`));
     const cross = await db.execute(sql`
       SELECT count(*)::int AS n FROM journal_entry_lines l
       JOIN journal_entries e ON e.id = l.journal_entry_id

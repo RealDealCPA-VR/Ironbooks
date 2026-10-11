@@ -412,6 +412,16 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  -- An account referenced by journal lines cannot move to another company: its lines
+  -- would then cross companies (the state BK001 forbids for touched entries). Checked
+  -- before the type-change branch so bundling a type change cannot skip it.
+  IF NEW.company_id IS DISTINCT FROM OLD.company_id
+     AND NOT bka_ledger_rewrite_allowed()
+     AND EXISTS (SELECT 1 FROM journal_entry_lines l WHERE l.account_id = OLD.id) THEN
+    RAISE EXCEPTION 'LEDGER: account % has journal lines and cannot be moved to another company', OLD.code
+      USING ERRCODE = 'BK003';
+  END IF;
+
   IF NEW.type IS DISTINCT FROM OLD.type THEN
     NEW.balance := bka_account_ledger_balance(NEW.id, NEW.type);
     RETURN NEW;
