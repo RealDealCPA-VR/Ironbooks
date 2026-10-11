@@ -319,6 +319,7 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_jel_non_posting: 'Non-posting accounts never carry posted amounts (lines)',
   bka_je_non_posting: 'Non-posting accounts never carry posted amounts (post transitions)',
   bka_accounts_non_posting: 'Accounts with history cannot become non-posting',
+  bka_transfers_no_ar_ap: 'Transfers never move money into or out of A/R or A/P',
 };
 
 async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string[]; total: number }> {

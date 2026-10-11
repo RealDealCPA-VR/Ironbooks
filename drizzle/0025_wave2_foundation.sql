@@ -266,3 +266,5 @@ DROP TRIGGER IF EXISTS bka_transfers_no_ar_ap ON transfers;
 CREATE TRIGGER bka_transfers_no_ar_ap
   BEFORE INSERT OR UPDATE OF from_account_id, to_account_id ON transfers
   FOR EACH ROW EXECUTE FUNCTION bka_transfers_no_ar_ap_check();
+--> statement-breakpoint
+ALTER TABLE transfers ENABLE ALWAYS TRIGGER bka_transfers_no_ar_ap;
