@@ -7,14 +7,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { closeDb, getDb, type DB } from '@/lib/db';
 import { accounts, auditLogs, customers, inventoryLayers, items, journalEntries, users, vendors } from '@/lib/db/schema';
 import type { ServiceContext } from '../_base';
 import { createCompany, setClosingDate } from '../company';
-import { createCustomer } from '../customers';
-import { createVendor } from '../vendors';
-import { createItem } from '../items';
+import { createCustomer, updateCustomer } from '../customers';
+import { createVendor, updateVendor } from '../vendors';
+import { createItem, updateItem } from '../items';
 import { adjustInventory, inventoryValuation } from '../inventory';
 import { createClass } from '../dimensions';
 import { balanceSheet, trialBalance } from '../reports';
@@ -24,7 +24,7 @@ import { computeDiscount, computeDueDate } from './termsMath';
 import { customerTerms, resolveTermsRef } from './terms';
 import { createEntry, listEntries, removeEntry, updateEntry } from './simpleLists';
 import { addNote } from './notes';
-import { createUomSet, convertToBase } from './uom';
+import { createUomSet, convertToBase, getUomSet, updateUomSet } from './uom';
 import { createItemWithOpeningStock } from './openingStock';
 import { mergeClasses, mergeItems, mergeOtherNames } from './mergeLists';
 import { previewCleanup, runCleanup } from './cleanup';
@@ -475,5 +475,158 @@ describe('permission mapping for the wave-2 lists routes and pages', () => {
   });
   it('new pages are mapped', () => {
     for (const p of ['/lists', '/lists/cleanup', '/inventory-center']) expect(PAGE_AREAS[p], p).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Re-test round 1: verify the doer's fixes with fresh, independent repros.
+describe('re-test round 1', () => {
+  async function freshCompany(name: string): Promise<ServiceContext> {
+    const [u] = await db.select().from(users).where(eq(users.email, 'qa@wave2.local'));
+    const co = await createCompany(db, { name, ownerId: u.id });
+    return { db, companyId: co.id, userId: u.id };
+  }
+
+  it('B5/J1 legacy codes on vendors protect their entry; another company\'s use does not', async () => {
+    const a = await freshCompany('Terms Use A');
+    const b = await freshCompany('Terms Use B');
+    await createVendor(a, { displayName: 'Due Vendor', terms: 'due_on_receipt' });
+    const [v] = await db.select().from(vendors).where(and(eq(vendors.companyId, a.companyId), eq(vendors.displayName, 'Due Vendor')));
+    const dueA = (await listEntries(a, 'terms')).find((t) => t.name === 'Due on receipt')!;
+    expect(v.termsId === dueA.id || v.terms === 'due_on_receipt').toBe(true);
+    expect((await removeEntry(a, 'terms', dueA.id)).deleted).toBe(false);
+    // Clean Up of company A must keep the now-inactive but still used entry
+    const preview = await previewCleanup(a, ['terms']);
+    expect(preview.lists[0].entries.map((e) => e.id)).not.toContain(dueA.id);
+    await runCleanup(a, { lists: ['terms'] });
+    const [still] = await db.select({ n: sql<number>`count(*)` }).from(sql`payment_terms`).where(sql`id = ${dueA.id}::uuid`);
+    expect(Number(still.n)).toBe(1);
+    // Company B has no one on "Due on receipt": deleting it there is a real delete
+    const dueB = (await listEntries(b, 'terms')).find((t) => t.name === 'Due on receipt')!;
+    expect((await removeEntry(b, 'terms', dueB.id)).deleted).toBe(true);
+    // A discount terms entry used by its text code cannot be deleted; an unused one can
+    await createCustomer(a, { displayName: 'Disc Cust', terms: '2_10_net_30' });
+    const two = (await listEntries(a, 'terms')).find((t) => t.name === '2% 10 Net 30')!;
+    const one = (await listEntries(a, 'terms')).find((t) => t.name === '1% 10 Net 30')!;
+    expect((await removeEntry(a, 'terms', two.id)).deleted).toBe(false);
+    expect((await removeEntry(a, 'terms', one.id)).deleted).toBe(true);
+  });
+
+  it('B16 merge rounding up (+0.01) is posted too; GL == subledger, TB/BS balanced', async () => {
+    const c = await freshCompany('Drift Up Co');
+    const [inv] = await db.select().from(accounts).where(and(eq(accounts.companyId, c.companyId), eq(accounts.code, '1300')));
+    const a = await createItem(c, { name: 'Up A', type: 'inventory', assetAccountId: inv.id });
+    const b = await createItem(c, { name: 'Up B', type: 'inventory', assetAccountId: inv.id });
+    await adjustInventory(c, { itemId: a.id, quantityChange: 100, unitCost: 1, date: d('2026-02-01') });
+    await adjustInventory(c, { itemId: b.id, quantityChange: 200, unitCost: 2, date: d('2026-02-01') });
+    expect((await inventoryValuation(c)).grandTotal).toBe('500.00');
+    const jesBefore = await db.select().from(journalEntries).where(eq(journalEntries.companyId, c.companyId));
+    await mergeItems(c, { fromId: a.id, toId: b.id });
+    expect((await inventoryValuation(c)).grandTotal).toBe('500.01'); // 300 x 1.6667
+    const jesAfter = await db.select().from(journalEntries).where(eq(journalEntries.companyId, c.companyId));
+    expect(jesAfter.length).toBe(jesBefore.length + 1);
+    await assertInvariants(c);
+  });
+
+  it('B16 merge without rounding posts nothing (no zero entries)', async () => {
+    const c = await freshCompany('Drift None Co');
+    const [inv] = await db.select().from(accounts).where(and(eq(accounts.companyId, c.companyId), eq(accounts.code, '1300')));
+    const a = await createItem(c, { name: 'Ex A', type: 'inventory', assetAccountId: inv.id });
+    const b = await createItem(c, { name: 'Ex B', type: 'inventory', assetAccountId: inv.id });
+    await adjustInventory(c, { itemId: a.id, quantityChange: 3, unitCost: 1, date: d('2026-02-01') });
+    await adjustInventory(c, { itemId: b.id, quantityChange: 3, unitCost: 2, date: d('2026-02-01') });
+    const n = (await db.select().from(journalEntries).where(eq(journalEntries.companyId, c.companyId))).length;
+    await mergeItems(c, { fromId: a.id, toId: b.id });
+    expect((await db.select().from(journalEntries).where(eq(journalEntries.companyId, c.companyId))).length).toBe(n);
+    expect((await inventoryValuation(c)).grandTotal).toBe('9.00');
+    await assertInvariants(c);
+  });
+
+  it('B16 merge needing a rounding entry inside a closed period either is refused and rolls back fully, or never lands in the closed period', async () => {
+    const c = await freshCompany('Drift Closed Co');
+    const [inv] = await db.select().from(accounts).where(and(eq(accounts.companyId, c.companyId), eq(accounts.code, '1300')));
+    const a = await createItem(c, { name: 'Cl A', type: 'inventory', assetAccountId: inv.id });
+    const b = await createItem(c, { name: 'Cl B', type: 'inventory', assetAccountId: inv.id });
+    await adjustInventory(c, { itemId: a.id, quantityChange: 100, unitCost: 2, date: d('2026-02-01') });
+    await adjustInventory(c, { itemId: b.id, quantityChange: 200, unitCost: 1, date: d('2026-02-01') });
+    const future = new Date(Date.now() + 5 * 86400_000).toISOString().slice(0, 10);
+    const closed = await setClosingDate(c, { closingDate: future }).then(() => true, () => false);
+    try {
+      const ok = await mergeItems(c, { fromId: a.id, toId: b.id }).then(() => true, () => false);
+      const [ra] = await db.select().from(items).where(eq(items.id, a.id));
+      const [rb] = await db.select().from(items).where(eq(items.id, b.id));
+      if (!ok) {
+        expect(ra.isActive).toBe(true);
+        expect(Number(ra.quantityOnHand)).toBe(100);
+        expect(Number(rb.quantityOnHand)).toBe(200);
+      } else {
+        expect(closed).toBe(false); // a posting dated inside the closed period must not succeed
+      }
+      await assertInvariants(c);
+    } finally {
+      if (closed) await setClosingDate(c, { closingDate: null });
+    }
+  });
+
+  it('G4 rounding "none" keeps cents: half-up, preview == stored for several odd prices', async () => {
+    const cases: Array<[string, string, string]> = [
+      ['9.99', '3.3', '10.32'],
+      ['1.00', '0.5', '1.01'], // 1.005 -> 1.01 half-up
+      ['0.10', '4.9', '0.10'],
+      ['19.95', '-12.345', '17.49'], // 17.4872...
+    ];
+    for (const [price, pct, expected] of cases) {
+      const it0 = await createItem(ctx, { name: `Cents ${price} ${pct}`, type: 'service', salesPrice: price });
+      const prev = await changeItemPrices(ctx, { itemIds: [it0.id], adjustBy: 'percent', value: pct, rounding: 'none', dryRun: true });
+      const res = await changeItemPrices(ctx, { itemIds: [it0.id], adjustBy: 'percent', value: pct, rounding: 'none' });
+      const [row] = await db.select().from(items).where(eq(items.id, it0.id));
+      expect(prev.changes[0].newPrice).toBe(expected);
+      expect(res.changes[0].newPrice).toBe(expected);
+      expect(row.salesPrice).toBe(expected);
+    }
+  });
+
+  it('G2 factors: 6 dp accepted exactly, 7 dp / exponent / oversize refused as validation errors', async () => {
+    const ok = await createUomSet(ctx, { name: 'Six dp', baseUnitName: 'Milligram', baseUnitAbbrev: 'mg', units: [{ name: 'Micro', abbrev: 'ug', factor: '0.000001' }] });
+    const u = ok.units.find((x: { name: string }) => x.name === 'Micro')!;
+    expect(u.factor).toBe('0.000001');
+    expect(Number(convertToBase(ok, 1_000_000, 'Micro'))).toBe(1);
+    for (const factor of ['0.0000001', '1e-7', '0.0000005']) {
+      await expect(
+        createUomSet(ctx, { name: `Bad ${factor}`, baseUnitName: 'G', baseUnitAbbrev: 'g', units: [{ name: 'X', abbrev: 'x', factor }] }),
+      ).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+    // numeric(18,6) holds at most 12 integer digits: a bigger factor must be a validation error, not a DB crash
+    await expect(
+      createUomSet(ctx, { name: 'Huge', baseUnitName: 'G', baseUnitAbbrev: 'g', units: [{ name: 'Planet', abbrev: 'pl', factor: '10000000000000' }] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    // and an update goes through the same rule
+    await expect(
+      updateUomSet(ctx, ok.id, { name: 'Six dp', baseUnitName: 'Milligram', baseUnitAbbrev: 'mg', units: [{ name: 'Micro', abbrev: 'ug', factor: '0.0000001' }] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect((await getUomSet(ctx, ok.id)).units[0].factor).toBe('0.000001');
+  });
+
+  it('B15 names are case-insensitive for vendors and items too (single create, bulk and rename)', async () => {
+    await createVendor(ctx, { displayName: 'Acme QA Supply' });
+    await expect(createVendor(ctx, { displayName: 'ACME qa supply' })).rejects.toThrow();
+    const rv = await bulkSave(ctx, 'vendors', [{ displayName: 'acme QA SUPPLY' }]);
+    expect(rv.saved).toBe(false);
+    await createItem(ctx, { name: 'Widget QA Case', type: 'service' });
+    await expect(createItem(ctx, { name: 'WIDGET qa case', type: 'service' })).rejects.toThrow();
+    const ri = await bulkSave(ctx, 'items', [{ name: 'widget qa case', type: 'service' }]);
+    expect(ri.saved).toBe(false);
+    // renaming onto another record's name in a different case is refused...
+    const c1 = await createCustomer(ctx, { displayName: 'Rename One QA' });
+    const c2 = await createCustomer(ctx, { displayName: 'Rename Two QA' });
+    await expect(updateCustomer(ctx, c2.id, { displayName: 'RENAME ONE qa' })).rejects.toThrow();
+    // ...but changing the case of your own name is allowed
+    await expect(updateCustomer(ctx, c1.id, { displayName: 'RENAME ONE QA' })).resolves.toBeTruthy();
+    const v2 = await createVendor(ctx, { displayName: 'Vendor Self QA' });
+    await expect(updateVendor(ctx, v2.id, { displayName: 'vendor self qa' })).resolves.toBeTruthy();
+    const i2 = await createItem(ctx, { name: 'Item Self QA', type: 'service' });
+    await expect(updateItem(ctx, i2.id, { name: 'ITEM SELF QA' })).resolves.toBeTruthy();
+    // case-variant names in another company are fine
+    await expect(createCustomer(other, { displayName: 'rename one qa' })).resolves.toBeTruthy();
   });
 });
