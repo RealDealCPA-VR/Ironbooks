@@ -31,8 +31,11 @@ import {
   Spinner,
   PageHeader,
   toast,
+  toastError,
   useGridKeys,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
+import { computeJournalBalance, journalPayloadAmount } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { useNewParam } from '@/lib/useFocusParam';
@@ -109,20 +112,6 @@ function nextMonthFirstISO(entryDateISO: string): string {
   const next = new Date(d.getFullYear(), d.getMonth() + 1, 1);
   const mm = String(next.getMonth() + 1).padStart(2, '0');
   return `${next.getFullYear()}-${mm}-01`;
-}
-
-function sumLines(lines: LineRow[], field: 'debit' | 'credit'): number {
-  return lines.reduce((acc, l) => acc + (Number(l[field]) || 0), 0);
-}
-
-function isBalanced(lines: LineRow[]): boolean {
-  const d = sumLines(lines, 'debit');
-  const c = sumLines(lines, 'credit');
-  return Math.abs(d - c) < 0.005 && d > 0;
-}
-
-function hasEnoughLines(lines: LineRow[]): boolean {
-  return lines.filter((l) => l.accountId).length >= 2;
 }
 
 function statusTone(status: string): 'success' | 'void' | 'neutral' {
@@ -215,11 +204,12 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
     disabled: saving,
   });
 
-  const totalDebits = sumLines(lines, 'debit');
-  const totalCredits = sumLines(lines, 'credit');
-  const balanced = isBalanced(lines);
-  const enoughLines = hasEnoughLines(lines);
-  const canSubmit = balanced && enoughLines && description.trim() && date;
+  // Live, decimal-exact balance check (lib/journalBalance.ts). Save stays disabled until
+  // debits equal credits, so an UNBALANCED error never reaches the user.
+  const bal = computeJournalBalance(lines);
+  const missingHeader = !date ? 'Enter a date.' : !description.trim() ? 'Enter a description.' : null;
+  const blocker = missingHeader ?? bal.blocker;
+  const canSubmit = bal.canSave && !missingHeader;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -233,8 +223,9 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           .filter((l) => l.accountId)
           .map((l) => ({
             accountId: l.accountId,
-            debit: l.debit ? l.debit : undefined,
-            credit: l.credit ? l.credit : undefined,
+            // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
+            debit: journalPayloadAmount(l.debit),
+            credit: journalPayloadAmount(l.credit),
             memo: l.memo.trim() || null,
             classId: l.classId || null,
           })),
@@ -249,28 +240,13 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       onSaved();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to save entry';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to save entry.');
     } finally {
       setSaving(false);
     }
   };
 
-  const BalancedIndicator = () => {
-    if (totalDebits === 0 && totalCredits === 0) return null;
-    return balanced ? (
-      <span className="flex items-center gap-1 text-emerald text-sm font-semibold">
-        <CheckCircle2 className="h-4 w-4" /> Balanced
-      </span>
-    ) : (
-      <span className="flex items-center gap-1 text-red-500 text-sm font-semibold">
-        <XCircle className="h-4 w-4" /> Unbalanced
-        <span className="text-xs font-normal text-navy/60 ml-1">
-          (diff: {formatCurrency(Math.abs(totalDebits - totalCredits))})
-        </span>
-      </span>
-    );
-  };
+  const diffIsZero = Number(bal.difference) === 0;
 
   const gridCols = 'grid-cols-[1fr_120px_130px_92px_92px_28px]';
 
@@ -285,7 +261,13 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSubmit} disabled={!canSubmit} loading={saving}>
+          <Button
+            onClick={handleSubmit}
+            disabled={!canSubmit}
+            loading={saving}
+            aria-describedby={blocker ? 'je-save-blocker' : undefined}
+            title={blocker ?? undefined}
+          >
             {editing ? 'Save Changes' : 'Post Entry'}
           </Button>
         </>
@@ -301,7 +283,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       {/* Header fields */}
       <div className="grid grid-cols-2 gap-4 mb-5">
         <div>
-          <Label htmlFor="je-date">Date</Label>
+          <Label htmlFor="je-date" required>Date</Label>
           <DateInput
             id="je-date"
             autoFocus
@@ -319,21 +301,32 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           />
         </div>
         <div className="col-span-2">
-          <Label htmlFor="je-desc">Description</Label>
+          <Label htmlFor="je-desc" required>Description</Label>
           <Input
             id="je-desc"
             placeholder="Memo / narration"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
+            aria-required="true"
           />
         </div>
       </div>
+
+      <p className="mb-4 flex items-start gap-1.5 rounded-lg bg-electric/5 px-3 py-2 text-xs text-navy/70">
+        <span>
+          Each line moves money into or out of an account. Put the amount in <strong>Debit</strong> or{' '}
+          <strong>Credit</strong> &mdash; the totals must match before you can save.
+        </span>
+        <Help term="debit-credit" side="bottom" />
+      </p>
 
       {/* Line items */}
       <div className="mb-3">
         <div className={`grid ${gridCols} gap-2 mb-1 px-1`}>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">Account</span>
-          <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">Class</span>
+          <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide inline-flex items-center gap-1">
+            Class <Help term="class" side="bottom" />
+          </span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">Memo</span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide text-right">Debit</span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide text-right">Credit</span>
@@ -341,9 +334,10 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
         </div>
 
         <div className="flex flex-col gap-2" onKeyDown={grid.onKeyDown}>
-          {lines.map((line) => (
+          {lines.map((line, idx) => (
             <div key={line.id} data-grid-row className={`grid ${gridCols} gap-2 items-center`}>
               <Select
+                aria-label={`Line ${idx + 1} account`}
                 value={line.accountId}
                 onChange={(e) => updateLine(line.id, 'accountId', e.target.value)}
               >
@@ -356,6 +350,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
               </Select>
 
               <Select
+                aria-label={`Line ${idx + 1} class`}
                 value={line.classId}
                 onChange={(e) => updateLine(line.id, 'classId', e.target.value)}
               >
@@ -368,12 +363,15 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
               </Select>
 
               <Input
+                aria-label={`Line ${idx + 1} memo`}
                 placeholder="Line memo"
                 value={line.memo}
                 onChange={(e) => updateLine(line.id, 'memo', e.target.value)}
               />
 
               <AmountInput
+                aria-label={`Line ${idx + 1} debit`}
+                aria-invalid={bal.invalidLines.includes(idx + 1) || undefined}
                 placeholder="0.00"
                 value={line.debit}
                 onChange={(e) => updateLine(line.id, 'debit', e.target.value)}
@@ -381,6 +379,8 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
               />
 
               <AmountInput
+                aria-label={`Line ${idx + 1} credit`}
+                aria-invalid={bal.invalidLines.includes(idx + 1) || undefined}
                 placeholder="0.00"
                 value={line.credit}
                 onChange={(e) => updateLine(line.id, 'credit', e.target.value)}
@@ -393,6 +393,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
                 disabled={lines.length <= 2}
                 className="text-red-400 hover:text-red-600 disabled:opacity-20 transition-colors"
                 title="Remove line"
+                aria-label={`Remove line ${idx + 1}`}
               >
                 <MinusCircle className="h-5 w-5" />
               </button>
@@ -416,21 +417,35 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           <span />
           <span />
           <span className="text-sm font-bold text-navy text-right tabular-nums">
-            {formatCurrency(totalDebits)}
+            {formatCurrency(bal.totalDebits)}
           </span>
           <span className="text-sm font-bold text-navy text-right tabular-nums">
-            {formatCurrency(totalCredits)}
+            {formatCurrency(bal.totalCredits)}
           </span>
           <span />
         </div>
-        <div className="mt-2 flex justify-end">
-          <BalancedIndicator />
+        {/* Live difference indicator, announced politely as amounts change. */}
+        <div className="mt-3 flex flex-col items-end gap-1" aria-live="polite">
+          {bal.balanced ? (
+            <span className="flex items-center gap-1 text-emerald text-sm font-semibold">
+              <CheckCircle2 className="h-4 w-4" aria-hidden="true" /> Balanced &mdash; debits equal credits
+            </span>
+          ) : (
+            <span
+              className={`flex items-center gap-1 text-sm font-semibold ${
+                diffIsZero ? 'text-navy/50' : 'text-red-500'
+              }`}
+            >
+              <XCircle className="h-4 w-4" aria-hidden="true" />
+              Difference: <span className="tabular-nums">{formatCurrency(bal.difference)}</span>
+            </span>
+          )}
+          {blocker && (
+            <p id="je-save-blocker" className="text-xs text-navy/60 text-right max-w-md">
+              {blocker}
+            </p>
+          )}
         </div>
-        {!enoughLines && (
-          <p className="text-xs text-navy/40 text-right mt-1">
-            Select an account for at least 2 lines.
-          </p>
-        )}
       </div>
     </Modal>
   );
@@ -469,8 +484,7 @@ function ReverseModal({ entry, onClose, onReversed }: ReverseModalProps) {
       onReversed();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to reverse entry';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to reverse entry.');
     } finally {
       setLoading(false);
     }
@@ -531,8 +545,7 @@ function JournalPageContent() {
       const data = await api.get<{ entries: JournalEntry[] }>('/api/journal-entries');
       setEntries(data.entries);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load journal entries';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load journal entries.');
     } finally {
       setLoading(false);
     }
@@ -578,8 +591,7 @@ function JournalPageContent() {
       setEditTarget(data.entry);
       setShowForm(true);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load entry';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load entry.');
     }
   };
 
@@ -592,8 +604,7 @@ function JournalPageContent() {
       setVoidTarget(null);
       fetchEntries();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void entry';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void entry.');
     } finally {
       setVoiding(false);
     }
@@ -628,7 +639,7 @@ function JournalPageContent() {
           <EmptyState
             icon={NotebookPen}
             title="No journal entries yet"
-            message="Record your first transaction to get started."
+            message="Journal entries are for adjustments and corrections. For everyday work, use Create Invoices, Enter Bills or Write Checks; they make the entries for you."
             action={
               <Button
                 onClick={() => {

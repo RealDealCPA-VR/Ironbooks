@@ -24,9 +24,11 @@ import {
   Td,
   Th,
   Tr,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
-import { api, ApiError } from '@/lib/client';
+import { Help } from '@/components/Help';
+import { api } from '@/lib/client';
+import { describeError } from '@/lib/friendlyErrors';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -118,7 +120,7 @@ export default function PayBillsPage() {
         setVendors(vendorData);
         setAccounts(accountData);
       } catch (err) {
-        toast(err instanceof ApiError ? err.message : 'Failed to load data', 'danger');
+        toastError(err, 'Failed to load data');
       }
     }
     init();
@@ -144,7 +146,7 @@ export default function PayBillsPage() {
       setCredits(creditData.filter((c) => c.status !== 'void' && Number(c.unapplied) > 0));
       setRows(Object.fromEntries(open.map((b) => [b.id, emptyRow()])));
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load vendor bills', 'danger');
+      toastError(err, 'Failed to load vendor bills');
     } finally {
       setLoadingBills(false);
     }
@@ -296,9 +298,9 @@ export default function PayBillsPage() {
       setReference('');
       await loadVendorData(vendorId);
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : 'Failed to pay bills.';
+      const f = describeError(err, 'Failed to pay bills.');
       toast(
-        `${msg} Note: vendor credits may already have been applied — review the refreshed balances below.`,
+        `${f.title}: ${f.message} ${f.nextStep} Note: vendor credits may already have been applied — review the refreshed balances below.`,
         'danger',
       );
       // Credits may have been applied before the failure — reload to show reality.
@@ -326,7 +328,7 @@ export default function PayBillsPage() {
       <Card className="mb-6">
         <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
           <div className="lg:col-span-2">
-            <Label htmlFor="pb-vendor">Vendor *</Label>
+            <Label htmlFor="pb-vendor" required>Vendor <Help term="ap" side="bottom" /></Label>
             <Select id="pb-vendor" value={vendorId} onChange={(e) => setVendorId(e.target.value)}>
               <option value="">Select vendor…</option>
               {vendors.map((v) => (
@@ -337,7 +339,7 @@ export default function PayBillsPage() {
             </Select>
           </div>
           <div className="lg:col-span-2">
-            <Label htmlFor="pb-account">Payment Account *</Label>
+            <Label htmlFor="pb-account" required>Payment Account</Label>
             <Select
               id="pb-account"
               value={paymentAccountId}
@@ -363,7 +365,7 @@ export default function PayBillsPage() {
             </Select>
           </div>
           <div>
-            <Label htmlFor="pb-date">Date *</Label>
+            <Label htmlFor="pb-date" required>Date</Label>
             <Input id="pb-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
           </div>
           <div className="lg:col-span-2">
@@ -411,7 +413,7 @@ export default function PayBillsPage() {
           <EmptyState
             icon={HandCoins}
             title="Select a vendor"
-            message="Choose a vendor above to see their open bills."
+            message="Choose a vendor above to see the bills you owe them. Only bills entered with Enter Bills appear here."
           />
         ) : loadingBills ? (
           <div className="p-12 flex items-center justify-center gap-2 text-navy/40 text-sm">
@@ -421,7 +423,7 @@ export default function PayBillsPage() {
           <EmptyState
             icon={HandCoins}
             title="No open bills"
-            message="This vendor has no open bills to pay."
+            message="Nothing is owed to this vendor. To pay for something without a bill, use Write Checks."
           />
         ) : (
           <Table>

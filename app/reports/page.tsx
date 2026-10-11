@@ -32,6 +32,7 @@ import {
   MapPin,
 } from 'lucide-react';
 import { Card, PageHeader } from '@/components/ui';
+import { Help } from '@/components/Help';
 
 // ---------------------------------------------------------------------------
 // Report link card
@@ -320,6 +321,37 @@ export default function ReportsPage() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Reports" icon={BarChart2} />
+
+      {/* Start here: the three questions most owners ask, in plain language. */}
+      <section aria-labelledby="reports-start" className="mb-8 rounded-2xl border-l-4 border-emerald bg-white p-5 shadow-xl">
+        <h2 id="reports-start" className="text-sm font-bold uppercase tracking-wide text-navy/70 mb-3">
+          New to reports? Start here
+        </h2>
+        <ul className="grid grid-cols-1 gap-3 md:grid-cols-3 text-sm">
+          <li>
+            <Link href="/reports/profit-loss" className="font-semibold text-electric hover:underline">
+              Am I making money?
+            </Link>
+            <span className="block text-navy/50">Profit &amp; Loss: income minus expenses for a period.</span>
+          </li>
+          <li>
+            <Link href="/reports/balance-sheet" className="font-semibold text-electric hover:underline">
+              What do I own and owe?
+            </Link>
+            <span className="block text-navy/50">Balance Sheet: your accounts on a single date.</span>
+          </li>
+          <li>
+            <Link href="/reports/ar-aging" className="font-semibold text-electric hover:underline">
+              Who owes me money?
+            </Link>
+            <span className="block text-navy/50">A/R Aging: unpaid invoices by how late they are.</span>
+          </li>
+        </ul>
+        <p className="mt-3 flex items-center gap-1 text-xs text-navy/50">
+          Most reports can be viewed on an accrual or cash basis.
+          <Help term="accrual-vs-cash" side="bottom" />
+        </p>
+      </section>
 
       <SectionHeading>Financial</SectionHeading>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">

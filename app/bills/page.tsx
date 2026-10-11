@@ -21,9 +21,10 @@ import {
   Tr,
   Modal,
   PageHeader,
-  toast,
+  toast, toastError,
   useGridKeys,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api, ApiError } from '@/lib/client';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import {
@@ -205,7 +206,7 @@ export default function BillsPage() {
       const data = await api.get<Bill[]>('/api/bills');
       setBills(data);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load bills', 'danger');
+      toastError(err, 'Failed to load bills');
     }
   }, []);
 
@@ -224,7 +225,7 @@ export default function BillsPage() {
         setAccounts(accountData);
         setItems(itemData.items ?? []);
       } catch (err) {
-        toast(err instanceof ApiError ? err.message : 'Failed to load data', 'danger');
+        toastError(err, 'Failed to load data');
       } finally {
         setLoading(false);
       }
@@ -316,7 +317,7 @@ export default function BillsPage() {
       );
       setModalOpen(true);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load bill.', 'danger');
+      toastError(err, 'Failed to load bill.');
     } finally {
       setLoadingEditId(null);
     }
@@ -450,14 +451,7 @@ export default function BillsPage() {
       setModalOpen(false);
       await fetchBills();
     } catch (err) {
-      toast(
-        err instanceof ApiError
-          ? err.message
-          : editingId
-            ? 'Failed to update bill.'
-            : 'Failed to create bill.',
-        'danger',
-      );
+      toastError(err, editingId ? 'Failed to update bill.' : 'Failed to create bill.');
     } finally {
       setSubmitting(false);
     }
@@ -475,7 +469,7 @@ export default function BillsPage() {
       setPendingVoid(null);
       await fetchBills();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to void bill.', 'danger');
+      toastError(err, 'Failed to void bill.');
     } finally {
       setVoidingId(null);
     }
@@ -506,6 +500,12 @@ export default function BillsPage() {
         }
       />
 
+      <p className="-mt-4 mb-4 text-sm text-navy/60">
+        A bill is money you owe a vendor. Until you pay it, it sits in Accounts Payable{' '}
+        <Help term="ap" side="bottom" />. Pay it from{' '}
+        <Link href="/pay-bills" className="text-electric underline">Pay Bills</Link>.
+      </p>
+
       <Card className="p-0 overflow-hidden">
         {loading ? (
           <div className="p-12 flex items-center justify-center gap-2 text-navy/40 text-sm">
@@ -515,7 +515,7 @@ export default function BillsPage() {
           <EmptyState
             icon={Receipt}
             title="No bills yet"
-            message="Enter your first vendor bill to start tracking payables."
+            message="Got a bill you will pay later? Enter it here so you know what you owe (Accounts Payable). When you pay it, use Pay Bills."
             action={
               <Button onClick={openModal}>
                 <Plus className="h-4 w-4" /> New Bill
@@ -610,7 +610,7 @@ export default function BillsPage() {
           )}
           {/* Vendor */}
           <div>
-            <Label htmlFor="bill-vendor">Vendor *</Label>
+            <Label htmlFor="bill-vendor" required>Vendor <Help term="ap" /></Label>
             <Select
               id="bill-vendor"
               autoFocus
@@ -639,7 +639,7 @@ export default function BillsPage() {
               />
             </div>
             <div>
-              <Label htmlFor="bill-date">Bill Date *</Label>
+              <Label htmlFor="bill-date" required>Bill Date</Label>
               <DateInput
                 id="bill-date"
                 value={date}
@@ -661,7 +661,7 @@ export default function BillsPage() {
           {/* Line items */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <Label className="mb-0">Line Items *</Label>
+              <Label className="mb-0" required>Line Items</Label>
               <span className="flex items-center gap-3">
                 <BarcodeScanInput onItem={addScannedItem} />
                 <button

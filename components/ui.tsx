@@ -11,6 +11,7 @@ import {
   formatAmountResult,
   isMathExpression,
 } from '@/lib/shortcuts';
+import { describeError } from '@/lib/friendlyErrors';
 
 // Re-export the line-grid keyboard hook so pages can import it from the kit.
 export { useGridKeys, type GridKeysOptions } from '@/lib/shortcuts';
@@ -218,8 +219,26 @@ export const Select = React.forwardRef<
   );
 });
 
-export function Label({ className, ...props }: React.LabelHTMLAttributes<HTMLLabelElement>) {
-  return <label className={cn('block text-sm font-medium text-navy/70 mb-1', className)} {...props} />;
+export function Label({
+  className,
+  required,
+  children,
+  ...props
+}: React.LabelHTMLAttributes<HTMLLabelElement> & {
+  /** Shows a visible red asterisk (announced as "required") after the label text. */
+  required?: boolean;
+}) {
+  return (
+    <label className={cn('block text-sm font-medium text-navy/70 mb-1', className)} {...props}>
+      {children}
+      {required && (
+        <>
+          <span aria-hidden="true" className="ml-0.5 text-red-500">*</span>
+          <span className="sr-only"> (required)</span>
+        </>
+      )}
+    </label>
+  );
 }
 
 // ---- Badge ----
@@ -516,35 +535,71 @@ export function PageHeader({
 }
 
 // ---- Toast (minimal, event-based) ----
-type Toast = { id: number; message: string; tone: 'success' | 'danger' | 'info' };
+type Toast = {
+  id: number;
+  message: string;
+  tone: 'success' | 'danger' | 'info';
+  /** Optional bold headline (friendly errors). */
+  title?: string;
+  /** Optional "what to do next" line (friendly errors). */
+  nextStep?: string;
+};
 let pushToastFn: ((t: Omit<Toast, 'id'>) => void) | null = null;
 export function toast(message: string, tone: Toast['tone'] = 'info') {
   pushToastFn?.({ message, tone });
 }
+
+/**
+ * Show a failure in plain language: headline, what happened, and what to do next.
+ * Maps ServiceError codes (UNBALANCED, PERIOD_CLOSED, FORBIDDEN, CONFLICT, VALIDATION,
+ * NOT_FOUND, …) via lib/friendlyErrors.ts. `fallback` is the action-specific message used
+ * when the error carries no useful text (e.g. "Failed to save invoice.").
+ */
+export function toastError(err: unknown, fallback?: string) {
+  const f = describeError(err, fallback);
+  pushToastFn?.({ tone: 'danger', title: f.title, message: f.message, nextStep: f.nextStep });
+}
+
 export function Toaster() {
   const [toasts, setToasts] = React.useState<Toast[]>([]);
+  const dismiss = React.useCallback(
+    (id: number) => setToasts((prev) => prev.filter((x) => x.id !== id)),
+    [],
+  );
   React.useEffect(() => {
     let n = 0;
     pushToastFn = (t) => {
       const id = ++n;
       setToasts((prev) => [...prev, { ...t, id }]);
-      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 4000);
+      // Guidance needs reading time: errors with a next step stay up longer.
+      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), t.nextStep ? 9000 : 4000);
     };
     return () => {
       pushToastFn = null;
     };
   }, []);
   return (
-    <div className="fixed bottom-4 right-4 z-[100] flex flex-col gap-2">
+    <div className="fixed bottom-4 right-4 z-[100] flex flex-col gap-2 max-w-[calc(100vw-2rem)] w-96" aria-live="polite">
       {toasts.map((t) => (
         <div
           key={t.id}
+          role={t.tone === 'danger' ? 'alert' : 'status'}
           className={cn(
-            'rounded-lg px-4 py-3 text-sm font-medium shadow-lg text-white',
+            'relative rounded-lg px-4 py-3 pr-9 text-sm font-medium shadow-lg text-white',
             t.tone === 'success' ? 'bg-emerald' : t.tone === 'danger' ? 'bg-red-500' : 'bg-navy',
           )}
         >
-          {t.message}
+          {t.title && <div className="font-bold">{t.title}</div>}
+          <div className={t.title ? 'font-normal' : undefined}>{t.message}</div>
+          {t.nextStep && <div className="mt-1 font-normal text-white/90">{t.nextStep}</div>}
+          <button
+            type="button"
+            onClick={() => dismiss(t.id)}
+            aria-label="Dismiss notification"
+            className="absolute right-2 top-2 rounded px-1 text-white/70 hover:text-white leading-none text-lg"
+          >
+            &times;
+          </button>
         </div>
       ))}
     </div>
