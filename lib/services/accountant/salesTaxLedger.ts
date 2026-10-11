@@ -563,6 +563,9 @@ async function toCashBasis(ctx: ServiceContext, rows: SalesTaxActivity[]): Promi
   // records the edge only in the audit trail (newValues.appliedToInvoice / amountApplied), so read
   // it from there. The settlement date is the later of the memo date and the invoice date, so the
   // invoice tax recognised by the credit lands in the same period as the memo's credited tax.
+  // KNOWN LIMIT: there is no credit-application table yet, so if an application is later edited or
+  // removed outside applyToInvoice the cash-basis view can go stale. Move to the real table once
+  // one exists (voided memos are already excluded below).
   const creditRows = await ctx.db
     .select({ memoId: auditLogs.entityId, newValues: auditLogs.newValues })
     .from(auditLogs)
@@ -595,6 +598,8 @@ async function toCashBasis(ctx: ServiceContext, rows: SalesTaxActivity[]): Promi
       apps.push({ invoiceId: nv.appliedToInvoice, amount: nv.amountApplied ?? '0', date, paymentId: c.memoId });
     }
   }
+  // Settlements in a stable order (date, then id) so the cumulative allocation below is deterministic.
+  apps.sort((a, b) => a.date.getTime() - b.date.getTime() || String(a.paymentId).localeCompare(String(b.paymentId)));
   const out: SalesTaxActivity[] = [];
   for (const r of rows) {
     if (r.docType !== 'invoice' || !r.docId) {
@@ -603,8 +608,19 @@ async function toCashBasis(ctx: ServiceContext, rows: SalesTaxActivity[]): Promi
     }
     const total = totalById.get(r.docId);
     if (!total || total.isZero()) continue;
+    // Cumulative allocation: each settlement's share is round(tax * cumulativeApplied / total) minus
+    // what earlier settlements already took, so rounding never drifts. Once the invoice is fully
+    // settled the shares sum to exactly the invoice tax (cash basis == accrual).
+    const tax = Money.of(r.amount);
+    let cumApplied = Money.of(0);
+    let allocated = Money.of(0);
     for (const a of apps.filter((x) => x.invoiceId === r.docId)) {
-      const share = Money.round2(Money.of(r.amount).times(Money.of(a.amount)).dividedBy(total));
+      cumApplied = cumApplied.plus(Money.of(a.amount));
+      const target = cumApplied.greaterThanOrEqualTo(total)
+        ? tax
+        : Money.round2(tax.times(cumApplied).dividedBy(total));
+      const share = target.minus(allocated);
+      allocated = target;
       if (share.isZero()) continue;
       out.push({ ...r, date: a.date, amount: toAmountString(share), description: `${r.description} (paid)` });
     }

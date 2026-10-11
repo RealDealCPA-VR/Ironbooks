@@ -209,6 +209,7 @@ describe('wave2 accountant — fix round 1', () => {
     // (a) Batch Void takes the correction with it.
     const r = await batchVoidTransactions(ctx, [`check:${exp1Id}`]);
     expect(r.succeeded).toBe(1);
+    expect(r.salesTaxFixesVoided).toBe(1);
     const report2 = await salesTaxLiabilityReport(ctx);
     expect(Number(report2.totals.balance)).toBeCloseTo(Number(report0.totals.balance) - 3, 2);
     expect(report2.tiesToGl).toBe(true);
@@ -217,6 +218,20 @@ describe('wave2 accountant — fix round 1', () => {
     await voidExpense(ctx, exp2Id);
     const orphan = (await findMisrecordedSalesTax(ctx)).find((i) => i.issue === 'orphaned_fix');
     expect(orphan).toBeDefined();
+    // A later, unrelated Batch Void leaves that pre-existing orphan alone (it is not this batch's).
+    const unrelated = await postJournalEntry(ctx, {
+      date: d('2025-05-04'),
+      description: 'Unrelated entry',
+      lines: [
+        { accountId: acct['6000'], debit: '1' },
+        { accountId: acct['1000'], credit: '1' },
+      ],
+    });
+    const unrelatedId = (unrelated as { id?: string; entry?: { id: string } }).entry?.id ?? (unrelated as { id: string }).id;
+    const r2 = await batchVoidTransactions(ctx, [`journal:${unrelatedId}`]);
+    expect(r2.succeeded).toBe(1);
+    expect(r2.salesTaxFixesVoided).toBe(0);
+    expect((await findMisrecordedSalesTax(ctx)).some((i) => i.issue === 'orphaned_fix' && i.entryId === orphan!.entryId)).toBe(true);
     await undoOrphanedSalesTaxFix(ctx, orphan!.entryId);
     const report3 = await salesTaxLiabilityReport(ctx);
     expect(report3.totals.balance).toBe(report0.totals.balance);

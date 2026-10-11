@@ -36,7 +36,7 @@ import { voidVendorCredit } from '../vendorCredits';
 import { voidPaycheck } from '../payroll';
 import { voidJournalEntry } from '../posting';
 import { requirePermission } from '../access';
-import { voidOrphanedSalesTaxFixes } from './salesTaxTools';
+import { orphanedSalesTaxFixes, voidOrphanedSalesTaxFixes } from './salesTaxTools';
 import type { Area } from '@/lib/permissions/model';
 
 /** The area that owns each document type — voiding needs that area's delete right too (the route
@@ -312,10 +312,12 @@ async function voidOne(ctx: ServiceContext, type: BatchTxnType, id: string): Pro
 export async function batchVoidTransactions(
   ctx: ServiceContext,
   keys: string[],
-): Promise<{ results: BatchVoidResult[]; succeeded: number; failed: number }> {
+): Promise<{ results: BatchVoidResult[]; succeeded: number; failed: number; salesTaxFixesVoided: number }> {
   const unique = [...new Set(keys ?? [])];
   if (unique.length === 0) throw new ServiceError('VALIDATION', 'Select at least one transaction.');
   if (unique.length > 500) throw new ServiceError('VALIDATION', 'Void at most 500 transactions at a time.');
+  // Corrections already orphaned before this batch are not this batch's to clean up.
+  const preexisting = new Set((await orphanedSalesTaxFixes(ctx)).map((o) => o.entryId));
   const results: BatchVoidResult[] = [];
   for (const key of unique) {
     const [type, id] = key.split(':') as [BatchTxnType, string];
@@ -336,18 +338,21 @@ export async function batchVoidTransactions(
     }
   }
   const succeeded = results.filter((r) => r.ok).length;
+  let salesTaxFixesVoided = 0;
   if (succeeded > 0) {
     // A voided check/bill that had been "counted as a tax payment" (Fix Sales Tax) must take its
     // correcting entry with it, or the agency would show a payment that never happened.
-    await voidOrphanedSalesTaxFixes(ctx);
+    // Only corrections orphaned by this batch are voided. That is the same check/bill the user was
+    // allowed to void, so no separate Sales Tax right is needed.
+    salesTaxFixesVoided = await voidOrphanedSalesTaxFixes(ctx, preexisting);
     await inTransaction(ctx, (tx) =>
       writeAudit(tx, {
         action: 'void',
         entityType: 'batch_void',
         entityId: randomUUID(),
-        newValues: { results, succeeded, failed: results.length - succeeded, total: results.length },
+        newValues: { results, succeeded, failed: results.length - succeeded, total: results.length, salesTaxFixesVoided },
       }),
     );
   }
-  return { results, succeeded, failed: results.length - succeeded };
+  return { results, succeeded, failed: results.length - succeeded, salesTaxFixesVoided };
 }

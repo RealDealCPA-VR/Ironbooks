@@ -67,12 +67,13 @@ export default function BatchVoidPage() {
   async function run() {
     setSaving(true);
     try {
-      const res = await api.post<{ results: VoidResult[]; succeeded: number; failed: number }>('/api/accountant/batch-void', {
+      const res = await api.post<{ results: VoidResult[]; succeeded: number; failed: number; salesTaxFixesVoided?: number }>('/api/accountant/batch-void', {
         keys: [...selected],
       });
       setResults(new Map(res.results.map((r) => [r.key, r])));
       toast(
-        `${res.succeeded} transaction(s) voided${res.failed ? `; ${res.failed} could not be (see the reasons in the list)` : ''}.`,
+        `${res.succeeded} transaction(s) voided${res.failed ? `; ${res.failed} could not be (see the reasons in the list)` : ''}.` +
+          (res.salesTaxFixesVoided ? ` ${res.salesTaxFixesVoided} sales tax correction(s) for those payments were undone too.` : ''),
         res.failed ? 'info' : 'success',
       );
       setConfirm(false);

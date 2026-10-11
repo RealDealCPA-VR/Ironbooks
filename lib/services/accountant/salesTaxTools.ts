@@ -424,12 +424,20 @@ export async function undoOrphanedSalesTaxFix(ctx: ServiceContext, entryId: stri
 }
 
 /**
- * Void every orphaned correcting entry (called after Batch Void). Best effort: an entry in a closed
+ * Void orphaned correcting entries (called after Batch Void). Pass `preexisting` (the orphan ids
+ * captured before the batch) to limit the cleanup to corrections whose payment the batch voided.
+ * Best effort: an entry in a closed
  * period is left in place and keeps showing on the Fix Incorrectly Recorded Sales Tax screen.
  */
-export async function voidOrphanedSalesTaxFixes(ctx: ServiceContext): Promise<number> {
+export async function voidOrphanedSalesTaxFixes(
+  ctx: ServiceContext,
+  /** Corrections that were already orphaned before the caller's voids; left alone (they are the
+   *  user's to undo from the Fix Incorrectly Recorded Sales Tax screen). */
+  preexisting?: ReadonlySet<string>,
+): Promise<number> {
   let n = 0;
   for (const o of await orphanedSalesTaxFixes(ctx)) {
+    if (preexisting?.has(o.entryId)) continue;
     try {
       await voidJournalEntry(ctx, o.entryId);
       n++;
