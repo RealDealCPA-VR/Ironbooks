@@ -82,7 +82,7 @@ export async function POST(req: NextRequest) {
 
     // Otherwise run all due templates up to asOf. Auto-enter templates post;
     // remind-only templates come back in `reminders` without posting.
-    const result = await runDue(ctx, parsed.data.asOf ?? new Date());
+    const result = await runDue(ctx, parsed.data.asOf ?? undefined);
     return NextResponse.json(result);
   } catch (err) {
     return errorResponse(err);

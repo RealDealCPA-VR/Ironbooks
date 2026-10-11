@@ -43,9 +43,10 @@ describe('Memorized transactions (integration)', () => {
     await t.cleanup();
   });
 
-  it('frequencies advance like QB (local calendar days, month-end clamped)', () => {
-    const local = (y: number, m: number, d: number) => new Date(y, m - 1, d);
-    const ymd = (d: Date | null) => (d ? [d.getFullYear(), d.getMonth() + 1, d.getDate()] : null);
+  it('frequencies advance like QB (calendar days of UTC-midnight dates, month-end clamped)', () => {
+    // Stored dates are UTC midnight, so the schedule works on UTC calendar fields.
+    const local = (y: number, m: number, d: number) => new Date(Date.UTC(y, m - 1, d));
+    const ymd = (d: Date | null) => (d ? [d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()] : null);
     expect(ymd(advanceDate(local(2026, 1, 10), 'biweekly'))).toEqual([2026, 1, 24]);
     expect(ymd(advanceDate(local(2026, 1, 10), 'every_four_weeks'))).toEqual([2026, 2, 7]);
     expect(ymd(advanceDate(local(2026, 1, 1), 'semiannually'))).toEqual([2026, 7, 1]);
@@ -54,10 +55,10 @@ describe('Memorized transactions (integration)', () => {
     expect(ymd(advanceDate(local(2028, 2, 29), 'yearly'))).toEqual([2029, 2, 28]);
     expect(ymd(advanceDate(local(2026, 8, 31), 'quarterly'))).toEqual([2026, 11, 30]);
     expect(advanceDate(local(2026, 1, 1), 'never')).toBeNull();
-    const sm1 = advanceDate(new Date(2026, 0, 1), 'semimonthly')!;
-    expect([sm1.getMonth(), sm1.getDate()]).toEqual([0, 16]);
+    const sm1 = advanceDate(local(2026, 1, 1), 'semimonthly')!;
+    expect([sm1.getUTCMonth(), sm1.getUTCDate()]).toEqual([0, 16]);
     const sm2 = advanceDate(sm1, 'semimonthly')!;
-    expect([sm2.getMonth(), sm2.getDate()]).toEqual([1, 1]);
+    expect([sm2.getUTCMonth(), sm2.getUTCDate()]).toEqual([1, 1]);
     expect(
       projectOccurrences(local(2026, 1, 1), 'monthly', local(2026, 2, 15), local(2026, 5, 15)).map(ymd),
     ).toEqual([

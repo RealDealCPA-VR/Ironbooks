@@ -27,6 +27,19 @@ const BANK_SUBTYPES = new Set(['checking', 'savings', 'bank']);
 // Liabilities that have their own subledger or register must never receive payroll withholdings.
 const NOT_PAYROLL_LIABILITY_SUBTYPES = new Set(['accounts_payable', 'credit_card']);
 
+/**
+ * System accounts that look like an ordinary bank/liability by type but are control accounts
+ * with their own subledger, resolved by code elsewhere (deposits.ts / payments.ts use 1050,
+ * sales-tax services use 2200). A preference must never point money at them.
+ * - 1050 Undeposited Funds is refused for EVERY bank preference, including the Make Deposits
+ *   default: Make Deposits moves payments OUT of Undeposited Funds into a real bank account, so
+ *   depositing "into" it would be a no-op loop. (Receiving payments into Undeposited Funds is a
+ *   separate setting, useUndepositedFunds.)
+ * - 2200 Sales Tax Payable is reserved for sales tax owed to agencies.
+ */
+export const UNDEPOSITED_FUNDS_CODE = '1050';
+export const SALES_TAX_PAYABLE_CODE = '2200';
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const KIND_LABEL: Record<PrefAccountKind, string> = {
@@ -35,15 +48,33 @@ const KIND_LABEL: Record<PrefAccountKind, string> = {
   payroll_liability: 'a liability account other than Accounts Payable or a credit card',
 };
 
-export function accountFitsKind(acct: { type: string; subtype: string }, kind: PrefAccountKind): boolean {
+export function accountFitsKind(
+  acct: { type: string; subtype: string; code?: string | null },
+  kind: PrefAccountKind,
+): boolean {
   switch (kind) {
     case 'bank':
-      return acct.type === 'asset' && BANK_SUBTYPES.has(acct.subtype);
+      return acct.type === 'asset' && BANK_SUBTYPES.has(acct.subtype) && acct.code !== UNDEPOSITED_FUNDS_CODE;
     case 'expense':
       return acct.type === 'expense';
     case 'payroll_liability':
-      return acct.type === 'liability' && !NOT_PAYROLL_LIABILITY_SUBTYPES.has(acct.subtype);
+      return (
+        acct.type === 'liability' &&
+        !NOT_PAYROLL_LIABILITY_SUBTYPES.has(acct.subtype) &&
+        acct.code !== SALES_TAX_PAYABLE_CODE
+      );
   }
+}
+
+/** Plain-language reason a system account is refused (null when the generic message fits). */
+function systemAccountReason(acct: { code?: string | null }, kind: PrefAccountKind): string | null {
+  if (kind === 'bank' && acct.code === UNDEPOSITED_FUNDS_CODE) {
+    return 'Undeposited Funds holds payments waiting to be deposited; choose a checking or savings account.';
+  }
+  if (kind === 'payroll_liability' && acct.code === SALES_TAX_PAYABLE_CODE) {
+    return 'Sales Tax Payable is kept for sales tax you owe; choose a payroll liabilities account.';
+  }
+  return null;
 }
 
 /**
@@ -55,20 +86,24 @@ export async function assertPreferenceAccount(
   accountId: string,
   kind: PrefAccountKind,
   label = 'This setting',
-): Promise<{ id: string; type: string; subtype: string; isActive: boolean }> {
+): Promise<{ id: string; type: string; subtype: string; code: string | null; isActive: boolean }> {
   if (!UUID_RE.test(accountId)) throw validation(`${label}: the chosen account was not found in this company.`);
   const [row] = await ctx.db
     .select({
       id: accounts.id,
       type: accounts.type,
       subtype: accounts.subtype,
+      code: accounts.code,
       isActive: accounts.isActive,
     })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, accountId)));
   if (!row) throw validation(`${label}: the chosen account was not found in this company.`);
   if (!row.isActive) throw validation(`${label}: the chosen account is inactive.`);
-  if (!accountFitsKind(row, kind)) throw validation(`${label} must be ${KIND_LABEL[kind]}.`);
+  if (!accountFitsKind(row, kind)) {
+    const reason = systemAccountReason(row, kind);
+    throw validation(reason ? `${label}: ${reason}` : `${label} must be ${KIND_LABEL[kind]}.`);
+  }
   return row;
 }
 

@@ -150,17 +150,21 @@ function payloadOf(template: Record<string, unknown>): Record<string, unknown> {
 // Schedule helpers
 // ---------------------------------------------------------------------------
 
+// Dates are stored at UTC midnight ('YYYY-MM-DD' parses that way), so all schedule math uses the
+// UTC calendar fields. Local-time getDate/setMonth would shift a day west of UTC (a monthly
+// template due May 1 would advance to May 31).
+
 /**
  * Add calendar months keeping the day of the month, clamped to the month's last day (Jan 31 +
  * 1 month = Feb 28/29, never Mar 3 — a plain setMonth overflows into the next month).
  */
 function addMonthsClamped(date: Date, months: number): Date {
   const d = new Date(date);
-  const dayOfMonth = d.getDate();
-  d.setDate(1);
-  d.setMonth(d.getMonth() + months);
-  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
-  d.setDate(Math.min(dayOfMonth, lastDay));
+  const dayOfMonth = d.getUTCDate();
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() + months);
+  const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(dayOfMonth, lastDay));
   return d;
 }
 
@@ -171,26 +175,26 @@ export function advanceDate(date: Date, frequency: Frequency): Date | null {
     case 'never':
       return null;
     case 'daily':
-      d.setDate(d.getDate() + 1);
+      d.setUTCDate(d.getUTCDate() + 1);
       break;
     case 'weekly':
-      d.setDate(d.getDate() + 7);
+      d.setUTCDate(d.getUTCDate() + 7);
       break;
     case 'biweekly':
-      d.setDate(d.getDate() + 14);
+      d.setUTCDate(d.getUTCDate() + 14);
       break;
     case 'every_four_weeks':
-      d.setDate(d.getDate() + 28);
+      d.setUTCDate(d.getUTCDate() + 28);
       break;
     case 'semimonthly':
       // Twice a month: the 1st/15th rhythm — before the 15th jump 15 days, else to next month's 1st
       // offset by the same day-of-half (keeps e.g. 5th/20th pairs).
-      if (d.getDate() <= 15) d.setDate(d.getDate() + 15);
+      if (d.getUTCDate() <= 15) d.setUTCDate(d.getUTCDate() + 15);
       else {
-        const dayInHalf = d.getDate() - 15;
-        d.setDate(1);
-        d.setMonth(d.getMonth() + 1);
-        d.setDate(Math.min(Math.max(1, dayInHalf), 15));
+        const dayInHalf = d.getUTCDate() - 15;
+        d.setUTCDate(1);
+        d.setUTCMonth(d.getUTCMonth() + 1);
+        d.setUTCDate(Math.min(Math.max(1, dayInHalf), 15));
       }
       break;
     case 'monthly':
@@ -205,6 +209,14 @@ export function advanceDate(date: Date, frequency: Frequency): Date | null {
       return addMonthsClamped(d, 12);
   }
   return d;
+}
+
+/**
+ * Today's calendar date (on this computer) at UTC midnight — the same convention stored dates
+ * use, so "due today" compares like for like.
+ */
+export function todayUtcMidnight(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
 }
 
 /** Upcoming scheduled dates for a template within [from, to] (calendar projection). */
@@ -227,7 +239,7 @@ export function projectOccurrences(
 
 function daysBefore(date: Date, days: number): Date {
   const d = new Date(date);
-  d.setDate(d.getDate() - days);
+  d.setUTCDate(d.getUTCDate() - days);
   return d;
 }
 
@@ -645,8 +657,13 @@ function errMessage(err: unknown): string {
  */
 export async function runDue(
   ctx: ServiceContext,
-  asOf: Date = new Date(),
+  asOf: Date = todayUtcMidnight(),
 ): Promise<{ generated: GeneratedDoc[]; reminders: TemplateReminder[]; failed: RunFailure[] }> {
+  // "Due on or before asOf" is a whole calendar day: anything dated during asOf's (UTC) day is
+  // due, so a date stored with a time-of-day (e.g. local midnight) is not skipped.
+  const dueBy = new Date(
+    Date.UTC(asOf.getUTCFullYear(), asOf.getUTCMonth(), asOf.getUTCDate()) + 86_400_000 - 1,
+  );
   const candidates = await ctx.db
     .select()
     .from(recurringTemplates)
@@ -655,7 +672,7 @@ export async function runDue(
         eq(recurringTemplates.companyId, ctx.companyId),
         eq(recurringTemplates.isActive, true),
         // Upper bound: the furthest a template may be entered in advance (filtered per row below).
-        lte(recurringTemplates.nextRunDate, new Date(asOf.getTime() + 366 * 86_400_000)),
+        lte(recurringTemplates.nextRunDate, new Date(dueBy.getTime() + 366 * 86_400_000)),
       ),
     );
 
@@ -668,7 +685,7 @@ export async function runDue(
     if (template.mode === 'never' || template.frequency === 'never') continue;
     if (template.remaining === 0) continue;
     const runDate = template.nextRunDate;
-    if (daysBefore(runDate, template.daysInAdvance ?? 0).getTime() > asOf.getTime()) continue;
+    if (daysBefore(runDate, template.daysInAdvance ?? 0).getTime() > dueBy.getTime()) continue;
 
     const remind = template.mode === 'remind';
     if (remind) {
@@ -715,7 +732,7 @@ export async function runTemplateNow(
   date?: Date,
 ): Promise<GeneratedDoc> {
   const now = new Date();
-  const runDate = date ?? now;
+  const runDate = date ?? todayUtcMidnight(now);
   const doc = await enterLocked(ctx, id, now, (cur) => {
     if (!cur.isActive) throw validation('This memorized transaction is inactive. Make it active to enter it.');
     if (cur.remaining === 0) throw validation('No entries remain for this memorized transaction.');

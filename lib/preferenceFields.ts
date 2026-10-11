@@ -26,10 +26,13 @@ export interface FieldMeta {
   dependsOn?: string;
 }
 
-const bank = (a: Account) => a.type === 'asset' && ['checking', 'savings', 'bank'].includes(String(a.subtype ?? ''));
+// Mirrors lib/services/prefAccounts.ts accountFitsKind (kept separate: this module is client-safe).
+// 1050 Undeposited Funds and 2200 Sales Tax Payable are system control accounts and never offered.
+const bank = (a: Account) =>
+  a.type === 'asset' && ['checking', 'savings', 'bank'].includes(String(a.subtype ?? '')) && a.code !== '1050';
 const expense = (a: Account) => a.type === 'expense';
 const liability = (a: Account) =>
-  a.type === 'liability' && !['accounts_payable', 'credit_card'].includes(String(a.subtype ?? ''));
+  a.type === 'liability' && !['accounts_payable', 'credit_card'].includes(String(a.subtype ?? '')) && a.code !== '2200';
 
 const TERMS: Array<[string, string]> = [
   ['due_on_receipt', 'Due on receipt'],
