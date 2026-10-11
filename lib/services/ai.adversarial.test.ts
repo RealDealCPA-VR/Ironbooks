@@ -460,4 +460,119 @@ describe('AI layer — adversarial QA', () => {
       await updateSettings(ctx, { providers: keep });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Re-test round 1 (tester): probing the fix-round changes
+  // -------------------------------------------------------------------------
+
+  it('round2: a viewer calling createJournalProposal directly is FORBIDDEN and stores nothing', async () => {
+    const before = await countProposals();
+    await expect(
+      createJournalProposal(viewerCtx, { date: '2026-09-30', description: 'viewer direct', lines: goodLines }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(await countProposals()).toBe(before);
+  });
+
+  it('round2: a viewer is told the proposal was not saved; no audit row is written for it', async () => {
+    const m = ollama(() =>
+      JSON.stringify({ action: 'answer', answer: 'Prepared.', proposal: { type: 'journal_entry', date: '2026-09-30', description: 'viewer write 2', lines: goodLines } }),
+    );
+    const auditsBefore = (await db.select().from(auditLogs).where(eq(auditLogs.entityType, 'ai_proposal'))).length;
+    const r = await ask(viewerCtx, [], 'Record $150 of supplies', { deps: { fetch: m.fetch } });
+    expect(r.proposals).toHaveLength(0);
+    expect(r.answer).toMatch(/view-only/i);
+    expect((await db.select().from(auditLogs).where(eq(auditLogs.entityType, 'ai_proposal'))).length).toBe(auditsBefore);
+  });
+
+  it('round2: approval of a proposal whose account was deleted fails cleanly and stays pending', async () => {
+    const tmp = await createAccount(ctx, { code: '6950', name: 'Temp Expense', type: 'expense' as never, subtype: 'operating_expenses' });
+    const p = await createJournalProposal(ctx, {
+      date: '2026-09-30',
+      description: 'temp',
+      lines: [{ accountCode: '6950', debit: '10.00' }, { accountCode: '2000', credit: '10.00' }],
+    });
+    await db.delete(accounts).where(eq(accounts.id, tmp.id));
+    const before = await countEntries();
+    await expect(approveProposal(ctx, p.id)).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect(await countEntries()).toBe(before);
+    const [row] = await db.select().from(aiProposals).where(eq(aiProposals.id, p.id));
+    expect(row.status).toBe('pending');
+    await rejectProposal(ctx, p.id);
+  });
+
+  it("round2: a tampered stored payload pointing at another company's account is not posted", async () => {
+    const [bAcct] = await db.select().from(accounts).where(and(eq(accounts.companyId, ctxB.companyId), eq(accounts.code, '7777')));
+    const p = await createJournalProposal(ctx, { date: '2026-09-30', description: 'tamper', lines: goodLines });
+    const [row] = await db.select().from(aiProposals).where(eq(aiProposals.id, p.id));
+    const payload = row.payload as any;
+    payload.lines[0].accountId = bAcct.id;
+    await db.update(aiProposals).set({ payload }).where(eq(aiProposals.id, p.id));
+    const before = await countEntries();
+    const beforeB = await countEntries(ctxB.companyId);
+    await expect(approveProposal(ctx, p.id)).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect(await countEntries()).toBe(before);
+    expect(await countEntries(ctxB.companyId)).toBe(beforeB);
+    await rejectProposal(ctx, p.id);
+  });
+
+  it('round2: a tampered stored impossible date is rejected at approval (no rollover posting)', async () => {
+    const p = await createJournalProposal(ctx, { date: '2026-09-30', description: 'date tamper', lines: goodLines });
+    const [row] = await db.select().from(aiProposals).where(eq(aiProposals.id, p.id));
+    await db.update(aiProposals).set({ payload: { ...(row.payload as any), date: '2026-02-30' } }).where(eq(aiProposals.id, p.id));
+    const before = await countEntries();
+    await expect(approveProposal(ctx, p.id)).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect(await countEntries()).toBe(before);
+    await rejectProposal(ctx, p.id);
+  });
+
+  it('round2: impossible dates (Feb 29 non-leap, month 13, Apr 31, month 00) are rejected at creation', async () => {
+    const before = await countProposals();
+    for (const date of ['2026-02-29', '2026-13-01', '2026-04-31', '2026-00-10']) {
+      await expect(createJournalProposal(ctx, { date, description: 'bad date', lines: goodLines })).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+    expect(await countProposals()).toBe(before);
+    // Leap day in a leap year is fine.
+    const ok = await createJournalProposal(ctx, { date: '2028-02-29', description: 'leap', lines: goodLines });
+    await rejectProposal(ctx, ok.id);
+  });
+
+  it('round2: an approved 3-line proposal posts once and keeps the trial balance balanced', async () => {
+    const p = await createJournalProposal(ctx, {
+      date: '2026-09-30',
+      description: 'split',
+      lines: [
+        { accountCode: '6200', debit: '33.33' },
+        { accountCode: '6400', debit: '33.34' },
+        { accountCode: '2000', credit: '66.67' },
+      ],
+    });
+    const before = await countEntries();
+    const v = await approveProposal(ctx, p.id);
+    expect(v.status).toBe('approved');
+    expect(await countEntries()).toBe(before + 1);
+    expect((await trialBalance(ctx)).balanced).toBe(true);
+    await expect(approveProposal(ctx, p.id)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await countEntries()).toBe(before + 1);
+  });
+
+  it('round2: the saved key survives a cosmetic base-URL edit but not a kind change', async () => {
+    const cur = await getPublicSettings(ctx);
+    const keep = cur.providers.map((p) => ({ id: p.id, kind: p.kind, label: p.label, baseUrl: p.baseUrl, model: p.model, enabled: p.enabled }));
+    const s = await updateSettings(ctx, {
+      providers: [...keep, { kind: 'openai-compatible', label: 'LM', baseUrl: 'http://10.0.0.9:1234', model: 'm', apiKey: 'sk-QA-ROUND2', enabled: false }],
+    });
+    const saved = s.providers.find((p) => p.label === 'LM')!;
+    try {
+      const cosmetic = await updateSettings(ctx, {
+        providers: [...keep, { id: saved.id, kind: 'openai-compatible', label: 'LM', baseUrl: 'http://10.0.0.9:1234/', model: 'm', enabled: false }],
+      });
+      expect(cosmetic.providers.find((p) => p.id === saved.id)!.hasApiKey).toBe(true);
+      const kindChanged = await updateSettings(ctx, {
+        providers: [...keep, { id: saved.id, kind: 'ollama', label: 'LM', baseUrl: 'http://10.0.0.9:1234/', model: 'm', enabled: false }],
+      });
+      expect(kindChanged.providers.find((p) => p.id === saved.id)!.hasApiKey).toBe(false);
+    } finally {
+      await updateSettings(ctx, { providers: keep });
+    }
+  });
 });
