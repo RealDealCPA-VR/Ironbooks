@@ -24,8 +24,8 @@
  *     COGS. FIFO layers split off one unit to carry the remainder, so integer layers stay exact.
  *
  * Voiding reverses the entries and the cost changes, but only while the affected stock is
- * untouched since the allocation (FIFO layers still hold the same quantity; average items still
- * have the same quantity on hand). Otherwise part of the capitalised cost has already flowed to
+ * untouched since the allocation (FIFO layers — together with any units later allocations split
+ * off them — still hold the same quantity; average items still have the same quantity on hand). Otherwise part of the capitalised cost has already flowed to
  * COGS through sales and an exact reversal is impossible — the user records a value adjustment
  * instead. Bills and item receipts with active allocations cannot be edited or voided.
  */
@@ -132,6 +132,12 @@ async function itemBookValue(ctx: ServiceContext, itemId: string, fifo: boolean)
 }
 
 /**
+ * One FIFO layer's unit-cost increment, as recorded on an allocation line. `splitFrom` marks a
+ * one-unit layer split off `splitFrom` by that allocation (see revalueLayer).
+ */
+type LayerAdjustment = { layerId: string; quantity: string; unitCostDelta: string; splitFrom?: string };
+
+/**
  * Raise a FIFO layer's value by exactly `part`. Unit cost is stored at 4dp, so the per-unit
  * increment is rounded down and, when that leaves a remainder, one unit is split off into its
  * own layer carrying the remainder (same date/source, so FIFO order is unchanged). Returns the
@@ -141,7 +147,7 @@ async function revalueLayer(
   ctx: ServiceContext,
   layer: typeof inventoryLayers.$inferSelect,
   part: Dec,
-): Promise<Array<{ layerId: string; quantity: string; unitCostDelta: string }>> {
+): Promise<LayerAdjustment[]> {
   const qty = Money.of(layer.quantityRemaining);
   const cost = Money.of(layer.unitCost);
   const delta = part.dividedBy(qty).toDecimalPlaces(4, Decimal.ROUND_DOWN);
@@ -176,7 +182,7 @@ async function revalueLayer(
     .returning();
   return [
     { layerId: layer.id, quantity: rest.toFixed(4), unitCostDelta: delta.toFixed(4) },
-    { layerId: split.id, quantity: '1.0000', unitCostDelta: unitDelta.toFixed(4) },
+    { layerId: split.id, quantity: '1.0000', unitCostDelta: unitDelta.toFixed(4), splitFrom: layer.id },
   ];
 }
 
@@ -599,7 +605,7 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
       const fifoTracked = share.fifo;
       const valueBefore = await itemBookValue(tx, t.itemId, fifoTracked);
       let quantityAtAllocation = Money.zero();
-      let layerAdjustments: Array<{ layerId: string; quantity: string; unitCostDelta: string }> | null = null;
+      let layerAdjustments: LayerAdjustment[] | null = null;
       if (invPortion.greaterThan(0)) {
         if (share.fifo) {
           const weights = share.layers.map((l) => Money.of(l.quantityRemaining));
@@ -754,6 +760,43 @@ export async function getLandedCostAllocation(ctx: ServiceContext, id: string) {
   };
 }
 
+/**
+ * Layers split off (parent layer id -> split layer ids) by allocation lines on `itemId` recorded
+ * after `lineId` of `allocation` — active or void, since a split is a physical fact either way.
+ */
+async function laterSplits(
+  ctx: ServiceContext,
+  allocation: { id: string; createdAt: Date },
+  lineId: string,
+  itemId: string,
+): Promise<Map<string, string[]>> {
+  const rows = await ctx.db
+    .select({
+      lineId: landedCostAllocationLines.id,
+      allocationId: landedCostAllocations.id,
+      createdAt: landedCostAllocations.createdAt,
+      lineOrder: landedCostAllocationLines.lineOrder,
+      layerAdjustments: landedCostAllocationLines.layerAdjustments,
+    })
+    .from(landedCostAllocationLines)
+    .innerJoin(landedCostAllocations, eq(landedCostAllocationLines.allocationId, landedCostAllocations.id))
+    .where(and(eq(landedCostAllocations.companyId, ctx.companyId), eq(landedCostAllocationLines.itemId, itemId)))
+    .orderBy(
+      asc(landedCostAllocations.createdAt),
+      asc(landedCostAllocations.id),
+      asc(landedCostAllocationLines.lineOrder),
+    );
+  const at = rows.findIndex((r) => r.lineId === lineId);
+  const splits = new Map<string, string[]>();
+  for (const r of rows.slice(at + 1)) {
+    for (const adj of r.layerAdjustments ?? []) {
+      if (!adj.splitFrom) continue;
+      splits.set(adj.splitFrom, [...(splits.get(adj.splitFrom) ?? []), adj.layerId]);
+    }
+  }
+  return splits;
+}
+
 /** Void an allocation: reverse its entries and back the cost out (see module header). */
 export async function voidLandedCostAllocation(ctx: ServiceContext, id: string) {
   return inTransaction(ctx, async (tx) => {
@@ -775,15 +818,30 @@ export async function voidLandedCostAllocation(ctx: ServiceContext, id: string) 
           );
         const valueBefore = await itemBookValue(tx, line.itemId, fifoLine);
         if (fifoLine) {
+          // A later allocation may have split one unit off a layer this line raised; that unit
+          // still carries this line's increment, so the layer and its later splits are restored
+          // together and "stock moved" is judged on their combined quantity.
+          const splits = await laterSplits(tx, allocation, line.id, line.itemId);
           for (const adj of line.layerAdjustments!) {
-            const [layer] = await tx.db.select().from(inventoryLayers).where(eq(inventoryLayers.id, adj.layerId));
-            if (!layer || !Money.of(layer.quantityRemaining).equals(Money.of(adj.quantity))) throw moved();
-            const restored = Money.of(layer.unitCost).minus(Money.of(adj.unitCostDelta));
-            if (restored.isNegative()) throw moved();
-            await tx.db
-              .update(inventoryLayers)
-              .set({ unitCost: restored.toFixed(4) })
-              .where(eq(inventoryLayers.id, layer.id));
+            const family: Array<typeof inventoryLayers.$inferSelect> = [];
+            const queue = [adj.layerId];
+            while (queue.length > 0) {
+              const layerId = queue.shift()!;
+              const [layer] = await tx.db.select().from(inventoryLayers).where(eq(inventoryLayers.id, layerId));
+              if (layer) family.push(layer);
+              else if (layerId === adj.layerId) throw moved();
+              queue.push(...(splits.get(layerId) ?? []));
+            }
+            const familyQty = family.reduce((sum, l) => sum.plus(Money.of(l.quantityRemaining)), Money.zero());
+            if (!familyQty.equals(Money.of(adj.quantity))) throw moved();
+            for (const layer of family) {
+              const restored = Money.of(layer.unitCost).minus(Money.of(adj.unitCostDelta));
+              if (restored.isNegative()) throw moved();
+              await tx.db
+                .update(inventoryLayers)
+                .set({ unitCost: restored.toFixed(4) })
+                .where(eq(inventoryLayers.id, layer.id));
+            }
           }
         } else {
           const qoh = Money.of(item.quantityOnHand ?? '0');

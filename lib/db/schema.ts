@@ -1336,7 +1336,7 @@ export const landedCostAllocationLines = pgTable('landed_cost_allocation_lines',
   /** Quantity still on hand when applied (FIFO: receipt layers; average: item QOH). */
   quantityAtAllocation: decimal('quantity_at_allocation', { precision: 15, scale: 4 }).notNull().default('0'),
   /** FIFO only: per-layer unit-cost increments applied, so a void can back them out exactly. */
-  layerAdjustments: jsonb('layer_adjustments').$type<Array<{ layerId: string; quantity: string; unitCostDelta: string }>>(),
+  layerAdjustments: jsonb('layer_adjustments').$type<Array<{ layerId: string; quantity: string; unitCostDelta: string; splitFrom?: string }>>(),
   entryId: uuid('entry_id').references(() => journalEntries.id),
   lineOrder: integer('line_order').notNull().default(0),
 });

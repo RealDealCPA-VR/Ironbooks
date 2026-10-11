@@ -208,6 +208,36 @@ describe('Advanced Inventory — QA re-test round 1', () => {
       await assertBooksTie(A);
     });
 
+    // Doer fix round 2: the void restores the layer AND the units later allocations split off it.
+    it('three stacked allocations voided out of order restore every layer to its original cost', async () => {
+      const { item, receipt } = await fifoReceipt('LC2 Stack x3', 1200);
+      const allocs = [];
+      for (const n of [1, 2, 3]) {
+        const f = await freightBill(A, 250 + n, `FRT-X${n}`);
+        allocs.push(await allocateLandedCost(A.ctx, { billId: f.billId, billLineId: f.lineId, method: 'quantity', itemReceiptIds: [receipt.id] }));
+      }
+      await assertBooksTie(A);
+      for (const i of [0, 2, 1]) {
+        await voidLandedCostAllocation(A.ctx, allocs[i].id);
+        await assertBooksTie(A);
+      }
+      const layers = await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, item));
+      for (const l of layers) expect(l.unitCost).toBe('2.5000');
+      expect(layers.reduce((s, l) => s.plus(Money.of(l.quantityRemaining)), Money.zero()).toFixed(4)).toBe('1201.0000');
+      expect(await balance(A, '1300')).toBe('3002.50');
+    });
+
+    it('selling a unit after two stacked allocations still blocks voiding the earlier one', async () => {
+      const { item, receipt } = await fifoReceipt('LC2 Stack then sell', 1200);
+      const f1 = await freightBill(A, 250, 'FRT-M1');
+      const f2 = await freightBill(A, 250, 'FRT-M2');
+      const a1 = await allocateLandedCost(A.ctx, { billId: f1.billId, billLineId: f1.lineId, method: 'quantity', itemReceiptIds: [receipt.id] });
+      await allocateLandedCost(A.ctx, { billId: f2.billId, billLineId: f2.lineId, method: 'quantity', itemReceiptIds: [receipt.id] });
+      await createInvoice(A.ctx, { customerId: A.customerId, date: new Date('2026-06-10'), lines: [{ itemId: item, quantity: 2, rate: 5 }] });
+      await expect(voidLandedCostAllocation(A.ctx, a1.id)).rejects.toMatchObject({ code: 'CONFLICT' });
+      await assertBooksTie(A);
+    });
+
     it('after a split allocation is voided, the item receipt itself can be voided and books tie', async () => {
       const { item, receipt } = await fifoReceipt('LC2 Split then void receipt', 1200);
       const f = await freightBill(A, 250, 'FRT-V');
