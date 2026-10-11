@@ -34,6 +34,7 @@
  * documents already present are skipped.
  */
 import { createHash } from 'node:crypto';
+import Decimal from 'decimal.js';
 import { and, eq, like, ne, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -46,7 +47,7 @@ import {
   vendorCredits,
   vendors as vendorsTable,
 } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation } from './_base';
 import { createAccount } from './accounts';
 import { createBill } from './bills';
@@ -301,8 +302,10 @@ export async function loadOpenItems(input: Pick<OpenItemsInput, 'file' | 'items'
       } catch {
         throw validation(`"${it.openBalance}" is not a valid amount.`);
       }
+      // Validate the value that will actually be stored (rounded to cents): 0.001 rounds to 0.00.
       // Decimal(0).isPositive() is true in decimal.js — compare explicitly.
-      if (!a.isFinite() || !a.greaterThan(0)) throw validation('Amounts must be greater than zero.');
+      if (!a.isFinite() || !Money.round2(a).greaterThan(0)) throw validation('Amounts must be at least 0.01.');
+      if (Money.round2(a).greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`"${it.openBalance}" is larger than the books can hold.`);
       const okKind = side === 'ar' ? ['invoice', 'credit_memo'] : ['bill', 'vendor_credit'];
       if (!okKind.includes(it.kind)) throw validation('Mixing customer and vendor balances in one import is not allowed.');
     }
@@ -705,6 +708,64 @@ export async function importOpenItems(ctx: ServiceContext, input: OpenItemsInput
   return result;
 }
 
+/** A named A/R or A/P row from a non-document IIF transaction (payment, refund, journal ...). */
+export interface IifControlRow {
+  side: LedgerSide;
+  name: string;
+  /** Signed IIF amount (positive = debit). */
+  amount: string;
+  /** YYYY-MM-DD */
+  date: string | null;
+}
+
+interface Residual {
+  side: LedgerSide;
+  name: string;
+  /** QuickBooks balance minus what the open documents carry (positive = owed). */
+  amount: Decimal;
+  /** Total of the documents QuickBooks marked PAID (they only absorb payments, see below). */
+  paid: Decimal;
+  date: string | null;
+}
+
+/**
+ * Make one name's open items add up to its QuickBooks balance. A negative residual (payments or
+ * credits the open documents do not reflect yet) reduces that name's open invoices / bills,
+ * oldest first; anything left becomes an unapplied credit. A positive residual reduces its open
+ * credits first; anything left becomes an open balance. Returns the amount of the added item.
+ */
+function applyResidual(list: OpenItem[], r: Residual): Decimal {
+  const key = r.name.toLowerCase();
+  const credit = r.amount.isNegative();
+  const reduceKinds: OpenItemKind[] = credit ? ['invoice', 'bill'] : ['credit_memo', 'vendor_credit'];
+  let rest = Money.round2(r.amount.abs());
+  const targets = list
+    .filter((it) => canonicalName(it.name).toLowerCase() === key && reduceKinds.includes(it.kind))
+    .sort((a, b) => (a.date === b.date ? (a.number ?? '').localeCompare(b.number ?? '') : a.date < b.date ? -1 : 1));
+  for (const it of targets) {
+    if (!rest.greaterThan(0)) break;
+    const bal = Money.of(it.openBalance);
+    const take = Decimal.min(bal, rest);
+    it.openBalance = toAmountString(bal.minus(take));
+    rest = rest.minus(take);
+  }
+  for (let i = list.length - 1; i >= 0; i--) if (Money.round2(list[i].openBalance).isZero()) list.splice(i, 1);
+  if (!rest.greaterThan(0)) return Money.zero();
+  const ar = r.side === 'ar';
+  list.push({
+    kind: credit ? (ar ? 'credit_memo' : 'vendor_credit') : ar ? 'invoice' : 'bill',
+    name: r.name,
+    date: r.date ?? new Date().toISOString().slice(0, 10),
+    number: null,
+    qbType: credit ? 'Unapplied payment / credit' : 'Balance from QuickBooks transactions',
+    memo: credit
+      ? 'Payments or credits in the QuickBooks file that are more than the open documents.'
+      : 'Charges in the QuickBooks file that have no open document.',
+    openBalance: toAmountString(rest),
+  });
+  return rest;
+}
+
 /**
  * IIF INVOICE / BILL (and credit) transactions → open items. A transaction QuickBooks marked
  * PAID=Y is not open and is skipped; when the export carries an open balance column it is used,
@@ -713,16 +774,48 @@ export async function importOpenItems(ctx: ServiceContext, input: OpenItemsInput
 export async function importOpenItemsFromIif(
   ctx: ServiceContext,
   txns: IIFTransaction[],
-  opts: { alreadyInGl: boolean },
+  opts: {
+    alreadyInGl: boolean;
+    /**
+     * Named A/R and A/P rows of the OTHER transactions in the same file (payments, bill
+     * payments, refunds, journals). Their total per customer / vendor is applied to that
+     * name's open documents, so each name's aging equals its real QuickBooks balance.
+     */
+    controlRows?: IifControlRow[];
+  },
 ): Promise<{ invoices: number; bills: number; credits: number; skipped: number; issues: ImportIssue[] }> {
   const ar: OpenItem[] = [];
   const ap: OpenItem[] = [];
   const issues: ImportIssue[] = [];
   let skipped = 0;
+  // Per side + customer / vendor: what QuickBooks says is owed (every document at its full
+  // amount plus every other A/R / A/P row) minus what the open documents below carry.
+  const residual = new Map<string, Residual>();
+  const touch = (side: LedgerSide, name: string, date: string | null, owed: Decimal, paid = false) => {
+    const key = `${side}|${canonicalName(name).toLowerCase()}`;
+    let r = residual.get(key);
+    if (!r) residual.set(key, (r = { side, name: canonicalName(name), amount: Money.zero(), paid: Money.zero(), date: null }));
+    if (paid) r.paid = r.paid.plus(owed);
+    else r.amount = r.amount.plus(owed);
+    if (date && (!r.date || date > r.date)) r.date = date;
+  };
+  for (const row of opts.controlRows ?? []) {
+    if (!row.name?.trim()) continue;
+    const a = parseAmount(row.amount);
+    if (!a) continue;
+    // A/R: a debit (positive IIF amount) adds to what the customer owes. A/P: a credit does.
+    touch(row.side, row.name, row.date, row.side === 'ar' ? a : a.negated());
+  }
   for (const t of txns) {
     const type = t.type.trim().toUpperCase();
     const label = `${t.type}${t.num ? ` #${t.num}` : ''}`;
+    const docSide: LedgerSide = type === 'BILL' || type === 'BILLCRED' || type === 'BILL REFUND' ? 'ap' : 'ar';
     if (t.paid) {
+      // Not open, but its full amount still counts toward the name's balance, so the payment
+      // that settled it (in controlRows) nets to zero instead of becoming a credit.
+      const paidTotal = parseAmount(t.lines[0]?.amount);
+      const paidName = t.name ?? t.lines[0]?.name;
+      if (paidTotal && paidName) touch(docSide, paidName, parseQbDate(t.date), docSide === 'ar' ? paidTotal : paidTotal.negated(), true);
       skipped++;
       issues.push({ entity: type === 'BILL' || type === 'BILLCRED' || type === 'BILL REFUND' ? 'bill' : 'invoice', name: label, reason: 'note', message: 'Marked paid in QuickBooks — not an open item, so it was not brought in.' });
       continue;
@@ -737,6 +830,9 @@ export async function importOpenItemsFromIif(
     }
     const open = t.openBalance ? parseAmount(t.openBalance) : null;
     const amount = (open ?? total).abs();
+    // The full document amount counts toward the name's QuickBooks balance (owed > 0 for
+    // invoices and bills, < 0 for credits); the open part is subtracted once the item exists.
+    touch(docSide, name, date, docSide === 'ar' ? total : total.negated());
     if (amount.isZero()) continue;
     const detail = t.lines
       .slice(1)
@@ -754,10 +850,34 @@ export async function importOpenItemsFromIif(
       memo: [t.memo, detail].filter(Boolean).join(' — ') || null,
       openBalance: toAmountString(amount),
     };
-    if (type === 'INVOICE') ar.push({ ...base, kind: total.isNegative() ? 'credit_memo' : 'invoice' });
-    else if (type === 'CREDIT MEMO' || type === 'CREDITMEMO') ar.push({ ...base, kind: 'credit_memo' });
-    else if (type === 'BILL') ap.push({ ...base, kind: total.isPositive() ? 'vendor_credit' : 'bill' });
-    else ap.push({ ...base, kind: 'vendor_credit' });
+    let kind: OpenItemKind;
+    if (type === 'INVOICE') kind = total.isNegative() ? 'credit_memo' : 'invoice';
+    else if (type === 'CREDIT MEMO' || type === 'CREDITMEMO') kind = 'credit_memo';
+    else if (type === 'BILL') kind = total.isPositive() ? 'vendor_credit' : 'bill';
+    else kind = 'vendor_credit';
+    (docSide === 'ar' ? ar : ap).push({ ...base, kind });
+    const isDoc = kind === 'invoice' || kind === 'bill';
+    touch(docSide, name, null, isDoc ? amount.negated() : amount);
+  }
+  // Apply payments / credits / charges that are not part of an open document's balance.
+  for (const r of residual.values()) {
+    // PAID documents are settled in QuickBooks: they absorb the payments that settled them, but
+    // never add a balance of their own (the payment may simply not be in this export).
+    if (r.amount.isNegative() && r.paid.isPositive()) r.amount = Decimal.min(0, r.amount.plus(r.paid));
+    else if (r.amount.isPositive() && r.paid.isNegative()) r.amount = Decimal.max(0, r.amount.plus(r.paid));
+    if (Money.round2(r.amount).isZero()) continue;
+    const added = applyResidual(r.side === 'ar' ? ar : ap, r);
+    const docs = r.side === 'ar' ? 'invoices' : 'bills';
+    issues.push({
+      entity: r.side === 'ar' ? 'invoice' : 'bill',
+      name: r.name,
+      reason: 'note',
+      message: r.amount.isNegative()
+        ? `${toAmountString(r.amount.abs())} of payments or credits in this file was applied to the open ${docs} of ${r.name}` +
+          (added.isZero() ? '.' : `; ${toAmountString(added)} more than those ${docs} was brought in as an unapplied credit.`)
+        : `${toAmountString(r.amount)} of charges in this file without an open document was applied to the open credits of ${r.name}` +
+          (added.isZero() ? '.' : `; ${toAmountString(added)} was brought in as an open balance.`),
+    });
   }
   const out = { invoices: 0, bills: 0, credits: 0, skipped, issues };
   for (const [side, list] of [['ar', ar], ['ap', ap]] as const) {

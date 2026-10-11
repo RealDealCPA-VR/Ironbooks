@@ -71,6 +71,7 @@ import { createSalesRep } from './salesReps';
 import { createTaxRate } from './salesTax';
 import { createBudget, setBudgetLine, listBudgets } from './budgets';
 import { readXlsx } from './qbGlFiles';
+import type { IifControlRow } from './openItemsImport';
 
 // ---------------------------------------------------------------------------
 // IIF type+subtype mapping
@@ -1366,7 +1367,13 @@ export async function importIIF(
     const docTypes = new Set(['INVOICE', 'BILL', 'CREDIT MEMO', 'BILL REFUND', 'BILLCRED', 'CREDITMEMO']);
     const docTxns = txns.filter((t) => docTypes.has(t.type.trim().toUpperCase()));
     txns = txns.filter((t) => !docTypes.has(t.type.trim().toUpperCase()));
-    const r = await importOpenItemsFromIif(ctx, docTxns, { alreadyInGl: !!opts.openItems.alreadyInGl });
+    // Named A/R / A/P rows of payments, bill payments, refunds and journals in the same file are
+    // applied to that customer's / vendor's open documents (QuickBooks' real per-name balance),
+    // because below those rows themselves are re-pointed to the conversion account.
+    const r = await importOpenItemsFromIif(ctx, docTxns, {
+      alreadyInGl: !!opts.openItems.alreadyInGl,
+      controlRows: collectIifControlRows(txns, lookup),
+    });
     counts.openItems = { invoices: r.invoices, bills: r.bills, credits: r.credits, skipped: r.skipped };
     counts.skipped += r.skipped;
     counts.issues.push(...r.issues);
@@ -2031,6 +2038,46 @@ async function ensureBucketAccount(
     message: `Account "${ref}" was not found — created under "${QB_IMPORT_BUCKET.name}" for review.`,
   });
   return entry;
+}
+
+/**
+ * Named A/R and A/P rows of the transactions importIifTransactions will actually post (date
+ * readable, every amount readable and unambiguous, rows balanced). Used to apply payments and
+ * other control-account activity to the open documents when those come in as documents.
+ */
+function collectIifControlRows(transactions: IIFTransaction[], lookup: AccountLookup): IifControlRow[] {
+  const out: IifControlRow[] = [];
+  for (const txn of transactions) {
+    const date = parseIifDate(txn.date);
+    if (!date) continue;
+    const rows: IifControlRow[] = [];
+    let net = Money.zero();
+    let ok = true;
+    let nonZero = 0;
+    for (const l of txn.lines) {
+      const amt = parseIifAmount(l.amount);
+      if (amt === null) {
+        ok = false;
+        break;
+      }
+      if (Money.isZero(amt)) continue;
+      nonZero++;
+      net = net.plus(toAmountString(amt));
+      const resolved = resolveAccountRef(lookup, l.accnt);
+      if (resolved && 'ambiguous' in resolved && resolved.ambiguous) {
+        ok = false;
+        break;
+      }
+      const acct = resolved as AccountRef | null;
+      if (!acct || acct.code === '1250') continue;
+      const side = acct.subtype === 'accounts_receivable' ? 'ar' : acct.subtype === 'accounts_payable' ? 'ap' : null;
+      const name = (l.name ?? txn.name ?? '').trim();
+      if (!side || !name) continue;
+      rows.push({ side, name, amount: toAmountString(amt), date: date.toISOString().slice(0, 10) });
+    }
+    if (ok && nonZero >= 2 && net.isZero()) out.push(...rows);
+  }
+  return out;
 }
 
 async function importIifTransactions(
