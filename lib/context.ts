@@ -24,6 +24,8 @@ import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 
 export const COMPANY_COOKIE = 'bka_company';
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /** FORBIDDEN message for a deactivated member (login route + lib/client.ts match it). */
 export const DEACTIVATED_MESSAGE =
   'Your user account has been deactivated for this company. Contact your administrator.';
@@ -34,7 +36,10 @@ export const CLOSING_PASSWORD_HEADER = 'x-closing-password';
 async function selectedCompanyCookie(): Promise<string | undefined> {
   try {
     const store = await cookies();
-    return store.get(COMPANY_COOKIE)?.value || undefined;
+    const value = store.get(COMPANY_COOKIE)?.value;
+    // Only a well-formed company id is ever looked up; anything else (tampered / stale garbage)
+    // is ignored and the user's first active membership is used instead.
+    return value && UUID_RE.test(value) ? value : undefined;
   } catch {
     return undefined;
   }

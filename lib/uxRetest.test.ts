@@ -151,11 +151,9 @@ describe('round-0 failures, verified end to end', () => {
     await expect(postLikeThePage(zeroSide)).resolves.toBeTruthy();
   });
 
-  // Deferred to the services team: the fix belongs in zMoney (lib/validation/helpers.ts:
-  // .transform(s => s.trim())) or in posting.ts (wrap DecimalError as VALIDATION), both
-  // outside this UI-only team's scope. The journal page itself always sends a normalized
-  // amount (see journalPayloadAmount). QA round 3: it.fails reverted to it -- an inverted test hides the bug as green; it must stay
-  // visibly red until the services fix lands.
+  // Originally deferred to the services team (QA round 3 kept it visibly red). Fixed in
+  // integration: lib/money.ts ignores surrounding whitespace, and posting.ts turns any
+  // unparseable amount into a VALIDATION ServiceError instead of a DecimalError 500.
   it('the server half: an unnormalized " 7.25 " reaching postJournalEntry fails as a ServiceError, not a 500', async () => {
     // zMoney accepts " 7.25 " (it trims only for its regex). If any other caller sends it,
     // posting must answer with a VALIDATION ServiceError rather than a raw DecimalError.

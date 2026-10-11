@@ -14,7 +14,7 @@
  *    (`allowLedgerRewrite`, used only by condense, account merge and company restore).
  */
 import { and, eq, inArray, sql } from 'drizzle-orm';
-import { Money, toAmountString } from '@/lib/money';
+import { MAX_LEDGER_AMOUNT, Money, MoneyParseError, toAmountString } from '@/lib/money';
 import {
   accounts,
   journalEntries,
@@ -76,8 +76,21 @@ export function assertBalanced(lines: PostingLine[]): { totalDebit: string; tota
   for (const [i, line] of lines.entries()) {
     // Round each line to 2dp BEFORE summing — this is exactly how lines are persisted,
     // so the balance check matches the stored ledger rather than the raw inputs.
-    const d = Money.round2(line.debit);
-    const c = Money.round2(line.credit);
+    let d: ReturnType<typeof Money.round2>;
+    let c: ReturnType<typeof Money.round2>;
+    try {
+      d = Money.round2(line.debit);
+      c = Money.round2(line.credit);
+    } catch (err) {
+      if (err instanceof MoneyParseError) throw validation(`Line ${i + 1}: ${err.message}`);
+      throw err;
+    }
+    if (!d.isFinite() || !c.isFinite()) {
+      throw validation(`Line ${i + 1}: the amount is not a number.`);
+    }
+    if (d.abs().greaterThan(MAX_LEDGER_AMOUNT) || c.abs().greaterThan(MAX_LEDGER_AMOUNT)) {
+      throw validation(`Line ${i + 1}: the amount is too large for the ledger (max ${MAX_LEDGER_AMOUNT.toFixed(2)}).`);
+    }
     if (d.isNegative() || c.isNegative()) {
       throw validation(`Line ${i + 1}: debit/credit cannot be negative.`);
     }

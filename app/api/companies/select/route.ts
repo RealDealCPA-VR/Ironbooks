@@ -32,6 +32,9 @@ export async function POST(req: NextRequest) {
   if (!companyId) {
     return NextResponse.json({ error: 'companyId is required', code: 'VALIDATION' }, { status: 400 });
   }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(companyId)) {
+    return NextResponse.json({ error: 'Company not found', code: 'NOT_FOUND' }, { status: 404 });
+  }
   const [membership] = await db
     .select({ companyId: userCompanies.companyId, isActive: userCompanies.isActive })
     .from(userCompanies)

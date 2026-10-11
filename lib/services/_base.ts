@@ -11,6 +11,7 @@
  */
 import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
+import { ServiceError } from './errors';
 import { logTransaction } from './transactionLog';
 import type { EffectiveAccess } from '@/lib/permissions/model';
 
@@ -45,25 +46,7 @@ export interface ServiceContext {
   access?: EffectiveAccess;
 }
 
-export type ServiceErrorCode =
-  | 'NOT_FOUND'
-  | 'VALIDATION'
-  | 'UNBALANCED'
-  | 'FORBIDDEN'
-  | 'CONFLICT'
-  | 'PERIOD_CLOSED'
-  | 'INTERNAL';
-
-export class ServiceError extends Error {
-  constructor(
-    public code: ServiceErrorCode,
-    message: string,
-    public details?: unknown,
-  ) {
-    super(message);
-    this.name = 'ServiceError';
-  }
-}
+export { ServiceError, type ServiceErrorCode } from './errors';
 
 export const notFound = (what: string) => new ServiceError('NOT_FOUND', `${what} not found`);
 export const validation = (msg: string, details?: unknown) =>

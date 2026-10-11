@@ -133,9 +133,9 @@ describe('round-1 fixes, verified', () => {
 });
 
 describe('what the per-entry cap cannot see: the cached account balance', () => {
-  // The overflow itself is an open server bug (raw Postgres 22003 from applyBalanceDeltas becomes
-  // a 500). Owner: services team -- lib/services/posting.ts should wrap SQLSTATE 22003 (or check
-  // cached balance + delta against the numeric(15,2) range) as a VALIDATION ServiceError.
+  // Fixed in integration: the database layer translates SQLSTATE 22003 (the cached balance
+  // overflowing numeric(15,2) inside the ledger trigger) into a VALIDATION ServiceError
+  // (lib/db/pgErrors.ts), and the transaction still rolls back.
   // Split in two so the accounting invariant (clean rollback) is enforced as a normal passing
   // test, while the missing friendly error stays a plain (red) test until fixed -- QA round 3.
   const overflowLines = () => [
@@ -164,8 +164,10 @@ describe('what the per-entry cap cannot see: the cached account balance', () => 
     expect((await trialBalance(ctx)).balanced).toBe(true);
   });
 
-  it('the overflow surfaces as a friendly ServiceError, not a raw 22003 (services team bug)', async () => {
+  it('the overflow surfaces as a friendly ServiceError, not a raw 22003', async () => {
     const err = await attemptOverflow();
     expect(err instanceof ServiceError, `raw error reached the route: ${String(err)}`).toBe(true);
+    expect((err as ServiceError).code).toBe('VALIDATION');
+    expect((err as ServiceError).message).toMatch(/too large/i);
   });
 });
