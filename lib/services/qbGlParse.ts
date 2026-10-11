@@ -1097,11 +1097,17 @@ function uniqueSubset(cands: RLine[], target: Decimal): RLine[] | null {
  * Split one candidate group (same type/date/num/adj, or same Trans #) into balanced entries:
  *  1. pairs  — line in A whose Split is B  ↔  line in B whose Split is A, equal and opposite;
  *  2. stars  — '-SPLIT-' main line in A + the lines whose Split is A that exactly offset it;
- *  3. rest   — whatever remains: one entry if it balances, otherwise a review item.
+ *  3. rest   — whatever remains: one entry if it balances and no line's Split contradicts it,
+ *              otherwise a review item.
  */
-function solveGroup(lines: RLine[], byTransId: boolean): { txns: RLine[][]; leftover: RLine[] } {
+function solveGroup(
+  lines: RLine[],
+  byTransId: boolean,
+): { txns: RLine[][]; leftover: RLine[]; contradicts: boolean } {
   const total = sumDr(lines);
-  if (byTransId) return total.isZero() ? { txns: [lines], leftover: [] } : { txns: [], leftover: lines };
+  if (byTransId) {
+    return total.isZero() ? { txns: [lines], leftover: [], contradicts: false } : { txns: [], leftover: lines, contradicts: false };
+  }
 
   const used = new Set<number>();
   const txns: RLine[][] = [];
@@ -1147,21 +1153,38 @@ function solveGroup(lines: RLine[], byTransId: boolean): { txns: RLine[][]; left
     }
   }
 
-  // 3. rest
+  // 3. rest — only posted when the Split column agrees with the grouping (see splitsConsistent).
   const rest = free();
-  if (!rest.length) return { txns, leftover: [] };
+  if (!rest.length) return { txns, leftover: [], contradicts: false };
   if (sumDr(rest).isZero()) {
     // Prefer one entry per payee when each payee's lines balance on their own.
     const byName = new Map<string, RLine[]>();
     for (const l of rest) byName.set(l.src.name, [...(byName.get(l.src.name) ?? []), l]);
-    if (byName.size > 1 && [...byName.values()].every((g) => sumDr(g).isZero())) {
-      txns.push(...byName.values());
-    } else {
-      txns.push(rest);
+    const perPayee = [...byName.values()];
+    if (byName.size > 1 && perPayee.every((g) => sumDr(g).isZero() && splitsConsistent(g))) {
+      txns.push(...perPayee);
+      return { txns, leftover: [], contradicts: false };
     }
-    return { txns, leftover: [] };
+    if (splitsConsistent(rest)) {
+      txns.push(rest);
+      return { txns, leftover: [], contradicts: false };
+    }
+    // Balanced, but the Split column says these lines belong to other transactions: never force it.
+    return { txns, leftover: rest, contradicts: true };
   }
-  return { txns, leftover: rest };
+  return { txns, leftover: rest, contradicts: false };
+}
+
+/**
+ * True when no line's Split contradicts putting `entry` together: every non-'-SPLIT-' line whose
+ * Split names a known account must point at another line of the same entry. Lines with an empty
+ * or unrecognised Split carry no evidence either way.
+ */
+function splitsConsistent(entry: RLine[]): boolean {
+  return entry.every((l) => {
+    if (l.marker || !l.splitKey) return true;
+    return entry.some((o) => o !== l && o.accountKey === l.splitKey);
+  });
 }
 
 function hashOf(parts: unknown): string {
@@ -1661,7 +1684,7 @@ export function analyzeGl(report: GlReport, opts: AnalyzeOptions = {}): GlAnalys
   for (const l of allLines) if (l.className) classes.add(l.className);
 
   for (const [gk, g] of groups) {
-    const { txns, leftover } = solveGroup(g.lines, g.byTransId);
+    const { txns, leftover, contradicts } = solveGroup(g.lines, g.byTransId);
     for (const t of txns) {
       // Invariant: every rebuilt entry balances exactly (re-checked by postJournalEntry).
       if (!sumDr(t).isZero()) throw new ServiceError('INTERNAL', `Rebuilt entry ${gk} does not balance.`);
@@ -1711,7 +1734,9 @@ export function analyzeGl(report: GlReport, opts: AnalyzeOptions = {}): GlAnalys
         date: first.date,
         num: first.num,
         difference: toAmountString(diff),
-        reason: pairedElsewhere
+        reason: contradicts
+          ? `These lines offset each other, but their Split column says each one belongs with a different account, so they may be separate ${first.type || 'transaction'}s whose other halves are missing. Please check them in QuickBooks.`
+          : pairedElsewhere
           ? `These lines are left over after matching the rest of this ${first.type || 'transaction'} group, and they don't balance (off by ${toAmountString(diff.abs())}).`
           : `The lines of this ${first.type || 'transaction'} don't balance (off by ${toAmountString(diff.abs())}). The other side may be in an account missing from the export.`,
         lines: leftover.map((l) => ({

@@ -24,6 +24,7 @@ import {
 import { Money } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
+import { createManualEntry } from './journal';
 import { listGlImports, previewGlImport, runGlImport, QB_SUSPENSE } from './qbGlImport';
 import {
   SAMPLE_GL,
@@ -209,16 +210,24 @@ describe('qbGlImport — QuickBooks General Ledger migration', () => {
     expect(r.proof.rows.every((row) => row.trialBalanceDifference === '0.00')).toBe(true);
   });
 
-  it('rolls back when the QB Trial Balance disagrees, unless the variance is accepted', async () => {
+  it('rolls back when the QB Trial Balance disagrees, even when a variance is accepted', async () => {
     const ctx = await newCompany('TB Mismatch Co');
-    const r = await runGlImport(ctx, {
-      file: upload('gl.csv', glCsv(SAMPLE_GL)),
-      references: [upload('tb.csv', trialBalanceCsv(SAMPLE_GL, { acct: '64000', by: '1.00' }))],
-    });
+    const tb = upload('tb.csv', trialBalanceCsv(SAMPLE_GL, { acct: '64000', by: '1.00' }));
+    const r = await runGlImport(ctx, { file: upload('gl.csv', glCsv(SAMPLE_GL)), references: [tb] });
     expect(r.ok).toBe(false);
     expect(r.rolledBack).toBe(true);
     expect(r.proof.trialBalanceMatches).toBe(false);
+    expect(r.message).toMatch(/Trial Balance/);
     expect(await entryCount(ctx)).toBe(0);
+
+    // A TB difference can't be reconciled through the GL, so accepting a variance doesn't apply.
+    const accepted = await runGlImport(ctx, { file: upload('gl.csv', glCsv(SAMPLE_GL)), references: [tb], acceptVariance: true });
+    expect(accepted.ok).toBe(false);
+    expect(accepted.rolledBack).toBe(true);
+    expect(accepted.variancePosted).toBeNull();
+    expect(accepted.message).toMatch(/Trial Balance/);
+    expect(await entryCount(ctx)).toBe(0);
+    expect(await db.select().from(accounts).where(eq(accounts.companyId, ctx.companyId))).toHaveLength(0);
   });
 
   it('an unbalanced report lands in review, rolls back, and only posts to suspense when accepted', async () => {
@@ -285,6 +294,28 @@ describe('qbGlImport — QuickBooks General Ledger migration', () => {
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '10200')));
     expect(sav.subtype).toBe('checking');
+  });
+
+  it('warns when a mapped account also holds entries that were not imported', async () => {
+    const ctx = await newCompany('Drift Co');
+    const car = await createAccount(ctx, { code: '6999', name: 'Car Costs', type: 'expense', subtype: 'operating_expenses' });
+    const petty = await createAccount(ctx, { code: '1999', name: 'Petty Cash', type: 'asset', subtype: 'checking' });
+    await createManualEntry(ctx, {
+      date: new Date(Date.UTC(2024, 0, 2)),
+      description: 'Parking',
+      lines: [
+        { accountId: car.id, debit: '50.00' },
+        { accountId: petty.id, credit: '50.00' },
+      ],
+    });
+    const file = upload('gl.csv', glCsv(SAMPLE_GL));
+    const preview = await previewGlImport(ctx, { file });
+    expect(preview.otherPostedEntries).toBe(1);
+    const fuel = preview.accounts.find((a) => a.number === '60100')!;
+    const r = await runGlImport(ctx, { file, accounts: { [fuel.key]: { mapTo: car.id } } });
+    expect(r.ok).toBe(true);
+    expect(r.proof.allMatch).toBe(true);
+    expect(r.warnings.some((w) => /weren't part of this import/.test(w) && w.includes('6999'))).toBe(true);
   });
 
   it('imports consecutive periods without doubling the opening balances', async () => {

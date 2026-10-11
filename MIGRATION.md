@@ -134,6 +134,16 @@ File → Migrate from QuickBooks…):
    balance (and the Trial Balance, if supplied), and debits must equal credits. If anything
    differs, **nothing is saved** — unless you explicitly choose to post the difference to a
    `QB Import Suspense` account to sort out later. The proof is stored with the import.
+   - `QB Import Suspense` (code `QB-SUSPENSE`) is created as an equity account so it shows
+     on the balance sheet as a clearing balance; reclassify its balance and bring it to zero.
+     The variance entry is dated the period end, so closing-date rules apply to it.
+   - A difference against the **Trial Balance** cannot be moved to suspense: if the General
+     Ledger reconciles but the Trial Balance doesn't, the two exports describe different books
+     (date, accrual/cash basis, filters) and the import is always rolled back.
+   - Lines that offset each other but whose `Split` column points to other accounts are not
+     forced into one entry; they go to the review list.
+   - The proof compares the entries this import posted. If the company file already has other
+     entries in a mapped account, the import warns that the account's full balance differs.
 
 Notes:
 

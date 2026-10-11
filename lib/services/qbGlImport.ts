@@ -415,7 +415,7 @@ function splitPersonName(raw: string): { firstName: string; lastName: string } {
 }
 
 /** Sum of imported (qbgl:*) postings per account, debit-positive, up to `asOf` inclusive. */
-async function importedBalances(ctx: ServiceContext, asOf: Date): Promise<Map<string, Decimal>> {
+async function importedBalances(ctx: ServiceContext, asOf: Date, onlyImported = true): Promise<Map<string, Decimal>> {
   const rows = await ctx.db
     .select({
       accountId: journalEntryLines.accountId,
@@ -428,7 +428,7 @@ async function importedBalances(ctx: ServiceContext, asOf: Date): Promise<Map<st
       and(
         eq(journalEntries.companyId, ctx.companyId),
         eq(journalEntries.status, 'posted'),
-        like(journalEntries.sourceRef, 'qbgl:%'),
+        onlyImported ? like(journalEntries.sourceRef, 'qbgl:%') : undefined,
         lte(journalEntries.date, asOf),
       ),
     )
@@ -772,11 +772,24 @@ export async function runGlImport(
       let proof = await buildProof();
       let variancePosted: string | null = null;
 
-      const needsVariance = !proof.allMatch || !proof.trialBalanceMatches;
-      if (needsVariance && !input.acceptVariance) {
-        const what = !proof.allMatch
-          ? `${proof.mismatches} account(s) don't match the report`
-          : 'some accounts differ from your QuickBooks Trial Balance';
+      // A Trial Balance difference can't be "accepted": the ledger already equals the GL report, so a
+      // TB that disagrees means the two exports don't describe the same books (date, basis, filters).
+      const tbRollback = (): Rollback =>
+        new Rollback({
+          ok: false,
+          dryRun,
+          rolledBack: true,
+          message: `Nothing was saved: your QuickBooks Trial Balance doesn't agree with the General Ledger report${proof.allMatch ? ', even though every account matches the General Ledger' : ''}. Make sure both reports are for the same date and the same basis (accrual or cash), with no filters, then try again — or import without the Trial Balance.`,
+          proof,
+          counts,
+          review: analysis.review,
+          variancePosted: null,
+          importId: null,
+          warnings,
+        });
+
+      if (!proof.allMatch && !input.acceptVariance) {
+        const what = `${proof.mismatches} account(s) don't match the report`;
         throw new Rollback({
           ok: false,
           dryRun,
@@ -838,6 +851,19 @@ export async function runGlImport(
           variancePosted = toAmountString(gross);
         }
         proof = await buildProof();
+      }
+      if (!proof.trialBalanceMatches) throw tbRollback();
+      // The proof counts imported entries only. Say so plainly when other postings in the same
+      // accounts make the account's real balance differ from QuickBooks.
+      const full = await importedBalances(tx, asOf, false);
+      const drifted = proof.rows.filter((r) => !Money.of(r.actual).equals(full.get(r.accountId) ?? Money.zero()));
+      if (drifted.length) {
+        warnings.push(
+          `${drifted.length} account(s) also hold entries that weren't part of this import, so their balance in BookKeeper differs from QuickBooks: ${drifted
+            .slice(0, 5)
+            .map((r) => `${r.code} ${r.name} (${toAmountString(full.get(r.accountId) ?? 0)} here vs ${r.expected} in QuickBooks)`)
+            .join('; ')}${drifted.length > 5 ? '; …' : ''}.`,
+        );
       }
       if (!proof.ledger.balanced) {
         // Impossible through postJournalEntry — refuse loudly rather than save a broken ledger.

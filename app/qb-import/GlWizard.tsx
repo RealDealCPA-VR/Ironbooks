@@ -633,7 +633,8 @@ function DryRunStep({
       {result.review.length > 0 && <ReviewList review={result.review} />}
       {result.warnings.length > 0 && <Problems errors={[]} warnings={result.warnings} />}
 
-      {(!result.ok || acceptVariance) && (
+      {/* A Trial Balance difference can't be moved to suspense — only General Ledger differences can. */}
+      {(!result.proof.allMatch || acceptVariance) && (
         <label className="flex items-start gap-2 rounded-lg border border-gold/40 bg-gold/10 p-3 text-sm text-navy">
           <input
             type="checkbox"
