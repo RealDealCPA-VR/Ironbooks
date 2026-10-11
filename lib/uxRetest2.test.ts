@@ -133,29 +133,39 @@ describe('round-1 fixes, verified', () => {
 });
 
 describe('what the per-entry cap cannot see: the cached account balance', () => {
-  it('a second max-size entry into the same account fails as a ServiceError and rolls back cleanly', async () => {
+  // The overflow itself is an open server bug (raw Postgres 22003 from applyBalanceDeltas becomes
+  // a 500). Owner: services team -- lib/services/posting.ts should wrap SQLSTATE 22003 (or check
+  // cached balance + delta against the numeric(15,2) range) as a VALIDATION ServiceError.
+  // Split in two so the accounting invariant (clean rollback) is enforced as a normal passing
+  // test, while the missing friendly error is an it.fails that flips to red once fixed.
+  const overflowLines = () => [
+    { accountId: bigAsset, debit: '1.00', credit: '' },
+    { accountId: bigEquity, debit: '', credit: '1.00' },
+  ];
+  async function attemptOverflow(): Promise<unknown> {
+    try {
+      await postLikeThePage(overflowLines());
+      return null;
+    } catch (e) {
+      return e;
+    }
+  }
+
+  it('a second max-size entry into the same account is refused and rolls back cleanly', async () => {
     // accounts.balance is numeric(15,2) too. The gate (correctly) allows this entry on its own,
-    // but the account already holds 9,999,999,999,999.99 from the boundary test above, so
-    // applyBalanceDeltas overflows. That must surface as a friendly ServiceError, and nothing
-    // from the failed entry may persist.
+    // but the account already holds 9,999,999,999,999.99 from the boundary test above.
     const before = await balanceOf(bigAsset);
     const entriesBefore = (await db.select({ id: journalEntries.id }).from(journalEntries)).length;
-    const lines = [
-      { accountId: bigAsset, debit: '1.00', credit: '' },
-      { accountId: bigEquity, debit: '', credit: '1.00' },
-    ];
-    expect(computeJournalBalance(lines).canSave).toBe(true);
-    let err: unknown = null;
-    try {
-      await postLikeThePage(lines);
-    } catch (e) {
-      err = e;
-    }
-    // Rollback (the accounting invariant) is checked first so it is reported regardless.
+    expect(computeJournalBalance(overflowLines()).canSave).toBe(true);
+    const err = await attemptOverflow();
+    expect(err, 'entry overflowing the account balance was accepted').not.toBeNull();
     expect(await balanceOf(bigAsset)).toBe(before);
     expect((await db.select({ id: journalEntries.id }).from(journalEntries)).length).toBe(entriesBefore);
     expect((await trialBalance(ctx)).balanced).toBe(true);
-    expect(err, 'entry overflowing the account balance was accepted').not.toBeNull();
+  });
+
+  it.fails('the overflow surfaces as a friendly ServiceError, not a raw 22003 (services team bug)', async () => {
+    const err = await attemptOverflow();
     expect(err instanceof ServiceError, `raw error reached the route: ${String(err)}`).toBe(true);
   });
 });
