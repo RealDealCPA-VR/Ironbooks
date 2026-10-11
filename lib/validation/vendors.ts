@@ -14,6 +14,8 @@ export const createVendorSchema = z.object({
   /** Free-form address map, e.g. { street, city, state, zip, country }. */
   address: z.record(z.string()).nullish(),
   terms: z.string().nullish(),
+  /** Wave-2 lists: Terms list entry (wins over the legacy terms string). */
+  termsId: zUuid.nullish(),
   is1099: z.boolean().optional(),
   taxId: z.string().nullish(),
   defaultExpenseAccountId: zUuid.nullish(),

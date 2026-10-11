@@ -186,10 +186,30 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/merge': r('lists', 'POST:delete'),
   '/api/fixed-assets': r('lists', 'GET POST'),
   '/api/fixed-assets/[id]': { ...r('lists', 'GET'), ...r('accounting', 'POST') },
+  // Wave-2 lists: simple QB lists (Other Names, Job Types, Terms, Ship Via, Payment Methods,
+  // Customer Messages, Sales Tax Codes, Vehicles), To Do, Billing Rate Levels, U/M sets, item
+  // tools. Notes are 'member' — the handler checks the area of the record the note is on.
+  '/api/lists/[list]': r('lists', 'GET POST'),
+  '/api/lists/[list]/[id]': r('lists', 'PATCH DELETE'),
+  '/api/terms/compute': r('lists', 'GET'),
+  '/api/todos': r('lists', 'GET POST'),
+  '/api/todos/[id]': r('lists', 'PATCH DELETE'),
+  '/api/notes': kind('member', 'GET POST'),
+  '/api/notes/[id]': kind('member', 'PATCH DELETE'),
+  '/api/billing-rate-levels': r('lists', 'GET POST'),
+  '/api/billing-rate-levels/[id]': r('lists', 'GET PUT:modify DELETE'),
+  '/api/billing-rate-levels/assign': r('lists', 'POST:modify'),
+  '/api/billing-rate-levels/resolve': r('time', 'GET'),
+  '/api/uom-sets': r('lists', 'GET POST'),
+  '/api/uom-sets/[id]': r('lists', 'GET PUT:modify DELETE'),
+  '/api/items/bulk': r('lists', 'GET POST'),
+  '/api/items/change-prices': r('lists', 'POST:modify'),
+  '/api/cleanup': r('file_utilities', 'GET POST:delete'),
 
   // ---- Customers & Receivables ----
   '/api/customers': r('customers', 'GET POST'),
   '/api/customers/[id]': r('customers', 'GET PATCH DELETE'),
+  '/api/customers/bulk': r('customers', 'GET POST'), // Add/Edit Multiple (edits also need modify)
   '/api/jobs': r('customers', 'GET POST'),
   '/api/jobs/[id]': r('customers', 'GET PATCH DELETE'),
   '/api/customer-prices': r('customers', 'GET POST'),
@@ -229,6 +249,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // ---- Vendors & Payables ----
   '/api/vendors': r('vendors', 'GET POST'),
   '/api/vendors/[id]': r('vendors', 'GET PATCH DELETE'),
+  '/api/vendors/bulk': r('vendors', 'GET POST'), // Add/Edit Multiple (edits also need modify)
   '/api/bills': r('vendors', 'GET POST'),
   '/api/bills/[id]': r('vendors', 'GET PATCH DELETE'),
   '/api/bill-payments': r('vendors', 'GET POST'),
@@ -310,6 +331,11 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/inventory/value-adjust': r('inventory', 'POST:modify'),
   '/api/inventory/stock-status': r('reports_inventory', 'GET'),
   '/api/inventory/worksheet': r('reports_inventory', 'GET'),
+  // Wave-2 lists: Inventory Center, POs from the reorder list, stock status by vendor.
+  '/api/inventory/center': r('inventory', 'GET'),
+  '/api/inventory/center/[id]': r('inventory', 'GET'),
+  '/api/inventory/reorder/create-po': r('vendors', 'POST'),
+  '/api/inventory/stock-by-vendor': r('reports_inventory', 'GET'),
   '/api/item-receipts': r('inventory', 'GET POST'),
   '/api/item-receipts/[id]': r('inventory', 'GET POST:modify'),
   '/api/assemblies': r('inventory', 'GET PUT PATCH'),
@@ -335,6 +361,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/tax-agencies': r('sales_tax', 'GET POST'),
   '/api/tax-rates': r('sales_tax', 'GET POST'),
   '/api/tax-rates/[id]/components': r('sales_tax', 'GET PATCH'),
+  '/api/tax-rates/[id]': r('sales_tax', 'PATCH'),
   '/api/pay-liabilities/sales-tax': r('sales_tax', 'GET'),
 
   // ---- Time & mileage ----
@@ -440,6 +467,9 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/attachments': 'lists',
   '/merge': 'lists',
   '/fixed-assets': 'lists',
+  '/lists': 'lists',
+  '/lists/cleanup': 'file_utilities',
+  '/inventory-center': 'inventory',
   '/currencies': 'lists',
   '/purchase-orders': 'vendors',
   '/item-receipts': 'inventory',

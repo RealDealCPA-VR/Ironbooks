@@ -15,6 +15,7 @@ import { and, asc, eq, ne } from 'drizzle-orm';
 import { vendors } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { maskForContext } from './access';
+import { resolvePartyTerms } from './lists/fields';
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -37,6 +38,8 @@ export interface CreateVendorInput {
   /** Preferred expense account pre-filled on new bills / expenses for this vendor. */
   defaultExpenseAccountId?: string | null;
   notes?: string | null;
+  /** Terms list entry (wins over the legacy `terms` string, which is kept in sync). */
+  termsId?: string | null;
 }
 
 export type UpdateVendorInput = Partial<CreateVendorInput>;
@@ -128,6 +131,7 @@ export async function createVendor(ctx: ServiceContext, input: CreateVendorInput
     throw validation('Enter the full tax ID; a masked value cannot be saved.');
   }
   await assertUniqueDisplayName(ctx, input.displayName);
+  const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
 
   const [row] = await ctx.db
     .insert(vendors)
@@ -138,7 +142,8 @@ export async function createVendor(ctx: ServiceContext, input: CreateVendorInput
       email: input.email?.trim() ?? null,
       phone: input.phone?.trim() ?? null,
       address: input.address ?? null,
-      terms: input.terms ?? 'net_30',
+      terms: termsRes ? termsRes.terms : 'net_30',
+      termsId: termsRes?.termsId ?? null,
       is1099: input.is1099 ?? false,
       taxId: input.taxId ?? null,
       defaultExpenseAccountId: input.defaultExpenseAccountId ?? null,
@@ -179,6 +184,7 @@ export async function updateVendor(
   if (patch.displayName !== undefined) {
     await assertUniqueDisplayName(ctx, newDisplayName, id);
   }
+  const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
 
   const [row] = await ctx.db
     .update(vendors)
@@ -189,7 +195,8 @@ export async function updateVendor(
       email: patch.email !== undefined ? (patch.email?.trim() ?? null) : before.email,
       phone: patch.phone !== undefined ? (patch.phone?.trim() ?? null) : before.phone,
       address: patch.address !== undefined ? patch.address : before.address,
-      terms: patch.terms !== undefined ? patch.terms : before.terms,
+      terms: termsRes ? termsRes.terms : before.terms,
+      termsId: termsRes ? termsRes.termsId : before.termsId,
       is1099: patch.is1099 !== undefined ? patch.is1099 : before.is1099,
       // A masked tax ID echoed back by a user who can't see the full one leaves it unchanged.
       taxId:

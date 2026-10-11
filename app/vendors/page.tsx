@@ -31,6 +31,8 @@ import {
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
+import { EntityNotes } from '@/components/lists/EntityNotes';
+import Link from 'next/link';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,6 +49,13 @@ interface Vendor {
   balance: string;
   isActive: boolean;
   notes: string | null;
+  termsId?: string | null;
+}
+
+interface TermsOption {
+  id: string;
+  name: string;
+  isActive: boolean;
 }
 
 interface VendorFormState {
@@ -55,6 +64,7 @@ interface VendorFormState {
   email: string;
   phone: string;
   terms: string;
+  termsId: string;
   is1099: boolean;
   notes: string;
 }
@@ -65,6 +75,7 @@ const EMPTY_FORM: VendorFormState = {
   email: '',
   phone: '',
   terms: 'net_30',
+  termsId: '',
   is1099: false,
   notes: '',
 };
@@ -105,6 +116,15 @@ function VendorsPageContent() {
   const [form, setForm] = useState<VendorFormState>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
 
+  // Terms list (wave-2 lists)
+  const [termsList, setTermsList] = useState<TermsOption[]>([]);
+  useEffect(() => {
+    api
+      .get<{ entries: TermsOption[] }>('/api/lists/terms?includeInactive=true')
+      .then((d) => setTermsList(d.entries))
+      .catch(() => {});
+  }, []);
+
   // Deactivate confirm
   const [deactivateTarget, setDeactivateTarget] = useState<Vendor | null>(null);
   const [deactivating, setDeactivating] = useState(false);
@@ -142,7 +162,8 @@ function VendorsPageContent() {
       companyName: vendor.companyName ?? '',
       email: vendor.email ?? '',
       phone: vendor.phone ?? '',
-      terms: vendor.terms ?? 'net_30',
+      terms: vendor.terms ?? '',
+      termsId: vendor.termsId ?? '',
       is1099: vendor.is1099,
       notes: vendor.notes ?? '',
     });
@@ -176,7 +197,8 @@ function VendorsPageContent() {
         companyName: form.companyName.trim() || null,
         email: form.email.trim() || null,
         phone: form.phone.trim() || null,
-        terms: form.terms || null,
+        // Terms change only when a Terms list entry is picked (an older setting is kept otherwise).
+        ...(form.termsId ? { termsId: form.termsId } : {}),
         is1099: form.is1099,
         notes: form.notes.trim() || null,
       };
@@ -235,6 +257,11 @@ function VendorsPageContent() {
               <Download className="h-4 w-4" />
               Export CSV
             </Button>
+            <Link href="/lists/multiple?list=vendors">
+              <Button variant="secondary" title="Add or edit many vendors at once (paste from Excel)">
+                Add/Edit Multiple
+              </Button>
+            </Link>
             <Button onClick={openAdd}>
               <Plus className="h-4 w-4" />
               Add Vendor
@@ -307,7 +334,9 @@ function VendorsPageContent() {
                     )}
                   </Td>
                   <Td>
-                    <span className="text-sm text-navy/70">{termsLabel(v.terms)}</span>
+                    <span className="text-sm text-navy/70">
+                      {(v.termsId ? termsList.find((t) => t.id === v.termsId)?.name : undefined) ?? termsLabel(v.terms)}
+                    </span>
                   </Td>
                   <Td>
                     {v.is1099 ? (
@@ -424,17 +453,19 @@ function VendorsPageContent() {
           {/* Payment Terms */}
           <div>
             <Label htmlFor="terms">Payment Terms</Label>
-            <Select
-              id="terms"
-              value={form.terms}
-              onChange={(e) => setField('terms', e.target.value)}
-            >
-              {TERMS_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
+            <Select id="terms" value={form.termsId} onChange={(e) => setField('termsId', e.target.value)}>
+              <option value="">{form.terms && !form.termsId ? `${termsLabel(form.terms)} (old setting)` : '—'}</option>
+              {termsList
+                .filter((t) => t.isActive || t.id === form.termsId)
+                .map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
             </Select>
+            <p className="mt-1 text-xs text-navy/50">
+              Edit the choices on the <Link href="/lists?list=terms" className="text-electric hover:underline">Terms list</Link>.
+            </p>
           </div>
 
           {/* 1099 Contractor */}
@@ -471,6 +502,7 @@ function VendorsPageContent() {
               className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30 placeholder:text-navy/30 resize-none"
             />
           </div>
+          {editingVendor && <EntityNotes entityType="vendor" entityId={editingVendor.id} />}
         </div>
       </Modal>
 

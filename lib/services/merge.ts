@@ -58,6 +58,8 @@ import {
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, inTransaction, writeAudit } from './_base';
 import { allowLedgerRewrite } from './posting';
+import { repointForeignKeys } from './lists/references';
+import { moveNotesAndTodos } from './lists/notes';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -227,6 +229,26 @@ export async function mergeCustomers(
       )
       .returning({ id: expenseLines.id });
 
+    // Wave-2 lists: sweep every remaining foreign key to the customer (sales receipts, tables
+    // added by other modules, ...) and carry dated notes / to-dos over. The sub-customer
+    // hierarchy is handled explicitly so the survivor can never become its own parent.
+    const [toCust] = await tx.db
+      .select({ parentId: customers.parentId })
+      .from(customers)
+      .where(eq(customers.id, toId));
+    if (toCust?.parentId === fromId) {
+      const [fromCust] = await tx.db
+        .select({ parentId: customers.parentId })
+        .from(customers)
+        .where(eq(customers.id, fromId));
+      await tx.db
+        .update(customers)
+        .set({ parentId: fromCust?.parentId ?? null, updatedAt: new Date() })
+        .where(eq(customers.id, toId));
+    }
+    const sweptCustomer = await repointForeignKeys(tx, 'customers', fromId, toId);
+    const movedCustomerNotes = await moveNotesAndTodos(tx, 'customer', fromId, toId);
+
     // Deactivate the from-customer.
     await tx.db
       .update(customers)
@@ -262,6 +284,8 @@ export async function mergeCustomers(
           billLines: billLineRows.length,
           expenseLines: expenseLineRows.length,
         },
+        otherReferences: sweptCustomer,
+        notesAndTodos: movedCustomerNotes,
       },
     });
 
@@ -337,6 +361,11 @@ export async function mergeVendors(
       .where(and(eq(purchaseOrders.vendorId, fromId), eq(purchaseOrders.companyId, tx.companyId)))
       .returning({ id: purchaseOrders.id });
 
+    // Wave-2 lists: sweep every remaining foreign key to the vendor (items' preferred vendor,
+    // item receipts, tables added by other modules, ...) and carry notes / to-dos over.
+    const sweptVendor = await repointForeignKeys(tx, 'vendors', fromId, toId);
+    const movedVendorNotes = await moveNotesAndTodos(tx, 'vendor', fromId, toId);
+
     // Deactivate the from-vendor.
     await tx.db
       .update(vendors)
@@ -364,6 +393,8 @@ export async function mergeVendors(
           vendorCredits: vcRows.length,
           purchaseOrders: poRows.length,
         },
+        otherReferences: sweptVendor,
+        notesAndTodos: movedVendorNotes,
       },
     });
 

@@ -1,0 +1,23 @@
+/**
+ * Shared body handling for the Add/Edit Multiple routes (app/api/{customers,vendors,items}/bulk).
+ * POST { rows, dryRun? } → validates every row; saves all-or-nothing. Rows with an id edit
+ * existing records, which needs 'modify' on top of the route's mapped 'create'.
+ */
+import { NextResponse } from 'next/server';
+import type { ServiceContext } from '@/lib/services/_base';
+import { requirePermission } from '@/lib/services/access';
+import { bulkSave } from '@/lib/services/lists/bulk';
+import { bulkSchema } from '@/lib/validation/lists';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import type { Area } from '@/lib/permissions/model';
+import type { BulkList } from './bulk';
+
+export async function handleBulkPost(ctx: ServiceContext, list: BulkList, area: Area, body: unknown): Promise<NextResponse> {
+  const parsed = bulkSchema.safeParse(body ?? {});
+  if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+  if (parsed.data.rows.some((r) => typeof r.id === 'string' && r.id.trim() !== '')) {
+    requirePermission(ctx, area, 'modify');
+  }
+  const result = await bulkSave(ctx, list, parsed.data.rows, { dryRun: parsed.data.dryRun });
+  return NextResponse.json(result, { status: result.errors.length ? 422 : 200 });
+}

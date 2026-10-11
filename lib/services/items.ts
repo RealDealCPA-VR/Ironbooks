@@ -15,6 +15,7 @@ import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, items } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
+import { assertUomSet, assertVendor, resolveSalesTaxCode } from './lists/fields';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -46,6 +47,12 @@ export interface CreateItemInput {
   trackingMode?: TrackingMode;
   /** Unit weight — used to allocate landed cost by weight. */
   weight?: string | number | null;
+  /** Preferred vendor (drives "Create PO from reorder list" and Stock Status by Vendor). */
+  preferredVendorId?: string | null;
+  /** Sales Tax Code list entry; when set, `taxable` follows the code's taxable flag. */
+  salesTaxCodeId?: string | null;
+  /** Unit of measure set (quantities on lines convert to the set's base unit). */
+  uomSetId?: string | null;
 }
 
 export interface UpdateItemInput {
@@ -64,6 +71,12 @@ export interface UpdateItemInput {
   barcode?: string | null;
   trackingMode?: TrackingMode;
   weight?: string | number | null;
+  /** Preferred vendor (drives "Create PO from reorder list" and Stock Status by Vendor). */
+  preferredVendorId?: string | null;
+  /** Sales Tax Code list entry; when set, `taxable` follows the code's taxable flag. */
+  salesTaxCodeId?: string | null;
+  /** Unit of measure set (quantities on lines convert to the set's base unit). */
+  uomSetId?: string | null;
 }
 
 /** A bundle (group item) component, joined with the component item's details. */
@@ -262,6 +275,9 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
   const barcode = await resolveBarcode(ctx, input.barcode);
   const trackingMode = resolveTracking((input.type ?? 'service') as ItemType, input.trackingMode);
   const weight = resolveWeight(input.weight);
+  if (input.preferredVendorId) await assertVendor(ctx, input.preferredVendorId);
+  if (input.uomSetId) await assertUomSet(ctx, input.uomSetId);
+  const taxCode = input.salesTaxCodeId ? await resolveSalesTaxCode(ctx, input.salesTaxCodeId) : null;
 
   // ── Insert ───────────────────────────────────────────────────────────────
   const [row] = await ctx.db
@@ -277,7 +293,10 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
       incomeAccountId: input.incomeAccountId ?? null,
       expenseAccountId: input.expenseAccountId ?? null,
       assetAccountId: input.assetAccountId ?? null,
-      taxable: input.taxable ?? true,
+      taxable: taxCode ? taxCode.taxable : input.taxable ?? true,
+      salesTaxCodeId: taxCode?.id ?? null,
+      preferredVendorId: input.preferredVendorId ?? null,
+      uomSetId: input.uomSetId ?? null,
       unitOfMeasure: input.unitOfMeasure?.trim() || null,
       barcode,
       trackingMode,
@@ -355,6 +374,19 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
     await assertTrackingModeChangeAllowed(ctx, before, trackingMode);
   }
   const weight = patch.weight !== undefined ? resolveWeight(patch.weight) : before.weight;
+  if (patch.preferredVendorId) await assertVendor(ctx, patch.preferredVendorId);
+  if (patch.uomSetId && patch.uomSetId !== before.uomSetId) {
+    await assertUomSet(ctx, patch.uomSetId);
+    // Inventory is counted in the set's base unit: switching sets on stocked items would
+    // silently reinterpret the quantity on hand.
+    if (before.type === 'inventory' && before.uomSetId && Number(before.quantityOnHand ?? 0) !== 0) {
+      throw validation('This item has stock on hand, so its unit of measure set cannot change.');
+    }
+  }
+  const taxCode =
+    patch.salesTaxCodeId !== undefined && patch.salesTaxCodeId !== null
+      ? await resolveSalesTaxCode(ctx, patch.salesTaxCodeId)
+      : null;
 
   // ── Update ───────────────────────────────────────────────────────────────
   const [row] = await ctx.db
@@ -389,7 +421,11 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
           : before.expenseAccountId,
       assetAccountId:
         patch.assetAccountId !== undefined ? patch.assetAccountId : before.assetAccountId,
-      taxable: patch.taxable !== undefined ? patch.taxable : before.taxable,
+      taxable: taxCode ? taxCode.taxable : patch.taxable !== undefined ? patch.taxable : before.taxable,
+      salesTaxCodeId: patch.salesTaxCodeId !== undefined ? taxCode?.id ?? null : before.salesTaxCodeId,
+      preferredVendorId:
+        patch.preferredVendorId !== undefined ? patch.preferredVendorId : before.preferredVendorId,
+      uomSetId: patch.uomSetId !== undefined ? patch.uomSetId : before.uomSetId,
       unitOfMeasure:
         patch.unitOfMeasure !== undefined
           ? (patch.unitOfMeasure?.trim() || null)

@@ -23,6 +23,9 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
+import { EntityNotes } from '@/components/lists/EntityNotes';
+import { Help } from '@/components/Help';
+import Link from 'next/link';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,6 +42,20 @@ interface Customer {
   terms: string | null;
   notes: string | null;
   customFields?: Record<string, string> | null;
+  termsId?: string | null;
+  salesTaxCodeId?: string | null;
+  resaleNumber?: string | null;
+  taxExemptionReason?: string | null;
+}
+
+/** Terms / Sales Tax Code list entries (wave-2 lists). */
+interface ListOption {
+  id: string;
+  name?: string;
+  code?: string;
+  description?: string | null;
+  taxable?: boolean;
+  isActive: boolean;
 }
 
 /** Custom-field definitions map from GET /api/custom-fields. */
@@ -57,6 +74,10 @@ interface CustomerFormState {
   email: string;
   phone: string;
   terms: string;
+  termsId: string;
+  salesTaxCodeId: string;
+  resaleNumber: string;
+  taxExemptionReason: string;
   notes: string;
 }
 
@@ -66,8 +87,16 @@ const EMPTY_FORM: CustomerFormState = {
   email: '',
   phone: '',
   terms: 'net_30',
+  termsId: '',
+  salesTaxCodeId: '',
+  resaleNumber: '',
+  taxExemptionReason: '',
   notes: '',
 };
+
+function termsLabelFor(val: string | null) {
+  return TERMS_OPTIONS.find((o) => o.value === val)?.label ?? val ?? '-';
+}
 
 const TERMS_OPTIONS = [
   { value: 'net_15', label: 'Net 15' },
@@ -87,9 +116,13 @@ function CustomerForm({
   customFieldNames,
   customValues,
   onCustomChange,
+  termsList,
+  taxCodes,
 }: {
   form: CustomerFormState;
   onChange: (field: keyof CustomerFormState, value: string) => void;
+  termsList: ListOption[];
+  taxCodes: ListOption[];
   /** Company-defined custom field names for customers (may be empty). */
   customFieldNames: string[];
   customValues: Record<string, string>;
@@ -139,20 +172,57 @@ function CustomerForm({
           />
         </div>
       </div>
-      <div>
-        <Label htmlFor="terms">Payment Terms</Label>
-        <Select
-          id="terms"
-          value={form.terms}
-          onChange={(e) => onChange('terms', e.target.value)}
-        >
-          {TERMS_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </Select>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <Label htmlFor="terms">Payment Terms</Label>
+          <Select id="terms" value={form.termsId} onChange={(e) => onChange('termsId', e.target.value)}>
+            <option value="">{form.terms && !form.termsId ? `${termsLabelFor(form.terms)} (old setting)` : '—'}</option>
+            {termsList
+              .filter((t) => t.isActive || t.id === form.termsId)
+              .map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+          </Select>
+          <p className="mt-1 text-xs text-navy/50">
+            Edit the choices on the <Link href="/lists?list=terms" className="text-electric hover:underline">Terms list</Link>.
+          </p>
+        </div>
+        <div>
+          <Label htmlFor="taxCode">
+            Sales tax code <Help term="sales-tax" />
+          </Label>
+          <Select id="taxCode" value={form.salesTaxCodeId} onChange={(e) => onChange('salesTaxCodeId', e.target.value)}>
+            <option value="">—</option>
+            {taxCodes
+              .filter((t) => t.isActive || t.id === form.salesTaxCodeId)
+              .map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.code} — {t.taxable ? 'taxable' : 'not taxable'}
+                </option>
+              ))}
+          </Select>
+        </div>
       </div>
+      {form.salesTaxCodeId && taxCodes.find((t) => t.id === form.salesTaxCodeId)?.taxable === false && (
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <Label htmlFor="resaleNumber">Resale certificate no.</Label>
+            <Input id="resaleNumber" maxLength={50} value={form.resaleNumber} onChange={(e) => onChange('resaleNumber', e.target.value)} />
+          </div>
+          <div>
+            <Label htmlFor="exemptReason">Why is this customer not taxed?</Label>
+            <Input
+              id="exemptReason"
+              maxLength={100}
+              placeholder="e.g. Reseller, Non-profit"
+              value={form.taxExemptionReason}
+              onChange={(e) => onChange('taxExemptionReason', e.target.value)}
+            />
+          </div>
+        </div>
+      )}
       <div>
         <Label htmlFor="notes">Notes</Label>
         <textarea
@@ -313,6 +383,20 @@ function CustomersPageContent() {
   const [editCustom, setEditCustom] = useState<Record<string, string>>({});
   const [editSaving, setEditSaving] = useState(false);
 
+  // Terms + Sales Tax Code lists (wave-2 lists)
+  const [termsList, setTermsList] = useState<ListOption[]>([]);
+  const [taxCodes, setTaxCodes] = useState<ListOption[]>([]);
+  useEffect(() => {
+    api
+      .get<{ entries: ListOption[] }>('/api/lists/terms?includeInactive=true')
+      .then((d) => setTermsList(d.entries))
+      .catch(() => {});
+    api
+      .get<{ entries: ListOption[] }>('/api/lists/sales-tax-codes?includeInactive=true')
+      .then((d) => setTaxCodes(d.entries))
+      .catch(() => {});
+  }, []);
+
   // Deactivate confirm modal
   const [deactivateTarget, setDeactivateTarget] = useState<Customer | null>(null);
   const [deactivating, setDeactivating] = useState(false);
@@ -397,7 +481,10 @@ function CustomersPageContent() {
         companyName: addForm.companyName.trim() || undefined,
         email: addForm.email.trim() || undefined,
         phone: addForm.phone.trim() || undefined,
-        terms: addForm.terms || undefined,
+        termsId: addForm.termsId || undefined,
+        salesTaxCodeId: addForm.salesTaxCodeId || undefined,
+        resaleNumber: addForm.resaleNumber.trim() || undefined,
+        taxExemptionReason: addForm.taxExemptionReason.trim() || undefined,
         notes: addForm.notes.trim() || undefined,
       });
       try {
@@ -431,7 +518,11 @@ function CustomersPageContent() {
       companyName: customer.companyName ?? '',
       email: customer.email ?? '',
       phone: customer.phone ?? '',
-      terms: customer.terms ?? 'net_30',
+      terms: customer.terms ?? '',
+      termsId: customer.termsId ?? '',
+      salesTaxCodeId: customer.salesTaxCodeId ?? '',
+      resaleNumber: customer.resaleNumber ?? '',
+      taxExemptionReason: customer.taxExemptionReason ?? '',
       notes: customer.notes ?? '',
     });
     setEditCustom({ ...(customer.customFields ?? {}) });
@@ -458,7 +549,11 @@ function CustomersPageContent() {
         companyName: editForm.companyName.trim() || null,
         email: editForm.email.trim() || null,
         phone: editForm.phone.trim() || null,
-        terms: editForm.terms || null,
+        // Terms change only when a Terms list entry is picked (an older setting is kept otherwise).
+        ...(editForm.termsId ? { termsId: editForm.termsId } : {}),
+        salesTaxCodeId: editForm.salesTaxCodeId || null,
+        resaleNumber: editForm.resaleNumber.trim() || null,
+        taxExemptionReason: editForm.taxExemptionReason.trim() || null,
         notes: editForm.notes.trim() || null,
       });
       try {
@@ -506,8 +601,8 @@ function CustomersPageContent() {
   // Render
   // ---------------------------------------------------------------------------
 
-  const termsLabel = (val: string | null) =>
-    TERMS_OPTIONS.find((o) => o.value === val)?.label ?? val ?? '-';
+  const termsLabel = (c: Customer) =>
+    (c.termsId ? termsList.find((t) => t.id === c.termsId)?.name : undefined) ?? termsLabelFor(c.terms);
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
@@ -552,6 +647,12 @@ function CustomersPageContent() {
               <Download className="h-4 w-4" />
               Export CSV
             </Button>
+            <Link href="/lists/multiple?list=customers">
+              <Button variant="secondary" title="Add or edit many customers at once (paste from Excel)">
+                <ListPlus className="h-4 w-4" />
+                Add/Edit Multiple
+              </Button>
+            </Link>
             <Button onClick={openAddModal}>
               <Plus className="h-4 w-4" />
               Add Customer
@@ -614,7 +715,7 @@ function CustomersPageContent() {
                     )}
                   </Td>
                   <Td className="text-navy/70">{c.phone ?? '-'}</Td>
-                  <Td className="text-navy/70">{termsLabel(c.terms)}</Td>
+                  <Td className="text-navy/70">{termsLabel(c)}</Td>
                   {showCustomCols &&
                     customFieldNames.map((name) => (
                       <Td key={name} className="text-navy/70">
@@ -682,6 +783,8 @@ function CustomersPageContent() {
         <CustomerForm
           form={addForm}
           onChange={updateAddForm}
+          termsList={termsList}
+          taxCodes={taxCodes}
           customFieldNames={customFieldNames}
           customValues={addCustom}
           onCustomChange={(name, value) => setAddCustom((prev) => ({ ...prev, [name]: value }))}
@@ -711,10 +814,13 @@ function CustomersPageContent() {
         <CustomerForm
           form={editForm}
           onChange={updateEditForm}
+          termsList={termsList}
+          taxCodes={taxCodes}
           customFieldNames={customFieldNames}
           customValues={editCustom}
           onCustomChange={(name, value) => setEditCustom((prev) => ({ ...prev, [name]: value }))}
         />
+        {editTarget && <EntityNotes entityType="customer" entityId={editTarget.id} />}
       </Modal>
 
       {/* ---- Define custom fields modal ---- */}
