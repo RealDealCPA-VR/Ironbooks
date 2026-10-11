@@ -101,9 +101,23 @@ describe('API permission map coverage', () => {
       const enforced = Object.values(rules).some((r) => typeof r === 'object' || r === 'member');
       if (!enforced) continue;
       if (!/getServerContext\s*\(/.test(f.src)) problems.push(`${f.rel}: never calls getServerContext()`);
-      if (!/FORBIDDEN|reportError/.test(f.src)) problems.push(`${f.rel}: does not map FORBIDDEN to 403`);
+      // Shared helpers are accepted only because the test below proves each maps FORBIDDEN to 403.
+      if (!/FORBIDDEN|reportError|routeError|aiErrorResponse/.test(f.src)) {
+        problems.push(`${f.rel}: does not map FORBIDDEN to 403`);
+      }
     }
     expect(problems).toEqual([]);
+  });
+
+  it('the shared route error helpers answer FORBIDDEN with HTTP 403', async () => {
+    const { ServiceError } = await import('@/lib/services/_base');
+    const { routeError } = await import('@/lib/routeErrors');
+    const { aiErrorResponse } = await import('@/app/api/ai/_errors');
+    const { reportError } = await import('@/app/api/reports/_lib');
+    const denied = () => new ServiceError('FORBIDDEN', 'nope');
+    expect(routeError(denied(), 't').status).toBe(403);
+    expect(aiErrorResponse(denied(), 't').status).toBe(403);
+    expect(reportError(denied(), 't').status).toBe(403);
   });
 
   it("every 'self' route passes the central session gate (file lock, file-bound session, deactivation)", () => {

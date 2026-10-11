@@ -15,6 +15,8 @@ import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { listCondenseArchives, restoreCondenseArchive } from '@/lib/services/condense';
 import { ServiceError } from '@/lib/services/_base';
+import { requireFileAdmin } from '@/lib/services/access';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -46,6 +48,11 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
+    // Restoring an archive copy replaces the whole company file (every company in it): same
+    // gates as POST /api/backup — Admin of every company, and single-user mode while anyone
+    // else is connected.
+    await requireFileAdmin(ctx);
+    await assertExclusiveAccess(ctx, 'Restore', { scope: 'file' });
     const body = await req.json().catch(() => ({}));
     const id = typeof body?.id === 'string' ? body.id : '';
     if (!id) {

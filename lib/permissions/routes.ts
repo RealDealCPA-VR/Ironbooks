@@ -100,6 +100,19 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/dashboard': r('reports_financial', 'GET'),
   '/api/search': kind('member', 'GET'), // results filtered per area in the route
   '/api/memorized-reports': kind('member', 'GET POST'),
+  // Privacy & Network (team hosting): any member may read the policy (admins see more; the
+  // route decides) and ask whether a destination is allowed; changing it is a company setting
+  // (the service additionally requires owner/admin).
+  '/api/network-policy': { GET: 'member', ...r('company', 'PUT:modify PATCH:modify') },
+  '/api/network-policy/check': kind('member', 'GET'),
+  // AI & Automation (team ai): provider settings are company preferences; tailnet discovery
+  // and Test Connection are part of editing them.
+  '/api/ai/settings': r('company', 'GET PUT:modify'),
+  '/api/ai/tailnet': r('company', 'GET:modify'),
+  '/api/ai/test': r('company', 'POST:modify'),
+  // Advanced pricing / receiving preferences (team pricing).
+  '/api/pricing/settings': r('company', 'GET PATCH'),
+  '/api/receiving/settings': r('company', 'GET PATCH'),
 
   // ---- Users & Roles ----
   '/api/users': r('users', 'GET POST'),
@@ -107,12 +120,29 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/users/[id]/reset-password': r('users', 'POST:modify'),
   '/api/roles': r('users', 'GET POST'),
   '/api/roles/[id]': r('users', 'GET PATCH DELETE'),
+  // Multi-user hosting (team hosting): who is logged in / sign-out / single-user mode. Every
+  // member sees their own session and may sign it out; the services restrict everything else
+  // (other people's sessions, sign-out-others, single-user mode) to owner/admin.
+  '/api/sessions': kind('member', 'GET POST'),
+  '/api/sessions/[id]': kind('member', 'DELETE'),
+  '/api/single-user': { GET: 'member', ...r('file_utilities', 'POST:modify') },
 
   // ---- File utilities ----
   '/api/backup': r('file_utilities', 'GET:create POST:delete'),
   '/api/backup/company': r('file_utilities', 'GET:create POST:delete'),
   '/api/dashboard/auto-backup': r('file_utilities', 'POST'),
   '/api/condense': r('file_utilities', 'POST:delete'),
+  '/api/condense/archives': r('file_utilities', 'GET POST:delete'), // POST restores the whole file
+  '/api/integrity/books-in-balance': r('file_utilities', 'GET'),
+  // Company file (team companyfile): portable file = full copy of the file (create, like a
+  // backup); restoring one is a restore ('delete', like /api/backup); the shareable ledger
+  // and transaction log are exports / an audit view of the books.
+  '/api/portable': r('file_utilities', 'GET:create'),
+  '/api/portable/restore': r('file_utilities', 'POST:delete'),
+  '/api/portable/shareable': r('file_utilities', 'GET:print'),
+  '/api/transaction-log': r('reports_financial', 'GET'),
+  '/api/transaction-log/verify': r('reports_financial', 'GET'),
+  '/api/qb-import/gl': r('file_utilities', 'GET POST'),
   '/api/integrity': r('file_utilities', 'GET'),
   '/api/import': r('file_utilities', 'POST'),
   '/api/import/csv-preview': r('file_utilities', 'POST'),
@@ -135,6 +165,17 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/items': r('lists', 'GET POST'),
   '/api/items/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/items/[id]/components': r('lists', 'GET'),
+  '/api/items/barcode': r('lists', 'GET'),
+  // Advanced pricing (team pricing): price levels, price rules and customer/vendor type lists
+  // are lists; assigning them to a customer/vendor edits that customer/vendor.
+  '/api/pricing/levels': r('lists', 'GET POST'),
+  '/api/pricing/levels/[id]': r('lists', 'PUT:modify DELETE'),
+  '/api/pricing/levels/[id]/items': r('lists', 'PUT:modify'),
+  '/api/pricing/rules': r('lists', 'GET POST'),
+  '/api/pricing/rules/[id]': r('lists', 'PUT:modify DELETE'),
+  '/api/type-lists/[kind]': r('lists', 'GET POST'),
+  '/api/type-lists/[kind]/[id]': r('lists', 'PUT:modify DELETE'),
+  '/api/ai/recurring': r('lists', 'GET POST'), // memorizes via the recurring-template list
   '/api/sales-reps': r('lists', 'GET POST'),
   '/api/sales-reps/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/sales-reps/assign': r('customers', 'POST:modify'),
@@ -153,6 +194,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/jobs/[id]': r('customers', 'GET PATCH DELETE'),
   '/api/customer-prices': r('customers', 'GET POST'),
   '/api/customer-prices/[id]': r('customers', 'DELETE'),
+  '/api/pricing/customers/[id]': r('customers', 'PATCH'),
+  '/api/pricing/quote': r('customers', 'POST:view'), // advisory price lookup for sales forms
   '/api/invoices': r('customers', 'GET POST'),
   '/api/invoices/[id]': r('customers', 'GET PUT PATCH DELETE'),
   '/api/invoices/[id]/email': r('customers', 'POST:print'),
@@ -167,6 +210,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/sales-orders': r('customers', 'GET POST'),
   '/api/sales-orders/[id]': r('customers', 'GET POST:modify'),
   '/api/sales-orders/backorders': r('customers', 'GET'),
+  // SO fulfillment worksheet (team pricing): batch-invoicing creates invoices.
+  '/api/fulfillment': r('customers', 'GET POST'),
+  '/api/fulfillment/pick-list': r('customers', 'GET:print'),
+  '/api/fulfillment/packing-slips': r('customers', 'GET:print'),
   '/api/sales-receipts': r('customers', 'GET POST'),
   '/api/sales-receipts/[id]': r('customers', 'GET DELETE'),
   '/api/payments': r('customers', 'GET POST'),
@@ -194,6 +241,13 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/expense-reports': r('vendors', 'GET POST'),
   '/api/expense-reports/[id]': r('vendors', 'GET POST:modify'),
   '/api/reports/1099/mapping': r('vendors', 'GET PATCH'),
+  '/api/type-lists/vendor-assign': r('vendors', 'POST:modify'),
+  // Enhanced receiving (team pricing): bill received items.
+  '/api/receiving/open-lines': r('vendors', 'GET'),
+  '/api/receiving/po/[id]': r('vendors', 'GET'),
+  '/api/receiving/bill': r('vendors', 'POST'),
+  // AI vendor pre-fill of expense accounts (bills / checks / expenses).
+  '/api/ai/prefill': r('vendors', 'GET'),
 
   // ---- Banking ----
   '/api/bank-accounts': r('banking', 'GET POST'),
@@ -205,6 +259,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/bank-transactions/match': r('banking', 'POST:modify'),
   '/api/bank-transactions/unmatch': r('banking', 'POST:modify'),
   '/api/rules': r('banking', 'GET POST'),
+  // AI categorization of bank feed lines (team ai): auto-apply posts through categorize.
+  '/api/ai/bank-suggestions': r('banking', 'GET POST'),
+  '/api/ai/categorizer': r('banking', 'GET POST:modify'),
   '/api/demo-feed': r('banking', 'POST'),
   '/api/plaid/exchange': r('banking', 'POST'),
   '/api/plaid/link-token': r('banking', 'POST'),
@@ -237,6 +294,11 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/errors': r('accounting', 'GET POST'),
   '/api/errors/[id]/analyze': r('accounting', 'POST'),
   '/api/errors/[id]/apply': r('accounting', 'POST:modify'),
+  // AI assistant (team ai): answers come from read-only report tools; proposals are journal
+  // entries that post only when approved, under the approver's own permissions.
+  '/api/ai/assistant': r('reports_financial', 'POST:view'),
+  '/api/ai/proposals': r('accounting', 'GET'),
+  '/api/ai/proposals/[id]': r('accounting', 'POST'),
   '/api/audit-trail': r('reports_financial', 'GET'),
   '/api/audit-trail/[id]': r('reports_financial', 'GET'),
 
@@ -255,6 +317,19 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/assemblies/pending': r('inventory', 'GET POST'),
   '/api/assemblies/pending/[id]': r('inventory', 'POST:modify'),
   '/api/fifo': r('inventory', 'GET POST'),
+  // Advanced Inventory (team inventory): sites, bins, transfers, landed cost.
+  '/api/inventory-sites': r('inventory', 'GET POST'),
+  '/api/inventory-sites/[id]': r('inventory', 'GET PATCH'),
+  '/api/inventory-sites/adjust': r('inventory', 'POST:modify'),
+  '/api/inventory-sites/bins': r('inventory', 'GET POST'),
+  '/api/inventory-sites/bins/[id]': r('inventory', 'PATCH'),
+  '/api/inventory-sites/reorder-points': r('inventory', 'GET PUT'),
+  '/api/inventory-sites/reports': r('reports_inventory', 'GET'),
+  '/api/inventory-transfers': r('inventory', 'GET POST'),
+  '/api/inventory-transfers/[id]': r('inventory', 'GET POST:modify'),
+  '/api/landed-cost': r('inventory', 'GET POST'),
+  '/api/landed-cost/[id]': r('inventory', 'GET POST:modify'),
+  '/api/landed-cost/preview': r('inventory', 'POST:view'),
 
   // ---- Sales tax ----
   '/api/tax-agencies': r('sales_tax', 'GET POST'),
@@ -402,6 +477,15 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/assemblies': 'inventory',
   '/inventory-ops': 'inventory',
   '/fifo': 'inventory',
+  '/inventory-sites': 'inventory',
+  '/inventory-transfers': 'inventory',
+  '/landed-cost': 'inventory',
+  '/advanced-pricing': 'lists',
+  '/so-fulfillment': 'customers',
+  '/receive-bill': 'vendors',
+  '/ai-settings': 'company',
+  '/privacy': 'company',
+  '/transaction-log': 'reports_financial',
   '/audit-trail': 'reports_financial',
   '/integrity': 'file_utilities',
   '/backup': 'file_utilities',
@@ -444,6 +528,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/reports/1099-efile': 'reports_purchases',
   '/reports/payroll-summary': 'reports_payroll',
   '/reports/inventory-valuation': 'reports_inventory',
+  '/reports/inventory-sites': 'reports_inventory',
   '/reports/sales-tax': 'sales_tax',
   '/reports/reconciliation': 'accounting',
 };

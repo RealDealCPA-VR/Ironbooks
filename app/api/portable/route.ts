@@ -10,6 +10,7 @@
  */
 import { NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { requireFileAdmin } from '@/lib/services/access';
 import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { createPortableCompanyFile } from '@/lib/services/portableFile';
@@ -39,6 +40,9 @@ function contentDisposition(filename: string): string {
 export async function GET() {
   try {
     const ctx = await getServerContext();
+    // The portable file carries EVERY company and user of this file: like a whole-file backup it
+    // needs an Admin of every company (lib/services/access requireFileAdmin).
+    await requireFileAdmin(ctx);
     const { buffer, filename } = await createPortableCompanyFile(ctx, {
       dataDir: dataDirOf(ctx.db) ?? resolveDataDir(),
     });

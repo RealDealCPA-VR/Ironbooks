@@ -647,6 +647,14 @@ export async function restorePortableCompanyFile(
       }
     }
 
+    // Multi-user hosting state is per running file, not part of the books: a restored copy never
+    // inherits the original's signed-in sessions or a single-user-mode lock (both verified above
+    // as exact copies, then reset here).
+    await client.exec(
+      `UPDATE user_sessions SET ended_at = now(), end_reason = 'expired' WHERE ended_at IS NULL;
+       DELETE FROM single_user_mode;`,
+    );
+
     // Make the folder a self-describing desktop company file.
     fs.writeFileSync(
       path.join(dir, COMPANY_FILE_MANIFEST),

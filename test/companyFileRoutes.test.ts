@@ -15,11 +15,26 @@ const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-companyfile-r
 const ACTIVE = path.join(ROOT, 'Active Co.bookkeeper');
 process.env.BKA_DATA_DIR = ACTIVE;
 
-const session = vi.hoisted(() => ({ userId: null as string | null }));
+const session = vi.hoisted(() => ({ userId: null as string | null, headers: new Map<string, string>() }));
 vi.mock('@/lib/auth', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/auth')>();
-  return { ...actual, getSessionUserId: async () => session.userId };
+  return {
+    ...actual,
+    getSessionUserId: async () => session.userId,
+    // Multi-user hosting: getServerContext reads the live session (no sid → no session row).
+    getSessionInfo: async () => (session.userId ? { userId: session.userId } : null),
+  };
 });
+// Users & Roles: getServerContext authorizes the request path/method that middleware stamps.
+vi.mock('next/headers', () => ({
+  cookies: async () => ({ get: () => undefined, set: () => undefined, delete: () => undefined }),
+  headers: async () => new Headers([...session.headers.entries()]),
+}));
+/** Stamp the route headers middleware.ts would set for this request. */
+function route(method: string, routePath: string) {
+  session.headers.set('x-bka-route-path', routePath);
+  session.headers.set('x-bka-route-method', method);
+}
 
 import { getDb, closeDb } from '@/lib/db';
 import { userCompanies, users } from '@/lib/db/schema';
@@ -66,16 +81,23 @@ describe('company-file API routes', () => {
 
   it('fails closed without a session', async () => {
     session.userId = null;
+    route('GET', '/api/portable');
     expect((await portableGET()).status).toBe(403);
+    route('GET', '/api/transaction-log');
     expect((await logGET(req('/api/transaction-log'))).status).toBe(403);
+    route('GET', '/api/transaction-log/verify');
     expect((await verifyGET()).status).toBe(403);
+    route('GET', '/api/condense/archives');
     expect((await archivesGET()).status).toBe(403);
+    route('GET', '/api/portable/shareable');
     expect((await shareableGET(req('/api/portable/shareable'))).status).toBe(403);
+    route('POST', '/api/portable/restore');
     expect((await restorePOST(req('/api/portable/restore', { method: 'POST', body: 'x' }))).status).toBe(403);
   });
 
   it('portable file: accountant refused, owner gets a .bkp', async () => {
     session.userId = accountantId;
+    route('GET', '/api/portable');
     const denied = await portableGET();
     expect(denied.status).toBe(403);
 
@@ -89,6 +111,7 @@ describe('company-file API routes', () => {
 
   it('inspects, then restores into a new sibling folder (ignoring a session-supplied target)', async () => {
     session.userId = ownerId;
+    route('POST', '/api/portable/restore');
     const inspect = await restorePOST(req('/api/portable/restore?inspect=1', { method: 'POST', body: bkp }));
     expect(inspect.status).toBe(200);
     const summary = await inspect.json();
@@ -109,6 +132,7 @@ describe('company-file API routes', () => {
 
   it('honors ?target= for the desktop shell (internal token)', async () => {
     session.userId = null;
+    route('POST', '/api/portable/restore');
     process.env.BKA_INTERNAL_TOKEN = 'test-internal-token';
     const target = path.join(ROOT, 'Chosen.bookkeeper');
     const res = await restorePOST(
@@ -134,13 +158,16 @@ describe('company-file API routes', () => {
 
   it('serves the transaction log, its verification, the shareable ledger and the archive list', async () => {
     session.userId = ownerId;
+    route('GET', '/api/transaction-log');
     const log = await (await logGET(req('/api/transaction-log?entityType=company'))).json();
     expect(log.total).toBe(1);
     expect(log.rows[0].summary).toContain('Created company "Active Co"');
 
+    route('GET', '/api/transaction-log/verify');
     const v = await (await verifyGET()).json();
     expect(v.ok).toBe(true);
 
+    route('GET', '/api/portable/shareable');
     const xlsx = await shareableGET(req('/api/portable/shareable?format=xlsx'));
     expect(xlsx.status).toBe(200);
     expect(xlsx.headers.get('Content-Type')).toContain('spreadsheetml');
@@ -148,6 +175,7 @@ describe('company-file API routes', () => {
     expect(pdf.headers.get('Content-Type')).toBe('application/pdf');
     expect((await shareableGET(req('/api/portable/shareable?format=doc'))).status).toBe(400);
 
+    route('GET', '/api/condense/archives');
     expect(await (await archivesGET()).json()).toEqual({ archives: [] });
   });
 });
