@@ -8,7 +8,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, invoices, journalEntries, users } from '@/lib/db/schema';
+import { accounts, fiscalPeriods, invoices, journalEntries, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { trialBalance } from './reports';
@@ -143,5 +143,36 @@ describe('L6 — payments in the same IIF are applied to the open documents', { 
     expect(after).toBe(before);
     const rec = await tie(ctx);
     expect(rec.ar.aging).toBe('300.00');
+  });
+
+  it('a PAYMENT in a closed fiscal period is not posted and not applied; the invoice stays whole', async () => {
+    const ctx = await newCompany('Pay Closed Period');
+    await ctx.db.insert(fiscalPeriods).values({
+      companyId: ctx.companyId,
+      periodStart: new Date('2025-11-01T00:00:00Z'),
+      periodEnd: new Date('2025-11-30T00:00:00Z'),
+      isClosed: true,
+    });
+    await importIIF(
+      ctx,
+      [...HDR, ...pmt('11/15/2025', 'Period Co', '200.00'), ...inv('12/05/2025', 'Period Co', '500.00', '4501')].join('\r\n'),
+      { openItems: { asDocuments: true, alreadyInGl: false } },
+    );
+    const rec = await tie(ctx);
+    expect(Number((await acct(ctx, '1050')).balance)).toBe(0);
+    expect(rec.ar.aging).toBe('500.00');
+  });
+
+  it('OPENBAL invoice: the applied part absorbs its same-file payment and never comes back', async () => {
+    const ctx = await newCompany('Pay Openbal Absorb');
+    // QuickBooks: 500 invoice, 200 paid by the payment in this file, OPENBAL 300.
+    await importIIF(
+      ctx,
+      [...HDR, ...inv('12/01/2025', 'Absorb Co', '500.00', '4601', 'N', '300.00'), ...pmt('12/10/2025', 'Absorb Co', '200.00')].join('\r\n'),
+      { openItems: { asDocuments: true, alreadyInGl: false } },
+    );
+    const rec = await tie(ctx);
+    expect(rec.ar.aging).toBe('300.00');
+    expect(Number((await acct(ctx, '1050')).balance)).toBe(200);
   });
 });

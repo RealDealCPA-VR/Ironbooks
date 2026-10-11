@@ -830,9 +830,16 @@ export async function importOpenItemsFromIif(
     }
     const open = t.openBalance ? parseAmount(t.openBalance) : null;
     const amount = (open ?? total).abs();
-    // The full document amount counts toward the name's QuickBooks balance (owed > 0 for
-    // invoices and bills, < 0 for credits); the open part is subtracted once the item exists.
-    touch(docSide, name, date, docSide === 'ar' ? total : total.negated());
+    // The document counts toward the name's QuickBooks balance (owed > 0 for invoices and
+    // bills, < 0 for credits); the open part is subtracted once the item exists. When the
+    // export carries an open balance, only that part is owed: the rest (total - open) was
+    // already applied in QuickBooks. It is counted like a PAID document — it absorbs the
+    // same-file payments that settled it, but never adds a balance when they are not here.
+    const owedTotal = docSide === 'ar' ? total : total.negated();
+    const owedOpen = owedTotal.isNegative() ? amount.negated() : amount;
+    touch(docSide, name, date, owedOpen);
+    const applied = owedTotal.minus(owedOpen);
+    if (!applied.isZero()) touch(docSide, name, null, applied, true);
     if (amount.isZero()) continue;
     const detail = t.lines
       .slice(1)

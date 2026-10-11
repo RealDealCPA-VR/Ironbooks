@@ -65,7 +65,8 @@ import { createItem, type ItemType } from './items';
 import { setBom } from './assemblies';
 import { createJob } from './jobs';
 import { createEmployee, updateEmployee } from './payroll';
-import { postJournalEntry, type PostingLine } from './posting';
+import { assertBalanced, postJournalEntry, type PostingLine } from './posting';
+import { assertPeriodOpen } from './fiscalPeriods';
 import { createType } from './typeLists';
 import { createSalesRep } from './salesReps';
 import { createTaxRate } from './salesTax';
@@ -1372,7 +1373,7 @@ export async function importIIF(
     // because below those rows themselves are re-pointed to the conversion account.
     const r = await importOpenItemsFromIif(ctx, docTxns, {
       alreadyInGl: !!opts.openItems.alreadyInGl,
-      controlRows: collectIifControlRows(txns, lookup),
+      controlRows: await collectIifControlRows(ctx, txns, lookup),
     });
     counts.openItems = { invoices: r.invoices, bills: r.bills, credits: r.credits, skipped: r.skipped };
     counts.skipped += r.skipped;
@@ -2042,15 +2043,23 @@ async function ensureBucketAccount(
 
 /**
  * Named A/R and A/P rows of the transactions importIifTransactions will actually post (date
- * readable, every amount readable and unambiguous, rows balanced). Used to apply payments and
- * other control-account activity to the open documents when those come in as documents.
+ * readable, every amount readable and unambiguous, rows balanced and within the ledger limits,
+ * date not in a closed period or on/before the closing date — the same checks postJournalEntry
+ * makes). Used to apply payments and other control-account activity to the open documents when
+ * those come in as documents. A transaction the ledger would refuse must never move a
+ * customer's or vendor's balance, or its money would disappear.
  */
-function collectIifControlRows(transactions: IIFTransaction[], lookup: AccountLookup): IifControlRow[] {
+async function collectIifControlRows(
+  ctx: ServiceContext,
+  transactions: IIFTransaction[],
+  lookup: AccountLookup,
+): Promise<IifControlRow[]> {
   const out: IifControlRow[] = [];
   for (const txn of transactions) {
     const date = parseIifDate(txn.date);
     if (!date) continue;
     const rows: IifControlRow[] = [];
+    const probe: PostingLine[] = [];
     let net = Money.zero();
     let ok = true;
     let nonZero = 0;
@@ -2063,6 +2072,8 @@ function collectIifControlRows(transactions: IIFTransaction[], lookup: AccountLo
       if (Money.isZero(amt)) continue;
       nonZero++;
       net = net.plus(toAmountString(amt));
+      const abs = toAmountString(Money.abs(amt));
+      probe.push({ accountId: '', debit: Money.isPositive(amt) ? abs : null, credit: Money.isPositive(amt) ? null : abs });
       const resolved = resolveAccountRef(lookup, l.accnt);
       if (resolved && 'ambiguous' in resolved && resolved.ambiguous) {
         ok = false;
@@ -2075,7 +2086,15 @@ function collectIifControlRows(transactions: IIFTransaction[], lookup: AccountLo
       if (!side || !name) continue;
       rows.push({ side, name, amount: toAmountString(amt), date: date.toISOString().slice(0, 10) });
     }
-    if (ok && nonZero >= 2 && net.isZero()) out.push(...rows);
+    if (!ok || nonZero < 2 || !net.isZero() || !rows.length) continue;
+    try {
+      assertBalanced(probe);
+      await assertPeriodOpen(ctx, date);
+    } catch (err) {
+      if (err instanceof ServiceError) continue; // postJournalEntry will refuse it too
+      throw err;
+    }
+    out.push(...rows);
   }
   return out;
 }
