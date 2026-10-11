@@ -20,6 +20,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { condensePeriod } from '@/lib/services/condense';
 import { ServiceError } from '@/lib/services/_base';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -55,6 +56,10 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+
+    // Multi-user: condensing rewrites history — owner/admin only, and single-user mode while
+    // anyone else is connected (QB Enterprise parity). The read-only preview is not gated.
+    if (body?.dryRun !== true) await assertExclusiveAccess(ctx, 'Condense Data');
 
     const result = await condensePeriod(ctx, {
       beforeDate: cutoff,

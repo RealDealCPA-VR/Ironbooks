@@ -11,6 +11,12 @@
  *
  * File-lock handling: a 403 "company file is locked" response (stale unlock cookie after an
  * app relaunch — see isFileLockError below) redirects the browser to /unlock before throwing.
+ *
+ * Multi-user optimistic concurrency: GET responses for invoices, bills, journal entries,
+ * customers, vendors and items are scanned for each record's `updatedAt`; a later
+ * PATCH/PUT/DELETE of that record automatically sends it as `x-expected-updated-at`, and the
+ * server answers 409 ("This record was changed by … Reload to see the latest.") if someone
+ * else saved in between. Pages need no changes; see lib/services/concurrency.ts.
  */
 export class ApiError extends Error {
   constructor(public status: number, message: string, public code?: string) {
@@ -86,6 +92,55 @@ async function handle<T>(res: Response): Promise<T> {
   return data as T;
 }
 
+// ---- optimistic-concurrency version cache ----
+
+/** Header verified by lib/services/concurrency.ts (EXPECTED_VERSION_HEADER). */
+export const EXPECTED_VERSION_HEADER = 'x-expected-updated-at';
+
+const VERSIONED_PATH =
+  /^\/api\/(invoices|bills|journal-entries|customers|vendors|items)(?:\/([^/]+))?\/?$/;
+/** '/api/<resource>/<id>' → updatedAt (ISO) the user last loaded. */
+const loadedVersions = new Map<string, string>();
+
+function pathOf(url: string): string {
+  try {
+    return new URL(url, 'http://localhost').pathname;
+  } catch {
+    return url.split('?')[0];
+  }
+}
+
+type Rec = { id?: unknown; updatedAt?: unknown };
+const isRec = (v: unknown): v is Rec => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+
+/** Remember record versions seen in a response from one of the versioned resources. */
+export function rememberVersions(url: string, data: unknown): void {
+  const m = VERSIONED_PATH.exec(pathOf(url));
+  if (!m || !data || typeof data !== 'object') return;
+  const base = `/api/${m[1]}`;
+  const note = (r: unknown, onlyId?: string) => {
+    if (!isRec(r) || typeof r.id !== 'string' || typeof r.updatedAt !== 'string') return false;
+    if (onlyId && r.id !== onlyId) return false;
+    loadedVersions.set(`${base}/${r.id}`, r.updatedAt);
+    return true;
+  };
+  const values = Array.isArray(data) ? [data] : [data, ...Object.values(data as object)];
+  if (m[2]) {
+    // Detail: the record itself, or wrapped one level deep ({ entry }, { item }).
+    if (!values.some((v) => note(v, m[2]))) loadedVersions.delete(`${base}/${m[2]}`);
+  } else {
+    // List: a bare array, or arrays one level deep ({ customers: [...] }).
+    for (const v of values) if (Array.isArray(v)) v.forEach((r) => note(r));
+  }
+}
+
+function versionFor(method: string, url: string): string | undefined {
+  if (method === 'POST') return undefined;
+  const path = pathOf(url).replace(/\/$/, '');
+  const m = VERSIONED_PATH.exec(path);
+  return m && m[2] ? loadedVersions.get(path) : undefined;
+}
+
 function mutateHeaders(opts?: MutateOpts, hasBody?: boolean): Record<string, string> {
   const headers: Record<string, string> = { ...(opts?.headers || {}) };
   if (hasBody) headers['content-type'] = 'application/json';
@@ -104,12 +159,22 @@ async function mutate<T>(
   opts?: MutateOpts,
 ): Promise<T> {
   const hasBody = body !== undefined;
-  const run = (o?: MutateOpts) =>
-    fetch(url, {
+  const version = versionFor(method, url);
+  const run = (o?: MutateOpts) => {
+    const headers = mutateHeaders(o, hasBody);
+    if (version && !headers[EXPECTED_VERSION_HEADER]) headers[EXPECTED_VERSION_HEADER] = version;
+    return fetch(url, {
       method,
-      headers: mutateHeaders(o, hasBody),
+      headers,
       body: hasBody ? JSON.stringify(body) : undefined,
-    }).then((r) => handle<T>(r));
+    })
+      .then((r) => handle<T>(r))
+      .then((data) => {
+        // The saved record's new version (or forget it, so the next save isn't a false 409).
+        if (version) rememberVersions(url, data);
+        return data;
+      });
+  };
 
   try {
     return await run(opts);
@@ -132,7 +197,13 @@ async function mutate<T>(
 }
 
 export const api = {
-  get: <T = unknown>(url: string) => fetch(url, { cache: 'no-store' }).then((r) => handle<T>(r)),
+  get: <T = unknown>(url: string) =>
+    fetch(url, { cache: 'no-store' })
+      .then((r) => handle<T>(r))
+      .then((data) => {
+        rememberVersions(url, data);
+        return data;
+      }),
   post: <T = unknown>(url: string, body?: unknown, opts?: MutateOpts) =>
     mutate<T>('POST', url, body, opts),
   patch: <T = unknown>(url: string, body?: unknown, opts?: MutateOpts) =>

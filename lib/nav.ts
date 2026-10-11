@@ -139,6 +139,8 @@ export const navGroups: NavGroup[] = [
       { icon: Building2, label: 'Companies', path: '/companies' },
       { icon: HardDrive, label: 'Company File', path: '/company-file' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security' },
+      { icon: Network, label: 'Privacy & Network', path: '/privacy' },
+      { icon: Users, label: 'Multi-user', path: '/multi-user' },
       { icon: Settings, label: 'Settings', path: '/settings' },
     ],
   },

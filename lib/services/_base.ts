@@ -30,6 +30,12 @@ export interface ServiceContext {
    * `assertPeriodOpen` blocks postings dated on/before the company closing date unless set.
    */
   closingDateOverride?: boolean;
+  /**
+   * Multi-user hosting: the signed-in session making this request (user_sessions.id), set by
+   * `getServerContext`. Used by "Who is logged in" and the single-user-mode gate
+   * (lib/services/sessions.ts). Absent for system jobs / first-run.
+   */
+  sessionId?: string;
 }
 
 export type ServiceErrorCode =

@@ -1,0 +1,193 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  DEFAULT_NETWORK_POLICY,
+  OUTBOUND_PURPOSES,
+  decideOutbound,
+  effectiveMode,
+  envModeCeiling,
+  normalizePolicy,
+  type NetworkPolicy,
+  type OutboundPurpose,
+} from './policy';
+
+// guard.ts reads the company policy from the DB; stub it so these stay pure unit tests.
+const stored = vi.hoisted(() => ({ policy: null as unknown }));
+vi.mock('@/lib/services/networkPolicy', () => ({
+  getNetworkPolicy: async () => stored.policy,
+}));
+import { assertOutboundAllowed, policyFetch, recentOutbound } from './guard';
+
+const policy = (mode: NetworkPolicy['mode'], optIn: Partial<Record<OutboundPurpose, boolean>> = {}): NetworkPolicy =>
+  normalizePolicy({ mode, cloudOptIn: optIn });
+
+describe('normalizePolicy', () => {
+  it('defaults to tailnet-only with every cloud purpose off', () => {
+    expect(normalizePolicy(undefined)).toEqual({
+      mode: 'tailnet-only',
+      cloudOptIn: { ai: false, email: false, 'bank-feeds': false, updates: false },
+    });
+    expect(DEFAULT_NETWORK_POLICY.mode).toBe('tailnet-only');
+  });
+  it('drops unknown modes/purposes and non-boolean opt-ins', () => {
+    const p = normalizePolicy({ mode: 'yolo', cloudOptIn: { ai: 'yes', email: true, telemetry: true } });
+    expect(p.mode).toBe('tailnet-only');
+    expect(p.cloudOptIn).toEqual({ ai: false, email: true, 'bank-feeds': false, updates: false });
+  });
+});
+
+describe('effectiveMode / env ceiling', () => {
+  it('takes the more restrictive of company mode and ceiling', () => {
+    expect(effectiveMode('allow-cloud', 'offline')).toBe('offline');
+    expect(effectiveMode('allow-cloud', 'tailnet-only')).toBe('tailnet-only');
+    expect(effectiveMode('offline', 'allow-cloud')).toBe('offline');
+    expect(effectiveMode('tailnet-only', undefined)).toBe('tailnet-only');
+  });
+  it('reads BKA_NETWORK_MODE and ignores junk', () => {
+    expect(envModeCeiling({ BKA_NETWORK_MODE: 'offline' })).toBe('offline');
+    expect(envModeCeiling({ BKA_NETWORK_MODE: 'nope' })).toBe('offline'); // typo fails closed
+    expect(envModeCeiling({ BKA_NETWORK_MODE: '  ' })).toBeUndefined();
+    expect(envModeCeiling({})).toBeUndefined();
+  });
+});
+
+describe('decideOutbound — per mode and purpose', () => {
+  const CLOUD = 'https://api.anthropic.com/v1/messages';
+  const TAILNET = 'http://100.100.1.2:11434/api';
+  const MAGICDNS = 'https://gpu-box.tail1234.ts.net/v1';
+  const LAN = 'smtp://192.168.1.5:25';
+  const LOCAL = 'http://127.0.0.1:8080/';
+
+  it('offline: only loopback, for every purpose', () => {
+    for (const p of OUTBOUND_PURPOSES) {
+      expect(decideOutbound(policy('offline'), LOCAL, p, undefined).allowed).toBe(true);
+      expect(decideOutbound(policy('offline'), TAILNET, p, undefined).allowed).toBe(false);
+      expect(decideOutbound(policy('offline'), LAN, p, undefined).allowed).toBe(false);
+      expect(decideOutbound(policy('offline', { [p]: true }), CLOUD, p, undefined).allowed).toBe(false);
+    }
+  });
+
+  it('tailnet-only (default): loopback + LAN + tailnet, never the internet — even when opted in', () => {
+    for (const p of OUTBOUND_PURPOSES) {
+      const pol = policy('tailnet-only', { [p]: true });
+      expect(decideOutbound(pol, LOCAL, p, undefined).allowed).toBe(true);
+      expect(decideOutbound(pol, LAN, p, undefined).allowed).toBe(true);
+      expect(decideOutbound(pol, TAILNET, p, undefined).allowed).toBe(true);
+      expect(decideOutbound(pol, MAGICDNS, p, undefined).allowed).toBe(true);
+      const d = decideOutbound(pol, CLOUD, p, undefined);
+      expect(d.allowed).toBe(false);
+      expect(d.hostClass).toBe('public');
+      expect(d.reason).toMatch(/Privacy & Network/);
+    }
+  });
+
+  it('allow-cloud: public destinations only for opted-in purposes', () => {
+    const pol = policy('allow-cloud', { ai: true });
+    expect(decideOutbound(pol, CLOUD, 'ai', undefined).allowed).toBe(true);
+    expect(decideOutbound(pol, 'https://production.plaid.com/x', 'bank-feeds', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'smtps://smtp.gmail.com:465', 'email', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'https://github.com/', 'updates', undefined).allowed).toBe(false);
+    // Private destinations need no opt-in.
+    expect(decideOutbound(pol, LAN, 'email', undefined).allowed).toBe(true);
+  });
+
+  it('the machine ceiling overrides a company opt-in', () => {
+    const pol = policy('allow-cloud', { ai: true });
+    expect(decideOutbound(pol, CLOUD, 'ai', 'tailnet-only').allowed).toBe(false);
+    expect(decideOutbound(pol, TAILNET, 'ai', 'offline').allowed).toBe(false);
+  });
+
+  it('never allows unroutable/special destinations, bad protocols or URL credentials', () => {
+    const pol = policy('allow-cloud', { ai: true, 'bank-feeds': true });
+    expect(decideOutbound(pol, 'http://169.254.169.254/latest/meta-data', 'ai', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'http://0.0.0.0:80/', 'ai', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'file:///etc/passwd', 'ai', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'ftp://192.168.1.1/', 'ai', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'https://user:pw@api.anthropic.com/', 'ai', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'not a url', 'ai', undefined).allowed).toBe(false);
+  });
+
+  it('cannot be tricked by numeric IPv4 spellings', () => {
+    const pol = policy('tailnet-only');
+    // 0x08080808 = 8.8.8.8 — public, so blocked in tailnet-only mode.
+    expect(decideOutbound(pol, 'http://0x08080808/', 'ai', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'http://134744072/', 'ai', undefined).allowed).toBe(false);
+  });
+});
+
+describe('guard — assertOutboundAllowed / policyFetch', () => {
+  const ctx = { db: {} as never, companyId: 'co-guard-test' };
+  let fetchSpy: ReturnType<typeof vi.fn>;
+  const realFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it('throws FORBIDDEN (and logs the attempt) when blocked', async () => {
+    stored.policy = policy('tailnet-only');
+    await expect(assertOutboundAllowed('https://api.anthropic.com/', 'ai', ctx)).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    const log = recentOutbound(ctx.companyId);
+    expect(log[0]).toMatchObject({ purpose: 'ai', host: 'api.anthropic.com', allowed: false });
+  });
+
+  it('policyFetch never contacts a blocked destination', async () => {
+    stored.policy = policy('tailnet-only');
+    await expect(
+      policyFetch('https://sandbox.plaid.com/link/token/create', { method: 'POST' }, { purpose: 'bank-feeds', ctx }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('re-checks every redirect hop (allowed tailnet host → public host is refused)', async () => {
+    stored.policy = policy('tailnet-only');
+    fetchSpy.mockResolvedValueOnce(
+      new Response(null, { status: 302, headers: { location: 'https://exfil.example.com/steal' } }),
+    );
+    await expect(
+      policyFetch('http://100.100.1.2:8080/start', undefined, { purpose: 'ai', ctx }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('follows allowed redirects and strips credentials across origins', async () => {
+    stored.policy = policy('tailnet-only');
+    fetchSpy
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { location: 'http://100.100.1.3/next' } }))
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+    const res = await policyFetch(
+      'http://100.100.1.2/start',
+      { method: 'GET', headers: { authorization: 'Bearer secret', 'content-type': 'text/plain' } },
+      { purpose: 'ai', ctx },
+    );
+    expect(await res.text()).toBe('ok');
+    const [secondUrl, secondInit] = fetchSpy.mock.calls[1] as [string, RequestInit];
+    expect(secondUrl).toBe('http://100.100.1.3/next');
+    const h = new Headers(secondInit.headers);
+    expect(h.get('authorization')).toBeNull();
+    expect(h.get('content-type')).toBe('text/plain');
+  });
+
+  it('307/308 keep method + body on the same origin, but never resend a body to another origin', async () => {
+    stored.policy = policy('tailnet-only');
+    fetchSpy
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { location: '/next' } }))
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+    await policyFetch('http://100.100.1.2/start', { method: 'POST', body: 'x' }, { purpose: 'bank-feeds', ctx });
+    const [, sameInit] = fetchSpy.mock.calls[1] as [string, RequestInit];
+    expect(sameInit.method).toBe('POST');
+    expect(sameInit.body).toBe('x');
+
+    fetchSpy.mockReset();
+    fetchSpy.mockResolvedValueOnce(new Response(null, { status: 308, headers: { location: 'http://100.100.1.3/x' } }));
+    await expect(
+      policyFetch('http://100.100.1.2/start', { method: 'POST', body: '{"secret":"s"}' }, { purpose: 'bank-feeds', ctx }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});

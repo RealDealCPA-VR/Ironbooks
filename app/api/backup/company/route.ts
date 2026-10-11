@@ -15,6 +15,7 @@ import { getServerContext } from '@/lib/context';
 import { companies, userCompanies } from '@/lib/db/schema';
 import { createCompanyBackup, restoreCompanyBackup } from '@/lib/services/backup';
 import { ServiceError } from '@/lib/services/_base';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -89,6 +90,7 @@ export async function POST(req: NextRequest) {
       throw new ServiceError('FORBIDDEN', 'Your role is view-only. This action requires write access.');
     }
     if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
+    await assertExclusiveAccess(ctx, 'Restore'); // adds a NEW company: other companies untouched
 
     const arrayBuffer = await req.arrayBuffer();
     if (!arrayBuffer.byteLength) {

@@ -37,5 +37,16 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     switch: (dir) => ipcRenderer.invoke('company:switch', dir),
     setProtected: (val) => ipcRenderer.invoke('company:setProtected', val),
   },
+  /** Multi-user hosting (QB Enterprise "Host multi-user access") — see electron/hosting.js. */
+  hosting: {
+    status: () => ipcRenderer.invoke('hosting:status'),
+    setEnabled: (enable) => ipcRenderer.invoke('hosting:setEnabled', enable),
+    openConnect: () => ipcRenderer.invoke('hosting:openConnect'),
+    disconnect: () => ipcRenderer.invoke('hosting:disconnect'),
+  },
+  /** Re-read the Privacy & Network policy for what the window may load (after saving it). */
+  network: {
+    refresh: () => ipcRenderer.invoke('network:refresh'),
+  },
   isDesktop: true,
 });

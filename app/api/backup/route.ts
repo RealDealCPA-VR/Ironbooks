@@ -15,6 +15,7 @@ import { getServerContext } from '@/lib/context';
 import { getCompany } from '@/lib/services/company';
 import { createBackup, restoreBackup } from '@/lib/services/backup';
 import { ServiceError } from '@/lib/services/_base';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -77,8 +78,11 @@ export async function GET(_req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    // Auth: restore is destructive — fail closed before even reading the body.
-    await getServerContext();
+    // Auth: restore is destructive — fail closed before even reading the body. Restore replaces
+    // the whole company file, so it is owner/admin only and needs single-user mode while
+    // anyone else is connected.
+    const ctx = await getServerContext();
+    await assertExclusiveAccess(ctx, 'Restore', { scope: 'file' });
 
     const arrayBuffer = await req.arrayBuffer();
     if (!arrayBuffer.byteLength) {

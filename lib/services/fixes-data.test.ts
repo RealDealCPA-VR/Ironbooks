@@ -29,7 +29,11 @@ import { createCompany } from './company';
 const session = vi.hoisted(() => ({ userId: null as string | null }));
 vi.mock('@/lib/auth', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/auth')>();
-  return { ...actual, getSessionUserId: async () => session.userId };
+  return {
+    ...actual,
+    getSessionUserId: async () => session.userId,
+    getSessionInfo: async () => (session.userId ? { userId: session.userId } : null),
+  };
 });
 
 import { NextRequest } from 'next/server';

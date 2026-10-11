@@ -10,6 +10,7 @@
  * Never log or expose the access token in the response beyond what is necessary.
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
 import { exchangePublicToken } from '@/lib/services/plaid';
 import { ServiceError } from '@/lib/services/_base';
 
@@ -28,12 +29,15 @@ function errorResponse(err: unknown) {
 
 export async function POST(req: NextRequest) {
   try {
+    // Auth first (this route previously had no session check), then the network policy is
+    // enforced inside the service.
+    const ctx = await getServerContext();
     const body = await req.json();
     const { publicToken } = body as { publicToken?: string };
     if (!publicToken || typeof publicToken !== 'string') {
       return NextResponse.json({ error: 'publicToken is required', code: 'VALIDATION' }, { status: 400 });
     }
-    const accessToken = await exchangePublicToken(publicToken);
+    const accessToken = await exchangePublicToken(ctx, publicToken);
     return NextResponse.json({ accessToken });
   } catch (err) {
     return errorResponse(err);

@@ -18,6 +18,7 @@ import { and, eq, inArray } from 'drizzle-orm';
 import { bankTransactions, bankAccounts } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, validation } from './_base';
+import { policyFetch } from '@/lib/net/guard';
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -55,7 +56,13 @@ function notConfiguredError(): ServiceError {
 // Low-level fetch wrapper
 // ---------------------------------------------------------------------------
 
-async function plaidPost<T>(path: string, body: Record<string, unknown>): Promise<T> {
+// Every Plaid call goes through the network policy (lib/net/guard.ts): bank feeds stay off
+// unless the company is in 'allow-cloud' mode AND has opted in to the 'bank-feeds' purpose.
+async function plaidPost<T>(
+  ctx: ServiceContext,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<T> {
   const creds = getCredentials();
   if (!creds) throw notConfiguredError();
 
@@ -66,11 +73,15 @@ async function plaidPost<T>(path: string, body: Record<string, unknown>): Promis
     ...body,
   };
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  const res = await policyFetch(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { purpose: 'bank-feeds', ctx },
+  );
 
   if (!res.ok) {
     let detail: unknown;
@@ -100,7 +111,7 @@ async function plaidPost<T>(path: string, body: Record<string, unknown>): Promis
 export async function createLinkToken(ctx: ServiceContext): Promise<string> {
   if (!isConfigured()) throw notConfiguredError();
 
-  const data = await plaidPost<{ link_token: string }>('/link/token/create', {
+  const data = await plaidPost<{ link_token: string }>(ctx, '/link/token/create', {
     user: { client_user_id: ctx.companyId },
     client_name: 'BookKeeper AI',
     products: ['transactions'],
@@ -117,10 +128,10 @@ export async function createLinkToken(ctx: ServiceContext): Promise<string> {
  * access token; this service intentionally does not persist it (it would need
  * encryption at rest — left as an infrastructure concern).
  */
-export async function exchangePublicToken(publicToken: string): Promise<string> {
+export async function exchangePublicToken(ctx: ServiceContext, publicToken: string): Promise<string> {
   if (!isConfigured()) throw notConfiguredError();
 
-  const data = await plaidPost<{ access_token: string }>('/item/public_token/exchange', {
+  const data = await plaidPost<{ access_token: string }>(ctx, '/item/public_token/exchange', {
     public_token: publicToken,
   });
 
@@ -184,7 +195,7 @@ export async function syncTransactions(
   }
 
   // Fetch one page of new transactions via the sync endpoint.
-  const syncData = await plaidPost<PlaidSyncResponse>('/transactions/sync', {
+  const syncData = await plaidPost<PlaidSyncResponse>(ctx, '/transactions/sync', {
     access_token: params.accessToken,
   });
 

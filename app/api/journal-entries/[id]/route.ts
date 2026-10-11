@@ -6,6 +6,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getEntry, updateEntry, voidEntry } from '@/lib/services/journal';
 
 type Params = { params: Promise<{ id: string }> };
@@ -32,23 +33,26 @@ export async function PATCH(req: NextRequest, { params }: Params) {
       return NextResponse.json({ error: 'date is required (ISO string).' }, { status: 400 });
     }
 
-    const entry = await updateEntry(ctx, id, {
-      date,
-      description: body.description ?? '',
-      reference: body.reference === undefined ? undefined : (body.reference ?? null),
-      lines: body.lines ?? [],
-    });
+    // Multi-user: 409 if someone else changed this entry since it was loaded.
+    const entry = await withVersionCheck(ctx, 'journal_entry', id, expectedVersion(req), (c) =>
+      updateEntry(c, id, {
+        date,
+        description: body.description ?? '',
+        reference: body.reference === undefined ? undefined : (body.reference ?? null),
+        lines: body.lines ?? [],
+      }),
+    );
     return NextResponse.json({ entry });
   } catch (err) {
     return mapError(err);
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: Params) {
+export async function DELETE(req: NextRequest, { params }: Params) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const entry = await voidEntry(ctx, id);
+    const entry = await withVersionCheck(ctx, 'journal_entry', id, expectedVersion(req), (c) => voidEntry(c, id));
     return NextResponse.json({ entry });
   } catch (err) {
     return mapError(err);

@@ -63,6 +63,8 @@ export interface JournalEntryDetail {
   /** Source-document link (e.g. "invoice:<id>", "manual") for drill-down to the origin. */
   sourceRef: string | null;
   createdAt: Date;
+  /** Version for multi-user optimistic concurrency (lib/services/concurrency.ts). */
+  updatedAt: Date;
   voidedAt: Date | null;
   lines: JournalEntryLine[];
 }
@@ -204,6 +206,7 @@ export async function getEntry(ctx: ServiceContext, id: string): Promise<Journal
     status: entry.status,
     sourceRef: entry.sourceRef ?? null,
     createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
     voidedAt: entry.voidedAt ?? null,
     lines: lineRows.map((l) => ({
       id: l.id,

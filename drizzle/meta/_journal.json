@@ -134,6 +134,13 @@
       "when": 1781100018000,
       "tag": "0018_team_companyfile",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1781100024000,
+      "tag": "0024_team_hosting",
+      "breakpoints": true
     }
   ]
 }

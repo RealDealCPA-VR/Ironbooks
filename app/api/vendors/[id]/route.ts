@@ -7,6 +7,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getVendor, updateVendor, deactivateVendor } from '@/lib/services/vendors';
 import { ServiceError } from '@/lib/services/_base';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateVendorSchema } from '@/lib/validation/vendors';
 
@@ -54,18 +55,23 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const vendor = await updateVendor(ctx, id, parsed.data);
+    // Multi-user: 409 if someone else saved this vendor since it was loaded.
+    const vendor = await withVersionCheck(ctx, 'vendor', id, expectedVersion(req), (c) =>
+      updateVendor(c, id, parsed.data),
+    );
     return NextResponse.json(vendor);
   } catch (err) {
     return errorResponse(err);
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const vendor = await deactivateVendor(ctx, id);
+    const vendor = await withVersionCheck(ctx, 'vendor', id, expectedVersion(req), (c) =>
+      deactivateVendor(c, id),
+    );
     return NextResponse.json(vendor);
   } catch (err) {
     return errorResponse(err);

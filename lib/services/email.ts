@@ -17,6 +17,7 @@ import { ServiceError } from './_base';
 import { getInvoice } from './invoices';
 import { getCompany } from './company';
 import { renderInvoicePdf } from '@/lib/pdf/invoice';
+import { assertOutboundAllowed } from '@/lib/net/guard';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -32,6 +33,12 @@ export function isConfigured(): boolean {
   );
 }
 
+/** Bracket bare IPv6 literals so the host can be embedded in a URL for the policy check. */
+function smtpHostForUrl(host: string): string {
+  const h = host.trim();
+  return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
+}
+
 // ---------------------------------------------------------------------------
 // Low-level sendMail
 // ---------------------------------------------------------------------------
@@ -44,13 +51,22 @@ export interface MailOptions {
   attachments?: Attachment[];
 }
 
-export async function sendMail(opts: MailOptions): Promise<void> {
+export async function sendMail(opts: MailOptions, ctx: ServiceContext): Promise<void> {
   if (!isConfigured()) {
     throw new ServiceError(
       'VALIDATION',
       'Email not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and SMTP_FROM environment variables.',
     );
   }
+
+  // Network policy: an SMTP relay on the LAN/tailnet is always fine; a public mail provider
+  // needs the company's explicit cloud opt-in for 'email' (Settings → Privacy & Network).
+  const port = Number(process.env.SMTP_PORT!);
+  await assertOutboundAllowed(
+    `${port === 465 ? 'smtps' : 'smtp'}://${smtpHostForUrl(process.env.SMTP_HOST!)}:${port}`,
+    'email',
+    ctx,
+  );
 
   const transport = nodemailer.createTransport({
     host: process.env.SMTP_HOST!,
@@ -178,5 +194,5 @@ export async function emailInvoice(
         contentType: 'application/pdf',
       },
     ],
-  });
+  }, ctx);
 }

@@ -19,6 +19,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { importIIF, importCustomersCSV, importVendorsCSV } from '@/lib/services/qbImport';
 import { ServiceError } from '@/lib/services/_base';
 
@@ -39,6 +40,8 @@ function errorResponse(err: unknown) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
+    // QuickBooks list/transaction import: owner/admin, single-user while others are on.
+    await assertExclusiveAccess(ctx, 'Import');
     const body = await req.json() as {
       format: string;
       kind?: string;
