@@ -138,6 +138,51 @@ async function nextEntryNumber(ctx: ServiceContext): Promise<number> {
   return (row?.max ?? 0) + 1;
 }
 
+/**
+ * Source documents whose A/R / A/P lines are already counted by the aging subledger (the
+ * document itself carries the customer / vendor), plus historical imports. Every other posting
+ * that touches an Accounts Receivable or Accounts Payable account must name the customer /
+ * vendor on that line, or A/R aging would stop matching the A/R balance (QB invariant I11).
+ */
+const SUBLEDGER_SOURCE_RE =
+  /^(invoice|credit_memo|refund|payment|customer|bill|vendor|vendor_credit|salesreceipt|condense|iif|qbgl):/;
+
+export function isSubledgerSource(sourceRef: string | null | undefined): boolean {
+  return Boolean(sourceRef && SUBLEDGER_SOURCE_RE.test(sourceRef));
+}
+
+/**
+ * Refuse an unnamed line on an A/R account (needs a customer) or an A/P account (needs a
+ * vendor), unless the posting comes from a customer/vendor document (see SUBLEDGER_SOURCE_RE).
+ * This is the single choke point for checks, deposits, transfers, account opening balances,
+ * bank-feed categorizing, expense reports, FX adjustments, reversals and anything added later.
+ */
+export function assertControlAccountNames(
+  input: Pick<PostJournalEntryInput, 'lines' | 'sourceRef'>,
+  accountRows: ReadonlyArray<{ id: string; type: string; subtype: string | null; name: string }>,
+): void {
+  // Postings without a source are direct engine calls (internal helpers, test fixtures). Every
+  // user-facing window passes a source ('manual', 'expense:…', 'deposit:…', 'account:…',
+  // 'bank_transaction:…', 'reversal:…', …) and is checked here; Transfer Funds is refused at
+  // the database (0025 bka_transfers_no_ar_ap) because it posts without a source.
+  if (!input.sourceRef || isSubledgerSource(input.sourceRef)) return;
+  const byId = new Map(accountRows.map((a) => [a.id, a]));
+  for (const l of input.lines) {
+    const acct = byId.get(l.accountId);
+    if (!acct) continue;
+    if (acct.type === 'asset' && acct.subtype === 'accounts_receivable' && l.entityType !== 'customer') {
+      throw validation(
+        `"${acct.name}" is an Accounts Receivable account. Amounts can only go there with a customer name — use an invoice, a payment, a credit memo or a journal entry that names the customer.`,
+      );
+    }
+    if (acct.type === 'liability' && acct.subtype === 'accounts_payable' && l.entityType !== 'vendor') {
+      throw validation(
+        `"${acct.name}" is an Accounts Payable account. Amounts can only go there with a vendor name — use a bill, a bill payment, a vendor credit or a journal entry that names the vendor.`,
+      );
+    }
+  }
+}
+
 /** Create a balanced journal entry. If posted, the DB trigger updates cached account balances. */
 export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEntryInput) {
   assertBalanced(input.lines);
@@ -175,6 +220,8 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       throw validation(`Line ${i + 1}: that name was not found.`);
     }
   }
+
+  assertControlAccountNames(input, accountRows);
 
   return inTransaction(ctx, async (tx) => {
     const entryNumber = await nextEntryNumber(tx);

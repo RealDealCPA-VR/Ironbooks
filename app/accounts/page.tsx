@@ -279,6 +279,9 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
   // Parent candidates: active accounts of the same QB account type.
   const parentOptions = accounts.filter((a) => qbTypeOfAccount(a) === form.qbType && a.isActive);
   const nonPosting = form.qbType === 'non_posting';
+  // QB: A/R and A/P balances come only from customer / vendor transactions, never an opening balance.
+  const subledger = form.qbType === 'accounts_receivable' || form.qbType === 'accounts_payable';
+  const allowOpening = !nonPosting && !subledger;
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -293,7 +296,7 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
         subtype: form.subtype,
         parentId: form.parentId || null,
         taxLine: form.taxLine || null,
-        openingBalance: !nonPosting && form.openingBalance.trim() ? form.openingBalance.trim() : null,
+        openingBalance: allowOpening && form.openingBalance.trim() ? form.openingBalance.trim() : null,
       });
       toast('Account created.', 'success');
       onCreated();
@@ -356,7 +359,14 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
           onChange={(v) => set('parentId', v)}
           options={parentOptions}
         />
-        {!nonPosting && (
+        {subledger && (
+          <p className="text-xs text-navy/60">
+            {form.qbType === 'accounts_receivable'
+              ? 'This account gets its balance from invoices and payments, so it has no opening balance. Enter what customers owe as invoices.'
+              : 'This account gets its balance from bills and bill payments, so it has no opening balance. Enter what you owe vendors as bills.'}
+          </p>
+        )}
+        {allowOpening && (
           <div>
             <Label htmlFor="acc-opening">
               Opening balance (optional) <Help term="opening-balance-equity" />

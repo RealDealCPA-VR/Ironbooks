@@ -128,26 +128,46 @@ export function withQbType<T extends { type: string; subtype: string }>(row: T):
   return { ...row, qbType: qbAccountTypeOf(row) };
 }
 
+/** A sub-account must be the same QuickBooks account type as its parent (QB rule). */
+function assertSameQbType(
+  parent: { type: string; subtype: string | null; name: string },
+  child: { type: string; subtype: string | null },
+): void {
+  const pt = qbAccountTypeOf(parent);
+  const ct = qbAccountTypeOf(child);
+  if (pt !== ct) {
+    const label = (t: string) => getQbAccountTypeInfo(t)?.label ?? t;
+    throw validation(
+      `A sub-account must be the same type as its parent. "${parent.name}" is ${label(pt)}, but this account is ${label(ct)}.`,
+    );
+  }
+}
+
 /**
  * Validate a proposed parentId for `accountId` (null when creating a new account):
  *  - the parent must exist and belong to this company (tenancy),
  *  - the parent cannot be the account itself,
- *  - the parent cannot be a descendant of the account (cycle).
+ *  - the parent cannot be a descendant of the account (cycle),
+ *  - the parent must be the same QuickBooks account type as the (new) sub-account — QB only
+ *    lets you nest an account under one of its own type (no expense account under A/R).
  */
 async function assertValidParent(
   ctx: ServiceContext,
   accountId: string | null,
   parentId: string,
+  child: { type: string; subtype: string | null },
 ): Promise<void> {
   if (accountId !== null && parentId === accountId) {
     throw validation('An account cannot be its own parent.');
   }
   const rows = await ctx.db
-    .select({ id: accounts.id, parentId: accounts.parentId })
+    .select({ id: accounts.id, parentId: accounts.parentId, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(eq(accounts.companyId, ctx.companyId));
   const byId = new Map(rows.map((r) => [r.id, r]));
-  if (!byId.has(parentId)) throw notFound('Parent account');
+  const parent = byId.get(parentId);
+  if (!parent) throw notFound('Parent account');
+  assertSameQbType(parent, child);
   // Walk the ancestor chain of the proposed parent; cap at row count to guard bad data.
   let cur: string | null = parentId;
   for (let steps = 0; cur && steps <= byId.size; steps++) {
@@ -234,11 +254,24 @@ export async function createAccount(ctx: ServiceContext, input: CreateAccountInp
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, input.code)));
   if (existing.length) throw validation(`Account code "${input.code}" already exists.`);
 
-  if (input.parentId) await assertValidParent(ctx, null, input.parentId);
+  if (input.parentId) await assertValidParent(ctx, null, input.parentId, { type, subtype });
 
   const openingBalance = Money.of(input.openingBalance ?? 0);
   if (subtype === 'non_posting' && !openingBalance.isZero()) {
     throw validation('A non-posting account (estimates, purchase orders) cannot have an opening balance.');
+  }
+  // QB: A/R and A/P balances come only from customer / vendor transactions (each one names who
+  // owes or is owed), so aging always matches the account. An opening balance here would be an
+  // amount nobody owes — refuse it and point the user to the right place.
+  if (subtype === 'accounts_receivable' && !openingBalance.isZero()) {
+    throw validation(
+      'An Accounts Receivable account cannot have an opening balance. Enter what each customer owes as invoices (or a journal entry that names the customer) instead.',
+    );
+  }
+  if (subtype === 'accounts_payable' && !openingBalance.isZero()) {
+    throw validation(
+      'An Accounts Payable account cannot have an opening balance. Enter what you owe each vendor as bills (or a journal entry that names the vendor) instead.',
+    );
   }
 
   // Insert the account with a zero cached balance, then post the opening balance through the
@@ -308,9 +341,6 @@ export async function updateAccount(
   },
 ) {
   const before = await getAccount(ctx, id);
-  if (patch.parentId !== undefined && patch.parentId !== null) {
-    await assertValidParent(ctx, id, patch.parentId);
-  }
   let type: AccountType = before.type;
   let subtype: string = before.subtype;
   if (patch.qbType) {
@@ -319,6 +349,26 @@ export async function updateAccount(
     subtype = resolved.subtype;
   } else if (patch.subtype !== undefined && patch.subtype !== null) {
     subtype = normalizeSubtype(patch.subtype, before.type);
+  }
+  // Parent / child QB types must match: check the (new) parent, and — when the account's own
+  // QB type changes — every direct sub-account under it.
+  const newParentId = patch.parentId === undefined ? before.parentId : patch.parentId;
+  const qbTypeChanged = qbAccountTypeOf({ type, subtype }) !== qbAccountTypeOf(before);
+  if (newParentId && (patch.parentId !== undefined || qbTypeChanged)) {
+    await assertValidParent(ctx, id, newParentId, { type, subtype });
+  }
+  if (qbTypeChanged) {
+    const kids = await ctx.db
+      .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.parentId, id)));
+    for (const k of kids) {
+      if (qbAccountTypeOf(k) !== qbAccountTypeOf({ type, subtype })) {
+        throw validation(
+          `"${before.name}" has sub-accounts of a different type (for example "${k.name}"). Move or change its sub-accounts first, since a sub-account must be the same type as its parent.`,
+        );
+      }
+    }
   }
   // A/R and A/P are subledger control accounts: every line on them carries a customer/vendor
   // name. Turning an account with history into (or out of) A/R or A/P would leave unnamed

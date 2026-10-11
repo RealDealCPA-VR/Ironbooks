@@ -240,3 +240,29 @@ DROP TRIGGER IF EXISTS docnum_purchase_orders_ref_number ON purchase_orders;
 --> statement-breakpoint
 CREATE TRIGGER docnum_purchase_orders_ref_number BEFORE INSERT OR UPDATE ON purchase_orders
   FOR EACH ROW EXECUTE FUNCTION docnum_fill_ref_number('po_number');
+--> statement-breakpoint
+-- ---- Transfer Funds never touches A/R or A/P (I11: aging == control account) ----------------
+-- A transfer carries no customer / vendor, so an amount moved into or out of A/R or A/P could
+-- never show in aging. QB's Transfer Funds window does not offer those accounts; refuse here.
+CREATE OR REPLACE FUNCTION bka_transfers_no_ar_ap_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_name text;
+BEGIN
+  SELECT a.name INTO v_name FROM accounts a
+  WHERE a.id IN (NEW.from_account_id, NEW.to_account_id)
+    AND a.subtype IN ('accounts_receivable', 'accounts_payable')
+  LIMIT 1;
+  IF FOUND THEN
+    RAISE EXCEPTION '"%" is an Accounts Receivable or Accounts Payable account, so money cannot be transferred into or out of it. Use Receive Payments, Pay Bills, or a journal entry that names the customer or vendor.', v_name
+      USING ERRCODE = 'BK003';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+DROP TRIGGER IF EXISTS bka_transfers_no_ar_ap ON transfers;
+--> statement-breakpoint
+CREATE TRIGGER bka_transfers_no_ar_ap
+  BEFORE INSERT OR UPDATE OF from_account_id, to_account_id ON transfers
+  FOR EACH ROW EXECUTE FUNCTION bka_transfers_no_ar_ap_check();
