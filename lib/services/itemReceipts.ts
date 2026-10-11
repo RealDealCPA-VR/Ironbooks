@@ -36,6 +36,7 @@ import { and, asc, desc, eq, inArray } from 'drizzle-orm';
 import {
   accounts,
   inventoryLayers,
+  itemReceiptBillLines,
   itemReceiptLines,
   itemReceipts,
   items,
@@ -63,6 +64,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { adjustPoReceivedUnbilled, recomputePoStatus } from './receivingLinks';
 
 // ---------------------------------------------------------------------------
 // Constants / types
@@ -643,6 +645,35 @@ export async function convertToBill(
       .set({ convertedBillId: bill.id })
       .where(eq(itemReceipts.id, receiptId));
 
+    // Enhanced-receiving bookkeeping: the whole receipt is now billed at its own cost (no
+    // variance). Link rows let voidBill put the quantities back to "awaiting bill".
+    for (const l of lines) {
+      await tx.db
+        .update(itemReceiptLines)
+        .set({ quantityBilled: l.quantity })
+        .where(eq(itemReceiptLines.id, l.id));
+    }
+    await tx.db.insert(itemReceiptBillLines).values(
+      lines.map((l) => ({
+        companyId: tx.companyId,
+        billId: bill.id,
+        itemReceiptId: receiptId,
+        itemReceiptLineId: l.id,
+        itemId: l.itemId,
+        quantity: l.quantity,
+        receiptUnitCost: l.unitCost,
+        billUnitCost: l.unitCost,
+        accrualAmount: l.amount,
+        billAmount: l.amount,
+      })),
+    );
+    if (receipt.purchaseOrderId) {
+      for (const l of lines) {
+        await adjustPoReceivedUnbilled(tx, receipt.purchaseOrderId, l.itemId, Money.of(l.quantity).negated());
+      }
+      await recomputePoStatus(tx, receipt.purchaseOrderId, `item_receipt_billed:${receiptId}`);
+    }
+
     await writeAudit(tx, {
       action: 'update',
       entityType: 'item_receipt',
@@ -668,10 +699,10 @@ export async function voidItemReceipt(ctx: ServiceContext, id: string) {
 
   if (receipt.status === 'void') return receipt; // idempotent
 
-  if (receipt.status === 'billed') {
+  if (receipt.status === 'billed' || receipt.status === 'partial') {
     throw new ServiceError(
       'CONFLICT',
-      'Cannot void an item receipt that has been converted to a bill. Void the bill first - then the receipt.',
+      'Cannot void an item receipt that has been (partly) billed. Void the bill first - then the receipt.',
     );
   }
 

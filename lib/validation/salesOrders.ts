@@ -10,7 +10,8 @@ export const salesOrderLineSchema = z.object({
   itemId: zUuid.nullish(),
   description: z.string().nullish(),
   quantity: zDecimal,
-  rate: zDecimal,
+  /** Omit on item lines to have the server price the line (advanced pricing). */
+  rate: zDecimal.nullish(),
 });
 
 export const createSalesOrderSchema = z.object({

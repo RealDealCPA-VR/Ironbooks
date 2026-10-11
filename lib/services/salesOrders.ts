@@ -33,6 +33,7 @@ import {
   writeAudit,
 } from './_base';
 import { createInvoice } from './invoices';
+import { type AppliedPricing, resolveLinePricing } from './pricing';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,7 +43,8 @@ export interface SalesOrderLineInput {
   itemId?: string | null;
   description?: string | null;
   quantity: string | number;
-  rate: string | number;
+  /** Unit price; omit on item lines to price server-side (lib/services/pricing.ts). */
+  rate?: string | number | null;
 }
 
 export interface CreateSalesOrderInput {
@@ -88,13 +90,21 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
     rate: string;
     amount: string;
     lineOrder: number;
+    pricing: AppliedPricing | null;
   };
+
+  // Advanced pricing: fill omitted item rates and record rule/level provenance.
+  const pricedLines = await resolveLinePricing(
+    ctx,
+    { customerId: input.customerId, date: input.date },
+    input.lines,
+  );
 
   let subtotal = Money.zero();
   const computedLines: ComputedLine[] = [];
 
-  for (let i = 0; i < input.lines.length; i++) {
-    const l = input.lines[i];
+  for (let i = 0; i < pricedLines.length; i++) {
+    const l = pricedLines[i];
     const qty = Money.of(l.quantity);
     const rate = Money.of(l.rate);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
@@ -110,6 +120,7 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
       rate: toAmountString(rate),
       amount: toAmountString(amount),
       lineOrder: i,
+      pricing: l.pricing,
     });
   }
 
@@ -141,6 +152,7 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
         rate: cl.rate,
         amount: cl.amount,
         lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
       })),
     );
 
@@ -401,6 +413,7 @@ export async function convertToInvoice(
         description: line.description ?? null,
         quantity: qty.toFixed(4),
         rate: line.rate,
+        pricing: { origin: 'sales_order' },
       })),
     });
 

@@ -11,7 +11,8 @@ export const invoiceLineSchema = z.object({
   accountId: zUuid.nullish(),
   description: z.string().nullish(),
   quantity: zDecimal,
-  rate: zDecimal,
+  /** Omit on item lines to have the server price the line (advanced pricing). */
+  rate: zDecimal.nullish(),
   /** Defaults to true in the service. */
   taxable: z.boolean().optional(),
   taxRateId: zUuid.nullish(),
@@ -46,6 +47,7 @@ const invoiceCoreFields = {
   taxRateId: zUuid.nullish(),
   classId: zUuid.nullish(),
   jobId: zUuid.nullish(),
+  salesRepId: zUuid.nullish(),
   discount: zMoney.nullish(),
   discountType: z.enum(['amount', 'percent']).nullish(),
   retainagePercent: zDecimal.nullish(),

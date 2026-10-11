@@ -10,7 +10,8 @@ export const salesReceiptLineSchema = z.object({
   accountId: zUuid.nullish(),
   description: z.string().nullish(),
   quantity: zDecimal,
-  rate: zDecimal,
+  /** Omit on item lines to have the server price the line (advanced pricing). */
+  rate: zDecimal.nullish(),
   /** Defaults to true (matches prior route behavior). */
   taxable: z.boolean().default(true),
   taxRateId: zUuid.nullish(),

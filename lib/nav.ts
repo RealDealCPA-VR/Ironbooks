@@ -19,6 +19,8 @@ import {
 import { pageAreasFor } from '@/lib/permissions/routes';
 import type { Area } from '@/lib/permissions/model';
 import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
+// team pricing: advanced pricing, SO fulfillment worksheet, enhanced receiving
+import { PackageCheck, FileInput, SlidersHorizontal } from 'lucide-react';
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -42,12 +44,14 @@ export const navGroups: NavGroup[] = [
       { icon: Receipt, label: 'Sales Receipts', path: '/sales-receipts' },
       { icon: ClipboardList, label: 'Estimates', path: '/estimates' },
       { icon: FileCheck, label: 'Sales Orders', path: '/sales-orders' },
+      { icon: PackageCheck, label: 'SO Fulfillment', path: '/so-fulfillment' },
       { icon: HandCoins, label: 'Receive Payments', path: '/payments' },
       { icon: RotateCcw, label: 'Credit Memos', path: '/credit-memos' },
       { icon: Users, label: 'Customers', path: '/customers' },
       { icon: Percent, label: 'Finance Charges', path: '/finance-charges' },
       { icon: Package, label: 'Items', path: '/items' },
       { icon: BadgePercent, label: 'Sales Reps', path: '/sales-reps' },
+      { icon: SlidersHorizontal, label: 'Advanced Pricing', path: '/advanced-pricing' },
     ],
   },
   {
@@ -55,6 +59,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: ShoppingCart, label: 'Purchase Orders', path: '/purchase-orders' },
       { icon: PackageSearch, label: 'Receive Items', path: '/item-receipts' },
+      { icon: FileInput, label: 'Bill Received Items', path: '/receive-bill' },
       { icon: Receipt, label: 'Bills', path: '/bills' },
       { icon: HandCoins, label: 'Pay Bills', path: '/pay-bills' },
       { icon: Banknote, label: 'Write Checks', path: '/expenses' },

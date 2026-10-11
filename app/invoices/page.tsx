@@ -36,6 +36,8 @@ import {
   inventoryLinePayload,
   useAdvancedInventory,
 } from '@/components/inventory/AdvancedInventory';
+import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
+import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -148,6 +150,8 @@ interface LineRow {
   discountPercent: boolean;
   /** Advanced Inventory: site / bin / serials / lot the stock is sold from. */
   inv?: InvDetail;
+  /** Advanced pricing: the user typed this rate, so automatic prices must not replace it. */
+  rateManual?: boolean;
 }
 
 /** Unbilled billable time & costs (GET /api/billables?customerId=). */
@@ -400,6 +404,8 @@ function InvoiceModal({
           jobId: l.jobId ?? '',
           discountPercent: false,
           inv: invFromLine(l),
+          // Saved invoices keep their stored rates; the badge still flags rule differences.
+          rateManual: true,
         })),
       );
     } else {
@@ -471,6 +477,24 @@ function InvoiceModal({
     });
   }
 
+  // Advanced pricing: server-side price rules / price levels / customer prices per line.
+  const quotes = usePriceQuotes(
+    { customerId, date, classId: classId || null },
+    lines.map((l) => ({ itemId: lineKind(l) === 'income' ? l.itemId : null, quantity: l.quantity || '1' })),
+  );
+  useEffect(() => {
+    setLines((prev) => {
+      let changed = false;
+      const next = prev.map((l, i) => {
+        const qt = quotes[i];
+        if (!qt || l.rateManual || l.itemId !== qt.itemId || samePrice(l.rate, qt.price)) return l;
+        changed = true;
+        return { ...l, rate: String(Number(qt.price)) };
+      });
+      return changed ? next : prev;
+    });
+  }, [quotes]);
+
   /** Expand a bundle item into its component lines (printed grouped under the bundle name). */
   async function expandBundle(idx: number, bundle: Item) {
     try {
@@ -538,6 +562,7 @@ function InvoiceModal({
         taxable: isSpecial ? match.type === 'discount' && match.taxable : match.taxable,
         quantity: match.type === 'subtotal' ? '' : lines[idx].quantity || '1',
         discountPercent: false,
+        rateManual: false,
       });
       if (customerPrice != null && !isSpecial) {
         toast(`Customer price applied for ${match.name}: ${formatCurrency(customerPrice)}`, 'info');
@@ -940,7 +965,7 @@ function InvoiceModal({
                     placeholder={kind === 'discount' ? (line.discountPercent ? '%' : 'Amount') : 'Rate'}
                     value={kind === 'subtotal' ? '' : line.rate}
                     disabled={kind === 'subtotal'}
-                    onChange={(e) => updateLine(idx, { rate: e.target.value })}
+                    onChange={(e) => updateLine(idx, { rate: e.target.value, rateManual: true })}
                   />
                   <Select
                     value={line.jobId}
@@ -975,6 +1000,13 @@ function InvoiceModal({
                     direction="out"
                     value={line.inv}
                     onChange={(inv) => updateLine(idx, { inv })}
+                  />
+                )}
+                {kind === 'income' && (
+                  <PriceSourceBadge
+                    quote={quotes[idx]}
+                    rate={line.rate}
+                    onUseQuoted={(price) => updateLine(idx, { rate: String(Number(price)), rateManual: false })}
                   />
                 )}
                 {/* Row 3 (special types / UoM): badge + helpers */}
