@@ -137,7 +137,7 @@ describe('what the per-entry cap cannot see: the cached account balance', () => 
   // a 500). Owner: services team -- lib/services/posting.ts should wrap SQLSTATE 22003 (or check
   // cached balance + delta against the numeric(15,2) range) as a VALIDATION ServiceError.
   // Split in two so the accounting invariant (clean rollback) is enforced as a normal passing
-  // test, while the missing friendly error is an it.fails that flips to red once fixed.
+  // test, while the missing friendly error stays a plain (red) test until fixed -- QA round 3.
   const overflowLines = () => [
     { accountId: bigAsset, debit: '1.00', credit: '' },
     { accountId: bigEquity, debit: '', credit: '1.00' },
@@ -164,7 +164,7 @@ describe('what the per-entry cap cannot see: the cached account balance', () => 
     expect((await trialBalance(ctx)).balanced).toBe(true);
   });
 
-  it.fails('the overflow surfaces as a friendly ServiceError, not a raw 22003 (services team bug)', async () => {
+  it('the overflow surfaces as a friendly ServiceError, not a raw 22003 (services team bug)', async () => {
     const err = await attemptOverflow();
     expect(err instanceof ServiceError, `raw error reached the route: ${String(err)}`).toBe(true);
   });
