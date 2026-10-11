@@ -429,7 +429,8 @@ describe('Users & Roles (integration)', () => {
       const res = await loginPOST(jsonRequest('/api/auth/login', { email: 'CARA', password: 'newclerkpw1' }));
       expect(res.status).toBe(200);
       const session = res.cookies.get(SESSION_COOKIE)?.value;
-      expect(verifySessionToken(session)).toEqual({ userId: clerkId });
+      // Bound to this file (fid) and to a server-side multi-user session row (sid).
+      expect(verifySessionToken(session)).toEqual({ userId: clerkId, sid: expect.any(String) });
 
       // With the unlock cookie the context resolves.
       const ctx = await ctxAs(clerkId, 'GET', '/api/invoices');
