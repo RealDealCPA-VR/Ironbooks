@@ -58,6 +58,11 @@ export default function AgingDetailReport({
       controls="asof"
       buildUrl={({ asOf }) => `${endpoint}?asOf=${asOf}`}
       getRows={(d) => d.rows}
+      rowHref={(r, q) =>
+        r.docType === 'invoice' || r.docType === 'credit_memo'
+          ? `/reports/std/customer-balance-detail?customerId=${r.entityId}&to=${q.asOf}`
+          : `/reports/std/vendor-balance-detail?vendorId=${r.entityId}&to=${q.asOf}`
+      }
       subtitle={(d) => `As of ${fmtDate(d.asOf)}`}
       columns={[
         { header: entityLabel, cell: (r) => <span className="font-medium">{r.entityName}</span>, csv: (r) => r.entityName },

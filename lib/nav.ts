@@ -21,6 +21,7 @@ import type { Area } from '@/lib/permissions/model';
 import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
 // team pricing: advanced pricing, SO fulfillment worksheet, enhanced receiving
 import { PackageCheck, FileInput, SlidersHorizontal } from 'lucide-react';
+import { Bookmark, LineChart, Grid3x3, Search } from 'lucide-react'; // wave2 reports
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -114,6 +115,10 @@ export const navGroups: NavGroup[] = [
       { icon: UserSquare, label: 'Payroll Reports', path: '/reports/payroll-summary' },
       { icon: Banknote, label: 'Reconciliation Reports', path: '/reports/reconciliation' },
       { icon: Network, label: 'Consolidated', path: '/reports/consolidated' },
+      { icon: Bookmark, label: 'Memorized Reports', path: '/reports/memorized' },
+      { icon: LineChart, label: 'Graphs', path: '/reports/graphs' },
+      { icon: Grid3x3, label: 'Advanced Reporting', path: '/reports/pivot' },
+      { icon: Search, label: 'Find Transactions', path: '/find' },
       { icon: AlertTriangle, label: 'AI Review', path: '/errors' },
     ],
   },

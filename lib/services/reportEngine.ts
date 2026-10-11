@@ -1496,3 +1496,75 @@ export async function entryIdsForSourceRefs(ctx: ServiceContext, refs: string[])
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Relative date ranges (QB "Dates" drop-down) — stored by memorized / scheduled reports so they
+// always run for the current period.
+// ---------------------------------------------------------------------------
+
+export const DATE_MACROS = [
+  'today',
+  'this_week',
+  'this_month',
+  'this_month_to_date',
+  'last_month',
+  'this_quarter',
+  'this_quarter_to_date',
+  'last_quarter',
+  'this_year',
+  'this_year_to_date',
+  'last_year',
+  'this_fiscal_year',
+  'this_fiscal_year_to_date',
+  'last_fiscal_year',
+  'all',
+] as const;
+export type DateMacro = (typeof DATE_MACROS)[number];
+
+/** Resolve a relative date range to concrete 'YYYY-MM-DD' from / to (UTC calendar days). */
+export function resolveDateMacro(macro: DateMacro, now: Date, fye?: string | null): { from?: string; to: string } {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const day = (yy: number, mm: number, dd: number) => dayStr(new Date(Date.UTC(yy, mm, dd)));
+  const today = dayStr(now);
+  const q = Math.floor(m / 3);
+  switch (macro) {
+    case 'today':
+      return { from: today, to: today };
+    case 'this_week': {
+      const dow = now.getUTCDay();
+      return { from: day(y, m, now.getUTCDate() - dow), to: day(y, m, now.getUTCDate() - dow + 6) };
+    }
+    case 'this_month':
+      return { from: day(y, m, 1), to: day(y, m + 1, 0) };
+    case 'this_month_to_date':
+      return { from: day(y, m, 1), to: today };
+    case 'last_month':
+      return { from: day(y, m - 1, 1), to: day(y, m, 0) };
+    case 'this_quarter':
+      return { from: day(y, q * 3, 1), to: day(y, q * 3 + 3, 0) };
+    case 'this_quarter_to_date':
+      return { from: day(y, q * 3, 1), to: today };
+    case 'last_quarter':
+      return { from: day(y, q * 3 - 3, 1), to: day(y, q * 3, 0) };
+    case 'this_year':
+      return { from: day(y, 0, 1), to: day(y, 11, 31) };
+    case 'this_year_to_date':
+      return { from: day(y, 0, 1), to: today };
+    case 'last_year':
+      return { from: day(y - 1, 0, 1), to: day(y - 1, 11, 31) };
+    case 'this_fiscal_year': {
+      const w = fiscalWindowFor(now, fye);
+      return { from: dayStr(w.start), to: dayStr(w.end) };
+    }
+    case 'this_fiscal_year_to_date':
+      return { from: dayStr(fiscalWindowFor(now, fye).start), to: today };
+    case 'last_fiscal_year': {
+      const cur = fiscalWindowFor(now, fye);
+      const w = fiscalWindowFor(new Date(cur.start.getTime() - 1), fye);
+      return { from: dayStr(w.start), to: dayStr(w.end) };
+    }
+    default:
+      return { to: today };
+  }
+}

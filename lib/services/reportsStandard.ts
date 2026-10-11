@@ -490,7 +490,11 @@ export async function balanceSheetReport(
     cols = [{ key: 'total', header: fmtDay(asOf), asOf, bs: await balanceSheet(ctx, asOf) }];
     subtitle = `As of ${fmtDay(asOf)}`;
     if (p.compare && p.compare !== 'none') {
-      const prior = shiftYears(asOf, -1);
+      let prior = p.priorAsOf ? parseDay(p.priorAsOf, true)! : shiftYears(asOf, -1);
+      if (!p.priorAsOf && p.compare === 'prev_period') {
+        prior = new Date(asOf);
+        prior.setUTCMonth(prior.getUTCMonth() - 1);
+      }
       cols.push({ key: 'prev', header: fmtDay(prior), asOf: prior, bs: await balanceSheet(ctx, prior) });
       extraCols.push({ key: 'chg', header: '$ Change', type: 'money' }, { key: 'pctchg', header: '% Change', type: 'percent' });
       derive = (v) => ({ chg: toAmountString(v[0].minus(v[1])), pctchg: pct(v[0].minus(v[1]), v[1]) });

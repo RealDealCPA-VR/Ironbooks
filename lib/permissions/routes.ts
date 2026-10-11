@@ -400,6 +400,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // report's own area (financial / sales / purchases / time). Graphs check per graph kind.
   '/api/reports/std/[report]': kind('member', 'GET'),
   '/api/reports/graphs': kind('member', 'GET'),
+  '/api/reports/filter-options': kind('member', 'GET'), // names only; service requires a report area
   '/api/reports/pivot': r('reports_financial', 'GET'),
   '/api/find': r('reports_financial', 'GET'),
   '/api/reports/ar-aging': r('reports_sales', 'GET'),

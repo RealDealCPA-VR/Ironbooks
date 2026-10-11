@@ -53,6 +53,8 @@ export const reportParamsSchema = z
     from: zDateStr.optional(),
     to: zDateStr.optional(),
     asOf: zDateStr.optional(),
+    /** Balance sheet comparison: the earlier as-of date (defaults to one year / one month earlier). */
+    priorAsOf: zDateStr.optional(),
     accountId: zId.optional(),
     /** Restrict detail to accounts of one P&L / balance-sheet section (sectionForAccount key). */
     section: z.string().max(40).optional(),
@@ -80,6 +82,14 @@ export const reportParamsSchema = z
     /** Summary vs detail variants of the same report (e.g. time reports). */
     view: z.enum(['summary', 'detail']).optional(),
     vehicle: z.string().max(100).optional(),
+    /** Relative date range (resolved to from / to / asOf when the report runs). */
+    dates: z
+      .enum([
+        'today', 'this_week', 'this_month', 'this_month_to_date', 'last_month', 'this_quarter',
+        'this_quarter_to_date', 'last_quarter', 'this_year', 'this_year_to_date', 'last_year',
+        'this_fiscal_year', 'this_fiscal_year_to_date', 'last_fiscal_year', 'all',
+      ])
+      .optional(),
   })
   .strip()
   .superRefine((p, ctx) => {

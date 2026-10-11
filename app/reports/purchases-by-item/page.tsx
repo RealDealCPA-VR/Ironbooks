@@ -1,6 +1,5 @@
 'use client';
 
-import Link from 'next/link';
 import { ShoppingCart } from 'lucide-react';
 import { formatCurrency } from '@/lib/money';
 import SimpleReport from '../_components/SimpleReport';
@@ -32,14 +31,13 @@ export default function PurchasesByItemPage() {
       controls="range"
       buildUrl={({ from, to }) => `/api/reports/purchases-by-item?from=${from}&to=${to}`}
       getRows={(d) => d.rows}
+      rowHref={(r, q) => (r.itemId ? `/reports/std/purchases-by-item-detail?itemId=${r.itemId}&from=${q.from}&to=${q.to}` : null)}
       subtitle={(d) => (d.from || d.to ? `${fmtDate(d.from)} – ${fmtDate(d.to)}` : 'All dates')}
       columns={[
         {
           header: 'Item',
           cell: (r) => (
-            <Link href="/items" className="font-medium text-electric hover:underline" title="Open items list">
-              {r.itemName}
-            </Link>
+            <span className="font-medium">{r.itemName}</span>
           ),
           csv: (r) => r.itemName,
         },

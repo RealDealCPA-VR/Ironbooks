@@ -10,6 +10,7 @@ import { parseReportParams, type ReportParams } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { notFound, validation } from './_base';
 import { requirePermission } from './access';
+import { DATE_MACROS, companyFiscalYearEnd, resolveDateMacro, type DateMacro } from './reportEngine';
 import {
   balanceSheetDetail,
   balanceSheetReport,
@@ -35,6 +36,7 @@ import {
   itemListing,
   itemPriceList,
   openPurchaseOrders,
+  purchasesByItemDetail,
   openSalesOrdersByCustomer,
   openSalesOrdersByItem,
   salesByCustomerDetail,
@@ -113,6 +115,7 @@ export const REPORT_RUNNERS: Record<string, Runner> = {
   'expenses-by-vendor-summary': expensesByVendorSummary,
   'expenses-by-vendor-detail': expensesByVendorDetail,
   'open-purchase-orders': openPurchaseOrders,
+  'purchases-by-item-detail': purchasesByItemDetail,
   'vendor-contact-list': (c, p) => vendorContactList(c, p),
   'vendor-phone-list': (c, p) => vendorContactList(c, p, true),
   'budget-overview': budgetOverviewReport,
@@ -138,6 +141,7 @@ export async function runStandardReport(
   ctx: ServiceContext,
   key: string,
   rawParams: URLSearchParams | Record<string, unknown>,
+  opts?: { now?: Date },
 ): Promise<StdReport> {
   const entry = CATALOG_BY_KEY[key];
   const runner = REPORT_RUNNERS[key];
@@ -146,6 +150,16 @@ export async function runStandardReport(
   const merged: Record<string, unknown> = { ...(entry.defaults ?? {}) };
   const entries = rawParams instanceof URLSearchParams ? [...rawParams.entries()] : Object.entries(rawParams ?? {});
   for (const [k, v] of entries) if (v !== undefined && v !== null && String(v) !== '') merged[k] = v;
+  // Relative dates ("This month to date", …) are resolved now, so memorized and scheduled
+  // reports always cover the current period.
+  if (typeof merged.dates === 'string' && (DATE_MACROS as readonly string[]).includes(merged.dates)) {
+    const r = resolveDateMacro(merged.dates as DateMacro, opts?.now ?? new Date(), await companyFiscalYearEnd(ctx));
+    if (merged.dates === 'all') {
+      merged.from = '1900-01-01';
+    } else if (r.from) merged.from = r.from;
+    merged.to = r.to;
+    merged.asOf = r.to;
+  }
   const parsed = parseReportParams(merged);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];

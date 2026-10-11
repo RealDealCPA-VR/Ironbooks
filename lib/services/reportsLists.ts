@@ -14,6 +14,7 @@ import { and, asc, eq, gte, inArray, isNull, lte, ne, notInArray, sql, type SQL 
 import type Decimal from 'decimal.js';
 import {
   accounts,
+  billLines,
   billPaymentApplications,
   billPayments,
   bills,
@@ -1106,3 +1107,68 @@ export async function incomeTaxReport(
 }
 
 export type { CellValue, StdColumn };
+
+/** Purchases by Item Detail — item lines on bills (void bills excluded), by item. */
+export async function purchasesByItemDetail(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const conds: SQL[] = [eq(bills.companyId, ctx.companyId), ne(bills.status, 'void'), gte(bills.date, from), lte(bills.date, to), sql`${billLines.itemId} IS NOT NULL`];
+  if (p.itemId) conds.push(eq(billLines.itemId, p.itemId));
+  if (p.vendorId) conds.push(eq(bills.vendorId, p.vendorId));
+  const rowsDb = await ctx.db
+    .select({ id: billLines.id, billId: bills.id, num: bills.billNumber, date: bills.date, vendor: vendors.displayName, itemId: billLines.itemId, item: items.name, memo: billLines.description, qty: billLines.quantity, amount: billLines.amount })
+    .from(billLines)
+    .innerJoin(bills, eq(billLines.billId, bills.id))
+    .innerJoin(vendors, eq(bills.vendorId, vendors.id))
+    .leftJoin(items, eq(billLines.itemId, items.id))
+    .where(and(...conds))
+    .orderBy(asc(items.name), asc(bills.date));
+  const entryIds = await entryIdsForSourceRefs(ctx, rowsDb.map((r) => `bill:${r.billId}`));
+  const rows: StdRow[] = [];
+  let tQty = Money.zero();
+  let tAmt = Money.zero();
+  const groups = new Map<string, typeof rowsDb>();
+  for (const r of rowsDb) groups.set(r.itemId ?? '', [...(groups.get(r.itemId ?? '') ?? []), r]);
+  for (const [k, list] of groups) {
+    const label = list[0].item ?? '(no item)';
+    const hid = `pid:${k}`;
+    const header: StdRow = { id: hid, depth: 0, kind: 'section', collapseKind: 'group', cells: { label } };
+    rows.push(header);
+    let q = Money.zero();
+    let a = Money.zero();
+    for (const r of list) {
+      q = q.plus(Money.of(r.qty));
+      a = a.plus(Money.of(r.amount));
+      rows.push({
+        id: `pid:l:${r.id}`,
+        parentId: hid,
+        depth: 1,
+        kind: 'data',
+        cells: { label: '', type: 'Bill', date: dayStr(r.date), num: r.num ?? '', name: r.vendor, memo: r.memo ?? '', qty: Money.of(r.qty).toFixed(4), amount: toAmountString(r.amount), balance: amt(a) },
+        entryId: entryIds.get(`bill:${r.billId}`) ?? null,
+      });
+    }
+    tQty = tQty.plus(q);
+    tAmt = tAmt.plus(a);
+    const tc = { label: `Total ${label}`, qty: q.toFixed(4), amount: amt(a), balance: amt(a) };
+    header.collapsedCells = { ...tc, label };
+    rows.push({ id: `${hid}:total`, depth: 0, kind: 'subtotal', totalOf: hid, cells: tc });
+  }
+  rows.push({ id: 'pid:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', qty: tQty.toFixed(4), amount: amt(tAmt) } });
+  return {
+    key: 'purchases-by-item-detail',
+    title: 'Purchases by Item Detail',
+    subtitle: rangeLabel(from, to),
+    columns: [
+      { key: 'label', header: '' },
+      { key: 'type', header: 'Type' },
+      { key: 'date', header: 'Date', type: 'date' },
+      { key: 'num', header: 'Num' },
+      { key: 'name', header: 'Vendor' },
+      { key: 'memo', header: 'Memo' },
+      { key: 'qty', header: 'Qty', type: 'number' },
+      { key: 'amount', header: 'Amount', type: 'money' },
+      { key: 'balance', header: 'Balance', type: 'money' },
+    ],
+    rows,
+  };
+}

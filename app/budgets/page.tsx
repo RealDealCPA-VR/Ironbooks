@@ -1,8 +1,11 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { BarChart2, Plus } from 'lucide-react';
 import {
+  Badge,
+  Select,
   Button,
   Card,
   EmptyState,
@@ -28,6 +31,9 @@ interface Budget {
   id: string;
   name: string;
   fiscalYear: number;
+  /** 'profit_loss' | 'balance_sheet' */
+  kind?: string;
+  isForecast?: boolean;
   createdAt: string;
 }
 
@@ -35,6 +41,8 @@ interface BudgetLine {
   id: string;
   budgetId: string;
   accountId: string;
+  customerId?: string | null;
+  classId?: string | null;
   month: number;
   amount: string;
 }
@@ -87,8 +95,10 @@ type PeriodMode = 'annual' | 'monthly' | 'quarterly';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-function getLineAmount(lines: BudgetLine[], accountId: string, month: number): string {
-  const line = lines.find((l) => l.accountId === accountId && l.month === month);
+function getLineAmount(lines: BudgetLine[], accountId: string, month: number, customerId = ''): string {
+  const line = lines.find(
+    (l) => l.accountId === accountId && l.month === month && (l.customerId ?? '') === customerId && !l.classId,
+  );
   return line?.amount ?? '';
 }
 
@@ -114,6 +124,8 @@ function NewBudgetModal({
 }) {
   const [name, setName] = useState('');
   const [fiscalYear, setFiscalYear] = useState(String(new Date().getFullYear()));
+  const [kind, setKind] = useState<'profit_loss' | 'balance_sheet'>('profit_loss');
+  const [isForecast, setIsForecast] = useState(false);
   const [saving, setSaving] = useState(false);
 
   async function handleCreate() {
@@ -122,8 +134,8 @@ function NewBudgetModal({
     if (!yr || yr < 2000 || yr > 2100) { toast('Enter a valid 4-digit fiscal year', 'danger'); return; }
     setSaving(true);
     try {
-      const budget = await api.post<Budget>('/api/budgets', { name: name.trim(), fiscalYear: yr });
-      toast('Budget created', 'success');
+      const budget = await api.post<Budget>('/api/budgets', { name: name.trim(), fiscalYear: yr, kind, isForecast });
+      toast(isForecast ? 'Forecast created' : 'Budget created', 'success');
       onCreated(budget);
       setName('');
       setFiscalYear(String(new Date().getFullYear()));
@@ -175,7 +187,21 @@ function NewBudgetModal({
             onChange={(e) => setFiscalYear(e.target.value)}
           />
         </div>
-        {/* Hidden submit so Enter submits the two-field form in all browsers */}
+        <div>
+          <Label htmlFor="budgetKind">What are you planning?</Label>
+          <Select id="budgetKind" value={kind} onChange={(e) => setKind(e.target.value as 'profit_loss' | 'balance_sheet')}>
+            <option value="profit_loss">Income and expenses (Profit &amp; Loss)</option>
+            <option value="balance_sheet">Month-end balances (Balance Sheet)</option>
+          </Select>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-navy">
+          <input type="checkbox" className="accent-[#2563eb]" checked={isForecast} onChange={(e) => setIsForecast(e.target.checked)} />
+          This is a forecast (your best guess), not a budget (your target)
+        </label>
+        <p className="text-xs text-navy/50">
+          You can enter amounts for the whole company, or pick a Customer:Job in the grid to budget for one customer or job.
+        </p>
+        {/* Hidden submit so Enter submits the form in all browsers */}
         <button type="submit" className="hidden" aria-hidden="true" tabIndex={-1} />
       </form>
     </Modal>
@@ -190,20 +216,24 @@ function BudgetGrid({
   budget,
   accounts,
   onLineChange,
+  customerId,
 }: {
   budget: BudgetWithLines;
   accounts: Account[];
   onLineChange: (accountId: string, month: number, amount: string) => void;
+  /** Customer:Job being budgeted ('' = whole company). */
+  customerId: string;
 }) {
-  // Only show income and expense accounts.
+  // P&L budgets: income and expense accounts. Balance-sheet budgets: asset, liability, equity.
+  const isBs = budget.kind === 'balance_sheet';
   const relevantAccounts = accounts.filter(
-    (a) => (a.type === 'revenue' || a.type === 'expense') && a.isActive,
+    (a) => (isBs ? !['revenue', 'expense'].includes(a.type) : a.type === 'revenue' || a.type === 'expense') && a.isActive,
   );
 
   return (
     <div className="overflow-x-auto">
       {/* Keyed by budget so switching budgets remounts the uncontrolled inputs. */}
-      <table key={budget.id} className="w-full border-collapse text-sm min-w-[900px]">
+      <table key={`${budget.id}:${customerId}`} className="w-full border-collapse text-sm min-w-[900px]">
         <thead>
           <tr>
             <th className="py-2.5 px-3 text-left font-semibold text-navy/70 border-b-2 border-navy/10 sticky left-0 bg-white z-10 min-w-[180px]">
@@ -223,7 +253,7 @@ function BudgetGrid({
           {relevantAccounts.length === 0 ? (
             <tr>
               <td colSpan={13} className="py-8 text-center text-navy/40">
-                No income or expense accounts found. Add accounts first.
+                {isBs ? 'No balance sheet accounts found.' : 'No income or expense accounts found.'} Add accounts first.
               </td>
             </tr>
           ) : (
@@ -235,12 +265,11 @@ function BudgetGrid({
                 </td>
                 {MONTHS.map((_, idx) => {
                   const month = idx + 1;
-                  const current = getLineAmount(budget.lines, acct.id, month);
+                  const current = getLineAmount(budget.lines, acct.id, month, customerId);
                   return (
                     <td key={month} className="py-1 px-1">
                       <input
                         type="number"
-                        min="0"
                         step="0.01"
                         placeholder="—"
                         aria-label={`${acct.name} ${MONTHS[idx]}`}
@@ -431,6 +460,15 @@ export default function BudgetsPage() {
 
   // Active tab on the right panel.
   const [tab, setTab] = useState<'grid' | 'vs-actual'>('grid');
+  // Customer:Job dimension for the grid ('' = whole company).
+  const [customerId, setCustomerId] = useState('');
+  const [customers, setCustomers] = useState<{ id: string; name: string }[]>([]);
+  useEffect(() => {
+    api
+      .get<{ customers: { id: string; name: string }[] }>('/api/reports/filter-options')
+      .then((o) => setCustomers(o.customers))
+      .catch(() => setCustomers([]));
+  }, []);
 
   // ---------------------------------------------------------------------------
   // Load budget list
@@ -496,7 +534,7 @@ export default function BudgetsPage() {
     const numAmount = Number(amount);
     if (isNaN(numAmount)) return;
     try {
-      await api.patch(`/api/budgets/${selected.id}`, { accountId, month, amount });
+      await api.patch(`/api/budgets/${selected.id}`, { accountId, month, amount, customerId: customerId || null });
       // Refresh budget lines silently.
       const full = await api.get<BudgetWithLines>(`/api/budgets/${selected.id}`);
       setSelected(full);
@@ -587,7 +625,11 @@ export default function BudgetsPage() {
                       }`}
                     >
                       <div className="font-medium text-sm truncate">{b.name}</div>
-                      <div className="text-xs text-navy/50 mt-0.5">FY{b.fiscalYear}</div>
+                      <div className="text-xs text-navy/50 mt-0.5 flex gap-1 items-center">
+                        FY{b.fiscalYear}
+                        {b.isForecast && <Badge tone="info">Forecast</Badge>}
+                        {b.kind === 'balance_sheet' && <Badge tone="neutral">Balance sheet</Badge>}
+                      </div>
                     </button>
                   </li>
                 ))}
@@ -623,6 +665,20 @@ export default function BudgetsPage() {
                 <div>
                   <span className="font-bold text-navy text-lg">{selected.name}</span>
                   <span className="ml-2 text-sm text-navy/50">FY{selected.fiscalYear}</span>
+                  <div className="flex gap-3 mt-1 text-xs">
+                    <Link
+                      className="text-electric hover:underline"
+                      href={`/reports/std/${selected.isForecast ? 'forecast-overview' : 'budget-overview'}?budgetId=${selected.id}${customerId ? `&customerId=${customerId}` : ''}`}
+                    >
+                      {selected.isForecast ? 'Forecast Overview' : 'Budget Overview'} report
+                    </Link>
+                    <Link
+                      className="text-electric hover:underline"
+                      href={`/reports/std/budget-vs-actual-report?budgetId=${selected.id}${customerId ? `&customerId=${customerId}` : ''}`}
+                    >
+                      {selected.isForecast ? 'Forecast' : 'Budget'} vs. Actual report
+                    </Link>
+                  </div>
                 </div>
                 <div className="flex gap-1">
                   {(['grid', 'vs-actual'] as const).map((t) => (
@@ -643,11 +699,30 @@ export default function BudgetsPage() {
 
               <div className="p-4">
                 {tab === 'grid' && (
-                  <BudgetGrid
-                    budget={selected}
-                    accounts={accounts}
-                    onLineChange={handleLineChange}
-                  />
+                  <>
+                    {selected.kind !== 'balance_sheet' && customers.length > 0 && (
+                      <div className="flex items-end gap-2 mb-3">
+                        <div className="min-w-[16rem]">
+                          <Label htmlFor="budget-customer">Budget for</Label>
+                          <Select id="budget-customer" value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
+                            <option value="">Whole company</option>
+                            {customers.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name}
+                              </option>
+                            ))}
+                          </Select>
+                        </div>
+                        <p className="text-xs text-navy/50 mb-2">A budget is either for the whole company or by Customer:Job — not both.</p>
+                      </div>
+                    )}
+                    <BudgetGrid
+                      budget={selected}
+                      accounts={accounts}
+                      onLineChange={handleLineChange}
+                      customerId={selected.kind === 'balance_sheet' ? '' : customerId}
+                    />
+                  </>
                 )}
 
                 {tab === 'vs-actual' && (

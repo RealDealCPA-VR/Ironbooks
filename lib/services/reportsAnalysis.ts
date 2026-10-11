@@ -7,12 +7,15 @@
  *  - QB graphs: Income & Expense, Net Worth, Sales, A/R, A/P, Budget vs. Actual series.
  */
 import type Decimal from 'decimal.js';
+import { eq } from 'drizzle-orm';
+import { budgets, classes, employees, items, jobs, mileageLogs, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
 import type { ReportParams } from '@/lib/validation/reports';
 import { PIVOT_DIMENSIONS, PIVOT_MEASURES } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { validation } from './_base';
+import { requireAnyReportAccess } from './reportsAccess';
 import { balanceSheet } from './reports';
 import { apAging, arAging } from './reportsExtra';
 import { budgetVsActualReport } from './budgets';
@@ -446,3 +449,62 @@ export async function graphData(ctx: ServiceContext, kind: GraphKind, p: ReportP
 }
 
 export { PL_SECTIONS };
+
+// ===========================================================================
+// Report filter options (names only) for the report toolbar's filter pickers
+// ===========================================================================
+
+export interface FilterOption {
+  id: string;
+  name: string;
+}
+
+export interface ReportFilterOptions {
+  accounts: (FilterOption & { section: string })[];
+  customers: FilterOption[];
+  vendors: FilterOption[];
+  classes: FilterOption[];
+  items: FilterOption[];
+  employees: FilterOption[];
+  jobs: FilterOption[];
+  budgets: (FilterOption & { fiscalYear: number; kind: string; isForecast: boolean })[];
+  vehicles: string[];
+}
+
+/**
+ * Id + display name lists for report filters. Any member who may run at least one report may
+ * read them (names only — no balances, contact details or tax ids).
+ */
+export async function reportFilterOptions(ctx: ServiceContext): Promise<ReportFilterOptions> {
+  requireAnyReportAccess(ctx);
+  const c = ctx.companyId;
+  const [meta, custs, vends, cls, its, emps, jbs, bdg, veh] = await Promise.all([
+    loadAccountMeta(ctx),
+    customerNames(ctx),
+    ctx.db.select({ id: vendors.id, name: vendors.displayName }).from(vendors).where(eq(vendors.companyId, c)),
+    ctx.db.select({ id: classes.id, name: classes.name }).from(classes).where(eq(classes.companyId, c)),
+    ctx.db.select({ id: items.id, name: items.name }).from(items).where(eq(items.companyId, c)),
+    ctx.db.select({ id: employees.id, first: employees.firstName, last: employees.lastName }).from(employees).where(eq(employees.companyId, c)),
+    ctx.db.select({ id: jobs.id, name: jobs.name, customerId: jobs.customerId }).from(jobs).where(eq(jobs.companyId, c)),
+    ctx.db.select().from(budgets).where(eq(budgets.companyId, c)),
+    ctx.db.selectDistinct({ v: mileageLogs.vehicle }).from(mileageLogs).where(eq(mileageLogs.companyId, c)),
+  ]);
+  const byName = <T extends { name: string }>(a: T, b: T) => a.name.localeCompare(b.name);
+  return {
+    accounts: [...meta.values()]
+      .sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }))
+      .map((a) => ({ id: a.id, name: `${a.code ? `${a.code} · ` : ''}${a.fullName}`, section: a.section })),
+    customers: [...custs.entries()].map(([id, v]) => ({ id, name: v.name })).sort(byName),
+    vendors: vends.sort(byName),
+    classes: cls.sort(byName),
+    items: its.sort(byName),
+    employees: emps.map((e) => ({ id: e.id, name: `${e.first} ${e.last}`.trim() })).sort(byName),
+    jobs: jbs
+      .map((j) => ({ id: j.id, name: j.customerId ? `${custs.get(j.customerId)?.name ?? ''}:${j.name}` : j.name }))
+      .sort(byName),
+    budgets: bdg
+      .map((b) => ({ id: b.id, name: b.name, fiscalYear: b.fiscalYear, kind: b.kind, isForecast: b.isForecast }))
+      .sort((a, b) => b.fiscalYear - a.fiscalYear || a.name.localeCompare(b.name)),
+    vehicles: veh.map((v) => v.v).filter((v): v is string => !!v).sort(),
+  };
+}

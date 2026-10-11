@@ -30,7 +30,14 @@ import {
   FileCode2,
   Wrench,
   MapPin,
+  Bookmark,
+  PieChart,
+  Grid3x3,
+  CalendarClock,
+  Search,
 } from 'lucide-react';
+import { REPORT_CATALOG, REPORT_GROUPS } from '@/lib/reports/catalog';
+import { canDo, useMe } from '@/lib/usePermissions';
 import { Card, PageHeader } from '@/components/ui';
 import { Help } from '@/components/Help';
 
@@ -294,6 +301,36 @@ const PLANNING_REPORTS: ReportCardProps[] = [
 
 const OTHER_REPORTS: ReportCardProps[] = [
   {
+    href: '/reports/memorized',
+    icon: Bookmark,
+    name: 'Memorized Reports',
+    description: 'Your saved reports and report groups. Run several at once and export them together.',
+  },
+  {
+    href: '/reports/graphs',
+    icon: PieChart,
+    name: 'Graphs',
+    description: 'Income & expense, net worth, sales, A/R, A/P and budget vs actual charts.',
+  },
+  {
+    href: '/reports/pivot',
+    icon: Grid3x3,
+    name: 'Advanced Reporting',
+    description: 'Slice your ledger or item sales by any two things — account, class, customer, month and more.',
+  },
+  {
+    href: '/reports/schedules',
+    icon: CalendarClock,
+    name: 'Scheduled Reports',
+    description: 'Save memorized reports to a folder automatically every day, week or month.',
+  },
+  {
+    href: '/find',
+    icon: Search,
+    name: 'Find Transactions',
+    description: 'Search every transaction by type, name, amount, number, account, date or memo.',
+  },
+  {
     href: '/reports/builder',
     icon: Wrench,
     name: 'Report Builder',
@@ -316,6 +353,37 @@ const OTHER_REPORTS: ReportCardProps[] = [
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
+
+function AllStandardReports() {
+  const { me } = useMe();
+  const visible = REPORT_CATALOG.filter((r) => !r.hidden && canDo(me, r.area, 'view'));
+  return (
+    <>
+      <SectionHeading>All reports</SectionHeading>
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        {REPORT_GROUPS.map((g) => {
+          const list = visible.filter((r) => r.group === g);
+          if (list.length === 0) return null;
+          return (
+            <Card key={g} className="p-5">
+              <h3 className="text-sm font-bold text-navy mb-2">{g}</h3>
+              <ul className="space-y-1.5">
+                {list.map((r) => (
+                  <li key={r.key}>
+                    <Link href={`/reports/std/${r.key}`} className="text-sm font-medium text-electric hover:underline">
+                      {r.title}
+                    </Link>
+                    <span className="block text-xs text-navy/50">{r.description}</span>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          );
+        })}
+      </div>
+    </>
+  );
+}
 
 export default function ReportsPage() {
   return (
@@ -394,6 +462,8 @@ export default function ReportsPage() {
           <ReportCard key={r.href} {...r} />
         ))}
       </div>
+
+      <AllStandardReports />
     </main>
   );
 }

@@ -117,6 +117,7 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'transaction-list-by-vendor', title: 'Transaction List by Vendor', description: 'All transactions, grouped by vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'vendor', 'txnType', 'amount', 'memo', 'number', 'sort'] },
   { key: 'expenses-by-vendor-summary', title: 'Expenses by Vendor Summary', description: 'Total spending per vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'class'] },
   { key: 'expenses-by-vendor-detail', title: 'Expenses by Vendor Detail', description: 'Every expense, grouped by vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'vendor', 'class', 'memo', 'sort'] },
+  { key: 'purchases-by-item-detail', title: 'Purchases by Item Detail', description: 'Every item bought, grouped by item.', group: 'Purchases', area: 'reports_purchases', controls: ['range', 'item', 'vendor'] },
   { key: 'open-purchase-orders', title: 'Open Purchase Orders', description: 'Purchase orders not yet received.', group: 'Purchases', area: 'reports_purchases', controls: ['vendor'] },
   { key: 'vendor-contact-list', title: 'Vendor Contact List', description: 'Name, phone, email, address and balance.', group: 'Lists', area: 'reports_purchases', controls: [] },
   { key: 'vendor-phone-list', title: 'Vendor Phone List', description: 'Vendor names and phone numbers.', group: 'Lists', area: 'reports_purchases', controls: [] },

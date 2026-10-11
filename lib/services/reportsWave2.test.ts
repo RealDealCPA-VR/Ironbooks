@@ -436,3 +436,39 @@ describe('pivot, find, graphs', () => {
     expect(sales.breakdown?.[0].value).toBe(300);
   });
 });
+
+describe('relative dates, purchases detail, filter options', () => {
+  it('resolves QB relative date ranges (fiscal-year aware)', async () => {
+    const { resolveDateMacro } = await import('./reportEngine');
+    const now = new Date('2026-05-15T12:00:00Z');
+    expect(resolveDateMacro('this_month', now)).toEqual({ from: '2026-05-01', to: '2026-05-31' });
+    expect(resolveDateMacro('last_month', now)).toEqual({ from: '2026-04-01', to: '2026-04-30' });
+    expect(resolveDateMacro('last_quarter', now)).toEqual({ from: '2026-01-01', to: '2026-03-31' });
+    expect(resolveDateMacro('this_fiscal_year', now, '06-30')).toEqual({ from: '2025-07-01', to: '2026-06-30' });
+    expect(resolveDateMacro('last_fiscal_year', now, '06-30')).toEqual({ from: '2024-07-01', to: '2025-06-30' });
+    // A memorized report with relative dates runs for the period at run time.
+    const r = await runStandardReport(ctx, 'profit-loss', { dates: 'last_month' }, { now: new Date('2026-03-10T12:00:00Z') });
+    expect(r.subtitle).toContain('02/01/2026');
+    expect(row(r, 'Total Income')!.cells.total).toBe('450.00');
+  });
+
+  it('Purchases by Item Detail', async () => {
+    const [b] = await db
+      .insert(bills)
+      .values({ companyId: ctx.companyId, vendorId: ids.vend, billNumber: 'L-2', date: d('2026-04-01'), total: '75', balanceDue: '75' })
+      .returning();
+    await db.insert(billLines).values({ billId: b.id, accountId: A.cogs, itemId: ids.item, quantity: '3', amount: '75' });
+    const r = await run('purchases-by-item-detail', { from: '2026-01-01', to: '2026-12-31' });
+    expect(row(r, 'Total Install')!.cells).toMatchObject({ qty: '3.0000', amount: '75.00' });
+  });
+
+  it('filter options list names and require some report access', async () => {
+    const { reportFilterOptions } = await import('./reportsAnalysis');
+    const o = await reportFilterOptions(ctx);
+    expect(o.customers.map((c) => c.name)).toContain('Acme:Kitchen');
+    expect(o.vehicles).toEqual(['Truck', 'Van']);
+    const none = fullAccess();
+    for (const k of Object.keys(none.permissions) as (keyof typeof none.permissions)[]) none.permissions[k] = [];
+    await expect(reportFilterOptions({ ...ctx, access: none })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+});

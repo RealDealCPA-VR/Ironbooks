@@ -1,6 +1,5 @@
 'use client';
 
-import Link from 'next/link';
 import { TrendingUp } from 'lucide-react';
 import { formatCurrency } from '@/lib/money';
 import SimpleReport from '../_components/SimpleReport';
@@ -26,13 +25,12 @@ export default function SalesByCustomerPage() {
       controls="range"
       buildUrl={({ from, to }) => `/api/reports/sales-by-customer?from=${from}&to=${to}`}
       getRows={(d) => d.rows}
+      rowHref={(r, q) => `/reports/std/sales-by-customer-detail?customerId=${r.customerId}&from=${q.from}&to=${q.to}`}
       columns={[
         {
           header: 'Customer',
           cell: (r) => (
-            <Link href="/customers" className="font-medium text-electric hover:underline" title="Open customers list">
-              {r.customerName}
-            </Link>
+            <span className="font-medium">{r.customerName}</span>
           ),
           csv: (r) => r.customerName,
         },

@@ -1,6 +1,5 @@
 'use client';
 
-import Link from 'next/link';
 import { Truck } from 'lucide-react';
 import { formatCurrency } from '@/lib/money';
 import SimpleReport from '../_components/SimpleReport';
@@ -26,13 +25,12 @@ export default function PurchasesByVendorPage() {
       controls="range"
       buildUrl={({ from, to }) => `/api/reports/purchases-by-vendor?from=${from}&to=${to}`}
       getRows={(d) => d.rows}
+      rowHref={(r, q) => `/reports/std/transaction-list-by-vendor?vendorId=${r.vendorId}&txnType=bill&from=${q.from}&to=${q.to}`}
       columns={[
         {
           header: 'Vendor',
           cell: (r) => (
-            <Link href="/vendors" className="font-medium text-electric hover:underline" title="Open vendors list">
-              {r.vendorName}
-            </Link>
+            <span className="font-medium">{r.vendorName}</span>
           ),
           csv: (r) => r.vendorName,
         },
