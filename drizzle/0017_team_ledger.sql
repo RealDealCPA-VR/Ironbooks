@@ -27,7 +27,9 @@
 --      `SELECT set_config('bka.allow_ledger_rewrite', 'on', true)` (transaction-
 --      local and bound to the setting transaction's txid; see allowLedgerRewrite()
 --      in lib/services/posting.ts): condense,
---      account merge and company restore. Even then (a) still runs at COMMIT.
+--      account merge and company restore. Even then (a) still runs at COMMIT for
+--      every entry whose header or lines the rewrite touched (untouched entries are
+--      not re-checked, which is why the flag never exempts an account's company move).
 --
 -- Error SQLSTATEs (translated to ServiceError by lib/services/_base.ts):
 --   BK001 unbalanced / malformed posted entry     → UNBALANCED
@@ -414,9 +416,11 @@ BEGIN
 
   -- An account referenced by journal lines cannot move to another company: its lines
   -- would then cross companies (the state BK001 forbids for touched entries). Checked
-  -- before the type-change branch so bundling a type change cannot skip it.
+  -- before the type-change branch so bundling a type change cannot skip it, and NOT
+  -- exempted by the rewrite flag: the deferred BK001 check only sees entries whose
+  -- header/lines were touched, and moving an account touches none. No sanctioned flow
+  -- (condense, merge, restore) changes accounts.company_id.
   IF NEW.company_id IS DISTINCT FROM OLD.company_id
-     AND NOT bka_ledger_rewrite_allowed()
      AND EXISTS (SELECT 1 FROM journal_entry_lines l WHERE l.account_id = OLD.id) THEN
     RAISE EXCEPTION 'LEDGER: account % has journal lines and cannot be moved to another company', OLD.code
       USING ERRCODE = 'BK003';

@@ -238,7 +238,9 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
  * Sanctioned ledger rewrite. Sets the transaction-local flag `bka.allow_ledger_rewrite` that
  * lets the current transaction delete / re-point / back-fill lines of posted entries (see the
  * immutability guards in drizzle/0017_team_ledger.sql). The deferred balance check still runs
- * at COMMIT, so a rewrite can never leave an unbalanced entry behind.
+ * at COMMIT for every entry whose header or lines the rewrite touched, so a rewrite can never
+ * leave an unbalanced entry behind. It does NOT exempt moving an account with journal lines to
+ * another company (that is refused unconditionally, since it touches no entry).
  *
  * WHITELIST — only these flows may call it: condense (summarize closed history), account merge
  * (re-point lines between same-type accounts) and company restore (re-insert a backup's ledger).
