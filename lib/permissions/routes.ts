@@ -548,7 +548,11 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/reports/inventory-sites': 'reports_inventory',
   '/reports/sales-tax': 'sales_tax',
   '/reports/reconciliation': 'accounting',
-  // wave2 reports
+  // wave2 reports. The standard report viewer, memorized reports and graphs host reports from
+  // several areas; their APIs check each report's own area (runStandardReport / graph kind).
+  '/reports/std': [...ANY_REPORT, 'time'],
+  '/reports/memorized': ANY_REPORT,
+  '/reports/graphs': ['reports_financial', 'reports_sales', 'reports_purchases'],
   '/reports/pivot': 'reports_financial',
   '/reports/schedules': 'file_utilities',
   '/find': 'reports_financial',
