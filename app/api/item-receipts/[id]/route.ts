@@ -9,7 +9,9 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getItemReceipt, convertToBill, voidItemReceipt } from '@/lib/services/itemReceipts';
+import { getItemReceipt, convertToBill, voidItemReceipt, updateItemReceipt } from '@/lib/services/itemReceipts';
+import { routeError } from '@/lib/routeErrors';
+import { createItemReceiptSchema } from '@/lib/validation/itemReceipts';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { itemReceiptActionSchema } from '@/lib/validation/itemReceipts';
@@ -72,5 +74,20 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     return NextResponse.json(receipt);
   } catch (err) {
     return errorResponse(err);
+  }
+}
+
+/** PATCH /api/item-receipts/:id — edit an unbilled item receipt (same body as POST /api/item-receipts). */
+export async function PATCH(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json().catch(() => ({}));
+    const parsed = createItemReceiptSchema.safeParse(body);
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    const receipt = await updateItemReceipt(ctx, id, parsed.data);
+    return NextResponse.json(receipt);
+  } catch (err) {
+    return routeError(err, 'PATCH /api/item-receipts/[id]');
   }
 }

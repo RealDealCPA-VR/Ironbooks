@@ -32,6 +32,14 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  /** wave2 purchases: currency of a bank / credit-card account (null = home). */
+  currency?: string | null;
+}
+
+interface CurrencyRow {
+  code: string;
+  name: string;
+  isBase: boolean;
 }
 
 interface BankAccount {
@@ -404,6 +412,7 @@ export default function BankingPage() {
   const [glAccounts, setGlAccounts] = useState<Account[]>([]);
   const [allAccounts, setAllAccounts] = useState<Account[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
+  const [currencyList, setCurrencyList] = useState<CurrencyRow[]>([]);
 
   // Loading
   const [loadingBankAccounts, setLoadingBankAccounts] = useState(true);
@@ -535,7 +544,27 @@ export default function BankingPage() {
     fetchBankAccounts();
     fetchRules();
     fetchAccounts();
+    api
+      .get<CurrencyRow[]>('/api/currencies')
+      .then(setCurrencyList)
+      .catch(() => setCurrencyList([]));
   }, [fetchBankAccounts, fetchRules, fetchAccounts]);
+
+  // Multi-currency: a bank / card account can hold a foreign currency (only before it is used).
+  const multiCurrency = currencyList.length > 1;
+  const homeCode = currencyList.find((c) => c.isBase)?.code ?? '';
+  async function changeAccountCurrency(accountId: string, code: string) {
+    try {
+      await api.post('/api/banking/account-currency', { accountId, currency: code || null });
+      toast('Account currency updated.', 'success');
+    } catch (err) {
+      toast(
+        err instanceof Error ? err.message : 'Could not change the account currency.',
+        'danger',
+      );
+    }
+    await fetchAccounts();
+  }
 
   // Auto-select first bank account for import when list loads
   useEffect(() => {
@@ -691,6 +720,7 @@ export default function BankingPage() {
                 <Th>GL Account</Th>
                 <Th>Last Reconciled</Th>
                 <Th numeric>Reconciled Balance</Th>
+                {multiCurrency && <Th>Currency</Th>}
               </Tr>
             </thead>
             <tbody>
@@ -708,6 +738,24 @@ export default function BankingPage() {
                       ? formatCurrency(ba.lastReconciledBalance)
                       : '—'}
                   </Td>
+                  {multiCurrency && (
+                    <Td>
+                      <Select
+                        aria-label={`Currency of ${ba.bankName}`}
+                        value={allAccounts.find((a) => a.id === ba.accountId)?.currency ?? ''}
+                        onChange={(e) => changeAccountCurrency(ba.accountId, e.target.value)}
+                      >
+                        <option value="">{homeCode ? `${homeCode} (home)` : 'Home currency'}</option>
+                        {currencyList
+                          .filter((c) => !c.isBase)
+                          .map((c) => (
+                            <option key={c.code} value={c.code}>
+                              {c.code} — {c.name}
+                            </option>
+                          ))}
+                      </Select>
+                    </Td>
+                  )}
                 </Tr>
               ))}
             </tbody>

@@ -15,12 +15,13 @@ import { and, asc, eq, ne } from 'drizzle-orm';
 import { vendors } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { maskForContext } from './access';
+import { type VendorPurchaseFieldsInput, resolveVendorPurchaseFields } from './vendorPurchaseFields';
 
 // ---------------------------------------------------------------------------
 // Input types
 // ---------------------------------------------------------------------------
 
-export interface CreateVendorInput {
+export interface CreateVendorInput extends VendorPurchaseFieldsInput {
   /** The name shown in all lists and documents — required and must be unique per company. */
   displayName: string;
   companyName?: string | null;
@@ -128,6 +129,7 @@ export async function createVendor(ctx: ServiceContext, input: CreateVendorInput
     throw validation('Enter the full tax ID; a masked value cannot be saved.');
   }
   await assertUniqueDisplayName(ctx, input.displayName);
+  const purchaseFields = await resolveVendorPurchaseFields(ctx, input);
 
   const [row] = await ctx.db
     .insert(vendors)
@@ -143,6 +145,7 @@ export async function createVendor(ctx: ServiceContext, input: CreateVendorInput
       taxId: input.taxId ?? null,
       defaultExpenseAccountId: input.defaultExpenseAccountId ?? null,
       notes: input.notes ?? null,
+      ...purchaseFields,
     })
     .returning();
 
@@ -179,6 +182,7 @@ export async function updateVendor(
   if (patch.displayName !== undefined) {
     await assertUniqueDisplayName(ctx, newDisplayName, id);
   }
+  const purchaseFields = await resolveVendorPurchaseFields(ctx, patch, before);
 
   const [row] = await ctx.db
     .update(vendors)
@@ -199,6 +203,7 @@ export async function updateVendor(
           ? patch.defaultExpenseAccountId
           : before.defaultExpenseAccountId,
       notes: patch.notes !== undefined ? patch.notes : before.notes,
+      ...purchaseFields,
       updatedAt: new Date(),
     })
     .where(eq(vendors.id, id))

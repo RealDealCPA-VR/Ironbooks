@@ -1,19 +1,21 @@
 'use client';
 
 /**
- * Print Checks page — QB-style "Print Checks"
+ * Print Checks page — QB-style "Print Checks" (wave2 purchases D3/D4).
  *
- * Two sections:
- *  1. Print Queue — checks written on the Write Checks / Expenses screen with
- *     "Print later" checked. Printing a queued check renders its PDF AND records
- *     the assigned check number back onto the transaction (toPrint=false), so
- *     printing is fully connected to the GL-posted expense.
- *  2. Quick Check — the original ad-hoc check generator (fill in payee, amount,
- *     date, memo, number) for one-off checks that are not recorded transactions.
+ * Sections:
+ *  1. Checks to Print — ONE queue for every source: checks written with "Print later", bill
+ *     payments marked "To be printed" and paychecks added to the queue. Printing a check renders
+ *     its PDF (in the company's check style) AND stamps the check number on the recorded
+ *     transaction and its journal entry. A number already used on the account asks first.
+ *  2. Add paychecks — paychecks that were never printed can be added to the queue.
+ *  3. Printer setup — check style (voucher / standard / wallet) and alignment nudges, with an
+ *     alignment test page.
+ *  4. Quick Check — ad-hoc check PDF that is not recorded.
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import { Printer, RefreshCw } from 'lucide-react';
+import { Printer, RefreshCw, Settings2, UserPlus } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -22,15 +24,18 @@ import {
   Input,
   Label,
   PageHeader,
+  Select,
   Spinner,
   Table,
   Th,
   Td,
   Tr,
   toast,
+  toastError,
 } from '@/components/ui';
 import { numberToWords } from '@/lib/pdf/check';
-import { api, ApiError } from '@/lib/client';
+import { api } from '@/lib/client';
+import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -38,29 +43,52 @@ import { formatDate } from '@/lib/utils';
 // Types
 // ---------------------------------------------------------------------------
 
-interface QueuedCheck {
+type PrintSource = 'expense' | 'bill_payment' | 'paycheck';
+
+interface QueueItem {
+  source: PrintSource;
   id: string;
-  vendorName: string | null;
-  payeeName: string | null;
   date: string;
-  paymentAccountName: string | null;
-  total: string;
+  payee: string;
+  amount: string;
   memo: string | null;
+  paymentAccountId: string | null;
+  paymentAccountName: string | null;
 }
+
+interface UnprintedPaycheck {
+  id: string;
+  payDate: string;
+  employee: string;
+  netPay: string;
+}
+
+type CheckStyle = 'voucher' | 'standard' | 'wallet';
+
+interface PrintSettings {
+  style: CheckStyle;
+  offsetX: string;
+  offsetY: string;
+}
+
+const SOURCE_LABEL: Record<PrintSource, string> = {
+  expense: 'Check',
+  bill_payment: 'Bill payment',
+  paycheck: 'Paycheck',
+};
+
+const STYLE_HELP: Record<CheckStyle, string> = {
+  voucher: 'Check on top with a detail stub below (shows the bills or expenses paid).',
+  standard: 'Just the check, no detail stub.',
+  wallet: 'Smaller check with a stub on the left for your checkbook register.',
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /** Render a check PDF via the API and open it in a new tab. */
-async function openCheckPdf(args: {
-  expenseId?: string;
-  payee?: string;
-  amount?: string;
-  date?: string;
-  memo?: string;
-  checkNumber?: string;
-}) {
+async function openCheckPdf(args: Record<string, unknown>) {
   const res = await fetch('/api/checks/pdf', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -76,16 +104,30 @@ async function openCheckPdf(args: {
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
+function errMsg(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
 export default function PrintChecksPage() {
   // ── Print queue state ─────────────────────────────────────────────────────
-  const [queue, setQueue] = useState<QueuedCheck[]>([]);
+  const [queue, setQueue] = useState<QueueItem[]>([]);
   const [queueLoading, setQueueLoading] = useState(true);
   const [nextNumber, setNextNumber] = useState('');
   const [printingId, setPrintingId] = useState<string | null>(null);
+
+  // ── Paychecks not yet queued ──────────────────────────────────────────────
+  const [unprinted, setUnprinted] = useState<UnprintedPaycheck[]>([]);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [queuingPaychecks, setQueuingPaychecks] = useState(false);
+
+  // ── Printer setup ─────────────────────────────────────────────────────────
+  const [settings, setSettings] = useState<PrintSettings>({ style: 'voucher', offsetX: '0', offsetY: '0' });
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [testing, setTesting] = useState(false);
 
   // ── Quick-check form state ────────────────────────────────────────────────
   const [payee, setPayee] = useState('');
@@ -96,19 +138,22 @@ export default function PrintChecksPage() {
   const [generating, setGenerating] = useState(false);
   const [amountWords, setAmountWords] = useState('');
 
-  // ── Queue loading ─────────────────────────────────────────────────────────
+  // ── Loading ───────────────────────────────────────────────────────────────
 
   const refreshQueue = useCallback(async () => {
     setQueueLoading(true);
     try {
-      const [queueData, nextData] = await Promise.all([
-        api.get<{ expenses: QueuedCheck[] }>('/api/expenses?toPrint=true'),
+      const [queueData, nextData, pcData] = await Promise.all([
+        api.get<{ items: QueueItem[] }>('/api/print-queue'),
         api.get<{ next: string }>('/api/check-numbers/next'),
+        api.get<{ paychecks: UnprintedPaycheck[] }>('/api/print-queue/paychecks').catch(() => ({ paychecks: [] })),
       ]);
-      setQueue(queueData.expenses);
+      setQueue(queueData.items);
       setNextNumber((prev) => prev || nextData.next);
+      setUnprinted(pcData.paychecks);
+      setPicked(new Set());
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load the print queue.', 'danger');
+      toastError(err, 'Failed to load the print queue.');
     } finally {
       setQueueLoading(false);
     }
@@ -116,45 +161,108 @@ export default function PrintChecksPage() {
 
   useEffect(() => {
     refreshQueue();
+    api
+      .get<PrintSettings>('/api/checks/settings')
+      .then((s) => setSettings(s))
+      .catch(() => {
+        /* defaults are fine */
+      });
   }, [refreshQueue]);
 
   useEffect(() => {
     const n = parseFloat(amount);
-    if (!amount || isNaN(n) || n < 0) {
-      setAmountWords('');
-    } else {
-      setAmountWords(numberToWords(amount));
-    }
+    setAmountWords(!amount || isNaN(n) || n < 0 ? '' : numberToWords(amount));
   }, [amount]);
 
   // ── Print a queued check ──────────────────────────────────────────────────
 
-  async function handlePrintQueued(check: QueuedCheck) {
+  async function handlePrintQueued(item: QueueItem) {
     const num = nextNumber.trim();
     if (!num) {
-      toast('Enter a starting check number.', 'danger');
+      toast('Enter the number printed on the first check in the printer.', 'danger');
       return;
     }
-    setPrintingId(check.id);
+    setPrintingId(item.id);
     try {
-      // 1. Render + open the PDF (with voucher stub) from the recorded expense
-      await openCheckPdf({ expenseId: check.id, checkNumber: num });
-
-      // 2. Record the number on the transaction (toPrint=false + reference)
-      await api.post(`/api/expenses/${check.id}/print`, { checkNumber: num });
-
+      // 1. Record the number first (asks before reusing a number), then render the PDF.
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        api.post('/api/print-queue', { source: item.source, id: item.id, checkNumber: num, allowDuplicateNumber }),
+      );
+      if (saved === null) return; // user chose a different number
+      await openCheckPdf({ source: item.source, id: item.id, checkNumber: num });
       toast(`Check #${num} printed and recorded.`, 'success');
 
-      // Advance the number for the next check in the run
+      // Advance the number for the next check in the run.
       const parsed = parseInt(num, 10);
-      if (!isNaN(parsed)) setNextNumber(String(parsed + 1));
-
-      setQueue((prev) => prev.filter((q) => q.id !== check.id));
+      if (!isNaN(parsed) && String(parsed) === num) setNextNumber(String(parsed + 1));
+      setQueue((prev) => prev.filter((q) => !(q.id === item.id && q.source === item.source)));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to print check.';
-      toast(msg, 'danger');
+      toast(errMsg(err, 'Failed to print check.'), 'danger');
     } finally {
       setPrintingId(null);
+    }
+  }
+
+  // ── Queue paychecks ───────────────────────────────────────────────────────
+
+  async function handleQueuePaychecks() {
+    if (picked.size === 0) {
+      toast('Tick the paychecks you want to print.', 'danger');
+      return;
+    }
+    setQueuingPaychecks(true);
+    try {
+      await api.post('/api/print-queue/paychecks', { paycheckIds: [...picked] });
+      toast(`${picked.size} paycheck${picked.size === 1 ? '' : 's'} added to the queue.`, 'success');
+      await refreshQueue();
+    } catch (err) {
+      toastError(err, 'Could not add the paychecks.');
+    } finally {
+      setQueuingPaychecks(false);
+    }
+  }
+
+  // ── Printer setup ─────────────────────────────────────────────────────────
+
+  function offsetOk(v: string) {
+    const n = Number(v);
+    return v.trim() !== '' && Number.isFinite(n) && Math.abs(n) <= 1;
+  }
+
+  async function handleSaveSettings() {
+    if (!offsetOk(settings.offsetX) || !offsetOk(settings.offsetY)) {
+      toast('Alignment must be between -1 and 1 inch.', 'danger');
+      return;
+    }
+    setSavingSettings(true);
+    try {
+      const saved = await api.put<PrintSettings>('/api/checks/settings', settings);
+      setSettings(saved);
+      toast('Printer setup saved.', 'success');
+    } catch (err) {
+      toastError(err, 'Could not save the printer setup.');
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleAlignmentTest() {
+    if (!offsetOk(settings.offsetX) || !offsetOk(settings.offsetY)) {
+      toast('Alignment must be between -1 and 1 inch.', 'danger');
+      return;
+    }
+    setTesting(true);
+    try {
+      await openCheckPdf({
+        alignmentTest: true,
+        style: settings.style,
+        offsetX: settings.offsetX,
+        offsetY: settings.offsetY,
+      });
+    } catch (err) {
+      toast(errMsg(err, 'Could not print the test page.'), 'danger');
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -174,7 +282,6 @@ export default function PrintChecksPage() {
       toast('Date is required.', 'danger');
       return;
     }
-
     setGenerating(true);
     try {
       await openCheckPdf({
@@ -186,8 +293,7 @@ export default function PrintChecksPage() {
       });
       toast('Check PDF opened in a new tab.', 'success');
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to generate check PDF.';
-      toast(msg, 'danger');
+      toast(errMsg(err, 'Failed to generate check PDF.'), 'danger');
     } finally {
       setGenerating(false);
     }
@@ -201,16 +307,15 @@ export default function PrintChecksPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <div className="max-w-4xl mx-auto space-y-6">
         <PageHeader title="Print Checks" icon={Printer} />
-        {/* ----------------------------------------------------------------- */}
-        {/* Print queue (checks marked "Print later" on Write Checks)          */}
-        {/* ----------------------------------------------------------------- */}
+
+        {/* Print queue */}
         <Card className="p-6 space-y-4">
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-lg font-bold text-navy">Checks to Print</h2>
               <p className="text-sm text-navy/50">
-                Checks saved with &quot;Print later&quot; on the Write Checks screen. Printing
-                assigns the check number to the recorded transaction.
+                Checks written with &quot;Print later&quot;, bill payments marked &quot;To be printed&quot;, and
+                paychecks you added below. Printing records the check number on the transaction.
               </p>
             </div>
             <Button variant="secondary" size="sm" onClick={refreshQueue} disabled={queueLoading}>
@@ -230,7 +335,9 @@ export default function PrintChecksPage() {
               />
             </div>
             {queue.length > 0 && (
-              <Badge tone="warning">{queue.length} check{queue.length === 1 ? '' : 's'} queued</Badge>
+              <Badge tone="warning">
+                {queue.length} check{queue.length === 1 ? '' : 's'} queued
+              </Badge>
             )}
           </div>
 
@@ -242,14 +349,15 @@ export default function PrintChecksPage() {
             <EmptyState
               icon={Printer}
               title="No checks waiting to print"
-              message='Write a check with "Print later" on the Write Checks screen to queue one.'
+              message='Write a check with "Print later", pay bills with "To be printed", or add paychecks below.'
             />
           ) : (
             <Table>
               <thead>
                 <tr>
                   <Th>Date</Th>
-                  <Th>Payee</Th>
+                  <Th>Type</Th>
+                  <Th>Pay to</Th>
                   <Th>Bank Account</Th>
                   <Th>Memo</Th>
                   <Th numeric>Amount</Th>
@@ -258,20 +366,21 @@ export default function PrintChecksPage() {
               </thead>
               <tbody>
                 {queue.map((q) => (
-                  <Tr key={q.id}>
+                  <Tr key={`${q.source}:${q.id}`}>
                     <Td>{q.date ? formatDate(q.date, 'MMM d, yyyy') : '—'}</Td>
-                    <Td className="font-medium">{q.vendorName ?? q.payeeName ?? '—'}</Td>
+                    <Td>
+                      <Badge tone={q.source === 'paycheck' ? 'success' : q.source === 'bill_payment' ? 'neutral' : 'info'}>
+                        {SOURCE_LABEL[q.source]}
+                      </Badge>
+                    </Td>
+                    <Td className="font-medium">{q.payee || '—'}</Td>
                     <Td>{q.paymentAccountName ?? '—'}</Td>
                     <Td className="text-navy/60">{q.memo ?? '—'}</Td>
                     <Td numeric className="font-semibold">
-                      {formatCurrency(q.total)}
+                      {formatCurrency(q.amount)}
                     </Td>
                     <Td className="text-right">
-                      <Button
-                        size="sm"
-                        loading={printingId === q.id}
-                        onClick={() => handlePrintQueued(q)}
-                      >
+                      <Button size="sm" loading={printingId === q.id} onClick={() => handlePrintQueued(q)}>
                         <Printer className="h-4 w-4" />
                         Print &amp; Record
                       </Button>
@@ -283,19 +392,136 @@ export default function PrintChecksPage() {
           )}
         </Card>
 
-        {/* ----------------------------------------------------------------- */}
-        {/* Quick check (ad-hoc PDF, not recorded)                              */}
-        {/* ----------------------------------------------------------------- */}
+        {/* Add paychecks */}
+        <Card className="p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-lg font-bold text-navy">Add Paychecks to the Queue</h2>
+              <p className="text-sm text-navy/50">Paychecks that have not been printed yet. Tick the ones to print.</p>
+            </div>
+            <Button size="sm" onClick={handleQueuePaychecks} loading={queuingPaychecks} disabled={picked.size === 0}>
+              <UserPlus className="h-4 w-4" />
+              Add to queue
+            </Button>
+          </div>
+          {unprinted.length === 0 ? (
+            <p className="text-sm text-navy/40">No unprinted paychecks.</p>
+          ) : (
+            <Table>
+              <thead>
+                <tr>
+                  <Th>
+                    <input
+                      type="checkbox"
+                      aria-label="Select all paychecks"
+                      className="h-4 w-4 accent-electric"
+                      checked={picked.size === unprinted.length}
+                      onChange={(e) => setPicked(e.target.checked ? new Set(unprinted.map((p) => p.id)) : new Set())}
+                    />
+                  </Th>
+                  <Th>Pay date</Th>
+                  <Th>Employee</Th>
+                  <Th numeric>Net pay</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {unprinted.map((p) => (
+                  <Tr key={p.id}>
+                    <Td>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select paycheck for ${p.employee}`}
+                        className="h-4 w-4 accent-electric"
+                        checked={picked.has(p.id)}
+                        onChange={(e) =>
+                          setPicked((prev) => {
+                            const next = new Set(prev);
+                            if (e.target.checked) next.add(p.id);
+                            else next.delete(p.id);
+                            return next;
+                          })
+                        }
+                      />
+                    </Td>
+                    <Td>{formatDate(p.payDate, 'MMM d, yyyy')}</Td>
+                    <Td className="font-medium">{p.employee}</Td>
+                    <Td numeric>{formatCurrency(p.netPay)}</Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          )}
+        </Card>
+
+        {/* Printer setup */}
+        <Card className="p-6 space-y-4">
+          <div className="flex items-center gap-2">
+            <Settings2 className="h-5 w-5 text-navy/60" />
+            <h2 className="text-lg font-bold text-navy">Printer Setup</h2>
+          </div>
+          <p className="text-sm text-navy/50">
+            Pick the kind of check paper you use. If the printing lands a little off on the paper, nudge it:
+            positive numbers move the print right / up, negative numbers left / down (in inches, at most 1).
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <Label htmlFor="chk-style">Check style</Label>
+              <Select
+                id="chk-style"
+                value={settings.style}
+                onChange={(e) => setSettings((s) => ({ ...s, style: e.target.value as CheckStyle }))}
+              >
+                <option value="voucher">Voucher</option>
+                <option value="standard">Standard</option>
+                <option value="wallet">Wallet</option>
+              </Select>
+              <p className="mt-1 text-xs text-navy/50">{STYLE_HELP[settings.style]}</p>
+            </div>
+            <div>
+              <Label htmlFor="chk-offx">Move right (inches)</Label>
+              <Input
+                id="chk-offx"
+                type="number"
+                step="0.01"
+                min="-1"
+                max="1"
+                value={settings.offsetX}
+                onChange={(e) => setSettings((s) => ({ ...s, offsetX: e.target.value }))}
+              />
+            </div>
+            <div>
+              <Label htmlFor="chk-offy">Move up (inches)</Label>
+              <Input
+                id="chk-offy"
+                type="number"
+                step="0.01"
+                min="-1"
+                max="1"
+                value={settings.offsetY}
+                onChange={(e) => setSettings((s) => ({ ...s, offsetY: e.target.value }))}
+              />
+            </div>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={handleAlignmentTest} loading={testing}>
+              Print alignment test
+            </Button>
+            <Button onClick={handleSaveSettings} loading={savingSettings}>
+              Save setup
+            </Button>
+          </div>
+        </Card>
+
+        {/* Quick check (ad-hoc PDF, not recorded) */}
         <Card className="p-6 space-y-5">
           <div>
             <h2 className="text-lg font-bold text-navy">Quick Check</h2>
             <p className="text-sm text-navy/50">
-              Generate a one-off check PDF without recording a transaction. To record spend on the
-              books, use Write Checks / Expenses instead.
+              Generate a one-off check PDF without recording a transaction. To record spend on the books, use
+              Write Checks / Expenses instead.
             </p>
           </div>
 
-          {/* Payee */}
           <div>
             <Label htmlFor="chk-payee">Pay to the Order of *</Label>
             <Input
@@ -306,7 +532,6 @@ export default function PrintChecksPage() {
             />
           </div>
 
-          {/* Amount + Date side by side */}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label htmlFor="chk-amount">Amount ($) *</Label>
@@ -322,29 +547,18 @@ export default function PrintChecksPage() {
             </div>
             <div>
               <Label htmlFor="chk-date">Date *</Label>
-              <Input
-                id="chk-date"
-                type="date"
-                value={date}
-                onChange={(e) => setDate(e.target.value)}
-              />
+              <Input id="chk-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
             </div>
           </div>
 
-          {/* Live words preview */}
           {amountWords && (
             <div className="rounded-lg border border-electric/30 bg-electric/5 px-4 py-3">
-              <p className="text-[11px] font-semibold uppercase tracking-wide text-navy/50 mb-0.5">
-                Amount in words
-              </p>
-              <p className="text-sm font-medium text-navy italic leading-snug">
-                {amountWords} DOLLARS
-              </p>
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-navy/50 mb-0.5">Amount in words</p>
+              <p className="text-sm font-medium text-navy italic leading-snug">{amountWords} DOLLARS</p>
               <p className="text-xs text-navy/40 mt-1 tabular-nums">{formatCurrency(amount)}</p>
             </div>
           )}
 
-          {/* Check number + Memo */}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label htmlFor="chk-number">Check Number</Label>
@@ -357,16 +571,10 @@ export default function PrintChecksPage() {
             </div>
             <div>
               <Label htmlFor="chk-memo">Memo</Label>
-              <Input
-                id="chk-memo"
-                placeholder="Optional note"
-                value={memo}
-                onChange={(e) => setMemo(e.target.value)}
-              />
+              <Input id="chk-memo" placeholder="Optional note" value={memo} onChange={(e) => setMemo(e.target.value)} />
             </div>
           </div>
 
-          {/* Action */}
           <div className="flex justify-end pt-2">
             <Button onClick={handleGenerate} loading={generating}>
               <Printer className="h-4 w-4" />
@@ -375,14 +583,11 @@ export default function PrintChecksPage() {
           </div>
         </Card>
 
-        {/* ----------------------------------------------------------------- */}
-        {/* Helpful notes                                                       */}
-        {/* ----------------------------------------------------------------- */}
         <Card className="p-5 bg-navy/5 border-navy/10">
           <h3 className="text-sm font-semibold text-navy mb-2">Tips</h3>
           <ul className="text-sm text-navy/60 space-y-1 list-disc list-inside">
             <li>The PDF opens in a new tab — use your browser&apos;s print dialog to send it to your printer.</li>
-            <li>Load blank check stock into your printer before printing.</li>
+            <li>Print the alignment test on plain paper first and hold it over a blank check to compare.</li>
             <li>Printing a queued check stamps its number onto the recorded transaction and journal entry.</li>
           </ul>
         </Card>

@@ -37,6 +37,12 @@ import {
 } from '@/components/inventory/AdvancedInventory';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import {
+  TERMS_CHOICES,
+  type PurchaseVendor,
+  saveWithDuplicateCheck,
+  vendorPrefillAccountIds,
+} from '@/lib/purchasesClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,6 +60,9 @@ interface Bill {
   balanceDue: string;
   status: 'open' | 'partial' | 'paid' | 'void';
   memo: string | null;
+  terms?: string | null;
+  currency?: string | null;
+  exchangeRate?: string | null;
 }
 
 interface BillDetailLine {
@@ -80,10 +89,7 @@ function isEditable(bill: Bill): boolean {
   );
 }
 
-interface Vendor {
-  id: string;
-  displayName: string;
-}
+type Vendor = PurchaseVendor;
 
 interface Account {
   id: string;
@@ -186,6 +192,9 @@ export default function BillsPage() {
   const [billNumber, setBillNumber] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [dueDate, setDueDate] = useState('');
+  const [terms, setTerms] = useState('');
+  const [memo, setMemo] = useState('');
+  const [exchangeRate, setExchangeRate] = useState('');
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
   /** Shown under the vendor picker after accounts were pre-filled (QB vendor pre-fill). */
   const [prefillNote, setPrefillNote] = useState('');
@@ -251,6 +260,9 @@ export default function BillsPage() {
     setBillNumber('');
     setDate(new Date().toISOString().slice(0, 10));
     setDueDate('');
+    setTerms('');
+    setMemo('');
+    setExchangeRate('');
     setLines([emptyLine()]);
     setPrefillNote('');
     setModalOpen(true);
@@ -264,9 +276,18 @@ export default function BillsPage() {
     setVendorId(id);
     setPrefillNote('');
     if (!id || editingId) return;
+    const vendor = vendors.find((v) => v.id === id);
+    setTerms(vendor?.terms ?? '');
     const blank = (ls: LineRow[]) =>
       ls.every((l) => l.mode === 'expense' && !l.accountId && !l.amount && !l.description);
     if (!blank(lines)) return;
+    // The vendor's own pre-fill accounts (up to 3) win over learned suggestions.
+    const own = vendorPrefillAccountIds(vendor);
+    if (own.length > 0) {
+      setLines(own.map((accountId) => ({ ...emptyLine('expense'), accountId })));
+      setPrefillNote("Accounts pre-filled from the vendor's pre-fill accounts.");
+      return;
+    }
     const pf = await fetchVendorPrefill({ vendorId: id });
     if (!pf) return;
     setLines((prev) => {
@@ -286,6 +307,9 @@ export default function BillsPage() {
       setBillNumber(detail.billNumber ?? '');
       setDate(detail.date.slice(0, 10));
       setDueDate(detail.dueDate ? detail.dueDate.slice(0, 10) : '');
+      setTerms(detail.terms ?? '');
+      setMemo(detail.memo ?? '');
+      setExchangeRate(detail.currency && detail.exchangeRate ? String(Number(detail.exchangeRate)) : '');
       setLines(
         detail.lines.length === 0
           ? [emptyLine()]
@@ -378,6 +402,7 @@ export default function BillsPage() {
 
   // Compute running total for display (Number() only — display only, not stored)
   const runningTotal = lines.reduce((sum, l) => sum + lineAmount(l), 0);
+  const selectedVendor = vendors.find((v) => v.id === vendorId);
 
   // ---------------------------------------------------------------------------
   // Submit new bill
@@ -425,6 +450,9 @@ export default function BillsPage() {
         billNumber: billNumber.trim() || undefined,
         date,
         dueDate: dueDate || undefined,
+        terms: terms || undefined,
+        memo: memo.trim() || undefined,
+        exchangeRate: selectedVendor?.currency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
         lines: lines.map((l) =>
           l.mode === 'item'
             ? {
@@ -441,13 +469,14 @@ export default function BillsPage() {
               },
         ),
       };
-      if (editingId) {
-        await api.patch(`/api/bills/${editingId}`, payload);
-        toast('Bill updated.', 'success');
-      } else {
-        await api.post('/api/bills', payload);
-        toast('Bill created.', 'success');
-      }
+      // Duplicate vendor reference number: warn and let the user keep it (QB behaviour).
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        editingId
+          ? api.patch(`/api/bills/${editingId}`, { ...payload, allowDuplicateNumber })
+          : api.post('/api/bills', { ...payload, allowDuplicateNumber }),
+      );
+      if (saved === null) return;
+      toast(editingId ? 'Bill updated.' : 'Bill created.', 'success');
       setModalOpen(false);
       await fetchBills();
     } catch (err) {
@@ -543,7 +572,10 @@ export default function BillsPage() {
                   <Td className="font-medium">{vendorName(bill.vendorId)}</Td>
                   <Td>{bill.date ? formatDate(bill.date, 'MMM d, yyyy') : '—'}</Td>
                   <Td>{bill.dueDate ? formatDate(bill.dueDate, 'MMM d, yyyy') : <span className="text-navy/30">—</span>}</Td>
-                  <Td numeric>{formatCurrency(bill.total)}</Td>
+                  <Td numeric>
+                    {formatCurrency(bill.total)}
+                    {bill.currency && <span className="ml-1 text-xs text-navy/50">{bill.currency}</span>}
+                  </Td>
                   <Td numeric className="font-semibold">
                     {formatCurrency(bill.balanceDue)}
                   </Td>
@@ -648,14 +680,53 @@ export default function BillsPage() {
             </div>
           </div>
 
-          {/* Due Date */}
+          {/* Terms + Due Date */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="bill-terms">Terms</Label>
+              <Select id="bill-terms" value={terms} onChange={(e) => setTerms(e.target.value)}>
+                <option value="">Vendor&apos;s terms</option>
+                {TERMS_CHOICES.map((t) => (
+                  <option key={t.value} value={t.value}>
+                    {t.label}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="bill-due">Due Date (optional)</Label>
+              <DateInput
+                id="bill-due"
+                value={dueDate}
+                onChange={(e) => setDueDate(e.target.value)}
+              />
+              <p className="mt-1 text-xs text-navy/40">Leave blank to work it out from the terms.</p>
+            </div>
+          </div>
+
+          {/* Foreign-currency vendor */}
+          {selectedVendor?.currency && (
+            <div className="grid grid-cols-2 gap-3 rounded-lg border border-electric/20 bg-electric/5 p-3">
+              <p className="text-xs text-navy/70">
+                This vendor bills in <strong>{selectedVendor.currency}</strong>. Enter the amounts in{' '}
+                {selectedVendor.currency}; the books record them in your home currency at the exchange rate.
+              </p>
+              <div>
+                <Label htmlFor="bill-fx">Exchange rate (home per 1 {selectedVendor.currency})</Label>
+                <Input
+                  id="bill-fx"
+                  inputMode="decimal"
+                  placeholder="Use the rate from Currencies"
+                  value={exchangeRate}
+                  onChange={(e) => setExchangeRate(e.target.value)}
+                />
+              </div>
+            </div>
+          )}
+
           <div>
-            <Label htmlFor="bill-due">Due Date (optional)</Label>
-            <DateInput
-              id="bill-due"
-              value={dueDate}
-              onChange={(e) => setDueDate(e.target.value)}
-            />
+            <Label htmlFor="bill-memo">Memo</Label>
+            <Input id="bill-memo" placeholder="Optional note" value={memo} onChange={(e) => setMemo(e.target.value)} />
           </div>
 
           {/* Line items */}

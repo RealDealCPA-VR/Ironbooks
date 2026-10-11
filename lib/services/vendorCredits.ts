@@ -18,6 +18,7 @@ import { and, asc, desc, eq } from 'drizzle-orm';
 import { accounts, bills, vendorCredits, vendorCreditLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
+import { planPostedEdit, retitleEntry } from './postedEdit';
 import {
   type ServiceContext,
   ServiceError,
@@ -176,6 +177,143 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
 }
 
 // ---------------------------------------------------------------------------
+// updateVendorCredit — edit a saved vendor credit (D1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Edit a saved vendor credit in ONE transaction. A ledger-neutral edit (memo, line
+ * descriptions — same date, accounts and amounts) keeps the journal entry. Changing amounts,
+ * accounts, the vendor or the date voids the entry and re-posts it; that is only allowed while
+ * nothing of the credit has been applied to a bill or refunded (unapply first, like QB).
+ */
+export async function updateVendorCredit(ctx: ServiceContext, id: string, input: CreateVendorCreditInput) {
+  const [existing] = await ctx.db
+    .select()
+    .from(vendorCredits)
+    .where(and(eq(vendorCredits.id, id), eq(vendorCredits.companyId, ctx.companyId)));
+  if (!existing) throw notFound('Vendor credit');
+  if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided vendor credit.');
+
+  const [vendor] = await ctx.db
+    .select({ id: vendors.id, name: vendors.displayName })
+    .from(vendors)
+    .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
+  if (!vendor) throw notFound('Vendor');
+  if (!input.lines || input.lines.length === 0) {
+    throw validation('A vendor credit must have at least one line.');
+  }
+  let total = Money.zero();
+  for (const [i, line] of input.lines.entries()) {
+    const amt = Money.of(line.amount);
+    if (!amt.greaterThan(0)) throw validation(`Line ${i + 1}: amount must be greater than zero.`);
+    total = total.plus(amt);
+  }
+  const totalStr = toAmountString(total);
+  const apAccountId = await resolveApAccount(ctx);
+
+  const postingLines = [
+    { accountId: apAccountId, debit: totalStr, memo: `Vendor credit ${id}` },
+    ...input.lines.map((line) => ({
+      accountId: line.accountId,
+      credit: toAmountString(line.amount),
+      memo: line.description ?? null,
+    })),
+  ];
+
+  return inTransaction(ctx, async (tx) => {
+    const [cur] = await tx.db.select().from(vendorCredits).where(eq(vendorCredits.id, id));
+    if (!cur || cur.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided vendor credit.');
+    const oldLines = await tx.db
+      .select()
+      .from(vendorCreditLines)
+      .where(eq(vendorCreditLines.vendorCreditId, id))
+      .orderBy(asc(vendorCreditLines.lineOrder));
+
+    let plan = await planPostedEdit(tx, { entryId: cur.postedEntryId, date: input.date, lines: postingLines, what: 'vendor credit' });
+    if (plan === 'unchanged' && cur.vendorId !== input.vendorId) plan = 'repost';
+
+    let entryId = cur.postedEntryId;
+    if (plan === 'unchanged') {
+      await tx.db.update(vendorCredits).set({ memo: input.memo ?? null }).where(eq(vendorCredits.id, id));
+      await tx.db.delete(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, id));
+      await tx.db.insert(vendorCreditLines).values(
+        input.lines.map((line, idx) => ({
+          vendorCreditId: id,
+          accountId: line.accountId,
+          description: line.description ?? null,
+          amount: toAmountString(line.amount),
+          lineOrder: idx,
+        })),
+      );
+      await retitleEntry(tx, entryId, { description: `Vendor Credit — ${vendor.name}` });
+    } else {
+      const used = Money.of(cur.total).minus(Money.of(cur.unapplied));
+      if (used.greaterThan(0) || Money.of(cur.refundedAmount).greaterThan(0)) {
+        throw new ServiceError(
+          'CONFLICT',
+          'Part of this credit was already applied to a bill or refunded. Unapply it first, then change the amount or accounts.',
+        );
+      }
+      if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
+      await tx.db.delete(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, id));
+      await tx.db.insert(vendorCreditLines).values(
+        input.lines.map((line, idx) => ({
+          vendorCreditId: id,
+          accountId: line.accountId,
+          description: line.description ?? null,
+          amount: toAmountString(line.amount),
+          lineOrder: idx,
+        })),
+      );
+      const entry = await postJournalEntry(tx, {
+        date: input.date,
+        description: `Vendor Credit — ${vendor.name}`,
+        sourceRef: `vendor_credit:${id}`,
+        lines: postingLines,
+      });
+      entryId = entry.id;
+      await tx.db
+        .update(vendorCredits)
+        .set({
+          vendorId: input.vendorId,
+          date: input.date,
+          memo: input.memo ?? null,
+          total: totalStr,
+          unapplied: totalStr,
+          status: 'open',
+          postedEntryId: entry.id,
+        })
+        .where(eq(vendorCredits.id, id));
+    }
+
+    const [updated] = await tx.db.select().from(vendorCredits).where(eq(vendorCredits.id, id));
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'vendor_credit',
+      entityId: id,
+      oldValues: {
+        vendorId: cur.vendorId,
+        date: cur.date,
+        memo: cur.memo,
+        total: cur.total,
+        postedEntryId: cur.postedEntryId,
+        lines: oldLines.map((l) => ({ accountId: l.accountId, amount: l.amount, description: l.description })),
+      },
+      newValues: {
+        vendorId: input.vendorId,
+        date: input.date,
+        memo: input.memo ?? null,
+        total: updated.total,
+        ledger: plan === 'unchanged' ? 'unchanged' : 'reposted',
+        postedEntryId: entryId,
+        lines: input.lines,
+      },
+    });
+    return updated;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // listVendorCredits
 // ---------------------------------------------------------------------------
 
@@ -271,6 +409,14 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
   // Verify the credit and bill belong to the same vendor.
   if (credit.vendorId !== bill.vendorId) {
     throw validation('Vendor credit and bill must belong to the same vendor.');
+  }
+
+  // Vendor credits are recorded in home currency; a foreign-currency bill is settled through
+  // Pay Bills (which converts at the booked rate and posts realized exchange gain/loss).
+  if (bill.currency) {
+    throw validation(
+      `This bill is in ${bill.currency}. Home-currency vendor credits can't be applied to it — settle it with Pay Bills instead.`,
+    );
   }
 
   return inTransaction(ctx, async (tx) => {

@@ -78,6 +78,7 @@ export const navGroups: NavGroup[] = [
       { icon: PiggyBank, label: 'Deposits', path: '/deposits' },
       { icon: Banknote, label: 'Reconcile', path: '/reconcile' },
       { icon: ArrowLeftRight, label: 'Transfers', path: '/transfers' },
+      { icon: Landmark, label: 'Loan Manager', path: '/loans' },
     ],
   },
   {

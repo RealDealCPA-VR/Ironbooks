@@ -80,7 +80,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const payment = await payBills(ctx, parsed.data);
+    const { allowDuplicateNumber, ...input } = parsed.data;
+    const payment = await payBills(ctx, { ...input, checkDuplicateNumber: !allowDuplicateNumber });
 
     return NextResponse.json({ payment }, { status: 201 });
   } catch (err) {

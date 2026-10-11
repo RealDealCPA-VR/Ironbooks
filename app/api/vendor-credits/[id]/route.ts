@@ -14,7 +14,11 @@ import {
   unapplyFromBill,
   refundVendorCredit,
   voidVendorCredit,
+  updateVendorCredit,
 } from '@/lib/services/vendorCredits';
+import { routeError } from '@/lib/routeErrors';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createVendorCreditSchema } from '@/lib/validation/vendorCredits';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
@@ -105,5 +109,20 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err);
+  }
+}
+
+/** PATCH /api/vendor-credits/:id — edit a saved vendor credit (same body as POST /api/vendor-credits). */
+export async function PATCH(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json().catch(() => ({}));
+    const parsed = createVendorCreditSchema.safeParse(body);
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    const credit = await updateVendorCredit(ctx, id, parsed.data);
+    return NextResponse.json(credit);
+  } catch (err) {
+    return routeError(err, 'PATCH /api/vendor-credits/[id]');
   }
 }

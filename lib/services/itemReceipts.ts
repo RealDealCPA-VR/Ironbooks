@@ -65,6 +65,7 @@ import {
   writeAudit,
 } from './_base';
 import { adjustPoReceivedUnbilled, recomputePoStatus } from './receivingLinks';
+import { getHomeCurrencyCode } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Constants / types
@@ -313,17 +314,61 @@ async function reverseStock(
   });
 }
 
+/**
+ * Item receipts post at home-currency cost through the 2050 accrual and have no exchange rate,
+ * so a foreign-currency vendor's goods must be entered with a bill (which converts them).
+ */
+async function assertHomeCurrencyVendor(ctx: ServiceContext, vendorCurrency: string | null) {
+  if (!vendorCurrency) return;
+  const home = await getHomeCurrencyCode(ctx);
+  if (home && vendorCurrency.toUpperCase() === home) return;
+  throw validation(
+    `This vendor uses ${vendorCurrency}. Receive their items with Enter Bills (which converts to your home currency) instead of an item receipt.`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // createItemReceipt
 // ---------------------------------------------------------------------------
 
 export async function createItemReceipt(ctx: ServiceContext, input: CreateItemReceiptInput) {
+  return saveItemReceipt(ctx, input);
+}
+
+/**
+ * Edit a saved item receipt (wave2 D1) — allowed while nothing of it has been billed. In ONE
+ * transaction the old receipt is unwound exactly like a void (entry voided on its old date,
+ * stock pulled back out, site movements reversed, PO quantities released) and the new version
+ * is posted on the SAME receipt (same id, so FIFO layers / landed-cost links keep pointing at it).
+ */
+export async function updateItemReceipt(ctx: ServiceContext, id: string, input: CreateItemReceiptInput) {
+  const [receipt] = await ctx.db
+    .select()
+    .from(itemReceipts)
+    .where(and(eq(itemReceipts.id, id), eq(itemReceipts.companyId, ctx.companyId)));
+  if (!receipt) throw notFound('Item receipt');
+  if (receipt.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided item receipt.');
+  if (receipt.status !== 'open') {
+    throw new ServiceError(
+      'CONFLICT',
+      'This item receipt has been (partly) billed, so it can no longer be edited. Void the bill first.',
+    );
+  }
+  return saveItemReceipt(ctx, input, receipt);
+}
+
+async function saveItemReceipt(
+  ctx: ServiceContext,
+  input: CreateItemReceiptInput,
+  existing?: typeof itemReceipts.$inferSelect,
+) {
   // --- Validate vendor ---
   const [vendor] = await ctx.db
-    .select({ id: vendors.id, name: vendors.displayName })
+    .select({ id: vendors.id, name: vendors.displayName, currency: vendors.currency })
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
+  await assertHomeCurrencyVendor(ctx, vendor.currency);
 
   if (!input.lines || input.lines.length === 0) {
     throw validation('An item receipt must have at least one line.');
@@ -410,6 +455,38 @@ export async function createItemReceipt(ctx: ServiceContext, input: CreateItemRe
   const accrualAccountId = await getOrCreateAccrualAccount(ctx);
 
   return inTransaction(ctx, async (tx) => {
+    // --- Edit: unwind the saved version first (mirrors voidItemReceipt, minus the status flip) ---
+    let oldLines: Array<typeof itemReceiptLines.$inferSelect> = [];
+    if (existing) {
+      const [cur] = await tx.db.select().from(itemReceipts).where(eq(itemReceipts.id, existing.id));
+      if (!cur || cur.status !== 'open') {
+        throw new ServiceError('CONFLICT', 'This item receipt can no longer be edited (it was billed or voided).');
+      }
+      oldLines = await tx.db
+        .select()
+        .from(itemReceiptLines)
+        .where(eq(itemReceiptLines.itemReceiptId, existing.id))
+        .orderBy(asc(itemReceiptLines.lineOrder));
+      if (oldLines.some((l) => Money.of(l.quantityBilled ?? '0').greaterThan(0))) {
+        throw new ServiceError('CONFLICT', 'Part of this item receipt was already billed, so it can no longer be edited.');
+      }
+      await assertNoActiveLandedCost(tx, { itemReceiptId: existing.id });
+      if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
+      for (const line of oldLines) {
+        await reverseStock(tx, line.itemId, Money.of(line.quantity), Money.of(line.unitCost), `item_receipt_edit:${existing.id}`);
+      }
+      await reverseDocumentInventory(tx, 'item_receipt', existing.id);
+      if (cur.purchaseOrderId) {
+        await releaseReceiptQuantities(
+          tx,
+          cur.purchaseOrderId,
+          oldLines.map((l) => ({ itemId: l.itemId, quantity: l.quantity })),
+          { sourceRef: `item_receipt_edit:${existing.id}` },
+        );
+      }
+      await tx.db.delete(itemReceiptLines).where(eq(itemReceiptLines.itemReceiptId, existing.id));
+    }
+
     // --- Claim PO quantities first (guarded; throws before anything posts) ---
     if (input.purchaseOrderId) {
       await claimReceiptQuantities(
@@ -420,20 +497,22 @@ export async function createItemReceipt(ctx: ServiceContext, input: CreateItemRe
       );
     }
 
-    // --- Insert the receipt header ---
-    const [receipt] = await tx.db
-      .insert(itemReceipts)
-      .values({
-        companyId: tx.companyId,
-        vendorId: input.vendorId,
-        purchaseOrderId: input.purchaseOrderId ?? null,
-        date: input.date,
-        reference: input.reference ?? null,
-        status: 'open',
-        total: totalStr,
-        memo: input.memo ?? null,
-      })
-      .returning();
+    // --- Insert (or, on edit, rewrite) the receipt header ---
+    const header = {
+      vendorId: input.vendorId,
+      purchaseOrderId: input.purchaseOrderId ?? null,
+      date: input.date,
+      reference: input.reference ?? null,
+      status: 'open',
+      total: totalStr,
+      memo: input.memo ?? null,
+    };
+    const [receipt] = existing
+      ? await tx.db.update(itemReceipts).set(header).where(eq(itemReceipts.id, existing.id)).returning()
+      : await tx.db
+          .insert(itemReceipts)
+          .values({ companyId: tx.companyId, ...header })
+          .returning();
 
     // --- Insert lines ---
     const insertedLines = await tx.db
@@ -503,12 +582,22 @@ export async function createItemReceipt(ctx: ServiceContext, input: CreateItemRe
         };
       }),
       memo: `Item receipt ${input.reference ?? ''}`.trim(),
+      carryForward: Boolean(existing),
     });
 
     await writeAudit(tx, {
-      action: 'create',
+      action: existing ? 'update' : 'create',
       entityType: 'item_receipt',
       entityId: receipt.id,
+      oldValues: existing
+        ? {
+            vendorId: existing.vendorId,
+            date: existing.date,
+            total: existing.total,
+            postedEntryId: existing.postedEntryId,
+            lines: oldLines.map((l) => ({ itemId: l.itemId, quantity: l.quantity, unitCost: l.unitCost })),
+          }
+        : undefined,
       newValues: {
         vendorId: input.vendorId,
         purchaseOrderId: input.purchaseOrderId ?? null,
@@ -582,6 +671,8 @@ export async function convertToBill(
   if (receipt.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot convert a voided item receipt to a bill.');
   }
+  const [rv] = await ctx.db.select({ currency: vendors.currency }).from(vendors).where(eq(vendors.id, receipt.vendorId));
+  await assertHomeCurrencyVendor(ctx, rv?.currency ?? null);
 
   const lines = await ctx.db
     .select()
