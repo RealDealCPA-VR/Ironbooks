@@ -16,7 +16,7 @@ import { resolveDataDir, closeDb, type DB } from '@/lib/db';
 import {
   accounts, assemblyComponents, attachments, auditLogs, bankAccounts, bankTransactions,
   billLines, billPaymentApplications, billPayments, bills, budgetLines, budgets, classes,
-  companies, creditMemoLines, creditMemos, currencies, customerPrices, customers,
+  companies, companyRoles, creditMemoLines, creditMemos, currencies, customerPrices, customers,
   depositLines, deposits, depreciationEntries, employees, errorCorrections, errorDetections,
   estimateLines, estimates, expenseLines, expenseReportLines, expenseReports, expenses,
   fileImports, fiscalPeriods, fixedAssets, inventoryLayers, invoiceLines, invoices, items,
@@ -519,8 +519,18 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
     name: 'errorCorrections', table: errorCorrections, companyCol: errorDetections.companyId,
     joins: [{ table: errorDetections, on: [errorCorrections.errorDetectionId, errorDetections.id] }],
   },
+  // Custom roles (Users & Roles) travel with the company; assignments do not, because users are
+  // machine-local and the restoring user becomes the sole (Admin) member.
+  { name: 'companyRoles', table: companyRoles, joins: [], companyCol: companyRoles.companyId },
   { name: 'auditLogs', table: auditLogs, joins: [], companyCol: auditLogs.companyId },
 ];
+
+/**
+ * Opaque "soft pointer" columns: they may name rows that are not exported (users, the company
+ * itself, deleted records), so they are remapped when possible and otherwise kept verbatim —
+ * never treated as a hard foreign key.
+ */
+const SOFT_REF_KEYS: Record<string, Set<string>> = { auditLogs: new Set(['entityId']) };
 
 /** Columns that reference users.id — users are NOT exported, so on restore these map to the restoring user. */
 const USER_REF_KEYS = new Set([
@@ -665,6 +675,7 @@ function reviveRow(
   idMap: Map<string, string>,
   newCompanyId: string,
   ownerId: string,
+  oldCompanyId?: string,
 ): Record<string, unknown> {
   const cols = getTableColumns(spec.table) as Record<
     string,
@@ -684,6 +695,11 @@ function reviveRow(
         if (key === 'companyId') v = newCompanyId;
         else if (USER_REF_KEYS.has(key)) v = ownerId;
         else if (idMap.has(v)) v = idMap.get(v)!;
+        else if (SOFT_REF_KEYS[spec.name]?.has(key)) {
+          // Audit trail entity pointer: the company itself → the new company; anything else
+          // (a user, a deleted record) keeps its original id as historical information.
+          if (oldCompanyId && v === oldCompanyId) v = newCompanyId;
+        }
         else if (col.notNull) {
           // A required reference points outside this company's data — the backup
           // is corrupt (cross-company leak). Refuse rather than guess.
@@ -766,7 +782,7 @@ export async function restoreCompanyBackup(
     for (const spec of COMPANY_TABLES) {
       let rows = data.tables[spec.name] ?? [];
       if (spec.selfParentKey) rows = topoSortByParent(rows, spec.selfParentKey);
-      const revived = rows.map((r) => reviveRow(spec, r, idMap, company.id, opts.ownerId));
+      const revived = rows.map((r) => reviveRow(spec, r, idMap, company.id, opts.ownerId, data.company.id));
       // Chunked inserts keep parameter counts well under PG limits.
       for (let i = 0; i < revived.length; i += 200) {
         await tx.insert(spec.table).values(revived.slice(i, i + 200) as never);

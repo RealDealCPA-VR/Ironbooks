@@ -107,12 +107,17 @@ export async function definitionsFor(
   return out;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /** Resolve a user's effective access in a company. */
 export async function resolveAccess(
   db: DB,
   companyId: string,
   userId: string,
 ): Promise<ResolvedAccess> {
+  if (!UUID_RE.test(companyId) || !UUID_RE.test(userId)) {
+    return { access: unionRoles([]), member: false, active: false, isOwner: false };
+  }
   const [company] = await db
     .select({ ownerId: companies.ownerId })
     .from(companies)
@@ -242,6 +247,10 @@ export async function requireAccessInCompany(
   action: Action,
 ): Promise<EffectiveAccess> {
   if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
+  // A malformed id would make Postgres throw 22P02 on the uuid comparison (→ 500); refuse it.
+  if (!UUID_RE.test(companyId)) {
+    throw new ServiceError('FORBIDDEN', 'You do not have access to that company.');
+  }
   const r = await resolveAccess(ctx.db, companyId, ctx.userId);
   if (!r.member || !r.active) {
     throw new ServiceError('FORBIDDEN', 'You do not have access to that company.');

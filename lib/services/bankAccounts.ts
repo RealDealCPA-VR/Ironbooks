@@ -6,6 +6,7 @@ import { and, eq } from 'drizzle-orm';
 import { accounts, bankAccounts } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { maskForContext } from './access';
+import { isMaskedValue } from '@/lib/permissions/mask';
 
 // Account numbers leave this service masked (last 4 only) unless the caller's roles grant
 // "view full bank / account numbers" (Users & Roles); see maskForContext.
@@ -42,6 +43,11 @@ export async function createBankAccount(
   input: { accountId: string; bankName: string; accountNumber: string },
 ) {
   if (!input.bankName?.trim()) throw validation('Bank name is required.');
+  // A role without "view full account numbers" only ever sees "••••6789"; never store that
+  // placeholder as if it were the real number.
+  if (isMaskedValue(input.accountNumber)) {
+    throw validation('Enter the full account number (a masked number cannot be saved).');
+  }
   // The GL account must belong to this company and be an asset/liability (bank or credit card).
   const [gl] = await ctx.db
     .select()
