@@ -5,13 +5,13 @@
  * Accessible tooltip/disclosure: opens on hover, keyboard focus or click/tap; Escape closes;
  * the trigger has an aria-label ("What is Accounts Receivable (A/R)?") and points at the
  * bubble with aria-describedby while it is open. Definitions live in lib/glossary.ts; the
- * bubble links to the full entry on /help.
+ * bubble links to the full entry on /help in a NEW window, so following it from inside a
+ * modal form (journal entry, reconcile) never discards unsaved work.
  *
  *   <Label>Deposit to <Help term="undeposited-funds" /></Label>
  *   <Help term="ar">A/R</Help>   // renders the text with a dotted underline + the "?" icon
  */
 import * as React from 'react';
-import Link from 'next/link';
 import { HelpCircle } from 'lucide-react';
 import { GLOSSARY, glossaryAnchor, type GlossaryEntry, type GlossaryKey } from '@/lib/glossary';
 import { cn } from '@/lib/utils';
@@ -105,15 +105,18 @@ export function Help({
         >
           <span className="block font-semibold text-sm mb-1">{entry.term}</span>
           <span className="block text-white/85">{entry.short}</span>
-          <Link
+          <a
             href={`/help#${glossaryAnchor(term)}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={`Learn more about ${entry.term} (opens in a new window)`}
             className="mt-2 inline-block font-semibold text-sky-300 hover:underline outline-none focus-visible:ring-2 focus-visible:ring-sky-300/60 rounded"
             onBlur={(e) => {
               if (!pinned && !wrapRef.current?.contains(e.relatedTarget as Node)) setOpen(false);
             }}
           >
             Learn more
-          </Link>
+          </a>
         </span>
       )}
     </span>

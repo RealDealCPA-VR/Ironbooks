@@ -11,6 +11,10 @@
  *   - `nextSteps`: links for the "what now?" checklist on the finish screen.
  *
  * No schema changes: everything goes through existing APIs.
+ *
+ * Known gap: "Do you charge sales tax?" switches on no preference — there is no sales-tax
+ * key in COMPANY_SETTINGS_KEYS and this team may not add settings/schema. A "yes" only adds
+ * the "Set up sales tax rates" next step (tax applies per item/rate once rates exist).
  */
 
 export type BusinessType =
@@ -285,7 +289,7 @@ export function buildSetupPlan(
     `${bt.label} chart of accounts${accounts.length ? ` (+${accounts.length} account${accounts.length === 1 ? '' : 's'})` : ''}`,
     `Fiscal year ends ${settings.fiscalYearEnd as string}`,
     `Reports on ${answers.reportBasis === 'cash' ? 'cash' : 'accrual'} basis (you can switch any report later)`,
-    answers.salesTax ? 'Sales tax: on' : 'Sales tax: off',
+    answers.salesTax ? 'Sales tax: set up your tax rates next (see below)' : 'Sales tax: not charged',
     answers.inventory ? 'Inventory tracking: on (warns before overselling)' : 'Inventory tracking: off',
     answers.employees ? 'Payroll: on (bi-weekly, 40-hour default)' : 'Payroll: off',
   ];

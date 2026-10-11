@@ -35,7 +35,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
-import { computeJournalBalance } from '@/lib/journalBalance';
+import { computeJournalBalance, journalPayloadAmount } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { useNewParam } from '@/lib/useFocusParam';
@@ -223,8 +223,9 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           .filter((l) => l.accountId)
           .map((l) => ({
             accountId: l.accountId,
-            debit: l.debit ? l.debit : undefined,
-            credit: l.credit ? l.credit : undefined,
+            // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
+            debit: journalPayloadAmount(l.debit),
+            credit: journalPayloadAmount(l.credit),
             memo: l.memo.trim() || null,
             classId: l.classId || null,
           })),

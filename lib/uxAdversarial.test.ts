@@ -26,7 +26,7 @@ import { createJournalEntrySchema } from '@/lib/validation/journal';
 import { companySettingsSchema } from '@/lib/validation/company';
 import { ApiError } from './client';
 import { describeError, humanizeFieldMessage } from './friendlyErrors';
-import { computeJournalBalance, type JournalLineInput } from './journalBalance';
+import { computeJournalBalance, journalPayloadAmount, type JournalLineInput } from './journalBalance';
 import { matchIntents } from './nav-actions';
 import { GLOSSARY } from './glossary';
 import { allWorkflowHrefs, buildAccountBalances, HOME_WORKFLOW } from './homeWorkflow';
@@ -69,8 +69,8 @@ function pagePayload(lines: JournalLineInput[]) {
       .filter((l) => l.accountId)
       .map((l) => ({
         accountId: l.accountId,
-        debit: l.debit ? l.debit : undefined,
-        credit: l.credit ? l.credit : undefined,
+        debit: journalPayloadAmount(l.debit),
+        credit: journalPayloadAmount(l.credit),
         memo: null,
         classId: null,
       })),
@@ -342,7 +342,7 @@ describe('Help tooltip usage', () => {
   });
 
   it('the key money forms explain their jargon with <Help>', () => {
-    for (const page of ['invoices', 'payments', 'deposits', 'bills', 'journal', 'reconcile']) {
+    for (const page of ['invoices', 'payments', 'deposits', 'bills', 'pay-bills', 'expenses', 'bank-feeds', 'journal', 'reconcile']) {
       const src = fs.readFileSync(path.join(ROOT, 'app', page, 'page.tsx'), 'utf8');
       expect(/<Help[\s>]/.test(src), `app/${page}/page.tsx has no <Help>`).toBe(true);
     }

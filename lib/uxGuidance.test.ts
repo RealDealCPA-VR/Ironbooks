@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { GLOSSARY, GLOSSARY_KEYS, glossaryAnchor, lookupTerm } from './glossary';
 import { matchIntents, navIntents } from './nav-actions';
-import { computeJournalBalance } from './journalBalance';
+import { computeJournalBalance, journalPayloadAmount, normalizeAmount } from './journalBalance';
 import { allWorkflowHrefs, buildAccountBalances, HOME_WORKFLOW } from './homeWorkflow';
 
 const APP_DIR = path.resolve(__dirname, '..', 'app');
@@ -163,6 +163,22 @@ describe('computeJournalBalance', () => {
     const b = computeJournalBalance([line('a', '0'), line('b', '', '0')]);
     expect(b.balanced).toBe(false);
     expect(b.canSave).toBe(false);
+  });
+
+  it('blocks a line with both a debit and a credit, with a plain-language reason', () => {
+    const b = computeJournalBalance([line('a', '10', '5'), line('b', '', '5')]);
+    expect(b.canSave).toBe(false);
+    expect(b.invalidLines).toEqual([1]);
+    expect(b.blocker).toMatch(/Line 1 has both a debit and a credit/);
+    // A zero on the other side is not "both sides".
+    expect(computeJournalBalance([line('a', '5', '0'), line('b', '', '5')]).canSave).toBe(true);
+  });
+
+  it('the payload amount is exactly the string the Save gate validated', () => {
+    expect(normalizeAmount(' 1,250.00 ')).toBe('1250.00');
+    expect(journalPayloadAmount(' 7.25 ')).toBe('7.25');
+    expect(journalPayloadAmount('  ')).toBeUndefined();
+    expect(journalPayloadAmount(null)).toBeUndefined();
   });
 });
 

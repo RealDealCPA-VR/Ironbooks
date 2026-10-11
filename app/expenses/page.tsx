@@ -34,6 +34,7 @@ import {
   toast, toastError,
   useGridKeys,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -401,7 +402,9 @@ function ExpensesPageContent() {
           </div>
 
           <div>
-            <Label htmlFor="exp-account">{isCC ? 'Credit Card Account *' : 'Bank Account *'}</Label>
+            <Label htmlFor="exp-account" required>
+              {isCC ? 'Credit Card Account' : 'Bank Account'} <Help term="reconcile" side="bottom" />
+            </Label>
             <Select
               id="exp-account"
               value={paymentAccountId}
@@ -476,8 +479,9 @@ function ExpensesPageContent() {
         {/* Lines grid */}
         <div>
           <div className="flex items-center justify-between mb-2">
-            <Label className="mb-0">
-              {entryType === 'cc_credit' ? 'Refunded Expense Lines *' : 'Expense Lines *'}
+            <Label className="mb-0" required>
+              {entryType === 'cc_credit' ? 'Refunded Expense Lines' : 'Expense Lines'}{' '}
+              <Help term="chart-of-accounts" />
             </Label>
             <button
               type="button"

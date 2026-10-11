@@ -26,6 +26,7 @@ import {
   Tr,
   toast, toastError,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { describeError } from '@/lib/friendlyErrors';
 import { formatCurrency } from '@/lib/money';
@@ -327,7 +328,7 @@ export default function PayBillsPage() {
       <Card className="mb-6">
         <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
           <div className="lg:col-span-2">
-            <Label htmlFor="pb-vendor" required>Vendor</Label>
+            <Label htmlFor="pb-vendor" required>Vendor <Help term="ap" side="bottom" /></Label>
             <Select id="pb-vendor" value={vendorId} onChange={(e) => setVendorId(e.target.value)}>
               <option value="">Select vendor…</option>
               {vendors.map((v) => (

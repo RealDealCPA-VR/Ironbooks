@@ -28,6 +28,7 @@ import {
   Badge,
   toast, toastError,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { format, parseISO } from 'date-fns';
@@ -251,7 +252,9 @@ export default function BankFeedsPage() {
           <h2 className="text-lg font-bold text-navy mb-1">No live connection needed</h2>
           <p className="text-sm text-navy/60 mb-4">
             Download a statement file (CSV, OFX or QFX) from your bank&apos;s website and import it.
-            Your data stays on this computer. Then review each transaction and choose where it belongs.
+            Your data stays on this computer. Then review each transaction and choose where it belongs
+            (its account in the chart of accounts <Help term="chart-of-accounts" side="bottom" />), and
+            reconcile <Help term="reconcile" side="bottom" /> against the statement at month end.
           </p>
           <div className="flex flex-wrap gap-2">
             <Link href="/banking" className="inline-flex items-center justify-center gap-2 rounded-lg font-semibold bg-electric text-white hover:bg-electric/90 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1 px-4 py-2 text-sm">
@@ -336,7 +339,9 @@ export default function BankFeedsPage() {
 
         <div className="flex flex-wrap items-end gap-4">
           <div className="flex-1 min-w-[220px]">
-            <Label htmlFor="bank-account-select">Target bank account</Label>
+            <Label htmlFor="bank-account-select">
+              Target bank account <Help term="reconcile" side="bottom" />
+            </Label>
             {bankAccounts.length === 0 ? (
               <p className="text-sm text-navy/50 mt-1">
                 No bank accounts found.{' '}

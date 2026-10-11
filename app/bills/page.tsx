@@ -24,6 +24,7 @@ import {
   toast, toastError,
   useGridKeys,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -443,6 +444,12 @@ export default function BillsPage() {
         }
       />
 
+      <p className="-mt-4 mb-4 text-sm text-navy/60">
+        A bill is money you owe a vendor. Until you pay it, it sits in Accounts Payable{' '}
+        <Help term="ap" side="bottom" />. Pay it from{' '}
+        <Link href="/pay-bills" className="text-electric underline">Pay Bills</Link>.
+      </p>
+
       <Card className="p-0 overflow-hidden">
         {loading ? (
           <div className="p-12 flex items-center justify-center gap-2 text-navy/40 text-sm">
@@ -547,7 +554,7 @@ export default function BillsPage() {
           )}
           {/* Vendor */}
           <div>
-            <Label htmlFor="bill-vendor" required>Vendor</Label>
+            <Label htmlFor="bill-vendor" required>Vendor <Help term="ap" /></Label>
             <Select
               id="bill-vendor"
               autoFocus

@@ -21,7 +21,8 @@ export interface JournalBalance {
   /** totalDebits - totalCredits (2dp string; negative when credits are larger). */
   difference: string;
   balanced: boolean;
-  /** Lines (1-based) whose amount is not a valid money number (e.g. "12.3.4", "-5"). */
+  /** Lines (1-based) whose amount is not a valid money number (e.g. "12.3.4", "-5"), or that
+   *  have both a debit and a credit. */
   invalidLines: number[];
   /** Lines with an amount but no account, or an account with no amount. */
   incompleteLines: number[];
@@ -35,8 +36,23 @@ export interface JournalBalance {
 
 const AMOUNT_RE = /^\d+(\.\d{1,2})?$/;
 
+/**
+ * Canonical form of a typed amount: trimmed, thousands separators removed ("1,250.00 " ->
+ * "1250.00"). The Save gate validates THIS string and the page must send THIS string (see
+ * journalPayloadAmount) — otherwise the form could show "Balanced" for text the API rejects.
+ */
+export function normalizeAmount(raw: string | null | undefined): string {
+  return (raw ?? '').trim().replace(/,/g, '');
+}
+
+/** Amount as sent to /api/journal-entries: normalized, or undefined when blank. */
+export function journalPayloadAmount(raw: string | null | undefined): string | undefined {
+  const s = normalizeAmount(raw);
+  return s ? s : undefined;
+}
+
 function parseAmount(raw: string): Decimal | null | 'invalid' {
-  const s = raw.trim().replace(/,/g, '');
+  const s = normalizeAmount(raw);
   if (!s) return null;
   if (!AMOUNT_RE.test(s)) return 'invalid';
   return new Decimal(s);
@@ -47,12 +63,16 @@ export function computeJournalBalance(lines: JournalLineInput[]): JournalBalance
   let credits = new Decimal(0);
   const invalidLines: number[] = [];
   const incompleteLines: number[] = [];
+  const twoSidedLines: number[] = [];
   let accountLines = 0;
 
   lines.forEach((l, i) => {
     const d = parseAmount(l.debit);
     const c = parseAmount(l.credit);
-    if (d === 'invalid' || c === 'invalid') invalidLines.push(i + 1);
+    // postJournalEntry rejects a line carrying both a debit and a credit.
+    const twoSided = d instanceof Decimal && !d.isZero() && c instanceof Decimal && !c.isZero();
+    if (twoSided) twoSidedLines.push(i + 1);
+    if (d === 'invalid' || c === 'invalid' || twoSided) invalidLines.push(i + 1);
     if (d instanceof Decimal) debits = debits.plus(d);
     if (c instanceof Decimal) credits = credits.plus(c);
     const hasAmount =
@@ -66,7 +86,11 @@ export function computeJournalBalance(lines: JournalLineInput[]): JournalBalance
 
   let blocker: string | null = null;
   if (invalidLines.length) {
-    blocker = `Line ${invalidLines[0]} has an amount that isn’t a number (use digits like 125.50).`;
+    const n = invalidLines[0];
+    const bothSides = twoSidedLines.includes(n);
+    blocker = bothSides
+      ? `Line ${n} has both a debit and a credit. Use one side per line (split it into two lines).`
+      : `Line ${n} has an amount that isn’t a number (use digits like 125.50).`;
   } else if (accountLines < 2) {
     blocker = 'Choose an account on at least two lines.';
   } else if (incompleteLines.length) {
