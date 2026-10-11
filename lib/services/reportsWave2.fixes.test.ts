@@ -7,12 +7,16 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { companies, userCompanies, users } from '@/lib/db/schema';
+import { companies, memorizedReports, reportSchedules, userCompanies, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { postJournalEntry } from './posting';
 import { isStandardReport, runStandardReport } from './reportRegistry';
+import { eq } from 'drizzle-orm';
 import {
+  createReportSchedule,
+  updateMemorizedReport,
+  updateReportSchedule,
   deleteMemorizedReport,
   listMemorizedGroups,
   nextRunAfter,
@@ -95,6 +99,33 @@ describe('monthly schedule anchor', () => {
     const apr = nextRunAfter(mar, 'monthly', 31);
     expect(apr.toISOString().slice(0, 10)).toBe('2026-04-30');
     expect(nextRunAfter(new Date('2026-01-30T06:00:00.000Z'), 'monthly', 30).toISOString().slice(0, 10)).toBe('2026-02-28');
+  });
+});
+
+describe('schedule anchor on frequency change', () => {
+  it('switching weekly to monthly anchors on the next run day; legacy null anchors are filled', async () => {
+    const m = await saveMemorizedReport(ctx, { name: 'Sched TB', reportType: 'trial-balance', config: {} });
+    const s = await createReportSchedule(ctx, { name: 'Weekly TB', memorizedReportId: m.id, frequency: 'weekly', startDate: '2026-01-05' });
+    expect(s.anchorDay).toBe(5);
+    await db.update(reportSchedules).set({ nextRunAt: new Date('2026-01-31T06:00:00.000Z'), anchorDay: null }).where(eq(reportSchedules.id, s.id));
+    const u = await updateReportSchedule(ctx, s.id, { frequency: 'monthly' });
+    expect(u.anchorDay).toBe(31);
+    // Rename only keeps an existing anchor.
+    const r = await updateReportSchedule(ctx, s.id, { name: 'Monthly TB' });
+    expect(r.anchorDay).toBe(31);
+  });
+});
+
+describe('legacy memorized rows (unknown report type)', () => {
+  it('owner can rename and delete; a no-report user still cannot', async () => {
+    const [legacy] = await db.insert(memorizedReports).values({ companyId: ctx.companyId, name: 'Old', reportType: 'pl_v1', config: {} }).returning();
+    const none = fullAccess();
+    for (const k of Object.keys(none.permissions) as (keyof typeof none.permissions)[]) {
+      if (String(k).startsWith('reports_') || k === 'time') none.permissions[k] = [];
+    }
+    await expect(deleteMemorizedReport({ ...ctx, access: none }, legacy.id)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(updateMemorizedReport(ctx, legacy.id, { name: 'Old (renamed)' })).resolves.toMatchObject({ name: 'Old (renamed)' });
+    await expect(deleteMemorizedReport(ctx, legacy.id)).resolves.toMatchObject({ deleted: true });
   });
 });
 

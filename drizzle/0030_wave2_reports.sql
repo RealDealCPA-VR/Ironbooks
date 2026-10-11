@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS "report_schedules" (
 --> statement-breakpoint
 ALTER TABLE "report_schedules" ADD COLUMN IF NOT EXISTS "anchor_day" integer;
 --> statement-breakpoint
+UPDATE "report_schedules" SET "anchor_day" = EXTRACT(DAY FROM "next_run_at")::integer WHERE "anchor_day" IS NULL;
+--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "report_schedules_due_idx" ON "report_schedules" ("company_id", "is_active", "next_run_at");
 --> statement-breakpoint
 ALTER TABLE "budgets" ADD COLUMN IF NOT EXISTS "kind" varchar(20) DEFAULT 'profit_loss' NOT NULL;

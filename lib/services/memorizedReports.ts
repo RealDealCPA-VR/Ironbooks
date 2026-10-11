@@ -37,6 +37,20 @@ function requireReportTypeAccess(ctx: ServiceContext, reportType: string): void 
   requirePermission(ctx, area, 'view');
 }
 
+/**
+ * Gate for changing or removing an existing row. Rows saved before report types were validated
+ * may carry a type no longer in the catalog; they can't be run (NOT_FOUND), so they expose no data,
+ * and anyone with report access may rename, move or delete them instead of being stuck forever.
+ */
+function requireExistingRowAccess(ctx: ServiceContext, reportType: string): void {
+  const area = typeof reportType === 'string' ? areaForReportType(reportType) : undefined;
+  if (!area) {
+    requireAnyReportAccess(ctx);
+    return;
+  }
+  requirePermission(ctx, area, 'view');
+}
+
 // ---------------------------------------------------------------------------
 // Memorized reports
 // ---------------------------------------------------------------------------
@@ -107,7 +121,7 @@ export async function updateMemorizedReport(
   requireAnyReportAccess(ctx);
   const before = await getMemorized(ctx, id);
   // Only someone who may run this report can rename, move or re-point it.
-  requireReportTypeAccess(ctx, before.reportType);
+  requireExistingRowAccess(ctx, before.reportType);
   if (patch.name !== undefined && !patch.name.trim()) throw validation('Report name is required.');
   if (patch.groupId !== undefined) await assertGroup(ctx, patch.groupId);
   return inTransaction(ctx, async (tx) => {
@@ -135,7 +149,7 @@ export async function updateMemorizedReport(
 export async function deleteMemorizedReport(ctx: ServiceContext, id: string) {
   requireAnyReportAccess(ctx);
   const row = await getMemorized(ctx, id);
-  requireReportTypeAccess(ctx, row.reportType);
+  requireExistingRowAccess(ctx, row.reportType);
   return inTransaction(ctx, async (tx) => {
     // Schedules that run this report go with it.
     await tx.db.delete(reportSchedules).where(and(eq(reportSchedules.companyId, tx.companyId), eq(reportSchedules.memorizedReportId, id)));
@@ -408,12 +422,18 @@ export async function updateReportSchedule(
 ) {
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
+  // Monthly schedules run on an anchor day of month. Keep it when frequency is unchanged (and set);
+  // otherwise derive it from the next scheduled run so a switch to monthly doesn't drift.
+  const frequency = patch.frequency ?? before.frequency;
+  const anchorDay =
+    frequency === before.frequency && before.anchorDay ? before.anchorDay : new Date(before.nextRunAt).getUTCDate();
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
       .update(reportSchedules)
       .set({
         name: patch.name?.trim() || before.name,
-        frequency: patch.frequency ?? before.frequency,
+        frequency,
+        anchorDay,
         isActive: patch.isActive ?? before.isActive,
         format: patch.format ?? before.format,
       })
