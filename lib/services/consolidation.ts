@@ -274,7 +274,25 @@ export async function combinedTrialBalance(ctx: ServiceContext, p: ReportParams)
     return c;
   };
   const tree = buildAccountTree({ meta, amounts, ncols: n, idPrefix: 'ctb', parentRowId: null, depth: 0, cells });
-  tree.rows.push({ id: 'ctb:total', depth: 0, kind: 'grand', cells: { label: 'TOTAL', total_dr: toAmountString(totalDebit), total_cr: toAmountString(totalCredit) } });
+  // TOTAL row = sum of the rows shown: each account's net per column lands in Debit or Credit,
+  // so (e.g.) an overdrawn bank in one company nets against the other's balance in Combined.
+  const colDr = zeros(n);
+  const colCr = zeros(n);
+  for (const v of amounts.values()) {
+    v.forEach((x, i) => {
+      if (x.greaterThan(0)) colDr[i] = colDr[i].plus(x);
+      else if (x.lessThan(0)) colCr[i] = colCr[i].plus(x.negated());
+    });
+  }
+  for (let i = 0; i < n; i++) {
+    assertTrialBalanceBalanced(i === n - 1 ? 'Combined trial balance (combined column)' : `Combined trial balance (${cos[i].name})`, colDr[i], colCr[i]);
+  }
+  const totalCells: Record<string, CellValue> = { label: 'TOTAL' };
+  for (let i = 0; i < n; i++) {
+    totalCells[`${colKey(i)}_dr`] = toAmountString(colDr[i]);
+    totalCells[`${colKey(i)}_cr`] = toAmountString(colCr[i]);
+  }
+  tree.rows.push({ id: 'ctb:total', depth: 0, kind: 'grand', cells: totalCells });
   const columns: StdColumn[] = [{ key: 'label', header: '' }];
   for (let i = 0; i < n; i++) {
     const name = i === n - 1 ? 'Combined' : cos[i].name;
@@ -286,7 +304,7 @@ export async function combinedTrialBalance(ctx: ServiceContext, p: ReportParams)
     subtitle: `As of ${fmtDay(asOf)} · ${cos.length} companies`,
     columns,
     rows: tree.rows,
-    balanced: balanced && Money.eq(totalDebit, totalCredit),
+    balanced: balanced && Money.eq(totalDebit, totalCredit) && Money.eq(colDr[n - 1], colCr[n - 1]),
   };
 }
 

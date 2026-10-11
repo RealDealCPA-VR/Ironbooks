@@ -1661,6 +1661,8 @@ export const reportSchedules = pgTable('report_schedules', {
   /** daily | weekly | monthly */
   frequency: varchar('frequency', { length: 20 }).notNull(),
   nextRunAt: timestamp('next_run_at').notNull(),
+  /** Day of month a monthly schedule is anchored to (31 = month end), so Feb 28 doesn't drift later months. */
+  anchorDay: integer('anchor_day'),
   /** csv | xlsx */
   format: varchar('format', { length: 10 }).notNull().default('csv'),
   /** Sub-folder (inside the company's report-export folder) the files are written to. */

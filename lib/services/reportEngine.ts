@@ -1312,12 +1312,18 @@ export interface DetailLayoutOptions {
   hrefForGroup?: (key: string) => string | undefined;
 }
 
+/**
+ * Sort key that puts unnamed groups ("(no name)", "Unclassified") after every named group.
+ * A "~" sentinel doesn't work: localeCompare orders punctuation before letters.
+ */
+const blankLast = (s: string | null | undefined) => (s ? `0|${s.toLowerCase()}` : '1|');
+
 function groupKeyOf(l: GlLine, g: GroupKey): { key: string; label: string; sort: string } {
   switch (g) {
     case 'account':
       return { key: l.accountId, label: l.account.fullName, sort: `${l.account.code}|${l.account.fullName}` };
     case 'name':
-      return { key: l.nameId ?? '', label: l.name || '(no name)', sort: (l.name || '~').toLowerCase() };
+      return { key: l.nameId ?? '', label: l.name || '(no name)', sort: blankLast(l.name) };
     case 'type':
       return { key: l.txnType, label: l.type, sort: l.type };
     case 'month': {
@@ -1325,7 +1331,7 @@ function groupKeyOf(l: GlLine, g: GroupKey): { key: string; label: string; sort:
       return { key: k, label: `${MONTHS[Number(k.slice(5, 7)) - 1]} ${k.slice(0, 4)}`, sort: k };
     }
     case 'class':
-      return { key: l.classId ?? '', label: l.className || 'Unclassified', sort: (l.className || '~').toLowerCase() };
+      return { key: l.classId ?? '', label: l.className || 'Unclassified', sort: blankLast(l.className) };
     default:
       return { key: 'all', label: 'All', sort: '' };
   }

@@ -71,14 +71,38 @@ export const rangeLabel = (from: Date, to: Date) => `${fmtDay(from)} – ${fmtDa
 const pct = (num: Decimal, den: Decimal): CellValue =>
   den.isZero() ? null : num.dividedBy(den.abs()).times(100).toFixed(2);
 
-function shiftYears(d: Date, years: number): Date {
-  const out = new Date(d);
-  out.setUTCFullYear(out.getUTCFullYear() + years);
-  return out;
+const lastDayOfMonth = (y: number, m: number) => new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+const isMonthEnd = (d: Date) => d.getUTCDate() === lastDayOfMonth(d.getUTCFullYear(), d.getUTCMonth());
+
+/**
+ * Move a date by whole months without rolling over: the day is clamped to the target month
+ * (Mar 31 − 1 month = Feb 28, Feb 29 − 12 months = Feb 28) and a month-end date stays a month
+ * end (Feb 28 − 1 month = Jan 31). Time of day is kept.
+ */
+function shiftMonths(d: Date, months: number): Date {
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth() + months;
+  const ty = y + Math.floor(m / 12);
+  const tm = ((m % 12) + 12) % 12;
+  const last = lastDayOfMonth(ty, tm);
+  const day = isMonthEnd(d) ? last : Math.min(d.getUTCDate(), last);
+  return new Date(Date.UTC(ty, tm, day, d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds()));
 }
 
-/** The period of equal length immediately before [from, to]. */
+function shiftYears(d: Date, years: number): Date {
+  return shiftMonths(d, years * 12);
+}
+
+/**
+ * The period immediately before [from, to]. A range of whole calendar months (1st through a
+ * month end) compares with the same number of whole months before it, like QuickBooks
+ * (September vs August, Q2 vs Q1); any other range uses the equal-length window just before it.
+ */
 function previousPeriod(from: Date, to: Date): { from: Date; to: Date } {
+  if (from.getUTCDate() === 1 && isMonthEnd(to)) {
+    const months = (to.getUTCFullYear() - from.getUTCFullYear()) * 12 + (to.getUTCMonth() - from.getUTCMonth()) + 1;
+    if (months >= 1) return { from: shiftMonths(from, -months), to: shiftMonths(to, -months) };
+  }
   const len = to.getTime() - from.getTime();
   const prevTo = new Date(from.getTime() - 1);
   return { from: new Date(prevTo.getTime() - len), to: prevTo };
@@ -408,7 +432,14 @@ function buildBSRows(
       if (opts.summary) {
         for (const v of m.values()) addInto(t, v);
         if (!reAccount) addInto(t, priorYears);
-        rows.push({ id: 'bs:equity:accounts', parentId: 'bs:equity', depth: 2, kind: 'data', cells: cells('Equity accounts', t) });
+        rows.push({
+          id: 'bs:equity:accounts',
+          parentId: 'bs:equity',
+          depth: 2,
+          kind: 'data',
+          cells: cells('Equity accounts', t),
+          href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: 'equity' }),
+        });
       } else {
         const tree = buildAccountTree({ meta, amounts: m, ncols: n, idPrefix: 'bs:equity', parentRowId: 'bs:equity', depth: 2, cells, hrefFor });
         rows.push(...tree.rows);
@@ -492,8 +523,7 @@ export async function balanceSheetReport(
     if (p.compare && p.compare !== 'none') {
       let prior = p.priorAsOf ? parseDay(p.priorAsOf, true)! : shiftYears(asOf, -1);
       if (!p.priorAsOf && p.compare === 'prev_period') {
-        prior = new Date(asOf);
-        prior.setUTCMonth(prior.getUTCMonth() - 1);
+        prior = shiftMonths(asOf, -1);
       }
       cols.push({ key: 'prev', header: fmtDay(prior), asOf: prior, bs: await balanceSheet(ctx, prior) });
       extraCols.push({ key: 'chg', header: '$ Change', type: 'money' }, { key: 'pctchg', header: '% Change', type: 'percent' });

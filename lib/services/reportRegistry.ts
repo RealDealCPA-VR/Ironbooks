@@ -130,7 +130,12 @@ export const REPORT_RUNNERS: Record<string, Runner> = {
 
 /** True when `key` is a runnable standard report. */
 export function isStandardReport(key: string): boolean {
-  return key in REPORT_RUNNERS && key in CATALOG_BY_KEY;
+  return typeof key === 'string' && Object.hasOwn(REPORT_RUNNERS, key) && Object.hasOwn(CATALOG_BY_KEY, key);
+}
+
+/** Catalog entry for a runnable standard report key (own keys only — never prototype members). */
+export function standardReportEntry(key: string) {
+  return isStandardReport(key) ? CATALOG_BY_KEY[key] : undefined;
 }
 
 /**
@@ -143,9 +148,9 @@ export async function runStandardReport(
   rawParams: URLSearchParams | Record<string, unknown>,
   opts?: { now?: Date },
 ): Promise<StdReport> {
+  if (!isStandardReport(key)) throw notFound('Report');
   const entry = CATALOG_BY_KEY[key];
   const runner = REPORT_RUNNERS[key];
-  if (!entry || !runner) throw notFound('Report');
   requirePermission(ctx, entry.area, 'view');
   const merged: Record<string, unknown> = { ...(entry.defaults ?? {}) };
   const entries = rawParams instanceof URLSearchParams ? [...rawParams.entries()] : Object.entries(rawParams ?? {});
@@ -170,5 +175,5 @@ export async function runStandardReport(
 
 /** Catalog keys missing a runner (should be empty — guarded by tests). */
 export function catalogKeysWithoutRunner(): string[] {
-  return REPORT_CATALOG.map((e) => e.key).filter((k) => !REPORT_RUNNERS[k]);
+  return REPORT_CATALOG.map((e) => e.key).filter((k) => !Object.hasOwn(REPORT_RUNNERS, k));
 }

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS "report_schedules" (
 	"group_id" uuid REFERENCES "memorized_report_groups"("id"),
 	"frequency" varchar(20) NOT NULL,
 	"next_run_at" timestamp NOT NULL,
+	"anchor_day" integer,
 	"format" varchar(10) DEFAULT 'csv' NOT NULL,
 	"folder" varchar(100),
 	"is_active" boolean DEFAULT true NOT NULL,
@@ -30,6 +31,8 @@ CREATE TABLE IF NOT EXISTS "report_schedules" (
 	"created_by" uuid REFERENCES "users"("id"),
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
+--> statement-breakpoint
+ALTER TABLE "report_schedules" ADD COLUMN IF NOT EXISTS "anchor_day" integer;
 --> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "report_schedules_due_idx" ON "report_schedules" ("company_id", "is_active", "next_run_at");
 --> statement-breakpoint

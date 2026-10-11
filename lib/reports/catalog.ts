@@ -135,7 +135,11 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'combined-ap-aging', title: 'Combined A/P Aging Summary', description: 'Payables aging for every company.', group: 'Multiple Companies', area: 'reports_purchases', controls: ['asOf'] },
 ];
 
-export const CATALOG_BY_KEY: Record<string, CatalogEntry> = Object.fromEntries(REPORT_CATALOG.map((e) => [e.key, e]));
+/** Null-prototype map so keys like "__proto__" / "constructor" never resolve to an entry. */
+export const CATALOG_BY_KEY: Record<string, CatalogEntry> = Object.assign(
+  Object.create(null) as Record<string, CatalogEntry>,
+  Object.fromEntries(REPORT_CATALOG.map((e) => [e.key, e])),
+);
 
 export const REPORT_GROUPS: ReportGroup[] = [
   'Company & Financial',

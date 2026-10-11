@@ -12,10 +12,13 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DECIMAL_RE = /^-?\d{1,13}(\.\d{1,2})?$/;
 
-const zDateStr = z.string().regex(DATE_RE, 'must be a date (YYYY-MM-DD)').refine(
-  (s) => !Number.isNaN(new Date(`${s}T00:00:00.000Z`).getTime()),
-  'must be a valid date',
-);
+/** A real calendar date: JS Date rolls 2026-02-30 over to March, so require a round trip. */
+function isCalendarDate(s: string): boolean {
+  const d = new Date(`${s}T00:00:00.000Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
+const zDateStr = z.string().regex(DATE_RE, 'must be a date (YYYY-MM-DD)').refine(isCalendarDate, 'must be a valid date');
 const zId = z.string().regex(UUID_RE, 'must be a valid id');
 const zAmount = z.string().regex(DECIMAL_RE, 'must be an amount like 100 or 99.95');
 

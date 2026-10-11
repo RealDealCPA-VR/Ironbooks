@@ -15,14 +15,34 @@ import { resolveDataDir } from '@/lib/db';
 import { buildXlsx, buildXlsxWorkbook } from '@/lib/export/xlsx';
 import { reportToCsv, reportToTable, type StdReport } from '@/lib/reports/types';
 import { type ServiceContext, notFound, validation, writeAudit, inTransaction } from './_base';
-import { isStandardReport, runStandardReport } from './reportRegistry';
+import { runStandardReport, standardReportEntry } from './reportRegistry';
 import { runReport, type ReportConfig } from './reportBuilder';
+import { requirePermission } from './access';
+import { requireAnyReportAccess } from './reportsAccess';
+import type { Area } from '@/lib/permissions/model';
+
+/**
+ * Permission area a memorized report's data belongs to. Report builder ("custom") reports read
+ * general-ledger lines, so they need the financial reports area. Unknown types → undefined.
+ */
+function areaForReportType(reportType: string): Area | undefined {
+  if (reportType === 'custom') return 'reports_financial';
+  return standardReportEntry(reportType)?.area;
+}
+
+/** The caller must be able to view the report's area (and so run it) to save or change it. */
+function requireReportTypeAccess(ctx: ServiceContext, reportType: string): void {
+  const area = areaForReportType(reportType);
+  if (!area) throw validation(`Unknown report type "${reportType}".`);
+  requirePermission(ctx, area, 'view');
+}
 
 // ---------------------------------------------------------------------------
 // Memorized reports
 // ---------------------------------------------------------------------------
 
 export async function listMemorizedReports(ctx: ServiceContext) {
+  requireAnyReportAccess(ctx);
   return ctx.db
     .select()
     .from(memorizedReports)
@@ -43,11 +63,10 @@ export async function saveMemorizedReport(
   ctx: ServiceContext,
   input: { name: string; reportType: string; config: Record<string, unknown>; groupId?: string | null },
 ) {
+  requireAnyReportAccess(ctx);
   if (!input.name?.trim()) throw validation('Report name is required.');
-  if (!input.reportType?.trim()) throw validation('Report type is required.');
-  if (input.reportType !== 'custom' && !isStandardReport(input.reportType)) {
-    throw validation(`Unknown report type "${input.reportType}".`);
-  }
+  if (typeof input.reportType !== 'string' || !input.reportType.trim()) throw validation('Report type is required.');
+  requireReportTypeAccess(ctx, input.reportType);
   await assertGroup(ctx, input.groupId);
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
@@ -85,7 +104,10 @@ export async function updateMemorizedReport(
   id: string,
   patch: { name?: string; config?: Record<string, unknown>; groupId?: string | null },
 ) {
+  requireAnyReportAccess(ctx);
   const before = await getMemorized(ctx, id);
+  // Only someone who may run this report can rename, move or re-point it.
+  requireReportTypeAccess(ctx, before.reportType);
   if (patch.name !== undefined && !patch.name.trim()) throw validation('Report name is required.');
   if (patch.groupId !== undefined) await assertGroup(ctx, patch.groupId);
   return inTransaction(ctx, async (tx) => {
@@ -111,7 +133,9 @@ export async function updateMemorizedReport(
 }
 
 export async function deleteMemorizedReport(ctx: ServiceContext, id: string) {
+  requireAnyReportAccess(ctx);
   const row = await getMemorized(ctx, id);
+  requireReportTypeAccess(ctx, row.reportType);
   return inTransaction(ctx, async (tx) => {
     // Schedules that run this report go with it.
     await tx.db.delete(reportSchedules).where(and(eq(reportSchedules.companyId, tx.companyId), eq(reportSchedules.memorizedReportId, id)));
@@ -128,6 +152,8 @@ export async function deleteMemorizedReport(ctx: ServiceContext, id: string) {
 
 /** Turn a report-builder result into the standard report shape (for groups / schedules). */
 async function runCustomReport(ctx: ServiceContext, name: string, config: Record<string, unknown>): Promise<StdReport> {
+  // Report builder output is general-ledger data: same gate as the GL / financial reports.
+  requirePermission(ctx, 'reports_financial', 'view');
   const res = await runReport(ctx, config as unknown as ReportConfig);
   return {
     key: 'custom',
@@ -148,6 +174,7 @@ async function runCustomReport(ctx: ServiceContext, name: string, config: Record
 
 /** Run one memorized report with its saved settings (permission-checked per report area). */
 export async function runMemorizedReport(ctx: ServiceContext, id: string): Promise<StdReport> {
+  requireAnyReportAccess(ctx);
   const row = await getMemorized(ctx, id);
   return runMemorizedRow(ctx, row);
 }
@@ -169,6 +196,7 @@ async function runMemorizedRow(
 // ---------------------------------------------------------------------------
 
 export async function listMemorizedGroups(ctx: ServiceContext) {
+  requireAnyReportAccess(ctx);
   return ctx.db
     .select()
     .from(memorizedReportGroups)
@@ -177,6 +205,7 @@ export async function listMemorizedGroups(ctx: ServiceContext) {
 }
 
 export async function createMemorizedGroup(ctx: ServiceContext, input: { name: string }) {
+  requireAnyReportAccess(ctx);
   if (!input.name?.trim()) throw validation('Group name is required.');
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
@@ -198,6 +227,7 @@ async function getGroup(ctx: ServiceContext, id: string) {
 }
 
 export async function renameMemorizedGroup(ctx: ServiceContext, id: string, input: { name: string }) {
+  requireAnyReportAccess(ctx);
   const g = await getGroup(ctx, id);
   if (!input.name?.trim()) throw validation('Group name is required.');
   return inTransaction(ctx, async (tx) => {
@@ -213,6 +243,7 @@ export async function renameMemorizedGroup(ctx: ServiceContext, id: string, inpu
 
 /** Delete a group; its reports are kept (moved to "no group"), its schedules are removed. */
 export async function deleteMemorizedGroup(ctx: ServiceContext, id: string) {
+  requireAnyReportAccess(ctx);
   const g = await getGroup(ctx, id);
   return inTransaction(ctx, async (tx) => {
     await tx.db.update(memorizedReports).set({ groupId: null }).where(and(eq(memorizedReports.companyId, tx.companyId), eq(memorizedReports.groupId, id)));
@@ -238,6 +269,7 @@ export async function processMultipleReports(
   ctx: ServiceContext,
   input: { groupId?: string; ids?: string[] },
 ): Promise<ProcessedReport[]> {
+  requireAnyReportAccess(ctx);
   let rows;
   if (input.groupId) {
     await getGroup(ctx, input.groupId);
@@ -287,12 +319,16 @@ export function reportsToWorkbook(reports: StdReport[]): Buffer {
 
 export type ScheduleFrequency = 'daily' | 'weekly' | 'monthly';
 
-export function nextRunAfter(from: Date, frequency: ScheduleFrequency): Date {
+/**
+ * Next run after `from`. Monthly schedules keep their anchor day (the start date's day of month):
+ * one started Jan 31 runs Feb 28, then Mar 31 — the clamped day never becomes the new anchor.
+ */
+export function nextRunAfter(from: Date, frequency: ScheduleFrequency, anchorDay?: number | null): Date {
   const d = new Date(from);
   if (frequency === 'daily') d.setUTCDate(d.getUTCDate() + 1);
   else if (frequency === 'weekly') d.setUTCDate(d.getUTCDate() + 7);
   else {
-    const day = d.getUTCDate();
+    const day = anchorDay && anchorDay >= 1 && anchorDay <= 31 ? anchorDay : d.getUTCDate();
     d.setUTCDate(1);
     d.setUTCMonth(d.getUTCMonth() + 1);
     const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
@@ -353,6 +389,7 @@ export async function createReportSchedule(
         groupId: input.groupId ?? null,
         frequency: input.frequency,
         nextRunAt: start,
+        anchorDay: start.getUTCDate(),
         format: input.format ?? 'csv',
         folder: input.folder?.trim() || null,
         isActive: input.isActive ?? true,
@@ -455,9 +492,10 @@ export async function runDueSchedules(
       status = 'failed';
       message = err instanceof Error ? err.message : 'Scheduled report failed.';
     }
-    let next = nextRunAfter(s.nextRunAt, s.frequency as ScheduleFrequency);
+    const freq = s.frequency as ScheduleFrequency;
+    let next = nextRunAfter(s.nextRunAt, freq, s.anchorDay);
     let guard = 0;
-    while (next <= now && guard++ < 5000) next = nextRunAfter(next, s.frequency as ScheduleFrequency);
+    while (next <= now && guard++ < 5000) next = nextRunAfter(next, freq, s.anchorDay);
     await inTransaction(ctx, async (tx) => {
       await tx.db
         .update(reportSchedules)
