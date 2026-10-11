@@ -346,3 +346,23 @@ describe('QA: categorizer numerics', () => {
     expect(predict(s, { payee: 'One Time Vendor', amount: '999.99', direction: 'out' }).account!.confidence).toBeLessThan(0.95);
   });
 });
+
+describe('fix round: numeric known entities do not shred ordinary numbers', () => {
+  it('a known phone matches across separators but leaves amounts, dates and short codes alone', () => {
+    const r = new Redactor([
+      { text: '(212) 555-0100', kind: 'PHONE' },
+      { text: '1234', kind: 'ACCOUNT' }, // too short to be safe — ignored
+    ]);
+    const out = r.redact('Call 212.555.0100 or 2125550100 re: $2,125,550.10 on 2026-01-23, acct code 1234');
+    expect(out).not.toMatch(/555.?0100/);
+    expect(out).toContain('$2,125,550.10');
+    expect(out).toContain('2026-01-23');
+    expect(out).toContain('1234');
+    expect(r.restore(out)).toContain('212.555.0100');
+  });
+
+  it('spaced-SSN detector does not fire inside longer digit sequences', () => {
+    const r = new Redactor();
+    expect(r.redact('ref 1 123 45 6789 2')).toBe('ref 1 123 45 6789 2');
+  });
+});

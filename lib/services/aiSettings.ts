@@ -178,7 +178,9 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
       const id = prev?.id ?? crypto.randomUUID();
       if (ids.has(id)) throw validation('Duplicate provider id.');
       ids.add(id);
-      let apiKeyEnc = prev?.apiKeyEnc ?? null;
+      // A stored key only carries over to the SAME endpoint — re-pointing a provider at another
+      // host requires re-entering the key, so it can never be redirected to an arbitrary URL.
+      let apiKeyEnc = prev && sameEndpoint(prev, p) ? prev.apiKeyEnc ?? null : null;
       if (p.clearApiKey) apiKeyEnc = null;
       if (p.apiKey !== undefined && p.apiKey.trim() !== '') apiKeyEnc = encryptSecret(p.apiKey.trim(), ctx.companyId);
       if (p.kind === 'anthropic' && !apiKeyEnc && p.enabled) {
@@ -349,6 +351,15 @@ export interface TestConnectionResult {
  * Probe a provider — either a saved one (by id) or an unsaved draft from the form. A draft
  * without an apiKey reuses the saved key of the provider with the same id.
  */
+function normUrl(u: string | null | undefined): string {
+  return (u ?? '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+/** True when a draft provider still points at the saved provider's kind + base URL. */
+function sameEndpoint(saved: StoredProviderConfig, draft: { kind: string; baseUrl?: string | null }): boolean {
+  return saved.kind === draft.kind && normUrl(saved.baseUrl) === normUrl(draft.baseUrl);
+}
+
 export async function testConnection(
   ctx: ServiceContext,
   input: ProviderInput,
@@ -360,7 +371,10 @@ export async function testConnection(
   const p = parsed.data;
   const s = await loadSettings(ctx);
   const saved = p.id ? s.providers.find((x) => x.id === p.id) : undefined;
-  const apiKey = p.apiKey?.trim() || (saved?.apiKeyEnc ? decryptSecret(saved.apiKeyEnc, ctx.companyId) : null);
+  // Reuse the saved key only for the endpoint it was saved for (see sameEndpoint).
+  const apiKey =
+    p.apiKey?.trim() ||
+    (saved?.apiKeyEnc && sameEndpoint(saved, p) ? decryptSecret(saved.apiKeyEnc, ctx.companyId) : null);
   const cfg: ProviderRuntimeConfig = {
     id: p.id ?? 'draft',
     kind: p.kind as ProviderRuntimeConfig['kind'],

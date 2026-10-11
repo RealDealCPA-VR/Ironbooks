@@ -112,6 +112,8 @@ const DETECTORS: Detector[] = [
     },
   },
   { kind: 'SSN', re: /(?<![\d-])\d{3}-\d{2}-\d{4}(?![\d-])/g },
+  // Unlabeled SSN written with spaces: "123 45 6789" (not part of a longer digit sequence).
+  { kind: 'SSN', re: /(?<![\d.,]|\d\s)\d{3} \d{2} \d{4}(?!\d|[.,]\d|\s\d)/g },
   { kind: 'EIN', re: /(?<![\d-])\d{2}-\d{7}(?![\d-])/g },
   {
     kind: 'PHONE',
@@ -149,6 +151,11 @@ function normalizeKey(kind: RedactionKind, value: string): string {
   return `${kind}:${value.toLowerCase().replace(/\s+/g, ' ').trim()}`;
 }
 
+/** Known-entity kinds that are identifiers matched on digits rather than as text. */
+const NUMERIC_KINDS = new Set<RedactionKind>(['PHONE', 'SSN', 'EIN', 'TAXID', 'ACCOUNT', 'CARD']);
+/** Shorter known numbers (e.g. "4567") would shred amounts and account codes. */
+const MIN_NUMERIC_ENTITY_DIGITS = 6;
+
 /** Entities from the person/organization lists all share their own kind's counter. */
 export class Redactor {
   private readonly entities: { re: RegExp; kind: RedactionKind }[];
@@ -159,22 +166,34 @@ export class Redactor {
   constructor(entities: KnownEntity[] = []) {
     const seen = new Set<string>();
     const cleaned = entities
-      .map((e) => ({ kind: e.kind, text: (e.text ?? '').replace(/\s+/g, ' ').trim() }))
-      // Too-short or purely numeric "names" would shred ordinary text.
-      .filter((e) => e.text.length >= 3 && !/^[\d\s.,-]+$/.test(e.text))
+      .map((e) => {
+        const text = (e.text ?? '').replace(/\s+/g, ' ').trim();
+        // Phones / tax ids / account numbers are matched on their digits, whatever the
+        // separators ("555-0100" ≈ "555 0100" ≈ "5550100").
+        const digits = NUMERIC_KINDS.has(e.kind) ? onlyDigits(text) : '';
+        return { kind: e.kind, text, digits };
+      })
+      .filter((e) =>
+        NUMERIC_KINDS.has(e.kind)
+          ? e.digits.length >= MIN_NUMERIC_ENTITY_DIGITS
+          : // Too-short or purely numeric "names" would shred ordinary text.
+            e.text.length >= 3 && !/^[\d\s.,-]+$/.test(e.text),
+      )
       .filter((e) => {
-        const k = e.text.toLowerCase();
+        const k = e.digits ? `#${e.digits}` : e.text.toLowerCase();
         if (seen.has(k)) return false;
         seen.add(k);
         return true;
       })
-      .sort((a, b) => b.text.length - a.text.length);
+      .sort((a, b) => (b.digits || b.text).length - (a.digits || a.text).length);
     this.entities = cleaned.map((e) => ({
       kind: e.kind,
-      re: new RegExp(
-        `(?<![A-Za-z0-9])${e.text.split(' ').map(escapeRegex).join('\\s+')}(?![A-Za-z0-9])`,
-        'gi',
-      ),
+      re: e.digits
+        ? new RegExp(`(?<![\\d.,])${e.digits.split('').join('[\\s.()-]*')}(?![\\d]|[.,]\\d)`, 'g')
+        : new RegExp(
+            `(?<![A-Za-z0-9])${e.text.split(' ').map(escapeRegex).join('\\s+')}(?![A-Za-z0-9])`,
+            'gi',
+          ),
     }));
   }
 

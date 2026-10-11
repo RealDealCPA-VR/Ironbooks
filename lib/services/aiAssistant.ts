@@ -15,7 +15,7 @@
  * Without any eligible model the assistant still works in an offline, keyword-driven mode
  * that runs the same tools and formats their results deterministically.
  */
-import { and, desc, eq, gte, ilike, lte, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { accounts, aiProposals, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString, formatCurrency } from '@/lib/money';
@@ -31,13 +31,18 @@ import { AiError } from '@/lib/ai/types';
 // Read-only tools
 // ---------------------------------------------------------------------------
 
-const zDateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'use YYYY-MM-DD');
+const zDateStr = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'use YYYY-MM-DD')
+  .refine((s) => parseDate(s) !== undefined, 'not a real calendar date');
 const MAX_ROWS = 40;
 
 function parseDate(s: string | undefined, endOfDay = false): Date | undefined {
   if (!s) return undefined;
   const d = new Date(`${s}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}Z`);
-  return isNaN(d.getTime()) ? undefined : d;
+  // Reject impossible calendar dates ("2026-02-30" would otherwise roll over to March 2).
+  if (isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) return undefined;
+  return d;
 }
 
 function cap<T>(rows: T[], n = MAX_ROWS): { rows: T[]; truncated: boolean } {
@@ -334,18 +339,28 @@ export async function createJournalProposal(
     rationale: rationale ?? null,
   };
   const summaryText = `Journal entry ${p.date}: ${p.description} (${formatCurrency(totals.totalDebit)})`;
-  const [row] = await ctx.db
-    .insert(aiProposals)
-    .values({
-      companyId: ctx.companyId,
-      createdBy: ctx.userId,
-      kind: 'journal_entry',
-      summary: summaryText,
-      payload: payload as unknown as Record<string, unknown>,
-      status: 'pending',
-    })
-    .returning();
-  return toView(row);
+  // inTransaction + writeAudit: RBAC (viewers cannot store write proposals) and audit trail.
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .insert(aiProposals)
+      .values({
+        companyId: tx.companyId,
+        createdBy: tx.userId,
+        kind: 'journal_entry',
+        summary: summaryText,
+        payload: payload as unknown as Record<string, unknown>,
+        status: 'pending',
+      })
+      .returning();
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'ai_proposal',
+      entityId: row.id,
+      newValues: { kind: row.kind, summary: row.summary, status: row.status },
+      llmReasoning: rationale ?? undefined,
+    });
+    return toView(row);
+  });
 }
 
 function toView(row: typeof aiProposals.$inferSelect): ProposalView {
@@ -383,9 +398,25 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
     if (row.status !== 'pending') throw new ServiceError('CONFLICT', `Proposal is already ${row.status}.`);
     if (row.kind !== 'journal_entry') throw validation(`Unsupported proposal kind: ${row.kind}`);
     const p = row.payload as unknown as StoredJournalProposal;
+    const date = parseDate(p.date);
+    if (!date) throw validation(`Proposal date ${p.date} is invalid.`);
+
+    // Re-check the accounts at approval time: posting.ts does not look at isActive, and an
+    // account may have been deactivated (or removed) since the proposal was made.
+    const ids = [...new Set(p.lines.map((l) => l.accountId))];
+    const live = await tx.db
+      .select({ id: accounts.id, code: accounts.code, name: accounts.name, isActive: accounts.isActive })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, tx.companyId), inArray(accounts.id, ids)));
+    const liveById = new Map(live.map((a) => [a.id, a]));
+    for (const l of p.lines) {
+      const a = liveById.get(l.accountId);
+      if (!a) throw validation(`Account ${l.accountCode} ${l.accountName} no longer exists.`);
+      if (!a.isActive) throw validation(`Account ${a.code} ${a.name} is inactive; the proposal cannot be posted.`);
+    }
 
     const entry = await createManualEntry(tx, {
-      date: parseDate(p.date)!,
+      date,
       description: p.description,
       reference: p.reference,
       lines: p.lines.map((l) => ({ accountId: l.accountId, debit: l.debit, credit: l.credit, memo: l.memo })),
@@ -589,7 +620,9 @@ export async function ask(
 
       let answer = (s.answer ?? '').trim();
       const proposals: ProposalView[] = [];
-      if (s.proposal !== undefined && s.proposal !== null) {
+      if (s.proposal !== undefined && s.proposal !== null && ctx.role === 'viewer') {
+        answer += '\n\n(Your role is view-only, so the proposed entry was not saved for approval.)';
+      } else if (s.proposal !== undefined && s.proposal !== null) {
         try {
           proposals.push(await createJournalProposal(ctx, s.proposal, `Assistant proposal for: "${question.slice(0, 300)}"`));
         } catch (err) {

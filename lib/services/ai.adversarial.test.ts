@@ -417,4 +417,47 @@ describe('AI layer — adversarial QA', () => {
       await updateSettings(ctx, { llmSuggestEnabled: true });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Fix-round regressions
+  // -------------------------------------------------------------------------
+
+  it('proposal creation is audited; an impossible tool date is rejected, not ignored', async () => {
+    const p = await createJournalProposal(ctx, { date: '2026-09-30', description: 'audited', lines: goodLines });
+    const audits = await db.select().from(auditLogs).where(and(eq(auditLogs.entityId, p.id), eq(auditLogs.action, 'create')));
+    expect(audits).toHaveLength(1);
+    expect(audits[0].entityType).toBe('ai_proposal');
+    await rejectProposal(ctx, p.id);
+    await expect(runTool(ctx, 'profit_and_loss', { from: '2026-02-30' })).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
+  it('Test Connection never sends a saved API key to a different base URL', async () => {
+    const cur = await getPublicSettings(ctx);
+    const keep = cur.providers.map((p) => ({ id: p.id, kind: p.kind, label: p.label, baseUrl: p.baseUrl, model: p.model, enabled: p.enabled }));
+    const s = await updateSettings(ctx, {
+      providers: [...keep, { kind: 'openai-compatible', label: 'vLLM', baseUrl: 'http://10.0.0.5:8000', model: 'm', apiKey: 'sk-QA-SAVED-KEY', enabled: false }],
+    });
+    const saved = s.providers.find((p) => p.label === 'vLLM')!;
+    const seen: { url: string; auth: string }[] = [];
+    const fetch: FetchLike = async (url, init) => {
+      const h = new Headers(init?.headers as HeadersInit);
+      seen.push({ url, auth: h.get('authorization') ?? '' });
+      return new Response(JSON.stringify({ data: [{ id: 'm' }] }), { status: 200 });
+    };
+    try {
+      await testConnection(ctx, { id: saved.id, kind: 'openai-compatible', label: 'vLLM', baseUrl: 'http://evil.example.com', model: 'm', enabled: true }, { fetch });
+      expect(seen.length).toBeGreaterThan(0);
+      expect(JSON.stringify(seen)).not.toContain('QA-SAVED-KEY');
+      seen.length = 0;
+      await testConnection(ctx, { id: saved.id, kind: 'openai-compatible', label: 'vLLM', baseUrl: 'http://10.0.0.5:8000/', model: 'm', enabled: true }, { fetch });
+      expect(seen.some((c) => c.auth === 'Bearer sk-QA-SAVED-KEY')).toBe(true);
+      // Saving the provider re-pointed at another host drops the stored key.
+      const moved = await updateSettings(ctx, {
+        providers: [...keep, { id: saved.id, kind: 'openai-compatible', label: 'vLLM', baseUrl: 'http://evil.example.com', model: 'm', enabled: false }],
+      });
+      expect(moved.providers.find((p) => p.id === saved.id)!.hasApiKey).toBe(false);
+    } finally {
+      await updateSettings(ctx, { providers: keep });
+    }
+  });
 });

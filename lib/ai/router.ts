@@ -208,16 +208,15 @@ export class AiRouter {
           attempts.push({ providerId: p.id, locality: p.locality, ok: true });
           return { data: parsed1.data, raw: first.content, repaired: false, providerId: p.id, model: first.model, locality: p.locality, redacted: !!redactor, attempts };
         }
-        // One repair attempt.
+        // One repair attempt. The validation error text can quote restored (real) values, so
+        // for a cloud provider the repair turn is redacted again before it goes on the wire.
+        const repairText =
+          `Your previous reply was not valid: ${parsed1.error}. ` +
+          'Reply again with ONLY the corrected JSON — no prose, no markdown fences.';
         const repairMsgs: ChatMessage[] = [
           ...wire,
-          { role: 'assistant', content: first.content },
-          {
-            role: 'user',
-            content:
-              `Your previous reply was not valid: ${parsed1.error}. ` +
-              'Reply again with ONLY the corrected JSON — no prose, no markdown fences.',
-          },
+          { role: 'assistant', content: redactor ? redactor.redact(first.content) : first.content },
+          { role: 'user', content: redactor ? redactor.redact(repairText) : repairText },
         ];
         const second = await this.callWithRetry(p, repairMsgs, opts);
         const parsed2 = parseAndValidate(second.content, schema, redactor);
