@@ -34,6 +34,7 @@ import { closeDb, getDb, resolveDataDir, type DB } from '@/lib/db';
 import { accounts, companies } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { ServiceError, type ServiceContext } from './_base';
+import { allowLedgerRewriteRaw } from './posting';
 import { trialBalance } from './reports';
 import { TRANSACTION_LOG_FILE, transactionLogPath, readAllTransactionLog } from './transactionLog';
 import pkg from '@/package.json';
@@ -517,6 +518,7 @@ export async function restorePortableCompanyFile(
     }
 
     // --- Load every table (FK checks deferred via replica role; the source was consistent). ---
+    let accountRowsText: string[] = [];
     const loadError = await client.transaction(async (tx) => {
       const targetTables = new Map((await listTables(tx)).map((t) => [t.name, t]));
       for (const [name, info] of Object.entries(manifest.tables)) {
@@ -526,6 +528,10 @@ export async function restorePortableCompanyFile(
         if (missing.length) return `table "${name}" is missing column(s) ${missing.join(', ')} in this version of the app`;
       }
       await tx.exec('SET LOCAL session_replication_role = replica');
+      // The ledger guards (drizzle/0017_team_ledger.sql) fire ALWAYS, even in replica mode.
+      // Re-inserting the file's posted ledger is a sanctioned rewrite; every restored posted
+      // entry is still verified balanced at COMMIT.
+      await allowLedgerRewriteRaw(tx, 'restore');
       if (targetTables.size) {
         // A brand-new database is empty apart from migration seed rows; the file's own copies replace them.
         await tx.exec(`TRUNCATE ${[...targetTables.keys()].map(qi).join(', ')}`);
@@ -536,12 +542,20 @@ export async function restorePortableCompanyFile(
         const lines = text ? text.split('\n') : [];
         if (lines.length !== info.rows) return `table "${name}" has ${lines.length} rows, expected ${info.rows}`;
         const colList = info.columns.map(qi).join(', ');
+        // accounts.balance is derived from the ledger: accounts are created at zero (the
+        // guard refuses anything else) and their cached balance/updated_at are put back after
+        // every table is loaded (the guard accepts it only if it equals the ledger value).
+        const selectList =
+          name === 'accounts'
+            ? info.columns.map((c) => (c === 'balance' ? `0 AS ${qi(c)}` : qi(c))).join(', ')
+            : colList;
+        if (name === 'accounts') accountRowsText = lines;
         let batch: string[] = [];
         let bytes = 0;
         const flush = async () => {
           if (!batch.length) return;
           await tx.query(
-            `INSERT INTO ${qi(name)} (${colList}) SELECT ${colList} FROM json_populate_recordset(NULL::${qi(name)}, $1::text::json)`,
+            `INSERT INTO ${qi(name)} (${colList}) SELECT ${selectList} FROM json_populate_recordset(NULL::${qi(name)}, $1::text::json)`,
             [`[${batch.join(',')}]`],
           );
           batch = [];
@@ -553,6 +567,18 @@ export async function restorePortableCompanyFile(
           if (bytes >= JSON_CHUNK_BYTES) await flush();
         }
         await flush();
+      }
+      if (accountRowsText.length) {
+        const setCols = ['balance', 'updated_at'].filter((c) => manifest.tables.accounts?.columns.includes(c));
+        if (setCols.length) {
+          for (let i = 0; i < accountRowsText.length; i += 500) {
+            await tx.query(
+              `UPDATE accounts a SET ${setCols.map((c) => `${qi(c)} = r.${qi(c)}`).join(', ')}
+                 FROM json_populate_recordset(NULL::accounts, $1::text::json) r WHERE a.id = r.id`,
+              [`[${accountRowsText.slice(i, i + 500).join(',')}]`],
+            );
+          }
+        }
       }
       // Advance any serial/identity sequences past the restored ids.
       const seqs = await tx.query<{ tbl: string; col: string; seq: string }>(
@@ -656,6 +682,14 @@ export async function restorePortableCompanyFile(
       // fail() already cleaned up; any other ServiceError must not leave a half-restored folder.
       await cleanup();
       throw err;
+    }
+    const code = (err as { code?: unknown })?.code;
+    if (code === 'BK001' || code === 'BK002' || code === 'BK003') {
+      // The database's own ledger guards rejected the file's ledger (unbalanced entry or a cached
+      // balance that does not match the journal) — the trial balance cannot be the original.
+      return fail(
+        `Restore refused — the trial balance of the file's ledger does not match the original (${(err as Error).message}). Nothing was kept.`,
+      );
     }
     return fail(`The portable file could not be restored: ${(err as Error).message}. Nothing was kept.`);
   }

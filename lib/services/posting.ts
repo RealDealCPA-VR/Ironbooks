@@ -258,3 +258,20 @@ export async function allowLedgerRewrite(
                set_config('bka.ledger_rewrite_reason', ${reason}, true)`,
   );
 }
+
+/**
+ * `allowLedgerRewrite` for code that runs on the raw PGlite transaction instead of Drizzle
+ * (the portable .bkp restore loads tables with raw SQL). Same flag, same txid binding, same
+ * whitelist of reasons — 'restore' here means "re-insert a backup's ledger verbatim".
+ */
+export async function allowLedgerRewriteRaw(
+  q: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  reason: 'condense' | 'merge' | 'restore',
+): Promise<void> {
+  await q.query(
+    `SELECT set_config('bka.allow_ledger_rewrite', 'on', true),
+            set_config('bka.ledger_rewrite_txid', txid_current()::text, true),
+            set_config('bka.ledger_rewrite_reason', $1, true)`,
+    [reason],
+  );
+}

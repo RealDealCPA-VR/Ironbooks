@@ -13,7 +13,7 @@ import { getDb, closeDb, type DB } from '@/lib/db';
 import { users, companies, journalEntries } from '@/lib/db/schema';
 import { inTransaction, writeAudit, type ServiceContext } from './_base';
 import { createAccount } from './accounts';
-import { postJournalEntry, voidJournalEntry } from './posting';
+import { allowLedgerRewrite, postJournalEntry, voidJournalEntry } from './posting';
 import {
   GENESIS_PREV_HASH,
   queryTransactionLog,
@@ -147,22 +147,38 @@ describe('running transaction log', () => {
   });
 
   it('flags a posted journal entry that bypassed the log', async () => {
-    const [rogue] = await db
-      .insert(journalEntries)
-      .values({
-        companyId: ctx.companyId,
-        entryNumber: 999,
-        date: new Date('2025-02-01'),
-        description: 'Written straight to the table',
-        status: 'posted',
-        createdBy: ctx.userId!,
-      })
-      .returning();
+    // The ledger guards (drizzle/0017_team_ledger.sql) still require a balanced posted entry, so
+    // the rogue write is a balanced entry + lines inserted straight into the tables (no log).
+    const { journalEntryLines } = await import('@/lib/db/schema');
+    const { eq } = await import('drizzle-orm');
+    const rogue = await db.transaction(async (tx) => {
+      const [je] = await tx
+        .insert(journalEntries)
+        .values({
+          companyId: ctx.companyId,
+          entryNumber: 999,
+          date: new Date('2025-02-01'),
+          description: 'Written straight to the table',
+          status: 'posted',
+          createdBy: ctx.userId!,
+        })
+        .returning();
+      await tx.insert(journalEntryLines).values([
+        { journalEntryId: je.id, accountId: acct['6000'], debit: '1.00', credit: null },
+        { journalEntryId: je.id, accountId: acct['1000'], debit: null, credit: '1.00' },
+      ]);
+      return je;
+    });
     const v = await verifyTransactionLog(db, TEST_DIR);
     expect(v.ok).toBe(false);
     expect(v.chainIntact).toBe(true);
     expect(v.missingEntries.map((m) => m.id)).toEqual([rogue.id]);
-    await db.delete(journalEntries).where((await import('drizzle-orm')).eq(journalEntries.id, rogue.id));
+    // Clean up through the sanctioned rewrite path (posted entries are otherwise undeletable).
+    await db.transaction(async (tx) => {
+      await allowLedgerRewrite({ db: tx as unknown as DB }, 'restore');
+      await tx.delete(journalEntryLines).where(eq(journalEntryLines.journalEntryId, rogue.id));
+      await tx.delete(journalEntries).where(eq(journalEntries.id, rogue.id));
+    });
   });
 
   it('detects an edited record and a deleted record', async () => {
