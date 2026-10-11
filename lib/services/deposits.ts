@@ -43,6 +43,7 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
+import { assertHomeCurrencyAccounts } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Structured deposit-line description prefixes (see schema note above).
@@ -295,6 +296,7 @@ async function prepareDeposit(
   if (depAcct.type !== 'asset') {
     throw validation('Deposit account must be an asset (bank) account.');
   }
+  await assertHomeCurrencyAccounts(ctx, [input.depositAccountId, input.cashBack?.accountId], 'Deposits');
 
   // ── payments: ownership + UF + not voided ────────────────────────────────
   const payRows =

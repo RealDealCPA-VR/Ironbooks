@@ -487,3 +487,31 @@ export async function setAccountCurrency(
   });
   return { id: updated.id, currency: updated.currency ?? null };
 }
+
+/**
+ * J10: documents that are recorded in home currency only (deposits, transfers, vendor credits,
+ * Loan Manager payments) refuse a foreign-currency bank / credit-card account with a plain
+ * message, so the ledger never takes a transaction-currency amount as if it were home currency.
+ */
+export async function assertHomeCurrencyAccounts(
+  ctx: ServiceContext,
+  accountIds: ReadonlyArray<string | null | undefined>,
+  what: string,
+): Promise<void> {
+  const ids = [...new Set(accountIds.filter((x): x is string => !!x))];
+  if (ids.length === 0) return;
+  let home: string | null | undefined;
+  for (const id of ids) {
+    const [a] = await ctx.db
+      .select({ name: accounts.name, currency: accounts.currency })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
+    const cur = (a?.currency ?? '').trim().toUpperCase();
+    if (!cur) continue;
+    if (home === undefined) home = await getHomeCurrencyCode(ctx);
+    if (home && cur === home) continue;
+    throw validation(
+      `"${a!.name}" is a ${cur} account. ${what} can only use home-currency accounts for now.`,
+    );
+  }
+}

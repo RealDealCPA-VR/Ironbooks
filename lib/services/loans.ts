@@ -14,6 +14,10 @@
  *     The document is created through createExpense / createBill, so it posts through
  *     postJournalEntry like any other check or bill (balanced, closing-date checked, audited).
  *
+ * Loan Manager payments are HOME-CURRENCY only: the loan schedule (and loan_payments) is kept
+ * in home currency, so a lender vendor or payment account in another currency is refused with a
+ * plain message instead of posting a converted amount that would drift from the schedule.
+ *
  * The remaining balance is derived from the payments whose check/bill is NOT void, so voiding a
  * loan payment's check automatically puts that principal back on the schedule.
  */
@@ -31,6 +35,7 @@ import {
 } from './_base';
 import { createExpense } from './expenses';
 import { createBill } from './bills';
+import { getHomeCurrencyCode } from './currencies';
 
 export const PAYMENT_FREQUENCIES: Record<number, string> = {
   1: 'Annually',
@@ -94,18 +99,29 @@ export function periodicPayment(
 }
 
 /** Date of payment #k (1-based) given the first payment date and frequency. */
+/** Add whole months, clamping to the last day of the target month (Jan 31 + 1 month = Feb 28/29). */
+function addMonthsClamped(base: Date, months: number): Date {
+  const y = base.getUTCFullYear();
+  const m = base.getUTCMonth() + months;
+  const lastDay = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+  const day = Math.min(base.getUTCDate(), lastDay);
+  return new Date(
+    Date.UTC(y, m, day, base.getUTCHours(), base.getUTCMinutes(), base.getUTCSeconds(), base.getUTCMilliseconds()),
+  );
+}
+
 export function paymentDate(first: Date, k: number, paymentsPerYear: number): Date {
-  const d = new Date(first);
   if (12 % paymentsPerYear === 0) {
-    d.setUTCMonth(d.getUTCMonth() + (k - 1) * (12 / paymentsPerYear));
-  } else if (paymentsPerYear === 24) {
-    // semi-monthly: alternate the 1st/16th-style half-month steps
-    const months = Math.floor((k - 1) / 2);
-    d.setUTCMonth(d.getUTCMonth() + months);
-    if ((k - 1) % 2 === 1) d.setUTCDate(d.getUTCDate() + 15);
-  } else {
-    d.setUTCDate(d.getUTCDate() + (k - 1) * Math.round(364 / paymentsPerYear));
+    return addMonthsClamped(first, (k - 1) * (12 / paymentsPerYear));
   }
+  if (paymentsPerYear === 24) {
+    // semi-monthly: alternate the 1st/16th-style half-month steps
+    const d = addMonthsClamped(first, Math.floor((k - 1) / 2));
+    if ((k - 1) % 2 === 1) d.setUTCDate(d.getUTCDate() + 15);
+    return d;
+  }
+  const d = new Date(first);
+  d.setUTCDate(d.getUTCDate() + (k - 1) * Math.round(364 / paymentsPerYear));
   return d;
 }
 
@@ -411,6 +427,45 @@ export interface SetUpPaymentInput {
  * Create the next loan payment as a check or a bill, split between principal (loan liability),
  * interest (expense) and escrow, and record it on the loan — all in one transaction.
  */
+/**
+ * Loan payments are kept in home currency (the schedule, loan_payments and the liability all
+ * agree). Refuse a foreign-currency lender or payment account rather than post converted amounts.
+ */
+async function assertHomeCurrencyLoanPayment(
+  ctx: ServiceContext,
+  refs: { lenderVendorId: string | null; paymentAccountId: string | null },
+) {
+  const home = await getHomeCurrencyCode(ctx);
+  const foreign = (c: string | null | undefined) => {
+    const v = (c ?? '').trim().toUpperCase();
+    return v !== '' && v !== (home ?? '') ? v : null;
+  };
+  if (refs.lenderVendorId) {
+    const [v] = await ctx.db
+      .select({ currency: vendors.currency })
+      .from(vendors)
+      .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.id, refs.lenderVendorId)));
+    const cur = foreign(v?.currency);
+    if (cur) {
+      throw validation(
+        `This loan's lender uses ${cur}. The Loan Manager only handles payments in your home currency, so enter this payment as a regular ${cur} check or bill instead.`,
+      );
+    }
+  }
+  if (refs.paymentAccountId) {
+    const [a] = await ctx.db
+      .select({ currency: accounts.currency })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, refs.paymentAccountId)));
+    const cur = foreign(a?.currency);
+    if (cur) {
+      throw validation(
+        `The payment account is a ${cur} account. The Loan Manager only handles payments in your home currency, so pick a home-currency bank account.`,
+      );
+    }
+  }
+}
+
 export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, input: SetUpPaymentInput) {
   const loan = await getLoan(ctx, loanId);
   if (!loan.isActive) throw new ServiceError('CONFLICT', 'This loan is no longer in the Loan Manager.');
@@ -446,6 +501,11 @@ export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, inpu
   if (escrow.greaterThan(0) && loan.escrowAccountId) {
     accountLines.push({ accountId: loan.escrowAccountId, amount: toAmountString(escrow), description: `Escrow — ${loan.name}` });
   }
+
+  await assertHomeCurrencyLoanPayment(ctx, {
+    lenderVendorId: loan.lenderVendorId ?? null,
+    paymentAccountId: input.kind === 'check' ? (input.paymentAccountId ?? loan.paymentAccountId ?? null) : null,
+  });
 
   return inTransaction(ctx, async (tx) => {
     let expenseId: string | null = null;

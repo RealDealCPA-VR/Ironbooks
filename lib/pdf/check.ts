@@ -27,6 +27,20 @@
  */
 
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
+import { Money } from '@/lib/money';
+
+/** "1234.5" -> "1,234.50" using Decimal (no float drift); null when not a number. */
+function fmtAmount(v: string): string | null {
+  let d;
+  try {
+    d = Money.of(v);
+  } catch {
+    return null;
+  }
+  if (!d.isFinite()) return null;
+  const [int, frac] = Money.round2(d).abs().toFixed(2).split('.');
+  return `${d.isNegative() ? '-' : ''}${int.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${frac}`;
+}
 
 // ---------------------------------------------------------------------------
 // numberToWords — converts a decimal amount string/number to check-style words
@@ -144,7 +158,12 @@ export const MAX_CHECK_OFFSET_IN = 1;
 
 /** Clamp an inch offset to +/- MAX_CHECK_OFFSET_IN and convert to PDF points. */
 export function offsetToPoints(v: number | string | null | undefined): number {
-  const n = typeof v === 'string' ? parseFloat(v) : (v ?? 0);
+  let n: number;
+  try {
+    n = typeof v === 'string' ? Money.of(v.trim() || '0').toNumber() : (v ?? 0);
+  } catch {
+    return 0;
+  }
   if (!Number.isFinite(n)) return 0;
   const clamped = Math.max(-MAX_CHECK_OFFSET_IN, Math.min(MAX_CHECK_OFFSET_IN, n));
   return Math.round(clamped * 72 * 100) / 100;
@@ -300,10 +319,7 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
   text('$', AMOUNT_BOX_X + 6, payeeY, { size: 11, color: C_NAVY });
 
   // Numeric amount right-aligned inside box
-  const numFmt = parseFloat(data.amountNumeric);
-  const numDisplay = isNaN(numFmt)
-    ? data.amountNumeric
-    : numFmt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const numDisplay = fmtAmount(data.amountNumeric) ?? data.amountNumeric;
 
   text(numDisplay, MR - 6, payeeY, {
     font: bold,
@@ -418,11 +434,7 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
     if (data.checkNumber != null && String(data.checkNumber).trim() !== '') stub('Check #', String(data.checkNumber));
     stub('Date', data.date);
     stub('To', data.payee);
-    const n = parseFloat(data.amountNumeric);
-    stub(
-      'Amount',
-      isNaN(n) ? data.amountNumeric : n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-    );
+    stub('Amount', fmtAmount(data.amountNumeric) ?? data.amountNumeric);
     if (data.memo) stub('Memo', data.memo);
   }
 
@@ -451,26 +463,24 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
     hRule(vy, ML, MR, 0.5, C_LIGHT);
     vy -= 12;
 
-    let voucherTotal = 0;
+    let voucherTotal = Money.zero();
     for (const line of data.voucher) {
       if (vy < 48) break; // never run off the page
       text(line.account.slice(0, 48), ML, vy, { size: 9, color: C_BLACK });
       if (line.description) {
         text(line.description.slice(0, 40), DESC_X, vy, { size: 9, color: C_GRAY });
       }
-      const amtNum = parseFloat(line.amount);
-      voucherTotal += isNaN(amtNum) ? 0 : amtNum;
-      const amtDisplay = isNaN(amtNum)
-        ? line.amount
-        : amtNum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      text(amtDisplay, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
+      const amtDisplay = fmtAmount(line.amount);
+      if (amtDisplay !== null) voucherTotal = voucherTotal.plus(Money.of(line.amount));
+      const amtDisplayOrRaw = amtDisplay ?? line.amount;
+      text(amtDisplayOrRaw, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
       vy -= 14;
     }
 
     hRule(vy + 6, DESC_X, MR, 0.5, C_LIGHT);
     text('Total', DESC_X, vy - 4, { font: bold, size: 9, color: C_NAVY });
     text(
-      voucherTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      fmtAmount(voucherTotal.toFixed(2)) ?? '0.00',
       AMT_X,
       vy - 4,
       { font: bold, size: 9, color: C_NAVY, rightAlign: true },

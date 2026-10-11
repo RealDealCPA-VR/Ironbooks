@@ -63,6 +63,8 @@ import {
   periodicPayment,
 } from './loans';
 import { renderCheckPdf } from '@/lib/pdf/check';
+import { apAging } from './reportsExtra';
+import { refundVendorCredit } from './vendorCredits';
 import { Money } from '@/lib/money';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-purchases-wave2');
@@ -624,6 +626,70 @@ describe('wave2 purchases', () => {
     });
     expect(chk.currency).toBe('EUR');
     expect(await bal('1020')).toBe('-11.01');
+    await tbOk();
+  });
+  it('J10: home-currency-only documents refuse foreign accounts/vendors; A/P aging ties in home currency', async () => {
+    // (Runs after the J10 test above: EUR is set up and 1020 is a EUR bank account.)
+    const eurVendor = await createVendor(ctx, { displayName: 'Lyon Parts', currency: 'EUR' });
+    const before = { ap: await bal('2000'), eur: await bal('1020'), chk: await bal('1000') };
+
+    // Vendor credits: foreign vendor refused; refund into a EUR bank refused.
+    await expect(
+      createVendorCredit(ctx, { vendorId: eurVendor.id, date: d('2026-06-22'), lines: [{ accountId: acct['6300'], amount: '5.00' }] }),
+    ).rejects.toThrow(/EUR/);
+    const vc = await createVendorCredit(ctx, { vendorId, date: d('2026-06-22'), lines: [{ accountId: acct['6300'], amount: '5.00' }] });
+    await expect(
+      refundVendorCredit(ctx, { vendorCreditId: vc.id, bankAccountId: acct['1020'], amount: '5.00', date: d('2026-06-22') }),
+    ).rejects.toThrow(/EUR/);
+
+    // Deposits and transfers touching the EUR bank are refused (nothing posted).
+    await expect(
+      createDeposit(ctx, { depositAccountId: acct['1020'], date: d('2026-06-22'), extraLines: [{ accountId: acct['4900'], amount: '10.00' }] }),
+    ).rejects.toThrow(/EUR/);
+    await expect(
+      createTransfer(ctx, { fromAccountId: acct['1000'], toAccountId: acct['1020'], amount: '10.00', date: d('2026-06-22') }),
+    ).rejects.toThrow(/EUR/);
+
+    // Loan Manager: a EUR lender is refused atomically.
+    const loan = await createLoan(ctx, {
+      name: 'Euro note',
+      lenderVendorId: eurVendor.id,
+      liabilityAccountId: acct['2600'],
+      interestAccountId: acct['6800'],
+      paymentAccountId: acct['1000'],
+      originalAmount: '1000',
+      annualRate: '5',
+      termMonths: 12,
+      originDate: d('2026-06-01'),
+      firstPaymentDate: d('2026-07-01'),
+    });
+    await expect(setUpLoanPayment(ctx, loan.id, { kind: 'check' })).rejects.toThrow(/home currency/);
+    expect((await getLoan(ctx, loan.id)).paymentsMade).toBe(0);
+
+    expect(await bal('1020')).toBe(before.eur);
+    expect(await bal('1000')).toBe(before.chk);
+    expect(Money.of(before.ap).minus(await bal('2000')).toFixed(2)).toBe('5.00'); // only the home credit
+
+    // A/P aging: a foreign bill, part paid at a different rate, is aged at its home open balance.
+    const bill = await createBill(ctx, {
+      vendorId: eurVendor.id,
+      date: d('2026-06-23'),
+      exchangeRate: '1.0712',
+      lines: [{ accountId: acct['6300'], amount: '100.00' }],
+    } as never);
+    await payBills(ctx, {
+      vendorId: eurVendor.id,
+      date: d('2026-06-24'),
+      method: 'check',
+      reference: '9950',
+      paymentAccountId: acct['1000'],
+      exchangeRate: '1.20',
+      applications: [{ billId: bill.id, amountApplied: '33.33' }],
+    });
+    const aging = await apAging(ctx, d('2026-12-31'));
+    const row = aging.rows.find((r) => r.id === eurVendor.id)!;
+    expect(row.total).toBe('71.42'); // 107.12 - round2(33.33 x 1.0712)=35.70
+    expect(Money.of(aging.totals.total).toFixed(2)).toBe(await bal('2000'));
     await tbOk();
   });
 });

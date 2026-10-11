@@ -41,7 +41,7 @@ import {
 import { Help } from '@/components/Help';
 import { api, ApiError } from '@/lib/client';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
-import { formatCurrency } from '@/lib/money';
+import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { useNewParam } from '@/lib/useFocusParam';
 import { type PurchaseVendor, saveWithDuplicateCheck, vendorPrefillAccountIds } from '@/lib/purchasesClient';
@@ -140,11 +140,16 @@ function emptyLine(mode: LineRow['mode'] = 'expense'): LineRow {
 
 /** Display amount of a line (qty x cost on the Items tab). */
 function lineTotal(l: LineRow): number {
-  if (l.mode === 'item') {
-    if (l.amount) return Number(l.amount) || 0;
-    return (Number(l.quantity) || 0) * (Number(l.unitCost) || 0);
-  }
-  return Number(l.amount) || 0;
+  const dec = (v: string) => {
+    try {
+      const d = Money.of(v || '0');
+      return d.isFinite() ? d : Money.zero();
+    } catch {
+      return Money.zero();
+    }
+  };
+  if (l.mode === 'item' && !l.amount) return Money.round2(dec(l.quantity).times(dec(l.unitCost))).toNumber();
+  return Money.round2(dec(l.amount)).toNumber();
 }
 
 function isBankish(a: Account): boolean {

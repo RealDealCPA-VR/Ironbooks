@@ -29,7 +29,7 @@
  */
 import { and, asc, desc, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
-import { accounts, bills, billLines, inventoryLayers, items, vendors } from '@/lib/db/schema';
+import { accounts, bills, billLines, inventoryLayers, items, loanPayments, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { discountFor, dueDateFromTerms } from './billTerms';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
@@ -776,6 +776,21 @@ export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
  *   4. Re-post the GL entry and re-receive stock from the new lines.
  *   5. Audit trail records old and new values.
  */
+/** A bill written by the Loan Manager "Set up payment" (its split must stay in step with the loan). */
+async function assertNotLoanBill(ctx: ServiceContext, billId: string) {
+  const [link] = await ctx.db
+    .select({ id: loanPayments.id })
+    .from(loanPayments)
+    .where(and(eq(loanPayments.companyId, ctx.companyId), eq(loanPayments.billId, billId)))
+    .limit(1);
+  if (link) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This bill is a Loan Manager payment. To change it, void it and set up the loan payment again.',
+    );
+  }
+}
+
 export async function updateBill(ctx: ServiceContext, id: string, input: CreateBillInput) {
   // Pre-check outside the transaction for a fast, friendly error.
   const [existing] = await ctx.db
@@ -798,6 +813,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
       'Cannot edit a bill that has vendor credits applied. Unapply vendor credits first.',
     );
   }
+  await assertNotLoanBill(ctx, id);
   if (await billHasReceiptLinks(ctx, id)) {
     throw new ServiceError(
       'CONFLICT',

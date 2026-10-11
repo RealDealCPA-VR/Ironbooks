@@ -21,8 +21,8 @@
  *   UPDATE on quantityBilled inside the transaction. convertedBillId is stamped
  *   with the bill that completes (closes) the PO.
  */
-import { and, asc, desc, eq, sql } from 'drizzle-orm';
-import { purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
+import { accounts, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { createBill } from '@/lib/services/bills';
 import {
@@ -76,6 +76,29 @@ async function nextPoNumber(ctx: ServiceContext): Promise<number> {
 // createPurchaseOrder
 // ---------------------------------------------------------------------------
 
+/** Every account / item referenced by PO lines must belong to the current company. */
+async function assertPoLineRefsOwned(
+  ctx: ServiceContext,
+  lines: ReadonlyArray<{ accountId?: string | null; itemId?: string | null }>,
+) {
+  const acctIds = [...new Set(lines.map((l) => l.accountId).filter((x): x is string => !!x))];
+  const itemIds = [...new Set(lines.map((l) => l.itemId).filter((x): x is string => !!x))];
+  if (acctIds.length) {
+    const found = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(inArray(accounts.id, acctIds), eq(accounts.companyId, ctx.companyId)));
+    if (found.length !== acctIds.length) throw validation('One of the lines uses an account that does not exist in this company.');
+  }
+  if (itemIds.length) {
+    const found = await ctx.db
+      .select({ id: items.id })
+      .from(items)
+      .where(and(inArray(items.id, itemIds), eq(items.companyId, ctx.companyId)));
+    if (found.length !== itemIds.length) throw validation('One of the lines uses an item that does not exist in this company.');
+  }
+}
+
 export async function createPurchaseOrder(
   ctx: ServiceContext,
   input: CreatePurchaseOrderInput,
@@ -90,6 +113,7 @@ export async function createPurchaseOrder(
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
+  await assertPoLineRefsOwned(ctx, input.lines);
 
   // Compute per-line amounts using safe decimal math.
   type ComputedLine = {
@@ -239,6 +263,7 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
+  await assertPoLineRefsOwned(ctx, input.lines);
 
   return inTransaction(ctx, async (tx) => {
     const [po] = await tx.db

@@ -19,6 +19,7 @@ import { accounts, bills, vendorCredits, vendorCreditLines, vendors } from '@/li
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
+import { getHomeCurrencyCode } from './currencies';
 import {
   type ServiceContext,
   ServiceError,
@@ -77,6 +78,32 @@ async function resolveApAccount(ctx: ServiceContext): Promise<string> {
 // createVendorCredit
 // ---------------------------------------------------------------------------
 
+/**
+ * J10: vendor credits are recorded in HOME currency only (vendor_credits has no exchange rate, and
+ * applying a foreign credit to a foreign bill would need a realized gain/loss). A vendor or bank
+ * account in another currency is refused with a plain message so A/P never takes an unconverted
+ * amount.
+ */
+async function foreignCurrencyOf(ctx: ServiceContext, code: string | null | undefined): Promise<string | null> {
+  const v = (code ?? '').trim().toUpperCase();
+  if (!v) return null;
+  const home = await getHomeCurrencyCode(ctx);
+  return home && v === home ? null : v;
+}
+
+async function assertHomeCurrencyVendor(ctx: ServiceContext, vendorId: string) {
+  const [v] = await ctx.db
+    .select({ currency: vendors.currency })
+    .from(vendors)
+    .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, ctx.companyId)));
+  const cur = await foreignCurrencyOf(ctx, v?.currency);
+  if (cur) {
+    throw validation(
+      `This vendor uses ${cur}. Vendor credits can only be entered for home-currency vendors — for a ${cur} vendor, enter the credit as a bill with a negative adjustment or ask the vendor for a refund.`,
+    );
+  }
+}
+
 export async function createVendorCredit(ctx: ServiceContext, input: CreateVendorCreditInput) {
   // Verify vendor belongs to this company.
   const [vendor] = await ctx.db
@@ -84,6 +111,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
+  await assertHomeCurrencyVendor(ctx, input.vendorId);
 
   // Validate lines.
   if (!input.lines || input.lines.length === 0) {
@@ -199,6 +227,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
+  await assertHomeCurrencyVendor(ctx, input.vendorId);
   if (!input.lines || input.lines.length === 0) {
     throw validation('A vendor credit must have at least one line.');
   }
@@ -636,10 +665,14 @@ export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendo
 
   // Validate the bank account: company-owned bank/cash asset.
   const [bankAcct] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, currency: accounts.currency })
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
+  const refundCur = await foreignCurrencyOf(ctx, bankAcct.currency);
+  if (refundCur) {
+    throw validation(`This is a ${refundCur} account. Vendor refunds can only go into a home-currency bank account.`);
+  }
   if (
     bankAcct.type !== 'asset' ||
     bankAcct.subtype === 'accounts_receivable' ||

@@ -7,7 +7,16 @@
  *   - currency          : the vendor's currency (multi-currency); fixed once it has transactions
  */
 import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
-import { accounts, billPayments, bills, expenses, vendors } from '@/lib/db/schema';
+import {
+  accounts,
+  billPayments,
+  bills,
+  expenses,
+  itemReceipts,
+  purchaseOrders,
+  vendorCredits,
+  vendors,
+} from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, validation } from './_base';
 import { getHomeCurrencyCode } from './currencies';
 import { currencies } from '@/lib/db/schema';
@@ -21,7 +30,10 @@ export interface VendorPurchaseFieldsInput {
 
 export const MAX_PREFILL_ACCOUNTS = 3;
 
-/** True when the vendor already has bills, checks or bill payments (that are not void). */
+/**
+ * True when the vendor already has bills, checks, bill payments, vendor credits, purchase orders or
+ * item receipts (that are not void).
+ */
 async function vendorHasTransactions(ctx: ServiceContext, vendorId: string): Promise<boolean> {
   const [b] = await ctx.db
     .select({ id: bills.id })
@@ -42,7 +54,25 @@ async function vendorHasTransactions(ctx: ServiceContext, vendorId: string): Pro
       and(eq(billPayments.companyId, ctx.companyId), eq(billPayments.vendorId, vendorId), isNull(billPayments.voidedAt)),
     )
     .limit(1);
-  return Boolean(p);
+  if (p) return true;
+  const [vc] = await ctx.db
+    .select({ id: vendorCredits.id })
+    .from(vendorCredits)
+    .where(and(eq(vendorCredits.companyId, ctx.companyId), eq(vendorCredits.vendorId, vendorId), ne(vendorCredits.status, 'void')))
+    .limit(1);
+  if (vc) return true;
+  const [po] = await ctx.db
+    .select({ id: purchaseOrders.id })
+    .from(purchaseOrders)
+    .where(and(eq(purchaseOrders.companyId, ctx.companyId), eq(purchaseOrders.vendorId, vendorId), ne(purchaseOrders.status, 'void')))
+    .limit(1);
+  if (po) return true;
+  const [ir] = await ctx.db
+    .select({ id: itemReceipts.id })
+    .from(itemReceipts)
+    .where(and(eq(itemReceipts.companyId, ctx.companyId), eq(itemReceipts.vendorId, vendorId), isNull(itemReceipts.voidedAt)))
+    .limit(1);
+  return Boolean(ir);
 }
 
 /**

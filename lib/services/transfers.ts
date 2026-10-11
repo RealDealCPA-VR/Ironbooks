@@ -28,6 +28,7 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
+import { assertHomeCurrencyAccounts } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -73,6 +74,7 @@ async function assertAccountsOwned(ctx: ServiceContext, input: CreateTransferInp
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
     if (!row) throw notFound('Account');
   }
+  await assertHomeCurrencyAccounts(ctx, [input.fromAccountId, input.toAccountId], 'Transfers');
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +83,7 @@ async function assertAccountsOwned(ctx: ServiceContext, input: CreateTransferInp
 
 export async function createTransfer(ctx: ServiceContext, input: CreateTransferInput) {
   const amountStr = validateTransfer(input);
+  await assertAccountsOwned(ctx, input);
 
   return inTransaction(ctx, async (tx) => {
     // Post the journal entry: Dr toAccount, Cr fromAccount.
