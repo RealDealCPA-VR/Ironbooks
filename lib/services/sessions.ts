@@ -57,25 +57,34 @@ export interface StartSessionInput {
 }
 
 export async function startSession(db: DB, input: StartSessionInput): Promise<{ id: string }> {
-  // Seat limit applies to people connecting over the network; the host machine always gets in.
-  if (input.viaHost) await assertSeatAvailable(db, input.userId);
-  // Timestamps are set from the app clock (not the column defaults) so every comparison in
-  // this module uses one clock regardless of the database session's TimeZone setting.
-  const now = new Date();
-  const [row] = await db
-    .insert(userSessions)
-    .values({
-      createdAt: now,
-      lastSeenAt: now,
-      userId: input.userId,
-      companyId: input.companyId ?? null,
-      remoteAddr: input.remoteAddr?.slice(0, 100) ?? null,
-      userAgent: input.userAgent?.slice(0, 500) ?? null,
-      viaHost: Boolean(input.viaHost),
-    })
-    .returning({ id: userSessions.id });
-  return row;
+  // The seat count and the insert run in one transaction, serialised by an advisory lock, so
+  // two sign-ins racing for the last seat can't both see a free one and both get in.
+  return db.transaction(async (txRaw) => {
+    const tx = txRaw as unknown as DB;
+    await tx.execute(sql`select pg_advisory_xact_lock(${SEAT_LOCK_KEY})`);
+    // Seat limit applies to people connecting over the network; the host machine always gets in.
+    if (input.viaHost) await assertSeatAvailable(tx, input.userId);
+    // Timestamps are set from the app clock (not the column defaults) so every comparison in
+    // this module uses one clock regardless of the database session's TimeZone setting.
+    const now = new Date();
+    const [row] = await tx
+      .insert(userSessions)
+      .values({
+        createdAt: now,
+        lastSeenAt: now,
+        userId: input.userId,
+        companyId: input.companyId ?? null,
+        remoteAddr: input.remoteAddr?.slice(0, 100) ?? null,
+        userAgent: input.userAgent?.slice(0, 500) ?? null,
+        viaHost: Boolean(input.viaHost),
+      })
+      .returning({ id: userSessions.id });
+    return row;
+  });
 }
+
+/** Advisory-lock key serialising sign-ins (seat count + insert). Arbitrary app-wide constant. */
+const SEAT_LOCK_KEY = 4_024_001;
 
 export async function endSession(db: DB, sessionId: string, reason = 'logout'): Promise<void> {
   if (!isUuid(sessionId)) return;

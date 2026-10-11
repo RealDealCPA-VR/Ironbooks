@@ -82,6 +82,8 @@ export async function assertOutboundAllowed(
 }
 
 const MAX_REDIRECTS = 5;
+/** Headers allowed to follow a redirect to a different origin; everything else is dropped. */
+const CROSS_ORIGIN_SAFE_HEADERS = ['accept', 'accept-language', 'content-type', 'user-agent'] as const;
 
 /**
  * Policy-checked fetch. Same shape as fetch(url, init) plus { purpose, ctx }. Redirects are
@@ -115,11 +117,14 @@ export async function policyFetch(
       );
     }
     if (crossOrigin && reqInit.headers) {
-      // Never forward credentials to a different origin.
-      const h = new Headers(reqInit.headers);
-      h.delete('authorization');
-      h.delete('cookie');
-      h.delete('x-api-key');
+      // Never forward credentials to a different origin: only an allowlist of harmless headers
+      // follows a cross-origin hop (any auth / proxy-auth / cookie / API-key header is dropped).
+      const src = new Headers(reqInit.headers);
+      const h = new Headers();
+      for (const name of CROSS_ORIGIN_SAFE_HEADERS) {
+        const v = src.get(name);
+        if (v !== null) h.set(name, v);
+      }
       reqInit = { ...reqInit, headers: h };
     }
     url = next;
