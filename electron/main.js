@@ -732,6 +732,7 @@ function buildMenu() {
         { label: 'Multi-user status…', click: () => navigate('/multi-user') },
         { type: 'separator' },
         { label: 'Import Bank File…', click: () => mainWindow?.webContents.send('menu', 'import') },
+        { label: 'Migrate from QuickBooks…', click: () => navigate('/qb-import') },
         { label: 'Backup Company…', click: () => mainWindow?.webContents.send('menu', 'backup') },
         { type: 'separator' },
         { label: 'Create Portable Company File…', click: () => mainWindow?.webContents.send('menu', 'portable-create') },
