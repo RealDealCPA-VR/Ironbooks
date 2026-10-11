@@ -45,7 +45,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
-import { getOrCreateAccrualAccount } from './itemReceipts';
+import { ITEM_RECEIPT_ACCRUAL_CODE, getOrCreateAccrualAccount } from './itemReceipts';
 import {
   type ReceivingSettings,
   adjustPoReceivedUnbilled,
@@ -316,6 +316,7 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
 
 /** Placeholder account id used by previews before the PPV account exists. */
 const PPV_PLACEHOLDER = 'ppv:new';
+const ACCRUAL_PLACEHOLDER = 'accrual:new';
 
 /**
  * Resolve (or create on first use) the Purchase Price Variance expense account. With
@@ -358,6 +359,15 @@ export async function getOrCreatePpvAccount(
     })
     .returning();
   return created.id;
+}
+
+/** Look up the 2050 accrual account without creating it (placeholder when missing). */
+async function findAccrualAccount(ctx: ServiceContext): Promise<string> {
+  const [row] = await ctx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, ITEM_RECEIPT_ACCRUAL_CODE)));
+  return row?.id ?? ACCRUAL_PLACEHOLDER;
 }
 
 async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boolean> {
@@ -574,10 +584,16 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
   }
 
   const billTotal = planned.reduce((s, l) => s.plus(Money.of(l.billAmount)), Money.zero());
-  if (!billTotal.greaterThan(0)) throw validation('The bill total must be greater than zero.');
   const accrualRelieved = planned.reduce((s, l) => s.plus(Money.of(l.accrualAmount)), Money.zero());
+  // A $0 "bill" is allowed only as a pure write-off: closing received quantity the vendor will
+  // never bill (QB: close the PO short). It still relieves the accrual through the GL.
+  const writeOffOnly = planned.some((l) => Money.gt(l.quantityWrittenOff, 0)) && accrualRelieved.greaterThan(0);
+  if (billTotal.isNegative() || (billTotal.isZero() && !writeOffOnly)) {
+    throw validation('The bill total must be greater than zero.');
+  }
 
-  const accrualAccountId = await getOrCreateAccrualAccount(ctx);
+  // Previews are read-only: never create the 2050 account from one (a receipt already did).
+  const accrualAccountId = dryRun ? await findAccrualAccount(ctx) : await getOrCreateAccrualAccount(ctx);
   const [apRow] = await ctx.db
     .select({ id: accounts.id })
     .from(accounts)
@@ -604,7 +620,7 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
   }
   add(apRow.id, billTotal.negated(), `Bill ${input.billNumber ?? ''} — ${vendor.name}`.replace('  ', ' '));
 
-  const acctIds = [...signed.keys()].filter((id) => id !== PPV_PLACEHOLDER);
+  const acctIds = [...signed.keys()].filter((id) => id !== PPV_PLACEHOLDER && id !== ACCRUAL_PLACEHOLDER);
   const names = new Map(
     (
       await ctx.db
@@ -614,6 +630,7 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     ).map((a) => [a.id, a.name]),
   );
   names.set(PPV_PLACEHOLDER, 'Purchase Price Variance (created when you save)');
+  names.set(ACCRUAL_PLACEHOLDER, 'Item Receipts Accrual (created when you save)');
   const postingLines = [...signed.entries()]
     .filter(([, v]) => !v.amount.isZero())
     .map(([accountId, v]) => ({
@@ -660,8 +677,13 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
         billNumber: input.billNumber ?? null,
         date: input.date,
         dueDate: input.dueDate ?? null,
-        memo: input.memo ?? `Bill for received items — ${vendor.name}`,
-        status: 'open',
+        memo:
+          input.memo ??
+          (Money.isZero(preview.billTotal)
+            ? `Write-off of unbilled received items — ${vendor.name}`
+            : `Bill for received items — ${vendor.name}`),
+        // A pure write-off owes the vendor nothing.
+        status: Money.isZero(preview.billTotal) ? 'paid' : 'open',
         total: preview.billTotal,
         amountPaid: '0.00',
         amountCredited: '0.00',
@@ -798,6 +820,9 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
             .update(items)
             .set({ averageCost: newAvg.toFixed(4), updatedAt: new Date() })
             .where(eq(items.id, l.itemId));
+          // Snapshot the stock the variance was spread over so a later void can tell whether
+          // any of it has since left inventory (see releaseReceiptBilling).
+          layerAdjustments.push({ kind: 'average', onHand: onHand.toFixed(4) });
           await writeAudit(tx, {
             action: 'update',
             entityType: 'item',

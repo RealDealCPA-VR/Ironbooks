@@ -311,4 +311,62 @@ describe('Enhanced receiving (QA)', () => {
     }
     await expectBalanced();
   });
+
+  // ---- doer fix round 1 ----
+  async function freshAvgItem(name: string) {
+    const [row] = await db
+      .insert(items)
+      .values({ companyId: ctx.companyId, name, type: 'inventory', salesPrice: '20.00', assetAccountId: acct['1300'], expenseAccountId: acct['5000'], quantityOnHand: '0', averageCost: '0' })
+      .returning();
+    return row;
+  }
+
+  it('average cost: voiding a variance bill is allowed when nothing was sold, even after a restock at another cost', async () => {
+    const it0 = await freshAvgItem('AvgRestock');
+    const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-06-01'), lines: [{ itemId: it0.id, quantity: 10, unitCost: '5.00' }] });
+    const [l] = await lineIds(r.id);
+    const bill = await enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-06-02'), lines: [{ receiptLineId: l, quantity: 10, unitCost: '6.00' }] });
+    await createItemReceipt(ctx, { vendorId, date: new Date('2026-06-03'), lines: [{ itemId: it0.id, quantity: 10, unitCost: '7.00' }] });
+    expect((await itemRow(it0.id)).averageCost).toBe('6.5000');
+    await voidBill(ctx, bill.id);
+    // 10 @ 5 + 10 @ 7 = 120 / 20
+    expect((await itemRow(it0.id)).averageCost).toBe('6.0000');
+    await expectBalanced();
+  });
+
+  it('average cost: a sale followed by a restock back to the same quantity still blocks the void', async () => {
+    const it0 = await freshAvgItem('AvgMasked');
+    const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-06-01'), lines: [{ itemId: it0.id, quantity: 10, unitCost: '5.00' }] });
+    const [l] = await lineIds(r.id);
+    const bill = await enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-06-02'), lines: [{ receiptLineId: l, quantity: 10, unitCost: '6.00' }] });
+    await createInvoice(ctx, { customerId, date: new Date('2026-06-03'), lines: [{ itemId: it0.id, quantity: 5, rate: '20.00' }] });
+    await createItemReceipt(ctx, { vendorId, date: new Date('2026-06-04'), lines: [{ itemId: it0.id, quantity: 5, unitCost: '6.00' }] });
+    expect((await itemRow(it0.id)).quantityOnHand).toBe('10.0000');
+    await expect(voidBill(ctx, bill.id)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect((await getBill(ctx, bill.id)).status).not.toBe('void');
+    await expectBalanced();
+  });
+
+  it('a write-off on its own closes the receipt line short with a $0 record and relieves the accrual', async () => {
+    const it0 = await freshAvgItem('WriteOffOnly');
+    const before = await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE);
+    const r = await createItemReceipt(ctx, { vendorId, date: new Date('2026-06-05'), lines: [{ itemId: it0.id, quantity: 4, unitCost: '5.00' }] });
+    const [l] = await lineIds(r.id);
+    const preview = await previewReceiptBill(ctx, { vendorId, date: new Date('2026-06-06'), lines: [{ receiptLineId: l, quantity: 0, unitCost: '5.00', closeLine: true }] });
+    expect(preview.billTotal).toBe('0.00');
+    const bill = await enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-06-06'), lines: [{ receiptLineId: l, quantity: 0, unitCost: '5.00', closeLine: true }] });
+    expect(bill.total).toBe('0.00');
+    expect(bill.status).toBe('paid');
+    expect(await balanceOf(ITEM_RECEIPT_ACCRUAL_CODE)).toBe(before);
+    expect((await getItemReceipt(ctx, r.id)).status).toBe('billed');
+    // The 4 units on hand are written down to zero cost (variance -20 capitalized).
+    expect((await itemRow(it0.id)).averageCost).toBe('0.0000');
+    await expectBalanced();
+    // Without a write-off a $0 bill is still rejected.
+    const r2 = await createItemReceipt(ctx, { vendorId, date: new Date('2026-06-07'), lines: [{ itemId: it0.id, quantity: 1, unitCost: '5.00' }] });
+    const [l2] = await lineIds(r2.id);
+    await expect(
+      enterBillForReceivedItems(ctx, { vendorId, date: new Date('2026-06-07'), lines: [{ receiptLineId: l2, quantity: 1, unitCost: '0' }] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
 });

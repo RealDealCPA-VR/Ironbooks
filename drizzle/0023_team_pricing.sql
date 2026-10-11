@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS "price_levels" (
 	"name" varchar(255) NOT NULL,
 	"type" varchar(20) DEFAULT 'fixed_percent' NOT NULL,
 	"percent" numeric(9, 4) DEFAULT '0' NOT NULL,
-	"rounding" varchar(20) DEFAULT 'none' NOT NULL,
+	"rounding" varchar(20),
 	"is_active" boolean DEFAULT true NOT NULL,
 	"created_at" timestamp DEFAULT now() NOT NULL,
 	"updated_at" timestamp DEFAULT now() NOT NULL

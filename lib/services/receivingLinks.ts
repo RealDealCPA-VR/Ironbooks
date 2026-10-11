@@ -14,8 +14,9 @@
  *     bill — receipt line billed quantities, PO received-unbilled counters, and any inventory
  *     cost adjustments the price variance made (the GL side is reversed by voidJournalEntry).
  */
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, sql } from 'drizzle-orm';
 import {
+  auditLogs,
   companies,
   inventoryLayers,
   itemReceiptBillLines,
@@ -222,6 +223,30 @@ export async function billHasReceiptLinks(ctx: ServiceContext, billId: string): 
 }
 
 /**
+ * True when any audited change since `since` reduced the item's quantity on hand (sales,
+ * adjustments, assembly builds, counts). Every average-cost stock decrement writes an item
+ * audit row with old/new quantityOnHand.
+ */
+async function stockDecreasedSince(ctx: ServiceContext, itemId: string, since: Date): Promise<boolean> {
+  const [row] = await ctx.db
+    .select({ id: auditLogs.id })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'item'),
+        eq(auditLogs.entityId, itemId),
+        gt(auditLogs.createdAt, since),
+        sql`(${auditLogs.newValues}->>'quantityOnHand') IS NOT NULL`,
+        sql`(${auditLogs.oldValues}->>'quantityOnHand') IS NOT NULL`,
+        sql`(${auditLogs.newValues}->>'quantityOnHand')::numeric < (${auditLogs.oldValues}->>'quantityOnHand')::numeric`,
+      ),
+    )
+    .limit(1);
+  return Boolean(row);
+}
+
+/**
  * Unwind everything a receipt-based bill did outside the GL. Call INSIDE voidBill's
  * transaction, after its journal entry was voided:
  *   - receipt lines' quantityBilled and receipt status (billed/partial -> partial/open),
@@ -262,7 +287,9 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
     // 2) Inventory cost adjustment made by the variance.
     const invVariance = Money.of(link.inventoryVariance);
     if (!invVariance.isZero()) {
-      const adjustments = (link.layerAdjustments ?? []) as Array<Record<string, string>>;
+      const all = (link.layerAdjustments ?? []) as Array<Record<string, string>>;
+      const adjustments = all.filter((a) => a.kind !== 'average');
+      const avgSnapshot = all.find((a) => a.kind === 'average');
       if (adjustments.length > 0) {
         for (const adj of adjustments) {
           const [layer] = await ctx.db
@@ -287,7 +314,14 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
           .where(and(eq(items.id, link.itemId), eq(items.companyId, ctx.companyId)));
         const onHand = Money.of(item?.quantityOnHand ?? '0');
         const value = onHand.times(Money.of(item?.averageCost ?? '0')).minus(invVariance);
-        if (!item || !onHand.greaterThan(0) || value.lessThan('-0.005')) {
+        // The variance was spread over the stock on hand at billing time. If any of that stock
+        // has since left inventory, part of the variance already flowed to COGS and reversing it
+        // all from the remaining units would misstate both — refuse (as the FIFO branch does).
+        const soldSince =
+          !item ||
+          (avgSnapshot != null && onHand.lessThan(avgSnapshot.onHand)) ||
+          (await stockDecreasedSince(ctx, item.id, link.createdAt));
+        if (soldSince || !onHand.greaterThan(0) || value.lessThan('-0.005')) {
           throw new ServiceError(
             'CONFLICT',
             'Cannot void this bill: stock whose cost it adjusted has since been sold. Enter a vendor credit for the difference instead.',

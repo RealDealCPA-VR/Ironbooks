@@ -78,7 +78,7 @@ interface PriceLevel {
   name: string;
   type: 'fixed_percent' | 'per_item';
   percent: string;
-  rounding: RoundingMode;
+  rounding: RoundingMode | null;
   isActive: boolean;
   customerCount: number;
   items: Array<{ itemId: string; price: string }>;
@@ -438,6 +438,12 @@ function RuleModal({
             <MultiPick label="Classes" options={lookups.classes} value={d.conditions.classIds} onChange={(classIds) => setCond({ classIds })} />
             <MultiPick label="Sales reps" options={lookups.salesReps} value={d.conditions.salesRepIds} onChange={(salesRepIds) => setCond({ salesRepIds })} />
           </div>
+          {(d.conditions.jobIds.length > 0 || d.conditions.classIds.length > 0 || d.conditions.salesRepIds.length > 0) && (
+            <p className="mt-2 text-xs text-navy/60">
+              Job, class and sales-rep conditions are checked on invoices (and class on sales receipts).
+              Estimates and sales orders don&apos;t record these fields, so such a rule won&apos;t price them.
+            </p>
+          )}
         </section>
       </div>
     </Modal>
@@ -582,7 +588,7 @@ function LevelModal({
   const [type, setType] = useState<'fixed_percent' | 'per_item'>('fixed_percent');
   const [direction, setDirection] = useState<'decrease' | 'increase'>('decrease');
   const [pct, setPct] = useState('');
-  const [rounding, setRounding] = useState<RoundingMode>('none');
+  const [rounding, setRounding] = useState<'' | RoundingMode>('');
   const [active, setActive] = useState(true);
   const [prices, setPrices] = useState<Record<string, string>>({});
   const [bulkPct, setBulkPct] = useState('');
@@ -595,7 +601,7 @@ function LevelModal({
     setType(level?.type ?? 'fixed_percent');
     setDirection(p > 0 ? 'increase' : 'decrease');
     setPct(p ? String(Math.abs(p)) : '');
-    setRounding(level?.rounding ?? 'none');
+    setRounding(level?.rounding ?? '');
     setActive(level?.isActive ?? true);
     setPrices(Object.fromEntries((level?.items ?? []).map((i) => [i.itemId, String(Number(i.price))])));
     setBulkPct('');
@@ -619,7 +625,7 @@ function LevelModal({
     const signed = type === 'fixed_percent' ? (direction === 'decrease' ? -1 : 1) * (Number(pct) || 0) : 0;
     setSaving(true);
     try {
-      const body = { name: name.trim(), type, percent: String(signed), rounding, isActive: active };
+      const body = { name: name.trim(), type, percent: String(signed), rounding: rounding || null, isActive: active };
       const saved = level
         ? await api.put<PriceLevel>(`/api/pricing/levels/${level.id}`, body)
         : await api.post<PriceLevel>('/api/pricing/levels', body);
@@ -681,7 +687,8 @@ function LevelModal({
             </div>
             <div>
               <Label htmlFor="lvl-round">Rounding</Label>
-              <Select id="lvl-round" value={rounding} onChange={(e) => setRounding(e.target.value as RoundingMode)}>
+              <Select id="lvl-round" value={rounding} onChange={(e) => setRounding(e.target.value as '' | RoundingMode)}>
+                <option value="">Company default</option>
                 {ROUNDING_MODES.map((m) => (
                   <option key={m} value={m}>{ROUNDING_LABELS[m]}</option>
                 ))}
@@ -790,7 +797,7 @@ function LevelsTab({ levels, items, reload }: { levels: PriceLevel[]; items: Ite
                     ? `${l.items.length} item price${l.items.length === 1 ? '' : 's'}`
                     : `${Number(l.percent) > 0 ? '+' : ''}${Number(l.percent)}%`}
                 </Td>
-                <Td className="text-sm text-navy/60">{ROUNDING_LABELS[l.rounding] ?? l.rounding}</Td>
+                <Td className="text-sm text-navy/60">{l.rounding ? ROUNDING_LABELS[l.rounding] ?? l.rounding : 'Company default'}</Td>
                 <Td numeric>{l.customerCount}</Td>
                 <Td className="text-right">
                   <Button size="sm" variant="ghost" onClick={() => { setEditing(l); setOpen(true); }} aria-label={`Edit ${l.name}`}>

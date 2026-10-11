@@ -397,6 +397,28 @@ describe('Advanced pricing (QA) — integration', () => {
     expect(row.parentId).toBeNull();
   });
 
+  it('vendor type hierarchy rejects deeper cycles (A under C, C under B, B under A)', async () => {
+    const a = await createType(ctx, 'vendor', { name: 'VCycle A' });
+    const b = await createType(ctx, 'vendor', { name: 'VCycle B', parentId: a.id });
+    const c = await createType(ctx, 'vendor', { name: 'VCycle C', parentId: b.id });
+    await expect(updateType(ctx, 'vendor', a.id, { name: 'VCycle A', parentId: c.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // Re-parenting within a valid tree still works.
+    await expect(updateType(ctx, 'vendor', c.id, { name: 'VCycle C', parentId: a.id })).resolves.toMatchObject({ parentId: a.id });
+  });
+
+  it('a fixed-price rule still applies to an item with unknown cost (only cost-based rules are skipped)', () => {
+    const item: EngineItem = { id: 'i1', type: 'service', salesPrice: '100.00', cost: null, customFields: null };
+    const d = data({
+      rules: [
+        rule({ id: 'r1', name: 'Cost plus', adjustment: { basis: 'cost', method: 'percent', direction: 'increase', value: '20' } }),
+        rule({ id: 'r2', name: 'Fixed 80', adjustment: { basis: 'cost', method: 'fixed', direction: 'increase', value: '80' } }),
+      ],
+    });
+    const q = evaluateLinePrice(item, d, line());
+    expect(q.price).toBe('80.00');
+    expect(q.candidates.map((c) => c.id)).toEqual(['r2']);
+  });
+
   it('customer type names are unique case-insensitively; parent must be same company', async () => {
     await createType(ctx, 'customer', { name: 'Dupe' });
     await expect(createType(ctx, 'customer', { name: ' dUPE ' })).rejects.toMatchObject({ code: 'VALIDATION' });

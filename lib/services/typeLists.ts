@@ -41,13 +41,27 @@ async function validateInput(ctx: ServiceContext, kind: TypeListKind, input: Typ
   if (!name) throw validation('Name is required.');
   if (name.length > 255) throw validation('Name is too long.');
   const t = tableFor(kind);
-  const existing = await ctx.db.select({ id: t.id, name: t.name }).from(t).where(eq(t.companyId, ctx.companyId));
+  const existing = await ctx.db
+    .select({ id: t.id, name: t.name, parentId: t.parentId })
+    .from(t)
+    .where(eq(t.companyId, ctx.companyId));
   if (existing.some((r) => r.id !== selfId && r.name.toLowerCase() === name.toLowerCase())) {
     throw validation(`A ${kind} type named "${name}" already exists.`);
   }
   if (input.parentId) {
     if (input.parentId === selfId) throw validation('A type cannot be its own parent.');
     await loadType(ctx, kind, input.parentId);
+    if (selfId) {
+      // Walk the proposed parent's ancestor chain: reaching this type would create a cycle.
+      const parentOf = new Map(existing.map((r) => [r.id, r.parentId]));
+      const seen = new Set<string>();
+      let cur: string | null | undefined = input.parentId;
+      while (cur && !seen.has(cur)) {
+        if (cur === selfId) throw validation('A type cannot be placed under one of its own subtypes.');
+        seen.add(cur);
+        cur = parentOf.get(cur);
+      }
+    }
   }
   return { name, parentId: input.parentId ?? null };
 }

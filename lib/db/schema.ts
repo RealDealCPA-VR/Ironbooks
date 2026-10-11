@@ -1226,7 +1226,8 @@ export const priceLevels = pgTable('price_levels', {
   type: varchar('type', { length: 20 }).notNull().default('fixed_percent'),
   /** Signed percent for fixed_percent levels: -10 = 10% below base, 5 = 5% above. */
   percent: decimal('percent', { precision: 9, scale: 4 }).notNull().default('0'),
-  rounding: varchar('rounding', { length: 20 }).notNull().default('none'),
+  /** null = use the company default rounding (advancedPricing.defaultRounding). */
+  rounding: varchar('rounding', { length: 20 }),
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -1288,7 +1289,7 @@ export const itemReceiptBillLines = pgTable('item_receipt_bill_lines', {
   /** Portion capitalized into on-hand inventory and portion expensed (COGS / PPV / expense). */
   inventoryVariance: decimal('inventory_variance', { precision: 15, scale: 2 }).notNull().default('0'),
   expensedVariance: decimal('expensed_variance', { precision: 15, scale: 2 }).notNull().default('0'),
-  /** FIFO layer cost adjustments made for inventoryVariance ([{ layerId, quantity, unitDelta }]). */
+  /** FIFO layer cost adjustments made for inventoryVariance ([{ layerId, quantity, unitDelta }]); average-cost items store [{ kind: 'average', onHand }] (stock the variance was spread over). */
   layerAdjustments: jsonb('layer_adjustments').$type<Array<Record<string, string>>>(),
   writtenOff: boolean('written_off').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),

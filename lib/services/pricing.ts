@@ -31,6 +31,9 @@
  *   - rate != expected -> accepted as a manual override (QB lets users type over any price),
  *                         flagged `overridden: true` with the expected price kept for audit.
  * Provenance is persisted on the line's `pricing` jsonb column.
+ * Known limitation: estimates and sales orders carry no class / sales rep / job, and sales
+ * receipts carry only a class, so rules conditioned on those never match there (the rule
+ * editor says so).
  */
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import Decimal from 'decimal.js';
@@ -222,7 +225,8 @@ export interface EngineLevel {
   name: string;
   type: 'fixed_percent' | 'per_item';
   percent: string;
-  rounding: RoundingMode;
+  /** null = company default rounding. */
+  rounding: RoundingMode | null;
   isActive: boolean;
 }
 
@@ -284,13 +288,16 @@ export function ruleMatches(
   return true;
 }
 
-/** Price an item under one rule (tiers + rounding). Returns the price and the tier used. */
+/**
+ * Price an item under one rule (tiers + rounding). Returns the price and the tier used, or
+ * null when the rule cannot be evaluated (cost-based adjustment on an item with unknown cost).
+ */
 export function priceUnderRule(
   rule: EngineRule,
   item: EngineItem,
   quantity: Decimal.Value,
   defaultRounding: RoundingMode,
-): { price: Decimal; tierMinQuantity: string | null; adjustment: PriceAdjustment } {
+): { price: Decimal; tierMinQuantity: string | null; adjustment: PriceAdjustment } | null {
   const qty = new Decimal(quantity);
   let adjustment = rule.adjustment;
   let tierMinQuantity: string | null = null;
@@ -304,6 +311,9 @@ export function priceUnderRule(
       break;
     }
   }
+  // A cost-based adjustment on an item with no known cost cannot be evaluated: skip the rule
+  // rather than price from a cost of 0 (which would give the item away).
+  if (adjustment.method !== 'fixed' && adjustment.basis === 'cost' && item.cost == null) return null;
   const raw = applyAdjustment(item.salesPrice ?? 0, item.cost ?? 0, adjustment);
   return {
     price: roundPrice(raw, rule.rounding ?? defaultRounding),
@@ -345,6 +355,7 @@ export function evaluateLinePrice(item: EngineItem, data: EngineData, line: Engi
     for (const rule of data.rules) {
       if (!ruleMatches(rule, item, data.customer, line)) continue;
       const r = priceUnderRule(rule, item, line.quantity, data.settings.defaultRounding);
+      if (!r) continue;
       candidates.push({
         source: 'price_rule',
         id: rule.id,
@@ -519,8 +530,8 @@ function normalizeLevel(input: PriceLevelInput) {
   const percent = toDecimal(input.percent ?? 0);
   if (percent.lessThanOrEqualTo(-100)) throw validation('A price level cannot reduce prices by 100% or more.');
   if (percent.greaterThan(10000)) throw validation('Price level percent is too large.');
-  const rounding = input.rounding ?? 'none';
-  if (!isRoundingMode(rounding)) throw validation('Unknown rounding option.');
+  const rounding = input.rounding ?? null; // null = company default
+  if (rounding !== null && !isRoundingMode(rounding)) throw validation('Unknown rounding option.');
   return { name, type: input.type, percent: percent.toFixed(4), rounding };
 }
 
@@ -989,7 +1000,7 @@ export async function loadPricingData(
           name: l.name,
           type: l.type === 'per_item' ? 'per_item' : 'fixed_percent',
           percent: l.percent,
-          rounding: isRoundingMode(l.rounding) ? l.rounding : 'none',
+          rounding: isRoundingMode(l.rounding) ? l.rounding : null,
           isActive: l.isActive,
         };
         if (level.type === 'per_item' && itemIds.length > 0) {
