@@ -51,6 +51,8 @@ interface Span {
   end: number;
   kind: RedactionKind;
   original: string;
+  /** Placeholder already assigned to this value by an earlier redact() call. */
+  placeholder?: string;
 }
 
 function escapeRegex(s: string): string {
@@ -113,7 +115,9 @@ const DETECTORS: Detector[] = [
   },
   { kind: 'SSN', re: /(?<![\d-])\d{3}-\d{2}-\d{4}(?![\d-])/g },
   // Unlabeled SSN written with spaces: "123 45 6789" (not part of a longer digit sequence).
-  { kind: 'SSN', re: /(?<![\d.,]|\d\s)\d{3} \d{2} \d{4}(?!\d|[.,]\d|\s\d)/g },
+  // Only a single plain space joins digit groups; a tab or newline next to a digit (TSV
+  // columns, line breaks) is a field boundary, not part of the number.
+  { kind: 'SSN', re: /(?<![\d.,]|\d )\d{3} \d{2} \d{4}(?!\d|[.,]\d| \d)/g },
   { kind: 'EIN', re: /(?<![\d-])\d{2}-\d{7}(?![\d-])/g },
   {
     kind: 'PHONE',
@@ -158,7 +162,7 @@ const MIN_NUMERIC_ENTITY_DIGITS = 6;
 
 /** Entities from the person/organization lists all share their own kind's counter. */
 export class Redactor {
-  private readonly entities: { re: RegExp; kind: RedactionKind }[];
+  private readonly entities: { re: RegExp; kind: RedactionKind; numeric: boolean }[];
   private readonly byKey = new Map<string, string>();
   private readonly byPlaceholder = new Map<string, string>();
   private readonly counters = new Map<RedactionKind, number>();
@@ -188,8 +192,14 @@ export class Redactor {
       .sort((a, b) => (b.digits || b.text).length - (a.digits || a.text).length);
     this.entities = cleaned.map((e) => ({
       kind: e.kind,
+      numeric: !!e.digits,
+      // Only phones are commonly written with dots ("555.0100"); for tax ids / account
+      // numbers a '.' would let the entity swallow a money amount ("$1234567.89").
       re: e.digits
-        ? new RegExp(`(?<![\\d.,])${e.digits.split('').join('[\\s.()-]*')}(?![\\d]|[.,]\\d)`, 'g')
+        ? new RegExp(
+            `(?<![\\d.,])${e.digits.split('').join(e.kind === 'PHONE' ? '[\\s.()-]*' : '[\\s()-]*')}(?![\\d]|[.,]\\d)`,
+            'g',
+          )
         : new RegExp(
             `(?<![A-Za-z0-9])${e.text.split(' ').map(escapeRegex).join('\\s+')}(?![A-Za-z0-9])`,
             'gi',
@@ -231,9 +241,35 @@ export class Redactor {
       spans.push({ start, end, kind, original: text.slice(start, end) });
     };
 
+    // Values this instance already replaced are re-redacted verbatim (longest first), whatever
+    // detector first found them. A value detected only through its context ("acct # 123456")
+    // would otherwise slip through when it reappears without that context.
+    if (this.byPlaceholder.size > 0) {
+      const known = [...this.byPlaceholder.entries()].sort((a, b) => b[1].length - a[1].length);
+      for (const [placeholder, original] of known) {
+        if (!original.trim()) continue;
+        const body = original.trim().split(/\s+/).map(escapeRegex).join('\\s+');
+        const re = /^\d|\d$/.test(original.trim())
+          ? new RegExp(`(?<![\\d.,])${body}(?![\\d]|[.,]\\d)`, 'g')
+          : new RegExp(`(?<![A-Za-z0-9])${body}(?![A-Za-z0-9])`, 'gi');
+        for (const m of text.matchAll(re)) {
+          const start = m.index!;
+          const end = start + m[0].length;
+          if (end <= start || overlaps(start, end)) continue;
+          taken.push([start, end]);
+          spans.push({ start, end, kind: 'PERSON', original: m[0], placeholder });
+        }
+      }
+    }
+
     for (const ent of this.entities) {
       ent.re.lastIndex = 0;
-      for (const m of text.matchAll(ent.re)) add(m.index!, m.index! + m[0].length, ent.kind);
+      for (const m of text.matchAll(ent.re)) {
+        // A digit-matched entity never ends on a decimal fraction: "55501.00" is a money
+        // amount, not the phone 555-0100.
+        if (ent.numeric && /[.,]\d{1,2}$/.test(m[0])) continue;
+        add(m.index!, m.index! + m[0].length, ent.kind);
+      }
     }
 
     for (const det of DETECTORS) {
@@ -258,7 +294,7 @@ export class Redactor {
     let out = '';
     let pos = 0;
     for (const sp of spans) {
-      out += text.slice(pos, sp.start) + this.placeholderFor(sp.kind, sp.original);
+      out += text.slice(pos, sp.start) + (sp.placeholder ?? this.placeholderFor(sp.kind, sp.original));
       pos = sp.end;
     }
     return out + text.slice(pos);

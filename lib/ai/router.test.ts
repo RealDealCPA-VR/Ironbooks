@@ -307,6 +307,26 @@ describe('AiRouter structured JSON', () => {
     const res = await r.chatJson('assistant', [{ role: 'user', content: 'Bob Plumbing' }], z.object({ who: z.string() }));
     expect(res.data.who).toBe('Bob Plumbing');
   });
+
+  it('cloud repair turns quote placeholders, never restored values', async () => {
+    const cloud = fakeProvider('c', 'cloud', ['{"who":"[VENDOR_1]","n":"x"}', '{"who":"6000","n":1}']);
+    const r = new AiRouter({ providers: [cloud], cloudEnabled: true, taskPolicies: { assistant: 'cloud-only' }, redactorFactory: () => new Redactor([{ text: 'Bob Plumbing', kind: 'VENDOR' }]) });
+    await r.chatJson('assistant', [{ role: 'user', content: 'Bob Plumbing' }], z.object({ who: z.enum(['6000', '6100']), n: z.number() }));
+    const repair = cloud.seen[1][cloud.seen[1].length - 1].content;
+    expect(repair).toContain('[VENDOR_1]');
+    expect(cloud.seen.flat().map((m) => m.content).join('\n')).not.toContain('Bob');
+  });
+
+  it('a cloud reply valid only in placeholder form gets a detail-free repair message', async () => {
+    // The placeholder passes max(12) but the restored vendor name does not.
+    const cloud = fakeProvider('c', 'cloud', ['{"who":"[VENDOR_1]"}', '{"who":"short"}']);
+    const r = new AiRouter({ providers: [cloud], cloudEnabled: true, taskPolicies: { assistant: 'cloud-only' }, redactorFactory: () => new Redactor([{ text: 'Bob Plumbing and Heating', kind: 'VENDOR' }]) });
+    const res = await r.chatJson('assistant', [{ role: 'user', content: 'Bob Plumbing and Heating' }], z.object({ who: z.string().max(12) }));
+    expect(res.data.who).toBe('short');
+    const wire = cloud.seen.flat().map((m) => m.content).join('\n');
+    expect(wire).not.toContain('Bob');
+    expect(wire).toMatch(/did not satisfy the required schema/);
+  });
 });
 
 describe('extractJson', () => {

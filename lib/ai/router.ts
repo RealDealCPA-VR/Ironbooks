@@ -208,8 +208,8 @@ export class AiRouter {
           attempts.push({ providerId: p.id, locality: p.locality, ok: true });
           return { data: parsed1.data, raw: first.content, repaired: false, providerId: p.id, model: first.model, locality: p.locality, redacted: !!redactor, attempts };
         }
-        // One repair attempt. The validation error text can quote restored (real) values, so
-        // for a cloud provider the repair turn is redacted again before it goes on the wire.
+        // One repair attempt. For a cloud provider the error text is built from placeholder
+        // values (see parseAndValidate) and is redacted again as defense in depth.
         const repairText =
           `Your previous reply was not valid: ${parsed1.error}. ` +
           'Reply again with ONLY the corrected JSON — no prose, no markdown fences.';
@@ -249,10 +249,18 @@ function parseAndValidate<T>(
   } catch (err) {
     return { ok: false, error: errMsg(err) };
   }
-  if (redactor) value = redactor.restoreDeep(value);
-  const res = schema.safeParse(value);
+  const res = schema.safeParse(redactor ? redactor.restoreDeep(value) : value);
   if (res.success) return { ok: true, data: res.data };
-  const issues = res.error.issues
+  // The error text goes back to the model in the repair turn. For a redacted (cloud) call it
+  // is built from the UNRESTORED value, so any quoted "received '…'" is a placeholder and
+  // never a real value. If the placeholder form happens to validate, give no details.
+  let failure = res.error;
+  if (redactor) {
+    const raw = schema.safeParse(value);
+    if (raw.success) return { ok: false, error: 'the values did not satisfy the required schema' };
+    failure = raw.error;
+  }
+  const issues = failure.issues
     .slice(0, 5)
     .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
     .join('; ');

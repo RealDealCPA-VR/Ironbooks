@@ -151,3 +151,27 @@ describe('Redactor — pattern detectors', () => {
     expect(x.restore(red)).toBe(memo);
   });
 });
+
+describe('Redactor — values already redacted stay redacted without their context', () => {
+  it('re-redacts a label-detected account number when it reappears bare', () => {
+    const x = new Redactor();
+    expect(x.redact('Transfer from acct # 123456')).toBe('Transfer from acct # [ACCOUNT_1]');
+    // No label now and only 6 digits — only the reverse map can catch it.
+    expect(x.redact("received '123456'")).toBe("received '[ACCOUNT_1]'");
+    // Does not bite into a longer number or a money amount.
+    expect(x.redact('1234567 and 123456.00')).toBe('1234567 and 123456.00');
+  });
+
+  it('known tax ids / account numbers do not match across a decimal point', () => {
+    const x = new Redactor([{ text: '98-7654321', kind: 'EIN' }, { text: '00123456', kind: 'ACCOUNT' }]);
+    expect(x.redact('Total 98765432.10 and 0012345.6')).toBe('Total 98765432.10 and 0012345.6');
+    expect(x.redact('EIN 98 7654321')).not.toContain('7654321');
+  });
+
+  it('spaced SSN after tab / newline boundaries is caught, but not inside a spaced digit run', () => {
+    const x = new Redactor();
+    expect(x.redact('9\t123 45 6789')).not.toContain('123 45 6789');
+    expect(x.redact('9\r\n123 45 6789')).not.toContain('123 45 6789');
+    expect(new Redactor().redact('9 123 45 6789')).toContain('123 45 6789');
+  });
+});
