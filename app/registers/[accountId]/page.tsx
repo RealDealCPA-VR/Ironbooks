@@ -11,6 +11,7 @@
  * journal-entry detail modal. A "New Transaction" menu shortcuts to the check,
  * deposit, transfer and journal-entry forms.
  */
+import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
@@ -110,6 +111,13 @@ function columnConfig(subtype: string): ColumnConfig {
           { key: 'decrease', label: 'Paid' },
         ],
       };
+    case 'undeposited_funds':
+      return {
+        columns: [
+          { key: 'decrease', label: 'Deposited' },
+          { key: 'increase', label: 'Received' },
+        ],
+      };
     default:
       return {
         columns: [
@@ -129,10 +137,7 @@ function amountFor(row: RegisterRow, accountType: string, key: AmountKey): strin
 }
 
 function subtypeLabel(subtype: string): string {
-  return subtype
-    .split('_')
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ');
+  return SUBTYPE_LABELS[subtype as keyof typeof SUBTYPE_LABELS] ?? subtype;
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@
  * (in transaction currency, via invoices.markPaidAmount).
  * The returned paymentsReceived row's `postedEntryId` links back to the journal entry.
  */
+import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { and, eq, inArray } from 'drizzle-orm';
 import {
   accounts,
@@ -811,11 +812,8 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
-  if (
-    bankAcct.type !== 'asset' ||
-    bankAcct.subtype === 'accounts_receivable' ||
-    bankAcct.subtype === 'inventory'
-  ) {
+  // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
+  if (!isDepositTargetAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
   }
 

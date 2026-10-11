@@ -35,6 +35,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { journalOpenItems } from './journal';
 import { ServiceError, inTransaction, writeAudit } from './_base';
 import { balanceSheetCashBasis } from './balanceSheetCashBasis';
 import { LedgerIntegrityError } from './ledgerAssert';
@@ -206,7 +207,11 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
     );
 
   const arBalance = Money.of(arAccount.balance);
-  const invoicesDue = Money.of(invRow?.totalDue ?? 0);
+  // Named General Journal lines on A/R are customer open items too (journal.ts journalOpenItems).
+  const journalItems = (await journalOpenItems(ctx, 'ar')).filter((j) => j.accountId === arAccount.id);
+  const invoicesDue = Money.of(invRow?.totalDue ?? 0).plus(
+    journalItems.reduce((sum, j) => sum.plus(Money.of(j.amount)), Money.zero()),
+  );
 
   if (Money.equalWithinCent(arBalance, invoicesDue)) {
     return {
@@ -284,6 +289,10 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_accounts_guard: 'Account balances cannot be edited directly',
   bka_jel_no_truncate: 'Journal lines cannot be truncated',
   bka_je_no_truncate: 'Journal entries cannot be truncated',
+  // drizzle/0025_wave2_foundation.sql
+  bka_jel_non_posting: 'Non-posting accounts never carry posted amounts (lines)',
+  bka_je_non_posting: 'Non-posting accounts never carry posted amounts (post transitions)',
+  bka_accounts_non_posting: 'Accounts with history cannot become non-posting',
 };
 
 async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string[]; total: number }> {

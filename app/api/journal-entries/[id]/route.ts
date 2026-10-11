@@ -40,6 +40,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
         description: body.description ?? '',
         reference: body.reference === undefined ? undefined : (body.reference ?? null),
         lines: body.lines ?? [],
+        isAdjusting: typeof body.isAdjusting === 'boolean' ? body.isAdjusting : undefined,
       }),
     );
     return NextResponse.json({ entry });

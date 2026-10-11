@@ -35,6 +35,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { notFound, validation, writeAudit, type ServiceContext } from './_base';
 import { taxIdFor } from './access';
+import { journalOpenItems } from './journal';
 
 // ---------------------------------------------------------------------------
 // Customer Statement
@@ -42,8 +43,11 @@ import { taxIdFor } from './access';
 
 export interface StatementLine {
   date: string;
-  type: 'invoice' | 'payment' | 'credit_memo';
-  /** Invoice number (invoices), payment reference (payments), or memo number (credit memos). */
+  type: 'invoice' | 'payment' | 'credit_memo' | 'general_journal';
+  /**
+   * Invoice number (invoices), payment reference (payments), memo number (credit memos), or
+   * "GJ #<entry>" for a named General Journal line on A/R (amount signed: + charge, − credit).
+   */
   ref: string | null;
   /** Positive for invoices (charges); positive for payments/credit memos (credits). */
   amount: string;
@@ -141,6 +145,18 @@ export async function customerStatement(
     openingBalance = priorInvoices.minus(priorPayments).minus(priorCreditMemos);
   }
 
+  // Named General Journal lines on A/R for this customer (QB shows them as "General Journal").
+  const journalItems = await journalOpenItems(ctx, 'ar', { entityId: customerId });
+  const toExclusive = range?.to ? new Date(range.to.getTime() + 86_400_000) : null;
+  const journalInRange = journalItems.filter(
+    (j) => (!range?.from || j.date >= range.from) && (!toExclusive || j.date < toExclusive),
+  );
+  if (range?.from) {
+    for (const j of journalItems) {
+      if (j.date < range.from) openingBalance = openingBalance.plus(Money.of(j.amount));
+    }
+  }
+
   // --- In-range invoices ---
   const invoiceConds = [
     eq(invoices.companyId, ctx.companyId),
@@ -203,7 +219,8 @@ export async function customerStatement(
   type RawLine =
     | { kind: 'invoice'; date: Date; ref: string; amount: string }
     | { kind: 'payment'; date: Date; ref: string | null; amount: string }
-    | { kind: 'credit_memo'; date: Date; ref: string; amount: string };
+    | { kind: 'credit_memo'; date: Date; ref: string; amount: string }
+    | { kind: 'general_journal'; date: Date; ref: string; amount: string };
 
   const raw: RawLine[] = [
     ...invoiceRows.map((r) => ({
@@ -224,6 +241,12 @@ export async function customerStatement(
       ref: String(r.memoNumber),
       amount: r.total,
     })),
+    ...journalInRange.map((j) => ({
+      kind: 'general_journal' as const,
+      date: j.date,
+      ref: `GJ #${j.entryNumber}`,
+      amount: j.amount,
+    })),
   ];
 
   raw.sort((a, b) => a.date.getTime() - b.date.getTime());
@@ -231,7 +254,8 @@ export async function customerStatement(
   // --- Compute running balance ---
   let running = openingBalance;
   const lines: StatementLine[] = raw.map((r) => {
-    if (r.kind === 'invoice') {
+    if (r.kind === 'invoice' || r.kind === 'general_journal') {
+      // General Journal amounts are already signed (+ charge, − credit).
       running = running.plus(Money.of(r.amount));
     } else {
       // Payments and credit memos both reduce what the customer owes.

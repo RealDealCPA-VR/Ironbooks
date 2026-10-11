@@ -40,7 +40,18 @@ export interface PostingLine {
   memo?: string | null;
   /** Optional class/department dimension for class-based reporting. */
   classId?: string | null;
+  /**
+   * QB "Name" column: the customer / vendor / employee / other name this line is for.
+   * Required by manual journal entries on A/R (customer) and A/P (vendor) lines — see
+   * journal.ts assertJournalNames. Both fields are set together or not at all.
+   */
+  entityType?: JournalEntityType | null;
+  entityId?: string | null;
 }
+
+export type JournalEntityType = 'customer' | 'vendor' | 'employee' | 'other';
+export const JOURNAL_ENTITY_TYPES: readonly JournalEntityType[] = ['customer', 'vendor', 'employee', 'other'];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface PostJournalEntryInput {
   date: Date;
@@ -51,6 +62,8 @@ export interface PostJournalEntryInput {
   lines: PostingLine[];
   /** Optional: link source document for traceability (e.g. "invoice:<id>"). */
   sourceRef?: string;
+  /** QB "Adjusting Entry" flag (shown on the Adjusting Journal Entries report). */
+  isAdjusting?: boolean;
 }
 
 const DEBIT_NORMAL = new Set(['asset', 'expense']);
@@ -134,12 +147,33 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
   // Verify every referenced account belongs to this company and load its type.
   const accountIds = [...new Set(input.lines.map((l) => l.accountId))];
   const accountRows = await ctx.db
-    .select({ id: accounts.id, type: accounts.type })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, accountIds)));
   const typeById = new Map(accountRows.map((a) => [a.id, a.type]));
   for (const id of accountIds) {
     if (!typeById.has(id)) throw notFound(`Account ${id}`);
+  }
+  // Non-posting accounts (estimates, purchase orders) never carry amounts. The database refuses
+  // it too (0025 bka_jel_non_posting); this gives a friendly message up front.
+  if (status === 'posted') {
+    const np = accountRows.find((a) => a.subtype === 'non_posting');
+    if (np) {
+      throw validation(
+        `"${np.name}" is a non-posting account (used for estimates and purchase orders) and cannot be used in a transaction.`,
+      );
+    }
+  }
+  for (const [i, l] of input.lines.entries()) {
+    if (Boolean(l.entityType) !== Boolean(l.entityId)) {
+      throw validation(`Line ${i + 1}: a name needs both its kind and its id.`);
+    }
+    if (l.entityType && !JOURNAL_ENTITY_TYPES.includes(l.entityType)) {
+      throw validation(`Line ${i + 1}: unknown name kind "${l.entityType}".`);
+    }
+    if (l.entityId && !UUID_RE.test(l.entityId)) {
+      throw validation(`Line ${i + 1}: that name was not found.`);
+    }
   }
 
   return inTransaction(ctx, async (tx) => {
@@ -154,6 +188,7 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
         reference: input.reference ?? null,
         status,
         sourceRef: input.sourceRef ?? null,
+        isAdjusting: input.isAdjusting ?? false,
         createdBy: tx.userId ?? '00000000-0000-0000-0000-000000000000',
       })
       .returning();
@@ -166,6 +201,8 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       credit: l.credit != null && Money.gt(l.credit, 0) ? toAmountString(l.credit) : null,
       memo: l.memo ?? null,
       classId: l.classId ?? null,
+      entityType: l.entityType ?? null,
+      entityId: l.entityType ? (l.entityId ?? null) : null,
     }));
 
     await tx.db.insert(journalEntryLines).values(
@@ -176,7 +213,12 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       action: 'create',
       entityType: 'journal_entry',
       entityId: entry.id,
-      newValues: { entryNumber, description: input.description, lines: input.lines },
+      newValues: {
+        entryNumber,
+        description: input.description,
+        lines: input.lines,
+        ...(input.isAdjusting ? { isAdjusting: true } : {}),
+      },
     });
 
     return entry;

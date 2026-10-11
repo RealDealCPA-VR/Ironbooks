@@ -13,10 +13,11 @@
  *  - displayName is mandatory and non-empty; email is validated if provided.
  *  - Deactivation is soft-delete (isActive = false); hard delete is not exposed.
  */
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { customers, invoices } from '@/lib/db/schema';
-import { toAmountString } from '@/lib/money';
+import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { journalBalancesByEntity } from './journal';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -334,10 +335,34 @@ export async function customerBalanceSummary(
     .groupBy(invoices.customerId, customers.displayName)
     .orderBy(asc(customers.displayName));
 
-  return rows.map((r) => ({
+  const result = rows.map((r) => ({
     customerId: r.customerId,
     displayName: r.displayName,
     totalBalanceDue: toAmountString(r.totalBalanceDue),
     openInvoiceCount: Number(r.openInvoiceCount),
   }));
+
+  // Named General Journal lines on A/R are part of the customer's balance (QB parity).
+  const journal = await journalBalancesByEntity(ctx, 'ar');
+  if (journal.size > 0) {
+    const byId = new Map(result.map((r) => [r.customerId, r]));
+    const missing = [...journal.keys()].filter((id) => !byId.has(id));
+    const names = missing.length
+      ? await ctx.db
+          .select({ id: customers.id, displayName: customers.displayName })
+          .from(customers)
+          .where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, missing)))
+      : [];
+    for (const n of names) {
+      const row = { customerId: n.id, displayName: n.displayName, totalBalanceDue: '0.00', openInvoiceCount: 0 };
+      result.push(row);
+      byId.set(n.id, row);
+    }
+    for (const [id, amt] of journal) {
+      const row = byId.get(id);
+      if (row) row.totalBalanceDue = toAmountString(Money.of(row.totalBalanceDue).plus(Money.of(amt)));
+    }
+    result.sort((a, b) => a.displayName.localeCompare(b.displayName));
+  }
+  return result;
 }

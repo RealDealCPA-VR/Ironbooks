@@ -473,7 +473,8 @@ describe('Linked transactions service', () => {
       description: 'Month-end accrual',
       lines: [
         { accountId: acct['5000'], debit: '250.00' },
-        { accountId: acct['2000'], credit: '250.00' },
+        // QB rule (wave2 foundation): an A/P line on a journal entry names the vendor.
+        { accountId: acct['2000'], credit: '250.00', entityType: 'vendor', entityId: vendorId },
       ],
     });
     const reversal = await reverseEntry(ctx, original.id, new Date('2025-09-01'));

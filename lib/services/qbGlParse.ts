@@ -115,19 +115,20 @@ export function toBookkeeperType(
     case 'Accounts Receivable':
       return { type: 'asset', subtype: 'accounts_receivable' };
     case 'Other Current Asset':
-      // Matches the IIF importer (OCASSET) and the default chart (Undeposited Funds).
-      return { type: 'asset', subtype: /inventory/.test(n) ? 'inventory' : 'checking' };
+      return {
+        type: 'asset',
+        subtype: /inventory/.test(n) ? 'inventory' : /undeposited/.test(n) ? 'undeposited_funds' : 'other_current_asset',
+      };
     case 'Fixed Asset':
-    case 'Other Asset':
       return { type: 'asset', subtype: 'fixed_assets' };
+    case 'Other Asset':
+      return { type: 'asset', subtype: 'other_asset' };
     case 'Accounts Payable':
       return { type: 'liability', subtype: 'accounts_payable' };
     case 'Credit Card':
       return { type: 'liability', subtype: 'credit_card' };
     case 'Other Current Liability':
-      // The subtype enum has no generic current-liability bucket; A/P's family is the
-      // current one (same choice as the IIF importer and Item Receipts Accrual).
-      return { type: 'liability', subtype: 'accounts_payable' };
+      return { type: 'liability', subtype: 'other_current_liability' };
     case 'Long Term Liability':
       return { type: 'liability', subtype: 'long_term_liability' };
     case 'Equity':
@@ -144,7 +145,7 @@ export function toBookkeeperType(
         subtype: /payroll|wage|salar/.test(n) ? 'payroll' : /\btax/.test(n) ? 'taxes' : 'operating_expenses',
       };
     case 'Other Expense':
-      return { type: 'expense', subtype: 'operating_expenses' };
+      return { type: 'expense', subtype: 'other_expense' };
   }
 }
 

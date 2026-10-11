@@ -42,6 +42,7 @@ const LEGACY_TRIGGERS: Array<[string, string]> = [
   ['journal_entry_lines', 'bka_jel_guard'],
   ['journal_entry_lines', 'bka_jel_sync_ins'],
   ['accounts', 'bka_accounts_guard'],
+  ['journal_entry_lines', 'bka_jel_non_posting'], // 0025 deferred guard
 ];
 
 describe('AI Error Detection + LLM Corrector', () => {

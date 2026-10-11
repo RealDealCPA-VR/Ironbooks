@@ -31,6 +31,66 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/services/reports';
 import type { ServiceContext } from './_base';
+import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
+import { journalOpenItems, resolveEntityNames } from './journal';
+
+/** Detail-report variant of addJournalItemsToAging: one 'General Journal' row per line. */
+async function addJournalItemsToAgingDetail(
+  ctx: ServiceContext,
+  side: 'ar' | 'ap',
+  cutoff: Date,
+  detail: AgingDetailRow[],
+): Promise<void> {
+  const items = await journalOpenItems(ctx, side, { asOf: cutoff });
+  if (items.length === 0) return;
+  const names = await resolveEntityNames(ctx, items);
+  for (const it of items) {
+    const amount = Money.of(it.amount);
+    const raw = ms_to_days(cutoff.getTime() - it.date.getTime());
+    detail.push({
+      docId: it.journalEntryId,
+      docNumber: `General Journal #${it.entryNumber}`,
+      docType: 'journal_entry',
+      entityId: it.entityId,
+      entityName: names.get(`${it.entityType}:${it.entityId}`) ?? '(unknown)',
+      date: it.date.toISOString(),
+      dueDate: it.date.toISOString(),
+      daysPastDue: amount.isNegative() ? 0 : Math.max(0, raw),
+      bucket: amount.isNegative() ? 'current' : agingKey(raw),
+      openBalance: toAmountString(amount),
+    });
+  }
+}
+
+/**
+ * Add named General Journal A/R or A/P lines (journal.ts journalOpenItems) to an aging map.
+ * Each line is an open item dated and due on the entry date (QB "General Journal" rows).
+ */
+async function addJournalItemsToAging(
+  ctx: ServiceContext,
+  side: 'ar' | 'ap',
+  cutoff: Date,
+  byEntity: Map<string, { name: string; buckets: BucketAccum }>,
+): Promise<void> {
+  const items = await journalOpenItems(ctx, side, { asOf: cutoff });
+  if (items.length === 0) return;
+  const names = await resolveEntityNames(ctx, items);
+  for (const it of items) {
+    if (!byEntity.has(it.entityId)) {
+      byEntity.set(it.entityId, {
+        name: names.get(`${it.entityType}:${it.entityId}`) ?? '(unknown)',
+        buckets: blankBuckets(),
+      });
+    }
+    const amount = Money.of(it.amount);
+    // Credits (negative items) sit in 'current' like unapplied credits; charges age by date.
+    const key = amount.isNegative()
+      ? 'current'
+      : agingKey(ms_to_days(cutoff.getTime() - it.date.getTime()));
+    const b = byEntity.get(it.entityId)!.buckets;
+    b[key] = b[key].plus(amount);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -215,6 +275,8 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     buckets.current = buckets.current.minus(Money.of(memo.unapplied));
   }
 
+  await addJournalItemsToAging(ctx, 'ar', cutoff, byCustomer);
+
   return buildAgingReport(byCustomer, cutoff);
 }
 
@@ -325,6 +387,8 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     const buckets = byVendor.get(credit.vendorId)!.buckets;
     buckets.current = buckets.current.minus(Money.of(credit.unapplied));
   }
+
+  await addJournalItemsToAging(ctx, 'ap', cutoff, byVendor);
 
   return buildAgingReport(byVendor, cutoff);
 }
@@ -472,8 +536,6 @@ export async function cashFlow(
       accounts.subtype,
     );
 
-  const CASH_SUBTYPES = new Set(['checking', 'savings']);
-
   let netIncome = Money.zero();
   let cashChange = Money.zero();
   let changeInAR = Money.zero();
@@ -509,13 +571,13 @@ export async function cashFlow(
       netIncome = netIncome.minus(debitNet); // debit-normal
     } else if (row.type === 'asset') {
       const naturalChange = debitNet; // debit-normal
-      if (CASH_SUBTYPES.has(row.subtype)) {
+      if (isCashAccount(row)) {
         cashChange = cashChange.plus(naturalChange);
       } else if (row.subtype === 'accounts_receivable') {
         changeInAR = changeInAR.plus(naturalChange);
       } else if (row.subtype === 'inventory') {
         changeInInventory = changeInInventory.plus(naturalChange);
-      } else if (row.subtype === 'fixed_assets') {
+      } else if (row.subtype === 'fixed_assets' || row.subtype === 'other_asset') {
         // Asset growth is a use of cash.
         const impact = naturalChange.negated();
         investingTotal = investingTotal.plus(impact);
@@ -530,8 +592,8 @@ export async function cashFlow(
       const naturalChange = debitNet.negated(); // credit-normal
       if (row.subtype === 'accounts_payable') {
         changeInAP = changeInAP.plus(naturalChange);
-      } else if (row.subtype === 'long_term_liability') {
-        // Loan draws/paydowns are financing.
+      } else if (!isCurrentLiability(row)) {
+        // Long-term liabilities: loan draws/paydowns are financing.
         financingTotal = financingTotal.plus(naturalChange);
         pushLine(financingLines, row, naturalChange);
       } else {
@@ -709,7 +771,7 @@ export interface AgingDetailRow {
   docId: string;
   /** Human-readable document label, e.g. "Invoice #12" or "Credit Memo #3". */
   docNumber: string;
-  docType: 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit';
+  docType: 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit' | 'journal_entry';
   entityId: string;
   entityName: string;
   date: string;
@@ -864,6 +926,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     });
   }
 
+  await addJournalItemsToAgingDetail(ctx, 'ar', cutoff, detail);
   return buildAgingDetailReport(detail, cutoff);
 }
 
@@ -972,6 +1035,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     });
   }
 
+  await addJournalItemsToAgingDetail(ctx, 'ap', cutoff, detail);
   return buildAgingDetailReport(detail, cutoff);
 }
 

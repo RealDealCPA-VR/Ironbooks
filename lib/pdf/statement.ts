@@ -402,14 +402,18 @@ export async function renderStatementPdf(
       }
 
       const isInvoice = line.type === 'invoice';
+      const isJournal = line.type === 'general_journal';
+      // General Journal amounts are signed: + is a charge, − a credit.
+      const isCharge = isInvoice || (isJournal && !line.amount.startsWith('-'));
+      const absAmount = line.amount.replace(/^-/, '');
       const refStr    = isInvoice && line.ref ? `Inv #${line.ref}` : (line.ref ?? '—');
 
       drawTableRow(
         fmtDate(line.date),
-        isInvoice ? 'Invoice' : line.type === 'credit_memo' ? 'Credit Memo' : 'Payment',
+        isInvoice ? 'Invoice' : line.type === 'credit_memo' ? 'Credit Memo' : isJournal ? 'General Journal' : 'Payment',
         refStr,
-        isInvoice ? fmt(line.amount) : '',
-        isInvoice ? '' : fmt(line.amount),
+        isCharge ? fmt(absAmount) : '',
+        isCharge ? '' : fmt(absAmount),
         fmt(line.runningBalance),
         { altShade: rowIdx % 2 === 0 },
       );

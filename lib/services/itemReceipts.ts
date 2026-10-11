@@ -72,9 +72,9 @@ import { adjustPoReceivedUnbilled, recomputePoStatus } from './receivingLinks';
 
 /**
  * The clearing liability that holds received-not-billed value. QB calls this
- * "Inventory Offset" / item receipts accrual. The account subtype enum has no
- * generic current-liability bucket, so 'accounts_payable' (the current-liability
- * family A/P lives in) is used; the 2050 code keeps it adjacent to 2000 A/P.
+ * "Inventory Offset" / item receipts accrual. It is an Other Current Liability (not A/P:
+ * it must not show in the A/P figure or need a vendor name); the 2050 code keeps it
+ * adjacent to 2000 A/P.
  */
 export const ITEM_RECEIPT_ACCRUAL_CODE = '2050';
 export const ITEM_RECEIPT_ACCRUAL_NAME = 'Item Receipts Accrual';
@@ -140,7 +140,7 @@ export async function getOrCreateAccrualAccount(ctx: ServiceContext): Promise<st
       code: ITEM_RECEIPT_ACCRUAL_CODE,
       name: ITEM_RECEIPT_ACCRUAL_NAME,
       type: 'liability',
-      subtype: 'accounts_payable',
+      subtype: 'other_current_liability',
       description: 'Received-not-billed clearing account for item receipts (QB Receive Items).',
     })
     .returning();

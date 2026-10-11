@@ -157,6 +157,7 @@ export const navGroups: NavGroup[] = [
       { icon: Network, label: 'Privacy & Network', path: '/privacy' },
       { icon: Users, label: 'Multi-user', path: '/multi-user' },
       { icon: Settings, label: 'Settings', path: '/settings' },
+      { icon: ListChecks, label: 'Document Numbers', path: '/doc-numbers' }, // wave2 foundation
       { icon: Sparkles, label: 'AI & Automation', path: '/ai-settings' },
     ],
   },

@@ -11,6 +11,7 @@
  * Multi-tenant safety: every query is scoped by ctx.companyId.
  * Money: all arithmetic uses Money/toAmountString — never JS floats.
  */
+import { isPaymentSourceAccount } from '@/lib/accountTypes';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import {
@@ -143,11 +144,8 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
   if (!payAcct) throw notFound('Payment account');
   // The funding source must be a bank/cash asset or a credit-card liability — not, say, A/R
   // or a revenue account, which would post a nonsensical bill-payment credit.
-  const isFundable =
-    (payAcct.type === 'asset' &&
-      payAcct.subtype !== 'accounts_receivable' &&
-      payAcct.subtype !== 'inventory') ||
-    (payAcct.type === 'liability' && payAcct.subtype === 'credit_card');
+  // QB parity: bills are paid from a Bank or Credit Card account (lib/accountTypes.ts).
+  const isFundable = isPaymentSourceAccount(payAcct);
   if (!isFundable) {
     throw validation('Payment account must be a bank/cash or credit-card account.');
   }

@@ -26,6 +26,7 @@
  * Multi-tenant safety: every query is scoped by ctx.companyId.
  * Money: all arithmetic uses Money/toAmountString — never JS floats.
  */
+import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { and, desc, eq, gte, inArray, isNull, lte } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import {
@@ -114,12 +115,9 @@ export async function createExpense(ctx: ServiceContext, input: CreateExpenseInp
     .where(and(eq(accounts.id, input.paymentAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!payAcct) throw notFound('Payment account');
 
-  const isBankish =
-    payAcct.type === 'asset' &&
-    payAcct.subtype !== 'accounts_receivable' &&
-    payAcct.subtype !== 'inventory' &&
-    payAcct.subtype !== 'fixed_assets';
-  const isCreditCard = payAcct.type === 'liability' && payAcct.subtype === 'credit_card';
+  // QB parity: checks and cash expenses come from a Bank account (lib/accountTypes.ts).
+  const isBankish = isBankAccount(payAcct);
+  const isCreditCard = isCreditCardAccount(payAcct);
 
   if (input.method === 'credit_card') {
     if (!isCreditCard) {

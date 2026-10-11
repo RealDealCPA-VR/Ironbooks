@@ -10,7 +10,16 @@
  * natural sign convention (debit-normal for asset/expense, credit-normal for liability/equity/revenue).
  */
 import { and, asc, desc, eq, gte, inArray, lt, lte, sql } from 'drizzle-orm';
-import { accounts, classes, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import {
+  accounts,
+  classes,
+  customers,
+  employees,
+  journalEntries,
+  journalEntryLines,
+  vendors,
+} from '@/lib/db/schema';
+import { REGISTER_SUBTYPES as REGISTER_SUBTYPE_LIST } from '@/lib/accountTypes';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -22,6 +31,7 @@ import {
 } from './_base';
 import { assertPeriodOpen } from './fiscalPeriods';
 import {
+  type JournalEntityType,
   type PostingLine,
   postJournalEntry,
   voidJournalEntry,
@@ -37,6 +47,8 @@ export interface ManualEntryInput {
   description: string;
   reference?: string | null;
   lines: PostingLine[];
+  /** QB "Adjusting Entry" checkbox. */
+  isAdjusting?: boolean;
 }
 
 export interface JournalEntryLine {
@@ -51,6 +63,11 @@ export interface JournalEntryLine {
   classId: string | null;
   /** Resolved class name via join (null when untagged). */
   className: string | null;
+  /** QB "Name" column: customer / vendor / employee / other (null when blank). */
+  entityType: JournalEntityType | null;
+  entityId: string | null;
+  /** Display name of the customer / vendor / employee (null when blank or not found). */
+  entityName: string | null;
 }
 
 export interface JournalEntryDetail {
@@ -62,6 +79,8 @@ export interface JournalEntryDetail {
   status: string;
   /** Source-document link (e.g. "invoice:<id>", "manual") for drill-down to the origin. */
   sourceRef: string | null;
+  /** QB "Adjusting Entry" flag. */
+  isAdjusting: boolean;
   createdAt: Date;
   /** Version for multi-user optimistic concurrency (lib/services/concurrency.ts). */
   updatedAt: Date;
@@ -123,13 +142,25 @@ export interface GLOptions {
  * Create a user-authored manual journal entry.
  * Delegates all validation and balance-update logic to `postJournalEntry`.
  */
-export async function createManualEntry(ctx: ServiceContext, input: ManualEntryInput) {
+export async function createManualEntry(
+  ctx: ServiceContext,
+  input: ManualEntryInput,
+  opts: {
+    /**
+     * Skip the QB rule that A/R lines name a customer and A/P lines a vendor. ONLY for callers
+     * that cannot collect a name yet (AI journal proposals — TODO(ai team): carry the vendor /
+     * customer on proposal lines and drop this). User-entered entries always enforce it.
+     */
+    skipNameRule?: boolean;
+  } = {},
+) {
   if (!input.description?.trim()) {
     throw validation('Description is required.');
   }
   if (!input.date || isNaN(input.date.getTime())) {
     throw validation('A valid date is required.');
   }
+  if (!opts.skipNameRule) await assertJournalNames(ctx, input.lines);
   return postJournalEntry(ctx, {
     date: input.date,
     description: input.description.trim(),
@@ -137,7 +168,108 @@ export async function createManualEntry(ctx: ServiceContext, input: ManualEntryI
     status: 'posted',
     lines: input.lines,
     sourceRef: 'manual',
+    isAdjusting: input.isAdjusting ?? false,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Names on journal lines (QB "Name" column) + the A/R / A/P name rule
+// ---------------------------------------------------------------------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Resolve display names for (entityType, entityId) pairs. Missing ids are simply absent. */
+export async function resolveEntityNames(
+  ctx: ServiceContext,
+  refs: Array<{ entityType: string | null; entityId: string | null }>,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = (t: string) => [
+    ...new Set(
+      refs
+        .filter((r) => r.entityType === t && r.entityId && UUID_RE.test(r.entityId))
+        .map((r) => r.entityId!),
+    ),
+  ];
+  const cust = ids('customer');
+  const vend = ids('vendor');
+  const emp = ids('employee');
+  const other = ids('other');
+  if (cust.length) {
+    const rows = await ctx.db
+      .select({ id: customers.id, name: customers.displayName })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, cust)));
+    for (const r of rows) out.set(`customer:${r.id}`, r.name);
+  }
+  if (vend.length) {
+    const rows = await ctx.db
+      .select({ id: vendors.id, name: vendors.displayName })
+      .from(vendors)
+      .where(and(eq(vendors.companyId, ctx.companyId), inArray(vendors.id, vend)));
+    for (const r of rows) out.set(`vendor:${r.id}`, r.name);
+  }
+  if (emp.length) {
+    const rows = await ctx.db
+      .select({ id: employees.id, first: employees.firstName, last: employees.lastName })
+      .from(employees)
+      .where(and(eq(employees.companyId, ctx.companyId), inArray(employees.id, emp)));
+    for (const r of rows) out.set(`employee:${r.id}`, `${r.first} ${r.last}`.trim());
+  }
+  if (other.length) {
+    // TODO(lists team): the "Other Names" list. Resolved only when its table exists
+    // (expected: other_names(id, company_id, name)).
+    const [{ exists }] = (
+      await ctx.db.execute(sql`SELECT to_regclass('public.other_names') IS NOT NULL AS exists`)
+    ).rows as Array<{ exists: boolean }>;
+    if (exists) {
+      const res = await ctx.db.execute(
+        sql`SELECT id::text AS id, name FROM other_names WHERE company_id = ${ctx.companyId} AND id::text IN (${sql.join(other.map((o) => sql`${o}`), sql`, `)})`,
+      );
+      for (const r of res.rows as Array<{ id: string; name: string }>) out.set(`other:${r.id}`, r.name);
+    }
+  }
+  return out;
+}
+
+/**
+ * QuickBooks rule for manual journal entries: every line that hits an Accounts Receivable
+ * account must name a customer, and every line that hits an Accounts Payable account must name
+ * a vendor — otherwise the amount could never appear in that customer's / vendor's balance or
+ * aging. Names on other lines are optional but must exist in this company.
+ */
+export async function assertJournalNames(ctx: ServiceContext, lines: PostingLine[]): Promise<void> {
+  const accountIds = [...new Set(lines.map((l) => l.accountId).filter(Boolean))];
+  if (accountIds.length === 0) return;
+  const acctRows = await ctx.db
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, accountIds)));
+  const byId = new Map(acctRows.map((a) => [a.id, a]));
+  const names = await resolveEntityNames(
+    ctx,
+    lines.map((l) => ({ entityType: l.entityType ?? null, entityId: l.entityId ?? null })),
+  );
+  for (const [i, l] of lines.entries()) {
+    const acct = byId.get(l.accountId);
+    if (!acct) continue; // postJournalEntry reports unknown accounts
+    if (Boolean(l.entityType) !== Boolean(l.entityId)) {
+      throw validation(`Line ${i + 1}: pick a name from the list (or leave it blank).`);
+    }
+    if (l.entityType && l.entityId && !names.has(`${l.entityType}:${l.entityId}`)) {
+      throw validation(`Line ${i + 1}: that ${l.entityType} was not found.`);
+    }
+    if (acct.type === 'asset' && acct.subtype === 'accounts_receivable' && l.entityType !== 'customer') {
+      throw validation(
+        `Line ${i + 1}: "${acct.name}" is an Accounts Receivable account, so the line needs a customer in the Name column.`,
+      );
+    }
+    if (acct.type === 'liability' && acct.subtype === 'accounts_payable' && l.entityType !== 'vendor') {
+      throw validation(
+        `Line ${i + 1}: "${acct.name}" is an Accounts Payable account, so the line needs a vendor in the Name column.`,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,12 +322,15 @@ export async function getEntry(ctx: ServiceContext, id: string): Promise<Journal
       memo: journalEntryLines.memo,
       classId: journalEntryLines.classId,
       className: classes.name,
+      entityType: journalEntryLines.entityType,
+      entityId: journalEntryLines.entityId,
     })
     .from(journalEntryLines)
     .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
     .leftJoin(classes, eq(journalEntryLines.classId, classes.id))
     .where(eq(journalEntryLines.journalEntryId, id))
     .orderBy(asc(journalEntryLines.createdAt));
+  const entityNames = await resolveEntityNames(ctx, lineRows);
 
   return {
     id: entry.id,
@@ -205,6 +340,7 @@ export async function getEntry(ctx: ServiceContext, id: string): Promise<Journal
     reference: entry.reference ?? null,
     status: entry.status,
     sourceRef: entry.sourceRef ?? null,
+    isAdjusting: entry.isAdjusting ?? false,
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     voidedAt: entry.voidedAt ?? null,
@@ -218,6 +354,9 @@ export async function getEntry(ctx: ServiceContext, id: string): Promise<Journal
       memo: l.memo ?? null,
       classId: l.classId ?? null,
       className: l.className ?? null,
+      entityType: (l.entityType as JournalEntityType | null) ?? null,
+      entityId: l.entityId ?? null,
+      entityName: l.entityType && l.entityId ? (entityNames.get(`${l.entityType}:${l.entityId}`) ?? null) : null,
     })),
   };
 }
@@ -231,6 +370,8 @@ export interface UpdateEntryInput {
   description: string;
   reference?: string | null;
   lines: PostingLine[];
+  /** Omitted = keep the original entry's flag. */
+  isAdjusting?: boolean;
 }
 
 /**
@@ -274,6 +415,8 @@ export async function updateEntry(ctx: ServiceContext, id: string, input: Update
   // before any work begins.)
   await assertPeriodOpen(ctx, before.date);
   await assertPeriodOpen(ctx, input.date);
+  await assertJournalNames(ctx, input.lines);
+  const isAdjusting = input.isAdjusting ?? before.isAdjusting;
 
   return inTransaction(ctx, async (tx) => {
     // 1. Void the original (reverses cached balances; guards reconciled lines).
@@ -287,6 +430,7 @@ export async function updateEntry(ctx: ServiceContext, id: string, input: Update
       status: 'posted',
       lines: input.lines,
       sourceRef: 'manual',
+      isAdjusting,
     });
 
     // 3. Audit the edit with the full old/new snapshots, linking old → new.
@@ -347,6 +491,8 @@ export async function reverseEntry(ctx: ServiceContext, id: string, asOfDate?: D
     credit: l.debit ?? undefined,
     memo: l.memo,
     classId: l.classId,
+    entityType: l.entityType,
+    entityId: l.entityId,
   }));
 
   return postJournalEntry(ctx, {
@@ -356,6 +502,7 @@ export async function reverseEntry(ctx: ServiceContext, id: string, asOfDate?: D
     status: 'posted',
     lines,
     sourceRef: `reversal:${id}`,
+    isAdjusting: original.isAdjusting,
   });
 }
 
@@ -540,14 +687,13 @@ export async function generalLedger(
 // Account registers (QB-style "Use Register" view) — additive query helpers
 // ---------------------------------------------------------------------------
 
-/** Account subtypes that get a register in the registers index (bank / CC / AR / AP). */
-export const REGISTER_SUBTYPES = [
-  'checking',
-  'savings',
-  'credit_card',
-  'accounts_receivable',
-  'accounts_payable',
-] as const;
+/**
+ * Account subtypes that get a register in the registers index: bank, credit card, A/R, A/P,
+ * plus the other balance-sheet types QuickBooks gives registers (other current asset incl.
+ * Undeposited Funds, other asset, fixed asset, other current / long-term liability). The
+ * shared list lives in lib/accountTypes.ts.
+ */
+export const REGISTER_SUBTYPES = REGISTER_SUBTYPE_LIST;
 
 export interface RegisterAccountSummary {
   id: string;
@@ -758,4 +904,163 @@ export async function accountRegister(
     offset,
     rows,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Adjusting Journal Entries report data (QB Accountant > Adjusting Journal Entries)
+// ---------------------------------------------------------------------------
+
+export interface AdjustingEntriesOptions {
+  from?: Date;
+  to?: Date;
+  /** Include voided adjusting entries (default false — QB shows posted only). */
+  includeVoid?: boolean;
+}
+
+export interface AdjustingEntriesReport {
+  from: string | null;
+  to: string | null;
+  entries: JournalEntryDetail[];
+  totalDebit: string;
+  totalCredit: string;
+}
+
+/**
+ * Every journal entry flagged "Adjusting Entry" in the date range, with its lines (account,
+ * name, memo, class). Totals are over the included entries; debits always equal credits.
+ */
+export async function getAdjustingEntries(
+  ctx: ServiceContext,
+  opts: AdjustingEntriesOptions = {},
+): Promise<AdjustingEntriesReport> {
+  const conds = [eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.isAdjusting, true)];
+  conds.push(
+    opts.includeVoid
+      ? inArray(journalEntries.status, ['posted', 'void'])
+      : eq(journalEntries.status, 'posted'),
+  );
+  if (opts.from) conds.push(gte(journalEntries.date, opts.from));
+  if (opts.to) conds.push(lte(journalEntries.date, opts.to));
+  const heads = await ctx.db
+    .select({ id: journalEntries.id })
+    .from(journalEntries)
+    .where(and(...conds))
+    .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
+  const entries: JournalEntryDetail[] = [];
+  let debit = Money.zero();
+  let credit = Money.zero();
+  for (const h of heads) {
+    const e = await getEntry(ctx, h.id);
+    entries.push(e);
+    if (e.status !== 'posted') continue;
+    for (const l of e.lines) {
+      debit = debit.plus(Money.of(l.debit));
+      credit = credit.plus(Money.of(l.credit));
+    }
+  }
+  return {
+    from: opts.from ? opts.from.toISOString() : null,
+    to: opts.to ? opts.to.toISOString() : null,
+    entries,
+    totalDebit: toAmountString(debit),
+    totalCredit: toAmountString(credit),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Named A/R / A/P journal lines as customer / vendor open items
+// ---------------------------------------------------------------------------
+
+export interface JournalOpenItem {
+  journalEntryId: string;
+  lineId: string;
+  entryNumber: number;
+  date: Date;
+  reference: string | null;
+  description: string;
+  memo: string | null;
+  accountId: string;
+  entityType: 'customer' | 'vendor';
+  entityId: string;
+  /**
+   * Signed amount owed: for A/R a debit is +(customer owes you more), a credit is −;
+   * for A/P a credit is +(you owe the vendor more), a debit is −.
+   */
+  amount: string;
+}
+
+/**
+ * Manual ("General Journal") lines on A/R accounts that name a customer, or on A/P accounts that
+ * name a vendor. QuickBooks treats each as an open item of that customer / vendor, dated (and
+ * due) on the entry date: they belong in the customer / vendor balance, aging and statements.
+ * Only manual entries and their reversals are included — document postings (invoices, bills,
+ * payments) are already represented by their own documents.
+ */
+export async function journalOpenItems(
+  ctx: ServiceContext,
+  side: 'ar' | 'ap',
+  opts: { asOf?: Date; entityId?: string } = {},
+): Promise<JournalOpenItem[]> {
+  const entityType = side === 'ar' ? 'customer' : 'vendor';
+  const conds = [
+    eq(journalEntries.companyId, ctx.companyId),
+    eq(journalEntries.status, 'posted'),
+    sql`(${journalEntries.sourceRef} = 'manual' OR ${journalEntries.sourceRef} LIKE 'reversal:%')`,
+    eq(accounts.subtype, side === 'ar' ? 'accounts_receivable' : 'accounts_payable'),
+    eq(accounts.type, side === 'ar' ? 'asset' : 'liability'),
+    eq(journalEntryLines.entityType, entityType),
+  ];
+  if (opts.asOf) conds.push(lte(journalEntries.date, opts.asOf));
+  if (opts.entityId) conds.push(eq(journalEntryLines.entityId, opts.entityId));
+  const rows = await ctx.db
+    .select({
+      journalEntryId: journalEntries.id,
+      lineId: journalEntryLines.id,
+      entryNumber: journalEntries.entryNumber,
+      date: journalEntries.date,
+      reference: journalEntries.reference,
+      description: journalEntries.description,
+      memo: journalEntryLines.memo,
+      accountId: journalEntryLines.accountId,
+      entityId: journalEntryLines.entityId,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+    .where(and(...conds))
+    .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
+  return rows
+    .filter((r) => r.entityId)
+    .map((r) => {
+      const dr = Money.of(r.debit);
+      const cr = Money.of(r.credit);
+      const amount = side === 'ar' ? dr.minus(cr) : cr.minus(dr);
+      return {
+        journalEntryId: r.journalEntryId,
+        lineId: r.lineId,
+        entryNumber: r.entryNumber,
+        date: r.date,
+        reference: r.reference ?? null,
+        description: r.description,
+        memo: r.memo ?? null,
+        accountId: r.accountId,
+        entityType,
+        entityId: r.entityId!,
+        amount: toAmountString(amount),
+      };
+    });
+}
+
+/** Net General Journal balance per customer (ar) / vendor (ap): entityId → signed amount. */
+export async function journalBalancesByEntity(
+  ctx: ServiceContext,
+  side: 'ar' | 'ap',
+  opts: { asOf?: Date } = {},
+): Promise<Map<string, string>> {
+  const items = await journalOpenItems(ctx, side, opts);
+  const sums = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const it of items) sums.set(it.entityId, (sums.get(it.entityId) ?? Money.zero()).plus(Money.of(it.amount)));
+  return new Map([...sums].map(([k, v]) => [k, toAmountString(v)]));
 }

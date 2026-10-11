@@ -39,6 +39,7 @@
  * reverses the main GL entry AND every restock entry, removing the restocked
  * quantity from stock again.
  */
+import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -720,11 +721,8 @@ export async function refundCreditMemo(ctx: ServiceContext, input: RefundCreditM
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
-  if (
-    bankAcct.type !== 'asset' ||
-    bankAcct.subtype === 'accounts_receivable' ||
-    bankAcct.subtype === 'inventory'
-  ) {
+  // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
+  if (!isDepositTargetAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
   }
 

@@ -176,6 +176,13 @@
       "when": 1781100024000,
       "tag": "0024_team_hosting",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1781200025000,
+      "tag": "0025_wave2_foundation",
+      "breakpoints": true
     }
   ]
 }

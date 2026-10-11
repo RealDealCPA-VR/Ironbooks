@@ -420,7 +420,7 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       description: p.description,
       reference: p.reference,
       lines: p.lines.map((l) => ({ accountId: l.accountId, debit: l.debit, credit: l.credit, memo: l.memo })),
-    });
+    }, { skipNameRule: true }); // TODO(ai team): proposals do not carry customer/vendor names yet
     const [updated] = await tx.db
       .update(aiProposals)
       .set({ status: 'approved', resultRef: `journal_entry:${entry.id}`, decidedBy: tx.userId, decidedAt: new Date() })

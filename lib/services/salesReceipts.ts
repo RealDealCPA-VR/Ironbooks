@@ -220,7 +220,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
     depositAccountId = await getOrCreateAccountByCode(ctx, '1050', {
       name: 'Undeposited Funds',
       type: 'asset',
-      subtype: 'checking',
+      subtype: 'undeposited_funds',
     });
   }
 

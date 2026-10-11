@@ -618,7 +618,7 @@ async function prepareInvoice(
     ? await getOrCreateAccountByCode(ctx, '1050', {
         name: 'Undeposited Funds',
         type: 'asset',
-        subtype: 'checking',
+        subtype: 'undeposited_funds',
       })
     : null;
 

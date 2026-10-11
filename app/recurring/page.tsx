@@ -1,5 +1,6 @@
 'use client';
 
+import { isPaymentSourceAccount } from '@/lib/accountTypes';
 import { useEffect, useState } from 'react';
 import { Repeat, Plus, Play, Clock, Trash2 } from 'lucide-react';
 import {
@@ -365,14 +366,7 @@ function TemplateFormFields({
   }
 
   // Payment sources for expenses: bank-ish assets + credit cards.
-  const paymentAccounts = accounts.filter(
-    (a) =>
-      (a.type === 'asset' &&
-        a.subtype !== 'accounts_receivable' &&
-        a.subtype !== 'inventory' &&
-        a.subtype !== 'fixed_assets') ||
-      (a.type === 'liability' && a.subtype === 'credit_card'),
-  );
+  const paymentAccounts = accounts.filter((a) => isPaymentSourceAccount(a));
 
   /** Account+description+amount grid shared by bill and expense templates. */
   const renderAmountLines = (field: 'billLines' | 'expenseLines', rows: AmountLineRow[]) => (
