@@ -39,7 +39,7 @@ import {
   payrollStateSettings,
   workersCompCodes,
 } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
   inTransaction,
@@ -97,13 +97,43 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
   return row?.id ?? null;
 }
 
-async function requireAccount(ctx: ServiceContext, id: string, label: string) {
+/**
+ * The account must belong to the company and be of the allowed kind. Never an A/R or A/P
+ * control account: a payroll entry carries no customer / vendor, so posting there would break
+ * control == aging.
+ */
+async function requireAccount(ctx: ServiceContext, id: string, label: string, allowed: 'bank' | 'expense') {
   const [row] = await ctx.db
-    .select({ id: accounts.id, isActive: accounts.isActive })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, isActive: accounts.isActive })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
   if (!row) throw notFound(label);
+  const ok =
+    allowed === 'bank'
+      ? row.type === 'asset' && (row.subtype === 'checking' || row.subtype === 'savings')
+      : row.type === 'expense';
+  if (!ok) {
+    throw validation(allowed === 'bank' ? `${label} must be a bank account (checking or savings).` : `${label} must be an expense account.`);
+  }
   return row.id;
+}
+
+/** A line amount as stored: a finite number, rounded to cents, within what the books can hold. */
+function lineAmount(l: { name: string; amount: string | number }): Dec {
+  let a: Dec;
+  try {
+    a = Money.of(typeof l.amount === 'string' ? l.amount.trim() : l.amount);
+  } catch {
+    throw validation(`"${l.name}" has an amount that is not a number.`);
+  }
+  if (!a.isFinite()) throw validation(`"${l.name}" has an amount that is not a number.`);
+  const r = Money.round2(a);
+  if (r.abs().greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`"${l.name}" is larger than the books can hold.`);
+  return r;
+}
+
+function withinBounds(d: Dec, label: string) {
+  if (d.abs().greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`${label} is larger than the books can hold.`);
 }
 
 function validDate(d: unknown, label: string): Date {
@@ -169,7 +199,7 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
     employer_contribution: Money.zero(),
   };
   const rows = input.lines.map((l) => {
-    const amt = Money.round2(l.amount);
+    const amt = lineAmount(l);
     if (amt.isNegative()) {
       throw validation(`"${l.name}" cannot be negative in a YTD entry. Use Adjust Liabilities to reduce amounts.`);
     }
@@ -178,6 +208,7 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
   });
   const gross = totals.earning;
   const net = gross.minus(totals.tax).minus(totals.deduction);
+  for (const k of KINDS) withinBounds(totals[k], 'The total');
   if (net.isNegative()) throw validation('Taxes and deductions are more than the gross pay.');
 
   // GL accounts (only when posting).
@@ -186,7 +217,7 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
     const expense = await accountIdByCode(ctx, '6500');
     const liab = await accountIdByCode(ctx, '2300');
     const bank = input.bankAccountId
-      ? await requireAccount(ctx, input.bankAccountId, 'Bank account')
+      ? await requireAccount(ctx, input.bankAccountId, 'Bank account', 'bank')
       : await accountIdByCode(ctx, '1000');
     if (!expense || !liab || !bank) {
       throw validation('Posting needs accounts 6500 Payroll Expense, 2300 Payroll Liabilities and a bank account.');
@@ -275,19 +306,21 @@ export async function createLiabilityAdjustment(ctx: ServiceContext, input: Liab
   let taxes = Money.zero();
   let deductions = Money.zero();
   const rows = input.lines.map((l) => {
-    const amt = Money.round2(l.amount);
+    const amt = lineAmount(l);
     if (amt.isZero()) throw validation(`"${l.name}" has no amount.`);
     if (l.kind === 'tax') taxes = taxes.plus(amt);
     if (l.kind === 'deduction') deductions = deductions.plus(amt);
     return { kind: l.kind, name: l.name.trim(), amount: toAmountString(amt), payrollItemId: l.payrollItemId ?? null };
   });
+  withinBounds(taxes, 'The tax total');
+  withinBounds(deductions, 'The deduction total');
 
   let posting: PostingLine[] | null = null;
   if (input.affectsAccounts) {
     const liab = await accountIdByCode(ctx, '2300');
     if (!liab) throw validation('Posting needs account 2300 Payroll Liabilities.');
     const offset = input.offsetAccountId
-      ? await requireAccount(ctx, input.offsetAccountId, 'Offset account')
+      ? await requireAccount(ctx, input.offsetAccountId, 'Offset account', 'expense')
       : (await accountIdByCode(ctx, '6510')) ?? (await accountIdByCode(ctx, '6500'));
     if (!offset) throw validation('Choose the expense account that offsets this adjustment.');
     const m = new Map<string, Dec>();

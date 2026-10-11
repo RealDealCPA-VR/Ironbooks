@@ -2055,12 +2055,15 @@ async function collectIifControlRows(
   lookup: AccountLookup,
 ): Promise<IifControlRow[]> {
   const out: IifControlRow[] = [];
+  // Same source references importIifTransactions gives these transactions (see there).
+  const seenKeys = new Map<string, number>();
   for (const txn of transactions) {
     const date = parseIifDate(txn.date);
     if (!date) continue;
     const rows: IifControlRow[] = [];
     const probe: PostingLine[] = [];
     let net = Money.zero();
+    let totalDebit = Money.zero();
     let ok = true;
     let nonZero = 0;
     for (const l of txn.lines) {
@@ -2073,6 +2076,7 @@ async function collectIifControlRows(
       nonZero++;
       net = net.plus(toAmountString(amt));
       const abs = toAmountString(Money.abs(amt));
+      if (Money.isPositive(amt)) totalDebit = totalDebit.plus(abs);
       probe.push({ accountId: '', debit: Money.isPositive(amt) ? abs : null, credit: Money.isPositive(amt) ? null : abs });
       const resolved = resolveAccountRef(lookup, l.accnt);
       if (resolved && 'ambiguous' in resolved && resolved.ambiguous) {
@@ -2086,7 +2090,21 @@ async function collectIifControlRows(
       if (!side || !name) continue;
       rows.push({ side, name, amount: toAmountString(amt), date: date.toISOString().slice(0, 10) });
     }
-    if (!ok || nonZero < 2 || !net.isZero() || !rows.length) continue;
+    if (!ok || nonZero < 2 || !net.isZero()) continue;
+    const baseKey = `iif:${txn.type || 'TRNS'}:${txn.num || 'no-num'}:${date.toISOString().slice(0, 10)}:${toAmountString(totalDebit)}`;
+    const occurrence = seenKeys.get(baseKey) ?? 0;
+    seenKeys.set(baseKey, occurrence + 1);
+    if (!rows.length) continue;
+    const ref = `${baseKey}:${occurrence}`;
+    const [dup] = await ctx.db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, ref)));
+    if (dup) {
+      // Posted by an earlier import (the ledger skips it now): applied back then already.
+      out.push(...rows.map((r) => ({ ...r, ref, posted: true })));
+      continue;
+    }
     try {
       assertBalanced(probe);
       await assertPeriodOpen(ctx, date);
@@ -2094,7 +2112,7 @@ async function collectIifControlRows(
       if (err instanceof ServiceError) continue; // postJournalEntry will refuse it too
       throw err;
     }
-    out.push(...rows);
+    out.push(...rows.map((r) => ({ ...r, ref })));
   }
   return out;
 }
