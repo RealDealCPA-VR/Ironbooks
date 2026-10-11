@@ -35,6 +35,15 @@ let db: DB;
 /** Maps account code → uuid */
 const acct: Record<string, string> = {};
 
+/** Ledger triggers (0017) switched off to fabricate a pre-0017 "legacy" unbalanced entry. */
+const LEGACY_TRIGGERS: Array<[string, string]> = [
+  ['journal_entries', 'bka_je_balanced'],
+  ['journal_entry_lines', 'bka_jel_balanced'],
+  ['journal_entry_lines', 'bka_jel_guard'],
+  ['journal_entry_lines', 'bka_jel_sync_ins'],
+  ['accounts', 'bka_accounts_guard'],
+];
+
 describe('AI Error Detection + LLM Corrector', () => {
   beforeAll(async () => {
     db = await getDb(TEST_DIR);
@@ -76,11 +85,14 @@ describe('AI Error Detection + LLM Corrector', () => {
   it('detectErrors finds an unbalanced posted entry', async () => {
     // Since migration 0017 the DATABASE refuses an unbalanced posted entry at COMMIT, so
     // this can only exist in a LEGACY file written before the guard. Simulate that by
-    // bypassing triggers for one transaction (replica mode — test-only) and applying the
-    // cached-balance deltas the way the pre-0017 posting code did.
+    // disabling the ledger triggers for one transaction (test-only DDL, restored to ENABLE
+    // ALWAYS before commit) and applying the cached-balance deltas the way the pre-0017
+    // posting code did.
     const userId = ctx.userId ?? '00000000-0000-0000-0000-000000000000';
     const entry = await db.transaction(async (tx) => {
-      await tx.execute(sql`SET LOCAL session_replication_role = replica`);
+      for (const [table, trig] of LEGACY_TRIGGERS) {
+        await tx.execute(sql.raw(`ALTER TABLE ${table} DISABLE TRIGGER ${trig}`));
+      }
       const [e] = await tx
         .insert(journalEntries)
         .values({
@@ -99,6 +111,9 @@ describe('AI Error Detection + LLM Corrector', () => {
       ]);
       await tx.execute(sql`UPDATE accounts SET balance = balance + 500 WHERE id = ${acct['1000']}`);
       await tx.execute(sql`UPDATE accounts SET balance = balance + 300 WHERE id = ${acct['4000']}`);
+      for (const [table, trig] of LEGACY_TRIGGERS) {
+        await tx.execute(sql.raw(`ALTER TABLE ${table} ENABLE ALWAYS TRIGGER ${trig}`));
+      }
       return e;
     });
 

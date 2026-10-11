@@ -36,6 +36,22 @@
  *
  * In practice most companies carry AR > 0 and AP > 0 so cash-basis equity is lower than
  * accrual equity (unreceived revenue is excluded from both sides).
+ *
+ * CONSISTENCY WITH THE CASH-BASIS P&L
+ * ───────────────────────────────────
+ * A/R and A/P are identified by the shared classifier in cashBasisClassify.ts, which the
+ * cash-basis P&L (cashBasisReports.ts) also uses, so cash-basis retained earnings + net
+ * income on this sheet always equal cash-basis net income to date.
+ *
+ * KNOWN DIFFERENCE FROM QUICKBOOKS DESKTOP (documented, deliberate for now)
+ * ─────────────────────────────────────────────────────────────────────────
+ * This whole-account method attributes the ENTIRE open A/R − A/P to earnings. When an unpaid
+ * invoice/bill also hits a balance-sheet account — sales tax payable, inventory bought on
+ * credit, retainage — that portion lands in cash-basis earnings (e.g. unpaid sales tax shows
+ * as negative earnings while Sales Tax Payable stays on the sheet). QuickBooks Desktop instead
+ * reverses only the P&L-affecting share of each open transaction, leaving the balance-sheet
+ * share in A/R / A/P. Both methods balance; QBD's per-transaction allocation is a parity
+ * follow-up and must keep this sheet and the cash-basis P&L on the same classifier.
  */
 import { eq } from 'drizzle-orm';
 import { accounts } from '@/lib/db/schema';
@@ -43,20 +59,7 @@ import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { assertBalanceSheetBalanced } from './ledgerAssert';
 import { balanceSheet, type ReportLine } from './reports';
-
-// ---- COA codes for the mandatory adjustments (legacy files without subtypes) ----
-const AR_CODE = '1200'; // Accounts Receivable (asset, debit-normal)
-const AP_CODE = '2000'; // Accounts Payable     (liability, credit-normal)
-
-/** Is this asset account an Accounts Receivable account (excluded on a cash basis)? */
-function isReceivable(a: { code: string; subtype: string }): boolean {
-  return a.code === AR_CODE || a.subtype === 'accounts_receivable';
-}
-
-/** Is this liability account an Accounts Payable account (excluded on a cash basis)? */
-function isPayable(a: { code: string; name: string; subtype: string }): boolean {
-  return a.code === AP_CODE || (a.subtype === 'accounts_payable' && /accounts\s*payable/i.test(a.name));
-}
+import { isPayable, isReceivable } from './cashBasisClassify';
 
 /** Shape of a single AR/AP line that was removed from the accrual sheet. */
 export interface RemovedLine {

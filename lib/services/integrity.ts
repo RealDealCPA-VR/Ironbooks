@@ -282,12 +282,15 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_jel_sync_del: 'Account balances follow removed journal lines',
   bka_je_sync_upd: 'Account balances follow post / void transitions',
   bka_accounts_guard: 'Account balances cannot be edited directly',
+  bka_jel_no_truncate: 'Journal lines cannot be truncated',
+  bka_je_no_truncate: 'Journal entries cannot be truncated',
 };
 
 async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string[]; total: number }> {
-  // tgenabled 'D' = disabled; anything else fires in normal (origin) sessions.
+  // Every guard must be ENABLE ALWAYS (tgenabled 'A'). Origin mode ('O') is skipped when a
+  // session sets session_replication_role = replica, so it does not count as active.
   const res = await ctx.db.execute(
-    sql`SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgenabled <> 'D' AND tgname LIKE 'bka%'`,
+    sql`SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgenabled = 'A' AND tgname LIKE 'bka%'`,
   );
   const rows = (res as unknown as { rows: Array<{ tgname: string }> }).rows ?? [];
   const present = new Set(rows.map((r) => r.tgname));

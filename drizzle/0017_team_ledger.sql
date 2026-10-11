@@ -25,7 +25,8 @@
 --      and posted cannot go back to draft — except (1) within the transaction
 --      that created the entry, or (2) when a whitelisted service has executed
 --      `SELECT set_config('bka.allow_ledger_rewrite', 'on', true)` (transaction-
---      local; see allowLedgerRewrite() in lib/services/posting.ts): condense,
+--      local and bound to the setting transaction's txid; see allowLedgerRewrite()
+--      in lib/services/posting.ts): condense,
 --      account merge and company restore. Even then (a) still runs at COMMIT.
 --
 -- Error SQLSTATEs (translated to ServiceError by lib/services/_base.ts):
@@ -43,9 +44,14 @@ CREATE INDEX IF NOT EXISTS "je_company_status_idx" ON "journal_entries" ("compan
 
 -- ---- helpers --------------------------------------------------------------
 
+-- The rewrite flag is honoured only for the transaction that set it: allowLedgerRewrite()
+-- also records txid_current() in bka.ledger_rewrite_txid, so a session-wide
+-- set_config(..., false) left behind by a bug or raw SQL never carries into later
+-- transactions on the same connection.
 CREATE OR REPLACE FUNCTION bka_ledger_rewrite_allowed() RETURNS boolean
 LANGUAGE sql STABLE AS $$
   SELECT coalesce(current_setting('bka.allow_ledger_rewrite', true), '') = 'on'
+     AND coalesce(current_setting('bka.ledger_rewrite_txid', true), '') = txid_current()::text
 $$;
 --> statement-breakpoint
 
@@ -71,6 +77,9 @@ $$;
 -- True when the entry row was created by the CURRENT transaction (created_at defaults to
 -- now(), which is the transaction start time and is identical for every statement and
 -- savepoint in it). Lets postJournalEntry insert lines into the entry it just created.
+-- Sound only because bka_je_guard makes created_at immutable: an old entry can never be
+-- made to "look new". (xmin is not usable here: rows written inside a savepoint carry the
+-- sub-transaction's xid, and any UPDATE of a header would also refresh its xmin.)
 CREATE OR REPLACE FUNCTION bka_entry_is_new(p_created timestamp) RETURNS boolean
 LANGUAGE sql STABLE AS $$
   SELECT p_created = now()::timestamp
@@ -229,6 +238,10 @@ BEGIN
     RETURN OLD;
   END IF;
 
+  IF NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'LEDGER: created_at of journal entry #% is immutable', OLD.entry_number
+      USING ERRCODE = 'BK002';
+  END IF;
   IF NEW.id IS DISTINCT FROM OLD.id OR NEW.company_id IS DISTINCT FROM OLD.company_id THEN
     RAISE EXCEPTION 'LEDGER: journal entry #% cannot be moved to another id or company', OLD.entry_number
       USING ERRCODE = 'BK002';
@@ -429,3 +442,30 @@ DROP TRIGGER IF EXISTS bka_accounts_guard ON accounts;
 CREATE TRIGGER bka_accounts_guard
   BEFORE INSERT OR UPDATE ON accounts
   FOR EACH ROW EXECUTE FUNCTION bka_accounts_guard();
+--> statement-breakpoint
+
+-- ---- fire always ----------------------------------------------------------
+-- Triggers are created in ENABLE (origin) mode, which `SET session_replication_role =
+-- replica` silently bypasses. ENABLE ALWAYS makes every guard fire regardless of the
+-- replication role (lib/services/integrity.ts reports any guard not in mode 'A').
+ALTER TABLE journal_entry_lines ENABLE ALWAYS TRIGGER bka_jel_balanced;
+--> statement-breakpoint
+ALTER TABLE journal_entries ENABLE ALWAYS TRIGGER bka_je_balanced;
+--> statement-breakpoint
+ALTER TABLE journal_entry_lines ENABLE ALWAYS TRIGGER bka_jel_guard;
+--> statement-breakpoint
+ALTER TABLE journal_entries ENABLE ALWAYS TRIGGER bka_je_guard;
+--> statement-breakpoint
+ALTER TABLE journal_entry_lines ENABLE ALWAYS TRIGGER bka_jel_no_truncate;
+--> statement-breakpoint
+ALTER TABLE journal_entries ENABLE ALWAYS TRIGGER bka_je_no_truncate;
+--> statement-breakpoint
+ALTER TABLE journal_entry_lines ENABLE ALWAYS TRIGGER bka_jel_sync_ins;
+--> statement-breakpoint
+ALTER TABLE journal_entry_lines ENABLE ALWAYS TRIGGER bka_jel_sync_upd;
+--> statement-breakpoint
+ALTER TABLE journal_entry_lines ENABLE ALWAYS TRIGGER bka_jel_sync_del;
+--> statement-breakpoint
+ALTER TABLE journal_entries ENABLE ALWAYS TRIGGER bka_je_sync_upd;
+--> statement-breakpoint
+ALTER TABLE accounts ENABLE ALWAYS TRIGGER bka_accounts_guard;

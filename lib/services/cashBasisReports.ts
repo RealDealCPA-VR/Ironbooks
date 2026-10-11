@@ -24,15 +24,13 @@
  *   so we compare net-credit activity, i.e. credits − debits on account 2000).
  *   Positive value → AP grew → we paid less cash than we incurred in expenses.
  */
-import { and, eq, lte, sql } from 'drizzle-orm';
+import { and, eq, inArray, lte, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { profitAndLoss, type ProfitAndLoss, type ReportLine } from './reports';
 
-// ---- AR / AP account codes (COA constants) ----
-const AR_CODE = '1200'; // Accounts Receivable  (asset, debit-normal)
-const AP_CODE = '2000'; // Accounts Payable     (liability, credit-normal)
+import { isPayable, isReceivable } from './cashBasisClassify';
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -81,6 +79,46 @@ export async function accountNetChange(
   return toAmountString(net);
 }
 
+/**
+ * Net debit-normal change (debits − credits) over [from, to] summed across EVERY account the
+ * shared classifier treats as A/R ('receivable') or A/P ('payable') — the same set the
+ * cash-basis Balance Sheet removes, so cash-basis net income to date equals cash-basis
+ * retained earnings on the sheet.
+ */
+export async function classifiedNetChange(
+  ctx: ServiceContext,
+  kind: 'receivable' | 'payable',
+  from: Date,
+  to: Date,
+): Promise<string> {
+  const accts = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, subtype: accounts.subtype })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const ids = accts.filter((a) => (kind === 'receivable' ? isReceivable(a) : isPayable(a))).map((a) => a.id);
+  if (ids.length === 0) return toAmountString(Money.zero());
+
+  const rows = await ctx.db
+    .select({
+      totalDebit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
+      totalCredit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        inArray(journalEntryLines.accountId, ids),
+        sql`${journalEntries.date} >= ${from}`,
+        lte(journalEntries.date, to),
+      ),
+    );
+
+  const row = rows[0];
+  return toAmountString(Money.sub(row?.totalDebit ?? 0, row?.totalCredit ?? 0));
+}
+
 // ---------------------------------------------------------------------------
 // Cash-Basis P&L
 // ---------------------------------------------------------------------------
@@ -116,9 +154,10 @@ export interface ProfitAndLossCashBasis {
  *
  * Implements the indirect conversion method:
  *   1. Fetch the standard accrual P&L for the period.
- *   2. Compute the change in Accounts Receivable (1200) during the period.
+ *   2. Compute the change in all Accounts Receivable accounts (shared classifier in
+ *      cashBasisClassify.ts: 1200, Retainage Receivable, …) during the period.
  *      A debit-net increase in AR means revenue was recognised but cash not yet received.
- *   3. Compute the change in Accounts Payable (2000) during the period.
+ *   3. Compute the change in all Accounts Payable accounts (same classifier) during the period.
  *      A credit-net increase in AP means expenses were recognised but cash not yet paid.
  *   4. Adjust:
  *        cashIncome   = accrualIncome   − increaseInAR
@@ -137,7 +176,7 @@ export async function profitAndLossCashBasis(
   //    here: profitAndLoss already excludes them via notFiscalCloseEntry(), and
   //    the AR/AP adjustments below are immune by construction — closing entries
   //    only touch revenue/expense accounts and Retained Earnings (3900), never
-  //    AR (1200) or AP (2000).
+  //    A/R or A/P accounts.
   const accrual = await profitAndLoss(ctx, range);
 
   // 2. Period boundaries. Default: 1970-01-01 → now (covers all history).
@@ -146,12 +185,12 @@ export async function profitAndLossCashBasis(
 
   // 3. AR change (debit-normal: debits − credits over the period).
   //    Positive → AR grew → less cash collected than earned.
-  const arNetChange = await accountNetChange(ctx, AR_CODE, from, to);
+  const arNetChange = await classifiedNetChange(ctx, 'receivable', from, to);
   const increaseInAR = Money.of(arNetChange);
 
   // 4. AP change (credit-normal: credits − debits over the period).
   //    Positive → AP grew → less cash paid than expensed.
-  const apRaw = await accountNetChange(ctx, AP_CODE, from, to);
+  const apRaw = await classifiedNetChange(ctx, 'payable', from, to);
   // accountNetChange returns debits−credits; for AP (credit-normal) negate to get credit-net.
   const increaseInAP = Money.of(apRaw).negated();
 

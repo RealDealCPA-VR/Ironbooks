@@ -84,11 +84,13 @@ describe('integrity — Rebuild Data', () => {
       db.update(accounts).set({ balance: '123.45' }).where(eq(accounts.id, acct['1000'])),
     ).rejects.toThrow(/derived from the ledger/);
 
-    // …so simulate LEGACY drift (a file written before the guard existed) by bypassing
-    // triggers for one transaction (replica mode — test-only; the app never does this).
+    // …so simulate LEGACY drift (a file written before the guard existed) by dropping the
+    // accounts guard for one transaction and restoring it (ENABLE ALWAYS) before commit.
+    // Test-only DDL; the app never does this.
     await db.transaction(async (tx) => {
-      await tx.execute(sql`SET LOCAL session_replication_role = replica`);
+      await tx.execute(sql`ALTER TABLE accounts DISABLE TRIGGER bka_accounts_guard`);
       await tx.update(accounts).set({ balance: '123.45' }).where(eq(accounts.id, acct['1000']));
+      await tx.execute(sql`ALTER TABLE accounts ENABLE ALWAYS TRIGGER bka_accounts_guard`);
     });
 
     const preview = await previewRebuild(ctx, 'account_balances');

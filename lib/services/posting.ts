@@ -249,6 +249,10 @@ export async function allowLedgerRewrite(
   reason: 'condense' | 'merge' | 'restore',
 ): Promise<void> {
   await ctx.db.execute(
-    sql`SELECT set_config('bka.allow_ledger_rewrite', 'on', true), set_config('bka.ledger_rewrite_reason', ${reason}, true)`,
+    // The txid binds the flag to THIS transaction: the guards ignore it anywhere else, even if a
+    // session-level set_config were left behind.
+    sql`SELECT set_config('bka.allow_ledger_rewrite', 'on', true),
+               set_config('bka.ledger_rewrite_txid', txid_current()::text, true),
+               set_config('bka.ledger_rewrite_reason', ${reason}, true)`,
   );
 }

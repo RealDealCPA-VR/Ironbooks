@@ -339,4 +339,22 @@ describe('ledger invariants enforced by the database', () => {
     expect(status.trialBalance.totalDebit).toBe(status.trialBalance.totalCredit);
     expect(status.inBalance).toBe(true);
   });
+
+  it('guards fire ALWAYS (replica mode cannot skip them) and origin mode is reported as inactive', async () => {
+    // Every bka_* trigger is ENABLE ALWAYS.
+    const res = await db.execute(sql`SELECT tgname, tgenabled FROM pg_trigger WHERE tgname LIKE 'bka%' AND NOT tgisinternal`);
+    const rows = (res as unknown as { rows: Array<{ tgname: string; tgenabled: string }> }).rows;
+    expect(rows.length).toBe(11);
+    expect(rows.filter((r) => r.tgenabled !== 'A')).toEqual([]);
+
+    // Downgraded to origin mode ('O'), the integrity check must flag it.
+    await db.execute(sql`ALTER TABLE accounts ENABLE TRIGGER bka_accounts_guard`);
+    try {
+      const status = await booksInBalance(ctx);
+      expect(status.guards.missing).toEqual(['bka_accounts_guard']);
+    } finally {
+      await db.execute(sql`ALTER TABLE accounts ENABLE ALWAYS TRIGGER bka_accounts_guard`);
+    }
+    expect((await booksInBalance(ctx)).guards.missing).toEqual([]);
+  });
 });
