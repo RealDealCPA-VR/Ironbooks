@@ -113,6 +113,15 @@ describe('transaction log anchor — re-test', () => {
     expect((await verifyTransactionLog(db, DIR)).ok).toBe(true);
   });
 
+  it('concurrent commits still leave the anchor on the newest record (descent check + compare-and-set)', async () => {
+    await Promise.all(Array.from({ length: 6 }, (_, i) => createCustomer(ctx, { displayName: `Concurrent ${i}` })));
+    const last = readAllTransactionLog(DIR).records.at(-1)!;
+    const a = await anchorRow();
+    expect(a.headSeq).toBe(last.seq);
+    expect(a.headHash).toBe(last.hash);
+    expect((await verifyTransactionLog(db, DIR)).ok).toBe(true);
+  });
+
   // Runs last: it leaves the log in a tampered state.
   it('cutting records off the tail stays detected after more records are appended on top', async () => {
     await createVendor(ctx, { displayName: 'Vendor whose creation is erased' });
@@ -132,5 +141,6 @@ describe('transaction log anchor — re-test', () => {
     const v = await verifyTransactionLog(db, DIR);
     // The erased record must not be laundered by later appends advancing the anchor.
     expect(v.ok).toBe(false);
+    expect(v.chainIntact).toBe(false);
   });
 });

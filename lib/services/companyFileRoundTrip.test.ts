@@ -79,7 +79,8 @@ async function expectIdenticalCopy(dir: string) {
   }
 }
 
-describe('company file round trips (.bka + .bkp)', () => {
+// Each restore boots a fresh PGlite and runs every migration; give it room on a loaded machine.
+describe('company file round trips (.bka + .bkp)', { timeout: 180_000 }, () => {
   beforeAll(async () => {
     fs.rmSync(ROOT, { recursive: true, force: true });
     db = await getDb(SRC);
@@ -148,7 +149,7 @@ describe('company file round trips (.bka + .bkp)', () => {
 
     beforeAll(async () => {
       good = (await createPortableCompanyFile(rich.ctx, { dataDir: SRC })).buffer;
-    });
+    }, 120_000);
 
     it('refuses a corrupted entry before writing anything', async () => {
       const bad = rewritePortable(

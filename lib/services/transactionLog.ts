@@ -383,7 +383,7 @@ export async function logTransaction(db: DB, change: TransactionLogChange): Prom
   const root = rootDbOf(db) as DB | null;
   await afterCommit(db, async () => {
     const written = appendTransactionLog(dir, [record]);
-    if (root) await anchorTransactionLog(root, dir, written[written.length - 1]);
+    if (root) await anchorTransactionLog(root, dir, written);
   });
 }
 
@@ -411,20 +411,55 @@ function readFirstRecord(file: string): TransactionLogRecord | null {
 }
 
 /**
- * Record the log's genesis and newest head in the database. Monotonic: the head only moves
- * forward, and only while the file's genesis matches the anchored one (a replaced log never
- * re-anchors itself).
+ * Does the log file still hold the anchored head (same hash at the same seq)? Cheap when the
+ * just-written batch chains straight off it (the usual case); otherwise re-reads the file from
+ * scratch (never trusting the incremental parse cache, which assumes an untouched prefix).
  */
-async function anchorTransactionLog(root: DB, dir: string, head: TransactionLogRecord): Promise<void> {
+function fileHoldsAnchoredHead(dir: string, written: TransactionLogRecord[], seq: number, hash: string): boolean {
+  for (const r of written) {
+    if (r.seq === seq) return r.hash === hash;
+    if (r.seq === seq + 1 && r.prevHash === hash) return true;
+  }
+  parsedCache.delete(transactionLogPath(dir));
+  const rec = readAllTransactionLog(dir).records.find((r) => r.seq === seq);
+  return !!rec && rec.hash === hash;
+}
+
+/**
+ * Record the log's genesis and newest head in the database. Monotonic and descent-checked: the
+ * head only moves forward, only while the file's genesis matches the anchored one (a replaced
+ * log never re-anchors itself), and only while the file still holds the anchored head record.
+ * A log whose tail was cut and then re-grown therefore never re-anchors onto the rewritten
+ * tail — the anchor stays put and verification keeps reporting the missing records for good.
+ */
+async function anchorTransactionLog(root: DB, dir: string, written: TransactionLogRecord[]): Promise<void> {
+  const head = written[written.length - 1];
+  if (!head) return;
   const genesis = readFirstRecord(transactionLogPath(dir));
   if (!genesis) return;
-  await root.execute(sql`
-    INSERT INTO transaction_log_anchor (id, genesis_hash, genesis_ts, head_seq, head_hash)
-    VALUES ('log', ${genesis.hash}, ${genesis.ts}, ${head.seq}, ${head.hash})
-    ON CONFLICT (id) DO UPDATE
-       SET head_seq = excluded.head_seq, head_hash = excluded.head_hash, updated_at = now()
-     WHERE transaction_log_anchor.head_seq < excluded.head_seq
-       AND transaction_log_anchor.genesis_hash = excluded.genesis_hash`);
+  // A failed compare-and-set means another commit moved the anchor first, so every retry makes
+  // progress; the bound only guards against a pathological loop.
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    const [anchor] = await root.select().from(transactionLogAnchor).where(eq(transactionLogAnchor.id, 'log'));
+    if (!anchor) {
+      const res = await root.execute(sql`
+        INSERT INTO transaction_log_anchor (id, genesis_hash, genesis_ts, head_seq, head_hash)
+        VALUES ('log', ${genesis.hash}, ${genesis.ts}, ${head.seq}, ${head.hash})
+        ON CONFLICT (id) DO NOTHING`);
+      if ((res as { affectedRows?: number }).affectedRows !== 0) return;
+      continue; // another commit anchored first — re-check against its row
+    }
+    if (anchor.genesisHash !== genesis.hash) return;
+    if (anchor.headSeq >= head.seq) return;
+    if (!fileHoldsAnchoredHead(dir, written, anchor.headSeq, anchor.headHash)) return;
+    // Compare-and-set so a concurrent anchor move is never overwritten with a stale check.
+    const res = await root.execute(sql`
+      UPDATE transaction_log_anchor
+         SET head_seq = ${head.seq}, head_hash = ${head.hash}, updated_at = now()
+       WHERE id = 'log' AND head_seq = ${anchor.headSeq} AND head_hash = ${anchor.headHash}
+         AND genesis_hash = ${genesis.hash}`);
+    if ((res as { affectedRows?: number }).affectedRows !== 0) return;
+  }
 }
 
 // ---------------------------------------------------------------------------
