@@ -16,6 +16,8 @@ import { formatCurrency } from '@/lib/money';
 interface ProposalLine {
   accountCode: string;
   accountName: string;
+  /** Customer / vendor on the line (QB Name column), when the proposal carries one. */
+  entityName?: string | null;
   debit: string | null;
   credit: string | null;
   memo: string | null;
@@ -135,6 +137,7 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
             <tr key={i} className="text-navy">
               <td>
                 {l.accountCode} {l.accountName}
+                {l.entityName ? <span className="text-navy/50"> · {l.entityName}</span> : null}
               </td>
               <td className="text-right tabular-nums">{l.debit ? formatCurrency(l.debit) : ''}</td>
               <td className="text-right tabular-nums">{l.credit ? formatCurrency(l.credit) : ''}</td>

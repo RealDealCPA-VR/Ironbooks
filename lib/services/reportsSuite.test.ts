@@ -401,8 +401,13 @@ describe('report suite', () => {
     expect(current.daysPastDue).toBe(0);
 
     expect(report.bucketTotals.days31_60).toBe('500.00');
-    expect(report.bucketTotals.current).toBe('300.00');
-    expect(report.total).toBe('800.00');
+    // The $300 payment received 7 days ago is unapplied: it was credited to A/R in full, so it
+    // is a credit in the customer's aging (wave-2 foundation, customerCredits.ts) and offsets
+    // the $300 current invoice — aging stays equal to the A/R account.
+    const credit = report.rows.find((r) => r.docType === 'payment')!;
+    expect(credit.openBalance).toBe('-300.00');
+    expect(report.bucketTotals.current).toBe('0.00');
+    expect(report.total).toBe('500.00');
   });
 
   it('arAgingDetail honors a backdated cutoff (invoice still current then)', async () => {

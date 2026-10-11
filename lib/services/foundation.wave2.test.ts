@@ -39,6 +39,7 @@ import {
 import { apAging, arAging, arAgingDetail, cashFlow } from './reportsExtra';
 import { createInvoice } from './invoices';
 import { createPurchaseOrder } from './purchaseOrders';
+import { approveProposal, createJournalProposal } from './aiAssistant';
 import { customerStatement } from './statements';
 import { trialBalance } from './reports';
 import { verifyIntegrity } from './integrity';
@@ -392,6 +393,34 @@ describe('names on journal entry lines', () => {
 // ---------------------------------------------------------------------------
 // I9 — adjusting entries
 // ---------------------------------------------------------------------------
+
+describe('AI journal proposals carry names', () => {
+  it('resolves the vendor named on an A/P line and posts it as a vendor open item', async () => {
+    await expect(
+      createJournalProposal(ctx, {
+        date: '2026-07-01',
+        description: 'accrual',
+        lines: [
+          { accountCode: '6000', debit: '12.00' },
+          { accountCode: '2000', credit: '12.00', name: 'Nobody Inc' },
+        ],
+      }),
+    ).rejects.toThrow(/no vendor named "Nobody Inc"/);
+    const p = await createJournalProposal(ctx, {
+      date: '2026-07-01',
+      description: 'accrual',
+      lines: [
+        { accountCode: '6000', debit: '12.00' },
+        { accountCode: '2000', credit: '12.00', name: 'paper supply co' },
+      ],
+    });
+    expect(p.payload.lines[1]).toMatchObject({ entityType: 'vendor', entityId: vendorId, entityName: 'Paper Supply Co' });
+    const v = await approveProposal(ctx, p.id);
+    const entryId = v.resultRef!.split(':')[1];
+    const items = await journalOpenItems(ctx, 'ap', { entityId: vendorId });
+    expect(items.some((i) => i.journalEntryId === entryId && i.amount === '12.00')).toBe(true);
+  });
+});
 
 describe('adjusting journal entries', () => {
   it('flags entries and lists them in the Adjusting Journal Entries data', async () => {

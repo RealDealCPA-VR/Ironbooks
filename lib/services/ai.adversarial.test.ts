@@ -73,7 +73,7 @@ async function countEntries(companyId = ctx.companyId) {
 
 const goodLines = [
   { accountCode: '6200', debit: '150.00' },
-  { accountCode: '2000', credit: '150.00' },
+  { accountCode: '2000', credit: '150.00', name: 'Shell Oil' },
 ];
 
 describe('AI layer — adversarial QA', () => {
@@ -552,7 +552,7 @@ describe('AI layer — adversarial QA', () => {
       lines: [
         { accountCode: '6200', debit: '33.33' },
         { accountCode: '6400', debit: '33.34' },
-        { accountCode: '2000', credit: '66.67' },
+        { accountCode: '2000', credit: '66.67', name: 'Shell Oil' },
       ],
     });
     const before = await countEntries();
