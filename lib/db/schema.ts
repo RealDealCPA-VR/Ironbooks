@@ -792,6 +792,10 @@ export const budgets = pgTable('budgets', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   name: varchar('name', { length: 255 }).notNull(),
   fiscalYear: integer('fiscal_year').notNull(),
+  /** wave2 reports: 'profit_loss' (income/expense) or 'balance_sheet' (month-end balances). */
+  kind: varchar('kind', { length: 20 }).notNull().default('profit_loss'),
+  /** wave2 reports: QB Forecast (same shape as a budget, reported separately). */
+  isForecast: boolean('is_forecast').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -800,6 +804,8 @@ export const budgetLines = pgTable('budget_lines', {
   budgetId: uuid('budget_id').references(() => budgets.id).notNull(),
   accountId: uuid('account_id').references(() => accounts.id).notNull(),
   classId: uuid('class_id').references(() => classes.id), // optional class dimension
+  /** wave2 reports: optional Customer:Job dimension (QB budgets by Customer:Job). */
+  customerId: uuid('customer_id').references(() => customers.id),
   month: integer('month').notNull(), // 1-12
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
 });
@@ -1121,6 +1127,8 @@ export const mileageLogs = pgTable('mileage_logs', {
   miles: decimal('miles', { precision: 12, scale: 2 }).notNull().default('0'),
   ratePerMile: decimal('rate_per_mile', { precision: 8, scale: 4 }).notNull().default('0.67'),
   purpose: text('purpose'),
+  /** wave2 reports: vehicle driven (Mileage by Vehicle report). */
+  vehicle: varchar('vehicle', { length: 100 }),
   billable: boolean('billable').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
@@ -1196,7 +1204,10 @@ export const memorizedReports = pgTable('memorized_reports', {
   name: varchar('name', { length: 255 }).notNull(),
   reportType: varchar('report_type', { length: 100 }).notNull(),
   config: jsonb('config').$type<Record<string, unknown>>().notNull(),
+  /** wave2 reports: Memorized Report Group this report belongs to (null = ungrouped). */
+  groupId: uuid('group_id').references((): any => memorizedReportGroups.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow(),
 });
 
 // ---- team companyfile ----
@@ -1625,5 +1636,39 @@ export const itemReceiptBillLines = pgTable('item_receipt_bill_lines', {
   /** FIFO layer cost adjustments made for inventoryVariance ([{ layerId, quantity, unitDelta }]); average-cost items store [{ kind: 'average', onHand }] (stock the variance was spread over). */
   layerAdjustments: jsonb('layer_adjustments').$type<Array<Record<string, string>>>(),
   writtenOff: boolean('written_off').notNull().default(false),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- wave2 reports ----
+/** Memorized Report Groups (QB: Memorized Report List groups; Process Multiple Reports). */
+export const memorizedReportGroups = pgTable('memorized_report_groups', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * Scheduled reports: run a memorized report (or a whole group) on a schedule and save the export
+ * to a local folder. The desktop shell's timer calls POST /api/report-schedules/run-due.
+ */
+export const reportSchedules = pgTable('report_schedules', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  memorizedReportId: uuid('memorized_report_id').references(() => memorizedReports.id),
+  groupId: uuid('group_id').references(() => memorizedReportGroups.id),
+  /** daily | weekly | monthly */
+  frequency: varchar('frequency', { length: 20 }).notNull(),
+  nextRunAt: timestamp('next_run_at').notNull(),
+  /** csv | xlsx */
+  format: varchar('format', { length: 10 }).notNull().default('csv'),
+  /** Sub-folder (inside the company's report-export folder) the files are written to. */
+  folder: varchar('folder', { length: 100 }),
+  isActive: boolean('is_active').notNull().default(true),
+  lastRunAt: timestamp('last_run_at'),
+  lastStatus: varchar('last_status', { length: 20 }),
+  lastMessage: text('last_message'),
+  createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

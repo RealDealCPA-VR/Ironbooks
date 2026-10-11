@@ -58,6 +58,8 @@ export interface LogMilesInput {
   ratePerMile?: number | string | null;
   purpose?: string | null;
   billable?: boolean;
+  /** Vehicle driven (Mileage by Vehicle report). */
+  vehicle?: string | null;
 }
 
 export interface MileageSummaryGroup {
@@ -163,6 +165,7 @@ export async function logMiles(ctx: ServiceContext, input: LogMilesInput): Promi
       ratePerMile: rate.toFixed(4),
       purpose: input.purpose ?? null,
       billable: input.billable ?? false,
+      vehicle: input.vehicle?.trim() || null,
     })
     .returning();
 
