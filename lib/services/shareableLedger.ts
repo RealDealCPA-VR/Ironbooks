@@ -131,7 +131,8 @@ async function collect(ctx: ServiceContext): Promise<LedgerData> {
       sheetName: 'Company Info',
       title: company.name,
       subtitle: 'Shareable ledger',
-      columns: [{ header: 'Field' }, { header: 'Value', numeric: true }],
+      // Text column: identifiers such as an EIN '012345678' must keep their leading zeros.
+      columns: [{ header: 'Field' }, { header: 'Value' }],
       rows: info,
     },
     {

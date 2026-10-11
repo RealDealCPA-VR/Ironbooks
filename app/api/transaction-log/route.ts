@@ -4,7 +4,7 @@
  * Query: from, to (YYYY-MM-DD, inclusive), userId, entityType, action, entityId, q (text),
  *        limit (default 200, max 5000), offset.
  * Response: { rows, total, users, entityTypes } — rows are full records incl. `data`.
- * Records of other companies sharing the data dir are hidden.
+ * Records of other companies sharing the data dir are hidden. Owner/admin/accountant only.
  *
  * SECURITY: middleware excludes /api from the session check, so this handler fails closed
  * via getServerContext() before reading anything.
@@ -40,6 +40,10 @@ function parseDay(value: string | null, endOfDay: boolean): Date | undefined {
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
+    // The log carries full before/after data (incl. user records) — not for staff/viewers.
+    if (ctx.role !== 'owner' && ctx.role !== 'admin' && ctx.role !== 'accountant') {
+      throw new ServiceError('FORBIDDEN', 'Only the owner, an admin or the accountant can view the transaction log.');
+    }
     const p = req.nextUrl.searchParams;
     const dir = dataDirOf(ctx.db) ?? resolveDataDir();
     const limit = Math.min(Math.max(Number(p.get('limit')) || 200, 1), 5000);

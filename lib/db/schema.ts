@@ -1167,3 +1167,16 @@ export const memorizedReports = pgTable('memorized_reports', {
   config: jsonb('config').$type<Record<string, unknown>>().notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+// ---- team companyfile ----
+// Anchor for the running transaction log (transactions.bktlg). Holds the log's genesis record
+// and the latest sequence head the database knows about, so deleting, replacing or truncating
+// the log file is detectable by verifyTransactionLog. Singleton row (id = 'log').
+export const transactionLogAnchor = pgTable('transaction_log_anchor', {
+  id: varchar('id', { length: 16 }).primaryKey().default('log'),
+  genesisHash: varchar('genesis_hash', { length: 64 }).notNull(),
+  genesisTs: varchar('genesis_ts', { length: 40 }).notNull(),
+  headSeq: integer('head_seq').notNull(),
+  headHash: varchar('head_hash', { length: 64 }).notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});

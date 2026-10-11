@@ -403,6 +403,7 @@ export function openPortableFile(buffer: Buffer): OpenedPortable {
     if (!listed.has(`data/${t}.jsonl`)) throw notPortable(`table "${t}" is not covered by a checksum`);
   }
   for (const f of Object.keys(manifest.files ?? {})) {
+    carriedRelative(f); // refuse anything that is not an attachment or the transaction log
     if (!listed.has(`files/${f}`)) throw notPortable(`file "${f}" is not covered by a checksum`);
   }
   return { zip, manifest };
@@ -439,12 +440,27 @@ function isEmptyDir(dir: string): boolean {
   }
 }
 
-/** Safe relative path inside the data dir (no absolute paths / traversal from the archive). */
-function safeRelative(rel: string): string {
-  const norm = path.posix.normalize(rel.replace(/\\/g, '/'));
-  if (norm.startsWith('../') || norm === '..' || path.posix.isAbsolute(norm) || /^[a-zA-Z]:/.test(norm)) {
+/**
+ * Safe relative path inside the data dir for a carried file. Only the transaction log and files
+ * under attachments/ are accepted; anything else (.auth-secret, PGlite internals, traversal,
+ * absolute paths) is refused so a crafted file cannot plant files in the company folder.
+ */
+function carriedRelative(rel: string): string {
+  const norm = path.posix.normalize(String(rel).replace(/\\/g, '/'));
+  if (
+    norm.startsWith('../') ||
+    norm === '..' ||
+    path.posix.isAbsolute(norm) ||
+    /^[a-zA-Z]:/.test(norm) ||
+    norm.includes('\u0000')
+  ) {
     throw notPortable(`unsafe file path "${rel}"`);
   }
+  const parts = norm.split('/');
+  const allowed =
+    norm === TRANSACTION_LOG_FILE ||
+    (parts[0] === 'attachments' && parts.length > 1 && parts.every((p) => p !== '' && p !== '.' && p !== '..'));
+  if (!allowed) throw notPortable(`file "${rel}" is not part of a company file`);
   return norm;
 }
 
@@ -467,7 +483,7 @@ export async function restorePortableCompanyFile(
   }
   const createdDir = !fs.existsSync(dir);
 
-  const fail = async (message: string): Promise<never> => {
+  const cleanup = async () => {
     await closeDb(dir).catch(() => undefined);
     try {
       if (createdDir) fs.rmSync(dir, { recursive: true, force: true });
@@ -475,6 +491,9 @@ export async function restorePortableCompanyFile(
     } catch {
       /* best-effort cleanup */
     }
+  };
+  const fail = async (message: string): Promise<never> => {
+    await cleanup();
     throw new ServiceError('VALIDATION', message);
   };
 
@@ -556,7 +575,7 @@ export async function restorePortableCompanyFile(
 
     // --- Carried files (attachments, transaction log). ---
     for (const [rel, info] of Object.entries(manifest.files ?? {})) {
-      const safe = safeRelative(rel);
+      const safe = carriedRelative(rel);
       const bytes = zip.getEntry(`files/${rel}`)!.getData();
       if (bytes.length !== info.bytes || sha256(bytes) !== info.sha256) {
         return await fail(`The portable file is damaged: "${rel}" does not match its checksum.`);
@@ -633,7 +652,11 @@ export async function restorePortableCompanyFile(
       },
     };
   } catch (err) {
-    if (err instanceof ServiceError) throw err;
+    if (err instanceof ServiceError) {
+      // fail() already cleaned up; any other ServiceError must not leave a half-restored folder.
+      await cleanup();
+      throw err;
+    }
     return fail(`The portable file could not be restored: ${(err as Error).message}. Nothing was kept.`);
   }
 }

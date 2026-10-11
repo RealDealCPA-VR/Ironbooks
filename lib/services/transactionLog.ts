@@ -21,14 +21,19 @@
  *
  * `verifyTransactionLog` checks the chain AND that every posted journal entry in the database
  * is present in the log (entries that predate the log's genesis are reported separately).
+ *
+ * The database keeps an anchor (table transaction_log_anchor): the genesis record's hash and
+ * timestamp plus the latest head seq/hash, updated right after each append. Verification trusts
+ * the anchor — not the file — for the "predates the log" cutoff, so deleting the file, replacing
+ * it with a fresh genesis, or cutting records off its tail is reported.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { eq, sql } from 'drizzle-orm';
 import type { DB } from '@/lib/db';
-import { journalEntries, users } from '@/lib/db/schema';
-import { afterCommit, dataDirOf } from '@/lib/db/txHooks';
+import { journalEntries, transactionLogAnchor, users } from '@/lib/db/schema';
+import { afterCommit, dataDirOf, rootDbOf } from '@/lib/db/txHooks';
 import { formatCurrency, Money } from '@/lib/money';
 
 /** File name of the running transaction log inside a company data directory. */
@@ -375,9 +380,51 @@ export async function logTransaction(db: DB, change: TransactionLogChange): Prom
     data,
   };
   if (change.entityType === 'user' && change.entityId) forgetUserName(change.entityId);
-  afterCommit(db, () => {
-    appendTransactionLog(dir, [record]);
+  const root = rootDbOf(db) as DB | null;
+  await afterCommit(db, async () => {
+    const written = appendTransactionLog(dir, [record]);
+    if (root) await anchorTransactionLog(root, dir, written[written.length - 1]);
   });
+}
+
+/** First (genesis) record of a log file, or null when missing/unreadable. */
+function readFirstRecord(file: string): TransactionLogRecord | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    let len = 4096;
+    for (;;) {
+      const buf = Buffer.alloc(len);
+      const n = fs.readSync(fd, buf, 0, len, 0);
+      const text = buf.subarray(0, n).toString('utf8');
+      const nl = text.indexOf('\n');
+      if (nl >= 0 || n < len) return parseLine((nl >= 0 ? text.slice(0, nl) : text).trim());
+      len *= 4;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Record the log's genesis and newest head in the database. Monotonic: the head only moves
+ * forward, and only while the file's genesis matches the anchored one (a replaced log never
+ * re-anchors itself).
+ */
+async function anchorTransactionLog(root: DB, dir: string, head: TransactionLogRecord): Promise<void> {
+  const genesis = readFirstRecord(transactionLogPath(dir));
+  if (!genesis) return;
+  await root.execute(sql`
+    INSERT INTO transaction_log_anchor (id, genesis_hash, genesis_ts, head_seq, head_hash)
+    VALUES ('log', ${genesis.hash}, ${genesis.ts}, ${head.seq}, ${head.hash})
+    ON CONFLICT (id) DO UPDATE
+       SET head_seq = excluded.head_seq, head_hash = excluded.head_hash, updated_at = now()
+     WHERE transaction_log_anchor.head_seq < excluded.head_seq
+       AND transaction_log_anchor.genesis_hash = excluded.genesis_hash`);
 }
 
 // ---------------------------------------------------------------------------
@@ -523,8 +570,10 @@ export interface TransactionLogVerification {
   /** First problem found in the chain, if any. */
   chainError: { line: number; seq: number | null; reason: string } | null;
   headHash: string | null;
-  /** When the log started (genesis ts). */
+  /** When the log started (genesis ts, from the database anchor when present). */
   startedAt: string | null;
+  /** The database holds an anchor for this log (genesis + head). */
+  anchored: boolean;
   postedEntries: number;
   /** Posted entries created after the log started that have no log record. */
   missingEntries: Array<{ id: string; entryNumber: number; companyId: string }>;
@@ -550,6 +599,8 @@ export async function verifyTransactionLog(db: DB, dataDir?: string): Promise<Tr
   let records = 0;
   let prevHash = GENESIS_PREV_HASH;
   let startedAt: string | null = null;
+  let genesisHash: string | null = null;
+  const hashBySeq = new Map<number, string>();
   const loggedEntryIds = new Set<string>();
 
   if (exists) {
@@ -564,6 +615,7 @@ export async function verifyTransactionLog(db: DB, dataDir?: string): Promise<Tr
         continue;
       }
       records += 1;
+      hashBySeq.set(rec.seq, rec.hash);
       if (rec.entityType === 'journal_entry' && rec.entityId) loggedEntryIds.add(rec.entityId);
       const bulk = (rec.data as { journalEntryIds?: unknown } | null)?.journalEntryIds;
       if (Array.isArray(bulk)) for (const id of bulk) if (typeof id === 'string') loggedEntryIds.add(id);
@@ -577,11 +629,40 @@ export async function verifyTransactionLog(db: DB, dataDir?: string): Promise<Tr
       }
       if (i === 0) {
         startedAt = rec.ts;
+        genesisHash = rec.hash;
         if (!chainError && rec.action !== 'log_started') {
           chainError = { line: 1, seq: rec.seq, reason: 'The log does not begin with its start record.' };
         }
       }
       prevHash = rec.hash;
+    }
+  }
+
+  // The database anchor is authoritative for when the log started and how far it reached; a
+  // file that is missing, restarted or cut short is a broken log, not a "new" one.
+  const [anchor] = await db.select().from(transactionLogAnchor).where(eq(transactionLogAnchor.id, 'log'));
+  if (anchor) {
+    startedAt = anchor.genesisTs;
+    if (!chainError) {
+      if (!exists || records === 0) {
+        chainError = {
+          line: 0,
+          seq: null,
+          reason: `The transaction log file is missing or empty, but this company file recorded a log started ${anchor.genesisTs}.`,
+        };
+      } else if (genesisHash !== anchor.genesisHash) {
+        chainError = {
+          line: 1,
+          seq: 1,
+          reason: 'The log was replaced: its start record does not match the one recorded in the company file.',
+        };
+      } else if (hashBySeq.get(anchor.headSeq) !== anchor.headHash) {
+        chainError = {
+          line: records,
+          seq: anchor.headSeq,
+          reason: `Records are missing from the end of the log (the company file recorded record #${anchor.headSeq}).`,
+        };
+      }
     }
   }
 
@@ -611,6 +692,14 @@ export async function verifyTransactionLog(db: DB, dataDir?: string): Promise<Tr
     missingEntries.push({ id: e.id, entryNumber: e.entryNumber, companyId: e.companyId });
   }
 
+  if (!anchor && !exists && posted.length > 0) {
+    chainError ??= {
+      line: 0,
+      seq: null,
+      reason: 'There is no transaction log for this company file, although it has posted transactions.',
+    };
+  }
+
   const chainIntact = chainError === null;
   return {
     ok: chainIntact && missingEntries.length === 0,
@@ -620,6 +709,7 @@ export async function verifyTransactionLog(db: DB, dataDir?: string): Promise<Tr
     chainError,
     headHash: records ? prevHash : null,
     startedAt,
+    anchored: !!anchor,
     postedEntries: posted.length,
     missingEntries,
     preLogEntries,

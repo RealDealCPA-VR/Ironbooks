@@ -14,7 +14,7 @@
  * the transaction log against the file's manifest, and refuses (400) on any mismatch.
  *
  * SECURITY: middleware excludes /api from the session check — this handler fails closed via
- * getServerContext() (non-viewer) unless the internal token is valid.
+ * getServerContext() (owner/admin only) unless the internal token is valid.
  */
 import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
@@ -57,8 +57,9 @@ export async function POST(req: NextRequest) {
     const internal = isInternal(req);
     if (!internal) {
       const ctx = await getServerContext();
-      if (ctx.role === 'viewer') {
-        throw new ServiceError('FORBIDDEN', 'Your role is view-only. This action requires write access.');
+      // Same rule as creating a portable file: only the owner/admin may open one.
+      if (ctx.role !== 'owner' && ctx.role !== 'admin') {
+        throw new ServiceError('FORBIDDEN', 'Only the company owner or an admin can open a portable company file.');
       }
     }
 

@@ -149,6 +149,23 @@ describe('transaction log — adversarial', () => {
     }
   });
 
+  it('cutting non-journal records off the tail of the log is detected', async () => {
+    await createCustomer(ctx, { displayName: 'Tail customer' });
+    const original = fs.readFileSync(file(), 'utf8');
+    try {
+      const l = original.split('\n').filter(Boolean);
+      expect(l[l.length - 1]).toContain('Tail customer');
+      fs.writeFileSync(file(), l.slice(0, -1).join('\n') + '\n');
+      const v = await verifyTransactionLog(db, DIR);
+      expect(v.anchored).toBe(true);
+      expect(v.ok).toBe(false);
+      expect(v.chainError?.reason).toMatch(/missing from the end/);
+    } finally {
+      fs.writeFileSync(file(), original);
+    }
+    expect((await verifyTransactionLog(db, DIR)).ok).toBe(true);
+  });
+
   it('replacing the log with a fresh one (new genesis) is detected', async () => {
     const original = fs.readFileSync(file(), 'utf8');
     const posted = await db.select({ id: journalEntries.id }).from(journalEntries).where(eq(journalEntries.status, 'posted'));
@@ -159,7 +176,10 @@ describe('transaction log — adversarial', () => {
       await new Promise((r) => setTimeout(r, 1100));
       await createCustomer(ctx, { displayName: 'After wipe' });
       const v = await verifyTransactionLog(db, DIR);
-      expect(v.chainIntact).toBe(true);
+      // The new file chains internally, but its genesis does not match the one anchored in the
+      // database, so the log is reported as replaced (a broken chain).
+      expect(v.chainIntact).toBe(false);
+      expect(v.chainError?.reason).toMatch(/replaced/);
       // The previously logged posted entries are now unaccounted for — this must not pass.
       expect(v.preLogEntries).toBe(0);
       expect(v.ok).toBe(false);
