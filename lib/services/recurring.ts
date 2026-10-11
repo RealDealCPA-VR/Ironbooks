@@ -192,6 +192,19 @@ export function semimonthlyAnchor(date: Date): number {
   return Math.min(dayOfMonth - 15, 15);
 }
 
+/** True when `date` is one of the two days of the twice-a-month pair anchored on `anchor`. */
+function inSemimonthlyPair(date: Date, anchor: number): boolean {
+  const dayOfMonth = date.getUTCDate();
+  const last = lastDayOfMonth(date.getUTCFullYear(), date.getUTCMonth());
+  return dayOfMonth === Math.min(anchor, last) || dayOfMonth === Math.min(anchor + 15, last);
+}
+
+/** The anchor to store for `date`: the existing one when the date still belongs to its pair. */
+function anchorFor(date: Date, stored: number | null | undefined): number {
+  const keep = validAnchor(stored);
+  return keep != null && inSemimonthlyPair(date, keep) ? keep : semimonthlyAnchor(date);
+}
+
 /**
  * Next occurrence after `date` for a frequency ('never' returns null). `anchorDay` (semimonthly
  * only) is the pair's first-half day; without it the anchor is derived from the date.
@@ -444,9 +457,13 @@ export async function updateTemplate(ctx: ServiceContext, id: string, input: Upd
       patch.name = input.name.trim();
     }
     if (input.frequency !== undefined) patch.frequency = input.frequency;
-    if (input.nextRunDate !== undefined) {
-      patch.nextRunDate = parseRunDate(input.nextRunDate);
-      patch.anchorDay = patch.nextRunDate ? semimonthlyAnchor(patch.nextRunDate) : null;
+    if (input.nextRunDate !== undefined) patch.nextRunDate = parseRunDate(input.nextRunDate);
+    if (input.nextRunDate !== undefined || input.frequency !== undefined) {
+      // The UI re-sends the next date on every save, and a frequency switch keeps the current date,
+      // so keep the stored twice-a-month pair whenever the (new or current) date is still one of its
+      // days (a 14th/29th pair saved on Feb 28 stays 14th/29th); otherwise pair on that date.
+      const nextDate = input.nextRunDate !== undefined ? patch.nextRunDate ?? null : before.nextRunDate;
+      patch.anchorDay = nextDate ? anchorFor(nextDate, before.anchorDay) : null;
     }
     if (input.groupName !== undefined) patch.groupName = input.groupName?.trim() || null;
     if (input.remaining !== undefined) patch.remaining = input.remaining;
@@ -625,7 +642,7 @@ async function recordRun(
 ): Promise<void> {
   const frequency = template.frequency as Frequency;
   // Catch up so a template several periods overdue fires once, not on every subsequent run.
-  const anchor = template.anchorDay ?? semimonthlyAnchor(fromDate);
+  const anchor = validAnchor(template.anchorDay) ?? semimonthlyAnchor(fromDate);
   let nextRun = advanceDate(fromDate, frequency, anchor);
   while (nextRun && nextRun.getTime() <= now.getTime()) {
     nextRun = advanceDate(nextRun, frequency, anchor);
