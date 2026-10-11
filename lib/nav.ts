@@ -13,6 +13,7 @@ import {
   Layers, ShieldCheck, Network, Landmark, FileClock, Paperclip, BadgeCheck,
   ListChecks, GitMerge, FileX, Clock, Timer, Boxes, Wallet, Percent, Combine,
   GitCompareArrows, CalendarRange, PackageSearch, Scale, BadgePercent, Car, HardDrive,
+  Warehouse, Ship, MapPin,
 } from 'lucide-react';
 
 export interface NavLink {
@@ -100,6 +101,7 @@ export const navGroups: NavGroup[] = [
       { icon: Scale, label: 'Balance Sheet (Cash)', path: '/reports/balance-sheet-cash' },
       { icon: Tag, label: 'P&L by Class', path: '/reports/pl-by-class' },
       { icon: Boxes, label: 'Inventory Valuation', path: '/reports/inventory-valuation' },
+      { icon: MapPin, label: 'Inventory by Site', path: '/reports/inventory-sites' },
       { icon: UserSquare, label: 'Payroll Reports', path: '/reports/payroll-summary' },
       { icon: Banknote, label: 'Reconciliation Reports', path: '/reports/reconciliation' },
       { icon: Network, label: 'Consolidated', path: '/reports/consolidated' },
@@ -127,6 +129,9 @@ export const navGroups: NavGroup[] = [
       { icon: Combine, label: 'Assemblies', path: '/assemblies' },
       { icon: PackageSearch, label: 'Inventory Ops', path: '/inventory-ops' },
       { icon: Layers, label: 'FIFO Inventory', path: '/fifo' },
+      { icon: Warehouse, label: 'Inventory Sites', path: '/inventory-sites' },
+      { icon: ArrowLeftRight, label: 'Transfer Inventory', path: '/inventory-transfers' },
+      { icon: Ship, label: 'Landed Cost', path: '/landed-cost' },
       { icon: HandCoins, label: 'Customer Pricing', path: '/customer-pricing' },
       { icon: FileSpreadsheet, label: 'Expense Reports', path: '/expense-reports' },
     ],

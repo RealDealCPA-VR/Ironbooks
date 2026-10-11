@@ -29,6 +29,7 @@
  *     build/unbuild, since this module's averageCost math never touches
  *     layers; route those items through fifo.ts instead.
  */
+import { randomUUID } from 'node:crypto';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { assemblyComponents, items, pendingBuilds } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -40,6 +41,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertNotFifoTracked } from './inventory';
+import { type InventoryLineDetail, type MovementRequest, recordMovements } from './inventorySites';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -58,10 +60,73 @@ export interface BomRow {
   quantity: string;
 }
 
-export interface BuildInput {
+export interface BuildInput extends InventoryLineDetail {
   assemblyItemId: string;
   /** Number of finished assemblies to build (must be > 0). */
   quantity: string | number;
+  /**
+   * Advanced Inventory: the site the build happens at (components are drawn from and the
+   * finished assemblies land in this site; defaults to the default site). `binId`,
+   * `serialNumbers`, `lotNumber`, `lotExpiration` describe the FINISHED assemblies;
+   * per-component bins / serials / lots go in `components`.
+   */
+  components?: Array<{
+    componentItemId: string;
+    binId?: string | null;
+    serialNumbers?: string[] | null;
+    lotNumber?: string | null;
+  }> | null;
+  /** Date stamped on the site movements (defaults to now). */
+  date?: Date | null;
+}
+
+/**
+ * Site-tagged movements for a build (direction 1) or unbuild (direction -1): components move
+ * out (in for unbuild) and the assembly moves in (out for unbuild) at the build's site.
+ */
+function buildMovements(
+  input: BuildInput,
+  bom: Array<{ componentItemId: string; quantity: string }>,
+  qty: ReturnType<typeof Money.zero>,
+  direction: 1 | -1,
+  sourceType: 'build' | 'unbuild',
+  sourceId: string,
+): MovementRequest[] {
+  const date = input.date ?? new Date();
+  const memo = `Assembly ${sourceType}`;
+  const detailFor = (id: string) => input.components?.find((c) => c.componentItemId === id);
+  return [
+    ...bom.map((b, i) => {
+      const d = detailFor(b.componentItemId);
+      return {
+        itemId: b.componentItemId,
+        siteId: input.siteId ?? null,
+        binId: d?.binId ?? null,
+        quantity: qty.times(Money.of(b.quantity)).times(-direction),
+        serialNumbers: d?.serialNumbers ?? null,
+        lotNumber: d?.lotNumber ?? null,
+        date,
+        sourceType,
+        sourceId,
+        sourceLine: i + 1,
+        memo,
+      };
+    }),
+    {
+      itemId: input.assemblyItemId,
+      siteId: input.siteId ?? null,
+      binId: input.binId ?? null,
+      quantity: qty.times(direction),
+      serialNumbers: input.serialNumbers ?? null,
+      lotNumber: input.lotNumber ?? null,
+      lotExpiration: input.lotExpiration ?? null,
+      date,
+      sourceType,
+      sourceId,
+      sourceLine: 0,
+      memo,
+    },
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +359,7 @@ export async function buildAssembly(
   totalCost: string;
   newAssemblyQty: string;
   newAssemblyAvgCost: string;
+  buildId: string;
 }> {
   const buildQty = Money.of(input.quantity);
   if (!buildQty.greaterThan(0)) {
@@ -401,12 +467,17 @@ export async function buildAssembly(
       },
     });
 
+    // Advanced Inventory: components leave, finished goods arrive, at the build's site.
+    const buildId = randomUUID();
+    await recordMovements(tx, buildMovements(input, bom, buildQty, 1, 'build', buildId));
+
     return {
       assemblyItemId: input.assemblyItemId,
       quantityBuilt: buildQty.toFixed(4),
       totalCost: toAmountString(totalCost),
       newAssemblyQty: newAssemblyQty.toFixed(4),
       newAssemblyAvgCost: newAssemblyAvgCost.toFixed(4),
+      buildId,
     };
   });
 }
@@ -560,6 +631,9 @@ export async function unbuildAssembly(
         quantityUnbuilt: unbuildQty.toFixed(4),
       },
     });
+
+    // Advanced Inventory: finished goods leave, components return, at the site.
+    await recordMovements(tx, buildMovements(input, bom, unbuildQty, -1, 'unbuild', randomUUID()));
 
     return {
       assemblyItemId: input.assemblyItemId,
@@ -787,6 +861,7 @@ async function loadPendingBuild(ctx: ServiceContext, id: string) {
 export async function finalizePendingBuild(
   ctx: ServiceContext,
   id: string,
+  opts?: Omit<BuildInput, 'assemblyItemId' | 'quantity'>,
 ): Promise<{
   pendingBuildId: string;
   status: string;
@@ -810,8 +885,10 @@ export async function finalizePendingBuild(
     // buildAssembly re-validates stock inside the same transaction (and rejects
     // FIFO-tracked items); any failure rolls the status update back too.
     const build = await buildAssembly(tx, {
+      ...opts,
       assemblyItemId: row.assemblyItemId,
       quantity: row.quantity,
+      date: opts?.date ?? row.date,
     });
 
     await tx.db

@@ -25,6 +25,14 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  invFromLine,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -53,6 +61,12 @@ interface BillDetailLine {
   description: string | null;
   quantity: string;
   amount: string;
+  // Advanced Inventory detail (present only when stored for the line)
+  siteId?: string | null;
+  binId?: string | null;
+  serialNumbers?: string[] | null;
+  lotNumber?: string | null;
+  lotExpiration?: string | null;
 }
 
 /** A bill can be edited while nothing has been applied against it. */
@@ -82,6 +96,7 @@ interface Item {
   type: 'service' | 'inventory' | 'non_inventory' | 'bundle';
   purchaseCost: string | null;
   quantityOnHand: string | null;
+  trackingMode?: string | null;
 }
 
 type LineMode = 'expense' | 'item';
@@ -97,6 +112,8 @@ interface LineRow {
   unitCost: string;
   // Shared
   description: string;
+  /** Advanced Inventory: receiving site / bin / serials / lot (inventory item lines). */
+  inv?: InvDetail;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +185,9 @@ export default function BillsPage() {
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [dueDate, setDueDate] = useState('');
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
+
+  // Advanced Inventory (sites / bins / serial & lot) for item lines.
+  const adv = useAdvancedInventory(modalOpen);
 
   // Void confirm
   const [pendingVoid, setPendingVoid] = useState<Bill | null>(null);
@@ -256,6 +276,7 @@ export default function BillsPage() {
                   quantity: String(qty),
                   unitCost: String(parseFloat(unitCost.toFixed(4))),
                   description: l.description ?? '',
+                  inv: invFromLine(l),
                 };
               }
               return {
@@ -305,6 +326,16 @@ export default function BillsPage() {
 
   function addLine(mode: LineMode = 'expense') {
     setLines((prev) => [...prev, emptyLine(mode)]);
+  }
+
+  /** Scan-to-add: a scanned item becomes an item line (fills an empty line when there is one). */
+  function addScannedItem(it: { id: string; purchaseCost?: string | null }) {
+    setLines((prev) => {
+      const row: LineRow = { ...emptyLine('item'), itemId: it.id, quantity: '1', unitCost: it.purchaseCost ?? '' };
+      const emptyIdx = prev.findIndex((l) => !l.itemId && !l.accountId && !l.amount && !l.quantity);
+      if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
+      return [...prev, row];
+    });
   }
 
   function removeLine(index: number) {
@@ -376,6 +407,7 @@ export default function BillsPage() {
                 quantity: l.quantity,
                 unitCost: l.unitCost,
                 description: l.description.trim() || undefined,
+                ...inventoryLinePayload(l.inv),
               }
             : {
                 accountId: l.accountId,
@@ -606,6 +638,7 @@ export default function BillsPage() {
             <div className="flex items-center justify-between mb-2">
               <Label className="mb-0">Line Items *</Label>
               <span className="flex items-center gap-3">
+                <BarcodeScanInput onItem={addScannedItem} />
                 <button
                   type="button"
                   onClick={() => addLine('expense')}
@@ -625,7 +658,8 @@ export default function BillsPage() {
 
             <div className="space-y-2" onKeyDown={grid.onKeyDown}>
               {lines.map((line, idx) => (
-                <div key={idx} data-grid-row className="flex gap-2 items-start">
+                <div key={idx} data-grid-row className="space-y-1">
+                <div className="flex gap-2 items-start">
                   {/* Mode toggle */}
                   <div className="flex rounded-lg border border-slate-200 overflow-hidden shrink-0">
                     {(['expense', 'item'] as const).map((m) => (
@@ -735,6 +769,17 @@ export default function BillsPage() {
                   >
                     <Trash2 className="h-4 w-4" />
                   </button>
+                </div>
+                {line.mode === 'item' && (
+                  <InventoryLineFields
+                    adv={adv}
+                    item={items.find((it) => it.id === line.itemId)}
+                    quantity={line.quantity}
+                    direction="in"
+                    value={line.inv}
+                    onChange={(inv) => updateLine(idx, { inv })}
+                  />
+                )}
                 </div>
               ))}
             </div>

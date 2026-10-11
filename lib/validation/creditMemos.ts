@@ -3,6 +3,7 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { inventoryLineFields } from './inventorySites';
 
 export const creditMemoLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -14,6 +15,8 @@ export const creditMemoLineSchema = z.object({
   taxable: z.boolean().optional(),
   /** Inventory items only: true (default) restocks; false = damaged write-off. */
   restock: z.boolean().optional(),
+  /** Advanced Inventory: site/bin/serial/lot returned goods go back to. */
+  ...inventoryLineFields,
 });
 
 export const createCreditMemoSchema = z.object({

@@ -26,6 +26,10 @@ import {
   salesOrders, salesReceiptLines, salesReceipts, salesReps, taxAgencies, taxRateComponents,
   taxRates, timeEntries, transactionRules, transfers, userCompanies, vendorCreditLines,
   vendorCredits, vendors,
+  // team inventory (Advanced Inventory)
+  inventoryBins, inventoryLineDetails, inventoryLots, inventoryMovements, inventorySites,
+  inventoryTransferLines, inventoryTransfers, itemReceiptLines, itemReceipts, itemSiteSettings,
+  landedCostAllocationLines, landedCostAllocations, pendingBuilds,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 
@@ -493,6 +497,29 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
     joins: [{ table: errorDetections, on: [errorCorrections.errorDetectionId, errorDetections.id] }],
   },
   { name: 'auditLogs', table: auditLogs, joins: [], companyCol: auditLogs.companyId },
+  // ---- team inventory: item receipts / pending builds + Advanced Inventory ----
+  { name: 'itemReceipts', table: itemReceipts, joins: [], companyCol: itemReceipts.companyId },
+  {
+    name: 'itemReceiptLines', table: itemReceiptLines, companyCol: itemReceipts.companyId,
+    joins: [{ table: itemReceipts, on: [itemReceiptLines.itemReceiptId, itemReceipts.id] }],
+  },
+  { name: 'pendingBuilds', table: pendingBuilds, joins: [], companyCol: pendingBuilds.companyId },
+  { name: 'inventorySites', table: inventorySites, joins: [], companyCol: inventorySites.companyId },
+  { name: 'inventoryBins', table: inventoryBins, joins: [], companyCol: inventoryBins.companyId },
+  { name: 'inventoryLots', table: inventoryLots, joins: [], companyCol: inventoryLots.companyId },
+  { name: 'itemSiteSettings', table: itemSiteSettings, joins: [], companyCol: itemSiteSettings.companyId },
+  { name: 'inventoryTransfers', table: inventoryTransfers, joins: [], companyCol: inventoryTransfers.companyId },
+  {
+    name: 'inventoryTransferLines', table: inventoryTransferLines, companyCol: inventoryTransfers.companyId,
+    joins: [{ table: inventoryTransfers, on: [inventoryTransferLines.transferId, inventoryTransfers.id] }],
+  },
+  { name: 'inventoryMovements', table: inventoryMovements, joins: [], companyCol: inventoryMovements.companyId },
+  { name: 'inventoryLineDetails', table: inventoryLineDetails, joins: [], companyCol: inventoryLineDetails.companyId },
+  { name: 'landedCostAllocations', table: landedCostAllocations, joins: [], companyCol: landedCostAllocations.companyId },
+  {
+    name: 'landedCostAllocationLines', table: landedCostAllocationLines, companyCol: landedCostAllocations.companyId,
+    joins: [{ table: landedCostAllocations, on: [landedCostAllocationLines.allocationId, landedCostAllocations.id] }],
+  },
 ];
 
 /** Columns that reference users.id — users are NOT exported, so on restore these map to the restoring user. */

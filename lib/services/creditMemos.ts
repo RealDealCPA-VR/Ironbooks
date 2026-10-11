@@ -56,6 +56,12 @@ import { Money, allocate, toAmountString } from '@/lib/money';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
 import {
+  type InventoryLineDetail,
+  attachInventoryDetails,
+  postDocumentInventory,
+  reverseDocumentInventory,
+} from './inventorySites';
+import {
   type ServiceContext,
   ServiceError,
   inTransaction,
@@ -68,7 +74,7 @@ import {
 // Input / output types
 // ---------------------------------------------------------------------------
 
-export interface CreditMemoLineInput {
+export interface CreditMemoLineInput extends InventoryLineDetail {
   /**
    * Optional product/service item; supplies the income account as a fallback
    * and (for inventory items) triggers restocking + COGS reversal.
@@ -479,6 +485,30 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
     }
 
+    // 4b) Advanced Inventory: restocked units go back to the chosen site/bin (with their
+    //     serial/lot identity). Damaged (restock=false) lines move no stock.
+    await postDocumentInventory(tx, {
+      sourceType: 'credit_memo',
+      sourceId: memo.id,
+      date: input.date,
+      direction: 'in',
+      lines: insertedLines.map((line) => {
+        const src = input.lines[line.lineOrder];
+        return {
+          lineOrder: line.lineOrder,
+          itemId: line.itemId,
+          quantity: line.quantity,
+          siteId: src?.siteId,
+          binId: src?.binId,
+          serialNumbers: src?.serialNumbers,
+          lotNumber: src?.lotNumber,
+          lotExpiration: src?.lotExpiration,
+        };
+      }),
+      movingLineOrders: computedLines.filter((cl) => cl.restock).map((cl) => cl.lineOrder),
+      memo: `Credit Memo #${memoNumber}`,
+    });
+
     // 5) Stamp postedEntryId
     const [updated] = await tx.db
       .update(creditMemos)
@@ -543,7 +573,7 @@ export async function getCreditMemo(ctx: ServiceContext, id: string) {
     .where(eq(creditMemoLines.creditMemoId, id))
     .orderBy(asc(creditMemoLines.lineOrder));
 
-  return { ...memo, lines };
+  return { ...memo, lines: await attachInventoryDetails(ctx, 'credit_memo', id, lines) };
 }
 
 // ---------------------------------------------------------------------------
@@ -852,9 +882,11 @@ export async function voidCreditMemo(ctx: ServiceContext, id: string) {
     }
 
     // Reverse each restock entry and pull the stock back out.
+    const reversedLineOrders: number[] = [];
     for (const je of restockJEs) {
       if (je.status !== 'posted') continue;
       const line = je.reference ? lineById.get(je.reference) : undefined;
+      if (line) reversedLineOrders.push(line.lineOrder);
 
       // Reverse the GL first (Cr Inventory / Dr COGS via balance-delta reversal).
       await voidJournalEntry(tx, je.id);
@@ -921,6 +953,9 @@ export async function voidCreditMemo(ctx: ServiceContext, id: string) {
         })
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
     }
+
+    // Pull the same units back out of the site/bin they were restocked to.
+    await reverseDocumentInventory(tx, 'credit_memo', id, { lineOrders: reversedLineOrders });
 
     // Reverse the main credit memo entry.
     if (memo.postedEntryId) {

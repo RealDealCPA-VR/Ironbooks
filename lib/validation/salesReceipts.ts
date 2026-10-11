@@ -3,6 +3,7 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { inventoryLineFields } from './inventorySites';
 
 export const salesReceiptLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -13,6 +14,8 @@ export const salesReceiptLineSchema = z.object({
   /** Defaults to true (matches prior route behavior). */
   taxable: z.boolean().default(true),
   taxRateId: zUuid.nullish(),
+  /** Advanced Inventory: site/bin/serial/lot the stock is sold from. */
+  ...inventoryLineFields,
 });
 
 export const createSalesReceiptSchema = z.object({

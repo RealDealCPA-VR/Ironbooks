@@ -29,6 +29,7 @@ import {
   Building2,
   FileCode2,
   Wrench,
+  MapPin,
 } from 'lucide-react';
 import { Card, PageHeader } from '@/components/ui';
 
@@ -245,6 +246,12 @@ const SALES_PURCHASES_REPORTS: ReportCardProps[] = [
     icon: ShoppingCart,
     name: 'Purchases by Item',
     description: 'Quantity and cost per item from vendor bills.',
+  },
+  {
+    href: '/reports/inventory-sites',
+    icon: MapPin,
+    name: 'Inventory by Site',
+    description: 'Quantity on hand, stock status, reorder, and serial/lot numbers by site.',
   },
 ];
 

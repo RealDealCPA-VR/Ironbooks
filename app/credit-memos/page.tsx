@@ -25,6 +25,13 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 import { formatDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
@@ -70,6 +77,7 @@ interface Item {
   type: 'service' | 'inventory' | 'non_inventory' | 'bundle';
   salesPrice: string | null;
   taxable: boolean;
+  trackingMode?: string | null;
 }
 
 interface TaxRate {
@@ -86,6 +94,8 @@ interface LineRow {
   taxable: boolean;
   /** Inventory items only: true = return to stock, false = damaged write-off. */
   restock: boolean;
+  /** Advanced Inventory: site / bin / serials / lot the returned goods go back to. */
+  inv?: InvDetail;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +206,25 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
     setLines((prev) => [...prev, { ...EMPTY_LINE }]);
   }
 
+  // Advanced Inventory: sites/bins + scan-to-add.
+  const adv = useAdvancedInventory(open);
+  function addScannedItem(it: { id: string; name: string; salesPrice?: string | null }) {
+    const item = itemMap.get(it.id);
+    setLines((prev) => {
+      const row: LineRow = {
+        ...EMPTY_LINE,
+        itemId: it.id,
+        description: it.name,
+        quantity: '1',
+        rate: it.salesPrice ?? '',
+        taxable: item?.taxable ?? true,
+      };
+      const emptyIdx = prev.findIndex((l) => !l.itemId && !l.description && !l.quantity && !l.rate);
+      if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
+      return [...prev, row];
+    });
+  }
+
   function removeLine(idx: number) {
     // Keep at least one line (mirrors the per-row remove button being disabled).
     setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev));
@@ -233,6 +262,7 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
           rate: l.rate,
           taxable: l.taxable,
           restock: l.restock,
+          ...(l.restock ? inventoryLinePayload(l.inv) : {}),
         })),
       });
       toast('Credit memo created.', 'success');
@@ -292,13 +322,16 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
-              <PlusCircle className="h-4 w-4" /> Add line
-            </button>
+            <div className="flex items-center gap-3">
+              <BarcodeScanInput onItem={addScannedItem} />
+              <button
+                type="button"
+                onClick={addLine}
+                className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
+              >
+                <PlusCircle className="h-4 w-4" /> Add line
+              </button>
+            </div>
           </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
@@ -377,6 +410,17 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
                   >
                     <MinusCircle className="h-4 w-4" />
                   </button>
+                  {line.restock && (
+                    <InventoryLineFields
+                      className="col-span-full"
+                      adv={adv}
+                      item={lineItem}
+                      quantity={line.quantity}
+                      direction="in"
+                      value={line.inv}
+                      onChange={(inv) => updateLine(idx, { inv })}
+                    />
+                  )}
                 </div>
               );
             })}

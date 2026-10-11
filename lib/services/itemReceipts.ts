@@ -49,6 +49,13 @@ import {
   releaseReceiptQuantities,
 } from '@/lib/services/purchaseOrders';
 import {
+  type InventoryLineDetail,
+  attachInventoryDetails,
+  postDocumentInventory,
+  reverseDocumentInventory,
+} from './inventorySites';
+import { assertNoActiveLandedCost } from './landedCost';
+import {
   type ServiceContext,
   ServiceError,
   inTransaction,
@@ -70,7 +77,7 @@ import {
 export const ITEM_RECEIPT_ACCRUAL_CODE = '2050';
 export const ITEM_RECEIPT_ACCRUAL_NAME = 'Item Receipts Accrual';
 
-export interface ItemReceiptLineInput {
+export interface ItemReceiptLineInput extends InventoryLineDetail {
   itemId: string;
   description?: string | null;
   /** Units received (> 0). */
@@ -179,6 +186,8 @@ async function receiveStock(
       date,
       quantityRemaining: qty.toFixed(4),
       unitCost: unitCost.toFixed(4),
+      // Tag the layer with its receipt so landed cost can find (and revalue) it.
+      sourceRef: reason,
     });
     await ctx.db
       .update(items)
@@ -472,6 +481,28 @@ export async function createItemReceipt(ctx: ServiceContext, input: CreateItemRe
       await receiveStock(tx, l.itemId, l.quantity, l.unitCost, input.date, `item_receipt:${receipt.id}`);
     }
 
+    // --- Advanced Inventory: receiving site / bin / serials / lot ---
+    await postDocumentInventory(tx, {
+      sourceType: 'item_receipt',
+      sourceId: receipt.id,
+      date: input.date,
+      direction: 'in',
+      lines: resolved.map((l, idx) => {
+        const src = input.lines[idx];
+        return {
+          lineOrder: idx,
+          itemId: l.isInventory ? l.itemId : null,
+          quantity: l.quantity,
+          siteId: src?.siteId,
+          binId: src?.binId,
+          serialNumbers: src?.serialNumbers,
+          lotNumber: src?.lotNumber,
+          lotExpiration: src?.lotExpiration,
+        };
+      }),
+      memo: `Item receipt ${input.reference ?? ''}`.trim(),
+    });
+
     await writeAudit(tx, {
       action: 'create',
       entityType: 'item_receipt',
@@ -520,7 +551,7 @@ export async function getItemReceipt(ctx: ServiceContext, id: string) {
     .where(eq(itemReceiptLines.itemReceiptId, id))
     .orderBy(asc(itemReceiptLines.lineOrder));
 
-  return { ...receipt, lines };
+  return { ...receipt, lines: await attachInventoryDetails(ctx, 'item_receipt', id, lines) };
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +682,10 @@ export async function voidItemReceipt(ctx: ServiceContext, id: string) {
     .orderBy(asc(itemReceiptLines.lineOrder));
 
   return inTransaction(ctx, async (tx) => {
+    // Landed cost capitalised onto this receipt must be voided first (its value sits in the
+    // receipt's cost layers / average cost).
+    await assertNoActiveLandedCost(tx, { itemReceiptId: id });
+
     // Reverse the GL entry (Dr 2050 / Cr Inventory at the receipt's cost).
     if (receipt.postedEntryId) {
       await voidJournalEntry(tx, receipt.postedEntryId);
@@ -666,6 +701,9 @@ export async function voidItemReceipt(ctx: ServiceContext, id: string) {
         `item_receipt_void:${id}`,
       );
     }
+
+    // Take the units back out of the site/bin (and serials/lots) they were received into.
+    await reverseDocumentInventory(tx, 'item_receipt', id);
 
     // Release the PO quantities this receipt claimed.
     if (receipt.purchaseOrderId) {

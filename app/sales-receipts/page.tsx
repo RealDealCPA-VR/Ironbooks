@@ -25,6 +25,13 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 import { formatDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
@@ -41,6 +48,7 @@ interface Item {
   name: string;
   type: string;
   salesPrice: string | null;
+  trackingMode?: string | null;
 }
 
 interface Account {
@@ -76,6 +84,8 @@ interface LineRow {
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** Advanced Inventory: site / bin / serials / lot the stock is sold from. */
+  inv?: InvDetail;
 }
 
 const EMPTY_LINE: LineRow = { itemId: '', description: '', quantity: '', rate: '', taxable: true };
@@ -188,6 +198,17 @@ function NewReceiptModal({
     setLines((prev) => [...prev, { ...EMPTY_LINE }]);
   }
 
+  // Advanced Inventory: sites/bins + scan-to-add.
+  const adv = useAdvancedInventory(open);
+  function addScannedItem(it: { id: string; name: string; salesPrice?: string | null }) {
+    setLines((prev) => {
+      const row: LineRow = { ...EMPTY_LINE, itemId: it.id, description: it.name, quantity: '1', rate: it.salesPrice ?? '' };
+      const emptyIdx = prev.findIndex((l) => !l.itemId && !l.description && !l.quantity && !l.rate);
+      if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
+      return [...prev, row];
+    });
+  }
+
   function removeLine(idx: number) {
     // Keep at least one line (mirrors the per-row remove button being disabled).
     setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev));
@@ -229,6 +250,7 @@ function NewReceiptModal({
           quantity: l.quantity,
           rate: l.rate,
           taxable: l.taxable,
+          ...inventoryLinePayload(l.inv),
         })),
       });
       toast('Sales receipt created.', 'success');
@@ -329,13 +351,16 @@ function NewReceiptModal({
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
-              <PlusCircle className="h-4 w-4" /> Add line
-            </button>
+            <div className="flex items-center gap-3">
+              <BarcodeScanInput onItem={addScannedItem} />
+              <button
+                type="button"
+                onClick={addLine}
+                className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
+              >
+                <PlusCircle className="h-4 w-4" /> Add line
+              </button>
+            </div>
           </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
@@ -396,6 +421,15 @@ function NewReceiptModal({
                 >
                   <MinusCircle className="h-4 w-4" />
                 </button>
+                <InventoryLineFields
+                  className="col-span-full"
+                  adv={adv}
+                  item={items.find((i) => i.id === line.itemId)}
+                  quantity={line.quantity}
+                  direction="out"
+                  value={line.inv}
+                  onChange={(inv) => updateLine(idx, { inv })}
+                />
               </div>
             ))}
           </div>

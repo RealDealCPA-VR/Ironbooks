@@ -35,6 +35,12 @@ export const createItemSchema = z.object({
   /** Defaults to true in the service. */
   taxable: z.boolean().optional(),
   unitOfMeasure: z.string().nullish(),
+  /** Advanced Inventory: scan code (unique per company). */
+  barcode: z.string().max(100).nullish(),
+  /** Advanced Inventory: serial/lot tracking for inventory items. */
+  trackingMode: z.enum(['none', 'serial', 'lot']).optional(),
+  /** Unit weight (landed cost by weight). */
+  weight: zDecimal.nullish(),
   /** Route-level: forwarded to setReorderPoint after creation. */
   reorderPoint: zReorderPoint,
 });
@@ -53,6 +59,9 @@ export const updateItemSchema = z.object({
   taxable: z.boolean().optional(),
   unitOfMeasure: z.string().nullish(),
   isActive: z.boolean().optional(),
+  barcode: z.string().max(100).nullish(),
+  trackingMode: z.enum(['none', 'serial', 'lot']).optional(),
+  weight: zDecimal.nullish(),
   /** Route-level: forwarded to setReorderPoint when the key is present. */
   reorderPoint: zReorderPoint,
 });

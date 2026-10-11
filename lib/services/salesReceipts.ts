@@ -47,6 +47,12 @@ import {
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
+import {
+  type InventoryLineDetail,
+  attachInventoryDetails,
+  postDocumentInventory,
+  reverseDocumentInventory,
+} from './inventorySites';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -69,7 +75,7 @@ const VALID_METHODS = new Set<SalesReceiptMethod>([
   'other',
 ]);
 
-export interface SalesReceiptLineInput {
+export interface SalesReceiptLineInput extends InventoryLineDetail {
   /** Optional product/service item; supplies incomeAccountId as fallback and triggers COGS for inventory items. */
   itemId?: string | null;
   /** Direct income account override; takes priority over item.incomeAccountId. */
@@ -466,6 +472,28 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
       cogsEntries.push({ entryId, lineId: line.id, itemId: line.itemId, cogs });
     }
 
+    // 4b) Advanced Inventory: record the site/bin/serial/lot the stock left from.
+    await postDocumentInventory(tx, {
+      sourceType: 'sales_receipt',
+      sourceId: receipt.id,
+      date: input.date,
+      direction: 'out',
+      lines: insertedLines.map((line) => {
+        const src = input.lines[line.lineOrder];
+        return {
+          lineOrder: line.lineOrder,
+          itemId: line.itemId,
+          quantity: line.quantity,
+          siteId: src?.siteId,
+          binId: src?.binId,
+          serialNumbers: src?.serialNumbers,
+          lotNumber: src?.lotNumber,
+          lotExpiration: src?.lotExpiration,
+        };
+      }),
+      memo: `Sales Receipt #${receiptNumber}`,
+    });
+
     // 5) Stamp postedEntryId on the receipt.
     const [updated] = await tx.db
       .update(salesReceipts)
@@ -546,7 +574,7 @@ export async function getSalesReceipt(ctx: ServiceContext, id: string) {
     .where(eq(salesReceiptLines.salesReceiptId, id))
     .orderBy(salesReceiptLines.lineOrder);
 
-  return { ...receipt, lines };
+  return { ...receipt, lines: await attachInventoryDetails(ctx, 'sales_receipt', id, lines) };
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +661,9 @@ export async function voidSalesReceipt(ctx: ServiceContext, id: string) {
         })
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
     }
+
+    // Put the stock back at the site/bin/serial it was sold from.
+    await reverseDocumentInventory(tx, 'sales_receipt', id);
 
     // Reverse the main income/payment entry.
     if (receipt.postedEntryId) {
