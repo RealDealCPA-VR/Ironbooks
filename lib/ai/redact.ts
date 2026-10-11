@@ -100,7 +100,11 @@ const DETECTORS: Detector[] = [
   {
     // Labeled tax ids: "SSN 123456789", "EIN: 12-3456789", "Tax ID #123-45-6789"
     kind: 'TAXID',
-    re: /\b(?:SSN|ITIN|TIN|EIN|FEIN|tax\s*id|social\s+security(?:\s+(?:no\.?|number|#))?)\b\s*(?:#|no\.?|number)?\s*[:#]?\s*(\d[\d .-]{7,12}\d)/gi,
+    // The capture tries the valid 9-digit shapes FIRST (SSN 3-2-4, EIN 2-7, each ending on a
+    // digit boundary that is not a decimal fraction), so a trailing number ("SSN 123 45 6789 2
+    // dependents") can't make a greedy capture overshoot to 10 digits and fail the check. The
+    // loose form stays as a fallback for odd groupings (still exactly 9 digits after `accept`).
+    re: /\b(?:SSN|ITIN|TIN|EIN|FEIN|tax\s*id|social\s+security(?:\s+(?:no\.?|number|#))?)\b\s*(?:#|no\.?|number)?\s*[:#]?\s*((?:\d{3}[ .-]?\d{2}[ .-]?\d{4}|\d{2}[ .-]?\d{7})(?!\d|[.,]\d)|\d[\d .-]{7,12}\d)/gi,
     group: 1,
     // Exactly 9 digits, and never a money amount ("EIN 1234567.89").
     accept: (v) => onlyDigits(v).length === 9 && !/[.,]\d{1,2}$/.test(v),
@@ -235,7 +239,14 @@ export class Redactor {
     // no-break spaces (common in text pasted from PDFs or the web) are plain spaces, so the
     // detectors' literal ' ' matches them. Offsets carry over 1:1; replaced values and the
     // untouched text are always sliced from `input`.
-    const text = input.replace(/[\u00A0\u2007\u2009\u202F]/g, ' ');
+    // Normalization: every Unicode space separator (\p{Zs}: NBSP, en / em / figure / thin /
+    // punctuation / ideographic spaces, \u2026) becomes a plain space; line / paragraph separators
+    // (\p{Zl}, \p{Zp}) become newlines (field boundaries, like '\n'); zero-width spaces / joiners
+    // and the BOM, invisible characters that can split a number, become spaces. Each of these
+    // is a single UTF-16 unit, so the copy keeps the same length.
+    const text = input
+      .replace(/[\p{Zl}\p{Zp}]/gu, '\n')
+      .replace(/[\p{Zs}\u200B-\u200D\u2060\uFEFF]/gu, ' ');
     const taken: Array<[number, number]> = [];
     const overlaps = (s: number, e: number) => taken.some(([a, b]) => s < b && e > a);
 
