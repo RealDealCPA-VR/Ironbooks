@@ -22,6 +22,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatDate } from '@/lib/dates';
+import RecurringSuggestions from '@/components/RecurringSuggestions';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -910,6 +911,8 @@ export default function RecurringPage() {
           </div>
         }
       />
+
+      <RecurringSuggestions onMemorized={fetchTemplates} />
 
       <Card>
         {loading ? (

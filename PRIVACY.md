@@ -12,7 +12,7 @@ This document lists everything that can leave the machine, and what controls it.
 | --- | --- | --- |
 | Company data (books, customers, vendors, payroll, attachments) | **Never stored remotely.** | — |
 | Multi-user hosting | Only to devices on **your** Tailscale tailnet, and only while hosting is on | File > Host multi-user access |
-| AI review (AI Review page, "Analyze") | Only the transaction you ask about, and only if allowed | Privacy & Network → AI assistance |
+| AI (assistant, categorization, AI Review "Analyze") | Model servers on this computer, your LAN or your tailnet by default; a cloud AI provider only if opted in (and then redacted) | AI & Automation (providers) + Privacy & Network → AI assistance |
 | Emailing an invoice | Only the message and PDF you send, to your SMTP server | Privacy & Network → Email |
 | Bank feeds (Plaid) | Plaid credentials and the bank link token; transactions download into the file | Privacy & Network → Bank feeds |
 | Update checks | App version and platform only (no company data) | Privacy & Network → App updates |
@@ -50,8 +50,9 @@ of that cap and the company setting. A value that is set but not recognised coun
   `lib/net/guard.ts` (`assertOutboundAllowed` and `policyFetch`), which applies the rules in
   `lib/net/policy.ts`. A blocked call fails with a plain-English message and never opens a
   connection. Redirects are checked hop by hop, so an allowed host cannot bounce a request to a
-  disallowed one. Today that covers Plaid (bank feeds), SMTP (email) and the Claude API (AI
-  review); new integrations must use the same gate.
+  disallowed one. Today that covers Plaid (bank feeds), SMTP (email) and every AI provider
+  configured in AI & Automation (Ollama / OpenAI-compatible / Anthropic, see
+  `lib/ai/providers.ts`); new integrations must use the same gate.
 - **Recent network activity:** the Privacy & Network page lists every outbound attempt since the
   app started: destination host, purpose and whether it was allowed. It never records the
   content, headers or query strings.

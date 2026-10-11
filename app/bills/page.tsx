@@ -25,6 +25,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -168,6 +169,8 @@ export default function BillsPage() {
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [dueDate, setDueDate] = useState('');
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
+  /** Shown under the vendor picker after accounts were pre-filled (QB vendor pre-fill). */
+  const [prefillNote, setPrefillNote] = useState('');
 
   // Void confirm
   const [pendingVoid, setPendingVoid] = useState<Bill | null>(null);
@@ -228,7 +231,28 @@ export default function BillsPage() {
     setDate(new Date().toISOString().slice(0, 10));
     setDueDate('');
     setLines([emptyLine()]);
+    setPrefillNote('');
     setModalOpen(true);
+  }
+
+  /**
+   * Vendor picked on a NEW bill whose lines are still blank: pre-fill the expense accounts
+   * (vendor default → last bill/check → learned categorizer). Never overwrites typed lines.
+   */
+  async function handleVendorChange(id: string) {
+    setVendorId(id);
+    setPrefillNote('');
+    if (!id || editingId) return;
+    const blank = (ls: LineRow[]) =>
+      ls.every((l) => l.mode === 'expense' && !l.accountId && !l.amount && !l.description);
+    if (!blank(lines)) return;
+    const pf = await fetchVendorPrefill({ vendorId: id });
+    if (!pf) return;
+    setLines((prev) => {
+      if (!blank(prev)) return prev; // user started typing while we fetched
+      return pf.lines.map((l) => ({ ...emptyLine('expense'), accountId: l.accountId }));
+    });
+    setPrefillNote(`Accounts pre-filled ${PREFILL_SOURCE_LABEL[pf.source]}.`);
   }
 
   /** Prefill the form from a saved bill and open the modal in edit mode. */
@@ -559,7 +583,7 @@ export default function BillsPage() {
               id="bill-vendor"
               autoFocus
               value={vendorId}
-              onChange={(e) => setVendorId(e.target.value)}
+              onChange={(e) => handleVendorChange(e.target.value)}
             >
               <option value="">Select vendor…</option>
               {vendors.map((v) => (
@@ -568,6 +592,7 @@ export default function BillsPage() {
                 </option>
               ))}
             </Select>
+            {prefillNote && <p className="mt-1 text-xs text-electric">{prefillNote}</p>}
           </div>
 
           {/* Bill Number + Date row */}

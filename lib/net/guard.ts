@@ -18,7 +18,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { getNetworkPolicy } from '@/lib/services/networkPolicy';
 import { decideOutbound, type OutboundDecision, type OutboundPurpose } from './policy';
 
-type PolicyCtx = Pick<ServiceContext, 'db' | 'companyId'>;
+export type PolicyCtx = Pick<ServiceContext, 'db' | 'companyId'>;
 
 export interface OutboundLogEntry {
   at: string;
@@ -92,13 +92,19 @@ const CROSS_ORIGIN_SAFE_HEADERS = ['accept', 'accept-language', 'content-type', 
 export async function policyFetch(
   input: string | URL,
   init: RequestInit | undefined,
-  opts: { purpose: OutboundPurpose; ctx: PolicyCtx },
+  opts: {
+    purpose: OutboundPurpose;
+    ctx: PolicyCtx;
+    /** Transport for each (already policy-checked) hop; defaults to the global fetch. */
+    fetchImpl?: (input: string, init?: RequestInit) => Promise<Response>;
+  },
 ): Promise<Response> {
+  const transport = opts.fetchImpl ?? ((u: string, i?: RequestInit) => fetch(u, i));
   let url = new URL(String(input));
   let reqInit: RequestInit = { ...(init ?? {}), redirect: 'manual' };
   for (let hop = 0; ; hop++) {
     await assertOutboundAllowed(url, opts.purpose, opts.ctx);
-    const res = await fetch(url.toString(), reqInit);
+    const res = await transport(url.toString(), reqInit);
     const status = typeof res?.status === 'number' ? res.status : 200;
     const location = status >= 300 && status < 400 ? res.headers?.get?.('location') : null;
     if (!location) return res;

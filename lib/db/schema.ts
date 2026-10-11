@@ -1239,5 +1239,68 @@ export const userRoleAssignments = pgTable('user_role_assignments', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   userId: uuid('user_id').references(() => users.id).notNull(),
   roleKey: varchar('role_key', { length: 64 }).notNull(),
+});
+
+// ---- team ai ----
+// AI layer: per-company provider/routing settings, the learned (local, pure-TS) categorizer
+// model, an auditable log of AI auto-applied bank categorizations, and assistant write
+// proposals awaiting human approval. See lib/ai/* and lib/services/ai*.ts.
+
+/** Per-company AI settings. API keys inside `providers` are AES-GCM ciphertext (lib/ai/keyVault). */
+export const aiSettings = pgTable('ai_settings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull().unique(),
+  /** StoredProviderConfig[] (lib/ai/types.ts) — apiKeyEnc is ciphertext, never plaintext. */
+  providers: jsonb('providers').$type<Record<string, unknown>[]>().notNull().default([]),
+  /** Record<AiTask, RoutingPolicy>; missing tasks default to 'local-only'. */
+  taskPolicies: jsonb('task_policies').$type<Record<string, string>>().notNull().default({}),
+  /** Company opt-in for ANY cloud model call. Off by default (local-first). */
+  cloudEnabled: boolean('cloud_enabled').notNull().default(false),
+  autoApplyEnabled: boolean('auto_apply_enabled').notNull().default(false),
+  /** Learned-categorizer confidence (0..1) at/above which bank-feed lines may auto-post. */
+  autoApplyThreshold: decimal('auto_apply_threshold', { precision: 5, scale: 4 }).notNull().default('0.9500'),
+  /** Ask the LLM router for low-confidence categorization suggestions. */
+  llmSuggestEnabled: boolean('llm_suggest_enabled').notNull().default(true),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Learned categorizer state (naive Bayes counts) — one row per company. */
+export const aiCategorizerModels = pgTable('ai_categorizer_models', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull().unique(),
+  version: integer('version').notNull().default(1),
+  model: jsonb('model').$type<Record<string, unknown>>().notNull(),
+  sampleCount: integer('sample_count').notNull().default(0),
+  /** Incremental-sync watermark: source documents created after this are not yet learned. */
+  watermark: timestamp('watermark'),
+  trainedAt: timestamp('trained_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Every bank-feed line the AI auto-categorized (never fed back into training). */
+export const aiAutoApplied = pgTable('ai_auto_applied', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  bankTransactionId: uuid('bank_transaction_id').references(() => bankTransactions.id).notNull(),
+  journalEntryId: uuid('journal_entry_id').references(() => journalEntries.id).notNull(),
+  accountId: uuid('account_id').references(() => accounts.id).notNull(),
+  confidence: decimal('confidence', { precision: 5, scale: 4 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Assistant-proposed writes. Nothing posts until a user approves (then via normal services). */
+export const aiProposals = pgTable('ai_proposals', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  createdBy: uuid('created_by').references(() => users.id),
+  kind: varchar('kind', { length: 50 }).notNull(), // 'journal_entry'
+  summary: text('summary').notNull(),
+  payload: jsonb('payload').$type<Record<string, unknown>>().notNull(),
+  status: varchar('status', { length: 20 }).notNull().default('pending'), // pending|approved|rejected|failed
+  resultRef: varchar('result_ref', { length: 255 }),
+  error: text('error'),
+  decidedBy: uuid('decided_by').references(() => users.id),
+  decidedAt: timestamp('decided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

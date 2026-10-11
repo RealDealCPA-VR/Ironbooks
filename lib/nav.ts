@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { pageAreasFor } from '@/lib/permissions/routes';
 import type { Area } from '@/lib/permissions/model';
+import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -145,6 +146,7 @@ export const navGroups: NavGroup[] = [
       { icon: Network, label: 'Privacy & Network', path: '/privacy' },
       { icon: Users, label: 'Multi-user', path: '/multi-user' },
       { icon: Settings, label: 'Settings', path: '/settings' },
+      { icon: Sparkles, label: 'AI & Automation', path: '/ai-settings' },
     ],
   },
 ];

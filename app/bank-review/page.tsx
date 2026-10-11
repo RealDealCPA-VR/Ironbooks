@@ -13,11 +13,16 @@
  * Auto-suggest: when exactly one HIGH-confidence match candidate exists for a
  * row, the row opens in Match mode with that candidate preselected.
  * Matched rows offer Unmatch (voids the entry only if categorize created it).
+ *
+ * AI (team ai): the local learned categorizer pre-selects an account for rows without a
+ * rule suggestion and shows its calibrated confidence; low-confidence rows can "Ask AI"
+ * (LLM router, existing accounts only, never auto-posted); "Auto-apply confident" posts
+ * rows at/above the company threshold through the normal categorize service.
  */
 
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { CheckCircle, CreditCard, Inbox, Link2 } from 'lucide-react';
+import { CheckCircle, CreditCard, Inbox, Link2, Sparkles } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -82,6 +87,21 @@ interface MatchCandidate {
   score: number;
 }
 
+interface AiSuggestion {
+  bankTransactionId: string;
+  accountId: string | null;
+  confidence: number;
+  source: 'rule' | 'model' | 'llm' | null;
+  autoApplyEligible: boolean;
+  reason?: string;
+}
+
+interface AiSuggestionsResponse {
+  suggestions: AiSuggestion[];
+  threshold: number;
+  autoApplyEnabled: boolean;
+}
+
 type ReviewTab = 'unreviewed' | 'matched' | 'excluded';
 type RowMode = 'add' | 'match';
 
@@ -120,6 +140,14 @@ export default function BankReviewPage() {
   const [loadingTxns, setLoadingTxns] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [bulkRunning, setBulkRunning] = useState(false);
+
+  // AI suggestions (learned categorizer / LLM second opinion)
+  const [aiSugg, setAiSugg] = useState<Record<string, AiSuggestion>>({});
+  const [aiMeta, setAiMeta] = useState<{ threshold: number; autoApplyEnabled: boolean }>({
+    threshold: 0.95,
+    autoApplyEnabled: false,
+  });
+  const [askingId, setAskingId] = useState<string | null>(null);
 
   // ------------------------------------------------------------------
   // Data fetching
@@ -162,6 +190,26 @@ export default function BankReviewPage() {
         if (txn.suggestedAccountId) initialAccounts[txn.id] = txn.suggestedAccountId;
       }
       setRowAccountId((prev) => ({ ...initialAccounts, ...prev }));
+
+      // Learned-categorizer suggestions (best-effort — the page works without them).
+      try {
+        const ai = await api.get<AiSuggestionsResponse>(
+          `/api/ai/bank-suggestions?bankAccountId=${bankAccountId}`,
+        );
+        const map: Record<string, AiSuggestion> = {};
+        const aiAccounts: Record<string, string> = {};
+        for (const sg of ai.suggestions) {
+          map[sg.bankTransactionId] = sg;
+          if (sg.source === 'model' && sg.accountId && sg.confidence >= 0.4) {
+            aiAccounts[sg.bankTransactionId] = sg.accountId;
+          }
+        }
+        setAiSugg(map);
+        setAiMeta({ threshold: ai.threshold, autoApplyEnabled: ai.autoApplyEnabled });
+        setRowAccountId((prev) => ({ ...aiAccounts, ...initialAccounts, ...prev }));
+      } catch {
+        setAiSugg({});
+      }
 
       // Fetch match candidates for every unreviewed row (small desktop volumes).
       const unreviewed = data.filter((t) => !t.matched && !t.excluded);
@@ -280,6 +328,45 @@ export default function BankReviewPage() {
       await api.post('/api/bank-transactions/unmatch', { bankTransactionId: txn.id });
       toast('Unmatched.', 'success');
     });
+
+  async function handleAskAi(txn: BankTransaction) {
+    setAskingId(txn.id);
+    try {
+      const r = await api.post<AiSuggestion & { reason: string }>('/api/ai/bank-suggestions', {
+        action: 'llm',
+        bankTransactionId: txn.id,
+      });
+      if (r.accountId) setRowAccountId((prev) => ({ ...prev, [txn.id]: r.accountId! }));
+      setAiSugg((prev) => ({ ...prev, [txn.id]: { ...r, source: 'llm', autoApplyEligible: false } }));
+      toast('AI suggestion selected — review it, then click Add.', 'info');
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'AI suggestion failed.', 'danger');
+    } finally {
+      setAskingId(null);
+    }
+  }
+
+  async function handleAutoApply() {
+    if (!selectedBankAccountId) return;
+    setBulkRunning(true);
+    try {
+      const r = await api.post<{ applied: unknown[]; skipped: unknown[] }>('/api/ai/bank-suggestions', {
+        action: 'auto-apply',
+        bankAccountId: selectedBankAccountId,
+      });
+      toast(
+        `AI added ${r.applied.length} confident transaction(s) to the register` +
+          (r.skipped.length ? ` (${r.skipped.length} skipped)` : '') +
+          '. Undo any with Unmatch.',
+        'success',
+      );
+      await fetchTransactions(selectedBankAccountId);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Auto-apply failed.', 'danger');
+    } finally {
+      setBulkRunning(false);
+    }
+  }
 
   async function handleBulk(action: 'applyRules' | 'categorizeSuggested') {
     if (!selectedBankAccountId) return;
@@ -405,6 +492,7 @@ export default function BankReviewPage() {
             >
               Add
             </Button>
+            {renderAiAssist(txn, busy)}
             <Button variant="secondary" size="sm" disabled={busy} onClick={() => handleExclude(txn)}>
               Exclude
             </Button>
@@ -447,6 +535,32 @@ export default function BankReviewPage() {
     );
   }
 
+  /** "Ask AI" for low-confidence rows, or the AI's one-line reason after it answered. */
+  function renderAiAssist(txn: BankTransaction, busy: boolean) {
+    const sg = aiSugg[txn.id];
+    if (sg?.source === 'rule') return null;
+    if (sg?.source === 'llm') {
+      return sg.reason ? (
+        <span className="text-xs text-navy/50 max-w-[220px] truncate" title={sg.reason}>
+          AI: {sg.reason}
+        </span>
+      ) : null;
+    }
+    if (sg && sg.confidence >= aiMeta.threshold) return null;
+    return (
+      <Button
+        variant="ghost"
+        size="sm"
+        loading={askingId === txn.id}
+        disabled={busy}
+        onClick={() => handleAskAi(txn)}
+        title="Ask the AI model to pick an account (you still confirm)"
+      >
+        <Sparkles className="h-3.5 w-3.5" /> Ask AI
+      </Button>
+    );
+  }
+
   function renderStatusCell(txn: BankTransaction) {
     if (txn.matched) {
       return (
@@ -468,6 +582,24 @@ export default function BankReviewPage() {
       );
     }
     if (txn.suggestedAccountId) return <Badge tone="info">Suggested</Badge>;
+    const sg = aiSugg[txn.id];
+    if (sg && sg.accountId && sg.source !== 'rule' && sg.confidence >= 0.4) {
+      const tone =
+        sg.confidence >= aiMeta.threshold ? 'success' : sg.confidence >= 0.6 ? 'info' : 'warning';
+      return (
+        <span
+          title={
+            sg.source === 'llm'
+              ? 'Suggested by the AI model'
+              : 'Learned from how you categorized similar transactions'
+          }
+        >
+          <Badge tone={tone}>
+            {sg.source === 'llm' ? 'AI pick' : `AI ${Math.round(sg.confidence * 100)}%`}
+          </Badge>
+        </span>
+      );
+    }
     return <Badge tone="warning">Review</Badge>;
   }
 
@@ -500,6 +632,7 @@ export default function BankReviewPage() {
                   setRowMode({});
                   setRowCandidates({});
                   setRowCandidateId({});
+                  setAiSugg({});
                 }}
               >
                 {bankAccounts.length === 0 && (
@@ -532,6 +665,18 @@ export default function BankReviewPage() {
             >
               Auto-add Suggested
             </Button>
+            {aiMeta.autoApplyEnabled && (
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={bulkRunning || !selectedBankAccountId}
+                onClick={handleAutoApply}
+                title="Post every line the learned categorizer is at least this confident about"
+              >
+                <Sparkles className="h-4 w-4" /> Auto-apply confident (≥
+                {Math.round(aiMeta.threshold * 100)}%)
+              </Button>
+            )}
           </div>
         </div>
 

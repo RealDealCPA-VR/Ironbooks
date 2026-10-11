@@ -1,20 +1,21 @@
 /**
- * LLM Corrector — uses the Anthropic Claude API to analyse a detected accounting
- * error, generate a structured correction suggestion, and let a user apply it.
+ * LLM Corrector — asks the company's AI router (task 'error-correction') to analyse a
+ * detected accounting error, generate a structured correction suggestion, and let a user
+ * apply it.
  *
  * Key design decisions:
- *   - Prompt caching: the stable accounting-system preamble is placed in the
- *     system array as a block with `cache_control: { type: "ephemeral" }` so
- *     subsequent analyseError calls for the same company share the cached context,
- *     dramatically reducing latency and token cost.
- *   - Offline-safe: if ANTHROPIC_API_KEY is absent the service returns a
- *     deterministic stub suggestion so tests and dev can run without a live key.
+ *   - Local-first: the call goes through lib/ai/router.ts, so it uses the company's tailnet
+ *     model by default and only reaches a cloud model when the company opted in — with
+ *     names / account numbers redacted before the request leaves the machine.
+ *   - Structured output: the reply is validated with zod (one repair attempt in the router).
+ *   - Offline-safe: when no model is configured/eligible (or every model fails) the service
+ *     returns a deterministic stub suggestion, so tests and offline installs keep working.
  *   - No destructive GL change: applyCorrection only marks status + writes an
  *     audit row — any actual journal correction must be made by the user via the
  *     normal posting workflow, with the LLM reasoning surfaced as guidance.
  */
-import Anthropic from '@anthropic-ai/sdk';
 import { and, eq } from 'drizzle-orm';
+import { z } from 'zod';
 import {
   errorCorrections,
   errorDetections,
@@ -24,7 +25,8 @@ import {
 } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
-import { assertOutboundAllowed } from '@/lib/net/guard';
+import { buildRouter, type BuildRouterOptions } from './aiSettings';
+import { AiError } from '@/lib/ai/types';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -45,15 +47,14 @@ export interface LlmSuggestion {
 
 /**
  * Fetch the detection + related entry, build an accounting-context prompt,
- * call Claude (with prompt caching on the system preamble), parse the JSON
- * suggestion, and persist an `error_corrections` row.
+ * ask the AI router for a JSON suggestion, and persist an `error_corrections` row.
  *
- * If ANTHROPIC_API_KEY is not set, returns a deterministic offline stub so
- * tests pass without a live API key.
+ * When no AI model is available, returns a deterministic offline stub.
  */
 export async function analyzeError(
   ctx: ServiceContext,
   errorId: string,
+  routerOpts: BuildRouterOptions = {},
 ): Promise<CorrectionRow> {
   // --- Load the detection (company-scoped) ---
   const [detection] = await ctx.db
@@ -116,17 +117,32 @@ ${lines
   let suggestion: LlmSuggestion;
   let llmReasoningText: string;
 
-  if (!process.env.ANTHROPIC_API_KEY) {
+  const router = await buildRouter(ctx, routerOpts);
+  const unavailable = router.unavailableReason('error-correction');
+  if (unavailable) {
     // Offline stub — deterministic so tests are reproducible.
     suggestion = buildStubSuggestion(detection.errorType, detection.description);
-    llmReasoningText = 'Offline stub: ANTHROPIC_API_KEY not set.';
+    llmReasoningText = `Offline stub: ${unavailable}`;
   } else {
-    // Network policy: cloud AI stays off unless the company opted in (Privacy & Network).
-    // Throws FORBIDDEN with a plain-English reason before any data leaves the machine.
-    await assertOutboundAllowed(anthropicBaseUrl(), 'ai', ctx);
-    const result = await callClaude(detection, entryContext);
-    suggestion = result.suggestion;
-    llmReasoningText = result.rawContent;
+    try {
+      const result = await router.chatJson(
+        'error-correction',
+        [
+          { role: 'system', content: SYSTEM_PREAMBLE },
+          { role: 'user', content: buildUserMessage(detection, entryContext) },
+        ],
+        suggestionSchema,
+        { jsonSchema: SUGGESTION_JSON_SCHEMA, temperature: 0.1, maxTokens: 1024 },
+      );
+      suggestion = result.data;
+      llmReasoningText = `${result.raw}
+
+[model: ${result.model} via ${result.providerId}${result.redacted ? ', redacted' : ''}]`;
+    } catch (err) {
+      if (!(err instanceof AiError)) throw err;
+      suggestion = buildStubSuggestion(detection.errorType, detection.description);
+      llmReasoningText = `Offline stub: AI model unavailable (${err.message}).`;
+    }
   }
 
   // --- Persist the correction suggestion ---
@@ -219,25 +235,26 @@ export async function applyCorrection(
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/** The endpoint the SDK will contact (honors ANTHROPIC_BASE_URL, e.g. a LAN/tailnet gateway). */
-function anthropicBaseUrl(): string {
-  return process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
-}
+const suggestionSchema = z.object({
+  analysis: z.string().min(1),
+  action: z.string().min(1).max(100),
+  steps: z.array(z.string()).min(1).max(20),
+  impact: z.string(),
+});
 
-/** Call the Claude API with a cached system preamble. */
-async function callClaude(
-  detection: typeof errorDetections.$inferSelect,
-  entryContext: string,
-): Promise<{ suggestion: LlmSuggestion; rawContent: string }> {
-  // baseURL pinned to the exact URL the network policy just approved.
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, baseURL: anthropicBaseUrl() });
+const SUGGESTION_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    analysis: { type: 'string' },
+    action: { type: 'string' },
+    steps: { type: 'array', items: { type: 'string' } },
+    impact: { type: 'string' },
+  },
+  required: ['analysis', 'action', 'steps', 'impact'],
+};
 
-  // Stable accounting-system preamble — placed in a cached block so repeated
-  // calls (e.g. analysing multiple errors in one session) share the cache hit.
-  const systemPreamble = `You are an expert accounting AI assistant embedded in BookKeeper AI, \
-a double-entry accounting system. Your role is to identify and explain accounting errors, then \
-suggest clear, actionable corrections that maintain the fundamental accounting equation: \
-Assets = Liabilities + Equity.
+/** Stable accounting-system preamble. */
+const SYSTEM_PREAMBLE = `You are an expert accounting AI assistant embedded in BookKeeper AI, a double-entry accounting system. Your role is to identify and explain accounting errors, then suggest clear, actionable corrections that maintain the fundamental accounting equation: Assets = Liabilities + Equity.
 
 Core principles you apply:
 - Every journal entry must have equal total debits and credits (the double-entry rule).
@@ -256,7 +273,8 @@ When analysing an error you MUST return a JSON object with exactly these fields:
 }
 Return ONLY the JSON object — no markdown fences, no prose outside the JSON.`;
 
-  const userMessage = `Please analyse the following accounting error and return the JSON correction suggestion.
+function buildUserMessage(detection: typeof errorDetections.$inferSelect, entryContext: string): string {
+  return `Please analyse the following accounting error and return the JSON correction suggestion.
 
 Error Type: ${detection.errorType}
 Severity: ${detection.severity}
@@ -264,51 +282,6 @@ Description: ${detection.description}
 ${entryContext}
 
 Remember: return ONLY a JSON object with fields: analysis, action, steps, impact.`;
-
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 1024,
-    system: [
-      {
-        type: 'text',
-        text: systemPreamble,
-        // Prompt caching: the stable preamble is reused across calls within the
-        // same session, reducing latency and input-token cost.
-        cache_control: { type: 'ephemeral' },
-      },
-    ],
-    messages: [{ role: 'user', content: userMessage }],
-  });
-
-  const rawContent =
-    response.content
-      .filter((c) => c.type === 'text')
-      .map((c) => (c as { type: 'text'; text: string }).text)
-      .join('') || '';
-
-  let suggestion: LlmSuggestion;
-  try {
-    suggestion = JSON.parse(rawContent) as LlmSuggestion;
-    // Basic validation.
-    if (
-      typeof suggestion.analysis !== 'string' ||
-      typeof suggestion.action !== 'string' ||
-      !Array.isArray(suggestion.steps) ||
-      typeof suggestion.impact !== 'string'
-    ) {
-      throw new Error('Invalid shape');
-    }
-  } catch {
-    // Graceful degradation: if the model didn't return valid JSON, wrap it.
-    suggestion = {
-      analysis: rawContent,
-      action: 'manual_review',
-      steps: ['Review the raw LLM response and apply the recommended correction manually.'],
-      impact: 'Unknown — see raw analysis above.',
-    };
-  }
-
-  return { suggestion, rawContent };
 }
 
 /** Return a rule-specific offline stub suggestion without hitting the API. */

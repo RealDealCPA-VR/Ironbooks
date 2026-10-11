@@ -35,6 +35,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { useNewParam } from '@/lib/useFocusParam';
@@ -142,6 +143,8 @@ function ExpensesPageContent() {
   const [toPrint, setToPrint] = useState(false);
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
+  /** Shown under the payee after accounts were pre-filled (QB vendor pre-fill). */
+  const [prefillNote, setPrefillNote] = useState('');
 
   const isCC = entryType === 'cc_charge' || entryType === 'cc_credit';
   const paymentAccounts = accounts.filter((a) => (isCC ? isCreditCard(a) : isBankish(a)));
@@ -246,6 +249,29 @@ function ExpensesPageContent() {
     setToPrint(false);
     setMemo('');
     setLines([emptyLine()]);
+    setPrefillNote('');
+  }
+
+  /**
+   * Payee chosen while the lines are still blank: pre-fill accounts (vendor default → last
+   * transaction → learned categorizer). Never overwrites anything the user typed.
+   */
+  async function prefillFor(q: { vendorId?: string; payee?: string }) {
+    setPrefillNote('');
+    const blank = (ls: LineRow[]) => ls.every((l) => !l.accountId && !l.amount && !l.description);
+    if (!blank(lines)) return;
+    const pf = await fetchVendorPrefill(q);
+    if (!pf) return;
+    setLines((prev) => {
+      if (!blank(prev)) return prev; // user started typing while we fetched
+      return pf.lines.map((l) => ({
+        ...emptyLine(),
+        accountId: l.accountId,
+        classId: l.classId ?? '',
+        customerId: l.customerId ?? '',
+      }));
+    });
+    setPrefillNote(`Accounts pre-filled ${PREFILL_SOURCE_LABEL[pf.source]}.`);
   }
 
   // ── submit ────────────────────────────────────────────────────────────────
@@ -381,7 +407,15 @@ function ExpensesPageContent() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <Label htmlFor="exp-payee">Pay to the Order of *</Label>
-            <Select id="exp-payee" value={payeeSel} onChange={(e) => setPayeeSel(e.target.value)}>
+            <Select
+              id="exp-payee"
+              value={payeeSel}
+              onChange={(e) => {
+                const v = e.target.value;
+                setPayeeSel(v);
+                if (v && v !== OTHER_PAYEE) prefillFor({ vendorId: v });
+              }}
+            >
               <option value="">Select payee…</option>
               {vendors.map((v) => (
                 <option key={v.id} value={v.id}>
@@ -396,8 +430,10 @@ function ExpensesPageContent() {
                 placeholder="Payee name"
                 value={payeeName}
                 onChange={(e) => setPayeeName(e.target.value)}
+                onBlur={() => payeeName.trim() && prefillFor({ payee: payeeName })}
               />
             )}
+            {prefillNote && <p className="mt-1 text-xs text-electric">{prefillNote}</p>}
           </div>
 
           <div>
