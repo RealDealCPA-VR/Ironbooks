@@ -6,6 +6,10 @@
  * must fail closed themselves via getServerContext() (FORBIDDEN → 403) before
  * reading or writing any backup bytes.
  *
+ * PERMISSIONS: both handlers act on the WHOLE data dir — every company in the file plus every
+ * user's login — so beyond the route map's File Utilities check in the active company they
+ * require the caller to be an active Admin of every company in the file (requireFileAdmin).
+ *
  * NOTE (POST): restoreBackup validates the archive, closes the live PGlite
  * handle, and atomically swaps the data directory. The next getDb() call
  * reopens the restored data — no process restart is required.
@@ -15,6 +19,7 @@ import { getServerContext } from '@/lib/context';
 import { getCompany } from '@/lib/services/company';
 import { createBackup, restoreBackup } from '@/lib/services/backup';
 import { ServiceError } from '@/lib/services/_base';
+import { requireFileAdmin } from '@/lib/services/access';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -40,6 +45,8 @@ export async function GET(_req: NextRequest) {
     // Auth: fail closed BEFORE producing any backup bytes. A FORBIDDEN throw
     // here propagates to errorResponse() and returns 403.
     const ctx = await getServerContext();
+    // The archive holds every company in the file and all password hashes.
+    await requireFileAdmin(ctx);
 
     // Resolve the active company name for the filename (cosmetic only).
     let companyName: string | undefined;
@@ -78,7 +85,9 @@ export async function GET(_req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     // Auth: restore is destructive — fail closed before even reading the body.
-    await getServerContext();
+    const ctx = await getServerContext();
+    // Restore replaces every company in the file.
+    await requireFileAdmin(ctx);
 
     const arrayBuffer = await req.arrayBuffer();
     if (!arrayBuffer.byteLength) {

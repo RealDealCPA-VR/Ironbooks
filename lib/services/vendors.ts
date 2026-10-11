@@ -122,6 +122,11 @@ const isMaskedValue = (v: string | null | undefined) =>
 
 /** Create a new vendor record for the company. */
 export async function createVendor(ctx: ServiceContext, input: CreateVendorInput) {
+  // A masked placeholder (e.g. copied from a vendor shown to a role without the sensitive flag)
+  // is not a TIN -- storing it would corrupt 1099 reporting.
+  if (isMaskedValue(input.taxId)) {
+    throw validation('Enter the full tax ID; a masked value cannot be saved.');
+  }
   await assertUniqueDisplayName(ctx, input.displayName);
 
   const [row] = await ctx.db

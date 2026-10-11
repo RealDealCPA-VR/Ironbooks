@@ -5,7 +5,9 @@
  *
  * Requires the file to be open (getServerContext enforces the lock + any login), so only someone
  * already inside the file can set, change, or remove its password — and, via the central
- * permission map, only roles with Users & Roles 'modify' (Admin). Changes are audited.
+ * permission map, only roles with Users & Roles 'modify'. The password locks EVERY company in
+ * the file, so changing it also requires an active Admin of every company in the file
+ * (requireFileAdmin). Changes are audited.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -15,6 +17,7 @@ import {
   removeFilePassword,
 } from '@/lib/services/fileLock';
 import { ServiceError, writeAudit } from '@/lib/services/_base';
+import { requireFileAdmin } from '@/lib/services/access';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -46,6 +49,7 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
+    await requireFileAdmin(ctx);
     const body = await req.json().catch(() => ({}));
     const action = body?.action;
 

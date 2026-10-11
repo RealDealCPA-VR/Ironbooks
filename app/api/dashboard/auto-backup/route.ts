@@ -21,6 +21,7 @@ import { getServerContext } from '@/lib/context';
 import { getCompany } from '@/lib/services/company';
 import { createBackup } from '@/lib/services/backup';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
+import { requireFileAdmin } from '@/lib/services/access';
 
 /** Constant-time check of the x-bka-internal header against BKA_INTERNAL_TOKEN. */
 async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
@@ -43,7 +44,13 @@ async function internalContext(req: NextRequest): Promise<ServiceContext | null>
 export async function POST(req: NextRequest) {
   try {
     // Fail closed BEFORE producing any backup bytes.
-    const ctx = (await internalContext(req)) ?? (await getServerContext());
+    let ctx = await internalContext(req);
+    if (!ctx) {
+      // A user session gets the same whole-file archive as GET /api/backup, so it needs the
+      // same gate: an active Admin of every company in the file.
+      ctx = await getServerContext();
+      await requireFileAdmin(ctx);
+    }
 
     // Company name is cosmetic (filename slug only).
     let companyName: string | undefined;

@@ -15,6 +15,16 @@ import type { EffectiveAccess } from './model';
 const SSN_KEYS = new Set(['ssn', 'employeeSsn', 'taxId']);
 const ACCOUNT_KEYS = new Set(['accountNumber', 'routingNumber', 'bankAccountNumber']);
 
+/** True for a field name that maskSensitive may mask. */
+export function isSensitiveKey(key: string): boolean {
+  return SSN_KEYS.has(key) || ACCOUNT_KEYS.has(key);
+}
+
+/** True for a value produced by masking ("***-**-6789", "••••6789") — never real data. */
+export function isMaskedValue(v: unknown): boolean {
+  return typeof v === 'string' && /[*•]/.test(v);
+}
+
 /** "123-45-6789" → "***-**-6789"; anything with < 4 digits → "****". */
 export function maskSsn(value: unknown): string | null {
   if (value === null || value === undefined || value === '') return null;

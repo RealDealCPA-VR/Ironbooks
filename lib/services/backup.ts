@@ -28,6 +28,8 @@ import {
   vendorCredits, vendors,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
+import type { EffectiveAccess } from '@/lib/permissions/model';
+import { isMaskedValue, isSensitiveKey, maskSensitive } from '@/lib/permissions/mask';
 
 /** Name of the manifest entry embedded at the root of every .bka archive. */
 export const BACKUP_MANIFEST_ENTRY = 'bookkeeper-manifest.json';
@@ -46,6 +48,11 @@ interface BackupManifest {
   kind?: BackupKind;
   companyName: string | null;
   createdAt: string;
+  /**
+   * Per-company archives only: true when SSNs / tax IDs or account numbers were masked because
+   * the exporting user lacked the sensitive-data flags. Those fields restore as empty.
+   */
+  redacted?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -544,9 +551,23 @@ export async function exportCompanyData(db: DB, companyId: string): Promise<Comp
   };
 }
 
-/** Zip a single company's rows into an in-memory per-company .bka buffer. */
-export async function createCompanyBackup(db: DB, companyId: string): Promise<BackupResult> {
-  const data = await exportCompanyData(db, companyId);
+/**
+ * Zip a single company's rows into an in-memory per-company .bka buffer.
+ *
+ * `opts.access` is the exporting user's effective access in that company: sensitive fields are
+ * masked for roles without "view sensitive payroll data" / "view full account numbers" (the
+ * same rule as every API response). Omit it only for trusted/system callers.
+ */
+export async function createCompanyBackup(
+  db: DB,
+  companyId: string,
+  opts: { access?: Pick<EffectiveAccess, 'flags'> | null } = {},
+): Promise<BackupResult> {
+  const raw = await exportCompanyData(db, companyId);
+  const data = maskSensitive(raw, opts.access);
+  const redacted = Boolean(
+    opts.access && !(opts.access.flags.sensitivePayroll && opts.access.flags.fullAccountNumbers),
+  );
 
   const zip = new AdmZip();
   const manifest: BackupManifest = {
@@ -555,6 +576,7 @@ export async function createCompanyBackup(db: DB, companyId: string): Promise<Ba
     kind: 'company',
     companyName: data.company.name,
     createdAt: new Date().toISOString(),
+    ...(redacted ? { redacted: true } : {}),
   };
   zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
   zip.addFile(COMPANY_DATA_ENTRY, Buffer.from(JSON.stringify(data), 'utf8'));
@@ -634,6 +656,8 @@ function topoSortByParent(
  *  - companyId → the new company
  *  - user references → the restoring user (users are machine-local, not in the backup)
  *  - every other UUID → its remapped fresh id
+ *  - masked sensitive values from a redacted export ("***-**-6789") → null (optional columns),
+ *    never stored as if they were the real SSN / tax ID
  */
 function reviveRow(
   spec: CompanyTableSpec,
@@ -650,6 +674,9 @@ function reviveRow(
   for (const [key, col] of Object.entries(cols)) {
     let v = row[key];
     if (v === undefined) continue;
+    // A required column (bank account number) keeps the visible "••••6789" placeholder so the
+    // restored record is obviously incomplete rather than failing the whole restore.
+    if (isSensitiveKey(key) && isMaskedValue(v) && !col.notNull) v = null;
     if (v !== null) {
       if (col.dataType === 'date' && typeof v === 'string') {
         v = new Date(v);

@@ -206,3 +206,46 @@ export function taxIdFor(ctx: Pick<ServiceContext, 'access'>, value: string | nu
 export function accountNumberFor(ctx: Pick<ServiceContext, 'access'>, value: string): string {
   return hasFlag(ctx, 'fullAccountNumbers') ? value : (maskAccountNumber(value) ?? '');
 }
+
+/**
+ * File-wide operations (whole-file backup / restore, the company-file password) reach EVERY
+ * company in the PGlite data dir, so a permission in the active company is not enough: the
+ * caller must be an active Admin of every company in the file (QB Enterprise: only the file's
+ * Admin can do these). Fails closed for contexts without a user.
+ */
+export async function requireFileAdmin(
+  ctx: Pick<ServiceContext, 'db' | 'userId'>,
+): Promise<void> {
+  const denied = () =>
+    new ServiceError(
+      'FORBIDDEN',
+      'Only an Admin of every company in this file can do this. Ask your administrator.',
+    );
+  if (!ctx.userId) throw denied();
+  const all = await ctx.db.select({ id: companies.id }).from(companies);
+  for (const c of all) {
+    const r = await resolveAccess(ctx.db, c.id, ctx.userId);
+    if (!r.member || !r.active || !r.access.isAdmin) throw denied();
+  }
+}
+
+/**
+ * Resolve the caller's access in a company OTHER than the active one (e.g. a per-company export
+ * named by ?companyId=) and require an action there. The route map only authorized the ACTIVE
+ * company, so cross-company routes must re-check membership, is_active and the permission in
+ * the target company itself.
+ */
+export async function requireAccessInCompany(
+  ctx: Pick<ServiceContext, 'db' | 'userId'>,
+  companyId: string,
+  area: Area,
+  action: Action,
+): Promise<EffectiveAccess> {
+  if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
+  const r = await resolveAccess(ctx.db, companyId, ctx.userId);
+  if (!r.member || !r.active) {
+    throw new ServiceError('FORBIDDEN', 'You do not have access to that company.');
+  }
+  if (!can(r.access, area, action)) throw permissionDenied(area, action);
+  return r.access;
+}
