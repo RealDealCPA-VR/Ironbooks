@@ -10,26 +10,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createInvoice, listInvoices } from '@/lib/services/invoices';
 import { createInvoiceWithBillables, type BillableSelection } from '@/lib/services/billables';
-import { ServiceError } from '@/lib/services/_base';
+import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createInvoiceBodySchema, hasBillableSelection } from '@/lib/validation/invoices';
 
 function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
-    return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
-  }
-  console.error('[invoices/route]', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  return routeErrorWithWarnings(err, 'invoices/route.ts');
 }
 
 export async function GET(req: NextRequest) {

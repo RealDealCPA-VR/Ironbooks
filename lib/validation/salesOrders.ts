@@ -5,8 +5,11 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { sendFlagFields, shippingFields } from './sales';
 
 export const salesOrderLineSchema = z.object({
+  /** Edit only: the existing line this row updates (keeps its invoiced quantity). */
+  id: zUuid.nullish(),
   itemId: zUuid.nullish(),
   description: z.string().nullish(),
   quantity: zDecimal,
@@ -19,6 +22,8 @@ export const createSalesOrderSchema = z.object({
   date: zDate,
   memo: z.string().nullish(),
   lines: zLines(salesOrderLineSchema),
+  ...shippingFields,
+  ...sendFlagFields,
 });
 export type CreateSalesOrderBody = z.infer<typeof createSalesOrderSchema>;
 
@@ -35,6 +40,7 @@ export const salesOrderActionSchema = z.discriminatedUnion('action', [
     /** Omitted → invoice the full remaining quantity of every line. */
     lines: zLines(convertLineSchema).optional(),
     date: zDate.optional(),
+    overrideCreditLimit: z.boolean().optional(),
   }),
   z.object({
     action: z.literal('status'),

@@ -273,7 +273,7 @@ describe('payment-void-refunds: corrections + refunds', () => {
     expect(apps).toHaveLength(0);
 
     // GL entry voided, balances reversed.
-    const [je] = await db.select().from(journalEntries).where(eq(journalEntries.id, entry.id));
+    const [je] = await db.select().from(journalEntries).where(eq(journalEntries.id, entry!.id));
     expect(je.status).toBe('void');
     const checkingAfter = await accountBalance('1000');
     expect(Money.sub(checkingBefore, checkingAfter).toFixed(2)).toBe('1000.00');

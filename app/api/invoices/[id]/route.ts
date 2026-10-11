@@ -7,27 +7,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getInvoice, updateInvoice, voidInvoice } from '@/lib/services/invoices';
-import { ServiceError } from '@/lib/services/_base';
+import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateInvoiceSchema } from '@/lib/validation/invoices';
 
 function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED' || err.code === 'PERIOD_CLOSED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
-    return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
-  }
-  console.error('[invoices/[id]/route]', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  return routeErrorWithWarnings(err, 'invoices/[id]/route.ts');
 }
 
 type RouteContext = { params: Promise<{ id: string }> };

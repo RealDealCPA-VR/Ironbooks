@@ -401,12 +401,21 @@ export async function renderStatementPdf(
         break;
       }
 
-      const isInvoice = line.type === 'invoice';
-      const refStr    = isInvoice && line.ref ? `Inv #${line.ref}` : (line.ref ?? '—');
+      // Charges increase the balance; payments, discounts and credit memos reduce it.
+      const isInvoice = line.type === 'invoice' || line.type === 'statement_charge' || line.type === 'bounced_check';
+      const refStr    = line.type === 'invoice' && line.ref ? `Inv #${line.ref}` : (line.ref ?? '—');
+      const typeLabel: Record<string, string> = {
+        invoice: 'Invoice',
+        statement_charge: 'Statement Charge',
+        bounced_check: 'Returned Check',
+        credit_memo: 'Credit Memo',
+        discount: 'Discount',
+        payment: 'Payment',
+      };
 
       drawTableRow(
         fmtDate(line.date),
-        isInvoice ? 'Invoice' : line.type === 'credit_memo' ? 'Credit Memo' : 'Payment',
+        typeLabel[line.type] ?? 'Payment',
         refStr,
         isInvoice ? fmt(line.amount) : '',
         isInvoice ? '' : fmt(line.amount),

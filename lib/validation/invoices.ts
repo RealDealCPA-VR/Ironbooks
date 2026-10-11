@@ -5,6 +5,7 @@
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zMoney, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
+import { creditLimitOverrideField, sendFlagFields, shippingFields } from './sales';
 
 export const invoiceLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -55,6 +56,10 @@ const invoiceCoreFields = {
   currency: z.string().nullish(),
   exchangeRate: zDecimal.nullish(),
   customFields: z.record(z.string()).nullish(),
+  // wave2 sales: shipping fields, send queues, credit-limit override
+  ...shippingFields,
+  ...sendFlagFields,
+  ...creditLimitOverrideField,
 };
 
 /**

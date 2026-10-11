@@ -434,6 +434,11 @@ export const estimates = pgTable('estimates', {
   convertedInvoiceId: uuid('converted_invoice_id'),
   /** Total billed so far via progress invoicing (≤ total). */
   amountInvoiced: decimal('amount_invoiced', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** wave2 sales: quoted tax rate (kept so the estimate can be edited later). */
+  taxRateId: uuid('tax_rate_id'),
+  toBePrinted: boolean('to_be_printed').notNull().default(false),
+  toBeEmailed: boolean('to_be_emailed').notNull().default(false),
+  lastEmailedAt: timestamp('last_emailed_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -482,6 +487,18 @@ export const invoices = pgTable('invoices', {
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   /** Values for company-defined custom fields ({ [fieldName]: value }). */
   customFields: jsonb('custom_fields').$type<Record<string, string>>(),
+  // wave2 sales: shipping fields (B6) + print/email queue flags (C7)
+  shipDate: timestamp('ship_date'),
+  shipVia: varchar('ship_via', { length: 100 }),
+  fob: varchar('fob', { length: 100 }),
+  trackingNumber: varchar('tracking_number', { length: 100 }),
+  shipTo: jsonb('ship_to').$type<Record<string, string>>(),
+  poNumber: varchar('po_number', { length: 100 }),
+  toBePrinted: boolean('to_be_printed').notNull().default(false),
+  toBeEmailed: boolean('to_be_emailed').notNull().default(false),
+  lastEmailedAt: timestamp('last_emailed_at'),
+  /** wave2 sales (C5): a customer-register statement charge (single line, appears on statements/aging). */
+  isStatementCharge: boolean('is_statement_charge').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -520,6 +537,11 @@ export const paymentsReceived = pgTable('payments_received', {
   depositAccountId: uuid('deposit_account_id').references(() => accounts.id), // bank or undeposited funds
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   voidedAt: timestamp('voided_at'),
+  /** wave2 sales: account early-payment discounts are posted to (C3). */
+  discountAccountId: uuid('discount_account_id'),
+  memo: text('memo'),
+  /** wave2 sales: set when the check bounced (F2, see bounced_checks). */
+  bouncedAt: timestamp('bounced_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -540,6 +562,18 @@ export const salesReceipts = pgTable('sales_receipts', {
   depositAccountId: uuid('deposit_account_id').references(() => accounts.id), // bank or undeposited funds
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** wave2 sales: receipt-level tax rate (kept so the receipt can be edited later). */
+  taxRateId: uuid('tax_rate_id'),
+  // wave2 sales: shipping fields (B6) + print/email queue flags (C7)
+  shipDate: timestamp('ship_date'),
+  shipVia: varchar('ship_via', { length: 100 }),
+  fob: varchar('fob', { length: 100 }),
+  trackingNumber: varchar('tracking_number', { length: 100 }),
+  shipTo: jsonb('ship_to').$type<Record<string, string>>(),
+  poNumber: varchar('po_number', { length: 100 }),
+  toBePrinted: boolean('to_be_printed').notNull().default(false),
+  toBeEmailed: boolean('to_be_emailed').notNull().default(false),
+  lastEmailedAt: timestamp('last_emailed_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -566,6 +600,8 @@ export const paymentApplications = pgTable('payment_applications', {
   paymentId: uuid('payment_id').references(() => paymentsReceived.id).notNull(),
   invoiceId: uuid('invoice_id').references(() => invoices.id).notNull(),
   amountApplied: decimal('amount_applied', { precision: 15, scale: 2 }).notNull(),
+  /** wave2 sales (C3): early-payment discount taken on this invoice (reduces its balance too). */
+  discountAmount: decimal('discount_amount', { precision: 15, scale: 2 }).notNull().default('0'),
 });
 
 // ---- Bills (A/P) ----
@@ -857,6 +893,11 @@ export const creditMemos = pgTable('credit_memos', {
   refundedAmount: decimal('refunded_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** wave2 sales: memo-level tax rate (kept so the memo can be edited later). */
+  taxRateId: uuid('tax_rate_id'),
+  toBePrinted: boolean('to_be_printed').notNull().default(false),
+  toBeEmailed: boolean('to_be_emailed').notNull().default(false),
+  lastEmailedAt: timestamp('last_emailed_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -870,6 +911,9 @@ export const creditMemoLines = pgTable('credit_memo_lines', {
   rate: decimal('rate', { precision: 15, scale: 4 }).notNull().default('0'),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
+  /** wave2 sales: persisted so an edit recomputes tax / restocking exactly. */
+  taxable: boolean('taxable').notNull().default(true),
+  restock: boolean('restock').notNull().default(true),
 });
 
 // ---- Vendor credits (A/P credits) ----
@@ -909,6 +953,16 @@ export const salesOrders = pgTable('sales_orders', {
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   convertedInvoiceId: uuid('converted_invoice_id'),
+  // wave2 sales: shipping fields (B6) + print/email queue flags (C7)
+  shipDate: timestamp('ship_date'),
+  shipVia: varchar('ship_via', { length: 100 }),
+  fob: varchar('fob', { length: 100 }),
+  trackingNumber: varchar('tracking_number', { length: 100 }),
+  shipTo: jsonb('ship_to').$type<Record<string, string>>(),
+  poNumber: varchar('po_number', { length: 100 }),
+  toBePrinted: boolean('to_be_printed').notNull().default(false),
+  toBeEmailed: boolean('to_be_emailed').notNull().default(false),
+  lastEmailedAt: timestamp('last_emailed_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1625,5 +1679,56 @@ export const itemReceiptBillLines = pgTable('item_receipt_bill_lines', {
   /** FIFO layer cost adjustments made for inventoryVariance ([{ layerId, quantity, unitDelta }]); average-cost items store [{ kind: 'average', onHand }] (stock the variance was spread over). */
   layerAdjustments: jsonb('layer_adjustments').$type<Array<Record<string, string>>>(),
   writtenOff: boolean('written_off').notNull().default(false),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- wave2 sales ----
+// Credits applied to invoices (credit memo -> invoice), optionally inside a Receive Payments
+// transaction (paymentId), bounced (NSF) checks, and Collections Center notes.
+
+/** One credit-memo application to an invoice. Deleted when the application is undone. */
+export const creditApplications = pgTable('credit_applications', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  creditMemoId: uuid('credit_memo_id').references(() => creditMemos.id).notNull(),
+  invoiceId: uuid('invoice_id').references(() => invoices.id).notNull(),
+  /** Set when the credit was applied as part of a received payment (undone if it is voided/edited). */
+  paymentId: uuid('payment_id').references(() => paymentsReceived.id),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  date: timestamp('date').defaultNow().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Record Bounced Check (QB "Record Bounced Check"): one row per bounced customer payment. */
+export const bouncedChecks = pgTable('bounced_checks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  paymentId: uuid('payment_id').references(() => paymentsReceived.id).notNull(),
+  customerId: uuid('customer_id').references(() => customers.id).notNull(),
+  date: timestamp('date').notNull(),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  bankAccountId: uuid('bank_account_id').references(() => accounts.id).notNull(),
+  reversalEntryId: uuid('reversal_entry_id').references(() => journalEntries.id),
+  bankFee: decimal('bank_fee', { precision: 15, scale: 2 }).notNull().default('0'),
+  bankFeeAccountId: uuid('bank_fee_account_id').references(() => accounts.id),
+  bankFeeEntryId: uuid('bank_fee_entry_id').references(() => journalEntries.id),
+  customerFee: decimal('customer_fee', { precision: 15, scale: 2 }).notNull().default('0'),
+  customerFeeInvoiceId: uuid('customer_fee_invoice_id').references(() => invoices.id),
+  /** Snapshot of the payment's invoice applications that were reopened. */
+  applications: jsonb('applications').$type<Array<Record<string, string>>>(),
+  memo: text('memo'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Collections Center notes (per customer, optionally per invoice) with a follow-up date. */
+export const collectionNotes = pgTable('collection_notes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  customerId: uuid('customer_id').references(() => customers.id).notNull(),
+  invoiceId: uuid('invoice_id').references(() => invoices.id),
+  note: text('note').notNull(),
+  followUpDate: timestamp('follow_up_date'),
+  done: boolean('done').notNull().default(false),
+  createdBy: uuid('created_by'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

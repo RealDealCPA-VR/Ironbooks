@@ -39,6 +39,15 @@ import {
 } from '@/components/inventory/AdvancedInventory';
 import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
+import Link from 'next/link';
+import {
+  EMPTY_SHIPPING,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+  useCreditLimitConfirm,
+} from '@/components/sales/SalesExtras';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -104,6 +113,10 @@ interface Invoice {
   total: string;
   balanceDue: string;
   status: InvoiceStatus;
+  /** wave2 sales: a customer-register statement charge (C5). */
+  isStatementCharge?: boolean;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 /** Full invoice (GET /api/invoices/:id) used to prefill the edit modal. */
@@ -357,6 +370,8 @@ function InvoiceModal({
   const [currency, setCurrency] = useState('');
   const [exchangeRate, setExchangeRate] = useState('');
   const [memo, setMemo] = useState('');
+  const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
+  const creditLimit = useCreditLimitConfirm();
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [saving, setSaving] = useState(false);
   const [saveAsPending, setSaveAsPending] = useState(false);
@@ -390,6 +405,7 @@ function InvoiceModal({
         editing.currency && editing.exchangeRate ? String(Number(editing.exchangeRate)) : '',
       );
       setMemo(editing.memo ?? '');
+      setShip(shippingFromDoc(editing));
       setSaveAsPending(editing.status === 'draft');
       setCustomValues(editing.customFields ?? {});
       setLines(
@@ -420,6 +436,7 @@ function InvoiceModal({
       setCurrency('');
       setExchangeRate('');
       setMemo('');
+      setShip(shippingFromDoc(null));
       setSaveAsPending(false);
       setCustomValues({});
       setLines([{ ...EMPTY_LINE }]);
@@ -689,6 +706,7 @@ function InvoiceModal({
       exchangeRate: exchangeRate || undefined,
       memo: memo || undefined,
       customFields: customFieldDefs.length > 0 ? customValues : undefined,
+      ...shippingPayload(ship),
       lines: indexed.map(({ l, idx }) => {
         const kind = lineKind(l);
         if (kind === 'subtotal') {
@@ -737,11 +755,16 @@ function InvoiceModal({
 
     setSaving(true);
     try {
+      // Over the customer's credit limit → "Save anyway?" (recorded in the audit trail).
+      const saved = await creditLimit.run((override) =>
+        editing
+          ? api.patch(`/api/invoices/${editing.id}`, { ...payload, overrideCreditLimit: override })
+          : api.post('/api/invoices', { ...payload, overrideCreditLimit: override }),
+      );
+      if (saved === undefined) return; // user chose not to go over the limit
       if (editing) {
-        await api.patch(`/api/invoices/${editing.id}`, payload);
         toast(`Invoice #${editing.invoiceNumber} updated.`, 'success');
       } else {
-        await api.post('/api/invoices', payload);
         toast(saveAsPending ? 'Pending invoice saved (not posted).' : 'Invoice created.', 'success');
       }
       onSaved();
@@ -786,8 +809,9 @@ function InvoiceModal({
       <div className="space-y-4">
         {editing && editing.status !== 'draft' && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
-            Editing re-posts this invoice&apos;s GL entry (and any COGS). Allowed only while no
-            payments are applied and the period is open.
+            Saving changes re-posts this invoice (and any cost of goods) so your books stay
+            balanced. Payments already received stay applied, so the new amount due can&apos;t be
+            less than what has been paid. The date must be after your closing date.
           </div>
         )}
         {editing && editing.status === 'draft' && (
@@ -864,6 +888,10 @@ function InvoiceModal({
             </Select>
           </div>
         </div>
+
+        {/* Shipping + print/email queue (wave2 sales) */}
+        <ShippingSection value={ship} onChange={setShip} idPrefix="inv-ship" />
+        {creditLimit.dialog}
 
         {/* Custom fields (company-defined) */}
         {customFieldDefs.length > 0 && (
@@ -1255,6 +1283,7 @@ function InvoicesPageContent() {
 
   // Post (pending → posted) state
   const [postTarget, setPostTarget] = useState<Invoice | null>(null);
+  const postLimit = useCreditLimitConfirm();
   const [posting, setPosting] = useState(false);
 
   // Email state
@@ -1349,7 +1378,10 @@ function InvoicesPageContent() {
     if (!postTarget) return;
     setPosting(true);
     try {
-      await api.post(`/api/invoices/${postTarget.id}/post`, {});
+      const posted = await postLimit.run((override) =>
+        api.post(`/api/invoices/${postTarget.id}/post`, { overrideCreditLimit: override }),
+      );
+      if (posted === undefined) return;
       toast(`Invoice #${postTarget.invoiceNumber} posted to the GL.`, 'success');
       setPostTarget(null);
       fetchData();
@@ -1399,6 +1431,15 @@ function InvoicesPageContent() {
               <option value="paid">Paid</option>
               <option value="void">Void</option>
             </Select>
+            <Link href="/invoices/batch" className="text-sm font-semibold text-electric hover:underline px-2">
+              Batch invoicing
+            </Link>
+            <Link href="/invoices/statement-charges" className="text-sm font-semibold text-electric hover:underline px-2">
+              Statement charges
+            </Link>
+            <Link href="/invoices/send-forms" className="text-sm font-semibold text-electric hover:underline px-2">
+              Print / send forms
+            </Link>
             <Button onClick={() => setShowNew(true)}>
               <Plus className="h-4 w-4" /> New Invoice
             </Button>
@@ -1454,7 +1495,14 @@ function InvoicesPageContent() {
                   id={`invoice-row-${inv.id}`}
                   className={inv.id === focusedId ? 'bg-electric/10' : undefined}
                 >
-                  <Td className="font-semibold text-navy">#{inv.invoiceNumber}</Td>
+                  <Td className="font-semibold text-navy">
+                    #{inv.invoiceNumber}
+                    {inv.isStatementCharge && (
+                      <span className="ml-2 align-middle">
+                        <Badge tone="neutral">Statement charge</Badge>
+                      </span>
+                    )}
+                  </Td>
                   <Td>{customerMap[inv.customerId] ?? '—'}</Td>
                   <Td className="text-navy/70">{formatDate(inv.date)}</Td>
                   <Td className="text-navy/70">{formatDate(inv.dueDate)}</Td>
@@ -1668,6 +1716,7 @@ function InvoicesPageContent() {
           </p>
         </div>
       </Modal>
+      {postLimit.dialog}
     </main>
   );
 }

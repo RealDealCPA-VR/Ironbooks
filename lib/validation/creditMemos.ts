@@ -4,6 +4,7 @@
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
+import { sendFlagFields } from './sales';
 
 export const creditMemoLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -25,5 +26,6 @@ export const createCreditMemoSchema = z.object({
   taxRateId: zUuid.nullish(),
   memo: z.string().nullish(),
   lines: zLines(creditMemoLineSchema),
+  ...sendFlagFields,
 });
 export type CreateCreditMemoBody = z.infer<typeof createCreditMemoSchema>;

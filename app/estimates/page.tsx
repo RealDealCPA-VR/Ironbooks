@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { ClipboardList, Plus, ArrowRight, Download, Percent } from 'lucide-react';
+import { ClipboardList, Plus, ArrowRight, Percent, Pencil } from 'lucide-react';
 import {
   AmountInput,
   Button,
@@ -25,6 +25,15 @@ import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { PricedLinesEditor, type PricedLineItem } from '@/components/PricedLinesEditor';
+import {
+  EMPTY_SHIPPING,
+  FormSendButtons,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+  useCreditLimitConfirm,
+} from '@/components/sales/SalesExtras';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,6 +53,9 @@ interface Estimate {
   convertedInvoiceId: string | null;
   /** Total billed via progress invoicing so far (≤ total). */
   amountInvoiced: string;
+  taxRateId?: string | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 interface EstimateDetailLine {
@@ -264,6 +276,11 @@ export default function EstimatesPage() {
   const [addOpen, setAddOpen] = useState(false);
   const [addForm, setAddForm] = useState<EstimateForm>({ ...EMPTY_FORM, lines: [{ ...EMPTY_LINE }] });
   const [addSaving, setAddSaving] = useState(false);
+  /** wave2 sales (C1): the estimate being edited (null = new). */
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingNumber, setEditingNumber] = useState<number | null>(null);
+  const [sendFlags, setSendFlags] = useState<ShippingState>(EMPTY_SHIPPING);
+  const creditLimit = useCreditLimitConfirm();
 
   // Convert confirm modal.
   const [convertTarget, setConvertTarget] = useState<Estimate | null>(null);
@@ -333,7 +350,38 @@ export default function EstimatesPage() {
 
   function openAddModal() {
     setAddForm({ ...EMPTY_FORM, date: today(), lines: [{ ...EMPTY_LINE }] });
+    setEditingId(null);
+    setEditingNumber(null);
+    setSendFlags(shippingFromDoc(null));
     setAddOpen(true);
+  }
+
+  /** Edit a saved estimate (allowed until it has been turned into an invoice). */
+  async function openEditModal(estimate: Estimate) {
+    try {
+      const detail = await api.get<Estimate & { lines: EstimateDetailLine[] }>(`/api/estimates/${estimate.id}`);
+      setAddForm({
+        customerId: detail.customerId,
+        date: detail.date.slice(0, 10),
+        expirationDate: detail.expirationDate ? detail.expirationDate.slice(0, 10) : '',
+        taxRateId: detail.taxRateId ?? '',
+        memo: detail.memo ?? '',
+        lines: detail.lines.map((l) => ({
+          itemId: l.itemId ?? '',
+          description: l.description ?? '',
+          quantity: String(Number(l.quantity)),
+          rate: String(Number(l.rate)),
+          taxable: l.taxable,
+          rateManual: true,
+        })),
+      });
+      setSendFlags(shippingFromDoc(detail));
+      setEditingId(detail.id);
+      setEditingNumber(detail.estimateNumber);
+      setAddOpen(true);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not open the estimate', 'danger');
+    }
   }
 
   function handleFormChange(field: keyof EstimateForm, value: string) {
@@ -356,7 +404,8 @@ export default function EstimatesPage() {
 
     setAddSaving(true);
     try {
-      await api.post('/api/estimates', {
+      const body = {
+        ...shippingPayload(sendFlags, { shipping: false }),
         customerId: addForm.customerId,
         date: addForm.date,
         expirationDate: addForm.expirationDate || null,
@@ -370,8 +419,14 @@ export default function EstimatesPage() {
           rate: l.rate.trim() === '' ? (l.itemId ? null : 0) : parseFloat(l.rate) || 0,
           taxable: l.taxable,
         })),
-      });
-      toast('Estimate created', 'success');
+      };
+      if (editingId) {
+        await api.patch(`/api/estimates/${editingId}`, body);
+        toast(`Estimate #${editingNumber} updated`, 'success');
+      } else {
+        await api.post('/api/estimates', body);
+        toast('Estimate created', 'success');
+      }
       setAddOpen(false);
       await fetchEstimates();
     } catch (err) {
@@ -406,7 +461,10 @@ export default function EstimatesPage() {
     if (!convertTarget) return;
     setConverting(true);
     try {
-      await api.post(`/api/estimates/${convertTarget.id}`, { action: 'convert' });
+      const done = await creditLimit.run((override) =>
+        api.post(`/api/estimates/${convertTarget.id}`, { action: 'convert', overrideCreditLimit: override }),
+      );
+      if (done === undefined) return;
       toast(`Estimate #${convertTarget.estimateNumber} converted to invoice`, 'success');
       setConvertTarget(null);
       await fetchEstimates();
@@ -461,7 +519,10 @@ export default function EstimatesPage() {
 
     setProgressSaving(true);
     try {
-      await api.post(`/api/estimates/${progressTarget.id}`, payload);
+      const done = await creditLimit.run((override) =>
+        api.post(`/api/estimates/${progressTarget.id}`, { ...payload, overrideCreditLimit: override }),
+      );
+      if (done === undefined) return;
       toast(
         `Progress invoice created for estimate EST-${String(progressTarget.estimateNumber).padStart(4, '0')}`,
         'success',
@@ -544,16 +605,13 @@ export default function EstimatesPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex items-center justify-end gap-1">
-                      {/* PDF download */}
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => window.open(`/api/estimates/${e.id}/pdf`, '_blank')}
-                        title="Download PDF"
-                      >
-                        <Download className="h-3.5 w-3.5" />
-                        PDF
-                      </Button>
+                      {/* Print (PDF) + Email */}
+                      <FormSendButtons kind="estimate" id={e.id} />
+                      {e.status !== 'closed' && e.status !== 'partial' && (
+                        <Button variant="ghost" size="sm" title="Edit estimate" aria-label="Edit estimate" onClick={() => openEditModal(e)}>
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                       {/* Status transitions for non-closed, non-partial estimates */}
                       {e.status !== 'closed' && e.status !== 'partial' && (
                         <>
@@ -634,14 +692,14 @@ export default function EstimatesPage() {
         size="lg"
         open={addOpen}
         onClose={() => setAddOpen(false)}
-        title="New Estimate"
+        title={editingId ? `Edit Estimate #${editingNumber}` : 'New Estimate'}
         footer={
           <>
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
             <Button onClick={handleCreate} loading={addSaving}>
-              Create Estimate
+              {editingId ? 'Save Changes' : 'Create Estimate'}
             </Button>
           </>
         }
@@ -654,6 +712,9 @@ export default function EstimatesPage() {
           onChange={handleFormChange}
           onLinesChange={(lines) => setAddForm((prev) => ({ ...prev, lines }))}
         />
+        <div className="mt-4">
+          <ShippingSection value={sendFlags} onChange={setSendFlags} showShipping={false} idPrefix="est" />
+        </div>
       </Modal>
 
       {/* ---- Progress Invoice modal ---- */}
@@ -829,6 +890,7 @@ export default function EstimatesPage() {
           marked as closed.
         </p>
       </Modal>
+      {creditLimit.dialog}
     </main>
   );
 }

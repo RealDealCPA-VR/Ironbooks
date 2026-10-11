@@ -30,10 +30,15 @@ interface Customer {
 
 interface StatementLine {
   date: string;
-  type: 'invoice' | 'payment' | 'credit_memo';
+  type: 'invoice' | 'payment' | 'credit_memo' | 'statement_charge' | 'bounced_check' | 'discount';
   ref: string | null;
   amount: string;
   runningBalance: string;
+}
+
+/** Charges raise the balance (invoices, statement charges, returned checks); the rest are credits. */
+function isChargeLine(type: string): boolean {
+  return type === 'invoice' || type === 'statement_charge' || type === 'bounced_check';
 }
 
 interface CustomerStatement {
@@ -416,6 +421,12 @@ export default function CustomerStatementsPage() {
                     <Td>
                       {line.type === 'invoice' ? (
                         <Badge tone="info">Invoice</Badge>
+                      ) : line.type === 'statement_charge' ? (
+                        <Badge tone="info">Statement Charge</Badge>
+                      ) : line.type === 'bounced_check' ? (
+                        <Badge tone="danger">Returned Check</Badge>
+                      ) : line.type === 'discount' ? (
+                        <Badge tone="neutral">Discount</Badge>
                       ) : line.type === 'credit_memo' ? (
                         <Badge tone="neutral">Credit Memo</Badge>
                       ) : (
@@ -426,10 +437,10 @@ export default function CustomerStatementsPage() {
                       {line.type === 'invoice' && line.ref ? `#${line.ref}` : (line.ref ?? '—')}
                     </Td>
                     <Td className="text-right tabular-nums">
-                      {line.type === 'invoice' ? formatCurrency(line.amount) : ''}
+                      {isChargeLine(line.type) ? formatCurrency(line.amount) : ''}
                     </Td>
                     <Td className="text-right tabular-nums text-emerald">
-                      {line.type !== 'invoice' ? formatCurrency(line.amount) : ''}
+                      {!isChargeLine(line.type) ? formatCurrency(line.amount) : ''}
                     </Td>
                     <Td className="text-right tabular-nums font-semibold">
                       {formatCurrency(line.runningBalance)}

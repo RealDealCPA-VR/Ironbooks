@@ -147,7 +147,8 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     const appRows = await ctx.db
       .select({
         invoiceId: paymentApplications.invoiceId,
-        applied: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC)), 0)`,
+        // wave2 sales: early-payment discounts are dated with their payment, like cash.
+        applied: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC) + CAST(${paymentApplications.discountAmount} AS NUMERIC)), 0)`,
       })
       .from(paymentApplications)
       .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
@@ -788,7 +789,8 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     const appRows = await ctx.db
       .select({
         invoiceId: paymentApplications.invoiceId,
-        applied: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC)), 0)`,
+        // wave2 sales: early-payment discounts are dated with their payment, like cash.
+        applied: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC) + CAST(${paymentApplications.discountAmount} AS NUMERIC)), 0)`,
       })
       .from(paymentApplications)
       .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))

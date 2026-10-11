@@ -21,6 +21,8 @@ import type { Area } from '@/lib/permissions/model';
 import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
 // team pricing: advanced pricing, SO fulfillment worksheet, enhanced receiving
 import { PackageCheck, FileInput, SlidersHorizontal } from 'lucide-react';
+// wave2 sales: Income Tracker, Collections Center, Batch Invoicing
+import { TrendingUp, PhoneCall } from 'lucide-react';
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -49,6 +51,9 @@ export const navGroups: NavGroup[] = [
       { icon: RotateCcw, label: 'Credit Memos', path: '/credit-memos' },
       { icon: Users, label: 'Customers', path: '/customers' },
       { icon: Percent, label: 'Finance Charges', path: '/finance-charges' },
+      { icon: TrendingUp, label: 'Income Tracker', path: '/income-tracker' },
+      { icon: PhoneCall, label: 'Collections Center', path: '/collections-center' },
+      { icon: Layers, label: 'Batch Invoicing', path: '/invoices/batch' },
       { icon: Package, label: 'Items', path: '/items' },
       { icon: BadgePercent, label: 'Sales Reps', path: '/sales-reps' },
       { icon: SlidersHorizontal, label: 'Advanced Pricing', path: '/advanced-pricing' },

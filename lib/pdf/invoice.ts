@@ -15,6 +15,7 @@
  */
 
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
+import { type SalesShippingInfo, drawShippingBand } from './salesForm';
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -41,6 +42,8 @@ export interface InvoicePdfData {
     balanceDue: string | number;
   };
   lines: InvoicePdfLine[];
+  /** wave2 sales (B6): ship date / via / FOB / tracking # / ship-to / customer P.O. No. */
+  shipping?: SalesShippingInfo | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +195,11 @@ export async function renderInvoicePdf(data: InvoicePdfData): Promise<Uint8Array
 
   // Move cursor past the header block — leave some breathing room
   cursor = Math.min(cursor, billToY - 14) - 28;
+
+  // Shipping details band (only when the invoice carries any).
+  if (data.shipping) {
+    cursor = drawShippingBand(page, { regular, bold }, data.shipping, cursor + 10, MARGIN_L, MARGIN_R);
+  }
 
   // ---------------------------------------------------------------------------
   // SEPARATOR

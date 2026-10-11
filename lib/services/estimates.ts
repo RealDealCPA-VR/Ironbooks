@@ -53,6 +53,9 @@ export interface CreateEstimateInput {
    */
   taxRateId?: string | null;
   memo?: string | null;
+  /** wave2 sales (C7): queue for batch printing / emailing. */
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 export type EstimateStatus = 'draft' | 'accepted' | 'rejected' | 'closed';
@@ -65,6 +68,8 @@ export interface ProgressInvoiceInput {
   lineAmounts?: Array<{ lineId: string; amount: string | number }> | null;
   /** Invoice date; defaults to now. */
   date?: Date | null;
+  /** wave2 sales (C2): save even if the invoice puts the customer over their credit limit. */
+  overrideCreditLimit?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +88,8 @@ async function nextEstimateNumber(ctx: ServiceContext): Promise<number> {
 // createEstimate
 // ---------------------------------------------------------------------------
 
-export async function createEstimate(ctx: ServiceContext, input: CreateEstimateInput) {
+/** Validate an estimate input and compute its lines/totals (read-only; shared by create + edit). */
+async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) {
   if (!input.lines || input.lines.length === 0) {
     throw validation('An estimate must have at least one line.');
   }
@@ -157,6 +163,12 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
   const taxAmount = Money.round2(Money.mul(taxableSubtotal, taxRateDecimal));
   const total = Money.round2(subtotal.plus(taxAmount));
 
+  return { computedLines, subtotal, taxAmount, total };
+}
+
+export async function createEstimate(ctx: ServiceContext, input: CreateEstimateInput) {
+  const { computedLines, subtotal, taxAmount, total } = await prepareEstimate(ctx, input);
+
   return inTransaction(ctx, async (tx) => {
     const estimateNumber = await nextEstimateNumber(tx);
 
@@ -173,6 +185,9 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         taxAmount: toAmountString(taxAmount),
         total: toAmountString(total),
         memo: input.memo ?? null,
+        taxRateId: input.taxRateId ?? null,
+        toBePrinted: input.toBePrinted ?? false,
+        toBeEmailed: input.toBeEmailed ?? false,
       })
       .returning();
 
@@ -294,7 +309,11 @@ export async function updateEstimateStatus(
  * - Stamps estimates.convertedInvoiceId and sets status to 'closed'.
  * - Returns the new invoice.
  */
-export async function convertToInvoice(ctx: ServiceContext, estimateId: string) {
+export async function convertToInvoice(
+  ctx: ServiceContext,
+  estimateId: string,
+  opts?: { overrideCreditLimit?: boolean },
+) {
   // Invoice creation and estimate stamping must commit or roll back TOGETHER —
   // otherwise a failure after createInvoice leaves a posted GL invoice with the
   // estimate still open and convertible again (duplicate invoice + revenue).
@@ -333,6 +352,9 @@ export async function convertToInvoice(ctx: ServiceContext, estimateId: string) 
       date: new Date(),
       lines: invoiceLines,
       memo: estimate.memo ?? undefined,
+      // wave2 sales: carry the quoted tax rate (stored since 0027) so the invoice total matches.
+      taxRateId: estimate.taxRateId ?? null,
+      overrideCreditLimit: opts?.overrideCreditLimit,
     });
 
     // Stamp the estimate as closed with the invoice reference. A full
@@ -470,6 +492,7 @@ export async function createProgressInvoice(
       customerId: estimate.customerId,
       date: input.date ?? new Date(),
       memo: `Progress billing (${progressLabel}) for Estimate #${estimate.estimateNumber}`,
+      overrideCreditLimit: input.overrideCreditLimit,
       lines: billLines.map((l) => ({
         itemId: l.itemId,
         description: l.description,
@@ -506,5 +529,96 @@ export async function createProgressInvoice(
     });
 
     return { invoice, estimate: updatedEstimate };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// updateEstimate (wave2 sales, C1 — edit a saved estimate)
+// ---------------------------------------------------------------------------
+
+/**
+ * Edit a saved estimate: customer, dates, lines, tax and memo. Estimates never post to the GL,
+ * so this is a plain replace of the lines + header (estimateNumber/createdAt preserved), with
+ * old/new values in the audit trail. Refused once the estimate has been invoiced (closed or
+ * progress-billed) — the invoices carry its amounts; edit those instead.
+ */
+export async function updateEstimate(ctx: ServiceContext, id: string, input: CreateEstimateInput) {
+  const existing = await getEstimate(ctx, id);
+  if (existing.status === 'closed' || existing.convertedInvoiceId) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This estimate has already been turned into an invoice, so it can no longer be changed. Edit the invoice instead.',
+    );
+  }
+  if (Money.gt(existing.amountInvoiced ?? '0', 0) || existing.status === 'partial') {
+    throw new ServiceError(
+      'CONFLICT',
+      'This estimate has progress invoices against it, so its lines can no longer be changed.',
+    );
+  }
+  const { computedLines, subtotal, taxAmount, total } = await prepareEstimate(ctx, input);
+
+  return inTransaction(ctx, async (tx) => {
+    const [current] = await tx.db
+      .select()
+      .from(estimates)
+      .where(and(eq(estimates.companyId, tx.companyId), eq(estimates.id, id)));
+    if (!current || current.status === 'closed' || current.status === 'partial') {
+      throw new ServiceError('CONFLICT', 'This estimate changed while you were editing it — reload and try again.');
+    }
+    await tx.db.delete(estimateLines).where(eq(estimateLines.estimateId, id));
+    await tx.db.insert(estimateLines).values(
+      computedLines.map((cl) => ({
+        estimateId: id,
+        itemId: cl.itemId,
+        description: cl.description,
+        quantity: cl.quantity,
+        rate: cl.rate,
+        amount: cl.amount,
+        taxable: cl.taxable,
+        lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
+      })),
+    );
+    const [updated] = await tx.db
+      .update(estimates)
+      .set({
+        customerId: input.customerId,
+        date: input.date,
+        expirationDate: input.expirationDate ?? null,
+        subtotal: toAmountString(subtotal),
+        taxAmount: toAmountString(taxAmount),
+        total: toAmountString(total),
+        memo: input.memo ?? null,
+        taxRateId: input.taxRateId ?? null,
+        toBePrinted: input.toBePrinted ?? current.toBePrinted,
+        toBeEmailed: input.toBeEmailed ?? current.toBeEmailed,
+        updatedAt: new Date(),
+      })
+      .where(eq(estimates.id, id))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'estimate',
+      entityId: id,
+      oldValues: {
+        customerId: existing.customerId,
+        date: existing.date,
+        expirationDate: existing.expirationDate,
+        total: existing.total,
+        memo: existing.memo,
+        lines: existing.lines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),
+      },
+      newValues: {
+        customerId: input.customerId,
+        date: input.date,
+        expirationDate: input.expirationDate ?? null,
+        total: toAmountString(total),
+        memo: input.memo ?? null,
+        lines: computedLines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),
+      },
+    });
+    return { ...updated, lines: computedLines };
   });
 }

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { FileCheck, Plus, ArrowRight, Printer, PackageCheck } from 'lucide-react';
+import { FileCheck, Plus, ArrowRight, Printer, PackageCheck, Pencil } from 'lucide-react';
 import Link from 'next/link';
 import {
   Button,
@@ -29,6 +29,15 @@ import {
   type PricedLineItem,
   type PricedLineValue,
 } from '@/components/PricedLinesEditor';
+import {
+  EMPTY_SHIPPING,
+  FormSendButtons,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+  useCreditLimitConfirm,
+} from '@/components/sales/SalesExtras';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,10 +56,20 @@ interface SalesOrder {
   total: string;
   status: string;
   convertedInvoiceId: string | null;
+  memo?: string | null;
+  shipDate?: string | null;
+  shipVia?: string | null;
+  fob?: string | null;
+  trackingNumber?: string | null;
+  poNumber?: string | null;
+  shipTo?: Record<string, string> | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 interface SalesOrderLine {
   id: string;
+  itemId?: string | null;
   description: string | null;
   quantity: string;
   rate: string;
@@ -95,27 +114,51 @@ function computeTotal(lines: PricedLineValue[]): number {
 
 interface NewOrderModalProps {
   open: boolean;
+  /** wave2 sales (C1): the order being edited (null = new). */
+  editing?: SalesOrderDetail | null;
   onClose: () => void;
   customers: Customer[];
   items: PricedLineItem[];
   onCreated: () => void;
 }
 
-function NewOrderModal({ open, onClose, customers, items, onCreated }: NewOrderModalProps) {
+type EditableLine = PricedLineValue & { id?: string; invoiced?: number };
+
+function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: NewOrderModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
-  const [lines, setLines] = useState<PricedLineValue[]>([emptyPricedLine()]);
+  const [lines, setLines] = useState<EditableLine[]>([emptyPricedLine()]);
+  const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (open) {
+    if (!open) return;
+    if (editing) {
+      setCustomerId(editing.customerId);
+      setDate(editing.date.slice(0, 10));
+      setMemo(editing.memo ?? '');
+      setShip(shippingFromDoc(editing));
+      setLines(
+        editing.lines.map((l) => ({
+          id: l.id,
+          invoiced: Number(l.quantityInvoiced ?? 0),
+          itemId: l.itemId ?? '',
+          description: l.description ?? '',
+          quantity: String(Number(l.quantity)),
+          rate: String(Number(l.rate)),
+          taxable: true,
+          rateManual: true,
+        })),
+      );
+    } else {
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setMemo('');
+      setShip(shippingFromDoc(null));
       setLines([emptyPricedLine()]);
     }
-  }, [open]);
+  }, [open, editing]);
 
   const liveTotal = computeTotal(lines);
 
@@ -136,19 +179,27 @@ function NewOrderModal({ open, onClose, customers, items, onCreated }: NewOrderM
 
     setSaving(true);
     try {
-      await api.post('/api/sales-orders', {
+      const body = {
         customerId,
         date,
         memo: memo || undefined,
+        ...shippingPayload(ship),
         lines: validLines.map((l) => ({
+          ...(l.id ? { id: l.id } : {}),
           itemId: l.itemId || null,
           description: l.description || null,
           quantity: l.quantity,
           // Blank rate on an item line: the server prices it (advanced pricing).
           rate: l.rate === '' ? null : l.rate,
         })),
-      });
-      toast('Sales order created.', 'success');
+      };
+      if (editing) {
+        await api.patch(`/api/sales-orders/${editing.id}`, body);
+        toast(`Sales Order #${editing.orderNumber} updated.`, 'success');
+      } else {
+        await api.post('/api/sales-orders', body);
+        toast('Sales order created.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
@@ -163,13 +214,13 @@ function NewOrderModal({ open, onClose, customers, items, onCreated }: NewOrderM
     <Modal
       open={open}
       onClose={onClose}
-      title="New Sales Order"
+      title={editing ? `Edit Sales Order #${editing.orderNumber}` : 'New Sales Order'}
       size="xl"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
-            Create Sales Order
+            {editing ? 'Save Changes' : 'Create Sales Order'}
           </Button>
         </>
       }
@@ -213,9 +264,17 @@ function NewOrderModal({ open, onClose, customers, items, onCreated }: NewOrderM
           />
         </div>
 
+        <ShippingSection value={ship} onChange={setShip} idPrefix="so-ship" />
+
         {/* Line items (item pick -> server-side pricing) */}
         <div>
           <Label className="mb-2">Line Items</Label>
+          {editing && editing.status === 'partial' && (
+            <p className="mb-2 text-xs text-amber-700">
+              Some lines are already invoiced. Keep those lines, and don&apos;t lower their quantity below what
+              has been invoiced.
+            </p>
+          )}
           <PricedLinesEditor
             items={items}
             lines={lines}
@@ -262,6 +321,7 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [qtyNow, setQtyNow] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+  const creditLimit = useCreditLimitConfirm();
 
   useEffect(() => {
     if (!open || !order) {
@@ -328,7 +388,10 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
 
     setSaving(true);
     try {
-      await api.post(`/api/sales-orders/${order.id}`, { action: 'convert', lines: plan });
+      const done = await creditLimit.run((override) =>
+        api.post(`/api/sales-orders/${order.id}`, { action: 'convert', lines: plan, overrideCreditLimit: override }),
+      );
+      if (done === undefined) return;
       const fully = lines.every(
         (l) => (parseFloat(qtyNow[l.id]) || 0) >= remainingOf(l),
       );
@@ -429,6 +492,7 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
           </div>
         </div>
       )}
+      {creditLimit.dialog}
     </Modal>
   );
 }
@@ -446,6 +510,16 @@ export default function SalesOrdersPage() {
 
   // Invoice (convert) state
   const [invoiceTarget, setInvoiceTarget] = useState<SalesOrder | null>(null);
+  // Edit state (wave2 sales C1)
+  const [editTarget, setEditTarget] = useState<SalesOrderDetail | null>(null);
+
+  async function openEdit(order: SalesOrder) {
+    try {
+      setEditTarget(await api.get<SalesOrderDetail>(`/api/sales-orders/${order.id}`));
+    } catch (err: unknown) {
+      toast(err instanceof Error ? err.message : 'Could not open the sales order.', 'danger');
+    }
+  }
 
   const customerMap = Object.fromEntries(customers.map((c) => [c.id, c.displayName]));
 
@@ -537,6 +611,18 @@ export default function SalesOrdersPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex items-center justify-end gap-1">
+                      <FormSendButtons kind="sales_order" id={order.id} />
+                      {(order.status === 'open' || order.status === 'partial') && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title="Edit sales order"
+                          aria-label="Edit sales order"
+                          onClick={() => openEdit(order)}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                       {(order.status === 'open' || order.status === 'partial') && (
                         <Button
                           variant="ghost"
@@ -612,8 +698,12 @@ export default function SalesOrdersPage() {
       )}
 
       <NewOrderModal
-        open={showNew}
-        onClose={() => setShowNew(false)}
+        open={showNew || !!editTarget}
+        editing={editTarget}
+        onClose={() => {
+          setShowNew(false);
+          setEditTarget(null);
+        }}
         customers={customers}
         items={items}
         onCreated={fetchData}

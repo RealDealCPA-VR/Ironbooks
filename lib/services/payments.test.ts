@@ -149,7 +149,7 @@ describe('payments-ar: Receive Payments', () => {
     // Payment row
     expect(payment.amount).toBe('1000.00');
     expect(payment.unapplied).toBe('0.00');
-    expect(payment.postedEntryId).toBe(entry.id);
+    expect(payment.postedEntryId).toBe(entry!.id);
 
     // Invoice updated
     const [inv] = await db.select().from(invoices).where(eq(invoices.id, invoiceId));

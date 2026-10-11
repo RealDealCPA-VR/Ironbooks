@@ -30,6 +30,8 @@ import {
   inventoryBins, inventoryLineDetails, inventoryLots, inventoryMovements, inventorySites,
   inventoryTransferLines, inventoryTransfers, itemReceiptLines, itemReceipts, itemSiteSettings,
   landedCostAllocationLines, landedCostAllocations, pendingBuilds,
+  // wave2 sales
+  bouncedChecks, collectionNotes, creditApplications,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
@@ -554,6 +556,10 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
     name: 'landedCostAllocationLines', table: landedCostAllocationLines, companyCol: landedCostAllocations.companyId,
     joins: [{ table: landedCostAllocations, on: [landedCostAllocationLines.allocationId, landedCostAllocations.id] }],
   },
+  // wave2 sales: credit applications, bounced checks, collections notes.
+  { name: 'creditApplications', table: creditApplications, joins: [], companyCol: creditApplications.companyId },
+  { name: 'bouncedChecks', table: bouncedChecks, joins: [], companyCol: bouncedChecks.companyId },
+  { name: 'collectionNotes', table: collectionNotes, joins: [], companyCol: collectionNotes.companyId },
 ];
 
 /**
