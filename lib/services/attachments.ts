@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { eq, and } from 'drizzle-orm';
+import { and, desc, eq, ilike, isNull, or } from 'drizzle-orm';
 import { resolveDataDir } from '@/lib/db';
 import { attachments } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
@@ -39,22 +39,46 @@ function ensureDir(dir: string): void {
 export interface AttachmentRow {
   id: string;
   companyId: string;
-  entityType: string;
-  entityId: string;
+  /** Null for unfiled documents (Doc Center inbox). */
+  entityType: string | null;
+  entityId: string | null;
   filename: string;
   storagePath: string;
   mimeType: string | null;
   sizeBytes: number | null;
+  description?: string | null;
   createdAt: Date;
 }
 
 export interface SaveAttachmentParams {
-  entityType: string;
-  entityId: string;
+  /** Omit BOTH entityType and entityId to drop the file into the Doc Center inbox (unfiled). */
+  entityType?: string | null;
+  entityId?: string | null;
   filename: string;
   mimeType: string;
   /** Base64-encoded file contents. */
   base64: string;
+  description?: string | null;
+}
+
+/** Largest file the Doc Center accepts (kept local; this just protects the company file). */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+const ENTITY_TYPE_RE = /^[a-z][a-z0-9_]{0,99}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Validate an (entityType, entityId) link: both set (filed) or both empty (unfiled). */
+function normalizeLink(
+  entityType: string | null | undefined,
+  entityId: string | null | undefined,
+): { entityType: string | null; entityId: string | null } {
+  const t = entityType?.trim() || null;
+  const i = entityId?.trim() || null;
+  if (!t && !i) return { entityType: null, entityId: null };
+  if (!t || !i) throw validation('entityType and entityId go together: give both, or neither to leave the file unfiled.');
+  if (!ENTITY_TYPE_RE.test(t)) throw validation('entityType is not valid.');
+  if (!UUID_RE.test(i)) throw validation('entityId must be a valid id.');
+  return { entityType: t, entityId: i };
 }
 
 // ---------------------------------------------------------------------------
@@ -70,10 +94,9 @@ export async function saveAttachment(
   ctx: ServiceContext,
   params: SaveAttachmentParams,
 ): Promise<AttachmentRow> {
-  const { entityType, entityId, filename, mimeType, base64 } = params;
+  const { filename, mimeType, base64 } = params;
+  const { entityType, entityId } = normalizeLink(params.entityType, params.entityId);
 
-  if (!entityType) throw validation('entityType is required');
-  if (!entityId) throw validation('entityId is required');
   if (!filename) throw validation('filename is required');
   if (!base64) throw validation('base64 content is required');
 
@@ -83,6 +106,10 @@ export async function saveAttachment(
     buffer = Buffer.from(base64, 'base64');
   } catch {
     throw validation('base64 content is invalid');
+  }
+  if (buffer.length === 0) throw validation('The file is empty.');
+  if (buffer.length > MAX_ATTACHMENT_BYTES) {
+    throw validation('Files can be at most 25 MB.');
   }
 
   const dir = attachmentsDir();
@@ -109,6 +136,7 @@ export async function saveAttachment(
       storagePath,
       mimeType: mimeType || null,
       sizeBytes: buffer.length,
+      description: params.description?.trim() || null,
     })
     .returning();
 
@@ -147,6 +175,84 @@ export async function listAttachments(
       ),
     );
   return rows as AttachmentRow[];
+}
+
+// ---------------------------------------------------------------------------
+// Doc Center: inbox, search, file/unfile, describe
+// ---------------------------------------------------------------------------
+
+/** Unfiled documents (Doc Center inbox), newest first. */
+export async function listUnfiledAttachments(ctx: ServiceContext): Promise<AttachmentRow[]> {
+  const rows = await ctx.db
+    .select()
+    .from(attachments)
+    .where(and(eq(attachments.companyId, ctx.companyId), isNull(attachments.entityId)))
+    .orderBy(desc(attachments.createdAt));
+  return rows as AttachmentRow[];
+}
+
+/** Every document in the company file, optionally filtered by name/description text. */
+export async function searchAttachments(
+  ctx: ServiceContext,
+  opts: { q?: string; limit?: number } = {},
+): Promise<AttachmentRow[]> {
+  const q = opts.q?.trim();
+  const pattern = q ? `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
+  const rows = await ctx.db
+    .select()
+    .from(attachments)
+    .where(
+      pattern
+        ? and(
+            eq(attachments.companyId, ctx.companyId),
+            or(ilike(attachments.filename, pattern), ilike(attachments.description, pattern)),
+          )
+        : eq(attachments.companyId, ctx.companyId),
+    )
+    .orderBy(desc(attachments.createdAt))
+    .limit(Math.min(Math.max(opts.limit ?? 200, 1), 1000));
+  return rows as AttachmentRow[];
+}
+
+export interface UpdateAttachmentParams {
+  /** File the document to a record (both set), or unfile it back to the inbox (both null). */
+  entityType?: string | null;
+  entityId?: string | null;
+  description?: string | null;
+}
+
+/** Attach an inbox document to a record, move it, unfile it, or change its description. */
+export async function updateAttachment(
+  ctx: ServiceContext,
+  id: string,
+  params: UpdateAttachmentParams,
+): Promise<AttachmentRow> {
+  const [row] = await ctx.db
+    .select()
+    .from(attachments)
+    .where(and(eq(attachments.id, id), eq(attachments.companyId, ctx.companyId)));
+  if (!row) throw notFound('Attachment');
+  const patch: Partial<typeof attachments.$inferInsert> = {};
+  if (params.entityType !== undefined || params.entityId !== undefined) {
+    const link = normalizeLink(params.entityType, params.entityId);
+    patch.entityType = link.entityType;
+    patch.entityId = link.entityId;
+  }
+  if (params.description !== undefined) patch.description = params.description?.trim() || null;
+  if (Object.keys(patch).length === 0) return row as AttachmentRow;
+  const [updated] = await ctx.db
+    .update(attachments)
+    .set(patch)
+    .where(and(eq(attachments.id, id), eq(attachments.companyId, ctx.companyId)))
+    .returning();
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'attachment',
+    entityId: id,
+    oldValues: { entityType: row.entityType, entityId: row.entityId, description: row.description },
+    newValues: { entityType: updated.entityType, entityId: updated.entityId, description: updated.description },
+  });
+  return updated as AttachmentRow;
 }
 
 // ---------------------------------------------------------------------------

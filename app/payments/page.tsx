@@ -27,6 +27,10 @@ import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useNewParam } from '@/lib/useFocusParam';
+// wave2 prefs: Payments > auto-apply / auto-calculate / Undeposited Funds; date warnings
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmTransactionDate } from '@/lib/formPrefs';
+import { autoApplyPayment, sumApplied } from '@/lib/paymentApply';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -58,6 +62,7 @@ interface Account {
 interface Invoice {
   id: string;
   date: string;
+  dueDate?: string | null;
   total: string;
   balanceDue: string;
   status: string;
@@ -114,10 +119,18 @@ interface ReceivePaymentModalProps {
   onClose: () => void;
   onSaved: () => void;
   customers: Customer[];
+  accounts: Account[];
 }
 
-function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePaymentModalProps) {
+function ReceivePaymentModal({ open, onClose, onSaved, customers, accounts }: ReceivePaymentModalProps) {
   const today = new Date().toISOString().slice(0, 10);
+  const prefs = usePreferences();
+  // Preferences > Payments: once the user edits one side by hand, stop recalculating it.
+  const [amountTouched, setAmountTouched] = useState(false);
+  const [appsTouched, setAppsTouched] = useState(false);
+  // "Use Undeposited Funds as a default deposit to account" off → pick the bank account here.
+  const [depositAccountId, setDepositAccountId] = useState('');
+  const bankAccounts = accounts.filter((a) => a.type === 'asset' && a.code !== '1050');
 
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(today);
@@ -142,8 +155,18 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
       setReference('');
       setInvoices([]);
       setApplicationAmounts({});
+      setAmountTouched(false);
+      setAppsTouched(false);
+      setDepositAccountId('');
     }
   }, [open, today]);
+
+  useEffect(() => {
+    if (!open || prefs.company.useUndepositedFunds || depositAccountId) return;
+    const def = prefs.company.defaultDepositAccountId;
+    if (def && bankAccounts.some((a) => a.id === def)) setDepositAccountId(def);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, prefs.loaded, accounts]);
 
   // Fetch open invoices when customer changes
   useEffect(() => {
@@ -161,7 +184,10 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
         // Show only invoices with a positive balance due
         const open = list.filter((inv) => Number(inv.balanceDue) > 0);
         setInvoices(open);
-        setApplicationAmounts({});
+        setAppsTouched(false);
+        setApplicationAmounts(
+          prefs.company.autoApplyPayments && amount ? autoApplyPayment(amount, open) : {},
+        );
       })
       .catch((err) => {
         toastError(err, 'Failed to load invoices.');
@@ -171,7 +197,23 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
   }, [customerId]);
 
   const setAppAmount = (invoiceId: string, value: string) => {
-    setApplicationAmounts((prev) => ({ ...prev, [invoiceId]: value }));
+    setAppsTouched(true);
+    const next = { ...applicationAmounts, [invoiceId]: value };
+    setApplicationAmounts(next);
+    // "Automatically calculate payments": the amount received follows what is applied.
+    if (prefs.company.autoCalculatePayments && !amountTouched) {
+      const total = sumApplied(next);
+      setAmount(total === '0.00' ? '' : total);
+    }
+  };
+
+  const changeAmount = (value: string) => {
+    setAmount(value);
+    setAmountTouched(true);
+    // "Automatically apply payments": spread it over open invoices, oldest due first.
+    if (prefs.company.autoApplyPayments && !appsTouched) {
+      setApplicationAmounts(autoApplyPayment(value, invoices));
+    }
   };
 
   const applications: Application[] = Object.entries(applicationAmounts)
@@ -184,6 +226,11 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter a date.', 'danger'); return; }
     if (!amount || Number(amount) <= 0) { toast('Please enter a valid payment amount.', 'danger'); return; }
+    if (!prefs.company.useUndepositedFunds && !depositAccountId) {
+      toast('Choose the account to deposit this payment to.', 'danger');
+      return;
+    }
+    if (!confirmTransactionDate(date, prefs)) return;
 
     setSaving(true);
     try {
@@ -194,6 +241,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
         amount,
         reference: reference.trim() || null,
         applications,
+        ...(prefs.company.useUndepositedFunds ? {} : { depositAccountId }),
       });
       toast('Payment recorded successfully.', 'success');
       onSaved();
@@ -276,7 +324,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
               id="pm-amount"
               placeholder="0.00"
               value={amount}
-              onChange={(e) => setAmount(e.target.value)}
+              onChange={(e) => changeAmount(e.target.value)}
             />
           </div>
           <div>
@@ -290,6 +338,26 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
             />
           </div>
         </div>
+
+        {/* Deposit to (only when Preferences > Payments turns Undeposited Funds off) */}
+        {!prefs.company.useUndepositedFunds && (
+          <div>
+            <Label htmlFor="pm-deposit" required>
+              Deposit To <Help term="undeposited-funds" />
+            </Label>
+            <Select id="pm-deposit" value={depositAccountId} onChange={(e) => setDepositAccountId(e.target.value)}>
+              <option value="">Select a bank account…</option>
+              {bankAccounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.code} — {a.name}
+                </option>
+              ))}
+            </Select>
+            <p className="mt-1 text-xs text-navy/50">
+              Your preferences send payments straight to a bank account instead of Undeposited Funds.
+            </p>
+          </div>
+        )}
 
         {/* Open invoices */}
         {customerId && (
@@ -806,6 +874,7 @@ function PaymentsPageContent() {
         onClose={() => setModalOpen(false)}
         onSaved={fetchPayments}
         customers={customers}
+        accounts={accounts}
       />
 
       <ApplyUnappliedModal

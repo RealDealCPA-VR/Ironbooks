@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
     const tpl = await createTemplate(ctx, {
       ...parsed.data,
       nextRunDate: parsed.data.nextRunDate ?? new Date(),
-      // Auto-enter (default) posts on schedule; remind-only surfaces a reminder.
+      // mode wins; legacy autoEnter (default true) maps to automatic / remind.
       autoEnter: parsed.data.autoEnter ?? true,
     });
 

@@ -37,6 +37,12 @@ import {
 } from '@/components/inventory/AdvancedInventory';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+// wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
+import { dueDateForTerms } from '@/lib/preferences';
+import MemorizeButton from '@/components/MemorizeButton';
+import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -83,6 +89,7 @@ function isEditable(bill: Bill): boolean {
 interface Vendor {
   id: string;
   displayName: string;
+  terms?: string | null;
 }
 
 interface Account {
@@ -171,6 +178,7 @@ function lineAmount(line: LineRow): number {
 export default function BillsPage() {
   const [bills, setBills] = useState<Bill[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
+  const prefs = usePreferences();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
@@ -264,6 +272,10 @@ export default function BillsPage() {
     setVendorId(id);
     setPrefillNote('');
     if (!id || editingId) return;
+    // Due date from the vendor's terms (else Preferences > Bills default terms).
+    const terms = vendors.find((v) => v.id === id)?.terms || prefs.company.defaultVendorTerms;
+    const due = dueDateForTerms(date, terms);
+    if (due) setDueDate(due);
     const blank = (ls: LineRow[]) =>
       ls.every((l) => l.mode === 'expense' && !l.accountId && !l.amount && !l.description);
     if (!blank(lines)) return;
@@ -417,6 +429,14 @@ export default function BillsPage() {
         }
       }
     }
+
+    if (!confirmTransactionDate(date, prefs)) return;
+    // Preferences > Bills: "Warn about duplicate bill numbers from same vendor".
+    const dupBill = findDuplicateNumber(billNumber, bills, (b) => b.billNumber, {
+      excludeId: editingId,
+      sameScope: (b) => b.vendorId === vendorId && b.status !== 'void',
+    });
+    if (!confirmUniqueNumber(prefs.company.warnDuplicateBillNumbers, 'Bill number', dupBill, billNumber)) return;
 
     setSubmitting(true);
     try {
@@ -592,6 +612,26 @@ export default function BillsPage() {
         size="lg"
         footer={
           <>
+            <MemorizeButton
+              docType="bill"
+              shortcut={modalOpen}
+              defaultName={vendors.find((v) => v.id === vendorId)?.displayName}
+              getTemplate={() => {
+                if (!vendorId) return 'Pick a vendor before memorizing.';
+                const rows = lines.filter((l) => (l.mode === 'item' ? l.itemId : l.accountId));
+                if (rows.length === 0) return 'Add at least one line before memorizing.';
+                return {
+                  vendorId,
+                  date,
+                  dueDate: dueDate || undefined,
+                  lines: rows.map((l) =>
+                    l.mode === 'item'
+                      ? { itemId: l.itemId, quantity: l.quantity, unitCost: l.unitCost, description: l.description.trim() || undefined }
+                      : { accountId: l.accountId, description: l.description.trim() || undefined, amount: l.amount },
+                  ),
+                };
+              }}
+            />
             <Button variant="secondary" onClick={closeModal} disabled={submitting}>
               Cancel
             </Button>
@@ -817,6 +857,7 @@ export default function BillsPage() {
               </span>
             </div>
           </div>
+          <AttachmentPanel entityType="bill" entityId={editingId} />
         </div>
       </Modal>
 

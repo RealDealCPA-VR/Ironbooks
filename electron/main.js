@@ -7,7 +7,9 @@
 // The active company file is a local data directory; we set BKA_DATA_DIR before starting the
 // server so lib/db persists there. This keeps all financial data on the user's machine (offline).
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell, session } = require('electron');
+const { buildSectionMenus } = require('./menuRoutes');
+const spelling = require('./spelling');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -752,13 +754,19 @@ function buildMenu() {
     { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }] },
     // Reload on F5 (not the default Ctrl+R): Ctrl+R is the QB "Registers" shortcut in the app.
     { label: 'View', submenu: [{ role: 'reload', accelerator: 'F5' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
+    // QB menus: Company, Customers, Vendors, Employees, Banking, Reports, Lists (electron/menuRoutes.js).
+    ...buildSectionMenus(navigate),
     {
-      label: 'Reports',
+      label: 'Window',
       submenu: [
-        { label: 'Profit & Loss', click: () => navigate('/reports/profit-loss') },
-        { label: 'Balance Sheet', click: () => navigate('/reports/balance-sheet') },
-        { label: 'Trial Balance', click: () => navigate('/reports/trial-balance') },
-        { label: 'General Ledger', click: () => navigate('/reports/general-ledger') },
+        { role: 'minimize' },
+        ...(process.platform === 'darwin' ? [{ role: 'zoom' }, { role: 'front' }] : []),
+        { role: 'togglefullscreen' },
+        { type: 'separator' },
+        { label: 'Back', accelerator: 'Alt+Left', click: () => mainWindow?.webContents.navigationHistory?.goBack?.() },
+        { label: 'Forward', accelerator: 'Alt+Right', click: () => mainWindow?.webContents.navigationHistory?.goForward?.() },
+        { type: 'separator' },
+        { label: 'Home', click: () => navigate('/dashboard') },
       ],
     },
     {
@@ -807,12 +815,15 @@ async function createWindow() {
       sandbox: true,
       webSecurity: true,
       webviewTag: false,
-      spellcheck: false, // Chromium would download dictionaries from Google
+      // Local-only spell check for memos/descriptions (electron/spelling.js: OS checker on
+      // Windows/macOS, no dictionary downloads anywhere).
+      spellcheck: true,
       navigateOnDragDrop: false,
     },
   });
   if (state?.maximized) mainWindow.maximize();
   trackWindowState(mainWindow);
+  spelling.attachContextMenu(mainWindow, Menu);
 
   if (remoteHostOrigin) {
     buildMenu();
@@ -848,6 +859,7 @@ async function createWindow() {
   buildMenu();
   runDueRecurring(url);
   scheduleAutoBackups();
+  scheduleBackgroundJobs(url);
   refreshRendererAllowlist();
   if (hostingConfig().enabled) setHosting(true, { quiet: true });
 
@@ -882,6 +894,60 @@ function runDueRecurring(url) {
     console.error('[recurring] launch-time run unavailable:', err);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Background jobs while the app is open (local server only):
+//  - memorized transactions due (hourly; the launch-time run is above)
+//  - scheduled reports (H5): the reports package's POST /api/reports/schedules/run-due, every
+//    15 minutes. Until that endpoint exists the server answers 404; we stop asking after that.
+// Both authenticate with the per-launch internal token, like the launch-time recurring run.
+// ---------------------------------------------------------------------------
+
+const SCHEDULED_REPORTS_EVERY_MS = 15 * 60 * 1000;
+const RECURRING_EVERY_MS = 60 * 60 * 1000;
+let scheduledReportsTimer = null;
+let recurringTimer = null;
+
+function runDueScheduledReports(url) {
+  return fetch(`${url}/api/reports/schedules/run-due`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-bka-internal': internalToken },
+    body: '{}',
+  })
+    .then(async (res) => {
+      if (res.status === 404) {
+        // Scheduled reports are not available in this build: stop polling quietly.
+        if (scheduledReportsTimer) clearInterval(scheduledReportsTimer);
+        scheduledReportsTimer = null;
+        return;
+      }
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.error(`[scheduled-reports] run failed: HTTP ${res.status} ${body.slice(0, 200)}`);
+      }
+    })
+    .catch((err) => console.error('[scheduled-reports] run failed:', err?.message || err));
+}
+
+function scheduleBackgroundJobs(url) {
+  if (scheduledReportsTimer || recurringTimer) return;
+  scheduledReportsTimer = setInterval(() => runDueScheduledReports(url), SCHEDULED_REPORTS_EVERY_MS);
+  recurringTimer = setInterval(() => runDueRecurring(url), RECURRING_EVERY_MS);
+  // First scheduled-reports check shortly after launch (the server is warm by then).
+  setTimeout(() => runDueScheduledReports(url), 60 * 1000);
+}
+
+app.on('before-quit', () => {
+  if (scheduledReportsTimer) clearInterval(scheduledReportsTimer);
+  if (recurringTimer) clearInterval(recurringTimer);
+});
+
+// My Preferences > Spelling (sent by the renderer's DesktopBridge).
+ipcMain.handle('spellcheck:setEnabled', (e, enabled) => {
+  if (!fromAppOrigin(e)) return false;
+  spelling.configureSpellChecker(session.defaultSession, process.platform, Boolean(enabled));
+  return true;
+});
 
 // --- IPC for native dialogs the renderer needs ---
 ipcMain.handle('dialog:openFile', async (e, filters) => {

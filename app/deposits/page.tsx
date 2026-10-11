@@ -24,9 +24,12 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import { useNewParam } from '@/lib/useFocusParam';
+// wave2 prefs: Checking > default account for Make Deposits; date warnings
+import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,6 +108,7 @@ function MakeDepositModal({
   loadingItems,
 }: MakeDepositModalProps) {
   const [depositAccountId, setDepositAccountId] = useState('');
+  const prefs = usePreferences();
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -117,7 +121,8 @@ function MakeDepositModal({
   // Reset when modal opens.
   useEffect(() => {
     if (open) {
-      setDepositAccountId('');
+      const def = prefs.company.defaultDepositAccountId;
+      setDepositAccountId(def && bankAccounts.some((a) => a.id === def) ? def : '');
       setDate(new Date().toISOString().slice(0, 10));
       setMemo('');
       setSelectedIds(new Set());
@@ -245,6 +250,30 @@ function MakeDepositModal({
       size="lg"
       footer={
         <>
+          <MemorizeButton
+            docType="deposit"
+            shortcut={open}
+            defaultName={memo || undefined}
+            getTemplate={() => {
+              // Only the "other" lines recur: customer payments are one-time money.
+              if (!depositAccountId) return 'Pick the bank account before memorizing.';
+              const rows = extraLines.filter((l) => l.accountId && Number(l.amount) > 0);
+              if (rows.length === 0)
+                return 'Add at least one deposit line (not a customer payment) to memorize a deposit.';
+              return {
+                depositAccountId,
+                date,
+                paymentIds: [],
+                salesReceiptIds: [],
+                extraLines: rows.map((l) => ({
+                  accountId: l.accountId,
+                  amount: l.amount,
+                  description: l.description.trim() || undefined,
+                })),
+                memo: memo || undefined,
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>

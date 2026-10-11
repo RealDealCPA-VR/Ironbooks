@@ -31,6 +31,8 @@ import { api } from '@/lib/client';
 import { describeError } from '@/lib/friendlyErrors';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+// wave2 prefs: Checking > default account for Pay Bills
+import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -102,6 +104,7 @@ export default function PayBillsPage() {
 
   // Payment header
   const [paymentAccountId, setPaymentAccountId] = useState('');
+  const prefs = usePreferences();
   const [discountAccountId, setDiscountAccountId] = useState('');
   const [method, setMethod] = useState('check');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -166,6 +169,12 @@ export default function PayBillsPage() {
         a.code !== '1050') ||
       (a.type === 'liability' && a.subtype === 'credit_card'),
   );
+  useEffect(() => {
+    const def = prefs.company.defaultBillPaymentAccountId;
+    if (def && !paymentAccountId && paymentAccounts.some((a) => a.id === def)) setPaymentAccountId(def);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts, prefs.loaded]);
+
   const discountAccounts = accounts.filter((a) => a.type === 'revenue' || a.type === 'expense');
 
   const availableCredit = credits.reduce((s, c) => s + Number(c.unapplied), 0);

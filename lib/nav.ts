@@ -21,6 +21,8 @@ import type { Area } from '@/lib/permissions/model';
 import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
 // team pricing: advanced pricing, SO fulfillment worksheet, enhanced receiving
 import { PackageCheck, FileInput, SlidersHorizontal } from 'lucide-react';
+// wave2 prefs: calendar, reminders, lead center, letters, form templates
+import { Bell, CalendarDays, Contact, Mail, LayoutTemplate } from 'lucide-react';
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -48,6 +50,7 @@ export const navGroups: NavGroup[] = [
       { icon: HandCoins, label: 'Receive Payments', path: '/payments' },
       { icon: RotateCcw, label: 'Credit Memos', path: '/credit-memos' },
       { icon: Users, label: 'Customers', path: '/customers' },
+      { icon: Contact, label: 'Lead Center', path: '/leads' },
       { icon: Percent, label: 'Finance Charges', path: '/finance-charges' },
       { icon: Package, label: 'Items', path: '/items' },
       { icon: BadgePercent, label: 'Sales Reps', path: '/sales-reps' },
@@ -93,7 +96,7 @@ export const navGroups: NavGroup[] = [
       { icon: Calculator, label: 'Payroll Tax', path: '/payroll-tax' },
       { icon: Tag, label: 'Tracking', path: '/tracking' },
       { icon: Percent, label: 'Tax Components', path: '/sales-tax-components' },
-      { icon: Repeat, label: 'Recurring', path: '/recurring' },
+      { icon: Repeat, label: 'Memorized Transactions', path: '/recurring' },
       { icon: Coins, label: 'Currencies', path: '/currencies' },
       { icon: CalendarRange, label: 'Fiscal Periods', path: '/fiscal-periods' },
       { icon: CalendarClock, label: 'Year-End Close', path: '/year-end' },
@@ -122,7 +125,10 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: FileClock, label: 'Audit Trail', path: '/audit-trail' },
       { icon: ScrollText, label: 'Transaction Log', path: '/transaction-log' },
-      { icon: Paperclip, label: 'Attachments', path: '/attachments' },
+      { icon: Paperclip, label: 'Doc Center', path: '/attachments' },
+      { icon: Bell, label: 'Reminders', path: '/reminders' },
+      { icon: CalendarDays, label: 'Calendar', path: '/calendar' },
+      { icon: Mail, label: 'Letters & Labels', path: '/letters' },
       { icon: BadgeCheck, label: 'Data Integrity', path: '/integrity' },
       { icon: GitMerge, label: 'Merge Records', path: '/merge' },
       { icon: FileX, label: '1099 E-File', path: '/reports/1099-efile' },
@@ -157,6 +163,7 @@ export const navGroups: NavGroup[] = [
       { icon: Network, label: 'Privacy & Network', path: '/privacy' },
       { icon: Users, label: 'Multi-user', path: '/multi-user' },
       { icon: Settings, label: 'Settings', path: '/settings' },
+      { icon: LayoutTemplate, label: 'Form Templates', path: '/templates' },
       { icon: Sparkles, label: 'AI & Automation', path: '/ai-settings' },
     ],
   },

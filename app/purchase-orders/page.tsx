@@ -30,6 +30,8 @@ import {
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+// wave2 prefs: Memorize (Ctrl+M)
+import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -236,6 +238,29 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewP
       size="lg"
       footer={
         <>
+          <MemorizeButton
+            docType="purchase_order"
+            shortcut={open}
+            defaultName={vendors.find((v) => v.id === vendorId)?.displayName}
+            getTemplate={() => {
+              if (!vendorId) return 'Pick a vendor before memorizing.';
+              const valid = lines.filter((l) => (l.itemId || l.accountId) && l.quantity && l.rate);
+              if (valid.length === 0) return 'Add at least one complete line before memorizing.';
+              return {
+                vendorId,
+                date,
+                expectedDate: expectedDate || undefined,
+                memo: memo || undefined,
+                lines: valid.map((l) => ({
+                  itemId: l.itemId || null,
+                  accountId: l.accountId || null,
+                  description: l.description || null,
+                  quantity: l.quantity,
+                  rate: l.rate,
+                })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>

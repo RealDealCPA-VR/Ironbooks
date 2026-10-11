@@ -17,6 +17,7 @@ import { and, asc, eq, sql } from 'drizzle-orm';
 import { customers, invoices } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { getPreferences } from './preferences';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -158,7 +159,8 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
       phone: input.phone?.trim() ?? null,
       billingAddress: (input.billingAddress as Record<string, string>) ?? null,
       shippingAddress: (input.shippingAddress as Record<string, string>) ?? null,
-      terms: input.terms ?? 'net_30',
+      // Preferences > Sales & Customers: default terms for new records.
+      terms: input.terms ?? (await getPreferences(ctx)).defaultCustomerTerms,
       creditLimit: input.creditLimit != null ? toAmountString(input.creditLimit) : null,
       taxable: input.taxable ?? true,
       taxRateId: input.taxRateId ?? null,

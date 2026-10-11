@@ -13,7 +13,7 @@
  */
 
 import { Suspense, useEffect, useState, useCallback } from 'react';
-import { Banknote, Plus, Trash2 } from 'lucide-react';
+import { Banknote, Paperclip, Plus, Trash2 } from 'lucide-react';
 import {
   AmountInput,
   Button,
@@ -31,6 +31,7 @@ import {
   Td,
   Tr,
   PageHeader,
+  Modal,
   toast, toastError,
   useGridKeys,
 } from '@/components/ui';
@@ -40,6 +41,11 @@ import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { useNewParam } from '@/lib/useFocusParam';
+// wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
+import MemorizeButton from '@/components/MemorizeButton';
+import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -146,6 +152,14 @@ function ExpensesPageContent() {
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
   /** Shown under the payee after accounts were pre-filled (QB vendor pre-fill). */
   const [prefillNote, setPrefillNote] = useState('');
+  const prefs = usePreferences();
+  const [attachFor, setAttachFor] = useState<string | null>(null);
+  // My Preferences > Checking: "Start with payee field on check" (else the bank account).
+  useEffect(() => {
+    if (!prefs.loaded || typeof document === 'undefined') return;
+    if (document.activeElement && document.activeElement !== document.body) return;
+    document.getElementById(prefs.my.startWithPayee ? 'exp-payee' : 'exp-account')?.focus();
+  }, [prefs.loaded, prefs.my.startWithPayee]);
 
   const isCC = entryType === 'cc_charge' || entryType === 'cc_credit';
   const paymentAccounts = accounts.filter((a) => (isCC ? isCreditCard(a) : isBankish(a)));
@@ -186,6 +200,15 @@ function ExpensesPageContent() {
     }
     init();
   }, []);
+
+  // Preferences > Checking: default bank account for Write Checks.
+  useEffect(() => {
+    const def = prefs.company.defaultCheckAccountId;
+    if (!def || paymentAccountId || isCC) return;
+    const acc = accounts.find((a) => a.id === def);
+    if (acc && isBankish(acc)) setPaymentAccountId(def);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts, prefs.loaded, isCC]);
 
   // Clear an incompatible payment account when switching entry type.
   useEffect(() => {
@@ -259,6 +282,8 @@ function ExpensesPageContent() {
    */
   async function prefillFor(q: { vendorId?: string; payee?: string }) {
     setPrefillNote('');
+    // Preferences > Checking: "Autofill payee account number / last account used".
+    if (!prefs.company.autofillPayeeAccount) return;
     const blank = (ls: LineRow[]) => ls.every((l) => !l.accountId && !l.amount && !l.description);
     if (!blank(lines)) return;
     const pf = await fetchVendorPrefill(q);
@@ -301,6 +326,15 @@ function ExpensesPageContent() {
         toast(`Line ${i + 1}: amount must be greater than zero.`, 'danger');
         return;
       }
+    }
+
+    if (!confirmTransactionDate(date, prefs)) return;
+    // Preferences > Checking: "Warn about duplicate check numbers" (same bank account).
+    if (entryType === 'check' && !toPrint) {
+      const dupCheck = findDuplicateNumber(reference, expenses, (e) => e.reference, {
+        sameScope: (e) => e.method === 'check' && e.paymentAccountId === paymentAccountId && !e.voidedAt,
+      });
+      if (!confirmUniqueNumber(prefs.company.warnDuplicateCheckNumbers, 'Check number', dupCheck, reference)) return;
     }
 
     setSubmitting(true);
@@ -616,7 +650,36 @@ function ExpensesPageContent() {
           </div>
         </div>
 
-        <div className="flex justify-end pt-1">
+        <div className="flex justify-end gap-2 pt-1">
+          <MemorizeButton
+            docType={entryType === 'check' ? 'check' : 'expense'}
+            defaultName={payeeSel === OTHER_PAYEE ? payeeName : vendors.find((v) => v.id === payeeSel)?.displayName}
+            getTemplate={() => {
+              const vendorId = payeeSel && payeeSel !== OTHER_PAYEE ? payeeSel : undefined;
+              const freePayee = payeeSel === OTHER_PAYEE ? payeeName.trim() : '';
+              if (!vendorId && !freePayee) return 'Pick a payee before memorizing.';
+              if (!paymentAccountId) return 'Pick the account you pay from before memorizing.';
+              const rows = lines.filter((l) => l.accountId && Number(l.amount) > 0);
+              if (rows.length === 0) return 'Add at least one line before memorizing.';
+              return {
+                vendorId,
+                payeeName: freePayee || undefined,
+                date,
+                method: entryType === 'cash' ? 'cash' : isCC ? 'credit_card' : 'check',
+                isRefund: entryType === 'cc_credit',
+                toPrint: entryType === 'check' ? toPrint : false,
+                paymentAccountId,
+                memo: memo.trim() || undefined,
+                lines: rows.map((l) => ({
+                  accountId: l.accountId,
+                  description: l.description.trim() || undefined,
+                  amount: l.amount,
+                  classId: l.classId || undefined,
+                  customerId: l.customerId || undefined,
+                })),
+              };
+            }}
+          />
           <Button onClick={handleSubmit} loading={submitting}>
             {`Save ${ENTRY_LABEL[entryType]}`}
           </Button>
@@ -676,6 +739,9 @@ function ExpensesPageContent() {
                     )}
                   </Td>
                   <Td className="text-right">
+                    <Button variant="ghost" size="sm" onClick={() => setAttachFor(e.id)} title="Receipts and files">
+                      <Paperclip className="h-4 w-4" />
+                    </Button>
                     {!e.voidedAt && (
                       <Button
                         variant="ghost"
@@ -695,6 +761,10 @@ function ExpensesPageContent() {
           </Table>
         )}
       </Card>
+
+      <Modal open={!!attachFor} onClose={() => setAttachFor(null)} title="Receipts & files" size="md">
+        <AttachmentPanel entityType="expense" entityId={attachFor} />
+      </Modal>
 
       {/* Void confirm */}
       <ConfirmDialog

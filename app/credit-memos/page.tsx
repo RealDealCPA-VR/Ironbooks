@@ -24,6 +24,8 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+// wave2 prefs: Memorize (Ctrl+M)
+import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import {
   BarcodeScanInput,
@@ -284,6 +286,31 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
       title="New Credit Memo"
       footer={
         <>
+          <MemorizeButton
+            docType="credit_memo"
+            shortcut={open}
+            defaultName={customers.find((c) => c.id === customerId)?.displayName}
+            getTemplate={() => {
+              if (!customerId) return 'Pick a customer before memorizing.';
+              const valid = lines.filter((l) => l.quantity || l.rate);
+              if (valid.length === 0) return 'Add at least one line before memorizing.';
+              // Lot / serial picks for restocked items are one-time and are not memorized.
+              return {
+                customerId,
+                date,
+                memo: memoNote || null,
+                taxRateId: taxRateId || null,
+                lines: valid.map((l) => ({
+                  itemId: l.itemId || null,
+                  description: l.description || null,
+                  quantity: l.quantity,
+                  rate: l.rate,
+                  taxable: l.taxable,
+                  restock: l.restock,
+                })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
             Create Credit Memo

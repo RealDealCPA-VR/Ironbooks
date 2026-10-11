@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Repeat, Plus, Play, Clock, Trash2 } from 'lucide-react';
+import { Repeat, Plus, Play, Clock, Trash2, Pencil, Layers } from 'lucide-react';
 import {
   Button,
   Card,
@@ -28,8 +28,32 @@ import RecurringSuggestions from '@/components/RecurringSuggestions';
 // Types
 // ---------------------------------------------------------------------------
 
-type DocType = 'invoice' | 'bill' | 'journal_entry' | 'expense';
-type Frequency = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
+type DocType =
+  | 'invoice'
+  | 'bill'
+  | 'journal_entry'
+  | 'expense'
+  | 'check'
+  | 'sales_receipt'
+  | 'credit_memo'
+  | 'deposit'
+  | 'transfer'
+  | 'purchase_order';
+/** The document types this page can build from scratch (others are memorized from their forms). */
+type BuildableDocType = 'invoice' | 'bill' | 'journal_entry' | 'expense';
+type Frequency =
+  | 'never'
+  | 'daily'
+  | 'weekly'
+  | 'biweekly'
+  | 'every_four_weeks'
+  | 'semimonthly'
+  | 'monthly'
+  | 'bimonthly'
+  | 'quarterly'
+  | 'semiannually'
+  | 'yearly';
+type Mode = 'automatic' | 'remind' | 'never';
 
 interface RecurringTemplate {
   id: string;
@@ -40,6 +64,11 @@ interface RecurringTemplate {
   isActive: boolean;
   template: Record<string, unknown> & { __options?: { autoEnter?: boolean } };
   createdAt: string;
+  mode?: Mode;
+  groupName?: string | null;
+  remaining?: number | null;
+  daysInAdvance?: number;
+  lastRunAt?: string | null;
 }
 
 interface GeneratedDoc {
@@ -78,7 +107,7 @@ interface AccountOption {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DOC_TYPE_OPTIONS: { value: DocType; label: string }[] = [
+const DOC_TYPE_OPTIONS: { value: BuildableDocType; label: string }[] = [
   { value: 'invoice', label: 'Invoice' },
   { value: 'bill', label: 'Bill' },
   { value: 'journal_entry', label: 'Journal Entry' },
@@ -86,10 +115,35 @@ const DOC_TYPE_OPTIONS: { value: DocType; label: string }[] = [
 ];
 
 const FREQUENCY_OPTIONS: { value: Frequency; label: string }[] = [
+  { value: 'daily', label: 'Daily' },
   { value: 'weekly', label: 'Weekly' },
+  { value: 'biweekly', label: 'Every two weeks' },
+  { value: 'every_four_weeks', label: 'Every four weeks' },
+  { value: 'semimonthly', label: 'Twice a month' },
   { value: 'monthly', label: 'Monthly' },
+  { value: 'bimonthly', label: 'Every two months' },
   { value: 'quarterly', label: 'Quarterly' },
+  { value: 'semiannually', label: 'Twice a year' },
   { value: 'yearly', label: 'Yearly' },
+  { value: 'never', label: 'No schedule' },
+];
+
+const FREQUENCY_LABEL: Record<Frequency, string> = Object.fromEntries(
+  FREQUENCY_OPTIONS.map((o) => [o.value, o.label]),
+) as Record<Frequency, string>;
+
+const MODE_OPTIONS: { value: Mode; label: string; help: string }[] = [
+  {
+    value: 'automatic',
+    label: 'Automate entry',
+    help: 'Entered for you on schedule (by "Run Due Now" or when the app starts).',
+  },
+  {
+    value: 'remind',
+    label: 'Add to my Reminders list',
+    help: "Never entered automatically: it shows on Reminders until you choose Enter Now.",
+  },
+  { value: 'never', label: "Don't remind me", help: 'Kept on the list; entered only when you choose Enter Now.' },
 ];
 
 const DOC_BADGES: Record<DocType, { label: string; tone: 'neutral' | 'success' | 'warning' | 'danger' | 'info' }> = {
@@ -97,6 +151,12 @@ const DOC_BADGES: Record<DocType, { label: string; tone: 'neutral' | 'success' |
   bill: { label: 'Bill', tone: 'warning' },
   journal_entry: { label: 'Journal Entry', tone: 'info' },
   expense: { label: 'Expense', tone: 'neutral' },
+  check: { label: 'Check', tone: 'neutral' },
+  sales_receipt: { label: 'Sales Receipt', tone: 'success' },
+  credit_memo: { label: 'Credit Memo', tone: 'warning' },
+  deposit: { label: 'Deposit', tone: 'info' },
+  transfer: { label: 'Transfer', tone: 'info' },
+  purchase_order: { label: 'Purchase Order', tone: 'neutral' },
 };
 
 // ---------------------------------------------------------------------------
@@ -107,8 +167,96 @@ function todayIso(): string {
   return new Date().toISOString().split('T')[0];
 }
 
-function autoEnterOf(tpl: RecurringTemplate): boolean {
-  return tpl.template?.__options?.autoEnter !== false;
+function modeOf(tpl: RecurringTemplate): Mode {
+  if (tpl.mode) return tpl.mode;
+  return tpl.template?.__options?.autoEnter === false ? 'remind' : 'automatic';
+}
+
+interface ScheduleValue {
+  frequency: Frequency;
+  nextRunDate: string;
+  mode: Mode;
+  groupName: string;
+  remaining: string;
+  daysInAdvance: string;
+}
+
+/** QB Schedule block: how often, next date, number remaining, days in advance, group. */
+function ScheduleFields({
+  value,
+  onChange,
+  groups,
+}: {
+  value: ScheduleValue;
+  onChange: (patch: Partial<ScheduleValue>) => void;
+  groups?: string[];
+}) {
+  const help = MODE_OPTIONS.find((m) => m.value === value.mode)?.help;
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <Label htmlFor="tpl-mode">How should it be entered?</Label>
+          <Select id="tpl-mode" value={value.mode} onChange={(e) => onChange({ mode: e.target.value as Mode })}>
+            {MODE_OPTIONS.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </Select>
+          {help && <p className="text-[11px] text-navy/40 mt-1">{help}</p>}
+        </div>
+        <div>
+          <Label htmlFor="tpl-group">Group (optional)</Label>
+          <Input
+            id="tpl-group"
+            list="tpl-group-list"
+            placeholder="e.g. Month-end"
+            value={value.groupName}
+            onChange={(e) => onChange({ groupName: e.target.value })}
+          />
+          <datalist id="tpl-group-list">
+            {(groups ?? []).map((g) => (
+              <option key={g} value={g} />
+            ))}
+          </datalist>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <Label htmlFor="tpl-remaining">Number remaining</Label>
+          <Input
+            id="tpl-remaining"
+            inputMode="numeric"
+            placeholder="No limit"
+            value={value.remaining}
+            onChange={(e) => onChange({ remaining: e.target.value.replace(/[^0-9]/g, '') })}
+          />
+          <p className="text-[11px] text-navy/40 mt-1">Leave blank to keep going until you stop it.</p>
+        </div>
+        <div>
+          <Label htmlFor="tpl-days">Days in advance to enter</Label>
+          <Input
+            id="tpl-days"
+            inputMode="numeric"
+            value={value.daysInAdvance}
+            onChange={(e) => onChange({ daysInAdvance: e.target.value.replace(/[^0-9]/g, '') })}
+          />
+        </div>
+      </div>
+    </>
+  );
+}
+
+function scheduleBody(v: ScheduleValue) {
+  return {
+    frequency: v.frequency,
+    nextRunDate: v.nextRunDate,
+    mode: v.mode,
+    groupName: v.groupName.trim() || null,
+    remaining: v.remaining === '' ? null : Number(v.remaining),
+    daysInAdvance: Number(v.daysInAdvance || '0'),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -138,13 +286,9 @@ const EMPTY_INVOICE_LINE: InvoiceLineRow = { description: '', quantity: '1', rat
 const EMPTY_AMOUNT_LINE: AmountLineRow = { accountId: '', description: '', amount: '' };
 const EMPTY_JOURNAL_LINE: JournalLineRow = { accountId: '', memo: '', debit: '', credit: '' };
 
-interface TemplateFormState {
+interface TemplateFormState extends ScheduleValue {
   name: string;
-  docType: DocType;
-  frequency: Frequency;
-  nextRunDate: string;
-  /** 'auto' posts on schedule; 'remind' only surfaces a reminder. */
-  autoEnter: 'auto' | 'remind';
+  docType: BuildableDocType;
   // Invoice
   customerId: string;
   invoiceLines: InvoiceLineRow[];
@@ -167,7 +311,10 @@ const EMPTY_FORM: TemplateFormState = {
   docType: 'invoice',
   frequency: 'monthly',
   nextRunDate: todayIso(),
-  autoEnter: 'auto',
+  mode: 'automatic',
+  groupName: '',
+  remaining: '',
+  daysInAdvance: '0',
   customerId: '',
   invoiceLines: [{ ...EMPTY_INVOICE_LINE }],
   vendorId: '',
@@ -235,6 +382,8 @@ function buildTemplatePayload(form: TemplateFormState): Record<string, unknown> 
 function validateForm(form: TemplateFormState): string | null {
   if (!form.name.trim()) return 'Template name is required';
   if (!form.nextRunDate) return 'Next run date is required';
+  if (form.remaining && !/^\d{1,4}$/.test(form.remaining)) return 'Number remaining must be a whole number';
+  if (!/^\d{1,3}$/.test(form.daysInAdvance || '0')) return 'Days in advance must be a whole number';
 
   if (form.docType === 'invoice') {
     if (!form.customerId) return 'Select a customer for invoice templates';
@@ -438,7 +587,7 @@ function TemplateFormFields({
           <Select
             id="tpl-docType"
             value={form.docType}
-            onChange={(e) => onChange('docType', e.target.value as DocType)}
+            onChange={(e) => onChange('docType', e.target.value as BuildableDocType)}
           >
             {DOC_TYPE_OPTIONS.map((opt) => (
               <option key={opt.value} value={opt.value}>
@@ -474,36 +623,9 @@ function TemplateFormFields({
             required
           />
         </div>
-        <div>
-          <Label>When Due</Label>
-          <div className="flex rounded-lg border border-slate-200 overflow-hidden">
-            {(
-              [
-                { value: 'auto', label: 'Auto-post' },
-                { value: 'remind', label: 'Remind me only' },
-              ] as const
-            ).map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => onChange('autoEnter', opt.value)}
-                className={`flex-1 px-2 py-2 text-xs font-semibold transition-colors ${
-                  form.autoEnter === opt.value
-                    ? 'bg-electric text-white'
-                    : 'bg-white text-navy/50 hover:bg-slate-50'
-                }`}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-          <p className="text-[11px] text-navy/40 mt-1">
-            {form.autoEnter === 'auto'
-              ? 'Posted automatically when "Run Due Now" (or the launch-time runner) finds it due.'
-              : 'Never posted automatically — stays due as a reminder until you click Run Now.'}
-          </p>
-        </div>
       </div>
+
+      <ScheduleFields value={form} onChange={(patch) => setForm((prev) => ({ ...prev, ...patch }))} />
 
       {/* ---- Invoice template ---- */}
       {form.docType === 'invoice' && (
@@ -766,6 +888,26 @@ export default function RecurringPage() {
   const [runNowTarget, setRunNowTarget] = useState<RecurringTemplate | null>(null);
   const [runNowLoading, setRunNowLoading] = useState(false);
 
+  // Edit schedule / delete / enter group
+  const [editTarget, setEditTarget] = useState<RecurringTemplate | null>(null);
+  const [editForm, setEditForm] = useState<ScheduleValue & { name: string; isActive: boolean }>({
+    name: '',
+    isActive: true,
+    frequency: 'monthly',
+    nextRunDate: todayIso(),
+    mode: 'automatic',
+    groupName: '',
+    remaining: '',
+    daysInAdvance: '0',
+  });
+  const [editSaving, setEditSaving] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<RecurringTemplate | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [groupRunning, setGroupRunning] = useState<string | null>(null);
+  const groups = Array.from(
+    new Set(templates.map((t) => t.groupName).filter((g): g is string => !!g)),
+  ).sort();
+
   // ---------------------------------------------------------------------------
   // Data fetching
   // ---------------------------------------------------------------------------
@@ -797,12 +939,16 @@ export default function RecurringPage() {
   async function handleRunDue() {
     setRunning(true);
     try {
-      const result = await api.post<{ generated: GeneratedDoc[]; reminders?: TemplateReminder[] }>(
-        '/api/recurring/run',
-        { asOf: new Date().toISOString() },
-      );
+      const result = await api.post<{
+        generated: GeneratedDoc[];
+        reminders?: TemplateReminder[];
+        failed?: { templateName: string; error: string }[];
+      }>('/api/recurring/run', { asOf: new Date().toISOString() });
       const count = result.generated.length;
       const reminders = result.reminders?.length ?? 0;
+      for (const f of result.failed ?? []) {
+        toast(`"${f.templateName}" could not be entered: ${f.error}`, 'danger');
+      }
       const parts: string[] = [
         count === 0
           ? 'No auto-post templates were due.'
@@ -869,9 +1015,7 @@ export default function RecurringPage() {
       await api.post('/api/recurring', {
         name: addForm.name.trim(),
         docType: addForm.docType,
-        frequency: addForm.frequency,
-        nextRunDate: addForm.nextRunDate,
-        autoEnter: addForm.autoEnter === 'auto',
+        ...scheduleBody(addForm),
         template: buildTemplatePayload(addForm),
       });
       toast('Recurring template created', 'success');
@@ -885,13 +1029,86 @@ export default function RecurringPage() {
   }
 
   // ---------------------------------------------------------------------------
+  // Edit schedule / delete / enter a group
+  // ---------------------------------------------------------------------------
+
+  function openEdit(tpl: RecurringTemplate) {
+    setEditForm({
+      name: tpl.name,
+      isActive: tpl.isActive,
+      frequency: tpl.frequency,
+      nextRunDate: tpl.nextRunDate ? tpl.nextRunDate.slice(0, 10) : todayIso(),
+      mode: modeOf(tpl),
+      groupName: tpl.groupName ?? '',
+      remaining: tpl.remaining === null || tpl.remaining === undefined ? '' : String(tpl.remaining),
+      daysInAdvance: String(tpl.daysInAdvance ?? 0),
+    });
+    setEditTarget(tpl);
+  }
+
+  async function handleEditSave() {
+    if (!editTarget) return;
+    if (!editForm.name.trim()) {
+      toast('Name is required', 'danger');
+      return;
+    }
+    setEditSaving(true);
+    try {
+      await api.patch(`/api/recurring/${editTarget.id}`, {
+        name: editForm.name.trim(),
+        isActive: editForm.isActive,
+        ...scheduleBody(editForm),
+      });
+      toast('Memorized transaction saved', 'success');
+      setEditTarget(null);
+      await fetchTemplates();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to save', 'danger');
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    try {
+      await api.del(`/api/recurring/${deleteTarget.id}`);
+      toast(`Deleted "${deleteTarget.name}"`, 'success');
+      setDeleteTarget(null);
+      await fetchTemplates();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to delete', 'danger');
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  async function handleRunGroup(group: string) {
+    setGroupRunning(group);
+    try {
+      const result = await api.post<{ generated: GeneratedDoc[]; failed?: { templateName: string; error: string }[] }>(
+        '/api/recurring/run',
+        { group },
+      );
+      toast(`Entered ${result.generated.length} transaction(s) from group "${group}"`, 'success');
+      for (const f of result.failed ?? []) toast(`"${f.templateName}" could not be entered: ${f.error}`, 'danger');
+      await fetchTemplates();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to enter the group', 'danger');
+    } finally {
+      setGroupRunning(null);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
-        title="Recurring / Memorized Transactions"
+        title="Memorized Transactions"
         icon={Repeat}
         action={
           <div className="flex items-center gap-3">
@@ -913,6 +1130,30 @@ export default function RecurringPage() {
       />
 
       <RecurringSuggestions onMemorized={fetchTemplates} />
+
+      <p className="mb-4 max-w-3xl text-sm text-navy/60">
+        Transactions you enter again and again. Memorize one from any form with <strong>Memorize</strong> (or
+        Ctrl+M), or build one here. Each entry posts through the normal form, so the books always stay in
+        balance.
+      </p>
+
+      {groups.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <span className="text-sm font-semibold text-navy/60">Groups:</span>
+          {groups.map((g) => (
+            <Button
+              key={g}
+              size="sm"
+              variant="secondary"
+              loading={groupRunning === g}
+              onClick={() => handleRunGroup(g)}
+              title={`Enter every transaction in "${g}" now`}
+            >
+              <Layers className="h-3.5 w-3.5" /> Enter {g}
+            </Button>
+          ))}
+        </div>
+      )}
 
       <Card>
         {loading ? (
@@ -936,9 +1177,11 @@ export default function RecurringPage() {
               <tr>
                 <Th>Name</Th>
                 <Th>Type</Th>
-                <Th>Frequency</Th>
-                <Th>Next Run</Th>
-                <Th>When Due</Th>
+                <Th>Group</Th>
+                <Th>How Often</Th>
+                <Th>Next Date</Th>
+                <Th>How Entered</Th>
+                <Th>Remaining</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
@@ -948,14 +1191,16 @@ export default function RecurringPage() {
                 const badge = DOC_BADGES[tpl.docType] ?? { label: tpl.docType, tone: 'neutral' as const };
                 const isPastDue =
                   tpl.nextRunDate !== null && new Date(tpl.nextRunDate) <= new Date();
-                const auto = autoEnterOf(tpl);
+                const mode = modeOf(tpl);
+                const auto = mode === 'automatic';
                 return (
                   <Tr key={tpl.id}>
                     <Td className="font-semibold text-navy">{tpl.name}</Td>
                     <Td>
                       <Badge tone={badge.tone}>{badge.label}</Badge>
                     </Td>
-                    <Td className="capitalize text-navy/70">{tpl.frequency}</Td>
+                    <Td className="text-navy/70">{tpl.groupName ?? ''}</Td>
+                    <Td className="text-navy/70">{FREQUENCY_LABEL[tpl.frequency] ?? tpl.frequency}</Td>
                     <Td>
                       <span
                         className={
@@ -971,9 +1216,15 @@ export default function RecurringPage() {
                       </span>
                     </Td>
                     <Td>
-                      <Badge tone={auto ? 'info' : 'warning'}>
-                        {auto ? 'Auto-post' : 'Remind only'}
+                      <Badge tone={auto ? 'info' : mode === 'remind' ? 'warning' : 'neutral'}>
+                        {auto ? 'Automatic' : mode === 'remind' ? 'Reminder' : 'Manual'}
                       </Badge>
+                      {(tpl.daysInAdvance ?? 0) > 0 && (
+                        <span className="ml-1 text-xs text-navy/40">{tpl.daysInAdvance}d early</span>
+                      )}
+                    </Td>
+                    <Td className="text-navy/70 tabular-nums">
+                      {tpl.remaining === null || tpl.remaining === undefined ? 'No limit' : tpl.remaining}
                     </Td>
                     <Td>
                       {tpl.isActive ? (
@@ -990,7 +1241,18 @@ export default function RecurringPage() {
                         title="Generate this document now"
                       >
                         <Clock className="h-3.5 w-3.5" />
-                        Run Now
+                        Enter Now
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => openEdit(tpl)} title="Edit the schedule">
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setDeleteTarget(tpl)}
+                        title="Delete this memorized transaction"
+                      >
+                        <Trash2 className="h-3.5 w-3.5 text-red-500" />
                       </Button>
                     </Td>
                   </Tr>
@@ -1027,10 +1289,98 @@ export default function RecurringPage() {
         />
       </Modal>
 
+      {/* ---- Edit schedule modal ---- */}
+      <Modal
+        open={!!editTarget}
+        onClose={() => setEditTarget(null)}
+        title={`Schedule: ${editTarget?.name ?? ''}`}
+        size="lg"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setEditTarget(null)} disabled={editSaving}>
+              Cancel
+            </Button>
+            <Button onClick={handleEditSave} loading={editSaving}>
+              Save
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="edit-name">Name</Label>
+              <Input
+                id="edit-name"
+                value={editForm.name}
+                onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))}
+              />
+            </div>
+            <div className="flex items-end gap-2 pb-2">
+              <input
+                id="edit-active"
+                type="checkbox"
+                checked={editForm.isActive}
+                onChange={(e) => setEditForm((f) => ({ ...f, isActive: e.target.checked }))}
+                className="h-4 w-4"
+              />
+              <Label htmlFor="edit-active" className="mb-0">
+                Active
+              </Label>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="edit-frequency">How often</Label>
+              <Select
+                id="edit-frequency"
+                value={editForm.frequency}
+                onChange={(e) => setEditForm((f) => ({ ...f, frequency: e.target.value as Frequency }))}
+              >
+                {FREQUENCY_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="edit-next">Next date</Label>
+              <Input
+                id="edit-next"
+                type="date"
+                value={editForm.nextRunDate}
+                onChange={(e) => setEditForm((f) => ({ ...f, nextRunDate: e.target.value }))}
+              />
+            </div>
+          </div>
+          <ScheduleFields
+            value={editForm}
+            groups={groups}
+            onChange={(patch) => setEditForm((f) => ({ ...f, ...patch }))}
+          />
+        </div>
+      </Modal>
+
+      <ConfirmDialog
+        open={!!deleteTarget}
+        title="Delete Memorized Transaction"
+        message={
+          <>
+            Delete <strong className="text-navy">&quot;{deleteTarget?.name}&quot;</strong>? Transactions it
+            already entered stay in your books.
+          </>
+        }
+        confirmLabel="Delete"
+        loading={deleting}
+        onConfirm={handleDelete}
+        onClose={() => setDeleteTarget(null)}
+      />
+
       {/* ---- Run Now confirm dialog ---- */}
       <ConfirmDialog
         open={!!runNowTarget}
-        title="Run Template Now"
+        title="Enter Transaction Now"
         message={
           <>
             Generate one{' '}
@@ -1039,7 +1389,8 @@ export default function RecurringPage() {
             </strong>{' '}
             from template{' '}
             <strong className="text-navy">&quot;{runNowTarget?.name}&quot;</strong> immediately?
-            The next run date will be advanced by one {runNowTarget?.frequency} period.
+            The next date moves ahead one period
+            {runNowTarget ? ` (${FREQUENCY_LABEL[runNowTarget.frequency] ?? runNowTarget.frequency})` : ''}.
           </>
         }
         confirmLabel="Yes, Generate Now"

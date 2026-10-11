@@ -21,7 +21,7 @@ import {
   type StatementFormat,
 } from '@/lib/services/statements';
 import { getCompany } from '@/lib/services/company';
-import { renderStatementPdf } from '@/lib/pdf/statement';
+import { buildStatementPdf } from '@/lib/pdf/forms';
 import { ServiceError } from '@/lib/services/_base';
 import { renderOpenItemStatementPdf } from '../openItemPdf';
 
@@ -78,7 +78,7 @@ export async function GET(req: NextRequest) {
       const bytes =
         entry.format === 'open_item'
           ? await renderOpenItemStatementPdf(entry.statement, companyName)
-          : await renderStatementPdf(entry.statement, companyName);
+          : await buildStatementPdf(ctx, entry.statement);
       rendered.push({ name: `statement-${safeName(entry.displayName)}.pdf`, bytes });
     }
 

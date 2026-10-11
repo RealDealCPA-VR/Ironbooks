@@ -29,6 +29,9 @@ import {
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+// wave2 prefs: default terms from Preferences + attachments on the record
+import { usePreferences } from '@/lib/usePreferences';
+import AttachmentPanel from '@/components/AttachmentPanel';
 import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
 
@@ -96,6 +99,7 @@ function balanceTone(balance: string): 'danger' | 'neutral' {
 // ---------------------------------------------------------------------------
 
 function VendorsPageContent() {
+  const prefs = usePreferences();
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -130,7 +134,8 @@ function VendorsPageContent() {
   // ---- Open Add modal ----
   function openAdd() {
     setEditingVendor(null);
-    setForm(EMPTY_FORM);
+    // Preferences > Bills: default terms for new vendors.
+    setForm({ ...EMPTY_FORM, terms: prefs.company.defaultVendorTerms });
     setModalOpen(true);
   }
 
@@ -471,6 +476,7 @@ function VendorsPageContent() {
               className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30 placeholder:text-navy/30 resize-none"
             />
           </div>
+          {editingVendor && <AttachmentPanel entityType="vendor" entityId={editingVendor.id} />}
         </div>
       </Modal>
 

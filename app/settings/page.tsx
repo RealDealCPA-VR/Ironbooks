@@ -11,25 +11,42 @@
  * Keys read by services TODAY: fiscalYearEnd (year-end close, dashboard),
  * currency/timezone (display), closingDate (+password, via its own endpoint).
  * Everything else is a default for NEW documents and is labeled as such.
+ *
+ * wave2 prefs: the full QB category list (Bills, Checking, General, Items & Inventory, Jobs &
+ * Estimates, Multiple Currencies, Payments, Reminders, Reports, Sales Tax, Send Forms, Spelling,
+ * Time & Expenses, Form Templates) renders <PreferencePane> with Company Preferences and My
+ * Preferences; consumers read them through getPreferences / usePreferences (lib/preferences.ts).
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import {
+  Bell,
   BookOpen,
+  Briefcase,
   Building2,
   Calculator,
+  Clock,
+  Coins,
+  CreditCard,
   Database,
   Download,
+  FileText,
+  HandCoins,
   Lock,
+  Mail,
   Package,
+  Percent,
+  PieChart,
   Settings,
   ShoppingCart,
+  SpellCheck,
   Tags,
   Truck,
   Upload,
   Users,
   Wallet,
 } from 'lucide-react';
+import PreferencePane from './PreferencePane';
 import {
   Badge,
   Button,
@@ -167,18 +184,70 @@ const CUSTOM_FIELD_ENTITIES: Array<{ key: CustomFieldEntity; label: string }> = 
   { key: 'invoice', label: 'Invoices' },
 ];
 
+// QB Preferences categories (alphabetical like QB, after Company info). Panes marked in
+// PANE_FOR_TAB render the categorized PreferencePane (Company + My Preferences).
 const TABS = [
   { id: 'company', label: 'Company', icon: Building2 },
   { id: 'accounting', label: 'Accounting', icon: Calculator },
+  { id: 'purchases', label: 'Bills', icon: Truck },
+  { id: 'checking', label: 'Checking', icon: CreditCard },
+  { id: 'general', label: 'General', icon: Settings },
+  { id: 'inventory', label: 'Items & Inventory', icon: Package },
+  { id: 'jobs', label: 'Jobs & Estimates', icon: Briefcase },
+  { id: 'currencies', label: 'Multiple Currencies', icon: Coins },
+  { id: 'payments', label: 'Payments', icon: HandCoins },
+  { id: 'payroll', label: 'Payroll & Employees', icon: Wallet },
+  { id: 'reminders', label: 'Reminders', icon: Bell },
+  { id: 'reports', label: 'Reports & Graphs', icon: PieChart },
   { id: 'sales', label: 'Sales & Customers', icon: ShoppingCart },
-  { id: 'purchases', label: 'Purchases & Vendors', icon: Truck },
-  { id: 'payroll', label: 'Payroll', icon: Wallet },
-  { id: 'inventory', label: 'Inventory', icon: Package },
+  { id: 'salesTax', label: 'Sales Tax', icon: Percent },
+  { id: 'sendForms', label: 'Send Forms', icon: Mail },
+  { id: 'spelling', label: 'Spelling', icon: SpellCheck },
+  { id: 'time', label: 'Time & Expenses', icon: Clock },
+  { id: 'templates', label: 'Form Templates', icon: FileText },
   { id: 'customFields', label: 'Custom Fields', icon: Tags },
   { id: 'users', label: 'Users & Roles', icon: Users },
   { id: 'backup', label: 'Backup', icon: Database },
 ] as const;
 type TabId = (typeof TABS)[number]['id'];
+
+/** Tab → PREFERENCE_CATEGORIES id rendered with <PreferencePane>. */
+const PANE_FOR_TAB: Partial<Record<TabId, string>> = {
+  accounting: 'accounting',
+  purchases: 'bills',
+  checking: 'checking',
+  general: 'general',
+  inventory: 'items',
+  jobs: 'jobs',
+  currencies: 'currencies',
+  payments: 'payments',
+  payroll: 'payroll',
+  reminders: 'reminders',
+  reports: 'reports',
+  sales: 'sales',
+  salesTax: 'salesTax',
+  sendForms: 'sendForms',
+  spelling: 'spelling',
+  time: 'time',
+};
+
+/** Company keys the original panes on this page already edit (not repeated in PreferencePane). */
+const LEGACY_PANE_KEYS = [
+  'currency',
+  'fiscalYearEnd',
+  'timezone',
+  'accountNumbersEnabled',
+  'reportBasis',
+  'defaultCustomerTerms',
+  'defaultInvoiceMemo',
+  'defaultVendorTerms',
+  'defaultExpenseAccountId',
+  'payrollPayPeriod',
+  'payrollStandardHours',
+  'payrollExpenseAccountId',
+  'payrollLiabilityAccountId',
+  'negativeStockWarning',
+];
 
 const FYE_RE = /^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 
@@ -1022,6 +1091,28 @@ export default function SettingsPage() {
                     </div>
                   </Link>
                 </div>
+              </Card>
+            )}
+
+            {/* ── Categorized QB preferences (Company + My Preferences) ───────── */}
+            {PANE_FOR_TAB[tab] && (
+              <PreferencePane categoryId={PANE_FOR_TAB[tab]!} accounts={accounts} exclude={LEGACY_PANE_KEYS} />
+            )}
+
+            {tab === 'templates' && (
+              <Card className="p-8">
+                <h2 className="text-lg font-bold text-navy mb-1">Form Templates</h2>
+                <p className="text-sm text-navy/50 mb-6">
+                  Design how invoices, estimates, sales receipts, credit memos, sales orders, purchase orders
+                  and statements look when printed or emailed: logo, colors, fonts, which fields and columns
+                  show, and your own header and footer text.
+                </p>
+                <Link
+                  href="/templates"
+                  className="inline-flex items-center gap-2 rounded-xl bg-electric px-4 py-2 text-sm font-semibold text-white hover:bg-electric/90"
+                >
+                  <FileText className="h-4 w-4" /> Open the template designer
+                </Link>
               </Card>
             )}
 

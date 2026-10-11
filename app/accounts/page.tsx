@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+// wave2 prefs: Accounting > "Use account numbers" shows/hides the number column.
+import { usePreferences } from '@/lib/usePreferences';
 import { BookOpen, Plus, Trash2, Pencil, ChevronDown, ChevronRight, CornerDownRight, Download } from 'lucide-react';
 import {
   Button,
@@ -423,13 +425,16 @@ interface AccountRowProps {
 function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
   const hasChildren = node.children.length > 0;
   const rolledUp = subtotal(node);
+  const showNumbers = usePreferences().company.accountNumbersEnabled;
 
   return (
     <>
       <Tr key={node.id} className={node.isActive ? '' : 'opacity-60'}>
-        <Td>
-          <span className="font-mono text-xs text-navy/60">{node.code}</span>
-        </Td>
+        {showNumbers && (
+          <Td>
+            <span className="font-mono text-xs text-navy/60">{node.code}</span>
+          </Td>
+        )}
         <Td>
           <span
             className="flex items-center gap-1.5"
@@ -501,6 +506,7 @@ interface AccountGroupProps {
 function AccountGroup({ type, roots, onDeactivate, onEdit }: AccountGroupProps) {
   const [collapsed, setCollapsed] = useState(false);
   const label = TYPE_LABELS[type];
+  const prefs = usePreferences();
 
   // Group total = sum of every account in the type (roots + all descendants).
   const all = flattenTree(roots);
@@ -531,7 +537,7 @@ function AccountGroup({ type, roots, onDeactivate, onEdit }: AccountGroupProps) 
         <Table>
           <thead>
             <tr>
-              <Th className="w-24">Code</Th>
+              {prefs.company.accountNumbersEnabled && <Th className="w-24">Code</Th>}
               <Th>Name</Th>
               <Th>Subtype</Th>
               <Th numeric>Balance</Th>

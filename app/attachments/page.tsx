@@ -1,7 +1,13 @@
 'use client';
 
 /**
- * Attachments page — attach receipts and files to any entity (invoice, bill, expense, etc.).
+ * Doc Center (QB Company > Documents > Doc Center): every document in the company file.
+ *  - Inbox: files dropped here wait, unattached, until you file them to a record.
+ *  - All documents: search by file name or description.
+ *  - By record: the original record-centric view below.
+ * Files are stored locally in the company data directory; nothing is uploaded anywhere.
+ *
+ * By record — attach receipts and files — attach receipts and files to any entity (invoice, bill, expense, etc.).
  *
  * UX:
  *  1. User picks an entity type, then picks the actual record from a searchable list
@@ -14,7 +20,8 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Paperclip, Upload, Trash2, Download } from 'lucide-react';
+import { Paperclip, Upload, Trash2, Download, Inbox, Search, FolderInput } from 'lucide-react';
+import { uploadFiles } from '@/components/AttachmentPanel';
 import {
   Button,
   Card,
@@ -41,8 +48,9 @@ import { formatDate } from '@/lib/utils';
 
 interface Attachment {
   id: string;
-  entityType: string;
-  entityId: string;
+  entityType: string | null;
+  entityId: string | null;
+  description?: string | null;
   filename: string;
   mimeType: string | null;
   sizeBytes: number | null;
@@ -171,7 +179,7 @@ function readFileAsBase64(file: File): Promise<string> {
 // Page component
 // ---------------------------------------------------------------------------
 
-export default function AttachmentsPage() {
+function ByRecordView() {
   // Entity picker state
   const [entityType, setEntityType] = useState<string>(ENTITY_TYPES[0].value);
   const [entityId, setEntityId] = useState<string>('');
@@ -339,9 +347,7 @@ export default function AttachmentsPage() {
   // ---------------------------------------------------------------------------
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Attachments" icon={Paperclip} />
-
+    <div>
       {/* ---- Entity picker ---- */}
       <Card className="p-6 mb-6 max-w-2xl">
         <h2 className="text-base font-bold text-navy mb-4">Find attachments for a record</h2>
@@ -516,6 +522,351 @@ export default function AttachmentsPage() {
         onConfirm={doDelete}
         onClose={() => setPendingDelete(null)}
       />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Doc Center: inbox + all documents + filing
+// ---------------------------------------------------------------------------
+
+/** Pick a record of a given type (same sources as the By record view). */
+function useRecords(entityType: string) {
+  const [records, setRecords] = useState<RecordOption[]>([]);
+  const [loading, setLoading] = useState(false);
+  useEffect(() => {
+    const source = ENTITY_TYPES.find((t) => t.value === entityType)?.source;
+    setRecords([]);
+    if (!source) return;
+    let cancelled = false;
+    setLoading(true);
+    api
+      .get<unknown>(source.url)
+      .then((data) => {
+        if (cancelled) return;
+        setRecords(
+          source
+            .rows(data)
+            .filter((r) => typeof r.id === 'string')
+            .map((r) => ({ id: r.id as string, label: source.label(r) })),
+        );
+      })
+      .catch(() => {})
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [entityType]);
+  return { records, loading };
+}
+
+function FileToRecord({ doc, onDone }: { doc: Attachment; onDone: () => void }) {
+  const filable = ENTITY_TYPES.filter((t) => t.source);
+  const [type, setType] = useState(filable[0].value);
+  const [recordId, setRecordId] = useState('');
+  const { records, loading } = useRecords(type);
+  const [saving, setSaving] = useState(false);
+
+  async function file() {
+    if (!recordId) return;
+    setSaving(true);
+    try {
+      await api.patch(`/api/attachments/${doc.id}`, { entityType: type, entityId: recordId });
+      toast(`Filed ${doc.filename}`, 'success');
+      onDone();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not file the document', 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Select aria-label="Record type" value={type} onChange={(e) => { setType(e.target.value); setRecordId(''); }} className="w-36">
+        {filable.map((t) => (
+          <option key={t.value} value={t.value}>
+            {t.label}
+          </option>
+        ))}
+      </Select>
+      <Select aria-label="Record" value={recordId} onChange={(e) => setRecordId(e.target.value)} className="w-56" disabled={loading}>
+        <option value="">{loading ? 'Loading…' : 'Pick a record…'}</option>
+        {records.map((r) => (
+          <option key={r.id} value={r.id}>
+            {r.label}
+          </option>
+        ))}
+      </Select>
+      <Button size="sm" onClick={() => void file()} disabled={!recordId} loading={saving}>
+        <FolderInput className="h-3.5 w-3.5" /> File
+      </Button>
+    </div>
+  );
+}
+
+function InboxView() {
+  const [docs, setDocs] = useState<Attachment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setDocs(await api.get<Attachment[]>('/api/attachments?unfiled=1'));
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not load the inbox', 'danger');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function add(files: File[]) {
+    if (files.length === 0) return;
+    setUploading(true);
+    const saved = await uploadFiles(files, null);
+    setUploading(false);
+    if (saved.length) {
+      toast(`Added ${saved.length} document${saved.length === 1 ? '' : 's'} to the inbox`, 'success');
+      await load();
+    }
+  }
+
+  async function remove(d: Attachment) {
+    if (!window.confirm(`Delete ${d.filename}? This cannot be undone.`)) return;
+    try {
+      await api.del(`/api/attachments/${d.id}`);
+      await load();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Delete failed', 'danger');
+    }
+  }
+
+  async function describe(d: Attachment) {
+    const description = window.prompt('Description or keywords for this document', d.description ?? '');
+    if (description === null) return;
+    try {
+      await api.patch(`/api/attachments/${d.id}`, { description });
+      await load();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not save the description', 'danger');
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          void add(Array.from(e.dataTransfer.files ?? []));
+        }}
+        className={`flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed p-8 text-center ${dragOver ? 'border-electric bg-electric/5' : 'border-slate-300 bg-white/60'}`}
+      >
+        <Upload className="h-6 w-6 text-electric" />
+        <p className="text-sm text-navy">Drag receipts, bills and other documents here</p>
+        <p className="text-xs text-navy/50">They wait in the inbox until you file them to an invoice, bill, customer…</p>
+        <Button size="sm" variant="secondary" loading={uploading} onClick={() => inputRef.current?.click()}>
+          Browse files
+        </Button>
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            void add(Array.from(e.target.files ?? []));
+            e.target.value = '';
+          }}
+        />
+      </div>
+
+      <Card>
+        {loading ? (
+          <div className="flex justify-center p-8 text-electric">
+            <Spinner className="h-5 w-5" />
+          </div>
+        ) : docs.length === 0 ? (
+          <EmptyState icon={Inbox} title="Inbox is empty" message="Documents you add here without a record wait for you to file them." />
+        ) : (
+          <Table>
+            <thead>
+              <tr>
+                <Th>Document</Th>
+                <Th>Added</Th>
+                <Th>Size</Th>
+                <Th>File it to</Th>
+                <Th className="text-right">Actions</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {docs.map((d) => (
+                <Tr key={d.id}>
+                  <Td>
+                    <button type="button" className="text-left font-semibold text-navy hover:text-electric" onClick={() => void describe(d)} title="Add a description">
+                      {d.filename}
+                    </button>
+                    {d.description && (
+                      <p className="text-xs text-navy/50">{d.description}</p>
+                    )}
+                  </Td>
+                  <Td className="text-navy/60">{formatDate(d.createdAt)}</Td>
+                  <Td className="text-navy/60">{formatBytes(d.sizeBytes)}</Td>
+                  <Td>
+                    <FileToRecord doc={d} onDone={() => void load()} />
+                  </Td>
+                  <Td className="text-right whitespace-nowrap">
+                    <a href={`/api/attachments/${d.id}`} className="mr-2 inline-flex items-center text-electric" title="Download">
+                      <Download className="h-4 w-4" />
+                    </a>
+                    <button type="button" onClick={() => void remove(d)} className="inline-flex items-center text-red-500" title="Delete">
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function AllDocsView() {
+  const [q, setQ] = useState('');
+  const [docs, setDocs] = useState<Attachment[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async (query: string) => {
+    setLoading(true);
+    try {
+      setDocs(await api.get<Attachment[]>(`/api/attachments?all=1&q=${encodeURIComponent(query)}`));
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not load documents', 'danger');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => void load(q), 250);
+    return () => clearTimeout(t);
+  }, [q, load]);
+
+  async function unfile(d: Attachment) {
+    try {
+      await api.patch(`/api/attachments/${d.id}`, { entityType: null, entityId: null });
+      await load(q);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not move the document', 'danger');
+    }
+  }
+
+  return (
+    <Card>
+      <div className="flex items-center gap-2 border-b border-slate-100 p-4">
+        <Search className="h-4 w-4 text-navy/40" />
+        <Input aria-label="Search documents" placeholder="Search by file name or description" value={q} onChange={(e) => setQ(e.target.value)} />
+      </div>
+      {loading ? (
+        <div className="flex justify-center p-8 text-electric">
+          <Spinner className="h-5 w-5" />
+        </div>
+      ) : docs.length === 0 ? (
+        <EmptyState icon={Paperclip} title="No documents" message="Nothing matches." />
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>Document</Th>
+              <Th>Attached to</Th>
+              <Th>Added</Th>
+              <Th>Size</Th>
+              <Th className="text-right">Actions</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {docs.map((d) => (
+              <Tr key={d.id}>
+                <Td className="font-semibold text-navy">{d.filename}</Td>
+                <Td>
+                  {d.entityType ? (
+                    <Badge tone="info">{ENTITY_TYPES.find((t) => t.value === d.entityType)?.label ?? d.entityType.replace(/_/g, ' ')}</Badge>
+                  ) : (
+                    <Badge tone="neutral">Inbox</Badge>
+                  )}
+                </Td>
+                <Td className="text-navy/60">{formatDate(d.createdAt)}</Td>
+                <Td className="text-navy/60">{formatBytes(d.sizeBytes)}</Td>
+                <Td className="text-right whitespace-nowrap">
+                  <a href={`/api/attachments/${d.id}`} className="mr-2 inline-flex items-center text-electric" title="Download">
+                    <Download className="h-4 w-4" />
+                  </a>
+                  {d.entityType && (
+                    <Button size="sm" variant="ghost" onClick={() => void unfile(d)} title="Move back to the inbox">
+                      Unfile
+                    </Button>
+                  )}
+                </Td>
+              </Tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+    </Card>
+  );
+}
+
+const DOC_TABS = [
+  { id: 'inbox', label: 'Inbox', icon: Inbox },
+  { id: 'all', label: 'All documents', icon: Search },
+  { id: 'record', label: 'By record', icon: Paperclip },
+] as const;
+
+export default function DocCenterPage() {
+  const [tab, setTab] = useState<(typeof DOC_TABS)[number]['id']>('inbox');
+
+  // Deep links (?entityType=&entityId=) open the record view directly.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('entityId')) setTab('record');
+  }, []);
+
+  return (
+    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+      <PageHeader title="Doc Center" icon={Paperclip} />
+      <div className="mb-6 flex gap-1 rounded-xl border border-slate-200 bg-white/70 p-1 w-fit" role="tablist">
+        {DOC_TABS.map((t) => {
+          const Icon = t.icon;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={tab === t.id}
+              onClick={() => setTab(t.id)}
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-semibold ${tab === t.id ? 'bg-electric text-white' : 'text-navy/60 hover:bg-electric/10'}`}
+            >
+              <Icon className="h-4 w-4" /> {t.label}
+            </button>
+          );
+        })}
+      </div>
+      {tab === 'inbox' && <InboxView />}
+      {tab === 'all' && <AllDocsView />}
+      {tab === 'record' && <ByRecordView />}
     </main>
   );
 }

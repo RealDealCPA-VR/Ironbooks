@@ -12,8 +12,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { customerStatement } from '@/lib/services/statements';
-import { getCompany } from '@/lib/services/company';
-import { renderStatementPdf } from '@/lib/pdf/statement';
+import { buildStatementPdf } from '@/lib/pdf/forms';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
@@ -47,10 +46,8 @@ export async function GET(req: NextRequest) {
 
     const statement = await customerStatement(ctx, customerId, range);
 
-    const company = await getCompany(ctx);
-    const companyName = company?.name ?? 'Your Company';
-
-    const pdfBytes = await renderStatementPdf(statement, companyName);
+    // Printed with the statement form template (Templates) and the company letterhead.
+    const pdfBytes = await buildStatementPdf(ctx, statement);
 
     const buffer = pdfBytes.buffer.slice(
       pdfBytes.byteOffset,

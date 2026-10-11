@@ -815,18 +815,31 @@ export const recurringTemplates = pgTable('recurring_templates', {
   template: jsonb('template').$type<Record<string, unknown>>().notNull(),
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+  // wave2 prefs (QB Memorized Transaction List depth): group, how often to remind,
+  // number remaining, days in advance to enter, last time it was entered.
+  groupName: varchar('group_name', { length: 100 }),
+  /** 'automatic' (enter on schedule) | 'remind' (Reminders list) | 'never' (manual only). */
+  mode: varchar('mode', { length: 20 }).notNull().default('automatic'),
+  /** Number of entries left; null = unlimited. Deactivates the template when it reaches 0. */
+  remaining: integer('remaining'),
+  /** Enter (or remind) this many days before the scheduled date. */
+  daysInAdvance: integer('days_in_advance').notNull().default(0),
+  lastRunAt: timestamp('last_run_at'),
 });
 
 // ---- Attachments / document store ----
 export const attachments = pgTable('attachments', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
-  entityType: varchar('entity_type', { length: 100 }).notNull(),
-  entityId: uuid('entity_id').notNull(),
+  /** Null (with entityId) = unfiled: sitting in the Doc Center inbox (wave2 prefs). */
+  entityType: varchar('entity_type', { length: 100 }),
+  entityId: uuid('entity_id'),
   filename: varchar('filename', { length: 255 }).notNull(),
   storagePath: text('storage_path').notNull(),
   mimeType: varchar('mime_type', { length: 100 }),
   sizeBytes: integer('size_bytes'),
+  /** Doc Center description / keywords (wave2 prefs). */
+  description: text('description'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1626,4 +1639,89 @@ export const itemReceiptBillLines = pgTable('item_receipt_bill_lines', {
   layerAdjustments: jsonb('layer_adjustments').$type<Array<Record<string, string>>>(),
   writtenOff: boolean('written_off').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- wave2 prefs ----
+
+/** "My Preferences": per-user preferences inside one company file (QB Preferences > My Preferences). */
+export const userPreferences = pgTable('user_preferences', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+  prefs: jsonb('prefs').$type<Record<string, unknown>>().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Form templates (QB "Templates" list + Layout Designer): one row per named template. */
+export const formTemplates = pgTable('form_templates', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** invoice | estimate | sales_receipt | credit_memo | sales_order | purchase_order | statement */
+  formType: varchar('form_type', { length: 30 }).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  isDefault: boolean('is_default').notNull().default(false),
+  isActive: boolean('is_active').notNull().default(true),
+  /** Layout: colors, font, title, header/footer text, field + column visibility and labels. */
+  design: jsonb('design').$type<Record<string, unknown>>().notNull(),
+  /** Logo image stored locally in the company file via the attachments store. */
+  logoAttachmentId: uuid('logo_attachment_id'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** To-dos (QB To Do List / Lead Center tasks): calls, meetings, tasks, emails. */
+export const todos = pgTable('todos', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  userId: uuid('user_id').references(() => users.id),
+  title: varchar('title', { length: 255 }).notNull(),
+  notes: text('notes'),
+  /** call | meeting | task | email */
+  kind: varchar('kind', { length: 20 }).notNull().default('task'),
+  /** low | medium | high */
+  priority: varchar('priority', { length: 10 }).notNull().default('medium'),
+  /** 'YYYY-MM-DD' (calendar day, no time zone shift). */
+  dueDate: varchar('due_date', { length: 10 }),
+  dueTime: varchar('due_time', { length: 5 }),
+  done: boolean('done').notNull().default(false),
+  doneAt: timestamp('done_at'),
+  /** Optional link: customer | vendor | employee | lead */
+  entityType: varchar('entity_type', { length: 30 }),
+  entityId: uuid('entity_id'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Lead Center: prospects tracked before they become customers. */
+export const leads = pgTable('leads', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  companyName: varchar('company_name', { length: 255 }),
+  /** hot | warm | cold */
+  status: varchar('status', { length: 10 }).notNull().default('warm'),
+  email: varchar('email', { length: 255 }),
+  phone: varchar('phone', { length: 50 }),
+  website: varchar('website', { length: 255 }),
+  address: jsonb('address').$type<Record<string, string>>(),
+  /** [{ name, title, email, phone }] */
+  contacts: jsonb('contacts').$type<Array<Record<string, string>>>(),
+  notes: text('notes'),
+  convertedCustomerId: uuid('converted_customer_id').references(() => customers.id),
+  convertedAt: timestamp('converted_at'),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Custom letter templates (QB "Prepare Letters with Envelopes"), listed beside the built-ins. */
+export const letterTemplates = pgTable('letter_templates', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** collection | customer | vendor | employee | lead | other */
+  category: varchar('category', { length: 20 }).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  body: text('body').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });

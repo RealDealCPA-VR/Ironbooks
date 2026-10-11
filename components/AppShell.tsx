@@ -6,6 +6,8 @@ import CommandPalette from './CommandPalette';
 import AssistantPanel from './AssistantPanel';
 import { filterNavGroups, navGroups, paletteDestinations } from '@/lib/nav';
 import { useMe } from '@/lib/usePermissions';
+import { usePreferences } from '@/lib/usePreferences';
+import { featureHiddenPaths } from '@/lib/preferences';
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
@@ -286,9 +288,16 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const [company, setCompany] = React.useState<CompanyRow | null>(null);
   // Users & Roles: hide sidebar entries the user's roles can't use (cosmetic; server enforces).
   const { me } = useMe(!bare);
+  // Preferences: features turned off (estimates, sales orders, POs, inventory, time, currencies,
+  // sales tax) drop out of the sidebar like QB's menus. Cosmetic; pages still work.
+  const prefs = usePreferences(!bare);
+  const hiddenPaths = React.useMemo(() => featureHiddenPaths(prefs.company), [prefs.company]);
   const visibleGroups = React.useMemo(
-    () => filterNavGroups(navGroups, me?.permissions),
-    [me?.permissions],
+    () =>
+      filterNavGroups(navGroups, me?.permissions)
+        .map((g) => ({ ...g, links: g.links.filter((l) => !hiddenPaths.has(l.path)) }))
+        .filter((g) => g.links.length > 0),
+    [me?.permissions, hiddenPaths],
   );
   const [assistantOpen, setAssistantOpen] = React.useState(false);
   const closeAssistant = React.useCallback(() => setAssistantOpen(false), []);

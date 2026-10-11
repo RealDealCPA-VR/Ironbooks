@@ -1,30 +1,34 @@
 /**
- * GET  /api/attachments?entityType=&entityId=  — list attachments for an entity.
- * POST /api/attachments                         — upload a new attachment (base64 encoded).
+ * Doc Center.
+ * GET  /api/attachments?entityType=&entityId=  — documents attached to one record
+ * GET  /api/attachments?unfiled=1              — the inbox (documents not attached to anything)
+ * GET  /api/attachments?all=1[&q=text]         — every document, optionally searched by name/description
+ * POST /api/attachments                        — upload { filename, mimeType, base64, description?,
+ *                                                entityType?, entityId? } (omit both to leave it unfiled)
+ * Files are stored locally in the company data directory.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { listAttachments, saveAttachment } from '@/lib/services/attachments';
-import { ServiceError } from '@/lib/services/_base';
-
-function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
-  }
-  console.error('[attachments] unexpected error:', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-}
+import {
+  listAttachments,
+  listUnfiledAttachments,
+  saveAttachment,
+  searchAttachments,
+} from '@/lib/services/attachments';
+import { routeError } from '@/lib/routeErrors';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { uploadAttachmentSchema } from '@/lib/validation/prefs';
 
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const { searchParams } = req.nextUrl;
+    if (searchParams.get('unfiled') === '1') {
+      return NextResponse.json(await listUnfiledAttachments(ctx));
+    }
+    if (searchParams.get('all') === '1') {
+      return NextResponse.json(await searchAttachments(ctx, { q: searchParams.get('q') ?? undefined }));
+    }
     const entityType = searchParams.get('entityType') ?? '';
     const entityId = searchParams.get('entityId') ?? '';
 
@@ -38,27 +42,26 @@ export async function GET(req: NextRequest) {
     const list = await listAttachments(ctx, { entityType, entityId });
     return NextResponse.json(list);
   } catch (err) {
-    return errorResponse(err);
+    return routeError(err, 'GET /api/attachments');
   }
 }
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    const { entityType, entityId, filename, mimeType, base64 } = body ?? {};
-
-    if (!entityType || !entityId || !filename || !base64) {
-      return NextResponse.json(
-        { error: 'entityType, entityId, filename, and base64 are required', code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-
-    const row = await saveAttachment(ctx, { entityType, entityId, filename, mimeType, base64 });
+    const parsed = uploadAttachmentSchema.safeParse(await req.json().catch(() => ({})));
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    const { entityType, entityId, filename, mimeType, base64, description } = parsed.data;
+    const row = await saveAttachment(ctx, {
+      entityType: entityType ?? null,
+      entityId: entityId ?? null,
+      filename,
+      mimeType: mimeType ?? 'application/octet-stream',
+      base64,
+      description: description ?? null,
+    });
     return NextResponse.json(row, { status: 201 });
   } catch (err) {
-    return errorResponse(err);
+    return routeError(err, 'POST /api/attachments');
   }
 }

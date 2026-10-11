@@ -2,7 +2,8 @@
  * POST /api/recurring/run    — run all due templates as of a given date
  *   Body: { asOf?: string }  — ISO date string; defaults to now
  *
- * POST /api/recurring/run    — also supports { id: string } to run a single template immediately
+ * POST /api/recurring/run    — also supports { id: string, date? } to run a single template immediately
+ *                              and { group: string } to enter a whole memorized group
  */
 import { timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
@@ -10,7 +11,7 @@ import { asc } from 'drizzle-orm';
 import { getServerContext } from '@/lib/context';
 import { getDb } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
-import { runDue, runTemplateNow } from '@/lib/services/recurring';
+import { runDue, runGroup, runTemplateNow } from '@/lib/services/recurring';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { runRecurringSchema } from '@/lib/validation/recurring';
@@ -70,8 +71,13 @@ export async function POST(req: NextRequest) {
 
     // If an explicit template id is provided, run just that one immediately.
     if (parsed.data.id) {
-      const doc = await runTemplateNow(ctx, parsed.data.id);
-      return NextResponse.json({ generated: [doc], reminders: [] });
+      const doc = await runTemplateNow(ctx, parsed.data.id, parsed.data.date ?? undefined);
+      return NextResponse.json({ generated: [doc], reminders: [], failed: [] });
+    }
+    // A memorized group: enter every template in it now.
+    if (parsed.data.group) {
+      const result = await runGroup(ctx, parsed.data.group);
+      return NextResponse.json({ ...result, reminders: [] });
     }
 
     // Otherwise run all due templates up to asOf. Auto-enter templates post;

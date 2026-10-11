@@ -49,6 +49,7 @@ import {
 import { getPayrollItemsByIds, type PayrollItem } from './payrollItems';
 import { sickVacationBalances } from './payrollReports';
 import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll } from './timeTracking';
+import { getPreferences } from './preferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -172,6 +173,28 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
+}
+
+/**
+ * Preferences > Payroll & Employees / Checking may name the wages expense, payroll liabilities
+ * and paycheck bank accounts. Use the preferred account when it is an active account of this
+ * company; otherwise fall back to the standard chart-of-accounts code.
+ */
+async function preferredAccountId(
+  ctx: ServiceContext,
+  preferredId: string | null,
+  fallbackCode: string,
+): Promise<string> {
+  if (preferredId) {
+    const [row] = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(
+        and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, preferredId), eq(accounts.isActive, true)),
+      );
+    if (row) return row.id;
+  }
+  return accountIdByCode(ctx, fallbackCode);
 }
 
 // ---------------------------------------------------------------------------
@@ -762,9 +785,10 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
   }
 
   // --- Resolve GL accounts ---
-  const payrollExpenseId = await accountIdByCode(ctx, '6500'); // Payroll Expense
-  const payrollLiabId = await accountIdByCode(ctx, '2300');    // Payroll Liabilities
-  const checkingId = await accountIdByCode(ctx, '1000');       // Checking
+  const payPrefs = await getPreferences(ctx);
+  const payrollExpenseId = await preferredAccountId(ctx, payPrefs.payrollExpenseAccountId, '6500'); // Payroll Expense
+  const payrollLiabId = await preferredAccountId(ctx, payPrefs.payrollLiabilityAccountId, '2300'); // Payroll Liabilities
+  const checkingId = await preferredAccountId(ctx, payPrefs.defaultPaycheckAccountId, '1000'); // Checking
 
   // Employer payroll taxes post to 6510 Payroll Tax Expense when the company has one,
   // otherwise fall back to 6500 Payroll Expense (the default COA has no 6510).

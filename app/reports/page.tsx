@@ -1,5 +1,7 @@
 'use client';
 
+// wave2 prefs: default report basis
+import { usePreferences } from '@/lib/usePreferences';
 import Link from 'next/link';
 import {
   BarChart2,
@@ -45,9 +47,17 @@ interface ReportCardProps {
   description: string;
 }
 
+/** Preferences > Reports: "Default report basis" opens these reports on their cash variant. */
+const CASH_VARIANT: Record<string, string> = {
+  '/reports/profit-loss': '/reports/profit-loss-cash',
+  '/reports/balance-sheet': '/reports/balance-sheet-cash',
+};
+
 function ReportCard({ href, icon: Icon, name, description }: ReportCardProps) {
+  const basis = usePreferences().company.reportBasis;
+  const target = basis === 'cash' ? (CASH_VARIANT[href] ?? href) : href;
   return (
-    <Link href={href} className="group focus:outline-none">
+    <Link href={target} className="group focus:outline-none">
       <Card className="flex items-start gap-4 p-5 transition-all duration-150 hover:shadow-2xl hover:border-electric/40 group-focus:ring-2 group-focus:ring-electric/40 cursor-pointer h-full">
         <div className="flex-shrink-0 rounded-xl bg-electric/10 p-2.5 group-hover:bg-electric/20 transition-colors">
           <Icon className="h-5 w-5 text-electric" />
