@@ -23,10 +23,12 @@ import { recurringTemplates } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
+  inTransaction,
   notFound,
   validation,
   writeAudit,
 } from './_base';
+import { requireEffectivePermission } from './access';
 import { createInvoice, type CreateInvoiceInput } from './invoices';
 import { createBill, type CreateBillInput } from './bills';
 import { createManualEntry, type ManualEntryInput } from './journal';
@@ -268,6 +270,17 @@ export async function getTemplate(ctx: ServiceContext, id: string): Promise<Temp
   return row;
 }
 
+/** Re-read a template inside a transaction and hold its row lock until commit. */
+async function lockTemplate(tx: ServiceContext, id: string): Promise<TemplateRow> {
+  const [row] = await tx.db
+    .select()
+    .from(recurringTemplates)
+    .where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.companyId, tx.companyId)))
+    .for('update');
+  if (!row) throw notFound('Memorized transaction');
+  return row;
+}
+
 // ---------------------------------------------------------------------------
 // Create / update / delete
 // ---------------------------------------------------------------------------
@@ -305,6 +318,18 @@ function parseRunDate(v: string | Date | null | undefined): Date | null {
   return d;
 }
 
+/**
+ * Automatic memorized transactions are posted unattended (at launch and hourly by the desktop
+ * app, or by Run due) through a trusted context, so deciding WHAT gets posted automatically is
+ * as sensitive as running memorized transactions (/api/recurring/run needs Accounting). Lists
+ * permission alone may still rename/regroup any template and edit remind-only or never
+ * templates, which only post when a user with the document's own permission enters them.
+ * Trusted contexts (no `access`) are unrestricted, as everywhere else.
+ */
+async function assertMayAutomate(ctx: ServiceContext): Promise<void> {
+  if (ctx.access) await requireEffectivePermission(ctx, 'accounting', 'create');
+}
+
 export async function createTemplate(ctx: ServiceContext, input: CreateTemplateInput) {
   if (!input.name?.trim()) {
     throw validation('Template name is required.');
@@ -325,117 +350,130 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
     [OPTIONS_KEY]: { autoEnter: mode === 'automatic' },
   };
 
-  const [row] = await ctx.db
-    .insert(recurringTemplates)
-    .values({
-      companyId: ctx.companyId,
-      name: input.name.trim(),
-      docType: input.docType,
-      frequency: input.frequency,
-      nextRunDate,
-      template,
-      isActive: true,
-      mode,
-      groupName: input.groupName?.trim() || null,
-      remaining: input.remaining ?? null,
-      daysInAdvance: input.daysInAdvance ?? 0,
-    })
-    .returning();
+  // The view-only check, the insert and its audit entry commit together: a refused call leaves
+  // nothing behind.
+  return inTransaction(ctx, async (tx) => {
+    if (mode === 'automatic') await assertMayAutomate(tx);
+    const [row] = await tx.db
+      .insert(recurringTemplates)
+      .values({
+        companyId: tx.companyId,
+        name: input.name.trim(),
+        docType: input.docType,
+        frequency: input.frequency,
+        nextRunDate,
+        template,
+        isActive: true,
+        mode,
+        groupName: input.groupName?.trim() || null,
+        remaining: input.remaining ?? null,
+        daysInAdvance: input.daysInAdvance ?? 0,
+      })
+      .returning();
 
-  await writeAudit(ctx, {
-    action: 'create',
-    entityType: 'recurring_template',
-    entityId: row.id,
-    newValues: {
-      name: row.name,
-      docType: row.docType,
-      frequency: row.frequency,
-      mode,
-      autoEnter: mode === 'automatic',
-      groupName: row.groupName,
-      remaining: row.remaining,
-      daysInAdvance: row.daysInAdvance,
-    },
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'recurring_template',
+      entityId: row.id,
+      newValues: {
+        name: row.name,
+        docType: row.docType,
+        frequency: row.frequency,
+        mode,
+        autoEnter: mode === 'automatic',
+        groupName: row.groupName,
+        remaining: row.remaining,
+        daysInAdvance: row.daysInAdvance,
+      },
+    });
+
+    return row;
   });
-
-  return row;
 }
 
 /** Edit a memorized transaction's schedule, options or (re-memorized) payload. */
 export async function updateTemplate(ctx: ServiceContext, id: string, input: UpdateTemplateInput) {
-  const before = await getTemplate(ctx, id);
   checkOptions(input);
-  const patch: Partial<typeof recurringTemplates.$inferInsert> = {};
-  if (input.name !== undefined) {
-    if (!input.name.trim()) throw validation('Template name is required.');
-    patch.name = input.name.trim();
-  }
-  if (input.frequency !== undefined) patch.frequency = input.frequency;
-  if (input.nextRunDate !== undefined) patch.nextRunDate = parseRunDate(input.nextRunDate);
-  if (input.groupName !== undefined) patch.groupName = input.groupName?.trim() || null;
-  if (input.remaining !== undefined) patch.remaining = input.remaining;
-  if (input.daysInAdvance !== undefined) patch.daysInAdvance = input.daysInAdvance;
-  if (input.isActive !== undefined) patch.isActive = input.isActive;
-  const mode = input.mode ?? (before.mode as MemorizedMode);
-  if (input.mode !== undefined) patch.mode = input.mode;
-  if (input.template !== undefined) {
-    if (!input.template || typeof input.template !== 'object' || Array.isArray(input.template)) {
-      throw validation('template payload must be an object.');
+  return inTransaction(ctx, async (tx) => {
+    const before = await lockTemplate(tx, id);
+    const patch: Partial<typeof recurringTemplates.$inferInsert> = {};
+    if (input.name !== undefined) {
+      if (!input.name.trim()) throw validation('Template name is required.');
+      patch.name = input.name.trim();
     }
-    patch.template = { ...payloadOf(input.template), [OPTIONS_KEY]: { autoEnter: mode === 'automatic' } };
-  } else if (input.mode !== undefined) {
-    patch.template = {
-      ...payloadOf(before.template as Record<string, unknown>),
-      [OPTIONS_KEY]: { autoEnter: mode === 'automatic' },
-    };
-  }
-  if (Object.keys(patch).length === 0) return before;
-  const [row] = await ctx.db
-    .update(recurringTemplates)
-    .set(patch)
-    .where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.companyId, ctx.companyId)))
-    .returning();
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'recurring_template',
-    entityId: id,
-    oldValues: {
-      name: before.name,
-      frequency: before.frequency,
-      nextRunDate: before.nextRunDate,
-      mode: before.mode,
-      groupName: before.groupName,
-      remaining: before.remaining,
-      daysInAdvance: before.daysInAdvance,
-      isActive: before.isActive,
-      ...(input.template !== undefined ? { template: before.template } : {}),
-    },
-    newValues: {
-      name: row.name,
-      frequency: row.frequency,
-      nextRunDate: row.nextRunDate,
-      mode: row.mode,
-      groupName: row.groupName,
-      remaining: row.remaining,
-      daysInAdvance: row.daysInAdvance,
-      isActive: row.isActive,
-      ...(input.template !== undefined ? { template: row.template } : {}),
-    },
+    if (input.frequency !== undefined) patch.frequency = input.frequency;
+    if (input.nextRunDate !== undefined) patch.nextRunDate = parseRunDate(input.nextRunDate);
+    if (input.groupName !== undefined) patch.groupName = input.groupName?.trim() || null;
+    if (input.remaining !== undefined) patch.remaining = input.remaining;
+    if (input.daysInAdvance !== undefined) patch.daysInAdvance = input.daysInAdvance;
+    if (input.isActive !== undefined) patch.isActive = input.isActive;
+    const mode = input.mode ?? (before.mode as MemorizedMode);
+    if (input.mode !== undefined) patch.mode = input.mode;
+    if (input.template !== undefined) {
+      if (!input.template || typeof input.template !== 'object' || Array.isArray(input.template)) {
+        throw validation('template payload must be an object.');
+      }
+      patch.template = { ...payloadOf(input.template), [OPTIONS_KEY]: { autoEnter: mode === 'automatic' } };
+    } else if (input.mode !== undefined) {
+      patch.template = {
+        ...payloadOf(before.template as Record<string, unknown>),
+        [OPTIONS_KEY]: { autoEnter: mode === 'automatic' },
+      };
+    }
+    if (Object.keys(patch).length === 0) return before;
+    // Anything that changes what, when or how often an AUTOMATIC template posts (payload, schedule,
+    // remaining, re-activation, switching to automatic) needs Accounting. Rename/regroup is a list edit.
+    const touchesPosting = Object.keys(patch).some((k) => k !== 'name' && k !== 'groupName');
+    if (mode === 'automatic' && touchesPosting) await assertMayAutomate(tx);
+    const [row] = await tx.db
+      .update(recurringTemplates)
+      .set(patch)
+      .where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.companyId, tx.companyId)))
+      .returning();
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'recurring_template',
+      entityId: id,
+      oldValues: {
+        name: before.name,
+        frequency: before.frequency,
+        nextRunDate: before.nextRunDate,
+        mode: before.mode,
+        groupName: before.groupName,
+        remaining: before.remaining,
+        daysInAdvance: before.daysInAdvance,
+        isActive: before.isActive,
+        ...(input.template !== undefined ? { template: before.template } : {}),
+      },
+      newValues: {
+        name: row.name,
+        frequency: row.frequency,
+        nextRunDate: row.nextRunDate,
+        mode: row.mode,
+        groupName: row.groupName,
+        remaining: row.remaining,
+        daysInAdvance: row.daysInAdvance,
+        isActive: row.isActive,
+        ...(input.template !== undefined ? { template: row.template } : {}),
+      },
+    });
+    return row;
   });
-  return row;
 }
 
 /** Delete a memorized transaction (documents it already entered are untouched). */
 export async function deleteTemplate(ctx: ServiceContext, id: string): Promise<void> {
-  const before = await getTemplate(ctx, id);
-  await ctx.db
-    .delete(recurringTemplates)
-    .where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.companyId, ctx.companyId)));
-  await writeAudit(ctx, {
-    action: 'delete',
-    entityType: 'recurring_template',
-    entityId: id,
-    oldValues: { name: before.name, docType: before.docType, frequency: before.frequency },
+  await inTransaction(ctx, async (tx) => {
+    const before = await lockTemplate(tx, id);
+    await tx.db
+      .delete(recurringTemplates)
+      .where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.companyId, tx.companyId)));
+    await writeAudit(tx, {
+      action: 'delete',
+      entityType: 'recurring_template',
+      entityId: id,
+      oldValues: { name: before.name, docType: before.docType, frequency: before.frequency },
+    });
   });
 }
 
@@ -566,6 +604,30 @@ async function recordRun(
   });
 }
 
+/**
+ * Enter one template atomically: lock its row, let `decide` re-check it against the CURRENT
+ * state (an overlapping run may have entered it a moment ago), then create the document and
+ * advance the schedule in the same transaction. Overlapping runs (desktop launch run, hourly
+ * timer, manual Run due / Enter Now / Enter Group) therefore never post the same occurrence
+ * twice, and a document that fails to post (e.g. closed period) leaves the template unchanged.
+ * Returns null when `decide` says the template is no longer due.
+ */
+async function enterLocked(
+  ctx: ServiceContext,
+  id: string,
+  now: Date,
+  decide: (row: TemplateRow) => { runDate: Date; fromDate: Date } | null,
+): Promise<GeneratedDoc | null> {
+  return inTransaction(ctx, async (tx) => {
+    const row = await lockTemplate(tx, id);
+    const plan = decide(row);
+    if (!plan) return null;
+    const doc = await generateFromTemplate(tx, row, plan.runDate);
+    await recordRun(tx, row, plan.fromDate, now, doc.docId);
+    return doc;
+  });
+}
+
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -619,9 +681,17 @@ export async function runDue(
       continue;
     }
     try {
-      const doc = await generateFromTemplate(ctx, template, runDate);
-      generated.push(doc);
-      await recordRun(ctx, template, runDate, asOf, doc.docId);
+      const doc = await enterLocked(ctx, template.id, asOf, (cur) =>
+        cur.isActive &&
+        cur.mode === 'automatic' &&
+        cur.frequency !== 'never' &&
+        cur.remaining !== 0 &&
+        cur.nextRunDate !== null &&
+        cur.nextRunDate.getTime() === runDate.getTime()
+          ? { runDate, fromDate: runDate }
+          : null, // already entered (or changed) by an overlapping run
+      );
+      if (doc) generated.push(doc);
     } catch (err) {
       if (err instanceof ServiceError && err.code === 'FORBIDDEN') throw err;
       failed.push({ templateId: template.id, templateName: template.name, error: errMessage(err) });
@@ -644,13 +714,14 @@ export async function runTemplateNow(
   id: string,
   date?: Date,
 ): Promise<GeneratedDoc> {
-  const template = await getTemplate(ctx, id);
-  if (!template.isActive) throw validation('This memorized transaction is inactive. Make it active to enter it.');
-  if (template.remaining === 0) throw validation('No entries remain for this memorized transaction.');
   const now = new Date();
   const runDate = date ?? now;
-  const doc = await generateFromTemplate(ctx, template, runDate);
-  await recordRun(ctx, template, template.nextRunDate ?? runDate, now, doc.docId);
+  const doc = await enterLocked(ctx, id, now, (cur) => {
+    if (!cur.isActive) throw validation('This memorized transaction is inactive. Make it active to enter it.');
+    if (cur.remaining === 0) throw validation('No entries remain for this memorized transaction.');
+    return { runDate, fromDate: cur.nextRunDate ?? runDate };
+  });
+  if (!doc) throw validation('This memorized transaction could not be entered.');
   return doc;
 }
 

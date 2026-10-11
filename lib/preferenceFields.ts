@@ -26,9 +26,10 @@ export interface FieldMeta {
   dependsOn?: string;
 }
 
-const bank = (a: Account) => a.type === 'asset' && ['checking', 'savings', 'cash'].includes(String(a.subtype ?? ''));
+const bank = (a: Account) => a.type === 'asset' && ['checking', 'savings', 'bank'].includes(String(a.subtype ?? ''));
 const expense = (a: Account) => a.type === 'expense';
-const liability = (a: Account) => a.type === 'liability';
+const liability = (a: Account) =>
+  a.type === 'liability' && !['accounts_payable', 'credit_card'].includes(String(a.subtype ?? ''));
 
 const TERMS: Array<[string, string]> = [
   ['due_on_receipt', 'Due on receipt'],

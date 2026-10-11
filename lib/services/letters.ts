@@ -8,10 +8,24 @@
  *
  * Merge fields: {{date}} {{company.name}} {{company.address}} {{company.phone}} {{company.email}}
  * {{recipient.name}} {{recipient.company}} {{recipient.address}} {{customer.name}} {{balance}}
- * {{overdueBalance}} {{daysOverdue}} {{invoiceList}} {{signer}}
+ * {{overdueBalance}} {{daysOverdue}} {{invoiceList}} {{credits}} {{signer}}
+ *
+ * Customer balances are NET of unapplied credit memos and unapplied payments (QB's customer
+ * balance), so a collection letter never asks for more than the customer actually owes. Credits
+ * are treated as applied to the oldest (overdue) invoices first, and are listed in the letter.
  */
-import { and, asc, eq, gt, inArray } from 'drizzle-orm';
-import { bills, customers, employees, invoices, leads, letterTemplates, vendors } from '@/lib/db/schema';
+import { and, asc, eq, gt, inArray, isNull, ne } from 'drizzle-orm';
+import {
+  bills,
+  creditMemos,
+  customers,
+  employees,
+  invoices,
+  leads,
+  letterTemplates,
+  paymentsReceived,
+  vendors,
+} from '@/lib/db/schema';
 import { Money, formatCurrency, toAmountString } from '@/lib/money';
 import { fillMergeFields, todayInTimeZone } from '@/lib/preferences';
 import { addressToLines, companyLetterhead } from '@/lib/pdf/forms';
@@ -204,6 +218,8 @@ export interface Recipient {
   overdueBalance: string | null;
   daysOverdue: number | null;
   invoiceList: string | null;
+  /** Customers: unapplied credit memos + unapplied payments already deducted from `balance`. */
+  credits?: string | null;
 }
 
 export interface ListRecipientsOptions {
@@ -255,6 +271,29 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
           gt(invoices.balanceDue, '0'),
         ),
       );
+    // Unapplied credits (credit memos + payments not yet applied to an invoice) reduce what is owed.
+    // Voiding zeroes `unapplied`, but filter void/voided rows anyway.
+    const credit = new Map<string, ReturnType<typeof Money.zero>>();
+    const addCredit = (id: string, amt: string) => {
+      if (Money.isPositive(amt)) credit.set(id, (credit.get(id) ?? Money.zero()).plus(Money.of(amt)));
+    };
+    const memoCredits = await ctx.db
+      .select({ customerId: creditMemos.customerId, amt: creditMemos.unapplied })
+      .from(creditMemos)
+      .where(and(eq(creditMemos.companyId, ctx.companyId), ne(creditMemos.status, 'void'), gt(creditMemos.unapplied, '0')));
+    for (const m of memoCredits) addCredit(m.customerId, m.amt);
+    const payCredits = await ctx.db
+      .select({ customerId: paymentsReceived.customerId, amt: paymentsReceived.unapplied })
+      .from(paymentsReceived)
+      .where(
+        and(
+          eq(paymentsReceived.companyId, ctx.companyId),
+          isNull(paymentsReceived.voidedAt),
+          gt(paymentsReceived.unapplied, '0'),
+        ),
+      );
+    for (const p of payCredits) addCredit(p.customerId, p.amt);
+
     const byCustomer = new Map<string, typeof open>();
     for (const o of open) {
       const l = byCustomer.get(o.customerId) ?? [];
@@ -283,6 +322,14 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
             `  Invoice ${i.n}  dated ${dayOf(i.date)}${i.due ? `, due ${dayOf(i.due)}` : ''}: ${formatCurrency(i.balance)}${days > 0 ? ` (${days} days overdue)` : ''}`,
           );
         }
+        const credits = credit.get(r.id) ?? Money.zero();
+        if (credits.greaterThan(0)) {
+          lines.push(`  Less unapplied credits and payments: -${formatCurrency(toAmountString(credits))}`);
+          balance = balance.minus(credits);
+          // Credits apply to the oldest (overdue) invoices first; overdue never goes below zero.
+          overdue = overdue.greaterThan(credits) ? overdue.minus(credits) : Money.zero();
+          if (!overdue.greaterThan(0)) maxDays = 0;
+        }
         return {
           id: r.id,
           type: 'customer' as const,
@@ -294,6 +341,7 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
           overdueBalance: toAmountString(overdue),
           daysOverdue: maxDays,
           invoiceList: lines.join('\n') || '  (no open invoices)',
+          credits: toAmountString(credits),
         };
       });
     if (opts.overdueDays !== undefined) {
@@ -409,6 +457,7 @@ export async function mergeLetters(ctx: ServiceContext, input: PrepareLettersInp
       overdueBalance: r.overdueBalance !== null ? formatCurrency(r.overdueBalance) : '',
       daysOverdue: r.daysOverdue ?? '',
       invoiceList: r.invoiceList ?? '',
+      credits: r.credits ? formatCurrency(r.credits) : '',
       signer: input.signer?.trim() || lh.name,
     }),
   }));

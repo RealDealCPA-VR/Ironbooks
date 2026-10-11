@@ -12,7 +12,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { and, eq } from 'drizzle-orm';
-import { accounts, customers, expenses, invoices, recurringTemplates, todos } from '@/lib/db/schema';
+import { accounts, companies, customers, expenses, invoices, recurringTemplates, todos } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { balanceSheet, trialBalance } from './reports';
 import { setClosingDate, updateCompany } from './company';
@@ -20,7 +20,7 @@ import { createCustomer } from './customers';
 import { createInvoice } from './invoices';
 import { createEmployee, runPaycheck } from './payroll';
 import { arAging, arAgingDetail } from './reportsExtra';
-import { createTemplate, getTemplate, runDue, runTemplateNow } from './recurring';
+import { createTemplate, deleteTemplate, getTemplate, runDue, runTemplateNow, updateTemplate } from './recurring';
 import { createTodo, deleteTodo, updateTodo } from './todos';
 import { convertLeadToCustomer, createLead } from './leads';
 import { addMember, makeTestCompany, type TestCompany } from './testkit.prefs';
@@ -43,6 +43,20 @@ async function balanceOf(code: string): Promise<string> {
   return Money.of(row.balance).toFixed(2);
 }
 
+/**
+ * Preferences must refuse to SAVE a wrong-kind account. A bad value can still be on disk (saved
+ * before this rule, or the account changed type later), so after the refusal the value is written
+ * straight into companies.settings and the consumer (runPaycheck) must also be safe.
+ */
+async function expectRejectedThenForce(patch: Record<string, string>) {
+  await expect(updateCompany(t.ctx, { settings: patch })).rejects.toMatchObject({ code: 'VALIDATION' });
+  const [row] = await t.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, t.ctx.companyId));
+  await t.db
+    .update(companies)
+    .set({ settings: { ...((row?.settings as Record<string, unknown>) ?? {}), ...patch } })
+    .where(eq(companies.id, t.ctx.companyId));
+}
+
 beforeAll(async () => {
   t = await makeTestCompany('prefsqa');
 }, 120_000);
@@ -58,7 +72,7 @@ describe('payroll account preferences', () => {
   it('a paycheck never comes out of A/R even if the "paycheck account" preference names it', async () => {
     const emp = await createEmployee(t.ctx, { firstName: 'Pat', lastName: 'Payee', payType: 'salary', payRate: '52000' });
     const arBefore = await balanceOf('1200');
-    await updateCompany(t.ctx, { settings: { defaultPaycheckAccountId: t.acct['1200'] } });
+    await expectRejectedThenForce({ defaultPaycheckAccountId: t.acct['1200'] });
     try {
       await runPaycheck(t.ctx, {
         employeeId: emp.id,
@@ -84,7 +98,7 @@ describe('payroll account preferences', () => {
   it('wages never post to Accounts Payable even if the "wages expense" preference names it', async () => {
     const emp = await createEmployee(t.ctx, { firstName: 'Ann', lastName: 'Wages', payType: 'salary', payRate: '52000' });
     const apBefore = await balanceOf('2000');
-    await updateCompany(t.ctx, { settings: { payrollExpenseAccountId: t.acct['2000'] } });
+    await expectRejectedThenForce({ payrollExpenseAccountId: t.acct['2000'] });
     try {
       await runPaycheck(t.ctx, {
         employeeId: emp.id,
@@ -364,6 +378,157 @@ describe('A/R subledger == control after the whole run', () => {
       .filter((r) => r.status !== 'void' && r.status !== 'draft')
       .reduce((s, r) => s.plus(Money.of(r.bal)), Money.of(0));
     expect(await balanceOf('1200')).toBe(sub.toFixed(2));
+    await books();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 1 regressions (doer): automation permission gate, Enter Now races, to-do links
+// ---------------------------------------------------------------------------
+describe('fix round 1 regressions', () => {
+  const listsOnly = (): typeof t.ctx => ({
+    ...t.ctx,
+    access: {
+      roleKeys: ['custom'],
+      permissions: { lists: ['view', 'create', 'modify', 'delete', 'print'] },
+      flags: {},
+      isAdmin: false,
+    } as unknown as NonNullable<typeof t.ctx.access>,
+  });
+  const tplInput = (name: string, mode: 'automatic' | 'remind') => ({
+    name,
+    docType: 'expense' as const,
+    frequency: 'monthly' as const,
+    nextRunDate: day('2027-01-01'),
+    mode,
+    template: {
+      payeeName: 'Supplier',
+      method: 'cash',
+      memo: name,
+      paymentAccountId: t.acct['1000'],
+      lines: [{ accountId: t.acct['6400'], amount: '5.00' }],
+    },
+  });
+
+  it('Lists permission alone cannot create or arm an automatic memorized transaction', async () => {
+    const before = (await t.db.select({ id: recurringTemplates.id }).from(recurringTemplates)).length;
+    await expect(createTemplate(listsOnly(), tplInput('lists auto', 'automatic'))).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    expect((await t.db.select({ id: recurringTemplates.id }).from(recurringTemplates)).length).toBe(before);
+
+    // A remind-only template is a plain list entry; renaming it is fine, arming it is not.
+    const remind = await createTemplate(listsOnly(), tplInput('lists remind', 'remind'));
+    await expect(updateTemplate(listsOnly(), remind.id, { mode: 'automatic' })).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    expect((await getTemplate(t.ctx, remind.id)).mode).toBe('remind');
+
+    // An automatic template (made by the owner): Lists users may rename it but not change what it posts.
+    const auto = await createTemplate(t.ctx, tplInput('owner auto', 'automatic'));
+    const renamed = await updateTemplate(listsOnly(), auto.id, { name: 'owner auto (renamed)', groupName: 'Rent' });
+    expect(renamed.name).toBe('owner auto (renamed)');
+    await expect(
+      updateTemplate(listsOnly(), auto.id, {
+        template: { ...tplInput('x', 'automatic').template, lines: [{ accountId: t.acct['6400'], amount: '9999.00' }] },
+      }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(updateTemplate(listsOnly(), auto.id, { remaining: 500 })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    const after = await getTemplate(t.ctx, auto.id);
+    expect((after.template as { lines: { amount: string }[] }).lines[0].amount).toBe('5.00');
+    expect(after.remaining).toBeNull();
+    await t.db.delete(recurringTemplates).where(eq(recurringTemplates.id, auto.id));
+    await t.db.delete(recurringTemplates).where(eq(recurringTemplates.id, remind.id));
+  });
+
+  it('a view-only member cannot edit or delete a memorized transaction', async () => {
+    const tpl = await createTemplate(t.ctx, tplInput('viewer edit target', 'remind'));
+    const viewer = await addMember(t, 'viewer', 'memo-viewer-2');
+    await expect(updateTemplate(viewer, tpl.id, { name: 'hijacked' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(deleteTemplate(viewer, tpl.id)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect((await getTemplate(t.ctx, tpl.id)).name).toBe('viewer edit target');
+    await t.db.delete(recurringTemplates).where(eq(recurringTemplates.id, tpl.id));
+  });
+
+  it('double-clicking Enter Now on a template with one entry left posts exactly once', async () => {
+    const memo = 'qa-enter-now-race';
+    const tpl = await createTemplate(t.ctx, {
+      ...tplInput(memo, 'remind'),
+      remaining: 1,
+    });
+    const results = await Promise.allSettled([
+      runTemplateNow(t.ctx, tpl.id, day('2026-03-05')),
+      runTemplateNow(t.ctx, tpl.id, day('2026-03-05')),
+    ]);
+    expect(results.filter((r) => r.status === 'fulfilled').length).toBe(1);
+    const rows = await t.db
+      .select({ id: expenses.id })
+      .from(expenses)
+      .where(and(eq(expenses.companyId, t.ctx.companyId), eq(expenses.memo, memo)));
+    expect(rows.length).toBe(1);
+    const after = await getTemplate(t.ctx, tpl.id);
+    expect(after.remaining).toBe(0);
+    expect(after.isActive).toBe(false);
+    await books();
+  });
+
+  it('a to-do cannot be re-linked to a made-up or other-company record', async () => {
+    const c = await createCustomer(t.ctx, { displayName: 'Real Link Co' });
+    const todo = await createTodo(t.ctx, { title: 'Call Real', entityType: 'customer', entityId: c.id });
+    expect(todo.entityId).toBe(c.id);
+    await expect(
+      updateTodo(t.ctx, todo.id, { entityType: 'vendor', entityId: c.id }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(
+      updateTodo(t.ctx, todo.id, { entityId: '00000000-0000-4000-8000-000000000000' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(updateTodo(t.ctx, todo.id, { dueDate: '2025-02-29' })).rejects.toMatchObject({ code: 'VALIDATION' });
+    const ok = await updateTodo(t.ctx, todo.id, { dueDate: '2028-02-29' });
+    expect(ok.dueDate).toBe('2028-02-29');
+    expect(ok.entityId).toBe(c.id);
+  });
+
+  it('Preferences reject a wrong-kind account for every account setting', async () => {
+    const bad: Record<string, string> = {
+      defaultCheckAccountId: t.acct['1200'],
+      defaultBillPaymentAccountId: t.acct['2000'],
+      defaultDepositAccountId: t.acct['6400'],
+      defaultExpenseAccountId: t.acct['1000'],
+      payrollLiabilityAccountId: t.acct['2000'],
+    };
+    for (const [k, v] of Object.entries(bad)) {
+      await expect(updateCompany(t.ctx, { settings: { [k]: v } })).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+    // Right kinds save fine.
+    const saved = await updateCompany(t.ctx, {
+      settings: { defaultPaycheckAccountId: t.acct['1000'], payrollExpenseAccountId: t.acct['6500'] },
+    });
+    expect((saved.settings as Record<string, unknown>).defaultPaycheckAccountId).toBe(t.acct['1000']);
+    await updateCompany(t.ctx, { settings: { defaultPaycheckAccountId: null, payrollExpenseAccountId: null } });
+  });
+});
+
+describe('collection letters (fix round 1)', () => {
+  it('the amount owed is net of unapplied credits and the credit is listed', async () => {
+    const { createCreditMemo } = await import('./creditMemos');
+    const { listRecipients } = await import('./letters');
+    const c = await createCustomer(t.ctx, { displayName: 'Credit Netting LLC' });
+    await createInvoice(t.ctx, {
+      customerId: c.id,
+      date: day('2026-01-02'),
+      dueDate: day('2026-02-01'),
+      lines: [{ description: 'Old work', quantity: '1', rate: '100.00' }],
+    });
+    await createCreditMemo(t.ctx, {
+      customerId: c.id,
+      date: day('2026-02-15'),
+      lines: [{ description: 'Goodwill credit', quantity: '1', rate: '30.00' }],
+    });
+    const [r] = await listRecipients(t.ctx, { type: 'customer', ids: [c.id], today: '2026-04-01' });
+    expect(r.balance).toBe('70.00');
+    expect(r.overdueBalance).toBe('70.00');
+    expect(r.credits).toBe('30.00');
+    expect(r.invoiceList).toMatch(/unapplied credits/i);
     await books();
   });
 });

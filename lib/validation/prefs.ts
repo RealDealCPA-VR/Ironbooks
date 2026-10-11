@@ -14,7 +14,19 @@ export function templateIdParam(v: string | null | undefined): string | null | f
   return UUID_RE.test(v) ? v : false;
 }
 
-const zIsoDay = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD');
+/** True when `v` is a real calendar day in YYYY-MM-DD form (rejects 2026-02-30, 2026-13-01). */
+export function isRealIsoDay(v: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+  if (!m) return false;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+const zIsoDay = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD')
+  .refine(isRealIsoDay, 'is not a real date');
 
 // ---- My Preferences ----
 export const myPreferencesSchema = z

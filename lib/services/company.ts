@@ -12,6 +12,7 @@ import { assertWrite } from './rbac';
 import { requireEffectivePermission } from './access';
 import type { DB } from '@/lib/db';
 import { logTransaction } from './transactionLog';
+import { assertPreferenceAccounts } from './prefAccounts';
 import {
   COMPANY_PREFERENCE_KEYS,
   resolveCompanyPreferences,
@@ -291,6 +292,9 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
   for (const [key, value] of Object.entries(input.settings ?? {})) {
     if (SETTINGS_KEY_SET.has(key) && value !== undefined) settingsPatch[key] = value;
   }
+  // Account-valued preferences must name the right kind of account (a paycheck account that is
+  // A/R or a wages account that is A/P would break the subledger == control-account rule).
+  await assertPreferenceAccounts(ctx, settingsPatch);
 
   const mergedSettings = {
     ...(existing.settings ?? {}),
