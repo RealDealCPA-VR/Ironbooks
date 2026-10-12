@@ -10,6 +10,7 @@ const FISCAL_YEAR_END_RE = /^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 /** '' clears an optional text setting. */
 const zOptionalText = z.string().optional();
 
+/** Legacy built-in terms codes — the Terms list (lib/services/lists) now holds the real entries. */
 export const TERMS_OPTIONS = ['due_on_receipt', 'net_15', 'net_30', 'net_60'] as const;
 export const PAY_PERIOD_OPTIONS = ['weekly', 'biweekly', 'semimonthly', 'monthly'] as const;
 export const CUSTOM_FIELD_ENTITIES = ['customer', 'vendor', 'item', 'invoice'] as const;
@@ -59,10 +60,11 @@ export const companySettingsSchema = z.object({
   accountNumbersEnabled: z.boolean().optional(),
   reportBasis: z.enum(['accrual', 'cash']).optional(),
   // Sales & Customers
-  defaultCustomerTerms: z.enum(TERMS_OPTIONS).optional(),
+  /** A Terms list entry (id, legacy code such as 'net_30', or name) — see lib/services/lists/terms.ts. */
+  defaultCustomerTerms: z.string().trim().min(1).max(100).optional(),
   defaultInvoiceMemo: zOptionalText,
   // Purchases & Vendors
-  defaultVendorTerms: z.enum(TERMS_OPTIONS).optional(),
+  defaultVendorTerms: z.string().trim().min(1).max(100).optional(),
   defaultExpenseAccountId: zUuid.nullable().optional(),
   // Payroll
   payrollPayPeriod: z.enum(PAY_PERIOD_OPTIONS).optional(),

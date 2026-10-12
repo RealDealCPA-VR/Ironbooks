@@ -59,6 +59,8 @@ import { toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, inTransaction, writeAudit } from './_base';
 import { allowLedgerRewrite } from './posting';
 import { qbAccountTypeOf } from '@/lib/accountTypes';
+import { repointForeignKeys } from './lists/references';
+import { moveNotesAndTodos } from './lists/notes';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -232,6 +234,25 @@ export async function mergeCustomers(
     // other customer-named lines follow the customer. Only the name changes — amounts and
     // accounts stay put — but posted lines are immutable outside a sanctioned rewrite.
     const jelRows = await repointJournalNames(tx, 'customer', fromId, toId);
+    // Wave-2 lists: sweep every remaining foreign key to the customer (sales receipts, tables
+    // added by other modules, ...) and carry dated notes / to-dos over. The sub-customer
+    // hierarchy is handled explicitly so the survivor can never become its own parent.
+    const [toCust] = await tx.db
+      .select({ parentId: customers.parentId })
+      .from(customers)
+      .where(eq(customers.id, toId));
+    if (toCust?.parentId === fromId) {
+      const [fromCust] = await tx.db
+        .select({ parentId: customers.parentId })
+        .from(customers)
+        .where(eq(customers.id, fromId));
+      await tx.db
+        .update(customers)
+        .set({ parentId: fromCust?.parentId ?? null, updatedAt: new Date() })
+        .where(eq(customers.id, toId));
+    }
+    const sweptCustomer = await repointForeignKeys(tx, 'customers', fromId, toId);
+    const movedCustomerNotes = await moveNotesAndTodos(tx, 'customer', fromId, toId);
 
     // Deactivate the from-customer.
     await tx.db
@@ -269,6 +290,8 @@ export async function mergeCustomers(
           expenseLines: expenseLineRows.length,
           journalEntryLines: jelRows,
         },
+        otherReferences: sweptCustomer,
+        notesAndTodos: movedCustomerNotes,
       },
     });
 
@@ -346,6 +369,10 @@ export async function mergeVendors(
 
     // Named General Journal lines follow the vendor (A/P open items from journal entries).
     const jelRows = await repointJournalNames(tx, 'vendor', fromId, toId);
+    // Wave-2 lists: sweep every remaining foreign key to the vendor (items' preferred vendor,
+    // item receipts, tables added by other modules, ...) and carry notes / to-dos over.
+    const sweptVendor = await repointForeignKeys(tx, 'vendors', fromId, toId);
+    const movedVendorNotes = await moveNotesAndTodos(tx, 'vendor', fromId, toId);
 
     // Deactivate the from-vendor.
     await tx.db
@@ -375,6 +402,8 @@ export async function mergeVendors(
           purchaseOrders: poRows.length,
           journalEntryLines: jelRows,
         },
+        otherReferences: sweptVendor,
+        notesAndTodos: movedVendorNotes,
       },
     });
 

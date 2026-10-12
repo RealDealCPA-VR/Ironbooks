@@ -31,6 +31,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
+import { CreatePosFromReorder, StockStatusByVendor } from '@/components/lists/ReorderTools';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1009,13 +1010,16 @@ export default function InventoryOpsPage() {
             Items where quantity on hand is at or below the reorder point.
           </p>
         </div>
-        {report && (
-          <Badge tone={report.count > 0 ? 'danger' : 'success'}>
-            {report.count === 0
-              ? 'All items stocked'
-              : `${report.count} item${report.count !== 1 ? 's' : ''} need reorder`}
-          </Badge>
-        )}
+        <div className="flex items-center gap-3">
+          {report && (
+            <Badge tone={report.count > 0 ? 'danger' : 'success'}>
+              {report.count === 0
+                ? 'All items stocked'
+                : `${report.count} item${report.count !== 1 ? 's' : ''} need reorder`}
+            </Badge>
+          )}
+          <CreatePosFromReorder disabled={!report || report.count === 0} onDone={fetchAll} />
+        </div>
       </div>
 
       <Card className="p-0 overflow-hidden">
@@ -1094,6 +1098,8 @@ export default function InventoryOpsPage() {
           </span>
         </div>
       )}
+
+      <StockStatusByVendor />
 
       <PhysicalCountModal
         open={showPhysicalCount}

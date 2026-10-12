@@ -53,12 +53,54 @@ interface GLAccount {
   isActive: boolean;
 }
 
-type RecordType = 'customer' | 'vendor' | 'account';
+type RecordType = 'customer' | 'vendor' | 'account' | 'item' | 'class' | 'employee' | 'other_name';
 
 const TYPE_LABEL: Record<RecordType, string> = {
   customer: 'customer',
   vendor: 'vendor',
   account: 'account',
+  item: 'item',
+  class: 'class',
+  employee: 'employee',
+  other_name: 'other name',
+};
+
+const TYPE_PLURAL: Record<RecordType, string> = {
+  customer: 'Customers',
+  vendor: 'Vendors',
+  account: 'Accounts',
+  item: 'Items',
+  class: 'Classes',
+  employee: 'Employees',
+  other_name: 'Other Names',
+};
+
+/** Wave-2 lists: the extra mergeable lists and how to load them. */
+const EXTRA_SOURCES: Partial<Record<RecordType, { url: string; pick: (data: unknown) => RecordOption[] }>> = {
+  item: {
+    url: '/api/items',
+    pick: (d) =>
+      ((d as { items: Array<{ id: string; name: string; type: string }> }).items ?? []).map((i) => ({
+        id: i.id,
+        label: `${i.name} (${i.type.replace('_', ' ')})`,
+        accountType: i.type,
+      })),
+  },
+  class: {
+    url: '/api/classes',
+    pick: (d) => ((d as Array<{ id: string; name: string; isActive: boolean }>) ?? []).filter((c) => c.isActive).map((c) => ({ id: c.id, label: c.name })),
+  },
+  employee: {
+    url: '/api/employees',
+    pick: (d) =>
+      ((d as Array<{ id: string; firstName: string; lastName: string; isActive: boolean }>) ?? [])
+        .filter((e) => e.isActive)
+        .map((e) => ({ id: e.id, label: `${e.firstName} ${e.lastName}` })),
+  },
+  other_name: {
+    url: '/api/lists/other-names',
+    pick: (d) => ((d as { entries: Array<{ id: string; name: string }> }).entries ?? []).map((o) => ({ id: o.id, label: o.name })),
+  },
 };
 
 interface MergeResult {
@@ -196,6 +238,20 @@ export default function MergePage() {
   const [showConfirm, setShowConfirm] = useState(false);
   const [merging, setMerging] = useState(false);
   const [lastResult, setLastResult] = useState<MergeResult | null>(null);
+  const [extraRecords, setExtraRecords] = useState<RecordOption[]>([]);
+
+  const fetchExtra = useCallback(async (type: RecordType) => {
+    const src = EXTRA_SOURCES[type];
+    if (!src) return;
+    setLoading(true);
+    try {
+      setExtraRecords(src.pick(await api.get<unknown>(src.url)));
+    } catch {
+      toast(`Failed to load ${TYPE_PLURAL[type].toLowerCase()}.`, 'danger');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   // ---------------------------------------------------------------------------
   // Data fetching
@@ -248,14 +304,17 @@ export default function MergePage() {
     setFromId('');
     setToId('');
     setLastResult(null);
-  }, [recordType]);
+    setExtraRecords([]);
+    void fetchExtra(recordType);
+  }, [recordType, fetchExtra]);
 
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
 
-  const records: RecordOption[] =
-    recordType === 'account'
+  const records: RecordOption[] = EXTRA_SOURCES[recordType]
+    ? extraRecords
+    : recordType === 'account'
       ? glAccounts.map((a) => ({
           id: a.id,
           label: `${a.code} · ${a.name} (${a.type})`,
@@ -279,7 +338,7 @@ export default function MergePage() {
 
   /** Account merges require matching GL types (asset↔asset, expense↔expense, …). */
   const typeMismatch =
-    recordType === 'account' &&
+    (recordType === 'account' || recordType === 'item') &&
     !!fromId &&
     !!toId &&
     fromId !== toId &&
@@ -314,6 +373,8 @@ export default function MergePage() {
         fetchCustomers();
       } else if (recordType === 'vendor') {
         fetchVendors();
+      } else if (EXTRA_SOURCES[recordType]) {
+        fetchExtra(recordType);
       } else {
         fetchGlAccounts();
       }
@@ -334,10 +395,12 @@ export default function MergePage() {
 
       <Card className="p-6 max-w-xl">
         <p className="text-sm text-navy/60 mb-6">
-          Merge a duplicate customer, vendor, or GL account into its master record. All linked
-          documents (invoices, bills, payments, etc.) will be reassigned to the master. Account
-          merges also move the journal history and require both accounts to be the same type.
-          The duplicate will be deactivated. This operation cannot be undone.
+          Merge a duplicate customer, vendor, GL account, item, class, employee or other name into
+          its master record. Everything that used the duplicate (invoices, bills, payments, price
+          lists, notes...) moves to the master. Account merges also move the journal history and
+          require both accounts to be the same type; items must be the same type and keep their
+          value in the same inventory account. The duplicate will be made inactive. This cannot be
+          undone.
         </p>
 
         {/* Record type */}
@@ -351,6 +414,10 @@ export default function MergePage() {
             <option value="customer">Customer</option>
             <option value="vendor">Vendor</option>
             <option value="account">Account</option>
+            <option value="item">Item</option>
+            <option value="class">Class</option>
+            <option value="employee">Employee</option>
+            <option value="other_name">Other name</option>
           </Select>
         </div>
 
@@ -413,7 +480,7 @@ export default function MergePage() {
             {/* Account merges require matching GL types */}
             {typeMismatch && (
               <p className="text-sm text-red-500 mb-5">
-                Accounts must be the same type to merge ({accountTypeFor(fromId)} vs{' '}
+                {recordType === 'item' ? 'Items' : 'Accounts'} must be the same type to merge ({accountTypeFor(fromId)} vs{' '}
                 {accountTypeFor(toId)}).
               </p>
             )}
@@ -442,12 +509,7 @@ export default function MergePage() {
               onClick={() => setShowConfirm(true)}
             >
               <GitMerge className="h-4 w-4" />
-              Merge{' '}
-              {recordType === 'customer'
-                ? 'Customers'
-                : recordType === 'vendor'
-                  ? 'Vendors'
-                  : 'Accounts'}
+              Merge {TYPE_PLURAL[recordType]}
             </Button>
 
             {/* Result summary */}

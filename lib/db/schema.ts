@@ -352,6 +352,11 @@ export const customers = pgTable('customers', {
   /** Advanced pricing (team pricing): customer type list + assigned price level. */
   customerTypeId: uuid('customer_type_id'),
   priceLevelId: uuid('price_level_id'),
+  /** Wave-2 lists: default payment terms (Terms list), sales tax code, resale number, exemption. */
+  termsId: uuid('terms_id').references((): any => paymentTerms.id),
+  salesTaxCodeId: uuid('sales_tax_code_id').references((): any => salesTaxCodes.id),
+  resaleNumber: varchar('resale_number', { length: 50 }),
+  taxExemptionReason: varchar('tax_exemption_reason', { length: 100 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -375,6 +380,9 @@ export const vendors = pgTable('vendors', {
   customFields: jsonb('custom_fields').$type<Record<string, string>>(),
   /** Vendor type list (team pricing). */
   vendorTypeId: uuid('vendor_type_id'),
+  /** Wave-2 lists: default payment terms (Terms list) and billing rate level for time billing. */
+  termsId: uuid('terms_id').references((): any => paymentTerms.id),
+  billingRateLevelId: uuid('billing_rate_level_id').references((): any => billingRateLevels.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -406,6 +414,10 @@ export const items = pgTable('items', {
   barcode: varchar('barcode', { length: 100 }),
   trackingMode: varchar('tracking_mode', { length: 10 }).notNull().default('none'),
   weight: decimal('weight', { precision: 15, scale: 4 }),
+  /** Wave-2 lists: preferred vendor (reorder → PO), sales tax code, unit of measure set. */
+  preferredVendorId: uuid('preferred_vendor_id').references((): any => vendors.id),
+  salesTaxCodeId: uuid('sales_tax_code_id').references((): any => salesTaxCodes.id),
+  uomSetId: uuid('uom_set_id').references((): any => uomSets.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -740,6 +752,8 @@ export const employees = pgTable('employees', {
   address: jsonb('address').$type<Record<string, unknown>>(),
   /** Sick/vacation accrual policy + running balances (hours). */
   accruals: jsonb('accruals').$type<Record<string, unknown>>(),
+  /** Wave-2 lists: billing rate level used when this employee's time is billed. */
+  billingRateLevelId: uuid('billing_rate_level_id').references((): any => billingRateLevels.id),
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -959,6 +973,8 @@ export const jobs = pgTable('jobs', {
   startDate: timestamp('start_date'),
   endDate: timestamp('end_date'),
   isActive: boolean('is_active').notNull().default(true),
+  /** Wave-2 lists: Job Type list. */
+  jobTypeId: uuid('job_type_id').references((): any => jobTypes.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1145,6 +1161,10 @@ export const mileageLogs = pgTable('mileage_logs', {
   ratePerMile: decimal('rate_per_mile', { precision: 8, scale: 4 }).notNull().default('0.67'),
   purpose: text('purpose'),
   billable: boolean('billable').notNull().default(false),
+  /** Wave-2 lists: Vehicle list + optional odometer readings. */
+  vehicleId: uuid('vehicle_id').references((): any => vehicles.id),
+  odometerStart: decimal('odometer_start', { precision: 12, scale: 1 }),
+  odometerEnd: decimal('odometer_end', { precision: 12, scale: 1 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1649,4 +1669,208 @@ export const itemReceiptBillLines = pgTable('item_receipt_bill_lines', {
   layerAdjustments: jsonb('layer_adjustments').$type<Array<Record<string, string>>>(),
   writtenOff: boolean('written_off').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- wave2 lists ----
+// QB Desktop "Lists" parity: Other Names, Job Types, Terms, Ship Via, Payment Methods, Customer
+// Messages, Sales Tax Codes, To Do, timestamped Notes, Billing Rate Levels, Vehicles, Unit of
+// Measure sets. Master data only — none of these post to the GL. See lib/services/lists/*.
+
+/** Records which built-in default entries were seeded for a company (id = companyId:listKey). */
+export const listSeeds = pgTable('list_seeds', {
+  id: varchar('id', { length: 120 }).primaryKey(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  listKey: varchar('list_key', { length: 50 }).notNull(),
+  seededAt: timestamp('seeded_at').defaultNow().notNull(),
+});
+
+/** QB "Other Names" list: payees that are not customers, vendors or employees. */
+export const otherNames = pgTable('other_names', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  companyName: varchar('company_name', { length: 255 }),
+  email: varchar('email', { length: 255 }),
+  phone: varchar('phone', { length: 50 }),
+  address: jsonb('address').$type<Record<string, string>>(),
+  accountNumber: varchar('account_number', { length: 100 }),
+  notes: text('notes'),
+  billingRateLevelId: uuid('billing_rate_level_id').references((): any => billingRateLevels.id),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** QB "Job Type" list (optionally hierarchical). */
+export const jobTypes = pgTable('job_types', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  parentId: uuid('parent_id').references((): any => jobTypes.id),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * QB "Terms" list. 'standard' = due N days after the transaction, optional early-payment discount
+ * within D days; 'date_driven' = due on a fixed day of the month (the next month when issued
+ * within `dueNextMonthWithinDays` of it), optional discount when paid by a fixed day of the month.
+ * `code` keeps compatibility with the legacy terms strings ('net_30', 'due_on_receipt', ...).
+ */
+export const paymentTerms = pgTable('payment_terms', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  code: varchar('code', { length: 50 }),
+  kind: varchar('kind', { length: 20 }).notNull().default('standard'),
+  netDays: integer('net_days'),
+  discountPercent: decimal('discount_percent', { precision: 7, scale: 4 }),
+  discountDays: integer('discount_days'),
+  dueDayOfMonth: integer('due_day_of_month'),
+  dueNextMonthWithinDays: integer('due_next_month_within_days'),
+  discountDayOfMonth: integer('discount_day_of_month'),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** QB "Ship Via" list. */
+export const shipViaMethods = pgTable('ship_via_methods', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** QB "Payment Method" list: custom names, each mapped to the payment_method enum `type`. */
+export const paymentMethods = pgTable('payment_methods', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  type: paymentMethodEnum('type').notNull().default('other'),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** QB "Customer Message" list (printed at the bottom of sales forms). */
+export const customerMessages = pgTable('customer_messages', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  message: varchar('message', { length: 500 }).notNull(),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** QB "Sales Tax Code" list: 'Tax' / 'Non' plus custom codes, each taxable or not. */
+export const salesTaxCodes = pgTable('sales_tax_codes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  code: varchar('code', { length: 3 }).notNull(),
+  description: varchar('description', { length: 255 }),
+  taxable: boolean('taxable').notNull().default(true),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** QB "To Do" list. Optionally linked to a customer/vendor/employee/other name/item. */
+export const todoItems = pgTable('todo_items', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  title: varchar('title', { length: 255 }).notNull(),
+  details: text('details'),
+  /** call | fax | email | meeting | appointment | task */
+  type: varchar('type', { length: 20 }).notNull().default('task'),
+  /** low | medium | high */
+  priority: varchar('priority', { length: 10 }).notNull().default('medium'),
+  /** open | done | inactive */
+  status: varchar('status', { length: 10 }).notNull().default('open'),
+  dueDate: timestamp('due_date'),
+  entityType: varchar('entity_type', { length: 30 }),
+  entityId: uuid('entity_id'),
+  assignedUserId: uuid('assigned_user_id').references(() => users.id),
+  createdBy: uuid('created_by').references(() => users.id),
+  completedAt: timestamp('completed_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Timestamped notes on customers, vendors, employees and other names (many per record). */
+export const entityNotes = pgTable('entity_notes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** customer | vendor | employee | other_name */
+  entityType: varchar('entity_type', { length: 30 }).notNull(),
+  entityId: uuid('entity_id').notNull(),
+  noteDate: timestamp('note_date').defaultNow().notNull(),
+  body: text('body').notNull(),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/**
+ * QB "Billing Rate Level" list (time billing). 'fixed_rate' = one hourly rate for every service
+ * item; 'custom' = per-service-item rates in billing_rate_level_items (items not listed fall back
+ * to the item's sales price).
+ */
+export const billingRateLevels = pgTable('billing_rate_levels', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  type: varchar('type', { length: 20 }).notNull().default('fixed_rate'),
+  fixedRate: decimal('fixed_rate', { precision: 15, scale: 4 }),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const billingRateLevelItems = pgTable('billing_rate_level_items', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  levelId: uuid('level_id').references(() => billingRateLevels.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  rate: decimal('rate', { precision: 15, scale: 4 }).notNull(),
+});
+
+/** QB "Vehicle" list (mileage tracking). */
+export const vehicles = pgTable('vehicles', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  description: varchar('description', { length: 255 }),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * Unit of Measure sets (QB "multiple U/M per item"): a base unit plus related units, each with
+ * a conversion factor = how many BASE units one of it holds (Case of 12 → 12). Inventory
+ * quantities are always kept in the base unit: line qty × factor.
+ */
+export const uomSets = pgTable('uom_sets', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  /** count | length | weight | volume | area | time | other */
+  kind: varchar('kind', { length: 20 }).notNull().default('count'),
+  baseUnitName: varchar('base_unit_name', { length: 50 }).notNull(),
+  baseUnitAbbrev: varchar('base_unit_abbrev', { length: 20 }).notNull(),
+  defaultPurchaseUnit: varchar('default_purchase_unit', { length: 50 }),
+  defaultSalesUnit: varchar('default_sales_unit', { length: 50 }),
+  defaultShippingUnit: varchar('default_shipping_unit', { length: 50 }),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const uomSetUnits = pgTable('uom_set_units', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  setId: uuid('set_id').references(() => uomSets.id).notNull(),
+  name: varchar('name', { length: 50 }).notNull(),
+  abbrev: varchar('abbrev', { length: 20 }).notNull(),
+  /** Base units per one of this unit (> 0). */
+  factor: decimal('factor', { precision: 18, scale: 6 }).notNull(),
+  lineOrder: integer('line_order').notNull().default(0),
 });

@@ -10,6 +10,8 @@ import { ServiceError } from '@/lib/services/_base';
 import type { ItemType } from '@/lib/services/items';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createItemSchema } from '@/lib/validation/items';
+import { createItemWithOpeningStock } from '@/lib/services/lists/openingStock';
+import { requirePermission } from '@/lib/services/access';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
@@ -58,9 +60,15 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (!parsed.success) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
-    const { reorderPoint, ...input } = parsed.data;
+    const { reorderPoint, openingQuantity, openingValue, openingUnitCost, openingAsOf, ...input } = parsed.data;
 
-    let item = await createItem(ctx, input);
+    // Opening quantity on hand posts to the ledger (Inventory Asset vs Opening Balance Equity),
+    // so it needs inventory rights on top of the list rights this route is mapped to.
+    const hasOpening = openingQuantity != null && openingQuantity !== '' && Number(openingQuantity) !== 0;
+    if (hasOpening) requirePermission(ctx, 'inventory', 'create');
+    let item = hasOpening
+      ? (await createItemWithOpeningStock(ctx, { ...input, openingQuantity, openingValue, openingUnitCost, openingAsOf })).item
+      : await createItem(ctx, input);
 
     // Reorder point is managed by the inventory service (it drives the
     // reorder report and low-stock alerts) rather than the item master data.

@@ -4,7 +4,7 @@
  * and a sales-tax liability summary.
  */
 import { and, eq, sql } from 'drizzle-orm';
-import { accounts, creditMemos, taxAgencies, taxRates, invoices } from '@/lib/db/schema';
+import { accounts, creditMemos, taxAgencies, taxRateComponents, taxRates, invoices } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 
@@ -66,6 +66,59 @@ export async function createTaxRate(
     .returning();
   await writeAudit(ctx, { action: 'create', entityType: 'tax_rate', entityId: row.id, newValues: row });
   return row;
+}
+
+/**
+ * Edit a sales tax rate item (QB: edit the Sales Tax Item). A new rate applies to transactions
+ * entered from now on — posted invoices keep the tax they were charged (their taxAmount and
+ * journal entries are not touched). Deactivating hides the rate from new transactions.
+ */
+export async function updateTaxRate(
+  ctx: ServiceContext,
+  id: string,
+  patch: { name?: string; rate?: string | number; agencyId?: string | null; isActive?: boolean },
+) {
+  const before = await getTaxRate(ctx, id);
+  const name = patch.name !== undefined ? patch.name.trim() : before.name;
+  if (!name) throw validation('Rate name is required.');
+  let rate = before.rate;
+  if (patch.rate !== undefined) {
+    // A combined rate is the sum of its components — edit the components instead.
+    const [component] = await ctx.db
+      .select({ id: taxRateComponents.id })
+      .from(taxRateComponents)
+      .where(eq(taxRateComponents.taxRateId, id))
+      .limit(1);
+    if (component && !Money.eq(patch.rate, before.rate)) {
+      throw validation('This rate is made of component rates. Change the components and the total updates itself.');
+    }
+    const r = Money.of(patch.rate);
+    if (r.isNegative() || r.greaterThan(1)) {
+      throw validation('Rate must be a decimal fraction between 0 and 1 (e.g. 0.0825 for 8.25%).');
+    }
+    rate = r.toFixed(6);
+  }
+  if (patch.agencyId) {
+    const [agency] = await ctx.db
+      .select({ id: taxAgencies.id })
+      .from(taxAgencies)
+      .where(and(eq(taxAgencies.id, patch.agencyId), eq(taxAgencies.companyId, ctx.companyId)));
+    if (!agency) throw notFound('Tax agency');
+  }
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .update(taxRates)
+      .set({
+        name,
+        rate,
+        agencyId: patch.agencyId !== undefined ? patch.agencyId : before.agencyId,
+        isActive: patch.isActive !== undefined ? patch.isActive : before.isActive,
+      })
+      .where(and(eq(taxRates.id, id), eq(taxRates.companyId, tx.companyId)))
+      .returning();
+    await writeAudit(tx, { action: 'update', entityType: 'tax_rate', entityId: id, oldValues: before, newValues: row });
+    return row;
+  });
 }
 
 export async function getTaxRate(ctx: ServiceContext, id: string) {

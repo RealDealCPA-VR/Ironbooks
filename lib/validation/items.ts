@@ -4,7 +4,7 @@
  * forwarded to inventory.setReorderPoint ('' / null clears it).
  */
 import { z } from 'zod';
-import { zDecimal, zUuid } from './helpers';
+import { zDate, zDecimal, zUuid } from './helpers';
 
 export const itemTypeSchema = z.enum([
   'service',
@@ -43,6 +43,15 @@ export const createItemSchema = z.object({
   weight: zDecimal.nullish(),
   /** Route-level: forwarded to setReorderPoint after creation. */
   reorderPoint: zReorderPoint,
+  /** Wave-2 lists: preferred vendor, sales tax code, unit of measure set. */
+  preferredVendorId: zUuid.nullish(),
+  salesTaxCodeId: zUuid.nullish(),
+  uomSetId: zUuid.nullish(),
+  /** Wave-2 lists: opening quantity on hand (inventory items; posts vs Opening Balance Equity). */
+  openingQuantity: zDecimal.nullish(),
+  openingValue: zDecimal.nullish(),
+  openingUnitCost: zDecimal.nullish(),
+  openingAsOf: zDate.nullish(),
 });
 export type CreateItemBody = z.infer<typeof createItemSchema>;
 
@@ -64,5 +73,8 @@ export const updateItemSchema = z.object({
   weight: zDecimal.nullish(),
   /** Route-level: forwarded to setReorderPoint when the key is present. */
   reorderPoint: zReorderPoint,
+  preferredVendorId: zUuid.nullish(),
+  salesTaxCodeId: zUuid.nullish(),
+  uomSetId: zUuid.nullish(),
 });
 export type UpdateItemBody = z.infer<typeof updateItemSchema>;

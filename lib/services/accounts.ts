@@ -203,7 +203,7 @@ const OPENING_BALANCE_EQUITY_NAME = 'Opening Balance Equity';
  * Find (or create) the company's "Opening Balance Equity" account — the QB-style offset
  * account for opening balances. Prefers code 3900; picks the next free code if taken.
  */
-async function findOrCreateOpeningBalanceEquity(ctx: ServiceContext) {
+export async function findOrCreateOpeningBalanceEquity(ctx: ServiceContext) {
   const [existing] = await ctx.db
     .select()
     .from(accounts)

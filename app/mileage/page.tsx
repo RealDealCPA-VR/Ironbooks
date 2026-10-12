@@ -67,6 +67,15 @@ interface LogMilesForm {
   customerId: string;
   purpose: string;
   billable: boolean;
+  vehicleId: string;
+  odometerStart: string;
+  odometerEnd: string;
+}
+
+/** Vehicle list entry (wave-2 lists). */
+interface Vehicle {
+  id: string;
+  name: string;
 }
 
 const EMPTY_FORM: LogMilesForm = {
@@ -78,6 +87,9 @@ const EMPTY_FORM: LogMilesForm = {
   customerId: '',
   purpose: '',
   billable: false,
+  vehicleId: '',
+  odometerStart: '',
+  odometerEnd: '',
 };
 
 // ---------------------------------------------------------------------------
@@ -130,10 +142,12 @@ function SummaryCard({ summary }: { summary: MileageSummary | null }) {
 function LogMilesForm({
   form,
   customers,
+  vehicles,
   onChange,
 }: {
   form: LogMilesForm;
   customers: Customer[];
+  vehicles: Vehicle[];
   onChange: (field: keyof LogMilesForm, value: string | boolean) => void;
 }) {
   return (
@@ -192,6 +206,51 @@ function LogMilesForm({
           ))}
         </Select>
       </div>
+      <div className="grid grid-cols-3 gap-3">
+        <div>
+          <Label htmlFor="ml-vehicle">Vehicle</Label>
+          <Select id="ml-vehicle" value={form.vehicleId} onChange={(e) => onChange('vehicleId', e.target.value)}>
+            <option value="">-- None --</option>
+            {vehicles.map((v) => (
+              <option key={v.id} value={v.id}>
+                {v.name}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <div>
+          <Label htmlFor="ml-odo-start">Odometer start</Label>
+          <Input
+            id="ml-odo-start"
+            type="number"
+            min="0"
+            step="0.1"
+            value={form.odometerStart}
+            onChange={(e) => {
+              onChange('odometerStart', e.target.value);
+              const end = parseFloat(form.odometerEnd);
+              const start = parseFloat(e.target.value);
+              if (!Number.isNaN(end) && !Number.isNaN(start) && end >= start) onChange('miles', (end - start).toFixed(1));
+            }}
+          />
+        </div>
+        <div>
+          <Label htmlFor="ml-odo-end">Odometer end</Label>
+          <Input
+            id="ml-odo-end"
+            type="number"
+            min="0"
+            step="0.1"
+            value={form.odometerEnd}
+            onChange={(e) => {
+              onChange('odometerEnd', e.target.value);
+              const start = parseFloat(form.odometerStart);
+              const end = parseFloat(e.target.value);
+              if (!Number.isNaN(end) && !Number.isNaN(start) && end >= start) onChange('miles', (end - start).toFixed(1));
+            }}
+          />
+        </div>
+      </div>
       <div>
         <Label htmlFor="ml-purpose">Purpose</Label>
         <Input
@@ -222,7 +281,17 @@ export default function MileagePage() {
   const [logs, setLogs] = useState<MileageLog[]>([]);
   const [summary, setSummary] = useState<MileageSummary | null>(null);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api
+      .get<{ entries: Vehicle[] }>('/api/lists/vehicles')
+      .then((d) => setVehicles(d.entries))
+      .catch(() => {
+        /* the Vehicle list is optional */
+      });
+  }, []);
 
   // Log modal
   const [logOpen, setLogOpen] = useState(false);
@@ -291,6 +360,9 @@ export default function MileagePage() {
         customerId: logForm.customerId || undefined,
         purpose: logForm.purpose.trim() || undefined,
         billable: logForm.billable,
+        vehicleId: logForm.vehicleId || undefined,
+        odometerStart: logForm.odometerStart || undefined,
+        odometerEnd: logForm.odometerEnd || undefined,
       });
       toast('Mileage logged', 'success');
       setLogOpen(false);
@@ -453,7 +525,12 @@ export default function MileagePage() {
           </>
         }
       >
-        <LogMilesForm form={logForm} customers={customers} onChange={updateForm} />
+        <LogMilesForm
+          form={logForm}
+          vehicles={vehicles}
+          customers={customers}
+          onChange={updateForm}
+        />
       </Modal>
 
       {/* ---- Delete confirm ---- */}

@@ -15,5 +15,9 @@ export const logMilesSchema = z.object({
   purpose: z.string().nullish(),
   /** Defaults to false. */
   billable: z.boolean().optional(),
+  /** Vehicle list entry + optional odometer readings (wave-2 lists). */
+  vehicleId: zUuid.nullish(),
+  odometerStart: zDecimal.nullish(),
+  odometerEnd: zDecimal.nullish(),
 });
 export type LogMilesBody = z.infer<typeof logMilesSchema>;
