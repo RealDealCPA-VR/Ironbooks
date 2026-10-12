@@ -20,12 +20,14 @@ import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/type
 import type { ReportParams } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { notFound, validation } from './_base';
-import { classes } from '@/lib/db/schema';
-import { and, eq } from 'drizzle-orm';
+import { classes, journalEntries } from '@/lib/db/schema';
+import { and, eq, gte, lte } from 'drizzle-orm';
 import { LedgerIntegrityError, assertBalanceSheetBalanced, assertTrialBalanceBalanced } from './ledgerAssert';
 import { balanceSheet, trialBalance, type BalanceSheet } from './reports';
 import { cashBasisBalanceSheet } from './balanceSheetCashBasis';
 import { cashBasisLedger } from './cashBasisLedger';
+import { cashFlow as cashFlowData } from './reportsExtra';
+import { isCashAccount } from '@/lib/accountTypes';
 import {
   BS_SECTIONS,
   DETAIL_COLUMNS,
@@ -316,6 +318,64 @@ export async function profitAndLossByClassReport(ctx: ServiceContext, p: ReportP
     });
   }
   return { key: 'pl-by-class', title: 'Profit & Loss by Class', subtitle: `${rangeLabel(from, to)}${basisSuffix(basis)}`, columns, rows: built.rows };
+}
+
+/**
+ * P&L by Job (QB "Profit & Loss by Job"): one column per customer:job with income or expense in
+ * the period (the customer on the invoice / sales receipt, or the customer:job an expense line is
+ * billed to), plus "No customer:job" so the TOTAL ties to the Profit & Loss.
+ */
+export async function profitAndLossByJobReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const meta = await loadAccountMeta(ctx);
+  const basis = basisOf(p);
+  const f = glFilterFromParams(meta, { basis: p.basis, classId: p.classId }, { from, to });
+  f.sections = [...PL_SECTIONS];
+  f.excludeClose = true;
+  const { lines, truncated } = await fetchGlLines(ctx, meta, { ...f, limit: 50000 });
+  const act = new Map<string, { accountId: string; bucket: string; debit: Decimal; credit: Decimal }>();
+  const names = new Map<string, string>();
+  for (const l of lines) {
+    const bucket = l.nameType === 'customer' && l.nameId ? l.nameId : '';
+    if (bucket) names.set(bucket, l.name || '(unnamed)');
+    const k = `${l.accountId}|${bucket}`;
+    const cur = act.get(k) ?? { accountId: l.accountId, bucket, debit: Money.zero(), credit: Money.zero() };
+    cur.debit = cur.debit.plus(l.debit);
+    cur.credit = cur.credit.plus(l.credit);
+    act.set(k, cur);
+  }
+  const jobs = [...names.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  if (jobs.length > 100) throw validation('More than 100 customers and jobs have activity in this period. Choose a shorter date range.');
+  const keys = jobs.map(([id]) => id);
+  const hasNone = [...act.values()].some((r) => r.bucket === '');
+  if (hasNone) keys.push('');
+  const columns: StdColumn[] = [
+    { key: 'label', header: '' },
+    ...jobs.map(([, name], i) => ({ key: `c${i}`, header: name, type: 'money' as const })),
+    ...(hasNone ? [{ key: `c${jobs.length}`, header: 'No customer:job', type: 'money' as const }] : []),
+    { key: 'total', header: 'TOTAL', type: 'money' },
+  ];
+  const amountKeys = [...keys.map((_, i) => `c${i}`), 'total'];
+  const rowsIn = [...act.values()].map((r) => ({ accountId: r.accountId, bucket: r.bucket, debit: toAmountString(r.debit), credit: toAmountString(r.credit) }));
+  const amounts = plAmountsFromActivity(meta, rowsIn, amountKeys.length, (b) => [keys.indexOf(b ?? ''), keys.length]);
+  const built = buildPLRows({ meta, amounts, columns, amountKeys, hrefFor: accountDetailHref(from, to, { basis, classId: p.classId }) });
+  for (const r of built.rows) {
+    const m = /:a:([0-9a-f-]{36})(?::other)?$/.exec(r.id);
+    if (!m || r.kind !== 'data') continue;
+    r.hrefs = {};
+    keys.forEach((k, i) => {
+      if (k) r.hrefs![`c${i}`] = stdHref('transaction-detail-by-account', { accountId: m[1], customerId: k, classId: p.classId, from: dayStr(from), to: dayStr(to), basis });
+    });
+  }
+  return {
+    key: 'profit-loss-by-job',
+    title: 'Profit & Loss by Job',
+    subtitle: `${rangeLabel(from, to)}${basisSuffix(basis)}`,
+    columns,
+    rows: built.rows,
+    truncated,
+    notes: truncated ? ['Only the first 50,000 lines were included. Choose a shorter date range.'] : undefined,
+  };
 }
 
 // ===========================================================================
@@ -761,11 +821,147 @@ export async function balanceSheetDetail(ctx: ServiceContext, p: ReportParams): 
   };
 }
 
+/**
+ * General Ledger (QB): every account with activity — beginning balance, the period's postings
+ * with a running balance, ending balance. Balance-sheet accounts open with their balance before
+ * the From date; income and expense accounts open with their fiscal-year-to-date amount (they
+ * start each fiscal year at zero). Runs on either basis, with all detail filters.
+ */
+export async function generalLedgerReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const meta = await loadAccountMeta(ctx);
+  if (p.accountId && !meta.has(p.accountId)) throw notFound('Account');
+  const f = glFilterFromParams(meta, p, { from, to });
+  const { lines, truncated } = await fetchGlLines(ctx, meta, f);
+  const dayBefore = new Date(from.getTime() - 1);
+  const fyStart = fiscalWindowFor(from, await companyFiscalYearEnd(ctx)).start;
+  // Opening balances only make sense when no line-level filter (name, type, amount…) is on.
+  const lineFiltered = !!(p.customerId || p.vendorId || p.employeeId || p.nameId || p.txnType || p.amountMin || p.amountMax || p.memo || p.number || (p.cleared && p.cleared !== 'any') || p.classId);
+  const opening = new Map<string, Decimal>();
+  if (!lineFiltered) {
+    const [bsBefore, plBefore] = await Promise.all([
+      activityByAccount(ctx, { to: dayBefore, accountIds: f.accountIds, basis: f.basis }),
+      fyStart < from ? activityByAccount(ctx, { from: fyStart, to: dayBefore, accountIds: f.accountIds, basis: f.basis, excludeClose: true }) : Promise.resolve([]),
+    ]);
+    for (const r of bsBefore) {
+      const a = meta.get(r.accountId);
+      if (!a || isPLSection(a.section) || (f.sections && !f.sections.includes(a.section))) continue;
+      const v = naturalAmount(a.section, r.debit, r.credit);
+      if (!v.isZero()) opening.set(r.accountId, (opening.get(r.accountId) ?? Money.zero()).plus(v));
+    }
+    for (const r of plBefore) {
+      const a = meta.get(r.accountId);
+      if (!a || !isPLSection(a.section) || (f.sections && !f.sections.includes(a.section))) continue;
+      const v = naturalAmount(a.section, r.debit, r.credit);
+      if (!v.isZero()) opening.set(r.accountId, (opening.get(r.accountId) ?? Money.zero()).plus(v));
+    }
+  }
+  const laid = layoutDetail(lines, {
+    columns: detailColumns(DEFAULT_DETAIL_KEYS),
+    groupBy: 'account',
+    sortBy: p.sortBy,
+    sortDir: p.sortDir,
+    natural: true,
+    running: true,
+    opening,
+    openingOnlyGroups: [...opening.keys()].map((id) => ({ key: id, label: meta.get(id)!.fullName })),
+    idPrefix: 'gl',
+    hrefForGroup: (k) => (k ? `/registers/${k}` : undefined),
+  });
+  // A grand total across assets, liabilities, income and expenses means nothing — drop it.
+  laid.rows.pop();
+  const acct = p.accountId ? meta.get(p.accountId) : undefined;
+  return {
+    key: 'general-ledger',
+    title: 'General Ledger',
+    subtitle: [rangeLabel(from, to), acct ? `Account: ${acct.fullName}` : '', basisOf(p) ? 'Cash Basis' : ''].filter(Boolean).join(' · '),
+    columns: detailColumns(DEFAULT_DETAIL_KEYS),
+    rows: laid.rows,
+    truncated,
+    notes: [
+      ...detailNotes(truncated),
+      ...(lineFiltered ? ['Beginning balances are left out because a filter is on.'] : []),
+    ],
+  };
+}
+
+/**
+ * Statement of Cash Flows (QB, indirect method): Net Income, then the change in each other
+ * current asset / liability (operating), fixed and other assets (investing), long-term
+ * liabilities and equity (financing); net cash increase, cash at beginning and end of period.
+ * Same classification as cashFlow() in reportsExtra.ts. QuickZoom on every line.
+ */
+export async function statementOfCashFlows(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const meta = await loadAccountMeta(ctx);
+  const cf = await cashFlowData(ctx, { from, to });
+  const openingCash = await activityByAccount(ctx, { to: new Date(from.getTime() - 1) });
+  let cashStart = Money.zero();
+  for (const r of openingCash) {
+    const a = meta.get(r.accountId);
+    if (a && isCashAccount(a)) cashStart = cashStart.plus(Money.sub(r.debit, r.credit));
+  }
+  const q = { from: dayStr(from), to: dayStr(to) };
+  const zoomAcct = (id: string) => stdHref('transaction-detail-by-account', { accountId: id, ...q });
+  const rows: StdRow[] = [];
+  const line = (id: string, label: string, v: string, href: string | null, depth = 1, kind: StdRow['kind'] = 'data', parentId?: string) =>
+    rows.push({ id, parentId, depth, kind, cells: { label, total: v }, href });
+  const section = (id: string, label: string) => rows.push({ id, depth: 0, kind: 'section', collapseKind: 'section', cells: { label } });
+  section('scf:op', 'OPERATING ACTIVITIES');
+  line('scf:ni', 'Net Income', cf.operating.netIncome, stdHref('profit-loss', q), 1, 'data', 'scf:op');
+  rows.push({ id: 'scf:adj', parentId: 'scf:op', depth: 1, kind: 'section', cells: { label: 'Adjustments to reconcile Net Income to net cash provided by operations:' } });
+  const adj: [string, string, string, string | null][] = [];
+  if (!Money.of(cf.operating.changeInAR).isZero()) adj.push(['scf:ar', 'Accounts Receivable', cf.operating.changeInAR, stdHref('transaction-detail-by-account', { section: 'ar', ...q })]);
+  if (!Money.of(cf.operating.changeInInventory).isZero()) adj.push(['scf:inv', 'Inventory Asset', cf.operating.changeInInventory, stdHref('transaction-detail-by-account', { section: 'other_current_asset', ...q })]);
+  if (!Money.of(cf.operating.changeInAP).isZero()) adj.push(['scf:ap', 'Accounts Payable', cf.operating.changeInAP, stdHref('transaction-detail-by-account', { section: 'ap', ...q })]);
+  for (const l of cf.operating.otherChanges) adj.push([`scf:o:${l.accountId}`, meta.get(l.accountId)?.fullName ?? l.name, l.amount, zoomAcct(l.accountId)]);
+  for (const [id, label, v, href] of adj) line(id, label, v, href, 2, 'data', 'scf:op');
+  line('scf:optotal', 'Net cash provided by Operating Activities', cf.operating.total, null, 0, 'total');
+  section('scf:invest', 'INVESTING ACTIVITIES');
+  for (const l of cf.investing.lines) line(`scf:i:${l.accountId}`, meta.get(l.accountId)?.fullName ?? l.name, l.amount, zoomAcct(l.accountId), 1, 'data', 'scf:invest');
+  line('scf:invtotal', 'Net cash provided by Investing Activities', cf.investing.total, null, 0, 'total');
+  section('scf:fin', 'FINANCING ACTIVITIES');
+  for (const l of cf.financing.lines) line(`scf:f:${l.accountId}`, meta.get(l.accountId)?.fullName ?? l.name, l.amount, zoomAcct(l.accountId), 1, 'data', 'scf:fin');
+  line('scf:fintotal', 'Net cash provided by Financing Activities', cf.financing.total, null, 0, 'total');
+  line('scf:net', 'Net cash increase for period', cf.netCashChange, stdHref('transaction-detail-by-account', { section: 'bank', ...q }), 0, 'total');
+  line('scf:begin', 'Cash at beginning of period', toAmountString(cashStart), null, 0, 'data');
+  line('scf:end', 'Cash at end of period', toAmountString(cashStart.plus(Money.of(cf.netCashChange))), null, 0, 'grand');
+  const ties = Money.eq(cf.netCashChange, cf.cashAccountsChange);
+  return {
+    key: 'statement-of-cash-flows',
+    title: 'Statement of Cash Flows',
+    subtitle: rangeLabel(from, to),
+    columns: [{ key: 'label', header: '' }, { key: 'total', header: rangeLabel(from, to), type: 'money' }],
+    rows,
+    balanced: ties,
+  };
+}
+
 /** Journal — every posted entry with all of its lines and per-entry debit/credit totals. */
-export async function journalReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+export async function journalReport(
+  ctx: ServiceContext,
+  p: ReportParams,
+  o: { adjustingOnly?: boolean } = {},
+): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
   const meta = await loadAccountMeta(ctx);
   const f = glFilterFromParams(meta, p, { from, to });
+  if (o.adjustingOnly) {
+    // QB Adjusting Journal Entries: only entries marked "Adjusting Entry".
+    const adj = await ctx.db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          eq(journalEntries.isAdjusting, true),
+          eq(journalEntries.status, 'posted'),
+          gte(journalEntries.date, from),
+          lte(journalEntries.date, to),
+        ),
+      );
+    f.entryIds = adj.map((r) => r.id);
+  }
   // Filters pick ENTRIES; the report then shows each matching entry in full.
   const { lines: hits, truncated: t1 } = await fetchGlLines(ctx, meta, f);
   const entryIds = [...new Set(hits.map((l) => l.entryId))];
@@ -819,8 +1015,8 @@ export async function journalReport(ctx: ServiceContext, p: ReportParams): Promi
   rows.push({ id: 'j:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', debit: toAmountString(tD), credit: toAmountString(tC) } });
   const truncated = t1 || t2;
   return {
-    key: 'journal',
-    title: 'Journal',
+    key: o.adjustingOnly ? 'adjusting-journal-entries' : 'journal',
+    title: o.adjustingOnly ? 'Adjusting Journal Entries' : 'Journal',
     subtitle: rangeLabel(from, to),
     columns: detailColumns(['label', 'type', 'date', 'num', 'name', 'memo', 'account', 'class', 'debit', 'credit']).map((c) =>
       c.key === 'label' ? { ...c, header: 'Trans #' } : c,

@@ -85,6 +85,12 @@ export const reportParamsSchema = z
     /** Summary vs detail variants of the same report (e.g. time reports). */
     view: z.enum(['summary', 'detail']).optional(),
     vehicle: z.string().max(100).optional(),
+    /** Aging reports: days per aging column (QB "Interval (days)", default 30). */
+    interval: z.string().regex(/^[0-9]{1,3}$/, 'must be a whole number of days').refine((v) => +v >= 1 && +v <= 365, 'must be 1 to 365 days').optional(),
+    /** Aging reports: last aged column (QB "Through (days past due)", default 90). */
+    through: z.string().regex(/^[0-9]{1,4}$/, 'must be a whole number of days').refine((v) => +v >= 1 && +v <= 3650, 'must be 1 to 3650 days').optional(),
+    /** Aging reports: age from the due date (QB default) or the transaction date. */
+    agingFrom: z.enum(['due_date', 'transaction_date']).optional(),
     /** Relative date range (resolved to from / to / asOf when the report runs). */
     dates: z
       .enum([
@@ -98,6 +104,9 @@ export const reportParamsSchema = z
   .superRefine((p, ctx) => {
     if (p.from && p.to && p.from > p.to) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['to'], message: 'The "To" date is before the "From" date.' });
+    }
+    if (p.interval && p.through && Math.ceil(+p.through / +p.interval) > 24) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['interval'], message: 'That makes more than 24 aging columns. Use a longer interval or a shorter "through".' });
     }
     if (p.amountMin && p.amountMax && Number(p.amountMin) > Number(p.amountMax)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['amountMax'], message: 'Maximum amount is less than the minimum.' });

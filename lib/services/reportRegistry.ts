@@ -14,8 +14,11 @@ import { DATE_MACROS, companyFiscalYearEnd, resolveDateMacro, type DateMacro } f
 import {
   balanceSheetDetail,
   balanceSheetReport,
+  generalLedgerReport,
   journalReport,
   profitAndLossByClassReport,
+  profitAndLossByJobReport,
+  statementOfCashFlows,
   profitAndLossDetail,
   profitAndLossReport,
   profitAndLossYtdComparison,
@@ -37,6 +40,10 @@ import {
   itemPriceList,
   openPurchaseOrders,
   purchasesByItemDetail,
+  purchasesByItemSummary,
+  purchasesByVendorSummary,
+  salesByCustomerSummary,
+  salesByItemSummary,
   openSalesOrdersByCustomer,
   openSalesOrdersByItem,
   salesByCustomerDetail,
@@ -57,6 +64,17 @@ import {
 } from './reportsJobsTime';
 import { budgetOverviewReport, budgetVsActualReport } from './budgets';
 import { combinedAging, combinedCashFlow, combinedProfitAndLossByMonth, combinedTrialBalance } from './consolidation';
+import {
+  apAgingDetailReport,
+  apAgingSummaryReport,
+  arAgingDetailReport,
+  arAgingSummaryReport,
+  collectionsStdReport,
+  openInvoicesReport,
+} from './reportsAging';
+import { salesTaxLiabilityStd } from './reportsSalesTax';
+import { companies } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 
 type Runner = (ctx: ServiceContext, p: ReportParams) => Promise<StdReport>;
 
@@ -71,6 +89,25 @@ export const REPORT_RUNNERS: Record<string, Runner> = {
   'profit-loss-percent': (c, p) =>
     profitAndLossReport(c, p, { percentOfIncome: true, key: 'profit-loss-percent', title: 'Profit & Loss % of Income' }),
   'pl-by-class': profitAndLossByClassReport,
+  'profit-loss-by-job': profitAndLossByJobReport,
+  'balance-sheet-prev-year': async (c, p) => {
+    const r = await balanceSheetReport(c, { ...p, compare: p.compare && p.compare !== 'none' ? p.compare : 'prev_year' });
+    return { ...r, key: 'balance-sheet-prev-year', title: 'Balance Sheet Prev Year Comparison' };
+  },
+  'statement-of-cash-flows': statementOfCashFlows,
+  'general-ledger': generalLedgerReport,
+  'adjusting-journal-entries': (c, p) => journalReport(c, p, { adjustingOnly: true }),
+  'ar-aging-summary': arAgingSummaryReport,
+  'ar-aging-detail': arAgingDetailReport,
+  'ap-aging-summary': apAgingSummaryReport,
+  'ap-aging-detail': apAgingDetailReport,
+  'open-invoices': openInvoicesReport,
+  'collections-report': collectionsStdReport,
+  'sales-by-customer-summary': salesByCustomerSummary,
+  'sales-by-item-summary': salesByItemSummary,
+  'purchases-by-item-summary': purchasesByItemSummary,
+  'purchases-by-vendor-summary': purchasesByVendorSummary,
+  'sales-tax-liability': salesTaxLiabilityStd,
   'balance-sheet': (c, p) => balanceSheetReport(c, p),
   'balance-sheet-summary': (c, p) => balanceSheetReport(c, p, { summary: true }),
   'balance-sheet-detail': balanceSheetDetail,
@@ -165,12 +202,23 @@ export async function runStandardReport(
     merged.to = r.to;
     merged.asOf = r.to;
   }
+  // QB Preferences > Reports "Summary reports basis": the default for reports offered on both
+  // bases. An explicit basis (the toolbar toggle, a memorized or scheduled report) always wins.
+  if (entry.basis && merged.basis === undefined) merged.basis = await companyReportBasis(ctx);
   const parsed = parseReportParams(merged);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
     throw validation(`${issue?.path?.join('.') || 'Report option'}: ${issue?.message ?? 'invalid value'}`, parsed.error.issues);
   }
-  return runner(ctx, parsed.data);
+  const report = await runner(ctx, parsed.data);
+  if (entry.basis) report.basis = parsed.data.basis === 'cash' ? 'cash' : 'accrual';
+  return report;
+}
+
+/** The company's default report basis (companies.settings.reportBasis; accrual when unset). */
+export async function companyReportBasis(ctx: ServiceContext): Promise<'accrual' | 'cash'> {
+  const [row] = await ctx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
+  return (row?.settings as { reportBasis?: string } | null)?.reportBasis === 'cash' ? 'cash' : 'accrual';
 }
 
 /** Catalog keys missing a runner (should be empty — guarded by tests). */

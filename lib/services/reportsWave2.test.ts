@@ -267,7 +267,7 @@ describe('sales & purchases detail, open orders, lists', () => {
     const prep = await incomeTaxPreparation(ctx, {}, mapper as never);
     expect(prep.rows.find((x) => x.cells.label === 'Sales')!.cells.taxLine).toBe('Gross receipts');
     const dflt = await incomeTaxPreparation(ctx, {});
-    expect(dflt.rows.every((x) => x.cells.taxLine === '<Unassigned>')).toBe(true);
+    expect(dflt.rows.every((x) => String(x.cells.taxLine).startsWith('Tax Line Unassigned'))).toBe(true);
   });
 });
 

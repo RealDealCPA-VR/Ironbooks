@@ -142,7 +142,7 @@ describe('run-due routes: internal token', () => {
   }
 
   it('the trusted run serves every company in the file (P1: not just the oldest)', async () => {
-    await db.insert(userCompanies).values({ userId: otherCtx.userId, companyId: otherCtx.companyId, role: 'owner' }).onConflictDoNothing();
+    await db.insert(userCompanies).values({ userId: otherCtx.userId!, companyId: otherCtx.companyId, role: 'owner' }).onConflictDoNothing();
     const m = await saveMemorizedReport(otherCtx, { name: 'Other TB', reportType: 'trial-balance', config: {} });
     const s = await createReportSchedule(otherCtx, { name: 'Other daily', memorizedReportId: m.id, frequency: 'daily', startDate: '2026-01-05' });
     const first = await dueTb('First co');
