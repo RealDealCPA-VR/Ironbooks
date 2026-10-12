@@ -709,7 +709,7 @@ export async function restoreCondenseArchive(
   ctx: ServiceContext,
   archiveId: string,
   dataDir?: string,
-): Promise<{ restored: true; archive: CondenseArchive }> {
+): Promise<{ restored: true; archive: CondenseArchive; notices?: string[] }> {
   assertWrite(ctx);
   if (ctx.role && ctx.role !== 'owner' && ctx.role !== 'admin') {
     throw new ServiceError('FORBIDDEN', 'Only the company owner or an admin can restore an archive copy.');
@@ -719,6 +719,6 @@ export async function restoreCondenseArchive(
   if (!archive.available) {
     throw new ServiceError('NOT_FOUND', `The archive file is missing: ${archive.filename}`);
   }
-  await restoreBackup(fs.readFileSync(archive.path), resolveDataDir(dataDir));
-  return { restored: true, archive };
+  const result = await restoreBackup(fs.readFileSync(archive.path), resolveDataDir(dataDir));
+  return result.notices?.length ? { restored: true, archive, notices: result.notices } : { restored: true, archive };
 }

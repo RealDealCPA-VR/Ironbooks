@@ -260,10 +260,13 @@ export default function BackupPage() {
         return;
       }
 
+      const data = (await res.json().catch(() => ({}))) as { notices?: string[] };
       toast(
         'Restore complete. Please restart the application to see the restored data.',
         'success',
       );
+      // The books balance, but Verify Data found something to tidy up (e.g. A/R vs open invoices).
+      if (data.notices?.length) toast(data.notices.join(' '), 'info');
       setRestoreModalOpen(false);
       setPendingFile(null);
     } catch {
@@ -336,12 +339,13 @@ export default function BackupPage() {
     if (!archiveToRestore || archiveConfirmText !== 'RESTORE') return;
     setRestoringArchive(true);
     try {
-      await api.post('/api/condense/archives', { id: archiveToRestore.id });
+      const result = await api.post<{ notices?: string[] }>('/api/condense/archives', { id: archiveToRestore.id });
       toast(
         `Archive copy from ${new Date(archiveToRestore.createdAt).toLocaleDateString('en-US')} restored — ` +
           'the full transaction detail is back. Reloading…',
         'success',
       );
+      if (result?.notices?.length) toast(result.notices.join(' '), 'info');
       setArchiveToRestore(null);
       setArchiveConfirmText('');
       setTimeout(() => window.location.reload(), 1200);

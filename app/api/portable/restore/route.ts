@@ -20,6 +20,7 @@ import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { withDamagedFileAccess } from '@/lib/db';
 import {
   defaultPortableRestoreDir,
   readPortableManifest,
@@ -56,7 +57,10 @@ export async function POST(req: NextRequest) {
   try {
     const internal = isInternal(req);
     if (!internal) {
-      const ctx = await getServerContext();
+      // The active company file is only used to check who is asking: opening a portable file
+      // into a NEW folder never touches it, so it stays possible when the active file is damaged
+      // (a damaged file is refused everywhere else; lib/db/index.ts).
+      const ctx = await withDamagedFileAccess(() => getServerContext());
       // Same rule as creating a portable file: only the owner/admin may open one.
       if (ctx.role !== 'owner' && ctx.role !== 'admin') {
         throw new ServiceError('FORBIDDEN', 'Only the company owner or an admin can open a portable company file.');

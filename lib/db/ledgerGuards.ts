@@ -98,8 +98,9 @@ async function rows<T>(db: Raw, text: string): Promise<T[]> {
 }
 
 /**
- * Re-install every ledger guard from the migration files, then force every bka_* trigger to
- * ENABLE ALWAYS. Runs in one transaction: either every guard is (re)installed or nothing changes
+ * Re-install every ledger guard from the migration files, force every bka_* trigger to
+ * ENABLE ALWAYS, and switch every other disabled trigger (including the database's internal
+ * foreign-key triggers) back on. Runs in one transaction: either every guard is (re)installed or nothing changes
  * and the error propagates (the caller must then refuse the file).
  */
 export async function ensureLedgerGuards(client: PGlite, migrationsFolder: string): Promise<void> {
@@ -116,15 +117,43 @@ export async function ensureLedgerGuards(client: PGlite, migrationsFolder: strin
         WHERE NOT t.tgisinternal AND t.tgname LIKE 'bka\\_%' AND t.tgenabled <> 'A'`,
     );
     for (const r of off) {
-      await tx.exec(`ALTER TABLE "${r.tbl.replace(/"/g, '""')}" ENABLE ALWAYS TRIGGER "${r.tgname.replace(/"/g, '""')}"`);
+      await tx.exec(`ALTER TABLE ${qi(r.tbl)} ENABLE ALWAYS TRIGGER ${qi(r.tgname)}`);
+    }
+    // `ALTER TABLE ... DISABLE TRIGGER ALL` (the usual offline tampering) also switches off the
+    // database's own foreign-key triggers (RI_ConstraintTrigger_*). With those off, a journal line
+    // can point at an entry or account that does not exist. Switch every disabled trigger back on
+    // (internal ones in disabled or replica-only mode too; PGlite runs as superuser, which
+    // enabling internal triggers requires).
+    const disabled = await rows<{ nsp: string; tbl: string; tgname: string }>(tx, DISABLED_TRIGGERS_SQL);
+    for (const r of disabled) {
+      await tx.exec(`ALTER TABLE ${qi(r.nsp)}.${qi(r.tbl)} ENABLE TRIGGER ${qi(r.tgname)}`);
     }
   });
 }
+
+function qi(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Triggers on this file's own tables that are switched off: any trigger in disabled mode ('D'),
+ * plus internal (foreign-key) triggers in replica-only mode ('R'), which never fire normally.
+ */
+const DISABLED_TRIGGERS_SQL = `
+  SELECT n.nspname AS nsp, c.relname AS tbl, t.tgname, t.tgisinternal
+    FROM pg_trigger t
+    JOIN pg_class c ON c.oid = t.tgrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+     AND n.nspname NOT LIKE 'pg\\_%'
+     AND (t.tgenabled = 'D' OR (t.tgisinternal AND t.tgenabled = 'R'))
+   ORDER BY n.nspname, c.relname, t.tgname`;
 
 export type LedgerProblemKind =
   | 'guards'
   | 'unbalanced_entries'
   | 'cross_company'
+  | 'orphan_lines'
   | 'non_posting'
   | 'cached_balances';
 
@@ -172,6 +201,19 @@ export async function checkLedgerHealth(
     });
   }
 
+  // (1b) No trigger switched off — including the database's own foreign-key triggers, which
+  //      DISABLE TRIGGER ALL turns off along with the ledger guards.
+  const disabled = await rows<{ tbl: string; tgname: string; tgisinternal: boolean }>(db, DISABLED_TRIGGERS_SQL);
+  if (disabled.length) {
+    const fk = disabled.filter((d) => d.tgisinternal).length;
+    problems.push({
+      kind: 'guards',
+      detail: `${disabled.length} database safety trigger${disabled.length === 1 ? ' is' : 's are'} turned off${
+        fk ? ` (${fk} of them enforce links between records, such as journal lines to their entries)` : ''
+      }.`,
+    });
+  }
+
   // (2) Every posted entry: at least two lines, each with exactly one positive side of at most
   //     2 decimals, and debits = credits (mirrors bka_assert_entry_balanced).
   const unbalanced = await rows<{ entry_number: number; debit: string; credit: string }>(
@@ -206,14 +248,36 @@ export async function checkLedgerHealth(
     `SELECT count(*)::int AS n
        FROM journal_entry_lines l
        JOIN journal_entries e ON e.id = l.journal_entry_id
-       LEFT JOIN accounts a ON a.id = l.account_id
+       JOIN accounts a ON a.id = l.account_id
       WHERE a.company_id IS DISTINCT FROM e.company_id`,
   );
   if (Number(cross?.n ?? 0) > 0) {
     problems.push({
       kind: 'cross_company',
-      detail: `${cross.n} journal line${Number(cross.n) === 1 ? '' : 's'} point at an account that belongs to another company or no longer exists.`,
+      detail: `${cross.n} journal line${Number(cross.n) === 1 ? '' : 's'} point at an account that belongs to another company.`,
     });
+  }
+
+  // (3b) No orphan lines: every line belongs to an existing entry and an existing account. The
+  //      foreign keys normally make this impossible, but a file edited with its triggers off can
+  //      carry them — amounts that move account balances yet appear on no entry or report.
+  const [orphan] = await rows<{ no_entry: number; no_account: number }>(
+    db,
+    `SELECT count(*) FILTER (WHERE e.id IS NULL)::int AS no_entry,
+            count(*) FILTER (WHERE a.id IS NULL)::int AS no_account
+       FROM journal_entry_lines l
+       LEFT JOIN journal_entries e ON e.id = l.journal_entry_id
+       LEFT JOIN accounts a ON a.id = l.account_id
+      WHERE e.id IS NULL OR a.id IS NULL`,
+  );
+  const noEntry = Number(orphan?.no_entry ?? 0);
+  const noAccount = Number(orphan?.no_account ?? 0);
+  if (noEntry || noAccount) {
+    const parts = [
+      noEntry && `${noEntry} journal line${noEntry === 1 ? ' belongs' : 's belong'} to a journal entry that does not exist`,
+      noAccount && `${noAccount} journal line${noAccount === 1 ? ' is' : 's are'} on an account that does not exist`,
+    ].filter(Boolean);
+    problems.push({ kind: 'orphan_lines', detail: `${parts.join(', and ')}.` });
   }
 
   // (4) No posted amount on a non-posting account.
@@ -269,5 +333,6 @@ export const OPEN_BLOCKING: ReadonlySet<LedgerProblemKind> = new Set([
   'guards',
   'unbalanced_entries',
   'cross_company',
+  'orphan_lines',
   'non_posting',
 ]);

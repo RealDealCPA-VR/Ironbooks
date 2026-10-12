@@ -349,7 +349,23 @@ async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string
   const rows = (res as unknown as { rows: Array<{ tgname: string }> }).rows ?? [];
   const present = new Set(rows.map((r) => r.tgname));
   const expected = Object.keys(LEDGER_GUARD_TRIGGERS);
-  return { missing: expected.filter((t) => !present.has(t)), total: expected.length };
+  // DISABLE TRIGGER ALL also switches off the database's own foreign-key triggers; with those off
+  // a journal line can point at an entry or account that does not exist.
+  const fk = await ctx.db.execute(
+    sql`SELECT count(*)::int AS n FROM pg_trigger t
+          JOIN pg_class c ON c.oid = t.tgrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE t.tgisinternal AND t.tgenabled IN ('D', 'R')
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema')`,
+  );
+  const fkOff = Number((fk as unknown as { rows: Array<{ n: number }> }).rows?.[0]?.n ?? 0);
+  return {
+    missing: [
+      ...expected.filter((t) => !present.has(t)),
+      ...(fkOff ? [`${fkOff} record-link (foreign key) trigger${fkOff === 1 ? '' : 's'}`] : []),
+    ],
+    total: expected.length,
+  };
 }
 
 async function checkLedgerGuards(ctx: ServiceContext): Promise<IntegrityCheck> {

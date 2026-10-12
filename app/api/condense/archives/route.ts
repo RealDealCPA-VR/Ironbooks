@@ -8,10 +8,15 @@
  *
  * SECURITY: middleware excludes /api from the session check, so both handlers fail closed via
  * getServerContext() before doing anything.
+ *
+ * DAMAGED FILES: both handlers run with damaged-file access (lib/db/index.ts). A company file
+ * whose ledger is damaged is refused everywhere else, but restoring a pre-condense archive copy
+ * is one of the recovery paths the Back Up and Restore page offers, so it must still work (the
+ * restored copy is verified before it goes live; restoreBackup). Permission checks are unchanged.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { resolveDataDir } from '@/lib/db';
+import { resolveDataDir, withDamagedFileAccess } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { listCondenseArchives, restoreCondenseArchive } from '@/lib/services/condense';
 import { ServiceError } from '@/lib/services/_base';
@@ -34,6 +39,14 @@ function errorResponse(err: unknown) {
 }
 
 export async function GET() {
+  return withDamagedFileAccess(() => handleGet());
+}
+
+export async function POST(req: NextRequest) {
+  return withDamagedFileAccess(() => handlePost(req));
+}
+
+async function handleGet() {
   try {
     const ctx = await getServerContext();
     const archives = listCondenseArchives(dataDirOf(ctx.db) ?? resolveDataDir())
@@ -45,7 +58,7 @@ export async function GET() {
   }
 }
 
-export async function POST(req: NextRequest) {
+async function handlePost(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     // Restoring an archive copy replaces the whole company file (every company in it): same
@@ -65,7 +78,11 @@ export async function POST(req: NextRequest) {
     }
     const result = await restoreCondenseArchive(ctx, id, dir);
     const { path: _path, dataDir: _dir, ...summary } = result.archive;
-    return NextResponse.json({ restored: true, archive: summary });
+    return NextResponse.json({
+      restored: true,
+      archive: summary,
+      ...(result.notices?.length ? { notices: result.notices } : {}),
+    });
   } catch (err) {
     return errorResponse(err);
   }

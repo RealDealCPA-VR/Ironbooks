@@ -481,6 +481,11 @@ describe('damaged files: isolation, permissions and recovery paths', () => {
         },
       ]),
     );
+    // Keep a raw copy of the damaged file: this restore replaces it, and the next test needs it
+    // damaged again.
+    await closeDb(damaged.dir);
+    const damagedCopy = `${damaged.dir}.copy`;
+    fs.cpSync(damaged.dir, damagedCopy, { recursive: true });
     const { POST } = await import('@/app/api/condense/archives/route');
     const res = await withRouteEnv(damaged.dir, damaged.userId, () =>
       POST(
@@ -493,6 +498,14 @@ describe('damaged files: isolation, permissions and recovery paths', () => {
     );
     const body = await res.json();
     expect(res.status, JSON.stringify(body)).toBe(200);
+    // The archive copy is now the company file, and it opens.
+    const restored = await getDb(damaged.dir);
+    expect((await restored.select({ name: companies.name }).from(companies)).map((c) => c.name)).toEqual(['Live Co']);
+    // Put the damaged file back for the next test.
+    await closeDb(damaged.dir);
+    fs.rmSync(damaged.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    fs.renameSync(damagedCopy, damaged.dir);
+    await expect(getDb(damaged.dir)).rejects.toBeInstanceOf(LedgerDamagedError);
   });
 
   it('POST /api/backup by the owner replaces the damaged file with a good backup', async () => {
