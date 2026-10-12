@@ -89,6 +89,8 @@ export interface LiabilityAdjustmentInput {
 
 const KINDS: AdjustmentLineKind[] = ['earning', 'tax', 'deduction', 'employer_contribution'];
 
+const UNDEPOSITED_FUNDS_CODE = '1050';
+
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string | null> {
   const [row] = await ctx.db
     .select({ id: accounts.id })
@@ -104,13 +106,14 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
  */
 async function requireAccount(ctx: ServiceContext, id: string, label: string, allowed: 'bank' | 'expense') {
   const [row] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, isActive: accounts.isActive })
+    .select({ id: accounts.id, code: accounts.code, type: accounts.type, subtype: accounts.subtype, isActive: accounts.isActive })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
   if (!row) throw notFound(label);
+  // Undeposited Funds (1050) is seeded as 'checking' but is a holding account, not a bank.
   const ok =
     allowed === 'bank'
-      ? row.type === 'asset' && (row.subtype === 'checking' || row.subtype === 'savings')
+      ? row.type === 'asset' && (row.subtype === 'checking' || row.subtype === 'savings') && row.code !== UNDEPOSITED_FUNDS_CODE
       : row.type === 'expense';
   if (!ok) {
     throw validation(allowed === 'bank' ? `${label} must be a bank account (checking or savings).` : `${label} must be an expense account.`);

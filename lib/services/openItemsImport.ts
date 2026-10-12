@@ -94,6 +94,14 @@ export interface OpenItem {
    * document; on re-import only the change against what the books already hold is brought in.
    */
   docKey?: string | null;
+  /**
+   * IIF documents: what the QuickBooks document adds to the balance in this file (signed, owed >
+   * 0), at its full total. Recorded per document, so a later export with an edited total brings
+   * in only the change.
+   */
+  qbTotal?: string | null;
+  /** Date of the newest payment / credit / charge in this file applied to the item. */
+  changeDate?: string | null;
 }
 
 export interface ParsedOpenItems {
@@ -547,6 +555,52 @@ async function openItemMarkerExists(ctx: ServiceContext, tag: string): Promise<b
   return !!row;
 }
 
+/**
+ * The QuickBooks total each IIF document was last accounted for at (audit trail, newest version
+ * wins). A later export with a different total brings in only the change.
+ */
+const OPEN_ITEM_TOTAL = 'qb_open_item_total';
+async function lastQbTotal(ctx: ServiceContext, tag: string): Promise<{ total: Decimal; version: number } | null> {
+  const rows = await ctx.db
+    .select({ v: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, OPEN_ITEM_TOTAL),
+        eq(auditLogs.entityId, markerEntityId(ctx, `total|${tag}`)),
+      ),
+    );
+  let best: { total: Decimal; version: number } | null = null;
+  for (const r of rows) {
+    const v = r.v as { total?: unknown; version?: unknown } | null;
+    if (!v || typeof v.total !== 'string' || typeof v.version !== 'number') continue;
+    const total = parseAmount(v.total);
+    if (!total) continue;
+    if (!best || v.version > best.version) best = { total, version: v.version };
+  }
+  return best;
+}
+async function recordQbTotal(ctx: ServiceContext, side: LedgerSide, tag: string, total: string, item: OpenItem): Promise<void> {
+  const last = await lastQbTotal(ctx, tag);
+  if (last && Money.round2(last.total).eq(Money.round2(total))) return;
+  await writeAudit(ctx, {
+    action: 'create',
+    entityType: OPEN_ITEM_TOTAL,
+    entityId: markerEntityId(ctx, `total|${tag}`),
+    newValues: {
+      tag,
+      side,
+      name: item.name,
+      number: item.number ?? null,
+      date: item.date,
+      total: toAmountString(total),
+      version: (last?.version ?? 0) + 1,
+      note: 'QuickBooks document total this import accounted for — a later export with a different total brings in only the change.',
+    },
+  });
+}
+
 interface PlannedItem {
   item: OpenItem;
   /** [qbdoc:…] tag for IIF documents; null → the [qbopen:…] amount tag. */
@@ -562,10 +616,16 @@ async function planConversion(
   ctx: ServiceContext,
   side: LedgerSide,
   items: OpenItem[],
-): Promise<{ plan: PlannedItem[]; duplicates: OpenItem[]; markers: Array<{ tag: string; item: OpenItem }> }> {
+): Promise<{
+  plan: PlannedItem[];
+  duplicates: OpenItem[];
+  markers: Array<{ tag: string; item: OpenItem }>;
+  totals: Array<{ tag: string; total: string; item: OpenItem }>;
+}> {
   const plan: PlannedItem[] = [];
   const duplicates: OpenItem[] = [];
   const markers: Array<{ tag: string; item: OpenItem }> = [];
+  const totals: Array<{ tag: string; total: string; item: OpenItem }> = [];
   const groups = new Map<string, OpenItem[]>();
   for (const it of items) {
     if (!it.docKey) {
@@ -581,6 +641,8 @@ async function planConversion(
   for (const [key, group] of groups) {
     const tag = docTag(side, key);
     const live = group.filter((it) => Money.round2(it.openBalance).greaterThan(0));
+    const withTotal = group.find((it) => it.qbTotal != null);
+    if (withTotal) totals.push({ tag, total: withTotal.qbTotal!, item: withTotal });
     const existing = await existingDocOwed(ctx, tag);
     if (existing.count === 0) {
       for (const it of live) plan.push({ item: it, docTag: tag });
@@ -601,7 +663,13 @@ async function planConversion(
       item: {
         kind: more ? (ar ? 'invoice' : 'bill') : ar ? 'credit_memo' : 'vendor_credit',
         name: first.name,
-        date: group.reduce((d, it) => (it.date > d ? it.date : d), first.date),
+        // Dated at the newest change behind it (a new payment, or the document itself when only
+        // its total changed) — never earlier, so a closing date set between imports that covers
+        // the document but not the new payment does not block it.
+        date: group.reduce((d, it) => {
+          const latest = it.changeDate && it.changeDate > it.date ? it.changeDate : it.date;
+          return latest > d ? latest : d;
+        }, first.date),
         number: null,
         qbType: more ? 'Change since the earlier import (more owed)' : 'Change since the earlier import (payments / credits)',
         memo:
@@ -612,7 +680,7 @@ async function planConversion(
       },
     });
   }
-  return { plan, duplicates, markers };
+  return { plan, duplicates, markers, totals };
 }
 
 const KIND_LABEL: Record<OpenItemKind, string> = {
@@ -752,7 +820,7 @@ async function convertOne(ctx: ServiceContext, env: ConvertEnv, it: OpenItem, qb
 
 async function runConversion(ctx: ServiceContext, side: LedgerSide, items: OpenItem[], input: OpenItemsInput): Promise<OpenItemsResult> {
   const alreadyInGl = input.alreadyInGl ?? (await hasGlImport(ctx));
-  const { plan, duplicates, markers } = await planConversion(ctx, side, items);
+  const { plan, duplicates, markers, totals } = await planConversion(ctx, side, items);
 
   // Guard against double counting the other way: with alreadyInGl the documents only add
   // detail to a balance that must ALREADY be in the control accounts. If these items add up to
@@ -811,10 +879,14 @@ async function runConversion(ctx: ServiceContext, side: LedgerSide, items: OpenI
     result.skipped++;
     result.issues.push({ entity: side === 'ar' ? 'invoice' : 'bill', name: labelOf(it), reason: 'duplicate', message: 'Already brought in by an earlier import.' });
   }
+  const failedTags = new Set<string>();
   for (const { item: it, docTag: qbdoc } of plan) {
     const label = labelOf(it);
     try {
-      const r = await convertOne(ctx, env, it, qbdoc);
+      const r = await convertOne(ctx, env, it, qbdoc).catch((err) => {
+        if (qbdoc && err instanceof ServiceError) failedTags.add(qbdoc);
+        throw err;
+      });
       if (r === 'duplicate') {
         result.skipped++;
         result.issues.push({ entity: side === 'ar' ? 'invoice' : 'bill', name: label, reason: 'duplicate', message: 'Already brought in by an earlier import.' });
@@ -847,6 +919,9 @@ async function runConversion(ctx: ServiceContext, side: LedgerSide, items: OpenI
       },
     });
   }
+  // A document whose change could not be brought in keeps its earlier total, so the next import
+  // tries the change again.
+  for (const t of totals) if (!failedTags.has(t.tag)) await recordQbTotal(ctx, side, t.tag, t.total, t.item);
   result.reconciliation = await arApReconciliation(ctx);
   return result;
 }
@@ -907,6 +982,7 @@ function applyResidual(list: OpenItem[], r: Residual): Decimal {
     if (!rest.greaterThan(0)) break;
     const bal = Money.of(it.openBalance);
     const take = Decimal.min(bal, rest);
+    if (take.greaterThan(0) && r.date && (!it.changeDate || r.date > it.changeDate)) it.changeDate = r.date;
     it.openBalance = toAmountString(bal.minus(take));
     rest = rest.minus(take);
   }
@@ -986,9 +1062,12 @@ export async function importOpenItemsFromIif(
     return 'vendor_credit';
   };
   // Identity of the QuickBooks document — never its open balance or PAID flag, which change
-  // between exports as payments come in.
-  const keyOf = (t: IIFTransaction, type: string, name: string, date: string, total: Decimal) =>
-    ['doc', type, canonicalName(name).toLowerCase(), (t.num ?? '').trim(), date, toAmountString(total)].join('|');
+  // between exports as payments come in, nor (when it has a number) its total, which changes
+  // when the document is edited in QuickBooks. Without a number the total tells documents apart.
+  const keyOf = (t: IIFTransaction, type: string, name: string, date: string, total: Decimal) => {
+    const num = (t.num ?? '').trim();
+    return ['doc', type, canonicalName(name).toLowerCase(), num, date, ...(num ? [] : [toAmountString(total)])].join('|');
+  };
   // Documents an earlier import already handled: they stand in once, at what the books carry.
   const seenKeys = new Set<string>();
   const earlier = async (side: LedgerSide, docKey: string) => {
@@ -1004,19 +1083,37 @@ export async function importOpenItemsFromIif(
     const kind: OpenItemKind = owed.isPositive() ? (isAr ? 'invoice' : 'bill') : owed.isNegative() ? (isAr ? 'credit_memo' : 'vendor_credit') : fallbackKind;
     (isAr ? ar : ap).push({ ...base, kind, openBalance: toAmountString(owed.abs()) });
   };
+  const sideOf = (type: string): LedgerSide => (type === 'BILL' || type === 'BILLCRED' || type === 'BILL REFUND' ? 'ap' : 'ar');
+  // What each QuickBooks document adds to the balance in this file, at its full total (summed
+  // when the file repeats a document identity).
+  const fileTotals = new Map<string, Decimal>();
+  for (const t of txns) {
+    const type = t.type.trim().toUpperCase();
+    const date = parseQbDate(t.date);
+    const total = parseAmount(t.lines[0]?.amount);
+    const name = t.name ?? t.lines[0]?.name;
+    if (!date || !total || !name) continue;
+    const k = keyOf(t, type, name, date, total);
+    const owed = sideOf(type) === 'ar' ? total : total.negated();
+    fileTotals.set(k, (fileTotals.get(k) ?? Money.zero()).plus(owed));
+  }
   for (const t of txns) {
     const type = t.type.trim().toUpperCase();
     const label = `${t.type}${t.num ? ` #${t.num}` : ''}`;
-    const docSide: LedgerSide = type === 'BILL' || type === 'BILLCRED' || type === 'BILL REFUND' ? 'ap' : 'ar';
+    const docSide = sideOf(type);
     const date = parseQbDate(t.date);
     const total = parseAmount(t.lines[0]?.amount);
     const name = t.name ?? t.lines[0]?.name;
     const docKey = date && total && name ? keyOf(t, type, name, date, total) : null;
+    const qbTotal = docKey ? toAmountString(fileTotals.get(docKey)!) : null;
     const before = docKey ? await earlier(docSide, docKey) : null;
     if (before && docKey && date && total && name) {
       // Already brought in (or settled) by an earlier import: no new document, and its payments
-      // from back then are not applied again. New payments in this file still reduce it.
-      standIn(docSide, { name, date, number: t.num ?? null, qbType: t.type, docKey }, kindOf(type, total), before.owed);
+      // from back then are not applied again. New payments in this file still reduce it, and a
+      // total edited in QuickBooks since then adds (or takes off) only the difference.
+      const last = await lastQbTotal(ctx, docTag(docSide, docKey));
+      const edit = last ? Money.of(qbTotal!).minus(last.total) : Money.zero();
+      standIn(docSide, { name, date, number: t.num ?? null, qbType: t.type, docKey, qbTotal }, kindOf(type, total), before.owed.plus(edit));
       skipped++;
       issues.push({ entity: docSide === 'ap' ? 'bill' : 'invoice', name: label, reason: 'duplicate', message: 'Already brought in by an earlier import.' });
       continue;
@@ -1028,7 +1125,7 @@ export async function importOpenItemsFromIif(
       // Zero-balance placeholder: marks the document as handled, so a later import does not
       // apply its payment again.
       if (docKey && date && total && name) {
-        (docSide === 'ar' ? ar : ap).push({ kind: kindOf(type, total), name, date, number: t.num ?? null, qbType: t.type, openBalance: '0.00', docKey });
+        (docSide === 'ar' ? ar : ap).push({ kind: kindOf(type, total), name, date, number: t.num ?? null, qbType: t.type, openBalance: '0.00', docKey, qbTotal });
       }
       skipped++;
       issues.push({ entity: docSide === 'ap' ? 'bill' : 'invoice', name: label, reason: 'note', message: 'Marked paid in QuickBooks — not an open item, so it was not brought in.' });
@@ -1053,7 +1150,7 @@ export async function importOpenItemsFromIif(
     if (!applied.isZero()) touch(docSide, name, null, applied, true);
     const kind = kindOf(type, total);
     if (amount.isZero()) {
-      (docSide === 'ar' ? ar : ap).push({ kind, name, date, number: t.num ?? null, qbType: t.type, openBalance: '0.00', docKey });
+      (docSide === 'ar' ? ar : ap).push({ kind, name, date, number: t.num ?? null, qbType: t.type, openBalance: '0.00', docKey, qbTotal });
       continue;
     }
     const detail = t.lines
@@ -1073,6 +1170,7 @@ export async function importOpenItemsFromIif(
       memo: [t.memo, detail].filter(Boolean).join(' — ') || null,
       openBalance: toAmountString(amount),
       docKey,
+      qbTotal,
     });
     const isDoc = kind === 'invoice' || kind === 'bill';
     touch(docSide, name, null, isDoc ? amount.negated() : amount);

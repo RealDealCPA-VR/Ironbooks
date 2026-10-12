@@ -2042,6 +2042,17 @@ async function ensureBucketAccount(
 }
 
 /**
+ * Identity of an IIF transaction across imports (before the occurrence counter): type, number,
+ * date, total and the customer / vendor it is for. The name matters: two payments with no
+ * DOCNUM on the same day for the same amount from different customers are different money.
+ */
+function iifBaseKey(txn: IIFTransaction, date: Date, totalDebit: ReturnType<typeof Money.zero>): string {
+  const rawName = (txn.name?.trim() || (txn.lines.find((l) => l.name && l.name.trim())?.name ?? '')).trim();
+  const name = rawName.replace(/\s+/g, ' ').toLowerCase();
+  return `iif:${txn.type || 'TRNS'}:${txn.num || 'no-num'}:${date.toISOString().slice(0, 10)}:${toAmountString(totalDebit)}${name ? `:${encodeURIComponent(name)}` : ''}`;
+}
+
+/**
  * Named A/R and A/P rows of the transactions importIifTransactions will actually post (date
  * readable, every amount readable and unambiguous, rows balanced and within the ledger limits,
  * date not in a closed period or on/before the closing date — the same checks postJournalEntry
@@ -2091,7 +2102,7 @@ async function collectIifControlRows(
       rows.push({ side, name, amount: toAmountString(amt), date: date.toISOString().slice(0, 10) });
     }
     if (!ok || nonZero < 2 || !net.isZero()) continue;
-    const baseKey = `iif:${txn.type || 'TRNS'}:${txn.num || 'no-num'}:${date.toISOString().slice(0, 10)}:${toAmountString(totalDebit)}`;
+    const baseKey = iifBaseKey(txn, date, totalDebit);
     const occurrence = seenKeys.get(baseKey) ?? 0;
     seenKeys.set(baseKey, occurrence + 1);
     if (!rows.length) continue;
@@ -2207,7 +2218,7 @@ async function importIifTransactions(
       continue;
     }
 
-    const baseKey = `iif:${txn.type || 'TRNS'}:${txn.num || 'no-num'}:${date.toISOString().slice(0, 10)}:${toAmountString(totalDebit)}`;
+    const baseKey = iifBaseKey(txn, date, totalDebit);
     const occurrence = seenKeys.get(baseKey) ?? 0;
     seenKeys.set(baseKey, occurrence + 1);
     const sourceRef = `${baseKey}:${occurrence}`;
