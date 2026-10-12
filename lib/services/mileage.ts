@@ -68,6 +68,8 @@ export interface LogMilesInput {
   /** Odometer readings; when both are given, miles must equal end − start. */
   odometerStart?: number | string | null;
   odometerEnd?: number | string | null;
+  /** Vehicle driven (Mileage by Vehicle report). */
+  vehicle?: string | null;
 }
 
 export interface MileageSummaryGroup {
@@ -206,6 +208,7 @@ export async function logMiles(ctx: ServiceContext, input: LogMilesInput): Promi
       vehicleId: input.vehicleId ?? null,
       odometerStart: odoStart ? odoStart.toFixed(1) : null,
       odometerEnd: odoEnd ? odoEnd.toFixed(1) : null,
+      vehicle: input.vehicle?.trim() || null,
     })
     .returning();
 

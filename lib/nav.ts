@@ -25,6 +25,7 @@ import { PackageCheck, FileInput, SlidersHorizontal } from 'lucide-react';
 import { ClipboardCheck, Table2, Eraser } from 'lucide-react';
 // wave2 sales: Income Tracker, Collections Center, Batch Invoicing
 import { TrendingUp, PhoneCall } from 'lucide-react';
+import { Bookmark, LineChart, Grid3x3, Search } from 'lucide-react'; // wave2 reports
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -123,6 +124,10 @@ export const navGroups: NavGroup[] = [
       { icon: Banknote, label: 'Reconciliation Reports', path: '/reports/reconciliation' },
       { icon: Percent, label: 'Sales Tax Liability', path: '/reports/sales-tax' }, // wave2 accountant
       { icon: Network, label: 'Consolidated', path: '/reports/consolidated' },
+      { icon: Bookmark, label: 'Memorized Reports', path: '/reports/memorized' },
+      { icon: LineChart, label: 'Graphs', path: '/reports/graphs' },
+      { icon: Grid3x3, label: 'Advanced Reporting', path: '/reports/pivot' },
+      { icon: Search, label: 'Find Transactions', path: '/find' },
       { icon: AlertTriangle, label: 'AI Review', path: '/errors' },
     ],
   },

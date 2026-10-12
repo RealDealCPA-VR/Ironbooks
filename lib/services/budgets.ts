@@ -7,13 +7,32 @@
  *  - budgetVsActual calls profitAndLoss for the budget's fiscal year and matches income/expense
  *    accounts by accountId, returning [{accountId, code, name, budget, actual, variance}].
  */
-import { and, eq } from 'drizzle-orm';
-import { accounts, budgetLines, budgets } from '@/lib/db/schema';
+import { and, eq, isNotNull, isNull } from 'drizzle-orm';
+import { accounts, budgetLines, budgets, classes, customers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { profitAndLoss } from '@/lib/services/reports';
 import { profitAndLossByMonth, type ProfitAndLossByMonth } from '@/lib/services/reportsComparative';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
+import type Decimal from 'decimal.js';
+import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
+import type { ReportParams } from '@/lib/validation/reports';
+import {
+  BS_SECTIONS,
+  PL_SECTIONS,
+  SECTION_LABELS,
+  activityByAccount,
+  anyNonZero,
+  buildAccountTree,
+  buildPLRows,
+  fetchGlLines,
+  isPLSection,
+  loadAccountMeta,
+  naturalAmount,
+  zeros,
+  type AccountMeta,
+  type Amounts,
+} from './reportEngine';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -23,6 +42,10 @@ export interface Budget {
   id: string;
   name: string;
   fiscalYear: number;
+  /** 'profit_loss' (default) or 'balance_sheet'. */
+  kind?: string;
+  /** True for a Forecast (QB Forecasts), reported separately from budgets. */
+  isForecast?: boolean;
   createdAt: Date;
 }
 
@@ -30,6 +53,8 @@ export interface BudgetLine {
   id: string;
   budgetId: string;
   accountId: string;
+  classId?: string | null;
+  customerId?: string | null;
   month: number;
   amount: string;
 }
@@ -122,9 +147,11 @@ export async function listBudgets(ctx: ServiceContext): Promise<Budget[]> {
 
 export async function createBudget(
   ctx: ServiceContext,
-  input: { name: string; fiscalYear: number },
+  input: { name: string; fiscalYear: number; kind?: 'profit_loss' | 'balance_sheet'; isForecast?: boolean },
 ): Promise<Budget> {
   const { name, fiscalYear } = input;
+  const kind = input.kind ?? 'profit_loss';
+  if (kind !== 'profit_loss' && kind !== 'balance_sheet') throw validation('Budget type must be profit_loss or balance_sheet');
   if (!name?.trim()) throw validation('Budget name is required');
   if (!fiscalYear || fiscalYear < 2000 || fiscalYear > 2100) {
     throw validation('fiscalYear must be a 4-digit year between 2000 and 2100');
@@ -132,14 +159,14 @@ export async function createBudget(
 
   const [row] = await ctx.db
     .insert(budgets)
-    .values({ companyId: ctx.companyId, name: name.trim(), fiscalYear })
+    .values({ companyId: ctx.companyId, name: name.trim(), fiscalYear, kind, isForecast: input.isForecast ?? false })
     .returning();
 
   await writeAudit(ctx, {
     action: 'create',
-    entityType: 'budget',
+    entityType: input.isForecast ? 'forecast' : 'budget',
     entityId: row.id,
-    newValues: { name: row.name, fiscalYear: row.fiscalYear },
+    newValues: { name: row.name, fiscalYear: row.fiscalYear, kind, isForecast: row.isForecast },
   });
 
   return row;
@@ -172,9 +199,19 @@ export async function getBudget(ctx: ServiceContext, id: string): Promise<Budget
 
 export async function setBudgetLine(
   ctx: ServiceContext,
-  input: { budgetId: string; accountId: string; month: number; amount: string },
+  input: {
+    budgetId: string;
+    accountId: string;
+    month: number;
+    amount: string;
+    /** Customer:Job dimension (QB budgets by Customer:Job). */
+    customerId?: string | null;
+    classId?: string | null;
+  },
 ): Promise<BudgetLine> {
   const { budgetId, accountId, month, amount } = input;
+  const customerId = input.customerId ?? null;
+  const classId = input.classId ?? null;
 
   // Verify budget belongs to this company.
   const [budget] = await ctx.db
@@ -193,10 +230,47 @@ export async function setBudgetLine(
     .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
   if (!account) throw notFound('Account');
 
-  // Budgets compare against P&L actuals — balance-sheet accounts have no P&L
-  // activity to compare to and would always report actual = 0.
-  if (account.type !== 'revenue' && account.type !== 'expense') {
+  // P&L budgets compare against P&L actuals — balance-sheet accounts have no P&L activity to
+  // compare to. Balance-sheet budgets (kind 'balance_sheet') are the reverse.
+  const isPl = account.type === 'revenue' || account.type === 'expense';
+  if ((budget.kind ?? 'profit_loss') === 'balance_sheet') {
+    if (isPl) throw validation('A balance sheet budget can only hold balance sheet accounts.');
+    if (customerId) throw validation('Balance sheet budgets cannot be split by customer.');
+  } else if (!isPl) {
     throw validation('Budget lines can only be set for revenue or expense accounts.');
+  }
+  if (customerId) {
+    const [cust] = await ctx.db
+      .select({ id: customers.id })
+      .from(customers)
+      .where(and(eq(customers.id, customerId), eq(customers.companyId, ctx.companyId)));
+    if (!cust) throw notFound('Customer');
+  }
+  if (classId) {
+    const [cls] = await ctx.db
+      .select({ id: classes.id })
+      .from(classes)
+      .where(and(eq(classes.id, classId), eq(classes.companyId, ctx.companyId)));
+    if (!cls) throw notFound('Class');
+  }
+  // A budget is either company-wide or by Customer:Job (QB picks the criteria per budget) —
+  // mixing would double count in budget-vs-actual totals.
+  const [mix] = await ctx.db
+    .select({ id: budgetLines.id })
+    .from(budgetLines)
+    .where(
+      and(
+        eq(budgetLines.budgetId, budgetId),
+        customerId ? isNull(budgetLines.customerId) : isNotNull(budgetLines.customerId),
+      ),
+    )
+    .limit(1);
+  if (mix) {
+    throw validation(
+      customerId
+        ? 'This budget already has company-wide amounts; create a separate budget by Customer:Job.'
+        : 'This budget is by Customer:Job; choose a customer for every amount.',
+    );
   }
 
   // Upsert: PGlite supports ON CONFLICT via Drizzle's onConflictDoUpdate.
@@ -210,6 +284,8 @@ export async function setBudgetLine(
         eq(budgetLines.budgetId, budgetId),
         eq(budgetLines.accountId, accountId),
         eq(budgetLines.month, month),
+        customerId ? eq(budgetLines.customerId, customerId) : isNull(budgetLines.customerId),
+        classId ? eq(budgetLines.classId, classId) : isNull(budgetLines.classId),
       ),
     );
 
@@ -233,14 +309,14 @@ export async function setBudgetLine(
   } else {
     const [inserted] = await ctx.db
       .insert(budgetLines)
-      .values({ budgetId, accountId, month, amount: normalizedAmount })
+      .values({ budgetId, accountId, month, amount: normalizedAmount, customerId, classId })
       .returning();
     line = inserted;
     await writeAudit(ctx, {
       action: 'create',
       entityType: 'budgetLine',
       entityId: line.id,
-      newValues: { budgetId, accountId, month, amount: normalizedAmount },
+      newValues: { budgetId, accountId, month, amount: normalizedAmount, customerId, classId },
     });
   }
 
@@ -451,5 +527,203 @@ export async function budgetVsActual(
           variance: toAmountString(actualP.minus(periodNetBudget[p])),
         }))
       : undefined,
+  };
+}
+
+// ===========================================================================
+// wave2 reports: Budget Overview, Budget vs. Actual (by Customer:Job / class / balance sheet),
+// Forecast Overview — standard report engine output (sub-account roll-up, QB sections).
+// ===========================================================================
+
+const MONTH_KEYS = Array.from({ length: 12 }, (_, i) => `m${i + 1}`);
+
+async function loadBudgetForReport(ctx: ServiceContext, budgetId: string | undefined) {
+  if (!budgetId) throw validation('Choose a budget or forecast to report on.');
+  const [budget] = await ctx.db
+    .select()
+    .from(budgets)
+    .where(and(eq(budgets.id, budgetId), eq(budgets.companyId, ctx.companyId)));
+  if (!budget) throw notFound('Budget');
+  const lines = await ctx.db.select().from(budgetLines).where(eq(budgetLines.budgetId, budgetId));
+  return { budget, lines };
+}
+
+function monthEnd(year: number, month: number): Date {
+  return new Date(Date.UTC(year, month, 1) - 1);
+}
+
+/** Rows for balance-sheet accounts grouped by section (used by balance-sheet budgets). */
+function bsSectionRows(
+  meta: Map<string, AccountMeta>,
+  amounts: Map<string, Amounts>,
+  ncols: number,
+  cells: (label: string, v: Amounts) => Record<string, CellValue>,
+): StdRow[] {
+  const rows: StdRow[] = [];
+  for (const s of BS_SECTIONS) {
+    const m = new Map([...amounts].filter(([id]) => meta.get(id)?.section === s));
+    if (![...m.values()].some(anyNonZero)) continue;
+    const id = `bb:${s}`;
+    const header: StdRow = { id, depth: 0, kind: 'section', collapseKind: 'section', cells: { label: SECTION_LABELS[s] } };
+    rows.push(header);
+    const tree = buildAccountTree({ meta, amounts: m, ncols, idPrefix: id, parentRowId: id, depth: 1, cells });
+    rows.push(...tree.rows);
+    header.collapsedCells = cells(SECTION_LABELS[s], tree.total);
+    rows.push({ id: `${id}:total`, depth: 0, kind: 'subtotal', totalOf: id, cells: cells(`Total ${SECTION_LABELS[s]}`, tree.total) });
+  }
+  return rows;
+}
+
+/**
+ * Budget Overview / Forecast Overview — the budget's monthly amounts in statement layout
+ * (P&L sections with Net Income, or balance-sheet sections), optionally for one Customer:Job.
+ */
+export async function budgetOverviewReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { budget, lines } = await loadBudgetForReport(ctx, p.budgetId);
+  const meta = await loadAccountMeta(ctx);
+  const isBs = budget.kind === 'balance_sheet';
+  const ncols = isBs ? 12 : 13;
+  const amounts = new Map<string, Amounts>();
+  for (const l of lines) {
+    if (p.customerId && l.customerId !== p.customerId) continue;
+    if (p.classId && l.classId !== p.classId) continue;
+    const v = amounts.get(l.accountId) ?? zeros(ncols);
+    v[l.month - 1] = v[l.month - 1].plus(Money.of(l.amount));
+    if (!isBs) v[12] = v[12].plus(Money.of(l.amount));
+    amounts.set(l.accountId, v);
+  }
+  const columns: StdColumn[] = [
+    { key: 'label', header: '' },
+    ...MONTH_KEYS.map((k, i) => ({ key: k, header: `${MONTH_LABELS[i]} ${budget.fiscalYear}`, type: 'money' as const })),
+    ...(isBs ? [] : [{ key: 'total', header: 'TOTAL', type: 'money' as const }]),
+  ];
+  const keys = [...MONTH_KEYS, ...(isBs ? [] : ['total'])];
+  const rows = isBs
+    ? bsSectionRows(meta, amounts, ncols, (label, v) => {
+        const c: Record<string, CellValue> = { label };
+        keys.forEach((k, i) => (c[k] = toAmountString(v[i])));
+        return c;
+      })
+    : buildPLRows({ meta, amounts, columns, amountKeys: keys }).rows;
+  return {
+    key: budget.isForecast ? 'forecast-overview' : 'budget-overview',
+    title: budget.isForecast ? 'Forecast Overview' : 'Budget Overview',
+    subtitle: `${budget.name} · FY${budget.fiscalYear}${p.customerId ? ' · one Customer:Job' : ''}`,
+    columns,
+    rows,
+  };
+}
+
+interface BvaPeriod {
+  key: string;
+  months: number[];
+  label: string;
+}
+
+/**
+ * Budget vs. Actual (QB layout: Actual, Budget, $ Over Budget, % of Budget) — P&L budgets by
+ * company, class or Customer:Job (actuals from the ledger lines of that customer's transactions),
+ * and balance-sheet budgets (actual month-end balances vs budgeted balances).
+ */
+export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { budget, lines } = await loadBudgetForReport(ctx, p.budgetId);
+  const meta = await loadAccountMeta(ctx);
+  const isBs = budget.kind === 'balance_sheet';
+  const year = budget.fiscalYear;
+  const periods: BvaPeriod[] =
+    p.columns === 'month'
+      ? MONTH_KEYS.map((k, i) => ({ key: k, months: [i + 1], label: `${MONTH_LABELS[i]} ${year}` }))
+      : [
+          {
+            key: 'total',
+            months: isBs ? [12] : MONTH_KEYS.map((_, i) => i + 1),
+            label: isBs ? `Dec ${year}` : `FY${year}`,
+          },
+        ];
+  const n = periods.length * 2;
+  const amounts = new Map<string, Amounts>();
+  const add = (id: string, idx: number, v: Decimal) => {
+    const a = amounts.get(id) ?? zeros(n);
+    a[idx] = a[idx].plus(v);
+    amounts.set(id, a);
+  };
+  const addForMonth = (id: string, month: number, slot: 0 | 1, v: Decimal) => {
+    periods.forEach((per, i) => {
+      if (per.months.includes(month)) add(id, i * 2 + slot, v);
+    });
+  };
+  // Budget amounts (odd slots).
+  for (const l of lines) {
+    if (p.customerId && l.customerId !== p.customerId) continue;
+    if (p.classId && l.classId !== p.classId) continue;
+    addForMonth(l.accountId, l.month, 1, Money.of(l.amount));
+  }
+  // Actual amounts (even slots).
+  const yearFrom = new Date(Date.UTC(year, 0, 1));
+  const yearTo = monthEnd(year, 12);
+  if (isBs) {
+    for (let i = 0; i < periods.length; i++) {
+      const lastMonth = periods[i].months[periods[i].months.length - 1];
+      for (const r of await activityByAccount(ctx, { to: monthEnd(year, lastMonth) })) {
+        const a = meta.get(r.accountId);
+        if (!a || isPLSection(a.section)) continue;
+        add(r.accountId, i * 2, naturalAmount(a.section, r.debit, r.credit));
+      }
+    }
+  } else if (p.customerId) {
+    const { lines: gl } = await fetchGlLines(ctx, meta, {
+      from: yearFrom,
+      to: yearTo,
+      sections: [...PL_SECTIONS],
+      excludeClose: true,
+      nameId: p.customerId,
+      nameType: 'customer',
+      limit: 50000,
+    });
+    for (const l of gl) addForMonth(l.accountId, l.date.getUTCMonth() + 1, 0, l.natural);
+  } else {
+    const act = await activityByAccount(ctx, { from: yearFrom, to: yearTo, classId: p.classId, excludeClose: true }, 'month');
+    for (const r of act) {
+      const a = meta.get(r.accountId);
+      if (!a || !isPLSection(a.section)) continue;
+      addForMonth(r.accountId, Number(String(r.bucket).slice(5, 7)), 0, naturalAmount(a.section, r.debit, r.credit));
+    }
+  }
+  const columns: StdColumn[] = [{ key: 'label', header: '' }];
+  const amountKeys: string[] = [];
+  for (const per of periods) {
+    const pre = periods.length > 1 ? `${per.label} ` : '';
+    columns.push(
+      { key: `${per.key}_act`, header: `${pre}Actual`, type: 'money' },
+      { key: `${per.key}_bud`, header: `${pre}${budget.isForecast ? 'Forecast' : 'Budget'}`, type: 'money' },
+      { key: `${per.key}_over`, header: `${pre}$ Over ${budget.isForecast ? 'Forecast' : 'Budget'}`, type: 'money' },
+      { key: `${per.key}_pct`, header: `${pre}% of ${budget.isForecast ? 'Forecast' : 'Budget'}`, type: 'percent' },
+    );
+    amountKeys.push(`${per.key}_act`, `${per.key}_bud`);
+  }
+  const derive = (v: Amounts): Record<string, CellValue> => {
+    const out: Record<string, CellValue> = {};
+    periods.forEach((per, i) => {
+      const act = v[i * 2];
+      const bud = v[i * 2 + 1];
+      out[`${per.key}_over`] = toAmountString(act.minus(bud));
+      out[`${per.key}_pct`] = bud.isZero() ? null : act.dividedBy(bud.abs()).times(100).toFixed(2);
+    });
+    return out;
+  };
+  const cells = (label: string, v: Amounts): Record<string, CellValue> => {
+    const c: Record<string, CellValue> = { label };
+    amountKeys.forEach((k, i) => (c[k] = toAmountString(v[i])));
+    return { ...c, ...derive(v) };
+  };
+  const rows = isBs
+    ? bsSectionRows(meta, amounts, n, cells)
+    : buildPLRows({ meta, amounts, columns, amountKeys, derive: (v) => derive(v) }).rows;
+  return {
+    key: 'budget-vs-actual-report',
+    title: budget.isForecast ? 'Forecast vs. Actual' : 'Budget vs. Actual',
+    subtitle: `${budget.name} · FY${year}`,
+    columns,
+    rows,
   };
 }

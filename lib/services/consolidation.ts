@@ -13,7 +13,32 @@ import { profitAndLoss, balanceSheet } from '@/lib/services/reports';
 import type { ProfitAndLoss, BalanceSheet } from '@/lib/services/reports';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
-import { assertBalanceSheetBalanced } from './ledgerAssert';
+import { assertBalanceSheetBalanced, assertTrialBalanceBalanced } from './ledgerAssert';
+import type Decimal from 'decimal.js';
+import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
+import type { ReportParams } from '@/lib/validation/reports';
+import { validation } from './_base';
+import { resolveAccess } from './access';
+import { can } from '@/lib/permissions/model';
+import { trialBalance } from './reports';
+import { apAging, arAging, cashFlow, type CashFlowLine, type CashFlowReport } from './reportsExtra';
+import {
+  activityByAccount,
+  buildAccountTree,
+  buildPLRows,
+  fmtDay,
+  isPLSection,
+  loadAccountMeta,
+  naturalAmount,
+  parseDay,
+  periodIndex,
+  resolveAsOf,
+  resolveRange,
+  splitPeriods,
+  zeros,
+  type AccountMeta,
+  type Amounts,
+} from './reportEngine';
 
 // ---------------------------------------------------------------------------
 // Per-company wrapper types
@@ -157,4 +182,269 @@ export async function consolidatedBalanceSheet(
   };
 
   return { companies, consolidated };
+}
+
+// ===========================================================================
+// wave2 reports: Combine Reports from Multiple Companies — Trial Balance, Cash Flow,
+// P&L by Month, A/R and A/P aging summaries (standard report engine output).
+// ===========================================================================
+
+/**
+ * Companies in this file the caller may report on. Trusted contexts (no `access`) see every
+ * company; a signed-in user only sees companies where they are an active member with the
+ * report permission — combining never leaks another company's books.
+ */
+export async function reportableCompanies(
+  ctx: ServiceContext,
+  area: 'reports_financial' | 'reports_sales' | 'reports_purchases' = 'reports_financial',
+) {
+  const all = await listCompanies(ctx.db);
+  if (!ctx.access) return all;
+  const out: typeof all = [];
+  for (const c of all) {
+    if (c.id === ctx.companyId) {
+      out.push(c);
+      continue;
+    }
+    if (!ctx.userId) continue;
+    const r = await resolveAccess(ctx.db, c.id, ctx.userId);
+    if (r.member && r.active && can(r.access, area, 'view')) out.push(c);
+  }
+  return out;
+}
+
+const companyCtx = (ctx: ServiceContext, companyId: string): ServiceContext => ({ db: ctx.db, companyId, userId: ctx.userId });
+
+/** Merge charts of accounts across companies by section + number + name (QB combines by name). */
+async function mergedMeta(ctx: ServiceContext, companyIds: string[]) {
+  const meta = new Map<string, AccountMeta>();
+  const keyOfAccount = new Map<string, string>();
+  const perCompany: Map<string, AccountMeta>[] = [];
+  for (const id of companyIds) perCompany.push(await loadAccountMeta(companyCtx(ctx, id)));
+  for (const m of perCompany) {
+    for (const a of m.values()) {
+      const key = `${a.section}|${a.code}|${a.name.toLowerCase()}`;
+      keyOfAccount.set(a.id, key);
+      if (!meta.has(key)) meta.set(key, { ...a, id: key, parentId: null });
+    }
+  }
+  for (const m of perCompany) {
+    for (const a of m.values()) {
+      if (!a.parentId) continue;
+      const k = keyOfAccount.get(a.id)!;
+      const pk = keyOfAccount.get(a.parentId);
+      const merged = meta.get(k)!;
+      if (pk && !merged.parentId && pk !== k) merged.parentId = pk;
+    }
+  }
+  return { meta, keyOfAccount };
+}
+
+export async function combinedTrialBalance(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const asOf = resolveAsOf(p);
+  const cos = await reportableCompanies(ctx);
+  const { meta, keyOfAccount } = await mergedMeta(ctx, cos.map((c) => c.id));
+  const n = cos.length + 1;
+  const amounts = new Map<string, Amounts>();
+  let totalDebit = Money.zero();
+  let totalCredit = Money.zero();
+  let balanced = true;
+  for (let i = 0; i < cos.length; i++) {
+    const tb = await trialBalance(companyCtx(ctx, cos[i].id), asOf);
+    balanced = balanced && tb.balanced;
+    totalDebit = totalDebit.plus(Money.of(tb.totalDebit));
+    totalCredit = totalCredit.plus(Money.of(tb.totalCredit));
+    for (const r of tb.rows) {
+      const k = keyOfAccount.get(r.accountId)!;
+      const v = amounts.get(k) ?? zeros(n);
+      const net = Money.sub(r.debit, r.credit);
+      v[i] = v[i].plus(net);
+      v[n - 1] = v[n - 1].plus(net);
+      amounts.set(k, v);
+    }
+  }
+  assertTrialBalanceBalanced('Combined trial balance', totalDebit, totalCredit);
+  const colKey = (i: number) => (i === n - 1 ? 'total' : `c${i}`);
+  const cells = (label: string, v: Amounts): Record<string, CellValue> => {
+    const c: Record<string, CellValue> = { label };
+    v.forEach((x, i) => {
+      c[`${colKey(i)}_dr`] = x.greaterThan(0) ? toAmountString(x) : null;
+      c[`${colKey(i)}_cr`] = x.lessThan(0) ? toAmountString(x.negated()) : null;
+    });
+    return c;
+  };
+  const tree = buildAccountTree({ meta, amounts, ncols: n, idPrefix: 'ctb', parentRowId: null, depth: 0, cells });
+  // TOTAL row = sum of the rows shown: each account's net per column lands in Debit or Credit,
+  // so (e.g.) an overdrawn bank in one company nets against the other's balance in Combined.
+  const colDr = zeros(n);
+  const colCr = zeros(n);
+  for (const v of amounts.values()) {
+    v.forEach((x, i) => {
+      if (x.greaterThan(0)) colDr[i] = colDr[i].plus(x);
+      else if (x.lessThan(0)) colCr[i] = colCr[i].plus(x.negated());
+    });
+  }
+  for (let i = 0; i < n; i++) {
+    assertTrialBalanceBalanced(i === n - 1 ? 'Combined trial balance (combined column)' : `Combined trial balance (${cos[i].name})`, colDr[i], colCr[i]);
+  }
+  const totalCells: Record<string, CellValue> = { label: 'TOTAL' };
+  for (let i = 0; i < n; i++) {
+    totalCells[`${colKey(i)}_dr`] = toAmountString(colDr[i]);
+    totalCells[`${colKey(i)}_cr`] = toAmountString(colCr[i]);
+  }
+  tree.rows.push({ id: 'ctb:total', depth: 0, kind: 'grand', cells: totalCells });
+  const columns: StdColumn[] = [{ key: 'label', header: '' }];
+  for (let i = 0; i < n; i++) {
+    const name = i === n - 1 ? 'Combined' : cos[i].name;
+    columns.push({ key: `${colKey(i)}_dr`, header: `${name} Debit`, type: 'money' }, { key: `${colKey(i)}_cr`, header: `${name} Credit`, type: 'money' });
+  }
+  return {
+    key: 'combined-trial-balance',
+    title: 'Combined Trial Balance',
+    subtitle: `As of ${fmtDay(asOf)} · ${cos.length} companies`,
+    columns,
+    rows: tree.rows,
+    balanced: balanced && Money.eq(totalDebit, totalCredit) && Money.eq(colDr[n - 1], colCr[n - 1]),
+  };
+}
+
+export async function combinedProfitAndLossByMonth(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const cos = await reportableCompanies(ctx);
+  const { meta, keyOfAccount } = await mergedMeta(ctx, cos.map((c) => c.id));
+  const periods = splitPeriods(from, to, 'month');
+  if (periods.length > 60) throw validation('Choose a shorter range (at most 60 months).');
+  const amountKeys = [...periods.map((x) => x.key), 'total'];
+  const amounts = new Map<string, Amounts>();
+  for (const c of cos) {
+    const cmeta = await loadAccountMeta(companyCtx(ctx, c.id));
+    const act = await activityByAccount(companyCtx(ctx, c.id), { from, to, excludeClose: true }, 'day');
+    for (const r of act) {
+      const a = cmeta.get(r.accountId);
+      if (!a || !isPLSection(a.section)) continue;
+      const k = keyOfAccount.get(r.accountId)!;
+      const v = amounts.get(k) ?? zeros(amountKeys.length);
+      const amt = naturalAmount(a.section, r.debit, r.credit);
+      const i = periodIndex(periods, parseDay(r.bucket ?? undefined)!);
+      if (i >= 0) v[i] = v[i].plus(amt);
+      v[periods.length] = v[periods.length].plus(amt);
+      amounts.set(k, v);
+    }
+  }
+  const columns: StdColumn[] = [
+    { key: 'label', header: '' },
+    ...periods.map((x) => ({ key: x.key, header: x.label, type: 'money' as const })),
+    { key: 'total', header: 'TOTAL', type: 'money' },
+  ];
+  const built = buildPLRows({ meta, amounts, columns, amountKeys });
+  return {
+    key: 'combined-pl-by-month',
+    title: 'Combined Profit & Loss by Month',
+    subtitle: `${fmtDay(from)} – ${fmtDay(to)} · ${cos.length} companies`,
+    columns,
+    rows: built.rows,
+  };
+}
+
+export async function combinedCashFlow(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const cos = await reportableCompanies(ctx);
+  const reports = await Promise.all(cos.map((c) => cashFlow(companyCtx(ctx, c.id), { from, to })));
+  const n = cos.length + 1;
+  const columns: StdColumn[] = [
+    { key: 'label', header: '' },
+    ...cos.map((c, i) => ({ key: `c${i}`, header: c.name, type: 'money' as const })),
+    { key: 'total', header: 'Combined', type: 'money' },
+  ];
+  const cells = (label: string, vals: Decimal[]): Record<string, CellValue> => {
+    const c: Record<string, CellValue> = { label };
+    vals.forEach((v, i) => (c[i === n - 1 ? 'total' : `c${i}`] = toAmountString(v)));
+    return c;
+  };
+  const withTotal = (vals: Decimal[]) => [...vals, vals.reduce((s, v) => s.plus(v), Money.zero())];
+  const rows: StdRow[] = [];
+  const line = (id: string, label: string, pick: (r: CashFlowReport) => string, depth = 1, kind: StdRow['kind'] = 'data') =>
+    rows.push({ id, depth, kind, cells: cells(label, withTotal(reports.map((r) => Money.of(pick(r))))) });
+  const named = (id: string, list: (r: CashFlowReport) => CashFlowLine[]) => {
+    const names = new Map<string, string>();
+    for (const r of reports) for (const l of list(r)) names.set(`${l.code}|${l.name}`, l.name);
+    for (const [k, label] of [...names.entries()].sort()) {
+      line(
+        `${id}:${k}`,
+        label,
+        (r) =>
+          list(r)
+            .filter((l) => `${l.code}|${l.name}` === k)
+            .reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero())
+            .toFixed(2),
+        1,
+      );
+    }
+  };
+  rows.push({ id: 'ccf:op', depth: 0, kind: 'section', cells: { label: 'OPERATING ACTIVITIES' } });
+  line('ccf:ni', 'Net Income', (r) => r.operating.netIncome);
+  line('ccf:ar', 'Accounts Receivable', (r) => r.operating.changeInAR);
+  line('ccf:ap', 'Accounts Payable', (r) => r.operating.changeInAP);
+  line('ccf:inv', 'Inventory', (r) => r.operating.changeInInventory);
+  named('ccf:oth', (r) => r.operating.otherChanges);
+  line('ccf:optotal', 'Net cash provided by Operating Activities', (r) => r.operating.total, 0, 'total');
+  rows.push({ id: 'ccf:invest', depth: 0, kind: 'section', cells: { label: 'INVESTING ACTIVITIES' } });
+  named('ccf:invl', (r) => r.investing.lines);
+  line('ccf:invtotal', 'Net cash provided by Investing Activities', (r) => r.investing.total, 0, 'total');
+  rows.push({ id: 'ccf:fin', depth: 0, kind: 'section', cells: { label: 'FINANCING ACTIVITIES' } });
+  named('ccf:finl', (r) => r.financing.lines);
+  line('ccf:fintotal', 'Net cash provided by Financing Activities', (r) => r.financing.total, 0, 'total');
+  line('ccf:net', 'Net cash increase for period', (r) => r.netCashChange, 0, 'grand');
+  return {
+    key: 'combined-cash-flow',
+    title: 'Combined Statement of Cash Flows',
+    subtitle: `${fmtDay(from)} – ${fmtDay(to)} · ${cos.length} companies`,
+    columns,
+    rows,
+  };
+}
+
+export async function combinedAging(ctx: ServiceContext, p: ReportParams, which: 'ar' | 'ap'): Promise<StdReport> {
+  const asOf = resolveAsOf(p);
+  const cos = await reportableCompanies(ctx, which === 'ar' ? 'reports_sales' : 'reports_purchases');
+  const keys = ['current', 'days1_30', 'days31_60', 'days61_90', 'days91plus', 'total'] as const;
+  const rows: StdRow[] = [];
+  const grand = keys.map(() => Money.zero());
+  for (const c of cos) {
+    const r = which === 'ar' ? await arAging(companyCtx(ctx, c.id), asOf) : await apAging(companyCtx(ctx, c.id), asOf);
+    if (r.rows.length === 0) continue;
+    const hid = `cag:${c.id}`;
+    const header: StdRow = { id: hid, depth: 0, kind: 'section', collapseKind: 'group', cells: { label: c.name } };
+    rows.push(header);
+    for (const b of r.rows) {
+      const cells: Record<string, CellValue> = { label: b.name };
+      for (const k of keys) cells[k] = b[k];
+      rows.push({ id: `${hid}:${b.id}`, parentId: hid, depth: 1, kind: 'data', cells });
+    }
+    const tc: Record<string, CellValue> = { label: `Total ${c.name}` };
+    keys.forEach((k, i) => {
+      tc[k] = r.totals[k];
+      grand[i] = grand[i].plus(Money.of(r.totals[k]));
+    });
+    header.collapsedCells = { ...tc, label: c.name };
+    rows.push({ id: `${hid}:total`, depth: 0, kind: 'subtotal', totalOf: hid, cells: tc });
+  }
+  const gc: Record<string, CellValue> = { label: 'TOTAL' };
+  keys.forEach((k, i) => (gc[k] = toAmountString(grand[i])));
+  rows.push({ id: 'cag:grand', depth: 0, kind: 'grand', cells: gc });
+  return {
+    key: which === 'ar' ? 'combined-ar-aging' : 'combined-ap-aging',
+    title: which === 'ar' ? 'Combined A/R Aging Summary' : 'Combined A/P Aging Summary',
+    subtitle: `As of ${fmtDay(asOf)} · ${cos.length} companies`,
+    columns: [
+      { key: 'label', header: which === 'ar' ? 'Customer' : 'Vendor' },
+      { key: 'current', header: 'Current', type: 'money' },
+      { key: 'days1_30', header: '1 - 30', type: 'money' },
+      { key: 'days31_60', header: '31 - 60', type: 'money' },
+      { key: 'days61_90', header: '61 - 90', type: 'money' },
+      { key: 'days91plus', header: '> 90', type: 'money' },
+      { key: 'total', header: 'TOTAL', type: 'money' },
+    ],
+    rows,
+  };
 }

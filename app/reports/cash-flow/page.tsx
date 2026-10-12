@@ -1,10 +1,12 @@
 'use client';
+
 /**
  * Cash Flow Statement page — indirect method.
  * Fetches GET /api/reports/cash-flow (optional ?from=&to= filters).
  * Shows Operating / Investing / Financing sections and net cash change.
  * "Download CSV" exports the visible report as a Blob download.
  */
+import Link from 'next/link';
 import { useState, useCallback, useEffect } from 'react';
 import { TrendingUp } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, toast } from '@/components/ui';
@@ -92,12 +94,27 @@ function AmountCell({ value }: { value: string }) {
   );
 }
 
-function SectionRow({ label, value, indent }: { label: string; value: string; indent?: boolean }) {
+function SectionRow({ label, value, indent, href }: { label: string; value: string; indent?: boolean; href?: string }) {
+  // QuickZoom: the label and amount open the report / transactions behind the line.
   return (
     <tr className="border-b border-slate-100 hover:bg-electric/5">
-      <td className={`py-2.5 px-4 text-navy${indent ? ' pl-10' : ' font-medium'}`}>{label}</td>
+      <td className={`py-2.5 px-4 text-navy${indent ? ' pl-10' : ' font-medium'}`}>
+        {href ? (
+          <Link href={href} className="hover:text-electric hover:underline">
+            {label}
+          </Link>
+        ) : (
+          label
+        )}
+      </td>
       <td className="py-2.5 px-4 text-right">
-        <AmountCell value={value} />
+        {href ? (
+          <Link href={href} className="hover:underline">
+            <AmountCell value={value} />
+          </Link>
+        ) : (
+          <AmountCell value={value} />
+        )}
       </td>
     </tr>
   );
@@ -140,6 +157,12 @@ function Spacer() {
 export default function CashFlowPage() {
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
+  const zoom = (key: string, extra: Record<string, string> = {}) => {
+    const qs = new URLSearchParams(extra);
+    if (from) qs.set('from', from);
+    if (to) qs.set('to', to);
+    return `/reports/std/${key}?${qs.toString()}`;
+  };
   const [report, setReport] = useState<CashFlowReport | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -224,16 +247,18 @@ export default function CashFlowPage() {
               <tbody>
                 {/* Operating */}
                 <SectionHeader title="Operating Activities" />
-                <SectionRow label="Net Income" value={report.operating.netIncome} indent />
+                <SectionRow label="Net Income" value={report.operating.netIncome} indent href={zoom('profit-loss')} />
                 <SectionRow
                   label="Change in Accounts Receivable"
                   value={report.operating.changeInAR}
                   indent
+                  href={zoom('transaction-detail-by-account', { section: 'ar' })}
                 />
                 <SectionRow
                   label="Change in Accounts Payable"
                   value={report.operating.changeInAP}
                   indent
+                  href={zoom('transaction-detail-by-account', { section: 'ap' })}
                 />
                 <SectionRow
                   label="Change in Inventory"
@@ -246,6 +271,7 @@ export default function CashFlowPage() {
                     label={`Change in ${l.code} ${l.name}`}
                     value={l.amount}
                     indent
+                    href={zoom('transaction-detail-by-account', { accountId: l.accountId })}
                   />
                 ))}
                 <SectionTotal label="Net Cash from Operating" value={report.operating.total} />
@@ -262,6 +288,7 @@ export default function CashFlowPage() {
                     label={`${l.code} ${l.name}`}
                     value={l.amount}
                     indent
+                    href={zoom('transaction-detail-by-account', { accountId: l.accountId })}
                   />
                 ))}
                 <SectionTotal label="Net Cash from Investing" value={report.investing.total} />
@@ -278,6 +305,7 @@ export default function CashFlowPage() {
                     label={`${l.code} ${l.name}`}
                     value={l.amount}
                     indent
+                    href={zoom('transaction-detail-by-account', { accountId: l.accountId })}
                   />
                 ))}
                 <SectionTotal label="Net Cash from Financing" value={report.financing.total} />

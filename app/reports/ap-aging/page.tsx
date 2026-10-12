@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import Link from 'next/link';
 import { Clock } from 'lucide-react';
 import {
   Button,
@@ -180,7 +181,16 @@ export default function ApAgingPage() {
               ) : (
                 report.rows.map((row) => (
                   <Tr key={row.id}>
-                    <Td className="font-medium">{row.name}</Td>
+                    <Td className="font-medium">
+                      {/* QuickZoom: the open transactions behind this balance */}
+                      <Link
+                        href={`/reports/std/vendor-balance-detail?vendorId=${row.id}&to=${asOf}`}
+                        className="hover:text-electric hover:underline"
+                        title="See the transactions behind this balance"
+                      >
+                        {row.name}
+                      </Link>
+                    </Td>
                     <Td numeric>{formatCurrency(row.current)}</Td>
                     <Td numeric>{formatCurrency(row.days1_30)}</Td>
                     <Td numeric>{formatCurrency(row.days31_60)}</Td>

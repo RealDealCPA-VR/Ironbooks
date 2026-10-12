@@ -102,6 +102,17 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/dashboard': r('reports_financial', 'GET'),
   '/api/search': kind('member', 'GET'), // results filtered per area in the route
   '/api/memorized-reports': kind('member', 'GET POST'),
+  // wave2 reports: memorized report groups / Process Multiple Reports run each report through
+  // runStandardReport, which checks that report's own area — so these are member routes.
+  '/api/memorized-reports/[id]': kind('member', 'GET PATCH DELETE'),
+  '/api/memorized-reports/groups': kind('member', 'GET POST'),
+  '/api/memorized-reports/groups/[id]': kind('member', 'PATCH DELETE'),
+  '/api/memorized-reports/process': kind('member', 'POST'),
+  // Scheduled reports write export files to the local disk (a file utility).
+  '/api/report-schedules': r('file_utilities', 'GET POST'),
+  '/api/report-schedules/[id]': r('file_utilities', 'PATCH:modify DELETE'),
+  '/api/report-schedules/run-due': r('file_utilities', 'POST:create'),
+  '/api/reports/schedules/run-due': r('file_utilities', 'POST:create'),
   // Privacy & Network (team hosting): any member may read the policy (admins see more; the
   // route decides) and ask whether a destination is allowed; changing it is a company setting
   // (the service additionally requires owner/admin).
@@ -466,6 +477,13 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/reports/profit-loss-cash': r('reports_financial', 'GET'),
   '/api/reports/transaction-detail': r('reports_financial', 'GET'),
   '/api/reports/trial-balance': r('reports_financial', 'GET'),
+  // wave2 reports: one route serves every standard report; runStandardReport checks the
+  // report's own area (financial / sales / purchases / time). Graphs check per graph kind.
+  '/api/reports/std/[report]': kind('member', 'GET'),
+  '/api/reports/graphs': kind('member', 'GET'),
+  '/api/reports/filter-options': kind('member', 'GET'), // names only; service requires a report area
+  '/api/reports/pivot': r('reports_financial', 'GET'),
+  '/api/find': r('reports_financial', 'GET'),
   '/api/reports/ar-aging': r('reports_sales', 'GET'),
   '/api/reports/ar-aging-detail': r('reports_sales', 'GET'),
   '/api/reports/collections': r('reports_sales', 'GET'),
@@ -626,6 +644,14 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/reports/closing-date-exceptions': 'closing',
   '/reports/voided-deleted': 'reports_financial',
   '/reports/reconciliation': 'accounting',
+  // wave2 reports. The standard report viewer, memorized reports and graphs host reports from
+  // several areas; their APIs check each report's own area (runStandardReport / graph kind).
+  '/reports/std': [...ANY_REPORT, 'time'],
+  '/reports/memorized': ANY_REPORT,
+  '/reports/graphs': ['reports_financial', 'reports_sales', 'reports_purchases'],
+  '/reports/pivot': 'reports_financial',
+  '/reports/schedules': 'file_utilities',
+  '/find': 'reports_financial',
 };
 
 // ---------------------------------------------------------------------------

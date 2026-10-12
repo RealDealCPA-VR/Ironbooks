@@ -8,6 +8,7 @@
  * route.
  */
 import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { Button, Card, EmptyState, PageHeader, Spinner, Table, Th, Td, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import ReportToolbar, { type ExportTable } from './ReportToolbar';
@@ -40,6 +41,11 @@ export interface SimpleReportProps<T, R> {
   subtitle?: (data: T) => string;
   /** Optional totals/footer rows: label + per-column CSV-able cells, rendered in tfoot. */
   footerRows?: (data: T) => { cells: CsvCell[]; emphasized?: boolean }[];
+  /**
+   * QuickZoom: where a row drills to (its first column and numeric cells become links), given the
+   * report's current dates. Return null for rows without a drill-down.
+   */
+  rowHref?: (row: R, q: { from: string; to: string; asOf: string }) => string | null;
 }
 
 export default function SimpleReport<T, R>({
@@ -55,6 +61,7 @@ export default function SimpleReport<T, R>({
   columns,
   subtitle,
   footerRows,
+  rowHref,
 }: SimpleReportProps<T, R>) {
   const [from, setFrom] = useState(defaultFrom ?? yearStartStr());
   const [to, setTo] = useState(defaultTo ?? todayStr());
@@ -181,15 +188,24 @@ export default function SimpleReport<T, R>({
                   </td>
                 </tr>
               ) : (
-                rows.map((row, i) => (
-                  <Tr key={i}>
-                    {visibleColumns.map((c) => (
-                      <Td key={c.header} numeric={c.numeric} className={c.className}>
-                        {c.cell(row)}
-                      </Td>
-                    ))}
-                  </Tr>
-                ))
+                rows.map((row, i) => {
+                  const href = rowHref?.(row, { from, to, asOf }) ?? null;
+                  return (
+                    <Tr key={i}>
+                      {visibleColumns.map((c, ci) => (
+                        <Td key={c.header} numeric={c.numeric} className={c.className}>
+                          {href && (ci === 0 || c.numeric) ? (
+                            <Link href={href} className="hover:text-electric hover:underline" title="QuickZoom: see the detail">
+                              {c.cell(row)}
+                            </Link>
+                          ) : (
+                            c.cell(row)
+                          )}
+                        </Td>
+                      ))}
+                    </Tr>
+                  );
+                })
               )}
             </tbody>
             {rows.length > 0 && footerRows && (
