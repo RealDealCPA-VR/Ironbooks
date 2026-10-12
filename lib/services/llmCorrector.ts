@@ -260,6 +260,25 @@ export async function applyCorrection(
         throw validation('Review the correcting journal entry and approve it to post it.');
       }
       if (!tx.userId) throw new ServiceError('FORBIDDEN', 'Posting a correction needs a signed-in user.');
+      // The correction was computed from the flagged entry as it was then. If that entry has
+      // since been voided (or deleted), the problem is already fixed — posting the stored
+      // reversal now would correct it a second time.
+      if (row.detection.journalEntryId) {
+        const [source] = await tx.db
+          .select({ status: journalEntries.status })
+          .from(journalEntries)
+          .where(
+            and(
+              eq(journalEntries.id, row.detection.journalEntryId),
+              eq(journalEntries.companyId, tx.companyId),
+            ),
+          );
+        if (!source || source.status !== 'posted') {
+          throw validation(
+            'The entry this correction was made for has been voided or changed since. Ask for a new suggestion instead.',
+          );
+        }
+      }
       const date = new Date(`${entry.date}T12:00:00Z`);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(entry.date) || isNaN(date.getTime())) {
         throw validation('The correcting entry needs a valid date.');
