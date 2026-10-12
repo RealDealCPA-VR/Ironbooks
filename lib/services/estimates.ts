@@ -23,7 +23,7 @@ import {
   writeAudit,
 } from './_base';
 import { createInvoice } from './invoices';
-import { assertFeatureOn } from '@/lib/featureGate';
+import { assertFeatureOn, assertSalesTaxAllowed } from '@/lib/featureGate';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { allocateDocNumber, docRef } from './docNumbers';
 import {
@@ -224,6 +224,7 @@ async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) 
 }
 
 export async function createEstimate(ctx: ServiceContext, input: CreateEstimateInput) {
+  await assertSalesTaxAllowed(ctx, input);
   const { computedLines, subtotal, taxAmount, total } = await prepareEstimate(ctx, input);
 
   return inTransaction(ctx, async (tx) => {
@@ -717,6 +718,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
       'This estimate has progress invoices against it, so its lines can no longer be changed.',
     );
   }
+  await assertSalesTaxAllowed(ctx, input, [existing.taxRateId]);
   const { computedLines, subtotal, taxAmount, total } = await prepareEstimate(ctx, input);
 
   return inTransaction(ctx, async (tx) => {

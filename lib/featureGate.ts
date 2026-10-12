@@ -60,3 +60,36 @@ export async function assertFeatureOn(ctx: ServiceContext, key: keyof CompanyPre
   const gate = FEATURE_GATES.find((g) => g.key === key) ?? EXTRA[key];
   throw featureOffError(gate ?? { label: String(key), category: 'Preferences', setting: String(key) });
 }
+
+/** Convenience: the plain "turned off" error for a FEATURE_GATES key. */
+function gateError(key: keyof CompanyPreferences): ServiceError {
+  const gate = FEATURE_GATES.find((g) => g.key === key) ?? EXTRA[key];
+  return featureOffError(gate ?? { label: String(key), category: 'Preferences', setting: String(key) });
+}
+
+/**
+ * Sales forms (invoice, sales receipt, estimate, credit memo) may not charge sales tax while
+ * "Charge sales tax" is off (QB removes the tax column and tax item from forms). `keep` lists
+ * tax rates already on the document being edited: an edit that leaves an old document's tax as
+ * it was is allowed, so turning sales tax off never locks existing records.
+ */
+export async function assertSalesTaxAllowed(
+  ctx: ServiceContext,
+  input: { taxRateId?: string | null; lines?: ReadonlyArray<object> },
+  keep: ReadonlyArray<string | null | undefined> = [],
+): Promise<void> {
+  const kept = new Set(keep.filter(Boolean) as string[]);
+  const used = [input.taxRateId, ...(input.lines ?? []).map((l) => (l as { taxRateId?: string | null }).taxRateId)].filter(
+    (id): id is string => !!id && !kept.has(id),
+  );
+  if (used.length === 0) return;
+  const prefs = await companyPrefs(ctx.db, ctx.companyId);
+  if (prefs.salesTaxEnabled === false) throw gateError('salesTaxEnabled');
+}
+
+/** Inventory Part / Inventory Assembly items need "Track inventory" (QB hides those types). */
+export async function assertItemTypeAllowed(ctx: ServiceContext, type: string | null | undefined): Promise<void> {
+  if (type !== 'inventory' && type !== 'assembly') return;
+  const prefs = await companyPrefs(ctx.db, ctx.companyId);
+  if (prefs.inventoryEnabled === false) throw gateError('inventoryEnabled');
+}

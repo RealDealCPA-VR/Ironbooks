@@ -24,6 +24,7 @@
  * with received payments until the bookkeeper makes a bank deposit.
  */
 import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
+import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -518,6 +519,7 @@ async function postSalesReceiptDocument(
 }
 
 export async function createSalesReceipt(ctx: ServiceContext, input: CreateSalesReceiptInput) {
+  await assertSalesTaxAllowed(ctx, input);
   const prep = await prepareSalesReceipt(ctx, input);
   const { method, depositAccountId, subtotal, taxAmount, total } = prep;
 
@@ -799,6 +801,11 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
     .where(and(eq(salesReceipts.companyId, ctx.companyId), eq(salesReceipts.id, id)));
   if (!existing) throw notFound('Sales receipt');
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided sales receipt.');
+  const keptTaxLines = await ctx.db
+    .select({ taxRateId: salesReceiptLines.taxRateId })
+    .from(salesReceiptLines)
+    .where(eq(salesReceiptLines.salesReceiptId, id));
+  await assertSalesTaxAllowed(ctx, input, [existing.taxRateId, ...keptTaxLines.map((l) => l.taxRateId)]);
 
   const prep = await prepareSalesReceipt(ctx, input);
 

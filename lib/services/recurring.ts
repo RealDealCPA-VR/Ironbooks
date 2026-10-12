@@ -691,6 +691,11 @@ async function enterLocked(
   });
 }
 
+/** A "feature turned off" refusal (lib/featureGate.ts): skip that template, keep running the rest. */
+function isFeatureOff(err: ServiceError): boolean {
+  return (err.details as { featureOff?: boolean } | undefined)?.featureOff === true;
+}
+
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -761,7 +766,7 @@ export async function runDue(
       );
       if (doc) generated.push(doc);
     } catch (err) {
-      if (err instanceof ServiceError && err.code === 'FORBIDDEN') throw err;
+      if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !isFeatureOff(err)) throw err;
       failed.push({ templateId: template.id, templateName: template.name, error: errMessage(err) });
     }
   }
@@ -816,7 +821,7 @@ export async function runGroup(
     try {
       generated.push(await runTemplateNow(ctx, t.id));
     } catch (err) {
-      if (err instanceof ServiceError && err.code === 'FORBIDDEN') throw err;
+      if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !isFeatureOff(err)) throw err;
       failed.push({ templateId: t.id, templateName: t.name, error: errMessage(err) });
     }
   }

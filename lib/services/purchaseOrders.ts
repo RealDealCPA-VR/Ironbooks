@@ -35,6 +35,7 @@ import {
 } from './_base';
 import { getReceivingSettings, poStatusFromLines } from './receivingLinks';
 import { allocateDocNumber } from './docNumbers';
+import { assertFeatureOn } from '@/lib/featureGate';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -103,6 +104,9 @@ export async function createPurchaseOrder(
   ctx: ServiceContext,
   input: CreatePurchaseOrderInput,
 ) {
+  // Enforced here, not only on the API path: memorized POs and reorder-list POs are entered
+  // without an HTTP request (QB has no purchase orders while "Use purchase orders" is off).
+  await assertFeatureOn(ctx, 'purchaseOrdersEnabled');
   if (!input.lines || input.lines.length === 0) {
     throw validation('A purchase order must have at least one line.');
   }

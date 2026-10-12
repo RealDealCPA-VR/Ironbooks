@@ -30,6 +30,7 @@
  * transaction — preserving invoiceNumber and createdAt.
  */
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
+import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -1379,6 +1380,7 @@ export async function auditCreditLimitOverride(
 }
 
 export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
+  await assertSalesTaxAllowed(ctx, input);
   const prep = await prepareInvoice(ctx, input);
   const isDraft = input.status === 'draft';
 
@@ -1742,6 +1744,11 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   // Payments/credits already applied stay applied (QB lets you edit a paid invoice) as long as
   // the edit keeps them valid; see assertEditKeepsApplications.
   const externalPaidPre = await externalPaidAmount(ctx, existing);
+  const keptTaxLines = await ctx.db
+    .select({ taxRateId: invoiceLines.taxRateId })
+    .from(invoiceLines)
+    .where(eq(invoiceLines.invoiceId, id));
+  await assertSalesTaxAllowed(ctx, input, [existing.taxRateId, ...keptTaxLines.map((l) => l.taxRateId)]);
 
   // An edit that does not mention the sales rep keeps the current one (it was usually set
   // via assignInvoiceRep, and it is also a price-rule condition).
