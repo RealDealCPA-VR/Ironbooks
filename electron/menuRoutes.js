@@ -24,6 +24,7 @@ const MENU_SECTIONS = [
       { separator: true },
       { label: 'Company Information…', route: '/settings' },
       { label: 'Preferences…', route: '/settings' },
+      { label: 'Setup Interview…', route: '/onboarding' },
       { label: 'Form Templates', route: '/templates' },
       { label: 'Users and Roles', route: '/users' },
       { label: 'Set Closing Date / Fiscal Periods', route: '/fiscal-periods' },

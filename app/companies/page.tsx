@@ -74,11 +74,11 @@ export default function CompaniesPage() {
     if (!name.trim()) return;
     setSaving(true);
     try {
-      await api.post('/api/companies', { name });
+      const created = await api.post<{ id: string }>('/api/companies', { name });
+      // Open the new company and run the setup interview for it (it offers Skip).
+      await api.post('/api/companies/select', { companyId: created.id });
       toast('Company created', 'success');
-      setOpen(false);
-      setName('');
-      load();
+      window.location.href = '/onboarding?new=1';
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Failed', 'danger');
     } finally {
