@@ -523,7 +523,7 @@ export async function queueCustomerRefundCheck(
   if (existing) throw new ServiceError('CONFLICT', 'This refund already has a check.');
   const refund = (await unprintedRefunds(ctx)).find((r) => r.entryId === entry.id);
   if (!refund) {
-    throw validation('Only a customer refund paid from a bank account, with no check number yet, can be printed as a check.');
+    throw validation('Only a customer refund paid from a bank account can be printed as a check.');
   }
   return inTransaction(ctx, async (tx) =>
     insertPaymentCheck(tx, {
@@ -553,7 +553,7 @@ export interface UnprintedRefund {
 }
 
 /**
- * Customer refunds paid from a bank account with no check number and no check document yet —
+ * Customer refunds paid from a bank account that have no check document yet —
  * the candidates for "Add refund checks" on Print Checks.
  */
 export async function unprintedRefunds(ctx: ServiceContext): Promise<UnprintedRefund[]> {
@@ -562,7 +562,6 @@ export async function unprintedRefunds(ctx: ServiceContext): Promise<UnprintedRe
       entryId: journalEntries.id,
       date: journalEntries.date,
       description: journalEntries.description,
-      reference: journalEntries.reference,
       sourceRef: journalEntries.sourceRef,
       accountId: journalEntryLines.accountId,
       credit: journalEntryLines.credit,
@@ -582,9 +581,9 @@ export async function unprintedRefunds(ctx: ServiceContext): Promise<UnprintedRe
         sql`NOT EXISTS (SELECT 1 FROM payment_checks pc WHERE pc.posted_entry_id = ${journalEntries.id})`,
       ),
     );
-  const banks = rows.filter(
-    (r) => isBankAccount({ type: r.acctType, subtype: r.acctSubtype }) && !(r.reference ?? '').trim(),
-  );
+  // The refund entry's reference is the credit memo / payment number, not a check number, so a
+  // refund counts as unprinted until it has a check document.
+  const banks = rows.filter((r) => isBankAccount({ type: r.acctType, subtype: r.acctSubtype }));
   if (banks.length === 0) return [];
   const docIds = [...new Set(banks.map((r) => r.sourceRef!.slice('refund:'.length)).filter((x) => UUID_RE.test(x)))];
   const memoRows = docIds.length
