@@ -40,7 +40,7 @@ export async function POST(
     const { id } = await params;
     const ctx = await getServerContext();
     const body = await req.json();
-    const { paymentAccountId, amount, date, memo } = body ?? {};
+    const { paymentAccountId, amount, date, memo, exchangeRate } = body ?? {};
     if (!paymentAccountId) {
       return NextResponse.json({ error: 'paymentAccountId is required.' }, { status: 400 });
     }
@@ -49,6 +49,7 @@ export async function POST(
       amount: amount ?? undefined,
       date: date ? new Date(date) : undefined,
       memo: memo ?? undefined,
+      exchangeRate: exchangeRate ?? undefined,
     });
     return NextResponse.json(entry, { status: 201 });
   } catch (err) {

@@ -416,6 +416,8 @@ function buildGlLines(prep: PreparedExpense, method: ExpenseMethod, paymentAccou
     accountId: paymentAccountId,
     ...(prep.isRefund ? { debit: prep.homeTotalStr } : { credit: prep.homeTotalStr }),
     memo: entryDescription(prep, method),
+    // p1 fx: a foreign-currency bank / card line keeps the amount in its own currency.
+    ...(prep.currency ? { foreignAmount: toAmountString(prep.absTotal) } : {}),
   });
   return gl;
 }

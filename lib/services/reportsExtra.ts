@@ -36,6 +36,7 @@ import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
 import { journalCreditsAppliedAfter, journalOpenItems, resolveEntityNames } from './journal';
 import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
+import { vendorCreditHomeByBill } from './vendorCreditsFx';
 
 /**
  * Credit-memo refunds dated AFTER the cutoff, per memo id. creditMemos.unapplied is today's
@@ -440,7 +441,12 @@ async function billPaymentHomeAppliedByBill(ctx: ServiceContext, upTo: Date): Pr
     .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
     .where(and(eq(billPayments.companyId, ctx.companyId), lte(billPayments.date, upTo)))
     .groupBy(billPaymentApplications.billId);
-  return new Map(appRows.map((r) => [r.billId, r.applied]));
+  const out = new Map(appRows.map((r) => [r.billId, r.applied]));
+  // p1 fx: foreign vendor credits applied to a bill relieved home A/P too.
+  for (const [billId, home] of await vendorCreditHomeByBill(ctx, upTo)) {
+    out.set(billId, toAmountString(Money.of(out.get(billId) ?? '0').plus(home)));
+  }
+  return out;
 }
 
 /** Home open balance = round2(total x rate) - home A/P already relieved (same anchor billPayments uses). */
@@ -534,7 +540,8 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     .select({
       vendorId: vendorCredits.vendorId,
       vendorName: vendors.displayName,
-      unapplied: sql<string>`COALESCE(SUM(CAST(${vendorCredits.unapplied} AS NUMERIC)), 0)`,
+      // p1 fx: a foreign credit counts at the home A/P it still carries.
+      unapplied: sql<string>`COALESCE(SUM(CAST(CASE WHEN ${vendorCredits.currency} IS NOT NULL THEN COALESCE(${vendorCredits.homeUnapplied}, ${vendorCredits.unapplied}) ELSE ${vendorCredits.unapplied} END AS NUMERIC)), 0)`,
     })
     .from(vendorCredits)
     .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
@@ -1206,7 +1213,8 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       vendorId: vendorCredits.vendorId,
       vendorName: vendors.displayName,
       date: vendorCredits.date,
-      unapplied: vendorCredits.unapplied,
+      // p1 fx: a foreign credit counts at the home A/P it still carries.
+      unapplied: sql<string>`CASE WHEN ${vendorCredits.currency} IS NOT NULL THEN COALESCE(${vendorCredits.homeUnapplied}, ${vendorCredits.unapplied}) ELSE ${vendorCredits.unapplied} END`,
     })
     .from(vendorCredits)
     .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))

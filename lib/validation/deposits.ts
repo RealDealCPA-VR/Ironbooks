@@ -2,7 +2,7 @@
  * Zod schemas for /api/deposits — mirrors CreateDepositInput.
  */
 import { z } from 'zod';
-import { zDate, zMoneyPositive, zUuid } from './helpers';
+import { zDate, zDecimalPositive, zMoneyPositive, zUuid } from './helpers';
 
 export const extraDepositLineSchema = z.object({
   accountId: zUuid,
@@ -25,6 +25,8 @@ export const createDepositSchema = z
     extraLines: z.array(extraDepositLineSchema).optional(),
     cashBack: cashBackSchema.nullish(),
     memo: z.string().nullish(),
+    // p1 fx: foreign-currency bank account — home units per 1 unit (default: list rate)
+    exchangeRate: zDecimalPositive.nullish(),
   })
   .refine(
     (d) =>

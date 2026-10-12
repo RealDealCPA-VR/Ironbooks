@@ -28,6 +28,8 @@ import { bankAccounts, bankTransactions, fileImports } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
 import { listRules, matchRule } from './rules';
+import { foreignCurrencyOfAccount } from './fxLedger';
+import { homeCode } from './fxLines';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -250,6 +252,15 @@ export function parseOFX(content: string): ParsedTransaction[] {
 
     return { fitId, date, description, amount };
   });
+}
+
+/**
+ * p1 fx: the statement currency declared by an OFX / QFX / QBO file (<CURDEF>), upper-cased, or
+ * null when the file does not say.
+ */
+export function parseOFXCurrency(content: string): string | null {
+  const m = /<CURDEF>\s*([A-Za-z]{3})/.exec(content);
+  return m ? m[1].toUpperCase() : null;
 }
 
 /**
@@ -481,12 +492,27 @@ export async function importTransactions(
 ): Promise<ImportSummary> {
   // 1. Verify the bank account belongs to this company.
   const [bankAccount] = await ctx.db
-    .select({ id: bankAccounts.id })
+    .select({ id: bankAccounts.id, glAccountId: bankAccounts.accountId })
     .from(bankAccounts)
     .where(
       and(eq(bankAccounts.id, input.bankAccountId), eq(bankAccounts.companyId, ctx.companyId)),
     );
   if (!bankAccount) throw notFound('Bank account');
+
+  // p1 fx: amounts are staged in the account's own currency. A bank file that declares another
+  // currency (OFX <CURDEF>) belongs to a different account — refuse it before anything is written.
+  if (input.fileType !== 'csv') {
+    const fileCurrency = parseOFXCurrency(input.content);
+    const home = await homeCode(ctx);
+    if (fileCurrency && home) {
+      const acctCurrency = (await foreignCurrencyOfAccount(ctx, bankAccount.glAccountId)) ?? home;
+      if (fileCurrency !== acctCurrency) {
+        throw validation(
+          `This file is a ${fileCurrency} statement, but the account is in ${acctCurrency}. Import it into a ${fileCurrency} account instead.`,
+        );
+      }
+    }
+  }
 
   // Map fileType enum for the fileImports row. 'qfx' is OFX-on-the-wire and the
   // file_type enum predates it (schema is frozen), so it is stored as 'ofx'.

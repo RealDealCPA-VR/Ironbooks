@@ -93,6 +93,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/custom-fields/values': r('lists', 'POST:modify'),
   '/api/currencies': r('lists', 'GET POST'),
   '/api/currencies/fx-adjustment': r('accounting', 'POST'),
+  // p1 fx: Home Currency Adjustment (preview + post, list, void)
+  '/api/currencies/home-currency-adjustment': r('accounting', 'GET POST'),
+  '/api/currencies/home-currency-adjustment/[id]': r('accounting', 'GET DELETE'),
   '/api/budgets': r('company', 'GET POST'),
   '/api/budgets/[id]': r('company', 'GET PATCH'),
   '/api/budgets/[id]/vs-actual': r('reports_financial', 'GET'),
@@ -373,7 +376,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/checks/settings': r('banking', 'GET PUT:modify'),
   '/api/loans': r('banking', 'GET POST'),
   '/api/loans/[id]': r('banking', 'GET PATCH DELETE'),
-  '/api/loans/[id]/payments': r('banking', 'POST'),
+  '/api/loans/[id]/payments': r('banking', 'POST DELETE'), // p1 fx: DELETE voids a payment + its FX entry
   '/api/banking/account-currency': r('accounting', 'POST:modify'),
   '/api/registers': r('banking', 'GET'),
   '/api/registers/[accountId]': r('banking', 'GET'),

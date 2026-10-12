@@ -71,6 +71,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         amount: body.amount,
         date: body.date ? new Date(body.date) : null,
         memo: body.memo ?? null,
+        exchangeRate: body.exchangeRate ?? null,
       });
       return NextResponse.json(result);
     }
@@ -93,6 +94,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       vendorCreditId: id,
       billId: body.billId,
       amount: body.amount,
+      date: body.date ? new Date(body.date) : null,
     });
 
     return NextResponse.json(result);

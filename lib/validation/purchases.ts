@@ -3,7 +3,7 @@
  * printer setup, bank/card account currency.
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zMoney, zUuid } from './helpers';
+import { zDate, zDecimal, zDecimalPositive, zMoney, zUuid } from './helpers';
 
 export const loanSchema = z.object({
   name: z.string().trim().min(1, 'Give the loan a name.').max(255),
@@ -20,6 +20,9 @@ export const loanSchema = z.object({
   firstPaymentDate: zDate,
   escrowAmount: zMoney.nullish(),
   notes: z.string().nullish(),
+  // p1 fx: loan currency (default: the lender's) and the rate it was booked at
+  currency: z.string().max(3).nullish(),
+  exchangeRate: zDecimalPositive.nullish(),
 });
 
 export const loanPaymentSchema = z.object({
@@ -33,6 +36,7 @@ export const loanPaymentSchema = z.object({
   toPrint: z.boolean().optional(),
   memo: z.string().nullish(),
   dueDate: zDate.nullish(),
+  exchangeRate: zDecimalPositive.nullish(),
 });
 
 export const printSourceSchema = z.enum(['expense', 'bill_payment', 'paycheck']);

@@ -22,6 +22,15 @@ import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import {
+  applyForeignVendorCredit,
+  isForeignApplication,
+  refundForeignVendorCredit,
+  resolveVendorCreditFx,
+  unapplyForeignVendorCredit,
+  vendorCreditEntryFx,
+  vendorCreditFxColumns,
+} from './vendorCreditsFx';
+import {
   type ServiceContext,
   ServiceError,
   inTransaction,
@@ -47,6 +56,9 @@ export interface CreateVendorCreditInput {
   date: Date;
   memo?: string | null;
   lines: VendorCreditLineInput[];
+  /** p1 fx: the vendor's currency is used; a stated rate overrides the currency list's rate. */
+  currency?: string | null;
+  exchangeRate?: string | number | null;
 }
 
 export interface ApplyToBillInput {
@@ -54,6 +66,8 @@ export interface ApplyToBillInput {
   billId: string;
   /** Amount to apply (must be <= credit.unapplied and <= bill.balanceDue). */
   amount: string | number;
+  /** p1 fx: date of a foreign application's exchange gain/loss entry (default today). */
+  date?: Date | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,29 +94,14 @@ async function resolveApAccount(ctx: ServiceContext): Promise<string> {
 // ---------------------------------------------------------------------------
 
 /**
- * J10: vendor credits are recorded in HOME currency only (vendor_credits has no exchange rate, and
- * applying a foreign credit to a foreign bill would need a realized gain/loss). A vendor or bank
- * account in another currency is refused with a plain message so A/P never takes an unconverted
- * amount.
+ * J10 / p1 fx: a vendor credit is in its vendor's currency (vendorCreditsFx.ts); A/P and the
+ * line accounts get home amounts. A home credit can't be refunded into a foreign account.
  */
 async function foreignCurrencyOf(ctx: ServiceContext, code: string | null | undefined): Promise<string | null> {
   const v = (code ?? '').trim().toUpperCase();
   if (!v) return null;
   const home = await getHomeCurrencyCode(ctx);
   return home && v === home ? null : v;
-}
-
-async function assertHomeCurrencyVendor(ctx: ServiceContext, vendorId: string) {
-  const [v] = await ctx.db
-    .select({ currency: vendors.currency })
-    .from(vendors)
-    .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, ctx.companyId)));
-  const cur = await foreignCurrencyOf(ctx, v?.currency);
-  if (cur) {
-    throw validation(
-      `This vendor uses ${cur}. Vendor credits can only be entered for home-currency vendors — for a ${cur} vendor, enter the credit as a bill with a negative adjustment or ask the vendor for a refund.`,
-    );
-  }
 }
 
 export async function createVendorCredit(ctx: ServiceContext, input: CreateVendorCreditInput) {
@@ -112,7 +111,6 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
-  await assertHomeCurrencyVendor(ctx, input.vendorId);
 
   // Validate lines.
   if (!input.lines || input.lines.length === 0) {
@@ -128,6 +126,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
     total = total.plus(amt);
   }
   const totalStr = toAmountString(total);
+  const fx = await resolveVendorCreditFx(ctx, input.vendorId, input);
 
   // Resolve A/P before opening the transaction.
   const apAccountId = await resolveApAccount(ctx);
@@ -144,6 +143,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
         status: 'open',
         total: totalStr,
         unapplied: totalStr,
+        ...vendorCreditFxColumns(fx),
       })
       .returning();
 
@@ -169,14 +169,14 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
       // Debit A/P to reduce the liability.
       {
         accountId: apAccountId,
-        debit: totalStr,
+        debit: fx.homeTotal,
         memo: `Vendor credit ${credit.id}`,
         controlLine: true,
       },
-      // Credit each expense/asset account for its line amount.
-      ...input.lines.map((line) => ({
+      // Credit each expense/asset account for its line amount (home value).
+      ...input.lines.map((line, idx) => ({
         accountId: line.accountId,
-        credit: toAmountString(line.amount),
+        credit: fx.homeLines[idx],
         memo: line.description ?? null,
       })),
     ];
@@ -186,6 +186,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
       description: `Vendor Credit — ${vendor.name}`,
       sourceRef: `vendor_credit:${credit.id}`,
       lines: postingLines,
+      ...vendorCreditEntryFx(fx),
     });
 
     // 4) Stamp postedEntryId.
@@ -229,7 +230,6 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
-  await assertHomeCurrencyVendor(ctx, input.vendorId);
   if (!input.lines || input.lines.length === 0) {
     throw validation('A vendor credit must have at least one line.');
   }
@@ -240,14 +240,15 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
     total = total.plus(amt);
   }
   const totalStr = toAmountString(total);
+  const fx = await resolveVendorCreditFx(ctx, input.vendorId, input);
   const apAccountId = await resolveApAccount(ctx);
 
   const postingLines = [
     // The credit's own A/P line (posting.ts PostingLine.controlLine).
-    { accountId: apAccountId, debit: totalStr, memo: `Vendor credit ${id}`, controlLine: true },
-    ...input.lines.map((line) => ({
+    { accountId: apAccountId, debit: fx.homeTotal, memo: `Vendor credit ${id}`, controlLine: true },
+    ...input.lines.map((line, idx) => ({
       accountId: line.accountId,
-      credit: toAmountString(line.amount),
+      credit: fx.homeLines[idx],
       memo: line.description ?? null,
     })),
   ];
@@ -263,6 +264,9 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
 
     let plan = await planPostedEdit(tx, { entryId: cur.postedEntryId, date: input.date, lines: postingLines, what: 'vendor credit' });
     if (plan === 'unchanged' && cur.vendorId !== input.vendorId) plan = 'repost';
+    // p1 fx: a foreign credit whose amount changed re-posts even if its home value did not.
+    if (plan === 'unchanged' && (cur.currency ?? null) !== fx.currency) plan = 'repost';
+    if (plan === 'unchanged' && fx.currency && !Money.eq(cur.total, totalStr)) plan = 'repost';
 
     let entryId = cur.postedEntryId;
     if (plan === 'unchanged') {
@@ -302,6 +306,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
         description: `Vendor Credit — ${vendor.name}`,
         sourceRef: `vendor_credit:${id}`,
         lines: postingLines,
+        ...vendorCreditEntryFx(fx),
       });
       entryId = entry.id;
       await tx.db
@@ -314,6 +319,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
           unapplied: totalStr,
           status: 'open',
           postedEntryId: entry.id,
+          ...vendorCreditFxColumns(fx),
         })
         .where(eq(vendorCredits.id, id));
     }
@@ -443,12 +449,10 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
     throw validation('Vendor credit and bill must belong to the same vendor.');
   }
 
-  // Vendor credits are recorded in home currency; a foreign-currency bill is settled through
-  // Pay Bills (which converts at the booked rate and posts realized exchange gain/loss).
-  if (bill.currency) {
-    throw validation(
-      `This bill is in ${bill.currency}. Home-currency vendor credits can't be applied to it — settle it with Pay Bills instead.`,
-    );
+  // p1 fx: a foreign credit / bill is applied at each side's booked rate with a realized
+  // exchange gain/loss (vendorCreditsFx.ts).
+  if (isForeignApplication(credit, bill)) {
+    return applyForeignVendorCredit(ctx, credit, bill, applyAmount, input.date);
   }
 
   return inTransaction(ctx, async (tx) => {
@@ -512,6 +516,8 @@ export interface UnapplyFromBillInput {
   billId: string;
   /** Amount to unapply (must be <= credit's applied amount and <= bill.amountCredited). */
   amount: string | number;
+  /** p1 fx: date of the reversing exchange gain/loss entry (default today). */
+  date?: Date | null;
 }
 
 /**
@@ -564,6 +570,9 @@ export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBil
     throw validation(
       `Unapply amount ${toAmountString(unapplyAmount)} exceeds the bill's credited amount ${toAmountString(billCredited)}.`,
     );
+  }
+  if (isForeignApplication(credit, bill)) {
+    return unapplyForeignVendorCredit(ctx, credit, bill, unapplyAmount, input.date);
   }
 
   return inTransaction(ctx, async (tx) => {
@@ -630,6 +639,8 @@ export interface RefundVendorCreditInput {
   amount: string | number;
   date?: Date | null;
   memo?: string | null;
+  /** p1 fx: foreign credit — home units per 1 unit on the refund date (default: list rate). */
+  exchangeRate?: string | number | null;
 }
 
 /**
@@ -664,6 +675,17 @@ export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendo
     throw validation(
       `Refund amount ${toAmountString(amount)} exceeds the credit's unapplied balance ${toAmountString(unapplied)}.`,
     );
+  }
+
+  // p1 fx: a foreign credit's refund is taken at its booked rate, banked at the refund's rate.
+  if (credit.currency) {
+    return refundForeignVendorCredit(ctx, credit, {
+      bankAccountId: input.bankAccountId,
+      amount,
+      date: input.date,
+      memo: input.memo,
+      exchangeRate: input.exchangeRate,
+    });
   }
 
   // Validate the bank account: company-owned bank/cash asset.
@@ -776,7 +798,7 @@ export async function voidVendorCredit(ctx: ServiceContext, id: string) {
 
     const [updated] = await tx.db
       .update(vendorCredits)
-      .set({ status: 'void', unapplied: '0.00' })
+      .set({ status: 'void', unapplied: '0.00', ...(credit.currency ? { homeUnapplied: '0.00' } : {}) })
       .where(eq(vendorCredits.id, id))
       .returning();
 
