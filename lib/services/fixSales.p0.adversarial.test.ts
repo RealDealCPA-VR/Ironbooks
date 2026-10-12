@@ -857,6 +857,13 @@ describe('fix/sales P0 — adversarial QA', () => {
   // Re-test round 1: estimate links now accepted from the API; aging memo-refund add-back
   // ===========================================================================
   describe('re-test round 1', () => {
+    // Own company: an earlier test (voided payment refund) leaves company A's integrity check
+    // failing, which would mask what these tests check.
+    let R: Co;
+    beforeAll(async () => {
+      R = await newCompany('Adv Co R (re-test)');
+    });
+
     async function twoLineEstimate(co: Co, name: string) {
       const customerId = await newCustomer(co, name);
       const est = await createEstimate(co.ctx, {
@@ -877,50 +884,50 @@ describe('fix/sales P0 — adversarial QA', () => {
     }
 
     it('original repro still fixed: deleting Labor from a 50% progress invoice leaves Permit 60.00, Labor 0.00, books balanced', async () => {
-      const { customerId, estimateId, labor, permit } = await twoLineEstimate(A, 'Repro Rita');
-      const r = await createProgressInvoice(A.ctx, estimateId, { percent: 50, date: d('2025-04-02') });
-      const inv = await getInvoice(A.ctx, r.invoice.id);
+      const { customerId, estimateId, labor, permit } = await twoLineEstimate(R, 'Repro Rita');
+      const r = await createProgressInvoice(R.ctx, estimateId, { percent: 50, date: d('2025-04-02') });
+      const inv = await getInvoice(R.ctx, r.invoice.id);
       const p = inv.lines.find((l) => l.description === 'Permit')!;
       // Exactly what the invoice form sends now (link round-tripped).
-      await updateInvoice(A.ctx, r.invoice.id, {
+      await updateInvoice(R.ctx, r.invoice.id, {
         customerId,
         date: d('2025-04-02'),
         lines: [{ description: 'Permit', quantity: p.quantity, rate: p.rate, taxable: false, estimateLineId: p.estimateLineId }],
       });
-      const after = await getEstimate(A.ctx, estimateId);
+      const after = await getEstimate(R.ctx, estimateId);
       expect(after.lines.find((l) => l.id === labor.id)!.amountInvoiced).toBe('0.00');
       expect(after.lines.find((l) => l.id === permit.id)!.amountInvoiced).toBe('60.00');
       expect(after.status).toBe('partial');
       expect(after.amountInvoiced).toBe('60.00');
       // The rest can still be billed in full without an over-billing warning.
-      await createProgressInvoice(A.ctx, estimateId, { remaining: true, date: d('2025-04-03') });
-      const done = await getEstimate(A.ctx, estimateId);
+      await createProgressInvoice(R.ctx, estimateId, { remaining: true, date: d('2025-04-03') });
+      const done = await getEstimate(R.ctx, estimateId);
       expect(done.lines.map((l) => l.amountInvoiced).sort()).toEqual(['120.00', '500.00']);
       expect(done.status).toBe('closed');
-      await assertBooks(A);
+      await assertBooks(R);
     });
 
     it('a plain invoice that links an estimate line (API now accepts estimateLineId) cannot silently over-bill it', async () => {
       // invoiceLineSchema now accepts estimateLineId on POST /api/invoices, so createInvoice is
       // a second way to bill an estimate. Billing 200% of Labor this way must get the same
       // over-billing refusal (or warning) createProgressInvoice gives, not pass silently.
-      const { customerId, estimateId, labor } = await twoLineEstimate(A, 'Overbill Olga');
-      const before = await invoiceCount(A);
+      const { customerId, estimateId, labor } = await twoLineEstimate(R, 'Overbill Olga');
+      const before = await invoiceCount(R);
       await expect(
-        createInvoice(A.ctx, {
+        createInvoice(R.ctx, {
           customerId,
           date: d('2025-04-05'),
           lines: [{ description: 'Labor', quantity: 20, rate: 50, taxable: false, estimateLineId: labor.id }],
         }),
       ).rejects.toThrow(/more than 100%/);
-      expect(await invoiceCount(A)).toBe(before);
-      const e = await getEstimate(A.ctx, estimateId);
+      expect(await invoiceCount(R)).toBe(before);
+      const e = await getEstimate(R.ctx, estimateId);
       expect(e.lines.find((l) => l.id === labor.id)!.amountInvoiced).toBe('0.00');
     });
 
     it('a plain invoice that bills an estimate line in full updates the estimate header (amount invoiced / status)', async () => {
-      const { customerId, estimateId, labor, permit } = await twoLineEstimate(A, 'Header Hank');
-      await createInvoice(A.ctx, {
+      const { customerId, estimateId, labor, permit } = await twoLineEstimate(R, 'Header Hank');
+      await createInvoice(R.ctx, {
         customerId,
         date: d('2025-04-05'),
         lines: [
@@ -928,7 +935,7 @@ describe('fix/sales P0 — adversarial QA', () => {
           { description: 'Permit', quantity: 1, rate: 120, taxable: false, estimateLineId: permit.id },
         ],
       });
-      const e = await getEstimate(A.ctx, estimateId);
+      const e = await getEstimate(R.ctx, estimateId);
       // Line progress is computed live, so it is right...
       expect(e.lines.map((l) => l.amountInvoiced).sort()).toEqual(['120.00', '500.00']);
       // ...and the header must agree with it.
@@ -937,30 +944,30 @@ describe('fix/sales P0 — adversarial QA', () => {
     });
 
     it('posting a pending (draft) invoice that bills estimate lines updates the estimate header', async () => {
-      const { customerId, estimateId, labor } = await twoLineEstimate(A, 'Draft Dan');
-      const draft = await createInvoice(A.ctx, {
+      const { customerId, estimateId, labor } = await twoLineEstimate(R, 'Draft Dan');
+      const draft = await createInvoice(R.ctx, {
         customerId,
         date: d('2025-04-06'),
         status: 'draft',
         lines: [{ description: 'Labor', quantity: 5, rate: 50, taxable: false, estimateLineId: labor.id }],
       });
-      let e = await getEstimate(A.ctx, estimateId);
+      let e = await getEstimate(R.ctx, estimateId);
       expect(e.lines.find((l) => l.id === labor.id)!.amountInvoiced).toBe('0.00'); // drafts bill nothing
-      await postDraftInvoice(A.ctx, draft.id);
-      e = await getEstimate(A.ctx, estimateId);
+      await postDraftInvoice(R.ctx, draft.id);
+      e = await getEstimate(R.ctx, estimateId);
       expect(e.lines.find((l) => l.id === labor.id)!.amountInvoiced).toBe('250.00');
       expect(e.amountInvoiced).toBe('250.00');
       expect(e.status).toBe('partial');
-      await assertBooks(A);
+      await assertBooks(R);
     });
 
     it('editing a progress invoice cannot silently push a line past 100% of the estimate', async () => {
-      const { customerId, estimateId, labor } = await twoLineEstimate(A, 'Edit Over Ed');
-      const r = await createProgressInvoice(A.ctx, estimateId, { percent: 100, date: d('2025-04-07') });
-      const inv = await getInvoice(A.ctx, r.invoice.id);
+      const { customerId, estimateId, labor } = await twoLineEstimate(R, 'Edit Over Ed');
+      const r = await createProgressInvoice(R.ctx, estimateId, { percent: 100, date: d('2025-04-07') });
+      const inv = await getInvoice(R.ctx, r.invoice.id);
       const l = inv.lines.find((x) => x.estimateLineId === labor.id)!;
       await expect(
-        updateInvoice(A.ctx, r.invoice.id, {
+        updateInvoice(R.ctx, r.invoice.id, {
           customerId,
           date: d('2025-04-07'),
           lines: inv.lines.map((x) => ({
@@ -972,18 +979,18 @@ describe('fix/sales P0 — adversarial QA', () => {
           })),
         }),
       ).rejects.toThrow(/more than 100%/);
-      const e = await getEstimate(A.ctx, estimateId);
+      const e = await getEstimate(R.ctx, estimateId);
       expect(e.lines.find((x) => x.id === labor.id)!.amountInvoiced).toBe('500.00');
-      await assertBooks(A);
+      await assertBooks(R);
     });
 
     it('an old-API edit (no links sent) of a progress invoice with re-ordered lines keeps each link by content', async () => {
-      const { customerId, estimateId, labor, permit } = await twoLineEstimate(A, 'Reorder Rex');
-      const r = await createProgressInvoice(A.ctx, estimateId, { percent: 50, date: d('2025-04-08') });
-      const inv = await getInvoice(A.ctx, r.invoice.id);
+      const { customerId, estimateId, labor, permit } = await twoLineEstimate(R, 'Reorder Rex');
+      const r = await createProgressInvoice(R.ctx, estimateId, { percent: 50, date: d('2025-04-08') });
+      const inv = await getInvoice(R.ctx, r.invoice.id);
       const lab = inv.lines.find((l) => l.description === 'Labor')!;
       const per = inv.lines.find((l) => l.description === 'Permit')!;
-      await updateInvoice(A.ctx, r.invoice.id, {
+      await updateInvoice(R.ctx, r.invoice.id, {
         customerId,
         date: d('2025-04-08'),
         lines: [
@@ -991,83 +998,83 @@ describe('fix/sales P0 — adversarial QA', () => {
           { description: 'Labor', quantity: lab.quantity, rate: lab.rate, taxable: false },
         ],
       });
-      const e = await getEstimate(A.ctx, estimateId);
+      const e = await getEstimate(R.ctx, estimateId);
       expect(e.lines.find((l) => l.id === labor.id)!.amountInvoiced).toBe('250.00');
       expect(e.lines.find((l) => l.id === permit.id)!.amountInvoiced).toBe('60.00');
     });
 
     it('A/R aging between a credit memo and its two refunds, part of the memo applied: aging == GL == statement', async () => {
-      const customerId = await newCustomer(A, 'Between Bea');
-      const inv = await createInvoice(A.ctx, {
+      const customerId = await newCustomer(R, 'Between Bea');
+      const inv = await createInvoice(R.ctx, {
         customerId,
         date: d('2025-09-01'),
         dueDate: d('2025-09-30'),
         lines: [{ description: 'Svc', quantity: 1, rate: 200 }],
       });
-      const cm = await createCreditMemo(A.ctx, {
+      const cm = await createCreditMemo(R.ctx, {
         customerId,
         date: d('2025-09-02'),
         lines: [{ description: 'Credit', quantity: 1, rate: '100.01', taxable: false }],
       });
-      await applyToInvoice(A.ctx, { creditMemoId: cm.id, invoiceId: inv.id, amount: '40.00' });
-      await refundCreditMemo(A.ctx, { creditMemoId: cm.id, bankAccountId: A.acct['1000'], amount: '30.00', date: d('2025-09-10') });
-      await refundCreditMemo(A.ctx, { creditMemoId: cm.id, bankAccountId: A.acct['1000'], amount: '30.01', date: d('2025-09-20') });
-      expect(await assertCustomerTies(A, customerId, d('2025-09-05'))).toBe('99.99');
-      expect(await assertCustomerTies(A, customerId, d('2025-09-15'))).toBe('129.99');
-      expect(await assertCustomerTies(A, customerId, d('2025-09-25'))).toBe('160.00');
-      const det = await arAgingDetail(A.ctx, d('2025-09-15'));
+      await applyToInvoice(R.ctx, { creditMemoId: cm.id, invoiceId: inv.id, amount: '40.00' });
+      await refundCreditMemo(R.ctx, { creditMemoId: cm.id, bankAccountId: R.acct['1000'], amount: '30.00', date: d('2025-09-10') });
+      await refundCreditMemo(R.ctx, { creditMemoId: cm.id, bankAccountId: R.acct['1000'], amount: '30.01', date: d('2025-09-20') });
+      expect(await assertCustomerTies(R, customerId, d('2025-09-05'))).toBe('99.99');
+      expect(await assertCustomerTies(R, customerId, d('2025-09-15'))).toBe('129.99');
+      expect(await assertCustomerTies(R, customerId, d('2025-09-25'))).toBe('160.00');
+      const det = await arAgingDetail(R.ctx, d('2025-09-15'));
       const sum = det.rows
         .filter((r) => r.entityId === customerId)
         .reduce((s, r) => s.plus(Money.of(r.openBalance)), Money.zero());
       expect(sum.toFixed(2)).toBe('129.99');
-      await assertBooks(A);
+      await assertBooks(R);
     });
 
     it('a voided credit-memo refund: statement, GL and aging still agree', async () => {
-      const customerId = await newCustomer(A, 'Void Memo Val');
-      const cm = await createCreditMemo(A.ctx, {
+      const customerId = await newCustomer(R, 'Void Memo Val');
+      const cm = await createCreditMemo(R.ctx, {
         customerId,
         date: d('2025-10-01'),
         lines: [{ description: 'Credit', quantity: 1, rate: 90, taxable: false }],
       });
-      await refundCreditMemo(A.ctx, { creditMemoId: cm.id, bankAccountId: A.acct['1000'], amount: 30, date: d('2025-10-05') });
+      await refundCreditMemo(R.ctx, { creditMemoId: cm.id, bankAccountId: R.acct['1000'], amount: 30, date: d('2025-10-05') });
       const [je] = await db
         .select({ id: journalEntries.id })
         .from(journalEntries)
-        .where(and(eq(journalEntries.companyId, A.ctx.companyId), eq(journalEntries.sourceRef, `refund:${cm.id}`)));
-      await voidJournalEntry(A.ctx, je.id);
-      expect(await assertCustomerTies(A, customerId, d('2025-10-31'))).toBe('-90.00');
+        .where(and(eq(journalEntries.companyId, R.ctx.companyId), eq(journalEntries.sourceRef, `refund:${cm.id}`)));
+      await voidJournalEntry(R.ctx, je.id);
+      expect(await assertCustomerTies(R, customerId, d('2025-10-31'))).toBe('-90.00');
     });
 
     it('a voided overpayment refund: statement, GL and aging still agree', async () => {
-      const customerId = await newCustomer(A, 'Void Pay Pat');
-      const pay = await receivePayment(A.ctx, {
+      const customerId = await newCustomer(R, 'Void Pay Pat');
+      const pay = await receivePayment(R.ctx, {
         customerId,
         date: d('2025-10-01'),
         method: 'check',
         reference: 'VP-1',
         amount: 75,
-        depositAccountId: A.acct['1000'],
+        depositAccountId: R.acct['1000'],
         applications: [],
       });
-      await refundPayment(A.ctx, { paymentId: pay.payment.id, bankAccountId: A.acct['1000'], amount: 25, date: d('2025-10-02') });
+      await refundPayment(R.ctx, { paymentId: pay.payment.id, bankAccountId: R.acct['1000'], amount: 25, date: d('2025-10-02') });
       const [je] = await db
         .select({ id: journalEntries.id })
         .from(journalEntries)
-        .where(and(eq(journalEntries.companyId, A.ctx.companyId), eq(journalEntries.sourceRef, `refund:${pay.payment.id}`)));
-      await voidJournalEntry(A.ctx, je.id);
-      expect(await assertCustomerTies(A, customerId, d('2025-10-31'))).toBe('-75.00');
+        .where(and(eq(journalEntries.companyId, R.ctx.companyId), eq(journalEntries.sourceRef, `refund:${pay.payment.id}`)));
+      await voidJournalEntry(R.ctx, je.id);
+      expect(await assertCustomerTies(R, customerId, d('2025-10-31'))).toBe('-75.00');
     });
 
     it('company-wide aging total == every customer GL balance summed, at several cuts', async () => {
       const aging = async (cut: string) => {
-        const a = await arAging(A.ctx, d(cut));
+        const a = await arAging(R.ctx, d(cut));
         return a.rows.reduce((s, r) => s.plus(Money.of(r.total)), Money.zero()).toFixed(2);
       };
-      const custs = await db.select({ id: customers.id }).from(customers).where(eq(customers.companyId, A.ctx.companyId));
+      const custs = await db.select({ id: customers.id }).from(customers).where(eq(customers.companyId, R.ctx.companyId));
       for (const cut of ['2025-06-10', '2025-09-15', '2030-01-01']) {
         let gl = Money.zero();
-        for (const c of custs) gl = gl.plus(Money.of(await customerArLedgerBalance(A.ctx, c.id, d(cut))));
+        for (const c of custs) gl = gl.plus(Money.of(await customerArLedgerBalance(R.ctx, c.id, d(cut))));
         expect(await aging(cut), cut).toBe(gl.toFixed(2));
       }
     });
