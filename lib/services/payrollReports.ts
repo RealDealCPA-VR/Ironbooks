@@ -21,14 +21,21 @@ import {
   journalEntryLines,
   paychecks,
   paycheckLines,
+  payrollItems,
   payrollStateSettings,
   workersCompCodes,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { employeeWorkState, getEmployee, paycheckCountsCondition } from './payroll';
-import { FUTA_NET_RATE, FUTA_WAGE_BASE, ssWageBaseFor } from './payrollTax';
-import { lineTracking, paycheckWageBases, type TaxTracking } from './payrollTaxTracking';
+import { FUTA_NET_RATE, FUTA_WAGE_BASE, futaCreditReductionFor, ssWageBaseFor } from './payrollTax';
+import {
+  inferEmployeeTaxTracking,
+  inferEmployerTracking,
+  lineTracking,
+  paycheckWageBases,
+  type TaxTracking,
+} from './payrollTaxTracking';
 import { getCompany } from './company';
 
 // ---------------------------------------------------------------------------
@@ -38,17 +45,27 @@ import { getCompany } from './company';
 
 
 /** Pull the employer name/address/EIN out of companies.settings.
- * EIN and address live in settings (`settings.ein`, `settings.address`) because the
- * companies table has no dedicated columns; blank when the settings page hasn't set them. */
-function companyProfile(company: {
+ * EIN and address live in settings (`settings.ein`, `settings.address` or the structured
+ * addressLine1/city/state/zip parts) because the companies table has no dedicated columns; blank
+ * when the settings page hasn't set them. `name` is the legal name when one is set (the IRS forms'
+ * "Name (not your trade name)"), `tradeName` the business name when it differs. */
+export function companyProfile(company: {
   name: string;
   settings?: Record<string, unknown> | null;
-}): { name: string; address: string | null; ein: string | null } {
+}): { name: string; tradeName: string | null; address: string | null; ein: string | null } {
   const s = (company.settings ?? {}) as Record<string, unknown>;
+  const str = (k: string) => (typeof s[k] === 'string' && (s[k] as string).trim() ? (s[k] as string).trim() : null);
+  const legal = str('legalName');
+  let address = str('address');
+  if (!address) {
+    const cityStateZip = [str('city'), [str('state'), str('zip')].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+    address = [str('addressLine1'), str('addressLine2'), cityStateZip].filter(Boolean).join(', ') || null;
+  }
   return {
-    name: company.name,
-    address: typeof s.address === 'string' && s.address.trim() ? s.address.trim() : null,
-    ein: typeof s.ein === 'string' && s.ein.trim() ? s.ein.trim() : null,
+    name: legal ?? company.name,
+    tradeName: legal && legal !== company.name ? company.name : null,
+    address,
+    ein: str('ein'),
   };
 }
 
@@ -233,6 +250,8 @@ async function countedChecks(ctx: ServiceContext, start: Date, end: Date, employ
       employeeId: paychecks.employeeId,
       grossPay: paychecks.grossPay,
       payDate: paychecks.payDate,
+      periodStart: paychecks.periodStart,
+      periodEnd: paychecks.periodEnd,
     })
     .from(paychecks)
     .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
@@ -317,18 +336,76 @@ export async function w2Data(
 // Form 941 data
 // ---------------------------------------------------------------------------
 
+export type DepositSchedule = 'monthly' | 'semiweekly';
+
 export interface Form941DataInput {
   /** Calendar quarter: 1, 2, 3, or 4. */
   quarter: 1 | 2 | 3 | 4;
   year: number;
+  /**
+   * Line 16 deposit schedule (from the lookback period — the IRS tells the employer which one).
+   * 'monthly' (default) fills the three monthly liabilities; 'semiweekly' also builds Schedule B
+   * (daily liabilities). A quarter with less than $2,500 of tax needs neither.
+   */
+  depositSchedule?: DepositSchedule;
+  /**
+   * Line 13 override. By default the deposits are the 941 liability payments (federal
+   * withholding, Social Security, Medicare items) whose date falls within the quarter's deposit
+   * window — see form941Data. Pass an amount when deposits were made outside the app.
+   */
+  depositsOverride?: string | number | null;
+}
+
+/** One 941 liability payment counted on line 13. */
+export interface Form941Deposit {
+  date: string;
+  item: string;
+  amount: string;
+  entryId: string;
+}
+
+/** Every numbered line of Form 941 Part 1 (+ line 16 in Part 2). Money as 2-dp strings. */
+export interface Form941Lines {
+  /** Line 1: employees who received pay for the pay period including the 12th of the quarter's last month. */
+  line1: number;
+  line2: string;
+  line3: string;
+  /** Line 4: no wages subject to Social Security or Medicare tax. */
+  line4: boolean;
+  line5aWages: string;
+  line5aTax: string;
+  /** 5a(i) qualified sick leave / 5a(ii) family leave wages — not used after 2021 (always 0). */
+  line5bWages: string;
+  line5bTax: string;
+  line5cWages: string;
+  line5cTax: string;
+  line5dWages: string;
+  line5dTax: string;
+  line5e: string;
+  /** Section 3121(q) notice and demand — tax due on unreported tips (not tracked: 0). */
+  line5f: string;
+  line6: string;
+  /** Current quarter's adjustment for fractions of cents (actual withheld/accrued − computed). */
+  line7: string;
+  /** Current quarter's adjustment for sick pay (not tracked: 0). */
+  line8: string;
+  /** Adjustments for tips and group-term life insurance (not tracked: 0). */
+  line9: string;
+  line10: string;
+  /** Line 11 credits (small business payroll R&D credit etc.) — 0 unless tracked. */
+  line11: string;
+  line12: string;
+  line13: string;
+  line14: string;
+  line15: string;
 }
 
 export interface Form941DataResult {
-  company: { name: string; address: string | null };
+  company: { name: string; tradeName: string | null; address: string | null; ein: string | null };
   quarter: 1 | 2 | 3 | 4;
   year: number;
   totals: {
-    /** Line 1: number of employees paid in the quarter. */
+    /** Number of employees paid in the quarter (informational; Form 941 line 1 is `lines.line1`). */
     employeeCount: number;
     /**
      * Line 2: wages, tips and other compensation — gross pay less 401(k)-type deferrals and
@@ -344,16 +421,9 @@ export interface Form941DataResult {
     medicareWages: string;
     /** Line 5d column 1: wages subject to Additional Medicare Tax withholding (over $200,000 YTD). */
     additionalMedicareWages: string;
-    /**
-     * TOTAL Social Security tax for the quarter (employee withheld + employer match),
-     * i.e. Form 941 line 5a column 2 (taxable SS wages × 12.4%).
-     */
+    /** TOTAL Social Security tax actually withheld + accrued (employee + employer). */
     socialSecurity: string;
-    /**
-     * TOTAL Medicare tax for the quarter (employee withheld + employer match),
-     * i.e. Form 941 line 5c column 2 (Medicare wages × 2.9%) plus any Additional
-     * Medicare Tax withheld.
-     */
+    /** TOTAL Medicare tax actually withheld + accrued (employee + employer, incl. Additional Medicare). */
     medicare: string;
     /** Employee-withheld Social Security only (breakdown of `socialSecurity`). */
     employeeSocialSecurity: string;
@@ -364,6 +434,23 @@ export interface Form941DataResult {
     /** Employer Medicare match only (breakdown of `medicare`). */
     employerMedicare: string;
   };
+  /** Form 941 lines 1-15. */
+  lines: Form941Lines;
+  /** Line 16 / Schedule B. */
+  schedule: {
+    /** 'under2500' when line 12 is less than $2,500 (line 16 box 1). */
+    kind: 'under2500' | DepositSchedule;
+    /** Monthly tax liability (months 1-3 of the quarter); total equals line 12. */
+    months: [string, string, string];
+    total: string;
+    /** Schedule B: per month, the liability by day of month (only days with a liability). */
+    scheduleB: Array<{ month: number; days: Array<{ day: number; amount: string }>; total: string }> | null;
+  };
+  /** The liability payments counted on line 13 (empty when overridden). */
+  deposits: Form941Deposit[];
+  depositsOverridden: boolean;
+  /** Plain-language notes about figures the app cannot know (shown on the PDF). */
+  notes: string[];
 }
 
 /** Compute the start and end Date for a given quarter in a given year (UTC, matching
@@ -376,22 +463,45 @@ function quarterRange(quarter: 1 | 2 | 3 | 4, year: number): { start: Date; end:
 }
 
 const ADDITIONAL_MEDICARE_WAGE_THRESHOLD = 200000;
+/** Combined (employee + employer) Form 941 rates. */
+const RATE_5A = '0.124';
+const RATE_5C = '0.029';
+const RATE_5D = '0.009';
+/** A deposit for a quarter is normally made by the 15th of the following month. */
+const DEPOSIT_LAG_DAYS = 15;
+
+const FORM941_EMPLOYEE_TRACKING = new Set(['federal_withholding', 'social_security', 'medicare']);
+const FORM941_EMPLOYER_TRACKING = new Set(['employer_social_security', 'employer_medicare']);
 
 /**
- * Aggregate Form 941 totals for a specific quarter and year, across all employees. Taxes are
- * summed by tax tracking type (employee + employer Social Security / Medicare, federal
- * withholding); wage lines use each check's wage bases with the Social Security wage base
- * applied per employee against wages earlier in the year.
+ * Form 941 for a quarter, across all employees — every line of Part 1 plus line 16 / Schedule B.
+ *
+ * - Wages and taxes come from live paychecks by TAX TRACKING type (never free-text names); the
+ *   Social Security wage base and the $200,000 Additional Medicare threshold are applied per
+ *   employee against their wages earlier in the year.
+ * - Line 5 column 2 = column 1 × the combined rates; line 7 is the fractions-of-cents adjustment
+ *   = (Social Security + Medicare actually withheld and accrued) − line 5e, so line 12 always
+ *   equals the tax that hit the books and the line 16 monthly total.
+ * - Line 1 counts employees paid for the pay period that includes the 12th of the quarter's last
+ *   month (checks without pay-period dates count when paid in that month).
+ * - Line 13 deposits: Pay Liabilities payments of 941 items (federal withholding, Social
+ *   Security, Medicare) dated from the 16th of the quarter's first month through the 15th of the
+ *   month after the quarter — the normal deposit window — unless `depositsOverride` is given.
+ * - Line 16: liability by month of the pay date; Schedule B by day for semiweekly depositors.
  */
 export async function form941Data(
   ctx: ServiceContext,
   input: Form941DataInput,
 ): Promise<Form941DataResult> {
+  if (![1, 2, 3, 4].includes(input.quarter)) throw validation('Pick a quarter from 1 to 4.');
+  if (!Number.isInteger(input.year)) throw validation('year must be an integer.');
   const company = await getCompany(ctx);
   if (!company) throw notFound('Company');
 
   const { start, end } = quarterRange(input.quarter, input.year);
   const yearStart = new Date(Date.UTC(input.year, 0, 1));
+  const lastMonth = (input.quarter - 1) * 3 + 2; // 0-based month index of the quarter's last month
+  const twelfth = Date.UTC(input.year, lastMonth, 12);
 
   // Year-to-quarter-end checks: earlier quarters only feed the per-employee wage-base room.
   const checks = await countedChecks(ctx, yearStart, end);
@@ -399,6 +509,7 @@ export async function form941Data(
 
   interface Acc { ficaBefore: Dec; ficaQ: Dec }
   const perEmployee = new Map<string, Acc>();
+  const line1Employees = new Set<string>();
   let wages = Money.zero();
   let gross = Money.zero();
   let medicareWages = Money.zero();
@@ -407,6 +518,8 @@ export async function form941Data(
   let employerSS = Money.zero();
   let employeeMedicare = Money.zero();
   let employerMedicare = Money.zero();
+  const monthly: [Dec, Dec, Dec] = [Money.zero(), Money.zero(), Money.zero()];
+  const daily: Array<Map<number, Dec>> = [new Map(), new Map(), new Map()];
 
   for (const c of checks) {
     const lines = byCheck.get(c.id) ?? [];
@@ -421,11 +534,34 @@ export async function form941Data(
       medicareWages = medicareWages.plus(b.ficaWages);
       const taxLines = lines.filter((l) => l.kind === 'tax');
       const erLines = lines.filter((l) => l.kind === 'employer_contribution');
-      fedWithheld = fedWithheld.plus(sumTracking(taxLines, 'federal_withholding'));
-      employeeSS = employeeSS.plus(sumTracking(taxLines, 'social_security'));
-      employeeMedicare = employeeMedicare.plus(sumTracking(taxLines, 'medicare'));
-      employerSS = employerSS.plus(sumTracking(erLines, 'employer_social_security'));
-      employerMedicare = employerMedicare.plus(sumTracking(erLines, 'employer_medicare'));
+      const fit = sumTracking(taxLines, 'federal_withholding');
+      const eeSS = sumTracking(taxLines, 'social_security');
+      const eeMed = sumTracking(taxLines, 'medicare');
+      const erSS = sumTracking(erLines, 'employer_social_security');
+      const erMed = sumTracking(erLines, 'employer_medicare');
+      fedWithheld = fedWithheld.plus(fit);
+      employeeSS = employeeSS.plus(eeSS);
+      employeeMedicare = employeeMedicare.plus(eeMed);
+      employerSS = employerSS.plus(erSS);
+      employerMedicare = employerMedicare.plus(erMed);
+      // Line 16 / Schedule B: the liability is incurred on the pay date.
+      const liability = fit.plus(eeSS).plus(eeMed).plus(erSS).plus(erMed);
+      const m = c.payDate.getUTCMonth() - (input.quarter - 1) * 3;
+      if (m >= 0 && m < 3) {
+        monthly[m] = monthly[m].plus(liability);
+        const day = c.payDate.getUTCDate();
+        daily[m].set(day, (daily[m].get(day) ?? Money.zero()).plus(liability));
+      }
+      // Line 1: pay period that includes the 12th of the last month of the quarter.
+      if (b.gross.greaterThan(0)) {
+        const ps = c.periodStart?.getTime();
+        const pe = c.periodEnd?.getTime();
+        const covers12th =
+          ps != null && pe != null
+            ? ps <= twelfth && twelfth <= pe + 86_399_999
+            : c.payDate.getUTCMonth() === lastMonth;
+        if (covers12th) line1Employees.add(c.employeeId);
+      }
     }
     perEmployee.set(c.employeeId, acc);
   }
@@ -443,26 +579,168 @@ export async function form941Data(
     additionalMedicareWages = additionalMedicareWages.plus(capAt(over, a.ficaQ));
   }
 
+  // ---- Part 1 lines ----
+  const r2 = (d: Dec) => Money.round2(d);
+  const l5aTax = r2(ssWages.times(RATE_5A));
+  const l5cTax = r2(medicareWages.times(RATE_5C));
+  const l5dTax = r2(additionalMedicareWages.times(RATE_5D));
+  const l5e = l5aTax.plus(l5cTax).plus(l5dTax);
+  const l6 = fedWithheld.plus(l5e);
+  const actualFica = employeeSS.plus(employerSS).plus(employeeMedicare).plus(employerMedicare);
+  const l7 = actualFica.minus(l5e);
+  const l10 = l6.plus(l7);
+  const l11 = Money.zero();
+  const l12 = l10.minus(l11);
+
+  // ---- Line 13: deposits ----
+  const deposits: Form941Deposit[] = [];
+  let l13: Dec;
+  const overridden = input.depositsOverride != null && input.depositsOverride !== '';
+  if (overridden) {
+    l13 = Money.round2(input.depositsOverride!);
+    if (l13.isNegative()) throw validation('Deposits cannot be negative.');
+  } else {
+    const winStart = new Date(start.getTime() + DEPOSIT_LAG_DAYS * 86_400_000);
+    const winEnd = new Date(end.getTime() + DEPOSIT_LAG_DAYS * 86_400_000);
+    deposits.push(...(await payrollTaxPayments(ctx, winStart, winEnd, is941Item)));
+    l13 = deposits.reduce((sum, d) => sum.plus(Money.of(d.amount)), Money.zero());
+  }
+  const l14 = l12.greaterThan(l13) ? l12.minus(l13) : Money.zero();
+  const l15 = l13.greaterThan(l12) ? l13.minus(l12) : Money.zero();
+
+  // ---- Line 16 ----
+  const kind: Form941DataResult['schedule']['kind'] =
+    l12.lessThan(2500) ? 'under2500' : input.depositSchedule === 'semiweekly' ? 'semiweekly' : 'monthly';
+  const scheduleB =
+    input.depositSchedule === 'semiweekly'
+      ? daily.map((m, i) => ({
+          month: i + 1,
+          days: [...m.entries()].sort((a, b) => a[0] - b[0]).map(([day, amt]) => ({ day, amount: toAmountString(amt) })),
+          total: toAmountString(monthly[i]),
+        }))
+      : null;
+
+  const notes: string[] = [];
+  if (!overridden && deposits.length === 0 && l12.greaterThan(0)) {
+    notes.push('No 941 tax payments were found for this quarter. Enter your deposits if you paid them outside the app.');
+  }
+  notes.push('Lines 5f, 8, 9 and 11 are zero: tips, third-party sick pay and payroll tax credits are not tracked.');
+
+  const s = (d: Dec) => toAmountString(d);
   return {
-    company: { name: company.name, address: null },
+    company: companyProfile(company),
     quarter: input.quarter,
     year: input.year,
     totals: {
       employeeCount,
-      wages: toAmountString(wages),
-      grossPay: toAmountString(gross),
-      federalWithheld: toAmountString(fedWithheld),
-      ssWages: toAmountString(ssWages),
-      medicareWages: toAmountString(medicareWages),
-      additionalMedicareWages: toAmountString(additionalMedicareWages),
-      socialSecurity:  toAmountString(employeeSS.plus(employerSS)),
-      medicare:        toAmountString(employeeMedicare.plus(employerMedicare)),
-      employeeSocialSecurity: toAmountString(employeeSS),
-      employerSocialSecurity: toAmountString(employerSS),
-      employeeMedicare:       toAmountString(employeeMedicare),
-      employerMedicare:       toAmountString(employerMedicare),
+      wages: s(wages),
+      grossPay: s(gross),
+      federalWithheld: s(fedWithheld),
+      ssWages: s(ssWages),
+      medicareWages: s(medicareWages),
+      additionalMedicareWages: s(additionalMedicareWages),
+      socialSecurity: s(employeeSS.plus(employerSS)),
+      medicare: s(employeeMedicare.plus(employerMedicare)),
+      employeeSocialSecurity: s(employeeSS),
+      employerSocialSecurity: s(employerSS),
+      employeeMedicare: s(employeeMedicare),
+      employerMedicare: s(employerMedicare),
     },
+    lines: {
+      line1: line1Employees.size,
+      line2: s(wages),
+      line3: s(fedWithheld),
+      line4: wages.greaterThan(0) && ssWages.isZero() && medicareWages.isZero(),
+      line5aWages: s(ssWages),
+      line5aTax: s(l5aTax),
+      line5bWages: '0.00',
+      line5bTax: '0.00',
+      line5cWages: s(medicareWages),
+      line5cTax: s(l5cTax),
+      line5dWages: s(additionalMedicareWages),
+      line5dTax: s(l5dTax),
+      line5e: s(l5e),
+      line5f: '0.00',
+      line6: s(l6),
+      line7: s(l7),
+      line8: '0.00',
+      line9: '0.00',
+      line10: s(l10),
+      line11: s(l11),
+      line12: s(l12),
+      line13: s(l13),
+      line14: s(l14),
+      line15: s(l15),
+    },
+    schedule: {
+      kind,
+      months: [s(monthly[0]), s(monthly[1]), s(monthly[2])],
+      total: s(monthly[0].plus(monthly[1]).plus(monthly[2])),
+      scheduleB,
+    },
+    deposits,
+    depositsOverridden: overridden,
+    notes,
   };
+}
+
+/** A Pay Liabilities line memo names a Form 941 tax (federal withholding, Social Security, Medicare). */
+function is941Item(memo: string): boolean {
+  const ee = inferEmployeeTaxTracking(memo);
+  return (!!ee && FORM941_EMPLOYEE_TRACKING.has(ee)) || FORM941_EMPLOYER_TRACKING.has(inferEmployerTracking(memo));
+}
+
+/**
+ * Pay Liabilities payments in [from, to): debits to a payroll liability account (other than
+ * paycheck postings) whose line memo (the payroll item name) passes `isItem`. Lump-sum payments
+ * without an item can't be attributed and are not counted (the forms' notes say so).
+ */
+async function payrollTaxPayments(
+  ctx: ServiceContext,
+  from: Date,
+  to: Date,
+  isItem: (memo: string) => boolean,
+): Promise<Form941Deposit[]> {
+  // Payroll liability accounts: 2300 plus every account a payroll item posts its liability to.
+  const base = await ctx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2300')));
+  const itemAccts = await ctx.db
+    .select({ id: payrollItems.liabilityAccountId })
+    .from(payrollItems)
+    .where(eq(payrollItems.companyId, ctx.companyId));
+  const liabAccounts = [...new Set([...base.map((b) => b.id), ...itemAccts.map((i) => i.id).filter((x): x is string => !!x)])].map((id) => ({ id }));
+  if (!liabAccounts.length) return [];
+  const rows = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      date: journalEntries.date,
+      debit: journalEntryLines.debit,
+      memo: journalEntryLines.memo,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        inArray(journalEntryLines.accountId, liabAccounts.map((a) => a.id)),
+        gte(journalEntries.date, from),
+        lt(journalEntries.date, to),
+        or(isNull(journalEntries.sourceRef), notLike(journalEntries.sourceRef, 'paycheck:%')),
+      ),
+    )
+    .orderBy(asc(journalEntries.date));
+  const out: Form941Deposit[] = [];
+  for (const r of rows) {
+    if (!r.debit || !Money.gt(r.debit, 0)) continue;
+    const memo = r.memo?.trim() ?? '';
+    if (!memo) continue;
+    if (!isItem(memo)) continue;
+    out.push({ date: r.date.toISOString().slice(0, 10), item: memo, amount: toAmountString(Money.of(r.debit)), entryId: r.entryId });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -471,26 +749,39 @@ export async function form941Data(
 
 export interface Form940DataInput {
   year: number;
+  /** Line 13 override: FUTA deposits made outside the app. */
+  depositsOverride?: string | number | null;
 }
 
 export interface Form940QuarterRow {
   quarter: 1 | 2 | 3 | 4;
-  /** FUTA tax accrued in the quarter (sum of per-paycheck FUTA accrual lines). */
+  /** FUTA tax accrued in the quarter (sum of per-paycheck FUTA accrual lines; Q4 also carries the credit reduction). */
   futaLiability: string;
 }
 
+export interface Form940CreditReductionRow {
+  state: string;
+  /** FUTA taxable wages paid to employees working in the state. */
+  wages: string;
+  /** Credit reduction rate (e.g. "0.012" = 1.2%). */
+  rate: string;
+  amount: string;
+}
+
 export interface Form940DataResult {
-  company: { name: string; address: string | null; ein: string | null };
+  company: { name: string; tradeName: string | null; address: string | null; ein: string | null };
   year: number;
   /** Number of employees paid during the year. */
   employeeCount: number;
   /** Line 3: total payments to all employees (gross wages). */
   totalPayments: string;
   /**
-   * Line 4: payments exempt from FUTA — Section 125 cafeteria deductions (fringe benefits,
-   * box 4a). 401(k) deferrals are NOT exempt (box 4b applies only to employer plan payments).
+   * Line 4: payments exempt from FUTA — Section 125 cafeteria / HSA deductions (fringe benefits,
+   * box 4a) and dependent care (box 4d). 401(k) deferrals are NOT exempt.
    */
   exemptPayments: string;
+  /** Line 4 breakdown (boxes 4a-4e). */
+  exemptBreakdown: { fringeBenefits: string; groupTermLife: string; retirement: string; dependentCare: string; other: string };
   /** Line 5: total of payments over the $7,000 FUTA wage base, per employee (after exempt payments). */
   excessOver7000: string;
   /** Line 6: subtotal (line 4 + line 5). */
@@ -499,22 +790,53 @@ export interface Form940DataResult {
   taxableFutaWages: string;
   /** Line 8 (worksheet): taxable FUTA wages × 0.6% net rate. */
   futaTaxCalculated: string;
+  /** Line 9: all wages excluded from state unemployment tax (× 5.4%) — not tracked, 0. */
+  line9: string;
+  /** Line 10: some wages excluded from state unemployment / late state payments — not tracked, 0. */
+  line10: string;
+  /** Line 11 / Schedule A: credit reduction. */
+  creditReduction: {
+    rows: Form940CreditReductionRow[];
+    total: string;
+    /** False when the year's credit reduction list is not published yet (see warnings). */
+    known: boolean;
+    source: string;
+  };
+  /** Line 12: total FUTA tax after adjustments (8 + 9 + 10 + 11). */
+  line12: string;
+  /** Line 13: FUTA tax deposited for the year. */
+  line13: string;
+  /** Line 14: balance due. */
+  line14: string;
+  /** Line 15: overpayment. */
+  line15: string;
   /** FUTA tax actually accrued on paychecks (employer FUTA lines) — the GL-backed figure. */
   futaTaxAccrued: string;
-  /** Part 5: FUTA liability by quarter (from per-paycheck accruals). */
+  /** Part 5: FUTA liability by quarter (from per-paycheck accruals; credit reduction in Q4). */
   quarters: Form940QuarterRow[];
-  /** Sum of the four quarterly liabilities (= futaTaxAccrued). */
+  /** Sum of the four quarterly liabilities (Form 940 line 17; equals line 12 when accruals match). */
   totalQuarterlyLiability: string;
+  /** FUTA payments counted on line 13. */
+  deposits: Array<{ date: string; item: string; amount: string; entryId: string }>;
+  depositsOverridden: boolean;
+  /** Plain-language warnings (unknown credit reduction year, employees without a work state). */
+  warnings: string[];
 }
 
+const CREDIT_REDUCTION_SOURCE =
+  'U.S. Department of Labor, "FUTA Credit Reductions" (oui.doleta.gov/unemploy/futa_credit.asp); IRS Schedule A (Form 940) instructions.';
+
 /**
- * Aggregate the Form 940 (FUTA) annual worksheet for a calendar year.
+ * Aggregate the Form 940 (FUTA) annual return for a calendar year.
  *
- * Line 3 is gross pay on live checks; line 4 the Section 125 (FUTA-exempt) deductions; line 5
- * the per-employee excess of FUTA wages over $7,000. The tax itself is reported two ways: the
- * worksheet computation (taxable wages × 0.6%) and the sum of the FUTA accrual lines (by tax
- * tracking type) runPaycheck stamps on each check — the accrued figure is what hit the GL and
- * feeds the Part 5 quarterly breakdown.
+ * Line 3 is gross pay on live checks; line 4 the FUTA-exempt payments by tax tracking (Section 125 /
+ * HSA = 4a fringe benefits, dependent care = 4d); line 5 the per-employee excess of FUTA wages over
+ * $7,000. Line 8 = taxable wages × 0.6%. Line 11 (Schedule A) applies the year's credit reduction
+ * rate to the FUTA taxable wages of employees working in each credit reduction state (the
+ * employee's work state). Line 13 sums FUTA payments made through Pay Liabilities from February 1
+ * of the year through January 31 of the next (the year's deposit window) unless overridden.
+ * Part 5 uses the FUTA accrual lines runPaycheck stamps on each check — the figure that hit the
+ * GL — with the credit reduction in the 4th quarter (as the IRS requires).
  */
 export async function form940Data(
   ctx: ServiceContext,
@@ -534,6 +856,7 @@ export async function form940Data(
   const futaWagesByEmployee = new Map<string, Dec>();
   let totalPayments = Money.zero();
   let exemptPayments = Money.zero();
+  let dependentCare = Money.zero();
   const quarterTotals: Record<1 | 2 | 3 | 4, Dec> = {
     1: Money.zero(), 2: Money.zero(), 3: Money.zero(), 4: Money.zero(),
   };
@@ -542,7 +865,9 @@ export async function form940Data(
     const lines = byCheck.get(c.id) ?? [];
     const b = paycheckWageBases(c.grossPay, lines);
     totalPayments = totalPayments.plus(b.gross);
-    exemptPayments = exemptPayments.plus(b.gross.minus(b.ficaWages));
+    const exempt = b.gross.minus(b.ficaWages);
+    exemptPayments = exemptPayments.plus(exempt);
+    dependentCare = dependentCare.plus(b.box10.greaterThan(exempt) ? exempt : b.box10);
     futaWagesByEmployee.set(
       c.employeeId,
       (futaWagesByEmployee.get(c.employeeId) ?? Money.zero()).plus(b.ficaWages),
@@ -556,9 +881,13 @@ export async function form940Data(
   }
 
   let excessOver7000 = Money.zero();
-  for (const total of futaWagesByEmployee.values()) {
+  const taxableByEmployee = new Map<string, Dec>();
+  for (const [id, total] of futaWagesByEmployee) {
     if (total.greaterThan(FUTA_WAGE_BASE)) {
       excessOver7000 = excessOver7000.plus(total.minus(FUTA_WAGE_BASE));
+      taxableByEmployee.set(id, Money.of(FUTA_WAGE_BASE));
+    } else {
+      taxableByEmployee.set(id, total);
     }
   }
 
@@ -566,22 +895,109 @@ export async function form940Data(
   const taxableFutaWages = totalPayments.minus(subtotal);
   const futaTaxCalculated = Money.round2(taxableFutaWages.times(FUTA_NET_RATE));
 
+  // ---- Line 11 / Schedule A: credit reduction by the employee's work state ----
+  const warnings: string[] = [];
+  const rates = futaCreditReductionFor(input.year);
+  const crRows: Form940CreditReductionRow[] = [];
+  let creditReduction = Money.zero();
+  if (taxableByEmployee.size > 0) {
+    const empRows = await ctx.db
+      .select({ id: employees.id, firstName: employees.firstName, lastName: employees.lastName, w4: employees.w4, address: employees.address })
+      .from(employees)
+      .where(and(eq(employees.companyId, ctx.companyId), inArray(employees.id, [...taxableByEmployee.keys()])));
+    const wagesByState = new Map<string, Dec>();
+    const noState: string[] = [];
+    for (const e of empRows) {
+      const st = employeeWorkState(e);
+      const w = taxableByEmployee.get(e.id) ?? Money.zero();
+      if (!st) {
+        if (w.greaterThan(0)) noState.push(`${e.firstName} ${e.lastName}`);
+        continue;
+      }
+      wagesByState.set(st, (wagesByState.get(st) ?? Money.zero()).plus(w));
+    }
+    if (noState.length) {
+      warnings.push(`No work state is set for ${noState.join(', ')}, so their wages were left out of the credit reduction check (Schedule A).`);
+    }
+    if (!rates) {
+      warnings.push(
+        `The FUTA credit reduction states for ${input.year} are not published in this app yet (the Department of Labor announces them in November). Line 11 shows 0 — check Schedule A before filing.`,
+      );
+    } else {
+      for (const [st, w] of [...wagesByState.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        const rate = rates[st];
+        if (!rate) continue;
+        const amt = Money.round2(w.times(rate));
+        creditReduction = creditReduction.plus(amt);
+        crRows.push({ state: st, wages: toAmountString(w), rate, amount: toAmountString(amt) });
+      }
+    }
+  }
+  quarterTotals[4] = quarterTotals[4].plus(creditReduction);
+
+  const line12 = futaTaxCalculated.plus(creditReduction);
+
+  // ---- Line 13: deposits ----
+  const overridden = input.depositsOverride != null && input.depositsOverride !== '';
+  const deposits: Form940DataResult['deposits'] = [];
+  let line13: Dec;
+  if (overridden) {
+    line13 = Money.round2(input.depositsOverride!);
+    if (line13.isNegative()) throw validation('Deposits cannot be negative.');
+  } else {
+    const from = new Date(Date.UTC(input.year, 1, 1));
+    const to = new Date(Date.UTC(input.year + 1, 1, 1));
+    deposits.push(...(await payrollTaxPayments(ctx, from, to, (memo) => inferEmployerTracking(memo) === 'futa')));
+    line13 = deposits.reduce((sum, d) => sum.plus(Money.of(d.amount)), Money.zero());
+  }
+  const line14 = line12.greaterThan(line13) ? line12.minus(line13) : Money.zero();
+  const line15 = line13.greaterThan(line12) ? line13.minus(line12) : Money.zero();
+
+  const totalQuarterly = quarterTotals[1].plus(quarterTotals[2]).plus(quarterTotals[3]).plus(quarterTotals[4]);
+  if (!totalQuarterly.equals(line12)) {
+    warnings.push(
+      `The FUTA tax accrued on paychecks (${toAmountString(totalQuarterly)} with the credit reduction) differs from line 12 (${toAmountString(line12)}). This usually means an employer tax was typed over on a paycheck.`,
+    );
+  }
+
   return {
     company: companyProfile(company),
     year: input.year,
     employeeCount: futaWagesByEmployee.size,
     totalPayments: toAmountString(totalPayments),
     exemptPayments: toAmountString(exemptPayments),
+    exemptBreakdown: {
+      fringeBenefits: toAmountString(exemptPayments.minus(dependentCare)),
+      groupTermLife: '0.00',
+      retirement: '0.00',
+      dependentCare: toAmountString(dependentCare),
+      other: '0.00',
+    },
     excessOver7000: toAmountString(excessOver7000),
     subtotal: toAmountString(subtotal),
     taxableFutaWages: toAmountString(taxableFutaWages),
     futaTaxCalculated: toAmountString(futaTaxCalculated),
+    line9: '0.00',
+    line10: '0.00',
+    creditReduction: {
+      rows: crRows,
+      total: toAmountString(creditReduction),
+      known: rates !== null,
+      source: CREDIT_REDUCTION_SOURCE,
+    },
+    line12: toAmountString(line12),
+    line13: toAmountString(line13),
+    line14: toAmountString(line14),
+    line15: toAmountString(line15),
     futaTaxAccrued: toAmountString(futaTaxAccrued),
     quarters: ([1, 2, 3, 4] as const).map((q) => ({
       quarter: q,
       futaLiability: toAmountString(quarterTotals[q]),
     })),
-    totalQuarterlyLiability: toAmountString(futaTaxAccrued),
+    totalQuarterlyLiability: toAmountString(totalQuarterly),
+    deposits,
+    depositsOverridden: overridden,
+    warnings,
   };
 }
 

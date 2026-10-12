@@ -148,6 +148,32 @@ export const FUTA_WAGE_BASE = 7000;
 /** Net FUTA rate (6.0% statutory minus the full 5.4% state unemployment credit). */
 export const FUTA_NET_RATE = '0.006';
 
+// ---------------------------------------------------------------------------
+// FUTA credit reduction states (Form 940 Schedule A)
+// ---------------------------------------------------------------------------
+
+/**
+ * FUTA credit reduction by year: states (and territories) with outstanding federal unemployment
+ * loans lose part of the 5.4% credit, so employers there owe the extra rate on FUTA taxable wages
+ * paid in that state (Form 940 line 11 / Schedule A).
+ *
+ * Source: U.S. Department of Labor, Employment & Training Administration, "FUTA Credit
+ * Reductions" (oui.doleta.gov/unemploy/futa_credit.asp), and the IRS Schedule A (Form 940)
+ * instructions for each year. The list for a year is announced in November of that year, so a
+ * year missing here is unknown (not "none") — form940Data warns instead of assuming zero.
+ */
+export const FUTA_CREDIT_REDUCTION: Record<number, Record<string, string>> = {
+  2022: { CA: '0.003', CT: '0.003', IL: '0.003', NY: '0.003', VI: '0.033' },
+  2023: { CA: '0.006', NY: '0.006', VI: '0.042' },
+  2024: { CA: '0.009', VI: '0.045' },
+  2025: { CA: '0.012' },
+};
+
+/** Credit reduction rates for a year, or null when the year's list is not known yet. */
+export function futaCreditReductionFor(year: number): Record<string, string> | null {
+  return FUTA_CREDIT_REDUCTION[year] ?? null;
+}
+
 /**
  * The table for `year`. Years outside the table use the nearest year we have (the latest
  * table for future years, the earliest for older ones) and report it via `tableYear`.

@@ -2,7 +2,7 @@
  * PDF renderers for IRS payroll tax forms.
  *
  * renderW2Pdf   — Employee W-2 Wage and Tax Statement (simplified layout)
- * render941Pdf  — Employer's Quarterly Federal Tax Return (Form 941, simplified)
+ * render941Pdf  — Employer's Quarterly Federal Tax Return (Form 941 lines 1-16 + Schedule B)
  *
  * Uses pdf-lib with standard Helvetica fonts (no external font files required).
  * Returns a Uint8Array of the PDF bytes.
@@ -13,6 +13,7 @@
  */
 
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
+import type { Form941Lines } from '@/lib/services/payrollReports';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -304,31 +305,20 @@ export async function renderW2Pdf(input: W2PdfInput): Promise<Uint8Array> {
 // Form 941 types + renderer
 // ---------------------------------------------------------------------------
 
-export interface Form941Totals {
-  /** Total wages, tips, and other compensation paid this quarter. */
-  wages: string | number;
-  /** Total federal income tax withheld from wages. */
-  federalWithheld: string | number;
-  /** Total Social Security tax (employee + employer shares combined — 941 line 5a col 2). */
-  socialSecurity: string | number;
-  /** Total Medicare tax (employee + employer shares combined — 941 line 5c col 2). */
-  medicare: string | number;
-  /** Line 1: employees paid in the quarter. */
-  employeeCount?: number;
-  /** Line 5a column 1: taxable Social Security wages. */
-  ssWages?: string | number;
-  /** Line 5c column 1: taxable Medicare wages. */
-  medicareWages?: string | number;
-  /** Line 5d column 1: wages subject to Additional Medicare Tax withholding. */
-  additionalMedicareWages?: string | number;
-}
-
 export interface Form941PdfInput {
-  company: { name: string; address?: string | null };
+  company: { name: string; tradeName?: string | null; address?: string | null; ein?: string | null };
   /** Calendar quarter: 1, 2, 3, or 4. */
   quarter: 1 | 2 | 3 | 4;
   year: number;
-  totals: Form941Totals;
+  /** Every Form 941 line (payrollReports.form941Data). */
+  lines: Form941Lines;
+  schedule: {
+    kind: 'under2500' | 'monthly' | 'semiweekly';
+    months: [string, string, string];
+    total: string;
+    scheduleB: Array<{ month: number; days: Array<{ day: number; amount: string }>; total: string }> | null;
+  };
+  notes?: string[];
 }
 
 const QUARTER_LABELS: Record<number, string> = {
@@ -337,22 +327,26 @@ const QUARTER_LABELS: Record<number, string> = {
   3: 'July, August, September',
   4: 'October, November, December',
 };
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
 /**
- * Render a simplified Form 941 (Employer's Quarterly Federal Tax Return) as a PDF.
+ * Render Form 941 (Employer's Quarterly Federal Tax Return): employer block (EIN, name, trade
+ * name, address), Part 1 lines 1-15 with the line 5 two-column table, Part 2 line 16 (deposit
+ * schedule and monthly liabilities), and Schedule B (daily liabilities) for semiweekly depositors.
  * Returns the PDF bytes as Uint8Array.
  */
 export async function render941Pdf(input: Form941PdfInput): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.create();
   const regular = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const bold    = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const L = input.lines;
 
-  const page = pdfDoc.addPage([PAGE_W, PAGE_H]);
+  let page = pdfDoc.addPage([PAGE_W, PAGE_H]);
+  let cursor = PAGE_H - 48;
 
   function hRule(y: number, x1 = ML, x2 = MR, thickness = 0.5, color = C_LIGHT) {
     page.drawLine({ start: { x: x1, y }, end: { x: x2, y }, thickness, color });
   }
-
   function txt(
     s: string,
     x: number,
@@ -363,134 +357,152 @@ export async function render941Pdf(input: Form941PdfInput): Promise<Uint8Array> 
     const drawX = rightAlign ? x - font.widthOfTextAtSize(s, size) : x;
     page.drawText(s, { x: drawX, y, font, size, color });
   }
-
-  let cursor = PAGE_H - 48;
-
-  // ----- Header -----
-  txt('Form 941', ML, cursor, { font: bold, size: 20, color: C_NAVY });
-  cursor -= 18;
-  txt("Employer's Quarterly Federal Tax Return", ML, cursor, { font: bold, size: 12, color: C_NAVY });
-  cursor -= 14;
-  txt(
-    `Quarter ${input.quarter} (${QUARTER_LABELS[input.quarter]})  —  Year ${input.year}`,
-    ML,
-    cursor,
-    { size: 10, color: C_GRAY },
-  );
-
-  const disc = 'INFORMATIONAL COPY — NOT OFFICIAL IRS FORM';
-  txt(disc, MR, PAGE_H - 48, { size: 7, color: C_GRAY, rightAlign: true });
-
-  cursor -= 10;
-  hRule(cursor, ML, MR, 1.5, C_ACCENT);
-  cursor -= 20;
-
-  // ----- Employer info -----
-  txt('Name', ML, cursor, { size: 8, color: C_GRAY });
-  cursor -= 14;
-  txt(input.company.name, ML, cursor, { font: bold, size: 11, color: C_BLACK });
-  if (input.company.address) {
-    cursor -= 14;
-    txt(input.company.address, ML, cursor, { size: 10, color: C_BLACK });
-  }
-
-  cursor -= 24;
-  hRule(cursor);
-  cursor -= 20;
-
-  // ----- Line items (Part 1 of 941) -----
-  txt('Part 1: Tell us about your return for this quarter', ML, cursor, {
-    font: bold, size: 10, color: C_NAVY,
-  });
-  cursor -= 20;
-
-  // Helper: draw a numbered line
-  function drawLine941(lineNum: string, description: string, value: string | number) {
-    txt(`${lineNum}.`, ML, cursor, { size: 10, color: C_GRAY });
-    txt(description, ML + 24, cursor, { size: 10, color: C_BLACK });
-    txt(fmt(value), MR, cursor, { font: bold, size: 10, color: C_BLACK, rightAlign: true });
-    cursor -= 6;
-    hRule(cursor, ML + 24, MR, 0.3, C_LIGHT);
-    cursor -= 14;
-  }
-
-  const { wages, federalWithheld, socialSecurity, medicare } = input.totals;
-
-  const totalSSAndMedicare =
-    parseFloat(String(socialSecurity)) + parseFloat(String(medicare));
-
-  const totalTaxBeforeAdjustments =
-    parseFloat(String(federalWithheld)) + totalSSAndMedicare;
-
-  const t = input.totals;
-  drawLine941('1',  'Number of employees who received wages',
-    t.employeeCount != null ? String(t.employeeCount) : '');
-  drawLine941('2',  'Wages, tips, and other compensation',                                wages);
-  drawLine941('3',  'Federal income tax withheld from wages, tips, and other compensation', federalWithheld);
-  if (t.ssWages != null) {
-    drawLine941('5a', 'Taxable social security wages (column 1)',                          t.ssWages);
-  }
-  drawLine941('5a', 'Social security tax (employee + employer shares)',                    socialSecurity);
-  if (t.medicareWages != null) {
-    drawLine941('5c', 'Taxable Medicare wages & tips (column 1)',                          t.medicareWages);
-  }
-  drawLine941('5c', 'Medicare tax (employee + employer shares)',                           medicare);
-  if (t.additionalMedicareWages != null) {
-    drawLine941('5d', 'Wages subject to Additional Medicare Tax withholding (column 1)',   t.additionalMedicareWages);
-  }
-  drawLine941('5e', 'Total social security and Medicare taxes (lines 5a + 5c + 5d)',       totalSSAndMedicare);
-
-  cursor -= 4;
-  hRule(cursor, ML, MR, 1, C_NAVY);
-  cursor -= 18;
-
-  txt('6.  Total taxes before adjustments (line 3 + line 5e)', ML, cursor, {
-    font: bold, size: 10, color: C_NAVY,
-  });
-  txt(fmt(totalTaxBeforeAdjustments), MR, cursor, {
-    font: bold, size: 11, color: C_NAVY, rightAlign: true,
-  });
-  cursor -= 20;
-
-  // Adjustments / deposits placeholder
-  txt(
-    '(Lines 7–15 — adjustments, deposits, and balance due — require manual completion.)',
-    ML,
-    cursor,
-    { size: 8, color: C_GRAY },
-  );
-  cursor -= 30;
-
-  // ----- Summary box -----
-  hRule(cursor, ML, MR, 1, C_LIGHT);
-  cursor -= 16;
-  txt('Summary', ML, cursor, { font: bold, size: 10, color: C_NAVY });
-  cursor -= 16;
-
-  const summaryRows: Array<[string, string | number]> = [
-    ['Wages, tips, other compensation (Line 2)',           wages],
-    ['Federal income tax withheld (Line 3)',               federalWithheld],
-    ['Social security tax, employee + employer (Line 5a)', socialSecurity],
-    ['Medicare tax, employee + employer (Line 5c)',        medicare],
-    ['Total social security + Medicare (Line 5e)',         totalSSAndMedicare],
-    ['Total taxes before adjustments (Line 6)',            totalTaxBeforeAdjustments],
-  ];
-
-  for (const [label, value] of summaryRows) {
-    txt(label, ML, cursor, { size: 10, color: C_GRAY });
-    if (value !== '') {
-      txt(fmt(value), MR, cursor, { font: bold, size: 10, color: C_BLACK, rightAlign: true });
+  function ensure(space: number) {
+    if (cursor - space < 56) {
+      page = pdfDoc.addPage([PAGE_W, PAGE_H]);
+      cursor = PAGE_H - 48;
     }
+  }
+  const COL1 = MR - 130;
+  /** A numbered line. Money values are formatted; `text` values print as-is. */
+  function line(
+    num: string,
+    description: string,
+    value: { money: string } | { text: string } | null,
+    col1?: string | null,
+    boldValue = false,
+  ) {
+    ensure(22);
+    txt(num, ML, cursor, { size: 9, color: C_GRAY });
+    txt(description, ML + 28, cursor, { size: 9, color: C_BLACK });
+    if (col1 != null) txt(fmt(col1), COL1, cursor, { size: 9, color: C_BLACK, rightAlign: true });
+    if (value) {
+      const shown = 'money' in value ? fmt(value.money) : value.text;
+      txt(shown, MR, cursor, { font: boldValue ? bold : regular, size: 9, color: C_BLACK, rightAlign: true });
+    }
+    cursor -= 5;
+    hRule(cursor, ML + 28, MR, 0.3, C_LIGHT);
+    cursor -= 12;
+  }
+  const $ = (money: string) => ({ money });
+  function heading(s: string) {
+    ensure(30);
+    cursor -= 4;
+    txt(s, ML, cursor, { font: bold, size: 10, color: C_NAVY });
     cursor -= 16;
   }
 
-  // ----- Footer -----
+  // ----- Header -----
+  txt(`Form 941 for ${input.year}`, ML, cursor, { font: bold, size: 18, color: C_NAVY });
+  txt('INFORMATIONAL COPY - FILE ON THE OFFICIAL IRS FORM', MR, cursor, { size: 7, color: C_GRAY, rightAlign: true });
+  cursor -= 16;
+  txt("Employer's QUARTERLY Federal Tax Return", ML, cursor, { font: bold, size: 11, color: C_NAVY });
   cursor -= 10;
-  hRule(cursor, ML, MR, 0.5, C_LIGHT);
-  cursor -= 14;
-  const footerStr = `${input.company.name}  —  Form 941 Q${input.quarter} ${input.year}`;
-  const ftW = regular.widthOfTextAtSize(footerStr, 7);
-  page.drawText(footerStr, { x: (PAGE_W - ftW) / 2, y: cursor, font: regular, size: 7, color: C_GRAY });
+  hRule(cursor, ML, MR, 1.5, C_ACCENT);
+  cursor -= 16;
+
+  // ----- Employer block -----
+  const field = (label: string, value: string, x: number, y: number) => {
+    txt(label, x, y, { size: 7, color: C_GRAY });
+    txt(value || '-', x, y - 12, { font: bold, size: 10 });
+  };
+  field('Employer identification number (EIN)', input.company.ein ?? '', ML, cursor);
+  field('Report for this quarter', `Q${input.quarter}: ${QUARTER_LABELS[input.quarter]}`, ML + 300, cursor);
+  cursor -= 30;
+  field('Name (not your trade name)', input.company.name, ML, cursor);
+  field('Trade name (if any)', input.company.tradeName ?? '', ML + 300, cursor);
+  cursor -= 30;
+  field('Address', input.company.address ?? '', ML, cursor);
+  cursor -= 30;
+  hRule(cursor);
+  cursor -= 16;
+
+  // ----- Part 1 -----
+  heading('Part 1: Answer these questions for this quarter.');
+  ensure(20);
+  txt('Column 1', COL1, cursor, { size: 7, color: C_GRAY, rightAlign: true });
+  txt('Column 2', MR, cursor, { size: 7, color: C_GRAY, rightAlign: true });
+  cursor -= 12;
+  line('1', 'Number of employees who received pay for the pay period including the 12th', { text: String(L.line1) });
+  line('2', 'Wages, tips, and other compensation', $(L.line2));
+  line('3', 'Federal income tax withheld from wages, tips, and other compensation', $(L.line3));
+  line('4', 'No wages, tips, and other compensation are subject to social security or Medicare tax', { text: L.line4 ? 'Checked' : '-' });
+  line('5a', 'Taxable social security wages  (x 0.124)', $(L.line5aTax), L.line5aWages);
+  line('5b', 'Taxable social security tips  (x 0.124)', $(L.line5bTax), L.line5bWages);
+  line('5c', 'Taxable Medicare wages & tips  (x 0.029)', $(L.line5cTax), L.line5cWages);
+  line('5d', 'Wages & tips subject to Additional Medicare Tax withholding  (x 0.009)', $(L.line5dTax), L.line5dWages);
+  line('5e', 'Total social security and Medicare taxes (5a + 5b + 5c + 5d)', $(L.line5e));
+  line('5f', 'Section 3121(q) Notice and Demand - tax due on unreported tips', $(L.line5f));
+  line('6', 'Total taxes before adjustments (3 + 5e + 5f)', $(L.line6), null, true);
+  line('7', "Current quarter's adjustment for fractions of cents", $(L.line7));
+  line('8', "Current quarter's adjustment for sick pay", $(L.line8));
+  line('9', "Current quarter's adjustments for tips and group-term life insurance", $(L.line9));
+  line('10', 'Total taxes after adjustments (6 through 9)', $(L.line10), null, true);
+  line('11', 'Total nonrefundable credits', $(L.line11));
+  line('12', 'Total taxes after adjustments and nonrefundable credits (10 - 11)', $(L.line12), null, true);
+  line('13', 'Total deposits for this quarter', $(L.line13));
+  line('14', 'Balance due (12 - 13 when 12 is more)', $(L.line14), null, true);
+  line('15', 'Overpayment (13 - 12 when 13 is more)', $(L.line15));
+
+  // ----- Part 2: line 16 -----
+  heading('Part 2: Tell us about your deposit schedule and tax liability for this quarter.');
+  const s = input.schedule;
+  const kindText =
+    s.kind === 'under2500'
+      ? 'Line 12 is less than $2,500 - no monthly or daily liability record is required.'
+      : s.kind === 'monthly'
+        ? 'Monthly schedule depositor for the entire quarter - tax liability by month:'
+        : 'Semiweekly schedule depositor - see Schedule B (Form 941) on the next page.';
+  ensure(16);
+  txt('16', ML, cursor, { size: 9, color: C_GRAY });
+  txt(kindText, ML + 28, cursor, { size: 9 });
+  cursor -= 16;
+  const firstMonth = (input.quarter - 1) * 3;
+  if (s.kind === 'monthly') {
+    s.months.forEach((m, i) => line('', `Month ${i + 1} (${MONTH_NAMES[firstMonth + i]})`, $(m)));
+    line('', 'Total liability for quarter (must equal line 12)', $(s.total), null, true);
+  }
+
+  if (input.notes?.length) {
+    cursor -= 6;
+    for (const n of input.notes) {
+      ensure(12);
+      txt(n, ML, cursor, { size: 7.5, color: C_GRAY });
+      cursor -= 11;
+    }
+  }
+
+  // ----- Schedule B -----
+  if (s.kind === 'semiweekly' && s.scheduleB) {
+    page = pdfDoc.addPage([PAGE_W, PAGE_H]);
+    cursor = PAGE_H - 48;
+    txt(`Schedule B (Form 941) for ${input.year}`, ML, cursor, { font: bold, size: 16, color: C_NAVY });
+    cursor -= 14;
+    txt('Report of Tax Liability for Semiweekly Schedule Depositors', ML, cursor, { font: bold, size: 10, color: C_NAVY });
+    cursor -= 12;
+    txt(`EIN ${input.company.ein ?? '-'}   ${input.company.name}   Quarter ${input.quarter}`, ML, cursor, { size: 9, color: C_GRAY });
+    cursor -= 10;
+    hRule(cursor, ML, MR, 1.5, C_ACCENT);
+    cursor -= 16;
+    for (const m of s.scheduleB) {
+      heading(`Month ${m.month} - ${MONTH_NAMES[firstMonth + m.month - 1]}`);
+      if (!m.days.length) {
+        ensure(14);
+        txt('No tax liability this month.', ML + 28, cursor, { size: 9, color: C_GRAY });
+        cursor -= 14;
+      }
+      for (const d of m.days) line(String(d.day), `Day ${d.day}`, $(d.amount));
+      line('', `Tax liability for month ${m.month}`, $(m.total), null, true);
+    }
+    line('', 'Total liability for the quarter (must equal line 12 of Form 941)', $(s.total), null, true);
+  }
+
+  // ----- Footer on every page -----
+  for (const p of pdfDoc.getPages()) {
+    const footer = `${input.company.name}  -  Form 941 Q${input.quarter} ${input.year}`;
+    const w = regular.widthOfTextAtSize(footer, 7);
+    p.drawText(footer, { x: (PAGE_W - w) / 2, y: 32, font: regular, size: 7, color: C_GRAY });
+  }
 
   return pdfDoc.save();
 }
@@ -520,6 +532,17 @@ export interface Form940PdfInput {
   /** Part 5: FUTA liability by quarter. */
   quarters: Array<{ quarter: 1 | 2 | 3 | 4; futaLiability: string | number }>;
   totalQuarterlyLiability: string | number;
+  /** Line 4 boxes (4a fringe benefits, 4d dependent care, ...). */
+  exemptBreakdown?: { fringeBenefits: string; groupTermLife: string; retirement: string; dependentCare: string; other: string };
+  line9?: string;
+  line10?: string;
+  /** Line 11 / Schedule A. */
+  creditReduction?: { rows: Array<{ state: string; wages: string; rate: string; amount: string }>; total: string; known: boolean; source: string };
+  line12?: string;
+  line13?: string;
+  line14?: string;
+  line15?: string;
+  warnings?: string[];
 }
 
 /**
@@ -603,10 +626,45 @@ export async function render940Pdf(input: Form940PdfInput): Promise<Uint8Array> 
 
   drawLine940('3', 'Total payments to all employees',                          input.totalPayments);
   drawLine940('4', 'Payments exempt from FUTA tax',                            input.exemptPayments);
+  if (input.exemptBreakdown) {
+    const eb = input.exemptBreakdown;
+    const boxes = [
+      ['4a', 'Fringe benefits (Section 125, HSA)', eb.fringeBenefits],
+      ['4b', 'Group-term life insurance', eb.groupTermLife],
+      ['4c', 'Retirement/Pension', eb.retirement],
+      ['4d', 'Dependent care', eb.dependentCare],
+      ['4e', 'Other', eb.other],
+    ];
+    for (const [box, label, amt] of boxes) {
+      if (Number(amt) === 0) continue;
+      txt(`${box}  ${label}`, ML + 40, cursor, { size: 8, color: C_GRAY });
+      txt(fmt(amt), MR - 90, cursor, { size: 8, color: C_GRAY, rightAlign: true });
+      cursor -= 12;
+    }
+  }
   drawLine940('5', 'Total of payments made to each employee in excess of $7,000', input.excessOver7000);
   drawLine940('6', 'Subtotal (line 4 + line 5)',                               input.subtotal);
   drawLine940('7', 'Total taxable FUTA wages (line 3 minus line 6)',           input.taxableFutaWages);
   drawLine940('8', 'FUTA tax before adjustments (line 7 × 0.006)',             input.futaTaxCalculated);
+  if (input.line12 != null) {
+    cursor -= 4;
+    txt('Part 3: Determine your adjustments', ML, cursor, { font: bold, size: 10, color: C_NAVY });
+    cursor -= 18;
+    drawLine940('9', 'All FUTA wages excluded from state unemployment tax (line 7 × 0.054)', input.line9 ?? '0');
+    drawLine940('10', 'Some FUTA wages excluded from state unemployment tax / late state payments', input.line10 ?? '0');
+    drawLine940('11', 'Credit reduction (Schedule A)', input.creditReduction?.total ?? '0');
+    for (const r of input.creditReduction?.rows ?? []) {
+      txt(`${r.state}: ${fmt(r.wages)} × ${(Number(r.rate) * 100).toFixed(1)}%`, ML + 40, cursor, { size: 8, color: C_GRAY });
+      txt(fmt(r.amount), MR - 90, cursor, { size: 8, color: C_GRAY, rightAlign: true });
+      cursor -= 12;
+    }
+    txt('Part 4: Determine your FUTA tax and balance due or overpayment', ML, cursor, { font: bold, size: 10, color: C_NAVY });
+    cursor -= 18;
+    drawLine940('12', 'Total FUTA tax after adjustments (lines 8 + 9 + 10 + 11)', input.line12);
+    drawLine940('13', 'FUTA tax deposited for the year', input.line13 ?? '0');
+    drawLine940('14', 'Balance due (line 12 - line 13 when 12 is more)', input.line14 ?? '0');
+    drawLine940('15', 'Overpayment (line 13 - line 12 when 13 is more)', input.line15 ?? '0');
+  }
 
   cursor -= 4;
   hRule(cursor, ML, MR, 1, C_NAVY);
@@ -649,10 +707,14 @@ export async function render940Pdf(input: Form940PdfInput): Promise<Uint8Array> 
   });
   cursor -= 24;
 
-  txt(
-    '(Lines 9–15 — adjustments, credit reduction, deposits, and balance due — require manual completion.)',
-    ML, cursor, { size: 8, color: C_GRAY },
-  );
+  for (const w of input.warnings ?? []) {
+    txt(w.length > 150 ? `${w.slice(0, 147)}...` : w, ML, cursor, { size: 7, color: C_GRAY });
+    cursor -= 10;
+  }
+  if (input.creditReduction?.rows.length) {
+    txt(`Credit reduction rates: ${input.creditReduction.source}`.slice(0, 160), ML, cursor, { size: 6.5, color: C_GRAY });
+    cursor -= 10;
+  }
 
   // ----- Footer -----
   cursor -= 24;
