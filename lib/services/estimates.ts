@@ -11,9 +11,9 @@
  * `convertToInvoice` is the only mutation that touches the GL, and it does so
  * by delegating entirely to `createInvoice` from the invoices service.
  */
-import { and, eq, sql } from 'drizzle-orm';
-import { Money, allocate, toAmountString } from '@/lib/money';
-import { estimates, estimateLines, customers, taxRates } from '@/lib/db/schema';
+import { and, eq, inArray } from 'drizzle-orm';
+import { Money, toAmountString } from '@/lib/money';
+import { estimates, estimateLines, customers, taxRates, classes, items } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -24,7 +24,8 @@ import {
 } from './_base';
 import { createInvoice } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { allocateDocNumber } from './docNumbers';
+import { allocateDocNumber, docRef } from './docNumbers';
+import { estimateLineProgress, refreshEstimateBilling } from './estimateBilling';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,6 +39,8 @@ export interface EstimateLineInput {
   rate?: string | number | null;
   /** Defaults to true. */
   taxable?: boolean;
+  /** Class for this line; carried onto the invoice lines that bill it. */
+  classId?: string | null;
 }
 
 export interface CreateEstimateInput {
@@ -68,16 +71,59 @@ export interface CreateEstimateInput {
 
 export type EstimateStatus = 'draft' | 'accepted' | 'rejected' | 'closed';
 
-/** Progress-invoicing request: bill a % of the remaining balance OR explicit per-line amounts. */
-export interface ProgressInvoiceInput {
-  /** Percentage (0–100] of the REMAINING (un-invoiced) estimate balance to bill. */
+/** One estimate line in a "selected items / different percentage of each item" progress bill. */
+export interface ProgressLineInput {
+  lineId: string;
+  /** Percentage of this line's estimate quantity and amount to bill now. */
   percent?: string | number | null;
-  /** Explicit dollar amounts per estimate line (estimateLines.id). */
+  /** Units to bill now (amount = units × the estimate rate). */
+  quantity?: string | number | null;
+  /** Dollars to bill now, before sales tax (units = amount ÷ the estimate rate). */
+  amount?: string | number | null;
+}
+
+/**
+ * Progress-invoicing request — the three QB Desktop choices:
+ *   { percent }  "a percentage of the entire estimate" — every line billed at that % of its
+ *                estimate quantity and amount (100 = the entire estimate);
+ *   { remaining: true }  everything not billed yet on every line;
+ *   { lines }    "selected items or different percentages of each item" — per line, a percent,
+ *                a quantity or an amount.
+ * Lines keep the estimate's item, rate, taxability and class; sales tax is computed on the
+ * invoice the normal way (never billed as income).
+ */
+export interface ProgressInvoiceInput {
+  /** Percentage (0–100] of the ENTIRE estimate to bill on every line. */
+  percent?: string | number | null;
+  /** Bill whatever has not been billed yet on every line. */
+  remaining?: boolean | null;
+  /** Per-line billing (percent, quantity or amount per estimate line). */
+  lines?: ProgressLineInput[] | null;
+  /** Older per-line dollar form; same as `lines` with `amount`. */
   lineAmounts?: Array<{ lineId: string; amount: string | number }> | null;
   /** Invoice date; defaults to now. */
   date?: Date | null;
   /** wave2 sales (C2): save even if the invoice puts the customer over their credit limit. */
   overrideCreditLimit?: boolean;
+  /**
+   * QB warns before billing more than 100% of an estimate line and lets you go ahead. Without
+   * this flag such a request is refused with a VALIDATION error whose details carry
+   * `{ warning: 'PROGRESS_OVERBILL', lines }`; resend with `allowOverBilling: true` to save.
+   */
+  allowOverBilling?: boolean;
+}
+
+/** Soft-warning code for billing more than 100% of an estimate line. */
+export const PROGRESS_OVERBILL_WARNING = 'PROGRESS_OVERBILL';
+
+export interface OverBilledLine {
+  lineId: string;
+  description: string;
+  estimateAmount: string;
+  invoicedToDate: string;
+  thisInvoice: string;
+  /** Percent of the line billed once this invoice is saved. */
+  percentBilled: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +159,17 @@ async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) 
     taxRateDecimal = Money.of(taxRow.rate);
   }
 
+  // Classes on lines must belong to this company.
+  const classIds = [...new Set(input.lines.map((l) => l.classId).filter((x): x is string => !!x))];
+  if (classIds.length > 0) {
+    const rows = await ctx.db
+      .select({ id: classes.id })
+      .from(classes)
+      .where(and(eq(classes.companyId, ctx.companyId), inArray(classes.id, classIds)));
+    const found = new Set(rows.map((r) => r.id));
+    for (const id of classIds) if (!found.has(id)) throw notFound(`Class ${id}`);
+  }
+
   // Compute per-line amounts.
   type ComputedLine = {
     itemId: string | null;
@@ -121,6 +178,7 @@ async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) 
     rate: string;
     amount: string;
     taxable: boolean;
+    classId: string | null;
     lineOrder: number;
     pricing: AppliedPricing | null;
   };
@@ -156,6 +214,7 @@ async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) 
       rate: rate.toFixed(4),
       amount: toAmountString(amount),
       taxable: l.taxable !== false,
+      classId: l.classId ?? null,
       lineOrder: i,
       pricing: l.pricing,
     });
@@ -205,6 +264,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        classId: cl.classId,
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
       })),
@@ -244,11 +304,32 @@ export async function getEstimate(ctx: ServiceContext, id: string) {
     .where(and(eq(estimates.companyId, ctx.companyId), eq(estimates.id, id)));
   if (!estimate) throw notFound('Estimate');
 
-  const lines = await ctx.db
+  const rows = await ctx.db
     .select()
     .from(estimateLines)
     .where(eq(estimateLines.estimateId, id))
     .orderBy(estimateLines.lineOrder);
+
+  // Invoiced-to-date per line (progress invoicing): units, dollars before tax, and percent.
+  const progress = await estimateLineProgress(ctx, id);
+  const lines = rows.map((l) => {
+    const p = progress.get(l.id);
+    const qtyInvoiced = p?.qtyInvoiced ?? Money.zero();
+    const amountInvoiced = p?.amountInvoiced ?? Money.zero();
+    const amount = Money.of(l.amount);
+    const qty = Money.of(l.quantity);
+    const pct = amount.greaterThan(0)
+      ? Money.mul(Money.div(amountInvoiced, amount), 100)
+      : qty.greaterThan(0)
+        ? Money.mul(Money.div(qtyInvoiced, qty), 100)
+        : Money.zero();
+    return {
+      ...l,
+      qtyInvoiced: qtyInvoiced.toFixed(4),
+      amountInvoiced: toAmountString(amountInvoiced),
+      percentInvoiced: pct.toDecimalPlaces(2).toFixed(2),
+    };
+  });
 
   return { ...estimate, lines };
 }
@@ -310,7 +391,8 @@ export async function updateEstimateStatus(
  * Convert an estimate into an invoice.
  *
  * - Loads the estimate + its lines.
- * - Calls createInvoice (which posts the A/R journal entry).
+ * - Calls createInvoice (which posts the A/R journal entry); every invoice line is linked to
+ *   the estimate line it bills.
  * - Stamps estimates.convertedInvoiceId and sets status to 'closed'.
  * - Returns the new invoice.
  */
@@ -333,7 +415,10 @@ export async function convertToInvoice(
     if (estimate.status === 'rejected') {
       throw new ServiceError('CONFLICT', 'Cannot convert a rejected estimate to an invoice.');
     }
-    if (Money.gt(estimate.amountInvoiced ?? '0', 0)) {
+    if (
+      Money.gt(estimate.amountInvoiced ?? '0', 0) ||
+      estimate.lines.some((l) => Money.gt(l.amountInvoiced, 0) || Money.gt(l.qtyInvoiced, 0))
+    ) {
       throw new ServiceError(
         'CONFLICT',
         'This estimate has progress invoices against it. Use progress invoicing to bill the remainder.',
@@ -347,7 +432,9 @@ export async function convertToInvoice(
       quantity: l.quantity,
       rate: l.rate,
       taxable: l.taxable,
+      classId: l.classId ?? null,
       pricing: { origin: 'estimate' },
+      estimateLineId: l.id,
     }));
 
     // createInvoice posts the GL entry; its internal inTransaction nests as a
@@ -362,16 +449,12 @@ export async function convertToInvoice(
       overrideCreditLimit: opts?.overrideCreditLimit,
     });
 
-    // Stamp the estimate as closed with the invoice reference. A full
-    // conversion bills 100%, so amountInvoiced is brought up to the total.
+    // Stamp the estimate as closed with the invoice reference (a full conversion bills every
+    // line in full, so amountInvoiced becomes the invoice total).
+    await refreshEstimateBilling(tx, estimateId, { closingInvoiceId: invoice.id });
     await tx.db
       .update(estimates)
-      .set({
-        status: 'closed',
-        convertedInvoiceId: invoice.id,
-        amountInvoiced: estimate.total,
-        updatedAt: new Date(),
-      })
+      .set({ status: 'closed', convertedInvoiceId: invoice.id, updatedAt: new Date() })
       .where(eq(estimates.id, estimateId));
 
     await writeAudit(tx, {
@@ -390,150 +473,240 @@ export async function convertToInvoice(
 // createProgressInvoice (QB Progress Invoicing)
 // ---------------------------------------------------------------------------
 
+type Dec = ReturnType<typeof Money.zero>;
+type EstimateLineRow = Awaited<ReturnType<typeof getEstimate>>['lines'][number];
+
+/** Quantity and amount for billing `pct` % of one estimate line (QB: quantity = estimate qty × %). */
+function billByPercent(line: EstimateLineRow, pct: Dec): { qty: Dec; amount: Dec } {
+  const Q = Money.of(line.quantity);
+  const A = Money.of(line.amount);
+  const qty = Money.mul(Q, Money.div(pct, 100)).toDecimalPlaces(4);
+  let amount = Money.round2(Money.mul(A, Money.div(pct, 100)));
+  // Finishing the line: bill exactly what is left, so the pennies add up to the estimate.
+  if (Money.of(line.qtyInvoiced).plus(qty).equals(Q)) {
+    const left = Money.round2(A.minus(Money.of(line.amountInvoiced)));
+    if (left.greaterThanOrEqualTo(0) && Money.abs(left.minus(amount)).lessThanOrEqualTo('0.05')) amount = left;
+  }
+  return { qty, amount };
+}
+
 /**
  * Bill PART of an estimate (QB Desktop Progress Invoicing).
  *
- * Two modes:
- *   { percent }      — bill a percentage (0–100] of the REMAINING balance,
- *                      allocated across estimate lines proportionally to their
- *                      amounts (penny-exact via allocate()).
- *   { lineAmounts }  — bill explicit dollar amounts against specific estimate
- *                      lines (per-line progress billing).
- *
- * Creates a partial invoice linked to the estimate (memo carries the estimate
- * number), accumulates estimates.amount_invoiced (guarded ≤ total), and keeps
- * the estimate open: status becomes 'partial' until the full total has been
- * invoiced, at which point it closes and convertedInvoiceId points at the
- * final progress invoice.
+ * The invoice gets the estimate's own lines — item, description, rate, taxability, class — with
+ * pro-rated quantities, so inventory relief and COGS follow the units actually billed. Sales tax
+ * is computed on the invoice from the estimate's tax rate exactly like any invoice (it is never
+ * billed as an income line). Each invoice line points back at its estimate line, which is how
+ * invoiced-to-date per line is known (lib/services/estimateBilling.ts). Billing more than 100%
+ * of a line needs `allowOverBilling` (QB warns, then lets you). The estimate is 'partial' until
+ * every line is fully billed, then 'closed' with convertedInvoiceId = the finishing invoice.
  */
 export async function createProgressInvoice(
   ctx: ServiceContext,
   estimateId: string,
   input: ProgressInvoiceInput,
 ) {
-  // Everything (estimate re-read, invoice creation, amount accumulation) runs
-  // in ONE transaction so concurrent progress bills cannot overshoot the total.
+  // Everything (estimate re-read, invoice creation, billing refresh) runs in ONE transaction so
+  // concurrent progress bills see each other.
   return inTransaction(ctx, async (tx) => {
     const estimate = await getEstimate(tx, estimateId);
 
     if (estimate.status === 'rejected') {
       throw new ServiceError('CONFLICT', 'Cannot invoice a rejected estimate.');
     }
-    if (estimate.status === 'closed') {
-      throw new ServiceError('CONFLICT', 'Estimate is closed (fully invoiced or converted).');
+
+    // Subtotal items only add up the lines above them — nothing to bill on their own.
+    const itemIds = [...new Set(estimate.lines.map((l) => l.itemId).filter((x): x is string => !!x))];
+    const itemTypes = new Map<string, string>();
+    if (itemIds.length > 0) {
+      const rows = await tx.db
+        .select({ id: items.id, type: items.type })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), inArray(items.id, itemIds)));
+      for (const r of rows) itemTypes.set(r.id, r.type);
+    }
+    const billable = estimate.lines.filter((l) => !(l.itemId && itemTypes.get(l.itemId) === 'subtotal'));
+
+    const lineDone = (l: EstimateLineRow) =>
+      Money.gt(l.amount, 0)
+        ? !Money.of(l.amountInvoiced).lessThan(Money.of(l.amount))
+        : !Money.of(l.qtyInvoiced).lessThan(Money.of(l.quantity));
+    const fullyBilled = estimate.status === 'closed' || billable.every(lineDone);
+    if (fullyBilled && !input.allowOverBilling) {
+      throw new ServiceError('CONFLICT', 'This estimate has already been fully invoiced.');
     }
 
-    const total = Money.of(estimate.total);
-    const alreadyInvoiced = Money.of(estimate.amountInvoiced ?? '0');
-    const remaining = Money.round2(total.minus(alreadyInvoiced));
-    if (remaining.lessThanOrEqualTo(0)) {
-      throw new ServiceError('CONFLICT', 'Estimate has already been fully invoiced.');
+    const perLine: ProgressLineInput[] = [
+      ...(input.lines ?? []),
+      ...(input.lineAmounts ?? []).map((la) => ({ lineId: la.lineId, amount: la.amount })),
+    ];
+    const modes = [input.percent != null, input.remaining === true, perLine.length > 0].filter(Boolean).length;
+    if (modes === 0) {
+      throw validation(
+        'Choose how much to bill: a percentage of the whole estimate, the remaining amounts, or amounts for selected lines.',
+      );
+    }
+    if (modes > 1) {
+      throw validation('Choose only one way to bill: a percentage, the remaining amounts, or selected lines.');
     }
 
-    // Resolve per-line billing amounts (transaction-currency dollars).
-    type BillLine = { itemId: string | null; description: string; amount: ReturnType<typeof Money.zero> };
-    const billLines: BillLine[] = [];
+    type Bill = { line: EstimateLineRow; qty: Dec; amount: Dec };
+    const bills: Bill[] = [];
     let progressLabel: string;
+    const isSet = (v: string | number | null | undefined) => v != null && v !== '';
 
     if (input.percent != null) {
       const pct = Money.of(input.percent);
       if (pct.lessThanOrEqualTo(0) || pct.greaterThan(100)) {
-        throw validation('percent must be greater than 0 and at most 100.');
+        throw validation('The percentage must be more than 0 and no more than 100.');
       }
-      const requested = Money.round2(Money.mul(remaining, Money.div(pct, 100)));
-      if (requested.lessThanOrEqualTo(0)) {
-        throw validation('Requested progress amount is zero — nothing to invoice.');
+      for (const l of billable) {
+        const b = billByPercent(l, pct);
+        if (b.qty.greaterThan(0)) bills.push({ line: l, ...b });
       }
-      // Allocate the requested amount across estimate lines proportionally to
-      // their amounts (largest-remainder, so the pennies sum exactly).
-      const weights = estimate.lines.map((l) => Money.of(l.amount));
-      const allocs = allocate(requested, weights);
-      estimate.lines.forEach((l, i) => {
-        if (allocs[i].greaterThan(0)) {
-          billLines.push({
-            itemId: l.itemId ?? null,
-            description: `${l.description ?? 'Estimate line'} — progress billing (${toAmountString(pct)}% of remaining)`,
-            amount: allocs[i],
-          });
+      progressLabel = `${toAmountString(pct)}% of estimate`;
+    } else if (input.remaining === true) {
+      for (const l of billable) {
+        let qty = Money.of(l.quantity).minus(Money.of(l.qtyInvoiced)).toDecimalPlaces(4);
+        const amount = Money.round2(Money.of(l.amount).minus(Money.of(l.amountInvoiced)));
+        if (amount.lessThanOrEqualTo(0) && qty.lessThanOrEqualTo(0)) continue;
+        if (qty.lessThanOrEqualTo(0)) {
+          // Only pennies left (rounding of an older bill): bill them on the smallest quantity.
+          const rate = Money.of(l.rate);
+          qty = rate.greaterThan(0) ? Money.div(amount, rate).toDecimalPlaces(4) : Money.zero();
+          if (qty.lessThanOrEqualTo(0)) qty = Money.of('0.0001');
         }
-      });
-      progressLabel = `${toAmountString(pct)}% of remaining`;
-    } else if (input.lineAmounts && input.lineAmounts.length > 0) {
+        bills.push({ line: l, qty, amount: amount.greaterThan(0) ? amount : Money.zero() });
+      }
+      progressLabel = 'remaining amounts';
+    } else {
       const lineById = new Map(estimate.lines.map((l) => [l.id, l]));
-      for (const la of input.lineAmounts) {
-        const line = lineById.get(la.lineId);
-        if (!line) throw notFound(`Estimate line ${la.lineId}`);
-        const amount = Money.round2(la.amount);
-        if (amount.lessThan(0)) throw validation('Line amounts cannot be negative.');
-        if (amount.isZero()) continue;
-        billLines.push({
-          itemId: line.itemId ?? null,
-          description: `${line.description ?? 'Estimate line'} — progress billing`,
-          amount,
+      const seen = new Set<string>();
+      for (const pl of perLine) {
+        const line = lineById.get(pl.lineId);
+        if (!line) throw notFound(`Estimate line ${pl.lineId}`);
+        if (seen.has(pl.lineId)) throw validation('Each estimate line can be listed only once.');
+        seen.add(pl.lineId);
+        const label = line.description ?? 'Estimate line';
+        const given = [isSet(pl.percent), isSet(pl.quantity), isSet(pl.amount)];
+        if (given.filter(Boolean).length !== 1) {
+          throw validation(`"${label}": enter a percentage, a quantity or an amount (just one).`);
+        }
+        const Q = Money.of(line.quantity);
+        const A = Money.of(line.amount);
+        const R = Money.of(line.rate);
+        let qty: Dec;
+        let amount: Dec;
+        if (given[0]) {
+          const pct = Money.of(pl.percent!);
+          if (pct.lessThan(0)) throw validation(`"${label}": the percentage cannot be negative.`);
+          if (pct.isZero()) continue;
+          ({ qty, amount } = billByPercent(line, pct));
+        } else if (given[1]) {
+          qty = Money.of(pl.quantity!).toDecimalPlaces(4);
+          if (qty.lessThan(0)) throw validation(`"${label}": the quantity cannot be negative.`);
+          if (qty.isZero()) continue;
+          amount = Money.round2(Money.mul(qty, R));
+          if (Money.of(line.qtyInvoiced).plus(qty).equals(Q)) {
+            const left = Money.round2(A.minus(Money.of(line.amountInvoiced)));
+            if (left.greaterThanOrEqualTo(0) && Money.abs(left.minus(amount)).lessThanOrEqualTo('0.05')) amount = left;
+          }
+        } else {
+          amount = Money.round2(pl.amount!);
+          if (amount.lessThan(0)) throw validation(`"${label}": the amount cannot be negative.`);
+          if (amount.isZero()) continue;
+          if (!R.greaterThan(0)) {
+            throw validation(`"${label}" has no rate on the estimate. Bill it by quantity or percentage instead.`);
+          }
+          qty = Money.div(amount, R).toDecimalPlaces(4);
+          if (Money.round2(Money.of(line.amountInvoiced).plus(amount)).equals(A)) {
+            const left = Q.minus(Money.of(line.qtyInvoiced));
+            if (left.greaterThan(0)) qty = left;
+          }
+          if (qty.lessThanOrEqualTo(0)) qty = Money.of('0.0001');
+        }
+        bills.push({ line, qty, amount });
+      }
+      progressLabel = 'selected lines';
+    }
+
+    if (bills.length === 0) {
+      throw validation('Nothing to invoice — every amount is zero.');
+    }
+
+    // Over-billing check (QB: "you are billing more than 100% of this item" — warn, then allow).
+    const over: OverBilledLine[] = [];
+    for (const b of bills) {
+      const A = Money.of(b.line.amount);
+      const Q = Money.of(b.line.quantity);
+      const newAmt = Money.of(b.line.amountInvoiced).plus(b.amount);
+      const newQty = Money.of(b.line.qtyInvoiced).plus(b.qty);
+      const overAmt = A.greaterThan(0) ? newAmt.greaterThan(A.plus('0.005')) : false;
+      const overQty = newQty.greaterThan(Q.plus('0.00005'));
+      if (overAmt || overQty) {
+        const pct = A.greaterThan(0)
+          ? Money.mul(Money.div(newAmt, A), 100)
+          : Q.greaterThan(0)
+            ? Money.mul(Money.div(newQty, Q), 100)
+            : Money.zero();
+        over.push({
+          lineId: b.line.id,
+          description: b.line.description ?? 'Estimate line',
+          estimateAmount: toAmountString(A),
+          invoicedToDate: toAmountString(Money.of(b.line.amountInvoiced)),
+          thisInvoice: toAmountString(b.amount),
+          percentBilled: pct.toDecimalPlaces(2).toFixed(2),
         });
       }
-      progressLabel = 'selected line amounts';
-    } else {
-      throw validation('Provide either { percent } or { lineAmounts } to create a progress invoice.');
     }
-
-    const billedTotal = billLines.reduce((sum, l) => sum.plus(l.amount), Money.zero());
-    if (billedTotal.lessThanOrEqualTo(0)) {
-      throw validation('Progress invoice amount must be greater than zero.');
-    }
-
-    // Guard: cumulative billing can never exceed the estimate total.
-    const newInvoiced = Money.round2(alreadyInvoiced.plus(billedTotal));
-    if (newInvoiced.greaterThan(total)) {
-      throw validation(
-        `Progress amount ${toAmountString(billedTotal)} exceeds the remaining balance ${toAmountString(remaining)} on this estimate.`,
+    if (over.length > 0 && !input.allowOverBilling) {
+      const names = over.map((o) => `"${o.description}" (${o.percentBilled}%)`).join(', ');
+      throw new ServiceError(
+        'VALIDATION',
+        `This invoice would bill more than 100% of the estimate for ${names}. Save anyway?`,
+        { warning: PROGRESS_OVERBILL_WARNING, lines: over },
       );
     }
 
-    // Create the partial invoice. Lines are dollar amounts (quantity 1) carved
-    // out of the estimate's quoted total, so they are not re-taxed (the quoted
-    // total already includes any estimate tax).
+    const estRef = docRef(estimate.refNumber, estimate.estimateNumber);
     const invoice = await createInvoice(tx, {
       customerId: estimate.customerId,
       date: input.date ?? new Date(),
-      memo: `Progress billing (${progressLabel}) for Estimate #${estimate.estimateNumber}`,
+      memo: `Progress billing (${progressLabel}) for Estimate #${estRef}`,
+      // Sales tax is charged on the invoice itself, at the estimate's rate, on taxable lines.
+      taxRateId: estimate.taxRateId ?? null,
       overrideCreditLimit: input.overrideCreditLimit,
-      lines: billLines.map((l) => ({
-        itemId: l.itemId,
-        description: l.description,
-        quantity: 1,
-        rate: toAmountString(l.amount),
-        taxable: false,
+      lines: bills.map((b) => ({
+        itemId: b.line.itemId ?? null,
+        description: b.line.description ?? null,
+        quantity: b.qty.toFixed(4),
+        rate: b.line.rate,
+        amount: toAmountString(b.amount),
+        taxable: b.line.taxable,
+        classId: b.line.classId ?? null,
+        pricing: { origin: 'estimate' },
+        estimateLineId: b.line.id,
       })),
     });
 
-    // Accumulate amount_invoiced; close the estimate once fully billed.
-    const fullyInvoiced = !newInvoiced.lessThan(total);
-    const [updatedEstimate] = await tx.db
-      .update(estimates)
-      .set({
-        amountInvoiced: toAmountString(newInvoiced),
-        status: fullyInvoiced ? 'closed' : 'partial',
-        convertedInvoiceId: fullyInvoiced ? invoice.id : estimate.convertedInvoiceId,
-        updatedAt: new Date(),
-      })
-      .where(eq(estimates.id, estimateId))
-      .returning();
+    const billedTotal = bills.reduce((sum, b) => sum.plus(b.amount), Money.zero());
+    const updatedEstimate = await refreshEstimateBilling(tx, estimateId, { closingInvoiceId: invoice.id });
 
     await writeAudit(tx, {
       action: 'update',
       entityType: 'estimate',
       entityId: estimateId,
-      oldValues: { status: estimate.status, amountInvoiced: toAmountString(alreadyInvoiced) },
+      oldValues: { status: estimate.status, amountInvoiced: estimate.amountInvoiced },
       newValues: {
-        status: updatedEstimate.status,
-        amountInvoiced: toAmountString(newInvoiced),
+        status: updatedEstimate?.status,
+        amountInvoiced: updatedEstimate?.amountInvoiced,
         progressInvoiceId: invoice.id,
         progressAmount: toAmountString(billedTotal),
+        overBilled: over.length > 0 ? over : undefined,
       },
     });
 
-    return { invoice, estimate: updatedEstimate };
+    return { invoice, estimate: updatedEstimate!, overBilled: over };
   });
 }
 
@@ -581,6 +754,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        classId: cl.classId,
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
       })),

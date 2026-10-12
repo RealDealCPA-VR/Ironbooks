@@ -23,10 +23,13 @@ const TYPE_LABEL: Record<string, string> = {
   discount: 'Discount',
   // wave2 foundation: named General Journal line on A/R
   general_journal: 'General Journal',
+  // fix/sales: credit-memo / overpayment refund paid to the customer
+  refund: 'Refund',
 };
 
 /**
- * Charges raise the balance: invoices, statement charges, returned (bounced) checks and positive
+ * Charges raise the balance: invoices, statement charges, returned (bounced) checks, refunds paid
+ * to the customer and positive
  * General Journal lines (GJ amounts are signed: + charge, − credit). Payments, discounts and
  * credit memos are credits.
  */
@@ -35,6 +38,7 @@ function isChargeLine(l: { type: string; amount: string }): boolean {
     l.type === 'invoice' ||
     l.type === 'statement_charge' ||
     l.type === 'bounced_check' ||
+    l.type === 'refund' ||
     (l.type === 'general_journal' && !l.amount.startsWith('-'))
   );
 }

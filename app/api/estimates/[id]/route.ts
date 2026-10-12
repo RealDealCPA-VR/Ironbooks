@@ -4,8 +4,11 @@
  *                                      carries `lines` — edit the whole estimate (wave2 sales C1).
  * POST  /api/estimates/:id           — action dispatch:
  *          { action: 'convert' }                              — one-shot full conversion
- *          { action: 'progress', percent }                    — bill % of remaining balance
- *          { action: 'progress', lineAmounts: [{lineId,amount}] } — per-line progress billing
+ *          { action: 'progress', percent }                    — bill % of the entire estimate
+ *          { action: 'progress', remaining: true }            — bill everything not billed yet
+ *          { action: 'progress', lines: [{lineId, percent|quantity|amount}] } — selected lines
+ *          (lineAmounts: [{lineId,amount}] still accepted). Billing over 100% of a line answers
+ *          409 { code: 'PROGRESS_OVERBILL' }; resend with allowOverBilling: true to save anyway.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -15,15 +18,31 @@ import {
   convertToInvoice,
   createProgressInvoice,
   updateEstimate,
+  PROGRESS_OVERBILL_WARNING,
   type EstimateStatus,
 } from '@/lib/services/estimates';
 import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
+import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createEstimateSchema } from '@/lib/validation/estimates';
 
 function errorResponse(err: unknown) {
+  // Over-billing an estimate line is a soft warning (QB asks, then lets you go ahead).
+  if (
+    err instanceof ServiceError &&
+    (err.details as { warning?: unknown } | undefined)?.warning === PROGRESS_OVERBILL_WARNING
+  ) {
+    return NextResponse.json(
+      { error: err.message, code: PROGRESS_OVERBILL_WARNING, details: err.details },
+      { status: 409 },
+    );
+  }
   return routeErrorWithWarnings(err, 'estimates/[id]');
 }
+
+type Num = string | number;
+const numOrNull = (v: unknown): Num | null =>
+  typeof v === 'number' || (typeof v === 'string' && v.trim() !== '') ? (v as Num) : null;
 
 type RouteContext = { params: Promise<{ id: string }> };
 
@@ -78,22 +97,36 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     if (action === 'progress') {
-      if (body.percent == null && !Array.isArray(body.lineAmounts)) {
+      if (body.percent == null && body.remaining !== true && !Array.isArray(body.lines) && !Array.isArray(body.lineAmounts)) {
         return NextResponse.json(
-          { error: 'Provide percent or lineAmounts for progress invoicing', code: 'VALIDATION' },
+          { error: 'Choose a percentage, the remaining amounts, or amounts for selected lines.', code: 'VALIDATION' },
           { status: 400 },
         );
       }
+      const date = body.date ? new Date(body.date) : null;
+      if (date && isNaN(date.getTime())) {
+        return NextResponse.json({ error: 'Invalid invoice date.', code: 'VALIDATION' }, { status: 400 });
+      }
       const result = await createProgressInvoice(ctx, id, {
-        percent: body.percent ?? null,
-        lineAmounts: Array.isArray(body.lineAmounts)
-          ? body.lineAmounts.map((la: Record<string, unknown>) => ({
-              lineId: la.lineId as string,
-              amount: la.amount as string | number,
+        percent: numOrNull(body.percent),
+        remaining: body.remaining === true,
+        lines: Array.isArray(body.lines)
+          ? body.lines.map((l: Record<string, unknown>) => ({
+              lineId: String(l.lineId ?? ''),
+              percent: numOrNull(l.percent),
+              quantity: numOrNull(l.quantity),
+              amount: numOrNull(l.amount),
             }))
           : null,
-        date: body.date ? new Date(body.date) : null,
+        lineAmounts: Array.isArray(body.lineAmounts)
+          ? body.lineAmounts.map((la: Record<string, unknown>) => ({
+              lineId: String(la.lineId ?? ''),
+              amount: numOrNull(la.amount) ?? 0,
+            }))
+          : null,
+        date,
         overrideCreditLimit: body.overrideCreditLimit === true,
+        allowOverBilling: body.allowOverBilling === true,
       });
       return NextResponse.json(result, { status: 201 });
     }

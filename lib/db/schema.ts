@@ -467,6 +467,8 @@ export const estimates = pgTable('estimates', {
   convertedInvoiceId: uuid('converted_invoice_id'),
   /** Total billed so far via progress invoicing (≤ total). */
   amountInvoiced: decimal('amount_invoiced', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** fix/sales (0036): amount billed by the old dollar-only progress invoicing (before line links). */
+  priorAmountInvoiced: decimal('prior_amount_invoiced', { precision: 15, scale: 2 }).notNull().default('0'),
   /** wave2 sales: quoted tax rate (kept so the estimate can be edited later). */
   taxRateId: uuid('tax_rate_id'),
   toBePrinted: boolean('to_be_printed').notNull().default(false),
@@ -488,6 +490,11 @@ export const estimateLines = pgTable('estimate_lines', {
   lineOrder: integer('line_order').notNull().default(0),
   /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
   pricing: jsonb('pricing').$type<Record<string, unknown>>(),
+  /** fix/sales (0036): class carried onto the invoice lines that bill this estimate line. */
+  classId: uuid('class_id'),
+  /** fix/sales (0036): billed before per-line links existed (backfill); new billing is linked. */
+  priorQtyInvoiced: decimal('prior_qty_invoiced', { precision: 15, scale: 4 }).notNull().default('0'),
+  priorAmountInvoiced: decimal('prior_amount_invoiced', { precision: 15, scale: 2 }).notNull().default('0'),
 });
 
 // ---- Invoices (A/R) ----
@@ -554,6 +561,8 @@ export const invoiceLines = pgTable('invoice_lines', {
   lineOrder: integer('line_order').notNull().default(0),
   /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
   pricing: jsonb('pricing').$type<Record<string, unknown>>(),
+  /** fix/sales (0036): the estimate line this line bills (progress invoicing / conversion). */
+  estimateLineId: uuid('estimate_line_id'),
 });
 
 // ---- Payments received (A/R) ----

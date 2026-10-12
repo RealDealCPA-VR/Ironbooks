@@ -13,6 +13,8 @@ export const estimateLineSchema = z.object({
   rate: zDecimal.nullish(),
   /** Defaults to true in the service. */
   taxable: z.boolean().optional(),
+  /** Class carried onto the invoice lines billed from this estimate line. */
+  classId: zUuid.nullish(),
 });
 
 export const createEstimateSchema = z.object({
