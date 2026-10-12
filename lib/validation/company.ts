@@ -83,7 +83,11 @@ export const companySettingsSchema = z.object({
   // ---- wave2 prefs: the categorized QB Preferences (lib/preferences.ts) ----
   // Accounting
   requireAccountNumbers: z.boolean().optional(),
-  requireAccounts: z.boolean().optional(),
+  // Always on: an account is required on every line (the Preferences page shows it locked).
+  requireAccounts: z
+    .boolean()
+    .refine((v) => v === true, 'is always on: every transaction line needs an account so the books balance')
+    .optional(),
   classTrackingEnabled: z.boolean().optional(),
   warnUnassignedClass: z.boolean().optional(),
   autoAssignJeNumbers: z.boolean().optional(),

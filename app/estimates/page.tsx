@@ -178,7 +178,7 @@ function EstimateFormBody({
     0,
   );
   const selectedRate = taxRates.find((t) => t.id === form.taxRateId);
-  const salesTaxOn = usePreferences().company.salesTaxEnabled;
+  const { salesTaxEnabled: salesTaxOn, classTrackingEnabled: classTrackingOn } = usePreferences().company;
   const taxAmount = taxableSubtotal * (selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
   const total = subtotal + taxAmount;
 
@@ -248,7 +248,8 @@ function EstimateFormBody({
           onChange={onLinesChange}
           header={{ customerId: form.customerId || null, date: form.date }}
           showTaxable
-          classes={classes}
+          // Class pickers only while "Use class tracking" is on (or a line already has a class).
+          classes={classTrackingOn || form.lines.some((l) => l.classId) ? classes : undefined}
         />
 
         <div className="flex flex-col items-end gap-0.5 mt-3 pt-3 border-t border-slate-100 text-sm">

@@ -973,7 +973,8 @@ function InvoiceModal({
               ))}
             </Select>
           </div>) : <div />}
-          <div>
+          {/* Class fields are hidden while "Use class tracking" is off (QB); a saved class still shows. */}
+          {(prefs.company.classTrackingEnabled || classId) && (<div>
             <Label htmlFor="inv-class">Class <Help term="class" /></Label>
             <Select
               id="inv-class"
@@ -985,7 +986,7 @@ function InvoiceModal({
                 <option key={c.id} value={c.id}>{c.name}</option>
               ))}
             </Select>
-          </div>
+          </div>)}
         </div>
 
         {/* Shipping + print/email queue (wave2 sales) */}

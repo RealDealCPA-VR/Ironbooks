@@ -290,6 +290,10 @@ export interface MyPreferences {
   /** 'today' | 'last' — default date for new transactions. */
   defaultDate: 'today' | 'last';
   autoRecallLastTransaction: boolean;
+  /**
+   * QB "Keep QuickBooks running for quick startups". Deliberate no-op: the desktop app has no
+   * background process to keep alive, so the option is not offered on the Preferences page.
+   */
   keepQuickBooksRunning: boolean;
   // Reminders
   showRemindersAtStartup: boolean;
@@ -546,11 +550,14 @@ export function resolveCompanyPreferences(settings: unknown): CompanyPreferences
   if (!TERMS_VALUES.includes(prefs.defaultCustomerTerms)) prefs.defaultCustomerTerms = 'net_30';
   if (!TERMS_VALUES.includes(prefs.defaultVendorTerms)) prefs.defaultVendorTerms = 'net_30';
   if (prefs.reportBasis !== 'cash') prefs.reportBasis = 'accrual';
+  // Always on (lib/preferenceFields.ts `fixed`): every line needs an account so the books balance.
+  prefs.requireAccounts = true;
   return prefs;
 }
 
 export function resolveMyPreferences(stored: unknown): MyPreferences {
-  return overlay(DEFAULT_MY_PREFERENCES, stored);
+  // warnWhenDeleting is always on (lib/preferenceFields.ts `fixed`): deleting/voiding always asks.
+  return { ...overlay(DEFAULT_MY_PREFERENCES, stored), warnWhenDeleting: true };
 }
 
 // ---------------------------------------------------------------------------
