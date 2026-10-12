@@ -6,15 +6,12 @@
  * Returns what ran, the files written and any errors.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { getServerContext } from '@/lib/context';
-import { runDueSchedules } from '@/lib/services/memorizedReports';
 import { reportError } from '../../reports/_lib';
-import { internalContext } from '../_internal';
+import { runDueForRequest } from '../_internal';
 
 export async function POST(req: NextRequest) {
   try {
-    const ctx = (await internalContext(req)) ?? (await getServerContext());
-    return NextResponse.json({ results: await runDueSchedules(ctx) });
+    return NextResponse.json({ results: await runDueForRequest(req) });
   } catch (e) {
     return reportError(e, 'report-schedules/run-due');
   }
