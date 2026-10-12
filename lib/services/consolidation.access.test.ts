@@ -16,7 +16,7 @@ import path from 'node:path';
 import { and, eq } from 'drizzle-orm';
 import { NextRequest } from 'next/server';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
+import { accounts, companies, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { postJournalEntry } from './posting';
@@ -121,5 +121,18 @@ describe('consolidated reports only combine companies the user may report on', (
     const access = (await resolveAccess(db, co.B, bob.id)).access;
     const r = await consolidatedPL({ db, companyId: co.B, userId: bob.id, access });
     expect(r.companies.map((c) => c.companyId)).not.toContain(co.A);
+  });
+
+  it('archived company files the user can open are not combined (current company always is)', async () => {
+    const [c] = await db.select().from(companies).where(eq(companies.id, co.C));
+    await db.update(companies).set({ settings: { ...((c.settings as object) ?? {}), archived: true } }).where(eq(companies.id, co.C));
+    try {
+      expect((await reportableCompanies(alice)).map((x) => x.id)).toEqual([co.A]);
+      const r = await consolidatedPL(alice);
+      expect(r.consolidated.totalIncome).toBe('100.00');
+    } finally {
+      await db.update(companies).set({ settings: c.settings }).where(eq(companies.id, co.C));
+    }
+    expect((await reportableCompanies(alice)).map((x) => x.id).sort()).toEqual([co.A, co.C].sort());
   });
 });

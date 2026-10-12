@@ -209,6 +209,8 @@ export async function reportableCompanies(
       continue;
     }
     if (!ctx.userId) continue;
+    // Archived (soft-deleted) company files are not combined, as in QB (closed files).
+    if ((c.settings as Record<string, unknown> | null)?.archived === true) continue;
     const r = await resolveAccess(ctx.db, c.id, ctx.userId);
     if (r.member && r.active && can(r.access, area, 'view')) out.push(c);
   }

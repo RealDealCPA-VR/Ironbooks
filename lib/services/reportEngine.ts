@@ -1383,12 +1383,12 @@ async function applyCashBasisToGlLines(
       '';
     return {
       lineId: `cash:${i}`,
-      entryId: a.settle?.entryId ?? '',
+      entryId: a.settle?.entryId ?? a.doc.entryId ?? '',
       entryNumber: 0,
       date: a.date,
       txnType,
       type: TXN_TYPE_LABELS[txnType],
-      num: a.settle?.num ?? '',
+      num: a.settle?.num ?? a.doc.num ?? '',
       nameType: a.doc.nameType,
       nameId: a.doc.nameId,
       name,
