@@ -10,7 +10,10 @@
  * `ensureLedgerGuards` re-runs every guard statement from the migration files (functions are
  * CREATE OR REPLACE'd, triggers dropped and recreated, then ENABLE ALWAYS) in one transaction, so
  * after it returns the guards are exactly the ones this version of the app ships, whatever the
- * file contained. It is idempotent and runs on every open (lib/db/index.ts).
+ * file contained. It also switches disabled foreign-key triggers back on and re-adds every
+ * foreign key the migrations declare that was dropped, made NOT VALID or given other delete
+ * rules offline (journal lines to their entry and account included). It is idempotent and runs
+ * on every open (lib/db/index.ts).
  *
  * `checkLedgerHealth` is a company-agnostic SQL check of the books themselves: every posted
  * entry balanced and well-formed, no line on another company's account or a non-posting
@@ -40,6 +43,21 @@ export interface LedgerGuardPlan {
   statements: string[];
   /** Every bka_* trigger name the migrations create. */
   triggers: string[];
+  /** Every foreign key the migrations declare (deduplicated by table/columns/target). */
+  foreignKeys: ForeignKeySpec[];
+}
+
+/** A foreign key declared by the migrations. */
+export interface ForeignKeySpec {
+  /** Constraint name the migration gives it (null = the database picks one). */
+  name: string | null;
+  table: string;
+  columns: string[];
+  refTable: string;
+  refColumns: string[];
+  /** pg_constraint.confdeltype / confupdtype codes: a no action, r restrict, c cascade, n set null, d set default. */
+  onDelete: string;
+  onUpdate: string;
 }
 
 const planCache = new Map<string, LedgerGuardPlan>();
@@ -74,11 +92,16 @@ export function ledgerGuardPlan(migrationsFolder: string): LedgerGuardPlan {
   const key = path.resolve(migrationsFolder);
   const cached = planCache.get(key);
   if (cached) return cached;
-  if (!fs.existsSync(key)) return { statements: [], triggers: [] };
+  if (!fs.existsSync(key)) return { statements: [], triggers: [], foreignKeys: [] };
   const statements: string[] = [];
   const triggers = new Set<string>();
+  const foreignKeys = new Map<string, ForeignKeySpec>();
   for (const file of migrationFiles(key)) {
     const text = fs.readFileSync(file, 'utf8');
+    for (const fk of parseForeignKeys(text)) {
+      const k = fkKey(fk);
+      if (!foreignKeys.has(k)) foreignKeys.set(k, fk);
+    }
     for (const raw of text.split('--> statement-breakpoint')) {
       const stmt = stripLeadingComments(raw);
       if (!stmt || !GUARD_STATEMENT.some((re) => re.test(stmt))) continue;
@@ -87,7 +110,11 @@ export function ledgerGuardPlan(migrationsFolder: string): LedgerGuardPlan {
       if (created) triggers.add(created[1]);
     }
   }
-  const plan = { statements, triggers: [...triggers].sort() };
+  const plan = {
+    statements,
+    triggers: [...triggers].sort(),
+    foreignKeys: [...foreignKeys.values()].sort((a, b) => fkKey(a).localeCompare(fkKey(b))),
+  };
   planCache.set(key, plan);
   return plan;
 }
@@ -105,7 +132,7 @@ async function rows<T>(db: Raw, text: string): Promise<T[]> {
  */
 export async function ensureLedgerGuards(client: PGlite, migrationsFolder: string): Promise<void> {
   const plan = ledgerGuardPlan(migrationsFolder);
-  if (!plan.statements.length) return;
+  if (!plan.statements.length && !plan.foreignKeys.length) return;
   await client.transaction(async (tx) => {
     for (const stmt of plan.statements) await tx.exec(stmt);
     // Belt and braces: a guard trigger a migration forgot to ENABLE ALWAYS (or one left in
@@ -128,7 +155,303 @@ export async function ensureLedgerGuards(client: PGlite, migrationsFolder: strin
     for (const r of disabled) {
       await tx.exec(`ALTER TABLE ${qi(r.nsp)}.${qi(r.tbl)} ENABLE TRIGGER ${qi(r.tgname)}`);
     }
+    // A foreign key DROPPED offline leaves no trigger to switch back on: re-add every key the
+    // migrations declare (journal lines to their entry and account included). Keys that cannot
+    // be re-added because orphan rows exist stay missing and make checkLedgerHealth refuse the file.
+    await restoreForeignKeys(tx, migrationsFolder);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Foreign keys declared by the migrations
+// ---------------------------------------------------------------------------
+
+/** Structural identity of a foreign key (names are ignored: inline REFERENCES get database-chosen names). */
+function fkKey(fk: Pick<ForeignKeySpec, 'table' | 'columns' | 'refTable' | 'refColumns'>): string {
+  return `${fk.table}(${fk.columns.join(',')})->${fk.refTable}(${fk.refColumns.join(',')})`;
+}
+
+const ACTION_CODE: Record<string, string> = {
+  'no action': 'a',
+  restrict: 'r',
+  cascade: 'c',
+  'set null': 'n',
+  'set default': 'd',
+};
+
+const ACTION_SQL: Record<string, string> = {
+  a: 'NO ACTION',
+  r: 'RESTRICT',
+  c: 'CASCADE',
+  n: 'SET NULL',
+  d: 'SET DEFAULT',
+};
+
+/** `"public"."x"` / `"x"` / `x` → `x`. */
+function ident(raw: string): string {
+  const parts = raw.trim().split('.');
+  return parts[parts.length - 1].trim().replace(/^"|"$/g, '');
+}
+
+function identList(raw: string): string[] {
+  return raw.split(',').map(ident).filter(Boolean);
+}
+
+const IDENT = String.raw`(?:"[^"]+"|\w+)`;
+const QUALIFIED = String.raw`(?:${IDENT}\s*\.\s*)?${IDENT}`;
+const ACTION_RE = String.raw`(?:NO\s+ACTION|RESTRICT|CASCADE|SET\s+NULL|SET\s+DEFAULT)`;
+const REFS = String.raw`REFERENCES\s+(${QUALIFIED})\s*\(([^)]*)\)((?:\s+ON\s+(?:DELETE|UPDATE)\s+${ACTION_RE})*)`;
+
+function actions(tail: string | undefined): { onDelete: string; onUpdate: string } {
+  const del = new RegExp(String.raw`ON\s+DELETE\s+(${ACTION_RE})`, 'i').exec(tail ?? '');
+  const upd = new RegExp(String.raw`ON\s+UPDATE\s+(${ACTION_RE})`, 'i').exec(tail ?? '');
+  const code = (m: RegExpExecArray | null) => (m ? ACTION_CODE[m[1].toLowerCase().replace(/\s+/g, ' ')] : 'a');
+  return { onDelete: code(del), onUpdate: code(upd) };
+}
+
+/** Split a CREATE TABLE body at top-level commas. */
+function splitTopLevel(body: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let quoted = false;
+  let cur = '';
+  for (const ch of body) {
+    if (ch === '"') quoted = !quoted;
+    if (!quoted) {
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+      else if (ch === ',' && depth === 0) {
+        out.push(cur);
+        cur = '';
+        continue;
+      }
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
+}
+
+/**
+ * Every foreign key a migration file declares, in any of the forms the migrations use:
+ * table-level `[CONSTRAINT n] FOREIGN KEY (...) REFERENCES ...` inside CREATE TABLE, an inline
+ * column `REFERENCES t(c)`, `ALTER TABLE t ADD [CONSTRAINT n] FOREIGN KEY ...` (also inside DO
+ * blocks), and `ALTER TABLE t ADD COLUMN c ... REFERENCES t(c)`. lib/db/ledgerGuards.test.ts
+ * checks the result equals the keys a freshly migrated database actually has.
+ */
+export function parseForeignKeys(sqlText: string): ForeignKeySpec[] {
+  const text = sqlText.replace(/--[^\n]*/g, ' ');
+  const found: ForeignKeySpec[] = [];
+  let m: RegExpExecArray | null;
+
+  // CREATE TABLE bodies.
+  const create = new RegExp(String.raw`CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(${QUALIFIED})\s*\(`, 'gi');
+  const tableLevel = new RegExp(String.raw`^(?:CONSTRAINT\s+(${IDENT})\s+)?FOREIGN\s+KEY\s*\(([^)]*)\)\s*${REFS}`, 'i');
+  const inline = new RegExp(String.raw`^(${IDENT})\s[\s\S]*?${REFS}`, 'i');
+  while ((m = create.exec(text))) {
+    const table = ident(m[1]);
+    let depth = 1;
+    let quoted = false;
+    let i = create.lastIndex;
+    for (; i < text.length && depth > 0; i++) {
+      const ch = text[i];
+      if (ch === '"') quoted = !quoted;
+      else if (!quoted && ch === '(') depth++;
+      else if (!quoted && ch === ')') depth--;
+    }
+    for (const raw of splitTopLevel(text.slice(create.lastIndex, i - 1))) {
+      const item = raw.trim();
+      const t = tableLevel.exec(item);
+      if (t) {
+        found.push({
+          name: t[1] ? ident(t[1]) : null,
+          table,
+          columns: identList(t[2]),
+          refTable: ident(t[3]),
+          refColumns: identList(t[4]),
+          ...actions(t[5]),
+        });
+        continue;
+      }
+      if (/^(?:CONSTRAINT|PRIMARY|UNIQUE|CHECK|EXCLUDE)\b/i.test(item)) continue;
+      const c = inline.exec(item);
+      if (c) {
+        found.push({
+          name: null,
+          table,
+          columns: [ident(c[1])],
+          refTable: ident(c[2]),
+          refColumns: identList(c[3]),
+          ...actions(c[4]),
+        });
+      }
+    }
+  }
+
+  // ALTER TABLE t ADD [CONSTRAINT n] FOREIGN KEY ...
+  const addFk = new RegExp(
+    String.raw`ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?(${QUALIFIED})\s+ADD\s+(?:CONSTRAINT\s+(${IDENT})\s+)?FOREIGN\s+KEY\s*\(([^)]*)\)\s*${REFS}`,
+    'gi',
+  );
+  while ((m = addFk.exec(text))) {
+    found.push({
+      name: m[2] ? ident(m[2]) : null,
+      table: ident(m[1]),
+      columns: identList(m[3]),
+      refTable: ident(m[4]),
+      refColumns: identList(m[5]),
+      ...actions(m[6]),
+    });
+  }
+
+  // ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type ... REFERENCES ...
+  const addCol = new RegExp(
+    String.raw`ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?(${QUALIFIED})\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(${IDENT})\s[^;]*?${REFS}`,
+    'gi',
+  );
+  while ((m = addCol.exec(text))) {
+    found.push({
+      name: null,
+      table: ident(m[1]),
+      columns: [ident(m[2])],
+      refTable: ident(m[3]),
+      refColumns: identList(m[4]),
+      ...actions(m[5]),
+    });
+  }
+  return found;
+}
+
+interface ActualForeignKey {
+  conname: string;
+  tbl: string;
+  cols: string;
+  ref: string;
+  refcols: string;
+  convalidated: boolean;
+  confdeltype: string;
+  confupdtype: string;
+}
+
+const ACTUAL_FKS_SQL = `
+  SELECT c.conname, tc.relname AS tbl, rc.relname AS ref, c.convalidated,
+         c.confdeltype::text AS confdeltype, c.confupdtype::text AS confupdtype,
+         (SELECT string_agg(a.attname::text, ',' ORDER BY k.ord)
+            FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum) AS cols,
+         (SELECT string_agg(a.attname::text, ',' ORDER BY k.ord)
+            FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum) AS refcols
+    FROM pg_constraint c
+    JOIN pg_class tc ON tc.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = tc.relnamespace
+    JOIN pg_class rc ON rc.oid = c.confrelid
+   WHERE c.contype = 'f' AND n.nspname = 'public'`;
+
+export interface ForeignKeyGap {
+  spec: ForeignKeySpec;
+  /** missing: no such key; unvalidated: present but NOT VALID; altered: present with other ON DELETE/UPDATE rules. */
+  state: 'missing' | 'unvalidated' | 'altered';
+  /** Existing constraints on the same columns and target. */
+  existing: ActualForeignKey[];
+}
+
+/** Run a raw query and return its rows (lets raw PGlite and drizzle callers share the check). */
+export type RowQuery = <T>(text: string) => Promise<T[]>;
+
+/**
+ * Foreign keys the migrations declare that this database does not enforce exactly as declared
+ * (missing, NOT VALID, or with other ON DELETE / ON UPDATE rules). Only keys whose table and
+ * target both exist are considered.
+ */
+export async function foreignKeyGaps(query: RowQuery, migrationsFolder: string): Promise<ForeignKeyGap[]> {
+  const expected = ledgerGuardPlan(migrationsFolder).foreignKeys;
+  if (!expected.length) return [];
+  const actual = await query<ActualForeignKey>(ACTUAL_FKS_SQL);
+  const tables = new Set(
+    (
+      await query<{ relname: string }>(
+        `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')`,
+      )
+    ).map((r) => r.relname),
+  );
+  const byKey = new Map<string, ActualForeignKey[]>();
+  for (const a of actual) {
+    const k = fkKey({ table: a.tbl, columns: a.cols.split(','), refTable: a.ref, refColumns: a.refcols.split(',') });
+    byKey.set(k, [...(byKey.get(k) ?? []), a]);
+  }
+  const gaps: ForeignKeyGap[] = [];
+  for (const spec of expected) {
+    if (!tables.has(spec.table) || !tables.has(spec.refTable)) continue;
+    const same = byKey.get(fkKey(spec)) ?? [];
+    const exact = same.filter((a) => a.confdeltype === spec.onDelete && a.confupdtype === spec.onUpdate);
+    if (exact.some((a) => a.convalidated)) continue;
+    gaps.push({ spec, state: exact.length ? 'unvalidated' : same.length ? 'altered' : 'missing', existing: same });
+  }
+  return gaps;
+}
+
+/** Plain-language summary of foreign-key gaps (null when there are none). */
+export function describeForeignKeyGaps(gaps: ForeignKeyGap[]): string | null {
+  if (!gaps.length) return null;
+  const label = (g: ForeignKeyGap) => `${g.spec.table}.${g.spec.columns.join('+')} to ${g.spec.refTable}`;
+  const ledgerFirst = [
+    ...gaps.filter((g) => g.spec.table === 'journal_entry_lines'),
+    ...gaps.filter((g) => g.spec.table !== 'journal_entry_lines'),
+  ];
+  return `${gaps.length} link${gaps.length === 1 ? '' : 's'} between records ${
+    gaps.length === 1 ? 'is' : 'are'
+  } not enforced, so a record could point at one that does not exist (${sample(ledgerFirst.map(label))}).`;
+}
+
+function lit(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Put back every foreign key the migrations declare that is missing, NOT VALID, or carries other
+ * ON DELETE / ON UPDATE rules. Each fix runs in its own savepoint: a key that cannot be re-added
+ * (orphan rows exist) is left missing, and checkLedgerHealth then reports it, plus the orphans,
+ * so the file is refused instead of opened half-guarded.
+ */
+async function restoreForeignKeys(tx: Raw, migrationsFolder: string): Promise<void> {
+  const gaps = await foreignKeyGaps(<T,>(t: string) => rows<T>(tx, t), migrationsFolder);
+  let n = 0;
+  for (const gap of gaps) {
+    const { spec } = gap;
+    const sp = `bka_fk_${++n}`;
+    await tx.exec(`SAVEPOINT ${sp}`);
+    try {
+      if (gap.state === 'unvalidated') {
+        for (const e of gap.existing) {
+          if (e.convalidated || e.confdeltype !== spec.onDelete || e.confupdtype !== spec.onUpdate) continue;
+          await tx.exec(`ALTER TABLE ${qi(spec.table)} VALIDATE CONSTRAINT ${qi(e.conname)}`);
+        }
+      } else {
+        // Drop look-alikes with other rules (e.g. ON DELETE CASCADE slipped in), then add the declared key.
+        for (const e of gap.existing) await tx.exec(`ALTER TABLE ${qi(spec.table)} DROP CONSTRAINT ${qi(e.conname)}`);
+        let name = '';
+        if (spec.name) {
+          const [taken] = await rows<{ n: number }>(
+            tx,
+            `SELECT count(*)::int AS n FROM pg_constraint WHERE conname = ${lit(spec.name)}`,
+          );
+          if (!Number(taken?.n ?? 0)) name = `CONSTRAINT ${qi(spec.name)} `;
+        }
+        await tx.exec(
+          `ALTER TABLE ${qi(spec.table)} ADD ${name}FOREIGN KEY (${spec.columns.map(qi).join(', ')}) ` +
+            `REFERENCES ${qi(spec.refTable)} (${spec.refColumns.map(qi).join(', ')}) ` +
+            `ON DELETE ${ACTION_SQL[spec.onDelete]} ON UPDATE ${ACTION_SQL[spec.onUpdate]}`,
+        );
+      }
+      await tx.exec(`RELEASE SAVEPOINT ${sp}`);
+    } catch (err) {
+      await tx.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+      await tx.exec(`RELEASE SAVEPOINT ${sp}`);
+      console.error(`[db] could not restore the record link ${fkKey(spec)}:`, err instanceof Error ? err.message : err);
+    }
+  }
 }
 
 function qi(name: string): string {
@@ -213,6 +536,13 @@ export async function checkLedgerHealth(
       }.`,
     });
   }
+
+  // (1c) Every foreign key the migrations declare is present, validated and unaltered. A key
+  //      dropped offline leaves no trigger behind, so (1b) cannot see it.
+  const fkDetail = describeForeignKeyGaps(
+    await foreignKeyGaps(<T,>(t: string) => rows<T>(db, t), migrationsFolder),
+  );
+  if (fkDetail) problems.push({ kind: 'guards', detail: fkDetail });
 
   // (2) Every posted entry: at least two lines, each with exactly one positive side of at most
   //     2 decimals, and debits = credits (mirrors bka_assert_entry_balanced).

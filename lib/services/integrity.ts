@@ -34,6 +34,8 @@ import {
   journalEntryLines,
   vendors,
 } from '@/lib/db/schema';
+import { MIGRATIONS_FOLDER } from '@/lib/db';
+import { foreignKeyGaps } from '@/lib/db/ledgerGuards';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { journalOpenItems } from './journal';
@@ -359,10 +361,22 @@ async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string
            AND n.nspname NOT IN ('pg_catalog', 'information_schema')`,
   );
   const fkOff = Number((fk as unknown as { rows: Array<{ n: number }> }).rows?.[0]?.n ?? 0);
+  // A foreign key dropped (or made NOT VALID, or given other delete rules) offline leaves no
+  // trigger behind, so compare against every key the migrations declare.
+  const gaps = await foreignKeyGaps(async <T,>(text: string) => {
+    const r = await ctx.db.execute(sql.raw(text));
+    return ((r as unknown as { rows: T[] }).rows ?? []) as T[];
+  }, MIGRATIONS_FOLDER);
   return {
     missing: [
       ...expected.filter((t) => !present.has(t)),
       ...(fkOff ? [`${fkOff} record-link (foreign key) trigger${fkOff === 1 ? '' : 's'}`] : []),
+      ...gaps.map(
+        (g) =>
+          `record link ${g.spec.table}.${g.spec.columns.join('+')} to ${g.spec.refTable} (${
+            g.state === 'missing' ? 'removed' : g.state === 'unvalidated' ? 'not checked against existing records' : 'rules changed'
+          })`,
+      ),
     ],
     total: expected.length,
   };
