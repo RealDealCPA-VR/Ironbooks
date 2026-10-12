@@ -8,13 +8,17 @@
  *
  * GL impact (the inventory side honors item.assetAccountId when configured,
  * falling back to account code 1300, matching the average-cost services):
- *   receiveStock:
+ *   receiveStock (QB Adjust Quantity/Value on Hand, quantity up):
  *     Dr Inventory Asset (item.assetAccountId ?? 1300)   qty * unitCost
- *     Cr 3000 Owner's Equity  qty * unitCost   (opening/adjustment offset)
+ *     Cr Adjustment Account                               qty * unitCost
  *
  *   consumeStock:
- *     Dr 5000 COGS           computed COGS (exact FIFO cost)
+ *     Dr 5000 COGS (sales) or the Adjustment Account      computed COGS (exact FIFO cost)
  *     Cr Inventory Asset (item.assetAccountId ?? 1300)   computed COGS
+ *
+ * p1 purchases: the Adjustment Account is user-chosen (default "Inventory Adjustments", an
+ * expense account created when missing — inventory.ts ensureInventoryAdjustmentAccount), with
+ * Class and Customer:Job on the adjustment line, like QB. Owner's Equity is never the offset.
  */
 import { and, asc, eq, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
@@ -28,6 +32,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry } from './posting';
+import { type AdjustmentDimensions, adjustmentPostingFields, resolveAdjustmentAccount } from './inventory';
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -57,7 +62,7 @@ async function loadItem(ctx: ServiceContext, itemId: string) {
 // receiveStock
 // ---------------------------------------------------------------------------
 
-export interface ReceiveStockInput {
+export interface ReceiveStockInput extends AdjustmentDimensions {
   itemId: string;
   quantity: string | number;
   unitCost: string | number;
@@ -95,12 +100,13 @@ export async function receiveStock(
 
   return inTransaction(ctx, async (tx) => {
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
-    const offsetAccountId = await accountIdByCode(tx, '3000');
+    const offsetAccountId = await resolveAdjustmentAccount(tx, input.adjustmentAccountId);
+    const dims = await adjustmentPostingFields(tx, input);
 
-    // Post GL: Dr Inventory, Cr Owner's Equity
+    // Post GL: Dr Inventory, Cr Adjustment Account
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: input.memo ?? `FIFO stock receipt — item ${input.itemId}`,
+      description: input.memo ?? `Inventory adjustment — ${item.name}`,
       lines: [
         {
           accountId: inventoryAccountId,
@@ -110,7 +116,8 @@ export async function receiveStock(
         {
           accountId: offsetAccountId,
           credit: toAmountString(totalCost),
-          memo: input.memo ?? 'FIFO stock receipt offset',
+          memo: input.memo ?? 'Inventory adjustment',
+          ...dims,
         },
       ],
       sourceRef: `item:${input.itemId}`,
@@ -165,11 +172,63 @@ export async function receiveStock(
 // consumeStock
 // ---------------------------------------------------------------------------
 
-export interface ConsumeStockInput {
+export interface ConsumeStockInput extends AdjustmentDimensions {
   itemId: string;
   quantity: string | number;
   date: Date;
   memo?: string | null;
+  /**
+   * 'cogs' (default — sales relief, Dr 5000 COGS) or 'adjustment' (QB Adjust Quantity on Hand:
+   * Dr the Adjustment Account, default "Inventory Adjustments", with Class / Customer:Job).
+   */
+  purpose?: 'cogs' | 'adjustment';
+}
+
+/**
+ * Deplete `qty` from an item's FIFO layers, oldest first, and return the exact cost taken.
+ * Writes the layers only (no GL, no quantityOnHand) — callers post and keep the item in sync.
+ * Throws VALIDATION when the layers hold less than `qty`.
+ */
+export async function takeFromLayers(
+  tx: ServiceContext,
+  itemId: string,
+  qty: Decimal,
+): Promise<{ cost: Decimal; layers: ConsumedLayer[] }> {
+  const layers = await tx.db
+    .select()
+    .from(inventoryLayers)
+    .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, itemId)))
+    .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt));
+  const available = layers.filter((l) => Money.of(l.quantityRemaining).greaterThan(0));
+  const totalAvailable = available.reduce((sum, l) => sum.plus(Money.of(l.quantityRemaining)), Money.zero());
+  if (qty.greaterThan(totalAvailable)) {
+    throw validation(
+      `Insufficient stock: need ${qty.toFixed(4)} but only ${totalAvailable.toFixed(4)} available (FIFO layers).`,
+    );
+  }
+  let remaining = new Decimal(qty);
+  let cost = Money.zero();
+  const taken: ConsumedLayer[] = [];
+  for (const layer of available) {
+    if (remaining.isZero()) break;
+    const layerQty = Money.of(layer.quantityRemaining);
+    const unitCost = Money.of(layer.unitCost);
+    const take = remaining.lessThanOrEqualTo(layerQty) ? remaining : layerQty;
+    const layerCost = Money.round2(take.times(unitCost));
+    cost = cost.plus(layerCost);
+    taken.push({
+      layerId: layer.id,
+      quantityTaken: take.toFixed(4),
+      unitCost: unitCost.toFixed(4),
+      layerCost: toAmountString(layerCost),
+    });
+    await tx.db
+      .update(inventoryLayers)
+      .set({ quantityRemaining: layerQty.minus(take).toFixed(4) })
+      .where(eq(inventoryLayers.id, layer.id));
+    remaining = remaining.minus(take);
+  }
+  return { cost: Money.round2(cost), layers: taken };
 }
 
 export interface ConsumedLayer {
@@ -203,82 +262,26 @@ export async function consumeStock(
   const item = await loadItem(ctx, input.itemId);
 
   return inTransaction(ctx, async (tx) => {
-    // Load all layers for this item with remaining qty > 0, oldest first
-    const layers = await tx.db
-      .select()
-      .from(inventoryLayers)
-      .where(
-        and(
-          eq(inventoryLayers.companyId, tx.companyId),
-          eq(inventoryLayers.itemId, input.itemId),
-        ),
-      )
-      .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt));
+    // Deplete layers FIFO (oldest first) for the exact cost.
+    const { cost: cogsAmount, layers: consumedLayers } = await takeFromLayers(tx, input.itemId, needQty);
 
-    // Filter to layers with quantity remaining > 0
-    const availableLayers = layers.filter((l) =>
-      Money.of(l.quantityRemaining).greaterThan(0),
-    );
-
-    // Check total available stock
-    const totalAvailable = availableLayers.reduce(
-      (sum, l) => sum.plus(Money.of(l.quantityRemaining)),
-      Money.zero(),
-    );
-
-    if (needQty.greaterThan(totalAvailable)) {
-      throw validation(
-        `Insufficient stock: need ${needQty.toFixed(4)} but only ${totalAvailable.toFixed(4)} available (FIFO layers).`,
-      );
-    }
-
-    // Deplete layers FIFO
-    let remaining = new Decimal(needQty);
-    let totalCOGS = Money.zero();
-    const consumedLayers: ConsumedLayer[] = [];
-
-    for (const layer of availableLayers) {
-      if (remaining.isZero()) break;
-
-      const layerQty = Money.of(layer.quantityRemaining);
-      const unitCost = Money.of(layer.unitCost);
-
-      // How much to take from this layer
-      const take = remaining.lessThanOrEqualTo(layerQty) ? remaining : layerQty;
-      const layerCost = Money.round2(take.times(unitCost));
-
-      totalCOGS = totalCOGS.plus(layerCost);
-
-      consumedLayers.push({
-        layerId: layer.id,
-        quantityTaken: take.toFixed(4),
-        unitCost: unitCost.toFixed(4),
-        layerCost: toAmountString(layerCost),
-      });
-
-      // Update the layer's remaining quantity
-      const newRemaining = layerQty.minus(take);
-      await tx.db
-        .update(inventoryLayers)
-        .set({ quantityRemaining: newRemaining.toFixed(4) })
-        .where(eq(inventoryLayers.id, layer.id));
-
-      remaining = remaining.minus(take);
-    }
-
-    // Post GL: Dr COGS, Cr Inventory
-    const cogsAmount = Money.round2(totalCOGS);
+    // Post GL: Dr COGS (sales) / Adjustment Account (adjustments), Cr Inventory
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
-    const cogsAccountId = await accountIdByCode(tx, '5000');
+    const isAdjustment = input.purpose === 'adjustment';
+    const cogsAccountId = isAdjustment
+      ? await resolveAdjustmentAccount(tx, input.adjustmentAccountId)
+      : await accountIdByCode(tx, '5000');
+    const dims = isAdjustment ? await adjustmentPostingFields(tx, input) : {};
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: input.memo ?? `FIFO COGS — item ${input.itemId}`,
+      description: input.memo ?? (isAdjustment ? `Inventory adjustment — ${item.name}` : `FIFO COGS — item ${input.itemId}`),
       lines: [
         {
           accountId: cogsAccountId,
           debit: toAmountString(cogsAmount),
-          memo: input.memo ?? 'FIFO COGS',
+          memo: input.memo ?? (isAdjustment ? 'Inventory adjustment' : 'FIFO COGS'),
+          ...dims,
         },
         {
           accountId: inventoryAccountId,

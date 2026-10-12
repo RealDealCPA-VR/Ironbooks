@@ -4,20 +4,26 @@
  *
  * adjustQuantityAtSite is QB "Adjust Quantity/Value on Hand" (quantity mode) with a site. The
  * costing side is delegated unchanged to the existing engines — average-cost items through
- * inventory.adjustInventory (Dr Inventory / Cr 3000 for adds, Dr COGS / Cr Inventory for
- * removals), FIFO-tracked items through fifo.receiveStock / fifo.consumeStock — so every value
+ * inventory.adjustInventory (Dr Inventory / Cr Adjustment Account for adds, Dr Adjustment Account /
+ * Cr Inventory for removals; p1: user-chosen account, default "Inventory Adjustments", with Class
+ * and Customer:Job), FIFO-tracked items through fifo.receiveStock / fifo.consumeStock — so every value
  * change still posts a balanced entry via posting.ts. The site-tagged movement (sourceType
  * 'adjustment', sourceId = the posted journal entry) is written in the same transaction.
  */
 import { and, eq, sql } from 'drizzle-orm';
-import { inventoryLayers, itemSiteSettings, items } from '@/lib/db/schema';
+import { accounts, inventoryLayers, itemSiteSettings, items } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
-import { adjustInventory } from './inventory';
+import { type AdjustmentDimensions, adjustInventory } from './inventory';
 import { consumeStock, receiveStock } from './fifo';
 import { type InventoryLineDetail, getSite, recordMovements } from './inventorySites';
 
-export interface SiteAdjustmentInput extends InventoryLineDetail {
+export interface SiteAdjustmentInput extends InventoryLineDetail, AdjustmentDimensions {
+  /**
+   * 'adjustment' (default): QB Adjust Quantity on Hand — offsets the Adjustment Account.
+   * 'cogs': relieve stock to Cost of Goods Sold (POST /api/inventory action 'cogs').
+   */
+  purpose?: 'adjustment' | 'cogs';
   itemId: string;
   /** Positive = add stock, negative = remove stock. */
   quantityChange: string | number;
@@ -53,6 +59,21 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
       .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, item.id)))
       .limit(1);
     const memo = input.memo ?? (qty.greaterThan(0) ? 'Inventory adjustment (add)' : 'Inventory adjustment (remove)');
+    const isCogs = input.purpose === 'cogs' && qty.lessThan(0);
+    let adjustmentAccountId = input.adjustmentAccountId ?? null;
+    if (isCogs && !adjustmentAccountId) {
+      const [cogs] = await tx.db
+        .select({ id: accounts.id })
+        .from(accounts)
+        .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.code, '5000')));
+      adjustmentAccountId = cogs?.id ?? null;
+    }
+    const dims: AdjustmentDimensions = {
+      adjustmentAccountId,
+      classId: input.classId ?? null,
+      customerId: input.customerId ?? null,
+      jobId: input.jobId ?? null,
+    };
 
     let entryId: string;
     let glAmount: string;
@@ -67,11 +88,19 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
           unitCost: input.unitCost,
           date: input.date,
           memo,
+          ...dims,
         });
         entryId = res.entryId;
         glAmount = res.totalCost;
       } else {
-        const res = await consumeStock(tx, { itemId: item.id, quantity: qty.abs().toFixed(4), date: input.date, memo });
+        const res = await consumeStock(tx, {
+          itemId: item.id,
+          quantity: qty.abs().toFixed(4),
+          date: input.date,
+          memo,
+          purpose: isCogs && !input.adjustmentAccountId ? 'cogs' : 'adjustment',
+          ...dims,
+        });
         entryId = res.entryId;
         glAmount = res.totalCOGS;
       }
@@ -82,6 +111,7 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
         unitCost: input.unitCost ?? null,
         date: input.date,
         memo,
+        ...dims,
       });
       entryId = res.entry.id;
       glAmount = res.glAmount;

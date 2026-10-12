@@ -24,6 +24,7 @@ import {
   paymentsReceived,
   reconciliationItems,
   reconciliations,
+  vendorCredits,
 } from '@/lib/db/schema';
 import {
   type ServiceContext,
@@ -432,7 +433,9 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
  * refunded amount down, or the payment's unapplied balance goes up. Without this the A/R GL
  * (where the void reverses the refund) and the open-credit subledger (aging, integrity check)
  * would disagree. The amount is the refund's own A/R debit (home currency); a foreign-currency
- * payment converts it back at the payment's rate. Vendor-credit refunds (A/P) are not touched.
+ * payment converts it back at the payment's rate. p1 purchases: a voided vendor-credit refund
+ * (A/P side, the vendor's cash back) gives the VENDOR CREDIT back the same way (unapplied up,
+ * refunded amount down), so A/P aging keeps matching the A/P account.
  */
 async function restoreRefundedCustomerCredit(
   tx: ServiceContext,
@@ -508,6 +511,32 @@ async function restoreRefundedCustomerCredit(
       entityId: payment.id,
       oldValues: { unapplied: payment.unapplied },
       newValues: { action: 'refund_voided', unapplied: toAmountString(unapplied) },
+    });
+    return;
+  }
+
+  const [credit] = await tx.db
+    .select()
+    .from(vendorCredits)
+    .where(and(eq(vendorCredits.companyId, tx.companyId), eq(vendorCredits.id, docId)));
+  if (credit && credit.status !== 'void') {
+    const unapplied = Money.round2(Money.of(credit.unapplied).plus(base));
+    const refunded = Money.round2(Money.of(credit.refundedAmount).minus(base));
+    const status = unapplied.greaterThanOrEqualTo(Money.of(credit.total)) ? 'open' : 'partial';
+    await tx.db
+      .update(vendorCredits)
+      .set({
+        unapplied: toAmountString(unapplied),
+        refundedAmount: toAmountString(refunded.lessThan(0) ? Money.zero() : refunded),
+        status: status as never,
+      })
+      .where(eq(vendorCredits.id, credit.id));
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'vendor_credit',
+      entityId: credit.id,
+      oldValues: { unapplied: credit.unapplied, refundedAmount: credit.refundedAmount, status: credit.status },
+      newValues: { action: 'refund_voided', unapplied: toAmountString(unapplied), status, postedEntryId: entryId },
     });
   }
 }

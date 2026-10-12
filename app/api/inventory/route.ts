@@ -3,7 +3,9 @@
  * POST /api/inventory        — adjust inventory or record COGS
  *
  * POST body shapes:
- *   { action: 'adjust', itemId, quantityChange, unitCost?, date, memo? }
+ *   { action: 'adjust', itemId, quantityChange, unitCost?, date, memo?,
+ *     adjustmentAccountId?, classId?, customerId?, jobId? }   (QB Adjust Quantity on Hand;
+ *     the account defaults to "Inventory Adjustments")
  *   { action: 'cogs',   itemId, quantity, date, memo? }
  * Both run through adjustQuantityAtSite so the quantity change is recorded at a site (optional
  * { siteId?, binId?, serialNumbers?, lotNumber?, lotExpiration? }; default site otherwise) and
@@ -38,6 +40,11 @@ function siteFields(body: Record<string, unknown>) {
     serialNumbers: Array.isArray(body.serialNumbers) ? body.serialNumbers.map(String) : null,
     lotNumber: typeof body.lotNumber === 'string' ? body.lotNumber : null,
     lotExpiration: typeof body.lotExpiration === 'string' ? new Date(body.lotExpiration) : null,
+    // p1 purchases: QB Adjustment Account, Class and Customer:Job.
+    adjustmentAccountId: typeof body.adjustmentAccountId === 'string' && body.adjustmentAccountId ? body.adjustmentAccountId : null,
+    classId: typeof body.classId === 'string' && body.classId ? body.classId : null,
+    customerId: typeof body.customerId === 'string' && body.customerId ? body.customerId : null,
+    jobId: typeof body.jobId === 'string' && body.jobId ? body.jobId : null,
   };
 }
 
@@ -132,6 +139,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         quantityChange: `-${String(quantity).replace(/^-/, '')}`,
         date: new Date(date),
         memo: memo ?? 'Cost of goods sold',
+        purpose: 'cogs',
       });
 
       return NextResponse.json(result, { status: 201 });
