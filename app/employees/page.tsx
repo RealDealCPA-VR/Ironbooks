@@ -28,6 +28,11 @@ import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import { EditPaycheckModal } from './EditPaycheckModal';
+import {
+  TAX_TRACKING_LABELS,
+  trackingChoicesFor,
+  type TaxTracking,
+} from '@/lib/services/payrollTaxTracking';
 import Decimal from 'decimal.js';
 
 // ---------------------------------------------------------------------------
@@ -155,6 +160,8 @@ interface PayrollItem {
   name: string;
   kind: PayrollItemKind;
   pretax: boolean;
+  /** QB tax tracking type (lib/services/payrollTaxTracking.ts). */
+  taxTracking: string | null;
   expenseAccountId: string | null;
   liabilityAccountId: string | null;
   calcBasis: 'fixed' | 'percent' | null;
@@ -173,6 +180,7 @@ interface PayrollItemFormState {
   name: string;
   kind: PayrollItemKind;
   pretax: boolean;
+  taxTracking: string;
   expenseAccountId: string;
   liabilityAccountId: string;
   calcBasis: '' | 'fixed' | 'percent';
@@ -185,8 +193,31 @@ interface PayrollFormState {
   periodStart: string;
   periodEnd: string;
   earnings: EarningRow[];
-  taxes: PayrollLineInput[];
+  /** Overrides of calculated taxes, keyed by TAX payroll item (never a typed name). */
+  taxOverrides: TaxOverrideRow[];
   deductions: PayrollLineInput[];
+}
+
+interface TaxOverrideRow {
+  payrollItemId: string;
+  amount: string;
+}
+
+/** POST /api/payroll?preview=true — the server's calculation of the check. */
+interface PaycheckPreview {
+  grossPay: string;
+  totalTaxes: string;
+  totalDeductions: string;
+  totalEmployerTaxes: string;
+  netPay: string;
+  wages: { gross: string; incomeTaxWages: string; ficaWages: string };
+  lines: Array<{
+    kind: string;
+    name: string;
+    amount: string;
+    payrollItemId: string | null;
+    taxTracking: string | null;
+  }>;
 }
 
 // Leave accruals (GET/PUT /api/payroll/accruals)
@@ -261,7 +292,7 @@ const EMPTY_PAYROLL_FORM: PayrollFormState = {
   periodStart: '',
   periodEnd: '',
   earnings: [{ kind: 'regular', hours: '', rate: '', amount: '' }],
-  taxes: [{ name: '', amount: '' }],
+  taxOverrides: [],
   deductions: [],
 };
 
@@ -290,6 +321,7 @@ const EMPTY_ITEM_FORM: PayrollItemFormState = {
   name: '',
   kind: 'deduction',
   pretax: false,
+  taxTracking: 'none',
   expenseAccountId: '',
   liabilityAccountId: '',
   calcBasis: '',
@@ -321,11 +353,16 @@ function computeGross(earnings: EarningRow[]): Decimal {
   return earnings.reduce((s, e) => s.plus(toDecimalSafe(e.amount)), new Decimal(0));
 }
 
-function computeNet(form: PayrollFormState): string {
-  const gross = computeGross(form.earnings);
-  const taxSum = form.taxes.reduce((s, t) => s.plus(toDecimalSafe(t.amount)), new Decimal(0));
-  const dedSum = form.deductions.reduce((s, d) => s.plus(toDecimalSafe(d.amount)), new Decimal(0));
-  return gross.minus(taxSum).minus(dedSum).toFixed(2);
+/** Default tracking type for a new item of a kind (mirrors the service defaults). */
+function defaultTrackingFor(kind: PayrollItemKind): string {
+  if (kind === 'deduction' || kind === 'garnishment') return 'none';
+  if (kind === 'employer_contribution') return 'other';
+  if (kind === 'tax') return 'federal_withholding';
+  return '';
+}
+
+function trackingLabel(t: string | null | undefined): string {
+  return t ? TAX_TRACKING_LABELS[t as TaxTracking] ?? t : '';
 }
 
 function employeeName(emp: Employee) {
@@ -631,61 +668,172 @@ function EmployeeForm({
   );
 }
 
-function LineEditor({
-  label,
-  lines,
-  onChange,
-  onAdd,
-  onRemove,
+/**
+ * Calculated taxes for the Run Payroll form. Every amount comes from the server (the same
+ * engine as pay runs). A calculated tax can be changed only through the matching TAX payroll
+ * item, so the W-2 and 941 always know which box it belongs in; other tax items (for example
+ * state withholding) can be added the same way.
+ */
+const OVERRIDABLE_TRACKING: string[] = [
+  ...trackingChoicesFor('tax'),
+  'employer_social_security',
+  'employer_medicare',
+  'futa',
+  'sui',
+  'workers_comp',
+];
+
+function TaxPreviewSection({
+  preview,
+  previewing,
+  error,
+  overrides,
+  payrollItems,
+  taxItemForTracking,
+  onOverride,
 }: {
-  label: string;
-  lines: PayrollLineInput[];
-  onChange: (idx: number, field: 'name' | 'amount', value: string) => void;
-  onAdd: () => void;
-  onRemove: (idx: number) => void;
+  preview: PaycheckPreview | null;
+  previewing: boolean;
+  error: string | null;
+  overrides: TaxOverrideRow[];
+  payrollItems: PayrollItem[];
+  taxItemForTracking: (tracking: string | null, kind: string) => PayrollItem | undefined;
+  onOverride: (payrollItemId: string, amount: string | null) => void;
 }) {
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-1">
-        <Label>{label}</Label>
-        <button
-          type="button"
-          onClick={onAdd}
-          className="text-xs text-electric hover:underline"
-        >
-          + Add line
-        </button>
-      </div>
-      {lines.length === 0 && (
-        <p className="text-xs text-navy/40 italic">No {label.toLowerCase()} lines.</p>
-      )}
-      {lines.map((line, idx) => (
-        <div key={idx} className="flex gap-2 mb-2">
-          <Input
-            placeholder="Description"
-            value={line.name}
-            onChange={(e) => onChange(idx, 'name', e.target.value)}
-            className="flex-1"
-          />
+  const overrideFor = (itemId: string | undefined) =>
+    itemId ? overrides.find((o) => o.payrollItemId === itemId) : undefined;
+  const taxLines = preview?.lines.filter((l) => l.kind === 'tax') ?? [];
+  const employerLines = preview?.lines.filter((l) => l.kind === 'employer_contribution') ?? [];
+  const shownTracking = new Set([...taxLines, ...employerLines].map((l) => l.taxTracking));
+  // Overrides set to 0 drop the line from the preview: keep them visible so they can be undone.
+  const hidden = overrides.filter((o) => {
+    const item = payrollItems.find((i) => i.id === o.payrollItemId);
+    return item && !shownTracking.has(item.taxTracking);
+  });
+  const addable = payrollItems.filter(
+    (i) =>
+      i.isActive &&
+      (i.kind === 'tax' || i.kind === 'employer_contribution') &&
+      !!i.taxTracking &&
+      OVERRIDABLE_TRACKING.includes(i.taxTracking) &&
+      !shownTracking.has(i.taxTracking) &&
+      !overrides.some((o) => o.payrollItemId === i.id),
+  );
+
+  const row = (l: PaycheckPreview['lines'][number], idx: number) => {
+    const item = taxItemForTracking(l.taxTracking, l.kind);
+    const ov = overrideFor(item?.id);
+    return (
+      <div key={`${l.kind}-${idx}`} className="flex items-center gap-2 mb-1.5">
+        <span className="flex-1 text-sm text-navy/80">
+          {l.name}
+          {ov && <Badge tone="warning" className="ml-2">changed</Badge>}
+        </span>
+        {item ? (
           <Input
             type="number"
             min="0"
             step="0.01"
-            placeholder="0.00"
-            value={line.amount}
-            onChange={(e) => onChange(idx, 'amount', e.target.value)}
-            className="w-28"
+            value={ov ? ov.amount : l.amount}
+            onChange={(e) => onOverride(item.id, e.target.value)}
+            className="w-28 text-right"
+            title={`Change the calculated amount (tax item: ${item.name})`}
           />
+        ) : (
+          <span
+            className="w-28 text-right font-mono text-sm"
+            title="There is no active tax item of this type, so this amount can't be changed here"
+          >
+            {formatCurrency(l.amount)}
+          </span>
+        )}
+        {ov && item ? (
           <button
             type="button"
-            onClick={() => onRemove(idx)}
-            className="text-red-400 hover:text-red-600 px-1 transition-colors"
-            title="Remove line"
+            onClick={() => onOverride(item.id, null)}
+            className="text-xs text-electric hover:underline w-14"
           >
-            <MinusCircle className="h-4 w-4" />
+            Reset
           </button>
-        </div>
-      ))}
+        ) : (
+          <span className="w-14" />
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="rounded-lg border border-slate-200 p-3">
+      <div className="flex items-center justify-between mb-2">
+        <Label>Taxes (calculated)</Label>
+        {previewing && <Spinner className="h-4 w-4 text-electric" />}
+      </div>
+      {error ? (
+        <p className="text-xs text-red-500 font-medium">{error}</p>
+      ) : !preview ? (
+        <p className="text-xs text-navy/40 italic">Enter earnings to calculate taxes.</p>
+      ) : (
+        <>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-navy/40 mb-1">
+            Withheld from the employee
+          </p>
+          {taxLines.length === 0 && (
+            <p className="text-xs text-navy/40 italic mb-1">No withholding on this check.</p>
+          )}
+          {taxLines.map(row)}
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-navy/40 mt-2 mb-1">
+            Paid by the company
+          </p>
+          {employerLines.length === 0 && (
+            <p className="text-xs text-navy/40 italic mb-1">No employer taxes on this check.</p>
+          )}
+          {employerLines.map(row)}
+          {hidden.map((o) => {
+            const item = payrollItems.find((i) => i.id === o.payrollItemId)!;
+            return (
+              <div key={o.payrollItemId} className="flex items-center gap-2 mb-1.5">
+                <span className="flex-1 text-sm text-navy/80">
+                  {item.name} <Badge tone="warning" className="ml-2">changed</Badge>
+                </span>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={o.amount}
+                  onChange={(e) => onOverride(item.id, e.target.value)}
+                  className="w-28 text-right"
+                />
+                <button
+                  type="button"
+                  onClick={() => onOverride(item.id, null)}
+                  className="text-xs text-electric hover:underline w-14"
+                >
+                  Remove
+                </button>
+              </div>
+            );
+          })}
+          {addable.length > 0 && (
+            <div className="mt-2">
+              <Select
+                value=""
+                onChange={(e) => e.target.value && onOverride(e.target.value, '0.00')}
+                className="w-64"
+                title="Add a tax the calculation doesn't include (for example state withholding)"
+              >
+                <option value="">+ Add a tax item…</option>
+                {addable.map((i) => (
+                  <option key={i.id} value={i.id}>{i.name}</option>
+                ))}
+              </Select>
+            </div>
+          )}
+          <p className="text-[11px] text-navy/40 mt-2">
+            Federal taxable wages {formatCurrency(preview.wages.incomeTaxWages)} · Social Security
+            and Medicare wages {formatCurrency(preview.wages.ficaWages)}
+          </p>
+        </>
+      )}
     </div>
   );
 }
@@ -728,6 +876,10 @@ export default function EmployeesPage() {
   const [payrollOpen, setPayrollOpen] = useState(false);
   const [payrollForm, setPayrollForm] = useState<PayrollFormState>(EMPTY_PAYROLL_FORM);
   const [payrollSaving, setPayrollSaving] = useState(false);
+  // Server-side calculation of the check (same engine as pay runs).
+  const [payrollPreview, setPayrollPreview] = useState<PaycheckPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
 
   // Voiding state (paycheck pending confirmation + id being voided)
   const [pendingVoid, setPendingVoid] = useState<(Paycheck & { employeeName: string }) | null>(null);
@@ -1039,7 +1191,7 @@ export default function EmployeesPage() {
   }
 
   function updatePayrollField(
-    field: keyof Omit<PayrollFormState, 'taxes' | 'deductions' | 'earnings'>,
+    field: keyof Omit<PayrollFormState, 'taxOverrides' | 'deductions' | 'earnings'>,
     value: string,
   ) {
     setPayrollForm((prev) => {
@@ -1093,23 +1245,81 @@ export default function EmployeesPage() {
     }));
   }
 
-  // ---- Tax / deduction rows ----
+  // ---- Calculated taxes: overrides by tax payroll item ----
 
-  function updateTaxLine(idx: number, field: 'name' | 'amount', value: string) {
+  /** Body shared by the preview and the post: the server always calculates the taxes. */
+  function paycheckBody(form: PayrollFormState) {
+    return {
+      employeeId: form.employeeId,
+      payDate: form.payDate,
+      periodStart: form.periodStart || undefined,
+      periodEnd: form.periodEnd || undefined,
+      earnings: form.earnings
+        .filter((e) => Number(e.amount) > 0)
+        .map((e) => ({
+          kind: e.kind,
+          hours: e.hours || undefined,
+          rate: e.rate || undefined,
+          amount: e.amount,
+        })),
+      deductions: form.deductions
+        .filter((d) => d.name.trim() && Number(d.amount) > 0)
+        .map((d) => ({
+          kind: 'deduction',
+          name: d.name.trim(),
+          amount: d.amount,
+          payrollItemId: d.payrollItemId || undefined,
+        })),
+      taxOverrides: form.taxOverrides
+        .filter((o) => o.payrollItemId && o.amount !== '' && Number(o.amount) >= 0)
+        .map((o) => ({ payrollItemId: o.payrollItemId, amount: o.amount })),
+    };
+  }
+
+  /** The active tax item that overrides a calculated line's tracking type (if any). */
+  function taxItemForTracking(tracking: string | null, kind: string): PayrollItem | undefined {
+    if (!tracking) return undefined;
+    const itemKind = kind === 'tax' ? 'tax' : 'employer_contribution';
+    return payrollItems.find((i) => i.isActive && i.kind === itemKind && i.taxTracking === tracking);
+  }
+
+  function setTaxOverride(payrollItemId: string, amount: string | null) {
     setPayrollForm((prev) => {
-      const taxes = [...prev.taxes];
-      taxes[idx] = { ...taxes[idx], [field]: value };
-      return { ...prev, taxes };
+      const rest = prev.taxOverrides.filter((o) => o.payrollItemId !== payrollItemId);
+      return {
+        ...prev,
+        taxOverrides: amount === null ? rest : [...rest, { payrollItemId, amount }],
+      };
     });
   }
 
-  function addTaxLine() {
-    setPayrollForm((prev) => ({ ...prev, taxes: [...prev.taxes, { name: '', amount: '' }] }));
-  }
-
-  function removeTaxLine(idx: number) {
-    setPayrollForm((prev) => ({ ...prev, taxes: prev.taxes.filter((_, i) => i !== idx) }));
-  }
+  // Recalculate on the server whenever the check changes (debounced).
+  useEffect(() => {
+    if (!payrollOpen) return;
+    const body = paycheckBody(payrollForm);
+    if (!body.employeeId || !body.payDate || body.earnings.length === 0) {
+      setPayrollPreview(null);
+      setPreviewError(null);
+      return;
+    }
+    let cancelled = false;
+    setPreviewing(true);
+    const t = setTimeout(async () => {
+      try {
+        const res = await api.post<PaycheckPreview>('/api/payroll?preview=true', body);
+        if (!cancelled) { setPayrollPreview(res); setPreviewError(null); }
+      } catch (err) {
+        if (!cancelled) {
+          setPayrollPreview(null);
+          setPreviewError(err instanceof ApiError ? err.message : 'Could not calculate this paycheck');
+        }
+      } finally {
+        if (!cancelled) setPreviewing(false);
+      }
+    }, 350);
+    return () => { cancelled = true; clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [payrollOpen, payrollForm]);
 
   function updateDeductionLine(idx: number, field: 'name' | 'amount', value: string) {
     setPayrollForm((prev) => {
@@ -1140,36 +1350,13 @@ export default function EmployeesPage() {
     if (earningRows.length === 0) {
       toast('Add at least one earnings line with an amount', 'danger'); return;
     }
-    const net = parseFloat(computeNet(payrollForm));
-    if (net < 0) {
-      toast('Taxes + deductions exceed gross pay — net pay would be negative', 'danger'); return;
-    }
+    if (previewError) { toast(previewError, 'danger'); return; }
 
     setPayrollSaving(true);
     try {
-      await api.post('/api/payroll', {
-        employeeId: payrollForm.employeeId,
-        payDate: payrollForm.payDate,
-        periodStart: payrollForm.periodStart || undefined,
-        periodEnd: payrollForm.periodEnd || undefined,
-        earnings: earningRows.map((e) => ({
-          kind: e.kind,
-          hours: e.hours || undefined,
-          rate: e.rate || undefined,
-          amount: e.amount,
-        })),
-        taxes: payrollForm.taxes
-          .filter((t) => t.name.trim() && Number(t.amount) > 0)
-          .map((t) => ({ kind: 'tax', name: t.name.trim(), amount: t.amount })),
-        deductions: payrollForm.deductions
-          .filter((d) => d.name.trim() && Number(d.amount) > 0)
-          .map((d) => ({
-            kind: 'deduction',
-            name: d.name.trim(),
-            amount: d.amount,
-            payrollItemId: d.payrollItemId || undefined,
-          })),
-      });
+      // No tax lines are sent: the server calculates withholding and employer taxes exactly
+      // like a pay run; changes ride along as overrides keyed by tax payroll item.
+      await api.post('/api/payroll', paycheckBody(payrollForm));
       toast('Paycheck posted to GL', 'success');
       setPayrollOpen(false);
       await fetchAll();
@@ -1216,6 +1403,7 @@ export default function EmployeesPage() {
       name: item.name,
       kind: item.kind,
       pretax: item.pretax,
+      taxTracking: item.taxTracking ?? defaultTrackingFor(item.kind),
       expenseAccountId: item.expenseAccountId ?? '',
       liabilityAccountId: item.liabilityAccountId ?? '',
       calcBasis: item.calcBasis ?? '',
@@ -1237,7 +1425,7 @@ export default function EmployeesPage() {
     try {
       const body = {
         name: itemForm.name.trim(),
-        pretax: itemForm.kind === 'deduction' ? itemForm.pretax : false,
+        taxTracking: itemForm.kind === 'earning' ? null : itemForm.taxTracking || null,
         expenseAccountId: itemForm.expenseAccountId || null,
         liabilityAccountId: itemForm.liabilityAccountId || null,
         calcBasis: itemForm.calcBasis || null,
@@ -1303,8 +1491,8 @@ export default function EmployeesPage() {
   }
 
   const grossPreview = computeGross(payrollForm.earnings).toFixed(2);
-  const netPreview = computeNet(payrollForm);
-  const netIsNegative = parseFloat(netPreview) < 0;
+  const netPreview = payrollPreview?.netPay ?? null;
+  const netIsNegative = !!previewError && /negative|exceed/i.test(previewError);
 
   const selectedEmployee = employees.find((e) => e.id === payrollForm.employeeId);
 
@@ -1592,9 +1780,15 @@ export default function EmployeesPage() {
                   <Td className="text-navy/70">{ITEM_KIND_LABELS[item.kind]}</Td>
                   <Td>
                     {item.kind === 'deduction' ? (
-                      item.pretax ? <Badge tone="info">Pre-tax</Badge> : <Badge tone="neutral">Post-tax</Badge>
+                      item.taxTracking && item.taxTracking !== 'none'
+                        ? <Badge tone="info">{trackingLabel(item.taxTracking)}</Badge>
+                        : <Badge tone="neutral">Post-tax</Badge>
                     ) : item.kind === 'garnishment' ? (
                       <Badge tone="warning">Post-tax</Badge>
+                    ) : item.taxTracking ? (
+                      <span className="text-navy/70 text-sm">{trackingLabel(item.taxTracking)}</span>
+                    ) : item.kind === 'tax' ? (
+                      <Badge tone="warning">Needs a tax type</Badge>
                     ) : (
                       <span className="text-navy/30">—</span>
                     )}
@@ -1680,7 +1874,12 @@ export default function EmployeesPage() {
                 value={itemForm.kind}
                 disabled={!!itemEditId}
                 onChange={(e) =>
-                  setItemForm((p) => ({ ...p, kind: e.target.value as PayrollItemKind, pretax: false }))
+                  setItemForm((p) => ({
+                    ...p,
+                    kind: e.target.value as PayrollItemKind,
+                    pretax: false,
+                    taxTracking: defaultTrackingFor(e.target.value as PayrollItemKind),
+                  }))
                 }
               >
                 {(Object.keys(ITEM_KIND_LABELS) as PayrollItemKind[]).map((k) => (
@@ -1693,16 +1892,24 @@ export default function EmployeesPage() {
             </div>
           </div>
 
-          {itemForm.kind === 'deduction' && (
-            <label className="flex items-center gap-2 text-sm text-navy/70 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                className="accent-electric"
-                checked={itemForm.pretax}
-                onChange={(e) => setItemForm((p) => ({ ...p, pretax: e.target.checked }))}
-              />
-              Pre-tax (reduces the wage base before withholding — e.g. 401(k), Section 125 health)
-            </label>
+          {(itemForm.kind === 'deduction' || itemForm.kind === 'tax' || itemForm.kind === 'employer_contribution') && (
+            <div>
+              <Label htmlFor="piTracking">Tax tracking type *</Label>
+              <Select
+                id="piTracking"
+                value={itemForm.taxTracking}
+                onChange={(e) => setItemForm((p) => ({ ...p, taxTracking: e.target.value }))}
+              >
+                {trackingChoicesFor(itemForm.kind).map((t) => (
+                  <option key={t} value={t}>{TAX_TRACKING_LABELS[t]}</option>
+                ))}
+              </Select>
+              <p className="text-[11px] text-navy/40 mt-1">
+                {itemForm.kind === 'deduction'
+                  ? '401(k), 403(b) and 457(b) lower income-tax wages only. Section 125 items also lower Social Security, Medicare and unemployment wages. This also sets the W-2 box.'
+                  : 'Decides which W-2, 941 and 940 line this amount is reported on.'}
+              </p>
+            </div>
           )}
           {itemForm.kind === 'garnishment' && (
             <p className="text-xs text-navy/50">
@@ -1917,7 +2124,11 @@ export default function EmployeesPage() {
             <Button variant="secondary" onClick={() => setPayrollOpen(false)} disabled={payrollSaving}>
               Cancel
             </Button>
-            <Button onClick={handleRunPayroll} disabled={netIsNegative} loading={payrollSaving}>
+            <Button
+              onClick={handleRunPayroll}
+              disabled={netIsNegative || !!previewError || previewing || !payrollPreview}
+              loading={payrollSaving}
+            >
               Post Paycheck
             </Button>
           </>
@@ -2053,13 +2264,15 @@ export default function EmployeesPage() {
             </p>
           </div>
 
-          {/* Tax lines */}
-          <LineEditor
-            label="Tax Withholdings"
-            lines={payrollForm.taxes}
-            onChange={updateTaxLine}
-            onAdd={addTaxLine}
-            onRemove={removeTaxLine}
+          {/* Taxes: calculated by the server (same as a pay run); change one by its tax item */}
+          <TaxPreviewSection
+            preview={payrollPreview}
+            previewing={previewing}
+            error={previewError}
+            overrides={payrollForm.taxOverrides}
+            payrollItems={payrollItems}
+            taxItemForTracking={taxItemForTracking}
+            onOverride={setTaxOverride}
           />
 
           {/* Deduction lines — may reference a payroll item (GL mapping / pre-tax) */}
@@ -2087,7 +2300,7 @@ export default function EmployeesPage() {
                     className="w-44"
                     title="Payroll item — maps the deduction to its GL liability account"
                   >
-                    <option value="">Custom…</option>
+                    <option value="">Custom (after-tax)…</option>
                     {payrollItems
                       .filter((i) => i.isActive && (i.kind === 'deduction' || i.kind === 'garnishment'))
                       .map((i) => (
@@ -2111,7 +2324,9 @@ export default function EmployeesPage() {
                     onChange={(e) => updateDeductionLine(idx, 'amount', e.target.value)}
                     className="w-28"
                   />
-                  {item?.pretax && <Badge tone="info">pre-tax</Badge>}
+                  {item && item.kind === 'deduction' && item.taxTracking && item.taxTracking !== 'none' && (
+                    <Badge tone="info">pre-tax</Badge>
+                  )}
                   {item?.kind === 'garnishment' && <Badge tone="warning">post-tax</Badge>}
                   <button
                     type="button"
@@ -2125,24 +2340,25 @@ export default function EmployeesPage() {
               );
             })}
             <p className="text-[11px] text-navy/40">
-              Pre-tax items reduce the wage base before withholding; garnishments are
-              withheld after tax to the item&apos;s liability account.
+              401(k)-type items lower income-tax wages only; Section 125 items (health, dental,
+              vision, FSA, HSA) also lower Social Security, Medicare and unemployment wages.
+              Custom lines and garnishments come out after tax.
             </p>
           </div>
 
           {/* Net pay preview */}
           <div className={`rounded-lg p-4 border ${netIsNegative ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
             <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-navy/70">Computed Net Pay</span>
+              <span className="text-sm font-medium text-navy/70">Net Pay</span>
               <span className={`text-lg font-bold font-mono ${netIsNegative ? 'text-red-600' : 'text-navy'}`}>
-                {formatCurrency(netIsNegative ? '0' : netPreview)}
+                {netPreview ? formatCurrency(netPreview) : '—'}
               </span>
             </div>
-            {selectedEmployee && (
+            {selectedEmployee && payrollPreview && (
               <p className="text-xs text-navy/40 mt-1">
-                GL: Dr 6500 Payroll Expense {formatCurrency(grossPreview)} |
-                Cr 2300 Payroll Liabilities + Cr 1000 Checking
-                (deduction lines with a payroll item post to that item&apos;s account)
+                Posts wages of {formatCurrency(payrollPreview.grossPay)} and employer taxes of{' '}
+                {formatCurrency(payrollPreview.totalEmployerTaxes)} to expense; withholding,
+                deductions and employer taxes to payroll liabilities; net pay from the bank account.
               </p>
             )}
             {netIsNegative && (

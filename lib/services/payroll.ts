@@ -52,7 +52,17 @@ import {
   type FilingStatus,
   type W4Data,
 } from '@/lib/services/payrollTax';
-import { getPayrollItemsByIds, type PayrollItem } from './payrollItems';
+import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
+import {
+  inferEmployeeTaxTracking,
+  inferEmployerTracking,
+  isEmployeeTaxTracking,
+  isEmployerTaxTracking,
+  isTrackingValidForKind,
+  paycheckWageBases,
+  TAX_TRACKING_LABELS,
+  type TaxTracking,
+} from './payrollTaxTracking';
 import { sickVacationBalances } from './payrollReports';
 import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll } from './timeTracking';
 import { getPreferences } from './preferences';
@@ -106,6 +116,22 @@ export interface PaycheckLineInput {
    * credited to the garnishment's own liability account.
    */
   payrollItemId?: string | null;
+  /**
+   * Tax tracking type (payrollTaxTracking.ts). Normally taken from the payroll item; a tax line
+   * without an item must carry (or be named as) a recognized payroll tax.
+   */
+  taxTracking?: string | null;
+}
+
+/**
+ * Override ONE computed tax on a paycheck, identified by its payroll ITEM (never a free-text
+ * name). The item's tax tracking type says which computed line it replaces (federal
+ * withholding, Social Security, FUTA, ...); a type the engine doesn't compute (state or local
+ * withholding) is added as a new line. Amount 0 removes the tax from this check.
+ */
+export interface TaxOverrideInput {
+  payrollItemId: string;
+  amount: string | number;
 }
 
 export type EarningKind = 'regular' | 'overtime' | 'bonus' | 'commission';
@@ -160,6 +186,12 @@ export interface RunPaycheckInput {
   employerTaxes?: PaycheckLineInput[];
   /** Itemized deductions (e.g. 401k, health insurance). */
   deductions?: PaycheckLineInput[];
+  /**
+   * Per-item overrides of the AUTO-computed taxes (employee withholding and employer taxes).
+   * Only valid when `taxes` / `employerTaxes` are omitted (the server computes everything,
+   * then applies these). Each override names a tax payroll item.
+   */
+  taxOverrides?: TaxOverrideInput[];
   /**
    * Filing status override for auto-computed taxes. Default: the employee's W-4
    * (employees.w4.filingStatus, else 'single'); the rest of the W-4 (Steps 2-4) still applies.
@@ -523,6 +555,14 @@ export interface PayStubData {
   lines: PayStubLineWithYtd[];
   ytd: { gross: string; taxes: string; deductions: string; net: string };
   /**
+   * Taxable wages: federal income-tax wages (gross less 401(k)/Section 125) and Social Security /
+   * Medicare wages (gross less Section 125 only), this check and calendar YTD.
+   */
+  taxableWages: {
+    current: { federal: string; fica: string };
+    ytd: { federal: string; fica: string };
+  };
+  /**
    * Current sick/vacation balances in hours (employees.accruals policy, derived by
    * payrollReports.sickVacationBalances). Null when the employee has no accrual policy.
    */
@@ -603,9 +643,31 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
     /* balances are an additive extra on the stub */
   }
 
+  const currentBases = paycheckWageBases(pc.grossPay, lines);
+  const ytdLinesByCheck = new Map<string, typeof ytdLines>();
+  for (const l of ytdLines) {
+    const arr = ytdLinesByCheck.get(l.paycheckId) ?? [];
+    arr.push(l);
+    ytdLinesByCheck.set(l.paycheckId, arr);
+  }
+  let ytdFederal = Money.zero();
+  let ytdFica = Money.zero();
+  for (const c of ytdChecks) {
+    const b = paycheckWageBases(c.grossPay, ytdLinesByCheck.get(c.id) ?? []);
+    ytdFederal = ytdFederal.plus(b.incomeTaxWages);
+    ytdFica = ytdFica.plus(b.ficaWages);
+  }
+
   return {
     paycheck: pc,
     employee,
+    taxableWages: {
+      current: {
+        federal: toAmountString(currentBases.incomeTaxWages),
+        fica: toAmountString(currentBases.ficaWages),
+      },
+      ytd: { federal: toAmountString(ytdFederal), fica: toAmountString(ytdFica) },
+    },
     lines: lines.map((l) => {
       const key = `${l.kind}|${lineGroupName(l.name)}`;
       // A voided stub's own lines are excluded from the YTD set — fall back to the
@@ -624,41 +686,71 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
 }
 
 /**
- * Sum gross wages already paid to an employee in the given UTC calendar year: posted
- * paychecks plus historical YTD / liability adjustments (non-posting adjustments count too —
- * QB's YTD setup amounts drive the wage-base limits). Voided checks don't count toward the
- * SS / FUTA / SUI wage bases or the Additional Medicare threshold. `excludePaycheckId` leaves
+ * Wages already paid to an employee in the given UTC calendar year: posted paychecks plus
+ * historical YTD / liability adjustments (non-posting adjustments count too — QB's YTD setup
+ * amounts drive the wage-base limits). Voided checks don't count. `excludePaycheckId` leaves
  * out the check being edited.
+ *
+ * `fica` is the Social Security / Medicare / FUTA / SUI wage total (gross minus Section 125
+ * deductions) — the figure every wage base and the Additional Medicare threshold apply to.
+ * Retirement deferrals do NOT reduce it.
  */
-async function ytdGrossPaid(
+export async function ytdWagesPaid(
   ctx: ServiceContext,
   employeeId: string,
   payDate: Date,
   excludePaycheckId?: string | null,
-): Promise<string> {
+): Promise<{ gross: string; fica: string; incomeTax: string }> {
   const year = payDate.getUTCFullYear();
   const yearStart = new Date(Date.UTC(year, 0, 1));
   const yearEnd   = new Date(Date.UTC(year + 1, 0, 1));
 
-  const rows = await ctx.db
-    .select({ id: paychecks.id, grossPay: paychecks.grossPay })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(
-      and(
-        eq(paychecks.companyId, ctx.companyId),
-        eq(paychecks.employeeId, employeeId),
-        paycheckCountsCondition(),
-        gte(paychecks.payDate, yearStart),
-        lt(paychecks.payDate, yearEnd),
-      ),
-    );
+  const rows = (
+    await ctx.db
+      .select({ id: paychecks.id, grossPay: paychecks.grossPay })
+      .from(paychecks)
+      .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+      .where(
+        and(
+          eq(paychecks.companyId, ctx.companyId),
+          eq(paychecks.employeeId, employeeId),
+          paycheckCountsCondition(),
+          gte(paychecks.payDate, yearStart),
+          lt(paychecks.payDate, yearEnd),
+        ),
+      )
+  ).filter((r) => r.id !== excludePaycheckId);
 
-  return toAmountString(
-    rows
-      .filter((r) => r.id !== excludePaycheckId)
-      .reduce((s, r) => s.plus(Money.of(r.grossPay)), Money.zero()),
-  );
+  const ids = rows.map((r) => r.id);
+  const lines = ids.length
+    ? await ctx.db
+        .select({
+          paycheckId: paycheckLines.paycheckId,
+          kind: paycheckLines.kind,
+          name: paycheckLines.name,
+          amount: paycheckLines.amount,
+          taxTracking: paycheckLines.taxTracking,
+        })
+        .from(paycheckLines)
+        .where(and(inArray(paycheckLines.paycheckId, ids), inArray(paycheckLines.kind, ['deduction', 'employer_contribution'])))
+    : [];
+  const byCheck = new Map<string, typeof lines>();
+  for (const l of lines) {
+    const arr = byCheck.get(l.paycheckId) ?? [];
+    arr.push(l);
+    byCheck.set(l.paycheckId, arr);
+  }
+
+  let gross = Money.zero();
+  let fica = Money.zero();
+  let incomeTax = Money.zero();
+  for (const r of rows) {
+    const w = paycheckWageBases(r.grossPay, byCheck.get(r.id) ?? []);
+    gross = gross.plus(w.gross);
+    fica = fica.plus(w.ficaWages);
+    incomeTax = incomeTax.plus(w.incomeTaxWages);
+  }
+  return { gross: toAmountString(gross), fica: toAmountString(fica), incomeTax: toAmountString(incomeTax) };
 }
 
 /** Two-letter work state of an employee: W-4 `state` (state withholding) else address state. */
@@ -680,6 +772,7 @@ type PersistLine = {
   name: string;
   amount: string;
   payrollItemId: string | null;
+  taxTracking?: string | null;
 };
 
 /** Everything runPaycheck / editPaycheck need to persist + post one check. */
@@ -694,6 +787,8 @@ interface PreparedPaycheck {
   taxLines: PaycheckLineInput[];
   deductionLines: PaycheckLineInput[];
   employerTaxLines: PaycheckLineInput[];
+  /** This check's wage bases (income-tax wages = W-2 Box 1 basis; FICA wages = Box 3/5 basis). */
+  wages: { gross: string; incomeTaxWages: string; ficaWages: string };
   itemFor: (id: string | null | undefined) => PayrollItem | null;
   accountsUsed: { payrollExpenseId: string; payrollTaxExpenseId: string; payrollLiabId: string; checkingId: string };
 }
@@ -768,18 +863,29 @@ async function preparePaycheck(
 
   if (gross.lessThanOrEqualTo(0)) throw validation('Gross pay must be greater than zero.');
 
-  // --- Resolve payroll items referenced by any line (GL mapping + pre-tax flags) ---
-  const deductionLines: PaycheckLineInput[] = input.deductions ?? [];
+  // --- Resolve payroll items referenced by any line (GL mapping + tax tracking) ---
+  const overrides = input.taxOverrides ?? [];
+  const callerSuppliedTaxes = Array.isArray(input.taxes);
+  const callerSuppliedEmployerTaxes = Array.isArray(input.employerTaxes);
+  if (overrides.length > 0 && (callerSuppliedTaxes || callerSuppliedEmployerTaxes)) {
+    throw validation(
+      'Tax overrides adjust the calculated taxes. Leave the tax lists out when you send overrides.',
+    );
+  }
   const referencedItemIds = [
     ...earningLines.map((l) => l.payrollItemId),
-    ...deductionLines.map((l) => l.payrollItemId),
+    ...(input.deductions ?? []).map((l) => l.payrollItemId),
     ...(input.taxes ?? []).map((l) => l.payrollItemId),
     ...(input.employerTaxes ?? []).map((l) => l.payrollItemId),
+    ...overrides.map((o) => o.payrollItemId),
   ].filter((id): id is string => !!id);
   const itemMap = await getPayrollItemsByIds(ctx, referencedItemIds);
 
   const itemFor = (id: string | null | undefined): PayrollItem | null =>
     id ? itemMap.get(id) ?? null : null;
+  /** The item's tracking type (stored, else inferred from its name / pre-tax flag). */
+  const itemTracking = (item: PayrollItem): TaxTracking | null =>
+    resolveItemTracking(item.kind, item.name, item.taxTracking, item.pretax);
 
   // Kind sanity: a line may only reference an item of a compatible kind.
   for (const l of earningLines) {
@@ -794,7 +900,7 @@ async function preparePaycheck(
       throw validation(`Tax line "${t.name}" references a ${item.kind} payroll item.`);
     }
   }
-  for (const d of deductionLines) {
+  for (const d of input.deductions ?? []) {
     const item = itemFor(d.payrollItemId);
     if (item && item.kind !== 'deduction' && item.kind !== 'garnishment') {
       throw validation(`Deduction line "${d.name}" references a ${item.kind} payroll item.`);
@@ -807,80 +913,103 @@ async function preparePaycheck(
     }
   }
 
-  // PRE-TAX deductions (item.pretax) reduce the wage base used for auto-withholding.
-  // Garnishment items are always post-tax. Simplified model: pre-tax reduces both the
-  // income-tax and FICA bases (Section 125-style).
-  let pretaxTotal = Money.zero();
-  for (const d of deductionLines) {
+  // --- Deductions carry their tax tracking type: an item's type, else after-tax ('none'). ---
+  const deductionLines: PaycheckLineInput[] = (input.deductions ?? []).map((d) => {
     const item = itemFor(d.payrollItemId);
-    if (item?.pretax) pretaxTotal = pretaxTotal.plus(Money.of(d.amount));
-  }
-  const taxableGross = Money.round2(
-    gross.minus(pretaxTotal).greaterThan(0) ? gross.minus(pretaxTotal) : Money.zero(),
-  );
+    return { ...d, taxTracking: item ? itemTracking(item) ?? 'none' : 'none' };
+  });
 
-  // --- Auto-compute taxes only when the caller did not pass a taxes array at all.
-  // An explicit empty array means "no taxes" (contractor/reimbursement) and is respected. ---
-  const callerSuppliedTaxes = Array.isArray(input.taxes);
-  const callerSuppliedEmployerTaxes = Array.isArray(input.employerTaxes);
+  /** Tax tracking for an employee tax line: item → explicit → standard name, else refuse. */
+  const employeeTaxTracking = (t: PaycheckLineInput): TaxTracking => {
+    const item = itemFor(t.payrollItemId);
+    const tr = item
+      ? itemTracking(item)
+      : t.taxTracking && isEmployeeTaxTracking(t.taxTracking)
+        ? t.taxTracking
+        : inferEmployeeTaxTracking(t.name);
+    if (!tr || !isEmployeeTaxTracking(tr)) {
+      throw validation(
+        `"${t.name}" isn't a payroll tax we can report. Pick a tax item (federal withholding, Social Security, Medicare, state withholding, SDI or local tax) so it lands on the W-2 and 941.`,
+      );
+    }
+    return tr;
+  };
+  /** Tracking for an employer line: item → explicit → standard name (unknown = 'other'). */
+  const employerTracking = (t: PaycheckLineInput): TaxTracking => {
+    const item = itemFor(t.payrollItemId);
+    if (item) return itemTracking(item) ?? 'other';
+    if (t.taxTracking && isTrackingValidForKind('employer_contribution', t.taxTracking)) return t.taxTracking;
+    return inferEmployerTracking(t.name);
+  };
+
+  // --- Wage bases (QuickBooks tax tracking): 401(k)/403(b)/457(b) deferrals reduce only the
+  // income-tax wages; Section 125 items reduce income-tax AND Social Security / Medicare /
+  // FUTA / SUI / SDI wages; after-tax deductions and garnishments reduce nothing. ---
+  const bases = paycheckWageBases(
+    gross,
+    deductionLines.map((d) => ({ kind: 'deduction', name: d.name, amount: d.amount, taxTracking: d.taxTracking })),
+  );
+  const incomeTaxWages = Money.round2(bases.incomeTaxWages);
+  const ficaWages = Money.round2(bases.ficaWages);
 
   let taxLines: PaycheckLineInput[];
   let employerTaxLines: PaycheckLineInput[] | undefined;
 
   if (callerSuppliedTaxes) {
-    taxLines = input.taxes!;
+    taxLines = input.taxes!.map((t) => ({ ...t, taxTracking: employeeTaxTracking(t) }));
   } else {
-    // Derive taxes from the TAXABLE gross using the PAY DATE's tax-year tables and the
-    // employee's W-4 (unless the caller overrides the filing status). The SS wage base and
-    // Additional Medicare threshold apply against ACTUAL YTD wages, which include historical
-    // YTD amounts entered at mid-year setup.
+    // Derive taxes from the PAY DATE's tax-year tables and the employee's W-4 (unless the caller
+    // overrides the filing status): federal income tax on income-tax wages; Social Security and
+    // Medicare on FICA wages. The SS wage base and Additional Medicare threshold apply against
+    // ACTUAL YTD FICA wages, which include historical YTD amounts entered at mid-year setup.
     const year = input.payDate.getUTCFullYear();
-    const ytdGrossBefore = await ytdGrossPaid(ctx, input.employeeId, input.payDate, opts.excludePaycheckId);
+    const ytd = await ytdWagesPaid(ctx, input.employeeId, input.payDate, opts.excludePaycheckId);
+    const ytdFicaBefore = ytd.fica;
     const w4 = (employee.w4 ?? {}) as W4Data;
     const withholding = computeWithholding({
-      grossPerPeriod: taxableGross.toNumber(),
+      grossPerPeriod: incomeTaxWages.toNumber(),
+      ficaWagesPerPeriod: ficaWages.toNumber(),
       periodsPerYear: input.periodsPerYear ?? 26,
       filingStatus: input.filingStatus ?? normalizeFilingStatus(w4.filingStatus),
-      ytdGrossBefore,
+      ytdGrossBefore: ytdFicaBefore,
       year,
       w4: input.filingStatus ? { ...w4, filingStatus: input.filingStatus } : w4,
     });
     taxLines = [
-      { kind: 'tax' as const, name: 'Federal Income Tax', amount: withholding.federalIncomeTax },
-      { kind: 'tax' as const, name: 'Social Security',    amount: withholding.socialSecurity },
-      { kind: 'tax' as const, name: 'Medicare',            amount: withholding.medicare },
-    ].filter((t) => parseFloat(t.amount) > 0);
+      { kind: 'tax' as const, name: 'Federal Income Tax', amount: withholding.federalIncomeTax, taxTracking: 'federal_withholding' },
+      { kind: 'tax' as const, name: 'Social Security',    amount: withholding.socialSecurity,   taxTracking: 'social_security' },
+      { kind: 'tax' as const, name: 'Medicare',            amount: withholding.medicare,         taxTracking: 'medicare' },
+    ];
 
     // State payroll taxes configured for the employee's work state (employee SDI).
     const state = employeeWorkState(employee);
     const stateSettings = state ? await stateSettingsFor(ctx, state, year) : null;
     if (state && stateSettings && Money.gt(stateSettings.sdiRate, 0)) {
-      const sdiTaxable = taxableUnderBase(taxableGross, ytdGrossBefore, stateSettings.sdiWageBase);
+      const sdiTaxable = taxableUnderBase(ficaWages, ytdFicaBefore, stateSettings.sdiWageBase);
       const sdi = Money.round2(sdiTaxable.times(Money.of(stateSettings.sdiRate)));
-      if (sdi.greaterThan(0)) {
-        taxLines.push({ kind: 'tax', name: `State Disability (${state})`, amount: toAmountString(sdi) });
-      }
+      taxLines.push({ kind: 'tax', name: `State Disability (${state})`, amount: toAmountString(sdi), taxTracking: 'sdi' });
     }
 
     // Employer payroll taxes (employer FICA match + FUTA + SUI + workers comp) — auto-computed
     // alongside the employee withholdings unless the caller supplied them explicitly.
     if (!callerSuppliedEmployerTaxes) {
       const employer = computeEmployerTaxes({
-        grossPerPeriod: taxableGross.toNumber(),
-        ytdGrossBefore,
+        grossPerPeriod: ficaWages.toNumber(),
+        ytdGrossBefore: ytdFicaBefore,
         year,
       });
       employerTaxLines = [
-        { kind: 'employer_contribution' as const, name: 'Employer Social Security',     amount: employer.socialSecurity },
-        { kind: 'employer_contribution' as const, name: 'Employer Medicare',            amount: employer.medicare },
-        { kind: 'employer_contribution' as const, name: 'Federal Unemployment (FUTA)',  amount: employer.futa },
+        { kind: 'employer_contribution' as const, name: 'Employer Social Security',     amount: employer.socialSecurity, taxTracking: 'employer_social_security' },
+        { kind: 'employer_contribution' as const, name: 'Employer Medicare',            amount: employer.medicare,       taxTracking: 'employer_medicare' },
+        { kind: 'employer_contribution' as const, name: 'Federal Unemployment (FUTA)',  amount: employer.futa,           taxTracking: 'futa' },
       ];
       if (state && stateSettings && Money.gt(stateSettings.suiRate, 0)) {
-        const suiTaxable = taxableUnderBase(taxableGross, ytdGrossBefore, stateSettings.suiWageBase);
+        const suiTaxable = taxableUnderBase(ficaWages, ytdFicaBefore, stateSettings.suiWageBase);
         employerTaxLines.push({
           kind: 'employer_contribution',
           name: `State Unemployment (${state})`,
           amount: toAmountString(Money.round2(suiTaxable.times(Money.of(stateSettings.suiRate)))),
+          taxTracking: 'sui',
         });
       }
       const wc = await workersCompFor(ctx, employee.workersCompCodeId ?? null);
@@ -889,16 +1018,56 @@ async function preparePaycheck(
           kind: 'employer_contribution',
           name: `Workers Compensation (${wc.code})`,
           amount: toAmountString(Money.round2(gross.times(Money.of(wc.ratePer100)).dividedBy(100))),
+          taxTracking: 'workers_comp',
         });
       }
-      employerTaxLines = employerTaxLines.filter((t) => parseFloat(String(t.amount)) > 0);
     }
+
+    // --- Per-item overrides (QB: type over a calculated tax on the paycheck). Matched by the
+    // item's tax tracking type — never by free-text name. ---
+    if (overrides.length > 0) {
+      const seenTracking = new Set<string>();
+      for (const o of overrides) {
+        const item = itemFor(o.payrollItemId)!;
+        const amount = Money.round2(o.amount);
+        if (amount.isNegative()) throw validation(`The ${item.name} amount cannot be negative.`);
+        const tr = itemTracking(item);
+        const isEmployee = item.kind === 'tax' && isEmployeeTaxTracking(tr);
+        const isEmployer = item.kind === 'employer_contribution' && isEmployerTaxTracking(tr);
+        if (!tr || (!isEmployee && !isEmployer)) {
+          throw validation(
+            `"${item.name}" isn't a payroll tax item. Only tax items (withholding, Social Security, Medicare, FUTA, SUI and similar) can override a calculated tax.`,
+          );
+        }
+        if (seenTracking.has(tr)) {
+          throw validation(`Only one override is allowed for ${TAX_TRACKING_LABELS[tr]}.`);
+        }
+        seenTracking.add(tr);
+        const list = isEmployee ? taxLines : (employerTaxLines ??= []);
+        const idx = list.findIndex((l) => l.taxTracking === tr);
+        const line: PaycheckLineInput = {
+          kind: isEmployee ? 'tax' : 'employer_contribution',
+          // Keep the engine's standard name (it carries the state code, e.g. "(CA)").
+          name: idx >= 0 ? list[idx].name : item.name,
+          amount: toAmountString(amount),
+          payrollItemId: item.id,
+          taxTracking: tr,
+        };
+        if (idx >= 0) list[idx] = line;
+        else list.push(line);
+      }
+    }
+
+    taxLines = taxLines.filter((t) => Money.gt(t.amount, 0));
+    if (employerTaxLines) employerTaxLines = employerTaxLines.filter((t) => Money.gt(t.amount, 0));
   }
 
   // Caller-supplied employer taxes always win; explicit [] means "no employer taxes".
   // When employee taxes were supplied explicitly and employerTaxes was omitted, no
   // employer taxes are auto-derived (the caller has taken over the tax math).
-  employerTaxLines ??= callerSuppliedEmployerTaxes ? input.employerTaxes! : [];
+  employerTaxLines ??= callerSuppliedEmployerTaxes
+    ? input.employerTaxes!.map((t) => ({ ...t, taxTracking: employerTracking(t) }))
+    : [];
 
   let totalEmployerTaxes = Money.zero();
   for (const t of employerTaxLines) {
@@ -954,6 +1123,11 @@ async function preparePaycheck(
     taxLines,
     deductionLines,
     employerTaxLines,
+    wages: {
+      gross: toAmountString(gross),
+      incomeTaxWages: toAmountString(incomeTaxWages),
+      ficaWages: toAmountString(ficaWages),
+    },
     itemFor,
     accountsUsed: { payrollExpenseId, payrollTaxExpenseId, payrollLiabId, checkingId },
   };
@@ -964,13 +1138,14 @@ function paycheckLineRows(prep: PreparedPaycheck, paycheckId: string) {
   // Garnishment-item lines persist as kind 'deduction' (the ITEM's kind carries the
   // garnishment semantics) so stubs / W-2 / YTD groupings keep working.
   return [
-    ...prep.earningLines.map((e) => ({ paycheckId, ...e })),
+    ...prep.earningLines.map((e) => ({ paycheckId, ...e, taxTracking: null })),
     ...prep.taxLines.map((t) => ({
       paycheckId,
       kind: 'tax' as const,
       name: t.name,
       amount: toAmountString(Money.of(t.amount)),
       payrollItemId: t.payrollItemId ?? null,
+      taxTracking: t.taxTracking ?? null,
     })),
     ...prep.deductionLines.map((d) => ({
       paycheckId,
@@ -978,6 +1153,7 @@ function paycheckLineRows(prep: PreparedPaycheck, paycheckId: string) {
       name: d.name,
       amount: toAmountString(Money.of(d.amount)),
       payrollItemId: d.payrollItemId ?? null,
+      taxTracking: d.taxTracking ?? 'none',
     })),
     ...prep.employerTaxLines.map((t) => ({
       paycheckId,
@@ -985,6 +1161,7 @@ function paycheckLineRows(prep: PreparedPaycheck, paycheckId: string) {
       name: t.name,
       amount: toAmountString(Money.of(t.amount)),
       payrollItemId: t.payrollItemId ?? null,
+      taxTracking: t.taxTracking ?? null,
     })),
   ];
 }
@@ -1076,6 +1253,27 @@ async function postPaycheckEntry(
     sourceRef: `paycheck:${paycheckId}`,
     lines: postingLines,
   });
+}
+
+/**
+ * Calculate a paycheck exactly as runPaycheck would (same engine as pay runs) WITHOUT saving or
+ * posting anything — QB's paycheck preview. Lines carry their tax tracking type and payroll
+ * item so the UI can show and override each calculated tax by item.
+ */
+export async function previewPaycheck(ctx: ServiceContext, input: RunPaycheckInput) {
+  const prep = await preparePaycheck(ctx, input);
+  const lines = paycheckLineRows(prep, '').map(({ paycheckId: _ignored, ...l }) => l);
+  return {
+    employeeId: input.employeeId,
+    payDate: input.payDate,
+    grossPay: toAmountString(prep.gross),
+    totalTaxes: toAmountString(prep.totalTaxes),
+    totalDeductions: toAmountString(prep.totalDeductions),
+    totalEmployerTaxes: toAmountString(prep.totalEmployerTaxes),
+    netPay: toAmountString(prep.netPay),
+    wages: prep.wages,
+    lines,
+  };
 }
 
 export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) {

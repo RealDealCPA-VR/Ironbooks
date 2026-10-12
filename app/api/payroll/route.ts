@@ -9,10 +9,17 @@
  * POST body accepts EITHER a single `grossPay` amount OR itemized `earnings`:
  *   earnings: [{ kind: 'regular'|'overtime'|'bonus'|'commission', hours?, rate?, amount }]
  * Gross = sum of earning lines when provided.
+ *
+ * Taxes: leave `taxes` / `employerTaxes` out and the server calculates federal withholding,
+ * Social Security and Medicare (employee + employer), FUTA, SUI/SDI and workers' comp from the
+ * year's tables — the same engine as pay runs. To change a calculated tax, send
+ * `taxOverrides: [{ payrollItemId, amount }]` naming a TAX payroll item (never a typed name).
+ *
+ * POST /api/payroll?preview=true — calculate the paycheck without saving or posting it.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { listPaychecks, runPaycheck } from '@/lib/services/payroll';
+import { listPaychecks, previewPaycheck, runPaycheck } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { runPaycheckSchema } from '@/lib/validation/payroll';
@@ -56,10 +63,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const paycheck = await runPaycheck(ctx, {
-      ...parsed.data,
-      deductions: parsed.data.deductions ?? [],
-    });
+    const input = { ...parsed.data, deductions: parsed.data.deductions ?? [] };
+    if (req.nextUrl.searchParams.get('preview') === 'true') {
+      return NextResponse.json(await previewPaycheck(ctx, input));
+    }
+    const paycheck = await runPaycheck(ctx, input);
 
     return NextResponse.json(paycheck, { status: 201 });
   } catch (err) {

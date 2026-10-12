@@ -18,6 +18,7 @@ interface Line {
   name: string;
   amount: string;
   payrollItemId: string | null;
+  taxTracking?: string | null;
 }
 interface PaycheckDetail {
   id: string;
@@ -37,6 +38,8 @@ interface SimpleRow {
   name: string;
   amount: string;
   payrollItemId: string | null;
+  /** Tax tracking type kept from the original line so W-2/941 aggregation survives the edit. */
+  taxTracking?: string | null;
 }
 
 const KINDS: Record<string, EarningKind> = {
@@ -98,7 +101,7 @@ export function EditPaycheckModal({
         setPayDate(String(pc.payDate).slice(0, 10));
         setEarnings(pc.lines.filter((l) => l.kind === 'earning').map(toEarnRow));
         const simple = (k: string) =>
-          pc.lines.filter((l) => l.kind === k).map((l) => ({ name: l.name, amount: l.amount, payrollItemId: l.payrollItemId }));
+          pc.lines.filter((l) => l.kind === k).map((l) => ({ name: l.name, amount: l.amount, payrollItemId: l.payrollItemId, taxTracking: l.taxTracking ?? null }));
         setDeductions(simple('deduction'));
         setTaxes(simple('tax'));
         setEmployer(simple('employer_contribution'));

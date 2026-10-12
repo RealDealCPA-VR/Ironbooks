@@ -232,6 +232,13 @@
       "when": 1781200032000,
       "tag": "0032_wave2_payroll",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1781300035000,
+      "tag": "0035_fix_payroll",
+      "breakpoints": true
     }
   ]
 }
