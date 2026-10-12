@@ -35,7 +35,7 @@ import {
 import { createInvoice, shippingColumns } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
-import { allocateDocNumber, renumberDoc } from './docNumbers';
+import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -536,6 +536,8 @@ export async function convertToInvoice(
 export interface BackorderReportRow {
   salesOrderId: string;
   orderNumber: number;
+  /** The S.O. number users see (typed ref number, else the integer). */
+  refNumber: string;
   date: Date;
   status: string;
   customerId: string;
@@ -560,6 +562,7 @@ export async function backorderReport(ctx: ServiceContext): Promise<BackorderRep
     .select({
       salesOrderId: salesOrders.id,
       orderNumber: salesOrders.orderNumber,
+      refNumber: salesOrders.refNumber,
       date: salesOrders.date,
       status: salesOrders.status,
       customerId: salesOrders.customerId,
@@ -586,6 +589,7 @@ export async function backorderReport(ctx: ServiceContext): Promise<BackorderRep
 
   return rows.map((r) => ({
     ...r,
+    refNumber: docRef(r.refNumber, r.orderNumber),
     quantityBackordered: Money.of(r.quantityOrdered)
       .minus(Money.of(r.quantityInvoiced ?? '0'))
       .toFixed(4),

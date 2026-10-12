@@ -31,6 +31,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, validation } from './_base';
 import { convertToInvoice } from './salesOrders';
+import { docRef } from './docNumbers';
 
 type Dec = ReturnType<typeof Money.zero>;
 export type ShipStatus = 'complete' | 'partial' | 'none';
@@ -69,6 +70,8 @@ export interface WorksheetLine {
 export interface WorksheetOrder {
   salesOrderId: string;
   orderNumber: number;
+  /** The S.O. number users see (typed ref number, else the integer). */
+  refNumber: string;
   date: Date;
   status: string;
   customerId: string;
@@ -111,6 +114,7 @@ export async function fulfillmentWorksheet(
     .select({
       salesOrderId: salesOrders.id,
       orderNumber: salesOrders.orderNumber,
+      refNumber: salesOrders.refNumber,
       date: salesOrders.date,
       status: salesOrders.status,
       customerId: salesOrders.customerId,
@@ -204,6 +208,7 @@ export async function fulfillmentWorksheet(
       order = {
         salesOrderId: r.salesOrderId,
         orderNumber: r.orderNumber,
+        refNumber: docRef(r.refNumber, r.orderNumber),
         date: r.date,
         status: r.status,
         customerId: r.customerId,
@@ -312,6 +317,7 @@ export interface ShipmentLine {
 export interface Shipment {
   salesOrderId: string;
   orderNumber: number;
+  refNumber: string;
   date: Date;
   customerId: string;
   customerName: string;
@@ -357,25 +363,25 @@ export async function planShipments(
     const requests = sel.lines
       ? sel.lines.map((r) => {
           const line = lineById.get(r.lineId);
-          if (!line) throw validation(`Sales order #${order.orderNumber}: a selected line is not open.`);
+          if (!line) throw validation(`Sales order #${order.refNumber}: a selected line is not open.`);
           return { line, qty: Money.of(r.quantity) };
         })
       : order.lines.map((line) => ({ line, qty: Money.of(line.canShip) }));
 
     const lines: ShipmentLine[] = [];
     for (const { line, qty } of requests) {
-      if (qty.isNegative()) throw validation(`Sales order #${order.orderNumber}: quantity cannot be negative.`);
+      if (qty.isNegative()) throw validation(`Sales order #${order.refNumber}: quantity cannot be negative.`);
       if (!qty.greaterThan(0)) continue;
       if (qty.greaterThan(line.quantityRemaining)) {
         throw validation(
-          `Sales order #${order.orderNumber}: only ${Money.of(line.quantityRemaining).toString()} of ${line.itemName ?? line.description ?? 'a line'} remain to ship.`,
+          `Sales order #${order.refNumber}: only ${Money.of(line.quantityRemaining).toString()} of ${line.itemName ?? line.description ?? 'a line'} remain to ship.`,
         );
       }
       if (line.tracksStock && line.itemId) {
         const left = physicalLeft.get(line.itemId) ?? Money.zero();
         if (qty.greaterThan(left)) {
           throw validation(
-            `Sales order #${order.orderNumber}: not enough ${line.itemName ?? 'stock'} on hand (${left.toString()} available to ship).`,
+            `Sales order #${order.refNumber}: not enough ${line.itemName ?? 'stock'} on hand (${left.toString()} available to ship).`,
           );
         }
         physicalLeft.set(line.itemId, left.minus(qty));
@@ -394,6 +400,7 @@ export async function planShipments(
       shipments.push({
         salesOrderId: order.salesOrderId,
         orderNumber: order.orderNumber,
+        refNumber: order.refNumber,
         date: order.date,
         customerId: order.customerId,
         customerName: order.customerName,
@@ -411,6 +418,8 @@ export async function planShipments(
 export interface BatchInvoiceResult {
   salesOrderId: string;
   orderNumber: number;
+  refNumber?: string;
+  invoiceRef?: string;
   customerName: string;
   ok: boolean;
   invoiceId?: string;
@@ -440,16 +449,19 @@ export async function batchInvoiceSalesOrders(
       results.push({
         salesOrderId: s.salesOrderId,
         orderNumber: s.orderNumber,
+        refNumber: s.refNumber,
         customerName: s.customerName,
         ok: true,
         invoiceId: invoice.id,
         invoiceNumber: invoice.invoiceNumber,
+        invoiceRef: docRef(invoice.refNumber, invoice.invoiceNumber),
         total: invoice.total,
       });
     } catch (err) {
       results.push({
         salesOrderId: s.salesOrderId,
         orderNumber: s.orderNumber,
+        refNumber: s.refNumber,
         customerName: s.customerName,
         ok: false,
         error: err instanceof Error ? err.message : 'Failed to invoice this order.',
@@ -465,6 +477,7 @@ export async function batchInvoiceSalesOrders(
     results.push({
       salesOrderId: sel.salesOrderId,
       orderNumber: o?.orderNumber ?? 0,
+      refNumber: o?.refNumber,
       customerName: o?.customerName ?? '',
       ok: false,
       error: 'Nothing can ship on this order yet.',

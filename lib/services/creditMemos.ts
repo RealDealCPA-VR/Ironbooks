@@ -785,7 +785,9 @@ export async function listCreditApplications(
       amount: creditApplications.amount,
       date: creditApplications.date,
       memoNumber: creditMemos.memoNumber,
+      memoRef: creditMemos.refNumber,
       invoiceNumber: invoices.invoiceNumber,
+      invoiceRef: invoices.refNumber,
     })
     .from(creditApplications)
     .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))

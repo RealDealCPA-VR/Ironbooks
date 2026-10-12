@@ -654,6 +654,7 @@ async function prepareInvoice(
         customerId: estimates.customerId,
         estimateStatus: estimates.status,
         estimateNumber: estimates.estimateNumber,
+        estimateRef: estimates.refNumber,
       })
       .from(estimateLines)
       .innerJoin(estimates, eq(estimates.id, estimateLines.estimateId))
@@ -670,7 +671,7 @@ async function prepareInvoice(
       if (el.estimateStatus === 'rejected') {
         throw new ServiceError(
           'CONFLICT',
-          `Line ${i + 1} bills estimate ${el.estimateNumber}, which the customer rejected. Mark the estimate accepted before invoicing it.`,
+          `Line ${i + 1} bills estimate ${el.estimateRef || el.estimateNumber}, which the customer rejected. Mark the estimate accepted before invoicing it.`,
         );
       }
       if ((el.itemId ?? null) !== (l.itemId ?? null)) {

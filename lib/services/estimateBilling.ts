@@ -211,7 +211,7 @@ export async function assertEstimatesNotRejected(
   const ids = [...new Set(lines.map((l) => l.estimateLineId).filter(Boolean) as string[])];
   if (ids.length === 0) return;
   const rows = await ctx.db
-    .selectDistinct({ estimateNumber: estimates.estimateNumber })
+    .selectDistinct({ estimateNumber: estimates.estimateNumber, refNumber: estimates.refNumber })
     .from(estimateLines)
     .innerJoin(estimates, eq(estimates.id, estimateLines.estimateId))
     .where(
@@ -220,7 +220,7 @@ export async function assertEstimatesNotRejected(
   if (rows.length > 0) {
     throw new ServiceError(
       'CONFLICT',
-      `This invoice bills estimate ${rows.map((r) => r.estimateNumber).join(', ')}, which the customer rejected. Mark the estimate accepted before invoicing it.`,
+      `This invoice bills estimate ${rows.map((r) => r.refNumber || r.estimateNumber).join(', ')}, which the customer rejected. Mark the estimate accepted before invoicing it.`,
     );
   }
 }
