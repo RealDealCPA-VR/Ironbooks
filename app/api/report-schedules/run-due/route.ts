@@ -6,12 +6,16 @@
  * Returns what ran, the files written and any errors.
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
 import { reportError } from '../../reports/_lib';
-import { runDueForRequest } from '../_internal';
+import { internalContexts, runDueForCompanies, runDueForUser } from '../_internal';
 
 export async function POST(req: NextRequest) {
   try {
-    return NextResponse.json({ results: await runDueForRequest(req) });
+    // Desktop timer (internal token): every company in the file. Otherwise the signed-in user.
+    const internal = await internalContexts(req);
+    const results = internal ? await runDueForCompanies(internal) : await runDueForUser(await getServerContext());
+    return NextResponse.json({ results });
   } catch (e) {
     return reportError(e, 'report-schedules/run-due');
   }

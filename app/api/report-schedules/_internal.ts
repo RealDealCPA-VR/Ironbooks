@@ -9,7 +9,6 @@ import { asc } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import type { ServiceContext } from '@/lib/services/_base';
-import { getServerContext } from '@/lib/context';
 import { reportExportRoot, runDueSchedules, type ScheduleRunResult } from '@/lib/services/memorizedReports';
 
 /** True when the request carries the per-launch internal token (constant-time compare). */
@@ -68,18 +67,13 @@ export async function internalContext(req: NextRequest): Promise<ServiceContext 
 export type DueRunResult = ScheduleRunResult & { companyId?: string };
 
 /**
- * Run every due schedule for the request: for the trusted timer, in EVERY company in the file
- * (a failure in one company is reported and the others still run); for a signed-in user, in the
- * user's current company with that user's permissions.
+ * Trusted timer: run every due schedule in EVERY company in the file (each as that company's
+ * owner, each schedule with its creator's access). A failure in one company is reported and the
+ * others still run.
  */
-export async function runDueForRequest(req: NextRequest): Promise<DueRunResult[]> {
-  const internal = await internalContexts(req);
-  if (!internal) {
-    const ctx = await getServerContext();
-    return runDueSchedules(ctx, { outDir: await companyExportDir(ctx) });
-  }
+export async function runDueForCompanies(ctxs: ServiceContext[]): Promise<DueRunResult[]> {
   const results: DueRunResult[] = [];
-  for (const ctx of internal) {
+  for (const ctx of ctxs) {
     try {
       for (const r of await runDueSchedules(ctx, { outDir: await companyExportDir(ctx) })) results.push({ ...r, companyId: ctx.companyId });
     } catch (e) {
@@ -94,4 +88,9 @@ export async function runDueForRequest(req: NextRequest): Promise<DueRunResult[]
     }
   }
   return results;
+}
+
+/** "Run due reports now": the signed-in user's current company, with that user's permissions. */
+export async function runDueForUser(ctx: ServiceContext): Promise<DueRunResult[]> {
+  return runDueSchedules(ctx, { outDir: await companyExportDir(ctx) });
 }
