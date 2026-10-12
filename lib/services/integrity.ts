@@ -327,6 +327,7 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_jel_balanced: 'Posted entries must balance (checked at commit, lines)',
   bka_je_balanced: 'Posted entries must balance (checked at commit, headers)',
   bka_jel_guard: 'Posted journal lines are immutable',
+  bka_jel_fx_guard: 'The foreign amount of a posted line cannot be changed (p1 fx, 0043)',
   bka_je_guard: 'Posted journal entries cannot be deleted, re-dated or un-voided',
   bka_jel_sync_ins: 'Account balances follow new journal lines',
   bka_jel_sync_upd: 'Account balances follow changed journal lines',
