@@ -52,6 +52,7 @@ import {
   journalEntries,
   journalEntryLines,
   taxRates,
+  creditApplications,
 } from '@/lib/db/schema';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
@@ -111,6 +112,9 @@ export interface CreateCreditMemoInput {
   /** Memo-level tax rate (UUID of a taxRates row); if absent no tax is credited back. */
   taxRateId?: string | null;
   memo?: string | null;
+  /** wave2 sales (C7): queue for batch printing / emailing. */
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 export interface ApplyToInvoiceInput {
@@ -118,6 +122,9 @@ export interface ApplyToInvoiceInput {
   invoiceId: string;
   /** Amount to apply (must be <= unapplied and <= invoice.balanceDue). */
   amount: string | number;
+  /** wave2 sales (C4): the received payment this credit was applied with (undone with it). */
+  paymentId?: string | null;
+  date?: Date | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +192,8 @@ async function restockUnitCost(
 // createCreditMemo
 // ---------------------------------------------------------------------------
 
-export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInput) {
+/** Validate a credit memo input and compute every amount/account (read-only). */
+async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInput) {
   // Validate lines
   if (!input.lines || input.lines.length === 0) {
     throw validation('A credit memo must have at least one line.');
@@ -266,8 +274,10 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
 
   for (let i = 0; i < input.lines.length; i++) {
     const l = input.lines[i];
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
 
@@ -303,8 +313,8 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
       itemId: l.itemId ?? null,
       accountId: resolvedAccountId,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       taxable,
       restock: l.restock !== false, // default true (returned to stock)
@@ -318,13 +328,231 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
     throw validation('Credit memo total must be greater than zero.');
   }
 
+  return {
+    arAccountId,
+    defaultIncomeId,
+    taxPayableId,
+    itemMap,
+    computedLines,
+    subtotal,
+    taxAmount,
+    total,
+  };
+}
+
+type PreparedCreditMemo = Awaited<ReturnType<typeof prepareCreditMemo>>;
+
+/**
+ * Insert the memo lines and post everything a saved credit memo posts: the A/R credit entry,
+ * restock (COGS-reversal) entries and site movements. Shared by create and edit (C1).
+ */
+async function postCreditMemoDocument(
+  tx: ServiceContext,
+  memo: { id: string; memoNumber: number; refNumber?: string | null },
+  input: CreateCreditMemoInput,
+  prep: PreparedCreditMemo,
+) {
+  const { arAccountId, taxPayableId, itemMap, computedLines, subtotal, taxAmount, total } = prep;
+  // The number shown on the GL: the typed ref number, else the legacy integer.
+  const shownNumber = docRef(memo.refNumber ?? null, memo.memoNumber);
+  // 2) Insert credit memo lines (returning ids so restock entries can reference them)
+  const insertedLines = await tx.db
+    .insert(creditMemoLines)
+    .values(
+      computedLines.map((cl) => ({
+        creditMemoId: memo.id,
+        itemId: cl.itemId,
+        accountId: cl.accountId,
+        description: cl.description,
+        quantity: cl.quantity,
+        rate: cl.rate,
+        amount: cl.amount,
+        lineOrder: cl.lineOrder,
+        taxable: cl.taxable,
+        restock: cl.restock,
+      })),
+    )
+    .returning();
+  insertedLines.sort((a, b) => a.lineOrder - b.lineOrder);
+
+  // 3) Build and post the GL entry — the exact reverse of an invoice posting:
+  //
+  //    Dr each income account for line amounts (sum per account)
+  //    Dr 2200 Sales Tax Payable for taxAmount (returns tax to the customer)
+  //    Cr 1200 A/R for total
+  //
+  // entryBase = subtotal + taxAmount = total; both sides are penny-allocated
+  // against the same anchor so rounding can never unbalance the entry.
+  const entryBase = Money.round2(subtotal.plus(taxAmount));
+
+  const incomeDebits = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const cl of computedLines) {
+    const prev = incomeDebits.get(cl.accountId) ?? Money.zero();
+    incomeDebits.set(cl.accountId, prev.plus(Money.of(cl.amount)));
+  }
+
+  const debitSpecs: Array<{
+    accountId: string;
+    weight: ReturnType<typeof Money.zero>;
+    memo: string;
+  }> = [];
+  for (const [acctId, amount] of incomeDebits) {
+    debitSpecs.push({
+      accountId: acctId,
+      weight: amount,
+      memo: `Credit Memo #${shownNumber} — income reversal`,
+    });
+  }
+  if (taxAmount.greaterThan(0) && taxPayableId) {
+    debitSpecs.push({
+      accountId: taxPayableId,
+      weight: taxAmount,
+      memo: `Credit Memo #${shownNumber} — sales tax reversal`,
+    });
+  }
+  const creditSpecs: Array<{
+    accountId: string;
+    weight: ReturnType<typeof Money.zero>;
+    memo: string;
+  }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${shownNumber}` }];
+
+  const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
+  const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
+
+  const postingLines: Array<{
+    accountId: string;
+    debit?: string;
+    credit?: string;
+    memo?: string;
+    controlLine?: boolean;
+  }> = [];
+  debitSpecs.forEach((s, i) => {
+    if (debitAlloc[i].greaterThan(0)) {
+      postingLines.push({ accountId: s.accountId, debit: toAmountString(debitAlloc[i]), memo: s.memo });
+    }
+  });
+  creditSpecs.forEach((s, i) => {
+    if (creditAlloc[i].greaterThan(0)) {
+      // The only credit spec is the memo's own A/R line (posting.ts PostingLine.controlLine).
+      postingLines.push({
+        accountId: s.accountId,
+        credit: toAmountString(creditAlloc[i]),
+        memo: s.memo,
+        controlLine: true,
+      });
+    }
+  });
+
+  const entry = await postJournalEntry(tx, {
+    date: input.date,
+    description: `Credit Memo #${shownNumber}`,
+    reference: shownNumber,
+    sourceRef: `credit_memo:${memo.id}`,
+    lines: postingLines,
+  });
+
+  // 4) Restock inventory + reverse COGS for inventory-item lines marked restock.
+  //
+  //   Dr <inventory asset>  qty x unit cost
+  //   Cr 5000 COGS          qty x unit cost
+  //
+  // Each entry is tagged sourceRef "creditmemo-cogs:<memoId>" with
+  // reference = the memo line id so voidCreditMemo can find it, reverse the
+  // GL, and pull the stock back out. FIFO items additionally get a NEW layer
+  // at the restock unit cost (mirrors voidSalesReceipt's restore pattern).
+  const restockEntries: Array<{ entryId: string; lineId: string; itemId: string; cost: string }> = [];
+  for (let i = 0; i < insertedLines.length; i++) {
+    const line = insertedLines[i];
+    const cl = computedLines[i];
+    if (!line.itemId || !cl.restock) continue;
+    const meta = itemMap.get(line.itemId);
+    if (!meta || meta.type !== 'inventory') continue;
+
+    const qty = Money.of(line.quantity);
+    const fifoTracked = await isFifoTracked(tx, line.itemId);
+    const unitCost = await restockUnitCost(tx, meta, fifoTracked);
+    const cost = Money.round2(qty.times(unitCost));
+
+    // Reverse COGS only when there is a real cost (postJournalEntry rejects $0 entries).
+    if (cost.greaterThan(0)) {
+      const inventoryAccountId = meta.assetAccountId ?? (await accountIdByCode(tx, '1300'));
+      const cogsAccountId = await accountIdByCode(tx, '5000');
+      const restockEntry = await postJournalEntry(tx, {
+        date: input.date,
+        description: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
+        reference: line.id,
+        sourceRef: `creditmemo-cogs:${memo.id}`,
+        lines: [
+          {
+            accountId: inventoryAccountId,
+            debit: toAmountString(cost),
+            memo: `Credit Memo #${shownNumber} — restock (${meta.name})`,
+          },
+          {
+            accountId: cogsAccountId,
+            credit: toAmountString(cost),
+            memo: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
+          },
+        ],
+      });
+      restockEntries.push({ entryId: restockEntry.id, lineId: line.id, itemId: line.itemId, cost: toAmountString(cost) });
+    }
+
+    // FIFO items: restore stock value as a new layer at the restock cost.
+    if (fifoTracked) {
+      await tx.db.insert(inventoryLayers).values({
+        companyId: tx.companyId,
+        itemId: line.itemId,
+        date: input.date,
+        quantityRemaining: qty.toFixed(4),
+        unitCost: unitCost.toFixed(4),
+      });
+    }
+
+    // Both costing methods: put the quantity back on hand.
+    await tx.db
+      .update(items)
+      .set({
+        quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) + ${qty.toFixed(4)}`,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+  }
+
+  // 4b) Advanced Inventory: restocked units go back to the chosen site/bin (with their
+  //     serial/lot identity). Damaged (restock=false) lines move no stock.
+  await postDocumentInventory(tx, {
+    sourceType: 'credit_memo',
+    sourceId: memo.id,
+    date: input.date,
+    direction: 'in',
+    lines: insertedLines.map((line) => {
+      const src = input.lines[line.lineOrder];
+      return {
+        lineOrder: line.lineOrder,
+        itemId: line.itemId,
+        quantity: line.quantity,
+        siteId: src?.siteId,
+        binId: src?.binId,
+        serialNumbers: src?.serialNumbers,
+        lotNumber: src?.lotNumber,
+        lotExpiration: src?.lotExpiration,
+      };
+    }),
+    movingLineOrders: computedLines.filter((cl) => cl.restock).map((cl) => cl.lineOrder),
+    memo: `Credit Memo #${shownNumber}`,
+  });
+
+  return { insertedLines, entry, restockEntries };
+}
+
+export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInput) {
+  const prep = await prepareCreditMemo(ctx, input);
+  const { subtotal, taxAmount, total } = prep;
   return inTransaction(ctx, async (tx) => {
     const { refNumber, number: memoNumber } = await allocateDocNumber(tx, 'credit_memo', input.refNumber, {
       allowDuplicate: input.allowDuplicateNumber === true,
     });
-    // The number shown on the GL: the typed ref number, else the legacy integer.
-    const shownNumber = docRef(refNumber, memoNumber);
-
     // 1) Insert credit memo header
     const [memo] = await tx.db
       .insert(creditMemos)
@@ -340,194 +568,18 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         total: toAmountString(total),
         unapplied: toAmountString(total),
         memo: input.memo ?? null,
+        taxRateId: input.taxRateId ?? null,
+        toBePrinted: input.toBePrinted ?? false,
+        toBeEmailed: input.toBeEmailed ?? false,
       })
       .returning();
 
-    // 2) Insert credit memo lines (returning ids so restock entries can reference them)
-    const insertedLines = await tx.db
-      .insert(creditMemoLines)
-      .values(
-        computedLines.map((cl) => ({
-          creditMemoId: memo.id,
-          itemId: cl.itemId,
-          accountId: cl.accountId,
-          description: cl.description,
-          quantity: cl.quantity,
-          rate: cl.rate,
-          amount: cl.amount,
-          lineOrder: cl.lineOrder,
-        })),
-      )
-      .returning();
-    insertedLines.sort((a, b) => a.lineOrder - b.lineOrder);
-
-    // 3) Build and post the GL entry — the exact reverse of an invoice posting:
-    //
-    //    Dr each income account for line amounts (sum per account)
-    //    Dr 2200 Sales Tax Payable for taxAmount (returns tax to the customer)
-    //    Cr 1200 A/R for total
-    //
-    // entryBase = subtotal + taxAmount = total; both sides are penny-allocated
-    // against the same anchor so rounding can never unbalance the entry.
-    const entryBase = Money.round2(subtotal.plus(taxAmount));
-
-    const incomeDebits = new Map<string, ReturnType<typeof Money.zero>>();
-    for (const cl of computedLines) {
-      const prev = incomeDebits.get(cl.accountId) ?? Money.zero();
-      incomeDebits.set(cl.accountId, prev.plus(Money.of(cl.amount)));
-    }
-
-    const debitSpecs: Array<{
-      accountId: string;
-      weight: ReturnType<typeof Money.zero>;
-      memo: string;
-    }> = [];
-    for (const [acctId, amount] of incomeDebits) {
-      debitSpecs.push({
-        accountId: acctId,
-        weight: amount,
-        memo: `Credit Memo #${shownNumber} — income reversal`,
-      });
-    }
-    if (taxAmount.greaterThan(0) && taxPayableId) {
-      debitSpecs.push({
-        accountId: taxPayableId,
-        weight: taxAmount,
-        memo: `Credit Memo #${shownNumber} — sales tax reversal`,
-      });
-    }
-    const creditSpecs: Array<{
-      accountId: string;
-      weight: ReturnType<typeof Money.zero>;
-      memo: string;
-    }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${shownNumber}` }];
-
-    const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
-    const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
-
-    const postingLines: Array<{
-      accountId: string;
-      debit?: string;
-      credit?: string;
-      memo?: string;
-      controlLine?: boolean;
-    }> = [];
-    debitSpecs.forEach((s, i) => {
-      if (debitAlloc[i].greaterThan(0)) {
-        postingLines.push({ accountId: s.accountId, debit: toAmountString(debitAlloc[i]), memo: s.memo });
-      }
-    });
-    creditSpecs.forEach((s, i) => {
-      if (creditAlloc[i].greaterThan(0)) {
-        // The only credit spec is the memo's own A/R line (posting.ts PostingLine.controlLine).
-        postingLines.push({
-          accountId: s.accountId,
-          credit: toAmountString(creditAlloc[i]),
-          memo: s.memo,
-          controlLine: true,
-        });
-      }
-    });
-
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: `Credit Memo #${shownNumber}`,
-      reference: shownNumber,
-      sourceRef: `credit_memo:${memo.id}`,
-      lines: postingLines,
-    });
-
-    // 4) Restock inventory + reverse COGS for inventory-item lines marked restock.
-    //
-    //   Dr <inventory asset>  qty x unit cost
-    //   Cr 5000 COGS          qty x unit cost
-    //
-    // Each entry is tagged sourceRef "creditmemo-cogs:<memoId>" with
-    // reference = the memo line id so voidCreditMemo can find it, reverse the
-    // GL, and pull the stock back out. FIFO items additionally get a NEW layer
-    // at the restock unit cost (mirrors voidSalesReceipt's restore pattern).
-    const restockEntries: Array<{ entryId: string; lineId: string; itemId: string; cost: string }> = [];
-    for (let i = 0; i < insertedLines.length; i++) {
-      const line = insertedLines[i];
-      const cl = computedLines[i];
-      if (!line.itemId || !cl.restock) continue;
-      const meta = itemMap.get(line.itemId);
-      if (!meta || meta.type !== 'inventory') continue;
-
-      const qty = Money.of(line.quantity);
-      const fifoTracked = await isFifoTracked(tx, line.itemId);
-      const unitCost = await restockUnitCost(tx, meta, fifoTracked);
-      const cost = Money.round2(qty.times(unitCost));
-
-      // Reverse COGS only when there is a real cost (postJournalEntry rejects $0 entries).
-      if (cost.greaterThan(0)) {
-        const inventoryAccountId = meta.assetAccountId ?? (await accountIdByCode(tx, '1300'));
-        const cogsAccountId = await accountIdByCode(tx, '5000');
-        const restockEntry = await postJournalEntry(tx, {
-          date: input.date,
-          description: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
-          reference: line.id,
-          sourceRef: `creditmemo-cogs:${memo.id}`,
-          lines: [
-            {
-              accountId: inventoryAccountId,
-              debit: toAmountString(cost),
-              memo: `Credit Memo #${shownNumber} — restock (${meta.name})`,
-            },
-            {
-              accountId: cogsAccountId,
-              credit: toAmountString(cost),
-              memo: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
-            },
-          ],
-        });
-        restockEntries.push({ entryId: restockEntry.id, lineId: line.id, itemId: line.itemId, cost: toAmountString(cost) });
-      }
-
-      // FIFO items: restore stock value as a new layer at the restock cost.
-      if (fifoTracked) {
-        await tx.db.insert(inventoryLayers).values({
-          companyId: tx.companyId,
-          itemId: line.itemId,
-          date: input.date,
-          quantityRemaining: qty.toFixed(4),
-          unitCost: unitCost.toFixed(4),
-        });
-      }
-
-      // Both costing methods: put the quantity back on hand.
-      await tx.db
-        .update(items)
-        .set({
-          quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) + ${qty.toFixed(4)}`,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
-    }
-
-    // 4b) Advanced Inventory: restocked units go back to the chosen site/bin (with their
-    //     serial/lot identity). Damaged (restock=false) lines move no stock.
-    await postDocumentInventory(tx, {
-      sourceType: 'credit_memo',
-      sourceId: memo.id,
-      date: input.date,
-      direction: 'in',
-      lines: insertedLines.map((line) => {
-        const src = input.lines[line.lineOrder];
-        return {
-          lineOrder: line.lineOrder,
-          itemId: line.itemId,
-          quantity: line.quantity,
-          siteId: src?.siteId,
-          binId: src?.binId,
-          serialNumbers: src?.serialNumbers,
-          lotNumber: src?.lotNumber,
-          lotExpiration: src?.lotExpiration,
-        };
-      }),
-      movingLineOrders: computedLines.filter((cl) => cl.restock).map((cl) => cl.lineOrder),
-      memo: `Credit Memo #${shownNumber}`,
-    });
+    const { insertedLines, entry, restockEntries } = await postCreditMemoDocument(
+      tx,
+      memo,
+      input,
+      prep,
+    );
 
     // 5) Stamp postedEntryId
     const [updated] = await tx.db
@@ -639,7 +691,8 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
     throw new ServiceError('CONFLICT', 'Cannot apply credit to a voided invoice.');
   }
   if (invoice.status === 'draft') {
-    throw new ServiceError('CONFLICT', 'Cannot apply credit to a pending (draft) invoice — post it first.');
+    // A pending invoice posted nothing to A/R, so a credit applied to it would relieve nothing.
+    throw new ServiceError('VALIDATION', 'This invoice is still a draft. Post it before applying a credit to it.');
   }
   if (invoice.customerId !== memo.customerId) {
     throw new ServiceError(
@@ -675,6 +728,19 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
       .where(eq(creditMemos.id, memo.id))
       .returning();
 
+    // wave2 sales: remember the application so it can be listed and undone.
+    const [application] = await tx.db
+      .insert(creditApplications)
+      .values({
+        companyId: tx.companyId,
+        creditMemoId: memo.id,
+        invoiceId: invoice.id,
+        paymentId: input.paymentId ?? null,
+        amount: toAmountString(amount),
+        date: input.date ?? new Date(),
+      })
+      .returning();
+
     await writeAudit(tx, {
       action: 'update',
       entityType: 'credit_memo',
@@ -685,10 +751,81 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
         status: newMemoStatus,
         appliedToInvoice: invoice.id,
         amountApplied: toAmountString(amount),
+        paymentId: input.paymentId ?? null,
+        creditApplicationId: application.id,
       },
     });
 
-    return { creditMemo: updatedMemo, invoice: updatedInvoice };
+    return { creditMemo: updatedMemo, invoice: updatedInvoice, application };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Credit applications (wave2 sales, C4): list / undo
+// ---------------------------------------------------------------------------
+
+export async function listCreditApplications(
+  ctx: ServiceContext,
+  opts: { creditMemoId?: string; invoiceId?: string; paymentId?: string },
+) {
+  const conds = [eq(creditApplications.companyId, ctx.companyId)];
+  if (opts.creditMemoId) conds.push(eq(creditApplications.creditMemoId, opts.creditMemoId));
+  if (opts.invoiceId) conds.push(eq(creditApplications.invoiceId, opts.invoiceId));
+  if (opts.paymentId) conds.push(eq(creditApplications.paymentId, opts.paymentId));
+  return ctx.db
+    .select({
+      id: creditApplications.id,
+      creditMemoId: creditApplications.creditMemoId,
+      invoiceId: creditApplications.invoiceId,
+      paymentId: creditApplications.paymentId,
+      amount: creditApplications.amount,
+      date: creditApplications.date,
+      memoNumber: creditMemos.memoNumber,
+      invoiceNumber: invoices.invoiceNumber,
+    })
+    .from(creditApplications)
+    .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
+    .innerJoin(invoices, eq(invoices.id, creditApplications.invoiceId))
+    .where(and(...conds))
+    .orderBy(asc(creditApplications.createdAt));
+}
+
+/**
+ * Undo one credit application: the invoice's balance comes back and the credit is available
+ * again. No GL entry (applying posted none either — the memo credited A/R when it was saved).
+ */
+export async function unapplyCreditApplication(ctx: ServiceContext, applicationId: string) {
+  const [app] = await ctx.db
+    .select()
+    .from(creditApplications)
+    .where(and(eq(creditApplications.companyId, ctx.companyId), eq(creditApplications.id, applicationId)));
+  if (!app) throw notFound('Credit application');
+
+  return inTransaction(ctx, async (tx) => {
+    const [memo] = await tx.db
+      .select()
+      .from(creditMemos)
+      .where(and(eq(creditMemos.companyId, tx.companyId), eq(creditMemos.id, app.creditMemoId)));
+    if (!memo) throw notFound('Credit memo');
+    const amount = Money.of(app.amount);
+
+    await markPaidAmount(tx, app.invoiceId, toAmountString(amount.negated()));
+    const newUnapplied = Money.round2(Money.of(memo.unapplied).plus(amount));
+    const [updatedMemo] = await tx.db
+      .update(creditMemos)
+      .set({ unapplied: toAmountString(newUnapplied), status: 'open' })
+      .where(eq(creditMemos.id, memo.id))
+      .returning();
+    await tx.db.delete(creditApplications).where(eq(creditApplications.id, app.id));
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'credit_memo',
+      entityId: memo.id,
+      oldValues: { unapplied: memo.unapplied, appliedToInvoice: app.invoiceId, amountApplied: app.amount },
+      newValues: { action: 'unapply', unapplied: toAmountString(newUnapplied), invoiceId: app.invoiceId },
+    });
+    return updatedMemo;
   });
 }
 
@@ -816,6 +953,145 @@ export async function refundCreditMemo(ctx: ServiceContext, input: RefundCreditM
 // ---------------------------------------------------------------------------
 
 /**
+ * Reverse everything a saved credit memo posted: every restock (COGS-reversal) entry with the
+ * restocked quantity pulled back out of stock/sites, then the main A/R entry. Used by void and
+ * by edit (C1, before re-posting). Refuses when restocked units have since been sold.
+ */
+async function reverseCreditMemoPostings(
+  tx: ServiceContext,
+  memo: { id: string; postedEntryId: string | null },
+) {
+  const lines = await tx.db
+    .select()
+    .from(creditMemoLines)
+    .where(eq(creditMemoLines.creditMemoId, memo.id));
+  const lineById = new Map(lines.map((l) => [l.id, l]));
+
+  // Find all restock (COGS-reversal) entries tagged against this memo
+  // (reference = memo line id).
+  const restockJEs = await tx.db
+    .select({
+      id: journalEntries.id,
+      reference: journalEntries.reference,
+      status: journalEntries.status,
+    })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, tx.companyId),
+        eq(journalEntries.sourceRef, `creditmemo-cogs:${memo.id}`),
+        memo.postedEntryId ? ne(journalEntries.id, memo.postedEntryId) : undefined,
+      ),
+    );
+
+  // Pre-check stock: every restocked quantity must still be on hand, or the
+  // void would drive quantityOnHand negative.
+  const removeQtyByItem = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const je of restockJEs) {
+    if (je.status !== 'posted') continue;
+    const line = je.reference ? lineById.get(je.reference) : undefined;
+    if (!line?.itemId) continue;
+    const prev = removeQtyByItem.get(line.itemId) ?? Money.zero();
+    removeQtyByItem.set(line.itemId, prev.plus(Money.of(line.quantity)));
+  }
+  for (const [itemId, qty] of removeQtyByItem) {
+    const [itemRow] = await tx.db
+      .select({ name: items.name, quantityOnHand: items.quantityOnHand })
+      .from(items)
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, itemId)));
+    const onHand = Money.of(itemRow?.quantityOnHand ?? '0');
+    if (qty.greaterThan(onHand)) {
+      throw new ServiceError(
+        'CONFLICT',
+        `Cannot void: restocked item "${itemRow?.name ?? itemId}" has since been sold ` +
+          `(need ${qty.toFixed(4)} on hand to remove, only ${onHand.toFixed(4)} available).`,
+      );
+    }
+  }
+
+  // Reverse each restock entry and pull the stock back out.
+  const reversedLineOrders: number[] = [];
+  for (const je of restockJEs) {
+    if (je.status !== 'posted') continue;
+    const line = je.reference ? lineById.get(je.reference) : undefined;
+    if (line) reversedLineOrders.push(line.lineOrder);
+
+    // Reverse the GL first (Cr Inventory / Dr COGS via balance-delta reversal).
+    await voidJournalEntry(tx, je.id);
+
+    if (!line?.itemId) continue; // defensive: entry not tied to an inventory line
+
+    const qty = Money.of(line.quantity);
+
+    // Restock cost = the entry's total debits (the inventory side); its
+    // unit cost identifies the layer the restock created.
+    const entryLines = await tx.db
+      .select({ debit: journalEntryLines.debit })
+      .from(journalEntryLines)
+      .where(eq(journalEntryLines.journalEntryId, je.id));
+    const cost = entryLines.reduce((s, l) => s.plus(Money.of(l.debit)), Money.zero());
+    const unitCost = qty.isZero() ? Money.zero() : cost.dividedBy(qty);
+
+    if (await isFifoTracked(tx, line.itemId)) {
+      // Deplete layers, preferring the exact layer the restock created
+      // (matching unit cost), then oldest-first for any remainder.
+      const layers = await tx.db
+        .select()
+        .from(inventoryLayers)
+        .where(
+          and(
+            eq(inventoryLayers.companyId, tx.companyId),
+            eq(inventoryLayers.itemId, line.itemId),
+          ),
+        )
+        .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt));
+      const available = layers.filter((l) => Money.of(l.quantityRemaining).greaterThan(0));
+      const target = unitCost.toFixed(4);
+      available.sort((a, b) => {
+        const aMatch = a.unitCost === target ? 0 : 1;
+        const bMatch = b.unitCost === target ? 0 : 1;
+        return aMatch - bMatch;
+      });
+
+      let remaining = qty;
+      for (const layer of available) {
+        if (remaining.lessThanOrEqualTo(0)) break;
+        const layerQty = Money.of(layer.quantityRemaining);
+        const take = remaining.lessThanOrEqualTo(layerQty) ? remaining : layerQty;
+        await tx.db
+          .update(inventoryLayers)
+          .set({ quantityRemaining: layerQty.minus(take).toFixed(4) })
+          .where(eq(inventoryLayers.id, layer.id));
+        remaining = remaining.minus(take);
+      }
+      if (remaining.greaterThan(0)) {
+        throw new ServiceError(
+          'CONFLICT',
+          `Cannot void: insufficient FIFO layers to remove ${qty.toFixed(4)} restocked units.`,
+        );
+      }
+    }
+
+    // Both costing methods: take the quantity back off hand.
+    await tx.db
+      .update(items)
+      .set({
+        quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) - ${qty.toFixed(4)}`,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+  }
+
+  // Pull the same units back out of the site/bin they were restocked to.
+  await reverseDocumentInventory(tx, 'credit_memo', memo.id, { lineOrders: reversedLineOrders });
+
+  // Reverse the main credit memo entry.
+  if (memo.postedEntryId) {
+    await voidJournalEntry(tx, memo.postedEntryId);
+  }
+}
+
+/**
  * Void a credit memo: reverse the main GL entry, reverse every restock
  * (COGS-reversal) entry, and pull the restocked quantity back out of stock.
  *
@@ -854,134 +1130,7 @@ export async function voidCreditMemo(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
-    const lines = await tx.db
-      .select()
-      .from(creditMemoLines)
-      .where(eq(creditMemoLines.creditMemoId, id));
-    const lineById = new Map(lines.map((l) => [l.id, l]));
-
-    // Find all restock (COGS-reversal) entries tagged against this memo
-    // (reference = memo line id).
-    const restockJEs = await tx.db
-      .select({
-        id: journalEntries.id,
-        reference: journalEntries.reference,
-        status: journalEntries.status,
-      })
-      .from(journalEntries)
-      .where(
-        and(
-          eq(journalEntries.companyId, tx.companyId),
-          eq(journalEntries.sourceRef, `creditmemo-cogs:${id}`),
-          memo.postedEntryId ? ne(journalEntries.id, memo.postedEntryId) : undefined,
-        ),
-      );
-
-    // Pre-check stock: every restocked quantity must still be on hand, or the
-    // void would drive quantityOnHand negative.
-    const removeQtyByItem = new Map<string, ReturnType<typeof Money.zero>>();
-    for (const je of restockJEs) {
-      if (je.status !== 'posted') continue;
-      const line = je.reference ? lineById.get(je.reference) : undefined;
-      if (!line?.itemId) continue;
-      const prev = removeQtyByItem.get(line.itemId) ?? Money.zero();
-      removeQtyByItem.set(line.itemId, prev.plus(Money.of(line.quantity)));
-    }
-    for (const [itemId, qty] of removeQtyByItem) {
-      const [itemRow] = await tx.db
-        .select({ name: items.name, quantityOnHand: items.quantityOnHand })
-        .from(items)
-        .where(and(eq(items.companyId, tx.companyId), eq(items.id, itemId)));
-      const onHand = Money.of(itemRow?.quantityOnHand ?? '0');
-      if (qty.greaterThan(onHand)) {
-        throw new ServiceError(
-          'CONFLICT',
-          `Cannot void: restocked item "${itemRow?.name ?? itemId}" has since been sold ` +
-            `(need ${qty.toFixed(4)} on hand to remove, only ${onHand.toFixed(4)} available).`,
-        );
-      }
-    }
-
-    // Reverse each restock entry and pull the stock back out.
-    const reversedLineOrders: number[] = [];
-    for (const je of restockJEs) {
-      if (je.status !== 'posted') continue;
-      const line = je.reference ? lineById.get(je.reference) : undefined;
-      if (line) reversedLineOrders.push(line.lineOrder);
-
-      // Reverse the GL first (Cr Inventory / Dr COGS via balance-delta reversal).
-      await voidJournalEntry(tx, je.id);
-
-      if (!line?.itemId) continue; // defensive: entry not tied to an inventory line
-
-      const qty = Money.of(line.quantity);
-
-      // Restock cost = the entry's total debits (the inventory side); its
-      // unit cost identifies the layer the restock created.
-      const entryLines = await tx.db
-        .select({ debit: journalEntryLines.debit })
-        .from(journalEntryLines)
-        .where(eq(journalEntryLines.journalEntryId, je.id));
-      const cost = entryLines.reduce((s, l) => s.plus(Money.of(l.debit)), Money.zero());
-      const unitCost = qty.isZero() ? Money.zero() : cost.dividedBy(qty);
-
-      if (await isFifoTracked(tx, line.itemId)) {
-        // Deplete layers, preferring the exact layer the restock created
-        // (matching unit cost), then oldest-first for any remainder.
-        const layers = await tx.db
-          .select()
-          .from(inventoryLayers)
-          .where(
-            and(
-              eq(inventoryLayers.companyId, tx.companyId),
-              eq(inventoryLayers.itemId, line.itemId),
-            ),
-          )
-          .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt));
-        const available = layers.filter((l) => Money.of(l.quantityRemaining).greaterThan(0));
-        const target = unitCost.toFixed(4);
-        available.sort((a, b) => {
-          const aMatch = a.unitCost === target ? 0 : 1;
-          const bMatch = b.unitCost === target ? 0 : 1;
-          return aMatch - bMatch;
-        });
-
-        let remaining = qty;
-        for (const layer of available) {
-          if (remaining.lessThanOrEqualTo(0)) break;
-          const layerQty = Money.of(layer.quantityRemaining);
-          const take = remaining.lessThanOrEqualTo(layerQty) ? remaining : layerQty;
-          await tx.db
-            .update(inventoryLayers)
-            .set({ quantityRemaining: layerQty.minus(take).toFixed(4) })
-            .where(eq(inventoryLayers.id, layer.id));
-          remaining = remaining.minus(take);
-        }
-        if (remaining.greaterThan(0)) {
-          throw new ServiceError(
-            'CONFLICT',
-            `Cannot void: insufficient FIFO layers to remove ${qty.toFixed(4)} restocked units.`,
-          );
-        }
-      }
-
-      // Both costing methods: take the quantity back off hand.
-      await tx.db
-        .update(items)
-        .set({
-          quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) - ${qty.toFixed(4)}`,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
-    }
-
-    // Pull the same units back out of the site/bin they were restocked to.
-    await reverseDocumentInventory(tx, 'credit_memo', id, { lineOrders: reversedLineOrders });
-
-    // Reverse the main credit memo entry.
-    if (memo.postedEntryId) {
-      await voidJournalEntry(tx, memo.postedEntryId);
-    }
+    await reverseCreditMemoPostings(tx, memo);
 
     const [updated] = await tx.db
       .update(creditMemos)
@@ -998,5 +1147,127 @@ export async function voidCreditMemo(ctx: ServiceContext, id: string) {
     });
 
     return updated;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// updateCreditMemo (wave2 sales, C1 — edit a saved credit memo)
+// ---------------------------------------------------------------------------
+
+/**
+ * Edit a saved credit memo in place (QB "edit any saved transaction").
+ *
+ * Sanctioned void/repost pattern, all inside ONE transaction: reverse every posting of the
+ * old version (restock entries + stock, then the A/R entry — the closing-date check runs on the
+ * old date), replace the lines, re-post from the new lines (closing-date check on the new date),
+ * and audit old + new values. memoNumber and createdAt are preserved.
+ *
+ * Credit already used (applied to invoices or refunded) stays used, so the edit must keep it
+ * valid: same customer, and the new total cannot drop below what has been used.
+ */
+export async function updateCreditMemo(
+  ctx: ServiceContext,
+  id: string,
+  input: CreateCreditMemoInput,
+) {
+  const [existing] = await ctx.db
+    .select()
+    .from(creditMemos)
+    .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.id, id)));
+  if (!existing) throw notFound('Credit memo');
+  if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided credit memo.');
+
+  const prep = await prepareCreditMemo(ctx, input);
+
+  return inTransaction(ctx, async (tx) => {
+    const [memo] = await tx.db
+      .select()
+      .from(creditMemos)
+      .where(and(eq(creditMemos.companyId, tx.companyId), eq(creditMemos.id, id)));
+    if (!memo || memo.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Cannot edit a voided credit memo.');
+    }
+    const used = Money.round2(Money.of(memo.total).minus(Money.of(memo.unapplied)));
+    if (used.greaterThan(0)) {
+      if (input.customerId !== memo.customerId) {
+        throw new ServiceError(
+          'CONFLICT',
+          'Part of this credit has already been used, so its customer cannot be changed. Unapply the credit first.',
+        );
+      }
+      if (prep.total.lessThan(used)) {
+        throw new ServiceError(
+          'CONFLICT',
+          `${toAmountString(used)} of this credit has already been applied or refunded, so the new total (${toAmountString(prep.total)}) cannot be less than that. Unapply some of the credit first.`,
+        );
+      }
+    }
+
+    const oldLines = await tx.db
+      .select()
+      .from(creditMemoLines)
+      .where(eq(creditMemoLines.creditMemoId, id))
+      .orderBy(asc(creditMemoLines.lineOrder));
+
+    // 1) Reverse the old version's postings (restock + A/R entry).
+    await reverseCreditMemoPostings(tx, memo);
+
+    // 2) Replace lines and re-post.
+    await tx.db.delete(creditMemoLines).where(eq(creditMemoLines.creditMemoId, id));
+    const { insertedLines, entry, restockEntries } = await postCreditMemoDocument(
+      tx,
+      { id, memoNumber: memo.memoNumber, refNumber: memo.refNumber },
+      input,
+      prep,
+    );
+
+    const newUnapplied = Money.round2(prep.total.minus(used));
+    const [updated] = await tx.db
+      .update(creditMemos)
+      .set({
+        customerId: input.customerId,
+        date: input.date,
+        subtotal: toAmountString(prep.subtotal),
+        taxAmount: toAmountString(prep.taxAmount),
+        total: toAmountString(prep.total),
+        unapplied: toAmountString(newUnapplied),
+        status: newUnapplied.isZero() ? 'paid' : 'open',
+        memo: input.memo ?? null,
+        taxRateId: input.taxRateId ?? null,
+        toBePrinted: input.toBePrinted ?? memo.toBePrinted,
+        toBeEmailed: input.toBeEmailed ?? memo.toBeEmailed,
+        postedEntryId: entry.id,
+      })
+      .where(eq(creditMemos.id, id))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'credit_memo',
+      entityId: id,
+      oldValues: {
+        customerId: memo.customerId,
+        date: memo.date,
+        subtotal: memo.subtotal,
+        taxAmount: memo.taxAmount,
+        total: memo.total,
+        unapplied: memo.unapplied,
+        postedEntryId: memo.postedEntryId,
+        lines: oldLines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),
+      },
+      newValues: {
+        customerId: input.customerId,
+        date: input.date,
+        subtotal: toAmountString(prep.subtotal),
+        taxAmount: toAmountString(prep.taxAmount),
+        total: toAmountString(prep.total),
+        unapplied: toAmountString(newUnapplied),
+        postedEntryId: entry.id,
+        restockEntries,
+        lines: prep.computedLines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),
+      },
+    });
+
+    return { ...updated, lines: insertedLines };
   });
 }

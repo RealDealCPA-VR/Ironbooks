@@ -3,6 +3,7 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
+import { sendFlagFields } from './sales';
 
 export const estimateLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -24,5 +25,6 @@ export const createEstimateSchema = z.object({
   taxRateId: zUuid.nullish(),
   memo: z.string().nullish(),
   lines: zLines(estimateLineSchema),
+  ...sendFlagFields,
 });
 export type CreateEstimateBody = z.infer<typeof createEstimateSchema>;

@@ -23,6 +23,8 @@ import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
 import { PackageCheck, FileInput, SlidersHorizontal } from 'lucide-react';
 // wave-2 lists: Lists hub, To Do, Add/Edit Multiple, Clean Up, Inventory Center
 import { ClipboardCheck, Table2, Eraser } from 'lucide-react';
+// wave2 sales: Income Tracker, Collections Center, Batch Invoicing
+import { TrendingUp, PhoneCall } from 'lucide-react';
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -51,6 +53,9 @@ export const navGroups: NavGroup[] = [
       { icon: RotateCcw, label: 'Credit Memos', path: '/credit-memos' },
       { icon: Users, label: 'Customers', path: '/customers' },
       { icon: Percent, label: 'Finance Charges', path: '/finance-charges' },
+      { icon: TrendingUp, label: 'Income Tracker', path: '/income-tracker' },
+      { icon: PhoneCall, label: 'Collections Center', path: '/collections-center' },
+      { icon: Layers, label: 'Batch Invoicing', path: '/invoices/batch' },
       { icon: Package, label: 'Items', path: '/items' },
       { icon: BadgePercent, label: 'Sales Reps', path: '/sales-reps' },
       { icon: SlidersHorizontal, label: 'Advanced Pricing', path: '/advanced-pricing' },

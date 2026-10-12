@@ -4,6 +4,7 @@
 import { z } from 'zod';
 import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
+import { sendFlagFields, shippingFields } from './sales';
 
 export const salesReceiptLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -40,5 +41,7 @@ export const createSalesReceiptSchema = z.object({
   memo: z.string().nullish(),
   classId: zUuid.nullish(),
   lines: zLines(salesReceiptLineSchema),
+  ...shippingFields,
+  ...sendFlagFields,
 });
 export type CreateSalesReceiptBody = z.infer<typeof createSalesReceiptSchema>;

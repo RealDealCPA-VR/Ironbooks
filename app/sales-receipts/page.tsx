@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Receipt, Plus, Trash2, PlusCircle, MinusCircle } from 'lucide-react';
+import { Receipt, Plus, Trash2, PlusCircle, MinusCircle, Pencil } from 'lucide-react';
 import {
   AmountInput,
   Button,
@@ -37,6 +37,14 @@ import { formatDate } from '@/lib/format';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
+import {
+  EMPTY_SHIPPING,
+  FormSendButtons,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+} from '@/components/sales/SalesExtras';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -81,6 +89,28 @@ interface SalesReceipt {
   taxAmount: string;
   total: string;
   status: 'paid' | 'void' | string;
+}
+
+/** GET /api/sales-receipts/:id (used to prefill the edit form, wave2 sales C1). */
+interface SalesReceiptDetail extends SalesReceipt {
+  depositAccountId: string | null;
+  taxRateId: string | null;
+  memo: string | null;
+  shipDate?: string | null;
+  shipVia?: string | null;
+  fob?: string | null;
+  trackingNumber?: string | null;
+  poNumber?: string | null;
+  shipTo?: Record<string, string> | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
+  lines: Array<{
+    itemId: string | null;
+    description: string | null;
+    quantity: string;
+    rate: string;
+    taxable: boolean;
+  }>;
 }
 
 interface LineRow {
@@ -132,6 +162,8 @@ function computeTotals(lines: LineRow[], taxRate: TaxRate | undefined) {
 
 interface NewReceiptModalProps {
   open: boolean;
+  /** wave2 sales (C1): receipt being edited (null = new). */
+  editing?: SalesReceiptDetail | null;
   onClose: () => void;
   customers: Customer[];
   items: Item[];
@@ -142,6 +174,7 @@ interface NewReceiptModalProps {
 
 function NewReceiptModal({
   open,
+  editing,
   onClose,
   customers,
   items,
@@ -161,12 +194,35 @@ function NewReceiptModal({
   const [taxRateId, setTaxRateId] = useState('');
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
+  const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const [saving, setSaving] = useState(false);
 
   // Reset form when modal opens; deposit-to defaults to Undeposited Funds (1050)
   // so receipts flow into the Make Deposits workflow.
   useEffect(() => {
+    if (open && editing) {
+      setCustomerId(editing.customerId ?? '');
+      setDate(editing.date.slice(0, 10));
+      setMethod(editing.method);
+      setDepositAccountId(editing.depositAccountId ?? '');
+      setReference(editing.reference ?? '');
+      setTaxRateId(editing.taxRateId ?? '');
+      setMemo(editing.memo ?? '');
+      setShip(shippingFromDoc(editing));
+      setLines(
+        editing.lines.map((l) => ({
+          itemId: l.itemId ?? '',
+          description: l.description ?? '',
+          quantity: String(Number(l.quantity)),
+          rate: String(Number(l.rate)),
+          taxable: l.taxable,
+          rateManual: true,
+        })),
+      );
+      return;
+    }
     if (open) {
+      setShip(shippingFromDoc(null));
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setMethod('cash');
@@ -177,7 +233,7 @@ function NewReceiptModal({
       setLines([{ ...EMPTY_LINE }]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, editing]);
 
   function updateLine(idx: number, patch: Partial<LineRow>) {
     setLines((prev) => {
@@ -263,7 +319,8 @@ function NewReceiptModal({
 
     setSaving(true);
     try {
-      await api.post('/api/sales-receipts', {
+      const body = {
+        ...shippingPayload(ship),
         customerId: customerId || null,
         date,
         method,
@@ -279,8 +336,14 @@ function NewReceiptModal({
           taxable: l.taxable,
           ...inventoryLinePayload(l.inv),
         })),
-      });
-      toast('Sales receipt created.', 'success');
+      };
+      if (editing) {
+        await api.patch(`/api/sales-receipts/${editing.id}`, body);
+        toast(`Sales Receipt #${editing.receiptNumber} updated.`, 'success');
+      } else {
+        await api.post('/api/sales-receipts', body);
+        toast('Sales receipt created.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
@@ -295,17 +358,23 @@ function NewReceiptModal({
       size="lg"
       open={open}
       onClose={onClose}
-      title="New Sales Receipt"
+      title={editing ? `Edit Sales Receipt #${editing.receiptNumber}` : 'New Sales Receipt'}
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
-            Create Receipt
+            {editing ? 'Save Changes' : 'Create Receipt'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
+        {editing && (
+          <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
+            Saving changes re-posts this sale (and puts back / takes out any stock) so your books stay
+            balanced. If it is already part of a bank deposit, its total and deposit account can&apos;t change.
+          </div>
+        )}
         {/* Customer (optional) + date */}
         <div className="grid grid-cols-2 gap-3">
           <div>
@@ -492,6 +561,8 @@ function NewReceiptModal({
           </div>
         </div>
 
+        <ShippingSection value={ship} onChange={setShip} idPrefix="sr-ship" />
+
         {/* Live totals */}
         <div className="rounded-lg bg-navy/5 px-4 py-3 space-y-1">
           <div className="flex items-center justify-between text-sm text-navy/70">
@@ -529,6 +600,15 @@ export default function SalesReceiptsPage() {
 
   // Void state
   const [voidTarget, setVoidTarget] = useState<SalesReceipt | null>(null);
+  const [editTarget, setEditTarget] = useState<SalesReceiptDetail | null>(null);
+
+  async function openEdit(r: SalesReceipt) {
+    try {
+      setEditTarget(await api.get<SalesReceiptDetail>(`/api/sales-receipts/${r.id}`));
+    } catch (err: unknown) {
+      toastError(err, 'Could not open the sales receipt.');
+    }
+  }
   const [voiding, setVoiding] = useState(false);
 
   const fetchData = useCallback(async () => {
@@ -631,6 +711,18 @@ export default function SalesReceiptsPage() {
                     </Badge>
                   </Td>
                   <Td className="text-right">
+                    {r.status !== 'void' && <FormSendButtons kind="sales_receipt" id={r.id} />}
+                    {r.status !== 'void' && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="Edit sales receipt"
+                        aria-label="Edit sales receipt"
+                        onClick={() => openEdit(r)}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
+                    )}
                     {r.status !== 'void' && (
                       <Button
                         variant="ghost"
@@ -668,8 +760,12 @@ export default function SalesReceiptsPage() {
       )}
 
       <NewReceiptModal
-        open={showNew}
-        onClose={() => setShowNew(false)}
+        open={showNew || !!editTarget}
+        editing={editTarget}
+        onClose={() => {
+          setShowNew(false);
+          setEditTarget(null);
+        }}
         customers={customers}
         items={items}
         accounts={accounts}

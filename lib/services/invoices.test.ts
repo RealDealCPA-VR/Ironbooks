@@ -12,11 +12,11 @@
  *   - Foreign-currency invoices post GL amounts in base currency (balanced).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { users, companies, accounts, customers, taxAgencies, taxRates, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import { users, companies, accounts, customers, taxAgencies, taxRates, journalEntries, journalEntryLines, auditLogs } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { trialBalance } from './reports';
@@ -355,11 +355,33 @@ describe('Invoices service (end-to-end)', () => {
         date: new Date('2025-04-02'),
         lines: [{ accountId: acct['4000'], description: 'Over limit', quantity: 1, rate: 200 }],
       }),
-    ).rejects.toMatchObject({ code: 'VALIDATION', message: 'Credit limit exceeded' });
+    ).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/^Credit limit exceeded/),
+      details: { warning: 'CREDIT_LIMIT', creditLimit: '500.00', currentBalance: '400.00', newBalance: '600.00', overBy: '100.00' },
+    });
 
     // Trial balance must still be balanced (the failed invoice should not have posted).
     const tb = await trialBalance(ctx);
     expect(tb.balanced).toBe(true);
+
+    // wave2 sales (C2): QB warns, it does not block — the user may save anyway, and the
+    // override is recorded in the audit trail.
+    const overridden = await createInvoice(ctx, {
+      customerId: limitedCust.id,
+      date: new Date('2025-04-02'),
+      overrideCreditLimit: true,
+      lines: [{ accountId: acct['4000'], description: 'Over limit', quantity: 1, rate: 200 }],
+    });
+    expect(overridden.total).toBe('200.00');
+    const audits = await db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.entityId, overridden.id), eq(auditLogs.entityType, 'invoice')));
+    expect(
+      audits.some((a) => (a.newValues as { creditLimitOverride?: { overBy?: string } } | null)?.creditLimitOverride?.overBy === '100.00'),
+    ).toBe(true);
+    expect((await trialBalance(ctx)).balanced).toBe(true);
   });
 
   // -------------------------------------------------------------------------

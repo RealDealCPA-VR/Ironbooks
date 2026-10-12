@@ -30,7 +30,14 @@ interface Customer {
 
 interface StatementLine {
   date: string;
-  type: 'invoice' | 'payment' | 'credit_memo' | 'general_journal';
+  type:
+    | 'invoice'
+    | 'payment'
+    | 'credit_memo'
+    | 'statement_charge'
+    | 'bounced_check'
+    | 'discount'
+    | 'general_journal';
   ref: string | null;
   amount: string;
   runningBalance: string;
@@ -99,9 +106,17 @@ function fmtDate(iso: string) {
 // Page
 // ---------------------------------------------------------------------------
 
-/** Charges column: invoices and positive General Journal lines; everything else is a credit. */
+/**
+ * Charges column: invoices, statement charges, returned (bounced) checks and positive General
+ * Journal lines raise the balance; everything else (payments, discounts, credit memos) is a credit.
+ */
 function isCharge(line: { type: string; amount: string }): boolean {
-  return line.type === 'invoice' || (line.type === 'general_journal' && !line.amount.startsWith('-'));
+  return (
+    line.type === 'invoice' ||
+    line.type === 'statement_charge' ||
+    line.type === 'bounced_check' ||
+    (line.type === 'general_journal' && !line.amount.startsWith('-'))
+  );
 }
 
 export default function CustomerStatementsPage() {
@@ -421,6 +436,12 @@ export default function CustomerStatementsPage() {
                     <Td>
                       {line.type === 'invoice' ? (
                         <Badge tone="info">Invoice</Badge>
+                      ) : line.type === 'statement_charge' ? (
+                        <Badge tone="info">Statement Charge</Badge>
+                      ) : line.type === 'bounced_check' ? (
+                        <Badge tone="danger">Returned Check</Badge>
+                      ) : line.type === 'discount' ? (
+                        <Badge tone="neutral">Discount</Badge>
                       ) : line.type === 'credit_memo' ? (
                         <Badge tone="neutral">Credit Memo</Badge>
                       ) : line.type === 'general_journal' ? (

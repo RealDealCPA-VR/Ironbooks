@@ -22,6 +22,8 @@ import {
   billLines,
   bills,
   billPaymentApplications,
+  bouncedChecks,
+  paymentApplications,
   billPayments,
   companies,
   creditMemos,
@@ -44,10 +46,22 @@ import { docRef } from './docNumbers';
 
 export interface StatementLine {
   date: string;
-  type: 'invoice' | 'payment' | 'credit_memo' | 'general_journal';
+  /**
+   * Charges: invoice, statement_charge (C5), bounced_check (F2 — a returned payment owed again).
+   * Credits: payment, credit_memo, discount (C3 — early-payment discount taken).
+   * general_journal: a named General Journal line on A/R (amount signed: + charge, − credit).
+   */
+  type:
+    | 'invoice'
+    | 'payment'
+    | 'credit_memo'
+    | 'statement_charge'
+    | 'bounced_check'
+    | 'discount'
+    | 'general_journal';
   /**
    * Invoice number (invoices), payment reference (payments), memo number (credit memos), or
-   * "GJ #<entry>" for a named General Journal line on A/R (amount signed: + charge, − credit).
+   * "GJ #<entry>" for a named General Journal line on A/R.
    */
   ref: string | null;
   /** Positive for invoices (charges); positive for payments/credit memos (credits). */
@@ -69,6 +83,38 @@ export interface CustomerStatement {
   openingBalance: string;
   lines: StatementLine[];
   closingBalance: string;
+}
+
+/**
+ * Bounced checks of a customer (wave2 sales F2): the amount owed again = the returned payment
+ * plus any early-payment discounts it had taken (both reversed by recordBouncedCheck).
+ */
+async function bouncedAmounts(
+  ctx: ServiceContext,
+  customerId: string,
+  range: { before?: Date; from?: Date; to?: Date },
+): Promise<Array<{ date: Date; reference: string | null; amount: ReturnType<typeof Money.zero> }>> {
+  const conds = [eq(bouncedChecks.companyId, ctx.companyId), eq(bouncedChecks.customerId, customerId)];
+  if (range.before) conds.push(lt(bouncedChecks.date, range.before));
+  if (range.from) conds.push(gte(bouncedChecks.date, range.from));
+  if (range.to) conds.push(lt(bouncedChecks.date, new Date(range.to.getTime() + 86_400_000)));
+  const rows = await ctx.db
+    .select({
+      date: bouncedChecks.date,
+      amount: bouncedChecks.amount,
+      applications: bouncedChecks.applications,
+      reference: paymentsReceived.reference,
+    })
+    .from(bouncedChecks)
+    .innerJoin(paymentsReceived, eq(paymentsReceived.id, bouncedChecks.paymentId))
+    .where(and(...conds));
+  return rows.map((r) => ({
+    date: r.date,
+    reference: r.reference ?? null,
+    amount: Money.of(r.amount).plus(
+      (r.applications ?? []).reduce((s, a) => s.plus(Money.of(a.discountAmount ?? '0')), Money.zero()),
+    ),
+  }));
 }
 
 export async function customerStatement(
@@ -122,9 +168,27 @@ export async function customerStatement(
         and(
           eq(paymentsReceived.companyId, ctx.companyId),
           eq(paymentsReceived.customerId, customerId),
+          isNull(paymentsReceived.voidedAt),
           lt(paymentsReceived.date, range.from),
         ),
       );
+
+    // wave2 sales: early-payment discounts (credits) and bounced checks (charges) before range.
+    const [priorDiscountRow] = await ctx.db
+      .select({
+        total: sql<string>`COALESCE(SUM(CAST(${paymentApplications.discountAmount} AS NUMERIC)), 0)`,
+      })
+      .from(paymentApplications)
+      .innerJoin(paymentsReceived, eq(paymentsReceived.id, paymentApplications.paymentId))
+      .where(
+        and(
+          eq(paymentsReceived.companyId, ctx.companyId),
+          eq(paymentsReceived.customerId, customerId),
+          isNull(paymentsReceived.voidedAt),
+          lt(paymentsReceived.date, range.from),
+        ),
+      );
+    const priorBounced = await bouncedAmounts(ctx, customerId, { before: range.from });
 
     // Credit memos before range start (non-void) — they credit A/R at creation,
     // so they reduce what the customer owes just like payments.
@@ -145,7 +209,12 @@ export async function customerStatement(
     const priorInvoices = Money.of(priorInvoiceRow?.total ?? '0');
     const priorPayments = Money.of(priorPaymentRow?.total ?? '0');
     const priorCreditMemos = Money.of(priorCreditMemoRow?.total ?? '0');
-    openingBalance = priorInvoices.minus(priorPayments).minus(priorCreditMemos);
+    const priorDiscounts = Money.of(priorDiscountRow?.total ?? '0');
+    openingBalance = priorInvoices
+      .minus(priorPayments)
+      .minus(priorCreditMemos)
+      .minus(priorDiscounts)
+      .plus(priorBounced.reduce((sum, b) => sum.plus(b.amount), Money.zero()));
   }
 
   // Named General Journal lines on A/R for this customer (QB shows them as "General Journal").
@@ -178,6 +247,7 @@ export async function customerStatement(
       refNumber: invoices.refNumber,
       // Billed base (total minus retainage) — the amount actually charged to A/R.
       total: sql<string>`CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC)`,
+      isStatementCharge: invoices.isStatementCharge,
     })
     .from(invoices)
     .where(and(...invoiceConds));
@@ -186,6 +256,8 @@ export async function customerStatement(
   const paymentConds = [
     eq(paymentsReceived.companyId, ctx.companyId),
     eq(paymentsReceived.customerId, customerId),
+    // A voided payment never happened — it must not reduce the statement balance.
+    isNull(paymentsReceived.voidedAt),
   ];
   if (range?.from) paymentConds.push(gte(paymentsReceived.date, range.from));
   if (range?.to)
@@ -193,12 +265,28 @@ export async function customerStatement(
 
   const paymentRows = await ctx.db
     .select({
+      id: paymentsReceived.id,
       date: paymentsReceived.date,
       reference: paymentsReceived.reference,
       amount: paymentsReceived.amount,
     })
     .from(paymentsReceived)
     .where(and(...paymentConds));
+
+  // wave2 sales: discounts taken with in-range payments, and in-range bounced checks.
+  const discountRows =
+    paymentRows.length > 0
+      ? await ctx.db
+          .select({
+            paymentId: paymentApplications.paymentId,
+            total: sql<string>`COALESCE(SUM(CAST(${paymentApplications.discountAmount} AS NUMERIC)), 0)`,
+          })
+          .from(paymentApplications)
+          .where(inArray(paymentApplications.paymentId, paymentRows.map((p) => p.id)))
+          .groupBy(paymentApplications.paymentId)
+      : [];
+  const discountByPayment = new Map(discountRows.map((r) => [r.paymentId, Money.of(r.total)]));
+  const bouncedRows = await bouncedAmounts(ctx, customerId, { from: range?.from, to: range?.to });
 
   // --- In-range credit memos ---
   // A credit memo credits A/R in the GL at creation (not at application), so the
@@ -224,24 +312,36 @@ export async function customerStatement(
     .where(and(...creditMemoConds));
 
   // --- Merge and sort chronologically ---
-  type RawLine =
-    | { kind: 'invoice'; date: Date; ref: string; amount: string }
-    | { kind: 'payment'; date: Date; ref: string | null; amount: string }
-    | { kind: 'credit_memo'; date: Date; ref: string; amount: string }
-    | { kind: 'general_journal'; date: Date; ref: string; amount: string };
+  type RawLine = { kind: StatementLine['type']; date: Date; ref: string | null; amount: string };
 
   const raw: RawLine[] = [
     ...invoiceRows.map((r) => ({
-      kind: 'invoice' as const,
+      kind: r.isStatementCharge ? ('statement_charge' as const) : ('invoice' as const),
       date: r.date,
       ref: docRef(r.refNumber, r.invoiceNumber),
       amount: r.total,
     })),
-    ...paymentRows.map((r) => ({
-      kind: 'payment' as const,
-      date: r.date,
-      ref: r.reference ?? null,
-      amount: r.amount,
+    ...paymentRows
+      .filter((r) => Money.of(r.amount).greaterThan(0))
+      .map((r) => ({
+        kind: 'payment' as const,
+        date: r.date,
+        ref: r.reference ?? null,
+        amount: r.amount,
+      })),
+    ...paymentRows
+      .filter((r) => (discountByPayment.get(r.id) ?? Money.zero()).greaterThan(0))
+      .map((r) => ({
+        kind: 'discount' as const,
+        date: r.date,
+        ref: r.reference ?? null,
+        amount: toAmountString(discountByPayment.get(r.id)!),
+      })),
+    ...bouncedRows.map((b) => ({
+      kind: 'bounced_check' as const,
+      date: b.date,
+      ref: b.reference,
+      amount: toAmountString(b.amount),
     })),
     ...creditMemoRows.map((r) => ({
       kind: 'credit_memo' as const,
@@ -262,11 +362,16 @@ export async function customerStatement(
   // --- Compute running balance ---
   let running = openingBalance;
   const lines: StatementLine[] = raw.map((r) => {
-    if (r.kind === 'invoice' || r.kind === 'general_journal') {
+    if (
+      r.kind === 'invoice' ||
+      r.kind === 'statement_charge' ||
+      r.kind === 'bounced_check' ||
       // General Journal amounts are already signed (+ charge, − credit).
+      r.kind === 'general_journal'
+    ) {
       running = running.plus(Money.of(r.amount));
     } else {
-      // Payments and credit memos both reduce what the customer owes.
+      // Payments, discounts and credit memos all reduce what the customer owes.
       running = running.minus(Money.of(r.amount));
     }
     return {

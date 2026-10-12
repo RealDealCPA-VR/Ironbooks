@@ -182,6 +182,9 @@ const DOCUMENT_SIDE: Record<string, 'ar' | 'ap' | 'either' | 'none' | 'import'> 
   credit_memo: 'ar',
   payment: 'ar',
   customer: 'ar',
+  // wave2 sales: Record Bounced Check re-charges A/R on the payment's own (unnamed) control line —
+  // the reopened invoices are the subledger items, so it must not be a named GJ line.
+  bounced: 'ar',
   bill: 'ap',
   vendor: 'ap',
   vendor_credit: 'ap',

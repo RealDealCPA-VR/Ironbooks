@@ -149,6 +149,123 @@ export interface CreateInvoiceInput {
   status?: 'draft' | 'open' | null;
   /** Values for company-defined invoice custom fields ({ [fieldName]: value }). */
   customFields?: Record<string, string> | null;
+  // ---- wave2 sales: shipping (B6), send queues (C7), credit limit override (C2) ----
+  shipDate?: Date | null;
+  shipVia?: string | null;
+  fob?: string | null;
+  trackingNumber?: string | null;
+  shipTo?: Record<string, string> | null;
+  /** Customer's purchase-order number. */
+  poNumber?: string | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
+  /**
+   * The user saw the "over credit limit" warning and chose to save anyway. Without it, an
+   * invoice that pushes the customer over their credit limit is refused with a
+   * VALIDATION error whose details carry `{ warning: 'CREDIT_LIMIT' }` (shown as a confirm).
+   * The override is recorded in the audit trail.
+   */
+  overrideCreditLimit?: boolean;
+  /** Internal (statement charges, C5): mark the A/R document as a statement charge. */
+  isStatementCharge?: boolean;
+}
+
+/** Shipping + send-queue columns of an A/R document, from an input (undefined keeps `prev`). */
+export function shippingColumns(
+  input: Pick<
+    CreateInvoiceInput,
+    'shipDate' | 'shipVia' | 'fob' | 'trackingNumber' | 'shipTo' | 'poNumber' | 'toBePrinted' | 'toBeEmailed'
+  >,
+  prev?: {
+    shipDate?: Date | null;
+    shipVia?: string | null;
+    fob?: string | null;
+    trackingNumber?: string | null;
+    shipTo?: Record<string, string> | null;
+    poNumber?: string | null;
+    toBePrinted?: boolean;
+    toBeEmailed?: boolean;
+  },
+) {
+  const pick = <K extends keyof NonNullable<typeof prev>>(k: K, v: unknown) =>
+    (v !== undefined ? v : (prev?.[k] ?? null)) as never;
+  return {
+    shipDate: pick('shipDate', input.shipDate),
+    shipVia: pick('shipVia', input.shipVia?.trim() || (input.shipVia === undefined ? undefined : null)),
+    fob: pick('fob', input.fob?.trim() || (input.fob === undefined ? undefined : null)),
+    trackingNumber: pick(
+      'trackingNumber',
+      input.trackingNumber?.trim() || (input.trackingNumber === undefined ? undefined : null),
+    ),
+    shipTo: pick('shipTo', input.shipTo),
+    poNumber: pick('poNumber', input.poNumber?.trim() || (input.poNumber === undefined ? undefined : null)),
+    toBePrinted: (input.toBePrinted ?? prev?.toBePrinted ?? false) as boolean,
+    toBeEmailed: (input.toBeEmailed ?? prev?.toBeEmailed ?? false) as boolean,
+  };
+}
+
+/** Details of a credit-limit breach (warning payload / audit record). */
+export interface CreditLimitBreach {
+  warning: 'CREDIT_LIMIT';
+  creditLimit: string;
+  /** Customer's open A/R before this document (base currency). */
+  currentBalance: string;
+  /** Balance after this document is saved (base currency). */
+  newBalance: string;
+  overBy: string;
+}
+
+/**
+ * Shared credit-limit check (C2 — QB warns, it does not block). Returns the breach when
+ * `additionalBase` (base currency) pushes the customer's open A/R over their credit limit.
+ */
+export async function checkCreditLimit(
+  ctx: ServiceContext,
+  customerId: string,
+  additionalBase: ReturnType<typeof Money.zero>,
+  opts?: { excludeInvoiceId?: string },
+): Promise<CreditLimitBreach | null> {
+  const [customer] = await ctx.db
+    .select({ creditLimit: customers.creditLimit })
+    .from(customers)
+    .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
+  if (!customer || customer.creditLimit == null) return null;
+  const creditLimit = Money.of(customer.creditLimit);
+  if (!creditLimit.greaterThan(0)) return null;
+  // Compare in BASE currency: creditLimit and GL postings are base, but each invoice's
+  // balanceDue is stored in its own transaction currency.
+  const openConds = [
+    eq(invoices.companyId, ctx.companyId),
+    eq(invoices.customerId, customerId),
+    inArray(invoices.status, ['open', 'partial', 'overdue']),
+  ];
+  if (opts?.excludeInvoiceId) openConds.push(ne(invoices.id, opts.excludeInvoiceId));
+  const rows = await ctx.db
+    .select({ balanceDue: invoices.balanceDue, exchangeRate: invoices.exchangeRate })
+    .from(invoices)
+    .where(and(...openConds));
+  const outstanding = rows.reduce(
+    (sum, row) => sum.plus(Money.round2(Money.mul(Money.of(row.balanceDue), Money.of(row.exchangeRate ?? 1)))),
+    Money.zero(),
+  );
+  const newBalance = outstanding.plus(additionalBase);
+  if (!newBalance.greaterThan(creditLimit)) return null;
+  return {
+    warning: 'CREDIT_LIMIT',
+    creditLimit: toAmountString(creditLimit),
+    currentBalance: toAmountString(outstanding),
+    newBalance: toAmountString(newBalance),
+    overBy: toAmountString(newBalance.minus(creditLimit)),
+  };
+}
+
+/** The VALIDATION error raised for an un-acknowledged credit-limit breach. */
+export function creditLimitError(breach: CreditLimitBreach): ServiceError {
+  return new ServiceError(
+    'VALIDATION',
+    `Credit limit exceeded: this customer's balance would be ${breach.newBalance}, which is ${breach.overBy} over their credit limit of ${breach.creditLimit}. Save anyway?`,
+    breach,
+  );
 }
 
 /** A company-defined custom field rendered on the invoice form. */
@@ -239,6 +356,54 @@ async function hasExternalPayments(
   return Money.of(invoice.amountPaid).greaterThan(paymentLines);
 }
 
+/** Amount applied to the invoice from OUTSIDE it (payments, discounts, credits). */
+async function externalPaidAmount(
+  ctx: ServiceContext,
+  invoice: { id: string; amountPaid: string | null },
+) {
+  if (!invoice.amountPaid || !Money.gt(invoice.amountPaid, 0)) return Money.zero();
+  const paymentLines = await storedPaymentLineTotal(ctx, invoice.id);
+  const ext = Money.of(invoice.amountPaid).minus(paymentLines);
+  return ext.greaterThan(0) ? Money.round2(ext) : Money.zero();
+}
+
+/**
+ * Editing an invoice that already has payments/credits applied (C1): the applications stay put,
+ * so the edit must not invalidate them. Refuses (plain language) when the edit would change the
+ * customer, the currency or exchange rate (A/R was relieved at the booked rate), or shrink the
+ * invoice below what has already been applied.
+ */
+function assertEditKeepsApplications(
+  existing: { customerId: string; currency: string | null; exchangeRate: string | null },
+  input: CreateInvoiceInput,
+  prep: PreparedInvoice,
+  externalPaid: ReturnType<typeof Money.zero>,
+) {
+  if (!externalPaid.greaterThan(0)) return;
+  if (input.customerId !== existing.customerId) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This invoice already has payments or credits applied, so its customer cannot be changed. Unapply them first.',
+    );
+  }
+  if (
+    (input.currency ?? null) !== (existing.currency ?? null) ||
+    !Money.eq(prep.exchangeRate, Money.round2(existing.exchangeRate ?? 1))
+  ) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This invoice already has payments applied, so its currency and exchange rate cannot be changed. Unapply them first.',
+    );
+  }
+  const openAfter = prep.dueNow.minus(prep.paymentTotal);
+  if (externalPaid.greaterThan(openAfter)) {
+    throw new ServiceError(
+      'CONFLICT',
+      `This invoice already has ${toAmountString(externalPaid)} in payments or credits applied, so its new amount due (${toAmountString(openAfter)}) cannot be less than that. Unapply some of the payment first, or increase the invoice.`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // prepareInvoice — shared validation + computation for create/update
 // ---------------------------------------------------------------------------
@@ -274,6 +439,8 @@ type ComputedLine = {
 };
 
 interface PreparedInvoice {
+  /** Set when the user overrode a credit-limit warning (recorded in the audit trail). */
+  creditLimitOverride: CreditLimitBreach | null;
   exchangeRate: ReturnType<typeof Money.zero>;
   arAccountId: string;
   defaultIncomeId: string;
@@ -532,8 +699,10 @@ async function prepareInvoice(
       continue;
     }
 
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (kind !== 'discount' && rate.lessThan(0)) {
       throw validation(`Line ${i + 1}: rate cannot be negative.`);
@@ -582,8 +751,8 @@ async function prepareInvoice(
       itemId: l.itemId ?? null,
       accountId: resolvedAccountId,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       taxable,
       taxRateId: kind === 'income' ? (l.taxRateId ?? null) : null,
@@ -645,35 +814,24 @@ async function prepareInvoice(
       })
     : null;
 
-  // --- Credit limit check ---
+  // --- Credit limit check (QB warns; the user may save anyway — C2) ---
+  // Exposure added by this document = what will be open on it (balance after payment lines).
+  let creditLimitOverride: CreditLimitBreach | null = null;
   if (customer.creditLimit != null) {
-    const creditLimit = Money.of(customer.creditLimit);
-    if (creditLimit.greaterThan(0)) {
-      // Compare in BASE currency: creditLimit and GL postings are base, but each invoice's
-      // balanceDue (and this invoice's `total`) are stored in their own transaction currency.
-      const openConds = [
-        eq(invoices.companyId, ctx.companyId),
-        eq(invoices.customerId, input.customerId),
-        inArray(invoices.status, ['open', 'partial']),
-      ];
-      if (opts?.excludeInvoiceId) openConds.push(ne(invoices.id, opts.excludeInvoiceId));
-      const openInvoiceRows = await ctx.db
-        .select({ balanceDue: invoices.balanceDue, exchangeRate: invoices.exchangeRate })
-        .from(invoices)
-        .where(and(...openConds));
-      const outstandingBase = openInvoiceRows.reduce(
-        (sum, row) =>
-          sum.plus(Money.round2(Money.mul(Money.of(row.balanceDue), Money.of(row.exchangeRate ?? 1)))),
-        Money.zero(),
-      );
-      const newExposureBase = Money.round2(Money.mul(total, exchangeRate));
-      if (outstandingBase.plus(newExposureBase).greaterThan(creditLimit)) {
-        throw new ServiceError('VALIDATION', 'Credit limit exceeded');
-      }
+    const newExposureBase = Money.round2(
+      Money.mul(dueNow.minus(paymentTotal).plus(retainageAmount), exchangeRate),
+    );
+    const breach = await checkCreditLimit(ctx, input.customerId, newExposureBase, {
+      excludeInvoiceId: opts?.excludeInvoiceId,
+    });
+    if (breach) {
+      if (!input.overrideCreditLimit) throw creditLimitError(breach);
+      creditLimitOverride = breach;
     }
   }
 
   return {
+    creditLimitOverride,
     exchangeRate,
     arAccountId,
     defaultIncomeId,
@@ -1130,6 +1288,21 @@ function postedStatus(prep: PreparedInvoice): 'open' | 'partial' | 'paid' {
   return 'open';
 }
 
+/** Record that the user saved past a credit-limit warning (C2). */
+export async function auditCreditLimitOverride(
+  tx: ServiceContext,
+  entityId: string,
+  breach: CreditLimitBreach,
+  entityType = 'invoice',
+) {
+  await writeAudit(tx, {
+    action: 'update',
+    entityType,
+    entityId,
+    newValues: { creditLimitOverride: breach },
+  });
+}
+
 export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
   const prep = await prepareInvoice(ctx, input);
   const isDraft = input.status === 'draft';
@@ -1177,9 +1350,15 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         retainageAmount: toAmountString(prep.retainageAmount),
         memo: input.memo ?? null,
         customFields: input.customFields ?? null,
+        ...shippingColumns(input),
+        isStatementCharge: input.isStatementCharge === true,
         // postedEntryId filled below after posting (stays null for drafts)
       })
       .returning();
+
+    if (prep.creditLimitOverride) {
+      await auditCreditLimitOverride(tx, invoice.id, prep.creditLimitOverride);
+    }
 
     // 2) Insert invoice lines.
     await tx.db.insert(invoiceLines).values(
@@ -1272,7 +1451,11 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
  * time) via `postJournalEntry`'s assertPeriodOpen on the invoice date — drafts
  * themselves are non-posting and may be saved into any period.
  */
-export async function postDraftInvoice(ctx: ServiceContext, id: string) {
+export async function postDraftInvoice(
+  ctx: ServiceContext,
+  id: string,
+  opts?: { overrideCreditLimit?: boolean },
+) {
   const [existing] = await ctx.db
     .select()
     .from(invoices)
@@ -1305,6 +1488,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
     exchangeRate: existing.exchangeRate,
     memo: existing.memo,
     customFields: existing.customFields ?? null,
+    overrideCreditLimit: opts?.overrideCreditLimit,
     lines: storedLines.map((l) => ({
       itemId: l.itemId,
       accountId: l.accountId,
@@ -1334,6 +1518,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
 
     // 1) Post the GL entry (assertPeriodOpen runs here, on the invoice date).
     const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
+    if (prep.creditLimitOverride) await auditCreditLimitOverride(tx, id, prep.creditLimitOverride);
 
     // 2) Flip the header to its posted state.
     const [updated] = await tx.db
@@ -1408,12 +1593,9 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   if (existing.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
   }
-  if (await hasExternalPayments(ctx, existing)) {
-    throw new ServiceError(
-      'CONFLICT',
-      'Cannot edit an invoice that has payments or credits applied. Unapply them first.',
-    );
-  }
+  // Payments/credits already applied stay applied (QB lets you edit a paid invoice) as long as
+  // the edit keeps them valid; see assertEditKeepsApplications.
+  const externalPaidPre = await externalPaidAmount(ctx, existing);
 
   // An edit that does not mention the sales rep keeps the current one (it was usually set
   // via assignInvoiceRep, and it is also a price-rule condition).
@@ -1422,6 +1604,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   // Validate + compute the new document (read-only). Exclude this invoice's own
   // current balance from the credit-limit exposure — it is being replaced.
   const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
+  assertEditKeepsApplications(existing, input, prep, externalPaidPre);
 
   // ── Drafts: editing a pending invoice is a simple row update — nothing was
   //    ever posted, so there is no GL/COGS to void or re-post. ──
@@ -1486,6 +1669,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           memo: input.memo ?? null,
           customFields:
             input.customFields !== undefined ? input.customFields : invoice.customFields,
+          ...shippingColumns(input, invoice),
           updatedAt: new Date(),
         })
         .where(eq(invoices.id, id))
@@ -1513,12 +1697,8 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     if (invoice.status === 'void') {
       throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
     }
-    if (await hasExternalPayments(tx, invoice)) {
-      throw new ServiceError(
-        'CONFLICT',
-        'Cannot edit an invoice that has payments or credits applied. Unapply them first.',
-      );
-    }
+    const externalPaid = await externalPaidAmount(tx, invoice);
+    assertEditKeepsApplications(invoice, input, prep, externalPaid);
 
     // Snapshot old lines for the audit trail BEFORE replacing them.
     const oldLines = await tx.db
@@ -1560,14 +1740,22 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     // 4) Re-post the GL entry from the new document, then update the header in
     //    place — invoiceNumber and createdAt are intentionally NOT touched.
     const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
+    if (prep.creditLimitOverride) await auditCreditLimitOverride(tx, id, prep.creditLimitOverride);
 
+    const paidNow = prep.paymentTotal.plus(externalPaid);
+    const balanceNow = Money.round2(prep.dueNow.minus(paidNow));
     const [updated] = await tx.db
       .update(invoices)
       .set({
         customerId: input.customerId,
         date: input.date,
         dueDate: input.dueDate ?? null,
-        status: postedStatus(prep),
+        status:
+          balanceNow.lessThanOrEqualTo(0) && paidNow.greaterThan(0)
+            ? 'paid'
+            : paidNow.greaterThan(0)
+              ? 'partial'
+              : 'open',
         taxRateId: input.taxRateId ?? null,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
@@ -1579,13 +1767,14 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         discount: toAmountString(prep.discount),
         taxAmount: toAmountString(prep.taxAmount),
         total: toAmountString(prep.total),
-        amountPaid: toAmountString(prep.paymentTotal),
-        balanceDue: toAmountString(prep.dueNow.minus(prep.paymentTotal)),
+        amountPaid: toAmountString(paidNow),
+        balanceDue: toAmountString(balanceNow),
         retainagePercent: prep.usesRetainage ? prep.retainagePct.toFixed(2) : null,
         retainageAmount: toAmountString(prep.retainageAmount),
         memo: input.memo ?? null,
         customFields:
           input.customFields !== undefined ? input.customFields : invoice.customFields,
+        ...shippingColumns(input, invoice),
         postedEntryId: entry.id,
         updatedAt: new Date(),
       })

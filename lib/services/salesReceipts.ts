@@ -23,11 +23,13 @@
  * The default deposit account is 1050 Undeposited Funds so counter sales sit
  * with received payments until the bookkeeper makes a bank deposit.
  */
-import { and, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
   customers,
+  depositLines,
+  deposits,
   inventoryLayers,
   items,
   journalEntries,
@@ -55,6 +57,7 @@ import {
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { allocateDocNumber, docRef } from './docNumbers';
+import { shippingColumns } from './invoices';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -114,6 +117,15 @@ export interface CreateSalesReceiptInput {
   reference?: string | null;
   memo?: string | null;
   classId?: string | null;
+  // wave2 sales: shipping (B6) + send queues (C7)
+  shipDate?: Date | null;
+  shipVia?: string | null;
+  fob?: string | null;
+  trackingNumber?: string | null;
+  shipTo?: Record<string, string> | null;
+  poNumber?: string | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +183,8 @@ async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boole
 // createSalesReceipt
 // ---------------------------------------------------------------------------
 
-export async function createSalesReceipt(ctx: ServiceContext, input: CreateSalesReceiptInput) {
+/** Validate a sales receipt input and compute every amount/account (read-only; create + edit). */
+async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceiptInput) {
   // --- Validate inputs ---
   if (!input.lines || input.lines.length === 0) {
     throw validation('A sales receipt must have at least one line.');
@@ -211,8 +224,10 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.depositAccountId)));
     if (!acct) throw notFound('Deposit account');
-    if (acct.type !== 'asset') {
-      throw validation('Deposit account must be an asset (bank or Undeposited Funds) account.');
+    // Same rule as Receive Payments: A/R and Inventory are subledger control accounts,
+    // so money can never be "deposited" into them (A/R would stop matching open invoices).
+    if (acct.type !== 'asset' || acct.subtype === 'accounts_receivable' || acct.subtype === 'inventory') {
+      throw validation('Deposit account must be a bank account or Undeposited Funds.');
     }
     assertNotControlAccount(acct, 'Deposit to');
     depositAccountId = acct.id;
@@ -284,8 +299,10 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
 
   for (let i = 0; i < pricedLines.length; i++) {
     const l = pricedLines[i];
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
 
@@ -319,8 +336,8 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
       itemId: l.itemId ?? null,
       accountId: resolvedAccountId,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       taxable,
       taxRateId: l.taxRateId ?? null,
@@ -336,15 +353,178 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
     throw validation('Sales receipt total must be greater than zero.');
   }
 
-  // ---------------------------------------------------------------------------
-  // Persist everything in a single transaction.
-  // ---------------------------------------------------------------------------
+  return { method, depositAccountId, taxPayableId, itemMap, computedLines, subtotal, taxAmount, total };
+}
+
+type PreparedSalesReceipt = Awaited<ReturnType<typeof prepareSalesReceipt>>;
+
+/**
+ * Insert the receipt lines and post everything a saved sales receipt posts: the income/payment
+ * entry, COGS entries (stock relief) and site movements. Shared by create and edit (C1).
+ */
+async function postSalesReceiptDocument(
+  tx: ServiceContext,
+  receipt: { id: string; receiptNumber: number; refNumber?: string | null },
+  input: CreateSalesReceiptInput,
+  prep: PreparedSalesReceipt,
+) {
+  const { depositAccountId, taxPayableId, itemMap, computedLines, subtotal, taxAmount, total } = prep;
+  // The number shown on the GL: the typed ref number, else the legacy integer.
+  const shownNumber = docRef(receipt.refNumber ?? null, receipt.receiptNumber);
+  // 2) Insert receipt lines (returning ids so COGS entries can reference them).
+  const insertedLines = await tx.db
+    .insert(salesReceiptLines)
+    .values(
+      computedLines.map((cl) => ({
+        salesReceiptId: receipt.id,
+        itemId: cl.itemId,
+        accountId: cl.accountId,
+        description: cl.description,
+        quantity: cl.quantity,
+        rate: cl.rate,
+        amount: cl.amount,
+        taxable: cl.taxable,
+        classId: input.classId ?? null,
+        taxRateId: cl.taxRateId,
+        lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
+      })),
+    )
+    .returning();
+  insertedLines.sort((a, b) => a.lineOrder - b.lineOrder);
+
+  // 3) Post the income/payment entry.
+  //
+  //   Dr <deposit account>   total
+  //   Cr <income accounts>   subtotal (per account)
+  //   Cr 2200 Tax Payable    taxAmount
+  //
+  // entryBase = subtotal + taxAmount = total; both sides are penny-allocated
+  // against the same anchor so the entry is always balanced.
+  const entryBase = Money.round2(subtotal.plus(taxAmount));
+
+  const incomeCredits = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const cl of computedLines) {
+    const prev = incomeCredits.get(cl.accountId) ?? Money.zero();
+    incomeCredits.set(cl.accountId, prev.plus(Money.of(cl.amount)));
+  }
+
+  const debitSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [
+    { accountId: depositAccountId, weight: total, memo: `Sales Receipt #${shownNumber}` },
+  ];
+  const creditSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [];
+  for (const [acctId, amount] of incomeCredits) {
+    creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — income` });
+  }
+  if (taxAmount.greaterThan(0)) {
+    creditSpecs.push({
+      accountId: taxPayableId,
+      weight: taxAmount,
+      memo: `Sales Receipt #${shownNumber} — sales tax`,
+    });
+  }
+
+  const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
+  const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
+
+  const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [];
+  debitSpecs.forEach((s, i) => {
+    if (debitAlloc[i].greaterThan(0)) {
+      postingLines.push({ accountId: s.accountId, debit: toAmountString(debitAlloc[i]), memo: s.memo });
+    }
+  });
+  creditSpecs.forEach((s, i) => {
+    if (creditAlloc[i].greaterThan(0)) {
+      postingLines.push({ accountId: s.accountId, credit: toAmountString(creditAlloc[i]), memo: s.memo });
+    }
+  });
+
+  const entry = await postJournalEntry(tx, {
+    date: input.date,
+    description: `Sales Receipt #${shownNumber}`,
+    reference: shownNumber,
+    sourceRef: `salesreceipt:${receipt.id}`,
+    lines: postingLines,
+  });
+
+  // 4) Relieve inventory + post COGS for inventory-item lines.
+  //
+  // FIFO-tracked items go through consumeStock (exact layer costing); the rest
+  // through recordCOGS (weighted average). Both already validate stock levels
+  // and keep item.quantityOnHand in sync. Each COGS entry is then re-stamped
+  // with sourceRef "salesreceipt:<id>" and reference = the receipt line id so
+  // voidSalesReceipt can find it, reverse the GL, and restore the stock.
+  const cogsEntries: Array<{ entryId: string; lineId: string; itemId: string; cogs: string }> = [];
+  for (const line of insertedLines) {
+    if (!line.itemId) continue;
+    const meta = itemMap.get(line.itemId);
+    if (!meta || meta.type !== 'inventory') continue;
+
+    const memo = `Sales Receipt #${shownNumber} — COGS (${meta.name})`;
+    let entryId: string;
+    let cogs: string;
+    if (await isFifoTracked(tx, line.itemId)) {
+      const res = await consumeStock(tx, {
+        itemId: line.itemId,
+        quantity: line.quantity,
+        date: input.date,
+        memo,
+      });
+      entryId = res.entryId;
+      cogs = res.totalCOGS;
+    } else {
+      const res = await recordCOGS(tx, {
+        itemId: line.itemId,
+        quantity: line.quantity,
+        date: input.date,
+        memo,
+      });
+      entryId = res.entry.id;
+      cogs = res.cogsAmount;
+    }
+
+    // Re-stamp the COGS entry for traceability + void reversal.
+    await tx.db
+      .update(journalEntries)
+      .set({ sourceRef: `salesreceipt:${receipt.id}`, reference: line.id })
+      .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, tx.companyId)));
+
+    cogsEntries.push({ entryId, lineId: line.id, itemId: line.itemId, cogs });
+  }
+
+  // 4b) Advanced Inventory: record the site/bin/serial/lot the stock left from.
+  await postDocumentInventory(tx, {
+    sourceType: 'sales_receipt',
+    sourceId: receipt.id,
+    date: input.date,
+    direction: 'out',
+    lines: insertedLines.map((line) => {
+      const src = input.lines[line.lineOrder];
+      return {
+        lineOrder: line.lineOrder,
+        itemId: line.itemId,
+        quantity: line.quantity,
+        siteId: src?.siteId,
+        binId: src?.binId,
+        serialNumbers: src?.serialNumbers,
+        lotNumber: src?.lotNumber,
+        lotExpiration: src?.lotExpiration,
+      };
+    }),
+    memo: `Sales Receipt #${shownNumber}`,
+  });
+
+  return { insertedLines, entry, cogsEntries };
+}
+
+export async function createSalesReceipt(ctx: ServiceContext, input: CreateSalesReceiptInput) {
+  const prep = await prepareSalesReceipt(ctx, input);
+  const { method, depositAccountId, subtotal, taxAmount, total } = prep;
+
   return inTransaction(ctx, async (tx) => {
     const { refNumber, number: receiptNumber } = await allocateDocNumber(tx, 'sales_receipt', input.refNumber, {
       allowDuplicate: input.allowDuplicateNumber === true,
     });
-    // The number shown on the GL: the typed ref number, else the legacy integer.
-    const shownNumber = docRef(refNumber, receiptNumber);
 
     // 1) Insert receipt header (already fully paid by definition).
     const [receipt] = await tx.db
@@ -364,152 +544,13 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
         total: toAmountString(total),
         depositAccountId,
         memo: input.memo ?? null,
+        taxRateId: input.taxRateId ?? null,
+        ...shippingColumns(input),
         // postedEntryId filled below after posting
       })
       .returning();
 
-    // 2) Insert receipt lines (returning ids so COGS entries can reference them).
-    const insertedLines = await tx.db
-      .insert(salesReceiptLines)
-      .values(
-        computedLines.map((cl) => ({
-          salesReceiptId: receipt.id,
-          itemId: cl.itemId,
-          accountId: cl.accountId,
-          description: cl.description,
-          quantity: cl.quantity,
-          rate: cl.rate,
-          amount: cl.amount,
-          taxable: cl.taxable,
-          classId: input.classId ?? null,
-          taxRateId: cl.taxRateId,
-          lineOrder: cl.lineOrder,
-          pricing: cl.pricing as Record<string, unknown> | null,
-        })),
-      )
-      .returning();
-    insertedLines.sort((a, b) => a.lineOrder - b.lineOrder);
-
-    // 3) Post the income/payment entry.
-    //
-    //   Dr <deposit account>   total
-    //   Cr <income accounts>   subtotal (per account)
-    //   Cr 2200 Tax Payable    taxAmount
-    //
-    // entryBase = subtotal + taxAmount = total; both sides are penny-allocated
-    // against the same anchor so the entry is always balanced.
-    const entryBase = Money.round2(subtotal.plus(taxAmount));
-
-    const incomeCredits = new Map<string, ReturnType<typeof Money.zero>>();
-    for (const cl of computedLines) {
-      const prev = incomeCredits.get(cl.accountId) ?? Money.zero();
-      incomeCredits.set(cl.accountId, prev.plus(Money.of(cl.amount)));
-    }
-
-    const debitSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [
-      { accountId: depositAccountId, weight: total, memo: `Sales Receipt #${shownNumber}` },
-    ];
-    const creditSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [];
-    for (const [acctId, amount] of incomeCredits) {
-      creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — income` });
-    }
-    if (taxAmount.greaterThan(0)) {
-      creditSpecs.push({
-        accountId: taxPayableId,
-        weight: taxAmount,
-        memo: `Sales Receipt #${shownNumber} — sales tax`,
-      });
-    }
-
-    const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
-    const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
-
-    const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [];
-    debitSpecs.forEach((s, i) => {
-      if (debitAlloc[i].greaterThan(0)) {
-        postingLines.push({ accountId: s.accountId, debit: toAmountString(debitAlloc[i]), memo: s.memo });
-      }
-    });
-    creditSpecs.forEach((s, i) => {
-      if (creditAlloc[i].greaterThan(0)) {
-        postingLines.push({ accountId: s.accountId, credit: toAmountString(creditAlloc[i]), memo: s.memo });
-      }
-    });
-
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: `Sales Receipt #${shownNumber}`,
-      reference: shownNumber,
-      sourceRef: `salesreceipt:${receipt.id}`,
-      lines: postingLines,
-    });
-
-    // 4) Relieve inventory + post COGS for inventory-item lines.
-    //
-    // FIFO-tracked items go through consumeStock (exact layer costing); the rest
-    // through recordCOGS (weighted average). Both already validate stock levels
-    // and keep item.quantityOnHand in sync. Each COGS entry is then re-stamped
-    // with sourceRef "salesreceipt:<id>" and reference = the receipt line id so
-    // voidSalesReceipt can find it, reverse the GL, and restore the stock.
-    const cogsEntries: Array<{ entryId: string; lineId: string; itemId: string; cogs: string }> = [];
-    for (const line of insertedLines) {
-      if (!line.itemId) continue;
-      const meta = itemMap.get(line.itemId);
-      if (!meta || meta.type !== 'inventory') continue;
-
-      const memo = `Sales Receipt #${shownNumber} — COGS (${meta.name})`;
-      let entryId: string;
-      let cogs: string;
-      if (await isFifoTracked(tx, line.itemId)) {
-        const res = await consumeStock(tx, {
-          itemId: line.itemId,
-          quantity: line.quantity,
-          date: input.date,
-          memo,
-        });
-        entryId = res.entryId;
-        cogs = res.totalCOGS;
-      } else {
-        const res = await recordCOGS(tx, {
-          itemId: line.itemId,
-          quantity: line.quantity,
-          date: input.date,
-          memo,
-        });
-        entryId = res.entry.id;
-        cogs = res.cogsAmount;
-      }
-
-      // Re-stamp the COGS entry for traceability + void reversal.
-      await tx.db
-        .update(journalEntries)
-        .set({ sourceRef: `salesreceipt:${receipt.id}`, reference: line.id })
-        .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, tx.companyId)));
-
-      cogsEntries.push({ entryId, lineId: line.id, itemId: line.itemId, cogs });
-    }
-
-    // 4b) Advanced Inventory: record the site/bin/serial/lot the stock left from.
-    await postDocumentInventory(tx, {
-      sourceType: 'sales_receipt',
-      sourceId: receipt.id,
-      date: input.date,
-      direction: 'out',
-      lines: insertedLines.map((line) => {
-        const src = input.lines[line.lineOrder];
-        return {
-          lineOrder: line.lineOrder,
-          itemId: line.itemId,
-          quantity: line.quantity,
-          siteId: src?.siteId,
-          binId: src?.binId,
-          serialNumbers: src?.serialNumbers,
-          lotNumber: src?.lotNumber,
-          lotExpiration: src?.lotExpiration,
-        };
-      }),
-      memo: `Sales Receipt #${shownNumber}`,
-    });
+    const { insertedLines, entry, cogsEntries } = await postSalesReceiptDocument(tx, receipt, input, prep);
 
     // 5) Stamp postedEntryId on the receipt.
     const [updated] = await tx.db
@@ -599,6 +640,82 @@ export async function getSalesReceipt(ctx: ServiceContext, id: string) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Reverse everything a saved sales receipt posted: COGS entries (stock put back on hand / new
+ * FIFO layers, site movements reversed) and the main income/payment entry. Used by void and by
+ * edit (C1, before re-posting).
+ */
+async function reverseSalesReceiptPostings(
+  tx: ServiceContext,
+  receipt: { id: string; date: Date; postedEntryId: string | null },
+) {
+  const lines = await tx.db
+    .select()
+    .from(salesReceiptLines)
+    .where(eq(salesReceiptLines.salesReceiptId, receipt.id));
+  const lineById = new Map(lines.map((l) => [l.id, l]));
+
+  // Find all COGS entries stamped against this receipt (reference = line id).
+  const relatedEntries = await tx.db
+    .select({ id: journalEntries.id, reference: journalEntries.reference, status: journalEntries.status })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, tx.companyId),
+        eq(journalEntries.sourceRef, `salesreceipt:${receipt.id}`),
+        receipt.postedEntryId ? ne(journalEntries.id, receipt.postedEntryId) : undefined,
+      ),
+    );
+
+  for (const cogsEntry of relatedEntries) {
+    if (cogsEntry.status !== 'posted') continue;
+    const line = cogsEntry.reference ? lineById.get(cogsEntry.reference) : undefined;
+
+    // Reverse the GL first (Dr Inventory / Cr COGS via balance-delta reversal).
+    await voidJournalEntry(tx, cogsEntry.id);
+
+    if (!line?.itemId) continue; // defensive: entry not tied to an inventory line
+
+    // COGS amount = the entry's total debits (the 5000 side).
+    const entryLines = await tx.db
+      .select({ debit: journalEntryLines.debit })
+      .from(journalEntryLines)
+      .where(eq(journalEntryLines.journalEntryId, cogsEntry.id));
+    const cogs = entryLines.reduce((s, l) => s.plus(Money.of(l.debit)), Money.zero());
+
+    const qty = Money.of(line.quantity);
+
+    if (await isFifoTracked(tx, line.itemId)) {
+      // Restore the stock value as a new layer at the blended consumed cost.
+      const unitCost = qty.isZero() ? Money.zero() : cogs.dividedBy(qty);
+      await tx.db.insert(inventoryLayers).values({
+        companyId: tx.companyId,
+        itemId: line.itemId,
+        date: receipt.date,
+        quantityRemaining: qty.toFixed(4),
+        unitCost: unitCost.toFixed(4),
+      });
+    }
+
+    // Both costing methods: put the quantity back on hand.
+    await tx.db
+      .update(items)
+      .set({
+        quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) + ${qty.toFixed(4)}`,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+  }
+
+  // Put the stock back at the site/bin/serial it was sold from.
+  await reverseDocumentInventory(tx, 'sales_receipt', receipt.id);
+
+  // Reverse the main income/payment entry.
+  if (receipt.postedEntryId) {
+    await voidJournalEntry(tx, receipt.postedEntryId);
+  }
+}
+
+/**
  * Void a sales receipt: reverse the income/payment entry, reverse every COGS
  * entry, and put the relieved stock back.
  *
@@ -621,71 +738,7 @@ export async function voidSalesReceipt(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
-    const lines = await tx.db
-      .select()
-      .from(salesReceiptLines)
-      .where(eq(salesReceiptLines.salesReceiptId, id));
-    const lineById = new Map(lines.map((l) => [l.id, l]));
-
-    // Find all COGS entries stamped against this receipt (reference = line id).
-    const relatedEntries = await tx.db
-      .select({ id: journalEntries.id, reference: journalEntries.reference, status: journalEntries.status })
-      .from(journalEntries)
-      .where(
-        and(
-          eq(journalEntries.companyId, tx.companyId),
-          eq(journalEntries.sourceRef, `salesreceipt:${id}`),
-          receipt.postedEntryId ? ne(journalEntries.id, receipt.postedEntryId) : undefined,
-        ),
-      );
-
-    for (const cogsEntry of relatedEntries) {
-      if (cogsEntry.status !== 'posted') continue;
-      const line = cogsEntry.reference ? lineById.get(cogsEntry.reference) : undefined;
-
-      // Reverse the GL first (Dr Inventory / Cr COGS via balance-delta reversal).
-      await voidJournalEntry(tx, cogsEntry.id);
-
-      if (!line?.itemId) continue; // defensive: entry not tied to an inventory line
-
-      // COGS amount = the entry's total debits (the 5000 side).
-      const entryLines = await tx.db
-        .select({ debit: journalEntryLines.debit })
-        .from(journalEntryLines)
-        .where(eq(journalEntryLines.journalEntryId, cogsEntry.id));
-      const cogs = entryLines.reduce((s, l) => s.plus(Money.of(l.debit)), Money.zero());
-
-      const qty = Money.of(line.quantity);
-
-      if (await isFifoTracked(tx, line.itemId)) {
-        // Restore the stock value as a new layer at the blended consumed cost.
-        const unitCost = qty.isZero() ? Money.zero() : cogs.dividedBy(qty);
-        await tx.db.insert(inventoryLayers).values({
-          companyId: tx.companyId,
-          itemId: line.itemId,
-          date: receipt.date,
-          quantityRemaining: qty.toFixed(4),
-          unitCost: unitCost.toFixed(4),
-        });
-      }
-
-      // Both costing methods: put the quantity back on hand.
-      await tx.db
-        .update(items)
-        .set({
-          quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) + ${qty.toFixed(4)}`,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
-    }
-
-    // Put the stock back at the site/bin/serial it was sold from.
-    await reverseDocumentInventory(tx, 'sales_receipt', id);
-
-    // Reverse the main income/payment entry.
-    if (receipt.postedEntryId) {
-      await voidJournalEntry(tx, receipt.postedEntryId);
-    }
+    await reverseSalesReceiptPostings(tx, receipt);
 
     // Mark the receipt void.
     const [updated] = await tx.db
@@ -703,5 +756,131 @@ export async function voidSalesReceipt(ctx: ServiceContext, id: string) {
     });
 
     return updated;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// updateSalesReceipt (wave2 sales, C1 — edit a saved sales receipt)
+// ---------------------------------------------------------------------------
+
+/** True when the receipt has been swept into a (non-void) bank deposit. */
+async function isDeposited(ctx: ServiceContext, receiptId: string): Promise<boolean> {
+  const [row] = await ctx.db
+    .select({ id: depositLines.id })
+    .from(depositLines)
+    .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
+    .where(
+      and(
+        eq(deposits.companyId, ctx.companyId),
+        isNull(deposits.voidedAt),
+        eq(depositLines.description, `salesReceipt:${receiptId}`),
+      ),
+    )
+    .limit(1);
+  return Boolean(row);
+}
+
+/**
+ * Edit a saved sales receipt in place (QB "edit any saved transaction").
+ *
+ * Sanctioned void/repost pattern inside ONE transaction: reverse the old version (COGS entries
+ * and stock, then the income/payment entry — closing-date check on the old date), replace the
+ * lines, re-post from the new lines (closing-date check on the new date) and audit old + new
+ * values. receiptNumber and createdAt are preserved.
+ *
+ * Once the receipt has been included in a bank deposit its amount and deposit account are
+ * locked (the deposit moved exactly that money); other details can still change.
+ */
+export async function updateSalesReceipt(ctx: ServiceContext, id: string, input: CreateSalesReceiptInput) {
+  const [existing] = await ctx.db
+    .select()
+    .from(salesReceipts)
+    .where(and(eq(salesReceipts.companyId, ctx.companyId), eq(salesReceipts.id, id)));
+  if (!existing) throw notFound('Sales receipt');
+  if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided sales receipt.');
+
+  const prep = await prepareSalesReceipt(ctx, input);
+
+  if (await isDeposited(ctx, id)) {
+    if (!Money.eq(prep.total, existing.total) || prep.depositAccountId !== existing.depositAccountId) {
+      throw new ServiceError(
+        'CONFLICT',
+        'This sales receipt is already part of a bank deposit, so its total and deposit account cannot change. Remove it from the deposit first, or change only the other details.',
+      );
+    }
+  }
+
+  return inTransaction(ctx, async (tx) => {
+    const [receipt] = await tx.db
+      .select()
+      .from(salesReceipts)
+      .where(and(eq(salesReceipts.companyId, tx.companyId), eq(salesReceipts.id, id)));
+    if (!receipt || receipt.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Cannot edit a voided sales receipt.');
+    }
+    const oldLines = await tx.db
+      .select()
+      .from(salesReceiptLines)
+      .where(eq(salesReceiptLines.salesReceiptId, id))
+      .orderBy(salesReceiptLines.lineOrder);
+
+    // 1) Reverse the old version.
+    await reverseSalesReceiptPostings(tx, receipt);
+
+    // 2) Replace lines + re-post.
+    await tx.db.delete(salesReceiptLines).where(eq(salesReceiptLines.salesReceiptId, id));
+    const { insertedLines, entry, cogsEntries } = await postSalesReceiptDocument(
+      tx,
+      { id, receiptNumber: receipt.receiptNumber, refNumber: receipt.refNumber },
+      input,
+      prep,
+    );
+
+    const [updated] = await tx.db
+      .update(salesReceipts)
+      .set({
+        customerId: input.customerId ?? null,
+        date: input.date,
+        method: prep.method,
+        reference: input.reference ?? null,
+        classId: input.classId ?? null,
+        subtotal: toAmountString(prep.subtotal),
+        taxAmount: toAmountString(prep.taxAmount),
+        total: toAmountString(prep.total),
+        depositAccountId: prep.depositAccountId,
+        memo: input.memo ?? null,
+        taxRateId: input.taxRateId ?? null,
+        ...shippingColumns(input, receipt),
+        postedEntryId: entry.id,
+      })
+      .where(eq(salesReceipts.id, id))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'sales_receipt',
+      entityId: id,
+      oldValues: {
+        customerId: receipt.customerId,
+        date: receipt.date,
+        method: receipt.method,
+        total: receipt.total,
+        depositAccountId: receipt.depositAccountId,
+        postedEntryId: receipt.postedEntryId,
+        lines: oldLines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),
+      },
+      newValues: {
+        customerId: input.customerId ?? null,
+        date: input.date,
+        method: prep.method,
+        total: toAmountString(prep.total),
+        depositAccountId: prep.depositAccountId,
+        postedEntryId: entry.id,
+        cogsEntries,
+        lines: prep.computedLines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),
+      },
+    });
+
+    return { ...updated, lines: insertedLines };
   });
 }

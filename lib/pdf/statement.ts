@@ -401,16 +401,27 @@ export async function renderStatementPdf(
         break;
       }
 
-      const isInvoice = line.type === 'invoice';
-      const isJournal = line.type === 'general_journal';
+      // Charges increase the balance; payments, discounts and credit memos reduce it.
       // General Journal amounts are signed: + is a charge, − a credit.
-      const isCharge = isInvoice || (isJournal && !line.amount.startsWith('-'));
+      const isJournal = line.type === 'general_journal';
+      const isCharge =
+        line.type === 'invoice' || line.type === 'statement_charge' || line.type === 'bounced_check' ||
+        (isJournal && !line.amount.startsWith('-'));
       const absAmount = line.amount.replace(/^-/, '');
-      const refStr    = isInvoice && line.ref ? `Inv #${line.ref}` : (line.ref ?? '—');
+      const refStr    = line.type === 'invoice' && line.ref ? `Inv #${line.ref}` : (line.ref ?? '—');
+      const typeLabel: Record<string, string> = {
+        invoice: 'Invoice',
+        statement_charge: 'Statement Charge',
+        bounced_check: 'Returned Check',
+        credit_memo: 'Credit Memo',
+        discount: 'Discount',
+        payment: 'Payment',
+        general_journal: 'General Journal',
+      };
 
       drawTableRow(
         fmtDate(line.date),
-        isInvoice ? 'Invoice' : line.type === 'credit_memo' ? 'Credit Memo' : isJournal ? 'General Journal' : 'Payment',
+        typeLabel[line.type] ?? 'Payment',
         refStr,
         isCharge ? fmt(absAmount) : '',
         isCharge ? '' : fmt(absAmount),

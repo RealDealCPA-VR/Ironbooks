@@ -208,7 +208,7 @@ describe('updateInvoice', () => {
     expect(tb.totalDebit).toBe(tb.totalCredit);
   });
 
-  it('rejects edits once a payment has been applied', async () => {
+  it('edits a partly paid invoice but never below what has been applied (wave2 sales C1)', async () => {
     const inv = await createInvoice(ctx, {
       customerId,
       date: new Date('2025-04-10'),
@@ -216,13 +216,25 @@ describe('updateInvoice', () => {
     });
     await markPaidAmount(ctx, inv.id, '50.00');
 
+    // Raising the invoice keeps the $50 applied and re-opens the rest.
+    const edited = await updateInvoice(ctx, inv.id, {
+      customerId,
+      date: new Date('2025-04-10'),
+      lines: [{ description: 'Service', quantity: 1, rate: 300 }],
+    });
+    expect(edited.total).toBe('300.00');
+    expect(edited.amountPaid).toBe('50.00');
+    expect(edited.balanceDue).toBe('250.00');
+    expect(edited.status).toBe('partial');
+
+    // Shrinking it below the applied $50 would break the payment — refused in plain language.
     await expect(
       updateInvoice(ctx, inv.id, {
         customerId,
         date: new Date('2025-04-10'),
-        lines: [{ description: 'Service', quantity: 1, rate: 300 }],
+        lines: [{ description: 'Service', quantity: 1, rate: 40 }],
       }),
-    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    ).rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringMatching(/cannot be less than that/) });
   });
 
   it('rejects edits to a voided invoice', async () => {

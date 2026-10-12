@@ -16,6 +16,8 @@
  */
 import { and, eq, inArray } from 'drizzle-orm';
 import {
+  bouncedChecks,
+  collectionNotes,
   customers,
   vendors,
   invoices,
@@ -174,6 +176,16 @@ export async function mergeCustomers(
       .set({ customerId: toId })
       .where(and(eq(mileageLogs.customerId, fromId), eq(mileageLogs.companyId, tx.companyId)))
       .returning({ id: mileageLogs.id });
+
+    // wave2 sales: bounced-check records and collections notes follow the customer.
+    await tx.db
+      .update(bouncedChecks)
+      .set({ customerId: toId })
+      .where(and(eq(bouncedChecks.customerId, fromId), eq(bouncedChecks.companyId, tx.companyId)));
+    await tx.db
+      .update(collectionNotes)
+      .set({ customerId: toId })
+      .where(and(eq(collectionNotes.customerId, fromId), eq(collectionNotes.companyId, tx.companyId)));
 
     // customerPrices: drop any from-customer price whose item is already priced for the
     // survivor (no unique constraint exists, but we avoid creating duplicate price rows),

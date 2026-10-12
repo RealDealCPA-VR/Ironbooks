@@ -3,6 +3,8 @@
  * POST   /api/credit-memos/:id              — actions:
  *           { action: 'apply',  invoiceId, amount }
  *           { action: 'refund', bankAccountId, amount, date?, memo? }
+ *           { action: 'unapply', applicationId }      — undo one credit application (wave2 sales)
+ * PUT/PATCH /api/credit-memos/:id           — edit the memo (void + re-post, wave2 sales C1)
  * DELETE /api/credit-memos/:id              — void the credit memo
  */
 import { NextRequest, NextResponse } from 'next/server';
@@ -12,8 +14,13 @@ import {
   applyToInvoice,
   refundCreditMemo,
   voidCreditMemo,
+  updateCreditMemo,
+  listCreditApplications,
+  unapplyCreditApplication,
 } from '@/lib/services/creditMemos';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createCreditMemoSchema } from '@/lib/validation/creditMemos';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -40,7 +47,8 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
     const { id } = await params;
     const ctx = await getServerContext();
     const memo = await getCreditMemo(ctx, id);
-    return NextResponse.json(memo);
+    const applications = await listCreditApplications(ctx, { creditMemoId: id });
+    return NextResponse.json({ ...memo, applications });
   } catch (err) {
     return errorResponse(err);
   }
@@ -88,13 +96,42 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json(result);
     }
 
+    if (body.action === 'unapply') {
+      if (!body.applicationId) {
+        return NextResponse.json({ error: 'applicationId is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      const apps = await listCreditApplications(ctx, { creditMemoId: id });
+      if (!apps.some((a) => a.id === body.applicationId)) {
+        return NextResponse.json({ error: 'Credit application not found', code: 'NOT_FOUND' }, { status: 404 });
+      }
+      return NextResponse.json(await unapplyCreditApplication(ctx, body.applicationId));
+    }
+
     return NextResponse.json(
-      { error: `Unknown action '${body.action}'. Supported: apply, refund`, code: 'VALIDATION' },
+      { error: `Unknown action '${body.action}'. Supported: apply, refund, unapply`, code: 'VALIDATION' },
       { status: 400 },
     );
   } catch (err) {
     return errorResponse(err);
   }
+}
+
+export async function PUT(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json().catch(() => ({}));
+    const parsed = createCreditMemoSchema.safeParse(body);
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    return NextResponse.json(await updateCreditMemo(ctx, id, parsed.data));
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
+/** Alias of PUT — the shared api client exposes patch. */
+export async function PATCH(req: NextRequest, rc: RouteContext) {
+  return PUT(req, rc);
 }
 
 export async function DELETE(_req: NextRequest, { params }: RouteContext) {
