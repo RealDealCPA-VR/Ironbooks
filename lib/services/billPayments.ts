@@ -36,6 +36,7 @@ import {
   billPaymentApplications,
   journalEntries,
   journalEntryLines,
+  vendorCredits,
   vendors,
 } from '@/lib/db/schema';
 import {
@@ -54,10 +55,15 @@ import {
   resolveDocumentCurrency,
 } from './currencies';
 import { entryHasReconciledLines } from './postedEdit';
+import { assertPeriodOpen } from './fiscalPeriods';
+import { applyToBill } from './vendorCredits';
 import {
   type JournalCreditToBillInput,
   type JournalItemPaymentInput,
+  type JournalOffsetInput,
   applyJournalCreditsToBills,
+  applyJournalOffsets,
+  journalOffsetsOf,
   listJournalApplications,
   recordJournalPayablesPaid,
   reverseJournalApplicationsForBillPayment,
@@ -108,6 +114,23 @@ export interface PayBillsInput {
   journalItems?: JournalItemPaymentInput[] | null;
   /** General Journal A/P debits (vendor credits) applied to bills in this Pay Bills session. */
   journalCredits?: JournalCreditToBillInput[] | null;
+  /**
+   * P1: General Journal A/P debits (vendor credits) applied to General Journal A/P credits
+   * (amounts owed) of the same vendor. No GL — both lines already sit in A/P.
+   */
+  journalOffsets?: JournalOffsetInput[] | null;
+  /**
+   * P1: vendor credit documents applied to bills in the same Pay Bills save (payBillsWithCredits),
+   * so credits and the payment are saved together or not at all.
+   */
+  vendorCredits?: VendorCreditUse[] | null;
+}
+
+/** A vendor credit document applied to a bill in Pay Bills. */
+export interface VendorCreditUse {
+  vendorCreditId: string;
+  billId: string;
+  amount: string | number;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +208,7 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
     throw validation('Duplicate billId in applications. Combine amounts into a single application per bill.');
   }
 
+  if (!input.paymentAccountId) throw validation('Select the account to pay from.');
   const [vendor] = await ctx.db
     .select({ id: vendors.id, name: vendors.displayName, currency: vendors.currency })
     .from(vendors)
@@ -474,6 +498,13 @@ async function applyJournalRows(tx: ServiceContext, paymentId: string, input: Pa
     billPaymentId: paymentId,
     credits: input.journalCredits ?? [],
   });
+  await applyJournalOffsets(tx, {
+    side: 'ap',
+    entityId: input.vendorId,
+    date: input.date,
+    billPaymentId: paymentId,
+    offsets: input.journalOffsets ?? [],
+  });
 }
 
 function referenceFor(input: PayBillsInput): { reference: string | null; toPrint: boolean } {
@@ -550,6 +581,7 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
         postedEntryId: entry.id,
         journalItems: input.journalItems ?? [],
         journalCredits: input.journalCredits ?? [],
+        journalOffsets: input.journalOffsets ?? [],
         applications: prep.rows.map((r) => ({
           billId: r.id,
           amountApplied: r.applied,
@@ -561,6 +593,90 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
     });
 
     return payment;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// payBillsWithCredits — one Pay Bills save: credits and payment together (P1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Save a Pay Bills screen in ONE transaction (QuickBooks saves the credits and the bill payment
+ * together): vendor credit documents applied to bills, General Journal credits applied to bills or
+ * to General Journal amounts owed, and — when any cash is paid — the bill payment itself. If any
+ * part is refused (a credit used twice, a bill over-applied, a closed period, a duplicate check
+ * number…), nothing is saved.
+ *
+ * Returns the bill payment, or null when only credits were applied (no money left the bank).
+ */
+export async function payBillsWithCredits(
+  ctx: ServiceContext,
+  input: PayBillsInput,
+): Promise<{ payment: typeof billPayments.$inferSelect | null; creditsApplied: string }> {
+  const vendorCreditUses = input.vendorCredits ?? [];
+  const journalCredits = input.journalCredits ?? [];
+  const journalOffsets = input.journalOffsets ?? [];
+  for (const a of input.applications) {
+    if (!Money.of(a.amountApplied).greaterThan(0) && Money.of(a.discountTaken ?? 0).greaterThan(0)) {
+      throw validation('An early-payment discount needs a cash payment on the same bill. Enter the amount you are paying.');
+    }
+  }
+  const hasPayment =
+    input.applications.some((a) => Money.of(a.amountApplied).greaterThan(0)) || (input.journalItems ?? []).length > 0;
+  const { reference } = referenceFor(input);
+  if (hasPayment && reference && input.method === 'check' && input.checkDuplicateNumber) {
+    await assertCheckNumberAvailable(ctx, { paymentAccountId: input.paymentAccountId, number: reference });
+  }
+
+  return inTransaction(ctx, async (tx) => {
+    await assertPeriodOpen(tx, input.date);
+    let creditsApplied = Money.zero();
+
+    // 1. Vendor credit documents -> bills (balances drop before the cash is validated).
+    for (const use of vendorCreditUses) {
+      const [vc] = await tx.db
+        .select({ vendorId: vendorCredits.vendorId })
+        .from(vendorCredits)
+        .where(and(eq(vendorCredits.id, use.vendorCreditId), eq(vendorCredits.companyId, tx.companyId)));
+      if (!vc) throw notFound('Vendor credit');
+      if (vc.vendorId !== input.vendorId) throw validation('A vendor credit you picked belongs to a different vendor.');
+      await applyToBill(tx, { vendorCreditId: use.vendorCreditId, billId: use.billId, amount: use.amount });
+      creditsApplied = creditsApplied.plus(Money.round2(use.amount));
+    }
+    for (const c of [...journalCredits, ...journalOffsets]) creditsApplied = creditsApplied.plus(Money.round2(c.amount));
+
+    // 2. The bill payment (cash), with the General Journal credits linked to it.
+    if (hasPayment) {
+      const payment = await payBills(tx, {
+        ...input,
+        applications: input.applications.filter((a) => Money.of(a.amountApplied).greaterThan(0)),
+        vendorCredits: null,
+        checkDuplicateNumber: false, // checked above, before the transaction
+      });
+      return { payment, creditsApplied: toAmountString(creditsApplied) };
+    }
+
+    // 3. Credits only: no money moves, so there is no bill payment (as in QuickBooks).
+    if (vendorCreditUses.length === 0 && journalCredits.length === 0 && journalOffsets.length === 0) {
+      throw validation('Nothing to pay — enter cash amounts or credits.');
+    }
+    const journalRows = [
+      ...(await applyJournalCreditsToBills(tx, { vendorId: input.vendorId, date: input.date, credits: journalCredits })),
+      ...(await applyJournalOffsets(tx, { side: 'ap', entityId: input.vendorId, date: input.date, offsets: journalOffsets })),
+    ];
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'vendor',
+      entityId: input.vendorId,
+      newValues: {
+        action: 'pay_bills_credits_only',
+        vendorCredits: vendorCreditUses,
+        journalCredits,
+        journalOffsets,
+        journalApplications: journalRows.map((r) => r.id),
+      },
+    });
+    return { payment: null, creditsApplied: toAmountString(creditsApplied) };
   });
 }
 
@@ -609,6 +725,10 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
       .from(billPaymentApplications)
       .where(eq(billPaymentApplications.billPaymentId, id));
     const oldJournal = await listJournalApplications(tx, { billPaymentId: id });
+    // P1: an edit that does not mention General Journal credit -> amount-owed applications keeps them.
+    if (input.journalOffsets === undefined) {
+      input = { ...input, journalOffsets: await journalOffsetsOf(tx, { billPaymentId: id }) };
+    }
 
     // Header-only edit? Compare the financial shape (discounts live in the GL, so any
     // discount on the old payment forces the full path — it cannot be compared cheaply).
@@ -627,7 +747,10 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
     const sameRate =
       !cur.currency || input.exchangeRate == null || Money.of(input.exchangeRate).equals(Money.of(cur.exchangeRate ?? 1));
     const noJournal =
-      oldJournal.length === 0 && (input.journalItems ?? []).length === 0 && (input.journalCredits ?? []).length === 0;
+      oldJournal.length === 0 &&
+      (input.journalItems ?? []).length === 0 &&
+      (input.journalCredits ?? []).length === 0 &&
+      (input.journalOffsets ?? []).length === 0;
     const headerOnly =
       noJournal &&
       sameApps &&
@@ -842,8 +965,9 @@ export async function getBillPayment(ctx: ServiceContext, id: string) {
 
   // I11: General Journal amounts this payment paid and journal credits applied with it.
   const journalApplications = await listJournalApplications(ctx, { billPaymentId: id });
+  const journalOffsets = await journalOffsetsOf(ctx, { billPaymentId: id });
 
-  return { ...payment, applications, journalApplications, discountTotal, discountAccountId };
+  return { ...payment, applications, journalApplications, journalOffsets, discountTotal, discountAccountId };
 }
 
 /** Bills (ids) for a set of payments — used by the edit form to show the paid bills. */

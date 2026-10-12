@@ -541,6 +541,51 @@ export async function applyJournalOffsets(
   return out;
 }
 
+/**
+ * The General Journal credit -> charge applications made by one received payment / bill payment,
+ * as offset inputs (credit line, charge line, amount) — so an edit can show and re-post them.
+ */
+export async function journalOffsetsOf(
+  ctx: ServiceContext,
+  opts: { paymentId?: string; billPaymentId?: string },
+): Promise<JournalOffsetInput[]> {
+  const conds = [eq(journalItemApplications.companyId, ctx.companyId), eq(journalItemApplications.kind, 'journal_offset')];
+  if (opts.paymentId) conds.push(eq(journalItemApplications.paymentId, opts.paymentId));
+  else if (opts.billPaymentId) conds.push(eq(journalItemApplications.billPaymentId, opts.billPaymentId));
+  else return [];
+  const rows = await ctx.db
+    .select({
+      pairId: journalItemApplications.pairId,
+      side: journalItemApplications.side,
+      lineId: journalItemApplications.journalLineId,
+      amount: journalItemApplications.amount,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+    })
+    .from(journalItemApplications)
+    .innerJoin(journalEntryLines, eq(journalEntryLines.id, journalItemApplications.journalLineId))
+    .where(and(...conds))
+    .orderBy(asc(journalItemApplications.createdAt));
+  const byPair = new Map<string, typeof rows>();
+  for (const r of rows) {
+    if (!r.pairId) continue;
+    byPair.set(r.pairId, [...(byPair.get(r.pairId) ?? []), r]);
+  }
+  const out: JournalOffsetInput[] = [];
+  for (const pair of byPair.values()) {
+    // A/R: the credit line is the one with more credit than debit; A/P: the one with more debit.
+    const isCreditLine = (r: (typeof rows)[number]) => {
+      const net = Money.of(r.debit ?? 0).minus(Money.of(r.credit ?? 0));
+      return r.side === 'ar' ? net.lessThan(0) : net.greaterThan(0);
+    };
+    const creditRow = pair.find(isCreditLine);
+    const chargeRow = pair.find((r) => !isCreditLine(r));
+    if (!creditRow || !chargeRow) continue;
+    out.push({ journalLineId: creditRow.lineId, chargeLineId: chargeRow.lineId, amount: toAmountString(creditRow.amount) });
+  }
+  return out;
+}
+
 type ApplicationRow = typeof journalItemApplications.$inferSelect;
 
 /**

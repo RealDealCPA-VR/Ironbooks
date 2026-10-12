@@ -148,6 +148,8 @@ export default function PayBillsPage() {
   const [journalPayables, setJournalPayables] = useState<JournalOpenRow[]>([]);
   const [journalCredits, setJournalCredits] = useState<JournalOpenRow[]>([]);
   const [journalPay, setJournalPay] = useState<Record<string, string>>({});
+  // P1: General Journal vendor credits applied to General Journal amounts owed (line id -> amount).
+  const [journalCreditUse, setJournalCreditUse] = useState<Record<string, string>>({});
   const [rows, setRows] = useState<Record<string, RowState>>({});
   const [loadingBills, setLoadingBills] = useState(false);
 
@@ -208,6 +210,7 @@ export default function PayBillsPage() {
       setJournalPayables([]);
       setJournalCredits([]);
       setJournalPay({});
+      setJournalCreditUse({});
       return;
     }
     setLoadingBills(true);
@@ -226,6 +229,7 @@ export default function PayBillsPage() {
       setJournalPayables(journalData.charges ?? []);
       setJournalCredits(journalData.credits ?? []);
       setJournalPay({});
+      setJournalCreditUse({});
       setPayments(payData.payments.filter((p) => !p.voidedAt));
       const open = billData.bills.filter(
         (b) => (b.status === 'open' || b.status === 'partial') && Number(b.balanceDue) > 0,
@@ -266,13 +270,19 @@ export default function PayBillsPage() {
   const journalItems = journalPayables
     .filter((j) => num(journalPay[j.journalLineId] ?? '') > 0)
     .map((j) => ({ journalLineId: j.journalLineId, amount: num(journalPay[j.journalLineId]).toFixed(2) }));
-  const journalOverpaid = journalPayables.some((j) => num(journalPay[j.journalLineId] ?? '') > Number(j.open) + 0.005);
+  const journalOverpaid = journalPayables.some(
+    (j) => num(journalPay[j.journalLineId] ?? '') + num(journalCreditUse[j.journalLineId] ?? '') > Number(j.open) + 0.005,
+  );
   const journalCashTotal = journalItems.reduce((s, j) => s + Number(j.amount), 0);
   const cashTotal = selected.reduce((s, b) => s + num(rows[b.id].payAmount), 0) + journalCashTotal;
   const discountTotal = selected.reduce((s, b) => s + num(rows[b.id].discount), 0);
-  const creditTotal = selected.reduce((s, b) => s + num(rows[b.id].credit), 0);
+  // P1: General Journal vendor credits used on General Journal amounts owed (journal credits only).
+  const journalCreditOnJournal = journalPayables.reduce((s, j) => s + num(journalCreditUse[j.journalLineId] ?? ''), 0);
+  const journalCreditAvailable = journalCredits.reduce((s, c) => s + Number(c.open), 0);
+  const creditTotal = selected.reduce((s, b) => s + num(rows[b.id].credit), 0) + journalCreditOnJournal;
 
-  const creditOverdrawn = creditTotal > availableCredit + 0.005;
+  const creditOverdrawn =
+    creditTotal > availableCredit + 0.005 || journalCreditOnJournal > journalCreditAvailable + 0.005;
 
   // ── row helpers ───────────────────────────────────────────────────────────
 
@@ -306,7 +316,7 @@ export default function PayBillsPage() {
     if (pay < 0 || disc < 0 || cred < 0) return 'Amounts cannot be negative';
     if (pay + disc + cred > Number(bill.balanceDue) + 0.005) return 'Exceeds balance due';
     if (pay === 0 && disc === 0 && cred === 0) return 'Enter an amount';
-    if (disc > 0 && pay + cred === 0) return 'Discount requires a payment or credit';
+    if (disc > 0 && pay === 0) return 'A discount needs a payment on this bill';
     return null;
   }
 
@@ -319,7 +329,7 @@ export default function PayBillsPage() {
       toast('Select a vendor first.', 'danger');
       return;
     }
-    if (selected.length === 0 && journalItems.length === 0) {
+    if (selected.length === 0 && journalItems.length === 0 && journalCreditOnJournal === 0) {
       toast('Check at least one bill to pay.', 'danger');
       return;
     }
@@ -350,33 +360,38 @@ export default function PayBillsPage() {
 
     setSubmitting(true);
     try {
-      // 1. Apply vendor credits per bill (greedy across open credits): vendor credit documents
-      //    first, then General Journal vendor credits (I11).
-      const pool = [
-        ...credits.map((c) => ({ id: c.id, journal: false, remaining: Number(c.unapplied) })),
-        ...journalCredits.map((c) => ({ id: c.journalLineId, journal: true, remaining: Number(c.open) })),
-      ];
-      // General Journal credits go in the same save as the payment (one transaction), or are
-      // applied on their own when no payment is being made.
+      // 1. Work out which open credit covers what (greedy, in cents). General Journal amounts owed
+      //    can only take General Journal vendor credits; bills take vendor credit documents first,
+      //    then what is left of the General Journal credits (I11). Nothing is saved yet — the
+      //    credits and the payment are saved together in ONE request below (all or nothing).
+      const cents = (v: number) => Math.round(v * 100);
+      const docPool = credits.map((c) => ({ id: c.id, remaining: cents(Number(c.unapplied)) }));
+      const journalPool = journalCredits.map((c) => ({ id: c.journalLineId, remaining: cents(Number(c.open)) }));
+      const vendorCreditApps: Array<{ vendorCreditId: string; billId: string; amount: string }> = [];
       const journalCreditApps: Array<{ journalLineId: string; billId: string; amount: string }> = [];
-      for (const bill of selected) {
-        let toApply = num(rows[bill.id].credit);
-        for (const credit of pool) {
-          if (toApply <= 0) break;
-          if (credit.remaining <= 0) continue;
-          const amount = Math.min(toApply, credit.remaining);
-          if (credit.journal) {
-            journalCreditApps.push({ journalLineId: credit.id, billId: bill.id, amount: amount.toFixed(2) });
-          } else {
-            await api.post(`/api/vendor-credits/${credit.id}`, {
-              action: 'apply',
-              billId: bill.id,
-              amount: amount.toFixed(2),
-            });
-          }
-          credit.remaining -= amount;
-          toApply -= amount;
+      const journalOffsets: Array<{ journalLineId: string; chargeLineId: string; amount: string }> = [];
+      const take = (pool: typeof docPool, want: number, use: (id: string, amount: string) => void) => {
+        let left = want;
+        for (const c of pool) {
+          if (left <= 0) break;
+          if (c.remaining <= 0) continue;
+          const amt = Math.min(left, c.remaining);
+          use(c.id, (amt / 100).toFixed(2));
+          c.remaining -= amt;
+          left -= amt;
         }
+        return left;
+      };
+      for (const j of journalPayables) {
+        const want = cents(num(journalCreditUse[j.journalLineId] ?? ''));
+        if (want > 0) {
+          take(journalPool, want, (id, amount) => journalOffsets.push({ journalLineId: id, chargeLineId: j.journalLineId, amount }));
+        }
+      }
+      for (const bill of selected) {
+        let left = cents(num(rows[bill.id].credit));
+        left = take(docPool, left, (id, amount) => vendorCreditApps.push({ vendorCreditId: id, billId: bill.id, amount }));
+        take(journalPool, left, (id, amount) => journalCreditApps.push({ journalLineId: id, billId: bill.id, amount }));
       }
 
       // 2. Batch cash payment (with discounts taken) for bills with cash > 0.
@@ -389,35 +404,30 @@ export default function PayBillsPage() {
             num(rows[b.id].discount) > 0 ? num(rows[b.id].discount).toFixed(2) : undefined,
         }));
 
-      const withPayment = applications.length > 0 || journalItems.length > 0;
-      if (!withPayment) {
-        for (const c of journalCreditApps) {
-          await api.post('/api/bill-payments/journal-items', { action: 'apply_credit', ...c, date });
-        }
-      }
-
-      if (withPayment) {
-        const queued = method === 'check' && toPrint;
-        const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-          api.post('/api/bill-payments', {
-            vendorId,
-            date,
-            method,
-            reference: queued ? undefined : reference.trim() || undefined,
-            toPrint: queued,
-            paymentAccountId,
-            discountAccountId: discountTotal > 0 ? discountAccountId : undefined,
-            exchangeRate: billCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
-            applications,
-            journalItems,
-            journalCredits: journalCreditApps.length > 0 ? journalCreditApps : undefined,
-            allowDuplicateNumber,
-          }),
-        );
-        if (saved === null) {
-          await loadVendorData(vendorId);
-          return;
-        }
+      // 2. One save: vendor credits, General Journal credits and the cash payment (with discounts)
+      //    are applied in a single transaction — if anything is refused, nothing is saved.
+      const queued = method === 'check' && toPrint;
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        api.post('/api/bill-payments', {
+          vendorId,
+          date,
+          method,
+          reference: queued ? undefined : reference.trim() || undefined,
+          toPrint: queued,
+          paymentAccountId: paymentAccountId || undefined,
+          discountAccountId: discountTotal > 0 ? discountAccountId : undefined,
+          exchangeRate: billCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
+          applications,
+          journalItems,
+          vendorCredits: vendorCreditApps,
+          journalCredits: journalCreditApps,
+          journalOffsets,
+          allowDuplicateNumber,
+        }),
+      );
+      if (saved === null) {
+        await loadVendorData(vendorId);
+        return;
       }
 
       const paidCount = applications.length + journalItems.length;
@@ -430,13 +440,10 @@ export default function PayBillsPage() {
       setReference('');
       await loadVendorData(vendorId);
     } catch (err) {
+      // Nothing was saved (credits and payment go in one transaction), so the screen keeps the
+      // user's entries to fix and try again.
       const f = describeError(err, 'Failed to pay bills.');
-      toast(
-        `${f.title}: ${f.message} ${f.nextStep} Note: vendor credits may already have been applied — review the refreshed balances below.`,
-        'danger',
-      );
-      // Credits may have been applied before the failure — reload to show reality.
-      await loadVendorData(vendorId);
+      toast(`${f.title}: ${f.message} ${f.nextStep}`, 'danger');
     } finally {
       setSubmitting(false);
     }
@@ -803,6 +810,7 @@ export default function PayBillsPage() {
                 <Th>Date</Th>
                 <Th>Memo</Th>
                 <Th numeric>Still owed</Th>
+                {journalCredits.length > 0 && <Th numeric>Credit Applied</Th>}
                 <Th numeric>Amount to Pay</Th>
               </tr>
             </thead>
@@ -813,6 +821,21 @@ export default function PayBillsPage() {
                   <Td>{formatDate(j.date, 'MMM d, yyyy')}</Td>
                   <Td className="text-sm text-navy/70">{j.memo ?? ''}</Td>
                   <Td numeric className="font-semibold">{formatCurrency(j.open)}</Td>
+                  {journalCredits.length > 0 && (
+                    <Td numeric>
+                      {/* P1: a General Journal vendor credit can be applied to a General Journal amount owed. */}
+                      <Input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        placeholder="0.00"
+                        aria-label={`Credit applied to ${j.ref}`}
+                        className="w-28 text-right ml-auto"
+                        value={journalCreditUse[j.journalLineId] ?? ''}
+                        onChange={(e) => setJournalCreditUse((prev) => ({ ...prev, [j.journalLineId]: e.target.value }))}
+                      />
+                    </Td>
+                  )}
                   <Td numeric>
                     <Input
                       type="number"

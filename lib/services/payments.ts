@@ -56,6 +56,7 @@ import {
   applyJournalCreditsToInvoices,
   applyJournalOffsets,
   applyPaymentToJournalCharges,
+  journalOffsetsOf,
   isForeignCurrency,
   listJournalApplications,
   listJournalOpenItems,
@@ -1046,8 +1047,10 @@ export async function getPayment(ctx: ServiceContext, id: string) {
 
   // I11: General Journal charges this payment paid, and General Journal credits applied with it.
   const journalApplications = await listJournalApplications(ctx, { paymentId: id });
+  // P1: General Journal credits it applied to General Journal charges (credit line -> charge line).
+  const journalOffsets = await journalOffsetsOf(ctx, { paymentId: id });
 
-  return { ...payment, applications, credits, journalApplications, bounced: bounced ?? null };
+  return { ...payment, applications, credits, journalApplications, journalOffsets, bounced: bounced ?? null };
 }
 
 // ---- Corrections: void / unapply / apply-later / refund -----------------------
@@ -1288,6 +1291,8 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
       .select({ creditMemoId: creditApplications.creditMemoId, invoiceId: creditApplications.invoiceId, amount: creditApplications.amount })
       .from(creditApplications)
       .where(and(eq(creditApplications.companyId, tx.companyId), eq(creditApplications.paymentId, id)));
+    // P1: an edit that does not mention General Journal credit -> charge applications keeps them.
+    const keptOffsets = input.journalOffsets === undefined ? await journalOffsetsOf(tx, { paymentId: id }) : null;
     const oldApps = await reversePaymentEffects(tx, payment);
     await writeAudit(tx, {
       action: 'update',
@@ -1312,7 +1317,7 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
     if ((input.paymentCredits ?? []).length > 0) {
       await applyEarlierPayments(tx, input.customerId, input.paymentCredits!, id);
     }
-    return postPayment(tx, { ...input, paymentCredits: null }, id);
+    return postPayment(tx, { ...input, paymentCredits: null, journalOffsets: keptOffsets ?? input.journalOffsets }, id);
   });
 }
 
