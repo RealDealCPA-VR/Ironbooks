@@ -1650,7 +1650,7 @@ export const memorizedReportGroups = pgTable('memorized_report_groups', {
 
 /**
  * Scheduled reports: run a memorized report (or a whole group) on a schedule and save the export
- * to a local folder. The desktop shell's timer calls POST /api/report-schedules/run-due.
+ * to a local folder. The desktop shell's timer calls POST /api/reports/schedules/run-due (alias of /api/report-schedules/run-due).
  */
 export const reportSchedules = pgTable('report_schedules', {
   id: uuid('id').primaryKey().defaultRandom(),

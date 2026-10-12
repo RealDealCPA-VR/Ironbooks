@@ -17,9 +17,9 @@ import { reportToCsv, reportToTable, type StdReport } from '@/lib/reports/types'
 import { type ServiceContext, notFound, validation, writeAudit, inTransaction } from './_base';
 import { runStandardReport, standardReportEntry } from './reportRegistry';
 import { runReport, type ReportConfig } from './reportBuilder';
-import { requirePermission } from './access';
+import { requirePermission, resolveAccess } from './access';
 import { requireAnyReportAccess } from './reportsAccess';
-import type { Area } from '@/lib/permissions/model';
+import { can, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 
 /**
  * Permission area a memorized report's data belongs to. Report builder ("custom") reports read
@@ -240,6 +240,40 @@ async function getGroup(ctx: ServiceContext, id: string) {
   return g;
 }
 
+/** Report types a schedule would run: its one memorized report, or every report in its group. */
+async function scheduleReportTypes(
+  ctx: ServiceContext,
+  target: { memorizedReportId?: string | null; groupId?: string | null },
+): Promise<string[]> {
+  if (target.memorizedReportId) {
+    const [row] = await ctx.db
+      .select({ reportType: memorizedReports.reportType })
+      .from(memorizedReports)
+      .where(and(eq(memorizedReports.id, target.memorizedReportId), eq(memorizedReports.companyId, ctx.companyId)));
+    return row ? [row.reportType] : [];
+  }
+  if (target.groupId) {
+    const rows = await ctx.db
+      .select({ reportType: memorizedReports.reportType })
+      .from(memorizedReports)
+      .where(and(eq(memorizedReports.companyId, ctx.companyId), eq(memorizedReports.groupId, target.groupId)));
+    return rows.map((r) => r.reportType);
+  }
+  return [];
+}
+
+/**
+ * True when `access` may view every report a schedule runs. Report types no longer in the catalog
+ * can't run (and expose no data), so they don't block. Undefined access = trusted context.
+ */
+function canRunReportTypes(access: EffectiveAccess | undefined, types: string[]): boolean {
+  if (!access) return true;
+  return types.every((t) => {
+    const area = typeof t === 'string' ? areaForReportType(t) : undefined;
+    return !area || can(access, area, 'view');
+  });
+}
+
 export async function renameMemorizedGroup(ctx: ServiceContext, id: string, input: { name: string }) {
   requireAnyReportAccess(ctx);
   const g = await getGroup(ctx, id);
@@ -391,8 +425,20 @@ export async function createReportSchedule(
 ) {
   requirePermission(ctx, 'file_utilities', 'create');
   if (!!input.memorizedReportId === !!input.groupId) throw validation('Choose either one memorized report or one report group.');
-  if (input.memorizedReportId) await getMemorized(ctx, input.memorizedReportId);
-  if (input.groupId) await getGroup(ctx, input.groupId);
+  if (input.memorizedReportId) {
+    // A schedule later runs unattended and writes the report to disk, so the person setting it up
+    // must be able to view that report's own area (file_utilities alone is not enough).
+    const row = await getMemorized(ctx, input.memorizedReportId);
+    requireExistingRowAccess(ctx, row.reportType);
+  }
+  if (input.groupId) {
+    await getGroup(ctx, input.groupId);
+    requireAnyReportAccess(ctx);
+    for (const t of await scheduleReportTypes(ctx, { groupId: input.groupId })) {
+      const area = typeof t === 'string' ? areaForReportType(t) : undefined;
+      if (area) requirePermission(ctx, area, 'view');
+    }
+  }
   const start = input.startDate ? new Date(`${input.startDate}T06:00:00.000Z`) : new Date();
   if (Number.isNaN(start.getTime())) throw validation('Invalid start date.');
   return inTransaction(ctx, async (tx) => {
@@ -461,7 +507,7 @@ export async function deleteReportSchedule(ctx: ServiceContext, id: string) {
 export interface ScheduleRunResult {
   scheduleId: string;
   name: string;
-  status: 'ok' | 'partial' | 'failed';
+  status: 'ok' | 'partial' | 'failed' | 'skipped';
   files: string[];
   message?: string;
 }
@@ -471,6 +517,14 @@ export interface ScheduleRunResult {
  * files into the export folder, then advance nextRunAt past `now` (missed runs are not replayed
  * one by one). Email delivery is intentionally not done here — reports leave the machine only if
  * the user sends them.
+ *
+ * Whose access a schedule runs with:
+ *  - Trusted context (the desktop timer's internal token): the schedule's creator's current access,
+ *    so a report added later to a scheduled group, or an area the creator has since lost, is not
+ *    exported. A creator who is no longer an active member → the run fails (and moves on).
+ *  - A signed-in user ("Run due reports now"): that user's access. A schedule that would run a
+ *    report the user can't view is skipped and left due (not marked failed, nextRunAt unchanged),
+ *    so the timer or its owner still runs it and that period's export is not lost.
  */
 export async function runDueSchedules(
   ctx: ServiceContext,
@@ -484,14 +538,35 @@ export async function runDueSchedules(
     .from(reportSchedules)
     .where(and(eq(reportSchedules.companyId, ctx.companyId), eq(reportSchedules.isActive, true), lte(reportSchedules.nextRunAt, now)));
   const results: ScheduleRunResult[] = [];
+  const creatorAccess = new Map<string, EffectiveAccess | null>();
   for (const s of due) {
+    if (ctx.access && !canRunReportTypes(ctx.access, await scheduleReportTypes(ctx, s))) {
+      results.push({
+        scheduleId: s.id,
+        name: s.name,
+        status: 'skipped',
+        files: [],
+        message: 'You do not have permission to run this report. It stays due and will run for someone who can.',
+      });
+      continue;
+    }
     const files: string[] = [];
     let status: ScheduleRunResult['status'] = 'ok';
     let message: string | undefined;
     try {
+      let runCtx: ServiceContext = ctx;
+      if (!ctx.access && s.createdBy) {
+        if (!creatorAccess.has(s.createdBy)) {
+          const r = await resolveAccess(ctx.db, ctx.companyId, s.createdBy);
+          creatorAccess.set(s.createdBy, r.member && r.active ? r.access : null);
+        }
+        const access = creatorAccess.get(s.createdBy);
+        if (!access) throw new Error('The person who set up this schedule no longer has access to this company.');
+        runCtx = { ...ctx, access };
+      }
       const processed = s.groupId
-        ? await processMultipleReports(ctx, { groupId: s.groupId })
-        : await processMultipleReports(ctx, { ids: [s.memorizedReportId!] });
+        ? await processMultipleReports(runCtx, { groupId: s.groupId })
+        : await processMultipleReports(runCtx, { ids: [s.memorizedReportId!] });
       const ok = processed.filter((p) => p.report);
       const failed = processed.filter((p) => p.error);
       if (processed.length === 0) throw new Error('The memorized report or group no longer exists.');

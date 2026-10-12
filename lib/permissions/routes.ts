@@ -110,6 +110,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/report-schedules': r('file_utilities', 'GET POST'),
   '/api/report-schedules/[id]': r('file_utilities', 'PATCH:modify DELETE'),
   '/api/report-schedules/run-due': r('file_utilities', 'POST:create'),
+  '/api/reports/schedules/run-due': r('file_utilities', 'POST:create'),
   // Privacy & Network (team hosting): any member may read the policy (admins see more; the
   // route decides) and ask whether a destination is allowed; changing it is a company setting
   // (the service additionally requires owner/admin).
