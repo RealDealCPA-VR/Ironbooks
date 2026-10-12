@@ -33,7 +33,7 @@ import type { ServiceContext } from './_base';
 import { getPreferences } from './company';
 import { listUndepositedPayments } from './deposits';
 import { reorderReport } from './inventoryOps';
-import { listTodos } from './todos';
+import { todosToRemind } from './todos';
 
 export interface ReminderItem {
   id: string;
@@ -86,7 +86,7 @@ const HREF: Record<ReminderKey, string> = {
   memorizedTransactionsDue: '/recurring',
   moneyToDeposit: '/deposits',
   purchaseOrdersToPrint: '/purchase-orders',
-  toDoNotes: '/calendar',
+  toDoNotes: '/todos',
 };
 
 function isoDay(d: Date | string | null | undefined): string | null {
@@ -264,8 +264,15 @@ const SOURCES: Record<ReminderKey, Source> = {
       .map((r) => ({ id: r.id, label: `P.O. ${r.n} — ${r.vendor}`, date: isoDay(r.expected ?? r.date), amount: r.total, href: '/purchase-orders' }));
   },
   async toDoNotes(ctx, today, days) {
-    const rows = await listTodos(ctx, { dueOnOrBefore: addDaysIso(today, days), includeUndated: false });
-    return rows.map((r) => ({ id: r.id, label: r.title, date: r.dueDate, amount: null, href: '/calendar' }));
+    // THE To Do list: open to-dos due within the window, or whose "remind me on" day has come.
+    const rows = await todosToRemind(ctx, today, addDaysIso(today, days));
+    return rows.map((r) => ({
+      id: r.id,
+      label: r.entityName ? `${r.title} (${r.entityName})` : r.title,
+      date: r.dueDate,
+      amount: null,
+      href: '/todos',
+    }));
   },
 };
 

@@ -1,25 +1,19 @@
 /**
- * GET  /api/calendar/todos[?includeDone=1&entityType=&entityId=] — the To Do list
- * POST /api/calendar/todos — create { title, notes?, kind?, priority?, dueDate?, dueTime?, entityType?, entityId? }
+ * Alias of /api/todos kept for older callers (Calendar / Lead Center before the To Do lists were
+ * merged). Same store, same rules; GET returns a bare array and defaults to open to-dos.
+ * GET  /api/calendar/todos[?includeDone=1&entityType=&entityId=&status=]
+ * POST /api/calendar/todos — create (same body as POST /api/todos)
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { createTodo, listTodos } from '@/lib/services/todos';
+import { createTodo, parseTodoBody } from '@/lib/services/todos';
 import { routeError } from '@/lib/routeErrors';
-import { zodErrorBody } from '@/lib/validation/helpers';
-import { createTodoSchema } from '@/lib/validation/prefs';
+import { listTodosFromQuery } from '@/app/api/todos/query';
 
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const sp = req.nextUrl.searchParams;
-    return NextResponse.json(
-      await listTodos(ctx, {
-        includeDone: sp.get('includeDone') === '1',
-        entityType: sp.get('entityType') ?? undefined,
-        entityId: sp.get('entityId') ?? undefined,
-      }),
-    );
+    return NextResponse.json(await listTodosFromQuery(ctx, req.nextUrl.searchParams, 'open'));
   } catch (err) {
     return routeError(err, 'GET /api/calendar/todos');
   }
@@ -28,9 +22,8 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = createTodoSchema.safeParse(await req.json().catch(() => ({})));
-    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    return NextResponse.json(await createTodo(ctx, parsed.data), { status: 201 });
+    const input = parseTodoBody(await req.json().catch(() => ({})));
+    return NextResponse.json(await createTodo(ctx, input), { status: 201 });
   } catch (err) {
     return routeError(err, 'POST /api/calendar/todos');
   }

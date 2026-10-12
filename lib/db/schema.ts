@@ -1910,7 +1910,10 @@ export const salesTaxCodes = pgTable('sales_tax_codes', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
-/** QB "To Do" list. Optionally linked to a customer/vendor/employee/other name/item. */
+/**
+ * LEGACY (read-only since 0039): the old Lists > To Do store. Its rows were copied into `todos`
+ * (same ids), which is now the only To Do list. Kept so no data is ever lost; nothing writes it.
+ */
 export const todoItems = pgTable('todo_items', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
@@ -2294,6 +2297,12 @@ export const todos = pgTable('todos', {
   entityId: uuid('entity_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  // p1 ux (0039): the ONE To Do store — todo_items rows were copied in under the same ids.
+  /** open | done | inactive (kept in step with `done`). */
+  status: varchar('status', { length: 10 }).notNull().default('open'),
+  assignedUserId: uuid('assigned_user_id').references(() => users.id),
+  /** 'YYYY-MM-DD': show in Reminders from this day (null = by due date and Preferences). */
+  remindOn: varchar('remind_on', { length: 10 }),
 });
 
 /** Lead Center: prospects tracked before they become customers. */
