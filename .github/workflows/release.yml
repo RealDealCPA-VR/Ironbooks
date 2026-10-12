@@ -1,0 +1,19 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci --legacy-peer-deps
+      - name: Build & publish NSIS installer + latest.yml (electron-updater)
+        run: npm run desktop:publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # Actions-provided, contents:write
