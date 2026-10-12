@@ -98,7 +98,7 @@ async function defaultArAp(ctx: ServiceContext) {
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.subtype, ['accounts_receivable', 'accounts_payable'])))
     .orderBy(asc(accounts.code));
   const ap = rows.find((r) => r.code === '2000') ?? rows.find((r) => r.subtype === 'accounts_payable');
-  const ar = rows.find((r) => r.code === '1100') ?? rows.find((r) => r.subtype === 'accounts_receivable');
+  const ar = rows.find((r) => r.code === '1200') ?? rows.find((r) => r.subtype === 'accounts_receivable');
   return { ar, ap };
 }
 
