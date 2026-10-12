@@ -22,6 +22,8 @@ export async function listBankAccounts(ctx: ServiceContext) {
       lastReconciledBalance: bankAccounts.lastReconciledBalance,
       glAccountName: accounts.name,
       glAccountCode: accounts.code,
+      /** p1 fx: the GL account's currency (null = home); feed amounts are in it. */
+      currency: accounts.currency,
     })
     .from(bankAccounts)
     .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))

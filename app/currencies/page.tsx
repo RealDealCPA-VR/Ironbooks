@@ -5,6 +5,7 @@
  * - Lists all currencies for the company (base currency highlighted).
  * - "Add / Update Currency" modal: code, name, rateToBase, isBase toggle.
  * - "FX Adjustment" modal: pick a GL account, enter amount, choose gain/loss, pick date.
+ * - "Home Currency Adjustment" (p1 fx): revalue every foreign balance at entered rates, as QB.
  */
 import { useState, useEffect, useCallback } from 'react';
 import { Coins } from 'lucide-react';
@@ -28,6 +29,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { HomeCurrencyAdjustmentHistory, HomeCurrencyAdjustmentModal } from './HomeCurrencyAdjustment';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -348,6 +350,8 @@ export default function CurrenciesPage() {
   const [editTarget, setEditTarget] = useState<Currency | null>(null);
 
   const [showFxModal, setShowFxModal] = useState(false);
+  const [showHca, setShowHca] = useState(false);
+  const [hcaRefresh, setHcaRefresh] = useState(0);
 
   const loadCurrencies = useCallback(() => {
     setLoading(true);
@@ -389,6 +393,14 @@ export default function CurrenciesPage() {
         icon={Coins}
         action={
           <div className="flex gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setShowHca(true)}
+              disabled={currencies.filter((c) => !c.isBase).length === 0}
+            >
+              Home Currency Adjustment
+            </Button>
             <Button
               variant="secondary"
               size="sm"
@@ -514,6 +526,15 @@ export default function CurrenciesPage() {
         onClose={() => setShowCurrencyModal(false)}
         onSaved={loadCurrencies}
         initial={editTarget}
+      />
+
+      <HomeCurrencyAdjustmentHistory refreshKey={hcaRefresh} />
+
+      <HomeCurrencyAdjustmentModal
+        open={showHca}
+        onClose={() => setShowHca(false)}
+        onPosted={() => { loadCurrencies(); setHcaRefresh((n) => n + 1); }}
+        currencies={currencies}
       />
 
       <FxAdjustmentModal

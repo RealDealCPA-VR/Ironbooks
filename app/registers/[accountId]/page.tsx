@@ -58,12 +58,23 @@ interface RegisterRow {
   debit: string | null;
   credit: string | null;
   runningBalance: string;
+  /** p1 fx: account-currency columns (foreign-currency bank / card accounts only). */
+  foreignDebit?: string | null;
+  foreignCredit?: string | null;
+  foreignRunningBalance?: string;
+  exchangeRate?: string | null;
+  homeOnly?: boolean;
 }
 
 interface RegisterResult {
   account: RegisterAccount;
   openingBalance: string;
   closingBalance: string;
+  /** p1 fx: the account's currency (null = home) and balances in it. */
+  currency?: string | null;
+  homeCurrency?: string | null;
+  foreignOpeningBalance?: string | null;
+  foreignClosingBalance?: string | null;
   totalRows: number;
   offset: number;
   rows: RegisterRow[];
@@ -129,10 +140,12 @@ function columnConfig(subtype: string): ColumnConfig {
 }
 
 /** Map a row's debit/credit to increase/decrease per the account's normal side. */
-function amountFor(row: RegisterRow, accountType: string, key: AmountKey): string | null {
+function amountFor(row: RegisterRow, accountType: string, key: AmountKey, foreign = false): string | null {
   const debitNormal = accountType === 'asset' || accountType === 'expense';
-  const increase = debitNormal ? row.debit : row.credit;
-  const decrease = debitNormal ? row.credit : row.debit;
+  const dr = foreign ? (row.foreignDebit ?? null) : row.debit;
+  const cr = foreign ? (row.foreignCredit ?? null) : row.credit;
+  const increase = debitNormal ? dr : cr;
+  const decrease = debitNormal ? cr : dr;
   return key === 'increase' ? increase : decrease;
 }
 
@@ -262,6 +275,8 @@ function RegisterPageInner() {
 
   const account = result?.account ?? null;
   const config = columnConfig(account?.subtype ?? '');
+  // p1 fx: a foreign-currency bank / card register is shown in the account's currency.
+  const fxCur = result?.currency ?? null;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
@@ -360,9 +375,10 @@ function RegisterPageInner() {
                     <Th>Number</Th>
                     <Th>Payee / Description</Th>
                     <Th>Memo</Th>
-                    <Th numeric>{config.columns[0].label}</Th>
-                    <Th numeric>{config.columns[1].label}</Th>
-                    <Th numeric>Balance</Th>
+                    <Th numeric>{config.columns[0].label}{fxCur ? ` (${fxCur})` : ''}</Th>
+                    <Th numeric>{config.columns[1].label}{fxCur ? ` (${fxCur})` : ''}</Th>
+                    <Th numeric>Balance{fxCur ? ` (${fxCur})` : ''}</Th>
+                    {fxCur && <Th numeric>Balance ({result.homeCurrency ?? 'home'})</Th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -377,17 +393,18 @@ function RegisterPageInner() {
                       <Td
                         numeric
                         className={`font-semibold ${
-                          Number(result.openingBalance) < 0 ? 'text-red-600' : 'text-navy'
+                          Number(fxCur ? result.foreignOpeningBalance : result.openingBalance) < 0 ? 'text-red-600' : 'text-navy'
                         }`}
                       >
-                        {formatCurrency(result.openingBalance)}
+                        {fxCur ? formatCurrency(result.foreignOpeningBalance ?? '0', fxCur) : formatCurrency(result.openingBalance)}
                       </Td>
+                      {fxCur && <Td numeric className="text-navy/60">{formatCurrency(result.openingBalance)}</Td>}
                     </tr>
                   )}
 
                   {result.rows.length === 0 && (
                     <tr>
-                      <Td colSpan={7} className="py-12 text-center text-navy/40">
+                      <Td colSpan={fxCur ? 8 : 7} className="py-12 text-center text-navy/40">
                         No transactions in this register for the selected filters.
                       </Td>
                     </tr>
@@ -420,21 +437,29 @@ function RegisterPageInner() {
                           {row.memo ?? ''}
                         </Td>
                         {config.columns.map((col) => {
-                          const amount = amountFor(row, result.account.type, col.key);
+                          const amount = amountFor(row, result.account.type, col.key, !!fxCur);
                           return (
                             <Td key={col.key} numeric>
-                              {amount ? formatCurrency(amount) : ''}
+                              {amount ? formatCurrency(amount, fxCur ?? undefined) : ''}
+                              {fxCur && row.homeOnly && col.key === 'increase' && (
+                                <span className="block text-[10px] text-navy/40">Home currency adjustment</span>
+                              )}
                             </Td>
                           );
                         })}
                         <Td
                           numeric
                           className={`font-semibold ${
-                            Number(row.runningBalance) < 0 ? 'text-red-600' : 'text-navy'
+                            Number(fxCur ? row.foreignRunningBalance : row.runningBalance) < 0 ? 'text-red-600' : 'text-navy'
                           }`}
                         >
-                          {formatCurrency(row.runningBalance)}
+                          {fxCur ? formatCurrency(row.foreignRunningBalance ?? '0', fxCur) : formatCurrency(row.runningBalance)}
                         </Td>
+                        {fxCur && (
+                          <Td numeric className="text-navy/60" title={row.exchangeRate ? `Rate ${Number(row.exchangeRate)}` : undefined}>
+                            {formatCurrency(row.runningBalance)}
+                          </Td>
+                        )}
                       </tr>
                     );
                   })}
@@ -455,8 +480,13 @@ function RegisterPageInner() {
                     Number(result.closingBalance) < 0 ? 'text-red-600' : 'text-emerald'
                   }`}
                 >
-                  {formatCurrency(result.closingBalance)}
+                  {fxCur ? formatCurrency(result.foreignClosingBalance ?? '0', fxCur) : formatCurrency(result.closingBalance)}
                 </span>
+                {fxCur && (
+                  <span className="ml-3 text-sm font-semibold text-navy/60">
+                    ({formatCurrency(result.closingBalance)} {result.homeCurrency ?? ''})
+                  </span>
+                )}
               </span>
             </div>
           </>

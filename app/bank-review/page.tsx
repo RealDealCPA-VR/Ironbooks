@@ -28,6 +28,7 @@ import {
   Button,
   Card,
   EmptyState,
+  Input,
   Label,
   PageHeader,
   Select,
@@ -59,6 +60,8 @@ interface BankAccount {
   accountNumber: string;
   glAccountName: string;
   glAccountCode: string;
+  /** p1 fx: account currency (null = home); feed amounts are in it. */
+  currency?: string | null;
 }
 
 interface BankTransaction {
@@ -148,6 +151,9 @@ export default function BankReviewPage() {
     autoApplyEnabled: false,
   });
   const [askingId, setAskingId] = useState<string | null>(null);
+  // p1 fx: exchange rate for adding feed lines of a foreign-currency account (blank = list rate).
+  const [fxRate, setFxRate] = useState('');
+  const feedCurrency = bankAccounts.find((b) => b.id === selectedBankAccountId)?.currency ?? null;
 
   // ------------------------------------------------------------------
   // Data fetching
@@ -288,6 +294,8 @@ export default function BankReviewPage() {
       await api.post('/api/bank-transactions/categorize', {
         bankTransactionId: txn.id,
         accountId,
+        // p1 fx: a foreign-currency account posts at the stated rate (blank = currency list rate).
+        ...(feedCurrency && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
       });
       toast('Transaction added to register.', 'success');
     });
@@ -744,6 +752,26 @@ export default function BankReviewPage() {
             }
           />
         ) : (
+          <>
+          {feedCurrency && tab === 'unreviewed' && (
+            <div className="flex flex-wrap items-center gap-3 px-4 py-3 border-b border-slate-100 text-sm text-navy/70">
+              <span>
+                This account is in <span className="font-semibold">{feedCurrency}</span>. Amounts below are in {feedCurrency};
+                adding a line records its home-currency value at
+              </span>
+              <Input
+                aria-label="Exchange rate"
+                className="w-36"
+                type="number"
+                step="0.00000001"
+                min="0.00000001"
+                placeholder="today's list rate"
+                value={fxRate}
+                onChange={(e) => setFxRate(e.target.value)}
+              />
+              <span className="text-xs text-navy/40">(home units per 1 {feedCurrency}; leave blank to use the Currencies list)</span>
+            </div>
+          )}
           <Table>
             <thead>
               <Tr>
@@ -781,7 +809,7 @@ export default function BankReviewPage() {
                           amtPositive ? 'text-emerald' : 'text-red-500'
                         }`}
                       >
-                        {formatCurrency(Math.abs(amt))}
+                        {formatCurrency(Math.abs(amt), feedCurrency ?? undefined)}
                         <span className="ml-1 text-xs font-normal text-navy/40">
                           {amtPositive ? 'IN' : 'OUT'}
                         </span>
@@ -798,6 +826,7 @@ export default function BankReviewPage() {
               })}
             </tbody>
           </Table>
+          </>
         )}
       </Card>
     </main>
