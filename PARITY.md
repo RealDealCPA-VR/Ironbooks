@@ -25,9 +25,9 @@ _Final audit, 2026-10-12, after waves 1 and 2 were merged (PR #3). Seven read-on
 | 2. Local/tailnet AI by default, optional per-company cloud with redaction, and AI wired into bookkeeping flows | **met** | llmCorrector.applyCorrection only marks status and writes an audit row. It never posts the correcting entry, so error fixes need manual posting. Cloud AI is still subject to the *.ts.net Funnel classification issue from goal 1. |
 | 3. Running transaction log (TLG-like) in the company file, shareable; company file portable | **met** | There is no direct download of the raw .bktlg chain. Exports go through the report toolbar as CSV/Excel/PDF and are capped at 5000 rows per query, so the only way to share the verifiable log is inside a .bkp or .bka. |
 | 4. Import QB general ledger from PDF / Excel / CSV with tie-out | **met** | None found. |
-| 5. Condensed backup with full restore, including restore from a condensed archive | **partial** | Full-file restore (restoreBackup, which archive restores also use) never checks the ledger after the swap. A tampered or corrupt archive with guards disabled is accepted and returns {restored:true} (see break #1). Portable .bkp restore does verify, so the gap is limited to the .bka / condense-archive path. |
+| 5. Condensed backup with full restore, including restore from a condensed archive | **met** (fixed 2026-10-12; was partial) | _Fixed by fix/restore. What the audit found:_ Full-file restore (restoreBackup, which archive restores also use) never checks the ledger after the swap. A tampered or corrupt archive with guards disabled is accepted and returns {restored:true} (see break #1). Portable .bkp restore does verify, so the gap is limited to the .bka / condense-archive path. |
 | 6. Users and permissions per company | **met** | None found in this audit. |
-| 7. Trial balance / balance sheet impossible to unbalance | **partial** | Running ALTER TABLE journal_entry_lines DISABLE TRIGGER ALL as raw SQL (PGlite runs as superuser) bypasses every guard. That is inherent to owning the DB. The real product break is that a database in that state can be imported through a full .bka restore and stays unguarded afterwards (break #1). verifyIntegrity does detect it ('Database ledger guards active' fails), but nothing re-enables the guards and nothing blocks the restore. |
+| 7. Trial balance / balance sheet impossible to unbalance | **met** (fixed 2026-10-12; was partial) | _Fixed by fix/restore. What the audit found:_ Running ALTER TABLE journal_entry_lines DISABLE TRIGGER ALL as raw SQL (PGlite runs as superuser) bypasses every guard. That is inherent to owning the DB. The real product break is that a database in that state can be imported through a full .bka restore and stays unguarded afterwards (break #1). verifyIntegrity does detect it ('Database ledger guards active' fails), but nothing re-enables the guards and nothing blocks the restore. |
 | 8. Simple UX for non-accountants | **partial** | The sidebar (lib/nav.ts) shows 107 links in 9 always-visible groups (Sales, Purchases, Banking, Accounting, Insights, Admin, Operations, Setup…). There is no simple/essentials mode or progressive disclosure, which is overwhelming for a non-accountant. <Help> tooltips appear in only 30 of 164 pages. Many labels are QB jargon ('SO Fulfillment', 'Finance Charges', 'Income Tracker'). |
 | 9. Production readiness: tsc, migrations fresh and upgraded, Electron packaging | **met** | Minor: the 0029 FK ADD CONSTRAINT will fail if an upgraded DB has orphan tax_rate_id values written between 0027 and 0029. No service hard-deletes tax_rates, so the risk is low. Because 'files' lists only electron/** and drizzle/**, electron-builder still packs all production dependencies (next, react, etc.) into the asar. That bloats the install but does not break it. |
 
@@ -37,7 +37,35 @@ _Final audit, 2026-10-12, after waves 1 and 2 were merged (PR #3). Seven read-on
 - **P2: *.ts.net hostnames are always classed as private 'tailnet', so Tailscale Funnel (public) endpoints get past the cloud opt-in and AI redaction**. Repro: decideOutbound(DEFAULT_NETWORK_POLICY, 'https://somehost.tailXXXX.ts.net/v1/chat/completions', 'ai') returns allowed:true with hostClass 'tailnet' (lib/net/cidr.ts:165), even though Funnel names resolve to public Tailscale relay IPs. The AI router also treats the provider as 'local', so no redaction is applied. Fix: resolve the hostname and require the address to be in 100.64.0.0/10 or fd7a:115c:a1e0::/48 before calling it 'tailnet'.
 - **P2: Navigation overwhelms non-accountants: 107 sidebar links in 9 always-expanded groups**. Repro: lib/nav.ts has 107 path entries rendered by components/AppShell.tsx with no essentials/simple mode. <Help> tooltips are used in only 30 of the 164 app pages (grep -rl '<Help ' app components).
 
-## P0 fix list (data correctness; must fix before release)
+## P0 fix round (2026-10-12): all 11 P0s fixed
+
+Five doer/tester/reviewer teams fixed every P0 below. All were approved, then merged to `main`. Verified on merged main: `tsc` clean, **315 files / 3,965 tests** passing, `next build` OK.
+
+| Team | Fixed | Migration |
+|---|---|---|
+| restore | `.bka` / condense-archive restore and every company-file open re-install and re-enable the ledger triggers. They also re-add, validate or rebuild every foreign key the migrations declare, then check the books. A damaged file is refused on open, and a damaged restore is rolled back. Verify Data reports missing or altered keys. | none |
+| reports | Cash-basis P&L/BS are rebuilt by allocating each payment back to the document lines per account, as QB does; the lines add up to the totals. The legacy consolidated P&L/BS only include companies the user can access. | 0034 unused |
+| payroll | Tax tracking per payroll item: 401(k) reduces only income-tax wages, while Section 125 and HSA also reduce FICA/FUTA wages. W-2 Box 1/3/5 are correct, plus Box 12 codes. The single-paycheck Run Payroll uses the shared tax engine and posts employer taxes. Tax lines are linked to payroll items, not free text. | 0035 |
+| sales | Progress invoicing works by percent or by line, taxes correctly and relieves inventory by quantity. Statements include refunds. Finance-charge invoices use `allocateDocNumber`. | 0036 |
+| ledger | Named A/R and A/P journal-entry lines can be applied in Receive Payments and Pay Bills. Reclassify sticks when the source document is saved again, and accounts on item lines can't be reclassified. | 0037 |
+
+**Goals 5 and 7 are now met.** A tampered or out-of-balance `.bka` can no longer be restored or opened while unguarded. Raw superuser SQL against a live database is still possible; that comes with owning the file.
+
+**Follow-ups found during the fix round (P1/P2):**
+- Server-rendered pages show the generic error screen on a damaged file. They should show a plain "file damaged, restore a backup" screen that links to /backup.
+- Extra foreign keys added offline (e.g. an extra ON DELETE CASCADE) are not flagged. Only the declared keys are checked.
+- Cash basis: after a bounced check, a line can sit up to 2¢ off its exact share until the document is fully paid.
+- Cash basis: a vendor-credit application is dated by its system timestamp, not the Pay Bills date.
+- Foreign-currency statements leave out exchange-rate adjustment lines.
+- Voiding a vendor-credit refund doesn't give the vendor credit back.
+- A General Journal A/R credit can't be applied to a General Journal A/R charge (or the A/P equivalent).
+- `openItemStatement` doesn't list General Journal items.
+- Condense deletes applications along with their entries.
+- Re-dating an invoice past its payment leaves aging off.
+- Legacy pre-tax paycheck lines with no linked item are treated as after-tax when a W-2 is recomputed.
+- API change: sending `taxes` without `employerTaxes` now posts calculated employer taxes. To keep the old behavior, send `employerTaxes: []`.
+
+## P0 fix list (as found by the audit; all fixed in the round above)
 
 - **A3** (setup-multiuser, buggy): Document numbers: user override, alphanumeric, starting number. BUG 1: lib/services/financeCharges.ts:332-391 inserts invoices with MAX(invoice_number)+1 and skips allocateDocNumber, so the trigger writes a bare integer ref. Repro: set the invoice starting number to INV-1001 and create two invoices (INV-1001, INV-1002). Assess finance charges: that invoice gets ref '1003'. lastUsedNumber (ordered by createdAt) then makes the next invoice '1004', and the INV- prefix is lost for good. BUG 2: app/{estimates,sales-orders,sales-receipts,credit-memos,purchase-orders}/page.tsx have no field for typing a number. They show only the legacy integer, e.g. estimates page:590 renders `EST-${padStart(estimateNumber)}`. The PDF prints docRef(refNumber) (lib/pdf/forms.ts:178), so screen and paper disagree (starting number 'Q-2026-17' shows as 'EST-0017'). Remaining gaps: you cannot override a number on those five forms. Editing an invoice to a duplicate number gives no confirm path (the 409 is handled only when !editing, invoices/page.tsx:814). Journal entries keep integer entry numbers and autoAssignJeNumbers is not read.
 - **NEW** (setup-multiuser): Finance-charge invoices bypass allocateDocNumber and break alphanumeric invoice numbering (also listed under A3). lib/services/financeCharges.ts:332-336 (nextInvoiceNumber = MAX(invoice_number)+1) and :386-395 (insert(invoices) with no refNumber). The drizzle/0025 trigger copies the integer into ref_number. docNumbers.lastUsedNumber orders by createdAt, so the next normal invoice continues from '1003' instead of 'INV-1003'.

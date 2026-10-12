@@ -7,7 +7,7 @@
 **Open-source double-entry accounting for Windows, macOS and Linux. The database itself
 refuses to let your books go out of balance.**
 
-![tests](https://img.shields.io/badge/tests-3%2C658%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-3%2C965%20passing-brightgreen)
 ![typecheck](https://img.shields.io/badge/tsc-clean-blue)
 ![local-first](https://img.shields.io/badge/data-100%25%20local-success)
 ![AI](https://img.shields.io/badge/AI-local%20%2B%20tailnet%20first-purple)
@@ -153,7 +153,7 @@ More: [`GETTING_STARTED.md`](./GETTING_STARTED.md) · [`INSTALL.md`](./INSTALL.m
 ## 🧪 Tested like the money matters
 
 ```bash
-npm test          # 290 files · 3,658 tests: unit, integration, adversarial
+npm test          # 315 files · 3,965 tests: unit, integration, adversarial
 npm run typecheck # tsc --noEmit
 npm run build     # Next standalone production build
 ```
@@ -198,8 +198,9 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] Wave 1: database-enforced ledger, transaction log, company file, backup and restore, local and
   tailnet AI, GL import from PDF/Excel/CSV, users and permissions
 - [x] Wave 2: 8 teams closing the QuickBooks Enterprise gaps in [`PARITY.md`](./PARITY.md)
-- [x] **Final parity audit**: 52 of 109 gaps done, 12 P0 items open (see [`PARITY.md`](./PARITY.md))
-- [ ] **Fix the P0 list** in `PARITY.md` (books, statements, payroll taxes, restore safety)
+- [x] **Final parity audit**: 52 of 109 gaps done, 11 P0 items found (see [`PARITY.md`](./PARITY.md))
+- [x] **P0 fix round**: all 11 fixed, covering restore safety, cash-basis P&L, consolidated-report access, payroll wage bases and W-2 Box 12, progress invoicing, statements, and A/R and A/P journal entries
+- [ ] **P1 round**: wire up every preference, add simple navigation mode, typed doc numbers on all forms, finish multi-currency, merge the two To-Do lists, close the report gaps
 - [ ] Follow-ups:
   - unify the two To-Do lists
   - typed numbers on every sales and purchase form
