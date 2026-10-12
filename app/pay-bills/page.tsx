@@ -356,6 +356,9 @@ export default function PayBillsPage() {
         ...credits.map((c) => ({ id: c.id, journal: false, remaining: Number(c.unapplied) })),
         ...journalCredits.map((c) => ({ id: c.journalLineId, journal: true, remaining: Number(c.open) })),
       ];
+      // General Journal credits go in the same save as the payment (one transaction), or are
+      // applied on their own when no payment is being made.
+      const journalCreditApps: Array<{ journalLineId: string; billId: string; amount: string }> = [];
       for (const bill of selected) {
         let toApply = num(rows[bill.id].credit);
         for (const credit of pool) {
@@ -363,13 +366,7 @@ export default function PayBillsPage() {
           if (credit.remaining <= 0) continue;
           const amount = Math.min(toApply, credit.remaining);
           if (credit.journal) {
-            await api.post('/api/bill-payments/journal-items', {
-              action: 'apply_credit',
-              journalLineId: credit.id,
-              billId: bill.id,
-              amount: amount.toFixed(2),
-              date,
-            });
+            journalCreditApps.push({ journalLineId: credit.id, billId: bill.id, amount: amount.toFixed(2) });
           } else {
             await api.post(`/api/vendor-credits/${credit.id}`, {
               action: 'apply',
@@ -392,7 +389,14 @@ export default function PayBillsPage() {
             num(rows[b.id].discount) > 0 ? num(rows[b.id].discount).toFixed(2) : undefined,
         }));
 
-      if (applications.length > 0 || journalItems.length > 0) {
+      const withPayment = applications.length > 0 || journalItems.length > 0;
+      if (!withPayment) {
+        for (const c of journalCreditApps) {
+          await api.post('/api/bill-payments/journal-items', { action: 'apply_credit', ...c, date });
+        }
+      }
+
+      if (withPayment) {
         const queued = method === 'check' && toPrint;
         const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
           api.post('/api/bill-payments', {
@@ -406,6 +410,7 @@ export default function PayBillsPage() {
             exchangeRate: billCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
             applications,
             journalItems,
+            journalCredits: journalCreditApps.length > 0 ? journalCreditApps : undefined,
             allowDuplicateNumber,
           }),
         );

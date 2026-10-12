@@ -55,8 +55,8 @@ let vendorId: string;
 const D = (s: string) => new Date(`${s}T12:00:00Z`);
 const AS_OF = new Date('2026-12-31T23:59:59Z');
 
-async function controlOf(subtype: 'accounts_receivable' | 'accounts_payable'): Promise<number> {
-  const tb = await trialBalance(ctx, AS_OF);
+async function controlOf(subtype: 'accounts_receivable' | 'accounts_payable', asOf: Date = AS_OF): Promise<number> {
+  const tb = await trialBalance(ctx, asOf);
   const ids = new Set(
     (
       await db
@@ -616,6 +616,90 @@ describe('A/P: General Journal amounts owed and vendor credits in Pay Bills', ()
     } finally {
       await setClosingDate(ctx, { closingDate: null, password: null });
     }
+    await expectArTied();
+  });
+});
+
+describe('as-of dates: an application moves both sides on the same day', () => {
+  const EOD = (d: string) => new Date(`${d}T23:59:59Z`);
+  async function arTiedOn(d: string, expected?: number) {
+    const control = await controlOf('accounts_receivable', EOD(d));
+    const aging = Number((await arAging(ctx, EOD(d))).totals.total);
+    const detail = (await arAgingDetail(ctx, EOD(d))).rows.reduce((s, r) => s + Number(r.openBalance), 0);
+    expect(aging, `A/R aging on ${d}`).toBeCloseTo(control, 2);
+    expect(detail, `A/R aging detail on ${d}`).toBeCloseTo(control, 2);
+    if (expected !== undefined) expect(control).toBeCloseTo(expected, 2);
+  }
+  async function apTiedOn(d: string) {
+    const control = await controlOf('accounts_payable', EOD(d));
+    const aging = Number((await apAging(ctx, EOD(d))).totals.total);
+    expect(aging, `A/P aging on ${d}`).toBeCloseTo(control, 2);
+  }
+
+  it('a JE credit applied to a LATER invoice: aging between the two dates still shows the credit', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'Later Invoice Customer' })).id;
+    const je = await createManualEntry(ctx, {
+      date: D('2026-08-02'),
+      description: 'Goodwill credit',
+      lines: [
+        { accountId: code['6000'], debit: '40.00' },
+        { accountId: code['1200'], credit: '40.00', entityType: 'customer', entityId: cust },
+      ],
+    });
+    const lineId = (await lineOf(je.id, '1200')).id;
+    const inv = await createInvoice(ctx, {
+      customerId: cust,
+      date: D('2026-08-10'),
+      lines: [{ description: 'August work', quantity: 1, rate: '150.00' }],
+    });
+    // Applied "on" Aug 5 — before the invoice existed; it is dated with the invoice instead.
+    const app = await applyJournalCredit(ctx, { journalLineId: lineId, invoiceId: inv.id, amount: '40.00', date: D('2026-08-05') });
+    expect(app.date.toISOString().slice(0, 10)).toBe('2026-08-10');
+    await arTiedOn('2026-08-01');
+    await arTiedOn('2026-08-06');
+    await arTiedOn('2026-08-11');
+    await expectArTied();
+  });
+
+  it('a JE vendor credit applied later to an earlier bill: A/P aging ties on every date', async () => {
+    const vend = (await createVendor(ctx, { displayName: 'As-Of Bill Vendor' })).id;
+    const bill = await createBill(ctx, { vendorId: vend, date: D('2026-08-01'), billNumber: 'ASOF-1', lines: [{ accountId: code['6000'], amount: '90.00' }] });
+    const je = await createManualEntry(ctx, {
+      date: D('2026-08-04'),
+      description: 'Vendor rebate',
+      lines: [
+        { accountId: code['2000'], debit: '30.00', entityType: 'vendor', entityId: vend },
+        { accountId: code['6000'], credit: '30.00' },
+      ],
+    });
+    const lineId = (await lineOf(je.id, '2000')).id;
+    await applyJournalCredit(ctx, { journalLineId: lineId, billId: bill.id, amount: '30.00', date: D('2026-08-08') });
+    for (const d of ['2026-08-02', '2026-08-05', '2026-08-09']) await apTiedOn(d);
+    await expectApTied();
+  });
+
+  it('a payment dated before the General Journal charge it pays is refused', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'Early Payment Customer' })).id;
+    const je = await createManualEntry(ctx, {
+      date: D('2026-08-20'),
+      description: 'Late fee',
+      lines: [
+        { accountId: code['1200'], debit: '25.00', entityType: 'customer', entityId: cust },
+        { accountId: code['4000'], credit: '25.00' },
+      ],
+    });
+    const lineId = (await lineOf(je.id, '1200')).id;
+    await expect(
+      receivePayment(ctx, {
+        customerId: cust,
+        date: D('2026-08-15'),
+        method: 'check',
+        amount: '25.00',
+        depositAccountId: code['1000'],
+        applications: [],
+        journalItems: [{ journalLineId: lineId, amount: '25.00' }],
+      }),
+    ).rejects.toThrow(/dated 2026-08-20, after this payment/);
     await expectArTied();
   });
 });

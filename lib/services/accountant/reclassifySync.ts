@@ -221,6 +221,9 @@ async function loadDoc(ctx: ServiceContext, kind: DocKind, id: string): Promise<
     if (!h) return null;
     const rows = await ctx.db.select().from(expenseLines).where(eq(expenseLines.expenseId, id));
     const it = await itemInfo(ctx, rows.map((r) => r.itemId));
+    // A credit-card credit credits its expense accounts. It is saved either with negative rows or
+    // with positive rows and the refund flag (the header total is negative either way).
+    const refund = Money.of(h.total ?? 0).isNegative() || rows.some((r) => Money.of(r.amount).isNegative());
     return {
       kind,
       label: h.reference ? `Check ${h.reference}` : 'Check / expense',
@@ -234,8 +237,7 @@ async function loadDoc(ctx: ServiceContext, kind: DocKind, id: string): Promise<
           id: r.id,
           accountId: r.accountId,
           classId: r.classId,
-          // A credit-card credit (negative rows) credits its expense accounts.
-          dir: amt.isNegative() ? ('credit' as const) : ('debit' as const),
+          dir: refund ? ('credit' as const) : ('debit' as const),
           amount: amt.abs(),
           itemId: r.itemId,
           itemName: it.get(r.itemId ?? '')?.name ?? null,

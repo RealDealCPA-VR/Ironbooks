@@ -9,7 +9,7 @@
  * that touched an account together with a running balance. The running balance respects the
  * natural sign convention (debit-normal for asset/expense, credit-normal for liability/equity/revenue).
  */
-import { and, asc, desc, eq, gte, inArray, lt, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, lt, lte, sql } from 'drizzle-orm';
 import {
   accounts,
   classes,
@@ -1134,9 +1134,11 @@ export interface JournalOpenItem {
 
 /**
  * Applied amount per General Journal line (journal_item_applications), as of `asOf` when given.
- * Cash applications ('payment', 'bill_payment') are dated with their payment, like invoice / bill
- * payment applications in aging; credit applications ('invoice_credit', 'bill_credit') always
- * count, like credit memos / vendor credits (the invoice or bill they reduce is reduced undated).
+ * Every application is dated: cash applications ('payment', 'bill_payment') with their payment,
+ * credit applications ('invoice_credit', 'bill_credit') on the day the credit was applied — never
+ * before the entry or the invoice / bill (journalApplications.ts). Only applications dated on or
+ * before `asOf` count; aging adds the later ones back to the invoice / bill they reduced
+ * (journalCreditsAppliedAfter), so both sides of an application move on the same day.
  */
 export async function journalAppliedByLine(
   ctx: ServiceContext,
@@ -1145,9 +1147,7 @@ export async function journalAppliedByLine(
 ): Promise<Map<string, ReturnType<typeof Money.zero>>> {
   const conds = [eq(journalItemApplications.companyId, ctx.companyId), eq(journalItemApplications.side, side)];
   if (opts.asOf) {
-    conds.push(
-      sql`(${journalItemApplications.kind} IN ('invoice_credit', 'bill_credit') OR ${journalItemApplications.date} <= ${opts.asOf})`,
-    );
+    conds.push(lte(journalItemApplications.date, opts.asOf));
   }
   if (opts.lineIds) {
     if (opts.lineIds.length === 0) return new Map();
@@ -1162,6 +1162,38 @@ export async function journalAppliedByLine(
     .where(and(...conds))
     .groupBy(journalItemApplications.journalLineId);
   return new Map(rows.map((r) => [r.lineId, Money.of(r.applied)]));
+}
+
+/**
+ * General Journal credits applied to invoices ('ar') or bills ('ap') AFTER `cutoff`, per invoice /
+ * bill id. Invoices and bills carry the credit undated (amountPaid / amountCredited), so as-of
+ * aging adds these back: on the cutoff date the credit had not been applied yet, and the General
+ * Journal line still shows its full amount (journalAppliedByLine), which keeps aging tied to the
+ * A/R / A/P control account on every date.
+ */
+export async function journalCreditsAppliedAfter(
+  ctx: ServiceContext,
+  side: 'ar' | 'ap',
+  cutoff: Date,
+): Promise<Map<string, ReturnType<typeof Money.zero>>> {
+  const docCol = side === 'ar' ? journalItemApplications.invoiceId : journalItemApplications.billId;
+  const rows = await ctx.db
+    .select({
+      docId: docCol,
+      applied: sql<string>`COALESCE(SUM(CAST(${journalItemApplications.amount} AS NUMERIC)), 0)`,
+    })
+    .from(journalItemApplications)
+    .where(
+      and(
+        eq(journalItemApplications.companyId, ctx.companyId),
+        eq(journalItemApplications.kind, side === 'ar' ? 'invoice_credit' : 'bill_credit'),
+        gt(journalItemApplications.date, cutoff),
+      ),
+    )
+    .groupBy(docCol);
+  const out = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const r of rows) if (r.docId) out.set(r.docId, Money.of(r.applied));
+  return out;
 }
 
 /**

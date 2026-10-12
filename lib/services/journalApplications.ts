@@ -143,6 +143,25 @@ async function loadItem(ctx: ServiceContext, side: Side, lineId: string): Promis
   };
 }
 
+const day = (d: Date) => d.toISOString().slice(0, 10);
+
+/** The latest of the given dates (an application can't happen before both sides exist). */
+function latest(...dates: Date[]): Date {
+  return dates.reduce((a, b) => (b.getTime() > a.getTime() ? b : a));
+}
+
+/**
+ * A payment can only pay a General Journal amount that already existed on the payment date —
+ * otherwise A/R or A/P would hold the payment with nothing to show it against in between.
+ */
+function assertPaidOnOrAfter(item: LoadedItem, paymentDate: Date, what: string) {
+  if (day(paymentDate) < day(item.date)) {
+    throw validation(
+      `${label(item)} is dated ${day(item.date)}, after this ${what} (${day(paymentDate)}). Date the ${what} on or after the entry.`,
+    );
+  }
+}
+
 /** Sum requested amounts per journal line; every amount must be positive. */
 function sumByLine(rows: Array<{ journalLineId: string; amount: string | number }>) {
   const by = new Map<string, Decimal>();
@@ -247,6 +266,7 @@ export async function recordJournalChargesPaid(
   const out = [];
   for (const [lineId, amount] of requested) {
     const item = loaded.get(lineId)!;
+    assertPaidOnOrAfter(item, input.date, 'payment');
     const [row] = await tx.db
       .insert(journalItemApplications)
       .values({
@@ -276,6 +296,7 @@ export async function recordJournalPayablesPaid(
   const out = [];
   for (const [lineId, amount] of requested) {
     const item = loaded.get(lineId)!;
+    assertPaidOnOrAfter(item, input.date, 'bill payment');
     const [row] = await tx.db
       .insert(journalItemApplications)
       .values({
@@ -307,6 +328,7 @@ export async function applyJournalCreditsToInvoices(
   const requested = sumByLine(input.credits);
   const loaded = await validateItems(tx, 'ar', input.customerId, 'credit', requested);
   const byInvoice = new Map<string, Decimal>();
+  const invoiceDate = new Map<string, Date>();
   for (const c of input.credits) {
     byInvoice.set(c.invoiceId, (byInvoice.get(c.invoiceId) ?? Money.zero()).plus(Money.round2(c.amount)));
   }
@@ -317,6 +339,7 @@ export async function applyJournalCreditsToInvoices(
       .where(and(eq(invoices.id, invoiceId), eq(invoices.companyId, tx.companyId)));
     if (!inv) throw notFound('Invoice');
     if (inv.customerId !== input.customerId) throw validation(`Invoice #${inv.invoiceNumber} belongs to a different customer.`);
+    invoiceDate.set(invoiceId, inv.date);
     if (inv.status === 'void') throw validation(`Invoice #${inv.invoiceNumber} is void.`);
     if (inv.status === 'draft') {
       throw validation(`Invoice #${inv.invoiceNumber} is still a draft. Post it before applying a credit to it.`);
@@ -346,7 +369,9 @@ export async function applyJournalCreditsToInvoices(
         invoiceId: c.invoiceId,
         paymentId: input.paymentId ?? null,
         amount: toAmountString(amount),
-        date: input.date,
+        // Dated when it could first apply: never before the credit or the invoice existed, so
+        // as-of aging (journalAppliedByLine / journalCreditsAppliedAfter) moves both together.
+        date: latest(input.date, item.date, invoiceDate.get(c.invoiceId)!),
       })
       .returning();
     out.push(row);
@@ -392,6 +417,7 @@ export async function applyJournalCreditsToBills(
   const requested = sumByLine(input.credits);
   const loaded = await validateItems(tx, 'ap', input.vendorId, 'credit', requested);
   const byBill = new Map<string, Decimal>();
+  const billDate = new Map<string, Date>();
   for (const c of input.credits) {
     byBill.set(c.billId, (byBill.get(c.billId) ?? Money.zero()).plus(Money.round2(c.amount)));
   }
@@ -403,6 +429,7 @@ export async function applyJournalCreditsToBills(
     if (!bill) throw notFound('Bill');
     const name = bill.billNumber ? `Bill ${bill.billNumber}` : 'That bill';
     if (bill.vendorId !== input.vendorId) throw validation(`${name} belongs to a different vendor.`);
+    billDate.set(billId, bill.date);
     if (bill.status === 'void') throw validation(`${name} is void.`);
     if (await isForeignCurrency(tx, bill.currency)) {
       throw validation(`General Journal credits can only be applied to bills in your home currency (${name.toLowerCase()}).`);
@@ -429,7 +456,7 @@ export async function applyJournalCreditsToBills(
         billId: c.billId,
         billPaymentId: input.billPaymentId ?? null,
         amount: toAmountString(amount),
-        date: input.date,
+        date: latest(input.date, item.date, billDate.get(c.billId)!),
       })
       .returning();
     out.push(row);
