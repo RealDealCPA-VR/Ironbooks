@@ -17,6 +17,7 @@ import type { ServiceContext } from '@/lib/services/_base';
 import { ServiceError } from '@/lib/services/_base';
 import { getNetworkPolicy } from '@/lib/services/networkPolicy';
 import { decideOutbound, type OutboundDecision, type OutboundPurpose } from './policy';
+import { verifyTailnetUrls } from './tailnetVerify';
 
 export type PolicyCtx = Pick<ServiceContext, 'db' | 'companyId'>;
 
@@ -63,6 +64,8 @@ export async function checkOutbound(
   ctx: PolicyCtx,
 ): Promise<OutboundDecision> {
   const policy = await getNetworkPolicy(ctx);
+  // A *.ts.net name is tailnet only if it resolves to tailnet addresses (Funnel names are public).
+  await verifyTailnetUrls([url]);
   const decision = decideOutbound(policy, url, purpose);
   log(ctx.companyId, decision);
   return decision;
