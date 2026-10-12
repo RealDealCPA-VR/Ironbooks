@@ -29,6 +29,7 @@ import {
 } from './liabilityPayments';
 import { checkPrintData, listPrintQueue, markPrinted } from './printQueue';
 import { findDuplicateCheckNumbers, nextCheckNumber } from './checkNumbers';
+import { checkDetail, missingChecks } from './reportsExtra';
 import {
   lastFilingPeriod,
   salesTaxDueThrough,
@@ -121,6 +122,15 @@ describe('P1 purchases — sales tax payments', () => {
       expect(rep.tiesToGl).toBe(true);
       expect(await nextCheckNumber(ctx, acct['1000'])).toBe('503');
       await expectBalanced(ctx);
+    });
+
+    it('sales tax checks show in Check Detail and Missing Checks', async () => {
+      const detail = await checkDetail(ctx);
+      const rows = detail.rows.filter((r) => r.source === 'payment_check');
+      expect(rows.map((r) => r.checkNumber).sort()).toEqual(['501', '502']);
+      expect(rows[0].lines[0].detail).toBe('Sales Tax Payment');
+      const missing = await missingChecks(ctx, acct['1000']);
+      expect(missing.accounts[0]).toMatchObject({ firstNumber: 501, lastNumber: 502, missingCount: 0 });
     });
 
     it('a used check number is refused unless confirmed', async () => {

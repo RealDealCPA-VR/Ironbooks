@@ -21,6 +21,7 @@ import {
   invoices,
   items,
   journalEntries,
+  paymentChecks,
   journalEntryLines,
   paymentApplications,
   paymentsReceived,
@@ -1483,9 +1484,22 @@ export async function missingChecks(ctx: ServiceContext, accountId?: string): Pr
     .innerJoin(accounts, eq(billPayments.paymentAccountId, accounts.id))
     .where(and(...bpConds));
 
+  // p1 purchases: Sales Tax Payment / Liability / refund checks.
+  const pcRows = await ctx.db
+    .select({ accountId: paymentChecks.paymentAccountId, accountName: accounts.name, reference: paymentChecks.reference })
+    .from(paymentChecks)
+    .innerJoin(accounts, eq(paymentChecks.paymentAccountId, accounts.id))
+    .where(
+      and(
+        eq(paymentChecks.companyId, ctx.companyId),
+        isNotNull(paymentChecks.reference),
+        ...(accountId ? [eq(paymentChecks.paymentAccountId, accountId)] : []),
+      ),
+    );
+
   // Collect distinct numeric check numbers per account.
   const byAccount = new Map<string, { name: string; numbers: Set<number> }>();
-  for (const r of [...expRows, ...bpRows]) {
+  for (const r of [...expRows, ...bpRows, ...pcRows]) {
     if (!r.accountId || !r.reference) continue;
     const trimmed = r.reference.trim();
     if (!/^\d+$/.test(trimmed)) continue;
@@ -1535,7 +1549,7 @@ export interface CheckDetailLine {
 }
 
 export interface CheckDetailRow {
-  source: 'expense' | 'bill_payment';
+  source: 'expense' | 'bill_payment' | 'payment_check';
   id: string;
   date: string;
   checkNumber: string | null;
@@ -1680,6 +1694,7 @@ export async function checkDetail(
       voided: r.voidedAt !== null,
       lines: bpLinesById.get(r.id) ?? [],
     })),
+    ...(await paymentCheckDetailRows(ctx, range)),
   ];
   rows.sort(
     (a, b) => a.date.localeCompare(b.date) || (a.checkNumber ?? '').localeCompare(b.checkNumber ?? ''),
@@ -1694,6 +1709,39 @@ export async function checkDetail(
     rows,
     total: toAmountString(total),
   };
+}
+
+/** p1 purchases: Sales Tax Payment, Liability and customer refund checks for Check Detail. */
+async function paymentCheckDetailRows(
+  ctx: ServiceContext,
+  range?: { from?: Date; to?: Date },
+): Promise<CheckDetailRow[]> {
+  const conds = [eq(paymentChecks.companyId, ctx.companyId)];
+  if (range?.from) conds.push(gte(paymentChecks.date, range.from));
+  if (range?.to) conds.push(lte(paymentChecks.date, range.to));
+  const rows = await ctx.db
+    .select({ c: paymentChecks, accountName: accounts.name, entryStatus: journalEntries.status })
+    .from(paymentChecks)
+    .innerJoin(accounts, eq(paymentChecks.paymentAccountId, accounts.id))
+    .leftJoin(journalEntries, eq(paymentChecks.postedEntryId, journalEntries.id))
+    .where(and(...conds));
+  const label: Record<string, string> = {
+    sales_tax: 'Sales Tax Payment',
+    payroll_liability: 'Liability Check',
+    customer_refund: 'Refund',
+  };
+  return rows.map((r) => ({
+    source: 'payment_check' as const,
+    id: r.c.id,
+    date: r.c.date.toISOString(),
+    checkNumber: r.c.reference,
+    payee: r.c.payeeName,
+    bankAccountId: r.c.paymentAccountId,
+    bankAccountName: r.accountName,
+    amount: toAmountString(r.c.amount),
+    voided: r.c.voidedAt !== null || r.entryStatus === 'void',
+    lines: [{ description: r.c.memo, detail: label[r.c.kind] ?? 'Check', amount: toAmountString(r.c.amount) }],
+  }));
 }
 
 // ---------------------------------------------------------------------------
