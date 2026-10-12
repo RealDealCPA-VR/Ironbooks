@@ -27,6 +27,10 @@ import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useNewParam } from '@/lib/useFocusParam';
+// wave2 prefs: Payments > auto-apply / auto-calculate / Undeposited Funds; date warnings
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmTransactionDate } from '@/lib/formPrefs';
+import { autoApplyPayment, sumApplied } from '@/lib/paymentApply';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,6 +65,7 @@ interface Invoice {
   id: string;
   invoiceNumber?: number;
   date: string;
+  dueDate?: string | null;
   total: string;
   balanceDue: string;
   status: string;
@@ -147,6 +152,10 @@ interface ReceivePaymentModalProps {
 
 function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accounts }: ReceivePaymentModalProps) {
   const today = new Date().toISOString().slice(0, 10);
+  const prefs = usePreferences();
+  // Preferences > Payments: once the user edits one side by hand, stop recalculating it.
+  const [amountTouched, setAmountTouched] = useState(false);
+  const [appsTouched, setAppsTouched] = useState(false);
 
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(today);
@@ -199,7 +208,18 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     setDiscountAmounts({});
     setCredits([]);
     setCreditUse({});
+    // Preferences > Payments auto-apply / auto-calculate never overwrite an edited payment's amounts.
+    setAmountTouched(!!editing);
+    setAppsTouched(!!editing);
   }, [open, editing, today]);
+
+  useEffect(() => {
+    // Preferences > Payments: with Undeposited Funds off, a NEW payment starts on the default bank.
+    if (!open || editing || prefs.company.useUndepositedFunds || depositAccountId) return;
+    const def = prefs.company.defaultDepositAccountId;
+    if (def && depositAccounts.some((a) => a.id === def)) setDepositAccountId(def);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, prefs.loaded, accounts]);
 
   // Fetch open invoices + available credits when the customer changes.
   useEffect(() => {
@@ -243,7 +263,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           setDiscountAmounts(Object.fromEntries(mine.applications.filter((a) => Number(a.discountAmount) > 0).map((a) => [a.invoiceId, String(Number(a.discountAmount))])));
           setCreditUse(Object.fromEntries(mine.credits.map((c) => [c.creditMemoId, { invoiceId: c.invoiceId, amount: String(Number(c.amount)) }])));
         } else {
-          setApplicationAmounts({});
+          // Preferences > Payments: "Automatically apply payments" (oldest due first).
+          setAppsTouched(false);
+          setApplicationAmounts(prefs.company.autoApplyPayments && amount ? autoApplyPayment(amount, open) : {});
           setDiscountAmounts({});
           setCreditUse({});
         }
@@ -266,6 +288,26 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       .then((r) => setSuggestions(Object.fromEntries((r.discounts ?? []).map((d) => [d.invoiceId, d]))))
       .catch(() => setSuggestions({}));
   }, [open, customerId, date]);
+
+  const setAppAmount = (invoiceId: string, value: string) => {
+    setAppsTouched(true);
+    const next = { ...applicationAmounts, [invoiceId]: value };
+    setApplicationAmounts(next);
+    // "Automatically calculate payments": the amount received follows what is applied.
+    if (prefs.company.autoCalculatePayments && !amountTouched) {
+      const total = sumApplied(next);
+      setAmount(total === '0.00' ? '' : total);
+    }
+  };
+
+  const changeAmount = (value: string) => {
+    setAmount(value);
+    setAmountTouched(true);
+    // "Automatically apply payments": spread it over open invoices, oldest due first.
+    if (prefs.company.autoApplyPayments && !appsTouched) {
+      setApplicationAmounts(autoApplyPayment(value, invoices));
+    }
+  };
 
   const applications = invoices
     .map((inv) => ({
@@ -326,6 +368,11 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         return;
       }
     }
+    if (!prefs.company.useUndepositedFunds && !depositAccountId) {
+      toast('Choose the account to deposit this payment to.', 'danger');
+      return;
+    }
+    if (!confirmTransactionDate(date, prefs)) return;
 
     const body = {
       customerId,
@@ -418,9 +465,14 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
             </Select>
           </div>
           <div>
-            <Label htmlFor="pm-deposit">Deposit to <Help term="undeposited-funds" /></Label>
+            <Label htmlFor="pm-deposit" required={!prefs.company.useUndepositedFunds}>
+              Deposit to <Help term="undeposited-funds" />
+            </Label>
             <Select id="pm-deposit" value={depositAccountId} onChange={(e) => setDepositAccountId(e.target.value)}>
-              <option value="">Undeposited Funds (deposit later)</option>
+              {/* Preferences > Payments: with Undeposited Funds off, a bank account must be picked. */}
+              <option value="">
+                {prefs.company.useUndepositedFunds ? 'Undeposited Funds (deposit later)' : 'Select a bank account…'}
+              </option>
               {depositAccounts
                 .filter((a) => a.code !== '1050')
                 .map((a) => (
@@ -436,7 +488,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         <div className="grid grid-cols-3 gap-3">
           <div>
             <Label htmlFor="pm-amount" required>Amount Received</Label>
-            <AmountInput id="pm-amount" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} />
+            <AmountInput id="pm-amount" placeholder="0.00" value={amount} onChange={(e) => changeAmount(e.target.value)} />
           </div>
           <div>
             <Label htmlFor="pm-ref">Reference / Check #</Label>
@@ -508,7 +560,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                               placeholder="0.00"
                               aria-label={`Payment for invoice ${inv.invoiceNumber ?? ''}`}
                               value={applicationAmounts[inv.id] ?? ''}
-                              onChange={(e) => setApplicationAmounts((p) => ({ ...p, [inv.id]: e.target.value }))}
+                              onChange={(e) => setAppAmount(inv.id, e.target.value)}
                               className="text-right"
                             />
                           </Td>

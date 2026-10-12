@@ -214,9 +214,14 @@ export const GLOBAL_SHORTCUTS: ShortcutDef[] = [
   { keys: 'Ctrl+R', ctrlKey: 'r', href: '/registers', description: 'Account registers' },
   { keys: 'Ctrl+J', ctrlKey: 'j', href: '/journal', description: 'Journal entries' },
   { keys: 'Ctrl+D', ctrlKey: 'd', href: '/deposits', description: 'Make deposits' },
+  // Handled by the open form's <MemorizeButton> (components/MemorizeButton.tsx), not navigation.
+  { keys: 'Ctrl+M', description: 'Memorize the open transaction' },
   { keys: 'Ctrl+K / Ctrl+F', description: 'Search & command palette' },
   { keys: '?', description: 'Show this shortcuts help' },
 ];
+
+/** Lowercase key for QB "Memorize Transaction" (Ctrl+M) — listened for by MemorizeButton. */
+export const MEMORIZE_SHORTCUT = 'm';
 
 /** Display-only rows for the help modal: QB date keys (live in any date field). */
 export const DATE_KEY_HELP: { keys: string; description: string }[] = [

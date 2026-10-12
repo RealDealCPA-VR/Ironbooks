@@ -14,6 +14,7 @@
 import { and, asc, eq, ne, sql } from 'drizzle-orm';
 import { vendors } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { getPreferences } from './preferences';
 import { maskForContext } from './access';
 import { resolvePartyTerms } from './lists/fields';
 import { type VendorPurchaseFieldsInput, resolveVendorPurchaseFields } from './vendorPurchaseFields';
@@ -144,7 +145,8 @@ export async function createVendor(ctx: ServiceContext, input: CreateVendorInput
       email: input.email?.trim() ?? null,
       phone: input.phone?.trim() ?? null,
       address: input.address ?? null,
-      terms: termsRes ? termsRes.terms : 'net_30',
+      // A Terms-list pick / typed terms win; else Preferences > Bills: default terms for new records.
+      terms: termsRes ? termsRes.terms : (await getPreferences(ctx)).defaultVendorTerms,
       termsId: termsRes?.termsId ?? null,
       is1099: input.is1099 ?? false,
       taxId: input.taxId ?? null,

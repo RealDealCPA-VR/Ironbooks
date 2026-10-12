@@ -21,6 +21,8 @@ import {
   toast, toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+// wave2 prefs: Memorize (Ctrl+M)
+import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 
@@ -112,6 +114,17 @@ function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTr
       title={editing ? 'Edit Transfer' : 'New Transfer'}
       footer={
         <>
+          <MemorizeButton
+            docType="transfer"
+            shortcut={open}
+            defaultName={memo || undefined}
+            getTemplate={() => {
+              if (!fromAccountId || !toAccountId) return 'Pick both accounts before memorizing.';
+              if (fromAccountId === toAccountId) return 'From and To accounts must be different.';
+              if (!amount || parseFloat(amount) <= 0) return 'Enter an amount before memorizing.';
+              return { fromAccountId, toAccountId, amount, date, memo: memo || null };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
             {editing ? 'Save Changes' : 'Record Transfer'}

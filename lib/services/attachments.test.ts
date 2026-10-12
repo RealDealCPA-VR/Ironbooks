@@ -8,7 +8,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { users, companies } from '@/lib/db/schema';
+import { users, companies, customers, vendors } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import {
   saveAttachment,
@@ -21,6 +21,9 @@ const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-attachmen
 
 let ctx: ServiceContext;
 let db: DB;
+/** Real records of the test company: uploads straight to a record must point at a real one. */
+let customerId: string;
+let vendorId: string;
 
 describe('Attachments service (integration)', () => {
   beforeAll(async () => {
@@ -40,6 +43,11 @@ describe('Attachments service (integration)', () => {
       .returning();
 
     ctx = { db, companyId: company.id, userId: user.id };
+
+    const [cust] = await db.insert(customers).values({ companyId: company.id, displayName: 'Attach Customer' }).returning();
+    const [vend] = await db.insert(vendors).values({ companyId: company.id, displayName: 'Attach Vendor' }).returning();
+    customerId = cust.id;
+    vendorId = vend.id;
   });
 
   afterAll(async () => {
@@ -61,8 +69,8 @@ describe('Attachments service (integration)', () => {
 
   it('saves a base64 file and returns a DB row', async () => {
     const row = await saveAttachment(ctx, {
-      entityType: 'invoice',
-      entityId: '00000000-0000-0000-0000-000000000001',
+      entityType: 'customer',
+      entityId: customerId,
       filename: 'receipt.png',
       mimeType: 'image/png',
       base64: TINY_PNG_B64,
@@ -84,8 +92,8 @@ describe('Attachments service (integration)', () => {
 
   it('lists the saved attachment for the entity', async () => {
     const list = await listAttachments(ctx, {
-      entityType: 'invoice',
-      entityId: '00000000-0000-0000-0000-000000000001',
+      entityType: 'customer',
+      entityId: customerId,
     });
 
     expect(list).toHaveLength(1);
@@ -95,7 +103,7 @@ describe('Attachments service (integration)', () => {
 
   it('returns an empty list for a different entityId', async () => {
     const list = await listAttachments(ctx, {
-      entityType: 'invoice',
+      entityType: 'customer',
       entityId: '00000000-0000-0000-0000-000000000099',
     });
     expect(list).toHaveLength(0);
@@ -127,8 +135,8 @@ describe('Attachments service (integration)', () => {
 
     // Row should be gone.
     const list = await listAttachments(ctx, {
-      entityType: 'invoice',
-      entityId: '00000000-0000-0000-0000-000000000001',
+      entityType: 'customer',
+      entityId: customerId,
     });
     expect(list).toHaveLength(0);
 
@@ -143,10 +151,10 @@ describe('Attachments service (integration)', () => {
   });
 
   it('saves a second attachment and lists both', async () => {
-    const entityId = '00000000-0000-0000-0000-000000000002';
+    const entityId = vendorId;
 
     const r1 = await saveAttachment(ctx, {
-      entityType: 'bill',
+      entityType: 'vendor',
       entityId,
       filename: 'invoice-a.pdf',
       mimeType: 'application/pdf',
@@ -154,17 +162,31 @@ describe('Attachments service (integration)', () => {
     });
 
     const r2 = await saveAttachment(ctx, {
-      entityType: 'bill',
+      entityType: 'vendor',
       entityId,
       filename: 'invoice-b.pdf',
       mimeType: 'application/pdf',
       base64: Buffer.from('pdf-content-b').toString('base64'),
     });
 
-    const list = await listAttachments(ctx, { entityType: 'bill', entityId });
+    const list = await listAttachments(ctx, { entityType: 'vendor', entityId });
     expect(list).toHaveLength(2);
     const ids = list.map((r) => r.id);
     expect(ids).toContain(r1.id);
     expect(ids).toContain(r2.id);
+  });
+  it('refuses an upload straight to a made-up record of a known type, but keeps free-form "other" references', async () => {
+    await expect(
+      saveAttachment(ctx, {
+        entityType: 'invoice',
+        entityId: '00000000-0000-0000-0000-000000000001',
+        filename: 'x.png',
+        mimeType: 'image/png',
+        base64: TINY_PNG_B64,
+      }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    const ref = '00000000-0000-0000-0000-000000000003';
+    const row = await saveAttachment(ctx, { entityType: 'other', entityId: ref, filename: 'o.png', mimeType: 'image/png', base64: TINY_PNG_B64 });
+    expect((await listAttachments(ctx, { entityType: 'other', entityId: ref })).map((r) => r.id)).toEqual([row.id]);
   });
 });

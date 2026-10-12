@@ -149,6 +149,8 @@ async function addJournalItemsToAging(
     b[key] = b[key].plus(amount);
   }
 }
+// wave2 prefs: Reports > "Aging reports: age from due date / transaction date".
+import { getPreferences } from './company';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -261,6 +263,7 @@ async function addBouncedApplicationsAsOf(ctx: ServiceContext, upTo: Date, map: 
  */
 export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
   const cutoff = asOf ?? new Date();
+  const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   // Invoices dated on/before the cutoff. Do NOT exclude 'paid' — an invoice paid
   // after the cutoff was still receivable as of the cutoff.
@@ -328,7 +331,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     const amount = billedBase.minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
 
-    const effectiveDue = row.dueDate ?? row.date;
+    const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const daysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     const key = agingKey(daysPastDue);
 
@@ -408,6 +411,7 @@ function billHomeOpen(row: { total: string; exchangeRate: string | null }, homeA
 
 export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
   const cutoff = asOf ?? new Date();
+  const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
     .select({
@@ -472,7 +476,7 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     // the A/P control account: round2(total x bill rate) minus the home A/P each payment relieved.
     if (row.currency) amount = billHomeOpen(row, homeAppliedAsOf.get(row.billId));
 
-    const effectiveDue = row.dueDate ?? row.date;
+    const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const daysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     const key = agingKey(daysPastDue);
 
@@ -948,6 +952,7 @@ function buildAgingDetailReport(rows: AgingDetailRow[], cutoff: Date): AgingDeta
  */
 export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
   const cutoff = asOf ?? new Date();
+  const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
     .select({
@@ -1007,7 +1012,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     const amount = billedBase.minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
 
-    const effectiveDue = row.dueDate ?? row.date;
+    const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
       docId: row.invoiceId,
@@ -1071,6 +1076,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
  */
 export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
   const cutoff = asOf ?? new Date();
+  const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
     .select({
@@ -1126,7 +1132,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     // the A/P control account: round2(total x bill rate) minus the home A/P each payment relieved.
     if (row.currency) amount = billHomeOpen(row, homeAppliedAsOf.get(row.billId));
 
-    const effectiveDue = row.dueDate ?? row.date;
+    const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
       docId: row.billId,

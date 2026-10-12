@@ -32,7 +32,9 @@ export function pdfResponse(bytes: Uint8Array, filename: string): NextResponse {
     status: 200,
     headers: {
       'Content-Type': 'application/pdf',
-      'Content-Disposition': `inline; filename="${filename}"`,
+      // Alphanumeric document numbers (wave2 foundation) may carry quotes, slashes or non-ASCII
+      // characters that are not valid in a header value — keep the filename header-safe.
+      'Content-Disposition': `inline; filename="${filename.replace(/[^A-Za-z0-9._-]+/g, '_')}"`,
       'Content-Length': String(buf.byteLength),
     },
   });

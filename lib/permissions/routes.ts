@@ -126,6 +126,33 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // Advanced pricing / receiving preferences (team pricing).
   '/api/pricing/settings': r('company', 'GET PATCH'),
   '/api/receiving/settings': r('company', 'GET PATCH'),
+  // wave2 prefs: resolved Preferences (company + My Preferences). Any member reads them (forms
+  // and reports honor them); company preferences are written through PATCH /api/company; My
+  // Preferences only change the signed-in person's own settings.
+  '/api/preferences': kind('member', 'GET'),
+  '/api/preferences/my': kind('member', 'GET PATCH'),
+  // Form templates: any member may list them (print/email template pickers); designing them is a
+  // company preference.
+  '/api/form-templates': { GET: 'member', ...r('company', 'POST') },
+  '/api/form-templates/[id]': { GET: 'member', ...r('company', 'PATCH DELETE') },
+  '/api/form-templates/[id]/logo': r('company', 'POST:modify DELETE:modify'),
+  '/api/form-templates/preview': r('company', 'POST:view'),
+  // Reminders / Calendar / To Do list: per-member views; the services drop categories from areas
+  // the member can't view. To-dos are personal notes (no books data).
+  '/api/reminders': kind('member', 'GET'),
+  '/api/calendar': kind('member', 'GET'),
+  // Calendar / Lead Center to-dos (wave2 prefs). Served under /api/calendar/todos because
+  // /api/todos is the wave2 lists To Do list (Lists > To Do, gated by the lists area).
+  '/api/calendar/todos': kind('member', 'GET POST'),
+  '/api/calendar/todos/[id]': kind('member', 'PATCH DELETE'),
+  // Letters & labels: the templates are a list; producing letters/labels/envelopes needs print
+  // on the recipients' area (customers / vendors / payroll), checked in the handlers.
+  '/api/letters/templates': r('lists', 'GET POST'),
+  '/api/letters/templates/[id]': r('lists', 'PATCH DELETE'),
+  '/api/letters/recipients': kind('member', 'GET'),
+  '/api/letters/prepare': kind('member', 'POST'),
+  '/api/letters/labels': kind('member', 'POST'),
+  '/api/letters/envelopes': kind('member', 'POST'),
 
   // ---- Users & Roles ----
   '/api/users': r('users', 'GET POST'),
@@ -195,8 +222,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/sales-reps/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/sales-reps/assign': r('customers', 'POST:modify'),
   '/api/attachments': r('lists', 'GET POST'),
-  '/api/attachments/[id]': r('lists', 'GET DELETE'),
+  '/api/attachments/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/recurring': r('lists', 'GET POST'),
+  '/api/recurring/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/recurring/run': r('accounting', 'POST'),
   '/api/merge': r('lists', 'POST:delete'),
   '/api/fixed-assets': r('lists', 'GET POST'),
@@ -228,6 +256,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/jobs': r('customers', 'GET POST'),
   '/api/jobs/[id]': r('customers', 'GET PATCH DELETE'),
   '/api/job-type-assign': r('customers', 'POST:modify'), // wave-2 lists: a job's Job Type
+  // Lead Center (wave2 prefs): prospects before they become customers.
+  '/api/leads': r('customers', 'GET POST'),
+  '/api/leads/[id]': r('customers', 'GET PATCH DELETE'),
+  '/api/leads/[id]/convert': r('customers', 'POST:create'),
   '/api/customer-prices': r('customers', 'GET POST'),
   '/api/customer-prices/[id]': r('customers', 'DELETE'),
   '/api/pricing/customers/[id]': r('customers', 'PATCH'),
@@ -538,6 +570,9 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/tracking': 'lists',
   '/recurring': 'lists',
   '/attachments': 'lists',
+  '/letters': 'lists',
+  '/leads': 'customers',
+  '/templates': 'company',
   '/merge': 'lists',
   '/fixed-assets': 'lists',
   '/lists': 'lists',

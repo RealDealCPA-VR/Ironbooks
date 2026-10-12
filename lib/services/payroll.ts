@@ -49,6 +49,8 @@ import {
 import { getPayrollItemsByIds, type PayrollItem } from './payrollItems';
 import { sickVacationBalances } from './payrollReports';
 import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll } from './timeTracking';
+import { getPreferences } from './preferences';
+import { type PrefAccountKind, assertPreferenceAccount } from './prefAccounts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -172,6 +174,30 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
+}
+
+/**
+ * Preferences > Payroll & Employees / Checking may name the wages expense, payroll liabilities
+ * and paycheck bank accounts. A preferred account that was deleted or made inactive falls back
+ * to the standard chart-of-accounts code; one of the WRONG KIND (e.g. A/R as the paycheck
+ * account, A/P as the wages account) is refused, so control accounts keep matching their
+ * subledgers even if a bad value was stored before validation existed.
+ */
+async function preferredAccountId(
+  ctx: ServiceContext,
+  preferredId: string | null,
+  fallbackCode: string,
+  kind: PrefAccountKind,
+  label: string,
+): Promise<string> {
+  if (preferredId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(preferredId)) {
+    const [row] = await ctx.db
+      .select({ id: accounts.id, isActive: accounts.isActive })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, preferredId)));
+    if (row?.isActive) return (await assertPreferenceAccount(ctx, row.id, kind, label)).id;
+  }
+  return accountIdByCode(ctx, fallbackCode);
 }
 
 // ---------------------------------------------------------------------------
@@ -762,9 +788,10 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
   }
 
   // --- Resolve GL accounts ---
-  const payrollExpenseId = await accountIdByCode(ctx, '6500'); // Payroll Expense
-  const payrollLiabId = await accountIdByCode(ctx, '2300');    // Payroll Liabilities
-  const checkingId = await accountIdByCode(ctx, '1000');       // Checking
+  const payPrefs = await getPreferences(ctx);
+  const payrollExpenseId = await preferredAccountId(ctx, payPrefs.payrollExpenseAccountId, '6500', 'expense', 'The payroll wages account'); // Payroll Expense
+  const payrollLiabId = await preferredAccountId(ctx, payPrefs.payrollLiabilityAccountId, '2300', 'payroll_liability', 'The payroll liabilities account'); // Payroll Liabilities
+  const checkingId = await preferredAccountId(ctx, payPrefs.defaultPaycheckAccountId, '1000', 'bank', 'The paycheck bank account'); // Checking
 
   // Employer payroll taxes post to 6510 Payroll Tax Expense when the company has one,
   // otherwise fall back to 6500 Payroll Expense (the default COA has no 6510).

@@ -185,7 +185,7 @@ describe('Recurring templates — expense docType + auto-enter modes', () => {
     await expect(
       createTemplate(ctx, {
         name: 'Bad',
-        docType: 'purchase_order' as never,
+        docType: 'wire_transfer' as never,
         frequency: 'monthly',
         nextRunDate: new Date(),
         template: {},

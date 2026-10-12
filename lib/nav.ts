@@ -26,6 +26,8 @@ import { ClipboardCheck, Table2, Eraser } from 'lucide-react';
 // wave2 sales: Income Tracker, Collections Center, Batch Invoicing
 import { TrendingUp, PhoneCall } from 'lucide-react';
 import { Bookmark, LineChart, Grid3x3, Search } from 'lucide-react'; // wave2 reports
+// wave2 prefs: calendar, reminders, lead center, letters, form templates
+import { Bell, CalendarDays, Contact, Mail, LayoutTemplate } from 'lucide-react';
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -53,6 +55,7 @@ export const navGroups: NavGroup[] = [
       { icon: HandCoins, label: 'Receive Payments', path: '/payments' },
       { icon: RotateCcw, label: 'Credit Memos', path: '/credit-memos' },
       { icon: Users, label: 'Customers', path: '/customers' },
+      { icon: Contact, label: 'Lead Center', path: '/leads' },
       { icon: Percent, label: 'Finance Charges', path: '/finance-charges' },
       { icon: TrendingUp, label: 'Income Tracker', path: '/income-tracker' },
       { icon: PhoneCall, label: 'Collections Center', path: '/collections-center' },
@@ -102,7 +105,7 @@ export const navGroups: NavGroup[] = [
       { icon: Calculator, label: 'Payroll Tax', path: '/payroll-tax' },
       { icon: Tag, label: 'Tracking', path: '/tracking' },
       { icon: Percent, label: 'Tax Components', path: '/sales-tax-components' },
-      { icon: Repeat, label: 'Recurring', path: '/recurring' },
+      { icon: Repeat, label: 'Memorized Transactions', path: '/recurring' },
       { icon: Coins, label: 'Currencies', path: '/currencies' },
       { icon: CalendarRange, label: 'Fiscal Periods', path: '/fiscal-periods' },
       { icon: CalendarClock, label: 'Year-End Close', path: '/year-end' },
@@ -137,7 +140,10 @@ export const navGroups: NavGroup[] = [
       { icon: FileClock, label: 'Audit Trail', path: '/audit-trail' },
       { icon: BriefcaseIcon, label: 'Accountant Center', path: '/accountant' }, // wave2 accountant
       { icon: ScrollText, label: 'Transaction Log', path: '/transaction-log' },
-      { icon: Paperclip, label: 'Attachments', path: '/attachments' },
+      { icon: Paperclip, label: 'Doc Center', path: '/attachments' },
+      { icon: Bell, label: 'Reminders', path: '/reminders' },
+      { icon: CalendarDays, label: 'Calendar', path: '/calendar' },
+      { icon: Mail, label: 'Letters & Labels', path: '/letters' },
       { icon: BadgeCheck, label: 'Data Integrity', path: '/integrity' },
       { icon: GitMerge, label: 'Merge Records', path: '/merge' },
       { icon: Eraser, label: 'Clean Up Lists', path: '/lists/cleanup' },
@@ -178,6 +184,7 @@ export const navGroups: NavGroup[] = [
       { icon: Users, label: 'Multi-user', path: '/multi-user' },
       { icon: Settings, label: 'Settings', path: '/settings' },
       { icon: ListChecks, label: 'Document Numbers', path: '/doc-numbers' }, // wave2 foundation
+      { icon: LayoutTemplate, label: 'Form Templates', path: '/templates' },
       { icon: Sparkles, label: 'AI & Automation', path: '/ai-settings' },
     ],
   },

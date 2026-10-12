@@ -12,6 +12,12 @@ import { assertWrite } from './rbac';
 import { requireEffectivePermission } from './access';
 import type { DB } from '@/lib/db';
 import { logTransaction } from './transactionLog';
+import { assertPreferenceAccounts } from './prefAccounts';
+import {
+  COMPANY_PREFERENCE_KEYS,
+  resolveCompanyPreferences,
+  type CompanyPreferences,
+} from '@/lib/preferences';
 
 type AccountSeed = { code: string; name: string; type: string; subtype: string };
 
@@ -246,7 +252,25 @@ export const COMPANY_SETTINGS_KEYS = [
   'customFields',
 ] as const satisfies readonly (keyof CompanySettings)[];
 
-const SETTINGS_KEY_SET = new Set<string>(COMPANY_SETTINGS_KEYS);
+/**
+ * wave2 prefs: every categorized Preferences key (lib/preferences.ts) is also whitelisted, so the
+ * full QB Preferences dialog (Accounting, Checking, Jobs & Estimates, Items & Inventory,
+ * Payments, Reminders, Reports, Sales Tax, Send Forms, Time & Expenses, Multiple Currencies…)
+ * persists through updateCompany. Values are validated by lib/validation/company.ts.
+ */
+const SETTINGS_KEY_SET = new Set<string>([...COMPANY_SETTINGS_KEYS, ...COMPANY_PREFERENCE_KEYS]);
+
+/**
+ * Resolved company preferences (stored overrides + defaults) — the one call consumers use to
+ * honor Preferences (forms, reports, services). See lib/preferences.ts for the catalogue.
+ */
+export async function getPreferences(ctx: ServiceContext): Promise<CompanyPreferences> {
+  const [row] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  return resolveCompanyPreferences(row?.settings ?? {});
+}
 
 export interface UpdateCompanyInput {
   name?: string;
@@ -268,6 +292,9 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
   for (const [key, value] of Object.entries(input.settings ?? {})) {
     if (SETTINGS_KEY_SET.has(key) && value !== undefined) settingsPatch[key] = value;
   }
+  // Account-valued preferences must name the right kind of account (a paycheck account that is
+  // A/R or a wages account that is A/P would break the subledger == control-account rule).
+  await assertPreferenceAccounts(ctx, settingsPatch);
 
   const mergedSettings = {
     ...(existing.settings ?? {}),

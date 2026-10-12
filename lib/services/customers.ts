@@ -20,6 +20,7 @@ import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { unappliedPaymentsByCustomer } from './customerCredits';
 import { journalBalancesByEntity } from './journal';
 import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
+import { getPreferences } from './preferences';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -172,7 +173,8 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
       phone: input.phone?.trim() ?? null,
       billingAddress: (input.billingAddress as Record<string, string>) ?? null,
       shippingAddress: (input.shippingAddress as Record<string, string>) ?? null,
-      terms: termsRes ? termsRes.terms : 'net_30',
+      // A Terms-list pick / typed terms win; else Preferences > Sales & Customers: default terms for new records.
+      terms: termsRes ? termsRes.terms : (await getPreferences(ctx)).defaultCustomerTerms,
       termsId: termsRes?.termsId ?? null,
       creditLimit: input.creditLimit != null ? toAmountString(input.creditLimit) : null,
       taxable: taxCode ? taxCode.taxable : input.taxable ?? true,

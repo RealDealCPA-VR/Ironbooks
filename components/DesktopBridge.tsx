@@ -15,8 +15,8 @@
  * Renders nothing in the browser (window.bookkeeper is absent outside Electron) and
  * nothing in the desktop shell until an update has finished downloading.
  */
-import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useEffect, useRef, useState } from 'react';
+import { usePathname, useRouter } from 'next/navigation';
 import { RefreshCw, X } from 'lucide-react';
 import { Button, toast } from '@/components/ui';
 import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
@@ -28,6 +28,7 @@ interface DesktopBridgeApi {
   onNavigate?: (cb: (route: string) => void) => Unsubscribe;
   quitAndInstall?: () => Promise<boolean>;
   company?: { newFile?: () => Promise<unknown>; open?: () => Promise<unknown> };
+  spellcheck?: { setEnabled?: (enabled: boolean) => Promise<unknown> };
 }
 
 function bridge(): DesktopBridgeApi | undefined {
@@ -52,6 +53,37 @@ export default function DesktopBridge() {
   const router = useRouter();
   const [updateReady, setUpdateReady] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const pathname = usePathname();
+  const myPrefsApplied = useRef(false);
+
+  // My Preferences in the desktop shell: spell checking on/off, and "Show the Reminders list
+  // when I open the company" (once per app session). Raw fetch on purpose: before sign-in it
+  // just fails quietly (no redirect), and we retry on the next navigation.
+  useEffect(() => {
+    const b = bridge();
+    if (!b?.isDesktop || myPrefsApplied.current) return;
+    if (pathname?.startsWith('/portal') || ['/login', '/signup', '/unlock', '/reset-password'].includes(pathname ?? '')) return;
+    let cancelled = false;
+    fetch('/api/preferences/my', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((my: { spellCheckEnabled?: boolean; showRemindersAtStartup?: boolean } | null) => {
+        if (!my || cancelled) return;
+        myPrefsApplied.current = true;
+        void b.spellcheck?.setEnabled?.(my.spellCheckEnabled !== false);
+        try {
+          if (my.showRemindersAtStartup && !sessionStorage.getItem('bka:reminders-shown')) {
+            sessionStorage.setItem('bka:reminders-shown', '1');
+            if (pathname !== '/reminders') router.push('/reminders');
+          }
+        } catch {
+          /* storage unavailable: skip the startup reminder */
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [pathname, router]);
 
   useEffect(() => {
     const b = bridge();

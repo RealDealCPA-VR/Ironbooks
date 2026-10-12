@@ -21,6 +21,8 @@ import { listAccounts } from '@/lib/services/accounts';
 import { trialBalance } from '@/lib/services/reports';
 import { buildAccountBalances } from '@/lib/homeWorkflow';
 import HomeWorkflow from '@/components/HomeWorkflow';
+import RemindersList from '@/components/RemindersList';
+import { getMyPreferences } from '@/lib/services/preferences';
 import { Help } from '@/components/Help';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -47,10 +49,11 @@ export default async function DashboardPage() {
   if (ctx.access && !can(ctx.access, 'reports_financial', 'view')) return <LimitedHome />;
   // Single aggregated read model (also served as GET /api/dashboard). KPI cards keep
   // the fiscal-YTD scoping from lib/ytd.ts (settings.fiscalYearEnd; defaults Jan 1).
-  const [d, accountRows, tb] = await Promise.all([
+  const [d, accountRows, tb, myPrefs] = await Promise.all([
     getDashboardInsights(ctx),
     listAccounts(ctx),
     trialBalance(ctx),
+    getMyPreferences(ctx),
   ]);
   // QB "Account Balances" panel: bank + credit card balances straight from the ledger.
   const balances = buildAccountBalances(accountRows, tb.rows);
@@ -67,8 +70,25 @@ export default async function DashboardPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Home" action={<QuickActions />} />
 
-      {/* QuickBooks-style workflow diagram: click any step to start that task. */}
-      <HomeWorkflow balances={balances} />
+      {/* QuickBooks-style workflow diagram: click any step to start that task
+          (My Preferences > General can hide it). */}
+      {myPrefs.showHomeWorkflow && <HomeWorkflow balances={balances} />}
+
+      {/* Reminders (Preferences > Reminders decides what shows). */}
+      <Card className="mt-8 p-6 max-w-3xl">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-lg font-bold text-navy">Reminders</h2>
+          <span className="flex gap-4 text-sm">
+            <Link href="/calendar" className="font-semibold text-electric hover:underline">
+              Calendar
+            </Link>
+            <Link href="/reminders" className="font-semibold text-electric hover:underline">
+              All reminders
+            </Link>
+          </span>
+        </div>
+        <RemindersList compact />
+      </Card>
 
       <h2 className="mt-10 mb-4 text-xl font-extrabold text-navy">Insights</h2>
 

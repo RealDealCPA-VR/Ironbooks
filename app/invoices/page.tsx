@@ -48,6 +48,12 @@ import {
   shippingPayload,
   useCreditLimitConfirm,
 } from '@/components/sales/SalesExtras';
+// wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmClassAssigned, confirmStockAvailable, confirmTransactionDate } from '@/lib/formPrefs';
+import { dueDateForTerms } from '@/lib/preferences';
+import MemorizeButton from '@/components/MemorizeButton';
+import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,6 +62,7 @@ import {
 interface Customer {
   id: string;
   displayName: string;
+  terms?: string | null;
 }
 
 type ItemType =
@@ -392,6 +399,7 @@ function InvoiceModal({
   const [dupNumberPrompt, setDupNumberPrompt] = useState<string | null>(null);
 
   const itemNameById = new Map(items.map((it) => [it.id, it.name]));
+  const prefs = usePreferences();
 
   // Reset / prefill form when the modal opens.
   useEffect(() => {
@@ -440,7 +448,8 @@ function InvoiceModal({
       setDiscountType('amount');
       setCurrency('');
       setExchangeRate('');
-      setMemo('');
+      // Preferences > Sales & Customers: default customer message.
+      setMemo(prefs.company.defaultInvoiceMemo ?? '');
       setShip(shippingFromDoc(null));
       setSaveAsPending(false);
       setRefNumber('');
@@ -450,9 +459,19 @@ function InvoiceModal({
     setBillables(null);
     setSelectedCostIds(new Set());
     setSelectedTimeIds(new Set());
-    setMarkupPercent('');
+    // Preferences > Time & Expenses: default markup on billable costs.
+    setMarkupPercent(prefs.company.defaultMarkupPercent > 0 ? String(prefs.company.defaultMarkupPercent) : '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing]);
+
+  // New invoice: due date follows the customer's terms (else the default terms preference).
+  useEffect(() => {
+    if (!open || editing || !customerId || !date) return;
+    const cust = customers.find((c) => c.id === customerId);
+    const due = dueDateForTerms(date, cust?.terms || prefs.company.defaultCustomerTerms);
+    if (due) setDueDate(due);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editing, customerId]);
 
   // When a customer is selected: load their price level + unbilled billables.
   useEffect(() => {
@@ -761,6 +780,20 @@ function InvoiceModal({
       };
     }
 
+    // Preferences: date range, class, and not-enough-inventory warnings.
+    if (!confirmTransactionDate(date, prefs)) return;
+    if (!confirmClassAssigned(classId, prefs)) return;
+    if (
+      !confirmStockAvailable(
+        indexed.map(({ l }) => ({ itemId: l.itemId, quantity: l.quantity })),
+        items,
+        prefs,
+        editing?.lines.map((l) => ({ itemId: l.itemId, quantity: l.quantity })) ?? [],
+      )
+    ) {
+      return;
+    }
+
     setSaving(true);
     try {
       // Over the customer's credit limit → "Save anyway?" (recorded in the audit trail).
@@ -812,6 +845,32 @@ function InvoiceModal({
               Save as pending (don&apos;t post yet)
             </label>
           )}
+          <MemorizeButton
+            docType="invoice"
+            shortcut={open}
+            defaultName={customers.find((c) => c.id === customerId)?.displayName}
+            getTemplate={() => {
+              if (!customerId) return 'Pick a customer before memorizing.';
+              const rows = lines.filter((l) => (l.itemId || l.description) && lineKind(l) !== 'subtotal');
+              if (rows.length === 0) return 'Add at least one line before memorizing.';
+              return {
+                customerId,
+                date,
+                dueDate: dueDate || undefined,
+                taxRateId: taxRateId || undefined,
+                classId: classId || undefined,
+                memo: memo || undefined,
+                lines: rows.map((l) => ({
+                  itemId: l.itemId,
+                  description: l.description || null,
+                  quantity: l.quantity || '1',
+                  rate: l.rate || '0',
+                  taxable: l.taxable,
+                  jobId: l.jobId || null,
+                })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={() => handleSubmit()} loading={saving}>
             {editing ? 'Save Changes' : saveAsPending ? 'Save Pending' : 'Create Invoice'}
@@ -1280,6 +1339,9 @@ function InvoiceModal({
           )}
         </div>
       </div>
+      {open && (
+        <AttachmentPanel className="mt-4" entityType="invoice" entityId={editing?.id} />
+      )}
     </Modal>
     <ConfirmDialog
       open={dupNumberPrompt !== null}

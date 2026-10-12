@@ -21,6 +21,9 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+// wave2 prefs: default terms from Preferences + attachments on the record
+import { usePreferences } from '@/lib/usePreferences';
+import AttachmentPanel from '@/components/AttachmentPanel';
 import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
 import { EntityNotes } from '@/components/lists/EntityNotes';
@@ -361,6 +364,7 @@ function DefineFieldsModal({
 // ---------------------------------------------------------------------------
 
 function CustomersPageContent() {
+  const prefs = usePreferences();
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
   const [includeInactive, setIncludeInactive] = useState(false);
@@ -460,7 +464,8 @@ function CustomersPageContent() {
   // ---------------------------------------------------------------------------
 
   function openAddModal() {
-    setAddForm(EMPTY_FORM);
+    // Preferences > Sales & Customers: default terms for new customers.
+    setAddForm({ ...EMPTY_FORM, terms: prefs.company.defaultCustomerTerms });
     setAddCustom({});
     setAddOpen(true);
   }
@@ -821,6 +826,7 @@ function CustomersPageContent() {
           onCustomChange={(name, value) => setEditCustom((prev) => ({ ...prev, [name]: value }))}
         />
         {editTarget && <EntityNotes entityType="customer" entityId={editTarget.id} />}
+        <AttachmentPanel className="mt-4" entityType="customer" entityId={editTarget?.id} />
       </Modal>
 
       {/* ---- Define custom fields modal ---- */}

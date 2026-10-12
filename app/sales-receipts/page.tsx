@@ -45,6 +45,9 @@ import {
   shippingFromDoc,
   shippingPayload,
 } from '@/components/sales/SalesExtras';
+// wave2 prefs: Payments > default deposit account; Memorize (Ctrl+M)
+import { usePreferences } from '@/lib/usePreferences';
+import MemorizeButton from '@/components/MemorizeButton';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -185,6 +188,13 @@ function NewReceiptModal({
   // QB lists bank, Undeposited Funds and other current assets in "Deposit to" — never A/R.
   const depositAccounts = accounts.filter((a) => isDepositTargetAccount(a));
   const undepositedFunds = depositAccounts.find((a) => a.code === '1050');
+  const prefs = usePreferences();
+  // Preferences > Payments: Undeposited Funds, or the Checking default deposit account.
+  const defaultDepositId = (() => {
+    const def = prefs.company.defaultDepositAccountId;
+    if (!prefs.company.useUndepositedFunds && def && depositAccounts.some((a) => a.id === def)) return def;
+    return undepositedFunds?.id ?? '';
+  })();
 
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -226,7 +236,7 @@ function NewReceiptModal({
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setMethod('cash');
-      setDepositAccountId(undepositedFunds?.id ?? '');
+      setDepositAccountId(defaultDepositId);
       setReference('');
       setTaxRateId('');
       setMemo('');
@@ -303,6 +313,27 @@ function NewReceiptModal({
   const selectedTaxRate = taxRates.find((t) => t.id === taxRateId);
   const { subtotal, tax, total } = computeTotals(lines, selectedTaxRate);
 
+  function receiptPayload(validLines: LineRow[]) {
+    return {
+      ...shippingPayload(ship),
+      customerId: customerId || null,
+      date,
+      method,
+      depositAccountId: depositAccountId || null,
+      reference: reference || null,
+      taxRateId: taxRateId || null,
+      memo: memo || null,
+      lines: validLines.map((l) => ({
+        itemId: l.itemId || null,
+        description: l.description || null,
+        quantity: l.quantity,
+        rate: l.rate,
+        taxable: l.taxable,
+        ...inventoryLinePayload(l.inv),
+      })),
+    };
+  }
+
   async function handleSubmit() {
     if (!date) { toast('Please enter a receipt date.', 'danger'); return; }
     const validLines = lines.filter((l) => l.itemId || l.description || l.quantity || l.rate);
@@ -319,24 +350,7 @@ function NewReceiptModal({
 
     setSaving(true);
     try {
-      const body = {
-        ...shippingPayload(ship),
-        customerId: customerId || null,
-        date,
-        method,
-        depositAccountId: depositAccountId || null,
-        reference: reference || null,
-        taxRateId: taxRateId || null,
-        memo: memo || null,
-        lines: validLines.map((l) => ({
-          itemId: l.itemId || null,
-          description: l.description || null,
-          quantity: l.quantity,
-          rate: l.rate,
-          taxable: l.taxable,
-          ...inventoryLinePayload(l.inv),
-        })),
-      };
+      const body = receiptPayload(validLines);
       if (editing) {
         await api.patch(`/api/sales-receipts/${editing.id}`, body);
         toast(`Sales Receipt #${editing.receiptNumber} updated.`, 'success');
@@ -361,6 +375,28 @@ function NewReceiptModal({
       title={editing ? `Edit Sales Receipt #${editing.receiptNumber}` : 'New Sales Receipt'}
       footer={
         <>
+          <MemorizeButton
+            docType="sales_receipt"
+            shortcut={open}
+            defaultName={customers.find((c) => c.id === customerId)?.displayName}
+            getTemplate={() => {
+              const valid = lines.filter((l) => l.itemId || l.description || l.quantity || l.rate);
+              if (valid.length === 0) return 'Add at least one line before memorizing.';
+              const p = receiptPayload(valid);
+              // Lot / serial picks are one-time: each memorized entry picks fresh stock.
+              return {
+                ...p,
+                reference: null,
+                lines: p.lines.map((l) => ({
+                  itemId: l.itemId,
+                  description: l.description,
+                  quantity: l.quantity,
+                  rate: l.rate,
+                  taxable: l.taxable,
+                })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
             {editing ? 'Save Changes' : 'Create Receipt'}

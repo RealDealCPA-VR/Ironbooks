@@ -8,13 +8,15 @@
 //    company has opted in to cloud bank feeds (refreshed from the server's network policy).
 //    Everything else is cancelled and logged — no CDNs, web fonts, analytics or telemetry.
 //  - No <webview>, no permission prompts (camera, mic, geolocation, notifications…), and the
-//    spellchecker is off (Chromium would otherwise download dictionaries from Google).
+//    spellchecker never downloads dictionaries: Windows/macOS use the OS checker, elsewhere the
+//    download URL points at localhost (electron/spelling.js).
 //
 // The page itself also ships a strict Content-Security-Policy (next.config.js headers()).
 
 'use strict';
 
 const { app, session, shell } = require('electron');
+const { configureSpellChecker } = require('./spelling');
 
 const INTERNAL_PROTOCOLS = new Set(['data:', 'blob:', 'devtools:', 'chrome-extension:', 'chrome:', 'about:']);
 const ALLOWED_PERMISSIONS = new Set(['clipboard-sanitized-write', 'fullscreen']);
@@ -108,11 +110,8 @@ function install(opts) {
   const ses = session.defaultSession;
   ses.setPermissionRequestHandler((_wc, permission, callback) => callback(ALLOWED_PERMISSIONS.has(permission)));
   ses.setPermissionCheckHandler((_wc, permission) => ALLOWED_PERMISSIONS.has(permission));
-  try {
-    ses.setSpellCheckerEnabled(false);
-  } catch {
-    /* older Electron */
-  }
+  // Local-only spell check (on by default; My Preferences > Spelling can turn it off).
+  configureSpellChecker(ses, process.platform, true);
   ses.webRequest.onBeforeRequest((details, callback) => {
     // Requests made by the main process itself (electron `net`, e.g. the updater — which only
     // runs when the policy allows it) carry no webContents; renderer traffic is filtered.

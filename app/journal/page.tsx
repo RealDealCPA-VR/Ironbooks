@@ -40,6 +40,12 @@ import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { useNewParam } from '@/lib/useFocusParam';
 import EntryDetailModal from '@/components/EntryDetailModal';
+// wave2 prefs: Preferences-driven labels/warnings, memorize (Ctrl+M), attachments
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmClassAssigned, confirmTransactionDate } from '@/lib/formPrefs';
+import { formatAccountLabel } from '@/lib/preferences';
+import MemorizeButton from '@/components/MemorizeButton';
+import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -173,6 +179,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
     emptyLine(++lineCounter),
   ]);
   const [saving, setSaving] = useState(false);
+  const prefs = usePreferences();
 
   const editing = !!editEntry;
 
@@ -254,6 +261,9 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
+    // Preferences: date range warning; class tracking "warn when a line has no class".
+    if (!confirmTransactionDate(date, prefs)) return;
+    if (lines.some((l) => l.accountId && !l.classId) && !confirmClassAssigned(null, prefs)) return;
     setSaving(true);
     try {
       const payload = {
@@ -305,6 +315,29 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       title={editing ? `Edit Journal Entry #${editEntry?.entryNumber}` : 'New Journal Entry'}
       footer={
         <>
+          <MemorizeButton
+            docType="journal_entry"
+            shortcut={open}
+            defaultName={description.trim() || undefined}
+            getTemplate={() => {
+              if (!bal.canSave) return 'Balance the entry (debits = credits) before memorizing.';
+              if (!description.trim()) return 'Enter a description before memorizing.';
+              return {
+                date,
+                description: description.trim(),
+                reference: reference.trim() || null,
+                lines: lines
+                  .filter((l) => l.accountId)
+                  .map((l) => ({
+                    accountId: l.accountId,
+                    debit: journalPayloadAmount(l.debit),
+                    credit: journalPayloadAmount(l.credit),
+                    memo: l.memo.trim() || null,
+                    classId: l.classId || null,
+                  })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
@@ -406,7 +439,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
                   .filter((a) => a.subtype !== 'non_posting')
                   .map((a) => (
                     <option key={a.id} value={a.id}>
-                      {a.code} · {a.name}
+                      {formatAccountLabel(a, prefs.company)}
                     </option>
                   ))}
               </Select>
@@ -543,6 +576,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
           )}
         </div>
       </div>
+      {open && <AttachmentPanel className="mt-4" entityType="journal_entry" entityId={editEntry?.id} />}
     </Modal>
   );
 }

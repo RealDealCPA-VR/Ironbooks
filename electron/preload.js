@@ -48,5 +48,9 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   network: {
     refresh: () => ipcRenderer.invoke('network:refresh'),
   },
+  /** My Preferences > Spelling: turn the (local-only) spell checker on or off. */
+  spellcheck: {
+    setEnabled: (enabled) => ipcRenderer.invoke('spellcheck:setEnabled', Boolean(enabled)),
+  },
   isDesktop: true,
 });
