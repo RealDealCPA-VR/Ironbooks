@@ -71,7 +71,7 @@ describe('Account registers (listRegisterAccounts + accountRegister)', () => {
       description: 'Invoice INV-100 — Acme Corp',
       reference: 'INV-100',
       lines: [
-        { accountId: acct['1200'], debit: '1200.00', memo: 'Acme Corp' },
+        { accountId: acct['1200'], debit: '1200.00', memo: 'Acme Corp', controlLine: true },
         { accountId: acct['4000'], credit: '1200.00' },
       ],
       sourceRef: 'invoice:abc-123',
@@ -105,7 +105,7 @@ describe('Account registers (listRegisterAccounts + accountRegister)', () => {
       description: 'Payment from Acme Corp',
       lines: [
         { accountId: acct['1000'], debit: '1200.00' },
-        { accountId: acct['1200'], credit: '1200.00', memo: 'pays INV-100' },
+        { accountId: acct['1200'], credit: '1200.00', memo: 'pays INV-100', controlLine: true },
       ],
       sourceRef: 'customer:cust-1',
     });

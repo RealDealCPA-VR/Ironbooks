@@ -163,7 +163,7 @@ describe('Linked transactions service', () => {
       description: 'Invoice #1',
       sourceRef: `invoice:${invoiceId}`,
       lines: [
-        { accountId: acct['1200'], debit: '1000.00' },
+        { accountId: acct['1200'], debit: '1000.00', controlLine: true },
         { accountId: acct['4000'], credit: '1000.00' },
       ],
     });
@@ -398,7 +398,7 @@ describe('Linked transactions service', () => {
       sourceRef: `customer:${customerId}`,
       lines: [
         { accountId: acct['1050'], debit: '600.00' },
-        { accountId: acct['1200'], credit: '600.00' },
+        { accountId: acct['1200'], credit: '600.00', controlLine: true },
       ],
     });
     await db
