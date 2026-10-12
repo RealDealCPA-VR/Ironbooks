@@ -71,6 +71,7 @@ export const companySettingsSchema = z.object({
   defaultVendorTerms: z.string().trim().min(1).max(100).optional(),
   defaultExpenseAccountId: zUuid.nullable().optional(),
   // Payroll
+  payrollEnabled: z.boolean().optional(),
   payrollPayPeriod: z.enum(PAY_PERIOD_OPTIONS).optional(),
   payrollStandardHours: z.number().positive().max(168).optional(),
   payrollExpenseAccountId: zUuid.nullable().optional(),

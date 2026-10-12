@@ -129,6 +129,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   // Multiple currencies
   multiCurrencyEnabled: { label: 'I use more than one currency', help: 'Turning this on cannot be undone in QuickBooks; here it only shows the currency fields on forms.', type: 'bool' },
   // Payroll
+  payrollEnabled: { label: 'Use payroll (QuickBooks "Full payroll")', help: 'Turn off if you do not pay employees through this app. Payroll screens leave the menus; nothing is deleted.', type: 'bool' },
   payrollPayPeriod: { label: 'Usual pay period', type: 'select', options: [['weekly', 'Weekly'], ['biweekly', 'Every two weeks'], ['semimonthly', 'Twice a month'], ['monthly', 'Monthly']] },
   payrollStandardHours: { label: 'Standard hours per week', type: 'number' },
   payrollExpenseAccountId: { label: 'Wages expense account', type: 'account', accounts: expense },

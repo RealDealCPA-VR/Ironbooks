@@ -205,6 +205,8 @@ export interface CompanyPreferences {
   // Multiple Currencies
   multiCurrencyEnabled: boolean;
   // Payroll
+  /** p1 ux: QB "Payroll features: Full payroll / No payroll". Off hides payroll screens. */
+  payrollEnabled: boolean;
   payrollPayPeriod: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly';
   payrollStandardHours: number;
   payrollExpenseAccountId: string | null;
@@ -267,6 +269,7 @@ export const DEFAULT_COMPANY_PREFERENCES: CompanyPreferences = {
   trackReimbursedAsIncome: false,
   defaultMarkupPercent: 0,
   multiCurrencyEnabled: false,
+  payrollEnabled: true,
   payrollPayPeriod: 'biweekly',
   payrollStandardHours: 40,
   payrollExpenseAccountId: null,
@@ -477,6 +480,7 @@ export const PREFERENCE_CATEGORIES: Array<{
     id: 'payroll',
     label: 'Payroll & Employees',
     company: [
+      'payrollEnabled',
       'payrollPayPeriod',
       'payrollStandardHours',
       'payrollExpenseAccountId',
@@ -635,7 +639,7 @@ export function featureHiddenPaths(
     | 'inventoryEnabled'
     | 'timeTrackingEnabled'
     | 'salesTaxEnabled'
-  >,
+  > & { payrollEnabled?: boolean },
 ): Set<string> {
   const hidden = new Set<string>();
   const add = (on: boolean, paths: string[]) => {
@@ -658,6 +662,17 @@ export function featureHiddenPaths(
   // Multiple Currencies stays visible: the Currencies page is where it is set up, and QB never
   // lets it be turned back off once foreign-currency records exist.
   add(prefs.salesTaxEnabled, ['/sales-tax-components']);
+  // p1 ux: "No payroll" hides the payroll screens (the employee list itself stays).
+  add(prefs.payrollEnabled !== false, [
+    '/employees/setup',
+    '/pay-runs',
+    '/pay-stubs',
+    '/payroll-forms',
+    '/payroll-forms/reports',
+    '/payroll-tax',
+    '/pay-liabilities',
+    '/reports/payroll-summary',
+  ]);
   return hidden;
 }
 
