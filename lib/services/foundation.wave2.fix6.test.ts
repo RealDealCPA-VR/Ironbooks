@@ -127,7 +127,7 @@ describe('Retainage Receivable is an Other Current Asset (I11)', () => {
     expect(integrity.checks.filter((k) => !k.ok)).toEqual([]);
   });
 
-  it('cash basis still treats unpaid retainage as not-yet-received revenue, and both cash reports agree', async () => {
+  it('cash basis: an unpaid retainage invoice adds no cash income, retainage stays an asset, both cash reports agree', async () => {
     const c = (await createCustomer(ctx, { displayName: 'Fix6 Cash Basis' })).id;
     await createInvoice(ctx, {
       customerId: c,
@@ -137,7 +137,9 @@ describe('Retainage Receivable is an Other Current Asset (I11)', () => {
     });
     const bs = await balanceSheetCashBasis(ctx);
     expect(bs.balanced).toBe(true);
-    expect(bs.adjustments.removedArLines.map((l) => l.code)).toContain('1250');
+    // QB: Retainage Receivable is a balance-sheet line of the invoice, so it stays on the cash
+    // sheet; the invoice's income waits until the billed amount is paid (cashBasisLedger.ts).
+    expect(bs.assets.map((l) => l.code)).toContain('1250');
     const pl = await profitAndLossCashBasis(ctx);
     expect(Money.of(bs.retainedEarnings).toFixed(2)).toBe(Money.of(pl.netIncome).toFixed(2));
   });

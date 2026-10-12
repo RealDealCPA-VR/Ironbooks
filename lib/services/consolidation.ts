@@ -1,12 +1,14 @@
 /**
- * Consolidation service — multi-entity reporting across ALL companies in the database.
+ * Consolidation service — QB "Combine Reports from Multiple Companies".
  *
  * Each company is treated as a separate reporting entity. The consolidated totals are the
  * arithmetic sum of the per-company figures. Intercompany eliminations are not performed
  * here (that would require mapping intercompany accounts, a future layer).
  *
- * NOTE: ctx.db is the shared database; ctx.companyId is the caller's own company but is
- * intentionally NOT used to scope the query — consolidation spans all companies.
+ * ACCESS: every function here combines ONLY the companies returned by reportableCompanies():
+ * the caller's current company plus other companies in this file where the same user is an
+ * active member with the report permission. Another company's books never leak into a
+ * combined report.
  */
 import { listCompanies } from '@/lib/services/company';
 import { profitAndLoss, balanceSheet } from '@/lib/services/reports';
@@ -73,17 +75,16 @@ export interface ConsolidatedBS {
 // ---------------------------------------------------------------------------
 
 /**
- * Run profitAndLoss for every company in the database and sum the results.
+ * Run profitAndLoss for every company the caller may report on and sum the results.
  *
- * @param ctx  Caller context — only ctx.db and ctx.userId are used (companyId is ignored
- *             because consolidation intentionally crosses company boundaries).
+ * @param ctx  Caller context (company, user and access decide which companies are combined).
  * @param range  Optional date range forwarded to each per-company P&L call.
  */
 export async function consolidatedPL(
   ctx: ServiceContext,
   range?: { from?: Date; to?: Date },
 ): Promise<ConsolidatedPL> {
-  const allCompanies = await listCompanies(ctx.db);
+  const allCompanies = await reportableCompanies(ctx);
 
   const companies: CompanyPL[] = await Promise.all(
     allCompanies.map(async (company) => {
@@ -124,16 +125,16 @@ export async function consolidatedPL(
 // ---------------------------------------------------------------------------
 
 /**
- * Run balanceSheet for every company in the database and sum the results.
+ * Run balanceSheet for every company the caller may report on and sum the results.
  *
- * @param ctx  Caller context — only ctx.db and ctx.userId are used.
+ * @param ctx  Caller context (company, user and access decide which companies are combined).
  * @param asOf  Optional date forwarded to each per-company balance sheet call.
  */
 export async function consolidatedBalanceSheet(
   ctx: ServiceContext,
   asOf?: Date,
 ): Promise<ConsolidatedBS> {
-  const allCompanies = await listCompanies(ctx.db);
+  const allCompanies = await reportableCompanies(ctx);
 
   const companies: CompanyBS[] = await Promise.all(
     allCompanies.map(async (company) => {
@@ -190,16 +191,17 @@ export async function consolidatedBalanceSheet(
 // ===========================================================================
 
 /**
- * Companies in this file the caller may report on. Trusted contexts (no `access`) see every
- * company; a signed-in user only sees companies where they are an active member with the
- * report permission — combining never leaks another company's books.
+ * Companies in this file the caller may report on: the current company, plus every other
+ * company where the same user is an ACTIVE member (or the owner) whose roles allow viewing the
+ * report area. Combining never leaks another company's books. This holds for internal contexts
+ * without an `access` grant too (the report scheduler runs as a company owner), so a scheduled
+ * combined report cannot pull in a company that user can't open.
  */
 export async function reportableCompanies(
   ctx: ServiceContext,
   area: 'reports_financial' | 'reports_sales' | 'reports_purchases' = 'reports_financial',
 ) {
   const all = await listCompanies(ctx.db);
-  if (!ctx.access) return all;
   const out: typeof all = [];
   for (const c of all) {
     if (c.id === ctx.companyId) {
@@ -207,6 +209,8 @@ export async function reportableCompanies(
       continue;
     }
     if (!ctx.userId) continue;
+    // Archived (soft-deleted) company files are not combined, as in QB (closed files).
+    if ((c.settings as Record<string, unknown> | null)?.archived === true) continue;
     const r = await resolveAccess(ctx.db, c.id, ctx.userId);
     if (r.member && r.active && can(r.access, area, 'view')) out.push(c);
   }
@@ -318,7 +322,11 @@ export async function combinedProfitAndLossByMonth(ctx: ServiceContext, p: Repor
   const amounts = new Map<string, Amounts>();
   for (const c of cos) {
     const cmeta = await loadAccountMeta(companyCtx(ctx, c.id));
-    const act = await activityByAccount(companyCtx(ctx, c.id), { from, to, excludeClose: true }, 'day');
+    const act = await activityByAccount(
+      companyCtx(ctx, c.id),
+      { from, to, excludeClose: true, basis: p.basis === 'cash' ? 'cash' : undefined },
+      'day',
+    );
     for (const r of act) {
       const a = cmeta.get(r.accountId);
       if (!a || !isPLSection(a.section)) continue;
@@ -340,7 +348,7 @@ export async function combinedProfitAndLossByMonth(ctx: ServiceContext, p: Repor
   return {
     key: 'combined-pl-by-month',
     title: 'Combined Profit & Loss by Month',
-    subtitle: `${fmtDay(from)} – ${fmtDay(to)} · ${cos.length} companies`,
+    subtitle: `${fmtDay(from)} – ${fmtDay(to)} · ${cos.length} companies${p.basis === 'cash' ? ' · Cash Basis' : ''}`,
     columns,
     rows: built.rows,
   };

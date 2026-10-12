@@ -48,6 +48,7 @@ import { fiscalYearWindow } from './fiscalClose';
 import { notFiscalCloseEntry } from './reports';
 import { docRef } from './docNumbers';
 import { resolveEntityNames } from './journal';
+import { cashActivityRows, cashBasisLedger } from './cashBasisLedger';
 
 // ===========================================================================
 // Sections
@@ -520,6 +521,11 @@ export interface ActivityFilter {
   /** Exclude year-end closing entries (P&L-style reports). */
   excludeClose?: boolean;
   accountIds?: string[];
+  /**
+   * 'cash' layers QuickBooks' per-transaction cash conversion (cashBasisLedger.ts) on top of the
+   * posted lines: A/R / A/P documents' income and expense lines move to the dates they are paid.
+   */
+  basis?: 'accrual' | 'cash';
 }
 
 /**
@@ -559,7 +565,17 @@ export async function activityByAccount(
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
     .where(and(...conds))
     .groupBy(...(bucket === 'none' ? [journalEntryLines.accountId] : [journalEntryLines.accountId, bucketExpr]));
-  return rows.map((r) => ({ ...r, debit: String(r.debit), credit: String(r.credit), bucket: r.bucket ?? null }));
+  const out: { accountId: string; bucket: string | null; debit: string; credit: string }[] = rows.map((r) => ({
+    ...r,
+    debit: String(r.debit),
+    credit: String(r.credit),
+    bucket: r.bucket ?? null,
+  }));
+  if (f.basis === 'cash') {
+    const { adjustments } = await cashBasisLedger(ctx, { to: f.to });
+    out.push(...cashActivityRows(adjustments, f, bucket));
+  }
+  return out;
 }
 
 // ===========================================================================
@@ -1103,6 +1119,7 @@ export function glFilterFromParams(
   range: { from?: Date; to?: Date },
 ): GlLineFilter {
   const f: GlLineFilter = { from: range.from, to: range.to };
+  if (p.basis === 'cash') f.basis = 'cash';
   if (p.accountId) f.accountIds = accountWithDescendants(meta, p.accountId);
   if (p.classId) f.classId = p.classId;
   if (p.txnType) f.txnType = p.txnType;
@@ -1257,6 +1274,7 @@ export async function fetchGlLines(
     };
   });
   lines = lines.filter((l) => !!l.account);
+  if (f.basis === 'cash') lines = await applyCashBasisToGlLines(ctx, meta, { ...f, accountIds }, lines);
   if (f.nameId) lines = lines.filter((l) => l.nameId === f.nameId && (!f.nameType || l.nameType === f.nameType));
   if (f.number) {
     const needle = f.number.toLowerCase();
@@ -1283,12 +1301,123 @@ export async function fetchGlLines(
     const byEntry = new Map<string, { lineId: string; accountId: string }[]>();
     for (const r of all) byEntry.set(r.entryId, [...(byEntry.get(r.entryId) ?? []), r]);
     for (const l of lines) {
+      if (l.lineId.startsWith('cash:')) continue; // split set by applyCashBasisToGlLines
       const others = (byEntry.get(l.entryId) ?? []).filter((o) => o.lineId !== l.lineId);
       const otherAccts = [...new Set(others.map((o) => o.accountId))];
       l.split = otherAccts.length === 1 ? (meta.get(otherAccts[0])?.fullName ?? '') : otherAccts.length > 1 ? '-SPLIT-' : '';
     }
   }
   return { lines, truncated };
+}
+
+/**
+ * Cash-basis detail lines (QB "Report Basis: Cash" on detail reports): the income / expense
+ * lines of A/R and A/P documents are replaced by the shares recognized on each settlement date
+ * (shown as the Payment / Bill Pmt / Credit Memo / Refund that settled them, with the document's
+ * customer or vendor as the Name), and the matching A/R / A/P offsets are added. The result has
+ * the same totals per account as the cash-basis summary reports.
+ */
+async function applyCashBasisToGlLines(
+  ctx: ServiceContext,
+  meta: Map<string, AccountMeta>,
+  f: GlLineFilter,
+  lines: GlLine[],
+): Promise<GlLine[]> {
+  const { adjustments, deferredEntryIds } = await cashBasisLedger(ctx, { to: f.to });
+  const plType = (id: string) => {
+    const t = meta.get(id)?.type;
+    return t === 'revenue' || t === 'expense';
+  };
+  const kept = lines.filter((l) => !(deferredEntryIds.has(l.entryId) && plType(l.accountId)));
+  const ids = f.accountIds ? new Set(f.accountIds) : null;
+  const picked = adjustments.filter((a) => {
+    if (!a.control && a.kind === 'defer') return false; // cancels the dropped original line
+    if (f.from && a.date < f.from) return false;
+    if (f.to && a.date > f.to) return false;
+    if (f.classId && a.classId !== f.classId) return false;
+    if (ids && !ids.has(a.accountId)) return false;
+    if (f.cleared === 'cleared') return false;
+    const amt = a.net.abs();
+    if (f.amountMin && amt.lessThan(f.amountMin)) return false;
+    if (f.amountMax && amt.greaterThan(f.amountMax)) return false;
+    return meta.has(a.accountId);
+  });
+  if (picked.length === 0) return kept;
+  const names = await resolveEntityNames(
+    ctx,
+    picked.map((a) => ({ entityType: a.doc.nameType, entityId: a.doc.nameId })),
+  );
+  const custFull = picked.some((a) => a.doc.nameType === 'customer') ? await customerNames(ctx) : null;
+  const classIds = [...new Set(picked.map((a) => a.classId).filter((x): x is string => !!x))];
+  const classNames = new Map<string, string>();
+  if (classIds.length) {
+    for (const c of await ctx.db
+      .select({ id: classes.id, name: classes.name })
+      .from(classes)
+      .where(and(eq(classes.companyId, ctx.companyId), inArray(classes.id, classIds)))) {
+      classNames.set(c.id, c.name);
+    }
+  }
+  // Each pair's counter account, for the Split column.
+  const ctrlOf = new Map<string, string>();
+  for (const a of adjustments) if (a.control) ctrlOf.set(`${a.doc.kind}:${a.doc.id}`, a.accountId);
+  const plOf = new Map<string, Set<string>>();
+  for (const a of adjustments) {
+    if (a.control) continue;
+    const k = `${a.doc.kind}:${a.doc.id}`;
+    plOf.set(k, (plOf.get(k) ?? new Set()).add(a.accountId));
+  }
+  const DOC_TYPE: Record<string, TxnTypeKey> = { invoice: 'invoice', credit_memo: 'credit_memo', bill: 'bill', vendor_credit: 'bill_credit' };
+  const synthetic: GlLine[] = picked.map((a, i) => {
+    const account = meta.get(a.accountId)!;
+    const txnType: TxnTypeKey = a.settle?.txnType ?? DOC_TYPE[a.doc.kind] ?? 'other';
+    const debit = a.net.greaterThan(0) ? a.net : Money.zero();
+    const credit = a.net.lessThan(0) ? a.net.negated() : Money.zero();
+    const dk = `${a.doc.kind}:${a.doc.id}`;
+    const pls = [...(plOf.get(dk) ?? [])];
+    const counter = a.control ? (pls.length === 1 ? pls[0] : '') : (ctrlOf.get(dk) ?? '');
+    const split = a.control && pls.length > 1 ? '-SPLIT-' : counter ? (meta.get(counter)?.fullName ?? '') : '';
+    const name =
+      (a.doc.nameType === 'customer' ? custFull?.get(a.doc.nameId)?.name : undefined) ??
+      names.get(`${a.doc.nameType}:${a.doc.nameId}`) ??
+      '';
+    return {
+      lineId: `cash:${i}`,
+      entryId: a.settle?.entryId ?? a.doc.entryId ?? '',
+      entryNumber: 0,
+      date: a.date,
+      txnType,
+      type: TXN_TYPE_LABELS[txnType],
+      num: a.settle?.num ?? a.doc.num ?? '',
+      nameType: a.doc.nameType,
+      nameId: a.doc.nameId,
+      name,
+      memo: a.kind === 'defer' ? 'Cash basis: not yet paid' : 'Cash basis: paid share',
+      description: '',
+      sourceRef: null,
+      accountId: a.accountId,
+      account,
+      classId: a.classId,
+      className: a.classId ? (classNames.get(a.classId) ?? '') : '',
+      debit,
+      credit,
+      amount: a.net,
+      natural: naturalAmount(account.section, debit, credit),
+      cleared: false,
+      split,
+    };
+  });
+  let extra = synthetic;
+  if (f.txnType) extra = extra.filter((l) => l.txnType === f.txnType);
+  if (f.memo) {
+    const needle = f.memo.toLowerCase();
+    extra = extra.filter((l) => l.memo.toLowerCase().includes(needle));
+  }
+  if (f.entryIds) {
+    const set = new Set(f.entryIds);
+    extra = extra.filter((l) => set.has(l.entryId));
+  }
+  return [...kept, ...extra].sort((x, y) => x.date.getTime() - y.date.getTime() || x.entryNumber - y.entryNumber);
 }
 
 // ---------------------------------------------------------------------------

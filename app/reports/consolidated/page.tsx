@@ -451,7 +451,7 @@ export default function ConsolidatedReportPage() {
           plData.companies.length === 0 ? (
             <div className="p-12 text-center">
               <Building2 className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-              <p className="text-navy/50 text-sm">No companies found in the database.</p>
+              <p className="text-navy/50 text-sm">No companies you can report on were found.</p>
             </div>
           ) : (
             <PLTable data={plData} />
@@ -460,7 +460,7 @@ export default function ConsolidatedReportPage() {
           bsData.companies.length === 0 ? (
             <div className="p-12 text-center">
               <Building2 className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-              <p className="text-navy/50 text-sm">No companies found in the database.</p>
+              <p className="text-navy/50 text-sm">No companies you can report on were found.</p>
             </div>
           ) : (
             <BSTable data={bsData} />

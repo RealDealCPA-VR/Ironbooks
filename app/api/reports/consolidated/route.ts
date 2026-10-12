@@ -1,9 +1,10 @@
 /**
  * GET /api/reports/consolidated
  *
- * Returns a multi-entity consolidated financial report spanning ALL companies in
- * the database. The caller's own company is used to establish the DB connection;
- * the companyId is otherwise irrelevant for this endpoint.
+ * Returns a combined (multi-company) financial report over the companies the signed-in user
+ * may report on: the current company plus every other company in this file where the user is
+ * an active member with permission to view financial reports (consolidation.ts
+ * reportableCompanies). Other companies' books are never included.
  *
  * Query params:
  *   type   "pl" — Consolidated Profit & Loss (default)

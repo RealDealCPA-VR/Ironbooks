@@ -5,8 +5,8 @@
  *   from  ISO date string (optional) — period start (inclusive).
  *   to    ISO date string (optional) — period end (inclusive).
  *
- * Returns a ProfitAndLossCashBasis report: accrual P&L converted to cash basis
- * via the indirect method (AR / AP balance adjustments).
+ * Returns a ProfitAndLossCashBasis report: each invoice / bill income and expense line counted
+ * when it is paid, pro-rata to the amount paid (lib/services/cashBasisLedger.ts).
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';

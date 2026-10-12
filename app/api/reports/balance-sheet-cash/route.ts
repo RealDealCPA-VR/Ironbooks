@@ -4,9 +4,8 @@
  * Query params:
  *   asOf  ISO date string (optional) — defaults to all-time.
  *
- * Returns a cash-basis Balance Sheet: accrual balances with Accounts Receivable (1200) and
- * Accounts Payable (2000) removed, and equity reduced by (arRemoved − apRemoved) so that
- * Assets = Liabilities + Equity continues to hold.
+ * Returns a cash-basis Balance Sheet: income and expenses on unpaid invoices / bills are left
+ * out of earnings and out of A/R / A/P (balanced adjustments, lib/services/cashBasisLedger.ts).
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
