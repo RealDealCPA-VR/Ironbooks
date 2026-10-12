@@ -24,6 +24,7 @@ import {
   billPayments,
   bills,
   classes,
+  creditMemos,
   customers,
   employees,
   inventoryLayers,
@@ -35,6 +36,9 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { journalOpenItems } from './journal';
+import { unappliedCustomerPayments } from './customerCredits';
+import { generalJournalSourceSql } from './posting';
 import { ServiceError, inTransaction, writeAudit } from './_base';
 import { balanceSheetCashBasis } from './balanceSheetCashBasis';
 import { LedgerIntegrityError } from './ledgerAssert';
@@ -206,7 +210,32 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
     );
 
   const arBalance = Money.of(arAccount.balance);
-  const invoicesDue = Money.of(invRow?.totalDue ?? 0);
+  // Named General Journal lines on A/R are customer open items too (journal.ts journalOpenItems).
+  const journalItems = (await journalOpenItems(ctx, 'ar')).filter((j) => j.accountId === arAccount.id);
+  // Unapplied customer payments were credited to A/R in full, so they are credits here too.
+  const unappliedCredits = (await unappliedCustomerPayments(ctx)).reduce(
+    (sum, p) => sum.plus(Money.of(p.amount)),
+    Money.zero(),
+  );
+  // Credit memos credit A/R in full at creation; the part not yet applied to an invoice is
+  // still a customer credit (QB shows it as a negative open item), so it nets against A/R too.
+  const [memoRow] = await ctx.db
+    .select({
+      unapplied: sql<string>`COALESCE(SUM(CAST(${creditMemos.unapplied} AS NUMERIC)), 0)`,
+    })
+    .from(creditMemos)
+    .where(
+      and(
+        eq(creditMemos.companyId, ctx.companyId),
+        ne(creditMemos.status, 'void'),
+        sql`CAST(${creditMemos.unapplied} AS NUMERIC) > 0`,
+      ),
+    );
+  const unappliedMemos = Money.of(memoRow?.unapplied ?? 0);
+  const invoicesDue = Money.of(invRow?.totalDue ?? 0)
+    .plus(journalItems.reduce((sum, j) => sum.plus(Money.of(j.amount)), Money.zero()))
+    .minus(unappliedCredits)
+    .minus(unappliedMemos);
 
   if (Money.equalWithinCent(arBalance, invoicesDue)) {
     return {
@@ -215,10 +244,30 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
       detail: `A/R balance ${toAmountString(arBalance)} matches open invoice balanceDue ${toAmountString(invoicesDue)}.`,
     };
   }
+  // Journal entries made before names were required can hit A/R with no customer. Those amounts
+  // are in the GL but in no customer's balance; tell the user how to fix it.
+  const [unnamed] = await ctx.db
+    .select({ n: sql<number>`COUNT(*)` })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        eq(journalEntryLines.accountId, arAccount.id),
+        generalJournalSourceSql(),
+        sql`${journalEntryLines.entityId} IS NULL`,
+      ),
+    );
+  const unnamedCount = Number(unnamed?.n ?? 0);
+  const hint =
+    unnamedCount > 0
+      ? ` ${unnamedCount} journal entry line(s) on Accounts Receivable have no customer name (entered before names were required). Reverse each one and re-enter it with the customer in the Name column so it shows in that customer's balance.`
+      : '';
   return {
     name,
     ok: false,
-    detail: `A/R cached balance ${toAmountString(arBalance)} != open invoice balanceDue ${toAmountString(invoicesDue)} (diff ${toAmountString(arBalance.minus(invoicesDue))}).`,
+    detail: `A/R cached balance ${toAmountString(arBalance)} != open invoice balanceDue ${toAmountString(invoicesDue)} (diff ${toAmountString(arBalance.minus(invoicesDue))}).${hint}`,
   };
 }
 
@@ -284,6 +333,11 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_accounts_guard: 'Account balances cannot be edited directly',
   bka_jel_no_truncate: 'Journal lines cannot be truncated',
   bka_je_no_truncate: 'Journal entries cannot be truncated',
+  // drizzle/0025_wave2_foundation.sql
+  bka_jel_non_posting: 'Non-posting accounts never carry posted amounts (lines)',
+  bka_je_non_posting: 'Non-posting accounts never carry posted amounts (post transitions)',
+  bka_accounts_non_posting: 'Accounts with history cannot become non-posting',
+  bka_transfers_no_ar_ap: 'Transfers never move money into or out of A/R or A/P',
 };
 
 async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string[]; total: number }> {

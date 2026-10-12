@@ -42,6 +42,7 @@ const LEGACY_TRIGGERS: Array<[string, string]> = [
   ['journal_entry_lines', 'bka_jel_guard'],
   ['journal_entry_lines', 'bka_jel_sync_ins'],
   ['accounts', 'bka_accounts_guard'],
+  ['journal_entry_lines', 'bka_jel_non_posting'], // 0025 deferred guard
 ];
 
 describe('AI Error Detection + LLM Corrector', () => {
@@ -133,6 +134,7 @@ describe('AI Error Detection + LLM Corrector', () => {
   it('detectErrors finds duplicate posted entries', async () => {
     // Post the same logical transaction twice using postJournalEntry.
     const duplicateInput = {
+      allowUnnamedControl: true, // fixture posts straight to A/R
       date: new Date('2025-03-10'),
       description: 'Duplicate sale',
       lines: [

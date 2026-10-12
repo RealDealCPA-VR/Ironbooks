@@ -100,6 +100,7 @@ describe('balanceSheetCashBasis', () => {
   it('unpaid invoice: accrual has AR + equity; cash-basis removes AR and reduces equity, still balanced', async () => {
     // Dr AR $1,000 / Cr Sales $1,000
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-03-15'),
       description: 'Invoice #1 — unpaid',
       lines: [
@@ -148,6 +149,7 @@ describe('balanceSheetCashBasis', () => {
   it('partial payment reduces AR removal and equity adjustment proportionally', async () => {
     // Dr Checking $400 / Cr AR $400  (partial payment)
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-04-01'),
       description: 'Partial payment on Invoice #1',
       lines: [
@@ -175,6 +177,7 @@ describe('balanceSheetCashBasis', () => {
   it('unpaid bill: AP is removed from liabilities and offsets the equity adjustment', async () => {
     // Dr Expenses $300 / Cr AP $300
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-05-01'),
       description: 'Bill #1 — unpaid',
       lines: [

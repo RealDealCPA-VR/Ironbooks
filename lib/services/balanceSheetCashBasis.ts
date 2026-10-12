@@ -13,7 +13,7 @@
  * 1. Start from the standard accrual Balance Sheet (balanceSheet from reports.ts), which is
  *    itself balanced by construction from the posted ledger.
  * 2. Remove every Accounts Receivable account from the assets section: subtype
- *    'accounts_receivable' (A/R, Retainage Receivable, …) or legacy code 1200.
+ *    'accounts_receivable', legacy code 1200, or Retainage Receivable (1250, an Other Current Asset).
  * 3. Remove every Accounts Payable account from the liabilities section: code 2000, or subtype
  *    'accounts_payable' whose name says "Accounts Payable" (the subtype alone is not trusted —
  *    it is the default for any liability created without a subtype, e.g. a loan).

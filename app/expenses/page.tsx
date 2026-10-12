@@ -12,6 +12,7 @@
  * account (flipped for CC credits) through the central posting engine.
  */
 
+import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { Suspense, useEffect, useState, useCallback } from 'react';
 import { Banknote, Plus, Trash2 } from 'lucide-react';
 import {
@@ -108,15 +109,13 @@ function emptyLine(): LineRow {
   return { accountId: '', description: '', amount: '', classId: '', customerId: '' };
 }
 
+/** Checks and cash expenses come from a Bank account (QB parity; lib/accountTypes.ts). */
 function isBankish(a: Account): boolean {
-  return (
-    a.type === 'asset' &&
-    !['accounts_receivable', 'inventory', 'fixed_assets'].includes(a.subtype)
-  );
+  return isBankAccount(a);
 }
 
 function isCreditCard(a: Account): boolean {
-  return a.type === 'liability' && a.subtype === 'credit_card';
+  return isCreditCardAccount(a);
 }
 
 // ---------------------------------------------------------------------------

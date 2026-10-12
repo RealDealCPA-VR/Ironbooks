@@ -73,6 +73,7 @@ async function expectRejected(p: Promise<unknown>, pattern?: RegExp): Promise<un
 
 async function post(amount: string, debitCode = '1000', creditCode = '4100', date = new Date('2026-03-01')) {
   return postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date,
     description: 'QA entry',
     lines: [
@@ -119,6 +120,7 @@ describe('ledger invariants — adversarial QA', () => {
 
   it('cannot bypass immutability by resetting created_at to now() (posted entry "looks new")', async () => {
     const e = await postJournalEntry(victimCtx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2026-03-01'),
       description: 'victim',
       lines: [
@@ -255,6 +257,7 @@ describe('ledger invariants — adversarial QA', () => {
   it('a posted line pointing at another company\'s account is refused (service and raw SQL)', async () => {
     await expectRejected(
       postJournalEntry(ctx, {
+        allowUnnamedControl: true, // fixture posts straight to A/R or A/P
         date: new Date('2026-03-03'),
         description: 'cross-company',
         lines: [
@@ -290,6 +293,7 @@ describe('ledger invariants — adversarial QA', () => {
     // 10.004 + 10.004 = 20.008 exactly, but each line rounds to 10.00 → 20.00 vs 20.01.
     const err = await expectRejected(
       postJournalEntry(ctx, {
+        allowUnnamedControl: true, // fixture posts straight to A/R or A/P
         date: new Date('2026-03-04'),
         description: 'sub-cent',
         lines: [
@@ -308,6 +312,7 @@ describe('ledger invariants — adversarial QA', () => {
   it('a line that rounds to 0.00 is refused (no zero-amount posted lines)', async () => {
     await expectRejected(
       postJournalEntry(ctx, {
+        allowUnnamedControl: true, // fixture posts straight to A/R or A/P
         date: new Date('2026-03-04'),
         description: 'dust',
         lines: [
@@ -344,6 +349,7 @@ describe('ledger invariants — adversarial QA', () => {
     await expectRejected(
       inTransaction(ctx, async (tx) => {
         await postJournalEntry(tx, {
+          allowUnnamedControl: true, // fixture posts straight to A/R or A/P
           date: new Date('2026-03-05'),
           description: 'rolled back',
           lines: [
@@ -460,6 +466,7 @@ describe('ledger invariants — adversarial QA', () => {
     // set_config(..., false) would open the gate for the whole connection. Only a
     // transaction-local flag is a sanctioned rewrite. (Reset afterwards either way.)
     const e = await postJournalEntry(victimCtx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2026-03-01'),
       description: 'victim 2',
       lines: [

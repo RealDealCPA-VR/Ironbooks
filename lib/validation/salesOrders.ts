@@ -4,7 +4,7 @@
  * (lib/services/salesOrders.ts).
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
 
 export const salesOrderLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -16,6 +16,9 @@ export const salesOrderLineSchema = z.object({
 
 export const createSalesOrderSchema = z.object({
   customerId: zUuid,
+  /** Typed document number (e.g. "INV-1001"); blank = next number. */
+  refNumber: zDocNumber,
+  allowDuplicateNumber: z.boolean().nullish(),
   date: zDate,
   memo: z.string().nullish(),
   lines: zLines(salesOrderLineSchema),

@@ -8,6 +8,7 @@
  * Cash goes out of the chosen payment account; discounts post to the chosen
  * discount account; credits draw down the vendor's open credits.
  */
+import { isPaymentSourceAccount } from '@/lib/accountTypes';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { HandCoins } from 'lucide-react';
 import {
@@ -158,14 +159,8 @@ export default function PayBillsPage() {
 
   // ── derived ───────────────────────────────────────────────────────────────
 
-  const paymentAccounts = accounts.filter(
-    (a) =>
-      (a.type === 'asset' &&
-        a.subtype !== 'accounts_receivable' &&
-        a.subtype !== 'inventory' &&
-        a.code !== '1050') ||
-      (a.type === 'liability' && a.subtype === 'credit_card'),
-  );
+  // Bills are paid from a Bank or Credit Card account (lib/accountTypes.ts).
+  const paymentAccounts = accounts.filter((a) => isPaymentSourceAccount(a));
   const discountAccounts = accounts.filter((a) => a.type === 'revenue' || a.type === 'expense');
 
   const availableCredit = credits.reduce((s, c) => s + Number(c.unapplied), 0);

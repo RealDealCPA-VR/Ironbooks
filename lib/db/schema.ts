@@ -8,7 +8,10 @@ export const accountSubtypeEnum = pgEnum('account_subtype', [
   'accounts_payable', 'credit_card', 'long_term_liability',
   'owners_equity', 'retained_earnings',
   'sales', 'service_revenue', 'other_income',
-  'cost_of_goods_sold', 'operating_expenses', 'payroll', 'taxes'
+  'cost_of_goods_sold', 'operating_expenses', 'payroll', 'taxes',
+  // wave2 foundation (0025): full QuickBooks account-type list (see lib/accountTypes.ts)
+  'other_current_asset', 'undeposited_funds', 'other_asset', 'other_current_liability',
+  'other_expense', 'non_posting',
 ]);
 export const journalEntryStatusEnum = pgEnum('journal_entry_status', ['draft', 'posted', 'void']);
 export const userRoleEnum = pgEnum('user_role', ['owner', 'admin', 'accountant', 'viewer']);
@@ -73,6 +76,8 @@ export const accounts = pgTable('accounts', {
   balance: decimal('balance', { precision: 15, scale: 2 }).notNull().default('0'),
   isActive: boolean('is_active').notNull().default(true),
   description: text('description'),
+  /** Income-tax line this account rolls up to (lib/taxLines.ts key, e.g. "1120:L1a"); wave2 foundation. */
+  taxLine: varchar('tax_line', { length: 40 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -88,6 +93,8 @@ export const journalEntries = pgTable('journal_entries', {
   status: journalEntryStatusEnum('status').notNull().default('draft'),
   /** Link to the source document, e.g. "invoice:<id>" — enables drill-down + duplicate-post guards. */
   sourceRef: varchar('source_ref', { length: 255 }),
+  /** QB "Adjusting Entry" checkbox (accountant adjustments); wave2 foundation. */
+  isAdjusting: boolean('is_adjusting').notNull().default(false),
   createdBy: uuid('created_by').references(() => users.id).notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -103,6 +110,10 @@ export const journalEntryLines = pgTable('journal_entry_lines', {
   credit: decimal('credit', { precision: 15, scale: 2 }),
   memo: text('memo'),
   classId: uuid('class_id').references((): any => classes.id), // class/department tracking dimension
+  /** QB "Name" column: 'customer' | 'vendor' | 'employee' | 'other' (wave2 foundation). */
+  entityType: varchar('entity_type', { length: 20 }),
+  /** Id of the customer / vendor / employee / other name (polymorphic, no FK). */
+  entityId: uuid('entity_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -424,6 +435,8 @@ export const estimates = pgTable('estimates', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   estimateNumber: integer('estimate_number').notNull(),
+  /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
+  refNumber: varchar('ref_number', { length: 50 }),
   date: timestamp('date').notNull(),
   expirationDate: timestamp('expiration_date'),
   status: docStatusEnum('status').notNull().default('draft'),
@@ -458,6 +471,8 @@ export const invoices = pgTable('invoices', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   invoiceNumber: integer('invoice_number').notNull(),
+  /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
+  refNumber: varchar('ref_number', { length: 50 }),
   date: timestamp('date').notNull(),
   dueDate: timestamp('due_date'),
   terms: varchar('terms', { length: 50 }),
@@ -529,6 +544,8 @@ export const salesReceipts = pgTable('sales_receipts', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   customerId: uuid('customer_id').references(() => customers.id),
   receiptNumber: integer('receipt_number').notNull(),
+  /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
+  refNumber: varchar('ref_number', { length: 50 }),
   date: timestamp('date').notNull(),
   method: paymentMethodEnum('method').notNull().default('cash'),
   reference: varchar('reference', { length: 100 }),
@@ -847,6 +864,8 @@ export const creditMemos = pgTable('credit_memos', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   memoNumber: integer('memo_number').notNull(),
+  /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
+  refNumber: varchar('ref_number', { length: 50 }),
   date: timestamp('date').notNull(),
   status: docStatusEnum('status').notNull().default('open'),
   subtotal: decimal('subtotal', { precision: 15, scale: 2 }).notNull().default('0'),
@@ -903,6 +922,8 @@ export const salesOrders = pgTable('sales_orders', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   orderNumber: integer('order_number').notNull(),
+  /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
+  refNumber: varchar('ref_number', { length: 50 }),
   date: timestamp('date').notNull(),
   status: docStatusEnum('status').notNull().default('open'),
   subtotal: decimal('subtotal', { precision: 15, scale: 2 }).notNull().default('0'),
@@ -993,6 +1014,8 @@ export const purchaseOrders = pgTable('purchase_orders', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   poNumber: integer('po_number').notNull(),
+  /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
+  refNumber: varchar('ref_number', { length: 50 }),
   date: timestamp('date').notNull(),
   expectedDate: timestamp('expected_date'),
   status: docStatusEnum('status').notNull().default('open'),

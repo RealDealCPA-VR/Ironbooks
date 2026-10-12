@@ -34,6 +34,7 @@ import {
 } from './_base';
 import { createInvoice } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { allocateDocNumber } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,6 +49,13 @@ export interface SalesOrderLineInput {
 }
 
 export interface CreateSalesOrderInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   customerId: string;
   date: Date;
   lines: SalesOrderLineInput[];
@@ -57,14 +65,6 @@ export interface CreateSalesOrderInput {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-async function nextOrderNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${salesOrders.orderNumber}), 0)` })
-    .from(salesOrders)
-    .where(eq(salesOrders.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
-}
 
 // ---------------------------------------------------------------------------
 // createSalesOrder
@@ -127,7 +127,9 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
   const total = Money.round2(subtotal);
 
   return inTransaction(ctx, async (tx) => {
-    const orderNumber = await nextOrderNumber(tx);
+    const { refNumber, number: orderNumber } = await allocateDocNumber(tx, 'sales_order', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     const [order] = await tx.db
       .insert(salesOrders)
@@ -135,6 +137,7 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
         companyId: tx.companyId,
         customerId: input.customerId,
         orderNumber,
+        refNumber,
         date: input.date,
         status: 'open',
         subtotal: toAmountString(subtotal),

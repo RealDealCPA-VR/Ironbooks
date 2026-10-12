@@ -99,7 +99,7 @@ describe('Credit memos — sales tax + inventory restocking', () => {
       ['1000', 'Checking', 'asset', 'checking'],
       ['1200', 'Accounts Receivable', 'asset', 'accounts_receivable'],
       ['1300', 'Inventory Asset', 'asset', 'inventory'],
-      ['2200', 'Sales Tax Payable', 'liability', 'accounts_payable'],
+      ['2200', 'Sales Tax Payable', 'liability', 'other_current_liability'],
       ['3000', "Owner's Equity", 'equity', 'owners_equity'],
       ['4000', 'Sales Income', 'revenue', 'sales'],
       ['4100', 'Service Income', 'revenue', 'service_revenue'],

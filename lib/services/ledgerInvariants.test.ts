@@ -344,7 +344,7 @@ describe('ledger invariants enforced by the database', () => {
     // Every bka_* trigger is ENABLE ALWAYS.
     const res = await db.execute(sql`SELECT tgname, tgenabled FROM pg_trigger WHERE tgname LIKE 'bka%' AND NOT tgisinternal`);
     const rows = (res as unknown as { rows: Array<{ tgname: string; tgenabled: string }> }).rows;
-    expect(rows.length).toBe(11);
+    expect(rows.length).toBe(15); // 11 from 0017 + 3 non-posting guards + 1 transfer A/R-A/P guard from 0025
     expect(rows.filter((r) => r.tgenabled !== 'A')).toEqual([]);
 
     // Downgraded to origin mode ('O'), the integrity check must flag it.

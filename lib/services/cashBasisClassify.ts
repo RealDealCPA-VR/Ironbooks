@@ -17,9 +17,20 @@ export interface ClassifiableAccount {
   subtype: string | null;
 }
 
-/** Is this an Accounts Receivable account (A/R, Retainage Receivable, …)? Excluded on a cash basis. */
+/** Retainage Receivable: an Other Current Asset (as in QB), but money customers will owe. */
+export const RETAINAGE_CODE = '1250';
+
+/**
+ * Is this a receivable that a cash basis excludes? Every Accounts Receivable account, plus
+ * Retainage Receivable (code 1250, an Other Current Asset like QB's contractor setup): retainage
+ * held back on an unpaid invoice is revenue not yet received in cash.
+ */
 export function isReceivable(a: ClassifiableAccount): boolean {
-  return a.code === AR_CODE || a.subtype === 'accounts_receivable';
+  return (
+    a.code === AR_CODE ||
+    a.subtype === 'accounts_receivable' ||
+    (a.code === RETAINAGE_CODE && a.subtype === 'other_current_asset' && /retainage/i.test(a.name))
+  );
 }
 
 /**

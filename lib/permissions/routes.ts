@@ -87,6 +87,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/companies/select': kind('self', 'POST'),
   '/api/company': { GET: 'member', ...r('company', 'PATCH') },
   '/api/company/closing-date': r('closing', 'GET PATCH'),
+  // wave2 foundation: document numbering (next number for forms; starting numbers).
+  '/api/doc-numbers': { GET: 'member', ...r('company', 'PUT') },
   '/api/custom-fields': r('lists', 'GET PATCH'),
   '/api/custom-fields/values': r('lists', 'POST:modify'),
   '/api/currencies': r('lists', 'GET POST'),
@@ -158,6 +160,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // ---- Lists ----
   '/api/accounts': { ...r('lists', 'GET'), ...r('accounting', 'POST') },
   '/api/accounts/[id]': { ...r('lists', 'GET'), ...r('accounting', 'PATCH DELETE') },
+  // wave2 foundation: income-tax form + account tax-line mapping.
+  '/api/accounts/tax-lines': { ...r('lists', 'GET'), ...r('accounting', 'PUT') },
   '/api/classes': r('lists', 'GET POST'),
   '/api/classes/[id]': r('lists', 'PATCH'),
   '/api/locations': r('lists', 'GET POST'),
@@ -282,6 +286,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/journal-entries/[id]': r('accounting', 'GET PATCH DELETE'),
   '/api/journal-entries/[id]/history': r('accounting', 'GET'),
   '/api/journal-entries/[id]/reverse': r('accounting', 'POST'),
+  // wave2 foundation: Adjusting Journal Entries report data.
+  '/api/journal-entries/adjusting': r('accounting', 'GET'),
   '/api/transfers': r('accounting', 'GET POST'),
   '/api/reconciliations': r('accounting', 'GET POST'),
   '/api/reconciliations/[id]': r('accounting', 'GET PATCH DELETE'),
@@ -472,6 +478,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/year-end': 'closing',
   '/budgets': 'company',
   '/settings': 'company',
+  '/doc-numbers': 'company', // wave2 foundation: starting document numbers
   '/time-tracking': 'time',
   '/mileage': 'time',
   '/assemblies': 'inventory',

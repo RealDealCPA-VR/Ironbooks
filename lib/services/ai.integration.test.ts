@@ -415,7 +415,7 @@ describe('AI layer — integration', () => {
           description: 'Accrue September supplies',
           lines: [
             { accountCode: '6200', debit: '150.00' },
-            { accountCode: '2000', credit: '150.00' },
+            { accountCode: '2000', credit: '150.00', name: 'Shell Oil' },
           ],
         },
       });

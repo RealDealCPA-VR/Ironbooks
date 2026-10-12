@@ -40,7 +40,26 @@ export interface PostingLine {
   memo?: string | null;
   /** Optional class/department dimension for class-based reporting. */
   classId?: string | null;
+  /**
+   * QB "Name" column: the customer / vendor / employee / other name this line is for.
+   * Required by manual journal entries on A/R (customer) and A/P (vendor) lines — see
+   * journal.ts assertJournalNames. Both fields are set together or not at all.
+   */
+  entityType?: JournalEntityType | null;
+  entityId?: string | null;
+  /**
+   * Marks THIS line as the source document's own A/R / A/P line (an invoice's A/R charge, a
+   * payment's A/R relief, a bill's A/P line, ...). Only document services set it, and only on
+   * the line they build from the document's own A/R / A/P account — never on a line whose account
+   * the user picked (item, expense, discount, "Deposit to" / "Pay from"). Not stored; read only by
+   * assertControlAccountNames (QB invariant I11).
+   */
+  controlLine?: boolean;
 }
+
+export type JournalEntityType = 'customer' | 'vendor' | 'employee' | 'other';
+export const JOURNAL_ENTITY_TYPES: readonly JournalEntityType[] = ['customer', 'vendor', 'employee', 'other'];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface PostJournalEntryInput {
   date: Date;
@@ -51,6 +70,13 @@ export interface PostJournalEntryInput {
   lines: PostingLine[];
   /** Optional: link source document for traceability (e.g. "invoice:<id>"). */
   sourceRef?: string;
+  /** QB "Adjusting Entry" flag (shown on the Adjusting Journal Entries report). */
+  isAdjusting?: boolean;
+  /**
+   * Opt out of the A/R / A/P name check (assertControlAccountNames). Test fixtures and internal
+   * repair tools only — never set it from a user-facing window.
+   */
+  allowUnnamedControl?: boolean;
 }
 
 const DEBIT_NORMAL = new Set(['asset', 'expense']);
@@ -125,6 +151,173 @@ async function nextEntryNumber(ctx: ServiceContext): Promise<number> {
   return (row?.max ?? 0) + 1;
 }
 
+/**
+ * Source documents whose own A/R / A/P line is counted by the aging subledger (the document
+ * itself carries the customer / vendor), plus historical imports. Named A/R / A/P lines posted by
+ * anything else (manual journal entries, checks, deposits, bank-feed lines, reversals, ...) are
+ * General Journal open items in aging (journal.ts journalOpenItems) — see QB invariant I11.
+ */
+const SUBLEDGER_SOURCE_RE =
+  /^(invoice|credit_memo|refund|payment|customer|bill|vendor|vendor_credit|salesreceipt|condense|iif|qbgl):/;
+
+export function isSubledgerSource(sourceRef: string | null | undefined): boolean {
+  return Boolean(sourceRef && SUBLEDGER_SOURCE_RE.test(sourceRef));
+}
+
+/**
+ * SQL test (on journal_entries.source_ref) for postings whose named A/R / A/P lines are open
+ * items in A/R / A/P aging: everything that is not a customer/vendor document or an import.
+ */
+export const generalJournalSourceSql = () =>
+  sql`(${journalEntries.sourceRef} IS NULL OR ${journalEntries.sourceRef} !~ ${SUBLEDGER_SOURCE_RE.source})`;
+
+/**
+ * Which control account a document's own line is on. 'ar' documents may carry their own
+ * (unnamed) A/R line, 'ap' documents their own A/P line, 'either' one of the two (refunds of a
+ * credit memo / payment / vendor credit), 'none' neither (a Sales Receipt never touches A/R or
+ * A/P in QB). Imports are not checked line by line (they are reconciled on import).
+ */
+const DOCUMENT_SIDE: Record<string, 'ar' | 'ap' | 'either' | 'none' | 'import'> = {
+  invoice: 'ar',
+  credit_memo: 'ar',
+  payment: 'ar',
+  customer: 'ar',
+  bill: 'ap',
+  vendor: 'ap',
+  vendor_credit: 'ap',
+  refund: 'either',
+  salesreceipt: 'none',
+  condense: 'import',
+  iif: 'import',
+  qbgl: 'import',
+};
+
+function documentSide(sourceRef: string | null | undefined) {
+  if (!sourceRef) return undefined;
+  const i = sourceRef.indexOf(':');
+  return i > 0 ? DOCUMENT_SIDE[sourceRef.slice(0, i)] : undefined;
+}
+
+type ControlSide = 'ar' | 'ap';
+function controlSideOf(acct: { type: string; subtype: string | null }): ControlSide | null {
+  if (acct.type === 'asset' && acct.subtype === 'accounts_receivable') return 'ar';
+  if (acct.type === 'liability' && acct.subtype === 'accounts_payable') return 'ap';
+  return null;
+}
+
+const SIDE_LABEL: Record<ControlSide, string> = { ar: 'Accounts Receivable', ap: 'Accounts Payable' };
+
+/**
+ * QB lists only bank, Undeposited Funds and other cash-like accounts in "Deposit to" / "Pay
+ * from". Refuse A/R and A/P there up front with a plain-language message (the posting guard
+ * below refuses them too).
+ */
+export function assertNotControlAccount(
+  acct: { type: string; subtype: string | null; name?: string | null },
+  role: string,
+): void {
+  const side = controlSideOf(acct);
+  if (side) {
+    throw validation(
+      `${acct.name ? `"${acct.name}" is an ${SIDE_LABEL[side]} account. ` : ''}${SIDE_LABEL[side]} can't be used as the "${role}" account. Pick a bank account or Undeposited Funds.`,
+    );
+  }
+}
+
+/**
+ * QB never lists Accounts Receivable / Accounts Payable as an item's account or as a form line's
+ * account (income, discount, expense lines). Refuse them up front with a plain-language message
+ * (the posting guard below refuses an unmarked A/R / A/P line on a document too). `where` names
+ * the place, e.g. "Line 2" or "the item's income account".
+ */
+export function assertNotControlLineAccount(
+  acct: { type: string; subtype: string | null; name?: string | null },
+  where: string,
+): void {
+  const side = controlSideOf(acct);
+  if (side) {
+    throw validation(
+      `${where}: ${acct.name ? `"${acct.name}" is an ${SIDE_LABEL[side]} account. ` : ''}${SIDE_LABEL[side]} can't be used as an item or line account. Pick an income, expense or other account instead.`,
+    );
+  }
+}
+
+/**
+ * QB invariant I11 (A/R aging == A/R balance, A/P aging == A/P balance), checked line by line on
+ * every posting — the single choke point for every window, current and future:
+ *  - A customer/vendor document may carry its OWN control line unnamed (the document is the
+ *    subledger item): an invoice / credit memo / customer payment its A/R line, a bill / bill
+ *    payment / vendor credit its A/P line, a refund the one control line of the document it
+ *    refunds. The document service marks that line `controlLine: true`; every unmarked A/R / A/P
+ *    line on a document is refused. Marked lines must be a single direction (an invoice only charges A/R, a payment only
+ *    relieves it), so a "Deposit to" or "Pay from" or item/expense line on the same control
+ *    account is refused. Any OTHER control line on a document (an A/P line on a customer form,
+ *    an A/R line on a bill, any control line on a Sales Receipt) is refused, as in QB.
+ *  - Every other posting (manual journal entries, checks, deposits, bank-feed lines, reversals,
+ *    account opening balances, FX adjustments, postings with no source at all, ...) must name the
+ *    customer on each A/R line and the vendor on each A/P line; aging shows those lines as
+ *    General Journal items for that name.
+ * `allowUnnamedControl` is an explicit opt-out for tests and internal repair tools only.
+ */
+export function assertControlAccountNames(
+  input: Pick<PostJournalEntryInput, 'lines' | 'sourceRef' | 'allowUnnamedControl'>,
+  accountRows: ReadonlyArray<{ id: string; type: string; subtype: string | null; name: string }>,
+): void {
+  if (input.allowUnnamedControl) return;
+  const docSide = documentSide(input.sourceRef);
+  if (docSide === 'import') return;
+  const byId = new Map(accountRows.map((a) => [a.id, a]));
+
+  if (docSide === undefined) {
+    for (const l of input.lines) {
+      const acct = byId.get(l.accountId);
+      if (!acct) continue;
+      const side = controlSideOf(acct);
+      if (side === 'ar' && l.entityType !== 'customer') {
+        throw validation(
+          `"${acct.name}" is an Accounts Receivable account. Amounts can only go there with a customer name — use an invoice, a payment, a credit memo or a journal entry that names the customer.`,
+        );
+      }
+      if (side === 'ap' && l.entityType !== 'vendor') {
+        throw validation(
+          `"${acct.name}" is an Accounts Payable account. Amounts can only go there with a vendor name — use a bill, a bill payment, a vendor credit or a journal entry that names the vendor.`,
+        );
+      }
+    }
+    return;
+  }
+
+  let ownSide: ControlSide | null = docSide === 'either' ? null : docSide === 'none' ? null : docSide;
+  let direction: 'debit' | 'credit' | null = null;
+  for (const l of input.lines) {
+    const acct = byId.get(l.accountId);
+    if (!acct) continue;
+    const side = controlSideOf(acct);
+    if (!side) continue;
+    // Only the document's own, explicitly marked control line may sit on A/R / A/P. Any other
+    // line on a control account (an item, discount, expense, "Deposit to" or "Pay from" line the
+    // user pointed at A/R or A/P) is refused, whatever its direction.
+    if (!l.controlLine) {
+      throw validation(
+        `"${acct.name}" is an ${SIDE_LABEL[side]} account and can't be used on this form as a "Deposit to", "Pay from", discount or line account. Pick a bank, Undeposited Funds, income or expense account instead.`,
+      );
+    }
+    if (docSide === 'either' && ownSide === null) ownSide = side;
+    if (side !== ownSide) {
+      throw validation(
+        `"${acct.name}" is an ${SIDE_LABEL[side]} account and can't be used on this form. Pick a bank, Undeposited Funds, income or expense account instead.`,
+      );
+    }
+    const dir = l.debit != null && Money.gt(l.debit, 0) ? 'debit' : 'credit';
+    if (direction && dir !== direction) {
+      throw validation(
+        `"${acct.name}" is this form's ${SIDE_LABEL[side]} account, so it can't also be the "Deposit to", "Pay from" or a line account. Pick a bank, Undeposited Funds, income or expense account instead.`,
+      );
+    }
+    direction = dir;
+  }
+}
+
 /** Create a balanced journal entry. If posted, the DB trigger updates cached account balances. */
 export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEntryInput) {
   assertBalanced(input.lines);
@@ -134,13 +327,36 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
   // Verify every referenced account belongs to this company and load its type.
   const accountIds = [...new Set(input.lines.map((l) => l.accountId))];
   const accountRows = await ctx.db
-    .select({ id: accounts.id, type: accounts.type })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, accountIds)));
   const typeById = new Map(accountRows.map((a) => [a.id, a.type]));
   for (const id of accountIds) {
     if (!typeById.has(id)) throw notFound(`Account ${id}`);
   }
+  // Non-posting accounts (estimates, purchase orders) never carry amounts. The database refuses
+  // it too (0025 bka_jel_non_posting); this gives a friendly message up front.
+  if (status === 'posted') {
+    const np = accountRows.find((a) => a.subtype === 'non_posting');
+    if (np) {
+      throw validation(
+        `"${np.name}" is a non-posting account (used for estimates and purchase orders) and cannot be used in a transaction.`,
+      );
+    }
+  }
+  for (const [i, l] of input.lines.entries()) {
+    if (Boolean(l.entityType) !== Boolean(l.entityId)) {
+      throw validation(`Line ${i + 1}: a name needs both its kind and its id.`);
+    }
+    if (l.entityType && !JOURNAL_ENTITY_TYPES.includes(l.entityType)) {
+      throw validation(`Line ${i + 1}: unknown name kind "${l.entityType}".`);
+    }
+    if (l.entityId && !UUID_RE.test(l.entityId)) {
+      throw validation(`Line ${i + 1}: that name was not found.`);
+    }
+  }
+
+  assertControlAccountNames(input, accountRows);
 
   return inTransaction(ctx, async (tx) => {
     const entryNumber = await nextEntryNumber(tx);
@@ -154,6 +370,7 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
         reference: input.reference ?? null,
         status,
         sourceRef: input.sourceRef ?? null,
+        isAdjusting: input.isAdjusting ?? false,
         createdBy: tx.userId ?? '00000000-0000-0000-0000-000000000000',
       })
       .returning();
@@ -166,6 +383,8 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       credit: l.credit != null && Money.gt(l.credit, 0) ? toAmountString(l.credit) : null,
       memo: l.memo ?? null,
       classId: l.classId ?? null,
+      entityType: l.entityType ?? null,
+      entityId: l.entityType ? (l.entityId ?? null) : null,
     }));
 
     await tx.db.insert(journalEntryLines).values(
@@ -176,7 +395,12 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       action: 'create',
       entityType: 'journal_entry',
       entityId: entry.id,
-      newValues: { entryNumber, description: input.description, lines: input.lines },
+      newValues: {
+        entryNumber,
+        description: input.description,
+        lines: input.lines,
+        ...(input.isAdjusting ? { isAdjusting: true } : {}),
+      },
     });
 
     return entry;

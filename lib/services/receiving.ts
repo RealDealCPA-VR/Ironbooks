@@ -599,6 +599,11 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2000')));
   if (!apRow) throw notFound('Accounts Payable account (code 2000)');
+  // A variance / inventory account on A/P would merge into the bill's own A/P line below and
+  // put an amount on A/P that the bill (and so A/P aging) does not carry (QB invariant I11).
+  if (planned.some((l) => l.varianceAccountId === apRow.id || l.inventoryAccountId === apRow.id)) {
+    throw validation("Accounts Payable can't be used as an item's expense, cost or inventory account. Pick an expense or asset account instead.");
+  }
 
   // Aggregate signed amounts per account: positive = debit, negative = credit.
   const signed = new Map<string, { amount: Dec; memo: string }>();
@@ -645,6 +650,7 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     vendor,
     planned,
     accrualAccountId,
+    apAccountId: apRow.id,
     preview: {
       lines: planned.map(({ receipt: _r, line: _l, qtyTouched: _q, varianceAccountId: _v, inventoryAccountId: _i, layerPlan: _p, ...rest }) => rest),
       billTotal: toAmountString(billTotal),
@@ -667,7 +673,7 @@ export async function previewReceiptBill(ctx: ServiceContext, input: EnterReceip
 export async function enterBillForReceivedItems(ctx: ServiceContext, input: EnterReceiptBillInput) {
   return inTransaction(ctx, async (tx) => {
     // Plan INSIDE the transaction so quantities/costs/layers cannot shift underneath us.
-    const { vendor, planned, preview, accrualAccountId } = await planReceiptBill(tx, input);
+    const { vendor, planned, preview, accrualAccountId, apAccountId } = await planReceiptBill(tx, input);
 
     const [bill] = await tx.db
       .insert(bills)
@@ -741,6 +747,8 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
         debit: p.debit,
         credit: p.credit,
         memo: p.memo,
+        // The bill's own A/P line (posting.ts PostingLine.controlLine).
+        ...(p.accountId === apAccountId ? { controlLine: true } : {}),
       })),
     });
     const [updated] = await tx.db

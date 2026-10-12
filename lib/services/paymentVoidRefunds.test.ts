@@ -89,6 +89,7 @@ async function createOpenInvoice(
   // Post the invoice GL impact at the BOOKED rate: Dr A/R / Cr Sales.
   const base = Money.round2(Money.mul(amount, rate)).toFixed(2);
   await postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date: new Date('2026-01-05'),
     description: `Invoice #${invoiceCounter}`,
     sourceRef: `invoice:${inv.id}`,
@@ -102,6 +103,7 @@ async function createOpenInvoice(
 
 async function createOpenBill(amount: string): Promise<string> {
   const entry = await postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date: new Date('2026-01-05'),
     description: 'Bill — supplies',
     lines: [
@@ -312,6 +314,7 @@ describe('payment-void-refunds: corrections + refunds', () => {
 
     // Sweep into a deposit (mirrors what the deposits service does).
     const depEntry = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2026-02-03'),
       description: 'Deposit',
       lines: [

@@ -508,6 +508,7 @@ function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId
       accountId: prep.apAccountId,
       credit: prep.totalStr,
       memo: `Bill ${billNumber ?? billId} — ${prep.vendor.name}`,
+      controlLine: true,
     },
   ];
 }

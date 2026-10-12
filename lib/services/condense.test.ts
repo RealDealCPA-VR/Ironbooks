@@ -153,7 +153,7 @@ describe('condensePeriod', () => {
       description: 'Open invoice posting',
       sourceRef: 'invoice:placeholder',
       lines: [
-        { accountId: arId, debit: '75.00' },
+        { accountId: arId, debit: '75.00', controlLine: true },
         { accountId: revenueId, credit: '75.00' },
       ],
     });

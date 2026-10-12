@@ -14,6 +14,7 @@
  * Voiding calls voidJournalEntry and flips the document status to 'void'.
  */
 
+import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { and, asc, desc, eq } from 'drizzle-orm';
 import { accounts, bills, vendorCredits, vendorCreditLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -141,6 +142,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
         accountId: apAccountId,
         debit: totalStr,
         memo: `Vendor credit ${credit.id}`,
+        controlLine: true,
       },
       // Credit each expense/asset account for its line amount.
       ...input.lines.map((line) => ({
@@ -494,11 +496,8 @@ export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendo
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
-  if (
-    bankAcct.type !== 'asset' ||
-    bankAcct.subtype === 'accounts_receivable' ||
-    bankAcct.subtype === 'inventory'
-  ) {
+  // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
+  if (!isDepositTargetAccount(bankAcct)) {
     throw validation('Vendor refunds must be deposited into a bank/cash account.');
   }
 
@@ -521,6 +520,7 @@ export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendo
           accountId: apAccountId,
           credit: toAmountString(amount),
           memo: 'Vendor credit settled in cash',
+          controlLine: true,
         },
       ],
     });

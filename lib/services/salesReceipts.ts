@@ -44,7 +44,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
 import {
@@ -54,6 +54,7 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { allocateDocNumber, docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -92,6 +93,13 @@ export interface SalesReceiptLineInput extends InventoryLineDetail {
 }
 
 export interface CreateSalesReceiptInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   /** Optional — walk-in / counter sales have no customer. */
   customerId?: string | null;
   date: Date;
@@ -144,15 +152,6 @@ async function getOrCreateAccountByCode(
     })
     .returning();
   return created.id;
-}
-
-/** Return the next receipt number for the company (max + 1, 1 if none). */
-async function nextReceiptNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${salesReceipts.receiptNumber}), 0)` })
-    .from(salesReceipts)
-    .where(eq(salesReceipts.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
 }
 
 /**
@@ -208,19 +207,20 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
   let depositAccountId: string;
   if (input.depositAccountId) {
     const [acct] = await ctx.db
-      .select({ id: accounts.id, type: accounts.type })
+      .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.depositAccountId)));
     if (!acct) throw notFound('Deposit account');
     if (acct.type !== 'asset') {
       throw validation('Deposit account must be an asset (bank or Undeposited Funds) account.');
     }
+    assertNotControlAccount(acct, 'Deposit to');
     depositAccountId = acct.id;
   } else {
     depositAccountId = await getOrCreateAccountByCode(ctx, '1050', {
       name: 'Undeposited Funds',
       type: 'asset',
-      subtype: 'checking',
+      subtype: 'undeposited_funds',
     });
   }
 
@@ -340,7 +340,11 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
   // Persist everything in a single transaction.
   // ---------------------------------------------------------------------------
   return inTransaction(ctx, async (tx) => {
-    const receiptNumber = await nextReceiptNumber(tx);
+    const { refNumber, number: receiptNumber } = await allocateDocNumber(tx, 'sales_receipt', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
+    // The number shown on the GL: the typed ref number, else the legacy integer.
+    const shownNumber = docRef(refNumber, receiptNumber);
 
     // 1) Insert receipt header (already fully paid by definition).
     const [receipt] = await tx.db
@@ -349,6 +353,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
         companyId: tx.companyId,
         customerId: input.customerId ?? null,
         receiptNumber,
+        refNumber,
         date: input.date,
         method,
         reference: input.reference ?? null,
@@ -402,17 +407,17 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
     }
 
     const debitSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [
-      { accountId: depositAccountId, weight: total, memo: `Sales Receipt #${receiptNumber}` },
+      { accountId: depositAccountId, weight: total, memo: `Sales Receipt #${shownNumber}` },
     ];
     const creditSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [];
     for (const [acctId, amount] of incomeCredits) {
-      creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${receiptNumber} — income` });
+      creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — income` });
     }
     if (taxAmount.greaterThan(0)) {
       creditSpecs.push({
         accountId: taxPayableId,
         weight: taxAmount,
-        memo: `Sales Receipt #${receiptNumber} — sales tax`,
+        memo: `Sales Receipt #${shownNumber} — sales tax`,
       });
     }
 
@@ -433,8 +438,8 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: `Sales Receipt #${receiptNumber}`,
-      reference: String(receiptNumber),
+      description: `Sales Receipt #${shownNumber}`,
+      reference: shownNumber,
       sourceRef: `salesreceipt:${receipt.id}`,
       lines: postingLines,
     });
@@ -452,7 +457,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
       const meta = itemMap.get(line.itemId);
       if (!meta || meta.type !== 'inventory') continue;
 
-      const memo = `Sales Receipt #${receiptNumber} — COGS (${meta.name})`;
+      const memo = `Sales Receipt #${shownNumber} — COGS (${meta.name})`;
       let entryId: string;
       let cogs: string;
       if (await isFifoTracked(tx, line.itemId)) {
@@ -503,7 +508,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
           lotExpiration: src?.lotExpiration,
         };
       }),
-      memo: `Sales Receipt #${receiptNumber}`,
+      memo: `Sales Receipt #${shownNumber}`,
     });
 
     // 5) Stamp postedEntryId on the receipt.

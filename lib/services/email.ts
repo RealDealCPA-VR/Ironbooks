@@ -15,6 +15,7 @@ import { customers } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { ServiceError } from './_base';
 import { getInvoice } from './invoices';
+import { docRef } from './docNumbers';
 import { getCompany } from './company';
 import { renderInvoicePdf } from '@/lib/pdf/invoice';
 import { assertOutboundAllowed } from '@/lib/net/guard';
@@ -150,12 +151,15 @@ export async function emailInvoice(
     );
   }
 
+  // The number the customer sees: the typed ref number, else the legacy integer.
+  const shownNumber = docRef(invoice.refNumber, invoice.invoiceNumber);
+
   // Render PDF.
   const pdfBytes = await renderInvoicePdf({
     company: { name: company.name },
     customerName,
     invoice: {
-      number: invoice.invoiceNumber,
+      number: shownNumber,
       date: fmtDate(invoice.date),
       dueDate: invoice.dueDate ? fmtDate(invoice.dueDate) : null,
       subtotal: invoice.subtotal,
@@ -172,15 +176,15 @@ export async function emailInvoice(
     })),
   });
 
-  const filename = `invoice-${invoice.invoiceNumber}.pdf`;
+  const filename = `invoice-${shownNumber.replace(/[^A-Za-z0-9._-]+/g, '_')}.pdf`;
 
   await sendMail({
     to: recipient,
-    subject: `Invoice #${invoice.invoiceNumber} from ${company.name}`,
+    subject: `Invoice #${shownNumber} from ${company.name}`,
     text: [
       `Dear ${customerName},`,
       '',
-      `Please find attached Invoice #${invoice.invoiceNumber} from ${company.name}.`,
+      `Please find attached Invoice #${shownNumber} from ${company.name}.`,
       `Total: ${invoice.total}`,
       `Balance Due: ${invoice.balanceDue}`,
       '',

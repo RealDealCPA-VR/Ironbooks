@@ -57,6 +57,16 @@ export const zDecimalPositive = zDecimal.refine((v) => Number(v) > 0, {
   message: 'must be greater than zero',
 });
 
+/**
+ * User-typed document number (alphanumeric, e.g. "INV-1001"; QB "Invoice #"). Blank / null =
+ * let the service pick the next number. Length and control characters are re-checked in
+ * lib/services/docNumbers.ts normalizeDocNumber.
+ */
+export const zDocNumber = z
+  .string({ invalid_type_error: 'must be text' })
+  .max(50, 'can be at most 50 characters')
+  .nullish();
+
 /** ISO date string -> Date. Rejects unparseable dates. */
 export const zDate = z
   .string({

@@ -53,6 +53,7 @@ interface JournalEntry {
   reference: string | null;
   status: string;
   sourceRef?: string | null;
+  isAdjusting?: boolean;
   createdAt: string;
   voidedAt: string | null;
 }
@@ -64,6 +65,8 @@ interface EntryDetailLine {
   credit: string | null;
   memo: string | null;
   classId: string | null;
+  entityType?: string | null;
+  entityId?: string | null;
 }
 
 interface EntryDetail {
@@ -74,6 +77,7 @@ interface EntryDetail {
   reference: string | null;
   status: string;
   sourceRef: string | null;
+  isAdjusting?: boolean;
   lines: EntryDetailLine[];
 }
 
@@ -82,6 +86,14 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype?: string;
+}
+
+/** A customer / vendor / employee for the QB "Name" column. value = "<kind>:<id>". */
+interface NameOption {
+  value: string;
+  label: string;
+  kind: 'customer' | 'vendor' | 'employee';
 }
 
 interface ClassOption {
@@ -96,6 +108,8 @@ interface LineRow {
   credit: string;
   memo: string;
   classId: string;
+  /** "<kind>:<id>" or '' (QB Name column). */
+  name: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +139,7 @@ function statusTone(status: string): 'success' | 'void' | 'neutral' {
 // ---------------------------------------------------------------------------
 
 function emptyLine(id: number): LineRow {
-  return { id, accountId: '', debit: '', credit: '', memo: '', classId: '' };
+  return { id, accountId: '', debit: '', credit: '', memo: '', classId: '', name: '' };
 }
 
 let lineCounter = 0;
@@ -136,14 +150,24 @@ interface EntryFormModalProps {
   onSaved: () => void;
   accounts: Account[];
   classes: ClassOption[];
+  names: NameOption[];
   /** When set, the modal edits this entry (prefilled) instead of creating a new one. */
   editEntry: EntryDetail | null;
 }
 
-function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }: EntryFormModalProps) {
+/** Which kind of name a line's account requires (QB: A/R needs a customer, A/P a vendor). */
+function requiredNameKind(acct: Account | undefined): 'customer' | 'vendor' | null {
+  if (!acct) return null;
+  if (acct.type === 'asset' && acct.subtype === 'accounts_receivable') return 'customer';
+  if (acct.type === 'liability' && acct.subtype === 'accounts_payable') return 'vendor';
+  return null;
+}
+
+function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, editEntry }: EntryFormModalProps) {
   const [date, setDate] = useState(todayISO());
   const [description, setDescription] = useState('');
   const [reference, setReference] = useState('');
+  const [isAdjusting, setIsAdjusting] = useState(false);
   const [lines, setLines] = useState<LineRow[]>(() => [
     emptyLine(++lineCounter),
     emptyLine(++lineCounter),
@@ -159,6 +183,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       setDate(editEntry.date.slice(0, 10));
       setDescription(editEntry.description);
       setReference(editEntry.reference ?? '');
+      setIsAdjusting(!!editEntry.isAdjusting);
       setLines(
         editEntry.lines.map((l) => ({
           id: ++lineCounter,
@@ -167,12 +192,14 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           credit: l.credit ?? '',
           memo: l.memo ?? '',
           classId: l.classId ?? '',
+          name: l.entityType && l.entityId ? `${l.entityType}:${l.entityId}` : '',
         })),
       );
     } else {
       setDate(todayISO());
       setDescription('');
       setReference('');
+      setIsAdjusting(false);
       setLines([emptyLine(++lineCounter), emptyLine(++lineCounter)]);
     }
     setSaving(false);
@@ -208,8 +235,22 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
   // debits equal credits, so an UNBALANCED error never reaches the user.
   const bal = computeJournalBalance(lines);
   const missingHeader = !date ? 'Enter a date.' : !description.trim() ? 'Enter a description.' : null;
-  const blocker = missingHeader ?? bal.blocker;
-  const canSubmit = bal.canSave && !missingHeader;
+  // QB rule: lines on Accounts Receivable need a customer, lines on Accounts Payable a vendor.
+  const accountById = new Map(accounts.map((a) => [a.id, a]));
+  const nameProblemIdx = lines.findIndex((l) => {
+    const need = requiredNameKind(accountById.get(l.accountId));
+    return need !== null && !l.name.startsWith(`${need}:`);
+  });
+  const nameBlocker =
+    nameProblemIdx >= 0
+      ? `Line ${nameProblemIdx + 1} uses ${
+          requiredNameKind(accountById.get(lines[nameProblemIdx].accountId)) === 'customer'
+            ? 'Accounts Receivable — pick the customer'
+            : 'Accounts Payable — pick the vendor'
+        } in the Name column.`
+      : null;
+  const blocker = missingHeader ?? nameBlocker ?? bal.blocker;
+  const canSubmit = bal.canSave && !missingHeader && !nameBlocker;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -219,16 +260,22 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
         date,
         description: description.trim(),
         reference: reference.trim() || null,
+        isAdjusting,
         lines: lines
           .filter((l) => l.accountId)
-          .map((l) => ({
-            accountId: l.accountId,
-            // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
-            debit: journalPayloadAmount(l.debit),
-            credit: journalPayloadAmount(l.credit),
-            memo: l.memo.trim() || null,
-            classId: l.classId || null,
-          })),
+          .map((l) => {
+            const [entityType, entityId] = l.name ? l.name.split(':') : [null, null];
+            return {
+              accountId: l.accountId,
+              // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
+              debit: journalPayloadAmount(l.debit),
+              credit: journalPayloadAmount(l.credit),
+              memo: l.memo.trim() || null,
+              classId: l.classId || null,
+              entityType: entityType || null,
+              entityId: entityId || null,
+            };
+          }),
       };
       if (editing && editEntry) {
         await api.patch(`/api/journal-entries/${editEntry.id}`, payload);
@@ -248,7 +295,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
 
   const diffIsZero = Number(bal.difference) === 0;
 
-  const gridCols = 'grid-cols-[1fr_120px_130px_92px_92px_28px]';
+  const gridCols = 'grid-cols-[1fr_130px_110px_120px_92px_92px_28px]';
 
   return (
     <Modal
@@ -310,6 +357,16 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
             aria-required="true"
           />
         </div>
+        <label className="col-span-2 inline-flex items-center gap-2 text-sm text-navy/80">
+          <input
+            type="checkbox"
+            checked={isAdjusting}
+            onChange={(e) => setIsAdjusting(e.target.checked)}
+            className="h-4 w-4 rounded border-slate-300"
+          />
+          Adjusting entry <Help term="adjusting-entry" side="bottom" />
+          <span className="text-xs text-navy/50">(year-end or accountant adjustment)</span>
+        </label>
       </div>
 
       <p className="mb-4 flex items-start gap-1.5 rounded-lg bg-electric/5 px-3 py-2 text-xs text-navy/70">
@@ -324,6 +381,9 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       <div className="mb-3">
         <div className={`grid ${gridCols} gap-2 mb-1 px-1`}>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">Account</span>
+          <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide inline-flex items-center gap-1">
+            Name <Help term="name-on-journal-line" side="bottom" />
+          </span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide inline-flex items-center gap-1">
             Class <Help term="class" side="bottom" />
           </span>
@@ -342,11 +402,46 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
                 onChange={(e) => updateLine(line.id, 'accountId', e.target.value)}
               >
                 <option value="">— Select account —</option>
-                {accounts.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.code} · {a.name}
-                  </option>
-                ))}
+                {accounts
+                  .filter((a) => a.subtype !== 'non_posting')
+                  .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.code} · {a.name}
+                    </option>
+                  ))}
+              </Select>
+
+              <Select
+                aria-label={`Line ${idx + 1} name`}
+                aria-invalid={nameProblemIdx === idx || undefined}
+                value={line.name}
+                onChange={(e) => updateLine(line.id, 'name', e.target.value)}
+              >
+                <option value="">
+                  {requiredNameKind(accountById.get(line.accountId)) === 'customer'
+                    ? '— Pick customer —'
+                    : requiredNameKind(accountById.get(line.accountId)) === 'vendor'
+                      ? '— Pick vendor —'
+                      : '— No name —'}
+                </option>
+                {(['customer', 'vendor', 'employee'] as const).map((kind) => {
+                  const need = requiredNameKind(accountById.get(line.accountId));
+                  if (need && need !== kind) return null;
+                  const opts = names.filter((n) => n.kind === kind);
+                  if (opts.length === 0) return null;
+                  return (
+                    <optgroup
+                      key={kind}
+                      label={kind === 'customer' ? 'Customers' : kind === 'vendor' ? 'Vendors' : 'Employees'}
+                    >
+                      {opts.map((n) => (
+                        <option key={n.value} value={n.value}>
+                          {n.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  );
+                })}
               </Select>
 
               <Select
@@ -414,6 +509,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       <div className="border-t border-slate-100 pt-4 mt-2">
         <div className={`grid ${gridCols} gap-2 items-center`}>
           <span className="text-sm font-bold text-navy text-right">Totals</span>
+          <span />
           <span />
           <span />
           <span className="text-sm font-bold text-navy text-right tabular-nums">
@@ -532,6 +628,7 @@ function JournalPageContent() {
   const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [classes, setClasses] = useState<ClassOption[]>([]);
+  const [names, setNames] = useState<NameOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editTarget, setEditTarget] = useState<EntryDetail | null>(null);
@@ -569,11 +666,31 @@ function JournalPageContent() {
     }
   }, []);
 
+  // Names for the QB "Name" column. Each list is optional (permissions may hide one).
+  const fetchNames = useCallback(async () => {
+    const [cust, vend, emp] = await Promise.all([
+      api.get<Array<{ id: string; displayName: string }>>('/api/customers').catch(() => []),
+      api.get<Array<{ id: string; displayName: string }>>('/api/vendors').catch(() => []),
+      api.get<Array<{ id: string; firstName: string; lastName: string }>>('/api/employees').catch(() => []),
+    ]);
+    const list = (v: unknown) => (Array.isArray(v) ? v : []);
+    setNames([
+      ...list(cust).map((c) => ({ value: `customer:${c.id}`, label: c.displayName, kind: 'customer' as const })),
+      ...list(vend).map((v) => ({ value: `vendor:${v.id}`, label: v.displayName, kind: 'vendor' as const })),
+      ...list(emp).map((e) => ({
+        value: `employee:${e.id}`,
+        label: `${e.firstName} ${e.lastName}`.trim(),
+        kind: 'employee' as const,
+      })),
+    ]);
+  }, []);
+
   useEffect(() => {
     fetchEntries();
     fetchAccounts();
     fetchClasses();
-  }, [fetchEntries, fetchAccounts, fetchClasses]);
+    fetchNames();
+  }, [fetchEntries, fetchAccounts, fetchClasses, fetchNames]);
 
   // Quick Actions navigate here with ?new=1 — open the create modal.
   useNewParam(() => {
@@ -675,6 +792,11 @@ function JournalPageContent() {
                   <Td className="whitespace-nowrap">{formatDate(entry.date)}</Td>
                   <Td className="max-w-xs truncate" title={entry.description}>
                     {entry.description}
+                    {entry.isAdjusting && (
+                      <Badge tone="info" className="ml-2">
+                        Adjusting
+                      </Badge>
+                    )}
                   </Td>
                   <Td className="text-navy/50 text-xs">{entry.reference ?? '—'}</Td>
                   <Td>
@@ -745,6 +867,7 @@ function JournalPageContent() {
         onSaved={fetchEntries}
         accounts={accounts}
         classes={classes}
+        names={names}
         editEntry={editTarget}
       />
 

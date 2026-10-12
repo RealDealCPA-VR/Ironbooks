@@ -160,12 +160,13 @@ export interface AccountBalanceRow {
 }
 
 /** Subtypes shown on the Home page balances panel (QB "Account Balances"). */
-const PANEL_SUBTYPES = new Set(['checking', 'savings', 'credit_card']);
+const PANEL_SUBTYPES = new Set(['checking', 'savings', 'undeposited_funds', 'credit_card']);
 
 /**
  * Build the balances panel rows. Banks (checking/savings) are debit-normal (debits - credits);
- * credit cards are credit-normal (credits - debits, i.e. what you owe). "Undeposited Funds"
- * carries a checking subtype in the default chart, so it is called out separately by name.
+ * credit cards are credit-normal (credits - debits, i.e. what you owe). Undeposited Funds has its
+ * own subtype (an Other Current Asset); legacy charts that still hold it as a bank account are
+ * recognised by name.
  */
 export function buildAccountBalances(
   accounts: BalanceAccount[],
@@ -181,7 +182,7 @@ export function buildAccountBalances(
     const isCard = a.subtype === 'credit_card';
     const kind: AccountBalanceRow['kind'] = isCard
       ? 'credit_card'
-      : /undeposited/i.test(a.name)
+      : a.subtype === 'undeposited_funds' || /undeposited/i.test(a.name)
         ? 'undeposited'
         : 'bank';
     rows.push({

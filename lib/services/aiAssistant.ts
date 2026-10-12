@@ -17,13 +17,13 @@
  */
 import { and, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { accounts, aiProposals, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import { accounts, aiProposals, customers, journalEntries, journalEntryLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString, formatCurrency } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { balanceSheet, profitAndLoss, trialBalance } from './reports';
 import { apAging, arAging } from './reportsExtra';
 import { assertBalanced } from './posting';
-import { createManualEntry } from './journal';
+import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { AiError } from '@/lib/ai/types';
 
@@ -255,6 +255,11 @@ const proposalLineSchema = z.object({
   debit: z.union([z.string(), z.number()]).nullish(),
   credit: z.union([z.string(), z.number()]).nullish(),
   memo: z.string().max(500).nullish(),
+  /**
+   * QB "Name" column: the customer (A/R lines) or vendor (A/P lines) display name. Resolved to
+   * an id when the proposal is stored; A/R and A/P lines need one to be approved.
+   */
+  name: z.string().trim().max(200).nullish(),
 });
 export const journalProposalSchema = z.object({
   type: z.literal('journal_entry').default('journal_entry'),
@@ -280,7 +285,18 @@ interface StoredJournalProposal {
   date: string;
   description: string;
   reference: string | null;
-  lines: { accountId: string; accountCode: string; accountName: string; debit: string | null; credit: string | null; memo: string | null }[];
+  lines: {
+    accountId: string;
+    accountCode: string;
+    accountName: string;
+    debit: string | null;
+    credit: string | null;
+    memo: string | null;
+    /** QB "Name" column. Optional: proposals that hit A/R or A/P must carry one to be approved. */
+    entityType?: 'customer' | 'vendor' | 'employee' | 'other' | null;
+    entityId?: string | null;
+    entityName?: string | null;
+  }[];
   totalDebit: string;
   rationale: string | null;
 }
@@ -292,6 +308,47 @@ function moneyOrNull(v: string | number | null | undefined, label: string): stri
   const s = typeof v === 'number' ? String(v) : v.trim().replace(/[$,]/g, '');
   if (!MONEY_RE.test(s)) throw validation(`${label}: "${v}" is not a valid amount.`);
   return Money.isZero(s) ? null : toAmountString(s);
+}
+
+/**
+ * Resolve the display name a proposal line carries to a customer (A/R lines) or vendor (A/P
+ * lines and, failing that, any other line), case-insensitively, within this company.
+ */
+async function resolveProposalName(
+  ctx: ServiceContext,
+  name: string,
+  acct: { type: string; subtype: string },
+  i: number,
+): Promise<{ entityType: 'customer' | 'vendor'; entityId: string; entityName: string }> {
+  const findCustomer = async () => {
+    const [r] = await ctx.db
+      .select({ id: customers.id, name: customers.displayName, isActive: customers.isActive })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), sql`lower(${customers.displayName}) = lower(${name})`))
+      .orderBy(desc(customers.isActive))
+      .limit(1);
+    return r ? { entityType: 'customer' as const, entityId: r.id, entityName: r.name, isActive: r.isActive } : null;
+  };
+  const findVendor = async () => {
+    const [r] = await ctx.db
+      .select({ id: vendors.id, name: vendors.displayName, isActive: vendors.isActive })
+      .from(vendors)
+      .where(and(eq(vendors.companyId, ctx.companyId), sql`lower(${vendors.displayName}) = lower(${name})`))
+      .orderBy(desc(vendors.isActive))
+      .limit(1);
+    return r ? { entityType: 'vendor' as const, entityId: r.id, entityName: r.name, isActive: r.isActive } : null;
+  };
+  const isAR = acct.type === 'asset' && acct.subtype === 'accounts_receivable';
+  const isAP = acct.type === 'liability' && acct.subtype === 'accounts_payable';
+  const found = isAR ? await findCustomer() : isAP ? await findVendor() : (await findVendor()) ?? (await findCustomer());
+  if (!found) {
+    const kind = isAR ? 'customer' : isAP ? 'vendor' : 'customer or vendor';
+    throw validation(`Line ${i + 1}: no ${kind} named "${name}" was found.`);
+  }
+  if (!found.isActive) {
+    throw validation(`Line ${i + 1}: "${found.entityName}" is inactive. Pick an active name, or make this one active again first.`);
+  }
+  return { entityType: found.entityType, entityId: found.entityId, entityName: found.entityName };
 }
 
 /**
@@ -309,24 +366,36 @@ export async function createJournalProposal(
   if (!parseDate(p.date)) throw validation('Proposal date is invalid.');
 
   const acctRows = await ctx.db
-    .select({ id: accounts.id, code: accounts.code, name: accounts.name, isActive: accounts.isActive })
+    .select({
+      id: accounts.id,
+      code: accounts.code,
+      name: accounts.name,
+      type: accounts.type,
+      subtype: accounts.subtype,
+      isActive: accounts.isActive,
+    })
     .from(accounts)
     .where(eq(accounts.companyId, ctx.companyId));
   const byCode = new Map(acctRows.map((a) => [a.code, a]));
 
-  const lines = p.lines.map((l, i) => {
+  const lines: StoredJournalProposal['lines'] = [];
+  for (const [i, l] of p.lines.entries()) {
     const acct = byCode.get(l.accountCode.trim());
     if (!acct) throw validation(`Line ${i + 1}: account code ${l.accountCode} does not exist.`);
     if (!acct.isActive) throw validation(`Line ${i + 1}: account ${acct.code} ${acct.name} is inactive.`);
-    return {
+    const named = l.name ? await resolveProposalName(ctx, l.name, acct, i) : null;
+    lines.push({
       accountId: acct.id,
       accountCode: acct.code,
       accountName: acct.name,
       debit: moneyOrNull(l.debit, `Line ${i + 1} debit`),
       credit: moneyOrNull(l.credit, `Line ${i + 1} credit`),
       memo: l.memo ?? null,
-    };
-  });
+      entityType: named?.entityType ?? null,
+      entityId: named?.entityId ?? null,
+      entityName: named?.entityName ?? null,
+    });
+  }
   // Same rules postJournalEntry enforces — reject an unbalanced proposal up front.
   const totals = assertBalanced(lines.map((l) => ({ accountId: l.accountId, debit: l.debit, credit: l.credit })));
 
@@ -415,12 +484,40 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       if (!a.isActive) throw validation(`Account ${a.code} ${a.name} is inactive; the proposal cannot be posted.`);
     }
 
-    const entry = await createManualEntry(tx, {
-      date,
-      description: p.description,
-      reference: p.reference,
-      lines: p.lines.map((l) => ({ accountId: l.accountId, debit: l.debit, credit: l.credit, memo: l.memo })),
-    });
+    // The QB name rule applies to AI proposals too: an A/R line needs a customer and an A/P line
+    // a vendor, otherwise A/R / A/P aging would stop matching the GL. Proposals that hit those
+    // accounts without a name are refused here with a plain-language message.
+    // TODO(ai team): let the assistant pick the customer / vendor so such proposals can carry it.
+    // The customer / vendor named in the proposal may have been merged away since it was made:
+    // follow the merge to the record that was kept. Any other inactive name is refused by the
+    // name rule in createManualEntry.
+    const lines = await followMergedNames(
+      tx,
+      p.lines.map((l) => ({
+        accountId: l.accountId,
+        debit: l.debit,
+        credit: l.credit,
+        memo: l.memo,
+        entityType: l.entityType ?? null,
+        entityId: l.entityId ?? null,
+      })),
+    );
+    let entry: Awaited<ReturnType<typeof createManualEntry>>;
+    try {
+      entry = await createManualEntry(tx, {
+        date,
+        description: p.description,
+        reference: p.reference,
+        lines,
+      });
+    } catch (e) {
+      if (e instanceof ServiceError && /needs a (customer|vendor) in the Name column/.test(e.message)) {
+        throw validation(
+          `This suggestion can't be posted as is: ${e.message} Enter it yourself in Make Journal Entries and pick the name.`,
+        );
+      }
+      throw e;
+    }
     const [updated] = await tx.db
       .update(aiProposals)
       .set({ status: 'approved', resultRef: `journal_entry:${entry.id}`, decidedBy: tx.userId, decidedAt: new Date() })
@@ -530,7 +627,7 @@ Rules:
 - If the tools cannot answer, say so.
 - You cannot change any data. If the user asks you to record something (e.g. a journal entry), call list_accounts first, then answer with an explanation AND a "proposal" field:
   {"action":"answer","answer":"...","proposal":{"type":"journal_entry","date":"YYYY-MM-DD","description":"...","lines":[{"accountCode":"6000","debit":"100.00"},{"accountCode":"1000","credit":"100.00"}]}}
-  Debits must equal credits. The user reviews and approves proposals; say that it awaits their approval.
+  Debits must equal credits. A line on Accounts Receivable needs "name": "<customer name>" and a line on Accounts Payable needs "name": "<vendor name>". The user reviews and approves proposals; say that it awaits their approval.
 - Keep answers short and clear for a non-accountant. Use YYYY-MM-DD dates in tool args.`;
 }
 

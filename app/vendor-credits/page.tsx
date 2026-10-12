@@ -1,5 +1,6 @@
 'use client';
 
+import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { useEffect, useState, useCallback } from 'react';
 import { RotateCcw, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle, Banknote } from 'lucide-react';
 import {
@@ -441,13 +442,9 @@ function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModa
     }
   }, [open, credit]);
 
-  // Bank-ish accounts only — exclude A/R, inventory and fixed assets (same filter as
-  // the pay-bills / expenses payment-account pickers).
-  const bankAccounts = accounts.filter(
-    (a) =>
-      a.type === 'asset' &&
-      !['accounts_receivable', 'inventory', 'fixed_assets'].includes(a.subtype ?? ''),
-  );
+  // Accounts a vendor refund can be deposited to: banks, Undeposited Funds and other
+  // cash-like current assets (lib/accountTypes.ts, same rule the service enforces).
+  const bankAccounts = accounts.filter((a) => isDepositTargetAccount(a));
 
   async function handleRefund() {
     if (!credit) return;

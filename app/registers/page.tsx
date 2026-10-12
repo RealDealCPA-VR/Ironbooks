@@ -6,6 +6,7 @@
  * current balances, grouped by category. Each row opens the account's register
  * at /registers/<accountId>.
  */
+import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
@@ -29,13 +30,13 @@ const GROUPS: { title: string; subtypes: string[] }[] = [
   { title: 'Credit Cards', subtypes: ['credit_card'] },
   { title: 'Accounts Receivable', subtypes: ['accounts_receivable'] },
   { title: 'Accounts Payable', subtypes: ['accounts_payable'] },
+  { title: 'Other Current Assets', subtypes: ['undeposited_funds', 'other_current_asset', 'inventory'] },
+  { title: 'Fixed & Other Assets', subtypes: ['fixed_assets', 'other_asset'] },
+  { title: 'Other Liabilities', subtypes: ['other_current_liability', 'long_term_liability'] },
 ];
 
 function subtypeLabel(subtype: string): string {
-  return subtype
-    .split('_')
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ');
+  return SUBTYPE_LABELS[subtype as keyof typeof SUBTYPE_LABELS] ?? subtype;
 }
 
 export default function RegistersIndexPage() {

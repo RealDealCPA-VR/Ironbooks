@@ -2,7 +2,7 @@
  * Zod schemas for /api/credit-memos — mirrors CreateCreditMemoInput / CreditMemoLineInput.
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
 
 export const creditMemoLineSchema = z.object({
@@ -21,6 +21,9 @@ export const creditMemoLineSchema = z.object({
 
 export const createCreditMemoSchema = z.object({
   customerId: zUuid,
+  /** Typed document number (e.g. "INV-1001"); blank = next number. */
+  refNumber: zDocNumber,
+  allowDuplicateNumber: z.boolean().nullish(),
   date: zDate,
   taxRateId: zUuid.nullish(),
   memo: z.string().nullish(),

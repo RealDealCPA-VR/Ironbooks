@@ -158,6 +158,38 @@ export const GLOSSARY = {
       'The final balance printed on your bank or credit card statement for the period you are reconciling.',
     aliases: ['ending balance', 'statement balance'],
   },
+  'account-type': {
+    term: 'Account type',
+    short:
+      'Tells the books what kind of account this is — a bank account, money customers owe you, a bill you owe, income, an expense and so on. It decides where the account appears on your reports.',
+    long:
+      'Example: prepaid insurance is something you own but cannot spend, so it is an Other Current Asset, not a Bank account. A loan you repay over five years is a Long Term Liability.',
+    aliases: ['account type', 'account types', 'other current asset', 'other current liability', 'long term liability'],
+  },
+  'non-posting-account': {
+    term: 'Non-posting account',
+    short:
+      'An account that only keeps track of estimates, sales orders or purchase orders. Nothing in it is real money yet, so it never appears on your financial reports.',
+    aliases: ['non-posting', 'nonposting', 'non posting account'],
+  },
+  'adjusting-entry': {
+    term: 'Adjusting entry',
+    short:
+      'A journal entry made at the end of a period to correct or update the books — for example recording depreciation or expenses you owe but have not been billed for yet.',
+    aliases: ['adjusting entries', 'adjusting journal entry', 'aje', 'adjustment'],
+  },
+  'tax-line': {
+    term: 'Tax line',
+    short:
+      'The line on your business income-tax return that an account adds up to. Setting it lets your tax preparer pull the right totals straight from your books.',
+    aliases: ['tax line', 'tax-line mapping', 'tax line mapping'],
+  },
+  'name-on-journal-line': {
+    term: 'Name (on a journal entry)',
+    short:
+      'The customer, vendor or employee a journal entry line is for. Lines that touch Accounts Receivable need a customer, and lines that touch Accounts Payable need a vendor, so their balances stay right.',
+    aliases: ['journal name', 'name column'],
+  },
 } satisfies Record<string, GlossaryEntry>;
 
 export type GlossaryKey = keyof typeof GLOSSARY;

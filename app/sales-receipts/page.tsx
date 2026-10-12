@@ -34,6 +34,7 @@ import {
   useAdvancedInventory,
 } from '@/components/inventory/AdvancedInventory';
 import { formatDate } from '@/lib/format';
+import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 
@@ -59,6 +60,7 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype?: string | null;
 }
 
 interface TaxRate {
@@ -147,7 +149,8 @@ function NewReceiptModal({
   taxRates,
   onCreated,
 }: NewReceiptModalProps) {
-  const depositAccounts = accounts.filter((a) => a.type === 'asset');
+  // QB lists bank, Undeposited Funds and other current assets in "Deposit to" — never A/R.
+  const depositAccounts = accounts.filter((a) => isDepositTargetAccount(a));
   const undepositedFunds = depositAccounts.find((a) => a.code === '1050');
 
   const [customerId, setCustomerId] = useState('');

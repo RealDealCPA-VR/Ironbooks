@@ -293,7 +293,8 @@ describe('qbGlImport — QuickBooks General Ledger migration', () => {
       .select()
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '10200')));
-    expect(sav.subtype).toBe('checking');
+    // An Other Current Asset is no longer stored as a bank account (wave2 foundation, B1).
+    expect(sav.subtype).toBe('other_current_asset');
   });
 
   it('warns when a mapped account also holds entries that were not imported', async () => {

@@ -186,6 +186,7 @@ describe('Budgets service', () => {
     // Post actual journal entries for FY2025.
     // Revenue: $18,000 credit to revenue, debit AR.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-03-15'),
       description: 'Service invoice',
       lines: [
@@ -196,6 +197,7 @@ describe('Budgets service', () => {
 
     // Rent expense: $1,800 debit to rent, credit cash.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-03-01'),
       description: 'March rent',
       lines: [

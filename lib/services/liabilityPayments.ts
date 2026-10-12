@@ -10,7 +10,7 @@ import { and, eq, gte, lte, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines, taxAgencies } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, notFound, validation } from './_base';
-import { postJournalEntry } from './posting';
+import { assertNotControlAccount, postJournalEntry } from './posting';
 import { salesTaxByAgency } from './combinedTax';
 
 // ── COA codes fixed by the project spec ─────────────────────────────────────
@@ -102,6 +102,13 @@ export async function paySalesTax(ctx: ServiceContext, input: PaySalesTaxInput) 
       .where(and(eq(taxAgencies.companyId, ctx.companyId), eq(taxAgencies.id, input.agencyId)));
     agency = row ?? null;
   }
+
+  // QB "Pay from" lists bank / credit card accounts — never A/R or A/P (aging would not see it).
+  const [payFrom] = await ctx.db
+    .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.paymentAccountId)));
+  if (payFrom) assertNotControlAccount(payFrom, 'Pay from');
 
   const salesTaxAccountId =
     agency?.liabilityAccountId ?? (await accountIdByCode(ctx, CODE_SALES_TAX_PAYABLE));

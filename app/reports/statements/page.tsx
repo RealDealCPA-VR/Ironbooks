@@ -30,7 +30,7 @@ interface Customer {
 
 interface StatementLine {
   date: string;
-  type: 'invoice' | 'payment' | 'credit_memo';
+  type: 'invoice' | 'payment' | 'credit_memo' | 'general_journal';
   ref: string | null;
   amount: string;
   runningBalance: string;
@@ -98,6 +98,11 @@ function fmtDate(iso: string) {
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
+
+/** Charges column: invoices and positive General Journal lines; everything else is a credit. */
+function isCharge(line: { type: string; amount: string }): boolean {
+  return line.type === 'invoice' || (line.type === 'general_journal' && !line.amount.startsWith('-'));
+}
 
 export default function CustomerStatementsPage() {
   const today = new Date().toISOString().slice(0, 10);
@@ -418,6 +423,8 @@ export default function CustomerStatementsPage() {
                         <Badge tone="info">Invoice</Badge>
                       ) : line.type === 'credit_memo' ? (
                         <Badge tone="neutral">Credit Memo</Badge>
+                      ) : line.type === 'general_journal' ? (
+                        <Badge tone="neutral">General Journal</Badge>
                       ) : (
                         <Badge tone="success">Payment</Badge>
                       )}
@@ -426,10 +433,10 @@ export default function CustomerStatementsPage() {
                       {line.type === 'invoice' && line.ref ? `#${line.ref}` : (line.ref ?? '—')}
                     </Td>
                     <Td className="text-right tabular-nums">
-                      {line.type === 'invoice' ? formatCurrency(line.amount) : ''}
+                      {isCharge(line) ? formatCurrency(line.amount) : ''}
                     </Td>
                     <Td className="text-right tabular-nums text-emerald">
-                      {line.type !== 'invoice' ? formatCurrency(line.amount) : ''}
+                      {!isCharge(line) ? formatCurrency(line.amount.replace(/^-/, '')) : ''}
                     </Td>
                     <Td className="text-right tabular-nums font-semibold">
                       {formatCurrency(line.runningBalance)}

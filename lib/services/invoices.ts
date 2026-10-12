@@ -54,7 +54,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
 import {
@@ -66,6 +66,7 @@ import {
   saveDocumentInventoryDetails,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { allocateDocNumber, docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -98,6 +99,13 @@ export interface InvoiceLineInput extends InventoryLineDetail {
 }
 
 export interface CreateInvoiceInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   customerId: string;
   date: Date;
   dueDate?: Date | null;
@@ -231,15 +239,6 @@ async function hasExternalPayments(
   return Money.of(invoice.amountPaid).greaterThan(paymentLines);
 }
 
-/** Return the next invoice number for the company (max + 1, 1 if none). */
-async function nextInvoiceNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${invoices.invoiceNumber}), 0)` })
-    .from(invoices)
-    .where(eq(invoices.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
-}
-
 // ---------------------------------------------------------------------------
 // prepareInvoice — shared validation + computation for create/update
 // ---------------------------------------------------------------------------
@@ -370,14 +369,29 @@ async function prepareInvoice(
   const taxPayableId = await accountIdByCode(ctx, '2200');   // Sales Tax Payable
 
   // Resolve (or create) the Retainage Receivable account if this invoice uses retainage.
+  // As in a QuickBooks contractor file, Retainage Receivable is an Other Current Asset, NOT an
+  // A/R account: the held-back amount is not part of what the customer owes today, so it must
+  // stay out of A/R (I11: A/R aging == the A/R accounts on the balance sheet). It is billed
+  // later with an invoice line on this account, which moves it into A/R.
   const usesRetainage = input.retainagePercent != null && Money.of(input.retainagePercent).greaterThan(0);
   const retainageAcctId = usesRetainage
     ? await getOrCreateAccountByCode(ctx, '1250', {
         name: 'Retainage Receivable',
         type: 'asset',
-        subtype: 'accounts_receivable',
+        subtype: 'other_current_asset',
       })
     : null;
+  if (retainageAcctId) {
+    const [ret] = await ctx.db
+      .select({ name: accounts.name, type: accounts.type, subtype: accounts.subtype })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, retainageAcctId)));
+    if (!ret || ret.type !== 'asset' || ret.subtype === 'accounts_receivable' || ret.subtype === 'non_posting') {
+      throw validation(
+        `Retainage is held in account 1250${ret ? ` "${ret.name}"` : ''}, which must be an Other Current Asset account. Change that account's type to Other Current Asset in the Chart of Accounts, then save the invoice again.`,
+      );
+    }
+  }
 
   // Pre-load items referenced by lines (income account routing + inventory typing).
   const itemIds = [
@@ -485,6 +499,15 @@ async function prepareInvoice(
     } else if (l.itemId) {
       const itemIncomeId = itemMap.get(l.itemId)?.incomeAccountId ?? null;
       if (itemIncomeId) resolvedAccountId = itemIncomeId;
+    }
+    // A/R and A/P are never a line / discount account (QB invariant I11): an extra A/R line
+    // would move the GL without moving the invoice's balance in A/R aging.
+    if (kind !== 'subtotal') {
+      const [lineAcct] = await ctx.db
+        .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+        .from(accounts)
+        .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, resolvedAccountId)));
+      if (lineAcct) assertNotControlLineAccount(lineAcct, `Line ${i + 1}`);
     }
 
     if (kind === 'subtotal') {
@@ -618,7 +641,7 @@ async function prepareInvoice(
     ? await getOrCreateAccountByCode(ctx, '1050', {
         name: 'Undeposited Funds',
         type: 'asset',
-        subtype: 'checking',
+        subtype: 'undeposited_funds',
       })
     : null;
 
@@ -705,7 +728,8 @@ async function postInvoiceGL(
   tx: ServiceContext,
   prep: PreparedInvoice,
   invoiceId: string,
-  invoiceNumber: number,
+  /** The number shown on the GL (typed ref number, else the legacy integer). */
+  invoiceNumber: number | string,
   date: Date,
 ) {
   const {
@@ -753,10 +777,13 @@ async function postInvoiceGL(
     weight: ReturnType<typeof Money.zero>;
     memo: string;
     classId?: string | null;
+    /** The invoice's own A/R line(s) — see posting.ts PostingLine.controlLine. */
+    controlLine?: boolean;
   }> = [{
     accountId: arAccountId,
     weight: dueNow.minus(paymentTotal),
     memo: `Invoice #${invoiceNumber}`,
+    controlLine: true,
   }];
   if (paymentTotal.greaterThan(0) && ufAccountId) {
     debitSpecs.push({
@@ -823,6 +850,7 @@ async function postInvoiceGL(
     credit?: string;
     memo?: string;
     classId?: string | null;
+    controlLine?: boolean;
   }> = [];
   debitSpecs.forEach((s, i) => {
     if (debitAlloc[i].greaterThan(0)) {
@@ -831,6 +859,7 @@ async function postInvoiceGL(
         debit: toAmountString(debitAlloc[i]),
         memo: s.memo,
         classId: s.classId ?? null,
+        ...(s.controlLine ? { controlLine: true } : {}),
       });
     }
   });
@@ -873,7 +902,8 @@ async function postInvoiceCOGS(
   tx: ServiceContext,
   prep: PreparedInvoice,
   invoiceId: string,
-  invoiceNumber: number,
+  /** The number shown on the GL (typed ref number, else the legacy integer). */
+  invoiceNumber: number | string,
   date: Date,
 ) {
   const { computedLines, itemMap } = prep;
@@ -1108,7 +1138,9 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
   // Persist everything in a single transaction.
   // ---------------------------------------------------------------------------
   return inTransaction(ctx, async (tx) => {
-    const invoiceNumber = await nextInvoiceNumber(tx);
+    const { refNumber, number: invoiceNumber } = await allocateDocNumber(tx, 'invoice', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     // Resolve currency fields.
     const currency = input.currency ?? null;
@@ -1124,6 +1156,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         companyId: tx.companyId,
         customerId: input.customerId,
         invoiceNumber,
+        refNumber,
         date: input.date,
         dueDate: input.dueDate ?? null,
         status: isDraft ? 'draft' : postedStatus(prep),
@@ -1190,7 +1223,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
     }
 
     // 3) Build and post the journal entry.
-    const entry = await postInvoiceGL(tx, prep, invoice.id, invoiceNumber, input.date);
+    const entry = await postInvoiceGL(tx, prep, invoice.id, docRef(refNumber, invoiceNumber), input.date);
 
     // 4) Stamp postedEntryId on the invoice.
     const [updated] = await tx.db
@@ -1201,14 +1234,14 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
 
     // 5) Perpetual inventory: relieve stock + post COGS for inventory-item lines,
     //    then record which site/bin/serial/lot the stock left from.
-    await postInvoiceCOGS(tx, prep, invoice.id, invoiceNumber, input.date);
+    await postInvoiceCOGS(tx, prep, invoice.id, docRef(refNumber, invoiceNumber), input.date);
     await postDocumentInventory(tx, {
       sourceType: 'invoice',
       sourceId: invoice.id,
       date: input.date,
       direction: 'out',
       lines: inventoryLinesOf(input.lines, prep),
-      memo: `Invoice #${invoiceNumber}`,
+      memo: `Invoice #${docRef(refNumber, invoiceNumber)}`,
     });
 
     // 6) Audit trail.
@@ -1300,7 +1333,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
     }
 
     // 1) Post the GL entry (assertPeriodOpen runs here, on the invoice date).
-    const entry = await postInvoiceGL(tx, prep, id, invoice.invoiceNumber, invoice.date);
+    const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
 
     // 2) Flip the header to its posted state.
     const [updated] = await tx.db
@@ -1322,14 +1355,14 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
 
     // 3) Perpetual inventory: relieve stock + post COGS now that it is real, using the
     //    site/serial/lot detail saved with the draft.
-    await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, invoice.date);
+    await postInvoiceCOGS(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
     await postDocumentInventory(tx, {
       sourceType: 'invoice',
       sourceId: id,
       date: invoice.date,
       direction: 'out',
       lines: inventoryLinesOf(input.lines, prep),
-      memo: `Invoice #${invoice.invoiceNumber}`,
+      memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
       carryForward: true,
     });
 
@@ -1526,7 +1559,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
 
     // 4) Re-post the GL entry from the new document, then update the header in
     //    place — invoiceNumber and createdAt are intentionally NOT touched.
-    const entry = await postInvoiceGL(tx, prep, id, invoice.invoiceNumber, input.date);
+    const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
 
     const [updated] = await tx.db
       .update(invoices)
@@ -1561,14 +1594,14 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
 
     // 5) Re-post perpetual inventory COGS for the new lines (site detail carried forward
     //    for lines the edit did not touch).
-    await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, input.date);
+    await postInvoiceCOGS(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
     await postDocumentInventory(tx, {
       sourceType: 'invoice',
       sourceId: id,
       date: input.date,
       direction: 'out',
       lines: inventoryLinesOf(input.lines, prep),
-      memo: `Invoice #${invoice.invoiceNumber}`,
+      memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
       carryForward: true,
     });
 

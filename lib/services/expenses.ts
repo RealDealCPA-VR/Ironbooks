@@ -26,6 +26,7 @@
  * Multi-tenant safety: every query is scoped by ctx.companyId.
  * Money: all arithmetic uses Money/toAmountString — never JS floats.
  */
+import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { and, desc, eq, gte, inArray, isNull, lte } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import {
@@ -114,12 +115,9 @@ export async function createExpense(ctx: ServiceContext, input: CreateExpenseInp
     .where(and(eq(accounts.id, input.paymentAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!payAcct) throw notFound('Payment account');
 
-  const isBankish =
-    payAcct.type === 'asset' &&
-    payAcct.subtype !== 'accounts_receivable' &&
-    payAcct.subtype !== 'inventory' &&
-    payAcct.subtype !== 'fixed_assets';
-  const isCreditCard = payAcct.type === 'liability' && payAcct.subtype === 'credit_card';
+  // QB parity: checks and cash expenses come from a Bank account (lib/accountTypes.ts).
+  const isBankish = isBankAccount(payAcct);
+  const isCreditCard = isCreditCardAccount(payAcct);
 
   if (input.method === 'credit_card') {
     if (!isCreditCard) {
@@ -160,9 +158,10 @@ export async function createExpense(ctx: ServiceContext, input: CreateExpenseInp
   // Validate line GL accounts belong to the company and are not the payment account.
   const lineAccountIds = [...new Set(input.lines.map((l) => l.accountId))];
   const acctRows = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, lineAccountIds)));
+  const acctById = new Map(acctRows.map((a) => [a.id, a]));
   const ownedAccountIds = new Set(acctRows.map((a) => a.id));
   for (const id of lineAccountIds) {
     if (!ownedAccountIds.has(id)) throw notFound(`Account ${id}`);
@@ -218,11 +217,23 @@ export async function createExpense(ctx: ServiceContext, input: CreateExpenseInp
     // GL lines. Charge: Dr expense lines / Cr payment. Credit: Dr payment / Cr expense lines.
     const glLines: PostingLine[] = input.lines.map((l) => {
       const abs = toAmountString(Money.round2(l.amount).abs());
+      // QB: a check line on A/R (e.g. refunding a customer) carries that customer's name, and a
+      // line on A/P carries the payee vendor, so A/R / A/P aging sees it (posting.ts guard).
+      const acct = acctById.get(l.accountId);
+      const isAr = acct?.type === 'asset' && acct.subtype === 'accounts_receivable';
+      const isAp = acct?.type === 'liability' && acct.subtype === 'accounts_payable';
+      const name =
+        isAr && l.customerId
+          ? { entityType: 'customer' as const, entityId: l.customerId }
+          : isAp && input.vendorId
+            ? { entityType: 'vendor' as const, entityId: input.vendorId }
+            : {};
       return {
         accountId: l.accountId,
         ...(isRefund ? { credit: abs } : { debit: abs }),
         memo: l.description?.trim() || null,
         classId: l.classId ?? null,
+        ...name,
       };
     });
     glLines.push({

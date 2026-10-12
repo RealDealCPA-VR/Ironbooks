@@ -3,7 +3,7 @@
  * (lib/services/invoices.ts) and BillableSelection (lib/services/billables.ts).
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zLines, zMoney, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLines, zMoney, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
 
 export const invoiceLineSchema = z.object({
@@ -65,6 +65,9 @@ export const createInvoiceBodySchema = z
   .object({
     ...invoiceCoreFields,
     status: z.enum(['draft', 'open']).nullish(),
+    /** Typed invoice number (alphanumeric, e.g. "INV-1001"); blank = next number. */
+    refNumber: zDocNumber,
+    allowDuplicateNumber: z.boolean().nullish(),
     lines: z.array(invoiceLineSchema, {
       required_error: 'lines are required',
       invalid_type_error: 'lines must be an array',

@@ -39,6 +39,7 @@
  * reverses the main GL entry AND every restock entry, removing the restocked
  * quantity from stock again.
  */
+import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -53,7 +54,7 @@ import {
   taxRates,
 } from '@/lib/db/schema';
 import { Money, allocate, toAmountString } from '@/lib/money';
-import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
+import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
 import {
   type InventoryLineDetail,
@@ -69,6 +70,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { allocateDocNumber, docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -96,6 +98,13 @@ export interface CreditMemoLineInput extends InventoryLineDetail {
 }
 
 export interface CreateCreditMemoInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   customerId: string;
   date: Date;
   lines: CreditMemoLineInput[];
@@ -123,15 +132,6 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
-}
-
-/** Return the next memo number for the company (max + 1, 1 if none). */
-async function nextMemoNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${creditMemos.memoNumber}), 0)` })
-    .from(creditMemos)
-    .where(eq(creditMemos.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
 }
 
 /**
@@ -286,6 +286,14 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
       const itemIncomeId = itemMap.get(l.itemId)?.incomeAccountId ?? null;
       if (itemIncomeId) resolvedAccountId = itemIncomeId;
     }
+    // A/R and A/P are never a line account (QB invariant I11).
+    {
+      const [lineAcct] = await ctx.db
+        .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+        .from(accounts)
+        .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, resolvedAccountId)));
+      if (lineAcct) assertNotControlLineAccount(lineAcct, `Line ${i + 1}`);
+    }
 
     const taxable = l.taxable !== false; // default true
     subtotal = subtotal.plus(amount);
@@ -311,7 +319,11 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
   }
 
   return inTransaction(ctx, async (tx) => {
-    const memoNumber = await nextMemoNumber(tx);
+    const { refNumber, number: memoNumber } = await allocateDocNumber(tx, 'credit_memo', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
+    // The number shown on the GL: the typed ref number, else the legacy integer.
+    const shownNumber = docRef(refNumber, memoNumber);
 
     // 1) Insert credit memo header
     const [memo] = await tx.db
@@ -320,6 +332,7 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         companyId: tx.companyId,
         customerId: input.customerId,
         memoNumber,
+        refNumber,
         date: input.date,
         status: 'open',
         subtotal: toAmountString(subtotal),
@@ -373,21 +386,21 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
       debitSpecs.push({
         accountId: acctId,
         weight: amount,
-        memo: `Credit Memo #${memoNumber} — income reversal`,
+        memo: `Credit Memo #${shownNumber} — income reversal`,
       });
     }
     if (taxAmount.greaterThan(0) && taxPayableId) {
       debitSpecs.push({
         accountId: taxPayableId,
         weight: taxAmount,
-        memo: `Credit Memo #${memoNumber} — sales tax reversal`,
+        memo: `Credit Memo #${shownNumber} — sales tax reversal`,
       });
     }
     const creditSpecs: Array<{
       accountId: string;
       weight: ReturnType<typeof Money.zero>;
       memo: string;
-    }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${memoNumber}` }];
+    }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${shownNumber}` }];
 
     const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
     const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
@@ -397,6 +410,7 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
       debit?: string;
       credit?: string;
       memo?: string;
+      controlLine?: boolean;
     }> = [];
     debitSpecs.forEach((s, i) => {
       if (debitAlloc[i].greaterThan(0)) {
@@ -405,14 +419,20 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
     });
     creditSpecs.forEach((s, i) => {
       if (creditAlloc[i].greaterThan(0)) {
-        postingLines.push({ accountId: s.accountId, credit: toAmountString(creditAlloc[i]), memo: s.memo });
+        // The only credit spec is the memo's own A/R line (posting.ts PostingLine.controlLine).
+        postingLines.push({
+          accountId: s.accountId,
+          credit: toAmountString(creditAlloc[i]),
+          memo: s.memo,
+          controlLine: true,
+        });
       }
     });
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: `Credit Memo #${memoNumber}`,
-      reference: String(memoNumber),
+      description: `Credit Memo #${shownNumber}`,
+      reference: shownNumber,
       sourceRef: `credit_memo:${memo.id}`,
       lines: postingLines,
     });
@@ -445,19 +465,19 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         const cogsAccountId = await accountIdByCode(tx, '5000');
         const restockEntry = await postJournalEntry(tx, {
           date: input.date,
-          description: `Credit Memo #${memoNumber} — COGS reversal (${meta.name})`,
+          description: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
           reference: line.id,
           sourceRef: `creditmemo-cogs:${memo.id}`,
           lines: [
             {
               accountId: inventoryAccountId,
               debit: toAmountString(cost),
-              memo: `Credit Memo #${memoNumber} — restock (${meta.name})`,
+              memo: `Credit Memo #${shownNumber} — restock (${meta.name})`,
             },
             {
               accountId: cogsAccountId,
               credit: toAmountString(cost),
-              memo: `Credit Memo #${memoNumber} — COGS reversal (${meta.name})`,
+              memo: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
             },
           ],
         });
@@ -506,7 +526,7 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         };
       }),
       movingLineOrders: computedLines.filter((cl) => cl.restock).map((cl) => cl.lineOrder),
-      memo: `Credit Memo #${memoNumber}`,
+      memo: `Credit Memo #${shownNumber}`,
     });
 
     // 5) Stamp postedEntryId
@@ -618,6 +638,9 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
   if (invoice.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot apply credit to a voided invoice.');
   }
+  if (invoice.status === 'draft') {
+    throw new ServiceError('CONFLICT', 'Cannot apply credit to a pending (draft) invoice — post it first.');
+  }
   if (invoice.customerId !== memo.customerId) {
     throw new ServiceError(
       'VALIDATION',
@@ -720,11 +743,8 @@ export async function refundCreditMemo(ctx: ServiceContext, input: RefundCreditM
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
-  if (
-    bankAcct.type !== 'asset' ||
-    bankAcct.subtype === 'accounts_receivable' ||
-    bankAcct.subtype === 'inventory'
-  ) {
+  // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
+  if (!isDepositTargetAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
   }
 
@@ -735,19 +755,20 @@ export async function refundCreditMemo(ctx: ServiceContext, input: RefundCreditM
     // 1. Post the refund check.
     const entry = await postJournalEntry(tx, {
       date: refundDate,
-      description: input.memo ?? `Refund — Credit Memo #${memo.memoNumber}`,
-      reference: String(memo.memoNumber),
+      description: input.memo ?? `Refund — Credit Memo #${docRef(memo.refNumber, memo.memoNumber)}`,
+      reference: docRef(memo.refNumber, memo.memoNumber),
       sourceRef: `refund:${input.creditMemoId}`,
       lines: [
         {
           accountId: arAccountId,
           debit: toAmountString(amount),
-          memo: `Credit Memo #${memo.memoNumber} refunded`,
+          memo: `Credit Memo #${docRef(memo.refNumber, memo.memoNumber)} refunded`,
+          controlLine: true,
         },
         {
           accountId: input.bankAccountId,
           credit: toAmountString(amount),
-          memo: `Refund check — Credit Memo #${memo.memoNumber}`,
+          memo: `Refund check — Credit Memo #${docRef(memo.refNumber, memo.memoNumber)}`,
         },
       ],
     });

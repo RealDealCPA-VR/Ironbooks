@@ -49,6 +49,7 @@ describe('Accounting engine (end-to-end)', () => {
   it('rejects an unbalanced entry', async () => {
     await expect(
       postJournalEntry(ctx, {
+        allowUnnamedControl: true, // fixture posts straight to A/R or A/P
         date: new Date('2025-01-01'),
         description: 'bad',
         lines: [
@@ -62,6 +63,7 @@ describe('Accounting engine (end-to-end)', () => {
   it('rejects a line with both debit and credit', async () => {
     await expect(
       postJournalEntry(ctx, {
+        allowUnnamedControl: true, // fixture posts straight to A/R or A/P
         date: new Date('2025-01-01'),
         description: 'bad2',
         lines: [
@@ -75,6 +77,7 @@ describe('Accounting engine (end-to-end)', () => {
   it('posts owner investment, a sale, and rent — balances reconcile', async () => {
     // Owner invests $10,000 cash
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-01-01'),
       description: 'Owner investment',
       lines: [
@@ -84,6 +87,7 @@ describe('Accounting engine (end-to-end)', () => {
     });
     // Sale of $2,500 on account (AR)
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-01-05'),
       description: 'Invoice #1',
       lines: [
@@ -93,6 +97,7 @@ describe('Accounting engine (end-to-end)', () => {
     });
     // Pay rent $1,200 cash
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-01-10'),
       description: 'January rent',
       lines: [
@@ -131,6 +136,7 @@ describe('Accounting engine (end-to-end)', () => {
 
   it('voiding an entry reverses balances', async () => {
     const entry = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-02-01'),
       description: 'To be voided',
       lines: [

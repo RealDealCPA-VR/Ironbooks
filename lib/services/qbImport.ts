@@ -57,9 +57,11 @@ const IIF_TYPE_MAP: Record<string, { type: string; subtype: string }> = {
   INVENTORY: { type: 'asset', subtype: 'inventory' },
   'FIXED ASSET': { type: 'asset', subtype: 'fixed_assets' },
   FIXEDASSET: { type: 'asset', subtype: 'fixed_assets' },
-  OTHERASSET: { type: 'asset', subtype: 'fixed_assets' },
-  'OTHER ASSET': { type: 'asset', subtype: 'fixed_assets' },
-  OCASSET: { type: 'asset', subtype: 'checking' },
+  OTHERASSET: { type: 'asset', subtype: 'other_asset' },
+  OASSET: { type: 'asset', subtype: 'other_asset' },
+  'OTHER ASSET': { type: 'asset', subtype: 'other_asset' },
+  OCASSET: { type: 'asset', subtype: 'other_current_asset' },
+  'OTHER CURRENT ASSET': { type: 'asset', subtype: 'other_current_asset' },
 
   // Liabilities
   'ACCOUNTS PAYABLE': { type: 'liability', subtype: 'accounts_payable' },
@@ -68,9 +70,11 @@ const IIF_TYPE_MAP: Record<string, { type: string; subtype: string }> = {
   'CREDIT CARD': { type: 'liability', subtype: 'credit_card' },
   CREDITCARD: { type: 'liability', subtype: 'credit_card' },
   LTLIABILITY: { type: 'liability', subtype: 'long_term_liability' },
+  LTLIAB: { type: 'liability', subtype: 'long_term_liability' },
   'LONG TERM LIABILITY': { type: 'liability', subtype: 'long_term_liability' },
-  OCLIABILITY: { type: 'liability', subtype: 'accounts_payable' },
-  'OTHER CURRENT LIABILITY': { type: 'liability', subtype: 'accounts_payable' },
+  OCLIABILITY: { type: 'liability', subtype: 'other_current_liability' },
+  OCLIAB: { type: 'liability', subtype: 'other_current_liability' },
+  'OTHER CURRENT LIABILITY': { type: 'liability', subtype: 'other_current_liability' },
 
   // Equity
   EQUITY: { type: 'equity', subtype: 'owners_equity' },
@@ -80,19 +84,31 @@ const IIF_TYPE_MAP: Record<string, { type: string; subtype: string }> = {
   INCOME: { type: 'revenue', subtype: 'sales' },
   'OTHER INCOME': { type: 'revenue', subtype: 'other_income' },
   OTHERINCOME: { type: 'revenue', subtype: 'other_income' },
+  EXINC: { type: 'revenue', subtype: 'other_income' },
 
   // Expenses
   EXPENSE: { type: 'expense', subtype: 'operating_expenses' },
   'COST OF GOODS SOLD': { type: 'expense', subtype: 'cost_of_goods_sold' },
   COGS: { type: 'expense', subtype: 'cost_of_goods_sold' },
-  'OTHER EXPENSE': { type: 'expense', subtype: 'operating_expenses' },
-  OTHEREXPENSE: { type: 'expense', subtype: 'operating_expenses' },
+  'OTHER EXPENSE': { type: 'expense', subtype: 'other_expense' },
+  OTHEREXPENSE: { type: 'expense', subtype: 'other_expense' },
+  EXEXP: { type: 'expense', subtype: 'other_expense' },
+
+  // Non-posting (estimates, purchase orders) — never carries amounts
+  NONPOSTING: { type: 'asset', subtype: 'non_posting' },
+  'NON-POSTING': { type: 'asset', subtype: 'non_posting' },
   PAYROLL: { type: 'expense', subtype: 'payroll' },
 };
 
-function mapIifType(iifType: string): { type: string; subtype: string } {
+function mapIifType(iifType: string, name?: string): { type: string; subtype: string } {
   const key = iifType.trim().toUpperCase();
-  return IIF_TYPE_MAP[key] ?? { type: 'expense', subtype: 'operating_expenses' };
+  const mapped = IIF_TYPE_MAP[key] ?? { type: 'expense', subtype: 'operating_expenses' };
+  // QB keeps Undeposited Funds as an Other Current Asset, but it holds cash waiting to be
+  // deposited — same special case as qbGlParse.toBookkeeperType.
+  if (mapped.subtype === 'other_current_asset' && name && /undeposited/i.test(name)) {
+    return { type: 'asset', subtype: 'undeposited_funds' };
+  }
+  return mapped;
 }
 
 // ---------------------------------------------------------------------------
@@ -555,7 +571,7 @@ export async function importIIF(
 
   // ---- Accounts ----
   for (const acc of parsed.accounts) {
-    const { type, subtype } = mapIifType(acc.accntType);
+    const { type, subtype } = mapIifType(acc.accntType, acc.name);
     await importAccountRow(ctx, counts, {
       name: acc.name,
       code: acc.accnum,

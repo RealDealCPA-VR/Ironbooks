@@ -35,6 +35,8 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { notFound, validation, writeAudit, type ServiceContext } from './_base';
 import { taxIdFor } from './access';
+import { journalOpenItems } from './journal';
+import { docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Customer Statement
@@ -42,8 +44,11 @@ import { taxIdFor } from './access';
 
 export interface StatementLine {
   date: string;
-  type: 'invoice' | 'payment' | 'credit_memo';
-  /** Invoice number (invoices), payment reference (payments), or memo number (credit memos). */
+  type: 'invoice' | 'payment' | 'credit_memo' | 'general_journal';
+  /**
+   * Invoice number (invoices), payment reference (payments), memo number (credit memos), or
+   * "GJ #<entry>" for a named General Journal line on A/R (amount signed: + charge, − credit).
+   */
   ref: string | null;
   /** Positive for invoices (charges); positive for payments/credit memos (credits). */
   amount: string;
@@ -90,10 +95,11 @@ export async function customerStatement(
   let openingBalance = Money.zero();
 
   if (range?.from) {
-    // Invoices before range start (non-void)
+    // Invoices before range start (posted, non-void). Only the billed base hits A/R —
+    // retainage held back sits in Retainage Receivable (an Other Current Asset).
     const [priorInvoiceRow] = await ctx.db
       .select({
-        total: sql<string>`COALESCE(SUM(CAST(${invoices.total} AS NUMERIC)), 0)`,
+        total: sql<string>`COALESCE(SUM(CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC)), 0)`,
       })
       .from(invoices)
       .where(
@@ -101,6 +107,7 @@ export async function customerStatement(
           eq(invoices.companyId, ctx.companyId),
           eq(invoices.customerId, customerId),
           ne(invoices.status, 'void'),
+          ne(invoices.status, 'draft'),
           lt(invoices.date, range.from),
         ),
       );
@@ -141,11 +148,25 @@ export async function customerStatement(
     openingBalance = priorInvoices.minus(priorPayments).minus(priorCreditMemos);
   }
 
+  // Named General Journal lines on A/R for this customer (QB shows them as "General Journal").
+  const journalItems = await journalOpenItems(ctx, 'ar', { entityId: customerId });
+  const toExclusive = range?.to ? new Date(range.to.getTime() + 86_400_000) : null;
+  const journalInRange = journalItems.filter(
+    (j) => (!range?.from || j.date >= range.from) && (!toExclusive || j.date < toExclusive),
+  );
+  if (range?.from) {
+    for (const j of journalItems) {
+      if (j.date < range.from) openingBalance = openingBalance.plus(Money.of(j.amount));
+    }
+  }
+
   // --- In-range invoices ---
   const invoiceConds = [
     eq(invoices.companyId, ctx.companyId),
     eq(invoices.customerId, customerId),
     ne(invoices.status, 'void'),
+    // Drafts (pending invoices) post nothing to A/R — QB leaves them off statements.
+    ne(invoices.status, 'draft'),
   ];
   if (range?.from) invoiceConds.push(gte(invoices.date, range.from));
   if (range?.to) invoiceConds.push(lt(invoices.date, new Date(range.to.getTime() + 86_400_000)));
@@ -154,7 +175,9 @@ export async function customerStatement(
     .select({
       date: invoices.date,
       invoiceNumber: invoices.invoiceNumber,
-      total: invoices.total,
+      refNumber: invoices.refNumber,
+      // Billed base (total minus retainage) — the amount actually charged to A/R.
+      total: sql<string>`CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC)`,
     })
     .from(invoices)
     .where(and(...invoiceConds));
@@ -194,6 +217,7 @@ export async function customerStatement(
     .select({
       date: creditMemos.date,
       memoNumber: creditMemos.memoNumber,
+      refNumber: creditMemos.refNumber,
       total: creditMemos.total,
     })
     .from(creditMemos)
@@ -203,13 +227,14 @@ export async function customerStatement(
   type RawLine =
     | { kind: 'invoice'; date: Date; ref: string; amount: string }
     | { kind: 'payment'; date: Date; ref: string | null; amount: string }
-    | { kind: 'credit_memo'; date: Date; ref: string; amount: string };
+    | { kind: 'credit_memo'; date: Date; ref: string; amount: string }
+    | { kind: 'general_journal'; date: Date; ref: string; amount: string };
 
   const raw: RawLine[] = [
     ...invoiceRows.map((r) => ({
       kind: 'invoice' as const,
       date: r.date,
-      ref: String(r.invoiceNumber),
+      ref: docRef(r.refNumber, r.invoiceNumber),
       amount: r.total,
     })),
     ...paymentRows.map((r) => ({
@@ -221,8 +246,14 @@ export async function customerStatement(
     ...creditMemoRows.map((r) => ({
       kind: 'credit_memo' as const,
       date: r.date,
-      ref: String(r.memoNumber),
+      ref: docRef(r.refNumber, r.memoNumber),
       amount: r.total,
+    })),
+    ...journalInRange.map((j) => ({
+      kind: 'general_journal' as const,
+      date: j.date,
+      ref: `GJ #${j.entryNumber}`,
+      amount: j.amount,
     })),
   ];
 
@@ -231,7 +262,8 @@ export async function customerStatement(
   // --- Compute running balance ---
   let running = openingBalance;
   const lines: StatementLine[] = raw.map((r) => {
-    if (r.kind === 'invoice') {
+    if (r.kind === 'invoice' || r.kind === 'general_journal') {
+      // General Journal amounts are already signed (+ charge, − credit).
       running = running.plus(Money.of(r.amount));
     } else {
       // Payments and credit memos both reduce what the customer owes.
@@ -272,6 +304,8 @@ export interface OpenItemLine {
   /** ISO invoice date (YYYY-MM-DD). */
   date: string;
   invoiceNumber: number;
+  /** The number the user sees (typed ref number, else the legacy integer). */
+  refNumber: string;
   /** ISO due date; falls back to the invoice date when no due date was set. */
   dueDate: string;
   total: string;
@@ -343,6 +377,7 @@ export async function openItemStatement(
       date: invoices.date,
       dueDate: invoices.dueDate,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       total: invoices.total,
       amountPaid: invoices.amountPaid,
       balanceDue: invoices.balanceDue,
@@ -379,6 +414,7 @@ export async function openItemStatement(
       invoiceId: r.id,
       date: r.date.toISOString().slice(0, 10),
       invoiceNumber: r.invoiceNumber,
+      refNumber: docRef(r.refNumber, r.invoiceNumber),
       dueDate: effDue.toISOString().slice(0, 10),
       total: toAmountString(r.total),
       amountPaid: toAmountString(r.amountPaid),

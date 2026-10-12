@@ -17,6 +17,7 @@
  * (in transaction currency, via invoices.markPaidAmount).
  * The returned paymentsReceived row's `postedEntryId` links back to the journal entry.
  */
+import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { and, eq, inArray } from 'drizzle-orm';
 import {
   accounts,
@@ -35,7 +36,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { markPaidAmount } from './invoices';
 
 // ---- Types ------------------------------------------------------------------
@@ -195,6 +196,10 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
     if (inv.status === 'void') {
       throw validation(`Invoice ${app.invoiceId} is voided and cannot receive payments.`);
     }
+    if (inv.status === 'draft') {
+      // A pending invoice posted nothing to A/R; paying it would credit A/R with no matching charge.
+      throw validation(`Invoice ${app.invoiceId} is pending (draft) — post it before receiving payment.`);
+    }
     // The balanceDue comparison below is in TRANSACTION currency, so the invoice's
     // currency must match the payment's currency.
     if ((inv.currency ?? null) !== paymentCurrency) {
@@ -217,10 +222,11 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
 
   // Confirm the deposit account is actually in this company.
   const [depAcct] = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.id, depositAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!depAcct) throw notFound('Deposit account');
+  assertNotControlAccount(depAcct, 'Deposit to');
 
   const arAccountId = await getArAccountId(ctx);
   const amountStr = toAmountString(totalAmount);
@@ -250,9 +256,15 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
   // --- Everything below runs atomically ---
   return inTransaction(ctx, async (tx) => {
     // 1. Post the GL entry: Dr deposit account / Cr A/R (+ FX gain/loss plug)
-    const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [
+    const postingLines: Array<{
+      accountId: string;
+      debit?: string;
+      credit?: string;
+      memo?: string;
+      controlLine?: boolean;
+    }> = [
       { accountId: depositAccountId, debit: toAmountString(cashBase), memo: 'Payment received' },
-      { accountId: arAccountId, credit: toAmountString(arBase), memo: 'A/R reduction' },
+      { accountId: arAccountId, credit: toAmountString(arBase), memo: 'A/R reduction', controlLine: true },
     ];
     if (fxAccountId && fxDiff.greaterThan(0)) {
       postingLines.push({
@@ -409,10 +421,10 @@ async function postFxAdjustmentForApplication(
     delta.greaterThan(0)
       ? [
           { accountId: fxAccountId, debit: toAmountString(delta), memo: 'Realized exchange loss' },
-          { accountId: params.arAccountId, credit: toAmountString(delta), memo: 'A/R FX adjustment' },
+          { accountId: params.arAccountId, credit: toAmountString(delta), memo: 'A/R FX adjustment', controlLine: true },
         ]
       : [
-          { accountId: params.arAccountId, debit: toAmountString(Money.abs(delta)), memo: 'A/R FX adjustment' },
+          { accountId: params.arAccountId, debit: toAmountString(Money.abs(delta)), memo: 'A/R FX adjustment', controlLine: true },
           { accountId: fxAccountId, credit: toAmountString(Money.abs(delta)), memo: 'Realized exchange gain' },
         ];
   return postJournalEntry(tx, {
@@ -681,6 +693,10 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
     if (inv.status === 'void') {
       throw validation(`Invoice ${app.invoiceId} is voided and cannot receive payments.`);
     }
+    if (inv.status === 'draft') {
+      // A pending invoice posted nothing to A/R; paying it would credit A/R with no matching charge.
+      throw validation(`Invoice ${app.invoiceId} is pending (draft) — post it before receiving payment.`);
+    }
     if ((inv.currency ?? null) !== (payment.currency ?? null)) {
       throw validation(
         `Invoice ${app.invoiceId} currency (${inv.currency ?? 'base'}) does not match payment currency (${payment.currency ?? 'base'}).`,
@@ -811,11 +827,8 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
-  if (
-    bankAcct.type !== 'asset' ||
-    bankAcct.subtype === 'accounts_receivable' ||
-    bankAcct.subtype === 'inventory'
-  ) {
+  // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
+  if (!isDepositTargetAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
   }
 
@@ -834,6 +847,7 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
           accountId: arAccountId,
           debit: toAmountString(baseAmount),
           memo: 'Customer overpayment refunded',
+          controlLine: true,
         },
         {
           accountId: input.bankAccountId,

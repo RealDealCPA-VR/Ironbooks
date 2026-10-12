@@ -24,6 +24,7 @@ import {
 } from './_base';
 import { createInvoice } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { allocateDocNumber } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,6 +41,13 @@ export interface EstimateLineInput {
 }
 
 export interface CreateEstimateInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   customerId: string;
   date: Date;
   expirationDate?: Date | null;
@@ -70,14 +78,6 @@ export interface ProgressInvoiceInput {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-async function nextEstimateNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${estimates.estimateNumber}), 0)` })
-    .from(estimates)
-    .where(eq(estimates.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
-}
 
 // ---------------------------------------------------------------------------
 // createEstimate
@@ -158,7 +158,9 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
   const total = Money.round2(subtotal.plus(taxAmount));
 
   return inTransaction(ctx, async (tx) => {
-    const estimateNumber = await nextEstimateNumber(tx);
+    const { refNumber, number: estimateNumber } = await allocateDocNumber(tx, 'estimate', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     const [estimate] = await tx.db
       .insert(estimates)
@@ -166,6 +168,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         companyId: tx.companyId,
         customerId: input.customerId,
         estimateNumber,
+        refNumber,
         date: input.date,
         expirationDate: input.expirationDate ?? null,
         status: 'draft',
