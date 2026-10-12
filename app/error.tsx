@@ -2,11 +2,14 @@
 /**
  * Route-level error boundary (App Router). Catches render/data errors thrown by any
  * page or server component below the root layout and shows a friendly recovery UI
- * inside the AppShell instead of Next's unstyled default error screen.
+ * inside the AppShell instead of Next's unstyled default error screen. A damaged company file
+ * gets its own plain "restore a backup" screen (components/DamagedFileNotice.tsx).
  */
 import { useEffect } from 'react';
 import Link from 'next/link';
 import { AlertTriangle, RotateCcw } from 'lucide-react';
+import DamagedFileNotice from '@/components/DamagedFileNotice';
+import { isDamagedFileMessage } from '@/lib/client';
 
 export default function RouteError({
   error,
@@ -19,6 +22,10 @@ export default function RouteError({
     // Surface the real error in the console / main-process logs for debugging.
     console.error('[route-error]', error);
   }, [error]);
+
+  // Damaged company file: not a glitch to retry — the way out is restoring a backup. (Server
+  // pages are normally redirected to /damaged-file first; this covers anything that slips by.)
+  if (isDamagedFileMessage(error?.message)) return <DamagedFileNotice />;
 
   return (
     <main className="min-h-[60vh] flex items-center justify-center p-8 font-sans">

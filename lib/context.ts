@@ -10,7 +10,7 @@
 import { cookies, headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { and, eq } from 'drizzle-orm';
-import { getDb, type DB } from '@/lib/db';
+import { getDb, LedgerDamagedError, type DB } from '@/lib/db';
 import { ensureDevCompany, verifyClosingDatePassword } from '@/lib/services/company';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { resolveAccess, PERMISSION_DENIED_PREFIX } from '@/lib/services/access';
@@ -230,6 +230,9 @@ export async function getPageContext(nextPath: string): Promise<ServiceContext> 
   try {
     return await getServerContext();
   } catch (err) {
+    // Damaged company file (ledgerGuards checkLedgerHealth refused it on open): a plain
+    // "restore a backup" screen instead of the generic error page.
+    if (err instanceof LedgerDamagedError) redirect('/damaged-file');
     if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
       // Same message coupling as lib/client.ts isFileLockError — keep the three in sync.
       if (/company file is locked/i.test(err.message)) {

@@ -130,6 +130,22 @@ export function isAuthError(status: number, message: string): boolean {
 
 const AUTH_PAGES = ['/login', '/signup', '/unlock', '/reset-password'];
 
+/**
+ * True when a failed response means the company file is damaged and was refused on open
+ * (lib/db LedgerDamagedError, 409). Coupled to that message — keep them in sync.
+ */
+export function isDamagedFileError(status: number, message: string): boolean {
+  return status === 409 && isDamagedFileMessage(message);
+}
+
+/** True when an error message is the damaged-company-file refusal (app/error.tsx uses it too). */
+export function isDamagedFileMessage(message: string | null | undefined): boolean {
+  return typeof message === 'string' && /company file is damaged/i.test(message);
+}
+
+/** Pages that still work with a damaged file (restore / back it up), so no redirect from them. */
+const DAMAGED_FILE_PAGES = ['/damaged-file', '/backup', '/login', '/unlock'];
+
 async function handle<T>(res: Response): Promise<T> {
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
@@ -148,6 +164,14 @@ async function handle<T>(res: Response): Promise<T> {
       window.location.assign(
         '/unlock?next=' + encodeURIComponent(window.location.pathname + window.location.search),
       );
+    }
+    // Damaged company file: every data call is refused, so show the "restore a backup" screen.
+    else if (
+      isDamagedFileError(res.status, message) &&
+      typeof window !== 'undefined' &&
+      !DAMAGED_FILE_PAGES.includes(window.location.pathname)
+    ) {
+      window.location.assign('/damaged-file');
     }
     // Session not valid for this company file (e.g. after switching files): back to sign-in.
     else if (
