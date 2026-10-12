@@ -11,8 +11,9 @@
  * require the caller to be an active Admin of every company in the file (requireFileAdmin).
  *
  * NOTE (POST): restoreBackup validates the archive, closes the live PGlite
- * handle, and atomically swaps the data directory. The next getDb() call
- * reopens the restored data — no process restart is required.
+ * handle, swaps the data directory, then re-installs the ledger guards and verifies the
+ * restored books; damaged books are refused (400, plain-language reason) and the original file
+ * is rolled back. No process restart is required.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -21,6 +22,7 @@ import { createBackup, restoreBackup } from '@/lib/services/backup';
 import { ServiceError } from '@/lib/services/_base';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { requireFileAdmin } from '@/lib/services/access';
+import { withDamagedFileAccess } from '@/lib/db';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -41,7 +43,18 @@ function errorResponse(err: unknown) {
 // GET — download backup
 // ---------------------------------------------------------------------------
 
-export async function GET(_req: NextRequest) {
+// Both handlers run with damaged-file access: a company file whose ledger is damaged is refused
+// everywhere else (lib/db/index.ts), but it must still be possible to back it up for support and
+// to replace it by restoring a good backup.
+export async function GET(req: NextRequest) {
+  return withDamagedFileAccess(() => handleGet(req));
+}
+
+export async function POST(req: NextRequest) {
+  return withDamagedFileAccess(() => handlePost(req));
+}
+
+async function handleGet(_req: NextRequest) {
   try {
     // Auth: fail closed BEFORE producing any backup bytes. A FORBIDDEN throw
     // here propagates to errorResponse() and returns 403.
@@ -83,7 +96,7 @@ export async function GET(_req: NextRequest) {
 // POST — restore backup
 // ---------------------------------------------------------------------------
 
-export async function POST(req: NextRequest) {
+async function handlePost(req: NextRequest) {
   try {
     // Auth: restore is destructive — fail closed before even reading the body. Restore replaces
     // every company in the file: Admin of every company, plus single-user mode while anyone
@@ -98,8 +111,8 @@ export async function POST(req: NextRequest) {
     }
 
     const buffer = Buffer.from(arrayBuffer);
-    // Validates the archive, closes the live DB handle, and swaps the data dir
-    // atomically; the next getDb() reopens the restored data.
+    // Validates the archive, closes the live DB handle, swaps the data dir, re-installs the
+    // ledger guards and verifies the books (rolls back and throws VALIDATION if damaged).
     const result = await restoreBackup(buffer);
 
     return NextResponse.json(result, { status: 200 });

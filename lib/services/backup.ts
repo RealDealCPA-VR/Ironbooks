@@ -12,7 +12,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { eq, getTableColumns } from 'drizzle-orm';
-import { resolveDataDir, closeDb, type DB } from '@/lib/db';
+import {
+  resolveDataDir,
+  closeDb,
+  getDb,
+  openDb,
+  withDamagedFileAccess,
+  MIGRATIONS_FOLDER,
+  type DB,
+} from '@/lib/db';
+import { checkLedgerHealth } from '@/lib/db/ledgerGuards';
+import { booksInBalance } from './integrity';
 import {
   accounts, assemblyComponents, attachments, auditLogs, bankAccounts, bankTransactions,
   billLines, billPaymentApplications, billPayments, bills, budgetLines, budgets, classes,
@@ -286,6 +296,36 @@ function validateBackupZip(buffer: Buffer): AdmZip {
 }
 
 /**
+ * Verify a just-restored company file (QB Verify Data, run before the file goes live):
+ *  - every ledger guard re-installed and ENABLE ALWAYS (getDb re-asserts them on open);
+ *  - every posted entry balanced and well-formed, no line on another company's or a
+ *    non-posting account, every cached account balance equal to the ledger;
+ *  - per company: trial balance, accrual and cash-basis balance sheets balance (booksInBalance).
+ * Returns plain-language problems (empty = the books are sound).
+ */
+export async function verifyRestoredBooks(dir: string): Promise<string[]> {
+  const db = await withDamagedFileAccess(() => getDb(dir));
+  const health = await checkLedgerHealth(openDb(dir).client, MIGRATIONS_FOLDER);
+  const problems = health.problems.map((p) => p.detail);
+  if (problems.length) return problems;
+
+  const rows = await db.select({ id: companies.id, name: companies.name }).from(companies);
+  for (const company of rows) {
+    const status = await booksInBalance({ db, companyId: company.id, userId: null });
+    if (status.inBalance) continue;
+    const failed = [
+      !status.trialBalance.ok && `trial balance (${status.trialBalance.detail})`,
+      !status.balanceSheet.ok && `balance sheet (${status.balanceSheet.detail})`,
+      !status.cashBasisBalanceSheet.ok && `cash-basis balance sheet (${status.cashBasisBalanceSheet.detail})`,
+      !status.accountBalances.ok && `account balances (${status.accountBalances.detail})`,
+      !status.guards.ok && `ledger safety checks (${status.guards.detail})`,
+    ].filter(Boolean);
+    problems.push(`In "${company.name}" these do not balance: ${failed.join('; ')}.`);
+  }
+  return problems;
+}
+
+/**
  * Restore a .bka backup into the target data directory.
  *
  * Safety properties:
@@ -298,8 +338,13 @@ function validateBackupZip(buffer: Buffer): AdmZip {
  *     into place, and on failure the original dir is rolled back. No stale files (e.g. old
  *     pg_wal segments) survive into the restored dir.
  *
- * After this resolves, the next getDb()/openDb() call reopens the directory and sees the
- * restored data — no process restart is required.
+ *  5. Before the restored file goes live it is opened, its ledger guards are re-installed
+ *     (ENABLE ALWAYS) and its books are verified (verifyRestoredBooks). A file with damaged
+ *     books — e.g. guards turned off offline and an entry altered — is refused with a
+ *     VALIDATION error and the original directory is rolled back untouched.
+ *
+ * After this resolves, the restored file has been verified and closed; the next getDb() reopens
+ * it — no process restart is required.
  *
  * @param buffer     The raw bytes of a .bka backup file.
  * @param targetDir  Optional path override; defaults to resolveDataDir().
@@ -349,6 +394,12 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
       preRestoreDir = `${dir}.pre-restore-${Date.now()}`;
       fs.renameSync(dir, preRestoreDir);
     }
+    const rollBack = async () => {
+      await closeDb(dir).catch(() => undefined);
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (preRestoreDir) fs.renameSync(preRestoreDir, dir);
+      resetTransactionLogCache(dir);
+    };
     try {
       fs.renameSync(tmpDir, dir);
     } catch (err) {
@@ -358,6 +409,36 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
     }
     // The running transaction log came back with the restored files — drop cached chain state.
     resetTransactionLogCache(dir);
+
+    // (5) Open the restored file, re-install the ledger guards, and verify the books. A file
+    // whose guards were turned off and whose books do not balance must never become the live
+    // company file: on any problem the original file is put back untouched.
+    let problems: string[];
+    try {
+      problems = await verifyRestoredBooks(dir);
+    } catch (err) {
+      console.error('[backup] restored company file could not be opened:', err);
+      await rollBack();
+      throw new ServiceError(
+        'VALIDATION',
+        'This backup was not restored because the company file inside it could not be opened. ' +
+          'Your current company file has not been changed. Try an earlier backup.',
+      );
+    }
+    if (problems.length) {
+      await rollBack();
+      throw new ServiceError(
+        'VALIDATION',
+        `This backup was not restored because the books in it are damaged: ${problems.join(' ')} ` +
+          'Your current company file has not been changed. Try an earlier backup.',
+        { problems },
+      );
+    }
+
+    // Release the verification handle: callers (and the next request) reopen the file with
+    // getDb(), which re-asserts the guards again on open.
+    await closeDb(dir);
+
     if (preRestoreDir) {
       // Best-effort cleanup of the safety copy; a leftover dir is harmless.
       try {

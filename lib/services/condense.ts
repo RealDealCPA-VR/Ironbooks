@@ -701,7 +701,9 @@ export function listCondenseArchives(dataDir?: string): Array<CondenseArchive & 
  * Restore a recorded archive copy over the current company file, bringing back the full
  * pre-condense detail. Only archives recorded in the index can be restored (never an
  * arbitrary path). restoreBackup snapshots the current file first (pre-op backup), so the
- * post-condense state stays recoverable too.
+ * post-condense state stays recoverable too, and verifies the restored books before they go
+ * live: an archive copy whose ledger guards were turned off or whose books do not balance is
+ * refused (VALIDATION) and the current file is kept.
  */
 export async function restoreCondenseArchive(
   ctx: ServiceContext,

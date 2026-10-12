@@ -365,7 +365,7 @@ async function checkLedgerGuards(ctx: ServiceContext): Promise<IntegrityCheck> {
   return {
     name,
     ok: false,
-    detail: `${missing.length} database guard${missing.length === 1 ? ' is' : 's are'} missing or disabled: ${missing.join(', ')}. Reopen the company file to re-run migrations.`,
+    detail: `${missing.length} database guard${missing.length === 1 ? ' is' : 's are'} missing or disabled: ${missing.join(', ')}. Close and reopen the company file: BookKeeper re-installs every ledger guard when a file is opened.`,
   };
 }
 
