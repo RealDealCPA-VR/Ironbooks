@@ -282,7 +282,7 @@ export async function paySalesTaxAgencies(
       const memo = input.memo?.trim() || (r.vendor.accountNumber ? `Acct # ${r.vendor.accountNumber}` : null);
       const entry = await postJournalEntry(tx, {
         date: input.date,
-        description: `Sales Tax Payment — ${r.agency.name}`,
+        description: input.memo?.trim() || `Pay Sales Tax — ${r.agency.name}`,
         reference,
         sourceRef: `tax_agency:${r.agency.id}`,
         lines: [

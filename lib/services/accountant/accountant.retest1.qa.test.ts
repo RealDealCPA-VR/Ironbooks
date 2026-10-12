@@ -233,10 +233,12 @@ describe('wave2 accountant — re-test of fix round 1', () => {
 
     it('the historic liability-account scope never pulls in the bank a tax payment was drawn on', async () => {
       await paySalesTax(ctx, { agencyId: agency, amount: '2.50', paymentAccountId: acct['1000'], date: d('2026-10-05') });
-      await paySalesTax(ctx, { agencyId: agency, amount: '1.00', paymentAccountId: acct['2100'], date: d('2026-10-06') });
+      // p1: Pay Sales Tax writes a check, so it is drawn on a bank account (savings here); a credit
+      // card pay-from is refused (see p1Purchases.salesTax.test.ts).
+      await paySalesTax(ctx, { agencyId: agency, amount: '1.00', paymentAccountId: acct['1010'], date: d('2026-10-06') });
       const scope = (await salesTaxLiabilityAccounts(ctx)).map((a) => a.id);
       expect(scope).not.toContain(acct['1000']);
-      expect(scope).not.toContain(acct['2100']);
+      expect(scope).not.toContain(acct['1010']);
       const rep = await salesTaxLiabilityReport(ctx);
       expect(rep.tiesToGl).toBe(true);
       await expectBalanced(ctx);

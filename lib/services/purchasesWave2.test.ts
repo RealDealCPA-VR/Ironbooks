@@ -425,7 +425,7 @@ describe('wave2 purchases', () => {
   it('D4/D6: check settings, styles, print-on-check name and account number memo', async () => {
     expect((await getCheckPrintSettings(ctx)).style).toBe('voucher');
     const s = await saveCheckPrintSettings(ctx, { style: 'wallet', offsetX: '0.125', offsetY: '-0.25' });
-    expect(s).toEqual({ style: 'wallet', offsetX: '0.13', offsetY: '-0.25' });
+    expect(s).toEqual({ style: 'wallet', stock: 'preprinted', offsetX: '0.13', offsetY: '-0.25' });
     await expect(saveCheckPrintSettings(ctx, { style: 'wallet', offsetX: '2', offsetY: '0' })).rejects.toThrow(/at most/);
 
     const v = await createVendor(ctx, {
