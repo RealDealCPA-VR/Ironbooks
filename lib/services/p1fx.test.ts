@@ -33,7 +33,7 @@ import {
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { trialBalance, balanceSheet } from './reports';
-import { postJournalEntry } from './posting';
+import { postJournalEntry, allowLedgerRewrite } from './posting';
 import { upsertCurrency, setBaseCurrency, setAccountCurrency } from './currencies';
 import { createBankAccount } from './bankAccounts';
 import { categorize, suggestMatches, matchTransaction } from './bankCategorize';
@@ -232,6 +232,35 @@ describe('P1 FX — multi-currency completeness', () => {
     ).rejects.toThrow();
     const [after] = await db.select().from(journalEntryLines).where(eq(journalEntryLines.id, line.id));
     expect(after.foreignAmount).toBe('1000.00');
+  });
+
+  it('migration 0043 re-runs cleanly and back-fills foreign amounts of lines posted before it', async () => {
+    const vendor = await createVendor(ctx, { displayName: 'Old Data Vendor', currency: 'EUR' });
+    const chk = await createExpense(ctx, {
+      vendorId: vendor.id,
+      date: d('2026-01-03'),
+      method: 'check',
+      paymentAccountId: acct['1030'],
+      exchangeRate: '1.25',
+      lines: [{ accountId: acct['6300'], amount: '8.00' }],
+    } as never);
+    const [line] = (await linesOf(chk.postedEntryId!)).filter((l) => l.accountId === acct['1030']);
+    expect(line.foreignAmount).toBe('8.00');
+    // Simulate a line written before 0043 (no foreign columns), inside a sanctioned rewrite.
+    await db.transaction(async (tx) => {
+      await allowLedgerRewrite({ db: tx as unknown as DB }, 'restore');
+      await tx.update(journalEntryLines).set({ foreignAmount: null, currency: null, exchangeRate: null }).where(eq(journalEntryLines.id, line.id));
+    });
+    // Re-run the whole migration (idempotent): the back-fill restores 8.00 EUR from the check's rate.
+    const file = fs.readFileSync(path.resolve(process.cwd(), 'drizzle', '0043_p1_fx.sql'), 'utf8');
+    for (const stmt of file.split('--> statement-breakpoint')) {
+      if (stmt.replace(/--.*$/gm, '').trim()) await db.execute(sql.raw(stmt));
+    }
+    const [after] = await db.select().from(journalEntryLines).where(eq(journalEntryLines.id, line.id));
+    expect(after.foreignAmount).toBe('8.00');
+    expect(after.currency).toBe('EUR');
+    expect(Money.of(after.exchangeRate!).toFixed(2)).toBe('1.25');
+    await invariants();
   });
 
   it('bank feed on a EUR account: posts home value at the list / stated rate; matching compares EUR', async () => {
