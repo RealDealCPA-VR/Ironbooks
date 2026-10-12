@@ -87,6 +87,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/companies/select': kind('self', 'POST'),
   '/api/company': { GET: 'member', ...r('company', 'PATCH') },
   '/api/company/closing-date': r('closing', 'GET PATCH'),
+  // P1 setup: EasyStep interview (apply answers / skip) for the active company.
+  '/api/company/setup-interview': { GET: 'member', ...r('company', 'POST:modify') },
   // wave2 foundation: document numbering (next number for forms; starting numbers).
   '/api/doc-numbers': { GET: 'member', ...r('company', 'PUT') },
   '/api/custom-fields': r('lists', 'GET PATCH'),
