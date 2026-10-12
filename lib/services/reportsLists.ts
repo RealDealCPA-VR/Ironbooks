@@ -61,6 +61,7 @@ import {
 } from './reportEngine';
 import { rangeLabel } from './reportsStandard';
 import { docRef } from './docNumbers';
+import { foreignAmountsByEntry } from './fxSubledger';
 
 const amt = (v: Decimal) => toAmountString(v);
 
@@ -156,11 +157,25 @@ async function balanceDetail(ctx: ServiceContext, p: ReportParams, section: 'ar'
     idPrefix: `bd${section}`,
   });
   const customer = section === 'ar';
+  // p1 fx: QB shows foreign-currency transactions in both currencies — add the transaction's
+  // currency and its amount in that currency next to the home amount.
+  const columns = detailColumns(keys);
+  const fx = await foreignAmountsByEntry(ctx, lines.map((l) => l.entryId));
+  if (fx.size > 0) {
+    columns.splice(columns.length - 2, 0, { key: 'currency', header: 'Currency' }, { key: 'foreignAmount', header: 'Foreign Amount', type: 'money' });
+    for (const row of laid.rows) {
+      const f = row.entryId ? fx.get(row.entryId) : undefined;
+      if (!f || row.kind !== 'data') continue;
+      const home = Money.of(String(row.cells.amount ?? '0'));
+      row.cells.currency = f.currency;
+      row.cells.foreignAmount = amt(home.isNegative() ? f.amount.negated() : f.amount);
+    }
+  }
   return {
     key: customer ? 'customer-balance-detail' : 'vendor-balance-detail',
     title: customer ? 'Customer Balance Detail' : 'Vendor Balance Detail',
     subtitle: from ? rangeLabel(from, asOf) : `All transactions as of ${fmtDay(asOf)}`,
-    columns: detailColumns(keys),
+    columns,
     rows: laid.rows,
     truncated,
   };

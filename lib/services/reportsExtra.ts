@@ -37,6 +37,7 @@ import { journalCreditsAppliedAfter, journalOpenItems, resolveEntityNames } from
 import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
 import { vendorCreditHomeByBill } from './vendorCreditsFx';
+import { foreignInvoiceHomeOpen } from './fxSubledger';
 
 /**
  * Credit-memo refunds dated AFTER the cutoff, per memo id. creditMemos.unapplied is today's
@@ -311,6 +312,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       amountPaid: invoices.amountPaid,
       dueDate: invoices.dueDate,
       date: invoices.date,
+      currency: invoices.currency,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
@@ -348,6 +350,8 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     paymentAppliedByInvoice(),
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
+  // p1 fx: foreign invoices are aged at the HOME amount A/R still carries (ties to the account).
+  const foreignOpen = await foreignInvoiceHomeOpen(ctx, cutoff);
 
   // Accumulate per customer.
   const byCustomer = new Map<string, { name: string; buckets: BucketAccum }>();
@@ -366,8 +370,9 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    const amount = billedBase.minus(cashAsOf).minus(creditResidual);
+    let amount = billedBase.minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
+    if (row.currency && foreignOpen.has(row.invoiceId)) amount = foreignOpen.get(row.invoiceId)!.homeOpen;
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const daysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
@@ -957,6 +962,9 @@ export interface AgingDetailRow {
   bucket: BucketKey;
   /** Open balance as of the cutoff (negative for unapplied credits). */
   openBalance: string;
+  /** p1 fx: foreign-currency document — its currency and open balance in that currency. */
+  currency?: string | null;
+  foreignOpenBalance?: string | null;
 }
 
 export interface AgingDetailReport {
@@ -1016,6 +1024,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       amountPaid: invoices.amountPaid,
       dueDate: invoices.dueDate,
       date: invoices.date,
+      currency: invoices.currency,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
@@ -1051,6 +1060,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     paymentAppliedByInvoice(),
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
+  const foreignOpen = await foreignInvoiceHomeOpen(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
@@ -1063,12 +1073,16 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    const amount = billedBase.minus(cashAsOf).minus(creditResidual);
+    let amount = billedBase.minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
+    // p1 fx: home amount A/R carries, with the foreign open amount alongside.
+    const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    if (fo) amount = fo.homeOpen;
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
+      ...(fo ? { currency: fo.currency, foreignOpenBalance: toAmountString(fo.foreignOpen) } : {}),
       docId: row.invoiceId,
       docNumber: `Invoice #${docRef(row.refNumber, row.invoiceNumber)}`,
       docType: 'invoice',
@@ -1189,11 +1203,13 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     if (!amount.greaterThan(0)) continue;
     // J10 (wave2 purchases): age foreign bills at their HOME open balance so the report ties to
     // the A/P control account: round2(total x bill rate) minus the home A/P each payment relieved.
+    const foreignOpenBalance = row.currency ? toAmountString(amount) : null; // p1 fx
     if (row.currency) amount = billHomeOpen(row, homeAppliedAsOf.get(row.billId));
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
+      ...(row.currency ? { currency: row.currency, foreignOpenBalance } : {}),
       docId: row.billId,
       docNumber: row.billNumber ? `Bill ${row.billNumber}` : 'Bill',
       docType: 'bill',
