@@ -61,3 +61,32 @@ export function sumApplied(applied: Record<string, string>): string {
   }
   return toAmountString(total);
 }
+
+/**
+ * What cash still has to cover on each open document once discounts and credits already entered
+ * are taken off (QB lowers the payment due by the discount). Feed this to autoApplyPayment so an
+ * auto-applied payment never adds up, with the discount and credits, to more than the balance.
+ * Documents with nothing left for cash are dropped; blank / invalid deductions count as zero.
+ */
+export function cashDue<T extends OpenDoc>(docs: T[], deductions: Record<string, string | number | undefined>): T[] {
+  const out: T[] = [];
+  for (const d of docs) {
+    let bal = Money.of(0);
+    let less = Money.of(0);
+    try {
+      bal = Money.of(d.balanceDue);
+    } catch {
+      continue;
+    }
+    try {
+      const v = deductions[d.id];
+      const x = Money.of(v === undefined || v === '' ? 0 : v);
+      if (x.isFinite() && x.gt(0)) less = x;
+    } catch {
+      /* partial input */
+    }
+    const left = bal.minus(less);
+    if (left.gt(0)) out.push({ ...d, balanceDue: toAmountString(left) });
+  }
+  return out;
+}
