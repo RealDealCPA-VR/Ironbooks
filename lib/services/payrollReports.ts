@@ -28,6 +28,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { employeeWorkState, getEmployee, paycheckCountsCondition } from './payroll';
 import { FUTA_NET_RATE, FUTA_WAGE_BASE, ssWageBaseFor } from './payrollTax';
+import { lineTracking, paycheckWageBases, type TaxTracking } from './payrollTaxTracking';
 import { getCompany } from './company';
 
 // ---------------------------------------------------------------------------
@@ -35,16 +36,6 @@ import { getCompany } from './company';
 // (ssWageBaseFor); FUTA's $7,000 base and 0.6% net rate are not indexed.
 // ---------------------------------------------------------------------------
 
-/** Matches the FUTA employer-accrual line name emitted by runPaycheck. */
-const FUTA_NAME_RE = /futa|federal unemployment/i;
-/** Matches state unemployment (SUI/SUTA) employer lines, e.g. "State Unemployment (CA)". */
-const SUI_NAME_RE = /state unemployment|suta?|sui/i;
-/** State lines that are NOT state income tax withholding (SDI/SUI/workers comp). */
-const NOT_STATE_INCOME_RE = /unemploy|disab|sdi|sui|suta|workers/i;
-/** State income-tax withholding lines (e.g. "State Income Tax (CA)"), excluding SDI/SUI. */
-const STATE_TAX_RE = {
-  test: (name: string) => /state/i.test(name) && !NOT_STATE_INCOME_RE.test(name),
-};
 
 /** Pull the employer name/address/EIN out of companies.settings.
  * EIN and address live in settings (`settings.ein`, `settings.address`) because the
@@ -59,6 +50,124 @@ function companyProfile(company: {
     address: typeof s.address === 'string' && s.address.trim() ? s.address.trim() : null,
     ein: typeof s.ein === 'string' && s.ein.trim() ? s.ein.trim() : null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Shared: paycheck lines + per-check wage bases (tax tracking driven)
+// ---------------------------------------------------------------------------
+
+type ReportLine = {
+  paycheckId: string;
+  kind: string;
+  name: string;
+  amount: string;
+  taxTracking: string | null;
+};
+
+/** Every line of the given (already company-scoped) paychecks, grouped by paycheck. */
+async function linesByPaycheck(ctx: ServiceContext, ids: string[]): Promise<Map<string, ReportLine[]>> {
+  const out = new Map<string, ReportLine[]>();
+  if (ids.length === 0) return out;
+  const rows = await ctx.db
+    .select({
+      paycheckId: paycheckLines.paycheckId,
+      kind: paycheckLines.kind,
+      name: paycheckLines.name,
+      amount: paycheckLines.amount,
+      taxTracking: paycheckLines.taxTracking,
+    })
+    .from(paycheckLines)
+    .where(inArray(paycheckLines.paycheckId, ids));
+  for (const r of rows) {
+    const arr = out.get(r.paycheckId) ?? [];
+    arr.push(r);
+    out.set(r.paycheckId, arr);
+  }
+  return out;
+}
+
+/** Sum the lines whose tax tracking type (stamped, else inferred from the name) matches. */
+function sumTracking(lines: ReportLine[], tracking: TaxTracking | TaxTracking[]): Dec {
+  const set = new Set(Array.isArray(tracking) ? tracking : [tracking]);
+  return lines.reduce((s, l) => {
+    const t = lineTracking(l);
+    return t && set.has(t) ? s.plus(Money.of(l.amount)) : s;
+  }, Money.zero());
+}
+
+type Dec = ReturnType<typeof Money.zero>;
+
+interface EmployeeYearFigures {
+  gross: Dec;
+  /** W-2 Box 1: gross − 401(k)/403(b)/457(b)/SIMPLE deferrals − Section 125. */
+  incomeTaxWages: Dec;
+  /** Box 5 (uncapped Social Security / Medicare wages): gross − Section 125. */
+  ficaWages: Dec;
+  /** Section 125 amounts (Form 940 line 4 exempt payments). */
+  cafeteria: Dec;
+  federalWithheld: Dec;
+  socialSecurity: Dec;
+  medicare: Dec;
+  stateWithheld: Dec;
+  box10: Dec;
+  box12: Map<string, Dec>;
+  box14: Map<string, Dec>;
+  /** Employee lines that carry a state code "(XX)" for W-2 Box 15 fallback. */
+  stateLineNames: string[];
+}
+
+function emptyFigures(): EmployeeYearFigures {
+  return {
+    gross: Money.zero(),
+    incomeTaxWages: Money.zero(),
+    ficaWages: Money.zero(),
+    cafeteria: Money.zero(),
+    federalWithheld: Money.zero(),
+    socialSecurity: Money.zero(),
+    medicare: Money.zero(),
+    stateWithheld: Money.zero(),
+    box10: Money.zero(),
+    box12: new Map(),
+    box14: new Map(),
+    stateLineNames: [],
+  };
+}
+
+/** Fold one paycheck into an employee's running figures. */
+function addCheck(f: EmployeeYearFigures, grossPay: string, lines: ReportLine[]) {
+  const b = paycheckWageBases(grossPay, lines);
+  f.gross = f.gross.plus(b.gross);
+  f.incomeTaxWages = f.incomeTaxWages.plus(b.incomeTaxWages);
+  f.ficaWages = f.ficaWages.plus(b.ficaWages);
+  f.cafeteria = f.cafeteria.plus(b.cafeteria);
+  f.box10 = f.box10.plus(b.box10);
+  for (const [k, v] of b.box12) f.box12.set(k, (f.box12.get(k) ?? Money.zero()).plus(v));
+  for (const [k, v] of b.box14) f.box14.set(k, (f.box14.get(k) ?? Money.zero()).plus(v));
+  const taxLines = lines.filter((l) => l.kind === 'tax');
+  f.federalWithheld = f.federalWithheld.plus(sumTracking(taxLines, 'federal_withholding'));
+  f.socialSecurity = f.socialSecurity.plus(sumTracking(taxLines, 'social_security'));
+  f.medicare = f.medicare.plus(sumTracking(taxLines, 'medicare'));
+  f.stateWithheld = f.stateWithheld.plus(sumTracking(taxLines, 'state_withholding'));
+  for (const l of taxLines) if (lineTracking(l) === 'state_withholding') f.stateLineNames.push(l.name);
+}
+
+const BOX12_ORDER = ['D', 'E', 'G', 'S', 'W', 'DD'];
+function box12List(m: Map<string, Dec>): Array<{ code: string; amount: string }> {
+  return [...m.entries()]
+    .filter(([, v]) => v.greaterThan(0))
+    .sort((a, b) => BOX12_ORDER.indexOf(a[0]) - BOX12_ORDER.indexOf(b[0]))
+    .map(([code, v]) => ({ code, amount: toAmountString(v) }));
+}
+function box14List(m: Map<string, Dec>): Array<{ label: string; amount: string }> {
+  return [...m.entries()]
+    .filter(([, v]) => v.greaterThan(0))
+    .map(([label, v]) => ({ label, amount: toAmountString(v) }));
+}
+
+/** Min(a, b) for decimals, floored at zero. */
+function capAt(value: Dec, cap: Dec): Dec {
+  const v = value.greaterThan(cap) ? cap : value;
+  return v.isNegative() ? Money.zero() : v;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,27 +193,57 @@ export interface W2DataResult {
   company: { name: string; address: string | null; ein: string | null };
   employee: { firstName: string; lastName: string; ssn: string | null };
   year: number;
-  /** Box 1: total gross wages paid in the calendar year. */
+  /**
+   * Box 1: wages, tips, other compensation — gross pay less 401(k)/403(b)/457(b)/SIMPLE
+   * deferrals and Section 125 cafeteria deductions.
+   */
   wages: string;
   /** Box 2: total federal income tax withheld. */
   federalWithheld: string;
-  /** Box 3: Social Security wages — Box 1 capped at the SS wage base. */
+  /** Box 3: Social Security wages — gross less Section 125, capped at the year's SS wage base. */
   ssWages: string;
   /** Box 4: total Social Security tax withheld. */
   socialSecurity: string;
-  /** Box 5: Medicare wages (no cap). */
+  /** Box 5: Medicare wages — gross less Section 125 (no cap). */
   medicareWages: string;
   /** Box 6: total Medicare tax withheld. */
   medicare: string;
+  /** Box 10: dependent care benefits. */
+  dependentCare: string;
+  /** Box 12: coded amounts (D 401(k), E 403(b), G 457(b), S SIMPLE, AA/BB/EE Roth, W HSA, DD employer health). */
+  box12: Array<{ code: string; amount: string }>;
+  /** Box 14: other (informational), e.g. Section 125 cafeteria deductions. */
+  box14: Array<{ label: string; amount: string }>;
   /** Boxes 15-17: state wages + state income tax withheld. */
   state: W2StateBoxes;
 }
 
+/** Live paychecks (and YTD adjustments) of the company in [start, end), optionally one employee. */
+async function countedChecks(ctx: ServiceContext, start: Date, end: Date, employeeId?: string) {
+  const conds = [
+    eq(paychecks.companyId, ctx.companyId),
+    paycheckCountsCondition(),
+    gte(paychecks.payDate, start),
+    lt(paychecks.payDate, end), // half-open [start, end)
+  ];
+  if (employeeId) conds.push(eq(paychecks.employeeId, employeeId));
+  return ctx.db
+    .select({
+      id: paychecks.id,
+      employeeId: paychecks.employeeId,
+      grossPay: paychecks.grossPay,
+      payDate: paychecks.payDate,
+    })
+    .from(paychecks)
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .where(and(...conds));
+}
+
 /**
- * Aggregate W-2 figures for an employee for a given calendar year.
- * Wages = sum of gross_pay on paychecks.
- * Federal / SS / Medicare = sum of matching paycheck_lines rows by name
- * (case-insensitive contains match on the standard names emitted by computeWithholding).
+ * Aggregate W-2 figures for an employee for a given calendar year. Wage boxes come from each
+ * check's gross pay and deduction TAX TRACKING types; withholding boxes sum the tax lines by
+ * tracking type (federal withholding, Social Security, Medicare, state withholding) — never by
+ * free-text line name.
  */
 export async function w2Data(
   ctx: ServiceContext,
@@ -120,28 +259,12 @@ export async function w2Data(
   const yearStart = new Date(Date.UTC(input.year,     0, 1));
   const yearEnd   = new Date(Date.UTC(input.year + 1, 0, 1));
 
-  // 1. Fetch paychecks for the employee in the year whose GL entry is still posted
-  //    (a voided paycheck must not appear on the W-2).
-  const yearPaychecks = await ctx.db
-    .select({ id: paychecks.id, grossPay: paychecks.grossPay })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(
-      and(
-        eq(paychecks.companyId, ctx.companyId),
-        eq(paychecks.employeeId, input.employeeId),
-        paycheckCountsCondition(),
-        gte(paychecks.payDate, yearStart),
-        lt(paychecks.payDate, yearEnd), // half-open [start, end): exclude Jan-1 of next year
-      ),
-    );
+  // A voided paycheck must not appear on the W-2.
+  const yearPaychecks = await countedChecks(ctx, yearStart, yearEnd, input.employeeId);
+  const byCheck = await linesByPaycheck(ctx, yearPaychecks.map((p) => p.id));
 
-  const paycheckIds = yearPaychecks.map((p) => p.id);
-
-  // Aggregate gross wages (decimal-exact, never IEEE-754 floats).
-  const wages = toAmountString(
-    yearPaychecks.reduce((sum, p) => sum.plus(Money.of(p.grossPay)), Money.zero()),
-  );
+  const f = emptyFigures();
+  for (const p of yearPaychecks) addCheck(f, p.grossPay, byCheck.get(p.id) ?? []);
 
   const employerInfo = companyProfile(company);
   const addressState = (() => {
@@ -151,63 +274,19 @@ export async function w2Data(
       : null;
   })();
 
-  if (paycheckIds.length === 0) {
-    return {
-      company: employerInfo,
-      employee: {
-        firstName: employee.firstName,
-        lastName: employee.lastName,
-        ssn: (employee.ssn as string | null | undefined) ?? null,
-      },
-      year: input.year,
-      wages: '0.00',
-      federalWithheld: '0.00',
-      ssWages: '0.00',
-      socialSecurity: '0.00',
-      medicareWages: '0.00',
-      medicare: '0.00',
-      state: { code: addressState, wages: '0.00', withheld: '0.00' },
-    };
-  }
-
-  // 2. Fetch the tax lines for THIS company's paychecks only (paycheck_lines has no
-  // companyId column, so scope by the already-company-scoped paycheckIds).
-  const relevantTaxLines = await ctx.db
-    .select({
-      paycheckId: paycheckLines.paycheckId,
-      name: paycheckLines.name,
-      amount: paycheckLines.amount,
-    })
-    .from(paycheckLines)
-    .where(and(eq(paycheckLines.kind, 'tax'), inArray(paycheckLines.paycheckId, paycheckIds)));
-
-  function sumByName(pattern: { test(s: string): boolean }): string {
-    return toAmountString(
-      relevantTaxLines
-        .filter((l) => pattern.test(l.name))
-        .reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero()),
-    );
-  }
-
-  const federalWithheld = sumByName(/federal income tax/i);
-  const socialSecurity  = sumByName(/social security/i);
-  const medicare        = sumByName(/medicare/i);
-  const stateWithheld   = sumByName(STATE_TAX_RE);
-
   // Box 15 state code: prefer the employee's address state; otherwise parse a
   // "(XX)" suffix from a state tax line name (e.g. "State Income Tax (CA)").
   let stateCode = addressState;
   if (!stateCode) {
-    const stateLine = relevantTaxLines.find((l) => STATE_TAX_RE.test(l.name));
-    const m = stateLine?.name.match(/\(([A-Za-z]{2})\)/);
-    if (m) stateCode = m[1].toUpperCase();
+    for (const n of f.stateLineNames) {
+      const m = n.match(/\(([A-Za-z]{2})\)/);
+      if (m) { stateCode = m[1].toUpperCase(); break; }
+    }
   }
-  const hasStateInfo = stateCode !== null || Money.gt(stateWithheld, 0);
+  const hasStateInfo = yearPaychecks.length > 0 && (stateCode !== null || f.stateWithheld.greaterThan(0));
 
-  // Box 3: SS wages are Box 1 capped at the annual SS wage base.
-  const grossDec = Money.of(wages);
-  const ssBase = ssWageBaseFor(input.year);
-  const ssWages = toAmountString(grossDec.greaterThan(ssBase) ? Money.of(ssBase) : grossDec);
+  // Box 3: Social Security wages capped at the year's wage base.
+  const ssBase = Money.of(ssWageBaseFor(input.year));
 
   return {
     company: employerInfo,
@@ -217,16 +296,19 @@ export async function w2Data(
       ssn: (employee.ssn as string | null | undefined) ?? null,
     },
     year: input.year,
-    wages,
-    federalWithheld,
-    ssWages,
-    socialSecurity,
-    medicareWages: wages,
-    medicare,
+    wages: toAmountString(f.incomeTaxWages),
+    federalWithheld: toAmountString(f.federalWithheld),
+    ssWages: toAmountString(capAt(f.ficaWages, ssBase)),
+    socialSecurity: toAmountString(f.socialSecurity),
+    medicareWages: toAmountString(f.ficaWages),
+    medicare: toAmountString(f.medicare),
+    dependentCare: toAmountString(f.box10),
+    box12: box12List(f.box12),
+    box14: box14List(f.box14),
     state: {
       code: stateCode,
-      wages: hasStateInfo ? wages : '0.00',
-      withheld: stateWithheld,
+      wages: hasStateInfo ? toAmountString(f.incomeTaxWages) : '0.00',
+      withheld: toAmountString(f.stateWithheld),
     },
   };
 }
@@ -246,8 +328,22 @@ export interface Form941DataResult {
   quarter: 1 | 2 | 3 | 4;
   year: number;
   totals: {
+    /** Line 1: number of employees paid in the quarter. */
+    employeeCount: number;
+    /**
+     * Line 2: wages, tips and other compensation — gross pay less 401(k)-type deferrals and
+     * Section 125 deductions (the W-2 Box 1 basis).
+     */
     wages: string;
+    /** Gross pay before any deductions (informational). */
+    grossPay: string;
     federalWithheld: string;
+    /** Line 5a column 1: taxable Social Security wages (gross less Section 125, wage base applied per employee). */
+    ssWages: string;
+    /** Line 5c column 1: taxable Medicare wages (gross less Section 125). */
+    medicareWages: string;
+    /** Line 5d column 1: wages subject to Additional Medicare Tax withholding (over $200,000 YTD). */
+    additionalMedicareWages: string;
     /**
      * TOTAL Social Security tax for the quarter (employee withheld + employer match),
      * i.e. Form 941 line 5a column 2 (taxable SS wages × 12.4%).
@@ -279,9 +375,13 @@ function quarterRange(quarter: 1 | 2 | 3 | 4, year: number): { start: Date; end:
   return { start, end };
 }
 
+const ADDITIONAL_MEDICARE_WAGE_THRESHOLD = 200000;
+
 /**
- * Aggregate Form 941 totals for a specific quarter and year.
- * Covers all employees in the company for that period.
+ * Aggregate Form 941 totals for a specific quarter and year, across all employees. Taxes are
+ * summed by tax tracking type (employee + employer Social Security / Medicare, federal
+ * withholding); wage lines use each check's wage bases with the Social Security wage base
+ * applied per employee against wages earlier in the year.
  */
 export async function form941Data(
   ctx: ServiceContext,
@@ -291,83 +391,70 @@ export async function form941Data(
   if (!company) throw notFound('Company');
 
   const { start, end } = quarterRange(input.quarter, input.year);
+  const yearStart = new Date(Date.UTC(input.year, 0, 1));
 
-  // Fetch all paychecks in the quarter whose GL entry is still posted (a voided
-  // paycheck must not appear on the 941).
-  const quarterPaychecks = await ctx.db
-    .select({ id: paychecks.id, grossPay: paychecks.grossPay })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(
-      and(
-        eq(paychecks.companyId, ctx.companyId),
-        paycheckCountsCondition(),
-        gte(paychecks.payDate, start),
-        lt(paychecks.payDate, end), // exclusive upper bound (quarterRange.end is exclusive)
-      ),
-    );
+  // Year-to-quarter-end checks: earlier quarters only feed the per-employee wage-base room.
+  const checks = await countedChecks(ctx, yearStart, end);
+  const byCheck = await linesByPaycheck(ctx, checks.map((c) => c.id));
 
-  const paycheckIds = quarterPaychecks.map((p) => p.id);
+  interface Acc { ficaBefore: Dec; ficaQ: Dec }
+  const perEmployee = new Map<string, Acc>();
+  let wages = Money.zero();
+  let gross = Money.zero();
+  let medicareWages = Money.zero();
+  let fedWithheld = Money.zero();
+  let employeeSS = Money.zero();
+  let employerSS = Money.zero();
+  let employeeMedicare = Money.zero();
+  let employerMedicare = Money.zero();
 
-  const wages = toAmountString(
-    quarterPaychecks.reduce((sum, p) => sum.plus(Money.of(p.grossPay)), Money.zero()),
-  );
-
-  if (paycheckIds.length === 0) {
-    return {
-      company: { name: company.name, address: null },
-      quarter: input.quarter,
-      year: input.year,
-      totals: {
-        wages: '0.00',
-        federalWithheld: '0.00',
-        socialSecurity: '0.00',
-        medicare: '0.00',
-        employeeSocialSecurity: '0.00',
-        employerSocialSecurity: '0.00',
-        employeeMedicare: '0.00',
-        employerMedicare: '0.00',
-      },
-    };
+  for (const c of checks) {
+    const lines = byCheck.get(c.id) ?? [];
+    const b = paycheckWageBases(c.grossPay, lines);
+    const acc = perEmployee.get(c.employeeId) ?? { ficaBefore: Money.zero(), ficaQ: Money.zero() };
+    if (c.payDate.getTime() < start.getTime()) {
+      acc.ficaBefore = acc.ficaBefore.plus(b.ficaWages);
+    } else {
+      acc.ficaQ = acc.ficaQ.plus(b.ficaWages);
+      wages = wages.plus(b.incomeTaxWages);
+      gross = gross.plus(b.gross);
+      medicareWages = medicareWages.plus(b.ficaWages);
+      const taxLines = lines.filter((l) => l.kind === 'tax');
+      const erLines = lines.filter((l) => l.kind === 'employer_contribution');
+      fedWithheld = fedWithheld.plus(sumTracking(taxLines, 'federal_withholding'));
+      employeeSS = employeeSS.plus(sumTracking(taxLines, 'social_security'));
+      employeeMedicare = employeeMedicare.plus(sumTracking(taxLines, 'medicare'));
+      employerSS = employerSS.plus(sumTracking(erLines, 'employer_social_security'));
+      employerMedicare = employerMedicare.plus(sumTracking(erLines, 'employer_medicare'));
+    }
+    perEmployee.set(c.employeeId, acc);
   }
 
-  // Both employee withholdings (kind='tax') AND the employer FICA match
-  // (kind='employer_contribution') feed the 941 — lines 5a/5c are taxable wages ×
-  // 12.4% / 2.9%, i.e. employee + employer shares combined. FUTA employer lines are
-  // excluded by the name patterns (FUTA is Form 940, not 941).
-  const relevantTaxLines = await ctx.db
-    .select({
-      paycheckId: paycheckLines.paycheckId,
-      kind: paycheckLines.kind,
-      name: paycheckLines.name,
-      amount: paycheckLines.amount,
-    })
-    .from(paycheckLines)
-    .where(
-      and(
-        inArray(paycheckLines.kind, ['tax', 'employer_contribution']),
-        inArray(paycheckLines.paycheckId, paycheckIds),
-      ),
-    );
-
-  function sumByName(pattern: RegExp, kind: 'tax' | 'employer_contribution') {
-    return relevantTaxLines
-      .filter((l) => l.kind === kind && pattern.test(l.name))
-      .reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero());
+  const ssBase = Money.of(ssWageBaseFor(input.year));
+  const addlThreshold = Money.of(ADDITIONAL_MEDICARE_WAGE_THRESHOLD);
+  let ssWages = Money.zero();
+  let additionalMedicareWages = Money.zero();
+  let employeeCount = 0;
+  for (const a of perEmployee.values()) {
+    if (a.ficaQ.isZero()) continue;
+    employeeCount += 1;
+    ssWages = ssWages.plus(capAt(a.ficaQ, ssBase.minus(a.ficaBefore)));
+    const over = a.ficaBefore.plus(a.ficaQ).minus(addlThreshold);
+    additionalMedicareWages = additionalMedicareWages.plus(capAt(over, a.ficaQ));
   }
-
-  const employeeSS       = sumByName(/social security/i, 'tax');
-  const employerSS       = sumByName(/social security/i, 'employer_contribution');
-  const employeeMedicare = sumByName(/medicare/i, 'tax');
-  const employerMedicare = sumByName(/medicare/i, 'employer_contribution');
 
   return {
     company: { name: company.name, address: null },
     quarter: input.quarter,
     year: input.year,
     totals: {
-      wages,
-      federalWithheld: toAmountString(sumByName(/federal income tax/i, 'tax')),
+      employeeCount,
+      wages: toAmountString(wages),
+      grossPay: toAmountString(gross),
+      federalWithheld: toAmountString(fedWithheld),
+      ssWages: toAmountString(ssWages),
+      medicareWages: toAmountString(medicareWages),
+      additionalMedicareWages: toAmountString(additionalMedicareWages),
       socialSecurity:  toAmountString(employeeSS.plus(employerSS)),
       medicare:        toAmountString(employeeMedicare.plus(employerMedicare)),
       employeeSocialSecurity: toAmountString(employeeSS),
@@ -399,9 +486,12 @@ export interface Form940DataResult {
   employeeCount: number;
   /** Line 3: total payments to all employees (gross wages). */
   totalPayments: string;
-  /** Line 4: payments exempt from FUTA. Always 0.00 — no exempt pay categories are tracked. */
+  /**
+   * Line 4: payments exempt from FUTA — Section 125 cafeteria deductions (fringe benefits,
+   * box 4a). 401(k) deferrals are NOT exempt (box 4b applies only to employer plan payments).
+   */
   exemptPayments: string;
-  /** Line 5: total of payments over the $7,000 FUTA wage base, per employee. */
+  /** Line 5: total of payments over the $7,000 FUTA wage base, per employee (after exempt payments). */
   excessOver7000: string;
   /** Line 6: subtotal (line 4 + line 5). */
   subtotal: string;
@@ -420,11 +510,11 @@ export interface Form940DataResult {
 /**
  * Aggregate the Form 940 (FUTA) annual worksheet for a calendar year.
  *
- * Wage lines (3/5/7) derive from gross pay on posted, non-void paychecks with the
- * $7,000-per-employee FUTA wage base applied. The tax itself is reported two ways:
- * the worksheet computation (taxable wages × 0.6%) and the sum of the FUTA accrual
- * lines runPaycheck stamps on each check — the accrued figure is what hit the GL
- * and feeds the Part 5 quarterly breakdown.
+ * Line 3 is gross pay on live checks; line 4 the Section 125 (FUTA-exempt) deductions; line 5
+ * the per-employee excess of FUTA wages over $7,000. The tax itself is reported two ways: the
+ * worksheet computation (taxable wages × 0.6%) and the sum of the FUTA accrual lines (by tax
+ * tracking type) runPaycheck stamps on each check — the accrued figure is what hit the GL and
+ * feeds the Part 5 quarterly breakdown.
  */
 export async function form940Data(
   ctx: ServiceContext,
@@ -437,85 +527,49 @@ export async function form940Data(
   const yearStart = new Date(Date.UTC(input.year,     0, 1));
   const yearEnd   = new Date(Date.UTC(input.year + 1, 0, 1));
 
-  const yearChecks = await ctx.db
-    .select({
-      id: paychecks.id,
-      employeeId: paychecks.employeeId,
-      grossPay: paychecks.grossPay,
-      payDate: paychecks.payDate,
-    })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(
-      and(
-        eq(paychecks.companyId, ctx.companyId),
-        paycheckCountsCondition(),
-        gte(paychecks.payDate, yearStart),
-        lt(paychecks.payDate, yearEnd),
-      ),
-    );
+  const yearChecks = await countedChecks(ctx, yearStart, yearEnd);
+  const byCheck = await linesByPaycheck(ctx, yearChecks.map((c) => c.id));
 
-  // Gross wages per employee (the FUTA base applies per employee, per year).
-  const grossByEmployee = new Map<string, ReturnType<typeof Money.zero>>();
+  // FUTA wages per employee (the FUTA base applies per employee, per year).
+  const futaWagesByEmployee = new Map<string, Dec>();
   let totalPayments = Money.zero();
+  let exemptPayments = Money.zero();
+  const quarterTotals: Record<1 | 2 | 3 | 4, Dec> = {
+    1: Money.zero(), 2: Money.zero(), 3: Money.zero(), 4: Money.zero(),
+  };
+  let futaTaxAccrued = Money.zero();
   for (const c of yearChecks) {
-    const g = Money.of(c.grossPay);
-    grossByEmployee.set(
+    const lines = byCheck.get(c.id) ?? [];
+    const b = paycheckWageBases(c.grossPay, lines);
+    totalPayments = totalPayments.plus(b.gross);
+    exemptPayments = exemptPayments.plus(b.gross.minus(b.ficaWages));
+    futaWagesByEmployee.set(
       c.employeeId,
-      (grossByEmployee.get(c.employeeId) ?? Money.zero()).plus(g),
+      (futaWagesByEmployee.get(c.employeeId) ?? Money.zero()).plus(b.ficaWages),
     );
-    totalPayments = totalPayments.plus(g);
+    const futa = sumTracking(lines.filter((l) => l.kind === 'employer_contribution'), 'futa');
+    if (futa.greaterThan(0)) {
+      const quarter = (Math.floor(c.payDate.getUTCMonth() / 3) + 1) as 1 | 2 | 3 | 4;
+      quarterTotals[quarter] = quarterTotals[quarter].plus(futa);
+      futaTaxAccrued = futaTaxAccrued.plus(futa);
+    }
   }
 
   let excessOver7000 = Money.zero();
-  for (const total of grossByEmployee.values()) {
+  for (const total of futaWagesByEmployee.values()) {
     if (total.greaterThan(FUTA_WAGE_BASE)) {
       excessOver7000 = excessOver7000.plus(total.minus(FUTA_WAGE_BASE));
     }
   }
 
-  const exemptPayments = Money.zero(); // no exempt pay categories tracked
   const subtotal = exemptPayments.plus(excessOver7000);
   const taxableFutaWages = totalPayments.minus(subtotal);
   const futaTaxCalculated = Money.round2(taxableFutaWages.times(FUTA_NET_RATE));
 
-  // FUTA accrual lines (kind employer_contribution, name "Federal Unemployment (FUTA)")
-  // summed per quarter for Part 5.
-  const ids = yearChecks.map((c) => c.id);
-  const quarterTotals: Record<1 | 2 | 3 | 4, ReturnType<typeof Money.zero>> = {
-    1: Money.zero(), 2: Money.zero(), 3: Money.zero(), 4: Money.zero(),
-  };
-  let futaTaxAccrued = Money.zero();
-  if (ids.length > 0) {
-    const futaLines = await ctx.db
-      .select({
-        paycheckId: paycheckLines.paycheckId,
-        name: paycheckLines.name,
-        amount: paycheckLines.amount,
-      })
-      .from(paycheckLines)
-      .where(
-        and(
-          eq(paycheckLines.kind, 'employer_contribution'),
-          inArray(paycheckLines.paycheckId, ids),
-        ),
-      );
-    const payDateById = new Map(yearChecks.map((c) => [c.id, c.payDate]));
-    for (const l of futaLines) {
-      if (!FUTA_NAME_RE.test(l.name)) continue;
-      const payDate = payDateById.get(l.paycheckId);
-      if (!payDate) continue;
-      const quarter = (Math.floor(payDate.getUTCMonth() / 3) + 1) as 1 | 2 | 3 | 4;
-      const amt = Money.of(l.amount);
-      quarterTotals[quarter] = quarterTotals[quarter].plus(amt);
-      futaTaxAccrued = futaTaxAccrued.plus(amt);
-    }
-  }
-
   return {
     company: companyProfile(company),
     year: input.year,
-    employeeCount: grossByEmployee.size,
+    employeeCount: futaWagesByEmployee.size,
     totalPayments: toAmountString(totalPayments),
     exemptPayments: toAmountString(exemptPayments),
     excessOver7000: toAmountString(excessOver7000),
@@ -544,7 +598,7 @@ export interface W3DataResult {
   year: number;
   /** Box c: number of W-2s (employees paid during the year). */
   w2Count: number;
-  /** Box 1: total wages, tips, other compensation. */
+  /** Box 1: total wages, tips, other compensation (sum of W-2 Box 1). */
   wages: string;
   /** Box 2: total federal income tax withheld. */
   federalWithheld: string;
@@ -556,7 +610,13 @@ export interface W3DataResult {
   medicareWages: string;
   /** Box 6: total Medicare tax withheld. */
   medicare: string;
-  /** Box 16: total state wages (wages of employees with state withholding). */
+  /** Box 10: total dependent care benefits. */
+  dependentCare: string;
+  /** Box 12a: total deferred compensation (codes D, E, F, G, H, S, Y, AA, BB, EE). */
+  deferredCompensation: string;
+  /** Box 12 totals by code across all W-2s. */
+  box12: Array<{ code: string; amount: string }>;
+  /** Box 16: total state wages (W-2 Box 1 wages of employees with state withholding). */
   stateWages: string;
   /** Box 17: total state income tax withheld. */
   stateWithheld: string;
@@ -575,84 +635,53 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
   const yearStart = new Date(Date.UTC(input.year,     0, 1));
   const yearEnd   = new Date(Date.UTC(input.year + 1, 0, 1));
 
-  const yearChecks = await ctx.db
-    .select({ id: paychecks.id, employeeId: paychecks.employeeId, grossPay: paychecks.grossPay })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(
-      and(
-        eq(paychecks.companyId, ctx.companyId),
-        paycheckCountsCondition(),
-        gte(paychecks.payDate, yearStart),
-        lt(paychecks.payDate, yearEnd),
-      ),
-    );
+  const yearChecks = await countedChecks(ctx, yearStart, yearEnd);
+  const byCheck = await linesByPaycheck(ctx, yearChecks.map((c) => c.id));
 
-  const grossByEmployee = new Map<string, ReturnType<typeof Money.zero>>();
-  let wages = Money.zero();
+  const perEmployee = new Map<string, EmployeeYearFigures>();
   for (const c of yearChecks) {
-    const g = Money.of(c.grossPay);
-    grossByEmployee.set(
-      c.employeeId,
-      (grossByEmployee.get(c.employeeId) ?? Money.zero()).plus(g),
-    );
-    wages = wages.plus(g);
+    const f = perEmployee.get(c.employeeId) ?? emptyFigures();
+    addCheck(f, c.grossPay, byCheck.get(c.id) ?? []);
+    perEmployee.set(c.employeeId, f);
   }
 
-  // Box 3: cap per employee at the SS wage base, then sum.
-  const ssBase = ssWageBaseFor(input.year);
+  const ssBase = Money.of(ssWageBaseFor(input.year));
+  const t = emptyFigures();
   let ssWages = Money.zero();
-  for (const total of grossByEmployee.values()) {
-    ssWages = ssWages.plus(total.greaterThan(ssBase) ? Money.of(ssBase) : total);
-  }
-
-  const ids = yearChecks.map((c) => c.id);
-  const taxLines = ids.length
-    ? await ctx.db
-        .select({
-          paycheckId: paycheckLines.paycheckId,
-          name: paycheckLines.name,
-          amount: paycheckLines.amount,
-        })
-        .from(paycheckLines)
-        .where(and(eq(paycheckLines.kind, 'tax'), inArray(paycheckLines.paycheckId, ids)))
-    : [];
-
-  const sumByName = (pattern: { test(s: string): boolean }) =>
-    taxLines
-      .filter((l) => pattern.test(l.name))
-      .reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero());
-
-  const federalWithheld = sumByName(/federal income tax/i);
-  const socialSecurity  = sumByName(/social security/i);
-  const medicare        = sumByName(/medicare/i);
-  const stateWithheld   = sumByName(STATE_TAX_RE);
-
-  // Box 16: state wages = total wages of the employees who had state withholding.
-  const employeeById = new Map(yearChecks.map((c) => [c.id, c.employeeId]));
-  const stateEmployeeIds = new Set<string>();
-  for (const l of taxLines) {
-    if (!STATE_TAX_RE.test(l.name)) continue;
-    const empId = employeeById.get(l.paycheckId);
-    if (empId) stateEmployeeIds.add(empId);
-  }
   let stateWages = Money.zero();
-  for (const empId of stateEmployeeIds) {
-    stateWages = stateWages.plus(grossByEmployee.get(empId) ?? Money.zero());
+  for (const f of perEmployee.values()) {
+    t.incomeTaxWages = t.incomeTaxWages.plus(f.incomeTaxWages);
+    t.ficaWages = t.ficaWages.plus(f.ficaWages);
+    t.federalWithheld = t.federalWithheld.plus(f.federalWithheld);
+    t.socialSecurity = t.socialSecurity.plus(f.socialSecurity);
+    t.medicare = t.medicare.plus(f.medicare);
+    t.stateWithheld = t.stateWithheld.plus(f.stateWithheld);
+    t.box10 = t.box10.plus(f.box10);
+    for (const [k, v] of f.box12) t.box12.set(k, (t.box12.get(k) ?? Money.zero()).plus(v));
+    ssWages = ssWages.plus(capAt(f.ficaWages, ssBase));
+    // Box 16: state wages of the employees who had state withholding.
+    if (f.stateWithheld.greaterThan(0)) stateWages = stateWages.plus(f.incomeTaxWages);
   }
+  const deferred = ['D', 'E', 'F', 'G', 'H', 'S', 'Y', 'AA', 'BB', 'EE'].reduce(
+    (s, code) => s.plus(t.box12.get(code) ?? Money.zero()),
+    Money.zero(),
+  );
 
   return {
     company: companyProfile(company),
     year: input.year,
-    w2Count: grossByEmployee.size,
-    wages: toAmountString(wages),
-    federalWithheld: toAmountString(federalWithheld),
+    w2Count: perEmployee.size,
+    wages: toAmountString(t.incomeTaxWages),
+    federalWithheld: toAmountString(t.federalWithheld),
     ssWages: toAmountString(ssWages),
-    socialSecurity: toAmountString(socialSecurity),
-    medicareWages: toAmountString(wages),
-    medicare: toAmountString(medicare),
+    socialSecurity: toAmountString(t.socialSecurity),
+    medicareWages: toAmountString(t.ficaWages),
+    medicare: toAmountString(t.medicare),
+    dependentCare: toAmountString(t.box10),
+    deferredCompensation: toAmountString(deferred),
+    box12: box12List(t.box12),
     stateWages: toAmountString(stateWages),
-    stateWithheld: toAmountString(stateWithheld),
+    stateWithheld: toAmountString(t.stateWithheld),
   };
 }
 
@@ -660,7 +689,6 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
 // Payroll Summary / Detail / Liability Balances (QB Desktop report parity)
 // ---------------------------------------------------------------------------
 
-type Dec = ReturnType<typeof Money.zero>;
 
 /** Strip the "(... hrs @ ...)" detail suffix so report columns group across checks. */
 function baseName(name: string): string {
@@ -720,6 +748,10 @@ export interface PayrollSummaryEmployeeRow {
   employeeName: string;
   paycheckCount: number;
   gross: string;
+  /** Federal income-tax wages (gross less 401(k)-type deferrals and Section 125). */
+  federalTaxableWages: string;
+  /** Social Security / Medicare wages before the wage-base cap (gross less Section 125). */
+  ficaWages: string;
   /** Withheld employee taxes by line name (e.g. "Federal Income Tax"). */
   taxes: Record<string, string>;
   totalTaxes: string;
@@ -742,6 +774,8 @@ export interface PayrollSummaryResult {
   rows: PayrollSummaryEmployeeRow[];
   totals: {
     gross: string;
+    federalTaxableWages: string;
+    ficaWages: string;
     totalTaxes: string;
     totalDeductions: string;
     totalEmployerTaxes: string;
@@ -771,6 +805,8 @@ export async function payrollSummary(
     employeeName: string;
     paycheckCount: number;
     gross: Dec;
+    fedWages: Dec;
+    ficaWages: Dec;
     net: Dec;
     taxes: Map<string, Dec>;
     deductions: Map<string, Dec>;
@@ -790,6 +826,8 @@ export async function payrollSummary(
         employeeName: `${r.firstName} ${r.lastName}`,
         paycheckCount: 0,
         gross: Money.zero(),
+        fedWages: Money.zero(),
+        ficaWages: Money.zero(),
         net: Money.zero(),
         taxes: new Map(),
         deductions: new Map(),
@@ -800,6 +838,9 @@ export async function payrollSummary(
     agg.paycheckCount += 1;
     agg.gross = agg.gross.plus(Money.of(pc.grossPay));
     agg.net = agg.net.plus(Money.of(pc.netPay));
+    const bases = paycheckWageBases(pc.grossPay, linesByPaycheck.get(pc.id) ?? []);
+    agg.fedWages = agg.fedWages.plus(bases.incomeTaxWages);
+    agg.ficaWages = agg.ficaWages.plus(bases.ficaWages);
 
     for (const l of linesByPaycheck.get(pc.id) ?? []) {
       const name = baseName(l.name);
@@ -830,6 +871,8 @@ export async function payrollSummary(
   const outRows: PayrollSummaryEmployeeRow[] = [];
   const totals = {
     gross: Money.zero(),
+    fedWages: Money.zero(),
+    ficaWages: Money.zero(),
     totalTaxes: Money.zero(),
     totalDeductions: Money.zero(),
     totalEmployerTaxes: Money.zero(),
@@ -848,6 +891,8 @@ export async function payrollSummary(
       employeeName: agg.employeeName,
       paycheckCount: agg.paycheckCount,
       gross: toAmountString(agg.gross),
+      federalTaxableWages: toAmountString(agg.fedWages),
+      ficaWages: toAmountString(agg.ficaWages),
       taxes: taxes.rec,
       totalTaxes: toAmountString(taxes.total),
       deductions: deductions.rec,
@@ -857,6 +902,8 @@ export async function payrollSummary(
       net: toAmountString(agg.net),
     });
     totals.gross = totals.gross.plus(agg.gross);
+    totals.fedWages = totals.fedWages.plus(agg.fedWages);
+    totals.ficaWages = totals.ficaWages.plus(agg.ficaWages);
     totals.totalTaxes = totals.totalTaxes.plus(taxes.total);
     totals.totalDeductions = totals.totalDeductions.plus(deductions.total);
     totals.totalEmployerTaxes = totals.totalEmployerTaxes.plus(employer.total);
@@ -872,6 +919,8 @@ export async function payrollSummary(
     rows: outRows,
     totals: {
       gross: toAmountString(totals.gross),
+      federalTaxableWages: toAmountString(totals.fedWages),
+      ficaWages: toAmountString(totals.ficaWages),
       totalTaxes: toAmountString(totals.totalTaxes),
       totalDeductions: toAmountString(totals.totalDeductions),
       totalEmployerTaxes: toAmountString(totals.totalEmployerTaxes),
@@ -1636,15 +1685,19 @@ export async function stateWageWorksheet(
     const a = acc.get(pc.employeeId) ?? {
       before: Money.zero(), q: Money.zero(), sui: Money.zero(), sdi: Money.zero(), st: Money.zero(),
     };
-    const g = Money.of(pc.grossPay);
+    // SUI wages = gross less Section 125 deductions (401(k) deferrals stay SUI-taxable in
+    // most states), the same basis the paycheck engine accrues SUI on.
+    const checkLines = linesByCheck.get(pc.id) ?? [];
+    const g = paycheckWageBases(pc.grossPay, checkLines).ficaWages;
     if (pc.payDate.getTime() < start.getTime()) {
       a.before = a.before.plus(g);
     } else {
       a.q = a.q.plus(g);
-      for (const l of linesByCheck.get(pc.id) ?? []) {
-        if (l.kind === 'employer_contribution' && SUI_NAME_RE.test(l.name)) a.sui = a.sui.plus(Money.of(l.amount));
-        else if (l.kind === 'tax' && /disab|\bsdi\b/i.test(l.name)) a.sdi = a.sdi.plus(Money.of(l.amount));
-        else if (l.kind === 'tax' && STATE_TAX_RE.test(l.name)) a.st = a.st.plus(Money.of(l.amount));
+      for (const l of checkLines) {
+        const t = lineTracking(l);
+        if (l.kind === 'employer_contribution' && t === 'sui') a.sui = a.sui.plus(Money.of(l.amount));
+        else if (l.kind === 'tax' && t === 'sdi') a.sdi = a.sdi.plus(Money.of(l.amount));
+        else if (l.kind === 'tax' && t === 'state_withholding') a.st = a.st.plus(Money.of(l.amount));
       }
     }
     acc.set(pc.employeeId, a);

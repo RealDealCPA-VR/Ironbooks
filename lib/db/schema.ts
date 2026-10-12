@@ -862,6 +862,8 @@ export const paycheckLines = pgTable('paycheck_lines', {
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
   /** Optional link to a payroll item definition (GL mapping + pre/post-tax behavior). */
   payrollItemId: uuid('payroll_item_id').references(() => payrollItems.id),
+  /** Tax tracking type (lib/services/payrollTaxTracking.ts) — drives W-2/941/940 aggregation. */
+  taxTracking: varchar('tax_tracking', { length: 40 }),
 });
 
 /** Payroll item definitions — QB-style earnings/taxes/deductions with GL mapping. */
@@ -873,6 +875,8 @@ export const payrollItems = pgTable('payroll_items', {
   kind: varchar('kind', { length: 50 }).notNull(),
   /** Deductions: pre-tax reduces taxable wages; post-tax does not. */
   pretax: boolean('pretax').notNull().default(false),
+  /** QB "tax tracking type": 401k, section125, federal_withholding, futa, ... (payrollTaxTracking.ts). */
+  taxTracking: varchar('tax_tracking', { length: 40 }),
   /** GL: expense side (earnings/employer items) and/or liability side (taxes/deductions). */
   expenseAccountId: uuid('expense_account_id').references(() => accounts.id),
   liabilityAccountId: uuid('liability_account_id').references(() => accounts.id),

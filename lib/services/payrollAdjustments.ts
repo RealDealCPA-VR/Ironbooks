@@ -49,7 +49,8 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { getEmployee } from './payroll';
-import { getPayrollItemsByIds, type PayrollItem } from './payrollItems';
+import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
+import { inferEmployeeTaxTracking, inferEmployerTracking } from './payrollTaxTracking';
 
 type Dec = ReturnType<typeof Money.zero>;
 
@@ -161,6 +162,33 @@ async function resolveItems(ctx: ServiceContext, lines: AdjustmentLineInput[]) {
   return (id: string | null | undefined): PayrollItem | null => (id ? map.get(id) ?? null : null);
 }
 
+/**
+ * Tax tracking type for an adjustment line (drives W-2 / 941 / 940 aggregation): the payroll
+ * item's type, else the standard tax name. A tax line that is neither is refused so it can't
+ * silently drop off the tax forms.
+ */
+function adjustmentTracking(
+  l: { kind: string; name: string },
+  item: PayrollItem | null,
+): string | null {
+  if (l.kind === 'earning') return null;
+  if (item) {
+    const t = resolveItemTracking(item.kind, item.name, item.taxTracking, item.pretax);
+    if (t) return t;
+  }
+  if (l.kind === 'tax') {
+    const t = inferEmployeeTaxTracking(l.name);
+    if (!t) {
+      throw validation(
+        `"${l.name}" isn't a payroll tax we can report. Pick a tax item (federal withholding, Social Security, Medicare, state withholding, SDI or local tax).`,
+      );
+    }
+    return t;
+  }
+  if (l.kind === 'employer_contribution') return inferEmployerTracking(l.name);
+  return 'none';
+}
+
 /** Sum of signed amounts per account → balanced posting lines (zero nets dropped). */
 function netLines(map: Map<string, Dec>, memo: string): PostingLine[] {
   const out: PostingLine[] = [];
@@ -207,7 +235,7 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
       throw validation(`"${l.name}" cannot be negative in a YTD entry. Use Adjust Liabilities to reduce amounts.`);
     }
     totals[l.kind] = totals[l.kind].plus(amt);
-    return { kind: l.kind, name: l.name.trim(), amount: toAmountString(amt), payrollItemId: l.payrollItemId ?? null };
+    return { kind: l.kind, name: l.name.trim(), amount: toAmountString(amt), payrollItemId: l.payrollItemId ?? null, taxTracking: adjustmentTracking(l, itemFor(l.payrollItemId)) };
   });
   const gross = totals.earning;
   const net = gross.minus(totals.tax).minus(totals.deduction);
@@ -313,7 +341,7 @@ export async function createLiabilityAdjustment(ctx: ServiceContext, input: Liab
     if (amt.isZero()) throw validation(`"${l.name}" has no amount.`);
     if (l.kind === 'tax') taxes = taxes.plus(amt);
     if (l.kind === 'deduction') deductions = deductions.plus(amt);
-    return { kind: l.kind, name: l.name.trim(), amount: toAmountString(amt), payrollItemId: l.payrollItemId ?? null };
+    return { kind: l.kind, name: l.name.trim(), amount: toAmountString(amt), payrollItemId: l.payrollItemId ?? null, taxTracking: adjustmentTracking(l, itemFor(l.payrollItemId)) };
   });
   withinBounds(taxes, 'The tax total');
   withinBounds(deductions, 'The deduction total');

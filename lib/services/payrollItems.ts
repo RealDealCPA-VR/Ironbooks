@@ -11,8 +11,12 @@
  *   employer_contribution  Dr expenseAccountId + Cr liabilityAccountId
  *   garnishment            Cr liabilityAccountId (always POST-tax)
  *
- * `pretax` (deductions only) makes runPaycheck reduce the wage base before
- * computing withholding. `calcBasis`/`defaultRate` are UI defaults: 'fixed' is a
+ * `taxTracking` is QuickBooks' "tax tracking type" (lib/services/payrollTaxTracking.ts). For
+ * deductions it decides which wage bases the item reduces: 401(k)/403(b)/457(b) deferrals
+ * reduce income-tax wages only, Section 125 items reduce income-tax AND Social Security /
+ * Medicare / FUTA wages, after-tax items reduce nothing. For taxes it tells the W-2 / 941 /
+ * 940 which box the line belongs in. `pretax` is kept in sync (true = reduces income-tax
+ * wages) for older callers. `calcBasis`/`defaultRate` are UI defaults: 'fixed' is a
  * flat amount per check, 'percent' is a % of gross.
  *
  * `ensureDefaultPayrollItems` seeds a sensible QB-like starter set per company on
@@ -25,6 +29,16 @@
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { Money } from '@/lib/money';
 import { accounts, payrollItems } from '@/lib/db/schema';
+import {
+  inferDeductionTracking,
+  inferEmployeeTaxTracking,
+  inferEmployerTracking,
+  isPretaxTracking,
+  isTrackingValidForKind,
+  TAX_TRACKING_LABELS,
+  trackingChoicesFor,
+  type TaxTracking,
+} from './payrollTaxTracking';
 import {
   type ServiceContext,
   inTransaction,
@@ -59,6 +73,8 @@ export interface CreatePayrollItemInput {
   kind: PayrollItemKind;
   /** Deductions only: reduce the wage base before withholding is computed. */
   pretax?: boolean;
+  /** Tax tracking type (payrollTaxTracking.ts). Defaults from the name / pretax flag. */
+  taxTracking?: string | null;
   expenseAccountId?: string | null;
   liabilityAccountId?: string | null;
   calcBasis?: PayrollCalcBasis | null;
@@ -69,6 +85,7 @@ export interface CreatePayrollItemInput {
 export interface UpdatePayrollItemInput {
   name?: string;
   pretax?: boolean;
+  taxTracking?: string | null;
   expenseAccountId?: string | null;
   liabilityAccountId?: string | null;
   calcBasis?: PayrollCalcBasis | null;
@@ -108,6 +125,42 @@ function requiredSides(kind: PayrollItemKind): { expense: boolean; liability: bo
     case 'deduction':
     case 'garnishment':
       return { expense: false, liability: true };
+  }
+}
+
+/**
+ * Resolve the tax tracking type for an item: an explicit value must fit the kind; otherwise it
+ * is inferred from the name (and the legacy pre-tax flag for deductions). Returns null for a
+ * tax item whose name is not a recognized payroll tax.
+ */
+export function resolveItemTracking(
+  kind: string,
+  name: string,
+  explicit: string | null | undefined,
+  pretax: boolean,
+): TaxTracking | null {
+  if (explicit) {
+    if (!isTrackingValidForKind(kind, explicit)) {
+      const allowed = trackingChoicesFor(kind).map((t) => TAX_TRACKING_LABELS[t]).join('; ');
+      throw validation(
+        allowed
+          ? `That tax tracking type doesn't fit a ${kind.replace('_', ' ')} item. Choose one of: ${allowed}.`
+          : `A ${kind} item has no tax tracking type.`,
+      );
+    }
+    return explicit;
+  }
+  switch (kind) {
+    case 'deduction':
+      return inferDeductionTracking(name, pretax);
+    case 'garnishment':
+      return 'none';
+    case 'tax':
+      return inferEmployeeTaxTracking(name);
+    case 'employer_contribution':
+      return inferEmployerTracking(name);
+    default:
+      return null;
   }
 }
 
@@ -169,10 +222,16 @@ export async function createPayrollItem(ctx: ServiceContext, input: CreatePayrol
     throw validation("calcBasis must be 'fixed' or 'percent'.");
   }
   // Garnishments are post-tax by definition; pretax only makes sense on deductions.
-  const pretax = input.kind === 'deduction' ? (input.pretax ?? false) : false;
   if (input.pretax && input.kind !== 'deduction') {
     throw validation('Only deductions can be pre-tax.');
   }
+  const taxTracking = resolveItemTracking(input.kind, name, input.taxTracking, input.pretax ?? false);
+  if (input.kind === 'tax' && !taxTracking) {
+    throw validation(
+      `Choose a tax tracking type for "${name}" (federal withholding, Social Security, Medicare, state withholding, SDI or local tax) so it lands on the right W-2 and 941 lines.`,
+    );
+  }
+  const pretax = input.kind === 'deduction' ? isPretaxTracking(taxTracking) : false;
 
   const sides = requiredSides(input.kind);
   if (sides.expense && !input.expenseAccountId) {
@@ -202,6 +261,7 @@ export async function createPayrollItem(ctx: ServiceContext, input: CreatePayrol
       name,
       kind: input.kind,
       pretax,
+      taxTracking,
       expenseAccountId: input.expenseAccountId ?? null,
       liabilityAccountId: input.liabilityAccountId ?? null,
       calcBasis: input.calcBasis ?? null,
@@ -238,6 +298,22 @@ export async function updatePayrollItem(
       throw validation('Only deductions can be pre-tax.');
     }
     updates.pretax = input.pretax;
+  }
+  if (input.taxTracking !== undefined) {
+    const t = resolveItemTracking(
+      existing.kind,
+      input.name ?? existing.name,
+      input.taxTracking,
+      input.pretax ?? existing.pretax,
+    );
+    if (existing.kind === 'tax' && !t) throw validation('A tax item needs a tax tracking type.');
+    updates.taxTracking = t;
+    if (existing.kind === 'deduction') updates.pretax = isPretaxTracking(t);
+  } else if (input.pretax !== undefined && existing.kind === 'deduction') {
+    // Legacy toggle: flipping pre-tax without a type re-derives the type from the name.
+    const t = inferDeductionTracking(input.name ?? existing.name, input.pretax);
+    updates.taxTracking = t;
+    updates.pretax = isPretaxTracking(t);
   }
   if (input.expenseAccountId !== undefined) {
     if (input.expenseAccountId) {
@@ -323,18 +399,21 @@ export async function ensureDefaultPayrollItems(ctx: ServiceContext) {
     { companyId: ctx.companyId, name: 'Overtime (1.5x)',   kind: 'earning', expenseAccountId: wagesId, calcBasis: 'fixed' },
     { companyId: ctx.companyId, name: 'Bonus',             kind: 'earning', expenseAccountId: wagesId, calcBasis: 'fixed' },
     // Employee tax withholdings — Cr 2300
-    { companyId: ctx.companyId, name: 'Federal Withholding', kind: 'tax', liabilityAccountId: liabId },
-    { companyId: ctx.companyId, name: 'Social Security',     kind: 'tax', liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '6.2000' },
-    { companyId: ctx.companyId, name: 'Medicare',            kind: 'tax', liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '1.4500' },
+    { companyId: ctx.companyId, name: 'Federal Withholding', kind: 'tax', taxTracking: 'federal_withholding', liabilityAccountId: liabId },
+    { companyId: ctx.companyId, name: 'Social Security',     kind: 'tax', taxTracking: 'social_security', liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '6.2000' },
+    { companyId: ctx.companyId, name: 'Medicare',            kind: 'tax', taxTracking: 'medicare', liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '1.4500' },
+    { companyId: ctx.companyId, name: 'State Withholding',   kind: 'tax', taxTracking: 'state_withholding', liabilityAccountId: liabId },
     // Employer taxes — Dr 6510 (or 6500) / Cr 2300
-    { companyId: ctx.companyId, name: 'Employer Social Security',    kind: 'employer_contribution', expenseAccountId: taxExpId, liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '6.2000' },
-    { companyId: ctx.companyId, name: 'Employer Medicare',           kind: 'employer_contribution', expenseAccountId: taxExpId, liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '1.4500' },
-    { companyId: ctx.companyId, name: 'Federal Unemployment (FUTA)', kind: 'employer_contribution', expenseAccountId: taxExpId, liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '0.6000' },
-    // Deductions — Cr 2300
-    { companyId: ctx.companyId, name: '401(k) Employee',            kind: 'deduction', pretax: true,  liabilityAccountId: liabId, calcBasis: 'percent' },
-    { companyId: ctx.companyId, name: 'Health Insurance (pre-tax)', kind: 'deduction', pretax: true,  liabilityAccountId: liabId, calcBasis: 'fixed' },
+    { companyId: ctx.companyId, name: 'Employer Social Security',    kind: 'employer_contribution', taxTracking: 'employer_social_security', expenseAccountId: taxExpId, liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '6.2000' },
+    { companyId: ctx.companyId, name: 'Employer Medicare',           kind: 'employer_contribution', taxTracking: 'employer_medicare', expenseAccountId: taxExpId, liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '1.4500' },
+    { companyId: ctx.companyId, name: 'Federal Unemployment (FUTA)', kind: 'employer_contribution', taxTracking: 'futa', expenseAccountId: taxExpId, liabilityAccountId: liabId, calcBasis: 'percent', defaultRate: '0.6000' },
+    { companyId: ctx.companyId, name: 'State Unemployment (SUI)',    kind: 'employer_contribution', taxTracking: 'sui', expenseAccountId: taxExpId, liabilityAccountId: liabId, calcBasis: 'percent' },
+    // Deductions — Cr 2300. 401(k) deferrals reduce income-tax wages only (they stay subject to
+    // Social Security, Medicare and FUTA); Section 125 health premiums reduce both.
+    { companyId: ctx.companyId, name: '401(k) Employee',            kind: 'deduction', pretax: true, taxTracking: '401k',       liabilityAccountId: liabId, calcBasis: 'percent' },
+    { companyId: ctx.companyId, name: 'Health Insurance (pre-tax)', kind: 'deduction', pretax: true, taxTracking: 'section125', liabilityAccountId: liabId, calcBasis: 'fixed' },
     // Garnishment — post-tax by definition — Cr 2300
-    { companyId: ctx.companyId, name: 'Wage Garnishment', kind: 'garnishment', liabilityAccountId: liabId, calcBasis: 'fixed' },
+    { companyId: ctx.companyId, name: 'Wage Garnishment', kind: 'garnishment', taxTracking: 'none', liabilityAccountId: liabId, calcBasis: 'fixed' },
   ];
 
   return inTransaction(ctx, async (tx) => {

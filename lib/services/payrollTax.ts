@@ -272,15 +272,24 @@ export function computeFederalIncomeTax({
 }
 
 export interface WithholdingInput {
-  /** Taxable wages for this pay period (gross minus pre-tax deductions). */
+  /**
+   * Federal income-tax wages for this pay period (gross minus 401(k)/403(b)/457(b) deferrals
+   * and Section 125 deductions).
+   */
   grossPerPeriod: number | string;
+  /**
+   * Social Security / Medicare wages for this pay period (gross minus Section 125 deductions
+   * only — retirement deferrals stay subject to FICA). Defaults to `grossPerPeriod`.
+   */
+  ficaWagesPerPeriod?: number | string;
   /** Number of pay periods in the year (26 biweekly, 24 semimonthly, 12 monthly, 52 weekly). */
   periodsPerYear: number;
   filingStatus: FilingStatus;
   /**
-   * Wages already paid to the employee this calendar year, EXCLUDING the current check
-   * (default 0). The Social Security wage base and the Additional Medicare Tax threshold are
-   * applied against actual YTD wages — not an annualized projection of the current period.
+   * Social Security / Medicare wages already paid to the employee this calendar year,
+   * EXCLUDING the current check (default 0). The Social Security wage base and the Additional
+   * Medicare Tax threshold are applied against actual YTD wages — not an annualized projection
+   * of the current period.
    */
   ytdGrossBefore?: MoneyInput;
   /** Calendar year of the pay date (selects brackets + SS wage base). */
@@ -349,6 +358,7 @@ export function annualFederalWithholding(
  */
 export function computeWithholding({
   grossPerPeriod,
+  ficaWagesPerPeriod,
   periodsPerYear,
   filingStatus,
   ytdGrossBefore = 0,
@@ -361,6 +371,9 @@ export function computeWithholding({
   const table = taxYearTable(year);
 
   const grossPer = new Decimal(grossPerPeriod);
+  const ficaPer = ficaWagesPerPeriod === undefined || ficaWagesPerPeriod === ''
+    ? grossPer
+    : Decimal.max(0, new Decimal(ficaWagesPerPeriod));
   const periods = new Decimal(periodsPerYear);
   const ytdBefore = Decimal.max(new Decimal(0), toDecimal(ytdGrossBefore));
 
@@ -373,16 +386,16 @@ export function computeWithholding({
   }
 
   // 3. Social Security — the portion of THIS check under the year's wage base.
-  const ssPerPeriod = Money.round2(ssTaxableThisCheck(grossPer, ytdBefore, table.year).times(SS_RATE));
+  const ssPerPeriod = Money.round2(ssTaxableThisCheck(ficaPer, ytdBefore, table.year).times(SS_RATE));
 
   // 4. Medicare — 1.45% on all wages; 0.9% only on the part of this check above $200k YTD.
   const additionalThreshold = new Decimal(ADDITIONAL_MEDICARE_THRESHOLD);
   const additionalTaxableThisPeriod = Decimal.min(
-    grossPer,
-    Decimal.max(new Decimal(0), ytdBefore.plus(grossPer).minus(additionalThreshold)),
+    ficaPer,
+    Decimal.max(new Decimal(0), ytdBefore.plus(ficaPer).minus(additionalThreshold)),
   );
   const medicarePerPeriod = Money.round2(
-    grossPer.times(MEDICARE_BASE_RATE).plus(additionalTaxableThisPeriod.times(ADDITIONAL_MEDICARE_RATE)),
+    ficaPer.times(MEDICARE_BASE_RATE).plus(additionalTaxableThisPeriod.times(ADDITIONAL_MEDICARE_RATE)),
   );
 
   const total = Money.round2(federalPerPeriod.plus(ssPerPeriod).plus(medicarePerPeriod));

@@ -49,6 +49,14 @@ export interface PaystubPdfData {
    * line is rendered beneath the net-pay box only when present.
    */
   accruals?: { sickBalance: string | number; vacationBalance: string | number } | null;
+  /**
+   * Taxable wages (federal income-tax wages and Social Security / Medicare wages), this check
+   * and YTD. Optional; rendered as a small line beneath the net-pay box.
+   */
+  taxableWages?: {
+    current: { federal: string | number; fica: string | number };
+    ytd: { federal: string | number; fica: string | number };
+  } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +362,19 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
       MARGIN_L,
       cursor + 6,
       { size: 9, color: COLOR_GRAY },
+    );
+    cursor -= 14;
+  }
+
+  // Taxable wages — differ from gross when 401(k) or Section 125 deductions apply.
+  if (data.taxableWages) {
+    const tw = data.taxableWages;
+    drawText(
+      `Federal taxable wages: ${fmt(tw.current.federal)} (YTD ${fmt(tw.ytd.federal)})   •   ` +
+        `Social Security/Medicare wages: ${fmt(tw.current.fica)} (YTD ${fmt(tw.ytd.fica)})`,
+      MARGIN_L,
+      cursor + 6,
+      { size: 8, color: COLOR_GRAY },
     );
     cursor -= 14;
   }

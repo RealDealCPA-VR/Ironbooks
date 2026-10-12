@@ -110,6 +110,8 @@ describe('Payroll service (end-to-end)', () => {
       grossPay: '1000.00',
       taxes: [{ kind: 'tax', name: 'Federal Income Tax', amount: '150.00' },
                { kind: 'tax', name: 'Social Security',   amount: '50.00' }],
+      // No employer taxes on this check (omitting employerTaxes has the server calculate them).
+      employerTaxes: [],
       deductions: [],
     });
 

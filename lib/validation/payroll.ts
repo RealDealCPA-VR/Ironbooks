@@ -15,6 +15,17 @@ export const paycheckLineSchema = z.object({
   name: z.string().min(1, 'line name is required'),
   amount: zMoney,
   payrollItemId: zUuid.nullish(),
+  /** Tax tracking type (lib/services/payrollTaxTracking.ts); normally taken from the item. */
+  taxTracking: z.string().max(40).nullish(),
+});
+
+/**
+ * Override one CALCULATED tax by its payroll item (never by a typed name). The item's tax
+ * tracking type picks the computed line it replaces; 0 removes that tax from the check.
+ */
+export const taxOverrideSchema = z.object({
+  payrollItemId: zUuid,
+  amount: zMoney,
 });
 
 export const earningLineSchema = z.object({
@@ -36,6 +47,7 @@ export const runPaycheckSchema = z.object({
   taxes: z.array(paycheckLineSchema).optional(),
   employerTaxes: z.array(paycheckLineSchema).optional(),
   deductions: z.array(paycheckLineSchema).optional(),
+  taxOverrides: z.array(taxOverrideSchema).optional(),
   filingStatus: z.enum(['single', 'married', 'head_of_household']).optional(),
   periodsPerYear: z.number().int().positive('periodsPerYear must be a positive integer').optional(),
 });

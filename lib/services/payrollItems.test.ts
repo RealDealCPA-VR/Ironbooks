@@ -278,8 +278,9 @@ describe('Payroll items (seeding, CRUD, GL mapping)', () => {
       Number(r.lines.find((l) => l.kind === 'tax' && l.name === 'Social Security')!.amount);
 
     expect(fed(withPretax)).toBeLessThan(fed(without));
-    // FICA base also reduced in the simplified pre-tax model: 6.2% of 1800 vs 2000.
-    expect(ss(withPretax)).toBeCloseTo(111.6, 2);
+    // A 401(k) deferral reduces income-tax wages only — it stays subject to Social Security
+    // (6.2% of the full 2000), unlike a Section 125 item (see payrollTaxTracking.test.ts).
+    expect(ss(withPretax)).toBeCloseTo(124, 2);
     expect(ss(without)).toBeCloseTo(124, 2);
 
     // Gross stays the full 2000; only the tax base shrinks.

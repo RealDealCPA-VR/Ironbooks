@@ -19,6 +19,8 @@ export const createPayrollItemSchema = z.object({
   name: z.string({ required_error: 'name is required' }).min(1, 'name is required'),
   kind: payrollItemKindSchema,
   pretax: z.boolean().optional(),
+  /** QB tax tracking type (lib/services/payrollTaxTracking.ts); checked against the kind by the service. */
+  taxTracking: z.string().max(40).nullish(),
   expenseAccountId: zUuid.nullish(),
   liabilityAccountId: zUuid.nullish(),
   calcBasis: payrollCalcBasisSchema.nullish(),
@@ -29,6 +31,8 @@ export type CreatePayrollItemBody = z.infer<typeof createPayrollItemSchema>;
 export const updatePayrollItemSchema = z.object({
   name: z.string().min(1, 'name is required').optional(),
   pretax: z.boolean().optional(),
+  /** QB tax tracking type (lib/services/payrollTaxTracking.ts); checked against the kind by the service. */
+  taxTracking: z.string().max(40).nullish(),
   expenseAccountId: zUuid.nullish(),
   liabilityAccountId: zUuid.nullish(),
   calcBasis: payrollCalcBasisSchema.nullish(),

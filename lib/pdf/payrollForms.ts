@@ -59,6 +59,12 @@ export interface W2PdfInput {
   medicareWages?: string | number;
   /** Box 6: Medicare tax withheld. */
   medicare: string | number;
+  /** Box 10: dependent care benefits. */
+  dependentCare?: string | number | null;
+  /** Box 12: coded amounts (D 401(k), E 403(b), G 457(b), S SIMPLE, W HSA, DD employer health). */
+  box12?: Array<{ code: string; amount: string | number }> | null;
+  /** Box 14: other (informational). */
+  box14?: Array<{ label: string; amount: string | number }> | null;
   /** Boxes 15-17: state code, state wages, state income tax withheld. */
   state?: { code: string | null; wages: string | number; withheld: string | number } | null;
 }
@@ -209,6 +215,22 @@ export async function renderW2Pdf(input: W2PdfInput): Promise<Uint8Array> {
   drawBox('Medicare tax withheld',    '6', input.medicare, COL2, cursor, BOXW);
   cursor -= 50;
 
+  // Box 10 (dependent care) and Box 12 (coded amounts: 401(k) D, 403(b) E, 457(b) G, HSA W, DD).
+  const box12 = (input.box12 ?? []).filter((b) => parseFloat(String(b.amount)) > 0);
+  const hasBox10 = parseFloat(String(input.dependentCare ?? 0)) > 0;
+  if (hasBox10 || box12.length > 0) {
+    if (hasBox10) {
+      drawBox('Dependent care benefits', '10', input.dependentCare ?? 0, COL1, cursor, BOXW);
+    }
+    box12.slice(0, 4).forEach((b, i) => {
+      const letter = String.fromCharCode(97 + i); // 12a..12d
+      const col = (hasBox10 ? i + 1 : i) % 2 === 0 ? COL1 : COL2;
+      drawBox(`Code ${b.code}`, `12${letter}`, b.amount, col, cursor, BOXW);
+      if (col === COL2) cursor -= 50;
+    });
+    if (((hasBox10 ? 1 : 0) + Math.min(box12.length, 4)) % 2 === 1) cursor -= 50;
+  }
+
   // Boxes 15-17: state code / state wages / state income tax (third-width boxes).
   if (input.state) {
     const BOX3W = (MR - ML) / 3 - 4;
@@ -240,6 +262,11 @@ export async function renderW2Pdf(input: W2PdfInput): Promise<Uint8Array> {
     ['Box 4 — Social security tax withheld',       input.socialSecurity],
     ['Box 5 — Medicare wages and tips',            medicareWages],
     ['Box 6 — Medicare tax withheld',              input.medicare],
+    ...(hasBox10 ? ([['Box 10 — Dependent care benefits', input.dependentCare ?? 0]] as Array<[string, string | number]>) : []),
+    ...box12.map((b) => [`Box 12 — Code ${b.code}`, b.amount] as [string, string | number]),
+    ...(input.box14 ?? [])
+      .filter((b) => parseFloat(String(b.amount)) > 0)
+      .map((b) => [`Box 14 — ${b.label}`, b.amount] as [string, string | number]),
     ...(input.state
       ? ([
           [`Box 16 — State wages (${input.state.code ?? 'state'})`, input.state.wages],
@@ -286,6 +313,14 @@ export interface Form941Totals {
   socialSecurity: string | number;
   /** Total Medicare tax (employee + employer shares combined — 941 line 5c col 2). */
   medicare: string | number;
+  /** Line 1: employees paid in the quarter. */
+  employeeCount?: number;
+  /** Line 5a column 1: taxable Social Security wages. */
+  ssWages?: string | number;
+  /** Line 5c column 1: taxable Medicare wages. */
+  medicareWages?: string | number;
+  /** Line 5d column 1: wages subject to Additional Medicare Tax withholding. */
+  additionalMedicareWages?: string | number;
 }
 
 export interface Form941PdfInput {
@@ -387,18 +422,29 @@ export async function render941Pdf(input: Form941PdfInput): Promise<Uint8Array> 
   const totalTaxBeforeAdjustments =
     parseFloat(String(federalWithheld)) + totalSSAndMedicare;
 
-  drawLine941('1',  'Number of employees who received wages (N/A — see payroll records)', '');
+  const t = input.totals;
+  drawLine941('1',  'Number of employees who received wages',
+    t.employeeCount != null ? String(t.employeeCount) : '');
   drawLine941('2',  'Wages, tips, and other compensation',                                wages);
   drawLine941('3',  'Federal income tax withheld from wages, tips, and other compensation', federalWithheld);
+  if (t.ssWages != null) {
+    drawLine941('5a', 'Taxable social security wages (column 1)',                          t.ssWages);
+  }
   drawLine941('5a', 'Social security tax (employee + employer shares)',                    socialSecurity);
+  if (t.medicareWages != null) {
+    drawLine941('5c', 'Taxable Medicare wages & tips (column 1)',                          t.medicareWages);
+  }
   drawLine941('5c', 'Medicare tax (employee + employer shares)',                           medicare);
-  drawLine941('5d', 'Total social security and Medicare taxes (lines 5a + 5c)',             totalSSAndMedicare);
+  if (t.additionalMedicareWages != null) {
+    drawLine941('5d', 'Wages subject to Additional Medicare Tax withholding (column 1)',   t.additionalMedicareWages);
+  }
+  drawLine941('5e', 'Total social security and Medicare taxes (lines 5a + 5c + 5d)',       totalSSAndMedicare);
 
   cursor -= 4;
   hRule(cursor, ML, MR, 1, C_NAVY);
   cursor -= 18;
 
-  txt('6.  Total taxes before adjustments (line 3 + line 5d)', ML, cursor, {
+  txt('6.  Total taxes before adjustments (line 3 + line 5e)', ML, cursor, {
     font: bold, size: 10, color: C_NAVY,
   });
   txt(fmt(totalTaxBeforeAdjustments), MR, cursor, {
@@ -426,7 +472,7 @@ export async function render941Pdf(input: Form941PdfInput): Promise<Uint8Array> 
     ['Federal income tax withheld (Line 3)',               federalWithheld],
     ['Social security tax, employee + employer (Line 5a)', socialSecurity],
     ['Medicare tax, employee + employer (Line 5c)',        medicare],
-    ['Total social security + Medicare (Line 5d)',         totalSSAndMedicare],
+    ['Total social security + Medicare (Line 5e)',         totalSSAndMedicare],
     ['Total taxes before adjustments (Line 6)',            totalTaxBeforeAdjustments],
   ];
 
@@ -634,6 +680,8 @@ export interface W3PdfInput {
   socialSecurity: string | number;   // Box 4
   medicareWages: string | number;    // Box 5
   medicare: string | number;         // Box 6
+  dependentCare?: string | number;   // Box 10
+  deferredCompensation?: string | number; // Box 12a (codes D, E, F, G, H, S)
   stateWages: string | number;       // Box 16
   stateWithheld: string | number;    // Box 17
 }
@@ -717,6 +765,12 @@ export async function renderW3Pdf(input: W3PdfInput): Promise<Uint8Array> {
   drawLineW3('4',  'Social security tax withheld',     input.socialSecurity);
   drawLineW3('5',  'Medicare wages and tips',          input.medicareWages);
   drawLineW3('6',  'Medicare tax withheld',            input.medicare);
+  if (input.dependentCare != null && parseFloat(String(input.dependentCare)) > 0) {
+    drawLineW3('10', 'Dependent care benefits',        input.dependentCare);
+  }
+  if (input.deferredCompensation != null && parseFloat(String(input.deferredCompensation)) > 0) {
+    drawLineW3('12a', 'Deferred compensation',         input.deferredCompensation);
+  }
   drawLineW3('16', 'State wages, tips, etc.',          input.stateWages);
   drawLineW3('17', 'State income tax',                 input.stateWithheld);
 
