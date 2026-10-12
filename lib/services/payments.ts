@@ -36,7 +36,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { markPaidAmount } from './invoices';
 
 // ---- Types ------------------------------------------------------------------
@@ -218,10 +218,11 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
 
   // Confirm the deposit account is actually in this company.
   const [depAcct] = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.id, depositAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!depAcct) throw notFound('Deposit account');
+  assertNotControlAccount(depAcct, 'Deposit to');
 
   const arAccountId = await getArAccountId(ctx);
   const amountStr = toAmountString(totalAmount);

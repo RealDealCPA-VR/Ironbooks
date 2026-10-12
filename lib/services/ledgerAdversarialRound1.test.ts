@@ -71,6 +71,7 @@ async function expectRejected(p: Promise<unknown>, pattern?: RegExp): Promise<vo
 
 async function post(amount: string, debitCode = '1000', creditCode = '4100', date = new Date('2026-03-01')) {
   return postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date,
     description: 'QA r1 entry',
     lines: [
@@ -152,6 +153,7 @@ describe('ledger invariants — adversarial QA, re-test round 1', () => {
     // A four-line old entry: two independent balanced pairs. Moving one pair into a fresh
     // entry keeps every entry balanced, so only the immutability guard can stop it.
     const old = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2026-03-02'),
       description: 'two pairs',
       lines: [

@@ -44,7 +44,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
 import {
@@ -207,13 +207,14 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
   let depositAccountId: string;
   if (input.depositAccountId) {
     const [acct] = await ctx.db
-      .select({ id: accounts.id, type: accounts.type })
+      .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.depositAccountId)));
     if (!acct) throw notFound('Deposit account');
     if (acct.type !== 'asset') {
       throw validation('Deposit account must be an asset (bank or Undeposited Funds) account.');
     }
+    assertNotControlAccount(acct, 'Deposit to');
     depositAccountId = acct.id;
   } else {
     depositAccountId = await getOrCreateAccountByCode(ctx, '1050', {

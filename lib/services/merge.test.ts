@@ -256,6 +256,7 @@ describe('merge service (integration)', () => {
   it('trial balance remains balanced after all merge operations', async () => {
     // Post a minimal balanced entry so the trial balance has something to check.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-06-01'),
       description: 'Merge service balance check',
       lines: [

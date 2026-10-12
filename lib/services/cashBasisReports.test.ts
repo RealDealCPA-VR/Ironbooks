@@ -78,6 +78,7 @@ describe('profitAndLossCashBasis', () => {
   it('cash-basis income is 0 after posting an invoice with no payment (AR up, cash not received)', async () => {
     // Post the invoice: Dr AR $1,000 / Cr Sales $1,000.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-03-15'),
       description: 'Invoice #1 — accrual income, no cash received yet',
       lines: [
@@ -104,6 +105,7 @@ describe('profitAndLossCashBasis', () => {
   it('cash-basis income is recognised after posting the payment (AR down, Cash up)', async () => {
     // Post the payment receipt: Dr Checking $1,000 / Cr AR $1,000.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-04-10'),
       description: 'Payment receipt for Invoice #1 — cash collected',
       lines: [
@@ -129,6 +131,7 @@ describe('profitAndLossCashBasis', () => {
   it('arAdjustment is positive when AR has a net debit over the period', async () => {
     // Post another invoice that is NOT yet paid.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-06-01'),
       description: 'Invoice #2 — unpaid',
       lines: [
@@ -148,6 +151,7 @@ describe('profitAndLossCashBasis', () => {
   it('AP adjustment reduces cash expenses when AP grows (bill posted, not yet paid)', async () => {
     // Post a bill: Dr COGS $300 / Cr AP $300.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-07-01'),
       description: 'Bill from supplier — accrual expense, not yet paid',
       lines: [

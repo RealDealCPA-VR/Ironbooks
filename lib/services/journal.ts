@@ -36,6 +36,7 @@ import {
   postJournalEntry,
   voidJournalEntry,
   balanceDelta,
+  generalJournalSourceSql,
 } from './posting';
 
 // ---------------------------------------------------------------------------
@@ -1110,7 +1111,9 @@ export async function journalOpenItems(
   const conds = [
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
-    sql`(${journalEntries.sourceRef} = 'manual' OR ${journalEntries.sourceRef} LIKE 'reversal:%')`,
+    // Manual journal entries, reversals, checks, deposits, bank-feed lines, ... — anything that is
+    // not a customer/vendor document (those are counted by their own document).
+    generalJournalSourceSql(),
     eq(accounts.subtype, side === 'ar' ? 'accounts_receivable' : 'accounts_payable'),
     eq(accounts.type, side === 'ar' ? 'asset' : 'liability'),
     eq(journalEntryLines.entityType, entityType),

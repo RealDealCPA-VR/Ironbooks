@@ -37,6 +37,7 @@ import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { journalOpenItems } from './journal';
 import { unappliedCustomerPayments } from './customerCredits';
+import { generalJournalSourceSql } from './posting';
 import { ServiceError, inTransaction, writeAudit } from './_base';
 import { balanceSheetCashBasis } from './balanceSheetCashBasis';
 import { LedgerIntegrityError } from './ledgerAssert';
@@ -237,7 +238,7 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
         eq(journalEntries.companyId, ctx.companyId),
         eq(journalEntries.status, 'posted'),
         eq(journalEntryLines.accountId, arAccount.id),
-        sql`(${journalEntries.sourceRef} = 'manual' OR ${journalEntries.sourceRef} LIKE 'reversal:%')`,
+        generalJournalSourceSql(),
         sql`${journalEntryLines.entityId} IS NULL`,
       ),
     );

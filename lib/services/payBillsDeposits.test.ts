@@ -63,6 +63,7 @@ async function balance(code: string): Promise<number> {
 /** Seed an open bill: Dr expense / Cr A/P + bills row. Returns billId. */
 async function seedBill(amount: string, billNumber: string): Promise<string> {
   const entry = await postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date: new Date('2025-05-01'),
     description: `Bill ${billNumber}`,
     lines: [
@@ -98,6 +99,7 @@ async function seedBill(amount: string, billNumber: string): Promise<string> {
 /** Seed a customer payment into Undeposited Funds (mirrors receivePayment). */
 async function seedUFPayment(amount: string, ref: string): Promise<string> {
   await postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date: new Date('2025-06-01'),
     description: `Payment ${ref}`,
     lines: [
@@ -124,6 +126,7 @@ async function seedUFPayment(amount: string, ref: string): Promise<string> {
 /** Seed a sales receipt received into Undeposited Funds (mirrors createSalesReceipt). */
 async function seedUFSalesReceipt(amount: string, receiptNumber: number): Promise<string> {
   await postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date: new Date('2025-06-02'),
     description: `Sales Receipt #${receiptNumber}`,
     lines: [

@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { and, eq } from 'drizzle-orm';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, users } from '@/lib/db/schema';
+import { accounts, transfers, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createCustomer } from './customers';
@@ -96,9 +96,21 @@ describe('I11 central guard on A/R and A/P lines', () => {
     ).rejects.toThrow(/Accounts Payable account.*vendor name/);
   });
 
-  it('a transfer into A/R is refused by the database with a plain-language message', async () => {
+  it('a transfer into A/R is refused (posting guard first, database trigger behind it)', async () => {
+    // Fix round 4: a posting with no source is no longer exempt, so the posting guard refuses it
+    // before the transfers row is written.
     await expect(
       createTransfer(ctx, { date: DAY, fromAccountId: code['1000'], toAccountId: code['1200'], amount: '5.00' }),
+    ).rejects.toThrow(/Accounts Receivable/);
+    // The database trigger still refuses a transfers row on A/R written by any other path.
+    await expect(
+      db.insert(transfers).values({
+        companyId: ctx.companyId,
+        date: DAY,
+        fromAccountId: code['1000'],
+        toAccountId: code['1200'],
+        amount: '5.00',
+      }),
     ).rejects.toThrow(/cannot be transferred into or out of it/);
   });
 

@@ -97,6 +97,7 @@ describe('payments-ar: Receive Payments', () => {
     // Dr A/R / Cr Sales
     const { postJournalEntry } = await import('./posting');
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2026-01-01'),
       description: `Invoice #${nextNum} — Acme Corp`,
       lines: [

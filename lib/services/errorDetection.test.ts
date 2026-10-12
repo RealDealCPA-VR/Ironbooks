@@ -134,6 +134,7 @@ describe('AI Error Detection + LLM Corrector', () => {
   it('detectErrors finds duplicate posted entries', async () => {
     // Post the same logical transaction twice using postJournalEntry.
     const duplicateInput = {
+      allowUnnamedControl: true, // fixture posts straight to A/R
       date: new Date('2025-03-10'),
       description: 'Duplicate sale',
       lines: [

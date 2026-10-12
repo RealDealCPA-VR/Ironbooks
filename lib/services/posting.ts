@@ -64,6 +64,11 @@ export interface PostJournalEntryInput {
   sourceRef?: string;
   /** QB "Adjusting Entry" flag (shown on the Adjusting Journal Entries report). */
   isAdjusting?: boolean;
+  /**
+   * Opt out of the A/R / A/P name check (assertControlAccountNames). Test fixtures and internal
+   * repair tools only — never set it from a user-facing window.
+   */
+  allowUnnamedControl?: boolean;
 }
 
 const DEBIT_NORMAL = new Set(['asset', 'expense']);
@@ -139,10 +144,10 @@ async function nextEntryNumber(ctx: ServiceContext): Promise<number> {
 }
 
 /**
- * Source documents whose A/R / A/P lines are already counted by the aging subledger (the
- * document itself carries the customer / vendor), plus historical imports. Every other posting
- * that touches an Accounts Receivable or Accounts Payable account must name the customer /
- * vendor on that line, or A/R aging would stop matching the A/R balance (QB invariant I11).
+ * Source documents whose own A/R / A/P line is counted by the aging subledger (the document
+ * itself carries the customer / vendor), plus historical imports. Named A/R / A/P lines posted by
+ * anything else (manual journal entries, checks, deposits, bank-feed lines, reversals, ...) are
+ * General Journal open items in aging (journal.ts journalOpenItems) — see QB invariant I11.
  */
 const SUBLEDGER_SOURCE_RE =
   /^(invoice|credit_memo|refund|payment|customer|bill|vendor|vendor_credit|salesreceipt|condense|iif|qbgl):/;
@@ -152,34 +157,129 @@ export function isSubledgerSource(sourceRef: string | null | undefined): boolean
 }
 
 /**
- * Refuse an unnamed line on an A/R account (needs a customer) or an A/P account (needs a
- * vendor), unless the posting comes from a customer/vendor document (see SUBLEDGER_SOURCE_RE).
- * This is the single choke point for checks, deposits, transfers, account opening balances,
- * bank-feed categorizing, expense reports, FX adjustments, reversals and anything added later.
+ * SQL test (on journal_entries.source_ref) for postings whose named A/R / A/P lines are open
+ * items in A/R / A/P aging: everything that is not a customer/vendor document or an import.
+ */
+export const generalJournalSourceSql = () =>
+  sql`(${journalEntries.sourceRef} IS NULL OR ${journalEntries.sourceRef} !~ ${SUBLEDGER_SOURCE_RE.source})`;
+
+/**
+ * Which control account a document's own line is on. 'ar' documents may carry their own
+ * (unnamed) A/R line, 'ap' documents their own A/P line, 'either' one of the two (refunds of a
+ * credit memo / payment / vendor credit), 'none' neither (a Sales Receipt never touches A/R or
+ * A/P in QB). Imports are not checked line by line (they are reconciled on import).
+ */
+const DOCUMENT_SIDE: Record<string, 'ar' | 'ap' | 'either' | 'none' | 'import'> = {
+  invoice: 'ar',
+  credit_memo: 'ar',
+  payment: 'ar',
+  customer: 'ar',
+  bill: 'ap',
+  vendor: 'ap',
+  vendor_credit: 'ap',
+  refund: 'either',
+  salesreceipt: 'none',
+  condense: 'import',
+  iif: 'import',
+  qbgl: 'import',
+};
+
+function documentSide(sourceRef: string | null | undefined) {
+  if (!sourceRef) return undefined;
+  const i = sourceRef.indexOf(':');
+  return i > 0 ? DOCUMENT_SIDE[sourceRef.slice(0, i)] : undefined;
+}
+
+type ControlSide = 'ar' | 'ap';
+function controlSideOf(acct: { type: string; subtype: string | null }): ControlSide | null {
+  if (acct.type === 'asset' && acct.subtype === 'accounts_receivable') return 'ar';
+  if (acct.type === 'liability' && acct.subtype === 'accounts_payable') return 'ap';
+  return null;
+}
+
+const SIDE_LABEL: Record<ControlSide, string> = { ar: 'Accounts Receivable', ap: 'Accounts Payable' };
+
+/**
+ * QB lists only bank, Undeposited Funds and other cash-like accounts in "Deposit to" / "Pay
+ * from". Refuse A/R and A/P there up front with a plain-language message (the posting guard
+ * below refuses them too).
+ */
+export function assertNotControlAccount(
+  acct: { type: string; subtype: string | null; name?: string | null },
+  role: string,
+): void {
+  const side = controlSideOf(acct);
+  if (side) {
+    throw validation(
+      `${acct.name ? `"${acct.name}" is an ${SIDE_LABEL[side]} account. ` : ''}${SIDE_LABEL[side]} can't be used as the "${role}" account. Pick a bank account or Undeposited Funds.`,
+    );
+  }
+}
+
+/**
+ * QB invariant I11 (A/R aging == A/R balance, A/P aging == A/P balance), checked line by line on
+ * every posting — the single choke point for every window, current and future:
+ *  - A customer/vendor document may carry its OWN control line unnamed (the document is the
+ *    subledger item): an invoice / credit memo / customer payment its A/R line, a bill / bill
+ *    payment / vendor credit its A/P line, a refund the one control line of the document it
+ *    refunds. That line must be a single direction (an invoice only charges A/R, a payment only
+ *    relieves it), so a "Deposit to" or "Pay from" or item/expense line on the same control
+ *    account is refused. Any OTHER control line on a document (an A/P line on a customer form,
+ *    an A/R line on a bill, any control line on a Sales Receipt) is refused, as in QB.
+ *  - Every other posting (manual journal entries, checks, deposits, bank-feed lines, reversals,
+ *    account opening balances, FX adjustments, postings with no source at all, ...) must name the
+ *    customer on each A/R line and the vendor on each A/P line; aging shows those lines as
+ *    General Journal items for that name.
+ * `allowUnnamedControl` is an explicit opt-out for tests and internal repair tools only.
  */
 export function assertControlAccountNames(
-  input: Pick<PostJournalEntryInput, 'lines' | 'sourceRef'>,
+  input: Pick<PostJournalEntryInput, 'lines' | 'sourceRef' | 'allowUnnamedControl'>,
   accountRows: ReadonlyArray<{ id: string; type: string; subtype: string | null; name: string }>,
 ): void {
-  // Postings without a source are direct engine calls (internal helpers, test fixtures). Every
-  // user-facing window passes a source ('manual', 'expense:…', 'deposit:…', 'account:…',
-  // 'bank_transaction:…', 'reversal:…', …) and is checked here; Transfer Funds is refused at
-  // the database (0025 bka_transfers_no_ar_ap) because it posts without a source.
-  if (!input.sourceRef || isSubledgerSource(input.sourceRef)) return;
+  if (input.allowUnnamedControl) return;
+  const docSide = documentSide(input.sourceRef);
+  if (docSide === 'import') return;
   const byId = new Map(accountRows.map((a) => [a.id, a]));
+
+  if (docSide === undefined) {
+    for (const l of input.lines) {
+      const acct = byId.get(l.accountId);
+      if (!acct) continue;
+      const side = controlSideOf(acct);
+      if (side === 'ar' && l.entityType !== 'customer') {
+        throw validation(
+          `"${acct.name}" is an Accounts Receivable account. Amounts can only go there with a customer name — use an invoice, a payment, a credit memo or a journal entry that names the customer.`,
+        );
+      }
+      if (side === 'ap' && l.entityType !== 'vendor') {
+        throw validation(
+          `"${acct.name}" is an Accounts Payable account. Amounts can only go there with a vendor name — use a bill, a bill payment, a vendor credit or a journal entry that names the vendor.`,
+        );
+      }
+    }
+    return;
+  }
+
+  let ownSide: ControlSide | null = docSide === 'either' ? null : docSide === 'none' ? null : docSide;
+  let direction: 'debit' | 'credit' | null = null;
   for (const l of input.lines) {
     const acct = byId.get(l.accountId);
     if (!acct) continue;
-    if (acct.type === 'asset' && acct.subtype === 'accounts_receivable' && l.entityType !== 'customer') {
+    const side = controlSideOf(acct);
+    if (!side) continue;
+    if (docSide === 'either' && ownSide === null) ownSide = side;
+    if (side !== ownSide) {
       throw validation(
-        `"${acct.name}" is an Accounts Receivable account. Amounts can only go there with a customer name — use an invoice, a payment, a credit memo or a journal entry that names the customer.`,
+        `"${acct.name}" is an ${SIDE_LABEL[side]} account and can't be used on this form. Pick a bank, Undeposited Funds, income or expense account instead.`,
       );
     }
-    if (acct.type === 'liability' && acct.subtype === 'accounts_payable' && l.entityType !== 'vendor') {
+    const dir = l.debit != null && Money.gt(l.debit, 0) ? 'debit' : 'credit';
+    if (direction && dir !== direction) {
       throw validation(
-        `"${acct.name}" is an Accounts Payable account. Amounts can only go there with a vendor name — use a bill, a bill payment, a vendor credit or a journal entry that names the vendor.`,
+        `"${acct.name}" is this form's ${SIDE_LABEL[side]} account, so it can't also be the "Deposit to", "Pay from" or a line account. Pick a bank, Undeposited Funds, income or expense account instead.`,
       );
     }
+    direction = dir;
   }
 }
 

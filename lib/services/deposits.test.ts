@@ -89,6 +89,7 @@ describe('Deposits service', () => {
   async function seedUFPayment(amount: string, ref: string): Promise<string> {
     // Post GL: Dr UF / Cr AR
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-06-01'),
       description: `Payment from customer (${ref})`,
       lines: [
