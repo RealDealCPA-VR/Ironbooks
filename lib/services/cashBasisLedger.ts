@@ -548,8 +548,9 @@ export async function cashBasisLedger(ctx: ServiceContext, opts: { to?: Date } =
       );
     }
     // Cumulative recognition through each settlement (see splitCumulative): rounded once per
-    // settlement, split so a line only ever moves in the settlement's direction, and the last
-    // settlement (frac = 1) lands every line exactly on its own amount.
+    // settlement, each line within a cent of its pro-rata share, moved from the previous
+    // settlement only in this settlement's direction; the last (frac = 1) lands every line
+    // exactly on its own amount.
     const prev = gl.map(() => Money.zero());
     let cum = Money.zero();
     for (const e of events) {
@@ -557,7 +558,7 @@ export async function cashBasisLedger(ctx: ServiceContext, opts: { to?: Date } =
       // Negative settlements (a bounced check) reverse recognition on their own date.
       cum = cum.plus(e.amount);
       const frac = Money.gte(cum, doc.base) ? Money.of(1) : cum.lessThanOrEqualTo(0) ? Money.zero() : Money.div(cum, doc.base);
-      const through = splitCumulative(gl.map((g) => g.net), frac);
+      const through = splitCumulative(gl.map((g) => g.net), frac, prev);
       gl.forEach((g, i) => {
         const inc = through[i].minus(prev[i]);
         prev[i] = through[i];
@@ -581,27 +582,28 @@ const B1 = BigInt(1);
 const B2 = BigInt(2);
 
 /**
- * Cumulative amount of each line recognized at fraction `frac` of the document.
+ * Cumulative amount of each line recognized at fraction `frac` of the document, given what was
+ * recognized through the previous settlement (`prev`, signed like `nets`; omitted = nothing yet).
  *
  * Lines are split into two same-sign groups (e.g. income vs. COGS on an invoice). The smaller
  * group recognizes round2(frac × its total); the group with the document's net sign recognizes
  * the rest of round2(frac × net), so each settlement recognizes exactly its share of the cash
- * (no 9.99 for 10.00) and both group totals only grow with frac. Those T cents are handed out
- * by a DIVISOR method (Sainte-Laguë / Webster): every cent of the group is ranked once, for
- * good, by amount ÷ (cents already given + ½), ties to the earlier line, and the first T cents
- * of that fixed ranking are recognized. Because the ranking never depends on `frac`, a larger
- * fraction only ever ADDS cents to a line (house-monotone): a payment never moves a line
- * against its own sign, a bounced check only ever moves lines back toward zero, and at
- * frac = 1 every line lands exactly on its own amount. (Largest remainder recomputed from
- * cumulative totals does not have this property — the Alabama paradox.)
+ * (no 9.99 for 10.00) and both group totals only move with frac. Inside a group the cents are
+ * handed out by the Balinski–Young quota rule, applied to the whole jump since `prev`
+ * (see quotaStep): every line stays within one cent of its exact pro-rata share of the group
+ * (never 3,333.30 for a one-third share of 10,000.00), a payment never moves a line against its
+ * sign, a bounced check only moves lines back toward zero, and at frac = 1 every line lands
+ * exactly on its own amount.
  */
-export function splitCumulative(nets: Decimal[], frac: Decimal): Decimal[] {
+export function splitCumulative(nets: Decimal[], frac: Decimal, prev?: Decimal[]): Decimal[] {
   if (frac.greaterThanOrEqualTo(1)) return nets.map((n) => Money.round2(n));
+  const toCents = (d: Decimal) => BigInt(Money.round2(d).times(100).toFixed(0));
+  const cents = nets.map(toCents);
+  const before = nets.map((_, i) => (prev ? toCents(prev[i]) : B0));
   const out = nets.map(() => Money.zero());
-  if (!frac.greaterThan(0)) return out;
-  const cents = nets.map((n) => BigInt(Money.round2(n).times(100).toFixed(0)));
+  const fr = frac.greaterThan(0) ? frac : Money.zero();
   const roundCents = (c: bigint) =>
-    BigInt(Money.round2(Money.mul(new DecimalValue(c.toString()).dividedBy(100), frac)).times(100).toFixed(0));
+    BigInt(Money.round2(Money.mul(new DecimalValue(c.toString()).dividedBy(100), fr)).times(100).toFixed(0));
   const net = cents.reduce((a, x) => a + x, B0);
   // The group with the net's sign absorbs the net target, so the settlement recognizes exactly
   // round2(frac × net); the other group is rounded on its own. Both targets are monotone in frac.
@@ -614,10 +616,14 @@ export function splitCumulative(nets: Decimal[], frac: Decimal): Decimal[] {
   const targets = [smallTarget, roundCents(net) - smallTarget];
   groups.forEach((g, gi) => {
     if (g.idx.length === 0) return;
-    const alloc = divisorApportion(
-      g.idx.map((i) => cents[i] * g.sign),
-      targets[gi] * g.sign,
-    );
+    const m = g.idx.map((i) => cents[i] * g.sign);
+    // previous recognition in this group's direction, clamped to the line (defensive)
+    const p = g.idx.map((i, k) => {
+      const v = before[i] * g.sign;
+      return v < B0 ? B0 : v > m[k] ? m[k] : v;
+    });
+    const t = targets[gi] * g.sign;
+    const alloc = quotaStep(m, p, t < B0 ? B0 : t);
     g.idx.forEach((i, k) => {
       out[i] = new DecimalValue((alloc[k] * g.sign).toString()).dividedBy(100);
     });
@@ -626,47 +632,136 @@ export function splitCumulative(nets: Decimal[], frac: Decimal): Decimal[] {
 }
 
 /**
- * Webster apportionment of `target` units over integer weights `m` (target ≤ sum m): the first
- * `target` units of the fixed ranking of (line i, unit j) by m_i ÷ (j + ½) descending, ties to
- * the lower index. Exact integer arithmetic; O(lines) adjustments.
+ * Move an allocation of integer cents over weights `m` from `p` to a new total `target`
+ * (0 ≤ target ≤ Σm) so that every line stays within quota — strictly less than one unit from
+ * its exact share target·m_i/Σm — and moves only in the direction of the change.
+ *
+ * Lower quota is floor(share), upper quota ceil(share). Each line first goes to the nearer of
+ * its quota bounds that keeps it on its side of `p`; the few cents left (fewer than the number
+ * of lines) go one each to the lines whose next cent falls due soonest, i.e. whose share will
+ * reach the next whole cent first. That is the Balinski–Young quota method (Jefferson priority
+ * restricted to lines under their upper quota): taking the earliest-due lines keeps every later
+ * total reachable within quota, so a sequence of payments never breaks quota. When it is
+ * provably just as safe, the cents go to the largest remainders instead (see pickExtras).
+ * Only after a reversal (a bounced check moves the total down, then back up) can quota become
+ * unreachable without moving a line backwards; monotonicity wins, and the leftover goes to the most
+ * overdue lines (a line may then sit a cent or two off its share until the next settlement).
  */
-function divisorApportion(m: bigint[], target: bigint): bigint[] {
+function quotaStep(m: bigint[], p: bigint[], target: bigint): bigint[] {
   const total = m.reduce((a, x) => a + x, B0);
-  if (target <= B0) return m.map(() => B0);
   if (target >= total) return [...m];
-  // Units strictly above the threshold total/target: unit j of line i qualifies when
-  // m_i/(j+½) > total/target  ⇔  j < (2·m_i·target − total) / (2·total).
-  const a = m.map((mi) => {
-    const num = B2 * mi * target - total;
-    if (num <= B0) return B0;
-    const den = B2 * total;
-    const c = (num + den - B1) / den; // ceil(num/den): count of j ≥ 0 with j < num/den
-    return c > mi ? mi : c;
-  });
-  // value of unit j of line i is m_i/(j+½); compare m_i·(2k+1) vs m_k·(2j+1).
-  const better = (i: number, ji: bigint, k: number, jk: bigint) => {
-    const l = m[i] * (B2 * jk + B1);
-    const r = m[k] * (B2 * ji + B1);
-    return l > r || (l === r && i < k);
+  if (target <= B0) return m.map(() => B0);
+  const before = p.reduce((a, x) => a + x, B0);
+  const up = target >= before;
+  const lowerQ = m.map((mi) => (target * mi) / total);
+  const upperQ = m.map((mi, i) => ((target * mi) % total === B0 ? lowerQ[i] : lowerQ[i] + B1));
+  // house by which unit k of line i is due under lower quota: ceil(k·total / m_i)
+  const due = (i: number, k: bigint) => (k * total + m[i] - B1) / m[i];
+  const byDue = (a: bigint[]) => (x: number, y: number) => {
+    const dx = due(x, a[x] + B1);
+    const dy = due(y, a[y] + B1);
+    return dx < dy ? -1 : dx > dy ? 1 : x - y;
   };
-  let sum = a.reduce((s, x) => s + x, B0);
-  while (sum < target) {
-    let best = -1;
-    for (let i = 0; i < m.length; i++) {
-      if (a[i] >= m[i]) continue;
-      if (best < 0 || better(i, a[i], best, a[best])) best = i;
-    }
-    a[best] += B1;
-    sum += B1;
+  // Start every line at its lower quota (or at p when the move's direction forbids going there).
+  let a = m.map((_, i) => (up ? (p[i] > lowerQ[i] ? p[i] : lowerQ[i]) : p[i] < lowerQ[i] ? p[i] : lowerQ[i]));
+  const hi = m.map((_, i) => (up ? (p[i] > upperQ[i] ? p[i] : upperQ[i]) : p[i] < upperQ[i] ? p[i] : upperQ[i]));
+  let rem = target - a.reduce((s, x) => s + x, B0);
+  if (rem < B0) {
+    // (up only, after a reversal) lower quota out of reach: keep p and fill the most overdue.
+    a = [...p];
+    rem = target - before;
+    return fillByDue(a, lowerQ, rem, byDue, m);
   }
-  while (sum > target) {
-    let worst = -1;
-    for (let i = 0; i < m.length; i++) {
-      if (a[i] <= B0) continue;
-      if (worst < 0 || better(worst, a[worst] - B1, i, a[i] - B1)) worst = i;
+  const cand = m.map((_, i) => i).filter((i) => a[i] < hi[i]); // each at most one cent short
+  const sticky = m.map((_, i) => i).filter((i) => a[i] > lowerQ[i]);
+  const k = rem < BigInt(cand.length) ? Number(rem) : cand.length;
+  for (const i of pickExtras(m, total, target, a, cand, k, sticky, due, byDue)) {
+    a[i] += B1;
+    rem -= B1;
+  }
+  // (down only, after a reversal) upper quota out of reach: stay at p for the most overdue.
+  return rem > B0 ? fillByDue(a, up ? m : p, rem, byDue, m) : a;
+}
+
+/**
+ * Which `k` of the candidate lines (each one cent short of its upper quota) get the leftover
+ * cents. The safe choice is the earliest-due lines (quota method). The nearest-to-exact choice
+ * is the lines with the largest remainders (what a per-line rounding would show, e.g. 3,333.33
+ * rather than 3,333.34 for a third of 10,000.00). Use the largest remainders whenever that
+ * provably keeps every later total reachable within quota, else the earliest-due lines.
+ *
+ * Later totals y stay reachable iff at every y the cents still owed by rounded-up lines whose
+ * share has not caught up (count of chosen due dates > y) fit in the fractional slack
+ * r(y) = Σ frac(y·m_i/total). The earliest-due set is feasible; the largest-remainder set
+ * differs only on [earliest j-th due, largest-remainder j-th due), where a lower bound of r(y)
+ * (exact per line while it wraps at most once, else 0) must cover the count.
+ */
+function pickExtras(
+  m: bigint[],
+  total: bigint,
+  target: bigint,
+  a: bigint[],
+  cand: number[],
+  k: number,
+  sticky: number[],
+  due: (i: number, u: bigint) => bigint,
+  byDue: (a: bigint[]) => (x: number, y: number) => number,
+): number[] {
+  const cmpDue = byDue(a);
+  const edf = [...cand].sort(cmpDue).slice(0, k);
+  const residue = (i: number) => (target * m[i]) % total;
+  const lr = [...cand]
+    .sort((x, y) => {
+      const rx = residue(x);
+      const ry = residue(y);
+      return rx > ry ? -1 : rx < ry ? 1 : cmpDue(x, y);
+    })
+    .slice(0, k);
+  const inEdf = new Set(edf);
+  if (lr.every((i) => inEdf.has(i))) return edf;
+  const asc = (x: bigint, y: bigint) => (x < y ? -1 : x > y ? 1 : 0);
+  const stickyDue = sticky.map((i) => due(i, a[i]));
+  const dEdf = [...stickyDue, ...edf.map((i) => due(i, a[i] + B1))].sort(asc);
+  const dLr = [...stickyDue, ...lr.map((i) => due(i, a[i] + B1))].sort(asc);
+  const K = dEdf.length;
+  for (let j = 0; j < K; j++) {
+    if (dLr[j] <= dEdf[j]) continue;
+    const need = BigInt(K - j);
+    const lo = dEdf[j];
+    const len = dLr[j] - B1 - lo;
+    let slack = B0; // Σ_i min over y in [lo, lo+len] of (y·m_i mod total), a lower bound
+    for (const mi of m) {
+      const r0 = (lo * mi) % total;
+      const end = r0 + len * mi;
+      if (end < total) slack += r0;
+      else if (end < B2 * total) {
+        const wrapped = r0 + ((total - r0 + mi - B1) / mi) * mi - total;
+        slack += wrapped < r0 ? wrapped : r0;
+      }
     }
-    a[worst] -= B1;
-    sum -= B1;
+    if (slack <= (need - B1) * total) return edf;
+  }
+  return lr;
+}
+
+/** Give `rem` units to lines below `cap`, whole lines at a time, earliest-due first. */
+function fillByDue(
+  a: bigint[],
+  cap: bigint[],
+  rem: bigint,
+  byDue: (a: bigint[]) => (x: number, y: number) => number,
+  m: bigint[],
+): bigint[] {
+  for (const i of a.map((_, k) => k).filter((k) => a[k] < cap[k]).sort(byDue(a))) {
+    if (rem === B0) return a;
+    const g = cap[i] - a[i] < rem ? cap[i] - a[i] : rem;
+    a[i] += g;
+    rem -= g;
+  }
+  for (let i = 0; i < a.length && rem > B0; i++) {
+    const g = m[i] - a[i] < rem ? m[i] - a[i] : rem;
+    a[i] += g;
+    rem -= g;
   }
   return a;
 }

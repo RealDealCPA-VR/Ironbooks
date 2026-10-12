@@ -111,7 +111,7 @@ describe('largest-remainder split', () => {
     const base = Money.of('69.48');
     let prev = nets.map(() => Money.zero());
     for (const cum of ['0.05', '17.14', '17.15', '29.43', '67.33', '69.48']) {
-      const cur = splitCumulative(nets, Money.div(cum, base));
+      const cur = splitCumulative(nets, Money.div(cum, base), prev);
       cur.forEach((x, i) => {
         const inc = x.minus(prev[i]);
         expect(inc.greaterThan(0), `line ${i} income reversed by a positive payment at cum ${cum}: ${inc.toFixed(2)}`).toBe(false);

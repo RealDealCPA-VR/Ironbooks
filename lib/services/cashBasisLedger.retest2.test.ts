@@ -134,7 +134,7 @@ describe('splitCumulative: pro-rata to the penny (re-test 2)', () => {
       let prevCum = 0;
       for (let step = 0; step < 12; step++) {
         const cum = step === 11 ? bc : Math.floor(r() * bc);
-        const cur = splitCumulative(nets, Money.div(cum / 100, base));
+        const cur = splitCumulative(nets, Money.div(cum / 100, base), prev);
         cur.forEach((x, i) => {
           const inc = x.minus(prev[i]);
           if (inc.isZero()) return;
