@@ -15,6 +15,8 @@ export const salesOrderLineSchema = z.object({
   quantity: zDecimal,
   /** Omit on item lines to have the server price the line (advanced pricing). */
   rate: zDecimal.nullish(),
+  /** QB "Tax" column; defaults to true. */
+  taxable: z.boolean().optional(),
 });
 
 export const createSalesOrderSchema = z.object({
@@ -24,6 +26,8 @@ export const createSalesOrderSchema = z.object({
   allowDuplicateNumber: z.boolean().nullish(),
   date: zDate,
   memo: z.string().nullish(),
+  /** Omitted → the customer's tax item; null → no tax. */
+  taxRateId: zUuid.nullish(),
   lines: zLines(salesOrderLineSchema),
   ...shippingFields,
   ...sendFlagFields,

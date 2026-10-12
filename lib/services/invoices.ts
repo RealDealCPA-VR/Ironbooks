@@ -68,7 +68,8 @@ import {
   saveDocumentInventoryDetails,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { allocateDocNumber, docRef } from './docNumbers';
+import { applyCustomerTaxDefaults } from './customerDefaults';
+import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import {
   assertEstimatesNotRejected,
   checkEstimateOverBilling,
@@ -1379,6 +1380,8 @@ export async function auditCreditLimitOverride(
 }
 
 export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
+  // Customer's tax item when the form left it out; non-taxable customer → untaxed lines.
+  input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   const prep = await prepareInvoice(ctx, input);
   const isDraft = input.status === 'draft';
 
@@ -1730,6 +1733,7 @@ function keepEstimateLinks(
 }
 
 export async function updateInvoice(ctx: ServiceContext, id: string, input: CreateInvoiceInput) {
+  input = await applyCustomerTaxDefaults(ctx, input);
   // Pre-check outside the transaction for a fast, friendly error.
   const [existing] = await ctx.db
     .select()
@@ -1763,6 +1767,10 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       if (!invoice || invoice.status !== 'draft') {
         throw new ServiceError('CONFLICT', 'Invoice is no longer a draft — reload and retry.');
       }
+      const renum = await renumberDoc(
+        tx, 'invoice', id, { refNumber: invoice.refNumber, number: invoice.invoiceNumber },
+        input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+      );
 
       const oldDraftLines = await tx.db
         .select()
@@ -1804,6 +1812,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           date: input.date,
           dueDate: input.dueDate ?? null,
           status: 'draft',
+          ...(renum ? { refNumber: renum.refNumber, invoiceNumber: renum.number } : {}),
           taxRateId: input.taxRateId ?? null,
           classId: prep.headerClassId,
           jobId: prep.headerJobId,
@@ -1832,8 +1841,13 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         action: 'update',
         entityType: 'invoice',
         entityId: id,
-        oldValues: { status: 'draft', total: invoice.total },
-        newValues: { status: 'draft', total: toAmountString(prep.total) },
+        oldValues: { status: 'draft', total: invoice.total, refNumber: invoice.refNumber },
+        newValues: {
+          status: 'draft',
+          total: toAmountString(prep.total),
+          refNumber: renum?.refNumber ?? invoice.refNumber,
+          duplicateNumber: renum?.duplicate || undefined,
+        },
       });
 
       return { ...updated, lines: prep.computedLines };
@@ -1852,6 +1866,12 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     }
     const externalPaid = await externalPaidAmount(tx, invoice);
     assertEditKeepsApplications(invoice, input, prep, externalPaid);
+    // QB lets the user change the number on a saved invoice (duplicate → warn + confirm).
+    const renum = await renumberDoc(
+      tx, 'invoice', id, { refNumber: invoice.refNumber, number: invoice.invoiceNumber },
+      input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+    );
+    const shownRef = renum ? renum.refNumber : docRef(invoice.refNumber, invoice.invoiceNumber);
 
     // Snapshot old lines for the audit trail BEFORE replacing them.
     const oldLines = await tx.db
@@ -1901,8 +1921,8 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     );
 
     // 4) Re-post the GL entry from the new document, then update the header in
-    //    place — invoiceNumber and createdAt are intentionally NOT touched.
-    const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
+    //    place — createdAt is intentionally NOT touched (the number only when retyped).
+    const entry = await postInvoiceGL(tx, prep, id, shownRef, input.date);
     if (prep.creditLimitOverride) await auditCreditLimitOverride(tx, id, prep.creditLimitOverride);
 
     const paidNow = prep.paymentTotal.plus(externalPaid);
@@ -1913,6 +1933,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         customerId: input.customerId,
         date: input.date,
         dueDate: input.dueDate ?? null,
+        ...(renum ? { refNumber: renum.refNumber, invoiceNumber: renum.number } : {}),
         status:
           balanceNow.lessThanOrEqualTo(0) && paidNow.greaterThan(0)
             ? 'paid'
@@ -1946,14 +1967,14 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
 
     // 5) Re-post perpetual inventory COGS for the new lines (site detail carried forward
     //    for lines the edit did not touch).
-    await postInvoiceCOGS(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
+    await postInvoiceCOGS(tx, prep, id, shownRef, input.date);
     await postDocumentInventory(tx, {
       sourceType: 'invoice',
       sourceId: id,
       date: input.date,
       direction: 'out',
       lines: inventoryLinesOf(input.lines, prep),
-      memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
+      memo: `Invoice #${shownRef}`,
       carryForward: true,
     });
 
@@ -1964,6 +1985,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       entityId: id,
       oldValues: {
         customerId: invoice.customerId,
+        refNumber: invoice.refNumber,
         date: invoice.date,
         dueDate: invoice.dueDate,
         subtotal: invoice.subtotal,
@@ -1982,6 +2004,8 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       },
       newValues: {
         customerId: input.customerId,
+        refNumber: shownRef,
+        duplicateNumber: renum?.duplicate || undefined,
         date: input.date,
         dueDate: input.dueDate ?? null,
         subtotal: toAmountString(prep.subtotal),

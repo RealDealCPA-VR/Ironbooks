@@ -24,7 +24,8 @@ import {
 } from './_base';
 import { createInvoice } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { allocateDocNumber, docRef } from './docNumbers';
+import { applyCustomerTaxDefaults } from './customerDefaults';
+import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import {
   estimateLineProgress,
   overBilledLine,
@@ -223,6 +224,7 @@ async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) 
 }
 
 export async function createEstimate(ctx: ServiceContext, input: CreateEstimateInput) {
+  input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   const { computedLines, subtotal, taxAmount, total } = await prepareEstimate(ctx, input);
 
   return inTransaction(ctx, async (tx) => {
@@ -701,6 +703,7 @@ export async function createProgressInvoice(
  * progress-billed) — the invoices carry its amounts; edit those instead.
  */
 export async function updateEstimate(ctx: ServiceContext, id: string, input: CreateEstimateInput) {
+  input = await applyCustomerTaxDefaults(ctx, input);
   const existing = await getEstimate(ctx, id);
   if (existing.status === 'closed' || existing.convertedInvoiceId) {
     throw new ServiceError(
@@ -724,6 +727,10 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
     if (!current || current.status === 'closed' || current.status === 'partial') {
       throw new ServiceError('CONFLICT', 'This estimate changed while you were editing it — reload and try again.');
     }
+    const renum = await renumberDoc(
+      tx, 'estimate', id, { refNumber: current.refNumber, number: current.estimateNumber },
+      input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+    );
     await tx.db.delete(estimateLines).where(eq(estimateLines.estimateId, id));
     await tx.db.insert(estimateLines).values(
       computedLines.map((cl) => ({
@@ -750,6 +757,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         total: toAmountString(total),
         memo: input.memo ?? null,
         taxRateId: input.taxRateId ?? null,
+        ...(renum ? { refNumber: renum.refNumber, estimateNumber: renum.number } : {}),
         toBePrinted: input.toBePrinted ?? current.toBePrinted,
         toBeEmailed: input.toBeEmailed ?? current.toBeEmailed,
         updatedAt: new Date(),
@@ -765,6 +773,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         customerId: existing.customerId,
         date: existing.date,
         expirationDate: existing.expirationDate,
+        refNumber: existing.refNumber,
         total: existing.total,
         memo: existing.memo,
         lines: existing.lines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),
@@ -773,6 +782,8 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         customerId: input.customerId,
         date: input.date,
         expirationDate: input.expirationDate ?? null,
+        refNumber: renum?.refNumber ?? existing.refNumber,
+        duplicateNumber: renum?.duplicate || undefined,
         total: toAmountString(total),
         memo: input.memo ?? null,
         lines: computedLines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),

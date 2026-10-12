@@ -23,7 +23,7 @@
  */
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { customers, items, salesOrders, salesOrderLines } from '@/lib/db/schema';
+import { customers, items, salesOrders, salesOrderLines, taxRates } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -34,7 +34,8 @@ import {
 } from './_base';
 import { createInvoice, shippingColumns } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { allocateDocNumber } from './docNumbers';
+import { applyCustomerTaxDefaults } from './customerDefaults';
+import { allocateDocNumber, renumberDoc } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,6 +49,8 @@ export interface SalesOrderLineInput {
   quantity: string | number;
   /** Unit price; omit on item lines to price server-side (lib/services/pricing.ts). */
   rate?: string | number | null;
+  /** QB "Tax" column; defaults to true. */
+  taxable?: boolean;
 }
 
 export interface CreateSalesOrderInput {
@@ -62,6 +65,11 @@ export interface CreateSalesOrderInput {
   date: Date;
   lines: SalesOrderLineInput[];
   memo?: string | null;
+  /**
+   * Sales tax item (taxRates row). Omitted → the customer's tax item; null → no tax. Tax is
+   * taxable lines × rate, the same math as invoices, and carries to the invoice on conversion.
+   */
+  taxRateId?: string | null;
   // wave2 sales: shipping (B6) + send queues (C7)
   shipDate?: Date | null;
   shipVia?: string | null;
@@ -94,6 +102,16 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, input.customerId)));
   if (!customer) throw notFound('Customer');
 
+  let taxRateDecimal = Money.zero();
+  if (input.taxRateId) {
+    const [taxRow] = await ctx.db
+      .select({ rate: taxRates.rate })
+      .from(taxRates)
+      .where(and(eq(taxRates.companyId, ctx.companyId), eq(taxRates.id, input.taxRateId)));
+    if (!taxRow) throw notFound('Tax rate');
+    taxRateDecimal = Money.of(taxRow.rate);
+  }
+
   // Compute per-line amounts.
   type ComputedLine = {
     itemId: string | null;
@@ -101,6 +119,7 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
     quantity: string;
     rate: string;
     amount: string;
+    taxable: boolean;
     lineOrder: number;
     pricing: AppliedPricing | null;
   };
@@ -113,6 +132,7 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
   );
 
   let subtotal = Money.zero();
+  let taxableSubtotal = Money.zero();
   const computedLines: ComputedLine[] = [];
 
   for (let i = 0; i < pricedLines.length; i++) {
@@ -126,6 +146,8 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
 
     const amount = Money.round2(Money.mul(qty, rate));
     subtotal = subtotal.plus(amount);
+    const taxable = input.lines[i].taxable !== false;
+    if (taxable) taxableSubtotal = taxableSubtotal.plus(amount);
 
     computedLines.push({
       itemId: l.itemId ?? null,
@@ -133,18 +155,22 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
       quantity: qty.toFixed(4),
       rate: rate.toFixed(4),
       amount: toAmountString(amount),
+      taxable,
       lineOrder: i,
       pricing: l.pricing,
     });
   }
 
-  const total = Money.round2(subtotal);
+  // Sales tax — identical to the invoice computation: taxableSubtotal * rate, 2dp.
+  const taxAmount = Money.round2(Money.mul(taxableSubtotal, taxRateDecimal));
+  const total = Money.round2(subtotal.plus(taxAmount));
 
-  return { computedLines, subtotal, total };
+  return { computedLines, subtotal, taxAmount, total };
 }
 
 export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInput) {
-  const { computedLines, subtotal, total } = await prepareSalesOrder(ctx, input);
+  input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
+  const { computedLines, subtotal, taxAmount, total } = await prepareSalesOrder(ctx, input);
 
   return inTransaction(ctx, async (tx) => {
     const { refNumber, number: orderNumber } = await allocateDocNumber(tx, 'sales_order', input.refNumber, {
@@ -161,6 +187,8 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
         date: input.date,
         status: 'open',
         subtotal: toAmountString(subtotal),
+        taxRateId: input.taxRateId ?? null,
+        taxAmount: toAmountString(taxAmount),
         total: toAmountString(total),
         memo: input.memo ?? null,
         ...shippingColumns(input),
@@ -175,6 +203,7 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
         quantity: cl.quantity,
         rate: cl.rate,
         amount: cl.amount,
+        taxable: cl.taxable,
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
       })),
@@ -434,6 +463,8 @@ export async function convertToInvoice(
       customerId: order.customerId,
       date: opts?.date ?? order.date,
       memo: order.memo,
+      // The order's tax item and Tax column carry over (null = the order was not taxed).
+      taxRateId: order.taxRateId ?? null,
       overrideCreditLimit: opts?.overrideCreditLimit,
       // wave2 sales (B6): the invoice inherits the order shipping details.
       shipDate: order.shipDate,
@@ -447,6 +478,7 @@ export async function convertToInvoice(
         description: line.description ?? null,
         quantity: qty.toFixed(4),
         rate: line.rate,
+        taxable: line.taxable,
         pricing: { origin: 'sales_order' },
       })),
     });
@@ -573,6 +605,7 @@ export async function backorderReport(ctx: ServiceContext): Promise<BackorderRep
  * orders cannot be edited. The status is recomputed (partial/closed) from the new quantities.
  */
 export async function updateSalesOrder(ctx: ServiceContext, id: string, input: CreateSalesOrderInput) {
+  input = await applyCustomerTaxDefaults(ctx, input);
   const existing = await getSalesOrder(ctx, id);
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided sales order.');
   if (existing.status === 'closed') {
@@ -581,7 +614,7 @@ export async function updateSalesOrder(ctx: ServiceContext, id: string, input: C
       'This sales order is closed (fully invoiced or cancelled), so it can no longer be changed.',
     );
   }
-  const { computedLines, subtotal, total } = await prepareSalesOrder(ctx, input);
+  const { computedLines, subtotal, taxAmount, total } = await prepareSalesOrder(ctx, input);
 
   // Map input rows to existing lines by id.
   const oldById = new Map(existing.lines.map((l) => [l.id, l]));
@@ -625,6 +658,10 @@ export async function updateSalesOrder(ctx: ServiceContext, id: string, input: C
   const newStatus = !anyInvoiced ? 'open' : fullyInvoiced ? 'closed' : 'partial';
 
   return inTransaction(ctx, async (tx) => {
+    const renum = await renumberDoc(
+      tx, 'sales_order', id, { refNumber: existing.refNumber, number: existing.orderNumber },
+      input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+    );
     await tx.db.delete(salesOrderLines).where(eq(salesOrderLines.salesOrderId, id));
     await tx.db.insert(salesOrderLines).values(
       computedLines.map((cl, i) => ({
@@ -634,6 +671,7 @@ export async function updateSalesOrder(ctx: ServiceContext, id: string, input: C
         quantity: cl.quantity,
         rate: cl.rate,
         amount: cl.amount,
+        taxable: cl.taxable,
         quantityInvoiced: keepInvoiced.get(i) ?? '0',
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
@@ -645,9 +683,12 @@ export async function updateSalesOrder(ctx: ServiceContext, id: string, input: C
         customerId: input.customerId,
         date: input.date,
         subtotal: toAmountString(subtotal),
+        taxRateId: input.taxRateId ?? null,
+        taxAmount: toAmountString(taxAmount),
         total: toAmountString(total),
         memo: input.memo ?? null,
         status: newStatus,
+        ...(renum ? { refNumber: renum.refNumber, orderNumber: renum.number } : {}),
         ...shippingColumns(input, existing),
       })
       .where(and(eq(salesOrders.id, id), eq(salesOrders.companyId, tx.companyId)));
@@ -659,6 +700,7 @@ export async function updateSalesOrder(ctx: ServiceContext, id: string, input: C
       oldValues: {
         customerId: existing.customerId,
         date: existing.date,
+        refNumber: existing.refNumber,
         total: existing.total,
         status: existing.status,
         memo: existing.memo,
@@ -673,6 +715,8 @@ export async function updateSalesOrder(ctx: ServiceContext, id: string, input: C
       newValues: {
         customerId: input.customerId,
         date: input.date,
+        refNumber: renum?.refNumber ?? existing.refNumber,
+        duplicateNumber: renum?.duplicate || undefined,
         total: toAmountString(total),
         status: newStatus,
         memo: input.memo ?? null,

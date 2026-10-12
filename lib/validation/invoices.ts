@@ -98,6 +98,9 @@ export type CreateInvoiceBody = z.infer<typeof createInvoiceBodySchema>;
 /** PUT /api/invoices/:id — full replace; no draft status and no billables here. */
 export const updateInvoiceSchema = z.object({
   ...invoiceCoreFields,
+  /** Retyped invoice number (blank/omitted = keep the current number). */
+  refNumber: zDocNumber,
+  allowDuplicateNumber: z.boolean().nullish(),
   lines: zLines(invoiceLineSchema),
 });
 export type UpdateInvoiceBody = z.infer<typeof updateInvoiceSchema>;
