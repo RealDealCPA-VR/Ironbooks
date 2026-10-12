@@ -3,7 +3,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { ClipboardList, Plus, ArrowRight, Percent, Pencil } from 'lucide-react';
 import {
-  AmountInput,
   Button,
   Card,
   DateInput,
@@ -19,6 +18,7 @@ import {
   Modal,
   PageHeader,
   Spinner,
+  ConfirmDialog,
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
@@ -51,7 +51,7 @@ interface Estimate {
   total: string;
   memo: string | null;
   convertedInvoiceId: string | null;
-  /** Total billed via progress invoicing so far (≤ total). */
+  /** Total billed via progress invoicing so far (invoice totals, tax included). */
   amountInvoiced: string;
   taxRateId?: string | null;
   toBePrinted?: boolean;
@@ -66,7 +66,15 @@ interface EstimateDetailLine {
   rate: string;
   amount: string;
   taxable: boolean;
+  classId?: string | null;
+  /** Progress invoicing: invoiced so far on this line (units, dollars before tax, percent). */
+  qtyInvoiced?: string;
+  amountInvoiced?: string;
+  percentInvoiced?: string;
 }
+
+type ProgressMode = 'percent' | 'remaining' | 'lines';
+type LineBillBy = 'percent' | 'quantity' | 'amount';
 
 interface Customer {
   id: string;
@@ -87,6 +95,8 @@ interface EstimateLineForm {
   taxable: boolean;
   /** Advanced pricing: the user typed the rate (automatic prices leave it alone). */
   rateManual?: boolean;
+  /** Class for the line; progress invoices carry it onto their lines. */
+  classId?: string;
 }
 
 interface EstimateForm {
@@ -145,6 +155,7 @@ function EstimateFormBody({
   customers,
   taxRates,
   items,
+  classes,
   onChange,
   onLinesChange,
 }: {
@@ -152,6 +163,7 @@ function EstimateFormBody({
   customers: Customer[];
   taxRates: TaxRate[];
   items: PricedLineItem[];
+  classes: Array<{ id: string; name: string }>;
   onChange: (field: keyof EstimateForm, value: string) => void;
   onLinesChange: (lines: EstimateLineForm[]) => void;
 }) {
@@ -233,6 +245,7 @@ function EstimateFormBody({
           onChange={onLinesChange}
           header={{ customerId: form.customerId || null, date: form.date }}
           showTaxable
+          classes={classes}
         />
 
         <div className="flex flex-col items-end gap-0.5 mt-3 pt-3 border-t border-slate-100 text-sm">
@@ -269,6 +282,7 @@ export default function EstimatesPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
   const [items, setItems] = useState<PricedLineItem[]>([]);
+  const [classList, setClassList] = useState<Array<{ id: string; name: string }>>([]);
   const [loading, setLoading] = useState(true);
   const [customerMap, setCustomerMap] = useState<Map<string, string>>(new Map());
 
@@ -292,10 +306,17 @@ export default function EstimatesPage() {
   // Progress invoicing modal.
   const [progressTarget, setProgressTarget] = useState<Estimate | null>(null);
   const [progressLines, setProgressLines] = useState<EstimateDetailLine[]>([]);
-  const [progressMode, setProgressMode] = useState<'percent' | 'lines'>('percent');
+  const [progressMode, setProgressMode] = useState<ProgressMode>('percent');
   const [progressPercent, setProgressPercent] = useState('');
-  const [progressLineAmounts, setProgressLineAmounts] = useState<Record<string, string>>({});
+  const [progressLineInputs, setProgressLineInputs] = useState<
+    Record<string, { by: LineBillBy; value: string }>
+  >({});
   const [progressSaving, setProgressSaving] = useState(false);
+  // "More than 100% of the estimate" warning (QB warns, then lets you go ahead).
+  const [overbillPending, setOverbillPending] = useState<{
+    message: string;
+    resolve: (ok: boolean) => void;
+  } | null>(null);
 
   // ---------------------------------------------------------------------------
   // Data fetching
@@ -342,6 +363,12 @@ export default function EstimatesPage() {
       .catch(() => {
         // Non-fatal; lines can still be typed without an item.
       });
+    api
+      .get<Array<{ id: string; name: string }>>('/api/classes')
+      .then((r) => setClassList(Array.isArray(r) ? r : []))
+      .catch(() => {
+        // Non-fatal; lines just have no class picker.
+      });
   }, [fetchEstimates, fetchCustomers, fetchTaxRates]);
 
   // ---------------------------------------------------------------------------
@@ -373,6 +400,7 @@ export default function EstimatesPage() {
           rate: String(Number(l.rate)),
           taxable: l.taxable,
           rateManual: true,
+          classId: l.classId ?? '',
         })),
       });
       setSendFlags(shippingFromDoc(detail));
@@ -418,6 +446,7 @@ export default function EstimatesPage() {
           // Blank rate on an item line: the server prices it (advanced pricing).
           rate: l.rate.trim() === '' ? (l.itemId ? null : 0) : parseFloat(l.rate) || 0,
           taxable: l.taxable,
+          classId: l.classId || null,
         })),
       };
       if (editingId) {
@@ -483,7 +512,7 @@ export default function EstimatesPage() {
     setProgressTarget(estimate);
     setProgressMode('percent');
     setProgressPercent('');
-    setProgressLineAmounts({});
+    setProgressLineInputs({});
     setProgressLines([]);
     try {
       const detail = await api.get<Estimate & { lines: EstimateDetailLine[] }>(
@@ -506,22 +535,42 @@ export default function EstimatesPage() {
         return;
       }
       payload.percent = progressPercent;
+    } else if (progressMode === 'remaining') {
+      payload.remaining = true;
     } else {
-      const lineAmounts = Object.entries(progressLineAmounts)
-        .filter(([, amount]) => parseFloat(amount) > 0)
-        .map(([lineId, amount]) => ({ lineId, amount }));
-      if (lineAmounts.length === 0) {
-        toast('Enter an amount for at least one line', 'danger');
+      const lines = Object.entries(progressLineInputs)
+        .filter(([, v]) => parseFloat(v.value) > 0)
+        .map(([lineId, v]) => ({ lineId, [v.by]: v.value }));
+      if (lines.length === 0) {
+        toast('Enter a percentage, quantity or amount for at least one line', 'danger');
         return;
       }
-      payload.lineAmounts = lineAmounts;
+      payload.lines = lines;
     }
+
+    const post = (allowOverBilling: boolean) =>
+      creditLimit.run((override) =>
+        api.post(`/api/estimates/${progressTarget.id}`, {
+          ...payload,
+          overrideCreditLimit: override,
+          allowOverBilling,
+        }),
+      );
 
     setProgressSaving(true);
     try {
-      const done = await creditLimit.run((override) =>
-        api.post(`/api/estimates/${progressTarget.id}`, { ...payload, overrideCreditLimit: override }),
-      );
+      let done: unknown;
+      try {
+        done = await post(false);
+      } catch (err) {
+        if (!(err instanceof ApiError && err.code === 'PROGRESS_OVERBILL')) throw err;
+        const ok = await new Promise<boolean>((resolve) =>
+          setOverbillPending({ message: err.message, resolve }),
+        );
+        setOverbillPending(null);
+        if (!ok) return;
+        done = await post(true);
+      }
       if (done === undefined) return;
       toast(
         `Progress invoice created for estimate EST-${String(progressTarget.estimateNumber).padStart(4, '0')}`,
@@ -709,6 +758,7 @@ export default function EstimatesPage() {
           customers={customers}
           taxRates={taxRates}
           items={items}
+          classes={classList}
           onChange={handleFormChange}
           onLinesChange={(lines) => setAddForm((prev) => ({ ...prev, lines }))}
         />
@@ -763,35 +813,33 @@ export default function EstimatesPage() {
               </div>
             </div>
 
-            {/* Mode toggle */}
+            {/* Mode toggle — QB's three progress-invoicing choices */}
             <div className="flex rounded-lg border border-slate-200 overflow-hidden w-fit">
-              <button
-                type="button"
-                onClick={() => setProgressMode('percent')}
-                className={`px-3 py-2 text-xs font-semibold transition-colors ${
-                  progressMode === 'percent'
-                    ? 'bg-electric text-white'
-                    : 'bg-white text-navy/60 hover:bg-slate-50'
-                }`}
-              >
-                % of remaining
-              </button>
-              <button
-                type="button"
-                onClick={() => setProgressMode('lines')}
-                className={`px-3 py-2 text-xs font-semibold transition-colors ${
-                  progressMode === 'lines'
-                    ? 'bg-electric text-white'
-                    : 'bg-white text-navy/60 hover:bg-slate-50'
-                }`}
-              >
-                Per-line amounts
-              </button>
+              {(
+                [
+                  ['percent', '% of entire estimate'],
+                  ['remaining', 'Everything not billed yet'],
+                  ['lines', 'Selected lines'],
+                ] as Array<[ProgressMode, string]>
+              ).map(([mode, label]) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setProgressMode(mode)}
+                  className={`px-3 py-2 text-xs font-semibold transition-colors ${
+                    progressMode === mode
+                      ? 'bg-electric text-white'
+                      : 'bg-white text-navy/60 hover:bg-slate-50'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
 
-            {progressMode === 'percent' ? (
+            {progressMode === 'percent' && (
               <div>
-                <Label htmlFor="progress-pct">Percentage of remaining balance *</Label>
+                <Label htmlFor="progress-pct">Percentage of the entire estimate *</Label>
                 <Input
                   id="progress-pct"
                   type="number"
@@ -802,58 +850,87 @@ export default function EstimatesPage() {
                   value={progressPercent}
                   onChange={(e) => setProgressPercent(e.target.value)}
                 />
-                {parseFloat(progressPercent) > 0 && (
-                  <p className="mt-1 text-xs text-navy/50">
-                    Will invoice{' '}
-                    <strong>
-                      {formatCurrency(
-                        (
-                          (Number(progressTarget.total) - Number(progressTarget.amountInvoiced)) *
-                          (parseFloat(progressPercent) / 100)
-                        ).toFixed(2),
-                      )}
-                    </strong>{' '}
-                    allocated across the estimate lines.
-                  </p>
-                )}
+                <p className="mt-1 text-xs text-navy/50">
+                  Every line is billed at this percentage of its quantity and amount. Sales tax is
+                  added on the invoice for taxable lines.
+                </p>
               </div>
-            ) : (
+            )}
+
+            {progressMode === 'remaining' && (
+              <p className="text-sm text-navy/70">
+                Bills whatever has not been invoiced yet on every line of the estimate.
+              </p>
+            )}
+
+            {progressMode !== 'percent' || progressLines.length > 0 ? (
               <div>
-                <Label>Amount to bill per line</Label>
+                <Label>{progressMode === 'lines' ? 'What to bill on each line' : 'Estimate lines'}</Label>
                 <div className="rounded-lg border border-slate-200 divide-y divide-slate-100">
                   {progressLines.length === 0 ? (
                     <div className="flex items-center gap-2 p-3 text-xs text-navy/40">
                       <Spinner className="h-4 w-4" /> Loading estimate lines…
                     </div>
                   ) : (
-                    progressLines.map((l) => (
-                      <div key={l.id} className="flex items-center gap-2 px-3 py-2 text-sm">
-                        <span className="flex-1 truncate text-navy/80">
-                          {l.description ?? 'Line'}
-                          <span className="text-navy/40">
-                            {' '}
-                            ({formatCurrency(l.amount)} quoted)
+                    progressLines.map((l) => {
+                      const input = progressLineInputs[l.id] ?? { by: 'percent' as LineBillBy, value: '' };
+                      return (
+                        <div key={l.id} className="flex items-center gap-2 px-3 py-2 text-sm">
+                          <span className="flex-1 min-w-0 truncate text-navy/80">
+                            {l.description ?? 'Line'}
+                            <span className="text-navy/40">
+                              {' '}
+                              ({Number(l.quantity)} × {formatCurrency(l.rate)} = {formatCurrency(l.amount)}
+                              {l.taxable ? ', taxable' : ''}; billed {Number(l.percentInvoiced ?? 0)}%)
+                            </span>
                           </span>
-                        </span>
-                        <AmountInput
-                          placeholder="0.00"
-                          value={progressLineAmounts[l.id] ?? ''}
-                          onChange={(ev) =>
-                            setProgressLineAmounts((prev) => ({ ...prev, [l.id]: ev.target.value }))
-                          }
-                          className="w-28"
-                          aria-label={`Amount for ${l.description ?? 'line'}`}
-                        />
-                      </div>
-                    ))
+                          {progressMode === 'lines' && (
+                            <>
+                              <Select
+                                value={input.by}
+                                onChange={(ev) =>
+                                  setProgressLineInputs((prev) => ({
+                                    ...prev,
+                                    [l.id]: { by: ev.target.value as LineBillBy, value: input.value },
+                                  }))
+                                }
+                                className="w-28"
+                                aria-label={`Bill ${l.description ?? 'line'} by`}
+                              >
+                                <option value="percent">Percent</option>
+                                <option value="quantity">Quantity</option>
+                                <option value="amount">Amount</option>
+                              </Select>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="any"
+                                placeholder="0"
+                                value={input.value}
+                                onChange={(ev) =>
+                                  setProgressLineInputs((prev) => ({
+                                    ...prev,
+                                    [l.id]: { by: input.by, value: ev.target.value },
+                                  }))
+                                }
+                                className="w-24"
+                                aria-label={`How much of ${l.description ?? 'line'} to bill`}
+                              />
+                            </>
+                          )}
+                        </div>
+                      );
+                    })
                   )}
                 </div>
               </div>
-            )}
+            ) : null}
 
             <p className="text-xs text-navy/50">
-              A partial invoice will be posted to A/R and linked to this estimate. The estimate
-              stays open until the full {formatCurrency(progressTarget.total)} has been invoiced.
+              The invoice uses the estimate's items, rates and quantities, so stock and cost of
+              goods follow the units billed. It is posted to A/R and linked to this estimate, which
+              stays open until every line has been invoiced. Voiding the invoice puts the amount
+              back on the estimate.
             </p>
           </div>
         )}
@@ -891,6 +968,14 @@ export default function EstimatesPage() {
         </p>
       </Modal>
       {creditLimit.dialog}
+      <ConfirmDialog
+        open={!!overbillPending}
+        title="More than the estimate"
+        message={overbillPending?.message}
+        confirmLabel="Bill anyway"
+        onConfirm={() => overbillPending?.resolve(true)}
+        onClose={() => overbillPending?.resolve(false)}
+      />
     </main>
   );
 }

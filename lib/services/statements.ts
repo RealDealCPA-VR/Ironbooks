@@ -31,6 +31,8 @@ import {
   expenseLines,
   expenses,
   invoices,
+  journalEntries,
+  journalEntryLines,
   paymentsReceived,
   vendors,
 } from '@/lib/db/schema';
@@ -38,6 +40,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { notFound, validation, writeAudit, type ServiceContext } from './_base';
 import { taxIdFor } from './access';
 import { journalOpenItems } from './journal';
+import { generalJournalSourceSql } from './posting';
 import { docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
@@ -47,7 +50,8 @@ import { docRef } from './docNumbers';
 export interface StatementLine {
   date: string;
   /**
-   * Charges: invoice, statement_charge (C5), bounced_check (F2 — a returned payment owed again).
+   * Charges: invoice, statement_charge (C5), bounced_check (F2 — a returned payment owed again),
+   * refund (money paid back to the customer: a credit-memo refund or an overpayment refund).
    * Credits: payment, credit_memo, discount (C3 — early-payment discount taken).
    * general_journal: a named General Journal line on A/R (amount signed: + charge, − credit).
    */
@@ -58,7 +62,8 @@ export interface StatementLine {
     | 'statement_charge'
     | 'bounced_check'
     | 'discount'
-    | 'general_journal';
+    | 'general_journal'
+    | 'refund';
   /**
    * Invoice number (invoices), payment reference (payments), memo number (credit memos), or
    * "GJ #<entry>" for a named General Journal line on A/R.
@@ -115,6 +120,127 @@ async function bouncedAmounts(
       (r.applications ?? []).reduce((s, a) => s.plus(Money.of(a.discountAmount ?? '0')), Money.zero()),
     ),
   }));
+}
+
+/**
+ * Refunds paid to a customer: refund checks for a credit memo and refunds of an unapplied payment
+ * (overpayment). They have no table of their own — the record is the posted journal entry
+ * `refund:<creditMemoId | paymentId>`, whose A/R line is a debit (it takes back the credit the
+ * memo / payment left in A/R). Amounts are returned in the document's currency (a payment refund
+ * posts amount × the payment's rate in home currency).
+ */
+async function refundAmounts(
+  ctx: ServiceContext,
+  customerId: string,
+  range: { before?: Date; from?: Date; to?: Date },
+): Promise<Array<{ date: Date; reference: string | null; amount: ReturnType<typeof Money.zero> }>> {
+  const [payments, memos] = await Promise.all([
+    ctx.db
+      .select({ id: paymentsReceived.id, reference: paymentsReceived.reference, exchangeRate: paymentsReceived.exchangeRate })
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.companyId, ctx.companyId), eq(paymentsReceived.customerId, customerId))),
+    ctx.db
+      .select({ id: creditMemos.id, refNumber: creditMemos.refNumber, memoNumber: creditMemos.memoNumber })
+      .from(creditMemos)
+      .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.customerId, customerId))),
+  ]);
+  const sources = new Map<string, { reference: string | null; rate: ReturnType<typeof Money.zero> }>();
+  for (const p of payments) {
+    sources.set(`refund:${p.id}`, { reference: p.reference ?? null, rate: Money.of(p.exchangeRate ?? 1) });
+  }
+  for (const m of memos) {
+    sources.set(`refund:${m.id}`, { reference: docRef(m.refNumber, m.memoNumber), rate: Money.of(1) });
+  }
+  if (sources.size === 0) return [];
+
+  const conds = [
+    eq(journalEntries.companyId, ctx.companyId),
+    eq(journalEntries.status, 'posted'),
+    inArray(journalEntries.sourceRef, [...sources.keys()]),
+    eq(accounts.type, 'asset'),
+    eq(accounts.subtype, 'accounts_receivable'),
+  ];
+  if (range.before) conds.push(lt(journalEntries.date, range.before));
+  if (range.from) conds.push(gte(journalEntries.date, range.from));
+  if (range.to) conds.push(lt(journalEntries.date, new Date(range.to.getTime() + 86_400_000)));
+  const rows = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      date: journalEntries.date,
+      sourceRef: journalEntries.sourceRef,
+      net: sql<string>`COALESCE(SUM(CAST(COALESCE(${journalEntryLines.debit}, '0') AS NUMERIC) - CAST(COALESCE(${journalEntryLines.credit}, '0') AS NUMERIC)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+    .innerJoin(accounts, eq(accounts.id, journalEntryLines.accountId))
+    .where(and(...conds))
+    .groupBy(journalEntries.id, journalEntries.date, journalEntries.sourceRef);
+  return rows
+    .map((r) => {
+      const src = sources.get(r.sourceRef ?? '')!;
+      const home = Money.of(r.net);
+      const amount = src.rate.greaterThan(0) && !src.rate.equals(1) ? Money.round2(home.dividedBy(src.rate)) : home;
+      return { date: r.date, reference: src.reference, amount };
+    })
+    .filter((r) => !r.amount.isZero());
+}
+
+/**
+ * A customer's balance straight from the general ledger: every posted line on an A/R account
+ * that belongs to this customer — the customer's own documents (invoice:, credit_memo:,
+ * customer: (payments), payment: (applying / unapplying an unapplied payment), bounced:,
+ * refund:) plus General Journal lines named for the customer. The customer statement's closing
+ * balance and the A/R aging total must both equal this number.
+ */
+export async function customerArLedgerBalance(
+  ctx: ServiceContext,
+  customerId: string,
+  asOf?: Date,
+): Promise<string> {
+  const [invRows, memoRows, payRows] = await Promise.all([
+    ctx.db
+      .select({ id: invoices.id })
+      .from(invoices)
+      .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.customerId, customerId))),
+    ctx.db
+      .select({ id: creditMemos.id })
+      .from(creditMemos)
+      .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.customerId, customerId))),
+    ctx.db
+      .select({ id: paymentsReceived.id })
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.companyId, ctx.companyId), eq(paymentsReceived.customerId, customerId))),
+  ]);
+  const refs = [
+    `customer:${customerId}`,
+    ...invRows.map((r) => `invoice:${r.id}`),
+    ...memoRows.flatMap((r) => [`credit_memo:${r.id}`, `refund:${r.id}`]),
+    ...payRows.flatMap((r) => [`payment:${r.id}`, `bounced:${r.id}`, `refund:${r.id}`]),
+  ];
+  const conds = [
+    eq(journalEntries.companyId, ctx.companyId),
+    eq(journalEntries.status, 'posted'),
+    eq(accounts.type, 'asset'),
+    eq(accounts.subtype, 'accounts_receivable'),
+    or(
+      inArray(journalEntries.sourceRef, refs),
+      and(
+        eq(journalEntryLines.entityType, 'customer'),
+        eq(journalEntryLines.entityId, customerId),
+        generalJournalSourceSql(),
+      ),
+    )!,
+  ];
+  if (asOf) conds.push(lt(journalEntries.date, new Date(asOf.getTime() + 86_400_000)));
+  const [row] = await ctx.db
+    .select({
+      net: sql<string>`COALESCE(SUM(CAST(COALESCE(${journalEntryLines.debit}, '0') AS NUMERIC) - CAST(COALESCE(${journalEntryLines.credit}, '0') AS NUMERIC)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+    .innerJoin(accounts, eq(accounts.id, journalEntryLines.accountId))
+    .where(and(...conds));
+  return toAmountString(Money.of(row?.net ?? '0'));
 }
 
 export async function customerStatement(
@@ -189,6 +315,7 @@ export async function customerStatement(
         ),
       );
     const priorBounced = await bouncedAmounts(ctx, customerId, { before: range.from });
+    const priorRefunds = await refundAmounts(ctx, customerId, { before: range.from });
 
     // Credit memos before range start (non-void) — they credit A/R at creation,
     // so they reduce what the customer owes just like payments.
@@ -214,7 +341,8 @@ export async function customerStatement(
       .minus(priorPayments)
       .minus(priorCreditMemos)
       .minus(priorDiscounts)
-      .plus(priorBounced.reduce((sum, b) => sum.plus(b.amount), Money.zero()));
+      .plus(priorBounced.reduce((sum, b) => sum.plus(b.amount), Money.zero()))
+      .plus(priorRefunds.reduce((sum, r) => sum.plus(r.amount), Money.zero()));
   }
 
   // Named General Journal lines on A/R for this customer (QB shows them as "General Journal").
@@ -287,6 +415,7 @@ export async function customerStatement(
       : [];
   const discountByPayment = new Map(discountRows.map((r) => [r.paymentId, Money.of(r.total)]));
   const bouncedRows = await bouncedAmounts(ctx, customerId, { from: range?.from, to: range?.to });
+  const refundRows = await refundAmounts(ctx, customerId, { from: range?.from, to: range?.to });
 
   // --- In-range credit memos ---
   // A credit memo credits A/R in the GL at creation (not at application), so the
@@ -343,6 +472,12 @@ export async function customerStatement(
       ref: b.reference,
       amount: toAmountString(b.amount),
     })),
+    ...refundRows.map((r) => ({
+      kind: 'refund' as const,
+      date: r.date,
+      ref: r.reference,
+      amount: toAmountString(r.amount),
+    })),
     ...creditMemoRows.map((r) => ({
       kind: 'credit_memo' as const,
       date: r.date,
@@ -366,6 +501,8 @@ export async function customerStatement(
       r.kind === 'invoice' ||
       r.kind === 'statement_charge' ||
       r.kind === 'bounced_check' ||
+      // A refund pays the customer back, so the credit it consumed is owed again.
+      r.kind === 'refund' ||
       // General Journal amounts are already signed (+ charge, − credit).
       r.kind === 'general_journal'
     ) {

@@ -239,6 +239,13 @@
       "when": 1781300035000,
       "tag": "0035_fix_payroll",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1781300036000,
+      "tag": "0036_fix_sales",
+      "breakpoints": true
     }
   ]
 }

@@ -30,6 +30,8 @@ export interface PricedLineValue {
   taxable: boolean;
   /** The user typed the rate — automatic prices leave it alone. */
   rateManual?: boolean;
+  /** Class for this line (shown only when the form passes `classes`). */
+  classId?: string;
 }
 
 const SPECIAL = new Set(['discount', 'subtotal', 'payment', 'sales_tax']);
@@ -44,12 +46,15 @@ export function PricedLinesEditor({
   onChange,
   header,
   showTaxable = false,
+  classes,
 }: {
   items: PricedLineItem[];
   lines: PricedLineValue[];
   onChange: (lines: PricedLineValue[]) => void;
   header: QuoteHeader;
   showTaxable?: boolean;
+  /** When given (and not empty), each line gets a Class picker. */
+  classes?: Array<{ id: string; name: string }>;
 }) {
   const latest = useRef(lines);
   latest.current = lines;
@@ -170,6 +175,22 @@ export function PricedLinesEditor({
                 <Trash2 className="h-4 w-4" />
               </button>
             </div>
+            {classes && classes.length > 0 && (
+              <div className="col-span-12 sm:col-start-4 sm:col-span-4 -mt-1">
+                <Select
+                  value={line.classId ?? ''}
+                  onChange={(e) => patch(idx, { classId: e.target.value })}
+                  aria-label="Class"
+                >
+                  <option value="">— No class —</option>
+                  {classes.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      Class: {c.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            )}
           </div>
         );
       })}

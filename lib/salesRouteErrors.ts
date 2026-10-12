@@ -9,14 +9,16 @@ import { ServiceError } from '@/lib/services/_base';
 import { routeError } from '@/lib/routeErrors';
 
 export const CREDIT_LIMIT_WARNING = 'CREDIT_LIMIT';
+/** Billing more than 100% of an estimate line (retry with `allowOverBilling: true`). */
+export const PROGRESS_OVERBILL_WARNING = 'PROGRESS_OVERBILL';
+
+const SOFT_WARNINGS = new Set<unknown>([CREDIT_LIMIT_WARNING, PROGRESS_OVERBILL_WARNING]);
 
 export function routeErrorWithWarnings(err: unknown, tag: string): NextResponse {
-  if (
-    err instanceof ServiceError &&
-    (err.details as { warning?: unknown } | undefined)?.warning === CREDIT_LIMIT_WARNING
-  ) {
+  const warning = err instanceof ServiceError ? (err.details as { warning?: unknown } | undefined)?.warning : undefined;
+  if (err instanceof ServiceError && SOFT_WARNINGS.has(warning)) {
     return NextResponse.json(
-      { error: err.message, code: CREDIT_LIMIT_WARNING, details: err.details },
+      { error: err.message, code: warning, details: err.details },
       { status: 409 },
     );
   }

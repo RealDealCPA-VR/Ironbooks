@@ -37,6 +37,39 @@ import { journalOpenItems, resolveEntityNames } from './journal';
 import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
 
+/**
+ * Credit-memo refunds dated AFTER the cutoff, per memo id. creditMemos.unapplied is today's
+ * figure; a refund posted after the cutoff had not yet reduced the customer's credit on the
+ * cutoff date, so a backdated aging adds it back (the same rule unappliedCustomerPayments
+ * applies to refunded overpayments). Keeps aging == A/R GL == customer statement.
+ */
+async function creditMemoRefundsAfter(ctx: ServiceContext, cutoff: Date): Promise<Map<string, string>> {
+  const rows = await ctx.db
+    .select({
+      sourceRef: journalEntries.sourceRef,
+      amount: sql<string>`COALESCE(SUM(CAST(${journalEntryLines.debit} AS NUMERIC)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        sql`${journalEntries.sourceRef} LIKE 'refund:%'`,
+        gt(journalEntries.date, cutoff),
+      ),
+    )
+    .groupBy(journalEntries.sourceRef);
+  const out = new Map<string, string>();
+  for (const r of rows) if (r.sourceRef) out.set(r.sourceRef.slice('refund:'.length), r.amount);
+  return out;
+}
+
+/** A credit memo's open credit as of the cutoff: today's unapplied plus refunds after it. */
+function memoCreditAsOf(m: { id: string; unapplied: string }, laterRefunds: Map<string, string>) {
+  return Money.of(m.unapplied).plus(Money.of(laterRefunds.get(m.id) ?? '0'));
+}
+
 /** Detail-report variant of addJournalItemsToAging: one 'General Journal' row per line. */
 async function addJournalItemsToAgingDetail(
   ctx: ServiceContext,
@@ -342,11 +375,14 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
   }
 
   // Unapplied credit memos reduce net receivables — negative 'current' rows.
+  // A memo refunded after the cutoff still held its credit on the cutoff date.
+  const memoLaterRefunds = await creditMemoRefundsAfter(ctx, cutoff);
   const memoRows = await ctx.db
     .select({
+      id: creditMemos.id,
       customerId: creditMemos.customerId,
       customerName: customers.displayName,
-      unapplied: sql<string>`COALESCE(SUM(CAST(${creditMemos.unapplied} AS NUMERIC)), 0)`,
+      unapplied: creditMemos.unapplied,
     })
     .from(creditMemos)
     .innerJoin(customers, eq(creditMemos.customerId, customers.id))
@@ -355,17 +391,17 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
         eq(creditMemos.companyId, ctx.companyId),
         ne(creditMemos.status, 'void'),
         lte(creditMemos.date, cutoff),
-        sql`CAST(${creditMemos.unapplied} AS NUMERIC) > 0`,
       ),
-    )
-    .groupBy(creditMemos.customerId, customers.displayName);
+    );
 
   for (const memo of memoRows) {
+    const credit = memoCreditAsOf(memo, memoLaterRefunds);
+    if (!credit.greaterThan(0)) continue;
     if (!byCustomer.has(memo.customerId)) {
       byCustomer.set(memo.customerId, { name: memo.customerName, buckets: blankBuckets() });
     }
     const buckets = byCustomer.get(memo.customerId)!.buckets;
-    buckets.current = buckets.current.minus(Money.of(memo.unapplied));
+    buckets.current = buckets.current.minus(credit);
   }
 
   await addJournalItemsToAging(ctx, 'ar', cutoff, byCustomer);
@@ -1028,7 +1064,8 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     });
   }
 
-  // Unapplied credit memos — negative 'current' rows.
+  // Unapplied credit memos — negative 'current' rows (refunds after the cutoff added back).
+  const memoLaterRefunds = await creditMemoRefundsAfter(ctx, cutoff);
   const memoRows = await ctx.db
     .select({
       id: creditMemos.id,
@@ -1046,10 +1083,11 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
         eq(creditMemos.companyId, ctx.companyId),
         ne(creditMemos.status, 'void'),
         lte(creditMemos.date, cutoff),
-        sql`CAST(${creditMemos.unapplied} AS NUMERIC) > 0`,
       ),
     );
   for (const m of memoRows) {
+    const credit = memoCreditAsOf(m, memoLaterRefunds);
+    if (!credit.greaterThan(0)) continue;
     detail.push({
       docId: m.id,
       docNumber: `Credit Memo #${docRef(m.refNumber, m.memoNumber)}`,
@@ -1060,7 +1098,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       dueDate: null,
       daysPastDue: 0,
       bucket: 'current',
-      openBalance: toAmountString(Money.of(m.unapplied).negated()),
+      openBalance: toAmountString(credit.negated()),
     });
   }
 

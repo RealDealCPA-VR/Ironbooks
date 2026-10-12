@@ -33,6 +33,7 @@ interface FinanceChargeSettings {
 interface FinanceChargeInvoiceDetail {
   invoiceId: string;
   invoiceNumber: number;
+  refNumber?: string;
   dueDate: string;
   balanceDue: string;
   daysOverdue: number;
@@ -59,7 +60,7 @@ interface FinanceChargePreview {
 interface AssessResult {
   asOf: string;
   periodKey: string;
-  assessed: Array<{ customerId: string; displayName: string; invoiceNumber: number; charge: string }>;
+  assessed: Array<{ customerId: string; displayName: string; invoiceNumber: number; refNumber?: string; charge: string }>;
   skipped: Array<{ customerId: string; displayName: string; reason: string }>;
 }
 
@@ -399,7 +400,7 @@ function FragmentRow({
             <Td></Td>
             <Td></Td>
             <Td className="pl-8">
-              Invoice #{inv.invoiceNumber} — due {formatDate(inv.dueDate)}
+              Invoice #{inv.refNumber ?? inv.invoiceNumber} — due {formatDate(inv.dueDate)}
             </Td>
             <Td numeric>{inv.daysOverdue} days late</Td>
             <Td numeric>{formatCurrency(inv.balanceDue)} open</Td>

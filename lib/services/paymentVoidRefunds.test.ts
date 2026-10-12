@@ -37,7 +37,7 @@ import {
 import { Money } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
-import { postJournalEntry } from './posting';
+import { postJournalEntry, voidJournalEntry } from './posting';
 import { trialBalance } from './reports';
 import {
   receivePayment,
@@ -601,6 +601,33 @@ describe('payment-void-refunds: corrections + refunds', () => {
     expect(row.status).toBe('paid');
     expect(row.balanceDue).toBe('0.00');
 
+    await assertBalanced();
+  });
+
+  it('voiding a foreign-currency overpayment refund restores exactly the refunded amount (no cent drift)', async () => {
+    // 10.05 EUR at 0.30 posts 3.02 base; 3.02 / 0.30 would give back 10.07.
+    const { payment } = await receivePayment(ctx, {
+      customerId,
+      date: new Date('2026-03-02'),
+      method: 'bank_transfer',
+      amount: '50.00',
+      depositAccountId: acct['1000'],
+      applications: [],
+      currency: 'EUR',
+      exchangeRate: '0.300000',
+    });
+    const { entry } = await refundPayment(ctx, {
+      paymentId: payment.id,
+      bankAccountId: acct['1000'],
+      amount: '10.05',
+      date: new Date('2026-03-03'),
+    });
+    const [refunded] = await db.select().from(paymentsReceived).where(eq(paymentsReceived.id, payment.id));
+    expect(refunded.unapplied).toBe('39.95');
+    await voidJournalEntry(ctx, entry.id);
+    const [restored] = await db.select().from(paymentsReceived).where(eq(paymentsReceived.id, payment.id));
+    expect(restored.unapplied).toBe('50.00');
+    await refundPayment(ctx, { paymentId: payment.id, bankAccountId: acct['1000'], amount: '50.00' });
     await assertBalanced();
   });
 

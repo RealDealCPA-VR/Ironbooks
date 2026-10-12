@@ -14,6 +14,9 @@
  * invoices are also EXCLUDED from the charge base, so finance charges never
  * compound on prior finance charges.
  *
+ * Numbering: finance-charge invoices take the next regular invoice number through
+ * allocateDocNumber (alphanumeric, honours the starting number).
+ *
  * NOTE: invoices are created directly here (header + line + GL posting via
  * postJournalEntry) instead of through invoices.createInvoice, because the
  * credit-limit check there would block exactly the delinquent customers this
@@ -32,6 +35,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry } from './posting';
+import { allocateDocNumber, docRef } from './docNumbers';
 
 const DAY_MS = 86_400_000;
 const FC_INCOME_CODE = '4400';
@@ -129,6 +133,8 @@ export async function updateFinanceChargeSettings(
 export interface FinanceChargeInvoiceDetail {
   invoiceId: string;
   invoiceNumber: number;
+  /** The invoice number the user sees (typed ref number, else the legacy integer). */
+  refNumber: string;
   dueDate: string;
   balanceDue: string;
   daysOverdue: number;
@@ -195,6 +201,7 @@ export async function previewFinanceCharges(
       id: invoices.id,
       customerId: invoices.customerId,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       date: invoices.date,
       dueDate: invoices.dueDate,
       balanceDue: invoices.balanceDue,
@@ -257,6 +264,7 @@ export async function previewFinanceCharges(
     entry.overdueInvoices.push({
       invoiceId: r.id,
       invoiceNumber: r.invoiceNumber,
+      refNumber: docRef(r.refNumber, r.invoiceNumber),
       dueDate: effDue.toISOString().slice(0, 10),
       balanceDue: toAmountString(r.balanceDue),
       daysOverdue,
@@ -295,6 +303,8 @@ export interface AssessedFinanceCharge {
   displayName: string;
   invoiceId: string;
   invoiceNumber: number;
+  /** The invoice number the user sees (alphanumeric, e.g. "INV-1003"). */
+  refNumber: string;
   charge: string;
 }
 
@@ -327,14 +337,6 @@ async function getOrCreateAccountByCode(
     })
     .returning();
   return created.id;
-}
-
-async function nextInvoiceNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${invoices.invoiceNumber}), 0)` })
-    .from(invoices)
-    .where(eq(invoices.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
 }
 
 /**
@@ -383,7 +385,11 @@ export async function assessFinanceCharges(
 
     try {
       const result = await inTransaction(ctx, async (tx) => {
-        const invoiceNumber = await nextInvoiceNumber(tx);
+        // Same numbering as every other invoice (QB: finance-charge invoices take the next
+        // invoice number): the last number used with its trailing digits + 1, prefix kept
+        // ("INV-1002" -> "INV-1003"), under the per-company allocation lock.
+        const { refNumber, number: invoiceNumber } = await allocateDocNumber(tx, 'invoice', null);
+        const shownNumber = docRef(refNumber, invoiceNumber);
         const asOfIso = preview.asOf;
         const description = `Finance charge on overdue balance (assessed ${asOfIso})`;
 
@@ -393,6 +399,7 @@ export async function assessFinanceCharges(
             companyId: tx.companyId,
             customerId: row.customerId,
             invoiceNumber,
+            refNumber,
             date: opts.asOf,
             dueDate: opts.asOf,
             status: 'open',
@@ -419,20 +426,20 @@ export async function assessFinanceCharges(
 
         const entry = await postJournalEntry(tx, {
           date: opts.asOf,
-          description: `Invoice #${invoiceNumber} — finance charge`,
-          reference: String(invoiceNumber),
+          description: `Invoice #${shownNumber} — finance charge`,
+          reference: shownNumber,
           sourceRef: `invoice:${invoice.id}`,
           lines: [
             {
               accountId: arAccountId,
               debit: toAmountString(charge),
-              memo: `Invoice #${invoiceNumber} — finance charge`,
+              memo: `Invoice #${shownNumber} — finance charge`,
               controlLine: true,
             },
             {
               accountId: fcIncomeId,
               credit: toAmountString(charge),
-              memo: `Invoice #${invoiceNumber} — finance charge income`,
+              memo: `Invoice #${shownNumber} — finance charge income`,
             },
           ],
         });
@@ -449,6 +456,7 @@ export async function assessFinanceCharges(
           entityId: invoice.id,
           newValues: {
             invoiceNumber,
+            refNumber,
             customerId: row.customerId,
             total: toAmountString(charge),
             financeCharge: true,
@@ -465,6 +473,7 @@ export async function assessFinanceCharges(
         displayName: row.displayName,
         invoiceId: result.id,
         invoiceNumber: result.invoiceNumber,
+        refNumber: docRef(result.refNumber, result.invoiceNumber),
         charge: toAmountString(charge),
       });
     } catch (err) {

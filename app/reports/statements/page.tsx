@@ -37,7 +37,8 @@ interface StatementLine {
     | 'statement_charge'
     | 'bounced_check'
     | 'discount'
-    | 'general_journal';
+    | 'general_journal'
+    | 'refund';
   ref: string | null;
   amount: string;
   runningBalance: string;
@@ -107,7 +108,8 @@ function fmtDate(iso: string) {
 // ---------------------------------------------------------------------------
 
 /**
- * Charges column: invoices, statement charges, returned (bounced) checks and positive General
+ * Charges column: invoices, statement charges, returned (bounced) checks, refunds paid to the
+ * customer and positive General
  * Journal lines raise the balance; everything else (payments, discounts, credit memos) is a credit.
  */
 function isCharge(line: { type: string; amount: string }): boolean {
@@ -115,6 +117,7 @@ function isCharge(line: { type: string; amount: string }): boolean {
     line.type === 'invoice' ||
     line.type === 'statement_charge' ||
     line.type === 'bounced_check' ||
+    line.type === 'refund' ||
     (line.type === 'general_journal' && !line.amount.startsWith('-'))
   );
 }
@@ -446,6 +449,8 @@ export default function CustomerStatementsPage() {
                         <Badge tone="neutral">Credit Memo</Badge>
                       ) : line.type === 'general_journal' ? (
                         <Badge tone="neutral">General Journal</Badge>
+                      ) : line.type === 'refund' ? (
+                        <Badge tone="warning">Refund</Badge>
                       ) : (
                         <Badge tone="success">Payment</Badge>
                       )}

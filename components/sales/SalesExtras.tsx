@@ -184,31 +184,50 @@ export function ShippingSection({
 }
 
 /**
- * Credit-limit warning flow (C2). `run(fn)` calls fn(false); when the server answers with a
- * CREDIT_LIMIT warning it shows a confirm dialog and, if the user agrees, calls fn(true).
- * Resolves with fn's result, or undefined when the user cancelled. Other errors propagate.
+ * Soft-warning flow for sales saves (C2). `run(fn)` calls fn(false, false). When the server
+ * answers with a CREDIT_LIMIT warning it asks "Save anyway?" and, if the user agrees, retries
+ * with the first flag (overrideCreditLimit) set; a PROGRESS_OVERBILL warning (a line bills more
+ * than 100% of its estimate line) does the same with the second flag (allowOverBilling). Each
+ * warning is asked about separately. Resolves with fn's result, or undefined when the user
+ * cancelled. Other errors propagate.
  */
 export function useCreditLimitConfirm() {
-  const [pending, setPending] = React.useState<{ message: string; resolve: (ok: boolean) => void } | null>(null);
+  const [pending, setPending] = React.useState<{
+    title: string;
+    message: string;
+    resolve: (ok: boolean) => void;
+  } | null>(null);
 
-  const run = React.useCallback(async <T,>(fn: (override: boolean) => Promise<T>): Promise<T | undefined> => {
-    try {
-      return await fn(false);
-    } catch (err) {
-      if (err instanceof ApiError && err.code === 'CREDIT_LIMIT') {
-        const ok = await new Promise<boolean>((resolve) => setPending({ message: err.message, resolve }));
-        setPending(null);
-        if (!ok) return undefined;
-        return fn(true);
+  const run = React.useCallback(
+    async <T,>(fn: (override: boolean, allowOverBilling: boolean) => Promise<T>): Promise<T | undefined> => {
+      let override = false;
+      let allowOverBilling = false;
+      for (;;) {
+        try {
+          return await fn(override, allowOverBilling);
+        } catch (err) {
+          const code = err instanceof ApiError ? err.code : undefined;
+          const isLimit = code === 'CREDIT_LIMIT' && !override;
+          const isOverbill = code === 'PROGRESS_OVERBILL' && !allowOverBilling;
+          if (!isLimit && !isOverbill) throw err;
+          const title = isLimit ? 'Over the credit limit' : 'More than the estimate';
+          const ok = await new Promise<boolean>((resolve) =>
+            setPending({ title, message: (err as Error).message, resolve }),
+          );
+          setPending(null);
+          if (!ok) return undefined;
+          if (isLimit) override = true;
+          else allowOverBilling = true;
+        }
       }
-      throw err;
-    }
-  }, []);
+    },
+    [],
+  );
 
   const dialog = (
     <ConfirmDialog
       open={!!pending}
-      title="Over the credit limit"
+      title={pending?.title ?? 'Save anyway?'}
       message={
         <>
           {pending?.message}
