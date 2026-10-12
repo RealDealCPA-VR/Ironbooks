@@ -481,22 +481,31 @@ export const LEDGER_TABLES = ['journal_entries', 'journal_entry_lines', 'account
 
 const triggerNameCache = new Map<string, Set<string>>();
 
-/** Every trigger name any migration creates (bka_* guards and others, e.g. bk_journal_item_applications_void_guard). */
+/**
+ * Every trigger any migration creates, as `table.trigger` pairs (bka_* guards and others, e.g.
+ * bk_journal_item_applications_void_guard). Keyed by table as well as name: a trigger that
+ * borrows a shipped trigger's name but sits on a different table is still an unexpected trigger.
+ */
 export function migrationTriggerNames(migrationsFolder: string): Set<string> {
   const key = path.resolve(migrationsFolder);
   const cached = triggerNameCache.get(key);
   if (cached) return cached;
-  const names = new Set<string>(ledgerGuardPlan(migrationsFolder).triggers);
+  const names = new Set<string>();
   if (fs.existsSync(key)) {
-    const re = /CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+"?(\w+)"?/gi;
+    const re =
+      /CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+"?(\w+)"?[\s\S]*?\bON\s+(?:ONLY\s+)?(?:"?public"?\.)?"?(\w+)"?/gi;
     for (const file of migrationFiles(key)) {
       const text = fs.readFileSync(file, 'utf8').replace(/--[^\n]*/g, ' ');
       let m: RegExpExecArray | null;
-      while ((m = re.exec(text))) names.add(m[1]);
+      while ((m = re.exec(text))) names.add(triggerKey(m[2], m[1]));
     }
   }
   triggerNameCache.set(key, names);
   return names;
+}
+
+function triggerKey(table: string, trigger: string): string {
+  return `${table.toLowerCase()}.${trigger.toLowerCase()}`;
 }
 
 /** Non-internal triggers on the ledger tables that no migration creates (added offline). */
@@ -515,7 +524,7 @@ export async function extraLedgerTriggers(
         AND c.relname IN (${LEDGER_TABLES.map((x) => `'${x}'`).join(', ')})
       ORDER BY c.relname, t.tgname`,
   );
-  return found.filter((t) => !known.has(t.tgname));
+  return found.filter((t) => !known.has(triggerKey(t.tbl, t.tgname)));
 }
 
 function qi(name: string): string {
