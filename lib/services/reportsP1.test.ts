@@ -24,6 +24,7 @@ import { createVendor } from './vendors';
 import { createInvoice } from './invoices';
 import { receivePayment } from './payments';
 import { createBill } from './bills';
+import { payBills } from './billPayments';
 import { createCreditMemo } from './creditMemos';
 import { createSalesReceipt } from './salesReceipts';
 import { createItem } from './items';
@@ -384,5 +385,72 @@ describe('Adjusting Journal Entries, Balance Sheet Prev Year, purchases, sales t
     const st = await runStandardReport(ctx, 'sales-tax-liability', { from: '2026-01-01', to: '2026-12-31' });
     expect(grand(st).cells.balance).toBe('0.00');
     expect(Money.of(String(grand(st).cells.collected)).isZero()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// basis=cash across the financial and vendor reports
+// ---------------------------------------------------------------------------
+
+describe('basis=cash on the financial, detail and vendor reports', () => {
+  let co: Co;
+  const ids: Record<string, string> = {};
+  const R = { from: '2026-02-01', to: '2026-03-31' };
+
+  beforeAll(async () => {
+    co = await newCompany();
+    const { ctx, code } = co;
+    ids.acme = (await createCustomer(ctx, { displayName: 'Acme' })).id;
+    ids.supplier = (await createVendor(ctx, { displayName: 'Supplier' })).id;
+    const inv = await createInvoice(ctx, { customerId: ids.acme, date: d('2026-02-01'), dueDate: d('2026-03-03'), lines: [{ accountId: code['4000'], quantity: 1, rate: '100.00', taxable: false }] });
+    await receivePayment(ctx, { customerId: ids.acme, date: d('2026-03-10'), amount: '40.00', method: 'check', depositAccountId: code['1000'], applications: [{ invoiceId: inv.id, amountApplied: '40.00' }] });
+    const bill = await createBill(ctx, { vendorId: ids.supplier, date: d('2026-02-02'), dueDate: d('2026-03-04'), lines: [{ accountId: code['6000'], amount: '300.00' }] });
+    await payBills(ctx, { vendorId: ids.supplier, date: d('2026-03-12'), method: 'check', paymentAccountId: code['1000'], applications: [{ billId: bill.id, amountApplied: '120.00' }] });
+  }, 120_000);
+
+  const run = (key: string, p: Record<string, string> = {}) => runStandardReport(co.ctx, key, { ...R, ...p });
+  const netIncome = (r: StdReport) => r.rows.find((x) => x.id === 'pl:net')!.cells.total;
+
+  it('P&L, P&L Detail, by Class, by Job and by Month follow the basis', async () => {
+    expect(netIncome(await run('profit-loss', { basis: 'accrual' }))).toBe('-200.00');
+    expect(netIncome(await run('profit-loss', { basis: 'cash' }))).toBe('-80.00');
+    const byJob = await run('profit-loss-by-job', { basis: 'cash' });
+    expect(byJob.subtitle).toContain('Cash Basis');
+    expect(netIncome(byJob)).toBe('-80.00');
+    const byClass = await run('pl-by-class', { basis: 'cash' });
+    expect(byClass.subtitle).toContain('Cash Basis');
+    const byMonth = await run('profit-loss-by-month', { basis: 'cash' });
+    expect(netIncome(byMonth)).toBe('-80.00');
+    const det = await run('profit-loss-detail', { basis: 'cash' });
+    expect(det.subtitle).toContain('Cash Basis');
+  });
+
+  it('Trial Balance and Balance Sheets balance on a cash basis', async () => {
+    const tb = await run('trial-balance', { asOf: R.to, basis: 'cash' });
+    expect(tb.balanced).toBe(true);
+    expect(tb.subtitle).toContain('Cash Basis');
+    expect(grand(tb).cells.debit).toBe(grand(tb).cells.credit);
+    // No A/R or A/P on a cash basis.
+    const ar = row(tb, 'Accounts Receivable');
+    if (ar) expect(ar.cells.debit ?? null).toBeNull();
+    for (const key of ['balance-sheet', 'balance-sheet-summary', 'balance-sheet-prev-year']) {
+      const bs = await run(key, { asOf: R.to, basis: 'cash' });
+      expect(bs.balanced, key).toBe(true);
+      expect(bs.basis, key).toBe('cash');
+    }
+  });
+
+  it('Transaction Detail by Account and Expenses by Vendor count only what was paid', async () => {
+    const td = await run('transaction-detail-by-account', { accountId: co.code['6000'], basis: 'cash' });
+    const sum = td.rows
+      .filter((x) => x.kind === 'data' && x.cells.amount != null)
+      .reduce((a, x) => a.plus(Money.of(String(x.cells.amount))), Money.zero());
+    expect(sum.abs().toFixed(2)).toBe('120.00');
+    const acc = await run('expenses-by-vendor-summary', { basis: 'accrual' });
+    expect(row(acc, 'Supplier')!.cells.amount).toBe('300.00');
+    const cash = await run('expenses-by-vendor-summary', { basis: 'cash' });
+    expect(row(cash, 'Supplier')!.cells.amount).toBe('120.00');
+    expect(cash.subtitle).toContain('Cash Basis');
+    expect(row(cash, 'Supplier')!.href).toContain('basis=cash');
   });
 });

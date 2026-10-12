@@ -936,14 +936,14 @@ export async function expensesByVendorSummary(ctx: ServiceContext, p: ReportPara
         depth: 0,
         kind: 'data' as const,
         cells: { label: v.name, amount: amt(v.total) },
-        href: id ? stdHref('expenses-by-vendor-detail', { vendorId: id, from: dayStr(from), to: dayStr(to) }) : null,
+        href: id ? stdHref('expenses-by-vendor-detail', { vendorId: id, classId: p.classId, from: dayStr(from), to: dayStr(to), basis: p.basis === 'cash' ? 'cash' : undefined }) : null,
       };
     });
   rows.push({ id: 'ebv:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', amount: amt(total) } });
   return {
     key: 'expenses-by-vendor-summary',
     title: 'Expenses by Vendor Summary',
-    subtitle: rangeLabel(from, to),
+    subtitle: `${rangeLabel(from, to)}${p.basis === 'cash' ? ' · Cash Basis' : ''}`,
     columns: [{ key: 'label', header: 'Vendor' }, { key: 'amount', header: 'Amount', type: 'money' }],
     rows,
     truncated,
@@ -970,7 +970,7 @@ export async function expensesByVendorDetail(ctx: ServiceContext, p: ReportParam
   return {
     key: 'expenses-by-vendor-detail',
     title: 'Expenses by Vendor Detail',
-    subtitle: rangeLabel(from, to),
+    subtitle: `${rangeLabel(from, to)}${p.basis === 'cash' ? ' · Cash Basis' : ''}`,
     columns: detailColumns(keys),
     rows: laid.rows,
     truncated,
