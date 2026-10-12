@@ -50,14 +50,17 @@
  *  - Settlement dates: a payment / bill payment counts on its own date (an unapplied amount
  *    applied later also counts on the payment's date, like QB, which links it to the payment).
  *    Payment lines entered on the invoice itself (QB "Payment" items) are cash received with
- *    the invoice, so they count on the invoice date. A vendor credit applied to a bill counts on
- *    max(credit date, bill date) for both documents (the application is read from the audit
- *    trail; applyToBill stores no other link). Any settled amount that still cannot be dated
+ *    the invoice, so they count on the invoice date. A vendor credit applied to a bill counts, for both
+ *    documents, on the day it was applied (the audit row written by applyToBill / unapplyFromBill;
+ *    no earlier than either document), as QB recognizes it on the Pay Bills date — a later
+ *    application never changes an earlier period. Any settled amount that still cannot be dated
  *    (legacy data with no audit row) counts on the document's own date. A settlement dated
  *    before its document counts on the document date.
- *  - Rounding: the document's P&L recognized through each settlement is rounded once and split
- *    across the lines by largest remainder, so every settlement recognizes exactly its share of
- *    the cash (no 9.99 for 10.00) and every line ties out to its own amount when fully settled.
+ *  - Rounding: the document's P&L recognized through each settlement is rounded once (per sign
+ *    group: income vs. COGS) and split across the lines by a house-monotone divisor method, so
+ *    every settlement recognizes exactly its share of the cash (no 9.99 for 10.00), a payment
+ *    never moves any line against its sign, and every line ties out to its own amount when fully
+ *    settled.
  *  - Bounced checks: the payment's applications are deleted but snapshotted on the
  *    bounced-check row; the paid share stays recognized on the original payment date and is
  *    reversed on the bounce date (no past period changes).
@@ -153,6 +156,12 @@ interface DocInfo {
   ownNum: string;
   settlements: Settlement[];
 }
+
+/**
+ * The calendar day (on this computer) a timestamp falls on, at UTC midnight — the convention
+ * stored document dates use.
+ */
+const calendarDay = (t: Date) => new Date(Date.UTC(t.getFullYear(), t.getMonth(), t.getDate()));
 
 const isPL = (t: string) => t === 'revenue' || t === 'expense';
 const controlSide = (a: { type: string; subtype: string | null }) =>
@@ -424,14 +433,15 @@ export async function cashBasisLedger(ctx: ServiceContext, opts: { to?: Date } =
     }
   }
   // Vendor credits applied to bills (vendorCredits.applyToBill / unapplyFromBill). These write
-  // no GL entry and no dated link row; the audit trail records each (credit, bill, amount). The
-  // application settles BOTH documents, dated max(credit date, bill date): the credit cannot be
-  // used before it exists, and it never reaches back into a period before the credit was
-  // issued (so a closed period is never rewritten). In QB the credit is recognized when it is
-  // applied, which can be no earlier than either document.
+  // no GL entry and no dated link row; the audit trail records each (credit, bill, amount) at
+  // the moment it happened. QB recognizes a bill credit on a cash basis when it is APPLIED (the
+  // Pay Bills date), so each application / unapplication settles BOTH documents on the calendar
+  // day its own audit row was written — never earlier than either document (floor), and never
+  // reaching back into a period that may already be closed. Applications and unapplications are
+  // netted per (credit, bill, day); an unapplication on a later day reverses on that day.
   if (billIds.length || vcIds.length) {
     const rows = await ctx.db
-      .select({ creditId: auditLogs.entityId, newValues: auditLogs.newValues })
+      .select({ creditId: auditLogs.entityId, newValues: auditLogs.newValues, createdAt: auditLogs.createdAt })
       .from(auditLogs)
       .where(
         and(
@@ -440,18 +450,7 @@ export async function cashBasisLedger(ctx: ServiceContext, opts: { to?: Date } =
           sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
         ),
       );
-    const net = new Map<string, { creditId: string; billId: string; amount: Decimal }>();
-    for (const r of rows) {
-      const nv = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
-      if (!nv.billId) continue;
-      const k = `${r.creditId}|${nv.billId}`;
-      const e = net.get(k) ?? { creditId: r.creditId, billId: nv.billId, amount: Money.zero() };
-      const a = Money.of(nv.amount ?? '0');
-      e.amount = nv.action === 'applied_to_bill' ? e.amount.plus(a) : e.amount.minus(a);
-      net.set(k, e);
-    }
-    const pairs = [...net.values()].filter((e) => e.amount.greaterThan(0));
-    if (pairs.length) {
+    if (rows.length) {
       const vcHead = new Map(
         (
           await ctx.db
@@ -468,20 +467,35 @@ export async function cashBasisLedger(ctx: ServiceContext, opts: { to?: Date } =
             .where(eq(bills.companyId, ctx.companyId))
         ).map((b) => [b.id, b]),
       );
-      for (const p of pairs) {
-        const c = vcHead.get(p.creditId);
-        const b = billHead.get(p.billId);
+      const net = new Map<string, { creditId: string; billId: string; date: Date; amount: Decimal }>();
+      for (const r of rows) {
+        const nv = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
+        if (!nv.billId) continue;
+        const c = vcHead.get(r.creditId);
+        const b = billHead.get(nv.billId);
         if (!c || !b) continue;
-        const date = c.date > b.date ? c.date : b.date;
+        let date = calendarDay(r.createdAt);
+        if (c.date > date) date = c.date;
+        if (b.date > date) date = b.date;
+        const k = `${r.creditId}|${nv.billId}|${date.getTime()}`;
+        const e = net.get(k) ?? { creditId: r.creditId, billId: nv.billId, date, amount: Money.zero() };
+        const a = Money.of(nv.amount ?? '0');
+        e.amount = nv.action === 'applied_to_bill' ? e.amount.plus(a) : e.amount.minus(a);
+        net.set(k, e);
+      }
+      for (const p of net.values()) {
+        if (p.amount.isZero()) continue;
+        const c = vcHead.get(p.creditId)!;
+        const b = billHead.get(p.billId)!;
         docs.get(`bill:${p.billId}`)?.settlements.push({
-          date,
+          date: p.date,
           amount: p.amount,
           entryId: c.entryId,
           txnType: 'bill_credit',
           num: '',
         });
         docs.get(`vendor_credit:${p.creditId}`)?.settlements.push({
-          date,
+          date: p.date,
           amount: p.amount,
           entryId: b.entryId,
           txnType: 'bill',
@@ -533,10 +547,9 @@ export async function cashBasisLedger(ctx: ServiceContext, opts: { to?: Date } =
         { accountId: ctrl, classId: g.classId, date: g.date, net: g.net, kind: 'defer', control: true, doc: docRef },
       );
     }
-    // Cumulative recognition through each settlement. The document's P&L total recognized
-    // through settlement k is rounded ONCE (so each settlement recognizes exactly its share of
-    // the cash, never 9.99 for 10.00), then split across the lines by largest remainder. The
-    // last settlement (frac = 1) lands every line exactly on its own amount.
+    // Cumulative recognition through each settlement (see splitCumulative): rounded once per
+    // settlement, split so a line only ever moves in the settlement's direction, and the last
+    // settlement (frac = 1) lands every line exactly on its own amount.
     const prev = gl.map(() => Money.zero());
     let cum = Money.zero();
     for (const e of events) {
@@ -562,29 +575,100 @@ export async function cashBasisLedger(ctx: ServiceContext, opts: { to?: Date } =
   return { adjustments, deferredEntryIds };
 }
 
+// BigInt constants (tsconfig target predates BigInt literals).
+const B0 = BigInt(0);
+const B1 = BigInt(1);
+const B2 = BigInt(2);
+
 /**
- * Cumulative amount of each line recognized at fraction `frac` of the document. The total is
- * round2(sum of exact shares); each line gets its floored exact share plus one cent for the
- * lines with the largest remainders until the total is reached (largest-remainder method;
- * floor, not truncation, so mixed-sign lines such as income and COGS stay exact).
+ * Cumulative amount of each line recognized at fraction `frac` of the document.
+ *
+ * Lines are split into two same-sign groups (e.g. income vs. COGS on an invoice). The smaller
+ * group recognizes round2(frac × its total); the group with the document's net sign recognizes
+ * the rest of round2(frac × net), so each settlement recognizes exactly its share of the cash
+ * (no 9.99 for 10.00) and both group totals only grow with frac. Those T cents are handed out
+ * by a DIVISOR method (Sainte-Laguë / Webster): every cent of the group is ranked once, for
+ * good, by amount ÷ (cents already given + ½), ties to the earlier line, and the first T cents
+ * of that fixed ranking are recognized. Because the ranking never depends on `frac`, a larger
+ * fraction only ever ADDS cents to a line (house-monotone): a payment never moves a line
+ * against its own sign, a bounced check only ever moves lines back toward zero, and at
+ * frac = 1 every line lands exactly on its own amount. (Largest remainder recomputed from
+ * cumulative totals does not have this property — the Alabama paradox.)
  */
 export function splitCumulative(nets: Decimal[], frac: Decimal): Decimal[] {
   if (frac.greaterThanOrEqualTo(1)) return nets.map((n) => Money.round2(n));
-  const exact = nets.map((n) => Money.mul(n, frac));
-  const total = Money.round2(exact.reduce((a, x) => a.plus(x), Money.zero()));
-  const out = exact.map((x) => new DecimalValue(x.toFixed(2, DecimalValue.ROUND_FLOOR)));
-  let cents = total.minus(out.reduce((a, x) => a.plus(x), Money.zero())).times(100).round().toNumber();
-  const order = out
-    .map((_, i) => i)
-    .sort((a, b) => {
-      const d = exact[b].minus(out[b]).comparedTo(exact[a].minus(out[a]));
-      return d !== 0 ? d : nets[b].abs().comparedTo(nets[a].abs()) || a - b;
+  const out = nets.map(() => Money.zero());
+  if (!frac.greaterThan(0)) return out;
+  const cents = nets.map((n) => BigInt(Money.round2(n).times(100).toFixed(0)));
+  const roundCents = (c: bigint) =>
+    BigInt(Money.round2(Money.mul(new DecimalValue(c.toString()).dividedBy(100), frac)).times(100).toFixed(0));
+  const net = cents.reduce((a, x) => a + x, B0);
+  // The group with the net's sign absorbs the net target, so the settlement recognizes exactly
+  // round2(frac × net); the other group is rounded on its own. Both targets are monotone in frac.
+  const big = net < B0 ? -B1 : B1;
+  const groups = [-big, big].map((sign) => {
+    const idx = cents.map((_, i) => i).filter((i) => cents[i] * sign > B0);
+    return { sign, idx, total: idx.reduce((a, i) => a + cents[i], B0) };
+  });
+  const smallTarget = roundCents(groups[0].total);
+  const targets = [smallTarget, roundCents(net) - smallTarget];
+  groups.forEach((g, gi) => {
+    if (g.idx.length === 0) return;
+    const alloc = divisorApportion(
+      g.idx.map((i) => cents[i] * g.sign),
+      targets[gi] * g.sign,
+    );
+    g.idx.forEach((i, k) => {
+      out[i] = new DecimalValue((alloc[k] * g.sign).toString()).dividedBy(100);
     });
-  for (let k = 0; cents > 0 && order.length > 0; k++, cents--) {
-    const i = order[k % order.length];
-    out[i] = out[i].plus('0.01');
-  }
+  });
   return out;
+}
+
+/**
+ * Webster apportionment of `target` units over integer weights `m` (target ≤ sum m): the first
+ * `target` units of the fixed ranking of (line i, unit j) by m_i ÷ (j + ½) descending, ties to
+ * the lower index. Exact integer arithmetic; O(lines) adjustments.
+ */
+function divisorApportion(m: bigint[], target: bigint): bigint[] {
+  const total = m.reduce((a, x) => a + x, B0);
+  if (target <= B0) return m.map(() => B0);
+  if (target >= total) return [...m];
+  // Units strictly above the threshold total/target: unit j of line i qualifies when
+  // m_i/(j+½) > total/target  ⇔  j < (2·m_i·target − total) / (2·total).
+  const a = m.map((mi) => {
+    const num = B2 * mi * target - total;
+    if (num <= B0) return B0;
+    const den = B2 * total;
+    const c = (num + den - B1) / den; // ceil(num/den): count of j ≥ 0 with j < num/den
+    return c > mi ? mi : c;
+  });
+  // value of unit j of line i is m_i/(j+½); compare m_i·(2k+1) vs m_k·(2j+1).
+  const better = (i: number, ji: bigint, k: number, jk: bigint) => {
+    const l = m[i] * (B2 * jk + B1);
+    const r = m[k] * (B2 * ji + B1);
+    return l > r || (l === r && i < k);
+  };
+  let sum = a.reduce((s, x) => s + x, B0);
+  while (sum < target) {
+    let best = -1;
+    for (let i = 0; i < m.length; i++) {
+      if (a[i] >= m[i]) continue;
+      if (best < 0 || better(i, a[i], best, a[best])) best = i;
+    }
+    a[best] += B1;
+    sum += B1;
+  }
+  while (sum > target) {
+    let worst = -1;
+    for (let i = 0; i < m.length; i++) {
+      if (a[i] <= B0) continue;
+      if (worst < 0 || better(worst, a[worst] - B1, i, a[i] - B1)) worst = i;
+    }
+    a[worst] -= B1;
+    sum -= B1;
+  }
+  return a;
 }
 
 /**

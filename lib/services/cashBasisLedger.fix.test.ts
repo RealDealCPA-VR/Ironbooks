@@ -67,7 +67,7 @@ afterAll(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
-describe('splitCumulative (largest remainder)', () => {
+describe('splitCumulative (house-monotone divisor split)', () => {
   const m = (xs: string[]) => xs.map((x) => Money.of(x));
   const sum = (xs: ReturnType<typeof m>) => xs.reduce((a, x) => a.plus(x), Money.zero());
 
@@ -100,7 +100,7 @@ describe('splitCumulative (largest remainder)', () => {
 });
 
 describe('settlement dates', () => {
-  it('a vendor credit dated BEFORE the bill counts on the bill date, never before', async () => {
+  it('a vendor credit dated BEFORE the bill counts on the day it is applied, never before the bill', async () => {
     const co = await newCompany();
     const vc = await createVendorCredit(co.ctx, {
       vendorId: co.vendor,
@@ -114,12 +114,16 @@ describe('settlement dates', () => {
     });
     expect(await cashNet(co, '2026-01-01', '2026-02-28')).toBe('0.00');
     await applyToBill(co.ctx, { vendorCreditId: vc.id, billId: bill.id, amount: '40.00' });
-    // January is untouched; the bill's 40 share and the credit's -40 settle together on Feb 10.
+    // January is untouched; the bill's 40 share and the credit's -40 settle together on the day
+    // the credit was applied (QB: the Pay Bills date), floored at the bill date.
     expect(await cashNet(co, '2026-01-01', '2026-01-31')).toBe('0.00');
+    const now = new Date();
+    const today = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())).toISOString().slice(0, 10);
+    const expected = today > '2026-02-10' ? today : '2026-02-10';
     const { adjustments } = await cashBasisLedger(co.ctx);
     const rec = adjustments.filter((a) => a.kind === 'recognize');
     expect(rec.length).toBeGreaterThan(0);
-    for (const a of rec) expect(a.date.toISOString().slice(0, 10)).toBe('2026-02-10');
+    for (const a of rec) expect(a.date.toISOString().slice(0, 10)).toBe(expected);
     expect(await cashNet(co, '2026-02-01', '2026-02-28')).toBe('0.00');
     for (const day of ['2026-01-31', '2026-02-28']) await invariants(co, day);
   });
