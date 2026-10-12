@@ -10,26 +10,41 @@
  *
  *   <Label>Deposit to <Help term="undeposited-funds" /></Label>
  *   <Help term="ar">A/R</Help>   // renders the text with a dotted underline + the "?" icon
+ *   <Help page="/invoices">What is this page?</Help>   // page help from lib/pageHelp.ts
  */
 import * as React from 'react';
 import { HelpCircle } from 'lucide-react';
 import { GLOSSARY, glossaryAnchor, type GlossaryEntry, type GlossaryKey } from '@/lib/glossary';
+import { pageHelpFor } from '@/lib/pageHelp';
 import { cn } from '@/lib/utils';
 
 export function Help({
   term,
+  page,
   children,
   className,
   side = 'top',
 }: {
-  term: GlossaryKey;
+  /** A glossary term… */
+  term?: GlossaryKey;
+  /** …or a page path: shows "What is this page?" help (lib/pageHelp.ts). */
+  page?: string;
   /** Optional inline text shown before the icon (dotted underline). */
   children?: React.ReactNode;
   className?: string;
   /** Which side of the trigger the bubble opens on. */
   side?: 'top' | 'bottom';
 }) {
-  const entry: GlossaryEntry = GLOSSARY[term];
+  const pageEntry = page ? pageHelpFor(page) : null;
+  const entry: GlossaryEntry = pageEntry
+    ? {
+        term: pageEntry.title,
+        short: `${pageEntry.what} First: ${pageEntry.first}`,
+        aliases: pageEntry.qb && pageEntry.qb !== pageEntry.title ? [pageEntry.qb] : undefined,
+      }
+    : term
+      ? GLOSSARY[term]
+      : { term: 'this', short: '' };
   const [open, setOpen] = React.useState(false);
   // Click "pins" the bubble open (touch devices have no hover); hover/focus show it transiently.
   const [pinned, setPinned] = React.useState(false);
@@ -60,6 +75,7 @@ export function Help({
     };
   }, [open]);
 
+  if (page && !pageEntry) return children ? <>{children}</> : null;
   return (
     <span
       ref={wrapRef}
@@ -74,7 +90,7 @@ export function Help({
       )}
       <button
         type="button"
-        aria-label={`What is ${entry.term}?`}
+        aria-label={pageEntry ? `What is the ${entry.term} page?` : `What is ${entry.term}?`}
         aria-expanded={open}
         aria-describedby={open ? id : undefined}
         onFocus={() => setOpen(true)}
@@ -105,11 +121,18 @@ export function Help({
         >
           <span className="block font-semibold text-sm mb-1">{entry.term}</span>
           <span className="block text-white/85">{entry.short}</span>
+          {pageEntry?.qb && pageEntry.qb !== pageEntry.title && (
+            <span className="mt-1 block text-white/60">QuickBooks calls this &ldquo;{pageEntry.qb}&rdquo;.</span>
+          )}
           <a
-            href={`/help#${glossaryAnchor(term)}`}
+            href={term && !pageEntry ? `/help#${glossaryAnchor(term)}` : '/help'}
             target="_blank"
             rel="noopener noreferrer"
-            aria-label={`Learn more about ${entry.term} (opens in a new window)`}
+            aria-label={
+              pageEntry
+                ? 'Open Help (opens in a new window)'
+                : `Learn more about ${entry.term} (opens in a new window)`
+            }
             className="mt-2 inline-block font-semibold text-sky-300 hover:underline outline-none focus-visible:ring-2 focus-visible:ring-sky-300/60 rounded"
             onBlur={(e) => {
               if (!pinned && !wrapRef.current?.contains(e.relatedTarget as Node)) setOpen(false);
