@@ -81,7 +81,8 @@ export interface ReceiveStockResult {
 
 /**
  * Record a stock receipt: inserts a new inventory layer (FIFO lot) and posts
- * Dr 1300 Inventory / Cr 3000 Owner's Equity for qty * unitCost.
+ * Dr Inventory / Cr the Adjustment Account (default "Inventory Adjustments") for qty * unitCost,
+ * tagged with the optional Class and Customer:Job.
  */
 export async function receiveStock(
   ctx: ServiceContext,

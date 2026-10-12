@@ -21,6 +21,12 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import {
+  InventoryAdjustmentFields,
+  EMPTY_ADJUSTMENT_FIELDS,
+  adjustmentPayload,
+  type AdjustmentFieldValues,
+} from '@/components/InventoryAdjustmentFields';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -108,6 +114,7 @@ export default function FifoPage() {
   const [receiveOpen, setReceiveOpen] = useState(false);
   const [receiveForm, setReceiveForm] = useState<ReceiveForm>(EMPTY_RECEIVE);
   const [receiveSaving, setReceiveSaving] = useState(false);
+  const [receiveAdj, setReceiveAdj] = useState<AdjustmentFieldValues>(EMPTY_ADJUSTMENT_FIELDS);
 
   // Consume modal
   const [consumeOpen, setConsumeOpen] = useState(false);
@@ -150,6 +157,7 @@ export default function FifoPage() {
 
   function openReceive() {
     setReceiveForm(EMPTY_RECEIVE);
+    setReceiveAdj(EMPTY_ADJUSTMENT_FIELDS);
     setReceiveOpen(true);
   }
 
@@ -176,6 +184,7 @@ export default function FifoPage() {
         unitCost: receiveForm.unitCost,
         date: receiveForm.date,
         memo: receiveForm.memo || undefined,
+        ...adjustmentPayload(receiveAdj),
       });
       toast('Stock received and inventory layer recorded', 'success');
       setReceiveOpen(false);
@@ -458,8 +467,10 @@ export default function FifoPage() {
               onChange={(e) => updateReceive('memo', e.target.value)}
             />
           </div>
+          <InventoryAdjustmentFields value={receiveAdj} onChange={setReceiveAdj} idPrefix="receive-adj" />
           <p className="text-xs text-navy/50">
-            GL: Dr 1300 Inventory / Cr 3000 Owner's Equity for qty &times; unit cost.
+            Adds quantity &times; unit cost to inventory. The other side goes to the adjustment account
+            (Inventory Adjustments unless you pick another).
           </p>
         </form>
       </Modal>
