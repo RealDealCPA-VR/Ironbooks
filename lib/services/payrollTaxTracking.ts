@@ -56,6 +56,9 @@ export const DEDUCTION_TRACKING = [
   '403b',
   '457b',
   'simple_ira',
+  'roth_401k',
+  'roth_403b',
+  'roth_457b',
   'section125',
   'hsa',
   'dependent_care',
@@ -96,6 +99,9 @@ export const TAX_TRACKING_LABELS: Record<TaxTracking, string> = {
   '403b': '403(b) employee deferral (W-2 Box 12 E)',
   '457b': '457(b) employee deferral (W-2 Box 12 G)',
   simple_ira: 'SIMPLE IRA deferral (W-2 Box 12 S)',
+  roth_401k: 'Roth 401(k) after-tax deferral (W-2 Box 12 AA)',
+  roth_403b: 'Roth 403(b) after-tax deferral (W-2 Box 12 BB)',
+  roth_457b: 'Roth 457(b) after-tax deferral (W-2 Box 12 EE)',
   section125: 'Section 125 cafeteria (health, dental, vision, FSA)',
   hsa: 'HSA through cafeteria plan (W-2 Box 12 W)',
   dependent_care: 'Dependent care FSA (W-2 Box 10)',
@@ -138,7 +144,7 @@ export interface DeductionTreatment {
   /** Reduces Social Security / Medicare / FUTA / SUI / SDI wages — W-2 Box 3 / 5, 941 5a/5c, 940. */
   reducesFicaWages: boolean;
   /** W-2 Box 12 code, if any. */
-  w2Box12?: 'D' | 'E' | 'G' | 'S' | 'W';
+  w2Box12?: 'D' | 'E' | 'G' | 'S' | 'W' | 'AA' | 'BB' | 'EE';
   /** Reported in W-2 Box 10 (dependent care benefits). */
   w2Box10?: boolean;
   /** Shown in W-2 Box 14 (informational) with this label. */
@@ -151,6 +157,10 @@ export const DEDUCTION_TREATMENT: Record<DeductionTracking, DeductionTreatment> 
   '403b': { reducesIncomeTaxWages: true, reducesFicaWages: false, w2Box12: 'E' },
   '457b': { reducesIncomeTaxWages: true, reducesFicaWages: false, w2Box12: 'G' },
   simple_ira: { reducesIncomeTaxWages: true, reducesFicaWages: false, w2Box12: 'S' },
+  // Roth deferrals are after-tax: they reduce no wage base and are reported in Box 12 only.
+  roth_401k: { reducesIncomeTaxWages: false, reducesFicaWages: false, w2Box12: 'AA' },
+  roth_403b: { reducesIncomeTaxWages: false, reducesFicaWages: false, w2Box12: 'BB' },
+  roth_457b: { reducesIncomeTaxWages: false, reducesFicaWages: false, w2Box12: 'EE' },
   section125: { reducesIncomeTaxWages: true, reducesFicaWages: true, w2Box14: 'Sec 125' },
   hsa: { reducesIncomeTaxWages: true, reducesFicaWages: true, w2Box12: 'W' },
   dependent_care: { reducesIncomeTaxWages: true, reducesFicaWages: true, w2Box10: true },
@@ -171,16 +181,24 @@ export function isPretaxTracking(tracking: string | null | undefined): boolean {
 
 /**
  * Default tracking for a DEDUCTION item from its name and legacy pre-tax flag.
- * Retirement deferrals are recognized by name; any other pre-tax deduction is treated as a
- * Section 125 cafeteria item; everything else is after-tax.
+ * Roth deferrals are always after-tax (W-2 Box 12 AA/BB/EE; they reduce no wages). Otherwise
+ * the pre-tax flag wins: an after-tax item never turns pre-tax because of its name. Pre-tax
+ * retirement deferrals are recognized by name; any other pre-tax deduction is treated as a
+ * Section 125 cafeteria item.
  */
 export function inferDeductionTracking(name: string, pretax: boolean): DeductionTracking {
   const n = name.toLowerCase();
-  if (/\b401\s*\(?k\)?|401k/.test(n)) return '401k';
-  if (/\b403\s*\(?b\)?|403b/.test(n)) return '403b';
-  if (/\b457\s*\(?b\)?|457b|\b457\b/.test(n)) return '457b';
-  if (/simple\s*ira/.test(n)) return 'simple_ira';
+  if (/(^|[^a-z])roth/.test(n)) {
+    if (/403\s*\(?b/.test(n)) return 'roth_403b';
+    if (/457/.test(n)) return 'roth_457b';
+    if (/401\s*\(?k/.test(n)) return 'roth_401k';
+    return 'none';
+  }
   if (!pretax) return 'none';
+  if (/401\s*\(?k/.test(n)) return '401k';
+  if (/403\s*\(?b/.test(n)) return '403b';
+  if (/457/.test(n)) return '457b';
+  if (/simple\s*ira/.test(n)) return 'simple_ira';
   if (/\bhsa\b|health savings/.test(n)) return 'hsa';
   if (/dependent\s*care|\bdcap\b|\bdcfsa\b/.test(n)) return 'dependent_care';
   if (/retire|pension|deferred comp/.test(n)) return '401k';

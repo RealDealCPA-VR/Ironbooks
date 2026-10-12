@@ -223,6 +223,7 @@ describe('fix/payroll tax tracking — adversarial QA', { timeout: 180_000 }, ()
     const w2 = await w2Data(ctx, { employeeId: e.id, year: 2025 });
     expect(w2.wages).toBe('2000.00');
     expect(w2.box12.find((b) => b.code === 'D')).toBeUndefined();
+    expect(w2.box12.find((b) => b.code === 'AA')?.amount).toBe('200.00');
   });
 
   it('migration 0035 must not flip a legacy after-tax "Roth 401(k)" item to pre-tax', async () => {
@@ -236,7 +237,8 @@ describe('fix/payroll tax tracking — adversarial QA', { timeout: 180_000 }, ()
     }
     const [after] = await db.select().from(payrollItems).where(eq(payrollItems.id, legacy.id));
     expect(after.pretax).toBe(false);
-    expect(after.taxTracking).toBe('none');
+    // After-tax Roth deferral: reduces no wages, reported in W-2 Box 12 AA.
+    expect(after.taxTracking).toBe('roth_401k');
   });
 
   it('migration 0035 leaves explicitly-typed items alone and keeps default items correct', async () => {

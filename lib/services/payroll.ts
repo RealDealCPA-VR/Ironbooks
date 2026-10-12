@@ -955,6 +955,66 @@ async function preparePaycheck(
   let taxLines: PaycheckLineInput[];
   let employerTaxLines: PaycheckLineInput[] | undefined;
 
+  // Tax context shared by the employee and employer calculations: the PAY DATE's tax year,
+  // YTD FICA wages before this check, and the employee's work-state settings.
+  const year = input.payDate.getUTCFullYear();
+  type TaxCtx = {
+    ytdFicaBefore: string;
+    state: string | null;
+    stateSettings: Awaited<ReturnType<typeof stateSettingsFor>> | null;
+  };
+  let taxCtx: TaxCtx | undefined;
+  const getTaxCtx = async (): Promise<TaxCtx> => {
+    if (!taxCtx) {
+      const ytd = await ytdWagesPaid(ctx, input.employeeId, input.payDate, opts.excludePaycheckId);
+      const state = employeeWorkState(employee);
+      taxCtx = {
+        ytdFicaBefore: ytd.fica,
+        state: state ?? null,
+        stateSettings: state ? await stateSettingsFor(ctx, state, year) : null,
+      };
+    }
+    return taxCtx;
+  };
+
+  /**
+   * Employer payroll taxes (employer FICA match + FUTA + SUI + workers comp) from the year's
+   * tables on this check's FICA wages. Computed whenever the caller did not supply them —
+   * including when the employee taxes were typed in — so no paycheck can skip employer taxes.
+   */
+  const computeEmployerTaxLines = async (): Promise<PaycheckLineInput[]> => {
+    const { ytdFicaBefore, state, stateSettings } = await getTaxCtx();
+    const employer = computeEmployerTaxes({
+      grossPerPeriod: ficaWages.toNumber(),
+      ytdGrossBefore: ytdFicaBefore,
+      year,
+    });
+    const lines: PaycheckLineInput[] = [
+      { kind: 'employer_contribution' as const, name: 'Employer Social Security',     amount: employer.socialSecurity, taxTracking: 'employer_social_security' },
+      { kind: 'employer_contribution' as const, name: 'Employer Medicare',            amount: employer.medicare,       taxTracking: 'employer_medicare' },
+      { kind: 'employer_contribution' as const, name: 'Federal Unemployment (FUTA)',  amount: employer.futa,           taxTracking: 'futa' },
+    ];
+    if (state && stateSettings && Money.gt(stateSettings.suiRate, 0)) {
+      const suiTaxable = taxableUnderBase(ficaWages, ytdFicaBefore, stateSettings.suiWageBase);
+      lines.push({
+        kind: 'employer_contribution',
+        name: `State Unemployment (${state})`,
+        amount: toAmountString(Money.round2(suiTaxable.times(Money.of(stateSettings.suiRate)))),
+        taxTracking: 'sui',
+      });
+    }
+    const wc = await workersCompFor(ctx, employee.workersCompCodeId ?? null);
+    if (wc && Money.gt(wc.ratePer100, 0)) {
+      lines.push({
+        kind: 'employer_contribution',
+        name: `Workers Compensation (${wc.code})`,
+        amount: toAmountString(Money.round2(gross.times(Money.of(wc.ratePer100)).dividedBy(100))),
+        taxTracking: 'workers_comp',
+      });
+    }
+    return lines.filter((t) => Money.gt(t.amount, 0));
+  };
+
   if (callerSuppliedTaxes) {
     taxLines = input.taxes!.map((t) => ({ ...t, taxTracking: employeeTaxTracking(t) }));
   } else {
@@ -962,9 +1022,7 @@ async function preparePaycheck(
     // overrides the filing status): federal income tax on income-tax wages; Social Security and
     // Medicare on FICA wages. The SS wage base and Additional Medicare threshold apply against
     // ACTUAL YTD FICA wages, which include historical YTD amounts entered at mid-year setup.
-    const year = input.payDate.getUTCFullYear();
-    const ytd = await ytdWagesPaid(ctx, input.employeeId, input.payDate, opts.excludePaycheckId);
-    const ytdFicaBefore = ytd.fica;
+    const { ytdFicaBefore, state, stateSettings } = await getTaxCtx();
     const w4 = (employee.w4 ?? {}) as W4Data;
     const withholding = computeWithholding({
       grossPerPeriod: incomeTaxWages.toNumber(),
@@ -982,46 +1040,13 @@ async function preparePaycheck(
     ];
 
     // State payroll taxes configured for the employee's work state (employee SDI).
-    const state = employeeWorkState(employee);
-    const stateSettings = state ? await stateSettingsFor(ctx, state, year) : null;
     if (state && stateSettings && Money.gt(stateSettings.sdiRate, 0)) {
       const sdiTaxable = taxableUnderBase(ficaWages, ytdFicaBefore, stateSettings.sdiWageBase);
       const sdi = Money.round2(sdiTaxable.times(Money.of(stateSettings.sdiRate)));
       taxLines.push({ kind: 'tax', name: `State Disability (${state})`, amount: toAmountString(sdi), taxTracking: 'sdi' });
     }
 
-    // Employer payroll taxes (employer FICA match + FUTA + SUI + workers comp) — auto-computed
-    // alongside the employee withholdings unless the caller supplied them explicitly.
-    if (!callerSuppliedEmployerTaxes) {
-      const employer = computeEmployerTaxes({
-        grossPerPeriod: ficaWages.toNumber(),
-        ytdGrossBefore: ytdFicaBefore,
-        year,
-      });
-      employerTaxLines = [
-        { kind: 'employer_contribution' as const, name: 'Employer Social Security',     amount: employer.socialSecurity, taxTracking: 'employer_social_security' },
-        { kind: 'employer_contribution' as const, name: 'Employer Medicare',            amount: employer.medicare,       taxTracking: 'employer_medicare' },
-        { kind: 'employer_contribution' as const, name: 'Federal Unemployment (FUTA)',  amount: employer.futa,           taxTracking: 'futa' },
-      ];
-      if (state && stateSettings && Money.gt(stateSettings.suiRate, 0)) {
-        const suiTaxable = taxableUnderBase(ficaWages, ytdFicaBefore, stateSettings.suiWageBase);
-        employerTaxLines.push({
-          kind: 'employer_contribution',
-          name: `State Unemployment (${state})`,
-          amount: toAmountString(Money.round2(suiTaxable.times(Money.of(stateSettings.suiRate)))),
-          taxTracking: 'sui',
-        });
-      }
-      const wc = await workersCompFor(ctx, employee.workersCompCodeId ?? null);
-      if (wc && Money.gt(wc.ratePer100, 0)) {
-        employerTaxLines.push({
-          kind: 'employer_contribution',
-          name: `Workers Compensation (${wc.code})`,
-          amount: toAmountString(Money.round2(gross.times(Money.of(wc.ratePer100)).dividedBy(100))),
-          taxTracking: 'workers_comp',
-        });
-      }
-    }
+    if (!callerSuppliedEmployerTaxes) employerTaxLines = await computeEmployerTaxLines();
 
     // --- Per-item overrides (QB: type over a calculated tax on the paycheck). Matched by the
     // item's tax tracking type — never by free-text name. ---
@@ -1063,11 +1088,11 @@ async function preparePaycheck(
   }
 
   // Caller-supplied employer taxes always win; explicit [] means "no employer taxes".
-  // When employee taxes were supplied explicitly and employerTaxes was omitted, no
-  // employer taxes are auto-derived (the caller has taken over the tax math).
+  // When employee taxes were typed in but employerTaxes was omitted, the employer taxes are
+  // still calculated (QB: employer FICA / FUTA / SUI are never silently skipped).
   employerTaxLines ??= callerSuppliedEmployerTaxes
     ? input.employerTaxes!.map((t) => ({ ...t, taxTracking: employerTracking(t) }))
-    : [];
+    : await computeEmployerTaxLines();
 
   let totalEmployerTaxes = Money.zero();
   for (const t of employerTaxLines) {

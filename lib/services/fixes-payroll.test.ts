@@ -101,7 +101,7 @@ describe('payroll audit fixes', () => {
       expect(taxNames).toContain('Medicare');
     });
 
-    it('explicit empty taxes array is respected (totalTaxes = 0, no employer taxes)', async () => {
+    it('explicit empty taxes array is respected (totalTaxes = 0); employer taxes still calculated unless [] too', async () => {
       const emp = await createEmployee(ctx, {
         firstName: 'No', lastName: 'Taxes', payType: 'hourly', payRate: '25.00',
       });
@@ -116,8 +116,23 @@ describe('payroll audit fixes', () => {
 
       const lines = await linesFor(check.id);
       expect(lines.filter((l) => l.kind === 'tax')).toHaveLength(0);
-      // Caller took over the tax math → no employer taxes are auto-derived either.
-      expect(lines.filter((l) => l.kind === 'employer_contribution')).toHaveLength(0);
+      // Employee taxes typed in, employerTaxes omitted → the employer taxes are still calculated
+      // (a paycheck can never silently skip employer FICA / FUTA).
+      const employer = lines.filter((l) => l.kind === 'employer_contribution');
+      expect(employer.find((l) => l.taxTracking === 'employer_social_security')?.amount).toBe('31.00');
+      expect(employer.find((l) => l.taxTracking === 'employer_medicare')?.amount).toBe('7.25');
+      expect(employer.find((l) => l.taxTracking === 'futa')?.amount).toBe('3.00');
+
+      // Explicit [] for both → no taxes of either kind.
+      const none = await runPaycheck(ctx, {
+        employeeId: emp.id,
+        payDate: new Date('2025-07-15'),
+        grossPay: '500.00',
+        taxes: [],
+        employerTaxes: [],
+      });
+      const noneLines = await linesFor(none.id);
+      expect(noneLines.filter((l) => l.kind === 'employer_contribution')).toHaveLength(0);
     });
   });
 

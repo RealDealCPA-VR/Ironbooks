@@ -192,6 +192,8 @@ interface PayrollFormState {
   payDate: string;
   periodStart: string;
   periodEnd: string;
+  /** Pay periods per year (52 weekly, 26 biweekly, 24 semimonthly, 12 monthly) — drives withholding. */
+  periodsPerYear: string;
   earnings: EarningRow[];
   /** Overrides of calculated taxes, keyed by TAX payroll item (never a typed name). */
   taxOverrides: TaxOverrideRow[];
@@ -291,10 +293,19 @@ const EMPTY_PAYROLL_FORM: PayrollFormState = {
   payDate: new Date().toISOString().slice(0, 10),
   periodStart: '',
   periodEnd: '',
+  periodsPerYear: '26',
   earnings: [{ kind: 'regular', hours: '', rate: '', amount: '' }],
   taxOverrides: [],
   deductions: [],
 };
+
+/** Pay frequency for the single paycheck — the same choices as a pay run. */
+const PAY_FREQUENCIES: Array<{ value: string; label: string }> = [
+  { value: '52', label: 'Weekly (52)' },
+  { value: '26', label: 'Every two weeks (26)' },
+  { value: '24', label: 'Twice a month (24)' },
+  { value: '12', label: 'Monthly (12)' },
+];
 
 const PAY_TYPE_LABELS: Record<string, string> = {
   hourly: 'Hourly',
@@ -1255,6 +1266,7 @@ export default function EmployeesPage() {
       payDate: form.payDate,
       periodStart: form.periodStart || undefined,
       periodEnd: form.periodEnd || undefined,
+      periodsPerYear: Number(form.periodsPerYear) || 26,
       earnings: form.earnings
         .filter((e) => Number(e.amount) > 0)
         .map((e) => ({
@@ -2154,7 +2166,7 @@ export default function EmployeesPage() {
           </div>
 
           {/* Dates */}
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-4 gap-3">
             <div>
               <Label htmlFor="prPayDate">Pay Date *</Label>
               <Input
@@ -2181,6 +2193,18 @@ export default function EmployeesPage() {
                 value={payrollForm.periodEnd}
                 onChange={(e) => updatePayrollField('periodEnd', e.target.value)}
               />
+            </div>
+            <div>
+              <Label htmlFor="prFrequency">How often paid</Label>
+              <Select
+                id="prFrequency"
+                value={payrollForm.periodsPerYear}
+                onChange={(e) => updatePayrollField('periodsPerYear', e.target.value)}
+              >
+                {PAY_FREQUENCIES.map((f) => (
+                  <option key={f.value} value={f.value}>{f.label}</option>
+                ))}
+              </Select>
             </div>
           </div>
 

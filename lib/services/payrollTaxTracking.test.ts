@@ -39,6 +39,7 @@ import { trialBalance } from './reports';
 import {
   inferDeductionTracking,
   inferEmployeeTaxTracking,
+  isPretaxTracking,
   paycheckWageBases,
 } from './payrollTaxTracking';
 import { runPaycheckSchema } from '@/lib/validation/payroll';
@@ -90,9 +91,16 @@ describe('payroll tax tracking (pure)', () => {
 
   it('infers sensible defaults from names', () => {
     expect(inferDeductionTracking('401(k) Employee', true)).toBe('401k');
-    // Roth deferrals are after-tax (W-2 Box 12 AA/BB, not D/E): they reduce no wages.
-    expect(inferDeductionTracking('Roth 401k', false)).toBe('none');
-    expect(inferDeductionTracking('Roth 403(b)', false)).toBe('none');
+    // Roth deferrals are after-tax (W-2 Box 12 AA/BB/EE, not D/E/G): they reduce no wages.
+    expect(inferDeductionTracking('Roth 401k', false)).toBe('roth_401k');
+    expect(inferDeductionTracking('Roth 401(k)', true)).toBe('roth_401k');
+    expect(inferDeductionTracking('Roth 403(b)', false)).toBe('roth_403b');
+    expect(inferDeductionTracking('Roth 457(b)', false)).toBe('roth_457b');
+    expect(inferDeductionTracking('Roth IRA', false)).toBe('none');
+    expect(isPretaxTracking(inferDeductionTracking('Roth 401k', true))).toBe(false);
+    // An after-tax item stays after-tax whatever its name.
+    expect(inferDeductionTracking('401(k) after-tax', false)).toBe('none');
+    expect(inferDeductionTracking('Brotherhood dues', true)).toBe('section125');
     expect(inferDeductionTracking('Health Insurance (pre-tax)', true)).toBe('section125');
     expect(inferDeductionTracking('HSA', true)).toBe('hsa');
     expect(inferDeductionTracking('Union dues', false)).toBe('none');

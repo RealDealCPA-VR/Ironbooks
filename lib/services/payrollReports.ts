@@ -210,7 +210,7 @@ export interface W2DataResult {
   medicare: string;
   /** Box 10: dependent care benefits. */
   dependentCare: string;
-  /** Box 12: coded amounts (D 401(k), E 403(b), G 457(b), S SIMPLE, W HSA, DD employer health). */
+  /** Box 12: coded amounts (D 401(k), E 403(b), G 457(b), S SIMPLE, AA/BB/EE Roth, W HSA, DD employer health). */
   box12: Array<{ code: string; amount: string }>;
   /** Box 14: other (informational), e.g. Section 125 cafeteria deductions. */
   box14: Array<{ label: string; amount: string }>;
@@ -612,7 +612,7 @@ export interface W3DataResult {
   medicare: string;
   /** Box 10: total dependent care benefits. */
   dependentCare: string;
-  /** Box 12a: total deferred compensation (codes D, E, F, G, H, S). */
+  /** Box 12a: total deferred compensation (codes D, E, F, G, H, S, Y, AA, BB, EE). */
   deferredCompensation: string;
   /** Box 12 totals by code across all W-2s. */
   box12: Array<{ code: string; amount: string }>;
@@ -662,7 +662,7 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
     // Box 16: state wages of the employees who had state withholding.
     if (f.stateWithheld.greaterThan(0)) stateWages = stateWages.plus(f.incomeTaxWages);
   }
-  const deferred = ['D', 'E', 'F', 'G', 'H', 'S'].reduce(
+  const deferred = ['D', 'E', 'F', 'G', 'H', 'S', 'Y', 'AA', 'BB', 'EE'].reduce(
     (s, code) => s.plus(t.box12.get(code) ?? Money.zero()),
     Money.zero(),
   );

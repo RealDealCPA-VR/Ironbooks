@@ -176,6 +176,9 @@ describe('Payroll UX (employee edit, itemized earnings, void, YTD, reports)', ()
         { kind: 'tax', name: 'Federal Income Tax', amount: '100.00' },
         { kind: 'tax', name: 'Social Security', amount: '50.00' },
       ],
+      // Fixed figures for the report assertions: no employer taxes on this check (omitting
+      // employerTaxes would have the server calculate them).
+      employerTaxes: [],
     });
 
     expect(checkA1.grossPay).toBe('1187.50');
@@ -204,6 +207,7 @@ describe('Payroll UX (employee edit, itemized earnings, void, YTD, reports)', ()
       payDate: new Date('2025-01-20'),
       grossPay: '1000.00',
       taxes: [{ kind: 'tax', name: 'Federal Income Tax', amount: '150.00' }],
+      employerTaxes: [],
       deductions: [{ kind: 'deduction', name: '401k', amount: '50.00' }],
     });
     expect(checkB1.grossPay).toBe('1000.00');

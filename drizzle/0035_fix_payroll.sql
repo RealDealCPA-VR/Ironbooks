@@ -4,13 +4,19 @@
 -- W-2 / 941 / 940 / state worksheets aggregate by this code instead of free-text line names.
 ALTER TABLE "payroll_items" ADD COLUMN IF NOT EXISTS "tax_tracking" varchar(40);--> statement-breakpoint
 ALTER TABLE "paycheck_lines" ADD COLUMN IF NOT EXISTS "tax_tracking" varchar(40);--> statement-breakpoint
--- Deduction items: retirement deferrals by name, other pre-tax items as Section 125, else after-tax.
+-- Deduction items: Roth deferrals are always after-tax (W-2 Box 12 AA/BB/EE); otherwise the
+-- existing pre-tax flag wins, then pre-tax retirement deferrals by name, other pre-tax items as
+-- Section 125. An after-tax item is never turned pre-tax because of its name.
 UPDATE "payroll_items" SET "tax_tracking" = CASE
+    WHEN "name" ~* '(^|[^a-z])roth' AND "name" ~* '403\s*\(?b' THEN 'roth_403b'
+    WHEN "name" ~* '(^|[^a-z])roth' AND "name" ~* '457' THEN 'roth_457b'
+    WHEN "name" ~* '(^|[^a-z])roth' AND "name" ~* '401\s*\(?k' THEN 'roth_401k'
+    WHEN "name" ~* '(^|[^a-z])roth' THEN 'none'
+    WHEN NOT "pretax" THEN 'none'
     WHEN "name" ~* '401\s*\(?k' THEN '401k'
     WHEN "name" ~* '403\s*\(?b' THEN '403b'
     WHEN "name" ~* '457' THEN '457b'
     WHEN "name" ~* 'simple\s*ira' THEN 'simple_ira'
-    WHEN NOT "pretax" THEN 'none'
     WHEN "name" ~* '(^|[^a-z])hsa([^a-z]|$)|health savings' THEN 'hsa'
     WHEN "name" ~* 'dependent\s*care' THEN 'dependent_care'
     WHEN "name" ~* 'retire|pension|deferred comp' THEN '401k'
