@@ -476,6 +476,9 @@ async function prepareDeposit(
       paymentId: null,
       description: l.description ?? 'Additional deposit line',
       amount: toAmountString(Money.round2(l.amount)),
+      // The credited account lives on the deposit's own row too (0037), so Reclassify can keep it
+      // in step and the edit form re-sends the right account.
+      accountId: l.accountId,
     })),
   ];
   if (input.cashBack && cashBackAmt.greaterThan(0)) {
