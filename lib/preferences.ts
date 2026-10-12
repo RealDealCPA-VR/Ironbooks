@@ -211,6 +211,9 @@ export interface CompanyPreferences {
   payrollLiabilityAccountId: string | null;
 }
 
+// Feature switches default to ON (class tracking, progress invoicing and units of measure too) so
+// company files from before these switches were enforced keep working; the setup interview asks
+// each question and saves an explicit on/off for new companies.
 export const DEFAULT_COMPANY_PREFERENCES: CompanyPreferences = {
   accountNumbersEnabled: true,
   requireAccountNumbers: false,
