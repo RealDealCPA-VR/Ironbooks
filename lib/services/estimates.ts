@@ -25,7 +25,13 @@ import {
 import { createInvoice } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { allocateDocNumber, docRef } from './docNumbers';
-import { estimateLineProgress, refreshEstimateBilling } from './estimateBilling';
+import {
+  estimateLineProgress,
+  overBilledLine,
+  overBillingError,
+  refreshEstimateBilling,
+  type OverBilledLine,
+} from './estimateBilling';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -113,18 +119,7 @@ export interface ProgressInvoiceInput {
   allowOverBilling?: boolean;
 }
 
-/** Soft-warning code for billing more than 100% of an estimate line. */
-export const PROGRESS_OVERBILL_WARNING = 'PROGRESS_OVERBILL';
-
-export interface OverBilledLine {
-  lineId: string;
-  description: string;
-  estimateAmount: string;
-  invoicedToDate: string;
-  thisInvoice: string;
-  /** Percent of the line billed once this invoice is saved. */
-  percentBilled: string;
-}
+export { PROGRESS_OVERBILL_WARNING, type OverBilledLine } from './estimateBilling';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -637,36 +632,19 @@ export async function createProgressInvoice(
     // Over-billing check (QB: "you are billing more than 100% of this item" — warn, then allow).
     const over: OverBilledLine[] = [];
     for (const b of bills) {
-      const A = Money.of(b.line.amount);
-      const Q = Money.of(b.line.quantity);
-      const newAmt = Money.of(b.line.amountInvoiced).plus(b.amount);
-      const newQty = Money.of(b.line.qtyInvoiced).plus(b.qty);
-      const overAmt = A.greaterThan(0) ? newAmt.greaterThan(A.plus('0.005')) : false;
-      const overQty = newQty.greaterThan(Q.plus('0.00005'));
-      if (overAmt || overQty) {
-        const pct = A.greaterThan(0)
-          ? Money.mul(Money.div(newAmt, A), 100)
-          : Q.greaterThan(0)
-            ? Money.mul(Money.div(newQty, Q), 100)
-            : Money.zero();
-        over.push({
-          lineId: b.line.id,
-          description: b.line.description ?? 'Estimate line',
-          estimateAmount: toAmountString(A),
-          invoicedToDate: toAmountString(Money.of(b.line.amountInvoiced)),
-          thisInvoice: toAmountString(b.amount),
-          percentBilled: pct.toDecimalPlaces(2).toFixed(2),
-        });
-      }
+      const o = overBilledLine({
+        lineId: b.line.id,
+        description: b.line.description,
+        quantity: b.line.quantity,
+        amount: b.line.amount,
+        qtyInvoicedToDate: Money.of(b.line.qtyInvoiced),
+        invoicedToDate: Money.of(b.line.amountInvoiced),
+        thisQty: b.qty,
+        thisAmount: b.amount,
+      });
+      if (o) over.push(o);
     }
-    if (over.length > 0 && !input.allowOverBilling) {
-      const names = over.map((o) => `"${o.description}" (${o.percentBilled}%)`).join(', ');
-      throw new ServiceError(
-        'VALIDATION',
-        `This invoice would bill more than 100% of the estimate for ${names}. Save anyway?`,
-        { warning: PROGRESS_OVERBILL_WARNING, lines: over },
-      );
-    }
+    if (over.length > 0 && !input.allowOverBilling) throw overBillingError(over);
 
     const estRef = docRef(estimate.refNumber, estimate.estimateNumber);
     const invoice = await createInvoice(tx, {
@@ -676,6 +654,8 @@ export async function createProgressInvoice(
       // Sales tax is charged on the invoice itself, at the estimate's rate, on taxable lines.
       taxRateId: estimate.taxRateId ?? null,
       overrideCreditLimit: input.overrideCreditLimit,
+      // Over-billing was checked (and, if asked, allowed) just above against the same figures.
+      allowOverBilling: true,
       lines: bills.map((b) => ({
         itemId: b.line.itemId ?? null,
         description: b.line.description ?? null,

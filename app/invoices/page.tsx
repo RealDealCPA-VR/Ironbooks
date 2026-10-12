@@ -809,10 +809,10 @@ function InvoiceModal({
     setSaving(true);
     try {
       // Over the customer's credit limit → "Save anyway?" (recorded in the audit trail).
-      const saved = await creditLimit.run((override) =>
+      const saved = await creditLimit.run((override, allowOverBilling) =>
         editing
-          ? api.patch(`/api/invoices/${editing.id}`, { ...payload, overrideCreditLimit: override })
-          : api.post('/api/invoices', { ...payload, overrideCreditLimit: override }),
+          ? api.patch(`/api/invoices/${editing.id}`, { ...payload, overrideCreditLimit: override, allowOverBilling })
+          : api.post('/api/invoices', { ...payload, overrideCreditLimit: override, allowOverBilling }),
       );
       if (saved === undefined) return; // user chose not to go over the limit
       if (editing) {
@@ -1491,8 +1491,8 @@ function InvoicesPageContent() {
     if (!postTarget) return;
     setPosting(true);
     try {
-      const posted = await postLimit.run((override) =>
-        api.post(`/api/invoices/${postTarget.id}/post`, { overrideCreditLimit: override }),
+      const posted = await postLimit.run((override, allowOverBilling) =>
+        api.post(`/api/invoices/${postTarget.id}/post`, { overrideCreditLimit: override, allowOverBilling }),
       );
       if (posted === undefined) return;
       toast(`Invoice #${postTarget.refNumber || postTarget.invoiceNumber} posted to the GL.`, 'success');

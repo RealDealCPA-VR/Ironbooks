@@ -21,9 +21,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as { overrideCreditLimit?: unknown };
+    const body = (await req.json().catch(() => ({}))) as {
+      overrideCreditLimit?: unknown;
+      allowOverBilling?: unknown;
+    };
     const posted = await postDraftInvoice(ctx, id, {
       overrideCreditLimit: body?.overrideCreditLimit === true,
+      allowOverBilling: body?.allowOverBilling === true,
     });
     return NextResponse.json(posted);
   } catch (err) {

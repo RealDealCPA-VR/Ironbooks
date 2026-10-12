@@ -17,8 +17,10 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { MAX_LEDGER_AMOUNT, Money, MoneyParseError, toAmountString } from '@/lib/money';
 import {
   accounts,
+  creditMemos,
   journalEntries,
   journalEntryLines,
+  paymentsReceived,
   reconciliationItems,
   reconciliations,
 } from '@/lib/db/schema';
@@ -423,6 +425,71 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
   });
 }
 
+/**
+ * A customer refund (credit-memo refund or overpayment refund, sourceRef `refund:<id>`) that is
+ * voided gives the customer their credit back: the memo's unapplied balance goes up and its
+ * refunded amount down, or the payment's unapplied balance goes up. Without this the A/R GL
+ * (where the void reverses the refund) and the open-credit subledger (aging, integrity check)
+ * would disagree. The amount is the refund's own A/R debit (home currency); a foreign-currency
+ * payment converts it back at the payment's rate. Vendor-credit refunds (A/P) are not touched.
+ */
+async function restoreRefundedCustomerCredit(
+  tx: ServiceContext,
+  docId: string,
+  lines: Array<{ debit: string | null; credit: string | null }>,
+) {
+  // The refund posts Dr A/R / Cr bank: the A/R debit equals the bank credit, i.e. the entry total.
+  const base = Money.round2(lines.reduce((s, l) => s.plus(Money.of(l.debit ?? '0')), Money.zero()));
+  if (!base.greaterThan(0)) return;
+
+  const [memo] = await tx.db
+    .select()
+    .from(creditMemos)
+    .where(and(eq(creditMemos.companyId, tx.companyId), eq(creditMemos.id, docId)));
+  if (memo) {
+    const unapplied = Money.round2(Money.of(memo.unapplied).plus(base));
+    const refunded = Money.round2(Money.of(memo.refundedAmount).minus(base));
+    const status = memo.status === 'void' ? memo.status : 'open';
+    await tx.db
+      .update(creditMemos)
+      .set({
+        unapplied: toAmountString(unapplied),
+        refundedAmount: toAmountString(refunded.lessThan(0) ? Money.zero() : refunded),
+        status: status as never,
+      })
+      .where(eq(creditMemos.id, memo.id));
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'credit_memo',
+      entityId: memo.id,
+      oldValues: { unapplied: memo.unapplied, refundedAmount: memo.refundedAmount, status: memo.status },
+      newValues: { action: 'refund_voided', unapplied: toAmountString(unapplied), status },
+    });
+    return;
+  }
+
+  const [payment] = await tx.db
+    .select()
+    .from(paymentsReceived)
+    .where(and(eq(paymentsReceived.companyId, tx.companyId), eq(paymentsReceived.id, docId)));
+  if (payment) {
+    const rate = Money.of(payment.exchangeRate ?? 1);
+    const amount = rate.greaterThan(0) && !rate.equals(1) ? Money.round2(Money.div(base, rate)) : base;
+    const unapplied = Money.round2(Money.of(payment.unapplied).plus(amount));
+    await tx.db
+      .update(paymentsReceived)
+      .set({ unapplied: toAmountString(unapplied) })
+      .where(eq(paymentsReceived.id, payment.id));
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'payment_received',
+      entityId: payment.id,
+      oldValues: { unapplied: payment.unapplied },
+      newValues: { action: 'refund_voided', unapplied: toAmountString(unapplied) },
+    });
+  }
+}
+
 /** Void a posted entry: mark void (the DB trigger reverses its balance impact). */
 export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
   return inTransaction(ctx, async (tx) => {
@@ -483,6 +550,9 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       oldValues: { status: entry.status },
       newValues: { status: 'void' },
     });
+    if (entry.sourceRef?.startsWith('refund:')) {
+      await restoreRefundedCustomerCredit(tx, entry.sourceRef.slice('refund:'.length), lines);
+    }
     await recordClosingDateException(tx, periodCheck, {
       entryId,
       operation: 'void',

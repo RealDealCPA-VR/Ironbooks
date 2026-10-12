@@ -63,6 +63,8 @@ const invoiceCoreFields = {
   ...shippingFields,
   ...sendFlagFields,
   ...creditLimitOverrideField,
+  /** Save even though a line bills more than 100% of its estimate line (PROGRESS_OVERBILL). */
+  allowOverBilling: z.boolean().optional(),
 };
 
 /**

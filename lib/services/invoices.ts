@@ -69,7 +69,7 @@ import {
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { allocateDocNumber, docRef } from './docNumbers';
-import { estimatesBilledByInvoice, refreshEstimateBilling } from './estimateBilling';
+import { checkEstimateOverBilling, estimatesBilledByInvoice, refreshEstimateBilling } from './estimateBilling';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -179,6 +179,12 @@ export interface CreateInvoiceInput {
    * The override is recorded in the audit trail.
    */
   overrideCreditLimit?: boolean;
+  /**
+   * Lines that bill estimate lines (estimateLineId) may not push a line past 100% of the
+   * estimate without this flag (QB warns, then lets you): the save is refused with a
+   * VALIDATION error whose details carry `{ warning: 'PROGRESS_OVERBILL', lines }`.
+   */
+  allowOverBilling?: boolean;
   /** Internal (statement charges, C5): mark the A/R document as a statement charge. */
   isStatementCharge?: boolean;
 }
@@ -1362,6 +1368,12 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
   // Persist everything in a single transaction.
   // ---------------------------------------------------------------------------
   return inTransaction(ctx, async (tx) => {
+    // Progress billing through a plain invoice: same over-billing rule as createProgressInvoice.
+    // A pending invoice bills nothing yet; it is checked when it is posted.
+    if (!isDraft) {
+      await checkEstimateOverBilling(tx, prep.computedLines, { allowOverBilling: input.allowOverBilling });
+    }
+
     const { refNumber, number: invoiceNumber } = await allocateDocNumber(tx, 'invoice', input.refNumber, {
       allowDuplicate: input.allowDuplicateNumber === true,
     });
@@ -1488,6 +1500,11 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       },
     });
 
+    // 7) Estimates this invoice bills: re-stamp amount invoiced / status.
+    for (const estimateId of await estimatesBilledByInvoice(tx, invoice.id)) {
+      await refreshEstimateBilling(tx, estimateId);
+    }
+
     return { ...updated, lines: prep.computedLines };
   });
 }
@@ -1506,7 +1523,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
 export async function postDraftInvoice(
   ctx: ServiceContext,
   id: string,
-  opts?: { overrideCreditLimit?: boolean },
+  opts?: { overrideCreditLimit?: boolean; allowOverBilling?: boolean },
 ) {
   const [existing] = await ctx.db
     .select()
@@ -1568,6 +1585,13 @@ export async function postDraftInvoice(
       throw new ServiceError('CONFLICT', 'Only pending (draft) invoices can be posted.');
     }
 
+    // Lines that bill estimate lines start counting now: same over-billing rule as
+    // createProgressInvoice (the stored links stay on the stored lines).
+    await checkEstimateOverBilling(tx, storedLines, {
+      excludeInvoiceId: id,
+      allowOverBilling: opts?.allowOverBilling,
+    });
+
     // 1) Post the GL entry (assertPeriodOpen runs here, on the invoice date).
     const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
     if (prep.creditLimitOverride) await auditCreditLimitOverride(tx, id, prep.creditLimitOverride);
@@ -1611,6 +1635,11 @@ export async function postDraftInvoice(
       oldValues: { status: 'draft' },
       newValues: { status: updated.status, postedEntryId: entry.id },
     });
+
+    // 5) Estimates this invoice bills: re-stamp amount invoiced / status.
+    for (const estimateId of await estimatesBilledByInvoice(tx, id)) {
+      await refreshEstimateBilling(tx, estimateId);
+    }
 
     return { ...updated, lines: prep.computedLines };
   });
@@ -1813,6 +1842,11 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     // Progress invoices: an edited line keeps billing the same estimate line (the form does not
     // send the link back), so the estimate's invoiced-to-date follows the edit.
     keepEstimateLinks(prep.computedLines, input.lines, oldLines);
+    // The edited lines replace this invoice's old ones, so invoiced-to-date leaves it out.
+    await checkEstimateOverBilling(tx, prep.computedLines, {
+      excludeInvoiceId: id,
+      allowOverBilling: input.allowOverBilling,
+    });
     const estimatesBefore = await estimatesBilledByInvoice(tx, id);
 
     // 1) Void the original A/R journal entry (assertPeriodOpen runs on its date).

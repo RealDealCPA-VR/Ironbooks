@@ -13,20 +13,20 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { users, companies, accounts, customers, items, taxAgencies, taxRates, invoices } from '@/lib/db/schema';
+import { users, companies, accounts, customers, items, taxAgencies, taxRates, invoices, creditMemos, journalEntries } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { trialBalance } from './reports';
 import { adjustInventory } from './inventory';
 import { Money } from '@/lib/money';
-import { createInvoice, getInvoice, voidInvoice, updateInvoice } from './invoices';
+import { createInvoice, getInvoice, voidInvoice, updateInvoice, postDraftInvoice } from './invoices';
 import { createEstimate, createProgressInvoice, getEstimate, convertToInvoice } from './estimates';
 import { receivePayment, refundPayment, recordBouncedCheck } from './payments';
 import { createCreditMemo, applyToInvoice, refundCreditMemo } from './creditMemos';
 import { createStatementCharge } from './batchInvoicing';
-import { createManualEntry } from './journal';
+import { createManualEntry, voidEntry } from './journal';
 import { assessFinanceCharges } from './financeCharges';
 import { setStartingDocNumber } from './docNumbers';
 import { customerStatement, customerArLedgerBalance } from './statements';
@@ -291,6 +291,71 @@ describe('fix/sales P0 regressions', () => {
   // ---------------------------------------------------------------------------
   // 3. Statements include refunds; statement == GL == aging
   // ---------------------------------------------------------------------------
+  it('a plain or pending invoice that bills estimate lines warns past 100%, saves when allowed, and re-stamps the estimate', async () => {
+    const customerId = await newCustomer('Linked Lena');
+    const est = await createEstimate(ctx, {
+      customerId,
+      date: new Date('2025-06-01'),
+      lines: [{ description: 'Labor', quantity: 10, rate: 50, taxable: false }],
+    });
+    const labor = (await getEstimate(ctx, est.id)).lines[0];
+    // A pending invoice for 6 hours: bills nothing yet, so no warning on save.
+    const draft = await createInvoice(ctx, {
+      customerId,
+      date: new Date('2025-06-02'),
+      status: 'draft',
+      lines: [{ description: 'Labor', quantity: 6, rate: 50, taxable: false, estimateLineId: labor.id }],
+    });
+    // A posted invoice for another 6 hours: 60%, fine.
+    await createInvoice(ctx, {
+      customerId,
+      date: new Date('2025-06-03'),
+      lines: [{ description: 'Labor', quantity: 6, rate: 50, taxable: false, estimateLineId: labor.id }],
+    });
+    let e = await getEstimate(ctx, est.id);
+    expect(e.amountInvoiced).toBe('300.00');
+    expect(e.status).toBe('partial');
+    // Posting the pending one would make it 120%: warned, nothing posted.
+    await expect(postDraftInvoice(ctx, draft.id)).rejects.toMatchObject({
+      details: { warning: 'PROGRESS_OVERBILL' },
+    });
+    expect((await getInvoice(ctx, draft.id)).status).toBe('draft');
+    // The user says "save anyway".
+    await postDraftInvoice(ctx, draft.id, { allowOverBilling: true });
+    e = await getEstimate(ctx, est.id);
+    expect(e.lines[0].amountInvoiced).toBe('600.00');
+    expect(e.amountInvoiced).toBe('600.00');
+    expect(e.status).toBe('closed');
+    await assertBalanced();
+  });
+
+  it('voiding a refund gives the customer the credit back (memo / payment can be refunded again)', async () => {
+    const customerId = await newCustomer('Void Refund Vic');
+    const cm = await createCreditMemo(ctx, {
+      customerId,
+      date: new Date('2025-07-01'),
+      lines: [{ description: 'Credit', quantity: 1, rate: 90, taxable: false }],
+    });
+    await refundCreditMemo(ctx, { creditMemoId: cm.id, bankAccountId: acct['1000'], amount: 90, date: new Date('2025-07-02') });
+    const [je] = await db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `refund:${cm.id}`)));
+    await voidEntry(ctx, je.id);
+    const [memo] = await db.select().from(creditMemos).where(eq(creditMemos.id, cm.id));
+    expect(memo.unapplied).toBe('90.00');
+    expect(memo.refundedAmount).toBe('0.00');
+    expect(memo.status).toBe('open');
+    expect(await customerArLedgerBalance(ctx, customerId)).toBe('-90.00');
+    expect((await customerStatement(ctx, customerId)).closingBalance).toBe('-90.00');
+    const aging = await arAging(ctx, new Date('2030-01-01'));
+    expect(Money.of(aging.rows.find((r) => r.id === customerId)!.total).toFixed(2)).toBe('-90.00');
+    // The restored credit is real: it can be refunded again, and the books end at zero.
+    await refundCreditMemo(ctx, { creditMemoId: cm.id, bankAccountId: acct['1000'], amount: 90, date: new Date('2025-07-03') });
+    expect(await customerArLedgerBalance(ctx, customerId)).toBe('0.00');
+    await assertBalanced();
+  });
+
   it('overpayment refund: statement balance matches A/R (audit repro)', async () => {
     const customerId = await newCustomer('Overpaid Olive');
     const pay = await receivePayment(ctx, {

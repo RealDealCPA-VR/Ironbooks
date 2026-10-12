@@ -11,10 +11,23 @@
  *
  * Kept separate from estimates.ts so invoices.ts can call it without a circular import.
  */
-import { and, eq, inArray, notInArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
 import { estimateLines, estimates, invoiceLines, invoices } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import type { ServiceContext } from './_base';
+import { type ServiceContext, ServiceError } from './_base';
+
+/** Soft-warning code for billing more than 100% of an estimate line. */
+export const PROGRESS_OVERBILL_WARNING = 'PROGRESS_OVERBILL';
+
+export interface OverBilledLine {
+  lineId: string;
+  description: string;
+  estimateAmount: string;
+  invoicedToDate: string;
+  thisInvoice: string;
+  /** Percent of the line billed once this invoice is saved. */
+  percentBilled: string;
+}
 
 type Dec = ReturnType<typeof Money.zero>;
 
@@ -33,6 +46,7 @@ const NOT_BILLED = ['void', 'draft'] as const;
 export async function estimateLineProgress(
   ctx: ServiceContext,
   estimateId: string,
+  opts: { excludeInvoiceId?: string } = {},
 ): Promise<Map<string, EstimateLineProgress>> {
   const lines = await ctx.db
     .select({
@@ -65,6 +79,7 @@ export async function estimateLineProgress(
         eq(invoices.companyId, ctx.companyId),
         inArray(invoiceLines.estimateLineId, [...out.keys()]),
         notInArray(invoices.status, [...NOT_BILLED]),
+        opts.excludeInvoiceId ? ne(invoices.id, opts.excludeInvoiceId) : undefined,
       ),
     )
     .groupBy(invoiceLines.estimateLineId);
@@ -75,6 +90,113 @@ export async function estimateLineProgress(
     p.amountInvoiced = p.amountInvoiced.plus(Money.of(r.amount));
   }
   return out;
+}
+
+/**
+ * One estimate line's over-billing (QB: "you are billing more than 100% of this item"), or null
+ * when the new total stays within the estimate. `invoicedToDate`/`qtyInvoicedToDate` exclude
+ * this invoice; `thisAmount`/`thisQty` are what this invoice bills.
+ */
+export function overBilledLine(l: {
+  lineId: string;
+  description: string | null;
+  quantity: string;
+  amount: string;
+  qtyInvoicedToDate: Dec;
+  invoicedToDate: Dec;
+  thisQty: Dec;
+  thisAmount: Dec;
+}): OverBilledLine | null {
+  const A = Money.of(l.amount);
+  const Q = Money.of(l.quantity);
+  const newAmt = l.invoicedToDate.plus(l.thisAmount);
+  const newQty = l.qtyInvoicedToDate.plus(l.thisQty);
+  const overAmt = A.greaterThan(0) ? newAmt.greaterThan(A.plus('0.005')) : false;
+  const overQty = newQty.greaterThan(Q.plus('0.00005'));
+  if (!overAmt && !overQty) return null;
+  const pct = A.greaterThan(0)
+    ? Money.mul(Money.div(newAmt, A), 100)
+    : Q.greaterThan(0)
+      ? Money.mul(Money.div(newQty, Q), 100)
+      : Money.zero();
+  return {
+    lineId: l.lineId,
+    description: l.description ?? 'Estimate line',
+    estimateAmount: toAmountString(A),
+    invoicedToDate: toAmountString(l.invoicedToDate),
+    thisInvoice: toAmountString(l.thisAmount),
+    percentBilled: pct.toDecimalPlaces(2).toFixed(2),
+  };
+}
+
+/** The soft over-billing error (HTTP 409 PROGRESS_OVERBILL); resend with allowOverBilling. */
+export function overBillingError(over: OverBilledLine[]) {
+  const names = over.map((o) => `"${o.description}" (${o.percentBilled}%)`).join(', ');
+  return new ServiceError(
+    'VALIDATION',
+    `This invoice would bill more than 100% of the estimate for ${names}. Save anyway?`,
+    { warning: PROGRESS_OVERBILL_WARNING, lines: over },
+  );
+}
+
+/**
+ * Over-billing check for ANY invoice that bills estimate lines (a plain invoice that links
+ * them, an edit of a progress invoice, a pending invoice being posted) - the same rule
+ * createProgressInvoice applies. Invoiced-to-date leaves out `excludeInvoiceId` (the invoice
+ * being edited/posted), so its old lines are not counted twice. Throws the soft
+ * PROGRESS_OVERBILL error unless `allowOverBilling`; returns the over-billed lines otherwise.
+ */
+export async function checkEstimateOverBilling(
+  ctx: ServiceContext,
+  lines: Array<{ estimateLineId?: string | null; quantity: string | number; amount: string | number }>,
+  opts: { excludeInvoiceId?: string; allowOverBilling?: boolean } = {},
+): Promise<OverBilledLine[]> {
+  const thisBill = new Map<string, { qty: Dec; amount: Dec }>();
+  for (const l of lines) {
+    if (!l.estimateLineId) continue;
+    const cur = thisBill.get(l.estimateLineId) ?? { qty: Money.zero(), amount: Money.zero() };
+    cur.qty = cur.qty.plus(Money.of(l.quantity));
+    cur.amount = cur.amount.plus(Money.abs(Money.of(l.amount)));
+    thisBill.set(l.estimateLineId, cur);
+  }
+  if (thisBill.size === 0) return [];
+
+  const estLines = await ctx.db
+    .select({
+      id: estimateLines.id,
+      estimateId: estimateLines.estimateId,
+      description: estimateLines.description,
+      quantity: estimateLines.quantity,
+      amount: estimateLines.amount,
+    })
+    .from(estimateLines)
+    .innerJoin(estimates, eq(estimates.id, estimateLines.estimateId))
+    .where(and(eq(estimates.companyId, ctx.companyId), inArray(estimateLines.id, [...thisBill.keys()])));
+
+  const over: OverBilledLine[] = [];
+  const progressByEstimate = new Map<string, Map<string, EstimateLineProgress>>();
+  for (const el of estLines) {
+    let progress = progressByEstimate.get(el.estimateId);
+    if (!progress) {
+      progress = await estimateLineProgress(ctx, el.estimateId, { excludeInvoiceId: opts.excludeInvoiceId });
+      progressByEstimate.set(el.estimateId, progress);
+    }
+    const p = progress.get(el.id);
+    const b = thisBill.get(el.id)!;
+    const o = overBilledLine({
+      lineId: el.id,
+      description: el.description,
+      quantity: el.quantity,
+      amount: el.amount,
+      qtyInvoicedToDate: p?.qtyInvoiced ?? Money.zero(),
+      invoicedToDate: p?.amountInvoiced ?? Money.zero(),
+      thisQty: b.qty,
+      thisAmount: Money.round2(b.amount),
+    });
+    if (o) over.push(o);
+  }
+  if (over.length > 0 && !opts.allowOverBilling) throw overBillingError(over);
+  return over;
 }
 
 /** Estimates billed by the given invoice (through its linked lines). */
