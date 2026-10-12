@@ -73,6 +73,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   defaultDate: { label: 'Default date for new transactions', type: 'select', options: [['today', "Today's date"], ['last', 'The last date I entered']] },
   autoRecallLastTransaction: { label: 'Recall the last transaction for a name', type: 'bool' },
   showHomeWorkflow: { label: 'Show the home workflow on the dashboard', type: 'bool' },
+  navMode: { label: 'Menu style', help: 'Simple shows only everyday tasks. Advanced shows every screen. You can also switch at the top of the menu.', type: 'select', options: [['simple', 'Simple (everyday tasks)'], ['advanced', 'Advanced (every screen)']] },
   // Jobs & Estimates
   estimatesEnabled: { label: 'Use estimates', type: 'bool' },
   progressInvoicingEnabled: { label: 'Use progress invoicing', help: 'Invoice part of an estimate at a time.', type: 'bool', dependsOn: 'estimatesEnabled' },
