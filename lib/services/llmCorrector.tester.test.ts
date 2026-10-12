@@ -86,7 +86,7 @@ describe('applyCorrection — adversarial', () => {
 
     await expect(applyCorrection(ctx, correction.id, { approved: true })).rejects.toBeTruthy();
     expect(await countEntries(ctx)).toBe(n);
-    expect((await trialBalance(ctx, AS_OF)).totals).toEqual(tbBefore.totals);
+    expect((await trialBalance(ctx, AS_OF)).rows).toEqual(tbBefore.rows);
   });
 
   it('two simultaneous approvals post exactly one correcting entry', async () => {

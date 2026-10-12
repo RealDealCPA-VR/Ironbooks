@@ -71,7 +71,7 @@ describe('record locking end to end', () => {
       depositAccountId: t.acct['1000'],
       applications: [],
     } as never);
-    const id = (pay as { payment?: { id: string }; id?: string }).payment?.id ?? (pay as { id: string }).id;
+    const id = pay.payment.id;
     const header = await versionHeaderAfterLoad(`/api/payments/${id}`, () => getPayment(alice, id));
     expect(header).toBeDefined();
     const [row] = await t.db.select().from(paymentsReceived).where(eq(paymentsReceived.id, id));
@@ -126,7 +126,7 @@ describe('record locking end to end', () => {
       depositAccountId: t.acct['1000'],
       applications: [],
     } as never);
-    const id = (pay as { payment?: { id: string }; id?: string }).payment?.id ?? (pay as { id: string }).id;
+    const id = pay.payment.id;
     const [opened] = await t.db.select().from(paymentsReceived).where(eq(paymentsReceived.id, id));
 
     await applyPayment(alice, { paymentId: id, applications: [{ invoiceId: inv.id, amountApplied: '100.00' }] } as never);
@@ -148,7 +148,7 @@ describe('record locking end to end', () => {
     expect((err as ServiceError).message).toMatch(/changed by/i);
 
     const tbAfter = await trialBalance(alice, D('2026-12-31'));
-    expect(tbAfter.totals).toEqual(tbBefore.totals);
+    expect(tbAfter.rows).toEqual(tbBefore.rows);
     expect(tbAfter.balanced).toBe(true);
     const invAfter = await getInvoice(alice, inv.id);
     expect((invAfter as { balanceDue: string }).balanceDue).toBe((invBefore as { balanceDue: string }).balanceDue);

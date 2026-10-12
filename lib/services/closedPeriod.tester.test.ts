@@ -93,7 +93,7 @@ describe('closing date covers every change to a closed-period transaction', () =
 
     const tbAfter = await trialBalance(t.ctx, D('2026-12-31'));
     expect(tbAfter.balanced).toBe(true);
-    expect(tbAfter.totals).toEqual(tbBefore.totals);
+    expect(tbAfter.rows).toEqual(tbBefore.rows);
     const rows = (await closingDateExceptionReport(t.ctx)).rows;
     expect(rows.some((r) => r.entryId === e2.postedEntryId || r.entryId === exp.postedEntryId)).toBe(true);
   });
@@ -123,7 +123,7 @@ describe('closing date covers every change to a closed-period transaction', () =
         lines: [{ description: 'Work', quantity: 1, rate: '120.00' }],
       } as never),
     ).rejects.toMatchObject({ code: 'PERIOD_CLOSED' });
-    const payId = (pay as { payment?: { id: string }; id?: string }).payment?.id ?? (pay as { id: string }).id;
+    const payId = pay.payment.id;
     await expect(
       updatePayment(t.ctx, payId, {
         customerId,

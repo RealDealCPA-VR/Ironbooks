@@ -91,7 +91,7 @@ describe('condense and applications that cross the cutoff', () => {
       applications: [],
       journalItems: [{ journalLineId: line.id, amount: '77.77' }],
     });
-    const paymentId = (pay as { payment?: { id: string }; id?: string }).payment?.id ?? (pay as { id: string }).id;
+    const paymentId = pay.payment.id;
     await expectArTied(0);
 
     await setClosingDate(ctx, { closingDate: '2026-01-31' } as never);
