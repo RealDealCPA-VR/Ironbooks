@@ -36,6 +36,7 @@ import { formatDate } from '@/lib/utils';
 interface ExpiringEstimate {
   id: string;
   estimateNumber: number;
+  refNumber?: string | null;
   customerName: string;
   status: string;
   total: string;
@@ -109,6 +110,7 @@ export default function EstimatesFollowupPage() {
         api.get<Array<{
           id: string;
           estimateNumber: number;
+          refNumber?: string | null;
           status: string;
           total: string;
           expirationDate: string | null;
@@ -139,6 +141,7 @@ export default function EstimatesFollowupPage() {
         .map((e) => ({
           id: e.id,
           estimateNumber: e.estimateNumber,
+          refNumber: e.refNumber,
           customerName: custMap.get(e.customerId) ?? '—',
           status: e.status,
           total: e.total,
@@ -191,7 +194,7 @@ export default function EstimatesFollowupPage() {
       const days = daysUntil(e.expirationDate);
       return (
         <Tr key={e.id}>
-          <Td className="font-bold">{e.estimateNumber}</Td>
+          <Td className="font-bold">{e.refNumber || e.estimateNumber}</Td>
           <Td>{e.customerName}</Td>
           <Td>
             <Badge tone={statusBadgeTone(e.status)}>{statusLabel(e.status)}</Badge>
