@@ -7,7 +7,7 @@
  * look-ahead window in days. Categories the member can't view (Users & Roles) are left out, and
  * a failing source never breaks the rest of the list.
  */
-import { and, eq, gt, inArray, isNull, lte } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
 import {
   bills,
   customers,
@@ -135,7 +135,7 @@ const SOURCES: Record<ReminderKey, Source> = {
     const flag = printFlag(invoices);
     if (!flag) return [];
     const rows = await ctx.db
-      .select({ id: invoices.id, n: invoices.invoiceNumber, date: invoices.date, total: invoices.total, customer: customers.displayName })
+      .select({ id: invoices.id, n: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`, date: invoices.date, total: invoices.total, customer: customers.displayName })
       .from(invoices)
       .innerJoin(customers, eq(customers.id, invoices.customerId))
       .where(and(eq(invoices.companyId, ctx.companyId), eq(flag as never, true)));
@@ -147,7 +147,7 @@ const SOURCES: Record<ReminderKey, Source> = {
     const rows = await ctx.db
       .select({
         id: invoices.id,
-        n: invoices.invoiceNumber,
+        n: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`,
         due: invoices.dueDate,
         balance: invoices.balanceDue,
         customer: customers.displayName,
@@ -174,14 +174,14 @@ const SOURCES: Record<ReminderKey, Source> = {
     const flag = printFlag(salesReceipts);
     if (!flag) return [];
     const rows = await ctx.db
-      .select({ id: salesReceipts.id, n: salesReceipts.receiptNumber, date: salesReceipts.date, total: salesReceipts.total })
+      .select({ id: salesReceipts.id, n: sql<string>`COALESCE(NULLIF(${salesReceipts.refNumber}, ''), CAST(${salesReceipts.receiptNumber} AS TEXT))`, date: salesReceipts.date, total: salesReceipts.total })
       .from(salesReceipts)
       .where(and(eq(salesReceipts.companyId, ctx.companyId), eq(flag as never, true)));
     return rows.map((r) => ({ id: r.id, label: `Sales receipt ${r.n}`, date: isoDay(r.date), amount: r.total, href: '/sales-receipts' }));
   },
   async salesOrdersToPrint(ctx, today, days) {
     const rows = await ctx.db
-      .select({ id: salesOrders.id, n: salesOrders.orderNumber, date: salesOrders.date, total: salesOrders.total, customer: customers.displayName })
+      .select({ id: salesOrders.id, n: sql<string>`COALESCE(NULLIF(${salesOrders.refNumber}, ''), CAST(${salesOrders.orderNumber} AS TEXT))`, date: salesOrders.date, total: salesOrders.total, customer: customers.displayName })
       .from(salesOrders)
       .innerJoin(customers, eq(customers.id, salesOrders.customerId))
       .where(
@@ -254,7 +254,7 @@ const SOURCES: Record<ReminderKey, Source> = {
   },
   async purchaseOrdersToPrint(ctx, today, days) {
     const rows = await ctx.db
-      .select({ id: purchaseOrders.id, n: purchaseOrders.poNumber, date: purchaseOrders.date, expected: purchaseOrders.expectedDate, total: purchaseOrders.total, vendor: vendors.displayName })
+      .select({ id: purchaseOrders.id, n: sql<string>`COALESCE(NULLIF(${purchaseOrders.refNumber}, ''), CAST(${purchaseOrders.poNumber} AS TEXT))`, date: purchaseOrders.date, expected: purchaseOrders.expectedDate, total: purchaseOrders.total, vendor: vendors.displayName })
       .from(purchaseOrders)
       .innerJoin(vendors, eq(vendors.id, purchaseOrders.vendorId))
       .where(and(eq(purchaseOrders.companyId, ctx.companyId), inArray(purchaseOrders.status, ['open', 'partial'])));

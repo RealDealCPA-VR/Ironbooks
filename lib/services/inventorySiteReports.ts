@@ -399,11 +399,11 @@ async function sourceNumbers(ctx: ServiceContext, refs: Array<{ type: string; id
     for (const r of rows) if (r.num != null && r.num !== '') out.set(`${t}:${r.id}`, String(r.num));
   };
   let ids = idsOf('invoice');
-  if (ids.length) put('invoice', await ctx.db.select({ id: invoices.id, num: invoices.invoiceNumber }).from(invoices).where(inArray(invoices.id, ids)));
+  if (ids.length) put('invoice', await ctx.db.select({ id: invoices.id, num: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))` }).from(invoices).where(inArray(invoices.id, ids)));
   ids = idsOf('sales_receipt');
-  if (ids.length) put('sales_receipt', await ctx.db.select({ id: salesReceipts.id, num: salesReceipts.receiptNumber }).from(salesReceipts).where(inArray(salesReceipts.id, ids)));
+  if (ids.length) put('sales_receipt', await ctx.db.select({ id: salesReceipts.id, num: sql<string>`COALESCE(NULLIF(${salesReceipts.refNumber}, ''), CAST(${salesReceipts.receiptNumber} AS TEXT))` }).from(salesReceipts).where(inArray(salesReceipts.id, ids)));
   ids = idsOf('credit_memo');
-  if (ids.length) put('credit_memo', await ctx.db.select({ id: creditMemos.id, num: creditMemos.memoNumber }).from(creditMemos).where(inArray(creditMemos.id, ids)));
+  if (ids.length) put('credit_memo', await ctx.db.select({ id: creditMemos.id, num: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))` }).from(creditMemos).where(inArray(creditMemos.id, ids)));
   ids = idsOf('bill');
   if (ids.length) put('bill', await ctx.db.select({ id: bills.id, num: bills.billNumber }).from(bills).where(inArray(bills.id, ids)));
   ids = idsOf('item_receipt');

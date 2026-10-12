@@ -3,7 +3,7 @@
  * the transactions DUE that day (invoices, bills, estimates expiring, P.O.s expected), to-dos,
  * and memorized transactions scheduled to enter. Areas the member can't view are left out.
  */
-import { and, eq, gte, isNull, lte, ne, or } from 'drizzle-orm';
+import { and, eq, gte, isNull, lte, ne, or, sql } from 'drizzle-orm';
 import {
   bills,
   customers,
@@ -89,7 +89,7 @@ export async function getCalendar(
 
   if (canView(ctx, 'customers')) {
     const inv = await ctx.db
-      .select({ id: invoices.id, n: invoices.invoiceNumber, date: invoices.date, due: invoices.dueDate, total: invoices.total, balance: invoices.balanceDue, status: invoices.status, customer: customers.displayName })
+      .select({ id: invoices.id, n: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`, date: invoices.date, due: invoices.dueDate, total: invoices.total, balance: invoices.balanceDue, status: invoices.status, customer: customers.displayName })
       .from(invoices)
       .innerJoin(customers, eq(customers.id, invoices.customerId))
       .where(and(eq(invoices.companyId, ctx.companyId), ne(invoices.status, 'void'), or(inRange(invoices.date), inRange(invoices.dueDate))));
@@ -102,7 +102,7 @@ export async function getCalendar(
       }
     }
     const est = await ctx.db
-      .select({ id: estimates.id, n: estimates.estimateNumber, date: estimates.date, exp: estimates.expirationDate, total: estimates.total, status: estimates.status, customer: customers.displayName })
+      .select({ id: estimates.id, n: sql<string>`COALESCE(NULLIF(${estimates.refNumber}, ''), CAST(${estimates.estimateNumber} AS TEXT))`, date: estimates.date, exp: estimates.expirationDate, total: estimates.total, status: estimates.status, customer: customers.displayName })
       .from(estimates)
       .innerJoin(customers, eq(customers.id, estimates.customerId))
       .where(and(eq(estimates.companyId, ctx.companyId), or(inRange(estimates.date), inRange(estimates.expirationDate))));
@@ -113,7 +113,7 @@ export async function getCalendar(
       }
     }
     const so = await ctx.db
-      .select({ id: salesOrders.id, n: salesOrders.orderNumber, date: salesOrders.date, total: salesOrders.total })
+      .select({ id: salesOrders.id, n: sql<string>`COALESCE(NULLIF(${salesOrders.refNumber}, ''), CAST(${salesOrders.orderNumber} AS TEXT))`, date: salesOrders.date, total: salesOrders.total })
       .from(salesOrders)
       .where(and(eq(salesOrders.companyId, ctx.companyId), inRange(salesOrders.date)));
     for (const r of so) add(day(r.date), { id: r.id, kind: 'sales_order', type: 'entered', label: `Sales order ${r.n}`, amount: r.total, href: '/sales-orders' });
@@ -124,7 +124,7 @@ export async function getCalendar(
       .where(and(eq(paymentsReceived.companyId, ctx.companyId), isNull(paymentsReceived.voidedAt), inRange(paymentsReceived.date)));
     for (const r of pay) add(day(r.date), { id: r.id, kind: 'payment', type: 'entered', label: `Payment from ${r.customer}`, amount: r.amount, href: '/payments' });
     const sr = await ctx.db
-      .select({ id: salesReceipts.id, n: salesReceipts.receiptNumber, date: salesReceipts.date, total: salesReceipts.total, status: salesReceipts.status })
+      .select({ id: salesReceipts.id, n: sql<string>`COALESCE(NULLIF(${salesReceipts.refNumber}, ''), CAST(${salesReceipts.receiptNumber} AS TEXT))`, date: salesReceipts.date, total: salesReceipts.total, status: salesReceipts.status })
       .from(salesReceipts)
       .where(and(eq(salesReceipts.companyId, ctx.companyId), ne(salesReceipts.status, 'void'), inRange(salesReceipts.date)));
     for (const r of sr) add(day(r.date), { id: r.id, kind: 'sales_receipt', type: 'entered', label: `Sales receipt ${r.n}`, amount: r.total, href: '/sales-receipts' });
@@ -144,7 +144,7 @@ export async function getCalendar(
       }
     }
     const po = await ctx.db
-      .select({ id: purchaseOrders.id, n: purchaseOrders.poNumber, date: purchaseOrders.date, exp: purchaseOrders.expectedDate, total: purchaseOrders.total, status: purchaseOrders.status, vendor: vendors.displayName })
+      .select({ id: purchaseOrders.id, n: sql<string>`COALESCE(NULLIF(${purchaseOrders.refNumber}, ''), CAST(${purchaseOrders.poNumber} AS TEXT))`, date: purchaseOrders.date, exp: purchaseOrders.expectedDate, total: purchaseOrders.total, status: purchaseOrders.status, vendor: vendors.displayName })
       .from(purchaseOrders)
       .innerJoin(vendors, eq(vendors.id, purchaseOrders.vendorId))
       .where(and(eq(purchaseOrders.companyId, ctx.companyId), or(inRange(purchaseOrders.date), inRange(purchaseOrders.expectedDate))));

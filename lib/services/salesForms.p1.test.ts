@@ -19,6 +19,8 @@ import { nextDocNumber } from './docNumbers';
 import { createCustomer, updateCustomer } from './customers';
 import { normalizeShipToAddresses, defaultShipTo } from '@/lib/shipTo';
 import { trialBalance } from './reports';
+import { runGlobalSearch } from '@/app/api/search/queries';
+import { buildResults } from '@/app/api/search/results';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-p1-salesforms');
 let db: DB;
@@ -210,5 +212,14 @@ describe('p1/salesforms — numbers and tax defaults', () => {
     expect(out.map((a) => a.isDefault)).toEqual([false, true, false]);
     expect(defaultShipTo(out)).toEqual({ line1: 'b' });
     expect(normalizeShipToAddresses([])).toBeNull();
+  });
+
+  it('global search finds estimates, sales orders, receipts, credit memos and POs by their typed number', async () => {
+    const hits = await runGlobalSearch(db, ctx.companyId, 'Q-2026');
+    expect(hits.docs?.some((d) => d.kind === 'estimate' && d.num === 'Q-2026-18')).toBe(true);
+    const res = buildResults(await runGlobalSearch(db, ctx.companyId, 'PO-78'));
+    expect(res.some((r) => r.type === 'Purchase Order' && r.label === 'Purchase Order #PO-78')).toBe(true);
+    const inv = buildResults(await runGlobalSearch(db, ctx.companyId, 'JOB-777'));
+    expect(inv.some((r) => r.label === 'Invoice #JOB-777')).toBe(true);
   });
 });
