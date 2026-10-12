@@ -33,6 +33,7 @@ import { addressToLines, companyLetterhead } from '@/lib/pdf/forms';
 import { renderEnvelopesPdf, renderLabelsPdf, renderLettersPdf } from '@/lib/pdf/letters';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { getPreferences } from './company';
+import { assertWrite } from './rbac';
 
 export const RECIPIENT_TYPES = ['customer', 'vendor', 'employee', 'lead'] as const;
 export type RecipientType = (typeof RECIPIENT_TYPES)[number];
@@ -144,6 +145,7 @@ export async function createLetterTemplate(
   ctx: ServiceContext,
   input: { category: string; name: string; body: string },
 ): Promise<LetterTemplateView> {
+  assertWrite(ctx); // view-only members cannot add letter templates (checked before any change)
   checkTemplate(input, true);
   const [row] = await ctx.db
     .insert(letterTemplates)
@@ -167,6 +169,7 @@ export async function updateLetterTemplate(
   id: string,
   input: { category?: string; name?: string; body?: string },
 ): Promise<LetterTemplateView> {
+  assertWrite(ctx); // view-only members cannot change letter templates (checked before any change)
   if (id.startsWith('builtin:')) throw validation('Built-in letters can’t be changed. Save a copy instead.');
   const before = await loadTemplateRow(ctx, id);
   checkTemplate(input, false);
@@ -191,6 +194,7 @@ export async function updateLetterTemplate(
 }
 
 export async function deleteLetterTemplate(ctx: ServiceContext, id: string): Promise<void> {
+  assertWrite(ctx); // view-only members cannot delete letter templates (checked before any change)
   if (id.startsWith('builtin:')) throw validation('Built-in letters can’t be deleted.');
   const before = await loadTemplateRow(ctx, id);
   await ctx.db.delete(letterTemplates).where(eq(letterTemplates.id, id));

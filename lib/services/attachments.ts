@@ -160,6 +160,13 @@ export async function saveAttachment(
   if (!filename) throw validation('filename is required');
   if (!base64) throw validation('base64 content is required');
 
+  // Never trust a client-supplied id: a document uploaded straight to a known record type must point
+  // at a real record of this company, checked before anything is written (no orphaned files).
+  // Types outside FILING_TABLES (the Doc Center's free-form "Other" reference) are kept as given.
+  if (entityType && entityId && Object.prototype.hasOwnProperty.call(FILING_TABLES, entityType)) {
+    await assertFilingTarget(ctx, entityType, entityId);
+  }
+
   // Decode
   let buffer: Buffer;
   try {
