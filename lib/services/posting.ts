@@ -34,6 +34,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
+import { foreignLineColumns } from './fxLines';
 
 export interface PostingLine {
   accountId: string;
@@ -58,6 +59,11 @@ export interface PostingLine {
    * assertControlAccountNames (QB invariant I11).
    */
   controlLine?: boolean;
+  /**
+   * p1 fx: this line's amount in its account's currency (foreign-currency bank / credit-card
+   * accounts). Omitted = converted from the home amount (fxLines.ts). 0 = home-only revaluation.
+   */
+  foreignAmount?: string | number | null;
 }
 
 export type JournalEntityType = 'customer' | 'vendor' | 'employee' | 'other';
@@ -80,6 +86,9 @@ export interface PostJournalEntryInput {
    * repair tools only — never set it from a user-facing window.
    */
   allowUnnamedControl?: boolean;
+  /** p1 fx: the transaction's currency + home units per 1 unit (see fxLines.ts). */
+  currency?: string | null;
+  exchangeRate?: string | number | { toString(): string } | null;
 }
 
 const DEBIT_NORMAL = new Set(['asset', 'expense']);
@@ -337,7 +346,13 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
   // Verify every referenced account belongs to this company and load its type.
   const accountIds = [...new Set(input.lines.map((l) => l.accountId))];
   const accountRows = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+    .select({
+      id: accounts.id,
+      type: accounts.type,
+      subtype: accounts.subtype,
+      name: accounts.name,
+      currency: accounts.currency,
+    })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, accountIds)));
   const typeById = new Map(accountRows.map((a) => [a.id, a.type]));
@@ -367,6 +382,15 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
   }
 
   assertControlAccountNames(input, accountRows);
+  const fxColumns = await foreignLineColumns(
+    ctx,
+    {
+      lines: input.lines,
+      currency: input.currency ?? null,
+      exchangeRate: input.exchangeRate == null ? null : String(input.exchangeRate),
+    },
+    new Map(accountRows.map((a) => [a.id, a.currency ?? null])),
+  );
 
   return inTransaction(ctx, async (tx) => {
     const entryNumber = await nextEntryNumber(tx);
@@ -387,7 +411,7 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
 
     // Canonical 2dp line values. accounts.balance is updated by the database trigger from
     // exactly these stored rows (no TypeScript-side delta, so nothing can be applied twice).
-    const normalizedLines = input.lines.map((l) => ({
+    const normalizedLines = input.lines.map((l, i) => ({
       accountId: l.accountId,
       debit: l.debit != null && Money.gt(l.debit, 0) ? toAmountString(l.debit) : null,
       credit: l.credit != null && Money.gt(l.credit, 0) ? toAmountString(l.credit) : null,
@@ -395,6 +419,7 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       classId: l.classId ?? null,
       entityType: l.entityType ?? null,
       entityId: l.entityType ? (l.entityId ?? null) : null,
+      ...fxColumns[i],
     }));
 
     await tx.db.insert(journalEntryLines).values(
