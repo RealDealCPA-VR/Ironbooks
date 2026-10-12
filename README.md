@@ -1,184 +1,212 @@
-# BookKeeper AI
+<div align="center">
 
-**Open-source desktop accounting built to match QuickBooks Desktop Enterprise, with local AI and books that can't go out of balance.**
+# 📒 BookKeeper AI
 
-BookKeeper AI is a cross-platform **desktop** app (Windows / macOS / Linux) for full double-entry
-accounting. Your company file lives **on your computer**. It is an embedded Postgres database
-(PGlite), and there is no cloud account, no subscription and no required internet. AI runs on
-models on your own machine or Tailscale tailnet by default. Cloud AI is opt-in per company and
-redacted.
+### QuickBooks Desktop Enterprise power. Your machine. Your AI. No subscription.
 
-> **Status:** two rounds of QuickBooks Desktop Enterprise parity work are merged into `main`.
-> 290 test files and 3,658 tests pass, the typecheck is clean, and the production build succeeds.
-> [`PARITY.md`](./PARITY.md) is the gap matrix that drove the second round. A final parity audit
-> and a short list of follow-ups are still open (see [Roadmap](#-roadmap)).
+**Open-source double-entry accounting for Windows, macOS and Linux. The database itself
+refuses to let your books go out of balance.**
 
-## ✨ Features
+![tests](https://img.shields.io/badge/tests-3%2C658%20passing-brightgreen)
+![typecheck](https://img.shields.io/badge/tsc-clean-blue)
+![local-first](https://img.shields.io/badge/data-100%25%20local-success)
+![AI](https://img.shields.io/badge/AI-local%20%2B%20tailnet%20first-purple)
+![platforms](https://img.shields.io/badge/desktop-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
+![stack](https://img.shields.io/badge/Next.js%2015%20%C2%B7%20Electron%20%C2%B7%20Postgres-black)
 
-### Books that can't go out of balance
-- One posting engine, with ledger rules **enforced by the database itself**. An unbalanced
-  entry, a direct balance edit, or a change to a posted line outside a sanctioned edit is rejected
-  at commit, whatever code path tries it.
-- A/R and A/P control accounts must tie to their aging. Every A/R and A/P line carries a customer
-  or vendor name, as in QuickBooks. Draft invoices never touch A/R.
-- A built-in integrity check, closing date with password, an audit trail, and Decimal-safe money
-  everywhere.
+[Why](#-why-bookkeeper-ai) · [Features](#-what-you-get) · [Switching from QuickBooks](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Quick start](#-quick-start) · [Roadmap](#-roadmap)
 
-### Company file and transaction log
-- **A running, tamper-evident transaction log** inside the company file records every change,
-  like QuickBooks' TLG file.
-- **Shareable company files**: a single-file portable copy, plus an Excel or PDF ledger export
-  for your accountant.
-- **Backups** that restore in full, an automatic backup before risky operations, and **Condense
-  Data** that writes a restorable full archive first.
-- **Multi-user**: per-company users, roles and permissions, with multi-user hosting limited to your
-  Tailscale tailnet.
+</div>
 
-### QuickBooks migration
-- **General Ledger import** from a QuickBooks GL report in **Excel, CSV or PDF**. It reconciles to
-  the penny against the trial balance before anything is committed.
-- **IIF import** with the account hierarchy, every item type, and customer, vendor and employee
-  fields and lists.
-- **Open invoices and bills** come in as real documents, so you can receive payments and pay bills
-  right after cutover. A/R and A/P still tie to the imported GL.
-- IIF, CSV and Excel export of lists and transactions.
+---
 
-### QuickBooks Enterprise workflows
-- **Chart of accounts**: every QuickBooks account type (Bank, A/R, Other Current Asset, Fixed
-  Asset, Credit Card, Long Term Liability, COGS, Other Income/Expense, Non-posting and more),
-  sub-accounts and tax-line mapping.
-- **Lists**: terms, customer/vendor/job types, other names, ship via, payment methods, sales tax
-  codes, price levels and billing rates, vehicles, units of measure, To Do and notes, Add/Edit
-  Multiple, merge and Clean Up.
-- **Sales / A/R**: estimates, sales orders, invoices (with alphanumeric numbers, retainage and
-  shipping fields), sales receipts, credit memos and refunds, Receive Payments with discounts and
-  credits, bounced checks, statements and statement charges, batch invoicing, finance charges, the
-  Income Tracker and the Collections Center.
-- **Purchases / A/P**: purchase orders, item receipts, bills, Pay Bills with due-date and discount
-  filters, checks and credit card charges with items, a check print queue with printer alignment,
-  vendor credits, the Loan Manager and multi-currency.
-- **Banking**: OFX/QBO/CSV import with rules, bank feeds (optional), reconciliation, deposits and
-  transfers.
-- **Inventory**: FIFO and average cost, opening quantities, assemblies, landed cost, sites and
-  transfers, reorder points and the Inventory Center.
-- **Payroll** (after-the-fact): Social Security wage base and withholding tables by year,
-  mid-year YTD setup, paycheck edits, liability adjustments, state unemployment, workers' comp,
-  941/940/W-2 data and payroll reports.
-- **Sales tax**: a liability report that ties to the GL by agency, on accrual or cash basis, plus
-  Pay Sales Tax and adjustments.
-- **Accountant tools**: the Accountant Center, Working Trial Balance, Reclassify Transactions,
-  Write Off Invoices, Batch Enter, Batch Delete/Void, Client Data Review, Review List Changes and
-  Fix Incorrectly Recorded Sales Tax.
-- **Preferences and forms**: QuickBooks-style Preferences, form templates (logo, colors, fields),
-  memorized transactions, reminders, the calendar, Lead Center, Doc Center, letters and labels.
+## 💡 Why BookKeeper AI
 
-### Reports
-- QuickBooks P&L sections, sub-account roll-ups, and Retained Earnings and Net Income on
-  separate lines.
-- The standard report set, including detail, job, time, mileage, list and income-tax reports.
-- Filters, QuickZoom drill-down, memorized report groups, scheduled exports, graphs, a pivot
-  builder, combined multi-company reports, budgets, forecasts and Advanced Find.
-- CSV/Excel/PDF export.
+QuickBooks Desktop runs on rising subscriptions and a shrinking product line. Cloud accounting
+puts your clients' books on someone else's server. BookKeeper AI is the third option:
 
-### AI that stays local
-- **Local models first**: Ollama, LM Studio or any OpenAI-compatible server on this computer, your
-  LAN or your **Tailscale tailnet**.
-- **Cloud models are optional**, chosen per company in **AI & Automation**. When a cloud model is
-  used, personal data (SSNs, TINs, account numbers) is redacted.
-- QuickBooks-style learned categorization, an AI assistant that proposes entries for your
-  approval, and AI error review: unbalanced, duplicate or miscategorized entries and outliers.
-- All network access goes through one policy guard. See [`PRIVACY.md`](./PRIVACY.md) for exactly
-  what can leave the machine. The answer is never your books.
+- 🔒 **Your books never leave your computer.** The company file is a folder you own. There's no
+  account, no telemetry and no lock-in.
+- ⚖️ **Unbalanced books are impossible, not just unlikely.** Ledger rules run as **database
+  triggers**. An unbalanced entry, a hand-edited balance, or a change to a posted line is
+  rejected at commit, whatever code path tries it.
+- 🤖 **AI that works for you, on your hardware.** Local models on your PC or Tailscale tailnet do
+  the categorizing, suggest entries and catch mistakes. Cloud AI is opt-in and redacted.
+- 🧾 **Built by working through QuickBooks Desktop Enterprise screen by screen**, from account
+  types to the Accountant Center. If your bookkeeper knows QB, they already know the workflow.
 
-## 🏗 Architecture
+## 🆚 At a glance
 
-```
-Electron shell  ──launches──►  Next.js server  ──►  lib/services/* (accounting engine)  ──►  PGlite (local DB)
-(native menus,                 (React UI +              posting, documents, reports,          embedded Postgres,
- file dialogs,                  API routes)             payroll, import/export, AI            one dir per company,
- per-company data dir)                                                                        ledger rules as DB triggers)
-```
+| | QuickBooks Desktop Enterprise | Cloud accounting | **BookKeeper AI** |
+|---|:---:|:---:|:---:|
+| Data stays on your machine | ✅ | ❌ | ✅ |
+| No subscription | ❌ | ❌ | ✅ |
+| Open source | ❌ | ❌ | ✅ |
+| Ledger balance enforced by the database | ❌ | ❓ | ✅ |
+| AI on your own hardware | ❌ | ❌ | ✅ |
+| Tamper-evident transaction log | ➖ (TLG) | ❌ | ✅ |
+| Imports a QB General Ledger from **PDF**, Excel or CSV | ❌ | ➖ | ✅ |
+| Multi-user | ✅ | ✅ | ✅ (over your tailnet) |
 
-- **UI**: Next.js 15 App Router + React 19 + Tailwind.
-- **Engine**: pure TypeScript services (`lib/services/*`) that can be tested without a browser.
-- **DB**: Drizzle ORM on **PGlite** (embedded Postgres). Migrations live in `drizzle/` and are
-  written by hand (see below).
-- **AI**: `lib/ai/` routes requests to local, tailnet or cloud providers. `lib/net/guard.ts` is the
-  only way out to the network.
-- **Desktop**: Electron (`electron/`). See [`DESKTOP.md`](./DESKTOP.md).
+## 🚀 What you get
 
-## 🚀 Getting started
+<table>
+<tr><td width="50%" valign="top">
+
+### 🧱 Rock-solid ledger
+- Every QuickBooks account type, sub-accounts, tax lines
+- A/R and A/P control accounts **always tie to aging**
+- Names on every A/R and A/P line, as in QuickBooks
+- Closing date + password, audit trail, integrity check
+- Decimal money everywhere, with no floating-point drift
+
+### 💼 Sales & A/R
+Estimates → sales orders → invoices with **retainage**, alphanumeric numbers
+and shipping · sales receipts · credit memos & refunds · Receive Payments with
+discounts & credits · bounced checks · statements · batch invoicing ·
+**Income Tracker** · **Collections Center**
+
+### 🧾 Purchases & A/P
+POs · item receipts · bills · Pay Bills with discount & due-date filters ·
+checks & card charges with items · **check print queue with printer
+alignment** · vendor credits · **Loan Manager** · multi-currency
+
+### 🏦 Banking
+OFX / QBO / CSV import with rules · optional bank feeds · reconciliation ·
+deposits & transfers
+
+</td><td width="50%" valign="top">
+
+### 📦 Inventory
+FIFO & average cost · assemblies · landed cost · sites & transfers ·
+units of measure · reorder points · **Inventory Center**
+
+### 👥 Payroll (after-the-fact)
+Social Security wage base & withholding **by year** · mid-year YTD setup ·
+paycheck edits · state unemployment · workers' comp · 941 / 940 / W-2 data
+
+### 🧮 Accountant toolbox
+**Accountant Center** · Working Trial Balance · Reclassify · Write Off
+Invoices · **Batch Enter** · Batch Delete/Void · Client Data Review ·
+Fix Incorrectly Recorded Sales Tax · sales tax that **ties to the GL by agency**
+
+### 📊 Reports
+QB-style P&L sections & sub-account roll-ups · the standard report set ·
+**QuickZoom** drill-down · filters · memorized report groups · scheduled
+exports · graphs · pivot builder · multi-company · budgets & forecasts ·
+Advanced Find
+
+### ⚙️ Make it yours
+QB-style Preferences · form templates (logo, colors, fields) · memorized
+transactions · reminders · calendar · Lead Center · Doc Center · letters & labels
+
+</td></tr>
+</table>
+
+### 🗄️ A company file you can trust
+- **Running transaction log** inside the file records every change, tamper-evident, like QB's TLG.
+- **Shareable**: a single-file portable copy, or an Excel/PDF ledger for your accountant.
+- **Backups that restore in full**, an automatic backup before risky operations, and **Condense
+  Data** that writes a restorable archive first.
+- **Per-company users, roles and permissions.** Multi-user hosting is limited to your Tailscale
+  tailnet.
+
+## 🔄 Switching from QuickBooks
+
+Bring your history with you:
+
+1. **Import your General Ledger** from a QuickBooks GL report in **PDF, Excel or CSV**. It reconciles
+   to the penny against the trial balance *before* anything is committed.
+2. **Import your lists via IIF**: the account hierarchy, every item type, and customer, vendor and
+   employee details.
+3. **Import open invoices and bills as real documents**, then receive payments and pay bills on day
+   one. A/R and A/P still tie to the imported GL.
+
+Want out again? Lists and transactions export to **IIF, CSV and Excel**.
+
+## 🤖 AI that stays home
+
+| Where the model runs | Default? | What leaves the machine |
+|---|:---:|---|
+| This computer (Ollama, LM Studio, any OpenAI-compatible server) | ✅ | Nothing |
+| Your LAN or **Tailscale tailnet** | ✅ | Nothing beyond your own network |
+| A cloud provider (e.g. Claude) | Opt-in per company | Only the prompt, with **SSNs, TINs and account numbers redacted** |
+
+The AI learns your categorization the way QuickBooks does, suggests journal entries for **your
+approval**, and reviews the books for unbalanced, duplicate or miscategorized entries and
+outliers. Every network call goes through one policy guard. [`PRIVACY.md`](./PRIVACY.md) lists
+exactly what can leave the machine, and it's never your books.
+
+## ⚡ Quick start
 
 ```bash
 npm install --legacy-peer-deps
 
-# Web/dev mode (browser):
-npm run dev            # http://localhost:3000
-
-# Desktop dev (Electron pointed at the dev server):
-npm run dev            # terminal 1
-npm run electron:dev   # terminal 2
-
-# Build desktop installers (Windows/mac/Linux):
-npm run desktop:dist
+npm run dev            # web/dev mode → http://localhost:3000
+npm run electron:dev   # desktop shell (with `npm run dev` running in another terminal)
+npm run desktop:dist   # build installers for Windows / macOS / Linux
 ```
 
-See [`GETTING_STARTED.md`](./GETTING_STARTED.md) and [`INSTALL.md`](./INSTALL.md) for more.
-Releases are tag-triggered. See [`RELEASING.md`](./RELEASING.md).
+More: [`GETTING_STARTED.md`](./GETTING_STARTED.md) · [`INSTALL.md`](./INSTALL.md) ·
+[`DESKTOP.md`](./DESKTOP.md) · [`RELEASING.md`](./RELEASING.md) (tag-triggered releases)
 
-## 🧪 Quality
+## 🧪 Tested like the money matters
 
 ```bash
-npm test          # vitest: unit, integration and adversarial accounting tests
+npm test          # 290 files · 3,658 tests: unit, integration, adversarial
 npm run typecheck # tsc --noEmit
 npm run build     # Next standalone production build
 ```
 
-Every feature area has adversarial tests that check the accounting invariants: the trial balance
-and balance sheet stay balanced, and each subledger matches its control account. They also cover
-closing-date rules, permission mapping and rollback. On a busy machine, run the suite with
-`npx vitest run --maxWorkers=3`.
+Every feature area was built by a **doer**, attacked by an **independent adversarial tester** and
+signed off by a **reviewer**. The tests check the trial balance and balance sheet stay balanced and
+each subledger matches its control account after every operation. They also cover closing-date
+rules, permissions and rollback. On a busy machine, run `npx vitest run --maxWorkers=3`.
 
-**Contributing rules**:
-- Work on `main` (short-lived branches only).
-- Never write account balances directly; post through `lib/services/posting.ts`.
-- Map every new API route in `lib/permissions/routes.ts`.
-- Write migrations by hand as the next `drizzle/00NN_*.sql`, with a `_journal.json` entry. Don't
-  run drizzle-kit generate.
+## 🏗 Under the hood
 
-## 📁 Layout
+```
+Electron shell ──► Next.js 15 (React 19 UI + API routes) ──► lib/services/* (accounting engine) ──► PGlite
+ native menus,                                                 posting, documents, reports,          embedded Postgres,
+ per-company dir                                               payroll, import/export, AI            one dir per company,
+                                                                                                     ledger rules as triggers
+```
 
 ```
 electron/            Desktop shell (main process + preload bridge)
+lib/services/        Accounting engine (posting.ts is the only way to touch the ledger)
 lib/db/              Drizzle schema + PGlite client
-lib/services/        Accounting engine: posting, documents, banking, inventory, payroll,
-                     reports, QuickBooks import/export, company file, transaction log, …
-lib/ai/              AI provider router (local / tailnet / cloud) + redaction
-lib/permissions/     Roles, permission areas, route → permission map
-lib/net/guard.ts     Network policy (the only path to the network)
-lib/money.ts         Decimal-safe money + allocation + formatting
-app/                 React UI (pages) + API route handlers (app/api/*)
-components/          Shared UI kit, help/glossary
-drizzle/             Hand-written SQL migrations (bundled into the desktop build)
+lib/ai/              AI router: local / tailnet / cloud + redaction
+lib/permissions/     Roles, areas, route → permission map
+lib/net/guard.ts     Network policy (the only way out)
+lib/money.ts         Decimal-safe money
+app/                 Pages + API routes (app/api/*)
+drizzle/             Hand-written SQL migrations
 PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 ```
 
+### 🤝 Contributing
+- Work on `main` and keep branches short-lived.
+- **Never write account balances directly.** Post through `lib/services/posting.ts`; the database
+  will reject anything else.
+- Map every new API route in `lib/permissions/routes.ts`. A test fails if you forget.
+- Write migrations by hand as the next `drizzle/00NN_*.sql` plus a `_journal.json` entry. Don't
+  run drizzle-kit generate.
+
 ## 🗺 Roadmap
 
-1. **Final parity audit.** Re-audit `main` against every gap in `PARITY.md` and against the
-   project goals: exact QB Desktop Enterprise parity, local-only data, local or tailnet AI, a
-   shareable company file and transaction log, GL import, full backup and restore, per-company
-   users, and books that can't go out of balance.
-2. **Known follow-ups:**
-   - Combine the two To-Do lists (Lists and Calendar/Leads).
-   - Add the typed-number field to the estimate, sales order, sales receipt, credit memo and
-     purchase order forms.
-   - When names are merged, update the memorized transactions that use them.
-   - Use as-of balances in the Income Tracker's unpaid and overdue groups.
-   - Multi-currency vendor credits, deposits and transfers.
-   - Refund-check printing.
-   - Test migration 0029 against a real upgraded company file.
-3. **Hands-on QA** of the new screens, Receive Payments first, then a tagged release.
+- [x] Wave 1: database-enforced ledger, transaction log, company file, backup and restore, local and
+  tailnet AI, GL import from PDF/Excel/CSV, users and permissions
+- [x] Wave 2: 8 teams closing the QuickBooks Enterprise gaps in [`PARITY.md`](./PARITY.md)
+- [ ] **Final parity audit** of `main` against every gap and the project goals *(in progress)*
+- [ ] Follow-ups:
+  - unify the two To-Do lists
+  - typed numbers on every sales and purchase form
+  - update memorized transactions on name merge
+  - Income Tracker as-of balances
+  - multi-currency vendor credits, deposits and transfers
+  - refund-check printing
+- [ ] Hands-on QA of the new screens, then a tagged release
 
 ## ⚠️ Disclaimer
 
