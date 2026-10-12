@@ -198,7 +198,8 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] Wave 1: database-enforced ledger, transaction log, company file, backup and restore, local and
   tailnet AI, GL import from PDF/Excel/CSV, users and permissions
 - [x] Wave 2: 8 teams closing the QuickBooks Enterprise gaps in [`PARITY.md`](./PARITY.md)
-- [ ] **Final parity audit** of `main` against every gap and the project goals *(in progress)*
+- [x] **Final parity audit**: 52 of 109 gaps done, 12 P0 items open (see [`PARITY.md`](./PARITY.md))
+- [ ] **Fix the P0 list** in `PARITY.md` (books, statements, payroll taxes, restore safety)
 - [ ] Follow-ups:
   - unify the two To-Do lists
   - typed numbers on every sales and purchase form
