@@ -128,7 +128,7 @@ describe('Advanced pricing — engine + documents', () => {
       ['1050', 'Undeposited Funds', 'asset', 'checking'],
       ['1200', 'Accounts Receivable', 'asset', 'accounts_receivable'],
       ['1300', 'Inventory Asset', 'asset', 'inventory'],
-      ['2200', 'Sales Tax Payable', 'liability', 'accounts_payable'],
+      ['2200', 'Sales Tax Payable', 'liability', 'other_current_liability'],
       ['3000', "Owner's Equity", 'equity', 'owners_equity'],
       ['4000', 'Sales Income', 'revenue', 'sales'],
       ['5000', 'Cost of Goods Sold', 'expense', 'cost_of_goods_sold'],
