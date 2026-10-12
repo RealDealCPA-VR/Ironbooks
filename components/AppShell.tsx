@@ -317,7 +317,15 @@ function writeLocal(key: string, value: string) {
 }
 
 /** Simple / All menus switch at the top of the sidebar (saved to My Preferences). */
-function MenuModeToggle({ mode, onChange }: { mode: NavMode; onChange: (m: NavMode) => void }) {
+function MenuModeToggle({
+  mode,
+  onChange,
+  className = 'hidden lg:flex mx-1 mb-3',
+}: {
+  mode: NavMode;
+  onChange: (m: NavMode) => void;
+  className?: string;
+}) {
   const btn = (m: NavMode, label: string, title: string) => (
     <button
       type="button"
@@ -333,7 +341,7 @@ function MenuModeToggle({ mode, onChange }: { mode: NavMode; onChange: (m: NavMo
     </button>
   );
   return (
-    <div role="radiogroup" aria-label="Menu style" className="hidden lg:flex gap-1 rounded-lg bg-slate-100 p-1 mx-1 mb-3 shrink-0">
+    <div role="radiogroup" aria-label="Menu style" className={`${className} gap-1 rounded-lg bg-slate-100 p-1 shrink-0`}>
       {btn('simple', 'Simple', 'Everyday tasks only')}
       {btn('advanced', 'All menus', 'Every screen, grouped like the QuickBooks menus')}
     </div>
@@ -347,9 +355,14 @@ function MenuModeToggle({ mode, onChange }: { mode: NavMode; onChange: (m: NavMo
 function SidebarSearch({
   permissions,
   hiddenPaths,
+  idPrefix = 'ss',
+  className = 'relative mx-1 mb-3 hidden lg:block',
 }: {
   permissions: Partial<Record<Area, readonly string[]>> | null | undefined;
   hiddenPaths: ReadonlySet<string>;
+  /** Keeps element ids unique when a second (narrow-window) copy is on the page. */
+  idPrefix?: string;
+  className?: string;
 }) {
   const router = useRouter();
   const [q, setQ] = React.useState('');
@@ -377,7 +390,7 @@ function SidebarSearch({
   }
 
   return (
-    <div ref={rootRef} className="relative mx-1 mb-3 hidden lg:block shrink-0">
+    <div ref={rootRef} className={`${className} shrink-0`}>
       <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-navy/40" aria-hidden="true" />
       <input
         type="search"
@@ -385,8 +398,8 @@ function SidebarSearch({
         aria-label="Find a page"
         aria-autocomplete="list"
         aria-expanded={open && results.length > 0}
-        aria-controls="sidebar-search-results"
-        aria-activedescendant={open && results[active] ? `ss-opt-${active}` : undefined}
+        aria-controls={`${idPrefix}-search-results`}
+        aria-activedescendant={open && results[active] ? `${idPrefix}-opt-${active}` : undefined}
         placeholder="Find a page (e.g. pay bills)"
         value={q}
         onChange={(e) => {
@@ -413,7 +426,7 @@ function SidebarSearch({
       />
       {open && q.trim() && (
         <div
-          id="sidebar-search-results"
+          id={`${idPrefix}-search-results`}
           role="listbox"
           className="absolute left-0 z-50 mt-1 w-80 max-w-[80vw] rounded-xl border border-slate-100 bg-white py-1 shadow-xl"
         >
@@ -425,7 +438,7 @@ function SidebarSearch({
             results.map((r, i) => (
               <button
                 key={r.href}
-                id={`ss-opt-${i}`}
+                id={`${idPrefix}-opt-${i}`}
                 role="option"
                 aria-selected={i === active}
                 type="button"
@@ -650,6 +663,14 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           ) : (
             <span className="mr-auto" />
           )}
+          {/* Narrow windows: the sidebar shows icons only, so page search and the menu switch live here. */}
+          <SidebarSearch
+            permissions={me?.permissions}
+            hiddenPaths={hiddenPaths}
+            idPrefix="ts"
+            className="relative w-48 sm:w-64 lg:hidden"
+          />
+          <MenuModeToggle mode={navMode} onChange={changeMode} className="flex lg:hidden w-40" />
           <button
             type="button"
             onClick={() => setAssistantOpen(true)}

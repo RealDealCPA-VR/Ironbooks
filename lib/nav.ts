@@ -387,6 +387,11 @@ function scoreCandidate(q: string, qWords: string[], c: Candidate): number {
   if (label === q || qb === q) return 100;
   if (label.startsWith(q)) return 90;
   if (qb.startsWith(q)) return 85;
+  // Everything typed is exactly this page's keyword list ("reports" -> Report Center): that is a
+  // name the page answers to, so it beats a page whose label merely contains the word.
+  const kw = words(c.keywords ?? '').map(stemWord);
+  const qStems = qWords.filter((w) => !SEARCH_STOP.has(w)).map(stemWord);
+  if (kw.length && qStems.length === kw.length && qStems.every((w, i) => w === kw[i])) return 80;
   if (label.includes(q)) return 75;
   if (qb.includes(q)) return 70;
   const hay = new Set([...words(c.label), ...words(c.qb ?? ''), ...words(c.keywords ?? ''), ...words(c.group)].map(stemWord));

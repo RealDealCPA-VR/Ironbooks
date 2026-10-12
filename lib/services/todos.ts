@@ -114,10 +114,12 @@ export function parseTodoBody(body: unknown): TodoInput {
       // Old Lists clients: an ISO timestamp. Check the calendar day first so an impossible
       // day (Feb 30) is refused instead of silently rolling over into the next month.
       if (!isDay(due.slice(0, 10))) throw validation('Due date must be a real date (YYYY-MM-DD).');
-      const d = new Date(due);
-      if (Number.isNaN(d.getTime())) throw validation('Due date must be a real date (YYYY-MM-DD).');
-      out.dueDate = d.toISOString().slice(0, 10);
-      const hhmm = d.toISOString().slice(11, 16);
+      // Keep the day and time as written: converting to UTC would move '00:30+01:00' to the
+      // previous day and 'T24:00' to the next one.
+      const m = /^T([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$/.exec(due.slice(10));
+      if (!m) throw validation('Due date must be a real date (YYYY-MM-DD).');
+      out.dueDate = due.slice(0, 10);
+      const hhmm = `${m[1]}:${m[2]}`;
       if (hhmm !== '00:00' && b.dueTime === undefined) out.dueTime = hhmm;
     } else out.dueDate = due || null;
   }
