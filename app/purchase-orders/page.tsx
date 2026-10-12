@@ -36,6 +36,12 @@ import { api } from '@/lib/client';
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import {
+  DocNumberField,
+  docNo,
+  useDocNumber,
+  useDuplicateNumberConfirm,
+} from '@/components/sales/DocNumberField';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,6 +70,8 @@ type PoStatus = 'open' | 'partial' | 'closed' | 'void';
 interface PurchaseOrder {
   id: string;
   poNumber: number;
+  /** P.O. No. the user typed / sees. */
+  refNumber?: string | null;
   vendorId: string;
   date: string;
   expectedDate: string | null;
@@ -159,6 +167,10 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
   const [saving, setSaving] = useState(false);
 
   const [loadingEdit, setLoadingEdit] = useState(false);
+  // P.O. No. (next number on a new PO; the saved one once the edited PO has loaded).
+  const [editRef, setEditRef] = useState<string | null>(null);
+  const docNumber = useDocNumber('purchase_order', open, editId ? (editRef ?? '') : null);
+  const dupConfirm = useDuplicateNumberConfirm();
 
   // Reset form when modal opens (or load the saved PO when editing).
   useEffect(() => {
@@ -168,6 +180,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
     setExpectedDate('');
     setMemo('');
     setLines([{ ...EMPTY_LINE }]);
+    setEditRef(null);
     if (!editId) return;
     let cancelled = false;
     setLoadingEdit(true);
@@ -176,6 +189,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
       .then((po) => {
         if (cancelled) return;
         setVendorId(po.vendorId);
+        setEditRef(docNo(po.refNumber, po.poNumber));
         setDate(String(po.date).slice(0, 10));
         setExpectedDate(po.expectedDate ? String(po.expectedDate).slice(0, 10) : '');
         setMemo(po.memo ?? '');
@@ -260,25 +274,33 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
         quantity: l.quantity,
         rate: l.rate,
       }));
-      if (editId) {
-        await api.patch(`/api/purchase-orders/${editId}`, {
-          vendorId,
-          date,
-          expectedDate: expectedDate || null,
-          memo: memo || null,
-          lines: lineBody,
-        });
-        toast('Purchase order updated.', 'success');
-      } else {
-        await api.post('/api/purchase-orders', {
-          vendorId,
-          date,
-          expectedDate: expectedDate || undefined,
-          memo: memo || undefined,
-          lines: lineBody,
-        });
-        toast('Purchase order created.', 'success');
-      }
+      const saved = await dupConfirm.run((allowDuplicateNumber) =>
+        editId
+          ? api.patch<PurchaseOrder>(`/api/purchase-orders/${editId}`, {
+              vendorId,
+              refNumber: docNumber.payload,
+              allowDuplicateNumber,
+              date,
+              expectedDate: expectedDate || null,
+              memo: memo || null,
+              lines: lineBody,
+            })
+          : api.post<PurchaseOrder>('/api/purchase-orders', {
+              vendorId,
+              refNumber: docNumber.payload,
+              allowDuplicateNumber,
+              date,
+              expectedDate: expectedDate || undefined,
+              memo: memo || undefined,
+              lines: lineBody,
+            }),
+      );
+      if (saved === undefined) return;
+      const savedNo = saved ? docNo(saved.refNumber, saved.poNumber) : '';
+      toast(
+        editId ? `Purchase order ${savedNo ? `#${savedNo} ` : ''}updated.` : `Purchase order ${savedNo ? `#${savedNo} ` : ''}created.`,
+        'success',
+      );
       onCreated();
       onClose();
     } catch (err: unknown) {
@@ -292,7 +314,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
     <Modal
       open={open}
       onClose={onClose}
-      title={editId ? 'Edit Purchase Order' : 'New Purchase Order'}
+      title={editId ? `Edit Purchase Order${editRef ? ` #${editRef}` : ''}` : 'New Purchase Order'}
       size="lg"
       footer={
         <>
@@ -358,8 +380,10 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
           </Select>
         </div>
 
-        {/* Dates */}
-        <div className="grid grid-cols-2 gap-3">
+        {/* P.O. No. + dates */}
+        {dupConfirm.dialog}
+        <div className="grid grid-cols-3 gap-3">
+          <DocNumberField id="po-number" label="P.O. No." value={docNumber.value} onChange={docNumber.setValue} />
           <div>
             <Label htmlFor="po-date">PO Date *</Label>
             <Input
@@ -587,7 +611,7 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
         action: 'convert',
         lines: billLines,
       });
-      toast(`Bill created from PO #${po.poNumber}.`, 'success');
+      toast(`Bill created from PO #${docNo(po.refNumber, po.poNumber)}.`, 'success');
       onBilled();
       onClose();
     } catch (err: unknown) {
@@ -602,7 +626,7 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
     <Modal
       open={!!po}
       onClose={onClose}
-      title={po ? `Receive & Bill — PO #${po.poNumber}` : 'Receive & Bill'}
+      title={po ? `Receive & Bill — PO #${docNo(po.refNumber, po.poNumber)}` : 'Receive & Bill'}
       size="lg"
       footer={
         <>
@@ -749,7 +773,7 @@ export default function PurchaseOrdersPage() {
     setVoiding(true);
     try {
       await api.post(`/api/purchase-orders/${voidTarget.id}`, { action: 'void' });
-      toast(`PO #${voidTarget.poNumber} voided.`, 'success');
+      toast(`PO #${docNo(voidTarget.refNumber, voidTarget.poNumber)} voided.`, 'success');
       setVoidTarget(null);
       await fetchData();
     } catch (err: unknown) {
@@ -764,7 +788,7 @@ export default function PurchaseOrdersPage() {
     setClosingId(po.id);
     try {
       await api.post(`/api/purchase-orders/${po.id}`, { action: 'close' });
-      toast(`PO #${po.poNumber} closed.`, 'success');
+      toast(`PO #${docNo(po.refNumber, po.poNumber)} closed.`, 'success');
       await fetchData();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to close purchase order.';
@@ -818,7 +842,7 @@ export default function PurchaseOrdersPage() {
             <tbody>
               {pos.map((po) => (
                 <Tr key={po.id}>
-                  <Td className="font-semibold text-navy">#{po.poNumber}</Td>
+                  <Td className="font-semibold text-navy">#{docNo(po.refNumber, po.poNumber)}</Td>
                   <Td>{vendorMap[po.vendorId] ?? '—'}</Td>
                   <Td className="text-navy/70">{po.date ? formatDate(po.date, 'MMM d, yyyy') : '—'}</Td>
                   <Td className="text-navy/70">
@@ -950,7 +974,7 @@ export default function PurchaseOrdersPage() {
       <ConfirmDialog
         open={!!voidTarget}
         title="Void purchase order?"
-        message={`Void PO #${voidTarget?.poNumber ?? ''} (${formatCurrency(voidTarget?.total ?? '0')})? The PO can no longer be billed. This cannot be undone.`}
+        message={`Void PO #${docNo(voidTarget?.refNumber, voidTarget?.poNumber ?? '')} (${formatCurrency(voidTarget?.total ?? '0')})? The PO can no longer be billed. This cannot be undone.`}
         confirmLabel="Void"
         tone="danger"
         loading={voiding}
