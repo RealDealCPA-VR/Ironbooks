@@ -47,6 +47,14 @@ export interface PostingLine {
    */
   entityType?: JournalEntityType | null;
   entityId?: string | null;
+  /**
+   * Marks THIS line as the source document's own A/R / A/P line (an invoice's A/R charge, a
+   * payment's A/R relief, a bill's A/P line, ...). Only document services set it, and only on
+   * the line they build from the document's own A/R / A/P account — never on a line whose account
+   * the user picked (item, expense, discount, "Deposit to" / "Pay from"). Not stored; read only by
+   * assertControlAccountNames (QB invariant I11).
+   */
+  controlLine?: boolean;
 }
 
 export type JournalEntityType = 'customer' | 'vendor' | 'employee' | 'other';
@@ -217,12 +225,31 @@ export function assertNotControlAccount(
 }
 
 /**
+ * QB never lists Accounts Receivable / Accounts Payable as an item's account or as a form line's
+ * account (income, discount, expense lines). Refuse them up front with a plain-language message
+ * (the posting guard below refuses an unmarked A/R / A/P line on a document too). `where` names
+ * the place, e.g. "Line 2" or "the item's income account".
+ */
+export function assertNotControlLineAccount(
+  acct: { type: string; subtype: string | null; name?: string | null },
+  where: string,
+): void {
+  const side = controlSideOf(acct);
+  if (side) {
+    throw validation(
+      `${where}: ${acct.name ? `"${acct.name}" is an ${SIDE_LABEL[side]} account. ` : ''}${SIDE_LABEL[side]} can't be used as an item or line account. Pick an income, expense or other account instead.`,
+    );
+  }
+}
+
+/**
  * QB invariant I11 (A/R aging == A/R balance, A/P aging == A/P balance), checked line by line on
  * every posting — the single choke point for every window, current and future:
  *  - A customer/vendor document may carry its OWN control line unnamed (the document is the
  *    subledger item): an invoice / credit memo / customer payment its A/R line, a bill / bill
  *    payment / vendor credit its A/P line, a refund the one control line of the document it
- *    refunds. That line must be a single direction (an invoice only charges A/R, a payment only
+ *    refunds. The document service marks that line `controlLine: true`; every unmarked A/R / A/P
+ *    line on a document is refused. Marked lines must be a single direction (an invoice only charges A/R, a payment only
  *    relieves it), so a "Deposit to" or "Pay from" or item/expense line on the same control
  *    account is refused. Any OTHER control line on a document (an A/P line on a customer form,
  *    an A/R line on a bill, any control line on a Sales Receipt) is refused, as in QB.
@@ -267,6 +294,14 @@ export function assertControlAccountNames(
     if (!acct) continue;
     const side = controlSideOf(acct);
     if (!side) continue;
+    // Only the document's own, explicitly marked control line may sit on A/R / A/P. Any other
+    // line on a control account (an item, discount, expense, "Deposit to" or "Pay from" line the
+    // user pointed at A/R or A/P) is refused, whatever its direction.
+    if (!l.controlLine) {
+      throw validation(
+        `"${acct.name}" is an ${SIDE_LABEL[side]} account and can't be used on this form as a "Deposit to", "Pay from", discount or line account. Pick a bank, Undeposited Funds, income or expense account instead.`,
+      );
+    }
     if (docSide === 'either' && ownSide === null) ownSide = side;
     if (side !== ownSide) {
       throw validation(

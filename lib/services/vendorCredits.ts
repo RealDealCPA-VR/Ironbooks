@@ -142,6 +142,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
         accountId: apAccountId,
         debit: totalStr,
         memo: `Vendor credit ${credit.id}`,
+        controlLine: true,
       },
       // Credit each expense/asset account for its line amount.
       ...input.lines.map((line) => ({
@@ -519,6 +520,7 @@ export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendo
           accountId: apAccountId,
           credit: toAmountString(amount),
           memo: 'Vendor credit settled in cash',
+          controlLine: true,
         },
       ],
     });

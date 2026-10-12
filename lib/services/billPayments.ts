@@ -256,6 +256,7 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
         accountId: apAccountId,
         debit: settledTotalStr,
         memo: `A/P payment to vendor ${vendor.name}`,
+        controlLine: true,
       },
       {
         accountId: input.paymentAccountId,

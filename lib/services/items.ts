@@ -14,6 +14,7 @@
 import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, items } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { assertNotControlLineAccount } from './posting';
 import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -103,10 +104,12 @@ async function requireAccount(
   expectedType?: string,
 ): Promise<void> {
   const [row] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
   if (!row) throw notFound(`${label} account ${accountId}`);
+  // QB never offers A/R or A/P as an item's account (QB invariant I11).
+  assertNotControlLineAccount(row, `${label} account`);
   if (expectedType && row.type !== expectedType) {
     throw validation(
       `${label} account must be a "${expectedType}" account (got "${row.type}").`,

@@ -54,7 +54,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
 import {
@@ -485,6 +485,15 @@ async function prepareInvoice(
       const itemIncomeId = itemMap.get(l.itemId)?.incomeAccountId ?? null;
       if (itemIncomeId) resolvedAccountId = itemIncomeId;
     }
+    // A/R and A/P are never a line / discount account (QB invariant I11): an extra A/R line
+    // would move the GL without moving the invoice's balance in A/R aging.
+    if (kind !== 'subtotal') {
+      const [lineAcct] = await ctx.db
+        .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+        .from(accounts)
+        .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, resolvedAccountId)));
+      if (lineAcct) assertNotControlLineAccount(lineAcct, `Line ${i + 1}`);
+    }
 
     if (kind === 'subtotal') {
       // UI-computed subtotal of the preceding body lines — non-posting,
@@ -753,10 +762,13 @@ async function postInvoiceGL(
     weight: ReturnType<typeof Money.zero>;
     memo: string;
     classId?: string | null;
+    /** The invoice's own A/R line(s) — see posting.ts PostingLine.controlLine. */
+    controlLine?: boolean;
   }> = [{
     accountId: arAccountId,
     weight: dueNow.minus(paymentTotal),
     memo: `Invoice #${invoiceNumber}`,
+    controlLine: true,
   }];
   if (paymentTotal.greaterThan(0) && ufAccountId) {
     debitSpecs.push({
@@ -770,6 +782,7 @@ async function postInvoiceGL(
       accountId: retainageAcctId,
       weight: retainageAmount,
       memo: `Invoice #${invoiceNumber} — retainage`,
+      controlLine: true,
     });
   }
   if (discount.greaterThan(0)) {
@@ -823,6 +836,7 @@ async function postInvoiceGL(
     credit?: string;
     memo?: string;
     classId?: string | null;
+    controlLine?: boolean;
   }> = [];
   debitSpecs.forEach((s, i) => {
     if (debitAlloc[i].greaterThan(0)) {
@@ -831,6 +845,7 @@ async function postInvoiceGL(
         debit: toAmountString(debitAlloc[i]),
         memo: s.memo,
         classId: s.classId ?? null,
+        ...(s.controlLine ? { controlLine: true } : {}),
       });
     }
   });

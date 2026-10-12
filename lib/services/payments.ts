@@ -252,9 +252,15 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
   // --- Everything below runs atomically ---
   return inTransaction(ctx, async (tx) => {
     // 1. Post the GL entry: Dr deposit account / Cr A/R (+ FX gain/loss plug)
-    const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [
+    const postingLines: Array<{
+      accountId: string;
+      debit?: string;
+      credit?: string;
+      memo?: string;
+      controlLine?: boolean;
+    }> = [
       { accountId: depositAccountId, debit: toAmountString(cashBase), memo: 'Payment received' },
-      { accountId: arAccountId, credit: toAmountString(arBase), memo: 'A/R reduction' },
+      { accountId: arAccountId, credit: toAmountString(arBase), memo: 'A/R reduction', controlLine: true },
     ];
     if (fxAccountId && fxDiff.greaterThan(0)) {
       postingLines.push({
@@ -411,10 +417,10 @@ async function postFxAdjustmentForApplication(
     delta.greaterThan(0)
       ? [
           { accountId: fxAccountId, debit: toAmountString(delta), memo: 'Realized exchange loss' },
-          { accountId: params.arAccountId, credit: toAmountString(delta), memo: 'A/R FX adjustment' },
+          { accountId: params.arAccountId, credit: toAmountString(delta), memo: 'A/R FX adjustment', controlLine: true },
         ]
       : [
-          { accountId: params.arAccountId, debit: toAmountString(Money.abs(delta)), memo: 'A/R FX adjustment' },
+          { accountId: params.arAccountId, debit: toAmountString(Money.abs(delta)), memo: 'A/R FX adjustment', controlLine: true },
           { accountId: fxAccountId, credit: toAmountString(Money.abs(delta)), memo: 'Realized exchange gain' },
         ];
   return postJournalEntry(tx, {
@@ -833,6 +839,7 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
           accountId: arAccountId,
           debit: toAmountString(baseAmount),
           memo: 'Customer overpayment refunded',
+          controlLine: true,
         },
         {
           accountId: input.bankAccountId,

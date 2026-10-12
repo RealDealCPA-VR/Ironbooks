@@ -54,7 +54,7 @@ import {
   taxRates,
 } from '@/lib/db/schema';
 import { Money, allocate, toAmountString } from '@/lib/money';
-import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
+import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
 import {
   type InventoryLineDetail,
@@ -286,6 +286,14 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
       const itemIncomeId = itemMap.get(l.itemId)?.incomeAccountId ?? null;
       if (itemIncomeId) resolvedAccountId = itemIncomeId;
     }
+    // A/R and A/P are never a line account (QB invariant I11).
+    {
+      const [lineAcct] = await ctx.db
+        .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+        .from(accounts)
+        .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, resolvedAccountId)));
+      if (lineAcct) assertNotControlLineAccount(lineAcct, `Line ${i + 1}`);
+    }
 
     const taxable = l.taxable !== false; // default true
     subtotal = subtotal.plus(amount);
@@ -402,6 +410,7 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
       debit?: string;
       credit?: string;
       memo?: string;
+      controlLine?: boolean;
     }> = [];
     debitSpecs.forEach((s, i) => {
       if (debitAlloc[i].greaterThan(0)) {
@@ -410,7 +419,13 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
     });
     creditSpecs.forEach((s, i) => {
       if (creditAlloc[i].greaterThan(0)) {
-        postingLines.push({ accountId: s.accountId, credit: toAmountString(creditAlloc[i]), memo: s.memo });
+        // The only credit spec is the memo's own A/R line (posting.ts PostingLine.controlLine).
+        postingLines.push({
+          accountId: s.accountId,
+          credit: toAmountString(creditAlloc[i]),
+          memo: s.memo,
+          controlLine: true,
+        });
       }
     });
 
@@ -745,6 +760,7 @@ export async function refundCreditMemo(ctx: ServiceContext, input: RefundCreditM
           accountId: arAccountId,
           debit: toAmountString(amount),
           memo: `Credit Memo #${docRef(memo.refNumber, memo.memoNumber)} refunded`,
+          controlLine: true,
         },
         {
           accountId: input.bankAccountId,
