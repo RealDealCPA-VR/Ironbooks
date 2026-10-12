@@ -2,7 +2,7 @@
 
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { useEffect, useState, useCallback } from 'react';
-import { RotateCcw, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle, Banknote, Pencil } from 'lucide-react';
+import { RotateCcw, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle, Banknote, Pencil, Printer } from 'lucide-react';
 import {
   Button,
   Card,
@@ -23,7 +23,7 @@ import {
   toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
@@ -62,12 +62,28 @@ interface VendorCredit {
   unapplied: string;
   refundedAmount: string;
   memo: string | null;
+  refNumber?: string | null;
 }
 
 interface CreditLine {
   accountId: string;
   description: string;
   amount: string;
+  classId: string;
+  customerId: string;
+  jobId: string;
+}
+
+/** Items tab line (returned items). */
+interface ItemLine {
+  itemId: string;
+  description: string;
+  quantity: string;
+  unitCost: string;
+  amount: string;
+  classId: string;
+  customerId: string;
+  jobId: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +104,17 @@ function statusLabel(status: VendorCredit['status']): string {
   return 'Void';
 }
 
-const EMPTY_LINE: CreditLine = { accountId: '', description: '', amount: '' };
+const EMPTY_LINE: CreditLine = { accountId: '', description: '', amount: '', classId: '', customerId: '', jobId: '' };
+const EMPTY_ITEM_LINE: ItemLine = {
+  itemId: '',
+  description: '',
+  quantity: '',
+  unitCost: '',
+  amount: '',
+  classId: '',
+  customerId: '',
+  jobId: '',
+};
 
 // ---------------------------------------------------------------------------
 // New Vendor Credit Modal
@@ -104,42 +130,105 @@ interface NewCreditModalProps {
   editId?: string | null;
 }
 
+interface Named {
+  id: string;
+  name?: string;
+  displayName?: string;
+  type?: string;
+  customerId?: string | null;
+  purchaseCost?: string | null;
+  averageCost?: string | null;
+}
+
+interface SavedLine {
+  accountId: string;
+  itemId: string | null;
+  quantity: string | null;
+  unitCost: string | null;
+  description: string | null;
+  amount: string;
+  classId: string | null;
+  customerId: string | null;
+  jobId: string | null;
+}
+
+/** QB Enter Bills (Credit): Expenses and Items tabs, Ref. No., Class and Customer:Job per line. */
 function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }: NewCreditModalProps) {
   const [vendorId, setVendorId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [refNumber, setRefNumber] = useState('');
   const [memo, setMemo] = useState('');
+  const [tab, setTab] = useState<'expenses' | 'items'>('expenses');
   const [lines, setLines] = useState<CreditLine[]>([{ ...EMPTY_LINE }]);
+  const [itemLines, setItemLines] = useState<ItemLine[]>([{ ...EMPTY_ITEM_LINE }]);
   const [saving, setSaving] = useState(false);
-
   const [loadingEdit, setLoadingEdit] = useState(false);
+  const [itemList, setItemList] = useState<Named[]>([]);
+  const [classList, setClassList] = useState<Named[]>([]);
+  const [customerList, setCustomerList] = useState<Named[]>([]);
+  const [jobList, setJobList] = useState<Named[]>([]);
+
+  // Lists for the Items tab and the Class / Customer:Job columns.
+  useEffect(() => {
+    if (!open) return;
+    const soft = <T,>(p: Promise<T>, fb: T) => p.catch(() => fb);
+    Promise.all([
+      soft(api.get<Named[]>('/api/items'), []),
+      soft(api.get<Named[]>('/api/classes'), []),
+      soft(api.get<Named[]>('/api/customers'), []),
+      soft(api.get<Named[]>('/api/jobs'), []),
+    ]).then(([it, cl, cu, jb]) => {
+      setItemList(Array.isArray(it) ? it.filter((i) => !['subtotal', 'discount', 'payment', 'sales_tax', 'group'].includes(i.type ?? '')) : []);
+      setClassList(Array.isArray(cl) ? cl : []);
+      setCustomerList(Array.isArray(cu) ? cu : []);
+      setJobList(Array.isArray(jb) ? jb : []);
+    });
+  }, [open]);
 
   // Reset on open (or load the saved credit when editing).
   useEffect(() => {
     if (!open) return;
     setVendorId('');
     setDate(new Date().toISOString().slice(0, 10));
+    setRefNumber('');
     setMemo('');
+    setTab('expenses');
     setLines([{ ...EMPTY_LINE }]);
+    setItemLines([{ ...EMPTY_ITEM_LINE }]);
     if (!editId) return;
     let cancelled = false;
     setLoadingEdit(true);
     api
-      .get<{
-        vendorId: string;
-        date: string;
-        memo: string | null;
-        lines: Array<{ accountId: string; description: string | null; amount: string }>;
-      }>(`/api/vendor-credits/${editId}`)
+      .get<{ vendorId: string; date: string; memo: string | null; refNumber: string | null; lines: SavedLine[] }>(
+        `/api/vendor-credits/${editId}`,
+      )
       .then((c) => {
         if (cancelled) return;
         setVendorId(c.vendorId);
         setDate(String(c.date).slice(0, 10));
         setMemo(c.memo ?? '');
+        setRefNumber(c.refNumber ?? '');
+        const dims = (l: SavedLine) => ({ classId: l.classId ?? '', customerId: l.customerId ?? '', jobId: l.jobId ?? '' });
+        const exp = c.lines.filter((l) => !l.itemId);
+        const its = c.lines.filter((l) => l.itemId);
         setLines(
-          c.lines.length > 0
-            ? c.lines.map((l) => ({ accountId: l.accountId, description: l.description ?? '', amount: l.amount }))
+          exp.length > 0
+            ? exp.map((l) => ({ accountId: l.accountId, description: l.description ?? '', amount: l.amount, ...dims(l) }))
             : [{ ...EMPTY_LINE }],
         );
+        setItemLines(
+          its.length > 0
+            ? its.map((l) => ({
+                itemId: l.itemId ?? '',
+                description: l.description ?? '',
+                quantity: l.quantity ? String(Number(l.quantity)) : '',
+                unitCost: l.unitCost ? String(Number(l.unitCost)) : '',
+                amount: l.amount,
+                ...dims(l),
+              }))
+            : [{ ...EMPTY_ITEM_LINE }],
+        );
+        if (exp.length === 0 && its.length > 0) setTab('items');
       })
       .catch((err) => {
         toastError(err, 'Could not load this vendor credit.');
@@ -153,46 +242,79 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
   }, [open, editId]);
 
   function updateLine(idx: number, field: keyof CreditLine, value: string) {
-    setLines((prev) => {
-      const next = [...prev];
-      next[idx] = { ...next[idx], [field]: value };
-      return next;
-    });
+    setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, [field]: value, ...(field === 'customerId' ? { jobId: '' } : {}) } : l)));
   }
 
-  function addLine() {
-    setLines((prev) => [...prev, { ...EMPTY_LINE }]);
+  function updateItemLine(idx: number, field: keyof ItemLine, value: string) {
+    setItemLines((prev) =>
+      prev.map((l, i) => {
+        if (i !== idx) return l;
+        const next: ItemLine = { ...l, [field]: value, ...(field === 'customerId' ? { jobId: '' } : {}) };
+        if (field === 'itemId') {
+          const it = itemList.find((x) => x.id === value);
+          next.unitCost = it?.purchaseCost ? String(Number(it.purchaseCost)) : next.unitCost;
+          if (!next.description) next.description = it?.name ?? '';
+        }
+        if (field === 'itemId' || field === 'quantity' || field === 'unitCost') {
+          const q = parseFloat(next.quantity);
+          const c = parseFloat(next.unitCost);
+          if (!isNaN(q) && !isNaN(c)) next.amount = (Math.round(q * c * 100) / 100).toFixed(2);
+        }
+        return next;
+      }),
+    );
   }
 
-  function removeLine(idx: number) {
-    setLines((prev) => prev.filter((_, i) => i !== idx));
-  }
-
-  const liveTotal = lines.reduce((sum, l) => sum + (parseFloat(l.amount) || 0), 0);
+  const expenseLinesFilled = lines.filter((l) => l.accountId && l.amount);
+  const itemLinesFilled = itemLines.filter((l) => l.itemId && l.quantity);
+  const liveTotal = Money.add(
+    ...expenseLinesFilled.map((l) => l.amount || 0),
+    ...itemLinesFilled.map((l) => l.amount || 0),
+  );
 
   async function handleSubmit() {
     if (!vendorId) { toast('Please select a vendor.', 'danger'); return; }
     if (!date) { toast('Please enter a date.', 'danger'); return; }
-    const validLines = lines.filter((l) => l.accountId && l.amount);
-    if (validLines.length === 0) { toast('Add at least one line with an account and amount.', 'danger'); return; }
-    for (let i = 0; i < validLines.length; i++) {
-      const l = validLines[i];
-      if (parseFloat(l.amount) <= 0) {
-        toast(`Line ${i + 1}: amount must be greater than zero.`, 'danger'); return;
-      }
+    if (expenseLinesFilled.length + itemLinesFilled.length === 0) {
+      toast('Add at least one expense line (account and amount) or item line (item and quantity).', 'danger');
+      return;
     }
+    for (const [i, l] of expenseLinesFilled.entries()) {
+      if (!(parseFloat(l.amount) > 0)) { toast(`Expenses line ${i + 1}: amount must be greater than zero.`, 'danger'); return; }
+    }
+    for (const [i, l] of itemLinesFilled.entries()) {
+      if (!(parseFloat(l.quantity) > 0)) { toast(`Items line ${i + 1}: enter the quantity returned.`, 'danger'); return; }
+      if (!(parseFloat(l.amount) > 0)) { toast(`Items line ${i + 1}: enter the cost or amount.`, 'danger'); return; }
+    }
+    const dims = (l: { classId: string; customerId: string; jobId: string }) => ({
+      classId: l.classId || null,
+      customerId: l.customerId || null,
+      jobId: l.jobId || null,
+    });
 
     setSaving(true);
     try {
       const body = {
         vendorId,
         date,
+        refNumber: refNumber.trim() || null,
         memo: memo || null,
-        lines: validLines.map((l) => ({
-          accountId: l.accountId,
-          description: l.description || null,
-          amount: l.amount,
-        })),
+        lines: [
+          ...expenseLinesFilled.map((l) => ({
+            accountId: l.accountId,
+            description: l.description || null,
+            amount: l.amount,
+            ...dims(l),
+          })),
+          ...itemLinesFilled.map((l) => ({
+            itemId: l.itemId,
+            quantity: l.quantity,
+            unitCost: l.unitCost || null,
+            amount: l.amount || null,
+            description: l.description || null,
+            ...dims(l),
+          })),
+        ],
       };
       if (editId) {
         await api.patch(`/api/vendor-credits/${editId}`, body);
@@ -212,8 +334,43 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
 
   // Show only expense/asset accounts for credit lines (the accounts that get credited).
   const eligibleAccounts = accounts.filter(
-    (a) => a.type === 'expense' || a.type === 'asset',
+    (a) =>
+      (a.type === 'expense' || a.type === 'asset') &&
+      a.subtype !== 'accounts_receivable',
   );
+
+  const dimCells = (
+    l: { classId: string; customerId: string; jobId: string },
+    set: (f: 'classId' | 'customerId' | 'jobId', v: string) => void,
+  ) => {
+    const jobs = l.customerId ? jobList.filter((j) => !j.customerId || j.customerId === l.customerId) : [];
+    return (
+      <>
+        <Select aria-label="Class" value={l.classId} onChange={(e) => set('classId', e.target.value)}>
+          <option value="">Class</option>
+          {classList.map((c) => (
+            <option key={c.id} value={c.id}>{c.name}</option>
+          ))}
+        </Select>
+        <div className="flex gap-1">
+          <Select aria-label="Customer:Job" value={l.customerId} onChange={(e) => set('customerId', e.target.value)}>
+            <option value="">Customer:Job</option>
+            {customerList.map((c) => (
+              <option key={c.id} value={c.id}>{c.displayName ?? c.name}</option>
+            ))}
+          </Select>
+          {jobs.length > 0 && (
+            <Select aria-label="Job" value={l.jobId} onChange={(e) => set('jobId', e.target.value)}>
+              <option value="">Job</option>
+              {jobs.map((j) => (
+                <option key={j.id} value={j.id}>{j.name}</option>
+              ))}
+            </Select>
+          )}
+        </div>
+      </>
+    );
+  };
 
   return (
     <Modal
@@ -235,8 +392,8 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
       <div className="space-y-4">
         {editId && (
           <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-            Changing amounts is only possible while none of the credit is applied or refunded — memo
-            and descriptions can always be changed.
+            Changing amounts, items or quantities is only possible while none of the credit is applied or
+            refunded — memo, Ref. No. and descriptions can always be changed.
           </div>
         )}
         {loadingEdit && (
@@ -244,29 +401,26 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
             <Spinner className="h-4 w-4" /> Loading credit…
           </div>
         )}
-        {/* Vendor */}
-        <div>
-          <Label htmlFor="vc-vendor">Vendor *</Label>
-          <Select id="vc-vendor" autoFocus value={vendorId} onChange={(e) => setVendorId(e.target.value)}>
-            <option value="">Select a vendor…</option>
-            {vendors.map((v) => (
-              <option key={v.id} value={v.id}>{v.displayName}</option>
-            ))}
-          </Select>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div>
+            <Label htmlFor="vc-vendor">Vendor *</Label>
+            <Select id="vc-vendor" autoFocus value={vendorId} onChange={(e) => setVendorId(e.target.value)}>
+              <option value="">Select a vendor…</option>
+              {vendors.map((v) => (
+                <option key={v.id} value={v.id}>{v.displayName}</option>
+              ))}
+            </Select>
+          </div>
+          <div>
+            <Label htmlFor="vc-date">Credit Date *</Label>
+            <Input id="vc-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </div>
+          <div>
+            <Label htmlFor="vc-ref">Ref. No.</Label>
+            <Input id="vc-ref" placeholder="Vendor's credit memo #" value={refNumber} onChange={(e) => setRefNumber(e.target.value)} />
+          </div>
         </div>
 
-        {/* Date */}
-        <div>
-          <Label htmlFor="vc-date">Credit Date *</Label>
-          <Input
-            id="vc-date"
-            type="date"
-            value={date}
-            onChange={(e) => setDate(e.target.value)}
-          />
-        </div>
-
-        {/* Memo */}
         <div>
           <Label htmlFor="vc-memo">Memo</Label>
           <Input
@@ -277,72 +431,126 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
           />
         </div>
 
-        {/* Line items */}
+        {/* Expenses / Items tabs */}
         <div>
           <div className="flex items-center justify-between mb-2">
-            <Label className="mb-0">Credit Lines</Label>
-            <Button type="button" variant="ghost" size="sm" onClick={addLine}>
+            <div className="flex gap-1" role="tablist">
+              {(['expenses', 'items'] as const).map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  role="tab"
+                  aria-selected={tab === t}
+                  onClick={() => setTab(t)}
+                  className={`rounded-md px-3 py-1 text-sm font-semibold ${tab === t ? 'bg-electric text-white' : 'text-navy/60 hover:bg-navy/5'}`}
+                >
+                  {t === 'expenses'
+                    ? `Expenses ${formatCurrency(Money.add(...expenseLinesFilled.map((l) => l.amount || 0)))}`
+                    : `Items ${formatCurrency(Money.add(...itemLinesFilled.map((l) => l.amount || 0)))}`}
+                </button>
+              ))}
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                tab === 'expenses'
+                  ? setLines((p) => [...p, { ...EMPTY_LINE }])
+                  : setItemLines((p) => [...p, { ...EMPTY_ITEM_LINE }])
+              }
+            >
               <PlusCircle className="h-4 w-4" /> Add line
             </Button>
           </div>
 
-          <div className="rounded-lg border border-slate-200 overflow-hidden">
-            <div className="grid grid-cols-[1fr_1fr_100px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
-              <span>Account</span>
-              <span>Description</span>
-              <span>Amount</span>
-              <span />
-            </div>
-
-            {lines.map((line, idx) => (
-              <div
-                key={idx}
-                className="grid grid-cols-[1fr_1fr_100px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
-              >
-                <Select
-                  value={line.accountId}
-                  onChange={(e) => updateLine(idx, 'accountId', e.target.value)}
-                >
-                  <option value="">Select account…</option>
-                  {eligibleAccounts.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.code} — {a.name}
-                    </option>
-                  ))}
-                </Select>
-                <Input
-                  placeholder="Description"
-                  value={line.description}
-                  onChange={(e) => updateLine(idx, 'description', e.target.value)}
-                />
-                <Input
-                  placeholder="0.00"
-                  type="number"
-                  min="0.01"
-                  step="0.01"
-                  value={line.amount}
-                  onChange={(e) => updateLine(idx, 'amount', e.target.value)}
-                />
-                <button
-                  type="button"
-                  onClick={() => removeLine(idx)}
-                  disabled={lines.length === 1}
-                  className="text-navy/30 hover:text-red-500 disabled:opacity-20 transition-colors flex items-center justify-center"
-                  aria-label="Remove line"
-                >
-                  <MinusCircle className="h-4 w-4" />
-                </button>
+          {tab === 'expenses' ? (
+            <div className="rounded-lg border border-slate-200 overflow-x-auto">
+              <div className="grid min-w-[760px] grid-cols-[1.3fr_1fr_90px_1fr_1.3fr_28px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+                <span>Account</span>
+                <span>Memo</span>
+                <span>Amount</span>
+                <span>Class</span>
+                <span>Customer:Job</span>
+                <span />
               </div>
-            ))}
-          </div>
+              {lines.map((line, idx) => (
+                <div
+                  key={idx}
+                  className="grid min-w-[760px] grid-cols-[1.3fr_1fr_90px_1fr_1.3fr_28px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
+                >
+                  <Select aria-label="Account" value={line.accountId} onChange={(e) => updateLine(idx, 'accountId', e.target.value)}>
+                    <option value="">Select account…</option>
+                    {eligibleAccounts.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.code} — {a.name}
+                      </option>
+                    ))}
+                  </Select>
+                  <Input placeholder="Description" value={line.description} onChange={(e) => updateLine(idx, 'description', e.target.value)} />
+                  <Input placeholder="0.00" type="number" min="0.01" step="0.01" value={line.amount} onChange={(e) => updateLine(idx, 'amount', e.target.value)} />
+                  {dimCells(line, (f, v) => updateLine(idx, f, v))}
+                  <button
+                    type="button"
+                    onClick={() => setLines((p) => (p.length === 1 ? [{ ...EMPTY_LINE }] : p.filter((_, i) => i !== idx)))}
+                    className="text-navy/30 hover:text-red-500 transition-colors flex items-center justify-center"
+                    aria-label="Remove line"
+                  >
+                    <MinusCircle className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-200 overflow-x-auto">
+              <div className="grid min-w-[880px] grid-cols-[1.3fr_1fr_70px_80px_90px_1fr_1.3fr_28px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+                <span>Item</span>
+                <span>Description</span>
+                <span>Qty</span>
+                <span>Cost</span>
+                <span>Amount</span>
+                <span>Class</span>
+                <span>Customer:Job</span>
+                <span />
+              </div>
+              {itemLines.map((line, idx) => (
+                <div
+                  key={idx}
+                  className="grid min-w-[880px] grid-cols-[1.3fr_1fr_70px_80px_90px_1fr_1.3fr_28px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
+                >
+                  <Select aria-label="Item" value={line.itemId} onChange={(e) => updateItemLine(idx, 'itemId', e.target.value)}>
+                    <option value="">Select item…</option>
+                    {itemList.map((it) => (
+                      <option key={it.id} value={it.id}>{it.name}</option>
+                    ))}
+                  </Select>
+                  <Input placeholder="Description" value={line.description} onChange={(e) => updateItemLine(idx, 'description', e.target.value)} />
+                  <Input aria-label="Quantity" type="number" min="0" step="any" value={line.quantity} onChange={(e) => updateItemLine(idx, 'quantity', e.target.value)} />
+                  <Input aria-label="Cost" type="number" min="0" step="any" value={line.unitCost} onChange={(e) => updateItemLine(idx, 'unitCost', e.target.value)} />
+                  <Input aria-label="Amount" type="number" min="0.01" step="0.01" value={line.amount} onChange={(e) => updateItemLine(idx, 'amount', e.target.value)} />
+                  {dimCells(line, (f, v) => updateItemLine(idx, f, v))}
+                  <button
+                    type="button"
+                    onClick={() => setItemLines((p) => (p.length === 1 ? [{ ...EMPTY_ITEM_LINE }] : p.filter((_, i) => i !== idx)))}
+                    className="text-navy/30 hover:text-red-500 transition-colors flex items-center justify-center"
+                    aria-label="Remove line"
+                  >
+                    <MinusCircle className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+              <p className="px-3 py-2 text-xs text-navy/50">
+                Returned inventory leaves stock at its current cost. If the vendor credits a different amount, the
+                difference goes to Cost of Goods Sold.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Live total */}
         <div className="flex items-center justify-between rounded-lg bg-navy/5 px-4 py-3">
           <span className="text-sm font-semibold text-navy/70">Credit Total</span>
-          <span className="text-lg font-bold text-navy tabular-nums">
-            {formatCurrency(liveTotal.toFixed(2))}
-          </span>
+          <span className="text-lg font-bold text-navy tabular-nums">{formatCurrency(liveTotal)}</span>
         </div>
       </div>
     </Modal>
@@ -678,6 +886,7 @@ export default function VendorCreditsPage() {
               <Tr>
                 <Th>Vendor</Th>
                 <Th>Date</Th>
+                <Th>Ref. No.</Th>
                 <Th>Memo</Th>
                 <Th numeric>Total</Th>
                 <Th numeric>Unapplied</Th>
@@ -692,6 +901,7 @@ export default function VendorCreditsPage() {
                     {vendorMap[c.vendorId] ?? '—'}
                   </Td>
                   <Td className="text-navy/70">{c.date ? formatDate(c.date, 'MMM d, yyyy') : '—'}</Td>
+                  <Td className="text-navy/70">{c.refNumber ?? '—'}</Td>
                   <Td className="text-navy/60 text-sm truncate max-w-[200px]">
                     {c.memo ?? '—'}
                   </Td>
@@ -706,6 +916,11 @@ export default function VendorCreditsPage() {
                   </Td>
                   <Td className="text-right">
                     <span className="inline-flex items-center gap-1">
+                      <a href={`/api/vendor-credits/${c.id}/pdf`} target="_blank" rel="noreferrer">
+                        <Button variant="ghost" size="sm" title="Print credit">
+                          <Printer className="h-3.5 w-3.5" /> Print
+                        </Button>
+                      </a>
                       {c.status !== 'void' && c.status !== 'closed' && (
                         <Button
                           variant="ghost"

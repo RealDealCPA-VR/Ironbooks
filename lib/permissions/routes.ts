@@ -326,6 +326,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/bill-payments/journal-items': r('vendors', 'GET POST:modify'),
   '/api/vendor-credits': r('vendors', 'GET POST'),
   '/api/vendor-credits/[id]': r('vendors', 'GET POST:modify PATCH DELETE'),
+  '/api/vendor-credits/[id]/pdf': r('vendors', 'GET:print'), // p1 purchases
   '/api/purchase-orders': r('vendors', 'GET POST'),
   '/api/purchase-orders/[id]': r('vendors', 'GET POST:modify PATCH'),
   '/api/purchase-orders/[id]/pdf': r('vendors', 'GET:print'),
