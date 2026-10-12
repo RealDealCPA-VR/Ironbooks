@@ -47,6 +47,7 @@ import {
 import { markExpensePrinted } from './expenses';
 import { markBillPaymentPrinted } from './billPayments';
 import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { assertClosedPeriodEdit } from './postedEdit';
 
 export type PrintSource = 'expense' | 'bill_payment' | 'paycheck';
 export const PRINT_SOURCES: PrintSource[] = ['expense', 'bill_payment', 'paycheck'];
@@ -229,6 +230,7 @@ export async function markPaycheckPrinted(
     allowDuplicate: input.allowDuplicateNumber,
   });
   return inTransaction(ctx, async (tx) => {
+    await assertClosedPeriodEdit(tx, { entryId: pc.postedEntryId, what: 'check number', date: pc.payDate });
     const [updated] = await tx.db
       .update(paychecks)
       .set({ toPrint: false, checkNumber })

@@ -310,7 +310,7 @@ const VERSIONED_POST_ACTIONS = new Set(['void', 'close', 'status']);
 
 function versionFor(method: string, url: string, body?: unknown): string | undefined {
   if (method === 'POST') {
-    const action = isRec(body) ? body.action : undefined;
+    const action = isRec(body) ? (body as { action?: unknown }).action : undefined;
     if (typeof action !== 'string' || !VERSIONED_POST_ACTIONS.has(action)) return undefined;
   }
   const path = pathOf(url).replace(/\/$/, '');

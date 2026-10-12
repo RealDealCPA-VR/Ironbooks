@@ -744,6 +744,7 @@ export async function markBillPaymentPrinted(
   });
 
   return inTransaction(ctx, async (tx) => {
+    await assertClosedPeriodEdit(tx, { entryId: payment.postedEntryId, what: 'check number', date: payment.date });
     const [updated] = await tx.db
       .update(billPayments)
       .set({ toPrint: false, reference: checkNumber })
