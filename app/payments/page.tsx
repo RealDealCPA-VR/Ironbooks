@@ -123,10 +123,22 @@ interface PaymentDetail extends Payment {
   memo: string | null;
   applications: Array<{ invoiceId: string; amountApplied: string; discountAmount: string }>;
   credits: Array<{ id: string; creditMemoId: string; invoiceId: string; amount: string }>;
+  /** I11: General Journal charges this payment paid / journal credits applied with it. */
+  journalApplications?: Array<{ kind: string; journalLineId: string; invoiceId: string | null; amount: string }>;
+}
+
+/** I11: an open General Journal A/R line (a charge to pay, or a credit to apply). */
+interface JournalOpenRow {
+  journalLineId: string;
+  ref: string;
+  date: string;
+  memo: string | null;
+  open: string;
 }
 
 interface AvailableCredit {
-  kind: 'credit_memo' | 'payment';
+  /** 'journal_entry' = a General Journal A/R credit (id is the journal line). */
+  kind: 'credit_memo' | 'payment' | 'journal_entry';
   id: string;
   ref: string;
   date: string;
@@ -175,6 +187,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   // credit memo id -> { invoiceId, amount }
   const [credits, setCredits] = useState<AvailableCredit[]>([]);
   const [creditUse, setCreditUse] = useState<Record<string, { invoiceId: string; amount: string }>>({});
+  // I11: open General Journal charges (journal line id -> cash applied).
+  const [journalCharges, setJournalCharges] = useState<JournalOpenRow[]>([]);
+  const [journalAmounts, setJournalAmounts] = useState<Record<string, string>>({});
 
   const [saving, setSaving] = useState(false);
 
@@ -208,6 +223,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     setDiscountAmounts({});
     setCredits([]);
     setCreditUse({});
+    setJournalCharges([]);
+    setJournalAmounts({});
     // Preferences > Payments auto-apply / auto-calculate never overwrite an edited payment's amounts.
     setAmountTouched(!!editing);
     setAppsTouched(!!editing);
@@ -226,6 +243,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     if (!open || !customerId) {
       setInvoices([]);
       setCredits([]);
+      setJournalCharges([]);
       return;
     }
     setInvoicesLoading(true);
@@ -233,8 +251,26 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     Promise.all([
       api.get<Invoice[] | { invoices?: Invoice[] }>(`/api/invoices?customerId=${customerId}`),
       api.get<{ credits: AvailableCredit[] }>(`/api/payments/credits?customerId=${customerId}`),
+      api.get<{ charges: JournalOpenRow[]; credits: JournalOpenRow[] }>(`/api/payments/journal-items?customerId=${customerId}`),
     ])
-      .then(([rows, cred]) => {
+      .then(([rows, cred, journal]) => {
+        // I11: General Journal charges, with what this payment already paid handed back when editing.
+        const myJournal = mine?.journalApplications ?? [];
+        const paidByMe = new Map<string, number>();
+        for (const j of myJournal.filter((j) => j.kind === 'payment')) {
+          paidByMe.set(j.journalLineId, (paidByMe.get(j.journalLineId) ?? 0) + Number(j.amount));
+        }
+        const charges = (journal.charges ?? []).map((c) => ({
+          ...c,
+          open: (Number(c.open) + (paidByMe.get(c.journalLineId) ?? 0)).toFixed(2),
+        }));
+        for (const [lineId, amt] of paidByMe) {
+          if (!charges.some((c) => c.journalLineId === lineId)) {
+            charges.push({ journalLineId: lineId, ref: 'General Journal', date: '', memo: null, open: amt.toFixed(2) });
+          }
+        }
+        setJournalCharges(charges);
+        setJournalAmounts(mine ? Object.fromEntries([...paidByMe].map(([id, amt]) => [id, String(amt)])) : {});
         const list = Array.isArray(rows) ? rows : (rows.invoices ?? []);
         // While editing, this payment's own applications are handed back to each invoice.
         const giveBack = new Map<string, number>();
@@ -244,24 +280,46 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         for (const c of mine?.credits ?? []) {
           giveBack.set(c.invoiceId, (giveBack.get(c.invoiceId) ?? 0) + Number(c.amount));
         }
+        for (const j of myJournal.filter((j) => j.kind === 'invoice_credit' && j.invoiceId)) {
+          giveBack.set(j.invoiceId!, (giveBack.get(j.invoiceId!) ?? 0) + Number(j.amount));
+        }
         const open = list
           .map((inv) => ({ ...inv, balanceDue: (Number(inv.balanceDue) + (giveBack.get(inv.id) ?? 0)).toFixed(2) }))
           .filter((inv) => inv.status !== 'void' && inv.status !== 'draft' && Number(inv.balanceDue) > 0);
         setInvoices(open);
         // Earlier unapplied payments can be used on a NEW payment only (not while editing).
-        const memoCredits = (cred.credits ?? []).filter((c) => c.kind === 'credit_memo' || (!mine && c.kind === 'payment'));
+        const memoCredits = (cred.credits ?? []).filter(
+          (c) => c.kind === 'credit_memo' || c.kind === 'journal_entry' || (!mine && c.kind === 'payment'),
+        );
         // Add back credit used by this payment so it can be re-applied when editing.
         const usedByMe = new Map<string, number>();
         for (const c of mine?.credits ?? []) usedByMe.set(c.creditMemoId, (usedByMe.get(c.creditMemoId) ?? 0) + Number(c.amount));
-        const merged = memoCredits.map((c) => ({ ...c, available: (Number(c.available) + (usedByMe.get(c.id) ?? 0)).toFixed(2) }));
+        const journalUsedByMe = new Map<string, number>();
+        for (const j of myJournal.filter((j) => j.kind === 'invoice_credit')) {
+          journalUsedByMe.set(j.journalLineId, (journalUsedByMe.get(j.journalLineId) ?? 0) + Number(j.amount));
+        }
+        const merged = memoCredits.map((c) => ({
+          ...c,
+          available: (Number(c.available) + ((c.kind === 'journal_entry' ? journalUsedByMe : usedByMe).get(c.id) ?? 0)).toFixed(2),
+        }));
         for (const [id, amt] of usedByMe) {
           if (!merged.some((c) => c.id === id)) merged.push({ kind: 'credit_memo', id, ref: 'Credit memo', date: '', available: amt.toFixed(2) });
+        }
+        for (const [id, amt] of journalUsedByMe) {
+          if (!merged.some((c) => c.id === id)) merged.push({ kind: 'journal_entry', id, ref: 'General Journal credit', date: '', available: amt.toFixed(2) });
         }
         setCredits(merged);
         if (mine) {
           setApplicationAmounts(Object.fromEntries(mine.applications.filter((a) => Number(a.amountApplied) > 0).map((a) => [a.invoiceId, String(Number(a.amountApplied))])));
           setDiscountAmounts(Object.fromEntries(mine.applications.filter((a) => Number(a.discountAmount) > 0).map((a) => [a.invoiceId, String(Number(a.discountAmount))])));
-          setCreditUse(Object.fromEntries(mine.credits.map((c) => [c.creditMemoId, { invoiceId: c.invoiceId, amount: String(Number(c.amount)) }])));
+          setCreditUse(
+            Object.fromEntries([
+              ...mine.credits.map((c) => [c.creditMemoId, { invoiceId: c.invoiceId, amount: String(Number(c.amount)) }] as const),
+              ...myJournal
+                .filter((j) => j.kind === 'invoice_credit' && j.invoiceId)
+                .map((j) => [j.journalLineId, { invoiceId: j.invoiceId!, amount: String(Number(j.amount)) }] as const),
+            ]),
+          );
         } else {
           // Preferences > Payments: "Automatically apply payments" (oldest due first).
           setAppsTouched(false);
@@ -317,16 +375,26 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     }))
     .filter((a) => Number(a.amountApplied) > 0 || Number(a.discountAmount ?? 0) > 0);
   const paymentCreditIds = new Set(credits.filter((c) => c.kind === 'payment').map((c) => c.id));
+  const journalCreditIds = new Set(credits.filter((c) => c.kind === 'journal_entry').map((c) => c.id));
   const usedCredits = Object.entries(creditUse).filter(([, u]) => u.invoiceId && Number(u.amount) > 0);
   const creditApps = usedCredits
-    .filter(([id]) => !paymentCreditIds.has(id))
+    .filter(([id]) => !paymentCreditIds.has(id) && !journalCreditIds.has(id))
     .map(([creditMemoId, u]) => ({ creditMemoId, invoiceId: u.invoiceId, amount: u.amount }));
   const paymentCreditApps = usedCredits
     .filter(([id]) => paymentCreditIds.has(id))
     .map(([paymentId, u]) => ({ paymentId, invoiceId: u.invoiceId, amount: u.amount }));
-  const allCreditApps = [...creditApps, ...paymentCreditApps];
+  // I11: General Journal A/R credits applied to invoices.
+  const journalCreditApps = usedCredits
+    .filter(([id]) => journalCreditIds.has(id))
+    .map(([journalLineId, u]) => ({ journalLineId, invoiceId: u.invoiceId, amount: u.amount }));
+  const allCreditApps = [...creditApps, ...paymentCreditApps, ...journalCreditApps];
+  // I11: cash applied to General Journal charges.
+  const journalItems = journalCharges
+    .filter((c) => Number(journalAmounts[c.journalLineId] || 0) > 0)
+    .map((c) => ({ journalLineId: c.journalLineId, amount: journalAmounts[c.journalLineId] }));
 
-  const appliedTotal = applications.reduce((s, a) => s + Number(a.amountApplied), 0);
+  const appliedTotal =
+    applications.reduce((s, a) => s + Number(a.amountApplied), 0) + journalItems.reduce((s, j) => s + Number(j.amount), 0);
   const discountTotal = applications.reduce((s, a) => s + Number(a.discountAmount ?? 0), 0);
   const creditTotal = allCreditApps.reduce((s, c) => s + Number(c.amount), 0);
   const anyDiscount = discountTotal > 0;
@@ -342,8 +410,19 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       if (take > 0) next[inv.id] = take.toFixed(2);
       left -= take;
     }
+    // Then the General Journal charges (I11), oldest first.
+    const nextJournal: Record<string, string> = {};
+    for (const c of journalCharges) {
+      const take = amount ? Math.min(Number(c.open), Math.max(0, left)) : Number(c.open);
+      if (take > 0) nextJournal[c.journalLineId] = take.toFixed(2);
+      left -= take;
+    }
     setApplicationAmounts(next);
-    if (!amount) setAmount(Object.values(next).reduce((s, v) => s + Number(v), 0).toFixed(2));
+    setJournalAmounts(nextJournal);
+    if (!amount) {
+      const all = [...Object.values(next), ...Object.values(nextJournal)];
+      setAmount(all.reduce((s, v) => s + Number(v), 0).toFixed(2));
+    }
   }
 
   async function handleSubmit() {
@@ -358,6 +437,12 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     if (appliedTotal > amt + 0.005) {
       toast('You applied more cash than you received. Lower an amount or raise the total.', 'danger');
       return;
+    }
+    for (const c of journalCharges) {
+      if (Number(journalAmounts[c.journalLineId] || 0) > Number(c.open) + 0.005) {
+        toast(`${c.ref}: the payment is more than what is still open (${formatCurrency(c.open)}).`, 'danger');
+        return;
+      }
     }
     for (const inv of invoices) {
       const cash = Number(applicationAmounts[inv.id] || 0);
@@ -385,6 +470,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       discountAccountId: anyDiscount && discountAccountId ? discountAccountId : null,
       applications,
       credits: creditApps,
+      journalItems,
+      journalCredits: journalCreditApps,
       ...(editing ? {} : { paymentCredits: paymentCreditApps }),
     };
     setSaving(true);
@@ -505,7 +592,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           <div>
             <div className="flex items-center justify-between">
               <Label>Apply to Open Invoices <Help term="ar" /></Label>
-              {invoices.length > 0 && (
+              {(invoices.length > 0 || journalCharges.length > 0) && (
                 <Button variant="ghost" size="sm" onClick={payAll}>
                   Pay all
                 </Button>
@@ -515,7 +602,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
               <div className="flex items-center gap-2 py-2 text-sm text-navy/50">
                 <Spinner className="h-4 w-4" /> Loading invoices…
               </div>
-            ) : invoices.length === 0 ? (
+            ) : invoices.length === 0 && journalCharges.length === 0 ? (
               <p className="text-sm text-navy/40 py-2 italic">No open invoices for this customer.</p>
             ) : (
               <div className="border border-slate-200 rounded-lg overflow-hidden mt-1">
@@ -567,6 +654,30 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                         </Tr>
                       );
                     })}
+                    {/* I11: General Journal charges for this customer (journal entries to A/R). */}
+                    {journalCharges.map((c) => (
+                      <Tr key={c.journalLineId}>
+                        <Td className="font-medium">
+                          {c.ref}
+                          {c.memo && <span className="block text-xs font-normal text-navy/50">{c.memo}</span>}
+                        </Td>
+                        <Td>{c.date ? formatDate(c.date) : ''}</Td>
+                        <Td numeric className="font-semibold">{formatCurrency(c.open)}</Td>
+                        <Td numeric />
+                        <Td numeric>
+                          <AmountInput
+                            placeholder="0.00"
+                            aria-label={`Payment for ${c.ref}`}
+                            value={journalAmounts[c.journalLineId] ?? ''}
+                            onChange={(e) => {
+                              setAppsTouched(true);
+                              setJournalAmounts((p) => ({ ...p, [c.journalLineId]: e.target.value }));
+                            }}
+                            className="text-right"
+                          />
+                        </Td>
+                      </Tr>
+                    ))}
                   </tbody>
                 </Table>
               </div>

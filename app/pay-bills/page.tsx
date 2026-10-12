@@ -93,7 +93,18 @@ interface BillPayment {
 
 interface PaymentDetail extends BillPayment {
   applications: Array<{ billId: string; amountApplied: string }>;
+  /** I11: General Journal amounts this payment paid / journal credits applied with it. */
+  journalApplications?: Array<{ kind: string; journalLineId: string; billId: string | null; amount: string; entryNumber: number }>;
   discountTotal: string;
+}
+
+/** I11: an open General Journal A/P line (an amount owed, or a vendor credit). */
+interface JournalOpenRow {
+  journalLineId: string;
+  ref: string;
+  date: string;
+  memo: string | null;
+  open: string;
 }
 
 interface VendorCredit {
@@ -133,6 +144,10 @@ export default function PayBillsPage() {
   const [vendorId, setVendorId] = useState('');
   const [bills, setBills] = useState<Bill[]>([]);
   const [credits, setCredits] = useState<VendorCredit[]>([]);
+  // I11: General Journal amounts owed to the vendor (payable here) and journal vendor credits.
+  const [journalPayables, setJournalPayables] = useState<JournalOpenRow[]>([]);
+  const [journalCredits, setJournalCredits] = useState<JournalOpenRow[]>([]);
+  const [journalPay, setJournalPay] = useState<Record<string, string>>({});
   const [rows, setRows] = useState<Record<string, RowState>>({});
   const [loadingBills, setLoadingBills] = useState(false);
 
@@ -190,6 +205,9 @@ export default function PayBillsPage() {
       setBills([]);
       setCredits([]);
       setRows({});
+      setJournalPayables([]);
+      setJournalCredits([]);
+      setJournalPay({});
       return;
     }
     setLoadingBills(true);
@@ -197,11 +215,17 @@ export default function PayBillsPage() {
       const qs = new URLSearchParams({ vendorId: vid, asOf: date });
       if (dueFilterOn && dueOnOrBefore) qs.set('dueOnOrBefore', dueOnOrBefore);
       if (discountOnly) qs.set('discountOnly', 'true');
-      const [billData, creditData, payData] = await Promise.all([
+      const [billData, creditData, payData, journalData] = await Promise.all([
         api.get<{ bills: Bill[] }>(`/api/bills/to-pay?${qs.toString()}`),
         api.get<VendorCredit[]>(`/api/vendor-credits?vendorId=${vid}`),
         api.get<{ payments: BillPayment[] }>(`/api/bill-payments?vendorId=${vid}&limit=10`).catch(() => ({ payments: [] })),
+        api
+          .get<{ charges: JournalOpenRow[]; credits: JournalOpenRow[] }>(`/api/bill-payments/journal-items?vendorId=${vid}`)
+          .catch(() => ({ charges: [], credits: [] })),
       ]);
+      setJournalPayables(journalData.charges ?? []);
+      setJournalCredits(journalData.credits ?? []);
+      setJournalPay({});
       setPayments(payData.payments.filter((p) => !p.voidedAt));
       const open = billData.bills.filter(
         (b) => (b.status === 'open' || b.status === 'partial') && Number(b.balanceDue) > 0,
@@ -234,10 +258,17 @@ export default function PayBillsPage() {
 
   const discountAccounts = accounts.filter((a) => a.type === 'revenue' || a.type === 'expense');
 
-  const availableCredit = credits.reduce((s, c) => s + Number(c.unapplied), 0);
+  const availableCredit =
+    credits.reduce((s, c) => s + Number(c.unapplied), 0) + journalCredits.reduce((s, c) => s + Number(c.open), 0);
 
   const selected = bills.filter((b) => rows[b.id]?.checked);
-  const cashTotal = selected.reduce((s, b) => s + num(rows[b.id].payAmount), 0);
+  // I11: General Journal amounts owed that are being paid.
+  const journalItems = journalPayables
+    .filter((j) => num(journalPay[j.journalLineId] ?? '') > 0)
+    .map((j) => ({ journalLineId: j.journalLineId, amount: num(journalPay[j.journalLineId]).toFixed(2) }));
+  const journalOverpaid = journalPayables.some((j) => num(journalPay[j.journalLineId] ?? '') > Number(j.open) + 0.005);
+  const journalCashTotal = journalItems.reduce((s, j) => s + Number(j.amount), 0);
+  const cashTotal = selected.reduce((s, b) => s + num(rows[b.id].payAmount), 0) + journalCashTotal;
   const discountTotal = selected.reduce((s, b) => s + num(rows[b.id].discount), 0);
   const creditTotal = selected.reduce((s, b) => s + num(rows[b.id].credit), 0);
 
@@ -288,8 +319,12 @@ export default function PayBillsPage() {
       toast('Select a vendor first.', 'danger');
       return;
     }
-    if (selected.length === 0) {
+    if (selected.length === 0 && journalItems.length === 0) {
       toast('Check at least one bill to pay.', 'danger');
+      return;
+    }
+    if (journalOverpaid) {
+      toast('A General Journal amount is more than what is still owed on it.', 'danger');
       return;
     }
     if (rowErrors.length > 0) {
@@ -315,19 +350,33 @@ export default function PayBillsPage() {
 
     setSubmitting(true);
     try {
-      // 1. Apply vendor credits per bill (greedy across open credits).
-      const pool = credits.map((c) => ({ id: c.id, remaining: Number(c.unapplied) }));
+      // 1. Apply vendor credits per bill (greedy across open credits): vendor credit documents
+      //    first, then General Journal vendor credits (I11).
+      const pool = [
+        ...credits.map((c) => ({ id: c.id, journal: false, remaining: Number(c.unapplied) })),
+        ...journalCredits.map((c) => ({ id: c.journalLineId, journal: true, remaining: Number(c.open) })),
+      ];
       for (const bill of selected) {
         let toApply = num(rows[bill.id].credit);
         for (const credit of pool) {
           if (toApply <= 0) break;
           if (credit.remaining <= 0) continue;
           const amount = Math.min(toApply, credit.remaining);
-          await api.post(`/api/vendor-credits/${credit.id}`, {
-            action: 'apply',
-            billId: bill.id,
-            amount: amount.toFixed(2),
-          });
+          if (credit.journal) {
+            await api.post('/api/bill-payments/journal-items', {
+              action: 'apply_credit',
+              journalLineId: credit.id,
+              billId: bill.id,
+              amount: amount.toFixed(2),
+              date,
+            });
+          } else {
+            await api.post(`/api/vendor-credits/${credit.id}`, {
+              action: 'apply',
+              billId: bill.id,
+              amount: amount.toFixed(2),
+            });
+          }
           credit.remaining -= amount;
           toApply -= amount;
         }
@@ -343,7 +392,7 @@ export default function PayBillsPage() {
             num(rows[b.id].discount) > 0 ? num(rows[b.id].discount).toFixed(2) : undefined,
         }));
 
-      if (applications.length > 0) {
+      if (applications.length > 0 || journalItems.length > 0) {
         const queued = method === 'check' && toPrint;
         const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
           api.post('/api/bill-payments', {
@@ -356,6 +405,7 @@ export default function PayBillsPage() {
             discountAccountId: discountTotal > 0 ? discountAccountId : undefined,
             exchangeRate: billCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
             applications,
+            journalItems,
             allowDuplicateNumber,
           }),
         );
@@ -365,9 +415,10 @@ export default function PayBillsPage() {
         }
       }
 
+      const paidCount = applications.length + journalItems.length;
       toast(
-        applications.length > 0
-          ? `Paid ${applications.length} bill${applications.length !== 1 ? 's' : ''} — ${formatCurrency(cashTotal.toFixed(2))}.`
+        paidCount > 0
+          ? `Paid ${paidCount} item${paidCount !== 1 ? 's' : ''} — ${formatCurrency(cashTotal.toFixed(2))}.`
           : 'Vendor credits applied.',
         'success',
       );
@@ -416,7 +467,15 @@ export default function PayBillsPage() {
     const applications = Object.entries(editAmounts)
       .filter(([, v]) => num(v) > 0)
       .map(([billId, v]) => ({ billId, amountApplied: num(v).toFixed(2) }));
-    if (applications.length === 0) {
+    // I11: General Journal amounts this payment paid (and journal credits applied with it) are kept.
+    const editJournal = editPay.journalApplications ?? [];
+    const keptJournalItems = editJournal
+      .filter((j) => j.kind === 'bill_payment')
+      .map((j) => ({ journalLineId: j.journalLineId, amount: Number(j.amount).toFixed(2) }));
+    const keptJournalCredits = editJournal
+      .filter((j) => j.kind === 'bill_credit' && j.billId)
+      .map((j) => ({ journalLineId: j.journalLineId, billId: j.billId!, amount: Number(j.amount).toFixed(2) }));
+    if (applications.length === 0 && keptJournalItems.length === 0) {
       toast('Enter an amount for at least one bill (or void the payment).', 'danger');
       return;
     }
@@ -432,6 +491,8 @@ export default function PayBillsPage() {
           paymentAccountId: editAccount,
           exchangeRate: editPay.currency && editPay.exchangeRate ? editPay.exchangeRate : undefined,
           applications,
+          journalItems: keptJournalItems,
+          journalCredits: keptJournalCredits,
           allowDuplicateNumber,
         }),
       );
@@ -608,12 +669,14 @@ export default function PayBillsPage() {
           <div className="p-12 flex items-center justify-center gap-2 text-navy/40 text-sm">
             <Spinner className="h-4 w-4" /> Loading open bills…
           </div>
-        ) : bills.length === 0 ? (
+        ) : bills.length === 0 && journalPayables.length === 0 ? (
           <EmptyState
             icon={HandCoins}
             title="No open bills"
             message="Nothing is owed to this vendor. To pay for something without a bill, use Write Checks."
           />
+        ) : bills.length === 0 ? (
+          <p className="px-4 py-3 text-sm text-navy/50">No open bills — only General Journal amounts below.</p>
         ) : (
           <Table>
             <thead>
@@ -719,6 +782,51 @@ export default function PayBillsPage() {
         )}
       </Card>
 
+      {/* I11: General Journal amounts owed to this vendor (journal entries to Accounts Payable). */}
+      {vendorId && journalPayables.length > 0 && (
+        <Card className="mt-6 p-0 overflow-hidden">
+          <div className="px-4 pt-4 pb-2">
+            <h2 className="text-sm font-bold text-navy">General Journal amounts owed to this vendor</h2>
+            <p className="text-xs text-navy/50">
+              Journal entries that put an amount for this vendor in Accounts Payable. Pay them here like a bill.
+            </p>
+          </div>
+          <Table>
+            <thead>
+              <tr>
+                <Th>Entry</Th>
+                <Th>Date</Th>
+                <Th>Memo</Th>
+                <Th numeric>Still owed</Th>
+                <Th numeric>Amount to Pay</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {journalPayables.map((j) => (
+                <Tr key={j.journalLineId}>
+                  <Td className="font-mono text-sm">{j.ref}</Td>
+                  <Td>{formatDate(j.date, 'MMM d, yyyy')}</Td>
+                  <Td className="text-sm text-navy/70">{j.memo ?? ''}</Td>
+                  <Td numeric className="font-semibold">{formatCurrency(j.open)}</Td>
+                  <Td numeric>
+                    <Input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      placeholder="0.00"
+                      aria-label={`Amount to pay on ${j.ref}`}
+                      className="w-28 text-right ml-auto"
+                      value={journalPay[j.journalLineId] ?? ''}
+                      onChange={(e) => setJournalPay((prev) => ({ ...prev, [j.journalLineId]: e.target.value }))}
+                    />
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </Card>
+      )}
+
       {/* Recent payments to this vendor — edit or void (QB: edit a saved bill payment) */}
       {vendorId && payments.length > 0 && (
         <Card className="mt-6 p-0 overflow-hidden">
@@ -803,6 +911,16 @@ export default function PayBillsPage() {
                 ))}
               </Select>
             </div>
+            {(editPay.journalApplications ?? []).filter((j) => j.kind === 'bill_payment').length > 0 && (
+              <p className="text-xs text-navy/60">
+                This payment also pays{' '}
+                {(editPay.journalApplications ?? [])
+                  .filter((j) => j.kind === 'bill_payment')
+                  .map((j) => `General Journal #${j.entryNumber} (${formatCurrency(j.amount)})`)
+                  .join(', ')}
+                . Those amounts stay as they are; void the payment to change them.
+              </p>
+            )}
             <div className="space-y-2">
               {Object.entries(editAmounts).map(([billId, amt]) => (
                 <div key={billId} className="flex items-center justify-between gap-3">
@@ -838,7 +956,7 @@ export default function PayBillsPage() {
       />
 
       {/* Totals + action bar — sticky so the primary action stays on screen */}
-      {vendorId && bills.length > 0 && (
+      {vendorId && (bills.length > 0 || journalPayables.length > 0) && (
         <div className="sticky bottom-0 z-10 -mx-8 mt-4 border-t border-slate-200 bg-white/90 px-8 py-3 backdrop-blur">
           <div className="flex flex-wrap items-center justify-end gap-6">
             <div className="text-sm text-navy/60">
@@ -854,9 +972,11 @@ export default function PayBillsPage() {
             <Button
               onClick={handlePay}
               loading={submitting}
-              disabled={selected.length === 0 || rowErrors.length > 0}
+              disabled={(selected.length === 0 && journalItems.length === 0) || rowErrors.length > 0 || journalOverpaid}
             >
-              {`Pay ${selected.length} Bill${selected.length !== 1 ? 's' : ''}`}
+              {journalItems.length > 0
+                ? `Pay ${selected.length + journalItems.length} Item${selected.length + journalItems.length !== 1 ? 's' : ''}`
+                : `Pay ${selected.length} Bill${selected.length !== 1 ? 's' : ''}`}
             </Button>
           </div>
         </div>
