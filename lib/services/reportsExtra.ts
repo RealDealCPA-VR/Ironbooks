@@ -33,7 +33,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/services/reports';
 import type { ServiceContext } from './_base';
 import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
-import { journalOpenItems, resolveEntityNames } from './journal';
+import { journalCreditsAppliedAfter, journalOpenItems, resolveEntityNames } from './journal';
 import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
 
@@ -346,6 +346,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     paymentAppliedByInvoice(cutoff),
     paymentAppliedByInvoice(),
   ]);
+  const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
 
   // Accumulate per customer.
   const byCustomer = new Map<string, { name: string; buckets: BucketAccum }>();
@@ -358,7 +359,10 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     const cashAllTime = Money.of(appliedAllTime.get(row.invoiceId) ?? '0');
     // Portion of amountPaid not backed by dated cash applications = credit memos
     // (undated) — treat as applied regardless of cutoff.
-    let creditResidual = Money.of(row.amountPaid).minus(cashAllTime);
+    // General Journal credits applied after the cutoff had not reduced the invoice yet.
+    let creditResidual = Money.of(row.amountPaid)
+      .minus(cashAllTime)
+      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     const amount = billedBase.minus(cashAsOf).minus(creditResidual);
@@ -492,6 +496,7 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     billPaymentAppliedByBill(cutoff),
     billPaymentAppliedByBill(),
   ]);
+  const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const byVendor = new Map<string, { name: string; buckets: BucketAccum }>();
@@ -503,7 +508,9 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     // (undated) — treat as applied regardless of cutoff.
     let creditResidual = Money.of(row.amountPaid)
       .plus(Money.of(row.amountCredited ?? '0'))
-      .minus(cashAllTime);
+      .minus(cashAllTime)
+      // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
+      .minus(journalCreditsLater.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
@@ -1036,13 +1043,17 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     paymentAppliedByInvoice(cutoff),
     paymentAppliedByInvoice(),
   ]);
+  const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
     const billedBase = Money.of(row.total).minus(Money.of(row.retainageAmount ?? '0'));
     const cashAsOf = Money.of(appliedAsOf.get(row.invoiceId) ?? '0');
     const cashAllTime = Money.of(appliedAllTime.get(row.invoiceId) ?? '0');
-    let creditResidual = Money.of(row.amountPaid).minus(cashAllTime);
+    // General Journal credits applied after the cutoff had not reduced the invoice yet.
+    let creditResidual = Money.of(row.amountPaid)
+      .minus(cashAllTime)
+      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     const amount = billedBase.minus(cashAsOf).minus(creditResidual);
@@ -1153,6 +1164,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     billPaymentAppliedByBill(cutoff),
     billPaymentAppliedByBill(),
   ]);
+  const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
@@ -1161,7 +1173,9 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     const cashAllTime = Money.of(appliedAllTime.get(row.billId) ?? '0');
     let creditResidual = Money.of(row.amountPaid)
       .plus(Money.of(row.amountCredited ?? '0'))
-      .minus(cashAllTime);
+      .minus(cashAllTime)
+      // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
+      .minus(journalCreditsLater.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);

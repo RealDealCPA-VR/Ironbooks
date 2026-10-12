@@ -29,6 +29,7 @@ import {
   deposits,
   invoices,
   journalEntries,
+  journalItemApplications,
   paymentsReceived,
   paymentApplications,
 } from '@/lib/db/schema';
@@ -45,6 +46,17 @@ import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './p
 import { assertPeriodOpen } from './fiscalPeriods';
 import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
+import {
+  type JournalCreditToInvoiceInput,
+  type JournalItemPaymentInput,
+  applyJournalCreditsToInvoices,
+  isForeignCurrency,
+  listJournalApplications,
+  listJournalOpenItems,
+  recordJournalChargesPaid,
+  reverseJournalApplicationsForPayment,
+  validateJournalChargesForPayment,
+} from './journalApplications';
 
 // ---- Types ------------------------------------------------------------------
 
@@ -110,6 +122,13 @@ export interface ReceivePaymentInput {
    * overpayment) applied to invoices from inside Receive Payments. New payments only.
    */
   paymentCredits?: PaymentCreditFromPaymentInput[] | null;
+  /**
+   * General Journal charges paid by this payment (QB I11): named A/R debits from journal entries,
+   * listed in Receive Payments next to the invoices. Home-currency payments only.
+   */
+  journalItems?: JournalItemPaymentInput[] | null;
+  /** General Journal A/R credits applied to invoices together with this payment (no GL). */
+  journalCredits?: JournalCreditToInvoiceInput[] | null;
 }
 
 export interface PaymentCreditFromPaymentInput {
@@ -286,7 +305,8 @@ export async function suggestEarlyPaymentDiscounts(
 // ---- Available credits (C4) ---------------------------------------------------
 
 export interface AvailableCredit {
-  kind: 'credit_memo' | 'payment';
+  /** 'journal_entry': a General Journal A/R credit; `id` is the journal LINE id. */
+  kind: 'credit_memo' | 'payment' | 'journal_entry';
   id: string;
   /** Credit memo number, or the payment's reference. */
   ref: string;
@@ -294,7 +314,10 @@ export interface AvailableCredit {
   available: string;
 }
 
-/** Open credits a customer can use in Receive Payments: credit memos + unapplied payments. */
+/**
+ * Open credits a customer can use in Receive Payments: credit memos, unapplied payments and
+ * General Journal A/R credits (I11).
+ */
 export async function listAvailableCredits(ctx: ServiceContext, customerId: string): Promise<AvailableCredit[]> {
   const memos = await ctx.db
     .select({ id: creditMemos.id, memoNumber: creditMemos.memoNumber, date: creditMemos.date, unapplied: creditMemos.unapplied })
@@ -334,6 +357,13 @@ export async function listAvailableCredits(ctx: ServiceContext, customerId: stri
       ref: p.reference ? `Unapplied payment ${p.reference}` : 'Unapplied payment',
       date: p.date.toISOString().slice(0, 10),
       available: toAmountString(p.unapplied),
+    })),
+    ...(await listJournalOpenItems(ctx, 'ar', customerId)).credits.map((j) => ({
+      kind: 'journal_entry' as const,
+      id: j.journalLineId,
+      ref: j.ref,
+      date: j.date,
+      available: j.open,
     })),
   ].sort((a, b) => a.date.localeCompare(b.date));
 }
@@ -388,7 +418,9 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
     const hasNewMoney =
       Money.round2(input.amount).greaterThan(0) ||
       input.applications.length > 0 ||
-      (input.credits ?? []).length > 0;
+      (input.credits ?? []).length > 0 ||
+      (input.journalItems ?? []).length > 0 ||
+      (input.journalCredits ?? []).length > 0;
     if (hasNewMoney) return postPayment(tx, { ...input, paymentCredits: null }, null);
     // Only earlier payments were used: no new payment is recorded (as in QuickBooks).
     const [payment] = await tx.db
@@ -439,13 +471,21 @@ async function postPayment(
     sumApplied = sumApplied.plus(applied);
     sumDiscount = sumDiscount.plus(discount);
   }
-  if (sumApplied.greaterThan(totalAmount)) {
+  // I11: General Journal charges paid with this payment (cash, like an invoice application).
+  const journalItems = input.journalItems ?? [];
+  const journalCredits = input.journalCredits ?? [];
+  const sumJournal = await validateJournalChargesForPayment(tx, {
+    customerId: input.customerId,
+    items: journalItems,
+    foreignPayment: await isForeignCurrency(tx, paymentCurrency),
+  });
+  if (sumApplied.plus(sumJournal).greaterThan(totalAmount)) {
     throw validation(
-      `Sum of applications (${toAmountString(sumApplied)}) exceeds payment amount (${toAmountString(totalAmount)}).`,
+      `Sum of applications (${toAmountString(sumApplied.plus(sumJournal))}) exceeds payment amount (${toAmountString(totalAmount)}).`,
     );
   }
   let sumCredits = Money.zero();
-  for (const c of credits) {
+  for (const c of [...credits, ...journalCredits]) {
     const amt = Money.round2(c.amount);
     if (!amt.greaterThan(0)) throw validation('Each credit applied must be greater than zero.');
     sumCredits = sumCredits.plus(amt);
@@ -466,7 +506,9 @@ async function postPayment(
     );
   }
 
-  const allInvoiceIds = [...new Set([...invoiceIds, ...credits.map((c) => c.invoiceId)])];
+  const allInvoiceIds = [
+    ...new Set([...invoiceIds, ...credits.map((c) => c.invoiceId), ...journalCredits.map((c) => c.invoiceId)]),
+  ];
   const invoiceRows =
     allInvoiceIds.length > 0
       ? await tx.db
@@ -515,7 +557,7 @@ async function postPayment(
     }
     addRequested(app.invoiceId, Money.round2(app.amountApplied ?? 0).plus(Money.round2(app.discountAmount ?? 0)));
   }
-  for (const c of credits) {
+  for (const c of [...credits, ...journalCredits]) {
     const inv = checkInvoice(c.invoiceId);
     if (inv.currency) {
       throw validation(`Credits can only be applied to invoices in your home currency (invoice #${inv.invoiceNumber}).`);
@@ -581,7 +623,7 @@ async function postPayment(
 
   const arAccountId = await getArAccountId(tx);
   const amountStr = toAmountString(totalAmount);
-  const unapplied = Money.sub(totalAmount, sumApplied);
+  const unapplied = Money.sub(totalAmount, sumApplied).minus(sumJournal);
 
   // --- Base-currency GL amounts ---
   // Deposit account is debited at the settlement rate. A/R is credited at the rate each
@@ -600,6 +642,8 @@ async function postPayment(
   if (unapplied.greaterThan(0)) {
     arBase = arBase.plus(Money.round2(Money.mul(unapplied, paymentRate)));
   }
+  // Journal charges are home currency (validated above: home-currency payments only).
+  arBase = arBase.plus(sumJournal);
   const fxDiff = Money.round2(cashBase.minus(arBase)); // > 0 = gain, < 0 = loss
   const fxAccountId = fxDiff.isZero() ? null : await getOrCreateExchangeGainLossId(tx);
 
@@ -689,6 +733,21 @@ async function postPayment(
     });
   }
 
+  // 4b. I11: General Journal charges paid by this payment, and General Journal credits applied
+  //     to invoices with it (linked to the payment so a void/edit undoes them).
+  await recordJournalChargesPaid(tx, {
+    paymentId: payment.id,
+    customerId: input.customerId,
+    date: input.date,
+    items: journalItems,
+  });
+  await applyJournalCreditsToInvoices(tx, {
+    customerId: input.customerId,
+    date: input.date,
+    paymentId: payment.id,
+    credits: journalCredits,
+  });
+
   // 5. Audit log
   await writeAudit(tx, {
     action: existingId ? 'update' : 'create',
@@ -699,6 +758,8 @@ async function postPayment(
       amount: amountStr,
       method: input.method,
       applications: input.applications,
+      journalItems,
+      journalCredits,
       credits,
       discountTotal: toAmountString(sumDiscount),
       discountAccountId,
@@ -759,7 +820,10 @@ export async function getPayment(ctx: ServiceContext, id: string) {
     .from(bouncedChecks)
     .where(and(eq(bouncedChecks.companyId, ctx.companyId), eq(bouncedChecks.paymentId, id)));
 
-  return { ...payment, applications, credits, bounced: bounced ?? null };
+  // I11: General Journal charges this payment paid, and General Journal credits applied with it.
+  const journalApplications = await listJournalApplications(ctx, { paymentId: id });
+
+  return { ...payment, applications, credits, journalApplications, bounced: bounced ?? null };
 }
 
 // ---- Corrections: void / unapply / apply-later / refund -----------------------
@@ -915,6 +979,10 @@ async function reversePaymentEffects(
     .from(creditApplications)
     .where(and(eq(creditApplications.companyId, tx.companyId), eq(creditApplications.paymentId, payment.id)));
   for (const ca of creditApps) await unapplyCreditApplication(tx, ca.id);
+
+  // 5. I11: General Journal charges it paid reopen; General Journal credits applied with it are
+  //    taken back off their invoices.
+  await reverseJournalApplicationsForPayment(tx, payment.id);
 
   return applications;
 }
@@ -1156,6 +1224,18 @@ export async function recordBouncedCheck(ctx: ServiceContext, input: RecordBounc
       if (back.greaterThan(0)) await markPaidAmount(tx, app.invoiceId, toAmountString(back.negated()));
     }
     await tx.db.delete(paymentApplications).where(eq(paymentApplications.paymentId, payment.id));
+    // I11: General Journal charges the payment paid are owed again too (the reversal above
+    // re-charged the whole payment to A/R). Credits applied with it stay applied.
+    const reopenedJournal = await tx.db
+      .delete(journalItemApplications)
+      .where(
+        and(
+          eq(journalItemApplications.companyId, tx.companyId),
+          eq(journalItemApplications.paymentId, payment.id),
+          eq(journalItemApplications.kind, 'payment'),
+        ),
+      )
+      .returning();
     await tx.db
       .update(paymentsReceived)
       .set({ unapplied: '0.00', bouncedAt: date })
@@ -1241,6 +1321,11 @@ export async function recordBouncedCheck(ctx: ServiceContext, input: RecordBounc
         bankFee: toAmountString(bankFee),
         customerFee: toAmountString(customerFee),
         customerFeeInvoiceId,
+        journalChargesReopened: reopenedJournal.map((j) => ({
+          journalEntryId: j.journalEntryId,
+          journalLineId: j.journalLineId,
+          amount: j.amount,
+        })),
       },
     });
 

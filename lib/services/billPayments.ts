@@ -54,6 +54,15 @@ import {
   resolveDocumentCurrency,
 } from './currencies';
 import { entryHasReconciledLines } from './postedEdit';
+import {
+  type JournalCreditToBillInput,
+  type JournalItemPaymentInput,
+  applyJournalCreditsToBills,
+  listJournalApplications,
+  recordJournalPayablesPaid,
+  reverseJournalApplicationsForBillPayment,
+  validateJournalPayablesForBillPayment,
+} from './journalApplications';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -92,6 +101,13 @@ export interface PayBillsInput {
   exchangeRate?: string | number | null;
   /** Refuse a check number already used on the account unless the user confirmed (A3). */
   checkDuplicateNumber?: boolean;
+  /**
+   * General Journal amounts owed to this vendor paid by this payment (QB I11): named A/P credits
+   * from journal entries, listed in Pay Bills next to the bills. Home currency only.
+   */
+  journalItems?: JournalItemPaymentInput[] | null;
+  /** General Journal A/P debits (vendor credits) applied to bills in this Pay Bills session. */
+  journalCredits?: JournalCreditToBillInput[] | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +161,8 @@ interface PreparedPayment {
   apHomeTotal: Decimal;
   fxAccountId: string | null;
   fxDiff: Decimal; // > 0 gain, < 0 loss
+  /** I11: cash paid on General Journal amounts owed (home currency). */
+  journalTotal: Decimal;
 }
 
 /**
@@ -152,8 +170,13 @@ interface PreparedPayment {
  * editing, after the old applications were rolled back) and compute the home-currency split.
  */
 async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promise<PreparedPayment> {
-  if (!input.applications || input.applications.length === 0) {
-    throw validation('At least one bill application is required.');
+  const journalItems = input.journalItems ?? [];
+  if ((!input.applications || input.applications.length === 0) && journalItems.length === 0) {
+    throw validation(
+      (input.journalCredits ?? []).length > 0
+        ? 'Pick at least one bill or General Journal amount to pay. To apply only credits, use Apply credit on the bill.'
+        : 'At least one bill application is required.',
+    );
   }
   // Reject duplicate billIds — two applications against the same bill would each be
   // validated against the bill's ORIGINAL balance, bypassing the over-application guard.
@@ -241,6 +264,13 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
   if (currencies.length > 1) {
     throw validation('Bills in different currencies must be paid with separate payments.');
   }
+  // I11: General Journal amounts owed are in home currency.
+  if (journalItems.length > 0 && currencies[0]) {
+    throw validation(
+      'General Journal amounts are in your home currency. Pay them separately from bills in another currency.',
+    );
+  }
+  const journalTotal = await validateJournalPayablesForBillPayment(ctx, { vendorId: input.vendorId, items: journalItems });
   let fx: { currency: string | null; rate: Decimal };
   if (currencies[0]) {
     fx = await resolveDocumentCurrency(ctx, {
@@ -299,6 +329,8 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
       apHome: toAmountString(apHome),
     });
   }
+  total = total.plus(journalTotal);
+  apHomeTotal = apHomeTotal.plus(journalTotal);
   if (total.isZero()) throw validation('Total payment amount must be greater than zero.');
 
   if (discountTotal.greaterThan(0)) {
@@ -331,6 +363,7 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
     apHomeTotal,
     fxAccountId,
     fxDiff,
+    journalTotal,
   };
 }
 
@@ -427,6 +460,22 @@ async function rollbackApplications(tx: ServiceContext, paymentId: string) {
   return applications;
 }
 
+/** I11: record the General Journal amounts this payment paid and the journal credits applied with it. */
+async function applyJournalRows(tx: ServiceContext, paymentId: string, input: PayBillsInput) {
+  await recordJournalPayablesPaid(tx, {
+    billPaymentId: paymentId,
+    vendorId: input.vendorId,
+    date: input.date,
+    items: input.journalItems ?? [],
+  });
+  await applyJournalCreditsToBills(tx, {
+    vendorId: input.vendorId,
+    date: input.date,
+    billPaymentId: paymentId,
+    credits: input.journalCredits ?? [],
+  });
+}
+
 function referenceFor(input: PayBillsInput): { reference: string | null; toPrint: boolean } {
   const toPrint = Boolean(input.toPrint) && input.method === 'check';
   return { reference: toPrint ? null : input.reference?.trim() || null, toPrint };
@@ -481,6 +530,7 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
       .returning();
 
     await applyRows(tx, payment.id, prep.rows);
+    await applyJournalRows(tx, payment.id, input);
 
     await writeAudit(tx, {
       action: 'create',
@@ -498,6 +548,8 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
         exchangeRate: prep.currency ? prep.rate.toFixed(8) : null,
         realizedFx: toAmountString(prep.fxDiff),
         postedEntryId: entry.id,
+        journalItems: input.journalItems ?? [],
+        journalCredits: input.journalCredits ?? [],
         applications: prep.rows.map((r) => ({
           billId: r.id,
           amountApplied: r.applied,
@@ -556,6 +608,7 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
       .select()
       .from(billPaymentApplications)
       .where(eq(billPaymentApplications.billPaymentId, id));
+    const oldJournal = await listJournalApplications(tx, { billPaymentId: id });
 
     // Header-only edit? Compare the financial shape (discounts live in the GL, so any
     // discount on the old payment forces the full path — it cannot be compared cheaply).
@@ -573,7 +626,10 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
       );
     const sameRate =
       !cur.currency || input.exchangeRate == null || Money.of(input.exchangeRate).equals(Money.of(cur.exchangeRate ?? 1));
+    const noJournal =
+      oldJournal.length === 0 && (input.journalItems ?? []).length === 0 && (input.journalCredits ?? []).length === 0;
     const headerOnly =
+      noJournal &&
       sameApps &&
       sameRate &&
       cur.paymentAccountId === input.paymentAccountId &&
@@ -599,6 +655,7 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
       }
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       await rollbackApplications(tx, id);
+      await reverseJournalApplicationsForBillPayment(tx, id);
       const prep = await preparePayment(tx, input);
       const entry = await postJournalEntry(tx, {
         date: input.date,
@@ -623,6 +680,7 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
         })
         .where(eq(billPayments.id, id));
       await applyRows(tx, id, prep.rows);
+      await applyJournalRows(tx, id, input);
     }
 
     const [updated] = await tx.db.select().from(billPayments).where(eq(billPayments.id, id));
@@ -638,6 +696,7 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
         paymentAccountId: cur.paymentAccountId,
         postedEntryId: cur.postedEntryId,
         applications: oldApps.map((a) => ({ billId: a.billId, amountApplied: a.amountApplied })),
+        journalApplications: oldJournal.map((j) => ({ kind: j.kind, journalLineId: j.journalLineId, billId: j.billId, amount: j.amount })),
       },
       newValues: {
         date: updated.date,
@@ -648,6 +707,8 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
         ledger: headerOnly ? 'unchanged' : 'reposted',
         postedEntryId: entryId,
         applications: input.applications,
+        journalItems: input.journalItems ?? [],
+        journalCredits: input.journalCredits ?? [],
       },
     });
     return updated;
@@ -779,7 +840,10 @@ export async function getBillPayment(ctx: ServiceContext, id: string) {
     }
   }
 
-  return { ...payment, applications, discountTotal, discountAccountId };
+  // I11: General Journal amounts this payment paid and journal credits applied with it.
+  const journalApplications = await listJournalApplications(ctx, { billPaymentId: id });
+
+  return { ...payment, applications, journalApplications, discountTotal, discountAccountId };
 }
 
 /** Bills (ids) for a set of payments — used by the edit form to show the paid bills. */
@@ -823,6 +887,8 @@ export async function voidBillPayment(ctx: ServiceContext, id: string) {
 
     // 2 + 3. Roll back each bill and delete the application rows.
     const applications = await rollbackApplications(tx, id);
+    // I11: General Journal amounts it paid are owed again; journal credits applied with it come off.
+    const journalApps = await reverseJournalApplicationsForBillPayment(tx, id);
 
     // 4. Stamp the payment void.
     const [updated] = await tx.db
@@ -841,6 +907,7 @@ export async function voidBillPayment(ctx: ServiceContext, id: string) {
           billId: a.billId,
           amountApplied: a.amountApplied,
         })),
+        journalApplications: journalApps.map((j) => ({ kind: j.kind, journalLineId: j.journalLineId, billId: j.billId, amount: j.amount })),
       },
       newValues: { voided: true },
     });

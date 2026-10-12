@@ -63,8 +63,16 @@ export default function ReclassifyPage() {
       if (newAccountId) body.newAccountId = newAccountId;
       if (classMode === 'clear') body.newClassId = null;
       else if (classMode !== 'keep') body.newClassId = classMode;
-      const res = await api.post<{ linesChanged: number; entriesChanged: number }>('/api/accountant/reclassify', body);
-      toast(`Reclassified ${res.linesChanged} line(s) in ${res.entriesChanged} transaction(s).`, 'success');
+      const res = await api.post<{ linesChanged: number; entriesChanged: number; documentsUpdated?: number }>(
+        '/api/accountant/reclassify',
+        body,
+      );
+      const docs = res.documentsUpdated ?? 0;
+      toast(
+        `Reclassified ${res.linesChanged} line(s) in ${res.entriesChanged} transaction(s)` +
+          (docs > 0 ? ` and updated ${docs} original form(s) to match.` : '.'),
+        'success',
+      );
       setConfirm(false);
       await load();
     } catch (err) {
@@ -85,7 +93,9 @@ export default function ReclassifyPage() {
       <p className="mb-4 max-w-3xl text-sm text-navy/60">
         Pick an account and a date range, tick the lines that were posted to the wrong account <Help term="chart-of-accounts" /> or
         class, then choose where they belong. Amounts never change, so your books stay balanced. Every change is recorded in the
-        audit trail.
+        audit trail. The original invoice, bill, check, deposit or credit is updated too, so editing it later keeps the new
+        account. Lines that come from an item keep the item&apos;s account (you can still change their class) — change the
+        item&apos;s account instead.
       </p>
 
       <Card className="mb-6 p-4">

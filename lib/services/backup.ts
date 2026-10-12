@@ -42,6 +42,8 @@ import {
   landedCostAllocationLines, landedCostAllocations, pendingBuilds,
   // wave2 sales
   bouncedChecks, collectionNotes, creditApplications,
+  // team ledger fix: General Journal A/R / A/P applications (0037)
+  journalItemApplications,
   // wave2 purchases
   checkPrintSettings, loanPayments, loans,
   // wave2 accountant
@@ -694,6 +696,8 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   },
   // wave2 sales: credit applications, bounced checks, collections notes.
   { name: 'creditApplications', table: creditApplications, joins: [], companyCol: creditApplications.companyId },
+  // team ledger fix (0037): JE A/R / A/P open-item applications (after payments, bills, JEs).
+  { name: 'journalItemApplications', table: journalItemApplications, joins: [], companyCol: journalItemApplications.companyId },
   { name: 'bouncedChecks', table: bouncedChecks, joins: [], companyCol: bouncedChecks.companyId },
   { name: 'collectionNotes', table: collectionNotes, joins: [], companyCol: collectionNotes.companyId },
   // ---- wave2 purchases: Loan Manager + check printer setup (after vendors/accounts/expenses/bills) ----

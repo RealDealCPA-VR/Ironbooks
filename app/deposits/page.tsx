@@ -59,6 +59,8 @@ interface DepositLine {
   paymentId: string | null;
   description: string | null;
   amount: string;
+  /** Account an extra line credits (null on payment / receipt / cash-back lines). */
+  accountId?: string | null;
 }
 
 interface Deposit {
@@ -134,9 +136,9 @@ function depositToEdit(dep: Deposit): DepositEdit {
       cashBackAccountId = desc.slice(CASHBACK_PREFIX.length);
       cashBackAmount = String(Math.abs(Number(l.amount)).toFixed(2));
     } else {
-      // Extra lines keep their description; the credited account is not stored on the line,
-      // so the user re-picks it (the form flags it as required).
-      extraLines.push({ accountId: '', amount: l.amount, description: desc });
+      // Extra lines keep their description and credited account (deposit_lines.account_id, 0037;
+      // older lines without one are re-picked — the form flags it as required).
+      extraLines.push({ accountId: l.accountId ?? '', amount: l.amount, description: desc });
     }
   }
   return {

@@ -16,36 +16,32 @@
  *  - control accounts with sub-ledgers (bank, A/R, A/P, credit card, inventory, Undeposited
  *    Funds, sales tax, payroll liabilities, retainage) can be neither source nor target — those
  *    balances are tied to documents and reconciliations;
- *  - when ALL of an entry's lines on the old account are moved, the source document's lines on
- *    that account are re-pointed too (invoice, sales receipt, credit memo, bill, check/expense),
- *    so editing the document later re-posts to the new account instead of undoing the fix.
- *    KNOWN LIMIT: a partial move (only some of an entry's lines on the old account) leaves the
- *    document lines alone, and a document line whose account is re-derived from its ITEM on save
- *    (the item's income/expense account) will follow the item again on the next edit. In both cases
- *    re-saving the document can undo the reclassification; reclassify again or change the item's
- *    account. TODO(wave2 sales/purchases): honour an explicit per-line account override on re-save.
+ *  - the source document's own rows are changed too (invoice, sales receipt, credit memo, bill,
+ *    check / expense, bill credit, deposit — reclassifySync.ts matches each posted line to the
+ *    rows it was built from, including partial moves), so editing the document later re-posts the
+ *    new account / class instead of silently undoing the fix. When that can't be done faithfully
+ *    the whole request is refused with a plain message and nothing changes: an item line's
+ *    account (QB only allows a class change there — the account comes from the item), a class on
+ *    a document that keeps no class per line, a line that matches no document row, and lines of
+ *    documents that rebuild their lines from their own settings (paychecks, payments, ...).
  *
  * Class-only changes need no rewrite flag (class is not a guarded ledger column).
  */
-import { and, eq, gte, inArray, lte, sql } from 'drizzle-orm';
+import { and, eq, gte, inArray, lte } from 'drizzle-orm';
 import {
   accounts,
   bankAccounts,
-  billLines,
   classes,
-  creditMemoLines,
-  expenseLines,
-  invoiceLines,
   journalEntries,
   journalEntryLines,
   reconciliationItems,
   reconciliations,
-  salesReceiptLines,
   taxAgencies,
 } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { allowLedgerRewrite } from '../posting';
+import { applyDocumentSync, type DocSyncPlan, planDocumentSync } from './reclassifySync';
 import { assertPeriodOpen, recordClosingDateException } from '../fiscalPeriods';
 
 const CONTROL_SUBTYPES = new Set([
@@ -269,18 +265,11 @@ export async function reclassifyLines(ctx: ServiceContext, input: ReclassifyInpu
     const checks = new Map<string, Awaited<ReturnType<typeof assertPeriodOpen>>>();
     for (const [entryId, ls] of byEntry) checks.set(entryId, await assertPeriodOpen(tx, ls[0].date));
 
-    // Which (entry, account) slices are moved COMPLETELY? Only those sync their source document.
-    const fullSlices = new Set<string>();
-    for (const [entryId, ls] of byEntry) {
-      const counts = await tx.db
-        .select({ accountId: journalEntryLines.accountId, n: sql<number>`COUNT(*)` })
-        .from(journalEntryLines)
-        .where(eq(journalEntryLines.journalEntryId, entryId))
-        .groupBy(journalEntryLines.accountId);
-      for (const c of counts) {
-        const selected = ls.filter((l) => l.accountId === c.accountId).length;
-        if (selected > 0 && selected === Number(c.n)) fullSlices.add(`${entryId}|${c.accountId}`);
-      }
+    // Keep each entry's source document in step — or refuse before anything is written.
+    const plans: DocSyncPlan[] = [];
+    for (const ls of byEntry.values()) {
+      const plan = await planDocumentSync(tx, ls, { account: changeAccount, class: changeClass });
+      if (plan) plans.push(plan);
     }
 
     if (changeAccount) await allowLedgerRewrite(tx, 'reclassify');
@@ -294,51 +283,15 @@ export async function reclassifyLines(ctx: ServiceContext, input: ReclassifyInpu
       .set({ updatedAt: new Date() })
       .where(inArray(journalEntries.id, [...byEntry.keys()]));
 
-    // Keep source documents in step when an entry's whole slice on the old account moved.
     let documentsUpdated = 0;
-    for (const [entryId, ls] of byEntry) {
-      const ref = ls[0].sourceRef;
-      if (!ref) continue;
-      const [prefix, docId] = ref.split(':');
-      if (!docId || !/^[0-9a-f-]{36}$/i.test(docId)) continue;
-      for (const oldAccountId of new Set(ls.map((l) => l.accountId))) {
-        if (!fullSlices.has(`${entryId}|${oldAccountId}`)) continue;
-        const acctSet = changeAccount ? { accountId: input.newAccountId! } : {};
-        const clsSet = changeClass ? { classId: input.newClassId ?? null } : {};
-        let updated: Array<{ id: string }> = [];
-        if (prefix === 'invoice') {
-          updated = await tx.db
-            .update(invoiceLines)
-            .set({ ...acctSet, ...clsSet })
-            .where(and(eq(invoiceLines.invoiceId, docId), eq(invoiceLines.accountId, oldAccountId)))
-            .returning({ id: invoiceLines.id });
-        } else if (prefix === 'salesreceipt') {
-          updated = await tx.db
-            .update(salesReceiptLines)
-            .set({ ...acctSet, ...clsSet })
-            .where(and(eq(salesReceiptLines.salesReceiptId, docId), eq(salesReceiptLines.accountId, oldAccountId)))
-            .returning({ id: salesReceiptLines.id });
-        } else if (prefix === 'bill') {
-          updated = await tx.db
-            .update(billLines)
-            .set({ ...acctSet, ...clsSet })
-            .where(and(eq(billLines.billId, docId), eq(billLines.accountId, oldAccountId)))
-            .returning({ id: billLines.id });
-        } else if (prefix === 'expense') {
-          updated = await tx.db
-            .update(expenseLines)
-            .set({ ...acctSet, ...clsSet })
-            .where(and(eq(expenseLines.expenseId, docId), eq(expenseLines.accountId, oldAccountId)))
-            .returning({ id: expenseLines.id });
-        } else if (prefix === 'credit_memo' && changeAccount) {
-          updated = await tx.db
-            .update(creditMemoLines)
-            .set({ accountId: input.newAccountId! })
-            .where(and(eq(creditMemoLines.creditMemoId, docId), eq(creditMemoLines.accountId, oldAccountId)))
-            .returning({ id: creditMemoLines.id });
-        }
-        if (updated.length > 0) documentsUpdated += 1;
-      }
+    for (const plan of plans) {
+      const n = await applyDocumentSync(tx, plan, {
+        account: changeAccount,
+        accountId: input.newAccountId ?? undefined,
+        class: changeClass,
+        classId: input.newClassId ?? null,
+      });
+      if (n > 0) documentsUpdated += 1;
     }
 
     for (const [entryId, ls] of byEntry) {
