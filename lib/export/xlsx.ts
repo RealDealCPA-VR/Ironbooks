@@ -160,3 +160,62 @@ export function buildXlsx(input: XlsxSheetInput): Buffer {
   add('xl/worksheets/sheet1.xml', worksheetXml(input));
   return zip.toBuffer();
 }
+
+// ---------------------------------------------------------------------------
+// Multi-sheet workbooks (shareable ledger export). Same minimal part set, one
+// worksheet part per sheet; sheet names are de-duplicated (Excel requires it).
+// ---------------------------------------------------------------------------
+
+/** Build an .xlsx workbook with one worksheet per input sheet. */
+export function buildXlsxWorkbook(sheets: XlsxSheetInput[]): Buffer {
+  if (!sheets.length) throw new Error('buildXlsxWorkbook requires at least one sheet.');
+  const names: string[] = [];
+  for (const s of sheets) {
+    if (!s.columns?.length) throw new Error('buildXlsxWorkbook: every sheet needs at least one column.');
+    const base = sanitizeSheetName(s.sheetName ?? s.title ?? 'Sheet');
+    let name = base;
+    for (let i = 2; names.some((n) => n.toLowerCase() === name.toLowerCase()); i++) {
+      const suffix = ` (${i})`;
+      name = base.slice(0, 31 - suffix.length) + suffix;
+    }
+    names.push(name);
+  }
+  const contentTypes =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+    '<Default Extension="xml" ContentType="application/xml"/>' +
+    '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+    names
+      .map(
+        (_n, i) =>
+          `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`,
+      )
+      .join('') +
+    '</Types>';
+  const workbookRels =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    names
+      .map(
+        (_n, i) =>
+          `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`,
+      )
+      .join('') +
+    '</Relationships>';
+  const workbook =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+    names.map((n, i) => `<sheet name="${xmlEscape(n)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('') +
+    '</sheets></workbook>';
+
+  const zip = new AdmZip();
+  const add = (path: string, xml: string) => zip.addFile(path, Buffer.from(xml, 'utf-8'));
+  add('[Content_Types].xml', contentTypes);
+  add('_rels/.rels', ROOT_RELS_XML);
+  add('xl/workbook.xml', workbook);
+  add('xl/_rels/workbook.xml.rels', workbookRels);
+  sheets.forEach((s, i) => add(`xl/worksheets/sheet${i + 1}.xml`, worksheetXml(s)));
+  return zip.toBuffer();
+}

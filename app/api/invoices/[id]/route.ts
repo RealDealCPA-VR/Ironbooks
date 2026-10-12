@@ -7,26 +7,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getInvoice, updateInvoice, voidInvoice } from '@/lib/services/invoices';
-import { ServiceError } from '@/lib/services/_base';
+import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateInvoiceSchema } from '@/lib/validation/invoices';
 
 function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED' || err.code === 'PERIOD_CLOSED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
-    return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
-  }
-  console.error('[invoices/[id]/route]', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  return routeErrorWithWarnings(err, 'invoices/[id]/route.ts');
 }
 
 type RouteContext = { params: Promise<{ id: string }> };
@@ -52,7 +39,10 @@ export async function PUT(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const updated = await updateInvoice(ctx, id, parsed.data);
+    // Multi-user: 409 if someone else saved this invoice since it was loaded.
+    const updated = await withVersionCheck(ctx, 'invoice', id, expectedVersion(req), (c) =>
+      updateInvoice(c, id, parsed.data),
+    );
 
     return NextResponse.json(updated);
   } catch (err) {
@@ -65,11 +55,11 @@ export async function PATCH(req: NextRequest, ctx: RouteContext) {
   return PUT(req, ctx);
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const voided = await voidInvoice(ctx, id);
+    const voided = await withVersionCheck(ctx, 'invoice', id, expectedVersion(req), (c) => voidInvoice(c, id));
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err);

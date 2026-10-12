@@ -4,7 +4,7 @@
  * (lib/services/purchaseOrders.ts).
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
 
 export const purchaseOrderLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -17,12 +17,20 @@ export const purchaseOrderLineSchema = z.object({
 
 export const createPurchaseOrderSchema = z.object({
   vendorId: zUuid,
+  /** Typed document number (e.g. "INV-1001"); blank = next number. */
+  refNumber: zDocNumber,
+  allowDuplicateNumber: z.boolean().nullish(),
   date: zDate,
   expectedDate: zDate.nullish(),
   memo: z.string().nullish(),
   lines: zLines(purchaseOrderLineSchema),
 });
 export type CreatePurchaseOrderBody = z.infer<typeof createPurchaseOrderSchema>;
+
+/** PATCH /api/purchase-orders/:id — full edit; existing lines carry their id. */
+export const updatePurchaseOrderSchema = createPurchaseOrderSchema.extend({
+  lines: zLines(purchaseOrderLineSchema.extend({ id: zUuid.nullish() })),
+});
 
 /** Per-line partial billing request ({ lineId, quantity }). */
 export const poBillLineSchema = z.object({

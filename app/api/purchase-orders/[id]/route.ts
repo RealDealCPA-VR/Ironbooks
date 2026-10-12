@@ -18,7 +18,10 @@ import {
   getPurchaseOrder,
   updateStatus,
   convertToBill,
+  updatePurchaseOrder,
 } from '@/lib/services/purchaseOrders';
+import { routeError } from '@/lib/routeErrors';
+import { updatePurchaseOrderSchema } from '@/lib/validation/purchaseOrders';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { purchaseOrderActionSchema } from '@/lib/validation/purchaseOrders';
@@ -86,5 +89,20 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     return NextResponse.json(po);
   } catch (err) {
     return errorResponse(err);
+  }
+}
+
+/** PATCH /api/purchase-orders/:id — edit an open / partly received purchase order. */
+export async function PATCH(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json().catch(() => ({}));
+    const parsed = updatePurchaseOrderSchema.safeParse(body);
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    const po = await updatePurchaseOrder(ctx, id, parsed.data);
+    return NextResponse.json(po);
+  } catch (err) {
+    return routeError(err, 'PATCH /api/purchase-orders/[id]');
   }
 }

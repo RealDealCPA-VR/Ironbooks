@@ -15,8 +15,12 @@ import { customers } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { ServiceError } from './_base';
 import { getInvoice } from './invoices';
-import { getCompany } from './company';
-import { renderInvoicePdf } from '@/lib/pdf/invoice';
+import { docRef } from './docNumbers';
+import { getCompany, getPreferences } from './company';
+import { buildInvoicePdf } from '@/lib/pdf/forms';
+import { fillMergeFields } from '@/lib/preferences';
+import { formatCurrency } from '@/lib/money';
+import { assertOutboundAllowed } from '@/lib/net/guard';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -32,6 +36,12 @@ export function isConfigured(): boolean {
   );
 }
 
+/** Bracket bare IPv6 literals so the host can be embedded in a URL for the policy check. */
+function smtpHostForUrl(host: string): string {
+  const h = host.trim();
+  return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
+}
+
 // ---------------------------------------------------------------------------
 // Low-level sendMail
 // ---------------------------------------------------------------------------
@@ -44,13 +54,22 @@ export interface MailOptions {
   attachments?: Attachment[];
 }
 
-export async function sendMail(opts: MailOptions): Promise<void> {
+export async function sendMail(opts: MailOptions, ctx: ServiceContext): Promise<void> {
   if (!isConfigured()) {
     throw new ServiceError(
       'VALIDATION',
       'Email not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and SMTP_FROM environment variables.',
     );
   }
+
+  // Network policy: an SMTP relay on the LAN/tailnet is always fine; a public mail provider
+  // needs the company's explicit cloud opt-in for 'email' (Settings → Privacy & Network).
+  const port = Number(process.env.SMTP_PORT!);
+  await assertOutboundAllowed(
+    `${port === 465 ? 'smtps' : 'smtp'}://${smtpHostForUrl(process.env.SMTP_HOST!)}:${port}`,
+    'email',
+    ctx,
+  );
 
   const transport = nodemailer.createTransport({
     host: process.env.SMTP_HOST!,
@@ -76,16 +95,14 @@ export async function sendMail(opts: MailOptions): Promise<void> {
 // emailInvoice — high-level: load invoice + render PDF + send
 // ---------------------------------------------------------------------------
 
-/** Format a Date or string as YYYY-MM-DD for the PDF renderer. */
-function fmtDate(value: Date | string | null | undefined): string {
-  if (!value) return '';
-  const d = value instanceof Date ? value : new Date(value);
-  return d.toISOString().slice(0, 10);
-}
-
 /**
  * Send an invoice as a PDF attachment to the customer's email (or to a
  * caller-supplied `to` address if the customer email is absent).
+ *
+ * The PDF prints with the invoice form template (the given `templateId`, else the invoice
+ * default template — see lib/pdf/forms.ts) and the subject/body come from the Send Forms
+ * preferences (merge fields: {{number}}, {{customer.name}}, {{company.name}}, {{total}},
+ * {{balance}}, {{dueDate}}).
  *
  * Throws ServiceError('VALIDATION') when SMTP is not configured.
  * Throws ServiceError('NOT_FOUND') when the invoice or company is missing.
@@ -95,6 +112,7 @@ export async function emailInvoice(
   ctx: ServiceContext,
   invoiceId: string,
   to?: string | null,
+  templateId?: string | null,
 ): Promise<void> {
   // Guard early so we don't do heavy work when SMTP is unconfigured.
   if (!isConfigured()) {
@@ -134,43 +152,28 @@ export async function emailInvoice(
     );
   }
 
-  // Render PDF.
-  const pdfBytes = await renderInvoicePdf({
-    company: { name: company.name },
-    customerName,
-    invoice: {
-      number: invoice.invoiceNumber,
-      date: fmtDate(invoice.date),
-      dueDate: invoice.dueDate ? fmtDate(invoice.dueDate) : null,
-      subtotal: invoice.subtotal,
-      discount: invoice.discount,
-      tax: invoice.taxAmount,
-      total: invoice.total,
-      balanceDue: invoice.balanceDue,
-    },
-    lines: invoice.lines.map((l) => ({
-      description: l.description ?? '',
-      quantity: l.quantity,
-      rate: l.rate,
-      amount: l.amount,
-    })),
-  });
+  // Render PDF with the selected / default invoice template.
+  const { bytes: pdfBytes } = await buildInvoicePdf(ctx, invoiceId, templateId);
+  // The number the customer sees: the typed ref number, else the legacy integer.
+  const shownNumber = docRef(invoice.refNumber, invoice.invoiceNumber);
+  const filename = `invoice-${shownNumber.replace(/[^A-Za-z0-9._-]+/g, '_')}.pdf`;
 
-  const filename = `invoice-${invoice.invoiceNumber}.pdf`;
+  // Subject + body from Send Forms preferences.
+  const prefs = await getPreferences(ctx);
+  const merge = {
+    number: shownNumber,
+    'customer.name': customerName,
+    'company.name': company.name,
+    total: formatCurrency(invoice.total),
+    balance: formatCurrency(invoice.balanceDue),
+    dueDate: invoice.dueDate ? new Date(invoice.dueDate).toISOString().slice(0, 10) : '',
+  };
+  const form = prefs.sendForms.invoice;
 
   await sendMail({
     to: recipient,
-    subject: `Invoice #${invoice.invoiceNumber} from ${company.name}`,
-    text: [
-      `Dear ${customerName},`,
-      '',
-      `Please find attached Invoice #${invoice.invoiceNumber} from ${company.name}.`,
-      `Total: ${invoice.total}`,
-      `Balance Due: ${invoice.balanceDue}`,
-      '',
-      'Thank you for your business.',
-      company.name,
-    ].join('\n'),
+    subject: fillMergeFields(form.subject, merge),
+    text: fillMergeFields(form.body, merge),
     attachments: [
       {
         filename,
@@ -178,5 +181,5 @@ export async function emailInvoice(
         contentType: 'application/pdf',
       },
     ],
-  });
+  }, ctx);
 }

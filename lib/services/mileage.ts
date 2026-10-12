@@ -14,7 +14,7 @@
  */
 import { and, asc, between, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { mileageLogs, customers, jobs } from '@/lib/db/schema';
+import { mileageLogs, customers, jobs, vehicles } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -47,6 +47,11 @@ export interface MileageLog {
   /** Denormalized display names (null when not linked). */
   customerName: string | null;
   jobName: string | null;
+  /** Vehicle list (wave-2 lists) + optional odometer readings. */
+  vehicleId: string | null;
+  vehicleName: string | null;
+  odometerStart: string | null;
+  odometerEnd: string | null;
 }
 
 export interface LogMilesInput {
@@ -58,6 +63,13 @@ export interface LogMilesInput {
   ratePerMile?: number | string | null;
   purpose?: string | null;
   billable?: boolean;
+  /** Vehicle list entry the trip was driven in. */
+  vehicleId?: string | null;
+  /** Odometer readings; when both are given, miles must equal end − start. */
+  odometerStart?: number | string | null;
+  odometerEnd?: number | string | null;
+  /** Vehicle driven (Mileage by Vehicle report). */
+  vehicle?: string | null;
 }
 
 export interface MileageSummaryGroup {
@@ -83,10 +95,11 @@ export interface MileageSummary {
 
 export async function listMileage(
   ctx: ServiceContext,
-  opts: { customerId?: string } = {},
+  opts: { customerId?: string; vehicleId?: string } = {},
 ): Promise<MileageLog[]> {
   const conds = [eq(mileageLogs.companyId, ctx.companyId)];
   if (opts.customerId) conds.push(eq(mileageLogs.customerId, opts.customerId));
+  if (opts.vehicleId) conds.push(eq(mileageLogs.vehicleId, opts.vehicleId));
 
   const rows = await ctx.db
     .select({
@@ -103,10 +116,15 @@ export async function listMileage(
       createdAt: mileageLogs.createdAt,
       customerName: customers.displayName,
       jobName: jobs.name,
+      vehicleId: mileageLogs.vehicleId,
+      vehicleName: vehicles.name,
+      odometerStart: mileageLogs.odometerStart,
+      odometerEnd: mileageLogs.odometerEnd,
     })
     .from(mileageLogs)
     .leftJoin(customers, eq(mileageLogs.customerId, customers.id))
     .leftJoin(jobs, eq(mileageLogs.jobId, jobs.id))
+    .leftJoin(vehicles, eq(mileageLogs.vehicleId, vehicles.id))
     .where(and(...conds))
     .orderBy(desc(mileageLogs.date), desc(mileageLogs.createdAt));
 
@@ -115,6 +133,10 @@ export async function listMileage(
     amount: toAmountString(Money.mul(r.miles, r.ratePerMile)),
     customerName: r.customerName ?? null,
     jobName: r.jobName ?? null,
+    vehicleId: r.vehicleId ?? null,
+    vehicleName: r.vehicleName ?? null,
+    odometerStart: r.odometerStart ?? null,
+    odometerEnd: r.odometerEnd ?? null,
   }));
 }
 
@@ -151,6 +173,26 @@ export async function logMiles(ctx: ServiceContext, input: LogMilesInput): Promi
     if (!j) throw notFound('Job');
   }
 
+  if (input.vehicleId) {
+    const [v] = await ctx.db
+      .select({ id: vehicles.id, isActive: vehicles.isActive })
+      .from(vehicles)
+      .where(and(eq(vehicles.id, input.vehicleId), eq(vehicles.companyId, ctx.companyId)));
+    if (!v) throw notFound('Vehicle');
+    if (!v.isActive) throw validation('That vehicle is inactive.');
+  }
+  const odoStart = input.odometerStart != null && input.odometerStart !== '' ? Money.of(input.odometerStart) : null;
+  const odoEnd = input.odometerEnd != null && input.odometerEnd !== '' ? Money.of(input.odometerEnd) : null;
+  if ((odoStart && odoStart.isNegative()) || (odoEnd && odoEnd.isNegative())) {
+    throw validation('Odometer readings cannot be negative.');
+  }
+  if (odoStart && odoEnd) {
+    if (odoEnd.lessThan(odoStart)) throw validation('The ending odometer reading is lower than the starting one.');
+    if (!odoEnd.minus(odoStart).toDecimalPlaces(1).eq(miles.toDecimalPlaces(1))) {
+      throw validation(`The odometer readings add up to ${odoEnd.minus(odoStart).toFixed(1)} miles, not ${miles.toFixed(1)}.`);
+    }
+  }
+
   const [row] = await ctx.db
     .insert(mileageLogs)
     .values({
@@ -163,6 +205,10 @@ export async function logMiles(ctx: ServiceContext, input: LogMilesInput): Promi
       ratePerMile: rate.toFixed(4),
       purpose: input.purpose ?? null,
       billable: input.billable ?? false,
+      vehicleId: input.vehicleId ?? null,
+      odometerStart: odoStart ? odoStart.toFixed(1) : null,
+      odometerEnd: odoEnd ? odoEnd.toFixed(1) : null,
+      vehicle: input.vehicle?.trim() || null,
     })
     .returning();
 

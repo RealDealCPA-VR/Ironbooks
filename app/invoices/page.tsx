@@ -21,12 +21,39 @@ import {
   Modal,
   PageHeader,
   Spinner,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
-import { api } from '@/lib/client';
+import { Help } from '@/components/Help';
+import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  type ScannedItem,
+  invFromLine,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
+import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
+import { PriceSourceBadge } from '@/components/PriceSourceBadge';
+import Link from 'next/link';
+import {
+  EMPTY_SHIPPING,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+  useCreditLimitConfirm,
+} from '@/components/sales/SalesExtras';
+// wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmClassAssigned, confirmStockAvailable, confirmTransactionDate } from '@/lib/formPrefs';
+import { dueDateForTerms } from '@/lib/preferences';
+import MemorizeButton from '@/components/MemorizeButton';
+import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -35,6 +62,7 @@ import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
 interface Customer {
   id: string;
   displayName: string;
+  terms?: string | null;
 }
 
 type ItemType =
@@ -50,6 +78,7 @@ interface Item {
   taxable: boolean;
   quantityOnHand: string | null;
   unitOfMeasure: string | null;
+  trackingMode?: string | null;
 }
 
 interface BundleComponent {
@@ -85,12 +114,18 @@ type InvoiceStatus = 'draft' | 'open' | 'partial' | 'paid' | 'void';
 interface Invoice {
   id: string;
   invoiceNumber: number;
+  /** Alphanumeric number shown to users (e.g. "INV-1001"); null on very old rows. */
+  refNumber?: string | null;
   customerId: string;
   date: string;
   dueDate: string | null;
   total: string;
   balanceDue: string;
   status: InvoiceStatus;
+  /** wave2 sales: a customer-register statement charge (C5). */
+  isStatementCharge?: boolean;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 /** Full invoice (GET /api/invoices/:id) used to prefill the edit modal. */
@@ -114,6 +149,12 @@ interface InvoiceDetail extends Invoice {
     itemName: string | null;
     itemType: ItemType | null;
     unitOfMeasure: string | null;
+    // Advanced Inventory detail (present only when stored for the line)
+    siteId?: string | null;
+    binId?: string | null;
+    serialNumbers?: string[] | null;
+    lotNumber?: string | null;
+    lotExpiration?: string | null;
   }>;
 }
 
@@ -130,6 +171,10 @@ interface LineRow {
   jobId: string;
   /** Discount items only: interpret `rate` as a % of the preceding body lines. */
   discountPercent: boolean;
+  /** Advanced Inventory: site / bin / serials / lot the stock is sold from. */
+  inv?: InvDetail;
+  /** Advanced pricing: the user typed this rate, so automatic prices must not replace it. */
+  rateManual?: boolean;
 }
 
 /** Unbilled billable time & costs (GET /api/billables?customerId=). */
@@ -334,6 +379,8 @@ function InvoiceModal({
   const [currency, setCurrency] = useState('');
   const [exchangeRate, setExchangeRate] = useState('');
   const [memo, setMemo] = useState('');
+  const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
+  const creditLimit = useCreditLimitConfirm();
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [saving, setSaving] = useState(false);
   const [saveAsPending, setSaveAsPending] = useState(false);
@@ -347,8 +394,12 @@ function InvoiceModal({
   const [selectedCostIds, setSelectedCostIds] = useState<Set<string>>(new Set());
   const [selectedTimeIds, setSelectedTimeIds] = useState<Set<string>>(new Set());
   const [markupPercent, setMarkupPercent] = useState('');
+  // Invoice # typed by the user (blank = next number); duplicate-number confirm prompt.
+  const [refNumber, setRefNumber] = useState('');
+  const [dupNumberPrompt, setDupNumberPrompt] = useState<string | null>(null);
 
   const itemNameById = new Map(items.map((it) => [it.id, it.name]));
+  const prefs = usePreferences();
 
   // Reset / prefill form when the modal opens.
   useEffect(() => {
@@ -367,6 +418,7 @@ function InvoiceModal({
         editing.currency && editing.exchangeRate ? String(Number(editing.exchangeRate)) : '',
       );
       setMemo(editing.memo ?? '');
+      setShip(shippingFromDoc(editing));
       setSaveAsPending(editing.status === 'draft');
       setCustomValues(editing.customFields ?? {});
       setLines(
@@ -381,6 +433,9 @@ function InvoiceModal({
           taxable: l.taxable,
           jobId: l.jobId ?? '',
           discountPercent: false,
+          inv: invFromLine(l),
+          // Saved invoices keep their stored rates; the badge still flags rule differences.
+          rateManual: true,
         })),
       );
     } else {
@@ -393,17 +448,30 @@ function InvoiceModal({
       setDiscountType('amount');
       setCurrency('');
       setExchangeRate('');
-      setMemo('');
+      // Preferences > Sales & Customers: default customer message.
+      setMemo(prefs.company.defaultInvoiceMemo ?? '');
+      setShip(shippingFromDoc(null));
       setSaveAsPending(false);
+      setRefNumber('');
       setCustomValues({});
       setLines([{ ...EMPTY_LINE }]);
     }
     setBillables(null);
     setSelectedCostIds(new Set());
     setSelectedTimeIds(new Set());
-    setMarkupPercent('');
+    // Preferences > Time & Expenses: default markup on billable costs.
+    setMarkupPercent(prefs.company.defaultMarkupPercent > 0 ? String(prefs.company.defaultMarkupPercent) : '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing]);
+
+  // New invoice: due date follows the customer's terms (else the default terms preference).
+  useEffect(() => {
+    if (!open || editing || !customerId || !date) return;
+    const cust = customers.find((c) => c.id === customerId);
+    const due = dueDateForTerms(date, cust?.terms || prefs.company.defaultCustomerTerms);
+    if (due) setDueDate(due);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editing, customerId]);
 
   // When a customer is selected: load their price level + unbilled billables.
   useEffect(() => {
@@ -451,6 +519,24 @@ function InvoiceModal({
       return next;
     });
   }
+
+  // Advanced pricing: server-side price rules / price levels / customer prices per line.
+  const quotes = usePriceQuotes(
+    { customerId, date, classId: classId || null },
+    lines.map((l) => ({ itemId: lineKind(l) === 'income' ? l.itemId : null, quantity: l.quantity || '1' })),
+  );
+  useEffect(() => {
+    setLines((prev) => {
+      let changed = false;
+      const next = prev.map((l, i) => {
+        const qt = quotes[i];
+        if (!qt || l.rateManual || l.itemId !== qt.itemId || samePrice(l.rate, qt.price)) return l;
+        changed = true;
+        return { ...l, rate: String(Number(qt.price)) };
+      });
+      return changed ? next : prev;
+    });
+  }, [quotes]);
 
   /** Expand a bundle item into its component lines (printed grouped under the bundle name). */
   async function expandBundle(idx: number, bundle: Item) {
@@ -519,6 +605,7 @@ function InvoiceModal({
         taxable: isSpecial ? match.type === 'discount' && match.taxable : match.taxable,
         quantity: match.type === 'subtotal' ? '' : lines[idx].quantity || '1',
         discountPercent: false,
+        rateManual: false,
       });
       if (customerPrice != null && !isSpecial) {
         toast(`Customer price applied for ${match.name}: ${formatCurrency(customerPrice)}`, 'info');
@@ -540,6 +627,27 @@ function InvoiceModal({
 
   // Ctrl+Insert adds a line, Ctrl+Delete removes the focused row, Enter moves down.
   const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
+
+  // Advanced Inventory: sites/bins for item lines + scan-to-add (fills an empty line or
+  // appends one, then runs the normal item lookup so prices/bundles behave as if typed).
+  const adv = useAdvancedInventory(open);
+  const [pendingScanIdx, setPendingScanIdx] = useState<number | null>(null);
+  function addScannedItem(it: ScannedItem) {
+    const emptyIdx = lines.findIndex((l) => !l.itemId && !l.itemName && !l.description && !l.quantity && !l.rate);
+    if (emptyIdx >= 0) {
+      handleItemInput(emptyIdx, it.name);
+      return;
+    }
+    setLines((prev) => [...prev, { ...EMPTY_LINE, itemName: it.name }]);
+    setPendingScanIdx(lines.length);
+  }
+  useEffect(() => {
+    if (pendingScanIdx == null || !lines[pendingScanIdx]) return;
+    const name = lines[pendingScanIdx].itemName;
+    setPendingScanIdx(null);
+    handleItemInput(pendingScanIdx, name);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingScanIdx, lines]);
 
   function toggleCost(id: string) {
     setSelectedCostIds((prev) => {
@@ -582,7 +690,7 @@ function InvoiceModal({
     billablesAmount,
   );
 
-  async function handleSubmit() {
+  async function handleSubmit(allowDuplicateNumber = false) {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter an invoice date.', 'danger'); return; }
 
@@ -623,6 +731,7 @@ function InvoiceModal({
       exchangeRate: exchangeRate || undefined,
       memo: memo || undefined,
       customFields: customFieldDefs.length > 0 ? customValues : undefined,
+      ...shippingPayload(ship),
       lines: indexed.map(({ l, idx }) => {
         const kind = lineKind(l);
         if (kind === 'subtotal') {
@@ -647,12 +756,15 @@ function InvoiceModal({
           rate: l.rate,
           taxable: l.taxable,
           jobId: l.jobId || null,
+          ...inventoryLinePayload(l.inv),
         };
       }),
     };
 
     if (!editing) {
       payload.status = saveAsPending ? 'draft' : 'open';
+      if (refNumber.trim()) payload.refNumber = refNumber.trim();
+      if (allowDuplicateNumber) payload.allowDuplicateNumber = true;
     }
 
     if (!editing && hasBillablesSelected && billables) {
@@ -668,33 +780,56 @@ function InvoiceModal({
       };
     }
 
+    // Preferences: date range, class, and not-enough-inventory warnings.
+    if (!confirmTransactionDate(date, prefs)) return;
+    if (!confirmClassAssigned(classId, prefs)) return;
+    if (
+      !confirmStockAvailable(
+        indexed.map(({ l }) => ({ itemId: l.itemId, quantity: l.quantity })),
+        items,
+        prefs,
+        editing?.lines.map((l) => ({ itemId: l.itemId, quantity: l.quantity })) ?? [],
+      )
+    ) {
+      return;
+    }
+
     setSaving(true);
     try {
+      // Over the customer's credit limit → "Save anyway?" (recorded in the audit trail).
+      const saved = await creditLimit.run((override) =>
+        editing
+          ? api.patch(`/api/invoices/${editing.id}`, { ...payload, overrideCreditLimit: override })
+          : api.post('/api/invoices', { ...payload, overrideCreditLimit: override }),
+      );
+      if (saved === undefined) return; // user chose not to go over the limit
       if (editing) {
-        await api.patch(`/api/invoices/${editing.id}`, payload);
-        toast(`Invoice #${editing.invoiceNumber} updated.`, 'success');
+        toast(`Invoice #${editing.refNumber || editing.invoiceNumber} updated.`, 'success');
       } else {
-        await api.post('/api/invoices', payload);
         toast(saveAsPending ? 'Pending invoice saved (not posted).' : 'Invoice created.', 'success');
       }
       onSaved();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to save invoice.';
-      toast(msg, 'danger');
+      if (!editing && err instanceof ApiError && err.status === 409 && /already used/.test(err.message)) {
+        setDupNumberPrompt(err.message);
+        return;
+      }
+      toastError(err, 'Failed to save invoice.');
     } finally {
       setSaving(false);
     }
   }
 
   return (
+    <>
     <Modal
       size="lg"
       open={open}
       onClose={onClose}
       title={
         editing
-          ? `Edit Invoice #${editing.invoiceNumber}${editing.status === 'draft' ? ' (Pending)' : ''}`
+          ? `Edit Invoice #${editing.refNumber || editing.invoiceNumber}${editing.status === 'draft' ? ' (Pending)' : ''}`
           : 'New Invoice'
       }
       footer={
@@ -710,8 +845,34 @@ function InvoiceModal({
               Save as pending (don&apos;t post yet)
             </label>
           )}
+          <MemorizeButton
+            docType="invoice"
+            shortcut={open}
+            defaultName={customers.find((c) => c.id === customerId)?.displayName}
+            getTemplate={() => {
+              if (!customerId) return 'Pick a customer before memorizing.';
+              const rows = lines.filter((l) => (l.itemId || l.description) && lineKind(l) !== 'subtotal');
+              if (rows.length === 0) return 'Add at least one line before memorizing.';
+              return {
+                customerId,
+                date,
+                dueDate: dueDate || undefined,
+                taxRateId: taxRateId || undefined,
+                classId: classId || undefined,
+                memo: memo || undefined,
+                lines: rows.map((l) => ({
+                  itemId: l.itemId,
+                  description: l.description || null,
+                  quantity: l.quantity || '1',
+                  rate: l.rate || '0',
+                  taxable: l.taxable,
+                  jobId: l.jobId || null,
+                })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSubmit} loading={saving}>
+          <Button onClick={() => handleSubmit()} loading={saving}>
             {editing ? 'Save Changes' : saveAsPending ? 'Save Pending' : 'Create Invoice'}
           </Button>
         </>
@@ -720,8 +881,9 @@ function InvoiceModal({
       <div className="space-y-4">
         {editing && editing.status !== 'draft' && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
-            Editing re-posts this invoice&apos;s GL entry (and any COGS). Allowed only while no
-            payments are applied and the period is open.
+            Saving changes re-posts this invoice (and any cost of goods) so your books stay
+            balanced. Payments already received stay applied, so the new amount due can&apos;t be
+            less than what has been paid. The date must be after your closing date.
           </div>
         )}
         {editing && editing.status === 'draft' && (
@@ -733,7 +895,7 @@ function InvoiceModal({
 
         {/* Customer */}
         <div>
-          <Label htmlFor="inv-customer">Customer *</Label>
+          <Label htmlFor="inv-customer" required>Customer</Label>
           <Select
             id="inv-customer"
             value={customerId}
@@ -747,10 +909,24 @@ function InvoiceModal({
           </Select>
         </div>
 
+        {/* Invoice number (QB "Invoice #"): blank = next number, letters allowed */}
+        {!editing && (
+          <div>
+            <Label htmlFor="inv-number">Invoice #</Label>
+            <Input
+              id="inv-number"
+              value={refNumber}
+              maxLength={50}
+              placeholder="Leave blank for the next number"
+              onChange={(e) => setRefNumber(e.target.value)}
+            />
+          </div>
+        )}
+
         {/* Dates */}
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <Label htmlFor="inv-date">Invoice Date *</Label>
+            <Label htmlFor="inv-date" required>Invoice Date</Label>
             <DateInput
               id="inv-date"
               value={date}
@@ -785,7 +961,7 @@ function InvoiceModal({
             </Select>
           </div>
           <div>
-            <Label htmlFor="inv-class">Class</Label>
+            <Label htmlFor="inv-class">Class <Help term="class" /></Label>
             <Select
               id="inv-class"
               value={classId}
@@ -798,6 +974,10 @@ function InvoiceModal({
             </Select>
           </div>
         </div>
+
+        {/* Shipping + print/email queue (wave2 sales) */}
+        <ShippingSection value={ship} onChange={setShip} idPrefix="inv-ship" />
+        {creditLimit.dialog}
 
         {/* Custom fields (company-defined) */}
         {customFieldDefs.length > 0 && (
@@ -822,13 +1002,16 @@ function InvoiceModal({
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
-              <PlusCircle className="h-4 w-4" /> Add line
-            </button>
+            <div className="flex items-center gap-3">
+              <BarcodeScanInput onItem={addScannedItem} />
+              <button
+                type="button"
+                onClick={addLine}
+                className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
+              >
+                <PlusCircle className="h-4 w-4" /> Add line
+              </button>
+            </div>
           </div>
 
           {/* Find-as-you-type item options shared by all line rows */}
@@ -896,7 +1079,7 @@ function InvoiceModal({
                     placeholder={kind === 'discount' ? (line.discountPercent ? '%' : 'Amount') : 'Rate'}
                     value={kind === 'subtotal' ? '' : line.rate}
                     disabled={kind === 'subtotal'}
-                    onChange={(e) => updateLine(idx, { rate: e.target.value })}
+                    onChange={(e) => updateLine(idx, { rate: e.target.value, rateManual: true })}
                   />
                   <Select
                     value={line.jobId}
@@ -922,6 +1105,24 @@ function InvoiceModal({
                     {formatCurrency((totals.amounts[idx] ?? 0).toFixed(2))}
                   </span>
                 </div>
+                {/* Advanced Inventory: site / bin / serial / lot for inventory items */}
+                {kind === 'income' && line.itemId && (
+                  <InventoryLineFields
+                    adv={adv}
+                    item={items.find((it) => it.id === line.itemId)}
+                    quantity={line.quantity}
+                    direction="out"
+                    value={line.inv}
+                    onChange={(inv) => updateLine(idx, { inv })}
+                  />
+                )}
+                {kind === 'income' && (
+                  <PriceSourceBadge
+                    quote={quotes[idx]}
+                    rate={line.rate}
+                    onUseQuoted={(price) => updateLine(idx, { rate: String(Number(price)), rateManual: false })}
+                  />
+                )}
                 {/* Row 3 (special types / UoM): badge + helpers */}
                 {(badge || line.unitOfMeasure) && (
                   <div className="flex items-center gap-2 text-xs text-navy/50">
@@ -1138,7 +1339,22 @@ function InvoiceModal({
           )}
         </div>
       </div>
+      {open && (
+        <AttachmentPanel className="mt-4" entityType="invoice" entityId={editing?.id} />
+      )}
     </Modal>
+    <ConfirmDialog
+      open={dupNumberPrompt !== null}
+      title="Number already used"
+      message={dupNumberPrompt ?? undefined}
+      confirmLabel="Keep this number"
+      onClose={() => setDupNumberPrompt(null)}
+      onConfirm={() => {
+        setDupNumberPrompt(null);
+        void handleSubmit(true);
+      }}
+    />
+    </>
   );
 }
 
@@ -1168,6 +1384,7 @@ function InvoicesPageContent() {
 
   // Post (pending → posted) state
   const [postTarget, setPostTarget] = useState<Invoice | null>(null);
+  const postLimit = useCreditLimitConfirm();
   const [posting, setPosting] = useState(false);
 
   // Email state
@@ -1199,8 +1416,7 @@ function InvoicesPageContent() {
       setClasses(classList);
       setJobs(jobList);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load invoices.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load invoices.');
     } finally {
       setLoading(false);
     }
@@ -1238,8 +1454,7 @@ function InvoicesPageContent() {
       const detail = await api.get<InvoiceDetail>(`/api/invoices/${inv.id}`);
       setEditTarget(detail);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load invoice.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load invoice.');
     } finally {
       setLoadingEditId(null);
     }
@@ -1250,12 +1465,11 @@ function InvoicesPageContent() {
     setVoiding(true);
     try {
       await api.del(`/api/invoices/${voidTarget.id}`);
-      toast(`Invoice #${voidTarget.invoiceNumber} voided.`, 'success');
+      toast(`Invoice #${voidTarget.refNumber || voidTarget.invoiceNumber} voided.`, 'success');
       setVoidTarget(null);
       fetchData();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void invoice.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void invoice.');
     } finally {
       setVoiding(false);
     }
@@ -1265,13 +1479,15 @@ function InvoicesPageContent() {
     if (!postTarget) return;
     setPosting(true);
     try {
-      await api.post(`/api/invoices/${postTarget.id}/post`, {});
-      toast(`Invoice #${postTarget.invoiceNumber} posted to the GL.`, 'success');
+      const posted = await postLimit.run((override) =>
+        api.post(`/api/invoices/${postTarget.id}/post`, { overrideCreditLimit: override }),
+      );
+      if (posted === undefined) return;
+      toast(`Invoice #${postTarget.refNumber || postTarget.invoiceNumber} posted to the GL.`, 'success');
       setPostTarget(null);
       fetchData();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to post invoice.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to post invoice.');
     } finally {
       setPosting(false);
     }
@@ -1282,12 +1498,11 @@ function InvoicesPageContent() {
     setEmailing(true);
     try {
       await api.post(`/api/invoices/${emailTarget.id}/email`, emailTo ? { to: emailTo } : {});
-      toast(`Invoice #${emailTarget.invoiceNumber} emailed successfully.`, 'success');
+      toast(`Invoice #${emailTarget.refNumber || emailTarget.invoiceNumber} emailed successfully.`, 'success');
       setEmailTarget(null);
       setEmailTo('');
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to send email.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to send email.');
     } finally {
       setEmailing(false);
     }
@@ -1317,6 +1532,15 @@ function InvoicesPageContent() {
               <option value="paid">Paid</option>
               <option value="void">Void</option>
             </Select>
+            <Link href="/invoices/batch" className="text-sm font-semibold text-electric hover:underline px-2">
+              Batch invoicing
+            </Link>
+            <Link href="/invoices/statement-charges" className="text-sm font-semibold text-electric hover:underline px-2">
+              Statement charges
+            </Link>
+            <Link href="/invoices/send-forms" className="text-sm font-semibold text-electric hover:underline px-2">
+              Print / send forms
+            </Link>
             <Button onClick={() => setShowNew(true)}>
               <Plus className="h-4 w-4" /> New Invoice
             </Button>
@@ -1335,7 +1559,7 @@ function InvoicesPageContent() {
             title={statusFilter === 'all' ? 'No invoices yet' : `No ${statusLabel(statusFilter as InvoiceStatus).toLowerCase()} invoices`}
             message={
               statusFilter === 'all'
-                ? 'Create your first invoice to get started.'
+                ? 'An invoice bills a customer who will pay you later. Create one, then use Receive Payments when the money arrives.'
                 : 'Try a different status filter.'
             }
             action={
@@ -1372,7 +1596,14 @@ function InvoicesPageContent() {
                   id={`invoice-row-${inv.id}`}
                   className={inv.id === focusedId ? 'bg-electric/10' : undefined}
                 >
-                  <Td className="font-semibold text-navy">#{inv.invoiceNumber}</Td>
+                  <Td className="font-semibold text-navy">
+                    #{inv.refNumber ?? inv.invoiceNumber}
+                    {inv.isStatementCharge && (
+                      <span className="ml-2 align-middle">
+                        <Badge tone="neutral">Statement charge</Badge>
+                      </span>
+                    )}
+                  </Td>
                   <Td>{customerMap[inv.customerId] ?? '—'}</Td>
                   <Td className="text-navy/70">{formatDate(inv.date)}</Td>
                   <Td className="text-navy/70">{formatDate(inv.dueDate)}</Td>
@@ -1513,13 +1744,13 @@ function InvoicesPageContent() {
         message={
           voidTarget?.status === 'draft' ? (
             <>
-              Discard pending <strong>Invoice #{voidTarget?.invoiceNumber}</strong>? Nothing was
+              Discard pending <strong>Invoice #{voidTarget?.refNumber || voidTarget?.invoiceNumber}</strong>? Nothing was
               posted to the GL, so this just marks the draft void.
             </>
           ) : (
             <>
               Are you sure you want to void{' '}
-              <strong>Invoice #{voidTarget?.invoiceNumber}</strong>? This will reverse the GL
+              <strong>Invoice #{voidTarget?.refNumber || voidTarget?.invoiceNumber}</strong>? This will reverse the GL
               entry and cannot be undone.
             </>
           )
@@ -1536,7 +1767,7 @@ function InvoicesPageContent() {
         title="Post Pending Invoice"
         message={
           <>
-            Post <strong>Invoice #{postTarget?.invoiceNumber}</strong> to the general ledger? This
+            Post <strong>Invoice #{postTarget?.refNumber || postTarget?.invoiceNumber}</strong> to the general ledger? This
             records A/R and income (and relieves inventory) as of the invoice date. The fiscal
             period is checked now.
           </>
@@ -1551,7 +1782,7 @@ function InvoicesPageContent() {
       <Modal
         open={!!emailTarget}
         onClose={() => { setEmailTarget(null); setEmailTo(''); }}
-        title={`Email Invoice #${emailTarget?.invoiceNumber ?? ''}`}
+        title={`Email Invoice #${emailTarget?.refNumber || emailTarget?.invoiceNumber || ''}`}
         footer={
           <>
             <Button variant="secondary" onClick={() => { setEmailTarget(null); setEmailTo(''); }} disabled={emailing}>
@@ -1586,6 +1817,7 @@ function InvoicesPageContent() {
           </p>
         </div>
       </Modal>
+      {postLimit.dialog}
     </main>
   );
 }

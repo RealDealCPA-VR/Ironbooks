@@ -14,8 +14,10 @@
  * reference the correct A/R / A/P accounts; only the customer/vendor FK on the
  * sub-ledger documents is updated. The GL and trial balance remain balanced.
  */
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import {
+  bouncedChecks,
+  collectionNotes,
   customers,
   vendors,
   invoices,
@@ -35,7 +37,6 @@ import {
   timeEntries,
   mileageLogs,
   accounts,
-  journalEntries,
   journalEntryLines,
   bankAccounts,
   items,
@@ -58,7 +59,10 @@ import {
 } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, inTransaction, writeAudit } from './_base';
-import { balanceDelta } from './posting';
+import { allowLedgerRewrite } from './posting';
+import { qbAccountTypeOf } from '@/lib/accountTypes';
+import { repointForeignKeys } from './lists/references';
+import { moveNotesAndTodos } from './lists/notes';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -173,6 +177,16 @@ export async function mergeCustomers(
       .where(and(eq(mileageLogs.customerId, fromId), eq(mileageLogs.companyId, tx.companyId)))
       .returning({ id: mileageLogs.id });
 
+    // wave2 sales: bounced-check records and collections notes follow the customer.
+    await tx.db
+      .update(bouncedChecks)
+      .set({ customerId: toId })
+      .where(and(eq(bouncedChecks.customerId, fromId), eq(bouncedChecks.companyId, tx.companyId)));
+    await tx.db
+      .update(collectionNotes)
+      .set({ customerId: toId })
+      .where(and(eq(collectionNotes.customerId, fromId), eq(collectionNotes.companyId, tx.companyId)));
+
     // customerPrices: drop any from-customer price whose item is already priced for the
     // survivor (no unique constraint exists, but we avoid creating duplicate price rows),
     // then re-point the remainder.
@@ -228,6 +242,30 @@ export async function mergeCustomers(
       )
       .returning({ id: expenseLines.id });
 
+    // Named General Journal lines (QB "Name" column): the duplicate's A/R open items and any
+    // other customer-named lines follow the customer. Only the name changes — amounts and
+    // accounts stay put — but posted lines are immutable outside a sanctioned rewrite.
+    const jelRows = await repointJournalNames(tx, 'customer', fromId, toId);
+    // Wave-2 lists: sweep every remaining foreign key to the customer (sales receipts, tables
+    // added by other modules, ...) and carry dated notes / to-dos over. The sub-customer
+    // hierarchy is handled explicitly so the survivor can never become its own parent.
+    const [toCust] = await tx.db
+      .select({ parentId: customers.parentId })
+      .from(customers)
+      .where(eq(customers.id, toId));
+    if (toCust?.parentId === fromId) {
+      const [fromCust] = await tx.db
+        .select({ parentId: customers.parentId })
+        .from(customers)
+        .where(eq(customers.id, fromId));
+      await tx.db
+        .update(customers)
+        .set({ parentId: fromCust?.parentId ?? null, updatedAt: new Date() })
+        .where(eq(customers.id, toId));
+    }
+    const sweptCustomer = await repointForeignKeys(tx, 'customers', fromId, toId);
+    const movedCustomerNotes = await moveNotesAndTodos(tx, 'customer', fromId, toId);
+
     // Deactivate the from-customer.
     await tx.db
       .update(customers)
@@ -262,7 +300,10 @@ export async function mergeCustomers(
           customerPrices: priceRows.length,
           billLines: billLineRows.length,
           expenseLines: expenseLineRows.length,
+          journalEntryLines: jelRows,
         },
+        otherReferences: sweptCustomer,
+        notesAndTodos: movedCustomerNotes,
       },
     });
 
@@ -338,6 +379,13 @@ export async function mergeVendors(
       .where(and(eq(purchaseOrders.vendorId, fromId), eq(purchaseOrders.companyId, tx.companyId)))
       .returning({ id: purchaseOrders.id });
 
+    // Named General Journal lines follow the vendor (A/P open items from journal entries).
+    const jelRows = await repointJournalNames(tx, 'vendor', fromId, toId);
+    // Wave-2 lists: sweep every remaining foreign key to the vendor (items' preferred vendor,
+    // item receipts, tables added by other modules, ...) and carry notes / to-dos over.
+    const sweptVendor = await repointForeignKeys(tx, 'vendors', fromId, toId);
+    const movedVendorNotes = await moveNotesAndTodos(tx, 'vendor', fromId, toId);
+
     // Deactivate the from-vendor.
     await tx.db
       .update(vendors)
@@ -364,7 +412,10 @@ export async function mergeVendors(
           expenses: expRows.length,
           vendorCredits: vcRows.length,
           purchaseOrders: poRows.length,
+          journalEntryLines: jelRows,
         },
+        otherReferences: sweptVendor,
+        notesAndTodos: movedVendorNotes,
       },
     });
 
@@ -379,6 +430,32 @@ export async function mergeVendors(
       deactivatedId: fromId,
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Named journal lines
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-point the QB "Name" on journal entry lines from one customer/vendor to another. The
+ * entity id is a UUID already verified to belong to this company, so the match is tenant-safe
+ * even though journal_entry_lines has no companyId column. Posted lines are immutable outside
+ * a sanctioned rewrite, so this runs under allowLedgerRewrite('merge') in the caller's
+ * transaction. Accounts and amounts are untouched, so every entry stays balanced.
+ */
+async function repointJournalNames(
+  tx: ServiceContext,
+  entityType: 'customer' | 'vendor',
+  fromId: string,
+  toId: string,
+): Promise<number> {
+  await allowLedgerRewrite(tx, 'merge');
+  const rows = await tx.db
+    .update(journalEntryLines)
+    .set({ entityId: toId })
+    .where(and(eq(journalEntryLines.entityType, entityType), eq(journalEntryLines.entityId, fromId)))
+    .returning({ id: journalEntryLines.id });
+  return rows.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,8 +483,10 @@ export interface MergeAccountsResult {
  * an account FK — the journal lines themselves (the GL history), item account
  * mappings, bank-account links, bank rules, budgets, document lines, transfers,
  * fixed-asset mappings, tax agencies, and accountIds embedded in recurring
- * templates / memorized-report configs — then recomputes the survivor's cached
- * balance from the posted ledger, zeroes + deactivates the source, and audits.
+ * templates / memorized-report configs — then deactivates the source and audits.
+ * Cached balances follow the re-pointed lines automatically (DB trigger, see
+ * drizzle/0017_team_ledger.sql): the survivor ends with the full ledger balance
+ * and the source with zero.
  *
  * Tenancy note: several line tables (journal_entry_lines, invoice_lines, …)
  * have no companyId column. `fromId` is a UUID primary key verified above to
@@ -439,6 +518,18 @@ export async function mergeAccounts(
       `Accounts must be the same type to merge (${fromRow.type} vs ${toRow.type}).`,
     );
   }
+  // QuickBooks only merges accounts of the same account type (Bank with Bank, Other Current
+  // Asset with Other Current Asset, ...). This also keeps A/R and A/P clean: every line on them
+  // carries a customer/vendor name, so unnamed lines from another type can never land there,
+  // and non-posting accounts can never receive posted history.
+  if (qbAccountTypeOf(fromRow) !== qbAccountTypeOf(toRow)) {
+    throw validation(
+      `"${fromRow.name}" and "${toRow.name}" are different kinds of account, so they can't be merged. Only accounts of the same type can be merged.`,
+    );
+  }
+  if (fromRow.subtype === 'non_posting' || toRow.subtype === 'non_posting') {
+    throw validation('Non-posting accounts (estimates, purchase orders) cannot be merged.');
+  }
 
   return inTransaction(ctx, async (tx) => {
     const reassigned: Record<string, number> = {};
@@ -450,6 +541,9 @@ export async function mergeAccounts(
     };
 
     // --- The GL itself: journal entry lines (posted, draft AND void history). ---
+    // Re-pointing lines of posted entries is a sanctioned ledger rewrite (same-type accounts,
+    // so every entry stays balanced; the DB trigger moves the balance with the lines).
+    await allowLedgerRewrite(tx, 'merge');
     await count(
       'journalEntryLines',
       tx.db
@@ -739,34 +833,18 @@ export async function mergeAccounts(
     }
     reassigned['memorizedReports'] = memorizedCount;
 
-    // --- Recompute the survivor's cached balance from the posted ledger (the
-    // authoritative source the posting engine maintains it from), and zero +
-    // deactivate the source — its entire ledger history now lives on the survivor. ---
-    const [sums] = await tx.db
-      .select({
-        debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
-        credit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
-      })
-      .from(journalEntryLines)
-      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-      .where(
-        and(
-          eq(journalEntryLines.accountId, toId),
-          eq(journalEntries.companyId, tx.companyId),
-          eq(journalEntries.status, 'posted'),
-        ),
-      );
-    const newBalance = toAmountString(
-      balanceDelta(toRow.type, sums?.debit ?? 0, sums?.credit ?? 0),
-    );
-    await tx.db
-      .update(accounts)
-      .set({ balance: newBalance, updatedAt: new Date() })
+    // --- Cached balances: the DB trigger already moved the balance along with the
+    // re-pointed lines (survivor = full ledger, source = 0). Read the survivor's
+    // balance back and deactivate the source — its history now lives on the survivor. ---
+    const [survivor] = await tx.db
+      .select({ balance: accounts.balance })
+      .from(accounts)
       .where(eq(accounts.id, toId));
+    const newBalance = toAmountString(survivor?.balance ?? 0);
 
     await tx.db
       .update(accounts)
-      .set({ balance: '0.00', isActive: false, updatedAt: new Date() })
+      .set({ isActive: false, updatedAt: new Date() })
       .where(eq(accounts.id, fromId));
 
     // Audit: deactivation of the source account.

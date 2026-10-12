@@ -4,10 +4,10 @@
  * Query params:
  *   from — ISO date string (inclusive start), optional
  *   to   — ISO date string (inclusive end), optional
+ *   basis — 'accrual' (default; ties to the GL) or 'cash'
  *
- * Returns { rows: AgencyLiabilityRow[], totalCollected, totalPaid, totalBalance }.
- * Collected is allocated to agencies through tax-rate components; paid sums the
- * posted "tax_agency:<id>" payment entries (what paySalesTax writes).
+ * Returns { rows: AgencyLiabilityRow[], totalCollected, totalPaid, totalBalance, glBalance, tiesToGl }
+ * from the GL-driven sales-tax engine (lib/services/accountant/salesTaxLedger.ts).
  *
  * Payments themselves POST to /api/pay-liabilities with type 'sales_tax' and an
  * agencyId — the service debits the agency's liabilityAccountId when set (else 2200).
@@ -36,7 +36,8 @@ export async function GET(req: NextRequest) {
     const ctx = await getServerContext();
     const { searchParams } = req.nextUrl;
 
-    const range: { from?: Date; to?: Date } = {};
+    const range: { from?: Date; to?: Date; basis?: 'accrual' | 'cash' } = {};
+    if (searchParams.get('basis') === 'cash') range.basis = 'cash';
     const fromStr = searchParams.get('from');
     const toStr = searchParams.get('to');
     if (fromStr) {

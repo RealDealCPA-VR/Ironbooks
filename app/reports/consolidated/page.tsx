@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import Link from 'next/link';
 import { Building2 } from 'lucide-react';
 import { Button, Card, PageHeader, Table, Th, Td, Tr, Badge, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
@@ -404,6 +405,14 @@ export default function ConsolidatedReportPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+      <nav aria-label="More combined reports" className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-sm print-hidden">
+        <span className="text-navy/50">More combined reports:</span>
+        <Link className="text-electric hover:underline" href="/reports/std/combined-trial-balance">Trial Balance</Link>
+        <Link className="text-electric hover:underline" href="/reports/std/combined-cash-flow">Cash Flow</Link>
+        <Link className="text-electric hover:underline" href="/reports/std/combined-pl-by-month">P&amp;L by Month</Link>
+        <Link className="text-electric hover:underline" href="/reports/std/combined-ar-aging">A/R Aging</Link>
+        <Link className="text-electric hover:underline" href="/reports/std/combined-ap-aging">A/P Aging</Link>
+      </nav>
       <PageHeader
         title="Consolidated Reports"
         icon={Building2}

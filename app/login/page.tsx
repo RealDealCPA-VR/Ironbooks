@@ -46,8 +46,14 @@ export default function LoginPage() {
         </div>
         <form onSubmit={submit} className="space-y-4">
           <div>
-            <Label>Email</Label>
-            <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoFocus />
+            <Label>Email or user name</Label>
+            <Input
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="username"
+              required
+              autoFocus
+            />
           </div>
           <div>
             <Label>Password</Label>
@@ -76,9 +82,9 @@ export default function LoginPage() {
           </Link>
         </p>
         <p className="mt-2 text-center text-sm text-navy/50">
-          No account?{' '}
+          New company file?{' '}
           <Link href="/signup" className="text-electric font-semibold hover:underline">
-            Create one
+            Set up the first user
           </Link>
         </p>
       </Card>

@@ -2,22 +2,30 @@
  * Zod schemas for /api/sales-receipts — mirrors CreateSalesReceiptInput.
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
+import { inventoryLineFields } from './inventorySites';
+import { sendFlagFields, shippingFields } from './sales';
 
 export const salesReceiptLineSchema = z.object({
   itemId: zUuid.nullish(),
   accountId: zUuid.nullish(),
   description: z.string().nullish(),
   quantity: zDecimal,
-  rate: zDecimal,
+  /** Omit on item lines to have the server price the line (advanced pricing). */
+  rate: zDecimal.nullish(),
   /** Defaults to true (matches prior route behavior). */
   taxable: z.boolean().default(true),
   taxRateId: zUuid.nullish(),
+  /** Advanced Inventory: site/bin/serial/lot the stock is sold from. */
+  ...inventoryLineFields,
 });
 
 export const createSalesReceiptSchema = z.object({
   /** Optional — walk-in / counter sales have no customer. */
   customerId: zUuid.nullish(),
+  /** Typed document number (e.g. "INV-1001"); blank = next number. */
+  refNumber: zDocNumber,
+  allowDuplicateNumber: z.boolean().nullish(),
   date: zDate,
   taxRateId: zUuid.nullish(),
   depositAccountId: zUuid.nullish(),
@@ -33,5 +41,7 @@ export const createSalesReceiptSchema = z.object({
   memo: z.string().nullish(),
   classId: zUuid.nullish(),
   lines: zLines(salesReceiptLineSchema),
+  ...shippingFields,
+  ...sendFlagFields,
 });
 export type CreateSalesReceiptBody = z.infer<typeof createSalesReceiptSchema>;

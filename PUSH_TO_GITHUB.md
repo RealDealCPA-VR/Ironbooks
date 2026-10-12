@@ -1,3 +1,8 @@
+> **⚠️ HISTORICAL DOCUMENT — December 2025; the push described below already happened.**
+> The real remote is `https://github.com/RealDealCPA-VR/Open-Source-QB.git` and the repo now has ~766 tracked files (not the 15-16 listed here).
+> The app shipped as an offline **Electron + PGlite** desktop application, not the cloud SaaS described in these docs.
+> See [README.md](README.md) for the current project; for setup see [INSTALL.md](INSTALL.md), and for the roadmap [TODO.md](TODO.md).
+
 # Push BookKeeper AI to GitHub
 
 ## Your repository is ready to push! 🚀
@@ -116,8 +121,8 @@ After pushing, configure these in GitHub settings:
 
 3. **Secrets** (for GitHub Actions):
    - `DATABASE_URL`
-   - `ANTHROPIC_API_KEY`
    - `NEXTAUTH_SECRET`
+   (AI provider keys are not secrets of the build: they are entered per company in AI & Automation.)
 
 ## Next Steps After Pushing
 

@@ -107,6 +107,7 @@ describe('year-end close vs P&L reports', () => {
     classId = cls.id;
 
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2024-04-01'),
       description: 'Revenue',
       lines: [
@@ -115,6 +116,7 @@ describe('year-end close vs P&L reports', () => {
       ],
     });
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2024-08-01'),
       description: 'Expense',
       lines: [
@@ -195,6 +197,7 @@ describe('year-end close fiscal year end setting', () => {
 
     // Inside FY2026 (2025-07-01 .. 2026-06-30).
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-07-15'),
       description: 'In FY2026',
       lines: [
@@ -204,6 +207,7 @@ describe('year-end close fiscal year end setting', () => {
     });
     // After FY2026 — must be excluded.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2026-07-01'),
       description: 'In FY2027',
       lines: [
@@ -245,7 +249,7 @@ describe('cash flow statement', () => {
     ]);
 
     const post = (date: string, description: string, lines: { accountId: string; debit?: string; credit?: string }[]) =>
-      postJournalEntry(ctx, { date: new Date(date), description, lines });
+      postJournalEntry(ctx, { date: new Date(date), description, lines, allowUnnamedControl: true });
 
     await post('2024-02-01', 'Invoice', [
       { accountId: acct['1200'], debit: '1000.00' },
@@ -471,6 +475,7 @@ describe('general ledger', () => {
       ['4000', 'Sales', 'revenue', 'sales'],
     ]);
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2024-01-10'),
       description: 'Early sale',
       lines: [
@@ -479,6 +484,7 @@ describe('general ledger', () => {
       ],
     });
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2024-05-10'),
       description: 'Later sale',
       lines: [
@@ -564,6 +570,7 @@ describe('budget vs actual', () => {
 
     // Actuals: 150 revenue (classed), 40 expense (unclassified, unbudgeted).
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2024-02-01'),
       description: 'Sale',
       lines: [
@@ -572,6 +579,7 @@ describe('budget vs actual', () => {
       ],
     });
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2024-03-01'),
       description: 'Supplies',
       lines: [

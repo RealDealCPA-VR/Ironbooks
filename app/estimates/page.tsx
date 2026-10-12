@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { ClipboardList, Plus, ArrowRight, Trash2, Download, Percent } from 'lucide-react';
+import { ClipboardList, Plus, ArrowRight, Percent, Pencil } from 'lucide-react';
 import {
   AmountInput,
   Button,
@@ -20,11 +20,20 @@ import {
   PageHeader,
   Spinner,
   toast,
-  useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
+import { PricedLinesEditor, type PricedLineItem } from '@/components/PricedLinesEditor';
+import {
+  EMPTY_SHIPPING,
+  FormSendButtons,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+  useCreditLimitConfirm,
+} from '@/components/sales/SalesExtras';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,6 +53,9 @@ interface Estimate {
   convertedInvoiceId: string | null;
   /** Total billed via progress invoicing so far (≤ total). */
   amountInvoiced: string;
+  taxRateId?: string | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 interface EstimateDetailLine {
@@ -73,6 +85,8 @@ interface EstimateLineForm {
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** Advanced pricing: the user typed the rate (automatic prices leave it alone). */
+  rateManual?: boolean;
 }
 
 interface EstimateForm {
@@ -88,7 +102,7 @@ const EMPTY_LINE: EstimateLineForm = {
   itemId: '',
   description: '',
   quantity: '1',
-  rate: '0',
+  rate: '',
   taxable: true,
 };
 
@@ -123,80 +137,6 @@ function statusLabel(status: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Line row component
-// ---------------------------------------------------------------------------
-
-function LineRow({
-  line,
-  index,
-  onChange,
-  onRemove,
-  canRemove,
-}: {
-  line: EstimateLineForm;
-  index: number;
-  onChange: (idx: number, field: keyof EstimateLineForm, value: string | boolean) => void;
-  onRemove: (idx: number) => void;
-  canRemove: boolean;
-}) {
-  const qty = parseFloat(line.quantity) || 0;
-  const rate = parseFloat(line.rate) || 0;
-  const amount = qty * rate;
-
-  return (
-    <div data-grid-row className="grid grid-cols-12 gap-2 items-center mb-2">
-      <div className="col-span-4">
-        <Input
-          placeholder="Description"
-          value={line.description}
-          onChange={(e) => onChange(index, 'description', e.target.value)}
-        />
-      </div>
-      <div className="col-span-2">
-        <AmountInput
-          placeholder="Qty"
-          value={line.quantity}
-          onChange={(e) => onChange(index, 'quantity', e.target.value)}
-        />
-      </div>
-      <div className="col-span-2">
-        <AmountInput
-          placeholder="Rate"
-          value={line.rate}
-          onChange={(e) => onChange(index, 'rate', e.target.value)}
-        />
-      </div>
-      <div className="col-span-1 flex justify-center">
-        <label className="flex items-center gap-1 text-xs text-navy/60 select-none">
-          <input
-            type="checkbox"
-            checked={line.taxable}
-            onChange={(e) => onChange(index, 'taxable', e.target.checked)}
-            className="accent-electric"
-            title="Taxable line"
-          />
-        </label>
-      </div>
-      <div className="col-span-2 text-right text-sm tabular-nums text-navy font-semibold">
-        {formatCurrency(amount)}
-      </div>
-      <div className="col-span-1 flex justify-end">
-        {canRemove && (
-          <button
-            type="button"
-            onClick={() => onRemove(index)}
-            className="text-red-400 hover:text-red-600 p-1 rounded"
-            title="Remove line"
-          >
-            <Trash2 className="h-4 w-4" />
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // New Estimate modal form
 // ---------------------------------------------------------------------------
 
@@ -204,18 +144,16 @@ function EstimateFormBody({
   form,
   customers,
   taxRates,
+  items,
   onChange,
-  onLineChange,
-  onAddLine,
-  onRemoveLine,
+  onLinesChange,
 }: {
   form: EstimateForm;
   customers: Customer[];
   taxRates: TaxRate[];
+  items: PricedLineItem[];
   onChange: (field: keyof EstimateForm, value: string) => void;
-  onLineChange: (idx: number, field: keyof EstimateLineForm, value: string | boolean) => void;
-  onAddLine: () => void;
-  onRemoveLine: (idx: number) => void;
+  onLinesChange: (lines: EstimateLineForm[]) => void;
 }) {
   const subtotal = form.lines.reduce(
     (sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0),
@@ -229,15 +167,6 @@ function EstimateFormBody({
   const selectedRate = taxRates.find((t) => t.id === form.taxRateId);
   const taxAmount = taxableSubtotal * (selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
   const total = subtotal + taxAmount;
-
-  // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
-  const grid = useGridKeys({
-    addRow: onAddLine,
-    removeRow: (idx) => {
-      // Keep at least one line (mirrors the per-row remove button's canRemove).
-      if (form.lines.length > 1) onRemoveLine(idx);
-    },
-  });
 
   return (
     <div className="flex flex-col gap-4">
@@ -296,38 +225,15 @@ function EstimateFormBody({
         </div>
       </div>
 
-      <div onKeyDown={grid.onKeyDown}>
+      <div>
         <Label>Line Items *</Label>
-        <div className="grid grid-cols-12 gap-2 text-xs font-semibold text-navy/50 mb-2">
-          <div className="col-span-4">Description</div>
-          <div className="col-span-2">Qty</div>
-          <div className="col-span-2">Rate</div>
-          <div className="col-span-1 text-center">Tax</div>
-          <div className="col-span-2 text-right">Amount</div>
-          <div className="col-span-1" />
-        </div>
-
-        {form.lines.map((line, idx) => (
-          <LineRow
-            key={idx}
-            line={line}
-            index={idx}
-            onChange={onLineChange}
-            onRemove={onRemoveLine}
-            canRemove={form.lines.length > 1}
-          />
-        ))}
-
-        <Button
-          variant="ghost"
-          size="sm"
-          type="button"
-          onClick={onAddLine}
-          className="mt-1 text-electric"
-        >
-          <Plus className="h-3.5 w-3.5" />
-          Add Line
-        </Button>
+        <PricedLinesEditor
+          items={items}
+          lines={form.lines}
+          onChange={onLinesChange}
+          header={{ customerId: form.customerId || null, date: form.date }}
+          showTaxable
+        />
 
         <div className="flex flex-col items-end gap-0.5 mt-3 pt-3 border-t border-slate-100 text-sm">
           <span className="text-navy/60">Subtotal: {formatCurrency(subtotal)}</span>
@@ -362,6 +268,7 @@ export default function EstimatesPage() {
   const [estimates, setEstimates] = useState<Estimate[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
+  const [items, setItems] = useState<PricedLineItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [customerMap, setCustomerMap] = useState<Map<string, string>>(new Map());
 
@@ -369,6 +276,11 @@ export default function EstimatesPage() {
   const [addOpen, setAddOpen] = useState(false);
   const [addForm, setAddForm] = useState<EstimateForm>({ ...EMPTY_FORM, lines: [{ ...EMPTY_LINE }] });
   const [addSaving, setAddSaving] = useState(false);
+  /** wave2 sales (C1): the estimate being edited (null = new). */
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingNumber, setEditingNumber] = useState<number | null>(null);
+  const [sendFlags, setSendFlags] = useState<ShippingState>(EMPTY_SHIPPING);
+  const creditLimit = useCreditLimitConfirm();
 
   // Convert confirm modal.
   const [convertTarget, setConvertTarget] = useState<Estimate | null>(null);
@@ -424,6 +336,12 @@ export default function EstimatesPage() {
     fetchEstimates();
     fetchCustomers();
     fetchTaxRates();
+    api
+      .get<{ items: PricedLineItem[] }>('/api/items')
+      .then((r) => setItems(r.items ?? []))
+      .catch(() => {
+        // Non-fatal; lines can still be typed without an item.
+      });
   }, [fetchEstimates, fetchCustomers, fetchTaxRates]);
 
   // ---------------------------------------------------------------------------
@@ -432,30 +350,42 @@ export default function EstimatesPage() {
 
   function openAddModal() {
     setAddForm({ ...EMPTY_FORM, date: today(), lines: [{ ...EMPTY_LINE }] });
+    setEditingId(null);
+    setEditingNumber(null);
+    setSendFlags(shippingFromDoc(null));
     setAddOpen(true);
+  }
+
+  /** Edit a saved estimate (allowed until it has been turned into an invoice). */
+  async function openEditModal(estimate: Estimate) {
+    try {
+      const detail = await api.get<Estimate & { lines: EstimateDetailLine[] }>(`/api/estimates/${estimate.id}`);
+      setAddForm({
+        customerId: detail.customerId,
+        date: detail.date.slice(0, 10),
+        expirationDate: detail.expirationDate ? detail.expirationDate.slice(0, 10) : '',
+        taxRateId: detail.taxRateId ?? '',
+        memo: detail.memo ?? '',
+        lines: detail.lines.map((l) => ({
+          itemId: l.itemId ?? '',
+          description: l.description ?? '',
+          quantity: String(Number(l.quantity)),
+          rate: String(Number(l.rate)),
+          taxable: l.taxable,
+          rateManual: true,
+        })),
+      });
+      setSendFlags(shippingFromDoc(detail));
+      setEditingId(detail.id);
+      setEditingNumber(detail.estimateNumber);
+      setAddOpen(true);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not open the estimate', 'danger');
+    }
   }
 
   function handleFormChange(field: keyof EstimateForm, value: string) {
     setAddForm((prev) => ({ ...prev, [field]: value }));
-  }
-
-  function handleLineChange(idx: number, field: keyof EstimateLineForm, value: string | boolean) {
-    setAddForm((prev) => {
-      const lines = [...prev.lines];
-      lines[idx] = { ...lines[idx], [field]: value };
-      return { ...prev, lines };
-    });
-  }
-
-  function handleAddLine() {
-    setAddForm((prev) => ({ ...prev, lines: [...prev.lines, { ...EMPTY_LINE }] }));
-  }
-
-  function handleRemoveLine(idx: number) {
-    setAddForm((prev) => ({
-      ...prev,
-      lines: prev.lines.filter((_, i) => i !== idx),
-    }));
   }
 
   async function handleCreate() {
@@ -474,7 +404,8 @@ export default function EstimatesPage() {
 
     setAddSaving(true);
     try {
-      await api.post('/api/estimates', {
+      const body = {
+        ...shippingPayload(sendFlags, { shipping: false }),
         customerId: addForm.customerId,
         date: addForm.date,
         expirationDate: addForm.expirationDate || null,
@@ -484,11 +415,18 @@ export default function EstimatesPage() {
           itemId: l.itemId || null,
           description: l.description.trim(),
           quantity: parseFloat(l.quantity) || 1,
-          rate: parseFloat(l.rate) || 0,
+          // Blank rate on an item line: the server prices it (advanced pricing).
+          rate: l.rate.trim() === '' ? (l.itemId ? null : 0) : parseFloat(l.rate) || 0,
           taxable: l.taxable,
         })),
-      });
-      toast('Estimate created', 'success');
+      };
+      if (editingId) {
+        await api.patch(`/api/estimates/${editingId}`, body);
+        toast(`Estimate #${editingNumber} updated`, 'success');
+      } else {
+        await api.post('/api/estimates', body);
+        toast('Estimate created', 'success');
+      }
       setAddOpen(false);
       await fetchEstimates();
     } catch (err) {
@@ -523,7 +461,10 @@ export default function EstimatesPage() {
     if (!convertTarget) return;
     setConverting(true);
     try {
-      await api.post(`/api/estimates/${convertTarget.id}`, { action: 'convert' });
+      const done = await creditLimit.run((override) =>
+        api.post(`/api/estimates/${convertTarget.id}`, { action: 'convert', overrideCreditLimit: override }),
+      );
+      if (done === undefined) return;
       toast(`Estimate #${convertTarget.estimateNumber} converted to invoice`, 'success');
       setConvertTarget(null);
       await fetchEstimates();
@@ -578,7 +519,10 @@ export default function EstimatesPage() {
 
     setProgressSaving(true);
     try {
-      await api.post(`/api/estimates/${progressTarget.id}`, payload);
+      const done = await creditLimit.run((override) =>
+        api.post(`/api/estimates/${progressTarget.id}`, { ...payload, overrideCreditLimit: override }),
+      );
+      if (done === undefined) return;
       toast(
         `Progress invoice created for estimate EST-${String(progressTarget.estimateNumber).padStart(4, '0')}`,
         'success',
@@ -661,16 +605,13 @@ export default function EstimatesPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex items-center justify-end gap-1">
-                      {/* PDF download */}
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => window.open(`/api/estimates/${e.id}/pdf`, '_blank')}
-                        title="Download PDF"
-                      >
-                        <Download className="h-3.5 w-3.5" />
-                        PDF
-                      </Button>
+                      {/* Print (PDF) + Email */}
+                      <FormSendButtons kind="estimate" id={e.id} />
+                      {e.status !== 'closed' && e.status !== 'partial' && (
+                        <Button variant="ghost" size="sm" title="Edit estimate" aria-label="Edit estimate" onClick={() => openEditModal(e)}>
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                       {/* Status transitions for non-closed, non-partial estimates */}
                       {e.status !== 'closed' && e.status !== 'partial' && (
                         <>
@@ -751,14 +692,14 @@ export default function EstimatesPage() {
         size="lg"
         open={addOpen}
         onClose={() => setAddOpen(false)}
-        title="New Estimate"
+        title={editingId ? `Edit Estimate #${editingNumber}` : 'New Estimate'}
         footer={
           <>
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
             <Button onClick={handleCreate} loading={addSaving}>
-              Create Estimate
+              {editingId ? 'Save Changes' : 'Create Estimate'}
             </Button>
           </>
         }
@@ -767,11 +708,13 @@ export default function EstimatesPage() {
           form={addForm}
           customers={customers}
           taxRates={taxRates}
+          items={items}
           onChange={handleFormChange}
-          onLineChange={handleLineChange}
-          onAddLine={handleAddLine}
-          onRemoveLine={handleRemoveLine}
+          onLinesChange={(lines) => setAddForm((prev) => ({ ...prev, lines }))}
         />
+        <div className="mt-4">
+          <ShippingSection value={sendFlags} onChange={setSendFlags} showShipping={false} idPrefix="est" />
+        </div>
       </Modal>
 
       {/* ---- Progress Invoice modal ---- */}
@@ -947,6 +890,7 @@ export default function EstimatesPage() {
           marked as closed.
         </p>
       </Modal>
+      {creditLimit.dialog}
     </main>
   );
 }

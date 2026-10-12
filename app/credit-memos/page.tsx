@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { RotateCcw, Plus, PlusCircle, MinusCircle } from 'lucide-react';
+import { RotateCcw, Plus, PlusCircle, MinusCircle, Pencil } from 'lucide-react';
 import {
   AmountInput,
   Button,
@@ -24,8 +24,25 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+// wave2 prefs: Memorize (Ctrl+M)
+import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 import { formatDate } from '@/lib/format';
+import {
+  EMPTY_SHIPPING,
+  FormSendButtons,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+} from '@/components/sales/SalesExtras';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,6 +74,22 @@ interface CreditMemo {
   memo: string | null;
 }
 
+/** GET /api/credit-memos/:id — prefills the edit form (wave2 sales C1). */
+interface CreditMemoDetail extends CreditMemo {
+  taxRateId: string | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
+  lines: Array<{
+    itemId: string | null;
+    description: string | null;
+    quantity: string;
+    rate: string;
+    taxable?: boolean;
+    restock?: boolean;
+  }>;
+  applications: Array<{ id: string; invoiceId: string; invoiceNumber: number; amount: string; paymentId: string | null }>;
+}
+
 interface Account {
   id: string;
   code: string;
@@ -70,6 +103,7 @@ interface Item {
   type: 'service' | 'inventory' | 'non_inventory' | 'bundle';
   salesPrice: string | null;
   taxable: boolean;
+  trackingMode?: string | null;
 }
 
 interface TaxRate {
@@ -86,6 +120,8 @@ interface LineRow {
   taxable: boolean;
   /** Inventory items only: true = return to stock, false = damaged write-off. */
   restock: boolean;
+  /** Advanced Inventory: site / bin / serials / lot the returned goods go back to. */
+  inv?: InvDetail;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +172,8 @@ const EMPTY_LINE: LineRow = {
 
 interface NewMemoModalProps {
   open: boolean;
+  /** wave2 sales (C1): memo being edited (null = new). */
+  editing?: CreditMemoDetail | null;
   onClose: () => void;
   customers: Customer[];
   items: Item[];
@@ -143,23 +181,58 @@ interface NewMemoModalProps {
   onCreated: () => void;
 }
 
-function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: NewMemoModalProps) {
+function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCreated }: NewMemoModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memoNote, setMemoNote] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
+  const [flags, setFlags] = useState<ShippingState>(EMPTY_SHIPPING);
+  const [applications, setApplications] = useState<CreditMemoDetail['applications']>([]);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
+    if (open && editing) {
+      setCustomerId(editing.customerId);
+      setDate(editing.date.slice(0, 10));
+      setMemoNote(editing.memo ?? '');
+      setTaxRateId(editing.taxRateId ?? '');
+      setFlags(shippingFromDoc(editing));
+      setApplications(editing.applications ?? []);
+      setLines(
+        editing.lines.map((l) => ({
+          itemId: l.itemId ?? '',
+          description: l.description ?? '',
+          quantity: String(Number(l.quantity)),
+          rate: String(Number(l.rate)),
+          taxable: l.taxable !== false,
+          restock: l.restock !== false,
+        })),
+      );
+      return;
+    }
     if (open) {
+      setFlags(shippingFromDoc(null));
+      setApplications([]);
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setMemoNote('');
       setTaxRateId('');
       setLines([{ ...EMPTY_LINE }]);
     }
-  }, [open]);
+  }, [open, editing]);
+
+  async function unapply(applicationId: string) {
+    if (!editing) return;
+    try {
+      await api.post(`/api/credit-memos/${editing.id}`, { action: 'unapply', applicationId });
+      setApplications((prev) => prev.filter((a) => a.id !== applicationId));
+      toast('Credit unapplied — the invoice is open again.', 'success');
+      onCreated();
+    } catch (err: unknown) {
+      toast(err instanceof Error ? err.message : 'Could not unapply the credit.', 'danger');
+    }
+  }
 
   const itemMap = new Map(items.map((i) => [i.id, i]));
 
@@ -196,6 +269,25 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
     setLines((prev) => [...prev, { ...EMPTY_LINE }]);
   }
 
+  // Advanced Inventory: sites/bins + scan-to-add.
+  const adv = useAdvancedInventory(open);
+  function addScannedItem(it: { id: string; name: string; salesPrice?: string | null }) {
+    const item = itemMap.get(it.id);
+    setLines((prev) => {
+      const row: LineRow = {
+        ...EMPTY_LINE,
+        itemId: it.id,
+        description: it.name,
+        quantity: '1',
+        rate: it.salesPrice ?? '',
+        taxable: item?.taxable ?? true,
+      };
+      const emptyIdx = prev.findIndex((l) => !l.itemId && !l.description && !l.quantity && !l.rate);
+      if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
+      return [...prev, row];
+    });
+  }
+
   function removeLine(idx: number) {
     // Keep at least one line (mirrors the per-row remove button being disabled).
     setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev));
@@ -221,7 +313,8 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
 
     setSaving(true);
     try {
-      await api.post('/api/credit-memos', {
+      const body = {
+        ...shippingPayload(flags, { shipping: false }),
         customerId,
         date,
         memo: memoNote || null,
@@ -233,9 +326,16 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
           rate: l.rate,
           taxable: l.taxable,
           restock: l.restock,
+          ...(l.restock ? inventoryLinePayload(l.inv) : {}),
         })),
-      });
-      toast('Credit memo created.', 'success');
+      };
+      if (editing) {
+        await api.patch(`/api/credit-memos/${editing.id}`, body);
+        toast(`Credit Memo #${editing.memoNumber} updated.`, 'success');
+      } else {
+        await api.post('/api/credit-memos', body);
+        toast('Credit memo created.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
@@ -251,17 +351,68 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
       size="lg"
       open={open}
       onClose={onClose}
-      title="New Credit Memo"
+      title={editing ? `Edit Credit Memo #${editing.memoNumber}` : 'New Credit Memo'}
       footer={
         <>
+          <MemorizeButton
+            docType="credit_memo"
+            shortcut={open}
+            defaultName={customers.find((c) => c.id === customerId)?.displayName}
+            getTemplate={() => {
+              if (!customerId) return 'Pick a customer before memorizing.';
+              const valid = lines.filter((l) => l.quantity || l.rate);
+              if (valid.length === 0) return 'Add at least one line before memorizing.';
+              // Lot / serial picks for restocked items are one-time and are not memorized.
+              return {
+                customerId,
+                date,
+                memo: memoNote || null,
+                taxRateId: taxRateId || null,
+                lines: valid.map((l) => ({
+                  itemId: l.itemId || null,
+                  description: l.description || null,
+                  quantity: l.quantity,
+                  rate: l.rate,
+                  taxable: l.taxable,
+                  restock: l.restock,
+                })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
-            Create Credit Memo
+            {editing ? 'Save Changes' : 'Create Credit Memo'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
+        {editing && (
+          <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
+            Saving changes re-posts this credit so your books stay balanced. Credit already applied
+            or refunded stays used, so the new total can&apos;t be less than that.
+          </div>
+        )}
+        {editing && applications.length > 0 && (
+          <div className="rounded-lg border border-slate-100 p-3 text-sm">
+            <p className="font-semibold text-navy mb-2">Applied to</p>
+            <ul className="space-y-1">
+              {applications.map((a) => (
+                <li key={a.id} className="flex items-center justify-between">
+                  <span>
+                    Invoice #{a.invoiceNumber} — {formatCurrency(a.amount)}
+                    {a.paymentId ? <span className="text-navy/40"> (with a payment)</span> : null}
+                  </span>
+                  {!a.paymentId && (
+                    <Button variant="ghost" size="sm" onClick={() => unapply(a.id)}>
+                      Unapply
+                    </Button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {/* Customer */}
         <div>
           <Label htmlFor="cm-customer">Customer *</Label>
@@ -292,13 +443,16 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
-              <PlusCircle className="h-4 w-4" /> Add line
-            </button>
+            <div className="flex items-center gap-3">
+              <BarcodeScanInput onItem={addScannedItem} />
+              <button
+                type="button"
+                onClick={addLine}
+                className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
+              >
+                <PlusCircle className="h-4 w-4" /> Add line
+              </button>
+            </div>
           </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
@@ -377,6 +531,17 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
                   >
                     <MinusCircle className="h-4 w-4" />
                   </button>
+                  {line.restock && (
+                    <InventoryLineFields
+                      className="col-span-full"
+                      adv={adv}
+                      item={lineItem}
+                      quantity={line.quantity}
+                      direction="in"
+                      value={line.inv}
+                      onChange={(inv) => updateLine(idx, { inv })}
+                    />
+                  )}
                 </div>
               );
             })}
@@ -410,6 +575,8 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
             onChange={(e) => setMemoNote(e.target.value)}
           />
         </div>
+
+        <ShippingSection value={flags} onChange={setFlags} showShipping={false} idPrefix="cm" />
 
         {/* Live totals */}
         <div className="rounded-lg bg-navy/5 px-4 py-3 space-y-1">
@@ -671,6 +838,15 @@ export default function CreditMemosPage() {
   const [applyTarget, setApplyTarget] = useState<CreditMemo | null>(null);
   const [refundTarget, setRefundTarget] = useState<CreditMemo | null>(null);
   const [voidTarget, setVoidTarget] = useState<CreditMemo | null>(null);
+  const [editTarget, setEditTarget] = useState<CreditMemoDetail | null>(null);
+
+  async function openEdit(m: CreditMemo) {
+    try {
+      setEditTarget(await api.get<CreditMemoDetail>(`/api/credit-memos/${m.id}`));
+    } catch (err: unknown) {
+      toast(err instanceof Error ? err.message : 'Could not open the credit memo.', 'danger');
+    }
+  }
   const [voiding, setVoiding] = useState(false);
 
   const customerMap = Object.fromEntries(customers.map((c) => [c.id, c.displayName]));
@@ -780,6 +956,18 @@ export default function CreditMemosPage() {
                   </Td>
                   <Td className="text-right">
                     <span className="inline-flex items-center gap-1">
+                      {m.status !== 'void' && <FormSendButtons kind="credit_memo" id={m.id} />}
+                      {m.status !== 'void' && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title="Edit credit memo"
+                          aria-label="Edit credit memo"
+                          onClick={() => openEdit(m)}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                       {m.status === 'open' && Number(m.unapplied) > 0 && (
                         <Button
                           variant="ghost"
@@ -835,8 +1023,12 @@ export default function CreditMemosPage() {
       )}
 
       <NewMemoModal
-        open={showNew}
-        onClose={() => setShowNew(false)}
+        open={showNew || !!editTarget}
+        editing={editTarget}
+        onClose={() => {
+          setShowNew(false);
+          setEditTarget(null);
+        }}
         customers={customers}
         items={items}
         taxRates={taxRates}

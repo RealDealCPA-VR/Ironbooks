@@ -9,6 +9,9 @@
  * result summary. Past runs list below with their paychecks expanded on click.
  */
 import { Fragment, useEffect, useState } from 'react';
+// wave2 prefs: Payroll & Employees > pay period + standard hours drive the defaults.
+import { usePreferences } from '@/lib/usePreferences';
+import { PAY_PERIODS_PER_YEAR, defaultPeriodHours } from '@/lib/preferences';
 import Link from 'next/link';
 import {
   CalendarClock,
@@ -122,10 +125,13 @@ function toDec(v: string): Decimal {
   }
 }
 
+/** Default hourly hours for one pay period (set from Preferences by the page). */
+let defaultHours = '80';
+
 function emptyRow(emp: Employee): RowState {
   return {
     selected: emp.isActive,
-    hours: emp.payType === 'hourly' ? '80' : '',
+    hours: emp.payType === 'hourly' ? defaultHours : '',
     amount: '',
     timeEntryIds: [],
     pulledHours: null,
@@ -147,6 +153,23 @@ export default function PayRunsPage() {
   const [periodEnd, setPeriodEnd] = useState('');
   const [memo, setMemo] = useState('');
   const [periodsPerYear, setPeriodsPerYear] = useState('26');
+  const prefs = usePreferences();
+  useEffect(() => {
+    if (!prefs.loaded) return;
+    const period = prefs.company.payrollPayPeriod;
+    setPeriodsPerYear(String(PAY_PERIODS_PER_YEAR[period] ?? 26));
+    const hours = String(defaultPeriodHours(period, prefs.company.payrollStandardHours));
+    const previous = defaultHours;
+    defaultHours = hours;
+    // Rows still showing the old default pick up the preference.
+    setRows((prev) => {
+      const next: Record<string, RowState> = {};
+      for (const [id, r] of Object.entries(prev)) {
+        next[id] = r.hours === previous && r.timeEntryIds.length === 0 ? { ...r, hours } : r;
+      }
+      return next;
+    });
+  }, [prefs.loaded, prefs.company.payrollPayPeriod, prefs.company.payrollStandardHours]);
 
   const [rows, setRows] = useState<Record<string, RowState>>({});
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -225,7 +248,7 @@ export default function PayRunsPage() {
     updateRow(empId, {
       timeEntryIds: [],
       pulledHours: null,
-      hours: emp.payType === 'hourly' ? '80' : '',
+      hours: emp.payType === 'hourly' ? defaultHours : '',
     });
   }
 

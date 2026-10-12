@@ -3,9 +3,10 @@
  * customer/vendor summary views. None of these touch the GL; they are pure
  * read-only projections over the invoices, bills, and journal_entry_lines tables.
  */
-import { and, asc, eq, gte, inArray, isNotNull, lte, ne, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, gte, inArray, isNotNull, lte, ne, sql } from 'drizzle-orm';
 import {
   accounts,
+  bouncedChecks,
   billLines,
   billPaymentApplications,
   billPayments,
@@ -31,6 +32,125 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/services/reports';
 import type { ServiceContext } from './_base';
+import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
+import { journalOpenItems, resolveEntityNames } from './journal';
+import { docRef } from './docNumbers';
+import { unappliedCustomerPayments } from './customerCredits';
+
+/** Detail-report variant of addJournalItemsToAging: one 'General Journal' row per line. */
+async function addJournalItemsToAgingDetail(
+  ctx: ServiceContext,
+  side: 'ar' | 'ap',
+  cutoff: Date,
+  detail: AgingDetailRow[],
+): Promise<void> {
+  const items = await journalOpenItems(ctx, side, { asOf: cutoff });
+  if (items.length === 0) return;
+  const names = await resolveEntityNames(ctx, items);
+  for (const it of items) {
+    const amount = Money.of(it.amount);
+    const raw = ms_to_days(cutoff.getTime() - it.date.getTime());
+    detail.push({
+      docId: it.journalEntryId,
+      docNumber: `General Journal #${it.entryNumber}`,
+      docType: 'journal_entry',
+      entityId: it.entityId,
+      entityName: names.get(`${it.entityType}:${it.entityId}`) ?? '(unknown)',
+      date: it.date.toISOString(),
+      dueDate: it.date.toISOString(),
+      daysPastDue: amount.isNegative() ? 0 : Math.max(0, raw),
+      bucket: amount.isNegative() ? 'current' : agingKey(raw),
+      openBalance: toAmountString(amount),
+    });
+  }
+}
+
+/**
+ * Unapplied customer payments (customerCredits.ts) are credits in the A/R subledger: the full
+ * payment was credited to A/R, so the unapplied part must reduce what the customer owes —
+ * e.g. a payment received against a General Journal charge, which has no invoice to apply to.
+ */
+async function addUnappliedPaymentsToAging(
+  ctx: ServiceContext,
+  cutoff: Date,
+  byCustomer: Map<string, { name: string; buckets: BucketAccum }>,
+): Promise<void> {
+  const credits = await unappliedCustomerPayments(ctx, { asOf: cutoff });
+  if (credits.length === 0) return;
+  const names = await resolveEntityNames(
+    ctx,
+    credits.map((c) => ({ entityType: 'customer', entityId: c.customerId })),
+  );
+  for (const c of credits) {
+    if (!byCustomer.has(c.customerId)) {
+      byCustomer.set(c.customerId, {
+        name: names.get(`customer:${c.customerId}`) ?? '(unknown)',
+        buckets: blankBuckets(),
+      });
+    }
+    const b = byCustomer.get(c.customerId)!.buckets;
+    b.current = b.current.minus(Money.of(c.amount));
+  }
+}
+
+async function addUnappliedPaymentsToAgingDetail(
+  ctx: ServiceContext,
+  cutoff: Date,
+  detail: AgingDetailRow[],
+): Promise<void> {
+  const credits = await unappliedCustomerPayments(ctx, { asOf: cutoff });
+  if (credits.length === 0) return;
+  const names = await resolveEntityNames(
+    ctx,
+    credits.map((c) => ({ entityType: 'customer', entityId: c.customerId })),
+  );
+  for (const c of credits) {
+    detail.push({
+      docId: c.paymentId,
+      docNumber: c.reference ? `Payment ${c.reference}` : 'Payment',
+      docType: 'payment',
+      entityId: c.customerId,
+      entityName: names.get(`customer:${c.customerId}`) ?? '(unknown)',
+      date: c.date.toISOString(),
+      dueDate: null,
+      daysPastDue: 0,
+      bucket: 'current',
+      openBalance: toAmountString(Money.of(c.amount).negated()),
+    });
+  }
+}
+
+/**
+ * Add named General Journal A/R or A/P lines (journal.ts journalOpenItems) to an aging map.
+ * Each line is an open item dated and due on the entry date (QB "General Journal" rows).
+ */
+async function addJournalItemsToAging(
+  ctx: ServiceContext,
+  side: 'ar' | 'ap',
+  cutoff: Date,
+  byEntity: Map<string, { name: string; buckets: BucketAccum }>,
+): Promise<void> {
+  const items = await journalOpenItems(ctx, side, { asOf: cutoff });
+  if (items.length === 0) return;
+  const names = await resolveEntityNames(ctx, items);
+  for (const it of items) {
+    if (!byEntity.has(it.entityId)) {
+      byEntity.set(it.entityId, {
+        name: names.get(`${it.entityType}:${it.entityId}`) ?? '(unknown)',
+        buckets: blankBuckets(),
+      });
+    }
+    const amount = Money.of(it.amount);
+    // Credits (negative items) sit in 'current' like unapplied credits; charges age by date.
+    const key = amount.isNegative()
+      ? 'current'
+      : agingKey(ms_to_days(cutoff.getTime() - it.date.getTime()));
+    const b = byEntity.get(it.entityId)!.buckets;
+    b[key] = b[key].plus(amount);
+  }
+}
+// wave2 prefs: Reports > "Aging reports: age from due date / transaction date".
+import { getPreferences } from './company';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -95,6 +215,33 @@ function ms_to_days(ms: number): number {
   return Math.floor(ms / (1000 * 60 * 60 * 24));
 }
 
+/**
+ * wave2 sales (F2): a bounced check deletes its payment's application rows and keeps a
+ * snapshot on the bounced_checks record. As of a date ON/AFTER the payment but BEFORE the
+ * bounce, that payment still paid those invoices — add the snapshot back so past aging
+ * does not change after the fact.
+ */
+async function addBouncedApplicationsAsOf(ctx: ServiceContext, upTo: Date, map: Map<string, string>) {
+  const rows = await ctx.db
+    .select({ applications: bouncedChecks.applications })
+    .from(bouncedChecks)
+    .innerJoin(paymentsReceived, eq(bouncedChecks.paymentId, paymentsReceived.id))
+    .where(
+      and(
+        eq(bouncedChecks.companyId, ctx.companyId),
+        lte(paymentsReceived.date, upTo),
+        gt(bouncedChecks.date, upTo),
+      ),
+    );
+  for (const r of rows) {
+    for (const a of r.applications ?? []) {
+      if (!a.invoiceId) continue;
+      const add = Money.of(a.amountApplied ?? 0).plus(Money.of(a.discountAmount ?? 0));
+      map.set(a.invoiceId, toAmountString(Money.of(map.get(a.invoiceId) ?? 0).plus(add)));
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // A/R Aging
 // ---------------------------------------------------------------------------
@@ -116,6 +263,7 @@ function ms_to_days(ms: number): number {
  */
 export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
   const cutoff = asOf ?? new Date();
+  const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   // Invoices dated on/before the cutoff. Do NOT exclude 'paid' — an invoice paid
   // after the cutoff was still receivable as of the cutoff.
@@ -136,6 +284,8 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       and(
         eq(invoices.companyId, ctx.companyId),
         ne(invoices.status, 'void'),
+        // Drafts (pending invoices) post nothing to A/R — QB leaves them off the aging.
+        ne(invoices.status, 'draft'),
         lte(invoices.date, cutoff),
       ),
     );
@@ -147,13 +297,16 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     const appRows = await ctx.db
       .select({
         invoiceId: paymentApplications.invoiceId,
-        applied: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC)), 0)`,
+        // wave2 sales: early-payment discounts are dated with their payment, like cash.
+        applied: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC) + CAST(${paymentApplications.discountAmount} AS NUMERIC)), 0)`,
       })
       .from(paymentApplications)
       .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
       .where(and(...conds))
       .groupBy(paymentApplications.invoiceId);
-    return new Map(appRows.map((r) => [r.invoiceId, r.applied]));
+    const map = new Map(appRows.map((r) => [r.invoiceId, r.applied]));
+    if (upTo) await addBouncedApplicationsAsOf(ctx, upTo, map);
+    return map;
   }
 
   const [appliedAsOf, appliedAllTime] = await Promise.all([
@@ -178,7 +331,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     const amount = billedBase.minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
 
-    const effectiveDue = row.dueDate ?? row.date;
+    const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const daysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     const key = agingKey(daysPastDue);
 
@@ -215,6 +368,9 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     buckets.current = buckets.current.minus(Money.of(memo.unapplied));
   }
 
+  await addJournalItemsToAging(ctx, 'ar', cutoff, byCustomer);
+  await addUnappliedPaymentsToAging(ctx, cutoff, byCustomer);
+
   return buildAgingReport(byCustomer, cutoff);
 }
 
@@ -229,8 +385,33 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
  * payments); bills dated after the cutoff are excluded; unapplied vendor credits
  * dated on/before the cutoff appear as negative 'current' amounts.
  */
+// ---------------------------------------------------------------------------
+// J10 (wave2 purchases): home-currency open balance of a foreign-currency bill
+// ---------------------------------------------------------------------------
+
+/** Home A/P relieved per bill by bill-payment applications dated on/before `upTo`. */
+async function billPaymentHomeAppliedByBill(ctx: ServiceContext, upTo: Date): Promise<Map<string, string>> {
+  const appRows = await ctx.db
+    .select({
+      billId: billPaymentApplications.billId,
+      applied: sql<string>`COALESCE(SUM(CAST(COALESCE(${billPaymentApplications.amountHome}, ${billPaymentApplications.amountApplied}) AS NUMERIC)), 0)`,
+    })
+    .from(billPaymentApplications)
+    .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
+    .where(and(eq(billPayments.companyId, ctx.companyId), lte(billPayments.date, upTo)))
+    .groupBy(billPaymentApplications.billId);
+  return new Map(appRows.map((r) => [r.billId, r.applied]));
+}
+
+/** Home open balance = round2(total x rate) - home A/P already relieved (same anchor billPayments uses). */
+function billHomeOpen(row: { total: string; exchangeRate: string | null }, homeApplied: string | undefined) {
+  const anchor = Money.round2(Money.of(row.total).times(Money.of(row.exchangeRate ?? 1)));
+  return Money.round2(anchor.minus(Money.of(homeApplied ?? '0')));
+}
+
 export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
   const cutoff = asOf ?? new Date();
+  const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
     .select({
@@ -242,6 +423,8 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       amountCredited: bills.amountCredited,
       dueDate: bills.dueDate,
       date: bills.date,
+      currency: bills.currency,
+      exchangeRate: bills.exchangeRate,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
@@ -273,6 +456,7 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     billPaymentAppliedByBill(cutoff),
     billPaymentAppliedByBill(),
   ]);
+  const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const byVendor = new Map<string, { name: string; buckets: BucketAccum }>();
 
@@ -286,10 +470,13 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .minus(cashAllTime);
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    const amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
+    let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
+    // J10 (wave2 purchases): age foreign bills at their HOME open balance so the report ties to
+    // the A/P control account: round2(total x bill rate) minus the home A/P each payment relieved.
+    if (row.currency) amount = billHomeOpen(row, homeAppliedAsOf.get(row.billId));
 
-    const effectiveDue = row.dueDate ?? row.date;
+    const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const daysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     const key = agingKey(daysPastDue);
 
@@ -325,6 +512,8 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     const buckets = byVendor.get(credit.vendorId)!.buckets;
     buckets.current = buckets.current.minus(Money.of(credit.unapplied));
   }
+
+  await addJournalItemsToAging(ctx, 'ap', cutoff, byVendor);
 
   return buildAgingReport(byVendor, cutoff);
 }
@@ -472,8 +661,6 @@ export async function cashFlow(
       accounts.subtype,
     );
 
-  const CASH_SUBTYPES = new Set(['checking', 'savings']);
-
   let netIncome = Money.zero();
   let cashChange = Money.zero();
   let changeInAR = Money.zero();
@@ -509,13 +696,13 @@ export async function cashFlow(
       netIncome = netIncome.minus(debitNet); // debit-normal
     } else if (row.type === 'asset') {
       const naturalChange = debitNet; // debit-normal
-      if (CASH_SUBTYPES.has(row.subtype)) {
+      if (isCashAccount(row)) {
         cashChange = cashChange.plus(naturalChange);
       } else if (row.subtype === 'accounts_receivable') {
         changeInAR = changeInAR.plus(naturalChange);
       } else if (row.subtype === 'inventory') {
         changeInInventory = changeInInventory.plus(naturalChange);
-      } else if (row.subtype === 'fixed_assets') {
+      } else if (row.subtype === 'fixed_assets' || row.subtype === 'other_asset') {
         // Asset growth is a use of cash.
         const impact = naturalChange.negated();
         investingTotal = investingTotal.plus(impact);
@@ -530,8 +717,8 @@ export async function cashFlow(
       const naturalChange = debitNet.negated(); // credit-normal
       if (row.subtype === 'accounts_payable') {
         changeInAP = changeInAP.plus(naturalChange);
-      } else if (row.subtype === 'long_term_liability') {
-        // Loan draws/paydowns are financing.
+      } else if (!isCurrentLiability(row)) {
+        // Long-term liabilities: loan draws/paydowns are financing.
         financingTotal = financingTotal.plus(naturalChange);
         pushLine(financingLines, row, naturalChange);
       } else {
@@ -609,6 +796,8 @@ export async function salesByCustomer(
   const conds = [
     eq(invoices.companyId, ctx.companyId),
     ne(invoices.status, 'void'),
+    // Drafts post no revenue — keep sales in step with the P&L (as salesByItem does).
+    ne(invoices.status, 'draft'),
   ];
   if (range?.from) conds.push(sql`${invoices.date} >= ${range.from}`);
   if (range?.to) conds.push(lte(invoices.date, range.to));
@@ -709,7 +898,7 @@ export interface AgingDetailRow {
   docId: string;
   /** Human-readable document label, e.g. "Invoice #12" or "Credit Memo #3". */
   docNumber: string;
-  docType: 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit';
+  docType: 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit' | 'journal_entry' | 'payment';
   entityId: string;
   entityName: string;
   date: string;
@@ -763,11 +952,13 @@ function buildAgingDetailReport(rows: AgingDetailRow[], cutoff: Date): AgingDeta
  */
 export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
   const cutoff = asOf ?? new Date();
+  const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
     .select({
       invoiceId: invoices.id,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       customerId: invoices.customerId,
       customerName: customers.displayName,
       total: invoices.total,
@@ -779,7 +970,12 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
     .where(
-      and(eq(invoices.companyId, ctx.companyId), ne(invoices.status, 'void'), lte(invoices.date, cutoff)),
+      and(
+        eq(invoices.companyId, ctx.companyId),
+        ne(invoices.status, 'void'),
+        ne(invoices.status, 'draft'),
+        lte(invoices.date, cutoff),
+      ),
     );
 
   async function paymentAppliedByInvoice(upTo?: Date): Promise<Map<string, string>> {
@@ -788,13 +984,16 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     const appRows = await ctx.db
       .select({
         invoiceId: paymentApplications.invoiceId,
-        applied: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC)), 0)`,
+        // wave2 sales: early-payment discounts are dated with their payment, like cash.
+        applied: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC) + CAST(${paymentApplications.discountAmount} AS NUMERIC)), 0)`,
       })
       .from(paymentApplications)
       .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
       .where(and(...conds))
       .groupBy(paymentApplications.invoiceId);
-    return new Map(appRows.map((r) => [r.invoiceId, r.applied]));
+    const map = new Map(appRows.map((r) => [r.invoiceId, r.applied]));
+    if (upTo) await addBouncedApplicationsAsOf(ctx, upTo, map);
+    return map;
   }
 
   const [appliedAsOf, appliedAllTime] = await Promise.all([
@@ -813,11 +1012,11 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     const amount = billedBase.minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
 
-    const effectiveDue = row.dueDate ?? row.date;
+    const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
       docId: row.invoiceId,
-      docNumber: `Invoice #${row.invoiceNumber}`,
+      docNumber: `Invoice #${docRef(row.refNumber, row.invoiceNumber)}`,
       docType: 'invoice',
       entityId: row.customerId,
       entityName: row.customerName,
@@ -834,6 +1033,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     .select({
       id: creditMemos.id,
       memoNumber: creditMemos.memoNumber,
+      refNumber: creditMemos.refNumber,
       customerId: creditMemos.customerId,
       customerName: customers.displayName,
       date: creditMemos.date,
@@ -852,7 +1052,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
   for (const m of memoRows) {
     detail.push({
       docId: m.id,
-      docNumber: `Credit Memo #${m.memoNumber}`,
+      docNumber: `Credit Memo #${docRef(m.refNumber, m.memoNumber)}`,
       docType: 'credit_memo',
       entityId: m.customerId,
       entityName: m.customerName,
@@ -864,6 +1064,8 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     });
   }
 
+  await addJournalItemsToAgingDetail(ctx, 'ar', cutoff, detail);
+  await addUnappliedPaymentsToAgingDetail(ctx, cutoff, detail);
   return buildAgingDetailReport(detail, cutoff);
 }
 
@@ -874,6 +1076,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
  */
 export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
   const cutoff = asOf ?? new Date();
+  const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
     .select({
@@ -886,6 +1089,8 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       amountCredited: bills.amountCredited,
       dueDate: bills.dueDate,
       date: bills.date,
+      currency: bills.currency,
+      exchangeRate: bills.exchangeRate,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
@@ -910,6 +1115,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     billPaymentAppliedByBill(cutoff),
     billPaymentAppliedByBill(),
   ]);
+  const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
@@ -920,10 +1126,13 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .minus(cashAllTime);
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    const amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
+    let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
+    // J10 (wave2 purchases): age foreign bills at their HOME open balance so the report ties to
+    // the A/P control account: round2(total x bill rate) minus the home A/P each payment relieved.
+    if (row.currency) amount = billHomeOpen(row, homeAppliedAsOf.get(row.billId));
 
-    const effectiveDue = row.dueDate ?? row.date;
+    const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
       docId: row.billId,
@@ -972,6 +1181,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     });
   }
 
+  await addJournalItemsToAgingDetail(ctx, 'ap', cutoff, detail);
   return buildAgingDetailReport(detail, cutoff);
 }
 
@@ -982,6 +1192,8 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
 export interface OpenInvoiceRow {
   invoiceId: string;
   invoiceNumber: number;
+  /** The number the user sees (typed ref number, else the legacy integer). */
+  refNumber: string;
   customerId: string;
   customerName: string;
   date: string;
@@ -1009,6 +1221,7 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
     .select({
       invoiceId: invoices.id,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       customerId: invoices.customerId,
       customerName: customers.displayName,
       date: invoices.date,
@@ -1036,6 +1249,7 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
     return {
       invoiceId: r.invoiceId,
       invoiceNumber: r.invoiceNumber,
+      refNumber: docRef(r.refNumber, r.invoiceNumber),
       customerId: r.customerId,
       customerName: r.customerName,
       date: r.date.toISOString(),
@@ -1057,6 +1271,8 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
 export interface CollectionsInvoice {
   invoiceId: string;
   invoiceNumber: number;
+  /** The number the user sees (typed ref number, else the legacy integer). */
+  refNumber: string;
   date: string;
   dueDate: string | null;
   daysOverdue: number;
@@ -1090,6 +1306,7 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
     .select({
       invoiceId: invoices.id,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       customerId: invoices.customerId,
       customerName: customers.displayName,
       email: customers.email,
@@ -1132,6 +1349,7 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
     cust.invoices.push({
       invoiceId: r.invoiceId,
       invoiceNumber: r.invoiceNumber,
+      refNumber: docRef(r.refNumber, r.invoiceNumber),
       date: r.date.toISOString(),
       dueDate: r.dueDate ? r.dueDate.toISOString() : null,
       daysOverdue,

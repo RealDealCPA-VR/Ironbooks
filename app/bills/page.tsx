@@ -21,12 +21,34 @@ import {
   Tr,
   Modal,
   PageHeader,
-  toast,
+  toast, toastError,
   useGridKeys,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api, ApiError } from '@/lib/client';
+import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  invFromLine,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import {
+  TERMS_CHOICES,
+  type PurchaseVendor,
+  saveWithDuplicateCheck,
+  vendorPrefillAccountIds,
+} from '@/lib/purchasesClient';
+// wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
+import { dueDateForTerms } from '@/lib/preferences';
+import MemorizeButton from '@/components/MemorizeButton';
+import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,6 +66,9 @@ interface Bill {
   balanceDue: string;
   status: 'open' | 'partial' | 'paid' | 'void';
   memo: string | null;
+  terms?: string | null;
+  currency?: string | null;
+  exchangeRate?: string | null;
 }
 
 interface BillDetailLine {
@@ -53,6 +78,12 @@ interface BillDetailLine {
   description: string | null;
   quantity: string;
   amount: string;
+  // Advanced Inventory detail (present only when stored for the line)
+  siteId?: string | null;
+  binId?: string | null;
+  serialNumbers?: string[] | null;
+  lotNumber?: string | null;
+  lotExpiration?: string | null;
 }
 
 /** A bill can be edited while nothing has been applied against it. */
@@ -64,10 +95,7 @@ function isEditable(bill: Bill): boolean {
   );
 }
 
-interface Vendor {
-  id: string;
-  displayName: string;
-}
+type Vendor = PurchaseVendor;
 
 interface Account {
   id: string;
@@ -82,6 +110,7 @@ interface Item {
   type: 'service' | 'inventory' | 'non_inventory' | 'bundle';
   purchaseCost: string | null;
   quantityOnHand: string | null;
+  trackingMode?: string | null;
 }
 
 type LineMode = 'expense' | 'item';
@@ -97,6 +126,8 @@ interface LineRow {
   unitCost: string;
   // Shared
   description: string;
+  /** Advanced Inventory: receiving site / bin / serials / lot (inventory item lines). */
+  inv?: InvDetail;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +183,7 @@ function lineAmount(line: LineRow): number {
 export default function BillsPage() {
   const [bills, setBills] = useState<Bill[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
+  const prefs = usePreferences();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
@@ -167,7 +199,15 @@ export default function BillsPage() {
   const [billNumber, setBillNumber] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [dueDate, setDueDate] = useState('');
+  const [terms, setTerms] = useState('');
+  const [memo, setMemo] = useState('');
+  const [exchangeRate, setExchangeRate] = useState('');
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
+  /** Shown under the vendor picker after accounts were pre-filled (QB vendor pre-fill). */
+  const [prefillNote, setPrefillNote] = useState('');
+
+  // Advanced Inventory (sites / bins / serial & lot) for item lines.
+  const adv = useAdvancedInventory(modalOpen);
 
   // Void confirm
   const [pendingVoid, setPendingVoid] = useState<Bill | null>(null);
@@ -182,7 +222,7 @@ export default function BillsPage() {
       const data = await api.get<Bill[]>('/api/bills');
       setBills(data);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load bills', 'danger');
+      toastError(err, 'Failed to load bills');
     }
   }, []);
 
@@ -201,7 +241,7 @@ export default function BillsPage() {
         setAccounts(accountData);
         setItems(itemData.items ?? []);
       } catch (err) {
-        toast(err instanceof ApiError ? err.message : 'Failed to load data', 'danger');
+        toastError(err, 'Failed to load data');
       } finally {
         setLoading(false);
       }
@@ -227,8 +267,44 @@ export default function BillsPage() {
     setBillNumber('');
     setDate(new Date().toISOString().slice(0, 10));
     setDueDate('');
+    setTerms('');
+    setMemo('');
+    setExchangeRate('');
     setLines([emptyLine()]);
+    setPrefillNote('');
     setModalOpen(true);
+  }
+
+  /**
+   * Vendor picked on a NEW bill whose lines are still blank: pre-fill the expense accounts
+   * (vendor default → last bill/check → learned categorizer). Never overwrites typed lines.
+   */
+  async function handleVendorChange(id: string) {
+    setVendorId(id);
+    setPrefillNote('');
+    if (!id || editingId) return;
+    const vendor = vendors.find((v) => v.id === id);
+    setTerms(vendor?.terms ?? '');
+    // Due date from the vendor's terms (else Preferences > Bills default terms).
+    const due = dueDateForTerms(date, vendor?.terms || prefs.company.defaultVendorTerms);
+    if (due) setDueDate(due);
+    const blank = (ls: LineRow[]) =>
+      ls.every((l) => l.mode === 'expense' && !l.accountId && !l.amount && !l.description);
+    if (!blank(lines)) return;
+    // The vendor's own pre-fill accounts (up to 3) win over learned suggestions.
+    const own = vendorPrefillAccountIds(vendor);
+    if (own.length > 0) {
+      setLines(own.map((accountId) => ({ ...emptyLine('expense'), accountId })));
+      setPrefillNote("Accounts pre-filled from the vendor's pre-fill accounts.");
+      return;
+    }
+    const pf = await fetchVendorPrefill({ vendorId: id });
+    if (!pf) return;
+    setLines((prev) => {
+      if (!blank(prev)) return prev; // user started typing while we fetched
+      return pf.lines.map((l) => ({ ...emptyLine('expense'), accountId: l.accountId }));
+    });
+    setPrefillNote(`Accounts pre-filled ${PREFILL_SOURCE_LABEL[pf.source]}.`);
   }
 
   /** Prefill the form from a saved bill and open the modal in edit mode. */
@@ -241,6 +317,9 @@ export default function BillsPage() {
       setBillNumber(detail.billNumber ?? '');
       setDate(detail.date.slice(0, 10));
       setDueDate(detail.dueDate ? detail.dueDate.slice(0, 10) : '');
+      setTerms(detail.terms ?? '');
+      setMemo(detail.memo ?? '');
+      setExchangeRate(detail.currency && detail.exchangeRate ? String(Number(detail.exchangeRate)) : '');
       setLines(
         detail.lines.length === 0
           ? [emptyLine()]
@@ -256,6 +335,7 @@ export default function BillsPage() {
                   quantity: String(qty),
                   unitCost: String(parseFloat(unitCost.toFixed(4))),
                   description: l.description ?? '',
+                  inv: invFromLine(l),
                 };
               }
               return {
@@ -271,7 +351,7 @@ export default function BillsPage() {
       );
       setModalOpen(true);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to load bill.', 'danger');
+      toastError(err, 'Failed to load bill.');
     } finally {
       setLoadingEditId(null);
     }
@@ -307,6 +387,16 @@ export default function BillsPage() {
     setLines((prev) => [...prev, emptyLine(mode)]);
   }
 
+  /** Scan-to-add: a scanned item becomes an item line (fills an empty line when there is one). */
+  function addScannedItem(it: { id: string; purchaseCost?: string | null }) {
+    setLines((prev) => {
+      const row: LineRow = { ...emptyLine('item'), itemId: it.id, quantity: '1', unitCost: it.purchaseCost ?? '' };
+      const emptyIdx = prev.findIndex((l) => !l.itemId && !l.accountId && !l.amount && !l.quantity);
+      if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
+      return [...prev, row];
+    });
+  }
+
   function removeLine(index: number) {
     // Keep at least one line (mirrors the per-row remove button being disabled).
     setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== index) : prev));
@@ -322,6 +412,7 @@ export default function BillsPage() {
 
   // Compute running total for display (Number() only — display only, not stored)
   const runningTotal = lines.reduce((sum, l) => sum + lineAmount(l), 0);
+  const selectedVendor = vendors.find((v) => v.id === vendorId);
 
   // ---------------------------------------------------------------------------
   // Submit new bill
@@ -362,6 +453,14 @@ export default function BillsPage() {
       }
     }
 
+    if (!confirmTransactionDate(date, prefs)) return;
+    // Preferences > Bills: "Warn about duplicate bill numbers from same vendor".
+    const dupBill = findDuplicateNumber(billNumber, bills, (b) => b.billNumber, {
+      excludeId: editingId,
+      sameScope: (b) => b.vendorId === vendorId && b.status !== 'void',
+    });
+    if (!confirmUniqueNumber(prefs.company.warnDuplicateBillNumbers, 'Bill number', dupBill, billNumber)) return;
+
     setSubmitting(true);
     try {
       const payload = {
@@ -369,6 +468,9 @@ export default function BillsPage() {
         billNumber: billNumber.trim() || undefined,
         date,
         dueDate: dueDate || undefined,
+        terms: terms || undefined,
+        memo: memo.trim() || undefined,
+        exchangeRate: selectedVendor?.currency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
         lines: lines.map((l) =>
           l.mode === 'item'
             ? {
@@ -376,6 +478,7 @@ export default function BillsPage() {
                 quantity: l.quantity,
                 unitCost: l.unitCost,
                 description: l.description.trim() || undefined,
+                ...inventoryLinePayload(l.inv),
               }
             : {
                 accountId: l.accountId,
@@ -384,24 +487,18 @@ export default function BillsPage() {
               },
         ),
       };
-      if (editingId) {
-        await api.patch(`/api/bills/${editingId}`, payload);
-        toast('Bill updated.', 'success');
-      } else {
-        await api.post('/api/bills', payload);
-        toast('Bill created.', 'success');
-      }
+      // Duplicate vendor reference number: warn and let the user keep it (QB behaviour).
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        editingId
+          ? api.patch(`/api/bills/${editingId}`, { ...payload, allowDuplicateNumber })
+          : api.post('/api/bills', { ...payload, allowDuplicateNumber }),
+      );
+      if (saved === null) return;
+      toast(editingId ? 'Bill updated.' : 'Bill created.', 'success');
       setModalOpen(false);
       await fetchBills();
     } catch (err) {
-      toast(
-        err instanceof ApiError
-          ? err.message
-          : editingId
-            ? 'Failed to update bill.'
-            : 'Failed to create bill.',
-        'danger',
-      );
+      toastError(err, editingId ? 'Failed to update bill.' : 'Failed to create bill.');
     } finally {
       setSubmitting(false);
     }
@@ -419,7 +516,7 @@ export default function BillsPage() {
       setPendingVoid(null);
       await fetchBills();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to void bill.', 'danger');
+      toastError(err, 'Failed to void bill.');
     } finally {
       setVoidingId(null);
     }
@@ -450,6 +547,12 @@ export default function BillsPage() {
         }
       />
 
+      <p className="-mt-4 mb-4 text-sm text-navy/60">
+        A bill is money you owe a vendor. Until you pay it, it sits in Accounts Payable{' '}
+        <Help term="ap" side="bottom" />. Pay it from{' '}
+        <Link href="/pay-bills" className="text-electric underline">Pay Bills</Link>.
+      </p>
+
       <Card className="p-0 overflow-hidden">
         {loading ? (
           <div className="p-12 flex items-center justify-center gap-2 text-navy/40 text-sm">
@@ -459,7 +562,7 @@ export default function BillsPage() {
           <EmptyState
             icon={Receipt}
             title="No bills yet"
-            message="Enter your first vendor bill to start tracking payables."
+            message="Got a bill you will pay later? Enter it here so you know what you owe (Accounts Payable). When you pay it, use Pay Bills."
             action={
               <Button onClick={openModal}>
                 <Plus className="h-4 w-4" /> New Bill
@@ -487,7 +590,10 @@ export default function BillsPage() {
                   <Td className="font-medium">{vendorName(bill.vendorId)}</Td>
                   <Td>{bill.date ? formatDate(bill.date, 'MMM d, yyyy') : '—'}</Td>
                   <Td>{bill.dueDate ? formatDate(bill.dueDate, 'MMM d, yyyy') : <span className="text-navy/30">—</span>}</Td>
-                  <Td numeric>{formatCurrency(bill.total)}</Td>
+                  <Td numeric>
+                    {formatCurrency(bill.total)}
+                    {bill.currency && <span className="ml-1 text-xs text-navy/50">{bill.currency}</span>}
+                  </Td>
                   <Td numeric className="font-semibold">
                     {formatCurrency(bill.balanceDue)}
                   </Td>
@@ -536,6 +642,26 @@ export default function BillsPage() {
         size="lg"
         footer={
           <>
+            <MemorizeButton
+              docType="bill"
+              shortcut={modalOpen}
+              defaultName={vendors.find((v) => v.id === vendorId)?.displayName}
+              getTemplate={() => {
+                if (!vendorId) return 'Pick a vendor before memorizing.';
+                const rows = lines.filter((l) => (l.mode === 'item' ? l.itemId : l.accountId));
+                if (rows.length === 0) return 'Add at least one line before memorizing.';
+                return {
+                  vendorId,
+                  date,
+                  dueDate: dueDate || undefined,
+                  lines: rows.map((l) =>
+                    l.mode === 'item'
+                      ? { itemId: l.itemId, quantity: l.quantity, unitCost: l.unitCost, description: l.description.trim() || undefined }
+                      : { accountId: l.accountId, description: l.description.trim() || undefined, amount: l.amount },
+                  ),
+                };
+              }}
+            />
             <Button variant="secondary" onClick={closeModal} disabled={submitting}>
               Cancel
             </Button>
@@ -554,12 +680,12 @@ export default function BillsPage() {
           )}
           {/* Vendor */}
           <div>
-            <Label htmlFor="bill-vendor">Vendor *</Label>
+            <Label htmlFor="bill-vendor" required>Vendor <Help term="ap" /></Label>
             <Select
               id="bill-vendor"
               autoFocus
               value={vendorId}
-              onChange={(e) => setVendorId(e.target.value)}
+              onChange={(e) => handleVendorChange(e.target.value)}
             >
               <option value="">Select vendor…</option>
               {vendors.map((v) => (
@@ -568,6 +694,7 @@ export default function BillsPage() {
                 </option>
               ))}
             </Select>
+            {prefillNote && <p className="mt-1 text-xs text-electric">{prefillNote}</p>}
           </div>
 
           {/* Bill Number + Date row */}
@@ -582,7 +709,7 @@ export default function BillsPage() {
               />
             </div>
             <div>
-              <Label htmlFor="bill-date">Bill Date *</Label>
+              <Label htmlFor="bill-date" required>Bill Date</Label>
               <DateInput
                 id="bill-date"
                 value={date}
@@ -591,21 +718,61 @@ export default function BillsPage() {
             </div>
           </div>
 
-          {/* Due Date */}
+          {/* Terms + Due Date */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="bill-terms">Terms</Label>
+              <Select id="bill-terms" value={terms} onChange={(e) => setTerms(e.target.value)}>
+                <option value="">Vendor&apos;s terms</option>
+                {TERMS_CHOICES.map((t) => (
+                  <option key={t.value} value={t.value}>
+                    {t.label}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="bill-due">Due Date (optional)</Label>
+              <DateInput
+                id="bill-due"
+                value={dueDate}
+                onChange={(e) => setDueDate(e.target.value)}
+              />
+              <p className="mt-1 text-xs text-navy/40">Leave blank to work it out from the terms.</p>
+            </div>
+          </div>
+
+          {/* Foreign-currency vendor */}
+          {selectedVendor?.currency && (
+            <div className="grid grid-cols-2 gap-3 rounded-lg border border-electric/20 bg-electric/5 p-3">
+              <p className="text-xs text-navy/70">
+                This vendor bills in <strong>{selectedVendor.currency}</strong>. Enter the amounts in{' '}
+                {selectedVendor.currency}; the books record them in your home currency at the exchange rate.
+              </p>
+              <div>
+                <Label htmlFor="bill-fx">Exchange rate (home per 1 {selectedVendor.currency})</Label>
+                <Input
+                  id="bill-fx"
+                  inputMode="decimal"
+                  placeholder="Use the rate from Currencies"
+                  value={exchangeRate}
+                  onChange={(e) => setExchangeRate(e.target.value)}
+                />
+              </div>
+            </div>
+          )}
+
           <div>
-            <Label htmlFor="bill-due">Due Date (optional)</Label>
-            <DateInput
-              id="bill-due"
-              value={dueDate}
-              onChange={(e) => setDueDate(e.target.value)}
-            />
+            <Label htmlFor="bill-memo">Memo</Label>
+            <Input id="bill-memo" placeholder="Optional note" value={memo} onChange={(e) => setMemo(e.target.value)} />
           </div>
 
           {/* Line items */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <Label className="mb-0">Line Items *</Label>
+              <Label className="mb-0" required>Line Items</Label>
               <span className="flex items-center gap-3">
+                <BarcodeScanInput onItem={addScannedItem} />
                 <button
                   type="button"
                   onClick={() => addLine('expense')}
@@ -625,7 +792,8 @@ export default function BillsPage() {
 
             <div className="space-y-2" onKeyDown={grid.onKeyDown}>
               {lines.map((line, idx) => (
-                <div key={idx} data-grid-row className="flex gap-2 items-start">
+                <div key={idx} data-grid-row className="space-y-1">
+                <div className="flex gap-2 items-start">
                   {/* Mode toggle */}
                   <div className="flex rounded-lg border border-slate-200 overflow-hidden shrink-0">
                     {(['expense', 'item'] as const).map((m) => (
@@ -736,6 +904,17 @@ export default function BillsPage() {
                     <Trash2 className="h-4 w-4" />
                   </button>
                 </div>
+                {line.mode === 'item' && (
+                  <InventoryLineFields
+                    adv={adv}
+                    item={items.find((it) => it.id === line.itemId)}
+                    quantity={line.quantity}
+                    direction="in"
+                    value={line.inv}
+                    onChange={(inv) => updateLine(idx, { inv })}
+                  />
+                )}
+                </div>
               ))}
             </div>
 
@@ -747,6 +926,7 @@ export default function BillsPage() {
               </span>
             </div>
           </div>
+          <AttachmentPanel entityType="bill" entityId={editingId} />
         </div>
       </Modal>
 

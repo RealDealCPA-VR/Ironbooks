@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Receipt, Plus, Trash2, PlusCircle, MinusCircle } from 'lucide-react';
+import { Receipt, Plus, Trash2, PlusCircle, MinusCircle, Pencil } from 'lucide-react';
 import {
   AmountInput,
   Button,
@@ -20,12 +20,34 @@ import {
   Modal,
   PageHeader,
   Spinner,
-  toast,
+  toast, toastError,
   useGridKeys,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 import { formatDate } from '@/lib/format';
+import { isDepositTargetAccount } from '@/lib/accountTypes';
+import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
+import { PriceSourceBadge } from '@/components/PriceSourceBadge';
+import {
+  EMPTY_SHIPPING,
+  FormSendButtons,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+} from '@/components/sales/SalesExtras';
+// wave2 prefs: Payments > default deposit account; Memorize (Ctrl+M)
+import { usePreferences } from '@/lib/usePreferences';
+import MemorizeButton from '@/components/MemorizeButton';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,6 +63,7 @@ interface Item {
   name: string;
   type: string;
   salesPrice: string | null;
+  trackingMode?: string | null;
 }
 
 interface Account {
@@ -48,6 +71,7 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype?: string | null;
 }
 
 interface TaxRate {
@@ -70,12 +94,38 @@ interface SalesReceipt {
   status: 'paid' | 'void' | string;
 }
 
+/** GET /api/sales-receipts/:id (used to prefill the edit form, wave2 sales C1). */
+interface SalesReceiptDetail extends SalesReceipt {
+  depositAccountId: string | null;
+  taxRateId: string | null;
+  memo: string | null;
+  shipDate?: string | null;
+  shipVia?: string | null;
+  fob?: string | null;
+  trackingNumber?: string | null;
+  poNumber?: string | null;
+  shipTo?: Record<string, string> | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
+  lines: Array<{
+    itemId: string | null;
+    description: string | null;
+    quantity: string;
+    rate: string;
+    taxable: boolean;
+  }>;
+}
+
 interface LineRow {
   itemId: string;
   description: string;
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** Advanced Inventory: site / bin / serials / lot the stock is sold from. */
+  inv?: InvDetail;
+  /** Advanced pricing: the user typed the rate (automatic prices leave it alone). */
+  rateManual?: boolean;
 }
 
 const EMPTY_LINE: LineRow = { itemId: '', description: '', quantity: '', rate: '', taxable: true };
@@ -115,6 +165,8 @@ function computeTotals(lines: LineRow[], taxRate: TaxRate | undefined) {
 
 interface NewReceiptModalProps {
   open: boolean;
+  /** wave2 sales (C1): receipt being edited (null = new). */
+  editing?: SalesReceiptDetail | null;
   onClose: () => void;
   customers: Customer[];
   items: Item[];
@@ -125,6 +177,7 @@ interface NewReceiptModalProps {
 
 function NewReceiptModal({
   open,
+  editing,
   onClose,
   customers,
   items,
@@ -132,8 +185,16 @@ function NewReceiptModal({
   taxRates,
   onCreated,
 }: NewReceiptModalProps) {
-  const depositAccounts = accounts.filter((a) => a.type === 'asset');
+  // QB lists bank, Undeposited Funds and other current assets in "Deposit to" — never A/R.
+  const depositAccounts = accounts.filter((a) => isDepositTargetAccount(a));
   const undepositedFunds = depositAccounts.find((a) => a.code === '1050');
+  const prefs = usePreferences();
+  // Preferences > Payments: Undeposited Funds, or the Checking default deposit account.
+  const defaultDepositId = (() => {
+    const def = prefs.company.defaultDepositAccountId;
+    if (!prefs.company.useUndepositedFunds && def && depositAccounts.some((a) => a.id === def)) return def;
+    return undepositedFunds?.id ?? '';
+  })();
 
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -143,23 +204,46 @@ function NewReceiptModal({
   const [taxRateId, setTaxRateId] = useState('');
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
+  const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const [saving, setSaving] = useState(false);
 
   // Reset form when modal opens; deposit-to defaults to Undeposited Funds (1050)
   // so receipts flow into the Make Deposits workflow.
   useEffect(() => {
+    if (open && editing) {
+      setCustomerId(editing.customerId ?? '');
+      setDate(editing.date.slice(0, 10));
+      setMethod(editing.method);
+      setDepositAccountId(editing.depositAccountId ?? '');
+      setReference(editing.reference ?? '');
+      setTaxRateId(editing.taxRateId ?? '');
+      setMemo(editing.memo ?? '');
+      setShip(shippingFromDoc(editing));
+      setLines(
+        editing.lines.map((l) => ({
+          itemId: l.itemId ?? '',
+          description: l.description ?? '',
+          quantity: String(Number(l.quantity)),
+          rate: String(Number(l.rate)),
+          taxable: l.taxable,
+          rateManual: true,
+        })),
+      );
+      return;
+    }
     if (open) {
+      setShip(shippingFromDoc(null));
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setMethod('cash');
-      setDepositAccountId(undepositedFunds?.id ?? '');
+      setDepositAccountId(defaultDepositId);
       setReference('');
       setTaxRateId('');
       setMemo('');
       setLines([{ ...EMPTY_LINE }]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, editing]);
 
   function updateLine(idx: number, patch: Partial<LineRow>) {
     setLines((prev) => {
@@ -177,15 +261,45 @@ function NewReceiptModal({
         ...next[idx],
         itemId,
         description: next[idx].description || item?.name || '',
-        rate: next[idx].rate || (item?.salesPrice ?? ''),
+        rate: item?.salesPrice ?? next[idx].rate,
         quantity: next[idx].quantity || '1',
+        rateManual: false,
       };
       return next;
     });
   }
 
+  // Advanced pricing: server-side price rules / price levels / customer prices per line.
+  const quotes = usePriceQuotes(
+    { customerId: customerId || null, date },
+    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1' })),
+  );
+  useEffect(() => {
+    setLines((prev) => {
+      let changed = false;
+      const next = prev.map((l, i) => {
+        const qt = quotes[i];
+        if (!qt || l.rateManual || l.itemId !== qt.itemId || samePrice(l.rate, qt.price)) return l;
+        changed = true;
+        return { ...l, rate: String(Number(qt.price)) };
+      });
+      return changed ? next : prev;
+    });
+  }, [quotes]);
+
   function addLine() {
     setLines((prev) => [...prev, { ...EMPTY_LINE }]);
+  }
+
+  // Advanced Inventory: sites/bins + scan-to-add.
+  const adv = useAdvancedInventory(open);
+  function addScannedItem(it: { id: string; name: string; salesPrice?: string | null }) {
+    setLines((prev) => {
+      const row: LineRow = { ...EMPTY_LINE, itemId: it.id, description: it.name, quantity: '1', rate: it.salesPrice ?? '' };
+      const emptyIdx = prev.findIndex((l) => !l.itemId && !l.description && !l.quantity && !l.rate);
+      if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
+      return [...prev, row];
+    });
   }
 
   function removeLine(idx: number) {
@@ -198,6 +312,27 @@ function NewReceiptModal({
 
   const selectedTaxRate = taxRates.find((t) => t.id === taxRateId);
   const { subtotal, tax, total } = computeTotals(lines, selectedTaxRate);
+
+  function receiptPayload(validLines: LineRow[]) {
+    return {
+      ...shippingPayload(ship),
+      customerId: customerId || null,
+      date,
+      method,
+      depositAccountId: depositAccountId || null,
+      reference: reference || null,
+      taxRateId: taxRateId || null,
+      memo: memo || null,
+      lines: validLines.map((l) => ({
+        itemId: l.itemId || null,
+        description: l.description || null,
+        quantity: l.quantity,
+        rate: l.rate,
+        taxable: l.taxable,
+        ...inventoryLinePayload(l.inv),
+      })),
+    };
+  }
 
   async function handleSubmit() {
     if (!date) { toast('Please enter a receipt date.', 'danger'); return; }
@@ -215,28 +350,18 @@ function NewReceiptModal({
 
     setSaving(true);
     try {
-      await api.post('/api/sales-receipts', {
-        customerId: customerId || null,
-        date,
-        method,
-        depositAccountId: depositAccountId || null,
-        reference: reference || null,
-        taxRateId: taxRateId || null,
-        memo: memo || null,
-        lines: validLines.map((l) => ({
-          itemId: l.itemId || null,
-          description: l.description || null,
-          quantity: l.quantity,
-          rate: l.rate,
-          taxable: l.taxable,
-        })),
-      });
-      toast('Sales receipt created.', 'success');
+      const body = receiptPayload(validLines);
+      if (editing) {
+        await api.patch(`/api/sales-receipts/${editing.id}`, body);
+        toast(`Sales Receipt #${editing.receiptNumber} updated.`, 'success');
+      } else {
+        await api.post('/api/sales-receipts', body);
+        toast('Sales receipt created.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to create sales receipt.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to create sales receipt.');
     } finally {
       setSaving(false);
     }
@@ -247,17 +372,45 @@ function NewReceiptModal({
       size="lg"
       open={open}
       onClose={onClose}
-      title="New Sales Receipt"
+      title={editing ? `Edit Sales Receipt #${editing.receiptNumber}` : 'New Sales Receipt'}
       footer={
         <>
+          <MemorizeButton
+            docType="sales_receipt"
+            shortcut={open}
+            defaultName={customers.find((c) => c.id === customerId)?.displayName}
+            getTemplate={() => {
+              const valid = lines.filter((l) => l.itemId || l.description || l.quantity || l.rate);
+              if (valid.length === 0) return 'Add at least one line before memorizing.';
+              const p = receiptPayload(valid);
+              // Lot / serial picks are one-time: each memorized entry picks fresh stock.
+              return {
+                ...p,
+                reference: null,
+                lines: p.lines.map((l) => ({
+                  itemId: l.itemId,
+                  description: l.description,
+                  quantity: l.quantity,
+                  rate: l.rate,
+                  taxable: l.taxable,
+                })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
-            Create Receipt
+            {editing ? 'Save Changes' : 'Create Receipt'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
+        {editing && (
+          <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
+            Saving changes re-posts this sale (and puts back / takes out any stock) so your books stay
+            balanced. If it is already part of a bank deposit, its total and deposit account can&apos;t change.
+          </div>
+        )}
         {/* Customer (optional) + date */}
         <div className="grid grid-cols-2 gap-3">
           <div>
@@ -275,7 +428,7 @@ function NewReceiptModal({
             </Select>
           </div>
           <div>
-            <Label htmlFor="sr-date">Sale Date *</Label>
+            <Label htmlFor="sr-date" required>Sale Date</Label>
             <DateInput
               id="sr-date"
               value={date}
@@ -307,7 +460,7 @@ function NewReceiptModal({
 
         {/* Deposit to */}
         <div>
-          <Label htmlFor="sr-deposit">Deposit To</Label>
+          <Label htmlFor="sr-deposit">Deposit To <Help term="undeposited-funds" /></Label>
           <Select
             id="sr-deposit"
             value={depositAccountId}
@@ -329,13 +482,16 @@ function NewReceiptModal({
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
-              <PlusCircle className="h-4 w-4" /> Add line
-            </button>
+            <div className="flex items-center gap-3">
+              <BarcodeScanInput onItem={addScannedItem} />
+              <button
+                type="button"
+                onClick={addLine}
+                className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
+              >
+                <PlusCircle className="h-4 w-4" /> Add line
+              </button>
+            </div>
           </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
@@ -353,7 +509,7 @@ function NewReceiptModal({
               <div
                 key={idx}
                 data-grid-row
-                className="grid grid-cols-[150px_1fr_60px_80px_44px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
+                className="grid grid-cols-[150px_1fr_60px_80px_44px_32px] gap-2 items-start px-3 py-2 border-b border-slate-100 last:border-b-0"
               >
                 <Select
                   value={line.itemId}
@@ -375,11 +531,18 @@ function NewReceiptModal({
                   value={line.quantity}
                   onChange={(e) => updateLine(idx, { quantity: e.target.value })}
                 />
-                <AmountInput
-                  placeholder="0.00"
-                  value={line.rate}
-                  onChange={(e) => updateLine(idx, { rate: e.target.value })}
-                />
+                <div>
+                  <AmountInput
+                    placeholder="0.00"
+                    value={line.rate}
+                    onChange={(e) => updateLine(idx, { rate: e.target.value, rateManual: true })}
+                  />
+                  <PriceSourceBadge
+                    quote={quotes[idx]}
+                    rate={line.rate}
+                    onUseQuoted={(price) => updateLine(idx, { rate: String(Number(price)), rateManual: false })}
+                  />
+                </div>
                 <input
                   type="checkbox"
                   checked={line.taxable}
@@ -396,6 +559,15 @@ function NewReceiptModal({
                 >
                   <MinusCircle className="h-4 w-4" />
                 </button>
+                <InventoryLineFields
+                  className="col-span-full"
+                  adv={adv}
+                  item={items.find((i) => i.id === line.itemId)}
+                  quantity={line.quantity}
+                  direction="out"
+                  value={line.inv}
+                  onChange={(inv) => updateLine(idx, { inv })}
+                />
               </div>
             ))}
           </div>
@@ -424,6 +596,8 @@ function NewReceiptModal({
             />
           </div>
         </div>
+
+        <ShippingSection value={ship} onChange={setShip} idPrefix="sr-ship" />
 
         {/* Live totals */}
         <div className="rounded-lg bg-navy/5 px-4 py-3 space-y-1">
@@ -462,6 +636,15 @@ export default function SalesReceiptsPage() {
 
   // Void state
   const [voidTarget, setVoidTarget] = useState<SalesReceipt | null>(null);
+  const [editTarget, setEditTarget] = useState<SalesReceiptDetail | null>(null);
+
+  async function openEdit(r: SalesReceipt) {
+    try {
+      setEditTarget(await api.get<SalesReceiptDetail>(`/api/sales-receipts/${r.id}`));
+    } catch (err: unknown) {
+      toastError(err, 'Could not open the sales receipt.');
+    }
+  }
   const [voiding, setVoiding] = useState(false);
 
   const fetchData = useCallback(async () => {
@@ -480,8 +663,7 @@ export default function SalesReceiptsPage() {
       setAccounts(acctList);
       setTaxRates(taxList);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load sales receipts.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load sales receipts.');
     } finally {
       setLoading(false);
     }
@@ -500,8 +682,7 @@ export default function SalesReceiptsPage() {
       setVoidTarget(null);
       fetchData();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void sales receipt.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void sales receipt.');
     } finally {
       setVoiding(false);
     }
@@ -530,7 +711,7 @@ export default function SalesReceiptsPage() {
           <EmptyState
             icon={Receipt}
             title="No sales receipts yet"
-            message="Record your first cash sale to get started."
+            message="Use a sales receipt when a customer pays at the time of sale. If they will pay later, create an invoice instead."
             action={
               <Button onClick={() => setShowNew(true)}>
                 <Plus className="h-4 w-4" /> New Sales Receipt
@@ -566,6 +747,18 @@ export default function SalesReceiptsPage() {
                     </Badge>
                   </Td>
                   <Td className="text-right">
+                    {r.status !== 'void' && <FormSendButtons kind="sales_receipt" id={r.id} />}
+                    {r.status !== 'void' && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="Edit sales receipt"
+                        aria-label="Edit sales receipt"
+                        onClick={() => openEdit(r)}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
+                    )}
                     {r.status !== 'void' && (
                       <Button
                         variant="ghost"
@@ -603,8 +796,12 @@ export default function SalesReceiptsPage() {
       )}
 
       <NewReceiptModal
-        open={showNew}
-        onClose={() => setShowNew(false)}
+        open={showNew || !!editTarget}
+        editing={editTarget}
+        onClose={() => {
+          setShowNew(false);
+          setEditTarget(null);
+        }}
         customers={customers}
         items={items}
         accounts={accounts}

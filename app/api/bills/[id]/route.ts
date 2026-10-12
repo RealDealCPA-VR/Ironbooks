@@ -7,6 +7,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getBill, updateBill, voidBill } from '@/lib/services/bills';
 import { ServiceError } from '@/lib/services/_base';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createBillSchema } from '@/lib/validation/bills';
 
@@ -51,7 +52,13 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const bill = await updateBill(ctx, id, parsed.data);
+    // Multi-user: 409 if someone else saved this bill since it was loaded.
+    const bill = await withVersionCheck(ctx, 'bill', id, expectedVersion(req), (c) =>
+      updateBill(c, id, {
+        ...parsed.data,
+        checkDuplicateNumber: !parsed.data.allowDuplicateNumber,
+      }),
+    );
 
     return NextResponse.json(bill);
   } catch (err) {
@@ -59,11 +66,11 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const voided = await voidBill(ctx, id);
+    const voided = await withVersionCheck(ctx, 'bill', id, expectedVersion(req), (c) => voidBill(c, id));
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err);

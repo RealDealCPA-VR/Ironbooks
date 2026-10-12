@@ -11,9 +11,12 @@
  * document is created and calls postJournalEntry. This service only manages
  * the item record and validates the linked account references.
  */
-import { and, asc, eq, ilike, ne } from 'drizzle-orm';
+import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, items } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { assertNotControlLineAccount } from './posting';
+import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
+import { assertUomSet, assertVendor, resolveSalesTaxCode } from './lists/fields';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -39,6 +42,18 @@ export interface CreateItemInput {
   taxable?: boolean;
   /** Unit of measure shown on line grids / printed docs (e.g. "hr", "box", "ea"). */
   unitOfMeasure?: string | null;
+  /** Advanced Inventory: scan code (unique per company). */
+  barcode?: string | null;
+  /** Advanced Inventory: serial/lot tracking (inventory items only). Defaults to 'none'. */
+  trackingMode?: TrackingMode;
+  /** Unit weight — used to allocate landed cost by weight. */
+  weight?: string | number | null;
+  /** Preferred vendor (drives "Create PO from reorder list" and Stock Status by Vendor). */
+  preferredVendorId?: string | null;
+  /** Sales Tax Code list entry; when set, `taxable` follows the code's taxable flag. */
+  salesTaxCodeId?: string | null;
+  /** Unit of measure set (quantities on lines convert to the set's base unit). */
+  uomSetId?: string | null;
 }
 
 export interface UpdateItemInput {
@@ -54,6 +69,15 @@ export interface UpdateItemInput {
   taxable?: boolean;
   unitOfMeasure?: string | null;
   isActive?: boolean;
+  barcode?: string | null;
+  trackingMode?: TrackingMode;
+  weight?: string | number | null;
+  /** Preferred vendor (drives "Create PO from reorder list" and Stock Status by Vendor). */
+  preferredVendorId?: string | null;
+  /** Sales Tax Code list entry; when set, `taxable` follows the code's taxable flag. */
+  salesTaxCodeId?: string | null;
+  /** Unit of measure set (quantities on lines convert to the set's base unit). */
+  uomSetId?: string | null;
 }
 
 /** A bundle (group item) component, joined with the component item's details. */
@@ -93,10 +117,12 @@ async function requireAccount(
   expectedType?: string,
 ): Promise<void> {
   const [row] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
   if (!row) throw notFound(`${label} account ${accountId}`);
+  // QB never offers A/R or A/P as an item's account (QB invariant I11).
+  assertNotControlLineAccount(row, `${label} account`);
   if (expectedType && row.type !== expectedType) {
     throw validation(
       `${label} account must be a "${expectedType}" account (got "${row.type}").`,
@@ -163,6 +189,38 @@ function validateTypeRules(
   }
 }
 
+/** Normalise a barcode ('' → null) and enforce per-company uniqueness. */
+async function resolveBarcode(
+  ctx: ServiceContext,
+  barcode: string | null | undefined,
+  exceptItemId?: string,
+): Promise<string | null> {
+  const code = barcode?.trim() || null;
+  if (!code) return null;
+  if (code.length > 100) throw validation('Barcode cannot be longer than 100 characters.');
+  const conds = [eq(items.companyId, ctx.companyId), eq(items.barcode, code)];
+  if (exceptItemId) conds.push(ne(items.id, exceptItemId));
+  const [dup] = await ctx.db.select({ name: items.name }).from(items).where(and(...conds));
+  if (dup) throw validation(`Barcode "${code}" is already assigned to item "${dup.name}".`);
+  return code;
+}
+
+function resolveTracking(type: ItemType, mode: TrackingMode | undefined): TrackingMode {
+  const m = mode ?? 'none';
+  if (!TRACKING_MODES.includes(m)) throw validation(`Invalid tracking mode "${m}".`);
+  if (m !== 'none' && type !== 'inventory') {
+    throw validation('Serial/lot tracking is only available for inventory items.');
+  }
+  return m;
+}
+
+function resolveWeight(weight: string | number | null | undefined): string | null {
+  if (weight == null || weight === '') return null;
+  const n = Number(weight);
+  if (!Number.isFinite(n) || n < 0) throw validation('Weight must be a non-negative number.');
+  return String(weight);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /** Return all items for the company, with optional filtering. */
@@ -207,16 +265,22 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
   const name = input.name?.trim();
   if (!name) throw validation('Item name is required.');
 
-  // Enforce unique name per company (case-sensitive match on stored value).
+  // Enforce unique name per company (case-insensitive, like QB).
   const [dup] = await ctx.db
     .select({ id: items.id })
     .from(items)
-    .where(and(eq(items.companyId, ctx.companyId), eq(items.name, name)));
+    .where(and(eq(items.companyId, ctx.companyId), sql`lower(${items.name}) = lower(${name})`));
   if (dup) throw validation(`An item named "${name}" already exists.`);
 
   // ── Validate type rules + account links ──────────────────────────────────
   validateTypeRules((input.type ?? 'service') as ItemType, input);
   await resolveAccountLinks(ctx, input);
+  const barcode = await resolveBarcode(ctx, input.barcode);
+  const trackingMode = resolveTracking((input.type ?? 'service') as ItemType, input.trackingMode);
+  const weight = resolveWeight(input.weight);
+  if (input.preferredVendorId) await assertVendor(ctx, input.preferredVendorId);
+  if (input.uomSetId) await assertUomSet(ctx, input.uomSetId);
+  const taxCode = input.salesTaxCodeId ? await resolveSalesTaxCode(ctx, input.salesTaxCodeId) : null;
 
   // ── Insert ───────────────────────────────────────────────────────────────
   const [row] = await ctx.db
@@ -232,8 +296,14 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
       incomeAccountId: input.incomeAccountId ?? null,
       expenseAccountId: input.expenseAccountId ?? null,
       assetAccountId: input.assetAccountId ?? null,
-      taxable: input.taxable ?? true,
+      taxable: taxCode ? taxCode.taxable : input.taxable ?? true,
+      salesTaxCodeId: taxCode?.id ?? null,
+      preferredVendorId: input.preferredVendorId ?? null,
+      uomSetId: input.uomSetId ?? null,
       unitOfMeasure: input.unitOfMeasure?.trim() || null,
+      barcode,
+      trackingMode,
+      weight,
     })
     .returning();
 
@@ -266,7 +336,7 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
         .where(
           and(
             eq(items.companyId, ctx.companyId),
-            eq(items.name, newName),
+            sql`lower(${items.name}) = lower(${newName})`,
             ne(items.id, id),
           ),
         );
@@ -297,6 +367,29 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
     assetAccountId:
       patch.assetAccountId !== undefined ? patch.assetAccountId : undefined,
   });
+
+  // ── Advanced Inventory fields ───────────────────────────────────────────
+  const barcode =
+    patch.barcode !== undefined ? await resolveBarcode(ctx, patch.barcode, id) : before.barcode;
+  let trackingMode = before.trackingMode as TrackingMode;
+  if (patch.trackingMode !== undefined || patch.type !== undefined) {
+    trackingMode = resolveTracking(effectiveType, patch.trackingMode ?? trackingMode);
+    await assertTrackingModeChangeAllowed(ctx, before, trackingMode);
+  }
+  const weight = patch.weight !== undefined ? resolveWeight(patch.weight) : before.weight;
+  if (patch.preferredVendorId) await assertVendor(ctx, patch.preferredVendorId);
+  if (patch.uomSetId && patch.uomSetId !== before.uomSetId) {
+    await assertUomSet(ctx, patch.uomSetId);
+    // Inventory is counted in the set's base unit: switching sets on stocked items would
+    // silently reinterpret the quantity on hand.
+    if (before.type === 'inventory' && before.uomSetId && Number(before.quantityOnHand ?? 0) !== 0) {
+      throw validation('This item has stock on hand, so its unit of measure set cannot change.');
+    }
+  }
+  const taxCode =
+    patch.salesTaxCodeId !== undefined && patch.salesTaxCodeId !== null
+      ? await resolveSalesTaxCode(ctx, patch.salesTaxCodeId)
+      : null;
 
   // ── Update ───────────────────────────────────────────────────────────────
   const [row] = await ctx.db
@@ -331,12 +424,19 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
           : before.expenseAccountId,
       assetAccountId:
         patch.assetAccountId !== undefined ? patch.assetAccountId : before.assetAccountId,
-      taxable: patch.taxable !== undefined ? patch.taxable : before.taxable,
+      taxable: taxCode ? taxCode.taxable : patch.taxable !== undefined ? patch.taxable : before.taxable,
+      salesTaxCodeId: patch.salesTaxCodeId !== undefined ? taxCode?.id ?? null : before.salesTaxCodeId,
+      preferredVendorId:
+        patch.preferredVendorId !== undefined ? patch.preferredVendorId : before.preferredVendorId,
+      uomSetId: patch.uomSetId !== undefined ? patch.uomSetId : before.uomSetId,
       unitOfMeasure:
         patch.unitOfMeasure !== undefined
           ? (patch.unitOfMeasure?.trim() || null)
           : before.unitOfMeasure,
       isActive: patch.isActive !== undefined ? patch.isActive : before.isActive,
+      barcode,
+      trackingMode,
+      weight,
       updatedAt: new Date(),
     })
     .where(eq(items.id, id))
@@ -401,4 +501,32 @@ export async function getBundleComponents(
     .orderBy(asc(items.name));
 
   return rows as BundleComponent[];
+}
+
+/**
+ * Look up an active item by scanned code (keyboard-wedge barcode scanners type the code and
+ * press Enter). Matches the barcode exactly first, then falls back to an exact,
+ * case-insensitive SKU match when exactly one item has that SKU. Returns null when nothing
+ * matches.
+ */
+export async function findItemByBarcode(ctx: ServiceContext, code: string) {
+  const value = code?.trim();
+  if (!value) return null;
+  const [byBarcode] = await ctx.db
+    .select()
+    .from(items)
+    .where(and(eq(items.companyId, ctx.companyId), eq(items.barcode, value), eq(items.isActive, true)));
+  if (byBarcode) return byBarcode;
+  const bySku = await ctx.db
+    .select()
+    .from(items)
+    .where(
+      and(
+        eq(items.companyId, ctx.companyId),
+        eq(items.isActive, true),
+        sql`lower(${items.sku}) = lower(${value})`,
+      ),
+    )
+    .limit(2);
+  return bySku.length === 1 ? bySku[0] : null;
 }

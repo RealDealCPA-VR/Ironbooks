@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { Hammer, RefreshCw, ShieldAlert, ShieldCheck, Wrench } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { Hammer, Lock, RefreshCw, Scale, ShieldAlert, ShieldCheck, Wrench } from 'lucide-react';
 import { Badge, Button, Card, ConfirmDialog, PageHeader, Spinner, Table, Td, Th, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { formatCurrency } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,6 +52,44 @@ interface RebuildResult {
   fixes: RebuildFix[];
 }
 
+interface BooksSection {
+  ok: boolean;
+  detail: string;
+}
+
+interface BooksInBalance {
+  inBalance: boolean;
+  checkedAt: string;
+  trialBalance: BooksSection & { totalDebit: string; totalCredit: string };
+  balanceSheet: BooksSection & { totalAssets: string; totalLiabilitiesAndEquity: string };
+  cashBasisBalanceSheet: BooksSection & { totalAssets: string; totalLiabilitiesAndEquity: string };
+  accountBalances: BooksSection & { drifted: number };
+  guards: BooksSection & { missing: string[] };
+}
+
+/** How often the live "Books in balance" panel re-checks while the page is open. */
+const LIVE_REFRESH_MS = 30_000;
+
+/** The guarantees the database itself enforces (drizzle/0017_team_ledger.sql). */
+const GUARANTEES: Array<{ title: string; body: string }> = [
+  {
+    title: 'Every transaction balances',
+    body: 'The database refuses to save any posted transaction whose debits do not equal its credits, that has fewer than two lines, or that has a malformed amount — no matter which screen, import or tool wrote it.',
+  },
+  {
+    title: 'Account balances cannot drift',
+    body: 'Account balances are calculated by the database from posted transactions. Nobody — not even a bug — can type over them.',
+  },
+  {
+    title: 'Posted history is permanent',
+    body: 'Posted transactions cannot be silently edited or deleted. Changes are made by voiding or reversing, which leaves an audit trail.',
+  },
+  {
+    title: 'Reports balance by construction',
+    body: 'The trial balance and balance sheets (accrual and cash basis) are built from the same ledger rows, so Assets always equal Liabilities + Equity. If they ever did not, the report would stop with an integrity error instead of showing wrong numbers.',
+  },
+];
+
 /** Which rebuild action repairs which failed check (best match). */
 const CHECK_TO_ACTION: Record<string, RebuildAction> = {
   'Cached account balances match GL': 'account_balances',
@@ -64,6 +103,8 @@ const CHECK_TO_ACTION: Record<string, RebuildAction> = {
 export default function IntegrityPage() {
   const [result, setResult] = useState<IntegrityResult | null>(null);
   const [loading, setLoading] = useState(true);
+  const [books, setBooks] = useState<BooksInBalance | null>(null);
+  const [booksError, setBooksError] = useState<string | null>(null);
 
   // ---- Rebuild state ----
   const [actions, setActions] = useState<RebuildActionInfo[]>([]);
@@ -87,6 +128,16 @@ export default function IntegrityPage() {
     }
   }
 
+  const loadBooks = useCallback(async () => {
+    try {
+      const data = await api.get<BooksInBalance>('/api/integrity/books-in-balance');
+      setBooks(data);
+      setBooksError(null);
+    } catch (err) {
+      setBooksError(err instanceof ApiError ? err.message : 'Could not check whether the books balance.');
+    }
+  }, []);
+
   async function loadActions() {
     try {
       const data = await api.get<{ actions: RebuildActionInfo[] }>('/api/import/rebuild');
@@ -101,6 +152,20 @@ export default function IntegrityPage() {
     loadActions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Live "Books in balance": check now, then periodically while the tab is visible.
+  useEffect(() => {
+    loadBooks();
+    const timer = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') loadBooks();
+    }, LIVE_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [loadBooks]);
+
+  function rerunAll() {
+    runChecks();
+    loadBooks();
+  }
 
   async function handlePreview(action: RebuildAction) {
     setBusyAction(action);
@@ -128,7 +193,7 @@ export default function IntegrityPage() {
       // Refresh the preview (should now be empty) and re-run the checks.
       setPreviews((prev) => ({ ...prev, [action]: { action, fixes: [], count: 0 } }));
       setPendingRebuild(null);
-      await runChecks();
+      await Promise.all([runChecks(), loadBooks()]);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Rebuild failed', 'danger');
       setPendingRebuild(null);
@@ -148,12 +213,15 @@ export default function IntegrityPage() {
         title="Data Integrity"
         icon={allOk ? ShieldCheck : ShieldAlert}
         action={
-          <Button onClick={runChecks} disabled={loading} variant="secondary">
+          <Button onClick={rerunAll} disabled={loading} variant="secondary">
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
             {loading ? 'Running...' : 'Re-run Checks'}
           </Button>
         }
       />
+
+      {/* Live "Books in balance" status */}
+      <BooksInBalancePanel books={books} error={booksError} />
 
       {/* Overall status banner */}
       {!loading && result && (
@@ -243,6 +311,25 @@ export default function IntegrityPage() {
             );
           })}
       </Card>
+
+      {/* ---- Guarantees ---- */}
+      <div className="mt-8">
+        <div className="flex items-center gap-2 mb-3">
+          <Lock className="h-5 w-5 text-navy/70" />
+          <h2 className="text-lg font-bold text-navy">What BookKeeper guarantees</h2>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          {GUARANTEES.map((g) => (
+            <Card key={g.title} className="p-5">
+              <div className="flex items-center gap-2 mb-1">
+                <ShieldCheck className="h-4 w-4 text-emerald flex-shrink-0" />
+                <span className="font-semibold text-navy text-sm">{g.title}</span>
+              </div>
+              <p className="text-navy/60 text-sm leading-relaxed">{g.body}</p>
+            </Card>
+          ))}
+        </div>
+      </div>
 
       {/* ---- Rebuild Data utility ---- */}
       <div className="mt-8">
@@ -338,5 +425,101 @@ export default function IntegrityPage() {
         onClose={() => setPendingRebuild(null)}
       />
     </main>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Books in balance panel
+// ---------------------------------------------------------------------------
+
+function BooksRow({ label, section, value }: { label: string; section: BooksSection; value: string }) {
+  return (
+    <div className="flex items-start justify-between gap-3 py-2">
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          {section.ok ? (
+            <ShieldCheck className="h-4 w-4 text-emerald flex-shrink-0" />
+          ) : (
+            <ShieldAlert className="h-4 w-4 text-red-500 flex-shrink-0" />
+          )}
+          <span className="text-sm font-medium text-navy">{label}</span>
+        </div>
+        {!section.ok && <p className="text-xs text-red-600 mt-1 ml-6">{section.detail}</p>}
+      </div>
+      <span className="text-sm tabular-nums text-navy/70 text-right">{value}</span>
+    </div>
+  );
+}
+
+function BooksInBalancePanel({ books, error }: { books: BooksInBalance | null; error: string | null }) {
+  if (!books && !error) {
+    return (
+      <Card className="mb-6 p-5 flex items-center gap-2 text-sm text-navy/50">
+        <Spinner className="h-4 w-4" /> Checking whether the books balance...
+      </Card>
+    );
+  }
+  if (!books) {
+    return (
+      <Card className="mb-6 p-5 flex items-center gap-2 text-sm text-red-600">
+        <ShieldAlert className="h-4 w-4" /> {error}
+      </Card>
+    );
+  }
+  const ok = books.inBalance;
+  return (
+    <Card className={`mb-6 p-5 border ${ok ? 'border-emerald/30' : 'border-red-200'}`}>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-2">
+        <div className="flex items-center gap-3">
+          <span
+            className={`inline-flex items-center justify-center h-10 w-10 rounded-full ${
+              ok ? 'bg-emerald/15' : 'bg-red-100'
+            }`}
+          >
+            <Scale className={`h-5 w-5 ${ok ? 'text-emerald' : 'text-red-500'}`} />
+          </span>
+          <div>
+            <div className="text-lg font-bold text-navy">
+              {ok ? 'Books in balance' : 'Books OUT of balance'}
+            </div>
+            <div className="text-xs text-navy/50">
+              Live check · updated {new Date(books.checkedAt).toLocaleTimeString('en-US')}
+            </div>
+          </div>
+        </div>
+        <Badge tone={ok ? 'success' : 'danger'}>{ok ? 'Balanced' : 'Needs attention'}</Badge>
+      </div>
+      <div className="divide-y divide-slate-100">
+        <BooksRow
+          label="Trial balance: debits = credits"
+          section={books.trialBalance}
+          value={
+            books.trialBalance.ok
+              ? `${formatCurrency(books.trialBalance.totalDebit)} = ${formatCurrency(books.trialBalance.totalCredit)}`
+              : ''
+          }
+        />
+        <BooksRow
+          label="Balance sheet (accrual): assets = liabilities + equity"
+          section={books.balanceSheet}
+          value={books.balanceSheet.ok ? formatCurrency(books.balanceSheet.totalAssets) : ''}
+        />
+        <BooksRow
+          label="Balance sheet (cash basis): assets = liabilities + equity"
+          section={books.cashBasisBalanceSheet}
+          value={books.cashBasisBalanceSheet.ok ? formatCurrency(books.cashBasisBalanceSheet.totalAssets) : ''}
+        />
+        <BooksRow
+          label="Account balances match the ledger"
+          section={books.accountBalances}
+          value={books.accountBalances.ok ? 'All match' : `${books.accountBalances.drifted} differ`}
+        />
+        <BooksRow
+          label="Database ledger guards active"
+          section={books.guards}
+          value={books.guards.ok ? 'On' : 'Off'}
+        />
+      </div>
+    </Card>
   );
 }

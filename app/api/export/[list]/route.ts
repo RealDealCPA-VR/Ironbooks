@@ -1,50 +1,69 @@
 /**
- * GET /api/export/<list>.csv — export a core list as CSV.
+ * GET /api/export/<list>[.csv|.xlsx|.iif][?format=csv|xlsx|iif] — export a list.
  *
- * <list> ∈ customers | vendors | items | accounts | employees
- * (the .csv suffix is optional; /api/export/customers also works).
+ * <list> ∈ customers | vendors | items | accounts | employees | classes | tax_rates | terms |
+ *          jobs | payroll_items | customer_types | vendor_types | sales_reps |
+ *          workers_comp_codes | all
+ *   all + xlsx → one workbook, a sheet per list; all + iif → every QuickBooks-readable list.
  *
- * Returns text/csv as an attachment download.
+ * GET /api/export/journal?format=iif&from=YYYY-MM-DD&to=YYYY-MM-DD
+ *   — posted journal entries as IIF GENERAL JOURNAL TRNS/SPL blocks.
+ *
+ * Returns the file as an attachment download.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { exportListCsv } from '@/lib/services/listExport';
-import { ServiceError } from '@/lib/services/_base';
-
-function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
-  }
-  console.error('[export/[list]] unexpected error:', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-}
+import { exportList, type ExportFormat } from '@/lib/services/listExport';
+import { exportJournalIif } from '@/lib/services/iifExport';
+import { routeError } from '@/lib/routeErrors';
 
 interface RouteParams {
   params: Promise<{ list: string }>;
 }
 
-export async function GET(_req: NextRequest, { params }: RouteParams) {
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
     const { list } = await params;
-    const name = decodeURIComponent(list).replace(/\.csv$/i, '').toLowerCase();
+    const raw = decodeURIComponent(list).toLowerCase();
+    const ext = /\.(csv|xlsx|iif)$/.exec(raw)?.[1] as ExportFormat | undefined;
+    const name = raw.replace(/\.(csv|xlsx|iif)$/, '');
+    const format = ((req.nextUrl.searchParams.get('format') ?? ext ?? 'csv').toLowerCase()) as ExportFormat;
 
     const ctx = await getServerContext();
-    const { filename, csv } = await exportListCsv(ctx, name);
 
-    return new Response(csv, {
+    if (name === 'journal') {
+      const from = req.nextUrl.searchParams.get('from');
+      const to = req.nextUrl.searchParams.get('to');
+      if (!from || !to || !DATE_RE.test(from) || !DATE_RE.test(to)) {
+        return NextResponse.json({ error: 'from and to (YYYY-MM-DD) are required', code: 'VALIDATION' }, { status: 400 });
+      }
+      const body = await exportJournalIif(ctx, {
+        from: new Date(`${from}T00:00:00.000Z`),
+        to: new Date(`${to}T23:59:59.999Z`),
+      });
+      return new Response(body, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Disposition': `attachment; filename="journal-${from}-to-${to}.iif"`,
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+
+    const file = await exportList(ctx, name, format);
+    const body = typeof file.body === 'string' ? file.body : new Uint8Array(file.body);
+    return new Response(body, {
       status: 200,
       headers: {
-        'Content-Type': 'text/csv; charset=utf-8',
-        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Type': file.contentType,
+        'Content-Disposition': `attachment; filename="${file.filename}"`,
         'Cache-Control': 'no-store',
       },
     });
   } catch (err) {
-    return errorResponse(err);
+    return routeError(err, 'export/[list]');
   }
 }

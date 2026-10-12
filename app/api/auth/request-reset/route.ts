@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { users } from '@/lib/db/schema';
+import { originFromHeaders } from '@/lib/net/requestInfo';
 
 export async function POST(req: NextRequest) {
   const { email } = await req.json();
@@ -30,7 +31,9 @@ export async function POST(req: NextRequest) {
   // cases the token is logged server-side so a local operator can retrieve it; a hosted
   // deployment should email a reset link instead.
   console.log(`[auth/request-reset] reset token for ${user.email}: ${token}`);
-  if (process.env.BKA_OFFLINE === '1') {
+  // Multi-user hosting: a request relayed from another machine is NOT local, so it never gets
+  // the token even in the desktop build (anyone on the tailnet could otherwise take over).
+  if (process.env.BKA_OFFLINE === '1' && !originFromHeaders(req.headers).remote) {
     return NextResponse.json({ ...generic, token });
   }
   return NextResponse.json(generic);

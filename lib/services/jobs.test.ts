@@ -187,6 +187,7 @@ describe('Jobs / Project-Costing service (integration)', () => {
   it('jobProfitability: aggregates revenue and cost correctly', async () => {
     // --- Post GL for invoice (AR + Sales) so trial balance stays balanced ---
     const je1 = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-02-15'),
       description: 'Invoice 1 for Roofing Alpha',
       lines: [
@@ -225,6 +226,7 @@ describe('Jobs / Project-Costing service (integration)', () => {
 
     // --- Post GL for bill (Expenses + AP) so trial balance stays balanced ---
     const je2 = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-02-20'),
       description: 'Bill 1 for Roofing Alpha materials',
       lines: [
@@ -260,6 +262,7 @@ describe('Jobs / Project-Costing service (integration)', () => {
 
     // --- Direct expense (out-of-pocket) — $300 cost ---
     const je3 = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-02-22'),
       description: 'Direct expense for Roofing Alpha',
       lines: [

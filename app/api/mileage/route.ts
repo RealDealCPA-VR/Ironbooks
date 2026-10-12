@@ -49,7 +49,8 @@ export async function GET(req: NextRequest) {
     }
 
     const customerId = searchParams.get('customerId') ?? undefined;
-    const list = await listMileage(ctx, { customerId });
+    const vehicleId = searchParams.get('vehicleId') ?? undefined;
+    const list = await listMileage(ctx, { customerId, vehicleId });
     return NextResponse.json(list);
   } catch (err) {
     return errorResponse(err);

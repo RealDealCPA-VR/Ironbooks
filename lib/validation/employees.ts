@@ -3,7 +3,7 @@
  * UpdateEmployeeInput (lib/services/payroll.ts).
  */
 import { z } from 'zod';
-import { zDecimal } from './helpers';
+import { zDate, zDecimal, zUuid } from './helpers';
 
 export const payTypeSchema = z.enum(['hourly', 'salary', 'commission']);
 
@@ -29,5 +29,10 @@ export const updateEmployeeSchema = z.object({
   /** Mailing address — shape is service-defined ({ line1, city, ... }). */
   address: z.record(z.unknown()).nullish(),
   isActive: z.boolean().optional(),
+  phone: z.string().max(50).nullish(),
+  hireDate: zDate.nullish(),
+  releaseDate: zDate.nullish(),
+  /** Default workers' comp class code (null clears it). */
+  workersCompCodeId: zUuid.nullish(),
 });
 export type UpdateEmployeeBody = z.infer<typeof updateEmployeeSchema>;

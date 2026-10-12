@@ -1,33 +1,35 @@
 /**
- * GET  /api/memorized-reports  — list saved reports
- * POST /api/memorized-reports  — save one ({name, reportType, config})
+ * GET  /api/memorized-reports  — list saved reports (?withGroups=1 also returns the groups)
+ * POST /api/memorized-reports  — memorize a report ({name, reportType, config, groupId?})
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { listMemorizedReports, saveMemorizedReport } from '@/lib/services/memorizedReports';
-import { ServiceError } from '@/lib/services/_base';
+import { listMemorizedGroups, listMemorizedReports, saveMemorizedReport } from '@/lib/services/memorizedReports';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { memorizeReportSchema } from '@/lib/validation/reports';
+import { reportError } from '../reports/_lib';
 
-function err(e: unknown) {
-  if (e instanceof ServiceError) {
-    const s = e.code === 'NOT_FOUND' ? 404 : e.code === 'VALIDATION' ? 400 : 500;
-    return NextResponse.json({ error: e.message, code: e.code }, { status: s });
-  }
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-}
-
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
-    return NextResponse.json(await listMemorizedReports(await getServerContext()));
+    const ctx = await getServerContext();
+    const reports = await listMemorizedReports(ctx);
+    // Legacy callers (report builder) expect a bare array.
+    if (req.nextUrl.searchParams.get('withGroups')) {
+      return NextResponse.json({ reports, groups: await listMemorizedGroups(ctx) });
+    }
+    return NextResponse.json(reports);
   } catch (e) {
-    return err(e);
+    return reportError(e, 'memorized-reports');
   }
 }
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    return NextResponse.json(await saveMemorizedReport(ctx, await req.json()), { status: 201 });
+    const parsed = memorizeReportSchema.safeParse(await req.json().catch(() => ({})));
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    return NextResponse.json(await saveMemorizedReport(ctx, parsed.data), { status: 201 });
   } catch (e) {
-    return err(e);
+    return reportError(e, 'memorized-reports');
   }
 }

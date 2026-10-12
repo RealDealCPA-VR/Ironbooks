@@ -384,6 +384,7 @@ describe('Customers service (integration)', () => {
   it('trial balance remains balanced after all customer operations', async () => {
     // Post a journal entry to give the trial balance something to validate.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-06-01'),
       description: 'Customer service balance check',
       lines: [

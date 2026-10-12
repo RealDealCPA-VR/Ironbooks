@@ -1,6 +1,7 @@
 /**
  * GET   /api/estimates/:id           — fetch estimate with lines.
- * PATCH /api/estimates/:id           — update status (body: { status }).
+ * PATCH /api/estimates/:id           — update status (body: { status }), or — when the body
+ *                                      carries `lines` — edit the whole estimate (wave2 sales C1).
  * POST  /api/estimates/:id           — action dispatch:
  *          { action: 'convert' }                              — one-shot full conversion
  *          { action: 'progress', percent }                    — bill % of remaining balance
@@ -13,23 +14,15 @@ import {
   updateEstimateStatus,
   convertToInvoice,
   createProgressInvoice,
+  updateEstimate,
   type EstimateStatus,
 } from '@/lib/services/estimates';
-import { ServiceError } from '@/lib/services/_base';
+import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createEstimateSchema } from '@/lib/validation/estimates';
 
 function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'CONFLICT' ? 409
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'PERIOD_CLOSED' ? 400
-      : 500;
-    return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
-  }
-  console.error('[estimates/[id]]', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  return routeErrorWithWarnings(err, 'estimates/[id]');
 }
 
 type RouteContext = { params: Promise<{ id: string }> };
@@ -52,6 +45,13 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json();
     const { status } = body;
 
+    // Full edit (C1): the body is a complete estimate form.
+    if (Array.isArray(body?.lines)) {
+      const parsed = createEstimateSchema.safeParse(body);
+      if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+      return NextResponse.json(await updateEstimate(ctx, id, parsed.data));
+    }
+
     if (!status) {
       return NextResponse.json({ error: 'Missing required field: status' }, { status: 400 });
     }
@@ -71,7 +71,9 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const { action } = body;
 
     if (action === 'convert') {
-      const invoice = await convertToInvoice(ctx, id);
+      const invoice = await convertToInvoice(ctx, id, {
+        overrideCreditLimit: body.overrideCreditLimit === true,
+      });
       return NextResponse.json(invoice, { status: 201 });
     }
 
@@ -91,6 +93,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
             }))
           : null,
         date: body.date ? new Date(body.date) : null,
+        overrideCreditLimit: body.overrideCreditLimit === true,
       });
       return NextResponse.json(result, { status: 201 });
     }

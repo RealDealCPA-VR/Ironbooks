@@ -43,6 +43,8 @@ export interface PackingSlipData {
     date: string;
     /** Optional sales-order number for reference. */
     orderNumber?: number | string | null;
+    /** Override the document reference line (default "Invoice #<invoiceNumber>"). */
+    label?: string | null;
   };
   lines: PackingSlipLine[];
 }
@@ -123,7 +125,7 @@ export async function renderPackingSlipPdf(data: PackingSlipData): Promise<Uint8
 
   cursor -= 22;
 
-  const numStr = `Invoice #${data.slip.invoiceNumber}`;
+  const numStr = data.slip.label || `Invoice #${data.slip.invoiceNumber}`;
   const numW = bold.widthOfTextAtSize(numStr, 12);
   page.drawText(numStr, {
     x: MARGIN_R - numW,

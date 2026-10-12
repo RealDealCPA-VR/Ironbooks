@@ -6,6 +6,9 @@
  *            { action: 'apply',   applications: [{ invoiceId, amountApplied }] }
  *            { action: 'unapply', invoiceId, amount? }
  *            { action: 'refund',  bankAccountId, amount, date?, memo? }
+ *            { action: 'bounce',  date?, bankFee?, bankFeeAccountId?, customerFee?, customerFeeAccountId?, memo? }
+ *                                  — Record Bounced Check (wave2 sales F2)
+ * PUT/PATCH — edit the payment (wave2 sales C1; same body as POST /api/payments)
  * DELETE — void the payment (reverses GL, rolls back invoice balances)
  */
 import { NextRequest, NextResponse } from 'next/server';
@@ -16,8 +19,12 @@ import {
   applyPayment,
   unapplyFromInvoice,
   refundPayment,
+  updatePayment,
+  recordBouncedCheck,
 } from '@/lib/services/payments';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { bouncedCheckSchema, receivePaymentSchema } from '@/lib/validation/payments';
 
 // Map ServiceError codes to HTTP status codes.
 function errorStatus(code: ServiceError['code']): number {
@@ -109,10 +116,16 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         });
         return NextResponse.json(result);
       }
+      case 'bounce': {
+        const parsed = bouncedCheckSchema.safeParse(body);
+        if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+        const result = await recordBouncedCheck(ctx, { paymentId: id, ...parsed.data });
+        return NextResponse.json(result, { status: 201 });
+      }
       default:
         return NextResponse.json(
           {
-            error: `Unknown action '${body.action}'. Supported: apply, unapply, refund.`,
+            error: `Unknown action '${body.action}'. Supported: apply, unapply, refund, bounce.`,
             code: 'VALIDATION',
           },
           { status: 400 },
@@ -121,6 +134,26 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   } catch (err) {
     return errorResponse(err, 'POST /api/payments/[id]');
   }
+}
+
+/** Edit a received payment (void + re-post onto the same record, in one transaction). */
+export async function PUT(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json().catch(() => ({}));
+    const parsed = receivePaymentSchema.safeParse(body);
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    const result = await updatePayment(ctx, id, parsed.data);
+    return NextResponse.json(result);
+  } catch (err) {
+    return errorResponse(err, 'PUT /api/payments/[id]');
+  }
+}
+
+/** Alias of PUT — the shared api client exposes patch. */
+export async function PATCH(req: NextRequest, rc: RouteContext) {
+  return PUT(req, rc);
 }
 
 export async function DELETE(_req: NextRequest, { params }: RouteContext) {

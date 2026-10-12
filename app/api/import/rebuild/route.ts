@@ -18,6 +18,7 @@ import {
   previewRebuild,
 } from '@/lib/services/integrity';
 import { ServiceError } from '@/lib/services/_base';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -63,6 +64,8 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+    // Rebuild rewrites cached balances — owner/admin only, single-user while others are on.
+    await assertExclusiveAccess(ctx, 'Rebuild Data');
     return NextResponse.json(await applyRebuild(ctx, body.action));
   } catch (err) {
     return errorResponse(err);

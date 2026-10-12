@@ -349,39 +349,42 @@ describe('Reconciliation completion features (end-to-end)', () => {
           eq(journalEntries.description, 'January rent'),
         ),
       );
-    await db
-      .update(journalEntries)
-      .set({ status: 'void', voidedAt: new Date() })
-      .where(eq(journalEntries.id, rentJe.id));
+    // The whole scenario runs in a transaction that is rolled back at the end, so the
+    // direct void (voiding is final at the DB level) never leaks into later tests.
+    const ROLLBACK = new Error('rollback-simulated-legacy-void');
+    await expect(
+      db.transaction(async (tx) => {
+        const tctx = { ...ctx, db: tx as unknown as DB };
+        await tx
+          .update(journalEntries)
+          .set({ status: 'void', voidedAt: new Date() })
+          .where(eq(journalEntries.id, rentJe.id));
 
-    // Beginning-balance discrepancy: stamped 4187.50 vs recomputed 4987.50 → −800.
-    const info = await getReconcileInfo(ctx, checkingBA);
-    expect(info.recomputedBalance).toBe('4987.50');
-    expect(info.discrepancy).toBe('-800.00');
+        // Beginning-balance discrepancy: stamped 4187.50 vs recomputed 4987.50 → −800.
+        const info = await getReconcileInfo(tctx, checkingBA);
+        expect(info.recomputedBalance).toBe('4987.50');
+        expect(info.discrepancy).toBe('-800.00');
 
-    // Session report flags the voided line.
-    const report = await getReconciliationReport(ctx, recon1Id);
-    expect(report.discrepancies.length).toBe(1);
-    expect(report.discrepancies[0].description).toBe('January rent');
-    expect(report.discrepancies[0].amount).toBe('-800.00');
+        // Session report flags the voided line.
+        const report = await getReconciliationReport(tctx, recon1Id);
+        expect(report.discrepancies.length).toBe(1);
+        expect(report.discrepancies[0].description).toBe('January rent');
+        expect(report.discrepancies[0].amount).toBe('-800.00');
 
-    // Company-wide discrepancy report shows the same row.
-    const all = await reconciliationDiscrepancies(ctx);
-    expect(all.length).toBe(1);
-    expect(all[0].description).toBe('January rent');
-    expect(all[0].amount).toBe('-800.00');
-    expect(all[0].bankName).toBe('First National');
-    expect(all[0].voidedAt).not.toBeNull();
+        // Company-wide discrepancy report shows the same row.
+        const all = await reconciliationDiscrepancies(tctx);
+        expect(all.length).toBe(1);
+        expect(all[0].description).toBe('January rent');
+        expect(all[0].amount).toBe('-800.00');
+        expect(all[0].bankName).toBe('First National');
+        expect(all[0].voidedAt).not.toBeNull();
 
-    // Filtered to an unrelated bank account → empty.
-    const ccOnly = await reconciliationDiscrepancies(ctx, ccBA);
-    expect(ccOnly.length).toBe(0);
-
-    // Un-void so later trial-balance style checks are not skewed by the direct update.
-    await db
-      .update(journalEntries)
-      .set({ status: 'posted', voidedAt: null })
-      .where(eq(journalEntries.id, rentJe.id));
+        // Filtered to an unrelated bank account → empty.
+        const ccOnly = await reconciliationDiscrepancies(tctx, ccBA);
+        expect(ccOnly.length).toBe(0);
+        throw ROLLBACK;
+      }),
+    ).rejects.toBe(ROLLBACK);
   });
 
   // -------------------------------------------------------------------------

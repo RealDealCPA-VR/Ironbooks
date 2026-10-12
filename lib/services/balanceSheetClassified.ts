@@ -4,12 +4,13 @@
  * Extends the standard Balance Sheet by splitting assets and liabilities into
  * Current vs Non-Current (Long-Term) sub-sections, following GAAP presentation.
  *
- * Classification is driven by account subtype (from the schema enum):
- *   Current assets   : checking | savings | accounts_receivable | inventory
- *   Non-Current assets: fixed_assets | other (any remaining asset subtypes)
+ * Classification is driven by the QuickBooks account type (lib/accountTypes.ts):
+ *   Current assets    : Bank, Accounts Receivable, Other Current Asset (incl. Undeposited
+ *                       Funds and inventory)
+ *   Non-Current assets: Fixed Asset, Other Asset
  *
- *   Current liabilities   : accounts_payable | credit_card
- *   Long-Term liabilities : long_term_liability | other (any remaining liability subtypes)
+ *   Current liabilities   : Accounts Payable, Credit Card, Other Current Liability
+ *   Long-Term liabilities : Long Term Liability
  *
  * Equity and net income are included unchanged (same logic as balanceSheet in reports.ts).
  * The report queries posted GL activity, not cached account balances, for accuracy.
@@ -18,6 +19,8 @@ import { and, eq, lte, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { isCurrentAsset, isCurrentLiability } from '@/lib/accountTypes';
+import { assertBalanceSheetBalanced } from './ledgerAssert';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,16 +64,7 @@ export interface ClassifiedBalanceSheet {
 // Classification sets
 // ---------------------------------------------------------------------------
 
-const CURRENT_ASSET_SUBTYPES = new Set([
-  'checking',
-  'savings',
-  'accounts_receivable',
-  'inventory',
-]);
-
-const CURRENT_LIABILITY_SUBTYPES = new Set(['accounts_payable', 'credit_card']);
-
-const LONG_TERM_LIABILITY_SUBTYPES = new Set(['long_term_liability']);
+// Current vs non-current comes from lib/accountTypes.ts (isCurrentAsset / isCurrentLiability).
 
 // Debit-normal types.
 const DEBIT_NORMAL = new Set(['asset', 'expense']);
@@ -156,7 +150,7 @@ export async function balanceSheetClassified(
     };
 
     if (a.type === 'asset') {
-      if (CURRENT_ASSET_SUBTYPES.has(a.subtype)) {
+      if (isCurrentAsset(a)) {
         currentAssetLines.push(line);
         totalCurrentAssets = totalCurrentAssets.plus(naturalBalance);
       } else {
@@ -164,11 +158,11 @@ export async function balanceSheetClassified(
         totalNonCurrentAssets = totalNonCurrentAssets.plus(naturalBalance);
       }
     } else if (a.type === 'liability') {
-      if (CURRENT_LIABILITY_SUBTYPES.has(a.subtype)) {
+      if (isCurrentLiability(a)) {
         currentLiabilityLines.push(line);
         totalCurrentLiabilities = totalCurrentLiabilities.plus(naturalBalance);
       } else {
-        // long_term_liability + any unknown liability subtypes go here.
+        // Long Term Liability accounts.
         longTermLiabilityLines.push(line);
         totalLongTermLiabilities = totalLongTermLiabilities.plus(naturalBalance);
       }
@@ -187,6 +181,9 @@ export async function balanceSheetClassified(
   const totalEquityWithRE = totalEquity.plus(netIncome);
 
   equityLines.sort((a, b) => a.code.localeCompare(b.code));
+  // Balanced by construction (all accounts from the same posted rows, net income folded into
+  // equity); unreachable while the DB ledger guards hold — throws a loud INTEGRITY error.
+  assertBalanceSheetBalanced('Classified balance sheet', totalAssets, totalLiabilities, totalEquityWithRE);
 
   return {
     currentAssets: makeSection(currentAssetLines, totalCurrentAssets),
@@ -201,7 +198,7 @@ export async function balanceSheetClassified(
     retainedEarnings: toAmountString(netIncome),
     totalEquity: toAmountString(totalEquityWithRE),
 
-    balanced: Money.equalWithinCent(totalAssets, totalLiabilities.plus(totalEquityWithRE)),
+    balanced: Money.eq(totalAssets, totalLiabilities.plus(totalEquityWithRE)),
     asOf: asOf?.toISOString(),
   };
 }

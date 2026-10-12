@@ -5,6 +5,7 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zMoney, zUuid } from './helpers';
+import { inventoryLineFields } from './inventorySites';
 
 export const billLineSchema = z.object({
   accountId: zUuid.nullish(),
@@ -16,6 +17,8 @@ export const billLineSchema = z.object({
   classId: zUuid.nullish(),
   customerId: zUuid.nullish(),
   jobId: zUuid.nullish(),
+  /** Advanced Inventory: receiving site/bin/serial/lot (inventory item lines only). */
+  ...inventoryLineFields,
 });
 
 export const createBillSchema = z.object({
@@ -23,8 +26,15 @@ export const createBillSchema = z.object({
   billNumber: z.string().nullish(),
   date: zDate,
   dueDate: zDate.nullish(),
+  /** Payment terms ('net_30', '2_10_net_30', …); default = the vendor's terms. */
+  terms: z.string().max(50).nullish(),
   memo: z.string().nullish(),
   classId: zUuid.nullish(),
+  /** Multi-currency: transaction currency + home units per 1 unit (defaults from vendor / list). */
+  currency: z.string().max(3).nullish(),
+  exchangeRate: zDecimal.nullish(),
+  /** The user saw the duplicate vendor reference warning and chose to keep the number. */
+  allowDuplicateNumber: z.boolean().optional(),
   lines: zLines(billLineSchema),
 });
 export type CreateBillBody = z.infer<typeof createBillSchema>;

@@ -5,6 +5,7 @@
  * Data: GET /api/payroll/reports?from=&to=
  */
 import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { Users } from 'lucide-react';
 import {
   Button,
@@ -326,7 +327,15 @@ export default function PayrollSummaryPage() {
               <tbody>
                 {s.rows.map((r) => (
                   <Tr key={r.employeeId}>
-                    <Td className="font-semibold text-navy">{r.employeeName}</Td>
+                    <Td className="font-semibold text-navy">
+                      {/* QuickZoom: this employee's paychecks in the ledger for the period */}
+                      <Link
+                        href={`/reports/std/transaction-detail-by-account?employeeId=${r.employeeId}&from=${from}&to=${to}&subtotalBy=account`}
+                        className="hover:text-electric hover:underline"
+                      >
+                        {r.employeeName}
+                      </Link>
+                    </Td>
                     <Td className="text-right tabular-nums text-navy/60">{r.paycheckCount}</Td>
                     <Td className="text-right tabular-nums font-medium">{formatCurrency(r.gross)}</Td>
                     {s.taxNames.map((n) => (

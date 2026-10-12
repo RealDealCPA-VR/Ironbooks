@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+// wave2 prefs: Accounting > "Use account numbers" shows/hides the number column.
+import { usePreferences } from '@/lib/usePreferences';
 import { BookOpen, Plus, Trash2, Pencil, ChevronDown, ChevronRight, CornerDownRight, Download } from 'lucide-react';
 import {
   Button,
@@ -20,8 +22,17 @@ import {
   PageHeader,
   toast,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api, ApiError } from '@/lib/client';
 import { Money, formatCurrency } from '@/lib/money';
+import {
+  QB_ACCOUNT_TYPES,
+  SUBTYPE_LABELS,
+  type QbAccountType,
+  getQbAccountTypeInfo,
+  qbAccountTypeOf,
+} from '@/lib/accountTypes';
+import { INCOME_TAX_FORMS, type IncomeTaxForm, getTaxLine, taxLinesForForm } from '@/lib/taxLines';
 import type Decimal from 'decimal.js';
 
 // ---- Types ----------------------------------------------------------------
@@ -34,10 +45,13 @@ interface Account {
   name: string;
   type: AccountType;
   subtype: string;
+  /** QuickBooks account type derived by the server (lib/accountTypes.ts). */
+  qbType?: QbAccountType;
   balance: string;
   isActive: boolean;
   description?: string | null;
   parentId?: string | null;
+  taxLine?: string | null;
 }
 
 /** Node shape returned by GET /api/accounts?tree=true (getAccountTree). */
@@ -45,48 +59,9 @@ interface AccountNode extends Account {
   children: AccountNode[];
 }
 
-// Map API type values -> display labels (API uses singular lowercase)
-const TYPE_LABELS: Record<AccountType, string> = {
-  asset: 'Assets',
-  liability: 'Liabilities',
-  equity: 'Equity',
-  revenue: 'Revenue',
-  expense: 'Expenses',
-};
-
-// Ordered for display
-const TYPE_ORDER: AccountType[] = ['asset', 'liability', 'equity', 'revenue', 'expense'];
-
-// Valid subtypes per type (must match accountSubtypeEnum in lib/db/schema.ts)
-const SUBTYPES_BY_TYPE: Record<AccountType, { value: string; label: string }[]> = {
-  asset: [
-    { value: 'checking', label: 'Checking' },
-    { value: 'savings', label: 'Savings' },
-    { value: 'accounts_receivable', label: 'Accounts Receivable' },
-    { value: 'inventory', label: 'Inventory' },
-    { value: 'fixed_assets', label: 'Fixed Assets' },
-  ],
-  liability: [
-    { value: 'accounts_payable', label: 'Accounts Payable' },
-    { value: 'credit_card', label: 'Credit Card' },
-    { value: 'long_term_liability', label: 'Long-Term Liability' },
-  ],
-  equity: [
-    { value: 'owners_equity', label: "Owner's Equity" },
-    { value: 'retained_earnings', label: 'Retained Earnings' },
-  ],
-  revenue: [
-    { value: 'sales', label: 'Sales' },
-    { value: 'service_revenue', label: 'Service Revenue' },
-    { value: 'other_income', label: 'Other Income' },
-  ],
-  expense: [
-    { value: 'cost_of_goods_sold', label: 'Cost of Goods Sold' },
-    { value: 'operating_expenses', label: 'Operating Expenses' },
-    { value: 'payroll', label: 'Payroll' },
-    { value: 'taxes', label: 'Taxes' },
-  ],
-};
+function qbTypeOfAccount(a: Account): QbAccountType {
+  return a.qbType ?? qbAccountTypeOf(a);
+}
 
 // ---- Tree helpers (client-side) --------------------------------------------
 
@@ -102,11 +77,6 @@ function flattenTree(nodes: AccountNode[]): AccountNode[] {
   walk(nodes);
   return out;
 }
-
-/** Map subtype enum value -> display label (e.g. 'accounts_receivable' -> 'Accounts Receivable'). */
-const SUBTYPE_LABELS: Record<string, string> = Object.fromEntries(
-  Object.values(SUBTYPES_BY_TYPE).flatMap((opts) => opts.map((o) => [o.value, o.label])),
-);
 
 /** Own balance + all descendants — the QB parent subtotal (decimal-safe). */
 function subtotal(node: AccountNode): Decimal {
@@ -124,7 +94,25 @@ function selfAndDescendantIds(node: AccountNode): Set<string> {
   return ids;
 }
 
-// ---- Parent picker (shared by Add + Edit modals) ----------------------------
+// ---- Tax form (company setting used by the tax-line picker) ----------------
+
+interface TaxMappingResponse {
+  form: IncomeTaxForm | null;
+}
+
+function useIncomeTaxForm(open: boolean): [IncomeTaxForm | null, (f: IncomeTaxForm | null) => void] {
+  const [form, setForm] = useState<IncomeTaxForm | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    api
+      .get<TaxMappingResponse>('/api/accounts/tax-lines')
+      .then((r) => setForm(r.form))
+      .catch(() => setForm(null));
+  }, [open]);
+  return [form, setForm];
+}
+
+// ---- Shared pickers (Add + Edit modals) -------------------------------------
 
 function ParentSelect({
   id,
@@ -149,7 +137,108 @@ function ParentSelect({
         ))}
       </Select>
       <p className="text-xs text-navy/40 mt-1">
-        Sub-accounts must have the same type as their parent.
+        Sub-accounts must have the same account type as their parent.
+      </p>
+    </div>
+  );
+}
+
+/** QuickBooks account-type picker with a plain-language explanation of the chosen type. */
+function AccountTypePicker({
+  id,
+  qbType,
+  subtype,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  qbType: QbAccountType;
+  subtype: string;
+  onChange: (qbType: QbAccountType, subtype: string) => void;
+  disabled?: boolean;
+}) {
+  const info = getQbAccountTypeInfo(qbType)!;
+  return (
+    <div className="flex flex-col gap-3">
+      <div>
+        <Label htmlFor={id} required>
+          Account type <Help term="account-type" />
+        </Label>
+        <Select
+          id={id}
+          value={qbType}
+          disabled={disabled}
+          onChange={(e) => {
+            const next = getQbAccountTypeInfo(e.target.value)!;
+            onChange(next.value, next.defaultSubtype);
+          }}
+        >
+          {QB_ACCOUNT_TYPES.map((t) => (
+            <option key={t.value} value={t.value}>
+              {t.label}
+            </option>
+          ))}
+        </Select>
+        <p className="text-xs text-navy/60 mt-1">
+          {info.help} <span className="text-navy/40">Examples: {info.examples}.</span>
+        </p>
+      </div>
+      {info.subtypes.length > 1 && (
+        <div>
+          <Label htmlFor={`${id}-detail`}>Detail type</Label>
+          <Select
+            id={`${id}-detail`}
+            value={subtype}
+            onChange={(e) => onChange(qbType, e.target.value)}
+          >
+            {info.subtypes.map((s) => (
+              <option key={s} value={s}>
+                {SUBTYPE_LABELS[s]}
+              </option>
+            ))}
+          </Select>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TaxLineSelect({
+  id,
+  value,
+  onChange,
+  form,
+}: {
+  id: string;
+  value: string;
+  onChange: (v: string) => void;
+  form: IncomeTaxForm | null;
+}) {
+  const current = getTaxLine(value);
+  const lines = form ? taxLinesForForm(form) : [];
+  const formLabel = INCOME_TAX_FORMS.find((f) => f.value === form)?.label;
+  return (
+    <div>
+      <Label htmlFor={id}>
+        Tax line (optional) <Help term="tax-line" />
+      </Label>
+      <Select id={id} value={value} onChange={(e) => onChange(e.target.value)} disabled={!form && !current}>
+        <option value="">— Unassigned —</option>
+        {current && current.form !== form && (
+          <option value={current.key}>
+            {current.form}: {current.label}
+          </option>
+        )}
+        {lines.map((l) => (
+          <option key={l.key} value={l.key}>
+            {l.label} (line {l.line})
+          </option>
+        ))}
+      </Select>
+      <p className="text-xs text-navy/40 mt-1">
+        {form
+          ? `Lines from ${formLabel}.`
+          : 'Choose your business tax form on the Chart of Accounts page (Tax form) to map tax lines.'}
       </p>
     </div>
   );
@@ -168,14 +257,17 @@ interface AddAccountModalProps {
 const EMPTY_FORM = {
   code: '',
   name: '',
-  type: 'asset' as AccountType,
-  subtype: SUBTYPES_BY_TYPE.asset[0].value,
+  qbType: 'bank' as QbAccountType,
+  subtype: 'checking',
   parentId: '',
+  taxLine: '',
+  openingBalance: '',
 };
 
 function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModalProps) {
   const [form, setForm] = useState(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
+  const [taxForm] = useIncomeTaxForm(open);
 
   // Reset form when modal opens
   useEffect(() => {
@@ -183,18 +275,15 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
   }, [open]);
 
   function set(field: keyof typeof EMPTY_FORM, value: string) {
-    setForm((prev) => {
-      // Changing the type resets the subtype + parent (parent must match type).
-      if (field === 'type') {
-        const type = value as AccountType;
-        return { ...prev, type, subtype: SUBTYPES_BY_TYPE[type][0].value, parentId: '' };
-      }
-      return { ...prev, [field]: value };
-    });
+    setForm((prev) => ({ ...prev, [field]: value }));
   }
 
-  // Parent candidates: active accounts of the same type.
-  const parentOptions = accounts.filter((a) => a.type === form.type && a.isActive);
+  // Parent candidates: active accounts of the same QB account type.
+  const parentOptions = accounts.filter((a) => qbTypeOfAccount(a) === form.qbType && a.isActive);
+  const nonPosting = form.qbType === 'non_posting';
+  // QB: A/R and A/P balances come only from customer / vendor transactions, never an opening balance.
+  const subledger = form.qbType === 'accounts_receivable' || form.qbType === 'accounts_payable';
+  const allowOpening = !nonPosting && !subledger;
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -205,9 +294,11 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
       await api.post('/api/accounts', {
         code: form.code.trim(),
         name: form.name.trim(),
-        type: form.type,
+        qbType: form.qbType,
         subtype: form.subtype,
         parentId: form.parentId || null,
+        taxLine: form.taxLine || null,
+        openingBalance: allowOpening && form.openingBalance.trim() ? form.openingBalance.trim() : null,
       });
       toast('Account created.', 'success');
       onCreated();
@@ -236,8 +327,17 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
       }
     >
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+        <AccountTypePicker
+          id="acc-type"
+          qbType={form.qbType}
+          subtype={form.subtype}
+          onChange={(qbType, subtype) =>
+            // Changing the type resets the parent (parent must have the same type).
+            setForm((prev) => ({ ...prev, qbType, subtype, parentId: prev.qbType === qbType ? prev.parentId : '' }))
+          }
+        />
         <div>
-          <Label htmlFor="acc-code">Account Code *</Label>
+          <Label htmlFor="acc-code" required>Account number</Label>
           <Input
             id="acc-code"
             placeholder="e.g. 1010"
@@ -247,41 +347,13 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
           />
         </div>
         <div>
-          <Label htmlFor="acc-name">Account Name *</Label>
+          <Label htmlFor="acc-name" required>Account name</Label>
           <Input
             id="acc-name"
-            placeholder="e.g. Checking Account"
+            placeholder="e.g. Business Checking"
             value={form.name}
             onChange={(e) => set('name', e.target.value)}
           />
-        </div>
-        <div>
-          <Label htmlFor="acc-type">Type *</Label>
-          <Select
-            id="acc-type"
-            value={form.type}
-            onChange={(e) => set('type', e.target.value as AccountType)}
-          >
-            <option value="asset">Asset</option>
-            <option value="liability">Liability</option>
-            <option value="equity">Equity</option>
-            <option value="revenue">Revenue</option>
-            <option value="expense">Expense</option>
-          </Select>
-        </div>
-        <div>
-          <Label htmlFor="acc-subtype">Subtype *</Label>
-          <Select
-            id="acc-subtype"
-            value={form.subtype}
-            onChange={(e) => set('subtype', e.target.value)}
-          >
-            {SUBTYPES_BY_TYPE[form.type].map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </Select>
         </div>
         <ParentSelect
           id="acc-parent"
@@ -289,6 +361,30 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
           onChange={(v) => set('parentId', v)}
           options={parentOptions}
         />
+        {subledger && (
+          <p className="text-xs text-navy/60">
+            {form.qbType === 'accounts_receivable'
+              ? 'This account gets its balance from invoices and payments, so it has no opening balance. Enter what customers owe as invoices.'
+              : 'This account gets its balance from bills and bill payments, so it has no opening balance. Enter what you owe vendors as bills.'}
+          </p>
+        )}
+        {allowOpening && (
+          <div>
+            <Label htmlFor="acc-opening">
+              Opening balance (optional) <Help term="opening-balance-equity" />
+            </Label>
+            <Input
+              id="acc-opening"
+              inputMode="decimal"
+              placeholder="0.00"
+              value={form.openingBalance}
+              onChange={(e) => set('openingBalance', e.target.value)}
+            />
+          </div>
+        )}
+        {!nonPosting && (
+          <TaxLineSelect id="acc-taxline" value={form.taxLine} onChange={(v) => set('taxLine', v)} form={taxForm} />
+        )}
       </form>
     </Modal>
   );
@@ -306,26 +402,35 @@ interface EditAccountModalProps {
 
 function EditAccountModal({ account, onClose, onSaved, accounts }: EditAccountModalProps) {
   const [name, setName] = useState('');
+  const [qbType, setQbType] = useState<QbAccountType>('bank');
   const [subtype, setSubtype] = useState('');
   const [parentId, setParentId] = useState('');
   const [description, setDescription] = useState('');
+  const [taxLine, setTaxLine] = useState('');
   const [saving, setSaving] = useState(false);
+  const [taxForm] = useIncomeTaxForm(!!account);
 
   useEffect(() => {
     if (account) {
       setName(account.name);
-      setSubtype(account.subtype);
+      const t = qbTypeOfAccount(account);
+      const info = getQbAccountTypeInfo(t)!;
+      setQbType(t);
+      // Legacy charts can hold a detail type that does not match the account type; fall back
+      // to the type's default so saving fixes it instead of failing validation.
+      setSubtype((info.subtypes as string[]).includes(account.subtype) ? account.subtype : info.defaultSubtype);
       setParentId(account.parentId ?? '');
       setDescription(account.description ?? '');
+      setTaxLine(account.taxLine ?? '');
       setSaving(false);
     }
   }, [account]);
 
-  // Parent candidates: same type, active, and not the account itself or any of
+  // Parent candidates: same QB type, active, and not the account itself or any of
   // its descendants (the service re-validates cycles server-side).
   const invalidIds = account ? selfAndDescendantIds(account) : new Set<string>();
   const parentOptions = accounts.filter(
-    (a) => account && a.type === account.type && a.isActive && !invalidIds.has(a.id),
+    (a) => account && qbTypeOfAccount(a) === qbType && a.isActive && !invalidIds.has(a.id),
   );
 
   async function handleSave() {
@@ -335,9 +440,11 @@ function EditAccountModal({ account, onClose, onSaved, accounts }: EditAccountMo
     try {
       await api.patch(`/api/accounts/${account.id}`, {
         name: name.trim(),
+        qbType,
         subtype,
         parentId: parentId || null,
         description: description.trim() || null,
+        taxLine: taxLine || null,
       });
       toast('Account updated.', 'success');
       onSaved();
@@ -368,7 +475,7 @@ function EditAccountModal({ account, onClose, onSaved, accounts }: EditAccountMo
       {account && (
         <div className="flex flex-col gap-4">
           <div>
-            <Label htmlFor="edit-acc-name">Account Name *</Label>
+            <Label htmlFor="edit-acc-name" required>Account name</Label>
             <Input
               id="edit-acc-name"
               autoFocus
@@ -376,20 +483,16 @@ function EditAccountModal({ account, onClose, onSaved, accounts }: EditAccountMo
               onChange={(e) => setName(e.target.value)}
             />
           </div>
-          <div>
-            <Label htmlFor="edit-acc-subtype">Subtype</Label>
-            <Select
-              id="edit-acc-subtype"
-              value={subtype}
-              onChange={(e) => setSubtype(e.target.value)}
-            >
-              {SUBTYPES_BY_TYPE[account.type].map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </Select>
-          </div>
+          <AccountTypePicker
+            id="edit-acc-type"
+            qbType={qbType}
+            subtype={subtype}
+            onChange={(t, s) => {
+              if (t !== qbType) setParentId('');
+              setQbType(t);
+              setSubtype(s);
+            }}
+          />
           <ParentSelect
             id="edit-acc-parent"
             value={parentId}
@@ -405,9 +508,53 @@ function EditAccountModal({ account, onClose, onSaved, accounts }: EditAccountMo
               onChange={(e) => setDescription(e.target.value)}
             />
           </div>
+          {qbType !== 'non_posting' && (
+            <TaxLineSelect id="edit-acc-taxline" value={taxLine} onChange={setTaxLine} form={taxForm} />
+          )}
         </div>
       )}
     </Modal>
+  );
+}
+
+// ---- Tax form picker (company setting) --------------------------------------
+
+function TaxFormPicker() {
+  const [form, setForm] = useIncomeTaxForm(true);
+  const [saving, setSaving] = useState(false);
+  async function change(value: string) {
+    const next = (value || null) as IncomeTaxForm | null;
+    setSaving(true);
+    try {
+      await api.put('/api/accounts/tax-lines', { form: next });
+      setForm(next);
+      toast('Tax form saved.', 'success');
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to save the tax form.', 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <div className="flex items-center gap-2">
+      <Label htmlFor="coa-tax-form" className="mb-0 whitespace-nowrap">
+        Tax form <Help term="tax-line" />
+      </Label>
+      <Select
+        id="coa-tax-form"
+        value={form ?? ''}
+        disabled={saving}
+        onChange={(e) => change(e.target.value)}
+        className="w-56"
+      >
+        <option value="">— Not set —</option>
+        {INCOME_TAX_FORMS.map((f) => (
+          <option key={f.value} value={f.value}>
+            {f.label}
+          </option>
+        ))}
+      </Select>
+    </div>
   );
 }
 
@@ -423,13 +570,16 @@ interface AccountRowProps {
 function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
   const hasChildren = node.children.length > 0;
   const rolledUp = subtotal(node);
+  const showNumbers = usePreferences().company.accountNumbersEnabled;
 
   return (
     <>
       <Tr key={node.id} className={node.isActive ? '' : 'opacity-60'}>
-        <Td>
-          <span className="font-mono text-xs text-navy/60">{node.code}</span>
-        </Td>
+        {showNumbers && (
+          <Td>
+            <span className="font-mono text-xs text-navy/60">{node.code}</span>
+          </Td>
+        )}
         <Td>
           <span
             className="flex items-center gap-1.5"
@@ -440,7 +590,14 @@ function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
           </span>
         </Td>
         <Td>
-          <span className="text-navy/50 text-xs">{SUBTYPE_LABELS[node.subtype] ?? node.subtype}</span>
+          <span className="text-navy/50 text-xs">
+            {SUBTYPE_LABELS[node.subtype as keyof typeof SUBTYPE_LABELS] ?? node.subtype}
+          </span>
+          {node.taxLine && (
+            <span className="block text-[11px] text-navy/40" title="Tax line">
+              {getTaxLine(node.taxLine)?.label ?? node.taxLine}
+            </span>
+          )}
         </Td>
         <Td numeric className="font-semibold text-navy">
           <div>{formatCurrency(node.balance)}</div>
@@ -492,7 +649,7 @@ function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
 // ---- Account Group Section ------------------------------------------------
 
 interface AccountGroupProps {
-  type: AccountType;
+  type: QbAccountType;
   roots: AccountNode[];
   onDeactivate: (account: Account) => void;
   onEdit: (account: AccountNode) => void;
@@ -500,7 +657,9 @@ interface AccountGroupProps {
 
 function AccountGroup({ type, roots, onDeactivate, onEdit }: AccountGroupProps) {
   const [collapsed, setCollapsed] = useState(false);
-  const label = TYPE_LABELS[type];
+  const info = getQbAccountTypeInfo(type)!;
+  const label = info.label;
+  const prefs = usePreferences();
 
   // Group total = sum of every account in the type (roots + all descendants).
   const all = flattenTree(roots);
@@ -520,6 +679,11 @@ function AccountGroup({ type, roots, onDeactivate, onEdit }: AccountGroupProps) 
         )}
         <span className="text-sm font-bold text-navy uppercase tracking-wide flex-1 text-left">
           {label}
+          {type === 'non_posting' && (
+            <span className="ml-2 normal-case font-normal text-navy/50">
+              (tracks estimates and orders; never on reports)
+            </span>
+          )}
         </span>
         <span className="text-sm font-semibold text-navy/60 tabular-nums">
           {formatCurrency(total)}
@@ -531,9 +695,9 @@ function AccountGroup({ type, roots, onDeactivate, onEdit }: AccountGroupProps) 
         <Table>
           <thead>
             <tr>
-              <Th className="w-24">Code</Th>
+              {prefs.company.accountNumbersEnabled && <Th className="w-24">Code</Th>}
               <Th>Name</Th>
-              <Th>Subtype</Th>
+              <Th>Detail type</Th>
               <Th numeric>Balance</Th>
               <Th className="w-24 text-center">Status</Th>
               <Th className="w-20 text-center">Actions</Th>
@@ -607,11 +771,12 @@ export default function AccountsPage() {
 
   const flat = flattenTree(tree);
 
-  // Group root nodes by type in display order (children render under their parent).
-  const grouped = TYPE_ORDER.map((type) => ({
-    type,
-    roots: tree.filter((a) => a.type === type),
-  }));
+  // Group root nodes by QuickBooks account type in QB order (children render under their
+  // parent); empty types are hidden.
+  const grouped = QB_ACCOUNT_TYPES.map((t) => ({
+    type: t.value,
+    roots: tree.filter((a) => qbTypeOfAccount(a) === t.value),
+  })).filter((g) => g.roots.length > 0);
 
   const totalAccounts = flat.length;
 
@@ -622,7 +787,8 @@ export default function AccountsPage() {
           title="Chart of Accounts"
           icon={BookOpen}
           action={
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              <TaxFormPicker />
               <Button
                 variant="secondary"
                 onClick={() => window.open('/api/export/accounts.csv', '_blank')}

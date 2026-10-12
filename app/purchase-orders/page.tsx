@@ -10,6 +10,7 @@ import {
   Download,
   Ban,
   CheckSquare,
+  Pencil,
 } from 'lucide-react';
 import {
   Button,
@@ -28,8 +29,11 @@ import {
   Modal,
   PageHeader,
   toast,
+  toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+// wave2 prefs: Memorize (Ctrl+M)
+import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -86,6 +90,10 @@ interface PoDetail extends PurchaseOrder {
 }
 
 interface LineRow {
+  /** Saved line id (edit mode) - sent back so received/billed quantities stay linked. */
+  id?: string;
+  /** Quantity already received or billed from this line (edit mode). */
+  billed?: number;
   itemId: string;
   accountId: string;
   description: string;
@@ -138,9 +146,11 @@ interface NewPoModalProps {
   accounts: Account[];
   items: Item[];
   onCreated: () => void;
+  /** When set, edits this saved PO (PATCH) instead of creating one. */
+  editId?: string | null;
 }
 
-function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewPoModalProps) {
+function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId }: NewPoModalProps) {
   const [vendorId, setVendorId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [expectedDate, setExpectedDate] = useState('');
@@ -148,16 +158,53 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewP
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [saving, setSaving] = useState(false);
 
-  // Reset form when modal opens.
+  const [loadingEdit, setLoadingEdit] = useState(false);
+
+  // Reset form when modal opens (or load the saved PO when editing).
   useEffect(() => {
-    if (open) {
-      setVendorId('');
-      setDate(new Date().toISOString().slice(0, 10));
-      setExpectedDate('');
-      setMemo('');
-      setLines([{ ...EMPTY_LINE }]);
-    }
-  }, [open]);
+    if (!open) return;
+    setVendorId('');
+    setDate(new Date().toISOString().slice(0, 10));
+    setExpectedDate('');
+    setMemo('');
+    setLines([{ ...EMPTY_LINE }]);
+    if (!editId) return;
+    let cancelled = false;
+    setLoadingEdit(true);
+    api
+      .get<PoDetail>(`/api/purchase-orders/${editId}`)
+      .then((po) => {
+        if (cancelled) return;
+        setVendorId(po.vendorId);
+        setDate(String(po.date).slice(0, 10));
+        setExpectedDate(po.expectedDate ? String(po.expectedDate).slice(0, 10) : '');
+        setMemo(po.memo ?? '');
+        setLines(
+          po.lines.length > 0
+            ? po.lines.map((l) => ({
+                id: l.id,
+                billed: parseFloat(l.quantityBilled) || 0,
+                itemId: l.itemId ?? '',
+                accountId: l.accountId ?? '',
+                description: l.description ?? '',
+                quantity: String(parseFloat(l.quantity)),
+                rate: String(parseFloat(l.rate)),
+              }))
+            : [{ ...EMPTY_LINE }],
+        );
+      })
+      .catch((err) => {
+        toastError(err, 'Could not load this purchase order.');
+        onClose();
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingEdit(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editId]);
 
   function updateLine(idx: number, field: keyof LineRow, value: string) {
     setLines((prev) => {
@@ -172,7 +219,8 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewP
   }
 
   function removeLine(idx: number) {
-    setLines((prev) => prev.filter((_, i) => i !== idx));
+    // Lines already received or billed must stay on the PO.
+    setLines((prev) => (prev[idx]?.billed ? prev : prev.filter((_, i) => i !== idx)));
   }
 
   const liveTotal = computeTotal(lines);
@@ -204,25 +252,37 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewP
 
     setSaving(true);
     try {
-      await api.post('/api/purchase-orders', {
-        vendorId,
-        date,
-        expectedDate: expectedDate || undefined,
-        memo: memo || undefined,
-        lines: validLines.map((l) => ({
-          itemId: l.itemId || null,
-          accountId: l.accountId || null,
-          description: l.description || null,
-          quantity: l.quantity,
-          rate: l.rate,
-        })),
-      });
-      toast('Purchase order created.', 'success');
+      const lineBody = validLines.map((l) => ({
+        ...(l.id ? { id: l.id } : {}),
+        itemId: l.itemId || null,
+        accountId: l.accountId || null,
+        description: l.description || null,
+        quantity: l.quantity,
+        rate: l.rate,
+      }));
+      if (editId) {
+        await api.patch(`/api/purchase-orders/${editId}`, {
+          vendorId,
+          date,
+          expectedDate: expectedDate || null,
+          memo: memo || null,
+          lines: lineBody,
+        });
+        toast('Purchase order updated.', 'success');
+      } else {
+        await api.post('/api/purchase-orders', {
+          vendorId,
+          date,
+          expectedDate: expectedDate || undefined,
+          memo: memo || undefined,
+          lines: lineBody,
+        });
+        toast('Purchase order created.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to create purchase order.';
-      toast(msg, 'danger');
+      toastError(err, editId ? 'Failed to save changes.' : 'Failed to create purchase order.');
     } finally {
       setSaving(false);
     }
@@ -232,20 +292,54 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewP
     <Modal
       open={open}
       onClose={onClose}
-      title="New Purchase Order"
+      title={editId ? 'Edit Purchase Order' : 'New Purchase Order'}
       size="lg"
       footer={
         <>
+          <MemorizeButton
+            docType="purchase_order"
+            shortcut={open}
+            defaultName={vendors.find((v) => v.id === vendorId)?.displayName}
+            getTemplate={() => {
+              if (!vendorId) return 'Pick a vendor before memorizing.';
+              const valid = lines.filter((l) => (l.itemId || l.accountId) && l.quantity && l.rate);
+              if (valid.length === 0) return 'Add at least one complete line before memorizing.';
+              return {
+                vendorId,
+                date,
+                expectedDate: expectedDate || undefined,
+                memo: memo || undefined,
+                lines: valid.map((l) => ({
+                  itemId: l.itemId || null,
+                  accountId: l.accountId || null,
+                  description: l.description || null,
+                  quantity: l.quantity,
+                  rate: l.rate,
+                })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>
-            Cancel
+            {editId ? 'Cancel edit' : 'Cancel'}
           </Button>
-          <Button onClick={handleSubmit} loading={saving}>
-            Create PO
+          <Button onClick={handleSubmit} loading={saving} disabled={loadingEdit}>
+            {editId ? 'Save Changes' : 'Create PO'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
+        {editId && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            Lines you have already received or billed can&apos;t be removed, and their quantity can&apos;t go
+            below what was received or billed. Everything else can be changed.
+          </div>
+        )}
+        {loadingEdit && (
+          <div className="flex items-center gap-2 text-sm text-navy/50">
+            <Spinner className="h-4 w-4" /> Loading purchase order...
+          </div>
+        )}
         {/* Vendor */}
         <div>
           <Label htmlFor="po-vendor">Vendor *</Label>
@@ -338,14 +432,21 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewP
                   value={line.description}
                   onChange={(e) => updateLine(idx, 'description', e.target.value)}
                 />
-                <Input
-                  placeholder="1"
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={line.quantity}
-                  onChange={(e) => updateLine(idx, 'quantity', e.target.value)}
-                />
+                <div>
+                  <Input
+                    placeholder="1"
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={line.quantity}
+                    onChange={(e) => updateLine(idx, 'quantity', e.target.value)}
+                  />
+                  {line.billed ? (
+                    <p className="mt-0.5 text-[10px] leading-tight text-amber-700">
+                      received/billed: {line.billed}
+                    </p>
+                  ) : null}
+                </div>
                 <Input
                   placeholder="0.00"
                   type="number"
@@ -357,7 +458,8 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewP
                 <button
                   type="button"
                   onClick={() => removeLine(idx)}
-                  disabled={lines.length === 1}
+                  disabled={lines.length === 1 || Boolean(line.billed)}
+                  title={line.billed ? 'Already received or billed - this line stays on the PO' : 'Remove line'}
                   className="text-navy/30 hover:text-red-500 disabled:opacity-20 transition-colors flex items-center justify-center"
                   aria-label="Remove line"
                 >
@@ -605,6 +707,7 @@ export default function PurchaseOrdersPage() {
   const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
 
   // Receive & Bill state
   const [billTarget, setBillTarget] = useState<PurchaseOrder | null>(null);
@@ -743,6 +846,17 @@ export default function PurchaseOrdersPage() {
                           <Button
                             variant="ghost"
                             size="sm"
+                            onClick={() => {
+                              setEditId(po.id);
+                              setShowNew(true);
+                            }}
+                            title="Edit the purchase order"
+                          >
+                            <Pencil className="h-3.5 w-3.5" /> Edit
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
                             onClick={() => setBillTarget(po)}
                             title="Receive items and create a bill"
                           >
@@ -814,11 +928,15 @@ export default function PurchaseOrdersPage() {
 
       <NewPoModal
         open={showNew}
-        onClose={() => setShowNew(false)}
+        onClose={() => {
+          setShowNew(false);
+          setEditId(null);
+        }}
         vendors={vendors}
         accounts={accounts}
         items={items}
         onCreated={fetchData}
+        editId={editId}
       />
 
       <ReceiveBillModal

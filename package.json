@@ -43,6 +43,7 @@
     "nodemailer": "^8.0.10",
     "papaparse": "^5.5.3",
     "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^4.10.38",
     "qrcode.react": "^4.2.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -90,6 +91,12 @@
         "ext": "bka",
         "name": "BookKeeper AI Company Backup",
         "description": "BookKeeper AI Company Backup",
+        "role": "Editor"
+      },
+      {
+        "ext": "bkp",
+        "name": "BookKeeper AI Portable Company File",
+        "description": "BookKeeper AI Portable Company File",
         "role": "Editor"
       }
     ],

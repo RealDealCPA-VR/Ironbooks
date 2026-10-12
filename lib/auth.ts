@@ -14,6 +14,8 @@ import bcrypt from 'bcryptjs';
 import { eq } from 'drizzle-orm';
 import { getDb, resolveDataDir } from '@/lib/db';
 import { users } from '@/lib/db/schema';
+import { touchSession } from '@/lib/services/sessions';
+import { getRequestOrigin } from '@/lib/net/requestInfo';
 
 export const SESSION_COOKIE = 'bka_session';
 export const PORTAL_COOKIE = 'bka_portal'; // employee self-service session
@@ -44,8 +46,50 @@ function sign(payload: string): string {
 /** Token audience: a main-app user session vs. an employee self-service portal session. */
 export type TokenKind = 'user' | 'portal';
 
-export function createSessionToken(userId: string, kind: TokenKind = 'user'): string {
-  const payload = JSON.stringify({ userId, kind, exp: Date.now() + SESSION_TTL_MS });
+/**
+ * Stable random identifier of the active company FILE (one PGlite data dir), persisted as
+ * `.file-id` next to `.auth-secret`. Session tokens carry it (signed), so a session minted for
+ * company file A is rejected by company file B — even when both share a signing secret
+ * (BKA_AUTH_SECRET) and the browser presents the same 127.0.0.1 cookie to whichever file the
+ * desktop shell currently has open. Falls back to a hash of the directory path if the dir is
+ * not writable.
+ */
+const fileIdCache = new Map<string, string>();
+export function companyFileId(): string {
+  const dir = resolveDataDir();
+  const cached = fileIdCache.get(dir);
+  if (cached) return cached;
+  let id: string;
+  const file = path.join(dir, '.file-id');
+  try {
+    if (fs.existsSync(file)) {
+      id = fs.readFileSync(file, 'utf8').trim();
+    } else {
+      fs.mkdirSync(dir, { recursive: true });
+      id = crypto.randomUUID();
+      fs.writeFileSync(file, id, { mode: 0o600 });
+    }
+    if (!id) throw new Error('empty .file-id');
+  } catch {
+    id = 'dir:' + crypto.createHash('sha256').update(dir).digest('hex').slice(0, 32);
+  }
+  fileIdCache.set(dir, id);
+  return id;
+}
+
+/**
+ * `sid` (multi-user hosting) binds the cookie to a server-side `user_sessions` row so an admin
+ * can see who is logged in and sign a session out; see getSessionInfo below. `fid` binds it to
+ * this company file (see companyFileId).
+ */
+export function createSessionToken(userId: string, kind: TokenKind = 'user', sid?: string): string {
+  const payload = JSON.stringify({
+    userId,
+    kind,
+    fid: companyFileId(),
+    exp: Date.now() + SESSION_TTL_MS,
+    ...(sid ? { sid } : {}),
+  });
   const body = Buffer.from(payload).toString('base64url');
   return `${body}.${sign(body)}`;
 }
@@ -53,7 +97,7 @@ export function createSessionToken(userId: string, kind: TokenKind = 'user'): st
 export function verifySessionToken(
   token: string | undefined | null,
   expectedKind: TokenKind = 'user',
-): { userId: string } | null {
+): { userId: string; sid?: string } | null {
   if (!token) return null;
   const [body, sig] = token.split('.');
   if (!body || !sig) return null;
@@ -70,7 +114,10 @@ export function verifySessionToken(
     // session (and vice versa). Legacy tokens with no `kind` are treated as 'user'.
     const kind: TokenKind = data.kind === 'portal' ? 'portal' : 'user';
     if (kind !== expectedKind) return null;
-    return { userId: data.userId };
+    // Bind the token to the company file it was issued by (legacy tokens without `fid` are
+    // rejected → one re-login after upgrading).
+    if (data.fid !== companyFileId()) return null;
+    return typeof data.sid === 'string' ? { userId: data.userId, sid: data.sid } : { userId: data.userId };
   } catch {
     return null;
   }
@@ -146,14 +193,35 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
   }
 }
 
-/** Resolve the current authenticated user id from the session cookie (verified). */
-export async function getSessionUserId(): Promise<string | null> {
+/**
+ * Resolve the current authenticated session from the cookie (signature verified), plus the
+ * server-side session check used by multi-user hosting:
+ *  - a cookie carrying a session id must match a live `user_sessions` row (logout and
+ *    "sign out" by an admin revoke it immediately);
+ *  - a legacy cookie WITHOUT a session id is still honored from this machine, but never for a
+ *    request that arrived over the network through the multi-user host.
+ */
+export async function getSessionInfo(): Promise<{ userId: string; sessionId?: string } | null> {
+  let token: { userId: string; sid?: string } | null;
   try {
     const store = await cookies();
-    return verifySessionToken(store.get(SESSION_COOKIE)?.value)?.userId ?? null;
+    token = verifySessionToken(store.get(SESSION_COOKIE)?.value);
   } catch {
     return null;
   }
+  if (!token) return null;
+  if (token.sid) {
+    const db = await getDb();
+    if (!(await touchSession(db, token.sid, token.userId))) return null;
+    return { userId: token.userId, sessionId: token.sid };
+  }
+  if ((await getRequestOrigin()).remote) return null;
+  return { userId: token.userId };
+}
+
+/** Resolve the current authenticated user id from the session cookie (verified). */
+export async function getSessionUserId(): Promise<string | null> {
+  return (await getSessionInfo())?.userId ?? null;
 }
 
 export async function getCurrentUser() {

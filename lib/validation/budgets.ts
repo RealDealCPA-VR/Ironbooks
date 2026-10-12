@@ -11,6 +11,10 @@ export const createBudgetSchema = z.object({
   fiscalYear: z.coerce
     .number({ invalid_type_error: 'fiscalYear must be a number' })
     .int('fiscalYear must be an integer'),
+  /** 'profit_loss' (default) or 'balance_sheet'. */
+  kind: z.enum(['profit_loss', 'balance_sheet']).optional(),
+  /** Create a Forecast instead of a budget. */
+  isForecast: z.boolean().optional(),
 });
 export type CreateBudgetBody = z.infer<typeof createBudgetSchema>;
 
@@ -22,5 +26,9 @@ export const setBudgetLineSchema = z.object({
     .int('month must be an integer'),
   /** Service wants a decimal string. */
   amount: zDecimal.transform((v) => String(v)),
+  /** Optional Customer:Job (budgets by Customer:Job). */
+  customerId: zUuid.nullish(),
+  /** Optional class. */
+  classId: zUuid.nullish(),
 });
 export type SetBudgetLineBody = z.infer<typeof setBudgetLineSchema>;

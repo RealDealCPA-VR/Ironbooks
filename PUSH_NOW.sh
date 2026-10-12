@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# ⚠️ HISTORICAL SCRIPT — December 2025; the push described below already happened.
+# The real remote is https://github.com/RealDealCPA-VR/Open-Source-QB.git and the
+# repo now has ~766 tracked files (not the 16 mentioned below).
+# The app shipped as an offline Electron + PGlite desktop application, not the
+# cloud SaaS described in these docs. See README.md, INSTALL.md, and TODO.md.
+
 # BookKeeper AI - Push to GitHub Script
 # This script will help you push your repository to GitHub
 

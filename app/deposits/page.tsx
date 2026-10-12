@@ -1,7 +1,7 @@
 'use client';
 
 import { Suspense, useEffect, useState, useCallback } from 'react';
-import { Landmark, Plus, Trash2 } from 'lucide-react';
+import { Landmark, Pencil, Plus, Trash2 } from 'lucide-react';
 import {
   AmountInput,
   Badge,
@@ -20,12 +20,16 @@ import {
   Tr,
   Modal,
   PageHeader,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import { useNewParam } from '@/lib/useFocusParam';
+// wave2 prefs: Checking > default account for Make Deposits; date warnings
+import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -80,6 +84,73 @@ function emptyExtraLine(): ExtraLine {
   return { accountId: '', amount: '', description: '' };
 }
 
+const RECEIPT_PREFIX = 'salesReceipt:';
+const CASHBACK_PREFIX = 'cashback:';
+
+/** A saved deposit loaded into the modal for editing. */
+interface DepositEdit {
+  id: string;
+  depositAccountId: string;
+  date: string;
+  memo: string;
+  /** Payments / sales receipts already on this deposit (shown in the picker, pre-checked). */
+  items: UndepositedItem[];
+  extraLines: ExtraLine[];
+  cashBackAccountId: string;
+  cashBackAmount: string;
+}
+
+/** Rebuild the form state of a saved deposit from its lines. */
+function depositToEdit(dep: Deposit): DepositEdit {
+  const items: UndepositedItem[] = [];
+  const extraLines: ExtraLine[] = [];
+  let cashBackAccountId = '';
+  let cashBackAmount = '';
+  for (const l of dep.lines) {
+    const desc = l.description ?? '';
+    if (l.paymentId) {
+      items.push({
+        id: l.paymentId,
+        kind: 'payment',
+        customerId: null,
+        customerName: 'Already on this deposit',
+        date: dep.date,
+        method: 'payment',
+        reference: null,
+        amount: l.amount,
+      });
+    } else if (desc.startsWith(RECEIPT_PREFIX)) {
+      items.push({
+        id: desc.slice(RECEIPT_PREFIX.length),
+        kind: 'sales_receipt',
+        customerId: null,
+        customerName: 'Already on this deposit',
+        date: dep.date,
+        method: 'sales receipt',
+        reference: null,
+        amount: l.amount,
+      });
+    } else if (desc.startsWith(CASHBACK_PREFIX)) {
+      cashBackAccountId = desc.slice(CASHBACK_PREFIX.length);
+      cashBackAmount = String(Math.abs(Number(l.amount)).toFixed(2));
+    } else {
+      // Extra lines keep their description; the credited account is not stored on the line,
+      // so the user re-picks it (the form flags it as required).
+      extraLines.push({ accountId: '', amount: l.amount, description: desc });
+    }
+  }
+  return {
+    id: dep.id,
+    depositAccountId: dep.depositAccountId,
+    date: dep.date.slice(0, 10),
+    memo: dep.memo ?? '',
+    items,
+    extraLines,
+    cashBackAccountId,
+    cashBackAmount,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Make Deposit Modal
 // ---------------------------------------------------------------------------
@@ -92,6 +163,8 @@ interface MakeDepositModalProps {
   allAccounts: Account[];
   undepositedItems: UndepositedItem[];
   loadingItems: boolean;
+  /** When set, the modal edits this saved deposit (PATCH). */
+  editing?: DepositEdit | null;
 }
 
 function MakeDepositModal({
@@ -100,10 +173,16 @@ function MakeDepositModal({
   onCreated,
   bankAccounts,
   allAccounts,
-  undepositedItems,
+  undepositedItems: freeItems,
   loadingItems,
+  editing,
 }: MakeDepositModalProps) {
+  // While editing, the items already on the deposit are selectable alongside the free ones.
+  const undepositedItems = editing
+    ? [...editing.items, ...freeItems.filter((f) => !editing.items.some((i) => i.id === f.id))]
+    : freeItems;
   const [depositAccountId, setDepositAccountId] = useState('');
+  const prefs = usePreferences();
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -116,16 +195,20 @@ function MakeDepositModal({
   // Reset when modal opens.
   useEffect(() => {
     if (open) {
-      setDepositAccountId('');
-      setDate(new Date().toISOString().slice(0, 10));
-      setMemo('');
-      setSelectedIds(new Set());
+      // Editing keeps the deposit's own account; a new deposit starts on the Preferences default.
+      const def = prefs.company.defaultDepositAccountId;
+      setDepositAccountId(
+        editing ? (editing.depositAccountId ?? '') : def && bankAccounts.some((a) => a.id === def) ? def : '',
+      );
+      setDate(editing?.date ?? new Date().toISOString().slice(0, 10));
+      setMemo(editing?.memo ?? '');
+      setSelectedIds(new Set(editing?.items.map((i) => i.id) ?? []));
       setMethodFilter('all');
-      setExtraLines([]);
-      setCashBackAccountId('');
-      setCashBackAmount('');
+      setExtraLines(editing?.extraLines ?? []);
+      setCashBackAccountId(editing?.cashBackAccountId ?? '');
+      setCashBackAmount(editing?.cashBackAmount ?? '');
     }
-  }, [open]);
+  }, [open, editing]);
 
   // QB groups "Payments to Deposit" by method — offer a method filter.
   const methods = [...new Set(undepositedItems.map((p) => p.method))];
@@ -207,7 +290,7 @@ function MakeDepositModal({
 
     setSaving(true);
     try {
-      await api.post('/api/deposits', {
+      const body = {
         depositAccountId,
         date,
         paymentIds,
@@ -222,13 +305,18 @@ function MakeDepositModal({
             ? { accountId: cashBackAccountId, amount: cashBackAmount }
             : undefined,
         memo: memo || undefined,
-      });
-      toast('Deposit created successfully.', 'success');
+      };
+      if (editing) {
+        await api.patch(`/api/deposits/${editing.id}`, body);
+        toast('Deposit updated.', 'success');
+      } else {
+        await api.post('/api/deposits', body);
+        toast('Deposit created successfully.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to create deposit.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to create deposit.');
     } finally {
       setSaving(false);
     }
@@ -241,10 +329,34 @@ function MakeDepositModal({
     <Modal
       open={open}
       onClose={onClose}
-      title="Make Deposit"
+      title={editing ? 'Edit Deposit' : 'Make Deposit'}
       size="lg"
       footer={
         <>
+          <MemorizeButton
+            docType="deposit"
+            shortcut={open}
+            defaultName={memo || undefined}
+            getTemplate={() => {
+              // Only the "other" lines recur: customer payments are one-time money.
+              if (!depositAccountId) return 'Pick the bank account before memorizing.';
+              const rows = extraLines.filter((l) => l.accountId && Number(l.amount) > 0);
+              if (rows.length === 0)
+                return 'Add at least one deposit line (not a customer payment) to memorize a deposit.';
+              return {
+                depositAccountId,
+                date,
+                paymentIds: [],
+                salesReceiptIds: [],
+                extraLines: rows.map((l) => ({
+                  accountId: l.accountId,
+                  amount: l.amount,
+                  description: l.description.trim() || undefined,
+                })),
+                memo: memo || undefined,
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
@@ -259,9 +371,15 @@ function MakeDepositModal({
       }
     >
       <div className="space-y-5">
+        {editing && (
+          <div className="rounded-lg border border-electric/30 bg-electric/5 px-4 py-3 text-sm text-navy/80">
+            You are changing a saved deposit. Uncheck a payment to send it back to Undeposited
+            Funds, or check more to add them. Pick the account again for any additional lines.
+          </div>
+        )}
         {/* Bank account */}
         <div>
-          <Label htmlFor="dep-account">Deposit To *</Label>
+          <Label htmlFor="dep-account" required>Deposit To</Label>
           <Select
             id="dep-account"
             autoFocus
@@ -279,7 +397,7 @@ function MakeDepositModal({
 
         {/* Date */}
         <div>
-          <Label htmlFor="dep-date">Date *</Label>
+          <Label htmlFor="dep-date" required>Date</Label>
           <DateInput
             id="dep-date"
             value={date}
@@ -301,7 +419,7 @@ function MakeDepositModal({
         {/* Undeposited items list */}
         <div>
           <div className="flex items-center justify-between mb-2 gap-2">
-            <Label className="mb-0">Payments in Undeposited Funds</Label>
+            <Label className="mb-0">Payments in Undeposited Funds <Help term="undeposited-funds" /></Label>
             <span className="flex items-center gap-3">
               {methods.length > 1 && (
                 <select
@@ -519,6 +637,18 @@ function DepositsPageContent() {
   const [showModal, setShowModal] = useState(false);
   const [voidingId, setVoidingId] = useState<string | null>(null);
   const [pendingVoid, setPendingVoid] = useState<string | null>(null);
+  const [editing, setEditing] = useState<DepositEdit | null>(null);
+
+  async function openEdit(id: string) {
+    try {
+      const dep = await api.get<Deposit>(`/api/deposits/${id}`);
+      await fetchSupportingData();
+      setEditing(depositToEdit(dep));
+      setShowModal(true);
+    } catch (err: unknown) {
+      toastError(err, 'Failed to load the deposit.');
+    }
+  }
 
   const fetchDeposits = useCallback(async () => {
     setLoading(true);
@@ -526,8 +656,7 @@ function DepositsPageContent() {
       const rows = await api.get<Deposit[]>('/api/deposits');
       setDeposits(rows);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load deposits.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load deposits.');
     } finally {
       setLoading(false);
     }
@@ -547,8 +676,7 @@ function DepositsPageContent() {
       setAccounts(accts);
       setUndepositedItems(items);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load data.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load data.');
       setLoadingItems(false);
     }
   }, []);
@@ -560,6 +688,7 @@ function DepositsPageContent() {
 
   function openModal() {
     // Refresh undeposited items each time the modal is opened.
+    setEditing(null);
     fetchSupportingData();
     setShowModal(true);
   }
@@ -579,8 +708,7 @@ function DepositsPageContent() {
       toast('Deposit voided — items returned to Undeposited Funds.', 'success');
       await Promise.all([fetchDeposits(), fetchSupportingData()]);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void deposit.';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void deposit.');
     } finally {
       setVoidingId(null);
       setPendingVoid(null);
@@ -636,7 +764,7 @@ function DepositsPageContent() {
           <EmptyState
             icon={Landmark}
             title="No deposits yet"
-            message='Use "Make Deposit" to move funds from Undeposited Funds.'
+            message="After you receive payments, take them to the bank and record the deposit here so your books match your bank statement."
             action={
               <Button onClick={openModal}>
                 <Plus className="h-4 w-4" /> Make Deposit
@@ -686,6 +814,12 @@ function DepositsPageContent() {
                   </Td>
                   <Td className="text-right">
                     {!dep.voidedAt && (
+                      <Button variant="ghost" size="sm" onClick={() => openEdit(dep.id)}>
+                        <Pencil className="h-4 w-4" />
+                        Edit
+                      </Button>
+                    )}
+                    {!dep.voidedAt && (
                       <Button
                         variant="ghost"
                         size="sm"
@@ -727,8 +861,12 @@ function DepositsPageContent() {
 
       <MakeDepositModal
         open={showModal}
-        onClose={() => setShowModal(false)}
+        onClose={() => {
+          setShowModal(false);
+          setEditing(null);
+        }}
         onCreated={handleCreated}
+        editing={editing}
         bankAccounts={bankAccounts}
         allAccounts={accounts}
         undepositedItems={undepositedItems}

@@ -15,7 +15,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import AdmZip from 'adm-zip';
 import { getDb, closeDb } from '@/lib/db';
-import { users, companies, accounts } from '@/lib/db/schema';
+import { users, companies, accounts, userCompanies } from '@/lib/db/schema';
 import { and, eq, inArray } from 'drizzle-orm';
 import type { ServiceContext } from './_base';
 import { createBackup, restoreBackup, BACKUP_MANIFEST_ENTRY } from './backup';
@@ -29,7 +29,11 @@ import { createCompany } from './company';
 const session = vi.hoisted(() => ({ userId: null as string | null }));
 vi.mock('@/lib/auth', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/auth')>();
-  return { ...actual, getSessionUserId: async () => session.userId };
+  return {
+    ...actual,
+    getSessionUserId: async () => session.userId,
+    getSessionInfo: async () => (session.userId ? { userId: session.userId } : null),
+  };
 });
 
 import { NextRequest } from 'next/server';
@@ -53,9 +57,13 @@ const jsonRequest = (url: string, body: unknown) =>
 const BK_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-fixes-data-backup');
 
 describe('backup service — restore validation and atomic swap', () => {
+  // Start clean: a dir left behind by an earlier interrupted run would fail the "nothing created" asserts.
+  beforeAll(() => {
+    fs.rmSync(BK_DIR, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
   afterAll(async () => {
     await closeDb(BK_DIR);
-    fs.rmSync(BK_DIR, { recursive: true, force: true });
+    fs.rmSync(BK_DIR, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('rejects junk bytes with VALIDATION before touching the data dir', async () => {
@@ -304,7 +312,25 @@ describe('route auth — /api/companies and /api/backup', () => {
     expect(post.status).toBe(403);
   });
 
+  it('a whole-file restore by an Admin of only ONE company in the file is refused (403)', async () => {
+    session.userId = userBId; // Admin of B Co only; A Co and the demo company share the file
+    const post = await backupPOST(
+      new Request('http://localhost/api/backup', {
+        method: 'POST',
+        body: 'junk bytes pretending to be a .bka',
+      }) as never,
+    );
+    expect(post.status).toBe(403);
+  });
+
   it('authenticated restore of a junk body returns 400 VALIDATION (data dir untouched)', async () => {
+    // Whole-file restore needs an active Admin of every company in the file.
+    const db = await getDb();
+    const all = await db.select({ id: companies.id, ownerId: companies.ownerId }).from(companies);
+    for (const c of all) {
+      if (c.ownerId === userBId) continue;
+      await db.insert(userCompanies).values({ userId: userBId, companyId: c.id, role: 'admin' });
+    }
     session.userId = userBId;
     const post = await backupPOST(
       new Request('http://localhost/api/backup', {

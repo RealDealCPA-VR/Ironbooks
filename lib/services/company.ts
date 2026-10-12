@@ -3,13 +3,21 @@
  * A "company file" maps to a PGlite data directory (see lib/db). For now we operate on the
  * active database; multi-file management is layered on in the Electron shell.
  */
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { accounts, companies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
-import { assertWrite, requireRole } from './rbac';
+import { assertWrite } from './rbac';
+import { requireEffectivePermission } from './access';
 import type { DB } from '@/lib/db';
+import { logTransaction } from './transactionLog';
+import { assertPreferenceAccounts } from './prefAccounts';
+import {
+  COMPANY_PREFERENCE_KEYS,
+  resolveCompanyPreferences,
+  type CompanyPreferences,
+} from '@/lib/preferences';
 
 type AccountSeed = { code: string; name: string; type: string; subtype: string };
 
@@ -17,15 +25,15 @@ type AccountSeed = { code: string; name: string; type: string; subtype: string }
 export const DEFAULT_COA: AccountSeed[] = [
   { code: '1000', name: 'Checking', type: 'asset', subtype: 'checking' },
   { code: '1010', name: 'Savings', type: 'asset', subtype: 'savings' },
-  { code: '1050', name: 'Undeposited Funds', type: 'asset', subtype: 'checking' },
+  { code: '1050', name: 'Undeposited Funds', type: 'asset', subtype: 'undeposited_funds' },
   { code: '1200', name: 'Accounts Receivable', type: 'asset', subtype: 'accounts_receivable' },
-  { code: '1250', name: 'Retainage Receivable', type: 'asset', subtype: 'accounts_receivable' },
+  { code: '1250', name: 'Retainage Receivable', type: 'asset', subtype: 'other_current_asset' },
   { code: '1300', name: 'Inventory Asset', type: 'asset', subtype: 'inventory' },
   { code: '1500', name: 'Fixed Assets', type: 'asset', subtype: 'fixed_assets' },
   { code: '2000', name: 'Accounts Payable', type: 'liability', subtype: 'accounts_payable' },
   { code: '2100', name: 'Credit Card', type: 'liability', subtype: 'credit_card' },
-  { code: '2200', name: 'Sales Tax Payable', type: 'liability', subtype: 'long_term_liability' },
-  { code: '2300', name: 'Payroll Liabilities', type: 'liability', subtype: 'long_term_liability' },
+  { code: '2200', name: 'Sales Tax Payable', type: 'liability', subtype: 'other_current_liability' },
+  { code: '2300', name: 'Payroll Liabilities', type: 'liability', subtype: 'other_current_liability' },
   { code: '3000', name: "Owner's Equity", type: 'equity', subtype: 'owners_equity' },
   { code: '3900', name: 'Retained Earnings', type: 'equity', subtype: 'retained_earnings' },
   { code: '4000', name: 'Sales Income', type: 'revenue', subtype: 'sales' },
@@ -47,8 +55,9 @@ export async function listCompanies(db: DB) {
 }
 
 /**
- * Companies the given user is a member of (via user_companies). Used by the API layer so an
- * authenticated caller only ever sees their own company files — never other tenants' rows.
+ * Companies the given user is an ACTIVE member of (via user_companies). Used by the API layer so
+ * an authenticated caller only ever sees their own company files — never other tenants' rows,
+ * nor companies they were deactivated in (Users & Roles).
  * Pass excludeArchived to hide soft-deleted files (settings.archived === true).
  */
 export async function listCompaniesForUser(
@@ -60,7 +69,7 @@ export async function listCompaniesForUser(
     .select({ company: companies })
     .from(companies)
     .innerJoin(userCompanies, eq(userCompanies.companyId, companies.id))
-    .where(eq(userCompanies.userId, userId));
+    .where(and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true)));
   const list = rows.map((r) => r.company);
   if (!opts?.excludeArchived) return list;
   return list.filter(
@@ -92,6 +101,27 @@ export async function createCompany(
       })),
     );
   }
+  // Running transaction log: company creation + owner permission (+ seeded chart of accounts).
+  await logTransaction(db, {
+    companyId: company.id,
+    userId: input.ownerId,
+    action: 'create',
+    entityType: 'company',
+    entityId: company.id,
+    summary:
+      `Created company "${company.name}"` +
+      (input.seedCoa !== false ? ` with the default chart of accounts (${DEFAULT_COA.length} accounts)` : ''),
+    data: { new: { name: company.name, seededAccounts: input.seedCoa !== false ? DEFAULT_COA.length : 0 } },
+  });
+  await logTransaction(db, {
+    companyId: company.id,
+    userId: input.ownerId,
+    action: 'create',
+    entityType: 'user_company',
+    entityId: input.ownerId,
+    summary: `Gave the company owner full ('owner') access to "${company.name}"`,
+    data: { new: { role: 'owner' } },
+  });
   return company;
 }
 
@@ -109,6 +139,14 @@ export async function ensureDevCompany(db: DB): Promise<{ companyId: string; use
     .insert(users)
     .values({ email: 'demo@bookkeeper.local', name: 'Demo User', passwordHash: 'dev' })
     .returning();
+  await logTransaction(db, {
+    userId: user.id,
+    action: 'create',
+    entityType: 'user',
+    entityId: user.id,
+    summary: 'Created the first-run user "Demo User"',
+    data: { new: { name: user.name, email: user.email } },
+  });
   const company = await createCompany(db, { name: 'Demo Company', ownerId: user.id });
   return { companyId: company.id, userId: user.id };
 }
@@ -214,7 +252,25 @@ export const COMPANY_SETTINGS_KEYS = [
   'customFields',
 ] as const satisfies readonly (keyof CompanySettings)[];
 
-const SETTINGS_KEY_SET = new Set<string>(COMPANY_SETTINGS_KEYS);
+/**
+ * wave2 prefs: every categorized Preferences key (lib/preferences.ts) is also whitelisted, so the
+ * full QB Preferences dialog (Accounting, Checking, Jobs & Estimates, Items & Inventory,
+ * Payments, Reminders, Reports, Sales Tax, Send Forms, Time & Expenses, Multiple Currencies…)
+ * persists through updateCompany. Values are validated by lib/validation/company.ts.
+ */
+const SETTINGS_KEY_SET = new Set<string>([...COMPANY_SETTINGS_KEYS, ...COMPANY_PREFERENCE_KEYS]);
+
+/**
+ * Resolved company preferences (stored overrides + defaults) — the one call consumers use to
+ * honor Preferences (forms, reports, services). See lib/preferences.ts for the catalogue.
+ */
+export async function getPreferences(ctx: ServiceContext): Promise<CompanyPreferences> {
+  const [row] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  return resolveCompanyPreferences(row?.settings ?? {});
+}
 
 export interface UpdateCompanyInput {
   name?: string;
@@ -236,6 +292,9 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
   for (const [key, value] of Object.entries(input.settings ?? {})) {
     if (SETTINGS_KEY_SET.has(key) && value !== undefined) settingsPatch[key] = value;
   }
+  // Account-valued preferences must name the right kind of account (a paycheck account that is
+  // A/R or a wages account that is A/P would break the subledger == control-account rule).
+  await assertPreferenceAccounts(ctx, settingsPatch);
 
   const mergedSettings = {
     ...(existing.settings ?? {}),
@@ -303,7 +362,9 @@ export async function setClosingDate(
   ctx: ServiceContext,
   input: SetClosingDateInput,
 ): Promise<ClosingDateSettings> {
-  await requireRole(ctx, 'admin');
+  // Enterprise roles: Closing Date / Periods — modify (Admin, Accountant, External Accountant,
+  // custom roles), same rule as the route map for PATCH /api/company/closing-date.
+  await requireEffectivePermission(ctx, 'closing', 'modify');
   const existing = await getCompany(ctx);
   if (!existing) throw notFound('company');
 

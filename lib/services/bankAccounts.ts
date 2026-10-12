@@ -5,9 +5,14 @@
 import { and, eq } from 'drizzle-orm';
 import { accounts, bankAccounts } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { maskForContext } from './access';
+import { isMaskedValue } from '@/lib/permissions/mask';
+
+// Account numbers leave this service masked (last 4 only) unless the caller's roles grant
+// "view full bank / account numbers" (Users & Roles); see maskForContext.
 
 export async function listBankAccounts(ctx: ServiceContext) {
-  return ctx.db
+  const rows = await ctx.db
     .select({
       id: bankAccounts.id,
       accountId: bankAccounts.accountId,
@@ -21,6 +26,7 @@ export async function listBankAccounts(ctx: ServiceContext) {
     .from(bankAccounts)
     .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
     .where(eq(bankAccounts.companyId, ctx.companyId));
+  return maskForContext(ctx, rows);
 }
 
 export async function getBankAccount(ctx: ServiceContext, id: string) {
@@ -29,7 +35,7 @@ export async function getBankAccount(ctx: ServiceContext, id: string) {
     .from(bankAccounts)
     .where(and(eq(bankAccounts.id, id), eq(bankAccounts.companyId, ctx.companyId)));
   if (!row) throw notFound('Bank account');
-  return row;
+  return maskForContext(ctx, row);
 }
 
 export async function createBankAccount(
@@ -37,6 +43,11 @@ export async function createBankAccount(
   input: { accountId: string; bankName: string; accountNumber: string },
 ) {
   if (!input.bankName?.trim()) throw validation('Bank name is required.');
+  // A role without "view full account numbers" only ever sees "••••6789"; never store that
+  // placeholder as if it were the real number.
+  if (isMaskedValue(input.accountNumber)) {
+    throw validation('Enter the full account number (a masked number cannot be saved).');
+  }
   // The GL account must belong to this company and be an asset/liability (bank or credit card).
   const [gl] = await ctx.db
     .select()
@@ -63,5 +74,5 @@ export async function createBankAccount(
     entityId: row.id,
     newValues: { bankName: row.bankName, accountId: row.accountId },
   });
-  return row;
+  return maskForContext(ctx, row);
 }

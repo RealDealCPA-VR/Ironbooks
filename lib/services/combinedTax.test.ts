@@ -13,10 +13,11 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { users, companies, accounts, customers, taxAgencies, taxRates, invoices } from '@/lib/db/schema';
+import { users, companies, accounts, customers, taxAgencies, taxRates } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { ServiceError } from './_base';
 import { listComponents, setComponents, salesTaxByAgency } from './combinedTax';
+import { createInvoice } from './invoices';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-combined-tax');
 
@@ -175,20 +176,14 @@ describe('combinedTax service', () => {
       .values({ companyId: ctx.companyId, displayName: 'Tax Split Customer' })
       .returning();
 
-    await db
-      .insert(invoices)
-      .values({
-        companyId: ctx.companyId,
-        customerId: cust.id,
-        invoiceNumber: 9001,
-        date: new Date('2026-01-15'),
-        status: 'open',
-        subtotal: '100.00',
-        taxRateId,
-        taxAmount: '7.50',
-        total: '107.50',
-        balanceDue: '107.50',
-      });
+    // Posted through the invoice service: the sales-tax engine reads the GL (Sales Tax
+    // Payable lines), not invoice headers.
+    await createInvoice(ctx, {
+      customerId: cust.id,
+      date: new Date('2026-01-15'),
+      taxRateId,
+      lines: [{ description: 'Taxable sale', quantity: 1, rate: '100.00' }],
+    });
 
     const result = await salesTaxByAgency(ctx, {
       from: new Date('2026-01-01'),

@@ -13,11 +13,41 @@ Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
 
 export type MoneyInput = string | number | Decimal | null | undefined;
 
-/** Coerce any money-ish input to a Decimal, treating null/undefined/'' as 0. */
+/**
+ * Coerce any money-ish input to a Decimal, treating null/undefined/'' (and whitespace-only
+ * strings) as 0. Strings are normalized first: surrounding whitespace of any kind (spaces, tabs,
+ * NBSP and other Unicode separators) is ignored, so " 7.25 " is 7.25. Anything still not a
+ * number throws (see `MoneyParseError`), never silently becomes 0.
+ */
 export function toDecimal(value: MoneyInput): Decimal {
-  if (value === null || value === undefined || value === '') return new Decimal(0);
-  return value instanceof Decimal ? value : new Decimal(value);
+  if (value === null || value === undefined) return new Decimal(0);
+  if (value instanceof Decimal) return value;
+  if (typeof value === 'string') {
+    const s = value.replace(/^[\s\p{Z}﻿]+|[\s\p{Z}﻿]+$/gu, '');
+    if (s === '') return new Decimal(0);
+    try {
+      return new Decimal(s);
+    } catch {
+      throw new MoneyParseError(value);
+    }
+  }
+  try {
+    return new Decimal(value);
+  } catch {
+    throw new MoneyParseError(String(value));
+  }
 }
+
+/** An amount that is not a decimal number. Callers translate it into a VALIDATION error. */
+export class MoneyParseError extends Error {
+  constructor(public readonly input: string) {
+    super(`"${input}" is not a valid amount.`);
+    this.name = 'MoneyParseError';
+  }
+}
+
+/** Largest absolute value a numeric(15,2) column (amounts and cached balances) can hold. */
+export const MAX_LEDGER_AMOUNT = new Decimal('9999999999999.99');
 
 /** Normalize to a 2dp string suitable for DB decimal columns. */
 export function toAmountString(value: MoneyInput): string {

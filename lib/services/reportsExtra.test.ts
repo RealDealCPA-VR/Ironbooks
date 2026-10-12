@@ -111,6 +111,7 @@ async function createTestInvoice(opts: {
   const date = opts.date ?? new Date('2025-01-01');
   // Post balanced GL entry: Dr A/R, Cr Sales Income.
   const entry = await postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date,
     description: `Test invoice ${opts.total}`,
     lines: [
@@ -152,6 +153,7 @@ async function createTestBill(opts: {
 }) {
   const date = opts.date ?? new Date('2025-01-01');
   const entry = await postJournalEntry(ctx, {
+    allowUnnamedControl: true, // fixture posts straight to A/R or A/P
     date,
     description: `Test bill ${opts.total}`,
     lines: [
@@ -283,6 +285,7 @@ describe('cashFlow', () => {
 
     // Revenue entry: Dr Checking, Cr Sales.
     await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-03-01'),
       description: 'Cash sale',
       lines: [

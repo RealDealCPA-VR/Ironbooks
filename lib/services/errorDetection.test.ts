@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   users,
@@ -20,7 +20,7 @@ import {
 } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
-import { postJournalEntry } from './posting';
+import { postJournalEntry, voidJournalEntry } from './posting';
 import { trialBalance } from './reports';
 import { detectErrors, listErrors } from './errorDetection';
 import { analyzeError, applyCorrection } from './llmCorrector';
@@ -34,6 +34,16 @@ let ctx: ServiceContext;
 let db: DB;
 /** Maps account code → uuid */
 const acct: Record<string, string> = {};
+
+/** Ledger triggers (0017) switched off to fabricate a pre-0017 "legacy" unbalanced entry. */
+const LEGACY_TRIGGERS: Array<[string, string]> = [
+  ['journal_entries', 'bka_je_balanced'],
+  ['journal_entry_lines', 'bka_jel_balanced'],
+  ['journal_entry_lines', 'bka_jel_guard'],
+  ['journal_entry_lines', 'bka_jel_sync_ins'],
+  ['accounts', 'bka_accounts_guard'],
+  ['journal_entry_lines', 'bka_jel_non_posting'], // 0025 deferred guard
+];
 
 describe('AI Error Detection + LLM Corrector', () => {
   beforeAll(async () => {
@@ -74,36 +84,39 @@ describe('AI Error Detection + LLM Corrector', () => {
   // -------------------------------------------------------------------------
 
   it('detectErrors finds an unbalanced posted entry', async () => {
-    // Insert a journal entry header directly — bypass postJournalEntry so we
-    // can create an intentionally unbalanced entry.
+    // Since migration 0017 the DATABASE refuses an unbalanced posted entry at COMMIT, so
+    // this can only exist in a LEGACY file written before the guard. Simulate that by
+    // disabling the ledger triggers for one transaction (test-only DDL, restored to ENABLE
+    // ALWAYS before commit) and applying the cached-balance deltas the way the pre-0017
+    // posting code did.
     const userId = ctx.userId ?? '00000000-0000-0000-0000-000000000000';
-    const [entry] = await db
-      .insert(journalEntries)
-      .values({
-        companyId: ctx.companyId,
-        entryNumber: 9001,
-        date: new Date('2025-03-01'),
-        description: 'Unbalanced test entry',
-        status: 'posted',
-        createdBy: userId,
-      })
-      .returning();
-
-    // debit 500, credit 300 → out of balance by 200.
-    await db.insert(journalEntryLines).values([
-      {
-        journalEntryId: entry.id,
-        accountId: acct['1000'],
-        debit: '500.00',
-        credit: null,
-      },
-      {
-        journalEntryId: entry.id,
-        accountId: acct['4000'],
-        debit: null,
-        credit: '300.00',
-      },
-    ]);
+    const entry = await db.transaction(async (tx) => {
+      for (const [table, trig] of LEGACY_TRIGGERS) {
+        await tx.execute(sql.raw(`ALTER TABLE ${table} DISABLE TRIGGER ${trig}`));
+      }
+      const [e] = await tx
+        .insert(journalEntries)
+        .values({
+          companyId: ctx.companyId,
+          entryNumber: 9001,
+          date: new Date('2025-03-01'),
+          description: 'Unbalanced test entry',
+          status: 'posted',
+          createdBy: userId,
+        })
+        .returning();
+      // debit 500, credit 300 → out of balance by 200.
+      await tx.insert(journalEntryLines).values([
+        { journalEntryId: e.id, accountId: acct['1000'], debit: '500.00', credit: null },
+        { journalEntryId: e.id, accountId: acct['4000'], debit: null, credit: '300.00' },
+      ]);
+      await tx.execute(sql`UPDATE accounts SET balance = balance + 500 WHERE id = ${acct['1000']}`);
+      await tx.execute(sql`UPDATE accounts SET balance = balance + 300 WHERE id = ${acct['4000']}`);
+      for (const [table, trig] of LEGACY_TRIGGERS) {
+        await tx.execute(sql.raw(`ALTER TABLE ${table} ENABLE ALWAYS TRIGGER ${trig}`));
+      }
+      return e;
+    });
 
     const detections = await detectErrors(ctx);
 
@@ -121,6 +134,7 @@ describe('AI Error Detection + LLM Corrector', () => {
   it('detectErrors finds duplicate posted entries', async () => {
     // Post the same logical transaction twice using postJournalEntry.
     const duplicateInput = {
+      allowUnnamedControl: true, // fixture posts straight to A/R
       date: new Date('2025-03-10'),
       description: 'Duplicate sale',
       lines: [
@@ -145,23 +159,27 @@ describe('AI Error Detection + LLM Corrector', () => {
 
   it('detectErrors finds entries with blank descriptions', async () => {
     const userId = ctx.userId ?? '00000000-0000-0000-0000-000000000000';
-    const [entry] = await db
-      .insert(journalEntries)
-      .values({
-        companyId: ctx.companyId,
-        entryNumber: 9002,
-        date: new Date('2025-03-05'),
-        description: '   ', // blank / whitespace only
-        status: 'posted',
-        createdBy: userId,
-      })
-      .returning();
+    // Header + lines in ONE transaction: the DB checks posted entries at COMMIT.
+    const entry = await db.transaction(async (tx) => {
+      const [e] = await tx
+        .insert(journalEntries)
+        .values({
+          companyId: ctx.companyId,
+          entryNumber: 9002,
+          date: new Date('2025-03-05'),
+          description: '   ', // blank / whitespace only
+          status: 'posted',
+          createdBy: userId,
+        })
+        .returning();
 
-    // Add balanced lines so this entry won't also trigger unbalanced.
-    await db.insert(journalEntryLines).values([
-      { journalEntryId: entry.id, accountId: acct['1000'], debit: '100.00', credit: null },
-      { journalEntryId: entry.id, accountId: acct['3000'], debit: null, credit: '100.00' },
-    ]);
+      // Add balanced lines so this entry won't also trigger unbalanced.
+      await tx.insert(journalEntryLines).values([
+        { journalEntryId: e.id, accountId: acct['1000'], debit: '100.00', credit: null },
+        { journalEntryId: e.id, accountId: acct['3000'], debit: null, credit: '100.00' },
+      ]);
+      return e;
+    });
 
     const detections = await detectErrors(ctx);
     const missingField = detections.filter(
@@ -247,22 +265,19 @@ describe('AI Error Detection + LLM Corrector', () => {
   // 7. Trial balance stays balanced after all the above
   // -------------------------------------------------------------------------
 
-  it('trial balance remains balanced for normally-posted entries', async () => {
-    // The two duplicate sales + balanced test entries are posted correctly,
-    // so the trial balance for posted entries must still balance.
+  it('trial balance refuses loudly to present the legacy out-of-balance ledger', async () => {
+    // The legacy unbalanced entry injected above makes the books unbalanced; reports must
+    // never silently show such a trial balance — they throw an INTEGRITY error instead.
+    await expect(trialBalance(ctx)).rejects.toThrow(/INTEGRITY/);
+
+    // Voiding the bad entry (the supported repair) restores a balanced trial balance.
+    const [bad] = await db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(eq(journalEntries.entryNumber, 9001));
+    await voidJournalEntry(ctx, bad.id);
     const tb = await trialBalance(ctx);
-    // Note: the "unbalanced test entry" was inserted with direct SQL and its
-    // balance deltas were NOT applied to accounts, so the TB recomputes from
-    // raw lines and will show the imbalance. We check that the NORMAL entries
-    // (the duplicates + owner equity seedings) do balance on their own by
-    // inspecting the trial balance. The key invariant is that detectErrors
-    // found the imbalanced entry and flagged it (tested above).
-    //
-    // If all entries in the DB happened to be balanced the TB would be true;
-    // here it may be false because we deliberately injected an unbalanced entry.
-    // The important assertion is that TB runs without throwing.
-    expect(typeof tb.balanced).toBe('boolean');
-    expect(tb.totalDebit).toBeTruthy();
-    expect(tb.totalCredit).toBeTruthy();
+    expect(tb.balanced).toBe(true);
+    expect(tb.totalDebit).toBe(tb.totalCredit);
   });
 });

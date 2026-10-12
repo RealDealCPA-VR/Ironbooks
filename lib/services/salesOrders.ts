@@ -32,43 +32,57 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { createInvoice } from './invoices';
+import { createInvoice, shippingColumns } from './invoices';
+import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { allocateDocNumber } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export interface SalesOrderLineInput {
+  /** Edit only (C1): the existing sales-order line this row updates (keeps its invoiced qty). */
+  id?: string | null;
   itemId?: string | null;
   description?: string | null;
   quantity: string | number;
-  rate: string | number;
+  /** Unit price; omit on item lines to price server-side (lib/services/pricing.ts). */
+  rate?: string | number | null;
 }
 
 export interface CreateSalesOrderInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   customerId: string;
   date: Date;
   lines: SalesOrderLineInput[];
   memo?: string | null;
+  // wave2 sales: shipping (B6) + send queues (C7)
+  shipDate?: Date | null;
+  shipVia?: string | null;
+  fob?: string | null;
+  trackingNumber?: string | null;
+  shipTo?: Record<string, string> | null;
+  poNumber?: string | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function nextOrderNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${salesOrders.orderNumber}), 0)` })
-    .from(salesOrders)
-    .where(eq(salesOrders.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
-}
-
 // ---------------------------------------------------------------------------
 // createSalesOrder
 // ---------------------------------------------------------------------------
 
-export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInput) {
+/** Validate a sales-order input and compute its lines/totals (read-only; create + edit). */
+async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInput) {
   if (!input.lines || input.lines.length === 0) {
     throw validation('A sales order must have at least one line.');
   }
@@ -88,15 +102,25 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
     rate: string;
     amount: string;
     lineOrder: number;
+    pricing: AppliedPricing | null;
   };
+
+  // Advanced pricing: fill omitted item rates and record rule/level provenance.
+  const pricedLines = await resolveLinePricing(
+    ctx,
+    { customerId: input.customerId, date: input.date },
+    input.lines,
+  );
 
   let subtotal = Money.zero();
   const computedLines: ComputedLine[] = [];
 
-  for (let i = 0; i < input.lines.length; i++) {
-    const l = input.lines[i];
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+  for (let i = 0; i < pricedLines.length; i++) {
+    const l = pricedLines[i];
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
 
@@ -106,17 +130,26 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
     computedLines.push({
       itemId: l.itemId ?? null,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       lineOrder: i,
+      pricing: l.pricing,
     });
   }
 
   const total = Money.round2(subtotal);
 
+  return { computedLines, subtotal, total };
+}
+
+export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInput) {
+  const { computedLines, subtotal, total } = await prepareSalesOrder(ctx, input);
+
   return inTransaction(ctx, async (tx) => {
-    const orderNumber = await nextOrderNumber(tx);
+    const { refNumber, number: orderNumber } = await allocateDocNumber(tx, 'sales_order', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     const [order] = await tx.db
       .insert(salesOrders)
@@ -124,11 +157,13 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
         companyId: tx.companyId,
         customerId: input.customerId,
         orderNumber,
+        refNumber,
         date: input.date,
         status: 'open',
         subtotal: toAmountString(subtotal),
         total: toAmountString(total),
         memo: input.memo ?? null,
+        ...shippingColumns(input),
       })
       .returning();
 
@@ -141,6 +176,7 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
         rate: cl.rate,
         amount: cl.amount,
         lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
       })),
     );
 
@@ -254,6 +290,8 @@ export interface ConvertToInvoiceLineInput {
 }
 
 export interface ConvertToInvoiceOptions {
+  /** wave2 sales (C2): save even if the invoice puts the customer over their credit limit. */
+  overrideCreditLimit?: boolean;
   /**
    * Per-line quantities to invoice. Lines omitted from the array are not
    * invoiced (they stay on backorder). When undefined, every line is invoiced
@@ -396,11 +434,20 @@ export async function convertToInvoice(
       customerId: order.customerId,
       date: opts?.date ?? order.date,
       memo: order.memo,
+      overrideCreditLimit: opts?.overrideCreditLimit,
+      // wave2 sales (B6): the invoice inherits the order shipping details.
+      shipDate: order.shipDate,
+      shipVia: order.shipVia,
+      fob: order.fob,
+      trackingNumber: order.trackingNumber,
+      shipTo: order.shipTo,
+      poNumber: order.poNumber,
       lines: plan.map(({ line, qty }) => ({
         itemId: line.itemId ?? null,
         description: line.description ?? null,
         quantity: qty.toFixed(4),
         rate: line.rate,
+        pricing: { origin: 'sales_order' },
       })),
     });
 
@@ -510,4 +557,128 @@ export async function backorderReport(ctx: ServiceContext): Promise<BackorderRep
       .minus(Money.of(r.quantityInvoiced ?? '0'))
       .toFixed(4),
   }));
+}
+
+// ---------------------------------------------------------------------------
+// updateSalesOrder (wave2 sales, C1 — edit a saved sales order)
+// ---------------------------------------------------------------------------
+
+/**
+ * Edit a saved sales order. Sales orders never post to the GL, so this replaces the lines and
+ * header (orderNumber/createdAt preserved) and audits old + new values.
+ *
+ * Lines already (partly) invoiced must be kept — send them back with their `id` — with the same
+ * item and a quantity no lower than what has been invoiced; their invoiced quantity carries
+ * over. New lines (no id) are added; lines without invoicing may be removed. Closed and void
+ * orders cannot be edited. The status is recomputed (partial/closed) from the new quantities.
+ */
+export async function updateSalesOrder(ctx: ServiceContext, id: string, input: CreateSalesOrderInput) {
+  const existing = await getSalesOrder(ctx, id);
+  if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided sales order.');
+  if (existing.status === 'closed') {
+    throw new ServiceError(
+      'CONFLICT',
+      'This sales order is closed (fully invoiced or cancelled), so it can no longer be changed.',
+    );
+  }
+  const { computedLines, subtotal, total } = await prepareSalesOrder(ctx, input);
+
+  // Map input rows to existing lines by id.
+  const oldById = new Map(existing.lines.map((l) => [l.id, l]));
+  const keepInvoiced = new Map<number, string>(); // new line index -> quantityInvoiced
+  const seen = new Set<string>();
+  input.lines.forEach((l, i) => {
+    if (!l.id) return;
+    const old = oldById.get(l.id);
+    if (!old) throw validation(`Line ${i + 1}: that sales order line no longer exists — reload and try again.`);
+    if (seen.has(l.id)) throw validation(`Line ${i + 1}: the same sales order line appears twice.`);
+    seen.add(l.id);
+    const invoiced = Money.of(old.quantityInvoiced ?? '0');
+    if (invoiced.greaterThan(0)) {
+      if ((l.itemId ?? null) !== (old.itemId ?? null)) {
+        throw new ServiceError('CONFLICT', `Line ${i + 1} has already been invoiced, so its item cannot be changed.`);
+      }
+      if (Money.of(computedLines[i].quantity).lessThan(invoiced)) {
+        throw new ServiceError(
+          'CONFLICT',
+          `Line ${i + 1} has already been invoiced for ${invoiced.toFixed(2)}, so its quantity cannot be lower than that.`,
+        );
+      }
+      keepInvoiced.set(i, invoiced.toFixed(4));
+    }
+  });
+  for (const old of existing.lines) {
+    if (!seen.has(old.id) && Money.of(old.quantityInvoiced ?? '0').greaterThan(0)) {
+      throw new ServiceError('CONFLICT', 'A line that has already been invoiced cannot be removed from the sales order.');
+    }
+  }
+  const anyInvoiced = keepInvoiced.size > 0;
+  if (anyInvoiced && input.customerId !== existing.customerId) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This sales order has already been partly invoiced, so its customer cannot be changed.',
+    );
+  }
+  const fullyInvoiced =
+    anyInvoiced &&
+    computedLines.every((cl, i) => !Money.of(cl.quantity).greaterThan(Money.of(keepInvoiced.get(i) ?? '0')));
+  const newStatus = !anyInvoiced ? 'open' : fullyInvoiced ? 'closed' : 'partial';
+
+  return inTransaction(ctx, async (tx) => {
+    await tx.db.delete(salesOrderLines).where(eq(salesOrderLines.salesOrderId, id));
+    await tx.db.insert(salesOrderLines).values(
+      computedLines.map((cl, i) => ({
+        salesOrderId: id,
+        itemId: cl.itemId,
+        description: cl.description,
+        quantity: cl.quantity,
+        rate: cl.rate,
+        amount: cl.amount,
+        quantityInvoiced: keepInvoiced.get(i) ?? '0',
+        lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
+      })),
+    );
+    await tx.db
+      .update(salesOrders)
+      .set({
+        customerId: input.customerId,
+        date: input.date,
+        subtotal: toAmountString(subtotal),
+        total: toAmountString(total),
+        memo: input.memo ?? null,
+        status: newStatus,
+        ...shippingColumns(input, existing),
+      })
+      .where(and(eq(salesOrders.id, id), eq(salesOrders.companyId, tx.companyId)));
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'sales_order',
+      entityId: id,
+      oldValues: {
+        customerId: existing.customerId,
+        date: existing.date,
+        total: existing.total,
+        status: existing.status,
+        memo: existing.memo,
+        lines: existing.lines.map((l) => ({
+          itemId: l.itemId,
+          description: l.description,
+          quantity: l.quantity,
+          rate: l.rate,
+          quantityInvoiced: l.quantityInvoiced,
+        })),
+      },
+      newValues: {
+        customerId: input.customerId,
+        date: input.date,
+        total: toAmountString(total),
+        status: newStatus,
+        memo: input.memo ?? null,
+        lines: computedLines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate })),
+      },
+    });
+    return getSalesOrder(tx, id);
+  });
 }

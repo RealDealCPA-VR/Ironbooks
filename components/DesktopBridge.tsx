@@ -8,15 +8,18 @@
  *  - File > Import Bank File -> /banking (import flow lives there)
  *  - File > Backup Company   -> /backup
  *  - File > New/Open Company -> /companies (company management/switcher)
+ *  - File > Create Portable Company File / Export Shareable Ledger -> fetch + native Save
+ *  - File > View Transaction Log -> /transaction-log
  *  - auto-updater 'update-ready' -> an actionable "Restart & install now" banner
  *
  * Renders nothing in the browser (window.bookkeeper is absent outside Electron) and
  * nothing in the desktop shell until an update has finished downloading.
  */
-import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useEffect, useRef, useState } from 'react';
+import { usePathname, useRouter } from 'next/navigation';
 import { RefreshCw, X } from 'lucide-react';
 import { Button, toast } from '@/components/ui';
+import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
 
 type Unsubscribe = (() => void) | void;
 interface DesktopBridgeApi {
@@ -25,6 +28,7 @@ interface DesktopBridgeApi {
   onNavigate?: (cb: (route: string) => void) => Unsubscribe;
   quitAndInstall?: () => Promise<boolean>;
   company?: { newFile?: () => Promise<unknown>; open?: () => Promise<unknown> };
+  spellcheck?: { setEnabled?: (enabled: boolean) => Promise<unknown> };
 }
 
 function bridge(): DesktopBridgeApi | undefined {
@@ -35,12 +39,51 @@ function bridge(): DesktopBridgeApi | undefined {
 const MENU_ROUTES: Record<string, string> = {
   import: '/banking',
   backup: '/backup',
+  'transaction-log': '/transaction-log',
+};
+
+/** File-menu exports that fetch from the local server (with the session) and save natively. */
+const MENU_EXPORTS: Record<string, { run: () => Promise<string | null>; done: string }> = {
+  'portable-create': { run: savePortableCompanyFile, done: 'Portable company file saved' },
+  'shareable-xlsx': { run: () => saveShareableLedger('xlsx'), done: 'Shareable ledger (Excel) saved' },
+  'shareable-pdf': { run: () => saveShareableLedger('pdf'), done: 'Shareable ledger (PDF) saved' },
 };
 
 export default function DesktopBridge() {
   const router = useRouter();
   const [updateReady, setUpdateReady] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const pathname = usePathname();
+  const myPrefsApplied = useRef(false);
+
+  // My Preferences in the desktop shell: spell checking on/off, and "Show the Reminders list
+  // when I open the company" (once per app session). Raw fetch on purpose: before sign-in it
+  // just fails quietly (no redirect), and we retry on the next navigation.
+  useEffect(() => {
+    const b = bridge();
+    if (!b?.isDesktop || myPrefsApplied.current) return;
+    if (pathname?.startsWith('/portal') || ['/login', '/signup', '/unlock', '/reset-password'].includes(pathname ?? '')) return;
+    let cancelled = false;
+    fetch('/api/preferences/my', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((my: { spellCheckEnabled?: boolean; showRemindersAtStartup?: boolean } | null) => {
+        if (!my || cancelled) return;
+        myPrefsApplied.current = true;
+        void b.spellcheck?.setEnabled?.(my.spellCheckEnabled !== false);
+        try {
+          if (my.showRemindersAtStartup && !sessionStorage.getItem('bka:reminders-shown')) {
+            sessionStorage.setItem('bka:reminders-shown', '1');
+            if (pathname !== '/reminders') router.push('/reminders');
+          }
+        } catch {
+          /* storage unavailable: skip the startup reminder */
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [pathname, router]);
 
   useEffect(() => {
     const b = bridge();
@@ -59,6 +102,15 @@ export default function DesktopBridge() {
       }
       if (action === 'open-company') {
         b.company?.open?.();
+        return;
+      }
+      const exp = MENU_EXPORTS[action];
+      if (exp) {
+        toast('Preparing the file…', 'info');
+        exp
+          .run()
+          .then((saved) => saved && toast(`${exp.done}: ${saved}`, 'success'))
+          .catch((err) => toast(err instanceof Error ? err.message : 'Export failed.', 'danger'));
         return;
       }
       const route = MENU_ROUTES[action];

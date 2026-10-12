@@ -26,6 +26,7 @@ import {
 } from './_base';
 import { assertNotFifoTracked } from './inventory';
 import { postJournalEntry } from './posting';
+import { assertDefaultSiteQuantities } from './inventorySites';
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -213,6 +214,13 @@ export async function physicalCount(
     );
   }
   await assertNotFifoTracked(ctx, item.id);
+  // Advanced Inventory: serial/lot-tracked units need their identity captured — count them
+  // through a site adjustment (Inventory Sites › Adjust Quantity) instead.
+  if (item.trackingMode && item.trackingMode !== 'none') {
+    throw validation(
+      `"${item.name}" is ${item.trackingMode}-tracked. Record count differences with Adjust Quantity at Site so the ${item.trackingMode} numbers are captured.`,
+    );
+  }
 
   const currentQty = Money.of(item.quantityOnHand ?? '0');
   const avgCost = Money.of(item.averageCost ?? '0');
@@ -306,6 +314,9 @@ export async function physicalCount(
         updatedAt: new Date(),
       })
       .where(eq(items.id, input.itemId));
+    // A whole-company count lands on the default site; it must not count away stock that
+    // physically sits at another site.
+    await assertDefaultSiteQuantities(tx, [input.itemId]);
 
     await writeAudit(tx, {
       action: 'update',
@@ -621,26 +632,34 @@ export async function batchPhysicalCount(
     seen.add(c.itemId);
   }
 
-  const applied: PhysicalCountResult[] = [];
-  const skipped: Array<{ itemId: string; reason: string }> = [];
+  // One outer transaction: each item's count runs in its own savepoint, so an item refused
+  // for a per-item reason (bad input, missing item, or a site guard CONFLICT) is rolled back and
+  // reported as skipped, while any other failure aborts the whole batch — never half-applied.
+  return inTransaction(ctx, async (tx) => {
+    const applied: PhysicalCountResult[] = [];
+    const skipped: Array<{ itemId: string; reason: string }> = [];
 
-  for (const c of input.counts) {
-    try {
-      const result = await physicalCount(ctx, {
-        itemId: c.itemId,
-        countedQty: c.countedQty,
-        date: input.date,
-        adjustmentAccountId: input.adjustmentAccountId ?? null,
-      });
-      applied.push(result);
-    } catch (err) {
-      if (err instanceof ServiceError && (err.code === 'VALIDATION' || err.code === 'NOT_FOUND')) {
-        skipped.push({ itemId: c.itemId, reason: err.message });
-      } else {
-        throw err;
+    for (const c of input.counts) {
+      try {
+        const result = await physicalCount(tx, {
+          itemId: c.itemId,
+          countedQty: c.countedQty,
+          date: input.date,
+          adjustmentAccountId: input.adjustmentAccountId ?? null,
+        });
+        applied.push(result);
+      } catch (err) {
+        if (
+          err instanceof ServiceError &&
+          (err.code === 'VALIDATION' || err.code === 'NOT_FOUND' || err.code === 'CONFLICT')
+        ) {
+          skipped.push({ itemId: c.itemId, reason: err.message });
+        } else {
+          throw err;
+        }
       }
     }
-  }
 
-  return { applied, skipped };
+    return { applied, skipped };
+  });
 }

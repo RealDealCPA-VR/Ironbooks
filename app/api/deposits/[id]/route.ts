@@ -7,7 +7,10 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getDeposit, voidDeposit } from '@/lib/services/deposits';
+import { getDeposit, updateDeposit, voidDeposit } from '@/lib/services/deposits';
+import { routeError } from '@/lib/routeErrors';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createDepositSchema } from '@/lib/validation/deposits';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorStatus(code: ServiceError['code']): number {
@@ -54,5 +57,20 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err, 'DELETE /api/deposits/[id]');
+  }
+}
+
+/** PATCH /api/deposits/:id — edit a saved deposit (same body as POST /api/deposits). */
+export async function PATCH(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json().catch(() => ({}));
+    const parsed = createDepositSchema.safeParse(body);
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    const deposit = await updateDeposit(ctx, id, parsed.data);
+    return NextResponse.json(deposit);
+  } catch (err) {
+    return routeError(err, 'PATCH /api/deposits/[id]');
   }
 }

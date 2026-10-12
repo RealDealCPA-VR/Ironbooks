@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { FileCheck, Plus, ArrowRight, PlusCircle, MinusCircle, Printer } from 'lucide-react';
+import { FileCheck, Plus, ArrowRight, Printer, PackageCheck, Pencil } from 'lucide-react';
+import Link from 'next/link';
 import {
   Button,
   Card,
@@ -22,6 +23,21 @@ import {
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
+import {
+  PricedLinesEditor,
+  emptyPricedLine,
+  type PricedLineItem,
+  type PricedLineValue,
+} from '@/components/PricedLinesEditor';
+import {
+  EMPTY_SHIPPING,
+  FormSendButtons,
+  ShippingSection,
+  type ShippingState,
+  shippingFromDoc,
+  shippingPayload,
+  useCreditLimitConfirm,
+} from '@/components/sales/SalesExtras';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,10 +56,20 @@ interface SalesOrder {
   total: string;
   status: string;
   convertedInvoiceId: string | null;
+  memo?: string | null;
+  shipDate?: string | null;
+  shipVia?: string | null;
+  fob?: string | null;
+  trackingNumber?: string | null;
+  poNumber?: string | null;
+  shipTo?: Record<string, string> | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
 }
 
 interface SalesOrderLine {
   id: string;
+  itemId?: string | null;
   description: string | null;
   quantity: string;
   rate: string;
@@ -55,11 +81,6 @@ interface SalesOrderDetail extends SalesOrder {
   lines: SalesOrderLine[];
 }
 
-interface LineRow {
-  description: string;
-  quantity: string;
-  rate: string;
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -83,15 +104,9 @@ function statusLabel(status: string): string {
   return status;
 }
 
-function computeLineTotal(line: LineRow): number {
-  return (parseFloat(line.quantity) || 0) * (parseFloat(line.rate) || 0);
+function computeTotal(lines: PricedLineValue[]): number {
+  return lines.reduce((sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0), 0);
 }
-
-function computeTotal(lines: LineRow[]): number {
-  return lines.reduce((sum, l) => sum + computeLineTotal(l), 0);
-}
-
-const EMPTY_LINE: LineRow = { description: '', quantity: '', rate: '' };
 
 // ---------------------------------------------------------------------------
 // New Sales Order Modal
@@ -99,73 +114,92 @@ const EMPTY_LINE: LineRow = { description: '', quantity: '', rate: '' };
 
 interface NewOrderModalProps {
   open: boolean;
+  /** wave2 sales (C1): the order being edited (null = new). */
+  editing?: SalesOrderDetail | null;
   onClose: () => void;
   customers: Customer[];
+  items: PricedLineItem[];
   onCreated: () => void;
 }
 
-function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalProps) {
+type EditableLine = PricedLineValue & { id?: string; invoiced?: number };
+
+function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: NewOrderModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
-  const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
+  const [lines, setLines] = useState<EditableLine[]>([emptyPricedLine()]);
+  const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (open) {
+    if (!open) return;
+    if (editing) {
+      setCustomerId(editing.customerId);
+      setDate(editing.date.slice(0, 10));
+      setMemo(editing.memo ?? '');
+      setShip(shippingFromDoc(editing));
+      setLines(
+        editing.lines.map((l) => ({
+          id: l.id,
+          invoiced: Number(l.quantityInvoiced ?? 0),
+          itemId: l.itemId ?? '',
+          description: l.description ?? '',
+          quantity: String(Number(l.quantity)),
+          rate: String(Number(l.rate)),
+          taxable: true,
+          rateManual: true,
+        })),
+      );
+    } else {
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setMemo('');
-      setLines([{ ...EMPTY_LINE }]);
+      setShip(shippingFromDoc(null));
+      setLines([emptyPricedLine()]);
     }
-  }, [open]);
-
-  function updateLine(idx: number, field: keyof LineRow, value: string) {
-    setLines((prev) => {
-      const next = [...prev];
-      next[idx] = { ...next[idx], [field]: value };
-      return next;
-    });
-  }
-
-  function addLine() {
-    setLines((prev) => [...prev, { ...EMPTY_LINE }]);
-  }
-
-  function removeLine(idx: number) {
-    setLines((prev) => prev.filter((_, i) => i !== idx));
-  }
+  }, [open, editing]);
 
   const liveTotal = computeTotal(lines);
 
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter an order date.', 'danger'); return; }
-    const validLines = lines.filter((l) => l.description || l.quantity || l.rate);
+    const validLines = lines.filter((l) => l.itemId || l.description || l.rate);
     if (validLines.length === 0) { toast('Add at least one line item.', 'danger'); return; }
     for (let i = 0; i < validLines.length; i++) {
       const l = validLines[i];
       if (!l.quantity || parseFloat(l.quantity) <= 0) {
         toast(`Line ${i + 1}: quantity must be a positive number.`, 'danger'); return;
       }
-      if (l.rate === '' || parseFloat(l.rate) < 0) {
-        toast(`Line ${i + 1}: rate cannot be negative.`, 'danger'); return;
+      if ((l.rate === '' && !l.itemId) || parseFloat(l.rate) < 0) {
+        toast(`Line ${i + 1}: enter a rate (it cannot be negative).`, 'danger'); return;
       }
     }
 
     setSaving(true);
     try {
-      await api.post('/api/sales-orders', {
+      const body = {
         customerId,
         date,
         memo: memo || undefined,
+        ...shippingPayload(ship),
         lines: validLines.map((l) => ({
+          ...(l.id ? { id: l.id } : {}),
+          itemId: l.itemId || null,
           description: l.description || null,
           quantity: l.quantity,
-          rate: l.rate,
+          // Blank rate on an item line: the server prices it (advanced pricing).
+          rate: l.rate === '' ? null : l.rate,
         })),
-      });
-      toast('Sales order created.', 'success');
+      };
+      if (editing) {
+        await api.patch(`/api/sales-orders/${editing.id}`, body);
+        toast(`Sales Order #${editing.orderNumber} updated.`, 'success');
+      } else {
+        await api.post('/api/sales-orders', body);
+        toast('Sales order created.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
@@ -180,12 +214,13 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
     <Modal
       open={open}
       onClose={onClose}
-      title="New Sales Order"
+      title={editing ? `Edit Sales Order #${editing.orderNumber}` : 'New Sales Order'}
+      size="xl"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
-            Create Sales Order
+            {editing ? 'Save Changes' : 'Create Sales Order'}
           </Button>
         </>
       }
@@ -229,65 +264,23 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
           />
         </div>
 
-        {/* Line items */}
+        <ShippingSection value={ship} onChange={setShip} idPrefix="so-ship" />
+
+        {/* Line items (item pick -> server-side pricing) */}
         <div>
-          <div className="flex items-center justify-between mb-2">
-            <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
-              <PlusCircle className="h-4 w-4" /> Add line
-            </button>
-          </div>
-
-          <div className="rounded-lg border border-slate-200 overflow-hidden">
-            <div className="grid grid-cols-[1fr_80px_90px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
-              <span>Description</span>
-              <span>Qty</span>
-              <span>Rate</span>
-              <span />
-            </div>
-
-            {lines.map((line, idx) => (
-              <div
-                key={idx}
-                className="grid grid-cols-[1fr_80px_90px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
-              >
-                <Input
-                  placeholder="Description"
-                  value={line.description}
-                  onChange={(e) => updateLine(idx, 'description', e.target.value)}
-                />
-                <Input
-                  placeholder="1"
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={line.quantity}
-                  onChange={(e) => updateLine(idx, 'quantity', e.target.value)}
-                />
-                <Input
-                  placeholder="0.00"
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={line.rate}
-                  onChange={(e) => updateLine(idx, 'rate', e.target.value)}
-                />
-                <button
-                  type="button"
-                  onClick={() => removeLine(idx)}
-                  disabled={lines.length === 1}
-                  className="text-navy/30 hover:text-red-500 disabled:opacity-20 transition-colors flex items-center justify-center"
-                  aria-label="Remove line"
-                >
-                  <MinusCircle className="h-4 w-4" />
-                </button>
-              </div>
-            ))}
-          </div>
+          <Label className="mb-2">Line Items</Label>
+          {editing && editing.status === 'partial' && (
+            <p className="mb-2 text-xs text-amber-700">
+              Some lines are already invoiced. Keep those lines, and don&apos;t lower their quantity below what
+              has been invoiced.
+            </p>
+          )}
+          <PricedLinesEditor
+            items={items}
+            lines={lines}
+            onChange={setLines}
+            header={{ customerId: customerId || null, date }}
+          />
         </div>
 
         {/* Live total */}
@@ -328,6 +321,7 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [qtyNow, setQtyNow] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+  const creditLimit = useCreditLimitConfirm();
 
   useEffect(() => {
     if (!open || !order) {
@@ -394,7 +388,10 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
 
     setSaving(true);
     try {
-      await api.post(`/api/sales-orders/${order.id}`, { action: 'convert', lines: plan });
+      const done = await creditLimit.run((override) =>
+        api.post(`/api/sales-orders/${order.id}`, { action: 'convert', lines: plan, overrideCreditLimit: override }),
+      );
+      if (done === undefined) return;
       const fully = lines.every(
         (l) => (parseFloat(qtyNow[l.id]) || 0) >= remainingOf(l),
       );
@@ -495,6 +492,7 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
           </div>
         </div>
       )}
+      {creditLimit.dialog}
     </Modal>
   );
 }
@@ -506,11 +504,22 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
 export default function SalesOrdersPage() {
   const [orders, setOrders] = useState<SalesOrder[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [items, setItems] = useState<PricedLineItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
 
   // Invoice (convert) state
   const [invoiceTarget, setInvoiceTarget] = useState<SalesOrder | null>(null);
+  // Edit state (wave2 sales C1)
+  const [editTarget, setEditTarget] = useState<SalesOrderDetail | null>(null);
+
+  async function openEdit(order: SalesOrder) {
+    try {
+      setEditTarget(await api.get<SalesOrderDetail>(`/api/sales-orders/${order.id}`));
+    } catch (err: unknown) {
+      toast(err instanceof Error ? err.message : 'Could not open the sales order.', 'danger');
+    }
+  }
 
   const customerMap = Object.fromEntries(customers.map((c) => [c.id, c.displayName]));
 
@@ -523,6 +532,12 @@ export default function SalesOrdersPage() {
       ]);
       setOrders(orderList);
       setCustomers(custList);
+      api
+        .get<{ items: PricedLineItem[] }>('/api/items')
+        .then((r) => setItems(r.items ?? []))
+        .catch(() => {
+          // Non-fatal; lines can still be typed without an item.
+        });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to load sales orders.';
       toast(msg, 'danger');
@@ -541,9 +556,16 @@ export default function SalesOrdersPage() {
         title="Sales Orders"
         icon={FileCheck}
         action={
-          <Button onClick={() => setShowNew(true)}>
-            <Plus className="h-4 w-4" /> New Sales Order
-          </Button>
+          <div className="flex items-center gap-2">
+            <Link href="/so-fulfillment">
+              <Button variant="secondary">
+                <PackageCheck className="h-4 w-4" /> Fulfillment Worksheet
+              </Button>
+            </Link>
+            <Button onClick={() => setShowNew(true)}>
+              <Plus className="h-4 w-4" /> New Sales Order
+            </Button>
+          </div>
         }
       />
 
@@ -589,6 +611,18 @@ export default function SalesOrdersPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex items-center justify-end gap-1">
+                      <FormSendButtons kind="sales_order" id={order.id} />
+                      {(order.status === 'open' || order.status === 'partial') && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title="Edit sales order"
+                          aria-label="Edit sales order"
+                          onClick={() => openEdit(order)}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                       {(order.status === 'open' || order.status === 'partial') && (
                         <Button
                           variant="ghost"
@@ -664,9 +698,14 @@ export default function SalesOrdersPage() {
       )}
 
       <NewOrderModal
-        open={showNew}
-        onClose={() => setShowNew(false)}
+        open={showNew || !!editTarget}
+        editing={editTarget}
+        onClose={() => {
+          setShowNew(false);
+          setEditTarget(null);
+        }}
         customers={customers}
+        items={items}
         onCreated={fetchData}
       />
 

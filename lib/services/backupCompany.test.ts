@@ -36,6 +36,10 @@ import {
   restoreBackup,
   restoreCompanyBackup,
 } from './backup';
+import { createVendor } from './vendors';
+import { vendors } from '@/lib/db/schema';
+import AdmZip from 'adm-zip';
+import { builtinRole, unionRoles } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-backup-company');
 
@@ -231,5 +235,33 @@ describe('per-company backup/restore', () => {
       .from(companies)
       .where(eq(companies.id, again.companyId));
     expect(rows).toHaveLength(1);
+  });
+
+  it('an export for a role without the sensitive flags is masked, and restores without fake TINs', async () => {
+    await createVendor(ctxA, { displayName: 'Sole Prop Sam', taxId: '123-45-6789' });
+    const access = unionRoles([builtinRole('external_accountant')!]);
+    expect(access.flags.sensitivePayroll).toBe(false);
+
+    const { buffer } = await createCompanyBackup(db, companyAId, { access });
+    const zip = new AdmZip(buffer);
+    const text = zip.getEntries().map((e) => zip.readAsText(e)).join('\n');
+    expect(text).toContain('Sole Prop Sam');
+    expect(text).not.toContain('123-45-6789');
+    expect(text).toContain('***-**-6789');
+    expect(JSON.parse(zip.readAsText('bookkeeper-manifest.json')).redacted).toBe(true);
+
+    const restored = await restoreCompanyBackup(db, buffer, { ownerId: userId, name: 'Redacted Copy' });
+    const [v] = await db
+      .select()
+      .from(vendors)
+      .where(eq(vendors.companyId, restored.companyId));
+    expect(v.displayName).toBe('Sole Prop Sam');
+    expect(v.taxId).toBeNull(); // the masked placeholder is never stored as a TIN
+
+    // Admin (both flags) gets the full value and an unredacted manifest.
+    const admin = unionRoles([builtinRole('admin')!]);
+    const full = new AdmZip((await createCompanyBackup(db, companyAId, { access: admin })).buffer);
+    expect(full.getEntries().map((e) => full.readAsText(e)).join('\n')).toContain('123-45-6789');
+    expect(JSON.parse(full.readAsText('bookkeeper-manifest.json')).redacted).toBeUndefined();
   });
 });

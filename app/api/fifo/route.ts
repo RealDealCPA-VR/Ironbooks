@@ -5,10 +5,14 @@
  * POST body shapes:
  *   { action: 'receive', itemId, quantity, unitCost, date, memo? }
  *   { action: 'consume', itemId, quantity, date, memo? }
+ * Both accept optional Advanced Inventory fields { siteId?, binId?, serialNumbers?, lotNumber?,
+ * lotExpiration? } and run through adjustQuantityAtSite (costing 'fifo'), so the movement is
+ * recorded at the right site and serial/lot rules are enforced.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { receiveStock, consumeStock, fifoValuation } from '@/lib/services/fifo';
+import { fifoValuation } from '@/lib/services/fifo';
+import { adjustQuantityAtSite } from '@/lib/services/inventorySiteOps';
 import { ServiceError } from '@/lib/services/_base';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
@@ -24,6 +28,17 @@ function serviceErrorToResponse(err: ServiceError): NextResponse {
   };
   const status = statusMap[err.code] ?? 500;
   return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+/** Optional Advanced Inventory fields from the raw body. */
+function siteFields(body: Record<string, unknown>) {
+  return {
+    siteId: typeof body.siteId === 'string' ? body.siteId : null,
+    binId: typeof body.binId === 'string' ? body.binId : null,
+    serialNumbers: Array.isArray(body.serialNumbers) ? body.serialNumbers.map(String) : null,
+    lotNumber: typeof body.lotNumber === 'string' ? body.lotNumber : null,
+    lotExpiration: typeof body.lotExpiration === 'string' ? new Date(body.lotExpiration) : null,
+  };
 }
 
 // ── GET /api/fifo ─────────────────────────────────────────────────────────────
@@ -77,12 +92,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
 
-      const result = await receiveStock(ctx, {
+      const result = await adjustQuantityAtSite(ctx, {
+        ...siteFields(body),
         itemId,
-        quantity,
+        quantityChange: quantity,
         unitCost,
         date: new Date(date),
         memo: memo ?? null,
+        costing: 'fifo',
       });
 
       return NextResponse.json(result, { status: 201 });
@@ -106,11 +123,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
 
-      const result = await consumeStock(ctx, {
+      const result = await adjustQuantityAtSite(ctx, {
+        ...siteFields(body),
         itemId,
-        quantity,
+        quantityChange: `-${String(quantity).replace(/^-/, '')}`,
         date: new Date(date),
         memo: memo ?? null,
+        costing: 'fifo',
       });
 
       return NextResponse.json(result, { status: 201 });

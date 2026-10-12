@@ -29,6 +29,8 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
+import Link from 'next/link';
+import { Help } from '@/components/Help';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -53,8 +55,21 @@ interface Item {
   incomeAccountId: string | null;
   expenseAccountId: string | null;
   assetAccountId: string | null;
+  barcode?: string | null;
+  trackingMode?: string | null;
+  weight?: string | null;
+  preferredVendorId?: string | null;
+  salesTaxCodeId?: string | null;
+  uomSetId?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Wave-2 lists: pick-list entries (vendors, sales tax codes, U/M sets). */
+interface PickOption {
+  id: string;
+  label: string;
+  taxable?: boolean;
 }
 
 interface Account {
@@ -77,6 +92,17 @@ interface FormState {
   incomeAccountId: string;
   expenseAccountId: string;
   assetAccountId: string;
+  // Advanced Inventory
+  barcode: string;
+  trackingMode: 'none' | 'serial' | 'lot';
+  weight: string;
+  // Wave-2 lists
+  preferredVendorId: string;
+  salesTaxCodeId: string;
+  uomSetId: string;
+  openingQuantity: string;
+  openingValue: string;
+  openingAsOf: string;
 }
 
 const EMPTY_FORM: FormState = {
@@ -92,6 +118,15 @@ const EMPTY_FORM: FormState = {
   incomeAccountId: '',
   expenseAccountId: '',
   assetAccountId: '',
+  barcode: '',
+  trackingMode: 'none',
+  weight: '',
+  preferredVendorId: '',
+  salesTaxCodeId: '',
+  uomSetId: '',
+  openingQuantity: '',
+  openingValue: '',
+  openingAsOf: '',
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -136,6 +171,25 @@ function ItemsPageContent() {
   const [editingItem, setEditingItem] = useState<Item | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
+
+  // Pick lists for preferred vendor, sales tax code and U/M set (wave-2 lists)
+  const [vendorOptions, setVendorOptions] = useState<PickOption[]>([]);
+  const [taxCodeOptions, setTaxCodeOptions] = useState<PickOption[]>([]);
+  const [uomOptions, setUomOptions] = useState<PickOption[]>([]);
+  useEffect(() => {
+    api
+      .get<Array<{ id: string; displayName: string }>>('/api/vendors')
+      .then((v) => setVendorOptions(v.map((x) => ({ id: x.id, label: x.displayName }))))
+      .catch(() => {});
+    api
+      .get<{ entries: Array<{ id: string; code: string; taxable: boolean }> }>('/api/lists/sales-tax-codes')
+      .then((d) => setTaxCodeOptions(d.entries.map((x) => ({ id: x.id, label: x.code, taxable: x.taxable }))))
+      .catch(() => {});
+    api
+      .get<{ sets: Array<{ id: string; name: string; baseUnitName: string }> }>('/api/uom-sets')
+      .then((d) => setUomOptions(d.sets.map((x) => ({ id: x.id, label: `${x.name} (${x.baseUnitName})` }))))
+      .catch(() => {});
+  }, []);
 
   // Deactivate confirmation
   const [confirmItem, setConfirmItem] = useState<Item | null>(null);
@@ -190,6 +244,15 @@ function ItemsPageContent() {
       incomeAccountId: item.incomeAccountId ?? '',
       expenseAccountId: item.expenseAccountId ?? '',
       assetAccountId: item.assetAccountId ?? '',
+      barcode: item.barcode ?? '',
+      trackingMode: (item.trackingMode as FormState['trackingMode']) ?? 'none',
+      weight: item.weight != null ? String(Number(item.weight)) : '',
+      preferredVendorId: item.preferredVendorId ?? '',
+      salesTaxCodeId: item.salesTaxCodeId ?? '',
+      uomSetId: item.uomSetId ?? '',
+      openingQuantity: '',
+      openingValue: '',
+      openingAsOf: '',
     });
     setModalOpen(true);
   }
@@ -232,6 +295,20 @@ function ItemsPageContent() {
       expenseAccountId: noAccounts ? null : form.expenseAccountId || null,
       assetAccountId:
         form.type === 'inventory' ? form.assetAccountId || null : null,
+      barcode: form.barcode.trim() || null,
+      trackingMode: form.type === 'inventory' ? form.trackingMode : 'none',
+      weight: form.weight.trim() || null,
+      preferredVendorId: form.preferredVendorId || null,
+      salesTaxCodeId: form.salesTaxCodeId || null,
+      uomSetId: form.uomSetId || null,
+      // Opening quantity on hand: new inventory items only (posts vs Opening Balance Equity).
+      ...(!editingItem && form.type === 'inventory' && form.openingQuantity.trim()
+        ? {
+            openingQuantity: form.openingQuantity.trim(),
+            openingValue: form.openingValue.trim() || null,
+            openingAsOf: form.openingAsOf ? new Date(form.openingAsOf).toISOString() : undefined,
+          }
+        : {}),
     };
 
     setSaving(true);
@@ -288,6 +365,12 @@ function ItemsPageContent() {
             >
               <Download className="h-4 w-4" /> Export CSV
             </Button>
+            <Link href="/lists/item-prices">
+              <Button variant="secondary" title="Raise or lower many prices at once">Change Prices</Button>
+            </Link>
+            <Link href="/lists/multiple?list=items">
+              <Button variant="secondary" title="Add or edit many items at once (paste from Excel)">Add/Edit Multiple</Button>
+            </Link>
             <Button onClick={openCreate}>
               <Plus className="h-4 w-4" /> Add Item
             </Button>
@@ -469,14 +552,29 @@ function ItemsPageContent() {
             </p>
           )}
 
-          <div>
-            <Label htmlFor="item-sku">SKU / Product Code</Label>
-            <Input
-              id="item-sku"
-              value={form.sku}
-              onChange={(e) => setField('sku', e.target.value)}
-              placeholder="Optional"
-            />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="item-sku">SKU / Product Code</Label>
+              <Input
+                id="item-sku"
+                value={form.sku}
+                onChange={(e) => setField('sku', e.target.value)}
+                placeholder="Optional"
+              />
+            </div>
+            <div>
+              <Label htmlFor="item-barcode">Barcode</Label>
+              <Input
+                id="item-barcode"
+                value={form.barcode}
+                onChange={(e) => setField('barcode', e.target.value)}
+                onKeyDown={(e) => {
+                  // A keyboard-wedge scanner ends with Enter — keep it from submitting the form.
+                  if (e.key === 'Enter') e.preventDefault();
+                }}
+                placeholder="Scan or type (optional)"
+              />
+            </div>
           </div>
 
           <div>
@@ -585,6 +683,111 @@ function ItemsPageContent() {
                   onChange={(e) => setField('reorderPoint', e.target.value)}
                   placeholder="e.g. 10"
                 />
+              </div>
+            </div>
+          )}
+
+          {form.type === 'inventory' && (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="item-tracking">Serial / Lot Tracking</Label>
+                <Select
+                  id="item-tracking"
+                  value={form.trackingMode}
+                  disabled={!!editingItem && Number(editingItem.quantityOnHand ?? 0) !== 0}
+                  onChange={(e) => setField('trackingMode', e.target.value as FormState['trackingMode'])}
+                >
+                  <option value="none">None</option>
+                  <option value="serial">Serial numbers (one per unit)</option>
+                  <option value="lot">Lot numbers (with expiration)</option>
+                </Select>
+                {!!editingItem && Number(editingItem.quantityOnHand ?? 0) !== 0 && (
+                  <p className="mt-1 text-xs text-navy/50">Can only change while nothing is on hand.</p>
+                )}
+              </div>
+              <div>
+                <Label htmlFor="item-weight">Unit Weight</Label>
+                <Input
+                  id="item-weight"
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={form.weight}
+                  onChange={(e) => setField('weight', e.target.value)}
+                  placeholder="For landed cost by weight"
+                />
+              </div>
+            </div>
+          )}
+
+          {form.type !== 'subtotal' && form.type !== 'payment' && (
+            <div className="grid grid-cols-3 gap-4">
+              <div>
+                <Label htmlFor="item-pref-vendor">Preferred vendor</Label>
+                <Select id="item-pref-vendor" value={form.preferredVendorId} onChange={(e) => setField('preferredVendorId', e.target.value)}>
+                  <option value="">—</option>
+                  {vendorOptions.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.label}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div>
+                <Label htmlFor="item-tax-code">Sales tax code</Label>
+                <Select
+                  id="item-tax-code"
+                  value={form.salesTaxCodeId}
+                  onChange={(e) => {
+                    setField('salesTaxCodeId', e.target.value);
+                    const code = taxCodeOptions.find((t) => t.id === e.target.value);
+                    if (code) setField('taxable', !!code.taxable);
+                  }}
+                >
+                  <option value="">—</option>
+                  {taxCodeOptions.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.label} — {t.taxable ? 'taxable' : 'not taxable'}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div>
+                <Label htmlFor="item-uom">Unit of measure set</Label>
+                <Select id="item-uom" value={form.uomSetId} onChange={(e) => setField('uomSetId', e.target.value)}>
+                  <option value="">Single unit</option>
+                  {uomOptions.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.label}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            </div>
+          )}
+
+          {!editingItem && form.type === 'inventory' && (
+            <div className="rounded-lg border border-slate-200 p-3">
+              <p className="mb-2 text-sm font-semibold text-navy">
+                Already have some in stock? <Help term="opening-balance-equity" />
+              </p>
+              <p className="mb-3 text-xs text-navy/60">
+                Enter what you have on hand and what it is worth. It is added to your inventory value with the other side
+                recorded in Opening Balance Equity.
+              </p>
+              <div className="grid grid-cols-3 gap-4">
+                <div>
+                  <Label htmlFor="item-open-qty">Quantity on hand</Label>
+                  <Input id="item-open-qty" type="number" min="0" step="any" value={form.openingQuantity} onChange={(e) => setField('openingQuantity', e.target.value)} />
+                </div>
+                <div>
+                  <Label htmlFor="item-open-value">Total value</Label>
+                  <Input id="item-open-value" type="number" min="0" step="0.01" value={form.openingValue} onChange={(e) => setField('openingValue', e.target.value)} />
+                </div>
+                <div>
+                  <Label htmlFor="item-open-asof">As of</Label>
+                  <Input id="item-open-asof" type="date" value={form.openingAsOf} onChange={(e) => setField('openingAsOf', e.target.value)} />
+                </div>
               </div>
             </div>
           )}

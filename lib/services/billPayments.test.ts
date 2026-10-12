@@ -70,6 +70,7 @@ describe('Bill Payments (A/P) — end-to-end', () => {
     // Create a bill via the GL directly (simulating what the bills service does):
     // Dr Expense 5000, Cr A/P 2000 — $500 bill
     const entry = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-03-01'),
       description: 'Bill: office supplies',
       lines: [
@@ -145,6 +146,7 @@ describe('Bill Payments (A/P) — end-to-end', () => {
       .values({ companyId: ctx.companyId, displayName: 'Wrong Vendor' })
       .returning();
     const e2 = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-03-02'),
       description: 'Bill: wrong vendor',
       lines: [
@@ -231,6 +233,7 @@ describe('Bill Payments (A/P) — end-to-end', () => {
   it('supports partial bill payment', async () => {
     // Create a second bill for $300
     const e3 = await postJournalEntry(ctx, {
+      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
       date: new Date('2025-04-01'),
       description: 'Bill: partial test',
       lines: [

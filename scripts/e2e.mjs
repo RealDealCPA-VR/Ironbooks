@@ -1,7 +1,8 @@
 /**
  * End-to-end smoke test against the built standalone server.
- * Spawns the production server on a throwaway local DB, runs a full business workflow through the
- * HTTP API (auth → master data → invoice → payment → reports), asserts invariants, and tears down.
+ * Spawns the production server on a throwaway local DB, checks first-run page redirects, runs a
+ * full business workflow through the HTTP API (auth → master data → invoice → payment → reports),
+ * asserts invariants, and tears down.
  *
  * Usage: npm run build && npm run test:e2e
  */
@@ -75,6 +76,15 @@ async function main() {
   if (!(await waitUp())) throw new Error('server did not start');
   console.log('E2E: full accounting workflow');
 
+  // First-run page boot with no cookies: the unlock gate must fire before the login gate, and
+  // /unlock must render without a session (regression guard for the /unlock ↔ /login redirect loop).
+  const home = await fetch(`${BASE}/`, { redirect: 'manual' });
+  assert(home.status >= 300 && home.status < 400 && (home.headers.get('location') || '').includes('/unlock'), 'GET / redirects to /unlock');
+  const unlock = await fetch(`${BASE}/unlock`, { redirect: 'manual' });
+  assert(unlock.status === 200, 'GET /unlock renders without a session');
+  const login = await fetch(`${BASE}/login`, { redirect: 'manual' });
+  assert(login.status >= 300 && login.status < 400 && (login.headers.get('location') || '').includes('/unlock'), 'GET /login redirects to /unlock (unlock gate precedes login gate)');
+
   const signup = await call('POST', '/api/auth/signup', {
     name: 'E2E', email: 'e2e@test.local', password: 'secret123', companyName: 'E2E Co',
   });
@@ -83,6 +93,9 @@ async function main() {
   const accounts = (await call('GET', '/api/accounts')).data;
   assert(Array.isArray(accounts) && accounts.length >= 20, `seeded chart of accounts (${accounts.length})`);
   const income = accounts.find((a) => a.code === '4000');
+
+  const agencies = await call('GET', '/api/tax-agencies');
+  assert(agencies.status >= 200 && agencies.status < 300 && Array.isArray(agencies.data), 'tax agencies list returns');
 
   const customer = (await call('POST', '/api/customers', { displayName: 'E2E Customer' })).data;
   assert(customer.id, 'create customer');

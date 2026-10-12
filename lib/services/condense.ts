@@ -30,6 +30,7 @@
  * the company closing date), and writes BOTH a rotating pre-op backup and a
  * permanent archive .bka snapshot before touching a single row.
  */
+import AdmZip from 'adm-zip';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -67,8 +68,10 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { allowLedgerRewrite } from './posting';
 import { assertWrite } from './rbac';
-import { createBackup, ensurePreOpBackup } from './backup';
+import { BACKUP_MANIFEST_ENTRY, createBackup, ensurePreOpBackup, restoreBackup } from './backup';
+import { logTransaction } from './transactionLog';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -441,6 +444,8 @@ export async function condensePeriod(
   }
 
   // --- Snapshots FIRST: rotating pre-op backup + permanent archive copy. ---
+  // QB Desktop parity: a complete archive copy of the file is written (and verified readable)
+  // before a single row is touched. If it cannot be written, nothing is condensed.
   ensurePreOpBackup(ctx, 'condense', input.dataDir);
   const [co] = await ctx.db
     .select({ name: companies.name })
@@ -451,7 +456,50 @@ export async function condensePeriod(
   const runId = randomUUID();
   const deletedIds = [...plan.postedIds, ...plan.voidIds];
 
+  try {
+    await runCondense(ctx, plan, preview, runId, deletedIds, archivePath);
+  } catch (err) {
+    // Nothing was condensed (the transaction rolled back) — the archive copy is not needed.
+    try {
+      fs.rmSync(archivePath, { force: true });
+    } catch {
+      /* a leftover archive is harmless */
+    }
+    throw err;
+  }
+
+  // Record the archive copy so the Backup page can offer "Restore archive copy".
+  recordCondenseArchive({
+    id: runId,
+    path: archivePath,
+    filename: path.basename(archivePath),
+    createdAt: new Date().toISOString(),
+    dataDir: resolveDataDir(input.dataDir),
+    companyId: ctx.companyId,
+    companyName: co?.name ?? null,
+    beforeDate: preview.beforeDate,
+    entriesCondensed: preview.entriesToCondense,
+    sizeBytes: fs.statSync(archivePath).size,
+  });
+
+  return { ...preview, dryRun: false, archivePath, runId };
+}
+
+/** The destructive part of condensePeriod, in one transaction. */
+async function runCondense(
+  ctx: ServiceContext,
+  plan: CondensePlan,
+  preview: CondensePreview,
+  runId: string,
+  deletedIds: string[],
+  archivePath: string,
+): Promise<void> {
   await inTransaction(ctx, async (tx) => {
+    // Condense is a sanctioned ledger rewrite: it deletes posted lines/entries and replaces
+    // them with summaries. The DB still verifies every summary balances at COMMIT, and the
+    // balance triggers net the deletes against the inserts (zero change per account).
+    await allowLedgerRewrite(tx, 'condense');
+
     // a) Completed-reconciliation detail rows pointing at removed lines.
     //    (In-progress reconciliations protected their entries in computePlan.)
     for (const idChunk of chunks(plan.lineIds)) {
@@ -502,9 +550,8 @@ export async function condensePeriod(
     }
 
     // e) Insert the monthly summary entries DIRECTLY (not via postJournalEntry):
-    //    the period is closed by design, and the cached account balances must
-    //    NOT be re-applied — the summaries replace exactly what was deleted, so
-    //    the net change to every account (and to accounts.balance) is zero.
+    //    the period is closed by design. The summaries replace exactly what was
+    //    deleted, so the trigger-maintained accounts.balance nets to zero change.
     const [maxRow] = await tx.db
       .select({ max: sql<number>`COALESCE(MAX(${journalEntries.entryNumber}), 0)` })
       .from(journalEntries)
@@ -536,6 +583,16 @@ export async function condensePeriod(
           })),
         );
       }
+      // Running transaction log: the summary entries are new posted entries.
+      await logTransaction(tx.db, {
+        companyId: tx.companyId,
+        userId: tx.userId,
+        action: 'create',
+        entityType: 'journal_entry',
+        entityId: entry.id,
+        summary: `Created condensed summary entry #${entry.entryNumber} for ${month.key}`,
+        data: { new: { entryNumber: entry.entryNumber, description: entry.description, lines: month.lines } },
+      });
     }
 
     // f) Audit row — condense is itself auditable.
@@ -546,8 +603,6 @@ export async function condensePeriod(
       newValues: { ...preview, archivePath },
     });
   });
-
-  return { ...preview, dryRun: false, archivePath, runId };
 }
 
 /**
@@ -557,9 +612,111 @@ export async function condensePeriod(
 function writeCondenseArchive(companyName: string | undefined, dataDir?: string): string {
   const dir = resolveDataDir(dataDir);
   const { buffer, filename } = createBackup(companyName, dir);
-  const outDir = path.join(path.dirname(dir), 'archives');
+  const outDir = condenseArchiveDir(dir);
   fs.mkdirSync(outDir, { recursive: true });
   const outPath = path.join(outDir, filename.replace(/^bookkeeper-backup/, 'condense-archive'));
   fs.writeFileSync(outPath, buffer);
+
+  // Verify the archive on disk is a complete, readable copy before anything is deleted.
+  try {
+    const zip = new AdmZip(fs.readFileSync(outPath));
+    const entries = zip.getEntries();
+    const names = new Set(entries.map((e) => e.entryName.replace(/\\/g, '/')));
+    const fileEntries = entries.filter((e) => !e.isDirectory).length - 1; // minus the manifest
+    if (!names.has('PG_VERSION') || !names.has(BACKUP_MANIFEST_ENTRY) || fileEntries < countFiles(dir)) {
+      throw new Error('archive is incomplete');
+    }
+    // Force a full read of every entry (CRC-checked by adm-zip) so a truncated write fails here.
+    for (const e of entries) if (!e.isDirectory) e.getData();
+  } catch (err) {
+    fs.rmSync(outPath, { force: true });
+    throw new ServiceError(
+      'INTERNAL',
+      `Condense stopped: the archive copy could not be verified (${(err as Error).message}). Nothing was changed.`,
+    );
+  }
   return outPath;
+}
+
+function countFiles(dir: string): number {
+  let n = 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    n += entry.isDirectory() ? countFiles(path.join(dir, entry.name)) : 1;
+  }
+  return n;
+}
+
+// ---------------------------------------------------------------------------
+// Archive copies (QB "archive copy" written before condensing)
+// ---------------------------------------------------------------------------
+
+/** Folder holding condense archive copies: a sibling `archives` folder of the data dir. */
+export function condenseArchiveDir(dataDir?: string): string {
+  return path.join(path.dirname(resolveDataDir(dataDir)), 'archives');
+}
+
+const ARCHIVE_INDEX = 'condense-archives.json';
+
+export interface CondenseArchive {
+  /** The condense run id. */
+  id: string;
+  path: string;
+  filename: string;
+  createdAt: string;
+  /** Data dir the archive was taken from (several company files may share an archives folder). */
+  dataDir: string;
+  companyId: string;
+  companyName: string | null;
+  beforeDate: string;
+  entriesCondensed: number;
+  sizeBytes: number;
+}
+
+function readArchiveIndex(dir: string): CondenseArchive[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, ARCHIVE_INDEX), 'utf8'));
+    return Array.isArray(raw) ? (raw as CondenseArchive[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function recordCondenseArchive(entry: CondenseArchive): void {
+  const dir = path.dirname(entry.path);
+  const list = readArchiveIndex(dir).filter((a) => a.id !== entry.id);
+  list.push(entry);
+  fs.writeFileSync(path.join(dir, ARCHIVE_INDEX), JSON.stringify(list, null, 2), 'utf8');
+}
+
+/** Archive copies recorded for this company file (newest first; missing files flagged). */
+export function listCondenseArchives(dataDir?: string): Array<CondenseArchive & { available: boolean }> {
+  const dir = resolveDataDir(dataDir);
+  return readArchiveIndex(condenseArchiveDir(dir))
+    .filter((a) => path.resolve(a.dataDir) === dir)
+    .map((a) => ({ ...a, available: fs.existsSync(a.path) }))
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+/**
+ * Restore a recorded archive copy over the current company file, bringing back the full
+ * pre-condense detail. Only archives recorded in the index can be restored (never an
+ * arbitrary path). restoreBackup snapshots the current file first (pre-op backup), so the
+ * post-condense state stays recoverable too.
+ */
+export async function restoreCondenseArchive(
+  ctx: ServiceContext,
+  archiveId: string,
+  dataDir?: string,
+): Promise<{ restored: true; archive: CondenseArchive }> {
+  assertWrite(ctx);
+  if (ctx.role && ctx.role !== 'owner' && ctx.role !== 'admin') {
+    throw new ServiceError('FORBIDDEN', 'Only the company owner or an admin can restore an archive copy.');
+  }
+  const archive = listCondenseArchives(dataDir).find((a) => a.id === archiveId);
+  if (!archive) throw new ServiceError('NOT_FOUND', 'Archive copy not found.');
+  if (!archive.available) {
+    throw new ServiceError('NOT_FOUND', `The archive file is missing: ${archive.filename}`);
+  }
+  await restoreBackup(fs.readFileSync(archive.path), resolveDataDir(dataDir));
+  return { restored: true, archive };
 }

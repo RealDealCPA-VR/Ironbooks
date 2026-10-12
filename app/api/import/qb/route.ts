@@ -1,84 +1,104 @@
 /**
  * POST /api/import/qb
  *
- * Import QuickBooks data into the active company — the COMPLETE import surface
+ * Import QuickBooks data into the active company — the COMPLETE list import surface
  * (supersedes /api/qb-import, which only handled IIF lists + customer/vendor CSV).
  *
  * Body (JSON):
  *   {
- *     format:  'iif' | 'csv',
- *     kind?:   'customers' | 'vendors' | 'items' | 'accounts',  // required when format === 'csv'
- *     content: string,                                          // raw file text
- *     mapping?: Record<string, string>,                         // required when format === 'csv'
+ *     format:  'iif' | 'csv' | 'xlsx',
+ *     kind?:   'customers' | 'vendors' | 'items' | 'accounts',  // required for csv / xlsx
+ *     content?: string,                                         // raw text (iif / csv)
+ *     data?:   string,                                          // base64 bytes (xlsx)
+ *     mapping?: Record<string, string>,                         // required for csv / xlsx
+ *     preview?: boolean,                                        // xlsx: return headers + rows only
+ *     openItems?: { asDocuments: boolean, alreadyInGl?: boolean } // iif: open invoices / bills
  *   }
  *
- * IIF imports cover accounts, customers, vendors, classes, items (INVITEM),
- * employees (EMP), and TRNS/SPL transactions (posted as balanced journal
- * entries; unmatched accounts auto-created under "QB Import (review)").
+ * IIF imports cover the account hierarchy, customers (with jobs), vendors, classes, items
+ * (all QB item types, group / assembly components), employees, the other lists in the import
+ * registry (deferred lists come back under `deferred`) and TRNS/SPL transactions.
  *
- * Response (200 JSON): ImportCounts — per-entity created counts, skipped, and a
- * per-row `issues` array explaining every skip/remap/auto-create.
+ * Response (200 JSON): ImportCounts — per-entity created counts, skipped, a per-row `issues`
+ * array explaining every skip/remap/auto-create, and `deferred` lists.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
 import {
   importAccountsCSV,
   importCustomersCSV,
   importIIF,
   importItemsCSV,
+  importListXlsx,
   importVendorsCSV,
+  xlsxRows,
+  type ListImportKind,
 } from '@/lib/services/qbImport';
-import { ServiceError } from '@/lib/services/_base';
+import { routeError } from '@/lib/routeErrors';
 
-const CSV_KINDS = ['customers', 'vendors', 'items', 'accounts'] as const;
-type CsvKind = (typeof CSV_KINDS)[number];
+const LIST_KINDS = ['customers', 'vendors', 'items', 'accounts'] as const;
 
-function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'CONFLICT' ? 409
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
-  }
-  console.error('[import/qb] unexpected error:', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+function decodeBase64(data: string): Uint8Array {
+  return new Uint8Array(Buffer.from(data.replace(/^data:[^,]*,/, ''), 'base64'));
 }
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json()) as {
-      format: string;
+    const body = (await req.json().catch(() => ({}))) as {
+      format?: string;
       kind?: string;
-      content: string;
+      content?: string;
+      data?: string;
       mapping?: Record<string, string>;
+      preview?: boolean;
+      openItems?: { asDocuments?: boolean; alreadyInGl?: boolean };
     };
-
     const { format, kind, content, mapping } = body;
 
+    if (format === 'xlsx') {
+      if (!body.data || typeof body.data !== 'string') {
+        return NextResponse.json({ error: 'data (base64 .xlsx bytes) is required.', code: 'VALIDATION' }, { status: 400 });
+      }
+      const bytes = decodeBase64(body.data);
+      if (body.preview) {
+        const { headers, rows, sheet } = xlsxRows(bytes);
+        return NextResponse.json({ headers, rows: rows.slice(0, 10), total: rows.length, sheet });
+      }
+      if (!LIST_KINDS.includes(kind as ListImportKind)) {
+        return NextResponse.json({ error: `kind must be one of: ${LIST_KINDS.join(', ')}.`, code: 'VALIDATION' }, { status: 400 });
+      }
+      await assertExclusiveAccess(ctx, 'Import');
+      return NextResponse.json(await importListXlsx(ctx, kind as ListImportKind, bytes, mapping ?? {}));
+    }
+
     if (!content || typeof content !== 'string') {
+      return NextResponse.json({ error: 'content is required and must be a string.', code: 'VALIDATION' }, { status: 400 });
+    }
+
+    // QuickBooks list/transaction import: owner/admin, single-user while others are on.
+    await assertExclusiveAccess(ctx, 'Import');
+
+    if (format === 'iif') {
       return NextResponse.json(
-        { error: 'content is required and must be a string.' },
-        { status: 400 },
+        await importIIF(ctx, content, {
+          openItems: body.openItems?.asDocuments
+            ? { asDocuments: true, alreadyInGl: body.openItems.alreadyInGl !== false }
+            : undefined,
+        }),
       );
     }
 
-    if (format === 'iif') {
-      return NextResponse.json(await importIIF(ctx, content));
-    }
-
     if (format === 'csv') {
-      if (!CSV_KINDS.includes(kind as CsvKind)) {
+      if (!LIST_KINDS.includes(kind as ListImportKind)) {
         return NextResponse.json(
-          { error: `For CSV imports, kind must be one of: ${CSV_KINDS.join(', ')}.` },
+          { error: `For CSV imports, kind must be one of: ${LIST_KINDS.join(', ')}.`, code: 'VALIDATION' },
           { status: 400 },
         );
       }
       const colMapping = (mapping ?? {}) as Record<string, string>;
-      switch (kind as CsvKind) {
+      switch (kind as ListImportKind) {
         case 'customers':
           return NextResponse.json(await importCustomersCSV(ctx, content, colMapping));
         case 'vendors':
@@ -90,8 +110,8 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    return NextResponse.json({ error: 'format must be "iif" or "csv".' }, { status: 400 });
+    return NextResponse.json({ error: 'format must be "iif", "csv" or "xlsx".', code: 'VALIDATION' }, { status: 400 });
   } catch (err) {
-    return errorResponse(err);
+    return routeError(err, 'import/qb');
   }
 }

@@ -177,7 +177,7 @@ describe('Recurring templates service', () => {
     await expect(
       createTemplate(ctx, {
         name: 'Bad',
-        docType: 'purchase_order' as never,
+        docType: 'wire_transfer' as never,
         frequency: 'monthly',
         nextRunDate: new Date(),
         template: {},
@@ -190,7 +190,7 @@ describe('Recurring templates service', () => {
       createTemplate(ctx, {
         name: 'Bad2',
         docType: 'bill',
-        frequency: 'biweekly' as never,
+        frequency: 'hourly' as never,
         nextRunDate: new Date(),
         template: {},
       }),

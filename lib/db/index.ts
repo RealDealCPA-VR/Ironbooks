@@ -15,6 +15,8 @@ import { PGlite } from '@electric-sql/pglite';
 import path from 'node:path';
 import fs from 'node:fs';
 import * as schema from './schema';
+import { instrumentDb } from './txHooks';
+import { translatePgErrors } from './pgErrors';
 
 export type DB = PgliteDatabase<typeof schema>;
 
@@ -46,8 +48,12 @@ export function openDb(dataDir?: string): DbHandle {
   if (existing) return existing;
 
   fs.mkdirSync(dir, { recursive: true });
-  const client = new PGlite(dir);
+  // Postgres data errors (malformed uuid 22P02, numeric overflow 22003) become ServiceErrors for
+  // every query, so bad input answers 4xx instead of 500 (lib/db/pgErrors.ts).
+  const client = translatePgErrors(new PGlite(dir));
   const db = drizzle(client, { schema });
+  // Commit tracking for the running transaction log (appends only after COMMIT).
+  instrumentDb(db, dir);
 
   const migrated = (async () => {
     // Only migrate if a migrations folder has been generated. In early dev before

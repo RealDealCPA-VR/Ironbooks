@@ -10,10 +10,22 @@
  *
  * CONVERSION METHOD (Balance Sheet indirect adjustment)
  * ──────────────────────────────────────────────────────
- * 1. Start from the standard accrual Balance Sheet (balanceSheet from reports.ts).
- * 2. Remove every line whose COA code is 1200 (AR) from the assets section.
- * 3. Remove every line whose COA code is 2000 (AP) from the liabilities section.
- * 4. Reduce total equity by (arRemoved − apRemoved) to keep Assets = Liabilities + Equity.
+ * 1. Start from the standard accrual Balance Sheet (balanceSheet from reports.ts), which is
+ *    itself balanced by construction from the posted ledger.
+ * 2. Remove every Accounts Receivable account from the assets section: subtype
+ *    'accounts_receivable', legacy code 1200, or Retainage Receivable (1250, an Other Current Asset).
+ * 3. Remove every Accounts Payable account from the liabilities section: code 2000, or subtype
+ *    'accounts_payable' whose name says "Accounts Payable" (the subtype alone is not trusted —
+ *    it is the default for any liability created without a subtype, e.g. a loan).
+ * 4. Reduce Retained Earnings / net income by (arRemoved − apRemoved): that difference is
+ *    exactly the earnings recognised on accrual but not yet realised in cash.
+ *
+ * BALANCED BY CONSTRUCTION — THE ONLY PLUG
+ * ────────────────────────────────────────
+ * The single plug (equityAdjustment) is computed from the SAME ledger-derived AR/AP balances
+ * that were removed, never from a difference of report totals, so it cannot hide a ledger
+ * error: if the accrual sheet balances (asserted), the cash sheet balances identically.
+ * `assertBalanceSheetBalanced` re-checks the result and throws a loud INTEGRITY error otherwise.
  *
  * WHY THIS KEEPS THE EQUATION BALANCED
  * ──────────────────────────────────────
@@ -24,14 +36,30 @@
  *
  * In practice most companies carry AR > 0 and AP > 0 so cash-basis equity is lower than
  * accrual equity (unreceived revenue is excluded from both sides).
+ *
+ * CONSISTENCY WITH THE CASH-BASIS P&L
+ * ───────────────────────────────────
+ * A/R and A/P are identified by the shared classifier in cashBasisClassify.ts, which the
+ * cash-basis P&L (cashBasisReports.ts) also uses, so cash-basis retained earnings + net
+ * income on this sheet always equal cash-basis net income to date.
+ *
+ * KNOWN DIFFERENCE FROM QUICKBOOKS DESKTOP (documented, deliberate for now)
+ * ─────────────────────────────────────────────────────────────────────────
+ * This whole-account method attributes the ENTIRE open A/R − A/P to earnings. When an unpaid
+ * invoice/bill also hits a balance-sheet account — sales tax payable, inventory bought on
+ * credit, retainage — that portion lands in cash-basis earnings (e.g. unpaid sales tax shows
+ * as negative earnings while Sales Tax Payable stays on the sheet). QuickBooks Desktop instead
+ * reverses only the P&L-affecting share of each open transaction, leaving the balance-sheet
+ * share in A/R / A/P. Both methods balance; QBD's per-transaction allocation is a parity
+ * follow-up and must keep this sheet and the cash-basis P&L on the same classifier.
  */
+import { eq } from 'drizzle-orm';
+import { accounts } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { assertBalanceSheetBalanced } from './ledgerAssert';
 import { balanceSheet, type ReportLine } from './reports';
-
-// ---- COA codes for the mandatory adjustments ----
-const AR_CODE = '1200'; // Accounts Receivable (asset, debit-normal)
-const AP_CODE = '2000'; // Accounts Payable     (liability, credit-normal)
+import { isPayable, isReceivable } from './cashBasisClassify';
 
 /** Shape of a single AR/AP line that was removed from the accrual sheet. */
 export interface RemovedLine {
@@ -50,8 +78,13 @@ export interface BalanceSheetCashBasis {
   liabilities: ReportLine[];
   /** Equity lines from the accrual sheet (unchanged except totals). */
   equity: ReportLine[];
-  /** Retained earnings line amount (net income to date, same as accrual). */
+  /**
+   * Cash-basis retained earnings / net income to date = accrual earnings − equityAdjustment,
+   * so the equity lines plus this line add up exactly to totals.totalEquity.
+   */
   retainedEarnings: string;
+  /** The accrual-basis figure the cash one was derived from. */
+  accrualRetainedEarnings: string;
   /** Totals after the cash-basis adjustments. */
   totals: {
     totalAssets: string;
@@ -60,7 +93,7 @@ export interface BalanceSheetCashBasis {
     /** Total liabilities + equity (should equal totalAssets). */
     totalLiabilitiesAndEquity: string;
   };
-  /** True when totalAssets = totalLiabilities + totalEquity (within 1 cent). */
+  /** True when totalAssets = totalLiabilities + totalEquity (exact; asserted). */
   balanced: boolean;
   /** Date the report is computed as of (undefined = all-time). */
   asOf?: string;
@@ -97,6 +130,15 @@ export async function balanceSheetCashBasis(
 ): Promise<BalanceSheetCashBasis> {
   // 1. Fetch the accrual Balance Sheet (source of truth — do NOT re-query the GL directly).
   const accrual = await balanceSheet(ctx, asOf);
+  const meta = new Map(
+    (
+      await ctx.db
+        .select({ id: accounts.id, code: accounts.code, name: accounts.name, subtype: accounts.subtype })
+        .from(accounts)
+        .where(eq(accounts.companyId, ctx.companyId))
+    ).map((a) => [a.id, a]),
+  );
+  const describe = (l: ReportLine) => meta.get(l.accountId) ?? { code: l.code, name: l.name, subtype: '' };
 
   // 2. Separate AR lines from the rest of the assets.
   const removedArLines: RemovedLine[] = [];
@@ -104,7 +146,7 @@ export async function balanceSheetCashBasis(
   let arRemoved = Money.zero();
 
   for (const line of accrual.assets) {
-    if (line.code === AR_CODE) {
+    if (isReceivable(describe(line))) {
       removedArLines.push({ accountId: line.accountId, code: line.code, name: line.name, amount: line.amount });
       arRemoved = arRemoved.plus(Money.of(line.amount));
     } else {
@@ -118,7 +160,7 @@ export async function balanceSheetCashBasis(
   let apRemoved = Money.zero();
 
   for (const line of accrual.liabilities) {
-    if (line.code === AP_CODE) {
+    if (isPayable(describe(line))) {
       removedApLines.push({ accountId: line.accountId, code: line.code, name: line.name, amount: line.amount });
       apRemoved = apRemoved.plus(Money.of(line.amount));
     } else {
@@ -136,15 +178,19 @@ export async function balanceSheetCashBasis(
   const equityAdjustment = arRemoved.minus(apRemoved);
   const totalEquity = Money.sub(accrual.totalEquity, equityAdjustment);
   const totalLiabilitiesAndEquity = totalLiabilities.plus(totalEquity);
+  const retainedEarnings = Money.sub(accrual.retainedEarnings, equityAdjustment);
 
-  const balanced = Money.equalWithinCent(totalAssets, totalLiabilitiesAndEquity);
+  // Unreachable: the plug above is derived from the removed ledger balances themselves.
+  assertBalanceSheetBalanced('Cash-basis balance sheet', totalAssets, totalLiabilities, totalEquity);
+  const balanced = Money.eq(totalAssets, totalLiabilitiesAndEquity);
 
   return {
     basis: 'cash',
     assets: cashAssets,
     liabilities: cashLiabilities,
     equity: accrual.equity,
-    retainedEarnings: accrual.retainedEarnings,
+    retainedEarnings: toAmountString(retainedEarnings),
+    accrualRetainedEarnings: accrual.retainedEarnings,
     totals: {
       totalAssets: toAmountString(totalAssets),
       totalLiabilities: toAmountString(totalLiabilities),

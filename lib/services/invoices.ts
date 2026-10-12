@@ -43,6 +43,7 @@ import {
   jobs,
   journalEntries,
   journalEntryLines,
+  salesReps,
   taxRates,
 } from '@/lib/db/schema';
 import {
@@ -53,22 +54,39 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
+import {
+  type DocumentInventoryLine,
+  type InventoryLineDetail,
+  attachInventoryDetails,
+  postDocumentInventory,
+  reverseDocumentInventory,
+  saveDocumentInventoryDetails,
+} from './inventorySites';
+import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { allocateDocNumber, docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export interface InvoiceLineInput {
+export interface InvoiceLineInput extends InventoryLineDetail {
   /** Optional product/service item; supplies incomeAccountId as fallback. */
   itemId?: string | null;
   /** Direct income account override; takes priority over item.incomeAccountId. */
   accountId?: string | null;
   description?: string | null;
   quantity: string | number;
-  rate: string | number;
+  /**
+   * Unit price. Omit on item lines to have the server price the line (price rules / price
+   * levels / customer price / base price — lib/services/pricing.ts). A supplied rate that differs
+   * from the computed price is kept as a manual override and flagged in the line's provenance.
+   */
+  rate?: string | number | null;
+  /** Internal: where a carried-over price came from (conversions). Never sent by the UI. */
+  pricing?: { origin?: string | null } | null;
   /** Whether this line participates in tax calculation. Defaults true. */
   taxable?: boolean;
   /** Per-line tax rate override (UUID of a taxRates row). When set, this line is taxed at this
@@ -81,6 +99,13 @@ export interface InvoiceLineInput {
 }
 
 export interface CreateInvoiceInput {
+  /**
+   * Document number typed by the user (alphanumeric, e.g. "INV-1001"). Blank = the next number
+   * (QB: last number used with its trailing digits + 1). See lib/services/docNumbers.ts.
+   */
+  refNumber?: string | null;
+  /** The user confirmed the "this number is already used" warning. */
+  allowDuplicateNumber?: boolean | null;
   customerId: string;
   date: Date;
   dueDate?: Date | null;
@@ -91,6 +116,8 @@ export interface CreateInvoiceInput {
   classId?: string | null;
   /** Invoice-level Customer:Job (job costing); inherited by lines without their own jobId. */
   jobId?: string | null;
+  /** Sales rep credited with the sale (commissions; also a price-rule condition). */
+  salesRepId?: string | null;
   /**
    * Discount value. Interpretation depends on discountType:
    *   'amount'  (default) — flat dollar subtracted from subtotal.
@@ -122,6 +149,123 @@ export interface CreateInvoiceInput {
   status?: 'draft' | 'open' | null;
   /** Values for company-defined invoice custom fields ({ [fieldName]: value }). */
   customFields?: Record<string, string> | null;
+  // ---- wave2 sales: shipping (B6), send queues (C7), credit limit override (C2) ----
+  shipDate?: Date | null;
+  shipVia?: string | null;
+  fob?: string | null;
+  trackingNumber?: string | null;
+  shipTo?: Record<string, string> | null;
+  /** Customer's purchase-order number. */
+  poNumber?: string | null;
+  toBePrinted?: boolean;
+  toBeEmailed?: boolean;
+  /**
+   * The user saw the "over credit limit" warning and chose to save anyway. Without it, an
+   * invoice that pushes the customer over their credit limit is refused with a
+   * VALIDATION error whose details carry `{ warning: 'CREDIT_LIMIT' }` (shown as a confirm).
+   * The override is recorded in the audit trail.
+   */
+  overrideCreditLimit?: boolean;
+  /** Internal (statement charges, C5): mark the A/R document as a statement charge. */
+  isStatementCharge?: boolean;
+}
+
+/** Shipping + send-queue columns of an A/R document, from an input (undefined keeps `prev`). */
+export function shippingColumns(
+  input: Pick<
+    CreateInvoiceInput,
+    'shipDate' | 'shipVia' | 'fob' | 'trackingNumber' | 'shipTo' | 'poNumber' | 'toBePrinted' | 'toBeEmailed'
+  >,
+  prev?: {
+    shipDate?: Date | null;
+    shipVia?: string | null;
+    fob?: string | null;
+    trackingNumber?: string | null;
+    shipTo?: Record<string, string> | null;
+    poNumber?: string | null;
+    toBePrinted?: boolean;
+    toBeEmailed?: boolean;
+  },
+) {
+  const pick = <K extends keyof NonNullable<typeof prev>>(k: K, v: unknown) =>
+    (v !== undefined ? v : (prev?.[k] ?? null)) as never;
+  return {
+    shipDate: pick('shipDate', input.shipDate),
+    shipVia: pick('shipVia', input.shipVia?.trim() || (input.shipVia === undefined ? undefined : null)),
+    fob: pick('fob', input.fob?.trim() || (input.fob === undefined ? undefined : null)),
+    trackingNumber: pick(
+      'trackingNumber',
+      input.trackingNumber?.trim() || (input.trackingNumber === undefined ? undefined : null),
+    ),
+    shipTo: pick('shipTo', input.shipTo),
+    poNumber: pick('poNumber', input.poNumber?.trim() || (input.poNumber === undefined ? undefined : null)),
+    toBePrinted: (input.toBePrinted ?? prev?.toBePrinted ?? false) as boolean,
+    toBeEmailed: (input.toBeEmailed ?? prev?.toBeEmailed ?? false) as boolean,
+  };
+}
+
+/** Details of a credit-limit breach (warning payload / audit record). */
+export interface CreditLimitBreach {
+  warning: 'CREDIT_LIMIT';
+  creditLimit: string;
+  /** Customer's open A/R before this document (base currency). */
+  currentBalance: string;
+  /** Balance after this document is saved (base currency). */
+  newBalance: string;
+  overBy: string;
+}
+
+/**
+ * Shared credit-limit check (C2 — QB warns, it does not block). Returns the breach when
+ * `additionalBase` (base currency) pushes the customer's open A/R over their credit limit.
+ */
+export async function checkCreditLimit(
+  ctx: ServiceContext,
+  customerId: string,
+  additionalBase: ReturnType<typeof Money.zero>,
+  opts?: { excludeInvoiceId?: string },
+): Promise<CreditLimitBreach | null> {
+  const [customer] = await ctx.db
+    .select({ creditLimit: customers.creditLimit })
+    .from(customers)
+    .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
+  if (!customer || customer.creditLimit == null) return null;
+  const creditLimit = Money.of(customer.creditLimit);
+  if (!creditLimit.greaterThan(0)) return null;
+  // Compare in BASE currency: creditLimit and GL postings are base, but each invoice's
+  // balanceDue is stored in its own transaction currency.
+  const openConds = [
+    eq(invoices.companyId, ctx.companyId),
+    eq(invoices.customerId, customerId),
+    inArray(invoices.status, ['open', 'partial', 'overdue']),
+  ];
+  if (opts?.excludeInvoiceId) openConds.push(ne(invoices.id, opts.excludeInvoiceId));
+  const rows = await ctx.db
+    .select({ balanceDue: invoices.balanceDue, exchangeRate: invoices.exchangeRate })
+    .from(invoices)
+    .where(and(...openConds));
+  const outstanding = rows.reduce(
+    (sum, row) => sum.plus(Money.round2(Money.mul(Money.of(row.balanceDue), Money.of(row.exchangeRate ?? 1)))),
+    Money.zero(),
+  );
+  const newBalance = outstanding.plus(additionalBase);
+  if (!newBalance.greaterThan(creditLimit)) return null;
+  return {
+    warning: 'CREDIT_LIMIT',
+    creditLimit: toAmountString(creditLimit),
+    currentBalance: toAmountString(outstanding),
+    newBalance: toAmountString(newBalance),
+    overBy: toAmountString(newBalance.minus(creditLimit)),
+  };
+}
+
+/** The VALIDATION error raised for an un-acknowledged credit-limit breach. */
+export function creditLimitError(breach: CreditLimitBreach): ServiceError {
+  return new ServiceError(
+    'VALIDATION',
+    `Credit limit exceeded: this customer's balance would be ${breach.newBalance}, which is ${breach.overBy} over their credit limit of ${breach.creditLimit}. Save anyway?`,
+    breach,
+  );
 }
 
 /** A company-defined custom field rendered on the invoice form. */
@@ -212,13 +356,52 @@ async function hasExternalPayments(
   return Money.of(invoice.amountPaid).greaterThan(paymentLines);
 }
 
-/** Return the next invoice number for the company (max + 1, 1 if none). */
-async function nextInvoiceNumber(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ max: sql<number>`COALESCE(MAX(${invoices.invoiceNumber}), 0)` })
-    .from(invoices)
-    .where(eq(invoices.companyId, ctx.companyId));
-  return (row?.max ?? 0) + 1;
+/** Amount applied to the invoice from OUTSIDE it (payments, discounts, credits). */
+async function externalPaidAmount(
+  ctx: ServiceContext,
+  invoice: { id: string; amountPaid: string | null },
+) {
+  if (!invoice.amountPaid || !Money.gt(invoice.amountPaid, 0)) return Money.zero();
+  const paymentLines = await storedPaymentLineTotal(ctx, invoice.id);
+  const ext = Money.of(invoice.amountPaid).minus(paymentLines);
+  return ext.greaterThan(0) ? Money.round2(ext) : Money.zero();
+}
+
+/**
+ * Editing an invoice that already has payments/credits applied (C1): the applications stay put,
+ * so the edit must not invalidate them. Refuses (plain language) when the edit would change the
+ * customer, the currency or exchange rate (A/R was relieved at the booked rate), or shrink the
+ * invoice below what has already been applied.
+ */
+function assertEditKeepsApplications(
+  existing: { customerId: string; currency: string | null; exchangeRate: string | null },
+  input: CreateInvoiceInput,
+  prep: PreparedInvoice,
+  externalPaid: ReturnType<typeof Money.zero>,
+) {
+  if (!externalPaid.greaterThan(0)) return;
+  if (input.customerId !== existing.customerId) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This invoice already has payments or credits applied, so its customer cannot be changed. Unapply them first.',
+    );
+  }
+  if (
+    (input.currency ?? null) !== (existing.currency ?? null) ||
+    !Money.eq(prep.exchangeRate, Money.round2(existing.exchangeRate ?? 1))
+  ) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This invoice already has payments applied, so its currency and exchange rate cannot be changed. Unapply them first.',
+    );
+  }
+  const openAfter = prep.dueNow.minus(prep.paymentTotal);
+  if (externalPaid.greaterThan(openAfter)) {
+    throw new ServiceError(
+      'CONFLICT',
+      `This invoice already has ${toAmountString(externalPaid)} in payments or credits applied, so its new amount due (${toAmountString(openAfter)}) cannot be less than that. Unapply some of the payment first, or increase the invoice.`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,9 +434,13 @@ type ComputedLine = {
   jobId: string | null;
   lineOrder: number;
   kind: LineKind;
+  /** Advanced-pricing provenance (null for lines without a priceable item). */
+  pricing: AppliedPricing | null;
 };
 
 interface PreparedInvoice {
+  /** Set when the user overrode a credit-limit warning (recorded in the audit trail). */
+  creditLimitOverride: CreditLimitBreach | null;
   exchangeRate: ReturnType<typeof Money.zero>;
   arAccountId: string;
   defaultIncomeId: string;
@@ -298,6 +485,29 @@ async function prepareInvoice(
     throw validation('An invoice must have at least one line.');
   }
 
+  // Advanced pricing: fill omitted item rates server-side and record which rule/level priced
+  // each line (or that the user overrode it). Every later step works on the priced lines.
+  const pricedLines = await resolveLinePricing(
+    ctx,
+    {
+      customerId: input.customerId,
+      date: input.date,
+      classId: input.classId ?? null,
+      salesRepId: input.salesRepId ?? null,
+      jobId: input.jobId ?? null,
+    },
+    input.lines,
+  );
+  input = { ...input, lines: pricedLines };
+
+  if (input.salesRepId) {
+    const [rep] = await ctx.db
+      .select({ id: salesReps.id })
+      .from(salesReps)
+      .where(and(eq(salesReps.companyId, ctx.companyId), eq(salesReps.id, input.salesRepId)));
+    if (!rep) throw notFound('Sales rep');
+  }
+
   // Validate exchange rate.
   const exchangeRate = Money.round2(input.exchangeRate ?? 1);
   if (exchangeRate.lessThanOrEqualTo(0)) throw validation('Exchange rate must be positive.');
@@ -326,14 +536,29 @@ async function prepareInvoice(
   const taxPayableId = await accountIdByCode(ctx, '2200');   // Sales Tax Payable
 
   // Resolve (or create) the Retainage Receivable account if this invoice uses retainage.
+  // As in a QuickBooks contractor file, Retainage Receivable is an Other Current Asset, NOT an
+  // A/R account: the held-back amount is not part of what the customer owes today, so it must
+  // stay out of A/R (I11: A/R aging == the A/R accounts on the balance sheet). It is billed
+  // later with an invoice line on this account, which moves it into A/R.
   const usesRetainage = input.retainagePercent != null && Money.of(input.retainagePercent).greaterThan(0);
   const retainageAcctId = usesRetainage
     ? await getOrCreateAccountByCode(ctx, '1250', {
         name: 'Retainage Receivable',
         type: 'asset',
-        subtype: 'accounts_receivable',
+        subtype: 'other_current_asset',
       })
     : null;
+  if (retainageAcctId) {
+    const [ret] = await ctx.db
+      .select({ name: accounts.name, type: accounts.type, subtype: accounts.subtype })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, retainageAcctId)));
+    if (!ret || ret.type !== 'asset' || ret.subtype === 'accounts_receivable' || ret.subtype === 'non_posting') {
+      throw validation(
+        `Retainage is held in account 1250${ret ? ` "${ret.name}"` : ''}, which must be an Other Current Asset account. Change that account's type to Other Current Asset in the Chart of Accounts, then save the invoice again.`,
+      );
+    }
+  }
 
   // Pre-load items referenced by lines (income account routing + inventory typing).
   const itemIds = [
@@ -442,6 +667,15 @@ async function prepareInvoice(
       const itemIncomeId = itemMap.get(l.itemId)?.incomeAccountId ?? null;
       if (itemIncomeId) resolvedAccountId = itemIncomeId;
     }
+    // A/R and A/P are never a line / discount account (QB invariant I11): an extra A/R line
+    // would move the GL without moving the invoice's balance in A/R aging.
+    if (kind !== 'subtotal') {
+      const [lineAcct] = await ctx.db
+        .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+        .from(accounts)
+        .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, resolvedAccountId)));
+      if (lineAcct) assertNotControlLineAccount(lineAcct, `Line ${i + 1}`);
+    }
 
     if (kind === 'subtotal') {
       // UI-computed subtotal of the preceding body lines — non-posting,
@@ -459,13 +693,16 @@ async function prepareInvoice(
         jobId: l.jobId ?? headerJobId,
         lineOrder: i,
         kind,
+        pricing: null,
       });
       runningBody = Money.zero(); // QB: a subtotal item resets the running group
       continue;
     }
 
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (kind !== 'discount' && rate.lessThan(0)) {
       throw validation(`Line ${i + 1}: rate cannot be negative.`);
@@ -514,8 +751,8 @@ async function prepareInvoice(
       itemId: l.itemId ?? null,
       accountId: resolvedAccountId,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       taxable,
       taxRateId: kind === 'income' ? (l.taxRateId ?? null) : null,
@@ -523,6 +760,7 @@ async function prepareInvoice(
       jobId: l.jobId ?? headerJobId,
       lineOrder: i,
       kind,
+      pricing: kind === 'income' ? pricedLines[i].pricing : null,
     });
   }
 
@@ -572,39 +810,28 @@ async function prepareInvoice(
     ? await getOrCreateAccountByCode(ctx, '1050', {
         name: 'Undeposited Funds',
         type: 'asset',
-        subtype: 'checking',
+        subtype: 'undeposited_funds',
       })
     : null;
 
-  // --- Credit limit check ---
+  // --- Credit limit check (QB warns; the user may save anyway — C2) ---
+  // Exposure added by this document = what will be open on it (balance after payment lines).
+  let creditLimitOverride: CreditLimitBreach | null = null;
   if (customer.creditLimit != null) {
-    const creditLimit = Money.of(customer.creditLimit);
-    if (creditLimit.greaterThan(0)) {
-      // Compare in BASE currency: creditLimit and GL postings are base, but each invoice's
-      // balanceDue (and this invoice's `total`) are stored in their own transaction currency.
-      const openConds = [
-        eq(invoices.companyId, ctx.companyId),
-        eq(invoices.customerId, input.customerId),
-        inArray(invoices.status, ['open', 'partial']),
-      ];
-      if (opts?.excludeInvoiceId) openConds.push(ne(invoices.id, opts.excludeInvoiceId));
-      const openInvoiceRows = await ctx.db
-        .select({ balanceDue: invoices.balanceDue, exchangeRate: invoices.exchangeRate })
-        .from(invoices)
-        .where(and(...openConds));
-      const outstandingBase = openInvoiceRows.reduce(
-        (sum, row) =>
-          sum.plus(Money.round2(Money.mul(Money.of(row.balanceDue), Money.of(row.exchangeRate ?? 1)))),
-        Money.zero(),
-      );
-      const newExposureBase = Money.round2(Money.mul(total, exchangeRate));
-      if (outstandingBase.plus(newExposureBase).greaterThan(creditLimit)) {
-        throw new ServiceError('VALIDATION', 'Credit limit exceeded');
-      }
+    const newExposureBase = Money.round2(
+      Money.mul(dueNow.minus(paymentTotal).plus(retainageAmount), exchangeRate),
+    );
+    const breach = await checkCreditLimit(ctx, input.customerId, newExposureBase, {
+      excludeInvoiceId: opts?.excludeInvoiceId,
+    });
+    if (breach) {
+      if (!input.overrideCreditLimit) throw creditLimitError(breach);
+      creditLimitOverride = breach;
     }
   }
 
   return {
+    creditLimitOverride,
     exchangeRate,
     arAccountId,
     defaultIncomeId,
@@ -659,7 +886,8 @@ async function postInvoiceGL(
   tx: ServiceContext,
   prep: PreparedInvoice,
   invoiceId: string,
-  invoiceNumber: number,
+  /** The number shown on the GL (typed ref number, else the legacy integer). */
+  invoiceNumber: number | string,
   date: Date,
 ) {
   const {
@@ -707,10 +935,13 @@ async function postInvoiceGL(
     weight: ReturnType<typeof Money.zero>;
     memo: string;
     classId?: string | null;
+    /** The invoice's own A/R line(s) — see posting.ts PostingLine.controlLine. */
+    controlLine?: boolean;
   }> = [{
     accountId: arAccountId,
     weight: dueNow.minus(paymentTotal),
     memo: `Invoice #${invoiceNumber}`,
+    controlLine: true,
   }];
   if (paymentTotal.greaterThan(0) && ufAccountId) {
     debitSpecs.push({
@@ -777,6 +1008,7 @@ async function postInvoiceGL(
     credit?: string;
     memo?: string;
     classId?: string | null;
+    controlLine?: boolean;
   }> = [];
   debitSpecs.forEach((s, i) => {
     if (debitAlloc[i].greaterThan(0)) {
@@ -785,6 +1017,7 @@ async function postInvoiceGL(
         debit: toAmountString(debitAlloc[i]),
         memo: s.memo,
         classId: s.classId ?? null,
+        ...(s.controlLine ? { controlLine: true } : {}),
       });
     }
   });
@@ -827,7 +1060,8 @@ async function postInvoiceCOGS(
   tx: ServiceContext,
   prep: PreparedInvoice,
   invoiceId: string,
-  invoiceNumber: number,
+  /** The number shown on the GL (typed ref number, else the legacy integer). */
+  invoiceNumber: number | string,
   date: Date,
 ) {
   const { computedLines, itemMap } = prep;
@@ -1016,6 +1250,33 @@ async function reverseInvoiceCOGS(
 }
 
 // ---------------------------------------------------------------------------
+// Advanced Inventory: per-line site / bin / serial / lot
+// ---------------------------------------------------------------------------
+
+/**
+ * Pair each computed line with the site/bin/serial/lot fields of its input line (lineOrder =
+ * input index). Absent keys stay undefined so edits can carry stored detail forward.
+ */
+function inventoryLinesOf(
+  lines: InvoiceLineInput[],
+  prep: PreparedInvoice,
+): DocumentInventoryLine[] {
+  return prep.computedLines.map((cl) => {
+    const src = lines[cl.lineOrder];
+    return {
+      lineOrder: cl.lineOrder,
+      itemId: cl.itemId,
+      quantity: cl.quantity,
+      siteId: src?.siteId,
+      binId: src?.binId,
+      serialNumbers: src?.serialNumbers,
+      lotNumber: src?.lotNumber,
+      lotExpiration: src?.lotExpiration,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // createInvoice
 // ---------------------------------------------------------------------------
 
@@ -1027,6 +1288,21 @@ function postedStatus(prep: PreparedInvoice): 'open' | 'partial' | 'paid' {
   return 'open';
 }
 
+/** Record that the user saved past a credit-limit warning (C2). */
+export async function auditCreditLimitOverride(
+  tx: ServiceContext,
+  entityId: string,
+  breach: CreditLimitBreach,
+  entityType = 'invoice',
+) {
+  await writeAudit(tx, {
+    action: 'update',
+    entityType,
+    entityId,
+    newValues: { creditLimitOverride: breach },
+  });
+}
+
 export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
   const prep = await prepareInvoice(ctx, input);
   const isDraft = input.status === 'draft';
@@ -1035,7 +1311,9 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
   // Persist everything in a single transaction.
   // ---------------------------------------------------------------------------
   return inTransaction(ctx, async (tx) => {
-    const invoiceNumber = await nextInvoiceNumber(tx);
+    const { refNumber, number: invoiceNumber } = await allocateDocNumber(tx, 'invoice', input.refNumber, {
+      allowDuplicate: input.allowDuplicateNumber === true,
+    });
 
     // Resolve currency fields.
     const currency = input.currency ?? null;
@@ -1051,12 +1329,14 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         companyId: tx.companyId,
         customerId: input.customerId,
         invoiceNumber,
+        refNumber,
         date: input.date,
         dueDate: input.dueDate ?? null,
         status: isDraft ? 'draft' : postedStatus(prep),
         taxRateId: input.taxRateId ?? null,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
+        salesRepId: input.salesRepId ?? null,
         currency,
         exchangeRate: exchangeRateStr,
         discountType: prep.discountType,
@@ -1070,9 +1350,15 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         retainageAmount: toAmountString(prep.retainageAmount),
         memo: input.memo ?? null,
         customFields: input.customFields ?? null,
+        ...shippingColumns(input),
+        isStatementCharge: input.isStatementCharge === true,
         // postedEntryId filled below after posting (stays null for drafts)
       })
       .returning();
+
+    if (prep.creditLimitOverride) {
+      await auditCreditLimitOverride(tx, invoice.id, prep.creditLimitOverride);
+    }
 
     // 2) Insert invoice lines.
     await tx.db.insert(invoiceLines).values(
@@ -1089,11 +1375,18 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         classId: cl.classId,
         jobId: cl.jobId,
         lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
       })),
     );
 
     if (isDraft) {
-      // Pending invoice: no journal entry, no COGS, no stock relief.
+      // Pending invoice: no journal entry, no COGS, no stock relief — but keep any
+      // site/serial/lot the user picked so posting later relieves the right stock.
+      await saveDocumentInventoryDetails(tx, {
+        sourceType: 'invoice',
+        sourceId: invoice.id,
+        lines: inventoryLinesOf(input.lines, prep),
+      });
       await writeAudit(tx, {
         action: 'create',
         entityType: 'invoice',
@@ -1109,7 +1402,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
     }
 
     // 3) Build and post the journal entry.
-    const entry = await postInvoiceGL(tx, prep, invoice.id, invoiceNumber, input.date);
+    const entry = await postInvoiceGL(tx, prep, invoice.id, docRef(refNumber, invoiceNumber), input.date);
 
     // 4) Stamp postedEntryId on the invoice.
     const [updated] = await tx.db
@@ -1118,8 +1411,17 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       .where(eq(invoices.id, invoice.id))
       .returning();
 
-    // 5) Perpetual inventory: relieve stock + post COGS for inventory-item lines.
-    await postInvoiceCOGS(tx, prep, invoice.id, invoiceNumber, input.date);
+    // 5) Perpetual inventory: relieve stock + post COGS for inventory-item lines,
+    //    then record which site/bin/serial/lot the stock left from.
+    await postInvoiceCOGS(tx, prep, invoice.id, docRef(refNumber, invoiceNumber), input.date);
+    await postDocumentInventory(tx, {
+      sourceType: 'invoice',
+      sourceId: invoice.id,
+      date: input.date,
+      direction: 'out',
+      lines: inventoryLinesOf(input.lines, prep),
+      memo: `Invoice #${docRef(refNumber, invoiceNumber)}`,
+    });
 
     // 6) Audit trail.
     await writeAudit(tx, {
@@ -1149,7 +1451,11 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
  * time) via `postJournalEntry`'s assertPeriodOpen on the invoice date — drafts
  * themselves are non-posting and may be saved into any period.
  */
-export async function postDraftInvoice(ctx: ServiceContext, id: string) {
+export async function postDraftInvoice(
+  ctx: ServiceContext,
+  id: string,
+  opts?: { overrideCreditLimit?: boolean },
+) {
   const [existing] = await ctx.db
     .select()
     .from(invoices)
@@ -1174,6 +1480,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
     taxRateId: existing.taxRateId,
     classId: existing.classId,
     jobId: existing.jobId,
+    salesRepId: existing.salesRepId,
     discount: existing.discount,
     discountType: 'amount',
     retainagePercent: existing.retainagePercent,
@@ -1181,6 +1488,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
     exchangeRate: existing.exchangeRate,
     memo: existing.memo,
     customFields: existing.customFields ?? null,
+    overrideCreditLimit: opts?.overrideCreditLimit,
     lines: storedLines.map((l) => ({
       itemId: l.itemId,
       accountId: l.accountId,
@@ -1191,6 +1499,7 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
       taxRateId: l.taxRateId,
       classId: l.classId,
       jobId: l.jobId,
+      pricing: { origin: (l.pricing as { origin?: string | null } | null)?.origin ?? null },
     })),
   };
 
@@ -1208,7 +1517,8 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
     }
 
     // 1) Post the GL entry (assertPeriodOpen runs here, on the invoice date).
-    const entry = await postInvoiceGL(tx, prep, id, invoice.invoiceNumber, invoice.date);
+    const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
+    if (prep.creditLimitOverride) await auditCreditLimitOverride(tx, id, prep.creditLimitOverride);
 
     // 2) Flip the header to its posted state.
     const [updated] = await tx.db
@@ -1228,8 +1538,18 @@ export async function postDraftInvoice(ctx: ServiceContext, id: string) {
       .where(eq(invoices.id, id))
       .returning();
 
-    // 3) Perpetual inventory: relieve stock + post COGS now that it is real.
-    await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, invoice.date);
+    // 3) Perpetual inventory: relieve stock + post COGS now that it is real, using the
+    //    site/serial/lot detail saved with the draft.
+    await postInvoiceCOGS(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
+    await postDocumentInventory(tx, {
+      sourceType: 'invoice',
+      sourceId: id,
+      date: invoice.date,
+      direction: 'out',
+      lines: inventoryLinesOf(input.lines, prep),
+      memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
+      carryForward: true,
+    });
 
     // 4) Audit trail.
     await writeAudit(tx, {
@@ -1273,16 +1593,18 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   if (existing.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
   }
-  if (await hasExternalPayments(ctx, existing)) {
-    throw new ServiceError(
-      'CONFLICT',
-      'Cannot edit an invoice that has payments or credits applied. Unapply them first.',
-    );
-  }
+  // Payments/credits already applied stay applied (QB lets you edit a paid invoice) as long as
+  // the edit keeps them valid; see assertEditKeepsApplications.
+  const externalPaidPre = await externalPaidAmount(ctx, existing);
+
+  // An edit that does not mention the sales rep keeps the current one (it was usually set
+  // via assignInvoiceRep, and it is also a price-rule condition).
+  if (input.salesRepId === undefined) input = { ...input, salesRepId: existing.salesRepId };
 
   // Validate + compute the new document (read-only). Exclude this invoice's own
   // current balance from the credit-limit exposure — it is being replaced.
   const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
+  assertEditKeepsApplications(existing, input, prep, externalPaidPre);
 
   // ── Drafts: editing a pending invoice is a simple row update — nothing was
   //    ever posted, so there is no GL/COGS to void or re-post. ──
@@ -1311,8 +1633,16 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           classId: cl.classId,
           jobId: cl.jobId,
           lineOrder: cl.lineOrder,
+          pricing: cl.pricing as Record<string, unknown> | null,
         })),
       );
+
+      await saveDocumentInventoryDetails(tx, {
+        sourceType: 'invoice',
+        sourceId: id,
+        lines: inventoryLinesOf(input.lines, prep),
+        carryForward: true,
+      });
 
       const [updated] = await tx.db
         .update(invoices)
@@ -1324,6 +1654,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           taxRateId: input.taxRateId ?? null,
           classId: prep.headerClassId,
           jobId: prep.headerJobId,
+          salesRepId: input.salesRepId ?? null,
           currency: input.currency ?? null,
           exchangeRate: toAmountString(prep.exchangeRate),
           discountType: prep.discountType,
@@ -1338,6 +1669,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           memo: input.memo ?? null,
           customFields:
             input.customFields !== undefined ? input.customFields : invoice.customFields,
+          ...shippingColumns(input, invoice),
           updatedAt: new Date(),
         })
         .where(eq(invoices.id, id))
@@ -1365,12 +1697,8 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     if (invoice.status === 'void') {
       throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
     }
-    if (await hasExternalPayments(tx, invoice)) {
-      throw new ServiceError(
-        'CONFLICT',
-        'Cannot edit an invoice that has payments or credits applied. Unapply them first.',
-      );
-    }
+    const externalPaid = await externalPaidAmount(tx, invoice);
+    assertEditKeepsApplications(invoice, input, prep, externalPaid);
 
     // Snapshot old lines for the audit trail BEFORE replacing them.
     const oldLines = await tx.db
@@ -1384,8 +1712,10 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       await voidJournalEntry(tx, invoice.postedEntryId);
     }
 
-    // 2) Void COGS entries + restore stock (reads old lines — must precede delete).
+    // 2) Void COGS entries + restore stock (reads old lines — must precede delete),
+    //    and put the stock back at the site/bin/serial it left from.
     await reverseInvoiceCOGS(tx, { id, date: invoice.date });
+    await reverseDocumentInventory(tx, 'invoice', id);
 
     // 3) Replace lines.
     await tx.db.delete(invoiceLines).where(eq(invoiceLines.invoiceId, id));
@@ -1403,23 +1733,33 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         classId: cl.classId,
         jobId: cl.jobId,
         lineOrder: cl.lineOrder,
+        pricing: cl.pricing as Record<string, unknown> | null,
       })),
     );
 
     // 4) Re-post the GL entry from the new document, then update the header in
     //    place — invoiceNumber and createdAt are intentionally NOT touched.
-    const entry = await postInvoiceGL(tx, prep, id, invoice.invoiceNumber, input.date);
+    const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
+    if (prep.creditLimitOverride) await auditCreditLimitOverride(tx, id, prep.creditLimitOverride);
 
+    const paidNow = prep.paymentTotal.plus(externalPaid);
+    const balanceNow = Money.round2(prep.dueNow.minus(paidNow));
     const [updated] = await tx.db
       .update(invoices)
       .set({
         customerId: input.customerId,
         date: input.date,
         dueDate: input.dueDate ?? null,
-        status: postedStatus(prep),
+        status:
+          balanceNow.lessThanOrEqualTo(0) && paidNow.greaterThan(0)
+            ? 'paid'
+            : paidNow.greaterThan(0)
+              ? 'partial'
+              : 'open',
         taxRateId: input.taxRateId ?? null,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
+        salesRepId: input.salesRepId ?? null,
         currency: input.currency ?? null,
         exchangeRate: toAmountString(prep.exchangeRate),
         discountType: prep.discountType,
@@ -1427,21 +1767,32 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         discount: toAmountString(prep.discount),
         taxAmount: toAmountString(prep.taxAmount),
         total: toAmountString(prep.total),
-        amountPaid: toAmountString(prep.paymentTotal),
-        balanceDue: toAmountString(prep.dueNow.minus(prep.paymentTotal)),
+        amountPaid: toAmountString(paidNow),
+        balanceDue: toAmountString(balanceNow),
         retainagePercent: prep.usesRetainage ? prep.retainagePct.toFixed(2) : null,
         retainageAmount: toAmountString(prep.retainageAmount),
         memo: input.memo ?? null,
         customFields:
           input.customFields !== undefined ? input.customFields : invoice.customFields,
+        ...shippingColumns(input, invoice),
         postedEntryId: entry.id,
         updatedAt: new Date(),
       })
       .where(eq(invoices.id, id))
       .returning();
 
-    // 5) Re-post perpetual inventory COGS for the new lines.
-    await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, input.date);
+    // 5) Re-post perpetual inventory COGS for the new lines (site detail carried forward
+    //    for lines the edit did not touch).
+    await postInvoiceCOGS(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), input.date);
+    await postDocumentInventory(tx, {
+      sourceType: 'invoice',
+      sourceId: id,
+      date: input.date,
+      direction: 'out',
+      lines: inventoryLinesOf(input.lines, prep),
+      memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
+      carryForward: true,
+    });
 
     // 6) Audit trail with old + new values.
     await writeAudit(tx, {
@@ -1547,7 +1898,7 @@ export async function getInvoice(ctx: ServiceContext, id: string) {
     .where(eq(invoiceLines.invoiceId, id))
     .orderBy(invoiceLines.lineOrder);
 
-  return { ...invoice, lines };
+  return { ...invoice, lines: await attachInventoryDetails(ctx, 'invoice', id, lines) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,8 +1933,9 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
     }
 
     // Reverse perpetual-inventory effects: void each COGS entry created by
-    // createInvoice and put the relieved stock back on hand.
+    // createInvoice and put the relieved stock back on hand (and at its site).
     await reverseInvoiceCOGS(tx, { id, date: invoice.date });
+    await reverseDocumentInventory(tx, 'invoice', id);
 
     // Mark invoice void.
     const [updated] = await tx.db

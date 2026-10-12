@@ -10,6 +10,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
 import { getFileLockStatus, verifyFilePassword } from '@/lib/services/fileLock';
 import { UNLOCK_COOKIE, createUnlockToken } from '@/lib/auth';
+import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
+import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 
 export async function POST(req: NextRequest) {
   const db = await getDb();
@@ -23,7 +25,27 @@ export async function POST(req: NextRequest) {
   }
 
   const status = await getFileLockStatus(db);
-  const ok = !status.enabled || (await verifyFilePassword(db, password));
+  // File-password guessing is rate-limited like sign-in (the file password is one shared secret,
+  // so the "account" key is the file itself).
+  const origin = originFromHeaders(req.headers);
+  const limiter = loginLimiter();
+  const keys = attemptKeys('unlock', status.enabled ? 'file' : null, origin.addr);
+  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
+  let ok = !status.enabled;
+  if (status.enabled) {
+    // Admitted before the slow password hash, released after (parallel guesses count).
+    const gate = limiter.begin(keys, Date.now(), weights);
+    if (!gate.allowed) {
+      const { body, retryAfter } = tooManyAttempts(gate.retryAfterMs);
+      return NextResponse.json({ ok: false, enabled: true, ...body }, { status: 429, headers: { 'Retry-After': retryAfter } });
+    }
+    try {
+      ok = await verifyFilePassword(db, password);
+      if (!ok) limiter.recordFailure(keys, Date.now(), weights);
+    } finally {
+      gate.release();
+    }
+  }
   if (!ok) {
     return NextResponse.json(
       { ok: false, enabled: true, companyName: status.companyName },
@@ -31,10 +53,11 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  if (status.enabled) limiter.recordSuccess(keys.slice(0, -1));
   const res = NextResponse.json({ ok: true });
   res.cookies.set(UNLOCK_COOKIE, createUnlockToken(), {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: cookieSecure(origin),
     sameSite: 'lax',
     path: '/',
     maxAge: 60 * 60 * 12,

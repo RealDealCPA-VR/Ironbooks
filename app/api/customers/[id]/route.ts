@@ -11,6 +11,7 @@ import {
   deactivateCustomer,
 } from '@/lib/services/customers';
 import { ServiceError } from '@/lib/services/_base';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateCustomerSchema } from '@/lib/validation/customers';
 
@@ -52,18 +53,23 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     if (!parsed.success) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
-    const customer = await updateCustomer(ctx, id, parsed.data);
+    // Multi-user: 409 if someone else saved this customer since it was loaded.
+    const customer = await withVersionCheck(ctx, 'customer', id, expectedVersion(req), (c) =>
+      updateCustomer(c, id, parsed.data),
+    );
     return NextResponse.json(customer);
   } catch (err) {
     return errorResponse(err);
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteParams) {
+export async function DELETE(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const customer = await deactivateCustomer(ctx, id);
+    const customer = await withVersionCheck(ctx, 'customer', id, expectedVersion(req), (c) =>
+      deactivateCustomer(c, id),
+    );
     return NextResponse.json(customer);
   } catch (err) {
     return errorResponse(err);

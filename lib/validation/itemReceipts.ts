@@ -4,12 +4,15 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { inventoryLineFields } from './inventorySites';
 
 export const itemReceiptLineSchema = z.object({
   itemId: zUuid,
   description: z.string().nullish(),
   quantity: zDecimal,
   unitCost: zDecimal,
+  /** Advanced Inventory: receiving site/bin/serial/lot. */
+  ...inventoryLineFields,
 });
 
 export const createItemReceiptSchema = z.object({

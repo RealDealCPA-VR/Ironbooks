@@ -5,16 +5,18 @@
  *                                            in the data dir are never touched.
  *
  * SECURITY: middleware excludes /api from the session check, so both handlers fail closed
- * via getServerContext(). Export additionally verifies the caller is a MEMBER of the
- * requested company (never exports another tenant's data). Restore requires write access
- * (viewers are read-only app-wide).
+ * via getServerContext(). The route map only authorizes File Utilities in the ACTIVE company,
+ * so export re-checks the TARGET company: the caller must be an active member there with
+ * File Utilities 'create' (requireAccessInCompany). Sensitive fields (SSNs / tax IDs, bank and
+ * account numbers) are masked in the export unless the caller's roles in that company grant the
+ * matching flags. Restore requires File Utilities 'delete' in the active company (route map).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { and, eq } from 'drizzle-orm';
 import { getServerContext } from '@/lib/context';
-import { companies, userCompanies } from '@/lib/db/schema';
 import { createCompanyBackup, restoreCompanyBackup } from '@/lib/services/backup';
 import { ServiceError } from '@/lib/services/_base';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
+import { requireAccessInCompany, requirePermission } from '@/lib/services/access';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -31,25 +33,6 @@ function errorResponse(err: unknown) {
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
 }
 
-/** The caller may export a company only if they are a member (or it is their active company). */
-async function assertMembership(
-  ctx: Awaited<ReturnType<typeof getServerContext>>,
-  companyId: string,
-): Promise<void> {
-  if (companyId === ctx.companyId) return;
-  if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
-  const [member] = await ctx.db
-    .select({ companyId: userCompanies.companyId })
-    .from(userCompanies)
-    .where(and(eq(userCompanies.userId, ctx.userId), eq(userCompanies.companyId, companyId)));
-  if (member) return;
-  const [owned] = await ctx.db
-    .select({ id: companies.id })
-    .from(companies)
-    .where(and(eq(companies.id, companyId), eq(companies.ownerId, ctx.userId)));
-  if (!owned) throw new ServiceError('FORBIDDEN', 'You are not a member of that company.');
-}
-
 // ---------------------------------------------------------------------------
 // GET — download a per-company backup
 // ---------------------------------------------------------------------------
@@ -58,9 +41,9 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const companyId = req.nextUrl.searchParams.get('companyId') ?? ctx.companyId;
-    await assertMembership(ctx, companyId);
+    const access = await requireAccessInCompany(ctx, companyId, 'file_utilities', 'create');
 
-    const { buffer, filename } = await createCompanyBackup(ctx.db, companyId);
+    const { buffer, filename } = await createCompanyBackup(ctx.db, companyId, { access });
     const arrayBuf: ArrayBuffer = buffer.buffer.slice(
       buffer.byteOffset,
       buffer.byteOffset + buffer.byteLength,
@@ -85,10 +68,9 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    if (ctx.role === 'viewer') {
-      throw new ServiceError('FORBIDDEN', 'Your role is view-only. This action requires write access.');
-    }
+    requirePermission(ctx, 'file_utilities', 'delete');
     if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
+    await assertExclusiveAccess(ctx, 'Restore'); // adds a NEW company: other companies untouched
 
     const arrayBuffer = await req.arrayBuffer();
     if (!arrayBuffer.byteLength) {

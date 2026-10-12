@@ -9,33 +9,22 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { postDraftInvoice } from '@/lib/services/invoices';
-import { ServiceError } from '@/lib/services/_base';
+import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
 
 function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED' || err.code === 'PERIOD_CLOSED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
-    return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
-  }
-  console.error('[invoices/[id]/post]', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  return routeErrorWithWarnings(err, 'invoices/[id]/post/route.ts');
 }
 
 type RouteContext = { params: Promise<{ id: string }> };
 
-export async function POST(_req: NextRequest, { params }: RouteContext) {
+export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const posted = await postDraftInvoice(ctx, id);
+    const body = (await req.json().catch(() => ({}))) as { overrideCreditLimit?: unknown };
+    const posted = await postDraftInvoice(ctx, id, {
+      overrideCreditLimit: body?.overrideCreditLimit === true,
+    });
     return NextResponse.json(posted);
   } catch (err) {
     return errorResponse(err);

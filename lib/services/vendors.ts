@@ -11,15 +11,19 @@
  *  - Soft-delete only: deactivateVendor sets isActive = false.
  *  - ServiceError codes: NOT_FOUND, VALIDATION, CONFLICT.
  */
-import { and, asc, eq, ne } from 'drizzle-orm';
+import { and, asc, eq, ne, sql } from 'drizzle-orm';
 import { vendors } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { getPreferences } from './preferences';
+import { maskForContext } from './access';
+import { resolvePartyTerms } from './lists/fields';
+import { type VendorPurchaseFieldsInput, resolveVendorPurchaseFields } from './vendorPurchaseFields';
 
 // ---------------------------------------------------------------------------
 // Input types
 // ---------------------------------------------------------------------------
 
-export interface CreateVendorInput {
+export interface CreateVendorInput extends VendorPurchaseFieldsInput {
   /** The name shown in all lists and documents — required and must be unique per company. */
   displayName: string;
   companyName?: string | null;
@@ -36,6 +40,8 @@ export interface CreateVendorInput {
   /** Preferred expense account pre-filled on new bills / expenses for this vendor. */
   defaultExpenseAccountId?: string | null;
   notes?: string | null;
+  /** Terms list entry (wins over the legacy `terms` string, which is kept in sync). */
+  termsId?: string | null;
 }
 
 export type UpdateVendorInput = Partial<CreateVendorInput>;
@@ -55,7 +61,7 @@ async function assertUniqueDisplayName(
   }
   const conds = [
     eq(vendors.companyId, ctx.companyId),
-    eq(vendors.displayName, displayName.trim()),
+    sql`lower(${vendors.displayName}) = lower(${displayName.trim()})`, // QB names are case-insensitive
   ];
   if (excludeId) {
     conds.push(ne(vendors.id, excludeId));
@@ -84,15 +90,20 @@ export async function listVendors(
   const where = opts?.includeInactive
     ? eq(vendors.companyId, ctx.companyId)
     : and(eq(vendors.companyId, ctx.companyId), eq(vendors.isActive, true));
-  return ctx.db.select().from(vendors).where(where).orderBy(asc(vendors.displayName));
+  // Tax IDs (a sole proprietor's TIN is their SSN) leave this service masked unless the
+  // caller may view sensitive data (Users & Roles flag).
+  return maskForContext(
+    ctx,
+    await ctx.db.select().from(vendors).where(where).orderBy(asc(vendors.displayName)),
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Get one
 // ---------------------------------------------------------------------------
 
-/** Fetch a single vendor by id, scoped to the company. Throws NOT_FOUND if missing. */
-export async function getVendor(ctx: ServiceContext, id: string) {
+/** Unmasked row (internal: updates must never write a masked tax ID back). */
+async function loadVendor(ctx: ServiceContext, id: string) {
   const [row] = await ctx.db
     .select()
     .from(vendors)
@@ -101,13 +112,29 @@ export async function getVendor(ctx: ServiceContext, id: string) {
   return row;
 }
 
+/** Fetch a single vendor by id, scoped to the company. Throws NOT_FOUND if missing. */
+export async function getVendor(ctx: ServiceContext, id: string) {
+  return maskForContext(ctx, await loadVendor(ctx, id));
+}
+
+/** True for a value produced by masking ("***-**-6789") -- never store it as a tax ID. */
+const isMaskedValue = (v: string | null | undefined) =>
+  typeof v === 'string' && /[*\u2022]/.test(v);
+
 // ---------------------------------------------------------------------------
 // Create
 // ---------------------------------------------------------------------------
 
 /** Create a new vendor record for the company. */
 export async function createVendor(ctx: ServiceContext, input: CreateVendorInput) {
+  // A masked placeholder (e.g. copied from a vendor shown to a role without the sensitive flag)
+  // is not a TIN -- storing it would corrupt 1099 reporting.
+  if (isMaskedValue(input.taxId)) {
+    throw validation('Enter the full tax ID; a masked value cannot be saved.');
+  }
   await assertUniqueDisplayName(ctx, input.displayName);
+  const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
+  const purchaseFields = await resolveVendorPurchaseFields(ctx, input);
 
   const [row] = await ctx.db
     .insert(vendors)
@@ -118,11 +145,14 @@ export async function createVendor(ctx: ServiceContext, input: CreateVendorInput
       email: input.email?.trim() ?? null,
       phone: input.phone?.trim() ?? null,
       address: input.address ?? null,
-      terms: input.terms ?? 'net_30',
+      // A Terms-list pick / typed terms win; else Preferences > Bills: default terms for new records.
+      terms: termsRes ? termsRes.terms : (await getPreferences(ctx)).defaultVendorTerms,
+      termsId: termsRes?.termsId ?? null,
       is1099: input.is1099 ?? false,
       taxId: input.taxId ?? null,
       defaultExpenseAccountId: input.defaultExpenseAccountId ?? null,
       notes: input.notes ?? null,
+      ...purchaseFields,
     })
     .returning();
 
@@ -133,7 +163,7 @@ export async function createVendor(ctx: ServiceContext, input: CreateVendorInput
     newValues: row,
   });
 
-  return row;
+  return maskForContext(ctx, row);
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +179,7 @@ export async function updateVendor(
   id: string,
   patch: UpdateVendorInput,
 ) {
-  const before = await getVendor(ctx, id);
+  const before = await loadVendor(ctx, id);
 
   // Re-validate displayName only if the caller is changing it.
   const newDisplayName = patch.displayName !== undefined
@@ -159,6 +189,8 @@ export async function updateVendor(
   if (patch.displayName !== undefined) {
     await assertUniqueDisplayName(ctx, newDisplayName, id);
   }
+  const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
+  const purchaseFields = await resolveVendorPurchaseFields(ctx, patch, before);
 
   const [row] = await ctx.db
     .update(vendors)
@@ -169,14 +201,18 @@ export async function updateVendor(
       email: patch.email !== undefined ? (patch.email?.trim() ?? null) : before.email,
       phone: patch.phone !== undefined ? (patch.phone?.trim() ?? null) : before.phone,
       address: patch.address !== undefined ? patch.address : before.address,
-      terms: patch.terms !== undefined ? patch.terms : before.terms,
+      terms: termsRes ? termsRes.terms : before.terms,
+      termsId: termsRes ? termsRes.termsId : before.termsId,
       is1099: patch.is1099 !== undefined ? patch.is1099 : before.is1099,
-      taxId: patch.taxId !== undefined ? patch.taxId : before.taxId,
+      // A masked tax ID echoed back by a user who can't see the full one leaves it unchanged.
+      taxId:
+        patch.taxId !== undefined && !isMaskedValue(patch.taxId) ? patch.taxId : before.taxId,
       defaultExpenseAccountId:
         patch.defaultExpenseAccountId !== undefined
           ? patch.defaultExpenseAccountId
           : before.defaultExpenseAccountId,
       notes: patch.notes !== undefined ? patch.notes : before.notes,
+      ...purchaseFields,
       updatedAt: new Date(),
     })
     .where(eq(vendors.id, id))
@@ -190,7 +226,7 @@ export async function updateVendor(
     newValues: row,
   });
 
-  return row;
+  return maskForContext(ctx, row);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +239,7 @@ export async function updateVendor(
  * lists and cannot be selected for new documents.
  */
 export async function deactivateVendor(ctx: ServiceContext, id: string) {
-  const before = await getVendor(ctx, id);
+  const before = await loadVendor(ctx, id);
 
   const [row] = await ctx.db
     .update(vendors)

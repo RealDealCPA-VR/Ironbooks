@@ -36,7 +36,7 @@ export const runPaycheckSchema = z.object({
   taxes: z.array(paycheckLineSchema).optional(),
   employerTaxes: z.array(paycheckLineSchema).optional(),
   deductions: z.array(paycheckLineSchema).optional(),
-  filingStatus: z.enum(['single', 'married']).optional(),
+  filingStatus: z.enum(['single', 'married', 'head_of_household']).optional(),
   periodsPerYear: z.number().int().positive('periodsPerYear must be a positive integer').optional(),
 });
 export type RunPaycheckBody = z.infer<typeof runPaycheckSchema>;
@@ -63,3 +63,62 @@ export const createPayRunSchema = z.object({
     .min(1, 'employees must be a non-empty array'),
 });
 export type CreatePayRunBody = z.infer<typeof createPayRunSchema>;
+
+/** PATCH /api/payroll/[id] — edit a paycheck (same fields as a new check, minus employee). */
+export const editPaycheckSchema = runPaycheckSchema.omit({ employeeId: true });
+export type EditPaycheckBody = z.infer<typeof editPaycheckSchema>;
+
+const adjustmentLineSchema = z.object({
+  kind: z.enum(['earning', 'tax', 'deduction', 'employer_contribution']),
+  name: z.string().min(1, 'line name is required').max(255),
+  amount: zMoney,
+  payrollItemId: zUuid.nullish(),
+});
+
+/** POST /api/payroll/adjustments — YTD setup amounts or a liability adjustment. */
+export const createAdjustmentSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('ytd'),
+    employeeId: zUuid,
+    date: zDate,
+    periodStart: zDate.nullish(),
+    periodEnd: zDate.nullish(),
+    memo: z.string().max(500).nullish(),
+    lines: z.array(adjustmentLineSchema).min(1, 'enter at least one amount'),
+    affectsAccounts: z.boolean().optional(),
+    bankAccountId: zUuid.nullish(),
+  }),
+  z.object({
+    type: z.literal('liability'),
+    employeeId: zUuid,
+    date: zDate,
+    memo: z.string().max(500).nullish(),
+    lines: z
+      .array(adjustmentLineSchema.extend({ kind: z.enum(['tax', 'deduction', 'employer_contribution']) }))
+      .min(1, 'enter at least one adjustment line'),
+    affectsAccounts: z.boolean().optional(),
+    offsetAccountId: zUuid.nullish(),
+  }),
+]);
+export type CreateAdjustmentBody = z.infer<typeof createAdjustmentSchema>;
+
+const zRate = z.union([z.string(), z.number()]).nullish();
+
+/** POST /api/payroll/state-settings — create or replace SUI/SDI settings for a state + year. */
+export const stateTaxSettingSchema = z.object({
+  state: z.string().regex(/^[A-Za-z]{2}$/, 'state must be a two-letter code'),
+  year: z.number().int().min(2000).max(2100),
+  suiRate: zRate,
+  suiWageBase: zRate,
+  sdiRate: zRate,
+  sdiWageBase: zRate,
+  accountNumber: z.string().max(50).nullish(),
+});
+
+export const workersCompCodeSchema = z.object({
+  code: z.string().min(1, 'class code is required').max(20),
+  description: z.string().max(255).nullish(),
+  ratePer100: z.union([z.string(), z.number()]),
+  isActive: z.boolean().optional(),
+});
+export const updateWorkersCompCodeSchema = workersCompCodeSchema.partial();

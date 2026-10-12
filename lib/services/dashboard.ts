@@ -12,6 +12,7 @@
  *
  * Served by GET /api/dashboard and rendered server-side by app/dashboard/page.tsx.
  */
+import { isAccountsPayable, isAccountsReceivable, isCashAccount } from '@/lib/accountTypes';
 import { and, desc, eq, gte, isNotNull, lt, lte, notInArray, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -189,8 +190,6 @@ export async function getDashboardInsights(
 // Pieces
 // ---------------------------------------------------------------------------
 
-const CASH_SUBTYPES = new Set(['checking', 'savings']);
-
 /**
  * The original five KPI tiles. Preserves the fiscal-YTD scoping from lib/ytd.ts
  * (settings.fiscalYearEnd "MM-DD"; defaults to Jan 1).
@@ -208,9 +207,12 @@ async function kpiCards(ctx: ServiceContext, now: Date): Promise<DashboardKpis> 
     ytdTo: ytd.to.toISOString(),
     revenueYtd: pl.totalIncome,
     netProfitYtd: pl.netIncome,
-    cash: sumWhere((a) => a.type === 'asset' && CASH_SUBTYPES.has(a.subtype)),
-    accountsReceivable: sumWhere((a) => a.subtype === 'accounts_receivable'),
-    accountsPayable: sumWhere((a) => a.subtype === 'accounts_payable'),
+    // Cash = bank accounts + Undeposited Funds (lib/accountTypes.ts); prepaids and other
+    // current assets are not cash. A/P = Accounts Payable accounts only (not payroll /
+    // sales-tax liabilities, which are Other Current Liabilities).
+    cash: sumWhere((a) => isCashAccount(a)),
+    accountsReceivable: sumWhere((a) => isAccountsReceivable(a)),
+    accountsPayable: sumWhere((a) => isAccountsPayable(a)),
   };
 }
 

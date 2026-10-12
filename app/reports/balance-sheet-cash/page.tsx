@@ -8,7 +8,7 @@
  */
 import { Scale } from 'lucide-react';
 import { Badge, Button, Card, Input, Label, PageHeader } from '@/components/ui';
-import { getServerContext } from '@/lib/context';
+import { getPageContext } from '@/lib/context';
 import { balanceSheetCashBasis, type BalanceSheetCashBasis } from '@/lib/services/balanceSheetCashBasis';
 import { formatCurrency, Money } from '@/lib/money';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
@@ -120,7 +120,7 @@ export default async function BalanceSheetCashPage({
 }: {
   searchParams: Promise<{ asOf?: string }>;
 }) {
-  const ctx = await getServerContext();
+  const ctx = await getPageContext('/reports/balance-sheet-cash');
   const params = await searchParams;
   const asOf = parseParamDate(params.asOf) ?? new Date();
   const asOfStr = toInputDate(asOf);
@@ -131,7 +131,7 @@ export default async function BalanceSheetCashPage({
     {
       accountId: 're',
       code: '3900',
-      name: 'Net Income / Retained Earnings',
+      name: 'Net Income / Retained Earnings (cash basis)',
       amount: bs.retainedEarnings,
     },
   ];
@@ -164,7 +164,7 @@ export default async function BalanceSheetCashPage({
       {/* Header */}
       <PageHeader
         title="Balance Sheet — Cash Basis"
-        icon={Scale}
+        iconNode={<Scale className="text-electric h-8 w-8" />}
         action={
           <Badge tone={bs.balanced ? 'success' : 'danger'}>
             {bs.balanced ? 'Assets = Liabilities + Equity' : 'OUT OF BALANCE'}
@@ -183,8 +183,8 @@ export default async function BalanceSheetCashPage({
           </span>
         )}
         <span className="text-xs text-navy/40">
-          AR (1200) and AP (2000) excluded — equity adjusted by{' '}
-          {formatCurrency(bs.adjustments.equityAdjustment)}
+          Accounts receivable &amp; payable excluded — earnings reduced by{' '}
+          {formatCurrency(bs.adjustments.equityAdjustment)} not yet received/paid in cash
         </span>
       </div>
 

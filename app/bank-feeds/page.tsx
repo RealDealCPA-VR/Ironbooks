@@ -26,9 +26,10 @@ import {
   Td,
   Tr,
   Badge,
-  toast,
+  toast, toastError,
 } from '@/components/ui';
-import { api, ApiError } from '@/lib/client';
+import { Help } from '@/components/Help';
+import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { format, parseISO } from 'date-fns';
 
@@ -38,6 +39,9 @@ import { format, parseISO } from 'date-fns';
 
 interface PlaidStatusResponse {
   configured: boolean;
+  /** Privacy & Network policy verdict for the 'bank-feeds' purpose (cloud opt-in). */
+  allowed?: boolean;
+  reason?: string;
 }
 
 interface BankAccount {
@@ -121,6 +125,7 @@ function loadPlaidScript(): Promise<void> {
 
 export default function BankFeedsPage() {
   const [configured, setConfigured] = useState<boolean | null>(null);
+  const [policyBlock, setPolicyBlock] = useState<string | null>(null);
   const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
   const [selectedBankAccountId, setSelectedBankAccountId] = useState('');
   const [connecting, setConnecting] = useState(false);
@@ -131,7 +136,10 @@ export default function BankFeedsPage() {
   useEffect(() => {
     api
       .get<PlaidStatusResponse>('/api/plaid/status')
-      .then((data) => setConfigured(data.configured))
+      .then((data) => {
+        if (data.allowed === false) setPolicyBlock(data.reason ?? 'Bank feeds are turned off.');
+        setConfigured(data.configured);
+      })
       .catch(() => setConfigured(false));
   }, []);
 
@@ -145,7 +153,7 @@ export default function BankFeedsPage() {
         if (rows.length > 0) setSelectedBankAccountId(rows[0].id);
       })
       .catch((err) => {
-        toast(err instanceof ApiError ? err.message : 'Failed to load bank accounts.', 'danger');
+        toastError(err, 'Failed to load bank accounts.');
       });
   }, [configured]);
 
@@ -204,7 +212,7 @@ export default function BankFeedsPage() {
               'success',
             );
           } catch (err) {
-            toast(err instanceof ApiError ? err.message : 'Sync failed. Please try again.', 'danger');
+            toastError(err, 'Sync failed. Please try again.');
           } finally {
             setConnecting(false);
             plaidHandlerRef.current?.destroy();
@@ -225,7 +233,7 @@ export default function BankFeedsPage() {
       plaidHandlerRef.current = handler;
       handler.open();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to start bank connection.', 'danger');
+      toastError(err, 'Failed to start bank connection.');
       setConnecting(false);
     }
   }, [selectedBankAccountId, bankAccounts]);
@@ -240,11 +248,56 @@ export default function BankFeedsPage() {
     );
   }
 
+  // ---- Render: blocked by the Privacy & Network policy ---------------------
+  if (policyBlock) {
+    return (
+      <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+        <PageHeader title="Live Bank Feeds" icon={Rss} />
+        <Card className="p-8 max-w-2xl">
+          <h2 className="text-xl font-bold text-navy mb-2">Bank feeds are off for this company</h2>
+          <p className="text-navy/60 text-sm mb-4">{policyBlock}</p>
+          <p className="text-navy/60 text-sm mb-6">
+            Live bank feeds connect to Plaid over the internet. BookKeeper AI keeps your books on this
+            computer, so cloud bank feeds stay off until an admin opts in. You can always import bank
+            files (OFX/QFX/CSV) instead — nothing leaves this machine.
+          </p>
+          <div className="flex gap-2">
+            <Link href="/privacy">
+              <Button variant="secondary">Privacy &amp; Network settings</Button>
+            </Link>
+            <Link href="/banking">
+              <Button>Import a bank file</Button>
+            </Link>
+          </div>
+        </Card>
+      </main>
+    );
+  }
+
   // ---- Render: not configured --------------------------------------------
   if (!configured) {
     return (
       <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
         <PageHeader title="Live Bank Feeds" icon={Rss} />
+
+        {/* Offline alternative first: most users never need a live connection. */}
+        <Card className="p-6 mb-6 max-w-2xl border-l-4 border-electric">
+          <h2 className="text-lg font-bold text-navy mb-1">No live connection needed</h2>
+          <p className="text-sm text-navy/60 mb-4">
+            Download a statement file (CSV, OFX or QFX) from your bank&apos;s website and import it.
+            Your data stays on this computer. Then review each transaction and choose where it belongs
+            (its account in the chart of accounts <Help term="chart-of-accounts" side="bottom" />), and
+            reconcile <Help term="reconcile" side="bottom" /> against the statement at month end.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Link href="/banking" className="inline-flex items-center justify-center gap-2 rounded-lg font-semibold bg-electric text-white hover:bg-electric/90 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1 px-4 py-2 text-sm">
+              Import a statement file
+            </Link>
+            <Link href="/bank-review" className="inline-flex items-center justify-center gap-2 rounded-lg font-semibold bg-white text-navy border border-slate-200 hover:bg-slate-50 outline-none focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1 px-4 py-2 text-sm">
+              Review downloaded transactions
+            </Link>
+          </div>
+        </Card>
 
         <Card className="p-8 max-w-2xl">
           <div className="flex items-start gap-4">
@@ -252,9 +305,10 @@ export default function BankFeedsPage() {
               !
             </div>
             <div>
-              <h2 className="text-xl font-bold text-navy mb-2">Plaid not configured</h2>
+              <h2 className="text-xl font-bold text-navy mb-2">Optional: live feeds (Plaid not configured)</h2>
               <p className="text-navy/60 text-sm mb-6">
-                Live bank feeds use the Plaid API. Set the following environment variables and
+                Live bank feeds use the Plaid API, an online service, and are usually set up by
+                whoever installs BookKeeper for you. Set the following environment variables and
                 restart the app to enable this feature.
               </p>
 
@@ -318,7 +372,9 @@ export default function BankFeedsPage() {
 
         <div className="flex flex-wrap items-end gap-4">
           <div className="flex-1 min-w-[220px]">
-            <Label htmlFor="bank-account-select">Target bank account</Label>
+            <Label htmlFor="bank-account-select">
+              Target bank account <Help term="reconcile" side="bottom" />
+            </Label>
             {bankAccounts.length === 0 ? (
               <p className="text-sm text-navy/50 mt-1">
                 No bank accounts found.{' '}
@@ -357,6 +413,18 @@ export default function BankFeedsPage() {
           authenticate, and your recent transactions will be imported automatically.
         </p>
       </Card>
+
+      {/* Next step after a sync: downloaded lines still need a home. */}
+      {syncHistory.length > 0 && (
+        <Card className="p-4 mb-6 max-w-2xl flex flex-wrap items-center justify-between gap-3 border-l-4 border-emerald">
+          <p className="text-sm text-navy/70">
+            Next: review the downloaded transactions and match or categorize each one.
+          </p>
+          <Link href="/bank-review" className="inline-flex items-center justify-center gap-2 rounded-lg font-semibold bg-electric text-white hover:bg-electric/90 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1 px-3 py-1.5 text-sm">
+            Review transactions
+          </Link>
+        </Card>
+      )}
 
       {/* Sync history */}
       {syncHistory.length > 0 && (

@@ -13,6 +13,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { emailInvoice } from '@/lib/services/email';
+import { templateIdParam } from '@/lib/validation/prefs';
 import { ServiceError } from '@/lib/services/_base';
 
 type RouteContext = { params: Promise<{ id: string }> };
@@ -41,16 +42,25 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const ctx = await getServerContext();
 
     let to: string | undefined;
+    let templateId: string | undefined;
     try {
       const body = await req.json();
       if (body && typeof body.to === 'string' && body.to.trim()) {
         to = body.to.trim();
       }
+      // Optional form template (Templates); default = the invoice default template.
+      if (body && typeof body.templateId === 'string' && body.templateId) {
+        const t = templateIdParam(body.templateId);
+        if (t === false) {
+          return NextResponse.json({ error: 'templateId must be a valid id', code: 'VALIDATION' }, { status: 400 });
+        }
+        templateId = t ?? undefined;
+      }
     } catch {
       // No body or non-JSON body — fall back to customer email.
     }
 
-    await emailInvoice(ctx, id, to);
+    await emailInvoice(ctx, id, to, templateId);
     return NextResponse.json({ ok: true });
   } catch (err) {
     return errorResponse(err);

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Archive, ArchiveRestore, Building2, Download } from 'lucide-react';
+import { Archive, ArchiveRestore, Building2, Download, History } from 'lucide-react';
 import {
   Button,
   Card,
@@ -45,6 +45,18 @@ interface CondenseResult {
   dryRun: boolean;
   archivePath: string | null;
   runId: string | null;
+}
+
+interface CondenseArchiveRow {
+  id: string;
+  filename: string;
+  createdAt: string;
+  companyId: string;
+  companyName: string | null;
+  beforeDate: string;
+  entriesCondensed: number;
+  sizeBytes: number;
+  available: boolean;
 }
 
 /** Download a fetch Response as a file, using Content-Disposition when present. */
@@ -98,6 +110,12 @@ export default function BackupPage() {
   const [condenseConfirmText, setCondenseConfirmText] = useState('');
   const [condensing, setCondensing] = useState(false);
 
+  // ---- Condense archive copies ----
+  const [archives, setArchives] = useState<CondenseArchiveRow[]>([]);
+  const [archiveToRestore, setArchiveToRestore] = useState<CondenseArchiveRow | null>(null);
+  const [archiveConfirmText, setArchiveConfirmText] = useState('');
+  const [restoringArchive, setRestoringArchive] = useState(false);
+
   async function loadCompanies() {
     try {
       const res = await fetch('/api/companies', { cache: 'no-store' });
@@ -110,8 +128,18 @@ export default function BackupPage() {
     }
   }
 
+  async function loadArchives() {
+    try {
+      const data = await api.get<{ archives: CondenseArchiveRow[] }>('/api/condense/archives');
+      setArchives(data.archives);
+    } catch {
+      /* archive list is informational — the rest of the page still works */
+    }
+  }
+
   useEffect(() => {
     loadCompanies();
+    loadArchives();
   }, []);
 
   // ---------------------------------------------------------------------------
@@ -292,10 +320,35 @@ export default function BackupPage() {
       setCondenseModalOpen(false);
       setCondenseConfirmText('');
       setCondensePreview(null);
+      await loadArchives();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Condense failed. Nothing was changed.', 'danger');
     } finally {
       setCondensing(false);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Restore a condense archive copy
+  // ---------------------------------------------------------------------------
+
+  async function handleArchiveRestoreConfirm() {
+    if (!archiveToRestore || archiveConfirmText !== 'RESTORE') return;
+    setRestoringArchive(true);
+    try {
+      await api.post('/api/condense/archives', { id: archiveToRestore.id });
+      toast(
+        `Archive copy from ${new Date(archiveToRestore.createdAt).toLocaleDateString('en-US')} restored — ` +
+          'the full transaction detail is back. Reloading…',
+        'success',
+      );
+      setArchiveToRestore(null);
+      setArchiveConfirmText('');
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'The archive copy could not be restored.', 'danger');
+    } finally {
+      setRestoringArchive(false);
     }
   }
 
@@ -363,9 +416,10 @@ export default function BackupPage() {
           <Card className="p-6 flex flex-col gap-3">
             <h2 className="text-lg font-bold text-navy">Full Backup (all companies)</h2>
             <p className="text-sm text-navy/60">
-              Save a complete snapshot of the whole data directory — every company file — to your
-              computer as a <span className="font-mono text-navy/80">.bka</span> file. Keep this
-              file in a safe place.
+              Save a complete, compressed snapshot of the whole data directory — every company
+              file, attachments and the transaction log — to your computer as a{' '}
+              <span className="font-mono text-navy/80">.bka</span> file. Restoring it brings back
+              everything exactly. Keep this file in a safe place.
             </p>
             <div>
               <Button onClick={handleDownload} loading={downloading}>
@@ -418,9 +472,10 @@ export default function BackupPage() {
               <span className="font-semibold">closed</span> first.
             </p>
             <p className="text-sm font-medium text-red-600">
-              This permanently deletes transaction detail and cannot be undone. The only way back
-              is the archive <span className="font-mono">.bka</span> snapshot that is saved
-              automatically before condensing.
+              This permanently deletes transaction detail from the working file. A complete archive
+              copy (<span className="font-mono">.bka</span>) is saved and verified automatically
+              before anything is removed — restore it from <span className="font-semibold">Archive
+              copies</span> below to bring the full detail back.
             </p>
             <div className="flex flex-wrap items-end gap-3">
               <div>
@@ -493,6 +548,103 @@ export default function BackupPage() {
             )}
           </Card>
         </div>
+
+        {/* Condense archive copies */}
+        <div className="max-w-xl mt-6">
+          <Card className="p-6 flex flex-col gap-3">
+            <h2 className="text-lg font-bold text-navy flex items-center gap-2">
+              <History className="h-5 w-5 text-electric" />
+              Archive copies (from Condense)
+            </h2>
+            <p className="text-sm text-navy/60">
+              Each condense first saves a full copy of the company file with all of its detail.
+              Restoring one replaces the current file with that copy — anything entered after the
+              condense is not in it (the current file is backed up automatically first).
+            </p>
+            {archives.length === 0 ? (
+              <p className="text-sm text-navy/40">No archive copies yet.</p>
+            ) : (
+              <ul className="divide-y divide-slate-100">
+                {archives.map((a) => (
+                  <li key={a.id} className="flex items-center justify-between gap-3 py-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-navy">
+                        {new Date(a.createdAt).toLocaleString('en-US')} — detail before {a.beforeDate}
+                      </p>
+                      <p className="text-xs text-navy/50 truncate" title={a.filename}>
+                        {a.entriesCondensed.toLocaleString()} entries condensed ·{' '}
+                        {(a.sizeBytes / (1024 * 1024)).toFixed(1)} MB · {a.filename}
+                        {!a.available && <span className="text-red-600"> · file missing</span>}
+                      </p>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={!a.available}
+                      onClick={() => {
+                        setArchiveConfirmText('');
+                        setArchiveToRestore(a);
+                      }}
+                    >
+                      <ArchiveRestore className="h-4 w-4" />
+                      Restore archive copy…
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Card>
+        </div>
+
+        {/* Archive-restore confirmation modal — requires typing RESTORE */}
+        <Modal
+          open={Boolean(archiveToRestore)}
+          onClose={() => {
+            if (!restoringArchive) setArchiveToRestore(null);
+          }}
+          title="Restore archive copy?"
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setArchiveToRestore(null)} disabled={restoringArchive}>
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                onClick={handleArchiveRestoreConfirm}
+                loading={restoringArchive}
+                disabled={archiveConfirmText !== 'RESTORE'}
+              >
+                Restore archive copy
+              </Button>
+            </>
+          }
+        >
+          <div className="flex flex-col gap-3 text-sm text-navy/70">
+            <p>
+              The company file will be returned to how it was on{' '}
+              <span className="font-semibold text-navy">
+                {archiveToRestore ? new Date(archiveToRestore.createdAt).toLocaleString('en-US') : ''}
+              </span>
+              , just before condensing — with every detailed transaction.
+            </p>
+            <p className="text-red-600 font-medium">
+              Changes made after that moment will not be in the restored file. The current file is
+              saved automatically as a safety backup first.
+            </p>
+            <div>
+              <Label htmlFor="archive-confirm">
+                Type <span className="font-mono font-bold">RESTORE</span> to continue
+              </Label>
+              <Input
+                id="archive-confirm"
+                autoFocus
+                value={archiveConfirmText}
+                onChange={(e) => setArchiveConfirmText(e.target.value)}
+                placeholder="RESTORE"
+              />
+            </div>
+          </div>
+        </Modal>
 
         {/* Full-restore confirmation modal */}
         <Modal
@@ -622,10 +774,10 @@ export default function BackupPage() {
               {condensePreview?.summaryEntriesToCreate ?? 0} monthly summary entries.
             </p>
             <p className="text-red-600 font-medium">
-              THIS CANNOT BE UNDONE. Transaction-level detail, drill-down links on old closed
-              documents, and completed-reconciliation detail in this range will be gone forever.
-              The only way back is restoring the archive .bka snapshot saved automatically before
-              condensing — which rolls back EVERYTHING to this moment.
+              Transaction-level detail, drill-down links on old closed documents, and
+              completed-reconciliation detail in this range will be removed from the working file.
+              The only way back is restoring the archive copy saved automatically before
+              condensing (Archive copies, below) — which rolls back EVERYTHING to this moment.
             </p>
             <p>
               Account balances, monthly totals, and class totals are preserved. Open invoices,

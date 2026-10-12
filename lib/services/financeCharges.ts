@@ -427,6 +427,7 @@ export async function assessFinanceCharges(
               accountId: arAccountId,
               debit: toAmountString(charge),
               memo: `Invoice #${invoiceNumber} — finance charge`,
+              controlLine: true,
             },
             {
               accountId: fcIncomeId,

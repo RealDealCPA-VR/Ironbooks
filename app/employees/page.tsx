@@ -27,6 +27,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { EditPaycheckModal } from './EditPaycheckModal';
 import Decimal from 'decimal.js';
 
 // ---------------------------------------------------------------------------
@@ -41,10 +42,30 @@ interface EmployeeAddress {
   zip?: string;
 }
 
+type FilingStatus = 'single' | 'married' | 'head_of_household';
+
+/** employees.w4 — 2020+ Form W-4 Steps 1(c)-4, or pre-2020 allowances (formYear < 2020). */
 interface EmployeeW4 {
-  filingStatus?: 'single' | 'married';
-  dependents?: number;
+  filingStatus?: FilingStatus;
+  formYear?: number;
+  step2Checkbox?: boolean;
+  dependentsAmount?: string;
+  otherIncome?: string;
+  deductions?: string;
   extraWithholding?: string;
+  allowances?: number;
+  exempt?: boolean;
+  /** Work state for state payroll taxes (SUI / SDI). */
+  state?: string;
+  /** Legacy field from earlier versions (count of dependents, not used in the math). */
+  dependents?: number;
+}
+
+interface WcCode {
+  id: string;
+  code: string;
+  description: string | null;
+  isActive: boolean;
 }
 
 interface Employee {
@@ -58,6 +79,10 @@ interface Employee {
   w4: EmployeeW4 | null;
   address: EmployeeAddress | null;
   isActive: boolean;
+  phone?: string | null;
+  hireDate?: string | null;
+  releaseDate?: string | null;
+  workersCompCodeId?: string | null;
 }
 
 interface Paycheck {
@@ -84,9 +109,21 @@ interface EmployeeFormState {
   payRate: string;
   // Payroll info (edit modal)
   ssn: string; // new entry only — existing value shown masked
-  filingStatus: 'single' | 'married';
-  dependents: string;
+  filingStatus: FilingStatus;
+  /** '2020' = redesigned W-4 (2020 or later), '2019' = older form with allowances. */
+  w4Version: '2020' | '2019';
+  step2: string; // 'true' | ''
+  dependentsAmount: string;
+  otherIncome: string;
+  w4Deductions: string;
+  allowances: string;
   extraWithholding: string;
+  exempt: string; // 'true' | ''
+  workState: string;
+  phone: string;
+  hireDate: string;
+  releaseDate: string;
+  workersCompCodeId: string;
   addrLine1: string;
   addrLine2: string;
   addrCity: string;
@@ -189,8 +226,19 @@ const EMPTY_EMPLOYEE_FORM: EmployeeFormState = {
   payRate: '',
   ssn: '',
   filingStatus: 'single',
-  dependents: '',
+  w4Version: '2020',
+  step2: '',
+  dependentsAmount: '',
+  otherIncome: '',
+  w4Deductions: '',
+  allowances: '',
   extraWithholding: '',
+  exempt: '',
+  workState: '',
+  phone: '',
+  hireDate: '',
+  releaseDate: '',
+  workersCompCodeId: '',
   addrLine1: '',
   addrLine2: '',
   addrCity: '',
@@ -292,9 +340,27 @@ function employeeToForm(emp: Employee): EmployeeFormState {
     payType: emp.payType,
     payRate: emp.payRate,
     ssn: '',
-    filingStatus: emp.w4?.filingStatus === 'married' ? 'married' : 'single',
-    dependents: emp.w4?.dependents != null ? String(emp.w4.dependents) : '',
+    filingStatus:
+      emp.w4?.filingStatus === 'married' || emp.w4?.filingStatus === 'head_of_household'
+        ? emp.w4.filingStatus
+        : 'single',
+    w4Version:
+      (typeof emp.w4?.formYear === 'number' && emp.w4.formYear < 2020) ||
+      (emp.w4?.formYear == null && (emp.w4?.allowances ?? 0) > 0)
+        ? '2019'
+        : '2020',
+    step2: emp.w4?.step2Checkbox ? 'true' : '',
+    dependentsAmount: emp.w4?.dependentsAmount != null ? String(emp.w4.dependentsAmount) : '',
+    otherIncome: emp.w4?.otherIncome != null ? String(emp.w4.otherIncome) : '',
+    w4Deductions: emp.w4?.deductions != null ? String(emp.w4.deductions) : '',
+    allowances: emp.w4?.allowances != null ? String(emp.w4.allowances) : '',
     extraWithholding: emp.w4?.extraWithholding != null ? String(emp.w4.extraWithholding) : '',
+    exempt: emp.w4?.exempt ? 'true' : '',
+    workState: emp.w4?.state ?? '',
+    phone: emp.phone ?? '',
+    hireDate: emp.hireDate ? String(emp.hireDate).slice(0, 10) : '',
+    releaseDate: emp.releaseDate ? String(emp.releaseDate).slice(0, 10) : '',
+    workersCompCodeId: emp.workersCompCodeId ?? '',
     addrLine1: emp.address?.line1 ?? '',
     addrLine2: emp.address?.line2 ?? '',
     addrCity: emp.address?.city ?? '',
@@ -313,11 +379,13 @@ function EmployeeForm({
   onChange,
   ssnLast4,
   showPayrollInfo,
+  wcCodes = [],
 }: {
   form: EmployeeFormState;
   onChange: (field: keyof EmployeeFormState, value: string) => void;
   ssnLast4?: string | null;
   showPayrollInfo?: boolean;
+  wcCodes?: WcCode[];
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -404,41 +472,120 @@ function EmployeeForm({
                 )}
               </div>
               <div>
-                <Label htmlFor="empFiling">W-4 Filing Status</Label>
-                <Select
-                  id="empFiling"
-                  value={form.filingStatus}
-                  onChange={(e) => onChange('filingStatus', e.target.value)}
-                >
-                  <option value="single">Single</option>
-                  <option value="married">Married</option>
-                </Select>
+                <Label htmlFor="empPhone">Phone</Label>
+                <Input
+                  id="empPhone"
+                  value={form.phone}
+                  onChange={(e) => onChange('phone', e.target.value)}
+                />
               </div>
             </div>
             <div className="grid grid-cols-2 gap-3 mt-3">
               <div>
-                <Label htmlFor="empDependents">W-4 Dependents</Label>
+                <Label htmlFor="empHire">Hire date</Label>
+                <Input id="empHire" type="date" value={form.hireDate} onChange={(e) => onChange('hireDate', e.target.value)} />
+              </div>
+              <div>
+                <Label htmlFor="empRelease">Release date</Label>
+                <Input id="empRelease" type="date" value={form.releaseDate} onChange={(e) => onChange('releaseDate', e.target.value)} />
+              </div>
+            </div>
+
+            <p className="text-xs font-semibold text-navy/50 uppercase tracking-wide mt-4 mb-2">
+              Federal W-4
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label htmlFor="empW4Version">Form version</Label>
+                <Select id="empW4Version" value={form.w4Version} onChange={(e) => onChange('w4Version', e.target.value)}>
+                  <option value="2020">2020 or later</option>
+                  <option value="2019">2019 or earlier (allowances)</option>
+                </Select>
+              </div>
+              <div>
+                <Label htmlFor="empFiling">Filing status</Label>
+                <Select id="empFiling" value={form.filingStatus} onChange={(e) => onChange('filingStatus', e.target.value)}>
+                  <option value="single">Single or married filing separately</option>
+                  <option value="married">Married filing jointly</option>
+                  {form.w4Version === '2020' && <option value="head_of_household">Head of household</option>}
+                </Select>
+              </div>
+            </div>
+            {form.w4Version === '2020' ? (
+              <>
+                <label className="flex items-start gap-2 text-sm text-navy mt-3">
+                  <input
+                    type="checkbox"
+                    className="mt-1"
+                    checked={form.step2 === 'true'}
+                    onChange={(e) => onChange('step2', e.target.checked ? 'true' : '')}
+                  />
+                  <span>Step 2: multiple jobs or spouse works (box checked)</span>
+                </label>
+                <div className="grid grid-cols-2 gap-3 mt-3">
+                  <div>
+                    <Label htmlFor="empDepAmt">Step 3: dependents amount ($ per year)</Label>
+                    <Input id="empDepAmt" inputMode="decimal" placeholder="0.00" value={form.dependentsAmount} onChange={(e) => onChange('dependentsAmount', e.target.value)} />
+                  </div>
+                  <div>
+                    <Label htmlFor="empOther">Step 4(a): other income ($ per year)</Label>
+                    <Input id="empOther" inputMode="decimal" placeholder="0.00" value={form.otherIncome} onChange={(e) => onChange('otherIncome', e.target.value)} />
+                  </div>
+                  <div>
+                    <Label htmlFor="empDed">Step 4(b): deductions ($ per year)</Label>
+                    <Input id="empDed" inputMode="decimal" placeholder="0.00" value={form.w4Deductions} onChange={(e) => onChange('w4Deductions', e.target.value)} />
+                  </div>
+                  <div>
+                    <Label htmlFor="empExtraWh">Step 4(c): extra withholding per paycheck</Label>
+                    <Input id="empExtraWh" inputMode="decimal" placeholder="0.00" value={form.extraWithholding} onChange={(e) => onChange('extraWithholding', e.target.value)} />
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="grid grid-cols-2 gap-3 mt-3">
+                <div>
+                  <Label htmlFor="empAllow">Allowances</Label>
+                  <Input id="empAllow" type="number" min="0" step="1" value={form.allowances} onChange={(e) => onChange('allowances', e.target.value)} />
+                </div>
+                <div>
+                  <Label htmlFor="empExtraWh">Extra withholding per paycheck</Label>
+                  <Input id="empExtraWh" inputMode="decimal" placeholder="0.00" value={form.extraWithholding} onChange={(e) => onChange('extraWithholding', e.target.value)} />
+                </div>
+              </div>
+            )}
+            <label className="flex items-start gap-2 text-sm text-navy mt-3">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={form.exempt === 'true'}
+                onChange={(e) => onChange('exempt', e.target.checked ? 'true' : '')}
+              />
+              <span>Exempt from federal income tax withholding (Social Security and Medicare still apply)</span>
+            </label>
+            <div className="grid grid-cols-2 gap-3 mt-3">
+              <div>
+                <Label htmlFor="empWorkState">Work state (for state payroll taxes)</Label>
                 <Input
-                  id="empDependents"
-                  type="number"
-                  min="0"
-                  step="1"
-                  placeholder="0"
-                  value={form.dependents}
-                  onChange={(e) => onChange('dependents', e.target.value)}
+                  id="empWorkState"
+                  maxLength={2}
+                  placeholder="Same as address"
+                  value={form.workState}
+                  onChange={(e) => onChange('workState', e.target.value.toUpperCase())}
                 />
               </div>
               <div>
-                <Label htmlFor="empExtraWh">Extra Withholding / Period</Label>
-                <Input
-                  id="empExtraWh"
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  placeholder="0.00"
-                  value={form.extraWithholding}
-                  onChange={(e) => onChange('extraWithholding', e.target.value)}
-                />
+                <Label htmlFor="empWc">Workers&apos; comp class</Label>
+                <Select id="empWc" value={form.workersCompCodeId} onChange={(e) => onChange('workersCompCodeId', e.target.value)}>
+                  <option value="">None</option>
+                  {wcCodes
+                    .filter((c) => c.isActive || c.id === form.workersCompCodeId)
+                    .map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.code}
+                        {c.description ? ` — ${c.description}` : ''}
+                      </option>
+                    ))}
+                </Select>
               </div>
             </div>
           </div>
@@ -585,6 +732,9 @@ export default function EmployeesPage() {
   // Voiding state (paycheck pending confirmation + id being voided)
   const [pendingVoid, setPendingVoid] = useState<(Paycheck & { employeeName: string }) | null>(null);
   const [voidingId, setVoidingId] = useState<string | null>(null);
+  // Edit paycheck (void + repost on the server)
+  const [editPaycheck, setEditPaycheck] = useState<{ id: string; employeeName: string } | null>(null);
+  const [wcCodes, setWcCodes] = useState<WcCode[]>([]);
 
   // Deactivation confirm state
   const [pendingDeactivate, setPendingDeactivate] = useState<Employee | null>(null);
@@ -612,6 +762,8 @@ export default function EmployeesPage() {
       setPaychecks(pcData);
       setPayrollItems(itemData);
       setAccounts(acctData);
+      // Workers' comp codes are optional — the page works without them.
+      api.get<WcCode[]>('/api/payroll/workers-comp').then(setWcCodes).catch(() => setWcCodes([]));
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load data', 'danger');
     } finally {
@@ -743,11 +895,31 @@ export default function EmployeesPage() {
       payRate: form.payRate,
       // SSN only when a new value was typed — blank keeps what is on file.
       ...(form.ssn.trim() ? { ssn: form.ssn.trim() } : {}),
-      w4: {
-        filingStatus: form.filingStatus,
-        dependents: form.dependents ? Number(form.dependents) : 0,
-        extraWithholding: form.extraWithholding || '0',
-      },
+      w4:
+        form.w4Version === '2019'
+          ? {
+              formYear: 2019,
+              filingStatus: form.filingStatus === 'married' ? 'married' : 'single',
+              allowances: form.allowances ? Number(form.allowances) : 0,
+              extraWithholding: form.extraWithholding || '0',
+              exempt: form.exempt === 'true',
+              ...(form.workState.trim() ? { state: form.workState.trim().toUpperCase() } : {}),
+            }
+          : {
+              formYear: 2020,
+              filingStatus: form.filingStatus,
+              step2Checkbox: form.step2 === 'true',
+              dependentsAmount: form.dependentsAmount || '0',
+              otherIncome: form.otherIncome || '0',
+              deductions: form.w4Deductions || '0',
+              extraWithholding: form.extraWithholding || '0',
+              exempt: form.exempt === 'true',
+              ...(form.workState.trim() ? { state: form.workState.trim().toUpperCase() } : {}),
+            },
+      phone: form.phone.trim() || null,
+      hireDate: form.hireDate || null,
+      releaseDate: form.releaseDate || null,
+      workersCompCodeId: form.workersCompCodeId || null,
       address: hasAddress
         ? {
             line1: form.addrLine1.trim(),
@@ -1341,7 +1513,18 @@ export default function EmployeesPage() {
                       <Badge tone="neutral">Draft</Badge>
                     )}
                   </Td>
-                  <Td className="text-right">
+                  <Td className="text-right whitespace-nowrap">
+                    {!pc.isVoid && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setEditPaycheck({ id: pc.id, employeeName: pc.employeeName })}
+                        title="Correct this paycheck"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        Edit
+                      </Button>
+                    )}
                     {!pc.isVoid && (
                       <Button
                         variant="ghost"
@@ -1633,6 +1816,7 @@ export default function EmployeesPage() {
           onChange={updateEditForm}
           ssnLast4={editingEmployee?.ssnLast4}
           showPayrollInfo
+          wcCodes={wcCodes}
         />
 
         {/* ---- Leave accruals (saved separately via PUT /api/payroll/accruals) ---- */}
@@ -2050,6 +2234,14 @@ export default function EmployeesPage() {
         loading={voidingId !== null}
         onConfirm={handleVoidPaycheck}
         onClose={() => setPendingVoid(null)}
+      />
+
+      {/* ---- Edit paycheck ---- */}
+      <EditPaycheckModal
+        paycheckId={editPaycheck?.id ?? null}
+        employeeName={editPaycheck?.employeeName ?? ''}
+        onClose={() => setEditPaycheck(null)}
+        onSaved={() => void fetchAll()}
       />
     </main>
   );

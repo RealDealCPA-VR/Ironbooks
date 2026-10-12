@@ -1,6 +1,6 @@
 /**
- * PATCH  /api/companies/[id]  — rename a company file (owner/admin only).
- * DELETE /api/companies/[id]  — archive (soft-delete) a company file (owner only;
+ * PATCH  /api/companies/[id]  — rename a company file (Company & Preferences: modify).
+ * DELETE /api/companies/[id]  — archive (soft-delete) a company file (Company: delete;
  *                               ?confirm=<exact company name> required; refuses the
  *                               caller's only active company). See manage.ts for why
  *                               this is a soft delete rather than a hard cascade.
@@ -10,8 +10,7 @@
  * existing company always requires a session.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
-import { getSessionUserId } from '@/lib/auth';
+import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { archiveCompany, renameCompany } from './manage';
 
@@ -35,16 +34,17 @@ interface RouteParams {
 
 export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
-    const userId = await getSessionUserId();
+    // File lock, file-bound session and deactivation checks (lib/context.ts getSessionGate);
+    // manage.ts then checks the caller's effective permissions in the company named by the URL.
+    const { db, userId } = await getSessionGate();
     if (!userId) {
       return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });
     }
     const { id } = await params;
-    const body = await req.json();
+    const body = await req.json().catch(() => null);
     if (typeof body?.name !== 'string') {
       return NextResponse.json({ error: 'name is required', code: 'VALIDATION' }, { status: 400 });
     }
-    const db = await getDb();
     const company = await renameCompany(db, userId, id, body.name);
     return NextResponse.json(company);
   } catch (err) {
@@ -54,14 +54,15 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
 
 export async function DELETE(req: NextRequest, { params }: RouteParams) {
   try {
-    const userId = await getSessionUserId();
+    // File lock, file-bound session and deactivation checks (lib/context.ts getSessionGate);
+    // manage.ts then checks the caller's effective permissions in the company named by the URL.
+    const { db, userId } = await getSessionGate();
     if (!userId) {
       return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });
     }
     const { id } = await params;
     // api.del sends no body, so the typed-name confirmation travels as ?confirm=.
     const confirm = new URL(req.url).searchParams.get('confirm') ?? '';
-    const db = await getDb();
     const company = await archiveCompany(db, userId, id, confirm);
     return NextResponse.json(company);
   } catch (err) {

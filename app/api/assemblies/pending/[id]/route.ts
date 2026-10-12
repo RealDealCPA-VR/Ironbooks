@@ -10,6 +10,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { cancelPendingBuild, finalizePendingBuild } from '@/lib/services/assemblies';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { buildSiteFieldsSchema } from '@/lib/validation/inventorySites';
 import { ServiceError } from '@/lib/services/_base';
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
@@ -36,7 +38,10 @@ export async function POST(req: NextRequest, { params }: RouteParams): Promise<N
     const body = (await req.json()) as { action?: string };
 
     if (body.action === 'finalize') {
-      const result = await finalizePendingBuild(ctx, id);
+      // Optional Advanced Inventory fields: build site / bins / serials / lots.
+      const site = buildSiteFieldsSchema.safeParse(body);
+      if (!site.success) return NextResponse.json(zodErrorBody(site.error), { status: 400 });
+      const result = await finalizePendingBuild(ctx, id, site.data);
       return NextResponse.json(result);
     }
     if (body.action === 'cancel') {

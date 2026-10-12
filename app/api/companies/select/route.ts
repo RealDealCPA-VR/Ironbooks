@@ -2,32 +2,48 @@
  * POST /api/companies/select  — set the active company (cookie read by getServerContext).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
 import { companies, userCompanies } from '@/lib/db/schema';
 import { and, eq } from 'drizzle-orm';
-import { getSessionUserId } from '@/lib/auth';
-import { COMPANY_COOKIE } from '@/lib/context';
+import { COMPANY_COOKIE, DEACTIVATED_MESSAGE, getSessionGate } from '@/lib/context';
+import { ServiceError } from '@/lib/services/_base';
+import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { stampLastOpened } from '../[id]/manage';
 
 export async function POST(req: NextRequest) {
-  // Require a session and verify the caller is a member of the company before pointing
-  // their active-company cookie at it. (getServerContext also re-validates membership, but
-  // gating here stops an unauthenticated/non-member caller from planting the cookie at all.)
-  const userId = await getSessionUserId();
+  // Require a session (file lock, file binding and deactivation checked by getSessionGate) and
+  // verify the caller is an ACTIVE member of the company before pointing their active-company
+  // cookie at it. (getServerContext also re-validates membership, but gating here stops an
+  // unauthenticated/non-member caller from planting the cookie at all.)
+  let gate;
+  try {
+    gate = await getSessionGate();
+  } catch (err) {
+    if (err instanceof ServiceError) {
+      return NextResponse.json({ error: err.message, code: err.code }, { status: 403 });
+    }
+    throw err;
+  }
+  const { db, userId } = gate;
   if (!userId) {
     return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });
   }
-  const { companyId } = await req.json();
+  const body = await req.json().catch(() => null);
+  const companyId = typeof body?.companyId === 'string' ? body.companyId : '';
   if (!companyId) {
     return NextResponse.json({ error: 'companyId is required', code: 'VALIDATION' }, { status: 400 });
   }
-  const db = await getDb();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(companyId)) {
+    return NextResponse.json({ error: 'Company not found', code: 'NOT_FOUND' }, { status: 404 });
+  }
   const [membership] = await db
-    .select({ companyId: userCompanies.companyId })
+    .select({ companyId: userCompanies.companyId, isActive: userCompanies.isActive })
     .from(userCompanies)
     .where(and(eq(userCompanies.userId, userId), eq(userCompanies.companyId, companyId)));
   if (!membership) {
     return NextResponse.json({ error: 'Forbidden', code: 'FORBIDDEN' }, { status: 403 });
+  }
+  if (membership.isActive === false) {
+    return NextResponse.json({ error: DEACTIVATED_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
   }
   const [c] = await db.select().from(companies).where(eq(companies.id, companyId));
   if (!c) {
@@ -38,7 +54,7 @@ export async function POST(req: NextRequest) {
   const res = NextResponse.json({ ok: true, company: c });
   res.cookies.set(COMPANY_COOKIE, companyId, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: cookieSecure(originFromHeaders(req.headers)),
     sameSite: 'lax',
     path: '/',
     maxAge: 60 * 60 * 24 * 365,

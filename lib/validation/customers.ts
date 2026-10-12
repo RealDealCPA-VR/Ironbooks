@@ -29,6 +29,11 @@ export const createCustomerSchema = z.object({
   taxRateId: zUuid.nullish(),
   parentId: zUuid.nullish(),
   notes: z.string().nullish(),
+  /** Wave-2 lists: Terms list entry, Sales Tax Code, resale number, exemption reason. */
+  termsId: zUuid.nullish(),
+  salesTaxCodeId: zUuid.nullish(),
+  resaleNumber: z.string().max(50).nullish(),
+  taxExemptionReason: z.string().max(100).nullish(),
 });
 export type CreateCustomerBody = z.infer<typeof createCustomerSchema>;
 

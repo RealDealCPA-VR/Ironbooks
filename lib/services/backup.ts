@@ -16,7 +16,7 @@ import { resolveDataDir, closeDb, type DB } from '@/lib/db';
 import {
   accounts, assemblyComponents, attachments, auditLogs, bankAccounts, bankTransactions,
   billLines, billPaymentApplications, billPayments, bills, budgetLines, budgets, classes,
-  companies, creditMemoLines, creditMemos, currencies, customerPrices, customers,
+  companies, companyRoles, creditMemoLines, creditMemos, currencies, customerPrices, customers,
   depositLines, deposits, depreciationEntries, employees, errorCorrections, errorDetections,
   estimateLines, estimates, expenseLines, expenseReportLines, expenseReports, expenses,
   fileImports, fiscalPeriods, fixedAssets, inventoryLayers, invoiceLines, invoices, items,
@@ -26,8 +26,24 @@ import {
   salesOrders, salesReceiptLines, salesReceipts, salesReps, taxAgencies, taxRateComponents,
   taxRates, timeEntries, transactionRules, transfers, userCompanies, vendorCreditLines,
   vendorCredits, vendors,
+  // team inventory (Advanced Inventory)
+  inventoryBins, inventoryLineDetails, inventoryLots, inventoryMovements, inventorySites,
+  inventoryTransferLines, inventoryTransfers, itemReceiptLines, itemReceipts, itemSiteSettings,
+  landedCostAllocationLines, landedCostAllocations, pendingBuilds,
+  // wave2 sales
+  bouncedChecks, collectionNotes, creditApplications,
+  // wave2 purchases
+  checkPrintSettings, loanPayments, loans,
+  // wave2 accountant
+  clientReviewTasks, listChangeReviews, salesTaxLineLinks, workingTbNotes,
+  // wave2 payroll
+  payrollStateSettings, workersCompCodes,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
+import { allowLedgerRewrite } from './posting';
+import { logTransaction, resetTransactionLogCache } from './transactionLog';
+import type { EffectiveAccess } from '@/lib/permissions/model';
+import { isMaskedValue, isSensitiveKey, maskSensitive } from '@/lib/permissions/mask';
 
 /** Name of the manifest entry embedded at the root of every .bka archive. */
 export const BACKUP_MANIFEST_ENTRY = 'bookkeeper-manifest.json';
@@ -46,11 +62,25 @@ interface BackupManifest {
   kind?: BackupKind;
   companyName: string | null;
   createdAt: string;
+  /**
+   * Per-company archives only: true when SSNs / tax IDs or account numbers were masked because
+   * the exporting user lacked the sensitive-data flags. Those fields restore as empty.
+   */
+  redacted?: boolean;
 }
 
 // ---------------------------------------------------------------------------
 // createBackup
 // ---------------------------------------------------------------------------
+
+/**
+ * Files at the root of a company data dir that identify/secure THIS file location and must
+ * never travel inside a backup: `.auth-secret` (HMAC key that signs session + unlock cookies)
+ * and `.file-id` (the company-file id session tokens are bound to; lib/auth.ts). A restore
+ * keeps the target directory's own copies, so sessions stay bound to the file they were
+ * issued for.
+ */
+export const FILE_LOCAL_SECRETS = ['.auth-secret', '.file-id'];
 
 export interface BackupResult {
   buffer: Buffer;
@@ -74,8 +104,11 @@ export function createBackup(companyName?: string, dataDir?: string): BackupResu
 
   const zip = new AdmZip();
   // addLocalFolder adds all files/dirs recursively under dir into the root of
-  // the zip, preserving the internal directory tree.
-  zip.addLocalFolder(dir);
+  // the zip, preserving the internal directory tree — EXCEPT the per-file
+  // secrets (FILE_LOCAL_SECRETS): a backup may be downloaded by any role with
+  // File Utilities, and the session signing secret would let them forge an
+  // Admin session.
+  zip.addLocalFolder(dir, '', (p: string) => !FILE_LOCAL_SECRETS.includes(p.replace(/\\/g, '/')));
 
   // Embed a manifest so restoreBackup can verify the archive is really a
   // BookKeeper backup (and reject backups from a newer, incompatible format).
@@ -298,6 +331,14 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
     }
     // The manifest is archive metadata, not a database file — keep it out of the data dir.
     fs.rmSync(path.join(tmpDir, BACKUP_MANIFEST_ENTRY), { force: true });
+    // Keep THIS file's signing secret + file id (FILE_LOCAL_SECRETS); never adopt ones from the
+    // archive (older backups included them).
+    for (const name of FILE_LOCAL_SECRETS) {
+      const restored = path.join(tmpDir, name);
+      const live = path.join(dir, name);
+      fs.rmSync(restored, { force: true });
+      if (fs.existsSync(live)) fs.copyFileSync(live, restored);
+    }
 
     // (3) Flush + release the live handle so it cannot checkpoint over the restored files.
     await closeDb(dir);
@@ -315,6 +356,8 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
       if (preRestoreDir) fs.renameSync(preRestoreDir, dir);
       throw err;
     }
+    // The running transaction log came back with the restored files — drop cached chain state.
+    resetTransactionLogCache(dir);
     if (preRestoreDir) {
       // Best-effort cleanup of the safety copy; a leftover dir is harmless.
       try {
@@ -459,6 +502,10 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
     name: 'depositLines', table: depositLines, companyCol: deposits.companyId,
     joins: [{ table: deposits, on: [depositLines.depositId, deposits.id] }],
   },
+  // wave2 payroll: SUI/SDI settings and workers' comp class codes (employees.workersCompCodeId
+  // is a soft pointer remapped through the global id map).
+  { name: 'payrollStateSettings', table: payrollStateSettings, joins: [], companyCol: payrollStateSettings.companyId },
+  { name: 'workersCompCodes', table: workersCompCodes, joins: [], companyCol: workersCompCodes.companyId },
   { name: 'paychecks', table: paychecks, joins: [], companyCol: paychecks.companyId },
   {
     name: 'paycheckLines', table: paycheckLines, companyCol: paychecks.companyId,
@@ -492,8 +539,55 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
     name: 'errorCorrections', table: errorCorrections, companyCol: errorDetections.companyId,
     joins: [{ table: errorDetections, on: [errorCorrections.errorDetectionId, errorDetections.id] }],
   },
+  // Custom roles (Users & Roles) travel with the company; assignments do not, because users are
+  // machine-local and the restoring user becomes the sole (Admin) member.
+  { name: 'companyRoles', table: companyRoles, joins: [], companyCol: companyRoles.companyId },
   { name: 'auditLogs', table: auditLogs, joins: [], companyCol: auditLogs.companyId },
+  // ---- team inventory: item receipts / pending builds + Advanced Inventory ----
+  { name: 'itemReceipts', table: itemReceipts, joins: [], companyCol: itemReceipts.companyId },
+  {
+    name: 'itemReceiptLines', table: itemReceiptLines, companyCol: itemReceipts.companyId,
+    joins: [{ table: itemReceipts, on: [itemReceiptLines.itemReceiptId, itemReceipts.id] }],
+  },
+  { name: 'pendingBuilds', table: pendingBuilds, joins: [], companyCol: pendingBuilds.companyId },
+  { name: 'inventorySites', table: inventorySites, joins: [], companyCol: inventorySites.companyId },
+  { name: 'inventoryBins', table: inventoryBins, joins: [], companyCol: inventoryBins.companyId },
+  { name: 'inventoryLots', table: inventoryLots, joins: [], companyCol: inventoryLots.companyId },
+  { name: 'itemSiteSettings', table: itemSiteSettings, joins: [], companyCol: itemSiteSettings.companyId },
+  { name: 'inventoryTransfers', table: inventoryTransfers, joins: [], companyCol: inventoryTransfers.companyId },
+  {
+    name: 'inventoryTransferLines', table: inventoryTransferLines, companyCol: inventoryTransfers.companyId,
+    joins: [{ table: inventoryTransfers, on: [inventoryTransferLines.transferId, inventoryTransfers.id] }],
+  },
+  { name: 'inventoryMovements', table: inventoryMovements, joins: [], companyCol: inventoryMovements.companyId },
+  { name: 'inventoryLineDetails', table: inventoryLineDetails, joins: [], companyCol: inventoryLineDetails.companyId },
+  { name: 'landedCostAllocations', table: landedCostAllocations, joins: [], companyCol: landedCostAllocations.companyId },
+  {
+    name: 'landedCostAllocationLines', table: landedCostAllocationLines, companyCol: landedCostAllocations.companyId,
+    joins: [{ table: landedCostAllocations, on: [landedCostAllocationLines.allocationId, landedCostAllocations.id] }],
+  },
+  // wave2 sales: credit applications, bounced checks, collections notes.
+  { name: 'creditApplications', table: creditApplications, joins: [], companyCol: creditApplications.companyId },
+  { name: 'bouncedChecks', table: bouncedChecks, joins: [], companyCol: bouncedChecks.companyId },
+  { name: 'collectionNotes', table: collectionNotes, joins: [], companyCol: collectionNotes.companyId },
+  // ---- wave2 purchases: Loan Manager + check printer setup (after vendors/accounts/expenses/bills) ----
+  { name: 'loans', table: loans, joins: [], companyCol: loans.companyId },
+  { name: 'loanPayments', table: loanPayments, joins: [], companyCol: loanPayments.companyId },
+  { name: 'checkPrintSettings', table: checkPrintSettings, joins: [], companyCol: checkPrintSettings.companyId },
+  // ---- wave2 accountant (client_review_snapshots is NOT exported: its balances are keyed by
+  // account id, which restore remaps, so an old snapshot would misreport every account) ----
+  { name: 'salesTaxLineLinks', table: salesTaxLineLinks, joins: [], companyCol: salesTaxLineLinks.companyId },
+  { name: 'workingTbNotes', table: workingTbNotes, joins: [], companyCol: workingTbNotes.companyId },
+  { name: 'listChangeReviews', table: listChangeReviews, joins: [], companyCol: listChangeReviews.companyId },
+  { name: 'clientReviewTasks', table: clientReviewTasks, joins: [], companyCol: clientReviewTasks.companyId },
 ];
+
+/**
+ * Opaque "soft pointer" columns: they may name rows that are not exported (users, the company
+ * itself, deleted records), so they are remapped when possible and otherwise kept verbatim —
+ * never treated as a hard foreign key.
+ */
+const SOFT_REF_KEYS: Record<string, Set<string>> = { auditLogs: new Set(['entityId']) };
 
 /** Columns that reference users.id — users are NOT exported, so on restore these map to the restoring user. */
 const USER_REF_KEYS = new Set([
@@ -524,9 +618,23 @@ export async function exportCompanyData(db: DB, companyId: string): Promise<Comp
   };
 }
 
-/** Zip a single company's rows into an in-memory per-company .bka buffer. */
-export async function createCompanyBackup(db: DB, companyId: string): Promise<BackupResult> {
-  const data = await exportCompanyData(db, companyId);
+/**
+ * Zip a single company's rows into an in-memory per-company .bka buffer.
+ *
+ * `opts.access` is the exporting user's effective access in that company: sensitive fields are
+ * masked for roles without "view sensitive payroll data" / "view full account numbers" (the
+ * same rule as every API response). Omit it only for trusted/system callers.
+ */
+export async function createCompanyBackup(
+  db: DB,
+  companyId: string,
+  opts: { access?: Pick<EffectiveAccess, 'flags'> | null } = {},
+): Promise<BackupResult> {
+  const raw = await exportCompanyData(db, companyId);
+  const data = maskSensitive(raw, opts.access);
+  const redacted = Boolean(
+    opts.access && !(opts.access.flags.sensitivePayroll && opts.access.flags.fullAccountNumbers),
+  );
 
   const zip = new AdmZip();
   const manifest: BackupManifest = {
@@ -535,6 +643,7 @@ export async function createCompanyBackup(db: DB, companyId: string): Promise<Ba
     kind: 'company',
     companyName: data.company.name,
     createdAt: new Date().toISOString(),
+    ...(redacted ? { redacted: true } : {}),
   };
   zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
   zip.addFile(COMPANY_DATA_ENTRY, Buffer.from(JSON.stringify(data), 'utf8'));
@@ -614,6 +723,8 @@ function topoSortByParent(
  *  - companyId → the new company
  *  - user references → the restoring user (users are machine-local, not in the backup)
  *  - every other UUID → its remapped fresh id
+ *  - masked sensitive values from a redacted export ("***-**-6789") → null (optional columns),
+ *    never stored as if they were the real SSN / tax ID
  */
 function reviveRow(
   spec: CompanyTableSpec,
@@ -621,6 +732,7 @@ function reviveRow(
   idMap: Map<string, string>,
   newCompanyId: string,
   ownerId: string,
+  oldCompanyId?: string,
 ): Record<string, unknown> {
   const cols = getTableColumns(spec.table) as Record<
     string,
@@ -630,13 +742,27 @@ function reviveRow(
   for (const [key, col] of Object.entries(cols)) {
     let v = row[key];
     if (v === undefined) continue;
+    // A required column (bank account number) keeps the visible "••••6789" placeholder so the
+    // restored record is obviously incomplete rather than failing the whole restore.
+    if (isSensitiveKey(key) && isMaskedValue(v) && !col.notNull) v = null;
     if (v !== null) {
       if (col.dataType === 'date' && typeof v === 'string') {
         v = new Date(v);
+      } else if (key === 'prefillAccountIds' && Array.isArray(v)) {
+        // wave2 purchases: vendor pre-fill accounts are ids inside jsonb — remap, drop unknowns.
+        const mapped = (v as unknown[]).flatMap((id) =>
+          typeof id === 'string' && idMap.has(id) ? [idMap.get(id)!] : [],
+        );
+        v = mapped.length > 0 ? mapped : null;
       } else if (col.columnType === 'PgUUID' && typeof v === 'string') {
         if (key === 'companyId') v = newCompanyId;
         else if (USER_REF_KEYS.has(key)) v = ownerId;
         else if (idMap.has(v)) v = idMap.get(v)!;
+        else if (SOFT_REF_KEYS[spec.name]?.has(key)) {
+          // Audit trail entity pointer: the company itself → the new company; anything else
+          // (a user, a deleted record) keeps its original id as historical information.
+          if (oldCompanyId && v === oldCompanyId) v = newCompanyId;
+        }
         else if (col.notNull) {
           // A required reference points outside this company's data — the backup
           // is corrupt (cross-company leak). Refuse rather than guess.
@@ -703,6 +829,11 @@ export async function restoreCompanyBackup(
   if (clash.length) name = `${name} (Restored ${new Date().toISOString().slice(0, 10)})`;
 
   return db.transaction(async (tx) => {
+    // Re-inserting a backup's posted ledger is a sanctioned rewrite (lines are added to
+    // entries that were not created "now"). Every restored posted entry is still verified
+    // balanced at COMMIT, so a corrupt archive cannot restore unbalanced books.
+    await allowLedgerRewrite({ db: tx as unknown as DB }, 'restore');
+
     const [company] = await tx
       .insert(companies)
       .values({
@@ -719,7 +850,10 @@ export async function restoreCompanyBackup(
     for (const spec of COMPANY_TABLES) {
       let rows = data.tables[spec.name] ?? [];
       if (spec.selfParentKey) rows = topoSortByParent(rows, spec.selfParentKey);
-      const revived = rows.map((r) => reviveRow(spec, r, idMap, company.id, opts.ownerId));
+      const revived = rows.map((r) => reviveRow(spec, r, idMap, company.id, opts.ownerId, data.company.id));
+      // Cached balances are never restored verbatim: accounts start at zero and the DB
+      // balance triggers rebuild them from the restored posted journal lines.
+      if (spec.name === 'accounts') for (const r of revived) r.balance = '0.00';
       // Chunked inserts keep parameter counts well under PG limits.
       for (let i = 0; i < revived.length; i += 200) {
         await tx.insert(spec.table).values(revived.slice(i, i + 200) as never);
@@ -735,6 +869,21 @@ export async function restoreCompanyBackup(
       entityType: 'company_restore',
       entityId: company.id,
       newValues: { restoredFrom: data.company.name, tableCounts },
+    });
+    // Running transaction log: one bulk record covering every restored posted entry, so
+    // verifyTransactionLog can account for them.
+    const journalEntryIds = (data.tables.journalEntries ?? [])
+      .filter((r) => r.status === 'posted' && typeof r.id === 'string')
+      .map((r) => idMap.get(r.id as string)!)
+      .filter(Boolean);
+    await logTransaction(tx as unknown as DB, {
+      companyId: company.id,
+      userId: opts.ownerId,
+      action: 'create',
+      entityType: 'company_restore',
+      entityId: company.id,
+      summary: `Restored company "${name}" from a company backup of "${data.company.name}" (${journalEntryIds.length} posted journal entries)`,
+      data: { new: { restoredFrom: data.company.name, tableCounts }, journalEntryIds },
     });
 
     return { companyId: company.id, name, tableCounts };

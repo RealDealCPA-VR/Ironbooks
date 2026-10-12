@@ -4,20 +4,29 @@
  * (lib/services/salesOrders.ts).
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
+import { sendFlagFields, shippingFields } from './sales';
 
 export const salesOrderLineSchema = z.object({
+  /** Edit only: the existing line this row updates (keeps its invoiced quantity). */
+  id: zUuid.nullish(),
   itemId: zUuid.nullish(),
   description: z.string().nullish(),
   quantity: zDecimal,
-  rate: zDecimal,
+  /** Omit on item lines to have the server price the line (advanced pricing). */
+  rate: zDecimal.nullish(),
 });
 
 export const createSalesOrderSchema = z.object({
   customerId: zUuid,
+  /** Typed document number (e.g. "INV-1001"); blank = next number. */
+  refNumber: zDocNumber,
+  allowDuplicateNumber: z.boolean().nullish(),
   date: zDate,
   memo: z.string().nullish(),
   lines: zLines(salesOrderLineSchema),
+  ...shippingFields,
+  ...sendFlagFields,
 });
 export type CreateSalesOrderBody = z.infer<typeof createSalesOrderSchema>;
 
@@ -34,6 +43,7 @@ export const salesOrderActionSchema = z.discriminatedUnion('action', [
     /** Omitted → invoice the full remaining quantity of every line. */
     lines: zLines(convertLineSchema).optional(),
     date: zDate.optional(),
+    overrideCreditLimit: z.boolean().optional(),
   }),
   z.object({
     action: z.literal('status'),

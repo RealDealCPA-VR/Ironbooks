@@ -11,6 +11,9 @@
  */
 import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
+import { ServiceError } from './errors';
+import { logTransaction } from './transactionLog';
+import type { EffectiveAccess } from '@/lib/permissions/model';
 
 export interface ServiceContext {
   db: DB;
@@ -29,27 +32,21 @@ export interface ServiceContext {
    * `assertPeriodOpen` blocks postings dated on/before the company closing date unless set.
    */
   closingDateOverride?: boolean;
+  /**
+   * Multi-user hosting: the signed-in session making this request (user_sessions.id), set by
+   * `getServerContext`. Used by "Who is logged in" and the single-user-mode gate
+   * (lib/services/sessions.ts). Absent for system jobs / first-run.
+   */
+  sessionId?: string;
+  /**
+   * Enterprise roles & permissions (team users): the member's effective permissions (union of
+   * their roles), loaded by `getServerContext`, which also enforces the API route map
+   * (lib/permissions/routes.ts). Absent = trusted internal context — no restriction.
+   */
+  access?: EffectiveAccess;
 }
 
-export type ServiceErrorCode =
-  | 'NOT_FOUND'
-  | 'VALIDATION'
-  | 'UNBALANCED'
-  | 'FORBIDDEN'
-  | 'CONFLICT'
-  | 'PERIOD_CLOSED'
-  | 'INTERNAL';
-
-export class ServiceError extends Error {
-  constructor(
-    public code: ServiceErrorCode,
-    message: string,
-    public details?: unknown,
-  ) {
-    super(message);
-    this.name = 'ServiceError';
-  }
-}
+export { ServiceError, type ServiceErrorCode } from './errors';
 
 export const notFound = (what: string) => new ServiceError('NOT_FOUND', `${what} not found`);
 export const validation = (msg: string, details?: unknown) =>
@@ -68,7 +65,11 @@ function assertNotViewer(ctx: ServiceContext): void {
   }
 }
 
-/** Record a mutation in the audit trail. Call inside the same transaction as the mutation. */
+/**
+ * Record a mutation in the audit trail. Call inside the same transaction as the mutation.
+ * Also queues the change for the running transaction log (transactions.bktlg), which is
+ * appended only after the enclosing transaction commits (see lib/services/transactionLog.ts).
+ */
 export async function writeAudit(
   ctx: ServiceContext,
   params: {
@@ -91,6 +92,34 @@ export async function writeAudit(
     newValues: params.newValues ?? null,
     llmReasoning: params.llmReasoning ?? null,
   });
+  await logTransaction(ctx.db, {
+    companyId: ctx.companyId,
+    userId: ctx.userId,
+    action: params.action,
+    entityType: params.entityType,
+    entityId: params.entityId,
+    data: {
+      old: params.oldValues ?? null,
+      new: params.newValues ?? null,
+      ...(params.llmReasoning ? { llmReasoning: params.llmReasoning } : {}),
+    },
+  });
+}
+
+/**
+ * Ledger invariants enforced by the database (drizzle/0017_team_ledger.sql) raise custom
+ * SQLSTATEs. Translate them into ServiceErrors so API routes answer 400/409 with the real
+ * reason instead of a generic 500. Anything else is returned unchanged.
+ */
+export function translateLedgerDbError(err: unknown): unknown {
+  if (err instanceof ServiceError || !err || typeof err !== 'object') return err;
+  const code = (err as { code?: unknown }).code;
+  const message = String((err as { message?: unknown }).message ?? '');
+  if (code === 'BK001') return new ServiceError('UNBALANCED', message, { sqlstate: code });
+  if (code === 'BK002' || code === 'BK003') {
+    return new ServiceError('CONFLICT', message, { sqlstate: code });
+  }
+  return err;
 }
 
 /** Run a function inside a DB transaction, returning its result. */
@@ -99,5 +128,10 @@ export async function inTransaction<T>(
   fn: (txCtx: ServiceContext) => Promise<T>,
 ): Promise<T> {
   assertNotViewer(ctx); // RBAC: viewers cannot mutate (see assertNotViewer above)
-  return ctx.db.transaction(async (tx) => fn({ ...ctx, db: tx as unknown as DB }));
+  try {
+    return await ctx.db.transaction(async (tx) => fn({ ...ctx, db: tx as unknown as DB }));
+  } catch (err) {
+    // Deferred ledger checks fire at COMMIT, i.e. here — surface them as ServiceErrors.
+    throw translateLedgerDbError(err);
+  }
 }

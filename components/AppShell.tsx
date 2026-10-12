@@ -3,7 +3,11 @@ import * as React from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import CommandPalette from './CommandPalette';
-import { navGroups, paletteDestinations } from '@/lib/nav';
+import AssistantPanel from './AssistantPanel';
+import { filterNavGroups, navGroups, paletteDestinations } from '@/lib/nav';
+import { useMe } from '@/lib/usePermissions';
+import { usePreferences } from '@/lib/usePreferences';
+import { featureHiddenPaths } from '@/lib/preferences';
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
@@ -12,7 +16,7 @@ import {
   isEditableTarget,
 } from '@/lib/shortcuts';
 import { Modal, toast } from '@/components/ui';
-import { Briefcase, Building2, ChevronDown, LogOut } from 'lucide-react';
+import { Briefcase, Building2, ChevronDown, LogOut, Sparkles } from 'lucide-react';
 
 // Routes that render without the app chrome (full-screen).
 const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock'];
@@ -282,6 +286,21 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() || '';
   const bare = BARE.some((p) => pathname === p || pathname.startsWith(p + '/'));
   const [company, setCompany] = React.useState<CompanyRow | null>(null);
+  // Users & Roles: hide sidebar entries the user's roles can't use (cosmetic; server enforces).
+  const { me } = useMe(!bare);
+  // Preferences: features turned off (estimates, sales orders, POs, inventory, time, currencies,
+  // sales tax) drop out of the sidebar like QB's menus. Cosmetic; pages still work.
+  const prefs = usePreferences(!bare);
+  const hiddenPaths = React.useMemo(() => featureHiddenPaths(prefs.company), [prefs.company]);
+  const visibleGroups = React.useMemo(
+    () =>
+      filterNavGroups(navGroups, me?.permissions)
+        .map((g) => ({ ...g, links: g.links.filter((l) => !hiddenPaths.has(l.path)) }))
+        .filter((g) => g.links.length > 0),
+    [me?.permissions, hiddenPaths],
+  );
+  const [assistantOpen, setAssistantOpen] = React.useState(false);
+  const closeAssistant = React.useCallback(() => setAssistantOpen(false), []);
 
   if (bare) return <>{children}</>;
 
@@ -305,7 +324,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </h1>
         </div>
         <nav className="flex flex-col gap-0.5 w-full flex-1 min-h-0 overflow-y-auto overscroll-contain pr-1 -mr-1">
-          {navGroups.map((group) => (
+          {visibleGroups.map((group) => (
             <div key={group.heading || 'home'} className="mb-2">
               {group.heading && (
                 <>
@@ -354,11 +373,21 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       </aside>
       <main className="flex-1 flex flex-col min-w-0">
         <header className="flex items-center justify-end gap-3 px-6 pt-4 -mb-2">
+          <button
+            type="button"
+            onClick={() => setAssistantOpen(true)}
+            title="Ask about your books"
+            className="flex items-center gap-1.5 rounded-full bg-white border border-slate-200 px-3 py-1 text-sm font-semibold text-navy shadow-sm hover:border-electric/50 hover:text-electric transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+          >
+            <Sparkles className="h-4 w-4 text-electric" />
+            Ask AI
+          </button>
           <CompanyChip company={company} onCompany={setCompany} />
         </header>
         {children}
       </main>
       <CommandPalette />
+      <AssistantPanel open={assistantOpen} onClose={closeAssistant} />
       <GlobalShortcuts />
       <TitleSync company={company?.name ?? null} />
     </div>

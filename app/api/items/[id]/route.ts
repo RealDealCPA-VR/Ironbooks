@@ -8,6 +8,7 @@ import { getServerContext } from '@/lib/context';
 import { getItem, updateItem, deactivateItem } from '@/lib/services/items';
 import { setReorderPoint } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateItemSchema } from '@/lib/validation/items';
 
@@ -62,13 +63,17 @@ export async function PATCH(req: NextRequest, { params }: RouteParams): Promise<
     }
     const { reorderPoint, ...patch } = parsed.data;
 
-    let item = await updateItem(ctx, id, patch);
+    // Multi-user: 409 if someone else saved this item since it was loaded.
+    const item = await withVersionCheck(ctx, 'item', id, expectedVersion(req), async (c) => {
+      let updated = await updateItem(c, id, patch);
 
-    // Reorder point is managed by the inventory service (it drives the
-    // reorder report and low-stock alerts). null / '' clears it.
-    if ('reorderPoint' in parsed.data) {
-      item = await setReorderPoint(ctx, id, reorderPoint ?? null);
-    }
+      // Reorder point is managed by the inventory service (it drives the
+      // reorder report and low-stock alerts). null / '' clears it.
+      if ('reorderPoint' in parsed.data) {
+        updated = await setReorderPoint(c, id, reorderPoint ?? null);
+      }
+      return updated;
+    });
 
     return NextResponse.json({ item });
   } catch (err) {
@@ -80,11 +85,11 @@ export async function PATCH(req: NextRequest, { params }: RouteParams): Promise<
 
 // ── DELETE /api/items/:id ─────────────────────────────────────────────────────
 
-export async function DELETE(_req: NextRequest, { params }: RouteParams): Promise<NextResponse> {
+export async function DELETE(req: NextRequest, { params }: RouteParams): Promise<NextResponse> {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const item = await deactivateItem(ctx, id);
+    const item = await withVersionCheck(ctx, 'item', id, expectedVersion(req), (c) => deactivateItem(c, id));
     return NextResponse.json({ item });
   } catch (err) {
     if (err instanceof ServiceError) return serviceErrorToResponse(err);

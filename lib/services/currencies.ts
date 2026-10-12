@@ -16,8 +16,9 @@
  *   Loss: Dr 6100 Bank & Merchant Fees  /  Cr <asset/liability account>
  */
 import { and, eq, ne } from 'drizzle-orm';
-import { currencies, accounts } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import Decimal from 'decimal.js';
+import { currencies, accounts, journalEntryLines } from '@/lib/db/schema';
+import { Money, allocate, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { type ServiceContext, ServiceError, validation, notFound, writeAudit } from './_base';
 
@@ -291,4 +292,226 @@ export async function recordFxAdjustment(
   });
 
   return { entryId: entry.id };
+}
+
+// ---------------------------------------------------------------------------
+// wave2 purchases — multi-currency purchase documents
+// ---------------------------------------------------------------------------
+//
+// Purchase documents (bills, checks / credit-card charges, bill payments) carry their own
+// `currency` (null = home) and `exchangeRate` (home units per 1 transaction unit). The document
+// stores amounts in its TRANSACTION currency; every GL line is posted in HOME currency. To keep
+// the trial balance balanced to the penny, the home-currency total is computed ONCE
+// (anchor = round2(total x rate)) and the lines are penny-allocated against it with `allocate`
+// (largest remainder), exactly like invoices do. For rate = 1 the amounts are used as-is, so
+// home-currency documents post exactly as before.
+
+/** The company's home (base) currency code, or null when multi-currency was never set up. */
+export async function getHomeCurrencyCode(ctx: ServiceContext): Promise<string | null> {
+  const [row] = await ctx.db
+    .select({ code: currencies.code })
+    .from(currencies)
+    .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+  return row?.code ?? null;
+}
+
+export interface ResolvedCurrency {
+  /** Transaction currency code; null = home currency. */
+  currency: string | null;
+  /** Home units per 1 transaction unit (exactly 1 for home documents). */
+  rate: Decimal;
+}
+
+function hasText(v: unknown): boolean {
+  return v !== undefined && v !== null && String(v).trim() !== '';
+}
+
+/**
+ * Decide a purchase document's currency + exchange rate.
+ *  - `currency` defaults to the payment account's currency, then the vendor's currency.
+ *  - A vendor or bank/credit-card account with a foreign currency only takes documents in that
+ *    currency (QuickBooks rule: a vendor's transactions are in the vendor's currency).
+ *  - A currency equal to the home currency is normalised to null (rate 1).
+ *  - Foreign documents use `exchangeRate` when given, else the currency list's current rate.
+ */
+export async function resolveDocumentCurrency(
+  ctx: ServiceContext,
+  input: {
+    currency?: string | null;
+    exchangeRate?: string | number | null;
+    /** The vendor's currency; null = a home-currency vendor; undefined = no vendor (free-text payee). */
+    vendorCurrency?: string | null;
+    accountCurrency?: string | null;
+  },
+): Promise<ResolvedCurrency> {
+  const homeVendor = input.vendorCurrency === null;
+  const anyForeign = hasText(input.currency) || hasText(input.vendorCurrency) || hasText(input.accountCurrency);
+  if (!anyForeign) return { currency: null, rate: Money.of(1) };
+
+  const home = await getHomeCurrencyCode(ctx);
+  const norm = (c: string | null | undefined): string | null => {
+    const v = (c ?? '').trim().toUpperCase();
+    return v === '' || (home != null && v === home) ? null : v;
+  };
+  const vendorCur = norm(input.vendorCurrency);
+  const accountCur = norm(input.accountCurrency);
+  const currency = hasText(input.currency) ? norm(input.currency) : (accountCur ?? vendorCur ?? null);
+
+  if (homeVendor && !vendorCur && currency) {
+    throw validation(
+      `This vendor uses your home currency, so it can't be paid from a ${currency} account. Pick a home-currency account (or set up the vendor in ${currency}).`,
+    );
+  }
+  if (vendorCur && currency !== vendorCur) {
+    throw validation(
+      `This vendor uses ${vendorCur}. Enter the transaction in ${vendorCur} (or change the vendor's currency).`,
+    );
+  }
+  if (accountCur && currency !== accountCur) {
+    throw validation(
+      `The selected account is a ${accountCur} account. Transactions in it must be in ${accountCur}.`,
+    );
+  }
+  if (!currency) return { currency: null, rate: Money.of(1) };
+
+  let rate: Decimal;
+  if (hasText(input.exchangeRate)) {
+    rate = Money.of(input.exchangeRate);
+  } else {
+    const [row] = await ctx.db
+      .select({ rateToBase: currencies.rateToBase })
+      .from(currencies)
+      .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.code, currency)));
+    if (!row) {
+      throw validation(
+        `${currency} is not in your currency list. Add it under Currencies (with an exchange rate) first.`,
+      );
+    }
+    rate = Money.of(row.rateToBase);
+  }
+  if (!rate.isFinite() || !rate.greaterThan(0)) throw validation('Exchange rate must be greater than zero.');
+  return { currency, rate: new Decimal(rate.toFixed(8)) };
+}
+
+/**
+ * Home-currency amounts for a document: anchor = round2(total x rate); each line gets its
+ * penny-allocated share so the lines sum to the anchor exactly. Line amounts are positive
+ * 2dp values in the transaction currency.
+ */
+export function homeAmounts(
+  lineAmounts: Array<string | number | Decimal>,
+  rate: string | number | Decimal,
+): { total: Decimal; lines: Decimal[] } {
+  const r = Money.of(rate);
+  const totalTxn = lineAmounts.reduce<Decimal>((a, v) => a.plus(Money.of(v)), Money.zero());
+  if (r.equals(1)) {
+    return { total: Money.round2(totalTxn), lines: lineAmounts.map((v) => Money.round2(v)) };
+  }
+  const anchor = Money.round2(totalTxn.times(r));
+  return { total: anchor, lines: allocate(anchor, lineAmounts.map((v) => Money.of(v))) };
+}
+
+/** Find-or-create the Exchange Gain/Loss account (code 6900) used for realized FX. */
+export async function getOrCreateExchangeGainLossAccount(ctx: ServiceContext): Promise<string> {
+  const [row] = await ctx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '6900')));
+  if (row) return row.id;
+  const [created] = await ctx.db
+    .insert(accounts)
+    .values({
+      companyId: ctx.companyId,
+      code: '6900',
+      name: 'Exchange Gain/Loss',
+      type: 'expense' as never,
+      subtype: 'operating_expenses' as never,
+    })
+    .returning();
+  return created.id;
+}
+
+/**
+ * Set the currency of a bank / credit-card account (QB: a foreign-currency bank account).
+ * Allowed only while the account has no transactions - changing it later would re-denominate
+ * history.
+ */
+export async function setAccountCurrency(
+  ctx: ServiceContext,
+  accountId: string,
+  code: string | null,
+): Promise<{ id: string; currency: string | null }> {
+  const [acct] = await ctx.db
+    .select()
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, accountId)));
+  if (!acct) throw notFound('Account');
+  const isBankish = acct.type === 'asset' && ['checking', 'savings'].includes(acct.subtype);
+  const isCard = acct.type === 'liability' && acct.subtype === 'credit_card';
+  if (!isBankish && !isCard) {
+    throw validation('Only bank and credit card accounts can have their own currency.');
+  }
+  const home = await getHomeCurrencyCode(ctx);
+  let next: string | null = (code ?? '').trim().toUpperCase() || null;
+  if (next && home && next === home) next = null;
+  if (next) {
+    const [cur] = await ctx.db
+      .select({ id: currencies.id })
+      .from(currencies)
+      .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.code, next)));
+    if (!cur) throw validation(`${next} is not in your currency list. Add it under Currencies first.`);
+  }
+  if ((acct.currency ?? null) === next) return { id: acct.id, currency: next };
+  const [used] = await ctx.db
+    .select({ id: journalEntryLines.id })
+    .from(journalEntryLines)
+    .where(eq(journalEntryLines.accountId, accountId))
+    .limit(1);
+  if (used) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This account already has transactions, so its currency can no longer be changed. Create a new account in the other currency instead.',
+    );
+  }
+  const [updated] = await ctx.db
+    .update(accounts)
+    .set({ currency: next, updatedAt: new Date() })
+    .where(eq(accounts.id, accountId))
+    .returning();
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'account',
+    entityId: accountId,
+    oldValues: { currency: acct.currency ?? null },
+    newValues: { currency: next },
+  });
+  return { id: updated.id, currency: updated.currency ?? null };
+}
+
+/**
+ * J10: documents that are recorded in home currency only (deposits, transfers, vendor credits,
+ * Loan Manager payments) refuse a foreign-currency bank / credit-card account with a plain
+ * message, so the ledger never takes a transaction-currency amount as if it were home currency.
+ */
+export async function assertHomeCurrencyAccounts(
+  ctx: ServiceContext,
+  accountIds: ReadonlyArray<string | null | undefined>,
+  what: string,
+): Promise<void> {
+  const ids = [...new Set(accountIds.filter((x): x is string => !!x))];
+  if (ids.length === 0) return;
+  let home: string | null | undefined;
+  for (const id of ids) {
+    const [a] = await ctx.db
+      .select({ name: accounts.name, currency: accounts.currency })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
+    const cur = (a?.currency ?? '').trim().toUpperCase();
+    if (!cur) continue;
+    if (home === undefined) home = await getHomeCurrencyCode(ctx);
+    if (home && cur === home) continue;
+    throw validation(
+      `"${a!.name}" is a ${cur} account. ${what} can only use home-currency accounts for now.`,
+    );
+  }
 }

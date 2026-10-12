@@ -31,12 +31,21 @@ import {
   Spinner,
   PageHeader,
   toast,
+  toastError,
   useGridKeys,
 } from '@/components/ui';
+import { Help } from '@/components/Help';
+import { computeJournalBalance, journalPayloadAmount } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { useNewParam } from '@/lib/useFocusParam';
 import EntryDetailModal from '@/components/EntryDetailModal';
+// wave2 prefs: Preferences-driven labels/warnings, memorize (Ctrl+M), attachments
+import { usePreferences } from '@/lib/usePreferences';
+import { confirmClassAssigned, confirmTransactionDate } from '@/lib/formPrefs';
+import { formatAccountLabel } from '@/lib/preferences';
+import MemorizeButton from '@/components/MemorizeButton';
+import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,6 +59,7 @@ interface JournalEntry {
   reference: string | null;
   status: string;
   sourceRef?: string | null;
+  isAdjusting?: boolean;
   createdAt: string;
   voidedAt: string | null;
 }
@@ -61,6 +71,8 @@ interface EntryDetailLine {
   credit: string | null;
   memo: string | null;
   classId: string | null;
+  entityType?: string | null;
+  entityId?: string | null;
 }
 
 interface EntryDetail {
@@ -71,6 +83,7 @@ interface EntryDetail {
   reference: string | null;
   status: string;
   sourceRef: string | null;
+  isAdjusting?: boolean;
   lines: EntryDetailLine[];
 }
 
@@ -79,6 +92,14 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype?: string;
+}
+
+/** A customer / vendor / employee for the QB "Name" column. value = "<kind>:<id>". */
+interface NameOption {
+  value: string;
+  label: string;
+  kind: 'customer' | 'vendor' | 'employee';
 }
 
 interface ClassOption {
@@ -93,6 +114,8 @@ interface LineRow {
   credit: string;
   memo: string;
   classId: string;
+  /** "<kind>:<id>" or '' (QB Name column). */
+  name: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,20 +134,6 @@ function nextMonthFirstISO(entryDateISO: string): string {
   return `${next.getFullYear()}-${mm}-01`;
 }
 
-function sumLines(lines: LineRow[], field: 'debit' | 'credit'): number {
-  return lines.reduce((acc, l) => acc + (Number(l[field]) || 0), 0);
-}
-
-function isBalanced(lines: LineRow[]): boolean {
-  const d = sumLines(lines, 'debit');
-  const c = sumLines(lines, 'credit');
-  return Math.abs(d - c) < 0.005 && d > 0;
-}
-
-function hasEnoughLines(lines: LineRow[]): boolean {
-  return lines.filter((l) => l.accountId).length >= 2;
-}
-
 function statusTone(status: string): 'success' | 'void' | 'neutral' {
   if (status === 'posted') return 'success';
   if (status === 'void') return 'void';
@@ -136,7 +145,7 @@ function statusTone(status: string): 'success' | 'void' | 'neutral' {
 // ---------------------------------------------------------------------------
 
 function emptyLine(id: number): LineRow {
-  return { id, accountId: '', debit: '', credit: '', memo: '', classId: '' };
+  return { id, accountId: '', debit: '', credit: '', memo: '', classId: '', name: '' };
 }
 
 let lineCounter = 0;
@@ -147,19 +156,30 @@ interface EntryFormModalProps {
   onSaved: () => void;
   accounts: Account[];
   classes: ClassOption[];
+  names: NameOption[];
   /** When set, the modal edits this entry (prefilled) instead of creating a new one. */
   editEntry: EntryDetail | null;
 }
 
-function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }: EntryFormModalProps) {
+/** Which kind of name a line's account requires (QB: A/R needs a customer, A/P a vendor). */
+function requiredNameKind(acct: Account | undefined): 'customer' | 'vendor' | null {
+  if (!acct) return null;
+  if (acct.type === 'asset' && acct.subtype === 'accounts_receivable') return 'customer';
+  if (acct.type === 'liability' && acct.subtype === 'accounts_payable') return 'vendor';
+  return null;
+}
+
+function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, editEntry }: EntryFormModalProps) {
   const [date, setDate] = useState(todayISO());
   const [description, setDescription] = useState('');
   const [reference, setReference] = useState('');
+  const [isAdjusting, setIsAdjusting] = useState(false);
   const [lines, setLines] = useState<LineRow[]>(() => [
     emptyLine(++lineCounter),
     emptyLine(++lineCounter),
   ]);
   const [saving, setSaving] = useState(false);
+  const prefs = usePreferences();
 
   const editing = !!editEntry;
 
@@ -170,6 +190,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       setDate(editEntry.date.slice(0, 10));
       setDescription(editEntry.description);
       setReference(editEntry.reference ?? '');
+      setIsAdjusting(!!editEntry.isAdjusting);
       setLines(
         editEntry.lines.map((l) => ({
           id: ++lineCounter,
@@ -178,12 +199,14 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           credit: l.credit ?? '',
           memo: l.memo ?? '',
           classId: l.classId ?? '',
+          name: l.entityType && l.entityId ? `${l.entityType}:${l.entityId}` : '',
         })),
       );
     } else {
       setDate(todayISO());
       setDescription('');
       setReference('');
+      setIsAdjusting(false);
       setLines([emptyLine(++lineCounter), emptyLine(++lineCounter)]);
     }
     setSaving(false);
@@ -215,29 +238,54 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
     disabled: saving,
   });
 
-  const totalDebits = sumLines(lines, 'debit');
-  const totalCredits = sumLines(lines, 'credit');
-  const balanced = isBalanced(lines);
-  const enoughLines = hasEnoughLines(lines);
-  const canSubmit = balanced && enoughLines && description.trim() && date;
+  // Live, decimal-exact balance check (lib/journalBalance.ts). Save stays disabled until
+  // debits equal credits, so an UNBALANCED error never reaches the user.
+  const bal = computeJournalBalance(lines);
+  const missingHeader = !date ? 'Enter a date.' : !description.trim() ? 'Enter a description.' : null;
+  // QB rule: lines on Accounts Receivable need a customer, lines on Accounts Payable a vendor.
+  const accountById = new Map(accounts.map((a) => [a.id, a]));
+  const nameProblemIdx = lines.findIndex((l) => {
+    const need = requiredNameKind(accountById.get(l.accountId));
+    return need !== null && !l.name.startsWith(`${need}:`);
+  });
+  const nameBlocker =
+    nameProblemIdx >= 0
+      ? `Line ${nameProblemIdx + 1} uses ${
+          requiredNameKind(accountById.get(lines[nameProblemIdx].accountId)) === 'customer'
+            ? 'Accounts Receivable — pick the customer'
+            : 'Accounts Payable — pick the vendor'
+        } in the Name column.`
+      : null;
+  const blocker = missingHeader ?? nameBlocker ?? bal.blocker;
+  const canSubmit = bal.canSave && !missingHeader && !nameBlocker;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
+    // Preferences: date range warning; class tracking "warn when a line has no class".
+    if (!confirmTransactionDate(date, prefs)) return;
+    if (lines.some((l) => l.accountId && !l.classId) && !confirmClassAssigned(null, prefs)) return;
     setSaving(true);
     try {
       const payload = {
         date,
         description: description.trim(),
         reference: reference.trim() || null,
+        isAdjusting,
         lines: lines
           .filter((l) => l.accountId)
-          .map((l) => ({
-            accountId: l.accountId,
-            debit: l.debit ? l.debit : undefined,
-            credit: l.credit ? l.credit : undefined,
-            memo: l.memo.trim() || null,
-            classId: l.classId || null,
-          })),
+          .map((l) => {
+            const [entityType, entityId] = l.name ? l.name.split(':') : [null, null];
+            return {
+              accountId: l.accountId,
+              // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
+              debit: journalPayloadAmount(l.debit),
+              credit: journalPayloadAmount(l.credit),
+              memo: l.memo.trim() || null,
+              classId: l.classId || null,
+              entityType: entityType || null,
+              entityId: entityId || null,
+            };
+          }),
       };
       if (editing && editEntry) {
         await api.patch(`/api/journal-entries/${editEntry.id}`, payload);
@@ -249,30 +297,15 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       onSaved();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to save entry';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to save entry.');
     } finally {
       setSaving(false);
     }
   };
 
-  const BalancedIndicator = () => {
-    if (totalDebits === 0 && totalCredits === 0) return null;
-    return balanced ? (
-      <span className="flex items-center gap-1 text-emerald text-sm font-semibold">
-        <CheckCircle2 className="h-4 w-4" /> Balanced
-      </span>
-    ) : (
-      <span className="flex items-center gap-1 text-red-500 text-sm font-semibold">
-        <XCircle className="h-4 w-4" /> Unbalanced
-        <span className="text-xs font-normal text-navy/60 ml-1">
-          (diff: {formatCurrency(Math.abs(totalDebits - totalCredits))})
-        </span>
-      </span>
-    );
-  };
+  const diffIsZero = Number(bal.difference) === 0;
 
-  const gridCols = 'grid-cols-[1fr_120px_130px_92px_92px_28px]';
+  const gridCols = 'grid-cols-[1fr_130px_110px_120px_92px_92px_28px]';
 
   return (
     <Modal
@@ -282,10 +315,39 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       title={editing ? `Edit Journal Entry #${editEntry?.entryNumber}` : 'New Journal Entry'}
       footer={
         <>
+          <MemorizeButton
+            docType="journal_entry"
+            shortcut={open}
+            defaultName={description.trim() || undefined}
+            getTemplate={() => {
+              if (!bal.canSave) return 'Balance the entry (debits = credits) before memorizing.';
+              if (!description.trim()) return 'Enter a description before memorizing.';
+              return {
+                date,
+                description: description.trim(),
+                reference: reference.trim() || null,
+                lines: lines
+                  .filter((l) => l.accountId)
+                  .map((l) => ({
+                    accountId: l.accountId,
+                    debit: journalPayloadAmount(l.debit),
+                    credit: journalPayloadAmount(l.credit),
+                    memo: l.memo.trim() || null,
+                    classId: l.classId || null,
+                  })),
+              };
+            }}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSubmit} disabled={!canSubmit} loading={saving}>
+          <Button
+            onClick={handleSubmit}
+            disabled={!canSubmit}
+            loading={saving}
+            aria-describedby={blocker ? 'je-save-blocker' : undefined}
+            title={blocker ?? undefined}
+          >
             {editing ? 'Save Changes' : 'Post Entry'}
           </Button>
         </>
@@ -301,7 +363,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       {/* Header fields */}
       <div className="grid grid-cols-2 gap-4 mb-5">
         <div>
-          <Label htmlFor="je-date">Date</Label>
+          <Label htmlFor="je-date" required>Date</Label>
           <DateInput
             id="je-date"
             autoFocus
@@ -319,21 +381,45 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           />
         </div>
         <div className="col-span-2">
-          <Label htmlFor="je-desc">Description</Label>
+          <Label htmlFor="je-desc" required>Description</Label>
           <Input
             id="je-desc"
             placeholder="Memo / narration"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
+            aria-required="true"
           />
         </div>
+        <label className="col-span-2 inline-flex items-center gap-2 text-sm text-navy/80">
+          <input
+            type="checkbox"
+            checked={isAdjusting}
+            onChange={(e) => setIsAdjusting(e.target.checked)}
+            className="h-4 w-4 rounded border-slate-300"
+          />
+          Adjusting entry <Help term="adjusting-entry" side="bottom" />
+          <span className="text-xs text-navy/50">(year-end or accountant adjustment)</span>
+        </label>
       </div>
+
+      <p className="mb-4 flex items-start gap-1.5 rounded-lg bg-electric/5 px-3 py-2 text-xs text-navy/70">
+        <span>
+          Each line moves money into or out of an account. Put the amount in <strong>Debit</strong> or{' '}
+          <strong>Credit</strong> &mdash; the totals must match before you can save.
+        </span>
+        <Help term="debit-credit" side="bottom" />
+      </p>
 
       {/* Line items */}
       <div className="mb-3">
         <div className={`grid ${gridCols} gap-2 mb-1 px-1`}>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">Account</span>
-          <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">Class</span>
+          <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide inline-flex items-center gap-1">
+            Name <Help term="name-on-journal-line" side="bottom" />
+          </span>
+          <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide inline-flex items-center gap-1">
+            Class <Help term="class" side="bottom" />
+          </span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">Memo</span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide text-right">Debit</span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide text-right">Credit</span>
@@ -341,21 +427,58 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
         </div>
 
         <div className="flex flex-col gap-2" onKeyDown={grid.onKeyDown}>
-          {lines.map((line) => (
+          {lines.map((line, idx) => (
             <div key={line.id} data-grid-row className={`grid ${gridCols} gap-2 items-center`}>
               <Select
+                aria-label={`Line ${idx + 1} account`}
                 value={line.accountId}
                 onChange={(e) => updateLine(line.id, 'accountId', e.target.value)}
               >
                 <option value="">— Select account —</option>
-                {accounts.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.code} · {a.name}
-                  </option>
-                ))}
+                {accounts
+                  .filter((a) => a.subtype !== 'non_posting')
+                  .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {formatAccountLabel(a, prefs.company)}
+                    </option>
+                  ))}
               </Select>
 
               <Select
+                aria-label={`Line ${idx + 1} name`}
+                aria-invalid={nameProblemIdx === idx || undefined}
+                value={line.name}
+                onChange={(e) => updateLine(line.id, 'name', e.target.value)}
+              >
+                <option value="">
+                  {requiredNameKind(accountById.get(line.accountId)) === 'customer'
+                    ? '— Pick customer —'
+                    : requiredNameKind(accountById.get(line.accountId)) === 'vendor'
+                      ? '— Pick vendor —'
+                      : '— No name —'}
+                </option>
+                {(['customer', 'vendor', 'employee'] as const).map((kind) => {
+                  const need = requiredNameKind(accountById.get(line.accountId));
+                  if (need && need !== kind) return null;
+                  const opts = names.filter((n) => n.kind === kind);
+                  if (opts.length === 0) return null;
+                  return (
+                    <optgroup
+                      key={kind}
+                      label={kind === 'customer' ? 'Customers' : kind === 'vendor' ? 'Vendors' : 'Employees'}
+                    >
+                      {opts.map((n) => (
+                        <option key={n.value} value={n.value}>
+                          {n.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  );
+                })}
+              </Select>
+
+              <Select
+                aria-label={`Line ${idx + 1} class`}
                 value={line.classId}
                 onChange={(e) => updateLine(line.id, 'classId', e.target.value)}
               >
@@ -368,12 +491,15 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
               </Select>
 
               <Input
+                aria-label={`Line ${idx + 1} memo`}
                 placeholder="Line memo"
                 value={line.memo}
                 onChange={(e) => updateLine(line.id, 'memo', e.target.value)}
               />
 
               <AmountInput
+                aria-label={`Line ${idx + 1} debit`}
+                aria-invalid={bal.invalidLines.includes(idx + 1) || undefined}
                 placeholder="0.00"
                 value={line.debit}
                 onChange={(e) => updateLine(line.id, 'debit', e.target.value)}
@@ -381,6 +507,8 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
               />
 
               <AmountInput
+                aria-label={`Line ${idx + 1} credit`}
+                aria-invalid={bal.invalidLines.includes(idx + 1) || undefined}
                 placeholder="0.00"
                 value={line.credit}
                 onChange={(e) => updateLine(line.id, 'credit', e.target.value)}
@@ -393,6 +521,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
                 disabled={lines.length <= 2}
                 className="text-red-400 hover:text-red-600 disabled:opacity-20 transition-colors"
                 title="Remove line"
+                aria-label={`Remove line ${idx + 1}`}
               >
                 <MinusCircle className="h-5 w-5" />
               </button>
@@ -415,23 +544,39 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           <span className="text-sm font-bold text-navy text-right">Totals</span>
           <span />
           <span />
+          <span />
           <span className="text-sm font-bold text-navy text-right tabular-nums">
-            {formatCurrency(totalDebits)}
+            {formatCurrency(bal.totalDebits)}
           </span>
           <span className="text-sm font-bold text-navy text-right tabular-nums">
-            {formatCurrency(totalCredits)}
+            {formatCurrency(bal.totalCredits)}
           </span>
           <span />
         </div>
-        <div className="mt-2 flex justify-end">
-          <BalancedIndicator />
+        {/* Live difference indicator, announced politely as amounts change. */}
+        <div className="mt-3 flex flex-col items-end gap-1" aria-live="polite">
+          {bal.balanced ? (
+            <span className="flex items-center gap-1 text-emerald text-sm font-semibold">
+              <CheckCircle2 className="h-4 w-4" aria-hidden="true" /> Balanced &mdash; debits equal credits
+            </span>
+          ) : (
+            <span
+              className={`flex items-center gap-1 text-sm font-semibold ${
+                diffIsZero ? 'text-navy/50' : 'text-red-500'
+              }`}
+            >
+              <XCircle className="h-4 w-4" aria-hidden="true" />
+              Difference: <span className="tabular-nums">{formatCurrency(bal.difference)}</span>
+            </span>
+          )}
+          {blocker && (
+            <p id="je-save-blocker" className="text-xs text-navy/60 text-right max-w-md">
+              {blocker}
+            </p>
+          )}
         </div>
-        {!enoughLines && (
-          <p className="text-xs text-navy/40 text-right mt-1">
-            Select an account for at least 2 lines.
-          </p>
-        )}
       </div>
+      {open && <AttachmentPanel className="mt-4" entityType="journal_entry" entityId={editEntry?.id} />}
     </Modal>
   );
 }
@@ -469,8 +614,7 @@ function ReverseModal({ entry, onClose, onReversed }: ReverseModalProps) {
       onReversed();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to reverse entry';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to reverse entry.');
     } finally {
       setLoading(false);
     }
@@ -518,6 +662,7 @@ function JournalPageContent() {
   const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [classes, setClasses] = useState<ClassOption[]>([]);
+  const [names, setNames] = useState<NameOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editTarget, setEditTarget] = useState<EntryDetail | null>(null);
@@ -531,8 +676,7 @@ function JournalPageContent() {
       const data = await api.get<{ entries: JournalEntry[] }>('/api/journal-entries');
       setEntries(data.entries);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load journal entries';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load journal entries.');
     } finally {
       setLoading(false);
     }
@@ -556,11 +700,31 @@ function JournalPageContent() {
     }
   }, []);
 
+  // Names for the QB "Name" column. Each list is optional (permissions may hide one).
+  const fetchNames = useCallback(async () => {
+    const [cust, vend, emp] = await Promise.all([
+      api.get<Array<{ id: string; displayName: string }>>('/api/customers').catch(() => []),
+      api.get<Array<{ id: string; displayName: string }>>('/api/vendors').catch(() => []),
+      api.get<Array<{ id: string; firstName: string; lastName: string }>>('/api/employees').catch(() => []),
+    ]);
+    const list = (v: unknown) => (Array.isArray(v) ? v : []);
+    setNames([
+      ...list(cust).map((c) => ({ value: `customer:${c.id}`, label: c.displayName, kind: 'customer' as const })),
+      ...list(vend).map((v) => ({ value: `vendor:${v.id}`, label: v.displayName, kind: 'vendor' as const })),
+      ...list(emp).map((e) => ({
+        value: `employee:${e.id}`,
+        label: `${e.firstName} ${e.lastName}`.trim(),
+        kind: 'employee' as const,
+      })),
+    ]);
+  }, []);
+
   useEffect(() => {
     fetchEntries();
     fetchAccounts();
     fetchClasses();
-  }, [fetchEntries, fetchAccounts, fetchClasses]);
+    fetchNames();
+  }, [fetchEntries, fetchAccounts, fetchClasses, fetchNames]);
 
   // Quick Actions navigate here with ?new=1 — open the create modal.
   useNewParam(() => {
@@ -578,8 +742,7 @@ function JournalPageContent() {
       setEditTarget(data.entry);
       setShowForm(true);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to load entry';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to load entry.');
     }
   };
 
@@ -592,8 +755,7 @@ function JournalPageContent() {
       setVoidTarget(null);
       fetchEntries();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void entry';
-      toast(msg, 'danger');
+      toastError(err, 'Failed to void entry.');
     } finally {
       setVoiding(false);
     }
@@ -628,7 +790,7 @@ function JournalPageContent() {
           <EmptyState
             icon={NotebookPen}
             title="No journal entries yet"
-            message="Record your first transaction to get started."
+            message="Journal entries are for adjustments and corrections. For everyday work, use Create Invoices, Enter Bills or Write Checks; they make the entries for you."
             action={
               <Button
                 onClick={() => {
@@ -664,6 +826,11 @@ function JournalPageContent() {
                   <Td className="whitespace-nowrap">{formatDate(entry.date)}</Td>
                   <Td className="max-w-xs truncate" title={entry.description}>
                     {entry.description}
+                    {entry.isAdjusting && (
+                      <Badge tone="info" className="ml-2">
+                        Adjusting
+                      </Badge>
+                    )}
                   </Td>
                   <Td className="text-navy/50 text-xs">{entry.reference ?? '—'}</Td>
                   <Td>
@@ -734,6 +901,7 @@ function JournalPageContent() {
         onSaved={fetchEntries}
         accounts={accounts}
         classes={classes}
+        names={names}
         editEntry={editTarget}
       />
 

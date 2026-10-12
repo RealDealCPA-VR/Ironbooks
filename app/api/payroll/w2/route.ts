@@ -9,6 +9,7 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { w2Data } from '@/lib/services/payrollReports';
 import { renderW2Pdf } from '@/lib/pdf/payrollForms';
+import { maskSensitive } from '@/lib/permissions/mask';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -40,7 +41,8 @@ export async function GET(req: NextRequest) {
 
     const year = parseInt(yearStr, 10);
 
-    const data = await w2Data(ctx, { employeeId, year });
+    // SSN printed in full only for roles allowed to view sensitive payroll data.
+    const data = maskSensitive(await w2Data(ctx, { employeeId, year }), ctx.access);
     const pdfBytes = await renderW2Pdf(data);
 
     const filename = `W2_${data.employee.lastName}_${data.employee.firstName}_${year}.pdf`;

@@ -5,7 +5,7 @@
  * List + New Receipt (vendor / optional PO picker prefilling remaining
  * quantities) + Convert to Bill + Void.
  */
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import {
   PackageCheck,
   Plus,
@@ -13,6 +13,7 @@ import {
   MinusCircle,
   ArrowRight,
   Ban,
+  Pencil,
 } from 'lucide-react';
 import {
   Button,
@@ -31,8 +32,17 @@ import {
   Modal,
   PageHeader,
   toast,
+  toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import {
+  BarcodeScanInput,
+  InventoryLineFields,
+  type InvDetail,
+  inventoryLinePayload,
+  invFromLine,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -49,9 +59,11 @@ interface Item {
   id: string;
   name: string;
   type: string;
+  purchaseCost?: string | null;
+  trackingMode?: string | null;
 }
 
-type ReceiptStatus = 'open' | 'billed' | 'void';
+type ReceiptStatus = 'open' | 'partial' | 'billed' | 'void';
 
 interface ItemReceipt {
   id: string;
@@ -90,20 +102,24 @@ interface LineRow {
   description: string;
   quantity: string;
   unitCost: string;
+  /** Advanced Inventory: receiving site / bin / serials / lot. */
+  inv?: InvDetail;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function statusTone(status: ReceiptStatus): 'info' | 'success' | 'neutral' {
+function statusTone(status: ReceiptStatus): 'info' | 'success' | 'neutral' | 'warning' {
   if (status === 'open') return 'info';
+  if (status === 'partial') return 'warning';
   if (status === 'billed') return 'success';
   return 'neutral';
 }
 
 function statusLabel(status: ReceiptStatus): string {
   if (status === 'open') return 'Awaiting Bill';
+  if (status === 'partial') return 'Partly Billed';
   if (status === 'billed') return 'Billed';
   return 'Void';
 }
@@ -131,9 +147,11 @@ interface NewReceiptModalProps {
   vendors: Vendor[];
   items: Item[];
   onCreated: () => void;
+  /** When set, edits this saved (unbilled) receipt (PATCH) instead of creating one. */
+  editId?: string | null;
 }
 
-function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceiptModalProps) {
+function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: NewReceiptModalProps) {
   const [vendorId, setVendorId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [reference, setReference] = useState('');
@@ -147,23 +165,93 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
   const [poLoading, setPoLoading] = useState(false);
 
   const itemMap = Object.fromEntries(items.map((it) => [it.id, it.name]));
+  const itemById = new Map(items.map((it) => [it.id, it]));
+  const adv = useAdvancedInventory(open);
 
-  // Reset the form when the modal opens.
+  // Scan-to-add: a scanned item fills the first empty line or appends one (qty 1, last cost).
+  function addScannedItem(it: { id: string; name: string; purchaseCost?: string | null }) {
+    setLines((prev) => {
+      const row: LineRow = { itemId: it.id, description: '', quantity: '1', unitCost: it.purchaseCost ?? '' };
+      const emptyIdx = prev.findIndex((l) => !l.itemId && !l.quantity && !l.unitCost);
+      if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
+      return [...prev, row];
+    });
+  }
+
+  const [loadingEdit, setLoadingEdit] = useState(false);
+  /** PO linked to the receipt being edited — restored after the vendor effect clears poId. */
+  const pendingPoRef = useRef<string | null>(null);
+
+  // Reset the form when the modal opens (or load the saved receipt when editing).
   useEffect(() => {
-    if (open) {
-      setVendorId('');
-      setDate(new Date().toISOString().slice(0, 10));
-      setReference('');
-      setMemo('');
-      setLines([{ ...EMPTY_LINE }]);
-      setVendorPos([]);
-      setPoId('');
-    }
-  }, [open]);
+    if (!open) return;
+    setVendorId('');
+    setDate(new Date().toISOString().slice(0, 10));
+    setReference('');
+    setMemo('');
+    setLines([{ ...EMPTY_LINE }]);
+    setVendorPos([]);
+    setPoId('');
+    pendingPoRef.current = null;
+    if (!editId) return;
+    let cancelled = false;
+    setLoadingEdit(true);
+    api
+      .get<{
+        vendorId: string;
+        purchaseOrderId: string | null;
+        date: string;
+        reference: string | null;
+        memo: string | null;
+        lines: Array<{
+          itemId: string;
+          description: string | null;
+          quantity: string;
+          unitCost: string;
+          siteId?: string | null;
+          binId?: string | null;
+          serialNumbers?: string[] | null;
+          lotNumber?: string | null;
+          lotExpiration?: string | null;
+        }>;
+      }>(`/api/item-receipts/${editId}`)
+      .then((r) => {
+        if (cancelled) return;
+        pendingPoRef.current = r.purchaseOrderId ?? null;
+        setVendorId(r.vendorId);
+        setDate(String(r.date).slice(0, 10));
+        setReference(r.reference ?? '');
+        setMemo(r.memo ?? '');
+        setLines(
+          r.lines.length > 0
+            ? r.lines.map((l) => ({
+                itemId: l.itemId,
+                description: l.description ?? '',
+                quantity: String(parseFloat(l.quantity)),
+                unitCost: String(parseFloat(l.unitCost)),
+                inv: invFromLine(l),
+              }))
+            : [{ ...EMPTY_LINE }],
+        );
+      })
+      .catch((err) => {
+        toastError(err, 'Could not load this item receipt.');
+        onClose();
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingEdit(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editId]);
 
   // Load this vendor's receivable POs (open/partial) when the vendor changes.
   useEffect(() => {
-    setPoId('');
+    // Editing: keep the receipt's own PO link (changing the PO means void + re-enter).
+    setPoId(pendingPoRef.current ?? '');
+    if (vendorId) pendingPoRef.current = null; // only restore once, for the loaded vendor
     setVendorPos([]);
     if (!vendorId) return;
     let cancelled = false;
@@ -215,7 +303,11 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
     }
   }
 
-  function updateLine(idx: number, field: keyof LineRow, value: string) {
+  function updateLineInv(idx: number, inv: InvDetail) {
+    setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, inv } : l)));
+  }
+
+  function updateLine(idx: number, field: Exclude<keyof LineRow, 'inv'>, value: string) {
     setLines((prev) => {
       const next = [...prev];
       next[idx] = { ...next[idx], [field]: value };
@@ -254,7 +346,7 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
 
     setSaving(true);
     try {
-      await api.post('/api/item-receipts', {
+      const body = {
         vendorId,
         date,
         reference: reference || undefined,
@@ -265,14 +357,20 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
           description: l.description || null,
           quantity: l.quantity,
           unitCost: l.unitCost,
+          ...inventoryLinePayload(l.inv),
         })),
-      });
-      toast('Item receipt recorded — stock received.', 'success');
+      };
+      if (editId) {
+        await api.patch(`/api/item-receipts/${editId}`, body);
+        toast('Item receipt updated — stock adjusted to match.', 'success');
+      } else {
+        await api.post('/api/item-receipts', body);
+        toast('Item receipt recorded — stock received.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to create item receipt.';
-      toast(msg, 'danger');
+      toastError(err, editId ? 'Failed to save changes.' : 'Failed to create item receipt.');
     } finally {
       setSaving(false);
     }
@@ -282,20 +380,32 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
     <Modal
       open={open}
       onClose={onClose}
-      title="Receive Items"
+      title={editId ? 'Edit Item Receipt' : 'Receive Items'}
       size="lg"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>
-            Cancel
+            {editId ? 'Cancel edit' : 'Cancel'}
           </Button>
-          <Button onClick={handleSubmit} loading={saving} disabled={poLoading}>
-            Receive Items
+          <Button onClick={handleSubmit} loading={saving} disabled={poLoading || loadingEdit}>
+            {editId ? 'Save Changes' : 'Receive Items'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
+        {editId && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            You can change this receipt until its bill is entered. Saving replaces the received
+            quantities and costs. To link it to a different purchase order, void it and receive the
+            items again.
+          </div>
+        )}
+        {loadingEdit && (
+          <div className="flex items-center gap-2 text-sm text-navy/50">
+            <Spinner className="h-4 w-4" /> Loading receipt...
+          </div>
+        )}
         <p className="text-sm text-navy/70">
           Record items that arrived <strong>before the vendor&apos;s bill</strong>. Stock is
           received immediately and the value sits in the Item Receipts Accrual (2050) until you
@@ -325,9 +435,12 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
             <Select
               id="ir-po"
               value={poId}
-              disabled={!vendorId || vendorPos.length === 0}
+              disabled={Boolean(editId) || !vendorId || vendorPos.length === 0}
               onChange={(e) => handlePoChange(e.target.value)}
             >
+              {editId && poId && !vendorPos.some((p) => p.id === poId) && (
+                <option value={poId}>Linked purchase order</option>
+              )}
               <option value="">
                 {vendorId
                   ? vendorPos.length > 0
@@ -365,9 +478,12 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Items Received</Label>
-            <Button type="button" variant="ghost" size="sm" onClick={addLine} disabled={poLoading}>
-              <PlusCircle className="h-4 w-4" /> Add line
-            </Button>
+            <div className="flex items-center gap-2">
+              {!poId && <BarcodeScanInput onItem={addScannedItem} />}
+              <Button type="button" variant="ghost" size="sm" onClick={addLine} disabled={poLoading}>
+                <PlusCircle className="h-4 w-4" /> Add line
+              </Button>
+            </div>
           </div>
 
           {poLoading ? (
@@ -444,6 +560,15 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated }: NewReceip
                     >
                       <MinusCircle className="h-4 w-4" />
                     </button>
+                    <InventoryLineFields
+                      className="col-span-full"
+                      adv={adv}
+                      item={itemById.get(line.itemId)}
+                      quantity={line.quantity}
+                      direction="in"
+                      value={line.inv}
+                      onChange={(inv) => updateLineInv(idx, inv)}
+                    />
                   </div>
                 );
               })}
@@ -590,6 +715,7 @@ export default function ItemReceiptsPage() {
   const [pos, setPos] = useState<PurchaseOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
   const [convertTarget, setConvertTarget] = useState<ItemReceipt | null>(null);
   const [voidTarget, setVoidTarget] = useState<ItemReceipt | null>(null);
   const [voiding, setVoiding] = useState(false);
@@ -649,9 +775,14 @@ export default function ItemReceiptsPage() {
         title="Item Receipts"
         icon={PackageCheck}
         action={
-          <Button onClick={() => setShowNew(true)}>
-            <Plus className="h-4 w-4" /> Receive Items
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" onClick={() => window.location.assign('/receive-bill')} title="Bill received items with quantity / price variances">
+              <ArrowRight className="h-4 w-4" /> Enter Bill for Received Items
+            </Button>
+            <Button onClick={() => setShowNew(true)}>
+              <Plus className="h-4 w-4" /> Receive Items
+            </Button>
+          </div>
         }
       />
 
@@ -712,6 +843,17 @@ export default function ItemReceiptsPage() {
                           <Button
                             variant="ghost"
                             size="sm"
+                            onClick={() => {
+                              setEditId(r.id);
+                              setShowNew(true);
+                            }}
+                            title="Edit this receipt (until its bill is entered)"
+                          >
+                            <Pencil className="h-3.5 w-3.5" /> Edit
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
                             onClick={() => setConvertTarget(r)}
                             title="Enter the vendor's bill for this receipt"
                           >
@@ -730,6 +872,11 @@ export default function ItemReceiptsPage() {
                       )}
                       {r.status === 'billed' && (
                         <span className="text-xs text-navy/30 italic">Bill created</span>
+                      )}
+                      {r.status === 'partial' && (
+                        <Button variant="ghost" size="sm" onClick={() => window.location.assign('/receive-bill')} title="Bill the rest of this receipt">
+                          <ArrowRight className="h-3.5 w-3.5" /> Bill the rest
+                        </Button>
                       )}
                     </div>
                   </Td>
@@ -760,10 +907,14 @@ export default function ItemReceiptsPage() {
 
       <NewReceiptModal
         open={showNew}
-        onClose={() => setShowNew(false)}
+        onClose={() => {
+          setShowNew(false);
+          setEditId(null);
+        }}
         vendors={vendors}
         items={items}
         onCreated={fetchData}
+        editId={editId}
       />
 
       <ConvertModal

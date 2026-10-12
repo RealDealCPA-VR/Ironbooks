@@ -13,10 +13,14 @@
  *  - displayName is mandatory and non-empty; email is validated if provided.
  *  - Deactivation is soft-delete (isActive = false); hard delete is not exposed.
  */
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { customers, invoices } from '@/lib/db/schema';
-import { toAmountString } from '@/lib/money';
+import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { unappliedPaymentsByCustomer } from './customerCredits';
+import { journalBalancesByEntity } from './journal';
+import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
+import { getPreferences } from './preferences';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -44,6 +48,14 @@ export interface CreateCustomerInput {
   taxRateId?: string | null;
   parentId?: string | null;
   notes?: string | null;
+  /** Terms list entry (wins over the legacy `terms` string, which is kept in sync). */
+  termsId?: string | null;
+  /** Sales Tax Code list entry; when set, `taxable` follows the code's taxable flag. */
+  salesTaxCodeId?: string | null;
+  /** Resale certificate number (tax-exempt customers). */
+  resaleNumber?: string | null;
+  /** Why this customer is exempt from sales tax. */
+  taxExemptionReason?: string | null;
 }
 
 export type UpdateCustomerInput = Partial<CreateCustomerInput>;
@@ -127,7 +139,7 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
     .where(
       and(
         eq(customers.companyId, ctx.companyId),
-        eq(customers.displayName, input.displayName.trim()),
+        sql`lower(${customers.displayName}) = lower(${input.displayName.trim()})`, // QB names are case-insensitive
       ),
     );
   if (conflict) {
@@ -148,6 +160,9 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
     if (!parent) throw notFound('Parent customer');
   }
 
+  const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
+  const taxCode = input.salesTaxCodeId ? await resolveSalesTaxCode(ctx, input.salesTaxCodeId) : null;
+
   const [row] = await ctx.db
     .insert(customers)
     .values({
@@ -158,9 +173,14 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
       phone: input.phone?.trim() ?? null,
       billingAddress: (input.billingAddress as Record<string, string>) ?? null,
       shippingAddress: (input.shippingAddress as Record<string, string>) ?? null,
-      terms: input.terms ?? 'net_30',
+      // A Terms-list pick / typed terms win; else Preferences > Sales & Customers: default terms for new records.
+      terms: termsRes ? termsRes.terms : (await getPreferences(ctx)).defaultCustomerTerms,
+      termsId: termsRes?.termsId ?? null,
       creditLimit: input.creditLimit != null ? toAmountString(input.creditLimit) : null,
-      taxable: input.taxable ?? true,
+      taxable: taxCode ? taxCode.taxable : input.taxable ?? true,
+      salesTaxCodeId: taxCode?.id ?? null,
+      resaleNumber: input.resaleNumber?.trim() || null,
+      taxExemptionReason: input.taxExemptionReason?.trim() || null,
       taxRateId: input.taxRateId ?? null,
       parentId: input.parentId ?? null,
       notes: input.notes ?? null,
@@ -200,7 +220,8 @@ export async function updateCustomer(
         .where(
           and(
             eq(customers.companyId, ctx.companyId),
-            eq(customers.displayName, patch.displayName.trim()),
+            sql`lower(${customers.displayName}) = lower(${patch.displayName.trim()})`,
+            sql`${customers.id} <> ${id}`,
           ),
         );
       if (conflict) {
@@ -227,6 +248,12 @@ export async function updateCustomer(
     if (!parent) throw notFound('Parent customer');
   }
 
+  const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
+  const taxCode =
+    patch.salesTaxCodeId !== undefined && patch.salesTaxCodeId !== null
+      ? await resolveSalesTaxCode(ctx, patch.salesTaxCodeId)
+      : null;
+
   const [row] = await ctx.db
     .update(customers)
     .set({
@@ -246,16 +273,27 @@ export async function updateCustomer(
         patch.shippingAddress !== undefined
           ? (patch.shippingAddress as Record<string, string>) ?? null
           : before.shippingAddress,
-      terms:
-        patch.terms !== undefined ? patch.terms ?? before.terms : before.terms,
+      terms: termsRes ? termsRes.terms ?? before.terms : before.terms,
+      termsId: termsRes ? termsRes.termsId : before.termsId,
       creditLimit:
         patch.creditLimit !== undefined
           ? patch.creditLimit != null
             ? toAmountString(patch.creditLimit)
             : null
           : before.creditLimit,
-      taxable:
-        patch.taxable !== undefined ? patch.taxable : before.taxable,
+      taxable: taxCode
+        ? taxCode.taxable
+        : patch.taxable !== undefined
+          ? patch.taxable
+          : before.taxable,
+      salesTaxCodeId:
+        patch.salesTaxCodeId !== undefined ? taxCode?.id ?? null : before.salesTaxCodeId,
+      resaleNumber:
+        patch.resaleNumber !== undefined ? patch.resaleNumber?.trim() || null : before.resaleNumber,
+      taxExemptionReason:
+        patch.taxExemptionReason !== undefined
+          ? patch.taxExemptionReason?.trim() || null
+          : before.taxExemptionReason,
       taxRateId:
         patch.taxRateId !== undefined ? patch.taxRateId ?? null : before.taxRateId,
       parentId:
@@ -334,10 +372,38 @@ export async function customerBalanceSummary(
     .groupBy(invoices.customerId, customers.displayName)
     .orderBy(asc(customers.displayName));
 
-  return rows.map((r) => ({
+  const result = rows.map((r) => ({
     customerId: r.customerId,
     displayName: r.displayName,
     totalBalanceDue: toAmountString(r.totalBalanceDue),
     openInvoiceCount: Number(r.openInvoiceCount),
   }));
+
+  // Named General Journal lines on A/R are part of the customer's balance (QB parity), and
+  // unapplied payments are credits against it (the whole payment was credited to A/R).
+  const journal = await journalBalancesByEntity(ctx, 'ar');
+  for (const [id, credit] of await unappliedPaymentsByCustomer(ctx)) {
+    journal.set(id, toAmountString(Money.of(journal.get(id) ?? '0').minus(Money.of(credit))));
+  }
+  if (journal.size > 0) {
+    const byId = new Map(result.map((r) => [r.customerId, r]));
+    const missing = [...journal.keys()].filter((id) => !byId.has(id));
+    const names = missing.length
+      ? await ctx.db
+          .select({ id: customers.id, displayName: customers.displayName })
+          .from(customers)
+          .where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, missing)))
+      : [];
+    for (const n of names) {
+      const row = { customerId: n.id, displayName: n.displayName, totalBalanceDue: '0.00', openInvoiceCount: 0 };
+      result.push(row);
+      byId.set(n.id, row);
+    }
+    for (const [id, amt] of journal) {
+      const row = byId.get(id);
+      if (row) row.totalBalanceDue = toAmountString(Money.of(row.totalBalanceDue).plus(Money.of(amt)));
+    }
+    result.sort((a, b) => a.displayName.localeCompare(b.displayName));
+  }
+  return result;
 }

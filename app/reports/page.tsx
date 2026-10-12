@@ -1,5 +1,7 @@
 'use client';
 
+// wave2 prefs: default report basis
+import { usePreferences } from '@/lib/usePreferences';
 import Link from 'next/link';
 import {
   BarChart2,
@@ -29,8 +31,17 @@ import {
   Building2,
   FileCode2,
   Wrench,
+  MapPin,
+  Bookmark,
+  PieChart,
+  Grid3x3,
+  CalendarClock,
+  Search,
 } from 'lucide-react';
+import { REPORT_CATALOG, REPORT_GROUPS } from '@/lib/reports/catalog';
+import { canDo, useMe } from '@/lib/usePermissions';
 import { Card, PageHeader } from '@/components/ui';
+import { Help } from '@/components/Help';
 
 // ---------------------------------------------------------------------------
 // Report link card
@@ -43,9 +54,17 @@ interface ReportCardProps {
   description: string;
 }
 
+/** Preferences > Reports: "Default report basis" opens these reports on their cash variant. */
+const CASH_VARIANT: Record<string, string> = {
+  '/reports/profit-loss': '/reports/profit-loss-cash',
+  '/reports/balance-sheet': '/reports/balance-sheet-cash',
+};
+
 function ReportCard({ href, icon: Icon, name, description }: ReportCardProps) {
+  const basis = usePreferences().company.reportBasis;
+  const target = basis === 'cash' ? (CASH_VARIANT[href] ?? href) : href;
   return (
-    <Link href={href} className="group focus:outline-none">
+    <Link href={target} className="group focus:outline-none">
       <Card className="flex items-start gap-4 p-5 transition-all duration-150 hover:shadow-2xl hover:border-electric/40 group-focus:ring-2 group-focus:ring-electric/40 cursor-pointer h-full">
         <div className="flex-shrink-0 rounded-xl bg-electric/10 p-2.5 group-hover:bg-electric/20 transition-colors">
           <Icon className="h-5 w-5 text-electric" />
@@ -246,6 +265,12 @@ const SALES_PURCHASES_REPORTS: ReportCardProps[] = [
     name: 'Purchases by Item',
     description: 'Quantity and cost per item from vendor bills.',
   },
+  {
+    href: '/reports/inventory-sites',
+    icon: MapPin,
+    name: 'Inventory by Site',
+    description: 'Quantity on hand, stock status, reorder, and serial/lot numbers by site.',
+  },
 ];
 
 const BANKING_REPORTS: ReportCardProps[] = [
@@ -286,6 +311,36 @@ const PLANNING_REPORTS: ReportCardProps[] = [
 
 const OTHER_REPORTS: ReportCardProps[] = [
   {
+    href: '/reports/memorized',
+    icon: Bookmark,
+    name: 'Memorized Reports',
+    description: 'Your saved reports and report groups. Run several at once and export them together.',
+  },
+  {
+    href: '/reports/graphs',
+    icon: PieChart,
+    name: 'Graphs',
+    description: 'Income & expense, net worth, sales, A/R, A/P and budget vs actual charts.',
+  },
+  {
+    href: '/reports/pivot',
+    icon: Grid3x3,
+    name: 'Advanced Reporting',
+    description: 'Slice your ledger or item sales by any two things — account, class, customer, month and more.',
+  },
+  {
+    href: '/reports/schedules',
+    icon: CalendarClock,
+    name: 'Scheduled Reports',
+    description: 'Save memorized reports to a folder automatically every day, week or month.',
+  },
+  {
+    href: '/find',
+    icon: Search,
+    name: 'Find Transactions',
+    description: 'Search every transaction by type, name, amount, number, account, date or memo.',
+  },
+  {
     href: '/reports/builder',
     icon: Wrench,
     name: 'Report Builder',
@@ -309,10 +364,72 @@ const OTHER_REPORTS: ReportCardProps[] = [
 // Page
 // ---------------------------------------------------------------------------
 
+function AllStandardReports() {
+  const { me } = useMe();
+  const visible = REPORT_CATALOG.filter((r) => !r.hidden && canDo(me, r.area, 'view'));
+  return (
+    <>
+      <SectionHeading>All reports</SectionHeading>
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        {REPORT_GROUPS.map((g) => {
+          const list = visible.filter((r) => r.group === g);
+          if (list.length === 0) return null;
+          return (
+            <Card key={g} className="p-5">
+              <h3 className="text-sm font-bold text-navy mb-2">{g}</h3>
+              <ul className="space-y-1.5">
+                {list.map((r) => (
+                  <li key={r.key}>
+                    <Link href={`/reports/std/${r.key}`} className="text-sm font-medium text-electric hover:underline">
+                      {r.title}
+                    </Link>
+                    <span className="block text-xs text-navy/50">{r.description}</span>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
 export default function ReportsPage() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Reports" icon={BarChart2} />
+
+      {/* Start here: the three questions most owners ask, in plain language. */}
+      <section aria-labelledby="reports-start" className="mb-8 rounded-2xl border-l-4 border-emerald bg-white p-5 shadow-xl">
+        <h2 id="reports-start" className="text-sm font-bold uppercase tracking-wide text-navy/70 mb-3">
+          New to reports? Start here
+        </h2>
+        <ul className="grid grid-cols-1 gap-3 md:grid-cols-3 text-sm">
+          <li>
+            <Link href="/reports/profit-loss" className="font-semibold text-electric hover:underline">
+              Am I making money?
+            </Link>
+            <span className="block text-navy/50">Profit &amp; Loss: income minus expenses for a period.</span>
+          </li>
+          <li>
+            <Link href="/reports/balance-sheet" className="font-semibold text-electric hover:underline">
+              What do I own and owe?
+            </Link>
+            <span className="block text-navy/50">Balance Sheet: your accounts on a single date.</span>
+          </li>
+          <li>
+            <Link href="/reports/ar-aging" className="font-semibold text-electric hover:underline">
+              Who owes me money?
+            </Link>
+            <span className="block text-navy/50">A/R Aging: unpaid invoices by how late they are.</span>
+          </li>
+        </ul>
+        <p className="mt-3 flex items-center gap-1 text-xs text-navy/50">
+          Most reports can be viewed on an accrual or cash basis.
+          <Help term="accrual-vs-cash" side="bottom" />
+        </p>
+      </section>
 
       <SectionHeading>Financial</SectionHeading>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -355,6 +472,8 @@ export default function ReportsPage() {
           <ReportCard key={r.href} {...r} />
         ))}
       </div>
+
+      <AllStandardReports />
     </main>
   );
 }

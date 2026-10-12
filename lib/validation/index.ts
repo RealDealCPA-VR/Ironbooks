@@ -92,3 +92,4 @@ export * from './timeEntries';
 export * from './transfers';
 export * from './vendorCredits';
 export * from './vendors';
+export * from './inventorySites';

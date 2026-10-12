@@ -42,13 +42,20 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as { checkNumber?: unknown };
+    const body = (await req.json().catch(() => ({}))) as {
+      checkNumber?: unknown;
+      allowDuplicateNumber?: unknown;
+    };
     const checkNumber =
       body.checkNumber != null && String(body.checkNumber).trim() !== ''
         ? String(body.checkNumber).trim()
         : undefined;
 
-    const expense = await markExpensePrinted(ctx, { expenseId: id, checkNumber });
+    const expense = await markExpensePrinted(ctx, {
+      expenseId: id,
+      checkNumber,
+      allowDuplicateNumber: body.allowDuplicateNumber === true,
+    });
     return NextResponse.json({ expense });
   } catch (err) {
     return errorResponse(err);
