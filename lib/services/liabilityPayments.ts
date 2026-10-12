@@ -6,12 +6,12 @@
  * Balances of 2200 / 2300 are derived from posted journal entries, not cached
  * columns, so they remain accurate even after void/adjustment entries.
  */
-import { and, eq, gte, lte, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines, taxAgencies } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, notFound, validation } from './_base';
 import { assertNotControlAccount, postJournalEntry } from './posting';
-import { salesTaxByAgency } from './combinedTax';
+import { type SalesTaxBasis, salesTaxLiabilityReport } from './accountant/salesTaxLedger';
 
 // ── COA codes fixed by the project spec ─────────────────────────────────────
 const CODE_SALES_TAX_PAYABLE = '2200';
@@ -352,16 +352,20 @@ export async function payrollLiabilitiesDue(ctx: ServiceContext): Promise<string
 // ── Sales tax by agency (QB Pay Sales Tax grid) ──────────────────────────────
 
 export interface AgencyLiabilityRow {
-  /** null = tax collected with no agency link (single-rate, uncomponentized). */
+  /** null = tax that cannot be tied to an agency (no rate/agency, or recorded outside sales tax). */
   agencyId: string | null;
   agencyName: string | null;
   /** The agency's dedicated liability account (payments post here when set; else 2200). */
   liabilityAccountId: string | null;
-  /** Tax collected on invoices in the range, allocated to this agency via rate components. */
+  /** Owed before the range (all earlier activity). '0.00' when no `from`. */
+  openingBalance: string;
+  /** Net tax charged in the range: invoices + sales receipts − credit memos. */
   collected: string;
-  /** Payments remitted to this agency in the range (entries sourceRef "tax_agency:<id>"). */
+  /** Sales tax adjustments in the range (signed; + increases what is owed). */
+  adjusted: string;
+  /** Payments remitted to this agency in the range. */
   paid: string;
-  /** collected - paid. */
+  /** Owed as of the end of the range: opening + collected + adjusted − paid. */
   balance: string;
 }
 
@@ -370,115 +374,45 @@ export interface SalesTaxLiabilityByAgencyResult {
   totalCollected: string;
   totalPaid: string;
   totalBalance: string;
+  /** Sales-tax liability accounts' GL balance at the end of the range. */
+  glBalance: string;
+  /** Σ balances == GL (accrual). */
+  tiesToGl: boolean;
 }
 
 /**
  * Per-agency sales-tax liability for the QB "Pay Sales Tax" screen.
  *
- * Collected: invoice tax allocated across tax-rate components → agencies
- * (delegates to combinedTax.salesTaxByAgency). Rates without components or
- * components without an agency land in the null-agency bucket.
- *
- * Paid: posted journal entries stamped sourceRef "tax_agency:<id>" (what
- * paySalesTax writes), summed by their liability-side debits. Voided payments
- * are excluded by status. Agency-less payments are not attributable and are
- * not netted against any bucket.
+ * GL-driven (lib/services/accountant/salesTaxLedger.ts): every posted line on a sales-tax
+ * liability account is attributed to agencies — invoice / sales receipt / credit memo tax via the
+ * document's rates and combined-rate components, Pay Sales Tax payments ("tax_agency:<id>"),
+ * Sales Tax Adjustments ("sales_tax_adj:<id>") and lines linked by Fix Incorrectly Recorded Sales
+ * Tax. Voided documents drop out automatically, and Σ balance equals the GL balance exactly.
+ * Activity that cannot be attributed shows in the null-agency row.
  */
 export async function salesTaxLiabilityByAgency(
   ctx: ServiceContext,
-  range?: { from?: Date; to?: Date },
+  range?: { from?: Date; to?: Date; basis?: SalesTaxBasis },
 ): Promise<SalesTaxLiabilityByAgencyResult> {
-  // 1) Collected per agency (component allocation).
-  const collectedReport = await salesTaxByAgency(ctx, range);
-  const collectedByAgency = new Map<string | null, ReturnType<typeof Money.zero>>();
-  for (const row of collectedReport.rows) {
-    const key = row.agencyId ?? null;
-    collectedByAgency.set(
-      key,
-      (collectedByAgency.get(key) ?? Money.zero()).plus(Money.of(row.taxCollected)),
-    );
-  }
-
-  // 2) All agencies for this company (so zero-collected agencies still list).
-  const agencies = await ctx.db
-    .select({
-      id: taxAgencies.id,
-      name: taxAgencies.name,
-      liabilityAccountId: taxAgencies.liabilityAccountId,
-    })
-    .from(taxAgencies)
-    .where(eq(taxAgencies.companyId, ctx.companyId));
-
-  // 3) Payments per agency: liability-side debits of posted "tax_agency:<id>" entries.
-  const paidConds = [
-    eq(journalEntries.companyId, ctx.companyId),
-    eq(journalEntries.status, 'posted'),
-    sql`${journalEntries.sourceRef} LIKE 'tax_agency:%'`,
-    sql`${journalEntryLines.debit} > 0`,
-  ];
-  if (range?.from) paidConds.push(gte(journalEntries.date, range.from));
-  if (range?.to) paidConds.push(lte(journalEntries.date, range.to));
-
-  const paidRows = await ctx.db
-    .select({
-      sourceRef: journalEntries.sourceRef,
-      paid: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
-    })
-    .from(journalEntryLines)
-    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .where(and(...paidConds))
-    .groupBy(journalEntries.sourceRef);
-
-  const paidByAgency = new Map<string, ReturnType<typeof Money.zero>>();
-  for (const row of paidRows) {
-    const agencyId = row.sourceRef?.slice('tax_agency:'.length);
-    if (!agencyId) continue;
-    paidByAgency.set(
-      agencyId,
-      (paidByAgency.get(agencyId) ?? Money.zero()).plus(Money.of(row.paid)),
-    );
-  }
-
-  // 4) Merge: every agency + the null bucket when it carries collected tax.
-  const rows: AgencyLiabilityRow[] = [];
-  let totalCollected = Money.zero();
-  let totalPaid = Money.zero();
-
-  for (const agency of agencies) {
-    const collected = collectedByAgency.get(agency.id) ?? Money.zero();
-    const paid = paidByAgency.get(agency.id) ?? Money.zero();
-    totalCollected = totalCollected.plus(collected);
-    totalPaid = totalPaid.plus(paid);
-    rows.push({
-      agencyId: agency.id,
-      agencyName: agency.name,
-      liabilityAccountId: agency.liabilityAccountId,
-      collected: toAmountString(collected),
-      paid: toAmountString(paid),
-      balance: toAmountString(collected.minus(paid)),
-    });
-  }
-
-  const unassigned = collectedByAgency.get(null) ?? Money.zero();
-  if (unassigned.greaterThan(0)) {
-    totalCollected = totalCollected.plus(unassigned);
-    rows.push({
-      agencyId: null,
-      agencyName: null,
-      liabilityAccountId: null,
-      collected: toAmountString(unassigned),
-      paid: '0.00',
-      balance: toAmountString(unassigned),
-    });
-  }
-
-  // Largest balances first; null bucket naturally sorts by its balance too.
+  const report = await salesTaxLiabilityReport(ctx, range ?? {});
+  const rows: AgencyLiabilityRow[] = report.agencies.map((a) => ({
+    agencyId: a.agencyId,
+    agencyName: a.agencyName,
+    liabilityAccountId: a.liabilityAccountId,
+    openingBalance: a.openingBalance,
+    collected: toAmountString(Money.add(a.collected, a.credited, a.unattributed)),
+    adjusted: a.adjustments,
+    paid: a.paid,
+    balance: a.balance,
+  }));
+  // Largest balances first; the null bucket sorts by its balance too.
   rows.sort((a, b) => Money.of(b.balance).comparedTo(Money.of(a.balance)));
-
   return {
     rows,
-    totalCollected: toAmountString(totalCollected),
-    totalPaid: toAmountString(totalPaid),
-    totalBalance: toAmountString(totalCollected.minus(totalPaid)),
+    totalCollected: toAmountString(Money.add(report.totals.collected, report.totals.credited, report.totals.unattributed)),
+    totalPaid: report.totals.paid,
+    totalBalance: report.totals.balance,
+    glBalance: report.glBalance,
+    tiesToGl: report.tiesToGl,
   };
 }

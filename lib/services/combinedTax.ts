@@ -9,10 +9,11 @@
  * `salesTaxByAgency` splits total collected tax across components/agencies
  * proportionally by their rate share.
  */
-import { and, eq, gte, lte, sql } from 'drizzle-orm';
-import { taxRates, taxRateComponents, taxAgencies, invoices } from '@/lib/db/schema';
+import { and, eq, sql } from 'drizzle-orm';
+import { taxRates, taxRateComponents, taxAgencies } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit, inTransaction } from './_base';
+import { salesTaxActivity } from './accountant/salesTaxLedger';
 
 // ---------------------------------------------------------------------------
 // listComponents
@@ -161,7 +162,7 @@ export interface AgencyTaxRow {
   componentName: string;
   componentRate: string;
   rateShare: string; // fraction of parent rate
-  taxCollected: string; // dollar amount for the period
+  taxCollected: string; // dollar amount for the period (net of credit memos)
 }
 
 export interface SalesTaxByAgencyResult {
@@ -170,170 +171,61 @@ export interface SalesTaxByAgencyResult {
 }
 
 /**
- * Total sales tax collected on invoices in the date range, split across
- * components/agencies proportionally by their rate share.
+ * Net sales tax collected in the date range, per agency component.
  *
- * For invoices that reference a tax rate composed of multiple components, this
- * allocates `invoice.taxAmount` to each component proportional to `component.rate
- * / sum(component.rates)`.  Invoices that reference a rate with no components
- * are reported as a single "uncategorized" bucket.
+ * Delegates to the GL-driven sales-tax engine (lib/services/accountant/salesTaxLedger.ts), so it
+ * covers invoices, sales receipts, credit memos (negative), per-line rates and combined-rate
+ * components, and excludes voided documents — and it agrees to the penny with the Sales Tax
+ * Payable ledger. Rates without components report under the rate's own agency; tax with no
+ * resolvable rate lands in an "Unassigned tax" row.
  */
 export async function salesTaxByAgency(
   ctx: ServiceContext,
   range?: { from?: Date; to?: Date },
 ): Promise<SalesTaxByAgencyResult> {
-  // 1. Fetch invoices in range for this company.
-  const conds = [eq(invoices.companyId, ctx.companyId)];
-  if (range?.from) conds.push(gte(invoices.date, range.from));
-  if (range?.to) conds.push(lte(invoices.date, range.to));
-  // Exclude void/draft invoices: their tax was never collected / was reversed.
-  conds.push(sql`${invoices.status} NOT IN ('void', 'draft')`);
+  const activity = await salesTaxActivity(ctx, { to: range?.to });
 
-  const invoiceRows = await ctx.db
-    .select({
-      id: invoices.id,
-      taxRateId: invoices.taxRateId,
-      taxAmount: invoices.taxAmount,
-    })
-    .from(invoices)
-    .where(and(...conds));
+  const rateRows = await ctx.db.select().from(taxRates).where(eq(taxRates.companyId, ctx.companyId));
+  const compRows = await ctx.db
+    .select()
+    .from(taxRateComponents)
+    .where(eq(taxRateComponents.companyId, ctx.companyId));
+  const agencyRows = await ctx.db
+    .select({ id: taxAgencies.id, name: taxAgencies.name })
+    .from(taxAgencies)
+    .where(eq(taxAgencies.companyId, ctx.companyId));
+  const agencyName = new Map(agencyRows.map((a) => [a.id, a.name]));
 
-  // 2. Collect all unique taxRateIds.
-  const taxRateIds = [...new Set(invoiceRows.map((i) => i.taxRateId).filter(Boolean))] as string[];
-
-  // 3. Load components for those rates (with agency name via join).
-  type ComponentRow = {
-    id: string;
-    taxRateId: string;
-    name: string;
-    agencyId: string | null;
-    agencyName: string | null;
-    rate: string;
-  };
-
-  let componentRows: ComponentRow[] = [];
-  if (taxRateIds.length > 0) {
-    componentRows = await ctx.db
-      .select({
-        id: taxRateComponents.id,
-        taxRateId: taxRateComponents.taxRateId,
-        name: taxRateComponents.name,
-        agencyId: taxRateComponents.agencyId,
-        agencyName: taxAgencies.name,
-        rate: taxRateComponents.rate,
-      })
-      .from(taxRateComponents)
-      .leftJoin(taxAgencies, eq(taxRateComponents.agencyId, taxAgencies.id))
-      .where(
-        and(
-          eq(taxRateComponents.companyId, ctx.companyId),
-          sql`${taxRateComponents.taxRateId} = ANY(ARRAY[${sql.join(
-            taxRateIds.map((id) => sql`${id}::uuid`),
-            sql`, `,
-          )}])`,
-        ),
-      );
-  }
-
-  // 4. Group components by taxRateId.
-  const componentsByRate = new Map<string, ComponentRow[]>();
-  for (const c of componentRows) {
-    const list = componentsByRate.get(c.taxRateId) ?? [];
-    list.push(c);
-    componentsByRate.set(c.taxRateId, list);
-  }
-
-  // 5. Allocate each invoice's taxAmount across its components.
-  // Accumulate per (agencyId, componentName, componentRate).
-  type Key = string; // agencyId|componentName|rate
-  const accumulated = new Map<
-    Key,
-    {
-      agencyId: string | null;
-      agencyName: string | null;
-      componentName: string;
-      componentRate: string;
-      rateShare: string;
-      collected: ReturnType<typeof Money.zero>;
-    }
-  >();
-
-  let grandTotal = Money.zero();
-
-  for (const inv of invoiceRows) {
-    const taxAmt = Money.of(inv.taxAmount);
-    if (taxAmt.isZero()) continue;
-    grandTotal = grandTotal.plus(taxAmt);
-
-    if (!inv.taxRateId) {
-      // No tax rate — lump into uncategorized.
-      const key = '__none__|uncategorized|0.000000';
-      const entry = accumulated.get(key) ?? {
-        agencyId: null,
-        agencyName: null,
-        componentName: 'Uncategorized',
-        componentRate: '0.000000',
-        rateShare: '1.000000',
-        collected: Money.zero(),
-      };
-      entry.collected = entry.collected.plus(taxAmt);
-      accumulated.set(key, entry);
-      continue;
-    }
-
-    const comps = componentsByRate.get(inv.taxRateId) ?? [];
-
-    if (comps.length === 0) {
-      // Rate exists but no components — report as single row.
-      const key = `${inv.taxRateId}|ungrouped|0.000000`;
-      const entry = accumulated.get(key) ?? {
-        agencyId: null,
-        agencyName: null,
-        componentName: 'Tax',
-        componentRate: '0.000000',
-        rateShare: '1.000000',
-        collected: Money.zero(),
-      };
-      entry.collected = entry.collected.plus(taxAmt);
-      accumulated.set(key, entry);
-      continue;
-    }
-
-    // Compute total rate for proportional allocation.
+  const acc = new Map<string, { row: Omit<AgencyTaxRow, 'taxCollected'>; v: ReturnType<typeof Money.zero> }>();
+  let total = Money.zero();
+  for (const r of activity) {
+    if (r.kind !== 'collected' && r.kind !== 'credited') continue;
+    if (range?.from && r.date < range.from) continue;
+    const amt = Money.of(r.amount);
+    total = total.plus(amt);
+    const rate = r.taxRateId ? rateRows.find((x) => x.id === r.taxRateId) : undefined;
+    const comps = r.taxRateId ? compRows.filter((c) => c.taxRateId === r.taxRateId) : [];
+    const comp = comps.find((c) => c.name === r.componentName && c.agencyId === r.agencyId);
     const totalRate = comps.reduce((s, c) => s.plus(Money.of(c.rate)), Money.zero());
-
-    for (const comp of comps) {
-      const share = totalRate.isZero()
-        ? Money.of(1).dividedBy(comps.length)
-        : Money.of(comp.rate).dividedBy(totalRate);
-
-      const portion = taxAmt.times(share);
-      const key = `${comp.agencyId ?? '__none__'}|${comp.name}|${comp.rate}`;
-      const rateShare = totalRate.isZero()
-        ? (1 / comps.length).toFixed(6)
-        : share.toFixed(6);
-
-      const entry = accumulated.get(key) ?? {
-        agencyId: comp.agencyId,
-        agencyName: comp.agencyName ?? null,
-        componentName: comp.name,
-        componentRate: comp.rate,
+    const componentRate = comp?.rate ?? rate?.rate ?? '0.000000';
+    const rateShare = comp && !totalRate.isZero() ? Money.of(comp.rate).dividedBy(totalRate).toFixed(6) : '1.000000';
+    const key = `${r.agencyId ?? '__none__'}|${r.componentName}|${componentRate}`;
+    const e = acc.get(key) ?? {
+      row: {
+        agencyId: r.agencyId,
+        agencyName: r.agencyId ? (agencyName.get(r.agencyId) ?? null) : null,
+        componentName: r.componentName,
+        componentRate,
         rateShare,
-        collected: Money.zero(),
-      };
-      entry.collected = entry.collected.plus(portion);
-      accumulated.set(key, entry);
-    }
+      },
+      v: Money.zero(),
+    };
+    e.v = e.v.plus(amt);
+    acc.set(key, e);
   }
 
-  const rows: AgencyTaxRow[] = [...accumulated.values()].map((e) => ({
-    agencyId: e.agencyId,
-    agencyName: e.agencyName,
-    componentName: e.componentName,
-    componentRate: e.componentRate,
-    rateShare: e.rateShare,
-    taxCollected: toAmountString(e.collected),
-  }));
-
-  return { rows, total: toAmountString(grandTotal) };
+  const rows: AgencyTaxRow[] = [...acc.values()]
+    .filter((e) => !e.v.isZero())
+    .map((e) => ({ ...e.row, taxCollected: toAmountString(e.v) }));
+  return { rows, total: toAmountString(total) };
 }

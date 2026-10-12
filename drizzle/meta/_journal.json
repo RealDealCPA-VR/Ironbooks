@@ -204,6 +204,13 @@
       "when": 1781200028000,
       "tag": "0028_wave2_purchases",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1781200029000,
+      "tag": "0029_wave2_accountant",
+      "breakpoints": true
     }
   ]
 }

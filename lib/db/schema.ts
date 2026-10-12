@@ -589,6 +589,8 @@ export const salesReceipts = pgTable('sales_receipts', {
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
   refNumber: varchar('ref_number', { length: 50 }),
   date: timestamp('date').notNull(),
+  /** Receipt-level sales tax rate (wave2 accountant: sales-tax liability attribution). */
+  taxRateId: uuid('tax_rate_id').references(() => taxRates.id),
   method: paymentMethodEnum('method').notNull().default('cash'),
   reference: varchar('reference', { length: 100 }),
   status: docStatusEnum('status').notNull().default('paid'),
@@ -599,8 +601,6 @@ export const salesReceipts = pgTable('sales_receipts', {
   depositAccountId: uuid('deposit_account_id').references(() => accounts.id), // bank or undeposited funds
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
-  /** wave2 sales: receipt-level tax rate (kept so the receipt can be edited later). */
-  taxRateId: uuid('tax_rate_id'),
   // wave2 sales: shipping fields (B6) + print/email queue flags (C7)
   shipDate: timestamp('ship_date'),
   shipVia: varchar('ship_via', { length: 100 }),
@@ -946,6 +946,9 @@ export const creditMemos = pgTable('credit_memos', {
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
   refNumber: varchar('ref_number', { length: 50 }),
   date: timestamp('date').notNull(),
+  /** Memo-level sales tax rate (wave2 accountant: lets the sales-tax liability engine attribute
+   *  credited-back tax to the right agency). Null on legacy memos. */
+  taxRateId: uuid('tax_rate_id').references(() => taxRates.id),
   status: docStatusEnum('status').notNull().default('open'),
   subtotal: decimal('subtotal', { precision: 15, scale: 2 }).notNull().default('0'),
   taxAmount: decimal('tax_amount', { precision: 15, scale: 2 }).notNull().default('0'),
@@ -955,8 +958,6 @@ export const creditMemos = pgTable('credit_memos', {
   refundedAmount: decimal('refunded_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
-  /** wave2 sales: memo-level tax rate (kept so the memo can be edited later). */
-  taxRateId: uuid('tax_rate_id'),
   toBePrinted: boolean('to_be_printed').notNull().default(false),
   toBeEmailed: boolean('to_be_emailed').notNull().default(false),
   lastEmailedAt: timestamp('last_emailed_at'),
@@ -2063,4 +2064,73 @@ export const loanPayments = pgTable('loan_payments', {
   expenseId: uuid('expense_id').references(() => expenses.id),
   billId: uuid('bill_id').references(() => bills.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+// ---- wave2 accountant ----
+// Accountant tools (lib/services/accountant/*): sales-tax line attribution (Fix Incorrectly
+// Recorded Sales Tax), Working Trial Balance notes, Review List Changes, Client Data Review.
+// Unique keys are declared in drizzle/0029_wave2_accountant.sql.
+
+/**
+ * Attribution of a journal line on a sales-tax liability account that was NOT recorded through
+ * Pay Sales Tax / a sales document (e.g. a check or journal entry that paid the agency). The
+ * posted line itself is never modified; this row only tells the sales-tax liability engine
+ * which agency (and as what kind of activity) the line belongs to. Unique per line.
+ */
+export const salesTaxLineLinks = pgTable('sales_tax_line_links', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  journalEntryLineId: uuid('journal_entry_line_id').references(() => journalEntryLines.id).notNull(),
+  agencyId: uuid('agency_id').references(() => taxAgencies.id),
+  /** 'payment' | 'adjustment' | 'collected' */
+  kind: varchar('kind', { length: 20 }).notNull(),
+  note: text('note'),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Working Trial Balance: per-account workpaper reference + accountant notes for a period end. */
+export const workingTbNotes = pgTable('working_tb_notes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  accountId: uuid('account_id').references(() => accounts.id).notNull(),
+  /** 'YYYY-MM-DD' period end the note belongs to. */
+  periodEnd: varchar('period_end', { length: 10 }).notNull(),
+  workpaperRef: varchar('workpaper_ref', { length: 100 }),
+  note: text('note'),
+  createdBy: uuid('created_by').references(() => users.id),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Review List Changes: an audit-log row (list change) the accountant marked as reviewed. */
+export const listChangeReviews = pgTable('list_change_reviews', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  auditLogId: uuid('audit_log_id').references(() => auditLogs.id).notNull(),
+  reviewedBy: uuid('reviewed_by').references(() => users.id),
+  reviewedAt: timestamp('reviewed_at').defaultNow().notNull(),
+});
+
+/** Client Data Review: account balances captured at the end of a review (compared next time). */
+export const clientReviewSnapshots = pgTable('client_review_snapshots', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** 'YYYY-MM-DD' — the review period end the balances are as of. */
+  asOf: varchar('as_of', { length: 10 }).notNull(),
+  /** accountId -> natural balance (2dp string) as of `asOf`. */
+  balances: jsonb('balances').$type<Record<string, string>>().notNull(),
+  note: text('note'),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Client Data Review: per-task status (QB lets the accountant mark each task done). */
+export const clientReviewTasks = pgTable('client_review_tasks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  taskKey: varchar('task_key', { length: 64 }).notNull(),
+  /** 'not_started' | 'in_progress' | 'completed' */
+  status: varchar('status', { length: 20 }).notNull().default('not_started'),
+  note: text('note'),
+  createdBy: uuid('created_by').references(() => users.id),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });

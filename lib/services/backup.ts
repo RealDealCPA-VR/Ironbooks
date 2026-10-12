@@ -34,6 +34,8 @@ import {
   bouncedChecks, collectionNotes, creditApplications,
   // wave2 purchases
   checkPrintSettings, loanPayments, loans,
+  // wave2 accountant
+  clientReviewTasks, listChangeReviews, salesTaxLineLinks, workingTbNotes,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
@@ -566,6 +568,12 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'loans', table: loans, joins: [], companyCol: loans.companyId },
   { name: 'loanPayments', table: loanPayments, joins: [], companyCol: loanPayments.companyId },
   { name: 'checkPrintSettings', table: checkPrintSettings, joins: [], companyCol: checkPrintSettings.companyId },
+  // ---- wave2 accountant (client_review_snapshots is NOT exported: its balances are keyed by
+  // account id, which restore remaps, so an old snapshot would misreport every account) ----
+  { name: 'salesTaxLineLinks', table: salesTaxLineLinks, joins: [], companyCol: salesTaxLineLinks.companyId },
+  { name: 'workingTbNotes', table: workingTbNotes, joins: [], companyCol: workingTbNotes.companyId },
+  { name: 'listChangeReviews', table: listChangeReviews, joins: [], companyCol: listChangeReviews.companyId },
+  { name: 'clientReviewTasks', table: clientReviewTasks, joins: [], companyCol: clientReviewTasks.companyId },
 ];
 
 /**

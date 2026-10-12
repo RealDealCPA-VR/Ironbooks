@@ -121,6 +121,7 @@ export const navGroups: NavGroup[] = [
       { icon: MapPin, label: 'Inventory by Site', path: '/reports/inventory-sites' },
       { icon: UserSquare, label: 'Payroll Reports', path: '/reports/payroll-summary' },
       { icon: Banknote, label: 'Reconciliation Reports', path: '/reports/reconciliation' },
+      { icon: Percent, label: 'Sales Tax Liability', path: '/reports/sales-tax' }, // wave2 accountant
       { icon: Network, label: 'Consolidated', path: '/reports/consolidated' },
       { icon: AlertTriangle, label: 'AI Review', path: '/errors' },
     ],
@@ -129,6 +130,7 @@ export const navGroups: NavGroup[] = [
     heading: 'Admin',
     links: [
       { icon: FileClock, label: 'Audit Trail', path: '/audit-trail' },
+      { icon: BriefcaseIcon, label: 'Accountant Center', path: '/accountant' }, // wave2 accountant
       { icon: ScrollText, label: 'Transaction Log', path: '/transaction-log' },
       { icon: Paperclip, label: 'Attachments', path: '/attachments' },
       { icon: BadgeCheck, label: 'Data Integrity', path: '/integrity' },

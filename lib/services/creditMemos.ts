@@ -562,13 +562,15 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         memoNumber,
         refNumber,
         date: input.date,
+        // Persisted so the sales-tax liability engine can attribute the credited-back tax
+        // to the rate's agencies (lib/services/accountant/salesTaxLedger.ts).
+        taxRateId: input.taxRateId ?? null,
         status: 'open',
         subtotal: toAmountString(subtotal),
         taxAmount: toAmountString(taxAmount),
         total: toAmountString(total),
         unapplied: toAmountString(total),
         memo: input.memo ?? null,
-        taxRateId: input.taxRateId ?? null,
         toBePrinted: input.toBePrinted ?? false,
         toBeEmailed: input.toBeEmailed ?? false,
       })

@@ -535,6 +535,8 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
         receiptNumber,
         refNumber,
         date: input.date,
+        // Persisted for the sales-tax liability engine (lib/services/accountant/salesTaxLedger.ts).
+        taxRateId: input.taxRateId ?? null,
         method,
         reference: input.reference ?? null,
         status: 'paid',
@@ -544,7 +546,6 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
         total: toAmountString(total),
         depositAccountId,
         memo: input.memo ?? null,
-        taxRateId: input.taxRateId ?? null,
         ...shippingColumns(input),
         // postedEntryId filled below after posting
       })
