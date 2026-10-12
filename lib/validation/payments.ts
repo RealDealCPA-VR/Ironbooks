@@ -32,6 +32,19 @@ export const paymentCreditFromPaymentSchema = z.object({
   amount: zMoneyPositive,
 });
 
+/** I11: a General Journal A/R charge paid by this payment. */
+export const journalItemPaymentSchema = z.object({
+  journalLineId: zUuid,
+  amount: zMoneyPositive,
+});
+
+/** I11: a General Journal A/R credit applied to an invoice inside Receive Payments. */
+export const journalCreditToInvoiceSchema = z.object({
+  journalLineId: zUuid,
+  invoiceId: zUuid,
+  amount: zMoneyPositive,
+});
+
 export const receivePaymentSchema = z.object({
   customerId: zUuid,
   date: zDate,
@@ -51,6 +64,8 @@ export const receivePaymentSchema = z.object({
   }),
   credits: z.array(paymentCreditSchema).nullish(),
   paymentCredits: z.array(paymentCreditFromPaymentSchema).nullish(),
+  journalItems: z.array(journalItemPaymentSchema).nullish(),
+  journalCredits: z.array(journalCreditToInvoiceSchema).nullish(),
   discountAccountId: zUuid.nullish(),
   memo: z.string().nullish(),
   currency: z.string().trim().length(3, 'currency must be a 3-letter ISO 4217 code').nullish(),

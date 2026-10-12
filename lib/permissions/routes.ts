@@ -300,6 +300,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/invoices/statement-charges/[id]': r('customers', 'PUT PATCH'),
   '/api/payments/credits': r('customers', 'GET'),
   '/api/payments/discounts': r('customers', 'GET'),
+  '/api/payments/journal-items': r('customers', 'GET POST:modify'),
   '/api/sales-forms/[kind]/[id]/pdf': r('customers', 'GET:print'),
   '/api/sales-forms/[kind]/[id]/email': r('customers', 'POST:print'),
   '/api/sales-forms/[kind]/[id]/flags': r('customers', 'PATCH'),
@@ -322,6 +323,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/bills/duplicate-number': r('vendors', 'GET'), // wave2 purchases: duplicate ref warning
   '/api/bill-payments': r('vendors', 'GET POST'),
   '/api/bill-payments/[id]': r('vendors', 'GET PATCH DELETE'),
+  '/api/bill-payments/journal-items': r('vendors', 'GET POST:modify'),
   '/api/vendor-credits': r('vendors', 'GET POST'),
   '/api/vendor-credits/[id]': r('vendors', 'GET POST:modify PATCH DELETE'),
   '/api/purchase-orders': r('vendors', 'GET POST'),

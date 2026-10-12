@@ -218,7 +218,7 @@ export async function customerStatement(
   }
 
   // Named General Journal lines on A/R for this customer (QB shows them as "General Journal").
-  const journalItems = await journalOpenItems(ctx, 'ar', { entityId: customerId });
+  const journalItems = await journalOpenItems(ctx, 'ar', { entityId: customerId, gross: true });
   const toExclusive = range?.to ? new Date(range.to.getTime() + 86_400_000) : null;
   const journalInRange = journalItems.filter(
     (j) => (!range?.from || j.date >= range.from) && (!toExclusive || j.date < toExclusive),

@@ -1242,6 +1242,8 @@ export const depositLines = pgTable('deposit_lines', {
   paymentId: uuid('payment_id').references(() => paymentsReceived.id),
   description: text('description'),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Account an "extra" (non-payment) deposit line credits (0037; null on payment/receipt lines). */
+  accountId: uuid('account_id').references(() => accounts.id),
 });
 
 // ---- Multi-currency: currencies & exchange rates (relative to the company base currency) ----
@@ -2010,6 +2012,28 @@ export const creditApplications = pgTable('credit_applications', {
   paymentId: uuid('payment_id').references(() => paymentsReceived.id),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   date: timestamp('date').defaultNow().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * Applications of named General Journal A/R / A/P lines (0037, QB invariant I11): a JE A/R debit
+ * paid by a received payment ('payment'), a JE A/R credit applied to an invoice ('invoice_credit'),
+ * a JE A/P credit paid by a bill payment ('bill_payment'), a JE A/P debit applied to a bill
+ * ('bill_credit'). Posts no GL; see lib/services/journalApplications.ts.
+ */
+export const journalItemApplications = pgTable('journal_item_applications', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  side: varchar('side', { length: 2 }).notNull(),
+  kind: varchar('kind', { length: 20 }).notNull(),
+  journalEntryId: uuid('journal_entry_id').references(() => journalEntries.id).notNull(),
+  journalLineId: uuid('journal_line_id').references(() => journalEntryLines.id).notNull(),
+  paymentId: uuid('payment_id').references(() => paymentsReceived.id),
+  billPaymentId: uuid('bill_payment_id').references(() => billPayments.id),
+  invoiceId: uuid('invoice_id').references(() => invoices.id),
+  billId: uuid('bill_id').references(() => bills.id),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  date: timestamp('date').notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

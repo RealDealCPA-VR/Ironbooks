@@ -17,6 +17,7 @@ import {
   employees,
   journalEntries,
   journalEntryLines,
+  journalItemApplications,
   vendors,
 } from '@/lib/db/schema';
 import { REGISTER_SUBTYPES as REGISTER_SUBTYPE_LIST } from '@/lib/accountTypes';
@@ -475,6 +476,34 @@ export interface UpdateEntryInput {
 }
 
 /**
+ * Refuse to void / edit a journal entry whose A/R or A/P lines were paid or applied (QB asks you
+ * to remove the payments / credits first). The DB trigger (0037) enforces the same rule for every
+ * other path that voids an entry.
+ */
+export async function assertNoJournalApplications(
+  ctx: ServiceContext,
+  journalEntryId: string,
+  verb: 'voided' | 'edited',
+): Promise<void> {
+  const [row] = await ctx.db
+    .select({ n: sql<number>`COUNT(*)` })
+    .from(journalItemApplications)
+    .where(
+      and(
+        eq(journalItemApplications.companyId, ctx.companyId),
+        eq(journalItemApplications.journalEntryId, journalEntryId),
+      ),
+    );
+  if (Number(row?.n ?? 0) > 0) {
+    throw new ServiceError(
+      'CONFLICT',
+      `This journal entry can't be ${verb} because payments or credits were applied to its customer or vendor lines. ` +
+        'Remove those in Receive Payments or Pay Bills first.',
+    );
+  }
+}
+
+/**
  * Edit a posted journal entry: void-and-repost atomically.
  *
  * QuickBooks parity: opening a saved JE and editing lines/amounts/date. We
@@ -508,6 +537,7 @@ export async function updateEntry(ctx: ServiceContext, id: string, input: Update
       'This entry was posted by a source document. Edit the source document instead.',
     );
   }
+  await assertNoJournalApplications(ctx, id, 'edited');
 
   // Period lock on BOTH dates — the old date is where balances get reversed,
   // the new date is where they get re-posted. (postJournalEntry/voidJournalEntry
@@ -625,6 +655,7 @@ export async function voidEntry(ctx: ServiceContext, id: string) {
     .where(and(eq(journalEntries.id, id), eq(journalEntries.companyId, ctx.companyId)));
 
   if (!entry) throw notFound('Journal entry');
+  await assertNoJournalApplications(ctx, id, 'voided');
 
   return voidJournalEntry(ctx, id);
 }
@@ -1089,10 +1120,48 @@ export interface JournalOpenItem {
   entityType: 'customer' | 'vendor';
   entityId: string;
   /**
-   * Signed amount owed: for A/R a debit is +(customer owes you more), a credit is −;
-   * for A/P a credit is +(you owe the vendor more), a debit is −.
+   * Signed amount still OPEN (or the full line amount with `gross: true`): for A/R a debit is
+   * +(customer owes you more), a credit is −; for A/P a credit is +(you owe the vendor more), a
+   * debit is −. Applications (payments, bill payments, credits applied to invoices / bills — see
+   * journalApplications.ts) reduce it toward zero.
    */
   amount: string;
+  /** Signed full amount of the line (before applications). */
+  original: string;
+  /** Total applied to the line (positive), as of `asOf` when given. */
+  applied: string;
+}
+
+/**
+ * Applied amount per General Journal line (journal_item_applications), as of `asOf` when given.
+ * Cash applications ('payment', 'bill_payment') are dated with their payment, like invoice / bill
+ * payment applications in aging; credit applications ('invoice_credit', 'bill_credit') always
+ * count, like credit memos / vendor credits (the invoice or bill they reduce is reduced undated).
+ */
+export async function journalAppliedByLine(
+  ctx: ServiceContext,
+  side: 'ar' | 'ap',
+  opts: { asOf?: Date; lineIds?: string[] } = {},
+): Promise<Map<string, ReturnType<typeof Money.zero>>> {
+  const conds = [eq(journalItemApplications.companyId, ctx.companyId), eq(journalItemApplications.side, side)];
+  if (opts.asOf) {
+    conds.push(
+      sql`(${journalItemApplications.kind} IN ('invoice_credit', 'bill_credit') OR ${journalItemApplications.date} <= ${opts.asOf})`,
+    );
+  }
+  if (opts.lineIds) {
+    if (opts.lineIds.length === 0) return new Map();
+    conds.push(inArray(journalItemApplications.journalLineId, opts.lineIds));
+  }
+  const rows = await ctx.db
+    .select({
+      lineId: journalItemApplications.journalLineId,
+      applied: sql<string>`COALESCE(SUM(CAST(${journalItemApplications.amount} AS NUMERIC)), 0)`,
+    })
+    .from(journalItemApplications)
+    .where(and(...conds))
+    .groupBy(journalItemApplications.journalLineId);
+  return new Map(rows.map((r) => [r.lineId, Money.of(r.applied)]));
 }
 
 /**
@@ -1101,11 +1170,16 @@ export interface JournalOpenItem {
  * due) on the entry date: they belong in the customer / vendor balance, aging and statements.
  * Only manual entries and their reversals are included — document postings (invoices, bills,
  * payments) are already represented by their own documents.
+ *
+ * By default each item carries its OPEN amount (line amount minus what payments / credits have
+ * applied to it) and fully applied lines are left out — that is what aging, customer / vendor
+ * balances and the A/R control check need. `gross: true` returns every line at its full amount
+ * (statements list activity, and count the payments that paid these lines in full too).
  */
 export async function journalOpenItems(
   ctx: ServiceContext,
   side: 'ar' | 'ap',
-  opts: { asOf?: Date; entityId?: string } = {},
+  opts: { asOf?: Date; entityId?: string; gross?: boolean } = {},
 ): Promise<JournalOpenItem[]> {
   const entityType = side === 'ar' ? 'customer' : 'vendor';
   const conds = [
@@ -1139,26 +1213,39 @@ export async function journalOpenItems(
     .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
     .where(and(...conds))
     .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
-  return rows
-    .filter((r) => r.entityId)
-    .map((r) => {
-      const dr = Money.of(r.debit);
-      const cr = Money.of(r.credit);
-      const amount = side === 'ar' ? dr.minus(cr) : cr.minus(dr);
-      return {
-        journalEntryId: r.journalEntryId,
-        lineId: r.lineId,
-        entryNumber: r.entryNumber,
-        date: r.date,
-        reference: r.reference ?? null,
-        description: r.description,
-        memo: r.memo ?? null,
-        accountId: r.accountId,
-        entityType,
-        entityId: r.entityId!,
-        amount: toAmountString(amount),
-      };
+  const named = rows.filter((r) => r.entityId);
+  const appliedByLine = await journalAppliedByLine(ctx, side, {
+    asOf: opts.asOf,
+    lineIds: opts.entityId ? named.map((r) => r.lineId) : undefined,
+  });
+  const out: JournalOpenItem[] = [];
+  for (const r of named) {
+    const dr = Money.of(r.debit);
+    const cr = Money.of(r.credit);
+    const original = side === 'ar' ? dr.minus(cr) : cr.minus(dr);
+    const applied = appliedByLine.get(r.lineId) ?? Money.zero();
+    // Applications move the line toward zero, never past it (the services refuse over-application).
+    const left = original.abs().minus(applied);
+    const openAbs = left.isNegative() ? Money.zero() : left;
+    const open = original.isNegative() ? openAbs.negated() : openAbs;
+    if (!opts.gross && open.isZero()) continue;
+    out.push({
+      journalEntryId: r.journalEntryId,
+      lineId: r.lineId,
+      entryNumber: r.entryNumber,
+      date: r.date,
+      reference: r.reference ?? null,
+      description: r.description,
+      memo: r.memo ?? null,
+      accountId: r.accountId,
+      entityType,
+      entityId: r.entityId!,
+      amount: toAmountString(opts.gross ? original : open),
+      original: toAmountString(original),
+      applied: toAmountString(applied),
     });
+  }
+  return out;
 }
 
 /** Net General Journal balance per customer (ar) / vendor (ap): entityId → signed amount. */
