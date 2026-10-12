@@ -24,6 +24,11 @@ export interface FieldMeta {
   accounts?: (a: Account) => boolean;
   /** Show only when another boolean key is on. */
   dependsOn?: string;
+  /**
+   * Fixed behaviour: the setting is shown checked and locked with this plain explanation
+   * (BookKeeper AI always does this, for the reason given).
+   */
+  fixed?: string;
 }
 
 // Mirrors lib/services/prefAccounts.ts accountFitsKind (kept separate: this module is client-safe).
@@ -44,11 +49,11 @@ const TERMS: Array<[string, string]> = [
 export const FIELD_META: Record<string, FieldMeta> = {
   // Accounting
   accountNumbersEnabled: { label: 'Use account numbers', help: 'Show account numbers next to account names everywhere.', type: 'bool' },
-  requireAccountNumbers: { label: 'Require an account number on new accounts', type: 'bool', dependsOn: 'accountNumbersEnabled' },
-  requireAccounts: { label: 'Require an account on every transaction line', help: 'Recommended. Lines without an account would otherwise land in an "uncategorized" bucket.', type: 'bool' },
+  requireAccountNumbers: { label: 'Require an account number on new accounts', help: 'When off, a new account left without a number gets the next free one.', type: 'bool', dependsOn: 'accountNumbersEnabled' },
+  requireAccounts: { label: 'Require an account on every transaction line', type: 'bool', fixed: 'Always on: every line needs an account, so your books always balance and nothing lands in an unknown bucket.' },
   classTrackingEnabled: { label: 'Use class tracking', help: 'Tag transactions with a class (department, location, …) for reports by class.', type: 'bool' },
   warnUnassignedClass: { label: 'Warn me when a transaction has no class', type: 'bool', dependsOn: 'classTrackingEnabled' },
-  autoAssignJeNumbers: { label: 'Automatically number journal entries', type: 'bool' },
+  autoAssignJeNumbers: { label: 'Automatically number journal entries', help: 'New journal entries get the next Entry No. You can still type your own.', type: 'bool' },
   warnPastDatesEnabled: { label: 'Warn if a transaction is dated in the past', type: 'bool' },
   warnPastDays: { label: 'More than this many days in the past', type: 'number', dependsOn: 'warnPastDatesEnabled' },
   warnFutureDatesEnabled: { label: 'Warn if a transaction is dated in the future', type: 'bool' },
@@ -65,13 +70,13 @@ export const FIELD_META: Record<string, FieldMeta> = {
   timezone: { label: 'Time zone', help: 'Decides what "today" means for due dates and reminders.', type: 'text' },
   currency: { label: 'Home currency (ISO code)', type: 'text' },
   fiscalYearEnd: { label: 'Fiscal year end (MM-DD)', type: 'text' },
-  enterMovesBetweenFields: { label: 'Pressing Enter moves between fields', type: 'bool' },
-  beepOnRecord: { label: 'Beep when recording a transaction', type: 'bool' },
+  enterMovesBetweenFields: { label: 'Pressing Enter moves between fields', help: 'Enter goes to the next field instead of saving. Use the Save button to save.', type: 'bool' },
+  beepOnRecord: { label: 'Beep when recording a transaction', help: 'Plays a short tone after a transaction is saved.', type: 'bool' },
   autoDecimalPoint: { label: 'Automatically place the decimal point', help: 'Typing 1234 enters 12.34.', type: 'bool' },
-  warnWhenEditing: { label: 'Warn when editing a transaction', type: 'bool' },
-  warnWhenDeleting: { label: 'Warn when deleting a transaction or unused list item', type: 'bool' },
-  defaultDate: { label: 'Default date for new transactions', type: 'select', options: [['today', "Today's date"], ['last', 'The last date I entered']] },
-  autoRecallLastTransaction: { label: 'Recall the last transaction for a name', type: 'bool' },
+  warnWhenEditing: { label: 'Warn when editing a transaction', help: 'Asks before saving changes to a transaction that was already recorded.', type: 'bool' },
+  warnWhenDeleting: { label: 'Warn when deleting a transaction or unused list item', type: 'bool', fixed: 'Always on: BookKeeper AI always asks before deleting or voiding, because it cannot be undone.' },
+  defaultDate: { label: 'Default date for new transactions', help: '"The last date I entered" uses the date of the last transaction you saved on this computer.', type: 'select', options: [['today', "Today's date"], ['last', 'The last date I entered']] },
+  autoRecallLastTransaction: { label: 'Recall the last transaction for a name', help: 'Bills and checks fill in the accounts you used last time for that vendor.', type: 'bool' },
   showHomeWorkflow: { label: 'Show the home workflow on the dashboard', type: 'bool' },
   // Jobs & Estimates
   estimatesEnabled: { label: 'Use estimates', type: 'bool' },
@@ -83,7 +88,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   purchaseOrdersEnabled: { label: 'Use purchase orders', type: 'bool' },
   warnDuplicatePoNumbers: { label: 'Warn about duplicate purchase order numbers', type: 'bool', dependsOn: 'purchaseOrdersEnabled' },
   negativeStockWarning: { label: 'Warn if not enough inventory to sell', type: 'bool' },
-  unitsOfMeasureEnabled: { label: 'Use units of measure', type: 'bool' },
+  unitsOfMeasureEnabled: { label: 'Use units of measure', help: 'Off hides the Units of Measure list and stops new unit sets from being saved.', type: 'bool' },
   // Payments
   autoApplyPayments: { label: 'Automatically apply payments to the oldest invoices', type: 'bool' },
   autoCalculatePayments: { label: 'Automatically calculate the payment amount from the invoices you check', type: 'bool' },
@@ -92,7 +97,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   defaultVendorTerms: { label: 'Default terms for new vendors', type: 'select', options: TERMS },
   defaultExpenseAccountId: { label: 'Default expense account', type: 'account', accounts: expense },
   warnDuplicateBillNumbers: { label: 'Warn about duplicate bill numbers from the same vendor', type: 'bool' },
-  autoUseVendorCredits: { label: 'Automatically use available vendor credits', type: 'bool' },
+  autoUseVendorCredits: { label: 'Automatically use available vendor credits', help: "In Pay Bills, checking a bill applies the vendor's open credits first.", type: 'bool' },
   // Reminders
   reminders: { label: 'What to remind me about', type: 'reminders' },
   showRemindersAtStartup: { label: 'Show the Reminders list when I open the company', type: 'bool' },
@@ -106,7 +111,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   defaultInvoiceMemo: { label: 'Default customer message on invoices', type: 'text' },
   defaultShipVia: { label: 'Usual shipping method', type: 'text' },
   defaultFob: { label: 'Usual FOB', type: 'text' },
-  priceLevelsEnabled: { label: 'Use price levels', type: 'bool' },
+  priceLevelsEnabled: { label: 'Use price levels', help: 'Off stops price levels from being created or changed.', type: 'bool' },
   salesOrdersEnabled: { label: 'Use sales orders', type: 'bool' },
   warnDuplicateInvoiceNumbers: { label: 'Warn about duplicate invoice numbers', type: 'bool' },
   // Sales Tax
@@ -117,13 +122,13 @@ export const FIELD_META: Record<string, FieldMeta> = {
   sendForms: { label: 'Email wording for each form', type: 'sendForms' },
   // Spelling
   spellCheckEnabled: { label: 'Check spelling as I type (memos and descriptions)', help: 'Uses the spell checker built into your computer. Right-click a word for suggestions.', type: 'bool' },
-  spellIgnoreUppercase: { label: 'Ignore words in UPPERCASE', type: 'bool', dependsOn: 'spellCheckEnabled' },
-  spellIgnoreWithNumbers: { label: 'Ignore words with numbers', type: 'bool', dependsOn: 'spellCheckEnabled' },
-  spellIgnoreInternetAddresses: { label: 'Ignore internet addresses', type: 'bool', dependsOn: 'spellCheckEnabled' },
+  spellIgnoreUppercase: { label: 'Ignore words in UPPERCASE', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; BookKeeper AI cannot change it." },
+  spellIgnoreWithNumbers: { label: 'Ignore words with numbers', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; BookKeeper AI cannot change it." },
+  spellIgnoreInternetAddresses: { label: 'Ignore internet addresses', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; BookKeeper AI cannot change it." },
   // Time & Expenses
   timeTrackingEnabled: { label: 'Track time', type: 'bool' },
   firstDayOfWeek: { label: 'First day of the work week', type: 'select', options: [['monday', 'Monday'], ['sunday', 'Sunday']], dependsOn: 'timeTrackingEnabled' },
-  trackReimbursedAsIncome: { label: 'Track reimbursed expenses as income', type: 'bool' },
+  trackReimbursedAsIncome: { label: 'Track reimbursed expenses as income', help: 'On: costs you bill back to customers go to an income account named "Reimbursed Expenses Income". Off: they reduce the original expense account.', type: 'bool' },
   defaultMarkupPercent: { label: 'Default markup percentage', type: 'number' },
   // Multiple currencies
   multiCurrencyEnabled: { label: 'I use more than one currency', help: 'Turning this on cannot be undone in QuickBooks; here it only shows the currency fields on forms.', type: 'bool' },

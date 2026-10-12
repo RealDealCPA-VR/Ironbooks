@@ -389,7 +389,8 @@ function ExpensesPageContent() {
     }
     // Preferences > Checking: "Autofill payee account number / last account used" gates the
     // last-transaction / learned suggestions (the vendor's own pre-fill accounts always apply).
-    if (!prefs.company.autofillPayeeAccount) return;
+    // My Preferences > General 'Recall the last transaction for a name' must be on too.
+    if (!prefs.company.autofillPayeeAccount || !prefs.my.autoRecallLastTransaction) return;
     const pf = await fetchVendorPrefill(q);
     if (!pf) return;
     setLines((prev) => {

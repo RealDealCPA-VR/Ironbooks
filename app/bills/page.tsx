@@ -298,6 +298,8 @@ export default function BillsPage() {
       setPrefillNote("Accounts pre-filled from the vendor's pre-fill accounts.");
       return;
     }
+    // My Preferences > General 'Recall the last transaction for a name'.
+    if (!prefs.my.autoRecallLastTransaction) return;
     const pf = await fetchVendorPrefill({ vendorId: id });
     if (!pf) return;
     setLines((prev) => {
