@@ -1199,6 +1199,7 @@ export default function EmployeesPage() {
       if (field === 'employeeId') {
         const emp = employees.find((e) => e.id === value);
         next.earnings = defaultEarningsFor(emp);
+        next.taxOverrides = []; // overrides belong to one employee's check
       }
       return next;
     });
