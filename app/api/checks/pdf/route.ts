@@ -5,7 +5,7 @@
  * its printer alignment offsets (Print Checks > Printer setup). Modes:
  *
  * 1. From a recorded document in the print queue:
- *      { source: 'expense' | 'bill_payment' | 'paycheck', id: string, checkNumber?: string }
+ *      { source: 'expense' | 'bill_payment' | 'paycheck' | 'payment_check', id: string, checkNumber?: string }
  *    or the legacy { expenseId, checkNumber? }.
  *    Payee ("print on check as" name), amount, date, memo (vendor account number when blank) and
  *    the voucher detail are pulled from the recorded transaction.
@@ -13,7 +13,7 @@
  * 2. Ad-hoc (quick check, not recorded):
  *      { payee: string, amount: string, date: string, memo?: string, checkNumber?: string }
  *
- * 3. Alignment test page: { alignmentTest: true, style?, offsetX?, offsetY? } — a sample check
+ * 3. Alignment test page: { alignmentTest: true, style?, stock?, offsetX?, offsetY? } — a sample check
  *    printed with the given (unsaved) settings so the user can line it up with their stock.
  *
  * Response: application/pdf (inline)
@@ -22,7 +22,15 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getCompany } from '@/lib/services/company';
 import { checkPrintData, getCheckPrintSettings, PRINT_SOURCES, type PrintSource } from '@/lib/services/printQueue';
-import { renderCheckPdf, numberToWords, CHECK_STYLES, type CheckStyle, type VoucherLine } from '@/lib/pdf/check';
+import {
+  renderCheckPdf,
+  numberToWords,
+  CHECK_STOCKS,
+  CHECK_STYLES,
+  type CheckStock,
+  type CheckStyle,
+  type VoucherLine,
+} from '@/lib/pdf/check';
 import { pdfResponse, routeError } from '@/lib/routeErrors';
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
@@ -46,6 +54,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         : undefined;
     let voucher: VoucherLine[] | undefined;
     let style: CheckStyle = settings.style;
+    let stock: CheckStock = settings.stock;
     let offset: { x: string | number; y: string | number } = { x: settings.offsetX, y: settings.offsetY };
 
     const source: PrintSource | null =
@@ -64,6 +73,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       checkNumber = checkNumber ?? '0000';
       voucher = [{ account: 'Sample account', description: 'Sample line', amount: '1234.56' }];
       if (typeof body.style === 'string' && CHECK_STYLES.includes(body.style as CheckStyle)) style = body.style as CheckStyle;
+      if (typeof body.stock === 'string' && CHECK_STOCKS.includes(body.stock as CheckStock)) stock = body.stock as CheckStock;
       if (body.offsetX != null) offset = { ...offset, x: String(body.offsetX) };
       if (body.offsetY != null) offset = { ...offset, y: String(body.offsetY) };
     } else if (source && docId) {
@@ -102,6 +112,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       checkNumber,
       voucher,
       style,
+      stock,
       offset,
     });
 

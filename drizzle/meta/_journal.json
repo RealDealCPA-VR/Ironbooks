@@ -253,6 +253,13 @@
       "when": 1781300037000,
       "tag": "0037_fix_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1781400042000,
+      "tag": "0042_p1_purchases",
+      "breakpoints": true
     }
   ]
 }
