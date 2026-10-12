@@ -285,8 +285,17 @@ export default function PayBillsPage() {
     if (row.checked) {
       patchRow(bill.id, emptyRow());
     } else {
-      // Default: pay the full balance in cash.
-      patchRow(bill.id, { checked: true, payAmount: Number(bill.balanceDue).toFixed(2) });
+      // Bills preference 'Automatically use available vendor credits': apply what credit is left
+      // (after other checked bills) first, and pay the rest. Otherwise pay the full balance.
+      const balance = Number(bill.balanceDue);
+      const credit = prefs.company.autoUseVendorCredits
+        ? Math.max(0, Math.min(balance, availableCredit - creditTotal))
+        : 0;
+      patchRow(bill.id, {
+        checked: true,
+        credit: credit > 0 ? credit.toFixed(2) : '',
+        payAmount: (balance - credit).toFixed(2),
+      });
     }
   }
 

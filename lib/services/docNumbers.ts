@@ -28,6 +28,7 @@ import {
   salesReceipts,
 } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, validation, writeAudit } from './_base';
+import { resolveCompanyPreferences } from '@/lib/preferences';
 
 export const DOC_TYPES = [
   'invoice',
@@ -146,7 +147,7 @@ export async function assertUniqueDocNumber(
   opts: { excludeId?: string; allowDuplicate?: boolean } = {},
 ): Promise<{ duplicate: boolean }> {
   const duplicate = await isDocNumberTaken(ctx, docType, ref, opts.excludeId);
-  if (duplicate && !opts.allowDuplicate) {
+  if (duplicate && !opts.allowDuplicate && (await warnsOnDuplicate(ctx, docType))) {
     throw new ServiceError(
       'CONFLICT',
       `${DOC_TYPE_LABELS[docType]} number ${ref} is already used. Use a different number, or confirm to keep the duplicate.`,
@@ -154,6 +155,27 @@ export async function assertUniqueDocNumber(
     );
   }
   return { duplicate };
+}
+
+/**
+ * QB Preferences 'Warn about duplicate invoice / estimate / purchase order numbers'. With the
+ * warning off QB accepts the duplicate silently; document types without such a preference
+ * always warn.
+ */
+const DUPLICATE_WARNING_PREF: Partial<Record<DocType, 'warnDuplicateInvoiceNumbers' | 'warnDuplicateEstimateNumbers' | 'warnDuplicatePoNumbers'>> = {
+  invoice: 'warnDuplicateInvoiceNumbers',
+  estimate: 'warnDuplicateEstimateNumbers',
+  purchase_order: 'warnDuplicatePoNumbers',
+};
+
+async function warnsOnDuplicate(ctx: ServiceContext, docType: DocType): Promise<boolean> {
+  const key = DUPLICATE_WARNING_PREF[docType];
+  if (!key) return true;
+  const [row] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  return resolveCompanyPreferences(row?.settings ?? {})[key];
 }
 
 /** Starting numbers per document type (companies.settings.docNumbers). */

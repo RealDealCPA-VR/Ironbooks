@@ -18,6 +18,7 @@
 import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import {
+  accounts,
   bills,
   billLines,
   customers,
@@ -34,6 +35,7 @@ import {
   validation,
 } from './_base';
 import { createInvoice, type CreateInvoiceInput, type InvoiceLineInput } from './invoices';
+import { getPreferences } from './company';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +51,8 @@ export interface UnbilledCost {
   description: string | null;
   amount: string;
   jobId: string | null;
+  /** The expense account the cost was recorded to (where the reimbursement goes by default). */
+  accountId?: string | null;
 }
 
 export interface UnbilledTime {
@@ -103,6 +107,7 @@ export async function listUnbilled(
       description: billLines.description,
       amount: billLines.amount,
       jobId: billLines.jobId,
+      accountId: billLines.accountId,
       date: bills.date,
       billNumber: bills.billNumber,
     })
@@ -125,6 +130,7 @@ export async function listUnbilled(
       description: expenseLines.description,
       amount: expenseLines.amount,
       jobId: expenseLines.jobId,
+      accountId: expenseLines.accountId,
       date: expenses.date,
       payeeName: expenses.payeeName,
       reference: expenses.reference,
@@ -195,6 +201,7 @@ export async function listUnbilled(
       description: r.description ?? null,
       amount: r.amount,
       jobId: r.jobId ?? null,
+      accountId: r.accountId ?? null,
     })),
     ...expenseRows.map((r) => ({
       id: r.id,
@@ -204,6 +211,7 @@ export async function listUnbilled(
       description: r.description ?? null,
       amount: r.amount,
       jobId: r.jobId ?? null,
+      accountId: r.accountId ?? null,
     })),
   ];
 
@@ -221,7 +229,8 @@ export async function listUnbilled(
  *
  * Cost lines intentionally carry NO itemId: the source item is a PURCHASE item
  * (re-attaching it would re-route income and, for inventory items, re-relieve
- * stock). Revenue lands on the default income account (4000).
+ * stock). Where the billed amount is credited follows the "Track reimbursed expenses as
+ * income" preference (reimbursementAccountResolver).
  */
 async function buildBillableLines(
   ctx: ServiceContext,
@@ -234,6 +243,7 @@ async function buildBillableLines(
 
   const markup = Money.of(selection.markupPercent ?? 0);
   if (markup.lessThan(0)) throw validation('Markup percent cannot be negative.');
+  const reimbursedTo = await reimbursementAccountResolver(ctx);
 
   const lines: InvoiceLineInput[] = [];
 
@@ -242,14 +252,14 @@ async function buildBillableLines(
     if (!cost || cost.source !== 'bill') {
       throw new ServiceError('CONFLICT', `Bill line ${id} is not an unbilled billable cost for this customer.`);
     }
-    lines.push(costToLine(cost, markup));
+    lines.push({ ...costToLine(cost, markup), accountId: reimbursedTo(cost) });
   }
   for (const id of selection.expenseLineIds ?? []) {
     const cost = costById.get(id);
     if (!cost || cost.source !== 'expense') {
       throw new ServiceError('CONFLICT', `Expense line ${id} is not an unbilled billable cost for this customer.`);
     }
-    lines.push(costToLine(cost, markup));
+    lines.push({ ...costToLine(cost, markup), accountId: reimbursedTo(cost) });
   }
   for (const id of selection.timeEntryIds ?? []) {
     const t = timeById.get(id);
@@ -267,6 +277,26 @@ async function buildBillableLines(
   }
 
   return lines;
+}
+
+/**
+ * QB Time & Expenses > 'Track reimbursed expenses as income'. Off (the QB default): the amount
+ * billed back to the customer is credited to the expense account the cost was recorded to, so
+ * the expense nets down. On: it is credited to an income account for reimbursements (the
+ * active income account whose name mentions 'reimburs', e.g. 4130 Reimbursed Expenses Income),
+ * or the default income account when there is none.
+ */
+async function reimbursementAccountResolver(
+  ctx: ServiceContext,
+): Promise<(cost: UnbilledCost) => string | null> {
+  const prefs = await getPreferences(ctx);
+  if (!prefs.trackReimbursedAsIncome) return (cost) => cost.accountId ?? null;
+  const income = await ctx.db
+    .select({ id: accounts.id, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.type, 'revenue'), eq(accounts.isActive, true)));
+  const reimbursed = income.find((a) => /reimburs/i.test(a.name));
+  return () => reimbursed?.id ?? null;
 }
 
 function costToLine(cost: UnbilledCost, markupPercent: ReturnType<typeof Money.zero>): InvoiceLineInput {

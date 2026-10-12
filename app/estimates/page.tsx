@@ -22,6 +22,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { PricedLinesEditor, type PricedLineItem } from '@/components/PricedLinesEditor';
@@ -278,6 +279,8 @@ function EstimateFormBody({
 // ---------------------------------------------------------------------------
 
 export default function EstimatesPage() {
+  // Preferences > Jobs & Estimates 'Use progress invoicing' (the server refuses it when off).
+  const progressOn = usePreferences().company.progressInvoicingEnabled;
   const [estimates, setEstimates] = useState<Estimate[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
@@ -702,7 +705,7 @@ export default function EstimatesPage() {
                       )}
                       {e.status !== 'closed' && e.status !== 'rejected' && (
                         <>
-                          <Button
+                          {progressOn && <Button
                             variant="ghost"
                             size="sm"
                             onClick={() => openProgressModal(e)}
@@ -710,7 +713,7 @@ export default function EstimatesPage() {
                           >
                             <Percent className="h-3.5 w-3.5" />
                             Progress
-                          </Button>
+                          </Button>}
                           {e.status !== 'partial' && (
                             <Button
                               variant="secondary"

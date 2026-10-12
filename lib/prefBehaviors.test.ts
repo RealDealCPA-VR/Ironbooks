@@ -55,12 +55,26 @@ describe('helpers', () => {
     expect(transactionTarget('/api/bills/1')).toEqual({ base: '/api/bills', record: true });
     expect(transactionTarget('/api/bills/1/void')).toBeNull();
     expect(transactionTarget('/api/bill-payments')).toEqual({ base: '/api/bill-payments', record: false });
+    expect(transactionTarget('/api/payroll/pay-runs')).toEqual({ base: '/api/payroll/pay-runs', record: false });
+    expect(transactionTarget('/api/payroll')).toEqual({ base: '/api/payroll', record: false });
     expect(recordsTransaction({ method: 'POST', path: '/api/deposits' })).toBe(true);
     expect(recordsTransaction({ method: 'PUT', path: '/api/deposits/1' })).toBe(true);
     expect(recordsTransaction({ method: 'DELETE', path: '/api/deposits/1' })).toBe(false);
     expect(recordsTransaction({ method: 'POST', path: '/api/customers' })).toBe(false);
     expect(bodyDate({ date: '2026-01-02T00:00:00Z' })).toBe('2026-01-02');
     expect(bodyDate({ memo: 'x' })).toBeNull();
+  });
+
+  it('nextJournalNumber continues the highest Entry No.', async () => {
+    const { nextJournalNumber } = await import('./prefBehaviors');
+    expect(nextJournalNumber([])).toBe('1');
+    expect(nextJournalNumber(['7', null, '12', 'REV of #40'])).toBe('13');
+    expect(nextJournalNumber(['GJ-0099', 'memo'])).toBe('GJ-0100');
+  });
+
+  it('paychecks get the date warning (payDate)', () => {
+    expect(promptsBeforeSave({ method: 'POST', path: '/api/payroll', body: { payDate: '2020-01-01' } }, company, my, today)[0]?.kind).toBe('date');
+    expect(promptsBeforeSave({ method: 'POST', path: '/api/payroll/pay-runs', body: { payDate: '2020-01-01' } }, company, my, today)[0]?.kind).toBe('date');
   });
 
   it('autoDecimal places the decimal point like QB (typing 1234 enters 12.34)', () => {

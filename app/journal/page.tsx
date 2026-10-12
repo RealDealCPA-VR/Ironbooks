@@ -44,6 +44,7 @@ import EntryDetailModal from '@/components/EntryDetailModal';
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmClassAssigned, confirmTransactionDate } from '@/lib/formPrefs';
 import { formatAccountLabel } from '@/lib/preferences';
+import { nextJournalNumber } from '@/lib/prefBehaviors';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 
@@ -206,6 +207,13 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       setDate(todayISO());
       setDescription('');
       setReference('');
+      // Preferences > Accounting 'Automatically number journal entries': next Entry No.
+      if (prefs.company.autoAssignJeNumbers) {
+        api
+          .get<{ entries: { reference: string | null }[] }>('/api/journal-entries')
+          .then((d) => setReference((r) => r || nextJournalNumber(d.entries.map((e) => e.reference))))
+          .catch(() => {});
+      }
       setIsAdjusting(false);
       setLines([emptyLine(++lineCounter), emptyLine(++lineCounter)]);
     }

@@ -33,6 +33,9 @@ export const TRANSACTION_APIS = [
   '/api/item-receipts',
   '/api/vendor-credits',
   '/api/bill-payments',
+  // Paychecks: pay runs first (more specific), then single paychecks.
+  '/api/payroll/pay-runs',
+  '/api/payroll',
 ] as const;
 
 /**
@@ -161,3 +164,22 @@ export const TRANSACTION_PAGES = [
 ];
 
 export const LAST_DATE_STORAGE_KEY = 'bka:lastTransactionDate';
+
+/**
+ * Accounting > 'Automatically number journal entries': the next Entry No. after the highest
+ * numbered one ('GJ-0099' -> 'GJ-0100', 17 -> 18), keeping prefix and leading zeros; '1' when
+ * no entry has a number. Reversal references ('REV of #12') are ignored.
+ */
+export function nextJournalNumber(refs: Array<string | null | undefined>): string {
+  let best: { prefix: string; digits: string; n: number } | null = null;
+  for (const raw of refs) {
+    const ref = (raw ?? '').trim();
+    if (!ref || /^REV of #/i.test(ref)) continue;
+    const m = /^(.*?)(\d+)$/.exec(ref);
+    if (!m) continue;
+    const n = Number(m[2]);
+    if (!best || n > best.n) best = { prefix: m[1], digits: m[2], n };
+  }
+  if (!best) return '1';
+  return best.prefix + String(best.n + 1).padStart(best.digits.length, '0');
+}

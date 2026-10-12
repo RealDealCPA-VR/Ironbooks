@@ -12,7 +12,8 @@ const zBaseType = z.enum(['asset', 'liability', 'equity', 'revenue', 'expense'],
 
 export const createAccountSchema = z
   .object({
-    code: z.string().trim().min(1, 'code is required'),
+    /** Blank = assign the next free number (unless Preferences require account numbers). */
+    code: z.string().trim().max(50).default(''),
     name: z.string().trim().min(1, 'name is required'),
     /** Base class. Optional when qbType is given. */
     type: zBaseType.optional(),

@@ -27,6 +27,7 @@ import {
 } from '@/lib/taxLines';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry } from './posting';
+import { resolveCompanyPreferences } from '@/lib/preferences';
 
 type AccountType = BaseAccountType;
 
@@ -241,10 +242,41 @@ export async function findOrCreateOpeningBalanceEquity(ctx: ServiceContext) {
   return row;
 }
 
+/** Next free numeric account code in the usual range for the type (1000 assets … 6000 expenses). */
+export async function nextAccountNumber(ctx: ServiceContext, type: AccountType, subtype: string): Promise<string> {
+  const start =
+    type === 'asset' ? 1000
+    : type === 'liability' ? 2000
+    : type === 'equity' ? 3000
+    : type === 'revenue' ? 4000
+    : subtype === 'cost_of_goods_sold' ? 5000
+    : 6000;
+  const rows = await ctx.db
+    .select({ code: accounts.code })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const taken = new Set(rows.map((r) => r.code));
+  let n = start;
+  while (taken.has(String(n))) n += 10;
+  return String(n);
+}
+
 export async function createAccount(ctx: ServiceContext, input: CreateAccountInput) {
-  if (!input.code?.trim()) throw validation('Account code is required.');
   if (!input.name?.trim()) throw validation('Account name is required.');
   const { type, subtype } = resolveTypeAndSubtype(input);
+  if (!input.code?.trim()) {
+    // Preferences > Accounting 'Require account numbers': refuse a blank number; otherwise
+    // assign the next free one in the type's range (QB numbers unnumbered accounts for you).
+    const [co] = await ctx.db
+      .select({ settings: companies.settings })
+      .from(companies)
+      .where(eq(companies.id, ctx.companyId));
+    const prefs = resolveCompanyPreferences(co?.settings ?? {});
+    if (prefs.accountNumbersEnabled && prefs.requireAccountNumbers) {
+      throw validation('Enter an account number. Your preferences require one (Preferences > Accounting).');
+    }
+    input = { ...input, code: await nextAccountNumber(ctx, type, subtype) };
+  }
   const taxLine = normalizeTaxLine(input.taxLine);
 
   // Enforce unique code per company.

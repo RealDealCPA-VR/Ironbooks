@@ -23,6 +23,7 @@ import {
   writeAudit,
 } from './_base';
 import { createInvoice } from './invoices';
+import { assertFeatureOn } from '@/lib/featureGate';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { allocateDocNumber, docRef } from './docNumbers';
 import {
@@ -501,6 +502,8 @@ export async function createProgressInvoice(
   estimateId: string,
   input: ProgressInvoiceInput,
 ) {
+  // Preferences > Jobs & Estimates 'Use progress invoicing'.
+  await assertFeatureOn(ctx, 'progressInvoicingEnabled');
   // Everything (estimate re-read, invoice creation, billing refresh) runs in ONE transaction so
   // concurrent progress bills see each other.
   return inTransaction(ctx, async (tx) => {
