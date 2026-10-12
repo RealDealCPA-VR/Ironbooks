@@ -479,12 +479,33 @@ async function restoreForeignKeys(tx: Raw, migrationsFolder: string): Promise<vo
  */
 export const LEDGER_TABLES = ['journal_entries', 'journal_entry_lines', 'accounts', 'journal_item_applications'] as const;
 
-/** Non-internal triggers on the ledger tables that the migrations don't create (added offline). */
+const triggerNameCache = new Map<string, Set<string>>();
+
+/** Every trigger name any migration creates (bka_* guards and others, e.g. bk_journal_item_applications_void_guard). */
+export function migrationTriggerNames(migrationsFolder: string): Set<string> {
+  const key = path.resolve(migrationsFolder);
+  const cached = triggerNameCache.get(key);
+  if (cached) return cached;
+  const names = new Set<string>(ledgerGuardPlan(migrationsFolder).triggers);
+  if (fs.existsSync(key)) {
+    const re = /CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+"?(\w+)"?/gi;
+    for (const file of migrationFiles(key)) {
+      const text = fs.readFileSync(file, 'utf8').replace(/--[^\n]*/g, ' ');
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text))) names.add(m[1]);
+    }
+  }
+  triggerNameCache.set(key, names);
+  return names;
+}
+
+/** Non-internal triggers on the ledger tables that no migration creates (added offline). */
 export async function extraLedgerTriggers(
   query: RowQuery,
   migrationsFolder: string,
 ): Promise<Array<{ tbl: string; tgname: string }>> {
-  const known = new Set(ledgerGuardPlan(migrationsFolder).triggers);
+  const known = migrationTriggerNames(migrationsFolder);
+  if (!known.size) return []; // no migrations folder: nothing to compare against
   const found = await query<{ tbl: string; tgname: string }>(
     `SELECT c.relname AS tbl, t.tgname
        FROM pg_trigger t

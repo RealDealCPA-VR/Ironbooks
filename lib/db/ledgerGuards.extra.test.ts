@@ -24,6 +24,16 @@ afterAll(async () => {
 });
 
 describe('undeclared keys and triggers added offline', () => {
+  it('a freshly migrated file has no unexpected triggers (migration triggers with any name are known)', async () => {
+    await getDb(dir);
+    const client = openDb(dir).client;
+    const q = async <T,>(t: string) => (await client.query<T>(t)).rows;
+    expect(await extraLedgerTriggers(q, MIGRATIONS_FOLDER)).toEqual([]);
+    // 0037's journal-application void guard is not bka_-named but is one of ours: it must survive.
+    const names = (await q<{ tgname: string }>(`SELECT tgname FROM pg_trigger WHERE tgname = 'bk_journal_item_applications_void_guard'`)).map((r) => r.tgname);
+    expect(names).toEqual(['bk_journal_item_applications_void_guard']);
+  });
+
   it('an extra ON DELETE CASCADE beside the declared key is flagged and dropped on open', async () => {
     const db = await getDb(dir);
     await db.execute(
