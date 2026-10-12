@@ -9,7 +9,7 @@
  * that touched an account together with a running balance. The running balance respects the
  * natural sign convention (debit-normal for asset/expense, credit-normal for liability/equity/revenue).
  */
-import { and, asc, desc, eq, gt, gte, inArray, lt, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lt, lte, sql } from 'drizzle-orm';
 import {
   accounts,
   classes,
@@ -19,6 +19,8 @@ import {
   journalEntryLines,
   journalItemApplications,
   vendors,
+  invoices,
+  bills,
 } from '@/lib/db/schema';
 import { REGISTER_SUBTYPES as REGISTER_SUBTYPE_LIST } from '@/lib/accountTypes';
 import { Money, toAmountString } from '@/lib/money';
@@ -1133,6 +1135,18 @@ export interface JournalOpenItem {
 }
 
 /**
+ * The day an application takes effect: its own date, but never before the invoice / bill it was
+ * applied to. The invoice / bill date can move later after the credit was applied (editing an
+ * invoice re-dates it); until that day the invoice is not in aging, so the General Journal credit
+ * must not count as applied either — otherwise as-of aging drifts from the control account.
+ * Postgres GREATEST ignores NULLs, so cash applications (no invoice / bill) keep their own date.
+ * Callers must LEFT JOIN invoices and bills on the application's invoice_id / bill_id.
+ */
+function effectiveApplicationDate() {
+  return sql`GREATEST(${journalItemApplications.date}, ${invoices.date}, ${bills.date})`;
+}
+
+/**
  * Applied amount per General Journal line (journal_item_applications), as of `asOf` when given.
  * Every application is dated: cash applications ('payment', 'bill_payment') with their payment,
  * credit applications ('invoice_credit', 'bill_credit') on the day the credit was applied — never
@@ -1147,7 +1161,7 @@ export async function journalAppliedByLine(
 ): Promise<Map<string, ReturnType<typeof Money.zero>>> {
   const conds = [eq(journalItemApplications.companyId, ctx.companyId), eq(journalItemApplications.side, side)];
   if (opts.asOf) {
-    conds.push(lte(journalItemApplications.date, opts.asOf));
+    conds.push(sql`${effectiveApplicationDate()} <= ${opts.asOf}`);
   }
   if (opts.lineIds) {
     if (opts.lineIds.length === 0) return new Map();
@@ -1159,6 +1173,8 @@ export async function journalAppliedByLine(
       applied: sql<string>`COALESCE(SUM(CAST(${journalItemApplications.amount} AS NUMERIC)), 0)`,
     })
     .from(journalItemApplications)
+    .leftJoin(invoices, eq(invoices.id, journalItemApplications.invoiceId))
+    .leftJoin(bills, eq(bills.id, journalItemApplications.billId))
     .where(and(...conds))
     .groupBy(journalItemApplications.journalLineId);
   return new Map(rows.map((r) => [r.lineId, Money.of(r.applied)]));
@@ -1183,11 +1199,13 @@ export async function journalCreditsAppliedAfter(
       applied: sql<string>`COALESCE(SUM(CAST(${journalItemApplications.amount} AS NUMERIC)), 0)`,
     })
     .from(journalItemApplications)
+    .leftJoin(invoices, eq(invoices.id, journalItemApplications.invoiceId))
+    .leftJoin(bills, eq(bills.id, journalItemApplications.billId))
     .where(
       and(
         eq(journalItemApplications.companyId, ctx.companyId),
         eq(journalItemApplications.kind, side === 'ar' ? 'invoice_credit' : 'bill_credit'),
-        gt(journalItemApplications.date, cutoff),
+        sql`${effectiveApplicationDate()} > ${cutoff}`,
       ),
     )
     .groupBy(docCol);
