@@ -253,6 +253,8 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       and(
         eq(invoices.companyId, ctx.companyId),
         ne(invoices.status, 'void'),
+        // Drafts (pending invoices) post nothing to A/R — QB leaves them off the aging.
+        ne(invoices.status, 'draft'),
         lte(invoices.date, cutoff),
       ),
     );
@@ -729,6 +731,8 @@ export async function salesByCustomer(
   const conds = [
     eq(invoices.companyId, ctx.companyId),
     ne(invoices.status, 'void'),
+    // Drafts post no revenue — keep sales in step with the P&L (as salesByItem does).
+    ne(invoices.status, 'draft'),
   ];
   if (range?.from) conds.push(sql`${invoices.date} >= ${range.from}`);
   if (range?.to) conds.push(lte(invoices.date, range.to));
@@ -900,7 +904,12 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
     .where(
-      and(eq(invoices.companyId, ctx.companyId), ne(invoices.status, 'void'), lte(invoices.date, cutoff)),
+      and(
+        eq(invoices.companyId, ctx.companyId),
+        ne(invoices.status, 'void'),
+        ne(invoices.status, 'draft'),
+        lte(invoices.date, cutoff),
+      ),
     );
 
   async function paymentAppliedByInvoice(upTo?: Date): Promise<Map<string, string>> {

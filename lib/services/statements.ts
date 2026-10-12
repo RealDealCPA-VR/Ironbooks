@@ -95,10 +95,11 @@ export async function customerStatement(
   let openingBalance = Money.zero();
 
   if (range?.from) {
-    // Invoices before range start (non-void)
+    // Invoices before range start (posted, non-void). Only the billed base hits A/R —
+    // retainage held back sits in Retainage Receivable (an Other Current Asset).
     const [priorInvoiceRow] = await ctx.db
       .select({
-        total: sql<string>`COALESCE(SUM(CAST(${invoices.total} AS NUMERIC)), 0)`,
+        total: sql<string>`COALESCE(SUM(CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC)), 0)`,
       })
       .from(invoices)
       .where(
@@ -106,6 +107,7 @@ export async function customerStatement(
           eq(invoices.companyId, ctx.companyId),
           eq(invoices.customerId, customerId),
           ne(invoices.status, 'void'),
+          ne(invoices.status, 'draft'),
           lt(invoices.date, range.from),
         ),
       );
@@ -163,6 +165,8 @@ export async function customerStatement(
     eq(invoices.companyId, ctx.companyId),
     eq(invoices.customerId, customerId),
     ne(invoices.status, 'void'),
+    // Drafts (pending invoices) post nothing to A/R — QB leaves them off statements.
+    ne(invoices.status, 'draft'),
   ];
   if (range?.from) invoiceConds.push(gte(invoices.date, range.from));
   if (range?.to) invoiceConds.push(lt(invoices.date, new Date(range.to.getTime() + 86_400_000)));
@@ -172,7 +176,8 @@ export async function customerStatement(
       date: invoices.date,
       invoiceNumber: invoices.invoiceNumber,
       refNumber: invoices.refNumber,
-      total: invoices.total,
+      // Billed base (total minus retainage) — the amount actually charged to A/R.
+      total: sql<string>`CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC)`,
     })
     .from(invoices)
     .where(and(...invoiceConds));

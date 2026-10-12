@@ -24,6 +24,7 @@ import {
   billPayments,
   bills,
   classes,
+  creditMemos,
   customers,
   employees,
   inventoryLayers,
@@ -216,9 +217,25 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
     (sum, p) => sum.plus(Money.of(p.amount)),
     Money.zero(),
   );
+  // Credit memos credit A/R in full at creation; the part not yet applied to an invoice is
+  // still a customer credit (QB shows it as a negative open item), so it nets against A/R too.
+  const [memoRow] = await ctx.db
+    .select({
+      unapplied: sql<string>`COALESCE(SUM(CAST(${creditMemos.unapplied} AS NUMERIC)), 0)`,
+    })
+    .from(creditMemos)
+    .where(
+      and(
+        eq(creditMemos.companyId, ctx.companyId),
+        ne(creditMemos.status, 'void'),
+        sql`CAST(${creditMemos.unapplied} AS NUMERIC) > 0`,
+      ),
+    );
+  const unappliedMemos = Money.of(memoRow?.unapplied ?? 0);
   const invoicesDue = Money.of(invRow?.totalDue ?? 0)
     .plus(journalItems.reduce((sum, j) => sum.plus(Money.of(j.amount)), Money.zero()))
-    .minus(unappliedCredits);
+    .minus(unappliedCredits)
+    .minus(unappliedMemos);
 
   if (Money.equalWithinCent(arBalance, invoicesDue)) {
     return {

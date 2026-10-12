@@ -638,6 +638,9 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
   if (invoice.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot apply credit to a voided invoice.');
   }
+  if (invoice.status === 'draft') {
+    throw new ServiceError('CONFLICT', 'Cannot apply credit to a pending (draft) invoice — post it first.');
+  }
   if (invoice.customerId !== memo.customerId) {
     throw new ServiceError(
       'VALIDATION',

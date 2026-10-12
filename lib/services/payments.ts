@@ -196,6 +196,10 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
     if (inv.status === 'void') {
       throw validation(`Invoice ${app.invoiceId} is voided and cannot receive payments.`);
     }
+    if (inv.status === 'draft') {
+      // A pending invoice posted nothing to A/R; paying it would credit A/R with no matching charge.
+      throw validation(`Invoice ${app.invoiceId} is pending (draft) — post it before receiving payment.`);
+    }
     // The balanceDue comparison below is in TRANSACTION currency, so the invoice's
     // currency must match the payment's currency.
     if ((inv.currency ?? null) !== paymentCurrency) {
@@ -688,6 +692,10 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
     }
     if (inv.status === 'void') {
       throw validation(`Invoice ${app.invoiceId} is voided and cannot receive payments.`);
+    }
+    if (inv.status === 'draft') {
+      // A pending invoice posted nothing to A/R; paying it would credit A/R with no matching charge.
+      throw validation(`Invoice ${app.invoiceId} is pending (draft) — post it before receiving payment.`);
     }
     if ((inv.currency ?? null) !== (payment.currency ?? null)) {
       throw validation(
