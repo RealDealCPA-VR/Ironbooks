@@ -241,6 +241,11 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
   }
   const totalStr = toAmountString(total);
   const fx = await resolveVendorCreditFx(ctx, input.vendorId, input);
+  if ((existing.currency ?? null) !== fx.currency) {
+    throw validation(
+      `This credit is in ${existing.currency ?? 'your home currency'} and can't be moved to a vendor or currency in ${fx.currency ?? 'your home currency'}. Void it and enter a new credit instead.`,
+    );
+  }
   const apAccountId = await resolveApAccount(ctx);
 
   const postingLines = [
@@ -265,7 +270,6 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
     let plan = await planPostedEdit(tx, { entryId: cur.postedEntryId, date: input.date, lines: postingLines, what: 'vendor credit' });
     if (plan === 'unchanged' && cur.vendorId !== input.vendorId) plan = 'repost';
     // p1 fx: a foreign credit whose amount changed re-posts even if its home value did not.
-    if (plan === 'unchanged' && (cur.currency ?? null) !== fx.currency) plan = 'repost';
     if (plan === 'unchanged' && fx.currency && !Money.eq(cur.total, totalStr)) plan = 'repost';
 
     let entryId = cur.postedEntryId;

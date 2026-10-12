@@ -484,21 +484,6 @@ describe('P1 FX — multi-currency completeness', () => {
         { accountId: acct['2600'], credit: '1100.00' },
       ],
     });
-    // A home-currency payment account is refused for a EUR loan.
-    await expect(
-      createLoan(ctx, {
-        name: 'Bad',
-        lenderVendorId: lender.id,
-        liabilityAccountId: acct['2600'],
-        interestAccountId: acct['6800'],
-        paymentAccountId: acct['1000'],
-        originalAmount: '1000',
-        annualRate: '6',
-        termMonths: 12,
-        originDate: d('2026-05-01'),
-        firstPaymentDate: d('2026-06-01'),
-      }),
-    ).rejects.toThrow(/home currency/);
     const loan = await createLoan(ctx, {
       name: 'Euro note',
       lenderVendorId: lender.id,
@@ -513,6 +498,9 @@ describe('P1 FX — multi-currency completeness', () => {
       exchangeRate: '1.10',
     });
     expect(loan.currency).toBe('EUR');
+    // A home-currency payment account is refused for a EUR loan (nothing written).
+    await expect(setUpLoanPayment(ctx, loan.id, { kind: 'check', paymentAccountId: acct['1000'] })).rejects.toThrow(/home currency/);
+    expect((await getLoan(ctx, loan.id)).paymentsMade).toBe(0);
     const lp = await setUpLoanPayment(ctx, loan.id, { kind: 'check', exchangeRate: '1.20' });
     expect(lp.fxEntryId).toBeTruthy();
     const after = await getLoan(ctx, loan.id);

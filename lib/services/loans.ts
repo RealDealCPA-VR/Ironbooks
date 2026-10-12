@@ -240,18 +240,7 @@ async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
     );
   }
   const fx = currency ? await currencyRate(ctx, currency, input.exchangeRate) : null;
-  if (input.paymentAccountId) {
-    const [pa] = await ctx.db
-      .select({ currency: accounts.currency, name: accounts.name })
-      .from(accounts)
-      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.paymentAccountId)));
-    const payCur = foreignCode(pa?.currency ?? null, home);
-    if (payCur !== currency) {
-      throw validation(
-        `This loan is in ${currency ?? home ?? 'your home currency'}, so its payments must come from a ${currency ?? 'home-currency'} bank account. "${pa?.name ?? 'That account'}" is in ${payCur ?? 'your home currency'}.`,
-      );
-    }
-  }
+  // The payment account's currency is checked when a payment is set up (assertLoanPaymentCurrency).
   return { amount, rate, ppy, escrow, currency, fxRate: fx ? fx.rate.toFixed(8) : null };
 }
 
