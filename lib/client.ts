@@ -301,8 +301,18 @@ export function rememberVersions(url: string, data: unknown): void {
   }
 }
 
-function versionFor(method: string, url: string): string | undefined {
-  if (method === 'POST') return undefined;
+/**
+ * POST actions that change the record itself (void / close / status) carry its version too, so
+ * acting on a record someone else changed since it was loaded gets the same 409. Other POSTs
+ * (create, convert, apply, refund, ...) create or touch other records and don't.
+ */
+const VERSIONED_POST_ACTIONS = new Set(['void', 'close', 'status']);
+
+function versionFor(method: string, url: string, body?: unknown): string | undefined {
+  if (method === 'POST') {
+    const action = isRec(body) ? body.action : undefined;
+    if (typeof action !== 'string' || !VERSIONED_POST_ACTIONS.has(action)) return undefined;
+  }
   const path = pathOf(url).replace(/\/$/, '');
   const m = VERSIONED_PATH.exec(path);
   return m && m[2] ? loadedVersions.get(path) : undefined;
@@ -326,7 +336,7 @@ async function mutate<T>(
   opts?: MutateOpts,
 ): Promise<T> {
   const hasBody = body !== undefined;
-  const version = versionFor(method, url);
+  const version = versionFor(method, url, body);
   const run = (o?: MutateOpts) => {
     const headers = mutateHeaders(o, hasBody);
     if (version && !headers[EXPECTED_VERSION_HEADER]) headers[EXPECTED_VERSION_HEADER] = version;

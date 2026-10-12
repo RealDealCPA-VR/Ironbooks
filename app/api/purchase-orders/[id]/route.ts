@@ -81,12 +81,12 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     if (parsed.data.action === 'void') {
-      const po = await updateStatus(ctx, id, 'void');
+      const po = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => updateStatus(c, id, 'void'));
       return NextResponse.json(po);
     }
 
     // action === 'close'
-    const po = await updateStatus(ctx, id, 'closed');
+    const po = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => updateStatus(c, id, 'closed'));
     return NextResponse.json(po);
   } catch (err) {
     return errorResponse(err);

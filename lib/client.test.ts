@@ -247,6 +247,23 @@ describe('record locking in the client (P1: every transaction type)', () => {
     expect(headerOf(calls[3], 'x-expected-updated-at')).toBe('2026-01-02T00:00:00.002Z');
   });
 
+  it('void / close / status POST actions carry the version; convert and other POSTs do not', async () => {
+    const calls = stubFetch(
+      jsonResponse({ id: 'po1', updatedAt: '2026-03-03T00:00:00.003Z' }),
+      jsonResponse({ id: 'b9' }),
+      jsonResponse({ id: 'po1', updatedAt: '2026-03-04T00:00:00.000Z' }),
+      jsonResponse({ id: 'po1', updatedAt: '2026-03-05T00:00:00.000Z' }),
+    );
+    await api.get('/api/purchase-orders/po1');
+    await api.post('/api/purchase-orders/po1', { action: 'convert' });
+    await api.post('/api/purchase-orders/po1', { action: 'close' });
+    await api.post('/api/purchase-orders/po1', { action: 'void' });
+    expect(headerOf(calls[1], 'x-expected-updated-at')).toBeUndefined();
+    expect(headerOf(calls[2], 'x-expected-updated-at')).toBe('2026-03-03T00:00:00.003Z');
+    // The saved record's new version becomes the next expected one.
+    expect(headerOf(calls[3], 'x-expected-updated-at')).toBe('2026-03-04T00:00:00.000Z');
+  });
+
   it('a stale-version 409 notifies the record-changed dialog with who changed it', async () => {
     stubFetch(
       jsonResponse(

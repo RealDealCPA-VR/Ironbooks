@@ -55,7 +55,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     // action === 'status'
-    const updated = await updateStatus(ctx, id, parsed.data.status);
+    const status = parsed.data.status;
+    const updated = await withVersionCheck(ctx, 'sales_order', id, expectedVersion(req), (c) => updateStatus(c, id, status));
     return NextResponse.json(updated);
   } catch (err) {
     return errorResponse(err);

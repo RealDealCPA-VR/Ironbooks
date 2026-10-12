@@ -71,7 +71,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     // action === 'void'
-    const receipt = await voidItemReceipt(ctx, id);
+    const receipt = await withVersionCheck(ctx, 'item_receipt', id, expectedVersion(req), (c) => voidItemReceipt(c, id));
     return NextResponse.json(receipt);
   } catch (err) {
     return errorResponse(err);
