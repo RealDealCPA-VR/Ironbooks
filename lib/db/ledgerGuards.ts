@@ -159,6 +159,12 @@ export async function ensureLedgerGuards(client: PGlite, migrationsFolder: strin
     // migrations declare (journal lines to their entry and account included). Keys that cannot
     // be re-added because orphan rows exist stay missing and make checkLedgerHealth refuse the file.
     await restoreForeignKeys(tx, migrationsFolder);
+    // Triggers added offline to the ledger tables (anything the migrations don't ship) could
+    // rewrite postings behind the guards' back: remove them.
+    for (const t of await extraLedgerTriggers(<T,>(q: string) => rows<T>(tx, q), migrationsFolder)) {
+      console.error(`[db] removing unexpected trigger ${t.tgname} on ${t.tbl}`);
+      await tx.exec(`DROP TRIGGER IF EXISTS ${qi(t.tgname)} ON ${qi(t.tbl)}`);
+    }
   });
 }
 
@@ -350,8 +356,12 @@ const ACTUAL_FKS_SQL = `
 
 export interface ForeignKeyGap {
   spec: ForeignKeySpec;
-  /** missing: no such key; unvalidated: present but NOT VALID; altered: present with other ON DELETE/UPDATE rules. */
-  state: 'missing' | 'unvalidated' | 'altered';
+  /**
+   * missing: no such key; unvalidated: present but NOT VALID; altered: present with other
+   * ON DELETE/UPDATE rules; extra: the declared key is there, but an undeclared look-alike on the
+   * same columns and target with other rules (e.g. an added ON DELETE CASCADE) sits next to it.
+   */
+  state: 'missing' | 'unvalidated' | 'altered' | 'extra';
   /** Existing constraints on the same columns and target. */
   existing: ActualForeignKey[];
 }
@@ -386,7 +396,12 @@ export async function foreignKeyGaps(query: RowQuery, migrationsFolder: string):
     if (!tables.has(spec.table) || !tables.has(spec.refTable)) continue;
     const same = byKey.get(fkKey(spec)) ?? [];
     const exact = same.filter((a) => a.confdeltype === spec.onDelete && a.confupdtype === spec.onUpdate);
-    if (exact.some((a) => a.convalidated)) continue;
+    if (exact.some((a) => a.convalidated)) {
+      // The declared key is enforced, but a second key on the same link with other rules would
+      // still fire (an extra ON DELETE CASCADE deletes rows the declared key protects).
+      if (exact.length < same.length) gaps.push({ spec, state: 'extra', existing: same.filter((a) => !exact.includes(a)) });
+      continue;
+    }
     gaps.push({ spec, state: exact.length ? 'unvalidated' : same.length ? 'altered' : 'missing', existing: same });
   }
   return gaps;
@@ -395,7 +410,8 @@ export async function foreignKeyGaps(query: RowQuery, migrationsFolder: string):
 /** Plain-language summary of foreign-key gaps (null when there are none). */
 export function describeForeignKeyGaps(gaps: ForeignKeyGap[]): string | null {
   if (!gaps.length) return null;
-  const label = (g: ForeignKeyGap) => `${g.spec.table}.${g.spec.columns.join('+')} to ${g.spec.refTable}`;
+  const label = (g: ForeignKeyGap) =>
+    `${g.spec.table}.${g.spec.columns.join('+')} to ${g.spec.refTable}${g.state === 'extra' ? ' (an extra link with other delete rules was added)' : ''}`;
   const ledgerFirst = [
     ...gaps.filter((g) => g.spec.table === 'journal_entry_lines'),
     ...gaps.filter((g) => g.spec.table !== 'journal_entry_lines'),
@@ -423,7 +439,10 @@ async function restoreForeignKeys(tx: Raw, migrationsFolder: string): Promise<vo
     const sp = `bka_fk_${++n}`;
     await tx.exec(`SAVEPOINT ${sp}`);
     try {
-      if (gap.state === 'unvalidated') {
+      if (gap.state === 'extra') {
+        // Keep the declared key; drop only the undeclared look-alikes with other rules.
+        for (const e of gap.existing) await tx.exec(`ALTER TABLE ${qi(spec.table)} DROP CONSTRAINT ${qi(e.conname)}`);
+      } else if (gap.state === 'unvalidated') {
         for (const e of gap.existing) {
           if (e.convalidated || e.confdeltype !== spec.onDelete || e.confupdtype !== spec.onUpdate) continue;
           await tx.exec(`ALTER TABLE ${qi(spec.table)} VALIDATE CONSTRAINT ${qi(e.conname)}`);
@@ -452,6 +471,30 @@ async function restoreForeignKeys(tx: Raw, migrationsFolder: string): Promise<vo
       console.error(`[db] could not restore the record link ${fkKey(spec)}:`, err instanceof Error ? err.message : err);
     }
   }
+}
+
+/**
+ * The ledger tables: the only triggers allowed on them are the bka_* guards the migrations ship.
+ * (Other tables carry app triggers such as docnum_*; those aren't ledger-critical.)
+ */
+export const LEDGER_TABLES = ['journal_entries', 'journal_entry_lines', 'accounts', 'journal_item_applications'] as const;
+
+/** Non-internal triggers on the ledger tables that the migrations don't create (added offline). */
+export async function extraLedgerTriggers(
+  query: RowQuery,
+  migrationsFolder: string,
+): Promise<Array<{ tbl: string; tgname: string }>> {
+  const known = new Set(ledgerGuardPlan(migrationsFolder).triggers);
+  const found = await query<{ tbl: string; tgname: string }>(
+    `SELECT c.relname AS tbl, t.tgname
+       FROM pg_trigger t
+       JOIN pg_class c ON c.oid = t.tgrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE NOT t.tgisinternal AND n.nspname = 'public'
+        AND c.relname IN (${LEDGER_TABLES.map((x) => `'${x}'`).join(', ')})
+      ORDER BY c.relname, t.tgname`,
+  );
+  return found.filter((t) => !known.has(t.tgname));
 }
 
 function qi(name: string): string {
@@ -543,6 +586,17 @@ export async function checkLedgerHealth(
     await foreignKeyGaps(<T,>(t: string) => rows<T>(db, t), migrationsFolder),
   );
   if (fkDetail) problems.push({ kind: 'guards', detail: fkDetail });
+
+  // (1d) No triggers on the ledger tables other than the shipped guards.
+  const extra = await extraLedgerTriggers(<T,>(t: string) => rows<T>(db, t), migrationsFolder);
+  if (extra.length) {
+    problems.push({
+      kind: 'guards',
+      detail: `${extra.length} unexpected database trigger${extra.length === 1 ? ' was' : 's were'} added to the ledger tables outside BookKeeper (${sample(
+        extra.map((t) => `${t.tgname} on ${t.tbl}`),
+      )}).`,
+    });
+  }
 
   // (2) Every posted entry: at least two lines, each with exactly one positive side of at most
   //     2 decimals, and debits = credits (mirrors bka_assert_entry_balanced).
