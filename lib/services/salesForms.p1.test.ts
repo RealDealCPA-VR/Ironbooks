@@ -6,6 +6,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
+import { eq, sql } from 'drizzle-orm';
 import { users, companies, customers, vendors, taxRates, taxAgencies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
@@ -221,5 +222,19 @@ describe('p1/salesforms — numbers and tax defaults', () => {
     expect(res.some((r) => r.type === 'Purchase Order' && r.label === 'Purchase Order #PO-78')).toBe(true);
     const inv = buildResults(await runGlobalSearch(db, ctx.companyId, 'JOB-777'));
     expect(inv.some((r) => r.label === 'Invoice #JOB-777')).toBe(true);
+  });
+
+  it('migration 0040 is idempotent and backfills a lone shipping address as the default ship-to', async () => {
+    const [legacy] = await db
+      .insert(customers)
+      .values({ companyId: ctx.companyId, displayName: 'Pre-0040', shippingAddress: { line1: '7 Upgrade Way', city: 'Oldtown' } })
+      .returning();
+    await db.execute(sql`UPDATE customers SET ship_to_addresses = NULL WHERE id = ${legacy.id}`);
+    const file = fs.readFileSync(path.resolve(process.cwd(), 'drizzle', '0040_p1_salesforms.sql'), 'utf-8');
+    for (const stmt of file.split('--> statement-breakpoint').map((x) => x.trim()).filter(Boolean)) {
+      await db.execute(sql.raw(stmt));
+    }
+    const [row] = await db.select().from(customers).where(eq(customers.id, legacy.id));
+    expect(row.shipToAddresses).toEqual([{ name: 'Ship To 1', line1: '7 Upgrade Way', city: 'Oldtown', isDefault: true }]);
   });
 });
