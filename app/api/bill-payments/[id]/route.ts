@@ -6,7 +6,10 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getBillPayment, voidBillPayment } from '@/lib/services/billPayments';
+import { getBillPayment, updateBillPayment, voidBillPayment } from '@/lib/services/billPayments';
+import { routeError } from '@/lib/routeErrors';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { payBillsSchema } from '@/lib/validation/billPayments';
 import { ServiceError } from '@/lib/services/_base';
 
 // Map ServiceError codes to HTTP status codes.
@@ -54,5 +57,21 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err, 'DELETE /api/bill-payments/[id]');
+  }
+}
+
+/** PATCH /api/bill-payments/:id — edit a saved bill payment (same body as POST /api/bill-payments). */
+export async function PATCH(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json().catch(() => ({}));
+    const parsed = payBillsSchema.safeParse(body);
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    const { allowDuplicateNumber, ...input } = parsed.data;
+    const payment = await updateBillPayment(ctx, id, { ...input, checkDuplicateNumber: !allowDuplicateNumber });
+    return NextResponse.json(payment);
+  } catch (err) {
+    return routeError(err, 'PATCH /api/bill-payments/[id]');
   }
 }

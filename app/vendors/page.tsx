@@ -50,12 +50,30 @@ interface Vendor {
   isActive: boolean;
   notes: string | null;
   termsId?: string | null;
+  /** wave2 purchases: check / pre-fill / currency fields. */
+  printOnCheckAs?: string | null;
+  accountNumber?: string | null;
+  currency?: string | null;
+  prefillAccountIds?: string[] | null;
 }
 
 interface TermsOption {
   id: string;
   name: string;
   isActive: boolean;
+}
+
+interface AccountOption {
+  id: string;
+  code: string;
+  name: string;
+  isActive?: boolean;
+}
+
+interface CurrencyOption {
+  code: string;
+  name: string;
+  isBase: boolean;
 }
 
 interface VendorFormState {
@@ -67,6 +85,11 @@ interface VendorFormState {
   termsId: string;
   is1099: boolean;
   notes: string;
+  printOnCheckAs: string;
+  accountNumber: string;
+  currency: string;
+  /** Always three slots; '' = unused. */
+  prefillAccountIds: [string, string, string];
 }
 
 const EMPTY_FORM: VendorFormState = {
@@ -78,6 +101,10 @@ const EMPTY_FORM: VendorFormState = {
   termsId: '',
   is1099: false,
   notes: '',
+  printOnCheckAs: '',
+  accountNumber: '',
+  currency: '',
+  prefillAccountIds: ['', '', ''],
 };
 
 const TERMS_OPTIONS = [
@@ -109,6 +136,8 @@ function balanceTone(balance: string): 'danger' | 'neutral' {
 function VendorsPageContent() {
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [loading, setLoading] = useState(true);
+  const [accountOptions, setAccountOptions] = useState<AccountOption[]>([]);
+  const [currencyOptions, setCurrencyOptions] = useState<CurrencyOption[]>([]);
 
   // Modal state
   const [modalOpen, setModalOpen] = useState(false);
@@ -145,6 +174,15 @@ function VendorsPageContent() {
 
   useEffect(() => {
     fetchVendors();
+    // Lists for the pre-fill account and currency pickers (non-fatal if unavailable).
+    api
+      .get<AccountOption[]>('/api/accounts')
+      .then((rows) => setAccountOptions(rows.filter((a) => a.isActive !== false)))
+      .catch(() => setAccountOptions([]));
+    api
+      .get<CurrencyOption[]>('/api/currencies')
+      .then(setCurrencyOptions)
+      .catch(() => setCurrencyOptions([]));
   }, []);
 
   // ---- Open Add modal ----
@@ -166,6 +204,10 @@ function VendorsPageContent() {
       termsId: vendor.termsId ?? '',
       is1099: vendor.is1099,
       notes: vendor.notes ?? '',
+      printOnCheckAs: vendor.printOnCheckAs ?? '',
+      accountNumber: vendor.accountNumber ?? '',
+      currency: vendor.currency ?? '',
+      prefillAccountIds: [0, 1, 2].map((i) => vendor.prefillAccountIds?.[i] ?? '') as [string, string, string],
     });
     setModalOpen(true);
   }
@@ -184,6 +226,16 @@ function VendorsPageContent() {
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
+  function setPrefill(index: number, accountId: string) {
+    setForm((prev) => {
+      const next = [...prev.prefillAccountIds] as [string, string, string];
+      next[index] = accountId;
+      return { ...prev, prefillAccountIds: next };
+    });
+  }
+
+  const foreignCurrencies = currencyOptions.filter((c) => !c.isBase);
+
   // ---- Save (create or update) ----
   async function handleSave() {
     if (!form.displayName.trim()) {
@@ -201,6 +253,10 @@ function VendorsPageContent() {
         ...(form.termsId ? { termsId: form.termsId } : {}),
         is1099: form.is1099,
         notes: form.notes.trim() || null,
+        printOnCheckAs: form.printOnCheckAs.trim() || null,
+        accountNumber: form.accountNumber.trim() || null,
+        currency: form.currency || null,
+        prefillAccountIds: [...new Set(form.prefillAccountIds.filter(Boolean))],
       };
 
       if (editingVendor) {
@@ -467,6 +523,79 @@ function VendorsPageContent() {
               Edit the choices on the <Link href="/lists?list=terms" className="text-electric hover:underline">Terms list</Link>.
             </p>
           </div>
+
+          {/* Check printing (QB "Print on check as" + account number on the memo line) */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="printOnCheckAs">Print on check as</Label>
+              <Input
+                id="printOnCheckAs"
+                placeholder={form.displayName.trim() || 'Same as display name'}
+                value={form.printOnCheckAs}
+                onChange={(e) => setField('printOnCheckAs', e.target.value)}
+              />
+              <p className="text-xs text-navy/50 mt-1">The name printed on the &quot;Pay to the order of&quot; line.</p>
+            </div>
+            <div>
+              <Label htmlFor="accountNumber">Account no. (printed on check memo)</Label>
+              <Input
+                id="accountNumber"
+                placeholder="Your account number with this vendor"
+                value={form.accountNumber}
+                onChange={(e) => setField('accountNumber', e.target.value)}
+              />
+              <p className="text-xs text-navy/50 mt-1">Shown on the memo line when a check has no memo.</p>
+            </div>
+          </div>
+
+          {/* Pre-fill accounts */}
+          <div>
+            <Label>Pre-fill accounts</Label>
+            <p className="text-xs text-navy/50 mb-2">
+              Up to three accounts filled in automatically when you enter a bill, check or card charge for
+              this vendor.
+            </p>
+            <div className="grid grid-cols-3 gap-2">
+              {[0, 1, 2].map((i) => (
+                <Select
+                  key={i}
+                  aria-label={`Pre-fill account ${i + 1}`}
+                  value={form.prefillAccountIds[i]}
+                  onChange={(e) => setPrefill(i, e.target.value)}
+                >
+                  <option value="">— none —</option>
+                  {accountOptions.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.code} – {a.name}
+                    </option>
+                  ))}
+                </Select>
+              ))}
+            </div>
+          </div>
+
+          {/* Currency (multi-currency) */}
+          {foreignCurrencies.length > 0 && (
+            <div>
+              <Label htmlFor="currency">Currency</Label>
+              <Select
+                id="currency"
+                value={form.currency}
+                onChange={(e) => setField('currency', e.target.value)}
+              >
+                <option value="">Home currency</option>
+                {foreignCurrencies.map((c) => (
+                  <option key={c.code} value={c.code}>
+                    {c.code} – {c.name}
+                  </option>
+                ))}
+              </Select>
+              <p className="text-xs text-navy/50 mt-1">
+                Bills and checks for this vendor are entered in this currency. It can&apos;t be changed once
+                the vendor has transactions.
+              </p>
+            </div>
+          )}
 
           {/* 1099 Contractor */}
           <div className="flex items-center gap-3 rounded-lg border border-slate-200 px-4 py-3 bg-slate-50">

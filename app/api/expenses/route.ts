@@ -92,7 +92,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const expense = await createExpense(ctx, parsed.data);
+    // QB duplicate check-number warning: refused (409, details.duplicateNumber) unless confirmed.
+    const { allowDuplicateNumber, ...input } = parsed.data;
+    const expense = await createExpense(ctx, { ...input, checkDuplicateNumber: !allowDuplicateNumber });
 
     return NextResponse.json({ expense }, { status: 201 });
   } catch (err) {

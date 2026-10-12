@@ -43,6 +43,8 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
+import { planPostedEdit, retitleEntry } from './postedEdit';
+import { assertHomeCurrencyAccounts } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Structured deposit-line description prefixes (see schema note above).
@@ -111,17 +113,23 @@ async function getUFAccountId(ctx: ServiceContext): Promise<string> {
 }
 
 /** Payment IDs already consumed by a NON-VOIDED deposit. */
-async function usedPaymentIds(ctx: ServiceContext): Promise<string[]> {
+async function usedPaymentIds(ctx: ServiceContext, excludeDepositId?: string): Promise<string[]> {
   const rows = await ctx.db
     .select({ paymentId: depositLines.paymentId })
     .from(depositLines)
     .innerJoin(deposits, eq(depositLines.depositId, deposits.id))
-    .where(and(eq(deposits.companyId, ctx.companyId), isNull(deposits.voidedAt)));
+    .where(
+      and(
+        eq(deposits.companyId, ctx.companyId),
+        isNull(deposits.voidedAt),
+        ...(excludeDepositId ? [ne(deposits.id, excludeDepositId)] : []),
+      ),
+    );
   return rows.map((r) => r.paymentId).filter((id): id is string => id !== null);
 }
 
 /** Sales-receipt IDs already consumed by a NON-VOIDED deposit (via description encoding). */
-async function usedSalesReceiptIds(ctx: ServiceContext): Promise<string[]> {
+async function usedSalesReceiptIds(ctx: ServiceContext, excludeDepositId?: string): Promise<string[]> {
   const rows = await ctx.db
     .select({ description: depositLines.description })
     .from(depositLines)
@@ -130,6 +138,7 @@ async function usedSalesReceiptIds(ctx: ServiceContext): Promise<string[]> {
       and(
         eq(deposits.companyId, ctx.companyId),
         isNull(deposits.voidedAt),
+        ...(excludeDepositId ? [ne(deposits.id, excludeDepositId)] : []),
         like(depositLines.description, `${RECEIPT_LINE_PREFIX}%`),
       ),
     );
@@ -233,7 +242,26 @@ export async function listUndepositedPayments(ctx: ServiceContext): Promise<Unde
 // createDeposit
 // ---------------------------------------------------------------------------
 
-export async function createDeposit(ctx: ServiceContext, input: CreateDepositInput) {
+interface PreparedDeposit {
+  glLines: PostingLine[];
+  /** Deposit lines WITHOUT depositId. Invariant: sum(amount) === netStr. */
+  lineValues: Array<Omit<typeof depositLines.$inferInsert, 'depositId'>>;
+  netStr: string;
+  paymentIds: string[];
+  salesReceiptIds: string[];
+  extraLines: ExtraDepositLineInput[];
+  cashBackAmt: ReturnType<typeof Money.zero>;
+}
+
+/**
+ * Validate a deposit and build its GL + deposit lines. `excludeDepositId` lets an edit re-use the
+ * payments / receipts the deposit already holds (they are not "already deposited" for itself).
+ */
+async function prepareDeposit(
+  ctx: ServiceContext,
+  input: CreateDepositInput,
+  excludeDepositId?: string,
+): Promise<PreparedDeposit> {
   const paymentIds = input.paymentIds ?? [];
   const salesReceiptIds = input.salesReceiptIds ?? [];
   const extraLines = input.extraLines ?? [];
@@ -269,6 +297,7 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
   if (depAcct.type !== 'asset') {
     throw validation('Deposit account must be an asset (bank) account.');
   }
+  await assertHomeCurrencyAccounts(ctx, [input.depositAccountId, input.cashBack?.accountId], 'Deposits');
 
   // ── payments: ownership + UF + not voided ────────────────────────────────
   const payRows =
@@ -328,7 +357,7 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
 
   // ── double-deposit guards (against non-voided deposits only) ─────────────
   if (paymentIds.length > 0) {
-    const used = (await usedPaymentIds(ctx)).filter((id) => paymentIds.includes(id));
+    const used = (await usedPaymentIds(ctx, excludeDepositId)).filter((id) => paymentIds.includes(id));
     if (used.length > 0) {
       throw new ServiceError(
         'CONFLICT',
@@ -337,7 +366,9 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
     }
   }
   if (salesReceiptIds.length > 0) {
-    const used = (await usedSalesReceiptIds(ctx)).filter((id) => salesReceiptIds.includes(id));
+    const used = (await usedSalesReceiptIds(ctx, excludeDepositId)).filter((id) =>
+      salesReceiptIds.includes(id),
+    );
     if (used.length > 0) {
       throw new ServiceError(
         'CONFLICT',
@@ -407,35 +438,68 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
   const netStr = toAmountString(net);
   const ufTotalStr = toAmountString(ufTotal);
 
-  return inTransaction(ctx, async (tx) => {
-    // 1. Post GL:
-    //    Dr bank (net) [+ Dr cash-back account] / Cr UF [+ Cr extra-line accounts]
-    const glLines: PostingLine[] = [
-      { accountId: input.depositAccountId, debit: netStr, memo: 'Deposit to bank' },
-    ];
-    if (input.cashBack && cashBackAmt.greaterThan(0)) {
-      glLines.push({
-        accountId: input.cashBack.accountId,
-        debit: toAmountString(cashBackAmt),
-        memo: input.cashBack.memo ? `Cash back — ${input.cashBack.memo}` : 'Cash back',
-      });
-    }
-    if (ufTotal.greaterThan(0)) {
-      glLines.push({ accountId: ufId, credit: ufTotalStr, memo: 'Undeposited Funds cleared' });
-    }
-    for (const l of extraLines) {
-      glLines.push({
-        accountId: l.accountId,
-        credit: toAmountString(Money.round2(l.amount)),
-        memo: l.description ?? 'Additional deposit line',
-      });
-    }
+  // GL: Dr bank (net) [+ Dr cash-back account] / Cr UF [+ Cr extra-line accounts]
+  const glLines: PostingLine[] = [
+    { accountId: input.depositAccountId, debit: netStr, memo: 'Deposit to bank' },
+  ];
+  if (input.cashBack && cashBackAmt.greaterThan(0)) {
+    glLines.push({
+      accountId: input.cashBack.accountId,
+      debit: toAmountString(cashBackAmt),
+      memo: input.cashBack.memo ? `Cash back — ${input.cashBack.memo}` : 'Cash back',
+    });
+  }
+  if (ufTotal.greaterThan(0)) {
+    glLines.push({ accountId: ufId, credit: ufTotalStr, memo: 'Undeposited Funds cleared' });
+  }
+  for (const l of extraLines) {
+    glLines.push({
+      accountId: l.accountId,
+      credit: toAmountString(Money.round2(l.amount)),
+      memo: l.description ?? 'Additional deposit line',
+    });
+  }
 
+  // Deposit lines. Invariant: sum(lines.amount) === deposits.total.
+  const lineValues: PreparedDeposit['lineValues'] = [
+    ...payRows.map((p) => ({
+      paymentId: p.id,
+      description: null as string | null,
+      amount: p.amount,
+    })),
+    ...srRows.map((r) => ({
+      paymentId: null,
+      description: `${RECEIPT_LINE_PREFIX}${r.id}`,
+      amount: r.total,
+    })),
+    ...extraLines.map((l) => ({
+      paymentId: null,
+      description: l.description ?? 'Additional deposit line',
+      amount: toAmountString(Money.round2(l.amount)),
+    })),
+  ];
+  if (input.cashBack && cashBackAmt.greaterThan(0)) {
+    lineValues.push({
+      paymentId: null,
+      description: `${CASHBACK_LINE_PREFIX}${input.cashBack.accountId}`,
+      amount: toAmountString(cashBackAmt.negated()),
+    });
+  }
+
+  return { glLines, lineValues, netStr, paymentIds, salesReceiptIds, extraLines, cashBackAmt };
+}
+
+export async function createDeposit(ctx: ServiceContext, input: CreateDepositInput) {
+  const prep = await prepareDeposit(ctx, input);
+  const { netStr, paymentIds, salesReceiptIds, extraLines, cashBackAmt } = prep;
+
+  return inTransaction(ctx, async (tx) => {
+    // 1. Post GL.
     const entry = await postJournalEntry(tx, {
       date: input.date,
       description: input.memo ? `Deposit: ${input.memo}` : 'Bank Deposit',
       sourceRef: `deposit:pending`,
-      lines: glLines,
+      lines: prep.glLines,
     });
 
     // 2. Insert the deposit header (total = NET amount that hit the bank).
@@ -458,36 +522,8 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
       .set({ sourceRef: `deposit:${deposit.id}` })
       .where(and(eq(journalEntries.id, entry.id), eq(journalEntries.companyId, tx.companyId)));
 
-    // 3. Insert deposit lines. Invariant: sum(lines.amount) === deposits.total.
-    const lineValues: Array<typeof depositLines.$inferInsert> = [
-      ...payRows.map((p) => ({
-        depositId: deposit.id,
-        paymentId: p.id,
-        description: null as string | null,
-        amount: p.amount,
-      })),
-      ...srRows.map((r) => ({
-        depositId: deposit.id,
-        paymentId: null,
-        description: `${RECEIPT_LINE_PREFIX}${r.id}`,
-        amount: r.total,
-      })),
-      ...extraLines.map((l) => ({
-        depositId: deposit.id,
-        paymentId: null,
-        description: l.description ?? 'Additional deposit line',
-        amount: toAmountString(Money.round2(l.amount)),
-      })),
-    ];
-    if (input.cashBack && cashBackAmt.greaterThan(0)) {
-      lineValues.push({
-        depositId: deposit.id,
-        paymentId: null,
-        description: `${CASHBACK_LINE_PREFIX}${input.cashBack.accountId}`,
-        amount: toAmountString(cashBackAmt.negated()),
-      });
-    }
-    await tx.db.insert(depositLines).values(lineValues);
+    // 3. Insert deposit lines.
+    await tx.db.insert(depositLines).values(prep.lineValues.map((l) => ({ ...l, depositId: deposit.id })));
 
     // 4. Audit log.
     await writeAudit(tx, {
@@ -512,6 +548,89 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
     });
 
     return { ...deposit, lines: [...paymentIds, ...salesReceiptIds] };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// updateDeposit — edit a saved deposit (D1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Edit a saved deposit in ONE transaction: payments / receipts can be added or removed (removed
+ * ones go back to Undeposited Funds), extra lines and cash back changed. A ledger-neutral edit
+ * (memo / descriptions only) keeps the entry, so it works on a reconciled deposit; otherwise the
+ * entry is voided and re-posted (refused when it was cleared in a completed reconciliation).
+ */
+export async function updateDeposit(ctx: ServiceContext, id: string, input: CreateDepositInput) {
+  const [existing] = await ctx.db
+    .select()
+    .from(deposits)
+    .where(and(eq(deposits.id, id), eq(deposits.companyId, ctx.companyId)));
+  if (!existing) throw notFound('Deposit');
+  if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This deposit is void and cannot be edited.');
+
+  return inTransaction(ctx, async (tx) => {
+    const prep = await prepareDeposit(tx, input, id);
+    const oldLines = await tx.db.select().from(depositLines).where(eq(depositLines.depositId, id));
+    const plan = await planPostedEdit(tx, {
+      entryId: existing.postedEntryId,
+      date: input.date,
+      lines: prep.glLines,
+      what: 'deposit',
+    });
+
+    let entryId = existing.postedEntryId;
+    if (plan === 'repost') {
+      if (existing.postedEntryId) await voidJournalEntry(tx, existing.postedEntryId);
+      const entry = await postJournalEntry(tx, {
+        date: input.date,
+        description: input.memo ? `Deposit: ${input.memo}` : 'Bank Deposit',
+        sourceRef: `deposit:${id}`,
+        lines: prep.glLines,
+      });
+      entryId = entry.id;
+    } else {
+      await retitleEntry(tx, entryId, { description: input.memo ? `Deposit: ${input.memo}` : 'Bank Deposit' });
+    }
+
+    // Deposit lines are a subledger of the entry — safe to rewrite (same totals either way).
+    await tx.db.delete(depositLines).where(eq(depositLines.depositId, id));
+    await tx.db.insert(depositLines).values(prep.lineValues.map((l) => ({ ...l, depositId: id })));
+    const [updated] = await tx.db
+      .update(deposits)
+      .set({
+        depositAccountId: input.depositAccountId,
+        date: input.date,
+        total: prep.netStr,
+        memo: input.memo ?? null,
+        postedEntryId: entryId,
+      })
+      .where(eq(deposits.id, id))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'deposit',
+      entityId: id,
+      oldValues: {
+        depositAccountId: existing.depositAccountId,
+        date: existing.date,
+        total: existing.total,
+        memo: existing.memo,
+        postedEntryId: existing.postedEntryId,
+        lines: oldLines.map((l) => ({ paymentId: l.paymentId, description: l.description, amount: l.amount })),
+      },
+      newValues: {
+        depositAccountId: input.depositAccountId,
+        date: input.date,
+        total: prep.netStr,
+        memo: input.memo ?? null,
+        ledger: plan === 'unchanged' ? 'unchanged' : 'reposted',
+        postedEntryId: entryId,
+        lines: prep.lineValues,
+      },
+    });
+    return updated;
   });
 }
 

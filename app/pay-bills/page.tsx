@@ -7,17 +7,24 @@
  * apply available vendor credits per bill, and take early-payment discounts.
  * Cash goes out of the chosen payment account; discounts post to the chosen
  * discount account; credits draw down the vendor's open credits.
+ *
+ * wave2 purchases: due dates and discount suggestions come from the bill's terms
+ * (/api/bills/to-pay), with "due on or before" and "discount available" filters; check
+ * payments can be queued "To be printed"; foreign-currency bills take an exchange rate;
+ * duplicate check numbers are warned about; recent payments can be edited or voided.
  */
 import { isPaymentSourceAccount } from '@/lib/accountTypes';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { HandCoins } from 'lucide-react';
+import { HandCoins, Pencil, Trash2 } from 'lucide-react';
 import {
   Badge,
   Button,
   Card,
+  ConfirmDialog,
   EmptyState,
   Input,
   Label,
+  Modal,
   PageHeader,
   Select,
   Spinner,
@@ -32,6 +39,7 @@ import { api } from '@/lib/client';
 import { describeError } from '@/lib/friendlyErrors';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,6 +67,31 @@ interface Bill {
   total: string;
   balanceDue: string;
   status: 'open' | 'partial' | 'paid' | 'void';
+  terms?: string | null;
+  currency?: string | null;
+  discountDate?: string | null;
+  discountPercent?: number;
+  suggestedDiscount?: string;
+  discountAvailable?: boolean;
+  overdue?: boolean;
+}
+
+interface BillPayment {
+  id: string;
+  date: string;
+  method: string;
+  reference: string | null;
+  amount: string;
+  paymentAccountId: string | null;
+  toPrint: boolean;
+  voidedAt: string | null;
+  currency?: string | null;
+  exchangeRate?: string | null;
+}
+
+interface PaymentDetail extends BillPayment {
+  applications: Array<{ billId: string; amountApplied: string }>;
+  discountTotal: string;
 }
 
 interface VendorCredit {
@@ -107,7 +140,29 @@ export default function PayBillsPage() {
   const [method, setMethod] = useState('check');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [reference, setReference] = useState('');
+  const [toPrint, setToPrint] = useState(false);
+  const [exchangeRate, setExchangeRate] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  // Filters (QB "Show bills due on or before" / discount available)
+  const [dueFilterOn, setDueFilterOn] = useState(false);
+  const [dueOnOrBefore, setDueOnOrBefore] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 10);
+    return d.toISOString().slice(0, 10);
+  });
+  const [discountOnly, setDiscountOnly] = useState(false);
+
+  // Recent payments (edit / void)
+  const [payments, setPayments] = useState<BillPayment[]>([]);
+  const [editPay, setEditPay] = useState<PaymentDetail | null>(null);
+  const [editAmounts, setEditAmounts] = useState<Record<string, string>>({});
+  const [editDate, setEditDate] = useState('');
+  const [editRef, setEditRef] = useState('');
+  const [editAccount, setEditAccount] = useState('');
+  const [editBills, setEditBills] = useState<Record<string, { billNumber: string | null; balanceDue: string }>>({});
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [pendingVoid, setPendingVoid] = useState<BillPayment | null>(null);
 
   // ── data loading ──────────────────────────────────────────────────────────
 
@@ -136,11 +191,16 @@ export default function PayBillsPage() {
     }
     setLoadingBills(true);
     try {
-      const [billData, creditData] = await Promise.all([
-        api.get<Bill[]>(`/api/bills?vendorId=${vid}`),
+      const qs = new URLSearchParams({ vendorId: vid, asOf: date });
+      if (dueFilterOn && dueOnOrBefore) qs.set('dueOnOrBefore', dueOnOrBefore);
+      if (discountOnly) qs.set('discountOnly', 'true');
+      const [billData, creditData, payData] = await Promise.all([
+        api.get<{ bills: Bill[] }>(`/api/bills/to-pay?${qs.toString()}`),
         api.get<VendorCredit[]>(`/api/vendor-credits?vendorId=${vid}`),
+        api.get<{ payments: BillPayment[] }>(`/api/bill-payments?vendorId=${vid}&limit=10`).catch(() => ({ payments: [] })),
       ]);
-      const open = billData.filter(
+      setPayments(payData.payments.filter((p) => !p.voidedAt));
+      const open = billData.bills.filter(
         (b) => (b.status === 'open' || b.status === 'partial') && Number(b.balanceDue) > 0,
       );
       setBills(open);
@@ -151,11 +211,13 @@ export default function PayBillsPage() {
     } finally {
       setLoadingBills(false);
     }
-  }, []);
+  }, [date, dueFilterOn, dueOnOrBefore, discountOnly]);
 
   useEffect(() => {
     loadVendorData(vendorId);
   }, [vendorId, loadVendorData]);
+
+  const billCurrency = bills.find((b) => b.currency)?.currency ?? null;
 
   // ── derived ───────────────────────────────────────────────────────────────
 
@@ -273,15 +335,25 @@ export default function PayBillsPage() {
         }));
 
       if (applications.length > 0) {
-        await api.post('/api/bill-payments', {
-          vendorId,
-          date,
-          method,
-          reference: reference.trim() || undefined,
-          paymentAccountId,
-          discountAccountId: discountTotal > 0 ? discountAccountId : undefined,
-          applications,
-        });
+        const queued = method === 'check' && toPrint;
+        const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+          api.post('/api/bill-payments', {
+            vendorId,
+            date,
+            method,
+            reference: queued ? undefined : reference.trim() || undefined,
+            toPrint: queued,
+            paymentAccountId,
+            discountAccountId: discountTotal > 0 ? discountAccountId : undefined,
+            exchangeRate: billCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
+            applications,
+            allowDuplicateNumber,
+          }),
+        );
+        if (saved === null) {
+          await loadVendorData(vendorId);
+          return;
+        }
       }
 
       toast(
@@ -302,6 +374,77 @@ export default function PayBillsPage() {
       await loadVendorData(vendorId);
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  // ── edit / void a recent payment ─────────────────────────────────────────
+
+  async function openEditPayment(p: BillPayment) {
+    try {
+      const detail = await api.get<PaymentDetail>(`/api/bill-payments/${p.id}`);
+      if (Number(detail.discountTotal) > 0) {
+        toast('This payment took an early-payment discount. Void it and pay the bills again to change it.', 'danger');
+        return;
+      }
+      const info: Record<string, { billNumber: string | null; balanceDue: string }> = {};
+      for (const a of detail.applications) {
+        const b = await api.get<{ billNumber: string | null; balanceDue: string }>(`/api/bills/${a.billId}`);
+        info[a.billId] = { billNumber: b.billNumber, balanceDue: b.balanceDue };
+      }
+      setEditBills(info);
+      setEditAmounts(Object.fromEntries(detail.applications.map((a) => [a.billId, Number(a.amountApplied).toFixed(2)])));
+      setEditDate(detail.date.slice(0, 10));
+      setEditRef(detail.reference ?? '');
+      setEditAccount(detail.paymentAccountId ?? '');
+      setEditPay(detail);
+    } catch (err) {
+      toastError(err, 'Failed to load the payment.');
+    }
+  }
+
+  async function saveEditPayment() {
+    if (!editPay) return;
+    const applications = Object.entries(editAmounts)
+      .filter(([, v]) => num(v) > 0)
+      .map(([billId, v]) => ({ billId, amountApplied: num(v).toFixed(2) }));
+    if (applications.length === 0) {
+      toast('Enter an amount for at least one bill (or void the payment).', 'danger');
+      return;
+    }
+    setSavingEdit(true);
+    try {
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        api.patch(`/api/bill-payments/${editPay.id}`, {
+          vendorId,
+          date: editDate,
+          method: editPay.method,
+          reference: editPay.toPrint ? undefined : editRef.trim() || undefined,
+          toPrint: editPay.toPrint,
+          paymentAccountId: editAccount,
+          exchangeRate: editPay.currency && editPay.exchangeRate ? editPay.exchangeRate : undefined,
+          applications,
+          allowDuplicateNumber,
+        }),
+      );
+      if (saved === null) return;
+      toast('Payment updated.', 'success');
+      setEditPay(null);
+      await loadVendorData(vendorId);
+    } catch (err) {
+      toastError(err, 'Failed to update the payment.');
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+  async function voidPayment(p: BillPayment) {
+    try {
+      await api.del(`/api/bill-payments/${p.id}`);
+      toast('Payment voided — the bills are open again.', 'success');
+      setPendingVoid(null);
+      await loadVendorData(vendorId);
+    } catch (err) {
+      toastError(err, 'Failed to void the payment.');
     }
   }
 
@@ -367,11 +510,38 @@ export default function PayBillsPage() {
             <Label htmlFor="pb-ref">Reference / Check #</Label>
             <Input
               id="pb-ref"
-              placeholder="e.g. 1042"
-              value={reference}
+              placeholder={method === 'check' && toPrint ? 'assigned when printed' : 'e.g. 1042'}
+              value={method === 'check' && toPrint ? '' : reference}
+              disabled={method === 'check' && toPrint}
               onChange={(e) => setReference(e.target.value)}
             />
+            {method === 'check' && (
+              <label className="mt-2 flex items-center gap-2 text-sm text-navy/70 select-none">
+                <input
+                  type="checkbox"
+                  checked={toPrint}
+                  onChange={(e) => setToPrint(e.target.checked)}
+                  className="h-4 w-4 accent-electric"
+                />
+                To be printed (number assigned in Print Checks)
+              </label>
+            )}
           </div>
+          {billCurrency && (
+            <div className="lg:col-span-2">
+              <Label htmlFor="pb-fx">Exchange rate today (home per 1 {billCurrency})</Label>
+              <Input
+                id="pb-fx"
+                inputMode="decimal"
+                placeholder="Use the rate from Currencies"
+                value={exchangeRate}
+                onChange={(e) => setExchangeRate(e.target.value)}
+              />
+              <p className="mt-1 text-xs text-navy/40">
+                Amounts below are in {billCurrency}. Any difference from the bill&apos;s rate is recorded as exchange gain or loss.
+              </p>
+            </div>
+          )}
           <div className="lg:col-span-2">
             <Label htmlFor="pb-disc-acct">
               Discount Account {discountTotal > 0 ? '*' : '(for discounts taken)'}
@@ -401,6 +571,21 @@ export default function PayBillsPage() {
           </div>
         </div>
       </Card>
+
+      {/* Filters */}
+      {vendorId && (
+        <div className="mb-3 flex flex-wrap items-center gap-4 text-sm text-navy/70">
+          <label className="flex items-center gap-2 select-none">
+            <input type="checkbox" className="h-4 w-4 accent-electric" checked={dueFilterOn} onChange={(e) => setDueFilterOn(e.target.checked)} />
+            Show bills due on or before
+          </label>
+          <Input type="date" className="w-40" value={dueOnOrBefore} disabled={!dueFilterOn} onChange={(e) => setDueOnOrBefore(e.target.value)} aria-label="Due on or before" />
+          <label className="flex items-center gap-2 select-none">
+            <input type="checkbox" className="h-4 w-4 accent-electric" checked={discountOnly} onChange={(e) => setDiscountOnly(e.target.checked)} />
+            Only bills with an early-payment discount available
+          </label>
+        </div>
+      )}
 
       {/* Open bills */}
       <Card className="p-0 overflow-hidden">
@@ -459,9 +644,26 @@ export default function PayBillsPage() {
                     </Td>
                     <Td className={dueTone(bill.dueDate)}>
                       {bill.dueDate ? formatDate(bill.dueDate, 'MMM d, yyyy') : '—'}
+                      {bill.discountAvailable && (
+                        <div className="text-xs font-normal text-emerald-700">
+                          {bill.discountPercent}% off until{' '}
+                          {bill.discountDate ? formatDate(bill.discountDate, 'MMM d') : ''}{' '}
+                          <button
+                            type="button"
+                            className="underline"
+                            onClick={() => {
+                              if (!row.checked) patchRow(bill.id, { checked: true });
+                              rebalanceCash(bill, { checked: true, discount: bill.suggestedDiscount ?? '' });
+                            }}
+                          >
+                            take {formatCurrency(bill.suggestedDiscount ?? '0')}
+                          </button>
+                        </div>
+                      )}
                     </Td>
                     <Td numeric className="font-semibold">
                       {formatCurrency(bill.balanceDue)}
+                      {bill.currency && <span className="ml-1 text-xs font-normal text-navy/50">{bill.currency}</span>}
                     </Td>
                     <Td numeric>
                       <Input
@@ -507,6 +709,124 @@ export default function PayBillsPage() {
           </Table>
         )}
       </Card>
+
+      {/* Recent payments to this vendor — edit or void (QB: edit a saved bill payment) */}
+      {vendorId && payments.length > 0 && (
+        <Card className="mt-6 p-0 overflow-hidden">
+          <div className="px-4 pt-4 pb-2">
+            <h2 className="text-sm font-bold text-navy">Recent payments to this vendor</h2>
+          </div>
+          <Table>
+            <thead>
+              <tr>
+                <Th>Date</Th>
+                <Th>Method</Th>
+                <Th>Check / Ref</Th>
+                <Th numeric>Amount</Th>
+                <Th className="text-right">Actions</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {payments.map((p) => (
+                <Tr key={p.id}>
+                  <Td>{formatDate(p.date, 'MMM d, yyyy')}</Td>
+                  <Td className="capitalize">{p.method.replace('_', ' ')}</Td>
+                  <Td className="font-mono text-sm">
+                    {p.reference ?? (p.toPrint ? <Badge tone="warning">To print</Badge> : '—')}
+                  </Td>
+                  <Td numeric>
+                    {formatCurrency(p.amount)}
+                    {p.currency && <span className="ml-1 text-xs text-navy/50">{p.currency}</span>}
+                  </Td>
+                  <Td className="text-right">
+                    <Button variant="ghost" size="sm" onClick={() => openEditPayment(p)}>
+                      <Pencil className="h-4 w-4" /> Edit
+                    </Button>
+                    <Button variant="ghost" size="sm" className="text-red-500 hover:text-red-700 hover:bg-red-50" onClick={() => setPendingVoid(p)}>
+                      <Trash2 className="h-4 w-4" /> Void
+                    </Button>
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </Card>
+      )}
+
+      <Modal
+        open={!!editPay}
+        onClose={() => !savingEdit && setEditPay(null)}
+        title="Edit Bill Payment"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setEditPay(null)} disabled={savingEdit}>
+              Cancel
+            </Button>
+            <Button onClick={saveEditPayment} loading={savingEdit}>
+              Save Changes
+            </Button>
+          </>
+        }
+      >
+        {editPay && (
+          <div className="space-y-4">
+            <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
+              Changing only the check number keeps the original entry. Changing amounts, the account or
+              the date replaces the entry (not allowed once the check is reconciled).
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label htmlFor="ep-date">Date</Label>
+                <Input id="ep-date" type="date" value={editDate} onChange={(e) => setEditDate(e.target.value)} />
+              </div>
+              <div>
+                <Label htmlFor="ep-ref">Check # / Ref</Label>
+                <Input id="ep-ref" value={editPay.toPrint ? '' : editRef} disabled={editPay.toPrint} placeholder={editPay.toPrint ? 'assigned when printed' : ''} onChange={(e) => setEditRef(e.target.value)} />
+              </div>
+            </div>
+            <div>
+              <Label htmlFor="ep-acct">Payment Account</Label>
+              <Select id="ep-acct" value={editAccount} onChange={(e) => setEditAccount(e.target.value)}>
+                {paymentAccounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.code} — {a.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div className="space-y-2">
+              {Object.entries(editAmounts).map(([billId, amt]) => (
+                <div key={billId} className="flex items-center justify-between gap-3">
+                  <span className="text-sm text-navy">
+                    Bill {editBills[billId]?.billNumber ?? ''}{' '}
+                    <span className="text-xs text-navy/40">
+                      (open now {formatCurrency(editBills[billId]?.balanceDue ?? '0')})
+                    </span>
+                  </span>
+                  <Input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    className="w-32 text-right"
+                    value={amt}
+                    onChange={(e) => setEditAmounts((prev) => ({ ...prev, [billId]: e.target.value }))}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <ConfirmDialog
+        open={!!pendingVoid}
+        title="Void payment?"
+        message={`Void this ${formatCurrency(pendingVoid?.amount ?? '0')} payment? The bills it paid become open again.`}
+        confirmLabel="Void"
+        tone="danger"
+        onConfirm={() => pendingVoid && voidPayment(pendingVoid)}
+        onClose={() => setPendingVoid(null)}
+      />
 
       {/* Totals + action bar — sticky so the primary action stays on screen */}
       {vendorId && bills.length > 0 && (

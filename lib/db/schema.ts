@@ -78,6 +78,8 @@ export const accounts = pgTable('accounts', {
   description: text('description'),
   /** Income-tax line this account rolls up to (lib/taxLines.ts key, e.g. "1120:L1a"); wave2 foundation. */
   taxLine: varchar('tax_line', { length: 40 }),
+  /** wave2 purchases: currency of a bank / credit-card account (null = home currency). */
+  currency: varchar('currency', { length: 3 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -383,6 +385,12 @@ export const vendors = pgTable('vendors', {
   /** Wave-2 lists: default payment terms (Terms list) and billing rate level for time billing. */
   termsId: uuid('terms_id').references((): any => paymentTerms.id),
   billingRateLevelId: uuid('billing_rate_level_id').references((): any => billingRateLevels.id),
+  // wave2 purchases: QB vendor fields - up to 3 pre-fill accounts, "print on check as" name,
+  // the account number the vendor knows us by (printed on the check memo), and the vendor's currency.
+  prefillAccountIds: jsonb('prefill_account_ids').$type<string[]>(),
+  printOnCheckAs: varchar('print_on_check_as', { length: 255 }),
+  accountNumber: varchar('account_number', { length: 100 }),
+  currency: varchar('currency', { length: 3 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -651,6 +659,9 @@ export const bills = pgTable('bills', {
   balanceDue: decimal('balance_due', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** wave2 purchases: transaction currency (null = home) + home units per 1 transaction unit. */
+  currency: varchar('currency', { length: 3 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -683,6 +694,10 @@ export const billPayments = pgTable('bill_payments', {
   paymentAccountId: uuid('payment_account_id').references(() => accounts.id), // bank/CC
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   voidedAt: timestamp('voided_at'),
+  /** wave2 purchases: bill-payment check queued for Print Checks (number stamped at print). */
+  toPrint: boolean('to_print').notNull().default(false),
+  currency: varchar('currency', { length: 3 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -691,6 +706,8 @@ export const billPaymentApplications = pgTable('bill_payment_applications', {
   billPaymentId: uuid('bill_payment_id').references(() => billPayments.id).notNull(),
   billId: uuid('bill_id').references(() => bills.id).notNull(),
   amountApplied: decimal('amount_applied', { precision: 15, scale: 2 }).notNull(),
+  /** wave2 purchases: home-currency A/P relieved by this application (null = amountApplied). */
+  amountHome: decimal('amount_home', { precision: 15, scale: 2 }),
 });
 
 // ---- Direct expenses / checks (non-bill spend) ----
@@ -709,6 +726,9 @@ export const expenses = pgTable('expenses', {
   /** 'check' expenses queue for check printing until printed (QB Write Checks → Print Queue). */
   toPrint: boolean('to_print').notNull().default(false),
   voidedAt: timestamp('voided_at'),
+  /** wave2 purchases: transaction currency (null = home) + home units per 1 transaction unit. */
+  currency: varchar('currency', { length: 3 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -724,6 +744,10 @@ export const expenseLines = pgTable('expense_lines', {
   /** Set when this billable line has been pulled onto a customer invoice. */
   billedInvoiceId: uuid('billed_invoice_id').references(() => invoices.id),
   lineOrder: integer('line_order').notNull().default(0),
+  /** wave2 purchases: Items tab on Write Checks / CC charges. */
+  itemId: uuid('item_id').references(() => items.id),
+  quantity: decimal('quantity', { precision: 15, scale: 4 }),
+  unitCost: decimal('unit_cost', { precision: 15, scale: 4 }),
 });
 
 // ---- Bank transfers ----
@@ -736,6 +760,8 @@ export const transfers = pgTable('transfers', {
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** wave2 purchases: transfers can be voided (reverses the entry). */
+  voidedAt: timestamp('voided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -810,6 +836,9 @@ export const paychecks = pgTable('paychecks', {
   /** Batch pay run this paycheck was created in (optional). */
   payRunId: uuid('pay_run_id').references(() => payRuns.id),
   voidedAt: timestamp('voided_at'),
+  /** wave2 purchases: paycheck queued for Print Checks; number stamped when printed. */
+  toPrint: boolean('to_print').notNull().default(false),
+  checkNumber: varchar('check_number', { length: 100 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1976,5 +2005,62 @@ export const collectionNotes = pgTable('collection_notes', {
   followUpDate: timestamp('follow_up_date'),
   done: boolean('done').notNull().default(false),
   createdBy: uuid('created_by'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- wave2 purchases ----
+
+/** Check printer setup (QB Printer Setup -> Check/Paycheck): style + alignment offsets per company. */
+export const checkPrintSettings = pgTable('check_print_settings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull().unique(),
+  /** 'voucher' | 'standard' | 'wallet' */
+  style: varchar('style', { length: 20 }).notNull().default('voucher'),
+  /** Alignment nudges in inches (positive = right / up). */
+  offsetX: decimal('offset_x', { precision: 6, scale: 3 }).notNull().default('0'),
+  offsetY: decimal('offset_y', { precision: 6, scale: 3 }).notNull().default('0'),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Loan Manager: a loan tracked against a liability account. */
+export const loans = pgTable('loans', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  lenderVendorId: uuid('lender_vendor_id').references(() => vendors.id),
+  liabilityAccountId: uuid('liability_account_id').references(() => accounts.id).notNull(),
+  interestAccountId: uuid('interest_account_id').references(() => accounts.id).notNull(),
+  escrowAccountId: uuid('escrow_account_id').references(() => accounts.id),
+  paymentAccountId: uuid('payment_account_id').references(() => accounts.id),
+  originalAmount: decimal('original_amount', { precision: 15, scale: 2 }).notNull(),
+  /** Annual interest rate in percent, e.g. 6.5 */
+  annualRate: decimal('annual_rate', { precision: 9, scale: 6 }).notNull(),
+  termMonths: integer('term_months').notNull(),
+  paymentsPerYear: integer('payments_per_year').notNull().default(12),
+  originDate: timestamp('origin_date').notNull(),
+  firstPaymentDate: timestamp('first_payment_date').notNull(),
+  /** Escrow added to every payment (taxes / insurance). */
+  escrowAmount: decimal('escrow_amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  notes: text('notes'),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** One "Set up payment" from the Loan Manager - the check or bill that carries it. */
+export const loanPayments = pgTable('loan_payments', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  loanId: uuid('loan_id').references(() => loans.id).notNull(),
+  paymentNumber: integer('payment_number').notNull(),
+  date: timestamp('date').notNull(),
+  principal: decimal('principal', { precision: 15, scale: 2 }).notNull(),
+  interest: decimal('interest', { precision: 15, scale: 2 }).notNull(),
+  escrow: decimal('escrow', { precision: 15, scale: 2 }).notNull().default('0'),
+  total: decimal('total', { precision: 15, scale: 2 }).notNull(),
+  /** 'check' | 'bill' */
+  kind: varchar('kind', { length: 10 }).notNull(),
+  expenseId: uuid('expense_id').references(() => expenses.id),
+  billId: uuid('bill_id').references(() => bills.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

@@ -20,6 +20,11 @@ export const createVendorSchema = z.object({
   taxId: z.string().nullish(),
   defaultExpenseAccountId: zUuid.nullish(),
   notes: z.string().nullish(),
+  /** wave2 purchases: up to 3 pre-fill accounts, print-on-check name, our account no., currency. */
+  prefillAccountIds: z.array(zUuid).max(3, 'at most 3 pre-fill accounts').nullish(),
+  printOnCheckAs: z.string().max(255).nullish(),
+  accountNumber: z.string().max(100).nullish(),
+  currency: z.string().max(3).nullish(),
 });
 export type CreateVendorBody = z.infer<typeof createVendorSchema>;
 

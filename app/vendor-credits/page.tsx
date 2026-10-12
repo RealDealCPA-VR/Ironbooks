@@ -2,7 +2,7 @@
 
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { useEffect, useState, useCallback } from 'react';
-import { RotateCcw, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle, Banknote } from 'lucide-react';
+import { RotateCcw, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle, Banknote, Pencil } from 'lucide-react';
 import {
   Button,
   Card,
@@ -20,6 +20,7 @@ import {
   Modal,
   PageHeader,
   toast,
+  toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -99,24 +100,57 @@ interface NewCreditModalProps {
   vendors: Vendor[];
   accounts: Account[];
   onCreated: () => void;
+  /** When set, the modal edits this saved credit (PATCH) instead of creating one. */
+  editId?: string | null;
 }
 
-function NewCreditModal({ open, onClose, vendors, accounts, onCreated }: NewCreditModalProps) {
+function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }: NewCreditModalProps) {
   const [vendorId, setVendorId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<CreditLine[]>([{ ...EMPTY_LINE }]);
   const [saving, setSaving] = useState(false);
 
-  // Reset on open.
+  const [loadingEdit, setLoadingEdit] = useState(false);
+
+  // Reset on open (or load the saved credit when editing).
   useEffect(() => {
-    if (open) {
-      setVendorId('');
-      setDate(new Date().toISOString().slice(0, 10));
-      setMemo('');
-      setLines([{ ...EMPTY_LINE }]);
-    }
-  }, [open]);
+    if (!open) return;
+    setVendorId('');
+    setDate(new Date().toISOString().slice(0, 10));
+    setMemo('');
+    setLines([{ ...EMPTY_LINE }]);
+    if (!editId) return;
+    let cancelled = false;
+    setLoadingEdit(true);
+    api
+      .get<{
+        vendorId: string;
+        date: string;
+        memo: string | null;
+        lines: Array<{ accountId: string; description: string | null; amount: string }>;
+      }>(`/api/vendor-credits/${editId}`)
+      .then((c) => {
+        if (cancelled) return;
+        setVendorId(c.vendorId);
+        setDate(String(c.date).slice(0, 10));
+        setMemo(c.memo ?? '');
+        setLines(
+          c.lines.length > 0
+            ? c.lines.map((l) => ({ accountId: l.accountId, description: l.description ?? '', amount: l.amount }))
+            : [{ ...EMPTY_LINE }],
+        );
+      })
+      .catch((err) => {
+        toastError(err, 'Could not load this vendor credit.');
+        onClose();
+      })
+      .finally(() => !cancelled && setLoadingEdit(false));
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editId]);
 
   function updateLine(idx: number, field: keyof CreditLine, value: string) {
     setLines((prev) => {
@@ -150,7 +184,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated }: NewCred
 
     setSaving(true);
     try {
-      await api.post('/api/vendor-credits', {
+      const body = {
         vendorId,
         date,
         memo: memo || null,
@@ -159,13 +193,18 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated }: NewCred
           description: l.description || null,
           amount: l.amount,
         })),
-      });
-      toast('Vendor credit created.', 'success');
+      };
+      if (editId) {
+        await api.patch(`/api/vendor-credits/${editId}`, body);
+        toast('Vendor credit updated.', 'success');
+      } else {
+        await api.post('/api/vendor-credits', body);
+        toast('Vendor credit created.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to create vendor credit.';
-      toast(msg, 'danger');
+      toastError(err, editId ? 'Failed to save changes.' : 'Failed to create vendor credit.');
     } finally {
       setSaving(false);
     }
@@ -180,18 +219,31 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated }: NewCred
     <Modal
       open={open}
       onClose={onClose}
-      title="New Vendor Credit"
+      title={editId ? 'Edit Vendor Credit' : 'New Vendor Credit'}
       size="lg"
       footer={
         <>
-          <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSubmit} loading={saving}>
-            Create Credit
+          <Button variant="secondary" onClick={onClose} disabled={saving}>
+            {editId ? 'Cancel edit' : 'Cancel'}
+          </Button>
+          <Button onClick={handleSubmit} loading={saving} disabled={loadingEdit}>
+            {editId ? 'Save Changes' : 'Create Credit'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
+        {editId && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            Changing amounts is only possible while none of the credit is applied or refunded — memo
+            and descriptions can always be changed.
+          </div>
+        )}
+        {loadingEdit && (
+          <div className="flex items-center gap-2 text-sm text-navy/50">
+            <Spinner className="h-4 w-4" /> Loading credit…
+          </div>
+        )}
         {/* Vendor */}
         <div>
           <Label htmlFor="vc-vendor">Vendor *</Label>
@@ -539,6 +591,7 @@ export default function VendorCreditsPage() {
   const [loading, setLoading] = useState(true);
 
   const [showNew, setShowNew] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
   const [applyTarget, setApplyTarget] = useState<VendorCredit | null>(null);
   const [refundTarget, setRefundTarget] = useState<VendorCredit | null>(null);
   const [voidTarget, setVoidTarget] = useState<VendorCredit | null>(null);
@@ -677,6 +730,19 @@ export default function VendorCreditsPage() {
                         <Button
                           variant="ghost"
                           size="sm"
+                          onClick={() => {
+                            setEditId(c.id);
+                            setShowNew(true);
+                          }}
+                          title="Edit credit"
+                        >
+                          <Pencil className="h-3.5 w-3.5" /> Edit
+                        </Button>
+                      )}
+                      {c.status !== 'void' && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           className="text-red-500 hover:text-red-700 hover:bg-red-50"
                           onClick={() => setVoidTarget(c)}
                           title="Void credit"
@@ -716,10 +782,14 @@ export default function VendorCreditsPage() {
 
       <NewCreditModal
         open={showNew}
-        onClose={() => setShowNew(false)}
+        onClose={() => {
+          setShowNew(false);
+          setEditId(null);
+        }}
         vendors={vendors}
         accounts={accounts}
         onCreated={fetchData}
+        editId={editId}
       />
 
       <ApplyModal

@@ -49,7 +49,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const bill = await createBill(ctx, parsed.data);
+    // QB duplicate vendor-reference warning: refused (409, details.duplicateNumber) unless confirmed.
+    const { allowDuplicateNumber, ...input } = parsed.data;
+    const bill = await createBill(ctx, { ...input, checkDuplicateNumber: !allowDuplicateNumber });
 
     return NextResponse.json(bill, { status: 201 });
   } catch (err) {

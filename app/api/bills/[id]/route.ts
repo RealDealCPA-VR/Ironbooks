@@ -54,7 +54,10 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
 
     // Multi-user: 409 if someone else saved this bill since it was loaded.
     const bill = await withVersionCheck(ctx, 'bill', id, expectedVersion(req), (c) =>
-      updateBill(c, id, parsed.data),
+      updateBill(c, id, {
+        ...parsed.data,
+        checkDuplicateNumber: !parsed.data.allowDuplicateNumber,
+      }),
     );
 
     return NextResponse.json(bill);

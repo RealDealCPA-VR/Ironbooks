@@ -27,6 +27,11 @@ export const createPurchaseOrderSchema = z.object({
 });
 export type CreatePurchaseOrderBody = z.infer<typeof createPurchaseOrderSchema>;
 
+/** PATCH /api/purchase-orders/:id — full edit; existing lines carry their id. */
+export const updatePurchaseOrderSchema = createPurchaseOrderSchema.extend({
+  lines: zLines(purchaseOrderLineSchema.extend({ id: zUuid.nullish() })),
+});
+
 /** Per-line partial billing request ({ lineId, quantity }). */
 export const poBillLineSchema = z.object({
   lineId: zUuid,

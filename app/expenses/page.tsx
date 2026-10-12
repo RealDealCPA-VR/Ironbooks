@@ -10,11 +10,15 @@
  *
  * Form posts to /api/expenses; the service posts Dr expense lines / Cr payment
  * account (flipped for CC credits) through the central posting engine.
+ *
+ * wave2 purchases: Items tab per line (inventory items receive stock), Edit of a saved
+ * check/charge (PATCH /api/expenses/:id), duplicate check-number warning with override,
+ * the vendor's own pre-fill accounts, and foreign-currency checks (exchange rate).
  */
 
 import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { Suspense, useEffect, useState, useCallback } from 'react';
-import { Banknote, Plus, Trash2 } from 'lucide-react';
+import { Banknote, Pencil, Plus, Trash2 } from 'lucide-react';
 import {
   AmountInput,
   Button,
@@ -38,9 +42,10 @@ import {
 import { Help } from '@/components/Help';
 import { api, ApiError } from '@/lib/client';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
-import { formatCurrency } from '@/lib/money';
+import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { useNewParam } from '@/lib/useFocusParam';
+import { type PurchaseVendor, saveWithDuplicateCheck, vendorPrefillAccountIds } from '@/lib/purchasesClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -60,12 +65,24 @@ interface Expense {
   memo: string | null;
   toPrint: boolean;
   voidedAt: string | null;
+  currency?: string | null;
+  exchangeRate?: string | null;
 }
 
-interface Vendor {
-  id: string;
-  displayName: string;
+interface ExpenseDetail extends Expense {
+  lines: Array<{
+    accountId: string;
+    itemId: string | null;
+    quantity: string | null;
+    unitCost: string | null;
+    description: string | null;
+    amount: string;
+    classId: string | null;
+    customerId: string | null;
+  }>;
 }
+
+type Vendor = PurchaseVendor;
 
 interface Account {
   id: string;
@@ -73,6 +90,14 @@ interface Account {
   name: string;
   type: string;
   subtype: string;
+  currency?: string | null;
+}
+
+interface Item {
+  id: string;
+  name: string;
+  type: string;
+  purchaseCost: string | null;
 }
 
 interface ClassRow {
@@ -86,7 +111,12 @@ interface Customer {
 }
 
 interface LineRow {
+  /** 'expense' = Expenses tab (account), 'item' = Items tab. */
+  mode: 'expense' | 'item';
   accountId: string;
+  itemId: string;
+  quantity: string;
+  unitCost: string;
   description: string;
   amount: string;
   classId: string;
@@ -105,8 +135,22 @@ const ENTRY_LABEL: Record<EntryType, string> = {
 
 const OTHER_PAYEE = '__other__';
 
-function emptyLine(): LineRow {
-  return { accountId: '', description: '', amount: '', classId: '', customerId: '' };
+function emptyLine(mode: LineRow['mode'] = 'expense'): LineRow {
+  return { mode, accountId: '', itemId: '', quantity: '', unitCost: '', description: '', amount: '', classId: '', customerId: '' };
+}
+
+/** Display amount of a line (qty x cost on the Items tab). */
+function lineTotal(l: LineRow): number {
+  const dec = (v: string) => {
+    try {
+      const d = Money.of(v || '0');
+      return d.isFinite() ? d : Money.zero();
+    } catch {
+      return Money.zero();
+    }
+  };
+  if (l.mode === 'item' && !l.amount) return Money.round2(dec(l.quantity).times(dec(l.unitCost))).toNumber();
+  return Money.round2(dec(l.amount)).toNumber();
 }
 
 /** Checks and cash expenses come from a Bank account (QB parity; lib/accountTypes.ts). */
@@ -128,7 +172,11 @@ function ExpensesPageContent() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [classes, setClasses] = useState<ClassRow[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
+  /** Set while the form edits a saved transaction. */
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [exchangeRate, setExchangeRate] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [pendingVoid, setPendingVoid] = useState<Expense | null>(null);
   const [voidingId, setVoidingId] = useState<string | null>(null);
@@ -172,6 +220,10 @@ function ExpensesPageContent() {
           api.get<ClassRow[]>('/api/classes').catch(() => [] as ClassRow[]),
           api.get<Customer[]>('/api/customers').catch(() => [] as Customer[]),
         ]);
+        api
+          .get<{ items: Item[] }>('/api/items')
+          .then((d) => setItems(d.items ?? []))
+          .catch(() => setItems([]));
         setExpenses(expData.expenses);
         setVendors(vendorData);
         setAccounts(accountData);
@@ -202,7 +254,7 @@ function ExpensesPageContent() {
   useEffect(() => {
     let cancelled = false;
     async function loadNext() {
-      if (entryType !== 'check' || toPrint || !paymentAccountId) return;
+      if (entryType !== 'check' || toPrint || !paymentAccountId || editingId) return;
       try {
         const data = await api.get<{ next: string }>(
           `/api/check-numbers/next?paymentAccountId=${paymentAccountId}`,
@@ -216,7 +268,7 @@ function ExpensesPageContent() {
     return () => {
       cancelled = true;
     };
-  }, [entryType, toPrint, paymentAccountId]);
+  }, [entryType, toPrint, paymentAccountId, editingId]);
 
   // ── line helpers ──────────────────────────────────────────────────────────
 
@@ -240,9 +292,54 @@ function ExpensesPageContent() {
     document.getElementById('exp-payee')?.focus();
   });
 
-  const runningTotal = lines.reduce((sum, l) => sum + (Number(l.amount) || 0), 0);
+  const runningTotal = lines.reduce((sum, l) => sum + lineTotal(l), 0);
+  const selectedVendor = vendors.find((v) => v.id === payeeSel);
+  const payAccount = accounts.find((a) => a.id === paymentAccountId);
+  const docCurrency = payAccount?.currency || selectedVendor?.currency || '';
+
+  function pickItem(index: number, itemId: string) {
+    const item = items.find((it) => it.id === itemId);
+    setLines((prev) =>
+      prev.map((row, i) =>
+        i === index
+          ? { ...row, itemId, quantity: row.quantity || '1', unitCost: row.unitCost || (item?.purchaseCost ?? ''), description: row.description || item?.name || '' }
+          : row,
+      ),
+    );
+  }
+
+  /** Load a saved check / charge into the form for editing. */
+  async function startEdit(e: Expense) {
+    try {
+      const d = await api.get<ExpenseDetail>(`/api/expenses/${e.id}`);
+      setEditingId(e.id);
+      const isCredit = d.method === 'credit_card' && Number(d.total) < 0;
+      setEntryType(d.method === 'cash' ? 'cash' : d.method === 'credit_card' ? (isCredit ? 'cc_credit' : 'cc_charge') : 'check');
+      setPayeeSel(d.vendorId ?? OTHER_PAYEE);
+      setPayeeName(d.vendorId ? '' : (d.payeeName ?? ''));
+      setPaymentAccountId(d.paymentAccountId);
+      setDate(d.date.slice(0, 10));
+      setReference(d.reference ?? '');
+      setToPrint(d.toPrint);
+      setMemo(d.memo ?? '');
+      setExchangeRate(d.currency && d.exchangeRate ? String(Number(d.exchangeRate)) : '');
+      setLines(
+        d.lines.map((l) =>
+          l.itemId
+            ? { ...emptyLine('item'), itemId: l.itemId, quantity: String(Number(l.quantity ?? 1)), unitCost: l.unitCost ? String(Number(l.unitCost)) : '', amount: String(Math.abs(Number(l.amount)).toFixed(2)), description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '' }
+            : { ...emptyLine('expense'), accountId: l.accountId, amount: isCredit ? String(Math.abs(Number(l.amount)).toFixed(2)) : l.amount, description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '' },
+        ),
+      );
+      setPrefillNote('');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (err) {
+      toastError(err, 'Failed to load the transaction.');
+    }
+  }
 
   function resetForm() {
+    setEditingId(null);
+    setExchangeRate('');
     setPayeeSel('');
     setPayeeName('');
     setReference('');
@@ -258,8 +355,15 @@ function ExpensesPageContent() {
    */
   async function prefillFor(q: { vendorId?: string; payee?: string }) {
     setPrefillNote('');
-    const blank = (ls: LineRow[]) => ls.every((l) => !l.accountId && !l.amount && !l.description);
-    if (!blank(lines)) return;
+    const blank = (ls: LineRow[]) => ls.every((l) => !l.accountId && !l.itemId && !l.amount && !l.description);
+    if (!blank(lines) || editingId) return;
+    // The vendor's own pre-fill accounts (up to 3) win over learned suggestions.
+    const own = vendorPrefillAccountIds(vendors.find((v) => v.id === q.vendorId));
+    if (own.length > 0) {
+      setLines(own.map((accountId) => ({ ...emptyLine(), accountId })));
+      setPrefillNote("Accounts pre-filled from the vendor's pre-fill accounts.");
+      return;
+    }
     const pf = await fetchVendorPrefill(q);
     if (!pf) return;
     setLines((prev) => {
@@ -292,6 +396,21 @@ function ExpensesPageContent() {
       return;
     }
     for (const [i, line] of lines.entries()) {
+      if (line.mode === 'item') {
+        if (!line.itemId) {
+          toast(`Line ${i + 1}: select an item.`, 'danger');
+          return;
+        }
+        if (!line.quantity || Number(line.quantity) <= 0) {
+          toast(`Line ${i + 1}: quantity must be greater than zero.`, 'danger');
+          return;
+        }
+        if (lineTotal(line) <= 0) {
+          toast(`Line ${i + 1}: enter a cost.`, 'danger');
+          return;
+        }
+        continue;
+      }
       if (!line.accountId) {
         toast(`Line ${i + 1}: select an expense account.`, 'danger');
         return;
@@ -304,7 +423,7 @@ function ExpensesPageContent() {
 
     setSubmitting(true);
     try {
-      await api.post('/api/expenses', {
+      const body = {
         vendorId,
         payeeName: freePayee || undefined,
         date,
@@ -319,18 +438,40 @@ function ExpensesPageContent() {
         toPrint: entryType === 'check' ? toPrint : false,
         paymentAccountId,
         memo: memo.trim() || undefined,
-        lines: lines.map((l) => ({
-          accountId: l.accountId,
-          description: l.description.trim() || undefined,
-          amount: l.amount,
-          classId: l.classId || undefined,
-          customerId: l.customerId || undefined,
-        })),
-      });
+        exchangeRate: docCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
+        lines: lines.map((l) =>
+          l.mode === 'item'
+            ? {
+                itemId: l.itemId,
+                quantity: l.quantity,
+                unitCost: l.unitCost || undefined,
+                amount: l.unitCost ? undefined : l.amount || undefined,
+                description: l.description.trim() || undefined,
+                classId: l.classId || undefined,
+                customerId: l.customerId || undefined,
+              }
+            : {
+                accountId: l.accountId,
+                description: l.description.trim() || undefined,
+                amount: l.amount,
+                classId: l.classId || undefined,
+                customerId: l.customerId || undefined,
+              },
+        ),
+      };
+      // Duplicate check numbers: warn and let the user keep the number (QB behaviour).
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        editingId
+          ? api.patch(`/api/expenses/${editingId}`, { ...body, allowDuplicateNumber })
+          : api.post('/api/expenses', { ...body, allowDuplicateNumber }),
+      );
+      if (saved === null) return;
       toast(
-        entryType === 'check' && toPrint
-          ? 'Check saved and added to the print queue.'
-          : `${ENTRY_LABEL[entryType]} recorded.`,
+        editingId
+          ? 'Changes saved.'
+          : entryType === 'check' && toPrint
+            ? 'Check saved and added to the print queue.'
+            : `${ENTRY_LABEL[entryType]} recorded.`,
         'success',
       );
       resetForm();
@@ -383,7 +524,14 @@ function ExpensesPageContent() {
       {/* ------------------------------------------------------------------ */}
       <Card className="p-6 mb-8 space-y-5">
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-bold text-navy">New Transaction</h2>
+          <h2 className="text-lg font-bold text-navy">
+            {editingId ? 'Edit Transaction' : 'New Transaction'}
+            {editingId && (
+              <button type="button" onClick={resetForm} className="ml-3 text-xs font-semibold text-electric hover:underline">
+                Cancel edit
+              </button>
+            )}
+          </h2>
           {/* Entry type toggle */}
           <div className="flex gap-1 rounded-lg bg-navy/5 p-1">
             {(Object.keys(ENTRY_LABEL) as EntryType[]).map((t) => (
@@ -511,6 +659,26 @@ function ExpensesPageContent() {
           </div>
         </div>
 
+        {editingId && (
+          <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
+            Changing only the payee, memo or number keeps the original entry. Changing amounts,
+            accounts or the date replaces the entry (not allowed once the check is reconciled).
+          </p>
+        )}
+
+        {docCurrency && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 rounded-lg border border-electric/20 bg-electric/5 p-3">
+            <p className="md:col-span-2 text-xs text-navy/70">
+              This is a <strong>{docCurrency}</strong> transaction. Enter amounts in {docCurrency}; the books
+              record them in your home currency at the exchange rate.
+            </p>
+            <div>
+              <Label htmlFor="exp-fx">Exchange rate (home per 1 {docCurrency})</Label>
+              <Input id="exp-fx" inputMode="decimal" placeholder="Use the rate from Currencies" value={exchangeRate} onChange={(e) => setExchangeRate(e.target.value)} />
+            </div>
+          </div>
+        )}
+
         {/* Lines grid */}
         <div>
           <div className="flex items-center justify-between mb-2">
@@ -518,13 +686,25 @@ function ExpensesPageContent() {
               {entryType === 'cc_credit' ? 'Refunded Expense Lines' : 'Expense Lines'}{' '}
               <Help term="chart-of-accounts" />
             </Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-xs text-electric font-semibold hover:text-electric/70 flex items-center gap-1"
-            >
-              <Plus className="h-3 w-3" /> Add Line
-            </button>
+            <span className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={addLine}
+                className="text-xs text-electric font-semibold hover:text-electric/70 flex items-center gap-1"
+              >
+                <Plus className="h-3 w-3" /> Expense Line
+              </button>
+              {entryType !== 'cc_credit' && (
+                <button
+                  type="button"
+                  onClick={() => setLines((prev) => [...prev, emptyLine('item')])}
+                  className="text-xs text-electric font-semibold hover:text-electric/70 flex items-center gap-1"
+                  title="Items tab: buy items (inventory items go into stock)"
+                >
+                  <Plus className="h-3 w-3" /> Item Line
+                </button>
+              )}
+            </span>
           </div>
 
           {/* Header row */}
@@ -544,29 +724,64 @@ function ExpensesPageContent() {
                 data-grid-row
                 className="grid grid-cols-1 md:grid-cols-[2fr_2fr_1fr_1.5fr_1.5fr_24px] gap-2 items-start"
               >
-                <Select
-                  value={line.accountId}
-                  onChange={(e) => updateLine(idx, 'accountId', e.target.value)}
-                >
-                  <option value="">Account…</option>
-                  {lineAccounts.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.code} – {a.name}
-                    </option>
-                  ))}
-                </Select>
+                {line.mode === 'item' ? (
+                  <Select value={line.itemId} onChange={(e) => pickItem(idx, e.target.value)} aria-label="Item">
+                    <option value="">Item…</option>
+                    {items.map((it) => (
+                      <option key={it.id} value={it.id}>
+                        {it.name}
+                        {it.type === 'inventory' ? ' (stock)' : ''}
+                      </option>
+                    ))}
+                  </Select>
+                ) : (
+                  <Select
+                    value={line.accountId}
+                    onChange={(e) => updateLine(idx, 'accountId', e.target.value)}
+                  >
+                    <option value="">Account…</option>
+                    {lineAccounts.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.code} – {a.name}
+                      </option>
+                    ))}
+                  </Select>
+                )}
 
-                <Input
-                  placeholder="Description"
-                  value={line.description}
-                  onChange={(e) => updateLine(idx, 'description', e.target.value)}
-                />
+                {line.mode === 'item' ? (
+                  <div className="grid grid-cols-2 gap-1">
+                    <Input
+                      placeholder="Qty"
+                      inputMode="decimal"
+                      aria-label="Quantity"
+                      value={line.quantity}
+                      onChange={(e) => updateLine(idx, 'quantity', e.target.value)}
+                    />
+                    <Input
+                      placeholder="Cost each"
+                      inputMode="decimal"
+                      aria-label="Cost each"
+                      value={line.unitCost}
+                      onChange={(e) => updateLine(idx, 'unitCost', e.target.value)}
+                    />
+                  </div>
+                ) : (
+                  <Input
+                    placeholder="Description"
+                    value={line.description}
+                    onChange={(e) => updateLine(idx, 'description', e.target.value)}
+                  />
+                )}
 
-                <AmountInput
-                  placeholder="0.00"
-                  value={line.amount}
-                  onChange={(e) => updateLine(idx, 'amount', e.target.value)}
-                />
+                {line.mode === 'item' ? (
+                  <div className="px-3 py-2 text-sm tabular-nums text-navy/70">{formatCurrency(lineTotal(line).toFixed(2))}</div>
+                ) : (
+                  <AmountInput
+                    placeholder="0.00"
+                    value={line.amount}
+                    onChange={(e) => updateLine(idx, 'amount', e.target.value)}
+                  />
+                )}
 
                 <Select
                   value={line.classId}
@@ -617,7 +832,7 @@ function ExpensesPageContent() {
 
         <div className="flex justify-end pt-1">
           <Button onClick={handleSubmit} loading={submitting}>
-            {`Save ${ENTRY_LABEL[entryType]}`}
+            {editingId ? 'Save Changes' : `Save ${ENTRY_LABEL[entryType]}`}
           </Button>
         </div>
       </Card>
@@ -664,6 +879,7 @@ function ExpensesPageContent() {
                   <Td>{methodBadge(e)}</Td>
                   <Td numeric className="font-semibold">
                     {formatCurrency(e.total)}
+                    {e.currency && <span className="ml-1 text-xs text-navy/50">{e.currency}</span>}
                   </Td>
                   <Td>
                     {e.voidedAt ? (
@@ -675,6 +891,12 @@ function ExpensesPageContent() {
                     )}
                   </Td>
                   <Td className="text-right">
+                    {!e.voidedAt && (
+                      <Button variant="ghost" size="sm" onClick={() => startEdit(e)} title="Edit this transaction">
+                        <Pencil className="h-4 w-4" />
+                        Edit
+                      </Button>
+                    )}
                     {!e.voidedAt && (
                       <Button
                         variant="ghost"

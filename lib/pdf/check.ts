@@ -17,9 +17,30 @@
  *   - Memo line — bottom-left
  *   - Signature line — bottom-right
  *   - Decorative MICR-area rule near the bottom
+ *
+ * wave2 purchases (D4) — QB Printer Setup parity:
+ *   - `style`: 'voucher' (check on top + voucher stub with the bill/expense detail, the default),
+ *     'standard' (check only, no stub) or 'wallet' (narrower check with a left-hand stub that
+ *     repeats date / payee / amount / memo for the checkbook register).
+ *   - `offset`: per-company alignment nudge in inches ({ x: right+, y: up+ }) applied to the
+ *     whole page, so pre-printed check stock lines up with the printer.
  */
 
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
+import { Money } from '@/lib/money';
+
+/** "1234.5" -> "1,234.50" using Decimal (no float drift); null when not a number. */
+function fmtAmount(v: string): string | null {
+  let d;
+  try {
+    d = Money.of(v);
+  } catch {
+    return null;
+  }
+  if (!d.isFinite()) return null;
+  const [int, frac] = Money.round2(d).abs().toFixed(2).split('.');
+  return `${d.isNegative() ? '-' : ''}${int.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${frac}`;
+}
 
 // ---------------------------------------------------------------------------
 // numberToWords — converts a decimal amount string/number to check-style words
@@ -124,6 +145,28 @@ export interface CheckPdfData {
    * detail behind the check, printed in the lower portion of the page.
    */
   voucher?: VoucherLine[];
+  /** Check style (default 'voucher'). */
+  style?: CheckStyle;
+  /** Printer alignment nudge in inches (positive x = right, positive y = up). */
+  offset?: { x?: number | string | null; y?: number | string | null };
+}
+
+export type CheckStyle = 'voucher' | 'standard' | 'wallet';
+export const CHECK_STYLES: CheckStyle[] = ['voucher', 'standard', 'wallet'];
+/** Largest alignment nudge accepted (inches). */
+export const MAX_CHECK_OFFSET_IN = 1;
+
+/** Clamp an inch offset to +/- MAX_CHECK_OFFSET_IN and convert to PDF points. */
+export function offsetToPoints(v: number | string | null | undefined): number {
+  let n: number;
+  try {
+    n = typeof v === 'string' ? Money.of(v.trim() || '0').toNumber() : (v ?? 0);
+  } catch {
+    return 0;
+  }
+  if (!Number.isFinite(n)) return 0;
+  const clamped = Math.max(-MAX_CHECK_OFFSET_IN, Math.min(MAX_CHECK_OFFSET_IN, n));
+  return Math.round(clamped * 72 * 100) / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,8 +182,9 @@ const PAGE_H = PageSizes.Letter[1]; // 792 pt
 const CHECK_TOP = PAGE_H - 48;      // 744 pt from bottom
 const CHECK_BOTTOM = PAGE_H - 300;  // 492 pt from bottom
 
-const ML = 48;                      // left margin
-const MR = PAGE_W - 48;             // right margin
+const PAGE_ML = 48;                 // page left margin
+const PAGE_MR = PAGE_W - 48;        // page right margin
+const WALLET_STUB_W = 162;          // 2.25" register stub on wallet checks
 
 // Colors
 const C_NAVY  = rgb(0.09, 0.13, 0.27);
@@ -159,6 +203,16 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
   const oblique = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
 
   const page = pdfDoc.addPage([PAGE_W, PAGE_H]);
+
+  const style: CheckStyle = data.style && CHECK_STYLES.includes(data.style) ? data.style : 'voucher';
+  // Printer alignment: shift everything drawn on the page.
+  const dx = offsetToPoints(data.offset?.x);
+  const dy = offsetToPoints(data.offset?.y);
+  if (dx !== 0 || dy !== 0) page.translateContent(dx, dy);
+
+  // Wallet checks leave a register stub on the left; the check body moves right.
+  const ML = style === 'wallet' ? PAGE_ML + WALLET_STUB_W : PAGE_ML;
+  const MR = PAGE_MR;
 
   // -------------------------------------------------------------------------
   // Helpers
@@ -265,10 +319,7 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
   text('$', AMOUNT_BOX_X + 6, payeeY, { size: 11, color: C_NAVY });
 
   // Numeric amount right-aligned inside box
-  const numFmt = parseFloat(data.amountNumeric);
-  const numDisplay = isNaN(numFmt)
-    ? data.amountNumeric
-    : numFmt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const numDisplay = fmtAmount(data.amountNumeric) ?? data.amountNumeric;
 
   text(numDisplay, MR - 6, payeeY, {
     font: bold,
@@ -332,7 +383,8 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
   hRule(MICR_Y + 18, ML, MR, 0.5, C_LIGHT);
   hRule(MICR_Y, ML, MR, 0.5, C_LIGHT);
 
-  text('⑆ ROUTING ⑆  ACCOUNT  ⑆  CHECK#', ML + 4, MICR_Y + 5, {
+  // Plain ASCII: the standard Helvetica (WinAnsi) font cannot encode the MICR symbols.
+  text('|: ROUTING |:  ACCOUNT  |:  CHECK#', ML + 4, MICR_Y + 5, {
     size: 7,
     color: C_LIGHT,
   });
@@ -356,7 +408,37 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
   // Voucher stub — expense/bill detail behind the check (QB voucher checks)
   // -------------------------------------------------------------------------
 
-  if (data.voucher && data.voucher.length > 0) {
+  // -------------------------------------------------------------------------
+  // Wallet stub — date / payee / amount / memo for the checkbook register
+  // -------------------------------------------------------------------------
+
+  if (style === 'wallet') {
+    const sx = PAGE_ML;
+    const sw = WALLET_STUB_W - 16;
+    page.drawLine({
+      start: { x: ML - 10, y: CHECK_TOP + 4 },
+      end: { x: ML - 10, y: CHECK_BOTTOM - 4 },
+      thickness: 0.5,
+      color: C_GRAY,
+      dashArray: [3, 3],
+    });
+    let sy = CHECK_TOP - 2;
+    const stub = (label: string, value: string) => {
+      page.drawText(label, { x: sx, y: sy, font: regular, size: 7, color: C_GRAY });
+      sy -= 11;
+      let v = value;
+      while (v.length > 0 && regular.widthOfTextAtSize(v, 9) > sw) v = v.slice(0, -1);
+      page.drawText(v, { x: sx, y: sy, font: bold, size: 9, color: C_BLACK });
+      sy -= 18;
+    };
+    if (data.checkNumber != null && String(data.checkNumber).trim() !== '') stub('Check #', String(data.checkNumber));
+    stub('Date', data.date);
+    stub('To', data.payee);
+    stub('Amount', fmtAmount(data.amountNumeric) ?? data.amountNumeric);
+    if (data.memo) stub('Memo', data.memo);
+  }
+
+  if (style === 'voucher' && data.voucher && data.voucher.length > 0) {
     let vy = STUB_Y - 36;
 
     text('VOUCHER', ML, vy, { font: bold, size: 10, color: C_NAVY });
@@ -381,26 +463,24 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
     hRule(vy, ML, MR, 0.5, C_LIGHT);
     vy -= 12;
 
-    let voucherTotal = 0;
+    let voucherTotal = Money.zero();
     for (const line of data.voucher) {
       if (vy < 48) break; // never run off the page
       text(line.account.slice(0, 48), ML, vy, { size: 9, color: C_BLACK });
       if (line.description) {
         text(line.description.slice(0, 40), DESC_X, vy, { size: 9, color: C_GRAY });
       }
-      const amtNum = parseFloat(line.amount);
-      voucherTotal += isNaN(amtNum) ? 0 : amtNum;
-      const amtDisplay = isNaN(amtNum)
-        ? line.amount
-        : amtNum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      text(amtDisplay, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
+      const amtDisplay = fmtAmount(line.amount);
+      if (amtDisplay !== null) voucherTotal = voucherTotal.plus(Money.of(line.amount));
+      const amtDisplayOrRaw = amtDisplay ?? line.amount;
+      text(amtDisplayOrRaw, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
       vy -= 14;
     }
 
     hRule(vy + 6, DESC_X, MR, 0.5, C_LIGHT);
     text('Total', DESC_X, vy - 4, { font: bold, size: 9, color: C_NAVY });
     text(
-      voucherTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      fmtAmount(voucherTotal.toFixed(2)) ?? '0.00',
       AMT_X,
       vy - 4,
       { font: bold, size: 9, color: C_NAVY, rightAlign: true },

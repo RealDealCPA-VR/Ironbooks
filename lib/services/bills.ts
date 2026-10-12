@@ -27,9 +27,12 @@
  * received from item lines, replaces the lines, re-posts the GL (period check on
  * the NEW date), and re-receives stock — all inside one transaction.
  */
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
-import { accounts, bills, billLines, inventoryLayers, items, vendors } from '@/lib/db/schema';
+import { and, asc, desc, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
+import type Decimal from 'decimal.js';
+import { accounts, bills, billLines, inventoryLayers, items, loanPayments, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
+import { discountFor, dueDateFromTerms } from './billTerms';
+import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import {
   type DocumentInventoryLine,
@@ -76,10 +79,62 @@ export interface CreateBillInput {
   vendorId: string;
   billNumber?: string | null;
   date: Date;
+  /** Explicit due date; when omitted it is computed from the terms (bill terms, else vendor terms). */
   dueDate?: Date | null;
+  /** Payment terms ('net_30', '2_10_net_30', …); defaults to the vendor's terms. */
+  terms?: string | null;
   memo?: string | null;
   classId?: string | null;
+  /** Transaction currency (defaults to the vendor's currency; null/home = no conversion). */
+  currency?: string | null;
+  /** Home-currency units per 1 transaction-currency unit (defaults to the currency list rate). */
+  exchangeRate?: string | number | null;
+  /**
+   * QB duplicate vendor reference warning (A4): when true, refuse (CONFLICT, details
+   * { duplicateNumber: true }) a bill number already used on another open bill from the same
+   * vendor. User-facing routes set it unless the user confirmed the duplicate; internal callers
+   * (PO / receipt conversion, recurring) leave it off.
+   */
+  checkDuplicateNumber?: boolean;
   lines: BillLineInput[];
+}
+
+/** Other non-void bills from the same vendor that already use this vendor reference number. */
+export async function findDuplicateBillNumbers(
+  ctx: ServiceContext,
+  params: { vendorId: string; billNumber: string | null | undefined; excludeId?: string },
+) {
+  const num = (params.billNumber ?? '').trim();
+  if (!num) return [];
+  return ctx.db
+    .select({ id: bills.id, date: bills.date, total: bills.total, billNumber: bills.billNumber })
+    .from(bills)
+    .where(
+      and(
+        eq(bills.companyId, ctx.companyId),
+        eq(bills.vendorId, params.vendorId),
+        ne(bills.status, 'void'),
+        sql`lower(trim(${bills.billNumber})) = ${num.toLowerCase()}`,
+        ...(params.excludeId ? [ne(bills.id, params.excludeId)] : []),
+      ),
+    );
+}
+
+async function assertBillNumberAvailable(ctx: ServiceContext, input: CreateBillInput, excludeId?: string) {
+  if (!input.checkDuplicateNumber) return;
+  const matches = await findDuplicateBillNumbers(ctx, {
+    vendorId: input.vendorId,
+    billNumber: input.billNumber,
+    excludeId,
+  });
+  if (matches.length > 0) {
+    const num = (input.billNumber ?? '').trim();
+    throw new ServiceError(
+      'CONFLICT',
+      `This vendor already has a bill with reference number ${num}. Check that this is not the same bill entered twice, or confirm to keep the duplicate.`,
+      { duplicateNumber: true, number: num, matches },
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,8 +187,10 @@ type ResolvedLine = {
   accountId: string;
   description: string | null;
   quantity: string; // 4dp
-  amount: string; // 2dp
-  /** Per-unit cost (4dp Decimal) — only set for inventory item lines. */
+  amount: string; // 2dp, transaction currency
+  /** Home-currency amount posted to the GL (== amount for home-currency bills). */
+  homeAmount: string;
+  /** Per-unit cost in HOME currency (Decimal) — only set for inventory item lines. */
   unitCost: ReturnType<typeof Money.zero> | null;
   isInventory: boolean;
   classId: string | null;
@@ -144,7 +201,14 @@ type ResolvedLine = {
 interface PreparedBill {
   vendor: { id: string; name: string };
   resolvedLines: ResolvedLine[];
+  /** Bill total in the transaction currency. */
   totalStr: string;
+  /** A/P credit in home currency (anchor; == totalStr for home-currency bills). */
+  homeTotalStr: string;
+  currency: string | null;
+  rate: Decimal;
+  terms: string | null;
+  dueDate: Date | null;
   apAccountId: string;
 }
 
@@ -154,11 +218,28 @@ interface PreparedBill {
  */
 async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise<PreparedBill> {
   // --- Validate vendor belongs to this company ---
-  const [vendor] = await ctx.db
-    .select({ id: vendors.id, name: vendors.displayName })
+  const [vendorRow] = await ctx.db
+    .select({
+      id: vendors.id,
+      name: vendors.displayName,
+      terms: vendors.terms,
+      currency: vendors.currency,
+    })
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
-  if (!vendor) throw notFound('Vendor');
+  if (!vendorRow) throw notFound('Vendor');
+  const vendor = { id: vendorRow.id, name: vendorRow.name };
+
+  // --- Currency (vendor's currency by default) ---
+  const fx = await resolveDocumentCurrency(ctx, {
+    currency: input.currency,
+    exchangeRate: input.exchangeRate,
+    vendorCurrency: vendorRow.currency,
+  });
+
+  // --- Terms + due date (explicit due date wins) ---
+  const terms = (input.terms ?? vendorRow.terms ?? null) || null;
+  const dueDate = input.dueDate ?? (terms ? dueDateFromTerms(input.date, terms) : null);
 
   // --- Validate lines ---
   if (!input.lines || input.lines.length === 0) {
@@ -252,6 +333,7 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
         description: line.description ?? item.name,
         quantity: qty.toFixed(4),
         amount: toAmountString(amount),
+        homeAmount: toAmountString(amount),
         unitCost: isInventory ? unitCost : null,
         isInventory,
         classId: line.classId ?? input.classId ?? null,
@@ -273,6 +355,7 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
         description: line.description ?? null,
         quantity: line.quantity != null ? toAmountString(line.quantity) : '1.0000',
         amount: toAmountString(amt),
+        homeAmount: toAmountString(amt),
         unitCost: null,
         isInventory: false,
         classId: line.classId ?? input.classId ?? null,
@@ -283,31 +366,66 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
     }
   }
 
+  // Home-currency amounts: one anchor (round2(total x rate)) penny-allocated across the lines,
+  // so the entry balances exactly. Inventory cost is carried in home currency.
+  const home = homeAmounts(
+    resolvedLines.map((l) => l.amount),
+    fx.rate,
+  );
+  if (fx.currency) {
+    resolvedLines.forEach((l, i) => {
+      if (!home.lines[i].greaterThan(0)) {
+        throw validation(`Line ${i + 1}: the amount is too small to convert to your home currency.`);
+      }
+      l.homeAmount = toAmountString(home.lines[i]);
+      if (l.isInventory) l.unitCost = home.lines[i].dividedBy(Money.of(l.quantity));
+    });
+  }
+
   // Resolve A/P account up front (read-only; no need to hold a tx lock).
   const apAccountId = await resolveApAccount(ctx);
 
-  return { vendor, resolvedLines, totalStr: toAmountString(total), apAccountId };
+  return {
+    vendor,
+    resolvedLines,
+    totalStr: toAmountString(total),
+    homeTotalStr: toAmountString(home.total),
+    currency: fx.currency,
+    rate: fx.rate,
+    terms,
+    dueDate,
+    apAccountId,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Stock subledger helpers (the GL side lives on the bill's own journal entry)
 // ---------------------------------------------------------------------------
 
+/** One purchased inventory line for the stock subledger (unit cost in HOME currency). */
+export interface PurchasedStockLine {
+  itemId: string | null;
+  isInventory: boolean;
+  quantity: string | number;
+  unitCost: ReturnType<typeof Money.zero> | null;
+}
+
 /**
- * Receive stock for inventory item lines (same transaction as the bill posting).
- * The bill's journal entry already debited the inventory asset account, so this
- * step only moves the quantity/cost subledger:
- *   FIFO-tracked items  → new cost layer at the line's unit cost.
- *   average-cost items  → weighted-average cost update.
+ * Receive stock for purchased inventory item lines (same transaction as the document's posting).
+ * Shared by bills and by checks / credit-card charges with an Items tab. The document's own
+ * journal entry already debited the inventory asset account, so this step only moves the
+ * quantity/cost subledger:
+ *   FIFO-tracked items  -> new cost layer at the line's unit cost (layer sourceRef = `sourceRef`).
+ *   average-cost items  -> weighted-average cost update.
  */
-async function receiveResolvedStock(
+export async function receivePurchasedStock(
   tx: ServiceContext,
-  billId: string,
+  sourceRef: string,
   date: Date,
-  resolvedLines: ResolvedLine[],
+  lines: PurchasedStockLine[],
   reason: string,
 ) {
-  for (const line of resolvedLines) {
+  for (const line of lines) {
     if (!line.isInventory || !line.itemId || !line.unitCost) continue;
 
     // Reload inside the tx so multiple lines for the same item compound correctly.
@@ -328,7 +446,7 @@ async function receiveResolvedStock(
         date,
         quantityRemaining: qty.toFixed(4),
         unitCost: line.unitCost.toFixed(4),
-        sourceRef: `bill:${billId}`,
+        sourceRef,
       });
       await tx.db
         .update(items)
@@ -360,24 +478,30 @@ async function receiveResolvedStock(
       newValues: {
         quantityOnHand: newQty.toFixed(4),
         unitCost: line.unitCost.toFixed(4),
-        reason: `${reason}:${billId}`,
+        reason,
       },
     });
   }
 }
 
-/**
- * Reverse any stock received via the bill's inventory item lines (as currently
- * saved in bill_lines). The matching GL reversal must already have happened via
- * voidJournalEntry; this step pulls the quantity/cost back out of the subledger.
- */
-async function reverseReceivedStock(tx: ServiceContext, billId: string, reason: string) {
-  const lines = await tx.db
-    .select()
-    .from(billLines)
-    .where(eq(billLines.billId, billId))
-    .orderBy(asc(billLines.lineOrder));
+/** A previously received line to pull back out (HOME-currency line amount). */
+export interface ReceivedStockLine {
+  itemId: string | null;
+  quantity: string | number;
+  homeAmount: string | number | Decimal;
+}
 
+/**
+ * Reverse stock received by purchased item lines. The matching GL reversal must already have
+ * happened via voidJournalEntry; this step pulls the quantity/cost back out of the subledger.
+ * `docLabel` is used in the plain-language error ("this bill's", "this check's").
+ */
+export async function reversePurchasedStock(
+  tx: ServiceContext,
+  lines: ReceivedStockLine[],
+  reason: string,
+  docLabel = "this bill's",
+) {
   for (const line of lines) {
     if (!line.itemId) continue;
     const [item] = await tx.db
@@ -388,21 +512,20 @@ async function reverseReceivedStock(tx: ServiceContext, billId: string, reason: 
 
     const qty = Money.of(line.quantity);
     if (qty.lessThanOrEqualTo(0)) continue;
-    const unitCost = Money.of(line.amount).dividedBy(qty);
+    const unitCost = Money.of(line.homeAmount).dividedBy(qty);
 
     const currentQty = Money.of(item.quantityOnHand ?? '0');
     if (currentQty.lessThan(qty)) {
       throw new ServiceError(
         'CONFLICT',
-        `Cannot reverse this bill's receipt: only ${currentQty.toFixed(4)} of "${item.name}" remain on hand (the received stock has already been consumed).`,
+        `Cannot reverse ${docLabel} receipt: only ${currentQty.toFixed(4)} of "${item.name}" remain on hand (the received stock has already been consumed).`,
       );
     }
     const newQty = currentQty.minus(qty);
 
     if (await isFifoTracked(tx, line.itemId)) {
-      // Remove the received quantity from layers — prefer layers at this bill's
-      // unit cost (the ones this bill created), newest first, then fall back to
-      // FIFO (oldest-first) for any remainder.
+      // Remove the received quantity from layers — prefer layers at this document's unit cost
+      // (the ones it created), newest first, then fall back to FIFO (oldest-first).
       const layers = await tx.db
         .select()
         .from(inventoryLayers)
@@ -434,7 +557,7 @@ async function reverseReceivedStock(tx: ServiceContext, billId: string, reason: 
       if (remaining.greaterThan(0)) {
         throw new ServiceError(
           'CONFLICT',
-          `Cannot reverse this bill's receipt: FIFO layers for "${item.name}" no longer hold the received quantity.`,
+          `Cannot reverse ${docLabel} receipt: FIFO layers for "${item.name}" no longer hold the received quantity.`,
         );
       }
       await tx.db
@@ -470,10 +593,46 @@ async function reverseReceivedStock(tx: ServiceContext, billId: string, reason: 
       },
       newValues: {
         quantityOnHand: newQty.toFixed(4),
-        reason: `${reason}:${billId}`,
+        reason,
       },
     });
   }
+}
+
+/** Receive stock for a bill's resolved inventory lines. */
+async function receiveResolvedStock(
+  tx: ServiceContext,
+  billId: string,
+  date: Date,
+  resolvedLines: ResolvedLine[],
+  reason: string,
+) {
+  await receivePurchasedStock(tx, `bill:${billId}`, date, resolvedLines, `${reason}:${billId}`);
+}
+
+/**
+ * Reverse any stock received via the bill's inventory item lines (as currently saved in
+ * bill_lines), at the HOME-currency cost they were received at.
+ */
+async function reverseReceivedStock(tx: ServiceContext, billId: string, reason: string) {
+  const [bill] = await tx.db
+    .select({ exchangeRate: bills.exchangeRate, currency: bills.currency })
+    .from(bills)
+    .where(eq(bills.id, billId));
+  const lines = await tx.db
+    .select()
+    .from(billLines)
+    .where(eq(billLines.billId, billId))
+    .orderBy(asc(billLines.lineOrder));
+  const home = homeAmounts(
+    lines.map((l) => l.amount),
+    bill?.currency ? (bill.exchangeRate ?? 1) : 1,
+  );
+  await reversePurchasedStock(
+    tx,
+    lines.map((l, i) => ({ itemId: l.itemId, quantity: l.quantity, homeAmount: home.lines[i] })),
+    `${reason}:${billId}`,
+  );
 }
 
 /** Advanced Inventory lines (site/bin/serial/lot) for a bill — lineOrder = input index. */
@@ -499,14 +658,14 @@ function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId
     // Debit lines (one per bill line)
     ...prep.resolvedLines.map((line) => ({
       accountId: line.accountId,
-      debit: line.amount,
+      debit: line.homeAmount,
       memo: line.description,
       classId: line.classId,
     })),
-    // Credit line — Accounts Payable
+    // Credit line — Accounts Payable (home currency)
     {
       accountId: prep.apAccountId,
-      credit: prep.totalStr,
+      credit: prep.homeTotalStr,
       memo: `Bill ${billNumber ?? billId} — ${prep.vendor.name}`,
       controlLine: true,
     },
@@ -520,6 +679,7 @@ function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId
 export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
   const prep = await prepareBill(ctx, input);
   const { resolvedLines, totalStr } = prep;
+  await assertBillNumberAvailable(ctx, input);
 
   return inTransaction(ctx, async (tx) => {
     // --- Insert the bill header ---
@@ -530,10 +690,13 @@ export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
         vendorId: input.vendorId,
         billNumber: input.billNumber ?? null,
         date: input.date,
-        dueDate: input.dueDate ?? null,
+        dueDate: prep.dueDate,
+        terms: prep.terms,
         memo: input.memo ?? null,
         status: 'open',
         classId: input.classId ?? null,
+        currency: prep.currency,
+        exchangeRate: prep.currency ? prep.rate.toFixed(8) : null,
         total: totalStr,
         amountPaid: '0.00',
         amountCredited: '0.00',
@@ -614,6 +777,21 @@ export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
  *   4. Re-post the GL entry and re-receive stock from the new lines.
  *   5. Audit trail records old and new values.
  */
+/** A bill written by the Loan Manager "Set up payment" (its split must stay in step with the loan). */
+async function assertNotLoanBill(ctx: ServiceContext, billId: string) {
+  const [link] = await ctx.db
+    .select({ id: loanPayments.id })
+    .from(loanPayments)
+    .where(and(eq(loanPayments.companyId, ctx.companyId), eq(loanPayments.billId, billId)))
+    .limit(1);
+  if (link) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This bill is a Loan Manager payment. To change it, void it and set up the loan payment again.',
+    );
+  }
+}
+
 export async function updateBill(ctx: ServiceContext, id: string, input: CreateBillInput) {
   // Pre-check outside the transaction for a fast, friendly error.
   const [existing] = await ctx.db
@@ -636,6 +814,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
       'Cannot edit a bill that has vendor credits applied. Unapply vendor credits first.',
     );
   }
+  await assertNotLoanBill(ctx, id);
   if (await billHasReceiptLinks(ctx, id)) {
     throw new ServiceError(
       'CONFLICT',
@@ -645,6 +824,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
 
   // Validate + resolve the new document (read-only).
   const prep = await prepareBill(ctx, input);
+  await assertBillNumberAvailable(ctx, input, id);
 
   return inTransaction(ctx, async (tx) => {
     // Re-load inside the transaction to close the read-then-write race.
@@ -722,9 +902,12 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
         vendorId: input.vendorId,
         billNumber: input.billNumber ?? null,
         date: input.date,
-        dueDate: input.dueDate ?? null,
+        dueDate: prep.dueDate,
+        terms: prep.terms,
         memo: input.memo ?? null,
         classId: input.classId ?? null,
+        currency: prep.currency,
+        exchangeRate: prep.currency ? prep.rate.toFixed(8) : null,
         status: 'open',
         total: prep.totalStr,
         amountPaid: '0.00',
@@ -773,7 +956,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
         vendorId: input.vendorId,
         billNumber: input.billNumber ?? null,
         date: input.date,
-        dueDate: input.dueDate ?? null,
+        dueDate: prep.dueDate,
         memo: input.memo ?? null,
         total: prep.totalStr,
         postedEntryId: entry.id,
@@ -808,6 +991,99 @@ export async function listBills(
     .from(bills)
     .where(and(...conditions))
     .orderBy(desc(bills.date), asc(bills.createdAt));
+}
+
+// ---------------------------------------------------------------------------
+// listBillsToPay — Pay Bills screen (due-date + discount filters, D5)
+// ---------------------------------------------------------------------------
+
+export interface BillToPay {
+  id: string;
+  vendorId: string;
+  vendorName: string | null;
+  billNumber: string | null;
+  date: Date;
+  dueDate: Date | null;
+  terms: string | null;
+  total: string;
+  amountPaid: string;
+  amountCredited: string;
+  balanceDue: string;
+  status: string;
+  currency: string | null;
+  exchangeRate: string | null;
+  /** Last day of the early-payment discount window (null when the terms have none). */
+  discountDate: Date | null;
+  discountPercent: number;
+  /** Suggested discount on the open balance when paid on `asOf` ('0.00' when none). */
+  suggestedDiscount: string;
+  discountAvailable: boolean;
+  overdue: boolean;
+}
+
+/**
+ * Open bills for Pay Bills (QB "Show bills: due on or before … / show all bills" plus the
+ * "discount available" filter). The due date falls back to the terms when none was stored.
+ */
+export async function listBillsToPay(
+  ctx: ServiceContext,
+  opts?: {
+    vendorId?: string;
+    /** Only bills due on/before this date (bills with no due date are kept). */
+    dueOnOrBefore?: Date;
+    /** Only bills whose early-payment discount is still available on `asOf`. */
+    discountAvailableOnly?: boolean;
+    /** Payment date used for the discount suggestion (default: today). */
+    asOf?: Date;
+  },
+): Promise<BillToPay[]> {
+  const conditions = [
+    eq(bills.companyId, ctx.companyId),
+    notInArray(bills.status, ['void', 'paid', 'draft'] as never[]),
+    sql`${bills.balanceDue} > 0`,
+  ];
+  if (opts?.vendorId) conditions.push(eq(bills.vendorId, opts.vendorId));
+  const rows = await ctx.db
+    .select({ bill: bills, vendorName: vendors.displayName, vendorTerms: vendors.terms })
+    .from(bills)
+    .leftJoin(vendors, eq(bills.vendorId, vendors.id))
+    .where(and(...conditions))
+    .orderBy(asc(bills.dueDate), asc(bills.date));
+
+  const asOf = opts?.asOf ?? new Date();
+  const todayKey = asOf.toISOString().slice(0, 10);
+  const out: BillToPay[] = [];
+  for (const { bill, vendorName, vendorTerms } of rows) {
+    const terms = bill.terms ?? vendorTerms ?? null;
+    const dueDate = bill.dueDate ?? (terms ? dueDateFromTerms(bill.date, terms) : null);
+    if (opts?.dueOnOrBefore && dueDate) {
+      if (dueDate.toISOString().slice(0, 10) > opts.dueOnOrBefore.toISOString().slice(0, 10)) continue;
+    }
+    const d = discountFor({ date: bill.date, terms, balanceDue: bill.balanceDue, total: bill.total }, asOf);
+    if (opts?.discountAvailableOnly && !(d.available && Money.gt(d.suggestedDiscount, 0))) continue;
+    out.push({
+      id: bill.id,
+      vendorId: bill.vendorId,
+      vendorName: vendorName ?? null,
+      billNumber: bill.billNumber,
+      date: bill.date,
+      dueDate,
+      terms,
+      total: bill.total,
+      amountPaid: bill.amountPaid,
+      amountCredited: bill.amountCredited,
+      balanceDue: bill.balanceDue,
+      status: bill.status,
+      currency: bill.currency ?? null,
+      exchangeRate: bill.exchangeRate ?? null,
+      discountDate: d.discountDate,
+      discountPercent: d.discountPercent,
+      suggestedDiscount: d.suggestedDiscount,
+      discountAvailable: d.available && Money.gt(d.suggestedDiscount, 0),
+      overdue: dueDate ? dueDate.toISOString().slice(0, 10) < todayKey : false,
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

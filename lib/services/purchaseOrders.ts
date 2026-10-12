@@ -21,8 +21,8 @@
  *   UPDATE on quantityBilled inside the transaction. convertedBillId is stamped
  *   with the bill that completes (closes) the PO.
  */
-import { and, asc, desc, eq, sql } from 'drizzle-orm';
-import { purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
+import { accounts, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { createBill } from '@/lib/services/bills';
 import {
@@ -76,6 +76,29 @@ export interface CreatePurchaseOrderInput {
 // createPurchaseOrder
 // ---------------------------------------------------------------------------
 
+/** Every account / item referenced by PO lines must belong to the current company. */
+async function assertPoLineRefsOwned(
+  ctx: ServiceContext,
+  lines: ReadonlyArray<{ accountId?: string | null; itemId?: string | null }>,
+) {
+  const acctIds = [...new Set(lines.map((l) => l.accountId).filter((x): x is string => !!x))];
+  const itemIds = [...new Set(lines.map((l) => l.itemId).filter((x): x is string => !!x))];
+  if (acctIds.length) {
+    const found = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(inArray(accounts.id, acctIds), eq(accounts.companyId, ctx.companyId)));
+    if (found.length !== acctIds.length) throw validation('One of the lines uses an account that does not exist in this company.');
+  }
+  if (itemIds.length) {
+    const found = await ctx.db
+      .select({ id: items.id })
+      .from(items)
+      .where(and(inArray(items.id, itemIds), eq(items.companyId, ctx.companyId)));
+    if (found.length !== itemIds.length) throw validation('One of the lines uses an item that does not exist in this company.');
+  }
+}
+
 export async function createPurchaseOrder(
   ctx: ServiceContext,
   input: CreatePurchaseOrderInput,
@@ -90,6 +113,7 @@ export async function createPurchaseOrder(
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
+  await assertPoLineRefsOwned(ctx, input.lines);
 
   // Compute per-line amounts using safe decimal math.
   type ComputedLine = {
@@ -212,6 +236,169 @@ export async function getPurchaseOrder(ctx: ServiceContext, id: string) {
     .orderBy(asc(purchaseOrderLines.lineOrder));
 
   return { ...po, lines };
+}
+
+// ---------------------------------------------------------------------------
+// updatePurchaseOrder — edit a saved PO (D1). POs do not post to the GL.
+// ---------------------------------------------------------------------------
+
+export interface UpdatePurchaseOrderLineInput extends PurchaseOrderLineInput {
+  /** Existing line id (omit for a new line). */
+  id?: string | null;
+}
+
+export interface UpdatePurchaseOrderInput extends Omit<CreatePurchaseOrderInput, 'lines'> {
+  lines: UpdatePurchaseOrderLineInput[];
+}
+
+/**
+ * Edit an open or partly received/billed purchase order (QB lets you edit a PO until it is
+ * closed). Lines that were already (partly) received or billed must stay on the PO with the same
+ * item/account and a quantity no smaller than what was received/billed; untouched lines may be
+ * removed and new lines added. The PO status is recomputed from the line quantities.
+ */
+export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input: UpdatePurchaseOrderInput) {
+  if (!input.lines || input.lines.length === 0) {
+    throw validation('A purchase order must have at least one line.');
+  }
+  const [vendor] = await ctx.db
+    .select({ id: vendors.id })
+    .from(vendors)
+    .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
+  if (!vendor) throw notFound('Vendor');
+  await assertPoLineRefsOwned(ctx, input.lines);
+
+  return inTransaction(ctx, async (tx) => {
+    const [po] = await tx.db
+      .select()
+      .from(purchaseOrders)
+      .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.companyId, tx.companyId)));
+    if (!po) throw notFound('Purchase order');
+    if (po.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided purchase order.');
+    if (po.status === 'closed') {
+      throw new ServiceError('CONFLICT', 'This purchase order is closed. Closed purchase orders cannot be edited.');
+    }
+    const oldLines = await tx.db
+      .select()
+      .from(purchaseOrderLines)
+      .where(eq(purchaseOrderLines.purchaseOrderId, id))
+      .orderBy(asc(purchaseOrderLines.lineOrder));
+    const oldById = new Map(oldLines.map((l) => [l.id, l]));
+    const used = (l: (typeof oldLines)[number]) => Money.of(l.quantityBilled ?? '0').greaterThan(0);
+    if (po.vendorId !== input.vendorId && oldLines.some(used)) {
+      throw new ServiceError('CONFLICT', 'Items on this purchase order were already received or billed, so the vendor cannot change.');
+    }
+
+    // Validate + compute each line.
+    let total = Money.zero();
+    const keepIds = new Set<string>();
+    const computed = input.lines.map((l, i) => {
+      const qty = Money.of(l.quantity);
+      const rate = Money.of(l.rate);
+      if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
+      if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
+      if (!l.accountId && !l.itemId) throw validation(`Line ${i + 1}: select an account or an item.`);
+      const prev = l.id ? oldById.get(l.id) : undefined;
+      if (l.id && !prev) throw notFound(`Purchase order line ${l.id}`);
+      if (prev) {
+        keepIds.add(prev.id);
+        if (used(prev)) {
+          if ((prev.itemId ?? null) !== (l.itemId ?? null) || (prev.accountId ?? null) !== (l.accountId ?? null)) {
+            throw validation(`Line ${i + 1}: this line was already received or billed — its item/account can't change.`);
+          }
+          if (qty.lessThan(Money.of(prev.quantityBilled))) {
+            throw validation(
+              `Line ${i + 1}: quantity can't be less than the ${Money.of(prev.quantityBilled).toFixed(2)} already received or billed.`,
+            );
+          }
+        }
+      }
+      const amount = Money.round2(Money.mul(qty, rate));
+      total = total.plus(amount);
+      return {
+        id: prev?.id ?? null,
+        itemId: l.itemId ?? null,
+        accountId: l.accountId ?? null,
+        description: l.description ?? null,
+        quantity: toAmountString(qty),
+        rate: toAmountString(rate),
+        amount: toAmountString(amount),
+        lineOrder: i,
+      };
+    });
+    for (const l of oldLines) {
+      if (!keepIds.has(l.id) && used(l)) {
+        throw validation('A line that was already received or billed cannot be removed from the purchase order.');
+      }
+    }
+
+    // Apply: delete removed lines, update kept ones, insert new ones.
+    for (const l of oldLines) {
+      if (!keepIds.has(l.id)) await tx.db.delete(purchaseOrderLines).where(eq(purchaseOrderLines.id, l.id));
+    }
+    for (const c of computed) {
+      const values = {
+        itemId: c.itemId,
+        accountId: c.accountId,
+        description: c.description,
+        quantity: c.quantity,
+        rate: c.rate,
+        amount: c.amount,
+        lineOrder: c.lineOrder,
+      };
+      if (c.id) {
+        await tx.db.update(purchaseOrderLines).set(values).where(eq(purchaseOrderLines.id, c.id));
+      } else {
+        await tx.db.insert(purchaseOrderLines).values({ purchaseOrderId: id, ...values });
+      }
+    }
+
+    const newLines = await tx.db
+      .select()
+      .from(purchaseOrderLines)
+      .where(eq(purchaseOrderLines.purchaseOrderId, id))
+      .orderBy(asc(purchaseOrderLines.lineOrder));
+    const { enhancedReceiving } = await getReceivingSettings(tx);
+    const status = poStatusFromLines(newLines, enhancedReceiving);
+
+    const [updated] = await tx.db
+      .update(purchaseOrders)
+      .set({
+        vendorId: input.vendorId,
+        date: input.date,
+        expectedDate: input.expectedDate ?? null,
+        memo: input.memo ?? null,
+        total: toAmountString(total),
+        status,
+      })
+      .where(eq(purchaseOrders.id, id))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'purchase_order',
+      entityId: id,
+      oldValues: {
+        vendorId: po.vendorId,
+        date: po.date,
+        expectedDate: po.expectedDate,
+        memo: po.memo,
+        total: po.total,
+        status: po.status,
+        lines: oldLines.map((l) => ({ id: l.id, itemId: l.itemId, accountId: l.accountId, quantity: l.quantity, rate: l.rate })),
+      },
+      newValues: {
+        vendorId: input.vendorId,
+        date: input.date,
+        expectedDate: input.expectedDate ?? null,
+        memo: input.memo ?? null,
+        total: toAmountString(total),
+        status,
+        lines: computed,
+      },
+    });
+    return { ...updated, lines: newLines };
+  });
 }
 
 // ---------------------------------------------------------------------------

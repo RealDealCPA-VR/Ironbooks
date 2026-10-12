@@ -382,6 +382,30 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
  * payments); bills dated after the cutoff are excluded; unapplied vendor credits
  * dated on/before the cutoff appear as negative 'current' amounts.
  */
+// ---------------------------------------------------------------------------
+// J10 (wave2 purchases): home-currency open balance of a foreign-currency bill
+// ---------------------------------------------------------------------------
+
+/** Home A/P relieved per bill by bill-payment applications dated on/before `upTo`. */
+async function billPaymentHomeAppliedByBill(ctx: ServiceContext, upTo: Date): Promise<Map<string, string>> {
+  const appRows = await ctx.db
+    .select({
+      billId: billPaymentApplications.billId,
+      applied: sql<string>`COALESCE(SUM(CAST(COALESCE(${billPaymentApplications.amountHome}, ${billPaymentApplications.amountApplied}) AS NUMERIC)), 0)`,
+    })
+    .from(billPaymentApplications)
+    .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
+    .where(and(eq(billPayments.companyId, ctx.companyId), lte(billPayments.date, upTo)))
+    .groupBy(billPaymentApplications.billId);
+  return new Map(appRows.map((r) => [r.billId, r.applied]));
+}
+
+/** Home open balance = round2(total x rate) - home A/P already relieved (same anchor billPayments uses). */
+function billHomeOpen(row: { total: string; exchangeRate: string | null }, homeApplied: string | undefined) {
+  const anchor = Money.round2(Money.of(row.total).times(Money.of(row.exchangeRate ?? 1)));
+  return Money.round2(anchor.minus(Money.of(homeApplied ?? '0')));
+}
+
 export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
   const cutoff = asOf ?? new Date();
 
@@ -395,6 +419,8 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       amountCredited: bills.amountCredited,
       dueDate: bills.dueDate,
       date: bills.date,
+      currency: bills.currency,
+      exchangeRate: bills.exchangeRate,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
@@ -426,6 +452,7 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     billPaymentAppliedByBill(cutoff),
     billPaymentAppliedByBill(),
   ]);
+  const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const byVendor = new Map<string, { name: string; buckets: BucketAccum }>();
 
@@ -439,8 +466,11 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .minus(cashAllTime);
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    const amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
+    let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
+    // J10 (wave2 purchases): age foreign bills at their HOME open balance so the report ties to
+    // the A/P control account: round2(total x bill rate) minus the home A/P each payment relieved.
+    if (row.currency) amount = billHomeOpen(row, homeAppliedAsOf.get(row.billId));
 
     const effectiveDue = row.dueDate ?? row.date;
     const daysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
@@ -1053,6 +1083,8 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       amountCredited: bills.amountCredited,
       dueDate: bills.dueDate,
       date: bills.date,
+      currency: bills.currency,
+      exchangeRate: bills.exchangeRate,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
@@ -1077,6 +1109,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     billPaymentAppliedByBill(cutoff),
     billPaymentAppliedByBill(),
   ]);
+  const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
@@ -1087,8 +1120,11 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .minus(cashAllTime);
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    const amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
+    let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
+    // J10 (wave2 purchases): age foreign bills at their HOME open balance so the report ties to
+    // the A/P control account: round2(total x bill rate) minus the home A/P each payment relieved.
+    if (row.currency) amount = billHomeOpen(row, homeAppliedAsOf.get(row.billId));
 
     const effectiveDue = row.dueDate ?? row.date;
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());

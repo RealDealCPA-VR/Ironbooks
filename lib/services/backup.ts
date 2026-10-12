@@ -32,6 +32,8 @@ import {
   landedCostAllocationLines, landedCostAllocations, pendingBuilds,
   // wave2 sales
   bouncedChecks, collectionNotes, creditApplications,
+  // wave2 purchases
+  checkPrintSettings, loanPayments, loans,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
@@ -560,6 +562,10 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'creditApplications', table: creditApplications, joins: [], companyCol: creditApplications.companyId },
   { name: 'bouncedChecks', table: bouncedChecks, joins: [], companyCol: bouncedChecks.companyId },
   { name: 'collectionNotes', table: collectionNotes, joins: [], companyCol: collectionNotes.companyId },
+  // ---- wave2 purchases: Loan Manager + check printer setup (after vendors/accounts/expenses/bills) ----
+  { name: 'loans', table: loans, joins: [], companyCol: loans.companyId },
+  { name: 'loanPayments', table: loanPayments, joins: [], companyCol: loanPayments.companyId },
+  { name: 'checkPrintSettings', table: checkPrintSettings, joins: [], companyCol: checkPrintSettings.companyId },
 ];
 
 /**
@@ -728,6 +734,12 @@ function reviveRow(
     if (v !== null) {
       if (col.dataType === 'date' && typeof v === 'string') {
         v = new Date(v);
+      } else if (key === 'prefillAccountIds' && Array.isArray(v)) {
+        // wave2 purchases: vendor pre-fill accounts are ids inside jsonb — remap, drop unknowns.
+        const mapped = (v as unknown[]).flatMap((id) =>
+          typeof id === 'string' && idMap.has(id) ? [idMap.get(id)!] : [],
+        );
+        v = mapped.length > 0 ? mapped : null;
       } else if (col.columnType === 'PgUUID' && typeof v === 'string') {
         if (key === 'companyId') v = newCompanyId;
         else if (USER_REF_KEYS.has(key)) v = ownerId;

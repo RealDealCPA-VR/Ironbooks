@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { ArrowLeftRight, Plus } from 'lucide-react';
+import { ArrowLeftRight, Pencil, Plus, Trash2 } from 'lucide-react';
 import {
   Button,
   Card,
@@ -15,6 +15,8 @@ import {
   Td,
   Tr,
   Modal,
+  Badge,
+  ConfirmDialog,
   PageHeader,
   toast, toastError,
 } from '@/components/ui';
@@ -41,6 +43,7 @@ interface Transfer {
   amount: string;
   memo: string | null;
   postedEntryId: string | null;
+  voidedAt?: string | null;
   createdAt: string;
 }
 
@@ -53,9 +56,11 @@ interface NewTransferModalProps {
   onClose: () => void;
   accounts: Account[];
   onCreated: () => void;
+  /** When set, the modal edits this saved transfer (PATCH) instead of creating one. */
+  editing?: Transfer | null;
 }
 
-function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferModalProps) {
+function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTransferModalProps) {
   const [fromAccountId, setFromAccountId] = useState('');
   const [toAccountId, setToAccountId] = useState('');
   const [amount, setAmount] = useState('');
@@ -66,13 +71,13 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
   // Reset form when modal opens.
   useEffect(() => {
     if (open) {
-      setFromAccountId('');
-      setToAccountId('');
-      setAmount('');
-      setDate(new Date().toISOString().slice(0, 10));
-      setMemo('');
+      setFromAccountId(editing?.fromAccountId ?? '');
+      setToAccountId(editing?.toAccountId ?? '');
+      setAmount(editing?.amount ?? '');
+      setDate(editing ? editing.date.slice(0, 10) : new Date().toISOString().slice(0, 10));
+      setMemo(editing?.memo ?? '');
     }
-  }, [open]);
+  }, [open, editing]);
 
   async function handleSubmit() {
     if (!fromAccountId) { toast('Please select a From account.', 'danger'); return; }
@@ -83,14 +88,14 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
 
     setSaving(true);
     try {
-      await api.post('/api/transfers', {
-        fromAccountId,
-        toAccountId,
-        amount,
-        date,
-        memo: memo || null,
-      });
-      toast('Transfer recorded.', 'success');
+      const body = { fromAccountId, toAccountId, amount, date, memo: memo || null };
+      if (editing) {
+        await api.patch(`/api/transfers/${editing.id}`, body);
+        toast('Transfer updated.', 'success');
+      } else {
+        await api.post('/api/transfers', body);
+        toast('Transfer recorded.', 'success');
+      }
       onCreated();
       onClose();
     } catch (err: unknown) {
@@ -104,12 +109,12 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
     <Modal
       open={open}
       onClose={onClose}
-      title="New Transfer"
+      title={editing ? 'Edit Transfer' : 'New Transfer'}
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
-            Record Transfer
+            {editing ? 'Save Changes' : 'Record Transfer'}
           </Button>
         </>
       }
@@ -199,6 +204,23 @@ export default function TransfersPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
+  const [editing, setEditing] = useState<Transfer | null>(null);
+  const [pendingVoid, setPendingVoid] = useState<Transfer | null>(null);
+  const [voiding, setVoiding] = useState(false);
+
+  async function handleVoid(tr: Transfer) {
+    setVoiding(true);
+    try {
+      await api.del(`/api/transfers/${tr.id}`);
+      toast('Transfer voided.', 'success');
+      setPendingVoid(null);
+      await fetchData();
+    } catch (err: unknown) {
+      toastError(err, 'Failed to void transfer.');
+    } finally {
+      setVoiding(false);
+    }
+  }
 
   // Build id -> display name map for rendering.
   const accountMap = Object.fromEntries(
@@ -231,7 +253,7 @@ export default function TransfersPage() {
         title="Transfers"
         icon={ArrowLeftRight}
         action={
-          <Button onClick={() => setShowNew(true)}>
+          <Button onClick={() => { setEditing(null); setShowNew(true); }}>
             <Plus className="h-4 w-4" /> New Transfer
           </Button>
         }
@@ -262,6 +284,7 @@ export default function TransfersPage() {
                 <Th>To</Th>
                 <Th numeric>Amount</Th>
                 <Th>Memo</Th>
+                <Th className="text-right">Actions</Th>
               </Tr>
             </thead>
             <tbody>
@@ -278,6 +301,29 @@ export default function TransfersPage() {
                     {formatCurrency(tr.amount)}
                   </Td>
                   <Td className="text-navy/50 text-sm">{tr.memo ?? '—'}</Td>
+                  <Td className="text-right whitespace-nowrap">
+                    {tr.voidedAt ? (
+                      <Badge tone="danger">Void</Badge>
+                    ) : (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => { setEditing(tr); setShowNew(true); }}
+                        >
+                          <Pencil className="h-4 w-4" /> Edit
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-red-500 hover:text-red-700 hover:bg-red-50"
+                          onClick={() => setPendingVoid(tr)}
+                        >
+                          <Trash2 className="h-4 w-4" /> Void
+                        </Button>
+                      </>
+                    )}
+                  </Td>
                 </Tr>
               ))}
             </tbody>
@@ -295,7 +341,10 @@ export default function TransfersPage() {
             Total moved:{' '}
             <span className="font-semibold text-navy/70">
               {formatCurrency(
-                transfers.reduce((s, t) => s + Number(t.amount), 0).toFixed(2),
+                transfers
+                  .filter((t) => !t.voidedAt)
+                  .reduce((s, t) => s + Number(t.amount), 0)
+                  .toFixed(2),
               )}
             </span>
           </span>
@@ -304,9 +353,21 @@ export default function TransfersPage() {
 
       <NewTransferModal
         open={showNew}
-        onClose={() => setShowNew(false)}
+        onClose={() => { setShowNew(false); setEditing(null); }}
         accounts={accounts}
         onCreated={fetchData}
+        editing={editing}
+      />
+
+      <ConfirmDialog
+        open={!!pendingVoid}
+        title="Void transfer?"
+        message={`Void this ${formatCurrency(pendingVoid?.amount ?? '0')} transfer? Both account balances go back to how they were before it.`}
+        confirmLabel="Void"
+        tone="danger"
+        loading={voiding}
+        onConfirm={() => pendingVoid && handleVoid(pendingVoid)}
+        onClose={() => setPendingVoid(null)}
       />
     </main>
   );
