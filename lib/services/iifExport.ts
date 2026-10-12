@@ -13,7 +13,7 @@
  * Sensitive data: SSNs and vendor tax IDs are written only when the user may see them in full
  * (Users & Roles "sensitive payroll data"); otherwise the column is left blank, never masked.
  */
-import { and, asc, eq, gte, lte } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, lte } from 'drizzle-orm';
 import {
   accounts,
   assemblyComponents,
@@ -24,7 +24,11 @@ import {
   items,
   journalEntries,
   journalEntryLines,
+  otherNames,
+  paymentTerms,
+  priceLevels,
   salesReps,
+  salesTaxCodes,
   taxRates,
   vendorTypes,
   vendors,
@@ -32,6 +36,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, validation } from './_base';
 import { taxIdFor } from './access';
+import { exportOtherListSections } from './qbIifLists';
 
 // ---------------------------------------------------------------------------
 // Low-level writer
@@ -160,9 +165,14 @@ const CONTACT_FIELDS: Record<string, string> = {
 // Lists
 // ---------------------------------------------------------------------------
 
-export type IifListName = 'accounts' | 'classes' | 'customers' | 'vendors' | 'items' | 'employees' | 'types' | 'reps';
+export type IifListName = 'accounts' | 'classes' | 'customers' | 'vendors' | 'items' | 'employees' | 'types' | 'reps' | 'other_lists';
 
-export const IIF_EXPORT_LISTS: IifListName[] = ['accounts', 'classes', 'types', 'reps', 'customers', 'vendors', 'items', 'employees'];
+/**
+ * 'other_lists' = TERMS, OTHERNAME, SHIPMETH, PAYMETH, CUSTMSG, SALESTAXCODE, JOBTYPE, VEH,
+ * PRICELEVEL and TODO (lib/services/qbIifLists.ts). Written before customers / vendors so a
+ * re-import links their terms, tax codes and price levels.
+ */
+export const IIF_EXPORT_LISTS: IifListName[] = ['accounts', 'classes', 'types', 'reps', 'other_lists', 'customers', 'vendors', 'items', 'employees'];
 
 /** Build an IIF document with the requested lists (default: all). */
 export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] = IIF_EXPORT_LISTS): Promise<string> {
@@ -222,6 +232,26 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
     );
   }
 
+  if (want.has('other_lists')) {
+    for (const sec of await exportOtherListSections(ctx)) w.section(sec.name, sec.cols, sec.rows);
+  }
+  // Terms / sales tax code / price level names for the CUST and VEND rows.
+  const termRows = await ctx.db
+    .select({ id: paymentTerms.id, name: paymentTerms.name })
+    .from(paymentTerms)
+    .where(eq(paymentTerms.companyId, ctx.companyId));
+  const termName = new Map(termRows.map((r) => [r.id, r.name]));
+  const codeRows = await ctx.db
+    .select({ id: salesTaxCodes.id, code: salesTaxCodes.code })
+    .from(salesTaxCodes)
+    .where(eq(salesTaxCodes.companyId, ctx.companyId));
+  const codeName = new Map(codeRows.map((r) => [r.id, r.code]));
+  const levelRows = await ctx.db
+    .select({ id: priceLevels.id, name: priceLevels.name })
+    .from(priceLevels)
+    .where(eq(priceLevels.companyId, ctx.companyId));
+  const levelName = new Map(levelRows.map((r) => [r.id, r.name]));
+
   // Custom-field labels shared by customers and vendors (CUSTNAMEDICT), max 15 like QB.
   const custRows = want.has('customers')
     ? await ctx.db.select().from(customers).where(eq(customers.companyId, ctx.companyId))
@@ -280,7 +310,7 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
       [
         'NAME', 'COMPANYNAME', 'BADDR1', 'BADDR2', 'BADDR3', 'BADDR4', 'BADDR5',
         'SADDR1', 'SADDR2', 'SADDR3', 'SADDR4', 'SADDR5', 'PHONE1', 'PHONE2', 'FAXNUM', 'EMAIL',
-        'CONT1', 'CONT2', 'CTYPE', 'TERMS', 'TAXABLE', 'TAXITEM', 'LIMIT', 'RESALENUM', 'REP',
+        'CONT1', 'CONT2', 'CTYPE', 'TERMS', 'TAXABLE', 'TAXITEM', 'SALESTAXCODE', 'PRICELEVEL', 'LIMIT', 'RESALENUM', 'REP',
         'SALUTATION', 'FIRSTNAME', 'MIDINIT', 'LASTNAME', 'NOTE', 'HIDDEN', ...custFldCols,
       ],
       [...custRows]
@@ -296,9 +326,11 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
             PHONE1: c.phone,
             EMAIL: c.email,
             CTYPE: c.customerTypeId ? ctypePath(c.customerTypeId) : '',
-            TERMS: displayTerms(c.terms),
+            TERMS: (c.termsId && termName.get(c.termsId)) || displayTerms(c.terms),
             TAXABLE: c.taxable ? 'Y' : 'N',
             TAXITEM: c.taxRateId ? rateName.get(c.taxRateId) ?? '' : '',
+            SALESTAXCODE: c.salesTaxCodeId ? codeName.get(c.salesTaxCodeId) ?? '' : '',
+            PRICELEVEL: c.priceLevelId ? levelName.get(c.priceLevelId) ?? '' : '',
             LIMIT: c.creditLimit ? toAmountString(c.creditLimit) : '',
             NOTE: c.notes,
             HIDDEN: c.isActive ? 'N' : 'Y',
@@ -328,7 +360,7 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
             VTYPE: v.vendorTypeId ? vtypePath(v.vendorTypeId) : '',
             PHONE1: v.phone,
             EMAIL: v.email,
-            TERMS: displayTerms(v.terms),
+            TERMS: (v.termsId && termName.get(v.termsId)) || displayTerms(v.terms),
             // Never write a masked value: blank when the user may not see the full TIN.
             TAXID: tin && !/[*•]/.test(tin) ? tin : '',
             '1099': v.is1099 ? 'Y' : 'N',
@@ -439,6 +471,11 @@ export async function exportJournalIif(ctx: ServiceContext, range: { from: Date;
   const classRows = await ctx.db.select().from(classes).where(eq(classes.companyId, ctx.companyId));
   const classPath = pathResolver(classRows);
 
+  // QB "Name" column: every named line (customer / vendor / employee / other name) writes the
+  // name exactly as the list export spells it, so QuickBooks accepts A/R and A/P lines (it
+  // rejects them without a name) and a re-import restores per-name detail.
+  const nameOf = await journalNameResolver(ctx);
+
   const entries = await ctx.db
     .select()
     .from(journalEntries)
@@ -457,12 +494,23 @@ export async function exportJournalIif(ctx: ServiceContext, range: { from: Date;
   w.raw(`!TRNS\t${cols.join('\t')}`);
   w.raw(`!SPL\tSPLID\t${cols.slice(1).join('\t')}`);
   w.raw('!ENDTRNS');
-  for (const e of entries) {
-    const lines = await ctx.db
+  // One query for every line of the range (not one per entry).
+  const linesByEntry = new Map<string, Array<typeof journalEntryLines.$inferSelect>>();
+  const ids = entries.map((e) => e.id);
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = await ctx.db
       .select()
       .from(journalEntryLines)
-      .where(eq(journalEntryLines.journalEntryId, e.id))
+      .where(inArray(journalEntryLines.journalEntryId, ids.slice(i, i + 500)))
       .orderBy(asc(journalEntryLines.createdAt), asc(journalEntryLines.id));
+    for (const l of chunk) {
+      const arr = linesByEntry.get(l.journalEntryId) ?? [];
+      arr.push(l);
+      linesByEntry.set(l.journalEntryId, arr);
+    }
+  }
+  for (const e of entries) {
+    const lines = linesByEntry.get(e.id) ?? [];
     if (lines.length < 2) continue;
     lines.forEach((l, i) => {
       const signed = Money.of(l.debit ?? 0).minus(Money.of(l.credit ?? 0));
@@ -471,7 +519,7 @@ export async function exportJournalIif(ctx: ServiceContext, range: { from: Date;
         'GENERAL JOURNAL',
         iifDate(e.date),
         acctPath(l.accountId),
-        '',
+        nameOf(l.entityType, l.entityId),
         classPath(l.classId),
         toAmountString(signed),
         e.reference ?? String(e.entryNumber),
@@ -482,4 +530,52 @@ export async function exportJournalIif(ctx: ServiceContext, range: { from: Date;
     w.raw('ENDTRNS');
   }
   return w.toString();
+}
+
+/**
+ * (entityType, entityId) → the QB name the list export writes for it: customers as their full
+ * "Customer:Job" path, vendors and other names by display name, employees "Last, First".
+ * Unknown / missing ids resolve to ''.
+ */
+async function journalNameResolver(
+  ctx: ServiceContext,
+): Promise<(type: string | null | undefined, id: string | null | undefined) => string> {
+  const custRows = await ctx.db
+    .select({ id: customers.id, displayName: customers.displayName, parentId: customers.parentId })
+    .from(customers)
+    .where(eq(customers.companyId, ctx.companyId));
+  const custById = new Map(custRows.map((c) => [c.id, c]));
+  const custName = (id: string, seen = new Set<string>()): string => {
+    const c = custById.get(id);
+    if (!c) return '';
+    if (!c.parentId || c.displayName.includes(':') || seen.has(id)) return c.displayName;
+    seen.add(id);
+    const parent = custName(c.parentId, seen);
+    return parent ? `${parent}:${c.displayName}` : c.displayName;
+  };
+  const vendRows = await ctx.db
+    .select({ id: vendors.id, name: vendors.displayName })
+    .from(vendors)
+    .where(eq(vendors.companyId, ctx.companyId));
+  const vendName = new Map(vendRows.map((v) => [v.id, v.name]));
+  const empRows = await ctx.db
+    .select({ id: employees.id, firstName: employees.firstName, lastName: employees.lastName })
+    .from(employees)
+    .where(eq(employees.companyId, ctx.companyId));
+  const empName = new Map(empRows.map((e) => [e.id, `${e.lastName}, ${e.firstName}`]));
+  const otherRows = await ctx.db
+    .select({ id: otherNames.id, name: otherNames.name })
+    .from(otherNames)
+    .where(eq(otherNames.companyId, ctx.companyId));
+  const otherName = new Map(otherRows.map((o) => [o.id, o.name]));
+  return (type, id) => {
+    if (!type || !id) return '';
+    switch (type) {
+      case 'customer': return custName(id);
+      case 'vendor': return vendName.get(id) ?? '';
+      case 'employee': return empName.get(id) ?? '';
+      case 'other': return otherName.get(id) ?? '';
+      default: return '';
+    }
+  };
 }

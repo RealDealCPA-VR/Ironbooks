@@ -41,6 +41,7 @@ import { createClass } from './dimensions';
 import { createEmployee } from './payroll';
 import { postJournalEntry, type PostingLine } from './posting';
 import { createVendor } from './vendors';
+import { controlSideOfAccount, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
 import { loadGrid } from './qbGlFiles';
 import {
   QB_ACCOUNT_TYPES,
@@ -689,6 +690,20 @@ export async function runGlImport(
       }
 
       // ---- 5. Transactions ---------------------------------------------------------
+      // Each line carries its QB Name as the journal line's customer / vendor / employee / other
+      // name (QB GL "Name" column), so Sales by Customer, Expenses by Vendor and QuickReports work
+      // for migrated periods. A/R lines only take a customer, A/P lines only a vendor; an A/R or
+      // A/P row without its own name takes the transaction's name.
+      const names = await loadQbNameResolver(tx);
+      const roleOf = new Map(analysis.names.map((n) => [n.name.toLowerCase(), n.role as QbNameRole]));
+      const acctById = new Map((await loadExistingAccounts(tx)).map((a) => [a.id, a]));
+      const nameFor = (accountId: string, lineName: string, txnName: string) => {
+        const side = controlSideOfAccount(acctById.get(accountId));
+        const raw = lineName || (side ? txnName : '');
+        if (!raw) return {};
+        const r = names.resolve(raw, { side, prefer: roleOf.get(raw.toLowerCase()) ?? null });
+        return r ? { entityType: r.entityType, entityId: r.entityId } : {};
+      };
       const already = await existingRefs(tx, analysis.transactions.map((t) => t.ref));
       for (const t of analysis.transactions) {
         if (already.has(t.ref)) {
@@ -707,6 +722,7 @@ export async function runGlImport(
           sourceRef: t.ref,
           lines: t.lines.map((l) => ({
             accountId: bkIdOf.get(l.accountKey)!,
+            ...nameFor(bkIdOf.get(l.accountKey)!, l.name, t.name),
             debit: Money.isZero(l.debit) ? null : l.debit,
             credit: Money.isZero(l.credit) ? null : l.credit,
             memo: [l.name && l.name !== t.name ? l.name : '', l.memo].filter(Boolean).join(' — ') || null,

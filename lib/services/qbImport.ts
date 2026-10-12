@@ -22,8 +22,8 @@
  *                  item / group, group, subtotal); group components and assembly BOMs from
  *                  INVITEMCOMP rows when present; STAX items also create sales-tax rates.
  *       Other lists through a REGISTRY (IIF_LIST_REGISTRY): CTYPE / VTYPE / SALESREP / BUD
- *                  import into their tables; lists without a table yet (OTHERNAME, JOBTYPE,
- *                  TERMS, SHIPMETH, PAYMETH, CUSTMSG, SALESTAXCODE, TODO, VEH) are parsed and
+ *                  import into their tables (OTHERNAME, JOBTYPE, TERMS, SHIPMETH, PAYMETH, CUSTMSG,
+ *                  SALESTAXCODE, TODO, VEH, PRICELEVEL via qbIifLists.ts); unknown sections are parsed and
  *                  returned under `deferred` in the import report — wiring one later is a
  *                  single registry entry.
  *       TRNS/SPL/ENDTRNS — posted as balanced journal entries; accounts matched by full path /
@@ -66,12 +66,15 @@ import { setBom } from './assemblies';
 import { createJob } from './jobs';
 import { createEmployee, updateEmployee } from './payroll';
 import { assertBalanced, postJournalEntry, type PostingLine } from './posting';
+import { controlSideOfAccount, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
 import { assertPeriodOpen } from './fiscalPeriods';
 import { createType } from './typeLists';
 import { createSalesRep } from './salesReps';
 import { createTaxRate } from './salesTax';
 import { createBudget, setBudgetLine, listBudgets } from './budgets';
 import { readXlsx } from './qbGlFiles';
+import * as L from './qbIifLists';
+import { assignJobType } from './lists/jobTypes';
 import type { IifControlRow } from './openItemsImport';
 
 // ---------------------------------------------------------------------------
@@ -1282,6 +1285,16 @@ const budgetImporter: ListImporter = async ({ ctx, counts, lookup }, rows) => {
   return n;
 };
 
+/** Adapter: a qbIifLists importer → registry importer (issues land in the import report). */
+const otherListImporter =
+  (fn: (ctx: ServiceContext, rows: IIFListRows, issues: L.ListIssue[]) => Promise<number>): ListImporter =>
+  async ({ ctx, counts }, rows) => {
+    const issues: L.ListIssue[] = [];
+    const n = await fn(ctx, rows, issues);
+    for (const i of issues) counts.issues.push({ entity: 'list', name: i.name, reason: 'validation', message: i.message });
+    return n;
+  };
+
 /**
  * IIF list registry. Adding a list = one entry here: give it an `importer` when its table
  * exists, otherwise a `deferredNote` and its parsed rows are returned in the import report.
@@ -1291,16 +1304,19 @@ export const IIF_LIST_REGISTRY: Record<string, ListRegistryEntry> = {
   VTYPE: { label: 'Vendor types', phase: 'early', importer: typeListImporter('vendor') },
   SALESREP: { label: 'Sales reps', phase: 'early', importer: salesRepImporter },
   BUD: { label: 'Budgets', phase: 'late', importer: budgetImporter },
-  OTHERNAME: { label: 'Other names', phase: 'late', deferredNote: 'The Other Names list arrives with the lists update; names are kept in this report.' },
-  JOBTYPE: { label: 'Job types', phase: 'late', deferredNote: 'Job types are not a separate list yet; each job keeps its type as a custom field.' },
-  TERMS: { label: 'Terms', phase: 'late', deferredNote: 'Terms are saved on each customer and vendor; the Terms list itself arrives with the lists update.' },
-  SHIPMETH: { label: 'Shipping methods', phase: 'late', deferredNote: 'The Ship Via list arrives with the lists update.' },
-  PAYMETH: { label: 'Payment methods', phase: 'late', deferredNote: 'Payment methods use the built-in list (cash, check, card, ACH…).' },
-  CUSTMSG: { label: 'Customer messages', phase: 'late', deferredNote: 'The Customer Message list arrives with the form templates update.' },
-  SALESTAXCODE: { label: 'Sales tax codes', phase: 'late', deferredNote: 'Sales tax codes arrive with the sales tax update; each customer keeps its code as a custom field.' },
-  TODO: { label: 'To Do notes', phase: 'late', deferredNote: 'To Do notes arrive with the reminders/calendar update.' },
-  VEH: { label: 'Vehicles', phase: 'late', deferredNote: 'The Vehicle list arrives with the lists update (mileage entries keep the vehicle name).' },
-  PRICELEVEL: { label: 'Price levels', phase: 'late', deferredNote: 'Set up price levels in Advanced Pricing; customers keep their level name as a custom field.' },
+  // Simple QB lists: imported before customers / vendors so their Terms, Sales Tax Code, Price
+  // Level and Job Type link to real list entries (lib/services/qbIifLists.ts).
+  OTHERNAME: { label: 'Other names', phase: 'early', importer: otherListImporter(L.importOtherNames) },
+  TERMS: { label: 'Terms', phase: 'early', importer: otherListImporter(L.importTerms) },
+  SHIPMETH: { label: 'Shipping methods', phase: 'early', importer: otherListImporter(L.importShipMethods) },
+  PAYMETH: { label: 'Payment methods', phase: 'early', importer: otherListImporter(L.importPaymentMethods) },
+  CUSTMSG: { label: 'Customer messages', phase: 'early', importer: otherListImporter(L.importCustomerMessages) },
+  SALESTAXCODE: { label: 'Sales tax codes', phase: 'early', importer: otherListImporter(L.importSalesTaxCodes) },
+  JOBTYPE: { label: 'Job types', phase: 'early', importer: otherListImporter(L.importJobTypes) },
+  VEH: { label: 'Vehicles', phase: 'early', importer: otherListImporter(L.importVehicles) },
+  PRICELEVEL: { label: 'Price levels', phase: 'early', importer: otherListImporter(L.importPriceLevels) },
+  // To-dos may name customers / vendors, so they come after the name lists.
+  TODO: { label: 'To Do notes', phase: 'late', importer: otherListImporter(L.importTodos) },
 };
 
 async function runListRegistry(env: ListImportEnv, lists: Record<string, IIFListRows>, phase: 'early' | 'late') {
@@ -1486,6 +1502,7 @@ async function importIifCustomers(ctx: ServiceContext, counts: ImportCounts, row
   const idByName = new Map(existing.map((c) => [c.name.toLowerCase(), c.id]));
   const ctypes = await typeIdMap(ctx, 'customer');
   const levels = await nameMap(ctx, priceLevels);
+  const lists = await L.listIdMaps(ctx);
   const rates = await nameMap(ctx, taxRates);
   const jobRows = await ctx.db
     .select({ name: jobsTable.name, customerId: jobsTable.customerId })
@@ -1561,6 +1578,20 @@ async function importIifCustomers(ctx: ServiceContext, counts: ImportCounts, row
         if (id) patch.priceLevelId = id;
         else fields['Price Level'] = cust.priceLevel;
       }
+      // Terms / Sales Tax Code list entries (imported from TERMS / SALESTAXCODE sections or
+      // already on the lists): link the real entries, as QuickBooks does.
+      const termsId = cust.terms ? lists.termsByName.get(cust.terms.toLowerCase()) : undefined;
+      if (termsId) {
+        patch.termsId = termsId;
+      }
+      if (cust.salesTaxCode) {
+        const code = lists.taxCodeByCode.get(cust.salesTaxCode.toLowerCase());
+        if (code) {
+          patch.salesTaxCodeId = code.id;
+          patch.taxable = code.taxable;
+          delete fields['Sales Tax Code'];
+        }
+      }
       if (cust.hidden) patch.isActive = false;
       if (Object.keys(fields).length) patch.customFields = fields;
       if (Object.keys(patch).length) {
@@ -1574,7 +1605,7 @@ async function importIifCustomers(ctx: ServiceContext, counts: ImportCounts, row
         const key = `${parentId}|${leaf.toLowerCase()}`;
         if (!jobKeys.has(key)) {
           try {
-            await createJob(ctx, {
+            const job = await createJob(ctx, {
               customerId: parentId,
               name: leaf,
               startDate: parseIifDate(cust.raw?.JOBSTART) ?? null,
@@ -1582,6 +1613,9 @@ async function importIifCustomers(ctx: ServiceContext, counts: ImportCounts, row
             });
             jobKeys.add(key);
             counts.jobs++;
+            const jobTypeName = cust.raw?.JOBTYPE?.trim();
+            const jobTypeId = jobTypeName ? lists.jobTypeByName.get(jobTypeName.split(':').pop()!.trim().toLowerCase()) : undefined;
+            if (jobTypeId) await assignJobType(ctx, job.id, jobTypeId);
           } catch (err) {
             if (err instanceof ServiceError && err.code === 'VALIDATION') {
               counts.issues.push({ entity: 'job', name: displayName, reason: 'validation', message: err.message });
@@ -1602,6 +1636,7 @@ async function importIifCustomers(ctx: ServiceContext, counts: ImportCounts, row
 
 async function importIifVendors(ctx: ServiceContext, counts: ImportCounts, rows: IIFVendor[]) {
   const vtypes = await typeIdMap(ctx, 'vendor');
+  const lists = await L.listIdMaps(ctx);
   for (const vend of rows) {
     const displayName = vend.name.trim();
     if (!displayName) {
@@ -1645,6 +1680,10 @@ async function importIifVendors(ctx: ServiceContext, counts: ImportCounts, rows:
         const id = vtypes.get(normPath(vend.vendorType));
         if (id) patch.vendorTypeId = id;
         else fields['Vendor Type'] = vend.vendorType;
+      }
+      const vTermsId = vend.terms ? lists.termsByName.get(vend.terms.toLowerCase()) : undefined;
+      if (vTermsId) {
+        patch.termsId = vTermsId;
       }
       if (vend.hidden) patch.isActive = false;
       if (Object.keys(fields).length) patch.customFields = fields;
@@ -2141,6 +2180,15 @@ async function collectIifControlRows(
   return out;
 }
 
+/** The kind of name a QB transaction type carries (the Name column's list). */
+export function iifRoleOfType(type: string | null | undefined): QbNameRole | null {
+  const t = (type ?? '').trim().toUpperCase();
+  if (['INVOICE', 'PAYMENT', 'CREDIT MEMO', 'CREDITMEMO', 'CASH SALE', 'SALES RECEIPT', 'ESTIMATE', 'STMT CHG', 'CUSTOMER REFUND'].includes(t)) return 'customer';
+  if (['BILL', 'BILLCRED', 'BILL REFUND', 'BILLPMT', 'BILL PMT -CHECK', 'BILL PMT -CCARD', 'CHECK', 'CREDIT CARD', 'CC CREDIT', 'ITEM RECEIPT', 'PURCHORD'].includes(t)) return 'vendor';
+  if (['PAYCHECK', 'LIABILITY ADJUSTMENT', 'YTD ADJUSTMENT'].includes(t)) return 'employee';
+  return null;
+}
+
 async function importIifTransactions(
   ctx: ServiceContext,
   counts: ImportCounts,
@@ -2153,6 +2201,8 @@ async function importIifTransactions(
   const seenKeys = new Map<string, number>();
   const isControl = (a: AccountRef) =>
     (a.subtype === 'accounts_receivable' || a.subtype === 'accounts_payable') && a.code !== '1250';
+  // QB Name column → journal line name (customer / vendor / employee / other name).
+  const names = await loadQbNameResolver(ctx);
 
   for (const txn of transactions) {
     const label = `${txn.type || 'TRNS'}${txn.num ? ` #${txn.num}` : ''}`;
@@ -2197,8 +2247,14 @@ async function importIifTransactions(
       const toConversion = !!redirectControl && isControl(acct);
       if (toConversion) redirected = true;
       const baseMemo = l.memo ?? (l.name ? `Payee: ${l.name}` : null);
+      const side = toConversion ? null : controlSideOfAccount(acct);
+      const named = names.resolve(l.name || (side ? txn.name : null), {
+        side,
+        prefer: iifRoleOfType(txn.type),
+      });
       lines.push({
         accountId: toConversion ? redirectControl!.accountId : acct.id,
+        ...(named ? { entityType: named.entityType, entityId: named.entityId } : {}),
         debit: isDebit ? abs : null,
         credit: isDebit ? null : abs,
         memo: toConversion
