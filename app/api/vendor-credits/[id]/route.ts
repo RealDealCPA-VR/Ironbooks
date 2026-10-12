@@ -8,6 +8,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import {
   getVendorCredit,
   applyToBill,
@@ -101,11 +102,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const voided = await voidVendorCredit(ctx, id);
+    const voided = await withVersionCheck(ctx, 'vendor_credit', id, expectedVersion(req), (c) => voidVendorCredit(c, id));
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err);
@@ -120,7 +121,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createVendorCreditSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    const credit = await updateVendorCredit(ctx, id, parsed.data);
+    const credit = await withVersionCheck(ctx, 'vendor_credit', id, expectedVersion(req), (c) => updateVendorCredit(c, id, parsed.data));
     return NextResponse.json(credit);
   } catch (err) {
     return routeError(err, 'PATCH /api/vendor-credits/[id]');

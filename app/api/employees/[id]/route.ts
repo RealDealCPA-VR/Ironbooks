@@ -8,6 +8,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getEmployee, updateEmployee } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
 import { hasFlag } from '@/lib/services/access';
@@ -69,7 +70,7 @@ export async function PATCH(
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const updated = await updateEmployee(ctx, id, parsed.data);
+    const updated = await withVersionCheck(ctx, 'employee', id, expectedVersion(req), (c) => updateEmployee(c, id, parsed.data));
 
     return NextResponse.json(maskEmployee(updated, hasFlag(ctx, 'sensitivePayroll')));
   } catch (err) {

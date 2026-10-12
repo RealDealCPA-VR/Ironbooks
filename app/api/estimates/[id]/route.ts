@@ -12,6 +12,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import {
   getEstimate,
   updateEstimateStatus,
@@ -68,14 +69,14 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     if (Array.isArray(body?.lines)) {
       const parsed = createEstimateSchema.safeParse(body);
       if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-      return NextResponse.json(await updateEstimate(ctx, id, parsed.data));
+      return NextResponse.json(await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) => updateEstimate(c, id, parsed.data)));
     }
 
     if (!status) {
       return NextResponse.json({ error: 'Missing required field: status' }, { status: 400 });
     }
 
-    const updated = await updateEstimateStatus(ctx, id, status as EstimateStatus);
+    const updated = await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) => updateEstimateStatus(c, id, status as EstimateStatus));
     return NextResponse.json(updated);
   } catch (err) {
     return errorResponse(err);

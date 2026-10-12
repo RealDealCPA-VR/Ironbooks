@@ -12,6 +12,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getSalesOrder, convertToInvoice, updateStatus, updateSalesOrder } from '@/lib/services/salesOrders';
 import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -68,7 +69,7 @@ export async function PUT(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createSalesOrderSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    return NextResponse.json(await updateSalesOrder(ctx, id, parsed.data));
+    return NextResponse.json(await withVersionCheck(ctx, 'sales_order', id, expectedVersion(req), (c) => updateSalesOrder(c, id, parsed.data)));
   } catch (err) {
     return errorResponse(err);
   }

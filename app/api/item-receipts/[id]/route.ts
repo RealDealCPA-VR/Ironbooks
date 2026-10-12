@@ -9,6 +9,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getItemReceipt, convertToBill, voidItemReceipt, updateItemReceipt } from '@/lib/services/itemReceipts';
 import { routeError } from '@/lib/routeErrors';
 import { createItemReceiptSchema } from '@/lib/validation/itemReceipts';
@@ -85,7 +86,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createItemReceiptSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    const receipt = await updateItemReceipt(ctx, id, parsed.data);
+    const receipt = await withVersionCheck(ctx, 'item_receipt', id, expectedVersion(req), (c) => updateItemReceipt(c, id, parsed.data));
     return NextResponse.json(receipt);
   } catch (err) {
     return routeError(err, 'PATCH /api/item-receipts/[id]');

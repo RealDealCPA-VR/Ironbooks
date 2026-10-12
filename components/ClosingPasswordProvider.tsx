@@ -7,9 +7,17 @@
  * user types the closing date password and the save is retried with it; a wrong password asks
  * again with a plain message. Accepted overrides are recorded by the server on the Closing Date
  * Exception report (Reports > Accountant).
+ *
+ * It also shows QB's record-locking notice: when someone else saved a record after this user
+ * opened it, the save is refused (409) and a dialog says who changed it and offers Reload.
  */
 import * as React from 'react';
-import { setClosingPasswordPrompt, type ClosingPasswordPromptInfo } from '@/lib/client';
+import {
+  setClosingPasswordPrompt,
+  setStaleRecordHandler,
+  type ClosingPasswordPromptInfo,
+  type StaleRecordInfo,
+} from '@/lib/client';
 import { Button, Input, Label, Modal } from '@/components/ui';
 
 interface Pending {
@@ -18,6 +26,50 @@ interface Pending {
 }
 
 export default function ClosingPasswordProvider() {
+  return (
+    <>
+      <ClosingPasswordPrompt />
+      <RecordChangedDialog />
+    </>
+  );
+}
+
+/** "This record was changed by another user" — QB record locking, with a Reload button. */
+function RecordChangedDialog() {
+  const [info, setInfo] = React.useState<StaleRecordInfo | null>(null);
+  React.useEffect(() => {
+    setStaleRecordHandler(setInfo);
+    return () => setStaleRecordHandler(null);
+  }, []);
+  const close = React.useCallback(() => setInfo(null), []);
+  if (!info) return null;
+  return (
+    <Modal
+      open
+      onClose={close}
+      title="This record was changed by another user"
+      footer={
+        <>
+          <Button variant="secondary" onClick={close}>
+            Keep my screen
+          </Button>
+          <Button onClick={() => window.location.reload()}>Reload</Button>
+        </>
+      }
+    >
+      <p className="text-sm text-navy/70">
+        {info.changedBy ? `${info.changedBy} saved` : 'Someone else saved'} this record
+        {info.changedAt ? ` at ${new Date(info.changedAt).toLocaleString()}` : ''}, after you opened
+        it. Your changes were not saved, so nothing was overwritten.
+      </p>
+      <p className="mt-2 text-sm text-navy/70">
+        Choose Reload to see the latest version, then make your changes again.
+      </p>
+    </Modal>
+  );
+}
+
+function ClosingPasswordPrompt() {
   const [pending, setPending] = React.useState<Pending | null>(null);
   const [password, setPassword] = React.useState('');
   const pendingRef = React.useRef<Pending | null>(null);

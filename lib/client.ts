@@ -14,8 +14,8 @@
  * File-lock handling: a 403 "company file is locked" response (stale unlock cookie after an
  * app relaunch — see isFileLockError below) redirects the browser to /unlock before throwing.
  *
- * Multi-user optimistic concurrency: GET responses for invoices, bills, journal entries,
- * customers, vendors and items are scanned for each record's `updatedAt`; a later
+ * Multi-user optimistic concurrency: GET responses for every VERSIONED_RESOURCES record type
+ * (transactions, names, items, employees, accounts) are scanned for each record's version; a later
  * PATCH/PUT/DELETE of that record automatically sends it as `x-expected-updated-at`, and the
  * server answers 409 ("This record was changed by … Reload to see the latest.") if someone
  * else saved in between. Pages need no changes; see lib/services/concurrency.ts.
@@ -26,7 +26,13 @@
 import { describeError, type FriendlyError } from '@/lib/friendlyErrors';
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string, public code?: string) {
+  constructor(
+    public status: number,
+    message: string,
+    public code?: string,
+    /** The server's structured details (e.g. { staleVersion, changedBy } on a record-lock 409). */
+    public details?: unknown,
+  ) {
     super(message);
     this.name = 'ApiError';
   }
@@ -153,9 +159,47 @@ async function handle<T>(res: Response): Promise<T> {
         '/login?next=' + encodeURIComponent(window.location.pathname + window.location.search),
       );
     }
-    throw new ApiError(res.status, message, data?.code);
+    throw new ApiError(res.status, message, data?.code, data?.details);
   }
   return data as T;
+}
+
+// ---- record changed by another user (record locking) ----
+
+/** Details the server sends with a record-lock 409 (lib/services/concurrency.ts). */
+export interface StaleRecordInfo {
+  message: string;
+  changedBy: string | null;
+  changedAt: string | null;
+}
+
+/** True when the error is "This record was changed by another user" (a stale-version 409). */
+export function isStaleRecordError(err: unknown): err is ApiError {
+  return (
+    err instanceof ApiError &&
+    err.status === 409 &&
+    Boolean((err.details as { staleVersion?: unknown } | undefined)?.staleVersion)
+  );
+}
+
+let staleRecordHandler: ((info: StaleRecordInfo) => void) | null = null;
+
+/**
+ * Register (or clear) the app-wide "record changed by another user" notice. Registered by
+ * components/ClosingPasswordProvider.tsx, which offers a Reload button.
+ */
+export function setStaleRecordHandler(handler: ((info: StaleRecordInfo) => void) | null): void {
+  staleRecordHandler = handler;
+}
+
+function notifyStale(err: unknown): void {
+  if (!isStaleRecordError(err) || !staleRecordHandler) return;
+  const d = err.details as { changedBy?: unknown; changedAt?: unknown };
+  staleRecordHandler({
+    message: err.message,
+    changedBy: typeof d.changedBy === 'string' ? d.changedBy : null,
+    changedAt: typeof d.changedAt === 'string' ? d.changedAt : null,
+  });
 }
 
 // ---- optimistic-concurrency version cache ----
@@ -163,8 +207,37 @@ async function handle<T>(res: Response): Promise<T> {
 /** Header verified by lib/services/concurrency.ts (EXPECTED_VERSION_HEADER). */
 export const EXPECTED_VERSION_HEADER = 'x-expected-updated-at';
 
-const VERSIONED_PATH =
-  /^\/api\/(invoices|bills|journal-entries|customers|vendors|items)(?:\/([^/]+))?\/?$/;
+/**
+ * API resources whose records carry a version (lib/services/concurrency.ts TABLES). Accounts carry
+ * it as `editedAt` (their updatedAt also moves with every posting); everything else as `updatedAt`.
+ */
+export const VERSIONED_RESOURCES = [
+  'invoices',
+  'bills',
+  'journal-entries',
+  'customers',
+  'vendors',
+  'items',
+  'estimates',
+  'sales-orders',
+  'sales-receipts',
+  'credit-memos',
+  'purchase-orders',
+  'expenses',
+  'deposits',
+  'transfers',
+  'payments',
+  'bill-payments',
+  'vendor-credits',
+  'item-receipts',
+  'payroll',
+  'employees',
+  'accounts',
+] as const;
+
+const VERSIONED_PATH = new RegExp(
+  `^/api/(${VERSIONED_RESOURCES.join('|')})(?:/([^/]+))?/?$`,
+);
 /** '/api/<resource>/<id>' → updatedAt (ISO) the user last loaded. */
 const loadedVersions = new Map<string, string>();
 
@@ -176,8 +249,10 @@ function pathOf(url: string): string {
   }
 }
 
-type Rec = { id?: unknown; updatedAt?: unknown };
+type Rec = { id?: unknown; updatedAt?: unknown; editedAt?: unknown };
 const isRec = (v: unknown): v is Rec => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+/** The record's version: editedAt where the record has one (accounts), else updatedAt. */
+const versionOf = (r: Rec): unknown => (r.editedAt !== undefined ? r.editedAt : r.updatedAt);
 
 /** Remember record versions seen in a response from one of the versioned resources. */
 export function rememberVersions(url: string, data: unknown): void {
@@ -185,9 +260,11 @@ export function rememberVersions(url: string, data: unknown): void {
   if (!m || !data || typeof data !== 'object') return;
   const base = `/api/${m[1]}`;
   const note = (r: unknown, onlyId?: string) => {
-    if (!isRec(r) || typeof r.id !== 'string' || typeof r.updatedAt !== 'string') return false;
+    if (!isRec(r) || typeof r.id !== 'string') return false;
+    const version = versionOf(r);
+    if (typeof version !== 'string') return false;
     if (onlyId && r.id !== onlyId) return false;
-    loadedVersions.set(`${base}/${r.id}`, r.updatedAt);
+    loadedVersions.set(`${base}/${r.id}`, version);
     return true;
   };
   const values = Array.isArray(data) ? [data] : [data, ...Object.values(data as object)];
@@ -245,6 +322,7 @@ async function mutate<T>(
   try {
     return await run(opts);
   } catch (first) {
+    notifyStale(first);
     // Explicitly supplied passwords are never re-prompted.
     if (!isClosingPasswordError(first) || opts?.closingPassword !== undefined) throw first;
     const prompt = resolvePrompt();
@@ -256,6 +334,7 @@ async function mutate<T>(
       try {
         return await run({ ...opts, closingPassword: password });
       } catch (retryErr) {
+        notifyStale(retryErr);
         // Still refused by the closing date: the password was wrong (or this user may not
         // change closed-period transactions). Ask again with a plain message.
         if (!isClosingPasswordError(retryErr)) throw retryErr;

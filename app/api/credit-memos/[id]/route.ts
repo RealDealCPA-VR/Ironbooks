@@ -9,6 +9,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import {
   getCreditMemo,
   applyToInvoice,
@@ -123,7 +124,7 @@ export async function PUT(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createCreditMemoSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    return NextResponse.json(await updateCreditMemo(ctx, id, parsed.data));
+    return NextResponse.json(await withVersionCheck(ctx, 'credit_memo', id, expectedVersion(req), (c) => updateCreditMemo(c, id, parsed.data)));
   } catch (err) {
     return errorResponse(err);
   }
@@ -134,11 +135,11 @@ export async function PATCH(req: NextRequest, rc: RouteContext) {
   return PUT(req, rc);
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const voided = await voidCreditMemo(ctx, id);
+    const voided = await withVersionCheck(ctx, 'credit_memo', id, expectedVersion(req), (c) => voidCreditMemo(c, id));
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err);

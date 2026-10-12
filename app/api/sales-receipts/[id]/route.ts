@@ -5,6 +5,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getSalesReceipt, updateSalesReceipt, voidSalesReceipt } from '@/lib/services/salesReceipts';
 import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -34,7 +35,7 @@ export async function PUT(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createSalesReceiptSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    return NextResponse.json(await updateSalesReceipt(ctx, id, parsed.data));
+    return NextResponse.json(await withVersionCheck(ctx, 'sales_receipt', id, expectedVersion(req), (c) => updateSalesReceipt(c, id, parsed.data)));
   } catch (err) {
     return errorResponse(err);
   }
@@ -45,11 +46,11 @@ export async function PATCH(req: NextRequest, rc: RouteContext) {
   return PUT(req, rc);
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const voided = await voidSalesReceipt(ctx, id);
+    const voided = await withVersionCheck(ctx, 'sales_receipt', id, expectedVersion(req), (c) => voidSalesReceipt(c, id));
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err);

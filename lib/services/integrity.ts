@@ -340,6 +340,26 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_je_non_posting: 'Non-posting accounts never carry posted amounts (post transitions)',
   bka_accounts_non_posting: 'Accounts with history cannot become non-posting',
   bka_transfers_no_ar_ap: 'Transfers never move money into or out of A/R or A/P',
+  // drizzle/0046_p1_controls.sql — record locking versions
+  ...Object.fromEntries(
+    [
+      'sales_orders',
+      'sales_receipts',
+      'credit_memos',
+      'purchase_orders',
+      'expenses',
+      'deposits',
+      'transfers',
+      'payments_received',
+      'bill_payments',
+      'vendor_credits',
+      'item_receipts',
+      'paychecks',
+      'estimates',
+      'employees',
+      'accounts',
+    ].map((t) => [`bka_version_${t}`, `Record locking: changes to ${t.replace(/_/g, ' ')} are detected`]),
+  ),
 };
 
 async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string[]; total: number }> {

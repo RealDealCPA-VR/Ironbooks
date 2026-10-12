@@ -17,6 +17,8 @@ import {
   CLOSING_PASSWORD_HEADER,
   isAuthError,
   isClosingPasswordError,
+  isStaleRecordError,
+  setStaleRecordHandler,
   isFileLockError,
   MAX_CLOSING_PASSWORD_ATTEMPTS,
   setClosingPasswordPrompt,
@@ -227,5 +229,61 @@ describe('isAuthError', () => {
     expect(isAuthError(403, 'You do not have permission to view Banking.')).toBe(false);
     expect(isAuthError(403, 'This company file is locked. Unlock it to continue.')).toBe(false);
     expect(isAuthError(500, 'Authentication required.')).toBe(false);
+  });
+});
+
+describe('record locking in the client (P1: every transaction type)', () => {
+  it('sends the loaded version for checks, deposits, paychecks …; accounts use editedAt', async () => {
+    const calls = stubFetch(
+      jsonResponse({ id: 'c1', updatedAt: '2026-01-01T00:00:00.001Z' }),
+      jsonResponse({ id: 'a1', updatedAt: '2026-05-05T00:00:00.000Z', editedAt: '2026-01-02T00:00:00.002Z' }),
+      jsonResponse({ ok: true }),
+    );
+    await api.get('/api/expenses/c1');
+    await api.get('/api/accounts/a1');
+    await api.patch('/api/expenses/c1', { memo: 'x' });
+    await api.patch('/api/accounts/a1', { name: 'y' });
+    expect(headerOf(calls[2], 'x-expected-updated-at')).toBe('2026-01-01T00:00:00.001Z');
+    expect(headerOf(calls[3], 'x-expected-updated-at')).toBe('2026-01-02T00:00:00.002Z');
+  });
+
+  it('a stale-version 409 notifies the record-changed dialog with who changed it', async () => {
+    stubFetch(
+      jsonResponse(
+        {
+          error: 'This record was changed by Dana at Jun 3, 2026, 2:14 PM. Reload to see the latest.',
+          code: 'CONFLICT',
+          details: { staleVersion: true, changedBy: 'Dana', changedAt: '2026-06-03T14:14:00.000Z' },
+        },
+        409,
+      ),
+    );
+    const seen: unknown[] = [];
+    setStaleRecordHandler((info) => seen.push(info));
+    try {
+      const err = await api.patch('/api/deposits/d1', {}).catch((e) => e);
+      expect(isStaleRecordError(err)).toBe(true);
+      expect(seen).toEqual([
+        {
+          message: 'This record was changed by Dana at Jun 3, 2026, 2:14 PM. Reload to see the latest.',
+          changedBy: 'Dana',
+          changedAt: '2026-06-03T14:14:00.000Z',
+        },
+      ]);
+    } finally {
+      setStaleRecordHandler(null);
+    }
+  });
+
+  it('an ordinary 409 (e.g. already deposited) does not open the record-changed dialog', async () => {
+    stubFetch(jsonResponse({ error: 'Already deposited', code: 'CONFLICT' }, 409));
+    const handler = vi.fn();
+    setStaleRecordHandler(handler);
+    try {
+      await api.patch('/api/payments/p1', {}).catch(() => undefined);
+      expect(handler).not.toHaveBeenCalled();
+    } finally {
+      setStaleRecordHandler(null);
+    }
   });
 });

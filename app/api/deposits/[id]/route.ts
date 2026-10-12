@@ -7,6 +7,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getDeposit, updateDeposit, voidDeposit } from '@/lib/services/deposits';
 import { routeError } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -49,11 +50,11 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const voided = await voidDeposit(ctx, id);
+    const voided = await withVersionCheck(ctx, 'deposit', id, expectedVersion(req), (c) => voidDeposit(c, id));
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err, 'DELETE /api/deposits/[id]');
@@ -68,7 +69,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createDepositSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    const deposit = await updateDeposit(ctx, id, parsed.data);
+    const deposit = await withVersionCheck(ctx, 'deposit', id, expectedVersion(req), (c) => updateDeposit(c, id, parsed.data));
     return NextResponse.json(deposit);
   } catch (err) {
     return routeError(err, 'PATCH /api/deposits/[id]');

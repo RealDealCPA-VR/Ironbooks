@@ -14,6 +14,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import {
   getPurchaseOrder,
   updateStatus,
@@ -100,7 +101,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = updatePurchaseOrderSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    const po = await updatePurchaseOrder(ctx, id, parsed.data);
+    const po = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => updatePurchaseOrder(c, id, parsed.data));
     return NextResponse.json(po);
   } catch (err) {
     return routeError(err, 'PATCH /api/purchase-orders/[id]');

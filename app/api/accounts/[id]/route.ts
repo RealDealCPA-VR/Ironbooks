@@ -5,6 +5,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getAccount, updateAccount, deactivateAccount } from '@/lib/services/accounts';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -47,17 +48,17 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     if (!parsed.success) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
-    return NextResponse.json(await updateAccount(ctx, id, parsed.data));
+    return NextResponse.json(await withVersionCheck(ctx, 'account', id, expectedVersion(req), (c) => updateAccount(c, id, parsed.data)));
   } catch (err) {
     return errorResponse(err);
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteParams) {
+export async function DELETE(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    return NextResponse.json(await deactivateAccount(ctx, id));
+    return NextResponse.json(await withVersionCheck(ctx, 'account', id, expectedVersion(req), (c) => deactivateAccount(c, id)));
   } catch (err) {
     return errorResponse(err);
   }

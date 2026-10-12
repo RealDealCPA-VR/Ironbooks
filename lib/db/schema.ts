@@ -82,6 +82,8 @@ export const accounts = pgTable('accounts', {
   currency: varchar('currency', { length: 3 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  /** Record-locking version: moves on edits only, not balance changes (P1 controls, 0046). */
+  editedAt: timestamp('edited_at').defaultNow().notNull(),
 });
 
 // Journal Entries (Transaction Headers)
@@ -569,6 +571,8 @@ export const invoiceLines = pgTable('invoice_lines', {
 export const paymentsReceived = pgTable('payments_received', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   date: timestamp('date').notNull(),
   method: paymentMethodEnum('method').notNull().default('check'),
@@ -593,6 +597,8 @@ export const paymentsReceived = pgTable('payments_received', {
 export const salesReceipts = pgTable('sales_receipts', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   customerId: uuid('customer_id').references(() => customers.id),
   receiptNumber: integer('receipt_number').notNull(),
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
@@ -695,6 +701,8 @@ export const billLines = pgTable('bill_lines', {
 export const billPayments = pgTable('bill_payments', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   date: timestamp('date').notNull(),
   method: paymentMethodEnum('method').notNull().default('check'),
@@ -723,6 +731,8 @@ export const billPaymentApplications = pgTable('bill_payment_applications', {
 export const expenses = pgTable('expenses', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id),
   payeeName: varchar('payee_name', { length: 255 }),
   date: timestamp('date').notNull(),
@@ -763,6 +773,8 @@ export const expenseLines = pgTable('expense_lines', {
 export const transfers = pgTable('transfers', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   date: timestamp('date').notNull(),
   fromAccountId: uuid('from_account_id').references(() => accounts.id).notNull(),
   toAccountId: uuid('to_account_id').references(() => accounts.id).notNull(),
@@ -838,6 +850,8 @@ export const employees = pgTable('employees', {
 export const paychecks = pgTable('paychecks', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   employeeId: uuid('employee_id').references(() => employees.id).notNull(),
   payDate: timestamp('pay_date').notNull(),
   periodStart: timestamp('period_start'),
@@ -987,6 +1001,8 @@ export const fiscalPeriods = pgTable('fiscal_periods', {
 export const creditMemos = pgTable('credit_memos', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   memoNumber: integer('memo_number').notNull(),
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
@@ -1029,6 +1045,8 @@ export const creditMemoLines = pgTable('credit_memo_lines', {
 export const vendorCredits = pgTable('vendor_credits', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   date: timestamp('date').notNull(),
   status: docStatusEnum('status').notNull().default('open'),
@@ -1054,6 +1072,8 @@ export const vendorCreditLines = pgTable('vendor_credit_lines', {
 export const salesOrders = pgTable('sales_orders', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   orderNumber: integer('order_number').notNull(),
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
@@ -1158,6 +1178,8 @@ export const expenseReportLines = pgTable('expense_report_lines', {
 export const purchaseOrders = pgTable('purchase_orders', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   poNumber: integer('po_number').notNull(),
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
@@ -1196,6 +1218,8 @@ export const purchaseOrderLines = pgTable('purchase_order_lines', {
 export const itemReceipts = pgTable('item_receipts', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   purchaseOrderId: uuid('purchase_order_id').references(() => purchaseOrders.id),
   date: timestamp('date').notNull(),
@@ -1240,6 +1264,8 @@ export const pendingBuilds = pgTable('pending_builds', {
 export const deposits = pgTable('deposits', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   depositAccountId: uuid('deposit_account_id').references(() => accounts.id).notNull(),
   date: timestamp('date').notNull(),
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
