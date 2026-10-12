@@ -90,7 +90,9 @@ describe('payroll tax tracking (pure)', () => {
 
   it('infers sensible defaults from names', () => {
     expect(inferDeductionTracking('401(k) Employee', true)).toBe('401k');
-    expect(inferDeductionTracking('Roth 401k', false)).toBe('401k');
+    // Roth deferrals are after-tax (W-2 Box 12 AA/BB, not D/E): they reduce no wages.
+    expect(inferDeductionTracking('Roth 401k', false)).toBe('none');
+    expect(inferDeductionTracking('Roth 403(b)', false)).toBe('none');
     expect(inferDeductionTracking('Health Insurance (pre-tax)', true)).toBe('section125');
     expect(inferDeductionTracking('HSA', true)).toBe('hsa');
     expect(inferDeductionTracking('Union dues', false)).toBe('none');
