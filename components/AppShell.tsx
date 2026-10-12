@@ -17,6 +17,7 @@ import { useMe } from '@/lib/usePermissions';
 import { refreshPreferences, usePreferences } from '@/lib/usePreferences';
 import { api } from '@/lib/client';
 import { Help } from '@/components/Help';
+import { pageHelpFor } from '@/lib/pageHelp';
 import type { Area } from '@/lib/permissions/model';
 import { featureHiddenPaths } from '@/lib/preferences';
 import {
@@ -640,11 +641,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <main className="flex-1 flex flex-col min-w-0">
         <header className="flex items-center justify-end gap-3 px-6 pt-4 -mb-2">
           {/* "What is this page?" — plain-language help for the current screen (lib/pageHelp.ts). */}
-          <span className="mr-auto text-sm text-navy/60">
-            <Help page={pathname} side="bottom">
-              What is this page?
-            </Help>
-          </span>
+          {pageHelpFor(pathname) ? (
+            <span className="mr-auto text-sm text-navy/60">
+              <Help key={pathname} page={pathname} side="bottom">
+                What is this page?
+              </Help>
+            </span>
+          ) : (
+            <span className="mr-auto" />
+          )}
           <button
             type="button"
             onClick={() => setAssistantOpen(true)}

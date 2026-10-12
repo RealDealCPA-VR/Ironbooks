@@ -18,6 +18,7 @@ const MENU_SECTIONS = [
     items: [
       { label: 'Home', route: '/dashboard' },
       { label: 'Calendar', route: '/calendar' },
+      { label: 'To Do List', route: '/todos' },
       { label: 'Reminders', route: '/reminders' },
       { label: 'Lead Center', route: '/leads' },
       { label: 'Doc Center', route: '/attachments' },
