@@ -14,7 +14,8 @@
 import { and, asc, eq, gte, isNotNull, lte, sql } from 'drizzle-orm';
 import { invoices, salesReps } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { assertClosedPeriodEdit } from './postedEdit';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -214,12 +215,23 @@ export async function assignRepToInvoice(
   ctx: ServiceContext,
   input: { invoiceId: string; salesRepId: string | null },
 ) {
+  return inTransaction(ctx, async (tx) => assignRepToInvoiceTx(tx, input));
+}
+
+async function assignRepToInvoiceTx(ctx: ServiceContext, input: { invoiceId: string; salesRepId: string | null }) {
   // Verify the invoice belongs to this company.
   const [inv] = await ctx.db
-    .select({ id: invoices.id })
+    .select({ id: invoices.id, date: invoices.date, postedEntryId: invoices.postedEntryId, salesRepId: invoices.salesRepId })
     .from(invoices)
     .where(and(eq(invoices.id, input.invoiceId), eq(invoices.companyId, ctx.companyId)));
   if (!inv) throw notFound('Invoice');
+  if ((inv.salesRepId ?? null) === input.salesRepId) {
+    const [same] = await ctx.db.select().from(invoices).where(eq(invoices.id, inv.id));
+    return same;
+  }
+  // Closing date: changing the rep changes a closed-period invoice (and its commission), so it
+  // needs the closing date password like any other edit (and is listed as an exception).
+  await assertClosedPeriodEdit(ctx, { entryId: inv.postedEntryId, what: 'invoice sales rep', date: inv.date });
 
   // If assigning a rep, verify they belong to this company and are active.
   if (input.salesRepId !== null) {
