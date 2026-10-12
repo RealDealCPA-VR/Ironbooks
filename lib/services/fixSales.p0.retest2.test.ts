@@ -421,6 +421,40 @@ describe('fix/sales P0 — re-test round 2', () => {
       // turn into a 'partial' estimate the user had turned down).
       if (!refused) expect(e.status).toBe('rejected');
     });
+
+    it('doer round 3: every invoice path refuses links to a rejected estimate and the status stays rejected', async () => {
+      const { customerId, estimateId, labor } = await twoLineEstimate(E, 'Rejected Rory');
+      // Pending invoice saved while the estimate was still open...
+      const draft = await createInvoice(E.ctx, { customerId, date: d('2025-04-05'), status: 'draft', lines: [laborLine(labor.id, 5)] });
+      // ...and an unlinked posted invoice for the same customer.
+      const plain = await createInvoice(E.ctx, {
+        customerId,
+        date: d('2025-04-05'),
+        lines: [{ description: 'Extra', quantity: 1, rate: 10, taxable: false }],
+      });
+      await updateEstimateStatus(E.ctx, estimateId, 'rejected');
+      const arBefore = await arControl(E);
+
+      await expect(
+        createInvoice(E.ctx, { customerId, date: d('2025-04-05'), lines: [laborLine(labor.id, 5)] }),
+      ).rejects.toThrow(/rejected/);
+      await expect(
+        updateInvoice(E.ctx, plain.id, { customerId, date: d('2025-04-05'), lines: [laborLine(labor.id, 5)] }),
+      ).rejects.toThrow(/rejected/);
+      await expect(postDraftInvoice(E.ctx, draft.id)).rejects.toThrow(/rejected/);
+      await expect(postDraftInvoice(E.ctx, draft.id, { allowOverBilling: true })).rejects.toThrow(/rejected/);
+      expect((await getInvoice(E.ctx, draft.id)).status).toBe('draft');
+      expect(await arControl(E)).toBe(arBefore);
+
+      const e = await getEstimate(E.ctx, estimateId);
+      expect(e.status).toBe('rejected');
+      expect(e.lines.find((l) => l.id === labor.id)!.amountInvoiced).toBe('0.00');
+      // The rejection can still be undone, after which billing works as usual.
+      await updateEstimateStatus(E.ctx, estimateId, 'accepted');
+      await postDraftInvoice(E.ctx, draft.id);
+      expect((await getEstimate(E.ctx, estimateId)).status).toBe('partial');
+      await assertBooks(E);
+    });
   });
 
   // ===========================================================================

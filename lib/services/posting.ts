@@ -17,6 +17,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { MAX_LEDGER_AMOUNT, Money, MoneyParseError, toAmountString } from '@/lib/money';
 import {
   accounts,
+  auditLogs,
   creditMemos,
   journalEntries,
   journalEntryLines,
@@ -436,6 +437,7 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
 async function restoreRefundedCustomerCredit(
   tx: ServiceContext,
   docId: string,
+  entryId: string,
   lines: Array<{ debit: string | null; credit: string | null }>,
 ) {
   // The refund posts Dr A/R / Cr bank: the A/R debit equals the bank credit, i.e. the entry total.
@@ -473,8 +475,28 @@ async function restoreRefundedCustomerCredit(
     .from(paymentsReceived)
     .where(and(eq(paymentsReceived.companyId, tx.companyId), eq(paymentsReceived.id, docId)));
   if (payment) {
+    // The exact refunded amount (payment currency) is on the refund's audit row; converting the
+    // base amount back can be a cent off at some exchange rates, so that is only the fallback.
     const rate = Money.of(payment.exchangeRate ?? 1);
-    const amount = rate.greaterThan(0) && !rate.equals(1) ? Money.round2(Money.div(base, rate)) : base;
+    const [refundAudit] = await tx.db
+      .select({ newValues: auditLogs.newValues })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, tx.companyId),
+          eq(auditLogs.entityType, 'payment_received'),
+          eq(auditLogs.entityId, payment.id),
+          sql`${auditLogs.newValues}->>'action' = 'refund'`,
+          sql`${auditLogs.newValues}->>'postedEntryId' = ${entryId}`,
+        ),
+      )
+      .limit(1);
+    const recorded = (refundAudit?.newValues as { amount?: string } | null)?.amount;
+    const amount = recorded
+      ? Money.round2(Money.of(recorded))
+      : rate.greaterThan(0) && !rate.equals(1)
+        ? Money.round2(Money.div(base, rate))
+        : base;
     const unapplied = Money.round2(Money.of(payment.unapplied).plus(amount));
     await tx.db
       .update(paymentsReceived)
@@ -551,7 +573,7 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       newValues: { status: 'void' },
     });
     if (entry.sourceRef?.startsWith('refund:')) {
-      await restoreRefundedCustomerCredit(tx, entry.sourceRef.slice('refund:'.length), lines);
+      await restoreRefundedCustomerCredit(tx, entry.sourceRef.slice('refund:'.length), entryId, lines);
     }
     await recordClosingDateException(tx, periodCheck, {
       entryId,

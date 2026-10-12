@@ -57,6 +57,8 @@ _Final audit, 2026-10-12, after waves 1 and 2 were merged (PR #3). Seven read-on
 - **Old dollar-only progress invoices (before migration 0036):** they billed estimate dollars, not lines. Backfill 2 in drizzle/0036_fix_sales.sql spreads what they billed across the estimate lines, pro rata, as fixed "prior" amounts. Voiding one of those old invoices does not give its amount back to the estimate. Progress invoices made after 0036 are linked line by line, and voiding them does give the amount back.
 - **Foreign-currency customers (follow-up):** customerArLedgerBalance counts exchange-rate adjustment entries (sourceRef payment:<id>), but customerStatement does not list them as lines. For a customer billed in another currency, the statement can differ from the home-currency A/R by the exchange difference. Home-currency customers tie: statement = A/R GL = aging.
 - **A/R aging as of a past date:** credit memos refunded after the cutoff are added back (same rule as refunded overpayments). Credit-memo applications still have no date, so they are treated as always applied (existing limit, noted in arAging).
+- **Voided refunds:** voiding a customer refund (refund:<id> for a credit memo or an overpayment) gives the customer the credit back; a foreign-currency overpayment gets back the exact amount recorded on the refund. Follow-up outside the sales brief: voiding a vendor-credit refund (refund:<vendorCreditId>, the A/P side) does not yet give the vendor credit back.
+- **Rejected estimates:** no invoice path bills one (progress invoice, conversion, plain invoice, edit, or posting a pending invoice); the estimate keeps its 'rejected' status.
 
 ## Area: setup-multiuser
 

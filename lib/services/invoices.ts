@@ -69,7 +69,12 @@ import {
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { allocateDocNumber, docRef } from './docNumbers';
-import { checkEstimateOverBilling, estimatesBilledByInvoice, refreshEstimateBilling } from './estimateBilling';
+import {
+  assertEstimatesNotRejected,
+  checkEstimateOverBilling,
+  estimatesBilledByInvoice,
+  refreshEstimateBilling,
+} from './estimateBilling';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -642,7 +647,13 @@ async function prepareInvoice(
   const linkedIds = [...new Set(input.lines.map((l) => l.estimateLineId).filter(Boolean) as string[])];
   if (linkedIds.length > 0) {
     const rows = await ctx.db
-      .select({ id: estimateLines.id, itemId: estimateLines.itemId, customerId: estimates.customerId })
+      .select({
+        id: estimateLines.id,
+        itemId: estimateLines.itemId,
+        customerId: estimates.customerId,
+        estimateStatus: estimates.status,
+        estimateNumber: estimates.estimateNumber,
+      })
       .from(estimateLines)
       .innerJoin(estimates, eq(estimates.id, estimateLines.estimateId))
       .where(and(eq(estimates.companyId, ctx.companyId), inArray(estimateLines.id, linkedIds)));
@@ -653,6 +664,13 @@ async function prepareInvoice(
       if (!el) throw notFound(`Estimate line ${l.estimateLineId}`);
       if (el.customerId !== input.customerId) {
         throw validation(`Line ${i + 1} bills an estimate for a different customer.`);
+      }
+      // Same rule as progress invoicing and estimate conversion: a declined estimate is not billed.
+      if (el.estimateStatus === 'rejected') {
+        throw new ServiceError(
+          'CONFLICT',
+          `Line ${i + 1} bills estimate ${el.estimateNumber}, which the customer rejected. Mark the estimate accepted before invoicing it.`,
+        );
       }
       if ((el.itemId ?? null) !== (l.itemId ?? null)) {
         throw validation(`Line ${i + 1}: the item does not match the estimate line it bills.`);
@@ -1586,7 +1604,9 @@ export async function postDraftInvoice(
     }
 
     // Lines that bill estimate lines start counting now: same over-billing rule as
-    // createProgressInvoice (the stored links stay on the stored lines).
+    // createProgressInvoice (the stored links stay on the stored lines). A rejected estimate
+    // is not billed at all.
+    await assertEstimatesNotRejected(tx, storedLines);
     await checkEstimateOverBilling(tx, storedLines, {
       excludeInvoiceId: id,
       allowOverBilling: opts?.allowOverBilling,

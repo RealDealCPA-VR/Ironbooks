@@ -199,6 +199,32 @@ export async function checkEstimateOverBilling(
   return over;
 }
 
+/**
+ * Refuse billing a rejected estimate (QB: a declined estimate is not invoiced). Used where the
+ * stored links of a pending invoice start counting (posting it); createInvoice / updateInvoice
+ * check the same rule while validating their links.
+ */
+export async function assertEstimatesNotRejected(
+  ctx: ServiceContext,
+  lines: Array<{ estimateLineId?: string | null }>,
+) {
+  const ids = [...new Set(lines.map((l) => l.estimateLineId).filter(Boolean) as string[])];
+  if (ids.length === 0) return;
+  const rows = await ctx.db
+    .selectDistinct({ estimateNumber: estimates.estimateNumber })
+    .from(estimateLines)
+    .innerJoin(estimates, eq(estimates.id, estimateLines.estimateId))
+    .where(
+      and(eq(estimates.companyId, ctx.companyId), inArray(estimateLines.id, ids), eq(estimates.status, 'rejected')),
+    );
+  if (rows.length > 0) {
+    throw new ServiceError(
+      'CONFLICT',
+      `This invoice bills estimate ${rows.map((r) => r.estimateNumber).join(', ')}, which the customer rejected. Mark the estimate accepted before invoicing it.`,
+    );
+  }
+}
+
 /** Estimates billed by the given invoice (through its linked lines). */
 export async function estimatesBilledByInvoice(ctx: ServiceContext, invoiceId: string): Promise<string[]> {
   const rows = await ctx.db
@@ -267,7 +293,9 @@ export async function refreshEstimateBilling(
 
   let status = est.status;
   let convertedInvoiceId = est.convertedInvoiceId;
-  if (allBilled && anyBilled) {
+  if (est.status === 'rejected') {
+    // A rejected estimate keeps its status (invoices cannot bill it; this only guards legacy links).
+  } else if (allBilled && anyBilled) {
     status = 'closed';
     convertedInvoiceId = opts.closingInvoiceId ?? est.convertedInvoiceId;
     if (!convertedInvoiceId) {
