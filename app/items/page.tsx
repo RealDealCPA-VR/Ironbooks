@@ -29,6 +29,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
+import { usePreferences } from '@/lib/usePreferences';
 import Link from 'next/link';
 import { Help } from '@/components/Help';
 
@@ -162,6 +163,7 @@ const NO_ACCOUNT_TYPES: ItemType[] = ['subtotal', 'payment'];
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 function ItemsPageContent() {
+  const { company: prefs } = usePreferences();
   const [items, setItems] = useState<Item[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
@@ -510,14 +512,19 @@ function ItemsPageContent() {
                 onChange={(e) => setField('type', e.target.value as ItemType)}
               >
                 <option value="service">Service</option>
-                <option value="inventory">Inventory</option>
+                {/* QB hides Inventory Part while "Track inventory" is off (the server refuses it too). */}
+                {(prefs.inventoryEnabled || editingItem?.type === 'inventory') && (
+                  <option value="inventory">Inventory</option>
+                )}
                 <option value="non_inventory">Non-Inventory</option>
                 <option value="bundle">Bundle (group)</option>
                 <option value="other_charge">Other Charge</option>
                 <option value="discount">Discount</option>
                 <option value="subtotal">Subtotal</option>
                 <option value="payment">Payment</option>
-                <option value="sales_tax">Sales Tax</option>
+                {(prefs.salesTaxEnabled || editingItem?.type === 'sales_tax') && (
+                  <option value="sales_tax">Sales Tax</option>
+                )}
               </Select>
             </div>
             <div>

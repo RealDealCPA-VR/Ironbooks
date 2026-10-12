@@ -178,6 +178,7 @@ function EstimateFormBody({
     0,
   );
   const selectedRate = taxRates.find((t) => t.id === form.taxRateId);
+  const salesTaxOn = usePreferences().company.salesTaxEnabled;
   const taxAmount = taxableSubtotal * (selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
   const total = subtotal + taxAmount;
 
@@ -221,7 +222,8 @@ function EstimateFormBody({
             onChange={(e) => onChange('expirationDate', e.target.value)}
           />
         </div>
-        <div>
+        {/* Hidden while "Charge sales tax" is off (QB removes tax from forms); an old document keeps its tax. */}
+        {(salesTaxOn || form.taxRateId) && (<div>
           <Label htmlFor="est-taxrate">Sales Tax</Label>
           <Select
             id="est-taxrate"
@@ -235,7 +237,7 @@ function EstimateFormBody({
               </option>
             ))}
           </Select>
-        </div>
+        </div>)}
       </div>
 
       <div>
