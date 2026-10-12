@@ -241,9 +241,10 @@ async function buildBillableLines(
   const costById = new Map(unbilled.costs.map((c) => [c.id, c]));
   const timeById = new Map(unbilled.time.map((t) => [t.id, t]));
 
-  const markup = Money.of(selection.markupPercent ?? 0);
+  const route = await reimbursementAccountResolver(ctx);
+  // Time & Expenses > "Default markup percentage" applies when the caller gives no markup.
+  const markup = Money.of(selection.markupPercent ?? route.defaultMarkupPercent ?? 0);
   if (markup.lessThan(0)) throw validation('Markup percent cannot be negative.');
-  const reimbursedTo = await reimbursementAccountResolver(ctx);
 
   const lines: InvoiceLineInput[] = [];
 
@@ -252,14 +253,14 @@ async function buildBillableLines(
     if (!cost || cost.source !== 'bill') {
       throw new ServiceError('CONFLICT', `Bill line ${id} is not an unbilled billable cost for this customer.`);
     }
-    lines.push({ ...costToLine(cost, markup), accountId: reimbursedTo(cost) });
+    lines.push(...costToLines(cost, markup, route));
   }
   for (const id of selection.expenseLineIds ?? []) {
     const cost = costById.get(id);
     if (!cost || cost.source !== 'expense') {
       throw new ServiceError('CONFLICT', `Expense line ${id} is not an unbilled billable cost for this customer.`);
     }
-    lines.push({ ...costToLine(cost, markup), accountId: reimbursedTo(cost) });
+    lines.push(...costToLines(cost, markup, route));
   }
   for (const id of selection.timeEntryIds ?? []) {
     const t = timeById.get(id);
@@ -279,42 +280,74 @@ async function buildBillableLines(
   return lines;
 }
 
+interface ReimbursementRouting {
+  /** Account the reimbursed COST is credited to. */
+  cost: (cost: UnbilledCost) => string | null;
+  /** Account the MARKUP is credited to (null = the default income account). */
+  markup: string | null;
+  defaultMarkupPercent: number;
+}
+
 /**
- * QB Time & Expenses > 'Track reimbursed expenses as income'. Off (the QB default): the amount
- * billed back to the customer is credited to the expense account the cost was recorded to, so
- * the expense nets down. On: it is credited to an income account for reimbursements (the
- * active income account whose name mentions 'reimburs', e.g. 4130 Reimbursed Expenses Income),
- * or the default income account when there is none.
+ * QB Time & Expenses > 'Track reimbursed expenses as income'.
+ *  - Off (the QB default): the reimbursed COST is credited back to the expense account it was
+ *    recorded to, so that expense nets to zero for costs passed through at cost.
+ *  - On: the cost is credited to an income account for reimbursements (the active income
+ *    account whose name mentions 'reimburs', e.g. 4130 Reimbursed Expenses Income), or the
+ *    default income account when there is none.
+ * Either way the MARKUP is income, never a reduction of expense: it goes to the active income
+ * account whose name mentions 'markup' (QB's Markup Income), or the default income account.
  */
-async function reimbursementAccountResolver(
-  ctx: ServiceContext,
-): Promise<(cost: UnbilledCost) => string | null> {
+async function reimbursementAccountResolver(ctx: ServiceContext): Promise<ReimbursementRouting> {
   const prefs = await getPreferences(ctx);
-  if (!prefs.trackReimbursedAsIncome) return (cost) => cost.accountId ?? null;
   const income = await ctx.db
     .select({ id: accounts.id, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.type, 'revenue'), eq(accounts.isActive, true)));
-  const reimbursed = income.find((a) => /reimburs/i.test(a.name));
-  return () => reimbursed?.id ?? null;
+  const markup = income.find((a) => /markup/i.test(a.name))?.id ?? null;
+  const defaultMarkupPercent = Number(prefs.defaultMarkupPercent) || 0;
+  if (!prefs.trackReimbursedAsIncome) {
+    return { cost: (cost) => cost.accountId ?? null, markup, defaultMarkupPercent };
+  }
+  const reimbursed = income.find((a) => /reimburs/i.test(a.name))?.id ?? null;
+  return { cost: () => reimbursed, markup, defaultMarkupPercent };
 }
 
-function costToLine(cost: UnbilledCost, markupPercent: ReturnType<typeof Money.zero>): InvoiceLineInput {
-  const base = Money.of(cost.amount);
-  const marked = Money.round2(
-    base.plus(Money.mul(base, Money.div(markupPercent, 100))),
-  );
-  const markupNote = markupPercent.greaterThan(0)
-    ? ` (+${toAmountString(markupPercent)}% markup)`
-    : '';
-  return {
-    itemId: null,
-    description: `Billable ${cost.source === 'bill' ? 'cost' : 'expense'}: ${cost.description ?? cost.ref ?? 'reimbursable'}${markupNote}`,
-    quantity: 1,
-    rate: toAmountString(marked),
-    taxable: false,
-    jobId: cost.jobId,
-  };
+/**
+ * One invoice line for the cost (at cost) plus, when there is a markup, a separate markup line
+ * (QB adds the markup as its own line credited to the markup account).
+ */
+function costToLines(
+  cost: UnbilledCost,
+  markupPercent: ReturnType<typeof Money.zero>,
+  route: ReimbursementRouting,
+): InvoiceLineInput[] {
+  const base = Money.round2(Money.of(cost.amount));
+  const what = cost.description ?? cost.ref ?? 'reimbursable';
+  const lines: InvoiceLineInput[] = [
+    {
+      itemId: null,
+      accountId: route.cost(cost),
+      description: `Billable ${cost.source === 'bill' ? 'cost' : 'expense'}: ${what}`,
+      quantity: 1,
+      rate: toAmountString(base),
+      taxable: false,
+      jobId: cost.jobId,
+    },
+  ];
+  const markupAmount = Money.round2(Money.mul(base, Money.div(markupPercent, 100)));
+  if (markupAmount.greaterThan(0)) {
+    lines.push({
+      itemId: null,
+      accountId: route.markup,
+      description: `Markup on ${what} (+${toAmountString(markupPercent)}% markup)`,
+      quantity: 1,
+      rate: toAmountString(markupAmount),
+      taxable: false,
+      jobId: cost.jobId,
+    });
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------

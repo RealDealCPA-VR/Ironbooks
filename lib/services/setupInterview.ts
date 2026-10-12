@@ -17,6 +17,7 @@ import {
   BUSINESS_TYPES,
   ENTITY_TYPES,
   buildSetupPlan,
+  isIsoDate,
   suggestTaxLine,
   type InterviewAnswers,
   type SetupPlan,
@@ -50,6 +51,7 @@ export const setupInterviewSchema = z.object({
   startDate: z
     .string()
     .regex(/^\d{4}-\d{2}-\d{2}$/, 'Start date must be a date like 2026-01-01')
+    .refine((s) => isIsoDate(s), 'Start date is not a real calendar date (check the day and month)')
     .optional()
     .or(z.literal('').transform(() => undefined)),
   reportBasis: z.enum(['accrual', 'cash']),
@@ -131,6 +133,14 @@ export async function applySetupInterview(
   return inTransaction(ctx, async (tx) => {
     const existing = await listAccounts(tx, { includeInactive: true });
     const plan = buildSetupPlan(answers, existing);
+    // Turning payroll on again keeps a pay period / standard week the company already chose.
+    const current = ((await getCompany(tx))?.settings ?? {}) as Record<string, unknown>;
+    for (const k of ['payrollPayPeriod', 'payrollStandardHours'] as const) {
+      if (current[k] !== undefined && current[k] !== null) delete plan.settings[k];
+    }
+    if (plan.settings.payrollEnabled === true && plan.settings.payrollPayPeriod === undefined) {
+      plan.summary = plan.summary.map((r) => (r.startsWith('Payroll: on') ? 'Payroll: on (your pay period is kept)' : r));
+    }
 
     // 1. Settings through the Preferences schema + updateCompany whitelist.
     const settings = companySettingsSchema.parse(plan.settings);

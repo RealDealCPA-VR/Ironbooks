@@ -42,6 +42,7 @@ import {
 import { Button, Card, Input, Select, Label, toast, toastError } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { resolveCompanyPreferences } from '@/lib/preferences';
 import { cn } from '@/lib/utils';
 import {
   BUSINESS_TYPES,
@@ -168,14 +169,21 @@ function toAnswers(s: WizardState): InterviewAnswers {
 }
 
 /** Pre-fill from the open company (so re-running the interview starts from what is saved). */
-function prefill(company: { name: string; settings: Record<string, unknown> | null }): Partial<WizardState> {
+function prefill(
+  company: { name: string; settings: Record<string, unknown> | null },
+  isNew: boolean,
+): Partial<WizardState> {
   const s = company.settings ?? {};
   const str = (k: string) => (typeof s[k] === 'string' ? (s[k] as string) : '');
   const bool = (k: string, fallback: boolean) => (typeof s[k] === 'boolean' ? (s[k] as boolean) : fallback);
   const rec = (s.setupInterview && typeof s.setupInterview === 'object' ? s.setupInterview : {}) as Record<string, unknown>;
   const businessType = BUSINESS_TYPES.find((b) => b.industry === str('industry'))?.value;
   const fiscalYearStartMonth = fiscalYearStartMonthFromEnd(str('fiscalYearEnd') || '12-31');
-  const ran = rec.status === 'done';
+  // A brand-new company (?new=1) starts every feature at "No" so each one is a conscious
+  // choice. An existing company — finished, skipped or never asked — starts from the switches
+  // it uses today, so clicking straight through never turns off a feature already in use.
+  const prefs = resolveCompanyPreferences(s);
+  const cur = (k: keyof typeof prefs) => (isNew ? false : prefs[k] === true);
   return {
     ...(businessType ? { businessType } : {}),
     ...(ENTITY_TYPES.some((e) => e.value === rec.entityType) ? { entityType: rec.entityType as EntityType } : {}),
@@ -184,16 +192,14 @@ function prefill(company: { name: string; settings: Record<string, unknown> | nu
     ...(typeof rec.startDate === 'string' ? { startDate: rec.startDate } : {}),
     reportBasis: str('reportBasis') === 'cash' ? 'cash' : 'accrual',
     currency: /^[A-Z]{3}$/.test(str('currency')) ? str('currency') : 'USD',
-    // A company that already ran the interview starts from its saved switches; a brand-new one
-    // starts from "No" so every feature is a conscious choice.
-    salesTax: ran ? bool('salesTaxEnabled', false) : false,
-    inventory: ran ? bool('inventoryEnabled', false) : false,
-    inventoryTouched: ran,
-    employees: Boolean(s.payrollPayPeriod),
-    estimates: ran ? bool('estimatesEnabled', false) : false,
-    progressInvoicing: ran ? bool('progressInvoicingEnabled', false) : false,
-    timeTracking: ran ? bool('timeTrackingEnabled', false) : false,
-    classTracking: bool('classTrackingEnabled', false),
+    salesTax: cur('salesTaxEnabled'),
+    inventory: cur('inventoryEnabled'),
+    inventoryTouched: !isNew,
+    employees: cur('payrollEnabled'),
+    estimates: cur('estimatesEnabled'),
+    progressInvoicing: cur('estimatesEnabled') && cur('progressInvoicingEnabled'),
+    timeTracking: cur('timeTrackingEnabled'),
+    classTracking: cur('classTrackingEnabled'),
     multiCurrency: bool('multiCurrencyEnabled', false),
     company: {
       name: company.name ?? '',
@@ -709,7 +715,7 @@ function StepFeatures({ state, set, onBack, onNext }: StepProps) {
         <YesNo
           name="employees"
           question="Do you have employees?"
-          help="Choose Yes to run payroll here. (Independent contractors don't count — pay them as vendors.)"
+          help="Yes turns payroll on. No hides pay runs and payroll forms (your employee list stays). Independent contractors don't count — pay them as vendors."
           value={state.employees}
           onChange={(v) => set({ employees: v })}
         />
@@ -890,7 +896,7 @@ function Interview() {
     ])
       .then(([company, rec]) => {
         if (cancelled) return;
-        setState((prev) => ({ ...prev, ...prefill(company) }));
+        setState((prev) => ({ ...prev, ...prefill(company, params.get('new') === '1') }));
         setRerun(Boolean(rec) && params.get('new') !== '1');
       })
       .catch(() => {

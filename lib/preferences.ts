@@ -205,6 +205,8 @@ export interface CompanyPreferences {
   // Multiple Currencies
   multiCurrencyEnabled: boolean;
   // Payroll
+  /** QB Payroll & Employees "Full payroll" vs "No payroll": off hides pay runs and payroll forms. */
+  payrollEnabled: boolean;
   payrollPayPeriod: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly';
   payrollStandardHours: number;
   payrollExpenseAccountId: string | null;
@@ -270,6 +272,7 @@ export const DEFAULT_COMPANY_PREFERENCES: CompanyPreferences = {
   trackReimbursedAsIncome: false,
   defaultMarkupPercent: 0,
   multiCurrencyEnabled: false,
+  payrollEnabled: true,
   payrollPayPeriod: 'biweekly',
   payrollStandardHours: 40,
   payrollExpenseAccountId: null,
@@ -476,6 +479,7 @@ export const PREFERENCE_CATEGORIES: Array<{
     id: 'payroll',
     label: 'Payroll & Employees',
     company: [
+      'payrollEnabled',
       'payrollPayPeriod',
       'payrollStandardHours',
       'payrollExpenseAccountId',
@@ -628,7 +632,8 @@ export type FeatureKey =
   | 'salesTaxEnabled'
   | 'classTrackingEnabled'
   | 'priceLevelsEnabled'
-  | 'unitsOfMeasureEnabled';
+  | 'unitsOfMeasureEnabled'
+  | 'payrollEnabled';
 
 export interface FeatureGate {
   key: FeatureKey;
@@ -674,7 +679,13 @@ export const FEATURE_GATES: FeatureGate[] = [
     category: 'Items & Inventory',
     setting: 'Use purchase orders',
     pages: ['/purchase-orders', '/item-receipts', '/receive-bill'],
-    apis: ['/api/purchase-orders', '/api/receiving/po'],
+    apis: [
+      '/api/purchase-orders',
+      '/api/receiving/po',
+      '/api/receiving/bill',
+      '/api/item-receipts',
+      '/api/inventory/reorder/create-po',
+    ],
   },
   {
     key: 'inventoryEnabled',
@@ -740,6 +751,15 @@ export const FEATURE_GATES: FeatureGate[] = [
     pages: ['/lists/uom'],
     apis: ['/api/uom-sets'],
   },
+  {
+    key: 'payrollEnabled',
+    label: 'Payroll',
+    category: 'Payroll & Employees',
+    setting: 'Full payroll',
+    // The Employee list itself stays (QB keeps the Employee Center with "No payroll").
+    pages: ['/pay-runs', '/pay-stubs', '/pay-liabilities', '/payroll-tax', '/payroll-forms'],
+    apis: ['/api/payroll', '/api/pay-liabilities', '/api/payroll-items'],
+  },
 ];
 
 const underPrefix = (path: string, prefix: string) => path === prefix || path.startsWith(prefix + '/');
@@ -755,15 +775,21 @@ export function featureGateForPage(path: string): FeatureGate | null {
   return best?.gate ?? null;
 }
 
-/** The feature gate an API path belongs to, or null. */
-export function featureGateForApi(path: string): FeatureGate | null {
-  for (const gate of FEATURE_GATES) {
-    if (gate.apis.some((p) => underPrefix(path, p))) return gate;
-  }
-  return null;
+/** Every feature gate an API path belongs to (a path can need more than one feature). */
+export function featureGatesForApi(path: string): FeatureGate[] {
+  return FEATURE_GATES.filter((gate) => gate.apis.some((p) => underPrefix(path, p)));
 }
 
-/** The gate that blocks `path` for these preferences right now (page or API), or null. */
+/** The first feature gate an API path belongs to, or null. */
+export function featureGateForApi(path: string): FeatureGate | null {
+  return featureGatesForApi(path)[0] ?? null;
+}
+
+/**
+ * The gate that blocks `path` for these preferences right now (page or API), or null. Every
+ * matching gate is checked: e.g. "create purchase orders from the reorder list" needs both
+ * inventory and purchase orders.
+ */
 export function blockingFeatureGate(
   path: string,
   prefs: Pick<CompanyPreferences, FeatureKey>,
@@ -771,8 +797,11 @@ export function blockingFeatureGate(
 ): FeatureGate | null {
   const isApi = path === '/api' || path.startsWith('/api/');
   if (isApi && method.toUpperCase() === 'GET') return null;
-  const gate = isApi ? featureGateForApi(path) : featureGateForPage(path);
-  return gate && prefs[gate.key] === false ? gate : null;
+  if (!isApi) {
+    const gate = featureGateForPage(path);
+    return gate && prefs[gate.key] === false ? gate : null;
+  }
+  return featureGatesForApi(path).find((g) => prefs[g.key] === false) ?? null;
 }
 
 /** Plain-language "turned off" message (also matched by lib/friendlyErrors.ts). */

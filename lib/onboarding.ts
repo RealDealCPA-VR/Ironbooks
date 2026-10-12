@@ -564,9 +564,13 @@ export function summarizeSettings(
     onOff('timeTrackingEnabled', 'Time tracking'),
     onOff('classTrackingEnabled', 'Class tracking'),
     onOff('multiCurrencyEnabled', 'More than one currency', 'yes', 'no'),
-    settings.payrollPayPeriod
-      ? 'Payroll: ready (every 2 weeks, 40-hour week)'
-      : 'Payroll: not set up (you can add employees any time)',
+    settings.payrollEnabled === false
+      ? 'Payroll: off (pay runs and payroll forms are hidden; your employee list stays)'
+      : settings.payrollPayPeriod
+        ? 'Payroll: on (every 2 weeks, 40-hour week)'
+        : settings.payrollEnabled === true
+          ? 'Payroll: on (your pay period is kept)'
+          : null,
   ];
   return rows.filter((r): r is string => r !== null);
 }
@@ -610,6 +614,8 @@ export function buildSetupPlan(
   if (answers.classTracking !== undefined) settings.classTrackingEnabled = answers.classTracking;
   if (answers.multiCurrency !== undefined) settings.multiCurrencyEnabled = answers.multiCurrency;
   if (answers.currency && /^[A-Z]{3}$/.test(answers.currency)) settings.currency = answers.currency;
+  // "Do you have employees?" is QB's Full payroll / No payroll switch.
+  settings.payrollEnabled = answers.employees;
   if (answers.employees) {
     settings.payrollPayPeriod = 'biweekly';
     settings.payrollStandardHours = 40;
