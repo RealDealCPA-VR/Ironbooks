@@ -396,9 +396,17 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
     }
     const rollBack = async () => {
       await closeDb(dir).catch(() => undefined);
-      fs.rmSync(dir, { recursive: true, force: true });
+      // Move the refused files aside first (a rename, so the original always gets its name
+      // back even if deleting the refused copy fails), then put the original back.
+      const refusedDir = `${dir}.refused-restore-${Date.now()}`;
+      fs.renameSync(dir, refusedDir);
       if (preRestoreDir) fs.renameSync(preRestoreDir, dir);
       resetTransactionLogCache(dir);
+      try {
+        fs.rmSync(refusedDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch {
+        /* a leftover refused copy is harmless */
+      }
     };
     try {
       fs.renameSync(tmpDir, dir);

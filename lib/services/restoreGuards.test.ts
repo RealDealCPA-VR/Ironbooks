@@ -286,6 +286,25 @@ describe('opening a company file re-asserts the ledger guards', () => {
     const modes = await guardModes(db);
     for (const t of Object.keys(LEDGER_GUARD_TRIGGERS)) expect(modes[t]).toBe('A');
 
+    // Signing in still works (the only way to reach Back Up and Restore): a wrong password is a
+    // normal 401, not a crash.
+    const prevDir = process.env.BKA_DATA_DIR;
+    process.env.BKA_DATA_DIR = co.dir;
+    try {
+      const { POST: login } = await import('@/app/api/auth/login/route');
+      const res = await login(
+        new NextRequest('http://localhost/api/auth/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ email: 'nobody@test.local', password: 'wrong-password' }),
+        }),
+      );
+      expect(res.status).toBe(401);
+    } finally {
+      if (prevDir === undefined) delete process.env.BKA_DATA_DIR;
+      else process.env.BKA_DATA_DIR = prevDir;
+    }
+
     // Restoring a good backup over the damaged file works and the file opens again.
     await restoreBackup(goodBackup, co.dir);
     const restored = await getDb(co.dir);
