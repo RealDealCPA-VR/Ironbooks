@@ -131,7 +131,14 @@ describe('qbImport — extended IIF + CSV', () => {
     expect(mapIifItemType('SERV')).toBe('service');
     expect(mapIifItemType('INVPART')).toBe('inventory');
     expect(mapIifItemType('NONINVPART')).toBe('non_inventory');
-    expect(mapIifItemType('OTHC')).toBe('non_inventory');
+    expect(mapIifItemType('OTHC')).toBe('other_charge');
+    expect(mapIifItemType('DISC')).toBe('discount');
+    expect(mapIifItemType('PMT')).toBe('payment');
+    expect(mapIifItemType('STAX')).toBe('sales_tax');
+    expect(mapIifItemType('COMPTAX')).toBe('sales_tax');
+    expect(mapIifItemType('GRP')).toBe('bundle');
+    expect(mapIifItemType('SUBT')).toBe('subtotal');
+    expect(mapIifItemType('ASSEMBLY')).toBe('inventory');
     expect(mapIifItemType('')).toBe('service');
   });
 

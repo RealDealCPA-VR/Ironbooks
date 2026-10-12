@@ -99,6 +99,7 @@ export const navGroups: NavGroup[] = [
       { icon: BookOpen, label: 'Chart of Accounts', path: '/accounts' },
       { icon: Landmark, label: 'Pay Liabilities', path: '/pay-liabilities' },
       { icon: UserSquare, label: 'Payroll', path: '/employees' },
+      { icon: Settings, label: 'Payroll Setup', path: '/employees/setup' },
       { icon: CalendarClock, label: 'Pay Runs', path: '/pay-runs' },
       { icon: FileSpreadsheet, label: 'Pay Stubs', path: '/pay-stubs' },
       { icon: ClipboardList, label: 'Payroll Forms', path: '/payroll-forms' },
@@ -124,6 +125,7 @@ export const navGroups: NavGroup[] = [
       { icon: Boxes, label: 'Inventory Valuation', path: '/reports/inventory-valuation' },
       { icon: MapPin, label: 'Inventory by Site', path: '/reports/inventory-sites' },
       { icon: UserSquare, label: 'Payroll Reports', path: '/reports/payroll-summary' },
+      { icon: ClipboardList, label: 'Payroll Item Reports', path: '/payroll-forms/reports' },
       { icon: Banknote, label: 'Reconciliation Reports', path: '/reports/reconciliation' },
       { icon: Percent, label: 'Sales Tax Liability', path: '/reports/sales-tax' }, // wave2 accountant
       { icon: Network, label: 'Consolidated', path: '/reports/consolidated' },

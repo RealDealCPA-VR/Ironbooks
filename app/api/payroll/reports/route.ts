@@ -11,13 +11,21 @@
  *                payments against 2300) as of the range end date.
  *
  * Defaults: from = Jan 1 of the current year, to = today (UTC).
+ *
+ * ?report=earnings-summary | item-detail | transactions-by-payee | workers-comp returns that
+ * single report instead (Employee Earnings Summary, Payroll Item Detail, Payroll Transactions
+ * by Payee, Workers Comp Summary).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import {
+  employeeEarningsSummary,
+  payrollItemDetail,
   payrollSummary,
   payrollDetail,
   payrollLiabilityBalances,
+  payrollTransactionsByPayee,
+  workersCompSummary,
 } from '@/lib/services/payrollReports';
 import { ServiceError } from '@/lib/services/_base';
 
@@ -68,6 +76,25 @@ export async function GET(req: NextRequest) {
     const to = toParam
       ? new Date(toParam)
       : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+
+    // Single-report mode (QB report parity): ?report=earnings-summary | item-detail |
+    // transactions-by-payee | workers-comp  (item-detail also takes ?item=<name>).
+    const report = searchParams.get('report');
+    if (report) {
+      const range = { from, to, employeeId };
+      switch (report) {
+        case 'earnings-summary':
+          return NextResponse.json(await employeeEarningsSummary(ctx, range));
+        case 'item-detail':
+          return NextResponse.json(await payrollItemDetail(ctx, { ...range, item: searchParams.get('item') ?? undefined }));
+        case 'transactions-by-payee':
+          return NextResponse.json(await payrollTransactionsByPayee(ctx, range));
+        case 'workers-comp':
+          return NextResponse.json(await workersCompSummary(ctx, range));
+        default:
+          return NextResponse.json({ error: 'Unknown report', code: 'VALIDATION' }, { status: 400 });
+      }
+    }
 
     const [summary, detail, liabilities] = await Promise.all([
       payrollSummary(ctx, { from, to, employeeId }),

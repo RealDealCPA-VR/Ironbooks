@@ -36,6 +36,8 @@ import {
   checkPrintSettings, loanPayments, loans,
   // wave2 accountant
   clientReviewTasks, listChangeReviews, salesTaxLineLinks, workingTbNotes,
+  // wave2 payroll
+  payrollStateSettings, workersCompCodes,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
@@ -500,6 +502,10 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
     name: 'depositLines', table: depositLines, companyCol: deposits.companyId,
     joins: [{ table: deposits, on: [depositLines.depositId, deposits.id] }],
   },
+  // wave2 payroll: SUI/SDI settings and workers' comp class codes (employees.workersCompCodeId
+  // is a soft pointer remapped through the global id map).
+  { name: 'payrollStateSettings', table: payrollStateSettings, joins: [], companyCol: payrollStateSettings.companyId },
+  { name: 'workersCompCodes', table: workersCompCodes, joins: [], companyCol: workersCompCodes.companyId },
   { name: 'paychecks', table: paychecks, joins: [], companyCol: paychecks.companyId },
   {
     name: 'paycheckLines', table: paycheckLines, companyCol: paychecks.companyId,

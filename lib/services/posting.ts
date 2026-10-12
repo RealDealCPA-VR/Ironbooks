@@ -193,6 +193,10 @@ const DOCUMENT_SIDE: Record<string, 'ar' | 'ap' | 'either' | 'none' | 'import'> 
   condense: 'import',
   iif: 'import',
   qbgl: 'import',
+  // wave2 payroll/QB migration (openItemsImport.ts): the conversion offset that moves an
+  // already-imported GL control balance onto the open documents — an import artifact, unnamed
+  // by design (the documents carry the per-name detail).
+  'qbopen-offset': 'import',
 };
 
 function documentSide(sourceRef: string | null | undefined) {

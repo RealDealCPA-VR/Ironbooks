@@ -271,7 +271,7 @@ export function statePerPeriod({
   const periods = new Decimal(periodsPerYear);
   const annualGross = grossPer.times(periods);
 
-  const annualStateTaxStr = computeStateWithholding({ state: state.toUpperCase(), annualTaxable: annualGross.toNumber() });
+  const annualStateTaxStr = computeStateWithholding({ state: state.toUpperCase(), annualTaxable: annualGross.toString() });
   const annualStateTax = new Decimal(annualStateTaxStr);
   const stateTaxPerPeriod = Money.round2(annualStateTax.dividedBy(periods));
 

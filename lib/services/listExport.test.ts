@@ -164,7 +164,7 @@ describe('listExport service (integration)', () => {
     expect(filename).toMatch(/^customers-\d{4}-\d{2}-\d{2}\.csv$/);
     const lines = rows(csv);
     expect(lines[0]).toBe(
-      'Name,Company,Email,Phone,Billing Address,Shipping Address,Terms,Credit Limit,Taxable,Balance,Notes,Active',
+      'Name,Company,Email,Phone,Billing Address,Shipping Address,Terms,Credit Limit,Taxable,Customer Type,Parent,Balance,Notes,Active',
     );
     expect(lines).toHaveLength(3); // header + 2 customers
     // CSV-hostile name correctly escaped
@@ -183,7 +183,7 @@ describe('listExport service (integration)', () => {
     const { csv } = await exportListCsv(ctx, 'vendors');
     const lines = rows(csv);
     expect(lines[0]).toBe(
-      'Name,Company,Email,Phone,Address,Terms,1099 Vendor,Balance,Notes,Active',
+      'Name,Company,Email,Phone,Address,Terms,1099 Vendor,Vendor Type,Balance,Notes,Active',
     );
     expect(lines).toHaveLength(2);
     expect(lines[1]).toContain('Vendor One');
@@ -214,7 +214,7 @@ describe('listExport service (integration)', () => {
   it('exports employees WITHOUT the SSN', async () => {
     const { csv } = await exportListCsv(ctx, 'employees');
     const lines = rows(csv);
-    expect(lines[0]).toBe('First Name,Last Name,Email,Pay Type,Pay Rate,Address,Active');
+    expect(lines[0]).toBe('First Name,Last Name,Email,Phone,Pay Type,Pay Rate,Address,Hire Date,Release Date,Active');
     expect(lines).toHaveLength(2);
     expect(lines[1]).toContain('Pat');
     expect(lines[1]).toContain('22.50');
