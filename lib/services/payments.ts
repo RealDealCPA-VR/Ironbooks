@@ -633,11 +633,22 @@ async function postPayment(
   const cashBase = Money.round2(Money.mul(totalAmount, paymentRate));
   let arBase = Money.zero();
   let discountBase = Money.zero();
+  // p1 fx: each application relieves home(balance before) - home(balance after), so the
+  // application that brings the foreign balance to zero clears exactly the home balance left
+  // (no stray cent on A/R after several partial payments; A/R == aging).
+  const runningBalance = new Map<string, ReturnType<typeof Money.zero>>();
   for (const app of input.applications) {
     const inv = invoiceById.get(app.invoiceId)!;
     const rate = Money.of(inv.exchangeRate ?? 1);
-    arBase = arBase.plus(Money.round2(Money.mul(Money.round2(app.amountApplied ?? 0), rate)));
-    discountBase = discountBase.plus(Money.round2(Money.mul(Money.round2(app.discountAmount ?? 0), rate)));
+    const applied = Money.round2(app.amountApplied ?? 0);
+    const disc = Money.round2(app.discountAmount ?? 0);
+    const before = runningBalance.get(app.invoiceId) ?? Money.of(inv.balanceDue);
+    const after = before.minus(applied).minus(disc);
+    runningBalance.set(app.invoiceId, after);
+    const relief = Money.round2(Money.mul(before, rate)).minus(Money.round2(Money.mul(after, rate)));
+    const discHome = Money.round2(Money.mul(disc, rate));
+    arBase = arBase.plus(relief.minus(discHome));
+    discountBase = discountBase.plus(discHome);
   }
   if (unapplied.greaterThan(0)) {
     arBase = arBase.plus(Money.round2(Money.mul(unapplied, paymentRate)));
@@ -655,9 +666,20 @@ async function postPayment(
     credit?: string;
     memo?: string;
     controlLine?: boolean;
+    foreignAmount?: string;
   }> = [];
   if (cashBase.greaterThan(0)) {
-    postingLines.push({ accountId: depositAccountId, debit: toAmountString(cashBase), memo: 'Payment received' });
+    // p1 fx: deposited straight into a bank in the payment's currency -> the register shows the
+    // amount received in that currency (not a list-rate conversion of the home amount).
+    const [depCurRow] = paymentCurrency
+      ? await tx.db.select({ currency: accounts.currency }).from(accounts).where(eq(accounts.id, depositAccountId))
+      : [];
+    postingLines.push({
+      accountId: depositAccountId,
+      debit: toAmountString(cashBase),
+      memo: 'Payment received',
+      ...(paymentCurrency && depCurRow?.currency === paymentCurrency ? { foreignAmount: amountStr } : {}),
+    });
   }
   if (discountAccountId && discountBase.greaterThan(0)) {
     postingLines.push({ accountId: discountAccountId, debit: toAmountString(discountBase), memo: 'Early-payment discount' });

@@ -412,7 +412,7 @@ function assertEditKeepsApplications(
   }
   if (
     (input.currency ?? null) !== (existing.currency ?? null) ||
-    !Money.eq(prep.exchangeRate, Money.round2(existing.exchangeRate ?? 1))
+    !Money.eq(prep.exchangeRate, Money.of(existing.exchangeRate ?? 1))
   ) {
     throw new ServiceError(
       'CONFLICT',
@@ -535,7 +535,9 @@ async function prepareInvoice(
   }
 
   // Validate exchange rate.
-  const exchangeRate = Money.round2(input.exchangeRate ?? 1);
+  // Keep the rate at full precision (QB allows 4+ decimals; the column is numeric(18,8)) —
+  // only home amounts are rounded to cents.
+  const exchangeRate = Money.of(Money.of(input.exchangeRate ?? 1).toFixed(8));
   if (exchangeRate.lessThanOrEqualTo(0)) throw validation('Exchange rate must be positive.');
 
   // Verify customer belongs to company; also load creditLimit for the credit check.
@@ -1398,7 +1400,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
 
     // Resolve currency fields.
     const currency = input.currency ?? null;
-    const exchangeRateStr = toAmountString(prep.exchangeRate);
+    const exchangeRateStr = prep.exchangeRate.toFixed(8);
 
     // 1) Insert invoice header.
     //    subtotal / discount / taxAmount / total / balanceDue are stored in TRANSACTION currency.
@@ -1809,7 +1811,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           jobId: prep.headerJobId,
           salesRepId: input.salesRepId ?? null,
           currency: input.currency ?? null,
-          exchangeRate: toAmountString(prep.exchangeRate),
+          exchangeRate: prep.exchangeRate.toFixed(8),
           discountType: prep.discountType,
           subtotal: toAmountString(prep.subtotal),
           discount: toAmountString(prep.discount),
@@ -1924,7 +1926,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         jobId: prep.headerJobId,
         salesRepId: input.salesRepId ?? null,
         currency: input.currency ?? null,
-        exchangeRate: toAmountString(prep.exchangeRate),
+        exchangeRate: prep.exchangeRate.toFixed(8),
         discountType: prep.discountType,
         subtotal: toAmountString(prep.subtotal),
         discount: toAmountString(prep.discount),

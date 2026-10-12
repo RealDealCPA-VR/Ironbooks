@@ -622,16 +622,29 @@ export async function reverseEntry(ctx: ServiceContext, id: string, asOfDate?: D
     throw validation('A valid reversal date is required.');
   }
 
+  // p1 fx: carry each line's foreign amount so the reversal takes the same foreign amount back
+  // out (not a list-rate conversion of the home amount). The side flips with debit/credit.
+  const fxRows = await ctx.db
+    .select({ id: journalEntryLines.id, currency: journalEntryLines.currency, foreignAmount: journalEntryLines.foreignAmount })
+    .from(journalEntryLines)
+    .where(eq(journalEntryLines.journalEntryId, id));
+  const fxById = new Map(fxRows.map((r) => [r.id, r]));
+  const fxCurrencies = new Set(fxRows.filter((r) => r.foreignAmount != null && r.currency).map((r) => r.currency!));
+
   // Swap debits and credits, preserving memo + class on each line.
-  const lines: PostingLine[] = original.lines.map((l) => ({
-    accountId: l.accountId,
-    debit: l.credit ?? undefined,
-    credit: l.debit ?? undefined,
-    memo: l.memo,
-    classId: l.classId,
-    entityType: l.entityType,
-    entityId: l.entityId,
-  }));
+  const lines: PostingLine[] = original.lines.map((l) => {
+    const fx = fxById.get(l.id);
+    return {
+      accountId: l.accountId,
+      debit: l.credit ?? undefined,
+      credit: l.debit ?? undefined,
+      memo: l.memo,
+      classId: l.classId,
+      entityType: l.entityType,
+      entityId: l.entityId,
+      ...(fx?.foreignAmount != null ? { foreignAmount: fx.foreignAmount } : {}),
+    };
+  });
 
   return postJournalEntry(ctx, {
     date,
@@ -641,6 +654,7 @@ export async function reverseEntry(ctx: ServiceContext, id: string, asOfDate?: D
     lines,
     sourceRef: `reversal:${id}`,
     isAdjusting: original.isAdjusting,
+    ...(fxCurrencies.size === 1 ? { currency: [...fxCurrencies][0] } : {}),
   });
 }
 

@@ -36,9 +36,11 @@ import {
   deposits,
   depositLines,
   journalEntries,
+  journalEntryLines,
   paymentsReceived,
   salesReceipts,
 } from '@/lib/db/schema';
+import Decimal from 'decimal.js';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -52,6 +54,27 @@ import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting'
 import { planPostedEdit, retitleEntry } from './postedEdit';
 import { homeAmounts } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
+
+/** p1 fx: home amount each payment's posted entry put into Undeposited Funds (debits - credits). */
+async function postedUndepositedHome(
+  ctx: ServiceContext,
+  payRows: Array<{ id: string; postedEntryId: string | null }>,
+  ufId: string,
+): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>();
+  const byEntry = new Map(payRows.filter((p) => p.postedEntryId).map((p) => [p.postedEntryId!, p.id]));
+  if (byEntry.size === 0) return out;
+  const rows = await ctx.db
+    .select({ entryId: journalEntryLines.journalEntryId, debit: journalEntryLines.debit, credit: journalEntryLines.credit })
+    .from(journalEntryLines)
+    .where(and(inArray(journalEntryLines.journalEntryId, [...byEntry.keys()]), eq(journalEntryLines.accountId, ufId)));
+  for (const r of rows) {
+    const pid = byEntry.get(r.entryId)!;
+    const prev = out.get(pid) ?? Money.zero();
+    out.set(pid, prev.plus(Money.of(r.debit ?? 0)).minus(Money.of(r.credit ?? 0)));
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Structured deposit-line description prefixes (see schema note above).
@@ -491,9 +514,12 @@ async function prepareDeposit(
   const bankHome = fx ? toHome(net, rate) : Money.round2(net);
   const cashBackHome = fx ? toHome(cashBackAmt, rate) : cashBackAmt;
   // Undeposited Funds is relieved at the home value each payment was received at.
+  // Use the home amount actually posted to UF by the payment's own entry (the stored payment
+  // rate is rounded, so recomputing amount x rate can miss by a few cents).
+  const postedUf = fx ? await postedUndepositedHome(ctx, payRows, ufId) : new Map<string, Decimal>();
   let ufHome = Money.zero();
   for (const p of payRows) {
-    ufHome = ufHome.plus(fx ? toHome(p.amount, p.exchangeRate ?? 1) : Money.of(p.amount));
+    ufHome = ufHome.plus(fx ? (postedUf.get(p.id) ?? toHome(p.amount, p.exchangeRate ?? 1)) : Money.of(p.amount));
   }
   for (const r of srRows) ufHome = ufHome.plus(Money.of(r.total));
   const extraHome = homeAmounts(

@@ -113,13 +113,27 @@ async function currencyOfAccount(ctx: ServiceContext, id: string, home: string |
   return foreignCode(row?.currency ?? null, home);
 }
 
+/** Parse an optional stated home amount (> 0). A money amount, not a rate: no rate ceiling. */
+function parseHomeAmount(v: string | number | null | undefined): Decimal | null {
+  if (v === undefined || v === null || String(v).trim() === '') return null;
+  let r: Decimal;
+  try {
+    r = Money.of(v);
+  } catch {
+    throw validation('Home amount is not a number.');
+  }
+  if (!r.isFinite() || !r.greaterThan(0)) throw validation('Home amount must be greater than zero.');
+  if (r.greaterThan('9999999999999.99')) throw validation('Home amount is too large.');
+  return Money.round2(r);
+}
+
 /** Resolve currencies and the home / to amounts of a transfer (see the header). */
 async function resolveTransferFx(ctx: ServiceContext, input: CreateTransferInput, amountStr: string): Promise<TransferFx> {
   const home = await homeCode(ctx);
   const fromCurrency = await currencyOfAccount(ctx, input.fromAccountId, home);
   const toCurrency = await currencyOfAccount(ctx, input.toAccountId, home);
   const amount = Money.of(amountStr);
-  const homeOverride = parseRate(input.homeAmount, 'Home amount');
+  const homeOverride = parseHomeAmount(input.homeAmount);
   const homeLabel = home ?? 'home currency';
 
   if (!fromCurrency && !toCurrency) {
