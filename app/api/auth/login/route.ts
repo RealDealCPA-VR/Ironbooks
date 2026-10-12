@@ -13,7 +13,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { eq } from 'drizzle-orm';
-import { getDb } from '@/lib/db';
+import { getDb, withDamagedFileAccess } from '@/lib/db';
 import { users, userCompanies, companies } from '@/lib/db/schema';
 import {
   verifyPassword,
@@ -30,7 +30,14 @@ import { loginSchema } from '@/lib/validation/users';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 
+// Signing in (and unlocking the file) must work even when the company file's ledger is damaged
+// (lib/db/index.ts refuses it everywhere else): it is the only way to reach Back Up and Restore
+// and replace the file with a good backup. Nothing here reads or writes the ledger.
 export async function POST(req: NextRequest) {
+  return withDamagedFileAccess(() => handlePost(req));
+}
+
+async function handlePost(req: NextRequest) {
   const parsed = loginSchema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     return NextResponse.json({ error: 'Email and password are required.', code: 'VALIDATION' }, { status: 400 });

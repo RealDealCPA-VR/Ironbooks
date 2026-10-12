@@ -226,8 +226,9 @@ describe('Users & Roles — fix round', () => {
   describe('restore keeps the target file identity', () => {
     it("restoring an old backup that carries a secret keeps the target's .auth-secret/.file-id", async () => {
       fs.rmSync(RESTORE_DIR, { recursive: true, force: true });
-      fs.mkdirSync(RESTORE_DIR, { recursive: true });
-      fs.writeFileSync(path.join(RESTORE_DIR, 'PG_VERSION'), '16');
+      // A real (empty) company file: restore now opens and verifies the restored books.
+      await getDb(RESTORE_DIR);
+      await closeDb(RESTORE_DIR);
       fs.writeFileSync(path.join(RESTORE_DIR, '.auth-secret'), 'target-secret');
       fs.writeFileSync(path.join(RESTORE_DIR, '.file-id'), 'target-file-id');
       // Simulate a legacy archive that still contains another file's secret + id.

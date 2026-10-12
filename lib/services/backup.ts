@@ -12,7 +12,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { eq, getTableColumns } from 'drizzle-orm';
-import { resolveDataDir, closeDb, type DB } from '@/lib/db';
+import {
+  resolveDataDir,
+  closeDb,
+  getDb,
+  openDb,
+  withDamagedFileAccess,
+  MIGRATIONS_FOLDER,
+  type DB,
+} from '@/lib/db';
+import { checkLedgerHealth } from '@/lib/db/ledgerGuards';
+import { booksInBalance, verifyIntegrity } from './integrity';
 import {
   accounts, assemblyComponents, attachments, auditLogs, bankAccounts, bankTransactions,
   billLines, billPaymentApplications, billPayments, bills, budgetLines, budgets, classes,
@@ -220,6 +230,12 @@ export function ensurePreOpBackup(
 
 export interface RestoreResult {
   restored: true;
+  /**
+   * Plain-language notes about the restored file that do not block the restore (the books
+   * balance), e.g. the A/R control account not matching open invoices. Fix with Verify Data /
+   * Rebuild Data.
+   */
+  notices?: string[];
 }
 
 const notABackup = (detail: string) =>
@@ -286,6 +302,58 @@ function validateBackupZip(buffer: Buffer): AdmZip {
 }
 
 /**
+ * Verify a just-restored company file (QB Verify Data, run before the file goes live):
+ *  - every ledger guard re-installed and ENABLE ALWAYS (getDb re-asserts them on open);
+ *  - every posted entry balanced and well-formed, no line on another company's or a
+ *    non-posting account, every cached account balance equal to the ledger;
+ *  - per company: trial balance, accrual and cash-basis balance sheets balance (booksInBalance).
+ * Returns plain-language problems (empty = the books are sound).
+ */
+export async function verifyRestoredBooks(dir: string): Promise<string[]> {
+  const db = await withDamagedFileAccess(() => getDb(dir));
+  const health = await checkLedgerHealth(openDb(dir).client, MIGRATIONS_FOLDER);
+  const problems = health.problems.map((p) => p.detail);
+  if (problems.length) return problems;
+
+  const rows = await db.select({ id: companies.id, name: companies.name }).from(companies);
+  for (const company of rows) {
+    const status = await booksInBalance({ db, companyId: company.id, userId: null });
+    if (status.inBalance) continue;
+    const failed = [
+      !status.trialBalance.ok && `trial balance (${status.trialBalance.detail})`,
+      !status.balanceSheet.ok && `balance sheet (${status.balanceSheet.detail})`,
+      !status.cashBasisBalanceSheet.ok && `cash-basis balance sheet (${status.cashBasisBalanceSheet.detail})`,
+      !status.accountBalances.ok && `account balances (${status.accountBalances.detail})`,
+      !status.guards.ok && `ledger safety checks (${status.guards.detail})`,
+    ].filter(Boolean);
+    problems.push(`In "${company.name}" these do not balance: ${failed.join('; ')}.`);
+  }
+  return problems;
+}
+
+/**
+ * Verify Data findings on a restored file that passed verifyRestoredBooks (so the books balance)
+ * but still disagree somewhere, e.g. the A/R control account vs open invoice balances. These do
+ * not block the restore — Rebuild Data is the QuickBooks-style fix — but the user is told.
+ */
+export async function restoredBookNotices(dir: string): Promise<string[]> {
+  const db = await withDamagedFileAccess(() => getDb(dir));
+  const notices: string[] = [];
+  const rows = await db.select({ id: companies.id, name: companies.name }).from(companies);
+  for (const company of rows) {
+    const result = await verifyIntegrity({ db, companyId: company.id, userId: null });
+    for (const check of result.checks) {
+      if (!check.ok) {
+        notices.push(
+          `In "${company.name}": ${check.name} — ${check.detail} Run Verify Data, then Rebuild Data (File > Utilities) to fix it.`,
+        );
+      }
+    }
+  }
+  return notices;
+}
+
+/**
  * Restore a .bka backup into the target data directory.
  *
  * Safety properties:
@@ -298,8 +366,13 @@ function validateBackupZip(buffer: Buffer): AdmZip {
  *     into place, and on failure the original dir is rolled back. No stale files (e.g. old
  *     pg_wal segments) survive into the restored dir.
  *
- * After this resolves, the next getDb()/openDb() call reopens the directory and sees the
- * restored data — no process restart is required.
+ *  5. Before the restored file goes live it is opened, its ledger guards are re-installed
+ *     (ENABLE ALWAYS) and its books are verified (verifyRestoredBooks). A file with damaged
+ *     books — e.g. guards turned off offline and an entry altered — is refused with a
+ *     VALIDATION error and the original directory is rolled back untouched.
+ *
+ * After this resolves, the restored file has been verified and closed; the next getDb() reopens
+ * it — no process restart is required.
  *
  * @param buffer     The raw bytes of a .bka backup file.
  * @param targetDir  Optional path override; defaults to resolveDataDir().
@@ -349,6 +422,20 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
       preRestoreDir = `${dir}.pre-restore-${Date.now()}`;
       fs.renameSync(dir, preRestoreDir);
     }
+    const rollBack = async () => {
+      await closeDb(dir).catch(() => undefined);
+      // Move the refused files aside first (a rename, so the original always gets its name
+      // back even if deleting the refused copy fails), then put the original back.
+      const refusedDir = `${dir}.refused-restore-${Date.now()}`;
+      fs.renameSync(dir, refusedDir);
+      if (preRestoreDir) fs.renameSync(preRestoreDir, dir);
+      resetTransactionLogCache(dir);
+      try {
+        fs.rmSync(refusedDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch {
+        /* a leftover refused copy is harmless */
+      }
+    };
     try {
       fs.renameSync(tmpDir, dir);
     } catch (err) {
@@ -358,6 +445,45 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
     }
     // The running transaction log came back with the restored files — drop cached chain state.
     resetTransactionLogCache(dir);
+
+    // (5) Open the restored file, re-install the ledger guards, and verify the books. A file
+    // whose guards were turned off and whose books do not balance must never become the live
+    // company file: on any problem the original file is put back untouched.
+    let problems: string[];
+    try {
+      problems = await verifyRestoredBooks(dir);
+    } catch (err) {
+      console.error('[backup] restored company file could not be opened:', err);
+      await rollBack();
+      throw new ServiceError(
+        'VALIDATION',
+        'This backup was not restored because the company file inside it could not be opened. ' +
+          'Your current company file has not been changed. Try an earlier backup.',
+      );
+    }
+    if (problems.length) {
+      await rollBack();
+      throw new ServiceError(
+        'VALIDATION',
+        `This backup was not restored because the books in it are damaged: ${problems.join(' ')} ` +
+          'Your current company file has not been changed. Try an earlier backup.',
+        { problems },
+      );
+    }
+
+    // Non-blocking findings (subledger drift such as A/R control vs open invoices): the books
+    // balance, so the restore goes ahead, but the user is told to run Verify / Rebuild Data.
+    let notices: string[] = [];
+    try {
+      notices = await restoredBookNotices(dir);
+    } catch (err) {
+      console.warn('[backup] post-restore Verify Data check failed (continuing):', err);
+    }
+
+    // Release the verification handle: callers (and the next request) reopen the file with
+    // getDb(), which re-asserts the guards again on open.
+    await closeDb(dir);
+
     if (preRestoreDir) {
       // Best-effort cleanup of the safety copy; a leftover dir is harmless.
       try {
@@ -367,7 +493,7 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
       }
     }
 
-    return { restored: true };
+    return notices.length ? { restored: true, notices } : { restored: true };
   } finally {
     // Clean up the temp dir if it is still around (validation/swap failure).
     try {

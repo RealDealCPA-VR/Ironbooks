@@ -701,13 +701,15 @@ export function listCondenseArchives(dataDir?: string): Array<CondenseArchive & 
  * Restore a recorded archive copy over the current company file, bringing back the full
  * pre-condense detail. Only archives recorded in the index can be restored (never an
  * arbitrary path). restoreBackup snapshots the current file first (pre-op backup), so the
- * post-condense state stays recoverable too.
+ * post-condense state stays recoverable too, and verifies the restored books before they go
+ * live: an archive copy whose ledger guards were turned off or whose books do not balance is
+ * refused (VALIDATION) and the current file is kept.
  */
 export async function restoreCondenseArchive(
   ctx: ServiceContext,
   archiveId: string,
   dataDir?: string,
-): Promise<{ restored: true; archive: CondenseArchive }> {
+): Promise<{ restored: true; archive: CondenseArchive; notices?: string[] }> {
   assertWrite(ctx);
   if (ctx.role && ctx.role !== 'owner' && ctx.role !== 'admin') {
     throw new ServiceError('FORBIDDEN', 'Only the company owner or an admin can restore an archive copy.');
@@ -717,6 +719,6 @@ export async function restoreCondenseArchive(
   if (!archive.available) {
     throw new ServiceError('NOT_FOUND', `The archive file is missing: ${archive.filename}`);
   }
-  await restoreBackup(fs.readFileSync(archive.path), resolveDataDir(dataDir));
-  return { restored: true, archive };
+  const result = await restoreBackup(fs.readFileSync(archive.path), resolveDataDir(dataDir));
+  return result.notices?.length ? { restored: true, archive, notices: result.notices } : { restored: true, archive };
 }
