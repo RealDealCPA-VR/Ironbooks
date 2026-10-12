@@ -20,13 +20,16 @@
  *  - 'invoice_credit': the JE credit's open amount drops, the invoice's balance drops
  *                      (markPaidAmount, like a credit memo);
  *  - 'bill_payment':   the JE payable's open amount drops (the bill payment's amount includes it);
- *  - 'bill_credit':    the JE vendor credit's open amount drops, the bill's `amountCredited` grows.
+ *  - 'bill_credit':    the JE vendor credit's open amount drops, the bill's `amountCredited` grows;
+ *  - 'journal_offset': (P1, 0041) a JE credit applied to a JE charge of the same customer / vendor —
+ *                      two rows sharing `pairId`, one on each line, both lines' open amounts drop.
  *
  * A journal entry with applications cannot be voided or edited until they are removed (QB asks
  * you to unapply first) — enforced here with a plain message and by a DB trigger (0037).
  * Journal items are home-currency only (journal entries have no exchange rate), so they can only
  * be applied with home-currency payments, invoices and bills.
  */
+import { randomUUID } from 'node:crypto';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import {
@@ -46,7 +49,7 @@ import { getHomeCurrencyCode } from './currencies';
 import { journalOpenItems, resolveEntityNames } from './journal';
 import { markPaidAmount } from './invoices';
 
-export type JournalApplicationKind = 'payment' | 'invoice_credit' | 'bill_payment' | 'bill_credit';
+export type JournalApplicationKind = 'payment' | 'invoice_credit' | 'bill_payment' | 'bill_credit' | 'journal_offset';
 type Side = 'ar' | 'ap';
 
 const SIDE_NAME: Record<Side, { entity: 'customer' | 'vendor'; account: string }> = {
@@ -64,6 +67,19 @@ export interface JournalItemPaymentInput {
 export interface JournalCreditToInvoiceInput {
   journalLineId: string;
   invoiceId: string;
+  amount: string | number;
+}
+
+/**
+ * A General Journal credit line applied to a General Journal charge line of the same customer
+ * (A/R credit -> A/R debit) or vendor (A/P debit -> A/P credit). QuickBooks lists JE charges in
+ * Receive Payments / Pay Bills next to invoices and bills, and lets any open credit be applied.
+ */
+export interface JournalOffsetInput {
+  /** The credit line (A/R credit / A/P debit). */
+  journalLineId: string;
+  /** The charge line it is applied to (A/R debit / A/P credit). */
+  chargeLineId: string;
   amount: string | number;
 }
 
@@ -464,6 +480,67 @@ export async function applyJournalCreditsToBills(
   return out;
 }
 
+/**
+ * Apply General Journal credits to General Journal charges of the same customer / vendor (no GL —
+ * both lines already sit in A/R or A/P, so only the two open items close out). Each application
+ * writes two rows sharing a `pairId`. `paymentId` / `billPaymentId` link them to a Receive
+ * Payments / Pay Bills transaction so voiding or editing it undoes them. Validated against the
+ * amounts open at the moment of writing, so cash this payment already put on a charge counts.
+ */
+export async function applyJournalOffsets(
+  tx: ServiceContext,
+  input: {
+    side: Side;
+    entityId: string;
+    date: Date;
+    paymentId?: string | null;
+    billPaymentId?: string | null;
+    offsets: JournalOffsetInput[];
+  },
+) {
+  if (input.offsets.length === 0) return [];
+  for (const o of input.offsets) {
+    if (o.journalLineId === o.chargeLineId) throw validation('A General Journal line cannot be applied to itself.');
+  }
+  const credits = await validateItems(tx, input.side, input.entityId, 'credit', sumByLine(input.offsets));
+  const charges = await validateItems(
+    tx,
+    input.side,
+    input.entityId,
+    'charge',
+    sumByLine(input.offsets.map((o) => ({ journalLineId: o.chargeLineId, amount: o.amount }))),
+  );
+  const out: ApplicationRow[] = [];
+  for (const o of input.offsets) {
+    const amount = toAmountString(Money.round2(o.amount));
+    const credit = credits.get(o.journalLineId)!;
+    const charge = charges.get(o.chargeLineId)!;
+    const pairId = randomUUID();
+    // Dated when it could first apply: never before either entry existed, so as-of aging moves
+    // both lines on the same day (journalAppliedByLine).
+    const date = latest(input.date, credit.date, charge.date);
+    const base = {
+      companyId: tx.companyId,
+      side: input.side,
+      kind: 'journal_offset',
+      paymentId: input.side === 'ar' ? (input.paymentId ?? null) : null,
+      billPaymentId: input.side === 'ap' ? (input.billPaymentId ?? null) : null,
+      amount,
+      date,
+      pairId,
+    };
+    const rows = await tx.db
+      .insert(journalItemApplications)
+      .values([
+        { ...base, journalEntryId: credit.entryId, journalLineId: credit.lineId },
+        { ...base, journalEntryId: charge.entryId, journalLineId: charge.lineId },
+      ])
+      .returning();
+    out.push(...rows);
+  }
+  return out;
+}
+
 type ApplicationRow = typeof journalItemApplications.$inferSelect;
 
 /**
@@ -529,16 +606,39 @@ export async function reverseJournalApplicationsForBillPayment(tx: ServiceContex
  */
 export async function applyJournalCredit(
   ctx: ServiceContext,
-  input: { journalLineId: string; invoiceId?: string | null; billId?: string | null; amount: string | number; date?: Date | null },
+  input: {
+    journalLineId: string;
+    invoiceId?: string | null;
+    billId?: string | null;
+    /** P1: a General Journal charge line (same customer / vendor) to apply the credit to. */
+    chargeLineId?: string | null;
+    amount: string | number;
+    date?: Date | null;
+  },
 ) {
   const date = input.date ?? new Date();
-  if (Boolean(input.invoiceId) === Boolean(input.billId)) {
-    throw validation('Pick the invoice or the bill to apply the credit to.');
+  const targets = [input.invoiceId, input.billId, input.chargeLineId].filter(Boolean).length;
+  if (targets !== 1) {
+    throw validation('Pick the invoice, bill or General Journal charge to apply the credit to.');
   }
   return inTransaction(ctx, async (tx) => {
     await assertPeriodOpen(tx, date);
     let rows: ApplicationRow[];
-    if (input.invoiceId) {
+    if (input.chargeLineId) {
+      const [line] = await tx.db
+        .select({ subtype: accounts.subtype })
+        .from(journalEntryLines)
+        .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+        .where(eq(journalEntryLines.id, input.journalLineId));
+      const side: Side = line?.subtype === 'accounts_payable' ? 'ap' : 'ar';
+      const item = await loadItem(tx, side, input.journalLineId);
+      rows = await applyJournalOffsets(tx, {
+        side,
+        entityId: item.entityId,
+        date,
+        offsets: [{ journalLineId: input.journalLineId, chargeLineId: input.chargeLineId, amount: input.amount }],
+      });
+    } else if (input.invoiceId) {
       const item = await loadItem(tx, 'ar', input.journalLineId);
       rows = await applyJournalCreditsToInvoices(tx, {
         customerId: item.entityId,
@@ -562,6 +662,7 @@ export async function applyJournalCredit(
         journalLineId: input.journalLineId,
         invoiceId: input.invoiceId ?? null,
         billId: input.billId ?? null,
+        chargeLineId: input.chargeLineId ?? null,
         amount: rows[0].amount,
         applicationId: rows[0].id,
       },
@@ -594,7 +695,15 @@ export async function unapplyJournalApplication(ctx: ServiceContext, application
       if (p?.voidedAt || p?.bouncedAt) throw new ServiceError('CONFLICT', 'That payment is void or bounced.');
     }
     await assertPeriodOpen(tx, app.date);
-    await reverseApplications(tx, [app], { restorePaymentUnapplied: true });
+    // A General Journal credit applied to a General Journal charge is one application in two rows.
+    const rows =
+      app.kind === 'journal_offset' && app.pairId
+        ? await tx.db
+            .select()
+            .from(journalItemApplications)
+            .where(and(eq(journalItemApplications.companyId, tx.companyId), eq(journalItemApplications.pairId, app.pairId)))
+        : [app];
+    await reverseApplications(tx, rows, { restorePaymentUnapplied: true });
     await writeAudit(tx, {
       action: 'update',
       entityType: 'journal_entry',
@@ -736,6 +845,7 @@ export async function listJournalApplications(
       billId: journalItemApplications.billId,
       amount: journalItemApplications.amount,
       date: journalItemApplications.date,
+      pairId: journalItemApplications.pairId,
     })
     .from(journalItemApplications)
     .innerJoin(journalEntries, eq(journalItemApplications.journalEntryId, journalEntries.id))

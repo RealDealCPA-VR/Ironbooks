@@ -18,12 +18,13 @@
  * The returned paymentsReceived row's `postedEntryId` links back to the journal entry.
  */
 import { isDepositTargetAccount } from '@/lib/accountTypes';
-import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, ilike, inArray, isNull, lt, ne, or, sql, type SQL } from 'drizzle-orm';
 import {
   accounts,
   bouncedChecks,
   creditApplications,
   creditMemos,
+  currencies,
   customers,
   depositLines,
   deposits,
@@ -46,10 +47,15 @@ import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './p
 import { assertPeriodOpen } from './fiscalPeriods';
 import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
+import { docRef } from './docNumbers';
+import { getHomeCurrencyCode } from './currencies';
 import {
   type JournalCreditToInvoiceInput,
   type JournalItemPaymentInput,
+  type JournalOffsetInput,
   applyJournalCreditsToInvoices,
+  applyJournalOffsets,
+  applyPaymentToJournalCharges,
   isForeignCurrency,
   listJournalApplications,
   listJournalOpenItems,
@@ -129,12 +135,19 @@ export interface ReceivePaymentInput {
   journalItems?: JournalItemPaymentInput[] | null;
   /** General Journal A/R credits applied to invoices together with this payment (no GL). */
   journalCredits?: JournalCreditToInvoiceInput[] | null;
+  /**
+   * P1: General Journal A/R credits applied to General Journal A/R charges of the same customer
+   * (no GL — both lines sit in A/R). QB lets any open credit be applied to any open charge.
+   */
+  journalOffsets?: JournalOffsetInput[] | null;
 }
 
 export interface PaymentCreditFromPaymentInput {
   /** The earlier payment that still has an unapplied balance. */
   paymentId: string;
-  invoiceId: string;
+  /** The invoice it is applied to — or `journalLineId`, a General Journal charge (P1). */
+  invoiceId?: string | null;
+  journalLineId?: string | null;
   amount: string | number;
 }
 
@@ -320,7 +333,7 @@ export interface AvailableCredit {
  */
 export async function listAvailableCredits(ctx: ServiceContext, customerId: string): Promise<AvailableCredit[]> {
   const memos = await ctx.db
-    .select({ id: creditMemos.id, memoNumber: creditMemos.memoNumber, date: creditMemos.date, unapplied: creditMemos.unapplied })
+    .select({ id: creditMemos.id, memoNumber: creditMemos.memoNumber, refNumber: creditMemos.refNumber, date: creditMemos.date, unapplied: creditMemos.unapplied })
     .from(creditMemos)
     .where(
       and(
@@ -347,7 +360,7 @@ export async function listAvailableCredits(ctx: ServiceContext, customerId: stri
     ...memos.map((m) => ({
       kind: 'credit_memo' as const,
       id: m.id,
-      ref: `Credit Memo #${m.memoNumber}`,
+      ref: `Credit Memo #${docRef(m.refNumber, m.memoNumber)}`,
       date: m.date.toISOString().slice(0, 10),
       available: toAmountString(m.unapplied),
     })),
@@ -391,44 +404,127 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
     // C4: apply earlier unapplied payments first (no new GL — that money already credited A/R
     // when it was received). postPayment then re-reads invoice balances, so cash + discounts +
     // credits + earlier payments together can never exceed what an invoice owes.
-    const byPayment = new Map<string, Array<{ invoiceId: string; amountApplied: string }>>();
-    for (const pc of paymentCredits) {
-      const amt = Money.round2(pc.amount);
-      if (!amt.greaterThan(0)) throw validation('Each earlier payment used must be greater than zero.');
-      const list = byPayment.get(pc.paymentId) ?? [];
-      const same = list.find((l) => l.invoiceId === pc.invoiceId);
-      if (same) same.amountApplied = toAmountString(Money.of(same.amountApplied).plus(amt));
-      else list.push({ invoiceId: pc.invoiceId, amountApplied: toAmountString(amt) });
-      byPayment.set(pc.paymentId, list);
-    }
-    let lastApplied: Awaited<ReturnType<typeof applyPayment>> | null = null;
-    for (const [paymentId, applications] of byPayment) {
-      const [earlier] = await tx.db
-        .select({ customerId: paymentsReceived.customerId, bouncedAt: paymentsReceived.bouncedAt })
-        .from(paymentsReceived)
-        .where(and(eq(paymentsReceived.id, paymentId), eq(paymentsReceived.companyId, tx.companyId)));
-      if (!earlier) throw notFound('Earlier payment');
-      if (earlier.customerId !== input.customerId) {
-        throw validation('An earlier payment you tried to use belongs to a different customer.');
-      }
-      if (earlier.bouncedAt) throw validation('An earlier payment you tried to use bounced, so it has no credit left.');
-      lastApplied = await applyPayment(tx, { paymentId, applications });
-    }
+    const lastPaymentId = await applyEarlierPayments(tx, input.customerId, paymentCredits, null);
 
-    const hasNewMoney =
-      Money.round2(input.amount).greaterThan(0) ||
-      input.applications.length > 0 ||
-      (input.credits ?? []).length > 0 ||
-      (input.journalItems ?? []).length > 0 ||
-      (input.journalCredits ?? []).length > 0;
-    if (hasNewMoney) return postPayment(tx, { ...input, paymentCredits: null }, null);
+    if (hasNewMoney(input)) return postPayment(tx, { ...input, paymentCredits: null }, null);
     // Only earlier payments were used: no new payment is recorded (as in QuickBooks).
     const [payment] = await tx.db
       .select()
       .from(paymentsReceived)
-      .where(eq(paymentsReceived.id, lastApplied!.id));
+      .where(eq(paymentsReceived.id, lastPaymentId!));
     return { payment, entry: null };
   });
+}
+
+/** True when the request does more than re-use earlier payments (so a payment is recorded). */
+function hasNewMoney(input: ReceivePaymentInput): boolean {
+  return (
+    Money.round2(input.amount).greaterThan(0) ||
+    input.applications.length > 0 ||
+    (input.credits ?? []).length > 0 ||
+    (input.journalItems ?? []).length > 0 ||
+    (input.journalCredits ?? []).length > 0 ||
+    (input.journalOffsets ?? []).length > 0
+  );
+}
+
+/**
+ * C4: apply earlier unapplied payments of the customer to invoices or General Journal charges
+ * (inside the caller's transaction). `excludeId` is the payment being edited — it can't be its
+ * own credit. Returns the id of the last earlier payment used.
+ */
+async function applyEarlierPayments(
+  tx: ServiceContext,
+  customerId: string,
+  paymentCredits: PaymentCreditFromPaymentInput[],
+  excludeId: string | null,
+): Promise<string | null> {
+  type Use = {
+    invoices: Array<{ invoiceId: string; amountApplied: string }>;
+    journal: Array<{ journalLineId: string; amount: string }>;
+  };
+  const byPayment = new Map<string, Use>();
+  for (const pc of paymentCredits) {
+    const amt = Money.round2(pc.amount);
+    if (!amt.greaterThan(0)) throw validation('Each earlier payment used must be greater than zero.');
+    if (Boolean(pc.invoiceId) === Boolean(pc.journalLineId)) {
+      throw validation('Pick the invoice or General Journal charge each earlier payment is applied to.');
+    }
+    if (excludeId && pc.paymentId === excludeId) {
+      throw validation('A payment cannot be used as a credit on itself.');
+    }
+    const use = byPayment.get(pc.paymentId) ?? { invoices: [], journal: [] };
+    if (pc.invoiceId) {
+      const same = use.invoices.find((l) => l.invoiceId === pc.invoiceId);
+      if (same) same.amountApplied = toAmountString(Money.of(same.amountApplied).plus(amt));
+      else use.invoices.push({ invoiceId: pc.invoiceId, amountApplied: toAmountString(amt) });
+    } else {
+      use.journal.push({ journalLineId: pc.journalLineId!, amount: toAmountString(amt) });
+    }
+    byPayment.set(pc.paymentId, use);
+  }
+  let last: string | null = null;
+  for (const [paymentId, use] of byPayment) {
+    const [earlier] = await tx.db
+      .select({
+        customerId: paymentsReceived.customerId,
+        bouncedAt: paymentsReceived.bouncedAt,
+        voidedAt: paymentsReceived.voidedAt,
+      })
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.id, paymentId), eq(paymentsReceived.companyId, tx.companyId)));
+    if (!earlier) throw notFound('Earlier payment');
+    if (earlier.customerId !== customerId) {
+      throw validation('An earlier payment you tried to use belongs to a different customer.');
+    }
+    if (earlier.voidedAt) throw validation('An earlier payment you tried to use is void, so it has no credit left.');
+    if (earlier.bouncedAt) throw validation('An earlier payment you tried to use bounced, so it has no credit left.');
+    if (use.invoices.length > 0) await applyPayment(tx, { paymentId, applications: use.invoices });
+    if (use.journal.length > 0) await applyPaymentToJournalCharges(tx, { paymentId, items: use.journal });
+    last = paymentId;
+  }
+  return last;
+}
+
+/** Normalise a currency code: upper case; the home currency (or blank) becomes null. */
+async function normalizeCurrency(ctx: ServiceContext, code: string | null | undefined): Promise<string | null> {
+  const v = (code ?? '').trim().toUpperCase();
+  if (!v) return null;
+  const home = ((await getHomeCurrencyCode(ctx)) ?? '').toUpperCase();
+  return v === home ? null : v;
+}
+
+/**
+ * Currency + settlement rate of a received payment. A home-currency payment always settles at 1.
+ * A foreign one uses the rate typed on the payment, or the currency list's current rate (QB fills
+ * the exchange rate in from the currency list). Rounded to the column's 6 decimals so every later
+ * calculation (refunds, apply-later) uses exactly the stored rate.
+ */
+export async function resolvePaymentCurrency(
+  ctx: ServiceContext,
+  input: { currency?: string | null; exchangeRate?: string | number | null },
+): Promise<{ currency: string | null; rate: ReturnType<typeof Money.of> }> {
+  const currency = await normalizeCurrency(ctx, input.currency);
+  if (!currency) return { currency: null, rate: Money.of(1) };
+  let rate: ReturnType<typeof Money.of>;
+  if (input.exchangeRate !== undefined && input.exchangeRate !== null && String(input.exchangeRate).trim() !== '') {
+    rate = Money.of(input.exchangeRate);
+  } else {
+    const [row] = await ctx.db
+      .select({ rateToBase: currencies.rateToBase })
+      .from(currencies)
+      .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.code, currency)));
+    if (!row) {
+      throw validation(
+        `${currency} is not in your currency list. Add it under Currencies (with an exchange rate) or type the exchange rate.`,
+      );
+    }
+    rate = Money.of(row.rateToBase);
+  }
+  if (!rate.isFinite() || !rate.greaterThan(0)) throw validation('Exchange rate must be positive.');
+  rate = Money.of(rate.toFixed(6));
+  if (!rate.greaterThan(0)) throw validation('Exchange rate must be positive.');
+  return { currency, rate };
 }
 
 /**
@@ -452,10 +548,9 @@ async function postPayment(
   if (totalAmount.lessThan(0)) throw validation('Payment amount cannot be negative.');
   const credits = input.credits ?? [];
 
-  // --- Validate currency / exchange rate (defaults: base currency at 1.0) ---
-  const paymentCurrency = input.currency ?? null;
-  const paymentRate = Money.of(input.exchangeRate ?? 1);
-  if (paymentRate.lessThanOrEqualTo(0)) throw validation('Exchange rate must be positive.');
+  // --- Validate currency / exchange rate (defaults: home currency at 1.0; a foreign payment
+  //     without a rate takes the currency list's rate) ---
+  const { currency: paymentCurrency, rate: paymentRate } = await resolvePaymentCurrency(tx, input);
 
   // --- Validate and sum applications ---
   let sumApplied = Money.zero();
@@ -474,6 +569,7 @@ async function postPayment(
   // I11: General Journal charges paid with this payment (cash, like an invoice application).
   const journalItems = input.journalItems ?? [];
   const journalCredits = input.journalCredits ?? [];
+  const journalOffsets = input.journalOffsets ?? [];
   const sumJournal = await validateJournalChargesForPayment(tx, {
     customerId: input.customerId,
     items: journalItems,
@@ -485,7 +581,7 @@ async function postPayment(
     );
   }
   let sumCredits = Money.zero();
-  for (const c of [...credits, ...journalCredits]) {
+  for (const c of [...credits, ...journalCredits, ...journalOffsets]) {
     const amt = Money.round2(c.amount);
     if (!amt.greaterThan(0)) throw validation('Each credit applied must be greater than zero.');
     sumCredits = sumCredits.plus(amt);
@@ -519,12 +615,14 @@ async function postPayment(
             balanceDue: invoices.balanceDue,
             amountPaid: invoices.amountPaid,
             status: invoices.status,
+            refNumber: invoices.refNumber,
             currency: invoices.currency,
             exchangeRate: invoices.exchangeRate,
           })
           .from(invoices)
           .where(and(eq(invoices.companyId, tx.companyId), inArray(invoices.id, allInvoiceIds)))
       : [];
+  for (const r of invoiceRows) r.currency = await normalizeCurrency(tx, r.currency);
 
   const invoiceById = new Map(invoiceRows.map((r) => [r.id, r]));
   const requestedByInvoice = new Map<string, ReturnType<typeof Money.zero>>();
@@ -542,7 +640,7 @@ async function postPayment(
     if (inv.status === 'draft') {
       // A draft (pending) invoice has not been posted to A/R yet, so paying it would take
       // money off A/R that was never put there.
-      throw validation(`Invoice #${inv.invoiceNumber} is still a draft. Post it before receiving a payment against it.`);
+      throw validation(`Invoice #${docRef(inv.refNumber, inv.invoiceNumber)} is still a draft. Post it before receiving a payment against it.`);
     }
     return inv;
   };
@@ -552,7 +650,7 @@ async function postPayment(
     // currency must match the payment's currency.
     if ((inv.currency ?? null) !== paymentCurrency) {
       throw validation(
-        `Invoice ${app.invoiceId} currency (${inv.currency ?? 'base'}) does not match payment currency (${paymentCurrency ?? 'base'}).`,
+        `Invoice #${docRef(inv.refNumber, inv.invoiceNumber)} is in ${inv.currency ?? 'your home currency'}, but this payment is in ${paymentCurrency ?? 'your home currency'}. Receive it in the invoice's currency.`,
       );
     }
     addRequested(app.invoiceId, Money.round2(app.amountApplied ?? 0).plus(Money.round2(app.discountAmount ?? 0)));
@@ -560,7 +658,7 @@ async function postPayment(
   for (const c of [...credits, ...journalCredits]) {
     const inv = checkInvoice(c.invoiceId);
     if (inv.currency) {
-      throw validation(`Credits can only be applied to invoices in your home currency (invoice #${inv.invoiceNumber}).`);
+      throw validation(`Credits can only be applied to invoices in your home currency (invoice #${docRef(inv.refNumber, inv.invoiceNumber)}).`);
     }
     addRequested(c.invoiceId, Money.round2(c.amount));
   }
@@ -570,7 +668,7 @@ async function postPayment(
     const inv = invoiceById.get(invoiceId)!;
     if (requested.greaterThan(Money.of(inv.balanceDue))) {
       throw validation(
-        `Applied amount (${toAmountString(requested)}) for invoice ${invoiceId} exceeds its balance due (${toAmountString(inv.balanceDue)}).`,
+        `Cash, discount and credits on invoice #${docRef(inv.refNumber, inv.invoiceNumber)} (${toAmountString(requested)}) add up to more than its balance due (${toAmountString(inv.balanceDue)}).`,
       );
     }
   }
@@ -579,13 +677,14 @@ async function postPayment(
   const memoIds = [...new Set(credits.map((c) => c.creditMemoId))];
   if (memoIds.length > 0) {
     const memoRows = await tx.db
-      .select({ id: creditMemos.id, customerId: creditMemos.customerId, status: creditMemos.status, unapplied: creditMemos.unapplied, memoNumber: creditMemos.memoNumber })
+      .select({ id: creditMemos.id, customerId: creditMemos.customerId, status: creditMemos.status, unapplied: creditMemos.unapplied, memoNumber: creditMemos.memoNumber, refNumber: creditMemos.refNumber })
       .from(creditMemos)
       .where(and(eq(creditMemos.companyId, tx.companyId), inArray(creditMemos.id, memoIds)));
     const memoById = new Map(memoRows.map((m) => [m.id, m]));
     for (const id of memoIds) {
-      const m = memoById.get(id);
-      if (!m) throw notFound(`Credit memo ${id}`);
+      const found = memoById.get(id);
+      if (!found) throw notFound(`Credit memo ${id}`);
+      const m = { ...found, memoNumber: docRef(found.refNumber, found.memoNumber) };
       if (m.customerId !== input.customerId) {
         throw validation(`Credit Memo #${m.memoNumber} belongs to a different customer.`);
       }
@@ -747,6 +846,15 @@ async function postPayment(
     paymentId: payment.id,
     credits: journalCredits,
   });
+  // P1: General Journal credits applied to General Journal charges (after the cash above, so the
+  // charge's open amount already reflects what this payment paid on it).
+  await applyJournalOffsets(tx, {
+    side: 'ar',
+    entityId: input.customerId,
+    date: input.date,
+    paymentId: payment.id,
+    offsets: journalOffsets,
+  });
 
   // 5. Audit log
   await writeAudit(tx, {
@@ -760,7 +868,10 @@ async function postPayment(
       applications: input.applications,
       journalItems,
       journalCredits,
+      journalOffsets,
       credits,
+      currency: paymentCurrency,
+      exchangeRate: paymentRate.toFixed(6),
       discountTotal: toAmountString(sumDiscount),
       discountAccountId,
       postedEntryId: entry?.id ?? null,
@@ -770,26 +881,139 @@ async function postPayment(
   return { payment, entry };
 }
 
-/** List all payments received for the company, newest first. */
-export async function listPayments(
+export interface PaymentListOptions {
+  customerId?: string;
+  /** Payments dated on/after this day. */
+  from?: Date;
+  /** Payments dated on/before this day (the whole day counts). */
+  to?: Date;
+  /**
+   * Free-text search: the reference / check number, memo or customer name (contains), or the
+   * amount (exact, e.g. "1250" or "1,250.00").
+   */
+  search?: string;
+  /** Max rows (1–500, default 50). */
+  limit?: number;
+  offset?: number;
+}
+
+/** A payment row on the Receive Payments list, with what can still be done to it. */
+export type PaymentListRow = typeof paymentsReceived.$inferSelect & {
+  customerName: string | null;
+  /** Swept into a (non-void) bank deposit. */
+  deposited: boolean;
+  /** Part of the unapplied balance was refunded. */
+  refunded: boolean;
+  /**
+   * Record Bounced Check is possible: a check whose money reached a bank account (directly or
+   * through a deposit), home currency, not refunded. Mirrors recordBouncedCheck's own checks.
+   */
+  canBounce: boolean;
+};
+
+function paymentListConditions(ctx: ServiceContext, opts: PaymentListOptions): SQL[] {
+  const conds: SQL[] = [eq(paymentsReceived.companyId, ctx.companyId)];
+  if (opts.customerId) conds.push(eq(paymentsReceived.customerId, opts.customerId));
+  if (opts.from) conds.push(gte(paymentsReceived.date, startOfUtcDay(opts.from)));
+  if (opts.to) conds.push(lt(paymentsReceived.date, new Date(startOfUtcDay(opts.to).getTime() + 86_400_000)));
+  const q = opts.search?.trim();
+  if (q) {
+    const like = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    const text = or(
+      ilike(paymentsReceived.reference, like),
+      ilike(paymentsReceived.memo, like),
+      ilike(customers.displayName, like),
+    )!;
+    const asAmount = q.replace(/[$,\s]/g, '');
+    conds.push(
+      /^\d+(\.\d{1,2})?$/.test(asAmount)
+        ? or(text, sql`CAST(${paymentsReceived.amount} AS NUMERIC) = ${asAmount}::numeric`)!
+        : text,
+    );
+  }
+  return conds;
+}
+
+function startOfUtcDay(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+/**
+ * Receive Payments list: newest first (date, then entry time), one page at a time, with the total
+ * number of matching payments so the page can offer paging. Filters: customer, date range and a
+ * search over reference / check number, memo, customer name and amount.
+ */
+export async function searchPayments(
   ctx: ServiceContext,
-  opts?: { customerId?: string; limit?: number; offset?: number },
-) {
-  // Build conditions
-  const rows = await ctx.db
-    .select()
+  opts: PaymentListOptions = {},
+): Promise<{ payments: PaymentListRow[]; total: number; limit: number; offset: number }> {
+  const limit = Math.min(500, Math.max(1, Math.floor(opts.limit ?? 50)));
+  const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+  const where = and(...paymentListConditions(ctx, opts));
+  const [{ n }] = await ctx.db
+    .select({ n: sql<number>`count(*)::int` })
     .from(paymentsReceived)
-    .where(
-      opts?.customerId
-        ? and(
-            eq(paymentsReceived.companyId, ctx.companyId),
-            eq(paymentsReceived.customerId, opts.customerId),
-          )
-        : eq(paymentsReceived.companyId, ctx.companyId),
-    )
-    .limit(opts?.limit ?? 100)
-    .offset(opts?.offset ?? 0);
-  return rows;
+    .leftJoin(customers, eq(customers.id, paymentsReceived.customerId))
+    .where(where);
+  const rows = await ctx.db
+    .select({ p: paymentsReceived, customerName: customers.displayName })
+    .from(paymentsReceived)
+    .leftJoin(customers, eq(customers.id, paymentsReceived.customerId))
+    .where(where)
+    .orderBy(desc(paymentsReceived.date), desc(paymentsReceived.createdAt), desc(paymentsReceived.id))
+    .limit(limit)
+    .offset(offset);
+
+  const ids = rows.map((r) => r.p.id);
+  const depositedTo = new Map<string, string>();
+  const refunded = new Set<string>();
+  if (ids.length > 0) {
+    for (const d of await ctx.db
+      .select({ paymentId: depositLines.paymentId, bankAccountId: deposits.depositAccountId })
+      .from(depositLines)
+      .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
+      .where(and(inArray(depositLines.paymentId, ids), isNull(deposits.voidedAt)))) {
+      if (d.paymentId) depositedTo.set(d.paymentId, d.bankAccountId);
+    }
+    for (const j of await ctx.db
+      .select({ sourceRef: journalEntries.sourceRef })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          eq(journalEntries.status, 'posted'),
+          inArray(journalEntries.sourceRef, ids.map((id) => `refund:${id}`)),
+        ),
+      )) {
+      if (j.sourceRef) refunded.add(j.sourceRef.slice('refund:'.length));
+    }
+  }
+  const ufId = await getUndepositedFundsId(ctx).catch(() => null);
+  const payments = rows.map(({ p, customerName }) => {
+    const deposited = depositedTo.has(p.id);
+    const reachedBank = deposited || (!!p.depositAccountId && p.depositAccountId !== ufId);
+    const home = !p.currency && Money.of(p.exchangeRate ?? 1).equals(1);
+    return {
+      ...p,
+      customerName,
+      deposited,
+      refunded: refunded.has(p.id),
+      canBounce:
+        !p.voidedAt &&
+        !p.bouncedAt &&
+        p.method === 'check' &&
+        Money.of(p.amount).greaterThan(0) &&
+        home &&
+        reachedBank &&
+        !refunded.has(p.id),
+    };
+  });
+  return { payments, total: n, limit, offset };
+}
+
+/** List payments received for the company, newest first (one page; see searchPayments). */
+export async function listPayments(ctx: ServiceContext, opts?: PaymentListOptions) {
+  return (await searchPayments(ctx, { limit: 100, ...opts })).payments;
 }
 
 /** Fetch a single payment (and its applications) by id. Throws NOT_FOUND if missing. */
@@ -1058,9 +1282,6 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
   if (!payment) throw notFound('Payment');
   if (payment.voidedAt) throw new ServiceError('CONFLICT', 'Cannot edit a voided payment.');
   await assertPaymentReversible(ctx, payment, 'edited');
-  if ((input.paymentCredits ?? []).length > 0) {
-    throw validation('Earlier payments can only be used when receiving a new payment, not while editing one.');
-  }
 
   return inTransaction(ctx, async (tx) => {
     const oldCredits = await tx.db
@@ -1086,7 +1307,12 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
       },
       newValues: { action: 'edit' },
     });
-    return postPayment(tx, input, id);
+    // C4: earlier unapplied payments picked while editing are applied too (they used to be
+    // dropped silently). They are applied from their own payment, exactly as on a new payment.
+    if ((input.paymentCredits ?? []).length > 0) {
+      await applyEarlierPayments(tx, input.customerId, input.paymentCredits!, id);
+    }
+    return postPayment(tx, { ...input, paymentCredits: null }, id);
   });
 }
 

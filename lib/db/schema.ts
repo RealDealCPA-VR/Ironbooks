@@ -2047,6 +2047,8 @@ export const journalItemApplications = pgTable('journal_item_applications', {
   billId: uuid('bill_id').references(() => bills.id),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   date: timestamp('date').notNull(),
+  /** P1 payments (0041): kind 'journal_offset' — the two rows (credit line + charge line) of one application. */
+  pairId: uuid('pair_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

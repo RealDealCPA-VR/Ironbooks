@@ -26,9 +26,23 @@ export const paymentCreditSchema = z.object({
 });
 
 /** wave2 sales (C4): an earlier unapplied payment used on an invoice inside Receive Payments. */
-export const paymentCreditFromPaymentSchema = z.object({
-  paymentId: zUuid,
-  invoiceId: zUuid,
+export const paymentCreditFromPaymentSchema = z
+  .object({
+    paymentId: zUuid,
+    /** The invoice it is applied to — or journalLineId, a General Journal charge (P1). */
+    invoiceId: zUuid.nullish(),
+    journalLineId: zUuid.nullish(),
+    amount: zMoneyPositive,
+  })
+  .refine((c) => Boolean(c.invoiceId) !== Boolean(c.journalLineId), {
+    message: 'Pick the invoice or the General Journal charge to apply the earlier payment to.',
+    path: ['invoiceId'],
+  });
+
+/** P1: a General Journal A/R credit applied to a General Journal A/R charge of the same customer. */
+export const journalOffsetSchema = z.object({
+  journalLineId: zUuid,
+  chargeLineId: zUuid,
   amount: zMoneyPositive,
 });
 
@@ -66,6 +80,7 @@ export const receivePaymentSchema = z.object({
   paymentCredits: z.array(paymentCreditFromPaymentSchema).nullish(),
   journalItems: z.array(journalItemPaymentSchema).nullish(),
   journalCredits: z.array(journalCreditToInvoiceSchema).nullish(),
+  journalOffsets: z.array(journalOffsetSchema).nullish(),
   discountAccountId: zUuid.nullish(),
   memo: z.string().nullish(),
   currency: z.string().trim().length(3, 'currency must be a 3-letter ISO 4217 code').nullish(),
