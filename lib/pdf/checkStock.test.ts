@@ -83,7 +83,7 @@ describe('check PDF paper modes', () => {
 
     const voucher = drawnText(await renderCheckPdf({ ...base, style: 'voucher' }));
     // Two voucher stubs with the detail lines.
-    expect(voucher.filter((t) => t.text === '2200 – Sales Tax Payable'.replace('–', '\x96')).length + voucher.filter((t) => t.text.startsWith('2200')).length).toBeGreaterThanOrEqual(2);
+    expect(voucher.filter((t) => t.text.startsWith('2200')).length).toBe(2);
   });
 
   it('blank stock draws the full check but no fake MICR line', async () => {
