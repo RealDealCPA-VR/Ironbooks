@@ -81,7 +81,7 @@ async function raceOn(
 ) {
   const loaded = await version(entity, id);
   await withVersionCheck(alice, entity, id, loaded, aliceSave);
-  const err = await withVersionCheck(bob, entity, id, loaded, bobSave).catch((e) => e);
+  const err = (await withVersionCheck(bob, entity, id, loaded, bobSave).catch((e) => e)) as ServiceError;
   expect(err, entity).toBeInstanceOf(ServiceError);
   expect(err.code).toBe('CONFLICT');
   expect(err.message).toMatch(/^This record was changed by Alice at .+\. Reload to see the latest\.$/);
