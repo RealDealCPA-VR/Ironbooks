@@ -1,17 +1,19 @@
 /**
  * /api/pay-liabilities
  *
- * GET  → { salesTaxDue: string, payrollLiabilitiesDue: string }
- *         Current credit balances of 2200 and 2300 derived from posted GL.
+ * Payroll liabilities only (payroll area). Sales tax is paid on Pay Sales Tax
+ * (/api/sales-tax/pay, sales_tax area) — a payroll-only user cannot pay sales tax here.
+ *
+ * GET  → { payrollLiabilitiesDue: string }   Current credit balance of 2300 from the posted GL.
  *
  * POST body:
  *   {
- *     type:             'sales_tax' | 'payroll',
+ *     type:             'payroll',
  *     amount:           string,          // decimal, e.g. "120.00"
  *     date:             string,          // ISO 8601, e.g. "2025-04-01"
- *     paymentAccountId: string,          // bank/cash account uuid
- *     agencyId?:        string,          // for sales_tax only — optional tax agency id
- *     memo?:            string,          // optional journal entry description
+ *     paymentAccountId: string,          // bank account uuid (writes a Liability Check)
+ *     memo?:            string,
+ *     vendorId?, payeeName?, checkNumber?, toPrint?, allowDuplicateNumber?   // check fields
  *   }
  *
  * POST → 201 { entry: JournalEntry }
@@ -24,12 +26,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import {
-  salesTaxDue,
-  payrollLiabilitiesDue,
-  paySalesTax,
-  payPayrollLiabilities,
-} from '@/lib/services/liabilityPayments';
+import { payrollLiabilitiesDue, payPayrollLiabilities } from '@/lib/services/liabilityPayments';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorStatus(code: string): number {
@@ -59,8 +56,7 @@ function serviceError(err: unknown): NextResponse {
 export async function GET() {
   try {
     const ctx = await getServerContext();
-    const [stDue, prDue] = await Promise.all([salesTaxDue(ctx), payrollLiabilitiesDue(ctx)]);
-    return NextResponse.json({ salesTaxDue: stDue, payrollLiabilitiesDue: prDue });
+    return NextResponse.json({ payrollLiabilitiesDue: await payrollLiabilitiesDue(ctx) });
   } catch (err) {
     return serviceError(err);
   }
@@ -73,20 +69,22 @@ export async function POST(req: NextRequest) {
     const ctx = await getServerContext();
     const body = await req.json();
 
-    const { type, amount, date, paymentAccountId, agencyId, memo } = body as {
+    const { type, amount, date, paymentAccountId, memo } = body as {
       type?: string;
       amount?: string;
       date?: string;
       paymentAccountId?: string;
-      agencyId?: string;
       memo?: string;
     };
 
-    if (type !== 'sales_tax' && type !== 'payroll') {
+    if (type === 'sales_tax') {
       return NextResponse.json(
-        { error: 'type must be "sales_tax" or "payroll".' },
+        { error: 'Sales tax is paid on the Pay Sales Tax page.', code: 'VALIDATION' },
         { status: 400 },
       );
+    }
+    if (type !== undefined && type !== 'payroll') {
+      return NextResponse.json({ error: 'type must be "payroll".' }, { status: 400 });
     }
     if (!amount || typeof amount !== 'string') {
       return NextResponse.json({ error: 'amount (decimal string) is required.' }, { status: 400 });
@@ -100,23 +98,18 @@ export async function POST(req: NextRequest) {
 
     const parsedDate = new Date(date);
 
-    let entry;
-    if (type === 'sales_tax') {
-      entry = await paySalesTax(ctx, {
-        amount,
-        date: parsedDate,
-        paymentAccountId,
-        agencyId: agencyId ?? null,
-        memo: memo ?? null,
-      });
-    } else {
-      entry = await payPayrollLiabilities(ctx, {
-        amount,
-        date: parsedDate,
-        paymentAccountId,
-        memo: memo ?? null,
-      });
-    }
+    const str = (v: unknown) => (typeof v === 'string' ? v : null);
+    const entry = await payPayrollLiabilities(ctx, {
+      amount,
+      date: parsedDate,
+      paymentAccountId,
+      memo: memo ?? null,
+      vendorId: str(body.vendorId),
+      payeeName: str(body.payeeName),
+      checkNumber: str(body.checkNumber),
+      toPrint: body.toPrint === true,
+      allowDuplicateNumber: body.allowDuplicateNumber === true,
+    });
 
     return NextResponse.json({ entry }, { status: 201 });
   } catch (err) {

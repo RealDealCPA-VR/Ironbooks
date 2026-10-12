@@ -75,6 +75,7 @@ export const navGroups: NavGroup[] = [
       { icon: HandCoins, label: 'Pay Bills', path: '/pay-bills' },
       { icon: Banknote, label: 'Write Checks', path: '/expenses' },
       { icon: RotateCcw, label: 'Vendor Credits', path: '/vendor-credits' },
+      { icon: Percent, label: 'Pay Sales Tax', path: '/sales-tax' }, // p1 purchases
       { icon: Printer, label: 'Print Checks', path: '/print-checks' },
       { icon: Truck, label: 'Vendors', path: '/vendors' },
     ],

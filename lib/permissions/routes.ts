@@ -370,6 +370,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/check-numbers/duplicate': r('banking', 'GET'),
   '/api/print-queue': r('banking', 'GET POST:print'),
   '/api/print-queue/paychecks': r('payroll', 'GET POST:print'),
+  '/api/print-queue/refunds': r('banking', 'GET POST:print'),
   '/api/checks/settings': r('banking', 'GET PUT:modify'),
   '/api/loans': r('banking', 'GET POST'),
   '/api/loans/[id]': r('banking', 'GET PATCH DELETE'),
@@ -457,6 +458,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/tax-rates/[id]/components': r('sales_tax', 'GET PATCH'),
   '/api/tax-rates/[id]': r('sales_tax', 'PATCH'),
   '/api/pay-liabilities/sales-tax': r('sales_tax', 'GET'),
+  // p1 purchases: Pay Sales Tax is a sales_tax action (bookkeepers have it; payroll-only users don't).
+  '/api/sales-tax/pay': r('sales_tax', 'GET POST'),
+  '/api/sales-tax/payments': r('sales_tax', 'GET'),
+  '/api/sales-tax/payments/[id]': r('sales_tax', 'GET POST:delete'),
   // wave2 accountant: sales tax liability engine, adjustments, fix incorrectly recorded tax.
   '/api/accountant/sales-tax/liability': r('sales_tax', 'GET'),
   '/api/accountant/sales-tax/revenue-summary': r('sales_tax', 'GET'),
@@ -492,6 +497,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/payroll/unpaid-time': r('payroll', 'GET'),
   '/api/pay-liabilities': r('payroll', 'GET POST'),
   '/api/pay-liabilities/by-item': r('payroll', 'GET POST'),
+  '/api/pay-liabilities/checks': r('payroll', 'GET'),
+  '/api/pay-liabilities/checks/[id]': r('payroll', 'POST:delete'),
   '/api/payroll/940': r('reports_payroll', 'GET'),
   '/api/payroll/941': r('reports_payroll', 'GET'),
   '/api/payroll/reports': r('reports_payroll', 'GET'),
@@ -619,6 +626,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/employees/setup': 'payroll',
   '/payroll-tax': 'payroll',
   '/sales-tax-components': 'sales_tax',
+  '/sales-tax': 'sales_tax', // p1 purchases: Pay Sales Tax
   '/fiscal-periods': 'closing',
   '/year-end': 'closing',
   '/budgets': 'company',

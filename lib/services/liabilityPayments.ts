@@ -29,7 +29,15 @@ import { type ServiceContext, ServiceError, inTransaction, notFound, validation,
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
 import { getHomeCurrencyCode } from './currencies';
-import { type SalesTaxBasis, salesTaxLiabilityReport } from './accountant/salesTaxLedger';
+import { getPreferences } from './company';
+import {
+  type SalesTaxBasis,
+  type SalesTaxDueRow,
+  type SalesTaxFrequency,
+  lastFilingPeriod,
+  salesTaxDueThrough,
+  salesTaxLiabilityReport,
+} from './accountant/salesTaxLedger';
 
 // ── COA codes fixed by the project spec ─────────────────────────────────────
 const CODE_SALES_TAX_PAYABLE = '2200';
@@ -969,5 +977,62 @@ export async function salesTaxLiabilityByAgency(
     totalBalance: report.totals.balance,
     glBalance: report.glBalance,
     tiesToGl: report.tiesToGl,
+  };
+}
+
+// ── Pay Sales Tax screen (QB Vendors > Sales Tax > Pay Sales Tax) ────────────────────────────────
+
+export interface PaySalesTaxScreenRow extends SalesTaxDueRow {
+  /** Payee on the check: the agency's vendor ("print on check as"), else the agency name. */
+  payee: string | null;
+  vendorId: string | null;
+}
+
+export interface PaySalesTaxScreen {
+  /** Company preference: owe sales tax as of invoice date (accrual) or upon payment (cash). */
+  basis: SalesTaxBasis;
+  frequency: SalesTaxFrequency;
+  /** Default "Show sales tax due through": the end of the last filing period. */
+  defaultDueThrough: string;
+  dueThrough: string;
+  rows: PaySalesTaxScreenRow[];
+  totalDue: string;
+}
+
+/**
+ * Data for Pay Sales Tax: per-agency amounts due through `dueThrough` (default: end of the last
+ * filing period for the company's filing frequency) on the company's sales tax basis.
+ */
+export async function paySalesTaxScreen(
+  ctx: ServiceContext,
+  opts: { dueThrough?: string | null; today?: Date } = {},
+): Promise<PaySalesTaxScreen> {
+  const prefs = await getPreferences(ctx);
+  const basis: SalesTaxBasis = prefs.salesTaxBasis === 'cash' ? 'cash' : 'accrual';
+  const frequency = prefs.salesTaxFrequency as SalesTaxFrequency;
+  const defaultDueThrough = lastFilingPeriod(frequency, opts.today ?? new Date()).to;
+  const dueThrough =
+    opts.dueThrough && /^\d{4}-\d{2}-\d{2}/.test(opts.dueThrough) ? opts.dueThrough.slice(0, 10) : defaultDueThrough;
+  const due = await salesTaxDueThrough(ctx, { dueThrough, basis });
+  const agencyRows = await ctx.db
+    .select({ id: taxAgencies.id, name: taxAgencies.name, vendorId: vendors.id, displayName: vendors.displayName, printOnCheckAs: vendors.printOnCheckAs })
+    .from(taxAgencies)
+    .leftJoin(vendors, eq(taxAgencies.vendorId, vendors.id))
+    .where(eq(taxAgencies.companyId, ctx.companyId));
+  const byId = new Map(agencyRows.map((a) => [a.id, a] as const));
+  return {
+    basis,
+    frequency,
+    defaultDueThrough,
+    dueThrough: due.dueThrough,
+    rows: due.rows.map((r) => {
+      const a = r.agencyId ? byId.get(r.agencyId) : undefined;
+      return {
+        ...r,
+        vendorId: a?.vendorId ?? null,
+        payee: a ? (a.vendorId ? vendorPayee({ displayName: a.displayName ?? a.name, printOnCheckAs: a.printOnCheckAs }, a.name) : a.name) : null,
+      };
+    }),
+    totalDue: due.totalDue,
   };
 }

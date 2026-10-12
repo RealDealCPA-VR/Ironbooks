@@ -70,6 +70,11 @@ export async function POST(req: NextRequest) {
       paymentAccountId?: string;
       memo?: string;
       items?: Array<{ name?: string; amount?: string }>;
+      vendorId?: string;
+      payeeName?: string;
+      checkNumber?: string;
+      toPrint?: boolean;
+      allowDuplicateNumber?: boolean;
     };
 
     if (!body.date || typeof body.date !== 'string') {
@@ -90,6 +95,11 @@ export async function POST(req: NextRequest) {
       paymentAccountId: body.paymentAccountId,
       memo: body.memo ?? null,
       items: body.items.map((i) => ({ name: i.name ?? '', amount: i.amount ?? '' })),
+      vendorId: typeof body.vendorId === 'string' ? body.vendorId : null,
+      payeeName: typeof body.payeeName === 'string' ? body.payeeName : null,
+      checkNumber: typeof body.checkNumber === 'string' ? body.checkNumber : null,
+      toPrint: body.toPrint === true,
+      allowDuplicateNumber: body.allowDuplicateNumber === true,
     });
 
     return NextResponse.json({ entry }, { status: 201 });
