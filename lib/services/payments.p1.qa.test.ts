@@ -272,29 +272,46 @@ describe('QA: foreign-currency payments', () => {
   });
 
   it('three partial payments at the booked rate leave no penny on A/R once the invoice is paid', async () => {
-    const arBefore = await controlOf(ctx, 'accounts_receivable');
+    // Own company, so a residue here can't spill into the other tests' tie-outs.
+    const ownerId = ctx.userId as string;
+    const co = await createCompany(db, { name: 'P1 Payments QA FX Pennies', ownerId });
+    const c: ServiceContext = { db, companyId: co.id, userId: ownerId };
+    const cc: Record<string, string> = {};
+    for (const a of await db.select().from(accounts).where(eq(accounts.companyId, c.companyId))) cc[a.code] = a.id;
+    await setBaseCurrency(c, { code: 'USD', name: 'US Dollar' });
+    await upsertCurrency(c, { code: 'EUR', name: 'Euro', rateToBase: '1.130000' });
+    const eu = (await createCustomer(c, { displayName: 'Euro Pennies' })).id;
     // 100.05 EUR at 1.13 books 113.06 (113.0565); three payments of 33.35 at 1.13 each relieve
     // 37.69 (37.6855) = 113.07 — one cent more than was ever put on A/R.
-    const inv = await invoiceFor(ctx, cust, '100.05', '2026-05-01', { currency: 'EUR', exchangeRate: '1.13' });
-    for (const [day, amt] of [['2026-05-02', '33.35'], ['2026-05-03', '33.35'], ['2026-05-04', '33.35']] as const) {
-      await receivePayment(ctx, {
-        customerId: cust,
+    const inv = await createInvoice(c, {
+      customerId: eu,
+      date: D('2026-05-01'),
+      dueDate: D('2026-05-01'),
+      currency: 'EUR',
+      exchangeRate: '1.13',
+      lines: [{ accountId: cc['4000'], description: 'Work', quantity: 1, rate: '100.05', taxable: false }],
+      overrideCreditLimit: true,
+    } as Parameters<typeof createInvoice>[1]);
+    for (const day of ['2026-05-02', '2026-05-03', '2026-05-04']) {
+      await receivePayment(c, {
+        customerId: eu,
         date: D(day),
         method: 'bank_transfer',
-        amount: amt,
-        depositAccountId: code['1000'],
+        amount: '33.35',
+        depositAccountId: cc['1000'],
         currency: 'EUR',
         exchangeRate: '1.13',
-        applications: [{ invoiceId: inv.id, amountApplied: amt }],
+        applications: [{ invoiceId: inv.id, amountApplied: '33.35' }],
       });
     }
     const [row] = await db.select().from(invoices).where(eq(invoices.id, inv.id));
     expect(row.status).toBe('paid');
     expect(row.balanceDue).toBe('0.00');
+    expect((await trialBalance(c, AS_OF)).balanced).toBe(true);
     // QuickBooks clears the rounding residue into Exchange Gain/Loss on the final payment:
-    // a fully paid invoice must leave nothing on the A/R control account.
-    expect(await controlOf(ctx, 'accounts_receivable')).toBeCloseTo(arBefore, 2);
-    await expectBooksTied();
+    // a fully paid invoice must leave nothing on the A/R control account (aging shows 0).
+    expect(Number((await arAging(c, AS_OF)).totals.total)).toBe(0);
+    expect(await controlOf(c, 'accounts_receivable')).toBeCloseTo(0, 2);
   });
 
   it('voiding a payment that posted a gain takes the gain back and reopens the invoice', async () => {
