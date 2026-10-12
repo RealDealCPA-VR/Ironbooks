@@ -16,7 +16,7 @@ export default async function Page() {
       <StdReportView
         reportKey="profit-loss"
         basis="cash"
-        basisNav={{ value: 'cash', accrualHref: '/reports/profit-loss', cashHref: '/reports/profit-loss-cash' }}
+        basisNav={{ value: 'cash', accrualHref: '/reports/profit-loss?basis=accrual', cashHref: '/reports/profit-loss-cash' }}
       />
     </Suspense>
   );

@@ -1,16 +1,18 @@
-'use client';
+import { Suspense } from 'react';
+import { getPageContext } from '@/lib/context';
+import StdReportView from '../_components/StdReportView';
 
-import { AlertCircle } from 'lucide-react';
-import AgingDetailReport from '../_components/AgingDetailReport';
+export const dynamic = 'force-dynamic';
 
-export default function ApAgingDetailPage() {
+/**
+ * A/P Aging Detail — runs on the standard report engine (lib/reports/catalog.ts key "ap-aging-detail"): filters,
+ * QuickZoom, Fonts & Numbers, memorize and scheduling. Settings live in the URL.
+ */
+export default async function Page() {
+  await getPageContext('/reports/ap-aging-detail');
   return (
-    <AgingDetailReport
-      title="A/P Aging Detail"
-      endpoint="/api/reports/ap-aging-detail"
-      entityLabel="Vendor"
-      csvName="ap-aging-detail.csv"
-      icon={AlertCircle}
-    />
+    <Suspense fallback={null}>
+      <StdReportView reportKey="ap-aging-detail" />
+    </Suspense>
   );
 }

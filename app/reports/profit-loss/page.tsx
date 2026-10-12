@@ -12,7 +12,7 @@ export default async function Page() {
   await getPageContext('/reports/profit-loss');
   return (
     <Suspense fallback={null}>
-      <StdReportView reportKey="profit-loss" basisNav={{ value: 'accrual', accrualHref: '/reports/profit-loss', cashHref: '/reports/profit-loss-cash' }} />
+      <StdReportView reportKey="profit-loss" />
     </Suspense>
   );
 }

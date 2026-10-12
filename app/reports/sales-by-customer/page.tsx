@@ -1,52 +1,18 @@
-'use client';
+import { Suspense } from 'react';
+import { getPageContext } from '@/lib/context';
+import StdReportView from '../_components/StdReportView';
 
-import { TrendingUp } from 'lucide-react';
-import { formatCurrency } from '@/lib/money';
-import SimpleReport from '../_components/SimpleReport';
+export const dynamic = 'force-dynamic';
 
-interface SalesByCustomerRow {
-  customerId: string;
-  customerName: string;
-  totalSales: string;
-  invoiceCount: number;
-}
-
-interface SalesByCustomerData {
-  rows: SalesByCustomerRow[];
-}
-
-export default function SalesByCustomerPage() {
+/**
+ * Sales by Customer Summary — runs on the standard report engine (lib/reports/catalog.ts key "sales-by-customer-summary"): filters,
+ * QuickZoom, Fonts & Numbers, memorize and scheduling. Settings live in the URL.
+ */
+export default async function Page() {
+  await getPageContext('/reports/sales-by-customer');
   return (
-    <SimpleReport<SalesByCustomerData, SalesByCustomerRow>
-      title="Sales by Customer"
-      icon={TrendingUp}
-      csvName="sales-by-customer.csv"
-      emptyText="No sales in this period."
-      controls="range"
-      buildUrl={({ from, to }) => `/api/reports/sales-by-customer?from=${from}&to=${to}`}
-      getRows={(d) => d.rows}
-      rowHref={(r, q) => `/reports/std/sales-by-customer-detail?customerId=${r.customerId}&from=${q.from}&to=${q.to}`}
-      columns={[
-        {
-          header: 'Customer',
-          cell: (r) => (
-            <span className="font-medium">{r.customerName}</span>
-          ),
-          csv: (r) => r.customerName,
-        },
-        {
-          header: 'Invoices',
-          className: 'text-right tabular-nums',
-          cell: (r) => r.invoiceCount,
-          csv: (r) => r.invoiceCount,
-        },
-        {
-          header: 'Total Sales',
-          className: 'text-right tabular-nums',
-          cell: (r) => <span className="font-semibold">{formatCurrency(r.totalSales)}</span>,
-          csv: (r) => r.totalSales,
-        },
-      ]}
-    />
+    <Suspense fallback={null}>
+      <StdReportView reportKey="sales-by-customer-summary" />
+    </Suspense>
   );
 }

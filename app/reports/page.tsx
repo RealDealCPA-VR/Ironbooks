@@ -1,7 +1,5 @@
 'use client';
 
-// wave2 prefs: default report basis
-import { usePreferences } from '@/lib/usePreferences';
 import Link from 'next/link';
 import {
   BarChart2,
@@ -54,17 +52,13 @@ interface ReportCardProps {
   description: string;
 }
 
-/** Preferences > Reports: "Default report basis" opens these reports on their cash variant. */
-const CASH_VARIANT: Record<string, string> = {
-  '/reports/profit-loss': '/reports/profit-loss-cash',
-  '/reports/balance-sheet': '/reports/balance-sheet-cash',
-};
-
+/**
+ * Reports offered on both bases open on the company's Reports preference ("Default report
+ * basis"); the report's own Accrual / Cash toggle switches it.
+ */
 function ReportCard({ href, icon: Icon, name, description }: ReportCardProps) {
-  const basis = usePreferences().company.reportBasis;
-  const target = basis === 'cash' ? (CASH_VARIANT[href] ?? href) : href;
   return (
-    <Link href={target} className="group focus:outline-none">
+    <Link href={href} className="group focus:outline-none">
       <Card className="flex items-start gap-4 p-5 transition-all duration-150 hover:shadow-2xl hover:border-electric/40 group-focus:ring-2 group-focus:ring-electric/40 cursor-pointer h-full">
         <div className="flex-shrink-0 rounded-xl bg-electric/10 p-2.5 group-hover:bg-electric/20 transition-colors">
           <Icon className="h-5 w-5 text-electric" />
@@ -146,10 +140,10 @@ const FINANCIAL_REPORTS: ReportCardProps[] = [
     description: 'Balance sheet with unpaid invoices and bills left out of income and expenses.',
   },
   {
-    href: '/reports/balance-sheet-classified',
+    href: '/reports/std/balance-sheet-prev-year',
     icon: Layers,
-    name: 'Balance Sheet — Classified',
-    description: 'Balance sheet grouped into current / long-term sections.',
+    name: 'Balance Sheet — Prev Year Comparison',
+    description: 'This balance sheet next to the same date last year.',
   },
   {
     href: '/reports/trial-balance',
@@ -161,7 +155,7 @@ const FINANCIAL_REPORTS: ReportCardProps[] = [
     href: '/reports/general-ledger',
     icon: List,
     name: 'General Ledger',
-    description: 'Every posted transaction entry across all accounts.',
+    description: 'Every account: beginning balance, transactions and ending balance.',
   },
   {
     href: '/reports/transaction-detail',
@@ -172,8 +166,41 @@ const FINANCIAL_REPORTS: ReportCardProps[] = [
   {
     href: '/reports/cash-flow',
     icon: TrendingUp,
-    name: 'Cash Flow',
+    name: 'Statement of Cash Flows',
     description: 'Operating, investing, and financing cash movements.',
+  },
+  {
+    href: '/reports/std/profit-loss-by-job',
+    icon: BarChart3,
+    name: 'P&L by Job',
+    description: 'Income and expenses per customer or job.',
+  },
+];
+
+const ACCOUNTANT_REPORTS: ReportCardProps[] = [
+  {
+    href: '/reports/std/adjusting-journal-entries',
+    icon: BookOpen,
+    name: 'Adjusting Journal Entries',
+    description: 'Journal entries marked as adjusting entries, with all their lines.',
+  },
+  {
+    href: '/reports/std/income-tax-preparation',
+    icon: FileText,
+    name: 'Income Tax Preparation',
+    description: 'Which tax form line each account adds up to.',
+  },
+  {
+    href: '/reports/std/income-tax-summary',
+    icon: Receipt,
+    name: 'Income Tax Summary',
+    description: 'Totals by tax form line, in form order.',
+  },
+  {
+    href: '/reports/std/income-tax-detail',
+    icon: ListChecks,
+    name: 'Income Tax Detail',
+    description: 'The accounts behind each tax form line.',
   },
 ];
 
@@ -215,6 +242,18 @@ const RECEIVABLES_PAYABLES_REPORTS: ReportCardProps[] = [
     description: 'Each open bill listed under its aging bucket.',
   },
   {
+    href: '/reports/std/unpaid-bills-detail',
+    icon: AlertCircle,
+    name: 'Unpaid Bills Detail',
+    description: 'Open bills and credits by vendor, with days past due.',
+  },
+  {
+    href: '/reports/std/sales-tax-liability',
+    icon: Percent,
+    name: 'Sales Tax Liability',
+    description: 'Sales tax collected, paid and still owed, by tax agency.',
+  },
+  {
     href: '/reports/statements',
     icon: FileText,
     name: 'Customer Statements',
@@ -238,14 +277,14 @@ const SALES_PURCHASES_REPORTS: ReportCardProps[] = [
   {
     href: '/reports/sales-by-customer',
     icon: TrendingUp,
-    name: 'Sales by Customer',
-    description: 'Invoiced totals per customer over a date range.',
+    name: 'Sales by Customer Summary',
+    description: 'Sales per customer and job over a date range.',
   },
   {
     href: '/reports/sales-by-item',
     icon: Package,
-    name: 'Sales by Item',
-    description: 'Quantity, revenue, COGS, and margin per item.',
+    name: 'Sales by Item Summary',
+    description: 'Quantity, sales, COGS, and gross margin per item.',
   },
   {
     href: '/reports/sales-by-rep',
@@ -256,13 +295,13 @@ const SALES_PURCHASES_REPORTS: ReportCardProps[] = [
   {
     href: '/reports/purchases-by-vendor',
     icon: Truck,
-    name: 'Purchases by Vendor',
-    description: 'Billed totals per vendor over a date range.',
+    name: 'Purchases by Vendor Summary',
+    description: 'Items bought from each vendor over a date range.',
   },
   {
     href: '/reports/purchases-by-item',
     icon: ShoppingCart,
-    name: 'Purchases by Item',
+    name: 'Purchases by Item Summary',
     description: 'Quantity and cost per item from vendor bills.',
   },
   {
@@ -434,6 +473,13 @@ export default function ReportsPage() {
       <SectionHeading>Financial</SectionHeading>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {FINANCIAL_REPORTS.map((r) => (
+          <ReportCard key={r.href} {...r} />
+        ))}
+      </div>
+
+      <SectionHeading>Accountant &amp; Taxes</SectionHeading>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {ACCOUNTANT_REPORTS.map((r) => (
           <ReportCard key={r.href} {...r} />
         ))}
       </div>
