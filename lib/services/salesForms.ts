@@ -165,6 +165,7 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
           total: est.total,
           memo: est.memo ?? null,
         },
+        shipTo: est.shipTo ?? null,
         lines: est.lines.map(lineOf),
       });
       return {

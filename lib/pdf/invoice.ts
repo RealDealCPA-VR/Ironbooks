@@ -48,7 +48,7 @@ export interface InvoicePdfData {
 }
 
 /** Ship-to address object (invoices.ship_to) → printable lines. */
-function shipToObjectLines(shipTo: Record<string, string> | null | undefined): string[] {
+export function shipToObjectLines(shipTo: Record<string, string> | null | undefined): string[] {
   if (!shipTo) return [];
   const v = (k: string) => (shipTo[k] ?? '').toString().trim();
   const cityLine = [v('city'), [v('state'), v('zip') || v('postalCode')].filter(Boolean).join(' ')].filter(Boolean).join(', ');
