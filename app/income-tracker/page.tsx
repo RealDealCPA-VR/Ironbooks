@@ -143,7 +143,7 @@ export default function IncomeTrackerPage() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
-        title="Income Tracker"
+        title="Money coming in (Income Tracker)"
         icon={TrendingUp}
         action={
           <Link href="/collections-center" className="text-sm font-semibold text-electric hover:underline">

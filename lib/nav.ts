@@ -429,16 +429,19 @@ export function searchPages(
     seen.add(key);
     out.push(r);
   };
-  // Plain-language intents first ("I got paid" -> Receive Payments).
+  const qWords = words(q);
+  const ranked = CANDIDATES.map((c, order) => ({ c, order, score: scoreCandidate(q, qWords, c) }))
+    .filter((s) => s.score > 0 && allowed(s.c.path))
+    .sort((a, b) => b.score - a.score || a.order - b.order);
+  const pushPage = ({ c }: (typeof ranked)[number]) =>
+    push({ label: c.label, href: c.href, description: c.qb && c.qb !== c.label ? `QuickBooks: ${c.qb}` : undefined, group: c.group });
+  // 1. The page whose name (or QuickBooks name) contains what was typed ("finance charges").
+  ranked.filter((s) => s.score >= 70).forEach(pushPage);
+  // 2. Plain-language intents ("I got paid" -> Receive Payments).
   for (const i of matchIntents(query, 3)) {
     if (allowed(i.href)) push({ label: i.label, href: i.href, description: i.description, group: 'Suggested' });
   }
-  const qWords = words(q);
-  CANDIDATES.map((c, order) => ({ c, order, score: scoreCandidate(q, qWords, c) }))
-    .filter((s) => s.score > 0 && allowed(s.c.path))
-    .sort((a, b) => b.score - a.score || a.order - b.order)
-    .forEach(({ c }) =>
-      push({ label: c.label, href: c.href, description: c.qb && c.qb !== c.label ? `QuickBooks: ${c.qb}` : undefined, group: c.group }),
-    );
+  // 3. Pages whose words / keywords match.
+  ranked.filter((s) => s.score < 70).forEach(pushPage);
   return out.slice(0, limit);
 }
