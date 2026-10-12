@@ -5,9 +5,11 @@
  *
  * Closing-date override (QB "Set Closing Date" parity): mutating calls accept an optional
  * `opts.closingPassword`, sent as the `x-closing-password` header that lib/context.ts verifies.
- * Pages can also register a window-level prompt (setClosingPasswordPrompt or
- * window.__bkaClosingPasswordPrompt); when a mutation fails with code PERIOD_CLOSED the client
- * invokes the prompt once and retries with the supplied password.
+ * The app shell registers a modal prompt (components/ClosingPasswordProvider.tsx via
+ * setClosingPasswordPrompt; window.__bkaClosingPasswordPrompt is a fallback). When a mutation
+ * fails with PERIOD_CLOSED because of the closing date, the client asks for the password and
+ * retries; a wrong password re-asks (up to MAX_CLOSING_PASSWORD_ATTEMPTS) with a plain message.
+ * The server records each accepted override on the Closing Date Exception report.
  *
  * File-lock handling: a 403 "company file is locked" response (stale unlock cookie after an
  * app relaunch — see isFileLockError below) redirects the browser to /unlock before throwing.
@@ -50,12 +52,38 @@ export interface MutateOpts {
   headers?: Record<string, string>;
 }
 
+/** What the closing-date password prompt is told about why it is being shown. */
+export interface ClosingPasswordPromptInfo {
+  /** The server's plain-language PERIOD_CLOSED message. */
+  message: string;
+  /** True when the password just tried was not accepted (wrong password, or no permission). */
+  rejected: boolean;
+}
+
 /**
  * Returns a closing-date password (or null to cancel). May be async (e.g. open a modal).
- * Transaction pages can adopt this by calling setClosingPasswordPrompt(...) on mount, or by
- * assigning window.__bkaClosingPasswordPrompt.
+ * Registered app-wide by components/ClosingPasswordProvider.tsx (mounted in app/layout.tsx);
+ * window.__bkaClosingPasswordPrompt is still honored as a fallback.
  */
-export type ClosingPasswordPrompt = () => string | null | Promise<string | null>;
+export type ClosingPasswordPrompt = (
+  info?: ClosingPasswordPromptInfo,
+) => string | null | Promise<string | null>;
+
+/** Most password attempts the client makes for one save before giving up. */
+export const MAX_CLOSING_PASSWORD_ATTEMPTS = 3;
+
+/**
+ * True when a PERIOD_CLOSED error can be overridden with the closing-date password. A closed
+ * fiscal period (Fiscal Periods screen) can't — it must be reopened — so no prompt is shown.
+ * Coupled to the messages thrown by assertPeriodOpen (lib/services/fiscalPeriods.ts).
+ */
+export function isClosingPasswordError(err: unknown): err is ApiError {
+  return (
+    err instanceof ApiError &&
+    err.code === 'PERIOD_CLOSED' &&
+    !/accounting period containing .* is closed/i.test(err.message)
+  );
+}
 
 let closingPasswordPrompt: ClosingPasswordPrompt | null = null;
 
@@ -216,18 +244,26 @@ async function mutate<T>(
 
   try {
     return await run(opts);
-  } catch (err) {
-    if (
-      err instanceof ApiError &&
-      err.code === 'PERIOD_CLOSED' &&
-      opts?.closingPassword === undefined
-    ) {
-      const prompt = resolvePrompt();
-      if (prompt) {
-        const password = await prompt();
-        if (password !== null && password !== undefined) {
-          return run({ ...opts, closingPassword: password });
-        }
+  } catch (first) {
+    // Explicitly supplied passwords are never re-prompted.
+    if (!isClosingPasswordError(first) || opts?.closingPassword !== undefined) throw first;
+    const prompt = resolvePrompt();
+    if (!prompt) throw first;
+    let err: ApiError = first;
+    for (let attempt = 0; attempt < MAX_CLOSING_PASSWORD_ATTEMPTS; attempt++) {
+      const password = await prompt({ message: err.message, rejected: attempt > 0 });
+      if (password === null || password === undefined) throw err;
+      try {
+        return await run({ ...opts, closingPassword: password });
+      } catch (retryErr) {
+        // Still refused by the closing date: the password was wrong (or this user may not
+        // change closed-period transactions). Ask again with a plain message.
+        if (!isClosingPasswordError(retryErr)) throw retryErr;
+        err = new ApiError(
+          retryErr.status,
+          'That closing date password is not correct, or your role is not allowed to change transactions on or before the closing date.',
+          retryErr.code,
+        );
       }
     }
     throw err;
