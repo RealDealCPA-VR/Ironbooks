@@ -261,9 +261,25 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
     .leftJoin(invoices, eq(invoices.id, journalItemApplications.invoiceId))
     .leftJoin(bills, eq(bills.id, journalItemApplications.billId))
     .where(eq(journalItemApplications.companyId, ctx.companyId));
-  for (const a of apps) {
-    const counterparts = [a.paymentEntry, a.billPaymentEntry, a.invoiceEntry, a.billEntry];
-    if (counterparts.some((id) => id && protectedIds.has(id))) protectedIds.add(a.journalEntryId);
+  //     The same goes for a document that is not being condensed at all (dated on/after the
+  //     cutoff, a draft, or one whose entry was already condensed away): if that payment is later
+  //     voided, the A/R or A/P charge must still be there with its application to re-open it.
+  //     Repeat until stable, since keeping one entry can keep the entries applied to it.
+  const condensable = new Set(candidates.filter((e) => e.status !== 'draft').map((e) => e.id));
+  const removable = (id: string | null) => !!id && condensable.has(id) && !protectedIds.has(id);
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const a of apps) {
+      if (!removable(a.journalEntryId)) continue;
+      const counterparts = [a.paymentEntry, a.billPaymentEntry, a.invoiceEntry, a.billEntry];
+      // Every application names exactly one counterpart document; a missing posted entry means
+      // the document is not being condensed now, so the application has to stay.
+      const linked = counterparts.filter((id) => id !== null && id !== undefined);
+      if (linked.length === 0 || linked.some((id) => id !== a.journalEntryId && !removable(id))) {
+        protectedIds.add(a.journalEntryId);
+        changed = true;
+      }
+    }
   }
   const openDocProtected = new Set(protectedIds);
 

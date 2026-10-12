@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { and, eq, sql } from 'drizzle-orm';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, journalEntryLines, users } from '@/lib/db/schema';
+import { accounts, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany, setClosingDate } from './company';
 import { createCustomer, customerBalanceSummary } from './customers';
@@ -94,8 +94,20 @@ describe('condense and applications that cross the cutoff', () => {
     const paymentId = pay.payment.id;
     await expectArTied(0);
 
+    // Something unrelated in January, so condense has work to do once the charge is kept.
+    await createManualEntry(ctx, {
+      date: D('2026-01-12'),
+      description: 'Cash sale',
+      lines: [
+        { accountId: code['1000'], debit: '10.00' },
+        { accountId: code['4000'], credit: '10.00' },
+      ],
+    });
+
     await setClosingDate(ctx, { closingDate: '2026-01-31' } as never);
     await condensePeriod(ctx, { beforeDate: new Date('2026-02-01T00:00:00Z'), dataDir: TEST_DIR });
+    // The charge (and its application to the February payment) is kept.
+    expect((await db.select().from(journalEntries).where(eq(journalEntries.id, charge.id))).length).toBe(1);
     await expectArTied(0);
     expect((await trialBalance(ctx, AS_OF)).balanced).toBe(true);
 
