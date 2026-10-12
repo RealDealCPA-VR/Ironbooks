@@ -89,14 +89,14 @@ export const QB_ACCOUNT_TYPES: QbAccountTypeInfo[] = [
     value: 'accounts_receivable', label: 'Accounts Receivable', baseType: 'asset',
     defaultSubtype: 'accounts_receivable', subtypes: ['accounts_receivable'], section: 'current_asset',
     help: 'Money customers owe you for invoices they have not paid yet.',
-    examples: 'Accounts Receivable, Retainage Receivable',
+    examples: 'Accounts Receivable',
   },
   {
     value: 'other_current_asset', label: 'Other Current Asset', baseType: 'asset',
     defaultSubtype: 'other_current_asset', subtypes: ['other_current_asset', 'undeposited_funds', 'inventory'],
     section: 'current_asset',
     help: 'Something you own that will turn into cash or be used up within a year, but is not a bank account.',
-    examples: 'Undeposited Funds, Prepaid Insurance, Inventory Asset, Employee Advances',
+    examples: 'Undeposited Funds, Prepaid Insurance, Inventory Asset, Retainage Receivable, Employee Advances',
   },
   {
     value: 'fixed_asset', label: 'Fixed Asset', baseType: 'asset', defaultSubtype: 'fixed_assets',

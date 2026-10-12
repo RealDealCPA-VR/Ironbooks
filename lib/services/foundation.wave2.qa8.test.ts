@@ -12,6 +12,8 @@
  *   - every line the services DO mark as controlLine: is it really in the subledger? The
  *     invoice's Retainage Receivable line is marked controlLine and sits on an A/R account, but
  *     aging leaves retainage out (billed base = total - retainage).
+ *     [Fixed in fix round 6: 1250 is now an Other Current Asset and its line is not a control
+ *     line — see foundation.wave2.fix6.test.ts.]
  *
  * Each test measures the gap (GL - aging) before and after its own posting. A refusal is always
  * acceptable; posting an amount that aging can never see is not.

@@ -21,7 +21,7 @@ export const DEFAULT_COA: AccountSeed[] = [
   { code: '1010', name: 'Savings', type: 'asset', subtype: 'savings' },
   { code: '1050', name: 'Undeposited Funds', type: 'asset', subtype: 'undeposited_funds' },
   { code: '1200', name: 'Accounts Receivable', type: 'asset', subtype: 'accounts_receivable' },
-  { code: '1250', name: 'Retainage Receivable', type: 'asset', subtype: 'accounts_receivable' },
+  { code: '1250', name: 'Retainage Receivable', type: 'asset', subtype: 'other_current_asset' },
   { code: '1300', name: 'Inventory Asset', type: 'asset', subtype: 'inventory' },
   { code: '1500', name: 'Fixed Assets', type: 'asset', subtype: 'fixed_assets' },
   { code: '2000', name: 'Accounts Payable', type: 'liability', subtype: 'accounts_payable' },

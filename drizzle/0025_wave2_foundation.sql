@@ -61,6 +61,16 @@ END
 $$;
 --> statement-breakpoint
 
+-- ---- Retainage Receivable is an Other Current Asset (QB contractor setup) -------------
+-- Older companies seeded 1250 Retainage Receivable as an Accounts Receivable account. The amount
+-- held back on an invoice is not owed by the customer yet, so A/R aging leaves it out; keeping it
+-- in an A/R account made the A/R accounts on the balance sheet exceed A/R aging (I11). Retype it
+-- (subtype only — type and balance are unchanged, so the ledger guards are unaffected).
+UPDATE "accounts" SET "subtype" = 'other_current_asset'
+WHERE "code" = '1250' AND "type" = 'asset' AND "subtype" = 'accounts_receivable'
+  AND "name" ~* 'retainage';
+--> statement-breakpoint
+
 -- ---- tax lines ------------------------------------------------------------------
 ALTER TABLE "accounts" ADD COLUMN IF NOT EXISTS "tax_line" varchar(40);
 --> statement-breakpoint

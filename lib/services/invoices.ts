@@ -369,14 +369,29 @@ async function prepareInvoice(
   const taxPayableId = await accountIdByCode(ctx, '2200');   // Sales Tax Payable
 
   // Resolve (or create) the Retainage Receivable account if this invoice uses retainage.
+  // As in a QuickBooks contractor file, Retainage Receivable is an Other Current Asset, NOT an
+  // A/R account: the held-back amount is not part of what the customer owes today, so it must
+  // stay out of A/R (I11: A/R aging == the A/R accounts on the balance sheet). It is billed
+  // later with an invoice line on this account, which moves it into A/R.
   const usesRetainage = input.retainagePercent != null && Money.of(input.retainagePercent).greaterThan(0);
   const retainageAcctId = usesRetainage
     ? await getOrCreateAccountByCode(ctx, '1250', {
         name: 'Retainage Receivable',
         type: 'asset',
-        subtype: 'accounts_receivable',
+        subtype: 'other_current_asset',
       })
     : null;
+  if (retainageAcctId) {
+    const [ret] = await ctx.db
+      .select({ name: accounts.name, type: accounts.type, subtype: accounts.subtype })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, retainageAcctId)));
+    if (!ret || ret.type !== 'asset' || ret.subtype === 'accounts_receivable' || ret.subtype === 'non_posting') {
+      throw validation(
+        `Retainage is held in account 1250${ret ? ` "${ret.name}"` : ''}, which must be an Other Current Asset account. Change that account's type to Other Current Asset in the Chart of Accounts, then save the invoice again.`,
+      );
+    }
+  }
 
   // Pre-load items referenced by lines (income account routing + inventory typing).
   const itemIds = [
@@ -782,7 +797,6 @@ async function postInvoiceGL(
       accountId: retainageAcctId,
       weight: retainageAmount,
       memo: `Invoice #${invoiceNumber} — retainage`,
-      controlLine: true,
     });
   }
   if (discount.greaterThan(0)) {
