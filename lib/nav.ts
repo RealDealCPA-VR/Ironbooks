@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import { pageAreasFor } from '@/lib/permissions/routes';
 import type { Area } from '@/lib/permissions/model';
-import { matchIntents } from '@/lib/nav-actions';
+import { matchIntentsScored } from '@/lib/nav-actions';
 import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
 // team pricing: advanced pricing, SO fulfillment worksheet, enhanced receiving
 import { PackageCheck, FileInput, SlidersHorizontal } from 'lucide-react';
@@ -136,6 +136,8 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: BarChart2, label: 'Report Center', path: '/reports', qb: 'Report Center', keywords: 'reports' },
       { icon: Wrench, label: 'Report Builder', path: '/reports/builder', qb: 'Custom Reports', keywords: 'custom report' },
+      { icon: TrendingUp, label: 'Profit & Loss', path: '/reports/profit-loss', qb: 'Profit & Loss Standard', keywords: 'p&l income statement' },
+      { icon: Scale, label: 'Balance Sheet', path: '/reports/balance-sheet', qb: 'Balance Sheet Standard', keywords: 'assets liabilities' },
       { icon: Wallet, label: 'Profit & Loss (cash basis)', path: '/reports/profit-loss-cash', qb: 'Profit & Loss (cash basis)', keywords: 'p&l income statement' },
       { icon: GitCompareArrows, label: 'Profit & Loss comparison', path: '/reports/pl-comparative', qb: 'Profit & Loss Prev Year Comparison', keywords: 'p&l compare' },
       { icon: CalendarRange, label: 'Profit & Loss by month', path: '/reports/pl-monthly', qb: 'Profit & Loss by Month', keywords: 'p&l monthly' },
@@ -437,11 +439,20 @@ export function searchPages(
     push({ label: c.label, href: c.href, description: c.qb && c.qb !== c.label ? `QuickBooks: ${c.qb}` : undefined, group: c.group });
   // 1. The page whose name (or QuickBooks name) contains what was typed ("finance charges").
   ranked.filter((s) => s.score >= 70).forEach(pushPage);
-  // 2. Plain-language intents ("I got paid" -> Receive Payments).
-  for (const i of matchIntents(query, 3)) {
+  // 2. Plain-language intents where a whole phrase was typed ("enter a bill" -> Enter Bills,
+  //    "I got paid" -> Receive Payments).
+  const intents = matchIntentsScored(query, 3);
+  const pushIntent = ({ intent: i }: (typeof intents)[number]) => {
     if (allowed(i.href)) push({ label: i.label, href: i.href, description: i.description, group: 'Suggested' });
-  }
-  // 3. Pages whose words / keywords match.
-  ranked.filter((s) => s.score < 70).forEach(pushPage);
+  };
+  intents.filter((i) => i.score >= 100).forEach(pushIntent);
+  // 3. Pages where every meaningful word typed matches the name or keywords ("late fee" ->
+  //    Late-payment charges, "make a deposit" -> Make Deposits). A full keyword match beats a
+  //    loose plain-language guess, so it ranks above the partial intents.
+  ranked.filter((s) => s.score >= 50 && s.score < 70).forEach(pushPage);
+  // 4. Looser plain-language intents.
+  intents.filter((i) => i.score < 100).forEach(pushIntent);
+  // 5. Pages where only some of the words match.
+  ranked.filter((s) => s.score < 50).forEach(pushPage);
   return out.slice(0, limit);
 }

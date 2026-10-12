@@ -111,7 +111,9 @@ export function parseTodoBody(body: unknown): TodoInput {
   const due = str('dueDate', b.dueDate);
   if (due !== undefined) {
     if (due && /^\d{4}-\d{2}-\d{2}T/.test(due)) {
-      // Old Lists clients: an ISO timestamp.
+      // Old Lists clients: an ISO timestamp. Check the calendar day first so an impossible
+      // day (Feb 30) is refused instead of silently rolling over into the next month.
+      if (!isDay(due.slice(0, 10))) throw validation('Due date must be a real date (YYYY-MM-DD).');
       const d = new Date(due);
       if (Number.isNaN(d.getTime())) throw validation('Due date must be a real date (YYYY-MM-DD).');
       out.dueDate = d.toISOString().slice(0, 10);
