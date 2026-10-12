@@ -5,7 +5,7 @@
  * Consumers read the resolved values with getPreferences (company) / getMyPreferences (user);
  * the catalogue, defaults and pure helpers live in lib/preferences.ts.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { userPreferences } from '@/lib/db/schema';
 import {
   MY_PREFERENCE_KEYS,
@@ -57,21 +57,19 @@ export async function updateMyPreferences(
     .select()
     .from(userPreferences)
     .where(and(eq(userPreferences.companyId, ctx.companyId), eq(userPreferences.userId, ctx.userId)));
-  const merged = { ...((existing?.prefs as Record<string, unknown>) ?? {}), ...clean };
-  let id: string;
-  if (existing) {
-    await ctx.db
-      .update(userPreferences)
-      .set({ prefs: merged, updatedAt: new Date() })
-      .where(eq(userPreferences.id, existing.id));
-    id = existing.id;
-  } else {
-    const [row] = await ctx.db
-      .insert(userPreferences)
-      .values({ companyId: ctx.companyId, userId: ctx.userId, prefs: merged })
-      .returning({ id: userPreferences.id });
-    id = row.id;
-  }
+  // Atomic upsert: two quick saves (even a person's very first ones) both stick — the unique
+  // (company_id, user_id) key turns the second insert into a JSON merge of just its own keys,
+  // so overlapping saves never drop each other's settings.
+  const [row] = await ctx.db
+    .insert(userPreferences)
+    .values({ companyId: ctx.companyId, userId: ctx.userId, prefs: clean })
+    .onConflictDoUpdate({
+      target: [userPreferences.companyId, userPreferences.userId],
+      set: { prefs: sql`${userPreferences.prefs} || excluded.prefs`, updatedAt: new Date() },
+    })
+    .returning({ id: userPreferences.id, prefs: userPreferences.prefs });
+  const id = row.id;
+  const merged = (row.prefs as Record<string, unknown>) ?? {};
   // My Preferences are personal settings, so a view-only member may change their own: audit
   // under a context without the viewer role (writeAudit would otherwise refuse the row).
   await writeAudit(

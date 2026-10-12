@@ -14,8 +14,30 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, ilike, isNull, or } from 'drizzle-orm';
 import { resolveDataDir } from '@/lib/db';
-import { attachments } from '@/lib/db/schema';
+import {
+  attachments,
+  billPayments,
+  bills,
+  creditMemos,
+  customers,
+  employees,
+  estimates,
+  expenses,
+  formTemplates,
+  invoices,
+  items,
+  journalEntries,
+  leads,
+  paychecks,
+  paymentsReceived,
+  purchaseOrders,
+  salesOrders,
+  salesReceipts,
+  vendorCredits,
+  vendors,
+} from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { assertWrite } from './rbac';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -81,6 +103,43 @@ function normalizeLink(
   return { entityType: t, entityId: i };
 }
 
+/**
+ * Record types a Doc Center document can be filed to (Doc Center "Attach to" and record panels).
+ * Filing never trusts a client-supplied id: the record must exist in this company.
+ */
+const FILING_TABLES = {
+  invoice: invoices,
+  bill: bills,
+  expense: expenses,
+  journal_entry: journalEntries,
+  customer: customers,
+  vendor: vendors,
+  employee: employees,
+  paycheck: paychecks,
+  estimate: estimates,
+  sales_receipt: salesReceipts,
+  sales_order: salesOrders,
+  purchase_order: purchaseOrders,
+  credit_memo: creditMemos,
+  vendor_credit: vendorCredits,
+  payment_received: paymentsReceived,
+  bill_payment: billPayments,
+  item: items,
+  lead: leads,
+  form_template: formTemplates,
+} as const;
+
+/** A filed link must point at a known record type and a real record of this company. */
+async function assertFilingTarget(ctx: ServiceContext, entityType: string, entityId: string): Promise<void> {
+  const table = (FILING_TABLES as Record<string, (typeof FILING_TABLES)[keyof typeof FILING_TABLES]>)[entityType];
+  if (!table) throw validation('Documents can only be filed to a known record type.');
+  const [found] = await ctx.db
+    .select({ id: table.id })
+    .from(table)
+    .where(and(eq(table.id, entityId), eq(table.companyId, ctx.companyId)));
+  if (!found) throw validation('That record was not found in this company.');
+}
+
 // ---------------------------------------------------------------------------
 // saveAttachment
 // ---------------------------------------------------------------------------
@@ -94,6 +153,7 @@ export async function saveAttachment(
   ctx: ServiceContext,
   params: SaveAttachmentParams,
 ): Promise<AttachmentRow> {
+  assertWrite(ctx); // view-only members cannot add documents (checked before the file is written)
   const { filename, mimeType, base64 } = params;
   const { entityType, entityId } = normalizeLink(params.entityType, params.entityId);
 
@@ -232,9 +292,11 @@ export async function updateAttachment(
     .from(attachments)
     .where(and(eq(attachments.id, id), eq(attachments.companyId, ctx.companyId)));
   if (!row) throw notFound('Attachment');
+  assertWrite(ctx); // view-only members cannot re-file or re-describe (checked before any change)
   const patch: Partial<typeof attachments.$inferInsert> = {};
   if (params.entityType !== undefined || params.entityId !== undefined) {
     const link = normalizeLink(params.entityType, params.entityId);
+    if (link.entityType && link.entityId) await assertFilingTarget(ctx, link.entityType, link.entityId);
     patch.entityType = link.entityType;
     patch.entityId = link.entityId;
   }
@@ -306,6 +368,7 @@ export async function deleteAttachment(ctx: ServiceContext, id: string): Promise
     .where(and(eq(attachments.id, id), eq(attachments.companyId, ctx.companyId)));
 
   if (!row) throw notFound('Attachment');
+  assertWrite(ctx); // view-only members cannot delete documents
 
   // Remove DB row first; if the file delete fails we still keep the DB clean.
   await ctx.db

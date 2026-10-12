@@ -24,6 +24,7 @@ import {
   leads,
   letterTemplates,
   paymentsReceived,
+  vendorCredits,
   vendors,
 } from '@/lib/db/schema';
 import { Money, formatCurrency, toAmountString } from '@/lib/money';
@@ -355,6 +356,12 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
       .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.status, ['open', 'partial', 'overdue'])));
     const owed = new Map<string, ReturnType<typeof Money.zero>>();
     for (const b of open) owed.set(b.vendorId, (owed.get(b.vendorId) ?? Money.zero()).plus(Money.of(b.balance)));
+    // Unapplied vendor credits reduce what we owe (QB's vendor balance), so vendor balances tie to A/P.
+    const vCredits = await ctx.db
+      .select({ vendorId: vendorCredits.vendorId, amt: vendorCredits.unapplied })
+      .from(vendorCredits)
+      .where(and(eq(vendorCredits.companyId, ctx.companyId), ne(vendorCredits.status, 'void'), gt(vendorCredits.unapplied, '0')));
+    for (const c of vCredits) owed.set(c.vendorId, (owed.get(c.vendorId) ?? Money.zero()).minus(Money.of(c.amt)));
     list = rows
       .filter((r) => opts.includeInactive || r.isActive)
       .map((r) => ({

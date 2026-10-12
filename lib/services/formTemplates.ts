@@ -15,6 +15,7 @@ import { formTemplates } from '@/lib/db/schema';
 import { defaultDesign, isFormType, normalizeDesign, type FormDesign, type FormType } from '@/lib/pdf/design';
 import type { FormLogo } from '@/lib/pdf/template';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { assertWrite } from './rbac';
 import { deleteAttachment, getAttachmentFile, saveAttachment } from './attachments';
 
 export type FormTemplateRow = typeof formTemplates.$inferSelect;
@@ -94,6 +95,7 @@ export async function createFormTemplate(
   ctx: ServiceContext,
   input: CreateFormTemplateInput,
 ): Promise<FormTemplateView> {
+  assertWrite(ctx); // view-only members change nothing (checked before any write or file save)
   assertFormType(input.formType);
   const name = input.name?.trim();
   if (!name) throw validation('Template name is required.');
@@ -141,6 +143,7 @@ export async function updateFormTemplate(
   id: string,
   input: UpdateFormTemplateInput,
 ): Promise<FormTemplateView> {
+  assertWrite(ctx); // view-only members change nothing (checked before any write or file save)
   const before = await loadRow(ctx, id);
   const formType = before.formType as FormType;
   const patch: Partial<typeof formTemplates.$inferInsert> = { updatedAt: new Date() };
@@ -183,6 +186,7 @@ export async function updateFormTemplate(
 
 /** Delete a template (the logo file goes too unless another template shares it). */
 export async function deleteFormTemplate(ctx: ServiceContext, id: string): Promise<void> {
+  assertWrite(ctx); // view-only members change nothing (checked before any write or file save)
   const row = await loadRow(ctx, id);
   await ctx.db.delete(formTemplates).where(and(eq(formTemplates.id, id), eq(formTemplates.companyId, ctx.companyId)));
   await writeAudit(ctx, {
@@ -212,6 +216,7 @@ export async function setFormTemplateLogo(
   id: string,
   input: { filename: string; mimeType: string; base64: string },
 ): Promise<FormTemplateView> {
+  assertWrite(ctx); // view-only members change nothing (checked before any write or file save)
   const row = await loadRow(ctx, id);
   const mime = (input.mimeType || '').toLowerCase();
   if (mime !== 'image/png' && mime !== 'image/jpeg' && mime !== 'image/jpg') {
@@ -247,6 +252,7 @@ export async function setFormTemplateLogo(
 }
 
 export async function removeFormTemplateLogo(ctx: ServiceContext, id: string): Promise<FormTemplateView> {
+  assertWrite(ctx); // view-only members change nothing (checked before any write or file save)
   const row = await loadRow(ctx, id);
   const [updated] = await ctx.db
     .update(formTemplates)

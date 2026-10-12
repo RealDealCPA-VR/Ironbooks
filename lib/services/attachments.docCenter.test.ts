@@ -12,6 +12,7 @@ import {
   searchAttachments,
   updateAttachment,
 } from './attachments';
+import { createCustomer } from './customers';
 import { makeTestCompany, type TestCompany } from './testkit.prefs';
 
 let t: TestCompany;
@@ -40,11 +41,15 @@ describe('Doc Center (integration)', () => {
 
   it('files it to a record, finds it there, and can unfile it again', async () => {
     const [doc] = await listUnfiledAttachments(t.ctx);
-    const invoiceId = randomUUID();
-    const filed = await updateAttachment(t.ctx, doc.id, { entityType: 'invoice', entityId: invoiceId });
-    expect(filed.entityType).toBe('invoice');
+    // Filing needs a real record of this company (a made-up id is refused).
+    await expect(updateAttachment(t.ctx, doc.id, { entityType: 'invoice', entityId: randomUUID() })).rejects.toMatchObject({
+      code: 'VALIDATION',
+    });
+    const cust = await createCustomer(t.ctx, { displayName: 'Doc Center Customer' });
+    const filed = await updateAttachment(t.ctx, doc.id, { entityType: 'customer', entityId: cust.id });
+    expect(filed.entityType).toBe('customer');
     expect((await listUnfiledAttachments(t.ctx)).some((d) => d.id === doc.id)).toBe(false);
-    expect((await listAttachments(t.ctx, { entityType: 'invoice', entityId: invoiceId })).map((d) => d.id)).toEqual([doc.id]);
+    expect((await listAttachments(t.ctx, { entityType: 'customer', entityId: cust.id })).map((d) => d.id)).toEqual([doc.id]);
     const back = await updateAttachment(t.ctx, doc.id, { entityType: null, entityId: null, description: 'moved back' });
     expect(back.entityId).toBeNull();
     expect(back.description).toBe('moved back');

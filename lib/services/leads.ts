@@ -7,6 +7,7 @@
 import { and, asc, eq } from 'drizzle-orm';
 import { leads, todos } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { assertWrite } from './rbac';
 import { createCustomer } from './customers';
 
 export type LeadRow = typeof leads.$inferSelect;
@@ -78,6 +79,7 @@ export async function getLead(ctx: ServiceContext, id: string): Promise<LeadRow>
 }
 
 export async function createLead(ctx: ServiceContext, input: LeadInput): Promise<LeadRow> {
+  assertWrite(ctx); // view-only members change nothing (checked before any write)
   const values = clean(input, true);
   const [row] = await ctx.db
     .insert(leads)
@@ -88,6 +90,7 @@ export async function createLead(ctx: ServiceContext, input: LeadInput): Promise
 }
 
 export async function updateLead(ctx: ServiceContext, id: string, input: LeadInput): Promise<LeadRow> {
+  assertWrite(ctx); // view-only members change nothing (checked before any write)
   const before = await getLead(ctx, id);
   const patch = clean(input, false);
   const [row] = await ctx.db
@@ -106,13 +109,16 @@ export async function updateLead(ctx: ServiceContext, id: string, input: LeadInp
 }
 
 export async function deleteLead(ctx: ServiceContext, id: string): Promise<void> {
-  const before = await getLead(ctx, id);
-  if (before.convertedCustomerId) {
-    throw validation('This lead became a customer. Make it inactive instead of deleting it.');
-  }
-  await ctx.db.delete(todos).where(and(eq(todos.companyId, ctx.companyId), eq(todos.entityType, 'lead'), eq(todos.entityId, id)));
-  await ctx.db.delete(leads).where(and(eq(leads.id, id), eq(leads.companyId, ctx.companyId)));
-  await writeAudit(ctx, { action: 'delete', entityType: 'lead', entityId: id, oldValues: { name: before.name } });
+  // One transaction (refuses view-only members up front): the lead and its to-dos go together.
+  await inTransaction(ctx, async (tx) => {
+    const before = await getLead(tx, id);
+    if (before.convertedCustomerId) {
+      throw validation('This lead became a customer. Make it inactive instead of deleting it.');
+    }
+    await tx.db.delete(todos).where(and(eq(todos.companyId, tx.companyId), eq(todos.entityType, 'lead'), eq(todos.entityId, id)));
+    await tx.db.delete(leads).where(and(eq(leads.id, id), eq(leads.companyId, tx.companyId)));
+    await writeAudit(tx, { action: 'delete', entityType: 'lead', entityId: id, oldValues: { name: before.name } });
+  });
 }
 
 /**
