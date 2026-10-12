@@ -62,6 +62,7 @@ const MENU_SECTIONS = [
       { label: 'Receive Items', route: '/item-receipts' },
       { label: 'Enter Bill for Received Items', route: '/receive-bill' },
       { label: 'Vendor Credits', route: '/vendor-credits' },
+      { label: 'Pay Sales Tax', route: '/sales-tax' },
       { separator: true },
       { label: '1099 Summary', route: '/reports/1099' },
     ],
