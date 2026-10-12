@@ -840,3 +840,68 @@ describe('round 2: as-of aging with dated General Journal applications', () => {
     await arTied();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Re-test round 2: attacks on the GREATEST(application, invoice / bill date) fix
+// ---------------------------------------------------------------------------
+
+describe('round 3: re-dated documents carrying General Journal credits', () => {
+  it('A/P mirror: re-dating a bill past the day a General Journal vendor credit was applied keeps as-of aging tied (or is refused)', async () => {
+    const vend = (await createVendor(ctx, { displayName: 'R3 Moved Bill Vendor' })).id;
+    const billIn = (date: string) => ({ vendorId: vend, date: D(date), billNumber: 'R3-MV', lines: [{ accountId: code['6000'], amount: '120.00' }] });
+    const bill = await createBill(ctx, billIn('2026-09-22'));
+    const vc = await apVendorCredit(vend, '2026-09-22', '20.00');
+    await applyJournalCredit(ctx, { journalLineId: vc.lineId, billId: bill.id, amount: '20.00', date: D('2026-09-23') });
+    const { updateBill } = await import('./bills');
+    await updateBill(ctx, bill.id, billIn('2026-09-28')).catch(() => undefined);
+    for (const d of ['2026-09-22', '2026-09-23', '2026-09-25', '2026-09-28', '2026-09-29']) await apAllTiedOn(d);
+    await apTied();
+  });
+
+  it('A/R: changing the customer on an invoice carrying a General Journal credit is refused; per-customer balances stay tied', async () => {
+    const a = (await createCustomer(ctx, { displayName: 'R3 Swap A' })).id;
+    const b = (await createCustomer(ctx, { displayName: 'R3 Swap B' })).id;
+    const lines = [{ description: 'Swap', quantity: 1, rate: '50.00', accountId: code['4000'] }];
+    const inv = await createInvoice(ctx, { customerId: a, date: D('2026-10-01'), lines });
+    const credit = await arCredit(a, '2026-10-01', '30.00');
+    await applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv.id, amount: '30.00', date: D('2026-10-02') });
+    await expect(updateInvoice(ctx, inv.id, { customerId: b, date: D('2026-10-01'), lines })).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+    const [row] = await db.select().from(invoices).where(eq(invoices.id, inv.id));
+    expect(row.customerId).toBe(a);
+    await arTied();
+  });
+
+  it('A/R: invoice moved later, then the credit is unapplied and re-applied — the new application is not dated before the invoice', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R3 Reapply Customer' })).id;
+    const lines = [{ description: 'Penny', quantity: 1, rate: '100.01', accountId: code['4000'] }];
+    const inv = await createInvoice(ctx, { customerId: cust, date: D('2026-10-10'), lines });
+    const credit = await arCredit(cust, '2026-10-10', '33.33');
+    const app = await applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv.id, amount: '33.33', date: D('2026-10-11') });
+    const moved = await updateInvoice(ctx, inv.id, { customerId: cust, date: D('2026-10-15'), lines }).then(
+      () => true,
+      () => false,
+    );
+    for (const d of ['2026-10-10', '2026-10-12', '2026-10-15', '2026-10-16']) await arAllTiedOn(d);
+    await unapplyJournalApplication(ctx, app.id);
+    for (const d of ['2026-10-12', '2026-10-16']) await arAllTiedOn(d);
+    const again = await applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv.id, amount: '33.33', date: D('2026-10-12') });
+    expect(new Date(again.date).toISOString().slice(0, 10)).toBe(moved ? '2026-10-15' : '2026-10-12');
+    const [row] = await db.select().from(invoices).where(eq(invoices.id, inv.id));
+    expect(row.balanceDue).toBe('66.68');
+    for (const d of ['2026-10-11', '2026-10-13', '2026-10-15', '2026-10-16']) await arAllTiedOn(d);
+    await arTied();
+  });
+
+  it('A/R: invoice moved EARLIER than the General Journal credit entry — ties before, between and after', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R3 Earlier Customer' })).id;
+    const lines = [{ description: 'Earlier', quantity: 1, rate: '90.00', accountId: code['4000'] }];
+    const inv = await createInvoice(ctx, { customerId: cust, date: D('2026-11-10'), lines });
+    const credit = await arCredit(cust, '2026-11-10', '40.00');
+    await applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv.id, amount: '40.00', date: D('2026-11-11') });
+    await updateInvoice(ctx, inv.id, { customerId: cust, date: D('2026-11-02'), lines }).catch(() => undefined);
+    for (const d of ['2026-11-01', '2026-11-03', '2026-11-10', '2026-11-11', '2026-11-12']) await arAllTiedOn(d);
+    await arTied();
+  });
+});
