@@ -561,6 +561,11 @@ export function toast(message: string, tone: Toast['tone'] = 'info') {
  */
 export function toastError(err: unknown, fallback?: string) {
   const f = describeError(err, fallback);
+  // A save the user cancelled at a Preferences prompt is not an error.
+  if ((err as { code?: string } | null)?.code === 'CANCELLED') {
+    pushToastFn?.({ tone: 'info', message: (err as Error).message });
+    return;
+  }
   pushToastFn?.({ tone: 'danger', title: f.title, message: f.message, nextStep: f.nextStep });
 }
 
