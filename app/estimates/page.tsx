@@ -66,6 +66,7 @@ interface EstimateDetailLine {
   rate: string;
   amount: string;
   taxable: boolean;
+  classId?: string | null;
   /** Progress invoicing: invoiced so far on this line (units, dollars before tax, percent). */
   qtyInvoiced?: string;
   amountInvoiced?: string;
@@ -94,6 +95,8 @@ interface EstimateLineForm {
   taxable: boolean;
   /** Advanced pricing: the user typed the rate (automatic prices leave it alone). */
   rateManual?: boolean;
+  /** Class for the line; progress invoices carry it onto their lines. */
+  classId?: string;
 }
 
 interface EstimateForm {
@@ -152,6 +155,7 @@ function EstimateFormBody({
   customers,
   taxRates,
   items,
+  classes,
   onChange,
   onLinesChange,
 }: {
@@ -159,6 +163,7 @@ function EstimateFormBody({
   customers: Customer[];
   taxRates: TaxRate[];
   items: PricedLineItem[];
+  classes: Array<{ id: string; name: string }>;
   onChange: (field: keyof EstimateForm, value: string) => void;
   onLinesChange: (lines: EstimateLineForm[]) => void;
 }) {
@@ -240,6 +245,7 @@ function EstimateFormBody({
           onChange={onLinesChange}
           header={{ customerId: form.customerId || null, date: form.date }}
           showTaxable
+          classes={classes}
         />
 
         <div className="flex flex-col items-end gap-0.5 mt-3 pt-3 border-t border-slate-100 text-sm">
@@ -276,6 +282,7 @@ export default function EstimatesPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
   const [items, setItems] = useState<PricedLineItem[]>([]);
+  const [classList, setClassList] = useState<Array<{ id: string; name: string }>>([]);
   const [loading, setLoading] = useState(true);
   const [customerMap, setCustomerMap] = useState<Map<string, string>>(new Map());
 
@@ -356,6 +363,12 @@ export default function EstimatesPage() {
       .catch(() => {
         // Non-fatal; lines can still be typed without an item.
       });
+    api
+      .get<Array<{ id: string; name: string }>>('/api/classes')
+      .then((r) => setClassList(Array.isArray(r) ? r : []))
+      .catch(() => {
+        // Non-fatal; lines just have no class picker.
+      });
   }, [fetchEstimates, fetchCustomers, fetchTaxRates]);
 
   // ---------------------------------------------------------------------------
@@ -387,6 +400,7 @@ export default function EstimatesPage() {
           rate: String(Number(l.rate)),
           taxable: l.taxable,
           rateManual: true,
+          classId: l.classId ?? '',
         })),
       });
       setSendFlags(shippingFromDoc(detail));
@@ -432,6 +446,7 @@ export default function EstimatesPage() {
           // Blank rate on an item line: the server prices it (advanced pricing).
           rate: l.rate.trim() === '' ? (l.itemId ? null : 0) : parseFloat(l.rate) || 0,
           taxable: l.taxable,
+          classId: l.classId || null,
         })),
       };
       if (editingId) {
@@ -743,6 +758,7 @@ export default function EstimatesPage() {
           customers={customers}
           taxRates={taxRates}
           items={items}
+          classes={classList}
           onChange={handleFormChange}
           onLinesChange={(lines) => setAddForm((prev) => ({ ...prev, lines }))}
         />

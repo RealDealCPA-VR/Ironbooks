@@ -36,6 +36,8 @@ import {
   classes,
   companies,
   customers,
+  estimateLines,
+  estimates,
   inventoryLayers,
   invoices,
   invoiceLines,
@@ -97,8 +99,10 @@ export interface InvoiceLineInput extends InventoryLineDetail {
   classId?: string | null;
   /** Customer:Job for this line (job costing); falls back to the invoice-level jobId. */
   jobId?: string | null;
-  /** Internal (progress invoicing / estimate conversion): the estimate line this line bills.
-   *  Never accepted from the API (the zod schema drops it). */
+  /** Progress invoicing / estimate conversion: the estimate line this line bills. The invoice
+   *  form sends it back on edit (null = no longer bills an estimate line); omitted (undefined)
+   *  on an edit means "keep the link the matching old line had". Validated in prepareInvoice:
+   *  it must be a line of an estimate for the same company and customer, for the same item. */
   estimateLineId?: string | null;
   /**
    * Internal (progress invoicing): the exact line amount when it differs from quantity × rate
@@ -624,6 +628,30 @@ async function prepareInvoice(
       .where(and(eq(jobs.companyId, ctx.companyId), inArray(jobs.id, jobIds)));
     const found = new Set(rows.map((r) => r.id));
     for (const id of jobIds) if (!found.has(id)) throw notFound(`Job ${id}`);
+  }
+
+  // Estimate links (progress invoicing): each must be a line of an estimate of this company
+  // for this customer, billing the same item — a client cannot move billing onto someone else's
+  // estimate or onto an unrelated line.
+  const linkedIds = [...new Set(input.lines.map((l) => l.estimateLineId).filter(Boolean) as string[])];
+  if (linkedIds.length > 0) {
+    const rows = await ctx.db
+      .select({ id: estimateLines.id, itemId: estimateLines.itemId, customerId: estimates.customerId })
+      .from(estimateLines)
+      .innerJoin(estimates, eq(estimates.id, estimateLines.estimateId))
+      .where(and(eq(estimates.companyId, ctx.companyId), inArray(estimateLines.id, linkedIds)));
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    input.lines.forEach((l, i) => {
+      if (!l.estimateLineId) return;
+      const el = byId.get(l.estimateLineId);
+      if (!el) throw notFound(`Estimate line ${l.estimateLineId}`);
+      if (el.customerId !== input.customerId) {
+        throw validation(`Line ${i + 1} bills an estimate for a different customer.`);
+      }
+      if ((el.itemId ?? null) !== (l.itemId ?? null)) {
+        throw validation(`Line ${i + 1}: the item does not match the estimate line it bills.`);
+      }
+    });
   }
 
   // Pre-load any per-line tax-rate overrides into a rate map.
@@ -1608,19 +1636,46 @@ export async function postDraftInvoice(
  *   5. Audit trail records old and new values.
  */
 /**
- * Carry each old line's estimate link (progress invoicing) onto the edited line in the same
- * position when it still bills the same item — the invoice form does not round-trip the link.
+ * Progress invoices: keep each edited line billing ITS estimate line. Lines that state their link
+ * (estimateLineId set or null — the invoice form round-trips it) are left alone. For a line that
+ * omits it (older API clients), find the old linked line it came from by content — same item,
+ * description and rate first, then same item and description — never by position, so deleting
+ * an earlier line cannot shift billing onto the wrong estimate line. Each old link is used once.
  */
 function keepEstimateLinks(
   lines: ComputedLine[],
-  oldLines: Array<{ lineOrder: number; itemId: string | null; estimateLineId: string | null }>,
+  inputLines: InvoiceLineInput[],
+  oldLines: Array<{
+    itemId: string | null;
+    description: string | null;
+    rate: string;
+    estimateLineId: string | null;
+  }>,
 ) {
-  const byOrder = new Map(oldLines.map((l) => [l.lineOrder, l]));
-  for (const cl of lines) {
-    if (cl.estimateLineId || (cl.kind !== 'income' && cl.kind !== 'discount')) continue;
-    const old = byOrder.get(cl.lineOrder);
-    if (old?.estimateLineId && (old.itemId ?? null) === (cl.itemId ?? null)) {
-      cl.estimateLineId = old.estimateLineId;
+  const pool = oldLines.filter((l) => l.estimateLineId);
+  // Links the new lines state explicitly are taken.
+  for (let i = 0; i < lines.length; i++) {
+    if (inputLines[lines[i].lineOrder]?.estimateLineId === undefined || !lines[i].estimateLineId) continue;
+    const at = pool.findIndex((o) => o.estimateLineId === lines[i].estimateLineId);
+    if (at >= 0) pool.splice(at, 1);
+  }
+  const norm = (d: string | null) => (d ?? '').trim();
+  const passes: Array<(o: (typeof pool)[number], cl: ComputedLine) => boolean> = [
+    (o, cl) =>
+      (o.itemId ?? null) === (cl.itemId ?? null) &&
+      norm(o.description) === norm(cl.description) &&
+      Money.of(o.rate).equals(Money.of(cl.rate)),
+    (o, cl) => (o.itemId ?? null) === (cl.itemId ?? null) && norm(o.description) === norm(cl.description),
+  ];
+  for (const match of passes) {
+    for (let i = 0; i < lines.length; i++) {
+      const cl = lines[i];
+      if (cl.estimateLineId || inputLines[cl.lineOrder]?.estimateLineId !== undefined) continue;
+      if (cl.kind !== 'income' && cl.kind !== 'discount') continue;
+      const at = pool.findIndex((o) => match(o, cl));
+      if (at < 0) continue;
+      cl.estimateLineId = pool[at].estimateLineId;
+      pool.splice(at, 1);
     }
   }
 }
@@ -1660,6 +1715,12 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         throw new ServiceError('CONFLICT', 'Invoice is no longer a draft — reload and retry.');
       }
 
+      const oldDraftLines = await tx.db
+        .select()
+        .from(invoiceLines)
+        .where(eq(invoiceLines.invoiceId, id))
+        .orderBy(invoiceLines.lineOrder);
+      keepEstimateLinks(prep.computedLines, input.lines, oldDraftLines);
       await tx.db.delete(invoiceLines).where(eq(invoiceLines.invoiceId, id));
       await tx.db.insert(invoiceLines).values(
         prep.computedLines.map((cl) => ({
@@ -1751,7 +1812,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       .orderBy(invoiceLines.lineOrder);
     // Progress invoices: an edited line keeps billing the same estimate line (the form does not
     // send the link back), so the estimate's invoiced-to-date follows the edit.
-    keepEstimateLinks(prep.computedLines, oldLines);
+    keepEstimateLinks(prep.computedLines, input.lines, oldLines);
     const estimatesBefore = await estimatesBilledByInvoice(tx, id);
 
     // 1) Void the original A/R journal entry (assertPeriodOpen runs on its date).
@@ -1941,6 +2002,7 @@ export async function getInvoice(ctx: ServiceContext, id: string) {
       jobId: invoiceLines.jobId,
       taxRateId: invoiceLines.taxRateId,
       lineOrder: invoiceLines.lineOrder,
+      estimateLineId: invoiceLines.estimateLineId,
       itemName: items.name,
       itemType: items.type,
       unitOfMeasure: items.unitOfMeasure,

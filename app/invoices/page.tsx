@@ -146,6 +146,8 @@ interface InvoiceDetail extends Invoice {
     rate: string;
     taxable: boolean;
     jobId: string | null;
+    /** Progress invoicing: the estimate line this invoice line bills. */
+    estimateLineId?: string | null;
     itemName: string | null;
     itemType: ItemType | null;
     unitOfMeasure: string | null;
@@ -175,6 +177,9 @@ interface LineRow {
   inv?: InvDetail;
   /** Advanced pricing: the user typed this rate, so automatic prices must not replace it. */
   rateManual?: boolean;
+  /** Progress invoicing: the estimate line this row bills (kept through an edit; cleared
+   *  when the row's item changes). */
+  estimateLineId?: string | null;
 }
 
 /** Unbilled billable time & costs (GET /api/billables?customerId=). */
@@ -436,6 +441,7 @@ function InvoiceModal({
           inv: invFromLine(l),
           // Saved invoices keep their stored rates; the badge still flags rule differences.
           rateManual: true,
+          estimateLineId: l.estimateLineId ?? null,
         })),
       );
     } else {
@@ -515,7 +521,10 @@ function InvoiceModal({
   function updateLine(idx: number, patch: Partial<LineRow>) {
     setLines((prev) => {
       const next = [...prev];
-      next[idx] = { ...next[idx], ...patch };
+      const row = { ...next[idx], ...patch };
+      // A row switched to a different item no longer bills its estimate line.
+      if ('itemId' in patch && patch.itemId !== next[idx].itemId) row.estimateLineId = null;
+      next[idx] = row;
       return next;
     });
   }
@@ -747,6 +756,7 @@ function InvoiceModal({
             rate: totals.amounts[idx].toFixed(2),
             taxable: l.taxable,
             jobId: l.jobId || null,
+            ...(editing ? { estimateLineId: l.estimateLineId ?? null } : {}),
           };
         }
         return {
@@ -757,6 +767,8 @@ function InvoiceModal({
           taxable: l.taxable,
           jobId: l.jobId || null,
           ...inventoryLinePayload(l.inv),
+          // Edits send each row's estimate link back so progress billing stays on the right line.
+          ...(editing ? { estimateLineId: l.estimateLineId ?? null } : {}),
         };
       }),
     };

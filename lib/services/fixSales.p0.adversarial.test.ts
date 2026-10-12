@@ -38,7 +38,7 @@ import { voidJournalEntry } from './posting';
 import { assessFinanceCharges } from './financeCharges';
 import { setStartingDocNumber } from './docNumbers';
 import { customerStatement, customerArLedgerBalance, batchStatements } from './statements';
-import { arAging } from './reportsExtra';
+import { arAging, arAgingDetail } from './reportsExtra';
 import { verifyIntegrity } from './integrity';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-fix-sales-adv-' + Date.now());
@@ -473,6 +473,70 @@ describe('fix/sales P0 — adversarial QA', () => {
       expect(after.lines.find((l) => l.id === labor.id)!.amountInvoiced).toBe('0.00');
       expect(after.lines.find((l) => l.id === permit.id)!.amountInvoiced).toBe('60.00');
     });
+
+    it('the edit form round-trips estimateLineId: explicit links are kept, null unlinks, foreign links are refused', async () => {
+      const customerId = await newCustomer(A, 'Explicit Ella');
+      const otherCustomer = await newCustomer(A, 'Other Otto');
+      const est = await createEstimate(A.ctx, {
+        customerId,
+        date: d('2025-03-25'),
+        lines: [
+          { description: 'Labor', quantity: 10, rate: 50, taxable: false },
+          { description: 'Labor', quantity: 2, rate: 50, taxable: false }, // same content as line 1
+        ],
+      });
+      const e = await getEstimate(A.ctx, est.id);
+      const [l1, l2] = e.lines;
+      const r = await createProgressInvoice(A.ctx, est.id, { percent: 50, date: d('2025-03-26') });
+      const inv = await getInvoice(A.ctx, r.invoice.id);
+      // getInvoice exposes the link so the form can send it back.
+      expect(inv.lines.map((l) => l.estimateLineId).sort()).toEqual([l1.id, l2.id].sort());
+      const second = inv.lines.find((l) => l.estimateLineId === l2.id)!;
+
+      // Keep only the second line, stating its link explicitly.
+      await updateInvoice(A.ctx, r.invoice.id, {
+        customerId,
+        date: d('2025-03-26'),
+        lines: [{ description: 'Labor', quantity: second.quantity, rate: second.rate, taxable: false, estimateLineId: l2.id }],
+      });
+      let after = await getEstimate(A.ctx, est.id);
+      expect(after.lines.find((l) => l.id === l1.id)!.amountInvoiced).toBe('0.00');
+      expect(after.lines.find((l) => l.id === l2.id)!.amountInvoiced).toBe('50.00');
+
+      // An explicit null unlinks it (the invoice no longer bills the estimate).
+      await updateInvoice(A.ctx, r.invoice.id, {
+        customerId,
+        date: d('2025-03-26'),
+        lines: [{ description: 'Labor', quantity: second.quantity, rate: second.rate, taxable: false, estimateLineId: null }],
+      });
+      after = await getEstimate(A.ctx, est.id);
+      expect(after.lines.find((l) => l.id === l2.id)!.amountInvoiced).toBe('0.00');
+
+      // A link to this estimate from an invoice for another customer is refused, as is a bogus id.
+      await expect(
+        createInvoice(A.ctx, {
+          customerId: otherCustomer,
+          date: d('2025-03-27'),
+          lines: [{ description: 'Labor', quantity: 1, rate: 50, taxable: false, estimateLineId: l1.id }],
+        }),
+      ).rejects.toThrow(/different customer/);
+      await expect(
+        updateInvoice(A.ctx, r.invoice.id, {
+          customerId,
+          date: d('2025-03-26'),
+          lines: [{ description: 'Labor', quantity: 1, rate: 50, taxable: false, estimateLineId: '00000000-0000-4000-8000-000000000000' }],
+        }),
+      ).rejects.toThrow();
+      // Another company cannot link to this estimate line.
+      const bCustomer = await newCustomer(B, 'Cross Carl');
+      await expect(
+        createInvoice(B.ctx, {
+          customerId: bCustomer,
+          date: d('2025-03-27'),
+          lines: [{ description: 'Labor', quantity: 1, rate: 50, taxable: false, estimateLineId: l1.id }],
+        }),
+      ).rejects.toThrow();
+    });
   });
 
   it('migration 0036 is idempotent: re-running it leaves estimate billing progress unchanged', async () => {
@@ -557,6 +621,23 @@ describe('fix/sales P0 — adversarial QA', () => {
       await refundCreditMemo(A.ctx, { creditMemoId: cm.id, bankAccountId: A.acct['1000'], amount: 30, date: d('2025-06-20') });
       expect(await assertCustomerTies(A, customerId, d('2025-06-10'))).toBe('-90.00');
       expect(await assertCustomerTies(A, customerId, d('2025-06-30'))).toBe('-60.00');
+    });
+
+    it('A/R aging detail as of a date before a FULL credit-memo refund still lists the memo credit', async () => {
+      const customerId = await newCustomer(A, 'Detail Dora');
+      const cm = await createCreditMemo(A.ctx, {
+        customerId,
+        date: d('2025-06-01'),
+        lines: [{ description: 'Credit', quantity: 1, rate: 75, taxable: false }],
+      });
+      await refundCreditMemo(A.ctx, { creditMemoId: cm.id, bankAccountId: A.acct['1000'], amount: 75, date: d('2025-06-20') });
+      const before = await arAgingDetail(A.ctx, d('2025-06-10'));
+      const row = before.rows.find((r) => r.docId === cm.id);
+      expect(row?.openBalance).toBe('-75.00');
+      expect(await assertCustomerTies(A, customerId, d('2025-06-10'))).toBe('-75.00');
+      const after = await arAgingDetail(A.ctx, d('2025-06-30'));
+      expect(after.rows.find((r) => r.docId === cm.id)).toBeUndefined();
+      expect(await assertCustomerTies(A, customerId, d('2025-06-30'))).toBe('0.00');
     });
 
     it('partial credit-memo refund with the rest applied, then fully refunded overpayment: ties at the end', async () => {

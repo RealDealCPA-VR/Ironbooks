@@ -19,6 +19,9 @@ export const invoiceLineSchema = z.object({
   taxRateId: zUuid.nullish(),
   classId: zUuid.nullish(),
   jobId: zUuid.nullish(),
+  /** Progress invoicing: the estimate line this line bills (round-tripped by the edit form).
+   *  The service checks it belongs to an estimate for the same customer and item. */
+  estimateLineId: zUuid.nullish(),
   /** Advanced Inventory: site/bin/serial/lot the stock is sold from. */
   ...inventoryLineFields,
 });
