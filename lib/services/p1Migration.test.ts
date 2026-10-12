@@ -123,6 +123,41 @@ describe('P1 migration fidelity', () => {
     expect(named.filter((l) => l.type === 'vendor' && l.id === bVend.id)).toHaveLength(2);
   });
 
+  it('P2: IIF ACCNT OBAMOUNT posts opening balances (dated before the first transaction) and the export writes them back', async () => {
+    const ctx = await newCompany('OB Co', false);
+    const iif = [
+      t('!ACCNT', 'NAME', 'ACCNTTYPE', 'ACCNUM', 'OBAMOUNT'),
+      t('ACCNT', 'Operating Bank', 'BANK', '1010', '1500.00'),
+      t('ACCNT', 'Card', 'CCARD', '2010', '-250.00'),
+      t('ACCNT', 'Receivables', 'AR', '1200', '300.00'),
+      t('ACCNT', 'Sales', 'INC', '4000', ''),
+      t('!TRNS', 'TRNSTYPE', 'DATE', 'ACCNT', 'AMOUNT'),
+      t('!SPL', 'TRNSTYPE', 'DATE', 'ACCNT', 'AMOUNT'),
+      '!ENDTRNS',
+      t('TRNS', 'DEPOSIT', '2/10/2026', 'Operating Bank', '100.00'),
+      t('SPL', 'DEPOSIT', '2/10/2026', 'Sales', '-100.00'),
+      'ENDTRNS',
+    ].join('\r\n');
+    const counts = await importIIF(ctx, iif);
+    const bank = await acct(ctx, '1010');
+    const card = await acct(ctx, '2010');
+    expect(Number(bank.balance)).toBe(1600);
+    expect(Math.abs(Number(card.balance))).toBe(250);
+    // A/R cannot take an opening balance (QB: enter customer invoices) — reported, not posted.
+    expect(counts.issues.some((i) => i.name === 'Receivables' && /opening balance/.test(i.message))).toBe(true);
+    const [ob] = await ctx.db
+      .select()
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `account:${bank.id}`)));
+    expect(ob.date.toISOString().slice(0, 10)).toBe('2026-02-09');
+    const out = await exportListsIif(ctx, ['accounts']);
+    expect(out).toMatch(/^ACCNT\tOperating Bank\tBANK\t\t1010\t1500\.00\t/m);
+    expect(out).toMatch(/^ACCNT\tCard\tCCARD\t\t2010\t-250\.00\t/m);
+    // The journal export leaves opening balances to OBAMOUNT (no double count on re-import).
+    const jr = await exportJournalIif(ctx, { from: new Date('2026-01-01T00:00:00Z'), to: new Date('2026-12-31T00:00:00Z') });
+    expect(jr.split('\r\n').filter((l) => l.startsWith('TRNS\t'))).toHaveLength(1);
+  });
+
   it('QB GL import names A/R, A/P and paycheck lines with the customers, vendors and employees it creates', async () => {
     const ctx = await newCompany('GL Names Co', false);
     const res = await runGlImport(ctx, { file: upload('General Ledger.csv', glCsv(SAMPLE_GL)) });

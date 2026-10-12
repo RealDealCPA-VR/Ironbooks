@@ -180,6 +180,8 @@ export interface IIFAccount {
   desc?: string;
   accnum?: string;
   hidden?: boolean;
+  /** OBAMOUNT: opening balance, debit-positive (QB IIF sign convention). */
+  obAmount?: string;
 }
 
 export interface IIFAddress {
@@ -528,6 +530,7 @@ export function parseIIF(content: string): ParsedIIF {
             desc: row.DESC ?? undefined,
             accnum: row.ACCNUM ?? undefined,
             hidden: yes(row.HIDDEN),
+            obAmount: opt(row.OBAMOUNT),
           });
         }
         break;
@@ -1038,6 +1041,7 @@ async function importIifAccounts(
   counts: ImportCounts,
   rows: IIFAccount[],
   lookup: AccountLookup,
+  obDate: Date = new Date(),
 ): Promise<void> {
   // Non-posting accounts (estimates, purchase orders) are imported as the wave2 foundation
   // 'non_posting' subtype (IIF_TYPE_MAP NONPOSTING): they never carry amounts or reach reports.
@@ -1113,14 +1117,36 @@ async function importIifAccounts(
       parentId = null;
     }
     try {
-      const row = await createAccount(ctx, {
+      const base = {
         code,
         name: leaf,
         type: t.type as never,
         subtype: t.subtype,
         description: def?.desc ?? (def ? null : 'Parent account created by QuickBooks IIF import.'),
         parentId,
-      });
+      };
+      // OBAMOUNT is debit-positive; createAccount's opening balance is in the account's natural
+      // direction (credit-normal accounts flip the sign).
+      const ob = def?.obAmount ? parseIifAmount(def.obAmount) : null;
+      let row;
+      if (ob && !Money.isZero(ob)) {
+        const natural = t.type === 'asset' || t.type === 'expense' ? Money.of(ob) : Money.of(ob).negated();
+        try {
+          row = await createAccount(ctx, { ...base, openingBalance: toAmountString(natural), openingBalanceDate: obDate });
+        } catch (err) {
+          if (!(err instanceof ServiceError)) throw err;
+          row = await createAccount(ctx, base);
+          counts.issues.push({
+            entity: 'account',
+            name: displayPath,
+            code,
+            reason: 'note',
+            message: `The opening balance ${toAmountString(Money.of(ob))} was not posted: ${err.message}`,
+          });
+        }
+      } else {
+        row = await createAccount(ctx, base);
+      }
       counts.accounts++;
       const ref: AccountRef = {
         id: row.id,
@@ -1366,7 +1392,13 @@ export async function importIIF(
 
   // ---- Accounts (full hierarchy) ----
   const lookup = await loadAccountLookup(ctx);
-  await importIifAccounts(ctx, counts, parsed.accounts, lookup);
+  // Opening balances (OBAMOUNT) are dated the day before the file's first transaction (QB has no
+  // opening-balance date in the IIF), or today when the file has no transactions.
+  const txnDates = parsed.transactions.map((t) => parseIifDate(t.date)).filter((d): d is Date => !!d);
+  const obDate = txnDates.length
+    ? new Date(Math.min(...txnDates.map((d) => d.getTime())) - 86_400_000)
+    : new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate()));
+  await importIifAccounts(ctx, counts, parsed.accounts, lookup, obDate);
 
   // ---- Classes ("Parent:Sub") ----
   const classIdByPath = await importIifClasses(ctx, counts, parsed.classes);

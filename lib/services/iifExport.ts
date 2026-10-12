@@ -13,7 +13,7 @@
  * Sensitive data: SSNs and vendor tax IDs are written only when the user may see them in full
  * (Users & Roles "sensitive payroll data"); otherwise the column is left blank, never masked.
  */
-import { and, asc, eq, gte, inArray, lte } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, isNull, like, lte, notLike, or } from 'drizzle-orm';
 import {
   accounts,
   assemblyComponents,
@@ -183,9 +183,20 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
     const rows = await ctx.db.select().from(accounts).where(eq(accounts.companyId, ctx.companyId)).orderBy(asc(accounts.code));
     const pathOf = pathResolver(rows);
     const depth = (id: string) => pathOf(id).split(':').length;
+    // OBAMOUNT: each account's opening balance entry (sourceRef "account:<id>"), debit-positive.
+    const obRows = await ctx.db
+      .select({ accountId: journalEntryLines.accountId, ref: journalEntries.sourceRef, debit: journalEntryLines.debit, credit: journalEntryLines.credit })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted'), like(journalEntries.sourceRef, 'account:%')));
+    const obOf = new Map<string, ReturnType<typeof Money.zero>>();
+    for (const r of obRows) {
+      if (r.ref !== `account:${r.accountId}`) continue;
+      obOf.set(r.accountId, (obOf.get(r.accountId) ?? Money.zero()).plus(Money.of(r.debit ?? 0)).minus(Money.of(r.credit ?? 0)));
+    }
     w.section(
       'ACCNT',
-      ['NAME', 'ACCNTTYPE', 'DESC', 'ACCNUM', 'HIDDEN'],
+      ['NAME', 'ACCNTTYPE', 'DESC', 'ACCNUM', 'OBAMOUNT', 'HIDDEN'],
       [...rows]
         .sort((a, b) => depth(a.id) - depth(b.id) || a.code.localeCompare(b.code))
         .map((a) => ({
@@ -193,6 +204,7 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
           ACCNTTYPE: qbAccountType(a.type, a.subtype),
           DESC: a.description,
           ACCNUM: a.code,
+          OBAMOUNT: obOf.has(a.id) && !obOf.get(a.id)!.isZero() ? toAmountString(obOf.get(a.id)!) : '',
           HIDDEN: a.isActive ? 'N' : 'Y',
         })),
     );
@@ -458,7 +470,8 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
 
 /**
  * Every POSTED journal entry dated in [from, to] as a GENERAL JOURNAL TRNS/SPL block (first
- * line on the TRNS row, the rest SPL). Amounts are signed (debit +, credit −), accounts are
+ * line on the TRNS row, the rest SPL) — except account opening balances, which the list export
+ * writes as ACCNT OBAMOUNT. Amounts are signed (debit +, credit −), accounts are
  * full "Parent:Sub" names, classes full paths.
  */
 export async function exportJournalIif(ctx: ServiceContext, range: { from: Date; to: Date }): Promise<string> {
@@ -485,6 +498,9 @@ export async function exportJournalIif(ctx: ServiceContext, range: { from: Date;
         eq(journalEntries.status, 'posted'),
         gte(journalEntries.date, range.from),
         lte(journalEntries.date, range.to),
+        // Account opening balances travel as ACCNT OBAMOUNT in the list export (QB's own
+        // convention); writing them here too would double them on import.
+        or(isNull(journalEntries.sourceRef), notLike(journalEntries.sourceRef, 'account:%')),
       ),
     )
     .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
