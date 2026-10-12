@@ -410,7 +410,7 @@ describe('ledger invariants — adversarial QA, re-test round 1', () => {
       subtype: 'accounts_payable',
     });
     acct['2010'] = ap2.id;
-    // Unpaid bill on the second A/P account: no cash moved, so cash-basis earnings ignore it.
+    // A journal entry on the second A/P account (not a bill): reported the same on both bases.
     await post('75.00', '6400', '2010', new Date('2026-05-01'));
     // A loan (liability, default subtype accounts_payable, not named A/P) is NOT A/P.
     const loan = await createAccount(ctx, { code: '2700', name: 'Bank Loan', type: 'liability' as never, subtype: '' });
@@ -423,8 +423,9 @@ describe('ledger invariants — adversarial QA, re-test round 1', () => {
     const pl = await profitAndLossCashBasis(ctx);
     expect(bs.balanced).toBe(true);
     expect(Money.of(bs.retainedEarnings).toFixed(2)).toBe(Money.of(pl.netIncome).toFixed(2));
-    expect(bs.adjustments.removedApLines.map((l) => l.code)).toContain('2010');
-    expect(bs.adjustments.removedApLines.map((l) => l.code)).not.toContain('2700');
+    // Journal entries are reported the same on both bases (QB): only invoices / bills and the
+    // like are converted (cashBasisLedger.ts), so the raw entries above stay on the sheet.
+    expect(bs.liabilities.map((l) => l.code)).toContain('2010');
     expect(bs.liabilities.map((l) => l.code)).toContain('2700');
   });
 

@@ -537,8 +537,8 @@ describe('ledger invariants — adversarial QA', () => {
   });
 
   it('cash-basis balance sheet earnings agree with the cash-basis P&L (all A/R accounts, e.g. Retainage)', async () => {
-    // Retainage Receivable (1250) is an A/R account in the default chart. Revenue billed to
-    // it is not cash yet, so BOTH cash-basis reports must exclude it consistently.
+    // A journal entry to Retainage Receivable (1250): journal entries are reported the same on
+    // both bases (QB), and BOTH cash-basis reports must treat it consistently.
     await post('250.00', '1250', '4100', new Date('2026-04-01'));
     const bs = await balanceSheetCashBasis(ctx);
     expect(bs.balanced).toBe(true);

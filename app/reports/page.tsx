@@ -125,7 +125,7 @@ const FINANCIAL_REPORTS: ReportCardProps[] = [
     href: '/reports/profit-loss-cash',
     icon: Wallet,
     name: 'P&L — Cash Basis',
-    description: 'Income statement adjusted for AR/AP to a cash basis.',
+    description: 'Income and expenses counted when they are paid (cash basis).',
   },
   {
     href: '/reports/pl-by-class',
@@ -143,7 +143,7 @@ const FINANCIAL_REPORTS: ReportCardProps[] = [
     href: '/reports/balance-sheet-cash',
     icon: Scale,
     name: 'Balance Sheet — Cash Basis',
-    description: 'Balance sheet with receivables and payables excluded.',
+    description: 'Balance sheet with unpaid invoices and bills left out of income and expenses.',
   },
   {
     href: '/reports/balance-sheet-classified',

@@ -22,8 +22,10 @@ import type { ServiceContext } from './_base';
 import { notFound, validation } from './_base';
 import { classes } from '@/lib/db/schema';
 import { and, eq } from 'drizzle-orm';
-import { LedgerIntegrityError, assertBalanceSheetBalanced } from './ledgerAssert';
+import { LedgerIntegrityError, assertBalanceSheetBalanced, assertTrialBalanceBalanced } from './ledgerAssert';
 import { balanceSheet, trialBalance, type BalanceSheet } from './reports';
+import { cashBasisBalanceSheet } from './balanceSheetCashBasis';
+import { cashBasisLedger } from './cashBasisLedger';
 import {
   BS_SECTIONS,
   DETAIL_COLUMNS,
@@ -67,6 +69,14 @@ import {
 // ---------------------------------------------------------------------------
 
 export const rangeLabel = (from: Date, to: Date) => `${fmtDay(from)} – ${fmtDay(to)}`;
+
+/** QB "Report Basis": 'cash' runs the report on the cash basis (cashBasisLedger.ts). */
+type Basis = 'cash' | undefined;
+const basisOf = (p: Pick<ReportParams, 'basis'>): Basis => (p.basis === 'cash' ? 'cash' : undefined);
+const basisSuffix = (b: Basis) => (b === 'cash' ? ' · Cash Basis' : '');
+/** The balance sheet for one as-of date on the report's basis. */
+const sheetAsOf = (ctx: ServiceContext, asOf: Date, b: Basis) =>
+  b === 'cash' ? cashBasisBalanceSheet(ctx, asOf) : balanceSheet(ctx, asOf);
 
 const pct = (num: Decimal, den: Decimal): CellValue =>
   den.isZero() ? null : num.dividedBy(den.abs()).times(100).toFixed(2);
@@ -136,6 +146,7 @@ export async function profitAndLossReport(
   const meta = await loadAccountMeta(ctx);
   const fye = await companyFiscalYearEnd(ctx);
   const classId = p.classId;
+  const basis = basisOf(p);
   const periodKind = p.columns && p.columns !== 'total' ? p.columns : null;
   const compare = !periodKind && p.compare && p.compare !== 'none' ? p.compare : null;
 
@@ -151,7 +162,7 @@ export async function profitAndLossReport(
     amountKeys = [...periods.map((x) => x.key), 'total'];
     columns.push(...periods.map((x) => ({ key: x.key, header: x.label, type: 'money' as const })));
     columns.push({ key: 'total', header: 'TOTAL', type: 'money' });
-    const act = await activityByAccount(ctx, { from, to, classId, excludeClose: true }, 'day');
+    const act = await activityByAccount(ctx, { from, to, classId, excludeClose: true, basis }, 'day');
     amounts = plAmountsFromActivity(meta, act, amountKeys.length, (b) => {
       const i = periodIndex(periods, parseDay(b ?? undefined)!);
       return i >= 0 ? [i, periods.length] : [periods.length];
@@ -159,8 +170,8 @@ export async function profitAndLossReport(
   } else if (compare) {
     const prev = compare === 'prev_year' ? { from: shiftYears(from, -1), to: shiftYears(to, -1) } : previousPeriod(from, to);
     const [cur, pri] = await Promise.all([
-      activityByAccount(ctx, { from, to, classId, excludeClose: true }),
-      activityByAccount(ctx, { from: prev.from, to: prev.to, classId, excludeClose: true }),
+      activityByAccount(ctx, { from, to, classId, excludeClose: true, basis }),
+      activityByAccount(ctx, { from: prev.from, to: prev.to, classId, excludeClose: true, basis }),
     ]);
     amountKeys = ['cur', 'prev'];
     columns.push(
@@ -173,7 +184,7 @@ export async function profitAndLossReport(
     amounts = plAmountsFromActivity(meta, tagged, 2, (b) => (b === 'cur' ? 0 : 1));
     derive = (v) => ({ chg: toAmountString(v[0].minus(v[1])), pctchg: pct(v[0].minus(v[1]), v[1]) });
   } else {
-    const act = await activityByAccount(ctx, { from, to, classId, excludeClose: true });
+    const act = await activityByAccount(ctx, { from, to, classId, excludeClose: true, basis });
     amountKeys = ['total'];
     columns.push({ key: 'total', header: rangeLabel(from, to), type: 'money' });
     amounts = plAmountsFromActivity(meta, act, 1, () => 0);
@@ -200,14 +211,14 @@ export async function profitAndLossReport(
     };
   }
 
-  const qs = { from: dayStr(from), to: dayStr(to), classId };
+  const qs = { from: dayStr(from), to: dayStr(to), classId, basis };
   const built = buildPLRows({
     meta,
     amounts,
     columns,
     amountKeys,
     derive,
-    hrefFor: accountDetailHref(from, to, { classId }),
+    hrefFor: accountDetailHref(from, to, { classId, basis }),
     totalHref: (s) => (s === 'net' ? stdHref('profit-loss-detail', qs) : stdHref('profit-loss-detail', { ...qs, section: s })),
   });
 
@@ -223,7 +234,7 @@ export async function profitAndLossReport(
   return {
     key: o.key ?? 'profit-loss',
     title: o.title ?? 'Profit & Loss',
-    subtitle: `${rangeLabel(from, to)}${className ? ` · Class: ${className}` : ''}`,
+    subtitle: `${rangeLabel(from, to)}${className ? ` · Class: ${className}` : ''}${basisSuffix(basis)}`,
     columns,
     rows: built.rows,
     notes,
@@ -236,9 +247,10 @@ export async function profitAndLossYtdComparison(ctx: ServiceContext, p: ReportP
   const meta = await loadAccountMeta(ctx);
   const fye = await companyFiscalYearEnd(ctx);
   const ytdFrom = fiscalWindowFor(to, fye).start;
+  const basis = basisOf(p);
   const [cur, ytd] = await Promise.all([
-    activityByAccount(ctx, { from, to, classId: p.classId, excludeClose: true }),
-    activityByAccount(ctx, { from: ytdFrom, to, classId: p.classId, excludeClose: true }),
+    activityByAccount(ctx, { from, to, classId: p.classId, excludeClose: true, basis }),
+    activityByAccount(ctx, { from: ytdFrom, to, classId: p.classId, excludeClose: true, basis }),
   ]);
   const tagged = [...cur.map((r) => ({ ...r, bucket: 'cur' })), ...ytd.map((r) => ({ ...r, bucket: 'ytd' }))];
   const amounts = plAmountsFromActivity(meta, tagged, 2, (b) => (b === 'cur' ? 0 : 1));
@@ -254,12 +266,12 @@ export async function profitAndLossYtdComparison(ctx: ServiceContext, p: ReportP
     columns,
     amountKeys: ['cur', 'ytd'],
     derive: (v) => ({ pctytd: pct(v[0], v[1]) }),
-    hrefFor: accountDetailHref(ytdFrom, to, { classId: p.classId }),
+    hrefFor: accountDetailHref(ytdFrom, to, { classId: p.classId, basis }),
   });
   return {
     key: 'profit-loss-ytd',
     title: 'Profit & Loss YTD Comparison',
-    subtitle: `${rangeLabel(from, to)} vs fiscal year to date`,
+    subtitle: `${rangeLabel(from, to)} vs fiscal year to date${basisSuffix(basis)}`,
     columns,
     rows: built.rows,
   };
@@ -269,7 +281,8 @@ export async function profitAndLossYtdComparison(ctx: ServiceContext, p: ReportP
 export async function profitAndLossByClassReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
   const meta = await loadAccountMeta(ctx);
-  const act = await activityByAccount(ctx, { from, to, excludeClose: true }, 'class');
+  const basis = basisOf(p);
+  const act = await activityByAccount(ctx, { from, to, excludeClose: true, basis }, 'class');
   const classRows = await ctx.db
     .select({ id: classes.id, name: classes.name })
     .from(classes)
@@ -291,7 +304,7 @@ export async function profitAndLossByClassReport(ctx: ServiceContext, p: ReportP
     amounts,
     columns,
     amountKeys,
-    hrefFor: accountDetailHref(from, to),
+    hrefFor: accountDetailHref(from, to, { basis }),
   });
   // Per-class QuickZoom on account rows.
   for (const r of built.rows) {
@@ -299,10 +312,10 @@ export async function profitAndLossByClassReport(ctx: ServiceContext, p: ReportP
     if (!m || r.kind !== 'data') continue;
     r.hrefs = {};
     keys.forEach((k, i) => {
-      if (k) r.hrefs![`c${i}`] = stdHref('transaction-detail-by-account', { accountId: m[1], classId: k, from: dayStr(from), to: dayStr(to) });
+      if (k) r.hrefs![`c${i}`] = stdHref('transaction-detail-by-account', { accountId: m[1], classId: k, from: dayStr(from), to: dayStr(to), basis });
     });
   }
-  return { key: 'pl-by-class', title: 'Profit & Loss by Class', subtitle: rangeLabel(from, to), columns, rows: built.rows };
+  return { key: 'pl-by-class', title: 'Profit & Loss by Class', subtitle: `${rangeLabel(from, to)}${basisSuffix(basis)}`, columns, rows: built.rows };
 }
 
 // ===========================================================================
@@ -327,8 +340,9 @@ const CURRENT_LIABS: BSSection[] = ['ap', 'credit_card', 'other_current_liabilit
 function buildBSRows(
   meta: Map<string, AccountMeta>,
   cols: BSColumn[],
-  opts: { summary?: boolean; derive?: (v: Amounts) => Record<string, CellValue> },
+  opts: { summary?: boolean; derive?: (v: Amounts) => Record<string, CellValue>; basis?: Basis },
 ): { rows: StdRow[]; balanced: boolean } {
+  const basis = opts.basis;
   const n = cols.length;
   const amounts = new Map<BSSection, Map<string, Amounts>>();
   for (const s of BS_SECTIONS) amounts.set(s, new Map());
@@ -359,7 +373,7 @@ function buildBSRows(
   };
   const rows: StdRow[] = [];
   const hrefFor = (a: AccountMeta) =>
-    stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(cols[0].asOf) });
+    stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(cols[0].asOf), basis });
 
   const sectionTotal = new Map<BSSection, Amounts>();
   const block = (s: BSSection, depth: number, parent: string | null) => {
@@ -379,7 +393,7 @@ function buildBSRows(
         depth,
         kind: 'data',
         cells: cells(SECTION_LABELS[s], total),
-        href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: s }),
+        href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: s, basis }),
       });
       return;
     }
@@ -438,7 +452,7 @@ function buildBSRows(
           depth: 2,
           kind: 'data',
           cells: cells('Equity accounts', t),
-          href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: 'equity' }),
+          href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: 'equity', basis }),
         });
       } else {
         const tree = buildAccountTree({ meta, amounts: m, ncols: n, idPrefix: 'bs:equity', parentRowId: 'bs:equity', depth: 2, cells, hrefFor });
@@ -452,7 +466,7 @@ function buildBSRows(
             kind: 'data',
             cells: cells('Retained Earnings', priorYears),
             href: cols[0].bs.fiscalYearStart
-              ? stdHref('profit-loss', { to: dayStr(new Date(new Date(cols[0].bs.fiscalYearStart).getTime() - 1)), from: '1900-01-01' })
+              ? stdHref('profit-loss', { to: dayStr(new Date(new Date(cols[0].bs.fiscalYearStart).getTime() - 1)), from: '1900-01-01', basis })
               : null,
           });
           addInto(t, priorYears);
@@ -465,7 +479,7 @@ function buildBSRows(
         kind: 'data',
         cells: cells('Net Income', netIncome),
         href: cols[0].bs.fiscalYearStart
-          ? stdHref('profit-loss', { from: dayStr(new Date(cols[0].bs.fiscalYearStart)), to: dayStr(cols[0].asOf) })
+          ? stdHref('profit-loss', { from: dayStr(new Date(cols[0].bs.fiscalYearStart)), to: dayStr(cols[0].asOf), basis })
           : null,
       });
       addInto(t, netIncome);
@@ -502,6 +516,7 @@ export async function balanceSheetReport(
   o: { summary?: boolean } = {},
 ): Promise<StdReport> {
   const meta = await loadAccountMeta(ctx);
+  const basis = basisOf(p);
   const periodKind = p.columns && p.columns !== 'total' ? p.columns : null;
   let cols: BSColumn[];
   let derive: ((v: Amounts) => Record<string, CellValue>) | undefined;
@@ -513,29 +528,29 @@ export async function balanceSheetReport(
     const periods: Period[] = splitPeriods(from, to, periodKind, fye);
     if (periods.length > 60) throw validation('Too many columns — choose a shorter date range or wider columns.');
     cols = await Promise.all(
-      periods.map(async (x) => ({ key: x.key, header: fmtDay(x.to), asOf: x.to, bs: await balanceSheet(ctx, x.to) })),
+      periods.map(async (x) => ({ key: x.key, header: fmtDay(x.to), asOf: x.to, bs: await sheetAsOf(ctx, x.to, basis) })),
     );
     subtitle = `As of each ${periodKind} end, ${rangeLabel(from, to)}`;
   } else {
     const asOf = resolveAsOf(p);
-    cols = [{ key: 'total', header: fmtDay(asOf), asOf, bs: await balanceSheet(ctx, asOf) }];
+    cols = [{ key: 'total', header: fmtDay(asOf), asOf, bs: await sheetAsOf(ctx, asOf, basis) }];
     subtitle = `As of ${fmtDay(asOf)}`;
     if (p.compare && p.compare !== 'none') {
       let prior = p.priorAsOf ? parseDay(p.priorAsOf, true)! : shiftYears(asOf, -1);
       if (!p.priorAsOf && p.compare === 'prev_period') {
         prior = shiftMonths(asOf, -1);
       }
-      cols.push({ key: 'prev', header: fmtDay(prior), asOf: prior, bs: await balanceSheet(ctx, prior) });
+      cols.push({ key: 'prev', header: fmtDay(prior), asOf: prior, bs: await sheetAsOf(ctx, prior, basis) });
       extraCols.push({ key: 'chg', header: '$ Change', type: 'money' }, { key: 'pctchg', header: '% Change', type: 'percent' });
       derive = (v) => ({ chg: toAmountString(v[0].minus(v[1])), pctchg: pct(v[0].minus(v[1]), v[1]) });
       subtitle = `As of ${fmtDay(asOf)} vs ${fmtDay(prior)}`;
     }
   }
-  const built = buildBSRows(meta, cols, { summary: o.summary, derive });
+  const built = buildBSRows(meta, cols, { summary: o.summary, derive, basis });
   return {
     key: o.summary ? 'balance-sheet-summary' : 'balance-sheet',
     title: o.summary ? 'Balance Sheet Summary' : 'Balance Sheet',
-    subtitle,
+    subtitle: `${subtitle}${basisSuffix(basis)}`,
     columns: [
       { key: 'label', header: '' },
       ...cols.map((c) => ({ key: c.key, header: c.header, type: 'money' as const })),
@@ -553,9 +568,29 @@ export async function balanceSheetReport(
 export async function trialBalanceReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
   const meta = await loadAccountMeta(ctx);
+  const basis = basisOf(p);
   const tb = await trialBalance(ctx, asOf);
   const amounts = new Map<string, Amounts>();
   for (const r of tb.rows) amounts.set(r.accountId, [Money.sub(r.debit, r.credit)]);
+  let totalDebit = Money.of(tb.totalDebit);
+  let totalCredit = Money.of(tb.totalCredit);
+  if (basis === 'cash') {
+    // Cash basis: layer the balanced cash-basis adjustments (cashBasisLedger.ts) on the ledger.
+    const { adjustments } = await cashBasisLedger(ctx, { to: asOf });
+    for (const a of adjustments) {
+      const v = amounts.get(a.accountId) ?? [Money.zero()];
+      v[0] = v[0].plus(a.net);
+      amounts.set(a.accountId, v);
+    }
+    totalDebit = Money.zero();
+    totalCredit = Money.zero();
+    for (const [id, v] of amounts) {
+      if (v[0].isZero()) amounts.delete(id);
+      else if (v[0].greaterThan(0)) totalDebit = totalDebit.plus(v[0]);
+      else totalCredit = totalCredit.minus(v[0]);
+    }
+    assertTrialBalanceBalanced('Cash-basis trial balance', totalDebit, totalCredit);
+  }
   const cells = (label: string, v: Amounts): Record<string, CellValue> => ({
     label,
     debit: v[0].greaterThan(0) ? toAmountString(v[0]) : null,
@@ -569,20 +604,25 @@ export async function trialBalanceReport(ctx: ServiceContext, p: ReportParams): 
     parentRowId: null,
     depth: 0,
     cells,
-    hrefFor: (a) => stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(asOf) }),
+    hrefFor: (a) => stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(asOf), basis }),
   });
-  tree.rows.push({ id: 'tb:total', depth: 0, kind: 'grand', cells: { label: 'TOTAL', debit: tb.totalDebit, credit: tb.totalCredit } });
+  tree.rows.push({
+    id: 'tb:total',
+    depth: 0,
+    kind: 'grand',
+    cells: { label: 'TOTAL', debit: toAmountString(totalDebit), credit: toAmountString(totalCredit) },
+  });
   return {
     key: 'trial-balance',
     title: 'Trial Balance',
-    subtitle: `As of ${fmtDay(asOf)}`,
+    subtitle: `As of ${fmtDay(asOf)}${basisSuffix(basis)}`,
     columns: [
       { key: 'label', header: '' },
       { key: 'debit', header: 'Debit', type: 'money' },
       { key: 'credit', header: 'Credit', type: 'money' },
     ],
     rows: tree.rows,
-    balanced: tb.balanced,
+    balanced: tb.balanced && Money.eq(totalDebit, totalCredit),
   };
 }
 
@@ -626,6 +666,7 @@ export async function transactionDetailByAccount(ctx: ServiceContext, p: ReportP
     subtitle: [
       p.from && range.from && range.to ? rangeLabel(range.from, range.to) : range.to ? `Through ${fmtDay(range.to)}` : 'All dates',
       acct ? `Account: ${acct.fullName}` : '',
+      p.basis === 'cash' ? 'Cash Basis' : '',
     ]
       .filter(Boolean)
       .join(' · '),
@@ -668,7 +709,7 @@ export async function profitAndLossDetail(ctx: ServiceContext, p: ReportParams):
   return {
     key: 'profit-loss-detail',
     title: 'Profit & Loss Detail',
-    subtitle: rangeLabel(from, to),
+    subtitle: `${rangeLabel(from, to)}${basisSuffix(basisOf(p))}`,
     columns: detailColumns(DEFAULT_DETAIL_KEYS),
     rows,
     truncated,
@@ -683,7 +724,7 @@ export async function balanceSheetDetail(ctx: ServiceContext, p: ReportParams): 
   const f = glFilterFromParams(meta, p, { from, to });
   f.sections = f.sections ? f.sections.filter((s) => !isPLSection(s)) : [...BS_SECTIONS];
   const { lines, truncated } = await fetchGlLines(ctx, meta, f);
-  const before = await activityByAccount(ctx, { to: new Date(from.getTime() - 1), accountIds: f.accountIds });
+  const before = await activityByAccount(ctx, { to: new Date(from.getTime() - 1), accountIds: f.accountIds, basis: f.basis });
   const opening = new Map<string, Decimal>();
   for (const r of before) {
     const a = meta.get(r.accountId);
@@ -709,7 +750,7 @@ export async function balanceSheetDetail(ctx: ServiceContext, p: ReportParams): 
   return {
     key: 'balance-sheet-detail',
     title: 'Balance Sheet Detail',
-    subtitle: rangeLabel(from, to),
+    subtitle: `${rangeLabel(from, to)}${basisSuffix(basisOf(p))}`,
     columns: detailColumns(DEFAULT_DETAIL_KEYS),
     rows: laid.rows,
     truncated,

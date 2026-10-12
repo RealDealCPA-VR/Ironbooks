@@ -1,224 +1,163 @@
 /**
- * Integration tests for the cash-basis Balance Sheet.
+ * Integration tests for the cash-basis Balance Sheet (QuickBooks per-transaction conversion).
  *
- * Scenario:
- *  1. Start with an empty ledger — both accrual and cash-basis sheets should be empty/balanced.
- *  2. Post an unpaid invoice (Dr AR / Cr Revenue).
- *     Accrual BS: AR appears in assets, retained earnings increases (revenue side).
- *     Cash-basis BS: AR is removed from assets AND equity is reduced by arRemoved, sheet balanced.
- *  3. Post a partial payment (Dr Cash / Cr AR).
- *     Cash-basis AR removal shrinks; equity adjustment also shrinks.
- *  4. Post an unpaid bill (Dr Expense / Cr AP).
- *     Accrual BS: AP appears in liabilities.
- *     Cash-basis BS: AP also removed; equityAdjustment = arRemoved − apRemoved.
+ *  1. Empty ledger — both sheets balanced and zero.
+ *  2. Unpaid invoice — its income is out of earnings AND out of A/R; the sheet still balances.
+ *  3. Partial payment — the paid share moves into earnings; A/R keeps only the unpaid share
+ *     of the invoice's balance-sheet lines (none here).
+ *  4. Unpaid bill — its expense is out of earnings and out of A/P.
+ *  5. Journal entries on A/R / A/P are not converted (QB reports them the same on both bases).
+ *  6. asOf limits the sheet; prior-year earnings and current-year net income split like accrual.
  *
- * Each test asserts the accounting equation: Assets = Liabilities + Equity.
+ * Each test asserts Assets = Liabilities + Equity and that cash earnings == cash net income.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
+import { eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { companies, users } from '@/lib/db/schema';
+import { accounts, invoices, users } from '@/lib/db/schema';
+import { Money } from '@/lib/money';
 import type { ServiceContext } from './_base';
-import { createAccount } from './accounts';
+import { createCompany } from './company';
+import { createCustomer } from './customers';
+import { createVendor } from './vendors';
+import { createInvoice } from './invoices';
+import { receivePayment } from './payments';
+import { createBill } from './bills';
 import { postJournalEntry } from './posting';
 import { balanceSheet } from './reports';
 import { balanceSheetCashBasis } from './balanceSheetCashBasis';
+import { profitAndLossCashBasis } from './cashBasisReports';
 
-// ---------------------------------------------------------------------------
-// Unique PGlite directory — never collides with another agent's run.
-// ---------------------------------------------------------------------------
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-bs-cash-basis');
 
 let ctx: ServiceContext;
 let db: DB;
-
-/** Account IDs keyed by COA code. */
 const acct: Record<string, string> = {};
+let customer: string;
+let vendor: string;
+const d = (s: string) => new Date(`${s}T00:00:00.000Z`);
 
 beforeAll(async () => {
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
   db = await getDb(TEST_DIR);
-
   const [user] = await db
     .insert(users)
     .values({ email: 'owner@bscashbasis.test', name: 'BS Cash Owner', passwordHash: 'x' })
     .returning();
-
-  const [company] = await db
-    .insert(companies)
-    .values({ name: 'BS Cash Basis Co', ownerId: user.id })
-    .returning();
-
+  const company = await createCompany(db, { name: 'BS Cash Basis Co', ownerId: user.id });
   ctx = { db, companyId: company.id, userId: user.id };
-
-  // Minimal COA for the tests.
-  const defs: Array<[string, string, string, string]> = [
-    ['1000', 'Checking',            'asset',     'checking'],
-    ['1200', 'Accounts Receivable', 'asset',     'accounts_receivable'],
-    ['2000', 'Accounts Payable',    'liability', 'accounts_payable'],
-    ['3000', "Owner's Equity",      'equity',    'owners_equity'],
-    ['3900', 'Retained Earnings',   'equity',    'retained_earnings'],
-    ['4000', 'Sales Revenue',       'revenue',   'sales'],
-    ['5000', 'Operating Expenses',  'expense',   'operating_expenses'],
-  ];
-  for (const [code, name, type, subtype] of defs) {
-    const row = await createAccount(ctx, { code, name, type: type as never, subtype });
-    acct[code] = row.id;
-  }
-});
+  for (const r of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) acct[r.code] = r.id;
+  customer = (await createCustomer(ctx, { displayName: 'Cash Customer' })).id;
+  vendor = (await createVendor(ctx, { displayName: 'Cash Vendor' })).id;
+}, 180_000);
 
 afterAll(async () => {
   await closeDb(TEST_DIR);
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function totalLiabilitiesAndEquity(report: Awaited<ReturnType<typeof balanceSheetCashBasis>>) {
-  return parseFloat(report.totals.totalLiabilities) + parseFloat(report.totals.totalEquity);
+async function firstInvoice() {
+  const [row] = await db.select().from(invoices).where(eq(invoices.companyId, ctx.companyId));
+  return row;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+const amt = (lines: { accountId: string; amount: string }[], id: string) =>
+  lines.find((l) => l.accountId === id)?.amount ?? '0.00';
+
+async function expectConsistent(asOf?: Date) {
+  const cash = await balanceSheetCashBasis(ctx, asOf);
+  expect(cash.balanced).toBe(true);
+  expect(cash.totals.totalAssets).toBe(cash.totals.totalLiabilitiesAndEquity);
+  expect(Money.add(cash.priorYearsEarnings, cash.currentYearNetIncome).toFixed(2)).toBe(cash.retainedEarnings);
+  const pl = await profitAndLossCashBasis(ctx, asOf ? { to: asOf } : undefined);
+  expect(cash.retainedEarnings).toBe(pl.netIncome);
+  return cash;
+}
 
 describe('balanceSheetCashBasis', () => {
-  it('empty ledger — both accrual and cash-basis sheets are balanced with zero totals', async () => {
-    const accrual = await balanceSheet(ctx);
-    expect(accrual.balanced).toBe(true);
-
-    const cash = await balanceSheetCashBasis(ctx);
+  it('empty ledger — balanced with zero totals', async () => {
+    const cash = await expectConsistent();
     expect(cash.basis).toBe('cash');
-    expect(cash.balanced).toBe(true);
-    expect(parseFloat(cash.totals.totalAssets)).toBeCloseTo(0, 2);
-    expect(parseFloat(cash.adjustments.arRemoved)).toBeCloseTo(0, 2);
-    expect(parseFloat(cash.adjustments.apRemoved)).toBeCloseTo(0, 2);
+    expect(cash.totals.totalAssets).toBe('0.00');
+    expect(cash.adjustments.arAdjustment).toBe('0.00');
+    expect(cash.adjustments.apAdjustment).toBe('0.00');
   });
 
-  it('unpaid invoice: accrual has AR + equity; cash-basis removes AR and reduces equity, still balanced', async () => {
-    // Dr AR $1,000 / Cr Sales $1,000
-    await postJournalEntry(ctx, {
-      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
-      date: new Date('2025-03-15'),
-      description: 'Invoice #1 — unpaid',
-      lines: [
-        { accountId: acct['1200'], debit: '1000.00' },  // AR up
-        { accountId: acct['4000'], credit: '1000.00' }, // Revenue
-      ],
+  it('unpaid invoice: income is out of earnings and out of A/R; still balanced', async () => {
+    await createInvoice(ctx, {
+      customerId: customer,
+      date: d('2025-03-15'),
+      lines: [{ accountId: acct['4000'], quantity: 1, rate: '1000.00', taxable: false }],
     });
-
-    // ---- Accrual sheet ----
     const accrual = await balanceSheet(ctx);
-    expect(accrual.balanced).toBe(true);
-    // AR should appear in accrual assets.
-    const arLine = accrual.assets.find((l) => l.code === '1200');
-    expect(arLine).toBeDefined();
-    expect(parseFloat(arLine!.amount)).toBeCloseTo(1000, 2);
-    // Accrual equity includes retained earnings from the revenue.
-    expect(parseFloat(accrual.retainedEarnings)).toBeCloseTo(1000, 2);
-
-    // ---- Cash-basis sheet ----
-    const cash = await balanceSheetCashBasis(ctx);
-    expect(cash.basis).toBe('cash');
-
-    // AR must NOT appear in cash-basis assets.
-    const cashArLine = cash.assets.find((l) => l.code === '1200');
-    expect(cashArLine).toBeUndefined();
-
-    // AR removed should equal $1,000.
-    expect(parseFloat(cash.adjustments.arRemoved)).toBeCloseTo(1000, 2);
-    expect(cash.adjustments.removedArLines).toHaveLength(1);
-
-    // No AP was posted, so AP removal is zero.
-    expect(parseFloat(cash.adjustments.apRemoved)).toBeCloseTo(0, 2);
-
-    // equityAdjustment = arRemoved − apRemoved = $1,000.
-    expect(parseFloat(cash.adjustments.equityAdjustment)).toBeCloseTo(1000, 2);
-
-    // Cash-basis equity should be accrual equity minus $1,000.
-    const expectedEquity = parseFloat(accrual.totalEquity) - 1000;
-    expect(parseFloat(cash.totals.totalEquity)).toBeCloseTo(expectedEquity, 2);
-
-    // Sheet must still balance.
-    expect(cash.balanced).toBe(true);
-    expect(parseFloat(cash.totals.totalAssets)).toBeCloseTo(totalLiabilitiesAndEquity(cash), 2);
+    expect(amt(accrual.assets, acct['1200'])).toBe('1000.00');
+    const cash = await expectConsistent();
+    expect(amt(cash.assets, acct['1200'])).toBe('0.00');
+    expect(cash.adjustments.arAdjustment).toBe('1000.00');
+    expect(cash.adjustments.equityAdjustment).toBe('1000.00');
+    expect(cash.retainedEarnings).toBe('0.00');
+    expect(cash.accrualRetainedEarnings).toBe('1000.00');
   });
 
-  it('partial payment reduces AR removal and equity adjustment proportionally', async () => {
-    // Dr Checking $400 / Cr AR $400  (partial payment)
-    await postJournalEntry(ctx, {
-      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
-      date: new Date('2025-04-01'),
-      description: 'Partial payment on Invoice #1',
-      lines: [
-        { accountId: acct['1000'], debit: '400.00' },   // Cash up
-        { accountId: acct['1200'], credit: '400.00' },  // AR down
-      ],
+  it('partial payment moves the paid share into earnings', async () => {
+    const open = await firstInvoice();
+    await receivePayment(ctx, {
+      customerId: customer,
+      date: d('2025-04-01'),
+      amount: '400.00',
+      method: 'check',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: open.id, amountApplied: '400.00' }],
     });
-
-    const cash = await balanceSheetCashBasis(ctx);
-
-    // AR balance remaining = $600.
-    expect(parseFloat(cash.adjustments.arRemoved)).toBeCloseTo(600, 2);
-    expect(parseFloat(cash.adjustments.equityAdjustment)).toBeCloseTo(600, 2);
-
-    // Cash (1000) should now appear in assets.
-    const checkingLine = cash.assets.find((l) => l.code === '1000');
-    expect(checkingLine).toBeDefined();
-    expect(parseFloat(checkingLine!.amount)).toBeCloseTo(400, 2);
-
-    // Sheet must balance.
-    expect(cash.balanced).toBe(true);
-    expect(parseFloat(cash.totals.totalAssets)).toBeCloseTo(totalLiabilitiesAndEquity(cash), 2);
+    const cash = await expectConsistent();
+    expect(amt(cash.assets, acct['1000'])).toBe('400.00');
+    expect(amt(cash.assets, acct['1200'])).toBe('0.00');
+    expect(cash.adjustments.arAdjustment).toBe('600.00');
+    expect(cash.retainedEarnings).toBe('400.00');
   });
 
-  it('unpaid bill: AP is removed from liabilities and offsets the equity adjustment', async () => {
-    // Dr Expenses $300 / Cr AP $300
-    await postJournalEntry(ctx, {
-      allowUnnamedControl: true, // fixture posts straight to A/R or A/P
-      date: new Date('2025-05-01'),
-      description: 'Bill #1 — unpaid',
-      lines: [
-        { accountId: acct['5000'], debit: '300.00' },   // Expense
-        { accountId: acct['2000'], credit: '300.00' },  // AP up
-      ],
-    });
-
-    // ---- Accrual sheet ----
+  it('unpaid bill: expense is out of earnings and out of A/P', async () => {
+    await createBill(ctx, { vendorId: vendor, date: d('2025-05-01'), lines: [{ accountId: acct['6000'], amount: '300.00' }] });
     const accrual = await balanceSheet(ctx);
-    expect(accrual.balanced).toBe(true);
-    const apLine = accrual.liabilities.find((l) => l.code === '2000');
-    expect(apLine).toBeDefined();
-    expect(parseFloat(apLine!.amount)).toBeCloseTo(300, 2);
-
-    // ---- Cash-basis sheet ----
-    const cash = await balanceSheetCashBasis(ctx);
-
-    // AP must NOT appear in cash-basis liabilities.
-    const cashApLine = cash.liabilities.find((l) => l.code === '2000');
-    expect(cashApLine).toBeUndefined();
-    expect(parseFloat(cash.adjustments.apRemoved)).toBeCloseTo(300, 2);
-    expect(cash.adjustments.removedApLines).toHaveLength(1);
-
-    // equityAdjustment = arRemoved($600) − apRemoved($300) = $300.
-    expect(parseFloat(cash.adjustments.equityAdjustment)).toBeCloseTo(300, 2);
-
-    // Cash-basis equity = accrual equity − $300 equity adjustment.
-    const expectedEquity = parseFloat(accrual.totalEquity) - 300;
-    expect(parseFloat(cash.totals.totalEquity)).toBeCloseTo(expectedEquity, 2);
-
-    // Sheet must balance.
-    expect(cash.balanced).toBe(true);
-    expect(parseFloat(cash.totals.totalAssets)).toBeCloseTo(totalLiabilitiesAndEquity(cash), 2);
+    expect(amt(accrual.liabilities, acct['2000'])).toBe('300.00');
+    const cash = await expectConsistent();
+    expect(amt(cash.liabilities, acct['2000'])).toBe('0.00');
+    expect(cash.adjustments.apAdjustment).toBe('300.00');
+    expect(cash.retainedEarnings).toBe('400.00');
   });
 
-  it('asOf date is forwarded and limits the report to that point in time', async () => {
-    // As of 2025-02-01 (before any entries) everything should be zero.
-    const cash = await balanceSheetCashBasis(ctx, new Date('2025-02-01'));
-    expect(cash.balanced).toBe(true);
-    expect(parseFloat(cash.totals.totalAssets)).toBeCloseTo(0, 2);
-    expect(cash.asOf).toBeDefined();
+  it('journal entries on A/R are reported the same on both bases', async () => {
+    await postJournalEntry(ctx, {
+      date: d('2025-05-10'),
+      description: 'Accrued fee',
+      lines: [
+        { accountId: acct['1200'], debit: '50.00', entityType: 'customer', entityId: customer },
+        { accountId: acct['4000'], credit: '50.00' },
+      ],
+    });
+    const cash = await expectConsistent();
+    expect(amt(cash.assets, acct['1200'])).toBe('50.00');
+    expect(cash.retainedEarnings).toBe('450.00');
+  });
+
+  it('asOf limits the sheet; earnings split into prior years and current year', async () => {
+    const before = await expectConsistent(d('2025-02-01'));
+    expect(before.totals.totalAssets).toBe('0.00');
+    expect(before.asOf).toBeDefined();
+    await receivePayment(ctx, {
+      customerId: customer,
+      date: d('2026-01-10'),
+      amount: '600.00',
+      method: 'check',
+      depositAccountId: acct['1000'],
+      applications: [
+        { invoiceId: (await firstInvoice()).id, amountApplied: '600.00' },
+      ],
+    });
+    const now = await expectConsistent(new Date('2026-06-30T23:59:59.999Z'));
+    expect(now.priorYearsEarnings).toBe('450.00');
+    expect(now.currentYearNetIncome).toBe('600.00');
   });
 });

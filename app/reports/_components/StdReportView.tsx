@@ -41,6 +41,13 @@ const PARAM_KEYS = [
   'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates',
 ];
 
+/** Reports that run on either basis (QB "Report Basis: Accrual / Cash"). */
+const BASIS_REPORTS = new Set([
+  'profit-loss', 'profit-loss-detail', 'profit-loss-prev-year', 'profit-loss-by-month', 'profit-loss-percent',
+  'profit-loss-ytd', 'pl-by-class', 'balance-sheet', 'balance-sheet-summary', 'balance-sheet-by-period',
+  'balance-sheet-prev-year', 'balance-sheet-detail', 'trial-balance', 'transaction-detail-by-account', 'combined-pl-by-month',
+]);
+
 function paramsFromSearch(sp: URLSearchParams | null): Params {
   const out: Params = {};
   if (!sp) return out;
@@ -54,12 +61,16 @@ function paramsFromSearch(sp: URLSearchParams | null): Params {
 export default function StdReportView({
   reportKey,
   basisNav,
+  basis: fixedBasis,
 }: {
   reportKey: string;
   /** Accrual / cash toggle for reports with a cash-basis sibling page. */
   basisNav?: { value: 'accrual' | 'cash'; accrualHref: string; cashHref: string };
+  /** Always run on this basis (the cash-basis sibling pages). */
+  basis?: 'cash';
 }) {
-  const entry = CATALOG_BY_KEY[reportKey];
+  const baseEntry = CATALOG_BY_KEY[reportKey];
+  const entry = baseEntry && fixedBasis ? { ...baseEntry, defaults: { ...(baseEntry.defaults ?? {}), basis: fixedBasis } } : baseEntry;
   const router = useRouter();
   const pathname = usePathname();
   const search = useSearchParams();
@@ -83,6 +94,7 @@ export default function StdReportView({
   }, [searchKey, reportKey]);
 
   const run = useCallback(async (p: Params) => {
+    if (fixedBasis) p = { ...p, basis: fixedBasis };
     setLoading(true);
     setError(null);
     try {
@@ -95,7 +107,7 @@ export default function StdReportView({
     } finally {
       setLoading(false);
     }
-  }, [reportKey]);
+  }, [reportKey, fixedBasis]);
 
   useEffect(() => {
     run({ ...(entry?.defaults ?? {}), ...paramsFromSearch(search) });
@@ -157,6 +169,20 @@ export default function StdReportView({
         table={table}
         disabled={loading}
         basisNav={basisNav}
+        basis={
+          !basisNav && !fixedBasis && BASIS_REPORTS.has(reportKey)
+            ? {
+                value: params.basis === 'cash' ? 'cash' : 'accrual',
+                onChange: (b) => {
+                  const next: Params = { ...params };
+                  if (b === 'cash') next.basis = 'cash';
+                  else delete next.basis;
+                  setParams(next);
+                  applyParams(next);
+                },
+              }
+            : undefined
+        }
         columnPicker={report?.columns.slice(1).map((c) => ({ key: c.key, label: c.header || c.key, visible: !hidden.has(c.key) }))}
         onToggleColumn={(key) =>
           setHidden((prev) => {
