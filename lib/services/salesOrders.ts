@@ -34,7 +34,7 @@ import {
 } from './_base';
 import { createInvoice, shippingColumns } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { applyCustomerTaxDefaults } from './customerDefaults';
+import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, renumberDoc } from './docNumbers';
 
 // ---------------------------------------------------------------------------
@@ -170,6 +170,7 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
 
 export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInput) {
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
+  input = await applyCustomerShipToDefault(ctx, input);
   const { computedLines, subtotal, taxAmount, total } = await prepareSalesOrder(ctx, input);
 
   return inTransaction(ctx, async (tx) => {

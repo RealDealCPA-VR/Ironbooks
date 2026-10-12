@@ -46,6 +46,14 @@ export interface PackingSlipData {
     /** Override the document reference line (default "Invoice #<invoiceNumber>"). */
     label?: string | null;
   };
+  /** The document's own shipping details (printed under the number, when present). */
+  shipping?: {
+    shipVia?: string | null;
+    trackingNumber?: string | null;
+    shipDate?: string | null;
+    fob?: string | null;
+    poNumber?: string | null;
+  } | null;
   lines: PackingSlipLine[];
 }
 
@@ -159,6 +167,23 @@ export async function renderPackingSlipPdf(data: PackingSlipData): Promise<Uint8
       color: COLOR_GRAY,
     });
     cursor -= 14;
+  }
+
+  // Shipping details from the document (Ship Via, tracking number, ...).
+  const sh = data.shipping ?? {};
+  const shipDetails: Array<[string, string | null | undefined]> = [
+    ['P.O. No.', sh.poNumber],
+    ['Ship Date', sh.shipDate],
+    ['Ship Via', sh.shipVia],
+    ['Tracking #', sh.trackingNumber],
+    ['F.O.B.', sh.fob],
+  ];
+  for (const [label, value] of shipDetails) {
+    if (!value || !String(value).trim()) continue;
+    const str = trunc(`${label}: ${String(value).trim()}`, 48);
+    const w = regular.widthOfTextAtSize(str, 9);
+    page.drawText(str, { x: MARGIN_R - w, y: cursor, font: regular, size: 9, color: COLOR_GRAY });
+    cursor -= 12;
   }
 
   // --- SHIP TO block (left side) ---------------------------------------------

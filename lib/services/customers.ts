@@ -21,6 +21,16 @@ import { unappliedPaymentsByCustomer } from './customerCredits';
 import { journalBalancesByEntity } from './journal';
 import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
 import { getPreferences } from './preferences';
+import { defaultShipTo, normalizeShipToAddresses, type ShipToAddress } from '@/lib/shipTo';
+
+/** Validate the named ship-to list; the default one also becomes `shippingAddress`. */
+function resolveShipTos(list: Array<Partial<ShipToAddress>> | null | undefined): ShipToAddress[] | null {
+  try {
+    return normalizeShipToAddresses(list as Array<Record<string, unknown>> | null | undefined);
+  } catch (err) {
+    throw validation((err as Error).message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -42,6 +52,8 @@ export interface CreateCustomerInput {
   phone?: string | null;
   billingAddress?: CustomerAddress | null;
   shippingAddress?: CustomerAddress | null;
+  /** QB Enterprise: several named ship-to addresses, one marked isDefault (see lib/shipTo.ts). */
+  shipToAddresses?: Array<Partial<ShipToAddress>> | null;
   terms?: string | null;
   creditLimit?: string | number | null;
   taxable?: boolean;
@@ -162,6 +174,13 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
 
   const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
   const taxCode = input.salesTaxCodeId ? await resolveSalesTaxCode(ctx, input.salesTaxCodeId) : null;
+  // Named ship-to addresses; a lone shipping address becomes "Ship To 1".
+  const shipTos =
+    input.shipToAddresses !== undefined
+      ? resolveShipTos(input.shipToAddresses)
+      : input.shippingAddress && Object.values(input.shippingAddress).some((v) => String(v ?? '').trim())
+        ? resolveShipTos([{ name: 'Ship To 1', ...input.shippingAddress, isDefault: true }])
+        : null;
 
   const [row] = await ctx.db
     .insert(customers)
@@ -172,7 +191,11 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
       email: input.email?.trim() ?? null,
       phone: input.phone?.trim() ?? null,
       billingAddress: (input.billingAddress as Record<string, string>) ?? null,
-      shippingAddress: (input.shippingAddress as Record<string, string>) ?? null,
+      shippingAddress:
+        (shipTos ? defaultShipTo(shipTos as never) : null) ??
+        (input.shippingAddress as Record<string, string>) ??
+        null,
+      shipToAddresses: (shipTos as Array<Record<string, string | boolean>> | null) ?? null,
       // A Terms-list pick / typed terms win; else Preferences > Sales & Customers: default terms for new records.
       terms: termsRes ? termsRes.terms : (await getPreferences(ctx)).defaultCustomerTerms,
       termsId: termsRes?.termsId ?? null,
@@ -249,6 +272,7 @@ export async function updateCustomer(
   }
 
   const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
+  const shipTos = patch.shipToAddresses !== undefined ? resolveShipTos(patch.shipToAddresses) : undefined;
   const taxCode =
     patch.salesTaxCodeId !== undefined && patch.salesTaxCodeId !== null
       ? await resolveSalesTaxCode(ctx, patch.salesTaxCodeId)
@@ -270,9 +294,15 @@ export async function updateCustomer(
           ? (patch.billingAddress as Record<string, string>) ?? null
           : before.billingAddress,
       shippingAddress:
-        patch.shippingAddress !== undefined
-          ? (patch.shippingAddress as Record<string, string>) ?? null
-          : before.shippingAddress,
+        shipTos !== undefined
+          ? defaultShipTo(shipTos as never)
+          : patch.shippingAddress !== undefined
+            ? (patch.shippingAddress as Record<string, string>) ?? null
+            : before.shippingAddress,
+      shipToAddresses:
+        shipTos !== undefined
+          ? ((shipTos as Array<Record<string, string | boolean>> | null) ?? null)
+          : before.shipToAddresses,
       terms: termsRes ? termsRes.terms ?? before.terms : before.terms,
       termsId: termsRes ? termsRes.termsId : before.termsId,
       creditLimit:

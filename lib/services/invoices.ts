@@ -68,7 +68,7 @@ import {
   saveDocumentInventoryDetails,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { applyCustomerTaxDefaults } from './customerDefaults';
+import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import {
   assertEstimatesNotRejected,
@@ -1382,6 +1382,7 @@ export async function auditCreditLimitOverride(
 export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
   // Customer's tax item when the form left it out; non-taxable customer → untaxed lines.
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
+  input = await applyCustomerShipToDefault(ctx, input);
   const prep = await prepareInvoice(ctx, input);
   const isDraft = input.status === 'draft';
 

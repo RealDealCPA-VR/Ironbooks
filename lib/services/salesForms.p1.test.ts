@@ -16,6 +16,8 @@ import { createSalesReceipt, updateSalesReceipt } from './salesReceipts';
 import { createCreditMemo, updateCreditMemo } from './creditMemos';
 import { createPurchaseOrder, updatePurchaseOrder } from './purchaseOrders';
 import { nextDocNumber } from './docNumbers';
+import { createCustomer, updateCustomer } from './customers';
+import { normalizeShipToAddresses, defaultShipTo } from '@/lib/shipTo';
 import { trialBalance } from './reports';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-p1-salesforms');
@@ -170,5 +172,43 @@ describe('p1/salesforms — numbers and tax defaults', () => {
     const po2 = await updatePurchaseOrder(ctx, po.id, { vendorId, date: D('2026-05-04'), refNumber: 'PO-78', lines: [{ accountId: acct['6000'], quantity: 1, rate: 5 }] });
     expect(po2.refNumber).toBe('PO-78');
     expect((await trialBalance(ctx)).balanced).toBe(true);
+  });
+
+  // ---------------------------------------------------------------- ship-to addresses
+  it('customers keep several named ship-to addresses; new sales forms default to the default one', async () => {
+    const cust = await createCustomer(ctx, {
+      displayName: 'Multi Site',
+      shipToAddresses: [
+        { name: 'Main', line1: '1 Main St', city: 'Springfield' },
+        { name: 'Warehouse', line1: '9 Dock Rd', city: 'Shelbyville', isDefault: true },
+      ],
+    });
+    expect(cust.shipToAddresses).toHaveLength(2);
+    expect(cust.shippingAddress).toEqual({ line1: '9 Dock Rd', city: 'Shelbyville' });
+    await expect(
+      updateCustomer(ctx, cust.id, { shipToAddresses: [{ name: 'A', line1: 'x' }, { name: 'a', line1: 'y' }] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+
+    const inv = await createInvoice(ctx, { customerId: cust.id, date: D('2026-05-05'), lines: [{ ...line }] });
+    expect(inv.shipTo).toEqual({ line1: '9 Dock Rd', city: 'Shelbyville' });
+    const so = await createSalesOrder(ctx, { customerId: cust.id, date: D('2026-05-05'), lines: [{ description: 'x', quantity: 1, rate: 1 }] });
+    expect(so.shipTo).toEqual({ line1: '9 Dock Rd', city: 'Shelbyville' });
+    const est = await createEstimate(ctx, { customerId: cust.id, date: D('2026-05-05'), shipTo: { line1: '1 Main St', city: 'Springfield' }, lines: [{ description: 'x', quantity: 1, rate: 1 }] });
+    expect(est.shipTo).toEqual({ line1: '1 Main St', city: 'Springfield' });
+    // An explicit null means "no ship-to".
+    const none = await createInvoice(ctx, { customerId: cust.id, date: D('2026-05-05'), shipTo: null, lines: [{ ...line }] });
+    expect(none.shipTo).toBeNull();
+
+    // Legacy single shipping address becomes "Ship To 1".
+    const legacy = await createCustomer(ctx, { displayName: 'Legacy', shippingAddress: { line1: '5 Old Rd' } });
+    expect(legacy.shipToAddresses).toEqual([{ name: 'Ship To 1', line1: '5 Old Rd', isDefault: true }]);
+  });
+
+  it('normalizeShipToAddresses names rows, keeps one default and drops blanks', () => {
+    const out = normalizeShipToAddresses([{ line1: 'a' }, { name: '', line1: '' }, { name: 'B', line1: 'b', isDefault: true }, { name: 'C', line1: 'c', isDefault: true }])!;
+    expect(out.map((a) => a.name)).toEqual(['Ship To 1', 'B', 'C']);
+    expect(out.map((a) => a.isDefault)).toEqual([false, true, false]);
+    expect(defaultShipTo(out)).toEqual({ line1: 'b' });
+    expect(normalizeShipToAddresses([])).toBeNull();
   });
 });

@@ -5,12 +5,15 @@
  *    the caller did not choose one, and a customer whose tax code is non-taxable ("Non",
  *    customers.taxable = false) makes every line non-taxable — QB only taxes a taxable item
  *    for a taxable customer.
+ *  - Ship to: a new invoice / sales order / sales receipt / estimate whose ship-to was left out
+ *    gets the customer's default ship-to address.
  *
  * Kept free of other service imports so invoices / estimates / sales receipts / credit memos /
  * sales orders can all use it without import cycles.
  */
 import { and, eq } from 'drizzle-orm';
 import { customers } from '@/lib/db/schema';
+import { defaultShipTo } from '@/lib/shipTo';
 import type { ServiceContext } from './_base';
 
 export interface CustomerTaxDefaults {
@@ -61,4 +64,22 @@ export async function applyCustomerTaxDefaults<T extends TaxableDoc>(
     out = { ...out, lines: input.lines.map((l) => ({ ...l, taxable: false })) };
   }
   return out;
+}
+
+/**
+ * New document with no ship-to given (undefined) → the customer's default ship-to address
+ * (customers.ship_to_addresses, else the plain shipping address). An explicit null is kept.
+ */
+export async function applyCustomerShipToDefault<T extends { customerId?: string | null; shipTo?: Record<string, string> | null }>(
+  ctx: ServiceContext,
+  input: T,
+): Promise<T> {
+  if (input.shipTo !== undefined || !input.customerId) return input;
+  const [row] = await ctx.db
+    .select({ list: customers.shipToAddresses, shipping: customers.shippingAddress })
+    .from(customers)
+    .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, input.customerId)));
+  if (!row) return input;
+  const addr = defaultShipTo(row.list) ?? defaultShipTo(row.shipping ? [row.shipping] : null);
+  return addr ? { ...input, shipTo: addr } : input;
 }

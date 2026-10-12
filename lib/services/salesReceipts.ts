@@ -56,7 +56,7 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { applyCustomerTaxDefaults } from './customerDefaults';
+import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import { shippingColumns } from './invoices';
 
@@ -520,6 +520,7 @@ async function postSalesReceiptDocument(
 
 export async function createSalesReceipt(ctx: ServiceContext, input: CreateSalesReceiptInput) {
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
+  input = await applyCustomerShipToDefault(ctx, input);
   const prep = await prepareSalesReceipt(ctx, input);
   const { method, depositAccountId, subtotal, taxAmount, total } = prep;
 
