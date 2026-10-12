@@ -467,8 +467,15 @@ const ADDITIONAL_MEDICARE_WAGE_THRESHOLD = 200000;
 const RATE_5A = '0.124';
 const RATE_5C = '0.029';
 const RATE_5D = '0.009';
-/** A deposit for a quarter is normally made by the 15th of the following month. */
+/** Monthly depositors: a month's tax is deposited by the 15th of the following month. */
 const DEPOSIT_LAG_DAYS = 15;
+/**
+ * Semiweekly depositors deposit within 3 business days after the payday's semiweekly period
+ * (Wed-Fri paydays by the next Wednesday, Sat-Tue paydays by the next Friday) — at most about a
+ * week, plus holidays. A deposit is matched to the latest payday at most this many days earlier.
+ */
+const SEMIWEEKLY_MATCH_DAYS = 14;
+const DAY_MS = 86_400_000;
 
 const FORM941_EMPLOYEE_TRACKING = new Set(['federal_withholding', 'social_security', 'medicare']);
 const FORM941_EMPLOYER_TRACKING = new Set(['employer_social_security', 'employer_medicare']);
@@ -485,8 +492,9 @@ const FORM941_EMPLOYER_TRACKING = new Set(['employer_social_security', 'employer
  * - Line 1 counts employees paid for the pay period that includes the 12th of the quarter's last
  *   month (checks without pay-period dates count when paid in that month).
  * - Line 13 deposits: Pay Liabilities payments of 941 items (federal withholding, Social
- *   Security, Medicare) dated from the 16th of the quarter's first month through the 15th of the
- *   month after the quarter — the normal deposit window — unless `depositsOverride` is given.
+ *   Security, Medicare) attributed to the quarter of the liability they pay — see
+ *   form941Deposits (monthly window, or the payday each semiweekly deposit pays) — unless
+ *   `depositsOverride` is given.
  * - Line 16: liability by month of the pay date; Schedule B by day for semiweekly depositors.
  */
 export async function form941Data(
@@ -600,9 +608,7 @@ export async function form941Data(
     l13 = Money.round2(input.depositsOverride!);
     if (l13.isNegative()) throw validation('Deposits cannot be negative.');
   } else {
-    const winStart = new Date(start.getTime() + DEPOSIT_LAG_DAYS * 86_400_000);
-    const winEnd = new Date(end.getTime() + DEPOSIT_LAG_DAYS * 86_400_000);
-    deposits.push(...(await payrollTaxPayments(ctx, winStart, winEnd, is941Item)));
+    deposits.push(...(await form941Deposits(ctx, start, end, input.depositSchedule === 'semiweekly')));
     l13 = deposits.reduce((sum, d) => sum.plus(Money.of(d.amount)), Money.zero());
   }
   const l14 = l12.greaterThan(l13) ? l12.minus(l13) : Money.zero();
@@ -682,6 +688,58 @@ export async function form941Data(
     depositsOverridden: overridden,
     notes,
   };
+}
+
+/**
+ * The Pay Liabilities payments that count on line 13 for the quarter [start, end) — each deposit
+ * goes to the quarter of the liability it pays (QuickBooks' "for period"):
+ * - Monthly (and under-$2,500) depositors: a month's tax is due by the 15th of the next month, so
+ *   the quarter's deposits are those dated from the 16th of its first month through the 15th of
+ *   the month after it.
+ * - Semiweekly depositors: a deposit pays the latest payday with Form 941 tax on or before the
+ *   deposit date (within SEMIWEEKLY_MATCH_DAYS), so a Jan 8 deposit for a Jan 3 payday is a Q1
+ *   deposit and a Jan 2 deposit for a Dec 27 payday is a Q4 deposit. A deposit with no such
+ *   payday falls back to the monthly window.
+ */
+async function form941Deposits(ctx: ServiceContext, start: Date, end: Date, semiweekly: boolean): Promise<Form941Deposit[]> {
+  const winStart = new Date(start.getTime() + DEPOSIT_LAG_DAYS * DAY_MS);
+  const winEnd = new Date(end.getTime() + DEPOSIT_LAG_DAYS * DAY_MS);
+  if (!semiweekly) return payrollTaxPayments(ctx, winStart, winEnd, is941Item);
+
+  // Candidate deposits: anything from the quarter start through the monthly window's end (or a
+  // match window past the quarter end, whichever is later).
+  const candFrom = start;
+  const candTo = new Date(Math.max(winEnd.getTime(), end.getTime() + (SEMIWEEKLY_MATCH_DAYS + 1) * DAY_MS));
+  const candidates = await payrollTaxPayments(ctx, candFrom, candTo, is941Item);
+  if (!candidates.length) return [];
+
+  // Paydays that carried Form 941 tax, from a match window before the quarter to the last candidate.
+  const checks = await countedChecks(ctx, new Date(start.getTime() - SEMIWEEKLY_MATCH_DAYS * DAY_MS), candTo);
+  const byCheck = await linesByPaycheck(ctx, checks.map((c) => c.id));
+  const paydays = new Set<number>();
+  for (const c of checks) {
+    const lines = byCheck.get(c.id) ?? [];
+    const tax = sumTracking(lines.filter((l) => l.kind === 'tax'), ['federal_withholding', 'social_security', 'medicare'])
+      .plus(sumTracking(lines.filter((l) => l.kind === 'employer_contribution'), ['employer_social_security', 'employer_medicare']));
+    if (!tax.isZero()) paydays.add(c.payDate.getTime());
+  }
+  const sortedPaydays = [...paydays].sort((a, b) => a - b);
+
+  const out: Form941Deposit[] = [];
+  for (const dep of candidates) {
+    const t = Date.parse(`${dep.date}T00:00:00Z`);
+    let payday: number | null = null;
+    for (const p of sortedPaydays) {
+      if (p > t) break;
+      if (t - p <= SEMIWEEKLY_MATCH_DAYS * DAY_MS) payday = p;
+    }
+    const inQuarter =
+      payday != null
+        ? payday >= start.getTime() && payday < end.getTime()
+        : t >= winStart.getTime() && t < winEnd.getTime();
+    if (inQuarter) out.push(dep);
+  }
+  return out;
 }
 
 /** A Pay Liabilities line memo names a Form 941 tax (federal withholding, Social Security, Medicare). */

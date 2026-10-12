@@ -266,6 +266,25 @@ describe('P1 payroll forms — tester QA', () => {
     expect(q4.lines.line15).toBe('0.00');
   });
 
+  it('941 line 13 (semiweekly): a deposit with no recent payday falls back to the monthly window; monthly filers keep the window', async () => {
+    const S = await newCompany('Semi Weekly Fallback Co');
+    const sam = await emp(S.ctx, 'Sid', 'TX');
+    await runPaycheck(S.ctx, {
+      employeeId: sam, payDate: d('2025-02-07'), periodStart: d('2025-02-07'), periodEnd: d('2025-02-07'),
+      grossPay: '10000.00', taxes: ee('1000.00', '620.00', '145.00'), employerTaxes: er('620.00', '145.00', '0.00'),
+    });
+    // Feb 12 pays the Feb 7 payday; Jan 10 has no payday in the prior 14 days → monthly window (Q4).
+    await pay(S.ctx, S.acct['1000'], '2025-01-10', [['Federal Income Tax', '50.00']]);
+    await pay(S.ctx, S.acct['1000'], '2025-02-12', [['Federal Income Tax', '1000.00'], ['Social Security', '1240.00'], ['Medicare', '290.00']]);
+    const semi = await form941Data(S.ctx, { quarter: 1, year: 2025, depositSchedule: 'semiweekly' });
+    expect(semi.lines.line13).toBe('2530.00');
+    expect(semi.deposits.every((x) => x.date === '2025-02-12')).toBe(true);
+    const q4 = await form941Data(S.ctx, { quarter: 4, year: 2024, depositSchedule: 'semiweekly' });
+    expect(q4.lines.line13).toBe('50.00');
+    const monthly = await form941Data(S.ctx, { quarter: 1, year: 2025 });
+    expect(monthly.lines.line13).toBe('2530.00');
+  });
+
   it('940: credit reduction for CA (2025 1.2%), exclusions, FUTA deposit window, SUI not a FUTA deposit', async () => {
     const f = await form940Data(A.ctx, { year: 2025 });
     // Voided $9,999 check excluded.
