@@ -255,9 +255,10 @@ describe('QuickBooks account types', () => {
       await db.insert(accounts).values({ companyId: ctx.companyId, code: c, name, type, subtype: subtype as never });
     }
     const file = fs.readFileSync(path.resolve(process.cwd(), 'drizzle', '0025_wave2_foundation.sql'), 'utf8');
-    // The reclassification runs once, inside the migration's guarded DO block.
+    // Five reclassifications run once, inside the migration's guarded DO block; the sixth
+    // retypes an A/R-typed 1250 Retainage Receivable to Other Current Asset.
     const updates = (file.match(/UPDATE "accounts" SET "subtype"[\s\S]*?;/g) ?? []).map((s) => s.trim());
-    expect(updates.length).toBe(5);
+    expect(updates.length).toBe(6);
     for (const stmt of updates) await db.execute(sql.raw(stmt));
     const rows = await listAccounts(ctx);
     const sub = (c: string) => rows.find((r) => r.code === c)!.subtype;
@@ -272,6 +273,7 @@ describe('QuickBooks account types', () => {
     // Seeded defaults are untouched by a re-run.
     expect(sub('2000')).toBe('accounts_payable');
     expect(sub('1000')).toBe('checking');
+    expect(sub('1250')).toBe('other_current_asset');
   });
 });
 
