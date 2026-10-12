@@ -386,3 +386,114 @@ describe('reclassify durability — adversarial', () => {
     expect(still.accountId).toBe(acct['6810']);
   });
 });
+
+describe('reclassify — re-test round 1 (credit-card credits)', () => {
+  it('credit-card credit saved with NEGATIVE rows: reclassify one twin line, re-save with negative amounts → kept', async () => {
+    const exp = await createExpense(ctx, {
+      vendorId,
+      date: D('2026-06-08'),
+      method: 'credit_card',
+      paymentAccountId: ccAccountId,
+      lines: [
+        { accountId: acct['6810'], amount: '-9.99', description: 'Twin' },
+        { accountId: acct['6810'], amount: '-9.99', description: 'Twin' },
+        { accountId: acct['6810'], amount: '-0.02', description: 'Penny' },
+      ],
+    });
+    const entry = await posted(expenses, exp.id);
+    const twins = (await on(entry, acct['6810'])).filter((l) => l.credit === '9.99');
+    expect(twins).toHaveLength(2);
+    await reclassifyLines(ctx, { lineIds: [twins[0].id], newAccountId: acct['6820'] });
+    const e = await getExpense(ctx, exp.id);
+    expect(e.lines.filter((r) => r.accountId === acct['6820']).map((r) => r.amount)).toEqual(['-9.99']);
+    await updateExpense(ctx, exp.id, {
+      vendorId,
+      date: e.date,
+      method: 'credit_card',
+      paymentAccountId: ccAccountId,
+      memo: 'memo only',
+      lines: e.lines.map((r) => ({
+        accountId: r.accountId,
+        itemId: r.itemId,
+        description: r.description,
+        amount: r.amount,
+        classId: r.classId,
+      })),
+    });
+    const after = await posted(expenses, exp.id);
+    expect((await on(after, acct['6820'])).map((l) => l.credit)).toEqual(['9.99']);
+    expect((await on(after, acct['6810'])).map((l) => l.credit).sort()).toEqual(['0.02', '9.99']);
+    const [cc] = await on(after, ccAccountId);
+    expect(cc.debit).toBe('20.00');
+    await expectBalanced();
+  });
+
+  it('credit-card credit (isRefund): class-only change on every line is kept after re-save', async () => {
+    const cls = await createClass(ctx, { name: 'QA Refund Class' });
+    const exp = await createExpense(ctx, {
+      vendorId,
+      date: D('2026-06-09'),
+      method: 'credit_card',
+      paymentAccountId: ccAccountId,
+      isRefund: true,
+      lines: [
+        { accountId: acct['6810'], amount: '5.00', description: 'R1' },
+        { accountId: acct['6830'], amount: '6.00', description: 'R2' },
+      ],
+    });
+    const entry = await posted(expenses, exp.id);
+    const ids = [...(await on(entry, acct['6810'])), ...(await on(entry, acct['6830']))].map((l) => l.id);
+    await reclassifyLines(ctx, { lineIds: ids, newClassId: cls.id });
+    const e = await getExpense(ctx, exp.id);
+    expect(e.lines.every((r) => r.classId === cls.id)).toBe(true);
+    await updateExpense(ctx, exp.id, {
+      vendorId,
+      date: e.date,
+      method: 'credit_card',
+      paymentAccountId: ccAccountId,
+      isRefund: true,
+      memo: 'class kept',
+      lines: e.lines.map((r) => ({
+        accountId: r.accountId,
+        itemId: r.itemId,
+        description: r.description,
+        amount: String(Math.abs(Number(r.amount)).toFixed(2)),
+        classId: r.classId,
+      })),
+    });
+    const after = await posted(expenses, exp.id);
+    const moved = [...(await on(after, acct['6810'])), ...(await on(after, acct['6830']))];
+    expect(moved).toHaveLength(2);
+    expect(moved.every((l) => l.classId === cls.id && Number(l.credit) > 0)).toBe(true);
+    await expectBalanced();
+  });
+
+  it('an ordinary credit-card charge (not a credit) still reclassifies and survives re-save', async () => {
+    const exp = await createExpense(ctx, {
+      vendorId,
+      date: D('2026-06-10'),
+      method: 'credit_card',
+      paymentAccountId: ccAccountId,
+      lines: [
+        { accountId: acct['6810'], amount: '12.00', description: 'C1' },
+        { accountId: acct['6810'], amount: '13.00', description: 'C2' },
+      ],
+    });
+    const entry = await posted(expenses, exp.id);
+    const c2 = (await on(entry, acct['6810'])).find((l) => l.debit === '13.00')!;
+    await reclassifyLines(ctx, { lineIds: [c2.id], newAccountId: acct['6830'] });
+    const e = await getExpense(ctx, exp.id);
+    await updateExpense(ctx, exp.id, {
+      vendorId,
+      date: e.date,
+      method: 'credit_card',
+      paymentAccountId: ccAccountId,
+      memo: 'charge memo',
+      lines: e.lines.map((r) => ({ accountId: r.accountId, itemId: r.itemId, description: r.description, amount: r.amount, classId: r.classId })),
+    });
+    const after = await posted(expenses, exp.id);
+    expect((await on(after, acct['6830'])).map((l) => l.debit)).toEqual(['13.00']);
+    expect((await on(after, acct['6810'])).map((l) => l.debit)).toEqual(['12.00']);
+    await expectBalanced();
+  });
+});

@@ -32,14 +32,14 @@ import type { ServiceContext } from './_base';
 import { createCompany, setClosingDate } from './company';
 import { createCustomer, customerBalanceSummary } from './customers';
 import { createVendor } from './vendors';
-import { apAging, arAging } from './reportsExtra';
+import { apAging, apAgingDetail, arAging, arAgingDetail } from './reportsExtra';
 import { vendorBalanceSummary } from './reportsLists';
 import { trialBalance } from './reports';
 import { createInvoice, updateInvoice, voidInvoice } from './invoices';
 import { createBill, voidBill } from './bills';
 import { createManualEntry, voidEntry } from './journal';
-import { receivePayment, updatePayment } from './payments';
-import { payBills } from './billPayments';
+import { receivePayment, updatePayment, voidPayment } from './payments';
+import { payBills, updateBillPayment, voidBillPayment } from './billPayments';
 import {
   applyJournalCredit,
   listJournalApplications,
@@ -640,5 +640,203 @@ describe('historical (as-of) aging ties to the balance sheet', () => {
     await apTiedAsOf(EOD('2026-05-17'));
     await apTiedAsOf(EOD('2026-05-21'));
     await apTied();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Re-test round 1: dated General Journal applications (as-of aging) — attacks on the fix
+// ---------------------------------------------------------------------------
+
+/** A/R control == aging == aging detail, as of `d` (end of day). */
+async function arAllTiedOn(d: string) {
+  const asOf = EOD(d);
+  const control = await controlOf(ctx, 'accounts_receivable', asOf);
+  const aging = Number((await arAging(ctx, asOf)).totals.total);
+  const detail = (await arAgingDetail(ctx, asOf)).rows.reduce((s, r) => s + Number(r.openBalance), 0);
+  expect(aging, `A/R aging on ${d} vs control`).toBeCloseTo(control, 2);
+  expect(detail, `A/R aging detail on ${d} vs control`).toBeCloseTo(control, 2);
+}
+async function apAllTiedOn(d: string) {
+  const asOf = EOD(d);
+  const control = await controlOf(ctx, 'accounts_payable', asOf);
+  const aging = Number((await apAging(ctx, asOf)).totals.total);
+  const detail = (await apAgingDetail(ctx, asOf)).rows.reduce((s, r) => s + Number(r.openBalance), 0);
+  expect(aging, `A/P aging on ${d} vs control`).toBeCloseTo(control, 2);
+  expect(detail, `A/P aging detail on ${d} vs control`).toBeCloseTo(control, 2);
+}
+
+describe('round 2: as-of aging with dated General Journal applications', () => {
+  it('A/R: credit applied inside Receive Payments (with cash), then the payment is re-dated and voided — ties every day', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R2 Payment Credit Customer' })).id;
+    const inv = await createInvoice(ctx, {
+      customerId: cust,
+      date: D('2026-09-01'),
+      lines: [{ description: 'Sept work', quantity: 1, rate: '300.00' }],
+    });
+    const credit = await arCredit(cust, '2026-09-05', '100.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: D('2026-09-10'),
+      method: 'check',
+      amount: '50.00',
+      depositAccountId: code['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '50.00' }],
+      journalCredits: [{ journalLineId: credit.lineId, invoiceId: inv.id, amount: '100.00' }],
+    });
+    for (const d of ['2026-09-03', '2026-09-07', '2026-09-11']) await arAllTiedOn(d);
+    await arTied();
+    // Re-date the payment two days later: the credit moves with it.
+    await updatePayment(ctx, payment.id, {
+      customerId: cust,
+      date: D('2026-09-12'),
+      method: 'check',
+      amount: '50.00',
+      depositAccountId: code['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '50.00' }],
+      journalCredits: [{ journalLineId: credit.lineId, invoiceId: inv.id, amount: '100.00' }],
+    });
+    const apps = await listJournalApplications(ctx, { journalEntryId: credit.entryId });
+    expect(apps).toHaveLength(1);
+    expect(new Date(apps[0].date).toISOString().slice(0, 10)).toBe('2026-09-12');
+    for (const d of ['2026-09-07', '2026-09-11', '2026-09-13']) await arAllTiedOn(d);
+    await voidPayment(ctx, apps[0].paymentId!);
+    expect((await listJournalOpenItems(ctx, 'ar', cust)).credits.map((c) => c.open)).toEqual(['100.00']);
+    for (const d of ['2026-09-07', '2026-09-11', '2026-09-13']) await arAllTiedOn(d);
+    await arTied();
+  });
+
+  it('A/R: one General Journal credit split over two invoices on two dates — ties between and after', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R2 Split Credit Customer' })).id;
+    const inv1 = await createInvoice(ctx, { customerId: cust, date: D('2026-09-14'), lines: [{ description: 'A', quantity: 1, rate: '40.01' }] });
+    const inv2 = await createInvoice(ctx, { customerId: cust, date: D('2026-09-14'), lines: [{ description: 'B', quantity: 1, rate: '59.99' }] });
+    const credit = await arCredit(cust, '2026-09-14', '100.00');
+    await applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv1.id, amount: '40.01', date: D('2026-09-16') });
+    await applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv2.id, amount: '59.98', date: D('2026-09-20') });
+    for (const d of ['2026-09-15', '2026-09-17', '2026-09-21']) await arAllTiedOn(d);
+    const [i2] = await db.select().from(invoices).where(eq(invoices.id, inv2.id));
+    expect(i2.balanceDue).toBe('0.01');
+    expect((await listJournalOpenItems(ctx, 'ar', cust)).credits.map((c) => c.open)).toEqual(['0.01']);
+    await arTied();
+  });
+
+  it('A/R: moving the invoice date past the day a General Journal credit was applied keeps as-of aging tied (or is refused)', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R2 Moved Invoice Customer' })).id;
+    const lines = [{ description: 'Moved', quantity: 1, rate: '120.00', accountId: code['4000'] }];
+    const inv = await createInvoice(ctx, { customerId: cust, date: D('2026-09-22'), lines });
+    const credit = await arCredit(cust, '2026-09-22', '20.00');
+    await applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv.id, amount: '20.00', date: D('2026-09-23') });
+    // Edit: invoice now dated Sep 28, after the application (Sep 23). Either the edit is refused,
+    // or aging on Sep 25 must still equal A/R control on Sep 25.
+    await updateInvoice(ctx, inv.id, { customerId: cust, date: D('2026-09-28'), lines }).catch(() => undefined);
+    for (const d of ['2026-09-22', '2026-09-25', '2026-09-29']) await arAllTiedOn(d);
+    await arTied();
+  });
+
+  it('A/R: re-dating a payment to before the General Journal charge it pays is refused and changes nothing', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R2 Early Redate Customer' })).id;
+    const { lineId } = await arCharge(ctx, code, cust, '2026-10-05', '45.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: D('2026-10-06'),
+      method: 'check',
+      amount: '45.00',
+      depositAccountId: code['1000'],
+      applications: [],
+      journalItems: [{ journalLineId: lineId, amount: '45.00' }],
+    });
+    const before = await countRows();
+    await expect(
+      updatePayment(ctx, payment.id, {
+        customerId: cust,
+        date: D('2026-10-01'),
+        method: 'check',
+        amount: '45.00',
+        depositAccountId: code['1000'],
+        applications: [],
+        journalItems: [{ journalLineId: lineId, amount: '45.00' }],
+      }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect(await countRows()).toEqual(before);
+    const [p] = await db.select().from(paymentsReceived).where(eq(paymentsReceived.id, payment.id));
+    expect(p.voidedAt).toBeNull();
+    expect(new Date(p.date).toISOString().slice(0, 10)).toBe('2026-10-06');
+    expect((await listJournalOpenItems(ctx, 'ar', cust)).charges).toHaveLength(0);
+    for (const d of ['2026-10-05', '2026-10-07']) await arAllTiedOn(d);
+    await arTied();
+  });
+
+  it('A/P: vendor credit applied inside Pay Bills, payment re-dated then voided — ties every day', async () => {
+    const vend = (await createVendor(ctx, { displayName: 'R2 Pay Bills Vendor' })).id;
+    const bill = await createBill(ctx, { vendorId: vend, date: D('2026-09-01'), billNumber: 'R2-1', lines: [{ accountId: code['6000'], amount: '200.00' }] });
+    const vc = await apVendorCredit(vend, '2026-09-05', '80.00');
+    await payBills(ctx, {
+      vendorId: vend,
+      date: D('2026-09-10'),
+      method: 'check',
+      paymentAccountId: code['1000'],
+      applications: [{ billId: bill.id, amountApplied: '20.00' }],
+      journalCredits: [{ journalLineId: vc.lineId, billId: bill.id, amount: '80.00' }],
+    });
+    const [first] = await listJournalApplications(ctx, { journalEntryId: vc.entryId });
+    expect(first?.billPaymentId).toBeTruthy();
+    expect(new Date(first.date).toISOString().slice(0, 10)).toBe('2026-09-10');
+    for (const d of ['2026-09-03', '2026-09-07', '2026-09-11']) await apAllTiedOn(d);
+    await apTied();
+    await updateBillPayment(ctx, first.billPaymentId!, {
+      vendorId: vend,
+      date: D('2026-09-12'),
+      method: 'check',
+      paymentAccountId: code['1000'],
+      applications: [{ billId: bill.id, amountApplied: '20.00' }],
+      journalCredits: [{ journalLineId: vc.lineId, billId: bill.id, amount: '80.00' }],
+    });
+    for (const d of ['2026-09-07', '2026-09-11', '2026-09-13']) await apAllTiedOn(d);
+    await apTied();
+    const [app] = await listJournalApplications(ctx, { journalEntryId: vc.entryId });
+    expect(new Date(app.date).toISOString().slice(0, 10)).toBe('2026-09-12');
+    await voidBillPayment(ctx, app.billPaymentId!);
+    expect((await listJournalOpenItems(ctx, 'ap', vend)).credits.map((c) => c.open)).toEqual(['80.00']);
+    const [b] = await db.select().from(bills).where(eq(bills.id, bill.id));
+    expect(b.balanceDue).toBe('200.00');
+    for (const d of ['2026-09-07', '2026-09-11', '2026-09-13']) await apAllTiedOn(d);
+    await apTied();
+  });
+
+  it('A/P: paying a General Journal amount owed with a bill payment dated before it is refused', async () => {
+    const vend = (await createVendor(ctx, { displayName: 'R2 Early Bill Payment Vendor' })).id;
+    const owed = await apOwed(vend, '2026-10-10', '33.00');
+    const before = await countRows();
+    await expect(
+      payBills(ctx, {
+        vendorId: vend,
+        date: D('2026-10-08'),
+        method: 'check',
+        paymentAccountId: code['1000'],
+        applications: [],
+        journalItems: [{ journalLineId: owed.lineId, amount: '33.00' }],
+      }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect(await countRows()).toEqual(before);
+    for (const d of ['2026-10-09', '2026-10-11']) await apAllTiedOn(d);
+    await apTied();
+  });
+
+  it('closing date: a credit applied after the close to an invoice inside the closed period leaves the closed period tied', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R2 Closed Period Customer' })).id;
+    const inv = await createInvoice(ctx, { customerId: cust, date: D('2026-07-10'), lines: [{ description: 'July', quantity: 1, rate: '75.00' }] });
+    const credit = await arCredit(cust, '2026-07-12', '25.00');
+    await setClosingDate(ctx, { closingDate: '2026-07-31', password: 'pw' });
+    try {
+      await expect(
+        applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv.id, amount: '25.00', date: D('2026-07-20') }),
+      ).rejects.toMatchObject({ code: 'PERIOD_CLOSED' });
+      const app = await applyJournalCredit(ctx, { journalLineId: credit.lineId, invoiceId: inv.id, amount: '25.00', date: D('2026-08-03') });
+      expect(new Date(app.date).toISOString().slice(0, 10)).toBe('2026-08-03');
+      await arAllTiedOn('2026-07-31');
+      await arAllTiedOn('2026-08-04');
+    } finally {
+      await setClosingDate(ctx, { closingDate: null, password: null });
+    }
+    await arTied();
   });
 });
