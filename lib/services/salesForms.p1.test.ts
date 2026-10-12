@@ -22,6 +22,7 @@ import { normalizeShipToAddresses, defaultShipTo } from '@/lib/shipTo';
 import { trialBalance } from './reports';
 import { runGlobalSearch } from '@/app/api/search/queries';
 import { buildResults } from '@/app/api/search/results';
+import { listAvailableCredits } from './payments';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-p1-salesforms');
 let db: DB;
@@ -222,6 +223,12 @@ describe('p1/salesforms — numbers and tax defaults', () => {
     expect(res.some((r) => r.type === 'Purchase Order' && r.label === 'Purchase Order #PO-78')).toBe(true);
     const inv = buildResults(await runGlobalSearch(db, ctx.companyId, 'JOB-777'));
     expect(inv.some((r) => r.label === 'Invoice #JOB-777')).toBe(true);
+  });
+
+  it('Receive Payments credit picker shows the typed credit memo number', async () => {
+    await createCreditMemo(ctx, { customerId: plainCust, date: D('2026-05-06'), refNumber: 'RMA-42', lines: [{ description: 'r', quantity: 1, rate: 5, accountId: acct['4000'] }] });
+    const credits = await listAvailableCredits(ctx, plainCust);
+    expect(credits.some((c) => c.ref === 'Credit Memo #RMA-42')).toBe(true);
   });
 
   it('migration 0040 is idempotent and backfills a lone shipping address as the default ship-to', async () => {

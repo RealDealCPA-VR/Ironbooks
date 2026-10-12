@@ -156,7 +156,7 @@ export function entityLabel(entityType: string): string {
 }
 
 const NUMBER_KEYS = [
-  'entryNumber', 'invoiceNumber', 'billNumber', 'receiptNumber', 'memoNumber', 'creditNumber',
+  'entryNumber', 'refNumber', 'invoiceNumber', 'billNumber', 'receiptNumber', 'memoNumber', 'creditNumber',
   'poNumber', 'orderNumber', 'estimateNumber', 'checkNumber', 'paymentNumber', 'number',
 ];
 const AMOUNT_KEYS = ['total', 'amount', 'totalAmount', 'netPay', 'grossPay'];
