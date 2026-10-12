@@ -320,7 +320,7 @@ describe('QA7: checks on A/R / A/P carry the name and stay in aging', () => {
     // Dr A/R 30 for the customer: the customer now owes 30 more (QB shows the check in aging).
     expect(await arRow(c)).toBe(30);
     expect(await arGap()).toBeCloseTo(g0, 2);
-    const id = (exp as { id?: string; expense?: { id: string } }).id ?? (exp as { expense: { id: string } }).expense.id;
+    const id = exp.id;
     await voidExpense(ctx, id);
     expect(await arRow(c)).toBe(0);
     expect(await arGap()).toBeCloseTo(g0, 2);
