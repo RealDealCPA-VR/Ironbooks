@@ -43,6 +43,7 @@ import {
 } from './journalApplications';
 import { verifyIntegrity } from './integrity';
 import { createDeposit } from './deposits';
+import { clientDataReview } from './accountant/clientDataReview';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-journal-applications');
 
@@ -274,6 +275,10 @@ describe('A/R: General Journal charges and credits in Receive Payments', () => {
     expect(available).toContainEqual(
       expect.objectContaining({ kind: 'journal_entry', id: creditLineId, available: '100.00' }),
     );
+    // Client Data Review > Fix unapplied customer credits sees it too.
+    const review = await clientDataReview(ctx);
+    const task = review.tasks.find((t) => t.key === 'unapplied_customer_credits')!;
+    expect(task.issues.some((i) => i.id === `journal_line:${creditLineId}`)).toBe(true);
 
     // Receive 200 and use the 100 General Journal credit on the same invoice.
     const { payment } = await receivePayment(ctx, {

@@ -45,6 +45,7 @@ import { listUndepositedPayments } from '../deposits';
 import { applyPayment } from '../payments';
 import { applyToInvoice } from '../creditMemos';
 import { applyToBill } from '../vendorCredits';
+import { journalOpenItems, resolveEntityNames } from '../journal';
 
 export const REVIEW_TASKS = [
   { key: 'unapplied_customer_credits', group: 'Customers', title: 'Fix unapplied customer payments and credits' },
@@ -127,6 +128,23 @@ async function unappliedCustomerCredits(ctx: ServiceContext): Promise<ReviewIssu
         : { kind: 'link', href: `/credit-memos?focus=${m.id}`, label: 'Open credit memo' },
     });
   }
+  // I11: General Journal credits to A/R for a customer are open credits too.
+  const journalCredits = (await journalOpenItems(ctx, 'ar')).filter((j) => Money.lt(j.amount, 0));
+  const names = await resolveEntityNames(ctx, journalCredits);
+  for (const j of journalCredits) {
+    const name = names.get(`customer:${j.entityId}`) ?? 'Customer';
+    const o = openBy.get(j.entityId);
+    const amt = toAmountString(Money.abs(j.amount));
+    out.push({
+      id: `journal_line:${j.lineId}`,
+      title: `${name}: General Journal #${j.entryNumber} credit has ${amt} not applied`,
+      detail: o
+        ? `${name} has ${Number(o.n)} open invoice(s). Apply the credit to them in Receive Payments.`
+        : `${name} has no open invoices — keep the credit for future invoices or refund it.`,
+      amount: amt,
+      fix: { kind: 'link', href: '/payments', label: 'Receive Payments' },
+    });
+  }
   return out;
 }
 
@@ -162,7 +180,7 @@ async function unappliedVendorCredits(ctx: ServiceContext): Promise<ReviewIssue[
     .from(vendorCredits)
     .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
     .where(and(eq(vendorCredits.companyId, ctx.companyId), ne(vendorCredits.status, 'void'), gt(vendorCredits.unapplied, '0')));
-  return credits.map((c) => {
+  const out: ReviewIssue[] = credits.map((c) => {
     const n = openBy.get(c.vendorId) ?? 0;
     return {
       id: `vendor_credit:${c.id}`,
@@ -172,6 +190,22 @@ async function unappliedVendorCredits(ctx: ServiceContext): Promise<ReviewIssue[
       fix: n > 0 ? { kind: 'apply_vendor_credit' as const, refId: c.id } : { kind: 'link' as const, href: '/vendor-credits', label: 'Open bill credits' },
     };
   });
+  // I11: General Journal debits to A/P for a vendor are vendor credits too.
+  const journalCredits = (await journalOpenItems(ctx, 'ap')).filter((j) => Money.lt(j.amount, 0));
+  const names = await resolveEntityNames(ctx, journalCredits);
+  for (const j of journalCredits) {
+    const name = names.get(`vendor:${j.entityId}`) ?? 'Vendor';
+    const n = openBy.get(j.entityId) ?? 0;
+    const amt = toAmountString(Money.abs(j.amount));
+    out.push({
+      id: `journal_line:${j.lineId}`,
+      title: `${name}: General Journal #${j.entryNumber} credit has ${amt} not applied`,
+      detail: n > 0 ? `${name} has ${n} open bill(s). Apply the credit to them in Pay Bills.` : `${name} has no open bills — ask for a refund or keep the credit.`,
+      amount: amt,
+      fix: { kind: 'link', href: '/pay-bills', label: 'Pay Bills' },
+    });
+  }
+  return out;
 }
 
 async function itemSetup(ctx: ServiceContext): Promise<ReviewIssue[]> {
