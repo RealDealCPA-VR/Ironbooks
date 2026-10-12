@@ -2,6 +2,7 @@
   "name": "bookkeeper-ai",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "Open-source desktop accounting — a QuickBooks competitor with AI-powered error correction.",
   "author": "BookKeeper AI",
   "main": "electron/main.js",

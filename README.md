@@ -7,6 +7,7 @@
 **Open-source double-entry accounting for Windows, macOS and Linux. The database itself
 refuses to let your books go out of balance.**
 
+![license](https://img.shields.io/badge/license-MIT-green)
 ![tests](https://img.shields.io/badge/tests-3%2C965%20passing-brightgreen)
 ![typecheck](https://img.shields.io/badge/tsc-clean-blue)
 ![local-first](https://img.shields.io/badge/data-100%25%20local-success)
@@ -209,6 +210,10 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
   - multi-currency vendor credits, deposits and transfers
   - refund-check printing
 - [ ] Hands-on QA of the new screens, then a tagged release
+
+## 📜 License
+
+[MIT](./LICENSE). Use it, fork it, ship it.
 
 ## ⚠️ Disclaimer
 
