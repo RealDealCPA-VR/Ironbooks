@@ -57,6 +57,7 @@ import {
   reverseJournalApplicationsForPayment,
   validateJournalChargesForPayment,
 } from './journalApplications';
+import { clearPaymentFxReliefs, ensureLegacyFxRelief, homeAt, invoiceHomeOpenNow, recordPaymentFxRelief } from './fxSubledger'; // p1 fx
 
 // ---- Types ------------------------------------------------------------------
 
@@ -633,20 +634,27 @@ async function postPayment(
   const cashBase = Money.round2(Money.mul(totalAmount, paymentRate));
   let arBase = Money.zero();
   let discountBase = Money.zero();
-  // p1 fx: each application relieves home(balance before) - home(balance after), so the
-  // application that brings the foreign balance to zero clears exactly the home balance left
-  // (no stray cent on A/R after several partial payments; A/R == aging).
-  const runningBalance = new Map<string, ReturnType<typeof Money.zero>>();
+  // p1 fx: a foreign invoice is relieved by (home still on A/R for it) - home(balance after), so
+  // the payment that brings its foreign balance to zero clears exactly what is left on A/R
+  // (partial payments, a voided middle payment, credit applied later). See fxSubledger.ts.
+  const fxInvoiceIds = input.applications
+    .filter((a) => invoiceById.get(a.invoiceId)?.currency)
+    .map((a) => a.invoiceId);
+  const homeOpenNow = await invoiceHomeOpenNow(tx, fxInvoiceIds);
+  const fxReliefs: Array<{ invoiceId: string; amount: ReturnType<typeof Money.zero>; home: ReturnType<typeof Money.zero> }> = [];
   for (const app of input.applications) {
     const inv = invoiceById.get(app.invoiceId)!;
     const rate = Money.of(inv.exchangeRate ?? 1);
     const applied = Money.round2(app.amountApplied ?? 0);
     const disc = Money.round2(app.discountAmount ?? 0);
-    const before = runningBalance.get(app.invoiceId) ?? Money.of(inv.balanceDue);
-    const after = before.minus(applied).minus(disc);
-    runningBalance.set(app.invoiceId, after);
-    const relief = Money.round2(Money.mul(before, rate)).minus(Money.round2(Money.mul(after, rate)));
     const discHome = Money.round2(Money.mul(disc, rate));
+    let relief = Money.round2(Money.mul(applied, rate)).plus(discHome);
+    if (inv.currency) {
+      const after = Money.of(inv.balanceDue).minus(applied).minus(disc);
+      const homeBefore = homeOpenNow.get(app.invoiceId) ?? Money.round2(Money.mul(inv.balanceDue, rate));
+      relief = homeBefore.minus(homeAt(after, rate));
+      fxReliefs.push({ invoiceId: app.invoiceId, amount: applied.plus(disc), home: relief });
+    }
     arBase = arBase.plus(relief.minus(discHome));
     discountBase = discountBase.plus(discHome);
   }
@@ -742,6 +750,10 @@ async function postPayment(
     // transaction (no stale snapshots) and computes balanceDue against the billed
     // base (total minus retainage), keeping the subledger in sync with the GL.
     await markPaidAmount(tx, app.invoiceId, toAmountString(applied.plus(discount)));
+  }
+  // p1 fx: home A/R relieved on each foreign invoice (fxSubledger.ts).
+  for (const r of fxReliefs) {
+    await recordPaymentFxRelief(tx, { paymentId: payment.id, invoiceId: r.invoiceId, date: input.date, amount: r.amount, homeAmount: r.home });
   }
 
   // 4. Credits applied with this payment (recorded against it so a void/edit undoes them).
@@ -865,9 +877,17 @@ export async function getPayment(ctx: ServiceContext, id: string) {
 async function postFxAdjustmentForApplication(
   tx: ServiceContext,
   params: {
+    /** Invoice-currency amount moved from the payment's credit onto the invoice (apply) or back (unapply). */
     amount: Parameters<typeof Money.of>[0];
+    invoiceId: string;
+    invoiceCurrency: string | null | undefined;
     invoiceRate: string | number | null | undefined;
+    /** The invoice's balance due BEFORE this apply / unapply (invoice currency). */
+    invoiceBalanceBefore: Parameters<typeof Money.of>[0];
+    paymentId: string;
     paymentRate: string | number | null | undefined;
+    /** The payment's unapplied amount BEFORE this apply / unapply (payment currency). */
+    unappliedBefore: Parameters<typeof Money.of>[0];
     arAccountId: string;
     date: Date;
     sign: 1 | -1;
@@ -876,11 +896,35 @@ async function postFxAdjustmentForApplication(
   },
 ) {
   const amt = Money.of(params.amount);
-  const delta = Money.round2(
-    Money.mul(amt, Money.of(params.invoiceRate ?? 1)).minus(
-      Money.mul(amt, Money.of(params.paymentRate ?? 1)),
-    ),
-  ).times(params.sign);
+  let delta: ReturnType<typeof Money.zero>;
+  if (params.invoiceCurrency) {
+    // p1 fx: the invoice is relieved by (home still on A/R for it) - home(balance after), and the
+    // payment's credit by home(unapplied before) - home(unapplied after) at the payment's rate, so
+    // both the invoice and the credit left keep exactly the home amount the aging shows for them.
+    const invRate = Money.of(params.invoiceRate ?? 1);
+    const payRate = Money.of(params.paymentRate ?? 1);
+    const balAfter = Money.of(params.invoiceBalanceBefore).minus(amt.times(params.sign));
+    await ensureLegacyFxRelief(tx, { paymentId: params.paymentId, invoiceId: params.invoiceId, invoiceRate: invRate });
+    const homeBefore =
+      (await invoiceHomeOpenNow(tx, [params.invoiceId])).get(params.invoiceId) ??
+      Money.round2(Money.mul(params.invoiceBalanceBefore, invRate));
+    const invoiceRelief = homeBefore.minus(homeAt(balAfter, invRate)); // + = A/R credited on the invoice
+    const uBefore = Money.of(params.unappliedBefore);
+    const uAfter = uBefore.minus(amt.times(params.sign));
+    const creditUsed = homeAt(uBefore, payRate).minus(homeAt(uAfter, payRate)); // + = A/R debited (credit used up)
+    await recordPaymentFxRelief(tx, {
+      paymentId: params.paymentId,
+      invoiceId: params.invoiceId,
+      date: params.date,
+      amount: amt.times(params.sign),
+      homeAmount: invoiceRelief,
+    });
+    delta = Money.round2(invoiceRelief.minus(creditUsed));
+  } else {
+    delta = Money.round2(
+      Money.mul(amt, Money.of(params.invoiceRate ?? 1)).minus(Money.mul(amt, Money.of(params.paymentRate ?? 1))),
+    ).times(params.sign);
+  }
   if (delta.isZero()) return null;
 
   const fxAccountId = await getOrCreateExchangeGainLossId(tx);
@@ -994,6 +1038,7 @@ async function reversePaymentEffects(
 
   // 3. Remove application rows (history is preserved in the audit log).
   await tx.db.delete(paymentApplications).where(eq(paymentApplications.paymentId, payment.id));
+  await clearPaymentFxReliefs(tx, payment.id); // p1 fx: its A/R relief entries were voided above
 
   // 4. Undo credit memos applied with this payment.
   const creditApps = await tx.db
@@ -1412,7 +1457,7 @@ export async function unapplyFromInvoice(ctx: ServiceContext, input: UnapplyFrom
   }
 
   const [invoice] = await ctx.db
-    .select({ exchangeRate: invoices.exchangeRate })
+    .select({ exchangeRate: invoices.exchangeRate, currency: invoices.currency, balanceDue: invoices.balanceDue })
     .from(invoices)
     .where(and(eq(invoices.id, input.invoiceId), eq(invoices.companyId, ctx.companyId)));
   if (!invoice) throw notFound('Invoice');
@@ -1420,6 +1465,24 @@ export async function unapplyFromInvoice(ctx: ServiceContext, input: UnapplyFrom
   const arAccountId = await getArAccountId(ctx);
 
   return inTransaction(ctx, async (tx) => {
+    // 0. FX plug if the invoice was booked at a different rate than the payment (p1 fx: before the
+    //    application row changes, so the home amount still open is read as it was).
+    await postFxAdjustmentForApplication(tx, {
+      amount,
+      invoiceId: input.invoiceId,
+      invoiceCurrency: invoice.currency,
+      invoiceRate: invoice.exchangeRate,
+      invoiceBalanceBefore: invoice.balanceDue,
+      paymentId: input.paymentId,
+      paymentRate: payment.exchangeRate,
+      unappliedBefore: payment.unapplied,
+      arAccountId,
+      date: new Date(),
+      sign: -1,
+      description: 'FX adjustment — payment unapplied from invoice',
+      sourceRef: `payment:${input.paymentId}`,
+    });
+
     // 1. Restore the invoice's balanceDue / status.
     await markPaidAmount(tx, input.invoiceId, toAmountString(Money.neg(amount)));
 
@@ -1443,18 +1506,6 @@ export async function unapplyFromInvoice(ctx: ServiceContext, input: UnapplyFrom
       .set({ unapplied: toAmountString(newUnapplied) })
       .where(eq(paymentsReceived.id, input.paymentId))
       .returning();
-
-    // 4. FX plug if the invoice was booked at a different rate than the payment.
-    await postFxAdjustmentForApplication(tx, {
-      amount,
-      invoiceRate: invoice.exchangeRate,
-      paymentRate: payment.exchangeRate,
-      arAccountId,
-      date: new Date(),
-      sign: -1,
-      description: 'FX adjustment — payment unapplied from invoice',
-      sourceRef: `payment:${input.paymentId}`,
-    });
 
     await writeAudit(tx, {
       action: 'update',
@@ -1571,11 +1622,29 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
   const arAccountId = await getArAccountId(ctx);
 
   return inTransaction(ctx, async (tx) => {
+    let unappliedLeft = unapplied; // p1 fx: running payment credit for the FX relief rule
     for (const app of input.applications) {
       const applied = Money.round2(app.amountApplied);
       const appliedStr = toAmountString(applied);
       const inv = invoiceById.get(app.invoiceId)!;
 
+      // FX plug if the invoice was booked at a different rate than the payment settled at (p1 fx:
+      // before the application row changes, so the home amount still open is read as it was).
+      await postFxAdjustmentForApplication(tx, {
+        amount: applied,
+        invoiceId: app.invoiceId,
+        invoiceCurrency: inv.currency,
+        invoiceRate: inv.exchangeRate,
+        invoiceBalanceBefore: inv.balanceDue,
+        paymentId: input.paymentId,
+        paymentRate: payment.exchangeRate,
+        unappliedBefore: unappliedLeft,
+        arAccountId,
+        date: new Date(),
+        sign: 1,
+        description: 'FX adjustment — unapplied payment applied to invoice',
+        sourceRef: `payment:${input.paymentId}`,
+      });
       const existing = existingByInvoice.get(app.invoiceId);
       if (existing) {
         await tx.db
@@ -1594,17 +1663,7 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
 
       await markPaidAmount(tx, app.invoiceId, appliedStr);
 
-      // FX plug if the invoice was booked at a different rate than the payment settled at.
-      await postFxAdjustmentForApplication(tx, {
-        amount: applied,
-        invoiceRate: inv.exchangeRate,
-        paymentRate: payment.exchangeRate,
-        arAccountId,
-        date: new Date(),
-        sign: 1,
-        description: 'FX adjustment — unapplied payment applied to invoice',
-        sourceRef: `payment:${input.paymentId}`,
-      });
+      unappliedLeft = unappliedLeft.minus(applied);
     }
 
     const newUnapplied = Money.round2(unapplied.minus(sumApplied));

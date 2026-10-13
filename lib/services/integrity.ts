@@ -38,6 +38,8 @@ import { MIGRATIONS_FOLDER } from '@/lib/db';
 import { foreignKeyGaps } from '@/lib/db/ledgerGuards';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { foreignOpenReceivables } from './fxSubledger';
+import { foreignCode, homeCode } from './fxLines';
 import { journalOpenItems } from './journal';
 import { unappliedCustomerPayments } from './customerCredits';
 import { generalJournalSourceSql } from './posting';
@@ -197,11 +199,11 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
     return { name, ok: true, detail: 'Account 1200 (A/R) not found — check skipped.' };
   }
 
-  // Sum balanceDue across open/partial/overdue invoices for this company.
-  const [invRow] = await ctx.db
-    .select({
-      totalDue: sql<string>`COALESCE(SUM(${invoices.balanceDue}), 0)`,
-    })
+  // Sum balanceDue across open/partial/overdue invoices for this company. balanceDue is in the
+  // invoice's currency, so only home-currency invoices are summed here (p1 fx).
+  const home = await homeCode(ctx);
+  const openInv = await ctx.db
+    .select({ due: invoices.balanceDue, currency: invoices.currency })
     .from(invoices)
     .where(
       and(
@@ -210,6 +212,14 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
         sql`${invoices.status} IN ('open', 'partial', 'overdue')`,
       ),
     );
+  let homeDue = Money.zero();
+  for (const r of openInv) if (!foreignCode(r.currency, home)) homeDue = homeDue.plus(Money.of(r.due));
+  // p1 fx: foreign invoices count at the home amount still on A/R for them (the same numbers as
+  // A/R aging; fxSubledger.ts). Unapplied foreign payments are already in home currency below.
+  for (const it of await foreignOpenReceivables(ctx, new Date('9999-12-31T00:00:00Z'))) {
+    if (it.kind === 'invoice') homeDue = homeDue.plus(it.homeOpen);
+  }
+  const invRow = { totalDue: toAmountString(homeDue) };
 
   const arBalance = Money.of(arAccount.balance);
   // Named General Journal lines on A/R are customer open items too (journal.ts journalOpenItems).

@@ -135,3 +135,20 @@ CREATE TRIGGER bka_jel_fx_guard
   FOR EACH ROW EXECUTE FUNCTION bka_jel_fx_guard();
 --> statement-breakpoint
 ALTER TABLE journal_entry_lines ENABLE ALWAYS TRIGGER bka_jel_fx_guard;
+--> statement-breakpoint
+-- 6. payment_fx_reliefs: home A/R relieved on each foreign invoice by each received payment, so
+--    the payment that finishes an invoice clears exactly the home amount still on A/R.
+CREATE TABLE IF NOT EXISTS "payment_fx_reliefs" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"company_id" uuid NOT NULL REFERENCES "companies"("id"),
+	"payment_id" uuid NOT NULL REFERENCES "payments_received"("id"),
+	"invoice_id" uuid NOT NULL REFERENCES "invoices"("id"),
+	"date" timestamp NOT NULL,
+	"amount" numeric(15, 2) NOT NULL,
+	"home_amount" numeric(15, 2) NOT NULL,
+	"created_at" timestamp DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "payment_fx_reliefs_invoice_idx" ON "payment_fx_reliefs" ("invoice_id");
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "payment_fx_reliefs_payment_idx" ON "payment_fx_reliefs" ("payment_id");

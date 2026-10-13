@@ -1325,6 +1325,25 @@ export const homeCurrencyAdjustments = pgTable('home_currency_adjustments', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
+/**
+ * p1 fx (0043): home A/R relieved on a foreign-currency invoice by a received payment (receive,
+ * apply later, or - negative - unapply). The home amount still open on the invoice is its own A/R
+ * line minus these rows (fxSubledger.ts), so the last payment clears exactly what is left on A/R.
+ * Rows are deleted when the payment is voided or edited (its entries are voided with it).
+ */
+export const paymentFxReliefs = pgTable('payment_fx_reliefs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  paymentId: uuid('payment_id').references(() => paymentsReceived.id).notNull(),
+  invoiceId: uuid('invoice_id').references(() => invoices.id).notNull(),
+  date: timestamp('date').notNull(),
+  /** Invoice-currency amount (applied + discount; negative = unapplied). */
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  /** Home A/R relieved on the invoice (negative = put back). */
+  homeAmount: decimal('home_amount', { precision: 15, scale: 2 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
 // ---- Sales reps & commissions ----
 export const salesReps = pgTable('sales_reps', {
   id: uuid('id').primaryKey().defaultRandom(),

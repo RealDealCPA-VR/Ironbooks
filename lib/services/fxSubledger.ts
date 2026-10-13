@@ -6,7 +6,8 @@
  * payment posts the realized gain/loss) or a Home Currency Adjustment revalues it. These helpers
  * reconstruct, as of a date:
  *   invoice  foreign open = total - retainage - payments/discounts applied (payments dated <= asOf)
- *            home open    = the invoice's own A/R line - round2(each application x invoice rate)
+ *            home open    = the invoice's own A/R line - the home relief each payment recorded
+ *                           (payment_fx_reliefs; legacy rows: round2(each application x invoice rate))
  *   payment  (unapplied, foreign)  home = round2(unapplied x payment rate)
  *   bill     foreign open = total - bill-payment applications - foreign vendor-credit applications
  *            home open    = round2(total x bill rate) - home A/P each of them relieved
@@ -25,6 +26,7 @@ import {
   invoices,
   journalEntryLines,
   paymentApplications,
+  paymentFxReliefs,
   paymentsReceived,
   vendorCreditApplications,
   vendorCredits,
@@ -50,6 +52,175 @@ export interface ForeignOpenItem {
 }
 
 const r2 = (v: Decimal | string | number) => Money.round2(v);
+
+/** Home value of a foreign amount at a rate (round2); exactly 0 when nothing is left. */
+export function homeAt(foreign: Decimal, rate: Decimal | string | number): Decimal {
+  return foreign.isZero() ? Money.zero() : r2(foreign.times(Money.of(rate)));
+}
+
+type InvoiceOpenRow = {
+  id: string;
+  rate: string | null;
+  total: string;
+  retainage: string | null;
+  postedEntryId: string | null;
+};
+
+/**
+ * Foreign and home amounts still open on each invoice as of a date (or now). The home amount is
+ * what is actually on A/R for it: the invoice's own A/R line minus the home relief recorded for
+ * each payment applied to it (payment_fx_reliefs, written by the same transaction that posted the
+ * A/R relief). Applications made before those records existed (an upgraded company) fall back to
+ * round2(applied x invoice rate) per application.
+ */
+async function invoiceOpenAmounts(
+  ctx: ServiceContext,
+  rows: InvoiceOpenRow[],
+  asOf?: Date,
+): Promise<Map<string, { foreign: Decimal; homeOpen: Decimal }>> {
+  const out = new Map<string, { foreign: Decimal; homeOpen: Decimal }>();
+  if (rows.length === 0) return out;
+  const ids = rows.map((i) => i.id);
+  const entryIds = rows.map((i) => i.postedEntryId).filter((x): x is string => !!x);
+  // The invoice's own A/R line (home), exactly as posted.
+  const arRows = entryIds.length
+    ? await ctx.db
+        .select({
+          entryId: journalEntryLines.journalEntryId,
+          net: sql<string>`COALESCE(SUM(COALESCE(${journalEntryLines.debit}, 0) - COALESCE(${journalEntryLines.credit}, 0)), 0)`,
+        })
+        .from(journalEntryLines)
+        .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+        .where(and(inArray(journalEntryLines.journalEntryId, entryIds), eq(accounts.subtype, 'accounts_receivable')))
+        .groupBy(journalEntryLines.journalEntryId)
+    : [];
+  const arByEntry = new Map(arRows.map((r) => [r.entryId, Money.of(r.net)]));
+  const live = asOf
+    ? and(isNull(paymentsReceived.voidedAt), lte(paymentsReceived.date, asOf))
+    : isNull(paymentsReceived.voidedAt);
+  const apps = await ctx.db
+    .select({
+      invoiceId: paymentApplications.invoiceId,
+      paymentId: paymentApplications.paymentId,
+      applied: paymentApplications.amountApplied,
+      discount: paymentApplications.discountAmount,
+    })
+    .from(paymentApplications)
+    .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
+    .where(and(inArray(paymentApplications.invoiceId, ids), live));
+  const reliefs = await ctx.db
+    .select({
+      invoiceId: paymentFxReliefs.invoiceId,
+      paymentId: paymentFxReliefs.paymentId,
+      date: paymentFxReliefs.date,
+      home: paymentFxReliefs.homeAmount,
+    })
+    .from(paymentFxReliefs)
+    .innerJoin(paymentsReceived, eq(paymentFxReliefs.paymentId, paymentsReceived.id))
+    .where(and(inArray(paymentFxReliefs.invoiceId, ids), live));
+  const hasRelief = new Set(reliefs.map((x) => `${x.invoiceId}|${x.paymentId}`));
+  const reliefBy = new Map<string, Decimal>();
+  for (const x of reliefs) {
+    // An apply / unapply after the cut-off date relieved A/R on its own date.
+    if (asOf && x.date.getTime() > asOf.getTime()) continue;
+    reliefBy.set(x.invoiceId, (reliefBy.get(x.invoiceId) ?? Money.zero()).plus(Money.of(x.home)));
+  }
+  const appsBy = new Map<string, typeof apps>();
+  for (const a of apps) appsBy.set(a.invoiceId, [...(appsBy.get(a.invoiceId) ?? []), a]);
+  for (const i of rows) {
+    const rate = Money.of(i.rate ?? 1);
+    let foreign = Money.of(i.total).minus(Money.of(i.retainage ?? 0));
+    let homeOpen =
+      i.postedEntryId && arByEntry.has(i.postedEntryId) ? arByEntry.get(i.postedEntryId)! : r2(foreign.times(rate));
+    homeOpen = homeOpen.minus(reliefBy.get(i.id) ?? Money.zero());
+    for (const a of appsBy.get(i.id) ?? []) {
+      foreign = foreign.minus(Money.of(a.applied)).minus(Money.of(a.discount ?? 0));
+      if (!hasRelief.has(`${i.id}|${a.paymentId}`)) {
+        homeOpen = homeOpen.minus(r2(r2(a.applied).times(rate))).minus(r2(r2(a.discount ?? 0).times(rate)));
+      }
+    }
+    out.set(i.id, { foreign, homeOpen });
+  }
+  return out;
+}
+
+/**
+ * Home amount still on A/R for each of these invoices right now (see invoiceOpenAmounts). Used by
+ * payments.ts so that a payment relieves A/R by (home open now) - homeAt(balance after): the
+ * payment that brings the foreign balance to zero clears exactly what is left, whatever happened
+ * before (partial payments, a voided middle payment, credit applied later).
+ */
+export async function invoiceHomeOpenNow(ctx: ServiceContext, invoiceIds: string[]): Promise<Map<string, Decimal>> {
+  const ids = [...new Set(invoiceIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await ctx.db
+    .select({
+      id: invoices.id,
+      rate: invoices.exchangeRate,
+      total: invoices.total,
+      retainage: invoices.retainageAmount,
+      postedEntryId: invoices.postedEntryId,
+    })
+    .from(invoices)
+    .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, ids)));
+  const open = await invoiceOpenAmounts(ctx, rows);
+  return new Map([...open].map(([k, v]) => [k, v.homeOpen]));
+}
+
+/** Record the home A/R a payment relieved (or, negative, put back) on a foreign invoice. */
+export async function recordPaymentFxRelief(
+  ctx: ServiceContext,
+  input: { paymentId: string; invoiceId: string; date: Date; amount: Decimal; homeAmount: Decimal },
+): Promise<void> {
+  await ctx.db.insert(paymentFxReliefs).values({
+    companyId: ctx.companyId,
+    paymentId: input.paymentId,
+    invoiceId: input.invoiceId,
+    date: input.date,
+    amount: r2(input.amount).toFixed(2),
+    homeAmount: r2(input.homeAmount).toFixed(2),
+  });
+}
+
+/**
+ * An application made before relief records existed (an upgraded company) relieved A/R by
+ * round2(applied x rate) + round2(discount x rate). Before such an application is changed (apply
+ * more / unapply), write that as its baseline record so the home amount still open stays the same.
+ */
+export async function ensureLegacyFxRelief(
+  ctx: ServiceContext,
+  input: { paymentId: string; invoiceId: string; invoiceRate: Decimal | string | number },
+): Promise<void> {
+  const [has] = await ctx.db
+    .select({ id: paymentFxReliefs.id })
+    .from(paymentFxReliefs)
+    .where(and(eq(paymentFxReliefs.paymentId, input.paymentId), eq(paymentFxReliefs.invoiceId, input.invoiceId)))
+    .limit(1);
+  if (has) return;
+  const [app] = await ctx.db
+    .select({
+      applied: paymentApplications.amountApplied,
+      discount: paymentApplications.discountAmount,
+      date: paymentsReceived.date,
+    })
+    .from(paymentApplications)
+    .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
+    .where(and(eq(paymentApplications.paymentId, input.paymentId), eq(paymentApplications.invoiceId, input.invoiceId)));
+  if (!app) return;
+  const rate = Money.of(input.invoiceRate);
+  await recordPaymentFxRelief(ctx, {
+    paymentId: input.paymentId,
+    invoiceId: input.invoiceId,
+    date: app.date,
+    amount: Money.of(app.applied).plus(Money.of(app.discount ?? 0)),
+    homeAmount: r2(r2(app.applied).times(rate)).plus(r2(r2(app.discount ?? 0).times(rate))),
+  });
+}
+
+/** Forget a payment's relief records (its entries are being voided: void or edit). */
+export async function clearPaymentFxReliefs(ctx: ServiceContext, paymentId: string): Promise<void> {
+  await ctx.db.delete(paymentFxReliefs).where(eq(paymentFxReliefs.paymentId, paymentId));
+}
 
 /** Open foreign-currency A/R items (invoices and unapplied payments) as of a date. */
 export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): Promise<ForeignOpenItem[]> {
@@ -80,46 +251,10 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
   const foreignInv = inv.filter((i) => foreignCode(i.currency, home));
   const out: ForeignOpenItem[] = [];
   if (foreignInv.length > 0) {
-    const ids = foreignInv.map((i) => i.id);
-    const entryIds = foreignInv.map((i) => i.postedEntryId).filter((x): x is string => !!x);
-    // The invoice's own A/R line (home), exactly as posted.
-    const arRows = entryIds.length
-      ? await ctx.db
-          .select({
-            entryId: journalEntryLines.journalEntryId,
-            net: sql<string>`COALESCE(SUM(COALESCE(${journalEntryLines.debit}, 0) - COALESCE(${journalEntryLines.credit}, 0)), 0)`,
-          })
-          .from(journalEntryLines)
-          .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
-          .where(and(inArray(journalEntryLines.journalEntryId, entryIds), eq(accounts.subtype, 'accounts_receivable')))
-          .groupBy(journalEntryLines.journalEntryId)
-      : [];
-    const arByEntry = new Map(arRows.map((r) => [r.entryId, Money.of(r.net)]));
-    const apps = await ctx.db
-      .select({
-        invoiceId: paymentApplications.invoiceId,
-        applied: paymentApplications.amountApplied,
-        discount: paymentApplications.discountAmount,
-      })
-      .from(paymentApplications)
-      .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
-      .where(
-        and(
-          inArray(paymentApplications.invoiceId, ids),
-          isNull(paymentsReceived.voidedAt),
-          lte(paymentsReceived.date, asOf),
-        ),
-      );
-    const appsBy = new Map<string, typeof apps>();
-    for (const a of apps) appsBy.set(a.invoiceId, [...(appsBy.get(a.invoiceId) ?? []), a]);
+    const open = await invoiceOpenAmounts(ctx, foreignInv, asOf);
     for (const i of foreignInv) {
       const rate = Money.of(i.rate ?? 1);
-      let foreign = Money.of(i.total).minus(Money.of(i.retainage ?? 0));
-      let homeOpen = i.postedEntryId && arByEntry.has(i.postedEntryId) ? arByEntry.get(i.postedEntryId)! : r2(foreign.times(rate));
-      for (const a of appsBy.get(i.id) ?? []) {
-        foreign = foreign.minus(Money.of(a.applied)).minus(Money.of(a.discount ?? 0));
-        homeOpen = homeOpen.minus(r2(r2(a.applied).times(rate))).minus(r2(r2(a.discount ?? 0).times(rate)));
-      }
+      const { foreign, homeOpen } = open.get(i.id)!;
       if (foreign.isZero() && homeOpen.isZero()) continue;
       out.push({
         kind: 'invoice',
