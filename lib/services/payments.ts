@@ -178,7 +178,8 @@ async function getArAccountId(ctx: ServiceContext): Promise<string> {
 
 /**
  * Home-currency A/R still open on an invoice: what the invoice put on A/R (its posted entry's net
- * A/R debit) minus the home A/R every live Receive Payments application on it already relieved.
+ * A/R debit) minus the home A/R every live Receive Payments application on it already relieved
+ * and the home amount of every credit memo applied to it.
  * Only foreign-currency invoices need this (home invoices relieve exactly the amount applied).
  */
 async function invoiceOpenHome(
@@ -217,6 +218,14 @@ async function invoiceOpenHome(
     .where(and(eq(paymentApplications.invoiceId, inv.id), isNull(paymentsReceived.voidedAt)));
   let relieved = Money.zero();
   for (const a of apps) relieved = relieved.plus(applicationHome(a, rate));
+  // Credit memos have no currency: one applied to this invoice (creditMemos.applyToInvoice) took
+  // its home amount off A/R when the memo posted, so that part is no longer open either.
+  // (Unapplying a credit deletes its row, so every remaining row is live.)
+  const [credits] = await tx.db
+    .select({ total: sql<string>`COALESCE(SUM(${creditApplications.amount}), 0)` })
+    .from(creditApplications)
+    .where(and(eq(creditApplications.invoiceId, inv.id), eq(creditApplications.companyId, tx.companyId)));
+  relieved = relieved.plus(Money.of(credits?.total ?? 0));
   return Money.round2(anchor.minus(relieved));
 }
 

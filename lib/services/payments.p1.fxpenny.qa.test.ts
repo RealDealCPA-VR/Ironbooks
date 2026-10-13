@@ -22,7 +22,7 @@ import { createCustomer } from './customers';
 import { arAging } from './reportsExtra';
 import { trialBalance } from './reports';
 import { createInvoice } from './invoices';
-import { createCreditMemo, applyToInvoice } from './creditMemos';
+import { createCreditMemo, applyToInvoice, unapplyCreditApplication } from './creditMemos';
 import { setBaseCurrency, upsertCurrency } from './currencies';
 import { applyPayment, receivePayment, unapplyFromInvoice, updatePayment, voidPayment } from './payments';
 
@@ -422,5 +422,41 @@ describe('Re-test: other documents that reduce a foreign invoice balance', () =>
     await pay(co, '2026-05-03', '90.05', [{ invoiceId: inv.id, amountApplied: '90.05' }]);
     expect((await invoiceRow(inv.id)).status).toBe('paid');
     expect(await arControl(co.c)).toBeCloseTo(0, 2);
+  });
+});
+
+describe('Fix round 2: home credit memos on a foreign invoice still close A/R to 0', () => {
+  async function memo(co: Co, amt: string) {
+    return createCreditMemo(co.c, {
+      customerId: co.cust,
+      date: D('2026-05-02'),
+      lines: [{ accountId: co.code['4000'], description: 'Credit', quantity: 1, rate: amt, taxable: false }],
+    } as Parameters<typeof createCreditMemo>[1]);
+  }
+
+  it('credit, then a part-payment at a new rate, then the payoff', async () => {
+    const co = await freshCompany();
+    const inv = await eurInvoice(co);
+    const m = await memo(co, '10.00');
+    await applyToInvoice(co.c, { creditMemoId: m.id, invoiceId: inv.id, amount: '10.00' });
+    await pay(co, '2026-05-03', '40.00', [{ invoiceId: inv.id, amountApplied: '40.00' }], '1.20');
+    expect((await trialBalance(co.c, AS_OF)).balanced).toBe(true);
+    await pay(co, '2026-05-04', '50.05', [{ invoiceId: inv.id, amountApplied: '50.05' }], '1.05');
+    expect((await invoiceRow(inv.id)).status).toBe('paid');
+    expect((await trialBalance(co.c, AS_OF)).balanced).toBe(true);
+    expect(await arControl(co.c)).toBeCloseTo(0, 2);
+  });
+
+  it('a credit unapplied before the payoff is no longer subtracted', async () => {
+    const co = await freshCompany();
+    const inv = await eurInvoice(co);
+    const m = await memo(co, '10.00');
+    const res = await applyToInvoice(co.c, { creditMemoId: m.id, invoiceId: inv.id, amount: '10.00' });
+    await unapplyCreditApplication(co.c, res.application.id);
+    await pay(co, '2026-05-03', '100.05', [{ invoiceId: inv.id, amountApplied: '100.05' }]);
+    expect((await invoiceRow(inv.id)).status).toBe('paid');
+    // The memo's 10.00 credit is still open on A/R (unapplied), everything else is closed.
+    expect(await arControl(co.c)).toBeCloseTo(-10, 2);
+    expect((await trialBalance(co.c, AS_OF)).balanced).toBe(true);
   });
 });
