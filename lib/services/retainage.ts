@@ -150,12 +150,19 @@ export async function retainageReport(
     .select({
       sourceRef: journalEntries.sourceRef,
       net: sql<string>`SUM(CAST(COALESCE(${journalEntryLines.debit}, '0') AS NUMERIC) - CAST(COALESCE(${journalEntryLines.credit}, '0') AS NUMERIC))`,
+      debit: sql<string>`SUM(CAST(COALESCE(${journalEntryLines.debit}, '0') AS NUMERIC))`,
+      credit: sql<string>`SUM(CAST(COALESCE(${journalEntryLines.credit}, '0') AS NUMERIC))`,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
     .where(and(...glConds))
     .groupBy(journalEntries.sourceRef);
   const glNet = new Map(glByInvoice.map((r) => [r.sourceRef ?? '', Money.of(r.net ?? '0')]));
+  // The posted 1250 amounts per invoice (home currency). postInvoiceGL penny-allocates the
+  // home-currency entry, so for foreign-currency invoices round2(amount x rate) can be a cent
+  // off; held/billed come from the invoice's own 1250 journal lines when it has them.
+  const glDebit = new Map(glByInvoice.map((r) => [r.sourceRef ?? '', Money.of(r.debit ?? '0')]));
+  const glCredit = new Map(glByInvoice.map((r) => [r.sourceRef ?? '', Money.of(r.credit ?? '0')]));
   const accountBalance = glByInvoice.reduce((s, r) => s.plus(Money.of(r.net ?? '0')), Money.zero());
 
   const custIds = [...new Set([...heldRows, ...billedRows].map((r) => r.customerId))];
@@ -180,14 +187,14 @@ export async function retainageReport(
   };
   for (const r of heldRows) {
     const a = acc(r.customerId);
-    const amt = Money.round2(Money.mul(r.retainageAmount, r.exchangeRate ?? '1'));
+    const amt = Money.round2(glDebit.get(`invoice:${r.id}`) ?? Money.mul(r.retainageAmount, r.exchangeRate ?? '1'));
     a.held = a.held.plus(amt);
     a.invIds.add(r.id);
     a.docs.push({ invoiceId: r.id, refNumber: docRef(r.refNumber, r.invoiceNumber), date: iso(r.date), kind: 'held', amount: toAmountString(amt) });
   }
   for (const r of billedRows) {
     const a = acc(r.customerId);
-    const amt = Money.round2(Money.mul(r.amount ?? '0', r.exchangeRate ?? '1'));
+    const amt = Money.round2(glCredit.get(`invoice:${r.id}`) ?? Money.mul(r.amount ?? '0', r.exchangeRate ?? '1'));
     a.billed = a.billed.plus(amt);
     a.invIds.add(r.id);
     a.docs.push({ invoiceId: r.id, refNumber: docRef(r.refNumber, r.invoiceNumber), date: iso(r.date), kind: 'billed', amount: toAmountString(amt) });

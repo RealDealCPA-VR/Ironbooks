@@ -21,7 +21,7 @@ import { unappliedPaymentsByCustomer } from './customerCredits';
 import { journalBalancesByEntity } from './journal';
 import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
 import { getPreferences } from './preferences';
-import { defaultShipTo, normalizeShipToAddresses, type ShipToAddress } from '@/lib/shipTo';
+import { defaultShipTo, normalizeShipToAddresses, shipToAddressFields, type ShipToAddress } from '@/lib/shipTo';
 
 /** Validate the named ship-to list; the default one also becomes `shippingAddress`. */
 function resolveShipTos(list: Array<Partial<ShipToAddress>> | null | undefined): ShipToAddress[] | null {
@@ -30,6 +30,23 @@ function resolveShipTos(list: Array<Partial<ShipToAddress>> | null | undefined):
   } catch (err) {
     throw validation((err as Error).message);
   }
+}
+
+/** The saved ship-to list with its default entry's address replaced (or removed when blank). */
+function shipToListWithDefault(
+  list: Array<Record<string, unknown>> | null | undefined,
+  address: object | null | undefined,
+): Array<Record<string, unknown>> {
+  const fields = shipToAddressFields(address);
+  const blank = Object.keys(fields).length === 0;
+  const rows = Array.isArray(list) ? list.filter((a) => a && typeof a === 'object') : [];
+  const di = rows.findIndex((a) => a.isDefault === true);
+  const idx = di >= 0 ? di : rows.length ? 0 : -1;
+  if (idx < 0) return blank ? [] : [{ name: 'Ship To 1', ...fields, isDefault: true }];
+  if (blank) return rows.filter((_, i) => i !== idx).map((a) => ({ ...a, isDefault: false }));
+  return rows.map((a, i) =>
+    i === idx ? { name: a.name, ...fields, isDefault: true } : { ...a, isDefault: false },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +289,14 @@ export async function updateCustomer(
   }
 
   const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
-  const shipTos = patch.shipToAddresses !== undefined ? resolveShipTos(patch.shipToAddresses) : undefined;
+  let shipTos = patch.shipToAddresses !== undefined ? resolveShipTos(patch.shipToAddresses) : undefined;
+  if (shipTos === undefined && patch.shippingAddress !== undefined) {
+    // Editing only the shipping address edits the default ship-to (as in QuickBooks), so new
+    // sales forms default to the new address. Clearing it drops the default entry.
+    shipTos = resolveShipTos(
+      shipToListWithDefault(before.shipToAddresses as Array<Record<string, unknown>> | null, patch.shippingAddress),
+    );
+  }
   const taxCode =
     patch.salesTaxCodeId !== undefined && patch.salesTaxCodeId !== null
       ? await resolveSalesTaxCode(ctx, patch.salesTaxCodeId)
@@ -296,9 +320,7 @@ export async function updateCustomer(
       shippingAddress:
         shipTos !== undefined
           ? defaultShipTo(shipTos as never)
-          : patch.shippingAddress !== undefined
-            ? (patch.shippingAddress as Record<string, string>) ?? null
-            : before.shippingAddress,
+          : before.shippingAddress,
       shipToAddresses:
         shipTos !== undefined
           ? ((shipTos as Array<Record<string, string | boolean>> | null) ?? null)
