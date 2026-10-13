@@ -1,14 +1,18 @@
 # Releasing & Auto-Update
 
 BookKeeper AI desktop ships auto-update via [`electron-updater`](https://www.electron.build/auto-update)
-against **GitHub Releases**. Installed apps check the repo's Releases on every launch, download a
-newer version in the background, and then show an in-app **"Update ready"** banner with a
-**Restart & install now** button (`components/DesktopBridge.tsx`). Clicking it quits, installs, and
-relaunches into the new version immediately; choosing **Later** lets the update install automatically
-on the next normal quit/relaunch.
+against **GitHub Releases**. Installed apps check the repo's Releases at launch, every 4 hours, and
+from **Help → Check for Updates…**. When a newer release is published they show an in-app
+**"Update available"** banner (`components/DesktopBridge.tsx`) offering **Download & install** or
+**Later**; nothing downloads until the user agrees. After the download the banner offers
+**Restart & install now**; choosing **Later** installs the update on the next normal quit.
+Update checks are on by default (version + platform only); a company can turn them off in
+Privacy & Network, and Offline mode blocks them.
 
 - **Feed:** configured in `package.json` → `build.publish` (`github` / `RealDealCPA-VR` / `Open-Source-QB`).
-- **Renderer wiring:** `electron/main.js` `checkForUpdates()` → `update-downloaded` → `components/DesktopBridge.tsx` toast.
+- **Renderer wiring:** `electron/main.js` `checkForUpdates()` → `update` IPC channel (`available` →
+  `downloading` → `ready` / `error`) → `components/DesktopBridge.tsx` banner; the user's choices go
+  back over `app:downloadUpdate` / `app:quitAndInstall`.
 - **Update granularity:** electron-updater swaps the **entire installed package** — the Electron shell,
   the bundled Next.js standalone server, and the `drizzle/` migrations all update together atomically.
 
@@ -46,9 +50,11 @@ their next launch.
 
 ## What happens on the user's machine
 
-1. App launches → `checkForUpdatesAndNotify()` queries the latest GitHub Release.
-2. If its version > the installed version, the installer downloads in the background.
-3. `update-downloaded` fires → the **"Update ready"** banner appears. The user can click
+1. At launch (and every 4 hours, or Help → Check for Updates…) `checkForUpdates()` asks the
+   company's Privacy & Network policy, then queries the latest GitHub Release.
+2. If its version > the installed version, the **"Update available"** banner appears. **Download &
+   install** downloads it (with a progress bar); **Later** hides it until the next check.
+3. `update-downloaded` fires → the banner switches to **"Update ready"**. The user can click
    **Restart & install now** (quits, installs, relaunches immediately via the `app:quitAndInstall`
    IPC handler) or **Later**.
 4. If they chose Later, the NSIS updater applies it on the next quit; relaunch runs the new version.

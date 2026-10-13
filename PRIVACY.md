@@ -15,7 +15,7 @@ This document lists everything that can leave the machine, and what controls it.
 | AI (assistant, categorization, AI Review "Analyze") | Model servers on this computer, your LAN or your tailnet by default; a cloud AI provider only if opted in (and then redacted) | AI & Automation (providers) + Privacy & Network → AI assistance |
 | Emailing an invoice | Only the message and PDF you send, to your SMTP server | Privacy & Network → Email |
 | Bank feeds (Plaid) | Plaid credentials and the bank link token; transactions download into the file | Privacy & Network → Bank feeds |
-| Update checks | App version and platform only (no company data) | Privacy & Network → App updates |
+| Update checks | App version and platform only (no company data); **on by default** | Privacy & Network → App updates |
 | Telemetry / analytics / crash reports | **None.** | — |
 | Web fonts / CDNs | **None.** Fonts are bundled at build time. | — |
 
@@ -30,11 +30,12 @@ change it; every change is written to the audit trail.
   - your private LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, IPv6 `fc00::/7`),
   - your Tailscale tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`).
 
-  It never connects to the public internet. This is enough for multi-user hosting, an SMTP
-  relay on your network, or an AI model running on a computer you own.
+  It never connects to the public internet, except the app update check (version and platform
+  only, to GitHub Releases), which is on by default and can be turned off. This is enough for
+  multi-user hosting, an SMTP relay on your network, or an AI model running on a computer you own.
 - **Allow cloud services I choose** — as above, plus the public internet **only** for the
-  purposes you switch on individually (AI, email, bank feeds, updates). All four are off until
-  you turn them on.
+  purposes you switch on individually (AI, email, bank feeds). Those are off until you turn them
+  on; update checks stay on unless you turn them off.
 
 Hostnames other than `localhost` and `*.ts.net` are treated as public internet, because a
 name can resolve anywhere. Link-local and cloud-metadata addresses (`169.254.0.0/16`,
@@ -68,8 +69,9 @@ of that cap and the company setting. A value that is set but not recognised coun
     off, because Chromium would otherwise download dictionaries.
   - The page also sends a strict Content-Security-Policy and related headers
     (`next.config.js`).
-  - **Updates** are checked only when the company allows the *App updates* purpose. By default
-    the app does not check.
+  - **Updates** are checked unless the company turns off the *App updates* purpose (or is in
+    Offline mode, or the computer's `BKA_NETWORK_MODE` ceiling is below allow-cloud). The app
+    asks before downloading a new version.
   - Next.js telemetry is disabled for the app server (`NEXT_TELEMETRY_DISABLED=1`).
 
 User actions that open your system browser are not data transfers by the app. These are

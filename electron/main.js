@@ -776,8 +776,9 @@ function buildMenu() {
       submenu: [
         { label: 'Run Setup Interview…', click: () => navigate('/onboarding') },
         { type: 'separator' },
+        { label: 'Check for Updates…', click: () => { checkForUpdates({ manual: true }); } },
         { label: 'BookKeeper AI on the web', click: () => shell.openExternal('https://github.com/') },
-        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { message: 'BookKeeper AI', detail: 'Open-source desktop accounting with AI error correction.' }) },
+        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { message: 'BookKeeper AI', detail: `Version ${app.getVersion()}\nOpen-source desktop accounting with AI error correction.` }) },
       ],
     },
   ];
@@ -1061,8 +1062,20 @@ app.on('second-instance', (_event, argv) => {
   }
 });
 
-// Held so the 'app:quitAndInstall' IPC handler can apply a downloaded update on demand.
+// ---- App updates (electron-updater + the GitHub Releases feed in package.json build.publish) ----
+// Checks run at startup, every few hours, and from Help > Check for Updates. When a newer release
+// is published the renderer shows an "Update available" banner (components/DesktopBridge.tsx);
+// nothing is downloaded until the user clicks Download & install. Once downloaded they can restart
+// now, or it installs the next time the app quits.
 let autoUpdater = null;
+/** { state: 'idle'|'checking'|'none'|'available'|'downloading'|'ready'|'error', version?, percent?, message? } */
+let updateState = { state: 'idle' };
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+
+function setUpdateState(next) {
+  updateState = next;
+  mainWindow?.webContents.send('update', next);
+}
 
 /** The release feed electron-updater will contact (package.json build.publish). */
 function updateFeedUrl() {
@@ -1077,12 +1090,16 @@ function updateFeedUrl() {
 }
 
 /**
- * Local-only: update checks contact the release feed on the internet, so they run only when
- * the company's Privacy & Network policy allows the 'updates' purpose (allow-cloud mode + the
- * updates opt-in). Default: no update checks. Never in dev or as a multi-user client.
+ * Local-only: update checks contact the release feed on the internet (app version + platform
+ * only), so they ask the company's Privacy & Network policy first. They are on by default and
+ * blocked in offline mode or when the company turns them off. Never as a multi-user client
+ * (the host computer updates itself). Resolves { allowed, reason }.
  */
 async function updatesAllowed() {
-  if (!serverUrl || remoteHostOrigin) return false;
+  if (remoteHostOrigin) {
+    return { allowed: false, reason: 'This computer is connected to a host; update the app on the host computer.' };
+  }
+  if (!serverUrl) return { allowed: false, reason: 'The app has not finished starting.' };
   try {
     const q = new URLSearchParams({ purpose: 'updates', url: updateFeedUrl() });
     const res = await fetch(`${serverUrl}/api/network-policy/check?${q}`, {
@@ -1090,36 +1107,99 @@ async function updatesAllowed() {
       signal: AbortSignal.timeout(5000),
     });
     const d = res.ok ? await res.json() : null;
-    return Boolean(d && d.allowed === true);
+    if (d && d.allowed === true) return { allowed: true, reason: '' };
+    return { allowed: false, reason: (d && d.reason) || 'Update checks are not allowed right now.' };
   } catch {
-    return false;
+    return { allowed: false, reason: 'Could not read the Privacy & Network settings.' };
   }
 }
 
-async function checkForUpdates() {
-  if (isDev) return;
-  if (!(await updatesAllowed())) {
-    console.log('[updates] skipped: not allowed by this company\'s Privacy & Network settings');
+function getUpdater() {
+  if (autoUpdater) return autoUpdater;
+  try {
+    ({ autoUpdater } = require('electron-updater'));
+  } catch {
+    return null; // electron-updater not bundled
+  }
+  autoUpdater.autoDownload = false; // ask first
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on('update-available', (info) => {
+    // A periodic re-check must not knock a download in progress (or a staged update) back.
+    if (['downloading', 'ready'].includes(updateState.state) && updateState.version === info.version) return;
+    setUpdateState({ state: 'available', version: info.version });
+  });
+  autoUpdater.on('download-progress', (p) => {
+    setUpdateState({ state: 'downloading', version: updateState.version, percent: Math.round(p.percent || 0) });
+  });
+  autoUpdater.on('update-downloaded', (info) => {
+    setUpdateState({ state: 'ready', version: info.version });
+  });
+  autoUpdater.on('error', (err) => {
+    // Check failures (e.g. no internet) stay quiet; a failed download is reported.
+    if (updateState.state === 'downloading') {
+      setUpdateState({ state: 'error', version: updateState.version, message: String(err?.message || err) });
+    }
+  });
+  return autoUpdater;
+}
+
+function updateDialog(message, detail) {
+  if (mainWindow) dialog.showMessageBox(mainWindow, { type: 'info', message, detail, buttons: ['OK'] });
+}
+
+/** Check the release feed. `manual` (Help menu) reports every outcome in a dialog. */
+async function checkForUpdates({ manual = false } = {}) {
+  if (isDev) {
+    if (manual) updateDialog('Update checks are off in development builds.');
+    return;
+  }
+  // Already found / downloading / staged: just show the banner again.
+  if (['available', 'downloading', 'ready'].includes(updateState.state)) {
+    if (manual) mainWindow?.webContents.send('update', { ...updateState, reshow: true });
+    return;
+  }
+  const policy = await updatesAllowed();
+  if (!policy.allowed) {
+    console.log(`[updates] skipped: ${policy.reason}`);
+    if (manual) updateDialog('Update checks are turned off.', policy.reason);
+    return;
+  }
+  const updater = getUpdater();
+  if (!updater) {
+    if (manual) updateDialog('Automatic updates are not available in this build.');
     return;
   }
   try {
-    // electron-updater reads the publish config baked in at build time. No-ops if none is set.
-    ({ autoUpdater } = require('electron-updater'));
-    autoUpdater.autoDownload = true;
-    autoUpdater.on('update-downloaded', () => {
-      mainWindow?.webContents.send('menu', 'update-ready');
-    });
-    autoUpdater.checkForUpdatesAndNotify().catch(() => {});
-  } catch {
-    // electron-updater not available / no feed configured — ignore.
-    autoUpdater = null;
+    const result = await updater.checkForUpdates();
+    // 'update-available' has already moved the state on when there is something new.
+    if (manual && !result?.isUpdateAvailable) {
+      updateDialog('You have the latest version.', `BookKeeper AI ${app.getVersion()} is up to date.`);
+    }
+  } catch (err) {
+    console.log('[updates] check failed:', err?.message || err);
+    if (manual) updateDialog('Could not check for updates.', String(err?.message || err));
   }
 }
 
-// Renderer "Restart & install now" button -> apply the downloaded update immediately.
+ipcMain.handle('app:updateStatus', () => updateState);
+ipcMain.handle('app:checkForUpdates', () => checkForUpdates({ manual: true }));
+
+// Renderer "Download & install" -> download the update that was found.
+ipcMain.handle('app:downloadUpdate', () => {
+  if (!autoUpdater || !['available', 'error'].includes(updateState.state)) return false;
+  setUpdateState({ state: 'downloading', version: updateState.version, percent: 0 });
+  autoUpdater.downloadUpdate().catch((err) => {
+    if (updateState.state === 'downloading') {
+      setUpdateState({ state: 'error', version: updateState.version, message: String(err?.message || err) });
+    }
+  });
+  return true;
+});
+
+// Renderer "Restart & install now" -> apply the downloaded update immediately.
 // Returns false if no update is staged (the UI then tells the user to restart manually).
 ipcMain.handle('app:quitAndInstall', () => {
-  if (!autoUpdater) return false;
+  if (!autoUpdater || updateState.state !== 'ready') return false;
   // Defer so the IPC reply is sent before the app tears down; relaunch after install.
   setImmediate(() => {
     try {
@@ -1141,6 +1221,7 @@ app.whenReady().then(async () => {
   });
   await createWindow();
   checkForUpdates();
+  setInterval(() => checkForUpdates(), UPDATE_CHECK_INTERVAL_MS).unref?.();
 });
 
 app.on('window-all-closed', () => {

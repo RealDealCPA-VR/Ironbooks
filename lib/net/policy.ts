@@ -10,8 +10,13 @@
  *   tailnet-only  — DEFAULT. Loopback, the private LAN (RFC 1918 / IPv6 ULA) and the Tailscale
  *                   tailnet (100.64.0.0/10, *.ts.net) are reachable; the public internet is not.
  *   allow-cloud   — as tailnet-only, plus public destinations for the purposes the company has
- *                   explicitly opted in to (ai, email, bank-feeds, updates). Every purpose is
- *                   OFF by default, even in this mode.
+ *                   explicitly opted in to (ai, email, bank-feeds). Those purposes are OFF by
+ *                   default, even in this mode.
+ *
+ * App update checks are the exception: they send no company data (app version + platform only),
+ * so they are ON by default and reach the release feed in tailnet-only and allow-cloud modes.
+ * A company can turn them off; offline mode and a BKA_NETWORK_MODE ceiling below allow-cloud
+ * still block them.
  *
  * A machine-wide ceiling can be set with BKA_NETWORK_MODE; the effective mode is the more
  * restrictive of the company's mode and the ceiling (an operator can force 'offline').
@@ -29,13 +34,16 @@ export type OutboundPurpose = (typeof OUTBOUND_PURPOSES)[number];
 
 export interface NetworkPolicy {
   mode: NetworkMode;
-  /** Per-purpose cloud opt-in. Only consulted in 'allow-cloud' mode; all false by default. */
+  /**
+   * Per-purpose cloud opt-in. ai/email/bank-feeds are only consulted in 'allow-cloud' mode and
+   * default to false; updates defaults to true and also applies in 'tailnet-only' mode.
+   */
   cloudOptIn: Record<OutboundPurpose, boolean>;
 }
 
 export const DEFAULT_NETWORK_POLICY: NetworkPolicy = Object.freeze({
   mode: 'tailnet-only',
-  cloudOptIn: Object.freeze({ ai: false, email: false, 'bank-feeds': false, updates: false }),
+  cloudOptIn: Object.freeze({ ai: false, email: false, 'bank-feeds': false, updates: true }),
 }) as NetworkPolicy;
 
 /** Human-facing description of each purpose: what would leave the machine if allowed. */
@@ -86,6 +94,8 @@ export function normalizePolicy(raw: unknown): NetworkPolicy {
   >;
   const cloudOptIn = {} as Record<OutboundPurpose, boolean>;
   for (const p of OUTBOUND_PURPOSES) cloudOptIn[p] = opt[p] === true;
+  // Update checks are on unless explicitly turned off.
+  cloudOptIn.updates = opt.updates !== false;
   return { mode: isNetworkMode(r.mode) ? r.mode : DEFAULT_NETWORK_POLICY.mode, cloudOptIn };
 }
 
@@ -104,6 +114,10 @@ export function envModeCeiling(env: Record<string, string | undefined> = process
 export function effectiveMode(mode: NetworkMode, ceiling?: NetworkMode): NetworkMode {
   if (!ceiling) return mode;
   return MODE_RANK[ceiling] < MODE_RANK[mode] ? ceiling : mode;
+}
+
+function ceilingBelowCloud(ceiling: NetworkMode | undefined): boolean {
+  return ceiling !== undefined && MODE_RANK[ceiling] < MODE_RANK['allow-cloud'];
 }
 
 export interface OutboundDecision {
@@ -166,7 +180,18 @@ export function decideOutbound(
       reason: hostClass === 'tailnet' ? 'Destination is on your tailnet.' : 'Destination is on your local network.',
     };
   }
-  // Public internet.
+  // Public internet. Update checks (no company data) only need the company not to be offline and
+  // no machine ceiling below allow-cloud; they can still be turned off per company.
+  if (purpose === 'updates' && mode === 'tailnet-only' && !ceilingBelowCloud(ceiling)) {
+    return policy.cloudOptIn.updates
+      ? { ...base, allowed: true, hostClass, reason: 'App update checks are on for this company.' }
+      : {
+          ...base,
+          allowed: false,
+          hostClass,
+          reason: 'App update checks are turned off for this company. Turn them on in Settings → Privacy & Network.',
+        };
+  }
   if (mode !== 'allow-cloud') {
     return {
       ...base,

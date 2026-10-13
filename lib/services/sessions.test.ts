@@ -248,7 +248,7 @@ describe('Privacy & Network policy persistence', () => {
     const owner = ctxFor(adminId, undefined, 'owner');
     expect(await getNetworkPolicy(owner)).toEqual({
       mode: 'tailnet-only',
-      cloudOptIn: { ai: false, email: false, 'bank-feeds': false, updates: false },
+      cloudOptIn: { ai: false, email: false, 'bank-feeds': false, updates: true },
     });
 
     await expect(
@@ -257,14 +257,26 @@ describe('Privacy & Network policy persistence', () => {
     await expect(setNetworkPolicy(owner, { mode: 'everything' })).rejects.toMatchObject({ code: 'VALIDATION' });
 
     const saved = await setNetworkPolicy(owner, { mode: 'allow-cloud', cloudOptIn: { ai: true } });
-    expect(saved).toEqual({ mode: 'allow-cloud', cloudOptIn: { ai: true, email: false, 'bank-feeds': false, updates: false } });
+    expect(saved).toEqual({ mode: 'allow-cloud', cloudOptIn: { ai: true, email: false, 'bank-feeds': false, updates: true } });
     expect(await getNetworkPolicy(owner)).toEqual(saved);
 
     // Other company settings are untouched.
     const [c] = await db.select().from(companies).where(eq(companies.id, companyId));
-    expect((c.settings as Record<string, unknown>).networkPolicy).toEqual(saved);
+    expect((c.settings as Record<string, unknown>).networkPolicy).toEqual({ ...saved, rev: 2 });
     const audits = await db.select().from(auditLogs).where(eq(auditLogs.entityType, 'network_policy'));
     expect(audits.length).toBe(1);
+
+    // Update checks can be turned off, and that choice survives a re-read.
+    const off = await setNetworkPolicy(owner, { mode: 'tailnet-only', cloudOptIn: { updates: false } });
+    expect(off.cloudOptIn.updates).toBe(false);
+    expect((await getNetworkPolicy(owner)).cloudOptIn.updates).toBe(false);
+
+    // A policy saved before update checks were on by default (no rev) reads as updates on.
+    await db
+      .update(companies)
+      .set({ settings: { ...(c.settings as Record<string, unknown>), networkPolicy: { mode: 'tailnet-only', cloudOptIn: { updates: false } } } })
+      .where(eq(companies.id, companyId));
+    expect((await getNetworkPolicy(owner)).cloudOptIn.updates).toBe(true);
   });
 });
 });

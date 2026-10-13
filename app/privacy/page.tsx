@@ -54,7 +54,7 @@ const MODES: { id: Mode; title: string; body: string; icon: typeof WifiOff }[] =
     id: 'tailnet-only',
     title: 'Local network + tailnet (recommended)',
     body:
-      'Connections stay on your own network and your private Tailscale network — for example multi-user hosting, a mail relay or an AI model on a computer you own. Nothing goes to the internet.',
+      'Connections stay on your own network and your private Tailscale network — for example multi-user hosting, a mail relay or an AI model on a computer you own. Nothing goes to the internet except the app update check (version number only), which you can turn off below.',
     icon: ShieldCheck,
   },
   {
@@ -77,7 +77,7 @@ export default function PrivacyNetworkPage() {
     ai: false,
     email: false,
     'bank-feeds': false,
-    updates: false,
+    updates: true,
   });
   const [saving, setSaving] = useState(false);
 
@@ -176,11 +176,14 @@ export default function PrivacyNetworkPage() {
       <h2 className="text-lg font-bold text-navy mb-1">What could leave this computer</h2>
       <p className="text-sm text-navy/60 mb-3">
         Each service is off unless you turn it on here <em>and</em> choose “Allow cloud services I
-        choose” above.
+        choose” above. App update checks are the exception: they send no company data, so they are on
+        unless you turn them off (or choose Offline).
       </p>
       <Card className="divide-y divide-slate-100 mb-8">
         {data.purposes.map((p) => {
-          const enabled = mode === 'allow-cloud' && optIn[p.purpose];
+          // Update checks work in any mode but offline; everything else needs allow-cloud.
+          const modeAllows = p.purpose === 'updates' ? mode !== 'offline' : mode === 'allow-cloud';
+          const enabled = modeAllows && optIn[p.purpose];
           return (
             <div key={p.purpose} className="p-5 flex gap-4 items-start justify-between">
               <div className="min-w-0">
@@ -201,7 +204,7 @@ export default function PrivacyNetworkPage() {
                   type="checkbox"
                   className="h-4 w-4 accent-electric"
                   checked={optIn[p.purpose]}
-                  disabled={readOnly || mode !== 'allow-cloud'}
+                  disabled={readOnly || !modeAllows}
                   onChange={(e) => setOptIn({ ...optIn, [p.purpose]: e.target.checked })}
                 />
                 {enabled ? 'On' : 'Off'}

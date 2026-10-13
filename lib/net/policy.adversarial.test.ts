@@ -64,7 +64,8 @@ describe('classifyHost — spellings that must not escape their class', () => {
 describe('decideOutbound — adversarial', () => {
   it('opting in one purpose never opens another', () => {
     for (const p of OUTBOUND_PURPOSES) {
-      const policy = pol('allow-cloud', { [p]: true });
+      // Update checks are on by default, so turn them off explicitly unless they are the one opted in.
+      const policy = pol('allow-cloud', { updates: false, [p]: true });
       for (const q of OUTBOUND_PURPOSES) {
         const d = decideOutbound(policy, 'https://api.example.com/', q, undefined);
         expect(d.allowed).toBe(p === q);
@@ -102,7 +103,7 @@ describe('decideOutbound — adversarial', () => {
 
   it('a tampered stored policy cannot opt in via truthy non-booleans or prototype keys', () => {
     const p = normalizePolicy(JSON.parse('{"mode":"allow-cloud","cloudOptIn":{"ai":"true","email":1,"__proto__":{"bank-feeds":true}}}'));
-    expect(p.cloudOptIn).toEqual({ ai: false, email: false, 'bank-feeds': false, updates: false });
+    expect(p.cloudOptIn).toEqual({ ai: false, email: false, 'bank-feeds': false, updates: true });
     expect(decideOutbound(p, 'https://production.plaid.com/', 'bank-feeds', undefined).allowed).toBe(false);
     expect(normalizePolicy({ mode: 'ALLOW-CLOUD' }).mode).toBe('tailnet-only');
     expect(normalizePolicy('allow-cloud').mode).toBe('tailnet-only');

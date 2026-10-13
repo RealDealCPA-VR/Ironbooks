@@ -203,6 +203,7 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] **P0 fix round**: all 11 fixed, covering restore safety, cash-basis P&L, consolidated-report access, payroll wage bases and W-2 Box 12, progress invoicing, statements, and A/R and A/P journal entries
 - [x] **P1 round**: 9 teams. Setup interview and every preference wired, Simple menu mode with page search and help, typed document numbers on every form, full multi-currency (foreign banks, Home Currency Adjustment, aging in both currencies), one To Do list, Form 941/940, closing-date password prompt and record locking everywhere
 - [x] **v1.1.0 release**: parity re-checked 2026-10-13: 66 of 109 gaps done, no P0 open (see [`PARITY.md`](./PARITY.md) Scorecard)
+- [x] **v1.2.0 release**: the desktop app checks for new versions by default (version only, can be turned off in Privacy & Network) and asks before downloading and installing; Help → Check for Updates
 - [ ] Next round: the 3 remaining buggy rows (custom terms due dates, templates on print/email, reorder list vs open POs), the partial rows, and the P2 follow-ups in [`PARITY.md`](./PARITY.md)
 - [ ] Hands-on QA of the new screens, then a tagged release
 

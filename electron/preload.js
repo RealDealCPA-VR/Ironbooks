@@ -26,6 +26,17 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     ipcRenderer.on('navigate', handler);
     return () => ipcRenderer.removeListener('navigate', handler);
   },
+  /** App updates: current state, subscribe to changes, and the user's choices. */
+  updates: {
+    status: () => ipcRenderer.invoke('app:updateStatus'),
+    onChange: (cb) => {
+      const handler = (_e, state) => cb(state);
+      ipcRenderer.on('update', handler);
+      return () => ipcRenderer.removeListener('update', handler);
+    },
+    check: () => ipcRenderer.invoke('app:checkForUpdates'),
+    download: () => ipcRenderer.invoke('app:downloadUpdate'),
+  },
   /** Apply a downloaded update now (quit, install, relaunch). Resolves false if none is staged. */
   quitAndInstall: () => ipcRenderer.invoke('app:quitAndInstall'),
   /** Company-file management (the "file lives wherever you put it" model). */

@@ -10,23 +10,38 @@
  *  - File > New/Open Company -> /companies (company management/switcher)
  *  - File > Create Portable Company File / Export Shareable Ledger -> fetch + native Save
  *  - File > View Transaction Log -> /transaction-log
- *  - auto-updater 'update-ready' -> an actionable "Restart & install now" banner
+ *  - app updates (electron/main.js) -> "Update available" banner: Download & install, progress,
+ *    then "Restart & install now"
  *
  * Renders nothing in the browser (window.bookkeeper is absent outside Electron) and
- * nothing in the desktop shell until an update has finished downloading.
+ * nothing in the desktop shell until a newer version has been published.
  */
 import { useEffect, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { RefreshCw, X } from 'lucide-react';
+import { Download, RefreshCw, X } from 'lucide-react';
 import { Button, toast } from '@/components/ui';
 import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
 
 type Unsubscribe = (() => void) | void;
+/** Mirrors updateState in electron/main.js. */
+interface UpdateState {
+  state: 'idle' | 'checking' | 'none' | 'available' | 'downloading' | 'ready' | 'error';
+  version?: string;
+  percent?: number;
+  message?: string;
+  /** Set when the user asked again (Help > Check for Updates). */
+  reshow?: boolean;
+}
 interface DesktopBridgeApi {
   isDesktop?: boolean;
   onMenu?: (cb: (action: string) => void) => Unsubscribe;
   onNavigate?: (cb: (route: string) => void) => Unsubscribe;
   quitAndInstall?: () => Promise<boolean>;
+  updates?: {
+    status?: () => Promise<UpdateState>;
+    onChange?: (cb: (state: UpdateState) => void) => Unsubscribe;
+    download?: () => Promise<boolean>;
+  };
   company?: { newFile?: () => Promise<unknown>; open?: () => Promise<unknown> };
   spellcheck?: { setEnabled?: (enabled: boolean) => Promise<unknown> };
 }
@@ -51,7 +66,9 @@ const MENU_EXPORTS: Record<string, { run: () => Promise<string | null>; done: st
 
 export default function DesktopBridge() {
   const router = useRouter();
-  const [updateReady, setUpdateReady] = useState(false);
+  const [update, setUpdate] = useState<UpdateState>({ state: 'idle' });
+  // The banner state the user dismissed with "Later" (shown again only when something changes).
+  const [dismissed, setDismissed] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const pathname = usePathname();
   const myPrefsApplied = useRef(false);
@@ -89,12 +106,15 @@ export default function DesktopBridge() {
     const b = bridge();
     if (!b?.isDesktop) return;
 
+    // Updates found before this page loaded (e.g. on the sign-in screen) are picked up here.
+    b.updates?.status?.().then((s) => s && setUpdate(s)).catch(() => {});
+    const offUpdate = b.updates?.onChange?.((s) => {
+      setUpdate(s);
+      // Help > Check for Updates re-sends the current state: show the banner again.
+      if (s.reshow) setDismissed(null);
+    });
+
     const offMenu = b.onMenu?.((action) => {
-      if (action === 'update-ready') {
-        setUpdateReady(true);
-        toast('Update downloaded — restart to apply it.', 'info');
-        return;
-      }
       // New/Open Company open native folder dialogs (the company-file model lives in the shell).
       if (action === 'new-company') {
         b.company?.newFile?.();
@@ -121,12 +141,24 @@ export default function DesktopBridge() {
     });
 
     return () => {
+      if (typeof offUpdate === 'function') offUpdate();
       if (typeof offMenu === 'function') offMenu();
       if (typeof offNavigate === 'function') offNavigate();
     };
   }, [router]);
 
-  if (!updateReady) return null;
+  const visible = ['available', 'downloading', 'ready', 'error'].includes(update.state);
+  const key = `${update.state}:${update.version ?? ''}`;
+  if (!visible || dismissed === key) return null;
+
+  async function download() {
+    try {
+      const started = await bridge()?.updates?.download?.();
+      if (started === false) toast('Could not start the download. Try Help > Check for Updates.', 'danger');
+    } catch {
+      toast('Could not start the download. Try Help > Check for Updates.', 'danger');
+    }
+  }
 
   async function applyUpdate() {
     setInstalling(true);
@@ -143,34 +175,70 @@ export default function DesktopBridge() {
     }
   }
 
+  const current = process.env.NEXT_PUBLIC_APP_VERSION;
+  const newVersion = update.version ? `BookKeeper AI ${update.version}` : 'A new version of BookKeeper AI';
+  const later = () => setDismissed(key);
+
+  let title: string;
+  let body: string;
+  if (update.state === 'available') {
+    title = 'Update available';
+    body = `${newVersion} is available${current ? ` (you have ${current})` : ''}. Download and install it now?`;
+  } else if (update.state === 'downloading') {
+    title = 'Downloading update…';
+    body = `${newVersion} is downloading. You can keep working.`;
+  } else if (update.state === 'ready') {
+    title = 'Update ready';
+    body = `${newVersion} has been downloaded. Restart now, or it installs the next time you close the app.`;
+  } else {
+    title = 'Update failed';
+    body = `${newVersion} could not be downloaded${update.message ? `: ${update.message}` : '.'}`;
+  }
+
   return (
-    <div className="fixed bottom-4 left-4 z-[200] max-w-sm">
+    <div className="fixed bottom-4 left-4 z-[200] max-w-sm" role="status" aria-live="polite">
       <div className="flex items-start gap-3 rounded-2xl border border-slate-100 bg-white p-4 shadow-2xl">
         <div className="mt-0.5 rounded-lg bg-electric/10 p-2">
-          <RefreshCw className="h-5 w-5 text-electric" />
+          {update.state === 'ready' ? (
+            <RefreshCw className="h-5 w-5 text-electric" />
+          ) : (
+            <Download className="h-5 w-5 text-electric" />
+          )}
         </div>
         <div className="flex-1">
-          <p className="text-sm font-semibold text-navy">Update ready</p>
-          <p className="mt-0.5 text-sm text-navy/60">
-            A new version of BookKeeper AI has been downloaded.
-          </p>
-          <div className="mt-3 flex items-center gap-2">
-            <Button size="sm" onClick={applyUpdate} loading={installing}>
-              Restart &amp; install now
-            </Button>
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => setUpdateReady(false)}
-              disabled={installing}
+          <p className="text-sm font-semibold text-navy">{title}</p>
+          <p className="mt-0.5 text-sm text-navy/60">{body}</p>
+          {update.state === 'downloading' && (
+            <div
+              className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-slate-100"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={update.percent ?? 0}
             >
-              Later
-            </Button>
-          </div>
+              <div className="h-full bg-electric transition-all" style={{ width: `${update.percent ?? 0}%` }} />
+            </div>
+          )}
+          {update.state !== 'downloading' && (
+            <div className="mt-3 flex items-center gap-2">
+              {update.state === 'ready' ? (
+                <Button size="sm" onClick={applyUpdate} loading={installing}>
+                  Restart &amp; install now
+                </Button>
+              ) : (
+                <Button size="sm" onClick={download}>
+                  {update.state === 'error' ? 'Try again' : 'Download & install'}
+                </Button>
+              )}
+              <Button size="sm" variant="secondary" onClick={later} disabled={installing}>
+                Later
+              </Button>
+            </div>
+          )}
         </div>
         <button
           aria-label="Dismiss"
-          onClick={() => setUpdateReady(false)}
+          onClick={later}
           disabled={installing}
           className="text-navy/30 hover:text-navy disabled:pointer-events-none"
         >

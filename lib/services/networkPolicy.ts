@@ -19,6 +19,19 @@ import { type ServiceContext, ServiceError, inTransaction, notFound, writeAudit 
 
 export const SETTINGS_KEY = 'networkPolicy';
 
+/**
+ * Stored-policy revision. Before rev 2 update checks were opt-in and every saved policy carried
+ * updates: false; those saves were never a real choice, so pre-rev-2 policies read as updates on.
+ */
+const POLICY_REV = 2;
+
+function readStored(raw: unknown): NetworkPolicy {
+  const policy = normalizePolicy(raw);
+  const rev = raw && typeof raw === 'object' ? (raw as Record<string, unknown>).rev : undefined;
+  if (rev !== POLICY_REV) policy.cloudOptIn.updates = true;
+  return policy;
+}
+
 export const networkPolicySchema = z.object({
   mode: z.enum(NETWORK_MODES),
   cloudOptIn: z
@@ -33,14 +46,14 @@ export const networkPolicySchema = z.object({
 });
 export type NetworkPolicyInput = z.infer<typeof networkPolicySchema>;
 
-/** The active company's policy (defaults when never configured: tailnet-only, no cloud). */
+/** The active company's policy (defaults when never configured: tailnet-only, no cloud, update checks on). */
 export async function getNetworkPolicy(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<NetworkPolicy> {
   const [row] = await ctx.db
     .select({ settings: companies.settings })
     .from(companies)
     .where(eq(companies.id, ctx.companyId));
   if (!row) return normalizePolicy(DEFAULT_NETWORK_POLICY);
-  return normalizePolicy((row.settings as Record<string, unknown> | null)?.[SETTINGS_KEY]);
+  return readStored((row.settings as Record<string, unknown> | null)?.[SETTINGS_KEY]);
 }
 
 /** Owner/admin only (trusted internal contexts without a role pass). */
@@ -69,8 +82,8 @@ export async function setNetworkPolicy(ctx: ServiceContext, input: unknown): Pro
       .where(eq(companies.id, tx.companyId));
     if (!row) throw notFound('Company');
     const settings = { ...((row.settings ?? {}) as Record<string, unknown>) };
-    const before = normalizePolicy(settings[SETTINGS_KEY]);
-    settings[SETTINGS_KEY] = next;
+    const before = readStored(settings[SETTINGS_KEY]);
+    settings[SETTINGS_KEY] = { ...next, rev: POLICY_REV };
     await tx.db
       .update(companies)
       .set({ settings, updatedAt: new Date() })

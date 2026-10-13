@@ -22,17 +22,47 @@ const policy = (mode: NetworkPolicy['mode'], optIn: Partial<Record<OutboundPurpo
   normalizePolicy({ mode, cloudOptIn: optIn });
 
 describe('normalizePolicy', () => {
-  it('defaults to tailnet-only with every cloud purpose off', () => {
+  it('defaults to tailnet-only with every cloud purpose off except update checks', () => {
     expect(normalizePolicy(undefined)).toEqual({
       mode: 'tailnet-only',
-      cloudOptIn: { ai: false, email: false, 'bank-feeds': false, updates: false },
+      cloudOptIn: { ai: false, email: false, 'bank-feeds': false, updates: true },
     });
     expect(DEFAULT_NETWORK_POLICY.mode).toBe('tailnet-only');
   });
   it('drops unknown modes/purposes and non-boolean opt-ins', () => {
     const p = normalizePolicy({ mode: 'yolo', cloudOptIn: { ai: 'yes', email: true, telemetry: true } });
     expect(p.mode).toBe('tailnet-only');
-    expect(p.cloudOptIn).toEqual({ ai: false, email: true, 'bank-feeds': false, updates: false });
+    expect(p.cloudOptIn).toEqual({ ai: false, email: true, 'bank-feeds': false, updates: true });
+  });
+  it('keeps update checks off only when explicitly false', () => {
+    expect(normalizePolicy({ cloudOptIn: { updates: false } }).cloudOptIn.updates).toBe(false);
+    expect(normalizePolicy({ cloudOptIn: { updates: 'no' } }).cloudOptIn.updates).toBe(true);
+  });
+});
+
+describe('update checks (on by default)', () => {
+  const FEED = 'https://github.com/RealDealCPA-VR/Open-Source-QB/releases';
+  it('reach the release feed in tailnet-only and allow-cloud modes by default', () => {
+    expect(decideOutbound(normalizePolicy(undefined), FEED, 'updates', undefined).allowed).toBe(true);
+    expect(decideOutbound(policy('allow-cloud'), FEED, 'updates', undefined).allowed).toBe(true);
+  });
+  it('can be turned off per company in either mode', () => {
+    for (const mode of ['tailnet-only', 'allow-cloud'] as const) {
+      const d = decideOutbound(policy(mode, { updates: false }), FEED, 'updates', undefined);
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toMatch(/Privacy & Network/);
+    }
+  });
+  it('are blocked offline and by a machine ceiling below allow-cloud', () => {
+    expect(decideOutbound(policy('offline'), FEED, 'updates', undefined).allowed).toBe(false);
+    expect(decideOutbound(policy('allow-cloud'), FEED, 'updates', 'tailnet-only').allowed).toBe(false);
+    expect(decideOutbound(policy('tailnet-only'), FEED, 'updates', 'tailnet-only').allowed).toBe(false);
+    expect(decideOutbound(policy('tailnet-only'), FEED, 'updates', 'allow-cloud').allowed).toBe(true);
+  });
+  it('do not open the internet to any other purpose in tailnet-only mode', () => {
+    const pol = policy('tailnet-only', { ai: true, email: true, 'bank-feeds': true });
+    expect(decideOutbound(pol, 'https://api.anthropic.com/v1/messages', 'ai', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'https://production.plaid.com/x', 'bank-feeds', undefined).allowed).toBe(false);
   });
 });
 
@@ -67,7 +97,7 @@ describe('decideOutbound — per mode and purpose', () => {
     }
   });
 
-  it('tailnet-only (default): loopback + LAN + tailnet, never the internet — even when opted in', () => {
+  it('tailnet-only (default): loopback + LAN + tailnet, never the internet — even when opted in (update checks aside)', () => {
     // The MagicDNS name was resolved to a tailnet address (lib/net/tailnetVerify.ts).
     recordTailnetVerification('gpu-box.tail1234.ts.net', true);
     for (const p of OUTBOUND_PURPOSES) {
@@ -76,6 +106,7 @@ describe('decideOutbound — per mode and purpose', () => {
       expect(decideOutbound(pol, LAN, p, undefined).allowed).toBe(true);
       expect(decideOutbound(pol, TAILNET, p, undefined).allowed).toBe(true);
       expect(decideOutbound(pol, MAGICDNS, p, undefined).allowed).toBe(true);
+      if (p === 'updates') continue; // version-only release check; see 'update checks' below
       const d = decideOutbound(pol, CLOUD, p, undefined);
       expect(d.allowed).toBe(false);
       expect(d.hostClass).toBe('public');
@@ -84,7 +115,7 @@ describe('decideOutbound — per mode and purpose', () => {
   });
 
   it('allow-cloud: public destinations only for opted-in purposes', () => {
-    const pol = policy('allow-cloud', { ai: true });
+    const pol = policy('allow-cloud', { ai: true, updates: false });
     expect(decideOutbound(pol, CLOUD, 'ai', undefined).allowed).toBe(true);
     expect(decideOutbound(pol, 'https://production.plaid.com/x', 'bank-feeds', undefined).allowed).toBe(false);
     expect(decideOutbound(pol, 'smtps://smtp.gmail.com:465', 'email', undefined).allowed).toBe(false);
