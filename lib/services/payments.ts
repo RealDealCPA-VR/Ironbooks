@@ -30,10 +30,12 @@ import {
   deposits,
   invoices,
   journalEntries,
+  journalEntryLines,
   journalItemApplications,
   paymentsReceived,
   paymentApplications,
 } from '@/lib/db/schema';
+import type Decimal from 'decimal.js';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -172,6 +174,82 @@ async function getArAccountId(ctx: ServiceContext): Promise<string> {
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1200')));
   if (!row) throw new ServiceError('NOT_FOUND', 'Accounts Receivable account (1200) not found.');
   return row.id;
+}
+
+/**
+ * Home-currency A/R still open on an invoice: what the invoice put on A/R (its posted entry's net
+ * A/R debit) minus the home A/R every live Receive Payments application on it already relieved.
+ * Only foreign-currency invoices need this (home invoices relieve exactly the amount applied).
+ */
+async function invoiceOpenHome(
+  tx: ServiceContext,
+  inv: { id: string; exchangeRate: string | null },
+  arAccountId: string,
+): Promise<Decimal> {
+  const rate = Money.of(inv.exchangeRate ?? 1);
+  const [row] = await tx.db
+    .select({ postedEntryId: invoices.postedEntryId, total: invoices.total, retainageAmount: invoices.retainageAmount })
+    .from(invoices)
+    .where(and(eq(invoices.id, inv.id), eq(invoices.companyId, tx.companyId)));
+  let anchor: Decimal | null = null;
+  if (row?.postedEntryId) {
+    const [net] = await tx.db
+      .select({
+        net: sql<string>`COALESCE(SUM(COALESCE(${journalEntryLines.debit}, 0) - COALESCE(${journalEntryLines.credit}, 0)), 0)`,
+      })
+      .from(journalEntryLines)
+      .where(and(eq(journalEntryLines.journalEntryId, row.postedEntryId), eq(journalEntryLines.accountId, arAccountId)));
+    const v = Money.of(net?.net ?? 0);
+    if (v.greaterThan(0)) anchor = v;
+  }
+  if (!anchor) {
+    const billed = Money.of(row?.total ?? 0).minus(Money.of(row?.retainageAmount ?? 0));
+    anchor = Money.round2(billed.times(rate));
+  }
+  const apps = await tx.db
+    .select({
+      amountApplied: paymentApplications.amountApplied,
+      discountAmount: paymentApplications.discountAmount,
+      amountHome: paymentApplications.amountHome,
+    })
+    .from(paymentApplications)
+    .innerJoin(paymentsReceived, eq(paymentsReceived.id, paymentApplications.paymentId))
+    .where(and(eq(paymentApplications.invoiceId, inv.id), isNull(paymentsReceived.voidedAt)));
+  let relieved = Money.zero();
+  for (const a of apps) relieved = relieved.plus(applicationHome(a, rate));
+  return Money.round2(anchor.minus(relieved));
+}
+
+/** Home A/R a stored application relieved (legacy rows: each part converted at the invoice rate). */
+function applicationHome(
+  a: { amountApplied: string; discountAmount: string | null; amountHome: string | null },
+  rate: Decimal,
+): Decimal {
+  if (a.amountHome !== null && a.amountHome !== undefined) return Money.of(a.amountHome);
+  return Money.round2(Money.of(a.amountApplied).times(rate)).plus(
+    Money.round2(Money.of(a.discountAmount ?? 0).times(rate)),
+  );
+}
+
+/**
+ * Home-currency A/R an application of `settled` (cash + discount, invoice currency) relieves.
+ * Home invoices: exactly `settled`. Foreign invoices: settled x booked rate, except the
+ * application that pays the invoice off, which relieves whatever home A/R is still open on it,
+ * so the rounding left over by earlier part-payments goes to Exchange Gain/Loss instead of
+ * staying on A/R (QuickBooks clears it on the final payment).
+ */
+async function applicationReliefHome(
+  tx: ServiceContext,
+  inv: { id: string; exchangeRate: string | null; balanceDue: string },
+  settled: Decimal,
+  arAccountId: string,
+): Promise<Decimal> {
+  const rate = Money.of(inv.exchangeRate ?? 1);
+  if (rate.equals(1)) return Money.round2(settled);
+  if (Money.round2(settled).equals(Money.round2(Money.of(inv.balanceDue)))) {
+    return invoiceOpenHome(tx, inv, arAccountId);
+  }
+  return Money.round2(settled.times(rate));
 }
 
 /** Find an account by code, creating it when missing (new accounts start at a zero balance). */
@@ -730,14 +808,22 @@ async function postPayment(
   // invoice was BOOKED at (plus any unapplied remainder at the settlement rate), so the
   // A/R control account clears exactly what createInvoice debited. The difference is
   // realized FX gain/loss. Discounts are converted at the invoice's booked rate on both sides.
+  // The application that pays a foreign invoice off relieves exactly the home A/R still open on
+  // it (applicationReliefHome), so part-payment rounding lands in Exchange Gain/Loss, not on A/R.
   const cashBase = Money.round2(Money.mul(totalAmount, paymentRate));
   let arBase = Money.zero();
   let discountBase = Money.zero();
+  const reliefHomeByInvoice = new Map<string, Decimal>();
   for (const app of input.applications) {
     const inv = invoiceById.get(app.invoiceId)!;
     const rate = Money.of(inv.exchangeRate ?? 1);
-    arBase = arBase.plus(Money.round2(Money.mul(Money.round2(app.amountApplied ?? 0), rate)));
-    discountBase = discountBase.plus(Money.round2(Money.mul(Money.round2(app.discountAmount ?? 0), rate)));
+    const applied = Money.round2(app.amountApplied ?? 0);
+    const discount = Money.round2(app.discountAmount ?? 0);
+    const discHome = Money.round2(Money.mul(discount, rate));
+    const relief = await applicationReliefHome(tx, inv, applied.plus(discount), arAccountId);
+    reliefHomeByInvoice.set(app.invoiceId, relief);
+    arBase = arBase.plus(relief.minus(discHome));
+    discountBase = discountBase.plus(discHome);
   }
   if (unapplied.greaterThan(0)) {
     arBase = arBase.plus(Money.round2(Money.mul(unapplied, paymentRate)));
@@ -815,6 +901,7 @@ async function postPayment(
       invoiceId: app.invoiceId,
       amountApplied: toAmountString(applied),
       discountAmount: toAmountString(discount),
+      amountHome: toAmountString(reliefHomeByInvoice.get(app.invoiceId) ?? applied.plus(discount)),
     });
     // Update invoice via the canonical helper — it re-reads the row inside this
     // transaction (no stale snapshots) and computes balanceDue against the billed
@@ -1071,7 +1158,8 @@ async function postFxAdjustmentForApplication(
   tx: ServiceContext,
   params: {
     amount: Parameters<typeof Money.of>[0];
-    invoiceRate: string | number | null | undefined;
+    /** Home A/R the application relieves (apply) or restores (unapply) on the invoice. */
+    invoiceHome: Decimal;
     paymentRate: string | number | null | undefined;
     arAccountId: string;
     date: Date;
@@ -1082,9 +1170,7 @@ async function postFxAdjustmentForApplication(
 ) {
   const amt = Money.of(params.amount);
   const delta = Money.round2(
-    Money.mul(amt, Money.of(params.invoiceRate ?? 1)).minus(
-      Money.mul(amt, Money.of(params.paymentRate ?? 1)),
-    ),
+    params.invoiceHome.minus(Money.round2(Money.mul(amt, Money.of(params.paymentRate ?? 1)))),
   ).times(params.sign);
   if (delta.isZero()) return null;
 
@@ -1628,6 +1714,20 @@ export async function unapplyFromInvoice(ctx: ServiceContext, input: UnapplyFrom
 
   const arAccountId = await getArAccountId(ctx);
 
+  // Home A/R this unapply puts back on the invoice: all of what the application relieved when the
+  // whole application goes, else the part at the invoice's booked rate.
+  const invRate = Money.of(invoice.exchangeRate ?? 1);
+  const appHome = applicationHome(app, invRate);
+  const discountLeft = Money.of(app.discountAmount ?? 0);
+  const homeBack =
+    amount.equals(applied) && !discountLeft.greaterThan(0)
+      ? appHome
+      : (() => {
+          const part = Money.round2(amount.times(invRate));
+          return part.greaterThan(appHome) ? appHome : part;
+        })();
+  const homeLeft = Money.round2(appHome.minus(homeBack));
+
   return inTransaction(ctx, async (tx) => {
     // 1. Restore the invoice's balanceDue / status.
     await markPaidAmount(tx, input.invoiceId, toAmountString(Money.neg(amount)));
@@ -1641,7 +1741,7 @@ export async function unapplyFromInvoice(ctx: ServiceContext, input: UnapplyFrom
     } else {
       await tx.db
         .update(paymentApplications)
-        .set({ amountApplied: toAmountString(remaining) })
+        .set({ amountApplied: toAmountString(remaining), amountHome: toAmountString(homeLeft) })
         .where(eq(paymentApplications.id, app.id));
     }
 
@@ -1656,7 +1756,7 @@ export async function unapplyFromInvoice(ctx: ServiceContext, input: UnapplyFrom
     // 4. FX plug if the invoice was booked at a different rate than the payment.
     await postFxAdjustmentForApplication(tx, {
       amount,
-      invoiceRate: invoice.exchangeRate,
+      invoiceHome: homeBack,
       paymentRate: payment.exchangeRate,
       arAccountId,
       date: new Date(),
@@ -1785,12 +1885,17 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
       const appliedStr = toAmountString(applied);
       const inv = invoiceById.get(app.invoiceId)!;
 
+      // Home A/R relieved on the invoice (the payoff application clears its whole open home amount).
+      const relief = await applicationReliefHome(tx, inv, applied, arAccountId);
+
       const existing = existingByInvoice.get(app.invoiceId);
       if (existing) {
+        const prevHome = applicationHome(existing, Money.of(inv.exchangeRate ?? 1));
         await tx.db
           .update(paymentApplications)
           .set({
             amountApplied: toAmountString(Money.of(existing.amountApplied).plus(applied)),
+            amountHome: toAmountString(prevHome.plus(relief)),
           })
           .where(eq(paymentApplications.id, existing.id));
       } else {
@@ -1798,6 +1903,7 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
           paymentId: input.paymentId,
           invoiceId: app.invoiceId,
           amountApplied: appliedStr,
+          amountHome: toAmountString(relief),
         });
       }
 
@@ -1806,7 +1912,7 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
       // FX plug if the invoice was booked at a different rate than the payment settled at.
       await postFxAdjustmentForApplication(tx, {
         amount: applied,
-        invoiceRate: inv.exchangeRate,
+        invoiceHome: relief,
         paymentRate: payment.exchangeRate,
         arAccountId,
         date: new Date(),

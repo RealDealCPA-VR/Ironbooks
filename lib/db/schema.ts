@@ -648,6 +648,8 @@ export const paymentApplications = pgTable('payment_applications', {
   amountApplied: decimal('amount_applied', { precision: 15, scale: 2 }).notNull(),
   /** wave2 sales (C3): early-payment discount taken on this invoice (reduces its balance too). */
   discountAmount: decimal('discount_amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** P1 payments: home-currency A/R relieved by this application, cash + discount (null = legacy, amount x rate). */
+  amountHome: decimal('amount_home', { precision: 15, scale: 2 }),
 });
 
 // ---- Bills (A/P) ----

@@ -20,3 +20,9 @@ ALTER TABLE "journal_item_applications" ADD CONSTRAINT "journal_item_application
 CREATE INDEX IF NOT EXISTS "journal_item_applications_pair_idx" ON "journal_item_applications" ("pair_id");
 --> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "payments_received_company_date_idx" ON "payments_received" ("company_id", "date");
+--> statement-breakpoint
+-- Home-currency A/R relieved by each Receive Payments application (cash + discount). The payment
+-- that pays a foreign-currency invoice off relieves exactly what is still open in home currency
+-- (the invoice's A/R minus these amounts), so no rounding penny is left on A/R. NULL on rows
+-- written before this column existed = round2(amount_applied x rate) + round2(discount x rate).
+ALTER TABLE "payment_applications" ADD COLUMN IF NOT EXISTS "amount_home" numeric(15, 2);
