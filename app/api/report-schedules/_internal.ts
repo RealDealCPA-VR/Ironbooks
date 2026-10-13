@@ -35,16 +35,21 @@ export async function internalContexts(req: NextRequest): Promise<ServiceContext
   if (!hasInternalToken(req)) return null;
   const db = await getDb();
   const rows = await db
-    .select({ id: companies.id, ownerId: companies.ownerId })
+    .select({ id: companies.id, ownerId: companies.ownerId, settings: companies.settings })
     .from(companies)
     .orderBy(asc(companies.createdAt), asc(companies.id));
-  return rows.map((c) => ({ db, companyId: c.id, userId: c.ownerId }));
+  // A deleted (archived) company file no longer runs its schedules, matching
+  // listCompaniesForUser and consolidation.
+  return rows
+    .filter((c) => (c.settings as Record<string, unknown> | null)?.archived !== true)
+    .map((c) => ({ db, companyId: c.id, userId: c.ownerId }));
 }
 
 /**
  * Where a company's scheduled exports go. The oldest company keeps the report-export folder
  * itself (unchanged from single-company files); every other company gets a sub-folder named
- * after it, so two companies' "Monthly P&L" exports never overwrite each other.
+ * after it plus its unique company id, so two companies' "Monthly P&L" exports never overwrite
+ * each other even when the companies share a name (or names that sanitize to the same text).
  */
 export async function companyExportDir(ctx: ServiceContext): Promise<string> {
   const root = reportExportRoot();
@@ -55,7 +60,8 @@ export async function companyExportDir(ctx: ServiceContext): Promise<string> {
   const idx = rows.findIndex((c) => c.id === ctx.companyId);
   if (idx <= 0) return root;
   const safe = rows[idx].name.replace(/[^A-Za-z0-9 _.&()'-]/g, '-').replace(/\.{2,}/g, '.').trim().slice(0, 80);
-  return path.join(root, 'Companies', safe && safe !== '.' ? safe : rows[idx].id);
+  const id = rows[idx].id.replace(/[^A-Za-z0-9-]/g, '');
+  return path.join(root, 'Companies', safe && safe !== '.' ? `${safe} (${id})` : id);
 }
 
 /** @deprecated The oldest company's internal context only; use internalContexts. */
