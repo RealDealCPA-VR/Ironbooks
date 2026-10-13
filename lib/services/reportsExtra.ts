@@ -26,6 +26,7 @@ import {
   paymentsReceived,
   salesReceiptLines,
   salesReceipts,
+  vendorCreditApplications,
   vendorCredits,
   vendors,
 } from '@/lib/db/schema';
@@ -370,9 +371,13 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    let amount = billedBase.minus(cashAsOf).minus(creditResidual);
+    // p1 fx: a foreign invoice's payments count on the date they were APPLIED (an apply made
+    // after the cutoff had not reduced it yet), so whether it was open is decided from its as-of
+    // foreign open amount, and it is aged at the home amount A/R still carries for it.
+    const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
-    if (row.currency && foreignOpen.has(row.invoiceId)) amount = foreignOpen.get(row.invoiceId)!.homeOpen;
+    if (fo) amount = fo.homeOpen;
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const daysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
@@ -460,6 +465,75 @@ function billHomeOpen(row: { total: string; exchangeRate: string | null }, homeA
   return Money.round2(anchor.minus(Money.of(homeApplied ?? '0')));
 }
 
+/**
+ * p1 fx: foreign vendor-credit applications (and unapplies, negative) dated AFTER the cutoff. On
+ * the cutoff date they had not reduced the bill yet, and the credit still held them: per bill the
+ * foreign amount, per credit the foreign amount and the home part of the credit they took.
+ */
+async function vendorCreditAppsAfter(ctx: ServiceContext, cutoff: Date) {
+  const rows = await ctx.db
+    .select({
+      billId: vendorCreditApplications.billId,
+      creditId: vendorCreditApplications.vendorCreditId,
+      amount: vendorCreditApplications.amount,
+      homeCredit: vendorCreditApplications.homeCredit,
+    })
+    .from(vendorCreditApplications)
+    .where(and(eq(vendorCreditApplications.companyId, ctx.companyId), gt(vendorCreditApplications.date, cutoff)));
+  const byBill = new Map<string, ReturnType<typeof Money.zero>>();
+  const byCredit = new Map<string, { foreign: ReturnType<typeof Money.zero>; home: ReturnType<typeof Money.zero> }>();
+  for (const r of rows) {
+    byBill.set(r.billId, (byBill.get(r.billId) ?? Money.zero()).plus(Money.of(r.amount)));
+    const c = byCredit.get(r.creditId) ?? { foreign: Money.zero(), home: Money.zero() };
+    byCredit.set(r.creditId, { foreign: c.foreign.plus(Money.of(r.amount)), home: c.home.plus(Money.of(r.homeCredit)) });
+  }
+  return { byBill, byCredit };
+}
+
+/**
+ * Vendor credits open as of the cutoff (dated on/before it), each at the home A/P it carried then:
+ * today's unapplied plus foreign applications made after the cutoff (a foreign credit counts at its
+ * home part, homeUnapplied). Home-currency credit applications are undated and count as applied.
+ */
+async function vendorCreditsOpenAsOf(
+  ctx: ServiceContext,
+  cutoff: Date,
+  later: Awaited<ReturnType<typeof vendorCreditAppsAfter>>['byCredit'],
+) {
+  const laterIds = [...later.keys()];
+  const open = sql`CAST(${vendorCredits.unapplied} AS NUMERIC) > 0`;
+  const rows = await ctx.db
+    .select({
+      id: vendorCredits.id,
+      vendorId: vendorCredits.vendorId,
+      vendorName: vendors.displayName,
+      date: vendorCredits.date,
+      currency: vendorCredits.currency,
+      unapplied: vendorCredits.unapplied,
+      homeUnapplied: vendorCredits.homeUnapplied,
+    })
+    .from(vendorCredits)
+    .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
+    .where(
+      and(
+        eq(vendorCredits.companyId, ctx.companyId),
+        ne(vendorCredits.status, 'void'),
+        lte(vendorCredits.date, cutoff),
+        laterIds.length ? sql`(${open} OR ${inArray(vendorCredits.id, laterIds)})` : open,
+      ),
+    );
+  const out: Array<(typeof rows)[number] & { homeOpen: ReturnType<typeof Money.zero> }> = [];
+  for (const r of rows) {
+    const l = later.get(r.id);
+    const foreign = Money.of(r.unapplied).plus(l?.foreign ?? Money.zero());
+    if (!foreign.greaterThan(0)) continue;
+    const homeNow = r.currency ? Money.of(r.homeUnapplied ?? r.unapplied) : Money.of(r.unapplied);
+    const homeOpen = Money.round2(homeNow.plus(r.currency ? (l?.home ?? Money.zero()) : (l?.foreign ?? Money.zero())));
+    out.push({ ...r, homeOpen });
+  }
+  return out;
+}
+
 export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
   const cutoff = asOf ?? new Date();
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
@@ -509,6 +583,7 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
+  const vcLater = await vendorCreditAppsAfter(ctx, cutoff);
 
   const byVendor = new Map<string, { name: string; buckets: BucketAccum }>();
 
@@ -521,7 +596,9 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .plus(Money.of(row.amountCredited ?? '0'))
       .minus(cashAllTime)
       // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
-      .minus(journalCreditsLater.get(row.billId) ?? Money.zero());
+      .minus(journalCreditsLater.get(row.billId) ?? Money.zero())
+      // p1 fx: nor had foreign vendor credits applied after it (their applications are dated).
+      .minus(vcLater.byBill.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
@@ -540,32 +617,13 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     byVendor.get(row.vendorId)!.buckets[key] = byVendor.get(row.vendorId)!.buckets[key].plus(amount);
   }
 
-  // Unapplied vendor credits reduce net payables — negative 'current' rows.
-  const creditRows = await ctx.db
-    .select({
-      vendorId: vendorCredits.vendorId,
-      vendorName: vendors.displayName,
-      // p1 fx: a foreign credit counts at the home A/P it still carries.
-      unapplied: sql<string>`COALESCE(SUM(CAST(CASE WHEN ${vendorCredits.currency} IS NOT NULL THEN COALESCE(${vendorCredits.homeUnapplied}, ${vendorCredits.unapplied}) ELSE ${vendorCredits.unapplied} END AS NUMERIC)), 0)`,
-    })
-    .from(vendorCredits)
-    .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
-    .where(
-      and(
-        eq(vendorCredits.companyId, ctx.companyId),
-        ne(vendorCredits.status, 'void'),
-        lte(vendorCredits.date, cutoff),
-        sql`CAST(${vendorCredits.unapplied} AS NUMERIC) > 0`,
-      ),
-    )
-    .groupBy(vendorCredits.vendorId, vendors.displayName);
-
-  for (const credit of creditRows) {
+  // Unapplied vendor credits reduce net payables — negative 'current' rows (as of the cutoff).
+  for (const credit of await vendorCreditsOpenAsOf(ctx, cutoff, vcLater.byCredit)) {
     if (!byVendor.has(credit.vendorId)) {
       byVendor.set(credit.vendorId, { name: credit.vendorName, buckets: blankBuckets() });
     }
     const buckets = byVendor.get(credit.vendorId)!.buckets;
-    buckets.current = buckets.current.minus(Money.of(credit.unapplied));
+    buckets.current = buckets.current.minus(credit.homeOpen);
   }
 
   await addJournalItemsToAging(ctx, 'ap', cutoff, byVendor);
@@ -1073,10 +1131,12 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    let amount = billedBase.minus(cashAsOf).minus(creditResidual);
-    if (!amount.greaterThan(0)) continue;
-    // p1 fx: home amount A/R carries, with the foreign open amount alongside.
+    // p1 fx: home amount A/R carries, with the foreign open amount alongside. Whether a foreign
+    // invoice was open is decided from its as-of foreign open amount (payments count on the date
+    // they were applied), as in arAging.
     const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
+    if (!amount.greaterThan(0)) continue;
     if (fo) amount = fo.homeOpen;
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
@@ -1187,6 +1247,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
+  const vcLater = await vendorCreditAppsAfter(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
@@ -1196,7 +1257,9 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .plus(Money.of(row.amountCredited ?? '0'))
       .minus(cashAllTime)
       // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
-      .minus(journalCreditsLater.get(row.billId) ?? Money.zero());
+      .minus(journalCreditsLater.get(row.billId) ?? Money.zero())
+      // p1 fx: nor had foreign vendor credits applied after it (their applications are dated).
+      .minus(vcLater.byBill.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
@@ -1223,26 +1286,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     });
   }
 
-  const creditRows = await ctx.db
-    .select({
-      id: vendorCredits.id,
-      vendorId: vendorCredits.vendorId,
-      vendorName: vendors.displayName,
-      date: vendorCredits.date,
-      // p1 fx: a foreign credit counts at the home A/P it still carries.
-      unapplied: sql<string>`CASE WHEN ${vendorCredits.currency} IS NOT NULL THEN COALESCE(${vendorCredits.homeUnapplied}, ${vendorCredits.unapplied}) ELSE ${vendorCredits.unapplied} END`,
-    })
-    .from(vendorCredits)
-    .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
-    .where(
-      and(
-        eq(vendorCredits.companyId, ctx.companyId),
-        ne(vendorCredits.status, 'void'),
-        lte(vendorCredits.date, cutoff),
-        sql`CAST(${vendorCredits.unapplied} AS NUMERIC) > 0`,
-      ),
-    );
-  for (const c of creditRows) {
+  for (const c of await vendorCreditsOpenAsOf(ctx, cutoff, vcLater.byCredit)) {
     detail.push({
       docId: c.id,
       docNumber: 'Vendor Credit',
@@ -1253,7 +1297,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       dueDate: null,
       daysPastDue: 0,
       bucket: 'current',
-      openBalance: toAmountString(Money.of(c.unapplied).negated()),
+      openBalance: toAmountString(c.homeOpen.negated()),
     });
   }
 

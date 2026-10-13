@@ -584,26 +584,65 @@ async function postRefundVoidFxPlug(
     reversed: ReturnType<typeof Money.of>;
   },
 ) {
+  const { paymentCreditHome } = await import('./customerCredits');
+  const homeAt = (v: ReturnType<typeof Money.of>) => paymentCreditHome(v, p.rate);
+  const total = Money.round2(homeAt(p.unappliedAfter).minus(homeAt(p.unappliedBefore)).minus(p.reversed));
+  await postPaymentCreditFxPlugs(tx, {
+    payment: p.payment,
+    arAccountId: p.arAccountId,
+    from: p.refundDate,
+    rate: p.rate,
+    unappliedNow: p.unappliedAfter,
+    total,
+    description: 'Exchange rounding on voided refund of a foreign-currency payment',
+  });
+}
+
+/**
+ * p1 fx: dated Exchange Gain/Loss plugs that keep a foreign payment's credit on A/R equal to
+ * round2(unapplied as of the date x payment rate) at every date from `from` on. Used after a refund
+ * is voided and after a refund is recorded (a refund backdated before applies / unapplies that were
+ * entered earlier changes the home value of those later steps). Walks the dates the credit or its
+ * A/R changed (customerCredits.ts paymentCreditEvents / paymentCreditLedger) in the CURRENT state
+ * (the refund or its void already written) and posts the difference on that date.
+ *
+ * `total` is the plug the change needs today (+ = the credit grows on A/R). Safety net: if the dated
+ * plugs do not add up to it (a ledger shape the walk does not model, e.g. data from before relief
+ * records existed), one plug of exactly `total` is posted on the latest date the credit changed,
+ * which keeps today's A/R equal to the aging.
+ */
+export async function postPaymentCreditFxPlugs(
+  tx: ServiceContext,
+  p: {
+    payment: { id: string; postedEntryId: string | null; exchangeRate: string | null };
+    arAccountId: string;
+    from: Date;
+    rate: ReturnType<typeof Money.of>;
+    /** The payment's unapplied credit now (payment currency), after the change. */
+    unappliedNow: ReturnType<typeof Money.of>;
+    total: ReturnType<typeof Money.of>;
+    description: string;
+  },
+) {
   const { paymentCreditEvents, paymentCreditLedger, ledgerCreditAsOf, unappliedAsOf, paymentCreditHome } =
     await import('./customerCredits');
   const homeAt = (v: ReturnType<typeof Money.of>) => paymentCreditHome(v, p.rate);
-  const total = Money.round2(homeAt(p.unappliedAfter).minus(homeAt(p.unappliedBefore)).minus(p.reversed));
+  const total = Money.round2(p.total);
   if (p.rate.equals(1)) {
-    if (!total.isZero()) await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, p.refundDate, total);
+    if (!total.isZero()) await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, p.from, total, p.description);
     return;
   }
 
-  // State after the void (the refund entry is already void, the unapplied credit restored).
   const events = (await paymentCreditEvents(tx, [p.payment])).get(p.payment.id) ?? [];
   const ledger = await paymentCreditLedger(tx, p.payment);
-  const from = p.refundDate.getTime();
+  const from = p.from.getTime();
   const times = [...new Set([from, ...events.map((e) => e.date.getTime()), ...ledger.map((l) => l.date.getTime())])]
     .filter((t) => t >= from)
     .sort((a, b) => a - b);
   const plugs: Array<{ date: Date; amount: ReturnType<typeof Money.of> }> = [];
   for (const t of times) {
     const at = new Date(t);
-    const target = homeAt(unappliedAsOf(p.unappliedAfter, events, at));
+    const target = homeAt(unappliedAsOf(p.unappliedNow, events, at));
     const diff = Money.round2(target.minus(ledgerCreditAsOf(ledger, at)));
     if (diff.isZero()) continue;
     plugs.push({ date: at, amount: diff });
@@ -614,10 +653,10 @@ async function postRefundVoidFxPlug(
   if (!Money.round2(sum).equals(total)) {
     if (total.isZero()) return;
     const latest = Math.max(from, ...events.map((e) => e.date.getTime()));
-    await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, new Date(latest), total);
+    await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, new Date(latest), total, p.description);
     return;
   }
-  for (const x of plugs) await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, x.date, x.amount);
+  for (const x of plugs) await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, x.date, x.amount, p.description);
 }
 
 /**
@@ -629,6 +668,7 @@ async function postOneRefundVoidPlug(
   arAccountId: string,
   date: Date,
   diff: ReturnType<typeof Money.of>,
+  description: string,
 ) {
   // Dynamic import: currencies.ts imports this module.
   const { getOrCreateExchangeGainLossAccount } = await import('./currencies');
@@ -636,7 +676,7 @@ async function postOneRefundVoidPlug(
   const amt = toAmountString(Money.abs(diff));
   await postJournalEntry(tx, {
     date,
-    description: 'Exchange rounding on voided refund of a foreign-currency payment',
+    description,
     sourceRef: `payment:${paymentId}`,
     lines: diff.greaterThan(0)
       ? [

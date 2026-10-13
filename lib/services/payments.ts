@@ -42,7 +42,8 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
+import { assertNotControlAccount, postJournalEntry, postPaymentCreditFxPlugs, voidJournalEntry } from './posting';
+import { paymentCreditEvents, unappliedAsOf } from './customerCredits'; // p1 fx
 import { assertPeriodOpen } from './fiscalPeriods';
 import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
@@ -1749,8 +1750,19 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
   // p1 fx: the credit's home value is telescoped exactly like apply/unapply
   // (homeAt(unapplied before) - homeAt(unapplied after)), so A/R stays equal to the aging
   // after any number of partial refunds and a refund of the whole remainder clears it exactly.
-  const baseAmount = Money.round2(homeAt(unapplied, rate).minus(homeAt(Money.round2(unapplied.minus(amount)), rate)));
+  // `todayAmount` telescopes today's credit; the refund itself telescopes the credit AS OF its own
+  // date (a refund backdated before applies / later refunds entered earlier), and dated plugs
+  // (postPaymentCreditFxPlugs) re-telescope the later steps, so A/R equals the aging on every date.
   const refundDate = input.date ?? new Date();
+  const todayAmount = Money.round2(homeAt(unapplied, rate).minus(homeAt(Money.round2(unapplied.minus(amount)), rate)));
+  let baseAmount = todayAmount;
+  if (!rate.equals(1)) {
+    const events = (await paymentCreditEvents(ctx, [payment], { after: refundDate })).get(payment.id);
+    const thenUnapplied = unappliedAsOf(unapplied, events, refundDate);
+    if (thenUnapplied.greaterThanOrEqualTo(amount)) {
+      baseAmount = Money.round2(homeAt(thenUnapplied, rate).minus(homeAt(Money.round2(thenUnapplied.minus(amount)), rate)));
+    }
+  }
 
   return inTransaction(ctx, async (tx) => {
     const entry = await postJournalEntry(tx, {
@@ -1794,6 +1806,20 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
         postedEntryId: entry.id,
       },
     });
+
+    // p1 fx: later-dated steps of the credit (applies / unapplies / refunds entered before this
+    // backdated refund) now telescope from a different credit: re-plug them on their own dates.
+    if (!rate.equals(1)) {
+      await postPaymentCreditFxPlugs(tx, {
+        payment,
+        arAccountId,
+        from: refundDate,
+        rate,
+        unappliedNow: newUnapplied,
+        total: Money.round2(baseAmount.minus(todayAmount)),
+        description: 'Exchange rounding on refund of a foreign-currency payment',
+      });
+    }
 
     return { payment: updatedPayment, entry };
   });
