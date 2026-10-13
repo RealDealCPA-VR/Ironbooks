@@ -26,6 +26,7 @@ import {
   creditApplications,
   creditMemos,
   customers,
+  homeCurrencyAdjustments,
   invoices,
   journalEntries,
   journalEntryLines,
@@ -43,7 +44,8 @@ import { paymentsUnappliedAsOf } from './customerCredits';
 import { vendorCreditRefundsAfter } from './vendorCreditsFx';
 
 export interface ForeignOpenItem {
-  kind: 'invoice' | 'payment' | 'bill' | 'vendor_credit';
+  /** 'hca': a posted Home Currency Adjustment not yet reversed (foreignOpen 0, home only). */
+  kind: 'invoice' | 'payment' | 'bill' | 'vendor_credit' | 'hca';
   id: string;
   entityId: string;
   entityName: string;
@@ -287,6 +289,82 @@ export async function clearPaymentFxReliefs(ctx: ServiceContext, paymentId: stri
 }
 
 /** Open foreign-currency A/R items (invoices and unapplied payments) as of a date. */
+/**
+ * Home Currency Adjustments in effect on the date, per customer / vendor and currency: the named
+ * A/R or A/P lines of posted hca:<id> entries and their next-day hca-reversal:<id> entries dated on
+ * or before asOf. They net to zero once the reversal date is reached, so they only show between an
+ * HCA and its reversal — where the control account already carries the revaluation. Without them
+ * the subledger disagrees with the GL on the HCA date and a second HCA re-posts the same
+ * adjustment. Home amount only (foreignOpen 0), in the item sign convention (A/R debit +, A/P
+ * credit +).
+ */
+async function hcaItemsAsOf(ctx: ServiceContext, side: 'ar' | 'ap', asOf: Date): Promise<ForeignOpenItem[]> {
+  const entityType = side === 'ar' ? 'customer' : 'vendor';
+  const rows = await ctx.db
+    .select({
+      ref: journalEntries.sourceRef,
+      date: journalEntries.date,
+      entityId: journalEntryLines.entityId,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+      memo: journalEntryLines.memo,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        lte(journalEntries.date, asOf),
+        sql`(${journalEntries.sourceRef} LIKE 'hca:%' OR ${journalEntries.sourceRef} LIKE 'hca-reversal:%')`,
+        eq(journalEntryLines.entityType, entityType),
+        isNotNull(journalEntryLines.entityId),
+      ),
+    );
+  if (rows.length === 0) return [];
+  const hcaIds = [...new Set(rows.map((r) => r.ref!.slice(r.ref!.indexOf(':') + 1)))];
+  const hcas = await ctx.db
+    .select({ id: homeCurrencyAdjustments.id, date: homeCurrencyAdjustments.date, detail: homeCurrencyAdjustments.detail })
+    .from(homeCurrencyAdjustments)
+    .where(and(eq(homeCurrencyAdjustments.companyId, ctx.companyId), inArray(homeCurrencyAdjustments.id, hcaIds)));
+  const byId = new Map(hcas.map((h) => [h.id, h]));
+  const names =
+    side === 'ar'
+      ? await ctx.db.select({ id: customers.id, name: customers.displayName }).from(customers).where(eq(customers.companyId, ctx.companyId))
+      : await ctx.db.select({ id: vendors.id, name: vendors.displayName }).from(vendors).where(eq(vendors.companyId, ctx.companyId));
+  const nameOf = new Map(names.map((n) => [n.id, n.name]));
+  const acc = new Map<string, { hcaId: string; entityId: string; currency: string; home: Decimal }>();
+  for (const r of rows) {
+    const hcaId = r.ref!.slice(r.ref!.indexOf(':') + 1);
+    const detail = (byId.get(hcaId)?.detail ?? []) as Array<{ kind?: string; entityId?: string | null; currency?: string }>;
+    const currency =
+      detail.find((l) => l.kind === entityType && l.entityId === r.entityId)?.currency ??
+      /\(([A-Z]{3})\)\s*$/.exec(r.memo ?? '')?.[1] ??
+      '';
+    const signed = Money.of(r.debit ?? 0).minus(Money.of(r.credit ?? 0));
+    const k = `${hcaId}|${r.entityId}|${currency}`;
+    const cur = acc.get(k) ?? { hcaId, entityId: r.entityId!, currency, home: Money.zero() };
+    cur.home = cur.home.plus(side === 'ar' ? signed : signed.negated());
+    acc.set(k, cur);
+  }
+  const out: ForeignOpenItem[] = [];
+  for (const v of acc.values()) {
+    if (r2(v.home).isZero()) continue;
+    out.push({
+      kind: 'hca',
+      id: v.hcaId,
+      entityId: v.entityId,
+      entityName: nameOf.get(v.entityId) ?? '',
+      date: byId.get(v.hcaId)?.date ?? asOf,
+      currency: v.currency,
+      rate: Money.zero(),
+      foreignOpen: Money.zero(),
+      homeOpen: r2(v.home),
+    });
+  }
+  return out;
+}
+
 export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): Promise<ForeignOpenItem[]> {
   const home = await homeCode(ctx);
   const inv = await ctx.db
@@ -379,6 +457,7 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
       homeOpen: homeAt(unapplied, rate).negated(),
     });
   }
+  out.push(...(await hcaItemsAsOf(ctx, 'ar', asOf)));
   return out;
 }
 
@@ -524,6 +603,7 @@ export async function foreignOpenPayables(ctx: ServiceContext, asOf: Date): Prom
       });
     }
   }
+  out.push(...(await hcaItemsAsOf(ctx, 'ap', asOf)));
   return out;
 }
 
