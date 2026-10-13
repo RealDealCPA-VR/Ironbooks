@@ -84,21 +84,23 @@ type ReportLine = {
 /** Every line of the given (already company-scoped) paychecks, grouped by paycheck. */
 async function linesByPaycheck(ctx: ServiceContext, ids: string[]): Promise<Map<string, ReportLine[]>> {
   const out = new Map<string, ReportLine[]>();
-  if (ids.length === 0) return out;
-  const rows = await ctx.db
-    .select({
-      paycheckId: paycheckLines.paycheckId,
-      kind: paycheckLines.kind,
-      name: paycheckLines.name,
-      amount: paycheckLines.amount,
-      taxTracking: paycheckLines.taxTracking,
-    })
-    .from(paycheckLines)
-    .where(inArray(paycheckLines.paycheckId, ids));
-  for (const r of rows) {
-    const arr = out.get(r.paycheckId) ?? [];
-    arr.push(r);
-    out.set(r.paycheckId, arr);
+  // Chunked: callers may pass a company's whole payroll history.
+  for (let i = 0; i < ids.length; i += 1000) {
+    const rows = await ctx.db
+      .select({
+        paycheckId: paycheckLines.paycheckId,
+        kind: paycheckLines.kind,
+        name: paycheckLines.name,
+        amount: paycheckLines.amount,
+        taxTracking: paycheckLines.taxTracking,
+      })
+      .from(paycheckLines)
+      .where(inArray(paycheckLines.paycheckId, ids.slice(i, i + 1000)));
+    for (const r of rows) {
+      const arr = out.get(r.paycheckId) ?? [];
+      arr.push(r);
+      out.set(r.paycheckId, arr);
+    }
   }
   return out;
 }
@@ -475,8 +477,12 @@ const DEPOSIT_LAG_DAYS = 15;
  * week, plus holidays. A deposit can pay paydays at most this many days earlier.
  */
 const SEMIWEEKLY_MATCH_DAYS = 14;
-/** How far before the quarter the semiweekly deposit allocation is replayed. */
-const SEMIWEEKLY_REPLAY_DAYS = 60;
+/**
+ * The semiweekly deposit allocation is always replayed from this fixed origin (before any
+ * company's payroll history), never from a point that depends on the quarter: every quarter's
+ * form then sees the same allocation, so a deposit is counted exactly once across forms.
+ */
+const SEMIWEEKLY_REPLAY_ORIGIN = new Date(Date.UTC(1900, 0, 1));
 const DAY_MS = 86_400_000;
 
 const FORM941_EMPLOYEE_TRACKING = new Set(['federal_withholding', 'social_security', 'medicare']);
@@ -712,16 +718,17 @@ async function form941Deposits(ctx: ServiceContext, start: Date, end: Date, semi
   const winEnd = new Date(end.getTime() + DEPOSIT_LAG_DAYS * DAY_MS);
   if (!semiweekly) return payrollTaxPayments(ctx, winStart, winEnd, is941Item);
 
-  // Replay allocation from well before the quarter so paydays just before it carry the right
-  // unpaid balance (earlier deposits have already paid them), through the later of the monthly
-  // window's end and a match window past the quarter end.
-  const replayFrom = new Date(start.getTime() - SEMIWEEKLY_REPLAY_DAYS * DAY_MS);
+  // Replay the allocation over the company's whole payroll history (checks and deposits loaded
+  // from the same fixed origin) so the starting state never depends on the quarter being
+  // computed, through the later of the monthly window's end and a match window past the
+  // quarter end.
+  const replayFrom = SEMIWEEKLY_REPLAY_ORIGIN;
   const candTo = new Date(Math.max(winEnd.getTime(), end.getTime() + (SEMIWEEKLY_MATCH_DAYS + 1) * DAY_MS));
   const candidates = await payrollTaxPayments(ctx, replayFrom, candTo, is941Item);
   if (!candidates.length) return [];
 
   // Unpaid Form 941 liability by payday (voided checks are not counted).
-  const checks = await countedChecks(ctx, new Date(replayFrom.getTime() - SEMIWEEKLY_MATCH_DAYS * DAY_MS), candTo);
+  const checks = await countedChecks(ctx, replayFrom, candTo);
   const byCheck = await linesByPaycheck(ctx, checks.map((c) => c.id));
   const unpaid = new Map<number, Dec>();
   for (const c of checks) {

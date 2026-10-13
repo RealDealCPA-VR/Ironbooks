@@ -1,8 +1,9 @@
 /**
  * Independent QA (tester, re-test round 2) for fix round 2 (847b0c6, 3ebe2bd):
  *  - Form 941 line 13 for semiweekly filers now applies each deposit by amount to the unpaid
- *    941 tax of the paydays in its 14-day lookback, oldest first, replaying from 60 days before
- *    the quarter; leftovers use the monthly window.
+ *    941 tax of the paydays in its 14-day lookback, oldest first, replaying over the company's
+ *    whole payroll history (fixed origin; was 60 days before the quarter); leftovers use the
+ *    monthly window.
  *  - State withholding tables not yet confirmed carry a check-the-amount note.
  *
  * Adversarial cases:
@@ -109,7 +110,7 @@ afterAll(async () => {
 });
 
 describe('P1 payroll fix round 2 — tester re-test', () => {
-  // PRODUCTION BUG (fails): the semiweekly allocation is replayed from a fixed 60 days before
+  // Regression (fixed in fix round 3 by replaying from a fixed origin): the semiweekly allocation was replayed from 60 days before
   // the quarter, so each quarter's computation starts from a different state. Paydays just
   // before the replay start whose deposits fall before it look unpaid, later deposits are
   // applied to them first, and the FIFO allocation shifts. With weekly paydays of varying
