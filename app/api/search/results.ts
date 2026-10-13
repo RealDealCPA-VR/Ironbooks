@@ -17,6 +17,21 @@ export interface SearchResultItem {
   id: string;
 }
 
+const DOC_KIND_LABEL: Record<NonNullable<SearchHits['docs']>[number]['kind'], string> = {
+  estimate: 'Estimate',
+  sales_order: 'Sales Order',
+  sales_receipt: 'Sales Receipt',
+  credit_memo: 'Credit Memo',
+  purchase_order: 'Purchase Order',
+};
+const DOC_KIND_HREF: Record<NonNullable<SearchHits['docs']>[number]['kind'], string> = {
+  estimate: '/estimates',
+  sales_order: '/sales-orders',
+  sales_receipt: '/sales-receipts',
+  credit_memo: '/credit-memos',
+  purchase_order: '/purchase-orders',
+};
+
 export function buildResults(hits: Partial<SearchHits>): SearchResultItem[] {
   const results: SearchResultItem[] = [
     ...(hits.cust ?? []).map((c) => ({
@@ -39,7 +54,7 @@ export function buildResults(hits: Partial<SearchHits>): SearchResultItem[] {
     })),
     ...(hits.inv ?? []).map((i) => ({
       type: 'Invoice',
-      label: `Invoice #${i.num}`,
+      label: `Invoice #${i.ref || i.num}`,
       href: `/invoices?focus=${i.id}`,
       id: i.id,
     })),
@@ -75,10 +90,16 @@ export function buildResults(hits: Partial<SearchHits>): SearchResultItem[] {
       href: '/journal',
       id: j.id,
     })),
+    ...(hits.docs ?? []).map((d) => ({
+      type: DOC_KIND_LABEL[d.kind],
+      label: `${DOC_KIND_LABEL[d.kind]} #${d.num}`,
+      href: DOC_KIND_HREF[d.kind],
+      id: d.id,
+    })),
     // Exact-amount hits (duplicates of number matches are removed below).
     ...(hits.amtInv ?? []).map((i) => ({
       type: 'Invoice',
-      label: `Invoice #${i.num} — ${formatCurrency(i.total)}`,
+      label: `Invoice #${i.ref || i.num} — ${formatCurrency(i.total)}`,
       href: `/invoices?focus=${i.id}`,
       id: i.id,
     })),

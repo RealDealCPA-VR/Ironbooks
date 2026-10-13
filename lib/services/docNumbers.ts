@@ -299,3 +299,32 @@ export async function setStartingDocNumber(
     nextNumber: await nextDocNumber(ctx, docType),
   };
 }
+
+/**
+ * Renumber an existing document when the user typed a different number on the edit form
+ * (QB lets you change "Invoice #", "Estimate No." ... on a saved form). Returns null when the
+ * number is unchanged or left blank (keep the current one). A number used by ANOTHER document
+ * of this type is refused (CONFLICT, duplicateDocNumber) unless the user confirmed the warning.
+ * Call inside the update transaction; store both returned values.
+ */
+export async function renumberDoc(
+  ctx: ServiceContext,
+  docType: DocType,
+  id: string,
+  current: { refNumber: string | null; number: number },
+  userRef: string | null | undefined,
+  opts: { allowDuplicate?: boolean } = {},
+): Promise<{ refNumber: string; number: number; duplicate: boolean } | null> {
+  if (userRef === undefined) return null;
+  const typed = normalizeDocNumber(userRef);
+  if (!typed) return null;
+  if (typed === docRef(current.refNumber, current.number)) return null;
+  await ctx.db.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtext(${`docnum:${ctx.companyId}:${docType}`}))`,
+  );
+  const { duplicate } = await assertUniqueDocNumber(ctx, docType, typed, {
+    excludeId: id,
+    allowDuplicate: opts.allowDuplicate,
+  });
+  return { refNumber: typed, number: docNumberToInt(typed) ?? current.number, duplicate };
+}

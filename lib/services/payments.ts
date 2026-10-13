@@ -320,7 +320,7 @@ export interface AvailableCredit {
  */
 export async function listAvailableCredits(ctx: ServiceContext, customerId: string): Promise<AvailableCredit[]> {
   const memos = await ctx.db
-    .select({ id: creditMemos.id, memoNumber: creditMemos.memoNumber, date: creditMemos.date, unapplied: creditMemos.unapplied })
+    .select({ id: creditMemos.id, memoNumber: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))`, date: creditMemos.date, unapplied: creditMemos.unapplied })
     .from(creditMemos)
     .where(
       and(
@@ -579,7 +579,7 @@ async function postPayment(
   const memoIds = [...new Set(credits.map((c) => c.creditMemoId))];
   if (memoIds.length > 0) {
     const memoRows = await tx.db
-      .select({ id: creditMemos.id, customerId: creditMemos.customerId, status: creditMemos.status, unapplied: creditMemos.unapplied, memoNumber: creditMemos.memoNumber })
+      .select({ id: creditMemos.id, customerId: creditMemos.customerId, status: creditMemos.status, unapplied: creditMemos.unapplied, memoNumber: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))` })
       .from(creditMemos)
       .where(and(eq(creditMemos.companyId, tx.companyId), inArray(creditMemos.id, memoIds)));
     const memoById = new Map(memoRows.map((m) => [m.id, m]));

@@ -77,6 +77,8 @@ export interface ExpiringEstimate {
   customerId: string;
   customerName: string;
   estimateNumber: number;
+  /** The estimate number users see (typed ref number, else the integer). */
+  refNumber: string | null;
   status: string;
   total: string;
   expirationDate: Date;
@@ -101,6 +103,7 @@ export async function listExpiringEstimates(
       customerId: estimates.customerId,
       customerName: customers.displayName,
       estimateNumber: estimates.estimateNumber,
+      refNumber: estimates.refNumber,
       status: estimates.status,
       total: estimates.total,
       expirationDate: estimates.expirationDate,

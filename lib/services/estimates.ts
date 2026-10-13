@@ -24,7 +24,8 @@ import {
 } from './_base';
 import { createInvoice } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { allocateDocNumber, docRef } from './docNumbers';
+import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
+import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import {
   estimateLineProgress,
   overBilledLine,
@@ -70,6 +71,8 @@ export interface CreateEstimateInput {
    */
   taxRateId?: string | null;
   memo?: string | null;
+  /** p1/salesforms: ship-to address (omitted on create → the customer's default ship-to). */
+  shipTo?: Record<string, string> | null;
   /** wave2 sales (C7): queue for batch printing / emailing. */
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
@@ -223,6 +226,8 @@ async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) 
 }
 
 export async function createEstimate(ctx: ServiceContext, input: CreateEstimateInput) {
+  input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
+  input = await applyCustomerShipToDefault(ctx, input);
   const { computedLines, subtotal, taxAmount, total } = await prepareEstimate(ctx, input);
 
   return inTransaction(ctx, async (tx) => {
@@ -245,6 +250,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         total: toAmountString(total),
         memo: input.memo ?? null,
         taxRateId: input.taxRateId ?? null,
+        shipTo: input.shipTo ?? null,
         toBePrinted: input.toBePrinted ?? false,
         toBeEmailed: input.toBeEmailed ?? false,
       })
@@ -441,6 +447,8 @@ export async function convertToInvoice(
       memo: estimate.memo ?? undefined,
       // wave2 sales: carry the quoted tax rate (stored since 0027) so the invoice total matches.
       taxRateId: estimate.taxRateId ?? null,
+      // The estimate's ship-to carries over (none → the customer's default ship-to).
+      shipTo: estimate.shipTo ?? undefined,
       overrideCreditLimit: opts?.overrideCreditLimit,
     });
 
@@ -653,6 +661,7 @@ export async function createProgressInvoice(
       memo: `Progress billing (${progressLabel}) for Estimate #${estRef}`,
       // Sales tax is charged on the invoice itself, at the estimate's rate, on taxable lines.
       taxRateId: estimate.taxRateId ?? null,
+      shipTo: estimate.shipTo ?? undefined,
       overrideCreditLimit: input.overrideCreditLimit,
       // Over-billing was checked (and, if asked, allowed) just above against the same figures.
       allowOverBilling: true,
@@ -701,6 +710,7 @@ export async function createProgressInvoice(
  * progress-billed) — the invoices carry its amounts; edit those instead.
  */
 export async function updateEstimate(ctx: ServiceContext, id: string, input: CreateEstimateInput) {
+  input = await applyCustomerTaxDefaults(ctx, input);
   const existing = await getEstimate(ctx, id);
   if (existing.status === 'closed' || existing.convertedInvoiceId) {
     throw new ServiceError(
@@ -724,6 +734,10 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
     if (!current || current.status === 'closed' || current.status === 'partial') {
       throw new ServiceError('CONFLICT', 'This estimate changed while you were editing it — reload and try again.');
     }
+    const renum = await renumberDoc(
+      tx, 'estimate', id, { refNumber: current.refNumber, number: current.estimateNumber },
+      input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+    );
     await tx.db.delete(estimateLines).where(eq(estimateLines.estimateId, id));
     await tx.db.insert(estimateLines).values(
       computedLines.map((cl) => ({
@@ -750,6 +764,8 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         total: toAmountString(total),
         memo: input.memo ?? null,
         taxRateId: input.taxRateId ?? null,
+        ...(renum ? { refNumber: renum.refNumber, estimateNumber: renum.number } : {}),
+        shipTo: input.shipTo !== undefined ? input.shipTo : current.shipTo,
         toBePrinted: input.toBePrinted ?? current.toBePrinted,
         toBeEmailed: input.toBeEmailed ?? current.toBeEmailed,
         updatedAt: new Date(),
@@ -765,6 +781,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         customerId: existing.customerId,
         date: existing.date,
         expirationDate: existing.expirationDate,
+        refNumber: existing.refNumber,
         total: existing.total,
         memo: existing.memo,
         lines: existing.lines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),
@@ -773,6 +790,8 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         customerId: input.customerId,
         date: input.date,
         expirationDate: input.expirationDate ?? null,
+        refNumber: renum?.refNumber ?? existing.refNumber,
+        duplicateNumber: renum?.duplicate || undefined,
         total: toAmountString(total),
         memo: input.memo ?? null,
         lines: computedLines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, amount: l.amount })),

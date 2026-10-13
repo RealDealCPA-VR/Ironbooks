@@ -3,7 +3,7 @@
  * (lib/pdf/template.ts) with the selected estimate template (default layout when none).
  */
 import { renderFormPdf } from './template';
-import type { PdfTemplate } from './invoice';
+import { shipToObjectLines, type PdfTemplate } from './invoice';
 
 export interface EstimatePdfLine {
   description: string;
@@ -26,6 +26,8 @@ export interface EstimatePdfData {
     memo?: string | null;
   };
   billToLines?: string[];
+  /** p1/salesforms: the estimate's ship-to address. */
+  shipTo?: Record<string, string> | null;
   lines: EstimatePdfLine[];
   currency?: string;
 }
@@ -39,7 +41,10 @@ export async function renderEstimatePdf(data: EstimatePdfData, template?: PdfTem
       company: data.company,
       currency: data.currency,
       fields: { number: e.number, date: e.date, expirationDate: e.expirationDate },
-      parties: { billTo: [data.customerName, ...(data.billToLines ?? [])] },
+      parties: {
+        billTo: [data.customerName, ...(data.billToLines ?? [])],
+        shipTo: shipToObjectLines(data.shipTo).length ? [data.customerName, ...shipToObjectLines(data.shipTo)] : null,
+      },
       lines: data.lines.map((l) => ({
         description: l.description || '—',
         quantity: l.quantity,

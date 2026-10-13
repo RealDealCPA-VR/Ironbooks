@@ -39,7 +39,7 @@ export function pickRows(shipments: Shipment[]): PickListRow[] {
         orders: [],
       };
       row.totalQuantity = String(Math.round((Number(row.totalQuantity) + Number(l.quantity)) * 10000) / 10000);
-      row.orders.push({ orderNumber: s.orderNumber, customerName: s.customerName, quantity: l.quantity });
+      row.orders.push({ orderNumber: s.refNumber || s.orderNumber, customerName: s.customerName, quantity: l.quantity });
       rows.set(key, row);
     }
   }
@@ -77,7 +77,7 @@ export async function packingSlipData(
     company: { name: companyName },
     customerName: s.customerName,
     shipToLines: addr.get(s.customerId) ?? [],
-    slip: { invoiceNumber: '', label: `Sales Order #${s.orderNumber}`, date, orderNumber: null },
+    slip: { invoiceNumber: '', label: `Sales Order #${s.refNumber || s.orderNumber}`, date, orderNumber: null },
     lines: s.lines.map((l) => ({ itemName: l.itemName, description: l.description ?? '', quantity: l.quantity })),
   }));
 }

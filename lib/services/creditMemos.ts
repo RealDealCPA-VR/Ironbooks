@@ -71,7 +71,8 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { allocateDocNumber, docRef } from './docNumbers';
+import { applyCustomerTaxDefaults } from './customerDefaults';
+import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -547,6 +548,7 @@ async function postCreditMemoDocument(
 }
 
 export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInput) {
+  input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   const prep = await prepareCreditMemo(ctx, input);
   const { subtotal, taxAmount, total } = prep;
   return inTransaction(ctx, async (tx) => {
@@ -783,7 +785,9 @@ export async function listCreditApplications(
       amount: creditApplications.amount,
       date: creditApplications.date,
       memoNumber: creditMemos.memoNumber,
+      memoRef: creditMemos.refNumber,
       invoiceNumber: invoices.invoiceNumber,
+      invoiceRef: invoices.refNumber,
     })
     .from(creditApplications)
     .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
@@ -1172,6 +1176,7 @@ export async function updateCreditMemo(
   id: string,
   input: CreateCreditMemoInput,
 ) {
+  input = await applyCustomerTaxDefaults(ctx, input);
   const [existing] = await ctx.db
     .select()
     .from(creditMemos)
@@ -1211,6 +1216,11 @@ export async function updateCreditMemo(
       .where(eq(creditMemoLines.creditMemoId, id))
       .orderBy(asc(creditMemoLines.lineOrder));
 
+    const renum = await renumberDoc(
+      tx, 'credit_memo', id, { refNumber: memo.refNumber, number: memo.memoNumber },
+      input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+    );
+
     // 1) Reverse the old version's postings (restock + A/R entry).
     await reverseCreditMemoPostings(tx, memo);
 
@@ -1218,7 +1228,11 @@ export async function updateCreditMemo(
     await tx.db.delete(creditMemoLines).where(eq(creditMemoLines.creditMemoId, id));
     const { insertedLines, entry, restockEntries } = await postCreditMemoDocument(
       tx,
-      { id, memoNumber: memo.memoNumber, refNumber: memo.refNumber },
+      {
+        id,
+        memoNumber: renum?.number ?? memo.memoNumber,
+        refNumber: renum?.refNumber ?? memo.refNumber,
+      },
       input,
       prep,
     );
@@ -1236,6 +1250,7 @@ export async function updateCreditMemo(
         status: newUnapplied.isZero() ? 'paid' : 'open',
         memo: input.memo ?? null,
         taxRateId: input.taxRateId ?? null,
+        ...(renum ? { refNumber: renum.refNumber, memoNumber: renum.number } : {}),
         toBePrinted: input.toBePrinted ?? memo.toBePrinted,
         toBeEmailed: input.toBeEmailed ?? memo.toBeEmailed,
         postedEntryId: entry.id,
@@ -1250,6 +1265,7 @@ export async function updateCreditMemo(
       oldValues: {
         customerId: memo.customerId,
         date: memo.date,
+        refNumber: memo.refNumber,
         subtotal: memo.subtotal,
         taxAmount: memo.taxAmount,
         total: memo.total,
@@ -1260,6 +1276,8 @@ export async function updateCreditMemo(
       newValues: {
         customerId: input.customerId,
         date: input.date,
+        refNumber: renum?.refNumber ?? memo.refNumber,
+        duplicateNumber: renum?.duplicate || undefined,
         subtotal: toAmountString(prep.subtotal),
         taxAmount: toAmountString(prep.taxAmount),
         total: toAmountString(prep.total),

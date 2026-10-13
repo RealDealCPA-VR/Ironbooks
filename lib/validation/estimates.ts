@@ -3,7 +3,7 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
-import { sendFlagFields } from './sales';
+import { sendFlagFields, zShipTo } from './sales';
 
 export const estimateLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -26,6 +26,7 @@ export const createEstimateSchema = z.object({
   expirationDate: zDate.nullish(),
   taxRateId: zUuid.nullish(),
   memo: z.string().nullish(),
+  shipTo: zShipTo,
   lines: zLines(estimateLineSchema),
   ...sendFlagFields,
 });

@@ -50,6 +50,7 @@ interface WorksheetLine {
 interface WorksheetOrder {
   salesOrderId: string;
   orderNumber: number;
+  refNumber?: string | null;
   date: string;
   status: string;
   customerId: string;
@@ -75,9 +76,11 @@ interface Worksheet {
 interface BatchResult {
   salesOrderId: string;
   orderNumber: number;
+  refNumber?: string | null;
   customerName: string;
   ok: boolean;
   invoiceNumber?: number;
+  invoiceRef?: string;
   total?: string;
   error?: string;
 }
@@ -192,11 +195,11 @@ export default function SoFulfillmentPage() {
       for (const l of o.lines) {
         const v = Number(shipQty[l.lineId] || 0);
         if (!Number.isFinite(v) || v < 0) {
-          toast(`SO #${o.orderNumber}: enter a valid quantity.`, 'danger');
+          toast(`SO #${o.refNumber || o.orderNumber}: enter a valid quantity.`, 'danger');
           return false;
         }
         if (v > Number(l.quantityRemaining)) {
-          toast(`SO #${o.orderNumber}: only ${q(l.quantityRemaining)} of ${l.itemName ?? l.description ?? 'a line'} remain.`, 'danger');
+          toast(`SO #${o.refNumber || o.orderNumber}: only ${q(l.quantityRemaining)} of ${l.itemName ?? l.description ?? 'a line'} remain.`, 'danger');
           return false;
         }
       }
@@ -366,12 +369,12 @@ export default function SoFulfillmentPage() {
                           className="accent-electric"
                           checked={selected.has(o.salesOrderId)}
                           onChange={() => toggle(o.salesOrderId)}
-                          aria-label={`Select sales order ${o.orderNumber}`}
+                          aria-label={`Select sales order ${o.refNumber || o.orderNumber}`}
                         />
                       </Td>
                       <Td>
                         <button type="button" className="inline-flex items-center gap-1 font-semibold text-navy" onClick={() => toggleExpand(o.salesOrderId)}>
-                          {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}#{o.orderNumber}
+                          {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}#{o.refNumber || o.orderNumber}
                         </button>
                       </Td>
                       <Td className="text-navy/70">{formatDate(o.date)}</Td>
@@ -477,9 +480,9 @@ export default function SoFulfillmentPage() {
           <tbody>
             {(results ?? []).map((r) => (
               <Tr key={r.salesOrderId}>
-                <Td>#{r.orderNumber}</Td>
+                <Td>#{r.refNumber || r.orderNumber}</Td>
                 <Td>{r.customerName}</Td>
-                <Td>{r.ok ? <Badge tone="success">Invoice #{r.invoiceNumber}</Badge> : <span className="text-sm text-red-600">{r.error}</span>}</Td>
+                <Td>{r.ok ? <Badge tone="success">Invoice #{r.invoiceRef || r.invoiceNumber}</Badge> : <span className="text-sm text-red-600">{r.error}</span>}</Td>
                 <Td numeric>{r.total ? formatCurrency(r.total) : '—'}</Td>
               </Tr>
             ))}

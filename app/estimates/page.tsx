@@ -33,7 +33,15 @@ import {
   shippingFromDoc,
   shippingPayload,
   useCreditLimitConfirm,
+  useCustomerSalesDefaults,
+  defaultShipToState,
 } from '@/components/sales/SalesExtras';
+import {
+  DocNumberField,
+  docNo,
+  useDocNumber,
+  useDuplicateNumberConfirm,
+} from '@/components/sales/DocNumberField';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,6 +50,9 @@ import {
 interface Estimate {
   id: string;
   estimateNumber: number;
+  /** The number the user typed / sees (e.g. "Q-2026-17"). */
+  refNumber?: string | null;
+  shipTo?: Record<string, string> | null;
   customerId: string;
   date: string;
   expirationDate: string | null;
@@ -292,9 +303,24 @@ export default function EstimatesPage() {
   const [addSaving, setAddSaving] = useState(false);
   /** wave2 sales (C1): the estimate being edited (null = new). */
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editingNumber, setEditingNumber] = useState<number | null>(null);
+  const [editingNumber, setEditingNumber] = useState<string | null>(null);
   const [sendFlags, setSendFlags] = useState<ShippingState>(EMPTY_SHIPPING);
   const creditLimit = useCreditLimitConfirm();
+  // Estimate No. (pre-filled with the next number; editable; duplicate → confirm).
+  const docNumber = useDocNumber('estimate', addOpen, editingId ? editingNumber : null);
+  const dupConfirm = useDuplicateNumberConfirm();
+  // Customer defaults: tax item and ship-to address (new estimates).
+  const custDefaults = useCustomerSalesDefaults(addOpen ? addForm.customerId : null);
+  useEffect(() => {
+    if (!custDefaults || editingId) return;
+    setAddForm((prev) => ({
+      ...prev,
+      taxRateId: custDefaults.taxable ? (custDefaults.taxRateId ?? prev.taxRateId) : '',
+    }));
+    const st = defaultShipToState(custDefaults);
+    if (st) setSendFlags((prev) => ({ ...prev, shipTo: st }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [custDefaults]);
 
   // Convert confirm modal.
   const [convertTarget, setConvertTarget] = useState<Estimate | null>(null);
@@ -405,7 +431,7 @@ export default function EstimatesPage() {
       });
       setSendFlags(shippingFromDoc(detail));
       setEditingId(detail.id);
-      setEditingNumber(detail.estimateNumber);
+      setEditingNumber(docNo(detail.refNumber, detail.estimateNumber));
       setAddOpen(true);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not open the estimate', 'danger');
@@ -433,7 +459,8 @@ export default function EstimatesPage() {
     setAddSaving(true);
     try {
       const body = {
-        ...shippingPayload(sendFlags, { shipping: false }),
+        ...shippingPayload(sendFlags, { shipToOnly: true }),
+        refNumber: docNumber.payload,
         customerId: addForm.customerId,
         date: addForm.date,
         expirationDate: addForm.expirationDate || null,
@@ -449,12 +476,17 @@ export default function EstimatesPage() {
           classId: l.classId || null,
         })),
       };
+      const saved = await dupConfirm.run((allowDuplicateNumber) =>
+        editingId
+          ? api.patch(`/api/estimates/${editingId}`, { ...body, allowDuplicateNumber })
+          : api.post('/api/estimates', { ...body, allowDuplicateNumber }),
+      );
+      if (saved === undefined) return; // kept the form open to change the number
       if (editingId) {
-        await api.patch(`/api/estimates/${editingId}`, body);
-        toast(`Estimate #${editingNumber} updated`, 'success');
+        toast(`Estimate #${docNumber.payload ?? editingNumber} updated`, 'success');
       } else {
-        await api.post('/api/estimates', body);
-        toast('Estimate created', 'success');
+        const ref = (saved as { refNumber?: string | null } | null)?.refNumber;
+        toast(ref ? `Estimate #${ref} created` : 'Estimate created', 'success');
       }
       setAddOpen(false);
       await fetchEstimates();
@@ -473,7 +505,7 @@ export default function EstimatesPage() {
     setPendingStatusId(estimate.id);
     try {
       await api.patch(`/api/estimates/${estimate.id}`, { status });
-      toast(`Estimate #${estimate.estimateNumber} marked ${status}`, 'success');
+      toast(`Estimate #${docNo(estimate.refNumber, estimate.estimateNumber)} marked ${status}`, 'success');
       await fetchEstimates();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to update status', 'danger');
@@ -494,7 +526,7 @@ export default function EstimatesPage() {
         api.post(`/api/estimates/${convertTarget.id}`, { action: 'convert', overrideCreditLimit: override }),
       );
       if (done === undefined) return;
-      toast(`Estimate #${convertTarget.estimateNumber} converted to invoice`, 'success');
+      toast(`Estimate #${docNo(convertTarget.refNumber, convertTarget.estimateNumber)} converted to invoice`, 'success');
       setConvertTarget(null);
       await fetchEstimates();
     } catch (err) {
@@ -573,7 +605,7 @@ export default function EstimatesPage() {
       }
       if (done === undefined) return;
       toast(
-        `Progress invoice created for estimate EST-${String(progressTarget.estimateNumber).padStart(4, '0')}`,
+        `Progress invoice created for estimate #${docNo(progressTarget.refNumber, progressTarget.estimateNumber)}`,
         'success',
       );
       setProgressTarget(null);
@@ -636,7 +668,7 @@ export default function EstimatesPage() {
               {estimates.map((e) => (
                 <Tr key={e.id}>
                   <Td className="font-mono font-semibold text-navy">
-                    EST-{String(e.estimateNumber).padStart(4, '0')}
+                    {docNo(e.refNumber, e.estimateNumber)}
                   </Td>
                   <Td className="font-semibold text-navy">
                     {customerMap.get(e.customerId) ?? '—'}
@@ -753,6 +785,9 @@ export default function EstimatesPage() {
           </>
         }
       >
+        <div className="mb-4 grid grid-cols-2 gap-3">
+          <DocNumberField id="est-number" label="Estimate No." value={docNumber.value} onChange={docNumber.setValue} />
+        </div>
         <EstimateFormBody
           form={addForm}
           customers={customers}
@@ -763,15 +798,22 @@ export default function EstimatesPage() {
           onLinesChange={(lines) => setAddForm((prev) => ({ ...prev, lines }))}
         />
         <div className="mt-4">
-          <ShippingSection value={sendFlags} onChange={setSendFlags} showShipping={false} idPrefix="est" />
+          <ShippingSection
+            value={sendFlags}
+            onChange={setSendFlags}
+            shipToOnly
+            shipTos={custDefaults?.shipTos}
+            idPrefix="est"
+          />
         </div>
+        {dupConfirm.dialog}
       </Modal>
 
       {/* ---- Progress Invoice modal ---- */}
       <Modal
         open={!!progressTarget}
         onClose={() => setProgressTarget(null)}
-        title={`Progress Invoice — EST-${String(progressTarget?.estimateNumber ?? 0).padStart(4, '0')}`}
+        title={`Progress Invoice — Estimate #${docNo(progressTarget?.refNumber, progressTarget?.estimateNumber ?? '')}`}
         footer={
           <>
             <Button
@@ -959,7 +1001,7 @@ export default function EstimatesPage() {
         <p className="text-navy/70 text-sm">
           Convert{' '}
           <strong className="text-navy">
-            EST-{String(convertTarget?.estimateNumber ?? 0).padStart(4, '0')}
+            #{docNo(convertTarget?.refNumber, convertTarget?.estimateNumber ?? '')}
           </strong>{' '}
           (
           <strong>{formatCurrency(convertTarget?.total ?? 0)}</strong>) into a posted invoice?

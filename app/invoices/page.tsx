@@ -47,7 +47,10 @@ import {
   shippingFromDoc,
   shippingPayload,
   useCreditLimitConfirm,
+  useCustomerSalesDefaults,
+  defaultShipToState,
 } from '@/components/sales/SalesExtras';
+import { useDocNumber } from '@/components/sales/DocNumberField';
 // wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmClassAssigned, confirmStockAvailable, confirmTransactionDate } from '@/lib/formPrefs';
@@ -134,6 +137,9 @@ interface InvoiceDetail extends Invoice {
   classId: string | null;
   discount: string;
   discountType: 'amount' | 'percent' | null;
+  /** Retainage held back (contractors): percent of the total and the held amount. */
+  retainagePercent?: string | null;
+  retainageAmount?: string | null;
   currency: string | null;
   exchangeRate: string | null;
   memo: string | null;
@@ -399,9 +405,22 @@ function InvoiceModal({
   const [selectedCostIds, setSelectedCostIds] = useState<Set<string>>(new Set());
   const [selectedTimeIds, setSelectedTimeIds] = useState<Set<string>>(new Set());
   const [markupPercent, setMarkupPercent] = useState('');
-  // Invoice # typed by the user (blank = next number); duplicate-number confirm prompt.
-  const [refNumber, setRefNumber] = useState('');
+  // Invoice # (pre-filled with the next number, editable; a duplicate asks to confirm).
+  const invNumber = useDocNumber('invoice', open, editing ? (editing.refNumber || String(editing.invoiceNumber)) : null);
+  const refNumber = invNumber.value;
+  const setRefNumber = invNumber.setValue;
   const [dupNumberPrompt, setDupNumberPrompt] = useState<string | null>(null);
+  // Retainage (contractors): % of the total held back in Retainage Receivable until billed.
+  const [retainagePercent, setRetainagePercent] = useState('');
+  // Customer defaults (new invoices): tax item / non-taxable tax code and default ship-to.
+  const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
+  useEffect(() => {
+    if (!custDefaults || editing) return;
+    setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
+    const st = defaultShipToState(custDefaults);
+    if (st) setShip((prev) => ({ ...prev, shipTo: st }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [custDefaults]);
 
   const itemNameById = new Map(items.map((it) => [it.id, it.name]));
   const prefs = usePreferences();
@@ -424,6 +443,9 @@ function InvoiceModal({
       );
       setMemo(editing.memo ?? '');
       setShip(shippingFromDoc(editing));
+      setRetainagePercent(
+        editing.retainagePercent && Number(editing.retainagePercent) > 0 ? String(Number(editing.retainagePercent)) : '',
+      );
       setSaveAsPending(editing.status === 'draft');
       setCustomValues(editing.customFields ?? {});
       setLines(
@@ -458,7 +480,7 @@ function InvoiceModal({
       setMemo(prefs.company.defaultInvoiceMemo ?? '');
       setShip(shippingFromDoc(null));
       setSaveAsPending(false);
-      setRefNumber('');
+      setRetainagePercent('');
       setCustomValues({});
       setLines([{ ...EMPTY_LINE }]);
     }
@@ -699,6 +721,13 @@ function InvoiceModal({
     billablesAmount,
   );
 
+  // Held-back retainage shown on the form (the server computes the same: total × %).
+  const retainageHeld = (() => {
+    const pct = parseFloat(retainagePercent);
+    if (!Number.isFinite(pct) || pct <= 0) return 0;
+    return Math.round(totals.total * Math.min(pct, 100)) / 100;
+  })();
+
   async function handleSubmit(allowDuplicateNumber = false) {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter an invoice date.', 'danger'); return; }
@@ -738,6 +767,7 @@ function InvoiceModal({
       discountType,
       currency: currency || undefined,
       exchangeRate: exchangeRate || undefined,
+      retainagePercent: retainagePercent.trim() ? retainagePercent.trim() : null,
       memo: memo || undefined,
       customFields: customFieldDefs.length > 0 ? customValues : undefined,
       ...shippingPayload(ship),
@@ -773,10 +803,14 @@ function InvoiceModal({
       }),
     };
 
-    if (!editing) {
-      payload.status = saveAsPending ? 'draft' : 'open';
-      if (refNumber.trim()) payload.refNumber = refNumber.trim();
-      if (allowDuplicateNumber) payload.allowDuplicateNumber = true;
+    if (!editing) payload.status = saveAsPending ? 'draft' : 'open';
+    // Invoice # on new AND edited invoices (QB lets you retype it; a duplicate asks first).
+    if (refNumber.trim()) payload.refNumber = refNumber.trim();
+    if (allowDuplicateNumber) payload.allowDuplicateNumber = true;
+    const retPct = parseFloat(retainagePercent);
+    if (retainagePercent.trim() && (!Number.isFinite(retPct) || retPct < 0 || retPct > 100)) {
+      toast('Retainage must be a percent between 0 and 100.', 'danger');
+      return;
     }
 
     if (!editing && hasBillablesSelected && billables) {
@@ -816,14 +850,14 @@ function InvoiceModal({
       );
       if (saved === undefined) return; // user chose not to go over the limit
       if (editing) {
-        toast(`Invoice #${editing.refNumber || editing.invoiceNumber} updated.`, 'success');
+        toast(`Invoice #${refNumber.trim() || editing.refNumber || editing.invoiceNumber} updated.`, 'success');
       } else {
         toast(saveAsPending ? 'Pending invoice saved (not posted).' : 'Invoice created.', 'success');
       }
       onSaved();
       onClose();
     } catch (err: unknown) {
-      if (!editing && err instanceof ApiError && err.status === 409 && /already used/.test(err.message)) {
+      if (err instanceof ApiError && err.status === 409 && /number .* is already used/i.test(err.message)) {
         setDupNumberPrompt(err.message);
         return;
       }
@@ -921,19 +955,17 @@ function InvoiceModal({
           </Select>
         </div>
 
-        {/* Invoice number (QB "Invoice #"): blank = next number, letters allowed */}
-        {!editing && (
-          <div>
-            <Label htmlFor="inv-number">Invoice #</Label>
-            <Input
-              id="inv-number"
-              value={refNumber}
-              maxLength={50}
-              placeholder="Leave blank for the next number"
-              onChange={(e) => setRefNumber(e.target.value)}
-            />
-          </div>
-        )}
+        {/* Invoice number (QB "Invoice #"): pre-filled with the next number, letters allowed */}
+        <div>
+          <Label htmlFor="inv-number">Invoice #</Label>
+          <Input
+            id="inv-number"
+            value={refNumber}
+            maxLength={50}
+            placeholder="Leave blank for the next number"
+            onChange={(e) => setRefNumber(e.target.value)}
+          />
+        </div>
 
         {/* Dates */}
         <div className="grid grid-cols-2 gap-3">
@@ -988,7 +1020,7 @@ function InvoiceModal({
         </div>
 
         {/* Shipping + print/email queue (wave2 sales) */}
-        <ShippingSection value={ship} onChange={setShip} idPrefix="inv-ship" />
+        <ShippingSection value={ship} onChange={setShip} shipTos={custDefaults?.shipTos} idPrefix="inv-ship" />
         {creditLimit.dialog}
 
         {/* Custom fields (company-defined) */}
@@ -1309,6 +1341,29 @@ function InvoiceModal({
           </div>
         </div>
 
+        {/* Retainage (contractors): part of the total held back until the work is accepted */}
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <Label htmlFor="inv-retainage">
+              Retainage % <span className="font-normal text-navy/50">(optional)</span>
+            </Label>
+            <Input
+              id="inv-retainage"
+              type="number"
+              min="0"
+              max="100"
+              step="any"
+              placeholder="e.g. 10"
+              value={retainagePercent}
+              onChange={(e) => setRetainagePercent(e.target.value)}
+            />
+          </div>
+          <p className="self-end pb-2 text-xs text-navy/50">
+            The held amount isn&apos;t due yet. Bill it later from{' '}
+            <Link href="/invoices/retainage" className="text-electric hover:underline">Retainage</Link>.
+          </p>
+        </div>
+
         {/* Live totals (incl. tax) */}
         <div className="rounded-lg bg-navy/5 px-4 py-3 space-y-1">
           <div className="flex items-center justify-between text-sm text-navy/60">
@@ -1333,6 +1388,22 @@ function InvoiceModal({
               {formatCurrency(totals.total.toFixed(2), currency || 'USD')}
             </span>
           </div>
+          {retainageHeld > 0 && (
+            <>
+              <div className="flex items-center justify-between text-sm text-navy/60">
+                <span>Retainage held ({Number(retainagePercent)}%)</span>
+                <span className="tabular-nums">
+                  -{formatCurrency(retainageHeld.toFixed(2), currency || 'USD')}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-navy/70">Due now</span>
+                <span className="text-base font-bold text-navy tabular-nums">
+                  {formatCurrency((totals.total - retainageHeld - totals.payments).toFixed(2), currency || 'USD')}
+                </span>
+              </div>
+            </>
+          )}
           {totals.payments > 0 && (
             <>
               <div className="flex items-center justify-between text-sm text-navy/60">
@@ -1549,6 +1620,9 @@ function InvoicesPageContent() {
             </Link>
             <Link href="/invoices/statement-charges" className="text-sm font-semibold text-electric hover:underline px-2">
               Statement charges
+            </Link>
+            <Link href="/invoices/retainage" className="text-sm font-semibold text-electric hover:underline px-2">
+              Retainage
             </Link>
             <Link href="/invoices/send-forms" className="text-sm font-semibold text-electric hover:underline px-2">
               Print / send forms

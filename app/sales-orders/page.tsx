@@ -37,7 +37,15 @@ import {
   shippingFromDoc,
   shippingPayload,
   useCreditLimitConfirm,
+  useCustomerSalesDefaults,
+  defaultShipToState,
 } from '@/components/sales/SalesExtras';
+import {
+  DocNumberField,
+  docNo,
+  useDocNumber,
+  useDuplicateNumberConfirm,
+} from '@/components/sales/DocNumberField';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,9 +59,13 @@ interface Customer {
 interface SalesOrder {
   id: string;
   orderNumber: number;
+  /** The number the user typed / sees (e.g. "SO-1001"). */
+  refNumber?: string | null;
   customerId: string;
   date: string;
   total: string;
+  taxRateId?: string | null;
+  taxAmount?: string;
   status: string;
   convertedInvoiceId: string | null;
   memo?: string | null;
@@ -75,6 +87,13 @@ interface SalesOrderLine {
   rate: string;
   amount: string;
   quantityInvoiced: string;
+  taxable?: boolean;
+}
+
+interface TaxRate {
+  id: string;
+  name: string;
+  rate: string;
 }
 
 interface SalesOrderDetail extends SalesOrder {
@@ -104,8 +123,13 @@ function statusLabel(status: string): string {
   return status;
 }
 
-function computeTotal(lines: PricedLineValue[]): number {
-  return lines.reduce((sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0), 0);
+function computeTotal(lines: PricedLineValue[], taxRate = 0): number {
+  const sub = lines.reduce((sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0), 0);
+  const taxable = lines.reduce(
+    (sum, l) => sum + (l.taxable ? (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0) : 0),
+    0,
+  );
+  return sub + Math.round(taxable * taxRate * 100) / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,13 +143,26 @@ interface NewOrderModalProps {
   onClose: () => void;
   customers: Customer[];
   items: PricedLineItem[];
+  taxRates: TaxRate[];
   onCreated: () => void;
 }
 
 type EditableLine = PricedLineValue & { id?: string; invoiced?: number };
 
-function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: NewOrderModalProps) {
+function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onCreated }: NewOrderModalProps) {
   const [customerId, setCustomerId] = useState('');
+  const [taxRateId, setTaxRateId] = useState('');
+  const docNumber = useDocNumber('sales_order', open, editing ? docNo(editing.refNumber, editing.orderNumber) : null);
+  const dupConfirm = useDuplicateNumberConfirm();
+  // Customer defaults (new orders): tax item, non-taxable tax code, default ship-to.
+  const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
+  useEffect(() => {
+    if (!custDefaults || editing) return;
+    setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
+    const st = defaultShipToState(custDefaults);
+    if (st) setShip((prev) => ({ ...prev, shipTo: st }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [custDefaults]);
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<EditableLine[]>([emptyPricedLine()]);
@@ -139,6 +176,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
       setDate(editing.date.slice(0, 10));
       setMemo(editing.memo ?? '');
       setShip(shippingFromDoc(editing));
+      setTaxRateId(editing.taxRateId ?? '');
       setLines(
         editing.lines.map((l) => ({
           id: l.id,
@@ -147,7 +185,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
           description: l.description ?? '',
           quantity: String(Number(l.quantity)),
           rate: String(Number(l.rate)),
-          taxable: true,
+          taxable: l.taxable !== false,
           rateManual: true,
         })),
       );
@@ -156,11 +194,13 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
       setDate(new Date().toISOString().slice(0, 10));
       setMemo('');
       setShip(shippingFromDoc(null));
+      setTaxRateId('');
       setLines([emptyPricedLine()]);
     }
   }, [open, editing]);
 
-  const liveTotal = computeTotal(lines);
+  const selectedRate = taxRates.find((t) => t.id === taxRateId);
+  const liveTotal = computeTotal(lines, selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
 
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
@@ -181,8 +221,10 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
     try {
       const body = {
         customerId,
+        refNumber: docNumber.payload,
         date,
         memo: memo || undefined,
+        taxRateId: taxRateId || null,
         ...shippingPayload(ship),
         lines: validLines.map((l) => ({
           ...(l.id ? { id: l.id } : {}),
@@ -191,14 +233,19 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
           quantity: l.quantity,
           // Blank rate on an item line: the server prices it (advanced pricing).
           rate: l.rate === '' ? null : l.rate,
+          taxable: l.taxable !== false,
         })),
       };
+      const saved = await dupConfirm.run((allowDuplicateNumber) =>
+        editing
+          ? api.patch<SalesOrder>(`/api/sales-orders/${editing.id}`, { ...body, allowDuplicateNumber })
+          : api.post<SalesOrder>('/api/sales-orders', { ...body, allowDuplicateNumber }),
+      );
+      if (saved === undefined) return;
       if (editing) {
-        await api.patch(`/api/sales-orders/${editing.id}`, body);
-        toast(`Sales Order #${editing.orderNumber} updated.`, 'success');
+        toast(`Sales Order #${docNo(saved.refNumber, saved.orderNumber)} updated.`, 'success');
       } else {
-        await api.post('/api/sales-orders', body);
-        toast('Sales order created.', 'success');
+        toast(`Sales Order #${docNo(saved.refNumber, saved.orderNumber)} created.`, 'success');
       }
       onCreated();
       onClose();
@@ -214,7 +261,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
     <Modal
       open={open}
       onClose={onClose}
-      title={editing ? `Edit Sales Order #${editing.orderNumber}` : 'New Sales Order'}
+      title={editing ? `Edit Sales Order #${docNo(editing.refNumber, editing.orderNumber)}` : 'New Sales Order'}
       size="xl"
       footer={
         <>
@@ -242,15 +289,31 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
           </Select>
         </div>
 
-        {/* Date */}
+        {/* S.O. No. + Date */}
+        <div className="grid grid-cols-2 gap-3">
+          <DocNumberField id="so-number" label="S.O. No." value={docNumber.value} onChange={docNumber.setValue} />
+          <div>
+            <Label htmlFor="so-date">Order Date *</Label>
+            <Input
+              id="so-date"
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {/* Sales tax (QB: Tax item; carried to the invoice) */}
         <div>
-          <Label htmlFor="so-date">Order Date *</Label>
-          <Input
-            id="so-date"
-            type="date"
-            value={date}
-            onChange={(e) => setDate(e.target.value)}
-          />
+          <Label htmlFor="so-taxrate">Sales Tax</Label>
+          <Select id="so-taxrate" value={taxRateId} onChange={(e) => setTaxRateId(e.target.value)}>
+            <option value="">No tax</option>
+            {taxRates.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+              </option>
+            ))}
+          </Select>
         </div>
 
         {/* Memo */}
@@ -264,7 +327,8 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
           />
         </div>
 
-        <ShippingSection value={ship} onChange={setShip} idPrefix="so-ship" />
+        <ShippingSection value={ship} onChange={setShip} shipTos={custDefaults?.shipTos} idPrefix="so-ship" />
+        {dupConfirm.dialog}
 
         {/* Line items (item pick -> server-side pricing) */}
         <div>
@@ -280,6 +344,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, onCreated }: 
             lines={lines}
             onChange={setLines}
             header={{ customerId: customerId || null, date }}
+            showTaxable
           />
         </div>
 
@@ -397,8 +462,8 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
       );
       toast(
         fully
-          ? `Sales Order #${order.orderNumber} fully invoiced.`
-          : `Sales Order #${order.orderNumber} partially invoiced — remainder on backorder.`,
+          ? `Sales Order #${docNo(order.refNumber, order.orderNumber)} fully invoiced.`
+          : `Sales Order #${docNo(order.refNumber, order.orderNumber)} partially invoiced — remainder on backorder.`,
         'success',
       );
       onInvoiced();
@@ -414,7 +479,7 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
     <Modal
       open={open}
       onClose={onClose}
-      title={`Create Invoice — Sales Order #${order?.orderNumber ?? ''}`}
+      title={`Create Invoice — Sales Order #${docNo(order?.refNumber, order?.orderNumber ?? '')}`}
       size="lg"
       footer={
         <>
@@ -505,6 +570,7 @@ export default function SalesOrdersPage() {
   const [orders, setOrders] = useState<SalesOrder[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [items, setItems] = useState<PricedLineItem[]>([]);
+  const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
 
@@ -537,6 +603,12 @@ export default function SalesOrdersPage() {
         .then((r) => setItems(r.items ?? []))
         .catch(() => {
           // Non-fatal; lines can still be typed without an item.
+        });
+      api
+        .get<TaxRate[]>('/api/tax-rates')
+        .then((r) => setTaxRates(Array.isArray(r) ? r : []))
+        .catch(() => {
+          // Non-fatal; the tax picker just stays empty.
         });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to load sales orders.';
@@ -600,7 +672,7 @@ export default function SalesOrdersPage() {
             <tbody>
               {orders.map((order) => (
                 <Tr key={order.id}>
-                  <Td className="font-semibold text-navy">#{order.orderNumber}</Td>
+                  <Td className="font-semibold text-navy">#{docNo(order.refNumber, order.orderNumber)}</Td>
                   <Td>{customerMap[order.customerId] ?? '—'}</Td>
                   <Td className="text-navy/70">{formatDate(order.date)}</Td>
                   <Td numeric className="font-medium">
@@ -706,6 +778,7 @@ export default function SalesOrdersPage() {
         }}
         customers={customers}
         items={items}
+        taxRates={taxRates}
         onCreated={fetchData}
       />
 

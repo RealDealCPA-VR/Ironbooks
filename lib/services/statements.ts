@@ -16,7 +16,7 @@
  *   Combines bill payments (via bill_payment_applications) and direct expenses.
  *   Only vendors with total >= $600 are included as eligible.
  */
-import { and, asc, eq, gt, gte, inArray, isNull, lt, ne, not, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, not, or, sql } from 'drizzle-orm';
 import {
   accounts,
   billLines,
@@ -63,7 +63,10 @@ export interface StatementLine {
     | 'bounced_check'
     | 'discount'
     | 'general_journal'
-    | 'refund';
+    | 'refund'
+    /** Foreign-currency customers (home-currency statement): an exchange-rate adjustment posted
+     *  to A/R when an unapplied payment was applied at a different rate (signed like GJ). */
+    | 'exchange_adjustment';
   /**
    * Invoice number (invoices), payment reference (payments), memo number (credit memos), or
    * "GJ #<entry>" for a named General Journal line on A/R.
@@ -88,6 +91,8 @@ export interface CustomerStatement {
   openingBalance: string;
   lines: StatementLine[];
   closingBalance: string;
+  /** true = a foreign-currency customer's statement, shown in home currency (ties to home A/R). */
+  homeCurrency?: boolean;
 }
 
 /**
@@ -243,6 +248,241 @@ export async function customerArLedgerBalance(
   return toAmountString(Money.of(row?.net ?? '0'));
 }
 
+// ---------------------------------------------------------------------------
+// Foreign-currency customers: the statement in home currency, tied to home A/R
+// ---------------------------------------------------------------------------
+
+/** Does this customer have any invoice or payment in a foreign currency? */
+async function hasForeignCurrencyActivity(ctx: ServiceContext, customerId: string): Promise<boolean> {
+  const [inv] = await ctx.db
+    .select({ id: invoices.id })
+    .from(invoices)
+    .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.customerId, customerId), isNotNull(invoices.currency)))
+    .limit(1);
+  if (inv) return true;
+  const [pay] = await ctx.db
+    .select({ id: paymentsReceived.id })
+    .from(paymentsReceived)
+    .where(
+      and(
+        eq(paymentsReceived.companyId, ctx.companyId),
+        eq(paymentsReceived.customerId, customerId),
+        isNotNull(paymentsReceived.currency),
+      ),
+    )
+    .limit(1);
+  return !!pay;
+}
+
+/** Net A/R movement (debit − credit, home currency) of posted entries, per entry. */
+async function arNetByEntry(
+  ctx: ServiceContext,
+  where: { sourceRefs?: string[]; entryIds?: string[] },
+  range: { from?: Date; toExclusive?: Date | null },
+): Promise<Array<{ entryId: string; sourceRef: string | null; date: Date; net: ReturnType<typeof Money.zero> }>> {
+  const conds = [
+    eq(journalEntries.companyId, ctx.companyId),
+    eq(journalEntries.status, 'posted'),
+    eq(accounts.type, 'asset'),
+    eq(accounts.subtype, 'accounts_receivable'),
+  ];
+  if (where.sourceRefs) {
+    if (where.sourceRefs.length === 0) return [];
+    conds.push(inArray(journalEntries.sourceRef, where.sourceRefs));
+  }
+  if (where.entryIds) {
+    if (where.entryIds.length === 0) return [];
+    conds.push(inArray(journalEntries.id, where.entryIds));
+  }
+  if (range.from) conds.push(gte(journalEntries.date, range.from));
+  if (range.toExclusive) conds.push(lt(journalEntries.date, range.toExclusive));
+  const rows = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      sourceRef: journalEntries.sourceRef,
+      date: journalEntries.date,
+      net: sql<string>`COALESCE(SUM(CAST(COALESCE(${journalEntryLines.debit}, '0') AS NUMERIC) - CAST(COALESCE(${journalEntryLines.credit}, '0') AS NUMERIC)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+    .innerJoin(accounts, eq(accounts.id, journalEntryLines.accountId))
+    .where(and(...conds))
+    .groupBy(journalEntries.id, journalEntries.sourceRef, journalEntries.date);
+  return rows.map((r) => ({ entryId: r.entryId, sourceRef: r.sourceRef, date: r.date, net: Money.of(r.net) }));
+}
+
+/**
+ * Balance-forward statement for a customer billed in a foreign currency, in HOME currency so
+ * it ties to the home-currency A/R account: every line is the A/R amount its document posted
+ * (invoices at their booked rate, payments at the amount they relieved), and the exchange-rate
+ * adjustments posted when an unapplied foreign payment is later applied (sourceRef
+ * payment:<id>) are listed as "Exchange Rate Adjustment" lines. Closing balance ==
+ * customerArLedgerBalance.
+ */
+async function homeCurrencyStatement(
+  ctx: ServiceContext,
+  cust: { id: string; displayName: string; companyName: string | null; email: string | null },
+  range?: { from?: Date; to?: Date },
+): Promise<CustomerStatement> {
+  const customerId = cust.id;
+  const from = range?.from;
+  const toExclusive = range?.to ? new Date(range.to.getTime() + 86_400_000) : null;
+  const inRange = { from, toExclusive };
+
+  // Opening balance straight from the GL (everything dated before `from`).
+  const openingBalance = from
+    ? Money.of(await customerArLedgerBalance(ctx, customerId, new Date(from.getTime() - 86_400_000)))
+    : Money.zero();
+
+  const [invRows, payRows, memoRows] = await Promise.all([
+    ctx.db
+      .select({
+        id: invoices.id,
+        invoiceNumber: invoices.invoiceNumber,
+        refNumber: invoices.refNumber,
+        isStatementCharge: invoices.isStatementCharge,
+      })
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.companyId, ctx.companyId),
+          eq(invoices.customerId, customerId),
+          ne(invoices.status, 'void'),
+          ne(invoices.status, 'draft'),
+        ),
+      ),
+    ctx.db
+      .select({
+        id: paymentsReceived.id,
+        date: paymentsReceived.date,
+        reference: paymentsReceived.reference,
+        postedEntryId: paymentsReceived.postedEntryId,
+      })
+      .from(paymentsReceived)
+      .where(
+        and(
+          eq(paymentsReceived.companyId, ctx.companyId),
+          eq(paymentsReceived.customerId, customerId),
+          isNull(paymentsReceived.voidedAt),
+        ),
+      ),
+    ctx.db
+      .select({
+        id: creditMemos.id,
+        date: creditMemos.date,
+        memoNumber: creditMemos.memoNumber,
+        refNumber: creditMemos.refNumber,
+        total: creditMemos.total,
+      })
+      .from(creditMemos)
+      .where(
+        and(
+          eq(creditMemos.companyId, ctx.companyId),
+          eq(creditMemos.customerId, customerId),
+          ne(creditMemos.status, 'void'),
+        ),
+      ),
+  ]);
+
+  type RawLine = { kind: StatementLine['type']; date: Date; ref: string | null; amount: ReturnType<typeof Money.zero> };
+  const raw: RawLine[] = [];
+
+  // Invoices / statement charges: the A/R their entries posted.
+  const invById = new Map(invRows.map((r) => [`invoice:${r.id}`, r]));
+  for (const e of await arNetByEntry(ctx, { sourceRefs: [...invById.keys()] }, inRange)) {
+    const inv = invById.get(e.sourceRef ?? '')!;
+    if (e.net.isZero()) continue;
+    raw.push({
+      kind: inv.isStatementCharge ? 'statement_charge' : 'invoice',
+      date: e.date,
+      ref: docRef(inv.refNumber, inv.invoiceNumber),
+      amount: e.net,
+    });
+  }
+
+  // Payments: the A/R each payment relieved (its discounts shown as their own line).
+  const payByEntry = new Map(payRows.filter((p) => p.postedEntryId).map((p) => [p.postedEntryId!, p]));
+  const payEntries = await arNetByEntry(ctx, { entryIds: [...payByEntry.keys()] }, inRange);
+  const discountRows = payEntries.length
+    ? await ctx.db
+        .select({
+          paymentId: paymentApplications.paymentId,
+          home: sql<string>`COALESCE(SUM(ROUND(CAST(${paymentApplications.discountAmount} AS NUMERIC) * CAST(COALESCE(${invoices.exchangeRate}, '1') AS NUMERIC), 2)), 0)`,
+        })
+        .from(paymentApplications)
+        .innerJoin(invoices, eq(invoices.id, paymentApplications.invoiceId))
+        .where(inArray(paymentApplications.paymentId, payEntries.map((e) => payByEntry.get(e.entryId)!.id)))
+        .groupBy(paymentApplications.paymentId)
+    : [];
+  const discountByPayment = new Map(discountRows.map((r) => [r.paymentId, Money.of(r.home)]));
+  for (const e of payEntries) {
+    const p = payByEntry.get(e.entryId)!;
+    const discount = discountByPayment.get(p.id) ?? Money.zero();
+    const paid = e.net.negated().minus(discount);
+    if (!paid.isZero()) raw.push({ kind: 'payment', date: e.date, ref: p.reference ?? null, amount: paid });
+    if (discount.greaterThan(0)) raw.push({ kind: 'discount', date: e.date, ref: p.reference ?? null, amount: discount });
+  }
+
+  // Exchange-rate adjustments, returned checks and refunds — straight from their entries.
+  const payRef = new Map(payRows.map((p) => [p.id, p.reference ?? null]));
+  const memoRef = new Map(memoRows.map((m) => [m.id, docRef(m.refNumber, m.memoNumber)]));
+  const extraRefs = [
+    ...payRows.flatMap((p) => [`payment:${p.id}`, `bounced:${p.id}`, `refund:${p.id}`]),
+    ...memoRows.map((m) => `refund:${m.id}`),
+  ];
+  for (const e of await arNetByEntry(ctx, { sourceRefs: extraRefs }, inRange)) {
+    if (e.net.isZero()) continue;
+    const [prefix, id] = (e.sourceRef ?? '').split(':');
+    const ref = payRef.get(id) ?? memoRef.get(id) ?? null;
+    if (prefix === 'payment') raw.push({ kind: 'exchange_adjustment', date: e.date, ref, amount: e.net });
+    else if (prefix === 'bounced') raw.push({ kind: 'bounced_check', date: e.date, ref, amount: e.net });
+    else raw.push({ kind: 'refund', date: e.date, ref, amount: e.net });
+  }
+
+  // Credit memos (home currency documents).
+  for (const m of memoRows) {
+    if ((from && m.date < from) || (toExclusive && m.date >= toExclusive)) continue;
+    raw.push({ kind: 'credit_memo', date: m.date, ref: docRef(m.refNumber, m.memoNumber), amount: Money.of(m.total) });
+  }
+
+  // Named General Journal lines on A/R.
+  const journalItems = await journalOpenItems(ctx, 'ar', { entityId: customerId, gross: true });
+  for (const j of journalItems) {
+    if ((from && j.date < from) || (toExclusive && j.date >= toExclusive)) continue;
+    raw.push({ kind: 'general_journal', date: j.date, ref: `GJ #${j.entryNumber}`, amount: Money.of(j.amount) });
+  }
+
+  raw.sort((a, b) => a.date.getTime() - b.date.getTime());
+  const SIGNED = new Set<StatementLine['type']>(['general_journal', 'exchange_adjustment']);
+  const CHARGE = new Set<StatementLine['type']>(['invoice', 'statement_charge', 'bounced_check', 'refund']);
+  let running = openingBalance;
+  const lines: StatementLine[] = raw.map((r) => {
+    running = SIGNED.has(r.kind) || CHARGE.has(r.kind) ? running.plus(r.amount) : running.minus(r.amount);
+    return {
+      date: r.date.toISOString().slice(0, 10),
+      type: r.kind,
+      ref: r.ref,
+      amount: toAmountString(r.amount),
+      runningBalance: toAmountString(running),
+    };
+  });
+
+  return {
+    customer: {
+      id: cust.id,
+      displayName: cust.displayName,
+      companyName: cust.companyName ?? null,
+      email: cust.email ?? null,
+    },
+    from: from?.toISOString().slice(0, 10) ?? null,
+    to: range?.to?.toISOString().slice(0, 10) ?? null,
+    openingBalance: toAmountString(openingBalance),
+    lines,
+    closingBalance: toAmountString(running),
+    homeCurrency: true,
+  };
+}
+
 export async function customerStatement(
   ctx: ServiceContext,
   customerId: string,
@@ -261,6 +501,12 @@ export async function customerStatement(
     .where(and(eq(customers.id, customerId), eq(customers.companyId, ctx.companyId)));
 
   if (!cust) throw notFound('Customer');
+
+  // Customers billed in another currency: list everything in home currency so the statement
+  // ties to home A/R (incl. exchange-rate adjustment lines).
+  if (await hasForeignCurrencyActivity(ctx, customerId)) {
+    return homeCurrencyStatement(ctx, cust, range);
+  }
 
   // --- Opening balance: sum of all charges and credits BEFORE the range start ---
   // We compute it by fetching all pre-range activity (if a from date is given).
@@ -542,18 +788,30 @@ export async function customerStatement(
 export type AgingBucket = 'current' | '1-30' | '31-60' | '61-90' | '90+';
 
 export interface OpenItemLine {
+  /** invoice = an open charge; credit_memo / payment = an open (unapplied) credit (negative
+   *  balance); general_journal = a named General Journal line on A/R (signed). */
+  type: 'invoice' | 'credit_memo' | 'payment' | 'general_journal';
+  /** The document's id (invoice, credit memo, payment, or journal entry). */
+  docId: string;
+  /** Same as docId (kept for older callers that only listed invoices). */
   invoiceId: string;
-  /** ISO invoice date (YYYY-MM-DD). */
+  /** ISO document date (YYYY-MM-DD). */
   date: string;
+  /** Legacy integer number (invoice / memo number, GJ entry number; 0 for payments). */
   invoiceNumber: number;
-  /** The number the user sees (typed ref number, else the legacy integer). */
+  /** The number the user sees (typed ref number, else the legacy integer; payment reference). */
   refNumber: string;
-  /** ISO due date; falls back to the invoice date when no due date was set. */
+  /** Plain-language label, e.g. "Invoice INV-1001", "Credit Memo CM-5", "Payment 1234". */
+  label: string;
+  /** ISO due date; falls back to the document date when no due date was set. */
   dueDate: string;
+  /** Amount billed (negative for credits). */
   total: string;
+  /** Paid / applied against it as of the statement date. */
   amountPaid: string;
+  /** Open as of the statement date (negative for credits). */
   balanceDue: string;
-  /** Whole days past due as of the statement date (0 when not yet due). */
+  /** Whole days past due as of the statement date (0 when not yet due, and for credits). */
   daysPastDue: number;
   agingBucket: AgingBucket;
 }
@@ -591,9 +849,11 @@ function bucketFor(daysPastDue: number): AgingBucket {
 }
 
 /**
- * Open-item statement: every invoice that still carries a balance as of `asOf`
- * (dated on/before it), with per-invoice aging and an aging summary footer.
- * Uses the invoice's CURRENT balanceDue (matches the A/R aging report).
+ * Open-item statement (QB "Open Item" format) as of `asOf`: every charge that was still open on
+ * that date and every open credit (unapplied credit memos and payments, General Journal A/R
+ * items). Open amounts are rebuilt AS OF the date — a payment or credit dated after the
+ * statement date does not reduce it — using the same reconstruction as the A/R Aging Detail
+ * report, so the total due always equals the customer's A/R aging total at `asOf`.
  */
 export async function openItemStatement(
   ctx: ServiceContext,
@@ -611,30 +871,52 @@ export async function openItemStatement(
     .where(and(eq(customers.id, customerId), eq(customers.companyId, ctx.companyId)));
   if (!cust) throw notFound('Customer');
 
-  // Invoices dated on/before asOf (end of day) that still carry a balance.
-  const asOfEnd = new Date(asOf.getTime() + DAY_MS);
-  const rows = await ctx.db
-    .select({
-      id: invoices.id,
-      date: invoices.date,
-      dueDate: invoices.dueDate,
-      invoiceNumber: invoices.invoiceNumber,
-      refNumber: invoices.refNumber,
-      total: invoices.total,
-      amountPaid: invoices.amountPaid,
-      balanceDue: invoices.balanceDue,
-    })
-    .from(invoices)
-    .where(
-      and(
-        eq(invoices.companyId, ctx.companyId),
-        eq(invoices.customerId, customerId),
-        inArray(invoices.status, ['open', 'partial', 'overdue']),
-        gt(sql`CAST(${invoices.balanceDue} AS NUMERIC)`, 0),
-        lt(invoices.date, asOfEnd),
-      ),
-    )
-    .orderBy(asc(invoices.date), asc(invoices.invoiceNumber));
+  // Lazy import: reportsExtra pulls in the report stack, which statements does not need otherwise.
+  const { arAgingDetail } = await import('./reportsExtra');
+  const detail = (await arAgingDetail(ctx, asOf)).rows.filter((r) => r.entityId === customerId);
+
+  // Document details the aging rows don't carry (totals, numbers).
+  const idsOf = (t: string) => detail.filter((d) => d.docType === t).map((d) => d.docId);
+  const invIds = idsOf('invoice');
+  const memoIds = idsOf('credit_memo');
+  const payIds = idsOf('payment');
+  const jeIds = idsOf('journal_entry');
+  const [invRows, memoRows, payRows, jeRows] = await Promise.all([
+    invIds.length
+      ? ctx.db
+          .select({
+            id: invoices.id,
+            invoiceNumber: invoices.invoiceNumber,
+            refNumber: invoices.refNumber,
+            billed: sql<string>`CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC)`,
+            isStatementCharge: invoices.isStatementCharge,
+          })
+          .from(invoices)
+          .where(inArray(invoices.id, invIds))
+      : [],
+    memoIds.length
+      ? ctx.db
+          .select({ id: creditMemos.id, memoNumber: creditMemos.memoNumber, refNumber: creditMemos.refNumber, total: creditMemos.total })
+          .from(creditMemos)
+          .where(inArray(creditMemos.id, memoIds))
+      : [],
+    payIds.length
+      ? ctx.db
+          .select({ id: paymentsReceived.id, reference: paymentsReceived.reference, amount: paymentsReceived.amount })
+          .from(paymentsReceived)
+          .where(inArray(paymentsReceived.id, payIds))
+      : [],
+    jeIds.length
+      ? ctx.db
+          .select({ id: journalEntries.id, entryNumber: journalEntries.entryNumber })
+          .from(journalEntries)
+          .where(inArray(journalEntries.id, jeIds))
+      : [],
+  ]);
+  const invById = new Map(invRows.map((r) => [r.id, r]));
+  const memoById = new Map(memoRows.map((r) => [r.id, r]));
+  const payById = new Map(payRows.map((r) => [r.id, r]));
+  const jeById = new Map(jeRows.map((r) => [r.id, r]));
 
   const bucketTotals: Record<AgingBucket, ReturnType<typeof Money.zero>> = {
     current: Money.zero(),
@@ -643,28 +925,82 @@ export async function openItemStatement(
     '61-90': Money.zero(),
     '90+': Money.zero(),
   };
+  const BUCKET: Record<string, AgingBucket> = {
+    current: 'current',
+    days1_30: '1-30',
+    days31_60: '31-60',
+    days61_90: '61-90',
+    days91plus: '90+',
+  };
   let totalDue = Money.zero();
 
-  const lines: OpenItemLine[] = rows.map((r) => {
-    const effDue = r.dueDate ?? r.date;
-    const daysPastDue = Math.max(0, Math.floor((asOf.getTime() - effDue.getTime()) / DAY_MS));
-    const bucket = bucketFor(daysPastDue);
-    const bal = Money.of(r.balanceDue);
-    bucketTotals[bucket] = bucketTotals[bucket].plus(bal);
-    totalDue = totalDue.plus(bal);
-    return {
-      invoiceId: r.id,
-      date: r.date.toISOString().slice(0, 10),
-      invoiceNumber: r.invoiceNumber,
-      refNumber: docRef(r.refNumber, r.invoiceNumber),
-      dueDate: effDue.toISOString().slice(0, 10),
-      total: toAmountString(r.total),
-      amountPaid: toAmountString(r.amountPaid),
-      balanceDue: toAmountString(bal),
-      daysPastDue,
+  const lines: OpenItemLine[] = detail.map((d) => {
+    const open = Money.of(d.openBalance);
+    const bucket = BUCKET[d.bucket] ?? 'current';
+    bucketTotals[bucket] = bucketTotals[bucket].plus(open);
+    totalDue = totalDue.plus(open);
+    const base = {
+      docId: d.docId,
+      invoiceId: d.docId,
+      date: d.date.slice(0, 10),
+      dueDate: (d.dueDate ?? d.date).slice(0, 10),
+      daysPastDue: d.daysPastDue,
       agingBucket: bucket,
+      balanceDue: toAmountString(open),
+    };
+    if (d.docType === 'invoice') {
+      const inv = invById.get(d.docId);
+      const total = Money.of(inv?.billed ?? d.openBalance);
+      const ref = inv ? docRef(inv.refNumber, inv.invoiceNumber) : '';
+      return {
+        ...base,
+        type: 'invoice' as const,
+        invoiceNumber: inv?.invoiceNumber ?? 0,
+        refNumber: ref,
+        label: `${inv?.isStatementCharge ? 'Statement Charge' : 'Invoice'} ${ref}`.trim(),
+        total: toAmountString(total),
+        amountPaid: toAmountString(total.minus(open)),
+      };
+    }
+    if (d.docType === 'credit_memo') {
+      const m = memoById.get(d.docId);
+      const total = m ? Money.of(m.total).negated() : open;
+      const ref = m ? docRef(m.refNumber, m.memoNumber) : '';
+      return {
+        ...base,
+        type: 'credit_memo' as const,
+        invoiceNumber: m?.memoNumber ?? 0,
+        refNumber: ref,
+        label: `Credit Memo ${ref}`.trim(),
+        total: toAmountString(total),
+        amountPaid: toAmountString(total.minus(open)),
+      };
+    }
+    if (d.docType === 'payment') {
+      const p = payById.get(d.docId);
+      const total = p ? Money.of(p.amount).negated() : open;
+      return {
+        ...base,
+        type: 'payment' as const,
+        invoiceNumber: 0,
+        refNumber: p?.reference ?? '',
+        label: p?.reference ? `Payment ${p.reference}` : 'Payment',
+        total: toAmountString(total),
+        amountPaid: toAmountString(total.minus(open)),
+      };
+    }
+    const je = jeById.get(d.docId);
+    return {
+      ...base,
+      type: 'general_journal' as const,
+      invoiceNumber: je?.entryNumber ?? 0,
+      refNumber: je ? `GJ #${je.entryNumber}` : 'GJ',
+      label: je ? `General Journal #${je.entryNumber}` : 'General Journal',
+      total: toAmountString(open),
+      amountPaid: '0.00',
     };
   });
+  lines.sort((a, b) => a.date.localeCompare(b.date) || a.refNumber.localeCompare(b.refNumber));
 
   return {
     customer: {

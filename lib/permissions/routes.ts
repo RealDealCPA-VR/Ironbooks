@@ -298,6 +298,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/invoices/batch': r('customers', 'POST'),
   '/api/invoices/statement-charges': r('customers', 'GET POST'),
   '/api/invoices/statement-charges/[id]': r('customers', 'PUT PATCH'),
+  '/api/invoices/retainage': r('customers', 'GET POST'), // p1/salesforms: retainage report + billing
   '/api/payments/credits': r('customers', 'GET'),
   '/api/payments/discounts': r('customers', 'GET'),
   '/api/payments/journal-items': r('customers', 'GET POST:modify'),

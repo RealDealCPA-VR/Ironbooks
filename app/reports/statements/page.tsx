@@ -38,7 +38,8 @@ interface StatementLine {
     | 'bounced_check'
     | 'discount'
     | 'general_journal'
-    | 'refund';
+    | 'refund'
+    | 'exchange_adjustment';
   ref: string | null;
   amount: string;
   runningBalance: string;
@@ -60,6 +61,10 @@ interface CustomerStatement {
 
 interface OpenItemLine {
   invoiceId: string;
+  docId?: string;
+  type?: 'invoice' | 'credit_memo' | 'payment' | 'general_journal';
+  label?: string;
+  refNumber?: string;
   date: string;
   invoiceNumber: number;
   dueDate: string;
@@ -118,7 +123,7 @@ function isCharge(line: { type: string; amount: string }): boolean {
     line.type === 'statement_charge' ||
     line.type === 'bounced_check' ||
     line.type === 'refund' ||
-    (line.type === 'general_journal' && !line.amount.startsWith('-'))
+    ((line.type === 'general_journal' || line.type === 'exchange_adjustment') && !line.amount.startsWith('-'))
   );
 }
 
@@ -451,6 +456,8 @@ export default function CustomerStatementsPage() {
                         <Badge tone="neutral">General Journal</Badge>
                       ) : line.type === 'refund' ? (
                         <Badge tone="warning">Refund</Badge>
+                      ) : line.type === 'exchange_adjustment' ? (
+                        <Badge tone="neutral">Exchange Rate Adjustment</Badge>
                       ) : (
                         <Badge tone="success">Payment</Badge>
                       )}
@@ -493,7 +500,7 @@ export default function CustomerStatementsPage() {
               <thead>
                 <tr>
                   <Th>Date</Th>
-                  <Th>Invoice #</Th>
+                  <Th>Document</Th>
                   <Th>Due Date</Th>
                   <Th className="text-right">Amount</Th>
                   <Th className="text-right">Paid</Th>
@@ -505,14 +512,14 @@ export default function CustomerStatementsPage() {
                 {openItem.lines.length === 0 ? (
                   <tr>
                     <Td colSpan={7} className="py-12 text-center text-navy/40">
-                      No open invoices — account is current.
+                      Nothing open on this date — account is current.
                     </Td>
                   </tr>
                 ) : (
                   openItem.lines.map((line) => (
-                    <Tr key={line.invoiceId}>
+                    <Tr key={line.docId ?? line.invoiceId}>
                       <Td className="tabular-nums">{fmtDate(line.date)}</Td>
-                      <Td className="text-navy/70">#{line.invoiceNumber}</Td>
+                      <Td className="text-navy/70">{line.label ?? `#${line.refNumber || line.invoiceNumber}`}</Td>
                       <Td className="tabular-nums text-navy/70">{fmtDate(line.dueDate)}</Td>
                       <Td className="text-right tabular-nums">{formatCurrency(line.total)}</Td>
                       <Td className="text-right tabular-nums text-emerald">

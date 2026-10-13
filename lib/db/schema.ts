@@ -341,6 +341,8 @@ export const customers = pgTable('customers', {
   phone: varchar('phone', { length: 50 }),
   billingAddress: jsonb('billing_address').$type<Record<string, string>>(),
   shippingAddress: jsonb('shipping_address').$type<Record<string, string>>(),
+  /** p1/salesforms: named ship-to addresses ({ name, line1.., isDefault }); drizzle/0040. */
+  shipToAddresses: jsonb('ship_to_addresses').$type<Array<Record<string, string | boolean>>>(),
   terms: varchar('terms', { length: 50 }).default('net_30'),
   creditLimit: decimal('credit_limit', { precision: 15, scale: 2 }),
   taxable: boolean('taxable').notNull().default(true),
@@ -471,6 +473,8 @@ export const estimates = pgTable('estimates', {
   priorAmountInvoiced: decimal('prior_amount_invoiced', { precision: 15, scale: 2 }).notNull().default('0'),
   /** wave2 sales: quoted tax rate (kept so the estimate can be edited later). */
   taxRateId: uuid('tax_rate_id'),
+  /** p1/salesforms: ship-to address (drizzle/0040). */
+  shipTo: jsonb('ship_to').$type<Record<string, string>>(),
   toBePrinted: boolean('to_be_printed').notNull().default(false),
   toBeEmailed: boolean('to_be_emailed').notNull().default(false),
   lastEmailedAt: timestamp('last_emailed_at'),
@@ -1064,6 +1068,9 @@ export const salesOrders = pgTable('sales_orders', {
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   convertedInvoiceId: uuid('converted_invoice_id'),
+  /** p1/salesforms: sales tax on sales orders (drizzle/0040). */
+  taxRateId: uuid('tax_rate_id'),
+  taxAmount: decimal('tax_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   // wave2 sales: shipping fields (B6) + print/email queue flags (C7)
   shipDate: timestamp('ship_date'),
   shipVia: varchar('ship_via', { length: 100 }),
@@ -1090,6 +1097,8 @@ export const salesOrderLines = pgTable('sales_order_lines', {
   lineOrder: integer('line_order').notNull().default(0),
   /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
   pricing: jsonb('pricing').$type<Record<string, unknown>>(),
+  /** p1/salesforms: QB "Tax" column (drizzle/0040). */
+  taxable: boolean('taxable').notNull().default(true),
 });
 
 // ---- Jobs / Projects (job costing) ----

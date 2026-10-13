@@ -80,6 +80,8 @@ interface ItemReceipt {
 interface PurchaseOrder {
   id: string;
   poNumber: number;
+  /** P.O. No. the user sees (typed ref number). */
+  refNumber?: string | null;
   vendorId: string;
   status: 'open' | 'partial' | 'closed' | 'void';
 }
@@ -450,7 +452,7 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
               </option>
               {vendorPos.map((p) => (
                 <option key={p.id} value={p.id}>
-                  PO #{p.poNumber} ({p.status === 'partial' ? 'partially received' : 'open'})
+                  PO #{p.refNumber || p.poNumber} ({p.status === 'partial' ? 'partially received' : 'open'})
                 </option>
               ))}
             </Select>
@@ -721,7 +723,7 @@ export default function ItemReceiptsPage() {
   const [voiding, setVoiding] = useState(false);
 
   const vendorMap = Object.fromEntries(vendors.map((v) => [v.id, v.displayName]));
-  const poNumberMap = Object.fromEntries(pos.map((p) => [p.id, p.poNumber]));
+  const poNumberMap = Object.fromEntries(pos.map((p) => [p.id, p.refNumber || String(p.poNumber)]));
 
   const fetchData = useCallback(async () => {
     setLoading(true);

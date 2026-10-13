@@ -186,7 +186,7 @@ async function invoicesForPayment(
   const rows = await ctx.db
     .select({
       id: invoices.id,
-      number: invoices.invoiceNumber,
+      number: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`,
       date: invoices.date,
       applied: paymentApplications.amountApplied,
     })
@@ -258,7 +258,7 @@ async function creditMemosForInvoice(
   const out: LinkedTransaction[] = [];
   for (const [memoId, applied] of appliedByMemo) {
     const [memo] = await ctx.db
-      .select({ id: creditMemos.id, number: creditMemos.memoNumber, date: creditMemos.date })
+      .select({ id: creditMemos.id, number: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))`, date: creditMemos.date })
       .from(creditMemos)
       .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.id, memoId)));
     if (!memo) continue;
@@ -319,13 +319,13 @@ async function invoiceTree(ctx: ServiceContext, invoiceId: string): Promise<Link
 
   // Source documents: estimate(s) and/or sales order(s) converted into this invoice.
   const ests = await ctx.db
-    .select({ id: estimates.id, number: estimates.estimateNumber, date: estimates.date, total: estimates.total })
+    .select({ id: estimates.id, number: sql<string>`COALESCE(NULLIF(${estimates.refNumber}, ''), CAST(${estimates.estimateNumber} AS TEXT))`, date: estimates.date, total: estimates.total })
     .from(estimates)
     .where(and(eq(estimates.companyId, ctx.companyId), eq(estimates.convertedInvoiceId, invoiceId)));
   for (const e of ests) children.push(node('estimate', e.id, `Estimate #${e.number}`, e.date, e.total));
 
   const sos = await ctx.db
-    .select({ id: salesOrders.id, number: salesOrders.orderNumber, date: salesOrders.date, total: salesOrders.total })
+    .select({ id: salesOrders.id, number: sql<string>`COALESCE(NULLIF(${salesOrders.refNumber}, ''), CAST(${salesOrders.orderNumber} AS TEXT))`, date: salesOrders.date, total: salesOrders.total })
     .from(salesOrders)
     .where(and(eq(salesOrders.companyId, ctx.companyId), eq(salesOrders.convertedInvoiceId, invoiceId)));
   for (const s of sos) children.push(node('sales_order', s.id, `Sales Order #${s.number}`, s.date, s.total));
@@ -362,7 +362,7 @@ async function billTree(ctx: ServiceContext, billId: string): Promise<LinkedTran
 
   // PO source(s).
   const pos = await ctx.db
-    .select({ id: purchaseOrders.id, number: purchaseOrders.poNumber, date: purchaseOrders.date, total: purchaseOrders.total })
+    .select({ id: purchaseOrders.id, number: sql<string>`COALESCE(NULLIF(${purchaseOrders.refNumber}, ''), CAST(${purchaseOrders.poNumber} AS TEXT))`, date: purchaseOrders.date, total: purchaseOrders.total })
     .from(purchaseOrders)
     .where(and(eq(purchaseOrders.companyId, ctx.companyId), eq(purchaseOrders.convertedBillId, billId)));
   for (const p of pos) children.push(node('purchase_order', p.id, `PO #${p.number}`, p.date, p.total));
@@ -499,7 +499,7 @@ async function creditMemoTree(ctx: ServiceContext, memoId: string): Promise<Link
     if (!nv.appliedToInvoice || seen.has(nv.appliedToInvoice)) continue;
     seen.add(nv.appliedToInvoice);
     const [inv] = await ctx.db
-      .select({ id: invoices.id, number: invoices.invoiceNumber, date: invoices.date })
+      .select({ id: invoices.id, number: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`, date: invoices.date })
       .from(invoices)
       .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.id, nv.appliedToInvoice)));
     if (inv) children.push(node('invoice', inv.id, `Invoice #${inv.number}`, inv.date, nv.amountApplied ?? '0'));
@@ -595,7 +595,7 @@ async function itemReceiptTree(ctx: ServiceContext, receiptId: string): Promise<
   const children: LinkedTransaction[] = [];
   if (rec.purchaseOrderId) {
     const [po] = await ctx.db
-      .select({ id: purchaseOrders.id, number: purchaseOrders.poNumber, date: purchaseOrders.date, total: purchaseOrders.total })
+      .select({ id: purchaseOrders.id, number: sql<string>`COALESCE(NULLIF(${purchaseOrders.refNumber}, ''), CAST(${purchaseOrders.poNumber} AS TEXT))`, date: purchaseOrders.date, total: purchaseOrders.total })
       .from(purchaseOrders)
       .where(and(eq(purchaseOrders.companyId, ctx.companyId), eq(purchaseOrders.id, rec.purchaseOrderId)));
     if (po) children.push(node('purchase_order', po.id, `PO #${po.number}`, po.date, po.total));
