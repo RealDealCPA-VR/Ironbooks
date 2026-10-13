@@ -702,6 +702,14 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
       'Credit memo and invoice must belong to the same customer.',
     );
   }
+  // Credit memos are recorded in home currency; a foreign-currency invoice is settled through
+  // Receive Payments (which converts at the booked rate and posts realized exchange gain/loss).
+  // Same rule as vendorCredits.applyToBill on the A/P side.
+  if (invoice.currency) {
+    throw validation(
+      `This invoice is in ${invoice.currency}. Home-currency credits can't be applied to it — settle it with Receive Payments instead.`,
+    );
+  }
 
   const balanceDue = Money.of(invoice.balanceDue);
   if (amount.greaterThan(balanceDue)) {

@@ -218,8 +218,10 @@ async function invoiceOpenHome(
     .where(and(eq(paymentApplications.invoiceId, inv.id), isNull(paymentsReceived.voidedAt)));
   let relieved = Money.zero();
   for (const a of apps) relieved = relieved.plus(applicationHome(a, rate));
-  // Credit memos have no currency: one applied to this invoice (creditMemos.applyToInvoice) took
-  // its home amount off A/R when the memo posted, so that part is no longer open either.
+  // Credit memos have no currency, and creditMemos.applyToInvoice now refuses foreign invoices
+  // (as Receive Payments and vendorCredits.applyToBill do), so new data never matches here.
+  // Safeguard for older databases where a home memo was applied to a foreign invoice before that
+  // rule: the memo took its home amount off A/R when it posted, so that part is no longer open.
   // (Unapplying a credit deletes its row, so every remaining row is live.)
   const [credits] = await tx.db
     .select({ total: sql<string>`COALESCE(SUM(${creditApplications.amount}), 0)` })
