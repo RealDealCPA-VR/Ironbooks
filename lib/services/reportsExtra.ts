@@ -110,6 +110,10 @@ async function creditMemoApplicationsAfter(
  * the credit's and the bill's own dates: before the credit existed it cannot have reduced the
  * bill, and from then on the bill and the credit move together, so aging always ties to the A/P
  * account. Applications and unapplications of the same pair net out.
+ *
+ * Known difference: the cash-basis engine (cashBasisLedger.ts) dates the same application by the
+ * day it was entered (audit timestamp), not by the document dates. Both tie to A/P in their own
+ * basis; a dated application row would let them agree exactly (deferred, outside this team).
  */
 async function vendorCreditApplicationsAfter(
   ctx: ServiceContext,
@@ -595,6 +599,9 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
   const vcAppsLater = await vendorCreditApplicationsAfter(ctx, cutoff);
+  // Vendor refunds dated after the cutoff (JE sourceRef 'refund:<vendorCreditId>', Dr Bank / Cr A/P,
+  // so the debit sum is the refund amount) had not consumed the credit yet on the cutoff date.
+  const vcRefundsLater = await creditMemoRefundsAfter(ctx, cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const byVendor = new Map<string, { name: string; buckets: BucketAccum }>();
@@ -630,7 +637,7 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
   }
 
   // Unapplied vendor credits reduce net payables — negative 'current' rows.
-  // Applications made after the cutoff are added back (the credit was still open then).
+  // Applications and refunds made after the cutoff are added back (the credit was still open then).
   const creditRows = await ctx.db
     .select({
       id: vendorCredits.id,
@@ -649,7 +656,9 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     );
 
   for (const credit of creditRows) {
-    const open = Money.of(credit.unapplied).plus(vcAppsLater.byCredit.get(credit.id) ?? Money.zero());
+    const open = Money.of(credit.unapplied)
+      .plus(vcAppsLater.byCredit.get(credit.id) ?? Money.zero())
+      .plus(Money.of(vcRefundsLater.get(credit.id) ?? '0'));
     if (!open.greaterThan(0)) continue;
     if (!byVendor.has(credit.vendorId)) {
       byVendor.set(credit.vendorId, { name: credit.vendorName, buckets: blankBuckets() });
@@ -1271,6 +1280,9 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
   const vcAppsLater = await vendorCreditApplicationsAfter(ctx, cutoff);
+  // Vendor refunds dated after the cutoff (JE sourceRef 'refund:<vendorCreditId>', Dr Bank / Cr A/P,
+  // so the debit sum is the refund amount) had not consumed the credit yet on the cutoff date.
+  const vcRefundsLater = await creditMemoRefundsAfter(ctx, cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
@@ -1326,8 +1338,10 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       ),
     );
   for (const c of creditRows) {
-    // Applications made after the cutoff are added back (the credit was still open then).
-    const open = Money.of(c.unapplied).plus(vcAppsLater.byCredit.get(c.id) ?? Money.zero());
+    // Applications and refunds made after the cutoff are added back (the credit was still open then).
+    const open = Money.of(c.unapplied)
+      .plus(vcAppsLater.byCredit.get(c.id) ?? Money.zero())
+      .plus(Money.of(vcRefundsLater.get(c.id) ?? '0'));
     if (!open.greaterThan(0)) continue;
     detail.push({
       docId: c.id,
