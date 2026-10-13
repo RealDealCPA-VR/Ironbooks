@@ -28,7 +28,7 @@ _Final audit, 2026-10-12, after waves 1 and 2 were merged (PR #3). Seven read-on
 | 5. Condensed backup with full restore, including restore from a condensed archive | **met** (fixed 2026-10-12; was partial) | _Fixed by fix/restore. What the audit found:_ Full-file restore (restoreBackup, which archive restores also use) never checks the ledger after the swap. A tampered or corrupt archive with guards disabled is accepted and returns {restored:true} (see break #1). Portable .bkp restore does verify, so the gap is limited to the .bka / condense-archive path. |
 | 6. Users and permissions per company | **met** | None found in this audit. |
 | 7. Trial balance / balance sheet impossible to unbalance | **met** (fixed 2026-10-12; was partial) | _Fixed by fix/restore. What the audit found:_ Running ALTER TABLE journal_entry_lines DISABLE TRIGGER ALL as raw SQL (PGlite runs as superuser) bypasses every guard. That is inherent to owning the DB. The real product break is that a database in that state can be imported through a full .bka restore and stays unguarded afterwards (break #1). verifyIntegrity does detect it ('Database ledger guards active' fails), but nothing re-enables the guards and nothing blocks the restore. |
-| 8. Simple UX for non-accountants | **partial** | The sidebar (lib/nav.ts) shows 107 links in 9 always-visible groups (Sales, Purchases, Banking, Accounting, Insights, Admin, Operations, Setup…). There is no simple/essentials mode or progressive disclosure, which is overwhelming for a non-accountant. <Help> tooltips appear in only 30 of 164 pages. Many labels are QB jargon ('SO Fulfillment', 'Finance Charges', 'Income Tracker'). |
+| 8. Simple UX for non-accountants | **met** (P1 round, 2026-10-13; was partial) | _Fixed by p1/ux: Simple mode with 18 everyday tasks (default for new users), page search, "What is this page?" help on every page, plain labels. What the audit found:_ The sidebar (lib/nav.ts) shows 107 links in 9 always-visible groups (Sales, Purchases, Banking, Accounting, Insights, Admin, Operations, Setup…). There is no simple/essentials mode or progressive disclosure, which is overwhelming for a non-accountant. <Help> tooltips appear in only 30 of 164 pages. Many labels are QB jargon ('SO Fulfillment', 'Finance Charges', 'Income Tracker'). |
 | 9. Production readiness: tsc, migrations fresh and upgraded, Electron packaging | **met** | Minor: the 0029 FK ADD CONSTRAINT will fail if an upgraded DB has orphan tax_rate_id values written between 0027 and 0029. No service hard-deletes tax_rates, so the risk is low. Because 'files' lists only electron/** and drizzle/**, electron-builder still packs all production dependencies (next, react, etc.) into the asar. That bloats the install but does not break it. |
 
 ### Breaks found by the adversarial goal auditor
@@ -64,6 +64,42 @@ Five doer/tester/reviewer teams fixed every P0 below. All were approved, then me
 - Re-dating an invoice past its payment leaves aging off.
 - Legacy pre-tax paycheck lines with no linked item are treated as after-tax when a W-2 is recomputed.
 - API change: sending `taxes` without `employerTaxes` now posts calculated employer taxes. To keep the old behavior, send `employerTaxes: []`.
+
+## P1 round (2026-10-12/13): all 9 teams approved and merged
+
+Nine doer/tester/reviewer teams closed the P1 gaps. The run was cut off once by a usage limit and resumed from each team's last stage. Every team was approved, then merged to `main`. Verified on merged main: `tsc` clean, **424 files / 5,059 tests** passing, `next build` OK.
+
+| Team | Delivered | Fix rounds | Migration |
+|---|---|---|---|
+| setup | The setup interview is reached from sign-up, New Company and the desktop new-file flow, with Skip, and can be run again from the Help and Company menus. Its answers really switch features and the summary is built from the saved values. It collects company info (legal name, address, EIN, phone, email), entity type (equity accounts, tax form and tax lines), an industry chart of accounts, fiscal and tax year, start date and basis. Feature switches hide menus, show a plain "turned off" page and refuse API saves. The inert company and My Preferences settings are wired: duplicate-number warnings, required account numbers, reimbursed expenses as income, auto JE numbers, auto-applied vendor credits, date warnings, warn when editing, recall last transaction, auto decimal, Enter moves between fields, and more. | 2 | none |
+| ux | **Simple mode**: 18 everyday tasks grouped like the QB Home page. It is the default for new users, existing users keep All menus, and a switch sits in the sidebar. Groups collapse and remember their state, the sidebar has page search ranked by intent, and every page has "What is this page?" help with plain titles. There is now one To Do list (`todo_items` merged into `todos`), used by the Calendar and reminders. | 3 | 0039 |
+| salesforms | Typed document numbers with a duplicate prompt on estimates, sales orders, sales receipts, credit memos, POs and invoices, shown everywhere (lists, search, calendar, reminders, linked transactions, reports). Named customer ship-to addresses with a default. Customer tax item and tax code defaults. Sales orders get sales tax. Invoices get retainage, with a Retainage page and Bill retainage. Open-item statements as of a date, and foreign-currency statements in home currency. | 1 | 0040 |
+| payments | Receive Payments: ref numbers, currency and exchange rate, discount-aware auto-apply, credits while editing, a JE credit applied to a JE charge, and a paged and filtered list. Pay Bills saves credits and the payment in one transaction. Income Tracker buckets honour the as-of date. Currency codes are normalised everywhere (a home code typed as `usd` counts as home). | 5 | 0041 |
+| purchases | Pay Sales Tax in the Vendors menu. Sales tax, liability and customer refund checks go through Print Checks (voucher stubs, check-paper modes), Check Detail and Missing Checks. Vendor credits get an Items tab (returns relieve stock at cost), Ref No., Class and Customer:Job, and a PDF. Inventory adjustments post to a chosen adjustment account with Class and Job. The cash-basis sales tax revenue summary uses running totals. | 1 | 0042 |
+| fx | Journal lines carry the account-currency amount and rate. Foreign-currency bank and card accounts get registers, reconciliation, deposits, transfers and bank feeds in their own currency. Foreign vendor credits, applications and refunds are dated. Foreign loans. Home Currency Adjustment (A/R, A/P and loans are reversed the next day; bank accounts are permanent). A/R and A/P subledgers and aging in both currencies tie to the control accounts as of any date. | 10 (last two fixed directly, plus an independent review) | 0043 |
+| payroll | Full Form 941 (lines 1-16, Schedule B, deposits) and Form 940 (exemptions, credit reduction, deposits). State income tax withholding engine by year. IIF account opening balances, journal NAME column, and import/export of the other IIF lists. | 3 | none |
+| reports | Aging, open invoices, collections, GL, cash flow, sales and purchase summaries, sales tax liability, P&L by Job, prior-year Balance Sheet and adjusting JEs run on the standard engine with QB options. The basis toggle follows the preference. Scheduled reports run in every company. As-of A/R and A/P aging use dated credit-memo and vendor-credit applications and later refunds. Voiding a vendor-credit refund gives the credit back. | 3 | none |
+| controls | Closing-date password prompt in the UI, with overrides on the Closing Date Exception report. Ledger-neutral edits of closed-period documents need the password. Record locking (version check) on every transaction type and on convert. Doc Center re-file/describe/delete. An approved AI correction posts its correcting entry. Condense keeps applications pointing at kept documents. Ledger trigger allowlist keyed by table. | 3 | 0046 |
+
+Migration indexes 38, 44 and 45 were reserved and not used.
+
+**Fixed while merging** (they only showed once branches were combined):
+- When sales tax is off, a customer's default tax item is no longer added to new sales forms. New sales orders are gated like the other forms.
+- Printing a sales tax, liability or refund check needs the closing-date password, like every other check.
+- **Database time zone:** PGlite's session time zone followed the host (e.g. `Etc/GMT+5`). Database-stamped times (audit log, created/updated) were stored as local wall-clock time and read back as UTC, so they came back hours early, and a day early just after midnight. The session is now pinned to UTC (`lib/db/index.ts`). Rows written before this fix keep the old offset.
+
+**Goal 8 (simple UX) is now met**, with Simple mode, page search, page help and plain labels. Every project goal is met. Hands-on QA of the new screens is still to do.
+
+**Follow-ups (P2) left by the reviewers:**
+- Open-item statement and A/R aging detail show foreign invoices in the transaction currency, not home currency. That matches how QB prints statements; the balance-forward statement ties to home A/R.
+- Vendor-credit applications made before the FX round have no stored date (rebuilt from the audit log). New applications are dated.
+- `inventoryOps` shrinkage still posts to 5900 Inventory Shrinkage, while item adjustments default to Inventory Adjustments.
+- A billed-back Inventory Part is credited to income without relieving stock (QB adds an item line).
+- Form 941 line 13 skips lump-sum liability payments that have no payroll item. Some 2025/2026 state withholding tables (GA, CA, IL, KY, MA, MI, NY, OH, UT, VA) need checking against the published guides.
+- A batch convert from the Income Tracker skips the record-lock version check.
+- `applyPayment` error messages show the internal invoice id, not the ref number.
+- Voiding only one of an HCA's two entries from the General Journal leaves a lasting HCA item. Void HCAs from the Home Currency Adjustment screen.
+- Rename `restoreRefundedCustomerCredit` (it also restores vendor credits now).
 
 ## P0 fix list (as found by the audit; all fixed in the round above)
 

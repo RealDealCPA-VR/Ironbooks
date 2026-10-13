@@ -201,14 +201,8 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] Wave 2: 8 teams closing the QuickBooks Enterprise gaps in [`PARITY.md`](./PARITY.md)
 - [x] **Final parity audit**: 52 of 109 gaps done, 11 P0 items found (see [`PARITY.md`](./PARITY.md))
 - [x] **P0 fix round**: all 11 fixed, covering restore safety, cash-basis P&L, consolidated-report access, payroll wage bases and W-2 Box 12, progress invoicing, statements, and A/R and A/P journal entries
-- [ ] **P1 round**: wire up every preference, add simple navigation mode, typed doc numbers on all forms, finish multi-currency, merge the two To-Do lists, close the report gaps
-- [ ] Follow-ups:
-  - unify the two To-Do lists
-  - typed numbers on every sales and purchase form
-  - update memorized transactions on name merge
-  - Income Tracker as-of balances
-  - multi-currency vendor credits, deposits and transfers
-  - refund-check printing
+- [x] **P1 round**: 9 teams. Setup interview and every preference wired, Simple menu mode with page search and help, typed document numbers on every form, full multi-currency (foreign banks, Home Currency Adjustment, aging in both currencies), one To Do list, Form 941/940, closing-date password prompt and record locking everywhere
+- [ ] Follow-ups (P2): listed in [`PARITY.md`](./PARITY.md) under "P1 round"
 - [ ] Hands-on QA of the new screens, then a tagged release
 
 ## 📜 License
