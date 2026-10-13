@@ -302,11 +302,14 @@ export function rememberVersions(url: string, data: unknown): void {
 }
 
 /**
- * POST actions that change the record itself (void / close / status) carry its version too, so
- * acting on a record someone else changed since it was loaded gets the same 409. Other POSTs
- * (create, convert, apply, refund, ...) create or touch other records and don't.
+ * POST actions that change or consume the record itself (void / close / status / convert) carry
+ * its version too, so acting on a record someone else changed since it was loaded gets the same
+ * 409. Convert counts: turning a stale estimate, sales order, purchase order or item receipt into
+ * an invoice or bill would bill what the other user just changed (QB: "the transaction has been
+ * changed by another user"). Other POSTs (create, apply, refund, ...) touch other records and
+ * don't; a route that doesn't check the header simply ignores it.
  */
-const VERSIONED_POST_ACTIONS = new Set(['void', 'close', 'status']);
+const VERSIONED_POST_ACTIONS = new Set(['void', 'close', 'status', 'convert']);
 
 function versionFor(method: string, url: string, body?: unknown): string | undefined {
   if (method === 'POST') {

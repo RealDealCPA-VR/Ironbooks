@@ -62,11 +62,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     if (parsed.data.action === 'convert') {
-      const bill = await convertToBill(ctx, id, {
-        billNumber: parsed.data.billNumber ?? null,
-        date: parsed.data.date,
-        dueDate: parsed.data.dueDate ?? null,
-      });
+      // A stale tab must not bill an item receipt another user just changed.
+      const { billNumber, date, dueDate } = parsed.data;
+      const bill = await withVersionCheck(ctx, 'item_receipt', id, expectedVersion(req), (c) =>
+        convertToBill(c, id, { billNumber: billNumber ?? null, date, dueDate: dueDate ?? null }),
+      );
       return NextResponse.json(bill);
     }
 

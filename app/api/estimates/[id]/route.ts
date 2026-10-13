@@ -91,9 +91,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const { action } = body;
 
     if (action === 'convert') {
-      const invoice = await convertToInvoice(ctx, id, {
-        overrideCreditLimit: body.overrideCreditLimit === true,
-      });
+      // A stale tab must not convert an estimate another user just changed.
+      const invoice = await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) =>
+        convertToInvoice(c, id, { overrideCreditLimit: body.overrideCreditLimit === true }),
+      );
       return NextResponse.json(invoice, { status: 201 });
     }
 
