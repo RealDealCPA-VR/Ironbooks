@@ -186,6 +186,11 @@ export async function recordPaymentFxRelief(
  * An application made before relief records existed (an upgraded company) relieved A/R by
  * round2(applied x rate) + round2(discount x rate). Before such an application is changed (apply
  * more / unapply), write that as its baseline record so the home amount still open stays the same.
+ *
+ * Known limitation (legacy data only): an application made partly before 0043 and partly after
+ * keeps the old round2(applied x rate) rule for the earlier part, so such an invoice can end up to
+ * 1 cent away from the telescoped home value. New applications are exact. A Home Currency
+ * Adjustment, or a 1-cent journal entry to Exchange Gain/Loss, clears the residue.
  */
 export async function ensureLegacyFxRelief(
   ctx: ServiceContext,

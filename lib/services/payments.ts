@@ -1703,7 +1703,8 @@ export interface RefundPaymentInput {
  * Refund (part of) a payment's unapplied balance to the customer — e.g. an
  * overpayment returned by check.
  *
- * Posting (base currency, at the payment's original settlement rate):
+ * Posting (base currency; for a foreign payment the home value is the change in the credit's
+ * home value, homeAt(unapplied before) - homeAt(unapplied after), at the payment rate):
  *   Dr  A/R (1200)      amount * rate   — removes the customer-credit sitting in A/R
  *   Cr  bank account    amount * rate   — money leaves the bank
  *
@@ -1734,7 +1735,7 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
 
   // Validate the bank account: must be a company-owned bank/cash asset.
   const [bankAcct] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, currency: accounts.currency })
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
@@ -1745,7 +1746,10 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
 
   const arAccountId = await getArAccountId(ctx);
   const rate = Money.of(payment.exchangeRate ?? 1);
-  const baseAmount = Money.round2(Money.mul(amount, rate));
+  // p1 fx: the credit's home value is telescoped exactly like apply/unapply
+  // (homeAt(unapplied before) - homeAt(unapplied after)), so A/R stays equal to the aging
+  // after any number of partial refunds and a refund of the whole remainder clears it exactly.
+  const baseAmount = Money.round2(homeAt(unapplied, rate).minus(homeAt(Money.round2(unapplied.minus(amount)), rate)));
   const refundDate = input.date ?? new Date();
 
   return inTransaction(ctx, async (tx) => {
@@ -1764,6 +1768,8 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
           accountId: input.bankAccountId,
           credit: toAmountString(baseAmount),
           memo: 'Refund paid to customer',
+          // p1 fx: refunded from a bank in the payment's currency -> register shows the foreign amount.
+          ...(payment.currency && bankAcct.currency === payment.currency ? { foreignAmount: toAmountString(amount) } : {}),
         },
       ],
     });
