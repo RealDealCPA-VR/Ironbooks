@@ -113,6 +113,9 @@ export default async function SalesTaxReportPage({
           <Link href={qs({ view: 'revenue' })}>
             <Button variant={view === 'revenue' ? 'primary' : 'secondary'} size="sm">Revenue summary</Button>
           </Link>
+          <Link href={`/reports/std/sales-tax-liability?from=${fromStr}&to=${toStr}&basis=${basis}`}>
+            <Button variant="secondary" size="sm">Memorize, schedule or drill down</Button>
+          </Link>
         </div>
         <ReportToolbar table={exportTable} />
 

@@ -141,20 +141,31 @@ describe('run-due routes: internal token', () => {
     });
   }
 
-  it('the trusted run only touches the first company (another company schedule stays due)', async () => {
+  it('the trusted run serves every company in the file (P1: not just the oldest)', async () => {
+    await db.insert(userCompanies).values({ userId: otherCtx.userId!, companyId: otherCtx.companyId, role: 'owner' }).onConflictDoNothing();
     const m = await saveMemorizedReport(otherCtx, { name: 'Other TB', reportType: 'trial-balance', config: {} });
     const s = await createReportSchedule(otherCtx, { name: 'Other daily', memorizedReportId: m.id, frequency: 'daily', startDate: '2026-01-05' });
+    const first = await dueTb('First co');
     const tok = '9'.repeat(64);
     process.env.BKA_INTERNAL_TOKEN = tok;
     try {
       const res = await (await load(NEW_ROUTE)).POST(req('/api/reports/schedules/run-due', { 'x-bka-internal': tok }));
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { results: { scheduleId: string }[] };
-      expect(body.results.map((r) => r.scheduleId)).not.toContain(s.id);
+      const body = (await res.json()) as { results: { scheduleId: string; status: string; companyId: string; files: string[] }[] };
+      const other = body.results.find((r) => r.scheduleId === s.id);
+      expect(other?.status).toBe('ok');
+      expect(other?.companyId).toBe(otherCtx.companyId);
+      const mine = body.results.find((r) => r.scheduleId === first.id);
+      expect(mine?.status).toBe('ok');
+      expect(mine?.companyId).toBe(ctx.companyId);
+      // The second company's exports go to its own sub-folder, so same-named files never collide.
+      expect(other!.files[0]).toContain(path.join('Companies', 'QA7 Other'));
+      expect(mine!.files[0]).not.toContain('Companies');
     } finally {
       delete process.env.BKA_INTERNAL_TOKEN;
     }
-    await untouched(s.id);
+    const [row] = await db.select().from(reportSchedules).where(eq(reportSchedules.id, s.id));
+    expect(row.lastStatus).toBe('ok');
   });
 });
 

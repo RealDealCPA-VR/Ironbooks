@@ -76,6 +76,8 @@ export interface StdReport {
   truncated?: boolean;
   /** Plain-language notes shown under the report. */
   notes?: string[];
+  /** Reports offered on both bases: the basis this run used (set by runStandardReport). */
+  basis?: 'accrual' | 'cash';
 }
 
 /** Flatten a report into an export table (labels indented with spaces by depth). */

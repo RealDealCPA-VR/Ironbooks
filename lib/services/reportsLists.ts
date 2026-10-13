@@ -37,6 +37,8 @@ import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/type
 import type { ReportParams } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { apAgingDetail } from './reportsExtra';
+import { cashBasisLedger } from './cashBasisLedger';
+import type { TxnTypeKey } from '@/lib/validation/reports';
 import {
   SECTION_LABELS,
   activityByAccount,
@@ -54,6 +56,7 @@ import {
   resolveAsOf,
   resolveRange,
   stdHref,
+  TXN_TYPE_LABELS,
   type AccountMeta,
   type GlLine,
   type NameType,
@@ -410,7 +413,10 @@ export async function openPurchaseOrders(ctx: ServiceContext, p: ReportParams): 
 
 interface SalesLine {
   id: string;
-  type: 'Invoice' | 'Sales Receipt' | 'Credit Memo';
+  /** Invoice / Sales Receipt / Credit Memo, or on a cash basis the settling transaction type. */
+  type: string;
+  /** Cash basis: the settling transaction's entry (QuickZoom), overriding sourceRef. */
+  entryId?: string | null;
   sourceRef: string;
   date: Date;
   num: string;
@@ -428,10 +434,14 @@ export async function salesLines(
   ctx: ServiceContext,
   range: { from: Date; to: Date },
   filter: { customerId?: string; itemId?: string; classId?: string } = {},
+  /** Only these invoices / credit memos, any date (no sales receipts) — used by the cash basis. */
+  scope?: { invoiceIds: string[]; creditMemoIds: string[] },
 ): Promise<SalesLine[]> {
   const c = ctx.companyId;
   const out: SalesLine[] = [];
-  const invConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), gte(invoices.date, range.from), lte(invoices.date, range.to)];
+  const invConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft'])];
+  if (scope) invConds.push(scope.invoiceIds.length ? inArray(invoices.id, scope.invoiceIds) : sql`false`);
+  else invConds.push(gte(invoices.date, range.from), lte(invoices.date, range.to));
   if (filter.customerId) invConds.push(eq(invoices.customerId, filter.customerId));
   if (filter.itemId) invConds.push(eq(invoiceLines.itemId, filter.itemId));
   if (filter.classId) invConds.push(sql`COALESCE(${invoiceLines.classId}, ${invoices.classId}) = ${filter.classId}`);
@@ -456,6 +466,7 @@ export async function salesLines(
     out.push({ id: r.id, type: 'Invoice', sourceRef: `invoice:${r.docId}`, date: r.date, num: docRef(r.ref, r.num), customerId: r.customerId, itemId: r.itemId, item: r.item ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), price: Money.of(r.rate), amount: Money.of(r.amount) });
   }
   const srConds: SQL[] = [eq(salesReceipts.companyId, c), ne(salesReceipts.status, 'void'), gte(salesReceipts.date, range.from), lte(salesReceipts.date, range.to)];
+  if (scope) srConds.push(sql`false`);
   if (filter.customerId) srConds.push(eq(salesReceipts.customerId, filter.customerId));
   if (filter.itemId) srConds.push(eq(salesReceiptLines.itemId, filter.itemId));
   if (filter.classId) srConds.push(sql`COALESCE(${salesReceiptLines.classId}, ${salesReceipts.classId}) = ${filter.classId}`);
@@ -480,7 +491,9 @@ export async function salesLines(
     out.push({ id: r.id, type: 'Sales Receipt', sourceRef: `salesreceipt:${r.docId}`, date: r.date, num: docRef(r.ref, r.num), customerId: r.customerId, itemId: r.itemId, item: r.item ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), price: Money.of(r.rate), amount: Money.of(r.amount) });
   }
   if (!filter.classId) {
-    const cmConds: SQL[] = [eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), gte(creditMemos.date, range.from), lte(creditMemos.date, range.to)];
+    const cmConds: SQL[] = [eq(creditMemos.companyId, c), ne(creditMemos.status, 'void')];
+    if (scope) cmConds.push(scope.creditMemoIds.length ? inArray(creditMemos.id, scope.creditMemoIds) : sql`false`);
+    else cmConds.push(gte(creditMemos.date, range.from), lte(creditMemos.date, range.to));
     if (filter.customerId) cmConds.push(eq(creditMemos.customerId, filter.customerId));
     if (filter.itemId) cmConds.push(eq(creditMemoLines.itemId, filter.itemId));
     for (const r of await ctx.db
@@ -507,9 +520,88 @@ export async function salesLines(
   return out.sort((a, b) => a.date.getTime() - b.date.getTime() || a.num.localeCompare(b.num, undefined, { numeric: true }));
 }
 
+/**
+ * Sales lines on the report's basis. Accrual: salesLines. Cash (QB "Report Basis: Cash"): sales
+ * receipts as they are, and each invoice / credit memo line recognized on the dates the document
+ * was paid (or credited), in proportion to the share of its income settled then — the same
+ * settlements the cash-basis ledger (cashBasisLedger.ts) uses for the Profit & Loss. Each line
+ * is rounded cumulatively, so a fully paid line always adds up to its own amount.
+ */
+export async function salesLinesOnBasis(
+  ctx: ServiceContext,
+  range: { from: Date; to: Date },
+  filter: { customerId?: string; itemId?: string; classId?: string },
+  basis: 'accrual' | 'cash' | undefined,
+): Promise<SalesLine[]> {
+  if (basis !== 'cash') return salesLines(ctx, range, filter);
+  const receipts = (await salesLines(ctx, range, filter)).filter((l) => l.type === 'Sales Receipt');
+  const meta = await loadAccountMeta(ctx);
+  const { adjustments } = await cashBasisLedger(ctx, { to: range.to });
+  const deferred = new Map<string, Decimal>();
+  const recog = new Map<string, Map<string, { date: Date; net: Decimal; entryId: string | null; txnType: TxnTypeKey }>>();
+  for (const a of adjustments) {
+    if (a.control || (a.doc.kind !== 'invoice' && a.doc.kind !== 'credit_memo')) continue;
+    if (meta.get(a.accountId)?.type !== 'revenue') continue;
+    const dk = `${a.doc.kind}:${a.doc.id}`;
+    if (a.kind === 'defer') {
+      deferred.set(dk, (deferred.get(dk) ?? Money.zero()).plus(a.net));
+      continue;
+    }
+    const sk = `${a.date.getTime()}|${a.settle?.entryId ?? ''}|${a.settle?.txnType ?? ''}`;
+    const m = recog.get(dk) ?? new Map();
+    const cur = m.get(sk) ?? { date: a.date, net: Money.zero(), entryId: a.settle?.entryId ?? a.doc.entryId, txnType: a.settle?.txnType ?? 'payment' };
+    cur.net = cur.net.plus(a.net);
+    m.set(sk, cur);
+    recog.set(dk, m);
+  }
+  // Only documents with a settlement inside the range matter.
+  const inRange = (d: Date) => d >= range.from && d <= range.to;
+  const docs = [...recog.entries()].filter(([, m]) => [...m.values()].some((r) => inRange(r.date)));
+  if (docs.length === 0) return receipts;
+  const scope = {
+    invoiceIds: docs.filter(([k]) => k.startsWith('invoice:')).map(([k]) => k.slice('invoice:'.length)),
+    creditMemoIds: docs.filter(([k]) => k.startsWith('credit_memo:')).map(([k]) => k.slice('credit_memo:'.length)),
+  };
+  const docLines = await salesLines(ctx, range, filter, scope);
+  const byDoc = new Map<string, SalesLine[]>();
+  for (const l of docLines) byDoc.set(l.sourceRef, [...(byDoc.get(l.sourceRef) ?? []), l]);
+  const out: SalesLine[] = [...receipts];
+  for (const [dk, m] of docs) {
+    const def = deferred.get(dk);
+    const lines = byDoc.get(dk);
+    if (!def || def.isZero() || !lines) continue;
+    const settlements = [...m.values()].sort((a, b) => a.date.getTime() - b.date.getTime());
+    let cum = Money.zero();
+    const prevAmt = new Map<string, Decimal>();
+    const prevQty = new Map<string, Decimal>();
+    settlements.forEach((s, k) => {
+      cum = cum.plus(s.net.negated().dividedBy(def));
+      if (!inRange(s.date)) {
+        for (const l of lines) {
+          prevAmt.set(l.id, Money.round2(l.amount.times(cum)));
+          prevQty.set(l.id, l.qty.times(cum).toDecimalPlaces(4));
+        }
+        return;
+      }
+      for (const l of lines) {
+        const a = Money.round2(l.amount.times(cum));
+        const q = l.qty.times(cum).toDecimalPlaces(4);
+        const share = a.minus(prevAmt.get(l.id) ?? Money.zero());
+        const qty = q.minus(prevQty.get(l.id) ?? Money.zero());
+        prevAmt.set(l.id, a);
+        prevQty.set(l.id, q);
+        if (share.isZero() && qty.isZero()) continue;
+        out.push({ ...l, id: `${l.id}:cash${k}`, type: TXN_TYPE_LABELS[s.txnType], date: s.date, qty, amount: share, entryId: s.entryId });
+      }
+    });
+  }
+  return out.sort((a, b) => a.date.getTime() - b.date.getTime() || a.num.localeCompare(b.num, undefined, { numeric: true }));
+}
+
 async function salesDetail(ctx: ServiceContext, p: ReportParams, by: 'customer' | 'item'): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
-  const lines = await salesLines(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId });
+  const basis = p.basis === 'cash' ? 'cash' : undefined;
+  const lines = await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis);
   const names = await customerNames(ctx);
   const entryIds = await entryIdsForSourceRefs(ctx, lines.map((l) => l.sourceRef));
   const groups = new Map<string, { label: string; lines: SalesLine[] }>();
@@ -548,7 +640,7 @@ async function salesDetail(ctx: ServiceContext, p: ReportParams, by: 'customer' 
           amount: amt(l.amount),
           balance: amt(total),
         },
-        entryId: entryIds.get(l.sourceRef) ?? null,
+        entryId: l.entryId !== undefined ? l.entryId : (entryIds.get(l.sourceRef) ?? null),
       });
     }
     tQty = tQty.plus(qty);
@@ -561,7 +653,7 @@ async function salesDetail(ctx: ServiceContext, p: ReportParams, by: 'customer' 
   return {
     key: by === 'customer' ? 'sales-by-customer-detail' : 'sales-by-item-detail',
     title: by === 'customer' ? 'Sales by Customer Detail' : 'Sales by Item Detail',
-    subtitle: rangeLabel(from, to),
+    subtitle: `${rangeLabel(from, to)}${basis ? ' · Cash Basis' : ''}`,
     columns: [
       { key: 'label', header: '' },
       { key: 'type', header: 'Type' },
@@ -580,6 +672,149 @@ async function salesDetail(ctx: ServiceContext, p: ReportParams, by: 'customer' 
 
 export const salesByCustomerDetail = (ctx: ServiceContext, p: ReportParams) => salesDetail(ctx, p, 'customer');
 export const salesByItemDetail = (ctx: ServiceContext, p: ReportParams) => salesDetail(ctx, p, 'item');
+
+/** Sales by Customer Summary (QB): sales per customer:job for the period, either basis. */
+export async function salesByCustomerSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const basis = p.basis === 'cash' ? 'cash' : undefined;
+  const lines = await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis);
+  const names = await customerNames(ctx);
+  const by = new Map<string, Decimal>();
+  for (const l of lines) by.set(l.customerId ?? '', (by.get(l.customerId ?? '') ?? Money.zero()).plus(l.amount));
+  const label = (id: string) => (id ? (names.get(id)?.name ?? '') : '(no customer)');
+  let total = Money.zero();
+  const rows: StdRow[] = [...by.entries()]
+    .filter(([, v]) => !v.isZero())
+    .sort((a, b) => (a[0] === '' ? 1 : b[0] === '' ? -1 : label(a[0]).localeCompare(label(b[0]))))
+    .map(([id, v]) => {
+      total = total.plus(v);
+      return {
+        id: `sbc:${id || 'none'}`,
+        depth: 0,
+        kind: 'data' as const,
+        cells: { label: label(id), amount: amt(v) },
+        href: id ? stdHref('sales-by-customer-detail', { customerId: id, itemId: p.itemId, classId: p.classId, from: dayStr(from), to: dayStr(to), basis }) : null,
+      };
+    });
+  rows.push({ id: 'sbc:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', amount: amt(total) } });
+  return {
+    key: 'sales-by-customer-summary',
+    title: 'Sales by Customer Summary',
+    subtitle: `${rangeLabel(from, to)}${basis ? ' · Cash Basis' : ''}`,
+    columns: [{ key: 'label', header: 'Customer' }, { key: 'amount', header: 'Amount', type: 'money' }],
+    rows,
+  };
+}
+
+const ITEM_TYPE_LABEL: Record<string, string> = {
+  inventory: 'Inventory',
+  non_inventory: 'Non-inventory',
+  service: 'Service',
+  other_charge: 'Other Charges',
+  discount: 'Discounts',
+  bundle: 'Groups',
+  payment: 'Payments',
+  subtotal: 'Subtotals',
+  sales_tax: 'Sales Tax',
+};
+
+/**
+ * Sales by Item Summary (QB): per item, grouped by item type — Qty, Amount, % of Sales, Avg Price,
+ * COGS, Avg COGS, Gross Margin and Gross Margin %. COGS for inventory items is quantity × the
+ * item's average cost (QB uses its average cost too).
+ */
+export async function salesByItemSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const basis = p.basis === 'cash' ? 'cash' : undefined;
+  const lines = await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis);
+  const acc = new Map<string, { qty: Decimal; amount: Decimal }>();
+  for (const l of lines) {
+    const k = l.itemId ?? '';
+    const cur = acc.get(k) ?? { qty: Money.zero(), amount: Money.zero() };
+    cur.qty = cur.qty.plus(l.qty);
+    cur.amount = cur.amount.plus(l.amount);
+    acc.set(k, cur);
+  }
+  const ids = [...acc.keys()].filter(Boolean);
+  const meta = new Map(
+    (ids.length
+      ? await ctx.db
+          .select({ id: items.id, name: items.name, type: items.type, averageCost: items.averageCost })
+          .from(items)
+          .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, ids)))
+      : []
+    ).map((i) => [i.id, i]),
+  );
+  const grandAmount = [...acc.values()].reduce((s, v) => s.plus(v.amount), Money.zero());
+  const pctOf = (v: Decimal) => (grandAmount.isZero() ? null : v.dividedBy(grandAmount.abs()).times(100).toFixed(2));
+  type Agg = { qty: Decimal; amount: Decimal; cogs: Decimal };
+  const cellsFor = (label: string, a: Agg): Record<string, CellValue> => {
+    const margin = a.amount.minus(a.cogs);
+    return {
+      label,
+      qty: a.qty.toFixed(4),
+      amount: amt(a.amount),
+      pct: pctOf(a.amount),
+      avgPrice: a.qty.isZero() ? null : a.amount.dividedBy(a.qty).toFixed(2),
+      cogs: amt(a.cogs),
+      avgCogs: a.qty.isZero() ? null : a.cogs.dividedBy(a.qty).toFixed(2),
+      margin: amt(margin),
+      marginPct: a.amount.isZero() ? null : margin.dividedBy(a.amount.abs()).times(100).toFixed(2),
+    };
+  };
+  const groups = new Map<string, { id: string; name: string; agg: Agg }[]>();
+  for (const [id, v] of acc) {
+    if (v.amount.isZero() && v.qty.isZero()) continue;
+    const it = id ? meta.get(id) : undefined;
+    const type = it ? (ITEM_TYPE_LABEL[it.type] ?? it.type) : 'No item';
+    const cogs = it && it.type === 'inventory' && it.averageCost ? Money.round2(v.qty.times(Money.of(it.averageCost))) : Money.zero();
+    groups.set(type, [...(groups.get(type) ?? []), { id, name: it?.name ?? '(no item)', agg: { ...v, cogs } }]);
+  }
+  const rows: StdRow[] = [];
+  const grand: Agg = { qty: Money.zero(), amount: Money.zero(), cogs: Money.zero() };
+  for (const [type, list] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const hid = `sbi:${type}`;
+    const sub: Agg = { qty: Money.zero(), amount: Money.zero(), cogs: Money.zero() };
+    const header: StdRow = { id: hid, depth: 0, kind: 'section', collapseKind: 'group', cells: { label: type } };
+    rows.push(header);
+    for (const x of list.sort((a, b) => a.name.localeCompare(b.name))) {
+      sub.qty = sub.qty.plus(x.agg.qty);
+      sub.amount = sub.amount.plus(x.agg.amount);
+      sub.cogs = sub.cogs.plus(x.agg.cogs);
+      rows.push({
+        id: `${hid}:${x.id || 'none'}`,
+        parentId: hid,
+        depth: 1,
+        kind: 'data',
+        cells: cellsFor(x.name, x.agg),
+        href: x.id ? stdHref('sales-by-item-detail', { itemId: x.id, customerId: p.customerId, classId: p.classId, from: dayStr(from), to: dayStr(to), basis }) : null,
+      });
+    }
+    grand.qty = grand.qty.plus(sub.qty);
+    grand.amount = grand.amount.plus(sub.amount);
+    grand.cogs = grand.cogs.plus(sub.cogs);
+    header.collapsedCells = cellsFor(type, sub);
+    rows.push({ id: `${hid}:total`, depth: 0, kind: 'subtotal', totalOf: hid, cells: cellsFor(`Total ${type}`, sub) });
+  }
+  rows.push({ id: 'sbi:grand', depth: 0, kind: 'grand', cells: cellsFor('TOTAL', grand) });
+  return {
+    key: 'sales-by-item-summary',
+    title: 'Sales by Item Summary',
+    subtitle: `${rangeLabel(from, to)}${basis ? ' · Cash Basis' : ''}`,
+    columns: [
+      { key: 'label', header: '' },
+      { key: 'qty', header: 'Qty', type: 'number' },
+      { key: 'amount', header: 'Amount', type: 'money' },
+      { key: 'pct', header: '% of Sales', type: 'percent' },
+      { key: 'avgPrice', header: 'Avg Price', type: 'money' },
+      { key: 'cogs', header: 'COGS', type: 'money' },
+      { key: 'avgCogs', header: 'Avg COGS', type: 'money' },
+      { key: 'margin', header: 'Gross Margin', type: 'money' },
+      { key: 'marginPct', header: 'Gross Margin %', type: 'percent' },
+    ],
+    rows,
+  };
+}
 
 async function openSalesOrders(ctx: ServiceContext, p: ReportParams, by: 'customer' | 'item'): Promise<StdReport> {
   const conds: SQL[] = [eq(salesOrders.companyId, ctx.companyId), notInArray(salesOrders.status, ['void', 'closed', 'paid'])];
@@ -701,14 +936,14 @@ export async function expensesByVendorSummary(ctx: ServiceContext, p: ReportPara
         depth: 0,
         kind: 'data' as const,
         cells: { label: v.name, amount: amt(v.total) },
-        href: id ? stdHref('expenses-by-vendor-detail', { vendorId: id, from: dayStr(from), to: dayStr(to) }) : null,
+        href: id ? stdHref('expenses-by-vendor-detail', { vendorId: id, classId: p.classId, from: dayStr(from), to: dayStr(to), basis: p.basis === 'cash' ? 'cash' : undefined }) : null,
       };
     });
   rows.push({ id: 'ebv:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', amount: amt(total) } });
   return {
     key: 'expenses-by-vendor-summary',
     title: 'Expenses by Vendor Summary',
-    subtitle: rangeLabel(from, to),
+    subtitle: `${rangeLabel(from, to)}${p.basis === 'cash' ? ' · Cash Basis' : ''}`,
     columns: [{ key: 'label', header: 'Vendor' }, { key: 'amount', header: 'Amount', type: 'money' }],
     rows,
     truncated,
@@ -735,7 +970,7 @@ export async function expensesByVendorDetail(ctx: ServiceContext, p: ReportParam
   return {
     key: 'expenses-by-vendor-detail',
     title: 'Expenses by Vendor Detail',
-    subtitle: rangeLabel(from, to),
+    subtitle: `${rangeLabel(from, to)}${p.basis === 'cash' ? ' · Cash Basis' : ''}`,
     columns: detailColumns(keys),
     rows: laid.rows,
     truncated,
@@ -984,129 +1219,8 @@ export async function accountListing(ctx: ServiceContext, p: ReportParams): Prom
   };
 }
 
-// ===========================================================================
-// Income tax reports (by tax line)
-// ===========================================================================
-
-export interface TaxLine {
-  id: string;
-  name: string;
-}
-
-/** Maps an account to its income-tax form line (null = unassigned). */
-export type TaxLineMapper = (account: AccountMeta & { raw: Record<string, unknown> }) => TaxLine | null;
-
-/**
- * Default mapper: reads the account's tax-line assignment when the accounts table carries one
- * (the foundation package adds it as `taxLineId` / `taxLine`). Until that column exists every
- * account is "unassigned", so the income-tax reports stay hidden in the Report Center.
- * TODO(foundation: tax lines) — resolve a tax-line id to its display name from the tax line list.
- */
-export const defaultTaxLineMapper: TaxLineMapper = (a) => {
-  const v = (a.raw.taxLineId ?? a.raw.taxLine ?? a.raw.tax_line) as unknown;
-  if (typeof v === 'string' && v.trim()) return { id: v, name: v };
-  if (v && typeof v === 'object' && 'id' in (v as object)) {
-    const o = v as { id: string; name?: string };
-    return { id: o.id, name: o.name ?? o.id };
-  }
-  return null;
-};
-
-async function accountsWithRaw(ctx: ServiceContext) {
-  const meta = await loadAccountMeta(ctx);
-  const raw = await ctx.db.select().from(accounts).where(eq(accounts.companyId, ctx.companyId));
-  const rawById = new Map(raw.map((r) => [r.id, r as unknown as Record<string, unknown>]));
-  return { meta, rawById };
-}
-
-/** Income Tax Preparation — every account with its assigned tax line. */
-export async function incomeTaxPreparation(ctx: ServiceContext, _p: ReportParams, mapper: TaxLineMapper = defaultTaxLineMapper): Promise<StdReport> {
-  const { meta, rawById } = await accountsWithRaw(ctx);
-  const list = [...meta.values()].sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }));
-  return {
-    key: 'income-tax-preparation',
-    title: 'Income Tax Preparation',
-    subtitle: 'Tax line assignments',
-    columns: [
-      { key: 'label', header: 'Account' },
-      { key: 'type', header: 'Type' },
-      { key: 'taxLine', header: 'Tax Line' },
-    ],
-    rows: list.map((a) => ({
-      id: `itp:${a.id}`,
-      depth: 0,
-      kind: 'data',
-      cells: { label: a.fullName, type: SECTION_LABELS[a.section], taxLine: mapper({ ...a, raw: rawById.get(a.id) ?? {} })?.name ?? '<Unassigned>' },
-    })),
-  };
-}
-
-/**
- * Income Tax Summary / Detail — period activity per tax line (P&L accounts: period activity;
- * balance-sheet accounts: balance as of the end date), from the posted ledger.
- */
-export async function incomeTaxReport(
-  ctx: ServiceContext,
-  p: ReportParams,
-  detail: boolean,
-  mapper: TaxLineMapper = defaultTaxLineMapper,
-): Promise<StdReport> {
-  const { from, to } = await resolveRange(ctx, p);
-  const { meta, rawById } = await accountsWithRaw(ctx);
-  const lineOf = new Map<string, TaxLine>();
-  for (const a of meta.values()) {
-    const t = mapper({ ...a, raw: rawById.get(a.id) ?? {} });
-    if (t) lineOf.set(a.id, t);
-  }
-  const [plAct, bsAct] = await Promise.all([
-    activityByAccount(ctx, { from, to, excludeClose: true }),
-    activityByAccount(ctx, { to }),
-  ]);
-  const perAccount = new Map<string, Decimal>();
-  for (const r of plAct) {
-    const a = meta.get(r.accountId);
-    if (a && isPLSection(a.section)) perAccount.set(r.accountId, naturalAmount(a.section, r.debit, r.credit));
-  }
-  for (const r of bsAct) {
-    const a = meta.get(r.accountId);
-    if (a && !isPLSection(a.section)) perAccount.set(r.accountId, naturalAmount(a.section, r.debit, r.credit));
-  }
-  const groups = new Map<string, { line: TaxLine; accounts: { a: AccountMeta; v: Decimal }[] }>();
-  for (const [id, v] of perAccount) {
-    if (v.isZero()) continue;
-    const t = lineOf.get(id) ?? { id: '', name: '<Unassigned>' };
-    if (!groups.has(t.id)) groups.set(t.id, { line: t, accounts: [] });
-    groups.get(t.id)!.accounts.push({ a: meta.get(id)!, v });
-  }
-  const rows: StdRow[] = [];
-  for (const g of [...groups.values()].sort((a, b) => (a.line.id === '' ? 1 : b.line.id === '' ? -1 : a.line.name.localeCompare(b.line.name)))) {
-    const total = g.accounts.reduce((s, x) => s.plus(x.v), Money.zero());
-    if (!detail) {
-      rows.push({ id: `it:${g.line.id || 'none'}`, depth: 0, kind: 'data', cells: { label: g.line.name, amount: amt(total) } });
-      continue;
-    }
-    const hid = `it:${g.line.id || 'none'}`;
-    rows.push({ id: hid, depth: 0, kind: 'section', collapseKind: 'group', cells: { label: g.line.name }, collapsedCells: { label: g.line.name, amount: amt(total) } });
-    for (const x of g.accounts.sort((a, b) => a.a.code.localeCompare(b.a.code))) {
-      rows.push({
-        id: `${hid}:${x.a.id}`,
-        parentId: hid,
-        depth: 1,
-        kind: 'data',
-        cells: { label: x.a.fullName, amount: amt(x.v) },
-        href: stdHref('transaction-detail-by-account', { accountId: x.a.id, from: isPLSection(x.a.section) ? dayStr(from) : undefined, to: dayStr(to) }),
-      });
-    }
-    rows.push({ id: `${hid}:total`, depth: 0, kind: 'subtotal', totalOf: hid, cells: { label: `Total ${g.line.name}`, amount: amt(total) } });
-  }
-  return {
-    key: detail ? 'income-tax-detail' : 'income-tax-summary',
-    title: detail ? 'Income Tax Detail' : 'Income Tax Summary',
-    subtitle: rangeLabel(from, to),
-    columns: [{ key: 'label', header: 'Tax Line' }, { key: 'amount', header: 'Amount', type: 'money' }],
-    rows,
-  };
-}
+// Income tax reports moved to incomeTaxReports.ts (form line names, form order, company form).
+export { incomeTaxPreparation, incomeTaxReport, defaultTaxLineMapper, type TaxLine, type TaxLineMapper } from './incomeTaxReports';
 
 export type { CellValue, StdColumn };
 
@@ -1174,3 +1288,68 @@ export async function purchasesByItemDetail(ctx: ServiceContext, p: ReportParams
     rows,
   };
 }
+
+/**
+ * Purchases by Item Summary / Purchases by Vendor Summary (QB Reports > Purchases): item lines on
+ * bills in the period (voided bills excluded), totalled per item or per vendor.
+ */
+async function purchaseLines(ctx: ServiceContext, p: ReportParams, from: Date, to: Date) {
+  const conds: SQL[] = [eq(bills.companyId, ctx.companyId), ne(bills.status, 'void'), gte(bills.date, from), lte(bills.date, to), sql`${billLines.itemId} IS NOT NULL`];
+  if (p.itemId) conds.push(eq(billLines.itemId, p.itemId));
+  if (p.vendorId) conds.push(eq(bills.vendorId, p.vendorId));
+  return ctx.db
+    .select({ vendorId: bills.vendorId, vendor: vendors.displayName, itemId: billLines.itemId, item: items.name, qty: billLines.quantity, amount: billLines.amount })
+    .from(billLines)
+    .innerJoin(bills, eq(billLines.billId, bills.id))
+    .innerJoin(vendors, eq(bills.vendorId, vendors.id))
+    .leftJoin(items, eq(billLines.itemId, items.id))
+    .where(and(...conds));
+}
+
+async function purchasesSummary(ctx: ServiceContext, p: ReportParams, by: 'item' | 'vendor'): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const lines = await purchaseLines(ctx, p, from, to);
+  const acc = new Map<string, { label: string; qty: Decimal; amount: Decimal }>();
+  for (const l of lines) {
+    const k = (by === 'item' ? l.itemId : l.vendorId) ?? '';
+    const cur = acc.get(k) ?? { label: (by === 'item' ? l.item : l.vendor) ?? '(none)', qty: Money.zero(), amount: Money.zero() };
+    cur.qty = cur.qty.plus(Money.of(l.qty));
+    cur.amount = cur.amount.plus(Money.of(l.amount));
+    acc.set(k, cur);
+  }
+  const grandAmt = [...acc.values()].reduce((s, v) => s.plus(v.amount), Money.zero());
+  const grandQty = [...acc.values()].reduce((s, v) => s.plus(v.qty), Money.zero());
+  const rows: StdRow[] = [...acc.entries()]
+    .sort((a, b) => a[1].label.localeCompare(b[1].label))
+    .map(([id, v]) => ({
+      id: `pbs:${by}:${id || 'none'}`,
+      depth: 0,
+      kind: 'data' as const,
+      cells: {
+        label: v.label,
+        qty: v.qty.toFixed(4),
+        amount: amt(v.amount),
+        pct: grandAmt.isZero() ? null : v.amount.dividedBy(grandAmt.abs()).times(100).toFixed(2),
+        avgCost: v.qty.isZero() ? null : v.amount.dividedBy(v.qty).toFixed(2),
+      },
+      href: id ? stdHref('purchases-by-item-detail', { [by === 'item' ? 'itemId' : 'vendorId']: id, from: dayStr(from), to: dayStr(to) }) : null,
+    }));
+  rows.push({ id: `pbs:${by}:grand`, depth: 0, kind: 'grand', cells: { label: 'TOTAL', qty: grandQty.toFixed(4), amount: amt(grandAmt), pct: grandAmt.isZero() ? null : '100.00' } });
+  const columns: StdColumn[] = [
+    { key: 'label', header: by === 'item' ? 'Item' : 'Vendor' },
+    { key: 'qty', header: 'Qty', type: 'number' },
+    { key: 'amount', header: 'Amount', type: 'money' },
+    { key: 'pct', header: '% of Purchases', type: 'percent' },
+  ];
+  if (by === 'item') columns.push({ key: 'avgCost', header: 'Avg Cost', type: 'money' });
+  return {
+    key: by === 'item' ? 'purchases-by-item-summary' : 'purchases-by-vendor-summary',
+    title: by === 'item' ? 'Purchases by Item Summary' : 'Purchases by Vendor Summary',
+    subtitle: rangeLabel(from, to),
+    columns,
+    rows,
+  };
+}
+
+export const purchasesByItemSummary = (ctx: ServiceContext, p: ReportParams) => purchasesSummary(ctx, p, 'item');
+export const purchasesByVendorSummary = (ctx: ServiceContext, p: ReportParams) => purchasesSummary(ctx, p, 'vendor');

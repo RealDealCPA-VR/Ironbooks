@@ -68,64 +68,105 @@ async function creditMemoRefundsAfter(ctx: ServiceContext, cutoff: Date): Promis
   return out;
 }
 
+type Dec = ReturnType<typeof Money.zero>;
+const addTo = (m: Map<string, Dec>, k: string, v: Dec) => m.set(k, (m.get(k) ?? Money.zero()).plus(v));
+
 /**
- * Credits that reduce an invoice's / bill's amountPaid / amountCredited but had not happened yet
- * on the cutoff date, per invoice / bill id: General Journal credits applied after the cutoff, plus
- * credit memos (A/R) and vendor credits (A/P) dated after the cutoff. As in QuickBooks, a credit
- * applies on its own transaction date — a credit memo dated after the cutoff is not on the as-of
- * aging at all (it is excluded below by date), so neither may its application be. Credits dated on
- * or before the cutoff stay applied, which keeps aging tied to the A/R / A/P control account.
+ * Credit-memo applications to invoices that take effect AFTER the cutoff, per invoice and per
+ * memo. invoices.amountPaid and creditMemos.unapplied carry every application undated (today's
+ * figures); on the cutoff date a later application had not yet reduced the invoice or consumed the
+ * memo, so as-of aging adds it back to both. An application is effective on its own date, never
+ * before the memo or the invoice (QB ages each invoice at its open balance on the report date).
  */
-async function creditsAppliedAfter(
+async function creditMemoApplicationsAfter(
   ctx: ServiceContext,
-  side: 'ar' | 'ap',
   cutoff: Date,
-): Promise<Map<string, ReturnType<typeof Money.zero>>> {
-  const out = await journalCreditsAppliedAfter(ctx, side, cutoff);
-  const add = (id: string | null, amt: ReturnType<typeof Money.zero>) => {
-    if (!id || amt.isZero()) return;
-    out.set(id, (out.get(id) ?? Money.zero()).plus(amt));
-  };
-  if (side === 'ar') {
-    const rows = await ctx.db
-      .select({
-        invoiceId: creditApplications.invoiceId,
-        amount: sql<string>`COALESCE(SUM(CAST(${creditApplications.amount} AS NUMERIC)), 0)`,
-      })
-      .from(creditApplications)
-      .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
-      .where(and(eq(creditApplications.companyId, ctx.companyId), gt(creditMemos.date, cutoff)))
-      .groupBy(creditApplications.invoiceId);
-    for (const r of rows) add(r.invoiceId, Money.of(r.amount));
-  } else {
-    // Vendor-credit applications are recorded in the audit log only (vendorCredits.ts
-    // applyToBill / unapplyFromBill), so the net applied per bill is rebuilt from it.
-    const rows = await ctx.db
-      .select({ newValues: auditLogs.newValues })
-      .from(auditLogs)
-      .innerJoin(vendorCredits, eq(vendorCredits.id, auditLogs.entityId))
-      .where(
-        and(
-          eq(auditLogs.companyId, ctx.companyId),
-          eq(auditLogs.entityType, 'vendor_credit'),
-          eq(vendorCredits.companyId, ctx.companyId),
-          gt(vendorCredits.date, cutoff),
-          sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
-        ),
-      );
-    for (const r of rows) {
-      const v = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
-      if (!v.billId || !v.amount) continue;
-      const amt = Money.of(v.amount);
-      add(v.billId, v.action === 'applied_to_bill' ? amt : amt.negated());
-    }
+): Promise<{ byInvoice: Map<string, Dec>; byMemo: Map<string, Dec> }> {
+  const rows = await ctx.db
+    .select({ invoiceId: creditApplications.invoiceId, memoId: creditApplications.creditMemoId, amount: creditApplications.amount })
+    .from(creditApplications)
+    .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
+    .innerJoin(invoices, eq(invoices.id, creditApplications.invoiceId))
+    .where(
+      and(
+        eq(creditApplications.companyId, ctx.companyId),
+        sql`GREATEST(${creditApplications.date}, ${creditMemos.date}, ${invoices.date}) > ${cutoff}`,
+      ),
+    );
+  const byInvoice = new Map<string, Dec>();
+  const byMemo = new Map<string, Dec>();
+  for (const r of rows) {
+    const a = Money.of(r.amount);
+    addTo(byInvoice, r.invoiceId, a);
+    addTo(byMemo, r.memoId, a);
   }
-  return out;
+  return { byInvoice, byMemo };
 }
 
-/** A credit memo's open credit as of the cutoff: today's unapplied plus refunds after it. */
-function memoCreditAsOf(m: { id: string; unapplied: string }, laterRefunds: Map<string, string>) {
-  return Money.of(m.unapplied).plus(Money.of(laterRefunds.get(m.id) ?? '0'));
+/**
+ * Vendor-credit applications to bills (vendorCredits.applyToBill / unapplyFromBill) that take
+ * effect AFTER the cutoff, per bill and per credit. Those write no GL entry and no dated link row;
+ * the audit trail records which (credit, bill, amount) pairs were applied or unapplied. The
+ * application itself is undated (applyToBill takes no date), so it is effective from the later of
+ * the credit's and the bill's own dates: before the credit existed it cannot have reduced the
+ * bill, and from then on the bill and the credit move together, so aging always ties to the A/P
+ * account. Applications and unapplications of the same pair net out.
+ *
+ * Known difference: the cash-basis engine (cashBasisLedger.ts) dates the same application by the
+ * day it was entered (audit timestamp), not by the document dates. Both tie to A/P in their own
+ * basis; a dated application row would let them agree exactly (deferred, outside this team).
+ */
+async function vendorCreditApplicationsAfter(
+  ctx: ServiceContext,
+  cutoff: Date,
+): Promise<{ byBill: Map<string, Dec>; byCredit: Map<string, Dec> }> {
+  const byBill = new Map<string, Dec>();
+  const byCredit = new Map<string, Dec>();
+  const rows = await ctx.db
+    .select({ creditId: auditLogs.entityId, newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'vendor_credit'),
+        sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
+      ),
+    );
+  if (!rows.length) return { byBill, byCredit };
+  const creditDate = new Map(
+    (await ctx.db.select({ id: vendorCredits.id, date: vendorCredits.date }).from(vendorCredits).where(eq(vendorCredits.companyId, ctx.companyId))).map((c) => [c.id, c.date]),
+  );
+  const billDate = new Map(
+    (await ctx.db.select({ id: bills.id, date: bills.date }).from(bills).where(eq(bills.companyId, ctx.companyId))).map((b) => [b.id, b.date]),
+  );
+  for (const r of rows) {
+    const nv = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
+    if (!nv.billId || !r.creditId) continue;
+    const cd = creditDate.get(r.creditId);
+    const bd = billDate.get(nv.billId);
+    if (!cd || !bd) continue;
+    const eff = cd > bd ? cd : bd;
+    if (!(eff > cutoff)) continue;
+    const a = Money.of(nv.amount ?? '0');
+    const signed = nv.action === 'applied_to_bill' ? a : a.negated();
+    addTo(byBill, nv.billId, signed);
+    addTo(byCredit, r.creditId, signed);
+  }
+  return { byBill, byCredit };
+}
+
+/**
+ * A credit memo's open credit as of the cutoff: today's unapplied plus refunds and invoice
+ * applications that happened after it.
+ */
+function memoCreditAsOf(
+  m: { id: string; unapplied: string },
+  laterRefunds: Map<string, string>,
+  laterApplications?: Map<string, Dec>,
+) {
+  return Money.of(m.unapplied)
+    .plus(Money.of(laterRefunds.get(m.id) ?? '0'))
+    .plus(laterApplications?.get(m.id) ?? Money.zero());
 }
 
 /** Detail-report variant of addJournalItemsToAging: one 'General Journal' row per line. */
@@ -349,8 +390,8 @@ async function addBouncedApplicationsAsOf(ctx: ServiceContext, upTo: Date, map: 
  * the report nets to true receivables (QB parity).
  *
  * The credited portion of amountPaid (anything beyond dated cash applications) counts
- * as applied on the credit's own date: credit memos dated after the cutoff (and General
- * Journal credits applied after it) are added back — see creditsAppliedAfter.
+ * as applied on its own date: credit-memo applications effective after the cutoff (see
+ * creditMemoApplicationsAfter) and General Journal credits applied after it are added back.
  */
 export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
   const cutoff = asOf ?? new Date();
@@ -404,7 +445,8 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     paymentAppliedByInvoice(cutoff),
     paymentAppliedByInvoice(),
   ]);
-  const journalCreditsLater = await creditsAppliedAfter(ctx, 'ar', cutoff);
+  const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
+  const memoAppsLater = await creditMemoApplicationsAfter(ctx, cutoff);
 
   // Accumulate per customer.
   const byCustomer = new Map<string, { name: string; buckets: BucketAccum }>();
@@ -420,7 +462,9 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     // General Journal credits applied after the cutoff had not reduced the invoice yet.
     let creditResidual = Money.of(row.amountPaid)
       .minus(cashAllTime)
-      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
+      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero())
+      // Credit memos applied after the cutoff had not reduced the invoice yet either.
+      .minus(memoAppsLater.byInvoice.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     const amount = billedBase.minus(cashAsOf).minus(creditResidual);
@@ -457,7 +501,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     );
 
   for (const memo of memoRows) {
-    const credit = memoCreditAsOf(memo, memoLaterRefunds);
+    const credit = memoCreditAsOf(memo, memoLaterRefunds, memoAppsLater.byMemo);
     if (!credit.greaterThan(0)) continue;
     if (!byCustomer.has(memo.customerId)) {
       byCustomer.set(memo.customerId, { name: memo.customerName, buckets: blankBuckets() });
@@ -554,7 +598,11 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     billPaymentAppliedByBill(cutoff),
     billPaymentAppliedByBill(),
   ]);
-  const journalCreditsLater = await creditsAppliedAfter(ctx, 'ap', cutoff);
+  const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
+  const vcAppsLater = await vendorCreditApplicationsAfter(ctx, cutoff);
+  // Vendor refunds dated after the cutoff (JE sourceRef 'refund:<vendorCreditId>', Dr Bank / Cr A/P,
+  // so the debit sum is the refund amount) had not consumed the credit yet on the cutoff date.
+  const vcRefundsLater = await creditMemoRefundsAfter(ctx, cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const byVendor = new Map<string, { name: string; buckets: BucketAccum }>();
@@ -568,7 +616,9 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .plus(Money.of(row.amountCredited ?? '0'))
       .minus(cashAllTime)
       // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
-      .minus(journalCreditsLater.get(row.billId) ?? Money.zero());
+      .minus(journalCreditsLater.get(row.billId) ?? Money.zero())
+      // Vendor credits applied after the cutoff had not reduced the bill yet either.
+      .minus(vcAppsLater.byBill.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
@@ -588,11 +638,13 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
   }
 
   // Unapplied vendor credits reduce net payables — negative 'current' rows.
+  // Applications and refunds made after the cutoff are added back (the credit was still open then).
   const creditRows = await ctx.db
     .select({
+      id: vendorCredits.id,
       vendorId: vendorCredits.vendorId,
       vendorName: vendors.displayName,
-      unapplied: sql<string>`COALESCE(SUM(CAST(${vendorCredits.unapplied} AS NUMERIC)), 0)`,
+      unapplied: vendorCredits.unapplied,
     })
     .from(vendorCredits)
     .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
@@ -601,17 +653,19 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
         eq(vendorCredits.companyId, ctx.companyId),
         ne(vendorCredits.status, 'void'),
         lte(vendorCredits.date, cutoff),
-        sql`CAST(${vendorCredits.unapplied} AS NUMERIC) > 0`,
       ),
-    )
-    .groupBy(vendorCredits.vendorId, vendors.displayName);
+    );
 
   for (const credit of creditRows) {
+    const open = Money.of(credit.unapplied)
+      .plus(vcAppsLater.byCredit.get(credit.id) ?? Money.zero())
+      .plus(Money.of(vcRefundsLater.get(credit.id) ?? '0'));
+    if (!open.greaterThan(0)) continue;
     if (!byVendor.has(credit.vendorId)) {
       byVendor.set(credit.vendorId, { name: credit.vendorName, buckets: blankBuckets() });
     }
     const buckets = byVendor.get(credit.vendorId)!.buckets;
-    buckets.current = buckets.current.minus(Money.of(credit.unapplied));
+    buckets.current = buckets.current.minus(open);
   }
 
   await addJournalItemsToAging(ctx, 'ap', cutoff, byVendor);
@@ -1101,7 +1155,8 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     paymentAppliedByInvoice(cutoff),
     paymentAppliedByInvoice(),
   ]);
-  const journalCreditsLater = await creditsAppliedAfter(ctx, 'ar', cutoff);
+  const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
+  const memoAppsLater = await creditMemoApplicationsAfter(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
@@ -1111,7 +1166,9 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     // General Journal credits applied after the cutoff had not reduced the invoice yet.
     let creditResidual = Money.of(row.amountPaid)
       .minus(cashAllTime)
-      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
+      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero())
+      // Credit memos applied after the cutoff had not reduced the invoice yet either.
+      .minus(memoAppsLater.byInvoice.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     const amount = billedBase.minus(cashAsOf).minus(creditResidual);
@@ -1155,7 +1212,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       ),
     );
   for (const m of memoRows) {
-    const credit = memoCreditAsOf(m, memoLaterRefunds);
+    const credit = memoCreditAsOf(m, memoLaterRefunds, memoAppsLater.byMemo);
     if (!credit.greaterThan(0)) continue;
     detail.push({
       docId: m.id,
@@ -1222,7 +1279,11 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     billPaymentAppliedByBill(cutoff),
     billPaymentAppliedByBill(),
   ]);
-  const journalCreditsLater = await creditsAppliedAfter(ctx, 'ap', cutoff);
+  const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
+  const vcAppsLater = await vendorCreditApplicationsAfter(ctx, cutoff);
+  // Vendor refunds dated after the cutoff (JE sourceRef 'refund:<vendorCreditId>', Dr Bank / Cr A/P,
+  // so the debit sum is the refund amount) had not consumed the credit yet on the cutoff date.
+  const vcRefundsLater = await creditMemoRefundsAfter(ctx, cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
@@ -1233,7 +1294,9 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .plus(Money.of(row.amountCredited ?? '0'))
       .minus(cashAllTime)
       // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
-      .minus(journalCreditsLater.get(row.billId) ?? Money.zero());
+      .minus(journalCreditsLater.get(row.billId) ?? Money.zero())
+      // Vendor credits applied after the cutoff had not reduced the bill yet either.
+      .minus(vcAppsLater.byBill.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
@@ -1273,10 +1336,14 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
         eq(vendorCredits.companyId, ctx.companyId),
         ne(vendorCredits.status, 'void'),
         lte(vendorCredits.date, cutoff),
-        sql`CAST(${vendorCredits.unapplied} AS NUMERIC) > 0`,
       ),
     );
   for (const c of creditRows) {
+    // Applications and refunds made after the cutoff are added back (the credit was still open then).
+    const open = Money.of(c.unapplied)
+      .plus(vcAppsLater.byCredit.get(c.id) ?? Money.zero())
+      .plus(Money.of(vcRefundsLater.get(c.id) ?? '0'));
+    if (!open.greaterThan(0)) continue;
     detail.push({
       docId: c.id,
       docNumber: 'Vendor Credit',
@@ -1287,7 +1354,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       dueDate: null,
       daysPastDue: 0,
       bucket: 'current',
-      openBalance: toAmountString(Money.of(c.unapplied).negated()),
+      openBalance: toAmountString(open.negated()),
     });
   }
 

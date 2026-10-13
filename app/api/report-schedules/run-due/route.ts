@@ -7,14 +7,15 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { runDueSchedules } from '@/lib/services/memorizedReports';
 import { reportError } from '../../reports/_lib';
-import { internalContext } from '../_internal';
+import { internalContexts, runDueForCompanies, runDueForUser } from '../_internal';
 
 export async function POST(req: NextRequest) {
   try {
-    const ctx = (await internalContext(req)) ?? (await getServerContext());
-    return NextResponse.json({ results: await runDueSchedules(ctx) });
+    // Desktop timer (internal token): every company in the file. Otherwise the signed-in user.
+    const internal = await internalContexts(req);
+    const results = internal ? await runDueForCompanies(internal) : await runDueForUser(await getServerContext());
+    return NextResponse.json({ results });
   } catch (e) {
     return reportError(e, 'report-schedules/run-due');
   }
