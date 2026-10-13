@@ -16,6 +16,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { accountRegister } from '@/lib/services/journal';
+import { withAccountCurrency } from '@/lib/services/fxLedger';
 
 type Params = { params: Promise<{ accountId: string }> };
 
@@ -40,7 +41,9 @@ export async function GET(req: NextRequest, { params }: Params) {
       return NextResponse.json({ error: 'offset must be a non-negative number.' }, { status: 400 });
     }
 
-    const register = await accountRegister(ctx, accountId, { from, to, search, limit, offset });
+    const opts = { from, to, search, limit, offset };
+    // p1 fx: a foreign-currency bank / card register also carries account-currency columns.
+    const register = await withAccountCurrency(ctx, await accountRegister(ctx, accountId, opts), opts);
     return NextResponse.json({ register });
   } catch (err) {
     return mapError(err);

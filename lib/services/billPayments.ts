@@ -57,6 +57,7 @@ import {
 import { assertClosedPeriodEdit, entryHasReconciledLines } from './postedEdit';
 import { assertPeriodOpen } from './fiscalPeriods';
 import { applyToBill } from './vendorCredits';
+import { vendorCreditHomeOnBill } from './vendorCreditsFx';
 import {
   type JournalCreditToBillInput,
   type JournalItemPaymentInput,
@@ -345,7 +346,8 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
           .from(billPaymentApplications)
           .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
           .where(and(eq(billPaymentApplications.billId, bill.id), isNull(billPayments.voidedAt)));
-        apHome = Money.round2(billHome.minus(Money.of(prior?.sum ?? 0)));
+        // p1 fx: foreign vendor credits applied to the bill relieved home A/P too.
+        apHome = Money.round2(billHome.minus(Money.of(prior?.sum ?? 0)).minus(await vendorCreditHomeOnBill(ctx, bill.id)));
       } else {
         apHome = Money.round2(settled.times(billRate));
       }
@@ -410,7 +412,13 @@ function buildPaymentLines(prep: PreparedPayment, input: PayBillsInput, referenc
       memo: `A/P payment to vendor ${prep.vendor.name}`,
       controlLine: true,
     },
-    { accountId: input.paymentAccountId, credit: toAmountString(prep.cashHome), memo: `Bill payment — ref: ${reference ?? 'n/a'}` },
+    {
+      accountId: input.paymentAccountId,
+      credit: toAmountString(prep.cashHome),
+      memo: `Bill payment — ref: ${reference ?? 'n/a'}`,
+      // p1 fx: a foreign-currency bank line keeps the amount paid in its own currency.
+      ...(prep.currency ? { foreignAmount: prep.totalStr } : {}),
+    },
   ];
   if (prep.discountHome.greaterThan(0) && input.discountAccountId) {
     lines.push({
@@ -648,7 +656,7 @@ export async function payBillsWithCredits(
         .where(and(eq(vendorCredits.id, use.vendorCreditId), eq(vendorCredits.companyId, tx.companyId)));
       if (!vc) throw notFound('Vendor credit');
       if (vc.vendorId !== input.vendorId) throw validation('A vendor credit you picked belongs to a different vendor.');
-      await applyToBill(tx, { vendorCreditId: use.vendorCreditId, billId: use.billId, amount: use.amount });
+      await applyToBill(tx, { vendorCreditId: use.vendorCreditId, billId: use.billId, amount: use.amount, date: input.date });
       creditsApplied = creditsApplied.plus(Money.round2(use.amount));
     }
     for (const c of [...journalCredits, ...journalOffsets]) creditsApplied = creditsApplied.plus(Money.round2(c.amount));

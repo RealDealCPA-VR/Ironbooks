@@ -33,6 +33,8 @@ import { formatDate } from '@/lib/utils';
 interface Vendor {
   id: string;
   displayName: string;
+  /** p1 fx: the vendor's currency (null = home); its credits are in it. */
+  currency?: string | null;
 }
 
 interface Account {
@@ -162,6 +164,10 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
   const [lines, setLines] = useState<CreditLine[]>([{ ...EMPTY_LINE }]);
   const [itemLines, setItemLines] = useState<ItemLine[]>([{ ...EMPTY_ITEM_LINE }]);
   const [saving, setSaving] = useState(false);
+  // p1 fx: a foreign vendor's credit is in its currency at the stated / list rate.
+  const [fxRate, setFxRate] = useState('');
+  const vendorCur = vendors.find((v) => v.id === vendorId)?.currency || null;
+
   const [loadingEdit, setLoadingEdit] = useState(false);
   const [itemList, setItemList] = useState<Named[]>([]);
   const [classList, setClassList] = useState<Named[]>([]);
@@ -195,11 +201,19 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
     setTab('expenses');
     setLines([{ ...EMPTY_LINE }]);
     setItemLines([{ ...EMPTY_ITEM_LINE }]);
+    setFxRate('');
     if (!editId) return;
     let cancelled = false;
     setLoadingEdit(true);
     api
-      .get<{ vendorId: string; date: string; memo: string | null; refNumber: string | null; lines: SavedLine[] }>(
+      .get<{
+        vendorId: string;
+        date: string;
+        memo: string | null;
+        refNumber: string | null;
+        exchangeRate?: string | null;
+        lines: SavedLine[];
+      }>(
         `/api/vendor-credits/${editId}`,
       )
       .then((c) => {
@@ -208,6 +222,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
         setDate(String(c.date).slice(0, 10));
         setMemo(c.memo ?? '');
         setRefNumber(c.refNumber ?? '');
+        setFxRate(c.exchangeRate ? String(Number(c.exchangeRate)) : '');
         const dims = (l: SavedLine) => ({ classId: l.classId ?? '', customerId: l.customerId ?? '', jobId: l.jobId ?? '' });
         const exp = c.lines.filter((l) => !l.itemId);
         const its = c.lines.filter((l) => l.itemId);
@@ -315,6 +330,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
             ...dims(l),
           })),
         ],
+        ...(vendorCur && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
       };
       if (editId) {
         await api.patch(`/api/vendor-credits/${editId}`, body);
@@ -550,8 +566,26 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
         {/* Live total */}
         <div className="flex items-center justify-between rounded-lg bg-navy/5 px-4 py-3">
           <span className="text-sm font-semibold text-navy/70">Credit Total</span>
-          <span className="text-lg font-bold text-navy tabular-nums">{formatCurrency(liveTotal)}</span>
+          <span className="text-lg font-bold text-navy tabular-nums">
+            {formatCurrency(liveTotal.toFixed(2), vendorCur ?? undefined)}
+          </span>
         </div>
+        {vendorCur && (
+          <div>
+            <Label htmlFor="vc-rate">Exchange rate (1 {vendorCur} = ? home)</Label>
+            <Input
+              id="vc-rate"
+              inputMode="decimal"
+              placeholder="Blank = Currencies list rate"
+              value={fxRate}
+              onChange={(e) => setFxRate(e.target.value)}
+            />
+            <p className="text-xs text-navy/40 mt-1">
+              This vendor uses {vendorCur}. When the credit is applied to a {vendorCur} bill, any difference between the two
+              rates is recorded as an exchange gain or loss.
+            </p>
+          </div>
+        )}
       </div>
     </Modal>
   );

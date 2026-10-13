@@ -21,6 +21,12 @@
  * description of the form `salesReceipt:<id>` (same spirit as journal
  * sourceRef traceability). Cash-back lines use `cashback:<accountId>` with a
  * NEGATIVE amount so that sum(lines) always equals deposits.total (net).
+ *
+ * p1 fx — a deposit is in its bank account's currency (QB Make Deposits shows only the payments
+ * in that currency). Amounts on the deposit and its lines stay in that currency; the GL gets home
+ * values: Undeposited Funds is relieved at the home value each payment was received at, the bank
+ * (and cash back / extra lines) at the deposit's rate, and the difference is the realized exchange
+ * gain or loss (6900 Exchange Gain/Loss).
  */
 import { and, eq, inArray, isNull, like, ne, notInArray } from 'drizzle-orm';
 import {
@@ -30,9 +36,11 @@ import {
   deposits,
   depositLines,
   journalEntries,
+  journalEntryLines,
   paymentsReceived,
   salesReceipts,
 } from '@/lib/db/schema';
+import Decimal from 'decimal.js';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -44,7 +52,29 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
-import { assertHomeCurrencyAccounts } from './currencies';
+import { homeAmounts } from './currencies';
+import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
+
+/** p1 fx: home amount each payment's posted entry put into Undeposited Funds (debits - credits). */
+async function postedUndepositedHome(
+  ctx: ServiceContext,
+  payRows: Array<{ id: string; postedEntryId: string | null }>,
+  ufId: string,
+): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>();
+  const byEntry = new Map(payRows.filter((p) => p.postedEntryId).map((p) => [p.postedEntryId!, p.id]));
+  if (byEntry.size === 0) return out;
+  const rows = await ctx.db
+    .select({ entryId: journalEntryLines.journalEntryId, debit: journalEntryLines.debit, credit: journalEntryLines.credit })
+    .from(journalEntryLines)
+    .where(and(inArray(journalEntryLines.journalEntryId, [...byEntry.keys()]), eq(journalEntryLines.accountId, ufId)));
+  for (const r of rows) {
+    const pid = byEntry.get(r.entryId)!;
+    const prev = out.get(pid) ?? Money.zero();
+    out.set(pid, prev.plus(Money.of(r.debit ?? 0)).minus(Money.of(r.credit ?? 0)));
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Structured deposit-line description prefixes (see schema note above).
@@ -84,6 +114,8 @@ export interface CreateDepositInput {
   /** QB "Cash back goes to": Dr cash account, reduces the net bank deposit. */
   cashBack?: CashBackInput | null;
   memo?: string | null;
+  /** p1 fx: foreign-currency bank account — home units per 1 unit (default: the list rate). */
+  exchangeRate?: string | number | null;
 }
 
 /** Unified row shape for the "Payments to Deposit" picker. */
@@ -96,6 +128,8 @@ export interface UndepositedItem {
   method: string;
   reference: string | null;
   amount: string;
+  /** p1 fx: payment currency (null = home); `amount` is in it. */
+  currency?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +245,7 @@ export async function listUndepositedPayments(ctx: ServiceContext): Promise<Unde
     ...pmtRows.map((r) => r.customerId),
     ...srRows.map((r) => r.customerId),
   ]);
+  const home = await homeCode(ctx);
 
   const items: UndepositedItem[] = [
     ...pmtRows.map((r) => ({
@@ -222,6 +257,7 @@ export async function listUndepositedPayments(ctx: ServiceContext): Promise<Unde
       method: r.method,
       reference: r.reference,
       amount: r.amount,
+      currency: foreignCode(r.currency, home),
     })),
     ...srRows.map((r) => ({
       id: r.id,
@@ -232,6 +268,7 @@ export async function listUndepositedPayments(ctx: ServiceContext): Promise<Unde
       method: r.method,
       reference: r.reference ?? `Sales Receipt #${r.refNumber || r.receiptNumber}`,
       amount: r.total,
+      currency: null,
     })),
   ];
 
@@ -251,6 +288,10 @@ interface PreparedDeposit {
   salesReceiptIds: string[];
   extraLines: ExtraDepositLineInput[];
   cashBackAmt: ReturnType<typeof Money.zero>;
+  /** p1 fx: deposit currency (null = home), rate, home value of the net deposit. */
+  currency: string | null;
+  rate: string | null;
+  homeNetStr: string;
 }
 
 /**
@@ -290,14 +331,32 @@ async function prepareDeposit(
 
   // Verify deposit account belongs to this company.
   const [depAcct] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, code: accounts.code })
+    .select({ id: accounts.id, type: accounts.type, code: accounts.code, currency: accounts.currency })
     .from(accounts)
     .where(and(eq(accounts.id, input.depositAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!depAcct) throw notFound('Deposit account');
   if (depAcct.type !== 'asset') {
     throw validation('Deposit account must be an asset (bank) account.');
   }
-  await assertHomeCurrencyAccounts(ctx, [input.depositAccountId, input.cashBack?.accountId], 'Deposits');
+  // p1 fx: the deposit is in the bank account's currency.
+  const home = await homeCode(ctx);
+  const depCur = foreignCode(depAcct.currency, home);
+  const depLabel = depCur ?? home ?? 'your home currency';
+  /** An account used on the deposit must be in the deposit's currency or the home currency. */
+  async function assertCompatibleAccount(accountId: string, role: string) {
+    const [a] = await ctx.db
+      .select({ name: accounts.name, currency: accounts.currency })
+      .from(accounts)
+      .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
+    const cur = foreignCode(a?.currency ?? null, home);
+    if (a && cur && cur !== depCur) {
+      throw validation(`${role}: "${a.name}" is a ${cur} account. This deposit is in ${depLabel}; pick a ${depLabel} or home-currency account.`);
+    }
+  }
+  if (input.cashBack?.accountId) await assertCompatibleAccount(input.cashBack.accountId, 'Cash back');
+  for (const [i, l] of (input.extraLines ?? []).entries()) {
+    if (l.accountId) await assertCompatibleAccount(l.accountId, `Extra line ${i + 1}`);
+  }
 
   // ── payments: ownership + UF + not voided ────────────────────────────────
   const payRows =
@@ -323,6 +382,12 @@ async function prepareDeposit(
     if (p.depositAccountId !== ufId) {
       throw validation(
         `Payment ${p.id} was not deposited to Undeposited Funds and cannot be re-deposited.`,
+      );
+    }
+    const payCur = foreignCode(p.currency, home);
+    if (payCur !== depCur) {
+      throw validation(
+        `A payment in this deposit is in ${payCur ?? home ?? 'your home currency'}. Deposit it into a ${payCur ?? 'home-currency'} bank account — a deposit holds payments in its account's currency only.`,
       );
     }
   }
@@ -351,6 +416,11 @@ async function prepareDeposit(
     if (r.depositAccountId !== ufId) {
       throw validation(
         `Sales receipt ${r.id} was not received into Undeposited Funds and cannot be re-deposited.`,
+      );
+    }
+    if (depCur) {
+      throw validation(
+        `Sales receipts are recorded in your home currency. Deposit them into a home-currency bank account, not this ${depCur} account.`,
       );
     }
   }
@@ -438,26 +508,61 @@ async function prepareDeposit(
   const netStr = toAmountString(net);
   const ufTotalStr = toAmountString(ufTotal);
 
-  // GL: Dr bank (net) [+ Dr cash-back account] / Cr UF [+ Cr extra-line accounts]
+  // p1 fx: home values. Home deposits use the amounts as they are (rate 1).
+  const fx = depCur ? await currencyRate(ctx, depCur, input.exchangeRate) : null;
+  const rate = fx ? fx.rate : Money.of(1);
+  const bankHome = fx ? toHome(net, rate) : Money.round2(net);
+  const cashBackHome = fx ? toHome(cashBackAmt, rate) : cashBackAmt;
+  // Undeposited Funds is relieved at the home value each payment was received at.
+  // Use the home amount actually posted to UF by the payment's own entry (the stored payment
+  // rate is rounded, so recomputing amount x rate can miss by a few cents).
+  const postedUf = fx ? await postedUndepositedHome(ctx, payRows, ufId) : new Map<string, Decimal>();
+  let ufHome = Money.zero();
+  for (const p of payRows) {
+    ufHome = ufHome.plus(fx ? (postedUf.get(p.id) ?? toHome(p.amount, p.exchangeRate ?? 1)) : Money.of(p.amount));
+  }
+  for (const r of srRows) ufHome = ufHome.plus(Money.of(r.total));
+  const extraHome = homeAmounts(
+    extraLines.map((l) => Money.round2(l.amount)),
+    rate,
+  );
+  if (fx && !bankHome.greaterThan(0)) throw validation('The deposit is too small to convert to your home currency.');
+  // Realized exchange gain (+) / loss (-) on the payments between receipt and deposit.
+  const fxGain = Money.round2(bankHome.plus(cashBackHome).minus(ufHome).minus(extraHome.total));
+  const cashBackCur = input.cashBack ? await foreignCurrencyOfId(ctx, input.cashBack.accountId, home) : null;
+  const extraCur = await Promise.all(extraLines.map((l) => foreignCurrencyOfId(ctx, l.accountId, home)));
+
+  // GL: Dr bank (net) [+ Dr cash-back account] / Cr UF [+ Cr extra-line accounts] [+/- FX]
   const glLines: PostingLine[] = [
-    { accountId: input.depositAccountId, debit: netStr, memo: 'Deposit to bank' },
+    {
+      accountId: input.depositAccountId,
+      debit: toAmountString(bankHome),
+      memo: 'Deposit to bank',
+      ...(depCur ? { foreignAmount: netStr } : {}),
+    },
   ];
   if (input.cashBack && cashBackAmt.greaterThan(0)) {
     glLines.push({
       accountId: input.cashBack.accountId,
-      debit: toAmountString(cashBackAmt),
+      debit: toAmountString(cashBackHome),
       memo: input.cashBack.memo ? `Cash back — ${input.cashBack.memo}` : 'Cash back',
+      ...(cashBackCur ? { foreignAmount: toAmountString(cashBackAmt) } : {}),
     });
   }
   if (ufTotal.greaterThan(0)) {
-    glLines.push({ accountId: ufId, credit: ufTotalStr, memo: 'Undeposited Funds cleared' });
+    glLines.push({ accountId: ufId, credit: toAmountString(ufHome), memo: 'Undeposited Funds cleared' });
   }
-  for (const l of extraLines) {
+  for (const [i, l] of extraLines.entries()) {
     glLines.push({
       accountId: l.accountId,
-      credit: toAmountString(Money.round2(l.amount)),
+      credit: toAmountString(extraHome.lines[i]),
       memo: l.description ?? 'Additional deposit line',
+      ...(extraCur[i] ? { foreignAmount: toAmountString(Money.round2(l.amount)) } : {}),
     });
+  }
+  if (fx) {
+    const fxLine = await exchangeGainLossLine(ctx, fxGain);
+    if (fxLine) glLines.push(fxLine);
   }
 
   // Deposit lines. Invariant: sum(lines.amount) === deposits.total.
@@ -489,7 +594,34 @@ async function prepareDeposit(
     });
   }
 
-  return { glLines, lineValues, netStr, paymentIds, salesReceiptIds, extraLines, cashBackAmt };
+  return {
+    glLines,
+    lineValues,
+    netStr,
+    paymentIds,
+    salesReceiptIds,
+    extraLines,
+    cashBackAmt,
+    currency: depCur,
+    rate: fx ? fx.rate.toFixed(8) : null,
+    homeNetStr: toAmountString(bankHome),
+  };
+}
+
+async function foreignCurrencyOfId(ctx: ServiceContext, accountId: string, home: string | null): Promise<string | null> {
+  const [a] = await ctx.db
+    .select({ currency: accounts.currency })
+    .from(accounts)
+    .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
+  return foreignCode(a?.currency ?? null, home);
+}
+
+function fxHeader(prep: PreparedDeposit) {
+  return {
+    currency: prep.currency,
+    exchangeRate: prep.rate,
+    homeTotal: prep.currency ? prep.homeNetStr : null,
+  };
 }
 
 export async function createDeposit(ctx: ServiceContext, input: CreateDepositInput) {
@@ -503,6 +635,7 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
       description: input.memo ? `Deposit: ${input.memo}` : 'Bank Deposit',
       sourceRef: `deposit:pending`,
       lines: prep.glLines,
+      ...(prep.currency ? { currency: prep.currency, exchangeRate: prep.rate } : {}),
     });
 
     // 2. Insert the deposit header (total = NET amount that hit the bank).
@@ -515,6 +648,7 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
         total: netStr,
         memo: input.memo ?? null,
         postedEntryId: entry.id,
+        ...fxHeader(prep),
       })
       .returning();
 
@@ -547,6 +681,7 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
           ? { accountId: input.cashBack.accountId, amount: toAmountString(cashBackAmt) }
           : null,
         postedEntryId: entry.id,
+        ...fxHeader(prep),
       },
     });
 
@@ -575,12 +710,14 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
   return inTransaction(ctx, async (tx) => {
     const prep = await prepareDeposit(tx, input, id);
     const oldLines = await tx.db.select().from(depositLines).where(eq(depositLines.depositId, id));
-    const plan = await planPostedEdit(tx, {
+    let plan = await planPostedEdit(tx, {
       entryId: existing.postedEntryId,
       date: input.date,
       lines: prep.glLines,
       what: 'deposit',
     });
+    // p1 fx: a foreign deposit whose amount changed re-posts even if its home value did not.
+    if (plan === 'unchanged' && prep.currency && !Money.eq(prep.netStr, existing.total)) plan = 'repost';
 
     let entryId = existing.postedEntryId;
     if (plan === 'repost') {
@@ -590,6 +727,7 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
         description: input.memo ? `Deposit: ${input.memo}` : 'Bank Deposit',
         sourceRef: `deposit:${id}`,
         lines: prep.glLines,
+        ...(prep.currency ? { currency: prep.currency, exchangeRate: prep.rate } : {}),
       });
       entryId = entry.id;
     } else {
@@ -607,6 +745,7 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
         total: prep.netStr,
         memo: input.memo ?? null,
         postedEntryId: entryId,
+        ...fxHeader(prep),
       })
       .where(eq(deposits.id, id))
       .returning();

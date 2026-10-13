@@ -52,6 +52,8 @@ import {
   clientReviewTasks, listChangeReviews, salesTaxLineLinks, workingTbNotes,
   // wave2 payroll
   payrollStateSettings, workersCompCodes,
+  // p1 fx
+  homeCurrencyAdjustments, vendorCreditApplications, paymentFxReliefs,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
@@ -705,6 +707,10 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   // ---- wave2 purchases: Loan Manager + check printer setup (after vendors/accounts/expenses/bills) ----
   { name: 'loans', table: loans, joins: [], companyCol: loans.companyId },
   { name: 'loanPayments', table: loanPayments, joins: [], companyCol: loanPayments.companyId },
+  // ---- p1 fx: foreign vendor-credit applications + Home Currency Adjustments ----
+  { name: 'vendorCreditApplications', table: vendorCreditApplications, joins: [], companyCol: vendorCreditApplications.companyId },
+  { name: 'homeCurrencyAdjustments', table: homeCurrencyAdjustments, joins: [], companyCol: homeCurrencyAdjustments.companyId },
+  { name: 'paymentFxReliefs', table: paymentFxReliefs, joins: [], companyCol: paymentFxReliefs.companyId },
   { name: 'checkPrintSettings', table: checkPrintSettings, joins: [], companyCol: checkPrintSettings.companyId },
   // p1 purchases: check documents for sales tax / payroll liability payments and customer refunds
   { name: 'paymentChecks', table: paymentChecks, joins: [], companyCol: paymentChecks.companyId },

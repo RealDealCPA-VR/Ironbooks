@@ -35,6 +35,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
+import { foreignLineColumns } from './fxLines';
 
 export interface PostingLine {
   accountId: string;
@@ -59,6 +60,11 @@ export interface PostingLine {
    * assertControlAccountNames (QB invariant I11).
    */
   controlLine?: boolean;
+  /**
+   * p1 fx: this line's amount in its account's currency (foreign-currency bank / credit-card
+   * accounts). Omitted = converted from the home amount (fxLines.ts). 0 = home-only revaluation.
+   */
+  foreignAmount?: string | number | null;
 }
 
 export type JournalEntityType = 'customer' | 'vendor' | 'employee' | 'other';
@@ -81,6 +87,9 @@ export interface PostJournalEntryInput {
    * repair tools only — never set it from a user-facing window.
    */
   allowUnnamedControl?: boolean;
+  /** p1 fx: the transaction's currency + home units per 1 unit (see fxLines.ts). */
+  currency?: string | null;
+  exchangeRate?: string | number | { toString(): string } | null;
 }
 
 const DEBIT_NORMAL = new Set(['asset', 'expense']);
@@ -338,7 +347,13 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
   // Verify every referenced account belongs to this company and load its type.
   const accountIds = [...new Set(input.lines.map((l) => l.accountId))];
   const accountRows = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+    .select({
+      id: accounts.id,
+      type: accounts.type,
+      subtype: accounts.subtype,
+      name: accounts.name,
+      currency: accounts.currency,
+    })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, accountIds)));
   const typeById = new Map(accountRows.map((a) => [a.id, a.type]));
@@ -368,6 +383,15 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
   }
 
   assertControlAccountNames(input, accountRows);
+  const fxColumns = await foreignLineColumns(
+    ctx,
+    {
+      lines: input.lines,
+      currency: input.currency ?? null,
+      exchangeRate: input.exchangeRate == null ? null : String(input.exchangeRate),
+    },
+    new Map(accountRows.map((a) => [a.id, a.currency ?? null])),
+  );
 
   return inTransaction(ctx, async (tx) => {
     const entryNumber = await nextEntryNumber(tx);
@@ -388,7 +412,7 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
 
     // Canonical 2dp line values. accounts.balance is updated by the database trigger from
     // exactly these stored rows (no TypeScript-side delta, so nothing can be applied twice).
-    const normalizedLines = input.lines.map((l) => ({
+    const normalizedLines = input.lines.map((l, i) => ({
       accountId: l.accountId,
       debit: l.debit != null && Money.gt(l.debit, 0) ? toAmountString(l.debit) : null,
       credit: l.credit != null && Money.gt(l.credit, 0) ? toAmountString(l.credit) : null,
@@ -396,6 +420,7 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       classId: l.classId ?? null,
       entityType: l.entityType ?? null,
       entityId: l.entityType ? (l.entityId ?? null) : null,
+      ...fxColumns[i],
     }));
 
     await tx.db.insert(journalEntryLines).values(
@@ -441,7 +466,8 @@ async function restoreRefundedCustomerCredit(
   tx: ServiceContext,
   docId: string,
   entryId: string,
-  lines: Array<{ debit: string | null; credit: string | null }>,
+  refundDate: Date,
+  lines: Array<{ accountId: string; debit: string | null; credit: string | null }>,
 ) {
   // The refund posts Dr A/R / Cr bank: the A/R debit equals the bank credit, i.e. the entry total.
   const base = Money.round2(lines.reduce((s, l) => s.plus(Money.of(l.debit ?? '0')), Money.zero()));
@@ -505,6 +531,23 @@ async function restoreRefundedCustomerCredit(
       .update(paymentsReceived)
       .set({ unapplied: toAmountString(unapplied) })
       .where(eq(paymentsReceived.id, payment.id));
+    // p1 fx: a refund relieved A/R by the change in the credit's home value at the time
+    // (homeAt(unapplied before) - homeAt(unapplied after)), which depends on the order of refunds,
+    // applies and unapplies. The void reverses exactly that posted amount, but the credit's home
+    // value now grows by homeAt(unapplied after restore) - homeAt(unapplied before restore). Post
+    // the (cent-level) difference to A/R against Exchange Gain/Loss so A/R stays equal to the
+    // aging — at every date from the refund's date on, not just today (see postRefundVoidFxPlug).
+    // sourceRef `payment:<id>`: voiding the payment voids these plugs with its other FX plugs.
+    const arLine = lines.find((l) => l.debit != null && Money.gt(l.debit, 0));
+    if (arLine) await postRefundVoidFxPlug(tx, {
+      payment: { id: payment.id, postedEntryId: payment.postedEntryId, exchangeRate: payment.exchangeRate },
+      arAccountId: arLine.accountId,
+      refundDate,
+      rate,
+      unappliedBefore: Money.of(payment.unapplied),
+      unappliedAfter: unapplied,
+      reversed: base,
+    });
     await writeAudit(tx, {
       action: 'update',
       entityType: 'payment_received',
@@ -539,6 +582,141 @@ async function restoreRefundedCustomerCredit(
       newValues: { action: 'refund_voided', unapplied: toAmountString(unapplied), status, postedEntryId: entryId },
     });
   }
+}
+
+/**
+ * p1 fx: Exchange Gain/Loss plug(s) posted when a foreign-currency payment refund is voided (see
+ * restoreRefundedCustomerCredit). Every A/R posting of the credit moved A/R by the change in the
+ * credit's home value at the time, in the order they were entered. Removing a refund from the
+ * middle changes the home value of every later step by a cent here and there, and the voided
+ * refund's date is not where that cent belongs: it belongs to the later refund / apply whose
+ * home value changed. So, walking the dates from the voided refund's date on (the dates the credit
+ * or its A/R changed), the credit's home amount on the ledger (customerCredits.ts
+ * paymentCreditLedger) is compared with round2(unapplied as of that date x rate) and the
+ * difference is posted ON THAT DATE. A/R then equals the aging as of every date, today included.
+ *
+ * Safety net: the plugs must add up to the change today, homeAt(after) - homeAt(before) - the
+ * reversed A/R. If they do not (a ledger shape this walk does not model, e.g. data from before
+ * relief records existed), one plug of exactly that change is posted on the latest date the
+ * credit changed instead, which keeps today's A/R equal to the aging as before.
+ */
+async function postRefundVoidFxPlug(
+  tx: ServiceContext,
+  p: {
+    payment: { id: string; postedEntryId: string | null; exchangeRate: string | null };
+    /** The A/R account the refund debited (the void reverses that line). */
+    arAccountId: string;
+    refundDate: Date;
+    rate: ReturnType<typeof Money.of>;
+    unappliedBefore: ReturnType<typeof Money.of>;
+    unappliedAfter: ReturnType<typeof Money.of>;
+    reversed: ReturnType<typeof Money.of>;
+  },
+) {
+  const { paymentCreditHome } = await import('./customerCredits');
+  const homeAt = (v: ReturnType<typeof Money.of>) => paymentCreditHome(v, p.rate);
+  const total = Money.round2(homeAt(p.unappliedAfter).minus(homeAt(p.unappliedBefore)).minus(p.reversed));
+  await postPaymentCreditFxPlugs(tx, {
+    payment: p.payment,
+    arAccountId: p.arAccountId,
+    from: p.refundDate,
+    rate: p.rate,
+    unappliedNow: p.unappliedAfter,
+    total,
+    description: 'Exchange rounding on voided refund of a foreign-currency payment',
+  });
+}
+
+/**
+ * p1 fx: dated Exchange Gain/Loss plugs that keep a foreign payment's credit on A/R equal to
+ * round2(unapplied as of the date x payment rate) at every date from `from` on. Used after a refund
+ * is voided and after a refund is recorded (a refund backdated before applies / unapplies that were
+ * entered earlier changes the home value of those later steps). Walks the dates the credit or its
+ * A/R changed (customerCredits.ts paymentCreditEvents / paymentCreditLedger) in the CURRENT state
+ * (the refund or its void already written) and posts the difference on that date.
+ *
+ * `total` is the plug the change needs today (+ = the credit grows on A/R). Safety net: if the dated
+ * plugs do not add up to it (a ledger shape the walk does not model, e.g. data from before relief
+ * records existed), one plug of exactly `total` is posted on the latest date the credit changed,
+ * which keeps today's A/R equal to the aging.
+ */
+export async function postPaymentCreditFxPlugs(
+  tx: ServiceContext,
+  p: {
+    payment: { id: string; postedEntryId: string | null; exchangeRate: string | null };
+    arAccountId: string;
+    from: Date;
+    rate: ReturnType<typeof Money.of>;
+    /** The payment's unapplied credit now (payment currency), after the change. */
+    unappliedNow: ReturnType<typeof Money.of>;
+    total: ReturnType<typeof Money.of>;
+    description: string;
+  },
+) {
+  const { paymentCreditEvents, paymentCreditLedger, ledgerCreditAsOf, unappliedAsOf, paymentCreditHome } =
+    await import('./customerCredits');
+  const homeAt = (v: ReturnType<typeof Money.of>) => paymentCreditHome(v, p.rate);
+  const total = Money.round2(p.total);
+  if (p.rate.equals(1)) {
+    if (!total.isZero()) await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, p.from, total, p.description);
+    return;
+  }
+
+  const events = (await paymentCreditEvents(tx, [p.payment])).get(p.payment.id) ?? [];
+  const ledger = await paymentCreditLedger(tx, p.payment);
+  const from = p.from.getTime();
+  const times = [...new Set([from, ...events.map((e) => e.date.getTime()), ...ledger.map((l) => l.date.getTime())])]
+    .filter((t) => t >= from)
+    .sort((a, b) => a - b);
+  const plugs: Array<{ date: Date; amount: ReturnType<typeof Money.of> }> = [];
+  for (const t of times) {
+    const at = new Date(t);
+    const target = homeAt(unappliedAsOf(p.unappliedNow, events, at));
+    const diff = Money.round2(target.minus(ledgerCreditAsOf(ledger, at)));
+    if (diff.isZero()) continue;
+    plugs.push({ date: at, amount: diff });
+    // A plug of +diff credits A/R (the credit grows): arNet -diff from this date on.
+    ledger.push({ date: at, arNet: diff.negated() });
+  }
+  const sum = plugs.reduce((s, x) => s.plus(x.amount), Money.zero());
+  if (!Money.round2(sum).equals(total)) {
+    if (total.isZero()) return;
+    const latest = Math.max(from, ...events.map((e) => e.date.getTime()));
+    await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, new Date(latest), total, p.description);
+    return;
+  }
+  for (const x of plugs) await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, x.date, x.amount, p.description);
+}
+
+/**
+ * One refund-void plug: `diff` > 0 needs an extra A/R credit (loss), < 0 an A/R debit (gain).
+ */
+async function postOneRefundVoidPlug(
+  tx: ServiceContext,
+  paymentId: string,
+  arAccountId: string,
+  date: Date,
+  diff: ReturnType<typeof Money.of>,
+  description: string,
+) {
+  // Dynamic import: currencies.ts imports this module.
+  const { getOrCreateExchangeGainLossAccount } = await import('./currencies');
+  const fxAccountId = await getOrCreateExchangeGainLossAccount(tx);
+  const amt = toAmountString(Money.abs(diff));
+  await postJournalEntry(tx, {
+    date,
+    description,
+    sourceRef: `payment:${paymentId}`,
+    lines: diff.greaterThan(0)
+      ? [
+          { accountId: fxAccountId, debit: amt, memo: 'Realized exchange loss' },
+          { accountId: arAccountId, credit: amt, memo: 'A/R FX adjustment', controlLine: true },
+        ]
+      : [
+          { accountId: arAccountId, debit: amt, memo: 'A/R FX adjustment', controlLine: true },
+          { accountId: fxAccountId, credit: amt, memo: 'Realized exchange gain' },
+        ],
+  });
 }
 
 /** Void a posted entry: mark void (the DB trigger reverses its balance impact). */
@@ -602,7 +780,7 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       newValues: { status: 'void' },
     });
     if (entry.sourceRef?.startsWith('refund:')) {
-      await restoreRefundedCustomerCredit(tx, entry.sourceRef.slice('refund:'.length), entryId, lines);
+      await restoreRefundedCustomerCredit(tx, entry.sourceRef.slice('refund:'.length), entryId, entry.date, lines);
     }
     await recordClosingDateException(tx, periodCheck, {
       entryId,

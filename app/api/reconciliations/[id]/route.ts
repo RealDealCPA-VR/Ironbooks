@@ -117,7 +117,7 @@ export async function PATCH(
     }
 
     if (action === 'adjustments') {
-      const { serviceCharge, interestEarned } = body ?? {};
+      const { serviceCharge, interestEarned, exchangeRate } = body ?? {};
       if (!serviceCharge && !interestEarned) {
         return NextResponse.json(
           { error: 'serviceCharge and/or interestEarned is required.' },
@@ -127,6 +127,7 @@ export async function PATCH(
       const progress = await addStatementAdjustments(ctx, id, {
         serviceCharge: serviceCharge ?? null,
         interestEarned: interestEarned ?? null,
+        exchangeRate: exchangeRate ?? null,
       });
       return NextResponse.json(progress);
     }

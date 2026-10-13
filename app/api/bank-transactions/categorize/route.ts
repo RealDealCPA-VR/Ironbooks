@@ -9,6 +9,7 @@
  *     accountId: string;           // offsetting GL account (income, expense, etc.)
  *     payee?: string;              // optional payee override
  *     memo?: string;               // optional memo / reference
+ *     exchangeRate?: string;       // foreign-currency account: home units per 1 unit (default: list rate)
  *   }
  *
  * Response 200: { transaction, entry }
@@ -38,7 +39,7 @@ export async function POST(req: NextRequest) {
     const ctx = await getServerContext();
     const body = await req.json();
 
-    const { bankTransactionId, accountId, payee, memo } = body ?? {};
+    const { bankTransactionId, accountId, payee, memo, exchangeRate } = body ?? {};
 
     if (!bankTransactionId) {
       return NextResponse.json({ error: 'bankTransactionId is required.' }, { status: 400 });
@@ -52,6 +53,7 @@ export async function POST(req: NextRequest) {
       accountId,
       payee: payee ?? null,
       memo: memo ?? null,
+      exchangeRate: exchangeRate ?? null,
     });
 
     return NextResponse.json(result);

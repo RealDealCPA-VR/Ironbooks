@@ -84,6 +84,8 @@ interface ReconcileInfo {
   beginningBalance: string;
   recomputedBalance: string;
   discrepancy: string;
+  /** p1 fx: account currency (null = home) — every amount on this page is in it. */
+  currency?: string | null;
 }
 
 interface GLAccount {
@@ -97,9 +99,15 @@ interface GLAccount {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** p1 fx: currency of the account being reconciled (set when its info loads). */
+let displayCurrency: string | undefined;
+function setDisplayCurrency(info: ReconcileInfo | null) {
+  displayCurrency = info?.currency ?? undefined;
+}
+
 function fmt(v: string | null | undefined) {
   if (v == null) return '—';
-  return formatCurrency(v);
+  return formatCurrency(v, displayCurrency);
 }
 
 function statusTone(status: string): 'info' | 'success' | 'warning' | 'neutral' {
@@ -210,6 +218,7 @@ function StartForm({
   }
 
   const hasDiscrepancy = info != null && !Money.isZero(info.discrepancy);
+  setDisplayCurrency(info);
 
   return (
     <Card className="p-6 max-w-lg">
@@ -242,7 +251,7 @@ function StartForm({
             <div className="flex justify-between">
               <span className="text-navy/60">Beginning Balance</span>
               <span className="font-mono font-semibold text-navy">
-                {formatCurrency(info.beginningBalance)}
+                {fmt(info.beginningBalance)}
               </span>
             </div>
             <div className="flex justify-between">
@@ -253,6 +262,11 @@ function StartForm({
               <div className="pt-1">
                 <Badge tone="info">Credit Card Account</Badge>
               </div>
+            )}
+            {info.currency && (
+              <p className="pt-1 text-xs text-navy/60">
+                This account is in {info.currency}. Enter the statement ending balance in {info.currency}, as printed on the statement.
+              </p>
             )}
             {hasDiscrepancy && (
               <div className="mt-2 rounded-md bg-gold/10 border border-gold/40 p-2 text-navy text-xs">
@@ -332,6 +346,7 @@ function ReconcileSession({
   const [lines, setLines] = useState<ClearableLine[]>([]);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [info, setInfo] = useState<ReconcileInfo | null>(null);
+  setDisplayCurrency(info); // p1 fx: amounts in the account currency
   const [glAccounts, setGlAccounts] = useState<GLAccount[]>([]);
   const [loadingLines, setLoadingLines] = useState(true);
   const [completing, setCompleting] = useState(false);
@@ -547,6 +562,11 @@ function ReconcileSession({
             {info.isCreditCard && (
               <span className="mr-2 align-middle">
                 <Badge tone="info">Credit Card</Badge>
+              </span>
+            )}
+            {info.currency && (
+              <span className="mr-2 align-middle">
+                <Badge tone="info">Amounts in {info.currency}</Badge>
               </span>
             )}
             Last reconciled: {fmtDate(info.lastReconciledDate)}

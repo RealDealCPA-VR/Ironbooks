@@ -34,5 +34,8 @@ export const createVendorCreditSchema = z.object({
   memo: z.string().nullish(),
   refNumber: z.string().max(50).nullish(),
   lines: zLines(vendorCreditLineSchema),
+  // p1 fx: the vendor's currency is used; a stated rate overrides the currency list's rate.
+  currency: z.string().max(3).nullish(),
+  exchangeRate: zDecimalPositive.nullish(),
 });
 export type CreateVendorCreditBody = z.infer<typeof createVendorCreditSchema>;

@@ -12,7 +12,7 @@
  * matching / confirmation step.  The GL lines being reconciled were already
  * posted by other services (invoices, expenses, transfers, etc.).
  */
-import { and, desc, eq, inArray, isNull, lt, lte, ne } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, lt, lte, ne, sql } from 'drizzle-orm';
 import {
   accounts,
   bankAccounts,
@@ -33,6 +33,9 @@ import {
 import { postJournalEntry } from './posting';
 import { accountNumberFor, maskForContext } from './access';
 import { payCreditCard } from './liabilityPayments';
+import { accountCreditSql, accountDebitSql, foreignCurrencyOfAccount, nz } from './fxLedger';
+import { currencyRate, toHome } from './exchangeRates';
+import { foreignCode, homeCode } from './fxLines';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -50,11 +53,17 @@ export interface ClearableLine {
   journalEntryId: string;
   date: Date;
   description: string;
-  /** Positive = credit to the bank account (money out), negative = debit (money in). */
+  /**
+   * Debit (money in) / credit (money out) in the ACCOUNT's currency — for a foreign-currency
+   * account that is the amount on the statement (p1 fx), not the home value.
+   */
   debit: string | null;
   credit: string | null;
   memo: string | null;
   isCleared: boolean;
+  /** Home-currency debit / credit (same as debit / credit for a home-currency account). */
+  homeDebit?: string | null;
+  homeCredit?: string | null;
 }
 
 export interface ReconciliationProgress {
@@ -110,10 +119,12 @@ async function computeClearedBalance(
   // accumulated on their natural side (credit − debit) instead of the asset side.
   let cleared = Money.zero();
   let glType: string | null = null;
+  let foreign = false;
   const [recon] = await ctx.db
     .select({
       opening: bankAccounts.lastReconciledBalance,
       glType: accounts.type,
+      glAccountId: accounts.id,
     })
     .from(reconciliations)
     .innerJoin(bankAccounts, eq(reconciliations.bankAccountId, bankAccounts.id))
@@ -122,13 +133,15 @@ async function computeClearedBalance(
   if (recon) {
     glType = recon.glType;
     if (recon.opening != null) cleared = Money.of(recon.opening);
+    // p1 fx: a foreign-currency account reconciles in its own currency.
+    foreign = !!(await foreignCurrencyOfAccount(ctx, recon.glAccountId));
   }
 
   // Pull every cleared item for this reconciliation.
   const items = await ctx.db
     .select({
-      debit: journalEntryLines.debit,
-      credit: journalEntryLines.credit,
+      debit: accountDebitSql(foreign),
+      credit: accountCreditSql(foreign),
     })
     .from(reconciliationItems)
     .innerJoin(
@@ -286,6 +299,7 @@ export async function listClearable(
   if (!bankAcct) throw notFound('Bank account');
 
   const glAccountId = bankAcct.accountId;
+  const foreign = !!(await foreignCurrencyOfAccount(ctx, glAccountId));
 
   // Fetch all posted lines on the GL account up to asOf that are not yet
   // permanently cleared (i.e. cleared in a completed reconciliation).
@@ -298,8 +312,10 @@ export async function listClearable(
       journalEntryId: journalEntryLines.journalEntryId,
       date: journalEntries.date,
       description: journalEntries.description,
-      debit: journalEntryLines.debit,
-      credit: journalEntryLines.credit,
+      debit: accountDebitSql(foreign),
+      credit: accountCreditSql(foreign),
+      homeDebit: journalEntryLines.debit,
+      homeCredit: journalEntryLines.credit,
       memo: journalEntryLines.memo,
     })
     .from(journalEntryLines)
@@ -355,15 +371,20 @@ export async function listClearable(
 
   return rows
     .filter((r) => !permanentlyClearedIds.has(r.journalEntryLineId))
+    // A Home Currency Adjustment line changes only the home value of a foreign account — it is
+    // never on the bank's statement, so it is not offered for clearing (p1 fx).
+    .filter((r) => !foreign || nz(r.debit) != null || nz(r.credit) != null)
     .map((r) => ({
       journalEntryLineId: r.journalEntryLineId,
       journalEntryId: r.journalEntryId,
       date: r.date,
       description: r.description,
-      debit: r.debit,
-      credit: r.credit,
+      debit: foreign ? nz(r.debit) : r.debit,
+      credit: foreign ? nz(r.credit) : r.credit,
       memo: r.memo,
       isCleared: clearedSet.has(r.journalEntryLineId),
+      homeDebit: r.homeDebit,
+      homeCredit: r.homeCredit,
     }));
 }
 
@@ -656,6 +677,9 @@ export interface ReconcileInfo {
   recomputedBalance: string;
   /** beginningBalance − recomputedBalance. Non-zero ⇒ a reconciled transaction was voided/changed. */
   discrepancy: string;
+  /** p1 fx: the account's currency (null = home); all balances above are in it. */
+  currency?: string | null;
+  homeCurrency?: string | null;
 }
 
 /**
@@ -688,14 +712,16 @@ export async function getReconcileInfo(
       and(eq(bankAccounts.id, bankAccountId), eq(bankAccounts.companyId, ctx.companyId)),
     );
   if (!ba) throw notFound('Bank account');
+  const currency = await foreignCurrencyOfAccount(ctx, ba.glAccountId);
+  const foreign = !!currency;
 
   // Recompute the cleared balance from completed sessions, counting only lines
   // whose journal entry is still 'posted' (voided lines drop out — that is the
   // discrepancy we are detecting).
   const rows = await ctx.db
     .select({
-      debit: journalEntryLines.debit,
-      credit: journalEntryLines.credit,
+      debit: accountDebitSql(foreign),
+      credit: accountCreditSql(foreign),
       jeStatus: journalEntries.status,
     })
     .from(reconciliationItems)
@@ -731,6 +757,8 @@ export async function getReconcileInfo(
     beginningBalance: toAmountString(beginning),
     recomputedBalance: toAmountString(recomputed),
     discrepancy: toAmountString(beginning.minus(recomputed)),
+    currency,
+    homeCurrency: await homeCode(ctx),
   };
 }
 
@@ -739,6 +767,8 @@ export interface StatementAdjustmentsInput {
   serviceCharge?: { amount: string | number; accountId: string } | null;
   /** Interest the bank paid: Dr bank / Cr income, dated the statement date. */
   interestEarned?: { amount: string | number; accountId: string } | null;
+  /** p1 fx: foreign-currency account — home units per 1 unit (default: the currency list's rate). */
+  exchangeRate?: string | number | null;
 }
 
 /** Insert an auto-cleared reconciliation item for the bank-side line of a new entry. */
@@ -789,6 +819,12 @@ export async function addStatementAdjustments(
   if (!input.serviceCharge && !input.interestEarned) {
     throw validation('Provide a service charge and/or interest earned amount.');
   }
+  // p1 fx: on a foreign-currency account the statement amounts are in the account's currency;
+  // post their home value at the stated rate (else the currency list's rate).
+  const adjCurrency = await foreignCurrencyOfAccount(ctx, recon.glAccountId);
+  const adjFx = adjCurrency ? await currencyRate(ctx, adjCurrency, input.exchangeRate) : null;
+  const homeOf = (amtStr: string) => (adjFx ? toAmountString(toHome(amtStr, adjFx.rate)) : amtStr);
+  const fxEntry = adjFx ? { currency: adjFx.currency, exchangeRate: adjFx.rate.toFixed(8) } : {};
 
   if (input.serviceCharge) {
     const amt = Money.of(input.serviceCharge.amount);
@@ -797,14 +833,16 @@ export async function addStatementAdjustments(
       throw validation('serviceCharge.accountId (expense account) is required.');
     }
     const amtStr = toAmountString(amt);
+    const homeStr = homeOf(amtStr);
     const entry = await postJournalEntry(ctx, {
       date: recon.statementDate,
       description: 'Bank service charge',
       sourceRef: `reconciliation:${reconciliationId}`,
       lines: [
-        { accountId: input.serviceCharge.accountId, debit: amtStr },
-        { accountId: recon.glAccountId, credit: amtStr },
+        { accountId: input.serviceCharge.accountId, debit: homeStr },
+        { accountId: recon.glAccountId, credit: homeStr, ...(adjFx ? { foreignAmount: amtStr } : {}) },
       ],
+      ...fxEntry,
     });
     await autoClearBankLine(ctx, reconciliationId, entry.id, recon.glAccountId);
   }
@@ -816,14 +854,16 @@ export async function addStatementAdjustments(
       throw validation('interestEarned.accountId (income account) is required.');
     }
     const amtStr = toAmountString(amt);
+    const homeStr = homeOf(amtStr);
     const entry = await postJournalEntry(ctx, {
       date: recon.statementDate,
       description: 'Interest earned',
       sourceRef: `reconciliation:${reconciliationId}`,
       lines: [
-        { accountId: recon.glAccountId, debit: amtStr },
-        { accountId: input.interestEarned.accountId, credit: amtStr },
+        { accountId: recon.glAccountId, debit: homeStr, ...(adjFx ? { foreignAmount: amtStr } : {}) },
+        { accountId: input.interestEarned.accountId, credit: homeStr },
       ],
+      ...fxEntry,
     });
     await autoClearBankLine(ctx, reconciliationId, entry.id, recon.glAccountId);
   }
@@ -974,6 +1014,8 @@ export interface ReconciliationReport {
   lines: ReconciliationReportLine[];
   /** Cleared lines whose journal entry is now void (reconciliation discrepancies). */
   discrepancies: ReconciliationReportLine[];
+  /** p1 fx: the account's currency (null = home); every amount above is in it. */
+  currency?: string | null;
 }
 
 /**
@@ -999,6 +1041,8 @@ export async function getReconciliationReport(
     .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
     .where(eq(bankAccounts.id, recon.bankAccountId));
   if (!meta) throw notFound('Bank account');
+  const reportCurrency = await foreignCurrencyOfAccount(ctx, recon.glAccountId);
+  const reportForeign = !!reportCurrency;
 
   // Beginning balance = statement balance of the previous completed session
   // (the session completed immediately before this one).
@@ -1027,8 +1071,8 @@ export async function getReconciliationReport(
       date: journalEntries.date,
       description: journalEntries.description,
       memo: journalEntryLines.memo,
-      debit: journalEntryLines.debit,
-      credit: journalEntryLines.credit,
+      debit: accountDebitSql(reportForeign),
+      credit: accountCreditSql(reportForeign),
       jeStatus: journalEntries.status,
     })
     .from(reconciliationItems)
@@ -1100,6 +1144,7 @@ export async function getReconciliationReport(
     paymentsTotal: toAmountString(paymentsTotal),
     lines,
     discrepancies: lines.filter((l) => l.isVoided),
+    currency: reportCurrency,
   };
 }
 
@@ -1150,8 +1195,9 @@ export async function reconciliationDiscrepancies(
       entryNumber: journalEntries.entryNumber,
       date: journalEntries.date,
       description: journalEntries.description,
-      debit: journalEntryLines.debit,
-      credit: journalEntryLines.credit,
+      // p1 fx: in the account's own currency for a foreign-currency account (as reconciled).
+      debit: sql<string | null>`CASE WHEN ${accounts.currency} IS NOT NULL AND ${journalEntryLines.debit} IS NOT NULL THEN COALESCE(${journalEntryLines.foreignAmount}, ${journalEntryLines.debit}) ELSE ${journalEntryLines.debit} END`,
+      credit: sql<string | null>`CASE WHEN ${accounts.currency} IS NOT NULL AND ${journalEntryLines.credit} IS NOT NULL THEN COALESCE(${journalEntryLines.foreignAmount}, ${journalEntryLines.credit}) ELSE ${journalEntryLines.credit} END`,
       voidedAt: journalEntries.voidedAt,
     })
     .from(reconciliationItems)
@@ -1180,6 +1226,67 @@ export async function reconciliationDiscrepancies(
   }));
 }
 
+/**
+ * Pay a foreign-currency credit card's statement balance (amount in the card's currency): the card
+ * line carries that amount plus its home value at the stated / list rate; the payment account must
+ * be in the card's currency or the home currency.
+ */
+async function payForeignCreditCard(
+  ctx: ServiceContext,
+  recon: { id: string; glAccountId: string; statementBalance: string },
+  cardName: string,
+  cardCurrency: string,
+  input: PayCreditCardBalanceInput,
+) {
+  const amt = Money.round2(input.amount ?? recon.statementBalance);
+  if (!amt.greaterThan(0)) throw validation('Payment amount must be greater than zero.');
+  if (!input.paymentAccountId) throw validation('paymentAccountId is required.');
+  if (input.paymentAccountId === recon.glAccountId) {
+    throw validation('Payment account must be different from the credit card account.');
+  }
+  const [pay] = await ctx.db
+    .select({ id: accounts.id, currency: accounts.currency, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.paymentAccountId)));
+  if (!pay) throw notFound('Payment account');
+  const home = await homeCode(ctx);
+  const payCur = foreignCode(pay.currency, home);
+  if (payCur && payCur !== cardCurrency) {
+    throw validation(
+      `"${pay.name}" is a ${payCur} account. Pay this ${cardCurrency} card from a ${cardCurrency} account or a home-currency account.`,
+    );
+  }
+  const sourceRef = `cc-payment:${recon.id}`;
+  const [existing] = await ctx.db
+    .select({ id: journalEntries.id })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.sourceRef, sourceRef),
+        eq(journalEntries.status, 'posted'),
+      ),
+    );
+  if (existing) {
+    throw new ServiceError('CONFLICT', 'A credit card payment for this reconciliation has already been recorded.');
+  }
+  const fx = await currencyRate(ctx, cardCurrency, input.exchangeRate);
+  const amtStr = toAmountString(amt);
+  const homeStr = toAmountString(toHome(amt, fx.rate));
+  if (!Money.gt(homeStr, 0)) throw validation('This amount is too small to convert to your home currency.');
+  return postJournalEntry(ctx, {
+    date: input.date ?? new Date(),
+    description: input.memo?.trim() ? input.memo.trim() : `Credit card payment — ${cardName}`,
+    sourceRef,
+    currency: fx.currency,
+    exchangeRate: fx.rate.toFixed(8),
+    lines: [
+      { accountId: recon.glAccountId, debit: homeStr, foreignAmount: amtStr },
+      { accountId: input.paymentAccountId, credit: homeStr, ...(payCur ? { foreignAmount: amtStr } : {}) },
+    ],
+  });
+}
+
 export interface PayCreditCardBalanceInput {
   /** GL account (bank/checking asset) the payment is drawn from. */
   paymentAccountId: string;
@@ -1188,6 +1295,8 @@ export interface PayCreditCardBalanceInput {
   /** Defaults to today. */
   date?: Date;
   memo?: string | null;
+  /** p1 fx: foreign-currency card — home units per 1 unit (default: the currency list's rate). */
+  exchangeRate?: string | number | null;
 }
 
 /**
@@ -1213,6 +1322,10 @@ export async function payCreditCardBalance(
   if (gl.type !== 'liability') {
     throw validation('This reconciliation is not for a credit card (liability) account.');
   }
+
+  // p1 fx: a foreign-currency card's statement balance is in the card's currency.
+  const cardCurrency = await foreignCurrencyOfAccount(ctx, recon.glAccountId);
+  if (cardCurrency) return payForeignCreditCard(ctx, recon, gl.name, cardCurrency, input);
 
   return payCreditCard(ctx, {
     creditCardAccountId: recon.glAccountId,

@@ -42,6 +42,8 @@ interface Account {
 interface Vendor {
   id: string;
   displayName: string;
+  /** p1 fx: the vendor's currency (null = home). */
+  currency?: string | null;
 }
 interface ScheduleRow {
   number: number;
@@ -67,6 +69,9 @@ interface LoanRow {
   paymentsMade: number;
   numberOfPayments: number;
   next: ScheduleRow | null;
+  /** p1 fx: loan currency (null = home) and the rate it was booked at. */
+  currency?: string | null;
+  exchangeRate?: string | null;
 }
 interface LoanDetail extends LoanRow {
   lenderVendorId: string | null;
@@ -112,6 +117,7 @@ function emptyForm() {
     firstPaymentDate: today(),
     escrowAmount: '',
     notes: '',
+    exchangeRate: '',
   };
 }
 
@@ -129,7 +135,7 @@ export default function LoansPage() {
 
   const [payOpen, setPayOpen] = useState(false);
   const [payKind, setPayKind] = useState<'check' | 'bill'>('check');
-  const [pay, setPay] = useState({ date: today(), paymentAccountId: '', principal: '', interest: '', escrow: '', reference: '', toPrint: false });
+  const [pay, setPay] = useState({ date: today(), paymentAccountId: '', principal: '', interest: '', escrow: '', reference: '', toPrint: false, exchangeRate: '' });
 
   const refresh = useCallback(async () => {
     try {
@@ -187,6 +193,7 @@ export default function LoansPage() {
       firstPaymentDate: d.firstPaymentDate.slice(0, 10),
       escrowAmount: Number(d.escrowAmount) > 0 ? d.escrowAmount : '',
       notes: d.notes ?? '',
+      exchangeRate: d.exchangeRate ? String(Number(d.exchangeRate)) : '',
     });
     setFormOpen(true);
   }
@@ -203,6 +210,7 @@ export default function LoansPage() {
         termMonths: Number(form.termMonths),
         paymentsPerYear: Number(form.paymentsPerYear),
         notes: form.notes || null,
+        exchangeRate: lenderCurrency && form.exchangeRate.trim() ? form.exchangeRate.trim() : null,
       };
       if (editingId) await api.patch(`/api/loans/${editingId}`, body);
       else await api.post('/api/loans', body);
@@ -217,6 +225,23 @@ export default function LoansPage() {
     }
   }
 
+  // p1 fx: currency of the open loan / of the lender picked on the form.
+  const cur = detail?.currency ?? undefined;
+  const lenderCurrency = vendors.find((v) => v.id === form.lenderVendorId)?.currency || null;
+
+  async function voidPayment(paymentId: string) {
+    if (!detail) return;
+    if (!confirm('Void this loan payment? Its check or bill is voided and the principal goes back on the loan.')) return;
+    try {
+      await api.del(`/api/loans/${detail.id}/payments?paymentId=${paymentId}`);
+      toast('Loan payment voided.', 'success');
+      await refresh();
+      await openDetail(detail.id);
+    } catch (err) {
+      toastError(err, 'Failed to void the payment.');
+    }
+  }
+
   function openPay(kind: 'check' | 'bill') {
     if (!detail?.next) return;
     setPayKind(kind);
@@ -228,6 +253,7 @@ export default function LoansPage() {
       escrow: detail.next.escrow,
       reference: '',
       toPrint: false,
+      exchangeRate: '',
     });
     setPayOpen(true);
   }
@@ -246,6 +272,7 @@ export default function LoansPage() {
           escrow: pay.escrow || '0',
           reference: pay.toPrint ? null : pay.reference || null,
           toPrint: payKind === 'check' ? pay.toPrint : false,
+          ...(detail.currency && pay.exchangeRate.trim() ? { exchangeRate: pay.exchangeRate.trim() } : {}),
         }),
       );
       if (saved === null) return;
@@ -312,8 +339,8 @@ export default function LoansPage() {
                 <Tr key={l.id}>
                   <Td className="font-medium">{l.name}</Td>
                   <Td>{l.lenderName ?? '—'}</Td>
-                  <Td numeric>{formatCurrency(l.payment)}</Td>
-                  <Td numeric className="font-semibold">{formatCurrency(l.balance)}</Td>
+                  <Td numeric>{formatCurrency(l.payment, l.currency ?? undefined)}</Td>
+                  <Td numeric className="font-semibold">{formatCurrency(l.balance, l.currency ?? undefined)}</Td>
                   <Td>{l.next ? `#${l.next.number} on ${formatDate(l.next.date, 'MMM d, yyyy')}` : <Badge tone="success">Paid off</Badge>}</Td>
                   <Td className="text-right">
                     <Button size="sm" variant="secondary" onClick={() => openDetail(l.id)}>
@@ -333,10 +360,16 @@ export default function LoansPage() {
             <div>
               <h2 className="text-lg font-bold text-navy">{detail.name}</h2>
               <p className="text-sm text-navy/60">
-                {formatCurrency(detail.originalAmount)} at {Number(detail.annualRate)}% for {detail.termMonths} months —{' '}
-                {detail.paymentsMade} of {detail.numberOfPayments} payments made. Principal paid {formatCurrency(detail.principalPaid)},
-                interest paid {formatCurrency(detail.interestPaid)}.
+                {formatCurrency(detail.originalAmount, cur)} at {Number(detail.annualRate)}% for {detail.termMonths} months —{' '}
+                {detail.paymentsMade} of {detail.numberOfPayments} payments made. Principal paid {formatCurrency(detail.principalPaid, cur)},
+                interest paid {formatCurrency(detail.interestPaid, cur)}.
               </p>
+              {detail.currency && (
+                <p className="text-xs text-navy/50 mt-1">
+                  This loan is in {detail.currency}, booked at {Number(detail.exchangeRate ?? 0)} home per {detail.currency}. Payments are
+                  converted at their own rate; the difference on the principal is recorded as an exchange gain or loss.
+                </p>
+              )}
             </div>
             <div className="flex gap-2">
               <Button variant="secondary" onClick={() => openEdit(detail)}>
@@ -363,6 +396,7 @@ export default function LoansPage() {
                     <Th numeric>Principal</Th>
                     <Th numeric>Interest</Th>
                     <Th numeric>Total</Th>
+                    <Th />
                   </tr>
                 </thead>
                 <tbody>
@@ -373,9 +407,16 @@ export default function LoansPage() {
                       <Td>
                         {p.kind === 'check' ? 'Check' : 'Bill'} {p.reference ?? ''} {!p.active && <Badge tone="danger">Void</Badge>}
                       </Td>
-                      <Td numeric>{formatCurrency(p.principal)}</Td>
-                      <Td numeric>{formatCurrency(p.interest)}</Td>
-                      <Td numeric>{formatCurrency(p.total)}</Td>
+                      <Td numeric>{formatCurrency(p.principal, cur)}</Td>
+                      <Td numeric>{formatCurrency(p.interest, cur)}</Td>
+                      <Td numeric>{formatCurrency(p.total, cur)}</Td>
+                      <Td className="text-right">
+                        {p.active && (
+                          <Button size="sm" variant="ghost" onClick={() => voidPayment(p.id)}>
+                            Void
+                          </Button>
+                        )}
+                      </Td>
                     </Tr>
                   ))}
                 </tbody>
@@ -444,10 +485,17 @@ export default function LoansPage() {
               <option value="">None</option>
               {vendors.map((v) => (
                 <option key={v.id} value={v.id}>
-                  {v.displayName}
+                  {v.displayName}{v.currency ? ` (${v.currency})` : ''}
                 </option>
               ))}
             </Select>
+            {lenderCurrency && (
+              <div className="mt-2">
+                <Label htmlFor="ln-rate">Booked rate (1 {lenderCurrency} = ? home)</Label>
+                <Input id="ln-rate" inputMode="decimal" placeholder="Blank = Currencies list rate" value={form.exchangeRate} onChange={set('exchangeRate')} />
+                <p className="text-xs text-navy/40 mt-1">The loan is in {lenderCurrency}; pay it from a {lenderCurrency} bank account.</p>
+              </div>
+            )}
           </div>
           <div>
             <Label htmlFor="ln-liab" required>Loan account (what you owe)</Label>
@@ -571,10 +619,16 @@ export default function LoansPage() {
               </label>
             )}
           </div>
+          {detail?.currency && (
+            <div className="col-span-2">
+              <Label htmlFor="lp-rate">Exchange rate today (1 {detail.currency} = ? home)</Label>
+              <Input id="lp-rate" inputMode="decimal" placeholder="Blank = Currencies list rate" value={pay.exchangeRate} onChange={(e) => setPay((p) => ({ ...p, exchangeRate: e.target.value }))} />
+            </div>
+          )}
           <p className="col-span-2 text-sm text-navy/70">
             Total:{' '}
             <strong>
-              {formatCurrency(((Number(pay.principal) || 0) + (Number(pay.interest) || 0) + (Number(pay.escrow) || 0)).toFixed(2))}
+              {formatCurrency(((Number(pay.principal) || 0) + (Number(pay.interest) || 0) + (Number(pay.escrow) || 0)).toFixed(2), detail?.currency ?? undefined)}
             </strong>
           </p>
         </div>

@@ -29,6 +29,7 @@ import {
   paymentsReceived,
   salesReceiptLines,
   salesReceipts,
+  vendorCreditApplications,
   vendorCredits,
   vendors,
 } from '@/lib/db/schema';
@@ -39,6 +40,9 @@ import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
 import { journalCreditsAppliedAfter, journalOpenItems, resolveEntityNames } from './journal';
 import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
+import { vendorCreditHomeByBill, vendorCreditRefundsAfter } from './vendorCreditsFx';
+import { foreignInvoiceHomeOpen } from './fxSubledger';
+import { getHomeCurrencyCode } from './currencies';
 
 /**
  * Credit-memo refunds dated AFTER the cutoff, per memo id. creditMemos.unapplied is today's
@@ -101,58 +105,6 @@ async function creditMemoApplicationsAfter(
     addTo(byMemo, r.memoId, a);
   }
   return { byInvoice, byMemo };
-}
-
-/**
- * Vendor-credit applications to bills (vendorCredits.applyToBill / unapplyFromBill) that take
- * effect AFTER the cutoff, per bill and per credit. Those write no GL entry and no dated link row;
- * the audit trail records which (credit, bill, amount) pairs were applied or unapplied. The
- * application itself is undated (applyToBill takes no date), so it is effective from the later of
- * the credit's and the bill's own dates: before the credit existed it cannot have reduced the
- * bill, and from then on the bill and the credit move together, so aging always ties to the A/P
- * account. Applications and unapplications of the same pair net out.
- *
- * Known difference: the cash-basis engine (cashBasisLedger.ts) dates the same application by the
- * day it was entered (audit timestamp), not by the document dates. Both tie to A/P in their own
- * basis; a dated application row would let them agree exactly (deferred, outside this team).
- */
-async function vendorCreditApplicationsAfter(
-  ctx: ServiceContext,
-  cutoff: Date,
-): Promise<{ byBill: Map<string, Dec>; byCredit: Map<string, Dec> }> {
-  const byBill = new Map<string, Dec>();
-  const byCredit = new Map<string, Dec>();
-  const rows = await ctx.db
-    .select({ creditId: auditLogs.entityId, newValues: auditLogs.newValues })
-    .from(auditLogs)
-    .where(
-      and(
-        eq(auditLogs.companyId, ctx.companyId),
-        eq(auditLogs.entityType, 'vendor_credit'),
-        sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
-      ),
-    );
-  if (!rows.length) return { byBill, byCredit };
-  const creditDate = new Map(
-    (await ctx.db.select({ id: vendorCredits.id, date: vendorCredits.date }).from(vendorCredits).where(eq(vendorCredits.companyId, ctx.companyId))).map((c) => [c.id, c.date]),
-  );
-  const billDate = new Map(
-    (await ctx.db.select({ id: bills.id, date: bills.date }).from(bills).where(eq(bills.companyId, ctx.companyId))).map((b) => [b.id, b.date]),
-  );
-  for (const r of rows) {
-    const nv = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
-    if (!nv.billId || !r.creditId) continue;
-    const cd = creditDate.get(r.creditId);
-    const bd = billDate.get(nv.billId);
-    if (!cd || !bd) continue;
-    const eff = cd > bd ? cd : bd;
-    if (!(eff > cutoff)) continue;
-    const a = Money.of(nv.amount ?? '0');
-    const signed = nv.action === 'applied_to_bill' ? a : a.negated();
-    addTo(byBill, nv.billId, signed);
-    addTo(byCredit, r.creditId, signed);
-  }
-  return { byBill, byCredit };
 }
 
 /**
@@ -409,6 +361,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       amountPaid: invoices.amountPaid,
       dueDate: invoices.dueDate,
       date: invoices.date,
+      currency: invoices.currency,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
@@ -446,6 +399,8 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     paymentAppliedByInvoice(),
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
+  // p1 fx: foreign invoices are aged at the HOME amount A/R still carries (ties to the account).
+  const foreignOpen = await foreignInvoiceHomeOpen(ctx, cutoff);
   const memoAppsLater = await creditMemoApplicationsAfter(ctx, cutoff);
 
   // Accumulate per customer.
@@ -467,8 +422,18 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .minus(memoAppsLater.byInvoice.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    const amount = billedBase.minus(cashAsOf).minus(creditResidual);
+    // p1 fx: a foreign invoice's payments count on the date they were APPLIED (an apply made
+    // after the cutoff had not reduced it yet), so whether it was open is decided from its as-of
+    // foreign open amount, and it is aged at the home amount A/R still carries for it.
+    const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    // Legacy home memos on a foreign invoice are already off its foreign open amount.
+    if (fo && fo.memoApplied.greaterThan(0)) {
+      creditResidual = creditResidual.minus(fo.memoApplied);
+      if (creditResidual.lessThan(0)) creditResidual = Money.zero();
+    }
+    let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
+    if (fo) amount = fo.homeOpen;
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const daysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
@@ -542,13 +507,159 @@ async function billPaymentHomeAppliedByBill(ctx: ServiceContext, upTo: Date): Pr
     .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
     .where(and(eq(billPayments.companyId, ctx.companyId), lte(billPayments.date, upTo)))
     .groupBy(billPaymentApplications.billId);
-  return new Map(appRows.map((r) => [r.billId, r.applied]));
+  const out = new Map(appRows.map((r) => [r.billId, r.applied]));
+  // p1 fx: foreign vendor credits applied to a bill relieved home A/P too.
+  for (const [billId, home] of await vendorCreditHomeByBill(ctx, upTo)) {
+    out.set(billId, toAmountString(Money.of(out.get(billId) ?? '0').plus(home)));
+  }
+  return out;
 }
 
 /** Home open balance = round2(total x rate) - home A/P already relieved (same anchor billPayments uses). */
 function billHomeOpen(row: { total: string; exchangeRate: string | null }, homeApplied: string | undefined) {
   const anchor = Money.round2(Money.of(row.total).times(Money.of(row.exchangeRate ?? 1)));
   return Money.round2(anchor.minus(Money.of(homeApplied ?? '0')));
+}
+
+/**
+ * Vendor-credit activity dated AFTER the cutoff — one engine for home and foreign credits. On the
+ * cutoff date none of it had happened yet: the bill still owed what a later application took off
+ * it, and the credit still held what a later application or refund used up. Per bill: the
+ * transaction-currency amount applied later (unapplies negative). Per credit: the later
+ * applications plus refunds, in the credit's currency (`foreign`) and as the home A/P they took
+ * from the credit (`home`; equal to `foreign` for a home credit).
+ *
+ * - Foreign credits: every application / unapply is a dated vendor_credit_applications row (its
+ *   date is never before the credit or the bill — vendorCreditApplicationDate).
+ * - Home credits: applyToBill / unapplyFromBill write no GL and no link row; the audit trail holds
+ *   each (credit, bill, amount). Such an application is effective from the later of the credit's
+ *   and the bill's own dates: before the credit existed it cannot have reduced the bill, and from
+ *   then on bill and credit move together, so the aging always ties to the A/P account.
+ *   (Known difference: the cash-basis engine dates it by the day it was entered.)
+ * - Refunds (home and foreign): the refund entry (sourceRef refund:<creditId>, dated) credits A/P
+ *   with the home value it took from the credit; a foreign refund's credit-currency amount is on
+ *   its audit row (postedEntryId).
+ */
+async function vendorCreditActivityAfter(ctx: ServiceContext, cutoff: Date) {
+  const byBill = new Map<string, Dec>();
+  const byCredit = new Map<string, { foreign: Dec; home: Dec }>();
+  const addCredit = (id: string, foreign: Dec, home: Dec) => {
+    const c = byCredit.get(id) ?? { foreign: Money.zero(), home: Money.zero() };
+    byCredit.set(id, { foreign: c.foreign.plus(foreign), home: c.home.plus(home) });
+  };
+
+  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const credits = await ctx.db
+    .select({ id: vendorCredits.id, date: vendorCredits.date, currency: vendorCredits.currency })
+    .from(vendorCredits)
+    .where(eq(vendorCredits.companyId, ctx.companyId));
+  const creditById = new Map(credits.map((c) => [c.id, c] as const));
+  const isForeign = (id: string) => {
+    const cur = (creditById.get(id)?.currency ?? '').trim().toUpperCase();
+    return cur !== '' && cur !== home;
+  };
+
+  // 1) Foreign credits: dated application rows.
+  const appRows = await ctx.db
+    .select({
+      billId: vendorCreditApplications.billId,
+      creditId: vendorCreditApplications.vendorCreditId,
+      amount: vendorCreditApplications.amount,
+      homeCredit: vendorCreditApplications.homeCredit,
+    })
+    .from(vendorCreditApplications)
+    .where(and(eq(vendorCreditApplications.companyId, ctx.companyId), gt(vendorCreditApplications.date, cutoff)));
+  for (const r of appRows) {
+    addTo(byBill, r.billId, Money.of(r.amount));
+    addCredit(r.creditId, Money.of(r.amount), Money.of(r.homeCredit));
+  }
+
+  // 2) Home credits: audited applications, effective from max(credit date, bill date).
+  const auditRows = await ctx.db
+    .select({ creditId: auditLogs.entityId, newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'vendor_credit'),
+        sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
+      ),
+    );
+  if (auditRows.length) {
+    const billDate = new Map(
+      (await ctx.db.select({ id: bills.id, date: bills.date }).from(bills).where(eq(bills.companyId, ctx.companyId))).map(
+        (b) => [b.id, b.date] as const,
+      ),
+    );
+    for (const r of auditRows) {
+      const nv = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
+      if (!nv.billId || !r.creditId || isForeign(r.creditId)) continue;
+      const cd = creditById.get(r.creditId)?.date;
+      const bd = billDate.get(nv.billId);
+      if (!cd || !bd) continue;
+      const eff = cd > bd ? cd : bd;
+      if (!(eff > cutoff)) continue;
+      const a = Money.of(nv.amount ?? '0');
+      const signed = nv.action === 'applied_to_bill' ? a : a.negated();
+      addTo(byBill, nv.billId, signed);
+      addCredit(r.creditId, signed, signed);
+    }
+  }
+
+  // 3) Refunds dated after the cutoff (shared with the foreign payables subledger / HCA).
+  for (const [creditId, r] of await vendorCreditRefundsAfter(ctx, cutoff)) addCredit(creditId, r.foreign, r.home);
+
+  return { byBill, byCredit };
+}
+
+/**
+ * Vendor credits open as of the cutoff (dated on/before it), each with what it still held then in
+ * its own currency (`foreignOpen`) and the home A/P that carried (`homeOpen`): today's unapplied
+ * plus the applications and refunds made after the cutoff (vendorCreditActivityAfter). A foreign
+ * credit's home part is homeUnapplied; a home credit's is its unapplied amount.
+ */
+async function vendorCreditsOpenAsOf(
+  ctx: ServiceContext,
+  cutoff: Date,
+  later: Awaited<ReturnType<typeof vendorCreditActivityAfter>>['byCredit'],
+) {
+  const rows = await ctx.db
+    .select({
+      id: vendorCredits.id,
+      vendorId: vendorCredits.vendorId,
+      vendorName: vendors.displayName,
+      date: vendorCredits.date,
+      currency: vendorCredits.currency,
+      exchangeRate: vendorCredits.exchangeRate,
+      unapplied: vendorCredits.unapplied,
+      homeUnapplied: vendorCredits.homeUnapplied,
+    })
+    .from(vendorCredits)
+    .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
+    .where(
+      and(
+        eq(vendorCredits.companyId, ctx.companyId),
+        ne(vendorCredits.status, 'void'),
+        lte(vendorCredits.date, cutoff),
+      ),
+    );
+  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const out: Array<(typeof rows)[number] & { foreignOpen: Dec; homeOpen: Dec }> = [];
+  for (const r of rows) {
+    const cur = (r.currency ?? '').trim().toUpperCase();
+    const foreign = cur !== '' && cur !== home;
+    const l = later.get(r.id);
+    const foreignOpen = Money.round2(Money.of(r.unapplied).plus(l?.foreign ?? Money.zero()));
+    if (!foreignOpen.greaterThan(0)) continue;
+    const homeNow = foreign
+      ? r.homeUnapplied != null
+        ? Money.of(r.homeUnapplied)
+        : Money.round2(Money.of(r.unapplied).times(Money.of(r.exchangeRate ?? 1)))
+      : Money.of(r.unapplied);
+    const homeOpen = Money.round2(homeNow.plus(l?.home ?? Money.zero()));
+    out.push({ ...r, currency: foreign ? cur : null, foreignOpen, homeOpen });
+  }
+  return out;
 }
 
 export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
@@ -599,11 +710,9 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     billPaymentAppliedByBill(),
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
-  const vcAppsLater = await vendorCreditApplicationsAfter(ctx, cutoff);
-  // Vendor refunds dated after the cutoff (JE sourceRef 'refund:<vendorCreditId>', Dr Bank / Cr A/P,
-  // so the debit sum is the refund amount) had not consumed the credit yet on the cutoff date.
-  const vcRefundsLater = await creditMemoRefundsAfter(ctx, cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
+  // Vendor-credit applications, unapplies and refunds dated after the cutoff (home and foreign).
+  const vcLater = await vendorCreditActivityAfter(ctx, cutoff);
 
   const byVendor = new Map<string, { name: string; buckets: BucketAccum }>();
 
@@ -617,8 +726,8 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .minus(cashAllTime)
       // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
       .minus(journalCreditsLater.get(row.billId) ?? Money.zero())
-      // Vendor credits applied after the cutoff had not reduced the bill yet either.
-      .minus(vcAppsLater.byBill.get(row.billId) ?? Money.zero());
+      // Vendor credits (home and foreign) applied after the cutoff had not reduced the bill yet either.
+      .minus(vcLater.byBill.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
@@ -637,35 +746,14 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     byVendor.get(row.vendorId)!.buckets[key] = byVendor.get(row.vendorId)!.buckets[key].plus(amount);
   }
 
-  // Unapplied vendor credits reduce net payables — negative 'current' rows.
-  // Applications and refunds made after the cutoff are added back (the credit was still open then).
-  const creditRows = await ctx.db
-    .select({
-      id: vendorCredits.id,
-      vendorId: vendorCredits.vendorId,
-      vendorName: vendors.displayName,
-      unapplied: vendorCredits.unapplied,
-    })
-    .from(vendorCredits)
-    .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
-    .where(
-      and(
-        eq(vendorCredits.companyId, ctx.companyId),
-        ne(vendorCredits.status, 'void'),
-        lte(vendorCredits.date, cutoff),
-      ),
-    );
-
-  for (const credit of creditRows) {
-    const open = Money.of(credit.unapplied)
-      .plus(vcAppsLater.byCredit.get(credit.id) ?? Money.zero())
-      .plus(Money.of(vcRefundsLater.get(credit.id) ?? '0'));
-    if (!open.greaterThan(0)) continue;
+  // Unapplied vendor credits reduce net payables — negative 'current' rows, each at the home A/P
+  // it carried on the cutoff date (applications and refunds made after it are added back).
+  for (const credit of await vendorCreditsOpenAsOf(ctx, cutoff, vcLater.byCredit)) {
     if (!byVendor.has(credit.vendorId)) {
       byVendor.set(credit.vendorId, { name: credit.vendorName, buckets: blankBuckets() });
     }
     const buckets = byVendor.get(credit.vendorId)!.buckets;
-    buckets.current = buckets.current.minus(open);
+    buckets.current = buckets.current.minus(credit.homeOpen);
   }
 
   await addJournalItemsToAging(ctx, 'ap', cutoff, byVendor);
@@ -1062,6 +1150,9 @@ export interface AgingDetailRow {
   bucket: BucketKey;
   /** Open balance as of the cutoff (negative for unapplied credits). */
   openBalance: string;
+  /** p1 fx: foreign-currency document — its currency and open balance in that currency. */
+  currency?: string | null;
+  foreignOpenBalance?: string | null;
 }
 
 export interface AgingDetailReport {
@@ -1121,6 +1212,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       amountPaid: invoices.amountPaid,
       dueDate: invoices.dueDate,
       date: invoices.date,
+      currency: invoices.currency,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
@@ -1156,6 +1248,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     paymentAppliedByInvoice(),
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
+  const foreignOpen = await foreignInvoiceHomeOpen(ctx, cutoff);
   const memoAppsLater = await creditMemoApplicationsAfter(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
@@ -1171,12 +1264,23 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .minus(memoAppsLater.byInvoice.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
-    const amount = billedBase.minus(cashAsOf).minus(creditResidual);
+    // p1 fx: home amount A/R carries, with the foreign open amount alongside. Whether a foreign
+    // invoice was open is decided from its as-of foreign open amount (payments count on the date
+    // they were applied), as in arAging.
+    const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    // Legacy home memos on a foreign invoice are already off its foreign open amount.
+    if (fo && fo.memoApplied.greaterThan(0)) {
+      creditResidual = creditResidual.minus(fo.memoApplied);
+      if (creditResidual.lessThan(0)) creditResidual = Money.zero();
+    }
+    let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
+    if (fo) amount = fo.homeOpen;
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
+      ...(fo ? { currency: fo.currency, foreignOpenBalance: toAmountString(fo.foreignOpen) } : {}),
       docId: row.invoiceId,
       docNumber: `Invoice #${docRef(row.refNumber, row.invoiceNumber)}`,
       docType: 'invoice',
@@ -1280,11 +1384,9 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     billPaymentAppliedByBill(),
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
-  const vcAppsLater = await vendorCreditApplicationsAfter(ctx, cutoff);
-  // Vendor refunds dated after the cutoff (JE sourceRef 'refund:<vendorCreditId>', Dr Bank / Cr A/P,
-  // so the debit sum is the refund amount) had not consumed the credit yet on the cutoff date.
-  const vcRefundsLater = await creditMemoRefundsAfter(ctx, cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
+  // Vendor-credit applications, unapplies and refunds dated after the cutoff (home and foreign).
+  const vcLater = await vendorCreditActivityAfter(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
@@ -1295,19 +1397,21 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .minus(cashAllTime)
       // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
       .minus(journalCreditsLater.get(row.billId) ?? Money.zero())
-      // Vendor credits applied after the cutoff had not reduced the bill yet either.
-      .minus(vcAppsLater.byBill.get(row.billId) ?? Money.zero());
+      // Vendor credits (home and foreign) applied after the cutoff had not reduced the bill yet either.
+      .minus(vcLater.byBill.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     let amount = Money.of(row.total).minus(cashAsOf).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
     // J10 (wave2 purchases): age foreign bills at their HOME open balance so the report ties to
     // the A/P control account: round2(total x bill rate) minus the home A/P each payment relieved.
+    const foreignOpenBalance = row.currency ? toAmountString(amount) : null; // p1 fx
     if (row.currency) amount = billHomeOpen(row, homeAppliedAsOf.get(row.billId));
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
     const rawDaysPastDue = ms_to_days(cutoff.getTime() - effectiveDue.getTime());
     detail.push({
+      ...(row.currency ? { currency: row.currency, foreignOpenBalance } : {}),
       docId: row.billId,
       docNumber: row.billNumber ? `Bill ${row.billNumber}` : 'Bill',
       docType: 'bill',
@@ -1321,29 +1425,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     });
   }
 
-  const creditRows = await ctx.db
-    .select({
-      id: vendorCredits.id,
-      vendorId: vendorCredits.vendorId,
-      vendorName: vendors.displayName,
-      date: vendorCredits.date,
-      unapplied: vendorCredits.unapplied,
-    })
-    .from(vendorCredits)
-    .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
-    .where(
-      and(
-        eq(vendorCredits.companyId, ctx.companyId),
-        ne(vendorCredits.status, 'void'),
-        lte(vendorCredits.date, cutoff),
-      ),
-    );
-  for (const c of creditRows) {
-    // Applications and refunds made after the cutoff are added back (the credit was still open then).
-    const open = Money.of(c.unapplied)
-      .plus(vcAppsLater.byCredit.get(c.id) ?? Money.zero())
-      .plus(Money.of(vcRefundsLater.get(c.id) ?? '0'));
-    if (!open.greaterThan(0)) continue;
+  for (const c of await vendorCreditsOpenAsOf(ctx, cutoff, vcLater.byCredit)) {
     detail.push({
       docId: c.id,
       docNumber: 'Vendor Credit',
@@ -1354,7 +1436,8 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       dueDate: null,
       daysPastDue: 0,
       bucket: 'current',
-      openBalance: toAmountString(open.negated()),
+      ...(c.currency ? { currency: c.currency, foreignOpenBalance: toAmountString(c.foreignOpen.negated()) } : {}),
+      openBalance: toAmountString(c.homeOpen.negated()),
     });
   }
 

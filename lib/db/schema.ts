@@ -118,6 +118,12 @@ export const journalEntryLines = pgTable('journal_entry_lines', {
   entityType: varchar('entity_type', { length: 20 }),
   /** Id of the customer / vendor / employee / other name (polymorphic, no FK). */
   entityId: uuid('entity_id'),
+  /** p1 fx (0043): account-currency amount of a line on a foreign-currency bank / credit-card
+   * account (same side as debit/credit; 0 = a home-currency-only revaluation line), its currency
+   * and the home units per 1 foreign unit. Null on home-currency lines. */
+  currency: varchar('currency', { length: 3 }),
+  foreignAmount: decimal('foreign_amount', { precision: 15, scale: 2 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -791,6 +797,13 @@ export const transfers = pgTable('transfers', {
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   /** wave2 purchases: transfers can be voided (reverses the entry). */
   voidedAt: timestamp('voided_at'),
+  /** p1 fx (0043): `amount` is in the FROM account's currency (null = home); `toAmount` in the
+   * TO account's currency; `homeAmount` is what both GL lines carry in home currency. */
+  currency: varchar('currency', { length: 3 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
+  toCurrency: varchar('to_currency', { length: 3 }),
+  toAmount: decimal('to_amount', { precision: 15, scale: 2 }),
+  homeAmount: decimal('home_amount', { precision: 15, scale: 2 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1066,6 +1079,12 @@ export const vendorCredits = pgTable('vendor_credits', {
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   /** p1 purchases: the vendor's credit memo number (QB "Ref. No."). */
   refNumber: varchar('ref_number', { length: 50 }),
+  /** p1 fx (0043): credit currency (null = home), home units per 1 unit, home A/P debited and
+   * the home part of it still unapplied (total/unapplied above stay in the credit's currency). */
+  currency: varchar('currency', { length: 3 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
+  homeTotal: decimal('home_total', { precision: 15, scale: 2 }),
+  homeUnapplied: decimal('home_unapplied', { precision: 15, scale: 2 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1296,6 +1315,10 @@ export const deposits = pgTable('deposits', {
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   voidedAt: timestamp('voided_at'),
+  /** p1 fx (0043): deposit currency = the bank account's (null = home); `total` stays in it. */
+  currency: varchar('currency', { length: 3 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
+  homeTotal: decimal('home_total', { precision: 15, scale: 2 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1318,6 +1341,57 @@ export const currencies = pgTable('currencies', {
   rateToBase: decimal('rate_to_base', { precision: 18, scale: 8 }).notNull().default('1'),
   isBase: boolean('is_base').notNull().default(false),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+// ---- p1 fx (0043): foreign vendor-credit applications + Home Currency Adjustments ----
+/** One application (or, with negative amounts, an unapply) of a foreign vendor credit to a bill. */
+export const vendorCreditApplications = pgTable('vendor_credit_applications', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  vendorCreditId: uuid('vendor_credit_id').references(() => vendorCredits.id).notNull(),
+  billId: uuid('bill_id').references(() => bills.id).notNull(),
+  date: timestamp('date').notNull(),
+  /** Transaction-currency amount (negative = unapplied). */
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  /** Home A/P relieved on the bill (at the bill's rate) and taken from the credit (at its rate). */
+  homeBill: decimal('home_bill', { precision: 15, scale: 2 }).notNull(),
+  homeCredit: decimal('home_credit', { precision: 15, scale: 2 }).notNull(),
+  fxEntryId: uuid('fx_entry_id').references(() => journalEntries.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** QB Home Currency Adjustment: revalue foreign balances as of a date at entered rates. */
+export const homeCurrencyAdjustments = pgTable('home_currency_adjustments', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  date: timestamp('date').notNull(),
+  memo: text('memo'),
+  rates: jsonb('rates').$type<Record<string, string>>().notNull(),
+  detail: jsonb('detail').$type<unknown[]>().notNull(),
+  total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
+  entryId: uuid('entry_id').references(() => journalEntries.id, { onDelete: 'set null' }),
+  reversalEntryId: uuid('reversal_entry_id').references(() => journalEntries.id, { onDelete: 'set null' }),
+  voidedAt: timestamp('voided_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * p1 fx (0043): home A/R relieved on a foreign-currency invoice by a received payment (receive,
+ * apply later, or - negative - unapply). The home amount still open on the invoice is its own A/R
+ * line minus these rows (fxSubledger.ts), so the last payment clears exactly what is left on A/R.
+ * Rows are deleted when the payment is voided or edited (its entries are voided with it).
+ */
+export const paymentFxReliefs = pgTable('payment_fx_reliefs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  paymentId: uuid('payment_id').references(() => paymentsReceived.id).notNull(),
+  invoiceId: uuid('invoice_id').references(() => invoices.id).notNull(),
+  date: timestamp('date').notNull(),
+  /** Invoice-currency amount (applied + discount; negative = unapplied). */
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  /** Home A/R relieved on the invoice (negative = put back). */
+  homeAmount: decimal('home_amount', { precision: 15, scale: 2 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
 // ---- Sales reps & commissions ----
@@ -2201,6 +2275,9 @@ export const loans = pgTable('loans', {
   escrowAmount: decimal('escrow_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   notes: text('notes'),
   isActive: boolean('is_active').notNull().default(true),
+  /** p1 fx (0043): loan currency (null = home) and the rate the loan was booked at. */
+  currency: varchar('currency', { length: 3 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -2220,6 +2297,9 @@ export const loanPayments = pgTable('loan_payments', {
   kind: varchar('kind', { length: 10 }).notNull(),
   expenseId: uuid('expense_id').references(() => expenses.id),
   billId: uuid('bill_id').references(() => bills.id),
+  /** p1 fx (0043): payment rate and the realized exchange gain/loss entry on the principal. */
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
+  fxEntryId: uuid('fx_entry_id').references(() => journalEntries.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 // ---- wave2 accountant ----

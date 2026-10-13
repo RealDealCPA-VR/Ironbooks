@@ -42,6 +42,29 @@ function errorResponse(err: unknown) {
 
 type RouteContext = { params: Promise<{ id: string }> };
 
+/**
+ * Reads an optional date from the request body. Missing means "today" (null); anything that is
+ * not a real calendar date (e.g. "not-a-date", "2026-13-45") is a validation error, not a crash.
+ */
+function readDate(value: unknown): Date | null {
+  if (value === undefined || value === null || value === '') return null;
+  const bad = () => new ServiceError('VALIDATION', 'Enter a valid date (for example 2026-07-15).');
+  if (typeof value !== 'string' && typeof value !== 'number') throw bad();
+  const input: string | number = typeof value === 'string' ? value.trim() : value;
+  if (typeof input === 'string') {
+    // Only a calendar date, optionally with a time and zone. Anything else (e.g. trailing junk
+    // like '2026-07-15junk', which JS would read leniently as another date) is refused.
+    const m = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.exec(input);
+    if (!m) throw bad();
+    const [y, mo, da] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    const probe = new Date(Date.UTC(y, mo - 1, da));
+    if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== da) throw bad();
+  }
+  const out = new Date(input);
+  if (Number.isNaN(out.getTime())) throw bad();
+  return out;
+}
+
 export async function GET(_req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
@@ -70,8 +93,9 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         vendorCreditId: id,
         bankAccountId: body.bankAccountId,
         amount: body.amount,
-        date: body.date ? new Date(body.date) : null,
+        date: readDate(body.date),
         memo: body.memo ?? null,
+        exchangeRate: body.exchangeRate ?? null,
       });
       return NextResponse.json(result);
     }
@@ -94,6 +118,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       vendorCreditId: id,
       billId: body.billId,
       amount: body.amount,
+      date: readDate(body.date),
     });
 
     return NextResponse.json(result);

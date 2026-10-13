@@ -14,16 +14,20 @@
  *     The document is created through createExpense / createBill, so it posts through
  *     postJournalEntry like any other check or bill (balanced, closing-date checked, audited).
  *
- * Loan Manager payments are HOME-CURRENCY only: the loan schedule (and loan_payments) is kept
- * in home currency, so a lender vendor or payment account in another currency is refused with a
- * plain message instead of posting a converted amount that would drift from the schedule.
+ * p1 fx — foreign-currency loans: a loan is in its lender's currency (or a stated currency). The
+ * schedule and loan_payments are kept in that currency; `exchangeRate` is the rate the loan was
+ * booked at (home units per 1 unit). A payment is written as a check from a bank account in the
+ * loan's currency (or a bill to the lender) and converted at the payment's rate; the principal is
+ * taken off the liability at the BOOKED rate, so the difference is posted as a realized exchange
+ * gain/loss (sourceRef loan:<id>, stored on loan_payments.fx_entry_id). Voiding the payment
+ * through voidLoanPayment voids that entry too.
  *
  * The remaining balance is derived from the payments whose check/bill is NOT void, so voiding a
  * loan payment's check automatically puts that principal back on the schedule.
  */
 import { and, asc, desc, eq } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
-import { accounts, bills, expenses, loanPayments, loans, vendors } from '@/lib/db/schema';
+import { accounts, bills, expenses, journalEntries, loanPayments, loans, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -33,9 +37,11 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { createExpense } from './expenses';
-import { createBill } from './bills';
-import { getHomeCurrencyCode } from './currencies';
+import { createExpense, voidExpense } from './expenses';
+import { createBill, voidBill } from './bills';
+import { getHomeCurrencyCode, homeAmounts } from './currencies';
+import { postJournalEntry, voidJournalEntry } from './posting';
+import { currencyRate, exchangeGainLossLine, foreignCode, toHome } from './exchangeRates';
 
 export const PAYMENT_FREQUENCIES: Record<number, string> = {
   1: 'Annually',
@@ -63,6 +69,9 @@ export interface LoanInput {
   firstPaymentDate: Date;
   escrowAmount?: string | number | null;
   notes?: string | null;
+  /** p1 fx: loan currency (default: the lender's currency) and the rate it was booked at. */
+  currency?: string | null;
+  exchangeRate?: string | number | null;
 }
 
 export interface ScheduleRow {
@@ -210,14 +219,29 @@ async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
   if (escrow.greaterThan(0) && !input.escrowAccountId) {
     throw validation('Pick an escrow account for the escrow part of each payment.');
   }
+  let lenderCurrency: string | null = null;
+  const home = await getHomeCurrencyCode(ctx);
   if (input.lenderVendorId) {
     const [v] = await ctx.db
-      .select({ id: vendors.id })
+      .select({ id: vendors.id, currency: vendors.currency })
       .from(vendors)
       .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.id, input.lenderVendorId)));
     if (!v) throw notFound('Lender');
+    lenderCurrency = foreignCode(v.currency, home);
   }
-  return { amount, rate, ppy, escrow };
+  // p1 fx: the loan's currency is the lender's (QB: a vendor's transactions are in its currency).
+  const stated = input.currency !== undefined && input.currency !== null && String(input.currency).trim() !== ''
+    ? foreignCode(input.currency, home)
+    : undefined;
+  const currency = stated !== undefined ? stated : lenderCurrency;
+  if (input.lenderVendorId && currency !== lenderCurrency) {
+    throw validation(
+      `The lender uses ${lenderCurrency ?? home ?? 'your home currency'}, so the loan must be in ${lenderCurrency ?? home ?? 'your home currency'} too.`,
+    );
+  }
+  const fx = currency ? await currencyRate(ctx, currency, input.exchangeRate) : null;
+  // The payment account's currency is checked when a payment is set up (assertLoanPaymentCurrency).
+  return { amount, rate, ppy, escrow, currency, fxRate: fx ? fx.rate.toFixed(8) : null };
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +269,8 @@ export async function createLoan(ctx: ServiceContext, input: LoanInput) {
         firstPaymentDate: input.firstPaymentDate,
         escrowAmount: toAmountString(v.escrow),
         notes: input.notes ?? null,
+        currency: v.currency,
+        exchangeRate: v.fxRate,
       })
       .returning();
     await writeAudit(tx, { action: 'create', entityType: 'loan', entityId: loan.id, newValues: loan });
@@ -277,6 +303,8 @@ export async function updateLoan(ctx: ServiceContext, id: string, input: LoanInp
         firstPaymentDate: input.firstPaymentDate,
         escrowAmount: toAmountString(v.escrow),
         notes: input.notes ?? null,
+        currency: v.currency,
+        exchangeRate: v.fxRate,
         updatedAt: new Date(),
       })
       .where(eq(loans.id, id))
@@ -421,6 +449,8 @@ export interface SetUpPaymentInput {
   toPrint?: boolean;
   memo?: string | null;
   dueDate?: Date | null;
+  /** p1 fx: foreign loan — home units per 1 unit on the payment date (default: the list rate). */
+  exchangeRate?: string | number | null;
 }
 
 /**
@@ -431,39 +461,92 @@ export interface SetUpPaymentInput {
  * Loan payments are kept in home currency (the schedule, loan_payments and the liability all
  * agree). Refuse a foreign-currency lender or payment account rather than post converted amounts.
  */
-async function assertHomeCurrencyLoanPayment(
+async function assertLoanPaymentCurrency(
   ctx: ServiceContext,
+  loanCurrency: string | null,
   refs: { lenderVendorId: string | null; paymentAccountId: string | null },
 ) {
   const home = await getHomeCurrencyCode(ctx);
-  const foreign = (c: string | null | undefined) => {
-    const v = (c ?? '').trim().toUpperCase();
-    return v !== '' && v !== (home ?? '') ? v : null;
-  };
+  const loanLabel = loanCurrency ?? home ?? 'your home currency';
   if (refs.lenderVendorId) {
     const [v] = await ctx.db
       .select({ currency: vendors.currency })
       .from(vendors)
       .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.id, refs.lenderVendorId)));
-    const cur = foreign(v?.currency);
-    if (cur) {
+    const cur = foreignCode(v?.currency ?? null, home);
+    if (cur !== loanCurrency) {
       throw validation(
-        `This loan's lender uses ${cur}. The Loan Manager only handles payments in your home currency, so enter this payment as a regular ${cur} check or bill instead.`,
+        `This loan is in ${loanLabel} but its lender uses ${cur ?? 'your home currency'}. Edit the loan so both use the same currency.`,
       );
     }
   }
   if (refs.paymentAccountId) {
     const [a] = await ctx.db
-      .select({ currency: accounts.currency })
+      .select({ currency: accounts.currency, name: accounts.name })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, refs.paymentAccountId)));
-    const cur = foreign(a?.currency);
-    if (cur) {
+    const cur = foreignCode(a?.currency ?? null, home);
+    if (cur !== loanCurrency) {
       throw validation(
-        `The payment account is a ${cur} account. The Loan Manager only handles payments in your home currency, so pick a home-currency bank account.`,
+        `This loan is in ${loanLabel}, so its payments must come from a ${loanCurrency ?? 'home-currency'} bank account. "${a?.name ?? 'That account'}" uses ${cur ?? 'your home currency'}.`,
       );
     }
   }
+}
+
+/**
+ * p1 fx: a loan payment whose check / bill was voided outside the Loan Manager leaves its realized
+ * exchange gain/loss entry behind — void those (called before every new payment and by HCA).
+ */
+export async function voidOrphanLoanFx(ctx: ServiceContext, loanId?: string): Promise<number> {
+  const rows = await ctx.db
+    .select({
+      id: loanPayments.id,
+      fxEntryId: loanPayments.fxEntryId,
+      kind: loanPayments.kind,
+      expenseVoidedAt: expenses.voidedAt,
+      billStatus: bills.status,
+      entryStatus: journalEntries.status,
+    })
+    .from(loanPayments)
+    .leftJoin(expenses, eq(loanPayments.expenseId, expenses.id))
+    .leftJoin(bills, eq(loanPayments.billId, bills.id))
+    .innerJoin(journalEntries, eq(loanPayments.fxEntryId, journalEntries.id))
+    .where(and(eq(loanPayments.companyId, ctx.companyId), ...(loanId ? [eq(loanPayments.loanId, loanId)] : [])));
+  let n = 0;
+  for (const r of rows) {
+    const docVoid = r.kind === 'check' ? !!r.expenseVoidedAt : r.billStatus === 'void';
+    if (docVoid && r.entryStatus === 'posted' && r.fxEntryId) {
+      await voidJournalEntry(ctx, r.fxEntryId);
+      n += 1;
+    }
+  }
+  return n;
+}
+
+/** Void a Loan Manager payment: its check or bill and its exchange gain/loss entry together. */
+export async function voidLoanPayment(ctx: ServiceContext, loanId: string, paymentId: string) {
+  const [lp] = await ctx.db
+    .select()
+    .from(loanPayments)
+    .where(and(eq(loanPayments.companyId, ctx.companyId), eq(loanPayments.loanId, loanId), eq(loanPayments.id, paymentId)));
+  if (!lp) throw notFound('Loan payment');
+  return inTransaction(ctx, async (tx) => {
+    if (lp.kind === 'check' && lp.expenseId) await voidExpense(tx, lp.expenseId);
+    if (lp.kind === 'bill' && lp.billId) await voidBill(tx, lp.billId);
+    if (lp.fxEntryId) {
+      const [e] = await tx.db.select({ status: journalEntries.status }).from(journalEntries).where(eq(journalEntries.id, lp.fxEntryId));
+      if (e?.status === 'posted') await voidJournalEntry(tx, lp.fxEntryId);
+    }
+    await writeAudit(tx, {
+      action: 'void',
+      entityType: 'loan_payment',
+      entityId: lp.id,
+      oldValues: { loanId, paymentNumber: lp.paymentNumber, total: lp.total },
+      newValues: { voided: true },
+    });
+    return lp;
+  });
 }
 
 export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, input: SetUpPaymentInput) {
@@ -502,12 +585,17 @@ export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, inpu
     accountLines.push({ accountId: loan.escrowAccountId, amount: toAmountString(escrow), description: `Escrow — ${loan.name}` });
   }
 
-  await assertHomeCurrencyLoanPayment(ctx, {
+  const loanCurrency = loan.currency ?? null;
+  await assertLoanPaymentCurrency(ctx, loanCurrency, {
     lenderVendorId: loan.lenderVendorId ?? null,
     paymentAccountId: input.kind === 'check' ? (input.paymentAccountId ?? loan.paymentAccountId ?? null) : null,
   });
+  // p1 fx: the payment's rate; the principal comes off the liability at the loan's booked rate.
+  const payFx = loanCurrency ? await currencyRate(ctx, loanCurrency, input.exchangeRate) : null;
+  const fxDocFields = payFx ? { currency: payFx.currency, exchangeRate: payFx.rate.toFixed(8) } : {};
 
   return inTransaction(ctx, async (tx) => {
+    await voidOrphanLoanFx(tx, loanId);
     let expenseId: string | null = null;
     let billId: string | null = null;
     if (input.kind === 'check') {
@@ -524,6 +612,7 @@ export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, inpu
         toPrint: input.toPrint,
         lines: accountLines,
         checkDuplicateNumber: Boolean(input.reference),
+        ...fxDocFields,
       });
       expenseId = exp.id;
     } else {
@@ -537,8 +626,36 @@ export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, inpu
         dueDate: input.dueDate ?? date,
         memo,
         lines: accountLines,
+        ...fxDocFields,
       });
       billId = bill.id;
+    }
+    // p1 fx: realized exchange gain/loss on the principal (paid at the payment's rate, booked at
+    // the loan's rate). The check / bill credited the liability with its own home share of the
+    // principal line; the difference goes to Exchange Gain/Loss.
+    let fxEntryId: string | null = null;
+    if (payFx && principal.greaterThan(0)) {
+      const paidHome = homeAmounts(
+        accountLines.map((l) => l.amount),
+        payFx.rate,
+      ).lines[0];
+      const bookedHome = toHome(principal, loan.exchangeRate ?? payFx.rate);
+      const gain = Money.round2(bookedHome.minus(paidHome)); // > 0: cost less than booked
+      if (!gain.isZero()) {
+        const fxLine = await exchangeGainLossLine(tx, gain, gain.greaterThan(0) ? 'Realized exchange gain — loan principal' : 'Realized exchange loss — loan principal');
+        const entry = await postJournalEntry(tx, {
+          date,
+          description: `Exchange gain/loss — ${loan.name} payment ${number}`,
+          sourceRef: `loan:${loanId}`,
+          lines: [
+            gain.greaterThan(0)
+              ? { accountId: loan.liabilityAccountId, debit: toAmountString(gain), memo: `Principal at booked rate — ${loan.name}` }
+              : { accountId: loan.liabilityAccountId, credit: toAmountString(gain.abs()), memo: `Principal at booked rate — ${loan.name}` },
+            fxLine!,
+          ],
+        });
+        fxEntryId = entry.id;
+      }
     }
     const [lp] = await tx.db
       .insert(loanPayments)
@@ -554,13 +671,15 @@ export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, inpu
         kind: input.kind,
         expenseId,
         billId,
+        exchangeRate: payFx ? payFx.rate.toFixed(8) : null,
+        fxEntryId,
       })
       .returning();
     await writeAudit(tx, {
       action: 'create',
       entityType: 'loan_payment',
       entityId: lp.id,
-      newValues: { loanId, paymentNumber: number, principal: lp.principal, interest: lp.interest, escrow: lp.escrow, total: lp.total, kind: input.kind, expenseId, billId },
+      newValues: { loanId, paymentNumber: number, principal: lp.principal, interest: lp.interest, escrow: lp.escrow, total: lp.total, kind: input.kind, expenseId, billId, currency: loanCurrency, exchangeRate: lp.exchangeRate, fxEntryId },
     });
     return lp;
   });

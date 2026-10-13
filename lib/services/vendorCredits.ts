@@ -52,6 +52,18 @@ import { postDocumentInventory, reverseDocumentInventory } from './inventorySite
 import { planPostedEdit, retitleEntry } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import {
+  applyForeignVendorCredit,
+  refundForeignVendorCredit,
+  resolveVendorCreditFx,
+  unapplyForeignVendorCredit,
+  vendorCreditEntryFx,
+  vendorCreditApplicationDate,
+  vendorCreditRefundDate,
+  assertRedateAfterVendorCreditSteps,
+  clearSettledForeignApplications,
+  vendorCreditFxColumns,
+} from './vendorCreditsFx';
+import {
   type ServiceContext,
   ServiceError,
   inTransaction,
@@ -90,6 +102,9 @@ export interface CreateVendorCreditInput {
   /** The vendor's credit memo number (QB "Ref. No."). */
   refNumber?: string | null;
   lines: VendorCreditLineInput[];
+  /** p1 fx: the vendor's currency is used; a stated rate overrides the currency list's rate. */
+  currency?: string | null;
+  exchangeRate?: string | number | null;
 }
 
 export interface ApplyToBillInput {
@@ -97,6 +112,8 @@ export interface ApplyToBillInput {
   billId: string;
   /** Amount to apply (must be <= credit.unapplied and <= bill.balanceDue). */
   amount: string | number;
+  /** p1 fx: date of a foreign application's exchange gain/loss entry (default today). */
+  date?: Date | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +424,11 @@ function postingLinesFor(
   return out;
 }
 
+/** The prepared lines with each amount replaced by its home value (p1 fx: postings are in home currency). */
+function homePrep(prep: PreparedLine[], fx: { homeLines: string[] }): PreparedLine[] {
+  return prep.map((l, i) => ({ ...l, amount: fx.homeLines[i] }));
+}
+
 function lineRowsFor(creditId: string, prep: PreparedLine[], costs: Map<number, Decimal>) {
   return prep.map((l, idx) => ({
     vendorCreditId: creditId,
@@ -441,29 +463,14 @@ function lineSignature(
 // ---------------------------------------------------------------------------
 
 /**
- * J10: vendor credits are recorded in HOME currency only (vendor_credits has no exchange rate, and
- * applying a foreign credit to a foreign bill would need a realized gain/loss). A vendor or bank
- * account in another currency is refused with a plain message so A/P never takes an unconverted
- * amount.
+ * J10 / p1 fx: a vendor credit is in its vendor's currency (vendorCreditsFx.ts); A/P and the
+ * line accounts get home amounts. A home credit can't be refunded into a foreign account.
  */
 async function foreignCurrencyOf(ctx: ServiceContext, code: string | null | undefined): Promise<string | null> {
   const v = (code ?? '').trim().toUpperCase();
   if (!v) return null;
   const home = await getHomeCurrencyCode(ctx);
   return home && v === home ? null : v;
-}
-
-async function assertHomeCurrencyVendor(ctx: ServiceContext, vendorId: string) {
-  const [v] = await ctx.db
-    .select({ currency: vendors.currency })
-    .from(vendors)
-    .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, ctx.companyId)));
-  const cur = await foreignCurrencyOf(ctx, v?.currency);
-  if (cur) {
-    throw validation(
-      `This vendor uses ${cur}. Vendor credits can only be entered for home-currency vendors — for a ${cur} vendor, enter the credit as a bill with a negative adjustment or ask the vendor for a refund.`,
-    );
-  }
 }
 
 export async function createVendorCredit(ctx: ServiceContext, input: CreateVendorCreditInput) {
@@ -473,10 +480,10 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
-  await assertHomeCurrencyVendor(ctx, input.vendorId);
 
   const { lines: prep, total } = await prepareLines(ctx, input.lines);
   const totalStr = toAmountString(total);
+  const fx = await resolveVendorCreditFx(ctx, input.vendorId, { ...input, lines: prep });
   const apAccountId = await resolveApAccount(ctx);
   const cogsAccountId = prep.some((l) => l.isInventory) ? await accountIdByCode(ctx, '5000') : null;
 
@@ -493,13 +500,14 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
         status: 'open',
         total: totalStr,
         unapplied: totalStr,
+        ...vendorCreditFxColumns(fx),
       })
       .returning();
 
     // 2) Returned items leave stock at their current cost.
     const costs = await relieveCreditStock(tx, credit.id, input.date, prep);
 
-    // 3) Lines.
+    // 3) Lines (amounts in the credit's currency).
     await tx.db.insert(vendorCreditLines).values(lineRowsFor(credit.id, prep, costs));
 
     // 4) Post: Dr A/P total / Cr line accounts (inventory at cost, price difference to COGS).
@@ -508,7 +516,8 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
       description: `Vendor Credit — ${vendor.name}`,
       reference: input.refNumber?.trim() || null,
       sourceRef: `vendor_credit:${credit.id}`,
-      lines: postingLinesFor(credit.id, apAccountId, cogsAccountId, prep, total, costs),
+      lines: postingLinesFor(credit.id, apAccountId, cogsAccountId, homePrep(prep, fx), Money.of(fx.homeTotal), costs),
+      ...vendorCreditEntryFx(fx),
     });
 
     // 5) Stamp postedEntryId.
@@ -547,15 +556,33 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
     .where(and(eq(vendorCredits.id, id), eq(vendorCredits.companyId, ctx.companyId)));
   if (!existing) throw notFound('Vendor credit');
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided vendor credit.');
+  // p1 fx: never move a credit after its dated applications or refunds.
+  await assertRedateAfterVendorCreditSteps(ctx, { vendorCreditId: id }, input.date);
 
   const [vendor] = await ctx.db
     .select({ id: vendors.id, name: vendors.displayName })
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
-  await assertHomeCurrencyVendor(ctx, input.vendorId);
   const { lines: prep, total } = await prepareLines(ctx, input.lines);
   const totalStr = toAmountString(total);
+  // p1 fx: a blank rate keeps the credit's saved rate (not today's list rate), so a memo edit of an
+  // applied foreign credit stays ledger-neutral.
+  const fx = await resolveVendorCreditFx(ctx, input.vendorId, {
+    ...input,
+    lines: prep,
+    exchangeRate:
+      input.exchangeRate == null || String(input.exchangeRate).trim() === ''
+        ? existing.currency
+          ? existing.exchangeRate
+          : null
+        : input.exchangeRate,
+  });
+  if ((existing.currency ?? null) !== fx.currency) {
+    throw validation(
+      `This credit is in ${existing.currency ?? 'your home currency'} and can't be moved to a vendor or currency in ${fx.currency ?? 'your home currency'}. Void it and enter a new credit instead.`,
+    );
+  }
   const apAccountId = await resolveApAccount(ctx);
   const cogsAccountId = prep.some((l) => l.isInventory) ? await accountIdByCode(ctx, '5000') : null;
   const refNumber = input.refNumber?.trim() || null;
@@ -581,10 +608,18 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
       plan = await planPostedEdit(tx, {
         entryId: cur.postedEntryId,
         date: input.date,
-        lines: postingLinesFor(id, apAccountId, cogsAccountId, prep, total, new Map()),
+        lines: postingLinesFor(id, apAccountId, cogsAccountId, homePrep(prep, fx), Money.of(fx.homeTotal), new Map()),
         what: 'vendor credit',
       });
       if (plan === 'unchanged' && cur.vendorId !== input.vendorId) plan = 'repost';
+    }
+    // p1 fx: a foreign credit whose amount or rate changed re-posts even if its home value did not.
+    if (
+      plan === 'unchanged' &&
+      fx.currency &&
+      (!Money.eq(cur.total, totalStr) || !Money.of(cur.exchangeRate ?? 0).equals(fx.rate))
+    ) {
+      plan = 'repost';
     }
 
     let entryId = cur.postedEntryId;
@@ -616,7 +651,8 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
         description: `Vendor Credit — ${vendor.name}`,
         reference: refNumber,
         sourceRef: `vendor_credit:${id}`,
-        lines: postingLinesFor(id, apAccountId, cogsAccountId, prep, total, costs),
+        lines: postingLinesFor(id, apAccountId, cogsAccountId, homePrep(prep, fx), Money.of(fx.homeTotal), costs),
+        ...vendorCreditEntryFx(fx),
       });
       entryId = entry.id;
       await tx.db
@@ -630,6 +666,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
           unapplied: totalStr,
           status: 'open',
           postedEntryId: entry.id,
+          ...vendorCreditFxColumns(fx),
         })
         .where(eq(vendorCredits.id, id));
     }
@@ -767,13 +804,25 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
     throw validation('Vendor credit and bill must belong to the same vendor.');
   }
 
-  // Vendor credits are recorded in home currency; a foreign-currency bill is settled through
-  // Pay Bills (which converts at the booked rate and posts realized exchange gain/loss).
-  // Blank or the home code (any case) means home currency — only a genuinely foreign bill is refused.
+  // Currencies: blank or the home code (any case) is home. A home credit only applies to a home
+  // bill; a foreign credit / bill is applied at each side's booked rate with a realized exchange
+  // gain/loss (vendorCreditsFx.ts) and only to a bill in the same currency.
+  const creditCurrency = await foreignCurrencyOf(ctx, credit.currency);
   const billCurrency = await foreignCurrencyOf(ctx, bill.currency);
-  if (billCurrency) {
+  if (!creditCurrency && billCurrency) {
     throw validation(
       `This bill is in ${billCurrency}. Home-currency vendor credits can't be applied to it — settle it with Pay Bills instead.`,
+    );
+  }
+  // An application is dated (never before the credit or the bill exists).
+  const applyDate = await vendorCreditApplicationDate(ctx, credit, bill, input.date, 'apply');
+  if (creditCurrency) {
+    return applyForeignVendorCredit(
+      ctx,
+      { ...credit, currency: creditCurrency },
+      { ...bill, currency: billCurrency },
+      applyAmount,
+      applyDate,
     );
   }
 
@@ -838,6 +887,8 @@ export interface UnapplyFromBillInput {
   billId: string;
   /** Amount to unapply (must be <= credit's applied amount and <= bill.amountCredited). */
   amount: string | number;
+  /** p1 fx: date of the reversing exchange gain/loss entry (default today). */
+  date?: Date | null;
 }
 
 /**
@@ -889,6 +940,18 @@ export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBil
   if (unapplyAmount.greaterThan(billCredited)) {
     throw validation(
       `Unapply amount ${toAmountString(unapplyAmount)} exceeds the bill's credited amount ${toAmountString(billCredited)}.`,
+    );
+  }
+  const creditCurrency = await foreignCurrencyOf(ctx, credit.currency);
+  const billCurrency = await foreignCurrencyOf(ctx, bill.currency);
+  const unapplyDate = await vendorCreditApplicationDate(ctx, credit, bill, input.date, 'unapply');
+  if (creditCurrency || billCurrency) {
+    return unapplyForeignVendorCredit(
+      ctx,
+      { ...credit, currency: creditCurrency },
+      { ...bill, currency: billCurrency },
+      unapplyAmount,
+      unapplyDate,
     );
   }
 
@@ -956,6 +1019,8 @@ export interface RefundVendorCreditInput {
   amount: string | number;
   date?: Date | null;
   memo?: string | null;
+  /** p1 fx: foreign credit — home units per 1 unit on the refund date (default: list rate). */
+  exchangeRate?: string | number | null;
 }
 
 /**
@@ -992,6 +1057,17 @@ export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendo
     );
   }
 
+  // p1 fx: a foreign credit's refund is taken at its booked rate, banked at the refund's rate.
+  if (credit.currency) {
+    return refundForeignVendorCredit(ctx, credit, {
+      bankAccountId: input.bankAccountId,
+      amount,
+      date: input.date,
+      memo: input.memo,
+      exchangeRate: input.exchangeRate,
+    });
+  }
+
   // Validate the bank account: company-owned bank/cash asset.
   const [bankAcct] = await ctx.db
     .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, currency: accounts.currency })
@@ -1008,7 +1084,7 @@ export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendo
   }
 
   const apAccountId = await resolveApAccount(ctx);
-  const refundDate = input.date ?? new Date();
+  const refundDate = vendorCreditRefundDate(credit, input.date);
 
   return inTransaction(ctx, async (tx) => {
     // 1. Post the refund receipt.
@@ -1095,6 +1171,8 @@ export async function voidVendorCredit(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
+    // p1 fx: settled (applied, then unapplied) foreign applications go with the credit.
+    await clearSettledForeignApplications(tx, { vendorCreditId: id });
     // Reverse the GL entry.
     if (credit.postedEntryId) {
       await voidJournalEntry(tx, credit.postedEntryId);
@@ -1104,7 +1182,7 @@ export async function voidVendorCredit(ctx: ServiceContext, id: string) {
 
     const [updated] = await tx.db
       .update(vendorCredits)
-      .set({ status: 'void', unapplied: '0.00' })
+      .set({ status: 'void', unapplied: '0.00', ...(credit.currency ? { homeUnapplied: '0.00' } : {}) })
       .where(eq(vendorCredits.id, id))
       .returning();
 

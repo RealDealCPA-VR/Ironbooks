@@ -40,6 +40,8 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  /** p1 fx: bank account currency (null = home). */
+  currency?: string | null;
 }
 
 interface UndepositedItem {
@@ -51,6 +53,8 @@ interface UndepositedItem {
   method: string;
   reference: string | null;
   amount: string;
+  /** p1 fx: payment currency (null = home). */
+  currency?: string | null;
 }
 
 interface DepositLine {
@@ -74,6 +78,9 @@ interface Deposit {
   voidedAt: string | null;
   createdAt: string;
   lines: DepositLine[];
+  /** p1 fx: deposit currency (null = home) and its home value. */
+  currency?: string | null;
+  homeTotal?: string | null;
 }
 
 interface ExtraLine {
@@ -180,10 +187,15 @@ function MakeDepositModal({
   editing,
 }: MakeDepositModalProps) {
   // While editing, the items already on the deposit are selectable alongside the free ones.
-  const undepositedItems = editing
+  const allItems = editing
     ? [...editing.items, ...freeItems.filter((f) => !editing.items.some((i) => i.id === f.id))]
     : freeItems;
   const [depositAccountId, setDepositAccountId] = useState('');
+  // p1 fx: a deposit is in its bank account's currency — only payments in that currency show.
+  const depCur = bankAccounts.find((a) => a.id === depositAccountId)?.currency || null;
+  const undepositedItems = allItems.filter((p) => (p.currency || null) === depCur);
+  const [fxRate, setFxRate] = useState('');
+  const money = (v: string | number) => formatCurrency(v, depCur ?? undefined);
   const prefs = usePreferences();
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
@@ -209,6 +221,7 @@ function MakeDepositModal({
       setExtraLines(editing?.extraLines ?? []);
       setCashBackAccountId(editing?.cashBackAccountId ?? '');
       setCashBackAmount(editing?.cashBackAmount ?? '');
+      setFxRate('');
     }
   }, [open, editing]);
 
@@ -307,6 +320,7 @@ function MakeDepositModal({
             ? { accountId: cashBackAccountId, amount: cashBackAmount }
             : undefined,
         memo: memo || undefined,
+        ...(depCur && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
       };
       if (editing) {
         await api.patch(`/api/deposits/${editing.id}`, body);
@@ -367,7 +381,7 @@ function MakeDepositModal({
             loading={saving}
             disabled={selectedIds.size === 0 && extraLines.length === 0}
           >
-            {`Deposit ${formatCurrency(netTotal.toFixed(2))}`}
+            {`Deposit ${money(netTotal.toFixed(2))}`}
           </Button>
         </>
       }
@@ -396,6 +410,26 @@ function MakeDepositModal({
             ))}
           </Select>
         </div>
+
+        {/* p1 fx: foreign-currency bank account */}
+        {depCur && (
+          <div>
+            <Label htmlFor="dep-rate">Exchange rate (1 {depCur} = ? home)</Label>
+            <Input
+              id="dep-rate"
+              type="number"
+              step="0.00000001"
+              min="0.00000001"
+              placeholder="Blank = Currencies list rate"
+              value={fxRate}
+              onChange={(e) => setFxRate(e.target.value)}
+            />
+            <p className="text-xs text-navy/40 mt-1">
+              This account is in {depCur}: only {depCur} payments are listed and amounts are in {depCur}. Any difference
+              from the rate each payment was received at is recorded as an exchange gain or loss.
+            </p>
+          </div>
+        )}
 
         {/* Date */}
         <div>
@@ -484,7 +518,7 @@ function MakeDepositModal({
                           </span>
                         </span>
                         <span className="text-sm font-semibold text-navy tabular-nums shrink-0">
-                          {formatCurrency(p.amount)}
+                          {formatCurrency(p.amount, p.currency ?? undefined)}
                         </span>
                       </div>
                       <div className="flex gap-3 text-xs text-navy/50 mt-0.5">
@@ -599,24 +633,24 @@ function MakeDepositModal({
               <span>
                 Selected ({selectedIds.size} item{selectedIds.size !== 1 ? 's' : ''})
               </span>
-              <span className="tabular-nums">{formatCurrency(selectedTotal.toFixed(2))}</span>
+              <span className="tabular-nums">{money(selectedTotal.toFixed(2))}</span>
             </div>
             {extraTotal > 0 && (
               <div className="flex items-center justify-between text-sm text-navy/70">
                 <span>Additional lines</span>
-                <span className="tabular-nums">{formatCurrency(extraTotal.toFixed(2))}</span>
+                <span className="tabular-nums">{money(extraTotal.toFixed(2))}</span>
               </div>
             )}
             {cashBackNum > 0 && (
               <div className="flex items-center justify-between text-sm text-navy/70">
                 <span>Cash back</span>
-                <span className="tabular-nums">-{formatCurrency(cashBackNum.toFixed(2))}</span>
+                <span className="tabular-nums">-{money(cashBackNum.toFixed(2))}</span>
               </div>
             )}
             <div className="flex items-center justify-between border-t border-navy/10 pt-1">
               <span className="text-sm font-semibold text-navy/70">Net deposit</span>
               <span className="text-lg font-bold text-navy tabular-nums">
-                {formatCurrency(netTotal.toFixed(2))}
+                {money(netTotal.toFixed(2))}
               </span>
             </div>
           </div>
@@ -812,7 +846,7 @@ function DepositsPageContent() {
                     )}
                   </Td>
                   <Td numeric className="font-semibold text-navy">
-                    {formatCurrency(dep.total)}
+                    {formatCurrency(dep.total, dep.currency ?? undefined)}
                   </Td>
                   <Td className="text-right">
                     {!dep.voidedAt && (

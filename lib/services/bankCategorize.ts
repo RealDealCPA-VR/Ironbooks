@@ -31,6 +31,8 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { applyRulesToAccount } from './rules';
+import { accountSigned, foreignCurrencyOfAccount } from './fxLedger';
+import { currencyRate, toHome } from './exchangeRates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,6 +44,11 @@ export interface CategorizeInput {
   accountId: string;
   payee?: string | null;
   memo?: string | null;
+  /**
+   * p1 fx: for a foreign-currency bank / credit-card account the feed amount is in the account's
+   * currency; it is posted at this rate (home units per 1 unit), default the currency list's rate.
+   */
+  exchangeRate?: string | number | null;
 }
 
 export type ReviewFilter = 'all' | 'unreviewed' | 'matched' | 'excluded';
@@ -184,18 +191,29 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
     throw validation('Cannot categorize a zero-amount transaction.');
   }
 
+  // p1 fx: a foreign-currency bank / card account's feed is in the account's currency. Post the
+  // home value at the stated rate (else the currency list's rate) and keep the feed amount on the
+  // bank line, so the register and reconciliation stay in the account's currency.
+  const feedCurrency = await foreignCurrencyOfAccount(ctx, bankGlAccountId);
+  const fx = feedCurrency ? await currencyRate(ctx, feedCurrency, input.exchangeRate) : null;
+  const homeAmt = fx ? toAmountString(toHome(Money.abs(txn.amount), fx.rate)) : absAmt;
+  if (fx && !Money.gt(homeAmt, 0)) {
+    throw validation('This amount is too small to convert to your home currency.');
+  }
+  const bankFx = fx ? { foreignAmount: absAmt } : {};
+
   // Build posting lines:
   //   amount > 0 (deposit / credit): money came IN — debit the bank GL, credit the offset.
   //   amount < 0 (withdrawal / debit): money went OUT — debit the offset, credit the bank GL.
   const lines =
     amt.greaterThan(0)
       ? [
-          { accountId: bankGlAccountId, debit: absAmt, memo: input.memo ?? null },
-          { accountId: input.accountId, credit: absAmt, memo: input.memo ?? null },
+          { accountId: bankGlAccountId, debit: homeAmt, memo: input.memo ?? null, ...bankFx },
+          { accountId: input.accountId, credit: homeAmt, memo: input.memo ?? null },
         ]
       : [
-          { accountId: input.accountId, debit: absAmt, memo: input.memo ?? null },
-          { accountId: bankGlAccountId, credit: absAmt, memo: input.memo ?? null },
+          { accountId: input.accountId, debit: homeAmt, memo: input.memo ?? null },
+          { accountId: bankGlAccountId, credit: homeAmt, memo: input.memo ?? null, ...bankFx },
         ];
 
   const description =
@@ -214,6 +232,7 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
       reference: input.memo ?? undefined,
       sourceRef: `bank_transaction:${txn.id}`,
       lines,
+      ...(fx ? { currency: fx.currency, exchangeRate: fx.rate.toFixed(8) } : {}),
     });
 
     // Mark the staging row as matched. The matched=false guard in the WHERE makes
@@ -237,7 +256,11 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
       entityType: 'bank_transaction',
       entityId: txn.id,
       oldValues: { matched: false },
-      newValues: { matched: true, matchedEntryId: entry.id },
+      newValues: {
+        matched: true,
+        matchedEntryId: entry.id,
+        ...(fx ? { currency: fx.currency, exchangeRate: fx.rate.toFixed(8), homeAmount: homeAmt } : {}),
+      },
     });
 
     return { transaction: updated, entry };
@@ -381,6 +404,8 @@ export async function suggestMatches(
   const ba = await loadBankAccount(ctx, txn.bankAccountId);
   const amt = Money.of(txn.amount);
   if (amt.isZero()) return [];
+  // p1 fx: a foreign-currency account's feed is compared in the account's currency.
+  const foreign = !!(await foreignCurrencyOfAccount(ctx, ba.accountId));
 
   const txnDate = new Date(txn.date);
   const from = new Date(txnDate.getTime() - MATCH_WINDOW_DAYS * DAY_MS);
@@ -410,6 +435,7 @@ export async function suggestMatches(
       sourceRef: journalEntries.sourceRef,
       debit: journalEntryLines.debit,
       credit: journalEntryLines.credit,
+      foreignAmount: journalEntryLines.foreignAmount,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
@@ -437,7 +463,7 @@ export async function suggestMatches(
   >();
   for (const r of rows) {
     const existing = byEntry.get(r.entryId);
-    const delta = Money.sub(r.debit ?? 0, r.credit ?? 0);
+    const delta = accountSigned(r, foreign);
     if (existing) {
       existing.net = existing.net.plus(delta);
     } else {
@@ -521,9 +547,15 @@ export async function matchTransaction(
     throw validation('Only posted journal entries can be matched.');
   }
 
-  // The entry must net to exactly the feed amount on the bank GL account.
+  // The entry must net to exactly the feed amount on the bank GL account (in the account's own
+  // currency for a foreign-currency account — p1 fx).
+  const foreign = !!(await foreignCurrencyOfAccount(ctx, ba.accountId));
   const lines = await ctx.db
-    .select({ debit: journalEntryLines.debit, credit: journalEntryLines.credit })
+    .select({
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+      foreignAmount: journalEntryLines.foreignAmount,
+    })
     .from(journalEntryLines)
     .where(
       and(
@@ -535,7 +567,7 @@ export async function matchTransaction(
     throw validation('Journal entry does not touch this bank account’s GL account.');
   }
   let net = Money.zero();
-  for (const l of lines) net = net.plus(Money.sub(l.debit ?? 0, l.credit ?? 0));
+  for (const l of lines) net = net.plus(accountSigned(l, foreign));
   if (!Money.eq(net, txn.amount)) {
     throw validation(
       `Journal entry's effect on the bank account (${toAmountString(net)}) does not equal the bank transaction amount (${toAmountString(txn.amount)}).`,

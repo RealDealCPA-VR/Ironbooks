@@ -35,6 +35,8 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  /** p1 fx: currency of a bank / card account (null = home). */
+  currency?: string | null;
 }
 
 interface Transfer {
@@ -47,6 +49,12 @@ interface Transfer {
   postedEntryId: string | null;
   voidedAt?: string | null;
   createdAt: string;
+  /** p1 fx: `amount` is in `currency` (FROM account; null = home); `toAmount` in `toCurrency`. */
+  currency?: string | null;
+  exchangeRate?: string | null;
+  toCurrency?: string | null;
+  toAmount?: string | null;
+  homeAmount?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +77,14 @@ function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTr
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memo, setMemo] = useState('');
   const [saving, setSaving] = useState(false);
+  // p1 fx: foreign-currency accounts.
+  const [toAmount, setToAmount] = useState('');
+  const [rate, setRate] = useState('');
+  const [homeAmount, setHomeAmount] = useState('');
+  const fromCur = accounts.find((a) => a.id === fromAccountId)?.currency || null;
+  const toCur = accounts.find((a) => a.id === toAccountId)?.currency || null;
+  const crossCurrency = !!fromAccountId && !!toAccountId && fromCur !== toCur;
+  const sameForeign = !!fromCur && fromCur === toCur;
 
   // Reset form when modal opens.
   useEffect(() => {
@@ -78,6 +94,9 @@ function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTr
       setAmount(editing?.amount ?? '');
       setDate(editing ? editing.date.slice(0, 10) : new Date().toISOString().slice(0, 10));
       setMemo(editing?.memo ?? '');
+      setToAmount(editing?.toCurrency !== editing?.currency ? (editing?.toAmount ?? '') : '');
+      setRate('');
+      setHomeAmount('');
     }
   }, [open, editing]);
 
@@ -90,7 +109,21 @@ function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTr
 
     setSaving(true);
     try {
-      const body = { fromAccountId, toAccountId, amount, date, memo: memo || null };
+      if (crossCurrency && !toAmount.trim() && !rate.trim()) {
+        toast(`Enter the amount that arrived in ${toCur ?? 'home currency'} (or the exchange rate).`, 'danger');
+        setSaving(false);
+        return;
+      }
+      const body = {
+        fromAccountId,
+        toAccountId,
+        amount,
+        date,
+        memo: memo || null,
+        ...(crossCurrency && toAmount.trim() ? { toAmount: toAmount.trim() } : {}),
+        ...((crossCurrency || sameForeign) && rate.trim() ? { exchangeRate: rate.trim() } : {}),
+        ...((crossCurrency || sameForeign) && homeAmount.trim() ? { homeAmount: homeAmount.trim() } : {}),
+      };
       if (editing) {
         await api.patch(`/api/transfers/${editing.id}`, body);
         toast('Transfer updated.', 'success');
@@ -181,7 +214,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTr
 
         {/* Amount */}
         <div>
-          <Label htmlFor="tr-amount" required>Amount</Label>
+          <Label htmlFor="tr-amount" required>Amount{fromCur ? ` (${fromCur})` : crossCurrency ? ' (home currency)' : ''}</Label>
           <Input
             id="tr-amount"
             type="number"
@@ -192,6 +225,33 @@ function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTr
             onChange={(e) => setAmount(e.target.value)}
           />
         </div>
+
+        {/* p1 fx: transfers between currencies */}
+        {crossCurrency && (
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="tr-to-amount" required>Amount received ({toCur ?? 'home currency'})</Label>
+              <Input id="tr-to-amount" type="number" min="0.01" step="0.01" value={toAmount} onChange={(e) => setToAmount(e.target.value)} />
+            </div>
+            <div>
+              <Label htmlFor="tr-rate">or rate (1 {fromCur ?? 'home'} = ? {toCur ?? 'home'})</Label>
+              <Input id="tr-rate" type="number" min="0.00000001" step="0.00000001" value={rate} onChange={(e) => setRate(e.target.value)} />
+            </div>
+          </div>
+        )}
+        {sameForeign && (
+          <div>
+            <Label htmlFor="tr-rate2">Exchange rate (1 {fromCur} = ? home; blank = Currencies list)</Label>
+            <Input id="tr-rate2" type="number" min="0.00000001" step="0.00000001" value={rate} onChange={(e) => setRate(e.target.value)} />
+          </div>
+        )}
+        {(crossCurrency || sameForeign) && (
+          <div>
+            <Label htmlFor="tr-home">Home-currency value (optional)</Label>
+            <Input id="tr-home" type="number" min="0.01" step="0.01" placeholder="Calculated for you" value={homeAmount} onChange={(e) => setHomeAmount(e.target.value)} />
+            <p className="text-xs text-navy/40 mt-1">Both accounts record this home value; leave blank to calculate it from the amounts.</p>
+          </div>
+        )}
 
         {/* Memo */}
         <div>
@@ -311,7 +371,12 @@ export default function TransfersPage() {
                     {accountMap[tr.toAccountId] ?? tr.toAccountId}
                   </Td>
                   <Td numeric className="font-semibold text-navy">
-                    {formatCurrency(tr.amount)}
+                    {formatCurrency(tr.amount, tr.currency ?? undefined)}
+                    {tr.toCurrency !== tr.currency && tr.toAmount && (
+                      <span className="block text-xs font-normal text-navy/50">
+                        → {formatCurrency(tr.toAmount, tr.toCurrency ?? undefined)}
+                      </span>
+                    )}
                   </Td>
                   <Td className="text-navy/50 text-sm">{tr.memo ?? '—'}</Td>
                   <Td className="text-right whitespace-nowrap">
@@ -356,7 +421,7 @@ export default function TransfersPage() {
               {formatCurrency(
                 transfers
                   .filter((t) => !t.voidedAt)
-                  .reduce((s, t) => s + Number(t.amount), 0)
+                  .reduce((s, t) => s + Number(t.homeAmount ?? t.amount), 0)
                   .toFixed(2),
               )}
             </span>

@@ -35,7 +35,7 @@ import { postJournalEntry } from './posting';
 import { createExpense, updateExpense, voidExpense, getExpense } from './expenses';
 import { createBill, listBillsToPay, getBill } from './bills';
 import { payBills, updateBillPayment, getBillPayment } from './billPayments';
-import { createVendorCredit, updateVendorCredit } from './vendorCredits';
+import { createVendorCredit, updateVendorCredit, voidVendorCredit } from './vendorCredits';
 import { createTransfer, updateTransfer, voidTransfer } from './transfers';
 import { createPurchaseOrder, updatePurchaseOrder, getPurchaseOrder } from './purchaseOrders';
 import { createItemReceipt, updateItemReceipt } from './itemReceipts';
@@ -633,18 +633,25 @@ describe('wave2 purchases', () => {
     const eurVendor = await createVendor(ctx, { displayName: 'Lyon Parts', currency: 'EUR' });
     const before = { ap: await bal('2000'), eur: await bal('1020'), chk: await bal('1000') };
 
-    // Vendor credits: foreign vendor refused; refund into a EUR bank refused.
-    await expect(
-      createVendorCredit(ctx, { vendorId: eurVendor.id, date: d('2026-06-22'), lines: [{ accountId: acct['6300'], amount: '5.00' }] }),
-    ).rejects.toThrow(/EUR/);
+    // p1 fx: a EUR vendor's credit is a EUR credit (home A/P at the list rate); a home credit still
+    // can't be refunded into a EUR bank.
+    const eurVc = await createVendorCredit(ctx, { vendorId: eurVendor.id, date: d('2026-06-22'), lines: [{ accountId: acct['6300'], amount: '5.00' }] });
+    expect(eurVc.currency).toBe('EUR');
+    await voidVendorCredit(ctx, eurVc.id);
     const vc = await createVendorCredit(ctx, { vendorId, date: d('2026-06-22'), lines: [{ accountId: acct['6300'], amount: '5.00' }] });
     await expect(
       refundVendorCredit(ctx, { vendorCreditId: vc.id, bankAccountId: acct['1020'], amount: '5.00', date: d('2026-06-22') }),
     ).rejects.toThrow(/EUR/);
 
-    // Deposits and transfers touching the EUR bank are refused (nothing posted).
+    // p1 fx: a home deposit can't put cash back into the EUR bank, and a transfer between
+    // currencies needs the amount that arrived (nothing posted).
     await expect(
-      createDeposit(ctx, { depositAccountId: acct['1020'], date: d('2026-06-22'), extraLines: [{ accountId: acct['4900'], amount: '10.00' }] }),
+      createDeposit(ctx, {
+        depositAccountId: acct['1000'],
+        date: d('2026-06-22'),
+        extraLines: [{ accountId: acct['4900'], amount: '10.00' }],
+        cashBack: { accountId: acct['1020'], amount: '1.00' },
+      }),
     ).rejects.toThrow(/EUR/);
     await expect(
       createTransfer(ctx, { fromAccountId: acct['1000'], toAccountId: acct['1020'], amount: '10.00', date: d('2026-06-22') }),
