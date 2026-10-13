@@ -171,7 +171,7 @@ export const navGroups: NavGroup[] = [
       { icon: GitMerge, label: 'Merge Records', path: '/merge', qb: 'Merge', keywords: 'duplicate combine' },
       { icon: Eraser, label: 'Clean Up Lists', path: '/lists/cleanup', qb: 'Clean Up Company Data', keywords: 'condense' },
       { icon: FileX, label: '1099 E-File', path: '/reports/1099-efile', qb: '1099 Wizard', keywords: '1099 contractor' },
-      { icon: Clock, label: 'Estimate Follow-up', path: '/estimates-followup', qb: 'Estimates follow-up', keywords: 'quotes' },
+      { icon: Clock, label: 'Estimate Follow-up', path: '/estimates-followup', qb: 'Estimates follow-up', keywords: 'quotes follow up' },
     ],
   },
   {
