@@ -40,6 +40,7 @@ import { Money } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { foreignCode, homeCode } from './fxLines';
 import { paymentsUnappliedAsOf } from './customerCredits';
+import { vendorCreditRefundsAfter } from './vendorCreditsFx';
 
 export interface ForeignOpenItem {
   kind: 'invoice' | 'payment' | 'bill' | 'vendor_credit';
@@ -489,16 +490,21 @@ export async function foreignOpenPayables(ctx: ServiceContext, asOf: Date): Prom
       })
       .from(vendorCreditApplications)
       .where(inArray(vendorCreditApplications.vendorCreditId, credits.map((c) => c.id)));
+    const laterRefunds = await vendorCreditRefundsAfter(ctx, asOf);
     for (const c of credits) {
       const cur = foreignCode(c.currency, home);
       if (!cur) continue;
       const mine = apps.filter((a) => a.creditId === c.id);
       const allHome = mine.reduce((s, a) => s.plus(Money.of(a.home)), Money.zero());
       const homeTotal = Money.of(c.homeTotal ?? r2(Money.of(c.total).times(Money.of(c.rate ?? 1))));
-      // Refunds are not dated per row: treat them as before the date (like A/P aging does).
+      // Refunds to date (home: what is neither unapplied nor applied today); refunds dated after
+      // the as-of date had not happened yet, so they are added back (same source as A/P aging).
       const homeRefunded = homeTotal.minus(Money.of(c.homeUnapplied ?? 0)).minus(allHome);
-      let foreign = Money.of(c.total).minus(Money.of(c.refunded ?? 0));
-      let homeOpen = homeTotal.minus(homeRefunded);
+      const later = laterRefunds.get(c.id);
+      let foreign = Money.of(c.total)
+        .minus(Money.of(c.refunded ?? 0))
+        .plus(later?.foreign ?? Money.zero());
+      let homeOpen = homeTotal.minus(homeRefunded).plus(later?.home ?? Money.zero());
       for (const a of mine) {
         if (a.date.getTime() > asOf.getTime()) continue;
         foreign = foreign.minus(Money.of(a.amount));

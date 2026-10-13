@@ -50,15 +50,17 @@ function readDate(value: unknown): Date | null {
   if (value === undefined || value === null || value === '') return null;
   const bad = () => new ServiceError('VALIDATION', 'Enter a valid date (for example 2026-07-15).');
   if (typeof value !== 'string' && typeof value !== 'number') throw bad();
-  if (typeof value === 'string') {
-    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(value);
-    if (m) {
-      const [y, mo, da] = [Number(m[1]), Number(m[2]), Number(m[3])];
-      const probe = new Date(Date.UTC(y, mo - 1, da));
-      if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== da) throw bad();
-    }
+  const input: string | number = typeof value === 'string' ? value.trim() : value;
+  if (typeof input === 'string') {
+    // Only a calendar date, optionally with a time and zone. Anything else (e.g. trailing junk
+    // like '2026-07-15junk', which JS would read leniently as another date) is refused.
+    const m = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.exec(input);
+    if (!m) throw bad();
+    const [y, mo, da] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    const probe = new Date(Date.UTC(y, mo - 1, da));
+    if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== da) throw bad();
   }
-  const out = new Date(value);
+  const out = new Date(input);
   if (Number.isNaN(out.getTime())) throw bad();
   return out;
 }

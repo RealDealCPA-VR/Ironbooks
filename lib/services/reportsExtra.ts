@@ -40,7 +40,7 @@ import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
 import { journalCreditsAppliedAfter, journalOpenItems, resolveEntityNames } from './journal';
 import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
-import { vendorCreditHomeByBill } from './vendorCreditsFx';
+import { vendorCreditHomeByBill, vendorCreditRefundsAfter } from './vendorCreditsFx';
 import { foreignInvoiceHomeOpen } from './fxSubledger';
 import { getHomeCurrencyCode } from './currencies';
 
@@ -606,53 +606,8 @@ async function vendorCreditActivityAfter(ctx: ServiceContext, cutoff: Date) {
     }
   }
 
-  // 3) Refunds dated after the cutoff: the home A/P each refund entry took from its credit.
-  const refundRows = await ctx.db
-    .select({
-      entryId: journalEntries.id,
-      sourceRef: journalEntries.sourceRef,
-      apHome: sql<string>`COALESCE(SUM(CAST(${journalEntryLines.credit} AS NUMERIC)), 0) - COALESCE(SUM(CAST(${journalEntryLines.debit} AS NUMERIC)), 0)`,
-    })
-    .from(journalEntryLines)
-    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
-    .where(
-      and(
-        eq(journalEntries.companyId, ctx.companyId),
-        eq(journalEntries.status, 'posted'),
-        sql`${journalEntries.sourceRef} LIKE 'refund:%'`,
-        eq(accounts.subtype, 'accounts_payable'),
-        gt(journalEntries.date, cutoff),
-      ),
-    )
-    .groupBy(journalEntries.id, journalEntries.sourceRef);
-  const refunds = refundRows
-    .map((r) => ({ ...r, creditId: (r.sourceRef ?? '').slice('refund:'.length) }))
-    .filter((r) => creditById.has(r.creditId));
-  const foreignRefundIds = refunds.filter((r) => isForeign(r.creditId)).map((r) => r.entryId);
-  const foreignByEntry = new Map<string, Dec>();
-  if (foreignRefundIds.length) {
-    const rows = await ctx.db
-      .select({ newValues: auditLogs.newValues })
-      .from(auditLogs)
-      .where(
-        and(
-          eq(auditLogs.companyId, ctx.companyId),
-          eq(auditLogs.entityType, 'vendor_credit'),
-          sql`${auditLogs.newValues}->>'action' = 'refund'`,
-          inArray(sql`${auditLogs.newValues}->>'postedEntryId'`, foreignRefundIds),
-        ),
-      );
-    for (const r of rows) {
-      const nv = (r.newValues ?? {}) as { amount?: string; postedEntryId?: string };
-      if (nv.postedEntryId) foreignByEntry.set(nv.postedEntryId, Money.of(nv.amount ?? '0'));
-    }
-  }
-  for (const r of refunds) {
-    const homeAmt = Money.of(r.apHome);
-    const foreignAmt = isForeign(r.creditId) ? (foreignByEntry.get(r.entryId) ?? Money.zero()) : homeAmt;
-    addCredit(r.creditId, foreignAmt, homeAmt);
-  }
+  // 3) Refunds dated after the cutoff (shared with the foreign payables subledger / HCA).
+  for (const [creditId, r] of await vendorCreditRefundsAfter(ctx, cutoff)) addCredit(creditId, r.foreign, r.home);
 
   return { byBill, byCredit };
 }

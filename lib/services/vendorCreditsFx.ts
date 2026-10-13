@@ -18,9 +18,20 @@
  * Refunding a foreign credit takes its home A/P at the credit's rate and puts the cash in the bank
  * at the refund's rate; the difference is again a realized gain/loss.
  */
-import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { accounts, billPaymentApplications, billPayments, bills, journalEntries, vendorCreditApplications, vendorCredits, vendors } from '@/lib/db/schema';
+import {
+  accounts,
+  auditLogs,
+  billPaymentApplications,
+  billPayments,
+  bills,
+  journalEntries,
+  journalEntryLines,
+  vendorCreditApplications,
+  vendorCredits,
+  vendors,
+} from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
@@ -248,6 +259,80 @@ export function vendorCreditRefundDate(credit: Pick<VendorCreditRow, 'date'>, da
     throw validation(`A credit can't be refunded before it exists. Use a date on or after the credit's date (${ymd(floor)}).`);
   }
   return date < floor ? floor : date;
+}
+
+/**
+ * Vendor refunds of credits dated AFTER the cutoff, per credit id: the one dated-refund source the
+ * as-of A/P aging and the foreign payables subledger (Home Currency Adjustment) share. `home` is
+ * the home A/P the refund entry (sourceRef refund:<creditId>, dated) took from the credit;
+ * `foreign` is the amount in the credit's currency (from the refund's audit row, postedEntryId) for
+ * a foreign credit, and equals `home` for a home credit. On the cutoff date none of these refunds
+ * had happened yet, so the credit still held them.
+ */
+export async function vendorCreditRefundsAfter(
+  ctx: ServiceContext,
+  cutoff: Date,
+): Promise<Map<string, { foreign: Decimal; home: Decimal }>> {
+  const out = new Map<string, { foreign: Decimal; home: Decimal }>();
+  const rows = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      sourceRef: journalEntries.sourceRef,
+      apHome: sql<string>`COALESCE(SUM(CAST(${journalEntryLines.credit} AS NUMERIC)), 0) - COALESCE(SUM(CAST(${journalEntryLines.debit} AS NUMERIC)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        sql`${journalEntries.sourceRef} LIKE 'refund:%'`,
+        eq(accounts.subtype, 'accounts_payable'),
+        gt(journalEntries.date, cutoff),
+      ),
+    )
+    .groupBy(journalEntries.id, journalEntries.sourceRef);
+  if (rows.length === 0) return out;
+  const credits = await ctx.db
+    .select({ id: vendorCredits.id, currency: vendorCredits.currency })
+    .from(vendorCredits)
+    .where(eq(vendorCredits.companyId, ctx.companyId));
+  const home = ((await homeCode(ctx)) ?? '').trim().toUpperCase();
+  const currencyById = new Map(credits.map((c) => [c.id, (c.currency ?? '').trim().toUpperCase()] as const));
+  const isForeign = (id: string) => {
+    const cur = currencyById.get(id) ?? '';
+    return cur !== '' && cur !== home;
+  };
+  const refunds = rows
+    .map((r) => ({ ...r, creditId: (r.sourceRef ?? '').slice('refund:'.length) }))
+    .filter((r) => currencyById.has(r.creditId));
+  const foreignRefundIds = refunds.filter((r) => isForeign(r.creditId)).map((r) => r.entryId);
+  const foreignByEntry = new Map<string, Decimal>();
+  if (foreignRefundIds.length) {
+    const audits = await ctx.db
+      .select({ newValues: auditLogs.newValues })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, ctx.companyId),
+          eq(auditLogs.entityType, 'vendor_credit'),
+          sql`${auditLogs.newValues}->>'action' = 'refund'`,
+          inArray(sql`${auditLogs.newValues}->>'postedEntryId'`, foreignRefundIds),
+        ),
+      );
+    for (const a of audits) {
+      const nv = (a.newValues ?? {}) as { amount?: string; postedEntryId?: string };
+      if (nv.postedEntryId) foreignByEntry.set(nv.postedEntryId, Money.of(nv.amount ?? '0'));
+    }
+  }
+  for (const r of refunds) {
+    const homeAmt = Money.of(r.apHome);
+    const foreignAmt = isForeign(r.creditId) ? (foreignByEntry.get(r.entryId) ?? Money.zero()) : homeAmt;
+    const c = out.get(r.creditId) ?? { foreign: Money.zero(), home: Money.zero() };
+    out.set(r.creditId, { foreign: c.foreign.plus(foreignAmt), home: c.home.plus(homeAmt) });
+  }
+  return out;
 }
 
 /**
