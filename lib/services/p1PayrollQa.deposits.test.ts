@@ -230,4 +230,29 @@ describe('P1 payroll 941 line 13 deposit attribution — tester re-test', () => 
     expect(q2.lines.line13).toBe(TAX);
     expect(q2.lines.line15).toBe('0.00');
   });
+  it('one deposit paying paydays in two quarters is split between them, oldest payday first', async () => {
+    const co = await newCompany('Split Deposit Co');
+    await check(co, '2026-03-27'); // Q1
+    await check(co, '2026-04-01'); // Q2
+    // One catch-up deposit for both paydays, as three item lines of 5060 total.
+    await pay(co, '2026-04-03', [['Federal Income Tax', '2000.00'], ['Social Security', '2480.00'], ['Medicare', '580.00']]);
+    const q1 = await semi(co, 1, 2026);
+    expect(q1.lines.line13).toBe(TAX);
+    expect(q1.lines.line14).toBe('0.00');
+    const q2 = await semi(co, 2, 2026);
+    expect(q2.lines.line13).toBe(TAX);
+    expect(q2.lines.line15).toBe('0.00');
+  });
+
+  it('a deposit larger than the unpaid lookback liability counts the excess by the monthly window', async () => {
+    const co = await newCompany('Overpay Co');
+    await check(co, '2026-03-27');
+    await pay(co, '2026-04-01', [['Federal Income Tax', '1100.00'], ['Social Security', '1240.00'], ['Medicare', '290.00']]);
+    const q1 = await semi(co, 1, 2026);
+    // 2530 pays the Mar 27 payday; the 100 excess is dated Apr 1 (monthly window: Q1).
+    expect(q1.lines.line13).toBe('2630.00');
+    expect(q1.lines.line15).toBe('100.00');
+    const q2 = await semi(co, 2, 2026);
+    expect(q2.lines.line13).toBe('0.00');
+  });
 });

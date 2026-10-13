@@ -472,9 +472,11 @@ const DEPOSIT_LAG_DAYS = 15;
 /**
  * Semiweekly depositors deposit within 3 business days after the payday's semiweekly period
  * (Wed-Fri paydays by the next Wednesday, Sat-Tue paydays by the next Friday) — at most about a
- * week, plus holidays. A deposit is matched to the latest payday at most this many days earlier.
+ * week, plus holidays. A deposit can pay paydays at most this many days earlier.
  */
 const SEMIWEEKLY_MATCH_DAYS = 14;
+/** How far before the quarter the semiweekly deposit allocation is replayed. */
+const SEMIWEEKLY_REPLAY_DAYS = 60;
 const DAY_MS = 86_400_000;
 
 const FORM941_EMPLOYEE_TRACKING = new Set(['federal_withholding', 'social_security', 'medicare']);
@@ -696,48 +698,62 @@ export async function form941Data(
  * - Monthly (and under-$2,500) depositors: a month's tax is due by the 15th of the next month, so
  *   the quarter's deposits are those dated from the 16th of its first month through the 15th of
  *   the month after it.
- * - Semiweekly depositors: a deposit pays the latest payday with Form 941 tax on or before the
- *   deposit date (within SEMIWEEKLY_MATCH_DAYS), so a Jan 8 deposit for a Jan 3 payday is a Q1
- *   deposit and a Jan 2 deposit for a Dec 27 payday is a Q4 deposit. A deposit with no such
- *   payday falls back to the monthly window.
+ * - Semiweekly depositors: deposits are applied, in date order and by amount, to the unpaid Form
+ *   941 liability of the paydays in their lookback (on or before the deposit date, at most
+ *   SEMIWEEKLY_MATCH_DAYS earlier), oldest payday first. So a Jan 8 deposit for a Jan 3 payday
+ *   is a Q1 deposit, a Jan 2 deposit for a Dec 27 payday is a Q4 deposit, and an off-cycle check
+ *   paid between a payday and that payday's deposit does not capture the deposit (the older,
+ *   unpaid payday is paid first). A deposit is split between quarters when it pays paydays in
+ *   both. Any amount left over (no payday in the lookback, or more than the unpaid liability)
+ *   falls back to the monthly window by deposit date.
  */
 async function form941Deposits(ctx: ServiceContext, start: Date, end: Date, semiweekly: boolean): Promise<Form941Deposit[]> {
   const winStart = new Date(start.getTime() + DEPOSIT_LAG_DAYS * DAY_MS);
   const winEnd = new Date(end.getTime() + DEPOSIT_LAG_DAYS * DAY_MS);
   if (!semiweekly) return payrollTaxPayments(ctx, winStart, winEnd, is941Item);
 
-  // Candidate deposits: anything from the quarter start through the monthly window's end (or a
-  // match window past the quarter end, whichever is later).
-  const candFrom = start;
+  // Replay allocation from well before the quarter so paydays just before it carry the right
+  // unpaid balance (earlier deposits have already paid them), through the later of the monthly
+  // window's end and a match window past the quarter end.
+  const replayFrom = new Date(start.getTime() - SEMIWEEKLY_REPLAY_DAYS * DAY_MS);
   const candTo = new Date(Math.max(winEnd.getTime(), end.getTime() + (SEMIWEEKLY_MATCH_DAYS + 1) * DAY_MS));
-  const candidates = await payrollTaxPayments(ctx, candFrom, candTo, is941Item);
+  const candidates = await payrollTaxPayments(ctx, replayFrom, candTo, is941Item);
   if (!candidates.length) return [];
 
-  // Paydays that carried Form 941 tax, from a match window before the quarter to the last candidate.
-  const checks = await countedChecks(ctx, new Date(start.getTime() - SEMIWEEKLY_MATCH_DAYS * DAY_MS), candTo);
+  // Unpaid Form 941 liability by payday (voided checks are not counted).
+  const checks = await countedChecks(ctx, new Date(replayFrom.getTime() - SEMIWEEKLY_MATCH_DAYS * DAY_MS), candTo);
   const byCheck = await linesByPaycheck(ctx, checks.map((c) => c.id));
-  const paydays = new Set<number>();
+  const unpaid = new Map<number, Dec>();
   for (const c of checks) {
     const lines = byCheck.get(c.id) ?? [];
     const tax = sumTracking(lines.filter((l) => l.kind === 'tax'), ['federal_withholding', 'social_security', 'medicare'])
       .plus(sumTracking(lines.filter((l) => l.kind === 'employer_contribution'), ['employer_social_security', 'employer_medicare']));
-    if (!tax.isZero()) paydays.add(c.payDate.getTime());
+    if (tax.isZero()) continue;
+    const t = c.payDate.getTime();
+    unpaid.set(t, (unpaid.get(t) ?? Money.zero()).plus(tax));
   }
-  const sortedPaydays = [...paydays].sort((a, b) => a - b);
+  const sortedPaydays = [...unpaid.keys()].sort((a, b) => a - b);
 
+  const inQuarter = (t: number) => t >= start.getTime() && t < end.getTime();
   const out: Form941Deposit[] = [];
+  // payrollTaxPayments returns lines in date order; ties keep their posting order.
   for (const dep of candidates) {
     const t = Date.parse(`${dep.date}T00:00:00Z`);
-    let payday: number | null = null;
+    let left = Money.of(dep.amount);
+    let counted = Money.zero();
     for (const p of sortedPaydays) {
       if (p > t) break;
-      if (t - p <= SEMIWEEKLY_MATCH_DAYS * DAY_MS) payday = p;
+      if (t - p > SEMIWEEKLY_MATCH_DAYS * DAY_MS) continue;
+      if (!left.greaterThan(0)) break;
+      const owed = unpaid.get(p)!;
+      if (!owed.greaterThan(0)) continue;
+      const applied = owed.lessThan(left) ? owed : left;
+      unpaid.set(p, owed.minus(applied));
+      left = left.minus(applied);
+      if (inQuarter(p)) counted = counted.plus(applied);
     }
-    const inQuarter =
-      payday != null
-        ? payday >= start.getTime() && payday < end.getTime()
-        : t >= winStart.getTime() && t < winEnd.getTime();
-    if (inQuarter) out.push(dep);
+    if (left.greaterThan(0) && t >= winStart.getTime() && t < winEnd.getTime()) counted = counted.plus(left);
+    if (counted.greaterThan(0)) out.push({ ...dep, amount: toAmountString(counted) });
   }
   return out;
 }
