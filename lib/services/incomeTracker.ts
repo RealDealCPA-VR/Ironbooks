@@ -16,11 +16,15 @@
  * Read-only except the notes and the batch actions (which go through the normal services, so
  * posting, permissions and the audit trail behave exactly as when done one at a time).
  */
-import { and, asc, desc, eq, gte, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import {
+  auditLogs,
   collectionNotes,
   customers,
+  estimateLines,
   estimates,
+  invoiceLines,
   invoices,
   paymentsReceived,
   salesOrderLines,
@@ -34,6 +38,7 @@ import { convertToInvoice as convertEstimate } from './estimates';
 import { convertToInvoice as convertSalesOrder } from './salesOrders';
 import { type SalesFormKind, sendQueuedEmails, setSendFlags } from './salesForms';
 import { docRef } from './docNumbers';
+import { arAgingDetail } from './reportsExtra';
 
 const DAY_MS = 86_400_000;
 
@@ -71,36 +76,101 @@ export interface IncomeTracker {
   rows: TrackerRow[];
 }
 
+/**
+ * The Income Tracker AS OF a day (default today). Every bucket is rebuilt for that day, the way
+ * QuickBooks' as-of reports are:
+ *  - documents dated after the day are left out;
+ *  - estimates / sales orders / billable time count as unbilled if they had not been invoiced by
+ *    then (invoices dated later are added back);
+ *  - open invoices use their balance as of the day — the same reconstruction as A/R Aging Detail
+ *    (payments dated later and General Journal credits applied later had not reduced them yet) —
+ *    and are overdue when past due on that day;
+ *  - paid = payments and sales receipts in the 30 days up to the day (a check that bounced after
+ *    the day still counts; it had been received).
+ */
 export async function incomeTracker(
   ctx: ServiceContext,
   opts?: { asOf?: Date; customerId?: string },
 ): Promise<IncomeTracker> {
   const asOf = opts?.asOf ?? new Date();
   const today = startOfDay(asOf);
+  /** Last instant of the as-of day: anything dated that day counts. */
+  const cutoff = new Date(today.getTime() + DAY_MS - 1);
   const rows: TrackerRow[] = [];
   const custFilter = opts?.customerId;
+  const nonVoidInvoice = ne(invoices.status, 'void');
 
   // --- Unbilled: estimates ---
   const estConds = [
     eq(estimates.companyId, ctx.companyId),
-    inArray(estimates.status, ['draft', 'accepted', 'partial', 'open']),
+    // 'closed' estimates were invoiced (or closed) — only shown when that happened after the day.
+    inArray(estimates.status, ['draft', 'accepted', 'partial', 'open', 'closed']),
+    lte(estimates.date, cutoff),
   ];
   if (custFilter) estConds.push(eq(estimates.customerId, custFilter));
-  for (const e of await ctx.db
-    .select({ id: estimates.id, customerId: estimates.customerId, num: estimates.estimateNumber, ref: estimates.refNumber, date: estimates.date, exp: estimates.expirationDate, total: estimates.total, invoiced: estimates.amountInvoiced, status: estimates.status })
+  const ests = await ctx.db
+    .select({ id: estimates.id, customerId: estimates.customerId, num: estimates.estimateNumber, ref: estimates.refNumber, date: estimates.date, exp: estimates.expirationDate, total: estimates.total, invoiced: estimates.amountInvoiced, status: estimates.status, convertedInvoiceId: estimates.convertedInvoiceId })
     .from(estimates)
-    .where(and(...estConds))) {
-    const open = Money.round2(Money.of(e.total).minus(Money.of(e.invoiced ?? '0')));
+    .where(and(...estConds));
+  // Amounts billed from each estimate by invoices dated AFTER the day (not yet billed on it).
+  const estBilledLater = new Map<string, ReturnType<typeof Money.zero>>();
+  const convertedLater = new Set<string>();
+  if (ests.length > 0) {
+    for (const r of await ctx.db
+      .select({
+        estimateId: estimateLines.estimateId,
+        amount: sql<string>`COALESCE(SUM(CAST(${invoiceLines.amount} AS NUMERIC)), 0)`,
+      })
+      .from(invoiceLines)
+      .innerJoin(estimateLines, eq(estimateLines.id, invoiceLines.estimateLineId))
+      .innerJoin(invoices, eq(invoices.id, invoiceLines.invoiceId))
+      .where(
+        and(
+          eq(invoices.companyId, ctx.companyId),
+          nonVoidInvoice,
+          gt(invoices.date, cutoff),
+          inArray(estimateLines.estimateId, ests.map((e) => e.id)),
+        ),
+      )
+      .groupBy(estimateLines.estimateId)) {
+      estBilledLater.set(r.estimateId, Money.of(r.amount));
+    }
+    const convIds = ests.map((e) => e.convertedInvoiceId).filter((x): x is string => !!x);
+    if (convIds.length > 0) {
+      const later = new Set(
+        (
+          await ctx.db
+            .select({ id: invoices.id })
+            .from(invoices)
+            .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, convIds), gt(invoices.date, cutoff)))
+        ).map((r) => r.id),
+      );
+      for (const e of ests) if (e.convertedInvoiceId && later.has(e.convertedInvoiceId)) convertedLater.add(e.id);
+    }
+  }
+  for (const e of ests) {
+    const later = estBilledLater.get(e.id) ?? Money.zero();
+    let invoicedAsOf = Money.of(e.invoiced ?? '0').minus(later);
+    if (invoicedAsOf.lessThan(0)) invoicedAsOf = Money.zero();
+    // A whole-estimate conversion dated after the day: nothing of it was billed yet.
+    if (convertedLater.has(e.id) && later.isZero()) invoicedAsOf = Money.zero();
+    if (e.status === 'closed' && later.isZero() && !convertedLater.has(e.id)) continue; // closed by the day
+    const open = Money.round2(Money.of(e.total).minus(invoicedAsOf));
     if (!open.greaterThan(0)) continue;
+    const status = e.status === 'closed' ? (invoicedAsOf.greaterThan(0) ? 'partial' : 'open') : e.status;
     rows.push({
       bucket: 'unbilled', type: 'estimate', id: e.id, customerId: e.customerId, customerName: '',
       number: docRef(e.ref, e.num), date: iso(e.date)!, dueDate: iso(e.exp), amount: toAmountString(e.total),
-      openBalance: toAmountString(open), status: e.status, daysOverdue: null,
+      openBalance: toAmountString(open), status, daysOverdue: null,
     });
   }
 
-  // --- Unbilled: sales orders (uninvoiced quantity x rate) ---
-  const soConds = [eq(salesOrders.companyId, ctx.companyId), inArray(salesOrders.status, ['open', 'partial'])];
+  // --- Unbilled: sales orders (uninvoiced quantity x rate, as of the day) ---
+  const soConds = [
+    eq(salesOrders.companyId, ctx.companyId),
+    inArray(salesOrders.status, ['open', 'partial', 'closed']),
+    lte(salesOrders.date, cutoff),
+  ];
   if (custFilter) soConds.push(eq(salesOrders.customerId, custFilter));
   const sos = await ctx.db
     .select({ id: salesOrders.id, customerId: salesOrders.customerId, num: salesOrders.orderNumber, ref: salesOrders.refNumber, date: salesOrders.date, total: salesOrders.total, status: salesOrders.status })
@@ -108,37 +178,49 @@ export async function incomeTracker(
     .where(and(...soConds));
   if (sos.length > 0) {
     const lines = await ctx.db
-      .select({ soId: salesOrderLines.salesOrderId, qty: salesOrderLines.quantity, inv: salesOrderLines.quantityInvoiced, rate: salesOrderLines.rate })
+      .select({ id: salesOrderLines.id, soId: salesOrderLines.salesOrderId, qty: salesOrderLines.quantity, inv: salesOrderLines.quantityInvoiced, rate: salesOrderLines.rate })
       .from(salesOrderLines)
       .where(inArray(salesOrderLines.salesOrderId, sos.map((s) => s.id)));
+    // Quantities pulled onto invoices dated after the day were still unbilled on it. Each
+    // conversion records its invoice and per-line quantities (salesOrders.convertToInvoice audit).
+    const qtyLater = await salesOrderQtyInvoicedAfter(ctx, sos.map((s) => s.id), cutoff);
     const openBy = new Map<string, ReturnType<typeof Money.zero>>();
+    const addedBack = new Set<string>();
     for (const l of lines) {
-      const remaining = Money.of(l.qty).minus(Money.of(l.inv ?? '0'));
+      const back = qtyLater.get(l.id) ?? Money.zero();
+      if (back.greaterThan(0)) addedBack.add(l.soId);
+      let invoicedAsOf = Money.of(l.inv ?? '0').minus(back);
+      if (invoicedAsOf.lessThan(0)) invoicedAsOf = Money.zero();
+      const remaining = Money.of(l.qty).minus(invoicedAsOf);
       if (!remaining.greaterThan(0)) continue;
       openBy.set(l.soId, (openBy.get(l.soId) ?? Money.zero()).plus(Money.round2(Money.mul(remaining, l.rate))));
     }
     for (const s of sos) {
+      if (s.status === 'closed' && !addedBack.has(s.id)) continue; // fully invoiced by the day
       const open = openBy.get(s.id) ?? Money.zero();
       if (!open.greaterThan(0)) continue;
       rows.push({
         bucket: 'unbilled', type: 'sales_order', id: s.id, customerId: s.customerId, customerName: '',
         number: docRef(s.ref, s.num), date: iso(s.date)!, dueDate: null, amount: toAmountString(s.total),
-        openBalance: toAmountString(Money.round2(open)), status: s.status, daysOverdue: null,
+        openBalance: toAmountString(Money.round2(open)), status: s.status === 'closed' ? 'partial' : s.status, daysOverdue: null,
       });
     }
   }
 
-  // --- Unbilled: billable time not yet invoiced ---
+  // --- Unbilled: billable time not yet invoiced on the day ---
+  const billedInv = alias(invoices, 'billed_inv');
   const teConds = [
     eq(timeEntries.companyId, ctx.companyId),
     eq(timeEntries.billable, true),
-    isNull(timeEntries.invoicedInvoiceId),
     sql`${timeEntries.customerId} IS NOT NULL`,
+    lte(timeEntries.date, cutoff),
+    or(isNull(timeEntries.invoicedInvoiceId), gt(billedInv.date, cutoff), eq(billedInv.status, 'void'))!,
   ];
   if (custFilter) teConds.push(eq(timeEntries.customerId, custFilter));
   for (const t of await ctx.db
     .select({ id: timeEntries.id, customerId: timeEntries.customerId, date: timeEntries.date, hours: timeEntries.hours, rate: timeEntries.rate, description: timeEntries.description })
     .from(timeEntries)
+    .leftJoin(billedInv, eq(billedInv.id, timeEntries.invoicedInvoiceId))
     .where(and(...teConds))) {
     const amount = Money.round2(Money.mul(t.hours, t.rate ?? 0));
     rows.push({
@@ -148,26 +230,34 @@ export async function incomeTracker(
     });
   }
 
-  // --- Unpaid / Overdue: open invoices ---
-  const invConds = [
-    eq(invoices.companyId, ctx.companyId),
-    inArray(invoices.status, ['open', 'partial', 'overdue']),
-    sql`CAST(${invoices.balanceDue} AS NUMERIC) > 0`,
-  ];
-  if (custFilter) invConds.push(eq(invoices.customerId, custFilter));
-  for (const i of await ctx.db
-    .select({ id: invoices.id, customerId: invoices.customerId, num: invoices.invoiceNumber, ref: invoices.refNumber, date: invoices.date, due: invoices.dueDate, total: invoices.total, bal: invoices.balanceDue, status: invoices.status, sc: invoices.isStatementCharge })
-    .from(invoices)
-    .where(and(...invConds))) {
-    const due = i.due ?? i.date;
-    const daysOverdue = Math.floor((today.getTime() - startOfDay(due).getTime()) / DAY_MS);
-    const overdue = daysOverdue > 0;
-    rows.push({
-      bucket: overdue ? 'overdue' : 'unpaid', type: i.sc ? 'statement_charge' : 'invoice', id: i.id,
-      customerId: i.customerId, customerName: '', number: docRef(i.ref, i.num), date: iso(i.date)!, dueDate: iso(due),
-      amount: toAmountString(i.total), openBalance: toAmountString(i.bal), status: overdue ? 'overdue' : i.status,
-      daysOverdue: overdue ? daysOverdue : null,
-    });
+  // --- Unpaid / Overdue: invoices open on the day (balance as of the day, as A/R Aging Detail) ---
+  const agingRows = (await arAgingDetail(ctx, cutoff)).rows.filter(
+    (r) => r.docType === 'invoice' && (!custFilter || r.entityId === custFilter),
+  );
+  if (agingRows.length > 0) {
+    const info = new Map(
+      (
+        await ctx.db
+          .select({ id: invoices.id, num: invoices.invoiceNumber, ref: invoices.refNumber, date: invoices.date, due: invoices.dueDate, total: invoices.total, retainage: invoices.retainageAmount, sc: invoices.isStatementCharge })
+          .from(invoices)
+          .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, agingRows.map((r) => r.docId))))
+      ).map((i) => [i.id, i]),
+    );
+    for (const a of agingRows) {
+      const i = info.get(a.docId);
+      if (!i) continue;
+      const due = i.due ?? i.date;
+      const daysOverdue = Math.floor((today.getTime() - startOfDay(due).getTime()) / DAY_MS);
+      const overdue = daysOverdue > 0;
+      const billed = Money.of(i.total).minus(Money.of(i.retainage ?? '0'));
+      const status = overdue ? 'overdue' : Money.of(a.openBalance).lessThan(billed) ? 'partial' : 'open';
+      rows.push({
+        bucket: overdue ? 'overdue' : 'unpaid', type: i.sc ? 'statement_charge' : 'invoice', id: i.id,
+        customerId: a.entityId, customerName: '', number: docRef(i.ref, i.num), date: iso(i.date)!, dueDate: iso(due),
+        amount: toAmountString(i.total), openBalance: toAmountString(a.openBalance), status,
+        daysOverdue: overdue ? daysOverdue : null,
+      });
+    }
   }
 
   // --- Paid in the last 30 days ---
@@ -177,7 +267,8 @@ export async function incomeTracker(
   const payConds = [
     eq(paymentsReceived.companyId, ctx.companyId),
     isNull(paymentsReceived.voidedAt),
-    isNull(paymentsReceived.bouncedAt),
+    // A check that bounced after the day had still been received on it.
+    or(isNull(paymentsReceived.bouncedAt), gt(paymentsReceived.bouncedAt, cutoff))!,
     gte(paymentsReceived.date, since),
     lt(paymentsReceived.date, until),
   ];
@@ -229,6 +320,62 @@ export async function incomeTracker(
   }
   rows.sort((a, b) => b.date.localeCompare(a.date));
   return { asOf: iso(today)!, totals, rows };
+}
+
+/**
+ * Sales-order line quantities pulled onto (non-void) invoices dated AFTER `cutoff`, per line.
+ * salesOrders.convertToInvoice records each conversion's invoice and per-line quantities in the
+ * audit trail (`invoiceId`, `invoicedQuantities`), which is the only dated link from an order
+ * line to the invoice that billed it.
+ */
+async function salesOrderQtyInvoicedAfter(
+  ctx: ServiceContext,
+  orderIds: string[],
+  cutoff: Date,
+): Promise<Map<string, ReturnType<typeof Money.zero>>> {
+  const out = new Map<string, ReturnType<typeof Money.zero>>();
+  if (orderIds.length === 0) return out;
+  const logs = await ctx.db
+    .select({ newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'sales_order'),
+        inArray(auditLogs.entityId, orderIds),
+        sql`${auditLogs.newValues} ->> 'invoiceId' IS NOT NULL`,
+      ),
+    );
+  const conv: Array<{ invoiceId: string; lines: Array<{ lineId: string; quantity: string }> }> = [];
+  for (const l of logs) {
+    const v = (l.newValues ?? {}) as { invoiceId?: unknown; invoicedQuantities?: unknown };
+    if (typeof v.invoiceId !== 'string' || !Array.isArray(v.invoicedQuantities)) continue;
+    const lines = (v.invoicedQuantities as Array<{ lineId?: unknown; quantity?: unknown }>)
+      .filter((q) => typeof q.lineId === 'string' && q.quantity !== undefined)
+      .map((q) => ({ lineId: q.lineId as string, quantity: String(q.quantity) }));
+    conv.push({ invoiceId: v.invoiceId, lines });
+  }
+  if (conv.length === 0) return out;
+  const later = new Set(
+    (
+      await ctx.db
+        .select({ id: invoices.id })
+        .from(invoices)
+        .where(
+          and(
+            eq(invoices.companyId, ctx.companyId),
+            inArray(invoices.id, [...new Set(conv.map((c) => c.invoiceId))]),
+            gt(invoices.date, cutoff),
+            ne(invoices.status, 'void'),
+          ),
+        )
+    ).map((r) => r.id),
+  );
+  for (const c of conv) {
+    if (!later.has(c.invoiceId)) continue;
+    for (const q of c.lines) out.set(q.lineId, (out.get(q.lineId) ?? Money.zero()).plus(Money.of(q.quantity)));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

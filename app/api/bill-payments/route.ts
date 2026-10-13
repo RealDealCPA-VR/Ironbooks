@@ -12,9 +12,14 @@
  *     reference?:       string,
  *     paymentAccountId: string,
  *     discountAccountId?: string,   // required if any application takes a discount
- *     applications: Array<{ billId: string, amountApplied: string, discountTaken?: string }>
+ *     applications: Array<{ billId: string, amountApplied: string, discountTaken?: string }>,
+ *     vendorCredits?:  Array<{ vendorCreditId, billId, amount }>,   // P1: applied in the same save
+ *     journalCredits?: Array<{ journalLineId, billId, amount }>,
+ *     journalOffsets?: Array<{ journalLineId, chargeLineId, amount }> // JE credit -> JE amount owed
  *   }
- *   → 201 { payment: BillPayment }
+ *   → 201 { payment: BillPayment | null, creditsApplied: string }
+ *   Everything is saved in ONE transaction (payBillsWithCredits): if any part is refused, nothing
+ *   is saved. payment is null when only credits were applied.
  *
  * ServiceError codes → HTTP:
  *   NOT_FOUND   → 404
@@ -26,7 +31,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { payBills, listBillPayments } from '@/lib/services/billPayments';
+import { payBillsWithCredits, listBillPayments } from '@/lib/services/billPayments';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { payBillsSchema } from '@/lib/validation/billPayments';
@@ -81,9 +86,9 @@ export async function POST(req: NextRequest) {
     }
 
     const { allowDuplicateNumber, ...input } = parsed.data;
-    const payment = await payBills(ctx, { ...input, checkDuplicateNumber: !allowDuplicateNumber });
+    const result = await payBillsWithCredits(ctx, { ...input, paymentAccountId: input.paymentAccountId ?? '', checkDuplicateNumber: !allowDuplicateNumber });
 
-    return NextResponse.json({ payment }, { status: 201 });
+    return NextResponse.json(result, { status: 201 });
   } catch (err) {
     if (err instanceof ServiceError) {
       return NextResponse.json(

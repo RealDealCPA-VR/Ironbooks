@@ -660,6 +660,8 @@ export const paymentApplications = pgTable('payment_applications', {
   amountApplied: decimal('amount_applied', { precision: 15, scale: 2 }).notNull(),
   /** wave2 sales (C3): early-payment discount taken on this invoice (reduces its balance too). */
   discountAmount: decimal('discount_amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** P1 payments: home-currency A/R relieved by this application, cash + discount (null = legacy, amount x rate). */
+  amountHome: decimal('amount_home', { precision: 15, scale: 2 }),
 });
 
 // ---- Bills (A/P) ----
@@ -2098,6 +2100,8 @@ export const journalItemApplications = pgTable('journal_item_applications', {
   billId: uuid('bill_id').references(() => bills.id),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   date: timestamp('date').notNull(),
+  /** P1 payments (0041): kind 'journal_offset' — the two rows (credit line + charge line) of one application. */
+  pairId: uuid('pair_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

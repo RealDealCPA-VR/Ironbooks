@@ -308,7 +308,7 @@ describe('wave2 sales — QA re-test round 2', () => {
       await assertBooks();
     });
 
-    it('refuses another customer invoice and refuses paymentCredits on edit; nothing changes', async () => {
+    it('refuses another customer invoice; nothing changes (P1: paymentCredits on edit are applied)', async () => {
       const cust = await newCustomer('QA4 Earlier Owner');
       const other = await newCustomer('QA4 Earlier Other');
       const otherInv = await newInvoice(other, 50, '2026-06-01');
@@ -334,17 +334,20 @@ describe('wave2 sales — QA re-test round 2', () => {
           paymentCredits: [{ paymentId: early.payment.id, invoiceId: otherInv.id, amount: '10' }],
         }),
       ).rejects.toMatchObject({ code: 'VALIDATION' });
-      await expect(
-        updatePayment(ctx, p.payment.id, {
-          customerId: cust, date: new Date('2026-06-03'), method: 'cash', amount: '10',
-          applications: [{ invoiceId: ownInv.id, amountApplied: '10' }],
-          paymentCredits: [{ paymentId: early.payment.id, invoiceId: ownInv.id, amount: '5' }],
-        }),
-      ).rejects.toMatchObject({ code: 'VALIDATION' });
       expect(await jeCount()).toBe(je);
       expect((await getPayment(ctx, early.payment.id)).unapplied).toBe('50.00');
       expect((await getInvoice(ctx, otherInv.id)).balanceDue).toBe('50.00');
       expect((await getInvoice(ctx, ownInv.id)).balanceDue).toBe('40.00');
+      await assertBooks();
+      // P1 (PARITY C4): earlier-payment credits picked while editing used to be refused / dropped;
+      // QuickBooks applies them, so they are applied now (from the earlier payment, no new GL).
+      await updatePayment(ctx, p.payment.id, {
+        customerId: cust, date: new Date('2026-06-03'), method: 'cash', amount: '10',
+        applications: [{ invoiceId: ownInv.id, amountApplied: '10' }],
+        paymentCredits: [{ paymentId: early.payment.id, invoiceId: ownInv.id, amount: '5' }],
+      });
+      expect((await getPayment(ctx, early.payment.id)).unapplied).toBe('45.00');
+      expect((await getInvoice(ctx, ownInv.id)).balanceDue).toBe('35.00');
       await assertBooks();
     });
 

@@ -1,12 +1,14 @@
 /**
  * API route: /api/payments
  *
- * GET  — list payments received (optionally filtered by ?customerId=)
+ * GET  — list payments received, newest first, one page at a time:
+ *        ?customerId=&from=YYYY-MM-DD&to=YYYY-MM-DD&search=&limit=&offset=
+ *        → { payments, total, limit, offset }
  * POST — record a new payment received from a customer
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { receivePayment, listPayments } from '@/lib/services/payments';
+import { receivePayment, searchPayments } from '@/lib/services/payments';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { receivePaymentSchema } from '@/lib/validation/payments';
@@ -30,12 +32,30 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const { searchParams } = req.nextUrl;
-    const customerId = searchParams.get('customerId') ?? undefined;
-    const limit = searchParams.has('limit') ? Number(searchParams.get('limit')) : undefined;
-    const offset = searchParams.has('offset') ? Number(searchParams.get('offset')) : undefined;
+    const customerId = searchParams.get('customerId') || undefined;
+    const num = (k: string) => {
+      const v = searchParams.get(k);
+      const n = v === null || v === '' ? NaN : Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const day = (k: string) => {
+      const v = searchParams.get(k);
+      if (!v) return undefined;
+      const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(v) ? `${v}T00:00:00Z` : v);
+      if (Number.isNaN(d.getTime())) throw new ServiceError('VALIDATION', `${k} must be a date (YYYY-MM-DD).`);
+      return d;
+    };
 
-    const payments = await listPayments(ctx, { customerId, limit, offset });
-    return NextResponse.json({ payments });
+    const page = await searchPayments(ctx, {
+      customerId,
+      from: day('from'),
+      to: day('to'),
+      search: searchParams.get('search') ?? undefined,
+      // Without paging parameters the route keeps returning the newest 100 (older callers).
+      limit: num('limit') ?? 100,
+      offset: num('offset'),
+    });
+    return NextResponse.json(page);
   } catch (err) {
     if (err instanceof ServiceError) {
       return NextResponse.json(

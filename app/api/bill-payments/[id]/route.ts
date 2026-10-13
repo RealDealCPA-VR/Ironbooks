@@ -70,7 +70,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const parsed = payBillsSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const { allowDuplicateNumber, ...input } = parsed.data;
-    const payment = await withVersionCheck(ctx, 'bill_payment', id, expectedVersion(req), (c) => updateBillPayment(c, id, { ...input, checkDuplicateNumber: !allowDuplicateNumber }));
+    const payment = await withVersionCheck(ctx, 'bill_payment', id, expectedVersion(req), (c) => updateBillPayment(c, id, { ...input, paymentAccountId: input.paymentAccountId ?? '', checkDuplicateNumber: !allowDuplicateNumber }));
     return NextResponse.json(payment);
   } catch (err) {
     return routeError(err, 'PATCH /api/bill-payments/[id]');

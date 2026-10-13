@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useMemo, useState, useCallback } from 'react';
 import { HandCoins, Plus } from 'lucide-react';
 import {
   AmountInput,
@@ -27,10 +27,11 @@ import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useNewParam } from '@/lib/useFocusParam';
+import { isDepositTargetAccount } from '@/lib/accountTypes';
 // wave2 prefs: Payments > auto-apply / auto-calculate / Undeposited Funds; date warnings
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate } from '@/lib/formPrefs';
-import { autoApplyPayment, sumApplied } from '@/lib/paymentApply';
+import { autoApplyPayment, cashDue, sumApplied } from '@/lib/paymentApply';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,6 +41,8 @@ interface Payment {
   id: string;
   date: string;
   customerId: string;
+  /** P1: returned by the paged list. */
+  customerName?: string | null;
   method: string;
   amount: string;
   unapplied: string;
@@ -47,11 +50,19 @@ interface Payment {
   voidedAt: string | null;
   /** wave2 sales (F2): set when the check bounced. */
   bouncedAt?: string | null;
+  currency?: string | null;
+  exchangeRate?: string | null;
+  /** P1: what the server will accept (see searchPayments). */
+  canBounce?: boolean;
+  deposited?: boolean;
+  refunded?: boolean;
 }
 
 interface Customer {
   id: string;
   displayName: string;
+  /** Present when customers carry a currency (multi-currency). */
+  currency?: string | null;
 }
 
 interface Account {
@@ -59,17 +70,29 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype?: string | null;
 }
 
 interface Invoice {
   id: string;
   invoiceNumber?: number;
+  /** The document number users see ("INV-1001"); falls back to the legacy integer. */
+  refNumber?: string | null;
   date: string;
   dueDate?: string | null;
   total: string;
   balanceDue: string;
   status: string;
   memo: string | null;
+  currency?: string | null;
+  exchangeRate?: string | null;
+}
+
+interface CurrencyRow {
+  code: string;
+  name?: string;
+  rateToBase: string;
+  isBase: boolean;
 }
 
 interface Application {
@@ -108,9 +131,31 @@ function methodBadgeTone(
   }
 }
 
+/** The invoice number users see everywhere else (typed ref number, else the legacy integer). */
+function invNo(inv: { refNumber?: string | null; invoiceNumber?: number | null }): string {
+  const typed = inv.refNumber?.trim();
+  if (typed) return typed;
+  return inv.invoiceNumber === undefined || inv.invoiceNumber === null ? '' : String(inv.invoiceNumber);
+}
+
+/** Format an amount in a document currency (home currency when null/blank). */
+function money(v: string | number, currency?: string | null): string {
+  if (!currency) return formatCurrency(v);
+  try {
+    return formatCurrency(v, currency);
+  } catch {
+    return `${currency} ${Number(v).toFixed(2)}`;
+  }
+}
+
 // Sum the amountApplied values across all applications for display only (Number() per rules).
 function sumApplications(apps: Application[]): number {
   return apps.reduce((acc, a) => acc + (Number(a.amountApplied) || 0), 0);
+}
+
+/** Accounts a payment can be deposited to / a refund paid from (bank, cash, Undeposited Funds). */
+function depositTargets(accounts: Account[]): Account[] {
+  return accounts.filter((a) => isDepositTargetAccount({ type: a.type, subtype: a.subtype ?? null }));
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +170,8 @@ interface PaymentDetail extends Payment {
   credits: Array<{ id: string; creditMemoId: string; invoiceId: string; amount: string }>;
   /** I11: General Journal charges this payment paid / journal credits applied with it. */
   journalApplications?: Array<{ kind: string; journalLineId: string; invoiceId: string | null; amount: string }>;
+  /** P1: General Journal credits it applied to General Journal charges. */
+  journalOffsets?: Array<{ journalLineId: string; chargeLineId: string; amount: string }>;
 }
 
 /** I11: an open General Journal A/R line (a charge to pay, or a credit to apply). */
@@ -162,6 +209,9 @@ interface ReceivePaymentModalProps {
   accounts: Account[];
 }
 
+/** "Apply to" targets in the credits table: an invoice id, or `je:<line id>` for a JE charge. */
+const JE_PREFIX = 'je:';
+
 function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accounts }: ReceivePaymentModalProps) {
   const today = new Date().toISOString().slice(0, 10);
   const prefs = usePreferences();
@@ -177,6 +227,10 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   const [memo, setMemo] = useState('');
   const [depositAccountId, setDepositAccountId] = useState('');
   const [discountAccountId, setDiscountAccountId] = useState('');
+  // P1: payment currency ('' = home) and exchange rate (home units per 1 unit).
+  const [currency, setCurrency] = useState('');
+  const [exchangeRate, setExchangeRate] = useState('');
+  const [currencyList, setCurrencyList] = useState<CurrencyRow[]>([]);
 
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [invoicesLoading, setInvoicesLoading] = useState(false);
@@ -184,7 +238,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   const [applicationAmounts, setApplicationAmounts] = useState<Record<string, string>>({});
   const [discountAmounts, setDiscountAmounts] = useState<Record<string, string>>({});
   const [suggestions, setSuggestions] = useState<Record<string, DiscountSuggestion>>({});
-  // credit memo id -> { invoiceId, amount }
+  // credit id -> { invoiceId (or je:<charge line id>), amount }
   const [credits, setCredits] = useState<AvailableCredit[]>([]);
   const [creditUse, setCreditUse] = useState<Record<string, { invoiceId: string; amount: string }>>({});
   // I11: open General Journal charges (journal line id -> cash applied).
@@ -193,8 +247,27 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
 
   const [saving, setSaving] = useState(false);
 
-  const depositAccounts = accounts.filter((a) => a.type === 'asset' && a.code !== '1200');
+  const depositAccounts = depositTargets(accounts);
   const discountAccounts = accounts.filter((a) => a.type === 'revenue' || a.type === 'expense');
+  const homeCode = (currencyList.find((c) => c.isBase)?.code ?? '').toUpperCase();
+  /** '' for the home currency, else the upper-case code. */
+  const normCur = useCallback(
+    (c: string | null | undefined) => {
+      const v = (c ?? '').trim().toUpperCase();
+      return v === homeCode ? '' : v;
+    },
+    [homeCode],
+  );
+  const foreign = currency !== '';
+
+  // Currency list (for the home code and default exchange rates). Not everyone can read it.
+  useEffect(() => {
+    if (!open) return;
+    api
+      .get<CurrencyRow[]>('/api/currencies')
+      .then((rows) => setCurrencyList(Array.isArray(rows) ? rows : []))
+      .catch(() => setCurrencyList([]));
+  }, [open]);
 
   // Reset / prefill when the modal opens.
   useEffect(() => {
@@ -208,6 +281,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       setMemo(editing.memo ?? '');
       setDepositAccountId(editing.depositAccountId ?? '');
       setDiscountAccountId(editing.discountAccountId ?? '');
+      setCurrency((editing.currency ?? '').toUpperCase());
+      setExchangeRate(editing.currency && editing.exchangeRate ? String(Number(editing.exchangeRate)) : '');
     } else {
       setCustomerId('');
       setDate(today);
@@ -217,6 +292,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       setMemo('');
       setDepositAccountId('');
       setDiscountAccountId('');
+      setCurrency('');
+      setExchangeRate('');
     }
     setInvoices([]);
     setApplicationAmounts({});
@@ -238,7 +315,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, prefs.loaded, accounts]);
 
-  // Fetch open invoices + available credits when the customer changes.
+  // Fetch open invoices + available credits when the customer changes. A quick switch to another
+  // customer cancels the earlier request so its results never land on the wrong customer.
   useEffect(() => {
     if (!open || !customerId) {
       setInvoices([]);
@@ -246,6 +324,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       setJournalCharges([]);
       return;
     }
+    let cancelled = false;
     setInvoicesLoading(true);
     const mine = editing && editing.customerId === customerId ? editing : null;
     Promise.all([
@@ -254,18 +333,23 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       api.get<{ charges: JournalOpenRow[]; credits: JournalOpenRow[] }>(`/api/payments/journal-items?customerId=${customerId}`),
     ])
       .then(([rows, cred, journal]) => {
-        // I11: General Journal charges, with what this payment already paid handed back when editing.
+        if (cancelled) return;
+        // I11: General Journal charges, with what this payment already paid / offset handed back.
         const myJournal = mine?.journalApplications ?? [];
+        const myOffsets = mine?.journalOffsets ?? [];
         const paidByMe = new Map<string, number>();
         for (const j of myJournal.filter((j) => j.kind === 'payment')) {
           paidByMe.set(j.journalLineId, (paidByMe.get(j.journalLineId) ?? 0) + Number(j.amount));
         }
+        const offsetOnCharge = new Map<string, number>();
+        for (const o of myOffsets) offsetOnCharge.set(o.chargeLineId, (offsetOnCharge.get(o.chargeLineId) ?? 0) + Number(o.amount));
         const charges = (journal.charges ?? []).map((c) => ({
           ...c,
-          open: (Number(c.open) + (paidByMe.get(c.journalLineId) ?? 0)).toFixed(2),
+          open: (Number(c.open) + (paidByMe.get(c.journalLineId) ?? 0) + (offsetOnCharge.get(c.journalLineId) ?? 0)).toFixed(2),
         }));
-        for (const [lineId, amt] of paidByMe) {
+        for (const lineId of new Set([...paidByMe.keys(), ...offsetOnCharge.keys()])) {
           if (!charges.some((c) => c.journalLineId === lineId)) {
+            const amt = (paidByMe.get(lineId) ?? 0) + (offsetOnCharge.get(lineId) ?? 0);
             charges.push({ journalLineId: lineId, ref: 'General Journal', date: '', memo: null, open: amt.toFixed(2) });
           }
         }
@@ -283,14 +367,19 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         for (const j of myJournal.filter((j) => j.kind === 'invoice_credit' && j.invoiceId)) {
           giveBack.set(j.invoiceId!, (giveBack.get(j.invoiceId!) ?? 0) + Number(j.amount));
         }
-        const open = list
+        const openInv = list
           .map((inv) => ({ ...inv, balanceDue: (Number(inv.balanceDue) + (giveBack.get(inv.id) ?? 0)).toFixed(2) }))
           .filter((inv) => inv.status !== 'void' && inv.status !== 'draft' && Number(inv.balanceDue) > 0);
-        setInvoices(open);
-        // Earlier unapplied payments can be used on a NEW payment only (not while editing).
-        const memoCredits = (cred.credits ?? []).filter(
-          (c) => c.kind === 'credit_memo' || c.kind === 'journal_entry' || (!mine && c.kind === 'payment'),
-        );
+        setInvoices(openInv);
+        // A new payment for a customer whose open invoices are all in one foreign currency starts in
+        // that currency (QB: a foreign customer's payments are in the customer's currency).
+        if (!mine) {
+          const custCur = normCur(customers.find((c) => c.id === customerId)?.currency);
+          const curs = [...new Set(openInv.map((i) => normCur(i.currency)))];
+          setCurrency(custCur || (curs.length === 1 ? curs[0] : ''));
+        }
+        // Earlier unapplied payments can be used too — never the payment being edited itself.
+        const usable = (cred.credits ?? []).filter((c) => !(mine && c.kind === 'payment' && c.id === mine.id));
         // Add back credit used by this payment so it can be re-applied when editing.
         const usedByMe = new Map<string, number>();
         for (const c of mine?.credits ?? []) usedByMe.set(c.creditMemoId, (usedByMe.get(c.creditMemoId) ?? 0) + Number(c.amount));
@@ -298,7 +387,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         for (const j of myJournal.filter((j) => j.kind === 'invoice_credit')) {
           journalUsedByMe.set(j.journalLineId, (journalUsedByMe.get(j.journalLineId) ?? 0) + Number(j.amount));
         }
-        const merged = memoCredits.map((c) => ({
+        for (const o of myOffsets) journalUsedByMe.set(o.journalLineId, (journalUsedByMe.get(o.journalLineId) ?? 0) + Number(o.amount));
+        const merged = usable.map((c) => ({
           ...c,
           available: (Number(c.available) + ((c.kind === 'journal_entry' ? journalUsedByMe : usedByMe).get(c.id) ?? 0)).toFixed(2),
         }));
@@ -318,22 +408,42 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
               ...myJournal
                 .filter((j) => j.kind === 'invoice_credit' && j.invoiceId)
                 .map((j) => [j.journalLineId, { invoiceId: j.invoiceId!, amount: String(Number(j.amount)) }] as const),
+              ...myOffsets.map((o) => [o.journalLineId, { invoiceId: JE_PREFIX + o.chargeLineId, amount: String(Number(o.amount)) }] as const),
             ]),
           );
         } else {
-          // Preferences > Payments: "Automatically apply payments" (oldest due first).
           setAppsTouched(false);
-          setApplicationAmounts(prefs.company.autoApplyPayments && amount ? autoApplyPayment(amount, open) : {});
+          setApplicationAmounts({});
           setDiscountAmounts({});
           setCreditUse({});
         }
       })
       .catch((err) => {
+        if (cancelled) return;
         toastError(err, 'Failed to load invoices.');
         setInvoices([]);
       })
-      .finally(() => setInvoicesLoading(false));
+      .finally(() => {
+        if (!cancelled) setInvoicesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, customerId, editing]);
+
+  // Exchange rate defaults from the currency list when the currency changes (a new payment, or an
+  // edit that switches currency). The user can type the rate the bank actually used.
+  useEffect(() => {
+    if (!open) return;
+    if (!currency) {
+      setExchangeRate('');
+      return;
+    }
+    if (editing && (editing.currency ?? '').toUpperCase() === currency && editing.exchangeRate) return;
+    const row = currencyList.find((c) => c.code.toUpperCase() === currency);
+    setExchangeRate(row ? String(Number(row.rateToBase)) : '');
+  }, [open, currency, currencyList, editing]);
 
   // Early-payment discount suggestions from the customer's terms, for the payment date.
   useEffect(() => {
@@ -341,11 +451,92 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       setSuggestions({});
       return;
     }
+    let cancelled = false;
     api
       .get<{ discounts: DiscountSuggestion[] }>(`/api/payments/discounts?customerId=${customerId}&date=${date}`)
-      .then((r) => setSuggestions(Object.fromEntries((r.discounts ?? []).map((d) => [d.invoiceId, d]))))
-      .catch(() => setSuggestions({}));
+      .then((r) => {
+        if (!cancelled) setSuggestions(Object.fromEntries((r.discounts ?? []).map((d) => [d.invoiceId, d])));
+      })
+      .catch(() => {
+        if (!cancelled) setSuggestions({});
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, customerId, date]);
+
+  // Only invoices in the payment's currency can be paid by it (QB: one currency per payment).
+  const visibleInvoices = useMemo(
+    () => invoices.filter((inv) => normCur(inv.currency) === currency),
+    [invoices, currency, normCur],
+  );
+  const currencyChoices = useMemo(
+    () => [...new Set(['', ...invoices.map((i) => normCur(i.currency)), currency])],
+    [invoices, currency, normCur],
+  );
+  // Credits and General Journal items are home-currency only.
+  const shownCredits = foreign ? [] : credits;
+  const shownCharges = foreign ? [] : journalCharges;
+
+  const paymentCreditIds = new Set(credits.filter((c) => c.kind === 'payment').map((c) => c.id));
+  const journalCreditIds = new Set(credits.filter((c) => c.kind === 'journal_entry').map((c) => c.id));
+  const usedCredits = Object.entries(foreign ? {} : creditUse).filter(([, u]) => u.invoiceId && Number(u.amount) > 0);
+  const toCharge = (target: string) => target.startsWith(JE_PREFIX);
+  const creditApps = usedCredits
+    .filter(([id, u]) => !paymentCreditIds.has(id) && !journalCreditIds.has(id) && !toCharge(u.invoiceId))
+    .map(([creditMemoId, u]) => ({ creditMemoId, invoiceId: u.invoiceId, amount: u.amount }));
+  const paymentCreditApps = usedCredits
+    .filter(([id]) => paymentCreditIds.has(id))
+    .map(([paymentId, u]) =>
+      toCharge(u.invoiceId)
+        ? { paymentId, journalLineId: u.invoiceId.slice(JE_PREFIX.length), amount: u.amount }
+        : { paymentId, invoiceId: u.invoiceId, amount: u.amount },
+    );
+  // I11: General Journal A/R credits applied to invoices; P1: ... or to General Journal charges.
+  const journalCreditApps = usedCredits
+    .filter(([id, u]) => journalCreditIds.has(id) && !toCharge(u.invoiceId))
+    .map(([journalLineId, u]) => ({ journalLineId, invoiceId: u.invoiceId, amount: u.amount }));
+  const journalOffsets = usedCredits
+    .filter(([id, u]) => journalCreditIds.has(id) && toCharge(u.invoiceId))
+    .map(([journalLineId, u]) => ({ journalLineId, chargeLineId: u.invoiceId.slice(JE_PREFIX.length), amount: u.amount }));
+  const allCreditApps = usedCredits.map(([, u]) => ({ invoiceId: u.invoiceId, amount: u.amount }));
+  /** Credits entered against one invoice (or `je:<line>` charge). */
+  const creditOn = (target: string) =>
+    allCreditApps.filter((c) => c.invoiceId === target).reduce((s, c) => s + Number(c.amount), 0);
+
+  const applications = visibleInvoices
+    .map((inv) => ({
+      invoiceId: inv.id,
+      amountApplied: applicationAmounts[inv.id] && Number(applicationAmounts[inv.id]) > 0 ? applicationAmounts[inv.id] : '0',
+      discountAmount: discountAmounts[inv.id] && Number(discountAmounts[inv.id]) > 0 ? discountAmounts[inv.id] : null,
+    }))
+    .filter((a) => Number(a.amountApplied) > 0 || Number(a.discountAmount ?? 0) > 0);
+  // I11: cash applied to General Journal charges.
+  const journalItems = shownCharges
+    .filter((c) => Number(journalAmounts[c.journalLineId] || 0) > 0)
+    .map((c) => ({ journalLineId: c.journalLineId, amount: journalAmounts[c.journalLineId] }));
+
+  const appliedTotal =
+    applications.reduce((s, a) => s + Number(a.amountApplied), 0) + journalItems.reduce((s, j) => s + Number(j.amount), 0);
+  const discountTotal = applications.reduce((s, a) => s + Number(a.discountAmount ?? 0), 0);
+  const creditTotal = allCreditApps.reduce((s, c) => s + Number(c.amount), 0);
+  const anyDiscount = discountTotal > 0;
+
+  /**
+   * C3: what cash still has to cover on each invoice — its balance less the discount and credits
+   * already entered (QB lowers the payment due by the discount). Auto-apply works from this, so a
+   * discount taken first can never make the save fail with "more than it owes".
+   */
+  const cashDueInvoices = (disc = discountAmounts, use = creditUse) => {
+    const deductions: Record<string, number> = {};
+    for (const inv of visibleInvoices) {
+      const cred = Object.values(use)
+        .filter((u) => u.invoiceId === inv.id)
+        .reduce((s, u) => s + (Number(u.amount) || 0), 0);
+      deductions[inv.id] = (Number(disc[inv.id]) || 0) + cred;
+    }
+    return cashDue(visibleInvoices, deductions);
+  };
 
   const setAppAmount = (invoiceId: string, value: string) => {
     setAppsTouched(true);
@@ -363,57 +554,51 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     setAmountTouched(true);
     // "Automatically apply payments": spread it over open invoices, oldest due first.
     if (prefs.company.autoApplyPayments && !appsTouched) {
-      setApplicationAmounts(autoApplyPayment(value, invoices));
+      setApplicationAmounts(autoApplyPayment(value, cashDueInvoices()));
     }
   };
 
-  const applications = invoices
-    .map((inv) => ({
-      invoiceId: inv.id,
-      amountApplied: applicationAmounts[inv.id] && Number(applicationAmounts[inv.id]) > 0 ? applicationAmounts[inv.id] : '0',
-      discountAmount: discountAmounts[inv.id] && Number(discountAmounts[inv.id]) > 0 ? discountAmounts[inv.id] : null,
-    }))
-    .filter((a) => Number(a.amountApplied) > 0 || Number(a.discountAmount ?? 0) > 0);
-  const paymentCreditIds = new Set(credits.filter((c) => c.kind === 'payment').map((c) => c.id));
-  const journalCreditIds = new Set(credits.filter((c) => c.kind === 'journal_entry').map((c) => c.id));
-  const usedCredits = Object.entries(creditUse).filter(([, u]) => u.invoiceId && Number(u.amount) > 0);
-  const creditApps = usedCredits
-    .filter(([id]) => !paymentCreditIds.has(id) && !journalCreditIds.has(id))
-    .map(([creditMemoId, u]) => ({ creditMemoId, invoiceId: u.invoiceId, amount: u.amount }));
-  const paymentCreditApps = usedCredits
-    .filter(([id]) => paymentCreditIds.has(id))
-    .map(([paymentId, u]) => ({ paymentId, invoiceId: u.invoiceId, amount: u.amount }));
-  // I11: General Journal A/R credits applied to invoices.
-  const journalCreditApps = usedCredits
-    .filter(([id]) => journalCreditIds.has(id))
-    .map(([journalLineId, u]) => ({ journalLineId, invoiceId: u.invoiceId, amount: u.amount }));
-  const allCreditApps = [...creditApps, ...paymentCreditApps, ...journalCreditApps];
-  // I11: cash applied to General Journal charges.
-  const journalItems = journalCharges
-    .filter((c) => Number(journalAmounts[c.journalLineId] || 0) > 0)
-    .map((c) => ({ journalLineId: c.journalLineId, amount: journalAmounts[c.journalLineId] }));
+  /** A discount or credit changed: re-spread an auto-applied amount over what is still due. */
+  const reapply = (disc: Record<string, string>, use: Record<string, { invoiceId: string; amount: string }>) => {
+    if (prefs.company.autoApplyPayments && !appsTouched && amount) {
+      setApplicationAmounts(autoApplyPayment(amount, cashDueInvoices(disc, use)));
+    }
+  };
+  const setDiscount = (invoiceId: string, value: string) => {
+    const next = { ...discountAmounts, [invoiceId]: value };
+    setDiscountAmounts(next);
+    reapply(next, creditUse);
+  };
+  const setCredit = (creditId: string, value: { invoiceId: string; amount: string }) => {
+    const next = { ...creditUse, [creditId]: value };
+    setCreditUse(next);
+    reapply(discountAmounts, next);
+  };
 
-  const appliedTotal =
-    applications.reduce((s, a) => s + Number(a.amountApplied), 0) + journalItems.reduce((s, j) => s + Number(j.amount), 0);
-  const discountTotal = applications.reduce((s, a) => s + Number(a.discountAmount ?? 0), 0);
-  const creditTotal = allCreditApps.reduce((s, c) => s + Number(c.amount), 0);
-  const anyDiscount = discountTotal > 0;
+  // A new payment for a customer whose invoices just loaded: auto-apply the amount already typed.
+  useEffect(() => {
+    if (!open || editing || appsTouched || !amount || !prefs.company.autoApplyPayments) return;
+    setApplicationAmounts(autoApplyPayment(amount, cashDueInvoices()));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleInvoices]);
 
   /** "Pay in full": fill cash for every invoice up to its balance (after discount/credits). */
   function payAll() {
+    // The user chose the amounts: a later change of the amount must not re-spread them.
+    setAppsTouched(true);
     const next: Record<string, string> = {};
     let left = Number(amount) || 0;
-    for (const inv of invoices) {
-      const credit = allCreditApps.filter((c) => c.invoiceId === inv.id).reduce((s, c) => s + Number(c.amount), 0);
-      const due = Math.max(0, Number(inv.balanceDue) - Number(discountAmounts[inv.id] || 0) - credit);
+    for (const inv of visibleInvoices) {
+      const due = Math.max(0, Number(inv.balanceDue) - Number(discountAmounts[inv.id] || 0) - creditOn(inv.id));
       const take = amount ? Math.min(due, left) : due;
       if (take > 0) next[inv.id] = take.toFixed(2);
       left -= take;
     }
     // Then the General Journal charges (I11), oldest first.
     const nextJournal: Record<string, string> = {};
-    for (const c of journalCharges) {
-      const take = amount ? Math.min(Number(c.open), Math.max(0, left)) : Number(c.open);
+    for (const c of shownCharges) {
+      const due = Math.max(0, Number(c.open) - creditOn(JE_PREFIX + c.journalLineId));
+      const take = amount ? Math.min(due, Math.max(0, left)) : due;
       if (take > 0) nextJournal[c.journalLineId] = take.toFixed(2);
       left -= take;
     }
@@ -434,22 +619,33 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       toast('Enter the amount received, or apply a credit or discount.', 'danger');
       return;
     }
+    if (foreign && !(Number(exchangeRate) > 0)) {
+      toast(`Enter the exchange rate: how much 1 ${currency} is worth in your home currency.`, 'danger');
+      return;
+    }
     if (appliedTotal > amt + 0.005) {
       toast('You applied more cash than you received. Lower an amount or raise the total.', 'danger');
       return;
     }
-    for (const c of journalCharges) {
-      if (Number(journalAmounts[c.journalLineId] || 0) > Number(c.open) + 0.005) {
-        toast(`${c.ref}: the payment is more than what is still open (${formatCurrency(c.open)}).`, 'danger');
+    for (const c of shownCharges) {
+      const cash = Number(journalAmounts[c.journalLineId] || 0);
+      if (cash + creditOn(JE_PREFIX + c.journalLineId) > Number(c.open) + 0.005) {
+        toast(`${c.ref}: the payment and credits are more than what is still open (${formatCurrency(c.open)}).`, 'danger');
         return;
       }
     }
-    for (const inv of invoices) {
+    for (const inv of visibleInvoices) {
       const cash = Number(applicationAmounts[inv.id] || 0);
       const disc = Number(discountAmounts[inv.id] || 0);
-      const cred = allCreditApps.filter((c) => c.invoiceId === inv.id).reduce((s, c) => s + Number(c.amount), 0);
-      if (cash + disc + cred > Number(inv.balanceDue) + 0.005) {
-        toast(`Invoice #${inv.invoiceNumber ?? ''}: cash, discount and credits add up to more than it owes.`, 'danger');
+      if (cash + disc + creditOn(inv.id) > Number(inv.balanceDue) + 0.005) {
+        toast(`Invoice #${invNo(inv)}: cash, discount and credits add up to more than it owes.`, 'danger');
+        return;
+      }
+    }
+    for (const c of shownCredits) {
+      const u = creditUse[c.id];
+      if (u && Number(u.amount) > Number(c.available) + 0.005) {
+        toast(`${c.ref}: only ${formatCurrency(c.available)} of this credit is left.`, 'danger');
         return;
       }
     }
@@ -468,11 +664,15 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       memo: memo.trim() || null,
       depositAccountId: depositAccountId || null,
       discountAccountId: anyDiscount && discountAccountId ? discountAccountId : null,
+      currency: foreign ? currency : null,
+      exchangeRate: foreign ? exchangeRate.trim() : null,
       applications,
       credits: creditApps,
       journalItems,
       journalCredits: journalCreditApps,
-      ...(editing ? {} : { paymentCredits: paymentCreditApps }),
+      journalOffsets,
+      // C4: earlier unapplied payments, on a new payment AND while editing (no longer dropped).
+      paymentCredits: paymentCreditApps,
     };
     setSaving(true);
     try {
@@ -491,6 +691,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       setSaving(false);
     }
   }
+
+  const homeValue = foreign && Number(amount) > 0 && Number(exchangeRate) > 0 ? Number(amount) * Number(exchangeRate) : null;
 
   return (
     <Modal
@@ -516,23 +718,69 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
             amounts back first, then the new amounts are applied.
           </div>
         )}
-        {/* Customer */}
-        <div>
-          <Label htmlFor="pm-customer" required>Customer</Label>
-          <Select
-            id="pm-customer"
-            value={customerId}
-            onChange={(e) => setCustomerId(e.target.value)}
-            autoFocus
-          >
-            <option value="">— Select customer —</option>
-            {customers.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.displayName}
-              </option>
-            ))}
-          </Select>
+        {/* Customer + currency */}
+        <div className={currencyChoices.length > 1 ? 'grid grid-cols-3 gap-3' : undefined}>
+          <div className={currencyChoices.length > 1 ? 'col-span-1' : undefined}>
+            <Label htmlFor="pm-customer" required>Customer</Label>
+            <Select
+              id="pm-customer"
+              value={customerId}
+              onChange={(e) => setCustomerId(e.target.value)}
+              autoFocus
+            >
+              <option value="">— Select customer —</option>
+              {customers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.displayName}
+                </option>
+              ))}
+            </Select>
+          </div>
+          {currencyChoices.length > 1 && (
+            <>
+              <div>
+                <Label htmlFor="pm-currency">Currency</Label>
+                <Select
+                  id="pm-currency"
+                  value={currency}
+                  onChange={(e) => {
+                    setCurrency(e.target.value);
+                    setApplicationAmounts({});
+                    setDiscountAmounts({});
+                  }}
+                >
+                  {currencyChoices.map((c) => (
+                    <option key={c || 'home'} value={c}>
+                      {c ? c : `${homeCode || 'Home'} (home currency)`}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div>
+                <Label htmlFor="pm-rate" required={foreign}>
+                  Exchange rate {foreign ? `(1 ${currency} = ? ${homeCode || 'home'})` : ''}
+                </Label>
+                <Input
+                  id="pm-rate"
+                  type="number"
+                  min="0"
+                  step="0.000001"
+                  disabled={!foreign}
+                  placeholder={foreign ? 'e.g. 1.10' : '1'}
+                  value={foreign ? exchangeRate : '1'}
+                  onChange={(e) => setExchangeRate(e.target.value)}
+                />
+              </div>
+            </>
+          )}
         </div>
+        {foreign && (
+          <p className="text-xs text-navy/60">
+            This payment is in {currency}. Amounts below are in {currency}. Any difference between this
+            rate and the rate each invoice was billed at is posted as an exchange gain or loss.
+            {homeValue !== null && <> Home-currency value: <strong>{formatCurrency(homeValue.toFixed(2))}</strong>.</>}
+          </p>
+        )}
 
         {/* Date + Method + Deposit-to */}
         <div className="grid grid-cols-3 gap-3">
@@ -574,7 +822,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         {/* Amount + Reference + Memo */}
         <div className="grid grid-cols-3 gap-3">
           <div>
-            <Label htmlFor="pm-amount" required>Amount Received</Label>
+            <Label htmlFor="pm-amount" required>Amount Received{foreign ? ` (${currency})` : ''}</Label>
             <AmountInput id="pm-amount" placeholder="0.00" value={amount} onChange={(e) => changeAmount(e.target.value)} />
           </div>
           <div>
@@ -592,7 +840,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           <div>
             <div className="flex items-center justify-between">
               <Label>Apply to Open Invoices <Help term="ar" /></Label>
-              {(invoices.length > 0 || journalCharges.length > 0) && (
+              {(visibleInvoices.length > 0 || shownCharges.length > 0) && (
                 <Button variant="ghost" size="sm" onClick={payAll}>
                   Pay all
                 </Button>
@@ -602,14 +850,18 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
               <div className="flex items-center gap-2 py-2 text-sm text-navy/50">
                 <Spinner className="h-4 w-4" /> Loading invoices…
               </div>
-            ) : invoices.length === 0 && journalCharges.length === 0 ? (
-              <p className="text-sm text-navy/40 py-2 italic">No open invoices for this customer.</p>
+            ) : visibleInvoices.length === 0 && shownCharges.length === 0 ? (
+              <p className="text-sm text-navy/40 py-2 italic">
+                {invoices.length > 0
+                  ? `No open invoices in ${currency || homeCode || 'your home currency'} for this customer. Pick another currency above.`
+                  : 'No open invoices for this customer.'}
+              </p>
             ) : (
               <div className="border border-slate-200 rounded-lg overflow-hidden mt-1">
                 <Table>
                   <thead>
                     <tr className="bg-slate-50">
-                      <Th>Invoice</Th>
+                      <Th>Number</Th>
                       <Th>Date</Th>
                       <Th numeric>Balance Due</Th>
                       <Th numeric>Early-pay discount <Help term="early-payment-discount" side="bottom" /></Th>
@@ -617,35 +869,35 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                     </tr>
                   </thead>
                   <tbody>
-                    {invoices.map((inv) => {
+                    {visibleInvoices.map((inv) => {
                       const sug = suggestions[inv.id];
                       return (
                         <Tr key={inv.id}>
-                          <Td className="font-medium">#{inv.invoiceNumber ?? ''}</Td>
+                          <Td className="font-medium">Invoice #{invNo(inv)}</Td>
                           <Td>{formatDate(inv.date)}</Td>
-                          <Td numeric className="font-semibold">{formatCurrency(inv.balanceDue)}</Td>
+                          <Td numeric className="font-semibold">{money(inv.balanceDue, currency)}</Td>
                           <Td numeric>
                             <AmountInput
                               placeholder="0.00"
-                              aria-label={`Discount for invoice ${inv.invoiceNumber ?? ''}`}
+                              aria-label={`Discount for invoice ${invNo(inv)}`}
                               value={discountAmounts[inv.id] ?? ''}
-                              onChange={(e) => setDiscountAmounts((p) => ({ ...p, [inv.id]: e.target.value }))}
+                              onChange={(e) => setDiscount(inv.id, e.target.value)}
                               className="text-right"
                             />
                             {sug?.eligible && Number(sug.suggested) > 0 && !discountAmounts[inv.id] && (
                               <button
                                 type="button"
                                 className="mt-1 text-xs text-electric hover:underline"
-                                onClick={() => setDiscountAmounts((p) => ({ ...p, [inv.id]: sug.suggested }))}
+                                onClick={() => setDiscount(inv.id, sug.suggested)}
                               >
-                                Take {formatCurrency(sug.suggested)} (paid by {formatDate(sug.discountDate)})
+                                Take {money(sug.suggested, currency)} (paid by {formatDate(sug.discountDate)})
                               </button>
                             )}
                           </Td>
                           <Td numeric>
                             <AmountInput
                               placeholder="0.00"
-                              aria-label={`Payment for invoice ${inv.invoiceNumber ?? ''}`}
+                              aria-label={`Payment for invoice ${invNo(inv)}`}
                               value={applicationAmounts[inv.id] ?? ''}
                               onChange={(e) => setAppAmount(inv.id, e.target.value)}
                               className="text-right"
@@ -655,7 +907,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                       );
                     })}
                     {/* I11: General Journal charges for this customer (journal entries to A/R). */}
-                    {journalCharges.map((c) => (
+                    {shownCharges.map((c) => (
                       <Tr key={c.journalLineId}>
                         <Td className="font-medium">
                           {c.ref}
@@ -702,8 +954,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
               </div>
             )}
 
-            {/* Credits (credit memos) */}
-            {credits.length > 0 && invoices.length > 0 && (
+            {/* Credits: credit memos, earlier payments, General Journal credits */}
+            {shownCredits.length > 0 && (visibleInvoices.length > 0 || shownCharges.length > 0) && (
               <div className="mt-4">
                 <Label>Use available credits</Label>
                 <div className="border border-slate-200 rounded-lg overflow-hidden mt-1">
@@ -717,24 +969,33 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                       </tr>
                     </thead>
                     <tbody>
-                      {credits.map((c) => {
+                      {shownCredits.map((c) => {
                         const use = creditUse[c.id] ?? { invoiceId: '', amount: '' };
+                        // General Journal charges can take a General Journal credit or an earlier
+                        // payment (QB lets any open credit go against any open charge).
+                        const canTakeCharges = c.kind === 'journal_entry' || c.kind === 'payment';
                         return (
                           <Tr key={c.id}>
                             <Td>{c.ref}</Td>
                             <Td numeric>{formatCurrency(c.available)}</Td>
                             <Td>
                               <Select
-                                aria-label={`Invoice for ${c.ref}`}
+                                aria-label={`Apply ${c.ref} to`}
                                 value={use.invoiceId}
-                                onChange={(e) => setCreditUse((p) => ({ ...p, [c.id]: { ...use, invoiceId: e.target.value } }))}
+                                onChange={(e) => setCredit(c.id, { ...use, invoiceId: e.target.value })}
                               >
                                 <option value="">Don&apos;t use</option>
-                                {invoices.map((inv) => (
+                                {visibleInvoices.map((inv) => (
                                   <option key={inv.id} value={inv.id}>
-                                    Invoice #{inv.invoiceNumber ?? ''} ({formatCurrency(inv.balanceDue)})
+                                    Invoice #{invNo(inv)} ({formatCurrency(inv.balanceDue)})
                                   </option>
                                 ))}
+                                {canTakeCharges &&
+                                  shownCharges.map((ch) => (
+                                    <option key={ch.journalLineId} value={JE_PREFIX + ch.journalLineId}>
+                                      {ch.ref} ({formatCurrency(ch.open)})
+                                    </option>
+                                  ))}
                               </Select>
                             </Td>
                             <Td numeric>
@@ -742,7 +1003,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                                 placeholder="0.00"
                                 aria-label={`Amount of ${c.ref}`}
                                 value={use.amount}
-                                onChange={(e) => setCreditUse((p) => ({ ...p, [c.id]: { ...use, amount: e.target.value } }))}
+                                onChange={(e) => setCredit(c.id, { ...use, amount: e.target.value })}
                                 className="text-right"
                               />
                             </Td>
@@ -757,9 +1018,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
 
             {/* Totals */}
             <div className="mt-3 space-y-1 px-1 text-sm">
-              <div className="flex justify-between"><span className="text-navy/60">Payment applied</span><span className="font-semibold tabular-nums">{formatCurrency(appliedTotal)}</span></div>
+              <div className="flex justify-between"><span className="text-navy/60">Payment applied</span><span className="font-semibold tabular-nums">{money(appliedTotal, currency)}</span></div>
               {discountTotal > 0 && (
-                <div className="flex justify-between"><span className="text-navy/60">Discounts</span><span className="font-semibold tabular-nums">{formatCurrency(discountTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-navy/60">Discounts</span><span className="font-semibold tabular-nums">{money(discountTotal, currency)}</span></div>
               )}
               {creditTotal > 0 && (
                 <div className="flex justify-between"><span className="text-navy/60">Credits used</span><span className="font-semibold tabular-nums">{formatCurrency(creditTotal)}</span></div>
@@ -768,7 +1029,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                 <div className="flex justify-between">
                   <span className="text-navy/60">Left over (kept as a credit for this customer)</span>
                   <span className={'font-semibold tabular-nums ' + (Number(amount) - appliedTotal > 0.005 ? 'text-gold' : 'text-emerald')}>
-                    {formatCurrency(Math.max(0, Number(amount) - appliedTotal))}
+                    {money(Math.max(0, Number(amount) - appliedTotal), currency)}
                   </span>
                 </div>
               )}
@@ -904,19 +1165,46 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
   const [loading, setLoading] = useState(false);
   const [amounts, setAmounts] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+  const [homeCode, setHomeCode] = useState('');
 
   useEffect(() => {
     if (!open || !payment) return;
+    let cancelled = false;
     setAmounts({});
     setLoading(true);
-    api
-      .get<{ invoices?: Invoice[] } | Invoice[]>(`/api/invoices?customerId=${payment.customerId}`)
-      .then((rows) => {
+    Promise.all([
+      api.get<{ invoices?: Invoice[] } | Invoice[]>(`/api/invoices?customerId=${payment.customerId}`),
+      api.get<CurrencyRow[]>('/api/currencies').catch(() => [] as CurrencyRow[]),
+    ])
+      .then(([rows, curs]) => {
+        if (cancelled) return;
+        const home = ((Array.isArray(curs) ? curs : []).find((c) => c.isBase)?.code ?? '').toUpperCase();
+        setHomeCode(home);
+        const norm = (c: string | null | undefined) => {
+          const v = (c ?? '').toUpperCase();
+          return v === home ? '' : v;
+        };
         const list = Array.isArray(rows) ? rows : (rows as { invoices?: Invoice[] }).invoices ?? [];
-        setInvoices(list.filter((inv) => inv.status !== 'void' && Number(inv.balanceDue) > 0));
+        // Only what the server accepts: posted (not draft / void), still owing, same currency.
+        setInvoices(
+          list.filter(
+            (inv) =>
+              inv.status !== 'void' &&
+              inv.status !== 'draft' &&
+              Number(inv.balanceDue) > 0 &&
+              norm(inv.currency) === norm(payment.currency),
+          ),
+        );
       })
-      .catch(() => toast('Failed to load invoices.', 'danger'))
-      .finally(() => setLoading(false));
+      .catch(() => {
+        if (!cancelled) toast('Failed to load invoices.', 'danger');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, payment]);
 
   const applications: Application[] = Object.entries(amounts)
@@ -924,6 +1212,7 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
     .map(([invoiceId, amountApplied]) => ({ invoiceId, amountApplied }));
   const appliedTotal = sumApplications(applications);
   const unapplied = Number(payment?.unapplied ?? 0);
+  const cur = payment?.currency && payment.currency.toUpperCase() !== homeCode ? payment.currency : null;
 
   async function handleApply() {
     if (!payment) return;
@@ -931,6 +1220,13 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
     if (appliedTotal > unapplied + 0.005) {
       toast('Total applied exceeds the unapplied balance.', 'danger');
       return;
+    }
+    for (const a of applications) {
+      const inv = invoices.find((i) => i.id === a.invoiceId);
+      if (inv && Number(a.amountApplied) > Number(inv.balanceDue) + 0.005) {
+        toast(`Invoice #${invNo(inv)} only owes ${money(inv.balanceDue, cur)}.`, 'danger');
+        return;
+      }
     }
     setSaving(true);
     try {
@@ -965,7 +1261,7 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
           <div className="rounded-lg bg-navy/5 px-4 py-3 text-sm">
             <span className="text-navy/60">Unapplied balance: </span>
             <span className="font-bold text-navy tabular-nums">
-              {formatCurrency(payment.unapplied)}
+              {money(payment.unapplied, cur)}
             </span>
           </div>
         )}
@@ -975,12 +1271,13 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
             <Spinner className="h-4 w-4" /> Loading invoices…
           </div>
         ) : invoices.length === 0 ? (
-          <p className="text-sm text-navy/40 py-2 italic">No open invoices for this customer.</p>
+          <p className="text-sm text-navy/40 py-2 italic">No open invoices for this customer{cur ? ` in ${cur}` : ''}.</p>
         ) : (
           <div className="border border-slate-200 rounded-lg overflow-hidden">
             <Table>
               <thead>
                 <tr className="bg-slate-50">
+                  <Th>Invoice</Th>
                   <Th>Date</Th>
                   <Th numeric>Balance Due</Th>
                   <Th numeric>Amount to Apply</Th>
@@ -989,13 +1286,15 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
               <tbody>
                 {invoices.map((inv) => (
                   <Tr key={inv.id}>
+                    <Td className="font-medium">#{invNo(inv)}</Td>
                     <Td>{formatDate(inv.date)}</Td>
                     <Td numeric className="font-semibold">
-                      {formatCurrency(inv.balanceDue)}
+                      {money(inv.balanceDue, cur)}
                     </Td>
                     <Td numeric>
                       <AmountInput
                         placeholder="0.00"
+                        aria-label={`Amount to apply to invoice ${invNo(inv)}`}
                         value={amounts[inv.id] ?? ''}
                         onChange={(e) =>
                           setAmounts((prev) => ({ ...prev, [inv.id]: e.target.value }))
@@ -1019,7 +1318,7 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
                 (appliedTotal > unapplied ? 'text-red-500' : 'text-navy')
               }
             >
-              {formatCurrency(appliedTotal)}
+              {money(appliedTotal, cur)}
             </span>
           </div>
         )}
@@ -1052,12 +1351,18 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
     }
   }, [open, payment]);
 
-  const bankAccounts = accounts.filter((a) => a.type === 'asset');
+  // Refunds are paid from a bank or cash account (the server refuses A/R, inventory and the like);
+  // Undeposited Funds is left out — a refund check is written on a bank account.
+  const bankAccounts = depositTargets(accounts).filter((a) => a.code !== '1050' && a.subtype !== 'undeposited_funds');
 
   async function handleRefund() {
     if (!payment) return;
     if (!bankAccountId) { toast('Select a bank account.', 'danger'); return; }
     if (!amount || Number(amount) <= 0) { toast('Enter a valid refund amount.', 'danger'); return; }
+    if (Number(amount) > Number(payment.unapplied) + 0.005) {
+      toast(`Only ${formatCurrency(payment.unapplied)} of this payment is unapplied.`, 'danger');
+      return;
+    }
     setSaving(true);
     try {
       await api.post(`/api/payments/${payment.id}`, {
@@ -1093,7 +1398,7 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
         {payment && (
           <div className="rounded-lg bg-gold/10 border border-gold/30 px-4 py-3 text-sm text-navy/80">
             Unapplied balance available to refund:{' '}
-            <span className="font-bold">{formatCurrency(payment.unapplied)}</span>
+            <span className="font-bold">{money(payment.unapplied, payment.currency)}</span>
           </div>
         )}
 
@@ -1132,13 +1437,24 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
 // Main Page
 // ---------------------------------------------------------------------------
 
+const PAGE_SIZE = 50;
+
 function PaymentsPageContent() {
   const [payments, setPayments] = useState<Payment[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [customerMap, setCustomerMap] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
+
+  // List filters (QB: date range, customer, find by number / amount).
+  const [filterCustomer, setFilterCustomer] = useState('');
+  const [filterFrom, setFilterFrom] = useState('');
+  const [filterTo, setFilterTo] = useState('');
+  const [searchInput, setSearchInput] = useState('');
+  const [search, setSearch] = useState('');
 
   const [applyTarget, setApplyTarget] = useState<Payment | null>(null);
   const [refundTarget, setRefundTarget] = useState<Payment | null>(null);
@@ -1155,18 +1471,32 @@ function PaymentsPageContent() {
     }
   }
 
+  // Search as you type, after a short pause.
+  useEffect(() => {
+    const t = setTimeout(() => setSearch(searchInput.trim()), 300);
+    return () => clearTimeout(t);
+  }, [searchInput]);
+  // Any filter change goes back to the first page.
+  useEffect(() => setPage(0), [filterCustomer, filterFrom, filterTo, search]);
+
   const fetchPayments = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await api.get<{ payments: Payment[] } | Payment[]>('/api/payments');
-      const list = Array.isArray(data) ? data : (data as { payments: Payment[] }).payments ?? [];
+      const qs = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(page * PAGE_SIZE) });
+      if (filterCustomer) qs.set('customerId', filterCustomer);
+      if (filterFrom) qs.set('from', filterFrom);
+      if (filterTo) qs.set('to', filterTo);
+      if (search) qs.set('search', search);
+      const data = await api.get<{ payments: Payment[]; total?: number } | Payment[]>(`/api/payments?${qs.toString()}`);
+      const list = Array.isArray(data) ? data : data.payments ?? [];
       setPayments(list);
+      setTotal(Array.isArray(data) ? list.length : (data.total ?? list.length));
     } catch (err: unknown) {
       toastError(err, 'Failed to load payments');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [page, filterCustomer, filterFrom, filterTo, search]);
 
   const fetchCustomers = useCallback(async () => {
     try {
@@ -1192,9 +1522,11 @@ function PaymentsPageContent() {
 
   useEffect(() => {
     fetchPayments();
+  }, [fetchPayments]);
+  useEffect(() => {
     fetchCustomers();
     fetchAccounts();
-  }, [fetchPayments, fetchCustomers, fetchAccounts]);
+  }, [fetchCustomers, fetchAccounts]);
 
   // Quick Actions navigate here with ?new=1 — open the Receive Payment modal.
   useNewParam(() => setModalOpen(true));
@@ -1214,6 +1546,11 @@ function PaymentsPageContent() {
     }
   }
 
+  const nameOf = (p: Payment) => p.customerName ?? customerMap[p.customerId] ?? '—';
+  const filtered = Boolean(filterCustomer || filterFrom || filterTo || search);
+  const firstRow = total === 0 ? 0 : page * PAGE_SIZE + 1;
+  const lastRow = Math.min(total, (page + 1) * PAGE_SIZE);
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
@@ -1227,22 +1564,61 @@ function PaymentsPageContent() {
         }
       />
 
+      {/* Filters */}
+      <div className="mb-3 grid grid-cols-1 gap-3 md:grid-cols-4">
+        <div>
+          <Label htmlFor="pf-search">Find</Label>
+          <Input
+            id="pf-search"
+            type="search"
+            placeholder="Check #, reference, customer or amount"
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
+          />
+        </div>
+        <div>
+          <Label htmlFor="pf-customer">Customer</Label>
+          <Select id="pf-customer" value={filterCustomer} onChange={(e) => setFilterCustomer(e.target.value)}>
+            <option value="">All customers</option>
+            {customers.map((c) => (
+              <option key={c.id} value={c.id}>{c.displayName}</option>
+            ))}
+          </Select>
+        </div>
+        <div>
+          <Label htmlFor="pf-from">From</Label>
+          <DateInput id="pf-from" value={filterFrom} onChange={(e) => setFilterFrom(e.target.value)} />
+        </div>
+        <div>
+          <Label htmlFor="pf-to">To</Label>
+          <DateInput id="pf-to" value={filterTo} onChange={(e) => setFilterTo(e.target.value)} />
+        </div>
+      </div>
+
       <Card className="p-0 overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center py-20 text-navy/40">
             <Spinner className="h-6 w-6" />
           </div>
         ) : payments.length === 0 ? (
-          <EmptyState
-            icon={HandCoins}
-            title="No payments recorded yet"
-            message="When a customer pays an invoice, record it here. The money waits in Undeposited Funds until you record the bank deposit."
-            action={
-              <Button onClick={() => setModalOpen(true)}>
-                <Plus className="h-4 w-4" /> Receive Payment
-              </Button>
-            }
-          />
+          filtered ? (
+            <EmptyState
+              icon={HandCoins}
+              title="No payments match"
+              message="Try a different customer, date range or search."
+            />
+          ) : (
+            <EmptyState
+              icon={HandCoins}
+              title="No payments recorded yet"
+              message="When a customer pays an invoice, record it here. The money waits in Undeposited Funds until you record the bank deposit."
+              action={
+                <Button onClick={() => setModalOpen(true)}>
+                  <Plus className="h-4 w-4" /> Receive Payment
+                </Button>
+              }
+            />
+          )
         ) : (
           <Table>
             <thead>
@@ -1261,9 +1637,7 @@ function PaymentsPageContent() {
               {payments.map((p) => (
                 <Tr key={p.id} className={p.voidedAt ? 'opacity-50' : undefined}>
                   <Td className="whitespace-nowrap text-navy/70">{formatDate(p.date)}</Td>
-                  <Td className="font-medium text-navy">
-                    {customerMap[p.customerId] ?? '—'}
-                  </Td>
+                  <Td className="font-medium text-navy">{nameOf(p)}</Td>
                   <Td>
                     <Badge tone={methodBadgeTone(p.method)}>
                       {METHOD_LABELS[p.method] ?? p.method}
@@ -1271,16 +1645,16 @@ function PaymentsPageContent() {
                   </Td>
                   <Td className="text-navy/60 text-sm">{p.reference ?? '—'}</Td>
                   <Td numeric className="font-semibold">
-                    {formatCurrency(p.amount)}
+                    {money(p.amount, p.currency)}
                   </Td>
                   <Td numeric>
                     {Number(p.unapplied) > 0 ? (
                       <span className="text-gold font-medium">
-                        {formatCurrency(p.unapplied)}
+                        {money(p.unapplied, p.currency)}
                       </span>
                     ) : (
                       <span className="text-emerald font-medium">
-                        {formatCurrency(p.unapplied)}
+                        {money(p.unapplied, p.currency)}
                       </span>
                     )}
                   </Td>
@@ -1289,6 +1663,8 @@ function PaymentsPageContent() {
                       <Badge tone="neutral">Void</Badge>
                     ) : p.bouncedAt ? (
                       <Badge tone="danger">Bounced</Badge>
+                    ) : p.deposited ? (
+                      <Badge tone="info">Deposited</Badge>
                     ) : (
                       <Badge tone="success">Posted</Badge>
                     )}
@@ -1299,7 +1675,8 @@ function PaymentsPageContent() {
                         <Button variant="ghost" size="sm" onClick={() => openEdit(p)} title="Edit this payment">
                           Edit
                         </Button>
-                        {Number(p.amount) > 0 && (
+                        {/* QB offers Record Bounced Check only for a check that reached the bank. */}
+                        {p.canBounce && (
                           <Button
                             variant="ghost"
                             size="sm"
@@ -1346,6 +1723,21 @@ function PaymentsPageContent() {
             </tbody>
           </Table>
         )}
+        {total > 0 && (
+          <div className="flex items-center justify-between border-t border-slate-100 px-4 py-2 text-sm text-navy/60">
+            <span>
+              Showing {firstRow}–{lastRow} of {total} payment{total === 1 ? '' : 's'} (newest first)
+            </span>
+            <span className="inline-flex gap-2">
+              <Button variant="ghost" size="sm" disabled={page === 0 || loading} onClick={() => setPage((p) => Math.max(0, p - 1))}>
+                Newer
+              </Button>
+              <Button variant="ghost" size="sm" disabled={lastRow >= total || loading} onClick={() => setPage((p) => p + 1)}>
+                Older
+              </Button>
+            </span>
+          </div>
+        )}
       </Card>
 
       <ReceivePaymentModal
@@ -1363,7 +1755,7 @@ function PaymentsPageContent() {
       <BouncedCheckModal
         payment={bounceTarget}
         accounts={accounts}
-        customerName={bounceTarget ? customerMap[bounceTarget.customerId] ?? 'this customer' : ''}
+        customerName={bounceTarget ? nameOf(bounceTarget) : ''}
         onClose={() => setBounceTarget(null)}
         onDone={fetchPayments}
       />
@@ -1389,9 +1781,9 @@ function PaymentsPageContent() {
         message={
           <>
             Are you sure you want to void the{' '}
-            <strong>{formatCurrency(voidTarget?.amount ?? '0')}</strong> payment from{' '}
+            <strong>{money(voidTarget?.amount ?? '0', voidTarget?.currency)}</strong> payment from{' '}
             <strong>
-              {voidTarget ? customerMap[voidTarget.customerId] ?? 'this customer' : ''}
+              {voidTarget ? nameOf(voidTarget) : ''}
             </strong>
             ? This reverses the journal entry and restores the balance due on every invoice it was
             applied to. This cannot be undone.
