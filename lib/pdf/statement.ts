@@ -25,6 +25,8 @@ const TYPE_LABEL: Record<string, string> = {
   general_journal: 'General Journal',
   // fix/sales: credit-memo / overpayment refund paid to the customer
   refund: 'Refund',
+  // p1/salesforms: foreign-currency customer statements (home currency)
+  exchange_adjustment: 'Exchange Rate Adjustment',
 };
 
 /**
@@ -39,7 +41,7 @@ function isChargeLine(l: { type: string; amount: string }): boolean {
     l.type === 'statement_charge' ||
     l.type === 'bounced_check' ||
     l.type === 'refund' ||
-    (l.type === 'general_journal' && !l.amount.startsWith('-'))
+    ((l.type === 'general_journal' || l.type === 'exchange_adjustment') && !l.amount.startsWith('-'))
   );
 }
 

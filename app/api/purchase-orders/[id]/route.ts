@@ -14,6 +14,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import {
   getPurchaseOrder,
   updateStatus,
@@ -71,21 +72,21 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     if (parsed.data.action === 'convert') {
-      const bill = await convertToBill(ctx, id, {
-        lines: parsed.data.lines,
-        date: parsed.data.date,
-        billNumber: parsed.data.billNumber ?? null,
-      });
+      // A stale tab must not bill a purchase order another user just changed.
+      const { lines, date, billNumber } = parsed.data;
+      const bill = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) =>
+        convertToBill(c, id, { lines, date, billNumber: billNumber ?? null }),
+      );
       return NextResponse.json(bill);
     }
 
     if (parsed.data.action === 'void') {
-      const po = await updateStatus(ctx, id, 'void');
+      const po = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => updateStatus(c, id, 'void'));
       return NextResponse.json(po);
     }
 
     // action === 'close'
-    const po = await updateStatus(ctx, id, 'closed');
+    const po = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => updateStatus(c, id, 'closed'));
     return NextResponse.json(po);
   } catch (err) {
     return errorResponse(err);
@@ -100,7 +101,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = updatePurchaseOrderSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    const po = await updatePurchaseOrder(ctx, id, parsed.data);
+    const po = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => updatePurchaseOrder(c, id, parsed.data));
     return NextResponse.json(po);
   } catch (err) {
     return routeError(err, 'PATCH /api/purchase-orders/[id]');

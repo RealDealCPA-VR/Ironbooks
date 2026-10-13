@@ -33,6 +33,8 @@ import {
   writeAudit,
 } from './_base';
 import { assertPeriodOpen } from './fiscalPeriods';
+import { getPreferences } from './company';
+import { nextJournalNumber } from '@/lib/prefBehaviors';
 import {
   type JournalEntityType,
   type PostingLine,
@@ -146,6 +148,20 @@ export interface GLOptions {
  * Create a user-authored manual journal entry.
  * Delegates all validation and balance-update logic to `postJournalEntry`.
  */
+/**
+ * Preferences > Accounting "Automatically assign general journal entry numbers": a manual entry
+ * saved without an Entry No. gets the next number after the highest one used (any caller: the
+ * journal page, the API, memorized entries). Off: the entry is saved without a number.
+ */
+async function autoJournalNumber(ctx: ServiceContext): Promise<string | null> {
+  if (!(await getPreferences(ctx)).autoAssignJeNumbers) return null;
+  const rows = await ctx.db
+    .select({ reference: journalEntries.reference })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, 'manual')));
+  return nextJournalNumber(rows.map((r) => r.reference));
+}
+
 export async function createManualEntry(
   ctx: ServiceContext,
   input: ManualEntryInput,
@@ -160,7 +176,7 @@ export async function createManualEntry(
   return postJournalEntry(ctx, {
     date: input.date,
     description: input.description.trim(),
-    reference: input.reference ?? null,
+    reference: input.reference?.trim() || (await autoJournalNumber(ctx)),
     status: 'posted',
     lines: input.lines,
     sourceRef: 'manual',

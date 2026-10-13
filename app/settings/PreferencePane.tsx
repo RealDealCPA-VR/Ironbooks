@@ -49,8 +49,8 @@ function FieldRow({
         <input
           id={id}
           type="checkbox"
-          checked={Boolean(value)}
-          disabled={disabled}
+          checked={meta.fixed ? true : Boolean(value)}
+          disabled={disabled || Boolean(meta.fixed)}
           onChange={(e) => onChange(e.target.checked)}
           className="mt-1 h-4 w-4 rounded border-slate-300 text-electric focus:ring-electric"
         />
@@ -59,6 +59,7 @@ function FieldRow({
             {meta.label}
           </Label>
           {meta.help && <p className="mt-0.5 text-xs text-navy/50">{meta.help}</p>}
+          {meta.fixed && <p className="mt-0.5 text-xs text-navy/50">{meta.fixed}</p>}
         </div>
       </div>
     );

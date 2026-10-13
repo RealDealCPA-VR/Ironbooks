@@ -268,6 +268,9 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
   const [form, setForm] = useState(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [taxForm] = useIncomeTaxForm(open);
+  // Preferences > Accounting: 'Require account numbers' (else a blank number is assigned for you).
+  const acctPrefs = usePreferences().company;
+  const numberRequired = acctPrefs.accountNumbersEnabled && acctPrefs.requireAccountNumbers;
 
   // Reset form when modal opens
   useEffect(() => {
@@ -287,7 +290,7 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!form.code.trim()) { toast('Account code is required.', 'danger'); return; }
+    if (numberRequired && !form.code.trim()) { toast('Enter an account number. Your preferences require one.', 'danger'); return; }
     if (!form.name.trim()) { toast('Account name is required.', 'danger'); return; }
     setSaving(true);
     try {
@@ -337,10 +340,10 @@ function AddAccountModal({ open, onClose, onCreated, accounts }: AddAccountModal
           }
         />
         <div>
-          <Label htmlFor="acc-code" required>Account number</Label>
+          <Label htmlFor="acc-code" required={numberRequired}>Account number</Label>
           <Input
             id="acc-code"
-            placeholder="e.g. 1010"
+            placeholder={numberRequired ? 'e.g. 1010' : 'Leave blank to number it for you'}
             value={form.code}
             onChange={(e) => set('code', e.target.value)}
             autoFocus

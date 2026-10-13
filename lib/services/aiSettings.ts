@@ -18,6 +18,7 @@ import { requireRole } from './rbac';
 import { AiRouter } from '@/lib/ai/router';
 import { createProvider, localityOf, type ProviderDeps } from '@/lib/ai/providers';
 import { classifyEndpoint } from '@/lib/ai/tailnet';
+import { verifyTailnetUrls } from '@/lib/net/tailnetVerify';
 import { decryptSecret, encryptSecret } from '@/lib/ai/keyVault';
 import { Redactor, addressEntities, type KnownEntity } from '@/lib/ai/redact';
 import {
@@ -76,8 +77,12 @@ function normalizePolicies(raw: Record<string, string> | null | undefined): Reco
 export async function loadSettings(ctx: ServiceContext): Promise<SettingsRecord> {
   const [row] = await ctx.db.select().from(aiSettings).where(eq(aiSettings.companyId, ctx.companyId));
   if (!row) return { ...DEFAULTS, taskPolicies: { ...DEFAULTS.taskPolicies } };
+  const providers = (row.providers as unknown as StoredProviderConfig[]) ?? [];
+  // *.ts.net endpoints count as tailnet (local, unredacted) only when they resolve to tailnet
+  // addresses — Funnel names are public (lib/net/tailnetVerify.ts).
+  await verifyTailnetUrls(providers.map((p) => p.baseUrl));
   return {
-    providers: (row.providers as unknown as StoredProviderConfig[]) ?? [],
+    providers,
     taskPolicies: normalizePolicies(row.taskPolicies),
     cloudEnabled: row.cloudEnabled,
     autoApplyEnabled: row.autoApplyEnabled,
@@ -376,6 +381,7 @@ export async function testConnection(
   if (!parsed.success) throw validation(parsed.error.issues.map((i) => i.message).join('; '));
   const p = parsed.data;
   const s = await loadSettings(ctx);
+  await verifyTailnetUrls([p.baseUrl]);
   const saved = p.id ? s.providers.find((x) => x.id === p.id) : undefined;
   // Reuse the saved key only for the endpoint it was saved for (see sameEndpoint).
   const apiKey =

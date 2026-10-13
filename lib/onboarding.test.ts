@@ -18,7 +18,9 @@ import { trialBalance } from '@/lib/services/reports';
 import { companySettingsSchema } from '@/lib/validation/company';
 import {
   BUSINESS_TYPES,
+  ENTITY_TYPES,
   buildSetupPlan,
+  suggestTaxLine,
   fiscalYearEndFromStartMonth,
   fiscalYearStartMonthFromEnd,
   nextFreeCode,
@@ -164,5 +166,125 @@ describe('setup plan applied through the services (integration)', () => {
     // No opening balances were posted: trial balance is empty and balanced.
     const tb = await trialBalance(ctx);
     expect(tb.balanced).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 setup: feature answers really switch features; entity type; company info; summary
+// ---------------------------------------------------------------------------
+
+describe('buildSetupPlan — feature toggles match the answers (P1)', () => {
+  it('answering No turns inventory, purchase orders and sales tax OFF (not just the warning)', () => {
+    const p = buildSetupPlan({ ...base, salesTax: false, inventory: false });
+    expect(p.settings).toMatchObject({
+      inventoryEnabled: false,
+      purchaseOrdersEnabled: false,
+      negativeStockWarning: false,
+      salesTaxEnabled: false,
+    });
+    const yes = buildSetupPlan(base);
+    expect(yes.settings).toMatchObject({ inventoryEnabled: true, purchaseOrdersEnabled: true, salesTaxEnabled: true });
+  });
+
+  it('maps estimates, progress invoicing, time, class and currency answers to preferences', () => {
+    const p = buildSetupPlan({
+      ...base,
+      estimates: true,
+      progressInvoicing: true,
+      timeTracking: false,
+      classTracking: true,
+      multiCurrency: false,
+    });
+    expect(p.settings).toMatchObject({
+      estimatesEnabled: true,
+      progressInvoicingEnabled: true,
+      timeTrackingEnabled: false,
+      classTrackingEnabled: true,
+      multiCurrencyEnabled: false,
+    });
+    // Progress invoicing needs estimates.
+    const noEst = buildSetupPlan({ ...base, estimates: false, progressInvoicing: true });
+    expect(noEst.settings).toMatchObject({ estimatesEnabled: false, progressInvoicingEnabled: false });
+    // Questions that were not asked leave the preference untouched.
+    const unasked = buildSetupPlan(base);
+    expect(unasked.settings).not.toHaveProperty('estimatesEnabled');
+    expect(unasked.settings).not.toHaveProperty('timeTrackingEnabled');
+  });
+
+  it('the summary is built from the saved values (never disagrees)', () => {
+    const p = buildSetupPlan({ ...base, salesTax: false, inventory: false, estimates: true, timeTracking: false });
+    expect(p.summary).toContain('Sales tax: off');
+    expect(p.summary).toContain('Inventory tracking: off');
+    expect(p.summary).toContain('Purchase orders: off');
+    expect(p.summary).toContain('Estimates: on');
+    expect(p.summary).toContain('Time tracking: off');
+    const on = buildSetupPlan(base);
+    expect(on.summary.some((s) => s.startsWith('Sales tax: on'))).toBe(true);
+    expect(on.summary.some((s) => s.startsWith('Inventory tracking: on'))).toBe(true);
+  });
+
+  it('company information is saved for invoices, W-2 and 1099 (and passes the schema)', () => {
+    const p = buildSetupPlan({
+      ...base,
+      company: {
+        name: ' Acme Plumbing ',
+        legalName: 'Acme Plumbing LLC',
+        ein: '12-3456789',
+        addressLine1: '12 Main St',
+        city: 'Springfield',
+        state: 'IL',
+        zip: '62701',
+        country: 'US',
+        phone: '555-0100',
+        email: 'books@acme.test',
+      },
+    });
+    expect(p.name).toBe('Acme Plumbing');
+    expect(p.settings).toMatchObject({
+      legalName: 'Acme Plumbing LLC',
+      ein: '12-3456789',
+      address: '12 Main St, Springfield, IL 62701',
+      phone: '555-0100',
+      email: 'books@acme.test',
+    });
+    expect(() => companySettingsSchema.parse(p.settings)).not.toThrow();
+  });
+
+  it('entity type picks the equity accounts, the tax form and tax lines', () => {
+    const scorp = buildSetupPlan({ ...base, entityType: 's_corp' });
+    expect(scorp.taxForm).toBe('1120S');
+    const names = scorp.accounts.map((a) => a.name);
+    expect(names).toEqual(expect.arrayContaining(['Capital Stock', 'Shareholder Distributions']));
+    expect(scorp.accounts.find((a) => a.name === 'Shareholder Distributions')?.taxLine).toBe('1120S:L26');
+    expect(scorp.accounts.find((a) => a.name === 'Merchandise Sales')?.taxLine).toBe('1120S:1a');
+
+    const sole = buildSetupPlan({ ...base, entityType: 'sole_prop' });
+    expect(sole.taxForm).toBe('SCHC');
+    expect(sole.accounts.map((a) => a.name)).toContain("Owner's Draw");
+    // Schedule C has no balance sheet: equity accounts carry no tax line.
+    expect(sole.accounts.find((a) => a.name === "Owner's Draw")?.taxLine).toBeNull();
+
+    const np = buildSetupPlan({ ...base, entityType: 'nonprofit' });
+    expect(np.taxForm).toBeNull();
+    expect(np.accounts.map((a) => a.name)).toContain('Net Assets Without Donor Restrictions');
+
+    // Every suggested tax line belongs to the entity's form.
+    for (const e of ENTITY_TYPES) {
+      const p = buildSetupPlan({ ...base, businessType: 'construction', employees: true, entityType: e.value });
+      for (const a of p.accounts) {
+        if (a.taxLine) expect(a.taxLine.startsWith(`${e.taxForm}:`)).toBe(true);
+      }
+    }
+    expect(suggestTaxLine('1120', { name: 'Rent', type: 'expense', subtype: 'operating_expenses' })).toBe('1120:16');
+    expect(suggestTaxLine('SCHC', { name: 'Payroll Expense', type: 'expense', subtype: 'payroll' })).toBe('SCHC:26');
+    expect(suggestTaxLine('1065', { name: 'Checking', type: 'asset', subtype: 'checking' })).toBe('1065:L1');
+    expect(suggestTaxLine(null, { name: 'Rent', type: 'expense' })).toBeNull();
+  });
+
+  it('tax year and start date are validated and carried in the interview record', () => {
+    const p = buildSetupPlan({ ...base, fiscalYearStartMonth: 7, startDate: '2026-07-01' });
+    expect(p.interview).toEqual({ entityType: 'other', taxYearStartMonth: 7, startDate: '2026-07-01' });
+    expect(buildSetupPlan({ ...base, taxYearStartMonth: 1, startDate: '2026-02-30' }).interview.startDate).toBeNull();
+    expect(() => buildSetupPlan({ ...base, taxYearStartMonth: 13 })).toThrow();
   });
 });

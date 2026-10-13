@@ -44,7 +44,15 @@ import {
   type ShippingState,
   shippingFromDoc,
   shippingPayload,
+  useCustomerSalesDefaults,
+  defaultShipToState,
 } from '@/components/sales/SalesExtras';
+import {
+  DocNumberField,
+  docNo,
+  useDocNumber,
+  useDuplicateNumberConfirm,
+} from '@/components/sales/DocNumberField';
 // wave2 prefs: Payments > default deposit account; Memorize (Ctrl+M)
 import { usePreferences } from '@/lib/usePreferences';
 import MemorizeButton from '@/components/MemorizeButton';
@@ -83,6 +91,8 @@ interface TaxRate {
 interface SalesReceipt {
   id: string;
   receiptNumber: number;
+  /** Sale No. the user typed / sees. */
+  refNumber?: string | null;
   customerId: string | null;
   customerName: string | null;
   date: string;
@@ -206,6 +216,17 @@ function NewReceiptModal({
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const [saving, setSaving] = useState(false);
+  const docNumber = useDocNumber('sales_receipt', open, editing ? docNo(editing.refNumber, editing.receiptNumber) : null);
+  const dupConfirm = useDuplicateNumberConfirm();
+  // Customer defaults (new receipts): tax item, non-taxable tax code, default ship-to.
+  const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
+  useEffect(() => {
+    if (!custDefaults || editing) return;
+    setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
+    const st = defaultShipToState(custDefaults);
+    if (st) setShip((prev) => ({ ...prev, shipTo: st }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [custDefaults]);
 
   // Reset form when modal opens; deposit-to defaults to Undeposited Funds (1050)
   // so receipts flow into the Make Deposits workflow.
@@ -350,13 +371,17 @@ function NewReceiptModal({
 
     setSaving(true);
     try {
-      const body = receiptPayload(validLines);
+      const body = { ...receiptPayload(validLines), refNumber: docNumber.payload };
+      const saved = await dupConfirm.run((allowDuplicateNumber) =>
+        editing
+          ? api.patch<SalesReceipt>(`/api/sales-receipts/${editing.id}`, { ...body, allowDuplicateNumber })
+          : api.post<SalesReceipt>('/api/sales-receipts', { ...body, allowDuplicateNumber }),
+      );
+      if (saved === undefined) return;
       if (editing) {
-        await api.patch(`/api/sales-receipts/${editing.id}`, body);
-        toast(`Sales Receipt #${editing.receiptNumber} updated.`, 'success');
+        toast(`Sales Receipt #${docNo(saved.refNumber, saved.receiptNumber)} updated.`, 'success');
       } else {
-        await api.post('/api/sales-receipts', body);
-        toast('Sales receipt created.', 'success');
+        toast(`Sales Receipt #${docNo(saved.refNumber, saved.receiptNumber)} created.`, 'success');
       }
       onCreated();
       onClose();
@@ -372,7 +397,7 @@ function NewReceiptModal({
       size="lg"
       open={open}
       onClose={onClose}
-      title={editing ? `Edit Sales Receipt #${editing.receiptNumber}` : 'New Sales Receipt'}
+      title={editing ? `Edit Sales Receipt #${docNo(editing.refNumber, editing.receiptNumber)}` : 'New Sales Receipt'}
       footer={
         <>
           <MemorizeButton
@@ -435,6 +460,10 @@ function NewReceiptModal({
               onChange={(e) => setDate(e.target.value)}
             />
           </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <DocNumberField id="sr-number" label="Sale No." value={docNumber.value} onChange={docNumber.setValue} />
         </div>
 
         {/* Payment method + reference */}
@@ -575,7 +604,8 @@ function NewReceiptModal({
 
         {/* Tax rate + memo */}
         <div className="grid grid-cols-2 gap-3">
-          <div>
+          {/* Hidden while "Charge sales tax" is off (QB removes tax from forms); an old document keeps its tax. */}
+          {(prefs.company.salesTaxEnabled || taxRateId) ? (<div>
             <Label htmlFor="sr-tax">Sales Tax</Label>
             <Select id="sr-tax" value={taxRateId} onChange={(e) => setTaxRateId(e.target.value)}>
               <option value="">No tax</option>
@@ -585,7 +615,7 @@ function NewReceiptModal({
                 </option>
               ))}
             </Select>
-          </div>
+          </div>) : <div />}
           <div>
             <Label htmlFor="sr-memo">Memo</Label>
             <Input
@@ -597,7 +627,8 @@ function NewReceiptModal({
           </div>
         </div>
 
-        <ShippingSection value={ship} onChange={setShip} idPrefix="sr-ship" />
+        <ShippingSection value={ship} onChange={setShip} shipTos={custDefaults?.shipTos} idPrefix="sr-ship" />
+        {dupConfirm.dialog}
 
         {/* Live totals */}
         <div className="rounded-lg bg-navy/5 px-4 py-3 space-y-1">
@@ -678,7 +709,7 @@ export default function SalesReceiptsPage() {
     setVoiding(true);
     try {
       await api.del(`/api/sales-receipts/${voidTarget.id}`);
-      toast(`Sales Receipt #${voidTarget.receiptNumber} voided.`, 'success');
+      toast(`Sales Receipt #${docNo(voidTarget.refNumber, voidTarget.receiptNumber)} voided.`, 'success');
       setVoidTarget(null);
       fetchData();
     } catch (err: unknown) {
@@ -735,7 +766,7 @@ export default function SalesReceiptsPage() {
             <tbody>
               {receipts.map((r) => (
                 <Tr key={r.id} id={`sales-receipt-row-${r.id}`}>
-                  <Td className="font-semibold text-navy">#{r.receiptNumber}</Td>
+                  <Td className="font-semibold text-navy">#{docNo(r.refNumber, r.receiptNumber)}</Td>
                   <Td>{r.customerName ?? 'Walk-in'}</Td>
                   <Td className="text-navy/70">{formatDate(r.date)}</Td>
                   <Td className="text-navy/70">{methodLabel(r.method)}</Td>
@@ -814,7 +845,7 @@ export default function SalesReceiptsPage() {
         title="Void Sales Receipt"
         message={
           <>
-            Are you sure you want to void <strong>Sales Receipt #{voidTarget?.receiptNumber}</strong>?
+            Are you sure you want to void <strong>Sales Receipt #{docNo(voidTarget?.refNumber, voidTarget?.receiptNumber)}</strong>?
             This will reverse the income and payment posting, restore any inventory sold, and cannot
             be undone.
           </>

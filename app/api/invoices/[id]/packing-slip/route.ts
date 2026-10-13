@@ -4,7 +4,9 @@
  * Generates a printable packing slip PDF for an invoice — ship-to address,
  * items, and quantities WITHOUT prices — and returns it inline so the browser
  * can display it directly. Filename: `packing-slip-<invoice number>.pdf`.
- * Ship-to comes from the customer's shipping address (billing as fallback).
+ * Ship-to is the invoice's own ship-to address; when the invoice has none, the customer's
+ * default ship-to address (then the shipping / billing address). The invoice's Ship Via,
+ * tracking number, ship date, F.O.B. and P.O. number are printed too.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -14,6 +16,8 @@ import { eq, and, inArray } from 'drizzle-orm';
 import { customers, items, salesOrders } from '@/lib/db/schema';
 import { renderPackingSlipPdf } from '@/lib/pdf/packingSlip';
 import { ServiceError } from '@/lib/services/_base';
+import { docRef } from '@/lib/services/docNumbers';
+import { defaultShipTo } from '@/lib/shipTo';
 
 type RouteContext = { params: Promise<{ id: string }> };
 
@@ -76,14 +80,22 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
       .select({
         displayName: customers.displayName,
         shippingAddress: customers.shippingAddress,
+        shipToAddresses: customers.shipToAddresses,
         billingAddress: customers.billingAddress,
       })
       .from(customers)
       .where(and(eq(customers.id, invoice.customerId), eq(customers.companyId, ctx.companyId)));
 
     const customerName = customerRow?.displayName ?? 'Unknown Customer';
+    const ownShipTo =
+      invoice.shipTo && Object.values(invoice.shipTo).some((v) => String(v ?? '').trim())
+        ? invoice.shipTo
+        : null;
     const shipToLines = addressLines(
-      customerRow?.shippingAddress ?? customerRow?.billingAddress,
+      ownShipTo ??
+        defaultShipTo(customerRow?.shipToAddresses) ??
+        customerRow?.shippingAddress ??
+        customerRow?.billingAddress,
     );
 
     // Item names for item-backed lines.
@@ -99,7 +111,7 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
 
     // If this invoice completed a sales order, reference its number on the slip.
     const [linkedOrder] = await ctx.db
-      .select({ orderNumber: salesOrders.orderNumber })
+      .select({ orderNumber: salesOrders.orderNumber, refNumber: salesOrders.refNumber })
       .from(salesOrders)
       .where(
         and(
@@ -113,9 +125,16 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
       customerName,
       shipToLines,
       slip: {
-        invoiceNumber: invoice.invoiceNumber,
+        invoiceNumber: docRef(invoice.refNumber, invoice.invoiceNumber),
         date: fmtDate(invoice.date),
-        orderNumber: linkedOrder?.orderNumber ?? null,
+        orderNumber: linkedOrder ? docRef(linkedOrder.refNumber, linkedOrder.orderNumber) : null,
+      },
+      shipping: {
+        shipVia: invoice.shipVia,
+        trackingNumber: invoice.trackingNumber,
+        shipDate: invoice.shipDate ? fmtDate(invoice.shipDate) : null,
+        fob: invoice.fob,
+        poNumber: invoice.poNumber,
       },
       lines: invoice.lines.map((l) => ({
         itemName: l.itemId ? itemNameById.get(l.itemId) ?? null : null,
@@ -124,7 +143,7 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
       })),
     });
 
-    const filename = `packing-slip-${invoice.invoiceNumber}.pdf`;
+    const filename = `packing-slip-${docRef(invoice.refNumber, invoice.invoiceNumber).replace(/[^A-Za-z0-9_-]/g, '_')}.pdf`;
 
     // pdf-lib returns a Uint8Array; slice out an owned ArrayBuffer for NextResponse.
     const arrayBuf: ArrayBuffer = pdfBytes.buffer.slice(

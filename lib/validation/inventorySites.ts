@@ -79,6 +79,11 @@ export const siteAdjustmentSchema = z.object({
   unitCost: zDecimal.nullish(),
   date: zDate,
   memo: z.string().nullish(),
+  /** p1 purchases: QB Adjustment Account (default "Inventory Adjustments"), Class, Customer:Job. */
+  adjustmentAccountId: zUuid.nullish(),
+  classId: zUuid.nullish(),
+  customerId: zUuid.nullish(),
+  jobId: zUuid.nullish(),
   ...inventoryLineFields,
 });
 

@@ -38,15 +38,8 @@ interface Group {
 const PARAM_KEYS = [
   'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
   'classId', 'budgetId', 'txnType', 'amountMin', 'amountMax', 'cleared', 'memo', 'number', 'sortBy', 'sortDir',
-  'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates',
+  'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates', 'interval', 'through', 'agingFrom',
 ];
-
-/** Reports that run on either basis (QB "Report Basis: Accrual / Cash"). */
-const BASIS_REPORTS = new Set([
-  'profit-loss', 'profit-loss-detail', 'profit-loss-prev-year', 'profit-loss-by-month', 'profit-loss-percent',
-  'profit-loss-ytd', 'pl-by-class', 'balance-sheet', 'balance-sheet-summary', 'balance-sheet-by-period',
-  'balance-sheet-prev-year', 'balance-sheet-detail', 'trial-balance', 'transaction-detail-by-account', 'combined-pl-by-month',
-]);
 
 function paramsFromSearch(sp: URLSearchParams | null): Params {
   const out: Params = {};
@@ -170,13 +163,13 @@ export default function StdReportView({
         disabled={loading}
         basisNav={basisNav}
         basis={
-          !basisNav && !fixedBasis && BASIS_REPORTS.has(reportKey)
+          !basisNav && !fixedBasis && entry.basis
             ? {
-                value: params.basis === 'cash' ? 'cash' : 'accrual',
+                // With no basis chosen the server uses the Reports preference; show what ran.
+                value: (params.basis ?? report?.basis) === 'cash' ? 'cash' : 'accrual',
                 onChange: (b) => {
-                  const next: Params = { ...params };
-                  if (b === 'cash') next.basis = 'cash';
-                  else delete next.basis;
+                  // Always explicit, so a memorized report keeps the basis it was saved with.
+                  const next: Params = { ...params, basis: b };
                   setParams(next);
                   applyParams(next);
                 },
@@ -278,7 +271,11 @@ export default function StdReportView({
         reportKey={reportKey}
         defaultName={title}
         existing={memorized}
-        config={{ params, display: { numberFormat: format, collapsed: allCollapsed } }}
+        config={{
+          // Memorized reports keep the basis they ran on (QB saves it with the report).
+          params: entry.basis && !params.basis && report?.basis ? { ...params, basis: report.basis } : params,
+          display: { numberFormat: format, collapsed: allCollapsed },
+        }}
         onSaved={(row) => {
           setMemorized(row);
           if (!memorizedId) router.replace(`${pathname}?${new URLSearchParams({ ...params, mem: row.id }).toString()}`);

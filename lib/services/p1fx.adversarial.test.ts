@@ -341,7 +341,9 @@ describe('P1 FX — adversarial QA', () => {
       applications: [{ invoiceId: inv.id, amountApplied: '100000.00' }],
     } as never);
     const ufIn = Money.of(await bal('1050')).minus(ufBefore);
-    expect(ufIn.toFixed(2)).toBe('123456.74');
+    // Receive Payments stores the settlement rate at the column's 6 decimals (1.234567) and posts
+    // at exactly that rate (payments team, resolvePaymentCurrency).
+    expect(ufIn.toFixed(2)).toBe('123456.70');
     await createDeposit(ctx, { depositAccountId: acct['1020'], date: d('2026-03-03'), paymentIds: [payment.id], exchangeRate: '1.2345674' });
     // Same rate on both sides: UF back to where it was, no exchange gain/loss.
     expect(Money.of(await bal('1050')).minus(ufBefore).toFixed(2)).toBe('0.00');

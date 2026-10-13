@@ -39,7 +39,7 @@ export const loanPaymentSchema = z.object({
   exchangeRate: zDecimalPositive.nullish(),
 });
 
-export const printSourceSchema = z.enum(['expense', 'bill_payment', 'paycheck']);
+export const printSourceSchema = z.enum(['expense', 'bill_payment', 'paycheck', 'payment_check']);
 
 export const markPrintedSchema = z.object({
   source: printSourceSchema,
@@ -54,6 +54,7 @@ export const queuePaychecksSchema = z.object({
 
 export const checkPrintSettingsSchema = z.object({
   style: z.enum(['voucher', 'standard', 'wallet']),
+  stock: z.enum(['preprinted', 'blank']).nullish(),
   offsetX: zDecimal,
   offsetY: zDecimal,
 });

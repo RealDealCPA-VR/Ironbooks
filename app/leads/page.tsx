@@ -94,7 +94,7 @@ export default function LeadsPage() {
 
   const loadTodos = useCallback(async (leadId: string) => {
     try {
-      setTodos(await api.get<Todo[]>(`/api/calendar/todos?includeDone=1&entityType=lead&entityId=${leadId}`));
+      setTodos((await api.get<{ todos: Todo[] }>(`/api/todos?includeDone=1&entityType=lead&entityId=${leadId}`)).todos);
     } catch {
       setTodos([]);
     }
@@ -193,7 +193,7 @@ export default function LeadsPage() {
   async function addTodo() {
     if (!selected || !newTodo.title.trim()) return;
     try {
-      await api.post('/api/calendar/todos', {
+      await api.post('/api/todos', {
         title: newTodo.title.trim(),
         dueDate: newTodo.dueDate || null,
         kind: 'call',
@@ -209,7 +209,7 @@ export default function LeadsPage() {
 
   async function toggleTodo(t: Todo) {
     try {
-      await api.patch(`/api/calendar/todos/${t.id}`, { done: !t.done });
+      await api.patch(`/api/todos/${t.id}`, { done: !t.done });
       if (selected) await loadTodos(selected.id);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not update the to-do', 'danger');

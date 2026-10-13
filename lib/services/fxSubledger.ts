@@ -23,6 +23,8 @@ import {
   billPaymentApplications,
   billPayments,
   bills,
+  creditApplications,
+  creditMemos,
   customers,
   invoices,
   journalEntries,
@@ -107,6 +109,7 @@ async function invoiceOpenAmounts(
       paymentId: paymentApplications.paymentId,
       applied: paymentApplications.amountApplied,
       discount: paymentApplications.discountAmount,
+      amountHome: paymentApplications.amountHome,
     })
     .from(paymentApplications)
     .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
@@ -134,6 +137,26 @@ async function invoiceOpenAmounts(
     }
     reliefBy.set(x.invoiceId, (reliefBy.get(x.invoiceId) ?? Money.zero()).plus(Money.of(x.home)));
   }
+  // Older databases may hold a HOME credit memo applied to a foreign invoice (refused since the
+  // payments P1 round): the memo took its home amount off A/R when it posted, so that part is no
+  // longer open in home currency. Effective from the latest of the application, memo and invoice
+  // dates (as the A/R aging dates credit-memo applications). The foreign side of it is counted
+  // by the aging's credit residual, so only the home amount is taken off here.
+  const memoApps = await ctx.db
+    .select({ invoiceId: creditApplications.invoiceId, amount: creditApplications.amount })
+    .from(creditApplications)
+    .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
+    .innerJoin(invoices, eq(invoices.id, creditApplications.invoiceId))
+    .where(
+      and(
+        eq(creditApplications.companyId, ctx.companyId),
+        inArray(creditApplications.invoiceId, ids),
+        ...(asOf ? [sql`GREATEST(${creditApplications.date}, ${creditMemos.date}, ${invoices.date}) <= ${asOf}`] : []),
+      ),
+    );
+  for (const m of memoApps) {
+    reliefBy.set(m.invoiceId, (reliefBy.get(m.invoiceId) ?? Money.zero()).plus(Money.of(m.amount)));
+  }
   const appsBy = new Map<string, typeof apps>();
   for (const a of apps) appsBy.set(a.invoiceId, [...(appsBy.get(a.invoiceId) ?? []), a]);
   for (const i of rows) {
@@ -145,7 +168,7 @@ async function invoiceOpenAmounts(
     for (const a of appsBy.get(i.id) ?? []) {
       foreign = foreign.minus(Money.of(a.applied)).minus(Money.of(a.discount ?? 0));
       if (!hasRelief.has(`${i.id}|${a.paymentId}`)) {
-        homeOpen = homeOpen.minus(r2(r2(a.applied).times(rate))).minus(r2(r2(a.discount ?? 0).times(rate)));
+        homeOpen = homeOpen.minus(legacyApplicationHome(a, rate));
       }
     }
     out.set(i.id, { foreign, homeOpen });
@@ -215,6 +238,7 @@ export async function ensureLegacyFxRelief(
     .select({
       applied: paymentApplications.amountApplied,
       discount: paymentApplications.discountAmount,
+      amountHome: paymentApplications.amountHome,
       date: paymentsReceived.date,
     })
     .from(paymentApplications)
@@ -227,8 +251,20 @@ export async function ensureLegacyFxRelief(
     invoiceId: input.invoiceId,
     date: app.date,
     amount: Money.of(app.applied).plus(Money.of(app.discount ?? 0)),
-    homeAmount: r2(r2(app.applied).times(rate)).plus(r2(r2(app.discount ?? 0).times(rate))),
+    homeAmount: legacyApplicationHome(app, rate),
   });
+}
+
+/**
+ * Home A/R an application without relief records relieved: its stored amount_home (payments P1,
+ * 0041), else (older rows) round2(applied x rate) + round2(discount x rate).
+ */
+function legacyApplicationHome(
+  a: { applied: string; discount: string | null; amountHome: string | null },
+  rate: Decimal,
+): Decimal {
+  if (a.amountHome != null) return Money.of(a.amountHome);
+  return r2(r2(a.applied).times(rate)).plus(r2(r2(a.discount ?? 0).times(rate)));
 }
 
 /** Forget a payment's relief records (its entries are being voided: void or edit). */

@@ -377,10 +377,12 @@ describe('P1 FX — fix round 6: as-of aging around later full applies; backdate
     expect(failures).toEqual([]);
     // Any re-telescoping plug is dated on a later step (today), never inside July.
     for (const p of await plugs(payment.id)) expect(p.date.getTime()).toBeGreaterThan(d('2026-07-31').getTime());
-    // Today: each invoice at round2(open x its rate), the credit at exactly round2(unapplied x rate).
+    // Today: the credit at exactly round2(unapplied x rate).
     const un = await unappliedOf(payment.id);
     expect(un.toFixed(2)).toBe('59.99'); // 150 - 25.88 - 32.92 - 25.33 - 5.88
-    expect(await bal('1200')).toBe(home('14.12', '1.1111').plus(home('4.67', '1.1111')).minus(home(un, rate)).toFixed(2));
+    // Invoices carry their booked home less round2(paid x rate) per part-payment (payments rule).
+    const invHome = home('40.00', '1.1111').minus(home('25.88', '1.1111')).plus(home('30.00', '1.1111')).minus(home('25.33', '1.1111'));
+    expect(await bal('1200')).toBe(invHome.minus(home(un, rate)).toFixed(2));
     await invariants();
     // Voiding the backdated refunds afterwards keeps every date equal; then the payment clears all.
     const refunds = await db

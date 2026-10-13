@@ -13,6 +13,9 @@
  *     account / debit / credit / class lines) the entry is left untouched and only the
  *     document header changes. That is what lets a user fix the memo or payee of a check that
  *     has already been cleared in a bank reconciliation.
+ *     Even a ledger-neutral edit of a transaction dated on/before the closing date needs the
+ *     closing-date password (QB: any change to a closed-period transaction), and is recorded on
+ *     the Closing Date Exception report — see assertClosedPeriodEdit.
  *  2. A ledger-changing edit of an entry that has a line cleared in a COMPLETED reconciliation
  *     is refused up front with a plain-language message (QB warns; we block).
  */
@@ -26,6 +29,7 @@ import {
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError } from './_base';
 import type { PostingLine } from './posting';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 
 /** Canonical key of a posting line (2dp amounts, nulls normalised). */
 function lineKey(l: {
@@ -105,7 +109,11 @@ export async function planPostedEdit(
     credit: l.credit,
     classId: l.classId,
   }));
-  if (sameDay(entry.date, params.date) && sameLedgerLines(oldLines, params.lines)) return 'unchanged';
+  if (sameDay(entry.date, params.date) && sameLedgerLines(oldLines, params.lines)) {
+    // The entry stays, so voidJournalEntry's period check never runs: check it here.
+    await assertClosedPeriodEdit(ctx, { entryId: entry.id, what: params.what });
+    return 'unchanged';
+  }
 
   if (await entryHasReconciledLines(ctx, entry.id)) {
     throw new ServiceError(
@@ -128,4 +136,45 @@ export async function retitleEntry(
     .update(journalEntries)
     .set({ ...patch, updatedAt: new Date() })
     .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, ctx.companyId)));
+}
+
+/**
+ * Closing-date lock for an edit that keeps the posted journal entry (memo, payee, number,
+ * customer:job, line description). QB requires the closing-date password for ANY change to a
+ * transaction dated on/before the closing date, and lists it on the Closing Date Exception report.
+ * Throws PERIOD_CLOSED without a valid password; records the exception when the password was used.
+ * Call inside the edit's transaction.
+ */
+export async function assertClosedPeriodEdit(
+  ctx: ServiceContext,
+  params: { entryId: string | null | undefined; what: string; date?: Date },
+): Promise<void> {
+  let date = params.date;
+  let entryNumber: number | null = null;
+  let description: string | null = null;
+  let sourceRef: string | null = null;
+  if (params.entryId) {
+    const [entry] = await ctx.db
+      .select()
+      .from(journalEntries)
+      .where(and(eq(journalEntries.id, params.entryId), eq(journalEntries.companyId, ctx.companyId)));
+    if (entry) {
+      date = entry.date;
+      entryNumber = entry.entryNumber ?? null;
+      description = entry.description ?? null;
+      sourceRef = entry.sourceRef ?? null;
+    }
+  }
+  if (!date) return;
+  const check = await assertPeriodOpen(ctx, date);
+  if (params.entryId) {
+    await recordClosingDateException(ctx, check, {
+      entryId: params.entryId,
+      operation: 'edit',
+      transactionDate: date,
+      entryNumber,
+      description: description ?? `Edited ${params.what}`,
+      sourceRef,
+    });
+  }
 }

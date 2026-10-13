@@ -82,6 +82,8 @@ export const accounts = pgTable('accounts', {
   currency: varchar('currency', { length: 3 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  /** Record-locking version: moves on edits only, not balance changes (P1 controls, 0046). */
+  editedAt: timestamp('edited_at').defaultNow().notNull(),
 });
 
 // Journal Entries (Transaction Headers)
@@ -347,6 +349,8 @@ export const customers = pgTable('customers', {
   phone: varchar('phone', { length: 50 }),
   billingAddress: jsonb('billing_address').$type<Record<string, string>>(),
   shippingAddress: jsonb('shipping_address').$type<Record<string, string>>(),
+  /** p1/salesforms: named ship-to addresses ({ name, line1.., isDefault }); drizzle/0040. */
+  shipToAddresses: jsonb('ship_to_addresses').$type<Array<Record<string, string | boolean>>>(),
   terms: varchar('terms', { length: 50 }).default('net_30'),
   creditLimit: decimal('credit_limit', { precision: 15, scale: 2 }),
   taxable: boolean('taxable').notNull().default(true),
@@ -442,6 +446,8 @@ export const taxAgencies = pgTable('tax_agencies', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   name: varchar('name', { length: 255 }).notNull(),
   liabilityAccountId: uuid('liability_account_id').references(() => accounts.id),
+  /** p1 purchases: the vendor Sales Tax Payment checks are written to (QB agencies are vendors). */
+  vendorId: uuid('vendor_id').references((): any => vendors.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -477,6 +483,8 @@ export const estimates = pgTable('estimates', {
   priorAmountInvoiced: decimal('prior_amount_invoiced', { precision: 15, scale: 2 }).notNull().default('0'),
   /** wave2 sales: quoted tax rate (kept so the estimate can be edited later). */
   taxRateId: uuid('tax_rate_id'),
+  /** p1/salesforms: ship-to address (drizzle/0040). */
+  shipTo: jsonb('ship_to').$type<Record<string, string>>(),
   toBePrinted: boolean('to_be_printed').notNull().default(false),
   toBeEmailed: boolean('to_be_emailed').notNull().default(false),
   lastEmailedAt: timestamp('last_emailed_at'),
@@ -575,6 +583,8 @@ export const invoiceLines = pgTable('invoice_lines', {
 export const paymentsReceived = pgTable('payments_received', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   date: timestamp('date').notNull(),
   method: paymentMethodEnum('method').notNull().default('check'),
@@ -599,6 +609,8 @@ export const paymentsReceived = pgTable('payments_received', {
 export const salesReceipts = pgTable('sales_receipts', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   customerId: uuid('customer_id').references(() => customers.id),
   receiptNumber: integer('receipt_number').notNull(),
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
@@ -654,6 +666,8 @@ export const paymentApplications = pgTable('payment_applications', {
   amountApplied: decimal('amount_applied', { precision: 15, scale: 2 }).notNull(),
   /** wave2 sales (C3): early-payment discount taken on this invoice (reduces its balance too). */
   discountAmount: decimal('discount_amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** P1 payments: home-currency A/R relieved by this application, cash + discount (null = legacy, amount x rate). */
+  amountHome: decimal('amount_home', { precision: 15, scale: 2 }),
 });
 
 // ---- Bills (A/P) ----
@@ -701,6 +715,8 @@ export const billLines = pgTable('bill_lines', {
 export const billPayments = pgTable('bill_payments', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   date: timestamp('date').notNull(),
   method: paymentMethodEnum('method').notNull().default('check'),
@@ -729,6 +745,8 @@ export const billPaymentApplications = pgTable('bill_payment_applications', {
 export const expenses = pgTable('expenses', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id),
   payeeName: varchar('payee_name', { length: 255 }),
   date: timestamp('date').notNull(),
@@ -769,6 +787,8 @@ export const expenseLines = pgTable('expense_lines', {
 export const transfers = pgTable('transfers', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   date: timestamp('date').notNull(),
   fromAccountId: uuid('from_account_id').references(() => accounts.id).notNull(),
   toAccountId: uuid('to_account_id').references(() => accounts.id).notNull(),
@@ -851,6 +871,8 @@ export const employees = pgTable('employees', {
 export const paychecks = pgTable('paychecks', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   employeeId: uuid('employee_id').references(() => employees.id).notNull(),
   payDate: timestamp('pay_date').notNull(),
   periodStart: timestamp('period_start'),
@@ -1000,6 +1022,8 @@ export const fiscalPeriods = pgTable('fiscal_periods', {
 export const creditMemos = pgTable('credit_memos', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   memoNumber: integer('memo_number').notNull(),
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
@@ -1042,6 +1066,8 @@ export const creditMemoLines = pgTable('credit_memo_lines', {
 export const vendorCredits = pgTable('vendor_credits', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   date: timestamp('date').notNull(),
   status: docStatusEnum('status').notNull().default('open'),
@@ -1051,6 +1077,8 @@ export const vendorCredits = pgTable('vendor_credits', {
   refundedAmount: decimal('refunded_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** p1 purchases: the vendor's credit memo number (QB "Ref. No."). */
+  refNumber: varchar('ref_number', { length: 50 }),
   /** p1 fx (0043): credit currency (null = home), home units per 1 unit, home A/P debited and
    * the home part of it still unapplied (total/unapplied above stay in the credit's currency). */
   currency: varchar('currency', { length: 3 }),
@@ -1067,12 +1095,23 @@ export const vendorCreditLines = pgTable('vendor_credit_lines', {
   description: text('description'),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
+  /** p1 purchases: Items tab (returned items), Class and Customer:Job. */
+  itemId: uuid('item_id').references(() => items.id),
+  quantity: decimal('quantity', { precision: 15, scale: 4 }),
+  unitCost: decimal('unit_cost', { precision: 15, scale: 4 }),
+  /** Inventory returns: the stock's cost taken out of inventory (home currency). */
+  costAmount: decimal('cost_amount', { precision: 15, scale: 2 }),
+  classId: uuid('class_id').references(() => classes.id),
+  customerId: uuid('customer_id').references(() => customers.id),
+  jobId: uuid('job_id').references((): any => jobs.id),
 });
 
 // ---- Sales orders (convert to invoice) ----
 export const salesOrders = pgTable('sales_orders', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   orderNumber: integer('order_number').notNull(),
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
@@ -1083,6 +1122,9 @@ export const salesOrders = pgTable('sales_orders', {
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   convertedInvoiceId: uuid('converted_invoice_id'),
+  /** p1/salesforms: sales tax on sales orders (drizzle/0040). */
+  taxRateId: uuid('tax_rate_id'),
+  taxAmount: decimal('tax_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   // wave2 sales: shipping fields (B6) + print/email queue flags (C7)
   shipDate: timestamp('ship_date'),
   shipVia: varchar('ship_via', { length: 100 }),
@@ -1109,6 +1151,8 @@ export const salesOrderLines = pgTable('sales_order_lines', {
   lineOrder: integer('line_order').notNull().default(0),
   /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
   pricing: jsonb('pricing').$type<Record<string, unknown>>(),
+  /** p1/salesforms: QB "Tax" column (drizzle/0040). */
+  taxable: boolean('taxable').notNull().default(true),
 });
 
 // ---- Jobs / Projects (job costing) ----
@@ -1177,6 +1221,8 @@ export const expenseReportLines = pgTable('expense_report_lines', {
 export const purchaseOrders = pgTable('purchase_orders', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   poNumber: integer('po_number').notNull(),
   /** Alphanumeric document number shown to users (e.g. "INV-1001"); see lib/services/docNumbers.ts. */
@@ -1215,6 +1261,8 @@ export const purchaseOrderLines = pgTable('purchase_order_lines', {
 export const itemReceipts = pgTable('item_receipts', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
   purchaseOrderId: uuid('purchase_order_id').references(() => purchaseOrders.id),
   date: timestamp('date').notNull(),
@@ -1259,6 +1307,8 @@ export const pendingBuilds = pgTable('pending_builds', {
 export const deposits = pgTable('deposits', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** Record-locking version (P1 controls, 0046; bumped by trigger bka_version_*). */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
   depositAccountId: uuid('deposit_account_id').references(() => accounts.id).notNull(),
   date: timestamp('date').notNull(),
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
@@ -1984,7 +2034,10 @@ export const salesTaxCodes = pgTable('sales_tax_codes', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
-/** QB "To Do" list. Optionally linked to a customer/vendor/employee/other name/item. */
+/**
+ * LEGACY (read-only since 0039): the old Lists > To Do store. Its rows were copied into `todos`
+ * (same ids), which is now the only To Do list. Kept so no data is ever lost; nothing writes it.
+ */
 export const todoItems = pgTable('todo_items', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
@@ -2121,6 +2174,8 @@ export const journalItemApplications = pgTable('journal_item_applications', {
   billId: uuid('bill_id').references(() => bills.id),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   date: timestamp('date').notNull(),
+  /** P1 payments (0041): kind 'journal_offset' — the two rows (credit line + charge line) of one application. */
+  pairId: uuid('pair_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -2169,7 +2224,34 @@ export const checkPrintSettings = pgTable('check_print_settings', {
   /** Alignment nudges in inches (positive = right / up). */
   offsetX: decimal('offset_x', { precision: 6, scale: 3 }).notNull().default('0'),
   offsetY: decimal('offset_y', { precision: 6, scale: 3 }).notNull().default('0'),
+  /** p1 purchases: 'preprinted' (print only the variable fields) | 'blank' (full check layout). */
+  stock: varchar('stock', { length: 20 }).notNull().default('preprinted'),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/**
+ * p1 purchases: printable check documents for Sales Tax Payments ('sales_tax'), Pay Payroll
+ * Liabilities ('payroll_liability') and customer refund checks ('customer_refund'). The journal
+ * entry (postedEntryId) is the ledger record; this row carries payee, check number and the
+ * "To be printed" flag so the payment sits in the Print Checks queue and the check register.
+ */
+export const paymentChecks = pgTable('payment_checks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  kind: varchar('kind', { length: 30 }).notNull(),
+  agencyId: uuid('agency_id').references(() => taxAgencies.id),
+  vendorId: uuid('vendor_id').references(() => vendors.id),
+  customerId: uuid('customer_id').references(() => customers.id),
+  payeeName: varchar('payee_name', { length: 255 }).notNull(),
+  paymentAccountId: uuid('payment_account_id').references(() => accounts.id).notNull(),
+  date: timestamp('date').notNull(),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  reference: varchar('reference', { length: 100 }),
+  toPrint: boolean('to_print').notNull().default(false),
+  memo: text('memo'),
+  postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  voidedAt: timestamp('voided_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
 /** Loan Manager: a loan tracked against a liability account. */
@@ -2374,6 +2456,12 @@ export const todos = pgTable('todos', {
   entityId: uuid('entity_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  // p1 ux (0039): the ONE To Do store — todo_items rows were copied in under the same ids.
+  /** open | done | inactive (kept in step with `done`). */
+  status: varchar('status', { length: 10 }).notNull().default('open'),
+  assignedUserId: uuid('assigned_user_id').references(() => users.id),
+  /** 'YYYY-MM-DD': show in Reminders from this day (null = by due date and Preferences). */
+  remindOn: varchar('remind_on', { length: 10 }),
 });
 
 /** Lead Center: prospects tracked before they become customers. */

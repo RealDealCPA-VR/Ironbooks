@@ -202,8 +202,11 @@ describe('payroll worksheets — 940 / W-3 / W-2 boxes / liabilities by item / a
     expect(byQ[1]).toBe('42.00'); // Alice Feb 30 + Bob Mar 12
     expect(byQ[2]).toBe('12.00'); // Alice Apr 12
     expect(byQ[3]).toBe('0.00');  // voided July check excluded
-    expect(byQ[4]).toBe('0.00');
-    expect(data.totalQuarterlyLiability).toBe('54.00');
+    // Alice works in California, a 2024 FUTA credit reduction state (0.9%): Schedule A adds
+    // 7,000 x 0.9% = 63.00, which the IRS has you report in the 4th quarter.
+    expect(byQ[4]).toBe('63.00');
+    expect(data.creditReduction.rows).toEqual([{ state: 'CA', wages: '7000.00', rate: '0.009', amount: '63.00' }]);
+    expect(data.totalQuarterlyLiability).toBe('117.00');
   });
 
   it('form940Data returns zeros for a year with no payroll', async () => {

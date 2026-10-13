@@ -110,7 +110,7 @@ async function unappliedCustomerCredits(ctx: ServiceContext): Promise<ReviewIssu
     });
   }
   const memos = await ctx.db
-    .select({ id: creditMemos.id, customerId: creditMemos.customerId, unapplied: creditMemos.unapplied, n: creditMemos.memoNumber, name: customers.displayName })
+    .select({ id: creditMemos.id, customerId: creditMemos.customerId, unapplied: creditMemos.unapplied, n: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))`, name: customers.displayName })
     .from(creditMemos)
     .innerJoin(customers, eq(creditMemos.customerId, customers.id))
     .where(and(eq(creditMemos.companyId, ctx.companyId), ne(creditMemos.status, 'void'), gt(creditMemos.unapplied, '0')));

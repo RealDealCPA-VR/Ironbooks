@@ -283,9 +283,12 @@ describe('payroll adjustments, edit paycheck, state taxes, workers comp', () => 
     expect(ws.totals.suiCalculated).toBe('238.00');
     expect(ws.accountNumber).toBe('123-4567-8');
 
-    // SDI is not state INCOME tax on the W-2.
+    // W-2 Box 17 is the state INCOME tax withheld (the auto-calculated California withholding),
+    // never the SDI.
     const w2 = await w2Data(ctx, { employeeId: emp.id, year: 2026 });
-    expect(w2.state.withheld).toBe('0.00');
+    const caWh = Number(l1['tax:State Withholding (CA)']) + Number(l2['tax:State Withholding (CA)']);
+    expect(caWh).toBeGreaterThan(0);
+    expect(w2.state.withheld).toBe(caWh.toFixed(2));
     expect(w2.state.code).toBe('CA');
   });
 

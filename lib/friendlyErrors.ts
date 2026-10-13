@@ -153,6 +153,15 @@ export function describeError(err: unknown, fallback = 'That didn’t work.'): F
           'Change the date to one after your closing date, or ask the company owner for the closing-date password (Settings → Closing Date).',
       };
     case 'FORBIDDEN':
+      // Preferences feature switch (lib/featureGate.ts): not a permission problem.
+      if (/is turned off for this company|are turned off for this company/.test(serverMsg)) {
+        return {
+          code,
+          title: 'This feature is turned off',
+          message: serverMsg,
+          nextStep: 'Turn it on in Settings > Preferences, or ask an administrator to.',
+        };
+      }
       return {
         code,
         title: 'You don’t have permission to do that',

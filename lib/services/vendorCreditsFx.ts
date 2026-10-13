@@ -183,6 +183,56 @@ function billStatus(bill: { amountPaid: string }, balanceDue: Decimal, amountCre
 // Apply / unapply
 // ---------------------------------------------------------------------------
 
+const ymd = (d: Date) => d.toISOString().slice(0, 10);
+
+/**
+ * The date an application (or unapply) of a vendor credit to a bill takes effect. QB does not let
+ * a credit be applied before it exists: an apply is never dated before the credit or the bill, and
+ * an unapply never before the credit was applied to that bill. A date that is too early is refused
+ * in plain words; no date means today (or the earliest allowed day, for documents dated later).
+ */
+export async function vendorCreditApplicationDate(
+  ctx: ServiceContext,
+  credit: Pick<VendorCreditRow, 'id' | 'date'>,
+  bill: Pick<BillRow, 'id' | 'date'>,
+  date: Date | null | undefined,
+  kind: 'apply' | 'unapply',
+): Promise<Date> {
+  let floor = credit.date > bill.date ? credit.date : bill.date;
+  let why = credit.date > bill.date ? `the credit's date (${ymd(credit.date)})` : `the bill's date (${ymd(bill.date)})`;
+  if (kind === 'unapply') {
+    const [last] = await ctx.db
+      .select({ date: sql<Date | string | null>`MAX(${vendorCreditApplications.date})` })
+      .from(vendorCreditApplications)
+      .where(
+        and(
+          eq(vendorCreditApplications.companyId, ctx.companyId),
+          eq(vendorCreditApplications.vendorCreditId, credit.id),
+          eq(vendorCreditApplications.billId, bill.id),
+          sql`CAST(${vendorCreditApplications.amount} AS NUMERIC) > 0`,
+        ),
+      );
+    const lastApplied = last?.date ? new Date(last.date) : null;
+    if (lastApplied && lastApplied > floor) {
+      floor = lastApplied;
+      why = `the day it was applied to this bill (${ymd(lastApplied)})`;
+    }
+  }
+  if (!date) {
+    const now = new Date();
+    return now > floor ? now : floor;
+  }
+  if (ymd(date) < ymd(floor)) {
+    throw validation(
+      kind === 'apply'
+        ? `A credit can't be applied before it exists. Use a date on or after ${why}.`
+        : `A credit can't be unapplied before it was applied. Use a date on or after ${why}.`,
+    );
+  }
+  // Same day but an earlier time of day: take the later moment so the order is kept.
+  return date < floor ? floor : date;
+}
+
 export function isForeignApplication(credit: VendorCreditRow, bill: BillRow): boolean {
   return !!credit.currency || !!bill.currency;
 }

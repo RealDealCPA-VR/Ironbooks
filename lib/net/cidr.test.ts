@@ -54,8 +54,9 @@ describe('classifyHost', () => {
     ['100.101.102.103', 'tailnet'],
     ['100.127.255.254', 'tailnet'],
     ['fd7a:115c:a1e0::1234', 'tailnet'],
-    ['office-pc.tail1234.ts.net', 'tailnet'],
-    ['OFFICE-PC.TAIL1234.TS.NET.', 'tailnet'],
+    // *.ts.net is public until DNS shows it is on the tailnet (Funnel names are public).
+    ['office-pc.tail1234.ts.net', 'public'],
+    ['OFFICE-PC.TAIL1234.TS.NET.', 'public'],
     ['100.128.0.1', 'public'],
     ['8.8.8.8', 'public'],
     ['172.32.0.1', 'public'],

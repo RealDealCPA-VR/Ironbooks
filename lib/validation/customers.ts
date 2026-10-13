@@ -13,6 +13,12 @@ export const customerAddressSchema = z.object({
   country: z.string().optional(),
 });
 
+/** A named ship-to address (QB Enterprise: several per customer, one default). */
+export const shipToAddressSchema = customerAddressSchema.extend({
+  name: z.string().max(41).optional(),
+  isDefault: z.boolean().optional(),
+});
+
 /** '' and null both mean "no email"; otherwise must be structurally valid. */
 const zEmail = z.union([z.literal(''), z.string().email('is not a valid email address')]).nullish();
 
@@ -23,6 +29,7 @@ export const createCustomerSchema = z.object({
   phone: z.string().nullish(),
   billingAddress: customerAddressSchema.nullish(),
   shippingAddress: customerAddressSchema.nullish(),
+  shipToAddresses: z.array(shipToAddressSchema).max(50).nullish(),
   terms: z.string().nullish(),
   creditLimit: zMoney.nullish(),
   taxable: z.boolean().optional(),

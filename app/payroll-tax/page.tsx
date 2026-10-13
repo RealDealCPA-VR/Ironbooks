@@ -3,8 +3,9 @@
  * Payroll Tax Calculator — federal + state withholding estimator.
  *
  * Federal: IRS Publication 15-T percentage-method tables for the chosen tax year
- * (lib/services/payrollTax.ts keeps one table per year). State: ~2024 public income-tax rates
- * (approximation). State unemployment / disability rates are set on Payroll setup.
+ * (lib/services/payrollTax.ts keeps one table per year). State: the same year-keyed state
+ * withholding engine paychecks use (lib/services/statePayrollTax.ts) for a single filer with no
+ * state allowances. State unemployment / disability rates are set on Payroll setup.
  * Results are for estimation purposes only; verify before filing.
  */
 import { useState } from 'react';
@@ -40,6 +41,7 @@ interface StateTaxResult {
   stateCode: string;
   stateName: string;
   rateLabel: string;
+  notes?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +181,8 @@ export default function PayrollTaxPage() {
           grossPerPeriod: gross,
           periodsPerYear: selectedFrequency.periodsPerYear,
           state: selectedState,
+          year: Number(taxYear),
+          filingStatus: filingStatus === 'married' ? 'married' : filingStatus === 'head_of_household' ? 'head_of_household' : 'single',
         }),
       ]);
       setResult(federalData);
@@ -388,13 +392,13 @@ export default function PayrollTaxPage() {
                 Social Security capped at {formatCurrency(String(taxYearTable(Number(taxYear)).ssWageBase))} of wages ({taxYearTable(Number(taxYear)).year}).
               </p>
 
-              <p className="mt-3 text-xs text-gold leading-relaxed font-semibold">
-                Approximation only — progressive states (CA, NY, NJ, OR, MN, DC, HI, VT, ME, CT,
-                WI, SC, NE, MT, IA, MO, AR, NM, MD, DE, AL, VA, RI, KS, OK, WV, ND, OH, LA) use
-                a single flat mid-range effective rate, not graduated brackets. Does not include
-                local taxes, pre-tax deductions (401k, health insurance, FSA), or individual
-                W-4/state equivalent adjustments. Always verify against official state guidance
-                before filing or remitting payroll taxes.
+              {(stateResult.notes ?? []).map((n) => (
+                <p key={n} className="mt-2 text-xs text-gold leading-relaxed font-semibold">{n}</p>
+              ))}
+              <p className="mt-3 text-xs text-navy/50 leading-relaxed">
+                The state figure uses the state&apos;s withholding formula for the year with no state
+                allowances and no pre-tax deductions. On a real paycheck the employee&apos;s state
+                withholding certificate (set on the employee) is used. Local taxes are not included.
               </p>
             </div>
           )}

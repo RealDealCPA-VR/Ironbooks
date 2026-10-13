@@ -30,6 +30,7 @@ import {
   paychecks,
   paycheckLines,
   payRuns,
+  payrollItems,
   payrollStateSettings,
   timeEntries,
   workersCompCodes,
@@ -47,12 +48,14 @@ import { maskForContext } from './access';
 import {
   computeEmployerTaxes,
   computeWithholding,
+  hasTaxYearTable,
   normalizeFilingStatus,
   taxableUnderBase,
   type FilingStatus,
   type W4Data,
 } from '@/lib/services/payrollTax';
 import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
+import { calculateStateWithholding, normalizeStateW4, type StateW4 } from './statePayrollTax';
 import {
   inferEmployeeTaxTracking,
   inferEmployerTracking,
@@ -389,6 +392,17 @@ export async function updateEmployee(
     const fs = (updates.w4 as Record<string, unknown>).filingStatus;
     if (fs !== undefined && fs !== null && !['single', 'married', 'head_of_household'].includes(String(fs))) {
       throw validation('W-4 filing status must be single, married or head_of_household.');
+    }
+    // State W-4 (state withholding inputs): validated and normalized; blank = not set.
+    const w4Obj = updates.w4 as Record<string, unknown>;
+    if ('stateW4' in w4Obj) {
+      try {
+        const st = normalizeStateW4(w4Obj.stateW4);
+        if (st) w4Obj.stateW4 = st;
+        else delete w4Obj.stateW4;
+      } catch (err) {
+        throw validation(err instanceof Error ? err.message : 'The state tax settings are not valid.');
+      }
     }
   }
 
@@ -790,6 +804,8 @@ interface PreparedPaycheck {
   /** This check's wage bases (income-tax wages = W-2 Box 1 basis; FICA wages = Box 3/5 basis). */
   wages: { gross: string; incomeTaxWages: string; ficaWages: string };
   itemFor: (id: string | null | undefined) => PayrollItem | null;
+  /** Plain-language notes about the calculation (state not set up, nearest-year tables, local taxes). */
+  notes: string[];
   accountsUsed: { payrollExpenseId: string; payrollTaxExpenseId: string; payrollLiabId: string; checkingId: string };
 }
 
@@ -883,6 +899,7 @@ async function preparePaycheck(
 
   const itemFor = (id: string | null | undefined): PayrollItem | null =>
     id ? itemMap.get(id) ?? null : null;
+  const notes: string[] = [];
   /** The item's tracking type (stored, else inferred from its name / pre-tax flag). */
   const itemTracking = (item: PayrollItem): TaxTracking | null =>
     resolveItemTracking(item.kind, item.name, item.taxTracking, item.pretax);
@@ -1046,6 +1063,40 @@ async function preparePaycheck(
       taxLines.push({ kind: 'tax', name: `State Disability (${state})`, amount: toAmountString(sdi), taxTracking: 'sdi' });
     }
 
+    // State income tax withholding for the work state (year-keyed engine, statePayrollTax.ts),
+    // posted to the company's State Withholding payroll item (its liability account) when set up.
+    if (!hasTaxYearTable(year)) {
+      notes.push(`Federal withholding tables for ${year} are not in this version; the nearest year's figures were used. Check the amounts before paying.`);
+    }
+    if (state) {
+      let sw;
+      try {
+        sw = calculateStateWithholding({
+          state,
+          year,
+          wagesPerPeriod: incomeTaxWages,
+          ficaWagesPerPeriod: ficaWages,
+          ficaTaxPerPeriod: Money.of(withholding.socialSecurity).plus(Money.of(withholding.medicare)),
+          periodsPerYear: input.periodsPerYear ?? 26,
+          stateW4: (w4 as Record<string, unknown>).stateW4 as StateW4 | undefined,
+        });
+      } catch (err) {
+        throw validation(err instanceof Error ? err.message : 'The state withholding could not be calculated.');
+      }
+      notes.push(...sw.notes);
+      if (Money.gt(sw.amount, 0)) {
+        const stateItem = await stateWithholdingItem(ctx);
+        if (stateItem) itemMap.set(stateItem.id, stateItem);
+        taxLines.push({
+          kind: 'tax',
+          name: `State Withholding (${state})`,
+          amount: sw.amount,
+          payrollItemId: stateItem?.id ?? null,
+          taxTracking: 'state_withholding',
+        });
+      }
+    }
+
     if (!callerSuppliedEmployerTaxes) employerTaxLines = await computeEmployerTaxLines();
 
     // --- Per-item overrides (QB: type over a calculated tax on the paycheck). Matched by the
@@ -1154,8 +1205,25 @@ async function preparePaycheck(
       ficaWages: toAmountString(ficaWages),
     },
     itemFor,
+    notes,
     accountsUsed: { payrollExpenseId, payrollTaxExpenseId, payrollLiabId, checkingId },
   };
+}
+
+/** The company's active State Withholding tax item (tax tracking 'state_withholding'), if any. */
+async function stateWithholdingItem(ctx: ServiceContext): Promise<PayrollItem | null> {
+  const rows = await ctx.db
+    .select()
+    .from(payrollItems)
+    .where(
+      and(
+        eq(payrollItems.companyId, ctx.companyId),
+        eq(payrollItems.kind, 'tax'),
+        eq(payrollItems.taxTracking, 'state_withholding'),
+        eq(payrollItems.isActive, true),
+      ),
+    );
+  return rows.find((r) => r.name.toLowerCase() === 'state withholding') ?? rows[0] ?? null;
 }
 
 /** The paycheck_lines rows for a prepared check. */
@@ -1298,6 +1366,7 @@ export async function previewPaycheck(ctx: ServiceContext, input: RunPaycheckInp
     netPay: toAmountString(prep.netPay),
     wages: prep.wages,
     lines,
+    notes: prep.notes,
   };
 }
 
@@ -1355,7 +1424,7 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
       },
     });
 
-    return { ...updated, lines: lineValues };
+    return { ...updated, lines: lineValues, notes: prep.notes };
   });
 }
 
@@ -1574,6 +1643,8 @@ export interface PayRunEmployeeResult {
   error?: string;
   /** Non-fatal issue (e.g. paycheck posted but time entries could not be marked). */
   warning?: string;
+  /** Calculation notes (state withholding not set up, nearest-year tables, local taxes). */
+  notes?: string[];
 }
 
 /**
@@ -1698,6 +1769,7 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
         paycheckId: paycheck.id,
         grossPay: paycheck.grossPay,
         netPay: paycheck.netPay,
+        ...(paycheck.notes.length ? { notes: paycheck.notes } : {}),
       };
 
       // Tag pulled time entries AFTER the check posts. The paycheck is already

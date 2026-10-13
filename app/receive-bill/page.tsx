@@ -35,6 +35,8 @@ interface OpenLine {
   reference: string | null;
   purchaseOrderId: string | null;
   poNumber: number | null;
+  /** P.O. No. the user sees (typed ref number). */
+  poRef?: string | null;
   lineId: string;
   itemId: string;
   itemName: string;
@@ -355,7 +357,7 @@ export default function ReceiveBillPage() {
                     <Td className="text-xs text-navy/70">
                       {formatDate(l.receiptDate)}
                       {l.reference && <div>Ref {l.reference}</div>}
-                      {l.poNumber && <div>PO #{l.poNumber}</div>}
+                      {l.poNumber && <div>PO #{l.poRef || l.poNumber}</div>}
                     </Td>
                     <Td>
                       <div className="font-medium">{l.itemName}</div>

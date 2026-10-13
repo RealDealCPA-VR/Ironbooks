@@ -34,6 +34,11 @@ import {
   type TaxTracking,
 } from '@/lib/services/payrollTaxTracking';
 import Decimal from 'decimal.js';
+import {
+  STATE_W4_FIELDS,
+  stateInfo,
+  type StateW4,
+} from '@/lib/services/statePayrollTax';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -60,8 +65,10 @@ interface EmployeeW4 {
   extraWithholding?: string;
   allowances?: number;
   exempt?: boolean;
-  /** Work state for state payroll taxes (SUI / SDI). */
+  /** Work state for state payroll taxes (SUI / SDI / state withholding). */
   state?: string;
+  /** State withholding certificate (statePayrollTax.ts StateW4). */
+  stateW4?: StateW4 | null;
   /** Legacy field from earlier versions (count of dependents, not used in the math). */
   dependents?: number;
 }
@@ -125,6 +132,18 @@ interface EmployeeFormState {
   extraWithholding: string;
   exempt: string; // 'true' | ''
   workState: string;
+  // State withholding (state W-4)
+  stFiling: string;
+  stAllow: string;
+  stAddl: string;
+  stDeps: string;
+  stExtra: string;
+  stExempt: string; // 'true' | ''
+  stRate: string;
+  stCoAllow: string;
+  stNjTable: string;
+  stPct: string;
+  stAmt: string;
   phone: string;
   hireDate: string;
   releaseDate: string;
@@ -220,6 +239,8 @@ interface PaycheckPreview {
     payrollItemId: string | null;
     taxTracking: string | null;
   }>;
+  /** Calculation notes (state withholding not set up, nearest-year tables, local taxes). */
+  notes?: string[];
 }
 
 // Leave accruals (GET/PUT /api/payroll/accruals)
@@ -268,6 +289,17 @@ const EMPTY_EMPLOYEE_FORM: EmployeeFormState = {
   extraWithholding: '',
   exempt: '',
   workState: '',
+  stFiling: '',
+  stAllow: '',
+  stAddl: '',
+  stDeps: '',
+  stExtra: '',
+  stExempt: '',
+  stRate: '',
+  stCoAllow: '',
+  stNjTable: '',
+  stPct: '',
+  stAmt: '',
   phone: '',
   hireDate: '',
   releaseDate: '',
@@ -405,6 +437,17 @@ function employeeToForm(emp: Employee): EmployeeFormState {
     extraWithholding: emp.w4?.extraWithholding != null ? String(emp.w4.extraWithholding) : '',
     exempt: emp.w4?.exempt ? 'true' : '',
     workState: emp.w4?.state ?? '',
+    stFiling: emp.w4?.stateW4?.filingStatus ?? '',
+    stAllow: emp.w4?.stateW4?.allowances != null ? String(emp.w4.stateW4.allowances) : '',
+    stAddl: emp.w4?.stateW4?.additionalAllowances != null ? String(emp.w4.stateW4.additionalAllowances) : '',
+    stDeps: emp.w4?.stateW4?.dependents != null ? String(emp.w4.stateW4.dependents) : '',
+    stExtra: emp.w4?.stateW4?.extraWithholding != null ? String(emp.w4.stateW4.extraWithholding) : '',
+    stExempt: emp.w4?.stateW4?.exempt ? 'true' : '',
+    stRate: emp.w4?.stateW4?.rate != null ? String(emp.w4.stateW4.rate) : '',
+    stCoAllow: emp.w4?.stateW4?.annualAllowance != null ? String(emp.w4.stateW4.annualAllowance) : '',
+    stNjTable: emp.w4?.stateW4?.njTable ?? '',
+    stPct: emp.w4?.stateW4?.fallbackPercent != null ? String(emp.w4.stateW4.fallbackPercent) : '',
+    stAmt: emp.w4?.stateW4?.fallbackAmount != null ? String(emp.w4.stateW4.fallbackAmount) : '',
     phone: emp.phone ?? '',
     hireDate: emp.hireDate ? String(emp.hireDate).slice(0, 10) : '',
     releaseDate: emp.releaseDate ? String(emp.releaseDate).slice(0, 10) : '',
@@ -421,6 +464,145 @@ function employeeToForm(emp: Employee): EmployeeFormState {
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
+
+/** The employee form's state withholding fields → the stored state W-4 (blank fields dropped). */
+function stateW4FromForm(form: EmployeeFormState): StateW4 | null {
+  const out: Record<string, unknown> = {};
+  const put = (k: keyof StateW4, v: string) => {
+    if (v.trim() !== '') out[k] = v.trim();
+  };
+  put('filingStatus', form.stFiling);
+  put('allowances', form.stAllow);
+  put('additionalAllowances', form.stAddl);
+  put('dependents', form.stDeps);
+  put('extraWithholding', form.stExtra);
+  put('rate', form.stRate);
+  put('annualAllowance', form.stCoAllow);
+  put('njTable', form.stNjTable);
+  put('fallbackPercent', form.stPct);
+  put('fallbackAmount', form.stAmt);
+  if (form.stExempt === 'true') out.exempt = true;
+  return Object.keys(out).length ? (out as StateW4) : null;
+}
+
+/**
+ * State withholding inputs for the employee's work state (else the address state): the fields that
+ * state's formula uses, or — for a state the app doesn't calculate — a percent or amount per check.
+ */
+function StateTaxFields({
+  form,
+  onChange,
+}: {
+  form: EmployeeFormState;
+  onChange: (field: keyof EmployeeFormState, value: string) => void;
+}) {
+  const code = (form.workState.trim() || form.addrState.trim()).toUpperCase();
+  const info = stateInfo(code);
+  if (!info) {
+    return (
+      <p className="text-xs text-navy/50 mt-3">
+        Enter a work state (or an address state) to set up state income tax withholding.
+      </p>
+    );
+  }
+  if (info.model === 'none') {
+    return <p className="text-xs text-navy/50 mt-3">{info.name} has no state income tax on wages.</p>;
+  }
+  const fields = STATE_W4_FIELDS[code] ?? [];
+  const has = (f: keyof StateW4) => fields.includes(f);
+  return (
+    <div className="mt-4">
+      <p className="text-xs font-semibold text-navy/50 uppercase tracking-wide mb-1">
+        {info.name} withholding
+      </p>
+      <p className="text-[11px] text-navy/50 mb-2">{info.rateLabel}.</p>
+      <div className="grid grid-cols-2 gap-3">
+        {info.model === 'employee' && (
+          <>
+            <div>
+              <Label htmlFor="stPct">Withhold this percent of wages</Label>
+              <Input id="stPct" inputMode="decimal" placeholder="e.g. 4.5" value={form.stPct} onChange={(e) => onChange('stPct', e.target.value)} />
+            </div>
+            <div>
+              <Label htmlFor="stAmt">Or this amount per paycheck</Label>
+              <Input id="stAmt" inputMode="decimal" placeholder="0.00" value={form.stAmt} onChange={(e) => onChange('stAmt', e.target.value)} />
+            </div>
+          </>
+        )}
+        {has('filingStatus') && (
+          <div>
+            <Label htmlFor="stFiling">State filing status</Label>
+            <Select id="stFiling" value={form.stFiling} onChange={(e) => onChange('stFiling', e.target.value)}>
+              <option value="">Single</option>
+              <option value="married">Married</option>
+              <option value="married_separate">Married, withhold at single rate</option>
+              <option value="head_of_household">Head of household</option>
+            </Select>
+          </div>
+        )}
+        {has('allowances') && (
+          <div>
+            <Label htmlFor="stAllow">State allowances / exemptions</Label>
+            <Input id="stAllow" type="number" min="0" step="1" value={form.stAllow} onChange={(e) => onChange('stAllow', e.target.value)} />
+          </div>
+        )}
+        {has('additionalAllowances') && (
+          <div>
+            <Label htmlFor="stAddl">Additional allowances</Label>
+            <Input id="stAddl" type="number" min="0" step="1" value={form.stAddl} onChange={(e) => onChange('stAddl', e.target.value)} />
+          </div>
+        )}
+        {has('dependents') && (
+          <div>
+            <Label htmlFor="stDeps">Dependents</Label>
+            <Input id="stDeps" type="number" min="0" step="1" value={form.stDeps} onChange={(e) => onChange('stDeps', e.target.value)} />
+          </div>
+        )}
+        {has('rate') && (
+          <div>
+            <Label htmlFor="stRate">Form A-4 percent</Label>
+            <Select id="stRate" value={form.stRate} onChange={(e) => onChange('stRate', e.target.value)}>
+              <option value="">2.0% (no A-4 on file)</option>
+              {['0', '0.5', '1', '1.5', '2', '2.5', '3', '3.5'].map((r) => (
+                <option key={r} value={r}>{r}%</option>
+              ))}
+            </Select>
+          </div>
+        )}
+        {has('annualAllowance') && (
+          <div>
+            <Label htmlFor="stCoAllow">DR 0004 annual allowance ($)</Label>
+            <Input id="stCoAllow" inputMode="decimal" placeholder="0.00" value={form.stCoAllow} onChange={(e) => onChange('stCoAllow', e.target.value)} />
+          </div>
+        )}
+        {has('njTable') && (
+          <div>
+            <Label htmlFor="stNjTable">NJ-W4 rate table</Label>
+            <Select id="stNjTable" value={form.stNjTable} onChange={(e) => onChange('stNjTable', e.target.value)}>
+              <option value="">From filing status</option>
+              <option value="A">Table A</option>
+              <option value="B">Table B</option>
+            </Select>
+          </div>
+        )}
+        <div>
+          <Label htmlFor="stExtra">Extra state withholding per paycheck</Label>
+          <Input id="stExtra" inputMode="decimal" placeholder="0.00" value={form.stExtra} onChange={(e) => onChange('stExtra', e.target.value)} />
+        </div>
+      </div>
+      <label className="flex items-start gap-2 text-sm text-navy mt-3">
+        <input
+          type="checkbox"
+          className="mt-1"
+          checked={form.stExempt === 'true'}
+          onChange={(e) => onChange('stExempt', e.target.checked ? 'true' : '')}
+        />
+        <span>Exempt from {info.name} income tax withholding</span>
+      </label>
+      {info.localNote && <p className="text-[11px] text-navy/50 mt-2">{info.localNote}</p>}
+    </div>
+  );
+}
 
 function EmployeeForm({
   form,
@@ -636,6 +818,7 @@ function EmployeeForm({
                 </Select>
               </div>
             </div>
+            <StateTaxFields form={form} onChange={onChange} />
           </div>
 
           <div className="border-t border-slate-200 pt-3">
@@ -843,6 +1026,9 @@ function TaxPreviewSection({
             Federal taxable wages {formatCurrency(preview.wages.incomeTaxWages)} · Social Security
             and Medicare wages {formatCurrency(preview.wages.ficaWages)}
           </p>
+          {(preview.notes ?? []).map((n) => (
+            <p key={n} className="text-[11px] text-amber-700 mt-1">{n}</p>
+          ))}
         </>
       )}
     </div>
@@ -1067,6 +1253,7 @@ export default function EmployeesPage() {
               extraWithholding: form.extraWithholding || '0',
               exempt: form.exempt === 'true',
               ...(form.workState.trim() ? { state: form.workState.trim().toUpperCase() } : {}),
+              stateW4: stateW4FromForm(form),
             }
           : {
               formYear: 2020,
@@ -1078,6 +1265,7 @@ export default function EmployeesPage() {
               extraWithholding: form.extraWithholding || '0',
               exempt: form.exempt === 'true',
               ...(form.workState.trim() ? { state: form.workState.trim().toUpperCase() } : {}),
+              stateW4: stateW4FromForm(form),
             },
       phone: form.phone.trim() || null,
       hireDate: form.hireDate || null,

@@ -188,13 +188,17 @@ export async function listOpenReceiptLines(ctx: ServiceContext, vendorId: string
 
   const poIds = [...new Set(rows.map((r) => r.purchaseOrderId).filter((x): x is string => !!x))];
   const poNumbers = new Map<string, number>();
+  const poRefs = new Map<string, string>();
   const poLinesByPo = new Map<string, Array<typeof purchaseOrderLines.$inferSelect>>();
   if (poIds.length > 0) {
     const pos = await ctx.db
-      .select({ id: purchaseOrders.id, poNumber: purchaseOrders.poNumber })
+      .select({ id: purchaseOrders.id, poNumber: purchaseOrders.poNumber, refNumber: purchaseOrders.refNumber })
       .from(purchaseOrders)
       .where(inArray(purchaseOrders.id, poIds));
-    for (const p of pos) poNumbers.set(p.id, p.poNumber);
+    for (const p of pos) {
+      poNumbers.set(p.id, p.poNumber);
+      poRefs.set(p.id, p.refNumber || String(p.poNumber));
+    }
     const pls = await ctx.db
       .select()
       .from(purchaseOrderLines)
@@ -219,6 +223,7 @@ export async function listOpenReceiptLines(ctx: ServiceContext, vendorId: string
       receiptStatus: r.receiptStatus,
       purchaseOrderId: r.purchaseOrderId,
       poNumber: r.purchaseOrderId ? (poNumbers.get(r.purchaseOrderId) ?? null) : null,
+      poRef: r.purchaseOrderId ? (poRefs.get(r.purchaseOrderId) ?? null) : null,
       lineId: r.lineId,
       itemId: r.itemId,
       itemName: r.itemName,

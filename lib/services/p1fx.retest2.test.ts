@@ -16,11 +16,11 @@
  *    keeps relief records so the restored books still finish the invoice exactly.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { users, companies, accounts, customers, invoices, journalEntries, paymentFxReliefs } from '@/lib/db/schema';
+import { users, companies, accounts, customers, invoices, journalEntries, journalEntryLines, paymentFxReliefs } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { trialBalance, balanceSheet } from './reports';
@@ -211,27 +211,28 @@ describe('P1 FX — tester re-test round 2 (relief records)', () => {
     for (const day of ['2026-03-05', '2026-03-15', '2026-03-25', '2026-04-05']) {
       expect(await agingTotal(ctx, d(day)), `aging as of ${day}`).toBe(await arAsOf(ctx, d(day)));
     }
-    expect(await arAsOf(ctx, d('2026-03-25'))).toBe('35.67'); // 107.00 - 35.66 - 35.67 (telescoped)
+    // Receive Payments rule (payments team, merged from main): a part-payment relieves A/R at the invoice's booked rate, round2(paid x rate); the payoff relieves whatever is still open.
+    expect(await arAsOf(ctx, d('2026-03-25'))).toBe('35.68'); // 107.00 - 35.66 - 35.66
     await invariants();
   });
 
-  it('[1] Home Currency Adjustment revalues from the home amount on A/R (telescoped), and the invoice still clears to 0', async () => {
+  it('[1] Home Currency Adjustment revalues from the home amount on A/R, and the invoice still clears to 0', async () => {
     const c = await customer('HCA Payer');
     const inv = await eurInvoice(c.id, '2026-04-01', '100', '1.07');
     for (const day of ['02', '03']) {
       await receivePayment(ctx, eurPay(c.id, `2026-04-${day}`, '33.33', '1.07', [{ invoiceId: inv.id, amountApplied: '33.33' }]));
     }
-    expect(await bal('1200')).toBe('35.67');
+    expect(await bal('1200')).toBe('35.68'); // 107.00 - 35.66 - 35.66 (part-payments at the booked rate)
     const preview = await previewHomeCurrencyAdjustment(ctx, { date: d('2026-04-30'), rates: { EUR: '1.20' } });
     const line = preview.lines.find((l) => l.entityId === c.id)!;
     expect(line).toBeTruthy();
     expect(Money.of(line.foreignBalance).toFixed(2)).toBe('33.34');
-    expect(Money.of(line.homeBalance).toFixed(2)).toBe('35.67'); // what A/R carries, not 35.68
+    expect(Money.of(line.homeBalance).toFixed(2)).toBe('35.68'); // what A/R carries
     expect(Money.of(line.newHomeBalance).toFixed(2)).toBe('40.01');
-    expect(Money.of(line.adjustment).toFixed(2)).toBe('4.34');
+    expect(Money.of(line.adjustment).toFixed(2)).toBe('4.33');
     await createHomeCurrencyAdjustment(ctx, { date: d('2026-04-30'), rates: { EUR: '1.20' } });
     expect(await arAsOf(ctx, d('2026-04-30'))).toBe('40.01');
-    expect(await arAsOf(ctx, d('2026-05-02'))).toBe('35.67'); // reversed the next day
+    expect(await arAsOf(ctx, d('2026-05-02'))).toBe('35.68'); // reversed the next day
     await invariants();
     await receivePayment(ctx, eurPay(c.id, '2026-05-05', '33.34', '1.20', [{ invoiceId: inv.id, amountApplied: '33.34' }]));
     expect(await bal('1200')).toBe('0.00');
@@ -339,9 +340,17 @@ describe('P1 FX — tester re-test round 2 (relief records)', () => {
       await invariants();
     }
     expect(await bal('1200')).toBe('0.00');
-    // Relief and credit-used telescope identically at the same rate: no plug entry at all.
-    const entriesAfter = (await db.select({ id: journalEntries.id }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))).length;
-    expect(entriesAfter).toBe(entriesBefore);
+    expect(await agingTotal(ctx)).toBe('0.00');
+    // Same rate: part-payments relieve the invoice at round2(paid x rate) while the credit is used
+    // at its telescoped home value, so at most a one-cent rounding plug per apply is posted.
+    const after = await db.select({ id: journalEntries.id }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId));
+    expect(after.length - entriesBefore).toBeLessThanOrEqual(3);
+    const plugLines = await db
+      .select({ debit: journalEntryLines.debit, credit: journalEntryLines.credit })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `payment:${payment.id}`), sql`${journalEntries.description} LIKE 'FX adjustment%'`));
+    for (const l of plugLines) expect(Money.of(l.debit ?? 0).plus(Money.of(l.credit ?? 0)).lessThanOrEqualTo('0.01')).toBe(true);
   });
 
   it('[3] two partial refunds of a foreign credit keep A/R == aging (credit home value telescoped like apply)', async () => {
@@ -454,15 +463,15 @@ describe('P1 FX — tester re-test round 2 (relief records)', () => {
     for (const day of ['11', '12']) {
       await receivePayment(ctx, eurPay(c.id, `2026-09-${day}`, '33.33', '1.07', [{ invoiceId: inv.id, amountApplied: '33.33' }]));
     }
-    expect(await bal('1200')).toBe('35.67');
+    expect(await bal('1200')).toBe('35.68');
     const backup = await createCompanyBackup(db, ctx.companyId);
     const restored = await restoreCompanyBackup(db, backup.buffer, { ownerId: user.id, name: `FX RT2 Restored ${seq}` });
     expect(restored.tableCounts.paymentFxReliefs).toBe(2);
     const rctx: ServiceContext = { db, companyId: restored.companyId, userId: user.id };
     const rmap: Record<string, string> = {};
     for (const a of await db.select().from(accounts).where(eq(accounts.companyId, rctx.companyId))) rmap[a.code!] = a.id;
-    expect(await bal('1200', rmap)).toBe('35.67');
-    expect(await agingTotal(rctx)).toBe('35.67');
+    expect(await bal('1200', rmap)).toBe('35.68');
+    expect(await agingTotal(rctx)).toBe('35.68');
     expect(await failedChecks(rctx)).toEqual([]);
     const [rinv] = await db.select().from(invoices).where(eq(invoices.companyId, rctx.companyId));
     const [rcust] = await db.select().from(customers).where(eq(customers.companyId, rctx.companyId));
@@ -470,6 +479,6 @@ describe('P1 FX — tester re-test round 2 (relief records)', () => {
     expect(await bal('1200', rmap)).toBe('0.00');
     await invariants(rctx, rmap);
     // The original company is untouched.
-    expect(await bal('1200')).toBe('35.67');
+    expect(await bal('1200')).toBe('35.68');
   });
 });

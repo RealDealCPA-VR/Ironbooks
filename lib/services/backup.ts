@@ -46,6 +46,8 @@ import {
   journalItemApplications,
   // wave2 purchases
   checkPrintSettings, loanPayments, loans,
+  // p1 purchases: Sales Tax Payment / Liability / refund check documents
+  paymentChecks,
   // wave2 accountant
   clientReviewTasks, listChangeReviews, salesTaxLineLinks, workingTbNotes,
   // wave2 payroll
@@ -710,6 +712,8 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'homeCurrencyAdjustments', table: homeCurrencyAdjustments, joins: [], companyCol: homeCurrencyAdjustments.companyId },
   { name: 'paymentFxReliefs', table: paymentFxReliefs, joins: [], companyCol: paymentFxReliefs.companyId },
   { name: 'checkPrintSettings', table: checkPrintSettings, joins: [], companyCol: checkPrintSettings.companyId },
+  // p1 purchases: check documents for sales tax / payroll liability payments and customer refunds
+  { name: 'paymentChecks', table: paymentChecks, joins: [], companyCol: paymentChecks.companyId },
   // ---- wave2 accountant (client_review_snapshots is NOT exported: its balances are keyed by
   // account id, which restore remaps, so an old snapshot would misreport every account) ----
   { name: 'salesTaxLineLinks', table: salesTaxLineLinks, joins: [], companyCol: salesTaxLineLinks.companyId },

@@ -129,7 +129,7 @@ export async function renderOpenItemStatementPdf(
         });
       }
       page.drawText(fmtDate(line.date), { x: COL_DATE, y: cursor, font: regular, size: 9, color: COLOR_BLACK });
-      page.drawText(`#${line.invoiceNumber}`, { x: COL_NUM, y: cursor, font: regular, size: 9, color: COLOR_BLACK });
+      page.drawText(shortDocLabel(line), { x: COL_NUM, y: cursor, font: regular, size: 9, color: COLOR_BLACK });
       page.drawText(fmtDate(line.dueDate), { x: COL_DUE, y: cursor, font: regular, size: 9, color: COLOR_GRAY });
       drawRight(fmt(line.total), COL_TOTAL, cursor, regular, 9, COLOR_BLACK);
       drawRight(
@@ -189,4 +189,15 @@ export async function renderOpenItemStatementPdf(
   });
 
   return pdfDoc.save();
+}
+
+/** Short document column text: invoice number, "CM <no.>", "Pmt <ref>", "GJ #<no.>". */
+function shortDocLabel(line: { type?: string; refNumber?: string; invoiceNumber: number }): string {
+  const ref = line.refNumber || String(line.invoiceNumber || '');
+  const text =
+    line.type === 'credit_memo' ? `CM ${ref}` :
+    line.type === 'payment' ? `Pmt ${ref}`.trim() :
+    line.type === 'general_journal' ? ref :
+    `#${ref}`;
+  return text.slice(0, 15);
 }

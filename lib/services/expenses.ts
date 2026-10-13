@@ -71,7 +71,7 @@ import {
   postDocumentInventory,
   reverseDocumentInventory,
 } from './inventorySites';
-import { planPostedEdit, retitleEntry } from './postedEdit';
+import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -904,6 +904,9 @@ export async function markExpensePrinted(
   });
 
   return inTransaction(ctx, async (tx) => {
+    // Printing stamps a number on the check — a change to a closed-period transaction (QB asks
+    // for the closing date password).
+    await assertClosedPeriodEdit(tx, { entryId: expense.postedEntryId, what: 'check number', date: expense.date });
     const [updated] = await tx.db
       .update(expenses)
       .set({ toPrint: false, reference: checkNumber })

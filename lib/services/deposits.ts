@@ -266,7 +266,7 @@ export async function listUndepositedPayments(ctx: ServiceContext): Promise<Unde
       customerName: r.customerId ? (custMap.get(r.customerId) ?? null) : null,
       date: r.date,
       method: r.method,
-      reference: r.reference ?? `SR-${r.receiptNumber}`,
+      reference: r.reference ?? `Sales Receipt #${r.refNumber || r.receiptNumber}`,
       amount: r.total,
       currency: null,
     })),

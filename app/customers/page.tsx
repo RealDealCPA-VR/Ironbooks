@@ -29,6 +29,8 @@ import { useFocusParam } from '@/lib/useFocusParam';
 import { EntityNotes } from '@/components/lists/EntityNotes';
 import { Help } from '@/components/Help';
 import Link from 'next/link';
+import { ShipToEditor, shipToRowsFrom, shipToRowsPayload, type ShipToRow } from '@/components/sales/ShipToEditor';
+import type { ShipToAddress } from '@/lib/shipTo';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +51,15 @@ interface Customer {
   salesTaxCodeId?: string | null;
   resaleNumber?: string | null;
   taxExemptionReason?: string | null;
+  /** Default sales tax item (QB "Tax Item"). */
+  taxRateId?: string | null;
+  shipToAddresses?: ShipToAddress[] | null;
+}
+
+interface TaxRateOption {
+  id: string;
+  name: string;
+  rate: string;
 }
 
 /** Terms / Sales Tax Code list entries (wave-2 lists). */
@@ -81,6 +92,7 @@ interface CustomerFormState {
   salesTaxCodeId: string;
   resaleNumber: string;
   taxExemptionReason: string;
+  taxRateId: string;
   notes: string;
 }
 
@@ -94,6 +106,7 @@ const EMPTY_FORM: CustomerFormState = {
   salesTaxCodeId: '',
   resaleNumber: '',
   taxExemptionReason: '',
+  taxRateId: '',
   notes: '',
 };
 
@@ -121,11 +134,17 @@ function CustomerForm({
   onCustomChange,
   termsList,
   taxCodes,
+  taxRates,
+  shipTos,
+  onShipTosChange,
 }: {
   form: CustomerFormState;
   onChange: (field: keyof CustomerFormState, value: string) => void;
   termsList: ListOption[];
   taxCodes: ListOption[];
+  taxRates: TaxRateOption[];
+  shipTos: ShipToRow[];
+  onShipTosChange: (rows: ShipToRow[]) => void;
   /** Company-defined custom field names for customers (may be empty). */
   customFieldNames: string[];
   customValues: Record<string, string>;
@@ -208,6 +227,18 @@ function CustomerForm({
           </Select>
         </div>
       </div>
+      <div>
+        <Label htmlFor="taxItem">Tax item</Label>
+        <Select id="taxItem" value={form.taxRateId} onChange={(e) => onChange('taxRateId', e.target.value)}>
+          <option value="">—</option>
+          {taxRates.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+            </option>
+          ))}
+        </Select>
+        <p className="mt-1 text-xs text-navy/50">New invoices and other sales forms for this customer use this tax.</p>
+      </div>
       {form.salesTaxCodeId && taxCodes.find((t) => t.id === form.salesTaxCodeId)?.taxable === false && (
         <div className="grid grid-cols-2 gap-3">
           <div>
@@ -226,6 +257,7 @@ function CustomerForm({
           </div>
         </div>
       )}
+      <ShipToEditor rows={shipTos} onChange={onShipTosChange} />
       <div>
         <Label htmlFor="notes">Notes</Label>
         <textarea
@@ -390,7 +422,14 @@ function CustomersPageContent() {
   // Terms + Sales Tax Code lists (wave-2 lists)
   const [termsList, setTermsList] = useState<ListOption[]>([]);
   const [taxCodes, setTaxCodes] = useState<ListOption[]>([]);
+  const [taxRates, setTaxRates] = useState<TaxRateOption[]>([]);
+  const [addShipTos, setAddShipTos] = useState<ShipToRow[]>([]);
+  const [editShipTos, setEditShipTos] = useState<ShipToRow[]>([]);
   useEffect(() => {
+    api
+      .get<TaxRateOption[]>('/api/tax-rates')
+      .then((d) => setTaxRates(Array.isArray(d) ? d : []))
+      .catch(() => {});
     api
       .get<{ entries: ListOption[] }>('/api/lists/terms?includeInactive=true')
       .then((d) => setTermsList(d.entries))
@@ -466,6 +505,7 @@ function CustomersPageContent() {
   function openAddModal() {
     // Preferences > Sales & Customers: default terms for new customers.
     setAddForm({ ...EMPTY_FORM, terms: prefs.company.defaultCustomerTerms });
+    setAddShipTos([]);
     setAddCustom({});
     setAddOpen(true);
   }
@@ -490,6 +530,8 @@ function CustomersPageContent() {
         salesTaxCodeId: addForm.salesTaxCodeId || undefined,
         resaleNumber: addForm.resaleNumber.trim() || undefined,
         taxExemptionReason: addForm.taxExemptionReason.trim() || undefined,
+        taxRateId: addForm.taxRateId || undefined,
+        shipToAddresses: shipToRowsPayload(addShipTos),
         notes: addForm.notes.trim() || undefined,
       });
       try {
@@ -528,8 +570,10 @@ function CustomersPageContent() {
       salesTaxCodeId: customer.salesTaxCodeId ?? '',
       resaleNumber: customer.resaleNumber ?? '',
       taxExemptionReason: customer.taxExemptionReason ?? '',
+      taxRateId: customer.taxRateId ?? '',
       notes: customer.notes ?? '',
     });
+    setEditShipTos(shipToRowsFrom(customer.shipToAddresses));
     setEditCustom({ ...(customer.customFields ?? {}) });
     setEditOpen(true);
   }
@@ -559,6 +603,8 @@ function CustomersPageContent() {
         salesTaxCodeId: editForm.salesTaxCodeId || null,
         resaleNumber: editForm.resaleNumber.trim() || null,
         taxExemptionReason: editForm.taxExemptionReason.trim() || null,
+        taxRateId: editForm.taxRateId || null,
+        shipToAddresses: shipToRowsPayload(editShipTos),
         notes: editForm.notes.trim() || null,
       });
       try {
@@ -790,6 +836,9 @@ function CustomersPageContent() {
           onChange={updateAddForm}
           termsList={termsList}
           taxCodes={taxCodes}
+          taxRates={taxRates}
+          shipTos={addShipTos}
+          onShipTosChange={setAddShipTos}
           customFieldNames={customFieldNames}
           customValues={addCustom}
           onCustomChange={(name, value) => setAddCustom((prev) => ({ ...prev, [name]: value }))}
@@ -821,6 +870,9 @@ function CustomersPageContent() {
           onChange={updateEditForm}
           termsList={termsList}
           taxCodes={taxCodes}
+          taxRates={taxRates}
+          shipTos={editShipTos}
+          onShipTosChange={setEditShipTos}
           customFieldNames={customFieldNames}
           customValues={editCustom}
           onCustomChange={(name, value) => setEditCustom((prev) => ({ ...prev, [name]: value }))}

@@ -6,6 +6,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getBillPayment, updateBillPayment, voidBillPayment } from '@/lib/services/billPayments';
 import { routeError } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -49,11 +50,11 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const voided = await voidBillPayment(ctx, id);
+    const voided = await withVersionCheck(ctx, 'bill_payment', id, expectedVersion(req), (c) => voidBillPayment(c, id));
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err, 'DELETE /api/bill-payments/[id]');
@@ -69,7 +70,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const parsed = payBillsSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const { allowDuplicateNumber, ...input } = parsed.data;
-    const payment = await updateBillPayment(ctx, id, { ...input, checkDuplicateNumber: !allowDuplicateNumber });
+    const payment = await withVersionCheck(ctx, 'bill_payment', id, expectedVersion(req), (c) => updateBillPayment(c, id, { ...input, paymentAccountId: input.paymentAccountId ?? '', checkDuplicateNumber: !allowDuplicateNumber }));
     return NextResponse.json(payment);
   } catch (err) {
     return routeError(err, 'PATCH /api/bill-payments/[id]');

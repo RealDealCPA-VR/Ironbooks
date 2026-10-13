@@ -447,8 +447,11 @@ describe('P1 FX — tester re-test 6: as-of A/P around dated vendor-credit steps
     await applyPayment(ctx, { paymentId: payment.id, applications: [{ invoiceId: inv.id, amountApplied: '11.11' }] });
     await refundPayment(ctx, { paymentId: payment.id, bankAccountId: acct['1000'], amount: '55.56', date: d('2026-07-03') });
     expect((await unappliedOf(payment.id)).toFixed(2)).toBe('0.00');
-    // Today: no credit left, A/R is exactly the invoice's home open.
-    expect(await bal('1200')).toBe(home('70.00', '1.1111').minus(home('44.44', '1.1111')).toFixed(2));
+    // Today: no credit left, A/R is exactly the invoice's home open (booked home less
+    // round2(paid x rate) for each part-payment — payments rule).
+    expect(await bal('1200')).toBe(
+      home('70.00', '1.1111').minus(home('33.33', '1.1111')).minus(home('11.11', '1.1111')).toFixed(2),
+    );
     expect(await arMismatches([d('2026-06-30'), ...JULY, new Date(), FAR])).toEqual([]);
     // On 07-10 the credit was 100 - 55.56 = 44.44 EUR (the applies are dated today).
     expect(await arAsOf(d('2026-07-10'))).toBe(home('70.00', '1.1111').minus(home('44.44', rate)).toFixed(2));

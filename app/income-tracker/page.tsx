@@ -11,7 +11,9 @@ import {
   Badge,
   Button,
   Card,
+  DateInput,
   EmptyState,
+  Label,
   PageHeader,
   Select,
   Spinner,
@@ -87,18 +89,33 @@ export default function IncomeTrackerPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [running, setRunning] = useState(false);
   const creditLimit = useCreditLimitConfirm();
+  // As of (blank = today) and customer: every bar is rebuilt for that day on the server.
+  const [asOf, setAsOf] = useState('');
+  const [customerId, setCustomerId] = useState('');
+  const [customers, setCustomers] = useState<Array<{ id: string; displayName: string }>>([]);
+
+  useEffect(() => {
+    api
+      .get<Array<{ id: string; displayName: string }>>('/api/customers')
+      .then((list) => setCustomers(Array.isArray(list) ? list : []))
+      .catch(() => setCustomers([]));
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setData(await api.get<Tracker>('/api/income-tracker'));
+      const qs = new URLSearchParams();
+      if (asOf) qs.set('asOf', asOf);
+      if (customerId) qs.set('customerId', customerId);
+      const q = qs.toString();
+      setData(await api.get<Tracker>(`/api/income-tracker${q ? `?${q}` : ''}`));
       setSelected(new Set());
     } catch (err) {
       toastError(err, 'Could not load the Income Tracker.');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [asOf, customerId]);
   useEffect(() => {
     load();
   }, [load]);
@@ -143,7 +160,7 @@ export default function IncomeTrackerPage() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
-        title="Income Tracker"
+        title="Money coming in (Income Tracker)"
         icon={TrendingUp}
         action={
           <Link href="/collections-center" className="text-sm font-semibold text-electric hover:underline">
@@ -151,6 +168,32 @@ export default function IncomeTrackerPage() {
           </Link>
         }
       />
+
+      <div className="mb-4 flex flex-wrap items-end gap-3">
+        <div>
+          <Label htmlFor="it-asof">As of</Label>
+          <DateInput id="it-asof" value={asOf} onChange={(e) => setAsOf(e.target.value)} />
+        </div>
+        <div className="w-64">
+          <Label htmlFor="it-customer">Customer</Label>
+          <Select id="it-customer" value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
+            <option value="">All customers</option>
+            {customers.map((c) => (
+              <option key={c.id} value={c.id}>{c.displayName}</option>
+            ))}
+          </Select>
+        </div>
+        {asOf && (
+          <Button variant="ghost" size="sm" onClick={() => setAsOf('')}>
+            Back to today
+          </Button>
+        )}
+        <p className="text-xs text-navy/50 pb-2">
+          {data
+            ? `Showing what was unbilled, open, overdue and paid on ${formatDate(data.asOf)}.`
+            : 'Pick a day to see the tracker as it stood then.'}
+        </p>
+      </div>
 
       {loading && !data ? (
         <div className="flex items-center justify-center py-20 text-navy/40">

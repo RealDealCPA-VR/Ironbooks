@@ -543,22 +543,75 @@ async function toCashBasis(ctx: ServiceContext, rows: SalesTaxActivity[]): Promi
     .from(invoices)
     .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)));
   const totalById = new Map(heads.map((h) => [h.id, Money.of(h.total)]));
-  const apps = await ctx.db
-    .select({
-      invoiceId: paymentApplications.invoiceId,
-      amount: paymentApplications.amountApplied,
-      date: paymentsReceived.date,
-      paymentId: paymentsReceived.id,
-    })
-    .from(paymentApplications)
-    .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
-    .where(
-      and(
-        inArray(paymentApplications.invoiceId, invoiceIds),
-        eq(paymentsReceived.companyId, ctx.companyId),
-        sql`${paymentsReceived.voidedAt} IS NULL`,
-      ),
-    );
+  const invDate = new Map(
+    rows.filter((r) => r.docType === 'invoice' && r.docId).map((r) => [r.docId!, r.date] as const),
+  );
+  const apps = await invoiceSettlements(ctx, invoiceIds, invDate);
+  const out: SalesTaxActivity[] = [];
+  for (const r of rows) {
+    if (r.docType !== 'invoice' || !r.docId) {
+      out.push(r);
+      continue;
+    }
+    const total = totalById.get(r.docId);
+    if (!total || total.isZero()) continue;
+    // Cumulative allocation: each settlement's share is round(tax * cumulativeApplied / total) minus
+    // what earlier settlements already took, so rounding never drifts. Once the invoice is fully
+    // settled the shares sum to exactly the invoice tax (cash basis == accrual).
+    const tax = Money.of(r.amount);
+    let cumApplied = Money.of(0);
+    let allocated = Money.of(0);
+    for (const a of apps.filter((x) => x.invoiceId === r.docId)) {
+      cumApplied = cumApplied.plus(Money.of(a.amount));
+      const target = cumApplied.greaterThanOrEqualTo(total)
+        ? tax
+        : Money.round2(tax.times(cumApplied).dividedBy(total));
+      const share = target.minus(allocated);
+      allocated = target;
+      if (share.isZero()) continue;
+      out.push({ ...r, date: a.date, amount: toAmountString(share), description: `${r.description} (paid)` });
+    }
+  }
+  return out.sort((a, b) => a.date.getTime() - b.date.getTime());
+}
+
+/** One settlement of an invoice: a customer payment application or an applied credit memo. */
+interface InvoiceSettlement {
+  invoiceId: string;
+  amount: string;
+  date: Date;
+  paymentId: string;
+}
+
+/**
+ * Every live settlement of the given invoices (payments applied + credit memos applied), in date
+ * then id order. Cash basis recognizes invoice tax (and Revenue Summary invoice sales) pro rata on
+ * these dates, as QB does.
+ */
+async function invoiceSettlements(
+  ctx: ServiceContext,
+  invoiceIds: string[],
+  invDate: Map<string, Date>,
+): Promise<InvoiceSettlement[]> {
+  if (invoiceIds.length === 0) return [];
+  const apps: InvoiceSettlement[] = (
+    await ctx.db
+      .select({
+        invoiceId: paymentApplications.invoiceId,
+        amount: paymentApplications.amountApplied,
+        date: paymentsReceived.date,
+        paymentId: paymentsReceived.id,
+      })
+      .from(paymentApplications)
+      .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
+      .where(
+        and(
+          inArray(paymentApplications.invoiceId, invoiceIds),
+          eq(paymentsReceived.companyId, ctx.companyId),
+          sql`${paymentsReceived.voidedAt} IS NULL`,
+        ),
+      )
+  ).map((a) => ({ invoiceId: String(a.invoiceId), amount: String(a.amount), date: a.date, paymentId: a.paymentId }));
   // Credit memos applied to an invoice settle it just like a payment (QB cash basis). applyToInvoice
   // records the edge only in the audit trail (newValues.appliedToInvoice / amountApplied), so read
   // it from there. The settlement date is the later of the memo date and the invoice date, so the
@@ -586,9 +639,6 @@ async function toCashBasis(ctx: ServiceContext, rows: SalesTaxActivity[]): Promi
       .from(creditMemos)
       .where(and(eq(creditMemos.companyId, ctx.companyId), inArray(creditMemos.id, memoIds)));
     const memoById = new Map(memoHeads.map((m) => [m.id, m]));
-    const invDate = new Map(
-      rows.filter((r) => r.docType === 'invoice' && r.docId).map((r) => [r.docId!, r.date] as const),
-    );
     for (const c of relevant) {
       const nv = c.newValues as { appliedToInvoice: string; amountApplied?: string };
       const m = memoById.get(c.memoId);
@@ -598,34 +648,8 @@ async function toCashBasis(ctx: ServiceContext, rows: SalesTaxActivity[]): Promi
       apps.push({ invoiceId: nv.appliedToInvoice, amount: nv.amountApplied ?? '0', date, paymentId: c.memoId });
     }
   }
-  // Settlements in a stable order (date, then id) so the cumulative allocation below is deterministic.
   apps.sort((a, b) => a.date.getTime() - b.date.getTime() || String(a.paymentId).localeCompare(String(b.paymentId)));
-  const out: SalesTaxActivity[] = [];
-  for (const r of rows) {
-    if (r.docType !== 'invoice' || !r.docId) {
-      out.push(r);
-      continue;
-    }
-    const total = totalById.get(r.docId);
-    if (!total || total.isZero()) continue;
-    // Cumulative allocation: each settlement's share is round(tax * cumulativeApplied / total) minus
-    // what earlier settlements already took, so rounding never drifts. Once the invoice is fully
-    // settled the shares sum to exactly the invoice tax (cash basis == accrual).
-    const tax = Money.of(r.amount);
-    let cumApplied = Money.of(0);
-    let allocated = Money.of(0);
-    for (const a of apps.filter((x) => x.invoiceId === r.docId)) {
-      cumApplied = cumApplied.plus(Money.of(a.amount));
-      const target = cumApplied.greaterThanOrEqualTo(total)
-        ? tax
-        : Money.round2(tax.times(cumApplied).dividedBy(total));
-      const share = target.minus(allocated);
-      allocated = target;
-      if (share.isZero()) continue;
-      out.push({ ...r, date: a.date, amount: toAmountString(share), description: `${r.description} (paid)` });
-    }
-  }
-  return out.sort((a, b) => a.date.getTime() - b.date.getTime());
+  return apps;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +861,7 @@ export interface RevenueSummaryRow {
 }
 
 export interface SalesTaxRevenueSummary {
+  basis: SalesTaxBasis;
   rows: RevenueSummaryRow[];
   totals: Omit<RevenueSummaryRow, 'taxRateId' | 'taxRateName' | 'rate'>;
 }
@@ -849,8 +874,9 @@ export interface SalesTaxRevenueSummary {
  */
 export async function salesTaxRevenueSummary(
   ctx: ServiceContext,
-  range: { from?: Date; to?: Date } = {},
+  range: { from?: Date; to?: Date; basis?: SalesTaxBasis } = {},
 ): Promise<SalesTaxRevenueSummary> {
+  const basis = range.basis ?? 'accrual';
   const rates = await loadRates(ctx);
   const itemRows = await ctx.db
     .select({ id: items.id, type: items.type })
@@ -877,11 +903,18 @@ export async function salesTaxRevenueSummary(
     lines: DocLine[],
     fx: Dec,
     sign: 1 | -1,
+    share?: { before: Dec; through: Dec },
   ) => {
     for (const l of lines) {
       const t = l.itemId ? itemTypes.get(l.itemId) : undefined;
       if (t === 'subtotal' || t === 'payment' || t === 'sales_tax') continue;
-      const amt = Money.round2(Money.of(l.amount).times(fx)).times(sign);
+      const full = Money.round2(Money.of(l.amount).times(fx));
+      // Cash basis: cumulative allocation per line — round(amount x paid-through-end / total) minus
+      // round(amount x paid-before-start / total) — so adjacent periods add up exactly to the whole.
+      const part = share
+        ? Money.round2(full.times(share.through)).minus(Money.round2(full.times(share.before)))
+        : full;
+      const amt = part.times(sign);
       const rateId = l.taxable ? (l.taxRateId && t !== 'discount' ? l.taxRateId : headerRateId) : headerRateId;
       const a = get(rateId);
       a.total = a.total.plus(amt);
@@ -890,10 +923,44 @@ export async function salesTaxRevenueSummary(
     }
   };
 
-  const invHeads = await ctx.db
-    .select({ id: invoices.id, taxRateId: invoices.taxRateId, fx: invoices.exchangeRate })
+  // Cash basis (QB "owe sales tax upon receipt of payment"): an invoice's sales count only as the
+  // customer pays, pro rata (settled in range / invoice total), on the payment dates.
+  const invHeadsAll = await ctx.db
+    .select({ id: invoices.id, taxRateId: invoices.taxRateId, fx: invoices.exchangeRate, total: invoices.total, date: invoices.date })
     .from(invoices)
-    .where(and(...dateConds(invoices.companyId, invoices.date), sql`${invoices.status} NOT IN ('void', 'draft')`));
+    .where(
+      and(
+        ...(basis === 'cash' ? [eq(invoices.companyId, ctx.companyId)] : dateConds(invoices.companyId, invoices.date)),
+        sql`${invoices.status} NOT IN ('void', 'draft')`,
+      ),
+    );
+  // Cash basis: fraction of each invoice settled before the range start and through the range end
+  // (capped at 1). Sales in range = share through end minus share before start, rounded per line on
+  // the running total (same cumulative approach as toCashBasis uses for the tax).
+  const invShare = new Map<string, { before: Dec; through: Dec }>();
+  if (basis === 'cash' && invHeadsAll.length) {
+    const settlements = await invoiceSettlements(
+      ctx,
+      invHeadsAll.map((h) => h.id),
+      new Map(invHeadsAll.map((h) => [h.id, h.date] as const)),
+    );
+    for (const h of invHeadsAll) {
+      const total = Money.of(h.total);
+      if (!total.greaterThan(0)) continue;
+      let before = Money.zero();
+      let through = Money.zero();
+      for (const x of settlements) {
+        if (x.invoiceId !== h.id) continue;
+        const where = inRange(x.date, range);
+        if (where === 'after') continue;
+        through = through.plus(Money.of(x.amount));
+        if (where === 'before') before = before.plus(Money.of(x.amount));
+      }
+      const frac = (v: Dec) => (v.greaterThanOrEqualTo(total) ? Money.of(1) : v.dividedBy(total));
+      if (through.greaterThan(before)) invShare.set(h.id, { before: frac(before), through: frac(through) });
+    }
+  }
+  const invHeads = basis === 'cash' ? invHeadsAll.filter((h) => invShare.has(h.id)) : invHeadsAll;
   if (invHeads.length) {
     const lines = await ctx.db
       .select({
@@ -906,7 +973,7 @@ export async function salesTaxRevenueSummary(
       .from(invoiceLines)
       .where(inArray(invoiceLines.invoiceId, invHeads.map((h) => h.id)));
     for (const h of invHeads) {
-      addDoc(h.taxRateId, lines.filter((l) => l.docId === h.id), Money.of(h.fx ?? 1), 1);
+      addDoc(h.taxRateId, lines.filter((l) => l.docId === h.id), Money.of(h.fx ?? 1), 1, invShare.get(h.id));
     }
   }
 
@@ -959,10 +1026,11 @@ export async function salesTaxRevenueSummary(
   }
 
   // Tax: from the ledger engine (collected + credited in range), grouped by rate.
-  const activity = await salesTaxActivity(ctx, { to: range.to });
+  let activity = await salesTaxActivity(ctx, { to: basis === 'accrual' ? range.to : undefined });
+  if (basis === 'cash') activity = await toCashBasis(ctx, activity);
   for (const r of activity) {
     if (r.kind !== 'collected' && r.kind !== 'credited') continue;
-    if (range.from && r.date < range.from) continue;
+    if (inRange(r.date, range) !== 'in') continue;
     get(r.taxRateId).tax = get(r.taxRateId).tax.plus(Money.of(r.amount));
   }
 
@@ -982,6 +1050,7 @@ export async function salesTaxRevenueSummary(
   const s = (f: 'totalSales' | 'nonTaxableSales' | 'taxableSales' | 'taxCollected') =>
     toAmountString(rows.reduce((t, r) => t.plus(Money.of(r[f])), Money.zero()));
   return {
+    basis,
     rows,
     totals: {
       totalSales: s('totalSales'),
@@ -989,5 +1058,105 @@ export async function salesTaxRevenueSummary(
       taxableSales: s('taxableSales'),
       taxCollected: s('taxCollected'),
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Filing periods + "Show sales tax due through" (QB Pay Sales Tax)
+// ---------------------------------------------------------------------------
+
+export type SalesTaxFrequency = 'monthly' | 'quarterly' | 'annually';
+
+const isoDay = (y: number, m0: number, d: number) =>
+  new Date(Date.UTC(y, m0, d)).toISOString().slice(0, 10);
+
+/**
+ * The last COMPLETE filing period before `today` for a filing frequency (calendar months,
+ * quarters and years, as QB uses): on 2026-10-12 monthly → Sep 1–30, quarterly → Jul 1–Sep 30,
+ * annually → 2025-01-01–2025-12-31. Dates are YYYY-MM-DD.
+ */
+export function lastFilingPeriod(
+  frequency: SalesTaxFrequency,
+  today: Date | string = new Date(),
+): { from: string; to: string } {
+  const t = typeof today === 'string' ? new Date(`${today.slice(0, 10)}T12:00:00.000Z`) : today;
+  const y = t.getUTCFullYear();
+  const m = t.getUTCMonth();
+  if (frequency === 'monthly') {
+    return { from: isoDay(y, m - 1, 1), to: isoDay(y, m, 0) };
+  }
+  if (frequency === 'annually') {
+    return { from: isoDay(y - 1, 0, 1), to: isoDay(y - 1, 11, 31) };
+  }
+  const q = Math.floor(m / 3); // current quarter 0..3
+  return { from: isoDay(y, (q - 1) * 3, 1), to: isoDay(y, q * 3, 0) };
+}
+
+export interface SalesTaxDueRow {
+  agencyId: string | null;
+  agencyName: string | null;
+  liabilityAccountId: string | null;
+  /** Owed on tax dated (accrual) or paid by customers (cash) on or before the due-through date. */
+  owedThrough: string;
+  /** Payments (and adjustments) dated after the due-through date — they settle this period first. */
+  settledLater: string;
+  /** What to pay now: owedThrough − settledLater (negative = overpaid / credit with the agency). */
+  amountDue: string;
+}
+
+export interface SalesTaxDueResult {
+  basis: SalesTaxBasis;
+  /** YYYY-MM-DD */
+  dueThrough: string;
+  rows: SalesTaxDueRow[];
+  totalDue: string;
+}
+
+/**
+ * QB Pay Sales Tax grid: per agency, the tax owed through `dueThrough` (on the company's sales tax
+ * basis) less payments / adjustments already recorded after that date. Tax collected after the
+ * date is not due yet and is left out, exactly like QB's "Show sales tax due through".
+ */
+export async function salesTaxDueThrough(
+  ctx: ServiceContext,
+  opts: { dueThrough: string; basis?: SalesTaxBasis },
+): Promise<SalesTaxDueResult> {
+  const basis = opts.basis ?? 'accrual';
+  const day = opts.dueThrough.slice(0, 10);
+  const through = new Date(`${day}T23:59:59.999Z`);
+  const owed = await salesTaxLiabilityReport(ctx, { to: through, basis });
+  const after = await salesTaxLiabilityReport(ctx, { from: new Date(through.getTime() + 1), basis });
+  const laterByAgency = new Map<string | null, Dec>();
+  for (const a of after.agencies) {
+    // paid is positive; adjustments are signed (+ increases what is owed).
+    laterByAgency.set(a.agencyId, Money.of(a.paid).minus(Money.of(a.adjustments)));
+  }
+  const keys = new Set<string | null>([...owed.agencies.map((a) => a.agencyId), ...after.agencies.map((a) => a.agencyId)]);
+  const rows: SalesTaxDueRow[] = [];
+  for (const k of keys) {
+    const o = owed.agencies.find((a) => a.agencyId === k);
+    const later = laterByAgency.get(k) ?? Money.zero();
+    const owedThrough = Money.of(o?.balance ?? 0);
+    const info = o ?? after.agencies.find((a) => a.agencyId === k)!;
+    if (k === null && owedThrough.isZero() && later.isZero()) continue;
+    rows.push({
+      agencyId: k,
+      agencyName: info.agencyName,
+      liabilityAccountId: info.liabilityAccountId,
+      owedThrough: toAmountString(owedThrough),
+      settledLater: toAmountString(later),
+      amountDue: toAmountString(owedThrough.minus(later)),
+    });
+  }
+  rows.sort((a, b) => {
+    if (a.agencyId === null) return 1;
+    if (b.agencyId === null) return -1;
+    return (a.agencyName ?? '').localeCompare(b.agencyName ?? '');
+  });
+  return {
+    basis,
+    dueThrough: day,
+    rows,
+    totalDue: toAmountString(rows.reduce((t, r) => t.plus(Money.of(r.amountDue)), Money.zero())),
   };
 }

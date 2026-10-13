@@ -21,6 +21,10 @@
  * What is kept intact:
  *   - entries backing documents that still carry an open balance (open/partial
  *     invoices & bills, unapplied credits/payments, un-billed item receipts),
+ *   - General Journal entries whose named A/R or A/P lines are still open, and those applied
+ *     (journal_item_applications) to a document that is kept — deleting them would also delete
+ *     the applications (ON DELETE CASCADE), so aging and customer/vendor balances would stop
+ *     tying to A/R and A/P. Applications are only removed when both sides are condensed,
  *   - entries with lines referenced by an in-progress ("current session")
  *     reconciliation,
  *   - draft entries (never posted — nothing to summarize),
@@ -51,6 +55,7 @@ import {
   itemReceipts,
   journalEntries,
   journalEntryLines,
+  journalItemApplications,
   paychecks,
   paymentsReceived,
   reconciliationItems,
@@ -72,6 +77,7 @@ import { allowLedgerRewrite } from './posting';
 import { assertWrite } from './rbac';
 import { BACKUP_MANIFEST_ENTRY, createBackup, ensurePreOpBackup, restoreBackup } from './backup';
 import { logTransaction } from './transactionLog';
+import { journalOpenItems } from './journal';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -231,6 +237,48 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
   for (const q of protectorQueries) {
     for (const row of await q) {
       if (row.id) protectedIds.add(row.id);
+    }
+  }
+  // 2b. General Journal open items (named A/R / A/P lines with an open amount) are open
+  //     transactions too: aging and customer / vendor balances list them.
+  for (const side of ['ar', 'ap'] as const) {
+    for (const item of await journalOpenItems(ctx, side)) protectedIds.add(item.journalEntryId);
+  }
+  // 2c. Keep applications consistent: a journal entry applied to (or paid by) a document whose
+  //     entry is kept must stay too — deleting the entry would cascade-delete the application
+  //     while the document still counts it.
+  const apps = await ctx.db
+    .select({
+      journalEntryId: journalItemApplications.journalEntryId,
+      paymentEntry: paymentsReceived.postedEntryId,
+      billPaymentEntry: billPayments.postedEntryId,
+      invoiceEntry: invoices.postedEntryId,
+      billEntry: bills.postedEntryId,
+    })
+    .from(journalItemApplications)
+    .leftJoin(paymentsReceived, eq(paymentsReceived.id, journalItemApplications.paymentId))
+    .leftJoin(billPayments, eq(billPayments.id, journalItemApplications.billPaymentId))
+    .leftJoin(invoices, eq(invoices.id, journalItemApplications.invoiceId))
+    .leftJoin(bills, eq(bills.id, journalItemApplications.billId))
+    .where(eq(journalItemApplications.companyId, ctx.companyId));
+  //     The same goes for a document that is not being condensed at all (dated on/after the
+  //     cutoff, a draft, or one whose entry was already condensed away): if that payment is later
+  //     voided, the A/R or A/P charge must still be there with its application to re-open it.
+  //     Repeat until stable, since keeping one entry can keep the entries applied to it.
+  const condensable = new Set(candidates.filter((e) => e.status !== 'draft').map((e) => e.id));
+  const removable = (id: string | null) => !!id && condensable.has(id) && !protectedIds.has(id);
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const a of apps) {
+      if (!removable(a.journalEntryId)) continue;
+      const counterparts = [a.paymentEntry, a.billPaymentEntry, a.invoiceEntry, a.billEntry];
+      // Every application names exactly one counterpart document; a missing posted entry means
+      // the document is not being condensed now, so the application has to stay.
+      const linked = counterparts.filter((id) => id !== null && id !== undefined);
+      if (linked.length === 0 || linked.some((id) => id !== a.journalEntryId && !removable(id))) {
+        protectedIds.add(a.journalEntryId);
+        changed = true;
+      }
     }
   }
   const openDocProtected = new Set(protectedIds);

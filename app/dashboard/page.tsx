@@ -19,7 +19,11 @@ import { getPageContext } from '@/lib/context';
 import { getDashboardInsights, type DashboardInsights } from '@/lib/services/dashboard';
 import { listAccounts } from '@/lib/services/accounts';
 import { trialBalance } from '@/lib/services/reports';
-import { buildAccountBalances } from '@/lib/homeWorkflow';
+import { allWorkflowHrefs, buildAccountBalances } from '@/lib/homeWorkflow';
+import { getPreferences } from '@/lib/services/company';
+import { featureHiddenPaths } from '@/lib/preferences';
+import { pageAreasFor } from '@/lib/permissions/routes';
+import type { ServiceContext } from '@/lib/services/_base';
 import HomeWorkflow from '@/components/HomeWorkflow';
 import RemindersList from '@/components/RemindersList';
 import { getMyPreferences } from '@/lib/services/preferences';
@@ -42,11 +46,30 @@ const CHART = {
   axis: '#0D1B2A', // brand navy
 } as const;
 
+/**
+ * Workflow steps this member can open: pages their roles can view (Users & Roles) and whose
+ * feature is on (Preferences). The Home diagram shows only these, like QB hides icons.
+ */
+async function allowedWorkflowHrefs(ctx: ServiceContext): Promise<string[]> {
+  const hidden = featureHiddenPaths(await getPreferences(ctx));
+  return allWorkflowHrefs().filter((href) => {
+    if (href.startsWith('#')) return true;
+    const path = href.split('?')[0];
+    if (hidden.has(path)) return false;
+    const areas = pageAreasFor(path);
+    return !ctx.access || !areas || areas.some((a) => can(ctx.access!, a, 'view'));
+  });
+}
+
 export default async function DashboardPage() {
   const ctx = await getPageContext('/dashboard');
+  const allowedHrefs = await allowedWorkflowHrefs(ctx);
   // Users & Roles: the financial snapshot needs Reports — Financial (QB Company Snapshot parity).
-  // Everyone else lands on a plain home page instead of an error.
-  if (ctx.access && !can(ctx.access, 'reports_financial', 'view')) return <LimitedHome />;
+  // Everyone else gets the Home workflow (only the tasks they can do) and their reminders.
+  if (ctx.access && !can(ctx.access, 'reports_financial', 'view')) {
+    const myPrefs = await getMyPreferences(ctx);
+    return <LimitedHome allowedHrefs={myPrefs.showHomeWorkflow ? allowedHrefs : null} />;
+  }
   // Single aggregated read model (also served as GET /api/dashboard). KPI cards keep
   // the fiscal-YTD scoping from lib/ytd.ts (settings.fiscalYearEnd; defaults Jan 1).
   const [d, accountRows, tb, myPrefs] = await Promise.all([
@@ -55,6 +78,7 @@ export default async function DashboardPage() {
     trialBalance(ctx),
     getMyPreferences(ctx),
   ]);
+  const showBalances = !ctx.access || can(ctx.access, 'banking', 'view');
   // QB "Account Balances" panel: bank + credit card balances straight from the ledger.
   const balances = buildAccountBalances(accountRows, tb.rows);
 
@@ -72,7 +96,9 @@ export default async function DashboardPage() {
 
       {/* QuickBooks-style workflow diagram: click any step to start that task
           (My Preferences > General can hide it). */}
-      {myPrefs.showHomeWorkflow && <HomeWorkflow balances={balances} />}
+      {myPrefs.showHomeWorkflow && (
+        <HomeWorkflow balances={balances} allowedHrefs={allowedHrefs} showBalances={showBalances} />
+      )}
 
       {/* Reminders (Preferences > Reminders decides what shows). */}
       <Card className="mt-8 p-6 max-w-3xl">
@@ -134,15 +160,21 @@ export default async function DashboardPage() {
 // Quick actions
 // ---------------------------------------------------------------------------
 
-function LimitedHome() {
+function LimitedHome({ allowedHrefs }: { allowedHrefs: string[] | null }) {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Home" />
-      <Card className="p-6 max-w-xl">
+      <Card className="p-6 max-w-xl mb-6">
         <p className="text-navy/70 text-sm">
-          Welcome! Use the menu on the left to get to the parts of the company file your role
-          gives you access to. Ask your administrator if you need access to something else.
+          Welcome! Click a task below, or use the menu on the left, to get to the parts of the
+          company file your role gives you access to. Ask your administrator if you need access to
+          something else.
         </p>
+      </Card>
+      {allowedHrefs && <HomeWorkflow balances={[]} allowedHrefs={allowedHrefs} showBalances={false} />}
+      <Card id="reminders" className="mt-8 p-6 max-w-3xl scroll-mt-6">
+        <h2 className="mb-2 text-lg font-bold text-navy">Reminders</h2>
+        <RemindersList compact />
       </Card>
     </main>
   );

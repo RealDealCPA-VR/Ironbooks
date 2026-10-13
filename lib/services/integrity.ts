@@ -35,7 +35,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { MIGRATIONS_FOLDER } from '@/lib/db';
-import { foreignKeyGaps } from '@/lib/db/ledgerGuards';
+import { extraLedgerTriggers, foreignKeyGaps } from '@/lib/db/ledgerGuards';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { foreignOpenReceivables } from './fxSubledger';
@@ -351,6 +351,26 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_je_non_posting: 'Non-posting accounts never carry posted amounts (post transitions)',
   bka_accounts_non_posting: 'Accounts with history cannot become non-posting',
   bka_transfers_no_ar_ap: 'Transfers never move money into or out of A/R or A/P',
+  // drizzle/0046_p1_controls.sql — record locking versions
+  ...Object.fromEntries(
+    [
+      'sales_orders',
+      'sales_receipts',
+      'credit_memos',
+      'purchase_orders',
+      'expenses',
+      'deposits',
+      'transfers',
+      'payments_received',
+      'bill_payments',
+      'vendor_credits',
+      'item_receipts',
+      'paychecks',
+      'estimates',
+      'employees',
+      'accounts',
+    ].map((t) => [`bka_version_${t}`, `Record locking: changes to ${t.replace(/_/g, ' ')} are detected`]),
+  ),
 };
 
 async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string[]; total: number }> {
@@ -378,6 +398,11 @@ async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string
     const r = await ctx.db.execute(sql.raw(text));
     return ((r as unknown as { rows: T[] }).rows ?? []) as T[];
   }, MIGRATIONS_FOLDER);
+  // Triggers added to the ledger tables outside the app could rewrite postings behind the guards.
+  const extraTriggers = await extraLedgerTriggers(async <T,>(text: string) => {
+    const r = await ctx.db.execute(sql.raw(text));
+    return ((r as unknown as { rows: T[] }).rows ?? []) as T[];
+  }, MIGRATIONS_FOLDER);
   return {
     missing: [
       ...expected.filter((t) => !present.has(t)),
@@ -385,9 +410,16 @@ async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string
       ...gaps.map(
         (g) =>
           `record link ${g.spec.table}.${g.spec.columns.join('+')} to ${g.spec.refTable} (${
-            g.state === 'missing' ? 'removed' : g.state === 'unvalidated' ? 'not checked against existing records' : 'rules changed'
+            g.state === 'missing'
+              ? 'removed'
+              : g.state === 'unvalidated'
+                ? 'not checked against existing records'
+                : g.state === 'extra'
+                  ? 'an extra link with other delete rules was added'
+                  : 'rules changed'
           })`,
       ),
+      ...extraTriggers.map((t) => `unexpected trigger ${t.tgname} on ${t.tbl} (added outside BookKeeper)`),
     ],
     total: expected.length,
   };

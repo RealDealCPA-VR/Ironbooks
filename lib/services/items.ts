@@ -14,6 +14,7 @@
 import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, items } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { assertItemTypeAllowed } from '@/lib/featureGate';
 import { assertNotControlLineAccount } from './posting';
 import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
 import { assertUomSet, assertVendor, resolveSalesTaxCode } from './lists/fields';
@@ -274,6 +275,7 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
 
   // ── Validate type rules + account links ──────────────────────────────────
   validateTypeRules((input.type ?? 'service') as ItemType, input);
+  await assertItemTypeAllowed(ctx, input.type);
   await resolveAccountLinks(ctx, input);
   const barcode = await resolveBarcode(ctx, input.barcode);
   const trackingMode = resolveTracking((input.type ?? 'service') as ItemType, input.trackingMode);
@@ -323,6 +325,7 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
  */
 export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateItemInput) {
   const before = await getItem(ctx, id);
+  if (patch.type !== undefined && patch.type !== before.type) await assertItemTypeAllowed(ctx, patch.type);
 
   // ── Name validation ──────────────────────────────────────────────────────
   let newName = before.name;

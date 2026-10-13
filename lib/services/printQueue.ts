@@ -5,9 +5,8 @@
  *   - expense      Write Checks saved with "Print later"            (expenses.toPrint)
  *   - bill_payment Pay Bills by check with "To be printed"          (billPayments.toPrint)
  *   - paycheck     paychecks added to the queue from Print Checks   (paychecks.toPrint)
- * Customer refund checks have no document table yet (credit-memo / payment refunds post a
- * journal entry only), so they cannot be queued — TODO(wave2 sales): add a refund-check
- * document with a toPrint flag and list it here.
+ *   - payment_check  p1: Sales Tax Payment checks, Pay Liabilities checks and customer refund
+ *                  checks (payment_checks.toPrint; refunds are added from Print Checks)
  * TODO(wave2 payroll): runPaycheck could set paychecks.toPrint when the user picks
  * "print later" — this module already lists and stamps such paychecks.
  *
@@ -18,7 +17,7 @@
  * a check PDF needs: "print on check as" name, vendor account number on the memo line, voucher
  * detail (expense lines / bills paid / paycheck lines).
  */
-import { and, asc, eq, inArray, isNull } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import {
   accounts,
   billPaymentApplications,
@@ -30,12 +29,22 @@ import {
   expenses,
   items,
   journalEntries,
+  journalEntryLines,
   paycheckLines,
   paychecks,
+  paymentChecks,
+  taxAgencies,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { CHECK_STYLES, MAX_CHECK_OFFSET_IN, type CheckStyle, type VoucherLine } from '@/lib/pdf/check';
+import {
+  CHECK_STOCKS,
+  CHECK_STYLES,
+  MAX_CHECK_OFFSET_IN,
+  type CheckStock,
+  type CheckStyle,
+  type VoucherLine,
+} from '@/lib/pdf/check';
 import {
   type ServiceContext,
   ServiceError,
@@ -47,9 +56,11 @@ import {
 import { markExpensePrinted } from './expenses';
 import { markBillPaymentPrinted } from './billPayments';
 import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { markPaymentCheckPrinted } from './liabilityPayments';
+import { assertClosedPeriodEdit } from './postedEdit';
 
-export type PrintSource = 'expense' | 'bill_payment' | 'paycheck';
-export const PRINT_SOURCES: PrintSource[] = ['expense', 'bill_payment', 'paycheck'];
+export type PrintSource = 'expense' | 'bill_payment' | 'paycheck' | 'payment_check';
+export const PRINT_SOURCES: PrintSource[] = ['expense', 'bill_payment', 'paycheck', 'payment_check'];
 
 export interface PrintQueueItem {
   source: PrintSource;
@@ -135,6 +146,33 @@ export async function listPrintQueue(
     });
   }
 
+  const pcRowsDoc = await ctx.db
+    .select({ c: paymentChecks, acctName: accounts.name, entryStatus: journalEntries.status })
+    .from(paymentChecks)
+    .leftJoin(accounts, eq(paymentChecks.paymentAccountId, accounts.id))
+    .leftJoin(journalEntries, eq(paymentChecks.postedEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(paymentChecks.companyId, ctx.companyId),
+        eq(paymentChecks.toPrint, true),
+        isNull(paymentChecks.voidedAt),
+        ...(opts?.paymentAccountId ? [eq(paymentChecks.paymentAccountId, opts.paymentAccountId)] : []),
+      ),
+    );
+  for (const r of pcRowsDoc) {
+    if (r.entryStatus === 'void') continue; // voided outside the check (e.g. Batch Void)
+    out.push({
+      source: 'payment_check',
+      id: r.c.id,
+      date: r.c.date,
+      payee: r.c.payeeName,
+      amount: toAmountString(r.c.amount),
+      memo: r.c.memo,
+      paymentAccountId: r.c.paymentAccountId,
+      paymentAccountName: r.acctName ?? null,
+    });
+  }
+
   const checking = await checkingAccount(ctx);
   if (!opts?.paymentAccountId || opts.paymentAccountId === checking?.id) {
     const pcRows = await ctx.db
@@ -194,6 +232,8 @@ export async function queuePaychecks(ctx: ServiceContext, ids: string[]) {
     for (const p of rows) {
       if (p.voidedAt) throw new ServiceError('CONFLICT', 'A voided paycheck cannot be printed.');
       if (p.toPrint) continue;
+      // Flagging a closed-period paycheck to print is a change to it: closing date password.
+      await assertClosedPeriodEdit(tx, { entryId: p.postedEntryId, what: 'to-be-printed flag', date: p.payDate });
       await tx.db.update(paychecks).set({ toPrint: true }).where(eq(paychecks.id, p.id));
       await writeAudit(tx, {
         action: 'update',
@@ -229,6 +269,7 @@ export async function markPaycheckPrinted(
     allowDuplicate: input.allowDuplicateNumber,
   });
   return inTransaction(ctx, async (tx) => {
+    await assertClosedPeriodEdit(tx, { entryId: pc.postedEntryId, what: 'check number', date: pc.payDate });
     const [updated] = await tx.db
       .update(paychecks)
       .set({ toPrint: false, checkNumber })
@@ -272,6 +313,12 @@ export async function markPrinted(
     case 'paycheck':
       return markPaycheckPrinted(ctx, {
         paycheckId: input.id,
+        checkNumber: input.checkNumber,
+        allowDuplicateNumber: input.allowDuplicateNumber,
+      });
+    case 'payment_check':
+      return markPaymentCheckPrinted(ctx, {
+        id: input.id,
         checkNumber: input.checkNumber,
         allowDuplicateNumber: input.allowDuplicateNumber,
       });
@@ -355,6 +402,41 @@ export async function checkPrintData(
       })),
     };
   }
+  if (source === 'payment_check') {
+    const [row] = await ctx.db
+      .select({ c: paymentChecks, agencyName: taxAgencies.name })
+      .from(paymentChecks)
+      .leftJoin(taxAgencies, eq(paymentChecks.agencyId, taxAgencies.id))
+      .where(and(eq(paymentChecks.companyId, ctx.companyId), eq(paymentChecks.id, id)));
+    if (!row) throw notFound('Check');
+    const c = row.c;
+    // Voucher detail: the liability lines of the entry (sales tax agency, payroll items) or the
+    // refund itself.
+    const lines = c.postedEntryId
+      ? await ctx.db
+          .select({ debit: journalEntryLines.debit, memo: journalEntryLines.memo, code: accounts.code, name: accounts.name })
+          .from(journalEntryLines)
+          .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+          .where(and(eq(journalEntryLines.journalEntryId, c.postedEntryId), sql`COALESCE(${journalEntryLines.debit}, 0) > 0`))
+      : [];
+    const label =
+      c.kind === 'sales_tax' ? 'Sales Tax Payment' : c.kind === 'payroll_liability' ? 'Liability Check' : 'Refund';
+    return {
+      payee: c.payeeName,
+      amount: toAmountString(c.amount),
+      date: new Date(c.date).toISOString().slice(0, 10),
+      memo: c.memo,
+      checkNumber: c.reference,
+      voucher:
+        lines.length > 0
+          ? lines.map((l) => ({
+              account: `${l.code} – ${l.name}`,
+              description: l.memo ?? (row.agencyName ? `${label} — ${row.agencyName}` : label),
+              amount: toAmountString(l.debit ?? '0'),
+            }))
+          : [{ account: label, description: c.memo, amount: toAmountString(c.amount) }],
+    };
+  }
   const [row] = await ctx.db
     .select({ p: paychecks, first: employees.firstName, last: employees.lastName })
     .from(paychecks)
@@ -383,6 +465,8 @@ export async function checkPrintData(
 
 export interface CheckPrintSettings {
   style: CheckStyle;
+  /** 'preprinted' (default): only the variable fields; 'blank': full check layout on plain paper. */
+  stock: CheckStock;
   offsetX: string;
   offsetY: string;
 }
@@ -394,6 +478,7 @@ export async function getCheckPrintSettings(ctx: ServiceContext): Promise<CheckP
     .where(eq(checkPrintSettings.companyId, ctx.companyId));
   return {
     style: (row?.style as CheckStyle) ?? 'voucher',
+    stock: row?.stock === 'blank' ? 'blank' : 'preprinted',
     offsetX: row ? Money.of(row.offsetX).toFixed(2) : '0.00',
     offsetY: row ? Money.of(row.offsetY).toFixed(2) : '0.00',
   };
@@ -401,10 +486,13 @@ export async function getCheckPrintSettings(ctx: ServiceContext): Promise<CheckP
 
 export async function saveCheckPrintSettings(
   ctx: ServiceContext,
-  input: { style: string; offsetX: string | number; offsetY: string | number },
+  input: { style: string; stock?: string | null; offsetX: string | number; offsetY: string | number },
 ): Promise<CheckPrintSettings> {
   if (!CHECK_STYLES.includes(input.style as CheckStyle)) {
     throw validation('Choose a check style: voucher, standard or wallet.');
+  }
+  if (input.stock != null && !CHECK_STOCKS.includes(input.stock as CheckStock)) {
+    throw validation('Choose the check paper: pre-printed checks or blank check stock.');
   }
   const x = Money.of(input.offsetX);
   const y = Money.of(input.offsetY);
@@ -419,7 +507,13 @@ export async function saveCheckPrintSettings(
       .select({ id: checkPrintSettings.id })
       .from(checkPrintSettings)
       .where(eq(checkPrintSettings.companyId, tx.companyId));
-    const values = { style: input.style, offsetX: x.toFixed(3), offsetY: y.toFixed(3), updatedAt: new Date() };
+    const values = {
+      style: input.style,
+      stock: (input.stock as CheckStock | null | undefined) ?? before.stock,
+      offsetX: x.toFixed(3),
+      offsetY: y.toFixed(3),
+      updatedAt: new Date(),
+    };
     let id: string;
     if (existing) {
       await tx.db.update(checkPrintSettings).set(values).where(eq(checkPrintSettings.id, existing.id));

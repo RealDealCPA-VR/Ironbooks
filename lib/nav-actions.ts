@@ -205,6 +205,14 @@ function scorePhrase(qTokens: string[], phrase: string): number {
  * counts as a phrase too, so "transfer" finds Transfer Funds. Blank queries return [].
  */
 export function matchIntents(query: string, limit = 3): NavIntent[] {
+  return matchIntentsScored(query, limit).map((s) => s.intent);
+}
+
+/**
+ * Same as matchIntents, with each match's score: 100+ means every word of one of the intent's
+ * phrases was typed ("enter a bill"); below 100 is a looser partial match.
+ */
+export function matchIntentsScored(query: string, limit = 3): Array<{ intent: NavIntent; score: number }> {
   const qTokens = intentTokens(query);
   if (!qTokens.length) return [];
   return navIntents
@@ -216,5 +224,5 @@ export function matchIntents(query: string, limit = 3): NavIntent[] {
     .filter((s) => s.score > 0)
     .sort((a, b) => b.score - a.score || a.order - b.order)
     .slice(0, limit)
-    .map((s) => s.intent);
+    .map(({ intent, score }) => ({ intent, score }));
 }

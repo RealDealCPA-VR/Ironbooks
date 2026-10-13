@@ -13,6 +13,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import {
   getPayment,
   voidPayment,
@@ -144,7 +145,7 @@ export async function PUT(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = receivePaymentSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    const result = await updatePayment(ctx, id, parsed.data);
+    const result = await withVersionCheck(ctx, 'payment_received', id, expectedVersion(req), (c) => updatePayment(c, id, parsed.data));
     return NextResponse.json(result);
   } catch (err) {
     return errorResponse(err, 'PUT /api/payments/[id]');
@@ -156,11 +157,11 @@ export async function PATCH(req: NextRequest, rc: RouteContext) {
   return PUT(req, rc);
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const voided = await voidPayment(ctx, id);
+    const voided = await withVersionCheck(ctx, 'payment_received', id, expectedVersion(req), (c) => voidPayment(c, id));
     return NextResponse.json(voided);
   } catch (err) {
     return errorResponse(err, 'DELETE /api/payments/[id]');

@@ -42,7 +42,15 @@ import {
   type ShippingState,
   shippingFromDoc,
   shippingPayload,
+  useCustomerSalesDefaults,
 } from '@/components/sales/SalesExtras';
+import {
+  DocNumberField,
+  docNo,
+  useDocNumber,
+  useDuplicateNumberConfirm,
+} from '@/components/sales/DocNumberField';
+import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,6 +64,7 @@ interface Customer {
 interface Invoice {
   id: string;
   invoiceNumber: number;
+  refNumber?: string | null;
   customerId: string;
   status: string;
   balanceDue: string;
@@ -65,6 +74,8 @@ interface Invoice {
 interface CreditMemo {
   id: string;
   memoNumber: number;
+  /** Credit No. the user typed / sees. */
+  refNumber?: string | null;
   customerId: string;
   date: string;
   status: 'open' | 'paid' | 'void';
@@ -87,7 +98,7 @@ interface CreditMemoDetail extends CreditMemo {
     taxable?: boolean;
     restock?: boolean;
   }>;
-  applications: Array<{ id: string; invoiceId: string; invoiceNumber: number; amount: string; paymentId: string | null }>;
+  applications: Array<{ id: string; invoiceId: string; invoiceNumber: number; invoiceRef?: string | null; amount: string; paymentId: string | null }>;
 }
 
 interface Account {
@@ -186,10 +197,20 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memoNote, setMemoNote] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
+  const salesTaxOn = usePreferences().company.salesTaxEnabled;
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [flags, setFlags] = useState<ShippingState>(EMPTY_SHIPPING);
   const [applications, setApplications] = useState<CreditMemoDetail['applications']>([]);
   const [saving, setSaving] = useState(false);
+  const docNumber = useDocNumber('credit_memo', open, editing ? docNo(editing.refNumber, editing.memoNumber) : null);
+  const dupConfirm = useDuplicateNumberConfirm();
+  // Customer defaults (new credit memos): tax item / non-taxable tax code.
+  const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
+  useEffect(() => {
+    if (!custDefaults || editing) return;
+    setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [custDefaults]);
 
   useEffect(() => {
     if (open && editing) {
@@ -315,6 +336,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
     try {
       const body = {
         ...shippingPayload(flags, { shipping: false }),
+        refNumber: docNumber.payload,
         customerId,
         date,
         memo: memoNote || null,
@@ -329,12 +351,16 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
           ...(l.restock ? inventoryLinePayload(l.inv) : {}),
         })),
       };
+      const saved = await dupConfirm.run((allowDuplicateNumber) =>
+        editing
+          ? api.patch<CreditMemo>(`/api/credit-memos/${editing.id}`, { ...body, allowDuplicateNumber })
+          : api.post<CreditMemo>('/api/credit-memos', { ...body, allowDuplicateNumber }),
+      );
+      if (saved === undefined) return;
       if (editing) {
-        await api.patch(`/api/credit-memos/${editing.id}`, body);
-        toast(`Credit Memo #${editing.memoNumber} updated.`, 'success');
+        toast(`Credit Memo #${docNo(saved.refNumber, saved.memoNumber)} updated.`, 'success');
       } else {
-        await api.post('/api/credit-memos', body);
-        toast('Credit memo created.', 'success');
+        toast(`Credit Memo #${docNo(saved.refNumber, saved.memoNumber)} created.`, 'success');
       }
       onCreated();
       onClose();
@@ -351,7 +377,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
       size="lg"
       open={open}
       onClose={onClose}
-      title={editing ? `Edit Credit Memo #${editing.memoNumber}` : 'New Credit Memo'}
+      title={editing ? `Edit Credit Memo #${docNo(editing.refNumber, editing.memoNumber)}` : 'New Credit Memo'}
       footer={
         <>
           <MemorizeButton
@@ -400,7 +426,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
               {applications.map((a) => (
                 <li key={a.id} className="flex items-center justify-between">
                   <span>
-                    Invoice #{a.invoiceNumber} — {formatCurrency(a.amount)}
+                    Invoice #{a.invoiceRef || a.invoiceNumber} — {formatCurrency(a.amount)}
                     {a.paymentId ? <span className="text-navy/40"> (with a payment)</span> : null}
                   </span>
                   {!a.paymentId && (
@@ -429,14 +455,17 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
           </Select>
         </div>
 
-        {/* Date */}
-        <div>
-          <Label htmlFor="cm-date">Date *</Label>
-          <DateInput
-            id="cm-date"
-            value={date}
-            onChange={(e) => setDate(e.target.value)}
-          />
+        {/* Credit No. + Date */}
+        <div className="grid grid-cols-2 gap-3">
+          <DocNumberField id="cm-number" label="Credit No." value={docNumber.value} onChange={docNumber.setValue} />
+          <div>
+            <Label htmlFor="cm-date">Date *</Label>
+            <DateInput
+              id="cm-date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+            />
+          </div>
         </div>
 
         {/* Line items */}
@@ -549,7 +578,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
         </div>
 
         {/* Tax rate */}
-        <div>
+        {/* Hidden while "Charge sales tax" is off (QB removes tax from forms); an old document keeps its tax. */}
+        {(salesTaxOn || taxRateId) && (<div>
           <Label htmlFor="cm-taxrate">Sales Tax Rate</Label>
           <Select
             id="cm-taxrate"
@@ -563,7 +593,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
               </option>
             ))}
           </Select>
-        </div>
+        </div>)}
 
         {/* Memo note */}
         <div>
@@ -577,6 +607,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
         </div>
 
         <ShippingSection value={flags} onChange={setFlags} showShipping={false} idPrefix="cm" />
+        {dupConfirm.dialog}
 
         {/* Live totals */}
         <div className="rounded-lg bg-navy/5 px-4 py-3 space-y-1">
@@ -665,7 +696,7 @@ function ApplyModal({ open, memo, onClose, onApplied }: ApplyModalProps) {
     <Modal
       open={open}
       onClose={onClose}
-      title={`Apply Credit Memo #${memo?.memoNumber ?? ''}`}
+      title={`Apply Credit Memo #${docNo(memo?.refNumber, memo?.memoNumber ?? '')}`}
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={applying}>Cancel</Button>
@@ -700,7 +731,7 @@ function ApplyModal({ open, memo, onClose, onApplied }: ApplyModalProps) {
               <option value="">Select an invoice…</option>
               {invoices.map((inv) => (
                 <option key={inv.id} value={inv.id}>
-                  #{inv.invoiceNumber} — Balance: {formatCurrency(inv.balanceDue)}
+                  #{inv.refNumber || inv.invoiceNumber} — Balance: {formatCurrency(inv.balanceDue)}
                 </option>
               ))}
             </Select>
@@ -774,7 +805,7 @@ function RefundModal({ open, memo, accounts, onClose, onRefunded }: RefundModalP
     <Modal
       open={open}
       onClose={onClose}
-      title={`Refund Credit Memo #${memo?.memoNumber ?? ''}`}
+      title={`Refund Credit Memo #${docNo(memo?.refNumber, memo?.memoNumber ?? '')}`}
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
@@ -883,7 +914,7 @@ export default function CreditMemosPage() {
     setVoiding(true);
     try {
       await api.del(`/api/credit-memos/${voidTarget.id}`);
-      toast(`Credit Memo #${voidTarget.memoNumber} voided.`, 'success');
+      toast(`Credit Memo #${docNo(voidTarget.refNumber, voidTarget.memoNumber)} voided.`, 'success');
       setVoidTarget(null);
       fetchData();
     } catch (err: unknown) {
@@ -942,7 +973,7 @@ export default function CreditMemosPage() {
             <tbody>
               {memos.map((m) => (
                 <Tr key={m.id}>
-                  <Td className="font-semibold text-navy">#{m.memoNumber}</Td>
+                  <Td className="font-semibold text-navy">#{docNo(m.refNumber, m.memoNumber)}</Td>
                   <Td>{customerMap[m.customerId] ?? '—'}</Td>
                   <Td className="text-navy/70">{formatDate(m.date)}</Td>
                   <Td numeric className="font-medium">
@@ -1056,7 +1087,7 @@ export default function CreditMemosPage() {
         message={
           <>
             Are you sure you want to void{' '}
-            <strong>Credit Memo #{voidTarget?.memoNumber}</strong>? This will reverse the GL
+            <strong>Credit Memo #{docNo(voidTarget?.refNumber, voidTarget?.memoNumber)}</strong>? This will reverse the GL
             entry and cannot be undone.
           </>
         }

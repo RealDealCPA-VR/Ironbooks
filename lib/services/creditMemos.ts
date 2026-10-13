@@ -40,6 +40,7 @@
  * quantity from stock again.
  */
 import { isDepositTargetAccount } from '@/lib/accountTypes';
+import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -57,6 +58,7 @@ import {
 import { Money, allocate, toAmountString } from '@/lib/money';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
+import { getHomeCurrencyCode } from './currencies';
 import {
   type InventoryLineDetail,
   attachInventoryDetails,
@@ -71,7 +73,8 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { allocateDocNumber, docRef } from './docNumbers';
+import { applyCustomerTaxDefaults } from './customerDefaults';
+import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -547,6 +550,8 @@ async function postCreditMemoDocument(
 }
 
 export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInput) {
+  await assertSalesTaxAllowed(ctx, input);
+  input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   const prep = await prepareCreditMemo(ctx, input);
   const { subtotal, taxAmount, total } = prep;
   return inTransaction(ctx, async (tx) => {
@@ -702,6 +707,20 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
       'Credit memo and invoice must belong to the same customer.',
     );
   }
+  // Credit memos are recorded in home currency; a foreign-currency invoice is settled through
+  // Receive Payments (which converts at the booked rate and posts realized exchange gain/loss).
+  // Same rule as vendorCredits.applyToBill on the A/P side.
+  // The invoice Currency field is free text: blank or the home code (any case) means home currency,
+  // the same normalisation Receive Payments uses — only a genuinely foreign code is refused.
+  const invoiceCurrency = (invoice.currency ?? '').trim().toUpperCase();
+  if (invoiceCurrency) {
+    const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+    if (invoiceCurrency !== home) {
+      throw validation(
+        `This invoice is in ${invoiceCurrency}. Home-currency credits can't be applied to it — settle it with Receive Payments instead.`,
+      );
+    }
+  }
 
   const balanceDue = Money.of(invoice.balanceDue);
   if (amount.greaterThan(balanceDue)) {
@@ -783,7 +802,9 @@ export async function listCreditApplications(
       amount: creditApplications.amount,
       date: creditApplications.date,
       memoNumber: creditMemos.memoNumber,
+      memoRef: creditMemos.refNumber,
       invoiceNumber: invoices.invoiceNumber,
+      invoiceRef: invoices.refNumber,
     })
     .from(creditApplications)
     .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
@@ -1172,12 +1193,14 @@ export async function updateCreditMemo(
   id: string,
   input: CreateCreditMemoInput,
 ) {
+  input = await applyCustomerTaxDefaults(ctx, input);
   const [existing] = await ctx.db
     .select()
     .from(creditMemos)
     .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.id, id)));
   if (!existing) throw notFound('Credit memo');
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided credit memo.');
+  await assertSalesTaxAllowed(ctx, input, [existing.taxRateId]);
 
   const prep = await prepareCreditMemo(ctx, input);
 
@@ -1211,6 +1234,11 @@ export async function updateCreditMemo(
       .where(eq(creditMemoLines.creditMemoId, id))
       .orderBy(asc(creditMemoLines.lineOrder));
 
+    const renum = await renumberDoc(
+      tx, 'credit_memo', id, { refNumber: memo.refNumber, number: memo.memoNumber },
+      input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+    );
+
     // 1) Reverse the old version's postings (restock + A/R entry).
     await reverseCreditMemoPostings(tx, memo);
 
@@ -1218,7 +1246,11 @@ export async function updateCreditMemo(
     await tx.db.delete(creditMemoLines).where(eq(creditMemoLines.creditMemoId, id));
     const { insertedLines, entry, restockEntries } = await postCreditMemoDocument(
       tx,
-      { id, memoNumber: memo.memoNumber, refNumber: memo.refNumber },
+      {
+        id,
+        memoNumber: renum?.number ?? memo.memoNumber,
+        refNumber: renum?.refNumber ?? memo.refNumber,
+      },
       input,
       prep,
     );
@@ -1236,6 +1268,7 @@ export async function updateCreditMemo(
         status: newUnapplied.isZero() ? 'paid' : 'open',
         memo: input.memo ?? null,
         taxRateId: input.taxRateId ?? null,
+        ...(renum ? { refNumber: renum.refNumber, memoNumber: renum.number } : {}),
         toBePrinted: input.toBePrinted ?? memo.toBePrinted,
         toBeEmailed: input.toBeEmailed ?? memo.toBeEmailed,
         postedEntryId: entry.id,
@@ -1250,6 +1283,7 @@ export async function updateCreditMemo(
       oldValues: {
         customerId: memo.customerId,
         date: memo.date,
+        refNumber: memo.refNumber,
         subtotal: memo.subtotal,
         taxAmount: memo.taxAmount,
         total: memo.total,
@@ -1260,6 +1294,8 @@ export async function updateCreditMemo(
       newValues: {
         customerId: input.customerId,
         date: input.date,
+        refNumber: renum?.refNumber ?? memo.refNumber,
+        duplicateNumber: renum?.duplicate || undefined,
         subtotal: toAmountString(prep.subtotal),
         taxAmount: toAmountString(prep.taxAmount),
         total: toAmountString(prep.total),

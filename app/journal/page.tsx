@@ -44,6 +44,7 @@ import EntryDetailModal from '@/components/EntryDetailModal';
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmClassAssigned, confirmTransactionDate } from '@/lib/formPrefs';
 import { formatAccountLabel } from '@/lib/preferences';
+import { nextJournalNumber } from '@/lib/prefBehaviors';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 
@@ -206,6 +207,13 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       setDate(todayISO());
       setDescription('');
       setReference('');
+      // Preferences > Accounting 'Automatically number journal entries': next Entry No.
+      if (prefs.company.autoAssignJeNumbers) {
+        api
+          .get<{ entries: { reference: string | null }[] }>('/api/journal-entries')
+          .then((d) => setReference((r) => r || nextJournalNumber(d.entries.map((e) => e.reference))))
+          .catch(() => {});
+      }
       setIsAdjusting(false);
       setLines([emptyLine(++lineCounter), emptyLine(++lineCounter)]);
     }
@@ -417,8 +425,13 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide inline-flex items-center gap-1">
             Name <Help term="name-on-journal-line" side="bottom" />
           </span>
+          {/* Class fields are hidden while "Use class tracking" is off (QB); a saved class still shows. */}
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide inline-flex items-center gap-1">
-            Class <Help term="class" side="bottom" />
+            {prefs.company.classTrackingEnabled && (
+              <>
+                Class <Help term="class" side="bottom" />
+              </>
+            )}
           </span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">Memo</span>
           <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide text-right">Debit</span>
@@ -477,18 +490,22 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
                 })}
               </Select>
 
-              <Select
-                aria-label={`Line ${idx + 1} class`}
-                value={line.classId}
-                onChange={(e) => updateLine(line.id, 'classId', e.target.value)}
-              >
-                <option value="">— No class —</option>
-                {classes.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </Select>
+              {prefs.company.classTrackingEnabled || line.classId ? (
+                <Select
+                  aria-label={`Line ${idx + 1} class`}
+                  value={line.classId}
+                  onChange={(e) => updateLine(line.id, 'classId', e.target.value)}
+                >
+                  <option value="">— No class —</option>
+                  {classes.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </Select>
+              ) : (
+                <span />
+              )}
 
               <Input
                 aria-label={`Line ${idx + 1} memo`}

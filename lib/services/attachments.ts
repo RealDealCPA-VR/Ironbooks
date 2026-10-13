@@ -8,11 +8,17 @@
  *
  * Conventions: every public function is scoped to ctx.companyId — callers can
  * never touch another company's attachments.
+ *
+ * Permissions (P1 controls): a document takes the permission area of the record it is filed to
+ * (RECORD_AREAS — employee and paycheck documents need Payroll, bills need Vendors, checks need
+ * Banking, ...). Listing, searching, downloading, filing, unfiling and deleting all check that
+ * area; unfiled documents (the Doc Center inbox) and free-form references use Lists. The API
+ * routes are open to any member and rely on these checks. Trusted contexts (no ctx.access) pass.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { and, desc, eq, ilike, isNull, or } from 'drizzle-orm';
+import { and, desc, eq, ilike, inArray, isNull, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { resolveDataDir } from '@/lib/db';
 import {
   attachments,
@@ -38,6 +44,8 @@ import {
 } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { assertWrite } from './rbac';
+import { requirePermission } from './access';
+import { can, type Action, type Area } from '@/lib/permissions/model';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -129,6 +137,80 @@ const FILING_TABLES = {
   form_template: formTemplates,
 } as const;
 
+/**
+ * Permission area of each filing record type. `null` = any member may VIEW (form-template logos
+ * print on every form); changing those documents needs Company & Preferences.
+ */
+const RECORD_AREAS: Record<keyof typeof FILING_TABLES, Area | null> = {
+  invoice: 'customers',
+  bill: 'vendors',
+  expense: 'banking',
+  journal_entry: 'accounting',
+  customer: 'customers',
+  vendor: 'vendors',
+  employee: 'payroll',
+  paycheck: 'payroll',
+  estimate: 'customers',
+  sales_receipt: 'customers',
+  sales_order: 'customers',
+  purchase_order: 'vendors',
+  credit_memo: 'customers',
+  vendor_credit: 'vendors',
+  payment_received: 'customers',
+  bill_payment: 'vendors',
+  item: 'lists',
+  lead: 'customers',
+  form_template: null,
+};
+
+function isFilingType(t: string): t is keyof typeof FILING_TABLES {
+  return Object.prototype.hasOwnProperty.call(FILING_TABLES, t);
+}
+
+/** The area guarding a document filed to `entityType` (unfiled / free-form: Lists). */
+export function attachmentArea(entityType: string | null | undefined, action: Action): Area | null {
+  if (!entityType || !isFilingType(entityType)) return 'lists';
+  const area = RECORD_AREAS[entityType];
+  if (area === null) return action === 'view' ? null : 'company';
+  return area;
+}
+
+/** Throw FORBIDDEN unless the caller may `action` documents filed to `entityType`. */
+function requireDocAccess(ctx: ServiceContext, entityType: string | null | undefined, action: Action): void {
+  const area = attachmentArea(entityType, action);
+  if (area) requirePermission(ctx, area, action);
+}
+
+/**
+ * A document the caller may not view is reported as not found (download / file / delete by id),
+ * so payroll documents don't show up for someone without Payroll access.
+ */
+function assertCanSee(ctx: ServiceContext, entityType: string | null): void {
+  const area = attachmentArea(entityType, 'view');
+  if (area && ctx.access && !can(ctx.access, area, 'view')) throw notFound('Attachment');
+}
+
+/**
+ * SQL condition limiting a document query to what the caller may view (null = everything).
+ * Unfiled and free-form documents need Lists; filed ones the area of their record type.
+ */
+function viewableCondition(ctx: ServiceContext): SQL | null {
+  if (!ctx.access) return null;
+  const filing = Object.keys(FILING_TABLES) as Array<keyof typeof FILING_TABLES>;
+  const allowed = filing.filter((t) => {
+    const area = RECORD_AREAS[t];
+    return area === null || can(ctx.access, area, 'view');
+  });
+  const parts: SQL[] = [];
+  if (allowed.length) parts.push(inArray(attachments.entityType, allowed));
+  if (can(ctx.access, 'lists', 'view')) {
+    parts.push(isNull(attachments.entityType));
+    parts.push(notInArray(attachments.entityType, filing));
+  }
+  if (!parts.length) return sql`false`;
+  return or(...parts) ?? null;
+}
+
 /** A filed link must point at a known record type and a real record of this company. */
 async function assertFilingTarget(ctx: ServiceContext, entityType: string, entityId: string): Promise<void> {
   const table = (FILING_TABLES as Record<string, (typeof FILING_TABLES)[keyof typeof FILING_TABLES]>)[entityType];
@@ -159,6 +241,8 @@ export async function saveAttachment(
 
   if (!filename) throw validation('filename is required');
   if (!base64) throw validation('base64 content is required');
+  // Adding a document to a record changes that record: needs modify in its area (Lists for the inbox).
+  requireDocAccess(ctx, entityType, entityType ? 'modify' : 'create');
 
   // Never trust a client-supplied id: a document uploaded straight to a known record type must point
   // at a real record of this company, checked before anything is written (no orphaned files).
@@ -231,6 +315,7 @@ export async function listAttachments(
   ctx: ServiceContext,
   params: ListAttachmentsParams,
 ): Promise<AttachmentRow[]> {
+  requireDocAccess(ctx, params.entityType, 'view');
   const rows = await ctx.db
     .select()
     .from(attachments)
@@ -250,6 +335,7 @@ export async function listAttachments(
 
 /** Unfiled documents (Doc Center inbox), newest first. */
 export async function listUnfiledAttachments(ctx: ServiceContext): Promise<AttachmentRow[]> {
+  requireDocAccess(ctx, null, 'view');
   const rows = await ctx.db
     .select()
     .from(attachments)
@@ -265,17 +351,15 @@ export async function searchAttachments(
 ): Promise<AttachmentRow[]> {
   const q = opts.q?.trim();
   const pattern = q ? `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
+  // Only documents filed to records the caller may view (payroll documents need Payroll, ...).
+  const visible = viewableCondition(ctx);
+  const conds: SQL[] = [eq(attachments.companyId, ctx.companyId)];
+  if (pattern) conds.push(or(ilike(attachments.filename, pattern), ilike(attachments.description, pattern))!);
+  if (visible) conds.push(visible);
   const rows = await ctx.db
     .select()
     .from(attachments)
-    .where(
-      pattern
-        ? and(
-            eq(attachments.companyId, ctx.companyId),
-            or(ilike(attachments.filename, pattern), ilike(attachments.description, pattern)),
-          )
-        : eq(attachments.companyId, ctx.companyId),
-    )
+    .where(and(...conds))
     .orderBy(desc(attachments.createdAt))
     .limit(Math.min(Math.max(opts.limit ?? 200, 1), 1000));
   return rows as AttachmentRow[];
@@ -299,15 +383,22 @@ export async function updateAttachment(
     .from(attachments)
     .where(and(eq(attachments.id, id), eq(attachments.companyId, ctx.companyId)));
   if (!row) throw notFound('Attachment');
+  assertCanSee(ctx, row.entityType);
   assertWrite(ctx); // view-only members cannot re-file or re-describe (checked before any change)
   const patch: Partial<typeof attachments.$inferInsert> = {};
   if (params.entityType !== undefined || params.entityId !== undefined) {
     const link = normalizeLink(params.entityType, params.entityId);
+    // Moving it off its record (or unfiling it) changes that record; filing it changes the target.
+    requireDocAccess(ctx, row.entityType, row.entityType ? 'modify' : 'create');
+    requireDocAccess(ctx, link.entityType, link.entityType ? 'modify' : 'create');
     if (link.entityType && link.entityId) await assertFilingTarget(ctx, link.entityType, link.entityId);
     patch.entityType = link.entityType;
     patch.entityId = link.entityId;
   }
-  if (params.description !== undefined) patch.description = params.description?.trim() || null;
+  if (params.description !== undefined) {
+    requireDocAccess(ctx, row.entityType, row.entityType ? 'modify' : 'create');
+    patch.description = params.description?.trim() || null;
+  }
   if (Object.keys(patch).length === 0) return row as AttachmentRow;
   const [updated] = await ctx.db
     .update(attachments)
@@ -348,6 +439,7 @@ export async function getAttachmentFile(
     .where(and(eq(attachments.id, id), eq(attachments.companyId, ctx.companyId)));
 
   if (!row) throw notFound('Attachment');
+  assertCanSee(ctx, row.entityType);
 
   const dataDir = resolveDataDir();
   const absolutePath = path.join(dataDir, row.storagePath);
@@ -375,6 +467,8 @@ export async function deleteAttachment(ctx: ServiceContext, id: string): Promise
     .where(and(eq(attachments.id, id), eq(attachments.companyId, ctx.companyId)));
 
   if (!row) throw notFound('Attachment');
+  assertCanSee(ctx, row.entityType);
+  requireDocAccess(ctx, row.entityType, row.entityType ? 'modify' : 'delete');
   assertWrite(ctx); // view-only members cannot delete documents
 
   // Remove DB row first; if the file delete fails we still keep the DB clean.

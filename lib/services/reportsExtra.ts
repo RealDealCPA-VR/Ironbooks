@@ -6,11 +6,13 @@
 import { and, asc, eq, gt, gte, inArray, isNotNull, lte, ne, sql } from 'drizzle-orm';
 import {
   accounts,
+  auditLogs,
   bouncedChecks,
   billLines,
   billPaymentApplications,
   billPayments,
   bills,
+  creditApplications,
   creditMemos,
   customers,
   deposits,
@@ -21,6 +23,7 @@ import {
   invoices,
   items,
   journalEntries,
+  paymentChecks,
   journalEntryLines,
   paymentApplications,
   paymentsReceived,
@@ -39,6 +42,7 @@ import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
 import { vendorCreditHomeByBill } from './vendorCreditsFx';
 import { foreignInvoiceHomeOpen } from './fxSubledger';
+import { getHomeCurrencyCode } from './currencies';
 
 /**
  * Credit-memo refunds dated AFTER the cutoff, per memo id. creditMemos.unapplied is today's
@@ -68,9 +72,53 @@ async function creditMemoRefundsAfter(ctx: ServiceContext, cutoff: Date): Promis
   return out;
 }
 
-/** A credit memo's open credit as of the cutoff: today's unapplied plus refunds after it. */
-function memoCreditAsOf(m: { id: string; unapplied: string }, laterRefunds: Map<string, string>) {
-  return Money.of(m.unapplied).plus(Money.of(laterRefunds.get(m.id) ?? '0'));
+type Dec = ReturnType<typeof Money.zero>;
+const addTo = (m: Map<string, Dec>, k: string, v: Dec) => m.set(k, (m.get(k) ?? Money.zero()).plus(v));
+
+/**
+ * Credit-memo applications to invoices that take effect AFTER the cutoff, per invoice and per
+ * memo. invoices.amountPaid and creditMemos.unapplied carry every application undated (today's
+ * figures); on the cutoff date a later application had not yet reduced the invoice or consumed the
+ * memo, so as-of aging adds it back to both. An application is effective on its own date, never
+ * before the memo or the invoice (QB ages each invoice at its open balance on the report date).
+ */
+async function creditMemoApplicationsAfter(
+  ctx: ServiceContext,
+  cutoff: Date,
+): Promise<{ byInvoice: Map<string, Dec>; byMemo: Map<string, Dec> }> {
+  const rows = await ctx.db
+    .select({ invoiceId: creditApplications.invoiceId, memoId: creditApplications.creditMemoId, amount: creditApplications.amount })
+    .from(creditApplications)
+    .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
+    .innerJoin(invoices, eq(invoices.id, creditApplications.invoiceId))
+    .where(
+      and(
+        eq(creditApplications.companyId, ctx.companyId),
+        sql`GREATEST(${creditApplications.date}, ${creditMemos.date}, ${invoices.date}) > ${cutoff}`,
+      ),
+    );
+  const byInvoice = new Map<string, Dec>();
+  const byMemo = new Map<string, Dec>();
+  for (const r of rows) {
+    const a = Money.of(r.amount);
+    addTo(byInvoice, r.invoiceId, a);
+    addTo(byMemo, r.memoId, a);
+  }
+  return { byInvoice, byMemo };
+}
+
+/**
+ * A credit memo's open credit as of the cutoff: today's unapplied plus refunds and invoice
+ * applications that happened after it.
+ */
+function memoCreditAsOf(
+  m: { id: string; unapplied: string },
+  laterRefunds: Map<string, string>,
+  laterApplications?: Map<string, Dec>,
+) {
+  return Money.of(m.unapplied)
+    .plus(Money.of(laterRefunds.get(m.id) ?? '0'))
+    .plus(laterApplications?.get(m.id) ?? Money.zero());
 }
 
 /** Detail-report variant of addJournalItemsToAging: one 'General Journal' row per line. */
@@ -293,9 +341,9 @@ async function addBouncedApplicationsAsOf(ctx: ServiceContext, upTo: Date, map: 
  * memos dated on/before the cutoff are included as negative 'current' amounts so
  * the report nets to true receivables (QB parity).
  *
- * Note: credit-memo applications have no dated application record, so the credited
- * portion of amountPaid (anything beyond dated cash applications) is treated as
- * always applied — a best-effort approximation for backdated runs.
+ * The credited portion of amountPaid (anything beyond dated cash applications) counts
+ * as applied on its own date: credit-memo applications effective after the cutoff (see
+ * creditMemoApplicationsAfter) and General Journal credits applied after it are added back.
  */
 export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
   const cutoff = asOf ?? new Date();
@@ -353,6 +401,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
   // p1 fx: foreign invoices are aged at the HOME amount A/R still carries (ties to the account).
   const foreignOpen = await foreignInvoiceHomeOpen(ctx, cutoff);
+  const memoAppsLater = await creditMemoApplicationsAfter(ctx, cutoff);
 
   // Accumulate per customer.
   const byCustomer = new Map<string, { name: string; buckets: BucketAccum }>();
@@ -368,7 +417,9 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     // General Journal credits applied after the cutoff had not reduced the invoice yet.
     let creditResidual = Money.of(row.amountPaid)
       .minus(cashAllTime)
-      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
+      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero())
+      // Credit memos applied after the cutoff had not reduced the invoice yet either.
+      .minus(memoAppsLater.byInvoice.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     // p1 fx: a foreign invoice's payments count on the date they were APPLIED (an apply made
@@ -410,7 +461,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     );
 
   for (const memo of memoRows) {
-    const credit = memoCreditAsOf(memo, memoLaterRefunds);
+    const credit = memoCreditAsOf(memo, memoLaterRefunds, memoAppsLater.byMemo);
     if (!credit.greaterThan(0)) continue;
     if (!byCustomer.has(memo.customerId)) {
       byCustomer.set(memo.customerId, { name: memo.customerName, buckets: blankBuckets() });
@@ -466,12 +517,45 @@ function billHomeOpen(row: { total: string; exchangeRate: string | null }, homeA
 }
 
 /**
- * p1 fx: foreign vendor-credit applications (and unapplies, negative) dated AFTER the cutoff. On
- * the cutoff date they had not reduced the bill yet, and the credit still held them: per bill the
- * foreign amount, per credit the foreign amount and the home part of the credit they took.
+ * Vendor-credit activity dated AFTER the cutoff — one engine for home and foreign credits. On the
+ * cutoff date none of it had happened yet: the bill still owed what a later application took off
+ * it, and the credit still held what a later application or refund used up. Per bill: the
+ * transaction-currency amount applied later (unapplies negative). Per credit: the later
+ * applications plus refunds, in the credit's currency (`foreign`) and as the home A/P they took
+ * from the credit (`home`; equal to `foreign` for a home credit).
+ *
+ * - Foreign credits: every application / unapply is a dated vendor_credit_applications row (its
+ *   date is never before the credit or the bill — vendorCreditApplicationDate).
+ * - Home credits: applyToBill / unapplyFromBill write no GL and no link row; the audit trail holds
+ *   each (credit, bill, amount). Such an application is effective from the later of the credit's
+ *   and the bill's own dates: before the credit existed it cannot have reduced the bill, and from
+ *   then on bill and credit move together, so the aging always ties to the A/P account.
+ *   (Known difference: the cash-basis engine dates it by the day it was entered.)
+ * - Refunds (home and foreign): the refund entry (sourceRef refund:<creditId>, dated) credits A/P
+ *   with the home value it took from the credit; a foreign refund's credit-currency amount is on
+ *   its audit row (postedEntryId).
  */
-async function vendorCreditAppsAfter(ctx: ServiceContext, cutoff: Date) {
-  const rows = await ctx.db
+async function vendorCreditActivityAfter(ctx: ServiceContext, cutoff: Date) {
+  const byBill = new Map<string, Dec>();
+  const byCredit = new Map<string, { foreign: Dec; home: Dec }>();
+  const addCredit = (id: string, foreign: Dec, home: Dec) => {
+    const c = byCredit.get(id) ?? { foreign: Money.zero(), home: Money.zero() };
+    byCredit.set(id, { foreign: c.foreign.plus(foreign), home: c.home.plus(home) });
+  };
+
+  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const credits = await ctx.db
+    .select({ id: vendorCredits.id, date: vendorCredits.date, currency: vendorCredits.currency })
+    .from(vendorCredits)
+    .where(eq(vendorCredits.companyId, ctx.companyId));
+  const creditById = new Map(credits.map((c) => [c.id, c] as const));
+  const isForeign = (id: string) => {
+    const cur = (creditById.get(id)?.currency ?? '').trim().toUpperCase();
+    return cur !== '' && cur !== home;
+  };
+
+  // 1) Foreign credits: dated application rows.
+  const appRows = await ctx.db
     .select({
       billId: vendorCreditApplications.billId,
       creditId: vendorCreditApplications.vendorCreditId,
@@ -480,28 +564,105 @@ async function vendorCreditAppsAfter(ctx: ServiceContext, cutoff: Date) {
     })
     .from(vendorCreditApplications)
     .where(and(eq(vendorCreditApplications.companyId, ctx.companyId), gt(vendorCreditApplications.date, cutoff)));
-  const byBill = new Map<string, ReturnType<typeof Money.zero>>();
-  const byCredit = new Map<string, { foreign: ReturnType<typeof Money.zero>; home: ReturnType<typeof Money.zero> }>();
-  for (const r of rows) {
-    byBill.set(r.billId, (byBill.get(r.billId) ?? Money.zero()).plus(Money.of(r.amount)));
-    const c = byCredit.get(r.creditId) ?? { foreign: Money.zero(), home: Money.zero() };
-    byCredit.set(r.creditId, { foreign: c.foreign.plus(Money.of(r.amount)), home: c.home.plus(Money.of(r.homeCredit)) });
+  for (const r of appRows) {
+    addTo(byBill, r.billId, Money.of(r.amount));
+    addCredit(r.creditId, Money.of(r.amount), Money.of(r.homeCredit));
   }
+
+  // 2) Home credits: audited applications, effective from max(credit date, bill date).
+  const auditRows = await ctx.db
+    .select({ creditId: auditLogs.entityId, newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'vendor_credit'),
+        sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
+      ),
+    );
+  if (auditRows.length) {
+    const billDate = new Map(
+      (await ctx.db.select({ id: bills.id, date: bills.date }).from(bills).where(eq(bills.companyId, ctx.companyId))).map(
+        (b) => [b.id, b.date] as const,
+      ),
+    );
+    for (const r of auditRows) {
+      const nv = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
+      if (!nv.billId || !r.creditId || isForeign(r.creditId)) continue;
+      const cd = creditById.get(r.creditId)?.date;
+      const bd = billDate.get(nv.billId);
+      if (!cd || !bd) continue;
+      const eff = cd > bd ? cd : bd;
+      if (!(eff > cutoff)) continue;
+      const a = Money.of(nv.amount ?? '0');
+      const signed = nv.action === 'applied_to_bill' ? a : a.negated();
+      addTo(byBill, nv.billId, signed);
+      addCredit(r.creditId, signed, signed);
+    }
+  }
+
+  // 3) Refunds dated after the cutoff: the home A/P each refund entry took from its credit.
+  const refundRows = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      sourceRef: journalEntries.sourceRef,
+      apHome: sql<string>`COALESCE(SUM(CAST(${journalEntryLines.credit} AS NUMERIC)), 0) - COALESCE(SUM(CAST(${journalEntryLines.debit} AS NUMERIC)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        sql`${journalEntries.sourceRef} LIKE 'refund:%'`,
+        eq(accounts.subtype, 'accounts_payable'),
+        gt(journalEntries.date, cutoff),
+      ),
+    )
+    .groupBy(journalEntries.id, journalEntries.sourceRef);
+  const refunds = refundRows
+    .map((r) => ({ ...r, creditId: (r.sourceRef ?? '').slice('refund:'.length) }))
+    .filter((r) => creditById.has(r.creditId));
+  const foreignRefundIds = refunds.filter((r) => isForeign(r.creditId)).map((r) => r.entryId);
+  const foreignByEntry = new Map<string, Dec>();
+  if (foreignRefundIds.length) {
+    const rows = await ctx.db
+      .select({ newValues: auditLogs.newValues })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, ctx.companyId),
+          eq(auditLogs.entityType, 'vendor_credit'),
+          sql`${auditLogs.newValues}->>'action' = 'refund'`,
+          inArray(sql`${auditLogs.newValues}->>'postedEntryId'`, foreignRefundIds),
+        ),
+      );
+    for (const r of rows) {
+      const nv = (r.newValues ?? {}) as { amount?: string; postedEntryId?: string };
+      if (nv.postedEntryId) foreignByEntry.set(nv.postedEntryId, Money.of(nv.amount ?? '0'));
+    }
+  }
+  for (const r of refunds) {
+    const homeAmt = Money.of(r.apHome);
+    const foreignAmt = isForeign(r.creditId) ? (foreignByEntry.get(r.entryId) ?? Money.zero()) : homeAmt;
+    addCredit(r.creditId, foreignAmt, homeAmt);
+  }
+
   return { byBill, byCredit };
 }
 
 /**
- * Vendor credits open as of the cutoff (dated on/before it), each at the home A/P it carried then:
- * today's unapplied plus foreign applications made after the cutoff (a foreign credit counts at its
- * home part, homeUnapplied). Home-currency credit applications are undated and count as applied.
+ * Vendor credits open as of the cutoff (dated on/before it), each with what it still held then in
+ * its own currency (`foreignOpen`) and the home A/P that carried (`homeOpen`): today's unapplied
+ * plus the applications and refunds made after the cutoff (vendorCreditActivityAfter). A foreign
+ * credit's home part is homeUnapplied; a home credit's is its unapplied amount.
  */
 async function vendorCreditsOpenAsOf(
   ctx: ServiceContext,
   cutoff: Date,
-  later: Awaited<ReturnType<typeof vendorCreditAppsAfter>>['byCredit'],
+  later: Awaited<ReturnType<typeof vendorCreditActivityAfter>>['byCredit'],
 ) {
-  const laterIds = [...later.keys()];
-  const open = sql`CAST(${vendorCredits.unapplied} AS NUMERIC) > 0`;
   const rows = await ctx.db
     .select({
       id: vendorCredits.id,
@@ -509,6 +670,7 @@ async function vendorCreditsOpenAsOf(
       vendorName: vendors.displayName,
       date: vendorCredits.date,
       currency: vendorCredits.currency,
+      exchangeRate: vendorCredits.exchangeRate,
       unapplied: vendorCredits.unapplied,
       homeUnapplied: vendorCredits.homeUnapplied,
     })
@@ -519,17 +681,23 @@ async function vendorCreditsOpenAsOf(
         eq(vendorCredits.companyId, ctx.companyId),
         ne(vendorCredits.status, 'void'),
         lte(vendorCredits.date, cutoff),
-        laterIds.length ? sql`(${open} OR ${inArray(vendorCredits.id, laterIds)})` : open,
       ),
     );
-  const out: Array<(typeof rows)[number] & { homeOpen: ReturnType<typeof Money.zero> }> = [];
+  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const out: Array<(typeof rows)[number] & { foreignOpen: Dec; homeOpen: Dec }> = [];
   for (const r of rows) {
+    const cur = (r.currency ?? '').trim().toUpperCase();
+    const foreign = cur !== '' && cur !== home;
     const l = later.get(r.id);
-    const foreign = Money.of(r.unapplied).plus(l?.foreign ?? Money.zero());
-    if (!foreign.greaterThan(0)) continue;
-    const homeNow = r.currency ? Money.of(r.homeUnapplied ?? r.unapplied) : Money.of(r.unapplied);
-    const homeOpen = Money.round2(homeNow.plus(r.currency ? (l?.home ?? Money.zero()) : (l?.foreign ?? Money.zero())));
-    out.push({ ...r, homeOpen });
+    const foreignOpen = Money.round2(Money.of(r.unapplied).plus(l?.foreign ?? Money.zero()));
+    if (!foreignOpen.greaterThan(0)) continue;
+    const homeNow = foreign
+      ? r.homeUnapplied != null
+        ? Money.of(r.homeUnapplied)
+        : Money.round2(Money.of(r.unapplied).times(Money.of(r.exchangeRate ?? 1)))
+      : Money.of(r.unapplied);
+    const homeOpen = Money.round2(homeNow.plus(l?.home ?? Money.zero()));
+    out.push({ ...r, currency: foreign ? cur : null, foreignOpen, homeOpen });
   }
   return out;
 }
@@ -583,7 +751,8 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
-  const vcLater = await vendorCreditAppsAfter(ctx, cutoff);
+  // Vendor-credit applications, unapplies and refunds dated after the cutoff (home and foreign).
+  const vcLater = await vendorCreditActivityAfter(ctx, cutoff);
 
   const byVendor = new Map<string, { name: string; buckets: BucketAccum }>();
 
@@ -597,7 +766,7 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .minus(cashAllTime)
       // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
       .minus(journalCreditsLater.get(row.billId) ?? Money.zero())
-      // p1 fx: nor had foreign vendor credits applied after it (their applications are dated).
+      // Vendor credits (home and foreign) applied after the cutoff had not reduced the bill yet either.
       .minus(vcLater.byBill.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
@@ -617,7 +786,8 @@ export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     byVendor.get(row.vendorId)!.buckets[key] = byVendor.get(row.vendorId)!.buckets[key].plus(amount);
   }
 
-  // Unapplied vendor credits reduce net payables — negative 'current' rows (as of the cutoff).
+  // Unapplied vendor credits reduce net payables — negative 'current' rows, each at the home A/P
+  // it carried on the cutoff date (applications and refunds made after it are added back).
   for (const credit of await vendorCreditsOpenAsOf(ctx, cutoff, vcLater.byCredit)) {
     if (!byVendor.has(credit.vendorId)) {
       byVendor.set(credit.vendorId, { name: credit.vendorName, buckets: blankBuckets() });
@@ -1119,6 +1289,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
   const foreignOpen = await foreignInvoiceHomeOpen(ctx, cutoff);
+  const memoAppsLater = await creditMemoApplicationsAfter(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
@@ -1128,7 +1299,9 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     // General Journal credits applied after the cutoff had not reduced the invoice yet.
     let creditResidual = Money.of(row.amountPaid)
       .minus(cashAllTime)
-      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero());
+      .minus(journalCreditsLater.get(row.invoiceId) ?? Money.zero())
+      // Credit memos applied after the cutoff had not reduced the invoice yet either.
+      .minus(memoAppsLater.byInvoice.get(row.invoiceId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
     // p1 fx: home amount A/R carries, with the foreign open amount alongside. Whether a foreign
@@ -1178,7 +1351,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       ),
     );
   for (const m of memoRows) {
-    const credit = memoCreditAsOf(m, memoLaterRefunds);
+    const credit = memoCreditAsOf(m, memoLaterRefunds, memoAppsLater.byMemo);
     if (!credit.greaterThan(0)) continue;
     detail.push({
       docId: m.id,
@@ -1247,7 +1420,8 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ap', cutoff);
   const homeAppliedAsOf = await billPaymentHomeAppliedByBill(ctx, cutoff);
-  const vcLater = await vendorCreditAppsAfter(ctx, cutoff);
+  // Vendor-credit applications, unapplies and refunds dated after the cutoff (home and foreign).
+  const vcLater = await vendorCreditActivityAfter(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
   for (const row of rows) {
@@ -1258,7 +1432,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .minus(cashAllTime)
       // General Journal vendor credits applied after the cutoff had not reduced the bill yet.
       .minus(journalCreditsLater.get(row.billId) ?? Money.zero())
-      // p1 fx: nor had foreign vendor credits applied after it (their applications are dated).
+      // Vendor credits (home and foreign) applied after the cutoff had not reduced the bill yet either.
       .minus(vcLater.byBill.get(row.billId) ?? Money.zero());
     if (creditResidual.lessThan(0)) creditResidual = Money.zero();
 
@@ -1297,6 +1471,7 @@ export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       dueDate: null,
       daysPastDue: 0,
       bucket: 'current',
+      ...(c.currency ? { currency: c.currency, foreignOpenBalance: toAmountString(c.foreignOpen.negated()) } : {}),
       openBalance: toAmountString(c.homeOpen.negated()),
     });
   }
@@ -1551,9 +1726,22 @@ export async function missingChecks(ctx: ServiceContext, accountId?: string): Pr
     .innerJoin(accounts, eq(billPayments.paymentAccountId, accounts.id))
     .where(and(...bpConds));
 
+  // p1 purchases: Sales Tax Payment / Liability / refund checks.
+  const pcRows = await ctx.db
+    .select({ accountId: paymentChecks.paymentAccountId, accountName: accounts.name, reference: paymentChecks.reference })
+    .from(paymentChecks)
+    .innerJoin(accounts, eq(paymentChecks.paymentAccountId, accounts.id))
+    .where(
+      and(
+        eq(paymentChecks.companyId, ctx.companyId),
+        isNotNull(paymentChecks.reference),
+        ...(accountId ? [eq(paymentChecks.paymentAccountId, accountId)] : []),
+      ),
+    );
+
   // Collect distinct numeric check numbers per account.
   const byAccount = new Map<string, { name: string; numbers: Set<number> }>();
-  for (const r of [...expRows, ...bpRows]) {
+  for (const r of [...expRows, ...bpRows, ...pcRows]) {
     if (!r.accountId || !r.reference) continue;
     const trimmed = r.reference.trim();
     if (!/^\d+$/.test(trimmed)) continue;
@@ -1603,7 +1791,7 @@ export interface CheckDetailLine {
 }
 
 export interface CheckDetailRow {
-  source: 'expense' | 'bill_payment';
+  source: 'expense' | 'bill_payment' | 'payment_check';
   id: string;
   date: string;
   checkNumber: string | null;
@@ -1748,6 +1936,7 @@ export async function checkDetail(
       voided: r.voidedAt !== null,
       lines: bpLinesById.get(r.id) ?? [],
     })),
+    ...(await paymentCheckDetailRows(ctx, range)),
   ];
   rows.sort(
     (a, b) => a.date.localeCompare(b.date) || (a.checkNumber ?? '').localeCompare(b.checkNumber ?? ''),
@@ -1762,6 +1951,39 @@ export async function checkDetail(
     rows,
     total: toAmountString(total),
   };
+}
+
+/** p1 purchases: Sales Tax Payment, Liability and customer refund checks for Check Detail. */
+async function paymentCheckDetailRows(
+  ctx: ServiceContext,
+  range?: { from?: Date; to?: Date },
+): Promise<CheckDetailRow[]> {
+  const conds = [eq(paymentChecks.companyId, ctx.companyId)];
+  if (range?.from) conds.push(gte(paymentChecks.date, range.from));
+  if (range?.to) conds.push(lte(paymentChecks.date, range.to));
+  const rows = await ctx.db
+    .select({ c: paymentChecks, accountName: accounts.name, entryStatus: journalEntries.status })
+    .from(paymentChecks)
+    .innerJoin(accounts, eq(paymentChecks.paymentAccountId, accounts.id))
+    .leftJoin(journalEntries, eq(paymentChecks.postedEntryId, journalEntries.id))
+    .where(and(...conds));
+  const label: Record<string, string> = {
+    sales_tax: 'Sales Tax Payment',
+    payroll_liability: 'Liability Check',
+    customer_refund: 'Refund',
+  };
+  return rows.map((r) => ({
+    source: 'payment_check' as const,
+    id: r.c.id,
+    date: r.c.date.toISOString(),
+    checkNumber: r.c.reference,
+    payee: r.c.payeeName,
+    bankAccountId: r.c.paymentAccountId,
+    bankAccountName: r.accountName,
+    amount: toAmountString(r.c.amount),
+    voided: r.c.voidedAt !== null || r.entryStatus === 'void',
+    lines: [{ description: r.c.memo, detail: label[r.c.kind] ?? 'Check', amount: toAmountString(r.c.amount) }],
+  }));
 }
 
 // ---------------------------------------------------------------------------

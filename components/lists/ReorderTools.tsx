@@ -17,7 +17,7 @@ interface PlannedPo {
   vendorName: string;
   total: string;
   lines: Array<{ itemId: string; name: string; quantity: string; rate: string }>;
-  poNumber?: number | null;
+  poNumber?: number | string | null;
 }
 interface PlanResult {
   dryRun: boolean;

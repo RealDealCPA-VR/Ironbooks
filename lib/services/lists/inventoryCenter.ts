@@ -134,7 +134,7 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
   const pos = (q: string | number) => new Decimal(q).toFixed(4);
 
   for (const r of await ctx.db
-    .select({ id: invoices.id, number: invoices.invoiceNumber, date: invoices.date, name: customers.displayName, qty: invoiceLines.quantity, amount: invoiceLines.amount, status: invoices.status })
+    .select({ id: invoices.id, number: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`, date: invoices.date, name: customers.displayName, qty: invoiceLines.quantity, amount: invoiceLines.amount, status: invoices.status })
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoices.id, invoiceLines.invoiceId))
     .leftJoin(customers, eq(customers.id, invoices.customerId))
@@ -142,7 +142,7 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
     tx.push({ type: 'Invoice', path: 'invoices', id: r.id, number: String(r.number), date: r.date, name: r.name, quantity: r.status === 'void' || r.status === 'draft' ? '0.0000' : neg(r.qty), amount: r.amount, status: r.status });
   }
   for (const r of await ctx.db
-    .select({ id: salesReceipts.id, number: salesReceipts.receiptNumber, date: salesReceipts.date, name: customers.displayName, qty: salesReceiptLines.quantity, amount: salesReceiptLines.amount, status: salesReceipts.status })
+    .select({ id: salesReceipts.id, number: sql<string>`COALESCE(NULLIF(${salesReceipts.refNumber}, ''), CAST(${salesReceipts.receiptNumber} AS TEXT))`, date: salesReceipts.date, name: customers.displayName, qty: salesReceiptLines.quantity, amount: salesReceiptLines.amount, status: salesReceipts.status })
     .from(salesReceiptLines)
     .innerJoin(salesReceipts, eq(salesReceipts.id, salesReceiptLines.salesReceiptId))
     .leftJoin(customers, eq(customers.id, salesReceipts.customerId))
@@ -150,7 +150,7 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
     tx.push({ type: 'Sales Receipt', path: 'sales-receipts', id: r.id, number: String(r.number), date: r.date, name: r.name, quantity: r.status === 'void' ? '0.0000' : neg(r.qty), amount: r.amount, status: r.status });
   }
   for (const r of await ctx.db
-    .select({ id: creditMemos.id, number: creditMemos.memoNumber, date: creditMemos.date, name: customers.displayName, qty: creditMemoLines.quantity, amount: creditMemoLines.amount, status: creditMemos.status })
+    .select({ id: creditMemos.id, number: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))`, date: creditMemos.date, name: customers.displayName, qty: creditMemoLines.quantity, amount: creditMemoLines.amount, status: creditMemos.status })
     .from(creditMemoLines)
     .innerJoin(creditMemos, eq(creditMemos.id, creditMemoLines.creditMemoId))
     .leftJoin(customers, eq(customers.id, creditMemos.customerId))
@@ -174,7 +174,7 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
     tx.push({ type: 'Item Receipt', path: 'item-receipts', id: r.id, number: r.number, date: r.date, name: r.name, quantity: r.status === 'void' ? '0.0000' : pos(r.qty), amount: r.amount, status: r.status });
   }
   for (const r of await ctx.db
-    .select({ id: purchaseOrders.id, number: purchaseOrders.poNumber, date: purchaseOrders.date, name: vendors.displayName, qty: purchaseOrderLines.quantity, amount: purchaseOrderLines.amount, status: purchaseOrders.status })
+    .select({ id: purchaseOrders.id, number: sql<string>`COALESCE(NULLIF(${purchaseOrders.refNumber}, ''), CAST(${purchaseOrders.poNumber} AS TEXT))`, date: purchaseOrders.date, name: vendors.displayName, qty: purchaseOrderLines.quantity, amount: purchaseOrderLines.amount, status: purchaseOrders.status })
     .from(purchaseOrderLines)
     .innerJoin(purchaseOrders, eq(purchaseOrders.id, purchaseOrderLines.purchaseOrderId))
     .leftJoin(vendors, eq(vendors.id, purchaseOrders.vendorId))
@@ -182,7 +182,7 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
     tx.push({ type: 'Purchase Order', path: 'purchase-orders', id: r.id, number: String(r.number), date: r.date, name: r.name, quantity: '0.0000', amount: r.amount, status: r.status });
   }
   for (const r of await ctx.db
-    .select({ id: salesOrders.id, number: salesOrders.orderNumber, date: salesOrders.date, name: customers.displayName, amount: salesOrderLines.amount, status: salesOrders.status })
+    .select({ id: salesOrders.id, number: sql<string>`COALESCE(NULLIF(${salesOrders.refNumber}, ''), CAST(${salesOrders.orderNumber} AS TEXT))`, date: salesOrders.date, name: customers.displayName, amount: salesOrderLines.amount, status: salesOrders.status })
     .from(salesOrderLines)
     .innerJoin(salesOrders, eq(salesOrders.id, salesOrderLines.salesOrderId))
     .leftJoin(customers, eq(customers.id, salesOrders.customerId))

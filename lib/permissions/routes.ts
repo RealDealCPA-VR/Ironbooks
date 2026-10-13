@@ -87,6 +87,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/companies/select': kind('self', 'POST'),
   '/api/company': { GET: 'member', ...r('company', 'PATCH') },
   '/api/company/closing-date': r('closing', 'GET PATCH'),
+  // P1 setup: EasyStep interview (apply answers / skip) for the active company.
+  '/api/company/setup-interview': { GET: 'member', ...r('company', 'POST:modify') },
   // wave2 foundation: document numbering (next number for forms; starting numbers).
   '/api/doc-numbers': { GET: 'member', ...r('company', 'PUT') },
   '/api/custom-fields': r('lists', 'GET PATCH'),
@@ -144,8 +146,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // the member can't view. To-dos are personal notes (no books data).
   '/api/reminders': kind('member', 'GET'),
   '/api/calendar': kind('member', 'GET'),
-  // Calendar / Lead Center to-dos (wave2 prefs). Served under /api/calendar/todos because
-  // /api/todos is the wave2 lists To Do list (Lists > To Do, gated by the lists area).
+  // THE To Do list (p1 ux): one store. Any member may keep to-dos; a to-do linked to a record
+  // follows that record's area (customers/leads, vendors, payroll, lists) in lib/services/todos.ts.
+  // /api/calendar/todos is a thin alias of /api/todos for older callers.
   '/api/calendar/todos': kind('member', 'GET POST'),
   '/api/calendar/todos/[id]': kind('member', 'PATCH DELETE'),
   // Letters & labels: the templates are a list; producing letters/labels/envelopes needs print
@@ -225,8 +228,11 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/sales-reps': r('lists', 'GET POST'),
   '/api/sales-reps/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/sales-reps/assign': r('customers', 'POST:modify'),
-  '/api/attachments': r('lists', 'GET POST'),
-  '/api/attachments/[id]': r('lists', 'GET PATCH DELETE'),
+  // Doc Center: a document takes the permission area of the record it is filed to (payroll
+  // documents need Payroll, bills need Vendors, the unfiled inbox needs Lists), checked per
+  // document in lib/services/attachments.ts, so the routes only require company membership.
+  '/api/attachments': kind('member', 'GET POST'),
+  '/api/attachments/[id]': kind('member', 'GET PATCH DELETE'),
   '/api/recurring': r('lists', 'GET POST'),
   '/api/recurring/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/recurring/run': r('accounting', 'POST'),
@@ -239,8 +245,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/lists/[list]': r('lists', 'GET POST'),
   '/api/lists/[list]/[id]': r('lists', 'PATCH DELETE'),
   '/api/terms/compute': r('lists', 'GET'),
-  '/api/todos': r('lists', 'GET POST'),
-  '/api/todos/[id]': r('lists', 'PATCH DELETE'),
+  '/api/todos': kind('member', 'GET POST'), // p1 ux: the one To Do list (see /api/calendar/todos)
+  '/api/todos/[id]': kind('member', 'GET PATCH DELETE'),
   '/api/notes': kind('member', 'GET POST'),
   '/api/notes/[id]': kind('member', 'PATCH DELETE'),
   '/api/billing-rate-levels': r('lists', 'GET POST'),
@@ -301,6 +307,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/invoices/batch': r('customers', 'POST'),
   '/api/invoices/statement-charges': r('customers', 'GET POST'),
   '/api/invoices/statement-charges/[id]': r('customers', 'PUT PATCH'),
+  '/api/invoices/retainage': r('customers', 'GET POST'), // p1/salesforms: retainage report + billing
   '/api/payments/credits': r('customers', 'GET'),
   '/api/payments/discounts': r('customers', 'GET'),
   '/api/payments/journal-items': r('customers', 'GET POST:modify'),
@@ -329,6 +336,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/bill-payments/journal-items': r('vendors', 'GET POST:modify'),
   '/api/vendor-credits': r('vendors', 'GET POST'),
   '/api/vendor-credits/[id]': r('vendors', 'GET POST:modify PATCH DELETE'),
+  '/api/vendor-credits/[id]/pdf': r('vendors', 'GET:print'), // p1 purchases
   '/api/purchase-orders': r('vendors', 'GET POST'),
   '/api/purchase-orders/[id]': r('vendors', 'GET POST:modify PATCH'),
   '/api/purchase-orders/[id]/pdf': r('vendors', 'GET:print'),
@@ -373,6 +381,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/check-numbers/duplicate': r('banking', 'GET'),
   '/api/print-queue': r('banking', 'GET POST:print'),
   '/api/print-queue/paychecks': r('payroll', 'GET POST:print'),
+  '/api/print-queue/refunds': r('banking', 'GET POST:print'),
   '/api/checks/settings': r('banking', 'GET PUT:modify'),
   '/api/loans': r('banking', 'GET POST'),
   '/api/loans/[id]': r('banking', 'GET PATCH DELETE'),
@@ -460,6 +469,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/tax-rates/[id]/components': r('sales_tax', 'GET PATCH'),
   '/api/tax-rates/[id]': r('sales_tax', 'PATCH'),
   '/api/pay-liabilities/sales-tax': r('sales_tax', 'GET'),
+  // p1 purchases: Pay Sales Tax is a sales_tax action (bookkeepers have it; payroll-only users don't).
+  '/api/sales-tax/pay': r('sales_tax', 'GET POST'),
+  '/api/sales-tax/payments': r('sales_tax', 'GET'),
+  '/api/sales-tax/payments/[id]': r('sales_tax', 'GET POST:delete'),
   // wave2 accountant: sales tax liability engine, adjustments, fix incorrectly recorded tax.
   '/api/accountant/sales-tax/liability': r('sales_tax', 'GET'),
   '/api/accountant/sales-tax/revenue-summary': r('sales_tax', 'GET'),
@@ -495,6 +508,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/payroll/unpaid-time': r('payroll', 'GET'),
   '/api/pay-liabilities': r('payroll', 'GET POST'),
   '/api/pay-liabilities/by-item': r('payroll', 'GET POST'),
+  '/api/pay-liabilities/checks': r('payroll', 'GET'),
+  '/api/pay-liabilities/checks/[id]': r('payroll', 'POST:delete'),
   '/api/payroll/940': r('reports_payroll', 'GET'),
   '/api/payroll/941': r('reports_payroll', 'GET'),
   '/api/payroll/reports': r('reports_payroll', 'GET'),
@@ -622,6 +637,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/employees/setup': 'payroll',
   '/payroll-tax': 'payroll',
   '/sales-tax-components': 'sales_tax',
+  '/sales-tax': 'sales_tax', // p1 purchases: Pay Sales Tax
   '/fiscal-periods': 'closing',
   '/year-end': 'closing',
   '/budgets': 'company',

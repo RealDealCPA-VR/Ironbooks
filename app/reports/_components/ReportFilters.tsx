@@ -231,6 +231,23 @@ export default function ReportFilters({
           </Select>
         </Field>
       )}
+      {has('aging') && (
+        <>
+          <Field id="rf-interval" label="Interval (days)">
+            <Input id="rf-interval" inputMode="numeric" placeholder="30" value={params.interval ?? ''} onChange={(e) => set('interval', e.target.value.replace(/[^0-9]/g, ''))} />
+          </Field>
+          <Field id="rf-through" label="Through (days past due)">
+            <Input id="rf-through" inputMode="numeric" placeholder="90" value={params.through ?? ''} onChange={(e) => set('through', e.target.value.replace(/[^0-9]/g, ''))} />
+          </Field>
+          <Field id="rf-agefrom" label="Age from">
+            <Select id="rf-agefrom" value={params.agingFrom ?? ''} onChange={(e) => set('agingFrom', e.target.value)}>
+              <option value="">Preference setting</option>
+              <option value="due_date">Due date</option>
+              <option value="transaction_date">Transaction date</option>
+            </Select>
+          </Field>
+        </>
+      )}
       {has('class') && pick('classId', 'Class', opts?.classes, <Help term="class" />)}
       {has('customer') && pick('customerId', 'Customer:Job', opts?.customers)}
       {has('vendor') && pick('vendorId', 'Vendor', opts?.vendors)}

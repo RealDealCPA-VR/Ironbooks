@@ -11,6 +11,7 @@ import * as React from 'react';
 import { Mail, Printer, Truck } from 'lucide-react';
 import { Button, ConfirmDialog, Input, Label, Modal, toast, toastError } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { shipToAddressFields, shipToSummary, type ShipToAddress } from '@/lib/shipTo';
 
 export type SalesFormKind = 'invoice' | 'estimate' | 'sales_receipt' | 'credit_memo' | 'sales_order';
 
@@ -70,12 +71,13 @@ export function shippingFromDoc(doc: DocShipping | null | undefined): ShippingSt
 }
 
 /** Request-body fields for a document (blank → null). */
-export function shippingPayload(s: ShippingState, opts?: { shipping?: boolean }) {
+export function shippingPayload(s: ShippingState, opts?: { shipping?: boolean; shipToOnly?: boolean }) {
   const flags = { toBePrinted: s.toBePrinted, toBeEmailed: s.toBeEmailed };
   if (opts?.shipping === false) return flags;
   const shipTo = Object.fromEntries(
     Object.entries(s.shipTo).filter(([, v]) => v.trim() !== '').map(([k, v]) => [k, v.trim()]),
   );
+  if (opts?.shipToOnly) return { ...flags, shipTo: Object.keys(shipTo).length ? shipTo : null };
   return {
     ...flags,
     shipDate: s.shipDate ? new Date(s.shipDate).toISOString() : null,
@@ -87,19 +89,107 @@ export function shippingPayload(s: ShippingState, opts?: { shipping?: boolean })
   };
 }
 
+/** The customer's sales defaults a form pre-fills (QB: tax item, tax code, ship-to). */
+export interface CustomerSalesDefaults {
+  taxRateId: string | null;
+  /** false = the customer's tax code is non-taxable. */
+  taxable: boolean;
+  shipTos: ShipToAddress[];
+}
+
+/**
+ * Load the selected customer's sales defaults (tax item, taxable tax code, named ship-to
+ * addresses). Returns null until loaded / when no customer is selected.
+ */
+export function useCustomerSalesDefaults(customerId: string | null | undefined): CustomerSalesDefaults | null {
+  const [state, setState] = React.useState<{ id: string; d: CustomerSalesDefaults } | null>(null);
+  React.useEffect(() => {
+    if (!customerId) return;
+    let cancelled = false;
+    api
+      .get<{
+        taxRateId?: string | null;
+        taxable?: boolean;
+        shipToAddresses?: ShipToAddress[] | null;
+        shippingAddress?: Record<string, string> | null;
+      }>(`/api/customers/${customerId}`)
+      .then((c) => {
+        if (cancelled) return;
+        const list =
+          c.shipToAddresses && c.shipToAddresses.length
+            ? c.shipToAddresses
+            : c.shippingAddress && Object.values(c.shippingAddress).some((v) => String(v ?? '').trim())
+              ? [{ name: 'Ship To 1', ...c.shippingAddress, isDefault: true }]
+              : [];
+        setState({ id: customerId, d: { taxRateId: c.taxRateId ?? null, taxable: c.taxable !== false, shipTos: list } });
+      })
+      .catch(() => {
+        if (!cancelled) setState({ id: customerId, d: { taxRateId: null, taxable: true, shipTos: [] } });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [customerId]);
+  return customerId && state?.id === customerId ? state.d : null;
+}
+
+/** Form ship-to state from a named address. */
+export function shipToFromAddress(a: ShipToAddress | null | undefined): ShippingState['shipTo'] {
+  const f = shipToAddressFields(a);
+  return { line1: f.line1 ?? '', line2: f.line2 ?? '', city: f.city ?? '', state: f.state ?? '', zip: f.zip ?? '' };
+}
+
+/** The customer's default ship-to (form state), or null when the customer has none. */
+export function defaultShipToState(d: CustomerSalesDefaults | null): ShippingState['shipTo'] | null {
+  if (!d || d.shipTos.length === 0) return null;
+  return shipToFromAddress(d.shipTos.find((a) => a.isDefault) ?? d.shipTos[0]);
+}
+
+const sameShipTo = (a: ShippingState['shipTo'], b: ShippingState['shipTo']) =>
+  (['line1', 'line2', 'city', 'state', 'zip'] as const).every((k) => (a[k] ?? '').trim() === (b[k] ?? '').trim());
+
+/** QB "Ship Via" list entries (Lists > Ship Via). Empty when the list can't be read. */
+function useShipViaList(enabled: boolean): string[] | null {
+  const [names, setNames] = React.useState<string[] | null>(null);
+  React.useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    api
+      .get<{ entries: Array<{ name: string }> }>('/api/lists/ship-via')
+      .then((r) => {
+        if (!cancelled) setNames((r.entries ?? []).map((e) => e.name).filter(Boolean));
+      })
+      .catch(() => {
+        if (!cancelled) setNames(null); // no access to the list: fall back to typing
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled]);
+  return names;
+}
+
 /** Collapsible "Shipping & delivery" fields + send-queue checkboxes. */
 export function ShippingSection({
   value,
   onChange,
   showShipping = true,
+  shipToOnly = false,
+  shipTos,
   idPrefix = 'ship',
 }: {
   value: ShippingState;
   onChange: (next: ShippingState) => void;
-  /** false = only the To be printed / To be emailed checkboxes (estimates, credit memos). */
+  /** false = only the To be printed / To be emailed checkboxes (credit memos). */
   showShipping?: boolean;
+  /** true = only the ship-to address (estimates). */
+  shipToOnly?: boolean;
+  /** The customer's named ship-to addresses (QB Enterprise) for the Ship To dropdown. */
+  shipTos?: ShipToAddress[] | null;
   idPrefix?: string;
 }) {
+  const shipViaNames = useShipViaList(showShipping && !shipToOnly);
+  const matchedShipTo = (shipTos ?? []).findIndex((a) => sameShipTo(shipToFromAddress(a), value.shipTo));
   const hasShipping =
     !!(value.shipDate || value.shipVia || value.fob || value.trackingNumber || value.poNumber) ||
     Object.values(value.shipTo).some((v) => v.trim());
@@ -136,39 +226,80 @@ export function ShippingSection({
             onClick={() => setOpen((o) => !o)}
             aria-expanded={open}
           >
-            <Truck className="h-4 w-4" /> {open ? 'Hide shipping details' : 'Add shipping details'}
+            <Truck className="h-4 w-4" /> {open ? 'Hide shipping details' : shipToOnly ? 'Add ship-to address' : 'Add shipping details'}
           </button>
         )}
       </div>
       {showShipping && open && (
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <div>
-            <Label htmlFor={`${idPrefix}-po`}>Customer P.O. number</Label>
-            <Input id={`${idPrefix}-po`} value={value.poNumber} onChange={(e) => set({ poNumber: e.target.value })} />
-          </div>
-          <div>
-            <Label htmlFor={`${idPrefix}-date`}>Ship date</Label>
-            <Input id={`${idPrefix}-date`} type="date" value={value.shipDate} onChange={(e) => set({ shipDate: e.target.value })} />
-          </div>
-          <div>
-            <Label htmlFor={`${idPrefix}-via`}>Ship via</Label>
-            <Input
-              id={`${idPrefix}-via`}
-              placeholder="UPS, FedEx, our truck…"
-              value={value.shipVia}
-              onChange={(e) => set({ shipVia: e.target.value })}
-            />
-          </div>
-          <div>
-            <Label htmlFor={`${idPrefix}-fob`}>F.O.B. (where ownership passes)</Label>
-            <Input id={`${idPrefix}-fob`} placeholder="e.g. Origin" value={value.fob} onChange={(e) => set({ fob: e.target.value })} />
-          </div>
-          <div className="sm:col-span-2">
-            <Label htmlFor={`${idPrefix}-trk`}>Tracking number</Label>
-            <Input id={`${idPrefix}-trk`} value={value.trackingNumber} onChange={(e) => set({ trackingNumber: e.target.value })} />
-          </div>
+          {!shipToOnly && (
+            <>
+              <div>
+                <Label htmlFor={`${idPrefix}-po`}>Customer P.O. number</Label>
+                <Input id={`${idPrefix}-po`} value={value.poNumber} onChange={(e) => set({ poNumber: e.target.value })} />
+              </div>
+              <div>
+                <Label htmlFor={`${idPrefix}-date`}>Ship date</Label>
+                <Input id={`${idPrefix}-date`} type="date" value={value.shipDate} onChange={(e) => set({ shipDate: e.target.value })} />
+              </div>
+              <div>
+                <Label htmlFor={`${idPrefix}-via`}>Ship via</Label>
+                {shipViaNames && shipViaNames.length > 0 ? (
+                  <select
+                    id={`${idPrefix}-via`}
+                    value={value.shipVia}
+                    onChange={(e) => set({ shipVia: e.target.value })}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30"
+                  >
+                    <option value="">—</option>
+                    {value.shipVia && !shipViaNames.includes(value.shipVia) && (
+                      <option value={value.shipVia}>{value.shipVia}</option>
+                    )}
+                    {shipViaNames.map((n) => (
+                      <option key={n} value={n}>{n}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <Input
+                    id={`${idPrefix}-via`}
+                    placeholder="UPS, FedEx, our truck…"
+                    value={value.shipVia}
+                    onChange={(e) => set({ shipVia: e.target.value })}
+                  />
+                )}
+              </div>
+              <div>
+                <Label htmlFor={`${idPrefix}-fob`}>F.O.B. (where ownership passes)</Label>
+                <Input id={`${idPrefix}-fob`} placeholder="e.g. Origin" value={value.fob} onChange={(e) => set({ fob: e.target.value })} />
+              </div>
+              <div className="sm:col-span-2">
+                <Label htmlFor={`${idPrefix}-trk`}>Tracking number</Label>
+                <Input id={`${idPrefix}-trk`} value={value.trackingNumber} onChange={(e) => set({ trackingNumber: e.target.value })} />
+              </div>
+            </>
+          )}
           <div className="sm:col-span-3">
-            <Label htmlFor={`${idPrefix}-l1`}>Ship to</Label>
+            <div className="flex flex-wrap items-end justify-between gap-2">
+              <Label htmlFor={`${idPrefix}-l1`}>Ship to</Label>
+              {shipTos && shipTos.length > 0 && (
+                <select
+                  aria-label="Ship to address"
+                  value={matchedShipTo >= 0 ? String(matchedShipTo) : ''}
+                  onChange={(e) => {
+                    const a = shipTos[Number(e.target.value)];
+                    if (a) setTo(shipToFromAddress(a));
+                  }}
+                  className="mb-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs text-navy outline-none focus:border-electric"
+                >
+                  <option value="">{matchedShipTo >= 0 ? '' : 'Other address'}</option>
+                  {shipTos.map((a, i) => (
+                    <option key={`${a.name}-${i}`} value={String(i)}>
+                      {shipToSummary(a)}{a.isDefault ? ' (default)' : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
             <div className="grid grid-cols-1 sm:grid-cols-6 gap-2">
               <Input id={`${idPrefix}-l1`} className="sm:col-span-3" placeholder="Street" value={value.shipTo.line1} onChange={(e) => setTo({ line1: e.target.value })} />
               <Input className="sm:col-span-3" placeholder="Suite / line 2" aria-label="Ship to line 2" value={value.shipTo.line2} onChange={(e) => setTo({ line2: e.target.value })} />

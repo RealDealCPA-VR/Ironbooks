@@ -196,10 +196,14 @@ describe('Billables service', () => {
     expect(invoice.total).toBe('768.00');
 
     const full = await getInvoice(ctx, invoice.id);
-    expect(full.lines).toHaveLength(4);
-    const billable = full.lines.find((l) => l.description?.includes('Lumber for deck'))!;
-    expect(billable.amount).toBe('220.00');
-    expect(billable.description).toContain('+10.00% markup');
+    // Each cost bills at cost plus its own markup line (QB: markup is credited to income,
+    // never netted against the expense): manual + 2 costs + 2 markups + time.
+    expect(full.lines).toHaveLength(6);
+    const billable = full.lines.find((l) => l.description?.startsWith('Billable cost: Lumber for deck'))!;
+    expect(billable.amount).toBe('200.00');
+    const markupLine = full.lines.find((l) => l.description?.startsWith('Markup on Lumber for deck'))!;
+    expect(markupLine.amount).toBe('20.00');
+    expect(markupLine.description).toContain('+10.00% markup');
     const time = full.lines.find((l) => l.description === 'On-site consulting')!;
     expect(Number(time.quantity)).toBe(3);
     expect(Number(time.rate)).toBe(120);

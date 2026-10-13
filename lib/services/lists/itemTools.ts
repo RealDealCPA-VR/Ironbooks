@@ -199,7 +199,7 @@ export async function createPurchaseOrdersFromReorder(ctx: ServiceContext, input
         memo: 'Created from the reorder list',
         lines: p.lines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate })),
       });
-      out.push({ ...p, purchaseOrderId: (po as { id: string }).id, poNumber: (po as { poNumber?: number }).poNumber ?? null });
+      out.push({ ...p, purchaseOrderId: (po as { id: string }).id, poNumber: (po as { refNumber?: string | null; poNumber?: number }).refNumber || (po as { poNumber?: number }).poNumber || null });
     }
     return out;
   });

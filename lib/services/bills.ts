@@ -32,6 +32,7 @@ import type Decimal from 'decimal.js';
 import { accounts, bills, billLines, inventoryLayers, items, loanPayments, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { discountFor, dueDateFromTerms } from './billTerms';
+import { getPreferences } from './company';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import {
@@ -122,6 +123,8 @@ export async function findDuplicateBillNumbers(
 
 async function assertBillNumberAvailable(ctx: ServiceContext, input: CreateBillInput, excludeId?: string) {
   if (!input.checkDuplicateNumber) return;
+  // Preferences > Bills: "Warn about duplicate bill numbers from same vendor" off accepts it silently.
+  if (!(await getPreferences(ctx)).warnDuplicateBillNumbers) return;
   const matches = await findDuplicateBillNumbers(ctx, {
     vendorId: input.vendorId,
     billNumber: input.billNumber,

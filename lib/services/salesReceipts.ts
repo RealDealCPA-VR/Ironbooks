@@ -24,6 +24,7 @@
  * with received payments until the bookkeeper makes a bank deposit.
  */
 import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
+import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -56,7 +57,8 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
-import { allocateDocNumber, docRef } from './docNumbers';
+import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
+import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import { shippingColumns } from './invoices';
 
 // ---------------------------------------------------------------------------
@@ -518,6 +520,9 @@ async function postSalesReceiptDocument(
 }
 
 export async function createSalesReceipt(ctx: ServiceContext, input: CreateSalesReceiptInput) {
+  await assertSalesTaxAllowed(ctx, input);
+  input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
+  input = await applyCustomerShipToDefault(ctx, input);
   const prep = await prepareSalesReceipt(ctx, input);
   const { method, depositAccountId, subtotal, taxAmount, total } = prep;
 
@@ -793,12 +798,18 @@ async function isDeposited(ctx: ServiceContext, receiptId: string): Promise<bool
  * locked (the deposit moved exactly that money); other details can still change.
  */
 export async function updateSalesReceipt(ctx: ServiceContext, id: string, input: CreateSalesReceiptInput) {
+  input = await applyCustomerTaxDefaults(ctx, input);
   const [existing] = await ctx.db
     .select()
     .from(salesReceipts)
     .where(and(eq(salesReceipts.companyId, ctx.companyId), eq(salesReceipts.id, id)));
   if (!existing) throw notFound('Sales receipt');
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided sales receipt.');
+  const keptTaxLines = await ctx.db
+    .select({ taxRateId: salesReceiptLines.taxRateId })
+    .from(salesReceiptLines)
+    .where(eq(salesReceiptLines.salesReceiptId, id));
+  await assertSalesTaxAllowed(ctx, input, [existing.taxRateId, ...keptTaxLines.map((l) => l.taxRateId)]);
 
   const prep = await prepareSalesReceipt(ctx, input);
 
@@ -825,6 +836,11 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
       .where(eq(salesReceiptLines.salesReceiptId, id))
       .orderBy(salesReceiptLines.lineOrder);
 
+    const renum = await renumberDoc(
+      tx, 'sales_receipt', id, { refNumber: receipt.refNumber, number: receipt.receiptNumber },
+      input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+    );
+
     // 1) Reverse the old version.
     await reverseSalesReceiptPostings(tx, receipt);
 
@@ -832,7 +848,11 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
     await tx.db.delete(salesReceiptLines).where(eq(salesReceiptLines.salesReceiptId, id));
     const { insertedLines, entry, cogsEntries } = await postSalesReceiptDocument(
       tx,
-      { id, receiptNumber: receipt.receiptNumber, refNumber: receipt.refNumber },
+      {
+        id,
+        receiptNumber: renum?.number ?? receipt.receiptNumber,
+        refNumber: renum?.refNumber ?? receipt.refNumber,
+      },
       input,
       prep,
     );
@@ -851,6 +871,7 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
         depositAccountId: prep.depositAccountId,
         memo: input.memo ?? null,
         taxRateId: input.taxRateId ?? null,
+        ...(renum ? { refNumber: renum.refNumber, receiptNumber: renum.number } : {}),
         ...shippingColumns(input, receipt),
         postedEntryId: entry.id,
       })
@@ -864,6 +885,7 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
       oldValues: {
         customerId: receipt.customerId,
         date: receipt.date,
+        refNumber: receipt.refNumber,
         method: receipt.method,
         total: receipt.total,
         depositAccountId: receipt.depositAccountId,
@@ -873,6 +895,8 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
       newValues: {
         customerId: input.customerId ?? null,
         date: input.date,
+        refNumber: renum?.refNumber ?? receipt.refNumber,
+        duplicateNumber: renum?.duplicate || undefined,
         method: prep.method,
         total: toAmountString(prep.total),
         depositAccountId: prep.depositAccountId,

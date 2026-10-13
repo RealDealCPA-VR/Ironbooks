@@ -34,7 +34,8 @@ import {
   writeAudit,
 } from './_base';
 import { getReceivingSettings, poStatusFromLines } from './receivingLinks';
-import { allocateDocNumber } from './docNumbers';
+import { allocateDocNumber, renumberDoc } from './docNumbers';
+import { assertFeatureOn } from '@/lib/featureGate';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -103,6 +104,9 @@ export async function createPurchaseOrder(
   ctx: ServiceContext,
   input: CreatePurchaseOrderInput,
 ) {
+  // Enforced here, not only on the API path: memorized POs and reorder-list POs are entered
+  // without an HTTP request (QB has no purchase orders while "Use purchase orders" is off).
+  await assertFeatureOn(ctx, 'purchaseOrdersEnabled');
   if (!input.lines || input.lines.length === 0) {
     throw validation('A purchase order must have at least one line.');
   }
@@ -278,6 +282,10 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
     if (po.status === 'closed') {
       throw new ServiceError('CONFLICT', 'This purchase order is closed. Closed purchase orders cannot be edited.');
     }
+    const renum = await renumberDoc(
+      tx, 'purchase_order', id, { refNumber: po.refNumber, number: po.poNumber },
+      input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
+    );
     const oldLines = await tx.db
       .select()
       .from(purchaseOrderLines)
@@ -370,6 +378,7 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
         memo: input.memo ?? null,
         total: toAmountString(total),
         status,
+        ...(renum ? { refNumber: renum.refNumber, poNumber: renum.number } : {}),
       })
       .where(eq(purchaseOrders.id, id))
       .returning();
@@ -380,6 +389,7 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
       entityId: id,
       oldValues: {
         vendorId: po.vendorId,
+        refNumber: po.refNumber,
         date: po.date,
         expectedDate: po.expectedDate,
         memo: po.memo,
@@ -389,6 +399,8 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
       },
       newValues: {
         vendorId: input.vendorId,
+        refNumber: renum?.refNumber ?? po.refNumber,
+        duplicateNumber: renum?.duplicate || undefined,
         date: input.date,
         expectedDate: input.expectedDate ?? null,
         memo: input.memo ?? null,

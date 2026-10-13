@@ -15,7 +15,8 @@ export default function SignupPage() {
     setBusy(true);
     try {
       await api.post('/api/auth/signup', form);
-      window.location.href = '/dashboard';
+      // Every new company goes through the setup interview (it offers Skip).
+      window.location.href = '/onboarding?new=1';
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Sign up failed', 'danger');
       setBusy(false);

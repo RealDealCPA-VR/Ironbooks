@@ -1,52 +1,18 @@
-'use client';
+import { Suspense } from 'react';
+import { getPageContext } from '@/lib/context';
+import StdReportView from '../_components/StdReportView';
 
-import { Truck } from 'lucide-react';
-import { formatCurrency } from '@/lib/money';
-import SimpleReport from '../_components/SimpleReport';
+export const dynamic = 'force-dynamic';
 
-interface PurchasesByVendorRow {
-  vendorId: string;
-  vendorName: string;
-  totalExpenses: string;
-  billCount: number;
-}
-
-interface PurchasesByVendorData {
-  rows: PurchasesByVendorRow[];
-}
-
-export default function PurchasesByVendorPage() {
+/**
+ * Purchases by Vendor Summary — runs on the standard report engine (lib/reports/catalog.ts key "purchases-by-vendor-summary"): filters,
+ * QuickZoom, Fonts & Numbers, memorize and scheduling. Settings live in the URL.
+ */
+export default async function Page() {
+  await getPageContext('/reports/purchases-by-vendor');
   return (
-    <SimpleReport<PurchasesByVendorData, PurchasesByVendorRow>
-      title="Purchases by Vendor"
-      icon={Truck}
-      csvName="purchases-by-vendor.csv"
-      emptyText="No vendor bills in this period."
-      controls="range"
-      buildUrl={({ from, to }) => `/api/reports/purchases-by-vendor?from=${from}&to=${to}`}
-      getRows={(d) => d.rows}
-      rowHref={(r, q) => `/reports/std/transaction-list-by-vendor?vendorId=${r.vendorId}&txnType=bill&from=${q.from}&to=${q.to}`}
-      columns={[
-        {
-          header: 'Vendor',
-          cell: (r) => (
-            <span className="font-medium">{r.vendorName}</span>
-          ),
-          csv: (r) => r.vendorName,
-        },
-        {
-          header: 'Bills',
-          className: 'text-right tabular-nums',
-          cell: (r) => r.billCount,
-          csv: (r) => r.billCount,
-        },
-        {
-          header: 'Total Purchases',
-          className: 'text-right tabular-nums',
-          cell: (r) => <span className="font-semibold">{formatCurrency(r.totalExpenses)}</span>,
-          csv: (r) => r.totalExpenses,
-        },
-      ]}
-    />
+    <Suspense fallback={null}>
+      <StdReportView reportKey="purchases-by-vendor-summary" />
+    </Suspense>
   );
 }

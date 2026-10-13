@@ -28,6 +28,7 @@ import {
   salesReceipts,
 } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, validation, writeAudit } from './_base';
+import { resolveCompanyPreferences } from '@/lib/preferences';
 
 export const DOC_TYPES = [
   'invoice',
@@ -146,7 +147,7 @@ export async function assertUniqueDocNumber(
   opts: { excludeId?: string; allowDuplicate?: boolean } = {},
 ): Promise<{ duplicate: boolean }> {
   const duplicate = await isDocNumberTaken(ctx, docType, ref, opts.excludeId);
-  if (duplicate && !opts.allowDuplicate) {
+  if (duplicate && !opts.allowDuplicate && (await warnsOnDuplicate(ctx, docType))) {
     throw new ServiceError(
       'CONFLICT',
       `${DOC_TYPE_LABELS[docType]} number ${ref} is already used. Use a different number, or confirm to keep the duplicate.`,
@@ -154,6 +155,27 @@ export async function assertUniqueDocNumber(
     );
   }
   return { duplicate };
+}
+
+/**
+ * QB Preferences 'Warn about duplicate invoice / estimate / purchase order numbers'. With the
+ * warning off QB accepts the duplicate silently; document types without such a preference
+ * always warn.
+ */
+const DUPLICATE_WARNING_PREF: Partial<Record<DocType, 'warnDuplicateInvoiceNumbers' | 'warnDuplicateEstimateNumbers' | 'warnDuplicatePoNumbers'>> = {
+  invoice: 'warnDuplicateInvoiceNumbers',
+  estimate: 'warnDuplicateEstimateNumbers',
+  purchase_order: 'warnDuplicatePoNumbers',
+};
+
+async function warnsOnDuplicate(ctx: ServiceContext, docType: DocType): Promise<boolean> {
+  const key = DUPLICATE_WARNING_PREF[docType];
+  if (!key) return true;
+  const [row] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  return resolveCompanyPreferences(row?.settings ?? {})[key];
 }
 
 /** Starting numbers per document type (companies.settings.docNumbers). */
@@ -298,4 +320,33 @@ export async function setStartingDocNumber(
     startingNumber: value,
     nextNumber: await nextDocNumber(ctx, docType),
   };
+}
+
+/**
+ * Renumber an existing document when the user typed a different number on the edit form
+ * (QB lets you change "Invoice #", "Estimate No." ... on a saved form). Returns null when the
+ * number is unchanged or left blank (keep the current one). A number used by ANOTHER document
+ * of this type is refused (CONFLICT, duplicateDocNumber) unless the user confirmed the warning.
+ * Call inside the update transaction; store both returned values.
+ */
+export async function renumberDoc(
+  ctx: ServiceContext,
+  docType: DocType,
+  id: string,
+  current: { refNumber: string | null; number: number },
+  userRef: string | null | undefined,
+  opts: { allowDuplicate?: boolean } = {},
+): Promise<{ refNumber: string; number: number; duplicate: boolean } | null> {
+  if (userRef === undefined) return null;
+  const typed = normalizeDocNumber(userRef);
+  if (!typed) return null;
+  if (typed === docRef(current.refNumber, current.number)) return null;
+  await ctx.db.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtext(${`docnum:${ctx.companyId}:${docType}`}))`,
+  );
+  const { duplicate } = await assertUniqueDocNumber(ctx, docType, typed, {
+    excludeId: id,
+    allowDuplicate: opts.allowDuplicate,
+  });
+  return { refNumber: typed, number: docNumberToInt(typed) ?? current.number, duplicate };
 }

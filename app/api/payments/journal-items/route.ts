@@ -4,7 +4,8 @@
  * GET  /api/payments/journal-items?customerId=
  *        → { charges, credits } — open JE A/R debits (payable) and credits (applicable to invoices)
  * POST /api/payments/journal-items
- *        { action: 'apply_credit', journalLineId, invoiceId, amount, date? } — JE credit → invoice
+ *        { action: 'apply_credit', journalLineId, invoiceId | chargeLineId, amount, date? }
+ *                                   — JE credit → invoice, or → General Journal charge
  *        { action: 'apply_payment', paymentId, items: [{ journalLineId, amount }] }
  *                                   — an earlier payment's unapplied credit → JE charges
  *        { action: 'unapply', applicationId } — remove one application
@@ -25,7 +26,9 @@ const bodySchema = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('apply_credit'),
     journalLineId: zUuid,
-    invoiceId: zUuid,
+    /** The invoice to apply the credit to — or `chargeLineId`, a General Journal charge (P1). */
+    invoiceId: zUuid.nullish(),
+    chargeLineId: zUuid.nullish(),
     amount: zMoneyPositive,
     date: zDate.nullish(),
   }),
@@ -59,7 +62,8 @@ export async function POST(req: NextRequest) {
     if (b.action === 'apply_credit') {
       const application = await applyJournalCredit(ctx, {
         journalLineId: b.journalLineId,
-        invoiceId: b.invoiceId,
+        invoiceId: b.invoiceId ?? null,
+        chargeLineId: b.chargeLineId ?? null,
         amount: b.amount,
         date: b.date ?? null,
       });
