@@ -19,6 +19,7 @@
 import { and, eq, isNull, ne, sql } from 'drizzle-orm';
 import { accounts, billPayments, expenses, paychecks } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError } from './_base';
+import { getPreferences } from './company';
 
 /** Parse a string reference as a non-negative integer. Returns null if non-numeric. */
 function parseRef(ref: string | null | undefined): number | null {
@@ -189,6 +190,8 @@ export async function assertCheckNumberAvailable(
   },
 ): Promise<void> {
   if (params.allowDuplicate) return;
+  // Preferences > Checking: "Warn about duplicate check numbers" off accepts the duplicate silently.
+  if (!(await getPreferences(ctx)).warnDuplicateCheckNumbers) return;
   const matches = await findDuplicateCheckNumbers(ctx, params);
   if (matches.length > 0) {
     const num = (params.number ?? '').trim();

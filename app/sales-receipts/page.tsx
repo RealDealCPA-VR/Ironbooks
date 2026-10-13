@@ -604,7 +604,8 @@ function NewReceiptModal({
 
         {/* Tax rate + memo */}
         <div className="grid grid-cols-2 gap-3">
-          <div>
+          {/* Hidden while "Charge sales tax" is off (QB removes tax from forms); an old document keeps its tax. */}
+          {(prefs.company.salesTaxEnabled || taxRateId) ? (<div>
             <Label htmlFor="sr-tax">Sales Tax</Label>
             <Select id="sr-tax" value={taxRateId} onChange={(e) => setTaxRateId(e.target.value)}>
               <option value="">No tax</option>
@@ -614,7 +615,7 @@ function NewReceiptModal({
                 </option>
               ))}
             </Select>
-          </div>
+          </div>) : <div />}
           <div>
             <Label htmlFor="sr-memo">Memo</Label>
             <Input

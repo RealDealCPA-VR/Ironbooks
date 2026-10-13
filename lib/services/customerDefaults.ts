@@ -14,6 +14,7 @@
 import { and, eq } from 'drizzle-orm';
 import { customers } from '@/lib/db/schema';
 import { defaultShipTo } from '@/lib/shipTo';
+import { salesTaxOn } from '@/lib/featureGate';
 import type { ServiceContext } from './_base';
 
 export interface CustomerTaxDefaults {
@@ -57,7 +58,7 @@ export async function applyCustomerTaxDefaults<T extends TaxableDoc>(
   const d = await customerTaxDefaults(ctx, input.customerId);
   if (!d) return input;
   let out: T = input;
-  if (opts.defaultRate && input.taxRateId === undefined && d.taxRateId) {
+  if (opts.defaultRate && input.taxRateId === undefined && d.taxRateId && (await salesTaxOn(ctx))) {
     out = { ...out, taxRateId: d.taxRateId };
   }
   if (!d.taxable && input.lines.some((l) => l.taxable !== false)) {

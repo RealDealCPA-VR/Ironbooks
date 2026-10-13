@@ -1,23 +1,31 @@
 'use client';
 
 /**
- * First-run setup — an EasyStep-style interview in plain language.
+ * Setup interview — an EasyStep-style interview in plain language (QB "EasyStep Interview").
  *
- * Step 1 — Welcome (+ prominent "Coming from QuickBooks Desktop?" link to /qb-import)
- * Step 2 — Company name + currency
- * Step 3 — What kind of business? (picks the industry chart-of-accounts template)
- * Step 4 — Fiscal year start month + accrual/cash reporting
- * Step 5 — Yes/no: sales tax, inventory, employees
- * Step 6 — Review & create, then a "what's next" checklist
+ * Every new company goes through it: sign-up, New Company (/companies) and the desktop app's
+ * File > New Company all land here, and Help > "Run setup interview" (and the command palette)
+ * opens it again for the company that is open. "Skip for now" is always offered.
  *
- * The answers become a setup plan (lib/onboarding.ts buildSetupPlan): Preferences switched on
- * via PATCH /api/company { settings } and template accounts added via POST /api/accounts. The
- * company is created once; if a later step fails, "Try again" resumes without creating a
- * second company. No opening balances are posted, so the books start in balance.
+ * Step 1 — Welcome (+ "Coming from QuickBooks Desktop?" link to /qb-import)
+ * Step 2 — Company information: name, legal name, address, phone, email, EIN (used on invoices,
+ *          W-2 and 1099), home currency
+ * Step 3 — Industry (picks the starter chart of accounts)
+ * Step 4 — How the business is organized (entity type → tax form, equity accounts, tax lines)
+ * Step 5 — Dates: first month of the fiscal year and of the income-tax year, start date,
+ *          accrual/cash reporting
+ * Step 6 — Yes/no features: sales tax, inventory, employees, estimates (+ progress invoicing),
+ *          time tracking, class tracking, more than one currency
+ * Step 7 — Review (the summary is built from the values that will be saved) and finish
+ *
+ * Finishing POSTs the answers to /api/company/setup-interview, which applies them to the open
+ * company in one transaction (lib/services/setupInterview.ts). No opening balances are posted,
+ * so the books start in balance.
  */
 
-import { useMemo, useState } from 'react';
+import { Suspense, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
+import { useSearchParams } from 'next/navigation';
 import {
   BookOpen,
   Building2,
@@ -25,6 +33,7 @@ import {
   ChevronLeft,
   ChevronRight,
   DownloadCloud,
+  Landmark,
   Store,
   CalendarRange,
   ToggleRight,
@@ -33,13 +42,20 @@ import {
 import { Button, Card, Input, Select, Label, toast, toastError } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { resolveCompanyPreferences } from '@/lib/preferences';
 import { cn } from '@/lib/utils';
 import {
   BUSINESS_TYPES,
+  ENTITY_TYPES,
+  MONTH_NAMES,
   buildSetupPlan,
   businessTypeOption,
+  entityTypeOption,
   fiscalYearEndFromStartMonth,
+  fiscalYearStartMonthFromEnd,
   type BusinessType,
+  type CompanyInfo,
+  type EntityType,
   type InterviewAnswers,
   type SetupStep,
 } from '@/lib/onboarding';
@@ -64,38 +80,142 @@ const CURRENCIES = [
   { value: 'HKD', label: 'HKD — Hong Kong Dollar (HK$)' },
 ];
 
-const MONTHS = [
-  'January', 'February', 'March', 'April', 'May', 'June',
-  'July', 'August', 'September', 'October', 'November', 'December',
-];
-
 const STEPS = [
   { label: 'Welcome', icon: BookOpen },
   { label: 'Company', icon: Building2 },
-  { label: 'Business', icon: Store },
-  { label: 'Year', icon: CalendarRange },
+  { label: 'Industry', icon: Store },
+  { label: 'Tax form', icon: Landmark },
+  { label: 'Dates', icon: CalendarRange },
   { label: 'Features', icon: ToggleRight },
-  { label: 'Create', icon: ClipboardCheck },
+  { label: 'Finish', icon: ClipboardCheck },
 ];
 
-interface WizardState extends InterviewAnswers {
-  name: string;
+type FeatureAnswers = Required<
+  Pick<
+    InterviewAnswers,
+    'salesTax' | 'inventory' | 'employees' | 'estimates' | 'progressInvoicing' | 'timeTracking' | 'classTracking' | 'multiCurrency'
+  >
+>;
+
+interface WizardState extends FeatureAnswers {
+  businessType: BusinessType;
+  entityType: EntityType;
+  fiscalYearStartMonth: number;
+  taxYearStartMonth: number;
+  startDate: string;
+  reportBasis: 'accrual' | 'cash';
   currency: string;
-  /** Whether the user has touched the inventory question (else it follows the business type). */
+  company: Required<CompanyInfo>;
+  /** Whether the user has touched the inventory question (else it follows the industry). */
   inventoryTouched: boolean;
 }
 
+function firstOfYear(): string {
+  return `${new Date().getFullYear()}-01-01`;
+}
+
 const INITIAL: WizardState = {
-  name: '',
-  currency: 'USD',
   businessType: 'service',
+  entityType: 'sole_prop',
   fiscalYearStartMonth: 1,
+  taxYearStartMonth: 1,
+  startDate: firstOfYear(),
   reportBasis: 'accrual',
+  currency: 'USD',
   salesTax: false,
   inventory: false,
   employees: false,
+  estimates: false,
+  progressInvoicing: false,
+  timeTracking: false,
+  classTracking: false,
+  multiCurrency: false,
+  company: {
+    name: '',
+    legalName: '',
+    ein: '',
+    addressLine1: '',
+    addressLine2: '',
+    city: '',
+    state: '',
+    zip: '',
+    country: 'US',
+    phone: '',
+    email: '',
+  },
   inventoryTouched: false,
 };
+
+/** The answers object sent to the server (and used for the review preview). */
+function toAnswers(s: WizardState): InterviewAnswers {
+  return {
+    businessType: s.businessType,
+    entityType: s.entityType,
+    fiscalYearStartMonth: s.fiscalYearStartMonth,
+    taxYearStartMonth: s.taxYearStartMonth,
+    startDate: s.startDate || undefined,
+    reportBasis: s.reportBasis,
+    currency: s.currency,
+    salesTax: s.salesTax,
+    inventory: s.inventory,
+    employees: s.employees,
+    estimates: s.estimates,
+    progressInvoicing: s.estimates && s.progressInvoicing,
+    timeTracking: s.timeTracking,
+    classTracking: s.classTracking,
+    multiCurrency: s.multiCurrency,
+    company: s.company,
+  };
+}
+
+/** Pre-fill from the open company (so re-running the interview starts from what is saved). */
+function prefill(
+  company: { name: string; settings: Record<string, unknown> | null },
+  isNew: boolean,
+): Partial<WizardState> {
+  const s = company.settings ?? {};
+  const str = (k: string) => (typeof s[k] === 'string' ? (s[k] as string) : '');
+  const bool = (k: string, fallback: boolean) => (typeof s[k] === 'boolean' ? (s[k] as boolean) : fallback);
+  const rec = (s.setupInterview && typeof s.setupInterview === 'object' ? s.setupInterview : {}) as Record<string, unknown>;
+  const businessType = BUSINESS_TYPES.find((b) => b.industry === str('industry'))?.value;
+  const fiscalYearStartMonth = fiscalYearStartMonthFromEnd(str('fiscalYearEnd') || '12-31');
+  // A brand-new company (?new=1) starts every feature at "No" so each one is a conscious
+  // choice. An existing company — finished, skipped or never asked — starts from the switches
+  // it uses today, so clicking straight through never turns off a feature already in use.
+  const prefs = resolveCompanyPreferences(s);
+  const cur = (k: keyof typeof prefs) => (isNew ? false : prefs[k] === true);
+  return {
+    ...(businessType ? { businessType } : {}),
+    ...(ENTITY_TYPES.some((e) => e.value === rec.entityType) ? { entityType: rec.entityType as EntityType } : {}),
+    fiscalYearStartMonth,
+    taxYearStartMonth: typeof rec.taxYearStartMonth === 'number' ? rec.taxYearStartMonth : fiscalYearStartMonth,
+    ...(typeof rec.startDate === 'string' ? { startDate: rec.startDate } : {}),
+    reportBasis: str('reportBasis') === 'cash' ? 'cash' : 'accrual',
+    currency: /^[A-Z]{3}$/.test(str('currency')) ? str('currency') : 'USD',
+    salesTax: cur('salesTaxEnabled'),
+    inventory: cur('inventoryEnabled'),
+    inventoryTouched: !isNew,
+    employees: cur('payrollEnabled'),
+    estimates: cur('estimatesEnabled'),
+    progressInvoicing: cur('estimatesEnabled') && cur('progressInvoicingEnabled'),
+    timeTracking: cur('timeTrackingEnabled'),
+    classTracking: cur('classTrackingEnabled'),
+    multiCurrency: bool('multiCurrencyEnabled', false),
+    company: {
+      name: company.name ?? '',
+      legalName: str('legalName'),
+      ein: str('ein'),
+      addressLine1: str('addressLine1'),
+      addressLine2: str('addressLine2'),
+      city: str('city'),
+      state: str('state'),
+      zip: str('zip'),
+      country: str('country') || 'US',
+      phone: str('phone'),
+      email: str('email'),
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Stepper indicator
@@ -221,13 +341,7 @@ function YesNo({
               value === v ? 'border-electric bg-electric/10 text-electric' : 'border-slate-200 text-navy/70 hover:bg-slate-50',
             )}
           >
-            <input
-              type="radio"
-              name={name}
-              className="sr-only"
-              checked={value === v}
-              onChange={() => onChange(v)}
-            />
+            <input type="radio" name={name} className="sr-only" checked={value === v} onChange={() => onChange(v)} />
             {v ? 'Yes' : 'No'}
           </label>
         ))}
@@ -236,11 +350,67 @@ function YesNo({
   );
 }
 
+/** A card-style single-choice list (industry, tax form, report basis). */
+function ChoiceList<T extends string>({
+  name,
+  legend,
+  options,
+  value,
+  onChange,
+}: {
+  name: string;
+  legend: string;
+  options: Array<{ value: T; label: string; description: string }>;
+  value: T;
+  onChange: (v: T) => void;
+}) {
+  return (
+    <fieldset>
+      <legend className="sr-only">{legend}</legend>
+      <div className="grid grid-cols-1 gap-2">
+        {options.map((o) => {
+          const checked = value === o.value;
+          return (
+            <label
+              key={o.value}
+              className={cn(
+                'flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-colors',
+                'has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-electric/50',
+                checked ? 'border-electric bg-electric/5' : 'border-slate-200 hover:bg-slate-50',
+              )}
+            >
+              <input
+                type="radio"
+                name={name}
+                value={o.value}
+                checked={checked}
+                onChange={() => onChange(o.value)}
+                className="mt-1 accent-electric"
+              />
+              <span>
+                <span className="block text-sm font-semibold text-navy">{o.label}</span>
+                <span className="block text-xs text-navy/50">{o.description}</span>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </fieldset>
+  );
+}
+
+interface StepProps {
+  state: WizardState;
+  set: (patch: Partial<WizardState>) => void;
+  onBack: () => void;
+  onNext: () => void;
+}
+
 // ---------------------------------------------------------------------------
 // Steps
 // ---------------------------------------------------------------------------
 
-function StepWelcome({ onNext }: { onNext: () => void }) {
+function StepWelcome({ onNext, rerun }: { onNext: () => void; rerun: boolean }) {
   return (
     <div className="flex flex-col items-center text-center gap-6">
       <div className="h-20 w-20 rounded-2xl bg-electric/10 flex items-center justify-center">
@@ -248,90 +418,131 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
       </div>
       <div>
         <h2 className="text-2xl font-extrabold text-navy mb-2" tabIndex={-1} data-step-heading>
-          Welcome to BookKeeper AI
+          {rerun ? 'Setup interview' : 'Welcome to BookKeeper AI'}
         </h2>
         <p className="text-navy/60 text-sm max-w-sm leading-relaxed mx-auto">
-          A few easy questions about your business and we&apos;ll set up your books — the right
-          accounts, your fiscal year, and only the features you need. About two minutes. You can
-          change every answer later in Settings.
+          {rerun
+            ? 'Go through the questions again to update your company details and turn features on or off. Your answers start from what is saved now, and nothing you entered is deleted.'
+            : "A few easy questions about your business and we'll set up your books — the right accounts, your fiscal and tax year, and only the features you need. About three minutes. You can change every answer later in Settings."}
         </p>
       </div>
 
-      <Link
-        href="/qb-import"
-        className="w-full rounded-xl border-2 border-gold/60 bg-gold/10 p-4 text-left outline-none transition-colors hover:bg-gold/20 focus-visible:ring-2 focus-visible:ring-electric"
-      >
-        <span className="flex items-start gap-3">
-          <DownloadCloud className="h-6 w-6 text-gold shrink-0 mt-0.5" aria-hidden="true" />
-          <span>
-            <span className="block font-bold text-navy">Coming from QuickBooks Desktop? Bring your data</span>
-            <span className="block text-xs text-navy/60 mt-0.5">
-              Import your customers, vendors, items, chart of accounts and transactions instead of
-              starting from scratch.
+      {!rerun && (
+        <Link
+          href="/qb-import"
+          className="w-full rounded-xl border-2 border-gold/60 bg-gold/10 p-4 text-left outline-none transition-colors hover:bg-gold/20 focus-visible:ring-2 focus-visible:ring-electric"
+        >
+          <span className="flex items-start gap-3">
+            <DownloadCloud className="h-6 w-6 text-gold shrink-0 mt-0.5" aria-hidden="true" />
+            <span>
+              <span className="block font-bold text-navy">Coming from QuickBooks Desktop? Bring your data</span>
+              <span className="block text-xs text-navy/60 mt-0.5">
+                Import your customers, vendors, items, chart of accounts and transactions instead of
+                starting from scratch.
+              </span>
             </span>
           </span>
-        </span>
-      </Link>
+        </Link>
+      )}
 
       <Button className="w-full" onClick={onNext}>
-        Start fresh — set up a new company
+        {rerun ? 'Start' : 'Start the interview'}
         <ChevronRight className="h-4 w-4" aria-hidden="true" />
       </Button>
     </div>
   );
 }
 
-function StepCompany({
-  state,
-  set,
-  onBack,
-  onNext,
-}: {
-  state: WizardState;
-  set: (patch: Partial<WizardState>) => void;
-  onBack: () => void;
-  onNext: () => void;
-}) {
+function StepCompany({ state, set, onBack, onNext }: StepProps) {
   const [touched, setTouched] = useState(false);
-  const nameMissing = !state.name.trim();
+  const c = state.company;
+  const setC = (patch: Partial<CompanyInfo>) => set({ company: { ...c, ...patch } as Required<CompanyInfo> });
+  const nameMissing = !c.name.trim();
+  const einBad = c.ein.trim() !== '' && !/^\d{2}-?\d{7}$/.test(c.ein.trim());
+  const emailBad = c.email.trim() !== '' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c.email.trim());
+  const field = (
+    id: string,
+    label: string,
+    key: keyof CompanyInfo,
+    opts: { placeholder?: string; type?: string; autoComplete?: string; error?: string | false; autoFocus?: boolean; required?: boolean } = {},
+  ) => (
+    <div>
+      <Label htmlFor={id} required={opts.required}>
+        {label}
+      </Label>
+      <Input
+        id={id}
+        type={opts.type}
+        placeholder={opts.placeholder}
+        autoComplete={opts.autoComplete}
+        value={c[key] ?? ''}
+        onChange={(e) => setC({ [key]: e.target.value })}
+        onBlur={() => setTouched(true)}
+        aria-invalid={touched && opts.error ? true : undefined}
+        aria-describedby={touched && opts.error ? `${id}-err` : undefined}
+        autoFocus={opts.autoFocus}
+      />
+      {touched && opts.error && (
+        <p id={`${id}-err`} className="mt-1 text-xs text-red-600">
+          {opts.error}
+        </p>
+      )}
+    </div>
+  );
   return (
     <div>
-      <StepHeading icon={Building2} title="What's your company called?" subtitle="This appears on invoices and reports." />
-      <div className="flex flex-col gap-4">
-        <div>
-          <Label htmlFor="co-name" required>Company name</Label>
-          <Input
-            id="co-name"
-            placeholder="e.g. Acme Plumbing LLC"
-            value={state.name}
-            onChange={(e) => set({ name: e.target.value })}
-            onBlur={() => setTouched(true)}
-            aria-required="true"
-            aria-invalid={touched && nameMissing ? true : undefined}
-            aria-describedby={touched && nameMissing ? 'co-name-err' : undefined}
-            autoFocus
-          />
-          {touched && nameMissing && (
-            <p id="co-name-err" className="mt-1 text-xs text-red-600">Enter your company name to continue.</p>
-          )}
+      <StepHeading
+        icon={Building2}
+        title="Tell us about your company"
+        subtitle="This appears on invoices and statements, and on W-2 and 1099 forms."
+      />
+      <div className="flex flex-col gap-3">
+        {field('co-name', 'Company name', 'name', {
+          placeholder: 'e.g. Acme Plumbing',
+          error: nameMissing && 'Enter your company name to continue.',
+          autoFocus: true,
+          required: true,
+        })}
+        {field('co-legal', 'Legal name (if different)', 'legalName', { placeholder: 'e.g. Acme Plumbing LLC' })}
+        {field('co-addr1', 'Street address', 'addressLine1', { autoComplete: 'address-line1' })}
+        {field('co-addr2', 'Address line 2', 'addressLine2', { autoComplete: 'address-line2' })}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {field('co-city', 'City', 'city', { autoComplete: 'address-level2' })}
+          {field('co-state', 'State', 'state', { autoComplete: 'address-level1' })}
+          {field('co-zip', 'ZIP', 'zip', { autoComplete: 'postal-code' })}
         </div>
-        <div>
-          <Label htmlFor="co-currency">Currency you report in</Label>
-          <Select id="co-currency" value={state.currency} onChange={(e) => set({ currency: e.target.value })}>
-            {CURRENCIES.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </Select>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {field('co-phone', 'Phone', 'phone', { type: 'tel', autoComplete: 'tel' })}
+          {field('co-email', 'Email', 'email', {
+            type: 'email',
+            autoComplete: 'email',
+            error: emailBad && 'Enter an email like name@example.com, or leave it blank.',
+          })}
         </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {field('co-ein', 'Federal Employer ID (EIN)', 'ein', {
+            placeholder: '12-3456789',
+            error: einBad && 'An EIN has 9 digits, like 12-3456789. Leave it blank if you do not have one.',
+          })}
+          <div>
+            <Label htmlFor="co-currency">Currency you report in</Label>
+            <Select id="co-currency" value={state.currency} onChange={(e) => set({ currency: e.target.value })}>
+              {CURRENCIES.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </Select>
+          </div>
+        </div>
+        <p className="text-xs text-navy/40">Only the company name is required. You can fill in the rest later in Settings.</p>
       </div>
       <NavButtons
         onBack={onBack}
         onNext={() => {
           setTouched(true);
-          if (nameMissing) {
-            toast('Enter your company name to continue.', 'danger');
+          if (nameMissing || einBad || emailBad) {
+            toast(nameMissing ? 'Enter your company name to continue.' : 'Fix the highlighted field to continue.', 'danger');
             return;
           }
           onNext();
@@ -341,81 +552,59 @@ function StepCompany({
   );
 }
 
-function StepBusiness({
-  state,
-  set,
-  onBack,
-  onNext,
-}: {
-  state: WizardState;
-  set: (patch: Partial<WizardState>) => void;
-  onBack: () => void;
-  onNext: () => void;
-}) {
+function StepBusiness({ state, set, onBack, onNext }: StepProps) {
   return (
     <div>
       <StepHeading
         icon={Store}
-        title="What kind of business is it?"
+        title="What is your industry?"
         subtitle="We'll add the income and expense accounts businesses like yours usually need."
       />
-      <fieldset>
-        <legend className="sr-only">Business type</legend>
-        <div className="grid grid-cols-1 gap-2">
-          {BUSINESS_TYPES.map((bt) => {
-            const checked = state.businessType === bt.value;
-            return (
-              <label
-                key={bt.value}
-                className={cn(
-                  'flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-colors',
-                  'has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-electric/50',
-                  checked ? 'border-electric bg-electric/5' : 'border-slate-200 hover:bg-slate-50',
-                )}
-              >
-                <input
-                  type="radio"
-                  name="business-type"
-                  value={bt.value}
-                  checked={checked}
-                  onChange={() =>
-                    set({
-                      businessType: bt.value as BusinessType,
-                      // Pre-answer the inventory question until the user answers it themselves.
-                      ...(state.inventoryTouched ? {} : { inventory: bt.suggestsInventory }),
-                    })
-                  }
-                  className="mt-1 accent-electric"
-                />
-                <span>
-                  <span className="block text-sm font-semibold text-navy">{bt.label}</span>
-                  <span className="block text-xs text-navy/50">{bt.description}</span>
-                </span>
-              </label>
-            );
-          })}
-        </div>
-      </fieldset>
+      <ChoiceList
+        name="business-type"
+        legend="Industry"
+        options={BUSINESS_TYPES.map((b) => ({ value: b.value, label: b.label, description: b.description }))}
+        value={state.businessType}
+        onChange={(v) => {
+          const bt = businessTypeOption(v);
+          set({
+            businessType: v,
+            // Pre-answer the inventory question until the user answers it themselves.
+            ...(state.inventoryTouched ? {} : { inventory: bt.suggestsInventory }),
+          });
+        }}
+      />
       <NavButtons onBack={onBack} onNext={onNext} />
     </div>
   );
 }
 
-function StepYear({
-  state,
-  set,
-  onBack,
-  onNext,
-}: {
-  state: WizardState;
-  set: (patch: Partial<WizardState>) => void;
-  onBack: () => void;
-  onNext: () => void;
-}) {
-  const fye = fiscalYearEndFromStartMonth(state.fiscalYearStartMonth);
+function StepEntity({ state, set, onBack, onNext }: StepProps) {
   return (
     <div>
-      <StepHeading icon={CalendarRange} title="Your accounting year" subtitle="Most businesses use January to December." />
+      <StepHeading
+        icon={Landmark}
+        title="How is your business organized?"
+        subtitle="This picks your equity accounts and matches your accounts to the lines of your tax return."
+      />
+      <ChoiceList
+        name="entity-type"
+        legend="Business organization"
+        options={ENTITY_TYPES.map((e) => ({ value: e.value, label: e.label, description: e.description }))}
+        value={state.entityType}
+        onChange={(v) => set({ entityType: v })}
+      />
+      <NavButtons onBack={onBack} onNext={onNext} />
+    </div>
+  );
+}
+
+function StepDates({ state, set, onBack, onNext }: StepProps) {
+  const fye = fiscalYearEndFromStartMonth(state.fiscalYearStartMonth);
+  const dateBad = state.startDate !== '' && !/^\d{4}-\d{2}-\d{2}$/.test(state.startDate);
+  return (
+    <div>
+      <StepHeading icon={CalendarRange} title="Your dates" subtitle="Most businesses use January to December for both years." />
       <div className="flex flex-col gap-5">
         <div>
           <Label htmlFor="co-fy-start">
@@ -424,18 +613,52 @@ function StepYear({
           <Select
             id="co-fy-start"
             value={state.fiscalYearStartMonth}
-            onChange={(e) => set({ fiscalYearStartMonth: Number(e.target.value) })}
+            onChange={(e) => {
+              const m = Number(e.target.value);
+              // The tax year usually matches the fiscal year: keep them together until changed.
+              set({
+                fiscalYearStartMonth: m,
+                ...(state.taxYearStartMonth === state.fiscalYearStartMonth ? { taxYearStartMonth: m } : {}),
+              });
+            }}
             aria-describedby="co-fy-hint"
           >
-            {MONTHS.map((m, i) => (
+            {MONTH_NAMES.map((m, i) => (
               <option key={m} value={i + 1}>
                 {m}
               </option>
             ))}
           </Select>
           <p id="co-fy-hint" className="mt-1 text-xs text-navy/40">
-            Your year ends on {MONTHS[Number(fye.slice(0, 2)) - 1]} {Number(fye.slice(3))}. Not sure? Ask your
+            Your year ends on {MONTH_NAMES[Number(fye.slice(0, 2)) - 1]} {Number(fye.slice(3))}. Not sure? Ask your
             accountant or use January.
+          </p>
+        </div>
+        <div>
+          <Label htmlFor="co-tax-start">First month of your income tax year</Label>
+          <Select
+            id="co-tax-start"
+            value={state.taxYearStartMonth}
+            onChange={(e) => set({ taxYearStartMonth: Number(e.target.value) })}
+          >
+            {MONTH_NAMES.map((m, i) => (
+              <option key={m} value={i + 1}>
+                {m}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <div>
+          <Label htmlFor="co-start">Date you want to start tracking your finances here</Label>
+          <Input
+            id="co-start"
+            type="date"
+            value={state.startDate}
+            onChange={(e) => set({ startDate: e.target.value })}
+            aria-describedby="co-start-hint"
+          />
+          <p id="co-start-hint" className="mt-1 text-xs text-navy/40">
+            Usually the first day of this year or of this month. You&apos;ll enter your bank balances as of this date.
           </p>
         </div>
 
@@ -443,57 +666,37 @@ function StepYear({
           <legend className="text-sm font-medium text-navy/70 mb-2 flex items-center gap-1">
             How should reports count income? <Help term="accrual-vs-cash" />
           </legend>
-          <div className="grid grid-cols-1 gap-2">
-            {(
-              [
-                { v: 'accrual', title: 'When I invoice (accrual)', text: 'Recommended. Shows what you earned and owe, even before money moves.' },
-                { v: 'cash', title: 'When I get paid (cash)', text: 'Simpler; matches your bank account.' },
-              ] as const
-            ).map((o) => (
-              <label
-                key={o.v}
-                className={cn(
-                  'flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-colors',
-                  'has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-electric/50',
-                  state.reportBasis === o.v ? 'border-electric bg-electric/5' : 'border-slate-200 hover:bg-slate-50',
-                )}
-              >
-                <input
-                  type="radio"
-                  name="report-basis"
-                  checked={state.reportBasis === o.v}
-                  onChange={() => set({ reportBasis: o.v })}
-                  className="mt-1 accent-electric"
-                />
-                <span>
-                  <span className="block text-sm font-semibold text-navy">{o.title}</span>
-                  <span className="block text-xs text-navy/50">{o.text}</span>
-                </span>
-              </label>
-            ))}
-          </div>
+          <ChoiceList
+            name="report-basis"
+            legend="Report basis"
+            options={[
+              { value: 'accrual', label: 'When I invoice (accrual)', description: 'Recommended. Shows what you earned and owe, even before money moves.' },
+              { value: 'cash', label: 'When I get paid (cash)', description: 'Simpler; matches your bank account.' },
+            ]}
+            value={state.reportBasis}
+            onChange={(v) => set({ reportBasis: v })}
+          />
           <p className="mt-2 text-xs text-navy/40">This is only the default view — you can switch any report later.</p>
         </fieldset>
       </div>
-      <NavButtons onBack={onBack} onNext={onNext} />
+      <NavButtons
+        onBack={onBack}
+        onNext={() => {
+          if (dateBad) {
+            toast('Enter a start date like 2026-01-01, or leave it blank.', 'danger');
+            return;
+          }
+          onNext();
+        }}
+      />
     </div>
   );
 }
 
-function StepFeatures({
-  state,
-  set,
-  onBack,
-  onNext,
-}: {
-  state: WizardState;
-  set: (patch: Partial<WizardState>) => void;
-  onBack: () => void;
-  onNext: () => void;
-}) {
+function StepFeatures({ state, set, onBack, onNext }: StepProps) {
   return (
     <div>
-      <StepHeading icon={ToggleRight} title="What do you need?" subtitle="We'll turn on only what you use. You can change this later." />
+      <StepHeading icon={ToggleRight} title="What do you need?" subtitle="We'll turn on only what you use. Answering No hides the feature; you can turn it on later in Settings." />
       <div className="flex flex-col gap-3">
         <YesNo
           name="sales-tax"
@@ -505,16 +708,53 @@ function StepFeatures({
         <YesNo
           name="inventory"
           question="Do you keep products in stock?"
-          help="Choose Yes to track quantities and costs of items you buy and resell."
+          help="Choose Yes to track quantities and costs of items you buy and resell, and to use purchase orders."
           value={state.inventory}
           onChange={(v) => set({ inventory: v, inventoryTouched: true })}
         />
         <YesNo
           name="employees"
           question="Do you have employees?"
-          help="Choose Yes to run payroll here. (Independent contractors don't count — pay them as vendors.)"
+          help="Yes turns payroll on. No hides pay runs and payroll forms (your employee list stays). Independent contractors don't count — pay them as vendors."
           value={state.employees}
           onChange={(v) => set({ employees: v })}
+        />
+        <YesNo
+          name="estimates"
+          question="Do you give customers estimates or quotes?"
+          help="Choose Yes to write estimates and turn them into invoices."
+          value={state.estimates}
+          onChange={(v) => set({ estimates: v, ...(v ? {} : { progressInvoicing: false }) })}
+        />
+        {state.estimates && (
+          <YesNo
+            name="progress-invoicing"
+            question="Do you bill a job in parts (progress invoicing)?"
+            help="Choose Yes to invoice part of an estimate at a time, for example 30% up front."
+            value={state.progressInvoicing}
+            onChange={(v) => set({ progressInvoicing: v })}
+          />
+        )}
+        <YesNo
+          name="time-tracking"
+          question="Do you track hours worked for customers?"
+          help="Choose Yes to enter time and bill it to customers."
+          value={state.timeTracking}
+          onChange={(v) => set({ timeTracking: v })}
+        />
+        <YesNo
+          name="class-tracking"
+          question="Do you want to split reports by department or location (classes)?"
+          help="Choose Yes to tag transactions with a class and see a profit and loss for each."
+          value={state.classTracking}
+          onChange={(v) => set({ classTracking: v })}
+        />
+        <YesNo
+          name="multi-currency"
+          question="Do you have customers or vendors that use another currency?"
+          help="Choose Yes only if you bill or pay in more than one currency."
+          value={state.multiCurrency}
+          onChange={(v) => set({ multiCurrency: v })}
         />
       </div>
       <NavButtons onBack={onBack} onNext={onNext} />
@@ -522,7 +762,7 @@ function StepFeatures({
   );
 }
 
-function StepCreate({
+function StepFinish({
   state,
   onBack,
   onDone,
@@ -532,81 +772,47 @@ function StepCreate({
   onDone: (nextSteps: SetupStep[], accountsAdded: number) => void;
 }) {
   const [loading, setLoading] = useState(false);
-  // Remember the company once created so a retry never creates a duplicate.
-  const [companyId, setCompanyId] = useState<string | null>(null);
-  const preview = useMemo(() => buildSetupPlan(state), [state]);
+  const [existing, setExisting] = useState<{ code: string; name: string }[]>([]);
+  useEffect(() => {
+    api
+      .get<{ code: string; name: string }[]>('/api/accounts?includeInactive=true')
+      .then(setExisting)
+      .catch(() => setExisting([]));
+  }, []);
+  const preview = useMemo(() => buildSetupPlan(toAnswers(state), existing), [state, existing]);
   const bt = businessTypeOption(state.businessType);
+  const entity = entityTypeOption(state.entityType);
 
-  async function handleCreate() {
+  async function handleFinish() {
     setLoading(true);
     try {
-      let id = companyId;
-      if (!id) {
-        const company = await api.post<{ id: string }>('/api/companies', { name: state.name.trim() });
-        id = company.id;
-        setCompanyId(id);
-      }
-      await api.post('/api/companies/select', { companyId: id });
-
-      // Build the real plan against the seeded chart so nothing is duplicated.
-      const existing = await api.get<{ code: string; name: string }[]>('/api/accounts?includeInactive=true');
-      const plan = buildSetupPlan(state, existing);
-
-      await api.patch('/api/company', { settings: { currency: state.currency, ...plan.settings } });
-
-      let added = 0;
-      const failed: string[] = [];
-      for (const a of plan.accounts) {
-        try {
-          await api.post('/api/accounts', a);
-          added++;
-        } catch {
-          failed.push(a.name);
-        }
-      }
-      if (failed.length) {
-        toast(
-          `Your company is ready, but ${failed.length} suggested account${failed.length === 1 ? '' : 's'} could not be added (${failed.join(', ')}). You can add them in Chart of Accounts.`,
-          'info',
-        );
-      }
-      onDone(plan.nextSteps, added);
+      const res = await api.post<{ nextSteps: SetupStep[]; accountsAdded: number }>(
+        '/api/company/setup-interview',
+        toAnswers(state),
+      );
+      onDone(res.nextSteps, res.accountsAdded);
     } catch (err) {
-      toastError(err, 'We could not finish setting up your company.');
+      toastError(err, 'We could not finish setting up your company. Nothing was changed.');
     } finally {
       setLoading(false);
     }
   }
 
-  const rows = [
-    { label: 'Company', value: state.name },
-    { label: 'Business type', value: bt.label },
-    { label: 'Currency', value: state.currency },
-    {
-      label: 'Fiscal year',
-      value: `Starts in ${MONTHS[state.fiscalYearStartMonth - 1]} (ends ${preview.settings.fiscalYearEnd as string})`,
-    },
-    { label: 'Reports count income', value: state.reportBasis === 'cash' ? 'When paid (cash)' : 'When invoiced (accrual)' },
-    { label: 'Sales tax', value: state.salesTax ? 'On' : 'Off' },
-    { label: 'Inventory tracking', value: state.inventory ? 'On' : 'Off' },
-    { label: 'Payroll', value: state.employees ? 'On (every 2 weeks, 40-hour week)' : 'Off' },
-  ];
-
   return (
     <div>
       <StepHeading icon={ClipboardCheck} title="Ready to set up your books" subtitle="Check your answers. Use Back to change anything." />
-      <dl className="rounded-xl border border-slate-100 bg-slate-50 divide-y divide-slate-100 text-sm">
-        {rows.map(({ label, value }, i) => (
-          <div key={i} className="flex justify-between gap-4 px-4 py-2.5">
-            <dt className="text-navy/50 font-medium">{label}</dt>
-            <dd className="text-navy font-semibold text-right">{value}</dd>
-          </div>
+      <p className="text-sm font-semibold text-navy mb-1">{state.company.name}</p>
+      <ul className="rounded-xl border border-slate-100 bg-slate-50 divide-y divide-slate-100 text-sm" aria-label="What will be saved">
+        {preview.summary.map((row) => (
+          <li key={row} className="px-4 py-2 text-navy">
+            {row}
+          </li>
         ))}
-      </dl>
+      </ul>
       {preview.accounts.length > 0 && (
         <div className="mt-4 text-sm">
           <p className="font-semibold text-navy mb-1">
-            Accounts we&apos;ll add for a {bt.label.toLowerCase()} business:
+            Accounts we&apos;ll add for a {bt.label.toLowerCase()} business ({entity.label.toLowerCase()}):
           </p>
           <p className="text-navy/60 text-xs leading-relaxed">{preview.accounts.map((a) => a.name).join(' · ')}</p>
           <p className="text-navy/40 text-xs mt-1">
@@ -614,12 +820,7 @@ function StepCreate({
           </p>
         </div>
       )}
-      <NavButtons
-        onBack={onBack}
-        onNext={handleCreate}
-        loading={loading}
-        nextLabel={companyId ? 'Try again' : 'Create my company'}
-      />
+      <NavButtons onBack={onBack} onNext={handleFinish} loading={loading} nextLabel="Finish setup" />
     </div>
   );
 }
@@ -636,8 +837,8 @@ function StepDone({ name, nextSteps, accountsAdded }: { name: string; nextSteps:
         </h2>
         <p className="text-navy/60 text-sm max-w-sm leading-relaxed">
           <strong className="text-navy">{name}</strong> is ready with a chart of accounts
-          {accountsAdded > 0 ? ` (including ${accountsAdded} account${accountsAdded === 1 ? '' : 's'} for your industry)` : ''} and
-          your preferences turned on.
+          {accountsAdded > 0 ? ` (including ${accountsAdded} new account${accountsAdded === 1 ? '' : 's'} for your business)` : ''} and
+          your features switched on or off as you chose.
         </p>
       </div>
       <div className="w-full text-left">
@@ -661,13 +862,13 @@ function StepDone({ name, nextSteps, accountsAdded }: { name: string; nextSteps:
           ))}
         </ol>
       </div>
-      <Link
+      <a
         href="/dashboard"
         className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-electric px-4 py-2 text-sm font-semibold text-white shadow-sm outline-none hover:bg-electric/90 focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1"
       >
         Go to Home
         <ChevronRight className="h-4 w-4" aria-hidden="true" />
-      </Link>
+      </a>
     </div>
   );
 }
@@ -676,12 +877,35 @@ function StepDone({ name, nextSteps, accountsAdded }: { name: string; nextSteps:
 // Page root
 // ---------------------------------------------------------------------------
 
-export default function OnboardingPage() {
+function Interview() {
+  const params = useSearchParams();
   const [step, setStep] = useState(1);
   const [state, setState] = useState<WizardState>(INITIAL);
+  const [rerun, setRerun] = useState(false);
+  const [skipping, setSkipping] = useState(false);
   const [done, setDone] = useState<{ nextSteps: SetupStep[]; accountsAdded: number } | null>(null);
 
   const set = (patch: Partial<WizardState>) => setState((prev) => ({ ...prev, ...patch }));
+
+  // The interview always sets up the company that is open: pre-fill from it.
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      api.get<{ name: string; settings: Record<string, unknown> | null }>('/api/company'),
+      api.get<{ status: string } | null>('/api/company/setup-interview').catch(() => null),
+    ])
+      .then(([company, rec]) => {
+        if (cancelled) return;
+        setState((prev) => ({ ...prev, ...prefill(company, params.get('new') === '1') }));
+        setRerun(Boolean(rec) && params.get('new') !== '1');
+      })
+      .catch(() => {
+        /* not signed in yet: the API client sends the user to sign in */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [params]);
 
   // Move keyboard/screen-reader focus to the new step's heading on navigation.
   function go(n: number) {
@@ -690,6 +914,31 @@ export default function OnboardingPage() {
       document.querySelector<HTMLElement>('[data-step-heading]')?.focus();
     }, 0);
   }
+
+  async function skip() {
+    setSkipping(true);
+    try {
+      await api.post('/api/company/setup-interview', { skip: true });
+    } catch {
+      // Skipping must never trap the user (e.g. a role that can't change company settings).
+    }
+    window.location.href = '/dashboard';
+  }
+
+  const steps = [
+    <StepWelcome key="w" rerun={rerun} onNext={() => go(2)} />,
+    <StepCompany key="c" state={state} set={set} onBack={() => go(1)} onNext={() => go(3)} />,
+    <StepBusiness key="b" state={state} set={set} onBack={() => go(2)} onNext={() => go(4)} />,
+    <StepEntity key="e" state={state} set={set} onBack={() => go(3)} onNext={() => go(5)} />,
+    <StepDates key="d" state={state} set={set} onBack={() => go(4)} onNext={() => go(6)} />,
+    <StepFeatures key="f" state={state} set={set} onBack={() => go(5)} onNext={() => go(7)} />,
+    <StepFinish
+      key="r"
+      state={state}
+      onBack={() => go(6)}
+      onDone={(nextSteps, accountsAdded) => setDone({ nextSteps, accountsAdded })}
+    />,
+  ];
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-4 sm:p-8 font-sans flex items-center justify-center">
@@ -705,31 +954,36 @@ export default function OnboardingPage() {
 
         <Card className="p-6 sm:p-8">
           {done ? (
-            <StepDone name={state.name} nextSteps={done.nextSteps} accountsAdded={done.accountsAdded} />
+            <StepDone name={state.company.name} nextSteps={done.nextSteps} accountsAdded={done.accountsAdded} />
           ) : (
-            <>
-              {step === 1 && <StepWelcome onNext={() => go(2)} />}
-              {step === 2 && <StepCompany state={state} set={set} onBack={() => go(1)} onNext={() => go(3)} />}
-              {step === 3 && <StepBusiness state={state} set={set} onBack={() => go(2)} onNext={() => go(4)} />}
-              {step === 4 && <StepYear state={state} set={set} onBack={() => go(3)} onNext={() => go(5)} />}
-              {step === 5 && <StepFeatures state={state} set={set} onBack={() => go(4)} onNext={() => go(6)} />}
-              {step === 6 && (
-                <StepCreate
-                  state={state}
-                  onBack={() => go(5)}
-                  onDone={(nextSteps, accountsAdded) => setDone({ nextSteps, accountsAdded })}
-                />
-              )}
-            </>
+            steps[step - 1]
           )}
         </Card>
 
         {!done && (
-          <p className="text-center text-xs text-navy/30 mt-6">
-            Step {step} of {STEPS.length}
-          </p>
+          <div className="mt-6 flex items-center justify-between text-xs text-navy/40">
+            <span>
+              Step {step} of {STEPS.length}
+            </span>
+            <button
+              type="button"
+              onClick={skip}
+              disabled={skipping}
+              className="font-semibold text-navy/60 underline-offset-2 hover:text-electric hover:underline outline-none focus-visible:ring-2 focus-visible:ring-electric/50 rounded"
+            >
+              {skipping ? 'Skipping…' : rerun ? 'Close without changes' : 'Skip for now'}
+            </button>
+          </div>
         )}
       </div>
     </main>
+  );
+}
+
+export default function OnboardingPage() {
+  return (
+    <Suspense fallback={null}>
+      <Interview />
+    </Suspense>
   );
 }

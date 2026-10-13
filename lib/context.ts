@@ -16,6 +16,7 @@ import { getFileLockStatus } from '@/lib/services/fileLock';
 import { resolveAccess, PERMISSION_DENIED_PREFIX } from '@/lib/services/access';
 import { fullAccess, legacyRoleFor } from '@/lib/permissions/model';
 import { enforceRequestPermission, enforceSelfRoute } from '@/lib/permissions/enforce';
+import { enforceFeatureGate } from '@/lib/featureGate';
 import { companies, userCompanies, users } from '@/lib/db/schema';
 import { getSessionInfo, hasValidUnlockCookie } from '@/lib/auth';
 import { assertSessionAllowed } from '@/lib/services/sessions';
@@ -169,6 +170,8 @@ export async function getServerContext(): Promise<ServiceContext> {
       if (!resolved.active) throw new ServiceError('FORBIDDEN', DEACTIVATED_MESSAGE);
       const access = resolved.access;
       await enforceRequestPermission(access);
+      // Preferences feature switches: saves to a turned-off feature are refused (lib/featureGate.ts).
+      await enforceFeatureGate(db, companyId);
       // Legacy 4-level role, still read by the view-only guard in _base.ts and a few services.
       const role = legacyRoleFor(access, resolved.isOwner);
       // The closing-date password only unlocks closed periods for users whose roles allow
@@ -206,6 +209,7 @@ export async function getServerContext(): Promise<ServiceContext> {
   // an unmapped API route is refused even here.
   const access = fullAccess();
   await enforceRequestPermission(access);
+  await enforceFeatureGate(db, fb.companyId);
   const closingDateOverride = await resolveClosingDateOverride(db, fb.companyId);
   return {
     db,

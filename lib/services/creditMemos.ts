@@ -40,6 +40,7 @@
  * quantity from stock again.
  */
 import { isDepositTargetAccount } from '@/lib/accountTypes';
+import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -548,6 +549,7 @@ async function postCreditMemoDocument(
 }
 
 export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInput) {
+  await assertSalesTaxAllowed(ctx, input);
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   const prep = await prepareCreditMemo(ctx, input);
   const { subtotal, taxAmount, total } = prep;
@@ -1183,6 +1185,7 @@ export async function updateCreditMemo(
     .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.id, id)));
   if (!existing) throw notFound('Credit memo');
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided credit memo.');
+  await assertSalesTaxAllowed(ctx, input, [existing.taxRateId]);
 
   const prep = await prepareCreditMemo(ctx, input);
 

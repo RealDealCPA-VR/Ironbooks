@@ -35,7 +35,10 @@ export const myPreferencesSchema = z
     beepOnRecord: z.boolean(),
     autoDecimalPoint: z.boolean(),
     warnWhenEditing: z.boolean(),
-    warnWhenDeleting: z.boolean(),
+    // Always on: deleting or voiding always asks first (shown locked on the Preferences page).
+    warnWhenDeleting: z
+      .boolean()
+      .refine((v) => v === true, 'is always on: deleting or voiding always asks first, because it cannot be undone'),
     defaultDate: z.enum(['today', 'last']),
     autoRecallLastTransaction: z.boolean(),
     keepQuickBooksRunning: z.boolean(),

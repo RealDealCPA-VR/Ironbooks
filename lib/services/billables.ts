@@ -18,6 +18,7 @@
 import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import {
+  accounts,
   bills,
   billLines,
   customers,
@@ -34,6 +35,7 @@ import {
   validation,
 } from './_base';
 import { createInvoice, type CreateInvoiceInput, type InvoiceLineInput } from './invoices';
+import { getPreferences } from './company';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +51,8 @@ export interface UnbilledCost {
   description: string | null;
   amount: string;
   jobId: string | null;
+  /** The expense account the cost was recorded to (where the reimbursement goes by default). */
+  accountId?: string | null;
 }
 
 export interface UnbilledTime {
@@ -103,6 +107,7 @@ export async function listUnbilled(
       description: billLines.description,
       amount: billLines.amount,
       jobId: billLines.jobId,
+      accountId: billLines.accountId,
       date: bills.date,
       billNumber: bills.billNumber,
     })
@@ -125,6 +130,7 @@ export async function listUnbilled(
       description: expenseLines.description,
       amount: expenseLines.amount,
       jobId: expenseLines.jobId,
+      accountId: expenseLines.accountId,
       date: expenses.date,
       payeeName: expenses.payeeName,
       reference: expenses.reference,
@@ -195,6 +201,7 @@ export async function listUnbilled(
       description: r.description ?? null,
       amount: r.amount,
       jobId: r.jobId ?? null,
+      accountId: r.accountId ?? null,
     })),
     ...expenseRows.map((r) => ({
       id: r.id,
@@ -204,6 +211,7 @@ export async function listUnbilled(
       description: r.description ?? null,
       amount: r.amount,
       jobId: r.jobId ?? null,
+      accountId: r.accountId ?? null,
     })),
   ];
 
@@ -221,7 +229,8 @@ export async function listUnbilled(
  *
  * Cost lines intentionally carry NO itemId: the source item is a PURCHASE item
  * (re-attaching it would re-route income and, for inventory items, re-relieve
- * stock). Revenue lands on the default income account (4000).
+ * stock). Where the billed amount is credited follows the "Track reimbursed expenses as
+ * income" preference (reimbursementAccountResolver).
  */
 async function buildBillableLines(
   ctx: ServiceContext,
@@ -232,7 +241,9 @@ async function buildBillableLines(
   const costById = new Map(unbilled.costs.map((c) => [c.id, c]));
   const timeById = new Map(unbilled.time.map((t) => [t.id, t]));
 
-  const markup = Money.of(selection.markupPercent ?? 0);
+  const route = await reimbursementAccountResolver(ctx);
+  // Time & Expenses > "Default markup percentage" applies when the caller gives no markup.
+  const markup = Money.of(selection.markupPercent ?? route.defaultMarkupPercent ?? 0);
   if (markup.lessThan(0)) throw validation('Markup percent cannot be negative.');
 
   const lines: InvoiceLineInput[] = [];
@@ -242,14 +253,14 @@ async function buildBillableLines(
     if (!cost || cost.source !== 'bill') {
       throw new ServiceError('CONFLICT', `Bill line ${id} is not an unbilled billable cost for this customer.`);
     }
-    lines.push(costToLine(cost, markup));
+    lines.push(...costToLines(cost, markup, route));
   }
   for (const id of selection.expenseLineIds ?? []) {
     const cost = costById.get(id);
     if (!cost || cost.source !== 'expense') {
       throw new ServiceError('CONFLICT', `Expense line ${id} is not an unbilled billable cost for this customer.`);
     }
-    lines.push(costToLine(cost, markup));
+    lines.push(...costToLines(cost, markup, route));
   }
   for (const id of selection.timeEntryIds ?? []) {
     const t = timeById.get(id);
@@ -269,22 +280,92 @@ async function buildBillableLines(
   return lines;
 }
 
-function costToLine(cost: UnbilledCost, markupPercent: ReturnType<typeof Money.zero>): InvoiceLineInput {
-  const base = Money.of(cost.amount);
-  const marked = Money.round2(
-    base.plus(Money.mul(base, Money.div(markupPercent, 100))),
-  );
-  const markupNote = markupPercent.greaterThan(0)
-    ? ` (+${toAmountString(markupPercent)}% markup)`
-    : '';
-  return {
-    itemId: null,
-    description: `Billable ${cost.source === 'bill' ? 'cost' : 'expense'}: ${cost.description ?? cost.ref ?? 'reimbursable'}${markupNote}`,
-    quantity: 1,
-    rate: toAmountString(marked),
-    taxable: false,
-    jobId: cost.jobId,
-  };
+interface ReimbursementRouting {
+  /** Account the reimbursed COST is credited to. */
+  cost: (cost: UnbilledCost) => string | null;
+  /** Account the MARKUP is credited to (null = the default income account). */
+  markup: string | null;
+  defaultMarkupPercent: number;
+}
+
+/**
+ * QB Time & Expenses > 'Track reimbursed expenses as income'.
+ *  - Off (the QB default): the reimbursed COST is credited back to the expense account it was
+ *    recorded to, so that expense nets to zero for costs passed through at cost. This applies
+ *    only to expense / COGS accounts; a cost recorded to a balance-sheet account (e.g. 1300
+ *    Inventory Asset) is credited to the default income account instead.
+ *  - On: the cost is credited to an income account for reimbursements (the active income
+ *    account whose name mentions 'reimburs', e.g. 4130 Reimbursed Expenses Income), or the
+ *    default income account when there is none.
+ * Either way the MARKUP is income, never a reduction of expense: it goes to the active income
+ * account whose name mentions 'markup' (QB's Markup Income), or the default income account.
+ */
+async function reimbursementAccountResolver(ctx: ServiceContext): Promise<ReimbursementRouting> {
+  const prefs = await getPreferences(ctx);
+  const income = await ctx.db
+    .select({ id: accounts.id, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.type, 'revenue'), eq(accounts.isActive, true)));
+  const markup = income.find((a) => /markup/i.test(a.name))?.id ?? null;
+  const defaultMarkupPercent = Number(prefs.defaultMarkupPercent) || 0;
+  if (!prefs.trackReimbursedAsIncome) {
+    // Only an expense / cost-of-goods account can be netted back. A billable line recorded to a
+    // balance-sheet account (Inventory Asset on an Inventory Part line, a prepaid, fixed asset or
+    // liability) must NOT be credited: that would drain the asset without relieving stock and the
+    // GL would stop tying to the subledger. Those fall back to the default income account.
+    const expenseIds = new Set(
+      (
+        await ctx.db
+          .select({ id: accounts.id })
+          .from(accounts)
+          .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.type, 'expense')))
+      ).map((a) => a.id),
+    );
+    return {
+      cost: (cost) => (cost.accountId && expenseIds.has(cost.accountId) ? cost.accountId : null),
+      markup,
+      defaultMarkupPercent,
+    };
+  }
+  const reimbursed = income.find((a) => /reimburs/i.test(a.name))?.id ?? null;
+  return { cost: () => reimbursed, markup, defaultMarkupPercent };
+}
+
+/**
+ * One invoice line for the cost (at cost) plus, when there is a markup, a separate markup line
+ * (QB adds the markup as its own line credited to the markup account).
+ */
+function costToLines(
+  cost: UnbilledCost,
+  markupPercent: ReturnType<typeof Money.zero>,
+  route: ReimbursementRouting,
+): InvoiceLineInput[] {
+  const base = Money.round2(Money.of(cost.amount));
+  const what = cost.description ?? cost.ref ?? 'reimbursable';
+  const lines: InvoiceLineInput[] = [
+    {
+      itemId: null,
+      accountId: route.cost(cost),
+      description: `Billable ${cost.source === 'bill' ? 'cost' : 'expense'}: ${what}`,
+      quantity: 1,
+      rate: toAmountString(base),
+      taxable: false,
+      jobId: cost.jobId,
+    },
+  ];
+  const markupAmount = Money.round2(Money.mul(base, Money.div(markupPercent, 100)));
+  if (markupAmount.greaterThan(0)) {
+    lines.push({
+      itemId: null,
+      accountId: route.markup,
+      description: `Markup on ${what} (+${toAmountString(markupPercent)}% markup)`,
+      quantity: 1,
+      rate: toAmountString(markupAmount),
+      taxable: false,
+      jobId: cost.jobId,
+    });
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------

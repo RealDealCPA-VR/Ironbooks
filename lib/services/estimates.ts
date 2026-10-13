@@ -23,6 +23,7 @@ import {
   writeAudit,
 } from './_base';
 import { createInvoice } from './invoices';
+import { assertFeatureOn, assertSalesTaxAllowed } from '@/lib/featureGate';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
@@ -226,6 +227,7 @@ async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) 
 }
 
 export async function createEstimate(ctx: ServiceContext, input: CreateEstimateInput) {
+  await assertSalesTaxAllowed(ctx, input);
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   input = await applyCustomerShipToDefault(ctx, input);
   const { computedLines, subtotal, taxAmount, total } = await prepareEstimate(ctx, input);
@@ -509,6 +511,8 @@ export async function createProgressInvoice(
   estimateId: string,
   input: ProgressInvoiceInput,
 ) {
+  // Preferences > Jobs & Estimates 'Use progress invoicing'.
+  await assertFeatureOn(ctx, 'progressInvoicingEnabled');
   // Everything (estimate re-read, invoice creation, billing refresh) runs in ONE transaction so
   // concurrent progress bills see each other.
   return inTransaction(ctx, async (tx) => {
@@ -724,6 +728,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
       'This estimate has progress invoices against it, so its lines can no longer be changed.',
     );
   }
+  await assertSalesTaxAllowed(ctx, input, [existing.taxRateId]);
   const { computedLines, subtotal, taxAmount, total } = await prepareEstimate(ctx, input);
 
   return inTransaction(ctx, async (tx) => {

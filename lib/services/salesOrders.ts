@@ -34,6 +34,7 @@ import {
 } from './_base';
 import { createInvoice, shippingColumns } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 
@@ -169,6 +170,7 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
 }
 
 export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInput) {
+  await assertSalesTaxAllowed(ctx, input);
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   input = await applyCustomerShipToDefault(ctx, input);
   const { computedLines, subtotal, taxAmount, total } = await prepareSalesOrder(ctx, input);

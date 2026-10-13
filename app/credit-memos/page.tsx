@@ -50,6 +50,7 @@ import {
   useDocNumber,
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
+import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -196,6 +197,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memoNote, setMemoNote] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
+  const salesTaxOn = usePreferences().company.salesTaxEnabled;
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [flags, setFlags] = useState<ShippingState>(EMPTY_SHIPPING);
   const [applications, setApplications] = useState<CreditMemoDetail['applications']>([]);
@@ -576,7 +578,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
         </div>
 
         {/* Tax rate */}
-        <div>
+        {/* Hidden while "Charge sales tax" is off (QB removes tax from forms); an old document keeps its tax. */}
+        {(salesTaxOn || taxRateId) && (<div>
           <Label htmlFor="cm-taxrate">Sales Tax Rate</Label>
           <Select
             id="cm-taxrate"
@@ -590,7 +593,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
               </option>
             ))}
           </Select>
-        </div>
+        </div>)}
 
         {/* Memo note */}
         <div>

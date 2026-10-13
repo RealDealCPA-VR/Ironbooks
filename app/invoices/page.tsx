@@ -989,7 +989,8 @@ function InvoiceModal({
 
         {/* Tax rate + class */}
         <div className="grid grid-cols-2 gap-3">
-          <div>
+          {/* Hidden while "Charge sales tax" is off (QB removes tax from forms); an old document keeps its tax. */}
+          {(prefs.company.salesTaxEnabled || taxRateId) ? (<div>
             <Label htmlFor="inv-taxrate">Sales Tax</Label>
             <Select
               id="inv-taxrate"
@@ -1003,8 +1004,9 @@ function InvoiceModal({
                 </option>
               ))}
             </Select>
-          </div>
-          <div>
+          </div>) : <div />}
+          {/* Class fields are hidden while "Use class tracking" is off (QB); a saved class still shows. */}
+          {(prefs.company.classTrackingEnabled || classId) && (<div>
             <Label htmlFor="inv-class">Class <Help term="class" /></Label>
             <Select
               id="inv-class"
@@ -1016,7 +1018,7 @@ function InvoiceModal({
                 <option key={c.id} value={c.id}>{c.name}</option>
               ))}
             </Select>
-          </div>
+          </div>)}
         </div>
 
         {/* Shipping + print/email queue (wave2 sales) */}

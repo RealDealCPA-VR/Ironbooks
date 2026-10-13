@@ -185,6 +185,7 @@ export const navGroups: NavGroup[] = [
       { icon: Network, label: 'Privacy & Network', path: '/privacy' },
       { icon: Users, label: 'Multi-user', path: '/multi-user' },
       { icon: Settings, label: 'Settings', path: '/settings' },
+      { icon: ClipboardCheck, label: 'Setup Interview', path: '/onboarding' }, // P1 setup: run it again
       { icon: ListChecks, label: 'Document Numbers', path: '/doc-numbers' }, // wave2 foundation
       { icon: LayoutTemplate, label: 'Form Templates', path: '/templates' },
       { icon: Sparkles, label: 'AI & Automation', path: '/ai-settings' },

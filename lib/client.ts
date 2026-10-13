@@ -186,6 +186,30 @@ function mutateHeaders(opts?: MutateOpts, hasBody?: boolean): Record<string, str
   return headers;
 }
 
+// ---- Preferences write hooks (P1 setup: My Preferences / date warnings, lib/prefBehaviors.ts) ----
+
+export interface WriteInfo {
+  method: 'POST' | 'PATCH' | 'PUT' | 'DELETE';
+  /** Pathname of the request URL. */
+  path: string;
+  body: unknown;
+}
+export interface WriteHooks {
+  /** Return false to cancel the save (the call rejects with code CANCELLED). */
+  before?: (info: WriteInfo) => boolean | Promise<boolean>;
+  /** Called after a successful save. */
+  after?: (info: WriteInfo, data: unknown) => void;
+}
+let writeHooks: WriteHooks | null = null;
+
+/** Register (or clear) the app-wide write hooks. Mounted once by components/PreferenceBehaviors. */
+export function setWriteHooks(hooks: WriteHooks | null): void {
+  writeHooks = hooks;
+}
+
+/** Code of the error thrown when a write hook cancels a save. */
+export const CANCELLED_CODE = 'CANCELLED';
+
 /**
  * Run a mutating request; on PERIOD_CLOSED, ask the registered prompt for the closing-date
  * password and retry exactly once. Explicitly supplied passwords are never re-prompted.
@@ -196,6 +220,10 @@ async function mutate<T>(
   body: unknown,
   opts?: MutateOpts,
 ): Promise<T> {
+  const info: WriteInfo = { method, path: pathOf(url), body };
+  if (writeHooks?.before && !(await writeHooks.before(info))) {
+    throw new ApiError(0, 'Not saved. Nothing was changed.', CANCELLED_CODE);
+  }
   const hasBody = body !== undefined;
   const version = versionFor(method, url);
   const run = (o?: MutateOpts) => {
@@ -210,6 +238,11 @@ async function mutate<T>(
       .then((data) => {
         // The saved record's new version (or forget it, so the next save isn't a false 409).
         if (version) rememberVersions(url, data);
+        try {
+          writeHooks?.after?.(info, data);
+        } catch {
+          /* a preference side effect (beep, remembered date) must never fail a save */
+        }
         return data;
       });
   };

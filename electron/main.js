@@ -405,8 +405,8 @@ function waitForServer(port, timeoutMs = 20000) {
 }
 
 // New Company: always ask for a name + location (a Save dialog), create the folder, seed a
-// manifest, and relaunch into the fresh (empty) file — onboarding then sets up the chart of
-// accounts. The "file" is a self-contained folder the user can place anywhere (incl. a server
+// manifest, and relaunch into the fresh (empty) file. The relaunch opens Create Account
+// (startRoute below), which then runs the setup interview (/onboarding) for the new company. The "file" is a self-contained folder the user can place anywhere (incl. a server
 // or network drive).
 async function createCompanyFlow() {
   const res = await dialog.showSaveDialog(mainWindow, {
@@ -434,6 +434,8 @@ async function createCompanyFlow() {
     return;
   }
   companyFile.writeManifest(target, { name, createdAt: new Date().toISOString() });
+  // First page of the new file: create its first user, then the setup interview.
+  saveConfig({ startRoute: '/signup' });
   openCompanyDir(target);
 }
 
@@ -772,6 +774,8 @@ function buildMenu() {
     {
       label: 'Help',
       submenu: [
+        { label: 'Run Setup Interview…', click: () => navigate('/onboarding') },
+        { type: 'separator' },
         { label: 'BookKeeper AI on the web', click: () => shell.openExternal('https://github.com/') },
         { label: 'About', click: () => dialog.showMessageBox(mainWindow, { message: 'BookKeeper AI', detail: 'Open-source desktop accounting with AI error correction.' }) },
       ],
@@ -849,7 +853,10 @@ async function createWindow() {
     return; // no local server: skip local-only chores (backups, recurring, hosting, updates)
   }
 
-  await mainWindow.loadURL(url);
+  // A just-created company file opens on Create Account -> setup interview (one-shot).
+  const startRoute = loadConfig().startRoute;
+  if (typeof startRoute === 'string' && startRoute.startsWith('/')) saveConfig({ startRoute: null });
+  await mainWindow.loadURL(typeof startRoute === 'string' && startRoute.startsWith('/') ? url + startRoute : url);
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
   // Ensure the active file is self-describing (manifest) and stamp its last-opened time.
   const activeDir = activeCompanyDir();

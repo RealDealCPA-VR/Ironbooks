@@ -205,17 +205,22 @@ export interface CompanyPreferences {
   // Multiple Currencies
   multiCurrencyEnabled: boolean;
   // Payroll
+  /** QB Payroll & Employees "Full payroll" vs "No payroll": off hides pay runs and payroll forms. */
+  payrollEnabled: boolean;
   payrollPayPeriod: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly';
   payrollStandardHours: number;
   payrollExpenseAccountId: string | null;
   payrollLiabilityAccountId: string | null;
 }
 
+// Feature switches default to ON (class tracking, progress invoicing and units of measure too) so
+// company files from before these switches were enforced keep working; the setup interview asks
+// each question and saves an explicit on/off for new companies.
 export const DEFAULT_COMPANY_PREFERENCES: CompanyPreferences = {
   accountNumbersEnabled: true,
   requireAccountNumbers: false,
   requireAccounts: true,
-  classTrackingEnabled: false,
+  classTrackingEnabled: true,
   warnUnassignedClass: false,
   autoAssignJeNumbers: true,
   warnPastDatesEnabled: true,
@@ -232,14 +237,14 @@ export const DEFAULT_COMPANY_PREFERENCES: CompanyPreferences = {
   currency: 'USD',
   fiscalYearEnd: '12-31',
   estimatesEnabled: true,
-  progressInvoicingEnabled: false,
+  progressInvoicingEnabled: true,
   warnDuplicateEstimateNumbers: true,
   dontPrintZeroAmountItems: false,
   inventoryEnabled: true,
   purchaseOrdersEnabled: true,
   warnDuplicatePoNumbers: true,
   negativeStockWarning: true,
-  unitsOfMeasureEnabled: false,
+  unitsOfMeasureEnabled: true,
   autoApplyPayments: true,
   autoCalculatePayments: true,
   useUndepositedFunds: true,
@@ -267,6 +272,7 @@ export const DEFAULT_COMPANY_PREFERENCES: CompanyPreferences = {
   trackReimbursedAsIncome: false,
   defaultMarkupPercent: 0,
   multiCurrencyEnabled: false,
+  payrollEnabled: true,
   payrollPayPeriod: 'biweekly',
   payrollStandardHours: 40,
   payrollExpenseAccountId: null,
@@ -284,6 +290,10 @@ export interface MyPreferences {
   /** 'today' | 'last' — default date for new transactions. */
   defaultDate: 'today' | 'last';
   autoRecallLastTransaction: boolean;
+  /**
+   * QB "Keep QuickBooks running for quick startups". Deliberate no-op: the desktop app has no
+   * background process to keep alive, so the option is not offered on the Preferences page.
+   */
   keepQuickBooksRunning: boolean;
   // Reminders
   showRemindersAtStartup: boolean;
@@ -473,6 +483,7 @@ export const PREFERENCE_CATEGORIES: Array<{
     id: 'payroll',
     label: 'Payroll & Employees',
     company: [
+      'payrollEnabled',
       'payrollPayPeriod',
       'payrollStandardHours',
       'payrollExpenseAccountId',
@@ -539,11 +550,14 @@ export function resolveCompanyPreferences(settings: unknown): CompanyPreferences
   if (!TERMS_VALUES.includes(prefs.defaultCustomerTerms)) prefs.defaultCustomerTerms = 'net_30';
   if (!TERMS_VALUES.includes(prefs.defaultVendorTerms)) prefs.defaultVendorTerms = 'net_30';
   if (prefs.reportBasis !== 'cash') prefs.reportBasis = 'accrual';
+  // Always on (lib/preferenceFields.ts `fixed`): every line needs an account so the books balance.
+  prefs.requireAccounts = true;
   return prefs;
 }
 
 export function resolveMyPreferences(stored: unknown): MyPreferences {
-  return overlay(DEFAULT_MY_PREFERENCES, stored);
+  // warnWhenDeleting is always on (lib/preferenceFields.ts `fixed`): deleting/voiding always asks.
+  return { ...overlay(DEFAULT_MY_PREFERENCES, stored), warnWhenDeleting: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -615,43 +629,203 @@ export function transactionDateWarning(
   return null;
 }
 
+/** On/off feature preferences that hide menus and block their pages and saves when off. */
+export type FeatureKey =
+  | 'estimatesEnabled'
+  | 'salesOrdersEnabled'
+  | 'purchaseOrdersEnabled'
+  | 'inventoryEnabled'
+  | 'timeTrackingEnabled'
+  | 'salesTaxEnabled'
+  | 'classTrackingEnabled'
+  | 'priceLevelsEnabled'
+  | 'unitsOfMeasureEnabled'
+  | 'payrollEnabled';
+
+export interface FeatureGate {
+  key: FeatureKey;
+  /** Plain name, used in "<label> are turned off…". */
+  label: string;
+  /** The Preferences category and checkbox that turn it back on. */
+  category: string;
+  setting: string;
+  /** Pages hidden from the menus and replaced by a "turned off" message. */
+  pages: string[];
+  /** API prefixes whose saves (POST/PUT/PATCH/DELETE) are refused while the feature is off. */
+  apis: string[];
+}
+
 /**
- * Pages QB hides from its menus while a feature is turned off in Preferences (Jobs & Estimates,
- * Sales & Customers, Items & Inventory, Time & Expenses, Sales Tax).
- * Cosmetic only: the pages and APIs keep working, and existing records stay intact.
+ * QB Preferences feature switches (Jobs & Estimates, Sales & Customers, Items & Inventory,
+ * Time & Expenses, Sales Tax, Accounting). While one is off, QB removes its menus and forms:
+ * here its pages are hidden from the menus and show a plain "turned off" message, and its APIs
+ * refuse to save (reads keep working, so existing records stay visible in reports). Existing
+ * records are never changed. Multiple Currencies is not gated here (QB never lets it be turned
+ * off once used; the Currencies page is where it is set up).
  */
-export function featureHiddenPaths(
-  prefs: Pick<
-    CompanyPreferences,
-    | 'estimatesEnabled'
-    | 'salesOrdersEnabled'
-    | 'purchaseOrdersEnabled'
-    | 'inventoryEnabled'
-    | 'timeTrackingEnabled'
-    | 'salesTaxEnabled'
-  >,
-): Set<string> {
+export const FEATURE_GATES: FeatureGate[] = [
+  {
+    key: 'estimatesEnabled',
+    label: 'Estimates',
+    category: 'Jobs & Estimates',
+    setting: 'Use estimates',
+    pages: ['/estimates', '/estimates-followup'],
+    apis: ['/api/estimates'],
+  },
+  {
+    key: 'salesOrdersEnabled',
+    label: 'Sales orders',
+    category: 'Sales & Customers',
+    setting: 'Use sales orders',
+    pages: ['/sales-orders', '/so-fulfillment'],
+    apis: ['/api/sales-orders', '/api/fulfillment'],
+  },
+  {
+    key: 'purchaseOrdersEnabled',
+    label: 'Purchase orders',
+    category: 'Items & Inventory',
+    setting: 'Use purchase orders',
+    pages: ['/purchase-orders', '/item-receipts', '/receive-bill'],
+    apis: [
+      '/api/purchase-orders',
+      '/api/receiving/po',
+      '/api/receiving/bill',
+      '/api/item-receipts',
+      '/api/inventory/reorder/create-po',
+    ],
+  },
+  {
+    key: 'inventoryEnabled',
+    label: 'Inventory features',
+    category: 'Items & Inventory',
+    setting: 'Track inventory',
+    pages: [
+      '/assemblies',
+      '/inventory-ops',
+      '/fifo',
+      '/inventory-sites',
+      '/inventory-transfers',
+      '/landed-cost',
+      '/reports/inventory-valuation',
+      '/reports/inventory-sites',
+    ],
+    apis: [
+      '/api/assemblies',
+      '/api/inventory',
+      '/api/fifo',
+      '/api/inventory-sites',
+      '/api/inventory-transfers',
+      '/api/landed-cost',
+    ],
+  },
+  {
+    key: 'timeTrackingEnabled',
+    label: 'Time tracking',
+    category: 'Time & Expenses',
+    setting: 'Track time',
+    pages: ['/time-tracking'],
+    apis: ['/api/time-entries'],
+  },
+  {
+    key: 'salesTaxEnabled',
+    label: 'Sales tax',
+    category: 'Sales Tax',
+    setting: 'Charge sales tax',
+    pages: ['/sales-tax-components'],
+    apis: ['/api/tax-rates', '/api/tax-agencies'],
+  },
+  {
+    key: 'classTrackingEnabled',
+    label: 'Class tracking',
+    category: 'Accounting',
+    setting: 'Use class tracking',
+    pages: [],
+    apis: ['/api/classes'],
+  },
+  {
+    key: 'priceLevelsEnabled',
+    label: 'Price levels',
+    category: 'Sales & Customers',
+    setting: 'Use price levels',
+    pages: [],
+    apis: ['/api/pricing/levels'],
+  },
+  {
+    key: 'unitsOfMeasureEnabled',
+    label: 'Units of measure',
+    category: 'Items & Inventory',
+    setting: 'Use units of measure',
+    pages: ['/lists/uom'],
+    apis: ['/api/uom-sets'],
+  },
+  {
+    key: 'payrollEnabled',
+    label: 'Payroll',
+    category: 'Payroll & Employees',
+    setting: 'Full payroll',
+    // The Employee list itself stays (QB keeps the Employee Center with "No payroll").
+    pages: ['/pay-runs', '/pay-stubs', '/pay-liabilities', '/payroll-tax', '/payroll-forms'],
+    apis: ['/api/payroll', '/api/pay-liabilities', '/api/payroll-items'],
+  },
+];
+
+const underPrefix = (path: string, prefix: string) => path === prefix || path.startsWith(prefix + '/');
+
+/** The feature gate a page path belongs to (longest page prefix wins), or null. */
+export function featureGateForPage(path: string): FeatureGate | null {
+  let best: { gate: FeatureGate; len: number } | null = null;
+  for (const gate of FEATURE_GATES) {
+    for (const p of gate.pages) {
+      if (underPrefix(path, p) && (!best || p.length > best.len)) best = { gate, len: p.length };
+    }
+  }
+  return best?.gate ?? null;
+}
+
+/** Every feature gate an API path belongs to (a path can need more than one feature). */
+export function featureGatesForApi(path: string): FeatureGate[] {
+  return FEATURE_GATES.filter((gate) => gate.apis.some((p) => underPrefix(path, p)));
+}
+
+/** The first feature gate an API path belongs to, or null. */
+export function featureGateForApi(path: string): FeatureGate | null {
+  return featureGatesForApi(path)[0] ?? null;
+}
+
+/**
+ * The gate that blocks `path` for these preferences right now (page or API), or null. Every
+ * matching gate is checked: e.g. "create purchase orders from the reorder list" needs both
+ * inventory and purchase orders.
+ */
+export function blockingFeatureGate(
+  path: string,
+  prefs: Pick<CompanyPreferences, FeatureKey>,
+  method: string = 'GET',
+): FeatureGate | null {
+  const isApi = path === '/api' || path.startsWith('/api/');
+  if (isApi && method.toUpperCase() === 'GET') return null;
+  if (!isApi) {
+    const gate = featureGateForPage(path);
+    return gate && prefs[gate.key] === false ? gate : null;
+  }
+  return featureGatesForApi(path).find((g) => prefs[g.key] === false) ?? null;
+}
+
+/** Plain-language "turned off" message (also matched by lib/friendlyErrors.ts). */
+export function featureOffMessage(gate: Pick<FeatureGate, 'label' | 'category' | 'setting'>): string {
+  return `${gate.label} ${/s$/i.test(gate.label) ? 'are' : 'is'} turned off for this company. To use ${/s$/i.test(gate.label) ? 'them' : 'it'}, an administrator can turn on "${gate.setting}" in Settings > Preferences > ${gate.category}.`;
+}
+
+/**
+ * Pages QB hides from its menus while a feature is turned off in Preferences. The same pages
+ * show a "turned off" message (components/AppShell.tsx) and their APIs refuse to save
+ * (lib/featureGate.ts, called by getServerContext).
+ */
+export function featureHiddenPaths(prefs: Pick<CompanyPreferences, FeatureKey>): Set<string> {
   const hidden = new Set<string>();
-  const add = (on: boolean, paths: string[]) => {
-    if (!on) for (const p of paths) hidden.add(p);
-  };
-  add(prefs.estimatesEnabled, ['/estimates', '/estimates-followup']);
-  add(prefs.salesOrdersEnabled, ['/sales-orders', '/so-fulfillment']);
-  add(prefs.purchaseOrdersEnabled, ['/purchase-orders', '/item-receipts', '/receive-bill']);
-  add(prefs.inventoryEnabled, [
-    '/assemblies',
-    '/inventory-ops',
-    '/fifo',
-    '/inventory-sites',
-    '/inventory-transfers',
-    '/landed-cost',
-    '/reports/inventory-valuation',
-    '/reports/inventory-sites',
-  ]);
-  add(prefs.timeTrackingEnabled, ['/time-tracking']);
-  // Multiple Currencies stays visible: the Currencies page is where it is set up, and QB never
-  // lets it be turned back off once foreign-currency records exist.
-  add(prefs.salesTaxEnabled, ['/sales-tax-components']);
+  for (const gate of FEATURE_GATES) {
+    if (prefs[gate.key] === false) for (const p of gate.pages) hidden.add(p);
+  }
   return hidden;
 }
 

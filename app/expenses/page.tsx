@@ -389,7 +389,8 @@ function ExpensesPageContent() {
     }
     // Preferences > Checking: "Autofill payee account number / last account used" gates the
     // last-transaction / learned suggestions (the vendor's own pre-fill accounts always apply).
-    if (!prefs.company.autofillPayeeAccount) return;
+    // My Preferences > General 'Recall the last transaction for a name' must be on too.
+    if (!prefs.company.autofillPayeeAccount || !prefs.my.autoRecallLastTransaction) return;
     const pf = await fetchVendorPrefill(q);
     if (!pf) return;
     setLines((prev) => {
@@ -747,7 +748,8 @@ function ExpensesPageContent() {
             <span>Account</span>
             <span>Description</span>
             <span>Amount</span>
-            <span>Class</span>
+            {/* Class fields are hidden while "Use class tracking" is off (QB); a saved class still shows. */}
+            <span>{prefs.company.classTrackingEnabled ? 'Class' : ''}</span>
             <span>Billable Customer</span>
             <span />
           </div>
@@ -818,17 +820,21 @@ function ExpensesPageContent() {
                   />
                 )}
 
-                <Select
-                  value={line.classId}
-                  onChange={(e) => updateLine(idx, 'classId', e.target.value)}
-                >
-                  <option value="">Class…</option>
-                  {classes.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </Select>
+                {prefs.company.classTrackingEnabled || line.classId ? (
+                  <Select
+                    value={line.classId}
+                    onChange={(e) => updateLine(idx, 'classId', e.target.value)}
+                  >
+                    <option value="">Class…</option>
+                    {classes.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </Select>
+                ) : (
+                  <span />
+                )}
 
                 <Select
                   value={line.customerId}

@@ -7,7 +7,9 @@ import AssistantPanel from './AssistantPanel';
 import { filterNavGroups, navGroups, paletteDestinations } from '@/lib/nav';
 import { useMe } from '@/lib/usePermissions';
 import { usePreferences } from '@/lib/usePreferences';
-import { featureHiddenPaths } from '@/lib/preferences';
+import { blockingFeatureGate, featureHiddenPaths } from '@/lib/preferences';
+import FeatureOff from './FeatureOff';
+import PreferenceBehaviors from './PreferenceBehaviors';
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
@@ -288,8 +290,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const [company, setCompany] = React.useState<CompanyRow | null>(null);
   // Users & Roles: hide sidebar entries the user's roles can't use (cosmetic; server enforces).
   const { me } = useMe(!bare);
-  // Preferences: features turned off (estimates, sales orders, POs, inventory, time, currencies,
-  // sales tax) drop out of the sidebar like QB's menus. Cosmetic; pages still work.
+  // Preferences: features turned off (estimates, sales orders, POs, inventory, time, sales tax,
+  // units of measure) drop out of the sidebar like QB's menus, their pages show a plain
+  // 'turned off' message, and the server refuses their saves (lib/featureGate.ts).
   const prefs = usePreferences(!bare);
   const hiddenPaths = React.useMemo(() => featureHiddenPaths(prefs.company), [prefs.company]);
   const visibleGroups = React.useMemo(
@@ -299,6 +302,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         .filter((g) => g.links.length > 0),
     [me?.permissions, hiddenPaths],
   );
+  const blockedGate = prefs.loaded ? blockingFeatureGate(pathname, prefs.company) : null;
   const [assistantOpen, setAssistantOpen] = React.useState(false);
   const closeAssistant = React.useCallback(() => setAssistantOpen(false), []);
 
@@ -384,11 +388,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </button>
           <CompanyChip company={company} onCompany={setCompany} />
         </header>
-        {children}
+        {blockedGate ? <FeatureOff gate={blockedGate} /> : children}
       </main>
       <CommandPalette />
       <AssistantPanel open={assistantOpen} onClose={closeAssistant} />
       <GlobalShortcuts />
+      <PreferenceBehaviors />
       <TitleSync company={company?.name ?? null} />
     </div>
   );
