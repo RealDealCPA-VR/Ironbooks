@@ -90,6 +90,11 @@ export function openDb(dataDir?: string): DbHandle {
 
   const handle: DbHandle = { client, db, migrated: Promise.resolve(), damage: null };
   handle.migrated = (async () => {
+    // PGlite's session time zone follows the host (e.g. Etc/GMT+5), so now() / defaultNow()
+    // wrote local wall-clock time into `timestamp` columns, which drizzle reads back as UTC —
+    // every DB-stamped time came back hours early (and a day early just after midnight).
+    // PGlite is a single session, so this holds for every query on the handle.
+    await client.exec("SET TIME ZONE 'UTC'");
     // Only migrate if a migrations folder has been generated. In early dev before
     // `db:generate`, callers can use db:push instead.
     if (fs.existsSync(MIGRATIONS_FOLDER)) {
