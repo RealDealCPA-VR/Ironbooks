@@ -38,6 +38,11 @@ function siteFields(body: Record<string, unknown>) {
     serialNumbers: Array.isArray(body.serialNumbers) ? body.serialNumbers.map(String) : null,
     lotNumber: typeof body.lotNumber === 'string' ? body.lotNumber : null,
     lotExpiration: typeof body.lotExpiration === 'string' ? new Date(body.lotExpiration) : null,
+    // p1 purchases: QB Adjustment Account, Class and Customer:Job.
+    adjustmentAccountId: typeof body.adjustmentAccountId === 'string' && body.adjustmentAccountId ? body.adjustmentAccountId : null,
+    classId: typeof body.classId === 'string' && body.classId ? body.classId : null,
+    customerId: typeof body.customerId === 'string' && body.customerId ? body.customerId : null,
+    jobId: typeof body.jobId === 'string' && body.jobId ? body.jobId : null,
   };
 }
 
@@ -130,6 +135,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         date: new Date(date),
         memo: memo ?? null,
         costing: 'fifo',
+        purpose: 'cogs',
       });
 
       return NextResponse.json(result, { status: 201 });

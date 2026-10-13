@@ -24,6 +24,16 @@
  *     repeats date / payee / amount / memo for the checkbook register).
  *   - `offset`: per-company alignment nudge in inches ({ x: right+, y: up+ }) applied to the
  *     whole page, so pre-printed check stock lines up with the printer.
+ *
+ * p1 purchases — check paper (`stock`):
+ *   - 'preprinted' (default, QB behaviour): the bank's check paper already carries the borders,
+ *     labels ("Pay to the Order of", "Dollars", "Memo"), the signature line, the check number and
+ *     the MICR line. Only the variable fields are printed — date, payee, numeric amount, amount in
+ *     words, memo — at the QB voucher / standard / wallet field positions (PREPRINTED_FIELDS),
+ *     shifted by the saved alignment offsets; voucher stubs get the detail lines.
+ *   - 'blank': the full check layout above (border, labels, amount box) on plain paper. No MICR
+ *     line is printed: real MICR needs the bank routing/account numbers and a MICR E-13B font,
+ *     which are not available, and a fake one would be rejected by the bank.
  */
 
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
@@ -147,12 +157,40 @@ export interface CheckPdfData {
   voucher?: VoucherLine[];
   /** Check style (default 'voucher'). */
   style?: CheckStyle;
+  /** Check paper (default 'preprinted' — print only the variable fields). */
+  stock?: CheckStock;
   /** Printer alignment nudge in inches (positive x = right, positive y = up). */
   offset?: { x?: number | string | null; y?: number | string | null };
 }
 
 export type CheckStyle = 'voucher' | 'standard' | 'wallet';
 export const CHECK_STYLES: CheckStyle[] = ['voucher', 'standard', 'wallet'];
+export type CheckStock = 'preprinted' | 'blank';
+export const CHECK_STOCKS: CheckStock[] = ['preprinted', 'blank'];
+
+/**
+ * Where QB prints each variable field on pre-printed check paper, in inches from the top-left
+ * corner of the check itself (one check = the top 3.5" of a Letter sheet; wallet checks sit
+ * right of a 2.25" register stub and are 6.25" wide). `amountRight` / `dateX` are measured from
+ * the check's right edge so the same table serves the narrower wallet check.
+ */
+export const PREPRINTED_FIELDS = {
+  /** Date: left edge, measured from the check's RIGHT edge. */
+  dateFromRight: 1.85,
+  dateTop: 0.82,
+  payeeX: 0.95,
+  payeeTop: 1.32,
+  /** Numeric amount: right edge, measured from the check's RIGHT edge. */
+  amountFromRight: 0.45,
+  amountTop: 1.32,
+  wordsX: 0.35,
+  wordsTop: 1.68,
+  memoX: 0.55,
+  memoTop: 2.72,
+  /** Voucher stubs start 3.5" and 7" from the top of the sheet. */
+  stubTops: [3.5, 7.0],
+  walletStubWidth: 2.25,
+} as const;
 /** Largest alignment nudge accepted (inches). */
 export const MAX_CHECK_OFFSET_IN = 1;
 
@@ -231,6 +269,96 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
     const { size = 10, font = regular, color = C_BLACK, rightAlign = false } = opts;
     const drawX = rightAlign ? x - font.widthOfTextAtSize(s, size) : x;
     page.drawText(s, { x: drawX, y, font, size, color });
+  }
+
+  /** Voucher detail (payee / number / date header, lines, total) from `top` down to `bottom`. */
+  function drawVoucher(top: number, bottom: number) {
+    if (!data.voucher || data.voucher.length === 0) return;
+    const VL = PAGE_ML;
+    let vy = top;
+    text('VOUCHER', VL, vy, { font: bold, size: 10, color: C_NAVY });
+    const headRight =
+      `${data.payee}` +
+      (data.checkNumber != null && String(data.checkNumber).trim() !== ''
+        ? `  —  Check #${data.checkNumber}`
+        : '') +
+      `  —  ${data.date}`;
+    text(headRight, MR, vy, { size: 8, color: C_GRAY, rightAlign: true });
+    vy -= 8;
+    hRule(vy, VL, MR, 0.75, C_NAVY);
+    vy -= 14;
+
+    const AMT_X = MR;
+    const DESC_X = VL + (MR - VL) * 0.45;
+    text('Account', VL, vy, { font: bold, size: 8, color: C_GRAY });
+    text('Description', DESC_X, vy, { font: bold, size: 8, color: C_GRAY });
+    text('Amount', AMT_X, vy, { font: bold, size: 8, color: C_GRAY, rightAlign: true });
+    vy -= 6;
+    hRule(vy, VL, MR, 0.5, C_LIGHT);
+    vy -= 12;
+
+    let voucherTotal = Money.zero();
+    for (const line of data.voucher) {
+      if (vy < bottom + 18) break; // never run off the stub
+      text(line.account.slice(0, 48), VL, vy, { size: 9, color: C_BLACK });
+      if (line.description) {
+        text(line.description.slice(0, 40), DESC_X, vy, { size: 9, color: C_GRAY });
+      }
+      const amtDisplay = fmtAmount(line.amount);
+      if (amtDisplay !== null) voucherTotal = voucherTotal.plus(Money.of(line.amount));
+      text(amtDisplay ?? line.amount, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
+      vy -= 14;
+    }
+
+    hRule(vy + 6, DESC_X, MR, 0.5, C_LIGHT);
+    text('Total', DESC_X, vy - 4, { font: bold, size: 9, color: C_NAVY });
+    text(fmtAmount(voucherTotal.toFixed(2)) ?? '0.00', AMT_X, vy - 4, {
+      font: bold,
+      size: 9,
+      color: C_NAVY,
+      rightAlign: true,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Pre-printed check paper: only the variable fields (QB default)
+  // -------------------------------------------------------------------------
+
+  const stock: CheckStock = data.stock === 'blank' ? 'blank' : 'preprinted';
+  if (stock === 'preprinted') {
+    const F = PREPRINTED_FIELDS;
+    const IN = 72;
+    const left = style === 'wallet' ? F.walletStubWidth * IN : 0;
+    const right = PAGE_W;
+    const y = (inchesFromTop: number) => PAGE_H - inchesFromTop * IN;
+    const words = data.amountWords ?? numberToWords(data.amountNumeric);
+    const amount = fmtAmount(data.amountNumeric) ?? data.amountNumeric;
+
+    text(data.date, right - F.dateFromRight * IN, y(F.dateTop), { size: 10 });
+    text(data.payee, left + F.payeeX * IN, y(F.payeeTop), { size: 10 });
+    // QB fills the amount field with asterisks so nothing can be added in front of it.
+    text(`**${amount}`, right - F.amountFromRight * IN, y(F.amountTop), { size: 10, rightAlign: true });
+    const maxWordsW = right - F.amountFromRight * IN - (left + F.wordsX * IN);
+    let wordsLine = `${words}*****`;
+    while (wordsLine.length < 160 && regular.widthOfTextAtSize(`${wordsLine}*`, 10) < maxWordsW) wordsLine += '*';
+    text(wordsLine, left + F.wordsX * IN, y(F.wordsTop), { size: 10 });
+    if (data.memo) text(data.memo.slice(0, 60), left + F.memoX * IN, y(F.memoTop), { size: 9 });
+
+    if (style === 'wallet') {
+      // Register stub values (labels are printed on the stub already).
+      const sx = 0.3 * IN;
+      let sy = y(0.82);
+      for (const v of [data.date, data.payee, amount, data.memo ?? '']) {
+        let s = v;
+        while (s.length > 0 && regular.widthOfTextAtSize(s, 9) > (F.walletStubWidth - 0.5) * IN) s = s.slice(0, -1);
+        if (s) text(s, sx, sy, { size: 9 });
+        sy -= 0.4 * IN;
+      }
+    }
+    if (style === 'voucher') {
+      for (const top of F.stubTops) drawVoucher(y(top) - 24, y(top + 3.5) + 12);
+    }
+    return pdfDoc.save();
   }
 
   // -------------------------------------------------------------------------
@@ -375,19 +503,8 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
 
   cursor -= 30;
 
-  // -------------------------------------------------------------------------
-  // MICR area (decorative — shows the routing/account number zone)
-  // -------------------------------------------------------------------------
-
-  const MICR_Y = CHECK_BOTTOM + 10;
-  hRule(MICR_Y + 18, ML, MR, 0.5, C_LIGHT);
-  hRule(MICR_Y, ML, MR, 0.5, C_LIGHT);
-
-  // Plain ASCII: the standard Helvetica (WinAnsi) font cannot encode the MICR symbols.
-  text('|: ROUTING |:  ACCOUNT  |:  CHECK#', ML + 4, MICR_Y + 5, {
-    size: 7,
-    color: C_LIGHT,
-  });
+  // No MICR line: real MICR needs the bank routing / account numbers and a MICR E-13B font
+  // (neither is available), and a fake one only gets the check rejected.
 
   // -------------------------------------------------------------------------
   // Footer stub — "NOT NEGOTIABLE / VOID IF NOT USED WITHIN 90 DAYS"
@@ -438,54 +555,7 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
     if (data.memo) stub('Memo', data.memo);
   }
 
-  if (style === 'voucher' && data.voucher && data.voucher.length > 0) {
-    let vy = STUB_Y - 36;
-
-    text('VOUCHER', ML, vy, { font: bold, size: 10, color: C_NAVY });
-    const headRight =
-      `${data.payee}` +
-      (data.checkNumber != null && String(data.checkNumber).trim() !== ''
-        ? `  —  Check #${data.checkNumber}`
-        : '') +
-      `  —  ${data.date}`;
-    text(headRight, MR, vy, { size: 8, color: C_GRAY, rightAlign: true });
-    vy -= 8;
-    hRule(vy, ML, MR, 0.75, C_NAVY);
-    vy -= 14;
-
-    // Column headers
-    const AMT_X = MR;
-    const DESC_X = ML + (MR - ML) * 0.45;
-    text('Account', ML, vy, { font: bold, size: 8, color: C_GRAY });
-    text('Description', DESC_X, vy, { font: bold, size: 8, color: C_GRAY });
-    text('Amount', AMT_X, vy, { font: bold, size: 8, color: C_GRAY, rightAlign: true });
-    vy -= 6;
-    hRule(vy, ML, MR, 0.5, C_LIGHT);
-    vy -= 12;
-
-    let voucherTotal = Money.zero();
-    for (const line of data.voucher) {
-      if (vy < 48) break; // never run off the page
-      text(line.account.slice(0, 48), ML, vy, { size: 9, color: C_BLACK });
-      if (line.description) {
-        text(line.description.slice(0, 40), DESC_X, vy, { size: 9, color: C_GRAY });
-      }
-      const amtDisplay = fmtAmount(line.amount);
-      if (amtDisplay !== null) voucherTotal = voucherTotal.plus(Money.of(line.amount));
-      const amtDisplayOrRaw = amtDisplay ?? line.amount;
-      text(amtDisplayOrRaw, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
-      vy -= 14;
-    }
-
-    hRule(vy + 6, DESC_X, MR, 0.5, C_LIGHT);
-    text('Total', DESC_X, vy - 4, { font: bold, size: 9, color: C_NAVY });
-    text(
-      fmtAmount(voucherTotal.toFixed(2)) ?? '0.00',
-      AMT_X,
-      vy - 4,
-      { font: bold, size: 9, color: C_NAVY, rightAlign: true },
-    );
-  }
+  if (style === 'voucher') drawVoucher(STUB_Y - 36, 30);
 
   // -------------------------------------------------------------------------
   // Finalize

@@ -12,13 +12,43 @@
  * reduced when the credit was posted; the application is a bookkeeping memo only.
  *
  * Voiding calls voidJournalEntry and flips the document status to 'void'.
+ *
+ * p1 purchases — QB Enter Bills (Credit) parity:
+ *   - Ref. No. (the vendor's credit memo number) on the credit and its journal entry reference.
+ *   - Expenses AND Items tabs. Returning inventory to the vendor takes the units out of stock at
+ *     their CURRENT cost (average cost, or the oldest FIFO layers) and credits the inventory asset
+ *     with that cost; any difference between what the vendor credits and that cost goes to Cost of
+ *     Goods Sold ("return price difference"), so the inventory value always equals the stock
+ *     subledger. Non-inventory / service items credit the item's expense account.
+ *   - Class and Customer:Job on every line (Class also on the journal line).
+ *   - Voiding (or a ledger-changing edit) puts the returned stock back at the cost it left with.
  */
 
 import { isDepositTargetAccount } from '@/lib/accountTypes';
-import { and, asc, desc, eq } from 'drizzle-orm';
-import { accounts, bills, vendorCredits, vendorCreditLines, vendors } from '@/lib/db/schema';
+import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import type Decimal from 'decimal.js';
+import {
+  accounts,
+  bills,
+  classes,
+  customers,
+  inventoryLayers,
+  items,
+  jobs,
+  vendorCredits,
+  vendorCreditLines,
+  vendors,
+} from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
+import {
+  type PostingLine,
+  assertNotControlLineAccount,
+  postJournalEntry,
+  voidJournalEntry,
+} from '@/lib/services/posting';
+import { receivePurchasedStock } from './bills';
+import { takeFromLayers } from './fifo';
+import { postDocumentInventory, reverseDocumentInventory } from './inventorySites';
 import { planPostedEdit, retitleEntry } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import {
@@ -35,17 +65,30 @@ import {
 // ---------------------------------------------------------------------------
 
 export interface VendorCreditLineInput {
-  /** GL account to credit (typically an expense or asset account). */
-  accountId: string;
+  /** Expenses tab: GL account to credit (expense or asset). Items tab: optional override for a
+   * non-inventory item's account. */
+  accountId?: string | null;
+  /** Items tab: the item returned / credited. Inventory items leave stock at cost. */
+  itemId?: string | null;
+  /** Items tab: units returned (> 0). */
+  quantity?: string | number | null;
+  /** Items tab: cost per unit the vendor credits (amount = quantity x unitCost when no amount). */
+  unitCost?: string | number | null;
   description?: string | null;
-  /** The dollar amount for this line (must be > 0). */
-  amount: string | number;
+  /** Line amount the vendor credits (> 0). Required on Expenses-tab lines. */
+  amount?: string | number | null;
+  classId?: string | null;
+  /** Customer:Job the credit relates to (job costing). */
+  customerId?: string | null;
+  jobId?: string | null;
 }
 
 export interface CreateVendorCreditInput {
   vendorId: string;
   date: Date;
   memo?: string | null;
+  /** The vendor's credit memo number (QB "Ref. No."). */
+  refNumber?: string | null;
   lines: VendorCreditLineInput[];
 }
 
@@ -73,6 +116,324 @@ async function resolveApAccount(ctx: ServiceContext): Promise<string> {
     );
   }
   return row.id;
+}
+
+async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
+  const [row] = await ctx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
+  if (!row) throw notFound(`Account with code ${code}`);
+  return row.id;
+}
+
+/** One validated vendor-credit line. */
+interface PreparedLine {
+  /** Account credited: the item's inventory asset for inventory returns. */
+  accountId: string;
+  itemId: string | null;
+  isInventory: boolean;
+  quantity: Decimal | null;
+  unitCost: string | null;
+  /** What the vendor credits for this line (2dp). */
+  amount: string;
+  description: string | null;
+  classId: string | null;
+  customerId: string | null;
+  jobId: string | null;
+}
+
+/**
+ * Validate the lines (Expenses and Items tabs) and resolve each line's account. Items tab:
+ * inventory items credit their inventory asset account (stock leaves at cost — see
+ * relieveReturnedStock); other items credit line.accountId ?? item.expenseAccountId.
+ */
+async function prepareLines(
+  ctx: ServiceContext,
+  lines: VendorCreditLineInput[],
+): Promise<{ lines: PreparedLine[]; total: Decimal }> {
+  if (!lines || lines.length === 0) throw validation('A vendor credit must have at least one line.');
+  const itemIds = [...new Set(lines.map((l) => l.itemId).filter((x): x is string => Boolean(x)))];
+  const itemRows = itemIds.length
+    ? await ctx.db
+        .select()
+        .from(items)
+        .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)))
+    : [];
+  const itemById = new Map(itemRows.map((i) => [i.id, i] as const));
+  let inventoryDefault: string | null = null;
+  let total = Money.zero();
+  const out: PreparedLine[] = [];
+  for (const [i, l] of lines.entries()) {
+    const n = i + 1;
+    const dims = { classId: l.classId ?? null, customerId: l.customerId ?? null, jobId: l.jobId ?? null };
+    if (l.itemId) {
+      const item = itemById.get(l.itemId);
+      if (!item) throw notFound(`Item on line ${n}`);
+      let qty: Decimal;
+      try {
+        qty = Money.of(l.quantity ?? 0);
+      } catch {
+        throw validation(`Line ${n}: quantity is not a number.`);
+      }
+      if (!qty.greaterThan(0)) throw validation(`Line ${n}: enter the quantity returned.`);
+      if (l.amount == null && l.unitCost == null) throw validation(`Line ${n}: enter a cost or an amount for "${item.name}".`);
+      const amount = l.amount != null ? Money.round2(l.amount) : Money.round2(qty.times(Money.of(l.unitCost!)));
+      if (!amount.greaterThan(0)) throw validation(`Line ${n}: the amount must be greater than zero.`);
+      const unitCost = l.unitCost != null ? Money.of(l.unitCost) : amount.dividedBy(qty);
+      const isInventory = item.type === 'inventory';
+      let accountId: string;
+      if (isInventory) {
+        accountId = item.assetAccountId ?? (inventoryDefault ??= await accountIdByCode(ctx, '1300'));
+      } else {
+        const routed = l.accountId ?? item.expenseAccountId;
+        if (!routed) {
+          throw validation(`Line ${n}: "${item.name}" has no expense account. Set one on the item or pick an account.`);
+        }
+        accountId = routed;
+      }
+      out.push({
+        accountId,
+        itemId: item.id,
+        isInventory,
+        quantity: qty,
+        unitCost: unitCost.toFixed(4),
+        amount: toAmountString(amount),
+        description: l.description?.trim() || item.name,
+        ...dims,
+      });
+      total = total.plus(amount);
+    } else {
+      if (!l.accountId) throw validation(`Line ${n}: pick an account or an item.`);
+      let amt: Decimal;
+      try {
+        amt = Money.round2(l.amount ?? 0);
+      } catch {
+        throw validation(`Line ${n}: amount is not a number.`);
+      }
+      if (!amt.greaterThan(0)) throw validation(`Line ${n}: amount must be greater than zero.`);
+      out.push({
+        accountId: l.accountId,
+        itemId: null,
+        isInventory: false,
+        quantity: null,
+        unitCost: null,
+        amount: toAmountString(amt),
+        description: l.description ?? null,
+        ...dims,
+      });
+      total = total.plus(amt);
+    }
+  }
+
+  // Line accounts: owned by the company, never A/R / A/P (QB lists neither on a form line).
+  const acctIds = [...new Set(out.map((l) => l.accountId))];
+  const acctRows = await ctx.db
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, acctIds)));
+  const acctById = new Map(acctRows.map((a) => [a.id, a] as const));
+  out.forEach((l, i) => {
+    const a = acctById.get(l.accountId);
+    if (!a) throw notFound(`Account on line ${i + 1}`);
+    assertNotControlLineAccount(a, `Line ${i + 1}`);
+  });
+
+  // Class / customer / job belong to this company; a job must belong to the line's customer.
+  const ids = (k: 'classId' | 'customerId' | 'jobId') => [...new Set(out.map((l) => l[k]).filter((x): x is string => Boolean(x)))];
+  const classIds = ids('classId');
+  if (classIds.length) {
+    const rows = await ctx.db.select({ id: classes.id }).from(classes).where(and(eq(classes.companyId, ctx.companyId), inArray(classes.id, classIds)));
+    if (rows.length !== classIds.length) throw notFound('Class');
+  }
+  const customerIds = ids('customerId');
+  if (customerIds.length) {
+    const rows = await ctx.db.select({ id: customers.id }).from(customers).where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, customerIds)));
+    if (rows.length !== customerIds.length) throw notFound('Customer');
+  }
+  const jobIds = ids('jobId');
+  if (jobIds.length) {
+    const rows = await ctx.db
+      .select({ id: jobs.id, customerId: jobs.customerId })
+      .from(jobs)
+      .where(and(eq(jobs.companyId, ctx.companyId), inArray(jobs.id, jobIds)));
+    if (rows.length !== jobIds.length) throw notFound('Job');
+    const jobCustomer = new Map(rows.map((r) => [r.id, r.customerId] as const));
+    for (const l of out) {
+      if (!l.jobId) continue;
+      const jc = jobCustomer.get(l.jobId) ?? null;
+      if (l.customerId && jc && jc !== l.customerId) throw validation('A job on the credit belongs to a different customer.');
+      if (!l.customerId) l.customerId = jc;
+    }
+  }
+  return { lines: out, total: Money.round2(total) };
+}
+
+/**
+ * Take returned units out of stock at their CURRENT cost (average cost, or the oldest FIFO
+ * layers), like an inventory decrease. Returns the cost relieved (2dp). Returning more than is on
+ * hand is refused.
+ */
+async function relieveReturnedStock(
+  tx: ServiceContext,
+  itemId: string,
+  qty: Decimal,
+  reason: string,
+): Promise<Decimal> {
+  const [item] = await tx.db
+    .select()
+    .from(items)
+    .where(and(eq(items.companyId, tx.companyId), eq(items.id, itemId)));
+  if (!item) throw notFound('Item');
+  const onHand = Money.of(item.quantityOnHand ?? '0');
+  if (qty.greaterThan(onHand)) {
+    throw validation(
+      `You are returning ${qty.toFixed(2)} of "${item.name}" but only ${onHand.toFixed(2)} are on hand.`,
+    );
+  }
+  const [layer] = await tx.db
+    .select({ id: inventoryLayers.id })
+    .from(inventoryLayers)
+    .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, itemId)))
+    .limit(1);
+  const cost = layer
+    ? (await takeFromLayers(tx, itemId, qty)).cost
+    : Money.round2(qty.times(Money.of(item.averageCost ?? '0')));
+  const newQty = onHand.minus(qty);
+  await tx.db
+    .update(items)
+    .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
+    .where(eq(items.id, itemId));
+  await writeAudit(tx, {
+    action: 'update',
+    entityType: 'item',
+    entityId: itemId,
+    oldValues: { quantityOnHand: item.quantityOnHand },
+    newValues: { quantityOnHand: newQty.toFixed(4), returnedCost: toAmountString(cost), reason },
+  });
+  return cost;
+}
+
+/** Relieve stock for every inventory line; returns the cost per line index. */
+async function relieveCreditStock(
+  tx: ServiceContext,
+  creditId: string,
+  date: Date,
+  prep: PreparedLine[],
+): Promise<Map<number, Decimal>> {
+  const costs = new Map<number, Decimal>();
+  for (const [i, l] of prep.entries()) {
+    if (!l.isInventory || !l.itemId || !l.quantity) continue;
+    costs.set(i, await relieveReturnedStock(tx, l.itemId, l.quantity, `vendor_credit:${creditId}`));
+  }
+  if (costs.size > 0) {
+    await postDocumentInventory(tx, {
+      sourceType: 'vendor_credit',
+      sourceId: creditId,
+      date,
+      direction: 'out',
+      lines: prep.map((l, idx) => ({
+        lineOrder: idx,
+        itemId: l.isInventory ? l.itemId : null,
+        quantity: l.quantity ? l.quantity.toFixed(4) : '0',
+      })),
+      memo: 'Returned to vendor',
+    });
+  }
+  return costs;
+}
+
+/** Put the stock a saved credit returned back on hand at the cost it left with (void / edit). */
+async function restoreCreditStock(tx: ServiceContext, credit: typeof vendorCredits.$inferSelect) {
+  const saved = await tx.db
+    .select()
+    .from(vendorCreditLines)
+    .where(eq(vendorCreditLines.vendorCreditId, credit.id));
+  const inv = saved.filter((l) => l.itemId && l.costAmount != null && l.quantity != null && Money.gt(l.quantity, 0));
+  if (inv.length === 0) return;
+  await receivePurchasedStock(
+    tx,
+    `vendor_credit:${credit.id}`,
+    credit.date,
+    inv.map((l) => ({
+      itemId: l.itemId,
+      isInventory: true,
+      quantity: Money.of(l.quantity!).toFixed(4),
+      unitCost: Money.of(l.costAmount!).dividedBy(Money.of(l.quantity!)),
+    })),
+    `vendor_credit_reversed:${credit.id}`,
+  );
+  await reverseDocumentInventory(tx, 'vendor_credit', credit.id);
+}
+
+/**
+ * The credit's journal lines:
+ *   Dr A/P                                   total (the credit's own control line)
+ *   Cr each Expenses-tab line account        line amount (with Class)
+ *   Cr Inventory asset                       cost of returned units (Items tab, inventory)
+ *   Cr / Dr Cost of Goods Sold               returned-price difference (credit amount − cost)
+ *   Cr other item's account                  line amount (non-inventory / service items)
+ */
+function postingLinesFor(
+  creditId: string,
+  apAccountId: string,
+  cogsAccountId: string | null,
+  prep: PreparedLine[],
+  total: Decimal,
+  costs: Map<number, Decimal>,
+): PostingLine[] {
+  const out: PostingLine[] = [
+    { accountId: apAccountId, debit: toAmountString(total), memo: `Vendor credit ${creditId}`, controlLine: true },
+  ];
+  prep.forEach((l, i) => {
+    const cost = costs.get(i);
+    if (!l.isInventory || cost === undefined) {
+      out.push({ accountId: l.accountId, credit: l.amount, memo: l.description, classId: l.classId });
+      return;
+    }
+    if (cost.greaterThan(0)) {
+      out.push({ accountId: l.accountId, credit: toAmountString(cost), memo: l.description, classId: l.classId });
+    }
+    const diff = Money.round2(Money.of(l.amount).minus(cost));
+    if (!diff.isZero()) {
+      out.push({
+        accountId: cogsAccountId!,
+        ...(diff.greaterThan(0) ? { credit: toAmountString(diff) } : { debit: toAmountString(diff.abs()) }),
+        memo: `Return price difference — ${l.description ?? 'item'}`,
+        classId: l.classId,
+      });
+    }
+  });
+  return out;
+}
+
+function lineRowsFor(creditId: string, prep: PreparedLine[], costs: Map<number, Decimal>) {
+  return prep.map((l, idx) => ({
+    vendorCreditId: creditId,
+    accountId: l.accountId,
+    description: l.description,
+    amount: l.amount,
+    lineOrder: idx,
+    itemId: l.itemId,
+    quantity: l.quantity ? l.quantity.toFixed(4) : null,
+    unitCost: l.unitCost,
+    costAmount: costs.has(idx) ? toAmountString(costs.get(idx)!) : null,
+    classId: l.classId,
+    customerId: l.customerId,
+    jobId: l.jobId,
+  }));
+}
+
+/** Ledger signature of a set of lines (account, item, qty, amount, class) — order-sensitive. */
+function lineSignature(
+  rows: Array<{ accountId: string; itemId: string | null; quantity: string | Decimal | null; amount: string; classId: string | null }>,
+): string {
+  return rows
+    .map(
+      (r) =>
+        `${r.accountId}|${r.itemId ?? ''}|${r.quantity == null ? '' : Money.of(r.quantity).toFixed(4)}|${Money.round2(r.amount).toFixed(2)}|${r.classId ?? ''}`,
+    )
+    .join(';');
 }
 
 // ---------------------------------------------------------------------------
@@ -114,23 +475,10 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
   if (!vendor) throw notFound('Vendor');
   await assertHomeCurrencyVendor(ctx, input.vendorId);
 
-  // Validate lines.
-  if (!input.lines || input.lines.length === 0) {
-    throw validation('A vendor credit must have at least one line.');
-  }
-
-  let total = Money.zero();
-  for (const [i, line] of input.lines.entries()) {
-    const amt = Money.of(line.amount);
-    if (!amt.greaterThan(0)) {
-      throw validation(`Line ${i + 1}: amount must be greater than zero.`);
-    }
-    total = total.plus(amt);
-  }
+  const { lines: prep, total } = await prepareLines(ctx, input.lines);
   const totalStr = toAmountString(total);
-
-  // Resolve A/P before opening the transaction.
   const apAccountId = await resolveApAccount(ctx);
+  const cogsAccountId = prep.some((l) => l.isInventory) ? await accountIdByCode(ctx, '5000') : null;
 
   return inTransaction(ctx, async (tx) => {
     // 1) Insert the vendor credit header.
@@ -141,54 +489,29 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
         vendorId: input.vendorId,
         date: input.date,
         memo: input.memo ?? null,
+        refNumber: input.refNumber?.trim() || null,
         status: 'open',
         total: totalStr,
         unapplied: totalStr,
       })
       .returning();
 
-    // 2) Insert lines.
-    await tx.db.insert(vendorCreditLines).values(
-      input.lines.map((line, idx) => ({
-        vendorCreditId: credit.id,
-        accountId: line.accountId,
-        description: line.description ?? null,
-        amount: toAmountString(line.amount),
-        lineOrder: idx,
-      })),
-    );
+    // 2) Returned items leave stock at their current cost.
+    const costs = await relieveCreditStock(tx, credit.id, input.date, prep);
 
-    // 3) Build and post the GL entry.
-    //
-    //   Dr  2000 Accounts Payable   total   (reduces A/P liability — Dr on liability = decrease)
-    //   Cr  <expense account>       each line amount
-    //
-    // Debits == Credits because sum(line amounts) = total.
+    // 3) Lines.
+    await tx.db.insert(vendorCreditLines).values(lineRowsFor(credit.id, prep, costs));
 
-    const postingLines = [
-      // Debit A/P to reduce the liability.
-      {
-        accountId: apAccountId,
-        debit: totalStr,
-        memo: `Vendor credit ${credit.id}`,
-        controlLine: true,
-      },
-      // Credit each expense/asset account for its line amount.
-      ...input.lines.map((line) => ({
-        accountId: line.accountId,
-        credit: toAmountString(line.amount),
-        memo: line.description ?? null,
-      })),
-    ];
-
+    // 4) Post: Dr A/P total / Cr line accounts (inventory at cost, price difference to COGS).
     const entry = await postJournalEntry(tx, {
       date: input.date,
       description: `Vendor Credit — ${vendor.name}`,
+      reference: input.refNumber?.trim() || null,
       sourceRef: `vendor_credit:${credit.id}`,
-      lines: postingLines,
+      lines: postingLinesFor(credit.id, apAccountId, cogsAccountId, prep, total, costs),
     });
 
-    // 4) Stamp postedEntryId.
+    // 5) Stamp postedEntryId.
     const [updated] = await tx.db
       .update(vendorCredits)
       .set({ postedEntryId: entry.id })
@@ -199,7 +522,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
       action: 'create',
       entityType: 'vendor_credit',
       entityId: credit.id,
-      newValues: { ...updated, linesCount: input.lines.length, total: totalStr },
+      newValues: { ...updated, linesCount: prep.length, total: totalStr },
     });
 
     return updated;
@@ -211,10 +534,11 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
 // ---------------------------------------------------------------------------
 
 /**
- * Edit a saved vendor credit in ONE transaction. A ledger-neutral edit (memo, line
- * descriptions — same date, accounts and amounts) keeps the journal entry. Changing amounts,
- * accounts, the vendor or the date voids the entry and re-posts it; that is only allowed while
- * nothing of the credit has been applied to a bill or refunded (unapply first, like QB).
+ * Edit a saved vendor credit in ONE transaction. A ledger-neutral edit (memo, Ref. No., line
+ * descriptions, Customer:Job — same date, vendor, accounts, items, quantities, amounts and
+ * classes) keeps the journal entry. Anything else voids the entry and re-posts it (returned stock
+ * goes back on hand and is taken out again); that is only allowed while nothing of the credit has
+ * been applied to a bill or refunded (unapply first, like QB).
  */
 export async function updateVendorCredit(ctx: ServiceContext, id: string, input: CreateVendorCreditInput) {
   const [existing] = await ctx.db
@@ -230,27 +554,11 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
   await assertHomeCurrencyVendor(ctx, input.vendorId);
-  if (!input.lines || input.lines.length === 0) {
-    throw validation('A vendor credit must have at least one line.');
-  }
-  let total = Money.zero();
-  for (const [i, line] of input.lines.entries()) {
-    const amt = Money.of(line.amount);
-    if (!amt.greaterThan(0)) throw validation(`Line ${i + 1}: amount must be greater than zero.`);
-    total = total.plus(amt);
-  }
+  const { lines: prep, total } = await prepareLines(ctx, input.lines);
   const totalStr = toAmountString(total);
   const apAccountId = await resolveApAccount(ctx);
-
-  const postingLines = [
-    // The credit's own A/P line (posting.ts PostingLine.controlLine).
-    { accountId: apAccountId, debit: totalStr, memo: `Vendor credit ${id}`, controlLine: true },
-    ...input.lines.map((line) => ({
-      accountId: line.accountId,
-      credit: toAmountString(line.amount),
-      memo: line.description ?? null,
-    })),
-  ];
+  const cogsAccountId = prep.some((l) => l.isInventory) ? await accountIdByCode(ctx, '5000') : null;
+  const refNumber = input.refNumber?.trim() || null;
 
   return inTransaction(ctx, async (tx) => {
     const [cur] = await tx.db.select().from(vendorCredits).where(eq(vendorCredits.id, id));
@@ -261,23 +569,35 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
       .where(eq(vendorCreditLines.vendorCreditId, id))
       .orderBy(asc(vendorCreditLines.lineOrder));
 
-    let plan = await planPostedEdit(tx, { entryId: cur.postedEntryId, date: input.date, lines: postingLines, what: 'vendor credit' });
-    if (plan === 'unchanged' && cur.vendorId !== input.vendorId) plan = 'repost';
+    const hasItems = oldLines.some((l) => l.itemId) || prep.some((l) => l.itemId);
+    let plan: 'unchanged' | 'repost';
+    if (hasItems) {
+      const same =
+        cur.vendorId === input.vendorId &&
+        new Date(cur.date).toISOString().slice(0, 10) === new Date(input.date).toISOString().slice(0, 10) &&
+        lineSignature(oldLines) === lineSignature(prep);
+      plan = same ? 'unchanged' : 'repost';
+    } else {
+      plan = await planPostedEdit(tx, {
+        entryId: cur.postedEntryId,
+        date: input.date,
+        lines: postingLinesFor(id, apAccountId, cogsAccountId, prep, total, new Map()),
+        what: 'vendor credit',
+      });
+      if (plan === 'unchanged' && cur.vendorId !== input.vendorId) plan = 'repost';
+    }
 
     let entryId = cur.postedEntryId;
     if (plan === 'unchanged') {
-      await tx.db.update(vendorCredits).set({ memo: input.memo ?? null }).where(eq(vendorCredits.id, id));
+      // Keep the entry and the stock; carry each line's relieved cost forward.
+      const costs = new Map<number, Decimal>();
+      oldLines.forEach((l, i) => {
+        if (l.costAmount != null) costs.set(i, Money.of(l.costAmount));
+      });
+      await tx.db.update(vendorCredits).set({ memo: input.memo ?? null, refNumber }).where(eq(vendorCredits.id, id));
       await tx.db.delete(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, id));
-      await tx.db.insert(vendorCreditLines).values(
-        input.lines.map((line, idx) => ({
-          vendorCreditId: id,
-          accountId: line.accountId,
-          description: line.description ?? null,
-          amount: toAmountString(line.amount),
-          lineOrder: idx,
-        })),
-      );
-      await retitleEntry(tx, entryId, { description: `Vendor Credit — ${vendor.name}` });
+      await tx.db.insert(vendorCreditLines).values(lineRowsFor(id, prep, costs));
+      await retitleEntry(tx, entryId, { description: `Vendor Credit — ${vendor.name}`, reference: refNumber });
     } else {
       const used = Money.of(cur.total).minus(Money.of(cur.unapplied));
       if (used.greaterThan(0) || Money.of(cur.refundedAmount).greaterThan(0)) {
@@ -287,21 +607,16 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
         );
       }
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
+      await restoreCreditStock(tx, cur);
       await tx.db.delete(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, id));
-      await tx.db.insert(vendorCreditLines).values(
-        input.lines.map((line, idx) => ({
-          vendorCreditId: id,
-          accountId: line.accountId,
-          description: line.description ?? null,
-          amount: toAmountString(line.amount),
-          lineOrder: idx,
-        })),
-      );
+      const costs = await relieveCreditStock(tx, id, input.date, prep);
+      await tx.db.insert(vendorCreditLines).values(lineRowsFor(id, prep, costs));
       const entry = await postJournalEntry(tx, {
         date: input.date,
         description: `Vendor Credit — ${vendor.name}`,
+        reference: refNumber,
         sourceRef: `vendor_credit:${id}`,
-        lines: postingLines,
+        lines: postingLinesFor(id, apAccountId, cogsAccountId, prep, total, costs),
       });
       entryId = entry.id;
       await tx.db
@@ -310,6 +625,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
           vendorId: input.vendorId,
           date: input.date,
           memo: input.memo ?? null,
+          refNumber,
           total: totalStr,
           unapplied: totalStr,
           status: 'open',
@@ -327,14 +643,22 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
         vendorId: cur.vendorId,
         date: cur.date,
         memo: cur.memo,
+        refNumber: cur.refNumber,
         total: cur.total,
         postedEntryId: cur.postedEntryId,
-        lines: oldLines.map((l) => ({ accountId: l.accountId, amount: l.amount, description: l.description })),
+        lines: oldLines.map((l) => ({
+          accountId: l.accountId,
+          itemId: l.itemId,
+          quantity: l.quantity,
+          amount: l.amount,
+          description: l.description,
+        })),
       },
       newValues: {
         vendorId: input.vendorId,
         date: input.date,
         memo: input.memo ?? null,
+        refNumber,
         total: updated.total,
         ledger: plan === 'unchanged' ? 'unchanged' : 'reposted',
         postedEntryId: entryId,
@@ -773,6 +1097,8 @@ export async function voidVendorCredit(ctx: ServiceContext, id: string) {
     if (credit.postedEntryId) {
       await voidJournalEntry(tx, credit.postedEntryId);
     }
+    // Returned items come back on hand at the cost they left with.
+    await restoreCreditStock(tx, credit);
 
     const [updated] = await tx.db
       .update(vendorCredits)

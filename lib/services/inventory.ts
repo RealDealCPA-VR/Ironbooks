@@ -2,13 +2,17 @@
  * Inventory service — adjustments, COGS recording, valuation, and low-stock queries.
  *
  * GL impact for inventory events:
- *   Receive stock (qty+):
+ *   Adjust quantity up (qty+) — QB Adjust Quantity/Value on Hand:
  *     Dr 1300 Inventory Asset      qty * unitCost
- *     Cr 3000 Owner's Equity       qty * unitCost   (opening/adjustment offset)
+ *     Cr Adjustment Account        qty * unitCost
  *
- *   Remove stock / write-off (qty-):
- *     Dr 5000 COGS                 qty * averageCost
+ *   Adjust quantity down / write-off (qty-):
+ *     Dr Adjustment Account        qty * averageCost
  *     Cr 1300 Inventory Asset      qty * averageCost
+ *
+ *   p1 purchases: the Adjustment Account is the user's pick (QB requires one); it defaults to
+ *   "Inventory Adjustments" (an expense account, created when missing). The adjustment line
+ *   carries the Class and the Customer:Job (as the line's Name). Equity is never the offset.
  *
  *   recordCOGS (triggered by sales):
  *     Dr 5000 COGS                 qty * averageCost
@@ -21,6 +25,9 @@ import Decimal from 'decimal.js';
 import {
   items,
   accounts,
+  classes,
+  customers,
+  jobs,
   inventoryLayers,
   salesOrders,
   salesOrderLines,
@@ -56,7 +63,114 @@ export async function assertNotFifoTracked(ctx: ServiceContext, itemId: string):
     );
   }
 }
-import { postJournalEntry } from './posting';
+import { assertNotControlLineAccount, postJournalEntry } from './posting';
+
+// ---------------------------------------------------------------------------
+// Adjustment Account / Class / Customer:Job (QB Adjust Quantity/Value on Hand) — p1 purchases
+// ---------------------------------------------------------------------------
+
+/** QB's default adjustment account name. */
+export const INVENTORY_ADJUSTMENTS_ACCOUNT_NAME = 'Inventory Adjustments';
+
+/** Optional QB adjustment fields shared by the average-cost and FIFO adjustment paths. */
+export interface AdjustmentDimensions {
+  /** Offset account; default "Inventory Adjustments" (expense, created when missing). */
+  adjustmentAccountId?: string | null;
+  classId?: string | null;
+  /** Customer (or the job's customer) — the adjustment line's Name, for job costing. */
+  customerId?: string | null;
+  jobId?: string | null;
+}
+
+/**
+ * Get-or-create the "Inventory Adjustments" expense account (QB's default Adjustment Account).
+ * An existing account with that name is reused; otherwise one is created with the first free
+ * code from 5950.
+ */
+export async function ensureInventoryAdjustmentAccount(ctx: ServiceContext): Promise<string> {
+  const rows = await ctx.db
+    .select({ id: accounts.id, name: accounts.name, code: accounts.code, type: accounts.type })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const existing = rows.find(
+    (r) => r.type === 'expense' && r.name.trim().toLowerCase() === INVENTORY_ADJUSTMENTS_ACCOUNT_NAME.toLowerCase(),
+  );
+  if (existing) return existing.id;
+  const used = new Set(rows.map((r) => r.code));
+  let code = 5950;
+  while (used.has(String(code))) code++;
+  return inTransaction(ctx, async (tx) => {
+    const [created] = await tx.db
+      .insert(accounts)
+      .values({
+        companyId: tx.companyId,
+        code: String(code),
+        name: INVENTORY_ADJUSTMENTS_ACCOUNT_NAME,
+        type: 'expense',
+        subtype: 'cost_of_goods_sold',
+        balance: '0',
+      })
+      .returning();
+    await writeAudit(tx, { action: 'create', entityType: 'account', entityId: created.id, newValues: created });
+    return created.id;
+  });
+}
+
+/**
+ * The adjustment account to post to: the user's pick (must belong to the company, not be A/R /
+ * A/P and not be an inventory asset), else the default "Inventory Adjustments".
+ */
+export async function resolveAdjustmentAccount(ctx: ServiceContext, accountId?: string | null): Promise<string> {
+  if (!accountId) return ensureInventoryAdjustmentAccount(ctx);
+  const [acct] = await ctx.db
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, accountId)));
+  if (!acct) throw notFound('Adjustment account');
+  assertNotControlLineAccount(acct, 'Adjustment account');
+  if (acct.type === 'asset' && acct.subtype === 'inventory') {
+    throw validation(`"${acct.name}" is an inventory asset account. Pick the account the adjustment is charged to, such as Inventory Adjustments.`);
+  }
+  return acct.id;
+}
+
+/** Validate Class / Customer:Job and return them as posting-line fields for the adjustment line. */
+export async function adjustmentPostingFields(
+  ctx: ServiceContext,
+  dims: AdjustmentDimensions,
+): Promise<{ classId?: string; entityType?: 'customer'; entityId?: string }> {
+  const out: { classId?: string; entityType?: 'customer'; entityId?: string } = {};
+  if (dims.classId) {
+    const [c] = await ctx.db
+      .select({ id: classes.id })
+      .from(classes)
+      .where(and(eq(classes.companyId, ctx.companyId), eq(classes.id, dims.classId)));
+    if (!c) throw notFound('Class');
+    out.classId = c.id;
+  }
+  let customerId = dims.customerId ?? null;
+  if (dims.jobId) {
+    const [j] = await ctx.db
+      .select({ id: jobs.id, customerId: jobs.customerId })
+      .from(jobs)
+      .where(and(eq(jobs.companyId, ctx.companyId), eq(jobs.id, dims.jobId)));
+    if (!j) throw notFound('Job');
+    if (customerId && j.customerId && j.customerId !== customerId) {
+      throw validation('That job belongs to a different customer.');
+    }
+    customerId = customerId ?? j.customerId;
+  }
+  if (customerId) {
+    const [c] = await ctx.db
+      .select({ id: customers.id })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
+    if (!c) throw notFound('Customer');
+    out.entityType = 'customer';
+    out.entityId = c.id;
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -146,7 +260,7 @@ export async function setReorderPoint(
 // adjustInventory
 // ---------------------------------------------------------------------------
 
-export interface AdjustInventoryInput {
+export interface AdjustInventoryInput extends AdjustmentDimensions {
   itemId: string;
   /** Positive = receiving stock; negative = removing/writing off stock. */
   quantityChange: string | number;
@@ -215,33 +329,45 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
     // Resolve GL accounts
     // Inventory Asset is either item.assetAccountId or code 1300
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
-    const cogsAccountId = await accountIdByCode(tx, '5000');
-    const offsetAccountId = await accountIdByCode(tx, '3000'); // Owner's Equity as adjustment offset
+    // QB Adjust Quantity/Value on Hand: the user's Adjustment Account (default Inventory
+    // Adjustments) offsets the inventory change, with Class and Customer:Job on that line.
+    const offsetAccountId = await resolveAdjustmentAccount(tx, input.adjustmentAccountId);
+    const dims = await adjustmentPostingFields(tx, input);
 
     // Build posting lines
-    let postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string | null }>;
+    let postingLines: Array<{
+      accountId: string;
+      debit?: string;
+      credit?: string;
+      memo?: string | null;
+      classId?: string;
+      entityType?: 'customer';
+      entityId?: string;
+    }>;
 
     if (qtyChange.greaterThan(0)) {
-      // Dr Inventory Asset, Cr Owner's Equity (adjustment/opening offset)
+      // Dr Inventory Asset, Cr Adjustment Account
       postingLines = [
         {
           accountId: inventoryAccountId,
           debit: toAmountString(glAmount),
-          memo: input.memo ?? 'Inventory receipt',
+          memo: input.memo ?? 'Inventory adjustment',
         },
         {
           accountId: offsetAccountId,
           credit: toAmountString(glAmount),
-          memo: input.memo ?? 'Inventory receipt offset',
+          memo: input.memo ?? 'Inventory adjustment',
+          ...dims,
         },
       ];
     } else {
-      // Dr COGS, Cr Inventory Asset
+      // Dr Adjustment Account, Cr Inventory Asset
       postingLines = [
         {
-          accountId: cogsAccountId,
+          accountId: offsetAccountId,
           debit: toAmountString(glAmount),
-          memo: input.memo ?? 'Inventory removal',
+          memo: input.memo ?? 'Inventory adjustment',
+          ...dims,
         },
         {
           accountId: inventoryAccountId,
@@ -253,7 +379,7 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: input.memo ?? (qtyChange.greaterThan(0) ? 'Inventory receipt' : 'Inventory removal'),
+      description: input.memo ?? `Inventory adjustment — ${item.name}`,
       lines: postingLines,
       sourceRef: `item:${input.itemId}`,
     });

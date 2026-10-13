@@ -58,7 +58,7 @@ export default async function AccountantCenterPage() {
         <Card className="p-4">
           <div className="text-xs uppercase tracking-wide text-navy/50">Sales tax owed (books)</div>
           <div className="text-xl font-bold text-navy">{formatCurrency(s.salesTaxOwed)}</div>
-          <Link className="text-sm text-electric hover:underline" href="/pay-liabilities">Pay sales tax</Link>
+          <Link className="text-sm text-electric hover:underline" href="/sales-tax">Pay sales tax</Link>
         </Card>
         <Card className="p-4">
           <div className="text-xs uppercase tracking-wide text-navy/50">List changes to review</div>

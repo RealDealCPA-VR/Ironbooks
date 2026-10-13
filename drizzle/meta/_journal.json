@@ -260,6 +260,13 @@
       "when": 1781400040000,
       "tag": "0040_p1_salesforms",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1781400042000,
+      "tag": "0042_p1_purchases",
+      "breakpoints": true
     }
   ]
 }

@@ -20,7 +20,7 @@ interface CheckDetailLine {
 }
 
 interface CheckDetailRow {
-  source: 'expense' | 'bill_payment';
+  source: 'expense' | 'bill_payment' | 'payment_check';
   id: string;
   date: string;
   checkNumber: string | null;
@@ -74,7 +74,7 @@ export default function CheckDetailPage() {
         r.checkNumber ?? '',
         r.payee ?? '',
         r.bankAccountName,
-        r.source === 'expense' ? 'Check / Expense' : 'Bill Payment',
+        r.source === 'expense' ? 'Check / Expense' : r.source === 'payment_check' ? (r.lines[0]?.detail ?? 'Check') : 'Bill Payment',
         r.voided ? 'VOID' : '',
         r.amount,
       ]);
@@ -162,7 +162,7 @@ export default function CheckDetailPage() {
                           {r.bankAccountName}
                         </Link>
                       </Td>
-                      <Td>{r.source === 'expense' ? 'Check / Expense' : 'Bill Payment'}</Td>
+                      <Td>{r.source === 'expense' ? 'Check / Expense' : r.source === 'payment_check' ? (r.lines[0]?.detail ?? 'Check') : 'Bill Payment'}</Td>
                       <Td className="text-right tabular-nums font-semibold">{formatCurrency(r.amount)}</Td>
                     </Tr>
                     {r.lines.map((l, i) => (

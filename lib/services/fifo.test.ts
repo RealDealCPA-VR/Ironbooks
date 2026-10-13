@@ -118,9 +118,13 @@ describe('FIFO inventory service (end-to-end)', () => {
     const [invAcct] = await db.select().from(accounts).where(eq(accounts.id, acct['1300']));
     expect(invAcct.balance).toBe('50.00');
 
-    // Equity account should be credited $50
+    // p1 purchases: the offset is the Adjustment Account (default "Inventory Adjustments",
+    // created on first use) — never Owner's Equity.
     const [eqAcct] = await db.select().from(accounts).where(eq(accounts.id, acct['3000']));
-    expect(eqAcct.balance).toBe('50.00');
+    expect(eqAcct.balance).toBe('0.00');
+    const adjAcct = (await db.select().from(accounts)).find((a) => a.companyId === ctx.companyId && a.name === 'Inventory Adjustments');
+    expect(adjAcct?.type).toBe('expense');
+    expect(Math.abs(Number(adjAcct?.balance))).toBe(50);
 
     const tb = await trialBalance(ctx);
     expect(tb.balanced).toBe(true);

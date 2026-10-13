@@ -1,11 +1,10 @@
 'use client';
 /**
- * Pay Liabilities page — shows current amounts due for:
- *   - 2200 Sales Tax Payable
- *   - 2300 Payroll Liabilities
+ * Pay Liabilities page (payroll) — shows the amount due on 2300 Payroll Liabilities.
+ * Sales tax is paid on its own Pay Sales Tax page (/sales-tax, Sales Tax permission).
  *
- * Each tile has a "Pay" button that opens a modal where the user selects
- * a bank account, enters an amount and date, then posts the GL entry.
+ * Paying from a bank account writes a QB Liability Check: payee, check number or
+ * "To be printed" (it then waits in Print Checks). Liability checks can be voided below.
  *
  * Payroll liabilities additionally break down by payroll ITEM (QB "Pay Scheduled
  * Liabilities"): each withheld tax / deduction / employer accrual shows its
@@ -15,7 +14,7 @@
  */
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
-import { Landmark, ListChecks, Receipt } from 'lucide-react';
+import { Landmark, ListChecks } from 'lucide-react';
 import {
   Button,
   Card,
@@ -33,36 +32,28 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { Money, formatCurrency } from '@/lib/money';
+import { isBankAccount } from '@/lib/accountTypes';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 interface DueAmounts {
-  salesTaxDue: string;
   payrollLiabilitiesDue: string;
 }
 
-interface AgencyLiabilityRow {
-  agencyId: string | null;
-  agencyName: string | null;
-  liabilityAccountId: string | null;
-  collected: string;
-  /** Sales tax adjustments (discounts, penalties…) — signed. */
-  adjusted?: string;
-  paid: string;
-  balance: string;
-}
-
-interface AgencyLiabilities {
-  rows: AgencyLiabilityRow[];
-  totalCollected: string;
-  totalPaid: string;
-  totalBalance: string;
-  /** Sales tax liability accounts' balance in the books; tiesToGl = the grid matches it. */
-  glBalance?: string;
-  tiesToGl?: boolean;
+interface LiabilityCheck {
+  id: string;
+  date: string;
+  payeeName: string;
+  amount: string;
+  reference: string | null;
+  toPrint: boolean;
+  isVoid: boolean;
+  paymentAccountName: string | null;
 }
 
 interface LiabilityItem {
@@ -95,13 +86,16 @@ interface Account {
   subtype: string;
 }
 
-type LiabilityType = 'sales_tax' | 'payroll';
+type LiabilityType = 'payroll';
 
 interface PayForm {
   amount: string;
   date: string;
   paymentAccountId: string;
   memo: string;
+  payeeName: string;
+  checkNumber: string;
+  toPrint: boolean;
 }
 
 const today = () => new Date().toISOString().split('T')[0];
@@ -111,6 +105,9 @@ const EMPTY_FORM: PayForm = {
   date: today(),
   paymentAccountId: '',
   memo: '',
+  payeeName: '',
+  checkNumber: '',
+  toPrint: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -175,7 +172,6 @@ function PayModal({
 }: {
   open: boolean;
   type: LiabilityType | null;
-  /** Set when paying a specific tax agency: posts against its liability account. */
   agency?: { id: string; name: string; defaultAmount: string } | null;
   accounts: Account[];
   onClose: () => void;
@@ -196,7 +192,7 @@ function PayModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  function update(field: keyof PayForm, value: string) {
+  function update(field: keyof PayForm, value: string | boolean) {
     setForm((prev) => ({ ...prev, [field]: value }));
   }
 
@@ -216,18 +212,21 @@ function PayModal({
 
     setSaving(true);
     try {
-      await api.post('/api/pay-liabilities', {
-        type,
-        amount: parseFloat(form.amount).toFixed(2),
-        date: new Date(form.date).toISOString(),
-        paymentAccountId: form.paymentAccountId,
-        agencyId: agency?.id,
-        memo: form.memo.trim() || undefined,
-      });
-      toast(
-        type === 'sales_tax' ? 'Sales tax payment recorded.' : 'Payroll liability payment recorded.',
-        'success',
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        api.post('/api/pay-liabilities', {
+          type,
+          amount: Money.toString(form.amount),
+          date: `${form.date}T12:00:00.000Z`,
+          paymentAccountId: form.paymentAccountId,
+          memo: form.memo.trim() || undefined,
+          payeeName: form.payeeName.trim() || undefined,
+          checkNumber: form.toPrint ? undefined : form.checkNumber.trim() || undefined,
+          toPrint: form.toPrint,
+          allowDuplicateNumber,
+        }),
       );
+      if (saved === null) return;
+      toast(form.toPrint ? 'Liability check saved — print it from Print Checks.' : 'Payroll liability payment recorded.', 'success');
       onSuccess();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to record payment.', 'danger');
@@ -236,14 +235,10 @@ function PayModal({
     }
   }
 
-  const title = agency
-    ? `Pay Sales Tax — ${agency.name}`
-    : type === 'sales_tax'
-      ? 'Pay Sales Tax (2200)'
-      : 'Pay Payroll Liabilities (2300)';
+  const title = agency ? `Pay — ${agency.name}` : 'Pay Payroll Liabilities (2300)';
 
-  // Only offer asset accounts as payment sources (bank, checking, savings)
-  const bankAccounts = accounts.filter((a) => a.type === 'asset');
+  // QB writes liability checks from a bank account.
+  const bankAccounts = accounts.filter((a) => isBankAccount(a));
 
   return (
     <Modal
@@ -303,10 +298,42 @@ function PayModal({
         </div>
 
         <div>
+          <Label htmlFor="payee">Pay to the order of</Label>
+          <Input
+            id="payee"
+            placeholder="e.g. United States Treasury"
+            value={form.payeeName}
+            onChange={(e) => update('payeeName', e.target.value)}
+          />
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 items-end">
+          <div>
+            <Label htmlFor="checkNo">Check no.</Label>
+            <Input
+              id="checkNo"
+              placeholder={form.toPrint ? 'Assigned when printed' : 'Next number'}
+              disabled={form.toPrint}
+              value={form.toPrint ? '' : form.checkNumber}
+              onChange={(e) => update('checkNumber', e.target.value)}
+            />
+          </div>
+          <label className="flex items-center gap-2 text-sm text-navy/70 pb-2">
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-electric"
+              checked={form.toPrint}
+              onChange={(e) => update('toPrint', e.target.checked)}
+            />
+            To be printed
+          </label>
+        </div>
+
+        <div>
           <Label htmlFor="memo">Memo (optional)</Label>
           <Input
             id="memo"
-            placeholder="e.g. Q1 sales tax remittance"
+            placeholder="e.g. 941 deposit — March"
             value={form.memo}
             onChange={(e) => update('memo', e.target.value)}
           />
@@ -337,6 +364,8 @@ function PayrollByItemCard({
   const [date, setDate] = useState(today());
   const [paymentAccountId, setPaymentAccountId] = useState('');
   const [memo, setMemo] = useState('');
+  const [payeeName, setPayeeName] = useState('');
+  const [toPrint, setToPrint] = useState(false);
   const [saving, setSaving] = useState(false);
 
   // Re-seed editable amounts whenever fresh balances arrive.
@@ -352,7 +381,7 @@ function PayrollByItemCard({
 
   if (!balances) return null;
 
-  const bankAccounts = accounts.filter((a) => a.type === 'asset');
+  const bankAccounts = accounts.filter((a) => isBankAccount(a));
   const items = balances.items;
 
   const keyOf = (i: LiabilityItem) => `${i.kind}|${i.name}`;
@@ -376,17 +405,23 @@ function PayrollByItemCard({
 
     setSaving(true);
     try {
-      await api.post('/api/pay-liabilities/by-item', {
-        date: new Date(date).toISOString(),
-        paymentAccountId,
-        memo: memo.trim() || undefined,
-        items: selected.map((i) => ({
-          name: i.name,
-          kind: i.kind,
-          amount: Money.toString(amounts[keyOf(i)]),
-        })),
-      });
-      toast('Payroll liability payment recorded.', 'success');
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        api.post('/api/pay-liabilities/by-item', {
+          date: `${date}T12:00:00.000Z`,
+          paymentAccountId,
+          memo: memo.trim() || undefined,
+          payeeName: payeeName.trim() || undefined,
+          toPrint,
+          allowDuplicateNumber,
+          items: selected.map((i) => ({
+            name: i.name,
+            kind: i.kind,
+            amount: Money.toString(amounts[keyOf(i)]),
+          })),
+        }),
+      );
+      if (saved === null) return;
+      toast(toPrint ? 'Liability check saved — print it from Print Checks.' : 'Payroll liability payment recorded.', 'success');
       setMemo('');
       onPaid();
     } catch (err) {
@@ -484,7 +519,7 @@ function PayrollByItemCard({
             </tbody>
           </Table>
 
-          <div className="p-6 pt-4 border-t border-navy/5 grid grid-cols-1 sm:grid-cols-4 gap-4 items-end">
+          <div className="p-6 pt-4 border-t border-navy/5 grid grid-cols-1 sm:grid-cols-5 gap-4 items-end">
             <div>
               <Label htmlFor="itemPayDate">Payment Date</Label>
               <Input
@@ -510,6 +545,24 @@ function PayrollByItemCard({
               </Select>
             </div>
             <div>
+              <Label htmlFor="itemPayee">Pay to the order of</Label>
+              <Input
+                id="itemPayee"
+                placeholder="e.g. United States Treasury"
+                value={payeeName}
+                onChange={(e) => setPayeeName(e.target.value)}
+              />
+              <label className="mt-1 flex items-center gap-2 text-xs text-navy/70">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 accent-electric"
+                  checked={toPrint}
+                  onChange={(e) => setToPrint(e.target.checked)}
+                />
+                To be printed
+              </label>
+            </div>
+            <div>
               <Label htmlFor="itemPayMemo">Memo (optional)</Label>
               <Input
                 id="itemPayMemo"
@@ -533,30 +586,30 @@ function PayrollByItemCard({
 // ---------------------------------------------------------------------------
 
 export default function PayLiabilitiesPage() {
-  const [due, setDue] = useState<DueAmounts>({ salesTaxDue: '0.00', payrollLiabilitiesDue: '0.00' });
+  const [due, setDue] = useState<DueAmounts>({ payrollLiabilitiesDue: '0.00' });
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [balances, setBalances] = useState<LiabilityBalances | null>(null);
-  const [agencyData, setAgencyData] = useState<AgencyLiabilities | null>(null);
+  const [checks, setChecks] = useState<LiabilityCheck[]>([]);
   const [loading, setLoading] = useState(true);
+  const [voidingId, setVoidingId] = useState<string | null>(null);
 
   // Modal state
   const [payType, setPayType] = useState<LiabilityType | null>(null);
-  const [payAgency, setPayAgency] = useState<{ id: string; name: string; defaultAmount: string } | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
 
   async function fetchData() {
     setLoading(true);
     try {
-      const [dueData, acctData, balanceData, agencyRows] = await Promise.all([
+      const [dueData, acctData, balanceData, checkData] = await Promise.all([
         api.get<DueAmounts>('/api/pay-liabilities'),
         api.get<Account[]>('/api/accounts'),
         api.get<LiabilityBalances>('/api/pay-liabilities/by-item'),
-        api.get<AgencyLiabilities>('/api/pay-liabilities/sales-tax'),
+        api.get<{ items: LiabilityCheck[] }>('/api/pay-liabilities/checks'),
       ]);
       setDue(dueData);
       setAccounts(acctData);
       setBalances(balanceData);
-      setAgencyData(agencyRows);
+      setChecks(checkData.items);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load data.', 'danger');
     } finally {
@@ -571,25 +624,12 @@ export default function PayLiabilitiesPage() {
 
   function openPayModal(type: LiabilityType) {
     setPayType(type);
-    setPayAgency(null);
-    setModalOpen(true);
-  }
-
-  function openAgencyPayModal(row: AgencyLiabilityRow) {
-    if (!row.agencyId) return;
-    setPayType('sales_tax');
-    setPayAgency({
-      id: row.agencyId,
-      name: row.agencyName ?? 'Tax Agency',
-      defaultAmount: Number(row.balance) > 0 ? row.balance : '',
-    });
     setModalOpen(true);
   }
 
   function closeModal() {
     setModalOpen(false);
     setPayType(null);
-    setPayAgency(null);
   }
 
   async function handleSuccess() {
@@ -597,9 +637,27 @@ export default function PayLiabilitiesPage() {
     await fetchData();
   }
 
+  async function handleVoid(c: LiabilityCheck) {
+    if (!window.confirm(`Void the ${formatCurrency(c.amount)} liability check to ${c.payeeName}? The amount will show as owed again.`)) return;
+    setVoidingId(c.id);
+    try {
+      await api.post(`/api/pay-liabilities/checks/${c.id}`, { action: 'void' });
+      toast('Liability check voided.', 'success');
+      await fetchData();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not void the check.', 'danger');
+    } finally {
+      setVoidingId(null);
+    }
+  }
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Pay Liabilities" icon={Landmark} />
+      <p className="mt-2 text-sm text-navy/50">
+        Payroll taxes and deductions you withheld. Sales tax is paid on{' '}
+        <Link href="/sales-tax" className="text-electric hover:underline">Pay Sales Tax</Link>.
+      </p>
 
       {loading ? (
         <div className="mt-8 flex justify-center text-electric">
@@ -608,16 +666,6 @@ export default function PayLiabilitiesPage() {
       ) : (
         <>
           <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-6 max-w-2xl">
-            <Card>
-              <LiabilityTile
-                icon={Receipt}
-                label="Sales Tax Payable"
-                accountCode="2200"
-                amount={due.salesTaxDue}
-                onPay={() => openPayModal('sales_tax')}
-              />
-            </Card>
-
             <Card>
               <LiabilityTile
                 icon={Landmark}
@@ -629,121 +677,58 @@ export default function PayLiabilitiesPage() {
             </Card>
           </div>
 
-          {/* ---- Pay Sales Tax by agency (QB Pay Sales Tax grid) ---- */}
+          <div className="mt-6 max-w-5xl">
+            <PayrollByItemCard balances={balances} accounts={accounts} onPaid={fetchData} />
+          </div>
+
           <div className="mt-6 max-w-5xl">
             <Card className="p-0 overflow-hidden">
-              <div className="p-6 pb-4">
-                <div className="flex items-center gap-3">
-                  <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-electric/10">
-                    <Receipt className="h-5 w-5 text-electric" />
-                  </span>
-                  <div>
-                    <p className="text-xs font-semibold text-navy/50 uppercase tracking-wide">
-                      Sales tax — by agency
-                    </p>
-                    <p className="text-base font-bold text-navy">Pay Sales Tax</p>
-                  </div>
-                </div>
-                <p className="text-xs text-navy/50 mt-2">
-                  Tax from invoices, sales receipts and credit memos is split to agencies by each tax
-                  rate (and its combined-rate parts). Payments post against the agency&apos;s own liability
-                  account when one is set (otherwise 2200).
-                  {agencyData?.tiesToGl !== undefined && (
-                    <span className={`ml-1 font-semibold ${agencyData.tiesToGl ? 'text-emerald' : 'text-red-600'}`}>
-                      {agencyData.tiesToGl ? 'Matches your Sales Tax Payable balance.' : 'Does not match Sales Tax Payable — run Fix Incorrectly Recorded Sales Tax.'}
-                    </span>
-                  )}
-                </p>
-                <div className="mt-2 flex flex-wrap gap-4 text-xs">
-                  <Link href="/accountant/sales-tax-adjustment" className="text-electric hover:underline">Adjust sales tax due</Link>
-                  <Link href="/accountant/fix-sales-tax" className="text-electric hover:underline">Fix incorrectly recorded sales tax</Link>
-                  <Link href="/reports/sales-tax" className="text-electric hover:underline">Sales tax liability report</Link>
-                </div>
+              <div className="p-6 pb-3">
+                <p className="text-base font-bold text-navy">Liability checks</p>
               </div>
-
-              {!agencyData || agencyData.rows.length === 0 ? (
-                <div className="px-6 pb-6 text-sm text-navy/40">
-                  No tax agencies or collected sales tax yet. Set up agencies and rates on the
-                  Sales Tax settings page.
-                </div>
+              {checks.length === 0 ? (
+                <p className="px-6 pb-6 text-sm text-navy/40">No liability checks yet.</p>
               ) : (
                 <Table>
                   <thead>
                     <tr>
-                      <Th>Agency</Th>
-                      <Th numeric>Collected</Th>
-                      <Th numeric>Paid</Th>
-                      <Th numeric>Balance</Th>
+                      <Th>Date</Th>
+                      <Th>Check no.</Th>
+                      <Th>Pay to</Th>
+                      <Th>Bank account</Th>
+                      <Th numeric>Amount</Th>
                       <Th className="text-right">Actions</Th>
                     </tr>
                   </thead>
                   <tbody>
-                    {agencyData.rows.map((row) => (
-                      <Tr key={row.agencyId ?? '__unassigned__'}>
-                        <Td className="font-semibold text-navy">
-                          {row.agencyName ?? (
-                            <Link href="/accountant/fix-sales-tax" className="italic text-navy/50 hover:text-electric hover:underline">Not tied to an agency — fix</Link>
-                          )}
-                          {row.agencyId && !row.liabilityAccountId && (
-                            <span className="ml-2 text-[11px] font-normal text-navy/40">
-                              posts to 2200
-                            </span>
-                          )}
-                        </Td>
-                        <Td numeric className="text-navy/70">{formatCurrency(row.collected)}</Td>
-                        <Td numeric className="text-navy/70">{formatCurrency(row.paid)}</Td>
-                        <Td
-                          numeric
-                          className={`font-semibold ${
-                            Number(row.balance) > 0 ? 'text-red-500' : 'text-navy/40'
-                          }`}
-                        >
-                          {formatCurrency(row.balance)}
-                        </Td>
-                        <Td className="text-right">
-                          {row.agencyId ? (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              disabled={Number(row.balance) <= 0}
-                              onClick={() => openAgencyPayModal(row)}
-                            >
-                              Pay
-                            </Button>
+                    {checks.map((c) => (
+                      <Tr key={c.id}>
+                        <Td>{formatDate(c.date, 'MMM d, yyyy')}</Td>
+                        <Td>
+                          {c.isVoid ? (
+                            <Badge tone="danger">Void</Badge>
+                          ) : c.toPrint ? (
+                            <Link href="/print-checks"><Badge tone="warning">To print</Badge></Link>
                           ) : (
-                            <span
-                              className="text-xs text-navy/40"
-                              title="Link this tax to an agency via rate components to pay it per-agency"
-                            >
-                              —
-                            </span>
+                            (c.reference ?? '—')
+                          )}
+                        </Td>
+                        <Td className="font-medium">{c.payeeName}</Td>
+                        <Td>{c.paymentAccountName ?? '—'}</Td>
+                        <Td numeric className={c.isVoid ? 'line-through text-navy/40' : ''}>{formatCurrency(c.amount)}</Td>
+                        <Td className="text-right">
+                          {!c.isVoid && (
+                            <Button variant="ghost" size="sm" loading={voidingId === c.id} onClick={() => handleVoid(c)}>
+                              Void
+                            </Button>
                           )}
                         </Td>
                       </Tr>
                     ))}
                   </tbody>
-                  <tfoot>
-                    <tr className="border-t-2 border-navy/20 bg-navy/5 font-bold text-navy">
-                      <td className="py-3 px-4">Total</td>
-                      <td className="py-3 px-4 text-right tabular-nums">
-                        {formatCurrency(agencyData.totalCollected)}
-                      </td>
-                      <td className="py-3 px-4 text-right tabular-nums">
-                        {formatCurrency(agencyData.totalPaid)}
-                      </td>
-                      <td className="py-3 px-4 text-right tabular-nums">
-                        {formatCurrency(agencyData.totalBalance)}
-                      </td>
-                      <td />
-                    </tr>
-                  </tfoot>
                 </Table>
               )}
             </Card>
-          </div>
-
-          <div className="mt-6 max-w-5xl">
-            <PayrollByItemCard balances={balances} accounts={accounts} onPaid={fetchData} />
           </div>
         </>
       )}
@@ -751,7 +736,7 @@ export default function PayLiabilitiesPage() {
       <PayModal
         open={modalOpen}
         type={payType}
-        agency={payAgency}
+        agency={null}
         accounts={accounts}
         onClose={closeModal}
         onSuccess={handleSuccess}

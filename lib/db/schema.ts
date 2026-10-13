@@ -438,6 +438,8 @@ export const taxAgencies = pgTable('tax_agencies', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   name: varchar('name', { length: 255 }).notNull(),
   liabilityAccountId: uuid('liability_account_id').references(() => accounts.id),
+  /** p1 purchases: the vendor Sales Tax Payment checks are written to (QB agencies are vendors). */
+  vendorId: uuid('vendor_id').references((): any => vendors.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1042,6 +1044,8 @@ export const vendorCredits = pgTable('vendor_credits', {
   refundedAmount: decimal('refunded_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** p1 purchases: the vendor's credit memo number (QB "Ref. No."). */
+  refNumber: varchar('ref_number', { length: 50 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1052,6 +1056,15 @@ export const vendorCreditLines = pgTable('vendor_credit_lines', {
   description: text('description'),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
+  /** p1 purchases: Items tab (returned items), Class and Customer:Job. */
+  itemId: uuid('item_id').references(() => items.id),
+  quantity: decimal('quantity', { precision: 15, scale: 4 }),
+  unitCost: decimal('unit_cost', { precision: 15, scale: 4 }),
+  /** Inventory returns: the stock's cost taken out of inventory (home currency). */
+  costAmount: decimal('cost_amount', { precision: 15, scale: 2 }),
+  classId: uuid('class_id').references(() => classes.id),
+  customerId: uuid('customer_id').references(() => customers.id),
+  jobId: uuid('job_id').references((): any => jobs.id),
 });
 
 // ---- Sales orders (convert to invoice) ----
@@ -2104,7 +2117,34 @@ export const checkPrintSettings = pgTable('check_print_settings', {
   /** Alignment nudges in inches (positive = right / up). */
   offsetX: decimal('offset_x', { precision: 6, scale: 3 }).notNull().default('0'),
   offsetY: decimal('offset_y', { precision: 6, scale: 3 }).notNull().default('0'),
+  /** p1 purchases: 'preprinted' (print only the variable fields) | 'blank' (full check layout). */
+  stock: varchar('stock', { length: 20 }).notNull().default('preprinted'),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/**
+ * p1 purchases: printable check documents for Sales Tax Payments ('sales_tax'), Pay Payroll
+ * Liabilities ('payroll_liability') and customer refund checks ('customer_refund'). The journal
+ * entry (postedEntryId) is the ledger record; this row carries payee, check number and the
+ * "To be printed" flag so the payment sits in the Print Checks queue and the check register.
+ */
+export const paymentChecks = pgTable('payment_checks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  kind: varchar('kind', { length: 30 }).notNull(),
+  agencyId: uuid('agency_id').references(() => taxAgencies.id),
+  vendorId: uuid('vendor_id').references(() => vendors.id),
+  customerId: uuid('customer_id').references(() => customers.id),
+  payeeName: varchar('payee_name', { length: 255 }).notNull(),
+  paymentAccountId: uuid('payment_account_id').references(() => accounts.id).notNull(),
+  date: timestamp('date').notNull(),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
+  reference: varchar('reference', { length: 100 }),
+  toPrint: boolean('to_print').notNull().default(false),
+  memo: text('memo'),
+  postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  voidedAt: timestamp('voided_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
 /** Loan Manager: a loan tracked against a liability account. */

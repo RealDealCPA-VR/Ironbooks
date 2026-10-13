@@ -4,7 +4,13 @@ import { Badge, Button, Card, Input, Label, PageHeader, Select, Table, Td, Th, T
 import { Help } from '@/components/Help';
 import { getPageContext } from '@/lib/context';
 import { formatCurrency } from '@/lib/money';
-import { salesTaxLiabilityReport, salesTaxRevenueSummary } from '@/lib/services/accountant/salesTaxLedger';
+import {
+  type SalesTaxFrequency,
+  lastFilingPeriod,
+  salesTaxLiabilityReport,
+  salesTaxRevenueSummary,
+} from '@/lib/services/accountant/salesTaxLedger';
+import { getPreferences } from '@/lib/services/company';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 export const dynamic = 'force-dynamic';
@@ -14,11 +20,6 @@ function day(v: string | undefined, end: boolean): Date | undefined {
   return new Date(`${v}T${end ? '23:59:59.999' : '00:00:00.000'}Z`);
 }
 
-function monthStart(): string {
-  const n = new Date();
-  return `${n.getUTCFullYear()}-${String(n.getUTCMonth() + 1).padStart(2, '0')}-01`;
-}
-
 export default async function SalesTaxReportPage({
   searchParams,
 }: {
@@ -26,14 +27,17 @@ export default async function SalesTaxReportPage({
 }) {
   const ctx = await getPageContext('/reports/sales-tax');
   const p = await searchParams;
-  const fromStr = p.from && /^\d{4}-\d{2}-\d{2}$/.test(p.from) ? p.from : monthStart();
-  const toStr = p.to && /^\d{4}-\d{2}-\d{2}$/.test(p.to) ? p.to : new Date().toISOString().slice(0, 10);
-  const basis = p.basis === 'cash' ? 'cash' : 'accrual';
+  // p1 purchases: default to the company's sales tax basis and its last filing period (QB).
+  const prefs = await getPreferences(ctx);
+  const period = lastFilingPeriod(prefs.salesTaxFrequency as SalesTaxFrequency);
+  const fromStr = p.from && /^\d{4}-\d{2}-\d{2}$/.test(p.from) ? p.from : period.from;
+  const toStr = p.to && /^\d{4}-\d{2}-\d{2}$/.test(p.to) ? p.to : period.to;
+  const basis = p.basis === 'cash' || p.basis === 'accrual' ? p.basis : prefs.salesTaxBasis === 'cash' ? 'cash' : 'accrual';
   const view = p.view === 'revenue' ? 'revenue' : 'liability';
   const range = { from: day(fromStr, false), to: day(toStr, true) };
 
   const liability = view === 'liability' ? await salesTaxLiabilityReport(ctx, { ...range, basis }) : null;
-  const revenue = view === 'revenue' ? await salesTaxRevenueSummary(ctx, range) : null;
+  const revenue = view === 'revenue' ? await salesTaxRevenueSummary(ctx, { ...range, basis }) : null;
 
   const exportTable: ExportTable = liability
     ? {
@@ -71,7 +75,7 @@ export default async function SalesTaxReportPage({
     : {
         filename: 'sales-tax-revenue-summary',
         title: 'Sales Tax Revenue Summary',
-        subtitle: `${fromStr} to ${toStr}`,
+        subtitle: `${fromStr} to ${toStr} (${basis} basis)`,
         columns: [
           { header: 'Tax rate' },
           { header: 'Total sales', numeric: true },
@@ -123,7 +127,7 @@ export default async function SalesTaxReportPage({
               <Label htmlFor="st-to">To</Label>
               <Input id="st-to" type="date" name="to" defaultValue={toStr} />
             </div>
-            {view === 'liability' && (
+            {(
               <div>
                 <Label htmlFor="st-basis">
                   Basis <Help term="accrual-vs-cash" />
@@ -185,7 +189,7 @@ export default async function SalesTaxReportPage({
               </p>
             )}
             <div className="mt-4 flex gap-4 text-sm print-hidden">
-              <Link href="/pay-liabilities" className="text-electric hover:underline">Pay sales tax</Link>
+              <Link href="/sales-tax" className="text-electric hover:underline">Pay sales tax</Link>
               <Link href="/accountant/sales-tax-adjustment" className="text-electric hover:underline">Adjust sales tax due</Link>
             </div>
           </Card>

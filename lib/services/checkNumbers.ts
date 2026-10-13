@@ -17,7 +17,7 @@
  * These functions never write: storing the chosen number is the job of the owning service.
  */
 import { and, eq, isNull, ne, sql } from 'drizzle-orm';
-import { accounts, billPayments, expenses, paychecks } from '@/lib/db/schema';
+import { accounts, billPayments, expenses, journalEntries, paychecks, paymentChecks } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError } from './_base';
 import { getPreferences } from './company';
 
@@ -73,8 +73,23 @@ export async function nextCheckNumber(
       ),
     );
 
-  const [bpRefs, expRefs] = await Promise.all([bpQuery, expQuery]);
-  const allRefs = [...bpRefs.map((r) => r.reference), ...expRefs.map((r) => r.reference)];
+  // p1 purchases: Sales Tax Payment / Liability / refund checks (payment_checks).
+  const pcQuery = ctx.db
+    .select({ reference: paymentChecks.reference })
+    .from(paymentChecks)
+    .where(
+      and(
+        eq(paymentChecks.companyId, ctx.companyId),
+        ...(paymentAccountId ? [eq(paymentChecks.paymentAccountId, paymentAccountId)] : []),
+      ),
+    );
+
+  const [bpRefs, expRefs, payChkRefs] = await Promise.all([bpQuery, expQuery, pcQuery]);
+  const allRefs = [
+    ...bpRefs.map((r) => r.reference),
+    ...expRefs.map((r) => r.reference),
+    ...payChkRefs.map((r) => r.reference),
+  ];
 
   if (await paychecksDrawOn(ctx, paymentAccountId)) {
     const pcRefs = await ctx.db
@@ -105,7 +120,7 @@ export async function reserveCheckNumber(
 }
 
 export interface CheckNumberUse {
-  source: 'expense' | 'bill_payment' | 'paycheck';
+  source: 'expense' | 'bill_payment' | 'paycheck' | 'payment_check';
   id: string;
   date: Date;
   amount: string;
@@ -157,6 +172,22 @@ export async function findDuplicateCheckNumbers(
       ),
     );
   out.push(...bpRows.map((r) => ({ source: 'bill_payment' as const, ...r })));
+
+  const chkRows = await ctx.db
+    .select({ id: paymentChecks.id, date: paymentChecks.date, amount: paymentChecks.amount })
+    .from(paymentChecks)
+    .leftJoin(journalEntries, eq(paymentChecks.postedEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(paymentChecks.companyId, ctx.companyId),
+        eq(paymentChecks.paymentAccountId, params.paymentAccountId),
+        isNull(paymentChecks.voidedAt),
+        sql`COALESCE(${journalEntries.status}, 'posted') <> 'void'`,
+        sql`trim(${paymentChecks.reference}) = ${num}`,
+        ...(ex?.source === 'payment_check' ? [ne(paymentChecks.id, ex.id)] : []),
+      ),
+    );
+  out.push(...chkRows.map((r) => ({ source: 'payment_check' as const, ...r })));
 
   if (await paychecksDrawOn(ctx, params.paymentAccountId)) {
     const pcRows = await ctx.db

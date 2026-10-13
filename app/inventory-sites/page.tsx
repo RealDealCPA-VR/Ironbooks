@@ -39,6 +39,12 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import {
+  type AdjustmentFieldValues,
+  EMPTY_ADJUSTMENT_FIELDS,
+  InventoryAdjustmentFields,
+  adjustmentPayload,
+} from '@/components/InventoryAdjustmentFields';
 import { formatCurrency } from '@/lib/money';
 import {
   InventoryLineFields,
@@ -414,6 +420,7 @@ function AdjustTab({ items, onDone }: { items: Item[]; onDone: () => Promise<voi
   const [date, setDate] = useState(today());
   const [memo, setMemo] = useState('');
   const [inv, setInv] = useState<InvDetail>({});
+  const [adjFields, setAdjFields] = useState<AdjustmentFieldValues>(EMPTY_ADJUSTMENT_FIELDS);
   const [saving, setSaving] = useState(false);
 
   const item = items.find((i) => i.id === itemId);
@@ -433,6 +440,7 @@ function AdjustTab({ items, onDone }: { items: Item[]; onDone: () => Promise<voi
         unitCost: adding ? unitCost : null,
         date,
         memo: memo || null,
+        ...adjustmentPayload(adjFields),
         ...inventoryLinePayload(inv),
       });
       toast('Inventory adjusted.', 'success');
@@ -450,9 +458,9 @@ function AdjustTab({ items, onDone }: { items: Item[]; onDone: () => Promise<voi
   return (
     <Card className="max-w-3xl space-y-4 p-6">
       <p className="text-sm text-navy/60">
-        Add or remove stock at a specific site and bin (damage, found stock, opening counts). Adds post Dr
-        Inventory / Cr Owner&apos;s Equity at the cost you enter; removals post Dr COGS / Cr Inventory at the
-        item&apos;s current cost.
+        Add or remove stock at a specific site and bin (damage, found stock, opening counts). The change in
+        inventory value goes to the adjustment account you pick (Inventory Adjustments unless you choose
+        another): adds at the cost you enter, removals at the item&apos;s current cost.
       </p>
       <div className="grid grid-cols-2 gap-4">
         <div>
@@ -500,6 +508,7 @@ function AdjustTab({ items, onDone }: { items: Item[]; onDone: () => Promise<voi
           onChange={setInv}
         />
       )}
+      <InventoryAdjustmentFields value={adjFields} onChange={setAdjFields} idPrefix="adj-site" />
       <div>
         <Label htmlFor="adj-memo">Reason / memo</Label>
         <Input id="adj-memo" value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="e.g. Damaged in transit" />

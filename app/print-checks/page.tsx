@@ -9,6 +9,8 @@
  *     its PDF (in the company's check style) AND stamps the check number on the recorded
  *     transaction and its journal entry. A number already used on the account asks first.
  *  2. Add paychecks — paychecks that were never printed can be added to the queue.
+ *     Add refund checks — customer refunds paid from a bank account (D3) can be added too.
+ *     Sales Tax Payment and Liability checks saved "To be printed" appear in the queue directly.
  *  3. Printer setup — check style (voucher / standard / wallet) and alignment nudges, with an
  *     alignment test page.
  *  4. Quick Check — ad-hoc check PDF that is not recorded.
@@ -43,7 +45,15 @@ import { formatDate } from '@/lib/utils';
 // Types
 // ---------------------------------------------------------------------------
 
-type PrintSource = 'expense' | 'bill_payment' | 'paycheck';
+type PrintSource = 'expense' | 'bill_payment' | 'paycheck' | 'payment_check';
+
+interface UnprintedRefund {
+  entryId: string;
+  date: string;
+  payee: string;
+  amount: string;
+  paymentAccountName: string;
+}
 
 interface QueueItem {
   source: PrintSource;
@@ -65,8 +75,11 @@ interface UnprintedPaycheck {
 
 type CheckStyle = 'voucher' | 'standard' | 'wallet';
 
+type CheckStock = 'preprinted' | 'blank';
+
 interface PrintSettings {
   style: CheckStyle;
+  stock: CheckStock;
   offsetX: string;
   offsetY: string;
 }
@@ -75,6 +88,13 @@ const SOURCE_LABEL: Record<PrintSource, string> = {
   expense: 'Check',
   bill_payment: 'Bill payment',
   paycheck: 'Paycheck',
+  payment_check: 'Tax / liability / refund',
+};
+
+const STOCK_HELP: Record<CheckStock, string> = {
+  preprinted:
+    'Your bank checks already show the lines, labels and bank numbers. Only the date, payee, amount and memo are printed.',
+  blank: 'Plain paper: the whole check is drawn. No bank (MICR) line is printed, so these are for records or hand-signed use.',
 };
 
 const STYLE_HELP: Record<CheckStyle, string> = {
@@ -125,7 +145,11 @@ export default function PrintChecksPage() {
   const [queuingPaychecks, setQueuingPaychecks] = useState(false);
 
   // ── Printer setup ─────────────────────────────────────────────────────────
-  const [settings, setSettings] = useState<PrintSettings>({ style: 'voucher', offsetX: '0', offsetY: '0' });
+  const [settings, setSettings] = useState<PrintSettings>({ style: 'voucher', stock: 'preprinted', offsetX: '0', offsetY: '0' });
+
+  // ── Customer refunds not yet printed (D3) ─────────────────────────────────
+  const [refunds, setRefunds] = useState<UnprintedRefund[]>([]);
+  const [queuingRefund, setQueuingRefund] = useState<string | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
   const [testing, setTesting] = useState(false);
 
@@ -143,14 +167,16 @@ export default function PrintChecksPage() {
   const refreshQueue = useCallback(async () => {
     setQueueLoading(true);
     try {
-      const [queueData, nextData, pcData] = await Promise.all([
+      const [queueData, nextData, pcData, refundData] = await Promise.all([
         api.get<{ items: QueueItem[] }>('/api/print-queue'),
         api.get<{ next: string }>('/api/check-numbers/next'),
         api.get<{ paychecks: UnprintedPaycheck[] }>('/api/print-queue/paychecks').catch(() => ({ paychecks: [] })),
+        api.get<{ items: UnprintedRefund[] }>('/api/print-queue/refunds').catch(() => ({ items: [] })),
       ]);
       setQueue(queueData.items);
       setNextNumber((prev) => prev || nextData.next);
       setUnprinted(pcData.paychecks);
+      setRefunds(refundData.items);
       setPicked(new Set());
     } catch (err) {
       toastError(err, 'Failed to load the print queue.');
@@ -222,6 +248,21 @@ export default function PrintChecksPage() {
     }
   }
 
+  // ── Queue a customer refund check ─────────────────────────────────────────
+
+  async function handleQueueRefund(r: UnprintedRefund) {
+    setQueuingRefund(r.entryId);
+    try {
+      await api.post('/api/print-queue/refunds', { entryId: r.entryId });
+      toast(`Refund check to ${r.payee} added to the queue.`, 'success');
+      await refreshQueue();
+    } catch (err) {
+      toastError(err, 'Could not add the refund check.');
+    } finally {
+      setQueuingRefund(null);
+    }
+  }
+
   // ── Printer setup ─────────────────────────────────────────────────────────
 
   function offsetOk(v: string) {
@@ -256,6 +297,7 @@ export default function PrintChecksPage() {
       await openCheckPdf({
         alignmentTest: true,
         style: settings.style,
+        stock: settings.stock,
         offsetX: settings.offsetX,
         offsetY: settings.offsetY,
       });
@@ -369,7 +411,17 @@ export default function PrintChecksPage() {
                   <Tr key={`${q.source}:${q.id}`}>
                     <Td>{q.date ? formatDate(q.date, 'MMM d, yyyy') : '—'}</Td>
                     <Td>
-                      <Badge tone={q.source === 'paycheck' ? 'success' : q.source === 'bill_payment' ? 'neutral' : 'info'}>
+                      <Badge
+                        tone={
+                          q.source === 'paycheck'
+                            ? 'success'
+                            : q.source === 'bill_payment'
+                              ? 'neutral'
+                              : q.source === 'payment_check'
+                                ? 'warning'
+                                : 'info'
+                        }
+                      >
                         {SOURCE_LABEL[q.source]}
                       </Badge>
                     </Td>
@@ -453,6 +505,46 @@ export default function PrintChecksPage() {
           )}
         </Card>
 
+        {/* Customer refund checks (D3) */}
+        <Card className="p-6 space-y-4">
+          <div>
+            <h2 className="text-lg font-bold text-navy">Add Refund Checks to the Queue</h2>
+            <p className="text-sm text-navy/50">
+              Refunds you gave customers from a bank account that have no check number yet.
+            </p>
+          </div>
+          {refunds.length === 0 ? (
+            <p className="text-sm text-navy/40">No refunds waiting for a check.</p>
+          ) : (
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Date</Th>
+                  <Th>Customer</Th>
+                  <Th>Bank Account</Th>
+                  <Th numeric>Amount</Th>
+                  <Th className="text-right">Actions</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {refunds.map((r) => (
+                  <Tr key={r.entryId}>
+                    <Td>{formatDate(r.date, 'MMM d, yyyy')}</Td>
+                    <Td className="font-medium">{r.payee}</Td>
+                    <Td>{r.paymentAccountName}</Td>
+                    <Td numeric>{formatCurrency(r.amount)}</Td>
+                    <Td className="text-right">
+                      <Button size="sm" variant="secondary" loading={queuingRefund === r.entryId} onClick={() => handleQueueRefund(r)}>
+                        Add to queue
+                      </Button>
+                    </Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          )}
+        </Card>
+
         {/* Printer setup */}
         <Card className="p-6 space-y-4">
           <div className="flex items-center gap-2">
@@ -463,6 +555,18 @@ export default function PrintChecksPage() {
             Pick the kind of check paper you use. If the printing lands a little off on the paper, nudge it:
             positive numbers move the print right / up, negative numbers left / down (in inches, at most 1).
           </p>
+          <div>
+            <Label htmlFor="chk-stock">Check paper</Label>
+            <Select
+              id="chk-stock"
+              value={settings.stock}
+              onChange={(e) => setSettings((s) => ({ ...s, stock: e.target.value as CheckStock }))}
+            >
+              <option value="preprinted">Pre-printed checks from my bank (recommended)</option>
+              <option value="blank">Blank check paper</option>
+            </Select>
+            <p className="mt-1 text-xs text-navy/50">{STOCK_HELP[settings.stock]}</p>
+          </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <Label htmlFor="chk-style">Check style</Label>
