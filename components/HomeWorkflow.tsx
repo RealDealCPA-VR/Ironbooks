@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import {
   HOME_WORKFLOW,
+  filterWorkflow,
   type AccountBalanceRow,
   type WorkflowIcon,
   type WorkflowSection,
@@ -216,22 +217,32 @@ function AccountBalancesPanel({ rows }: { rows: AccountBalanceRow[] }) {
   );
 }
 
-export default function HomeWorkflow({ balances }: { balances: AccountBalanceRow[] }) {
-  const byId = Object.fromEntries(HOME_WORKFLOW.map((s) => [s.id, s])) as Record<
-    WorkflowSection['id'],
-    WorkflowSection
+export default function HomeWorkflow({
+  balances,
+  allowedHrefs,
+  showBalances = true,
+}: {
+  balances: AccountBalanceRow[];
+  /** p1 ux: only these step links show (permissions + feature switches); all when omitted. */
+  allowedHrefs?: string[];
+  showBalances?: boolean;
+}) {
+  const allowed = allowedHrefs ? new Set(allowedHrefs) : null;
+  const sections = allowed ? filterWorkflow(HOME_WORKFLOW, (h) => allowed.has(h)) : HOME_WORKFLOW;
+  const byId = Object.fromEntries(sections.map((s) => [s.id, s])) as Partial<
+    Record<WorkflowSection['id'], WorkflowSection>
   >;
   return (
     <nav aria-label="Home workflow" className="grid grid-cols-1 gap-6 xl:grid-cols-3">
       <div className="space-y-6 xl:col-span-2">
-        <Section section={byId.vendors} />
-        <Section section={byId.customers} />
-        <Section section={byId.employees} />
+        {byId.vendors && <Section section={byId.vendors} />}
+        {byId.customers && <Section section={byId.customers} />}
+        {byId.employees && <Section section={byId.employees} />}
       </div>
       <div className="space-y-6">
-        <Section section={byId.company} />
-        <Section section={byId.banking} />
-        <AccountBalancesPanel rows={balances} />
+        {byId.company && <Section section={byId.company} />}
+        {byId.banking && <Section section={byId.banking} />}
+        {showBalances && <AccountBalancesPanel rows={balances} />}
       </div>
     </nav>
   );

@@ -144,7 +144,7 @@ export default function CollectionsCenterPage() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
-        title="Collections Center"
+        title="Collect overdue payments (Collections Center)"
         icon={PhoneCall}
         action={
           <Link href="/income-tracker" className="text-sm font-semibold text-electric hover:underline">

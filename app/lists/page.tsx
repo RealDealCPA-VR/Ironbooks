@@ -15,7 +15,7 @@ import { LIST_SPECS } from '@/lib/lists/listSpecs';
 import { cn } from '@/lib/utils';
 
 const TOOLS = [
-  { href: '/lists/todos', label: 'To Do list', icon: ClipboardCheck, text: 'Reminders to call, email or follow up.' },
+  { href: '/todos', label: 'To Do list', icon: ClipboardCheck, text: 'Reminders to call, email or follow up.' },
   { href: '/lists/multiple', label: 'Add/Edit Multiple', icon: Table2, text: 'Type or paste many customers, vendors or items at once.' },
   { href: '/lists/billing-rates', label: 'Billing Rate Levels', icon: Timer, text: 'Hourly rates used when billing time.' },
   { href: '/lists/uom', label: 'Units of Measure', icon: Ruler, text: 'Each, case of 12, box of 100…' },

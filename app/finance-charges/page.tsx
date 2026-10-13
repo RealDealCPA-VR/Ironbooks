@@ -197,7 +197,7 @@ export default function FinanceChargesPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Assess Finance Charges" icon={Percent} />
+      <PageHeader title="Late-payment charges (finance charges)" icon={Percent} />
 
       {/* ---- Settings ---- */}
       <Card className="mb-6">

@@ -4,7 +4,7 @@
  * list, and the helper merges use to carry notes/to-dos over to the surviving record.
  */
 import { and, desc, eq } from 'drizzle-orm';
-import { customers, employees, entityNotes, items, otherNames, todoItems, vendors } from '@/lib/db/schema';
+import { customers, employees, entityNotes, items, otherNames, todos as todoItems, vendors } from '@/lib/db/schema';
 import { noteSchema, noteUpdateSchema } from '@/lib/validation/lists';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
 
@@ -128,6 +128,7 @@ export async function moveNotesAndTodos(
           .set({ entityId: toId, updatedAt: new Date() })
           .where(and(eq(entityNotes.companyId, tx.companyId), eq(entityNotes.entityType, entityType), eq(entityNotes.entityId, fromId)))
           .returning({ id: entityNotes.id });
+  // p1 ux: `todos` is the one To Do store (imported as todoItems above).
   const todos = await tx.db
     .update(todoItems)
     .set({ entityId: toId, updatedAt: new Date() })

@@ -196,3 +196,22 @@ export function buildAccountBalances(
   const order = { bank: 0, undeposited: 1, credit_card: 2 } as const;
   return rows.sort((x, y) => order[x.kind] - order[y.kind] || x.code.localeCompare(y.code));
 }
+
+/**
+ * p1 ux: the diagram for one person — steps they can't open (permissions) or whose feature is
+ * switched off (Preferences) drop out; a flow keeps its arrows between the remaining steps, and a
+ * section with nothing left disappears. Same-page anchors (#reminders) always stay.
+ */
+export function filterWorkflow(
+  sections: WorkflowSection[],
+  allowed: (href: string) => boolean,
+): WorkflowSection[] {
+  const ok = (st: WorkflowStep) => st.href.startsWith('#') || allowed(st.href);
+  return sections
+    .map((s) => ({
+      ...s,
+      flows: s.flows.map((f) => f.filter(ok)).filter((f) => f.length > 0),
+      extras: s.extras?.filter(ok),
+    }))
+    .filter((s) => s.flows.length > 0 || (s.extras ?? []).some((st) => !st.href.startsWith('#')));
+}

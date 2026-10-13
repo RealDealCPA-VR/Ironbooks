@@ -4,9 +4,21 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import CommandPalette from './CommandPalette';
 import AssistantPanel from './AssistantPanel';
-import { filterNavGroups, navGroups, paletteDestinations } from '@/lib/nav';
+import {
+  linkHref,
+  paletteDestinations,
+  searchPages,
+  visibleNavGroups,
+  type NavGroup,
+  type NavMode,
+  type PageSearchResult,
+} from '@/lib/nav';
 import { useMe } from '@/lib/usePermissions';
-import { usePreferences } from '@/lib/usePreferences';
+import { refreshPreferences, usePreferences } from '@/lib/usePreferences';
+import { api } from '@/lib/client';
+import { Help } from '@/components/Help';
+import { pageHelpFor } from '@/lib/pageHelp';
+import type { Area } from '@/lib/permissions/model';
 import { blockingFeatureGate, featureHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
 import PreferenceBehaviors from './PreferenceBehaviors';
@@ -18,7 +30,7 @@ import {
   isEditableTarget,
 } from '@/lib/shortcuts';
 import { Modal, toast } from '@/components/ui';
-import { Briefcase, Building2, ChevronDown, LogOut, Sparkles } from 'lucide-react';
+import { Briefcase, Building2, ChevronDown, ChevronRight, LogOut, Search, Sparkles } from 'lucide-react';
 
 // Routes that render without the app chrome (full-screen).
 const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock'];
@@ -284,6 +296,246 @@ function GlobalShortcuts() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// p1 ux: Simple / Advanced menus, collapsible groups, page search
+// ---------------------------------------------------------------------------
+
+const NAV_MODE_KEY = 'bka.navMode';
+const collapsedKey = (userId: string | undefined) => `bka.nav.collapsed.${userId ?? 'anon'}`;
+
+function readLocal(key: string): string | null {
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writeLocal(key: string, value: string) {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    /* private mode: not remembered */
+  }
+}
+
+/** Simple / All menus switch at the top of the sidebar (saved to My Preferences). */
+function MenuModeToggle({
+  mode,
+  onChange,
+  className = 'hidden lg:flex mx-1 mb-3',
+}: {
+  mode: NavMode;
+  onChange: (m: NavMode) => void;
+  className?: string;
+}) {
+  const btn = (m: NavMode, label: string, title: string) => (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={mode === m}
+      title={title}
+      onClick={() => mode !== m && onChange(m)}
+      className={`flex-1 rounded-md px-2 py-1 text-xs font-semibold transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
+        mode === m ? 'bg-white text-electric shadow-sm' : 'text-navy/60 hover:text-navy'
+      }`}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div role="radiogroup" aria-label="Menu style" className={`${className} gap-1 rounded-lg bg-slate-100 p-1 shrink-0`}>
+      {btn('simple', 'Simple', 'Everyday tasks only')}
+      {btn('advanced', 'All menus', 'Every screen, grouped like the QuickBooks menus')}
+    </div>
+  );
+}
+
+/**
+ * Search box: finds any page by its name, its QuickBooks name or plain words ("pay a bill",
+ * "record a sale"), limited to pages this person can open. Enter opens the top match.
+ */
+function SidebarSearch({
+  permissions,
+  hiddenPaths,
+  idPrefix = 'ss',
+  className = 'relative mx-1 mb-3 hidden lg:block',
+}: {
+  permissions: Partial<Record<Area, readonly string[]>> | null | undefined;
+  hiddenPaths: ReadonlySet<string>;
+  /** Keeps element ids unique when a second (narrow-window) copy is on the page. */
+  idPrefix?: string;
+  className?: string;
+}) {
+  const router = useRouter();
+  const [q, setQ] = React.useState('');
+  const [open, setOpen] = React.useState(false);
+  const [active, setActive] = React.useState(0);
+  const rootRef = React.useRef<HTMLDivElement>(null);
+  const results: PageSearchResult[] = React.useMemo(
+    () => searchPages(q, { permissions, hiddenPaths, limit: 8 }),
+    [q, permissions, hiddenPaths],
+  );
+
+  React.useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  function go(href: string) {
+    setOpen(false);
+    setQ('');
+    router.push(href);
+  }
+
+  return (
+    <div ref={rootRef} className={`${className} shrink-0`}>
+      <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-navy/40" aria-hidden="true" />
+      <input
+        type="search"
+        role="combobox"
+        aria-label="Find a page"
+        aria-autocomplete="list"
+        aria-expanded={open && results.length > 0}
+        aria-controls={`${idPrefix}-search-results`}
+        aria-activedescendant={open && results[active] ? `${idPrefix}-opt-${active}` : undefined}
+        placeholder="Find a page (e.g. pay bills)"
+        value={q}
+        onChange={(e) => {
+          setQ(e.target.value);
+          setActive(0);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setActive((a) => Math.min(a + 1, results.length - 1));
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setActive((a) => Math.max(a - 1, 0));
+          } else if (e.key === 'Enter' && results[active]) {
+            e.preventDefault();
+            go(results[active].href);
+          } else if (e.key === 'Escape') {
+            setOpen(false);
+          }
+        }}
+        className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-8 pr-2 text-sm text-navy placeholder:text-navy/40 outline-none focus:border-electric/50 focus:bg-white focus:ring-2 focus:ring-electric/30"
+      />
+      {open && q.trim() && (
+        <div
+          id={`${idPrefix}-search-results`}
+          role="listbox"
+          className="absolute left-0 z-50 mt-1 w-80 max-w-[80vw] rounded-xl border border-slate-100 bg-white py-1 shadow-xl"
+        >
+          {results.length === 0 ? (
+            <div className="px-3 py-3 text-sm text-navy/50">
+              No page found. Try other words, like &ldquo;pay a bill&rdquo; or &ldquo;record a sale&rdquo;.
+            </div>
+          ) : (
+            results.map((r, i) => (
+              <button
+                key={r.href}
+                id={`${idPrefix}-opt-${i}`}
+                role="option"
+                aria-selected={i === active}
+                type="button"
+                onMouseEnter={() => setActive(i)}
+                onClick={() => go(r.href)}
+                className={`block w-full px-3 py-2 text-left ${i === active ? 'bg-electric/10' : ''}`}
+              >
+                <span className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-medium text-navy">{r.label}</span>
+                  <span className="text-[10px] font-bold uppercase tracking-wide text-navy/30">{r.group}</span>
+                </span>
+                {r.description && <span className="block text-xs text-navy/50">{r.description}</span>}
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NavItems({
+  groups,
+  pathname,
+  collapsible,
+  collapsed,
+  onToggle,
+}: {
+  groups: NavGroup[];
+  pathname: string;
+  collapsible: boolean;
+  collapsed: ReadonlySet<string>;
+  onToggle: (heading: string) => void;
+}) {
+  return (
+    <>
+      {groups.map((group) => {
+        const hasActive = group.links.some((l) => pathname === l.path || pathname.startsWith(l.path + '/'));
+        // The group holding the current page always shows (without changing what is remembered).
+        const isCollapsed = collapsible && !!group.heading && collapsed.has(group.heading) && !hasActive;
+        const listId = `nav-group-${(group.heading || 'home').toLowerCase().replace(/[^a-z]+/g, '-')}`;
+        return (
+          <div key={group.heading || 'home'} className="mb-2">
+            {group.heading && (
+              <>
+                {collapsible ? (
+                  <button
+                    type="button"
+                    aria-expanded={!isCollapsed}
+                    aria-controls={listId}
+                    onClick={() => onToggle(group.heading)}
+                    className="hidden lg:flex w-full items-center justify-between rounded px-3 pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-navy/40 hover:text-navy outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+                  >
+                    {group.heading}
+                    {isCollapsed ? <ChevronRight className="h-3 w-3" aria-hidden="true" /> : <ChevronDown className="h-3 w-3" aria-hidden="true" />}
+                  </button>
+                ) : (
+                  <div className="hidden lg:block px-3 pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-navy/30">
+                    {group.heading}
+                  </div>
+                )}
+                {/* Collapsed mode: divider stands in for the group heading. */}
+                <div className="lg:hidden mx-2 my-2 border-t border-slate-100" aria-hidden="true" />
+              </>
+            )}
+            <div id={listId} className={isCollapsed ? 'lg:hidden' : ''}>
+              {group.links.map((nav) => {
+                const Icon = nav.icon;
+                const active = pathname === nav.path || pathname.startsWith(nav.path + '/');
+                return (
+                  <Link
+                    key={nav.label}
+                    href={linkHref(nav)}
+                    prefetch={false}
+                    title={nav.qb && nav.qb !== nav.label ? `${nav.label} (QuickBooks: ${nav.qb})` : nav.label}
+                    aria-current={active ? 'page' : undefined}
+                    className={`flex items-center justify-center lg:justify-start gap-3 px-2 lg:px-3 py-2 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
+                      active
+                        ? 'bg-electric/10 text-electric font-semibold shadow-[inset_3px_0_0_0_theme(colors.electric)]'
+                        : 'text-navy/80 font-medium hover:text-electric hover:bg-electric/5'
+                    }`}
+                  >
+                    <Icon className="h-[18px] w-[18px] shrink-0" />
+                    <span className="hidden lg:inline-block text-sm">{nav.label}</span>
+                  </Link>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() || '';
   const bare = BARE.some((p) => pathname === p || pathname.startsWith(p + '/'));
@@ -295,12 +547,52 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // 'turned off' message, and the server refuses their saves (lib/featureGate.ts).
   const prefs = usePreferences(!bare);
   const hiddenPaths = React.useMemo(() => featureHiddenPaths(prefs.company), [prefs.company]);
+  // Menu style (My Preferences > General > Menu style, or the switch in the sidebar). The last
+  // choice is cached locally so the menu doesn't flicker while preferences load.
+  const [localMode, setLocalMode] = React.useState<NavMode | null>(null);
+  React.useEffect(() => {
+    const cached = readLocal(NAV_MODE_KEY);
+    if (cached === 'simple' || cached === 'advanced') setLocalMode(cached);
+  }, []);
+  React.useEffect(() => {
+    if (prefs.loaded) {
+      setLocalMode(prefs.my.navMode);
+      writeLocal(NAV_MODE_KEY, prefs.my.navMode);
+    }
+  }, [prefs.loaded, prefs.my.navMode]);
+  const navMode: NavMode = localMode ?? (prefs.loaded ? prefs.my.navMode : 'simple');
+  async function changeMode(m: NavMode) {
+    setLocalMode(m);
+    writeLocal(NAV_MODE_KEY, m);
+    try {
+      await api.patch('/api/preferences/my', { navMode: m });
+      await refreshPreferences();
+    } catch {
+      toast('Could not save the menu style; it will reset next time.', 'danger');
+    }
+  }
+  // Advanced mode: groups fold away and stay the way the person left them.
+  const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
+  React.useEffect(() => {
+    const raw = readLocal(collapsedKey(me?.id));
+    try {
+      setCollapsed(new Set(raw ? (JSON.parse(raw) as string[]) : []));
+    } catch {
+      setCollapsed(new Set());
+    }
+  }, [me?.id]);
+  function toggleGroup(heading: string) {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(heading)) next.delete(heading);
+      else next.add(heading);
+      writeLocal(collapsedKey(me?.id), JSON.stringify([...next]));
+      return next;
+    });
+  }
   const visibleGroups = React.useMemo(
-    () =>
-      filterNavGroups(navGroups, me?.permissions)
-        .map((g) => ({ ...g, links: g.links.filter((l) => !hiddenPaths.has(l.path)) }))
-        .filter((g) => g.links.length > 0),
-    [me?.permissions, hiddenPaths],
+    () => visibleNavGroups(navMode, me?.permissions, hiddenPaths),
+    [navMode, me?.permissions, hiddenPaths],
   );
   const blockedGate = prefs.loaded ? blockingFeatureGate(pathname, prefs.company) : null;
   const [assistantOpen, setAssistantOpen] = React.useState(false);
@@ -327,40 +619,28 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             BookKeeper AI
           </h1>
         </div>
-        <nav className="flex flex-col gap-0.5 w-full flex-1 min-h-0 overflow-y-auto overscroll-contain pr-1 -mr-1">
-          {visibleGroups.map((group) => (
-            <div key={group.heading || 'home'} className="mb-2">
-              {group.heading && (
-                <>
-                  <div className="hidden lg:block px-3 pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-navy/30">
-                    {group.heading}
-                  </div>
-                  {/* Collapsed mode: divider stands in for the group heading. */}
-                  <div className="lg:hidden mx-2 my-2 border-t border-slate-100" aria-hidden="true" />
-                </>
-              )}
-              {group.links.map((nav) => {
-                const Icon = nav.icon;
-                const active = pathname === nav.path || pathname.startsWith(nav.path + '/');
-                return (
-                  <Link
-                    key={nav.label}
-                    href={nav.path}
-                    prefetch={false}
-                    aria-current={active ? 'page' : undefined}
-                    className={`flex items-center justify-center lg:justify-start gap-3 px-2 lg:px-3 py-2 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
-                      active
-                        ? 'bg-electric/10 text-electric font-semibold shadow-[inset_3px_0_0_0_theme(colors.electric)]'
-                        : 'text-navy/80 font-medium hover:text-electric hover:bg-electric/5'
-                    }`}
-                  >
-                    <Icon className="h-[18px] w-[18px] shrink-0" />
-                    <span className="hidden lg:inline-block text-sm">{nav.label}</span>
-                  </Link>
-                );
-              })}
-            </div>
-          ))}
+        <MenuModeToggle mode={navMode} onChange={changeMode} />
+        <SidebarSearch permissions={me?.permissions} hiddenPaths={hiddenPaths} />
+        <nav
+          aria-label={navMode === 'simple' ? 'Everyday tasks' : 'All menus'}
+          className="flex flex-col gap-0.5 w-full flex-1 min-h-0 overflow-y-auto overscroll-contain pr-1 -mr-1"
+        >
+          <NavItems
+            groups={visibleGroups}
+            pathname={pathname}
+            collapsible={navMode === 'advanced'}
+            collapsed={collapsed}
+            onToggle={toggleGroup}
+          />
+          {navMode === 'simple' && (
+            <button
+              type="button"
+              onClick={() => changeMode('advanced')}
+              className="hidden lg:block mt-1 px-3 py-2 text-left text-xs font-semibold text-electric hover:underline outline-none focus-visible:ring-2 focus-visible:ring-electric/50 rounded"
+            >
+              Show all menus…
+            </button>
+          )}
         </nav>
         <div className="shrink-0 pt-3 mt-1 border-t border-slate-100">
           <button
@@ -377,6 +657,24 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       </aside>
       <main className="flex-1 flex flex-col min-w-0">
         <header className="flex items-center justify-end gap-3 px-6 pt-4 -mb-2">
+          {/* "What is this page?" — plain-language help for the current screen (lib/pageHelp.ts). */}
+          {pageHelpFor(pathname) ? (
+            <span className="mr-auto text-sm text-navy/60">
+              <Help key={pathname} page={pathname} side="bottom">
+                What is this page?
+              </Help>
+            </span>
+          ) : (
+            <span className="mr-auto" />
+          )}
+          {/* Narrow windows: the sidebar shows icons only, so page search and the menu switch live here. */}
+          <SidebarSearch
+            permissions={me?.permissions}
+            hiddenPaths={hiddenPaths}
+            idPrefix="ts"
+            className="relative w-48 sm:w-64 lg:hidden"
+          />
+          <MenuModeToggle mode={navMode} onChange={changeMode} className="flex lg:hidden w-40" />
           <button
             type="button"
             onClick={() => setAssistantOpen(true)}

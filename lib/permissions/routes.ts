@@ -143,8 +143,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // the member can't view. To-dos are personal notes (no books data).
   '/api/reminders': kind('member', 'GET'),
   '/api/calendar': kind('member', 'GET'),
-  // Calendar / Lead Center to-dos (wave2 prefs). Served under /api/calendar/todos because
-  // /api/todos is the wave2 lists To Do list (Lists > To Do, gated by the lists area).
+  // THE To Do list (p1 ux): one store. Any member may keep to-dos; a to-do linked to a record
+  // follows that record's area (customers/leads, vendors, payroll, lists) in lib/services/todos.ts.
+  // /api/calendar/todos is a thin alias of /api/todos for older callers.
   '/api/calendar/todos': kind('member', 'GET POST'),
   '/api/calendar/todos/[id]': kind('member', 'PATCH DELETE'),
   // Letters & labels: the templates are a list; producing letters/labels/envelopes needs print
@@ -238,8 +239,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/lists/[list]': r('lists', 'GET POST'),
   '/api/lists/[list]/[id]': r('lists', 'PATCH DELETE'),
   '/api/terms/compute': r('lists', 'GET'),
-  '/api/todos': r('lists', 'GET POST'),
-  '/api/todos/[id]': r('lists', 'PATCH DELETE'),
+  '/api/todos': kind('member', 'GET POST'), // p1 ux: the one To Do list (see /api/calendar/todos)
+  '/api/todos/[id]': kind('member', 'GET PATCH DELETE'),
   '/api/notes': kind('member', 'GET POST'),
   '/api/notes/[id]': kind('member', 'PATCH DELETE'),
   '/api/billing-rate-levels': r('lists', 'GET POST'),

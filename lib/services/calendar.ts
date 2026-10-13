@@ -208,7 +208,7 @@ export async function getCalendar(
       type: 'todo',
       label: `${t.dueTime ? `${t.dueTime} ` : ''}${t.title}`,
       amount: null,
-      href: '/calendar',
+      href: '/todos',
       done: t.done,
       overdue: !t.done && (t.dueDate ?? '') < today,
     });

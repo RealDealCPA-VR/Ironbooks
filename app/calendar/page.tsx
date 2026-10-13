@@ -98,7 +98,7 @@ export default function CalendarPage() {
 
   const loadTodos = useCallback(async () => {
     try {
-      setTodos(await api.get<Todo[]>('/api/calendar/todos'));
+      setTodos((await api.get<{ todos: Todo[] }>('/api/todos')).todos);
     } catch {
       setTodos([]);
     }
@@ -127,7 +127,7 @@ export default function CalendarPage() {
     }
     setSavingTodo(true);
     try {
-      await api.post('/api/calendar/todos', {
+      await api.post('/api/todos', {
         title: todoForm.title.trim(),
         dueDate: todoForm.dueDate || null,
         dueTime: todoForm.dueTime || null,
@@ -146,7 +146,7 @@ export default function CalendarPage() {
 
   async function toggleTodo(id: string, done: boolean) {
     try {
-      await api.patch(`/api/calendar/todos/${id}`, { done });
+      await api.patch(`/api/todos/${id}`, { done });
       await Promise.all([load(), loadTodos()]);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not update the to-do', 'danger');
@@ -155,7 +155,7 @@ export default function CalendarPage() {
 
   async function deleteTodo(id: string) {
     try {
-      await api.del(`/api/calendar/todos/${id}`);
+      await api.del(`/api/todos/${id}`);
       await Promise.all([load(), loadTodos()]);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not delete the to-do', 'danger');
@@ -263,7 +263,12 @@ export default function CalendarPage() {
           </Card>
 
           <Card className="p-4">
-            <h3 className="mb-2 font-bold text-navy">To Do list</h3>
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="font-bold text-navy">To Do list</h3>
+              <Link href="/todos" className="text-xs font-semibold text-electric hover:underline">
+                Open the To Do list
+              </Link>
+            </div>
             {todos.length === 0 ? (
               <p className="text-sm text-navy/50">No open to-dos.</p>
             ) : (

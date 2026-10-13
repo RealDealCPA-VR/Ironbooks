@@ -308,6 +308,8 @@ export interface MyPreferences {
   startWithPayee: boolean;
   // Desktop
   showHomeWorkflow: boolean;
+  /** p1 ux: 'simple' = everyday tasks only (default for new users); 'advanced' = every menu. */
+  navMode: 'simple' | 'advanced';
 }
 
 export const DEFAULT_MY_PREFERENCES: MyPreferences = {
@@ -327,6 +329,7 @@ export const DEFAULT_MY_PREFERENCES: MyPreferences = {
   spellIgnoreInternetAddresses: true,
   startWithPayee: true,
   showHomeWorkflow: true,
+  navMode: 'simple',
 };
 
 export const MY_PREFERENCE_KEYS = Object.keys(DEFAULT_MY_PREFERENCES) as (keyof MyPreferences)[];
@@ -386,6 +389,7 @@ export const PREFERENCE_CATEGORIES: Array<{
       'defaultDate',
       'autoRecallLastTransaction',
       'showHomeWorkflow',
+      'navMode',
     ],
   },
   {
@@ -557,7 +561,9 @@ export function resolveCompanyPreferences(settings: unknown): CompanyPreferences
 
 export function resolveMyPreferences(stored: unknown): MyPreferences {
   // warnWhenDeleting is always on (lib/preferenceFields.ts `fixed`): deleting/voiding always asks.
-  return { ...overlay(DEFAULT_MY_PREFERENCES, stored), warnWhenDeleting: true };
+  const my = { ...overlay(DEFAULT_MY_PREFERENCES, stored), warnWhenDeleting: true };
+  if (my.navMode !== 'advanced') my.navMode = 'simple';
+  return my;
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +770,15 @@ export const FEATURE_GATES: FeatureGate[] = [
     category: 'Payroll & Employees',
     setting: 'Full payroll',
     // The Employee list itself stays (QB keeps the Employee Center with "No payroll").
-    pages: ['/pay-runs', '/pay-stubs', '/pay-liabilities', '/payroll-tax', '/payroll-forms'],
+    pages: [
+      '/employees/setup',
+      '/pay-runs',
+      '/pay-stubs',
+      '/pay-liabilities',
+      '/payroll-tax',
+      '/payroll-forms',
+      '/reports/payroll-summary',
+    ],
     apis: ['/api/payroll', '/api/pay-liabilities', '/api/payroll-items'],
   },
 ];

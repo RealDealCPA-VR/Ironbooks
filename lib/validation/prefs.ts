@@ -50,6 +50,7 @@ export const myPreferencesSchema = z
     spellIgnoreInternetAddresses: z.boolean(),
     startWithPayee: z.boolean(),
     showHomeWorkflow: z.boolean(),
+    navMode: z.enum(['simple', 'advanced']),
   })
   .partial()
   .strict();
