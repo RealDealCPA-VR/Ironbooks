@@ -266,6 +266,31 @@ describe('P1 FX — tester re-test 9', () => {
     expect({ mism, redo, postedAgain }).toEqual({ mism: [], redo: [], postedAgain: false });
   });
 
+  it('[HCA3] a customer with invoices in two currencies: each posted HCA line stays in its own currency', async () => {
+    const c = await createCustomer(ctx, { displayName: 'HCA3 C' } as never);
+    for (const [cur, rate] of [['EUR', '1.10'], ['GBP', '1.25']] as const) {
+      await createInvoice(ctx, {
+        customerId: c.id,
+        date: d('2026-06-15'),
+        currency: cur,
+        exchangeRate: rate,
+        lines: [{ accountId: acct['4000'], quantity: 1, rate: '100.00' }],
+      } as never);
+    }
+    const day = d('2026-07-05');
+    await createHomeCurrencyAdjustment(ctx, { date: day, rates: { EUR: '1.20', GBP: '1.40' }, updateCurrencyList: false });
+    const hca = (await foreignOpenReceivables(ctx, day))
+      .filter((i) => i.kind === 'hca')
+      .map((i) => `${i.currency} ${i.homeOpen.toFixed(2)}`)
+      .sort();
+    expect(hca).toEqual(['EUR 10.00', 'GBP 15.00']);
+    const again = await previewHomeCurrencyAdjustment(ctx, { date: day, rates: { EUR: '1.20', GBP: '1.40' }, updateCurrencyList: false });
+    expect(again.lines.filter((l) => l.kind === 'customer')).toEqual([]);
+    // A later rate change on the same date adjusts each currency by its own delta only.
+    const delta = await previewHomeCurrencyAdjustment(ctx, { date: day, rates: { EUR: '1.25', GBP: '1.40' }, updateCurrencyList: false });
+    expect(delta.lines.filter((l) => l.kind === 'customer').map((l) => `${l.currency} ${l.adjustment}`)).toEqual(['EUR 5.00']);
+  });
+
   it('[R3e] a tiny credit refunded a cent at a time at odd rates leaves no residual and ties each day', async () => {
     const v = await fxVendor('R3e');
     const vc = await fxCredit(v.id, '0.03', '2026-07-01', '1.555');

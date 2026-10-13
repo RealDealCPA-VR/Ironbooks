@@ -288,7 +288,6 @@ export async function clearPaymentFxReliefs(ctx: ServiceContext, paymentId: stri
   await ctx.db.delete(paymentFxReliefs).where(eq(paymentFxReliefs.paymentId, paymentId));
 }
 
-/** Open foreign-currency A/R items (invoices and unapplied payments) as of a date. */
 /**
  * Home Currency Adjustments in effect on the date, per customer / vendor and currency: the named
  * A/R or A/P lines of posted hca:<id> entries and their next-day hca-reversal:<id> entries dated on
@@ -337,9 +336,13 @@ async function hcaItemsAsOf(ctx: ServiceContext, side: 'ar' | 'ap', asOf: Date):
   for (const r of rows) {
     const hcaId = r.ref!.slice(r.ref!.indexOf(':') + 1);
     const detail = (byId.get(hcaId)?.detail ?? []) as Array<{ kind?: string; entityId?: string | null; currency?: string }>;
+    // linesFor writes one line per name AND currency, its memo ending "(CUR)"; a customer can
+    // hold invoices in more than one currency, so the memo decides. The detail is the fallback
+    // (older rows / edited memos) and is only trusted when the name has a single currency.
+    const fromDetail = detail.filter((l) => l.kind === entityType && l.entityId === r.entityId);
     const currency =
-      detail.find((l) => l.kind === entityType && l.entityId === r.entityId)?.currency ??
       /\(([A-Z]{3})\)\s*$/.exec(r.memo ?? '')?.[1] ??
+      (fromDetail.length === 1 ? fromDetail[0].currency : undefined) ??
       '';
     const signed = Money.of(r.debit ?? 0).minus(Money.of(r.credit ?? 0));
     const k = `${hcaId}|${r.entityId}|${currency}`;
@@ -365,6 +368,7 @@ async function hcaItemsAsOf(ctx: ServiceContext, side: 'ar' | 'ap', asOf: Date):
   return out;
 }
 
+/** Open foreign-currency A/R items (invoices and unapplied payments) as of a date. */
 export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): Promise<ForeignOpenItem[]> {
   const home = await homeCode(ctx);
   const inv = await ctx.db
