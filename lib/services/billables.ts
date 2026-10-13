@@ -291,7 +291,9 @@ interface ReimbursementRouting {
 /**
  * QB Time & Expenses > 'Track reimbursed expenses as income'.
  *  - Off (the QB default): the reimbursed COST is credited back to the expense account it was
- *    recorded to, so that expense nets to zero for costs passed through at cost.
+ *    recorded to, so that expense nets to zero for costs passed through at cost. This applies
+ *    only to expense / COGS accounts; a cost recorded to a balance-sheet account (e.g. 1300
+ *    Inventory Asset) is credited to the default income account instead.
  *  - On: the cost is credited to an income account for reimbursements (the active income
  *    account whose name mentions 'reimburs', e.g. 4130 Reimbursed Expenses Income), or the
  *    default income account when there is none.
@@ -307,7 +309,23 @@ async function reimbursementAccountResolver(ctx: ServiceContext): Promise<Reimbu
   const markup = income.find((a) => /markup/i.test(a.name))?.id ?? null;
   const defaultMarkupPercent = Number(prefs.defaultMarkupPercent) || 0;
   if (!prefs.trackReimbursedAsIncome) {
-    return { cost: (cost) => cost.accountId ?? null, markup, defaultMarkupPercent };
+    // Only an expense / cost-of-goods account can be netted back. A billable line recorded to a
+    // balance-sheet account (Inventory Asset on an Inventory Part line, a prepaid, fixed asset or
+    // liability) must NOT be credited: that would drain the asset without relieving stock and the
+    // GL would stop tying to the subledger. Those fall back to the default income account.
+    const expenseIds = new Set(
+      (
+        await ctx.db
+          .select({ id: accounts.id })
+          .from(accounts)
+          .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.type, 'expense')))
+      ).map((a) => a.id),
+    );
+    return {
+      cost: (cost) => (cost.accountId && expenseIds.has(cost.accountId) ? cost.accountId : null),
+      markup,
+      defaultMarkupPercent,
+    };
   }
   const reimbursed = income.find((a) => /reimburs/i.test(a.name))?.id ?? null;
   return { cost: () => reimbursed, markup, defaultMarkupPercent };

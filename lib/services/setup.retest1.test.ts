@@ -206,6 +206,39 @@ describe('reimbursed expenses and markup (ledger)', () => {
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION' });
   });
+
+  it('tracked as expense: a billable line recorded to an ASSET account is never credited back to the asset; it goes to income', async () => {
+    await updateCompany(A, { settings: { trackReimbursedAsIncome: false, defaultMarkupPercent: 0 } });
+    const prepaid = await createAccount(A, { code: '1391', name: 'Prepaid Job Supplies', type: 'asset', subtype: 'other_current_asset' });
+    const e = await billableExpense(prepaid.id, '70.00');
+    const before = await trialBalance(A);
+    const incomeBefore = Number(net(before, acctA['4000']));
+    expect(net(before, prepaid.id)).toBe('70.00');
+    await createInvoiceWithBillables(
+      A,
+      { customerId: custA, date: new Date('2026-03-12'), lines: [] },
+      { expenseLineIds: [e], markupPercent: 0 },
+    );
+    const tb = await trialBalance(A);
+    expect(tb.balanced).toBe(true);
+    // The asset keeps its balance; the reimbursement is income.
+    expect(net(tb, prepaid.id)).toBe('70.00');
+    expect((Number(net(tb, acctA['4000'])) - incomeBefore).toFixed(2)).toBe('-70.00');
+  });
+
+  it('tracked as expense: a cost recorded to a COGS account nets that COGS account to zero', async () => {
+    await updateCompany(A, { settings: { trackReimbursedAsIncome: false, defaultMarkupPercent: 0 } });
+    const cogs = await createAccount(A, { code: '5091', name: 'Job Materials COGS', type: 'expense', subtype: 'cost_of_goods_sold' });
+    const e = await billableExpense(cogs.id, '45.00');
+    await createInvoiceWithBillables(
+      A,
+      { customerId: custA, date: new Date('2026-03-12'), lines: [] },
+      { expenseLineIds: [e], markupPercent: 0 },
+    );
+    const tb = await trialBalance(A);
+    expect(tb.balanced).toBe(true);
+    expect(net(tb, cogs.id)).toBe('0.00');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -493,7 +526,7 @@ describe('automatic journal numbers and always-on settings', () => {
 // ---------------------------------------------------------------------------
 
 describe('re-test probes', () => {
-  it('BUG: billing back an inventory item bought for a customer credits Inventory Asset, so the GL no longer ties to inventory valuation', async () => {
+  it('billing back an inventory item bought for a customer never credits Inventory Asset, so the GL keeps tying to inventory valuation', async () => {
     // Before this branch billable costs were credited to income (4000). With the new routing
     // ("Track reimbursed expenses as income" off) the cost goes back to the bill line's account;
     // for an Inventory Part line that account is 1300 Inventory Asset. The invoice carries no
@@ -530,6 +563,9 @@ describe('re-test probes', () => {
     expect(tb.balanced).toBe(true);
     const valuation = await inventoryValuation(C);
     expect(net(tb, accts['1300'])).toBe(Number(valuation.grandTotal).toFixed(2));
+    expect(net(tb, accts['1300'])).toBe('80.00');
+    // The reimbursement is income (default income account), not a reduction of the asset.
+    expect(net(tb, accts['4000'])).toBe('-80.00');
   });
 
   it('converting an old taxed estimate while sales tax is off gives a plain answer and never unbalances the books', async () => {
