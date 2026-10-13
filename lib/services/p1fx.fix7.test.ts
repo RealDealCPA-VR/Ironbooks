@@ -110,7 +110,7 @@ function eurCredit(vendorId: string, amount: string, date = '2026-07-01', rate =
 
 describe('P1 FX — fix round 7', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-fix7@test.local', name: 'FX Fix7', passwordHash: 'x' }).returning();
     userId = u.id;

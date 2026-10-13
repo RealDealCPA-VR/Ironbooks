@@ -81,7 +81,7 @@ describe('P1 FX — fix round 2: home open amount from the A/R actually relieved
   let user: { id: string };
   let seq = 0;
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     [user] = await db.insert(users).values({ email: 'p1fx-fix2@test.local', name: 'FX F2', passwordHash: 'x' }).returning();
   });

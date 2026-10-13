@@ -171,7 +171,7 @@ function post(id: string, body: unknown) {
 
 describe('P1 FX — tester re-test 7: dated vendor-credit steps around void / edit / refund / penny / isolation', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-rt7@test.local', name: 'FX RT7', passwordHash: 'x' }).returning();
     userId = u.id;

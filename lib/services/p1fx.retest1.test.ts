@@ -129,7 +129,7 @@ describe('P1 FX — tester re-test round 1', () => {
   let user: { id: string };
   let seq = 0;
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     [user] = await db
       .insert(users)

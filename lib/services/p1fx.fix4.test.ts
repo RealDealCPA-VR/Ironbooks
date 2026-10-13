@@ -103,7 +103,7 @@ describe('P1 FX — fix round 4: voiding foreign refunds, refund rows in balance
   let seq = 0;
   let userId: string;
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-fix4@test.local', name: 'FX F4', passwordHash: 'x' }).returning();
     userId = u.id;

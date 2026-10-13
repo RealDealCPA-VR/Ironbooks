@@ -141,7 +141,7 @@ async function setupCompany(name: string) {
 
 describe('P1 FX — tester re-test 9', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-retest9@test.local', name: 'FX R9', passwordHash: 'x' }).returning();
     userId = u.id;

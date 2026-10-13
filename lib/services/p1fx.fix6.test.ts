@@ -180,7 +180,7 @@ describe('P1 FX — fix round 6: as-of aging around later full applies; backdate
   let seq = 0;
   let userId: string;
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-fix6@test.local', name: 'FX F6', passwordHash: 'x' }).returning();
     userId = u.id;

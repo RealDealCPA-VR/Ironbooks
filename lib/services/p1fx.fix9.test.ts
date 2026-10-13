@@ -94,7 +94,7 @@ const post = (id: string, body: unknown) =>
 
 describe('P1 FX — fix round 9', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-fix9@test.local', name: 'FX F9', passwordHash: 'x' }).returning();
     userId = u.id;

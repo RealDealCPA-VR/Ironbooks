@@ -144,7 +144,7 @@ describe('P1 FX — fix round 3: refundPayment telescopes the credit home value'
   let user: { id: string };
   let seq = 0;
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     [user] = await db.insert(users).values({ email: 'p1fx-fix3@test.local', name: 'FX FIX3', passwordHash: 'x' }).returning();
   });

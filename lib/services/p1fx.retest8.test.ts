@@ -152,7 +152,7 @@ const appsFor = (where: { billId?: string; vendorCreditId?: string }) =>
 
 describe('P1 FX — tester re-test 8', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-retest8@test.local', name: 'FX RT8', passwordHash: 'x' }).returning();
     userId = u.id;
