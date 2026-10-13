@@ -259,14 +259,15 @@ export async function paySalesTaxAgencies(
   await assertPayFromBank(ctx, input.paymentAccountId, 'Sales tax');
   const toPrint = Boolean(input.toPrint);
 
-  const resolved: Array<{ agency: typeof taxAgencies.$inferSelect; vendor: typeof vendors.$inferSelect; amount: string }> = [];
-  for (const p of input.payments) {
-    const { agency, vendor } = await ensureAgencyVendor(ctx, p.agencyId);
-    resolved.push({ agency, vendor, amount: toAmountString(Money.of(p.amount)) });
-  }
-  const fallback2200 = await accountIdByCode(ctx, CODE_SALES_TAX_PAYABLE);
-
   return inTransaction(ctx, async (tx) => {
+    // Agency vendors are linked/created inside the same transaction as the checks, so a run that
+    // fails part-way (e.g. a used check number on the 2nd agency) leaves nothing behind.
+    const resolved: Array<{ agency: typeof taxAgencies.$inferSelect; vendor: typeof vendors.$inferSelect; amount: string }> = [];
+    for (const p of input.payments) {
+      const { agency, vendor } = await ensureAgencyVendor(tx, p.agencyId);
+      resolved.push({ agency, vendor, amount: toAmountString(Money.of(p.amount)) });
+    }
+    const fallback2200 = await accountIdByCode(tx, CODE_SALES_TAX_PAYABLE);
     const checks: SalesTaxPaymentResult['checks'] = [];
     let number: string | null = input.checkNumber?.trim() || null;
     let total = Money.zero();
@@ -469,6 +470,14 @@ export async function markPaymentCheckPrinted(
 ): Promise<PaymentCheckRow> {
   const check = await getPaymentCheck(ctx, input.id);
   if (check.voidedAt) throw new ServiceError('CONFLICT', 'This check is void and cannot be printed.');
+  if (check.postedEntryId) {
+    // The journal entry may have been voided another way (Void journal entry, Batch Void).
+    const [entry] = await ctx.db
+      .select({ status: journalEntries.status })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.id, check.postedEntryId), eq(journalEntries.companyId, ctx.companyId)));
+    if (entry?.status === 'void') throw new ServiceError('CONFLICT', 'This check is void and cannot be printed.');
+  }
   if (!check.toPrint) throw new ServiceError('CONFLICT', 'This check is not in the print queue.');
   const checkNumber = input.checkNumber?.trim() || (await nextCheckNumber(ctx, check.paymentAccountId));
   await assertCheckNumberAvailable(ctx, {

@@ -903,11 +903,18 @@ export async function salesTaxRevenueSummary(
     lines: DocLine[],
     fx: Dec,
     sign: 1 | -1,
+    share?: { before: Dec; through: Dec },
   ) => {
     for (const l of lines) {
       const t = l.itemId ? itemTypes.get(l.itemId) : undefined;
       if (t === 'subtotal' || t === 'payment' || t === 'sales_tax') continue;
-      const amt = Money.round2(Money.of(l.amount).times(fx)).times(sign);
+      const full = Money.round2(Money.of(l.amount).times(fx));
+      // Cash basis: cumulative allocation per line — round(amount x paid-through-end / total) minus
+      // round(amount x paid-before-start / total) — so adjacent periods add up exactly to the whole.
+      const part = share
+        ? Money.round2(full.times(share.through)).minus(Money.round2(full.times(share.before)))
+        : full;
+      const amt = part.times(sign);
       const rateId = l.taxable ? (l.taxRateId && t !== 'discount' ? l.taxRateId : headerRateId) : headerRateId;
       const a = get(rateId);
       a.total = a.total.plus(amt);
@@ -927,7 +934,10 @@ export async function salesTaxRevenueSummary(
         sql`${invoices.status} NOT IN ('void', 'draft')`,
       ),
     );
-  const invShare = new Map<string, Dec>();
+  // Cash basis: fraction of each invoice settled before the range start and through the range end
+  // (capped at 1). Sales in range = share through end minus share before start, rounded per line on
+  // the running total (same cumulative approach as toCashBasis uses for the tax).
+  const invShare = new Map<string, { before: Dec; through: Dec }>();
   if (basis === 'cash' && invHeadsAll.length) {
     const settlements = await invoiceSettlements(
       ctx,
@@ -937,10 +947,17 @@ export async function salesTaxRevenueSummary(
     for (const h of invHeadsAll) {
       const total = Money.of(h.total);
       if (!total.greaterThan(0)) continue;
-      const paid = settlements
-        .filter((x) => x.invoiceId === h.id && inRange(x.date, range) === 'in')
-        .reduce((t, x) => t.plus(Money.of(x.amount)), Money.zero());
-      if (paid.greaterThan(0)) invShare.set(h.id, paid.greaterThan(total) ? Money.of(1) : paid.dividedBy(total));
+      let before = Money.zero();
+      let through = Money.zero();
+      for (const x of settlements) {
+        if (x.invoiceId !== h.id) continue;
+        const where = inRange(x.date, range);
+        if (where === 'after') continue;
+        through = through.plus(Money.of(x.amount));
+        if (where === 'before') before = before.plus(Money.of(x.amount));
+      }
+      const frac = (v: Dec) => (v.greaterThanOrEqualTo(total) ? Money.of(1) : v.dividedBy(total));
+      if (through.greaterThan(before)) invShare.set(h.id, { before: frac(before), through: frac(through) });
     }
   }
   const invHeads = basis === 'cash' ? invHeadsAll.filter((h) => invShare.has(h.id)) : invHeadsAll;
@@ -956,8 +973,7 @@ export async function salesTaxRevenueSummary(
       .from(invoiceLines)
       .where(inArray(invoiceLines.invoiceId, invHeads.map((h) => h.id)));
     for (const h of invHeads) {
-      const share = invShare.get(h.id) ?? Money.of(1);
-      addDoc(h.taxRateId, lines.filter((l) => l.docId === h.id), Money.of(h.fx ?? 1).times(share), 1);
+      addDoc(h.taxRateId, lines.filter((l) => l.docId === h.id), Money.of(h.fx ?? 1), 1, invShare.get(h.id));
     }
   }
 
