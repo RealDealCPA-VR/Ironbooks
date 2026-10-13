@@ -167,7 +167,7 @@ async function setupCompany(c: ServiceContext, map: Record<string, string>) {
 describe('P1 FX — re-test 3: refundPayment telescoping (fix round 3)', () => {
   let seq = 0;
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     [user] = await db.insert(users).values({ email: 'p1fx-rt3@test.local', name: 'FX RT3', passwordHash: 'x' }).returning();
   });

@@ -127,7 +127,7 @@ describe('P1 FX — fix round 5: as-of reports around voided, applied and unappl
   let seq = 0;
   let userId: string;
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-fix5@test.local', name: 'FX F5', passwordHash: 'x' }).returning();
     userId = u.id;

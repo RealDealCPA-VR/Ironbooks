@@ -127,7 +127,7 @@ async function stageFeed(bankAccountId: string, date: string, amount: string, de
 
 describe('P1 FX — multi-currency completeness', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [user] = await db.insert(users).values({ email: 'p1fx@test.local', name: 'FX', passwordHash: 'x' }).returning();
     const [company] = await db.insert(companies).values({ name: 'FX Co', ownerId: user.id }).returning();

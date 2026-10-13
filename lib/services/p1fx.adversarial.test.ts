@@ -158,7 +158,7 @@ const DEFS: Array<[string, string, string, string]> = [
 
 describe('P1 FX — adversarial QA', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [user] = await db
       .insert(users)

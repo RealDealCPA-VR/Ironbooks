@@ -176,7 +176,7 @@ async function newCompany(name: string): Promise<ServiceContext> {
 describe('P1 FX — tester re-test 4 (refund voids keep A/R == aging)', () => {
   let seq = 0;
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'p1fx-rt4@test.local', name: 'FX RT4', passwordHash: 'x' }).returning();
     userId = u.id;
