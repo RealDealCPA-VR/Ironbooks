@@ -1854,6 +1854,10 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
     })
     .from(invoices)
     .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)));
+  // A Currency field holding the home code (any case) or a lower-case foreign code is the same
+  // currency as the normalised code; compare normalised codes, as postPayment does.
+  for (const r of invoiceRows) r.currency = await normalizeCurrency(ctx, r.currency);
+  const paymentCurrency = await normalizeCurrency(ctx, payment.currency);
   const invoiceById = new Map(invoiceRows.map((r) => [r.id, r]));
 
   for (const app of input.applications) {
@@ -1869,9 +1873,9 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
       // A pending invoice posted nothing to A/R; paying it would credit A/R with no matching charge.
       throw validation('That invoice is still a draft. Post it before applying a payment to it.');
     }
-    if ((inv.currency ?? null) !== (payment.currency ?? null)) {
+    if ((inv.currency ?? null) !== paymentCurrency) {
       throw validation(
-        `Invoice ${app.invoiceId} currency (${inv.currency ?? 'base'}) does not match payment currency (${payment.currency ?? 'base'}).`,
+        `Invoice ${app.invoiceId} currency (${inv.currency ?? 'home'}) does not match payment currency (${paymentCurrency ?? 'home'}).`,
       );
     }
     if (Money.of(app.amountApplied).greaterThan(inv.balanceDue)) {
