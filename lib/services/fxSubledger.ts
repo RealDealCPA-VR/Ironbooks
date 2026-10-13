@@ -19,11 +19,13 @@ import { and, eq, inArray, isNotNull, isNull, lte, ne, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
   accounts,
+  auditLogs,
   billPaymentApplications,
   billPayments,
   bills,
   customers,
   invoices,
+  journalEntries,
   journalEntryLines,
   paymentApplications,
   paymentFxReliefs,
@@ -538,6 +540,55 @@ export async function foreignAmountsByEntry(
       .innerJoin(vendorCredits, eq(vendorCreditApplications.vendorCreditId, vendorCredits.id))
       .where(and(eq(vendorCreditApplications.companyId, ctx.companyId), inArray(vendorCreditApplications.fxEntryId, chunk)))) {
       put(r.e, r.c, 0);
+    }
+    // Refund of a foreign payment's unapplied credit (sourceRef refund:<paymentId>): the refunded
+    // amount in the payment's currency is on the payment's refund audit row (postedEntryId).
+    const refunds = await ctx.db
+      .select({ e: journalEntries.id, ref: journalEntries.sourceRef })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          inArray(journalEntries.id, chunk),
+          sql`${journalEntries.sourceRef} LIKE 'refund:%'`,
+        ),
+      );
+    if (refunds.length) {
+      const payIds = [...new Set(refunds.map((r) => r.ref!.slice('refund:'.length)))].filter((id) =>
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id),
+      );
+      if (payIds.length === 0) continue;
+      const payCur = new Map(
+        (
+          await ctx.db
+            .select({ id: paymentsReceived.id, c: paymentsReceived.currency })
+            .from(paymentsReceived)
+            .where(and(eq(paymentsReceived.companyId, ctx.companyId), inArray(paymentsReceived.id, payIds)))
+        ).map((p) => [p.id, p.c]),
+      );
+      const foreignPayIds = payIds.filter((id) => foreignCode(payCur.get(id) ?? null, home));
+      if (foreignPayIds.length) {
+        const audits = await ctx.db
+          .select({ id: auditLogs.entityId, v: auditLogs.newValues })
+          .from(auditLogs)
+          .where(
+            and(
+              eq(auditLogs.companyId, ctx.companyId),
+              eq(auditLogs.entityType, 'payment_received'),
+              inArray(auditLogs.entityId, foreignPayIds),
+              sql`${auditLogs.newValues}->>'action' = 'refund'`,
+            ),
+          );
+        const amountByEntry = new Map<string, string>();
+        for (const a of audits) {
+          const v = a.v as { postedEntryId?: string; amount?: string } | null;
+          if (v?.postedEntryId && v.amount != null) amountByEntry.set(v.postedEntryId, v.amount);
+        }
+        for (const r of refunds) {
+          const amount = amountByEntry.get(r.e);
+          if (amount != null) put(r.e, payCur.get(r.ref!.slice('refund:'.length)) ?? null, amount);
+        }
+      }
     }
   }
   return out;
