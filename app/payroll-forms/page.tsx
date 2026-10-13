@@ -18,6 +18,7 @@ import {
   Card,
   Select,
   Label,
+  Input,
   PageHeader,
   toast,
 } from '@/components/ui';
@@ -60,6 +61,9 @@ export default function PayrollFormsPage() {
   // 941 form state
   const [q941Quarter, setQ941Quarter] = useState('1');
   const [q941Year, setQ941Year]       = useState(String(currentYear));
+  const [q941Schedule, setQ941Schedule] = useState<'monthly' | 'semiweekly'>('monthly');
+  const [q941Deposits, setQ941Deposits] = useState('');
+  const [f940Deposits, setF940Deposits] = useState('');
 
   // 940 form state (annual — defaults to the last completed year)
   const [f940Year, setF940Year] = useState(String(currentYear - 1));
@@ -102,13 +106,24 @@ export default function PayrollFormsPage() {
   function handleDownload941() {
     if (!q941Quarter) { toast('Please select a quarter', 'danger'); return; }
     if (!q941Year)    { toast('Please select a year', 'danger');   return; }
-    const url = `/api/payroll/941?quarter=${encodeURIComponent(q941Quarter)}&year=${encodeURIComponent(q941Year)}`;
+    if (q941Deposits.trim() && !/^\d+(\.\d{1,2})?$/.test(q941Deposits.trim())) {
+      toast('Enter deposits as an amount, like 1234.56', 'danger'); return;
+    }
+    const url =
+      `/api/payroll/941?quarter=${encodeURIComponent(q941Quarter)}&year=${encodeURIComponent(q941Year)}` +
+      `&schedule=${q941Schedule}` +
+      (q941Deposits.trim() ? `&deposits=${encodeURIComponent(q941Deposits.trim())}` : '');
     window.open(url, '_blank', 'noopener,noreferrer');
   }
 
   function handleDownload940() {
     if (!f940Year) { toast('Please select a year', 'danger'); return; }
-    const url = `/api/payroll/940?year=${encodeURIComponent(f940Year)}`;
+    if (f940Deposits.trim() && !/^\d+(\.\d{1,2})?$/.test(f940Deposits.trim())) {
+      toast('Enter deposits as an amount, like 1234.56', 'danger'); return;
+    }
+    const url =
+      `/api/payroll/940?year=${encodeURIComponent(f940Year)}` +
+      (f940Deposits.trim() ? `&deposits=${encodeURIComponent(f940Deposits.trim())}` : '');
     window.open(url, '_blank', 'noopener,noreferrer');
   }
 
@@ -186,7 +201,9 @@ export default function PayrollFormsPage() {
           <div>
             <h2 className="text-base font-semibold text-navy">Form 941 — Quarterly Tax Return</h2>
             <p className="text-xs text-navy/50 mt-1">
-              Download a Form 941 summary for a calendar quarter, covering all employees.
+              Form 941 for a calendar quarter, covering all employees: every line, the monthly
+              liability (line 16) and Schedule B for semiweekly depositors. Deposits come from
+              your Pay Liabilities payments of federal withholding, Social Security and Medicare.
             </p>
           </div>
 
@@ -217,6 +234,29 @@ export default function PayrollFormsPage() {
             </Select>
           </div>
 
+          <div>
+            <Label htmlFor="q941Schedule">Deposit schedule</Label>
+            <Select
+              id="q941Schedule"
+              value={q941Schedule}
+              onChange={(e) => setQ941Schedule(e.target.value as 'monthly' | 'semiweekly')}
+            >
+              <option value="monthly">Monthly depositor</option>
+              <option value="semiweekly">Semiweekly depositor (adds Schedule B)</option>
+            </Select>
+          </div>
+
+          <div>
+            <Label htmlFor="q941Deposits">Deposits made outside the app (optional)</Label>
+            <Input
+              id="q941Deposits"
+              inputMode="decimal"
+              placeholder="Leave blank to use your recorded payments"
+              value={q941Deposits}
+              onChange={(e) => setQ941Deposits(e.target.value)}
+            />
+          </div>
+
           <Button onClick={handleDownload941} className="mt-auto">
             <FileText className="h-4 w-4" />
             Download 941
@@ -228,8 +268,9 @@ export default function PayrollFormsPage() {
           <div>
             <h2 className="text-base font-semibold text-navy">Form 940 — Annual FUTA Return</h2>
             <p className="text-xs text-navy/50 mt-1">
-              Annual FUTA worksheet: total payments, wages over the $7,000 base, FUTA tax,
-              and the quarterly liability breakdown.
+              Annual FUTA return: total and exempt payments, wages over the $7,000 base, FUTA
+              tax, credit reduction states (Schedule A), deposits, balance due and the quarterly
+              liability.
             </p>
           </div>
 
@@ -244,6 +285,17 @@ export default function PayrollFormsPage() {
                 <option key={y} value={String(y)}>{y}</option>
               ))}
             </Select>
+          </div>
+
+          <div>
+            <Label htmlFor="f940Deposits">FUTA deposits made outside the app (optional)</Label>
+            <Input
+              id="f940Deposits"
+              inputMode="decimal"
+              placeholder="Leave blank to use your recorded payments"
+              value={f940Deposits}
+              onChange={(e) => setF940Deposits(e.target.value)}
+            />
           </div>
 
           <Button onClick={handleDownload940} className="mt-auto">

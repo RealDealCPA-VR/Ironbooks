@@ -6,14 +6,15 @@
  * state income-tax withholding.
  *
  * Request body:
- *   { grossPerPeriod: string|number, periodsPerYear: number, state: string }
+ *   { grossPerPeriod: string|number, periodsPerYear: number, state: string,
+ *     year?: number, filingStatus?: 'single'|'married'|'married_separate'|'head_of_household' }
  *
  * Response (200):
- *   { stateTax: string, annualStateTax: string, stateCode: string, stateName: string, rateLabel: string }
+ *   { stateTax, annualStateTax, stateCode, stateName, rateLabel, method, notes }
  *   (monetary values as 2-dp decimal strings)
  *
- * APPROXIMATION: rates are ~2024 public figures for estimation only.
- * Always verify with the official state revenue department before filing.
+ * Same year-keyed engine as paychecks (lib/services/statePayrollTax.ts); states the app does not
+ * calculate return 0 with a note (never a guess).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { statePerPeriod, SUPPORTED_STATE_CODES } from '@/lib/services/statePayrollTax';
@@ -75,10 +76,22 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const { year, filingStatus } = body as { year?: unknown; filingStatus?: unknown };
+    const taxYear = year === undefined || year === null || year === '' ? undefined : Number(year);
+    if (taxYear !== undefined && (!Number.isInteger(taxYear) || taxYear < 2000 || taxYear > 2100)) {
+      return errorResponse('year must be a four-digit year');
+    }
+    const fs = typeof filingStatus === 'string' ? filingStatus : undefined;
+    if (fs && !['single', 'married', 'married_separate', 'head_of_household'].includes(fs)) {
+      return errorResponse('filingStatus must be single, married, married_separate or head_of_household');
+    }
+
     const result = statePerPeriod({
       grossPerPeriod: gross,
       periodsPerYear: periods,
       state: stateCode,
+      year: taxYear,
+      stateW4: fs ? { filingStatus: fs as 'single' } : null,
     });
 
     return NextResponse.json({
@@ -87,6 +100,8 @@ export async function POST(req: NextRequest) {
       stateCode: result.stateInfo.code,
       stateName: result.stateInfo.name,
       rateLabel: result.stateInfo.rateLabel,
+      method: result.method,
+      notes: result.notes,
     });
   } catch (err) {
     console.error('[payroll/state-tax] unexpected error:', err);

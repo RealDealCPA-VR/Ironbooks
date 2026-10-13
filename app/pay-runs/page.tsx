@@ -97,6 +97,8 @@ interface RunResult {
   netPay?: string;
   error?: string;
   warning?: string;
+  /** Calculation notes (state withholding not set up, nearest-year tables, local taxes). */
+  notes?: string[];
 }
 
 interface UnpaidTime {
@@ -369,6 +371,9 @@ export default function PayRunsPage() {
                   )}
                   <span className="text-sm font-medium text-navy">{r.employeeName}</span>
                   {r.warning && <Badge tone="warning">{r.warning}</Badge>}
+                  {(r.notes ?? []).map((n) => (
+                    <span key={n} className="text-[11px] text-amber-700">{n}</span>
+                  ))}
                 </div>
                 {r.ok ? (
                   <span className="text-sm font-mono text-navy">

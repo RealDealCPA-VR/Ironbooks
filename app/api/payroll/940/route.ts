@@ -37,7 +37,11 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const data = await form940Data(ctx, { year: parseInt(yearStr, 10) });
+    const deposits = searchParams.get('deposits');
+    if (deposits && !/^\d+(\.\d{1,2})?$/.test(deposits.trim())) {
+      return NextResponse.json({ error: 'deposits must be an amount like 1234.56', code: 'VALIDATION' }, { status: 400 });
+    }
+    const data = await form940Data(ctx, { year: parseInt(yearStr, 10), depositsOverride: deposits?.trim() || null });
 
     if (searchParams.get('format') === 'json') {
       return NextResponse.json(data);

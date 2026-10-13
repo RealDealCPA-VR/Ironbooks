@@ -238,16 +238,17 @@ describe('IIF migration fidelity', () => {
     expect(e.w4).toMatchObject({ filingStatus: 'head_of_household' });
   });
 
-  it('L4: registry lists import into their tables; lists without a table are returned as deferred', async () => {
+  it('L4: registry lists import into their tables (TERMS / SHIPMETH de-duplicated against the defaults)', async () => {
     expect(counts.lists.CTYPE).toBe(2);
     expect(counts.lists.VTYPE).toBe(1);
     expect(counts.lists.SALESREP).toBe(1);
     const reps = await ctx.db.select().from(salesReps).where(eq(salesReps.companyId, ctx.companyId));
     expect(reps.map((r) => r.name)).toContain('John Smith');
-    const deferred = new Map(counts.deferred.map((d) => [d.list, d]));
-    expect(deferred.get('TERMS')?.count).toBe(1);
-    expect(deferred.get('TERMS')?.rows[0].NAME).toBe('Net 15');
-    expect(deferred.get('SHIPMETH')?.note).toBeTruthy();
+    // TERMS and SHIPMETH now import into their lists; 'Net 15' and 'UPS' are QB defaults that
+    // already exist, so nothing is added and nothing is deferred.
+    expect(counts.deferred.map((d) => d.list)).toEqual([]);
+    expect(counts.lists.TERMS).toBe(0);
+    expect(counts.lists.SHIPMETH).toBe(0);
   });
 
   it('re-importing the same file creates nothing new', async () => {

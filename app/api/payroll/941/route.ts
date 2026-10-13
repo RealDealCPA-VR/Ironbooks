@@ -1,8 +1,9 @@
 /**
- * GET /api/payroll/941?quarter=<1-4>&year=<yyyy>
+ * GET /api/payroll/941?quarter=<1-4>&year=<yyyy>[&schedule=monthly|semiweekly][&deposits=<amount>][&format=json]
  *
- * Returns a Form 941 PDF (application/pdf, inline) for the specified
- * calendar quarter and year, covering all employees of the active company.
+ * Returns a Form 941 PDF (application/pdf, inline) for the specified calendar quarter and year,
+ * covering all employees of the active company: lines 1-15, line 16 and (semiweekly) Schedule B.
+ * `deposits` overrides line 13 (deposits made outside the app); `format=json` returns the data.
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -45,7 +46,22 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'quarter must be between 1 and 4', code: 'VALIDATION' }, { status: 400 });
     }
 
-    const data = await form941Data(ctx, { quarter: quarter as 1 | 2 | 3 | 4, year });
+    const schedule = searchParams.get('schedule');
+    if (schedule && schedule !== 'monthly' && schedule !== 'semiweekly') {
+      return NextResponse.json({ error: 'schedule must be monthly or semiweekly', code: 'VALIDATION' }, { status: 400 });
+    }
+    const deposits = searchParams.get('deposits');
+    if (deposits && !/^\d+(\.\d{1,2})?$/.test(deposits.trim())) {
+      return NextResponse.json({ error: 'deposits must be an amount like 1234.56', code: 'VALIDATION' }, { status: 400 });
+    }
+
+    const data = await form941Data(ctx, {
+      quarter: quarter as 1 | 2 | 3 | 4,
+      year,
+      depositSchedule: (schedule as 'monthly' | 'semiweekly' | null) ?? undefined,
+      depositsOverride: deposits?.trim() || null,
+    });
+    if (searchParams.get('format') === 'json') return NextResponse.json(data);
     const pdfBytes = await render941Pdf(data);
 
     const filename = `Form941_Q${quarter}_${year}.pdf`;
