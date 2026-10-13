@@ -28,6 +28,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { assertClosedPeriodEdit } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import { getPreferences } from './company';
 import {
@@ -487,6 +488,7 @@ export async function markPaymentCheckPrinted(
     allowDuplicate: input.allowDuplicateNumber,
   });
   return inTransaction(ctx, async (tx) => {
+    await assertClosedPeriodEdit(tx, { entryId: check.postedEntryId, what: 'check number', date: check.date });
     const [updated] = await tx.db
       .update(paymentChecks)
       .set({ toPrint: false, reference: checkNumber })

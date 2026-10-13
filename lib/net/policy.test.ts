@@ -16,6 +16,7 @@ vi.mock('@/lib/services/networkPolicy', () => ({
   getNetworkPolicy: async () => stored.policy,
 }));
 import { assertOutboundAllowed, policyFetch, recentOutbound } from './guard';
+import { recordTailnetVerification } from './cidr';
 
 const policy = (mode: NetworkPolicy['mode'], optIn: Partial<Record<OutboundPurpose, boolean>> = {}): NetworkPolicy =>
   normalizePolicy({ mode, cloudOptIn: optIn });
@@ -67,6 +68,8 @@ describe('decideOutbound — per mode and purpose', () => {
   });
 
   it('tailnet-only (default): loopback + LAN + tailnet, never the internet — even when opted in', () => {
+    // The MagicDNS name was resolved to a tailnet address (lib/net/tailnetVerify.ts).
+    recordTailnetVerification('gpu-box.tail1234.ts.net', true);
     for (const p of OUTBOUND_PURPOSES) {
       const pol = policy('tailnet-only', { [p]: true });
       expect(decideOutbound(pol, LOCAL, p, undefined).allowed).toBe(true);

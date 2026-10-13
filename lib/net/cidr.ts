@@ -4,16 +4,20 @@
  * Every outbound destination is reduced to one of five classes:
  *   loopback — this machine (127.0.0.0/8, ::1, localhost)
  *   lan      — private LAN ranges (RFC 1918 10/8, 172.16/12, 192.168/16; IPv6 ULA fc00::/7)
- *   tailnet  — the Tailscale network (100.64.0.0/10 CGNAT, fd7a:115c:a1e0::/48, *.ts.net)
+ *   tailnet  — the Tailscale network (100.64.0.0/10 CGNAT, fd7a:115c:a1e0::/48, and *.ts.net
+ *              names VERIFIED to resolve only to those ranges — see below)
  *   public   — anything else, INCLUDING every hostname we cannot classify syntactically
  *              (a name like mail.example.com could resolve anywhere, so it is never trusted)
  *   invalid  — unroutable / special-purpose ranges we never call (0.0.0.0/8, link-local
  *              169.254/16 + fe80::/10 — which includes cloud metadata endpoints —, multicast,
  *              reserved, broadcast) and unparseable input
  *
- * Classification is purely syntactic (no DNS), so it cannot be fooled by DNS rebinding:
- * names are only trusted when the name itself pins the network (localhost, *.ts.net —
- * MagicDNS names are answered by Tailscale's own resolver with 100.x addresses).
+ * Classification is syntactic (no DNS here): names are only trusted when the name itself pins
+ * the network (localhost). *.ts.net is NOT enough on its own — Tailscale Funnel publishes
+ * *.ts.net names that resolve to PUBLIC relay addresses. A *.ts.net name counts as tailnet only
+ * after lib/net/tailnetVerify.ts resolved it and every address was in 100.64.0.0/10 or
+ * fd7a:115c:a1e0::/48 (remembered for a short time, below). Until then it is 'public', so the
+ * cloud opt-in and AI redaction apply.
  */
 
 export type HostClass = 'loopback' | 'lan' | 'tailnet' | 'public' | 'invalid';
@@ -150,6 +154,42 @@ export function normalizeHost(host: string): string {
   return h.replace(/\.$/, '');
 }
 
+// ---- *.ts.net names verified to resolve to tailnet addresses ----
+
+/** How long a DNS verification of a *.ts.net name is trusted. */
+export const TAILNET_VERIFY_TTL_MS = 60_000;
+const verifiedTailnetNames = new Map<string, number>();
+
+/** True for a syntactically valid name under ts.net (MagicDNS or Funnel; not yet trusted). */
+export function isTsNetName(host: string): boolean {
+  const h = normalizeHost(host);
+  return h.endsWith('.ts.net') && /^[a-z0-9.-]+$/.test(h) && !h.startsWith('.') && !h.includes('..');
+}
+
+/** Record the result of resolving a *.ts.net name (lib/net/tailnetVerify.ts). */
+export function recordTailnetVerification(host: string, isTailnet: boolean, now: number = Date.now()): void {
+  const h = normalizeHost(host);
+  if (isTailnet) verifiedTailnetNames.set(h, now + TAILNET_VERIFY_TTL_MS);
+  else verifiedTailnetNames.delete(h);
+}
+
+/** True while a *.ts.net name's tailnet-only resolution is fresh. */
+export function isVerifiedTailnetName(host: string, now: number = Date.now()): boolean {
+  const h = normalizeHost(host);
+  const until = verifiedTailnetNames.get(h);
+  if (until === undefined) return false;
+  if (until < now) {
+    verifiedTailnetNames.delete(h);
+    return false;
+  }
+  return true;
+}
+
+/** Forget every verification (tests). */
+export function clearTailnetVerifications(): void {
+  verifiedTailnetNames.clear();
+}
+
 /** Classify a hostname or IP literal (no port). See the module comment for the classes. */
 export function classifyHost(rawHost: string): HostClass {
   if (!rawHost || typeof rawHost !== 'string') return 'invalid';
@@ -161,8 +201,9 @@ export function classifyHost(rawHost: string): HostClass {
   if (v6) return classifyIPv6(v6);
   if (host.includes(':')) return 'invalid';
   if (!/^[a-z0-9.-]+$/.test(host) || host.startsWith('.') || host.includes('..')) return 'invalid';
-  // Tailscale MagicDNS names are resolved by Tailscale to tailnet addresses.
-  if (host.endsWith('.ts.net')) return 'tailnet';
+  // MagicDNS names resolve to tailnet addresses, but Funnel names under ts.net are public:
+  // trust one only after it was resolved and verified (lib/net/tailnetVerify.ts).
+  if (host.endsWith('.ts.net')) return isVerifiedTailnetName(host) ? 'tailnet' : 'public';
   return 'public';
 }
 

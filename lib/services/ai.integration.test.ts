@@ -13,6 +13,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
+import { setHostLookup } from '@/lib/net/tailnetVerify';
 import {
   users,
   companies,
@@ -86,6 +87,8 @@ async function addBankTxn(payee: string, amount: string, date = '2026-09-15') {
 
 describe('AI layer — integration', () => {
   beforeAll(async () => {
+    // The tailnet GPU box's MagicDNS name resolves to a tailnet address (no real DNS in tests).
+    setHostLookup(async (h) => (h.endsWith('.tail1234.ts.net') ? ['100.101.1.5'] : []));
     process.env.BKA_AUTH_SECRET = 'test-ai-secret-0123456789abcdef';
     db = await getDb(TEST_DIR);
     const [owner] = await db.insert(users).values({ email: 'ai-owner@test.local', name: 'Owner', passwordHash: 'x' }).returning();

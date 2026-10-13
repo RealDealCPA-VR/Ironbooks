@@ -53,7 +53,7 @@ import {
   getOrCreateExchangeGainLossAccount,
   resolveDocumentCurrency,
 } from './currencies';
-import { entryHasReconciledLines } from './postedEdit';
+import { assertClosedPeriodEdit, entryHasReconciledLines } from './postedEdit';
 import {
   type JournalCreditToBillInput,
   type JournalItemPaymentInput,
@@ -638,6 +638,8 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
 
     let entryId = cur.postedEntryId;
     if (headerOnly) {
+      // Closing date: even a number-only change to a closed-period payment needs the password.
+      await assertClosedPeriodEdit(tx, { entryId: cur.postedEntryId, what: 'bill payment', date: cur.date });
       await tx.db.update(billPayments).set({ reference, toPrint }).where(eq(billPayments.id, id));
       if (entryId) {
         await tx.db
@@ -742,6 +744,7 @@ export async function markBillPaymentPrinted(
   });
 
   return inTransaction(ctx, async (tx) => {
+    await assertClosedPeriodEdit(tx, { entryId: payment.postedEntryId, what: 'check number', date: payment.date });
     const [updated] = await tx.db
       .update(billPayments)
       .set({ toPrint: false, reference: checkNumber })

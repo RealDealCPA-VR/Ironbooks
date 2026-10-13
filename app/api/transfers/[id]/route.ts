@@ -5,6 +5,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getTransfer, updateTransfer, voidTransfer } from '@/lib/services/transfers';
 import { routeError } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -29,17 +30,17 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createTransferSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    return NextResponse.json(await updateTransfer(ctx, id, parsed.data));
+    return NextResponse.json(await withVersionCheck(ctx, 'transfer', id, expectedVersion(req), (c) => updateTransfer(c, id, parsed.data)));
   } catch (err) {
     return routeError(err, 'PATCH /api/transfers/[id]');
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    return NextResponse.json(await voidTransfer(ctx, id));
+    return NextResponse.json(await withVersionCheck(ctx, 'transfer', id, expectedVersion(req), (c) => voidTransfer(c, id)));
   } catch (err) {
     return routeError(err, 'DELETE /api/transfers/[id]');
   }

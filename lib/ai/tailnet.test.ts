@@ -1,5 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { classifyEndpoint, classifyHost, discoverTailnetPeers, parseTailscaleStatus } from './tailnet';
+import { clearTailnetVerifications, recordTailnetVerification } from '@/lib/net/cidr';
+
+// gpu-box.tail1234.ts.net was resolved to a tailnet address (lib/net/tailnetVerify.ts).
+beforeAll(() => recordTailnetVerification('gpu-box.tail1234.ts.net', true));
+afterAll(() => clearTailnetVerifications());
 
 describe('classifyHost', () => {
   it.each([
@@ -13,6 +18,7 @@ describe('classifyHost', () => {
     ['100.128.0.1', 'public'], // just outside 100.64.0.0/10
     ['100.63.255.255', 'public'],
     ['gpu-box.tail1234.ts.net', 'tailnet'],
+    ['funnel-box.tail1234.ts.net', 'public'], // not verified: could be a public Funnel name
     ['fd7a:115c:a1e0::1', 'tailnet'],
     ['10.0.0.5', 'lan'],
     ['172.16.4.2', 'lan'],

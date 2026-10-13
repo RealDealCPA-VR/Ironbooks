@@ -33,7 +33,7 @@ let vendorId: string;
 const TABLE = { invoice: invoices, bill: bills, journal_entry: journalEntries, customer: customers, vendor: vendors, item: items } as const;
 
 async function storedVersion(entity: VersionedEntity, id: string): Promise<Date> {
-  const t = TABLE[entity] as unknown as typeof customers;
+  const t = (TABLE as Record<string, unknown>)[entity] as unknown as typeof customers;
   const [row] = await db.select({ updatedAt: t.updatedAt }).from(t).where(eq(t.id, id));
   return row.updatedAt;
 }

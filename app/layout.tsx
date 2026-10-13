@@ -3,6 +3,7 @@ import { Inter } from "next/font/google";
 import { Toaster } from "@/components/ui";
 import AppShell from "@/components/AppShell";
 import DesktopBridge from "@/components/DesktopBridge";
+import ClosingPasswordProvider from "@/components/ClosingPasswordProvider";
 
 // Self-hosted via next/font: the woff2 is downloaded at BUILD time and served from the app
 // bundle, so the offline desktop app never phones Google Fonts at runtime.
@@ -28,6 +29,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <DesktopBridge />
         <AppShell>{children}</AppShell>
         <Toaster />
+        <ClosingPasswordProvider />
       </body>
     </html>
   );

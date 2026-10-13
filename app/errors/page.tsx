@@ -49,6 +49,19 @@ interface Suggestion {
   impact: string;
 }
 
+interface ProposedEntry {
+  date: string;
+  description: string;
+  lines: Array<{
+    accountId: string;
+    accountCode?: string;
+    accountName?: string;
+    debit?: string | null;
+    credit?: string | null;
+    memo?: string | null;
+  }>;
+}
+
 interface Correction {
   id: string;
   errorDetectionId: string;
@@ -57,6 +70,10 @@ interface Correction {
     action: string;
     changes: { steps: string[] };
     reasoning?: string;
+    /** Proposed correcting journal entry — posted only when the user approves it. */
+    entry?: ProposedEntry;
+    /** The journal entry posted when the correction was applied. */
+    postedEntryId?: string;
   } | null;
   llmReasoning: string | null;
   status: 'pending' | 'applied' | 'rejected';
@@ -125,10 +142,13 @@ function InsightPanel({ detectionId, onApplied }: InsightPanelProps) {
     if (!correction) return;
     setApplying(true);
     try {
+      const entry = correction.correctionData?.entry;
+      // The user clicking "Approve and post" IS the approval of the entry shown above.
       await api.post(`/api/errors/${detectionId}/apply`, {
         correctionId: correction.id,
+        approved: Boolean(entry),
       });
-      toast('Correction applied and error resolved', 'success');
+      toast(entry ? 'Correcting entry posted and error resolved' : 'Correction applied and error resolved', 'success');
       onApplied();
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Apply failed', 'danger');
@@ -224,12 +244,42 @@ function InsightPanel({ detectionId, onApplied }: InsightPanelProps) {
             </div>
           )}
 
+          {/* Proposed correcting entry (posted only when approved) */}
+          {correction.correctionData?.entry && (
+            <div>
+              <p className="text-xs font-semibold text-navy/50 uppercase tracking-wider mb-1">
+                Correcting journal entry {isApplied ? '(posted)' : '(will be posted when you approve)'}
+              </p>
+              <p className="text-sm text-navy mb-2">
+                {correction.correctionData.entry.date} — {correction.correctionData.entry.description}
+              </p>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs text-navy/50">
+                    <th className="py-1">Account</th>
+                    <th className="py-1 text-right">Debit</th>
+                    <th className="py-1 text-right">Credit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {correction.correctionData.entry.lines.map((l, i) => (
+                    <tr key={i} className="border-t border-navy/10">
+                      <td className="py-1">{[l.accountCode, l.accountName].filter(Boolean).join(' · ') || l.accountId}</td>
+                      <td className="py-1 text-right font-mono">{l.debit ?? ''}</td>
+                      <td className="py-1 text-right font-mono">{l.credit ?? ''}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           {/* Actions row */}
           <div className="flex items-center gap-3 pt-1">
             {!isApplied && (
               <Button onClick={handleApply} loading={applying} size="sm">
                 {!applying && <CheckCircle2 className="h-3.5 w-3.5" />}
-                Apply Correction
+                {correction.correctionData?.entry ? 'Approve and post entry' : 'Mark as fixed'}
               </Button>
             )}
             {isApplied && (

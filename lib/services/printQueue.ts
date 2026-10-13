@@ -57,6 +57,7 @@ import { markExpensePrinted } from './expenses';
 import { markBillPaymentPrinted } from './billPayments';
 import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
 import { markPaymentCheckPrinted } from './liabilityPayments';
+import { assertClosedPeriodEdit } from './postedEdit';
 
 export type PrintSource = 'expense' | 'bill_payment' | 'paycheck' | 'payment_check';
 export const PRINT_SOURCES: PrintSource[] = ['expense', 'bill_payment', 'paycheck', 'payment_check'];
@@ -231,6 +232,8 @@ export async function queuePaychecks(ctx: ServiceContext, ids: string[]) {
     for (const p of rows) {
       if (p.voidedAt) throw new ServiceError('CONFLICT', 'A voided paycheck cannot be printed.');
       if (p.toPrint) continue;
+      // Flagging a closed-period paycheck to print is a change to it: closing date password.
+      await assertClosedPeriodEdit(tx, { entryId: p.postedEntryId, what: 'to-be-printed flag', date: p.payDate });
       await tx.db.update(paychecks).set({ toPrint: true }).where(eq(paychecks.id, p.id));
       await writeAudit(tx, {
         action: 'update',
@@ -266,6 +269,7 @@ export async function markPaycheckPrinted(
     allowDuplicate: input.allowDuplicateNumber,
   });
   return inTransaction(ctx, async (tx) => {
+    await assertClosedPeriodEdit(tx, { entryId: pc.postedEntryId, what: 'check number', date: pc.payDate });
     const [updated] = await tx.db
       .update(paychecks)
       .set({ toPrint: false, checkNumber })

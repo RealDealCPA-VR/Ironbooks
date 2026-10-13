@@ -3,7 +3,9 @@
  *
  *  - loopback: 127.0.0.0/8, ::1, localhost
  *  - lan:      RFC1918 (10/8, 172.16/12, 192.168/16), link-local, *.local, bare hostnames
- *  - tailnet:  Tailscale CGNAT range 100.64.0.0/10, Tailscale ULA fd7a:115c:a1e0::/48, *.ts.net
+ *  - tailnet:  Tailscale CGNAT range 100.64.0.0/10, Tailscale ULA fd7a:115c:a1e0::/48, and *.ts.net
+ *              names verified to resolve only to those (lib/net/tailnetVerify.ts) — Tailscale
+ *              Funnel names under ts.net are public, so an unverified *.ts.net name is 'public'
  *  - public:   anything else
  *
  * Plain-HTTP to a PUBLIC host sends client data over the open internet unencrypted — the UI
@@ -11,6 +13,7 @@
  */
 import { execFile } from 'node:child_process';
 import type { HostClass } from './types';
+import { isVerifiedTailnetName } from '@/lib/net/cidr';
 
 function ipv4Parts(host: string): number[] | null {
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
@@ -51,7 +54,7 @@ export function classifyHost(rawHost: string): HostClass {
   }
 
   if (!/^[a-z0-9.-]+$/.test(host)) return 'invalid';
-  if (host.endsWith('.ts.net')) return 'tailnet';
+  if (host.endsWith('.ts.net')) return isVerifiedTailnetName(host) ? 'tailnet' : 'public';
   if (host.endsWith('.local') || host.endsWith('.lan') || host.endsWith('.home.arpa') || host.endsWith('.internal')) {
     return 'lan';
   }

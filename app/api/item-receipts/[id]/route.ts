@@ -9,6 +9,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getItemReceipt, convertToBill, voidItemReceipt, updateItemReceipt } from '@/lib/services/itemReceipts';
 import { routeError } from '@/lib/routeErrors';
 import { createItemReceiptSchema } from '@/lib/validation/itemReceipts';
@@ -61,16 +62,16 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     if (parsed.data.action === 'convert') {
-      const bill = await convertToBill(ctx, id, {
-        billNumber: parsed.data.billNumber ?? null,
-        date: parsed.data.date,
-        dueDate: parsed.data.dueDate ?? null,
-      });
+      // A stale tab must not bill an item receipt another user just changed.
+      const { billNumber, date, dueDate } = parsed.data;
+      const bill = await withVersionCheck(ctx, 'item_receipt', id, expectedVersion(req), (c) =>
+        convertToBill(c, id, { billNumber: billNumber ?? null, date, dueDate: dueDate ?? null }),
+      );
       return NextResponse.json(bill);
     }
 
     // action === 'void'
-    const receipt = await voidItemReceipt(ctx, id);
+    const receipt = await withVersionCheck(ctx, 'item_receipt', id, expectedVersion(req), (c) => voidItemReceipt(c, id));
     return NextResponse.json(receipt);
   } catch (err) {
     return errorResponse(err);
@@ -85,7 +86,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createItemReceiptSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    const receipt = await updateItemReceipt(ctx, id, parsed.data);
+    const receipt = await withVersionCheck(ctx, 'item_receipt', id, expectedVersion(req), (c) => updateItemReceipt(c, id, parsed.data));
     return NextResponse.json(receipt);
   } catch (err) {
     return routeError(err, 'PATCH /api/item-receipts/[id]');

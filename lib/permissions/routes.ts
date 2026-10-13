@@ -225,8 +225,11 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/sales-reps': r('lists', 'GET POST'),
   '/api/sales-reps/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/sales-reps/assign': r('customers', 'POST:modify'),
-  '/api/attachments': r('lists', 'GET POST'),
-  '/api/attachments/[id]': r('lists', 'GET PATCH DELETE'),
+  // Doc Center: a document takes the permission area of the record it is filed to (payroll
+  // documents need Payroll, bills need Vendors, the unfiled inbox needs Lists), checked per
+  // document in lib/services/attachments.ts, so the routes only require company membership.
+  '/api/attachments': kind('member', 'GET POST'),
+  '/api/attachments/[id]': kind('member', 'GET PATCH DELETE'),
   '/api/recurring': r('lists', 'GET POST'),
   '/api/recurring/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/recurring/run': r('accounting', 'POST'),

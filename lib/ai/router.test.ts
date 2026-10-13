@@ -13,6 +13,7 @@ import {
   type FetchLike,
 } from './providers';
 import { AiRouter } from './router';
+import { recordTailnetVerification } from '@/lib/net/cidr';
 import { Redactor } from './redact';
 import { extractJson } from './json';
 import { AiError, type AiProvider, type ChatMessage } from './types';
@@ -33,6 +34,7 @@ function mockFetch(handler: (url: string, init: RequestInit) => Response | Promi
 describe('Ollama provider', () => {
   it('posts to /api/chat with schema as format and reads message.content', async () => {
     const f = mockFetch(() => jsonResponse({ model: 'llama3.1:8b', message: { role: 'assistant', content: '{"a":1}' } }));
+    recordTailnetVerification('gpu-box.tail1234.ts.net', true); // resolved to a tailnet address
     const p = createOllamaProvider({ id: 'o', kind: 'ollama', label: 'GPU', baseUrl: 'http://gpu-box.tail1234.ts.net:11434/', model: 'llama3.1:8b', enabled: true }, { fetch: f.fn });
     expect(p.locality).toBe('local');
     const res = await p.chat([{ role: 'user', content: 'hi' }], { jsonSchema: { type: 'object' }, temperature: 0, maxTokens: 50 });

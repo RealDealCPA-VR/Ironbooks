@@ -1,8 +1,10 @@
 /**
  * Optimistic concurrency for multi-user mode.
  *
- * Several people can have the same invoice / bill / journal entry / customer / vendor / item
- * open at once. The record's `updated_at` is its version: the UI sends the version it loaded
+ * Several people can have the same record open at once: invoices, bills, journal entries,
+ * customers, vendors, items, estimates, sales orders, sales receipts, credit memos, purchase
+ * orders, checks/expenses, deposits, transfers, payments, bill payments, vendor credits, item
+ * receipts, paychecks, employees and accounts (QB Enterprise record locking). The record's `updated_at` is its version: the UI sends the version it loaded
  * (header `x-expected-updated-at`, attached automatically by lib/client.ts) and the save is
  * refused with 409 CONFLICT if someone else saved in between:
  *
@@ -19,13 +21,28 @@
  */
 import { and, desc, eq } from 'drizzle-orm';
 import {
+  accounts,
   auditLogs,
+  billPayments,
   bills,
+  creditMemos,
   customers,
+  deposits,
+  employees,
+  estimates,
+  expenses,
   invoices,
+  itemReceipts,
   items,
   journalEntries,
+  paychecks,
+  paymentsReceived,
+  purchaseOrders,
+  salesOrders,
+  salesReceipts,
+  transfers,
   users,
+  vendorCredits,
   vendors,
 } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, inTransaction } from './_base';
@@ -33,6 +50,11 @@ import { type ServiceContext, ServiceError, inTransaction } from './_base';
 /** Request header carrying the version (ISO updatedAt) the client last loaded. */
 export const EXPECTED_VERSION_HEADER = 'x-expected-updated-at';
 
+/**
+ * Every record type with record locking. Keys are the audit-trail entity types (used to name who
+ * changed the record). Migration 0046 gives the transaction tables an updated_at that a
+ * bka_version_* trigger moves on every change (edit, void, payment applied, print, ...).
+ */
 const TABLES = {
   invoice: invoices,
   bill: bills,
@@ -40,9 +62,27 @@ const TABLES = {
   customer: customers,
   vendor: vendors,
   item: items,
+  estimate: estimates,
+  sales_order: salesOrders,
+  sales_receipt: salesReceipts,
+  credit_memo: creditMemos,
+  purchase_order: purchaseOrders,
+  expense: expenses,
+  deposit: deposits,
+  transfer: transfers,
+  payment_received: paymentsReceived,
+  bill_payment: billPayments,
+  vendor_credit: vendorCredits,
+  item_receipt: itemReceipts,
+  paycheck: paychecks,
+  employee: employees,
+  account: accounts,
 } as const;
 
 export type VersionedEntity = keyof typeof TABLES;
+
+/** All record types with record locking. */
+export const VERSIONED_ENTITIES = Object.keys(TABLES) as VersionedEntity[];
 
 const LABELS: Record<VersionedEntity, string> = {
   invoice: 'invoice',
@@ -51,7 +91,30 @@ const LABELS: Record<VersionedEntity, string> = {
   customer: 'customer',
   vendor: 'vendor',
   item: 'item',
+  estimate: 'estimate',
+  sales_order: 'sales order',
+  sales_receipt: 'sales receipt',
+  credit_memo: 'credit memo',
+  purchase_order: 'purchase order',
+  expense: 'check',
+  deposit: 'deposit',
+  transfer: 'transfer',
+  payment_received: 'payment',
+  bill_payment: 'bill payment',
+  vendor_credit: 'vendor credit',
+  item_receipt: 'item receipt',
+  paycheck: 'paycheck',
+  employee: 'employee',
+  account: 'account',
 };
+
+/**
+ * The record field carrying the version. Accounts use editedAt: their updated_at also moves when
+ * a posting changes the cached balance, which must not make an open account form stale.
+ */
+export function versionField(entity: VersionedEntity): 'updatedAt' | 'editedAt' {
+  return entity === 'account' ? 'editedAt' : 'updatedAt';
+}
 
 /** Parse the expected version from a request (header), or null when absent/invalid. */
 export function expectedVersion(req: { headers: { get(name: string): string | null } }): Date | null {
@@ -64,15 +127,17 @@ export function parseVersion(v: string | Date | null | undefined): Date | null {
   return isNaN(d.getTime()) ? null : d;
 }
 
-/** All six tables share id / company_id / updated_at; drizzle only needs the column objects. */
+/** Every versioned table has id / company_id and a version column; drizzle only needs the column objects. */
 function table(entity: VersionedEntity) {
-  return TABLES[entity] as unknown as typeof customers;
+  const t = TABLES[entity] as unknown as typeof customers;
+  const col = (TABLES[entity] as unknown as Record<string, typeof customers.updatedAt>)[versionField(entity)];
+  return { t, col };
 }
 
 async function loadVersion(ctx: ServiceContext, entity: VersionedEntity, id: string) {
-  const t = table(entity);
+  const { t, col } = table(entity);
   const [row] = await ctx.db
-    .select({ updatedAt: t.updatedAt })
+    .select({ updatedAt: col })
     .from(t)
     .where(and(eq(t.id, id), eq(t.companyId, ctx.companyId)));
   return row ?? null;
@@ -157,7 +222,7 @@ export async function withVersionCheck<T>(
     const version = await bumpVersion(tx, entity, id, want);
     // The client caches the version in the returned record as its next expected version, so
     // it must be the bumped one — otherwise the user's next save is a false 409 naming themselves.
-    return version ? withReturnedVersion(result, id, version) : result;
+    return version ? withReturnedVersion(result, id, version, versionField(entity)) : result;
   });
 }
 
@@ -168,13 +233,16 @@ async function bumpVersion(
   id: string,
   previous: Date,
 ): Promise<Date | null> {
-  const t = table(entity);
+  const { t } = table(entity);
   const row = await loadVersion(ctx, entity, id);
   if (!row) return null;
   const floor = Math.max(previous.getTime(), row.updatedAt.getTime());
   if (row.updatedAt.getTime() > previous.getTime() && row.updatedAt.getTime() <= Date.now()) return row.updatedAt;
   const next = new Date(Math.max(Date.now(), floor + 1));
-  await ctx.db.update(t).set({ updatedAt: next }).where(and(eq(t.id, id), eq(t.companyId, ctx.companyId)));
+  await ctx.db
+    .update(t)
+    .set({ [versionField(entity)]: next } as never)
+    .where(and(eq(t.id, id), eq(t.companyId, ctx.companyId)));
   return next;
 }
 
@@ -183,11 +251,16 @@ async function bumpVersion(
  * one level down for wrapped results ({ invoice: {...} }, { entry: {...} }). Returns a shallow
  * copy; anything without a matching record is passed through untouched.
  */
-function withReturnedVersion<T>(result: T, id: string, version: Date): T {
+function withReturnedVersion<T>(
+  result: T,
+  id: string,
+  version: Date,
+  field: 'updatedAt' | 'editedAt' = 'updatedAt',
+): T {
   const isRecord = (v: unknown): v is Record<string, unknown> =>
     typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Date);
   const patch = (rec: Record<string, unknown>) =>
-    'updatedAt' in rec && (rec.id === undefined || rec.id === id) ? { ...rec, updatedAt: version } : null;
+    field in rec && (rec.id === undefined || rec.id === id) ? { ...rec, [field]: version } : null;
   if (!isRecord(result)) return result;
   const top = patch(result);
   if (top) return top as T;

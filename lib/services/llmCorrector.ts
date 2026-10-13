@@ -10,9 +10,12 @@
  *   - Structured output: the reply is validated with zod (one repair attempt in the router).
  *   - Offline-safe: when no model is configured/eligible (or every model fails) the service
  *     returns a deterministic stub suggestion, so tests and offline installs keep working.
- *   - No destructive GL change: applyCorrection only marks status + writes an
- *     audit row — any actual journal correction must be made by the user via the
- *     normal posting workflow, with the LLM reasoning surfaced as guidance.
+ *   - Correcting entries are proposed, never posted silently: a suggestion may carry a
+ *     proposed correcting journal entry (the reversal of a duplicate General Journal entry, or
+ *     balanced lines the model proposed on existing accounts). applyCorrection posts it ONLY
+ *     with the user's explicit approval, as a General Journal entry through journal.ts /
+ *     posting.ts (closing date + password, ledger guards, audit), links the posted entry to
+ *     the correction and resolves the detection — all in one transaction.
  */
 import { and, eq } from 'drizzle-orm';
 import { z } from 'zod';
@@ -24,7 +27,10 @@ import {
   accounts,
 } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
-import { notFound, validation, writeAudit } from './_base';
+import { inTransaction, notFound, validation, writeAudit, ServiceError } from './_base';
+import { createManualEntry } from './journal';
+import type { JournalEntityType, PostingLine } from './posting';
+import { Money, toAmountString } from '@/lib/money';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { AiError } from '@/lib/ai/types';
 
@@ -39,6 +45,31 @@ export interface LlmSuggestion {
   action: string;
   steps: string[];
   impact: string;
+}
+
+/** A correcting journal entry proposed with a suggestion (posted only on approval). */
+export interface ProposedEntry {
+  /** YYYY-MM-DD. */
+  date: string;
+  description: string;
+  lines: Array<{
+    accountId: string;
+    accountCode?: string;
+    accountName?: string;
+    debit?: string | null;
+    credit?: string | null;
+    memo?: string | null;
+    entityType?: JournalEntityType | null;
+    entityId?: string | null;
+  }>;
+}
+
+/** What the user approved when applying a correction. */
+export interface ApplyCorrectionOptions {
+  /** Explicit approval to post the correcting entry (required whenever one will be posted). */
+  approved?: boolean;
+  /** The correcting entry as the user reviewed / edited it (defaults to the proposed one). */
+  entry?: ProposedEntry | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +105,7 @@ export async function analyzeError(
 
   // --- Load related journal entry + lines (if available) ---
   let entryContext = '';
+  let reversal: ProposedEntry | null = null;
   if (detection.journalEntryId) {
     const [entry] = await ctx.db
       .select()
@@ -95,6 +127,7 @@ export async function analyzeError(
         .from(journalEntryLines)
         .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
         .where(eq(journalEntryLines.journalEntryId, entry.id));
+      if (detection.errorType === 'duplicate') reversal = await reversalProposal(ctx, entry.id);
 
       entryContext = `
 Journal Entry #${entry.entryNumber}:
@@ -145,6 +178,14 @@ ${lines
     }
   }
 
+  // --- Proposed correcting entry (reviewed and approved by the user before posting) ---
+  // A duplicate's fix is always the exact reversal of the duplicate (never model-made numbers);
+  // otherwise a model-proposed entry is kept only if it balances on this company's accounts.
+  const proposed: ProposedEntry | null =
+    detection.errorType === 'duplicate' || suggestion.action === 'void_duplicate'
+      ? reversal
+      : await modelProposal(ctx, suggestion, detection.description);
+
   // --- Persist the correction suggestion ---
   const [correction] = await ctx.db
     .insert(errorCorrections)
@@ -156,6 +197,7 @@ ${lines
         action: suggestion.action,
         changes: { steps: suggestion.steps },
         reasoning: suggestion.analysis,
+        ...(proposed ? { entry: proposed } : {}),
       },
       llmReasoning: llmReasoningText,
       status: 'pending',
@@ -170,65 +212,238 @@ ${lines
 // ---------------------------------------------------------------------------
 
 /**
- * Mark a pending correction as applied, resolve the parent detection, and
- * write an audit row. No actual GL entries are created here — the user must
- * execute the recommended steps via the normal posting workflow. The LLM
- * reasoning is surfaced in the audit trail so reviewers can see why the
- * correction was applied.
+ * Apply a correction. When it carries a correcting journal entry (proposed, or edited by the
+ * user in `opts.entry`), the entry is posted ONLY with explicit approval (`opts.approved`), as a
+ * General Journal entry through journal.ts / posting.ts — so the closing date (and its password),
+ * the ledger guards and the A/R / A/P name rules all apply — and linked to the correction
+ * (correctionData.postedEntryId). Posting, marking the correction applied, resolving the
+ * detection and the audit row happen in ONE transaction: if posting is refused nothing changes.
+ * A correction without an entry (e.g. "add a description") is simply marked applied.
  */
 export async function applyCorrection(
   ctx: ServiceContext,
   correctionId: string,
+  opts: ApplyCorrectionOptions = {},
 ): Promise<CorrectionRow> {
-  // Load the correction (and verify it belongs to this company via the detection join).
-  const [row] = await ctx.db
-    .select({
-      correction: errorCorrections,
-      detection: errorDetections,
-    })
-    .from(errorCorrections)
-    .innerJoin(errorDetections, eq(errorCorrections.errorDetectionId, errorDetections.id))
-    .where(
-      and(
-        eq(errorCorrections.id, correctionId),
-        eq(errorDetections.companyId, ctx.companyId),
-      ),
-    );
+  return inTransaction(ctx, async (tx) => {
+    // Load the correction (and verify it belongs to this company via the detection join).
+    const [row] = await tx.db
+      .select({
+        correction: errorCorrections,
+        detection: errorDetections,
+      })
+      .from(errorCorrections)
+      .innerJoin(errorDetections, eq(errorCorrections.errorDetectionId, errorDetections.id))
+      .where(
+        and(
+          eq(errorCorrections.id, correctionId),
+          eq(errorDetections.companyId, tx.companyId),
+        ),
+      );
 
-  if (!row) throw notFound('Error correction');
-  if (row.correction.status === 'applied') {
-    throw validation('Correction has already been applied.');
-  }
-  if (row.correction.status === 'rejected') {
-    throw validation('Cannot apply a rejected correction.');
-  }
+    if (!row) throw notFound('Error correction');
+    if (row.correction.status === 'applied') {
+      throw validation('Correction has already been applied.');
+    }
+    if (row.correction.status === 'rejected') {
+      throw validation('Cannot apply a rejected correction.');
+    }
 
-  const now = new Date();
+    const data = (row.correction.correctionData ?? {}) as NonNullable<CorrectionRow['correctionData']> & {
+      entry?: ProposedEntry;
+      postedEntryId?: string;
+    };
+    const entry = opts.entry ?? data.entry ?? null;
+    let posted: { id: string; entryNumber: number } | null = null;
+    if (entry) {
+      if (opts.approved !== true) {
+        throw validation('Review the correcting journal entry and approve it to post it.');
+      }
+      if (!tx.userId) throw new ServiceError('FORBIDDEN', 'Posting a correction needs a signed-in user.');
+      // The correction was computed from the flagged entry as it was then. If that entry has
+      // since been voided (or deleted), the problem is already fixed — posting the stored
+      // reversal now would correct it a second time.
+      if (row.detection.journalEntryId) {
+        const [source] = await tx.db
+          .select({ status: journalEntries.status })
+          .from(journalEntries)
+          .where(
+            and(
+              eq(journalEntries.id, row.detection.journalEntryId),
+              eq(journalEntries.companyId, tx.companyId),
+            ),
+          );
+        if (!source || source.status !== 'posted') {
+          throw validation(
+            'The entry this correction was made for has been voided or changed since. Ask for a new suggestion instead.',
+          );
+        }
+      }
+      const date = new Date(`${entry.date}T12:00:00Z`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(entry.date) || isNaN(date.getTime())) {
+        throw validation('The correcting entry needs a valid date.');
+      }
+      const lines: PostingLine[] = entry.lines.map((l) => ({
+        accountId: l.accountId,
+        debit: l.debit ?? null,
+        credit: l.credit ?? null,
+        memo: l.memo ?? null,
+        entityType: l.entityType ?? null,
+        entityId: l.entityId ?? null,
+      }));
+      await assertCompanyAccounts(tx, lines);
+      const je = await createManualEntry(tx, {
+        date,
+        description: entry.description?.trim() || 'Correcting entry',
+        reference: 'AI correction',
+        lines,
+      });
+      posted = { id: je.id, entryNumber: je.entryNumber };
+    }
 
-  // Mark correction applied.
-  const [updated] = await ctx.db
-    .update(errorCorrections)
-    .set({ status: 'applied', appliedAt: now, reviewedBy: ctx.userId ?? undefined })
-    .where(eq(errorCorrections.id, correctionId))
-    .returning();
+    const now = new Date();
+    const [updated] = await tx.db
+      .update(errorCorrections)
+      .set({
+        status: 'applied',
+        appliedAt: now,
+        reviewedBy: tx.userId ?? undefined,
+        ...(posted || opts.entry
+          ? {
+              correctionData: {
+                ...data,
+                ...(opts.entry ? { entry: opts.entry } : {}),
+                ...(posted ? { postedEntryId: posted.id } : {}),
+              },
+            }
+          : {}),
+      })
+      .where(eq(errorCorrections.id, correctionId))
+      .returning();
 
-  // Resolve the parent detection.
-  await ctx.db
-    .update(errorDetections)
-    .set({ resolvedAt: now })
-    .where(eq(errorDetections.id, row.correction.errorDetectionId));
+    // Resolve the parent detection.
+    await tx.db
+      .update(errorDetections)
+      .set({ resolvedAt: now })
+      .where(eq(errorDetections.id, row.correction.errorDetectionId));
 
-  // Audit trail.
-  await writeAudit(ctx, {
-    action: 'llm_correction',
-    entityType: 'error_correction',
-    entityId: correctionId,
-    oldValues: { status: row.correction.status },
-    newValues: { status: 'applied', appliedAt: now.toISOString() },
-    llmReasoning: row.correction.llmReasoning ?? undefined,
+    // Audit trail (the posted entry has its own audit rows from the posting engine).
+    await writeAudit(tx, {
+      action: 'llm_correction',
+      entityType: 'error_correction',
+      entityId: correctionId,
+      oldValues: { status: row.correction.status },
+      newValues: {
+        status: 'applied',
+        appliedAt: now.toISOString(),
+        approvedBy: tx.userId,
+        postedEntryId: posted?.id ?? null,
+        postedEntryNumber: posted?.entryNumber ?? null,
+      },
+      llmReasoning: row.correction.llmReasoning ?? undefined,
+    });
+
+    return updated;
   });
+}
 
-  return updated;
+/** Every line must be on an account of this company (never trust ids from the client / model). */
+async function assertCompanyAccounts(ctx: ServiceContext, lines: PostingLine[]): Promise<void> {
+  const ids = [...new Set(lines.map((l) => l.accountId))];
+  const rows = await ctx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId)));
+  const own = new Set(rows.map((r) => r.id));
+  if (ids.some((id) => !own.has(id))) throw validation('The correcting entry uses an account that is not in this company.');
+}
+
+/** Reversal of a posted General Journal entry (the fix for a duplicate), dated like the original. */
+async function reversalProposal(ctx: ServiceContext, entryId: string): Promise<ProposedEntry | null> {
+  const [entry] = await ctx.db
+    .select()
+    .from(journalEntries)
+    .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, ctx.companyId)));
+  if (!entry || entry.status !== 'posted') return null;
+  // Documents (invoices, bills, payments, ...) are fixed by voiding the document, not by a journal entry.
+  if (entry.sourceRef && entry.sourceRef !== 'manual') return null;
+  const lines = await ctx.db
+    .select({
+      accountId: journalEntryLines.accountId,
+      accountCode: accounts.code,
+      accountName: accounts.name,
+      subtype: accounts.subtype,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+      entityType: journalEntryLines.entityType,
+      entityId: journalEntryLines.entityId,
+    })
+    .from(journalEntryLines)
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+    .where(eq(journalEntryLines.journalEntryId, entry.id));
+  if (lines.length < 2) return null;
+  // An A/R / A/P line without a customer / vendor name can't be reversed by a General Journal
+  // entry (QB requires the name); leave that one to the user.
+  const control = (t: string) => t === 'accounts_receivable' || t === 'accounts_payable';
+  if (lines.some((l) => control(String(l.subtype)) && !l.entityId)) return null;
+  return {
+    date: entry.date.toISOString().slice(0, 10),
+    description: `Reverse duplicate entry #${entry.entryNumber}: ${entry.description}`.slice(0, 500),
+    lines: lines.map((l) => ({
+      accountId: l.accountId,
+      accountCode: l.accountCode,
+      accountName: l.accountName,
+      // Swap sides.
+      debit: Money.of(l.credit ?? 0).greaterThan(0) ? toAmountString(Money.of(l.credit)) : null,
+      credit: Money.of(l.debit ?? 0).greaterThan(0) ? toAmountString(Money.of(l.debit)) : null,
+      memo: 'Reverses a duplicate entry',
+      entityType: (l.entityType as JournalEntityType | null) ?? null,
+      entityId: l.entityId ?? null,
+    })),
+  };
+}
+
+/** A model-proposed entry, kept only when it balances on existing posting accounts. */
+async function modelProposal(
+  ctx: ServiceContext,
+  suggestion: LlmSuggestion & { entry?: z.infer<typeof suggestionSchema>['entry'] },
+  fallbackDescription: string,
+): Promise<ProposedEntry | null> {
+  const e = suggestion.entry;
+  if (!e) return null;
+  const rows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, subtype: accounts.subtype })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const byCode = new Map(rows.map((r) => [r.code, r]));
+  let dr = Money.zero();
+  let cr = Money.zero();
+  const lines: ProposedEntry['lines'] = [];
+  for (const l of e.lines) {
+    const acct = byCode.get(String(l.accountCode).trim());
+    if (!acct || acct.subtype === 'non_posting') return null;
+    // Model-made A/R / A/P lines would need a customer / vendor name: leave those to the user.
+    if (acct.subtype === 'accounts_receivable' || acct.subtype === 'accounts_payable') return null;
+    const d = Money.of(l.debit ?? 0);
+    const c = Money.of(l.credit ?? 0);
+    if (d.isNegative() || c.isNegative() || (d.isZero() === c.isZero())) return null;
+    dr = dr.plus(d);
+    cr = cr.plus(c);
+    lines.push({
+      accountId: acct.id,
+      accountCode: acct.code,
+      accountName: acct.name,
+      debit: d.isZero() ? null : toAmountString(d),
+      credit: c.isZero() ? null : toAmountString(c),
+      memo: l.memo ?? null,
+    });
+  }
+  if (lines.length < 2 || !dr.equals(cr) || dr.isZero()) return null;
+  return {
+    date: new Date().toISOString().slice(0, 10),
+    description: (e.description || `Correcting entry: ${fallbackDescription}`).slice(0, 500),
+    lines,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +455,23 @@ const suggestionSchema = z.object({
   action: z.string().min(1).max(100),
   steps: z.array(z.string()).min(1).max(20),
   impact: z.string(),
+  /** Optional correcting entry on existing account codes (validated before it is offered). */
+  entry: z
+    .object({
+      description: z.string().min(1).max(500),
+      lines: z
+        .array(
+          z.object({
+            accountCode: z.string().min(1),
+            debit: z.union([z.string(), z.number()]).nullish(),
+            credit: z.union([z.string(), z.number()]).nullish(),
+            memo: z.string().nullish(),
+          }),
+        )
+        .min(2)
+        .max(20),
+    })
+    .nullish(),
 });
 
 const SUGGESTION_JSON_SCHEMA = {
@@ -249,6 +481,25 @@ const SUGGESTION_JSON_SCHEMA = {
     action: { type: 'string' },
     steps: { type: 'array', items: { type: 'string' } },
     impact: { type: 'string' },
+    entry: {
+      type: 'object',
+      properties: {
+        description: { type: 'string' },
+        lines: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              accountCode: { type: 'string' },
+              debit: { type: 'string' },
+              credit: { type: 'string' },
+              memo: { type: 'string' },
+            },
+            required: ['accountCode'],
+          },
+        },
+      },
+    },
   },
   required: ['analysis', 'action', 'steps', 'impact'],
 };
@@ -269,8 +520,10 @@ When analysing an error you MUST return a JSON object with exactly these fields:
   "analysis": "<what is wrong and why it matters>",
   "action":   "<short imperative: void_duplicate | add_correcting_entry | update_description | review_amount>",
   "steps":    ["<step 1>", "<step 2>", ...],
-  "impact":   "<effect on financial statements if not corrected>"
+  "impact":   "<effect on financial statements if not corrected>",
+  "entry":    { "description": "<memo>", "lines": [{ "accountCode": "<existing code>", "debit": "0.00", "credit": "0.00" }] }
 }
+"entry" is optional: include it only for add_correcting_entry, using account codes from the entry shown, with debits equal to credits. The user reviews and approves it before anything is posted.
 Return ONLY the JSON object — no markdown fences, no prose outside the JSON.`;
 
 function buildUserMessage(detection: typeof errorDetections.$inferSelect, entryContext: string): string {
