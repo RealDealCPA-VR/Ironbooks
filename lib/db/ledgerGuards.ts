@@ -493,19 +493,30 @@ export function migrationTriggerNames(migrationsFolder: string): Set<string> {
   const names = new Set<string>();
   if (fs.existsSync(key)) {
     const re =
-      /CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+"?(\w+)"?[\s\S]*?\bON\s+(?:ONLY\s+)?(?:"?public"?\.)?"?(\w+)"?/gi;
+      /CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+("(?:[^"]|"")+"|\w+)[\s\S]*?\bON\s+(?:ONLY\s+)?(?:(?:"public"|public)\.)?("(?:[^"]|"")+"|\w+)/gi;
     for (const file of migrationFiles(key)) {
       const text = fs.readFileSync(file, 'utf8').replace(/--[^\n]*/g, ' ');
       let m: RegExpExecArray | null;
-      while ((m = re.exec(text))) names.add(triggerKey(m[2], m[1]));
+      while ((m = re.exec(text))) names.add(triggerKey(sqlIdent(m[2]), sqlIdent(m[1])));
     }
   }
   triggerNameCache.set(key, names);
   return names;
 }
 
+/**
+ * The name Postgres stores for an identifier as written in SQL: unquoted names fold to lower
+ * case, quoted names are kept exactly (with "" unescaped). Quoted names are case-sensitive, so
+ * "BKA_JEL_BALANCED" is a different trigger from bka_jel_balanced.
+ */
+function sqlIdent(raw: string): string {
+  if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) return raw.slice(1, -1).replace(/""/g, '"');
+  return raw.toLowerCase();
+}
+
+/** Exact, case-sensitive `table.trigger` key; names from pg_catalog are compared as stored. */
 function triggerKey(table: string, trigger: string): string {
-  return `${table.toLowerCase()}.${trigger.toLowerCase()}`;
+  return `${table}.${trigger}`;
 }
 
 /** Non-internal triggers on the ledger tables that no migration creates (added offline). */

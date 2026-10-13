@@ -195,6 +195,8 @@ export async function queuePaychecks(ctx: ServiceContext, ids: string[]) {
     for (const p of rows) {
       if (p.voidedAt) throw new ServiceError('CONFLICT', 'A voided paycheck cannot be printed.');
       if (p.toPrint) continue;
+      // Flagging a closed-period paycheck to print is a change to it: closing date password.
+      await assertClosedPeriodEdit(tx, { entryId: p.postedEntryId, what: 'to-be-printed flag', date: p.payDate });
       await tx.db.update(paychecks).set({ toPrint: true }).where(eq(paychecks.id, p.id));
       await writeAudit(tx, {
         action: 'update',

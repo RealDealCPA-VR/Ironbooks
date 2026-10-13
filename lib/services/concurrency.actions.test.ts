@@ -15,7 +15,7 @@ import { users, vendors, customers, accounts, items, purchaseOrders, salesOrders
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createPurchaseOrder, updatePurchaseOrder } from './purchaseOrders';
-import { createSalesOrder } from './salesOrders';
+import { createSalesOrder, updateSalesOrder } from './salesOrders';
 import { createItemReceipt, updateItemReceipt } from './itemReceipts';
 import { trialBalance } from './reports';
 
@@ -118,6 +118,27 @@ describe('record locking on POST actions', () => {
     const current = (await versionOf(itemReceipts, ir.id)).v;
     const ok = await irPOST(post(`/api/item-receipts/${ir.id}`, { action: 'void' }, current), params(ir.id));
     expect(ok.status).toBe(200);
+    expect((await trialBalance(ctx)).balanced).toBe(true);
+  });
+
+  it('converting a sales order changed since it was opened is refused (409) and makes no invoice; a current one converts', async () => {
+    const input = { customerId, date: d('2026-03-05'), lines: [{ description: 'Service', quantity: 1, rate: '25' }] };
+    const so = await createSalesOrder(ctx, input as never);
+    const opened = (await versionOf(salesOrders, so.id)).v;
+    await new Promise((r) => setTimeout(r, 5));
+    await updateSalesOrder(ctx, so.id, { ...input, memo: 'changed by Bob' } as never);
+    const tb = (await trialBalance(ctx)).rows;
+
+    const res = await soPOST(post(`/api/sales-orders/${so.id}`, { action: 'convert' }, opened), params(so.id));
+    expect(res.status).toBe(409);
+    expect((await res.json()).details?.staleVersion).toBe(true);
+    expect((await trialBalance(ctx)).rows).toEqual(tb);
+    expect((await versionOf(salesOrders, so.id)).status).toBe('open');
+
+    const current = (await versionOf(salesOrders, so.id)).v;
+    const ok = await soPOST(post(`/api/sales-orders/${so.id}`, { action: 'convert' }, current), params(so.id));
+    expect(ok.status).toBe(201);
+    expect((await versionOf(salesOrders, so.id)).status).not.toBe('open');
     expect((await trialBalance(ctx)).balanced).toBe(true);
   });
 });

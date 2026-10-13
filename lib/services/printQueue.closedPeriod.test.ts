@@ -6,13 +6,13 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { expenses } from '@/lib/db/schema';
+import { employees, expenses, paychecks } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { makeTestCompany, type TestCompany } from './testkit.prefs';
 import { postJournalEntry } from './posting';
 import { createVendor } from './vendors';
 import { createExpense } from './expenses';
-import { markPrinted } from './printQueue';
+import { markPrinted, queuePaychecks } from './printQueue';
 import { setClosingDate } from './company';
 import { trialBalance } from './reports';
 import { closingDateExceptionReport } from './accountant/auditReports';
@@ -78,5 +78,46 @@ describe('Print Checks respects the closing date', () => {
     expect((await trialBalance(t.ctx, D('2026-12-31'))).rows).toEqual(tb);
     const rows = (await closingDateExceptionReport(t.ctx)).rows;
     expect(rows.some((r) => r.entryId === closed.postedEntryId)).toBe(true);
+  });
+
+  it('putting a closed-period paycheck in the print queue needs the password and is listed as an exception', async () => {
+    await setClosingDate(t.ctx, { closingDate: null } as never);
+    const [emp] = await t.ctx.db
+      .insert(employees)
+      .values({ companyId: t.ctx.companyId, firstName: 'Queue', lastName: 'Payee' })
+      .returning();
+    const entry = await postJournalEntry(t.ctx, {
+      date: D('2026-01-15'),
+      description: 'Paycheck',
+      lines: [
+        { accountId: t.acct['6500'], debit: '300.00' },
+        { accountId: t.acct['2300'], credit: '50.00' },
+        { accountId: t.acct['1000'], credit: '250.00' },
+      ],
+    });
+    const [pc] = await t.ctx.db
+      .insert(paychecks)
+      .values({
+        companyId: t.ctx.companyId,
+        employeeId: emp.id,
+        payDate: D('2026-01-15'),
+        grossPay: '300.00',
+        totalTaxes: '50.00',
+        netPay: '250.00',
+        postedEntryId: entry.id,
+      })
+      .returning();
+    await setClosingDate(t.ctx, { closingDate: '2026-01-31', password: 'pw' } as never);
+    const tb = (await trialBalance(t.ctx, D('2026-12-31'))).rows;
+
+    await expect(queuePaychecks(t.ctx, [pc.id])).rejects.toMatchObject({ code: 'PERIOD_CLOSED' });
+    const [still] = await t.ctx.db.select().from(paychecks).where(eq(paychecks.id, pc.id));
+    expect(still.toPrint).toBe(false);
+
+    await queuePaychecks(over, [pc.id]);
+    const [queued] = await t.ctx.db.select().from(paychecks).where(eq(paychecks.id, pc.id));
+    expect(queued.toPrint).toBe(true);
+    expect((await closingDateExceptionReport(t.ctx)).rows.some((r) => r.entryId === entry.id)).toBe(true);
+    expect((await trialBalance(t.ctx, D('2026-12-31'))).rows).toEqual(tb);
   });
 });

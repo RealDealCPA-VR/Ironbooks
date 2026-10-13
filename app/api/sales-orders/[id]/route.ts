@@ -46,11 +46,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     if (parsed.data.action === 'convert') {
-      const invoice = await convertToInvoice(ctx, id, {
-        lines: parsed.data.lines,
-        date: parsed.data.date,
-        overrideCreditLimit: parsed.data.overrideCreditLimit,
-      });
+      const { lines, date, overrideCreditLimit } = parsed.data;
+      // A stale tab must not convert an order another user just changed.
+      const invoice = await withVersionCheck(ctx, 'sales_order', id, expectedVersion(req), (c) =>
+        convertToInvoice(c, id, { lines, date, overrideCreditLimit }),
+      );
       return NextResponse.json(invoice, { status: 201 });
     }
 
