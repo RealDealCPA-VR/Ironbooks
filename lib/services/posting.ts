@@ -24,6 +24,7 @@ import {
   paymentsReceived,
   reconciliationItems,
   reconciliations,
+  vendorCredits,
 } from '@/lib/db/schema';
 import {
   type ServiceContext,
@@ -432,7 +433,10 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
  * refunded amount down, or the payment's unapplied balance goes up. Without this the A/R GL
  * (where the void reverses the refund) and the open-credit subledger (aging, integrity check)
  * would disagree. The amount is the refund's own A/R debit (home currency); a foreign-currency
- * payment converts it back at the payment's rate. Vendor-credit refunds (A/P) are not touched.
+ * payment converts it back at the payment's rate. A vendor-credit refund (Dr bank / Cr A/P)
+ * that is voided gives the vendor credit back the same way: its unapplied balance goes up by the
+ * refund's debit total, its refunded amount goes down (floored at 0) and it reopens, so A/P aging
+ * keeps tying to the A/P control account.
  */
 async function restoreRefundedCustomerCredit(
   tx: ServiceContext,
@@ -508,6 +512,42 @@ async function restoreRefundedCustomerCredit(
       entityId: payment.id,
       oldValues: { unapplied: payment.unapplied },
       newValues: { action: 'refund_voided', unapplied: toAmountString(unapplied) },
+    });
+    return;
+  }
+
+  const [vendorCredit] = await tx.db
+    .select()
+    .from(vendorCredits)
+    .where(and(eq(vendorCredits.companyId, tx.companyId), eq(vendorCredits.id, docId)));
+  if (vendorCredit) {
+    // The vendor refund posts Dr bank / Cr A/P: the entry's debit total is the refund amount.
+    const unapplied = Money.round2(Money.of(vendorCredit.unapplied).plus(base));
+    const refunded = Money.round2(Money.of(vendorCredit.refundedAmount).minus(base));
+    const status =
+      vendorCredit.status === 'void'
+        ? vendorCredit.status
+        : unapplied.lessThan(Money.of(vendorCredit.total))
+          ? 'partial'
+          : 'open';
+    await tx.db
+      .update(vendorCredits)
+      .set({
+        unapplied: toAmountString(unapplied),
+        refundedAmount: toAmountString(refunded.lessThan(0) ? Money.zero() : refunded),
+        status: status as never,
+      })
+      .where(eq(vendorCredits.id, vendorCredit.id));
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'vendor_credit',
+      entityId: vendorCredit.id,
+      oldValues: {
+        unapplied: vendorCredit.unapplied,
+        refundedAmount: vendorCredit.refundedAmount,
+        status: vendorCredit.status,
+      },
+      newValues: { action: 'refund_voided', unapplied: toAmountString(unapplied), status, postedEntryId: entryId },
     });
   }
 }
