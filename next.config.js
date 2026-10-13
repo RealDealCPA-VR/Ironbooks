@@ -35,6 +35,8 @@ const securityHeaders = [
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // App version for the sidebar footer, from package.json (the version electron-updater compares).
+  env: { NEXT_PUBLIC_APP_VERSION: require('./package.json').version },
   // 'standalone' emits .next/standalone/server.js which the Electron main process launches
   // as the desktop app's local backend (bundling the accounting engine + PGlite).
   output: 'standalone',

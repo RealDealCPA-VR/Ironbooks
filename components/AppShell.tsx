@@ -651,7 +651,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <span className="hidden lg:inline-block text-sm">Sign out</span>
           </button>
           <div className="hidden lg:block px-3 pt-2 text-[10px] text-navy/30">
-            BookKeeper AI v1.0.0
+            BookKeeper AI v{process.env.NEXT_PUBLIC_APP_VERSION}
           </div>
         </div>
       </aside>

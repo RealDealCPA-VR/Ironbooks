@@ -6,7 +6,7 @@ embedded database internally).
 
 ## Option A — Installer (recommended; creates a Desktop icon)
 
-1. Get **`BookKeeper AI Setup 1.0.0.exe`** (in the `release/` folder after a build, or from a release page).
+1. Get **`BookKeeper AI Setup 1.1.0.exe`** (in the `release/` folder after a build, or from a release page).
 2. Double-click it. The installer:
    - installs per-user (no admin password needed),
    - lets you choose the install folder,
@@ -18,7 +18,7 @@ To uninstall: Settings → Apps → BookKeeper AI → Uninstall (your company da
 
 ## Option B — Portable (no install)
 
-Use **`BookKeeper AI 1.0.0.exe`** (the portable build). Double-click to run it directly — nothing is
+Use **`BookKeeper AI 1.1.0.exe`** (the portable build). Double-click to run it directly — nothing is
 installed. To get an icon, right-click it → *Send to → Desktop (create shortcut)*, or drag it to the
 taskbar to pin it.
 
@@ -32,7 +32,7 @@ It never leaves your machine. Back it up from the in-app **Backup** screen (or c
 
 ```bash
 npm install
-npm run desktop:dist     # produces release/BookKeeper AI Setup 1.0.0.exe + the portable .exe
+npm run desktop:dist     # produces release/BookKeeper AI Setup 1.1.0.exe + the portable .exe
 ```
 
 - The installer is **code-signed** if you set `CSC_LINK` / `CSC_KEY_PASSWORD` (see SIGNING.md).
