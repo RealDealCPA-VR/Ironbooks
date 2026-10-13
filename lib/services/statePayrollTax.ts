@@ -338,6 +338,16 @@ const TABLES: Record<string, Record<number, AnnualTaxFn>> = {
   VA: { 2025: vaTax(8500), 2026: vaTax(8500) },
 };
 
+/**
+ * State/year tables whose figures have not yet been checked against that year's published
+ * employer withholding guide (entered from legislation or the prior year's guide). A paycheck
+ * using one gets a note asking the user to check the amount; remove the entry once confirmed.
+ * GA 2026: 4.99% entered; HB 111's schedule would give 5.09% — confirm against the 2026 guide.
+ */
+export const UNCONFIRMED_TABLES: Record<string, number[]> = {
+  CA: [2025], GA: [2026], IL: [2025], KY: [2025], MA: [2025], MI: [2025], NY: [2025], OH: [2025], UT: [2025], VA: [2025],
+};
+
 /** Years with any state table. */
 export const STATE_TABLE_YEARS = [2025, 2026];
 
@@ -438,6 +448,11 @@ export function calculateStateWithholding(input: StateWithholdingCalcInput): Sta
     tableYear = input.year > years[years.length - 1] ? years[years.length - 1] : years.find((y) => y >= input.year) ?? years[0];
     notes.push(
       `${info.name} withholding tables for ${input.year} are not in this version; the ${tableYear} figures were used. Check the amount against the state's ${input.year} guide.`,
+    );
+  }
+  if (UNCONFIRMED_TABLES[code]?.includes(tableYear)) {
+    notes.push(
+      `The ${info.name} ${tableYear} withholding figures in this version are not yet confirmed against the state's published ${tableYear} employer guide. Check the amount before filing.`,
     );
   }
   const base = code === 'PA' && input.ficaWagesPerPeriod != null ? Money.of(input.ficaWagesPerPeriod) : wages;
