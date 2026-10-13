@@ -8,7 +8,7 @@
  *   invoice  foreign open = total - retainage - payments/discounts applied (payments dated <= asOf)
  *            home open    = the invoice's own A/R line - the home relief each payment recorded
  *                           (payment_fx_reliefs; legacy rows: round2(each application x invoice rate))
- *   payment  (unapplied, foreign)  home = round2(unapplied x payment rate)
+ *   payment  (unapplied as of the date, foreign: customerCredits.ts)  home = round2(unapplied x payment rate)
  *   bill     foreign open = total - bill-payment applications - foreign vendor-credit applications
  *            home open    = round2(total x bill rate) - home A/P each of them relieved
  *   vendor credit (foreign) foreign open = unapplied as of the date, home = the home part left
@@ -37,6 +37,7 @@ import {
 import { Money } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { foreignCode, homeCode } from './fxLines';
+import { paymentsUnappliedAsOf } from './customerCredits';
 
 export interface ForeignOpenItem {
   kind: 'invoice' | 'payment' | 'bill' | 'vendor_credit';
@@ -115,6 +116,7 @@ async function invoiceOpenAmounts(
       invoiceId: paymentFxReliefs.invoiceId,
       paymentId: paymentFxReliefs.paymentId,
       date: paymentFxReliefs.date,
+      amount: paymentFxReliefs.amount,
       home: paymentFxReliefs.homeAmount,
     })
     .from(paymentFxReliefs)
@@ -122,16 +124,21 @@ async function invoiceOpenAmounts(
     .where(and(inArray(paymentFxReliefs.invoiceId, ids), live));
   const hasRelief = new Set(reliefs.map((x) => `${x.invoiceId}|${x.paymentId}`));
   const reliefBy = new Map<string, Decimal>();
+  // Foreign amount applied (+) / unapplied (-) after the cut-off date: not yet applied on that date.
+  const laterForeignBy = new Map<string, Decimal>();
   for (const x of reliefs) {
     // An apply / unapply after the cut-off date relieved A/R on its own date.
-    if (asOf && x.date.getTime() > asOf.getTime()) continue;
+    if (asOf && x.date.getTime() > asOf.getTime()) {
+      laterForeignBy.set(x.invoiceId, (laterForeignBy.get(x.invoiceId) ?? Money.zero()).plus(Money.of(x.amount)));
+      continue;
+    }
     reliefBy.set(x.invoiceId, (reliefBy.get(x.invoiceId) ?? Money.zero()).plus(Money.of(x.home)));
   }
   const appsBy = new Map<string, typeof apps>();
   for (const a of apps) appsBy.set(a.invoiceId, [...(appsBy.get(a.invoiceId) ?? []), a]);
   for (const i of rows) {
     const rate = Money.of(i.rate ?? 1);
-    let foreign = Money.of(i.total).minus(Money.of(i.retainage ?? 0));
+    let foreign = Money.of(i.total).minus(Money.of(i.retainage ?? 0)).plus(laterForeignBy.get(i.id) ?? Money.zero());
     let homeOpen =
       i.postedEntryId && arByEntry.has(i.postedEntryId) ? arByEntry.get(i.postedEntryId)! : r2(foreign.times(rate));
     homeOpen = homeOpen.minus(reliefBy.get(i.id) ?? Money.zero());
@@ -295,13 +302,20 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
         isNotNull(paymentsReceived.currency),
         isNull(paymentsReceived.voidedAt),
         lte(paymentsReceived.date, asOf),
-        sql`CAST(${paymentsReceived.unapplied} AS NUMERIC) > 0`,
       ),
     );
-  for (const p of pays) {
-    const cur = foreignCode(p.currency, home);
-    if (!cur) continue;
+  // The credit as of the date: today's unapplied + refunds / applies dated after it (customerCredits.ts).
+  const foreignPays = pays.filter((p) => foreignCode(p.currency, home));
+  const unappliedThen = await paymentsUnappliedAsOf(
+    ctx,
+    foreignPays.map((p) => ({ id: p.id, unapplied: p.unapplied, exchangeRate: p.rate })),
+    asOf,
+  );
+  for (const p of foreignPays) {
+    const cur = foreignCode(p.currency, home)!;
     const rate = Money.of(p.rate ?? 1);
+    const unapplied = unappliedThen.get(p.id) ?? Money.zero();
+    if (!unapplied.greaterThan(0)) continue;
     out.push({
       kind: 'payment',
       id: p.id,
@@ -310,8 +324,8 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
       date: p.date,
       currency: cur,
       rate,
-      foreignOpen: Money.of(p.unapplied).negated(),
-      homeOpen: r2(Money.of(p.unapplied).times(rate)).negated(),
+      foreignOpen: unapplied.negated(),
+      homeOpen: homeAt(unapplied, rate).negated(),
     });
   }
   return out;

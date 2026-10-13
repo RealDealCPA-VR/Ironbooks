@@ -149,7 +149,8 @@ describe('P1 FX — fix round 4: voiding foreign refunds, refund rows in balance
     expect(Money.of(await bal('1000')).minus(Money.of(checkingBefore)).toFixed(2)).toBe('41.15');
     const p = await plugs(payment.id);
     expect(p).toHaveLength(1);
-    expect(p[0].date.toISOString().slice(0, 10)).toBe('2026-07-02');
+    // Fix round 5: the cent belongs to the surviving later refund (07-03), not the voided one's date.
+    expect(p[0].date.toISOString().slice(0, 10)).toBe('2026-07-03');
     await invariants();
     await refundPayment(ctx, { paymentId: payment.id, bankAccountId: acct['1000'], amount: '66.67', date: d('2026-07-04') });
     expect(await bal('1200')).toBe('0.00');

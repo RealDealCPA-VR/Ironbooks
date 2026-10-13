@@ -533,12 +533,13 @@ async function restoreRefundedCustomerCredit(
     // applies and unapplies. The void reverses exactly that posted amount, but the credit's home
     // value now grows by homeAt(unapplied after restore) - homeAt(unapplied before restore). Post
     // the (cent-level) difference to A/R against Exchange Gain/Loss so A/R stays equal to the
-    // aging. sourceRef `payment:<id>`: voiding the payment voids this plug with its other FX plugs.
+    // aging — at every date from the refund's date on, not just today (see postRefundVoidFxPlug).
+    // sourceRef `payment:<id>`: voiding the payment voids these plugs with its other FX plugs.
     const arLine = lines.find((l) => l.debit != null && Money.gt(l.debit, 0));
     if (arLine) await postRefundVoidFxPlug(tx, {
-      paymentId: payment.id,
+      payment: { id: payment.id, postedEntryId: payment.postedEntryId, exchangeRate: payment.exchangeRate },
       arAccountId: arLine.accountId,
-      date: refundDate,
+      refundDate,
       rate,
       unappliedBefore: Money.of(payment.unapplied),
       unappliedAfter: unapplied,
@@ -555,42 +556,95 @@ async function restoreRefundedCustomerCredit(
 }
 
 /**
- * p1 fx: Exchange Gain/Loss plug posted when a foreign-currency payment refund is voided (see
- * restoreRefundedCustomerCredit). `reversed` is the refund's own A/R debit that the void takes
- * back; the credit's home value changes by homeAt(after) - homeAt(before) at the payment rate.
- * A positive difference needs an extra A/R credit (loss); a negative one a debit (gain).
+ * p1 fx: Exchange Gain/Loss plug(s) posted when a foreign-currency payment refund is voided (see
+ * restoreRefundedCustomerCredit). Every A/R posting of the credit moved A/R by the change in the
+ * credit's home value at the time, in the order they were entered. Removing a refund from the
+ * middle changes the home value of every later step by a cent here and there, and the voided
+ * refund's date is not where that cent belongs: it belongs to the later refund / apply whose
+ * home value changed. So, walking the dates from the voided refund's date on (the dates the credit
+ * or its A/R changed), the credit's home amount on the ledger (customerCredits.ts
+ * paymentCreditLedger) is compared with round2(unapplied as of that date x rate) and the
+ * difference is posted ON THAT DATE. A/R then equals the aging as of every date, today included.
+ *
+ * Safety net: the plugs must add up to the change today, homeAt(after) - homeAt(before) - the
+ * reversed A/R. If they do not (a ledger shape this walk does not model, e.g. data from before
+ * relief records existed), one plug of exactly that change is posted on the latest date the
+ * credit changed instead, which keeps today's A/R equal to the aging as before.
  */
 async function postRefundVoidFxPlug(
   tx: ServiceContext,
   p: {
-    paymentId: string;
+    payment: { id: string; postedEntryId: string | null; exchangeRate: string | null };
     /** The A/R account the refund debited (the void reverses that line). */
     arAccountId: string;
-    date: Date;
+    refundDate: Date;
     rate: ReturnType<typeof Money.of>;
     unappliedBefore: ReturnType<typeof Money.of>;
     unappliedAfter: ReturnType<typeof Money.of>;
     reversed: ReturnType<typeof Money.of>;
   },
 ) {
-  const homeAt = (v: ReturnType<typeof Money.of>) => (v.isZero() ? Money.zero() : Money.round2(v.times(p.rate)));
-  const diff = Money.round2(homeAt(p.unappliedAfter).minus(homeAt(p.unappliedBefore)).minus(p.reversed));
-  if (diff.isZero()) return;
+  const { paymentCreditEvents, paymentCreditLedger, ledgerCreditAsOf, unappliedAsOf, paymentCreditHome } =
+    await import('./customerCredits');
+  const homeAt = (v: ReturnType<typeof Money.of>) => paymentCreditHome(v, p.rate);
+  const total = Money.round2(homeAt(p.unappliedAfter).minus(homeAt(p.unappliedBefore)).minus(p.reversed));
+  if (p.rate.equals(1)) {
+    if (!total.isZero()) await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, p.refundDate, total);
+    return;
+  }
+
+  // State after the void (the refund entry is already void, the unapplied credit restored).
+  const events = (await paymentCreditEvents(tx, [p.payment])).get(p.payment.id) ?? [];
+  const ledger = await paymentCreditLedger(tx, p.payment);
+  const from = p.refundDate.getTime();
+  const times = [...new Set([from, ...events.map((e) => e.date.getTime()), ...ledger.map((l) => l.date.getTime())])]
+    .filter((t) => t >= from)
+    .sort((a, b) => a - b);
+  const plugs: Array<{ date: Date; amount: ReturnType<typeof Money.of> }> = [];
+  for (const t of times) {
+    const at = new Date(t);
+    const target = homeAt(unappliedAsOf(p.unappliedAfter, events, at));
+    const diff = Money.round2(target.minus(ledgerCreditAsOf(ledger, at)));
+    if (diff.isZero()) continue;
+    plugs.push({ date: at, amount: diff });
+    // A plug of +diff credits A/R (the credit grows): arNet -diff from this date on.
+    ledger.push({ date: at, arNet: diff.negated() });
+  }
+  const sum = plugs.reduce((s, x) => s.plus(x.amount), Money.zero());
+  if (!Money.round2(sum).equals(total)) {
+    if (total.isZero()) return;
+    const latest = Math.max(from, ...events.map((e) => e.date.getTime()));
+    await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, new Date(latest), total);
+    return;
+  }
+  for (const x of plugs) await postOneRefundVoidPlug(tx, p.payment.id, p.arAccountId, x.date, x.amount);
+}
+
+/**
+ * One refund-void plug: `diff` > 0 needs an extra A/R credit (loss), < 0 an A/R debit (gain).
+ */
+async function postOneRefundVoidPlug(
+  tx: ServiceContext,
+  paymentId: string,
+  arAccountId: string,
+  date: Date,
+  diff: ReturnType<typeof Money.of>,
+) {
   // Dynamic import: currencies.ts imports this module.
   const { getOrCreateExchangeGainLossAccount } = await import('./currencies');
   const fxAccountId = await getOrCreateExchangeGainLossAccount(tx);
   const amt = toAmountString(Money.abs(diff));
   await postJournalEntry(tx, {
-    date: p.date,
+    date,
     description: 'Exchange rounding on voided refund of a foreign-currency payment',
-    sourceRef: `payment:${p.paymentId}`,
+    sourceRef: `payment:${paymentId}`,
     lines: diff.greaterThan(0)
       ? [
           { accountId: fxAccountId, debit: amt, memo: 'Realized exchange loss' },
-          { accountId: p.arAccountId, credit: amt, memo: 'A/R FX adjustment', controlLine: true },
+          { accountId: arAccountId, credit: amt, memo: 'A/R FX adjustment', controlLine: true },
         ]
       : [
-          { accountId: p.arAccountId, debit: amt, memo: 'A/R FX adjustment', controlLine: true },
+          { accountId: arAccountId, debit: amt, memo: 'A/R FX adjustment', controlLine: true },
           { accountId: fxAccountId, credit: amt, memo: 'Realized exchange gain' },
         ],
   });

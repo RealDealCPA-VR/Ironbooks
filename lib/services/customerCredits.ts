@@ -6,13 +6,28 @@
  * apply to). That unapplied part therefore belongs in the customer subledger as a credit, or A/R
  * aging / customer balances would stop matching the A/R account in the GL.
  *
- * As-of reconstruction mirrors arAging's invoice side (applications count as of their payment's
- * date): credit(as of cutoff) = current `unapplied` + refunds of that payment dated after the
- * cutoff (a refund debits A/R on its own date). Voided payments are excluded entirely — their
- * journal entry is voided, so they leave the GL at every date.
+ * As-of reconstruction (p1 fx): the credit is rebuilt in the PAYMENT'S currency, then converted:
+ *   unapplied(as of cutoff) = current `unapplied`
+ *                           + refunds of that payment dated after the cutoff (foreign amount)
+ *                           + foreign-invoice applies / unapplies recorded after the cutoff
+ *                             (payment_fx_reliefs dated after it; an unapply is negative)
+ *   credit (home)           = round2(unapplied(as of cutoff) x payment rate)
+ * Every A/R posting that changes the credit (refund, apply / unapply FX plug, refund-void plug) is
+ * dated on the day the credit changed, so the A/R balance as of any date equals this figure.
+ * Home-currency payments (rate 1) reduce to current unapplied + later refunds, as before.
+ * Voided payments are excluded entirely — their journal entry is voided, so they leave the GL at
+ * every date.
  */
-import { and, eq, gt, isNull, lte, sql } from 'drizzle-orm';
-import { journalEntries, journalEntryLines, paymentsReceived } from '@/lib/db/schema';
+import { and, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
+import type Decimal from 'decimal.js';
+import {
+  accounts,
+  auditLogs,
+  journalEntries,
+  journalEntryLines,
+  paymentFxReliefs,
+  paymentsReceived,
+} from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 
@@ -23,6 +38,173 @@ export interface UnappliedCustomerPayment {
   reference: string | null;
   /** Positive amount of credit the customer holds, in base currency (reduces what they owe). */
   amount: string;
+}
+
+/** Home value of a payment-currency amount at the payment rate (round2); exactly 0 when nothing is left. */
+export function paymentCreditHome(foreign: Decimal, rate: Decimal): Decimal {
+  return foreign.isZero() ? Money.zero() : Money.round2(foreign.times(rate));
+}
+
+/** A change to a payment's unapplied credit after the payment itself. */
+export interface PaymentCreditEvent {
+  date: Date;
+  /** Reduction of the unapplied credit, payment currency (a refund or apply: +, an unapply: -). */
+  foreign: Decimal;
+  kind: 'refund' | 'apply';
+  /** refund: the refund's journal entry. */
+  entryId?: string;
+}
+
+/**
+ * Posted refunds and later foreign-invoice applies / unapplies of these payments, optionally only
+ * those dated after `after`. A refund's foreign amount is the one recorded on its audit row
+ * (exact); a refund without one falls back to round2(posted home / rate).
+ */
+export async function paymentCreditEvents(
+  ctx: ServiceContext,
+  payments: Array<{ id: string; exchangeRate: string | null }>,
+  opts: { after?: Date } = {},
+): Promise<Map<string, PaymentCreditEvent[]>> {
+  const out = new Map<string, PaymentCreditEvent[]>();
+  if (payments.length === 0) return out;
+  const ids = payments.map((p) => p.id);
+  const rateOf = new Map(payments.map((p) => [p.id, Money.of(p.exchangeRate ?? 1)]));
+  const push = (id: string, e: PaymentCreditEvent) => out.set(id, [...(out.get(id) ?? []), e]);
+
+  const refundConds = [
+    eq(journalEntries.companyId, ctx.companyId),
+    eq(journalEntries.status, 'posted'),
+    inArray(
+      journalEntries.sourceRef,
+      ids.map((id) => `refund:${id}`),
+    ),
+  ];
+  if (opts.after) refundConds.push(gt(journalEntries.date, opts.after));
+  const refundRows = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      sourceRef: journalEntries.sourceRef,
+      date: journalEntries.date,
+      amount: sql<string>`COALESCE(SUM(CAST(${journalEntryLines.debit} AS NUMERIC)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(...refundConds))
+    .groupBy(journalEntries.id, journalEntries.sourceRef, journalEntries.date);
+  if (refundRows.length > 0) {
+    const refunded = [...new Set(refundRows.map((r) => r.sourceRef!.slice('refund:'.length)))];
+    const audits = await ctx.db
+      .select({ newValues: auditLogs.newValues })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, ctx.companyId),
+          eq(auditLogs.entityType, 'payment_received'),
+          inArray(auditLogs.entityId, refunded),
+          sql`${auditLogs.newValues}->>'action' = 'refund'`,
+        ),
+      );
+    const foreignByEntry = new Map<string, string>();
+    for (const a of audits) {
+      const v = a.newValues as { postedEntryId?: string; amount?: string } | null;
+      if (v?.postedEntryId && v.amount) foreignByEntry.set(v.postedEntryId, v.amount);
+    }
+    for (const r of refundRows) {
+      const id = r.sourceRef!.slice('refund:'.length);
+      const rate = rateOf.get(id) ?? Money.of(1);
+      const recorded = foreignByEntry.get(r.entryId);
+      const foreign = recorded
+        ? Money.round2(Money.of(recorded))
+        : rate.greaterThan(0) && !rate.equals(1)
+          ? Money.round2(Money.of(r.amount).div(rate))
+          : Money.round2(Money.of(r.amount));
+      push(id, { date: r.date, foreign, kind: 'refund', entryId: r.entryId });
+    }
+  }
+
+  const reliefConds = [
+    eq(paymentFxReliefs.companyId, ctx.companyId),
+    inArray(paymentFxReliefs.paymentId, ids),
+    // Reliefs recorded with the payment itself (dated the payment date) are part of the payment.
+    gt(paymentFxReliefs.date, paymentsReceived.date),
+  ];
+  if (opts.after) reliefConds.push(gt(paymentFxReliefs.date, opts.after));
+  const reliefs = await ctx.db
+    .select({ paymentId: paymentFxReliefs.paymentId, date: paymentFxReliefs.date, amount: paymentFxReliefs.amount })
+    .from(paymentFxReliefs)
+    .innerJoin(paymentsReceived, eq(paymentFxReliefs.paymentId, paymentsReceived.id))
+    .where(and(...reliefConds));
+  for (const r of reliefs) push(r.paymentId, { date: r.date, foreign: Money.of(r.amount), kind: 'apply' });
+  return out;
+}
+
+/** The payment's unapplied credit (payment currency) as of a date: today's + events after it. */
+export function unappliedAsOf(current: Decimal | string, events: PaymentCreditEvent[] | undefined, asOf: Date): Decimal {
+  let u = Money.of(current);
+  for (const e of events ?? []) if (e.date.getTime() > asOf.getTime()) u = u.plus(e.foreign);
+  return Money.round2(u);
+}
+
+/**
+ * Unapplied credit (payment currency) of these payments as of a date (or today), per payment id.
+ * Shared by the A/R aging (unappliedCustomerPayments) and the foreign subledger (fxSubledger.ts).
+ */
+export async function paymentsUnappliedAsOf(
+  ctx: ServiceContext,
+  payments: Array<{ id: string; unapplied: string; exchangeRate: string | null }>,
+  asOf?: Date,
+): Promise<Map<string, Decimal>> {
+  if (!asOf) return new Map(payments.map((p) => [p.id, Money.round2(Money.of(p.unapplied))]));
+  const events = await paymentCreditEvents(ctx, payments, { after: asOf });
+  return new Map(payments.map((p) => [p.id, unappliedAsOf(p.unapplied, events.get(p.id), asOf)]));
+}
+
+/**
+ * What the ledger carries for a payment's unapplied credit, as dated A/R movements: the A/R of the
+ * payment's own entry, its FX plugs (`payment:<id>`) and its refunds (`refund:<id>`), plus the home
+ * A/R it moved onto foreign invoices (payment_fx_reliefs: A/R taken off the credit and put on the
+ * invoice). ledgerCreditAsOf turns it into the credit's home amount as of a date. Used when a
+ * refund is voided to keep A/R equal to the credit at every date.
+ */
+export async function paymentCreditLedger(
+  ctx: ServiceContext,
+  payment: { id: string; postedEntryId: string | null },
+): Promise<Array<{ date: Date; arNet: Decimal }>> {
+  const refs = [`payment:${payment.id}`, `refund:${payment.id}`];
+  const rows = await ctx.db
+    .select({
+      date: journalEntries.date,
+      net: sql<string>`COALESCE(SUM(COALESCE(CAST(${journalEntryLines.debit} AS NUMERIC), 0) - COALESCE(CAST(${journalEntryLines.credit} AS NUMERIC), 0)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        eq(accounts.subtype, 'accounts_receivable'),
+        payment.postedEntryId
+          ? sql`(${inArray(journalEntries.sourceRef, refs)} OR ${eq(journalEntries.id, payment.postedEntryId)})`
+          : inArray(journalEntries.sourceRef, refs),
+      ),
+    )
+    .groupBy(journalEntries.id, journalEntries.date);
+  const reliefs = await ctx.db
+    .select({ date: paymentFxReliefs.date, home: paymentFxReliefs.homeAmount })
+    .from(paymentFxReliefs)
+    .where(and(eq(paymentFxReliefs.companyId, ctx.companyId), eq(paymentFxReliefs.paymentId, payment.id)));
+  return [
+    ...rows.map((r) => ({ date: r.date, arNet: Money.of(r.net) })),
+    ...reliefs.map((r) => ({ date: r.date, arNet: Money.of(r.home) })),
+  ];
+}
+
+/** Credit (positive home amount) the ledger carries for the payment as of a date. */
+export function ledgerCreditAsOf(ledger: Array<{ date: Date; arNet: Decimal }>, asOf: Date): Decimal {
+  let net = Money.zero();
+  for (const l of ledger) if (l.date.getTime() <= asOf.getTime()) net = net.plus(l.arNet);
+  return Money.round2(net.negated());
 }
 
 export async function unappliedCustomerPayments(
@@ -44,36 +226,15 @@ export async function unappliedCustomerPayments(
     .from(paymentsReceived)
     .where(and(...conds));
 
-  // Refunds dated after the cutoff: the credit still existed on the cutoff date.
-  const laterRefunds = new Map<string, string>();
-  if (opts.asOf) {
-    const refundRows = await ctx.db
-      .select({
-        sourceRef: journalEntries.sourceRef,
-        amount: sql<string>`COALESCE(SUM(CAST(${journalEntryLines.debit} AS NUMERIC)), 0)`,
-      })
-      .from(journalEntryLines)
-      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-      .where(
-        and(
-          eq(journalEntries.companyId, ctx.companyId),
-          eq(journalEntries.status, 'posted'),
-          sql`${journalEntries.sourceRef} LIKE 'refund:%'`,
-          gt(journalEntries.date, opts.asOf),
-        ),
-      )
-      .groupBy(journalEntries.sourceRef);
-    for (const r of refundRows) {
-      if (r.sourceRef) laterRefunds.set(r.sourceRef.slice('refund:'.length), r.amount);
-    }
-  }
+  // Refunds / foreign applies dated after the cutoff: the credit still existed on the cutoff date.
+  const unappliedThen = await paymentsUnappliedAsOf(ctx, rows, opts.asOf);
 
   const out: UnappliedCustomerPayment[] = [];
   for (const r of rows) {
     // `unapplied` is in the payment's currency; A/R was credited at the payment's settlement
-    // rate (payments.ts receivePayment), and refunds debit A/R at that same rate (base amounts).
-    const unappliedBase = Money.round2(Money.mul(Money.of(r.unapplied), Money.of(r.exchangeRate ?? 1)));
-    const amount = unappliedBase.plus(Money.of(laterRefunds.get(r.id) ?? '0'));
+    // rate (payments.ts receivePayment), and every later change to the credit moved A/R by the
+    // change in its home value at that rate.
+    const amount = paymentCreditHome(unappliedThen.get(r.id) ?? Money.zero(), Money.of(r.exchangeRate ?? 1));
     if (!amount.greaterThan(0)) continue;
     out.push({
       paymentId: r.id,
