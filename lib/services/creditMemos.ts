@@ -57,6 +57,7 @@ import {
 import { Money, allocate, toAmountString } from '@/lib/money';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
+import { getHomeCurrencyCode } from './currencies';
 import {
   type InventoryLineDetail,
   attachInventoryDetails,
@@ -705,10 +706,16 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
   // Credit memos are recorded in home currency; a foreign-currency invoice is settled through
   // Receive Payments (which converts at the booked rate and posts realized exchange gain/loss).
   // Same rule as vendorCredits.applyToBill on the A/P side.
-  if (invoice.currency) {
-    throw validation(
-      `This invoice is in ${invoice.currency}. Home-currency credits can't be applied to it — settle it with Receive Payments instead.`,
-    );
+  // The invoice Currency field is free text: blank or the home code (any case) means home currency,
+  // the same normalisation Receive Payments uses — only a genuinely foreign code is refused.
+  const invoiceCurrency = (invoice.currency ?? '').trim().toUpperCase();
+  if (invoiceCurrency) {
+    const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+    if (invoiceCurrency !== home) {
+      throw validation(
+        `This invoice is in ${invoiceCurrency}. Home-currency credits can't be applied to it — settle it with Receive Payments instead.`,
+      );
+    }
   }
 
   const balanceDue = Money.of(invoice.balanceDue);

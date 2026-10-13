@@ -445,9 +445,11 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
 
   // Vendor credits are recorded in home currency; a foreign-currency bill is settled through
   // Pay Bills (which converts at the booked rate and posts realized exchange gain/loss).
-  if (bill.currency) {
+  // Blank or the home code (any case) means home currency — only a genuinely foreign bill is refused.
+  const billCurrency = await foreignCurrencyOf(ctx, bill.currency);
+  if (billCurrency) {
     throw validation(
-      `This bill is in ${bill.currency}. Home-currency vendor credits can't be applied to it — settle it with Pay Bills instead.`,
+      `This bill is in ${billCurrency}. Home-currency vendor credits can't be applied to it — settle it with Pay Bills instead.`,
     );
   }
 

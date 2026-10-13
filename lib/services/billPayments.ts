@@ -241,6 +241,13 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
     exchangeRate: string | null;
   };
   const billRows: Array<{ bill: BillRow; applied: Decimal; discount: Decimal }> = [];
+  // A bill's Currency column may hold the home code in any case (imported / upgraded data):
+  // that is a home bill. Normalise once so the FX path only ever sees genuinely foreign bills.
+  const homeCode = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const billCurrencyOf = (code: string | null): string | null => {
+    const v = (code ?? '').trim().toUpperCase();
+    return v === '' || v === homeCode ? null : v;
+  };
   for (const app of input.applications) {
     const applied = Money.of(app.amountApplied);
     const discount = Money.of(app.discountTaken ?? 0);
@@ -263,6 +270,7 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
       .from(bills)
       .where(and(eq(bills.id, app.billId), eq(bills.companyId, ctx.companyId)));
     if (!bill) throw notFound(`Bill ${app.billId}`);
+    bill.currency = billCurrencyOf(bill.currency);
     if (bill.vendorId !== input.vendorId) {
       throw validation(`Bill ${app.billId} does not belong to the specified vendor.`);
     }
