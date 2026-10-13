@@ -29,4 +29,15 @@ describe('PGlite local database', () => {
     expect(found).toHaveLength(1);
     expect(found[0].name).toBe('Smoke Test');
   });
+
+  it('stamps database-default timestamps in real UTC (session time zone pinned)', async () => {
+    const db = await getDb(TEST_DIR);
+    const before = Date.now();
+    const [row] = await db
+      .insert(users)
+      .values({ email: 'tz@test.local', name: 'TZ', passwordHash: 'x' })
+      .returning();
+    // Host time zones like Etc/GMT+5 used to make defaultNow() come back hours early.
+    expect(Math.abs(row.createdAt.getTime() - before)).toBeLessThan(60_000);
+  });
 });
