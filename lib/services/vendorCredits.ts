@@ -58,6 +58,9 @@ import {
   unapplyForeignVendorCredit,
   vendorCreditEntryFx,
   vendorCreditApplicationDate,
+  vendorCreditRefundDate,
+  assertRedateAfterVendorCreditSteps,
+  clearSettledForeignApplications,
   vendorCreditFxColumns,
 } from './vendorCreditsFx';
 import {
@@ -553,6 +556,8 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
     .where(and(eq(vendorCredits.id, id), eq(vendorCredits.companyId, ctx.companyId)));
   if (!existing) throw notFound('Vendor credit');
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided vendor credit.');
+  // p1 fx: never move a credit after its dated applications or refunds.
+  await assertRedateAfterVendorCreditSteps(ctx, { vendorCreditId: id }, input.date);
 
   const [vendor] = await ctx.db
     .select({ id: vendors.id, name: vendors.displayName })
@@ -1079,7 +1084,7 @@ export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendo
   }
 
   const apAccountId = await resolveApAccount(ctx);
-  const refundDate = input.date ?? new Date();
+  const refundDate = vendorCreditRefundDate(credit, input.date);
 
   return inTransaction(ctx, async (tx) => {
     // 1. Post the refund receipt.
@@ -1166,6 +1171,8 @@ export async function voidVendorCredit(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
+    // p1 fx: settled (applied, then unapplied) foreign applications go with the credit.
+    await clearSettledForeignApplications(tx, { vendorCreditId: id });
     // Reverse the GL entry.
     if (credit.postedEntryId) {
       await voidJournalEntry(tx, credit.postedEntryId);

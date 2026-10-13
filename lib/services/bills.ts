@@ -52,6 +52,7 @@ import {
   writeAudit,
 } from './_base';
 import { billHasReceiptLinks, releaseReceiptBilling } from './receivingLinks';
+import { assertRedateAfterVendorCreditSteps, clearSettledForeignApplications } from './vendorCreditsFx';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -818,6 +819,8 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
     );
   }
   await assertNotLoanBill(ctx, id);
+  // p1 fx: never move a bill after the dated vendor-credit steps recorded against it.
+  await assertRedateAfterVendorCreditSteps(ctx, { billId: id }, input.date);
   if (await billHasReceiptLinks(ctx, id)) {
     throw new ServiceError(
       'CONFLICT',
@@ -1143,6 +1146,9 @@ export async function voidBill(ctx: ServiceContext, id: string) {
   return inTransaction(ctx, async (tx) => {
     // Landed cost allocated from this bill's charge lines must be voided first.
     await assertNoActiveLandedCost(tx, { billId: id });
+
+    // p1 fx: settled (applied, then unapplied) foreign vendor-credit applications go with the bill.
+    await clearSettledForeignApplications(tx, { billId: id });
 
     // Reverse the GL entry.
     if (bill.postedEntryId) {

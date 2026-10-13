@@ -54,6 +54,11 @@ export interface ForeignOpenItem {
   foreignOpen: Decimal;
   /** Home amount the control account carries for it (same sign convention). */
   homeOpen: Decimal;
+  /**
+   * Invoices only: amount of legacy HOME credit memos applied to this foreign invoice by the cut-off
+   * (older data; refused since the payments P1 round). Already taken off foreignOpen.
+   */
+  memoApplied?: Decimal;
 }
 
 const r2 = (v: Decimal | string | number) => Money.round2(v);
@@ -82,8 +87,8 @@ async function invoiceOpenAmounts(
   ctx: ServiceContext,
   rows: InvoiceOpenRow[],
   asOf?: Date,
-): Promise<Map<string, { foreign: Decimal; homeOpen: Decimal }>> {
-  const out = new Map<string, { foreign: Decimal; homeOpen: Decimal }>();
+): Promise<Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal }>> {
+  const out = new Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal }>();
   if (rows.length === 0) return out;
   const ids = rows.map((i) => i.id);
   const entryIds = rows.map((i) => i.postedEntryId).filter((x): x is string => !!x);
@@ -140,8 +145,11 @@ async function invoiceOpenAmounts(
   // Older databases may hold a HOME credit memo applied to a foreign invoice (refused since the
   // payments P1 round): the memo took its home amount off A/R when it posted, so that part is no
   // longer open in home currency. Effective from the latest of the application, memo and invoice
-  // dates (as the A/R aging dates credit-memo applications). The foreign side of it is counted
-  // by the aging's credit residual, so only the home amount is taken off here.
+  // dates (as the A/R aging dates credit-memo applications). The legacy apply also took the same
+  // number off the invoice's balance due (its foreign balance), so it comes off the foreign open
+  // amount too: Home Currency Adjustment and the foreign columns then revalue / show what the
+  // invoice really still asks for. The aging leaves it out of its own credit residual (memoApplied).
+  const memoBy = new Map<string, Decimal>();
   const memoApps = await ctx.db
     .select({ invoiceId: creditApplications.invoiceId, amount: creditApplications.amount })
     .from(creditApplications)
@@ -156,12 +164,17 @@ async function invoiceOpenAmounts(
     );
   for (const m of memoApps) {
     reliefBy.set(m.invoiceId, (reliefBy.get(m.invoiceId) ?? Money.zero()).plus(Money.of(m.amount)));
+    memoBy.set(m.invoiceId, (memoBy.get(m.invoiceId) ?? Money.zero()).plus(Money.of(m.amount)));
   }
   const appsBy = new Map<string, typeof apps>();
   for (const a of apps) appsBy.set(a.invoiceId, [...(appsBy.get(a.invoiceId) ?? []), a]);
   for (const i of rows) {
     const rate = Money.of(i.rate ?? 1);
-    let foreign = Money.of(i.total).minus(Money.of(i.retainage ?? 0)).plus(laterForeignBy.get(i.id) ?? Money.zero());
+    const memoApplied = memoBy.get(i.id) ?? Money.zero();
+    let foreign = Money.of(i.total)
+      .minus(Money.of(i.retainage ?? 0))
+      .plus(laterForeignBy.get(i.id) ?? Money.zero())
+      .minus(memoApplied);
     let homeOpen =
       i.postedEntryId && arByEntry.has(i.postedEntryId) ? arByEntry.get(i.postedEntryId)! : r2(foreign.times(rate));
     homeOpen = homeOpen.minus(reliefBy.get(i.id) ?? Money.zero());
@@ -171,7 +184,7 @@ async function invoiceOpenAmounts(
         homeOpen = homeOpen.minus(legacyApplicationHome(a, rate));
       }
     }
-    out.set(i.id, { foreign, homeOpen });
+    out.set(i.id, { foreign, homeOpen, memoApplied });
   }
   return out;
 }
@@ -304,7 +317,7 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
     const open = await invoiceOpenAmounts(ctx, foreignInv, asOf);
     for (const i of foreignInv) {
       const rate = Money.of(i.rate ?? 1);
-      const { foreign, homeOpen } = open.get(i.id)!;
+      const { foreign, homeOpen, memoApplied } = open.get(i.id)!;
       if (foreign.isZero() && homeOpen.isZero()) continue;
       out.push({
         kind: 'invoice',
@@ -316,6 +329,7 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
         rate,
         foreignOpen: r2(foreign),
         homeOpen: r2(homeOpen),
+        memoApplied,
       });
     }
   }
@@ -511,12 +525,12 @@ export async function foreignOpenPayables(ctx: ServiceContext, asOf: Date): Prom
 export async function foreignInvoiceHomeOpen(
   ctx: ServiceContext,
   asOf: Date,
-): Promise<Map<string, { foreignOpen: Decimal; homeOpen: Decimal; currency: string }>> {
+): Promise<Map<string, { foreignOpen: Decimal; homeOpen: Decimal; currency: string; memoApplied: Decimal }>> {
   const items = await foreignOpenReceivables(ctx, asOf);
   return new Map(
     items
       .filter((i) => i.kind === 'invoice')
-      .map((i) => [i.id, { foreignOpen: i.foreignOpen, homeOpen: i.homeOpen, currency: i.currency }]),
+      .map((i) => [i.id, { foreignOpen: i.foreignOpen, homeOpen: i.homeOpen, currency: i.currency, memoApplied: i.memoApplied ?? Money.zero() }]),
   );
 }
 

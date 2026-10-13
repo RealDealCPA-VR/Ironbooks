@@ -426,6 +426,11 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     // after the cutoff had not reduced it yet), so whether it was open is decided from its as-of
     // foreign open amount, and it is aged at the home amount A/R still carries for it.
     const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    // Legacy home memos on a foreign invoice are already off its foreign open amount.
+    if (fo && fo.memoApplied.greaterThan(0)) {
+      creditResidual = creditResidual.minus(fo.memoApplied);
+      if (creditResidual.lessThan(0)) creditResidual = Money.zero();
+    }
     let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
     if (fo) amount = fo.homeOpen;
@@ -1308,6 +1313,11 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     // invoice was open is decided from its as-of foreign open amount (payments count on the date
     // they were applied), as in arAging.
     const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    // Legacy home memos on a foreign invoice are already off its foreign open amount.
+    if (fo && fo.memoApplied.greaterThan(0)) {
+      creditResidual = creditResidual.minus(fo.memoApplied);
+      if (creditResidual.lessThan(0)) creditResidual = Money.zero();
+    }
     let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
     if (!amount.greaterThan(0)) continue;
     if (fo) amount = fo.homeOpen;

@@ -18,12 +18,12 @@
  * Refunding a foreign credit takes its home A/P at the credit's rate and puts the cash in the bank
  * at the refund's rate; the difference is again a realized gain/loss.
  */
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { accounts, billPaymentApplications, billPayments, bills, vendorCreditApplications, vendorCredits, vendors } from '@/lib/db/schema';
+import { accounts, billPaymentApplications, billPayments, bills, journalEntries, vendorCreditApplications, vendorCredits, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
-import { postJournalEntry, type PostingLine } from './posting';
+import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
@@ -231,6 +231,124 @@ export async function vendorCreditApplicationDate(
   }
   // Same day but an earlier time of day: take the later moment so the order is kept.
   return date < floor ? floor : date;
+}
+
+/**
+ * The date a vendor refund of a credit takes effect. Like an application, a refund can't be dated
+ * before the credit exists (the cash would come back for a credit A/P does not carry yet). No date
+ * means today, or the credit's date when the credit is dated later.
+ */
+export function vendorCreditRefundDate(credit: Pick<VendorCreditRow, 'date'>, date: Date | null | undefined): Date {
+  const floor = new Date(credit.date);
+  if (!date) {
+    const now = new Date();
+    return now > floor ? now : floor;
+  }
+  if (ymd(date) < ymd(floor)) {
+    throw validation(`A credit can't be refunded before it exists. Use a date on or after the credit's date (${ymd(floor)}).`);
+  }
+  return date < floor ? floor : date;
+}
+
+/**
+ * Earliest dated step recorded against a bill or a vendor credit: foreign application / unapply
+ * rows, and (for a credit) its posted vendor refunds. A bill or credit can't be re-dated after one
+ * of these: the step would then come before the document it belongs to, and the as-of A/P aging
+ * would no longer match the ledger. Returns null when there is no such history.
+ */
+export async function earliestVendorCreditStep(
+  ctx: ServiceContext,
+  by: { billId: string } | { vendorCreditId: string },
+): Promise<{ date: Date; what: string } | null> {
+  const [app] = await ctx.db
+    .select({ date: sql<Date | string | null>`MIN(${vendorCreditApplications.date})` })
+    .from(vendorCreditApplications)
+    .where(
+      and(
+        eq(vendorCreditApplications.companyId, ctx.companyId),
+        'billId' in by ? eq(vendorCreditApplications.billId, by.billId) : eq(vendorCreditApplications.vendorCreditId, by.vendorCreditId),
+      ),
+    );
+  let best: { date: Date; what: string } | null = app?.date ? { date: new Date(app.date), what: 'a vendor credit was applied' } : null;
+  if ('vendorCreditId' in by) {
+    const [refund] = await ctx.db
+      .select({ date: sql<Date | string | null>`MIN(${journalEntries.date})` })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          eq(journalEntries.sourceRef, `refund:${by.vendorCreditId}`),
+          eq(journalEntries.status, 'posted'),
+        ),
+      );
+    if (refund?.date) {
+      const r = new Date(refund.date);
+      if (!best || r < best.date) best = { date: r, what: 'a vendor refund was recorded' };
+    }
+  }
+  return best;
+}
+
+/** Refuse moving a bill or credit to a date after its earliest dated credit step (see above). */
+export async function assertRedateAfterVendorCreditSteps(
+  ctx: ServiceContext,
+  by: { billId: string } | { vendorCreditId: string },
+  newDate: Date,
+): Promise<void> {
+  const step = await earliestVendorCreditStep(ctx, by);
+  if (step && ymd(new Date(newDate)) > ymd(step.date)) {
+    const doc = 'billId' in by ? 'bill' : 'credit';
+    throw validation(
+      `This ${doc} can't be dated after ${ymd(step.date)}, because ${step.what} on that date. Use a date on or before ${ymd(step.date)}.`,
+    );
+  }
+}
+
+/**
+ * Voiding a bill or a foreign vendor credit whose applications were all unapplied again: the
+ * apply / unapply pairs net to zero, but their dated rows and exchange gain/loss entries would
+ * still move A/P between the apply and unapply dates for a document the ledger no longer has.
+ * Void those exchange entries and drop the settled rows with the document (the audit log keeps
+ * the history). A pair that is still applied is refused (the callers already require unapplying).
+ */
+export async function clearSettledForeignApplications(
+  tx: ServiceContext,
+  by: { billId: string } | { vendorCreditId: string },
+): Promise<void> {
+  const rows = await tx.db
+    .select()
+    .from(vendorCreditApplications)
+    .where(
+      and(
+        eq(vendorCreditApplications.companyId, tx.companyId),
+        'billId' in by ? eq(vendorCreditApplications.billId, by.billId) : eq(vendorCreditApplications.vendorCreditId, by.vendorCreditId),
+      ),
+    );
+  if (rows.length === 0) return;
+  const pairs = new Map<string, { amount: Decimal; homeBill: Decimal; homeCredit: Decimal }>();
+  for (const r of rows) {
+    const k = `${r.vendorCreditId}|${r.billId}`;
+    const p = pairs.get(k) ?? { amount: Money.zero(), homeBill: Money.zero(), homeCredit: Money.zero() };
+    p.amount = p.amount.plus(Money.of(r.amount));
+    p.homeBill = p.homeBill.plus(Money.of(r.homeBill));
+    p.homeCredit = p.homeCredit.plus(Money.of(r.homeCredit));
+    pairs.set(k, p);
+  }
+  for (const p of pairs.values()) {
+    if (!p.amount.isZero() || !p.homeBill.isZero() || !p.homeCredit.isZero()) {
+      throw new ServiceError('CONFLICT', 'This vendor credit is still applied to a bill. Unapply it first.');
+    }
+  }
+  const entryIds = [...new Set(rows.map((r) => r.fxEntryId).filter((x): x is string => !!x))];
+  for (const entryId of entryIds) await voidJournalEntry(tx, entryId);
+  await tx.db.delete(vendorCreditApplications).where(inArray(vendorCreditApplications.id, rows.map((r) => r.id)));
+  await writeAudit(tx, {
+    action: 'delete',
+    entityType: 'vendor_credit_application',
+    entityId: rows[0].id,
+    oldValues: { rows: rows.map((r) => ({ id: r.id, vendorCreditId: r.vendorCreditId, billId: r.billId, date: r.date, amount: r.amount, fxEntryId: r.fxEntryId })) },
+    newValues: { reason: 'billId' in by ? 'bill voided' : 'vendor credit voided', voidedFxEntries: entryIds },
+  });
 }
 
 export function isForeignApplication(credit: VendorCreditRow, bill: BillRow): boolean {
@@ -441,7 +559,7 @@ export async function refundForeignVendorCredit(
   const bankHome = toHome(amount, fx.rate);
   if (!bankHome.greaterThan(0)) throw validation('This refund is too small to convert to your home currency.');
   const ap = await apAccountId(ctx);
-  const when = input.date ?? new Date();
+  const when = vendorCreditRefundDate(credit, input.date);
 
   return inTransaction(ctx, async (tx) => {
     const lines: PostingLine[] = [
