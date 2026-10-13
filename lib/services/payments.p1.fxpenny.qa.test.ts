@@ -460,3 +460,172 @@ describe('Fix round 2: home credit memos on a foreign invoice still close A/R to
     expect((await trialBalance(co.c, AS_OF)).balanced).toBe(true);
   });
 });
+
+describe('Re-test round 2: home credit memos on foreign invoices (invoiceOpenHome subtracts credit applications)', () => {
+  // A/R control with home credit memos in play: booked invoice A/R - live payment relief
+  // - payments' unapplied - every memo's posted credit. Each step must stay balanced and the
+  // books must close exactly when every document is closed.
+  async function memo(co: Co, amt: string, date = '2026-05-02') {
+    return createCreditMemo(co.c, {
+      customerId: co.cust,
+      date: D(date),
+      lines: [{ accountId: co.code['4000'], description: 'Credit', quantity: 1, rate: amt, taxable: false }],
+    } as Parameters<typeof createCreditMemo>[1]);
+  }
+  const balanced = async (co: Co) => expect((await trialBalance(co.c, AS_OF)).balanced).toBe(true);
+
+  it('two credits from two memos, then the payoff: A/R 0, FX = cash home - (113.06 - credits)', async () => {
+    const co = await freshCompany();
+    const inv = await eurInvoice(co);
+    const m1 = await memo(co, '10.00');
+    const m2 = await memo(co, '7.33');
+    await applyToInvoice(co.c, { creditMemoId: m1.id, invoiceId: inv.id, amount: '6.00' });
+    await applyToInvoice(co.c, { creditMemoId: m2.id, invoiceId: inv.id, amount: '7.33' });
+    // m1 still has 4.00 unapplied: it stays on A/R as a credit.
+    await pay(co, '2026-05-03', '86.72', [{ invoiceId: inv.id, amountApplied: '86.72' }], '1.21');
+    expect((await invoiceRow(inv.id)).status).toBe('paid');
+    await balanced(co);
+    expect(await arControl(co.c)).toBeCloseTo(-4, 2);
+    // FX: A/R relieved 113.06 - 13.33 = 99.73; cash 86.72 x 1.21 = 104.93 -> 5.20 gain (a credit).
+    expect(await fxNet(co.c)).toBeCloseTo(-r2(r2(86.72 * 1.21) - 99.73), 2);
+    // Use the rest of m1 on a home invoice: everything closes.
+    const home = await createInvoice(co.c, {
+      customerId: co.cust,
+      date: D('2026-05-04'),
+      dueDate: D('2026-05-31'),
+      lines: [{ accountId: co.code['4000'], description: 'Home', quantity: 1, rate: '4.00', taxable: false }],
+      overrideCreditLimit: true,
+    } as Parameters<typeof createInvoice>[1]);
+    await applyToInvoice(co.c, { creditMemoId: m1.id, invoiceId: home.id, amount: '4.00' });
+    await expectAllClosed(co);
+  });
+
+  it('void the payoff after a credit: A/R back to 113.06 - credit, FX 0; re-pay closes to 0', async () => {
+    const co = await freshCompany();
+    const inv = await eurInvoice(co);
+    const m = await memo(co, '10.00');
+    await applyToInvoice(co.c, { creditMemoId: m.id, invoiceId: inv.id, amount: '10.00' });
+    const p = await pay(co, '2026-05-03', '90.05', [{ invoiceId: inv.id, amountApplied: '90.05' }], '1.25');
+    expect(await arControl(co.c)).toBeCloseTo(0, 2);
+    await voidPayment(co.c, p.payment.id);
+    await balanced(co);
+    expect(await arControl(co.c)).toBeCloseTo(103.06, 2);
+    expect(await fxNet(co.c)).toBeCloseTo(0, 2);
+    expect((await invoiceRow(inv.id)).balanceDue).toBe('90.05');
+    await pay(co, '2026-05-05', '90.05', [{ invoiceId: inv.id, amountApplied: '90.05' }], '1.02');
+    await balanced(co);
+    await expectAllClosed(co);
+  });
+
+  it('edit the payoff (after a credit) to another rate and still pay off: A/R stays 0', async () => {
+    const co = await freshCompany();
+    const inv = await eurInvoice(co);
+    const m = await memo(co, '10.00');
+    await applyToInvoice(co.c, { creditMemoId: m.id, invoiceId: inv.id, amount: '10.00' });
+    const p = await pay(co, '2026-05-03', '90.05', [{ invoiceId: inv.id, amountApplied: '90.05' }]);
+    await updatePayment(co.c, p.payment.id, {
+      customerId: co.cust,
+      date: D('2026-05-03'),
+      method: 'bank_transfer',
+      amount: '90.05',
+      depositAccountId: co.code['1000'],
+      currency: 'EUR',
+      exchangeRate: '1.40',
+      applications: [{ invoiceId: inv.id, amountApplied: '90.05' }],
+    });
+    await balanced(co);
+    await expectAllClosed(co);
+    expect(await fxNet(co.c)).toBeCloseTo(-r2(r2(90.05 * 1.4) - 103.06), 2);
+  });
+
+  it('credit, then an unapplied payment applied later as the payoff (applyPayment path): A/R 0', async () => {
+    const co = await freshCompany();
+    const inv = await eurInvoice(co);
+    const m = await memo(co, '10.00');
+    await applyToInvoice(co.c, { creditMemoId: m.id, invoiceId: inv.id, amount: '10.00' });
+    const p = await pay(co, '2026-05-03', '90.05', [], '1.18');
+    await balanced(co);
+    await applyPayment(co.c, { paymentId: p.payment.id, applications: [{ invoiceId: inv.id, amountApplied: '90.05' }] });
+    expect((await invoiceRow(inv.id)).status).toBe('paid');
+    await balanced(co);
+    await expectAllClosed(co);
+  });
+
+  it('credit + payoff, unapply the payoff, unapply the credit, pay in full: A/R -10 (memo open) and balanced', async () => {
+    const co = await freshCompany();
+    const inv = await eurInvoice(co);
+    const m = await memo(co, '10.00');
+    const ca = await applyToInvoice(co.c, { creditMemoId: m.id, invoiceId: inv.id, amount: '10.00' });
+    const p = await pay(co, '2026-05-03', '90.05', [{ invoiceId: inv.id, amountApplied: '90.05' }]);
+    await unapplyFromInvoice(co.c, { paymentId: p.payment.id, invoiceId: inv.id, amount: '90.05' });
+    await balanced(co);
+    await unapplyCreditApplication(co.c, ca.application.id);
+    await balanced(co);
+    expect((await invoiceRow(inv.id)).balanceDue).toBe('100.05');
+    await pay(co, '2026-05-04', '10.00', [{ invoiceId: inv.id, amountApplied: '10.00' }]);
+    await applyPayment(co.c, { paymentId: p.payment.id, applications: [{ invoiceId: inv.id, amountApplied: '90.05' }] });
+    expect((await invoiceRow(inv.id)).status).toBe('paid');
+    await balanced(co);
+    expect(await arControl(co.c)).toBeCloseTo(-10, 2);
+  });
+
+  it('a credit on a HOME invoice is unaffected (rate 1 path): credit + payment close A/R to 0, no FX', async () => {
+    const co = await freshCompany();
+    const home = await createInvoice(co.c, {
+      customerId: co.cust,
+      date: D('2026-05-01'),
+      dueDate: D('2026-05-31'),
+      lines: [{ accountId: co.code['4000'], description: 'Home', quantity: 1, rate: '100.05', taxable: false }],
+      overrideCreditLimit: true,
+    } as Parameters<typeof createInvoice>[1]);
+    const m = await memo(co, '10.00');
+    await applyToInvoice(co.c, { creditMemoId: m.id, invoiceId: home.id, amount: '10.00' });
+    await receivePayment(co.c, {
+      customerId: co.cust,
+      date: D('2026-05-03'),
+      method: 'bank_transfer',
+      amount: '90.05',
+      depositAccountId: co.code['1000'],
+      applications: [{ invoiceId: home.id, amountApplied: '90.05' }],
+    });
+    await expectAllClosed(co);
+    expect(await fxNet(co.c)).toBeCloseTo(0, 2);
+  });
+
+  it('credit applications in another company never reduce this company\'s open home A/R', async () => {
+    const a = await freshCompany();
+    const b = await freshCompany();
+    const ia = await eurInvoice(a);
+    const ib = await eurInvoice(b);
+    const mb = await memo(b, '10.00');
+    await applyToInvoice(b.c, { creditMemoId: mb.id, invoiceId: ib.id, amount: '10.00' });
+    // A memo from B can't be applied to A's invoice, from either company.
+    await expect(applyToInvoice(a.c, { creditMemoId: mb.id, invoiceId: ia.id, amount: '1.00' })).rejects.toThrow();
+    await expect(applyToInvoice(b.c, { creditMemoId: mb.id, invoiceId: ia.id, amount: '1.00' })).rejects.toThrow();
+    await pay(a, '2026-05-03', '100.05', [{ invoiceId: ia.id, amountApplied: '100.05' }]);
+    await expectAllClosed(a);
+    await pay(b, '2026-05-03', '90.05', [{ invoiceId: ib.id, amountApplied: '90.05' }]);
+    await expectAllClosed(b);
+  });
+
+  // Gap outside this team's files (creditMemos.applyToInvoice): when the CREDIT is the document
+  // that closes a part-paid foreign invoice, nothing clears the home rate difference left on A/R,
+  // so the invoice shows paid while A/R control is not 0. Refusing the apply also passes.
+  it('a home credit that pays off the LAST part of a foreign invoice leaves A/R at 0 (or is refused)', async () => {
+    const co = await freshCompany();
+    const inv = await eurInvoice(co);
+    await pay(co, '2026-05-02', '90.05', [{ invoiceId: inv.id, amountApplied: '90.05' }]);
+    const m = await memo(co, '10.00', '2026-05-03');
+    let applied = true;
+    try {
+      await applyToInvoice(co.c, { creditMemoId: m.id, invoiceId: inv.id, amount: '10.00' });
+    } catch {
+      applied = false;
+    }
+    await balanced(co);
+    if (!applied) return;
+    expect((await invoiceRow(inv.id)).status).toBe('paid');
+    expect(Number((await arAging(co.c, AS_OF)).totals.total)).toBeCloseTo(0, 2);
+    expect(await arControl(co.c)).toBeCloseTo(0, 2);
+  });
+});
