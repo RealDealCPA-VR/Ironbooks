@@ -51,6 +51,7 @@ import { assertPeriodOpen } from './fiscalPeriods';
 import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
 import { docRef } from './docNumbers';
+import { computeDiscount, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
 import { getHomeCurrencyCode } from './currencies';
 import {
   type JournalCreditToInvoiceInput,
@@ -258,9 +259,8 @@ export interface DiscountTerms {
  * Parse a terms code/name carrying an early-payment discount: '2_10_net_30', '2% 10 Net 30',
  * '2/10 n/30', '1% 15 net 45'. Returns null for terms without a discount ('net_30', …).
  *
- * TODO(wave2 lists): when lib/services/lists/terms.ts (the Terms list with discountPercent /
- * discountDays) lands on main, resolve the customer's terms record there first and fall back to
- * this parser for legacy free-text terms.
+ * Legacy fallback: suggestEarlyPaymentDiscounts resolves the terms on the Terms list first
+ * (lib/services/lists/terms.ts) and only parses free text that is not on the list.
  */
 export function parseDiscountTerms(terms: string | null | undefined): DiscountTerms | null {
   if (!terms) return null;
@@ -310,8 +310,25 @@ export async function suggestEarlyPaymentDiscounts(
     .select({ id: invoices.id, date: invoices.date, terms: invoices.terms, balanceDue: invoices.balanceDue })
     .from(invoices)
     .where(and(...conds));
+  // Terms list entries (standard / date-driven) by reference, resolved once per distinct string.
+  const termsCache = new Map<string, TermsRow | null>();
+  for (const r of rows) {
+    const ref = r.terms ?? cust.terms ?? null;
+    if (ref && !termsCache.has(ref)) termsCache.set(ref, await findTermsRef(ctx, ref));
+  }
   return rows.map((r) => {
     const terms = r.terms ?? cust.terms ?? null;
+    const row = terms ? termsCache.get(terms) : null;
+    if (row) {
+      const d = computeDiscount(row as TermsLike, r.date, input.paymentDate, r.balanceDue);
+      return {
+        invoiceId: r.id,
+        terms,
+        discountDate: d.discountDate ? d.discountDate.toISOString().slice(0, 10) : null,
+        eligible: d.eligible,
+        suggested: d.amount ?? '0.00',
+      };
+    }
     const parsed = parseDiscountTerms(terms);
     if (!parsed) {
       return { invoiceId: r.id, terms, discountDate: null, eligible: false, suggested: '0.00' };

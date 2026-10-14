@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { Briefcase } from 'lucide-react';
 import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { api } from '@/lib/client';
+import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 
 export default function SignupPage() {
   const [form, setForm] = useState({ name: '', email: '', password: '', companyName: '' });
@@ -48,7 +49,7 @@ export default function SignupPage() {
           </div>
           <div>
             <Label>Password</Label>
-            <Input type="password" value={form.password} onChange={set('password')} required minLength={6} />
+            <Input type="password" value={form.password} onChange={set('password')} required minLength={MIN_PASSWORD_LENGTH} />
           </div>
           <Button type="submit" className="w-full" loading={busy}>
             Create account

@@ -12,7 +12,8 @@
  */
 import { and, eq, sql } from 'drizzle-orm';
 import { customers, paymentTerms, vendors } from '@/lib/db/schema';
-import { type ServiceContext, notFound } from '../_base';
+import { type ServiceContext, ServiceError, notFound } from '../_base';
+import { dueDateFromTerms as legacyDueDate } from '../billTerms';
 import { ensureSeeded } from './simpleLists';
 import { computeDiscount, computeDueDate, describeTerms, type DiscountResult, type TermsLike } from './termsMath';
 
@@ -87,6 +88,32 @@ export async function vendorTerms(ctx: ServiceContext, vendorId: string): Promis
 export async function dueDateFor(ctx: ServiceContext, ref: string | null | undefined, txnDate: Date): Promise<Date> {
   const row = await resolveTermsRef(ctx, ref);
   return row ? computeDueDate(row as TermsLike, txnDate) : computeDueDate({ kind: 'standard', netDays: 0 }, txnDate);
+}
+
+/** Like resolveTermsRef, but an unknown reference (free-text terms) gives null instead of throwing. */
+export async function findTermsRef(ctx: ServiceContext, ref: string | null | undefined): Promise<TermsRow | null> {
+  try {
+    return await resolveTermsRef(ctx, ref);
+  } catch (err) {
+    if (err instanceof ServiceError && err.code === 'NOT_FOUND') return null;
+    throw err;
+  }
+}
+
+/**
+ * Due date for a document's terms (B5): the Terms list entry (standard or date-driven) named by
+ * the reference wins; free text that is not on the list falls back to the legacy parser
+ * ('2/10 n/30', 'net 45'). Null when the terms are empty or not understood.
+ */
+export async function dueDateFromTermsList(
+  ctx: ServiceContext,
+  ref: string | null | undefined,
+  txnDate: Date,
+): Promise<Date | null> {
+  if (!ref?.trim()) return null;
+  const row = await findTermsRef(ctx, ref);
+  if (row) return computeDueDate(row as TermsLike, txnDate);
+  return legacyDueDate(txnDate, ref);
 }
 
 /** Early-payment discount under the referenced terms (no terms → never eligible). */

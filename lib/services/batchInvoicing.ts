@@ -25,6 +25,7 @@ import {
   getInvoice,
   updateInvoice,
 } from './invoices';
+import { dueDateFromTermsList } from './lists/terms';
 
 const DAY_MS = 86_400_000;
 
@@ -105,7 +106,8 @@ export async function createBatchInvoices(
     const invoiceInput: CreateInvoiceInput = {
       customerId: id,
       date: input.date,
-      dueDate: input.dueDate ?? dueDateFromTerms(input.date, cust.terms),
+      dueDate: input.dueDate ?? (await dueDateFromTermsList(ctx, cust.terms, input.date)),
+      terms: cust.terms ?? null,
       lines: input.lines.map((l) => ({ ...l, taxable: cust.taxable ? l.taxable : false })),
       taxRateId,
       classId: input.classId ?? null,
@@ -161,14 +163,14 @@ export interface StatementChargeInput {
   overrideCreditLimit?: boolean;
 }
 
-function chargeToInvoiceInput(input: StatementChargeInput, terms: string | null): CreateInvoiceInput {
+function chargeToInvoiceInput(input: StatementChargeInput, termsDue: Date | null): CreateInvoiceInput {
   const qty = input.quantity ?? 1;
   if (!Money.of(qty).greaterThan(0)) throw validation('Quantity must be greater than zero.');
   if (!Money.of(input.rate).greaterThan(0)) throw validation('The charge amount must be greater than zero.');
   return {
     customerId: input.customerId,
     date: input.date,
-    dueDate: input.dueDate ?? dueDateFromTerms(input.date, terms) ?? input.date,
+    dueDate: input.dueDate ?? termsDue ?? input.date,
     classId: input.classId ?? null,
     jobId: input.jobId ?? null,
     memo: input.description ?? null,
@@ -188,26 +190,27 @@ function chargeToInvoiceInput(input: StatementChargeInput, terms: string | null)
   };
 }
 
-async function customerTerms(ctx: ServiceContext, customerId: string): Promise<string | null> {
+/** Due date under the customer's terms (Terms list, else the legacy parser), or null. */
+async function customerTermsDue(ctx: ServiceContext, customerId: string, date: Date): Promise<Date | null> {
   const [c] = await ctx.db
     .select({ terms: customers.terms })
     .from(customers)
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
   if (!c) throw notFound('Customer');
-  return c.terms ?? null;
+  return dueDateFromTermsList(ctx, c.terms, date);
 }
 
 export async function createStatementCharge(ctx: ServiceContext, input: StatementChargeInput) {
-  const terms = await customerTerms(ctx, input.customerId);
-  return createInvoice(ctx, chargeToInvoiceInput(input, terms));
+  const termsDue = await customerTermsDue(ctx, input.customerId, input.date);
+  return createInvoice(ctx, chargeToInvoiceInput(input, termsDue));
 }
 
 /** Edit a statement charge (void + re-post through updateInvoice; payments stay applied). */
 export async function updateStatementCharge(ctx: ServiceContext, id: string, input: StatementChargeInput) {
   const existing = await getInvoice(ctx, id);
   if (!existing.isStatementCharge) throw notFound('Statement charge');
-  const terms = await customerTerms(ctx, input.customerId);
-  const { isStatementCharge: _flag, ...rest } = chargeToInvoiceInput(input, terms);
+  const termsDue = await customerTermsDue(ctx, input.customerId, input.date);
+  const { isStatementCharge: _flag, ...rest } = chargeToInvoiceInput(input, termsDue);
   return updateInvoice(ctx, id, rest);
 }
 

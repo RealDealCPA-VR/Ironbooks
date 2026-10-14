@@ -4,7 +4,8 @@
  * Body: {
  *   date: string;
  *   counts: Array<{ itemId: string; countedQty: string | number }>;
- *   adjustmentAccountId?: string;
+ *   adjustmentAccountId?: string;   // default "Inventory Adjustments"
+ *   classId?: string; customerId?: string; jobId?: string;
  * }
  *
  * Applies a whole physical count sheet at once. Each entry posts its own
@@ -37,6 +38,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       date?: string;
       counts?: Array<{ itemId: string; countedQty: string | number }>;
       adjustmentAccountId?: string | null;
+      classId?: string | null;
+      customerId?: string | null;
+      jobId?: string | null;
     };
 
     if (!body.date) {
@@ -53,6 +57,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       date: new Date(body.date),
       counts: body.counts,
       adjustmentAccountId: body.adjustmentAccountId ?? null,
+      classId: body.classId ?? null,
+      customerId: body.customerId ?? null,
+      jobId: body.jobId ?? null,
     });
 
     return NextResponse.json(result, { status: 201 });

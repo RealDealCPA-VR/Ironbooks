@@ -46,7 +46,7 @@ import {
 // wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
-import { dueDateForTerms } from '@/lib/preferences';
+import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 
@@ -200,6 +200,8 @@ export default function BillsPage() {
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [dueDate, setDueDate] = useState('');
   const [terms, setTerms] = useState('');
+  // Terms list entries (custom and date-driven terms included); the built-in set until it loads.
+  const termsChoices = useTermsChoices(TERMS_CHOICES);
   const [memo, setMemo] = useState('');
   const [exchangeRate, setExchangeRate] = useState('');
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
@@ -279,15 +281,26 @@ export default function BillsPage() {
    * Vendor picked on a NEW bill whose lines are still blank: pre-fill the expense accounts
    * (vendor default → last bill/check → learned categorizer). Never overwrites typed lines.
    */
+  /** Terms picked: the due date follows them (Terms list, Standard or Date-Driven). */
+  function handleTermsChange(value: string) {
+    setTerms(value);
+    const vendor = vendors.find((v) => v.id === vendorId);
+    const ref = value || vendor?.terms || prefs.company.defaultVendorTerms;
+    void fetchDueDateForTerms(date, ref).then((due) => {
+      if (due) setDueDate(due);
+    });
+  }
+
   async function handleVendorChange(id: string) {
     setVendorId(id);
     setPrefillNote('');
     if (!id || editingId) return;
     const vendor = vendors.find((v) => v.id === id);
     setTerms(vendor?.terms ?? '');
-    // Due date from the vendor's terms (else Preferences > Bills default terms).
-    const due = dueDateForTerms(date, vendor?.terms || prefs.company.defaultVendorTerms);
-    if (due) setDueDate(due);
+    // Due date from the vendor's terms on the Terms list (else Preferences > Bills default terms).
+    void fetchDueDateForTerms(date, vendor?.terms || prefs.company.defaultVendorTerms).then((due) => {
+      if (due) setDueDate(due);
+    });
     const blank = (ls: LineRow[]) =>
       ls.every((l) => l.mode === 'expense' && !l.accountId && !l.amount && !l.description);
     if (!blank(lines)) return;
@@ -724,9 +737,9 @@ export default function BillsPage() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <Label htmlFor="bill-terms">Terms</Label>
-              <Select id="bill-terms" value={terms} onChange={(e) => setTerms(e.target.value)}>
+              <Select id="bill-terms" value={terms} onChange={(e) => handleTermsChange(e.target.value)}>
                 <option value="">Vendor&apos;s terms</option>
-                {TERMS_CHOICES.map((t) => (
+                {withCurrentTerms(termsChoices, terms).map((t) => (
                   <option key={t.value} value={t.value}>
                     {t.label}
                   </option>

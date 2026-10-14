@@ -1,10 +1,12 @@
 /**
  * POST /api/inventory/physical-count
  *
- * Body: { itemId: string, countedQty: string | number, date: string, adjustmentAccountId?: string }
+ * Body: { itemId: string, countedQty: string | number, date: string,
+ *         adjustmentAccountId?: string, classId?, customerId?, jobId? }
  *
  * Records a physical inventory count. If countedQty differs from quantityOnHand,
- * posts a GL adjustment (Dr/Cr Inventory Shrinkage vs Inventory Asset) and updates
+ * posts a GL adjustment (Dr/Cr the Adjustment Account — default "Inventory Adjustments" —
+ * vs Inventory Asset) and updates
  * the item's quantityOnHand to the counted value.
  */
 import { NextRequest, NextResponse } from 'next/server';
@@ -34,9 +36,12 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       countedQty?: string | number;
       date?: string;
       adjustmentAccountId?: string | null;
+      classId?: string | null;
+      customerId?: string | null;
+      jobId?: string | null;
     };
 
-    const { itemId, countedQty, date, adjustmentAccountId } = body;
+    const { itemId, countedQty, date, adjustmentAccountId, classId, customerId, jobId } = body;
 
     if (!itemId) {
       return NextResponse.json({ error: 'itemId is required', code: 'VALIDATION' }, { status: 400 });
@@ -61,6 +66,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       countedQty,
       date: new Date(date),
       adjustmentAccountId: adjustmentAccountId ?? null,
+      classId: classId ?? null,
+      customerId: customerId ?? null,
+      jobId: jobId ?? null,
     });
 
     return NextResponse.json(result, { status: 201 });

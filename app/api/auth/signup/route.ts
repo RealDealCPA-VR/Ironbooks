@@ -16,7 +16,9 @@ import {
   createSessionToken,
   hasValidUnlockCookie,
   SESSION_COOKIE,
+  MIN_PASSWORD_LENGTH,
 } from '@/lib/auth';
+import { invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { COMPANY_COOKIE } from '@/lib/context';
 import { logTransaction } from '@/lib/services/transactionLog';
@@ -24,10 +26,16 @@ import { startSession } from '@/lib/services/sessions';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 
 export async function POST(req: NextRequest) {
-  const { name, email, password, companyName } = await req.json();
-  if (!name?.trim() || !email?.trim() || !password || password.length < 6) {
+  const body = await readJsonObject(req);
+  if (!body) return invalidJsonBody();
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  const name = str(body.name);
+  const email = str(body.email);
+  const password = str(body.password);
+  const companyName = str(body.companyName);
+  if (!name.trim() || !email.trim() || password.length < MIN_PASSWORD_LENGTH) {
     return NextResponse.json(
-      { error: 'Name, email and a password (min 6 chars) are required.', code: 'VALIDATION' },
+      { error: `Name, email and a password (min ${MIN_PASSWORD_LENGTH} chars) are required.`, code: 'VALIDATION' },
       { status: 400 },
     );
   }
@@ -82,7 +90,7 @@ export async function POST(req: NextRequest) {
     data: { new: { name: user.name, email: user.email } },
   });
 
-  const company = await createCompany(db, { name: (companyName?.trim() || `${name}'s Company`), ownerId: user.id });
+  const company = await createCompany(db, { name: (companyName.trim() || `${name}'s Company`), ownerId: user.id });
 
   const res = NextResponse.json({ id: user.id, name: user.name, email: user.email, companyId: company.id }, { status: 201 });
   const session = await startSession(db, {

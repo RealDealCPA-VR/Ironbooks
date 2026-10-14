@@ -7,11 +7,12 @@
  *   newUnitCost?: string | number;
  *   date: string;
  *   reason?: string;
- *   adjustmentAccountId?: string;
+ *   adjustmentAccountId?: string;   // default "Inventory Adjustments"
+ *   classId?: string; customerId?: string; jobId?: string;
  * }
  *
  * Inventory value adjustment (revaluation). Posts Dr/Cr Inventory Asset vs the
- * Inventory Adjustment expense account (find-or-create 5900); updates
+ * Adjustment Account (default "Inventory Adjustments"); updates
  * averageCost for average-cost items or revalues remaining FIFO layers.
  */
 import { NextRequest, NextResponse } from 'next/server';
@@ -42,6 +43,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       date?: string;
       reason?: string | null;
       adjustmentAccountId?: string | null;
+      classId?: string | null;
+      customerId?: string | null;
+      jobId?: string | null;
     };
 
     if (!body.itemId) {
@@ -58,6 +62,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       date: new Date(body.date),
       reason: body.reason ?? null,
       adjustmentAccountId: body.adjustmentAccountId ?? null,
+      classId: body.classId ?? null,
+      customerId: body.customerId ?? null,
+      jobId: body.jobId ?? null,
     });
 
     return NextResponse.json(result, { status: 201 });

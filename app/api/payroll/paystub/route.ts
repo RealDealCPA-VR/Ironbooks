@@ -6,7 +6,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getPortalEmployeeId } from '@/lib/auth';
+import { getPortalEmployeeId, getSessionUserId } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { ServiceError } from '@/lib/services/_base';
 import { renderPaystubPdf } from '@/lib/pdf/paystub';
@@ -50,17 +50,40 @@ export async function GET(req: NextRequest) {
     const db = await getDb();
 
     // Two authorized callers:
-    //  - An employee in the self-service portal (bka_portal): may fetch ONLY their own stubs.
     //  - A main-app user / employer (bka_session): may fetch any stub in their company.
-    // Anyone else (no valid session) is rejected: getServerContext() throws FORBIDDEN -> 403.
-    const portalEmployeeId = await getPortalEmployeeId();
-
+    //  - An employee in the self-service portal (bka_portal): may fetch ONLY their own stubs.
+    // The main session is checked FIRST so a stale portal cookie in the same browser can never
+    // shadow the employer's access; the portal cookie is only consulted when the main session
+    // does not authorize the request. getPortalEmployeeId() also requires the employee to be
+    // active with a current portal password. Anyone else gets getServerContext()'s FORBIDDEN.
     let companyId: string;
     let paycheck:
       | typeof paychecks.$inferSelect
       | undefined;
 
-    if (portalEmployeeId) {
+    let ctx: Awaited<ReturnType<typeof getServerContext>> | null = null;
+    let mainErr: unknown = null;
+    if (await getSessionUserId()) {
+      try {
+        ctx = await getServerContext();
+      } catch (err) {
+        mainErr = err; // e.g. no payroll permission — the portal cookie may still authorize
+      }
+    }
+    const portalEmployeeId = ctx ? null : await getPortalEmployeeId();
+    if (!ctx && !portalEmployeeId) {
+      if (mainErr) throw mainErr;
+      ctx = await getServerContext(); // no session at all: throws FORBIDDEN (or first-run fallback)
+    }
+
+    if (ctx) {
+      companyId = ctx.companyId;
+      [paycheck] = await db
+        .select()
+        .from(paychecks)
+        .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, companyId)));
+    } else {
+      if (!portalEmployeeId) throw mainErr; // unreachable: handled above
       const [emp] = await db
         .select()
         .from(employees)
@@ -74,13 +97,6 @@ export async function GET(req: NextRequest) {
         .select()
         .from(paychecks)
         .where(and(eq(paychecks.id, paycheckId), eq(paychecks.employeeId, portalEmployeeId)));
-    } else {
-      const ctx = await getServerContext();
-      companyId = ctx.companyId;
-      [paycheck] = await db
-        .select()
-        .from(paychecks)
-        .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, companyId)));
     }
 
     if (!paycheck) {

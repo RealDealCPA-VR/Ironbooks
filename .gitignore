@@ -13,7 +13,9 @@
 /out/
 
 # production
-/build
+/build/*
+!/build/icon.png
+!/build/icon.ico
 
 # misc
 .DS_Store

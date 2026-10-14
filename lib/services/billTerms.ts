@@ -1,9 +1,9 @@
 /**
  * Payment-terms math for A/P (QB "Terms" on bills): due date and early-payment discount.
  *
- * TODO(wave2 lists): when lib/services/lists/terms.ts (the Terms list with standard/date-driven
- * terms) lands, resolve a terms id/name through it and keep this parser as the fallback for the
- * legacy short strings stored on vendors/bills ('due_on_receipt', 'net_15', 'net_30', 'net_60').
+ * Legacy fallback: documents resolve their terms on the Terms list first
+ * (lists/terms.ts `dueDateFromTermsList` / `findTermsRef`, standard and date-driven); this parser
+ * only handles free text that is not on the list.
  *
  * Accepted shapes (case-insensitive, separators '_', ' ', '/', '%'):
  *   due_on_receipt                  -> due the bill date, no discount

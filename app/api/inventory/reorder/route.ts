@@ -1,8 +1,9 @@
 /**
  * GET /api/inventory/reorder
  *
- * Returns all inventory items where quantityOnHand <= reorderPoint,
- * along with a suggested reorder quantity for each.
+ * The reorder list: inventory items where on hand - committed (open SOs) + on order (open
+ * POs) <= reorderPoint, with a suggested quantity up to the max level (else the reorder
+ * point). Items whose open POs already cover the shortfall are left off.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';

@@ -55,6 +55,14 @@ export async function createTaxRate(
   if (rate.isNegative() || rate.greaterThan(1)) {
     throw validation('Rate must be a decimal fraction between 0 and 1 (e.g. 0.0825 for 8.25%).');
   }
+  if (input.agencyId) {
+    // Same company check as updateTaxRate: never link another company's tax agency.
+    const [agency] = await ctx.db
+      .select({ id: taxAgencies.id })
+      .from(taxAgencies)
+      .where(and(eq(taxAgencies.id, input.agencyId), eq(taxAgencies.companyId, ctx.companyId)));
+    if (!agency) throw notFound('Tax agency');
+  }
   const [row] = await ctx.db
     .insert(taxRates)
     .values({

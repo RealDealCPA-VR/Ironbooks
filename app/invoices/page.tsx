@@ -54,7 +54,7 @@ import { useDocNumber } from '@/components/sales/DocNumberField';
 // wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmClassAssigned, confirmStockAvailable, confirmTransactionDate } from '@/lib/formPrefs';
-import { dueDateForTerms } from '@/lib/preferences';
+import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 
@@ -122,6 +122,8 @@ interface Invoice {
   customerId: string;
   date: string;
   dueDate: string | null;
+  /** Payment terms (Terms list code/name) the due date was worked out from. */
+  terms?: string | null;
   total: string;
   balanceDue: string;
   status: InvoiceStatus;
@@ -383,6 +385,9 @@ function InvoiceModal({
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [dueDate, setDueDate] = useState('');
+  const [terms, setTerms] = useState('');
+  // Terms list entries (custom and date-driven terms included).
+  const termsChoices = useTermsChoices();
   const [taxRateId, setTaxRateId] = useState('');
   const [classId, setClassId] = useState('');
   const [discount, setDiscount] = useState('');
@@ -432,6 +437,7 @@ function InvoiceModal({
       setCustomerId(editing.customerId);
       setDate(editing.date ? editing.date.slice(0, 10) : new Date().toISOString().slice(0, 10));
       setDueDate(editing.dueDate ? editing.dueDate.slice(0, 10) : '');
+      setTerms(editing.terms ?? '');
       setTaxRateId(editing.taxRateId ?? '');
       setClassId(editing.classId ?? '');
       // The stored discount is the resolved dollar amount — prefill as a flat amount.
@@ -470,6 +476,7 @@ function InvoiceModal({
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setDueDate('');
+      setTerms('');
       setTaxRateId('');
       setClassId('');
       setDiscount('');
@@ -496,10 +503,27 @@ function InvoiceModal({
   useEffect(() => {
     if (!open || editing || !customerId || !date) return;
     const cust = customers.find((c) => c.id === customerId);
-    const due = dueDateForTerms(date, cust?.terms || prefs.company.defaultCustomerTerms);
-    if (due) setDueDate(due);
+    const custTerms = cust?.terms || prefs.company.defaultCustomerTerms;
+    setTerms(custTerms ?? '');
+    // Terms list entries (Standard or Date-Driven) via /api/terms/compute.
+    let live = true;
+    void fetchDueDateForTerms(date, custTerms).then((due) => {
+      if (live && due) setDueDate(due);
+    });
+    return () => {
+      live = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing, customerId]);
+
+  /** Terms picked on the form: the due date follows them. */
+  function handleTermsChange(value: string) {
+    setTerms(value);
+    if (!value || !date) return;
+    void fetchDueDateForTerms(date, value).then((due) => {
+      if (due) setDueDate(due);
+    });
+  }
 
   // When a customer is selected: load their price level + unbilled billables.
   useEffect(() => {
@@ -761,6 +785,7 @@ function InvoiceModal({
       customerId,
       date,
       dueDate: dueDate || undefined,
+      terms: terms || undefined,
       taxRateId: taxRateId || undefined,
       classId: classId || undefined,
       discount: discount || undefined,
@@ -984,6 +1009,21 @@ function InvoiceModal({
               value={dueDate}
               onChange={(e) => setDueDate(e.target.value)}
             />
+          </div>
+        </div>
+
+        {/* Terms (Terms list: Standard or Date-Driven) — picking one fills the due date */}
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <Label htmlFor="inv-terms">Terms</Label>
+            <Select id="inv-terms" value={terms} onChange={(e) => handleTermsChange(e.target.value)}>
+              <option value="">—</option>
+              {withCurrentTerms(termsChoices, terms).map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
+            </Select>
           </div>
         </div>
 

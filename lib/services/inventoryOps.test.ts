@@ -3,7 +3,7 @@
  *
  * Scenario:
  *   - Seed: inventory item qty=10, avgCost=5, reorderPoint=8
- *   - physicalCount to 7 → shrinkage delta=-3, GL Dr Shrinkage $15, Cr Inventory $15
+ *   - physicalCount to 7 → shrinkage delta=-3, GL Dr Inventory Adjustments $15, Cr Inventory $15
  *   - trial balance balanced after adjustment
  *   - reorderReport now includes the item (qty=7 <= reorderPoint=8)
  *   - lowStockCount returns 1
@@ -128,21 +128,21 @@ describe('inventoryOps service (end-to-end)', () => {
     // Journal entry was created
     expect(result.journalEntryId).not.toBeNull();
 
-    // adjustmentAccountId should be the auto-created 5900
+    // adjustmentAccountId should be the auto-created "Inventory Adjustments" (never 5900 / 3000)
     expect(result.adjustmentAccountId).not.toBeNull();
 
     // Updated qty in DB
     const [row] = await db.select().from(items).where(eq(items.id, itemId));
     expect(row.quantityOnHand).toBe('7.0000');
 
-    // Shrinkage account (5900) should now have debit balance = 15
+    // Inventory Adjustments should now have debit balance = 15
     const [shrinkAcct] = await db
       .select()
       .from(accounts)
       .where(
         eq(accounts.id, result.adjustmentAccountId!),
       );
-    expect(shrinkAcct.code).toBe('5900');
+    expect(shrinkAcct.name).toBe('Inventory Adjustments');
     // Expense account: balance increases on debit
     expect(shrinkAcct.balance).toBe('15.00');
 
@@ -165,8 +165,8 @@ describe('inventoryOps service (end-to-end)', () => {
     expect(row.quantityOnHand).toBe('7.0000');
     expect(row.reorderPoint).toBe('8.0000');
 
-    // suggestedReorderQty = max(reorderPoint*2 - qty, 1) = 16 - 7 = 9
-    expect(parseFloat(row.suggestedReorderQty)).toBeCloseTo(9, 2);
+    // No max level: reorder up to the reorder point = 8 - 7 = 1
+    expect(parseFloat(row.suggestedReorderQty)).toBeCloseTo(1, 2);
   });
 
   it('lowStockCount returns 1 after adjustment', async () => {
@@ -192,7 +192,7 @@ describe('inventoryOps service (end-to-end)', () => {
     expect(tb.balanced).toBe(true);
   });
 
-  it('physicalCount overage (count > current) — Dr Inventory, Cr Shrinkage', async () => {
+  it('physicalCount overage (count > current) — Dr Inventory, Cr Inventory Adjustments', async () => {
     // Count to 9 (overage of 2 at $5 = $10)
     const result = await physicalCount(ctx, {
       itemId,

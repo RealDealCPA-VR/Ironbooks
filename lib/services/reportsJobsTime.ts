@@ -92,7 +92,7 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .select({ id: invoices.id, num: invoices.invoiceNumber, ref: invoices.refNumber, date: invoices.date, customerId: invoices.customerId, headJob: invoices.jobId, jobId: invoiceLines.jobId, item: items.name, memo: invoiceLines.description, qty: invoiceLines.quantity, amount: invoiceLines.amount })
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
-    .leftJoin(items, eq(invoiceLines.itemId, items.id))
+    .leftJoin(items, and(eq(invoiceLines.itemId, items.id), eq(items.companyId, c)))
     .where(and(eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), ...dateConds(invoices.date)))) {
     const k = keyOf(r.jobId ?? r.headJob, r.customerId);
     if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Invoice', num: docRef(r.ref, r.num), sourceRef: `invoice:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
@@ -101,7 +101,7 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .select({ id: salesReceipts.id, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber, date: salesReceipts.date, customerId: salesReceipts.customerId, jobId: salesReceiptLines.jobId, item: items.name, memo: salesReceiptLines.description, qty: salesReceiptLines.quantity, amount: salesReceiptLines.amount })
     .from(salesReceiptLines)
     .innerJoin(salesReceipts, eq(salesReceiptLines.salesReceiptId, salesReceipts.id))
-    .leftJoin(items, eq(salesReceiptLines.itemId, items.id))
+    .leftJoin(items, and(eq(salesReceiptLines.itemId, items.id), eq(items.companyId, c)))
     .where(and(eq(salesReceipts.companyId, c), ne(salesReceipts.status, 'void'), ...dateConds(salesReceipts.date)))) {
     const k = keyOf(r.jobId, r.customerId);
     if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Sales Receipt', num: docRef(r.ref, r.num), sourceRef: `salesreceipt:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
@@ -110,7 +110,7 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .select({ id: creditMemos.id, num: creditMemos.memoNumber, ref: creditMemos.refNumber, date: creditMemos.date, customerId: creditMemos.customerId, item: items.name, memo: creditMemoLines.description, qty: creditMemoLines.quantity, amount: creditMemoLines.amount })
     .from(creditMemoLines)
     .innerJoin(creditMemos, eq(creditMemoLines.creditMemoId, creditMemos.id))
-    .leftJoin(items, eq(creditMemoLines.itemId, items.id))
+    .leftJoin(items, and(eq(creditMemoLines.itemId, items.id), eq(items.companyId, c)))
     .where(and(eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), ...dateConds(creditMemos.date)))) {
     out.push({ kind: 'revenue', jobKey: `cust:${r.customerId}`, date: r.date, type: 'Credit Memo', num: docRef(r.ref, r.num), sourceRef: `credit_memo:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty).negated(), amount: Money.of(r.amount).negated() });
   }
@@ -118,8 +118,8 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, item: items.name, account: accounts.name, memo: billLines.description, qty: billLines.quantity, amount: billLines.amount })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
-    .leftJoin(items, eq(billLines.itemId, items.id))
-    .leftJoin(accounts, eq(billLines.accountId, accounts.id))
+    .leftJoin(items, and(eq(billLines.itemId, items.id), eq(items.companyId, c)))
+    .leftJoin(accounts, and(eq(billLines.accountId, accounts.id), eq(accounts.companyId, c)))
     .where(and(eq(bills.companyId, c), ne(bills.status, 'void'), or(isNotNull(billLines.jobId), isNotNull(billLines.customerId)), ...dateConds(bills.date)))) {
     const k = keyOf(r.jobId, r.customerId);
     if (k) out.push({ kind: 'cost', jobKey: k, date: r.date, type: 'Bill', num: r.num ?? '', sourceRef: `bill:${r.id}`, itemOrAccount: r.item ?? r.account ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
@@ -128,7 +128,7 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .select({ id: expenses.id, num: expenses.reference, date: expenses.date, customerId: expenseLines.customerId, jobId: expenseLines.jobId, account: accounts.name, memo: expenseLines.description, amount: expenseLines.amount })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
-    .leftJoin(accounts, eq(expenseLines.accountId, accounts.id))
+    .leftJoin(accounts, and(eq(expenseLines.accountId, accounts.id), eq(accounts.companyId, c)))
     .where(and(eq(expenses.companyId, c), isNull(expenses.voidedAt), or(isNotNull(expenseLines.jobId), isNotNull(expenseLines.customerId)), ...dateConds(expenses.date)))) {
     const k = keyOf(r.jobId, r.customerId);
     if (k) out.push({ kind: 'cost', jobKey: k, date: r.date, type: 'Check', num: r.num ?? '', sourceRef: `expense:${r.id}`, itemOrAccount: r.account ?? '', memo: r.memo ?? '', qty: Money.of(1), amount: Money.of(r.amount) });
@@ -244,7 +244,7 @@ async function estimateFacts(ctx: ServiceContext, range: { from?: Date; to?: Dat
     .select({ customerId: estimates.customerId, itemId: estimateLines.itemId, item: items.name, qty: estimateLines.quantity, amount: estimateLines.amount })
     .from(estimateLines)
     .innerJoin(estimates, eq(estimateLines.estimateId, estimates.id))
-    .leftJoin(items, eq(estimateLines.itemId, items.id))
+    .leftJoin(items, and(eq(estimateLines.itemId, items.id), eq(items.companyId, ctx.companyId)))
     .where(and(...conds));
 }
 
@@ -462,8 +462,8 @@ export async function timeReport(ctx: ServiceContext, p: ReportParams, by: 'job'
       item: items.name,
     })
     .from(timeEntries)
-    .leftJoin(employees, eq(timeEntries.employeeId, employees.id))
-    .leftJoin(items, eq(timeEntries.serviceItemId, items.id))
+    .leftJoin(employees, and(eq(timeEntries.employeeId, employees.id), eq(employees.companyId, ctx.companyId)))
+    .leftJoin(items, and(eq(timeEntries.serviceItemId, items.id), eq(items.companyId, ctx.companyId)))
     .where(and(...conds));
   const { label } = await jobLabels(ctx);
   const jobOf = (r: (typeof rowsDb)[number]) => {
@@ -551,7 +551,7 @@ export async function mileageReport(ctx: ServiceContext, p: ReportParams, by: 'j
     await ctx.db
       .select({ log: mileageLogs, vehicleName: vehicles.name })
       .from(mileageLogs)
-      .leftJoin(vehicles, eq(vehicles.id, mileageLogs.vehicleId))
+      .leftJoin(vehicles, and(eq(vehicles.id, mileageLogs.vehicleId), eq(vehicles.companyId, ctx.companyId)))
       .where(and(...conds))
   )
     .map((r) => ({ ...r.log, vehicle: r.vehicleName ?? r.log.vehicle }))

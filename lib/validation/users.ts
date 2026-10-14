@@ -2,6 +2,7 @@
  * Users & Roles request schemas (team users). Routes: app/api/users/**, app/api/roles/**.
  */
 import { z } from 'zod';
+import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 import { ACTIONS, AREA_KEYS, FLAGS } from '@/lib/permissions/model';
 
 const login = z
@@ -13,7 +14,7 @@ const login = z
 
 export const passwordSchema = z
   .string()
-  .min(8, 'must be at least 8 characters')
+  .min(MIN_PASSWORD_LENGTH, `must be at least ${MIN_PASSWORD_LENGTH} characters`)
   .max(200);
 
 const roleKeys = z.array(z.string().min(1).max(64)).min(1, 'assign at least one role').max(30);

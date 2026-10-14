@@ -9,8 +9,8 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import type { DB } from '@/lib/db';
-import { users } from '@/lib/db/schema';
-import { getSessionGate } from '@/lib/context';
+import { companies, users } from '@/lib/db/schema';
+import { getServerContext, getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import {
   listCompanies,
@@ -72,6 +72,22 @@ export async function POST(req: NextRequest) {
     const name = typeof body?.name === 'string' ? body.name.trim() : '';
     if (!name) {
       return NextResponse.json({ error: 'Company name is required', code: 'VALIDATION' }, { status: 400 });
+    }
+    if (sessionUserId) {
+      // Creating a company makes the caller its owner/Admin, and file-wide operations
+      // (backup/restore, condense archives) require Admin of every company in the file — so only
+      // an Admin of the caller's CURRENT company may add one. An empty file (no companies yet)
+      // stays open so a signed-in owner can create the first company.
+      const [anyCompany] = await db.select({ id: companies.id }).from(companies).limit(1);
+      if (anyCompany) {
+        const ctx = await getServerContext();
+        if (ctx.userId !== sessionUserId || !ctx.access?.isAdmin) {
+          throw new ServiceError(
+            'FORBIDDEN',
+            'Only an Admin can create a new company. Ask your administrator.',
+          );
+        }
+      }
     }
     // Owner = the authenticated user; first-run only, fall back to the seeded dev user.
     const ownerId = sessionUserId ?? (await ensureDevCompany(db)).userId;

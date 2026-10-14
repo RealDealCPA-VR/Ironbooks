@@ -12,8 +12,8 @@
  *  - ServiceError codes: NOT_FOUND, VALIDATION, CONFLICT.
  */
 import { and, asc, eq, ne, sql } from 'drizzle-orm';
-import { vendors } from '@/lib/db/schema';
-import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { accounts, vendors } from '@/lib/db/schema';
+import { type ServiceContext, assertRefInCompany, notFound, validation, writeAudit } from './_base';
 import { getPreferences } from './preferences';
 import { maskForContext } from './access';
 import { resolvePartyTerms } from './lists/fields';
@@ -133,6 +133,9 @@ export async function createVendor(ctx: ServiceContext, input: CreateVendorInput
     throw validation('Enter the full tax ID; a masked value cannot be saved.');
   }
   await assertUniqueDisplayName(ctx, input.displayName);
+  if (input.defaultExpenseAccountId) {
+    await assertRefInCompany(ctx, accounts, input.defaultExpenseAccountId, 'Default expense account');
+  }
   const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
   const purchaseFields = await resolveVendorPurchaseFields(ctx, input);
 
@@ -188,6 +191,9 @@ export async function updateVendor(
 
   if (patch.displayName !== undefined) {
     await assertUniqueDisplayName(ctx, newDisplayName, id);
+  }
+  if (patch.defaultExpenseAccountId) {
+    await assertRefInCompany(ctx, accounts, patch.defaultExpenseAccountId, 'Default expense account');
   }
   const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
   const purchaseFields = await resolveVendorPurchaseFields(ctx, patch, before);

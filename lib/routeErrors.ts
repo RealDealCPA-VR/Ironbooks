@@ -5,6 +5,24 @@
 import { NextResponse } from 'next/server';
 import { ServiceError } from '@/lib/services/_base';
 
+/** 400 response for a request body that is not valid JSON (or not a JSON object). */
+export function invalidJsonBody(): NextResponse {
+  return NextResponse.json({ error: 'Invalid JSON body', code: 'VALIDATION' }, { status: 400 });
+}
+
+/**
+ * Parse a JSON object request body; returns null when the body is malformed or not an object,
+ * so handlers can answer 400 (see invalidJsonBody) instead of throwing a SyntaxError -> 500.
+ */
+export async function readJsonObject(req: Request): Promise<Record<string, unknown> | null> {
+  try {
+    const body: unknown = await req.json();
+    return body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 const STATUS: Record<string, number> = {
   NOT_FOUND: 404,
   VALIDATION: 400,
@@ -20,6 +38,10 @@ export function routeError(err: unknown, tag: string): NextResponse {
       { error: err.message, code: err.code, details: err.details },
       { status: STATUS[err.code] ?? 500 },
     );
+  }
+  // A malformed request body (`await req.json()` on invalid JSON) is the caller's fault, not ours.
+  if (err instanceof SyntaxError) {
+    return invalidJsonBody();
   }
   console.error(`[${tag}]`, err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

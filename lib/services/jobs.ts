@@ -27,7 +27,14 @@ import {
   customers,
 } from '@/lib/db/schema';
 import { toAmountString, Money } from '@/lib/money';
-import { type ServiceContext, notFound, validation, writeAudit, inTransaction } from './_base';
+import {
+  type ServiceContext,
+  assertRefInCompany,
+  notFound,
+  validation,
+  writeAudit,
+  inTransaction,
+} from './_base';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -119,6 +126,7 @@ export async function getJob(ctx: ServiceContext, id: string) {
 
 export async function createJob(ctx: ServiceContext, input: CreateJobInput) {
   validateCreateInput(input);
+  if (input.customerId) await assertRefInCompany(ctx, customers, input.customerId, 'Customer');
   return inTransaction(ctx, async (tx) => {
     const [job] = await tx.db
       .insert(jobs)
@@ -156,6 +164,7 @@ export async function updateJob(ctx: ServiceContext, id: string, input: UpdateJo
     endDate: input.endDate !== undefined ? input.endDate : existing.endDate,
   };
   validateCreateInput(merged);
+  if (input.customerId) await assertRefInCompany(ctx, customers, input.customerId, 'Customer');
 
   return inTransaction(ctx, async (tx) => {
     const patch: Record<string, unknown> = {};
@@ -327,7 +336,10 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
       createdAt: jobs.createdAt,
     })
     .from(jobs)
-    .leftJoin(customers, eq(jobs.customerId, customers.id))
+    .leftJoin(
+      customers,
+      and(eq(jobs.customerId, customers.id), eq(customers.companyId, ctx.companyId)),
+    )
     .where(and(eq(jobs.companyId, ctx.companyId), eq(jobs.isActive, true)))
     .orderBy(asc(jobs.name));
 

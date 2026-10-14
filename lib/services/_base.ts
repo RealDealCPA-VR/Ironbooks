@@ -9,6 +9,8 @@
  *  - Multi-tenant safety: every query is scoped by `ctx.companyId`. Never trust a client-supplied id
  *    without checking it belongs to the company.
  */
+import { and, eq } from 'drizzle-orm';
+import type { PgColumn, PgTable } from 'drizzle-orm/pg-core';
 import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
 import { ServiceError } from './errors';
@@ -51,6 +53,30 @@ export { ServiceError, type ServiceErrorCode } from './errors';
 export const notFound = (what: string) => new ServiceError('NOT_FOUND', `${what} not found`);
 export const validation = (msg: string, details?: unknown) =>
   new ServiceError('VALIDATION', msg, details);
+
+const REF_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Multi-company scoping guard for foreign ids taken from a payload (customerId, employeeId, ...):
+ * the referenced row must exist in ctx.companyId, otherwise VALIDATION. Without it a caller could
+ * attach another company's record (and later see its name through a join). A malformed id is
+ * refused the same way instead of surfacing Postgres' 22P02 as a 500.
+ */
+export async function assertRefInCompany(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  table: PgTable & { id: PgColumn; companyId: PgColumn },
+  id: string,
+  label: string,
+): Promise<void> {
+  const missing = () => validation(`${label} does not exist in this company.`);
+  if (typeof id !== 'string' || !REF_UUID_RE.test(id)) throw missing();
+  const [row] = await ctx.db
+    .select({ id: table.id })
+    .from(table as PgTable)
+    .where(and(eq(table.id, id), eq(table.companyId, ctx.companyId)))
+    .limit(1);
+  if (!row) throw missing();
+}
 
 export type AuditAction = 'create' | 'update' | 'delete' | 'void' | 'llm_correction';
 

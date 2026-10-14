@@ -97,6 +97,22 @@ export async function endSession(db: DB, sessionId: string, reason = 'logout'): 
 }
 
 /**
+ * End every live session of one user (e.g. after a self-service password reset, so whoever
+ * held the old password is signed out everywhere). Returns how many sessions were ended.
+ */
+export async function endUserSessions(db: DB, userId: string, reason = 'password_reset'): Promise<number> {
+  if (!isUuid(userId)) return 0;
+  const ended = await db
+    .update(userSessions)
+    .set({ endedAt: new Date(), endReason: reason })
+    .where(and(eq(userSessions.userId, userId), isNull(userSessions.endedAt)))
+    .returning({ id: userSessions.id });
+  const ids = ended.map((r) => r.id);
+  if (ids.length) await db.delete(singleUserMode).where(inArray(singleUserMode.sessionId, ids));
+  return ids.length;
+}
+
+/**
  * Validate a session id taken from a verified cookie and refresh its lastSeenAt (throttled).
  * Returns false when the session doesn't exist, belongs to someone else, or has been ended
  * (logout / signed out by an admin) — the caller then treats the request as signed out.

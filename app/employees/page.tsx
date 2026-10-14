@@ -25,6 +25,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import { EditPaycheckModal } from './EditPaycheckModal';
@@ -1343,8 +1344,8 @@ export default function EmployeesPage() {
 
   async function handleSetPortalPassword() {
     if (!portalTarget) return;
-    if (portalPassword.length < 6) {
-      toast('Password must be at least 6 characters', 'danger');
+    if (portalPassword.length < MIN_PASSWORD_LENGTH) {
+      toast(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`, 'danger');
       return;
     }
     setPortalSaving(true);
@@ -2603,7 +2604,7 @@ export default function EmployeesPage() {
             </Button>
             <Button
               onClick={handleSetPortalPassword}
-              disabled={portalPassword.length < 6}
+              disabled={portalPassword.length < MIN_PASSWORD_LENGTH}
               loading={portalSaving}
             >
               Set Password
@@ -2621,14 +2622,14 @@ export default function EmployeesPage() {
             id="portalPassword"
             type="password"
             autoFocus
-            minLength={6}
-            placeholder="Minimum 6 characters"
+            minLength={MIN_PASSWORD_LENGTH}
+            placeholder={`Minimum ${MIN_PASSWORD_LENGTH} characters`}
             value={portalPassword}
             onChange={(e) => setPortalPassword(e.target.value)}
             autoComplete="new-password"
           />
-          {portalPassword.length > 0 && portalPassword.length < 6 && (
-            <p className="text-xs text-red-500 mt-1">Password must be at least 6 characters.</p>
+          {portalPassword.length > 0 && portalPassword.length < MIN_PASSWORD_LENGTH && (
+            <p className="text-xs text-red-500 mt-1">Password must be at least {MIN_PASSWORD_LENGTH} characters.</p>
           )}
         </div>
       </Modal>

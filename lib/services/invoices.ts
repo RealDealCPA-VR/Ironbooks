@@ -70,6 +70,7 @@ import {
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
+import { dueDateFromTermsList } from './lists/terms';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import {
   assertEstimatesNotRejected,
@@ -129,6 +130,12 @@ export interface CreateInvoiceInput {
   customerId: string;
   date: Date;
   dueDate?: Date | null;
+  /**
+   * Payment terms (a Terms list name/code such as "Net 45", or legacy text like 'net_30').
+   * A blank due date is worked out from them (standard or date-driven). Omitted on an edit =
+   * keep the stored terms.
+   */
+  terms?: string | null;
   lines: InvoiceLineInput[];
   /** UUID of a taxRates row; if absent no tax is charged. */
   taxRateId?: string | null;
@@ -1383,7 +1390,20 @@ export async function auditCreditLimitOverride(
   });
 }
 
+/** B5: a blank due date follows the document's terms (Terms list first, then the legacy parser). */
+async function applyTermsDueDate(ctx: ServiceContext, input: CreateInvoiceInput): Promise<CreateInvoiceInput> {
+  if (input.dueDate || !input.terms?.trim()) return input;
+  const dueDate = await dueDateFromTermsList(ctx, input.terms, input.date);
+  return dueDate ? { ...input, dueDate } : input;
+}
+
+/** Stored `terms` varchar for an input's terms (blank → null). */
+function termsColumn(terms: string | null | undefined): string | null {
+  return terms?.trim() ? terms.trim().slice(0, 50) : null;
+}
+
 export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
+  input = await applyTermsDueDate(ctx, input);
   await assertSalesTaxAllowed(ctx, input);
   // Customer's tax item when the form left it out; non-taxable customer → untaxed lines.
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
@@ -1422,6 +1442,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         refNumber,
         date: input.date,
         dueDate: input.dueDate ?? null,
+        terms: termsColumn(input.terms),
         status: isDraft ? 'draft' : postedStatus(prep),
         taxRateId: input.taxRateId ?? null,
         classId: prep.headerClassId,
@@ -1740,6 +1761,7 @@ function keepEstimateLinks(
 
 export async function updateInvoice(ctx: ServiceContext, id: string, input: CreateInvoiceInput) {
   input = await applyCustomerTaxDefaults(ctx, input);
+  input = await applyTermsDueDate(ctx, input);
   // Pre-check outside the transaction for a fast, friendly error.
   const [existing] = await ctx.db
     .select()
@@ -1822,6 +1844,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           customerId: input.customerId,
           date: input.date,
           dueDate: input.dueDate ?? null,
+          ...(input.terms !== undefined ? { terms: termsColumn(input.terms) } : {}),
           status: 'draft',
           ...(renum ? { refNumber: renum.refNumber, invoiceNumber: renum.number } : {}),
           taxRateId: input.taxRateId ?? null,
@@ -1944,6 +1967,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         customerId: input.customerId,
         date: input.date,
         dueDate: input.dueDate ?? null,
+        ...(input.terms !== undefined ? { terms: termsColumn(input.terms) } : {}),
         ...(renum ? { refNumber: renum.refNumber, invoiceNumber: renum.number } : {}),
         status:
           balanceNow.lessThanOrEqualTo(0) && paidNow.greaterThan(0)

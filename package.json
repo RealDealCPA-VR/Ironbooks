@@ -30,18 +30,18 @@
     "@anthropic-ai/sdk": "^0.101.0",
     "@electric-sql/pglite": "^0.5.1",
     "@neondatabase/serverless": "^0.10.4",
-    "adm-zip": "^0.5.17",
+    "adm-zip": "^0.6.1",
     "bcryptjs": "^3.0.3",
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
     "decimal.js": "^10.6.0",
     "drizzle-orm": "^0.36.4",
     "electron-updater": "^6.8.9",
-    "fast-xml-parser": "^4.5.0",
+    "fast-xml-parser": "^4.5.7",
     "lucide-react": "^0.468.0",
-    "next": "^15.1.3",
-    "next-auth": "^5.0.0-beta.25",
-    "nodemailer": "^8.0.10",
+    "next": "^15.5.28",
+    "next-auth": "^5.0.0-beta.32",
+    "nodemailer": "^10.1.1",
     "papaparse": "^5.5.3",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.10.38",
@@ -56,7 +56,7 @@
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",
     "@types/node": "^22.10.2",
-    "@types/nodemailer": "^8.0.0",
+    "@types/nodemailer": "^8.0.2",
     "@types/papaparse": "^5.5.2",
     "@types/react": "^19.0.2",
     "@types/react-dom": "^19.0.2",
@@ -103,7 +103,8 @@
     ],
     "files": [
       "electron/**/*",
-      "drizzle/**/*"
+      "drizzle/**/*",
+      "!node_modules/{next,@next,@img,sharp,@swc,react,react-dom,scheduler,@electric-sql,pdfjs-dist,pdf-lib,@pdf-lib,@anthropic-ai,@neondatabase,drizzle-orm,next-auth,@auth,date-fns,lucide-react,zod,nodemailer,papaparse,fast-xml-parser,xml2js,decimal.js,qrcode.react,adm-zip,bcryptjs,tailwind-merge,tailwindcss-animate,clsx,typescript}/**"
     ],
     "extraResources": [
       {
@@ -167,6 +168,11 @@
       ],
       "category": "Office",
       "icon": "build/icon.png"
+    }
+  },
+  "overrides": {
+    "next-auth": {
+      "nodemailer": "$nodemailer"
     }
   }
 }

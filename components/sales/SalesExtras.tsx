@@ -9,7 +9,7 @@
  */
 import * as React from 'react';
 import { Mail, Printer, Truck } from 'lucide-react';
-import { Button, ConfirmDialog, Input, Label, Modal, toast, toastError } from '@/components/ui';
+import { Button, ConfirmDialog, Input, Label, Modal, Select, toast, toastError } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { shipToAddressFields, shipToSummary, type ShipToAddress } from '@/lib/shipTo';
 
@@ -374,7 +374,70 @@ export function useCreditLimitConfirm() {
   return { run, dialog };
 }
 
-/** Print (opens the PDF) + Email (asks for the address) buttons for a saved sales form. */
+interface FormTemplateOption {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  isActive: boolean;
+}
+
+/** Active form templates per form type, fetched once per page load (shared by every row's buttons). */
+const templateCache = new Map<SalesFormKind, Promise<FormTemplateOption[]>>();
+function loadFormTemplates(kind: SalesFormKind): Promise<FormTemplateOption[]> {
+  let p = templateCache.get(kind);
+  if (!p) {
+    p = api
+      .get<FormTemplateOption[]>(`/api/form-templates?formType=${kind}`)
+      .then((rows) => rows.filter((t) => t.isActive))
+      .catch(() => {
+        templateCache.delete(kind);
+        return [];
+      });
+    templateCache.set(kind, p);
+  }
+  return p;
+}
+
+function pdfUrl(kind: SalesFormKind, id: string, templateId: string) {
+  return `/api/sales-forms/${kind}/${id}/pdf${templateId ? `?templateId=${encodeURIComponent(templateId)}` : ''}`;
+}
+
+/** Template picker: '' = the form's default template (or the built-in layout when none is set). */
+function TemplateSelect({
+  id,
+  templates,
+  value,
+  onChange,
+}: {
+  id: string;
+  templates: FormTemplateOption[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const def = templates.find((t) => t.isDefault);
+  return (
+    <>
+      <Label htmlFor={id}>Form template</Label>
+      <Select
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value="">{def ? `Default (${def.name})` : 'Standard (built-in)'}</option>
+        {templates.map((t) => (
+          <option key={t.id} value={t.id}>
+            {t.name}
+          </option>
+        ))}
+      </Select>
+    </>
+  );
+}
+
+/**
+ * Print (opens the PDF) + Email (asks for the address) buttons for a saved sales form. Both use
+ * the form's default template; when the company has templates for this form, the user can pick one.
+ */
 export function FormSendButtons({
   kind,
   id,
@@ -391,10 +454,51 @@ export function FormSendButtons({
   const [open, setOpen] = React.useState(false);
   const [to, setTo] = React.useState(defaultEmail ?? '');
   const [sending, setSending] = React.useState(false);
+  const [templates, setTemplates] = React.useState<FormTemplateOption[]>([]);
+  const [templateId, setTemplateId] = React.useState('');
+  const [printOpen, setPrintOpen] = React.useState(false);
+  async function refreshTemplates() {
+    const rows = await loadFormTemplates(kind);
+    setTemplates(rows);
+    if (templateId && !rows.some((t) => t.id === templateId)) setTemplateId('');
+    return rows;
+  }
+  const [templatesLoaded, setTemplatesLoaded] = React.useState(false);
+  // Prefetch so Print can open the PDF inside the click (a popup opened after an await is blocked).
+  React.useEffect(() => {
+    let live = true;
+    void loadFormTemplates(kind).then((rows) => {
+      if (!live) return;
+      setTemplates(rows);
+      setTemplatesLoaded(true);
+    });
+    return () => {
+      live = false;
+    };
+  }, [kind]);
+  function print() {
+    // With no custom templates there is nothing to choose: print the built-in layout right away.
+    if (templatesLoaded && templates.length === 0) {
+      window.open(pdfUrl(kind, id, ''), '_blank', 'noopener');
+      return;
+    }
+    if (templatesLoaded) {
+      setPrintOpen(true);
+      return;
+    }
+    // Still loading: show the picker once the list arrives (it has a Print button of its own).
+    void refreshTemplates().then((rows) => {
+      if (rows.length === 0) window.open(pdfUrl(kind, id, ''), '_blank', 'noopener');
+      else setPrintOpen(true);
+    });
+  }
   async function send() {
     setSending(true);
     try {
-      const r = await api.post<{ to: string }>(`/api/sales-forms/${kind}/${id}/email`, to.trim() ? { to: to.trim() } : {});
+      const body: { to?: string; templateId?: string } = {};
+      if (to.trim()) body.to = to.trim();
+      if (templateId) body.templateId = templateId;
+      const r = await api.post<{ to: string }>(`/api/sales-forms/${kind}/${id}/email`, body);
       toast(`Emailed to ${r.to}.`, 'success');
       setOpen(false);
       onSent?.();
@@ -411,13 +515,43 @@ export function FormSendButtons({
         size={size}
         title="Print / save as PDF"
         aria-label="Print or save as PDF"
-        onClick={() => window.open(`/api/sales-forms/${kind}/${id}/pdf`, '_blank', 'noopener')}
+        onClick={print}
       >
         <Printer className="h-4 w-4" />
       </Button>
-      <Button variant="ghost" size={size} title="Email" aria-label="Email this form" onClick={() => { setTo(defaultEmail ?? ''); setOpen(true); }}>
+      <Button
+        variant="ghost"
+        size={size}
+        title="Email"
+        aria-label="Email this form"
+        onClick={() => {
+          setTo(defaultEmail ?? '');
+          setOpen(true);
+          void refreshTemplates();
+        }}
+      >
         <Mail className="h-4 w-4" />
       </Button>
+      <Modal
+        open={printOpen}
+        onClose={() => setPrintOpen(false)}
+        title="Print this form"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setPrintOpen(false)}>Cancel</Button>
+            <Button
+              onClick={() => {
+                window.open(pdfUrl(kind, id, templateId), '_blank', 'noopener');
+                setPrintOpen(false);
+              }}
+            >
+              Print
+            </Button>
+          </>
+        }
+      >
+        <TemplateSelect id={`print-tpl-${id}`} templates={templates} value={templateId} onChange={setTemplateId} />
+      </Modal>
       <Modal
         open={open}
         onClose={() => setOpen(false)}
@@ -437,6 +571,11 @@ export function FormSendButtons({
           value={to}
           onChange={(e) => setTo(e.target.value)}
         />
+        {templates.length > 0 && (
+          <div className="mt-3">
+            <TemplateSelect id={`email-tpl-${id}`} templates={templates} value={templateId} onChange={setTemplateId} />
+          </div>
+        )}
         <p className="mt-2 text-xs text-navy/50">The form is attached as a PDF.</p>
       </Modal>
     </>

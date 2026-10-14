@@ -31,7 +31,8 @@ import { and, asc, desc, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import { accounts, bills, billLines, inventoryLayers, items, loanPayments, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { discountFor, dueDateFromTerms } from './billTerms';
+import { type DiscountInfo, discountFor, dueDateFromTerms } from './billTerms';
+import { computeDiscount, computeDueDate, dueDateFromTermsList, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
 import { getPreferences } from './company';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
@@ -243,7 +244,8 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
 
   // --- Terms + due date (explicit due date wins) ---
   const terms = (input.terms ?? vendorRow.terms ?? null) || null;
-  const dueDate = input.dueDate ?? (terms ? dueDateFromTerms(input.date, terms) : null);
+  // B5: the Terms list (standard / date-driven) decides; legacy free text falls back to the parser.
+  const dueDate = input.dueDate ?? (await dueDateFromTermsList(ctx, terms, input.date));
 
   // --- Validate lines ---
   if (!input.lines || input.lines.length === 0) {
@@ -1027,6 +1029,20 @@ export interface BillToPay {
   overdue: boolean;
 }
 
+/** Pay Bills discount from a Terms list entry (same shape as billTerms.discountFor). */
+function listDiscount(row: TermsRow, bill: { date: Date; balanceDue: string | number }, asOf: Date): DiscountInfo {
+  const r = computeDiscount(row as TermsLike, bill.date, asOf, bill.balanceDue);
+  if (!r.discountDate) {
+    return { discountDate: null, discountPercent: 0, suggestedDiscount: '0.00', available: false };
+  }
+  return {
+    discountDate: r.discountDate,
+    discountPercent: Number(r.percent),
+    suggestedDiscount: r.amount ?? '0.00',
+    available: r.eligible,
+  };
+}
+
 /**
  * Open bills for Pay Bills (QB "Show bills: due on or before … / show all bills" plus the
  * "discount available" filter). The due date falls back to the terms when none was stored.
@@ -1059,13 +1075,21 @@ export async function listBillsToPay(
   const asOf = opts?.asOf ?? new Date();
   const todayKey = asOf.toISOString().slice(0, 10);
   const out: BillToPay[] = [];
+  // Terms list rows by reference (B5/C3), resolved once per distinct terms string.
+  const termsCache = new Map<string, TermsRow | null>();
+  const termsRow = async (ref: string | null) => {
+    if (!ref) return null;
+    if (!termsCache.has(ref)) termsCache.set(ref, await findTermsRef(ctx, ref));
+    return termsCache.get(ref) ?? null;
+  };
   for (const { bill, vendorName, vendorTerms } of rows) {
     const terms = bill.terms ?? vendorTerms ?? null;
-    const dueDate = bill.dueDate ?? (terms ? dueDateFromTerms(bill.date, terms) : null);
+    const row = await termsRow(terms);
+    const dueDate = bill.dueDate ?? (row ? computeDueDate(row as TermsLike, bill.date) : dueDateFromTerms(bill.date, terms));
     if (opts?.dueOnOrBefore && dueDate) {
       if (dueDate.toISOString().slice(0, 10) > opts.dueOnOrBefore.toISOString().slice(0, 10)) continue;
     }
-    const d = discountFor({ date: bill.date, terms, balanceDue: bill.balanceDue, total: bill.total }, asOf);
+    const d = row ? listDiscount(row, bill, asOf) : discountFor({ date: bill.date, terms, balanceDue: bill.balanceDue, total: bill.total }, asOf);
     if (opts?.discountAvailableOnly && !(d.available && Money.gt(d.suggestedDiscount, 0))) continue;
     out.push({
       id: bill.id,

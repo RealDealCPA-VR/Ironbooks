@@ -14,9 +14,9 @@
  *  - Deactivation is soft-delete (isActive = false); hard delete is not exposed.
  */
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
-import { customers, invoices } from '@/lib/db/schema';
+import { customers, invoices, taxRates } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, assertRefInCompany, notFound, validation, writeAudit } from './_base';
 import { unappliedPaymentsByCustomer } from './customerCredits';
 import { journalBalancesByEntity } from './journal';
 import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
@@ -189,6 +189,8 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
     if (!parent) throw notFound('Parent customer');
   }
 
+  if (input.taxRateId) await assertRefInCompany(ctx, taxRates, input.taxRateId, 'Sales tax rate');
+
   const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
   const taxCode = input.salesTaxCodeId ? await resolveSalesTaxCode(ctx, input.salesTaxCodeId) : null;
   // Named ship-to addresses; a lone shipping address becomes "Ship To 1".
@@ -287,6 +289,8 @@ export async function updateCustomer(
       );
     if (!parent) throw notFound('Parent customer');
   }
+
+  if (patch.taxRateId) await assertRefInCompany(ctx, taxRates, patch.taxRateId, 'Sales tax rate');
 
   const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
   let shipTos = patch.shipToAddresses !== undefined ? resolveShipTos(patch.shipToAddresses) : undefined;

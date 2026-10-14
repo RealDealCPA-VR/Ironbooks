@@ -3,6 +3,8 @@
  *
  *  - `renderSalesFormPdf(kind, id)` renders any A/R form — invoice, estimate, sales receipt,
  *    credit memo/refund, sales order — or a customer statement, with shipping details (B6).
+ *    Every form prints with its form template (B11): the explicit `templateId` when given, else
+ *    the form's default template, else the built-in layout (resolveFormTemplate).
  *  - `emailSalesForm` sends it as a PDF attachment through `sendMail` (lib/services/email.ts),
  *    which enforces SMTP configuration and the company network policy (lib/net/guard.ts). A
  *    successful send clears the form's "to be emailed" flag and stamps `lastEmailedAt`.
@@ -35,8 +37,9 @@ import { renderEstimatePdf } from '@/lib/pdf/estimate';
 import { renderSalesReceiptPdf } from '@/lib/pdf/salesReceipt';
 import { renderCreditMemoPdf } from '@/lib/pdf/creditMemo';
 import { renderSalesOrderPdf } from '@/lib/pdf/salesOrder';
-import { renderStatementPdf } from '@/lib/pdf/statement';
 import type { SalesShippingInfo } from '@/lib/pdf/salesForm';
+import { addressToLines, buildStatementPdf, companyLetterhead } from '@/lib/pdf/forms';
+import { resolveFormTemplate } from './formTemplates';
 
 export const SALES_FORM_KINDS = ['invoice', 'estimate', 'sales_receipt', 'credit_memo', 'sales_order'] as const;
 export type SalesFormKind = (typeof SALES_FORM_KINDS)[number];
@@ -82,12 +85,12 @@ function shippingOf(doc: {
 }
 
 async function customerInfo(ctx: ServiceContext, customerId: string | null) {
-  if (!customerId) return { name: 'Walk-in customer', email: null as string | null };
+  if (!customerId) return { name: 'Walk-in customer', email: null as string | null, billToLines: [] as string[] };
   const [row] = await ctx.db
-    .select({ displayName: customers.displayName, email: customers.email })
+    .select({ displayName: customers.displayName, email: customers.email, billingAddress: customers.billingAddress })
     .from(customers)
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
-  return { name: row?.displayName ?? 'Customer', email: row?.email ?? null };
+  return { name: row?.displayName ?? 'Customer', email: row?.email ?? null, billToLines: addressToLines(row?.billingAddress) };
 }
 
 export interface RenderedForm {
@@ -105,10 +108,26 @@ export interface RenderedForm {
 /** A document number made safe for a download filename (alphanumeric numbers may contain / etc.). */
 const fileSafe = (ref: string) => ref.replace(/[^A-Za-z0-9._-]+/g, '-');
 
-/** Render one sales form as a PDF (scoped to the company; NOT_FOUND otherwise). */
-export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, id: string): Promise<RenderedForm> {
-  const company = await getCompany(ctx);
-  const companyName = company?.name ?? 'Your Company';
+/**
+ * Render one sales form as a PDF (scoped to the company; NOT_FOUND otherwise), with its form
+ * template (B11): `templateId` when given (must be this company's template for the same form —
+ * NOT_FOUND / VALIDATION otherwise), else the form's default template, else the built-in layout.
+ */
+export async function renderSalesForm(
+  ctx: ServiceContext,
+  kind: SalesFormKind,
+  id: string,
+  templateId?: string | null,
+): Promise<RenderedForm> {
+  const [letterhead, resolved] = await Promise.all([
+    companyLetterhead(ctx),
+    resolveFormTemplate(ctx, kind, templateId),
+  ]);
+  // Invoices and estimates always print through the template renderer (the built-in layout is
+  // its default design). Sales receipts, credit memos and sales orders keep their built-in
+  // layout unless a template (explicit or default) exists.
+  const template = { design: resolved.design, logo: resolved.logo };
+  const customTemplate = resolved.templateId ? template : null;
   const lineOf = (l: { description: string | null; quantity: string; rate: string; amount: string }) => ({
     description: l.description ?? '',
     quantity: l.quantity,
@@ -121,7 +140,8 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
       const inv = await getInvoice(ctx, id);
       const cust = await customerInfo(ctx, inv.customerId);
       const bytes = await renderInvoicePdf({
-        company: { name: companyName },
+        company: letterhead,
+        billToLines: cust.billToLines,
         customerName: cust.name,
         invoice: {
           number: docRef(inv.refNumber, inv.invoiceNumber),
@@ -138,7 +158,7 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
           description: l.unitOfMeasure ? `${l.description ?? ''} (${l.unitOfMeasure})`.trim() : (l.description ?? ''),
         })),
         shipping: shippingOf(inv),
-      });
+      }, template);
       const title = `${inv.isStatementCharge ? 'Statement Charge' : 'Invoice'} #${docRef(inv.refNumber, inv.invoiceNumber)}`;
       return {
         bytes,
@@ -154,7 +174,8 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
       const est = await getEstimate(ctx, id);
       const cust = await customerInfo(ctx, est.customerId);
       const bytes = await renderEstimatePdf({
-        company: { name: companyName },
+        company: letterhead,
+        billToLines: cust.billToLines,
         customerName: cust.name,
         estimate: {
           number: docRef(est.refNumber, est.estimateNumber),
@@ -167,7 +188,7 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
         },
         shipTo: est.shipTo ?? null,
         lines: est.lines.map(lineOf),
-      });
+      }, template);
       return {
         bytes,
         filename: `estimate-${fileSafe(docRef(est.refNumber, est.estimateNumber))}.pdf`,
@@ -182,7 +203,8 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
       const r = await getSalesReceipt(ctx, id);
       const cust = await customerInfo(ctx, r.customerId);
       const bytes = await renderSalesReceiptPdf({
-        company: { name: companyName },
+        company: letterhead,
+        billToLines: cust.billToLines,
         customerName: cust.name,
         receipt: {
           number: docRef(r.refNumber, r.receiptNumber),
@@ -196,7 +218,7 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
         },
         lines: r.lines.map(lineOf),
         shipping: shippingOf(r),
-      });
+      }, customTemplate);
       return {
         bytes,
         filename: `sales-receipt-${fileSafe(docRef(r.refNumber, r.receiptNumber))}.pdf`,
@@ -211,7 +233,8 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
       const m = await getCreditMemo(ctx, id);
       const cust = await customerInfo(ctx, m.customerId);
       const bytes = await renderCreditMemoPdf({
-        company: { name: companyName },
+        company: letterhead,
+        billToLines: cust.billToLines,
         customerName: cust.name,
         memo: {
           number: docRef(m.refNumber, m.memoNumber),
@@ -224,7 +247,7 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
           memo: m.memo,
         },
         lines: m.lines.map(lineOf),
-      });
+      }, customTemplate);
       return {
         bytes,
         filename: `credit-memo-${fileSafe(docRef(m.refNumber, m.memoNumber))}.pdf`,
@@ -239,7 +262,8 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
       const o = await getSalesOrder(ctx, id);
       const cust = await customerInfo(ctx, o.customerId);
       const bytes = await renderSalesOrderPdf({
-        company: { name: companyName },
+        company: letterhead,
+        billToLines: cust.billToLines,
         customerName: cust.name,
         order: { number: docRef(o.refNumber, o.orderNumber), date: iso(o.date), status: o.status, total: o.total, memo: o.memo },
         lines: o.lines.map((l) => {
@@ -248,7 +272,7 @@ export async function renderSalesForm(ctx: ServiceContext, kind: SalesFormKind, 
           return { ...lineOf(l), description: `${l.description ?? ''}${note}` };
         }),
         shipping: shippingOf(o),
-      });
+      }, customTemplate);
       return {
         bytes,
         filename: `sales-order-${fileSafe(docRef(o.refNumber, o.orderNumber))}.pdf`,
@@ -267,10 +291,11 @@ export async function renderCustomerStatement(
   ctx: ServiceContext,
   customerId: string,
   range?: { from?: Date; to?: Date },
+  templateId?: string | null,
 ): Promise<RenderedForm> {
-  const company = await getCompany(ctx);
   const stmt = await customerStatement(ctx, customerId, range);
-  const bytes = await renderStatementPdf(stmt, company?.name ?? 'Your Company');
+  // B11: the default statement template (else the built-in layout), with the company letterhead.
+  const bytes = await buildStatementPdf(ctx, stmt, templateId);
   return {
     bytes,
     filename: `statement-${stmt.customer.displayName.replace(/[^A-Za-z0-9]+/g, '-').toLowerCase()}.pdf`,
@@ -322,15 +347,19 @@ const TABLE = {
   sales_order: salesOrders,
 } as const;
 
-/** Email one sales form to the customer (or `to`). Clears its "to be emailed" flag. */
+/**
+ * Email one sales form to the customer (or `to`). Clears its "to be emailed" flag. The PDF prints
+ * with `templateId` when given, else the form's default template (B11).
+ */
 export async function emailSalesForm(
   ctx: ServiceContext,
   kind: SalesFormKind,
   id: string,
   to?: string | null,
+  templateId?: string | null,
 ): Promise<{ ok: true; to: string }> {
   if (!isConfigured()) throw new ServiceError('VALIDATION', NOT_CONFIGURED);
-  const form = await renderSalesForm(ctx, kind, id);
+  const form = await renderSalesForm(ctx, kind, id, templateId);
   const recipient = await deliver(ctx, form, to);
   const t = TABLE[kind];
   await inTransaction(ctx, async (tx) => {

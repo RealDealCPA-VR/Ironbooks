@@ -151,6 +151,37 @@ export function loginLimiter(): LoginRateLimiter {
   return (g.__bkaLoginLimiter ??= new LoginRateLimiter(DEFAULTS));
 }
 
+const RESET_DEFAULTS: RateLimitOptions = {
+  maxFailures: 5,
+  windowMs: 15 * 60 * 1000,
+  lockoutMs: 15 * 60 * 1000,
+  maxLockoutMs: 60 * 60 * 1000,
+};
+
+const gr = globalThis as unknown as { __bkaResetLimiter?: LoginRateLimiter };
+
+/**
+ * Process-wide limiter for the self-service password-reset routes (/api/auth/request-reset and
+ * /api/auth/reset). Every reset REQUEST counts against it (not only failures), as does every
+ * attempt with a wrong token.
+ */
+export function resetLimiter(): LoginRateLimiter {
+  return (gr.__bkaResetLimiter ??= new LoginRateLimiter(RESET_DEFAULTS));
+}
+
+/** Standard 429 response body for the password-reset routes. */
+export function tooManyResets(retryAfterMs: number): { body: Record<string, unknown>; retryAfter: string } {
+  const r = tooManyAttempts(retryAfterMs);
+  const secs = Number(r.retryAfter);
+  return {
+    body: {
+      error: `Too many password-reset attempts. Try again in ${secs < 90 ? `${secs} seconds` : `${Math.ceil(secs / 60)} minutes`}.`,
+      code: 'RATE_LIMITED',
+    },
+    retryAfter: r.retryAfter,
+  };
+}
+
 /**
  * Keys for one sign-in attempt. `scope` separates login / unlock / portal counters; `addr` is
  * the peer address, or 'local' for this machine. Local sign-ins get their own account and

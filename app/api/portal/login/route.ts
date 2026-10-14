@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { eq } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { employees } from '@/lib/db/schema';
-import { verifyPassword, createSessionToken, PORTAL_COOKIE } from '@/lib/auth';
+import { verifyPassword, createPortalToken, PORTAL_COOKIE } from '@/lib/auth';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 
@@ -30,7 +30,7 @@ export async function POST(req: NextRequest) {
       if (emp.portalPasswordHash && emp.isActive && (await verifyPassword(password, emp.portalPasswordHash))) {
         limiter.recordSuccess(keys.slice(0, -1));
         const res = NextResponse.json({ id: emp.id, name: `${emp.firstName} ${emp.lastName}` });
-        res.cookies.set(PORTAL_COOKIE, createSessionToken(emp.id, 'portal'), {
+        res.cookies.set(PORTAL_COOKIE, createPortalToken(emp.id, emp.portalPasswordHash), {
           httpOnly: true,
           secure: cookieSecure(origin),
           sameSite: 'lax',

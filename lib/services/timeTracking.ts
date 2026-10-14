@@ -12,10 +12,11 @@
  */
 import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { timeEntries, customers, items } from '@/lib/db/schema';
+import { timeEntries, customers, items, employees, jobs } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
@@ -83,6 +84,16 @@ export async function listTimeEntries(ctx: ServiceContext, filter: ListTimeEntri
 // createTimeEntry
 // ---------------------------------------------------------------------------
 
+/** Employee / job / service item ids from the payload must belong to this company. */
+async function assertTimeRefsOwned(
+  ctx: ServiceContext,
+  refs: Pick<TimeEntryInput, 'employeeId' | 'jobId' | 'serviceItemId'>,
+) {
+  if (refs.employeeId) await assertRefInCompany(ctx, employees, refs.employeeId, 'Employee');
+  if (refs.jobId) await assertRefInCompany(ctx, jobs, refs.jobId, 'Job');
+  if (refs.serviceItemId) await assertRefInCompany(ctx, items, refs.serviceItemId, 'Service item');
+}
+
 export async function createTimeEntry(ctx: ServiceContext, input: TimeEntryInput) {
   const hours = Money.of(input.hours);
   if (hours.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
@@ -95,6 +106,7 @@ export async function createTimeEntry(ctx: ServiceContext, input: TimeEntryInput
       .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, input.customerId)));
     if (!cust) throw notFound('Customer');
   }
+  await assertTimeRefsOwned(ctx, input);
 
   const rate = input.rate != null ? toAmountString(input.rate) : null;
 
@@ -155,6 +167,7 @@ export async function updateTimeEntry(
       .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, update.customerId)));
     if (!cust) throw notFound('Customer');
   }
+  await assertTimeRefsOwned(ctx, update);
 
   const patch: Partial<typeof timeEntries.$inferInsert> = {};
   if (update.employeeId !== undefined) patch.employeeId = update.employeeId;

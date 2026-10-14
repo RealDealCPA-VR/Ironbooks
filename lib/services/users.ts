@@ -15,7 +15,7 @@
  */
 import { and, eq } from 'drizzle-orm';
 import { companies, companyRoles, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
-import { hashPassword } from '@/lib/auth';
+import { hashPassword, MIN_PASSWORD_LENGTH } from '@/lib/auth';
 import {
   ADMIN_ROLE_KEY,
   BUILTIN_ROLES,
@@ -312,8 +312,8 @@ export async function addUser(
       }
       id = existing.id;
     } else {
-      if (!input.password || input.password.length < 8) {
-        throw validation('Password must be at least 8 characters.');
+      if (!input.password || input.password.length < MIN_PASSWORD_LENGTH) {
+        throw validation(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
       }
       const [created] = await tx.db
         .insert(users)
@@ -450,8 +450,8 @@ export async function resetUserPassword(
   if (!(await getMembership(ctx, userId))) throw notFound('User');
   await assertCanManageUser(ctx, userId);
   await assertCanChangeSharedLogin(ctx, userId);
-  if (typeof password !== 'string' || password.length < 8) {
-    throw validation('Password must be at least 8 characters.');
+  if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+    throw validation(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
   }
   const hash = await hashPassword(password);
   await inTransaction(ctx, async (tx) => {

@@ -6,20 +6,20 @@ _Status re-checked 2026-10-13 after the P0 and P1 rounds (release v1.1.0). The f
 
 _Re-checked 2026-10-13 against `main` after the P0 and P1 rounds (one read-only auditor per area). The 2026-10-12 audit figures are in brackets._
 
-**Original gaps:** 109. Done **66** (52) · partial **38** (46) · buggy **3** (9) · missing **2** (2).
-**New gaps from the audit (68) still open or only partly fixed:** P0 **0** (9) · P1 **4** (34) · P2 **19** (25).
+**Original gaps:** 109. Done **69** (52) · partial **38** (46) · buggy **0** (9) · missing **2** (2).
+**New gaps from the audit (68) still open or only partly fixed:** P0 **0** (9) · P1 **3** (34) · P2 **18** (25).
 
 | Area | Done | Partial | Buggy | Missing | Open new gaps P0/P1/P2 |
 |---|---|---|---|---|---|
 | setup-multiuser | 2 | 3 | 0 | 0 | 0/1/4 |
-| lists-inventory | 9 | 11 | 3 | 0 | 0/1/3 |
+| lists-inventory | 12 | 11 | 0 | 0 | 0/0/2 |
 | sales-ar | 5 | 5 | 0 | 0 | 0/0/0 |
 | ap-banking-tax | 8 | 4 | 0 | 0 | 0/0/4 |
 | payroll-migration | 14 | 0 | 0 | 0 | 0/2/2 |
 | reports | 10 | 7 | 0 | 0 | 0/0/3 |
 | accountant-utilities | 18 | 8 | 0 | 2 | 0/0/3 |
 
-**Still buggy:** B5 custom terms leave the due date blank · B11 print/email of sales forms ignores custom templates · G3 reorder list ignores open POs (duplicate POs). **Never built:** I1 Accountant's Copy · I7 Period Copy. These and the partial rows are the next round (all P1/P2; no P0 is open).
+**Buggy rows fixed 2026-10-14** (production-readiness pass, below): B5 terms drive due dates, B11 templates on print/email, G3 reorder list nets open POs. **Never built:** I1 Accountant's Copy · I7 Period Copy. These and the partial rows are the next round (all P1/P2; no P0 is open).
 
 ## Project goals
 
@@ -40,6 +40,25 @@ _Re-checked 2026-10-13 against `main` after the P0 and P1 rounds (one read-only 
 - **P0: Full .bka restore (and condense-archive restore) accepts a tampered company file with ledger guards disabled and books out of balance, and leaves the guards off afterwards**. Repro: Scratch test: scratchpad/audit/ledger.audit.ts, run with npx vitest run --config scratchpad/audit/vitest.config.mts from the repo root. (1) getDb(A), createCompany, then post 100.00 Dr expense / Cr 1000 plus 25 more entries. (2) Raw SQL: ALTER TABLE journal_entry_lines DISABLE TRIGGER ALL; UPDATE journal_entry_lines SET debit=90 WHERE journal_entry_id=<e1> AND debit>0. (3) createBackup('Audit Co', A), closeDb(A). (4) restoreBackup(buffer, B) returns {restored:true} with no error. (5) getDb(B): trialBalance throws 'INTEGRITY: Trial balance is out of balance: debits 415.25 ≠ credits 425.25'. pg_trigger shows all 7 journal_entry_lines guards (bka_jel_balanced, bka_jel_guard, bka_jel_sync_*, …) with tgenabled='D'. verifyIntegrity reports an unbalanced entry, a cached-balance mismatch, and '7 database guards are missing or disabled'. Cause: lib/services/backup.ts restoreBackup (line 307) only checks zip/manifest/PG_VERSION, then swaps the data dir. Migrations already recorded are not re-run on open (lib/db/index.ts), so the guards are never reinstalled or re-enabled, and nothing checks ledger balance after the swap. restoreCondenseArchive (condense.ts:720) and POST /api/backup (route.ts:103) share this path, as does a double-clicked .bka. By contrast, portable .bkp restore (portableFile.ts) loads into a fresh, guarded DB and refuses unbalanced ledgers. Fix: after the swap, open the restored DB, re-assert the guard triggers (ENABLE ALWAYS / recreate from 0017 and 0025), and run booksInBalance plus a guard check. Roll back to preRestoreDir on failure. Alternatively, restore .bka through the portable-style reload.
 - **P2: *.ts.net hostnames are always classed as private 'tailnet', so Tailscale Funnel (public) endpoints get past the cloud opt-in and AI redaction**. Repro: decideOutbound(DEFAULT_NETWORK_POLICY, 'https://somehost.tailXXXX.ts.net/v1/chat/completions', 'ai') returns allowed:true with hostClass 'tailnet' (lib/net/cidr.ts:165), even though Funnel names resolve to public Tailscale relay IPs. The AI router also treats the provider as 'local', so no redaction is applied. Fix: resolve the hostname and require the address to be in 100.64.0.0/10 or fd7a:115c:a1e0::/48 before calling it 'tailnet'.
 - **P2: Navigation overwhelms non-accountants: 107 sidebar links in 9 always-expanded groups**. Repro: lib/nav.ts has 107 path entries rendered by components/AppShell.tsx with no essentials/simple mode. <Help> tooltips are used in only 30 of the 164 app pages (grep -rl '<Help ' app components).
+
+## Production-readiness pass (2026-10-14)
+
+Bug fixes, a security sweep and dependency updates before the next release. Verified with `tsc`, the full suite and `next build`.
+
+- **B5 terms:** Terms list entries (standard and date-driven) fill the due date on invoice and bill forms and on the server when it's left blank. Batch invoices and statement charges use the customer's terms. Receive Payments and Pay Bills take early-payment discounts from the list, falling back to the free-text parser. Invoices now store their terms.
+- **B11 templates:** Print and email of every sales form use the chosen template, else the form's default template, else the built-in layout. Print and Email have a template picker, and statements use the default statement template.
+- **G3 reorder list:** available = on hand − committed on sales orders + open POs. Suggestions go up to the site max level, and items already covered by open POs are left out, so running "create POs" twice no longer duplicates them. Physical counts, value adjustments and batch counts post to a chosen Adjustment Account (default Inventory Adjustments, never 3000 or 5900) with Class and Customer:Job.
+- **Security:**
+  - Offline forgot-password returns a reset token only on a single-user file; otherwise an Admin resets the password. The reset routes are rate-limited and check the file lock, and a reset ends the user's sessions.
+  - Only an Admin of the current company can create another company. Before this, any user could, which locked Admins out of backups.
+  - Cross-company ids are refused on jobs, time, mileage, tax rates, customers and vendors, and the report joins that leaked names across companies are scoped to the company.
+  - Employee portal tokens are revoked when the password changes or the employee is deactivated.
+  - The auth secret fails closed instead of falling back to a constant.
+  - The password minimum is 8 everywhere.
+  - Malformed JSON returns 400.
+- **Dependencies:** next 15.5.28 (Windows RCE and middleware-bypass advisories), next-auth beta.32 / @auth/core 0.41.3, adm-zip 0.6.1 (untrusted .bka zips), nodemailer 10, fast-xml-parser 4.5.7. An npm `overrides` entry resolves next-auth's nodemailer peer conflict.
+  - Advisories still open, judged not reachable: drizzle identifier escaping (identifiers are constants), the fast-xml-parser XMLBuilder advisory (only XMLParser is used), sharp (next/image is unused), and the build-time postcss and tailwind tooling.
+- **Release and CI:** a CI workflow runs typecheck, tests and build on every push and PR. The app icons are now tracked, so a clean checkout builds with them. Server-only packages are kept out of `app.asar`; they already ship in `resources/app/node_modules`.
 
 ## P0 fix round (2026-10-12): all 11 P0s fixed
 
@@ -164,11 +183,11 @@ I audited sections B (B1-B18) and G (G1-G5) on main at 98e0b44. Of the 23 rows, 
 
 | ID | Pri | Status | Title | Remaining / evidence |
 |---|---|---|---|---|
-| B5 | P1 | buggy | Terms list (Standard and Date-Driven) driving due dates and discounts | Not fixed. Invoice and bill forms still know only the 4 hard-coded terms (lib/preferences.ts:597-599), so a custom "Net 45" or date-driven term leaves the due date blank; no termsId on documents and no form calls /api/terms/compute. |
+| B5 | P1 | done | Terms list (Standard and Date-Driven) driving due dates and discounts | Not fixed. Invoice and bill forms still know only the 4 hard-coded terms (lib/preferences.ts:597-599), so a custom "Net 45" or date-driven term leaves the due date blank; no termsId on documents and no form calls /api/terms/compute. |
 | B9 | P1 | partial | Sales Tax Code list, resale number, exemption | The "Non" customer bug is fixed: a non-taxable customer makes every line non-taxable on invoice, SR, SO, estimate and CM (customerDefaults.ts:53-68). Left: the item's tax code is applied only in the browser (an API caller can tax a Non item), and the per-line control is a checkbox, not a tax-code column. |
 | B10 | P2 | partial | To Do list and timestamped Notes | Mostly fixed: one todos store (0039) feeds Calendar, Reminders and Leads, and merge and lead convert repoint to-dos. Left: the notes panel is on customers and vendors only, not employees. |
-| B11 | P1 | buggy | Form templates / Layout Designer | Not fixed. renderSalesForm takes no template (salesForms.ts:109), so print and email of SR, CM, SO and other forms ignore custom templates and logos; only the invoice, estimate, PO and statement PDF routes accept ?templateId, and no form has a template selector. |
-| G3 | P2 | buggy | Preferred vendor, PO from reorder list, Stock Status by Vendor | Not fixed. reorderReport still ignores open POs, committed quantity and the max level (inventoryOps.ts:126-136), so creating POs from it twice makes duplicate POs. |
+| B11 | P1 | done | Form templates / Layout Designer | Not fixed. renderSalesForm takes no template (salesForms.ts:109), so print and email of SR, CM, SO and other forms ignore custom templates and logos; only the invoice, estimate, PO and statement PDF routes accept ?templateId, and no form has a template selector. |
+| G3 | P2 | done | Preferred vendor, PO from reorder list, Stock Status by Vendor | Not fixed. reorderReport still ignores open POs, committed quantity and the max level (inventoryOps.ts:126-136), so creating POs from it twice makes duplicate POs. |
 | B2 | P1 | done | Tax-line mapping on accounts | Done (P1). Income Tax Preparation, Summary and Detail are in the catalog and the Report Center, with labels from getTaxLine; tested. |
 | B3 | P1 | partial | Other Names list | Unchanged. The JE service accepts Other Names but no picker (JE, check, expense, CC) offers them, and checks do not print the account number. |
 | B4 | P2 | partial | Customer/Vendor/Job Type lists | Unchanged. Job type has an API but no UI; customer and vendor types are set only on /advanced-pricing; reports have no type filter. |

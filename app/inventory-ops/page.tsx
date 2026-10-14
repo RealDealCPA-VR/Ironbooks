@@ -32,6 +32,12 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
 import { CreatePosFromReorder, StockStatusByVendor } from '@/components/lists/ReorderTools';
+import {
+  EMPTY_ADJUSTMENT_FIELDS,
+  type AdjustmentFieldValues,
+  InventoryAdjustmentFields,
+  adjustmentPayload,
+} from '@/components/InventoryAdjustmentFields';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,7 +48,11 @@ interface ReorderRow {
   name: string;
   sku: string | null;
   quantityOnHand: string;
+  committed: string;
+  onPurchaseOrder: string;
+  available: string;
   reorderPoint: string;
+  maxQuantity: string | null;
   averageCost: string;
   suggestedReorderQty: string;
 }
@@ -147,6 +157,7 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
   const [date, setDate] = useState(todayStr);
   const [saving, setSaving] = useState(false);
   const [result, setResult] = useState<PhysicalCountResult | null>(null);
+  const [adjFields, setAdjFields] = useState<AdjustmentFieldValues>(EMPTY_ADJUSTMENT_FIELDS);
 
   useEffect(() => {
     if (!open) {
@@ -154,6 +165,7 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
       setCountedQty('');
       setDate(todayStr());
       setResult(null);
+      setAdjFields(EMPTY_ADJUSTMENT_FIELDS);
       return;
     }
     setLoadingItems(true);
@@ -187,6 +199,7 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
         itemId,
         countedQty: countedQty,
         date,
+        ...adjustmentPayload(adjFields),
       });
       setResult(data);
       toast('Physical count recorded.', 'success');
@@ -280,8 +293,8 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
               }`}
             >
               {deltaNum < 0
-                ? `Shrinkage of ${Math.abs(deltaNum).toFixed(4)} units recorded. Dr Inventory Shrinkage, Cr Inventory Asset.`
-                : `Overage of ${deltaNum.toFixed(4)} units recorded. Dr Inventory Asset, Cr Inventory Shrinkage.`}
+                ? `Shrinkage of ${Math.abs(deltaNum).toFixed(4)} units recorded. Dr Adjustment Account, Cr Inventory Asset.`
+                : `Overage of ${deltaNum.toFixed(4)} units recorded. Dr Inventory Asset, Cr Adjustment Account.`}
             </div>
           )}
         </div>
@@ -352,6 +365,8 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
             <Label htmlFor="pc-date">Count Date *</Label>
             <Input id="pc-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
           </div>
+
+          <InventoryAdjustmentFields value={adjFields} onChange={setAdjFields} idPrefix="pc-adj" />
         </form>
       )}
     </Modal>
@@ -380,6 +395,7 @@ function ValueAdjustModal({
   const [reason, setReason] = useState('');
   const [saving, setSaving] = useState(false);
   const [result, setResult] = useState<ValueAdjustResult | null>(null);
+  const [adjFields, setAdjFields] = useState<AdjustmentFieldValues>(EMPTY_ADJUSTMENT_FIELDS);
 
   useEffect(() => {
     if (!open) {
@@ -389,6 +405,7 @@ function ValueAdjustModal({
       setDate(todayStr());
       setReason('');
       setResult(null);
+      setAdjFields(EMPTY_ADJUSTMENT_FIELDS);
       return;
     }
     setLoading(true);
@@ -423,6 +440,7 @@ function ValueAdjustModal({
         newUnitCost: mode === 'unit' ? value : undefined,
         date,
         reason: reason || undefined,
+        ...adjustmentPayload(adjFields),
       });
       setResult(data);
       toast('Inventory value adjusted.', 'success');
@@ -506,8 +524,8 @@ function ValueAdjustModal({
           </div>
           <p className="text-xs text-navy/40">
             {deltaNum < 0
-              ? 'Write-down posted: Dr Inventory Adjustment (5900), Cr Inventory Asset.'
-              : 'Write-up posted: Dr Inventory Asset, Cr Inventory Adjustment (5900).'}
+              ? 'Write-down posted: Dr Adjustment Account, Cr Inventory Asset.'
+              : 'Write-up posted: Dr Inventory Asset, Cr Adjustment Account.'}
             {result.costingMethod === 'fifo'
               ? ' Remaining FIFO layers were revalued.'
               : ' Average cost was updated; quantity on hand is unchanged.'}
@@ -595,7 +613,7 @@ function ValueAdjustModal({
                   ),
                 )}
               </span>{' '}
-              vs Inventory Adjustment (5900)
+              vs the adjustment account
             </p>
           )}
 
@@ -613,6 +631,8 @@ function ValueAdjustModal({
               onChange={(e) => setReason(e.target.value)}
             />
           </div>
+
+          <InventoryAdjustmentFields value={adjFields} onChange={setAdjFields} idPrefix="va-adj" />
         </form>
       )}
     </Modal>
@@ -638,10 +658,12 @@ function BatchCountModal({
   const [date, setDate] = useState(todayStr);
   const [saving, setSaving] = useState(false);
   const [result, setResult] = useState<BatchCountResult | null>(null);
+  const [adjFields, setAdjFields] = useState<AdjustmentFieldValues>(EMPTY_ADJUSTMENT_FIELDS);
 
   useEffect(() => {
     if (!open) {
       setCounts({});
+      setAdjFields(EMPTY_ADJUSTMENT_FIELDS);
       setDate(todayStr());
       setResult(null);
       return;
@@ -673,6 +695,7 @@ function BatchCountModal({
       const data = await api.post<BatchCountResult>('/api/inventory/batch-count', {
         date,
         counts: entered.map((r) => ({ itemId: r.id, countedQty: counts[r.id] })),
+        ...adjustmentPayload(adjFields),
       });
       setResult(data);
       toast(`Applied ${data.applied.length} count(s).`, 'success');
@@ -782,9 +805,10 @@ function BatchCountModal({
               <Input id="bc-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
             </div>
             <p className="text-xs text-navy/50 pb-2">
-              Leave a row blank to skip it. Differences post as shrinkage/overage vs account 5900.
+              Leave a row blank to skip it. Differences post as shrinkage/overage vs the adjustment account.
             </p>
           </div>
+          <InventoryAdjustmentFields value={adjFields} onChange={setAdjFields} idPrefix="bc-adj" />
           <div className="max-h-96 overflow-y-auto">
             <Table>
               <thead>
@@ -1031,7 +1055,7 @@ export default function InventoryOpsPage() {
           <EmptyState
             icon={Package}
             title="No items need reordering right now"
-            message="Items appear here when their quantity on hand falls to or below their reorder point."
+            message="Items appear here when on hand less committed plus on order falls to or below their reorder point."
           />
         ) : (
           <Table>
@@ -1040,7 +1064,11 @@ export default function InventoryOpsPage() {
                 <Th>Item</Th>
                 <Th>SKU</Th>
                 <Th numeric>On Hand</Th>
+                <Th numeric>Committed</Th>
+                <Th numeric>On PO</Th>
+                <Th numeric>Available</Th>
                 <Th numeric>Reorder Point</Th>
+                <Th numeric>Max</Th>
                 <Th numeric>Avg Cost</Th>
                 <Th numeric>Suggested Order</Th>
                 <Th numeric>Est. Cost</Th>
@@ -1061,7 +1089,19 @@ export default function InventoryOpsPage() {
                       </span>
                     </Td>
                     <Td numeric className="text-navy/70">
+                      {parseFloat(row.committed).toFixed(2)}
+                    </Td>
+                    <Td numeric className="text-navy/70">
+                      {parseFloat(row.onPurchaseOrder).toFixed(2)}
+                    </Td>
+                    <Td numeric className="text-navy/70">
+                      {parseFloat(row.available).toFixed(2)}
+                    </Td>
+                    <Td numeric className="text-navy/70">
                       {parseFloat(row.reorderPoint).toFixed(2)}
+                    </Td>
+                    <Td numeric className="text-navy/70">
+                      {row.maxQuantity == null ? '—' : parseFloat(row.maxQuantity).toFixed(2)}
                     </Td>
                     <Td numeric className="text-navy/70">
                       {formatCurrency(row.averageCost)}

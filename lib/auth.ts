@@ -13,7 +13,7 @@ import { cookies } from 'next/headers';
 import bcrypt from 'bcryptjs';
 import { eq } from 'drizzle-orm';
 import { getDb, resolveDataDir } from '@/lib/db';
-import { users } from '@/lib/db/schema';
+import { employees, users } from '@/lib/db/schema';
 import { touchSession } from '@/lib/services/sessions';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 
@@ -27,17 +27,32 @@ function secret(): string {
   if (process.env.BKA_AUTH_SECRET) return process.env.BKA_AUTH_SECRET;
   const dir = resolveDataDir();
   const file = path.join(dir, '.auth-secret');
+  let s: string;
   try {
-    if (fs.existsSync(file)) return fs.readFileSync(file, 'utf8');
-    fs.mkdirSync(dir, { recursive: true });
-    const s = crypto.randomBytes(32).toString('hex');
-    fs.writeFileSync(file, s, { mode: 0o600 });
-    return s;
+    if (fs.existsSync(file)) {
+      s = fs.readFileSync(file, 'utf8');
+    } else {
+      fs.mkdirSync(dir, { recursive: true });
+      s = crypto.randomBytes(32).toString('hex');
+      try {
+        fs.writeFileSync(file, s, { mode: 0o600, flag: 'wx' });
+      } catch {
+        s = fs.readFileSync(file, 'utf8'); // lost the race — use the winner's secret
+      }
+    }
   } catch {
-    // Last-resort ephemeral secret (sessions won't survive restart, but login still works).
-    return 'bookkeeper-ai-dev-secret';
+    s = '';
   }
+  // SECURITY: fail closed. A well-known fallback secret would let anyone forge session,
+  // portal and unlock cookies. Set BKA_AUTH_SECRET to override when the data dir is read-only.
+  if (!s.trim()) {
+    throw new Error('Cannot read or create the session-signing secret (.auth-secret); refusing to sign sessions.');
+  }
+  return s;
 }
+
+/** Minimum length for every password the app sets (see lib/passwordPolicy.ts). */
+export { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 
 function sign(payload: string): string {
   return crypto.createHmac('sha256', secret()).update(payload).digest('base64url');
@@ -97,7 +112,7 @@ export function createSessionToken(userId: string, kind: TokenKind = 'user', sid
 export function verifySessionToken(
   token: string | undefined | null,
   expectedKind: TokenKind = 'user',
-): { userId: string; sid?: string } | null {
+): { userId: string; sid?: string; pv?: string } | null {
   if (!token) return null;
   const [body, sig] = token.split('.');
   if (!body || !sig) return null;
@@ -117,7 +132,11 @@ export function verifySessionToken(
     // Bind the token to the company file it was issued by (legacy tokens without `fid` are
     // rejected → one re-login after upgrading).
     if (data.fid !== companyFileId()) return null;
-    return typeof data.sid === 'string' ? { userId: data.userId, sid: data.sid } : { userId: data.userId };
+    return {
+      userId: data.userId,
+      ...(typeof data.sid === 'string' ? { sid: data.sid } : {}),
+      ...(typeof data.pv === 'string' ? { pv: data.pv } : {}),
+    };
   } catch {
     return null;
   }
@@ -235,12 +254,51 @@ export async function getCurrentUser() {
   return user ?? null;
 }
 
-/** Resolve the current employee id from the portal session cookie (verified). */
+/**
+ * Portal password version: a keyed digest of the employee's current portal password hash.
+ * Portal tokens carry it, so setting a new portal password (or removing it) invalidates every
+ * portal session minted under the old one. Keyed so the cookie reveals nothing about the hash.
+ */
+export function portalPasswordVersion(portalPasswordHash: string): string {
+  return crypto.createHmac('sha256', secret()).update(`portal-pv:${portalPasswordHash}`).digest('base64url').slice(0, 22);
+}
+
+/** Mint an employee self-service portal token bound to the current portal password. */
+export function createPortalToken(employeeId: string, portalPasswordHash: string): string {
+  const payload = JSON.stringify({
+    userId: employeeId,
+    kind: 'portal',
+    fid: companyFileId(),
+    pv: portalPasswordVersion(portalPasswordHash),
+    exp: Date.now() + SESSION_TTL_MS,
+  });
+  const body = Buffer.from(payload).toString('base64url');
+  return `${body}.${sign(body)}`;
+}
+
+/**
+ * Resolve the current employee id from the portal session cookie. Beyond the signature, the
+ * employee must still be active and still have a portal password, and the token must have been
+ * issued under that same password (see portalPasswordVersion) — so deactivating the employee or
+ * changing/removing their portal password ends existing portal sessions.
+ */
 export async function getPortalEmployeeId(): Promise<string | null> {
+  let token: { userId: string; pv?: string } | null;
   try {
     const store = await cookies();
-    return verifySessionToken(store.get(PORTAL_COOKIE)?.value, 'portal')?.userId ?? null;
+    token = verifySessionToken(store.get(PORTAL_COOKIE)?.value, 'portal');
   } catch {
     return null;
   }
+  if (!token?.pv) return null; // legacy portal tokens (no password version) are not honored
+  const db = await getDb();
+  const [emp] = await db
+    .select({ id: employees.id, isActive: employees.isActive, portalPasswordHash: employees.portalPasswordHash })
+    .from(employees)
+    .where(eq(employees.id, token.userId));
+  if (!emp || !emp.isActive || !emp.portalPasswordHash) return null;
+  const expected = Buffer.from(portalPasswordVersion(emp.portalPasswordHash));
+  const got = Buffer.from(token.pv);
+  if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) return null;
+  return emp.id;
 }

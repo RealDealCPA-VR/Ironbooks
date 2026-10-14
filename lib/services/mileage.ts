@@ -14,10 +14,11 @@
  */
 import { and, asc, between, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { mileageLogs, customers, jobs, vehicles } from '@/lib/db/schema';
+import { mileageLogs, customers, employees, jobs, vehicles } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   notFound,
   validation,
   writeAudit,
@@ -122,9 +123,9 @@ export async function listMileage(
       odometerEnd: mileageLogs.odometerEnd,
     })
     .from(mileageLogs)
-    .leftJoin(customers, eq(mileageLogs.customerId, customers.id))
-    .leftJoin(jobs, eq(mileageLogs.jobId, jobs.id))
-    .leftJoin(vehicles, eq(mileageLogs.vehicleId, vehicles.id))
+    .leftJoin(customers, and(eq(mileageLogs.customerId, customers.id), eq(customers.companyId, ctx.companyId)))
+    .leftJoin(jobs, and(eq(mileageLogs.jobId, jobs.id), eq(jobs.companyId, ctx.companyId)))
+    .leftJoin(vehicles, and(eq(mileageLogs.vehicleId, vehicles.id), eq(vehicles.companyId, ctx.companyId)))
     .where(and(...conds))
     .orderBy(desc(mileageLogs.date), desc(mileageLogs.createdAt));
 
@@ -172,6 +173,8 @@ export async function logMiles(ctx: ServiceContext, input: LogMilesInput): Promi
       .where(and(eq(jobs.id, input.jobId), eq(jobs.companyId, ctx.companyId)));
     if (!j) throw notFound('Job');
   }
+
+  if (input.employeeId) await assertRefInCompany(ctx, employees, input.employeeId, 'Employee');
 
   if (input.vehicleId) {
     const [v] = await ctx.db
@@ -276,8 +279,8 @@ export async function mileageSummary(
       jobName: jobs.name,
     })
     .from(mileageLogs)
-    .leftJoin(customers, eq(mileageLogs.customerId, customers.id))
-    .leftJoin(jobs, eq(mileageLogs.jobId, jobs.id))
+    .leftJoin(customers, and(eq(mileageLogs.customerId, customers.id), eq(customers.companyId, ctx.companyId)))
+    .leftJoin(jobs, and(eq(mileageLogs.jobId, jobs.id), eq(jobs.companyId, ctx.companyId)))
     .where(and(...conds));
 
   // Aggregate totals and groups in-process (PGlite DECIMAL SUM quirks).

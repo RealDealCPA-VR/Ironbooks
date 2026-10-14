@@ -119,6 +119,10 @@ describe('inventory suite (value adjust, counts, commitment, pending builds, val
   // ── adjustInventoryValue ───────────────────────────────────────────────────
 
   it('value adjustment (avg, newTotalValue): write-down $50 -> $40, avgCost 4, GL balanced', async () => {
+    // The default Adjustment Account also took the stock-receipt offsets; measure the change.
+    const adjBefore = (await db.select().from(accounts)).find(
+      (a) => a.companyId === ctx.companyId && a.name === 'Inventory Adjustments',
+    );
     const result = await adjustInventoryValue(ctx, {
       itemId: avgId,
       newTotalValue: '40',
@@ -137,10 +141,10 @@ describe('inventory suite (value adjust, counts, commitment, pending builds, val
     expect(row.averageCost).toBe('4.0000');
     expect(row.quantityOnHand).toBe('10.0000'); // qty untouched
 
-    // Write-down: 5900 debit balance +10
+    // Write-down: default Adjustment Account "Inventory Adjustments" debit balance +10
     const [adj] = await db.select().from(accounts).where(eq(accounts.id, result.adjustmentAccountId));
-    expect(adj.code).toBe('5900');
-    expect(adj.balance).toBe('10.00');
+    expect(adj.name).toBe('Inventory Adjustments');
+    expect(Number(adj.balance) - Number(adjBefore?.balance ?? 0)).toBeCloseTo(10, 2);
 
     const tb = await trialBalance(ctx);
     expect(tb.balanced).toBe(true);

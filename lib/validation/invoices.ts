@@ -48,6 +48,8 @@ const invoiceCoreFields = {
   customerId: zUuid,
   date: zDate,
   dueDate: zDate.nullish(),
+  /** Payment terms (Terms list name/code); a blank due date is computed from them. */
+  terms: z.string().max(50).nullish(),
   taxRateId: zUuid.nullish(),
   classId: zUuid.nullish(),
   jobId: zUuid.nullish(),

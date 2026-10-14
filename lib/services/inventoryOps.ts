@@ -1,20 +1,32 @@
 /**
  * Inventory operations — reorder reporting, physical count adjustments, and low-stock counts.
  *
- * GL impact for physical count adjustments:
+ * GL impact for physical count adjustments (QB "Adjust Quantity/Value on Hand"):
  *   Shrinkage (countedQty < currentQty, delta < 0):
- *     Dr 5900 Inventory Shrinkage (expense)   |delta| * averageCost
+ *     Dr Adjustment Account                   |delta| * averageCost
  *     Cr 1300 Inventory Asset                 |delta| * averageCost
  *
  *   Overage (countedQty > currentQty, delta > 0):
  *     Dr 1300 Inventory Asset                 delta * averageCost
- *     Cr 5900 Inventory Shrinkage (expense)   delta * averageCost
+ *     Cr Adjustment Account                   delta * averageCost
  *
- * The adjustment account defaults to code '5900' (get-or-create).
+ * The Adjustment Account is the user's pick, defaulting to "Inventory Adjustments" (the same
+ * default as inventory.adjustInventory / fifo.ts), with optional Class and Customer:Job on the
+ * adjustment line.
  */
-import { and, asc, eq, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { accounts, items, inventoryLayers } from '@/lib/db/schema';
+import {
+  accounts,
+  items,
+  inventoryLayers,
+  inventorySites,
+  itemSiteSettings,
+  purchaseOrderLines,
+  purchaseOrders,
+  salesOrderLines,
+  salesOrders,
+} from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -24,7 +36,12 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { assertNotFifoTracked } from './inventory';
+import {
+  type AdjustmentDimensions,
+  adjustmentPostingFields,
+  assertNotFifoTracked,
+  resolveAdjustmentAccount,
+} from './inventory';
 import { postJournalEntry } from './posting';
 import { assertDefaultSiteQuantities } from './inventorySites';
 
@@ -40,31 +57,6 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
-}
-
-/**
- * Get-or-create the Inventory Shrinkage expense account (code '5900').
- * If the company already has one, returns it; otherwise inserts a new row.
- */
-async function ensureShrinkageAccount(ctx: ServiceContext): Promise<string> {
-  const [existing] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '5900')));
-  if (existing) return existing.id;
-
-  const [created] = await ctx.db
-    .insert(accounts)
-    .values({
-      companyId: ctx.companyId,
-      code: '5900',
-      name: 'Inventory Shrinkage',
-      type: 'expense',
-      subtype: 'operating_expenses',
-      balance: '0',
-    })
-    .returning();
-  return created.id;
 }
 
 /** Load an inventory-type item scoped to the company. Throws NOT_FOUND. */
@@ -86,9 +78,20 @@ export interface ReorderReportRow {
   name: string;
   sku: string | null;
   quantityOnHand: string;
+  /** Open sales-order quantity not yet invoiced. */
+  committed: string;
+  /** Open purchase-order quantity not yet received / billed. */
+  onPurchaseOrder: string;
+  /** quantityOnHand - committed + onPurchaseOrder. */
+  available: string;
   reorderPoint: string;
+  /** Max (reorder-up-to) level, from the item's default-site setting; null when not set. */
+  maxQuantity: string | null;
   averageCost: string;
-  /** Suggested reorder quantity = reorderPoint * 2 - quantityOnHand (at least 1). */
+  /**
+   * Suggested reorder quantity: up to the max level when one is set, else up to the reorder
+   * point, net of committed and on-order quantities (at least 1 when nothing is on order).
+   */
   suggestedReorderQty: string;
 }
 
@@ -98,8 +101,12 @@ export interface ReorderReportResult {
 }
 
 /**
- * Returns all inventory-type items where quantityOnHand <= reorderPoint
- * (and reorderPoint is set), with a suggested reorder quantity.
+ * QB reorder list ("Inventory Stock Status" reorder behaviour). For every active inventory item
+ * with a reorder point:
+ *   available = on hand - committed (open sales orders) + on order (open purchase orders)
+ * The item is listed when available <= reorder point, suggesting a reorder up to the max level
+ * (when set) or the reorder point. Items whose open purchase orders already cover the shortfall
+ * are left off — so creating POs from the list twice never orders the same shortage twice.
  */
 export async function reorderReport(ctx: ServiceContext): Promise<ReorderReportResult> {
   const rows = await ctx.db
@@ -120,30 +127,92 @@ export async function reorderReport(ctx: ServiceContext): Promise<ReorderReportR
         isNotNull(items.reorderPoint),
       ),
     );
+  if (rows.length === 0) return { rows: [], count: 0 };
+  const itemIds = rows.map((r) => r.id);
 
-  const reportRows: ReorderReportRow[] = rows
-    .filter((r) => {
-      if (r.reorderPoint == null) return false;
-      const qty = Money.of(r.quantityOnHand ?? '0');
-      const reorder = Money.of(r.reorderPoint);
-      return qty.lessThanOrEqualTo(reorder);
+  const committedRows = await ctx.db
+    .select({
+      itemId: salesOrderLines.itemId,
+      committed: sql<string>`COALESCE(SUM(GREATEST(${salesOrderLines.quantity} - ${salesOrderLines.quantityInvoiced}, 0)), 0)`,
     })
-    .map((r) => {
-      const qty = Money.of(r.quantityOnHand ?? '0');
-      const reorder = Money.of(r.reorderPoint!);
-      // Suggest: (reorderPoint * 2) - quantityOnHand, floor to 4dp, minimum 1
-      const suggested = Money.abs(reorder.times(2).minus(qty));
-      const suggestedQty = suggested.lessThan(1) ? Money.of(1) : suggested;
-      return {
-        id: r.id,
-        name: r.name,
-        sku: r.sku ?? null,
-        quantityOnHand: qty.toFixed(4),
-        reorderPoint: reorder.toFixed(4),
-        averageCost: Money.of(r.averageCost ?? '0').toFixed(4),
-        suggestedReorderQty: suggestedQty.toFixed(4),
-      };
+    .from(salesOrderLines)
+    .innerJoin(salesOrders, eq(salesOrderLines.salesOrderId, salesOrders.id))
+    .where(
+      and(
+        eq(salesOrders.companyId, ctx.companyId),
+        inArray(salesOrders.status, ['open', 'partial']),
+        inArray(salesOrderLines.itemId, itemIds),
+      ),
+    )
+    .groupBy(salesOrderLines.itemId);
+  const committedBy = new Map(committedRows.map((r) => [r.itemId, Money.of(r.committed)]));
+
+  const onPoRows = await ctx.db
+    .select({
+      itemId: purchaseOrderLines.itemId,
+      onPO: sql<string>`COALESCE(SUM(GREATEST(${purchaseOrderLines.quantity} - ${purchaseOrderLines.quantityBilled}, 0)), 0)`,
+    })
+    .from(purchaseOrderLines)
+    .innerJoin(purchaseOrders, eq(purchaseOrderLines.purchaseOrderId, purchaseOrders.id))
+    .where(
+      and(
+        eq(purchaseOrders.companyId, ctx.companyId),
+        inArray(purchaseOrders.status, ['open', 'partial']),
+        inArray(purchaseOrderLines.itemId, itemIds),
+      ),
+    )
+    .groupBy(purchaseOrderLines.itemId);
+  const onPoBy = new Map(onPoRows.map((r) => [r.itemId, Money.of(r.onPO)]));
+
+  // Max level: the item-level reorder point is the default site's, so the max comes from the
+  // default site's setting (Inventory Sites › reorder points).
+  const maxRows = await ctx.db
+    .select({ itemId: itemSiteSettings.itemId, maxQuantity: itemSiteSettings.maxQuantity })
+    .from(itemSiteSettings)
+    .innerJoin(inventorySites, eq(itemSiteSettings.siteId, inventorySites.id))
+    .where(
+      and(
+        eq(itemSiteSettings.companyId, ctx.companyId),
+        eq(inventorySites.isDefault, true),
+        isNotNull(itemSiteSettings.maxQuantity),
+        inArray(itemSiteSettings.itemId, itemIds),
+      ),
+    );
+  const maxBy = new Map(maxRows.map((r) => [r.itemId, Money.of(r.maxQuantity!)]));
+
+  const reportRows: ReorderReportRow[] = [];
+  for (const r of rows) {
+    if (r.reorderPoint == null) continue;
+    const onHand = Money.of(r.quantityOnHand ?? '0');
+    const reorder = Money.of(r.reorderPoint);
+    const committed = committedBy.get(r.id) ?? Money.zero();
+    const onPO = onPoBy.get(r.id) ?? Money.zero();
+    const available = onHand.minus(committed).plus(onPO);
+    if (available.greaterThan(reorder)) continue;
+
+    const max = maxBy.get(r.id);
+    const target = max && max.greaterThan(reorder) ? max : reorder;
+    let suggested = target.minus(available);
+    if (!suggested.greaterThan(0)) {
+      // Already on order up to the target: the open POs cover the shortfall.
+      if (onPO.greaterThan(0)) continue;
+      suggested = Money.of(1);
+    }
+
+    reportRows.push({
+      id: r.id,
+      name: r.name,
+      sku: r.sku ?? null,
+      quantityOnHand: onHand.toFixed(4),
+      committed: committed.toFixed(4),
+      onPurchaseOrder: onPO.toFixed(4),
+      available: available.toFixed(4),
+      reorderPoint: reorder.toFixed(4),
+      maxQuantity: max ? max.toFixed(4) : null,
+      averageCost: Money.of(r.averageCost ?? '0').toFixed(4),
+      suggestedReorderQty: suggested.toFixed(4),
     });
+  }
 
   return { rows: reportRows, count: reportRows.length };
 }
@@ -162,15 +231,12 @@ export async function lowStockCount(ctx: ServiceContext): Promise<number> {
 // physicalCount
 // ---------------------------------------------------------------------------
 
-export interface PhysicalCountInput {
+export interface PhysicalCountInput extends AdjustmentDimensions {
   itemId: string;
   /** The actual counted quantity from the physical inventory count. */
   countedQty: string | number;
   date: Date;
-  /**
-   * The GL account to use for the adjustment offset.
-   * Defaults to get-or-create '5900' Inventory Shrinkage.
-   */
+  /** Offset account; default "Inventory Adjustments" (see AdjustmentDimensions). */
   adjustmentAccountId?: string | null;
 }
 
@@ -248,24 +314,9 @@ export async function physicalCount(
     // Resolve the inventory asset account
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
 
-    // Resolve or create the adjustment account
-    let adjustmentAccountId: string;
-    if (input.adjustmentAccountId) {
-      // Verify it belongs to this company
-      const [adj] = await tx.db
-        .select({ id: accounts.id })
-        .from(accounts)
-        .where(
-          and(
-            eq(accounts.companyId, tx.companyId),
-            eq(accounts.id, input.adjustmentAccountId),
-          ),
-        );
-      if (!adj) throw notFound(`Adjustment account ${input.adjustmentAccountId}`);
-      adjustmentAccountId = adj.id;
-    } else {
-      adjustmentAccountId = await ensureShrinkageAccount(tx);
-    }
+    // The user's Adjustment Account (default "Inventory Adjustments"), Class and Customer:Job.
+    const adjustmentAccountId = await resolveAdjustmentAccount(tx, input.adjustmentAccountId);
+    const dims = await adjustmentPostingFields(tx, input);
 
     // Build posting lines
     const amountStr = toAmountString(glAmount);
@@ -273,11 +324,12 @@ export async function physicalCount(
 
     const postingLines = isShrinkage
       ? [
-          // Shrinkage: Dr Adjustment (Shrinkage expense), Cr Inventory
+          // Shrinkage: Dr Adjustment Account, Cr Inventory
           {
             accountId: adjustmentAccountId,
             debit: amountStr,
             memo: `Physical count shrinkage — item ${item.name}`,
+            ...dims,
           },
           {
             accountId: inventoryAccountId,
@@ -286,7 +338,7 @@ export async function physicalCount(
           },
         ]
       : [
-          // Overage: Dr Inventory, Cr Adjustment (Shrinkage reversed)
+          // Overage: Dr Inventory, Cr Adjustment Account
           {
             accountId: inventoryAccountId,
             debit: amountStr,
@@ -296,6 +348,7 @@ export async function physicalCount(
             accountId: adjustmentAccountId,
             credit: amountStr,
             memo: `Physical count overage — item ${item.name}`,
+            ...dims,
           },
         ];
 
@@ -347,7 +400,7 @@ export async function physicalCount(
 // adjustInventoryValue — revalue stock without changing quantity
 // ---------------------------------------------------------------------------
 
-export interface AdjustInventoryValueInput {
+export interface AdjustInventoryValueInput extends AdjustmentDimensions {
   itemId: string;
   /** Target total value for the on-hand stock. Provide exactly one of newTotalValue / newUnitCost. */
   newTotalValue?: string | number | null;
@@ -355,7 +408,7 @@ export interface AdjustInventoryValueInput {
   newUnitCost?: string | number | null;
   date: Date;
   reason?: string | null;
-  /** Offset account; defaults to get-or-create '5900' (Inventory Shrinkage / Adjustment). */
+  /** Offset account; default "Inventory Adjustments" (see AdjustmentDimensions). */
   adjustmentAccountId?: string | null;
 }
 
@@ -378,8 +431,9 @@ export interface AdjustInventoryValueResult {
  * Quantity on hand is untouched; only the carrying value changes.
  *
  * GL impact:
- *   Write-up   (newValue > oldValue): Dr Inventory Asset, Cr Adjustment (5900)
- *   Write-down (newValue < oldValue): Dr Adjustment (5900), Cr Inventory Asset
+ *   Write-up   (newValue > oldValue): Dr Inventory Asset, Cr Adjustment Account
+ *   Write-down (newValue < oldValue): Dr Adjustment Account, Cr Inventory Asset
+ * (Adjustment Account default "Inventory Adjustments", with optional Class / Customer:Job.)
  *
  * Costing:
  *   - Average items: averageCost = newValue / quantityOnHand.
@@ -447,17 +501,8 @@ export async function adjustInventoryValue(
   return inTransaction(ctx, async (tx) => {
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
 
-    let adjustmentAccountId: string;
-    if (input.adjustmentAccountId) {
-      const [adj] = await tx.db
-        .select({ id: accounts.id })
-        .from(accounts)
-        .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.id, input.adjustmentAccountId)));
-      if (!adj) throw notFound(`Adjustment account ${input.adjustmentAccountId}`);
-      adjustmentAccountId = adj.id;
-    } else {
-      adjustmentAccountId = await ensureShrinkageAccount(tx);
-    }
+    const adjustmentAccountId = await resolveAdjustmentAccount(tx, input.adjustmentAccountId);
+    const dims = await adjustmentPostingFields(tx, input);
 
     const amountStr = toAmountString(delta.abs());
     const memo = input.reason ?? `Inventory value adjustment — ${item.name}`;
@@ -468,10 +513,10 @@ export async function adjustInventoryValue(
       lines: isWriteUp
         ? [
             { accountId: inventoryAccountId, debit: amountStr, memo },
-            { accountId: adjustmentAccountId, credit: amountStr, memo },
+            { accountId: adjustmentAccountId, credit: amountStr, memo, ...dims },
           ]
         : [
-            { accountId: adjustmentAccountId, debit: amountStr, memo },
+            { accountId: adjustmentAccountId, debit: amountStr, memo, ...dims },
             { accountId: inventoryAccountId, credit: amountStr, memo },
           ],
       sourceRef: `item:${input.itemId}`,
@@ -621,7 +666,7 @@ export interface BatchCountResult {
  */
 export async function batchPhysicalCount(
   ctx: ServiceContext,
-  input: { date: Date; counts: BatchCountEntry[]; adjustmentAccountId?: string | null },
+  input: { date: Date; counts: BatchCountEntry[] } & AdjustmentDimensions,
 ): Promise<BatchCountResult> {
   if (!input.counts || input.counts.length === 0) {
     throw validation('counts must contain at least one entry.');
@@ -636,6 +681,10 @@ export async function batchPhysicalCount(
   // for a per-item reason (bad input, missing item, or a site guard CONFLICT) is rolled back and
   // reported as skipped, while any other failure aborts the whole batch — never half-applied.
   return inTransaction(ctx, async (tx) => {
+    // A bad Adjustment Account / Class / Customer:Job fails the whole batch up front instead of
+    // skipping every item one by one.
+    await resolveAdjustmentAccount(tx, input.adjustmentAccountId);
+    await adjustmentPostingFields(tx, input);
     const applied: PhysicalCountResult[] = [];
     const skipped: Array<{ itemId: string; reason: string }> = [];
 
@@ -646,6 +695,9 @@ export async function batchPhysicalCount(
           countedQty: c.countedQty,
           date: input.date,
           adjustmentAccountId: input.adjustmentAccountId ?? null,
+          classId: input.classId ?? null,
+          customerId: input.customerId ?? null,
+          jobId: input.jobId ?? null,
         });
         applied.push(result);
       } catch (err) {
