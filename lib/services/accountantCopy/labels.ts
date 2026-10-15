@@ -7,6 +7,7 @@
 import { and, eq } from 'drizzle-orm';
 import {
   accounts,
+  billPayments,
   bills,
   classes,
   creditMemos,
@@ -75,6 +76,12 @@ export async function loadLabelMaps(ctx: Pick<ServiceContext, 'db' | 'companyId'
   }
   for (const r of await ctx.db.select({ id: bills.id, ref: bills.billNumber, total: bills.total, v: bills.vendorId }).from(bills).where(eq(bills.companyId, c))) {
     m.docs.set(r.id, `bill${r.ref ? ` #${r.ref}` : ` of ${formatCurrency(r.total)}`}${who(r.v)}`);
+  }
+  for (const r of await ctx.db
+    .select({ id: billPayments.id, ref: billPayments.reference, amount: billPayments.amount, v: billPayments.vendorId })
+    .from(billPayments)
+    .where(eq(billPayments.companyId, c))) {
+    m.docs.set(r.id, `bill payment${r.ref ? ` #${r.ref}` : ''} of ${formatCurrency(r.amount)}${who(r.v)}`);
   }
   for (const r of await ctx.db
     .select({ id: vendorCredits.id, ref: vendorCredits.refNumber, total: vendorCredits.total, v: vendorCredits.vendorId })

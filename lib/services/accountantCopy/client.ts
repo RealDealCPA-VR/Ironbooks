@@ -102,6 +102,7 @@ import {
 } from './docs';
 import { applicationTargets, applyApplication, applyReconciliation, describeApplication, describeReconciliation, reconciliationBlocker } from './extras';
 import { addFileLabels, labelsOf, loadLabelMaps } from './labels';
+import { applicationKey, clientWorkConflicts } from './clientWork';
 import { resolveLineRef, type IdMap, type LineMap } from './lineRefs';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -626,6 +627,8 @@ async function currentRecordDay(
   }
   return (await recordStates(ctx, type, [id])).get(id)?.day ?? null;
 }
+
+const joinWords = (xs: string[]) => (xs.length <= 1 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
 
 const withArticle = (w: string) => `${/^[aeiou]/i.test(w) ? 'an' : 'a'} ${w}`;
 
@@ -1230,7 +1233,7 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       if (!row) problem = 'That journal entry credit is no longer applied in your file.';
     }
     items.push({
-      key: `application:${a.kind}:${a.op}:${a.id}:${a.kind === 'vendor_credit' ? a.billId : ''}`,
+      key: applicationKey(a),
       group: 'application',
       op: a.op,
       kind: 'Application',
@@ -1282,6 +1285,13 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       after: x.lines,
       problem,
     });
+  }
+
+  // The client's own work after the dividing date that the import would refuse to undo
+  // (reconciled lines, later payments / credits / deposits, balances already used).
+  const conflicts = await clientWorkConflicts(ctx, file, copy, L);
+  for (const it of items) {
+    if (!it.problem && conflicts.has(it.key)) it.problem = conflicts.get(it.key)!;
   }
 
   return {
@@ -1422,14 +1432,24 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
         },
       });
 
-      const wrap = (label: string, err: unknown): unknown => {
-        if (err instanceof ServiceError) {
-          // A record-locking conflict is explained in the message; drop its details so the app's
-          // "record changed - reload" dialog does not appear for a whole-file import.
-          const stale = Boolean((err.details as { staleVersion?: unknown } | undefined)?.staleVersion);
-          return new ServiceError(err.code, `Could not import the ${label}: ${err.message} Nothing was imported.`, stale ? { accountantCopyImport: true } : err.details);
+      const wrap = (label: string, thrown: unknown): unknown => {
+        if (!(thrown instanceof ServiceError)) return thrown;
+        let err: ServiceError = thrown;
+        // Name payments / sales receipts by label, never by id.
+        const used = (err.details as { alreadyDeposited?: unknown } | undefined)?.alreadyDeposited;
+        if (Array.isArray(used) && used.length) {
+          const names = used.map((id) => L.doc(id));
+          const one = names.length === 1;
+          err = new ServiceError(
+            err.code,
+            `Your ${joinWords(names)} ${one ? 'is' : 'are'} already in one of your deposits, so this deposit can't hold ${one ? 'it' : 'them'} too. ` +
+              `Remove ${one ? 'it' : 'them'} from your deposit (or void that deposit), then import again — or ask your accountant to take ${one ? 'it' : 'them'} out of this deposit.`,
+          );
         }
-        return err;
+        // A record-locking conflict is explained in the message; drop its details so the app's
+        // "record changed - reload" dialog does not appear for a whole-file import.
+        const stale = Boolean((err.details as { staleVersion?: unknown } | undefined)?.staleVersion);
+        return new ServiceError(err.code, `Could not import the ${label}: ${err.message} Nothing was imported.`, stale ? { accountantCopyImport: true } : err.details);
       };
 
       // 0. Record locking, before anything is applied: every form, name and item the file edits or
@@ -1766,6 +1786,18 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
           extraLines: p.extraLines.map((l) => ({ accountId: mapId(l.accountId), amount: l.amount, description: l.description })),
           cashBack: p.cashBack ? { accountId: mapId(p.cashBack.accountId), amount: p.cashBack.amount, memo: p.cashBack.memo } : null,
         };
+      }
+
+      // The client's own work after the dividing date the steps would run into: refuse up front, in
+      // the review's words (the client's record and the way out), before anything is applied.
+      const conflicts = await clientWorkConflicts(tx, file, copy, L);
+      if (conflicts.size) {
+        const stepLabel = new Map<string, string>();
+        for (const t of file.transactions) stepLabel.set(`${t.type}:${t.op}:${t.id}`, describeTxn(t));
+        for (const d of file.documents) stepLabel.set(`${d.type}:${d.op}:${d.id}`, docLabel(d));
+        for (const a of file.applications) stepLabel.set(applicationKey(a), `application "${describeApplication(a, L).title}"`);
+        const [key, text] = [...conflicts][0];
+        throw wrap(stepLabel.get(key) ?? 'change', new ServiceError('CONFLICT', text));
       }
 
       // Run the steps in that order. A step refused because something it depends on comes later in

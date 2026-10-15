@@ -309,7 +309,7 @@ async function journalPayload(ctx: ServiceContext, entry: typeof journalEntries.
   };
 }
 
-async function expensePayload(ctx: ServiceContext, id: string): Promise<ExpensePayload> {
+export async function expensePayload(ctx: ServiceContext, id: string): Promise<ExpensePayload> {
   const e = await getExpense(ctx, id);
   const total = String(e.total);
   return {
