@@ -25,6 +25,8 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
+import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api, ApiError } from '@/lib/client';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import {
@@ -419,6 +421,14 @@ export default function BillsPage() {
 
   // Line-grid keyboard ergonomics: Ctrl+Insert adds a line (same mode as the
   // last line), Ctrl+Delete removes the focused row, Enter moves down.
+  // Find-as-you-type pickers for the line grid (type a name or account number, then Tab).
+  const accountChoices: TypeaheadChoice[] = accounts.map((a) => ({ id: a.id, label: `${a.code} – ${a.name}`, terms: [a.code, a.name] }));
+  const itemChoices: TypeaheadChoice[] = items.map((it) => ({
+    id: it.id,
+    label: it.name,
+    hint: it.type === 'inventory' ? `${Number(it.quantityOnHand ?? 0)} on hand` : undefined,
+  }));
+
   const grid = useGridKeys({
     addRow: () => setLines((prev) => [...prev, emptyLine(prev[prev.length - 1]?.mode ?? 'expense')]),
     removeRow: removeLine,
@@ -832,20 +842,13 @@ export default function BillsPage() {
                     <>
                       {/* Item */}
                       <div className="flex-1 min-w-0">
-                        <Select
+                        <TypeaheadSelect
+                          aria-label={`Line ${idx + 1} item`}
+                          placeholder="Item…"
                           value={line.itemId}
-                          onChange={(e) => pickItem(idx, e.target.value)}
-                        >
-                          <option value="">Item…</option>
-                          {items.map((it) => (
-                            <option key={it.id} value={it.id}>
-                              {it.name}
-                              {it.type === 'inventory'
-                                ? ` (${Number(it.quantityOnHand ?? 0)} on hand)`
-                                : ''}
-                            </option>
-                          ))}
-                        </Select>
+                          onChange={(id) => pickItem(idx, id)}
+                          choices={itemChoices}
+                        />
                       </div>
 
                       {/* Qty */}
@@ -875,17 +878,13 @@ export default function BillsPage() {
                     <>
                       {/* Account */}
                       <div className="flex-1 min-w-0">
-                        <Select
+                        <TypeaheadSelect
+                          aria-label={`Line ${idx + 1} account`}
+                          placeholder="Account…"
                           value={line.accountId}
-                          onChange={(e) => updateLine(idx, { accountId: e.target.value })}
-                        >
-                          <option value="">Account…</option>
-                          {accounts.map((a) => (
-                            <option key={a.id} value={a.id}>
-                              {a.code} – {a.name}
-                            </option>
-                          ))}
-                        </Select>
+                          onChange={(id) => updateLine(idx, { accountId: id })}
+                          choices={accountChoices}
+                        />
                       </div>
 
                       {/* Description */}

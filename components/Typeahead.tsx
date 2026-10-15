@@ -10,11 +10,13 @@
  *   Esc             closes the list (and only the list — not the dialog or form around it)
  *
  * While the list is closed, Down / Up / Enter are left alone so line grids keep moving between
- * lines. The list is drawn with position: fixed so it is never clipped by scrolling tables.
+ * lines. With `allowFreeText` (a payee that may be one-time) nothing is highlighted while typing
+ * unless an entry matches exactly, so Enter keeps the typed text; Down picks the first entry.
+ * The list is drawn with position: fixed so it is never clipped by scrolling tables.
  */
 import * as React from 'react';
 import { Input } from '@/components/ui';
-import { type TypeaheadOption, filterTypeahead, moveHighlight } from '@/lib/typeahead';
+import { type TypeaheadOption, comboboxAria, filterTypeahead, initialHighlight, moveHighlight } from '@/lib/typeahead';
 
 export interface TypeaheadProps
   extends Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'onSelect' | 'type'> {
@@ -24,10 +26,15 @@ export interface TypeaheadProps
   /** Called after an option is chosen from the list. */
   onPick?: (option: TypeaheadOption) => void;
   maxResults?: number;
+  /**
+   * The typed text is a valid answer on its own (e.g. a one-time payee): don't pre-highlight a
+   * longer suggestion, so Enter / Tab keep what was typed.
+   */
+  allowFreeText?: boolean;
 }
 
 export const Typeahead = React.forwardRef<HTMLInputElement, TypeaheadProps>(function Typeahead(
-  { value, onChange, options, onPick, maxResults = 8, onKeyDown, onBlur, onFocus, className, ...rest },
+  { value, onChange, options, onPick, maxResults = 8, allowFreeText = false, onKeyDown, onBlur, onFocus, className, ...rest },
   ref,
 ) {
   const inputRef = React.useRef<HTMLInputElement | null>(null);
@@ -115,15 +122,14 @@ export const Typeahead = React.forwardRef<HTMLInputElement, TypeaheadProps>(func
         role="combobox"
         autoComplete="off"
         aria-autocomplete="list"
-        aria-expanded={expanded}
-        aria-controls={listId}
-        aria-activedescendant={expanded && active >= 0 ? optionId(active) : undefined}
+        {...comboboxAria(expanded, listId, active >= 0 ? optionId(active) : null)}
         className={className}
         value={value}
         onChange={(e) => {
-          onChange(e.target.value);
+          const text = e.target.value;
+          onChange(text);
           setOpen(true);
-          setActive(e.target.value.trim() ? 0 : -1);
+          setActive(initialHighlight(filterTypeahead(options, text, maxResults), text, allowFreeText));
         }}
         onFocus={onFocus}
         onBlur={(e) => {

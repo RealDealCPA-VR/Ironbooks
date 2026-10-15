@@ -294,6 +294,11 @@ export interface ResolveBatchInput {
 export interface ResolveBatchOptions {
   /** Company closing date ('YYYY-MM-DD'): rows on/before it get a warning. */
   closingDate?: string | null;
+  /**
+   * 1-based row number to print in messages for the 0-based input row i (default i + 1). The
+   * Batch Enter grid skips blank rows before resolving, so it maps back to the grid row number.
+   */
+  rowNumber?: (i: number) => number;
 }
 
 const didYouMean = (s: string | null) => (s ? ` Did you mean "${s}"?` : '');
@@ -307,6 +312,8 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
   const t = input.type;
   const needsBank = t === 'check' || t === 'deposit' || t === 'cc_charge' || t === 'cc_credit';
   const bank = input.bankAccountId ?? null;
+  /** 1-based row number shown in messages for 0-based input row i. */
+  const rn = opts.rowNumber ?? ((i: number) => i + 1);
   const closedWarning = (rowNo: number, date: string | null, warnings: string[]) => {
     if (date && opts.closingDate && date <= opts.closingDate) {
       warnings.push(`Row ${rowNo}: dated on or before the closing date (${opts.closingDate}) — saving needs the closing date password.`);
@@ -332,20 +339,20 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
       const warnings: string[] = [];
       const first = input.rows[g.idx[0]];
       const date = normalizeDate(first.date);
-      if (!date) errors.push(`Row ${g.idx[0] + 1}: date "${first.date ?? ''}" is not a valid date.`);
-      closedWarning(g.idx[0] + 1, date, warnings);
+      if (!date) errors.push(`Row ${rn(g.idx[0])}: date "${first.date ?? ''}" is not a valid date.`);
+      closedWarning(rn(g.idx[0]), date, warnings);
       const lines = g.idx.map((i) => {
         const r = input.rows[i];
         const accountId = r.account ? M.account(r.account) : null;
-        if (!accountId) errors.push(accountError(`Row ${i + 1}`, r.account));
+        if (!accountId) errors.push(accountError(`Row ${rn(i)}`, r.account));
         const debit = normalizeAmount(r.debit);
         const credit = normalizeAmount(r.credit);
-        if (r.debit && debit === null) errors.push(`Row ${i + 1}: debit "${r.debit}" is not a number.`);
-        if (r.credit && credit === null) errors.push(`Row ${i + 1}: credit "${r.credit}" is not a number.`);
-        if (subCent(debit) || subCent(credit)) errors.push(`Row ${i + 1}: ${SUB_CENT}`);
-        if (!debit && !credit) errors.push(`Row ${i + 1}: enter a debit or a credit.`);
+        if (r.debit && debit === null) errors.push(`Row ${rn(i)}: debit "${r.debit}" is not a number.`);
+        if (r.credit && credit === null) errors.push(`Row ${rn(i)}: credit "${r.credit}" is not a number.`);
+        if (subCent(debit) || subCent(credit)) errors.push(`Row ${rn(i)}: ${SUB_CENT}`);
+        if (!debit && !credit) errors.push(`Row ${rn(i)}: enter a debit or a credit.`);
         const classId = r.className ? M.className(r.className) : null;
-        if (r.className && !classId) errors.push(`Row ${i + 1}: class "${r.className}" was not found.${didYouMean(M.suggest('class', r.className))}`);
+        if (r.className && !classId) errors.push(`Row ${rn(i)}: class "${r.className}" was not found.${didYouMean(M.suggest('class', r.className))}`);
         // QB "Name" column: A/R lines need a customer and A/P lines a vendor; on other lines a
         // name that matches exactly one customer or vendor is attached too.
         let entity: { entityType: 'customer' | 'vendor'; entityId: string } | null = null;
@@ -356,15 +363,15 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
           const vend = M.vendor(name);
           if (side === 'ar') {
             if (cust) entity = { entityType: 'customer', entityId: cust };
-            else errors.push(`Row ${i + 1}: customer "${name}" was not found (an Accounts Receivable line needs a customer).${didYouMean(M.suggest('customer', name))}`);
+            else errors.push(`Row ${rn(i)}: customer "${name}" was not found (an Accounts Receivable line needs a customer).${didYouMean(M.suggest('customer', name))}`);
           } else if (side === 'ap') {
             if (vend) entity = { entityType: 'vendor', entityId: vend };
-            else errors.push(`Row ${i + 1}: vendor "${name}" was not found (an Accounts Payable line needs a vendor).${didYouMean(M.suggest('vendor', name))}`);
+            else errors.push(`Row ${rn(i)}: vendor "${name}" was not found (an Accounts Payable line needs a vendor).${didYouMean(M.suggest('vendor', name))}`);
           } else if (cust && !vend) entity = { entityType: 'customer', entityId: cust };
           else if (vend && !cust) entity = { entityType: 'vendor', entityId: vend };
         } else if (side) {
           errors.push(
-            `Row ${i + 1}: an Accounts ${side === 'ar' ? 'Receivable line needs a customer' : 'Payable line needs a vendor'} in the Name column.`,
+            `Row ${rn(i)}: an Accounts ${side === 'ar' ? 'Receivable line needs a customer' : 'Payable line needs a vendor'} in the Name column.`,
           );
         }
         return {
@@ -376,11 +383,11 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
           ...(entity ?? {}),
         };
       });
-      if (g.idx.length < 2) errors.push(`Row ${g.idx[0] + 1}: a journal entry needs at least two rows (use the same Ref on each row).`);
+      if (g.idx.length < 2) errors.push(`Row ${rn(g.idx[0])}: a journal entry needs at least two rows (use the same Ref on each row).`);
       const td = lines.reduce((s, l) => s.plus(Money.of(l.debit ?? 0)), Money.zero());
       const tc = lines.reduce((s, l) => s.plus(Money.of(l.credit ?? 0)), Money.zero());
       if (errors.length === 0 && !td.equals(tc)) {
-        errors.push(`Rows ${g.idx[0] + 1}–${g.idx[g.idx.length - 1] + 1}: debits (${td.toFixed(2)}) and credits (${tc.toFixed(2)}) must be equal.`);
+        errors.push(`Rows ${rn(g.idx[0])}–${rn(g.idx[g.idx.length - 1])}: debits (${td.toFixed(2)}) and credits (${tc.toFixed(2)}) must be equal.`);
       }
       jobs.push({
         rows: g.idx,
@@ -403,10 +410,10 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
   input.rows.forEach((r, i) => {
     const errors: string[] = [];
     const warnings: string[] = [];
-    const n = `Row ${i + 1}`;
+    const n = `Row ${rn(i)}`;
     const date = normalizeDate(r.date);
     if (!date) errors.push(`${n}: date "${r.date ?? ''}" is not a valid date.`);
-    closedWarning(i + 1, date, warnings);
+    closedWarning(rn(i), date, warnings);
     const accountId = r.account ? M.account(r.account) : null;
     if (!accountId) errors.push(accountError(n, r.account));
     else if (bank && accountId === bank) errors.push(`${n}: the account can't be the same as the ${t.startsWith('cc') ? 'credit card' : 'bank'} account.`);
@@ -499,4 +506,17 @@ export function messagesByRow(jobs: ResolvedBatchJob[]): Map<number, { errors: s
     for (const i of j.rows) out.set(i, { errors: j.errors, warnings: j.warnings });
   }
   return out;
+}
+
+/**
+ * Rewrite the leading "Row N:" / "Rows N–M:" of a message using rowNumber (N is 1-based in the
+ * message; rowNumber takes the 0-based input row). Used by the grid for server messages, which
+ * number rows by their position among the rows sent (blank grid rows are not sent).
+ */
+export function renumberRowMessage(text: string, rowNumber: (i: number) => number): string {
+  return text.replace(/^Rows? (\d+)(?:[–-](\d+))?:/, (_m, a: string, b: string | undefined) => {
+    const from = rowNumber(Number(a) - 1);
+    if (b === undefined) return `Row ${from}:`;
+    return `Rows ${from}–${rowNumber(Number(b) - 1)}:`;
+  });
 }

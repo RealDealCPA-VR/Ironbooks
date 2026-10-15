@@ -65,6 +65,7 @@ import {
   type BatchLookupLists,
   type ResolvedBatchJob,
   createBatchMatchers,
+  renumberRowMessage,
   resolveBatchRows,
 } from '@/lib/services/accountant/batchEnterMatch';
 import { BackToCenter } from '../_shared';
@@ -97,6 +98,8 @@ interface ReportLine {
 
 const START_ROWS = 10;
 const blank = blankKeyedRow;
+/** Types whose Name column takes any payee (a name not in the vendor list saves as a one-time payee). */
+const FREE_TEXT_NAME_TYPES: BatchEnterType[] = ['check', 'cc_charge', 'cc_credit', 'deposit'];
 const NEEDS_BANK: BatchEnterType[] = ['check', 'deposit', 'cc_charge', 'cc_credit'];
 const MONEY_COLS: BatchColumn[] = ['amount', 'debit', 'credit'];
 const DATE_COLS: BatchColumn[] = ['date', 'dueDate'];
@@ -154,6 +157,8 @@ export default function BatchEnterPage() {
   // ---- live row checks (same rules as the server) ----
   const matchers = useMemo(() => createBatchMatchers(lookups), [lookups]);
   const filledIdx = useMemo(() => rows.map((r, i) => (isBlankBatchRow(r) ? -1 : i)).filter((i) => i >= 0), [rows]);
+  /** Blank rows are skipped before checking, so messages are renumbered to the grid's # column. */
+  const gridRowNumber = useCallback((k: number) => (filledIdx[k] ?? k) + 1, [filledIdx]);
   const jobs: ResolvedBatchJob[] = useMemo(
     () =>
       filledIdx.length === 0
@@ -161,9 +166,9 @@ export default function BatchEnterPage() {
         : resolveBatchRows(
             { type, bankAccountId: NEEDS_BANK.includes(type) ? bankAccountId || null : null, rows: filledIdx.map((i) => rows[i]) },
             matchers,
-            { closingDate: lookups.closingDate },
+            { closingDate: lookups.closingDate, rowNumber: gridRowNumber },
           ),
-    [filledIdx, rows, type, bankAccountId, matchers, lookups.closingDate],
+    [filledIdx, rows, type, bankAccountId, matchers, lookups.closingDate, gridRowNumber],
   );
   /** Grid row index → its messages (job row indexes point into the filled rows). */
   const rowMessages = useMemo(() => {
@@ -285,7 +290,8 @@ export default function BatchEnterPage() {
       const lines: ReportLine[] = [];
       for (const r of res.results) {
         const gridRows = r.rows.map((k) => filledIdx[k]);
-        if (!r.ok) for (const g of gridRows) errs.set(g, r.errors);
+        const rowErrors = r.errors.map((e) => renumberRowMessage(e, gridRowNumber));
+        if (!r.ok) for (const g of gridRows) errs.set(g, rowErrors);
         if (r.ok && r.id && !res.rolledBack && !validateOnly) gridRows.forEach((g) => savedGridRows.add(g));
         const first = gridRows[0] + 1;
         lines.push({
@@ -295,7 +301,7 @@ export default function BatchEnterPage() {
             ? validateOnly || res.rolledBack
               ? 'Ready to save.'
               : `Saved${gridRows.length > 1 ? ` (rows ${first}–${gridRows[gridRows.length - 1] + 1})` : ''}.`
-            : r.errors.join(' '),
+            : rowErrors.join(' '),
         });
       }
       setReport(lines);
@@ -477,6 +483,7 @@ export default function BatchEnterPage() {
                             value={v}
                             onChange={(val) => setCell(i, c, val)}
                             options={c === 'account' ? accountOptions : c === 'name' ? nameOptions : classOptions}
+                            allowFreeText={c === 'name' && FREE_TEXT_NAME_TYPES.includes(type)}
                           />
                         );
                       } else if (MONEY_COLS.includes(c)) {

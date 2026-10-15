@@ -41,6 +41,8 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
+import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api, ApiError } from '@/lib/client';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import { Money, formatCurrency } from '@/lib/money';
@@ -308,6 +310,11 @@ function ExpensesPageContent() {
 
   // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
   const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: submitting });
+  // Find-as-you-type pickers for the line grid (type a name or account number, then Tab).
+  const lineAccountChoices: TypeaheadChoice[] = lineAccounts.map((a) => ({ id: a.id, label: `${a.code} – ${a.name}`, terms: [a.code, a.name] }));
+  const itemChoices: TypeaheadChoice[] = items.map((it) => ({ id: it.id, label: it.name, hint: it.type === 'inventory' ? 'stock' : undefined }));
+  const classChoices: TypeaheadChoice[] = classes.map((c) => ({ id: c.id, label: c.name }));
+  const customerChoices: TypeaheadChoice[] = customers.map((c) => ({ id: c.id, label: c.displayName }));
 
   // Ctrl+E / Quick Actions navigate here with ?new=1 — the entry form is always
   // visible, so jump focus to the start of it (the payee field).
@@ -762,27 +769,21 @@ function ExpensesPageContent() {
                 className="grid grid-cols-1 md:grid-cols-[2fr_2fr_1fr_1.5fr_1.5fr_24px] gap-2 items-start"
               >
                 {line.mode === 'item' ? (
-                  <Select value={line.itemId} onChange={(e) => pickItem(idx, e.target.value)} aria-label="Item">
-                    <option value="">Item…</option>
-                    {items.map((it) => (
-                      <option key={it.id} value={it.id}>
-                        {it.name}
-                        {it.type === 'inventory' ? ' (stock)' : ''}
-                      </option>
-                    ))}
-                  </Select>
+                  <TypeaheadSelect
+                    aria-label={`Line ${idx + 1} item`}
+                    placeholder="Item…"
+                    value={line.itemId}
+                    onChange={(id) => pickItem(idx, id)}
+                    choices={itemChoices}
+                  />
                 ) : (
-                  <Select
+                  <TypeaheadSelect
+                    aria-label={`Line ${idx + 1} account`}
+                    placeholder="Account…"
                     value={line.accountId}
-                    onChange={(e) => updateLine(idx, 'accountId', e.target.value)}
-                  >
-                    <option value="">Account…</option>
-                    {lineAccounts.map((a) => (
-                      <option key={a.id} value={a.id}>
-                        {a.code} – {a.name}
-                      </option>
-                    ))}
-                  </Select>
+                    onChange={(id) => updateLine(idx, 'accountId', id)}
+                    choices={lineAccountChoices}
+                  />
                 )}
 
                 {line.mode === 'item' ? (
@@ -821,32 +822,24 @@ function ExpensesPageContent() {
                 )}
 
                 {prefs.company.classTrackingEnabled || line.classId ? (
-                  <Select
+                  <TypeaheadSelect
+                    aria-label={`Line ${idx + 1} class`}
+                    placeholder="Class…"
                     value={line.classId}
-                    onChange={(e) => updateLine(idx, 'classId', e.target.value)}
-                  >
-                    <option value="">Class…</option>
-                    {classes.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </Select>
+                    onChange={(id) => updateLine(idx, 'classId', id)}
+                    choices={classChoices}
+                  />
                 ) : (
                   <span />
                 )}
 
-                <Select
+                <TypeaheadSelect
+                  aria-label={`Line ${idx + 1} customer`}
+                  placeholder="Customer…"
                   value={line.customerId}
-                  onChange={(e) => updateLine(idx, 'customerId', e.target.value)}
-                >
-                  <option value="">Customer…</option>
-                  {customers.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.displayName}
-                    </option>
-                  ))}
-                </Select>
+                  onChange={(id) => updateLine(idx, 'customerId', id)}
+                  choices={customerChoices}
+                />
 
                 <button
                   type="button"

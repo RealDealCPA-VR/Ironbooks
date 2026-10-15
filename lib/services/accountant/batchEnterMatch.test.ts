@@ -3,7 +3,9 @@
  * the service share these rules).
  */
 import { describe, it, expect } from 'vitest';
-import { closestLabel, closestMatcher, createBatchMatchers, editDistance, normName, messagesByRow, resolveBatchRows, type BatchLookupLists } from './batchEnterMatch';
+import { closestLabel, closestMatcher, createBatchMatchers, editDistance, normName, messagesByRow, renumberRowMessage, resolveBatchRows, type BatchLookupLists } from './batchEnterMatch';
+import { isBlankBatchRow } from './batchEnterParse';
+import type { BatchEnterRow } from './batchEnterParse';
 
 const lists: BatchLookupLists = {
   accounts: [
@@ -297,5 +299,64 @@ describe('amounts to the cent (review P2)', () => {
       M,
     );
     expect(je[0].errors).toEqual(['Row 1: amounts can have at most 2 decimals.', 'Row 2: amounts can have at most 2 decimals.']);
+  });
+});
+
+describe('row numbers match the grid when blank rows are skipped (review P2)', () => {
+  // Grid rows 1-2 blank, 3 filled, 4 blank (cleared), 5-6 filled — what the page resolves.
+  const grid: BatchEnterRow[] = [
+    { date: '', account: '' },
+    { date: ' ', account: '', memo: '   ' },
+    { date: 'not a date', name: 'Office Depot', account: '6300', amount: '5' },
+    { date: '', account: '' },
+    { date: '2026-03-01', name: 'Corner Shop', account: '9999', amount: '5' },
+    { date: '2026-03-01', name: 'Office Depot', account: '6300', amount: '5' },
+  ];
+  const filledIdx = grid.map((r, i) => (isBlankBatchRow(r) ? -1 : i)).filter((i) => i >= 0);
+  const rowNumber = (k: number) => filledIdx[k] + 1;
+
+  it('uses the custom rowNumber in every error and warning', () => {
+    expect(filledIdx).toEqual([2, 4, 5]);
+    const jobs = resolveBatchRows(
+      { type: 'check', bankAccountId: 'a1000', rows: filledIdx.map((i) => grid[i]) },
+      M,
+      { closingDate: '2026-03-31', rowNumber },
+    );
+    expect(jobs[0].errors).toEqual(['Row 3: date "not a date" is not a valid date.']);
+    expect(jobs[1].errors[0]).toMatch(/^Row 5: account "9999" was not found\./);
+    expect(jobs[1].warnings[0]).toMatch(/^Row 5: dated on or before the closing date/);
+    expect(jobs[1].warnings[1]).toMatch(/^Row 5: "Corner Shop" is not in your vendor list/);
+    expect(jobs[2].errors).toEqual([]);
+    expect(jobs[2].warnings[0]).toMatch(/^Row 6: /);
+    // Every message names its own grid row; none falls back to the filled-row position.
+    const all = jobs.flatMap((j) => [...j.errors, ...j.warnings]);
+    expect(all.some((m) => /^Rows? [12]/.test(m))).toBe(false);
+  });
+
+  it('renumbers journal "Rows N–M" and per-line messages', () => {
+    const je: BatchEnterRow[] = [
+      { date: '', account: '' },
+      { date: '2026-04-01', ref: 'J1', account: '6600', debit: '10' },
+      { date: '', account: '' },
+      { date: '2026-04-01', ref: 'J1', account: '1000', credit: '9' },
+    ];
+    const idx = je.map((r, i) => (isBlankBatchRow(r) ? -1 : i)).filter((i) => i >= 0);
+    const jobs = resolveBatchRows({ type: 'journal', rows: idx.map((i) => je[i]) }, M, { rowNumber: (k) => idx[k] + 1 });
+    expect(jobs[0].errors).toEqual(['Rows 2–4: debits (10.00) and credits (9.00) must be equal.']);
+  });
+
+  it('defaults to i + 1, so the server numbering is unchanged', () => {
+    const jobs = resolveBatchRows({ type: 'check', bankAccountId: 'a1000', rows: filledIdx.map((i) => grid[i]) }, M);
+    expect(jobs[0].errors).toEqual(['Row 1: date "not a date" is not a valid date.']);
+    expect(jobs[1].errors[0]).toMatch(/^Row 2: /);
+  });
+
+  it('renumberRowMessage rewrites the leading Row / Rows prefix of server messages', () => {
+    expect(renumberRowMessage('Row 2: the period is closed.', rowNumber)).toBe('Row 5: the period is closed.');
+    expect(renumberRowMessage('Rows 1–2: debits (1.00) and credits (2.00) must be equal.', rowNumber)).toBe(
+      'Rows 3–5: debits (1.00) and credits (2.00) must be equal.',
+    );
+    expect(renumberRowMessage('Rows 1-3: x', rowNumber)).toBe('Rows 3–6: x');
+    expect(renumberRowMessage('Nothing to renumber in Row 1: here', rowNumber)).toBe('Nothing to renumber in Row 1: here');
   });
 });
