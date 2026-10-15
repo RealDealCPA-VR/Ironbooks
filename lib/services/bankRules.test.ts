@@ -30,7 +30,7 @@ import {
 import type { ServiceContext } from './_base';
 import { ServiceError } from './_base';
 import { trialBalance } from './reports';
-import { categorize, unmatch } from './bankCategorize';
+import { categorize, categorizeSuggested, unmatch } from './bankCategorize';
 import {
   acceptOffer,
   createBankRule,
@@ -189,10 +189,10 @@ describe('bank rules that learn', () => {
 
     it('"No thanks" hides the offer for good', async () => {
       const offer = (await ruleOffers(ctx)).find((o) => o.pattern === 'UBER TRIP')!;
-      await dismissOffer(ctx, { pattern: offer.pattern, accountId: offer.accountId });
+      await dismissOffer(ctx, { pattern: offer.pattern, accountId: offer.accountId, direction: offer.direction });
       expect((await ruleOffers(ctx)).some((o) => o.pattern === 'UBER TRIP')).toBe(false);
       // Idempotent.
-      await dismissOffer(ctx, { pattern: offer.pattern, accountId: offer.accountId });
+      await dismissOffer(ctx, { pattern: offer.pattern, accountId: offer.accountId, direction: offer.direction });
     });
 
     it('accepting creates a learned rule, after which the offer disappears and the rule matches', async () => {
@@ -211,7 +211,7 @@ describe('bank rules that learn', () => {
 
     it('offers are per company', async () => {
       expect(await ruleOffers(other)).toEqual([]);
-      await expect(dismissOffer(other, { pattern: 'STAPLES', accountId: office })).rejects.toThrow(/does not exist/);
+      await expect(dismissOffer(other, { pattern: 'STAPLES', accountId: office, direction: 'out' })).rejects.toThrow(/does not exist/);
     });
   });
 
@@ -520,6 +520,110 @@ describe('bank rules that learn', () => {
     });
   });
 
+  describe('review fixes (round 3)', () => {
+    const newBank = async (n: string) =>
+      (await db.insert(bankAccounts).values({ companyId: ctx.companyId, accountId: checkingGl, bankName: `Bank ${n}`, accountNumber: n }).returning())[0].id;
+    const row = async (id: string) => (await db.select().from(bankTransactions).where(eq(bankTransactions.id, id)))[0];
+
+    it('"Add all suggested" only posts lines a live rule still gives, as source "rule" (never learning)', async () => {
+      const ba = await newBank('4401');
+      const live = await createBankRule(ctx, { name: 'Gizmo → Office', matchValue: 'gizmo mart', setAccountId: office, setClassId: classA });
+      const off = await createBankRule(ctx, { name: 'Widget → Fuel', matchValue: 'widget hub', setAccountId: fuel });
+      const g = await feed('GIZMO MART 0001', '-30.00', '2025-04-02', ba);
+      const w = await feed('WIDGET HUB 0001', '-31.00', '2025-04-02', ba);
+      const s = await feed('STALE THING 0001', '-32.00', '2025-04-02', ba);
+      // What the import-time rule pass left behind (the "stale thing" rule is long gone).
+      await db.update(bankTransactions).set({ suggestedAccountId: office }).where(eq(bankTransactions.id, g));
+      await db.update(bankTransactions).set({ suggestedAccountId: fuel }).where(eq(bankTransactions.id, w));
+      await db.update(bankTransactions).set({ suggestedAccountId: meals }).where(eq(bankTransactions.id, s));
+      // Switched off behind the service's back (e.g. the legacy rules API): no refresh ran.
+      await db.update(transactionRules).set({ enabled: false }).where(eq(transactionRules.id, off.id));
+
+      expect(await categorizeSuggested(ctx, ba)).toBe(1);
+      const gRow = await row(g);
+      expect(gRow.matched).toBe(true);
+      const [h] = await db.select().from(bankCategorizationHistory).where(eq(bankCategorizationHistory.bankTransactionId, g));
+      expect(h.source).toBe('rule');
+      expect(h.ruleId).toBe(live.id);
+      expect((await entryLines(gRow.matchedEntryId!)).find((l) => l.accountId === office)?.classId).toBe(classA);
+      expect((await getBankRule(ctx, live.id)).appliedCount).toBe(1);
+      // The disabled rule's line and the orphan line are skipped and their stale suggestion cleared.
+      for (const id of [w, s]) {
+        const r = await row(id);
+        expect(r.matched).toBe(false);
+        expect(r.suggestedAccountId).toBeNull();
+      }
+      await expectBalanced(ctx);
+      await expect(categorizeSuggested(other, ba)).rejects.toThrow(/not found/);
+    });
+
+    it('editing, switching off or deleting a rule re-checks the import-time suggestion of unreviewed lines', async () => {
+      const ba = await newBank('4402');
+      const rule = await createBankRule(ctx, { name: 'Sprocket → Meals', matchValue: 'sprocket co', setAccountId: meals });
+      const p = await feed('SPROCKET CO 0001', '-12.00', '2025-04-03', ba);
+      await db.update(bankTransactions).set({ suggestedAccountId: meals }).where(eq(bankTransactions.id, p));
+      await db.update(bankTransactions).set({ suggestedAccountId: otherAccount }).where(eq(bankTransactions.id, otherTxn));
+
+      await updateBankRule(ctx, rule.id, { setAccountId: office });
+      expect((await row(p)).suggestedAccountId).toBe(office);
+      await updateBankRule(ctx, rule.id, { enabled: false });
+      expect((await row(p)).suggestedAccountId).toBeNull();
+
+      await updateBankRule(ctx, rule.id, { enabled: true });
+      await db.update(bankTransactions).set({ suggestedAccountId: office }).where(eq(bankTransactions.id, p));
+      await deleteBankRule(ctx, rule.id);
+      expect((await row(p)).suggestedAccountId).toBeNull();
+      // Another company's lines are never touched.
+      expect((await row(otherTxn)).suggestedAccountId).toBe(otherAccount);
+      await db.update(bankTransactions).set({ suggestedAccountId: null }).where(eq(bankTransactions.id, otherTxn));
+    });
+
+    it('a rule limited to one bank account covers that account\'s choices: no duplicate general offer', async () => {
+      const baA = await newBank('4403');
+      const baB = await newBank('4404');
+      await createBankRule(ctx, { name: 'Acme fuel (A only)', matchValue: 'acme fuel', bankAccountId: baA, direction: 'out', setAccountId: fuel });
+      for (const n of ['0001', '0002']) {
+        await categorize(ctx, { bankTransactionId: await feed(`ACME FUEL ${n}`, '-20.00', '2025-04-04', baA), accountId: fuel });
+      }
+      expect((await ruleOffers(ctx)).some((o) => o.pattern === 'ACME FUEL')).toBe(false);
+      expect(await ruleOffers(ctx, { pattern: 'ACME FUEL' })).toEqual([]);
+      // Choices on another bank account are not covered by that rule and do count.
+      await categorize(ctx, { bankTransactionId: await feed('ACME FUEL 0003', '-21.00', '2025-04-04', baB), accountId: fuel });
+      expect((await ruleOffers(ctx)).some((o) => o.pattern === 'ACME FUEL')).toBe(false);
+      await categorize(ctx, { bankTransactionId: await feed('ACME FUEL 0004', '-22.00', '2025-04-04', baB), accountId: fuel });
+      const offer = (await ruleOffers(ctx)).find((o) => o.pattern === 'ACME FUEL')!;
+      expect(offer.count).toBe(2);
+    });
+
+    it('"No thanks" is per direction: dismissing money out leaves a money-in offer alone', async () => {
+      const ba = await newBank('4405');
+      for (const n of ['0001', '0002']) {
+        await categorize(ctx, { bankTransactionId: await feed(`REFUNDO SHOP ${n}`, '-15.00', '2025-04-05', ba), accountId: office });
+      }
+      const out = (await ruleOffers(ctx)).find((o) => o.pattern === 'REFUNDO SHOP')!;
+      expect(out.direction).toBe('out');
+      await dismissOffer(ctx, { pattern: out.pattern, accountId: out.accountId, direction: 'out' });
+      expect((await ruleOffers(ctx)).some((o) => o.pattern === 'REFUNDO SHOP')).toBe(false);
+
+      for (const n of ['0003', '0004']) {
+        await categorize(ctx, { bankTransactionId: await feed(`REFUNDO SHOP ${n}`, '15.00', '2025-04-05', ba), accountId: office });
+      }
+      const offers = (await ruleOffers(ctx)).filter((o) => o.pattern === 'REFUNDO SHOP');
+      expect(offers.map((o) => o.direction)).toEqual(['in']);
+      await dismissOffer(ctx, { pattern: 'REFUNDO SHOP', accountId: office, direction: 'in' });
+      expect((await ruleOffers(ctx)).some((o) => o.pattern === 'REFUNDO SHOP')).toBe(false);
+
+      const rows = await db
+        .select()
+        .from(bankRuleDismissals)
+        .where(and(eq(bankRuleDismissals.companyId, ctx.companyId), eq(bankRuleDismissals.pattern, 'REFUNDO SHOP')));
+      expect(rows.map((r) => r.direction).sort()).toEqual(['in', 'out']);
+      await expect(
+        dismissOffer(ctx, { pattern: 'REFUNDO SHOP', accountId: office, direction: 'sideways' as never }),
+      ).rejects.toThrow(/Direction/);
+    });
+  });
+
   describe('auto-apply rules', () => {
     it('posts lines whose first matching rule is in auto mode, through categorize', async () => {
       const rule = await createBankRule(ctx, {
@@ -572,13 +676,17 @@ describe('bank rules that learn', () => {
       .where(and(eq(bankCategorizationHistory.companyId, ctx.companyId), eq(bankCategorizationHistory.accountId, meals)));
     expect(before.length).toBeGreaterThan(0);
     // The same pattern dismissed for both accounts must not break the merge (unique index).
-    await dismissOffer(ctx, { pattern: 'DUP PATTERN', accountId: meals });
-    await dismissOffer(ctx, { pattern: 'DUP PATTERN', accountId: office });
-    await dismissOffer(ctx, { pattern: 'ONLY MEALS', accountId: meals });
+    await dismissOffer(ctx, { pattern: 'DUP PATTERN', accountId: meals, direction: 'out' });
+    await dismissOffer(ctx, { pattern: 'DUP PATTERN', accountId: office, direction: 'out' });
+    // Same pattern, other direction, only on the merged-away account: survives as its own row.
+    await dismissOffer(ctx, { pattern: 'DUP PATTERN', accountId: meals, direction: 'in' });
+    await dismissOffer(ctx, { pattern: 'ONLY MEALS', accountId: meals, direction: 'out' });
     await mergeAccounts(ctx, { fromId: meals, toId: office });
     const dismissals = await db.select().from(bankRuleDismissals).where(eq(bankRuleDismissals.companyId, ctx.companyId));
     expect(dismissals.some((d) => d.accountId === meals)).toBe(false);
-    expect(dismissals.filter((d) => d.pattern === 'DUP PATTERN').map((d) => d.accountId)).toEqual([office]);
+    expect(
+      dismissals.filter((d) => d.pattern === 'DUP PATTERN').map((d) => `${d.direction}:${d.accountId}`).sort(),
+    ).toEqual([`in:${office}`, `out:${office}`]);
     expect(dismissals.filter((d) => d.pattern === 'ONLY MEALS').map((d) => d.accountId)).toEqual([office]);
     const after = await db
       .select()

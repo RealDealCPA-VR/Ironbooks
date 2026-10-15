@@ -883,6 +883,8 @@ export const bankRuleDismissals = pgTable('bank_rule_dismissals', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   pattern: varchar('pattern', { length: 255 }).notNull(),
+  /** 'in' (money in) | 'out' (money out) — a money-out "No thanks" never hides a money-in offer. */
+  direction: varchar('direction', { length: 10 }).notNull(),
   accountId: uuid('account_id').notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

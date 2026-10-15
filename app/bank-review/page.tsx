@@ -27,7 +27,7 @@
  * "Add automatically" run when the account is opened.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { CheckCircle, CreditCard, Inbox, Link2, SlidersHorizontal, Sparkles } from 'lucide-react';
 import {
@@ -49,6 +49,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { mergePrefills } from '@/lib/bankRules/core';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -180,6 +181,9 @@ export default function BankReviewPage() {
 
   // Per-row state
   const [rowAccountId, setRowAccountId] = useState<Record<string, string>>({});
+  // Rows whose account / class picker the user set by hand: suggestions never overwrite those.
+  const touchedAccount = useRef<Set<string>>(new Set());
+  const touchedClass = useRef<Set<string>>(new Set());
   const [rowMode, setRowMode] = useState<Record<string, RowMode>>({});
   const [rowCandidates, setRowCandidates] = useState<Record<string, MatchCandidate[]>>({});
   const [rowCandidateId, setRowCandidateId] = useState<Record<string, string>>({});
@@ -241,18 +245,21 @@ export default function BankReviewPage() {
         `/api/bank-transactions/suggestions?bankAccountId=${bankAccountId}${ai ? '&ai=1' : ''}`,
       );
       const map: Record<string, LineSuggestion> = {};
-      const accts: Record<string, string> = {};
-      const cls: Record<string, string> = {};
+      // null = the server has nothing for this row (any older pre-fill on an untouched row goes).
+      const accts: Record<string, string | null> = {};
+      const cls: Record<string, string | null> = {};
       for (const sg of res.suggestions) {
         map[sg.bankTransactionId] = sg;
-        if (sg.accountId && (sg.source === 'rule' || sg.confidence >= 40)) accts[sg.bankTransactionId] = sg.accountId;
-        if (sg.classId) cls[sg.bankTransactionId] = sg.classId;
+        if (!sg.accountId) accts[sg.bankTransactionId] = null;
+        else if (sg.source === 'rule' || sg.confidence >= 40) accts[sg.bankTransactionId] = sg.accountId;
+        cls[sg.bankTransactionId] = sg.classId ?? null;
       }
       setSugg(map);
       setHighConfidence(res.highConfidence);
-      // Suggestions fill in rows the user has not touched yet (an AI re-ask may update them).
-      setRowAccountId((prev) => (ai ? { ...prev, ...accts } : { ...accts, ...prev }));
-      setRowClassId((prev) => ({ ...cls, ...prev }));
+      // The latest suggestion (rules as they are now) drives every row the user has not touched;
+      // an explicit AI re-ask may also update rows the user picked.
+      setRowAccountId((prev) => mergePrefills(prev, accts, touchedAccount.current, { overrideTouched: ai }));
+      setRowClassId((prev) => mergePrefills(prev, cls, touchedClass.current));
     } catch {
       setSugg({});
     }
@@ -267,12 +274,8 @@ export default function BankReviewPage() {
       );
       setTransactions(data);
 
-      // Pre-fill per-row account selections from suggestedAccountId.
-      const initialAccounts: Record<string, string> = {};
-      for (const txn of data) {
-        if (txn.suggestedAccountId) initialAccounts[txn.id] = txn.suggestedAccountId;
-      }
-      setRowAccountId((prev) => ({ ...initialAccounts, ...prev }));
+      // No pre-fill from txn.suggestedAccountId: it was written at import time and may come from a
+      // rule switched off since. The merged suggestions below re-check the live rules.
       setSelected(new Set());
 
       // bankrules: merged rule / history / AI suggestion with confidence for every row.
@@ -473,7 +476,11 @@ export default function BankReviewPage() {
         action: 'llm',
         bankTransactionId: txn.id,
       });
-      if (r.accountId) setRowAccountId((prev) => ({ ...prev, [txn.id]: r.accountId! }));
+      if (r.accountId) {
+        // The user asked for this row's answer: treat it as their pick.
+        touchedAccount.current.add(txn.id);
+        setRowAccountId((prev) => ({ ...prev, [txn.id]: r.accountId! }));
+      }
       setAiSugg((prev) => ({ ...prev, [txn.id]: { ...r, source: 'llm', autoApplyEligible: false } }));
       toast('AI suggestion selected — review it, then click Add.', 'info');
     } catch (err) {
@@ -580,7 +587,7 @@ export default function BankReviewPage() {
   async function handleOffer(o: RuleOffer, action: 'accept' | 'auto' | 'dismiss') {
     try {
       if (action === 'dismiss') {
-        await api.post('/api/bank-rules/offers', { action: 'dismiss', pattern: o.pattern, accountId: o.accountId });
+        await api.post('/api/bank-rules/offers', { action: 'dismiss', pattern: o.pattern, accountId: o.accountId, direction: o.direction });
       } else {
         await api.post('/api/bank-rules/offers', {
           action: 'accept',
@@ -592,7 +599,7 @@ export default function BankReviewPage() {
         toast(`Rule created: ${o.pattern} goes to ${o.accountName}.`, 'success');
         if (selectedBankAccountId) await fetchSuggestions(selectedBankAccountId);
       }
-      setOffers((prev) => prev.filter((x) => !(x.pattern === o.pattern && x.accountId === o.accountId)));
+      setOffers((prev) => prev.filter((x) => !(x.pattern === o.pattern && x.direction === o.direction && x.accountId === o.accountId)));
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not save that.', 'danger');
     }
@@ -719,9 +726,10 @@ export default function BankReviewPage() {
             <Select
               className="min-w-[180px]"
               value={rowAccountId[txn.id] ?? ''}
-              onChange={(e) =>
-                setRowAccountId((prev) => ({ ...prev, [txn.id]: e.target.value }))
-              }
+              onChange={(e) => {
+                touchedAccount.current.add(txn.id);
+                setRowAccountId((prev) => ({ ...prev, [txn.id]: e.target.value }));
+              }}
             >
               <option value="">Select account…</option>
               {allAccounts.map((a) => (
@@ -735,7 +743,10 @@ export default function BankReviewPage() {
                 aria-label="Class"
                 className="min-w-[120px] w-auto"
                 value={rowClassId[txn.id] ?? ''}
-                onChange={(e) => setRowClassId((prev) => ({ ...prev, [txn.id]: e.target.value }))}
+                onChange={(e) => {
+                  touchedClass.current.add(txn.id);
+                  setRowClassId((prev) => ({ ...prev, [txn.id]: e.target.value }));
+                }}
               >
                 <option value="">No class</option>
                 {classList.map((c) => (
@@ -811,7 +822,10 @@ export default function BankReviewPage() {
             <button
               type="button"
               className="text-electric underline"
-              onClick={() => setRowAccountId((prev) => ({ ...prev, [txn.id]: sg.accountId! }))}
+              onClick={() => {
+                touchedAccount.current.add(txn.id);
+                setRowAccountId((prev) => ({ ...prev, [txn.id]: sg.accountId! }));
+              }}
             >
               Use suggestion
             </button>
@@ -881,7 +895,6 @@ export default function BankReviewPage() {
         </span>
       );
     }
-    if (txn.suggestedAccountId) return <Badge tone="info">Suggested</Badge>;
     const sg = aiSugg[txn.id];
     if (sg && sg.accountId && sg.source !== 'rule' && sg.confidence >= 0.4) {
       const tone =
@@ -972,6 +985,8 @@ export default function BankReviewPage() {
                 onChange={(e) => {
                   setSelectedBankAccountId(e.target.value);
                   setRowAccountId({});
+                  touchedAccount.current = new Set();
+                  touchedClass.current = new Set();
                   setRowMode({});
                   setRowCandidates({});
                   setRowCandidateId({});

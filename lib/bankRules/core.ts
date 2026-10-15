@@ -428,3 +428,26 @@ function round4(n: number): number {
 
 /** Learning threshold: offer a rule once the same pattern went to the same place this many times. */
 export const LEARN_THRESHOLD = 2;
+
+/**
+ * Review screen pre-fill (account / class pickers). `suggested` is the latest merged suggestion
+ * per row (rules as they are now + history + AI): a string = pre-fill this, null = the server has
+ * no suggestion for the row any more. Rows the user has not touched always follow the latest
+ * suggestion — so an out-of-date pre-fill (e.g. from a rule switched off since) is replaced or
+ * cleared — while a user's own pick is kept unless `overrideTouched` (an explicit "Ask AI").
+ * Rows absent from `suggested` keep their current value.
+ */
+export function mergePrefills(
+  current: Readonly<Record<string, string>>,
+  suggested: Readonly<Record<string, string | null>>,
+  touched: ReadonlySet<string>,
+  opts: { overrideTouched?: boolean } = {},
+): Record<string, string> {
+  const next: Record<string, string> = { ...current };
+  for (const [id, value] of Object.entries(suggested)) {
+    if (touched.has(id) && !(opts.overrideTouched && value)) continue;
+    if (value) next[id] = value;
+    else delete next[id];
+  }
+  return next;
+}

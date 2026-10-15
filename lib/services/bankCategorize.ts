@@ -6,8 +6,8 @@
  *  2. `categorize` posts a GL journal entry and marks the transaction matched.
  *  3. `bulkApplyRules` runs active categorization rules against all unmatched transactions,
  *     writing suggestedAccountId where a rule fires (no GL posting yet).
- *  4. `categorizeSuggested` calls `categorize` for every unmatched txn that already has a
- *     suggestion — the "Auto-add" one-click batch.
+ *  4. `categorizeSuggested` calls `categorize` for every unmatched txn whose suggestion a live
+ *     rule still gives — the "Add all suggested" one-click batch.
  *  5. `unmatch` voids the GL entry and clears the matched flag (undo).
  *
  * IMPORTANT: GL writes happen ONLY through `postJournalEntry` (posting.ts).
@@ -33,7 +33,8 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { patternOf, splitError, type RuleSplit } from '@/lib/bankRules/core';
+import { patternOf, pickRule, splitError, type RuleSplit } from '@/lib/bankRules/core';
+import { activeBankRules, noteRuleApplied } from './bankRules';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { applyRulesToAccount } from './rules';
 import { accountSigned, foreignCurrencyOfAccount } from './fxLedger';
@@ -366,7 +367,7 @@ export async function bulkApplyRules(
 // ---------------------------------------------------------------------------
 
 /**
- * For every unmatched transaction that already has a suggestedAccountId, call
+ * For every unmatched transaction whose suggestedAccountId a currently enabled rule still gives, call
  * `categorize` so it gets posted to the GL. Returns the count of categorized rows.
  */
 export async function categorizeSuggested(
@@ -395,14 +396,36 @@ export async function categorizeSuggested(
       ),
     );
 
+  // bankrules: suggestedAccountId was written by the rule pass at import time. Only post a line
+  // when a rule that is live NOW still puts it in that account — a rule switched off, deleted or
+  // edited since must not keep posting. These posts are the rule's doing, not a person's choice,
+  // so they are recorded as source 'rule' (never counted towards learning offers).
+  const rules = await activeBankRules(ctx);
   let count = 0;
   for (const txn of candidates) {
     if (!txn.suggestedAccountId) continue;
+    const rule = pickRule(rules, txn);
+    if (!rule || rule.setAccountId !== txn.suggestedAccountId || (rule.splits && rule.splits.length > 0)) {
+      // Stale import-time suggestion: bring it in line with the live rules and skip the line.
+      const live = rule?.setAccountId ?? null;
+      await ctx.db
+        .update(bankTransactions)
+        .set({ suggestedAccountId: live })
+        .where(and(eq(bankTransactions.id, txn.id), eq(bankTransactions.companyId, ctx.companyId)));
+      continue;
+    }
     try {
-      await categorize(ctx, {
-        bankTransactionId: txn.id,
-        accountId: txn.suggestedAccountId,
-        source: 'bulk',
+      await inTransaction(ctx, async (tx) => {
+        await categorize(tx, {
+          bankTransactionId: txn.id,
+          accountId: rule.setAccountId!,
+          classId: rule.setClassId ?? null,
+          payee: rule.setPayee ?? null,
+          memo: rule.setMemo ?? null,
+          source: 'rule',
+          ruleId: rule.id,
+        });
+        await noteRuleApplied(tx, rule.id);
       });
       count += 1;
     } catch (err) {

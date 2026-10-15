@@ -16,7 +16,7 @@
  *
  * Every query is scoped by ctx.companyId; every referenced id is checked with assertRefInCompany.
  */
-import { and, desc, eq, gte, inArray, max, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, max, sql } from 'drizzle-orm';
 import {
   accounts,
   bankAccounts,
@@ -295,6 +295,7 @@ export async function updateBankRule(
       .returning();
     if (!row) throw notFound('Rule');
     await writeAudit(tx, { action: 'update', entityType: 'transaction_rule', entityId: id, oldValues: before, newValues: row });
+    await refreshStaleSuggestions(tx);
     return row;
   });
 }
@@ -321,7 +322,49 @@ export async function deleteBankRule(ctx: ServiceContext, id: string): Promise<v
       .set({ isActive: false, enabled: false, updatedAt: new Date() })
       .where(and(eq(transactionRules.id, id), eq(transactionRules.companyId, tx.companyId)));
     await writeAudit(tx, { action: 'delete', entityType: 'transaction_rule', entityId: id, oldValues: before, newValues: { isActive: false } });
+    await refreshStaleSuggestions(tx);
   });
+}
+
+/**
+ * Re-check the import-time suggestion (bank_transactions.suggested_account_id, written by the
+ * rule pass at import / "Apply rules") of every unreviewed line against the rules as they are
+ * NOW. Called after a rule is edited, switched off or deleted, so a rule that no longer fires
+ * cannot keep pre-filling the review screen or feeding "Add all suggested". A line whose current
+ * winning rule gives another account is moved to it; a line no live rule covers is cleared.
+ * Returns the number of lines changed.
+ */
+export async function refreshStaleSuggestions(ctx: ServiceContext, opts: { bankAccountId?: string } = {}): Promise<number> {
+  const conds = [
+    eq(bankTransactions.companyId, ctx.companyId),
+    eq(bankTransactions.matched, false),
+    isNotNull(bankTransactions.suggestedAccountId),
+  ];
+  if (opts.bankAccountId) conds.push(eq(bankTransactions.bankAccountId, opts.bankAccountId));
+  const lines = await ctx.db
+    .select({
+      id: bankTransactions.id,
+      description: bankTransactions.description,
+      payee: bankTransactions.payee,
+      amount: bankTransactions.amount,
+      bankAccountId: bankTransactions.bankAccountId,
+      suggestedAccountId: bankTransactions.suggestedAccountId,
+    })
+    .from(bankTransactions)
+    .where(and(...conds));
+  if (lines.length === 0) return 0;
+  const rules = await activeBankRules(ctx);
+  let changed = 0;
+  for (const t of lines) {
+    const live = pickRule(rules, t)?.setAccountId ?? null;
+    if (live === t.suggestedAccountId) continue;
+    await ctx.db
+      .update(bankTransactions)
+      .set({ suggestedAccountId: live })
+      .where(and(eq(bankTransactions.id, t.id), eq(bankTransactions.companyId, ctx.companyId)));
+    changed += 1;
+  }
+  return changed;
 }
 
 /**
@@ -447,6 +490,7 @@ export const LEARNING_SOURCES = ['user', 'bulk'] as const;
 
 export interface HistoryRow {
   pattern: string;
+  bankAccountId: string;
   direction: string;
   accountId: string;
   classId: string | null;
@@ -473,6 +517,7 @@ export async function loadHistory(
   return ctx.db
     .select({
       pattern: bankCategorizationHistory.pattern,
+      bankAccountId: bankCategorizationHistory.bankAccountId,
       direction: bankCategorizationHistory.direction,
       accountId: bankCategorizationHistory.accountId,
       classId: bankCategorizationHistory.classId,
@@ -521,14 +566,38 @@ export async function ruleOffers(ctx: ServiceContext, opts: { pattern?: string }
   });
   if (history.length === 0) return [];
 
+  const rules = await activeBankRules(ctx);
+  // Is (pattern, direction) already handled by a live rule on this bank account? A rule limited
+  // to one bank account only covers that account's lines, so coverage is checked per bank
+  // account. Probe with the pattern itself as the description (amount bounds ignored).
+  const probeRules = rules.map((r) => ({ ...r, amountMin: null, amountMax: null }));
+  const coveredCache = new Map<string, boolean>();
+  const isCovered = (pattern: string, direction: 'in' | 'out', bankAccountId: string): boolean => {
+    const key = `${pattern}|${direction}|${bankAccountId}`;
+    let hit = coveredCache.get(key);
+    if (hit === undefined) {
+      hit = !!pickRule(probeRules, {
+        description: pattern,
+        payee: null,
+        amount: direction === 'in' ? '1.00' : '-1.00',
+        bankAccountId,
+      });
+      coveredCache.set(key, hit);
+    }
+    return hit;
+  };
+
   type Group = { pattern: string; direction: 'in' | 'out'; accountId: string; classId: string | null; payees: Set<string | null>; count: number };
   const groups = new Map<string, Group>();
   for (const h of history) {
     if (h.split || !h.pattern) continue;
-    const key = `${h.pattern}|${h.direction}|${h.accountId}|${h.classId ?? ''}`;
+    const dir: 'in' | 'out' = h.direction === 'in' ? 'in' : 'out';
+    // Choices on a bank account that a rule already covers do not count towards a new offer.
+    if (isCovered(h.pattern, dir, h.bankAccountId)) continue;
+    const key = `${h.pattern}|${dir}|${h.accountId}|${h.classId ?? ''}`;
     const g = groups.get(key) ?? {
       pattern: h.pattern,
-      direction: h.direction === 'in' ? 'in' : 'out',
+      direction: dir,
       accountId: h.accountId,
       classId: h.classId,
       payees: new Set<string | null>(),
@@ -542,11 +611,10 @@ export async function ruleOffers(ctx: ServiceContext, opts: { pattern?: string }
   if (eligible.length === 0) return [];
 
   const dismissed = await ctx.db
-    .select({ pattern: bankRuleDismissals.pattern, accountId: bankRuleDismissals.accountId })
+    .select({ pattern: bankRuleDismissals.pattern, direction: bankRuleDismissals.direction, accountId: bankRuleDismissals.accountId })
     .from(bankRuleDismissals)
     .where(eq(bankRuleDismissals.companyId, ctx.companyId));
-  const dismissedKeys = new Set(dismissed.map((d) => `${d.pattern}|${d.accountId}`));
-  const rules = await activeBankRules(ctx);
+  const dismissedKeys = new Set(dismissed.map((d) => `${d.pattern}|${d.direction}|${d.accountId}`));
 
   const acctIds = [...new Set(eligible.map((g) => g.accountId))];
   const acctRows = await ctx.db
@@ -568,18 +636,11 @@ export async function ruleOffers(ctx: ServiceContext, opts: { pattern?: string }
   for (const g of eligible.sort((a, b) => b.count - a.count)) {
     const acct = acctById.get(g.accountId);
     if (!acct || !acct.isActive) continue;
-    if (dismissedKeys.has(`${g.pattern}|${g.accountId}`)) continue;
+    if (dismissedKeys.has(`${g.pattern}|${g.direction}|${g.accountId}`)) continue;
     // One offer per pattern + direction (the most frequent choice).
     const pkey = `${g.pattern}|${g.direction}`;
     if (seenPattern.has(pkey)) continue;
     seenPattern.add(pkey);
-    // Already covered by a rule? (probe with the pattern itself as the description)
-    const probeAmount = g.direction === 'in' ? '1.00' : '-1.00';
-    const covering = pickRule(
-      rules.map((r) => ({ ...r, amountMin: null, amountMax: null })),
-      { description: g.pattern, payee: null, amount: probeAmount, bankAccountId: null },
-    );
-    if (covering) continue;
     const payee = g.payees.size === 1 ? [...g.payees][0] : null;
     const className = g.classId ? classById.get(g.classId) ?? null : null;
     offers.push({
@@ -643,21 +704,29 @@ export async function acceptOffer(
   return createBankRule(ctx, { ...offer.rule, mode: input.mode ?? 'suggest' });
 }
 
-/** "No thanks" on a learning offer: never offer this pattern → account again. */
-export async function dismissOffer(ctx: ServiceContext, input: { pattern: string; accountId: string }): Promise<void> {
+/**
+ * "No thanks" on a learning offer: never offer this pattern → account again in the same
+ * direction (dismissing a money-out offer leaves a later money-in offer for the pattern alone).
+ */
+export async function dismissOffer(
+  ctx: ServiceContext,
+  input: { pattern: string; accountId: string; direction: 'in' | 'out' },
+): Promise<void> {
   const pattern = (input.pattern ?? '').trim().slice(0, MAX_TEXT);
   if (!pattern) throw validation('Pattern is required.');
+  const direction = input.direction;
+  if (direction !== 'in' && direction !== 'out') throw validation('Direction must be "in" or "out".');
   await assertRefInCompany(ctx, accounts, input.accountId, 'Account');
   await inTransaction(ctx, async (tx) => {
     await tx.db
       .insert(bankRuleDismissals)
-      .values({ companyId: tx.companyId, pattern, accountId: input.accountId })
+      .values({ companyId: tx.companyId, pattern, direction, accountId: input.accountId })
       .onConflictDoNothing();
     await writeAudit(tx, {
       action: 'create',
       entityType: 'bank_rule_dismissal',
       entityId: input.accountId,
-      newValues: { pattern, accountId: input.accountId },
+      newValues: { pattern, direction, accountId: input.accountId },
     });
   });
 }
@@ -686,8 +755,8 @@ export async function repointBankRuleAccount(ctx: ServiceContext, fromId: string
       .where(and(eq(bankCategorizationHistory.companyId, ctx.companyId), eq(bankCategorizationHistory.accountId, fromId)))
       .returning({ id: bankCategorizationHistory.id })
   ).length;
-  // A pattern dismissed for BOTH accounts would collide on bank_rule_dismissals_uq once
-  // repointed: drop the old account's duplicate first (the surviving dismissal still applies).
+  // A pattern + direction dismissed for BOTH accounts would collide on bank_rule_dismissals_uq
+  // once repointed: drop the old account's duplicate first (the surviving dismissal still applies).
   touched += (
     await ctx.db
       .delete(bankRuleDismissals)
@@ -695,7 +764,7 @@ export async function repointBankRuleAccount(ctx: ServiceContext, fromId: string
         and(
           eq(bankRuleDismissals.companyId, ctx.companyId),
           eq(bankRuleDismissals.accountId, fromId),
-          sql`exists (select 1 from bank_rule_dismissals e where e.company_id = ${ctx.companyId} and e.pattern = ${bankRuleDismissals.pattern} and e.account_id = ${toId})`,
+          sql`exists (select 1 from bank_rule_dismissals e where e.company_id = ${ctx.companyId} and e.pattern = ${bankRuleDismissals.pattern} and e.direction = ${bankRuleDismissals.direction} and e.account_id = ${toId})`,
         ),
       )
       .returning({ id: bankRuleDismissals.id })

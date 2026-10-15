@@ -289,16 +289,16 @@ export default function BankRulesPage() {
     });
 
   const acceptOffer = (o: Offer, mode: 'suggest' | 'auto') =>
-    run(`offer-${o.pattern}-${o.accountId}`, async () => {
+    run(`offer-${o.pattern}-${o.direction}-${o.accountId}`, async () => {
       await api.post('/api/bank-rules/offers', { action: 'accept', pattern: o.pattern, accountId: o.accountId, direction: o.direction, mode });
       toast(`Rule created: ${o.pattern} → ${o.accountName}.`, 'success');
       await load();
     });
 
   const dismissOffer = (o: Offer) =>
-    run(`offer-${o.pattern}-${o.accountId}`, async () => {
-      await api.post('/api/bank-rules/offers', { action: 'dismiss', pattern: o.pattern, accountId: o.accountId });
-      setOffers((prev) => prev.filter((x) => !(x.pattern === o.pattern && x.accountId === o.accountId)));
+    run(`offer-${o.pattern}-${o.direction}-${o.accountId}`, async () => {
+      await api.post('/api/bank-rules/offers', { action: 'dismiss', pattern: o.pattern, accountId: o.accountId, direction: o.direction });
+      setOffers((prev) => prev.filter((x) => !(x.pattern === o.pattern && x.direction === o.direction && x.accountId === o.accountId)));
     });
 
   async function confirmDelete() {
@@ -426,7 +426,7 @@ export default function BankRulesPage() {
           <p className="text-sm text-navy/50 mb-4">You put these bank lines in the same place more than once.</p>
           <ul className="divide-y divide-slate-100">
             {offers.map((o) => {
-              const key = `offer-${o.pattern}-${o.accountId}`;
+              const key = `offer-${o.pattern}-${o.direction}-${o.accountId}`;
               return (
                 <li key={`${o.pattern}|${o.direction}|${o.accountId}`} className="py-3 flex flex-wrap items-center gap-3">
                   <div className="flex-1 min-w-[240px]">

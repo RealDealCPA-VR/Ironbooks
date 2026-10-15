@@ -14,7 +14,7 @@
 --   updated_at        record version for optimistic locking of rule edits
 -- bank_categorization_history: every bank-feed line categorized through categorize(), with the
 --   normalized description pattern — powers "you chose Fuel 5 times" and the learning offers.
--- bank_rule_dismissals: patterns the user said "don't ask again" for.
+-- bank_rule_dismissals: (pattern, money in/out, account) offers the user said "don't ask again" for.
 ALTER TABLE "transaction_rules" ADD COLUMN IF NOT EXISTS "bank_account_id" uuid;
 --> statement-breakpoint
 ALTER TABLE "transaction_rules" ADD COLUMN IF NOT EXISTS "direction" varchar(10) DEFAULT 'any' NOT NULL;
@@ -68,8 +68,9 @@ CREATE TABLE IF NOT EXISTS "bank_rule_dismissals" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"company_id" uuid NOT NULL REFERENCES "companies"("id"),
 	"pattern" varchar(255) NOT NULL,
+	"direction" varchar(10) NOT NULL,
 	"account_id" uuid NOT NULL,
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "bank_rule_dismissals_uq" ON "bank_rule_dismissals" ("company_id", "pattern", "account_id");
+CREATE UNIQUE INDEX IF NOT EXISTS "bank_rule_dismissals_uq" ON "bank_rule_dismissals" ("company_id", "pattern", "direction", "account_id");

@@ -160,6 +160,17 @@ describe('bank rules API', () => {
     as(ownerA, 'GET', '/api/bank-rules/offers', companyA);
     expect((await (await offersGET()).json()).offers).toHaveLength(1);
     as(ownerA, 'POST', '/api/bank-rules/offers', companyA);
+    // "No thanks" must say which direction it is for.
+    const noDir = await offersPOST(req('POST', '/api/bank-rules/offers', { action: 'dismiss', pattern: 'SHELL OIL', accountId: fuel }));
+    expect(noDir.status).toBe(400);
+    // Dismissing the money-in side leaves the money-out offer in place.
+    const inDismissed = await offersPOST(
+      req('POST', '/api/bank-rules/offers', { action: 'dismiss', pattern: 'SHELL OIL', accountId: fuel, direction: 'in' }),
+    );
+    expect(inDismissed.status).toBe(200);
+    as(ownerA, 'GET', '/api/bank-rules/offers', companyA);
+    expect((await (await offersGET()).json()).offers).toHaveLength(1);
+    as(ownerA, 'POST', '/api/bank-rules/offers', companyA);
     const created = await offersPOST(
       req('POST', '/api/bank-rules/offers', { action: 'accept', pattern: 'SHELL OIL', accountId: fuel, direction: 'out', mode: 'auto' }),
     );

@@ -61,7 +61,12 @@ export const offerActionSchema = z.discriminatedUnion('action', [
     direction: z.enum(['in', 'out']),
     mode: z.enum(['suggest', 'auto']).optional(),
   }),
-  z.object({ action: z.literal('dismiss'), pattern: z.string().min(1).max(255), accountId: uuid }),
+  z.object({
+    action: z.literal('dismiss'),
+    pattern: z.string().min(1).max(255),
+    accountId: uuid,
+    direction: z.enum(['in', 'out']),
+  }),
 ]);
 
 const bulkItemSchema = z.object({

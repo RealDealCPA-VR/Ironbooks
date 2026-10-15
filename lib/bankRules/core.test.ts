@@ -7,6 +7,7 @@ import {
   AI_CONFIDENCE_CAP,
   combineSignals,
   globMatch,
+  mergePrefills,
   historyConfidence,
   normalizeDescription,
   patternOf,
@@ -219,5 +220,29 @@ describe('confidence math', () => {
     expect(ai.confidence).toBe(Math.round(AI_CONFIDENCE_CAP * 100));
     expect(ai.confidence).toBeLessThan(90);
     expect(combineSignals([])).toBeNull();
+  });
+});
+
+describe('mergePrefills (review screen pickers)', () => {
+  it('the latest suggestion replaces or clears an untouched pre-fill (stale rule account)', () => {
+    const current = { a: 'fuel-from-old-rule', b: 'meals', c: 'kept' };
+    const next = mergePrefills(current, { a: null, b: 'office' }, new Set());
+    expect(next).toEqual({ b: 'office', c: 'kept' });
+    // Input is not mutated.
+    expect(current.a).toBe('fuel-from-old-rule');
+  });
+
+  it('a row the user picked by hand is never overwritten by a refresh', () => {
+    const next = mergePrefills({ a: 'user-pick', b: 'x' }, { a: 'office', b: null }, new Set(['a', 'b']));
+    expect(next).toEqual({ a: 'user-pick', b: 'x' });
+  });
+
+  it('an explicit AI re-ask may update touched rows, but never clears them', () => {
+    const next = mergePrefills({ a: 'user-pick', b: 'x' }, { a: 'office', b: null }, new Set(['a', 'b']), { overrideTouched: true });
+    expect(next).toEqual({ a: 'office', b: 'x' });
+  });
+
+  it('fills empty rows', () => {
+    expect(mergePrefills({}, { a: 'fuel' }, new Set())).toEqual({ a: 'fuel' });
   });
 });
