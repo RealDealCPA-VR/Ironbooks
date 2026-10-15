@@ -574,7 +574,14 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
           return await fn();
         } catch (err) {
           if (err instanceof ServiceError) {
-            throw new ServiceError(err.code, `Could not import the ${label}: ${err.message} Nothing was imported.`, err.details);
+            // A record-locking conflict is explained in the message; drop its details so the app's
+            // "record changed - reload" dialog does not appear for a whole-file import.
+            const stale = Boolean((err.details as { staleVersion?: unknown } | undefined)?.staleVersion);
+            throw new ServiceError(
+              err.code,
+              `Could not import the ${label}: ${err.message} Nothing was imported.`,
+              stale ? { accountantCopyImport: true } : err.details,
+            );
           }
           throw err;
         }

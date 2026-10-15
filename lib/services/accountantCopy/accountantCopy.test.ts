@@ -277,8 +277,23 @@ describe("Accountant's Copy", () => {
     const adb2 = await getDb(ACCT_DIR2);
     const actx2: ServiceContext = { db: adb2, companyId: ctx.companyId, userId: ctx.userId };
     await createManualEntry(actx2, je('2026-04-20', acct['6300'], acct['1000'], '7.00', 'Late adjustment'));
+    await updateAccount(actx2, acct['6100'], { name: 'Bank Charges' });
+    // The accountant's copy can't start or cancel copies of its own.
+    await expect(createAccountantCopy(actx2, { dividingDate: '2026-04-30', dataDir: ACCT_DIR2 })).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(cancelAccountantCopy(actx2)).rejects.toMatchObject({ code: 'CONFLICT' });
     const late = await exportChangesFile(actx2, {});
     await closeDb(ACCT_DIR2);
+
+    // Record locking: the client renamed the same (unused) account meanwhile -> the review flags it
+    // and the import is refused as a whole (nothing applied).
+    await updateAccount(ctx, acct['6100'], { name: 'Bank Fees (client)' });
+    const review = await reviewChangesFile(ctx, late.buffer);
+    expect(review.canImport).toBe(false);
+    expect(review.items.find((i) => i.kind === 'Account')?.problem).toMatch(/changed in your file/);
+    await expect(importChangesFile(ctx, late.buffer)).rejects.toMatchObject({ code: 'CONFLICT' });
+    const lateRows = await db.select().from(journalEntries).where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.description, 'Late adjustment')));
+    expect(lateRows).toHaveLength(0);
+    expect((await accountantCopyStatus(ctx)).mode).toBe('client');
 
     // ...but the client cancels the copy first.
     const cancelled = await cancelAccountantCopy(ctx);
