@@ -335,6 +335,15 @@ export default function ErrorsPage() {
     fetchDetections();
   }, [fetchDetections]);
 
+  // Deep link (Needs attention > See the fix): ?focus=<detection id> opens that finding.
+  useEffect(() => {
+    const focus = new URLSearchParams(window.location.search).get('focus');
+    if (focus) {
+      setFilter('open');
+      setExpandedId(focus);
+    }
+  }, []);
+
   const handleRunReview = async () => {
     setRunning(true);
     try {

@@ -248,6 +248,24 @@ export default function PayBillsPage() {
     loadVendorData(vendorId);
   }, [vendorId, loadVendorData]);
 
+  // Deep link (Needs attention > Pay): ?vendor=<id>&bill=<id> opens that vendor with the bill
+  // already ticked for payment.
+  const [pendingBillId, setPendingBillId] = useState<string | null>(null);
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    const v = q.get('vendor');
+    if (v) setVendorId(v);
+    setPendingBillId(q.get('bill'));
+  }, []);
+  useEffect(() => {
+    if (!pendingBillId || loadingBills) return;
+    const bill = bills.find((b) => b.id === pendingBillId);
+    if (!bill) return;
+    setPendingBillId(null);
+    if (!rows[bill.id]?.checked) toggleBill(bill);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingBillId, bills, loadingBills]);
+
   const billCurrency = bills.find((b) => b.currency)?.currency ?? null;
 
   // ── derived ───────────────────────────────────────────────────────────────

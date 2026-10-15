@@ -157,6 +157,16 @@ function StartForm({
   const [undoing, setUndoing] = useState(false);
   const [confirmUndo, setConfirmUndo] = useState(false);
 
+  // Deep link (Needs attention > Reconcile): ?account=<bank account id>&through=YYYY-MM-DD picks
+  // the account and the statement date.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    const account = q.get('account');
+    const through = q.get('through');
+    if (account && bankAccounts.some((b) => b.id === account)) setBankAccountId(account);
+    if (through && /^\d{4}-\d{2}-\d{2}$/.test(through)) setStatementDate(through);
+  }, [bankAccounts]);
+
   // Load Begin-Reconciliation info (beginning balance, last reconciled,
   // discrepancy check) whenever the selected bank account changes.
   useEffect(() => {
@@ -953,8 +963,10 @@ export default function ReconcilePage() {
       ]);
       setBankAccounts(bas);
       setReconciliations(recons);
-      // Auto-resume if there is exactly one in-progress reconciliation.
-      const inProgress = recons.find((r) => r.status === 'in_progress');
+      // Auto-resume if there is exactly one in-progress reconciliation (for the account named by
+      // a ?account= deep link, when there is one).
+      const wanted = new URLSearchParams(window.location.search).get('account');
+      const inProgress = recons.find((r) => r.status === 'in_progress' && (!wanted || r.bankAccountId === wanted));
       if (inProgress && !activeRecon) {
         setActiveRecon(inProgress);
       }

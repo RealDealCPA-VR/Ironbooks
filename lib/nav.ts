@@ -35,6 +35,7 @@ import { Bookmark, LineChart, Grid3x3, Search } from 'lucide-react'; // wave2 re
 import { Bell, CalendarDays, Contact, Mail, LayoutTemplate } from 'lucide-react';
 // p1 ux: Simple mode
 import { Home, PenLine, FilePlus2 } from 'lucide-react';
+import { Inbox } from 'lucide-react'; // team home: Needs attention inbox
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -60,6 +61,7 @@ export const navGroups: NavGroup[] = [
     heading: '',
     links: [
       { icon: PieChart, label: 'Home', path: '/dashboard', qb: 'Home page', keywords: 'dashboard start overview' },
+      { icon: Inbox, label: 'Needs attention', path: '/attention', qb: 'Company Snapshot alerts', keywords: 'inbox alerts urgent caught up' },
       { icon: ClipboardCheck, label: 'To Do list', path: '/todos', qb: 'To Do List', keywords: 'task reminder call follow up' },
     ],
   },
@@ -224,6 +226,7 @@ export const simpleNavGroups: NavGroup[] = [
     heading: '',
     links: [
       { icon: Home, label: 'Home', path: '/dashboard', qb: 'Home page', keywords: 'dashboard start' },
+      { icon: Inbox, label: 'Needs attention', path: '/attention', qb: 'Company Snapshot alerts', keywords: 'inbox alerts urgent caught up' },
       { icon: ClipboardCheck, label: 'To Do list', path: '/todos', qb: 'To Do List', keywords: 'task reminder' },
     ],
   },

@@ -56,36 +56,13 @@ import { requireFileAdmin } from './access';
 import { isConfigured as emailIsConfigured, sendMail } from './email';
 import { createBackup } from './backup';
 import { buildInvoicePdf } from '@/lib/pdf/forms';
+import { ATTENTION_KINDS, type AttentionKind } from '@/lib/attentionKinds';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export const ATTENTION_KINDS = [
-  'bank_txn',
-  'overdue_invoice',
-  'bill_due',
-  'ai_error',
-  'reconcile',
-  'payroll_tax',
-  'todo',
-  'backup',
-  'undeposited',
-] as const;
-export type AttentionKind = (typeof ATTENTION_KINDS)[number];
-
-/** Plain-language group names (filters / counts in the UI). */
-export const ATTENTION_KIND_LABELS: Record<AttentionKind, string> = {
-  bank_txn: 'Bank transactions to sort',
-  overdue_invoice: 'Customers who owe you',
-  bill_due: 'Bills to pay',
-  ai_error: 'Possible mistakes',
-  reconcile: 'Accounts to reconcile',
-  payroll_tax: 'Payroll taxes to deposit',
-  todo: 'To-dos',
-  backup: 'Backup',
-  undeposited: 'Money to deposit',
-};
+export { ATTENTION_KINDS, ATTENTION_KIND_LABELS, type AttentionKind } from '@/lib/attentionKinds';
 
 /** How the item is fixed in one click. */
 export type AttentionAction =
@@ -1135,7 +1112,7 @@ export async function recordBackup(
 
 /** Folder for Back up now copies: beside the company data folder, never inside it. */
 export function quickBackupDir(dataDir?: string): string {
-  return path.join(path.dirname(resolveDataDir(dataDir)), 'backups');
+  return path.join(path.dirname(resolveDataDir(dataDir)), 'Ironbooks Backups');
 }
 
 export const QUICK_BACKUP_KEEP = 20;
