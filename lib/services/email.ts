@@ -21,6 +21,7 @@ import { buildInvoicePdf } from '@/lib/pdf/forms';
 import { fillMergeFields } from '@/lib/preferences';
 import { formatCurrency } from '@/lib/money';
 import { assertOutboundAllowed } from '@/lib/net/guard';
+import { assertNotSandbox } from './sandboxState';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -55,6 +56,8 @@ export interface MailOptions {
 }
 
 export async function sendMail(opts: MailOptions, ctx: ServiceContext): Promise<void> {
+  // Sandbox mode: nothing leaves a practice copy (checked first, even before SMTP config).
+  assertNotSandbox('Email');
   if (!isConfigured()) {
     throw new ServiceError(
       'VALIDATION',
@@ -114,6 +117,7 @@ export async function emailInvoice(
   to?: string | null,
   templateId?: string | null,
 ): Promise<void> {
+  assertNotSandbox('Email');
   // Guard early so we don't do heavy work when SMTP is unconfigured.
   if (!isConfigured()) {
     throw new ServiceError(

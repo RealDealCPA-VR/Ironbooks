@@ -10,6 +10,7 @@
  *  - File > New/Open Company -> /companies (company management/switcher)
  *  - File > Create Portable Company File / Export Shareable Ledger -> fetch + native Save
  *  - File > View Transaction Log -> /transaction-log
+ *  - File / Help > Try It on a Copy -> make the sandbox copy (lib/sandboxClient.ts)
  *  - app updates (electron/main.js) -> "Update available" banner: Download & install, progress,
  *    then "Restart & install now"
  *
@@ -19,7 +20,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { Download, RefreshCw, X } from 'lucide-react';
-import { Button, toast } from '@/components/ui';
+import { Button, toast, toastError } from '@/components/ui';
+import { startSandbox } from '@/lib/sandboxClient';
 import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
 
 type Unsubscribe = (() => void) | void;
@@ -122,6 +124,15 @@ export default function DesktopBridge() {
       }
       if (action === 'open-company') {
         b.company?.open?.();
+        return;
+      }
+      // File / Help > Try It on a Copy: one click makes the copy and the shell relaunches into it.
+      if (action === 'sandbox-start') {
+        toast('Making a copy of your company file…', 'info');
+        startSandbox().catch((err) => {
+          toastError(err, 'The sandbox copy could not be made.');
+          router.push('/sandbox');
+        });
         return;
       }
       const exp = MENU_EXPORTS[action];

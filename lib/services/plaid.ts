@@ -19,6 +19,7 @@ import { bankTransactions, bankAccounts } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, validation } from './_base';
 import { policyFetch } from '@/lib/net/guard';
+import { assertNotSandbox } from './sandboxState';
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -109,6 +110,7 @@ async function plaidPost<T>(
  * The Link token is short-lived (~30 min); do not cache it.
  */
 export async function createLinkToken(ctx: ServiceContext): Promise<string> {
+  assertNotSandbox('Bank feed sync'); // sandbox mode: no bank connections from a practice copy
   if (!isConfigured()) throw notConfiguredError();
 
   const data = await plaidPost<{ link_token: string }>(ctx, '/link/token/create', {
@@ -129,6 +131,7 @@ export async function createLinkToken(ctx: ServiceContext): Promise<string> {
  * encryption at rest — left as an infrastructure concern).
  */
 export async function exchangePublicToken(ctx: ServiceContext, publicToken: string): Promise<string> {
+  assertNotSandbox('Bank feed sync'); // sandbox mode: no bank connections from a practice copy
   if (!isConfigured()) throw notConfiguredError();
 
   const data = await plaidPost<{ access_token: string }>(ctx, '/item/public_token/exchange', {
@@ -178,6 +181,7 @@ export async function syncTransactions(
   ctx: ServiceContext,
   params: { accessToken: string; bankAccountId: string },
 ): Promise<SyncResult> {
+  assertNotSandbox('Bank feed sync'); // sandbox mode: no bank connections from a practice copy
   if (!isConfigured()) throw notConfiguredError();
 
   // Verify the bank account belongs to this company.

@@ -22,6 +22,7 @@ import { getCompany } from '@/lib/services/company';
 import { createBackup } from '@/lib/services/backup';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { requireFileAdmin } from '@/lib/services/access';
+import { assertNotSandbox } from '@/lib/services/sandboxState';
 
 /** Constant-time check of the x-bka-internal header against BKA_INTERNAL_TOKEN. */
 async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
@@ -51,6 +52,9 @@ export async function POST(req: NextRequest) {
       ctx = await getServerContext();
       await requireFileAdmin(ctx);
     }
+    // Sandbox mode: the quit-time / scheduled auto-backup is of the REAL file only — never of a
+    // practice copy (it would rotate real backups out of the backups folder).
+    assertNotSandbox('Automatic backup');
 
     // Company name is cosmetic (filename slug only).
     let companyName: string | undefined;

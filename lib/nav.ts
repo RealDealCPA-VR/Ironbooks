@@ -35,6 +35,7 @@ import { Bookmark, LineChart, Grid3x3, Search } from 'lucide-react'; // wave2 re
 import { Bell, CalendarDays, Contact, Mail, LayoutTemplate } from 'lucide-react';
 // p1 ux: Simple mode
 import { Home, PenLine, FilePlus2 } from 'lucide-react';
+import { FlaskConical } from 'lucide-react'; // sandbox mode: Try it on a copy
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -200,6 +201,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: Building2, label: 'Companies', path: '/companies', qb: 'Open or Restore Company', keywords: 'company file switch' },
       { icon: HardDrive, label: 'Company File', path: '/company-file', qb: 'Back Up Company', keywords: 'backup restore' },
+      { icon: FlaskConical, label: 'Try it on a copy', path: '/sandbox', qb: 'Sandbox / practice file', keywords: 'sandbox practice training test copy experiment safe' },
       { icon: Users, label: 'Users & Roles', path: '/users', qb: 'Set Up Users and Roles', keywords: 'permissions access' },
       { icon: FileSpreadsheet, label: 'Migrate from QuickBooks', path: '/qb-import', qb: 'Import IIF / Convert', keywords: 'import iif convert' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security', qb: 'Security', keywords: 'two factor password' },

@@ -96,7 +96,13 @@ interface BackupManifest {
  * keeps the target directory's own copies, so sessions stay bound to the file they were
  * issued for.
  */
-export const FILE_LOCAL_SECRETS = ['.auth-secret', '.file-id'];
+export const FILE_LOCAL_SECRETS = [
+  '.auth-secret',
+  '.file-id',
+  // Sandbox / training-file marker (lib/services/sandboxState.ts SANDBOX_MARKER): a backup made
+  // in a sandbox must never turn the real file into a "sandbox" when restored there.
+  '.ironbooks-sandbox.json',
+];
 
 export interface BackupResult {
   buffer: Buffer;

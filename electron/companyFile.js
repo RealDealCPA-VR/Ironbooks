@@ -70,7 +70,28 @@ function ensureManifest(dir) {
   return readManifest(dir);
 }
 
+// Sandbox mode ("Try it on a copy", lib/services/sandboxState.ts): a sandbox / training copy of
+// a company file carries this marker at its root. The shell reads it to know it is running a
+// practice copy (no auto-backups, scheduled reports, hosting, Recent Companies or update prompts).
+const SANDBOX_MARKER = '.ironbooks-sandbox.json';
+const SANDBOX_SCHEMA = 'ironbooks-sandbox/v1';
+
+/** The sandbox marker of a company-file folder, or null for a real company file. */
+function readSandboxMarker(dir) {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(dir, SANDBOX_MARKER), 'utf8'));
+    if (m && m.schema === SANDBOX_SCHEMA && (m.kind === 'sandbox' || m.kind === 'training') && typeof m.realDataDir === 'string') {
+      return m;
+    }
+  } catch {
+    /* missing / unreadable: a real company file */
+  }
+  return null;
+}
+
 module.exports = {
+  SANDBOX_MARKER,
+  readSandboxMarker,
   MANIFEST,
   readManifest,
   writeManifest,

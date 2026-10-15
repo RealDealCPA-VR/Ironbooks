@@ -3,6 +3,7 @@ import { Inter } from "next/font/google";
 import { Toaster } from "@/components/ui";
 import AppShell from "@/components/AppShell";
 import DesktopBridge from "@/components/DesktopBridge";
+import SandboxBanner from "@/components/SandboxBanner";
 import ClosingPasswordProvider from "@/components/ClosingPasswordProvider";
 
 // Self-hosted via next/font: the woff2 is downloaded at BUILD time and served from the app
@@ -27,6 +28,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body className="bg-offwhite font-sans antialiased min-h-screen">
         <DesktopBridge />
+        <SandboxBanner />
         <AppShell>{children}</AppShell>
         <Toaster />
         <ClosingPasswordProvider />

@@ -85,6 +85,17 @@ const GUIDES: Guide[] = [
       { text: 'Something missing? Add it (or download it with Bank Feeds), then come back.', href: '/bank-feeds', linkText: 'Bank Feeds' },
     ],
   },
+  {
+    id: 'try-it-on-a-copy',
+    title: 'Can I try something without changing my real books?',
+    intro:
+      'Yes. "Try it on a copy" opens Ironbooks on a throwaway copy of your whole company file (the sandbox). An orange SANDBOX bar shows on every page and anything you print is stamped SANDBOX.',
+    steps: [
+      { text: 'Click "Try it on a copy". The copy opens straight away.', href: '/sandbox', linkText: 'Try it on a copy' },
+      { text: 'Practise or test anything. Emails, bank feeds, scheduled reports and automatic backups are off in the sandbox, so nothing leaves the copy.' },
+      { text: 'When you are done: Discard the sandbox (the copy is deleted) or Keep it as a training file with a name you choose. Nothing is ever copied back into your real books.' },
+    ],
+  },
 ];
 
 export default function HelpPage() {

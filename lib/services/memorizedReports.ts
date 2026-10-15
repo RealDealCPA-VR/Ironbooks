@@ -19,6 +19,7 @@ import { runStandardReport, standardReportEntry } from './reportRegistry';
 import { runReport, type ReportConfig } from './reportBuilder';
 import { requirePermission, resolveAccess } from './access';
 import { requireAnyReportAccess } from './reportsAccess';
+import { assertNotSandbox } from './sandboxState';
 import { can, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 
 /**
@@ -531,6 +532,7 @@ export async function runDueSchedules(
   opts: { now?: Date; outDir?: string } = {},
 ): Promise<ScheduleRunResult[]> {
   requirePermission(ctx, 'file_utilities', 'create');
+  assertNotSandbox('Scheduled reports'); // sandbox mode: schedules wait for the real file
   const now = opts.now ?? new Date();
   const root = opts.outDir ?? reportExportRoot();
   const due = await ctx.db

@@ -161,6 +161,7 @@ describe('API permission map coverage', () => {
         '/api/portal/login',
         '/api/portal/logout',
         '/api/portal/me',
+        '/api/sandbox/status', // banner flag only (sandbox mode)
         '/api/unlock',
       ].sort(),
     );

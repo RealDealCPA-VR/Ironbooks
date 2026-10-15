@@ -11,6 +11,7 @@
  * column headings repeated; "Page x of y" and the footer print on every page.
  */
 import { PDFDocument, PDFFont, PDFImage, PDFPage, StandardFonts, rgb, PageSizes, type RGB } from 'pdf-lib';
+import { stampSandbox } from './sandboxStamp';
 import {
   MONEY_COLUMNS,
   NUMERIC_COLUMNS,
@@ -382,6 +383,7 @@ export async function renderFormPdf(
     }
   });
 
+  await stampSandbox(pdf); // printed from a sandbox copy: stamped SANDBOX
   return pdf.save();
 }
 
