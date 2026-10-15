@@ -58,7 +58,7 @@ import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/t
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
-import type { SmartLine } from '@/lib/smartDefaults';
+import { type SmartLine, fillRecalledItems, invoiceFieldsFromRecall, lineClassOverride } from '@/lib/smartDefaults';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -157,6 +157,8 @@ interface InvoiceDetail extends Invoice {
     rate: string;
     taxable: boolean;
     jobId: string | null;
+    /** The line's class (stored as its own class, or the invoice's when it had none). */
+    classId?: string | null;
     /** Progress invoicing: the estimate line this invoice line bills. */
     estimateLineId?: string | null;
     itemName: string | null;
@@ -182,6 +184,8 @@ interface LineRow {
   rate: string;
   taxable: boolean;
   jobId: string;
+  /** The line's own class when it differs from the invoice's ('' / absent = the invoice class). */
+  classId?: string;
   /** Discount items only: interpret `rate` as a % of the preceding body lines. */
   discountPercent: boolean;
   /** Advanced Inventory: site / bin / serials / lot the stock is sold from. */
@@ -355,23 +359,13 @@ const EMPTY_LINE: LineRow = {
   discountPercent: false,
 };
 
-/** A recalled line (smart defaults: the customer's last invoice) as a form row. */
-function rowFromRecall(l: SmartLine, items: Item[]): LineRow {
-  const item = l.itemId ? items.find((it) => it.id === l.itemId) : undefined;
-  return {
-    ...EMPTY_LINE,
-    itemName: item?.name ?? '',
-    itemId: item ? item.id : null,
-    itemType: item?.type ?? null,
-    unitOfMeasure: item?.unitOfMeasure ?? null,
-    description: l.description ?? '',
-    quantity: l.quantity ? String(Number(l.quantity)) : '1',
-    rate: l.rate ? String(Number(l.rate)) : '',
-    taxable: l.taxable ?? true,
-    jobId: l.jobId ?? '',
-    // QB recall keeps last time's rates: automatic pricing must not replace them.
-    rateManual: true,
-  };
+/**
+ * A recalled line (smart defaults: the customer's last invoice) as a form row. The item id is
+ * kept even before the item list has loaded (its name is filled in when it arrives), and so is
+ * a line class that differs from the recalled invoice class.
+ */
+function rowFromRecall(l: SmartLine, items: Item[], headerClassId: string | null): LineRow {
+  return { ...EMPTY_LINE, ...invoiceFieldsFromRecall(l, items, headerClassId) };
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +422,11 @@ function InvoiceModal({
   const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const creditLimit = useCreditLimitConfirm();
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
+  // Recalled lines keep their item id even when the item list had not loaded yet: show the
+  // item's name / type / unit once it arrives.
+  useEffect(() => {
+    setLines((prev) => fillRecalledItems(prev, items));
+  }, [items]);
   const [saving, setSaving] = useState(false);
   const [saveAsPending, setSaveAsPending] = useState(false);
   const [customValues, setCustomValues] = useState<Record<string, string>>({});
@@ -512,6 +511,7 @@ function InvoiceModal({
           rate: String(Number(l.rate)),
           taxable: l.taxable,
           jobId: l.jobId ?? '',
+          classId: lineClassOverride(l.classId, editing.classId),
           discountPercent: false,
           inv: invFromLine(l),
           // Saved invoices keep their stored rates; the badge still flags rule differences.
@@ -602,7 +602,7 @@ function InvoiceModal({
       if (d.lines.length > 0) {
         setLines((prev) =>
           prev.every((l) => !l.itemId && !l.itemName.trim() && !l.description.trim() && !l.rate)
-            ? d.lines.map((l) => rowFromRecall(l, items))
+            ? d.lines.map((l) => rowFromRecall(l, items, h.classId))
             : prev,
         );
       }
@@ -910,6 +910,7 @@ function InvoiceModal({
             rate: totals.amounts[idx].toFixed(2),
             taxable: l.taxable,
             jobId: l.jobId || null,
+            classId: l.classId || null,
             ...(editing ? { estimateLineId: l.estimateLineId ?? null } : {}),
           };
         }
@@ -920,6 +921,7 @@ function InvoiceModal({
           rate: l.rate,
           taxable: l.taxable,
           jobId: l.jobId || null,
+          classId: l.classId || null,
           ...inventoryLinePayload(l.inv),
           // Edits send each row's estimate link back so progress billing stays on the right line.
           ...(editing ? { estimateLineId: l.estimateLineId ?? null } : {}),

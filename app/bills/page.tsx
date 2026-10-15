@@ -49,7 +49,7 @@ import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
-import type { SmartLine } from '@/lib/smartDefaults';
+import { billRowFromRecall, lineClassOverride } from '@/lib/smartDefaults';
 import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
@@ -81,6 +81,11 @@ interface BillDetailLine {
   description: string | null;
   quantity: string;
   amount: string;
+  /** Stored as the line's own class, or the bill's class when the line had none. */
+  classId?: string | null;
+  /** Billable customer (+ job) for invoice passthrough. */
+  customerId?: string | null;
+  jobId?: string | null;
   // Advanced Inventory detail (present only when stored for the line)
   siteId?: string | null;
   binId?: string | null;
@@ -112,6 +117,11 @@ interface ClassRow {
   name: string;
 }
 
+interface CustomerRow {
+  id: string;
+  displayName: string;
+}
+
 interface Item {
   id: string;
   name: string;
@@ -134,6 +144,11 @@ interface LineRow {
   unitCost: string;
   // Shared
   description: string;
+  /** The line's own class ('' = the bill's class). */
+  classId: string;
+  /** Billable customer ('' = not billable) and its job (kept from recall / edit). */
+  customerId: string;
+  jobId: string;
   /** Advanced Inventory: receiving site / bin / serials / lot (inventory item lines). */
   inv?: InvDetail;
 }
@@ -173,21 +188,18 @@ function statusLabel(status: Bill['status']): string {
 // ---------------------------------------------------------------------------
 
 function emptyLine(mode: LineMode = 'expense'): LineRow {
-  return { mode, accountId: '', amount: '', itemId: '', quantity: '', unitCost: '', description: '' };
-}
-
-/** A recalled line (smart defaults) as a form row. */
-function rowFromRecall(l: SmartLine): LineRow {
-  if (l.kind === 'item' && l.itemId) {
-    return {
-      ...emptyLine('item'),
-      itemId: l.itemId,
-      quantity: l.quantity ?? '1',
-      unitCost: l.rate ?? '',
-      description: l.description ?? '',
-    };
-  }
-  return { ...emptyLine('expense'), accountId: l.accountId ?? '', amount: l.amount, description: l.description ?? '' };
+  return {
+    mode,
+    accountId: '',
+    amount: '',
+    itemId: '',
+    quantity: '',
+    unitCost: '',
+    description: '',
+    classId: '',
+    customerId: '',
+    jobId: '',
+  };
 }
 
 /** Display amount for a line: explicit amount (expense) or qty x cost (item). */
@@ -210,6 +222,8 @@ export default function BillsPage() {
   const smart = useSmartDefaults('bill');
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [classes, setClasses] = useState<ClassRow[]>([]);
+  /** Customers for billable lines (empty when the user cannot read customers). */
+  const [customers, setCustomers] = useState<CustomerRow[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -274,6 +288,10 @@ export default function BillsPage() {
           .get<ClassRow[]>('/api/classes')
           .then(setClasses)
           .catch(() => setClasses([]));
+        api
+          .get<CustomerRow[]>('/api/customers')
+          .then(setCustomers)
+          .catch(() => setCustomers([]));
       } catch (err) {
         toastError(err, 'Failed to load data');
       } finally {
@@ -364,7 +382,8 @@ export default function BillsPage() {
       return;
     }
     if (recalled && recalled.lines.length > 0) {
-      setLines((prev) => (blank(prev) ? recalled.lines.map(rowFromRecall) : prev));
+      // Each line keeps its own class (when it differs from the bill's) and billable customer:job.
+      setLines((prev) => (blank(prev) ? recalled.lines.map((l) => billRowFromRecall(l, recalled.header.classId)) : prev));
       setPrefillNote(recallNote(recalled));
       return;
     }
@@ -399,6 +418,11 @@ export default function BillsPage() {
         detail.lines.length === 0
           ? [emptyLine()]
           : detail.lines.map((l) => {
+              const dims = {
+                classId: lineClassOverride(l.classId, detail.classId),
+                customerId: l.customerId ?? '',
+                jobId: l.customerId ? (l.jobId ?? '') : '',
+              };
               if (l.itemId) {
                 const qty = Number(l.quantity) || 1;
                 const unitCost = Number(l.amount) / qty;
@@ -410,6 +434,7 @@ export default function BillsPage() {
                   quantity: String(qty),
                   unitCost: String(parseFloat(unitCost.toFixed(4))),
                   description: l.description ?? '',
+                  ...dims,
                   inv: invFromLine(l),
                 };
               }
@@ -421,6 +446,7 @@ export default function BillsPage() {
                 quantity: '',
                 unitCost: '',
                 description: l.description ?? '',
+                ...dims,
               };
             }),
       );
@@ -547,21 +573,29 @@ export default function BillsPage() {
         memo: memo.trim() || undefined,
         classId: classId || (editingId ? null : undefined),
         exchangeRate: selectedVendor?.currency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
-        lines: lines.map((l) =>
-          l.mode === 'item'
+        lines: lines.map((l) => {
+          // Blank class = the bill's class (the service fills it in).
+          const dims = {
+            classId: l.classId || null,
+            customerId: l.customerId || null,
+            jobId: (l.customerId && l.jobId) || null,
+          };
+          return l.mode === 'item'
             ? {
                 itemId: l.itemId,
                 quantity: l.quantity,
                 unitCost: l.unitCost,
                 description: l.description.trim() || undefined,
+                ...dims,
                 ...inventoryLinePayload(l.inv),
               }
             : {
                 accountId: l.accountId,
                 description: l.description.trim() || undefined,
                 amount: l.amount,
-              },
-        ),
+                ...dims,
+              };
+        }),
       };
       // Duplicate vendor reference number: warn and let the user keep it (QB behaviour).
       const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
@@ -996,6 +1030,45 @@ export default function BillsPage() {
                     <Trash2 className="h-4 w-4" />
                   </button>
                 </div>
+                {(prefs.company.classTrackingEnabled || line.classId || customers.length > 0 || line.customerId) && (
+                  <div className="flex gap-2 pl-[4.5rem] pr-6">
+                    {(prefs.company.classTrackingEnabled || line.classId) && (
+                      <div className="flex-1 min-w-0">
+                        <Select
+                          aria-label={`Line ${idx + 1} class`}
+                          value={line.classId}
+                          onChange={(e) => updateLine(idx, { classId: e.target.value })}
+                        >
+                          <option value="">{classId ? 'Bill class' : 'No class'}</option>
+                          {classes.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.name}
+                            </option>
+                          ))}
+                        </Select>
+                      </div>
+                    )}
+                    {(customers.length > 0 || line.customerId) && (
+                      <div className="flex-1 min-w-0">
+                        <Select
+                          aria-label={`Line ${idx + 1} billable customer`}
+                          value={line.customerId}
+                          onChange={(e) => updateLine(idx, { customerId: e.target.value, jobId: '' })}
+                        >
+                          <option value="">Not billable</option>
+                          {line.customerId && !customers.some((c) => c.id === line.customerId) && (
+                            <option value={line.customerId}>(customer)</option>
+                          )}
+                          {customers.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              Billable to {c.displayName}
+                            </option>
+                          ))}
+                        </Select>
+                      </div>
+                    )}
+                  </div>
+                )}
                 {line.mode === 'item' && (
                   <InventoryLineFields
                     adv={adv}

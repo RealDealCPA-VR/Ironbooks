@@ -10,6 +10,8 @@
  *    (sessionStorage), so a check does not inherit the date typed on an invoice.
  */
 
+import { Money } from '@/lib/money';
+
 export const VENDOR_FORMS = ['bill', 'check', 'expense', 'credit_card'] as const;
 export const CUSTOMER_FORMS = ['invoice', 'sales_receipt', 'estimate', 'sales_order'] as const;
 export const SMART_FORMS = [...VENDOR_FORMS, ...CUSTOMER_FORMS] as const;
@@ -94,8 +96,11 @@ export const EMPTY_HEADER: SmartHeader = { terms: null, classId: null, salesRepI
 // Check numbers
 // ---------------------------------------------------------------------------
 
-/** Longer digit runs are confirmation / reference numbers, not check numbers. */
-const MAX_CHECK_DIGITS = 9;
+/**
+ * Longer digit runs are confirmation / reference numbers, not check numbers. 10 so the sequence
+ * survives the 999999999 -> 1000000000 rollover (a 10-digit check must still count as used).
+ */
+export const MAX_CHECK_DIGITS = 10;
 
 /**
  * Read a used check number: plain digits ("1001", "0099") or digits with a short letter suffix
@@ -246,10 +251,142 @@ export function salesRowsFromRecall(lines: SmartLine[]): Array<{
   return lines.map((l) => ({
     itemId: l.itemId ?? '',
     description: l.description ?? '',
-    quantity: l.quantity ? String(Number(l.quantity)) : '1',
-    rate: l.rate ? String(Number(l.rate)) : '',
+    quantity: recallQuantity(l.quantity),
+    rate: recallNumber(l.rate),
     taxable: l.taxable ?? true,
     rateManual: true,
     classId: l.classId ?? '',
   }));
+}
+
+/**
+ * A recalled decimal (quantity, rate, unit cost: numeric strings from the DB) as the text a form
+ * field shows: Decimal, never a JS float, trailing zeros dropped ("9.5000" -> "9.5"), always in
+ * plain notation (no "1e-8"). '' for null / blank / unparseable.
+ */
+export function recallNumber(v: string | null | undefined): string {
+  if (v == null || String(v).trim() === '') return '';
+  try {
+    return Money.of(v).toFixed();
+  } catch {
+    return '';
+  }
+}
+
+/** A recalled quantity: as recallNumber, '1' when there is none. */
+export function recallQuantity(v: string | null | undefined): string {
+  return recallNumber(v) || '1';
+}
+
+/**
+ * The class a recalled line keeps on its own. The services store `line.classId ?? header classId`
+ * on every line, so a line whose class equals the header's is just inheriting it: leave it blank
+ * so a header class change still flows to it; only a genuinely different line class is kept.
+ */
+export function lineClassOverride(lineClassId: string | null | undefined, headerClassId: string | null | undefined): string {
+  return lineClassId && lineClassId !== (headerClassId ?? null) ? lineClassId : '';
+}
+
+/**
+ * Recalled invoice line fields. The item id is kept even when `items` does not have it yet (the
+ * list is still loading): dropping it would turn the line into a description-only line that still
+ * carries a rate. The name / type / unit are filled once the list arrives (fillRecalledItems).
+ */
+export function invoiceFieldsFromRecall<T extends RecallItem>(
+  l: SmartLine,
+  items: readonly T[],
+  headerClassId: string | null | undefined,
+): {
+  itemName: string;
+  itemId: string | null;
+  itemType: T['type'] | null;
+  unitOfMeasure: string | null;
+  description: string;
+  quantity: string;
+  rate: string;
+  taxable: boolean;
+  jobId: string;
+  classId: string;
+  rateManual: true;
+} {
+  const item = l.itemId ? items.find((it) => it.id === l.itemId) : undefined;
+  return {
+    itemName: item?.name ?? '',
+    itemId: l.itemId ?? null,
+    itemType: item?.type ?? null,
+    unitOfMeasure: item?.unitOfMeasure ?? null,
+    description: l.description ?? '',
+    quantity: recallQuantity(l.quantity),
+    rate: recallNumber(l.rate),
+    taxable: l.taxable ?? true,
+    jobId: l.jobId ?? '',
+    classId: lineClassOverride(l.classId, headerClassId),
+    // QB recall keeps last time's rates: automatic pricing must not replace them.
+    rateManual: true,
+  };
+}
+
+export interface RecallItem {
+  id: string;
+  name: string;
+  type: string;
+  unitOfMeasure?: string | null;
+}
+
+/**
+ * Rows that hold an item id but no item name yet (recalled before the item list loaded): fill
+ * name / type / unit from `items`. Returns the same array when nothing changed (no re-render).
+ */
+export function fillRecalledItems<
+  R extends { itemId: string | null; itemName: string; itemType: string | null; unitOfMeasure: string | null },
+  T extends RecallItem,
+>(rows: R[], items: readonly T[]): R[] {
+  let changed = false;
+  const next = rows.map((r) => {
+    if (!r.itemId || r.itemName) return r;
+    const it = items.find((i) => i.id === r.itemId);
+    if (!it) return r;
+    changed = true;
+    return { ...r, itemName: it.name, itemType: it.type, unitOfMeasure: it.unitOfMeasure ?? null } as R;
+  });
+  return changed ? next : rows;
+}
+
+/**
+ * A recalled bill line as a bill form row: account or item line, with its own class (when it
+ * differs from the bill's class) and billable customer:job, as the service returned them.
+ */
+export function billRowFromRecall(
+  l: SmartLine,
+  headerClassId: string | null | undefined,
+): {
+  mode: 'expense' | 'item';
+  accountId: string;
+  amount: string;
+  itemId: string;
+  quantity: string;
+  unitCost: string;
+  description: string;
+  classId: string;
+  customerId: string;
+  jobId: string;
+} {
+  const shared = {
+    description: l.description ?? '',
+    classId: lineClassOverride(l.classId, headerClassId),
+    customerId: l.customerId ?? '',
+    jobId: l.customerId ? (l.jobId ?? '') : '',
+  };
+  if (l.kind === 'item' && l.itemId) {
+    return {
+      mode: 'item',
+      accountId: '',
+      amount: '',
+      itemId: l.itemId,
+      quantity: recallQuantity(l.quantity),
+      unitCost: recallNumber(l.rate),
+      ...shared,
+    };
+  }
+  return { mode: 'expense', accountId: l.accountId ?? '', amount: l.amount, itemId: '', quantity: '', unitCost: '', ...shared };
 }

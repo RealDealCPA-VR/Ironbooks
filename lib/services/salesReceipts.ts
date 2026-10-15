@@ -28,6 +28,7 @@ import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
+  classes,
   customers,
   depositLines,
   deposits,
@@ -42,6 +43,7 @@ import {
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
@@ -523,6 +525,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
   await assertSalesTaxAllowed(ctx, input);
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   input = await applyCustomerShipToDefault(ctx, input);
+  if (input.classId) await assertRefInCompany(ctx, classes, input.classId, 'Class');
   const prep = await prepareSalesReceipt(ctx, input);
   const { method, depositAccountId, subtotal, taxAmount, total } = prep;
 
@@ -799,6 +802,7 @@ async function isDeposited(ctx: ServiceContext, receiptId: string): Promise<bool
  */
 export async function updateSalesReceipt(ctx: ServiceContext, id: string, input: CreateSalesReceiptInput) {
   input = await applyCustomerTaxDefaults(ctx, input);
+  if (input.classId) await assertRefInCompany(ctx, classes, input.classId, 'Class');
   const [existing] = await ctx.db
     .select()
     .from(salesReceipts)

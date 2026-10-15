@@ -5,15 +5,40 @@
 import { describe, expect, it } from 'vitest';
 import {
   FORM_HEADER_FIELDS,
+  MAX_CHECK_DIGITS,
   SMART_FORMS,
+  type SmartLine,
+  billRowFromRecall,
   defaultFormDate,
+  fillRecalledItems,
+  invoiceFieldsFromRecall,
+  lineClassOverride,
   formKeyForSave,
   nextCheckNumberFrom,
   parseCheckNumber,
   recallFormDate,
+  recallNumber,
+  recallQuantity,
   rememberFormDate,
   salesRowsFromRecall,
 } from './smartDefaults';
+
+function line(over: Partial<SmartLine>): SmartLine {
+  return {
+    kind: 'item',
+    accountId: null,
+    itemId: null,
+    description: null,
+    quantity: null,
+    rate: null,
+    amount: '0.00',
+    taxable: null,
+    classId: null,
+    customerId: null,
+    jobId: null,
+    ...over,
+  };
+}
 
 function memStore() {
   const m = new Map<string, string>();
@@ -26,7 +51,7 @@ describe('check numbers', () => {
     expect(parseCheckNumber(' 1001A ')).toEqual({ n: 1001, width: 4 });
     expect(parseCheckNumber('1001-b')).toEqual({ n: 1001, width: 4 });
     expect(parseCheckNumber('0099')).toEqual({ n: 99, width: 4 });
-    for (const bad of ['', null, undefined, 'EFT', 'DEBIT', 'CHK12', '12.5', '-5', '1001ABCD', '1234567890']) {
+    for (const bad of ['', null, undefined, 'EFT', 'DEBIT', 'CHK12', '12.5', '-5', '1001ABCD', '12345678901']) {
       expect(parseCheckNumber(bad as string)).toBeNull();
     }
   });
@@ -41,6 +66,18 @@ describe('check numbers', () => {
     expect(nextCheckNumberFrom(['999'])).toBe('1000');
     expect(nextCheckNumberFrom(['12', '4455667788990'])).toBe('13');
     expect(nextCheckNumberFrom([], '501')).toBe('501');
+  });
+
+  it('survives the 999999999 -> 1000000000 rollover (10-digit checks still count)', () => {
+    expect(MAX_CHECK_DIGITS).toBe(10);
+    expect(parseCheckNumber('1000000000')).toEqual({ n: 1000000000, width: 10 });
+    expect(nextCheckNumberFrom(['999999998', '999999999'])).toBe('1000000000');
+    // Once 1000000000 is used, the next suggestion goes up, not back down to a lower number.
+    expect(nextCheckNumberFrom(['999999999', '1000000000'])).toBe('1000000001');
+    expect(nextCheckNumberFrom(['1000000000', '1000000001', '12'])).toBe('1000000002');
+    // Longer runs are still confirmation numbers, not checks.
+    expect(parseCheckNumber('10000000000')).toBeNull();
+    expect(nextCheckNumberFrom(['1000000000', '98765432101'])).toBe('1000000001');
   });
 });
 
@@ -102,5 +139,109 @@ describe('form catalogue', () => {
       { kind: 'item', itemId: 'i1', accountId: null, description: 'W', quantity: '2.0000', rate: '9.5000', amount: '19.00', taxable: false, classId: 'c1', customerId: null, jobId: null },
     ]);
     expect(rows).toEqual([{ itemId: 'i1', description: 'W', quantity: '2', rate: '9.5', taxable: false, rateManual: true, classId: 'c1' }]);
+  });
+});
+
+describe('recalled numbers are Decimal text, never JS floats', () => {
+  it('drops trailing zeros without float rounding or exponent notation', () => {
+    expect(recallNumber('9.5000')).toBe('9.5');
+    expect(recallNumber('100.0000')).toBe('100');
+    // Past float precision: String(Number(x)) would give "1234567890123.457".
+    expect(recallNumber('1234567890123.4567')).toBe('1234567890123.4567');
+    expect(String(Number('1234567890123.4567'))).not.toBe('1234567890123.4567');
+    // Tiny values stay in plain notation (Number -> "1e-7").
+    expect(recallNumber('0.0000001')).toBe('0.0000001');
+    expect(recallNumber('0.10000000000000000001')).toBe('0.10000000000000000001');
+    expect(recallNumber(null)).toBe('');
+    expect(recallNumber('  ')).toBe('');
+    expect(recallNumber('abc')).toBe('');
+    expect(recallQuantity(null)).toBe('1');
+    expect(recallQuantity('3.2500')).toBe('3.25');
+  });
+
+  it('salesRowsFromRecall uses them', () => {
+    const [row] = salesRowsFromRecall([line({ itemId: 'i', quantity: '0.0000001', rate: '1234567890123.4567' })]);
+    expect(row.quantity).toBe('0.0000001');
+    expect(row.rate).toBe('1234567890123.4567');
+  });
+});
+
+describe('recalled invoice lines', () => {
+  const items = [{ id: 'i1', name: 'Widget', type: 'inventory', unitOfMeasure: 'ea' }];
+
+  it('keeps the item id when the item list has not loaded yet, then fills the name in', () => {
+    const r = invoiceFieldsFromRecall(line({ itemId: 'i1', quantity: '2.0000', rate: '9.5000' }), [], null);
+    expect(r).toMatchObject({ itemId: 'i1', itemName: '', itemType: null, quantity: '2', rate: '9.5', rateManual: true });
+    const rows = [{ ...r, unitOfMeasure: r.unitOfMeasure }];
+    const filled = fillRecalledItems(rows, items);
+    expect(filled[0]).toMatchObject({ itemId: 'i1', itemName: 'Widget', itemType: 'inventory', unitOfMeasure: 'ea', rate: '9.5' });
+    // Nothing to fill: same array (no re-render loop).
+    expect(fillRecalledItems(filled, items)).toBe(filled);
+    expect(fillRecalledItems(rows, [])).toBe(rows);
+  });
+
+  it('resolves the item at once when the list is there; description lines stay item-less', () => {
+    expect(invoiceFieldsFromRecall(line({ itemId: 'i1' }), items, null)).toMatchObject({
+      itemId: 'i1',
+      itemName: 'Widget',
+      itemType: 'inventory',
+      unitOfMeasure: 'ea',
+      quantity: '1',
+    });
+    expect(invoiceFieldsFromRecall(line({ description: 'Note' }), items, null)).toMatchObject({ itemId: null, itemName: '' });
+  });
+
+  it("carries a line class that differs from the invoice's; an inherited one stays blank", () => {
+    expect(invoiceFieldsFromRecall(line({ itemId: 'i1', classId: 'east' }), items, 'west').classId).toBe('east');
+    expect(invoiceFieldsFromRecall(line({ itemId: 'i1', classId: 'west' }), items, 'west').classId).toBe('');
+    expect(invoiceFieldsFromRecall(line({ itemId: 'i1', classId: 'east' }), items, null).classId).toBe('east');
+    expect(lineClassOverride(null, 'west')).toBe('');
+    expect(lineClassOverride(undefined, undefined)).toBe('');
+  });
+});
+
+describe('recalled bill lines', () => {
+  it('item line: qty / cost as Decimal text, own class and billable customer:job kept', () => {
+    expect(
+      billRowFromRecall(
+        line({ itemId: 'i1', quantity: '3.0000', rate: '12.5000', description: 'Bolts', classId: 'east', customerId: 'c1', jobId: 'j1' }),
+        'west',
+      ),
+    ).toEqual({
+      mode: 'item',
+      accountId: '',
+      amount: '',
+      itemId: 'i1',
+      quantity: '3',
+      unitCost: '12.5',
+      description: 'Bolts',
+      classId: 'east',
+      customerId: 'c1',
+      jobId: 'j1',
+    });
+  });
+
+  it('account line: amount kept; a class equal to the bill class is left to inherit it', () => {
+    expect(
+      billRowFromRecall(
+        line({ kind: 'account', accountId: 'a1', amount: '40.00', classId: 'west', customerId: 'c2', jobId: null }),
+        'west',
+      ),
+    ).toEqual({
+      mode: 'expense',
+      accountId: 'a1',
+      amount: '40.00',
+      itemId: '',
+      quantity: '',
+      unitCost: '',
+      description: '',
+      classId: '',
+      customerId: 'c2',
+      jobId: '',
+    });
+  });
+
+  it('a job without a customer is dropped', () => {
+    expect(billRowFromRecall(line({ kind: 'account', accountId: 'a1', jobId: 'j1' }), null).jobId).toBe('');
   });
 });

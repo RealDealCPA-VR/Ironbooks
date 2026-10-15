@@ -13,11 +13,11 @@ import { eq, and } from 'drizzle-orm';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { users, companies, accounts, vendors } from '@/lib/db/schema';
+import { users, companies, accounts, vendors, classes, customers, jobs, billLines } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { trialBalance } from './reports';
-import { createBill, getBill, listBills, voidBill } from './bills';
+import { createBill, getBill, listBills, updateBill, voidBill } from './bills';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-bills');
 let ctx: ServiceContext;
@@ -107,6 +107,57 @@ describe('Bills (A/P) service', () => {
         lines: [{ accountId: acct['5000'], amount: '100.00' }],
       }),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it("rejects another company's class, customer or job (bill and line, create and update); keeps its own per line", async () => {
+    const [otherUser] = await db
+      .insert(users)
+      .values({ email: 'bills-other@test.local', name: 'Other', passwordHash: 'x' })
+      .returning();
+    const [other] = await db.insert(companies).values({ name: 'Other Co', ownerId: otherUser.id }).returning();
+    const [fClass] = await db.insert(classes).values({ companyId: other.id, name: 'Foreign class' }).returning();
+    const [fCust] = await db.insert(customers).values({ companyId: other.id, displayName: 'Foreign customer' }).returning();
+    const [fJob] = await db.insert(jobs).values({ companyId: other.id, customerId: fCust.id, name: 'Foreign job' }).returning();
+    const [east] = await db.insert(classes).values({ companyId: ctx.companyId, name: 'East' }).returning();
+    const [west] = await db.insert(classes).values({ companyId: ctx.companyId, name: 'West' }).returning();
+    const [cust] = await db.insert(customers).values({ companyId: ctx.companyId, displayName: 'Own customer' }).returning();
+    const [job] = await db.insert(jobs).values({ companyId: ctx.companyId, customerId: cust.id, name: 'Own job' }).returning();
+
+    const base = { vendorId, date: new Date('2025-03-02') };
+    const ln = { accountId: acct['6300'], amount: '10.00' };
+    const bad: Array<[Record<string, unknown>, Record<string, unknown>, RegExp]> = [
+      [{ classId: fClass.id }, {}, /^Class does not exist/],
+      [{}, { classId: fClass.id }, /^Class does not exist/],
+      [{}, { customerId: fCust.id }, /^Customer does not exist/],
+      [{}, { customerId: cust.id, jobId: fJob.id }, /^Job does not exist/],
+    ];
+    for (const [head, line, msg] of bad) {
+      await expect(createBill(ctx, { ...base, ...head, lines: [{ ...ln, ...line }] })).rejects.toMatchObject({
+        code: 'VALIDATION',
+        message: expect.stringMatching(msg),
+      });
+    }
+
+    const bill = await createBill(ctx, {
+      ...base,
+      classId: west.id,
+      lines: [
+        { ...ln, classId: east.id, customerId: cust.id, jobId: job.id },
+        { accountId: acct['6000'], amount: '5.00' },
+      ],
+    });
+    const stored = await db.select().from(billLines).where(eq(billLines.billId, bill.id));
+    const byAmt = new Map(stored.map((l) => [l.amount, l]));
+    expect(byAmt.get('10.00')).toMatchObject({ classId: east.id, customerId: cust.id, jobId: job.id });
+    expect(byAmt.get('5.00')).toMatchObject({ classId: west.id, customerId: null, jobId: null });
+
+    for (const [head, line, msg] of bad) {
+      await expect(updateBill(ctx, bill.id, { ...base, ...head, lines: [{ ...ln, ...line }] })).rejects.toMatchObject({
+        code: 'VALIDATION',
+        message: expect.stringMatching(msg),
+      });
+    }
+    await voidBill(ctx, bill.id);
   });
 
   // -----------------------------------------------------------------------

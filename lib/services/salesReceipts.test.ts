@@ -24,6 +24,8 @@ import {
   taxAgencies,
   taxRates,
   journalEntries,
+  classes,
+  salesReceipts,
 } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
@@ -35,6 +37,7 @@ import {
   createSalesReceipt,
   getSalesReceipt,
   listSalesReceipts,
+  updateSalesReceipt,
   voidSalesReceipt,
 } from './salesReceipts';
 
@@ -484,6 +487,40 @@ describe('Sales Receipts service (end-to-end)', () => {
         lines: [{ accountId: acct['4000'], quantity: 1, rate: 10 }],
       }),
     ).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
+  // -------------------------------------------------------------------------
+  // Test 13b: the receipt's class must belong to this company (create and update)
+  // -------------------------------------------------------------------------
+  it('rejects a class from another company on create and update, accepts its own', async () => {
+    const [otherUser] = await db
+      .insert(users)
+      .values({ email: 'other@salesreceipts.test', name: 'Other', passwordHash: 'x' })
+      .returning();
+    const [otherCo] = await db.insert(companies).values({ name: 'Other Co', ownerId: otherUser.id }).returning();
+    const [foreignClass] = await db.insert(classes).values({ companyId: otherCo.id, name: 'Foreign' }).returning();
+    const [ownClass] = await db.insert(classes).values({ companyId: ctx.companyId, name: 'Retail' }).returning();
+    const base = { date: new Date('2025-03-14'), lines: [{ accountId: acct['4000'], quantity: 1, rate: 10 }] };
+
+    await expect(createSalesReceipt(ctx, { ...base, classId: foreignClass.id })).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: 'Class does not exist in this company.',
+    });
+    await expect(
+      createSalesReceipt(ctx, { ...base, classId: '00000000-0000-0000-0000-000000000077' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+
+    const ok = await createSalesReceipt(ctx, { ...base, classId: ownClass.id });
+    expect(ok.classId).toBe(ownClass.id);
+
+    await expect(updateSalesReceipt(ctx, ok.id, { ...base, classId: foreignClass.id })).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: 'Class does not exist in this company.',
+    });
+    const [still] = await db.select().from(salesReceipts).where(eq(salesReceipts.id, ok.id));
+    expect(still.classId).toBe(ownClass.id);
+    const cleared = await updateSalesReceipt(ctx, ok.id, { ...base, classId: null });
+    expect(cleared.classId).toBeNull();
   });
 
   // -------------------------------------------------------------------------

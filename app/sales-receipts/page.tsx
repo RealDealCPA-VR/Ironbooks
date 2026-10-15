@@ -57,6 +57,7 @@ import {
 import { usePreferences } from '@/lib/usePreferences';
 import MemorizeButton from '@/components/MemorizeButton';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
+import { recallNumber, recallQuantity } from '@/lib/smartDefaults';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -319,8 +320,9 @@ function NewReceiptModal({
                 ...EMPTY_LINE,
                 itemId: l.itemId ?? '',
                 description: l.description ?? '',
-                quantity: l.quantity ? String(Number(l.quantity)) : '1',
-                rate: l.rate ? String(Number(l.rate)) : '',
+                // Decimal, not a JS float: "9.5000" -> "9.5".
+                quantity: recallQuantity(l.quantity),
+                rate: recallNumber(l.rate),
                 taxable: l.taxable ?? true,
                 // QB recall keeps last time's rates: automatic pricing must not replace them.
                 rateManual: true,
