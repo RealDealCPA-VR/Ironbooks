@@ -65,7 +65,7 @@ import {
   safeCompanyName,
   serializeChangesFile,
 } from './format';
-import { DIGEST_TYPES, baselineInsertSql, recordStates } from './digest';
+import { DIGEST_TYPES, baselineInsertSql, changedNameFields, recordStates } from './digest';
 import {
   DOC_LABEL,
   DOC_ORDER,
@@ -561,7 +561,18 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
       }
       if (row.digest !== null && st.digest === row.digest) continue;
       if (row.digest === null) continue; // baseline from an older copy: nothing to compare against
-      names.push({ op: 'edit', type, id: st.id, baseVersion: iso(row.version), baseDigest: row.digest, after: await namePayload(ctx, type, st.id, true) });
+      // Which fields changed (null for a baseline from an older copy: the whole record is compared).
+      const fields = changedNameFields(type, row.digest, st.digest);
+      if (fields && fields.length === 0) continue;
+      names.push({
+        op: 'edit',
+        type,
+        id: st.id,
+        baseVersion: iso(row.version),
+        baseDigest: row.digest,
+        after: await namePayload(ctx, type, st.id, true),
+        ...(fields ? { fields } : {}),
+      });
     }
     // Sub-customers after their parent.
     const ids = new Set(added.map((a) => a.id));

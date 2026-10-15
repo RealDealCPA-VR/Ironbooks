@@ -83,28 +83,46 @@ async function ownerOfEntry(
 export type IdMap = Map<string, string>;
 
 /**
+ * Journal lines resolved so far in one import: accountant line id → client line id. References
+ * naming the SAME accountant line (one General Journal credit split across two invoices, one
+ * charge paid by two partial payments, ...) resolve to the same client line; two DIFFERENT
+ * accountant lines that look alike (same account, amount and name) never land on one client line.
+ */
+export type LineMap = Map<string, string>;
+
+/**
  * Client side: the journal line the reference names, after the changes applied so far
- * (`idMap`: accountant id → id of the record the import created). `used` keeps two references to
- * look-alike lines (same account and amount) from landing on the same line.
+ * (`idMap`: accountant id → id of the record the import created; `lines`: see LineMap).
  */
 export async function resolveLineRef(
   ctx: Pick<ServiceContext, 'db' | 'companyId'>,
   ref: LineRef,
   idMap: IdMap,
-  used: Set<string>,
+  lines: LineMap,
 ): Promise<string> {
   const mapId = (id: string | null) => (id ? idMap.get(id) ?? id : id);
-  // 1. The same line (it existed when the copy was made and is still posted).
-  if (!idMap.has(ref.entryId)) {
-    const [same] = await ctx.db
+  const postedLine = async (id: string) => {
+    const [row] = await ctx.db
       .select({ id: journalEntryLines.id })
       .from(journalEntryLines)
       .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
-      .where(and(eq(journalEntryLines.id, ref.lineId), eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted')));
-    if (same && !used.has(same.id)) {
-      used.add(same.id);
-      return same.id;
-    }
+      .where(and(eq(journalEntryLines.id, id), eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted')));
+    return row?.id ?? null;
+  };
+  // 0. Already resolved for an earlier reference to the same accountant line (and still posted).
+  const known = lines.get(ref.lineId);
+  if (known && (await postedLine(known))) return known;
+  if (known) lines.delete(ref.lineId);
+  /** Client lines already taken by a different accountant line. */
+  const taken = new Set<string>([...lines.values()]);
+  const claim = (id: string) => {
+    lines.set(ref.lineId, id);
+    return id;
+  };
+  // 1. The same line (it existed when the copy was made and is still posted).
+  if (!idMap.has(ref.entryId)) {
+    const same = await postedLine(ref.lineId);
+    if (same && !taken.has(same)) return claim(same);
   }
   // 2. The entry that now carries it: through the owning record, else the source reference.
   const entryIds = new Set<string>();
@@ -159,16 +177,13 @@ export async function resolveLineRef(
     const hit = lines.find(
       (l) =>
         l.status === 'posted' &&
-        !used.has(l.id) &&
+        !taken.has(l.id) &&
         l.accountId === want.account &&
         Money.of(l.debit ?? 0).equals(want.debit) &&
         Money.of(l.credit ?? 0).equals(want.credit) &&
         (l.entityId ?? null) === (want.entity ?? null),
     );
-    if (hit) {
-      used.add(hit.id);
-      return hit.id;
-    }
+    if (hit) return claim(hit.id);
   }
   const side = ref.debit ? `debit ${ref.debit}` : `credit ${ref.credit ?? '0.00'}`;
   throw new ServiceError(

@@ -20,6 +20,7 @@
  */
 import { createHash } from 'node:crypto';
 import { ServiceError } from '../errors';
+import { NAME_COLUMNS } from './digest';
 
 export const TRANSFER_EXTENSION = 'ibac';
 export const CHANGES_EXTENSION = 'ibcx';
@@ -189,7 +190,20 @@ export interface LineRef {
 export type NameType = 'customer' | 'vendor' | 'item' | 'other_name';
 export type NameChange =
   | { op: 'add'; type: NameType; id: string; after: Record<string, unknown> }
-  | { op: 'edit'; type: NameType; id: string; baseVersion: string | null; baseDigest: string | null; after: Record<string, unknown> };
+  | {
+      op: 'edit';
+      type: NameType;
+      id: string;
+      baseVersion: string | null;
+      baseDigest: string | null;
+      after: Record<string, unknown>;
+      /**
+       * The fields the accountant changed (NAME_COLUMNS keys). Only these are applied, and the
+       * client's own edits of OTHER fields of the same record are not a conflict. Absent in files
+       * from copies made before it existed: the whole record is compared then.
+       */
+      fields?: string[];
+    };
 
 export type DocType =
   | 'invoice'
@@ -453,7 +467,7 @@ const classOk = (c: unknown) => isObj(c) && c.op === 'add' && isId(c.id) && isSt
 export type FieldSpec =
   | 'id' | 'id?' | 'dec' | 'dec?' | 'date' | 'date?' | 'str' | 'str?' | 'bool' | 'bool?'
   | 'strmap?' | 'strs?' | 'ids?' | 'lineRef' | 'lineRef?'
-  | { arr: Shape }
+  | { arr: Shape; opt?: boolean }
   | { obj: Shape; opt?: boolean };
 export type Shape = { readonly [key: string]: FieldSpec };
 
@@ -483,7 +497,10 @@ export function matchesShape(v: unknown, shape: Shape): boolean {
 
 function fieldOk(v: unknown, spec: FieldSpec): boolean {
   if (typeof spec === 'object') {
-    if ('arr' in spec) return Array.isArray(v) && v.every((x) => matchesShape(x, spec.arr));
+    if ('arr' in spec) {
+      if (spec.opt && (v === undefined || v === null)) return true;
+      return Array.isArray(v) && v.every((x) => matchesShape(x, spec.arr));
+    }
     if (spec.opt && (v === undefined || v === null)) return true;
     return matchesShape(v, spec.obj);
   }
@@ -528,7 +545,7 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
     lines: {
       arr: {
         itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?',
-        taxRateId: 'id?', classId: 'id?', jobId: 'id?', ...INV,
+        taxRateId: 'id?', classId: 'id?', jobId: 'id?', estimateLineId: 'id?', ...INV,
       },
     },
   },
@@ -608,24 +625,32 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
   },
 };
 
+/** One of a customer's ship-to addresses (lib/shipTo.ts). */
+const SHIP_TO: Shape = {
+  name: 'str', line1: 'str?', line2: 'str?', city: 'str?', state: 'str?', zip: 'str?', country: 'str?', isDefault: 'bool?',
+};
+
 export const NAME_SHAPES: Record<NameType, Shape> = {
   customer: {
     displayName: 'str', companyName: 'str?', email: 'str?', phone: 'str?', billingAddress: 'strmap?',
     shippingAddress: 'strmap?', terms: 'str?', termsId: 'id?', creditLimit: 'dec?', taxable: 'bool?', taxRateId: 'id?',
     salesTaxCodeId: 'id?', resaleNumber: 'str?', taxExemptionReason: 'str?', notes: 'str?',
-    // New customers only (a job's place in the customer list is structural).
-    parentId: 'id?',
+    customFields: 'strmap?', customerTypeId: 'id?',
+    // New customers only (a job's place in the customer list, its price level and ship-to list are
+    // structural: guard.ts refuses changing them in the copy).
+    parentId: 'id?', priceLevelId: 'id?', shipToAddresses: { arr: SHIP_TO, opt: true },
   },
   vendor: {
     displayName: 'str', companyName: 'str?', email: 'str?', phone: 'str?', address: 'strmap?', terms: 'str?',
     termsId: 'id?', is1099: 'bool?', defaultExpenseAccountId: 'id?', notes: 'str?', printOnCheckAs: 'str?',
-    accountNumber: 'str?', prefillAccountIds: 'ids?',
+    accountNumber: 'str?', prefillAccountIds: 'ids?', customFields: 'strmap?',
     // New vendors only.
     currency: 'str?',
   },
   item: {
     name: 'str', sku: 'str?', description: 'str?', salesPrice: 'dec?', purchaseCost: 'dec?', taxable: 'bool?',
     salesTaxCodeId: 'id?', unitOfMeasure: 'str?', barcode: 'str?', weight: 'dec?', preferredVendorId: 'id?',
+    reorderPoint: 'dec?', customFields: 'strmap?',
     // New items only (type, accounts and tracking are structural).
     type: 'str?', incomeAccountId: 'id?', expenseAccountId: 'id?', assetAccountId: 'id?', trackingMode: 'str?', uomSetId: 'id?',
   },
@@ -636,7 +661,7 @@ export const NAME_SHAPES: Record<NameType, Shape> = {
 
 /** Fields a new name / item may carry but an edit may not (QB: hierarchy, type, accounts, currency). */
 export const NAME_ADD_ONLY: Record<NameType, readonly string[]> = {
-  customer: ['parentId'],
+  customer: ['parentId', 'priceLevelId', 'shipToAddresses'],
   vendor: ['currency'],
   item: ['type', 'incomeAccountId', 'expenseAccountId', 'assetAccountId', 'trackingMode', 'uomSetId'],
   other_name: [],
@@ -650,6 +675,10 @@ function nameOk(n: unknown): boolean {
   if (n.op === 'edit') {
     if (!isVersion(n.baseVersion) || !isBaseDigest(n.baseDigest)) return false;
     if (isObj(n.after) && NAME_ADD_ONLY[type].some((k) => (n.after as Rec)[k] !== undefined)) return false;
+    if (n.fields !== undefined) {
+      const cols = NAME_COLUMNS[type].cols;
+      if (!Array.isArray(n.fields) || !n.fields.every((k) => isStr(k) && Object.prototype.hasOwnProperty.call(cols, k))) return false;
+    }
   } else if (n.op !== 'add') return false;
   return matchesShape(n.after, NAME_SHAPES[type]);
 }

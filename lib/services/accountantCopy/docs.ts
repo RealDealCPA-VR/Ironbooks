@@ -16,6 +16,7 @@ import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   auditLogs,
   inventoryMovements,
+  inventorySites,
   items,
   journalEntries,
   journalEntryLines,
@@ -54,6 +55,9 @@ import { createVendor, updateVendor, type CreateVendorInput } from '../vendors';
 import { createItem, updateItem, type CreateItemInput } from '../items';
 import { createEntry, updateEntry as updateListEntry } from '../lists/simpleLists';
 import { lineRefOf } from './lineRefs';
+import { setEntityCustomFields } from '../customFields';
+import { assignCustomerPricing } from '../pricing';
+import { setReorderPoint } from '../inventory';
 import {
   DOC_SHAPES,
   NAME_ADD_ONLY,
@@ -111,6 +115,28 @@ function invOf(l: P): P {
   return out;
 }
 
+/**
+ * The percent an invoice's percent discount was entered as. Only the dollar amount is stored
+ * (round2(subtotal × percent / 100), the percent itself rounded to 2 places), so this finds the
+ * simplest percent — whole, then 1 decimal, then 2 — that gives back exactly that dollar amount
+ * (null when none does; the invoice then travels as a dollar discount).
+ */
+export function discountPercentOf(subtotal: unknown, discount: unknown): string | null {
+  const s = Money.of(String(subtotal ?? '0'));
+  const d = Money.of(String(discount ?? '0'));
+  if (!s.greaterThan(0) || !d.greaterThan(0)) return null;
+  const exact = d.dividedBy(s).times(100);
+  const gives = (p: ReturnType<typeof Money.of>) => Money.round2(Money.mul(s, Money.div(p, 100))).equals(d);
+  for (const places of [0, 1, 2]) {
+    const step = Money.of(1).dividedBy(10 ** places);
+    const mid = exact.toDecimalPlaces(places);
+    for (const p of [mid, mid.minus(step), mid.plus(step)]) {
+      if (p.greaterThan(0) && !p.greaterThan(100) && gives(p)) return p.toFixed(places);
+    }
+  }
+  return null;
+}
+
 async function lineRef(ctx: ServiceContext, lineId: string): Promise<LineRef> {
   const ref = await lineRefOf(ctx, lineId);
   if (!ref) throw new ServiceError('NOT_FOUND', 'A journal line this record uses is missing from the file.');
@@ -133,9 +159,12 @@ async function invoicePayload(ctx: ServiceContext, id: string): Promise<P> {
     classId: r.classId,
     jobId: r.jobId,
     salesRepId: r.salesRepId,
-    // The stored discount is the dollar amount (a percent discount was already worked out).
-    discount: nz(r.discount),
-    discountType: 'amount',
+    // The stored discount is the dollar amount; a percent discount travels as its percent so the
+    // client's invoice keeps "percent" (and the same dollar amount).
+    ...(() => {
+      const pct = r.discountType === 'percent' ? discountPercentOf(r.subtotal, r.discount) : null;
+      return pct ? { discount: pct, discountType: 'percent' } : { discount: nz(r.discount), discountType: 'amount' };
+    })(),
     retainagePercent: nz(r.retainagePercent),
     memo: r.memo,
     currency: r.currency,
@@ -162,6 +191,8 @@ async function invoicePayload(ctx: ServiceContext, id: string): Promise<P> {
       taxRateId: l.taxRateId,
       classId: l.classId,
       jobId: l.jobId,
+      // Progress-invoicing link (the invoice form round-trips it; removing it travels too).
+      estimateLineId: l.estimateLineId ?? null,
       ...invOf(l as P),
     })),
   };
@@ -540,16 +571,33 @@ const PAYLOAD_OF: Record<DocType, (ctx: ServiceContext, id: string) => Promise<P
   inventory_adjustment: inventoryAdjustmentPayload,
 };
 
-/** The record as its service's input (dates as ISO strings, money as decimal strings). */
-export function docPayload(ctx: ServiceContext, type: DocType, id: string): Promise<P> {
-  return PAYLOAD_OF[type](ctx, id);
+/**
+ * The record as its service's input (dates as ISO strings, money as decimal strings). A line (or
+ * adjustment) at the DEFAULT inventory site travels without a site: the default site may have been
+ * created in the copy (the first inventory form there makes it) and its id is not in the client's
+ * file — without a site the client's own default site is used, which is the same place.
+ */
+export async function docPayload(ctx: ServiceContext, type: DocType, id: string): Promise<P> {
+  const p = await PAYLOAD_OF[type](ctx, id);
+  const [def] = await ctx.db
+    .select({ id: inventorySites.id })
+    .from(inventorySites)
+    .where(and(eq(inventorySites.companyId, ctx.companyId), eq(inventorySites.isDefault, true)));
+  if (def) {
+    const strip = (x: P) => {
+      if (x.siteId === def.id && !x.binId) delete x.siteId;
+    };
+    strip(p);
+    if (Array.isArray(p.lines)) for (const l of p.lines as P[]) strip(l);
+  }
+  return p;
 }
 
 /** A name / item as its create input (`forEdit`: only the fields an Accountant's Copy may change). */
 export async function namePayload(ctx: ServiceContext, type: NameType, id: string, forEdit = false): Promise<P> {
   const { table, cols } = NAME_COLUMNS[type];
   const extra: Record<NameType, string[]> = {
-    customer: ['parent_id'],
+    customer: ['parent_id', 'price_level_id', 'ship_to_addresses'],
     vendor: ['currency'],
     item: ['type', 'income_account_id', 'expense_account_id', 'asset_account_id', 'tracking_mode', 'uom_set_id'],
     other_name: [],
@@ -565,6 +613,25 @@ export async function namePayload(ctx: ServiceContext, type: NameType, id: strin
   for (const [k, spec] of Object.entries(shape)) {
     if (forEdit && NAME_ADD_ONLY[type].includes(k)) continue;
     out[k] = normalizeField(row[k], spec);
+  }
+  if (Array.isArray(out.shipToAddresses)) {
+    // Only the ship-to fields the file carries (lib/shipTo.ts), as strings.
+    const keys = ['line1', 'line2', 'city', 'state', 'zip', 'country'] as const;
+    const list = (out.shipToAddresses as P[]).filter((a) => a && typeof a === 'object' && typeof a.name === 'string');
+    out.shipToAddresses = list.length
+      ? list.map((a) => {
+          const s: P = { name: a.name };
+          for (const k of keys) if (typeof a[k] === 'string') s[k] = a[k];
+          if (typeof a.isDefault === 'boolean') s.isDefault = a.isDefault;
+          return s;
+        })
+      : null;
+  }
+  if (out.customFields && typeof out.customFields === 'object') {
+    // Custom field values are strings (customFields.ts); drop empty ones.
+    const cf: Record<string, string> = {};
+    for (const [k, v] of Object.entries(out.customFields as P)) if (typeof v === 'string' && v !== '') cf[k] = v;
+    out.customFields = Object.keys(cf).length ? cf : null;
   }
   return out;
 }
@@ -877,23 +944,73 @@ export async function voidDoc(tx: ServiceContext, type: DocType, id: string): Pr
   }
 }
 
-/** Create a name / item; returns the new (client) id. */
-export async function createName(tx: ServiceContext, type: NameType, p: P): Promise<string> {
-  switch (type) {
-    case 'customer':
-      return (await createCustomer(tx, asInput<CreateCustomerInput>(p))).id;
-    case 'vendor':
-      return (await createVendor(tx, asInput<CreateVendorInput>(p))).id;
-    case 'item':
-      return (await createItem(tx, asInput<CreateItemInput>(p))).id;
-    case 'other_name':
-      return (await createEntry(tx, 'other-names', p)).id;
+/**
+ * Fields of a name / item that its create / update service does not take; they are set through
+ * their own services (custom field values, customer type, reorder point).
+ */
+const NAME_SIDE_FIELDS = ['customFields', 'customerTypeId', 'reorderPoint'] as const;
+
+function splitSideFields(p: P): { main: P; side: P } {
+  const main: P = { ...p };
+  const side: P = {};
+  for (const k of NAME_SIDE_FIELDS) {
+    if (k in main) {
+      side[k] = main[k];
+      delete main[k];
+    }
+  }
+  return { main, side };
+}
+
+/** Set the side fields (only those present in `side`) through their own services. */
+async function applySideFields(tx: ServiceContext, type: NameType, id: string, side: P): Promise<void> {
+  if ('customFields' in side && (type === 'customer' || type === 'vendor' || type === 'item')) {
+    const want = (side.customFields ?? {}) as Record<string, string>;
+    const table = NAME_COLUMNS[type].table;
+    const res = await tx.db.execute(sql`SELECT custom_fields AS cf FROM ${sql.raw(table)} WHERE company_id = ${tx.companyId}::uuid AND id = ${id}::uuid`);
+    const have = ((res as unknown as { rows: Array<{ cf: Record<string, unknown> | null }> }).rows[0]?.cf ?? {}) as Record<string, unknown>;
+    const values: Record<string, string> = {};
+    for (const [k, v] of Object.entries(want)) if (have[k] !== v) values[k] = v;
+    for (const k of Object.keys(have)) if (!(k in want) && have[k] !== null && have[k] !== '') values[k] = ''; // '' clears it
+    if (Object.keys(values).length) await setEntityCustomFields(tx, type, id, values);
+  }
+  if ('customerTypeId' in side && type === 'customer') {
+    await assignCustomerPricing(tx, id, { customerTypeId: (side.customerTypeId as string | null) ?? null });
+  }
+  if ('reorderPoint' in side && type === 'item') {
+    await setReorderPoint(tx, id, (side.reorderPoint as string | null) ?? null);
   }
 }
 
+/** Create a name / item; returns the new (client) id. */
+export async function createName(tx: ServiceContext, type: NameType, p: P): Promise<string> {
+  const { main, side } = splitSideFields(p);
+  const id = await (async () => {
+    switch (type) {
+      case 'customer':
+        return (await createCustomer(tx, asInput<CreateCustomerInput>(main))).id;
+      case 'vendor':
+        return (await createVendor(tx, asInput<CreateVendorInput>(main))).id;
+      case 'item':
+        return (await createItem(tx, asInput<CreateItemInput>(main))).id;
+      case 'other_name':
+        return (await createEntry(tx, 'other-names', main)).id as string;
+    }
+  })();
+  // A new record has nothing to clear: set only what has a value.
+  const set: P = {};
+  for (const [k, v] of Object.entries(side)) if (v !== null && v !== undefined) set[k] = v;
+  await applySideFields(tx, type, id, set);
+  return id;
+}
+
+/** Edit a name / item: `p` holds the fields to change (all of them, or the ones the accountant changed). */
 export async function updateName(tx: ServiceContext, type: NameType, id: string, p: P): Promise<void> {
-  const patch: P = { ...p };
+  const { main, side } = splitSideFields(p);
+  const patch: P = { ...main };
   for (const k of NAME_ADD_ONLY[type]) delete patch[k];
+  await applySideFields(tx, type, id, side);
+  if (!Object.keys(patch).length) return;
   switch (type) {
     case 'customer':
       await updateCustomer(tx, id, patch as never);
@@ -957,7 +1074,7 @@ const qtyText = (v: unknown) => {
 function salesLine(L: Labels, l: P): string {
   const what = l.itemId ? L.item(l.itemId) : L.account(l.accountId);
   const amount = l.rate != null ? Money.mul(String(l.quantity ?? '1'), String(l.rate)) : null;
-  const extras = [l.description, l.classId ? `class ${L.cls(l.classId)}` : null].filter(Boolean);
+  const extras = [l.description, l.classId ? `class ${L.cls(l.classId)}` : null, l.estimateLineId ? 'bills an estimate line' : null].filter(Boolean);
   return `${what} — ${qtyText(l.quantity)} × ${money(l.rate ?? 0)}${amount ? ` = ${money(toAmountString(amount))}` : ''}${extras.length ? ` (${extras.join(', ')})` : ''}`;
 }
 
@@ -990,7 +1107,7 @@ export function describeDoc(type: DocType, p: P, L: Labels): Described {
       const head = `${DOC_LABEL[type]}${num('refNumber')} for ${who}, ${day}${p.status === 'draft' && type === 'invoice' ? ' (pending)' : ''}`;
       const extra = [
         ...(type === 'sales_receipt' && p.depositAccountId ? [`Deposited to ${L.account(p.depositAccountId)}`] : []),
-        ...(p.discount ? [`Discount ${money(p.discount)}`] : []),
+        ...(p.discount ? [p.discountType === 'percent' ? `Discount ${Number(p.discount)}%` : `Discount ${money(p.discount)}`] : []),
         ...(type !== 'invoice' && type !== 'sales_receipt' && type !== 'credit_memo' && p.status ? [`Status: ${p.status}`] : []),
       ];
       return {
@@ -1095,6 +1212,16 @@ export function describeName(type: NameType, p: P, L: Labels): Described {
     const a = p[k] as Record<string, string> | null | undefined;
     if (a && Object.values(a).some(Boolean)) lines.push(`${k === 'shippingAddress' ? 'Ship to' : 'Address'}: ${Object.values(a).filter(Boolean).join(', ')}`);
   }
+  if (p.reorderPoint != null) lines.push(`Reorder point: ${Number(p.reorderPoint)}`);
+  if (p.customFields && typeof p.customFields === 'object') {
+    const cf = Object.entries(p.customFields as P).filter(([, v]) => v !== null && v !== '');
+    if (cf.length) lines.push(`Custom fields: ${cf.map(([k, v]) => `${k}: ${String(v)}`).join(', ')}`);
+  }
+  if (Array.isArray(p.shipToAddresses) && p.shipToAddresses.length) {
+    lines.push(`Ship-to addresses: ${(p.shipToAddresses as P[]).map((a) => String(a.name)).join(', ')}`);
+  }
+  if (p.priceLevelId) lines.push('Has a price level');
+  if (p.customerTypeId) lines.push('Has a customer type');
   if (p.is1099) lines.push('1099 vendor');
   if (p.type) lines.push(`Type: ${String(p.type).replace(/_/g, ' ')}`);
   if (p.parentId) lines.push(`Under ${L.name(p.parentId)}`);

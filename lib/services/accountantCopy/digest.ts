@@ -12,6 +12,11 @@
  * out (balances, amounts paid / credited / invoiced, status, print / email flags, the posted
  * entry, ids of re-posted lines). Both files compute it with the same SQL on the same data, so
  * an unchanged record has the same digest everywhere.
+ *
+ * Names and items are the exception: their "digest" is the JSON of the columns a copy may change
+ * (NAME_COLUMNS), not an md5 of it. It compares the same way, and it also says WHICH fields
+ * changed, so a name both sides edited only conflicts when they changed the same field
+ * (nameFieldValues / changedNameFields).
  */
 import { sql, type SQL } from 'drizzle-orm';
 import type { ServiceContext } from '../_base';
@@ -148,7 +153,11 @@ export const DOC_DIGEST: Record<Exclude<DocType, 'inventory_adjustment'>, Digest
   },
 };
 
-/** Name / item columns an Accountant's Copy may edit (payload key → column). */
+/**
+ * Name / item columns an Accountant's Copy may edit (payload key → column). Every column the
+ * name / item screens the copy allows can change is here (or refused as structural in guard.ts),
+ * so no edit goes unnoticed.
+ */
 export const NAME_COLUMNS: Record<NameType, { table: string; cols: Record<string, string> }> = {
   customer: {
     table: 'customers',
@@ -157,6 +166,7 @@ export const NAME_COLUMNS: Record<NameType, { table: string; cols: Record<string
       billingAddress: 'billing_address', shippingAddress: 'shipping_address', terms: 'terms', termsId: 'terms_id',
       creditLimit: 'credit_limit', taxable: 'taxable', taxRateId: 'tax_rate_id', salesTaxCodeId: 'sales_tax_code_id',
       resaleNumber: 'resale_number', taxExemptionReason: 'tax_exemption_reason', notes: 'notes',
+      customFields: 'custom_fields', customerTypeId: 'customer_type_id',
     },
   },
   vendor: {
@@ -165,6 +175,7 @@ export const NAME_COLUMNS: Record<NameType, { table: string; cols: Record<string
       displayName: 'display_name', companyName: 'company_name', email: 'email', phone: 'phone', address: 'address',
       terms: 'terms', termsId: 'terms_id', is1099: 'is_1099', defaultExpenseAccountId: 'default_expense_account_id',
       notes: 'notes', printOnCheckAs: 'print_on_check_as', accountNumber: 'account_number', prefillAccountIds: 'prefill_account_ids',
+      customFields: 'custom_fields',
     },
   },
   item: {
@@ -172,7 +183,7 @@ export const NAME_COLUMNS: Record<NameType, { table: string; cols: Record<string
     cols: {
       name: 'name', sku: 'sku', description: 'description', salesPrice: 'sales_price', purchaseCost: 'purchase_cost',
       taxable: 'taxable', salesTaxCodeId: 'sales_tax_code_id', unitOfMeasure: 'unit_of_measure', barcode: 'barcode',
-      weight: 'weight', preferredVendorId: 'preferred_vendor_id',
+      weight: 'weight', preferredVendorId: 'preferred_vendor_id', reorderPoint: 'reorder_point', customFields: 'custom_fields',
     },
   },
   other_name: {
@@ -209,7 +220,26 @@ function nameDigestSql(type: NameType): string {
   const args = Object.entries(cols)
     .map(([k, c]) => `'${k}', t.${c}`)
     .join(', ');
-  return `md5(jsonb_build_object(${args})::text)`;
+  return `jsonb_build_object(${args})::text`;
+}
+
+/** The field values a name / item "digest" holds (null for an md5 digest of an older copy). */
+export function nameFieldValues(digest: string | null | undefined): Record<string, unknown> | null {
+  if (!digest || !digest.startsWith('{')) return null;
+  try {
+    const v = JSON.parse(digest) as unknown;
+    return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Fields of `type` whose values differ between two name / item digests (null when unknown). */
+export function changedNameFields(type: NameType, a: string | null | undefined, b: string | null | undefined): string[] | null {
+  const x = nameFieldValues(a);
+  const y = nameFieldValues(b);
+  if (!x || !y) return null;
+  return Object.keys(NAME_COLUMNS[type].cols).filter((k) => JSON.stringify(x[k] ?? null) !== JSON.stringify(y[k] ?? null));
 }
 
 export type VersionedType = Exclude<DocType, 'inventory_adjustment'> | NameType;

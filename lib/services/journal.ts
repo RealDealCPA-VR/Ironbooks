@@ -34,6 +34,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertPeriodOpen } from './fiscalPeriods';
+import { assertAccountantMayVoidEntry } from './accountantCopy/guard';
 import { balanceFixes, balanceSummary } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
@@ -721,11 +722,12 @@ export async function reverseEntry(ctx: ServiceContext, id: string, asOfDate?: D
 export async function voidEntry(ctx: ServiceContext, id: string) {
   // Confirm the entry belongs to this company before delegating to the engine.
   const [entry] = await ctx.db
-    .select({ id: journalEntries.id, companyId: journalEntries.companyId })
+    .select({ id: journalEntries.id, companyId: journalEntries.companyId, sourceRef: journalEntries.sourceRef })
     .from(journalEntries)
     .where(and(eq(journalEntries.id, id), eq(journalEntries.companyId, ctx.companyId)));
 
   if (!entry) throw notFound('Journal entry');
+  await assertAccountantMayVoidEntry(ctx, entry.sourceRef); // Accountant's Copy (I1): only GJ voids travel
   await assertNoJournalApplications(ctx, id, 'voided');
 
   return voidJournalEntry(ctx, id);

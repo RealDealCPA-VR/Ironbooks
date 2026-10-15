@@ -608,7 +608,7 @@ describe("Accountant's Copy — every form type, applications and reconciliation
     expect(rent.debit).toBe('700.00');
   });
 
-  it('record locking: a name both sides changed is refused; journal charges paid, credits taken off and lines of new entries resolve', async () => {
+  it('record locking: a field both sides changed is refused unless the client keeps theirs; journal charges paid, credits taken off and lines of new entries resolve', async () => {
     const { db, ctx, acct } = client;
     const third = await createAccountantCopy(ctx, { dividingDate: '2026-05-31', dataDir: CLIENT_DIR });
     const [newCo] = await db.select().from(customers).where(and(eq(customers.companyId, ctx.companyId), eq(customers.displayName, 'NewCo LLC')));
@@ -642,8 +642,9 @@ describe("Accountant's Copy — every form type, applications and reconciliation
     const [ja] = await a3.db.select().from(journalItemApplications).where(eq(journalItemApplications.journalEntryId, R.je));
     await unapplyJournalApplication(a3, ja.id);
     await unapplyFromBill(a3, { vendorCreditId: R.vcA, billId: R.billB, amount: '20' });
-    // Names: one the client changed too (conflict), one only the accountant changed.
-    await updateCustomer(a3, newCo.id, { email: 'accounts@newco.test' });
+    // Names: one the client changed too (the email: conflict; the phone: only the accountant), one
+    // only the accountant changed.
+    await updateCustomer(a3, newCo.id, { email: 'accounts@newco.test', phone: '555-0400' });
     await updateVendor(a3, auditVendor.id, { phone: '555-0300' });
     const out = await exportChangesFile(a3, {});
     const accountantTbAtDividing = await tbByCode(a3, endOfDay('2026-05-31'));
@@ -651,21 +652,25 @@ describe("Accountant's Copy — every form type, applications and reconciliation
 
     const review = await reviewChangesFile(ctx, out.buffer);
     expect(review.canImport).toBe(false);
-    expect(review.items.find((i) => i.key === `customer:edit:${newCo.id}`)?.problem).toMatch(/changed in your file/);
+    const conflict = review.items.find((i) => i.key === `customer:edit:${newCo.id}`)!;
+    expect(conflict.problem).toMatch(/You also changed this customer's email in your file/);
+    expect(conflict).toMatchObject({ keepable: true, conflictFields: ['email'] });
+    expect(review.canImportKeepingMine).toBe(true);
     expect(review.items.find((i) => i.key === `vendor:edit:${auditVendor.id}`)?.problem).toBeNull();
     await expect(importChangesFile(ctx, out.buffer)).rejects.toMatchObject({
       code: 'CONFLICT',
-      message: expect.stringMatching(/^Could not import the change to customer NewCo LLC: This record was changed in your file/),
+      message: expect.stringMatching(/^Could not import the change to customer NewCo LLC: You also changed this customer's email/),
     });
     const [stillMine] = await db.select().from(customers).where(eq(customers.id, newCo.id));
     expect(stillMine.email).toBe('billing@newco.test');
 
-    // Without the conflicting change the file imports.
-    const { sha256: _s, ...body } = parseChangesFile(out.buffer);
-    const ok = serializeChangesFile({ ...body, names: body.names.filter((n) => n.id !== newCo.id) });
-    expect((await reviewChangesFile(ctx, ok)).canImport).toBe(true);
-    const res = await importChangesFile(ctx, ok);
-    expect(res.applied).toMatchObject({ names: 1, added: 2, applications: 2 });
+    // Keeping the client's email, the same file imports (no hand editing); the accountant's phone
+    // change to the same customer is still applied.
+    const res = await importChangesFile(ctx, out.buffer, { keepMine: [`customer:edit:${newCo.id}`] });
+    expect(res.keptYours).toEqual(['Customer NewCo LLC: kept your email']);
+    expect(res.applied).toMatchObject({ names: 2, added: 2, applications: 2 });
+    const [merged] = await db.select().from(customers).where(eq(customers.id, newCo.id));
+    expect(merged).toMatchObject({ email: 'billing@newco.test', phone: '555-0400' });
     expect(res.trialBalance.balanced).toBe(true);
     expect(await tbByCode(ctx, endOfDay('2026-05-31'))).toEqual(accountantTbAtDividing);
 

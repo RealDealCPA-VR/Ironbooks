@@ -16,6 +16,7 @@
  * No direct GL posting here — the GL is written exclusively by createInvoice.
  */
 import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
+import { assertAccountantMayBillCosts } from './accountantCopy/guard';
 import { Money, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -384,6 +385,7 @@ export async function addBillablesToInvoice(
   invoiceId: string,
   selection: BillableSelection,
 ): Promise<void> {
+  await assertAccountantMayBillCosts(tx); // Accountant's Copy (I1): the links can't travel back
   const billLineIds = selection.billLineIds ?? [];
   const expenseLineIds = selection.expenseLineIds ?? [];
   const timeEntryIds = selection.timeEntryIds ?? [];
@@ -451,6 +453,7 @@ export async function createInvoiceWithBillables(
   if (!hasSelection) {
     throw validation('Select at least one billable cost or time entry.');
   }
+  await assertAccountantMayBillCosts(ctx); // Accountant's Copy (I1)
 
   const billableLines = await buildBillableLines(ctx, input.customerId, selection);
 

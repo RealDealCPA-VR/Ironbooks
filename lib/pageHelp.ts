@@ -374,7 +374,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/accountant/accountants-copy': {
     title: "Accountant's Copy",
     what: 'Your accountant fixes anything dated on or before a dividing date (entries, sales, bills, payments, reconciliations) while you keep working after it; then you review and import their changes.',
-    first: 'Pick the dividing date and create the copy. When the changes file comes back, open it here, check each change, then import.',
+    first: 'Pick the dividing date and create the copy. When the changes file comes back, open it here, check each change, then import. If you and your accountant changed the same field of a name, tick "Keep mine" or ask them.',
     qb: "Accountant's Copy",
   },
   '/accountant/period-copy': {

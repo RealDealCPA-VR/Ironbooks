@@ -155,6 +155,46 @@ export async function assertAccountantMayConvert(ctx: Pick<ServiceContext, 'db' 
 }
 
 /**
+ * Accountant side: voiding a journal entry from the journal screens. Only General Journal entries
+ * (and reversals) travel back that way; an entry a form or an inventory adjustment posted is
+ * voided with its form. An inventory quantity adjustment has no void in this app at all (its
+ * quantity and site movements would stay), so its entry can't be voided in the copy — enter a new
+ * adjustment that puts the quantity back instead (that one travels).
+ */
+export async function assertAccountantMayVoidEntry(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  sourceRef: string | null,
+): Promise<void> {
+  if (sourceRef === null || sourceRef === 'manual' || sourceRef.startsWith('reversal:')) return;
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (!copy || copy.side !== 'accountant') return;
+  const adjustment = sourceRef.startsWith('item:');
+  throw new ServiceError(
+    'FORBIDDEN',
+    adjustment
+      ? "An inventory adjustment can't be voided or changed in an Accountant's Copy (the void can't be sent back to your client). Enter a new inventory adjustment that corrects the quantity instead."
+      : "This entry was posted by a form, so it can't be voided here in an Accountant's Copy. Open the form and void it there (that change is sent back to your client).",
+    { accountantCopy: true, side: copy.side },
+  );
+}
+
+/**
+ * Accountant side: billing time and costs (bill / check lines and time entries marked billable)
+ * onto an invoice stamps those source records as billed. The changes file carries the invoice
+ * but not those links, so the client could bill the same costs again — refused in the copy; enter
+ * the invoice lines directly and let the client bill the costs, or mark them billed after import.
+ */
+export async function assertAccountantMayBillCosts(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<void> {
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (!copy || copy.side !== 'accountant') return;
+  throw new ServiceError(
+    'FORBIDDEN',
+    "Billable time and costs can't be added to an invoice in an Accountant's Copy (your client's file would still show those costs as unbilled, so they could be billed twice). Enter the invoice lines directly instead.",
+    { accountantCopy: true, side: copy.side },
+  );
+}
+
+/**
  * Accountant side: changing a record dated after the dividing date (applying a credit or payment
  * to an invoice / bill the client entered after it) is refused — that record belongs to the client.
  */

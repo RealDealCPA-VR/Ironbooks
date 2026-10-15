@@ -67,6 +67,7 @@ import {
   type ExpensePayload,
   type JournalPayload,
   type LineRef,
+  type NameChange,
   type NameType,
   type TransferManifest,
   type TransferPayload,
@@ -76,7 +77,7 @@ import {
   safeCompanyName,
 } from './format';
 import { formatDividingDate, runAccountantImport } from './guard';
-import { NAME_COLUMNS, recordStates } from './digest';
+import { NAME_COLUMNS, changedNameFields, recordStates } from './digest';
 import {
   DOC_LABEL,
   DOC_ORDER,
@@ -96,7 +97,7 @@ import {
 } from './docs';
 import { applicationTargets, applyApplication, applyReconciliation, describeApplication, describeReconciliation } from './extras';
 import { addFileLabels, labelsOf, loadLabelMaps } from './labels';
-import { resolveLineRef, type IdMap } from './lineRefs';
+import { resolveLineRef, type IdMap, type LineMap } from './lineRefs';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -323,6 +324,13 @@ export interface ReviewItem {
   problem: string | null;
   /** Something worth knowing that does not stop the import (e.g. a document number used twice). */
   note?: string | null;
+  /**
+   * A name / item both sides changed: the import can still go ahead if you keep your version of
+   * the fields you both changed (the accountant's other changes to it are applied).
+   */
+  keepable?: boolean;
+  /** The fields you both changed (empty when the file can't tell which fields the accountant changed). */
+  conflictFields?: string[];
 }
 
 export interface ChangesReview {
@@ -335,6 +343,8 @@ export interface ChangesReview {
   items: ReviewItem[];
   counts: { added: number; changed: number; voided: number; lists: number; applications: number; reconciliations: number };
   canImport: boolean;
+  /** Every problem is a name / item both sides changed: importing while keeping your version of those is possible. */
+  canImportKeepingMine: boolean;
   closingDate: string | null;
   /** True when some change is dated on/before the closing date (the closing-date password is needed). */
   needsClosingPassword: boolean;
@@ -686,6 +696,52 @@ async function recordUnchanged(
   return 'changed';
 }
 
+type NameEdit = Extract<NameChange, { op: 'edit' }>;
+
+/** "phone, email" from payload keys. */
+const fieldWords = (keys: string[]) => keys.map((k) => k.replace(/([A-Z])/g, ' $1').toLowerCase()).join(', ');
+
+/**
+ * Record locking for a name / item edit, per field: it only conflicts when the client changed one
+ * of the fields the accountant changed (the client editing the email does not block the
+ * accountant's phone change). The field values the copy started from travel in the file (the
+ * name's baseDigest), so this also catches a client change that did not move the record's
+ * version (custom field values). Files without them compare the record's version / digest.
+ */
+async function nameEditCheck(ctx: ServiceContext, n: NameEdit): Promise<{ state: 'ok' | 'missing' | 'changed'; conflicts: string[] }> {
+  const ok = { state: 'ok' as const, conflicts: [] };
+  const version = n.type === 'other_name' ? await otherNameVersion(ctx, n.id) : await currentVersion(ctx, n.type, n.id);
+  if (!version) return { state: 'missing', conflicts: [] };
+  const st = (await recordStates(ctx, n.type, [n.id])).get(n.id);
+  const clientChanged = changedNameFields(n.type, n.baseDigest, st?.digest);
+  if (clientChanged) {
+    if (!n.fields) return clientChanged.length ? { state: 'changed', conflicts: [] } : ok;
+    const conflicts = n.fields.filter((k) => clientChanged.includes(k));
+    return conflicts.length ? { state: 'changed', conflicts } : ok;
+  }
+  if (!n.baseVersion || version.getTime() === new Date(n.baseVersion).getTime()) return ok;
+  if (st && n.baseDigest && st.digest === n.baseDigest) return ok;
+  return { state: 'changed', conflicts: [] };
+}
+
+function nameConflictText(n: NameEdit, conflicts: string[]): string {
+  const what = NAME_LABEL[n.type].toLowerCase();
+  return conflicts.length
+    ? `You also changed this ${what}'s ${fieldWords(conflicts)} in your file after the Accountant's Copy was made. Tick "Keep mine" to keep your version of ${conflicts.length === 1 ? 'that field' : 'those fields'} (the accountant's other changes to it are still applied), or ask your accountant.`
+    : `${changedElsewhere} Tick "Keep mine" to keep your version of this ${what} (the accountant's change to it is skipped), or ask your accountant.`;
+}
+
+/** The part of a name edit the import applies: the accountant's changed fields (less the ones you keep). */
+function nameEditPayload(n: NameEdit, keep: Set<string> | 'all' | undefined): Record<string, unknown> | null {
+  if (keep === 'all') return null;
+  if (!n.fields) return n.after;
+  const keys = n.fields.filter((k) => !keep?.has(k));
+  if (!keys.length) return null;
+  const out: Record<string, unknown> = {};
+  for (const k of keys) if (k in n.after) out[k] = n.after[k];
+  return out;
+}
+
 /** A list record of that type and name already exists (names are unique per list). */
 async function nameTaken(ctx: ServiceContext, type: NameType, name: string): Promise<boolean> {
   const { table } = NAME_COLUMNS[type];
@@ -791,8 +847,9 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       });
       continue;
     }
-    const state = await recordUnchanged(ctx, n.type, n.id, n.baseVersion, n.baseDigest);
-    const before = state === 'missing' ? null : await namePayload(ctx, n.type, n.id, true);
+    const chk = await nameEditCheck(ctx, n);
+    const before = chk.state === 'missing' ? null : await namePayload(ctx, n.type, n.id, true);
+    const shown = nameEditPayload(n, undefined) ?? n.after;
     items.push({
       key: `${n.type}:edit:${n.id}`,
       group: 'name',
@@ -802,8 +859,14 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       title: `Changed ${d.title.charAt(0).toLowerCase()}${d.title.slice(1)}`,
       amount: null,
       before: before ? describeName(n.type, before, L).lines : null,
-      after: before ? nameEditSummary(before, n.after) : d.lines,
-      problem: state === 'missing' ? `This ${NAME_LABEL[n.type].toLowerCase()} no longer exists in your file.` : state === 'changed' ? changedElsewhere : null,
+      after: before ? nameEditSummary(before, shown) : d.lines,
+      problem:
+        chk.state === 'missing'
+          ? `This ${NAME_LABEL[n.type].toLowerCase()} no longer exists in your file.`
+          : chk.state === 'changed'
+            ? nameConflictText(n, chk.conflicts)
+            : null,
+      ...(chk.state === 'changed' ? { keepable: true, conflictFields: chk.conflicts } : {}),
     });
   }
 
@@ -1037,6 +1100,7 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
     items,
     counts,
     canImport: items.every((i) => !i.problem),
+    canImportKeepingMine: items.every((i) => !i.problem || i.keepable),
     closingDate,
     needsClosingPassword,
     formatVersion: file.formatVersion,
@@ -1060,7 +1124,17 @@ export interface ImportResult {
     reconciliations: number;
   };
   note: string | null;
+  /** Name / item changes where you kept your version (all of it, or the fields you both changed). */
+  keptYours: string[];
   trialBalance: { totalDebit: string; totalCredit: string; balanced: boolean };
+}
+
+export interface ImportOptions {
+  /**
+   * Review keys (`customer:edit:<id>`, ...) of names / items both sides changed where you keep your
+   * version: of the fields you both changed when the file says which ones, else of the record.
+   */
+  keepMine?: string[];
 }
 
 const toDate = (iso: string) => {
@@ -1079,12 +1153,14 @@ function describeTxn(t: TxnChange): string {
 /** One unit of the import: applied in its own savepoint so a refused step leaves nothing behind. */
 interface Step {
   label: string;
-  run: (c: ServiceContext) => Promise<void>;
+  /** 'skipped': nothing to apply (you kept your version), not counted. */
+  run: (c: ServiceContext) => Promise<void | 'skipped'>;
   count: keyof ImportResult['applied'];
 }
 
 /** Apply the accountant's changes, then lift the Accountant's Copy restriction. */
-export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Promise<ImportResult> {
+export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opts: ImportOptions = {}): Promise<ImportResult> {
+  const keepMine = new Set(opts.keepMine ?? []);
   assertOwnerOrAdmin(ctx, "import an accountant's changes");
   const file = parseChangesFile(buffer);
   const copy = await matchCopy(ctx, file);
@@ -1110,7 +1186,7 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       await assertChangesWithinDividingDate(tx, file, copy);
       const idMap: IdMap = new Map<string, string>();
       const mapId = <T extends string | null | undefined>(id: T): T => (id ? ((idMap.get(id) ?? id) as T) : id);
-      const usedLines = new Set<string>();
+      const lineMap: LineMap = new Map<string, string>();
       const applied: ImportResult['applied'] = { accounts: 0, classes: 0, names: 0, added: 0, changed: 0, voided: 0, applications: 0, reconciliations: 0 };
       const labelMaps = await loadLabelMaps(tx);
       addFileLabels(labelMaps, file);
@@ -1118,7 +1194,7 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       const helpers = (c: ServiceContext) => ({
         mapId: (id: string) => idMap.get(id) ?? id,
         toDate,
-        line: (ref: LineRef) => resolveLineRef(c, ref, idMap, usedLines),
+        line: (ref: LineRef) => resolveLineRef(c, ref, idMap, lineMap),
       });
 
       const wrap = (label: string, err: unknown): unknown => {
@@ -1134,13 +1210,28 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       // 0. Record locking, before anything is applied: every form, name and item the file edits or
       //    voids must still be what the accountant started from (same version, or — when only a
       //    derived value such as an applied payment moved it — the same substance).
+      //    Names / items are checked per field; where both sides changed the same field you may
+      //    keep yours (opts.keepMine).
+      const nameKeep = new Map<string, Set<string> | 'all'>();
+      const keptYours: string[] = [];
       for (const n of file.names) {
         if (n.op !== 'edit') continue;
-        const state = await recordUnchanged(tx, n.type, n.id, n.baseVersion, n.baseDigest);
-        if (state !== 'ok') {
-          const label = `change to ${NAME_LABEL[n.type].toLowerCase()} ${String(n.after.displayName ?? n.after.name ?? '')}`;
-          throw wrap(label, new ServiceError(state === 'missing' ? 'NOT_FOUND' : 'CONFLICT', state === 'missing' ? 'It no longer exists in your file.' : changedElsewhere));
+        const chk = await nameEditCheck(tx, n);
+        if (chk.state === 'ok') continue;
+        const label = `change to ${NAME_LABEL[n.type].toLowerCase()} ${String(n.after.displayName ?? n.after.name ?? '')}`;
+        if (chk.state === 'changed' && keepMine.has(`${n.type}:edit:${n.id}`)) {
+          const partial = chk.conflicts.length > 0 && Boolean(n.fields);
+          nameKeep.set(n.id, partial ? new Set(chk.conflicts) : 'all');
+          keptYours.push(`${NAME_LABEL[n.type]} ${String(n.after.displayName ?? n.after.name ?? '')}: kept your ${partial ? fieldWords(chk.conflicts) : 'version'}`);
+          continue;
         }
+        throw wrap(
+          label,
+          new ServiceError(
+            chk.state === 'missing' ? 'NOT_FOUND' : 'CONFLICT',
+            chk.state === 'missing' ? 'It no longer exists in your file.' : nameConflictText(n, chk.conflicts),
+          ),
+        );
       }
       for (const d of file.documents) {
         if (d.op === 'add') continue;
@@ -1221,11 +1312,15 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
           label: `${n.op === 'add' ? 'new' : 'change to'} ${NAME_LABEL[n.type].toLowerCase()} ${label}`,
           count: 'names',
           run: async (c) => {
-            const input = await decodePayload(n.after, NAME_SHAPES[n.type], helpers(c));
             if (n.op === 'add') {
-              idMap.set(n.id, await createName(c, n.type, input));
+              const created = await decodePayload(n.after, NAME_SHAPES[n.type], helpers(c));
+              idMap.set(n.id, await createName(c, n.type, created));
               return;
             }
+            // Only the fields the accountant changed (less the ones you keep).
+            const part = nameEditPayload(n, nameKeep.get(n.id));
+            if (!part) return 'skipped';
+            const input = await decodePayload(part, NAME_SHAPES[n.type], helpers(c));
             if (n.type === 'other_name') {
               await updateName(c, n.type, n.id, input);
               return;
@@ -1445,14 +1540,14 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       while (pending.length) {
         const refused: Step[] = [];
         for (const st of pending) {
-          const lines = new Set(usedLines);
+          const lines = new Map(lineMap);
           const ids = new Map(idMap);
           try {
-            await inTransaction(tx, (sp) => st.run(sp));
-            applied[st.count]++;
+            const r = await inTransaction(tx, (sp) => st.run(sp));
+            if (r !== 'skipped') applied[st.count]++;
           } catch (err) {
-            usedLines.clear();
-            for (const l of lines) usedLines.add(l);
+            lineMap.clear();
+            for (const [k, v] of lines) lineMap.set(k, v);
             idMap.clear();
             for (const [k, v] of ids) idMap.set(k, v);
             refused.push(st);
@@ -1480,7 +1575,7 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
           importedAt: new Date(),
           importedBy: tx.userId,
           accountantNote: file.note,
-          result: { applied, preparedBy: file.preparedBy, fileCreatedAt: file.createdAt, warnings: file.warnings },
+          result: { applied, preparedBy: file.preparedBy, fileCreatedAt: file.createdAt, warnings: file.warnings, keptYours },
           updatedAt: new Date(),
         })
         .where(and(eq(accountantCopies.id, copy.id), eq(accountantCopies.status, 'outstanding')))
@@ -1491,12 +1586,13 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         entityType: 'accountant_copy',
         entityId: copy.id,
         oldValues: { status: 'outstanding' },
-        newValues: { status: 'imported', applied, note: file.note },
+        newValues: { status: 'imported', applied, note: file.note, ...(keptYours.length ? { keptYours } : {}) },
       });
       return {
         copy: publicCopy(done),
         applied,
         note: file.note,
+        keptYours,
         trialBalance: { totalDebit: tb.totalDebit, totalCredit: tb.totalCredit, balanced: tb.balanced },
       };
     }),

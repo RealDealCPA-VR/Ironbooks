@@ -78,6 +78,9 @@ interface ReviewItem {
   after: string[] | null;
   problem: string | null;
   note?: string | null;
+  /** A name / item you also changed: you can keep your version of the fields you both changed. */
+  keepable?: boolean;
+  conflictFields?: string[];
 }
 interface Review {
   companyName: string;
@@ -89,6 +92,7 @@ interface Review {
   items: ReviewItem[];
   counts: { added: number; changed: number; voided: number; lists: number; applications?: number; reconciliations?: number };
   canImport: boolean;
+  canImportKeepingMine?: boolean;
   closingDate: string | null;
   needsClosingPassword: boolean;
   formatVersion?: number;
@@ -291,6 +295,12 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
   const [review, setReview] = useState<Review | null>(null);
   const [busy, setBusy] = useState<null | 'review' | 'import' | 'cancel'>(null);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  /** Review keys of names / items you keep your version of. */
+  const [keep, setKeep] = useState<Set<string>>(new Set());
+  const keepable = review ? review.items.filter((i) => i.problem && i.keepable) : [];
+  const importable = Boolean(
+    review && (review.canImport || (review.canImportKeepingMine && keepable.every((i) => keep.has(i.key)))),
+  );
 
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -305,6 +315,7 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
         throw new Error("This is not an accountant's changes file (.ibcx).");
       }
       setReview(await api.post<Review>('/api/accountant-copy/changes/review', parsed));
+      setKeep(new Set());
       setFileJson(parsed);
     } catch (err) {
       toastError(err, 'Could not read the changes file.');
@@ -317,8 +328,11 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
     if (!fileJson) return;
     setBusy('import');
     try {
-      const res = await api.post<{ applied: Applied }>('/api/accountant-copy/changes/import', fileJson);
-      toast(`Imported: ${appliedText(res.applied)}. Your books are unlocked.`, 'success');
+      const keys = keepable.filter((i) => keep.has(i.key)).map((i) => i.key);
+      const url = `/api/accountant-copy/changes/import${keys.length ? `?keep=${encodeURIComponent(keys.join(','))}` : ''}`;
+      const res = await api.post<{ applied: Applied; keptYours?: string[] }>(url, fileJson);
+      const kept = res.keptYours?.length ? ` Kept your version: ${res.keptYours.join('; ')}.` : '';
+      toast(`Imported: ${appliedText(res.applied)}. Your books are unlocked.${kept}`, 'success');
       setReview(null);
       setFileJson(null);
       onChanged();
@@ -398,7 +412,7 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
               <Button variant="secondary" onClick={() => setReview(null)} disabled={busy === 'import'}>
                 Close
               </Button>
-              <Button onClick={doImport} loading={busy === 'import'} disabled={!review.canImport}>
+              <Button onClick={doImport} loading={busy === 'import'} disabled={!importable}>
                 Import these changes
               </Button>
             </div>
@@ -422,9 +436,11 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
               date password when you import.
             </p>
           )}
-          {!review.canImport && (
+          {!importable && (
             <p className="mt-4 text-sm font-semibold text-red-600" role="alert">
-              Some changes can&apos;t be applied (see below). Ask your accountant about them; nothing will be imported until every change can be.
+              {review.canImportKeepingMine
+                ? 'You and your accountant both changed some names or items (see below). Tick "Keep mine" on each to keep your version, or ask your accountant.'
+                : "Some changes can't be applied (see below). Ask your accountant about them; nothing will be imported until every change can be."}
             </p>
           )}
           <div className="mt-4">
@@ -446,6 +462,23 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
                       <p className="mt-1 text-sm font-medium">{i.title}</p>
                       <p className="text-xs text-navy/50">{i.kind}</p>
                       {i.problem && <p className="mt-1 text-xs font-semibold text-red-600">{i.problem}</p>}
+                      {i.problem && i.keepable && (
+                        <label className="mt-1 flex items-center gap-1.5 text-xs font-medium text-navy">
+                          <input
+                            type="checkbox"
+                            checked={keep.has(i.key)}
+                            onChange={(e) =>
+                              setKeep((prev) => {
+                                const next = new Set(prev);
+                                if (e.target.checked) next.add(i.key);
+                                else next.delete(i.key);
+                                return next;
+                              })
+                            }
+                          />
+                          Keep mine{i.conflictFields?.length ? ` (${i.conflictFields.map((f) => f.replace(/([A-Z])/g, ' $1').toLowerCase()).join(', ')})` : ''}
+                        </label>
+                      )}
                       {i.note && <p className="mt-1 text-xs text-yellow-800">{i.note}</p>}
                     </Td>
                     <Td className="align-top whitespace-nowrap text-sm">{niceDate(i.date)}</Td>
@@ -651,8 +684,9 @@ function AccountantSide({ copy, closingDate }: { copy: CopyRow; closingDate: str
           </li>
           <li>
             Not available here, because they can&apos;t be sent back: deleting, merging or making list entries inactive, changing a list entry&apos;s type,
-            accounts or place in the list, turning estimates, orders or item receipts into invoices or bills, refunds, bounced checks, payroll, and anything
-            dated after the dividing date.
+            accounts or place in the list, turning estimates, orders or item receipts into invoices or bills, adding billable time and costs to an
+            invoice, voiding or changing an inventory adjustment (enter a new one that corrects the quantity), refunds, bounced checks, payroll, and
+            anything dated after the dividing date.
           </li>
           {closingDate && <li>The client&apos;s closing date ({niceDate(closingDate)}) still applies; changes on or before it need the closing date password.</li>}
           <li>When you are done, save the changes file and send it to your client. You can save it again later if you make more changes.</li>
