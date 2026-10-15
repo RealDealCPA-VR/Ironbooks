@@ -14,21 +14,26 @@
  * All money arithmetic uses '@/lib/money'.
  */
 import { and, desc, eq, gte, isNotNull, lte } from 'drizzle-orm';
-import { Money, toAmountString } from '@/lib/money';
+import { Money, allocate, toAmountString } from '@/lib/money';
 import {
+  accounts,
   bankAccounts,
+  bankCategorizationHistory,
   bankTransactions,
+  classes,
   journalEntries,
   journalEntryLines,
 } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
   writeAudit,
 } from './_base';
+import { patternOf, splitError, type RuleSplit } from '@/lib/bankRules/core';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { applyRulesToAccount } from './rules';
 import { accountSigned, foreignCurrencyOfAccount } from './fxLedger';
@@ -49,6 +54,22 @@ export interface CategorizeInput {
    * currency; it is posted at this rate (home units per 1 unit), default the currency list's rate.
    */
   exchangeRate?: string | number | null;
+  /** bankrules: class for the offset line(s). */
+  classId?: string | null;
+  /**
+   * bankrules: split the offset by percentage across accounts (sums to 100). When given, each
+   * split line uses its own account/class and `accountId` is only the "main" account recorded
+   * for learning.
+   */
+  splits?: RuleSplit[] | null;
+  /**
+   * bankrules: who decided this categorization — recorded in the learning history. 'user' (the
+   * default) and 'bulk' (user accepted suggestions in bulk) teach the rules engine; 'rule_auto'
+   * and 'ai' (automatic posts) are kept for reference but never count towards learning.
+   */
+  source?: 'user' | 'bulk' | 'rule' | 'rule_auto' | 'ai';
+  /** bankrules: the rule that produced this categorization (usage statistics). */
+  ruleId?: string | null;
 }
 
 export type ReviewFilter = 'all' | 'unreviewed' | 'matched' | 'excluded';
@@ -202,18 +223,45 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
   }
   const bankFx = fx ? { foreignAmount: absAmt } : {};
 
+  // bankrules: class + percentage splits for the offset side.
+  const splits = input.splits && input.splits.length > 0 ? input.splits : null;
+  if (splits) {
+    const err = splitError(splits);
+    if (err) throw validation(err);
+    for (const sp of splits) {
+      await assertRefInCompany(ctx, accounts, sp.accountId, 'Split account');
+      if (sp.classId) await assertRefInCompany(ctx, classes, sp.classId, 'Split class');
+    }
+  } else if (!input.accountId) {
+    throw validation('Choose an account.');
+  }
+  if (input.classId) await assertRefInCompany(ctx, classes, input.classId, 'Class');
+  const offsets: { accountId: string; classId: string | null; amount: string }[] = splits
+    ? allocate(homeAmt, splits.map((sp) => sp.percent))
+        .map((a, i) => ({
+          accountId: splits[i].accountId,
+          classId: splits[i].classId ?? input.classId ?? null,
+          amount: toAmountString(a),
+        }))
+        .filter((o) => Money.gt(o.amount, 0))
+    : [{ accountId: input.accountId, classId: input.classId ?? null, amount: homeAmt }];
+  const mainAccountId = splits
+    ? [...offsets].sort((a, b) => (Money.gt(b.amount, a.amount) ? 1 : Money.gt(a.amount, b.amount) ? -1 : 0))[0].accountId
+    : input.accountId;
+
   // Build posting lines:
   //   amount > 0 (deposit / credit): money came IN — debit the bank GL, credit the offset.
   //   amount < 0 (withdrawal / debit): money went OUT — debit the offset, credit the bank GL.
+  const memo = input.memo ?? null;
   const lines =
     amt.greaterThan(0)
       ? [
-          { accountId: bankGlAccountId, debit: homeAmt, memo: input.memo ?? null, ...bankFx },
-          { accountId: input.accountId, credit: homeAmt, memo: input.memo ?? null },
+          { accountId: bankGlAccountId, debit: homeAmt, memo, ...bankFx },
+          ...offsets.map((o) => ({ accountId: o.accountId, credit: o.amount, memo, classId: o.classId })),
         ]
       : [
-          { accountId: input.accountId, debit: homeAmt, memo: input.memo ?? null },
-          { accountId: bankGlAccountId, credit: homeAmt, memo: input.memo ?? null, ...bankFx },
+          ...offsets.map((o) => ({ accountId: o.accountId, debit: o.amount, memo, classId: o.classId })),
+          { accountId: bankGlAccountId, credit: homeAmt, memo, ...bankFx },
         ];
 
   const description =
@@ -260,8 +308,29 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
         matched: true,
         matchedEntryId: entry.id,
         ...(fx ? { currency: fx.currency, exchangeRate: fx.rate.toFixed(8), homeAmount: homeAmt } : {}),
+        ...(splits ? { splits } : {}),
+        ...(input.classId ? { classId: input.classId } : {}),
       },
     });
+
+    // bankrules: remember the choice under the line's normalized description (learning + history).
+    const pattern = patternOf(txn);
+    if (pattern) {
+      await tx.db.insert(bankCategorizationHistory).values({
+        companyId: tx.companyId,
+        bankTransactionId: txn.id,
+        bankAccountId: txn.bankAccountId,
+        journalEntryId: entry.id,
+        pattern,
+        direction: amt.greaterThan(0) ? 'in' : 'out',
+        accountId: mainAccountId,
+        classId: splits ? null : input.classId ?? null,
+        payee: input.payee ?? null,
+        split: !!splits,
+        source: input.source ?? 'user',
+        ruleId: input.ruleId ?? null,
+      });
+    }
 
     return { transaction: updated, entry };
   });
@@ -333,6 +402,7 @@ export async function categorizeSuggested(
       await categorize(ctx, {
         bankTransactionId: txn.id,
         accountId: txn.suggestedAccountId,
+        source: 'bulk',
       });
       count += 1;
     } catch (err) {

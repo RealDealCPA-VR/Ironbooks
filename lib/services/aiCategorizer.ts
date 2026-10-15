@@ -378,7 +378,7 @@ export async function autoApplyBankSuggestions(ctx: ServiceContext, bankAccountI
     if (s.source !== 'model' || !s.accountId || s.confidence < threshold) continue;
     try {
       const { entry } = await inTransaction(ctx, async (tx) => {
-        const r = await categorize(tx, { bankTransactionId: s.bankTransactionId, accountId: s.accountId! });
+        const r = await categorize(tx, { bankTransactionId: s.bankTransactionId, accountId: s.accountId!, source: 'ai' });
         await tx.db.insert(aiAutoApplied).values({
           companyId: tx.companyId,
           bankTransactionId: s.bankTransactionId,

@@ -229,6 +229,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Work down the list: confirm the suggested match or choose a category.',
     qb: 'Bank Feeds Center',
   },
+  '/bank-rules': {
+    title: 'Bank rules',
+    what: 'Rules tell the app which account to use for bank lines that look alike, such as every SHELL OIL charge going to Fuel. It also offers rules when you repeat a choice.',
+    first: 'Click "New rule", say what the bank line contains and which account it goes to, then test it.',
+    qb: 'Bank Feeds Rules',
+  },
   '/deposits': {
     title: 'Make Deposits',
     what: 'Group customer payments you took to the bank into one deposit, so it matches your bank statement.',

@@ -43,7 +43,7 @@ export async function loadDemoFeed(
     const fitId = `${bankAccountId}:${s.id}`;
     if (seen.has(fitId)) continue;
     const date = new Date(now.getTime() - s.days * 24 * 60 * 60 * 1000);
-    const suggested = await applyRules(ctx, { description: s.desc, payee: s.payee, amount: s.amount }).catch(
+    const suggested = await applyRules(ctx, { description: s.desc, payee: s.payee, amount: s.amount, bankAccountId }).catch(
       () => null,
     );
     await ctx.db.insert(bankTransactions).values({

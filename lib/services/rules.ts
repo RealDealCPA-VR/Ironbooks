@@ -12,6 +12,7 @@
 import { and, asc, desc, eq } from 'drizzle-orm';
 import { accounts, bankTransactions, transactionRules } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { pickRule } from '@/lib/bankRules/core';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,18 +39,29 @@ export interface BankTxnForRules {
   description?: string | null;
   payee?: string | null;
   amount: string; // decimal string
+  /** bankrules: the feed's bank account (rules limited to one account need it). */
+  bankAccountId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------
 
-/** List all active rules for the company, ordered by priority desc then name asc. */
+/**
+ * List all active, enabled rules for the company, ordered by priority desc then name asc.
+ * (bankrules: disabled rules are kept but never fire — see lib/services/bankRules.ts.)
+ */
 export async function listRules(ctx: ServiceContext) {
   return ctx.db
     .select()
     .from(transactionRules)
-    .where(and(eq(transactionRules.companyId, ctx.companyId), eq(transactionRules.isActive, true)))
+    .where(
+      and(
+        eq(transactionRules.companyId, ctx.companyId),
+        eq(transactionRules.isActive, true),
+        eq(transactionRules.enabled, true),
+      ),
+    )
     .orderBy(desc(transactionRules.priority), asc(transactionRules.name));
 }
 
@@ -128,30 +140,6 @@ export async function deactivateRule(ctx: ServiceContext, id: string) {
 // Rule evaluation
 // ---------------------------------------------------------------------------
 
-function fieldValue(txn: BankTxnForRules, field: MatchField): string {
-  switch (field) {
-    case 'description':
-      return txn.description ?? '';
-    case 'payee':
-      return txn.payee ?? '';
-    case 'amount':
-      return txn.amount;
-  }
-}
-
-function matchesOperator(value: string, operator: MatchOperator, pattern: string): boolean {
-  const v = value.toLowerCase();
-  const p = pattern.toLowerCase();
-  switch (operator) {
-    case 'contains':
-      return v.includes(p);
-    case 'equals':
-      return v === p;
-    case 'starts_with':
-      return v.startsWith(p);
-  }
-}
-
 /** The actionable fields of the highest-priority rule that matched a transaction. */
 export interface MatchedRule {
   setAccountId: string | null;
@@ -173,15 +161,11 @@ export async function matchRule(
   rules?: Awaited<ReturnType<typeof listRules>>,
 ): Promise<MatchedRule | null> {
   const ruleList = rules ?? (await listRules(ctx));
-  for (const rule of ruleList) {
-    const field = rule.matchField as MatchField;
-    const operator = rule.matchOperator as MatchOperator;
-    const value = fieldValue(txn, field);
-    if (matchesOperator(value, operator, rule.matchValue)) {
-      return { setAccountId: rule.setAccountId ?? null, setPayee: rule.setPayee ?? null };
-    }
-  }
-  return null;
+  // bankrules: shared matcher (conditions incl. direction / amount range / bank account, raw +
+  // normalized text, safe wildcard patterns) and precedence (priority, then oldest first).
+  const rule = pickRule(ruleList, txn);
+  if (!rule) return null;
+  return { setAccountId: rule.setAccountId ?? rule.splits?.[0]?.accountId ?? null, setPayee: rule.setPayee ?? null };
 }
 
 /**
@@ -223,7 +207,11 @@ export async function applyRulesToAccount(
 
   let updated = 0;
   for (const txn of txns) {
-    const match = await matchRule(ctx, { description: txn.description, payee: txn.payee, amount: txn.amount }, rules);
+    const match = await matchRule(
+      ctx,
+      { description: txn.description, payee: txn.payee, amount: txn.amount, bankAccountId: txn.bankAccountId },
+      rules,
+    );
     if (!match) continue;
     const set: { suggestedAccountId?: string; payee?: string } = {};
     if (match.setAccountId && match.setAccountId !== txn.suggestedAccountId) {

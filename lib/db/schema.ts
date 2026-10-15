@@ -838,6 +838,53 @@ export const transactionRules = pgTable('transaction_rules', {
   priority: integer('priority').notNull().default(0),
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+  // ---- bankrules (0048): conditions, actions, mode, learning + usage ----
+  /** Only fire for this bank account (null = any). */
+  bankAccountId: uuid('bank_account_id'),
+  /** 'any' | 'in' (money in) | 'out' (money out). */
+  direction: varchar('direction', { length: 10 }).notNull().default('any'),
+  /** Absolute-amount range; min = max means "amount equals". */
+  amountMin: decimal('amount_min', { precision: 15, scale: 2 }),
+  amountMax: decimal('amount_max', { precision: 15, scale: 2 }),
+  setClassId: uuid('set_class_id'),
+  setMemo: varchar('set_memo', { length: 255 }),
+  /** Optional split by percentage: [{ accountId, classId, percent }] summing to 100. */
+  splits: jsonb('splits').$type<{ accountId: string; classId?: string | null; percent: string }[]>(),
+  /** 'suggest' (pre-fill for review) | 'auto' (post automatically). */
+  mode: varchar('mode', { length: 10 }).notNull().default('suggest'),
+  enabled: boolean('enabled').notNull().default(true),
+  learned: boolean('learned').notNull().default(false),
+  appliedCount: integer('applied_count').notNull().default(0),
+  lastAppliedAt: timestamp('last_applied_at'),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** bankrules (0048): every bank-feed line categorized, keyed by its normalized description. */
+export const bankCategorizationHistory = pgTable('bank_categorization_history', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  bankTransactionId: uuid('bank_transaction_id').notNull(),
+  bankAccountId: uuid('bank_account_id').notNull(),
+  journalEntryId: uuid('journal_entry_id').notNull(),
+  pattern: varchar('pattern', { length: 255 }).notNull(),
+  direction: varchar('direction', { length: 10 }).notNull(),
+  accountId: uuid('account_id').notNull(),
+  classId: uuid('class_id'),
+  payee: varchar('payee', { length: 255 }),
+  split: boolean('split').notNull().default(false),
+  /** 'user' | 'bulk' | 'rule' | 'rule_auto' | 'ai' */
+  source: varchar('source', { length: 20 }).notNull().default('user'),
+  ruleId: uuid('rule_id'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** bankrules (0048): "don't offer a rule for this pattern → account again". */
+export const bankRuleDismissals = pgTable('bank_rule_dismissals', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  pattern: varchar('pattern', { length: 255 }).notNull(),
+  accountId: uuid('account_id').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
 // ---- Payroll ----

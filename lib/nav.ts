@@ -106,6 +106,7 @@ export const navGroups: NavGroup[] = [
       { icon: BookOpen, label: 'Registers', path: '/registers', qb: 'Use Register (Check Register)', keywords: 'check register ledger' },
       { icon: Rss, label: 'Bank Feeds', path: '/bank-feeds', qb: 'Bank Feeds', keywords: 'import download bank transactions csv ofx qfx' },
       { icon: ListChecks, label: 'Review bank transactions', path: '/bank-review', qb: 'Bank Feeds Center (review)', keywords: 'match categorize' },
+      { icon: SlidersHorizontal, label: 'Bank rules', path: '/bank-rules', qb: 'Bank Feeds Rules', keywords: 'rules auto categorize always learn renaming' }, // bankrules
       { icon: PiggyBank, label: 'Make Deposits', path: '/deposits', qb: 'Make Deposits', keywords: 'deposit bank undeposited' },
       { icon: Banknote, label: 'Reconcile', path: '/reconcile', qb: 'Reconcile', keywords: 'bank statement balance checkbook' },
       { icon: ArrowLeftRight, label: 'Transfer Funds', path: '/transfers', qb: 'Transfer Funds', keywords: 'move money transfer' },
