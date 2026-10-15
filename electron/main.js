@@ -47,6 +47,7 @@ const hostingCore = require('./hostingCore');
 const hosting = require('./hosting');
 const security = require('./security');
 const { promptForHost } = require('./connectPrompt');
+const { pruneLegacyAutoBackups } = require('./legacyBackups');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
@@ -297,6 +298,11 @@ function backupsDir() {
 }
 
 async function runAutoBackup() {
+  // Pre-history versions wrote `auto-backup-<ts>.bka` here and rotated them in this process;
+  // the server's rotation only touches files in a company file's history, so keep pruning
+  // those legacy files to the newest 10 (as the old AUTO_BACKUP_KEEP did).
+  const legacyRemoved = pruneLegacyAutoBackups(backupsDir());
+  if (legacyRemoved.length) console.log(`[auto-backup] removed ${legacyRemoved.length} old-style backup(s)`);
   if (!serverUrl || remoteHostOrigin) return; // a client never backs up the host's file
   const res = await fetch(`${serverUrl}/api/dashboard/auto-backup?save=1`, {
     method: 'POST',

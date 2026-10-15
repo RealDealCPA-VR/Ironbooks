@@ -10,7 +10,7 @@ import * as React from 'react';
 import { CheckCircle2, AlertTriangle, History, Save, ShieldCheck, Eye } from 'lucide-react';
 import { Badge, Button, Card, Input, Label, Select, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatAge, indicatorDetail, sourceLabel, type BackupStatusDto } from '@/lib/backupStatusText';
+import { formatAge, indicatorDetail, scheduleCopy, sourceLabel, type BackupStatusDto } from '@/lib/backupStatusText';
 import { BACKUP_CHANGED_EVENT, notifyBackupChanged } from './BackupStatus';
 import { formatBytes } from './BackupPreviewModal';
 
@@ -66,6 +66,13 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
     keep: '14',
     folder: '',
   });
+
+  // Only the desktop shell backs up on close; decided after mount so server and client render match.
+  const [isDesktop, setIsDesktop] = React.useState(false);
+  React.useEffect(() => {
+    setIsDesktop(Boolean((window as unknown as { bookkeeper?: { isDesktop?: boolean } }).bookkeeper?.isDesktop));
+  }, []);
+  const copy = scheduleCopy(isDesktop);
 
   const load = React.useCallback(async () => {
     try {
@@ -182,8 +189,7 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
       <Card className="p-6 flex flex-col gap-3">
         <h2 className="text-lg font-bold text-navy">Automatic backups</h2>
         <p className="text-sm text-navy/60">
-          While Ironbooks is open it saves a copy of the whole company file on this schedule, and again when you
-          close the app. A copy is skipped when nothing has changed since the last one. Older copies are removed
+          {copy.intro} A copy is skipped when nothing has changed since the last one. Older copies are removed
           so only the most recent ones are kept. Copies you make with Back up now are kept separately (the newest{' '}
           {MANUAL_COPIES_KEPT}).
         </p>
@@ -198,8 +204,11 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
               >
                 <option value="daily">Every day</option>
                 <option value="hours">Every few hours</option>
-                <option value="off">Off (only when the app closes)</option>
+                <option value="off">{copy.offLabel}</option>
               </Select>
+              {form.schedule === 'off' && (
+                <p className="mt-1 text-xs text-navy/50 max-w-xs">{copy.offHint}</p>
+              )}
             </div>
             {form.schedule === 'hours' && (
               <div className="w-36">

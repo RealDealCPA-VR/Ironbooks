@@ -86,3 +86,28 @@ export function bannerDismissed(dismissedUntil: string | null, now: Date = new D
   const t = Number(dismissedUntil);
   return Number.isFinite(t) && t > now.getTime();
 }
+
+/**
+ * Wording for the "Automatic backups" settings. Only the desktop app (electron/main.js) makes a
+ * backup when it closes; in a plain browser "Off" means no automatic backups at all, so the copy
+ * must not promise a close-time backup there.
+ */
+export interface ScheduleCopy {
+  intro: string;
+  offLabel: string;
+  /** Shown under the schedule picker when "Off" is selected. */
+  offHint: string;
+}
+
+export function scheduleCopy(isDesktop: boolean): ScheduleCopy {
+  const intro = isDesktop
+    ? 'While Ironbooks is open it saves a copy of the whole company file on this schedule, and again when you close the app.'
+    : 'While Ironbooks is open it saves a copy of the whole company file on this schedule.';
+  return {
+    intro,
+    offLabel: 'Off',
+    offHint: isDesktop
+      ? 'The desktop app still makes a backup when it closes.'
+      : 'No automatic backups will be made. Use Back up now to save a copy. (The desktop app also makes a backup when it closes.)',
+  };
+}

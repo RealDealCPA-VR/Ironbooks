@@ -63,6 +63,7 @@ import { readBackupHistory, saveBackupSettings, type BackupRecord } from './back
 import { currentFingerprint } from './backupFingerprint';
 import { isSchedulerRunning, runScheduledBackupIfDue, runVersionedBackup, stopBackupScheduler } from './backupSchedule';
 import { PREVIEW_DIR_PREFIX, previewBackup } from './backupPreview';
+import { trialBalance } from './reports';
 import type { ServiceContext } from './_base';
 import { GET as fullBackupGET } from '@/app/api/backup/route';
 import { GET as companyBackupGET } from '@/app/api/backup/company/route';
@@ -404,8 +405,16 @@ describe('backups you can see and trust', () => {
   describe('restore preview', () => {
     it('reads a version read-only in a temp folder: companies, counts, last date, balanced totals, date and version', async () => {
       const startedAt = Date.now();
-      const liveCount = await postedCount(db);
       const version = history().find((r) => r.source === 'scheduled' && !r.prunedAt)!;
+      // The version matches the live file right now; change the live file afterwards so the
+      // preview can only pass if it reads the backup copy, not the live database.
+      const liveCountBefore = await postedCount(db);
+      const liveTbBefore = await trialBalance(trusted);
+      await postSale('123.45', '2026-06-15');
+      const liveCount = await postedCount(db);
+      const liveTbAfter = await trialBalance(trusted);
+      expect(liveCount).toBe(liveCountBefore + 1);
+      expect(liveTbAfter.totalDebit).not.toBe(liveTbBefore.totalDebit);
 
       as(ownerId, 'POST', '/api/backups/preview');
       const res = await previewPOST(req(`/api/backups/preview?id=${version.id}`, { method: 'POST' }));
@@ -420,10 +429,15 @@ describe('backups you can see and trust', () => {
       const c = p.companies[0];
       expect(c.name).toBe('Backup Bakery');
       expect(c.transactions).toBeGreaterThanOrEqual(2);
-      expect(c.lastTransactionDate).toBe('2026-05-01');
+      // Counts, last date and totals come from the backup copy, not the live file.
+      expect(c.transactions).toBe(liveCountBefore);
+      expect(c.transactions).toBeLessThan(liveCount);
+      expect(c.lastTransactionDate).toBe('2026-05-01'); // live file's last entry is 2026-06-15
       expect(c.trialBalance.balanced).toBe(true);
       expect(c.trialBalance.totalDebit).toBe(c.trialBalance.totalCredit);
       expect(Number(c.trialBalance.totalDebit)).toBeGreaterThan(0);
+      expect(c.trialBalance.totalDebit).toBe(liveTbBefore.totalDebit);
+      expect(c.trialBalance.totalDebit).not.toBe(liveTbAfter.totalDebit);
 
       // The live company file was not closed, swapped or changed.
       expect(await getDb(TEST_DIR)).toBe(db);

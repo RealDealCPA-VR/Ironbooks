@@ -24,7 +24,7 @@ import {
   type BackupRecord,
   type BackupSettings,
 } from './backupHistory';
-import { bannerDismissed, formatAge, indicatorDetail, indicatorText, BANNER_DISMISS_MS } from '@/lib/backupStatusText';
+import { bannerDismissed, formatAge, indicatorDetail, indicatorText, scheduleCopy, BANNER_DISMISS_MS } from '@/lib/backupStatusText';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -261,5 +261,30 @@ describe('indicator text', () => {
     expect(bannerDismissed(null, NOW)).toBe(false);
     expect(bannerDismissed(until, new Date(NOW.getTime() + 23 * HOUR))).toBe(true);
     expect(bannerDismissed(until, new Date(NOW.getTime() + 25 * HOUR))).toBe(false);
+  });
+});
+
+describe('automatic-backup schedule wording (desktop vs browser)', () => {
+  it('never promises a close-time backup in the browser', () => {
+    const web = scheduleCopy(false);
+    expect(web.offLabel).toBe('Off');
+    expect(web.intro).not.toMatch(/close/i);
+    expect(web.offHint).toMatch(/No automatic backups/);
+    expect(web.offHint).toMatch(/desktop app/i);
+  });
+
+  it('mentions the close-time backup in the desktop app', () => {
+    const desk = scheduleCopy(true);
+    expect(desk.offLabel).toBe('Off');
+    expect(desk.intro).toMatch(/when you close the app/);
+    expect(desk.offHint).toBe('The desktop app still makes a backup when it closes.');
+  });
+
+  it('the Backup Center renders this wording instead of the old hard-coded label', () => {
+    const src = fs.readFileSync(path.resolve(__dirname, '..', '..', 'components', 'BackupCenter.tsx'), 'utf8');
+    expect(src).not.toContain('only when the app closes');
+    expect(src).toContain('{copy.offLabel}');
+    expect(src).toContain('{copy.offHint}');
+    expect(src).toContain('scheduleCopy(isDesktop)');
   });
 });
