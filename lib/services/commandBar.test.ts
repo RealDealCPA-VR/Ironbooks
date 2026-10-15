@@ -14,6 +14,7 @@ import {
   accounts,
   bankAccounts,
   bills as billsTable,
+  companies,
   customers,
   estimates,
   expenses as expensesTable,
@@ -37,7 +38,7 @@ import { createInvoice } from './invoices';
 import { profitAndLoss } from './reports';
 import { getPublicSettings, updateSettings } from './aiSettings';
 import { setNetworkPolicy } from './networkPolicy';
-import { runCommand, type CommandResult } from './commandBar';
+import { executeIntent, runCommand, type CommandResult } from './commandBar';
 
 const TEST_ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-command-bar');
 const TEST_DIR = path.join(TEST_ROOT, 'data');
@@ -522,5 +523,133 @@ describe('AI fallback (only when configured; same executor; never writes)', () =
     expect(sent.length).toBeGreaterThan(0);
     for (const wire of sent) expect(wire).not.toContain('Bayside Bakery');
     await updateSettings(ctx, { cloudEnabled: false, taskPolicies: { assistant: 'local-only' } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1 fixes
+// ---------------------------------------------------------------------------
+
+describe('typed amounts reach the prefilled form', () => {
+  it('invoice: "2 widgets $100" → 2 × $50 (the $100 is the line total)', async () => {
+    const r = expectType(await run('invoice Acme Corporation 2 widgets $100'), 'prefill');
+    expect(r.prefill.lines).toEqual([expect.objectContaining({ itemId: item.widget, quantity: '2', rate: '50', rateFromUser: true })]);
+    expect(r.summary).toContain('total $100.00');
+  });
+
+  it('bill: "2 widgets $100" → 2 × $50 = $100', async () => {
+    const r = expectType(await run('bill from Staples 2 widgets $100'), 'prefill');
+    expect(r.prefill.lines).toEqual([expect.objectContaining({ itemId: item.widget, quantity: '2', rate: '50', amount: '100.00' })]);
+    expect(r.summary).toContain('total $100.00');
+  });
+
+  it('check: "2 widgets $10" → 2 × $5 = $10', async () => {
+    const r = expectType(await run('check to Shell Oil 2 widgets $10'), 'prefill');
+    expect(r.prefill).toMatchObject({ kind: 'expense', vendorId: vend.shell });
+    expect(r.prefill.lines).toEqual([expect.objectContaining({ itemId: item.widget, quantity: '2', rate: '5', amount: '10.00' })]);
+  });
+
+  it('bill: "3 widgets" on an item line is three widgets at cost, not $3', async () => {
+    const r = expectType(await run('bill from Staples 3 widgets'), 'prefill');
+    expect(r.prefill.lines).toEqual([expect.objectContaining({ itemId: item.widget, quantity: '3', rate: '5', amount: '15.00' })]);
+  });
+
+  it('bill: "$3 widgets" is still $3 (a typed dollar sign is money)', async () => {
+    const r = expectType(await run('bill from Staples $3 widgets'), 'prefill');
+    expect(r.prefill.lines).toEqual([expect.objectContaining({ itemId: item.widget, quantity: '1', rate: '3', amount: '3.00' })]);
+  });
+
+  it('bill: a bare number on an expense-account line stays dollars', async () => {
+    const r = expectType(await run('bill from Staples 120 office supplies'), 'prefill');
+    expect(r.prefill.lines).toEqual([{ accountId: acct['6300'], description: 'office supplies', amount: '120.00' }]);
+  });
+
+  it('bill: "0 widgets $100" keeps the $100 and says the 0 was left out', async () => {
+    const r = expectType(await run('bill from Staples 0 widgets $100'), 'prefill');
+    expect(r.prefill.lines).toEqual([expect.objectContaining({ itemId: item.widget, quantity: '1', amount: '100.00' })]);
+    expect(r.notes.join(' ')).toMatch(/couldn't tell what “0” was for on line 1/);
+  });
+
+  it('an extra number is reported in the notes instead of being dropped', async () => {
+    const r = expectType(await run('invoice Acme Corporation 2 widgets $50 for $100'), 'prefill');
+    expect(r.prefill.lines[0]).toMatchObject({ quantity: '2', rate: '50' });
+    expect(r.notes.join(' ')).toMatch(/couldn't tell what “\$50” was for/);
+  });
+});
+
+describe('bad numbers are a 400 (ServiceError), never a 500', () => {
+  const create = (form: 'invoice' | 'bill' | 'expense', line: Record<string, string>) =>
+    runCommand(ctx, { intent: { kind: 'create', form, party: form === 'invoice' ? 'Acme Corporation' : 'Staples', lines: [{ text: 'widget', ...line }] } as never }, { today: TODAY });
+
+  it.each(['invoice', 'bill', 'expense'] as const)('%s: quantity 0 is rejected', async (form) => {
+    await expect(create(form, { quantity: '0', amount: '100' })).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
+  it.each(['invoice', 'bill', 'expense'] as const)('%s: an amount that overflows 13 digits is rejected', async (form) => {
+    const err = await create(form, { quantity: '9999999999999', rate: '9999999999999' }).catch((e) => e);
+    expect(err).toBeInstanceOf(ServiceError);
+    expect(err).toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/too large/) });
+  });
+
+  it('a derived unit rate that overflows is rejected', async () => {
+    const err = await create('bill', { quantity: '0.0001', amount: '9999999999999' }).catch((e) => e);
+    expect(err).toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/too large/) });
+  });
+
+  it('the executor itself refuses a zero quantity (defence in depth, no Infinity)', async () => {
+    for (const form of ['invoice', 'bill', 'expense'] as const) {
+      const intent = { kind: 'create' as const, form, party: form === 'invoice' ? 'Acme Corporation' : 'Staples', lines: [{ text: 'widget', quantity: '0', amount: '100' }] };
+      await expect(executeIntent(ctx, intent, {}, TODAY)).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+  });
+
+  it('a report with a date that is not on the calendar is rejected', async () => {
+    await expect(
+      runCommand(ctx, { intent: { kind: 'report', report: 'profit_loss', from: '2026-02-01', to: '2026-02-31' } as never }, { today: TODAY }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+});
+
+describe('periods are never silently replaced', () => {
+  it('start after end → a clear message, not a whole-year answer', async () => {
+    await expect(run('what did we spend on fuel from 2026-08-01 to 2026-07-01')).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/start date \(2026-08-01\) is after the end date/),
+    });
+    await expect(
+      runCommand(ctx, { intent: { kind: 'report', report: 'profit_loss', from: '2026-08-01', to: '2026-07-01' } }, { today: TODAY }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
+  it('a date that is not on the calendar → a clear message', async () => {
+    await expect(run('what did we spend on fuel in 2026-02-30')).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/isn't a real date/),
+    });
+  });
+
+  it('"spent on Shell Oil in july" answers the question', async () => {
+    const r = expectType(await run('spent on Shell Oil in july'), 'answer');
+    expect(r.amount).toBe('40.00');
+    expect(r.range).toMatchObject({ from: '2026-07-01', to: '2026-07-31' });
+  });
+
+  it("quarters and YTD follow the company's fiscal year", async () => {
+    const [row] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
+    await db.update(companies).set({ settings: { ...(row.settings ?? {}), fiscalYearEnd: '06-30' } }).where(eq(companies.id, ctx.companyId));
+    try {
+      // Fiscal Q1 = Jul–Sep 2026: fuel 40 + 60 + 25.50.
+      const q1 = expectType(await run('what did we spend on fuel in Q1'), 'answer');
+      expect(q1.range).toMatchObject({ from: '2026-07-01', to: '2026-09-30' });
+      expect(q1.amount).toBe('125.50');
+      // Fiscal YTD = Jul 1 – Oct 15: adds October's 99.
+      const ytd = expectType(await run('fuel expenses ytd'), 'answer');
+      expect(ytd.range).toMatchObject({ from: '2026-07-01', to: '2026-10-15' });
+      expect(ytd.amount).toBe('224.50');
+    } finally {
+      await db.update(companies).set({ settings: row.settings }).where(eq(companies.id, ctx.companyId));
+    }
+    const cal = expectType(await run('what did we spend on fuel in Q1'), 'answer');
+    expect(cal.range).toMatchObject({ from: '2026-01-01', to: '2026-03-31' });
   });
 });

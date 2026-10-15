@@ -42,17 +42,28 @@ export const ACTION_KEYS = [
 ] as const;
 export type ActionKey = (typeof ACTION_KEYS)[number];
 
-const zDay = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'use YYYY-MM-DD');
+/** A real calendar day ('2026-02-31' is rejected — JS Date would roll it into March). */
+const zDay = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'use YYYY-MM-DD')
+  .refine((s) => {
+    const [y, m, d] = s.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+  }, 'not a real date');
 const zText = (max = 200) => z.string().trim().min(1).max(max);
 
-/** Accepts "3", 3, "$1,200.50" — normalizes to a canonical decimal string. */
+/**
+ * Accepts "3", 3, "$1,200.50" — normalizes to a canonical decimal string. Zero is rejected: a
+ * zero quantity, rate or amount is never what was meant (and a zero quantity would divide by 0).
+ */
 const zDecimal = z.preprocess(
   (v) => (typeof v === 'number' ? String(v) : v),
   z
     .string()
     .transform((s, ctx) => {
       const n = parseNumber(s);
-      if (n === null || !/^\d{1,13}(\.\d{1,4})?$/.test(n)) {
+      if (n === null || !/^\d{1,13}(\.\d{1,4})?$/.test(n) || !/[1-9]/.test(n)) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'not a positive number' });
         return z.NEVER;
       }
@@ -68,6 +79,13 @@ export const intentLineSchema = z.object({
   rate: zDecimal.optional(),
   /** Line total (purchases: the amount; sales: quantity 1 at this rate). */
   amount: zDecimal.optional(),
+  /**
+   * Purchases: `amount` came from a bare whole number ("bill from Staples 3 widgets"). If the line
+   * turns out to be an ITEM, the executor reads it as a quantity instead of dollars.
+   */
+  amountMaybeCount: z.boolean().optional(),
+  /** Numbers the user typed that the grammar could not place — shown as a note, never dropped. */
+  unclear: z.array(z.string().trim().min(1).max(40)).max(5).optional(),
 });
 export type IntentLine = z.infer<typeof intentLineSchema>;
 
@@ -93,6 +111,8 @@ const zReport = z.object({
   to: zDay.optional(),
   /** Free-text period ("Q3", "last month"), resolved by the executor when from/to are absent. */
   period: zText(60).optional(),
+  /** The typed period was not valid (inverted / not a real date) — the executor reports it. */
+  dateProblem: zText(200).optional(),
 });
 
 const zQuestion = z.object({
@@ -105,6 +125,8 @@ const zQuestion = z.object({
   to: zDay.optional(),
   period: zText(60).optional(),
   rangeLabel: zText(100).optional(),
+  /** The typed period was not valid (inverted / not a real date) — the executor reports it. */
+  dateProblem: zText(200).optional(),
 });
 
 const zNavigate = z.object({
@@ -168,6 +190,7 @@ function lineText(l: IntentLine): string {
   if (l.text) parts.push(l.text);
   if (l.rate) parts.push(`at $${l.rate}`);
   if (l.amount) parts.push(`$${l.amount}`);
+  if (l.unclear?.length) parts.push(`(not sure about ${l.unclear.join(', ')})`);
   return parts.join(' ');
 }
 
@@ -200,11 +223,13 @@ export function describeIntent(i: CommandIntent): string {
       return `Fill in a new ${FORM_LABELS[i.form]}${who}${what ? ` — ${what}` : ''} (you review and save)`;
     }
     case 'report': {
+      if (i.dateProblem) return i.dateProblem;
       const over = i.overDays !== undefined ? ` more than ${i.overDays} days past due` : '';
       const who = i.party ? ` for “${i.party}”` : '';
       return `Show ${REPORT_TITLES[i.report]}${who}${over}`;
     }
     case 'question': {
+      if (i.dateProblem) return i.dateProblem;
       const verb = i.measure === 'spend' ? 'spent' : 'earned';
       const on = i.subject ? (i.measure === 'spend' ? ` on “${i.subject}”` : ` from “${i.subject}”`) : '';
       return `Work out how much you ${verb}${on}${i.rangeLabel ? `, ${i.rangeLabel}` : ''}`;

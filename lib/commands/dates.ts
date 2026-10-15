@@ -3,9 +3,10 @@
  * "in September", "last 30 days", "since March", "from 2026-01-01 to 2026-03-31", "yesterday",
  * "on 10/3". PURE — `today` is always passed in, so results are deterministic and testable.
  *
- * Every date is a 'YYYY-MM-DD' calendar day (UTC, like the rest of the app). Quarters and years
- * are calendar quarters/years. A quarter or month named without a year means the most recent
- * one that has started (in October, "Q4" is this year's; in May, "Q4" is last year's).
+ * Every date is a 'YYYY-MM-DD' calendar day (UTC, like the rest of the app). Quarters, "this /
+ * last year", YTD and QTD follow the company's fiscal year when `fiscalStartMonth` is given
+ * (calendar quarters/years otherwise). A quarter or month named without a year means the most
+ * recent one that has started (in October, "Q4" is this year's; in May, "Q4" is last year's).
  */
 
 export interface DateRange {
@@ -115,50 +116,121 @@ export function parseSingleDate(text: string, today: Date): { date: string; matc
 }
 
 /**
+ * A typed period that cannot be used as-is: a date that is not on the calendar ("2026-02-30",
+ * "2/30", "Feb 30") or a "from X to Y" whose start is after its end. Returns a plain-language
+ * message, or null when every date in the text is fine. Callers report it instead of silently
+ * answering for some other period.
+ */
+export function findDateProblem(text: string, today: Date): string | null {
+  let m: RegExpExecArray | null;
+  const range = new RegExp(String.raw`\b(?:from|between)\s+(${EXPLICIT_DATE})\s+(?:to|and|through|thru|-)\s+(${EXPLICIT_DATE})(?![\d/])`, 'i').exec(text);
+  if (range) {
+    const a = parseExplicitDate(range[1], today);
+    const b = parseExplicitDate(range[2], today);
+    if (a && b && a > b) return `The start date (${a}) is after the end date (${b}). Swap them and try again.`;
+  }
+  const numeric = new RegExp(String.raw`(?<![\w/-])(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}(?:/(?:\d{4}|\d{2}))?)(?![\w/-])`, 'gi');
+  while ((m = numeric.exec(text))) {
+    if (!parseExplicitDate(m[1], today)) return `“${m[1]}” isn't a real date. Check the month and day.`;
+  }
+  // "Feb 30" / "February 30th 2026" ("July 2026" is a month and a year, not a day).
+  const named = new RegExp(String.raw`\b(${MONTH_NC}\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?)(?!\d)`, 'gi');
+  while ((m = named.exec(text))) {
+    if (!parseExplicitDate(m[1], today)) return `“${m[1]}” isn't a real date. Check the month and day.`;
+  }
+  return null;
+}
+
+/** Options for {@link parseDateRange}. */
+export interface DateRangeOptions {
+  /**
+   * First month of the company's fiscal year, 0-11 (0 = January = calendar year). Quarters,
+   * "this/last year", YTD and QTD follow it. Fiscal years are named by the year they end in.
+   */
+  fiscalStartMonth?: number;
+}
+
+/**
+ * The fiscal-year start month (0-11) from a company's `fiscalYearEnd` setting ('MM-DD'). A year
+ * that ends on (or near) a month end starts on the 1st of the next month; any other end day
+ * cannot be split into calendar-month quarters, so calendar quarters are used (0).
+ */
+export function fiscalStartMonthFromYearEnd(fiscalYearEnd: string | null | undefined): number {
+  const m = /^(\d{1,2})-(\d{1,2})$/.exec(fiscalYearEnd ?? '');
+  if (!m) return 0;
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  if (month < 1 || month > 12 || day < 28) return 0;
+  return month % 12;
+}
+
+/** The fiscal year containing `today`: its first month's year and its name (the year it ends in). */
+function fiscalYearOf(t: { y: number; m: number }, fs: number): { startY: number; name: number } {
+  const startY = t.m >= fs ? t.y : t.y - 1;
+  return { startY, name: fs === 0 ? startY : startY + 1 };
+}
+
+/**
  * Find a date RANGE in free text. Tries the most specific phrasings first. Returns null when
  * the text has no recognizable period.
  */
-export function parseDateRange(text: string, today: Date): RangeMatch | null {
+export function parseDateRange(text: string, today: Date, opts: DateRangeOptions = {}): RangeMatch | null {
   const t = todayParts(today);
   const now = todayStr(today);
-  const curQ = Math.floor(t.m / 3) + 1;
+  const fs = opts.fiscalStartMonth && opts.fiscalStartMonth >= 1 && opts.fiscalStartMonth <= 11 ? Math.floor(opts.fiscalStartMonth) : 0;
+  const fiscal = fs !== 0;
+  const fy = fiscalYearOf(t, fs);
+  const curQ = Math.floor(((t.m - fs + 12) % 12) / 3) + 1;
+  /** Quarter q of the fiscal year whose first month falls in startY. */
+  const quarter = (q: number, startY: number): DateRange => {
+    const m0 = fs + (q - 1) * 3;
+    const from = ymd(startY, m0, 1);
+    const to = lastDay(startY, m0 + 2);
+    if (!fiscal) return quarterRange(q, startY);
+    return { from, to, label: `fiscal Q${q} FY${startY + 1} (${from} to ${to})` };
+  };
+  /** Fiscal year named `name` → its first month's year. */
+  const startYearOfNamed = (name: number) => (fiscal ? name - 1 : name);
+  const fyLabel = (startY: number) => (fiscal ? `fiscal year FY${startY + 1}` : String(startY));
   let m: RegExpExecArray | null;
   const re = (src: string) => new RegExp(src, 'i');
 
-  // Explicit "from X to Y" / "between X and Y".
+  // Explicit "from X to Y" / "between X and Y". An inverted range is returned as typed (the
+  // caller reports "the start date is after the end date") — never swapped for another period.
   if ((m = re(String.raw`\b(?:from|between)\s+(${EXPLICIT_DATE})\s+(?:to|and|through|thru|-)\s+(${EXPLICIT_DATE})(?![\d/])`).exec(text))) {
     const a = parseExplicitDate(m[1], today);
     const b = parseExplicitDate(m[2], today);
-    if (a && b && a <= b) return { range: { from: a, to: b, label: `${a} to ${b}` }, matched: m[0] };
+    if (a && b) return { range: { from: a, to: b, label: `${a} to ${b}` }, matched: m[0] };
   }
 
-  // Year to date / quarter to date / month to date.
+  // Year to date / quarter to date / month to date (year and quarter follow the fiscal year).
   if ((m = re(String.raw`\b(?:(?:for|in)\s+(?:the\s+)?)?(?:ytd|year[\s-]to[\s-]date|so far this year)\b`).exec(text))) {
-    return { range: { from: ymd(t.y, 0, 1), to: now, label: `year to date (${t.y})` }, matched: m[0] };
+    return { range: { from: ymd(fy.startY, fs, 1), to: now, label: `year to date (${fyLabel(fy.startY)})` }, matched: m[0] };
   }
   if ((m = re(String.raw`\b(?:(?:for|in)\s+(?:the\s+)?)?(?:qtd|quarter[\s-]to[\s-]date)\b`).exec(text))) {
-    return { range: { from: ymd(t.y, (curQ - 1) * 3, 1), to: now, label: `quarter to date (Q${curQ} ${t.y})` }, matched: m[0] };
+    const r = quarter(curQ, fy.startY);
+    return { range: { from: r.from, to: now, label: `quarter to date (${fiscal ? `fiscal Q${curQ} FY${fy.name}` : `Q${curQ} ${t.y}`})` }, matched: m[0] };
   }
   if ((m = re(String.raw`\b(?:(?:for|in)\s+(?:the\s+)?)?(?:mtd|month[\s-]to[\s-]date)\b`).exec(text))) {
     return { range: { from: ymd(t.y, t.m, 1), to: now, label: `month to date (${MONTH_SHORT[t.m]} ${t.y})` }, matched: m[0] };
   }
 
-  // Q1..Q4 [year] / first..fourth quarter [of year].
+  // Q1..Q4 [year] / first..fourth quarter [of year]. A year names the fiscal year (the year it ends in).
   if ((m = re(String.raw`\b${PREP}q([1-4])(?:\s*(?:of\s+|,\s*)?(\d{4}|'\d{2}))?\b`).exec(text))) {
     const q = Number(m[1]);
-    const y = m[2] ? fullYear(m[2], t.y) : q > curQ ? t.y - 1 : t.y;
-    return { range: quarterRange(q, y), matched: m[0] };
+    const y = m[2] ? startYearOfNamed(fullYear(m[2], t.y)) : q > curQ ? fy.startY - 1 : fy.startY;
+    return { range: quarter(q, y), matched: m[0] };
   }
   if ((m = re(String.raw`\b${PREP}(first|second|third|fourth|1st|2nd|3rd|4th)\s+quarter(?:\s+(?:of\s+)?(\d{4}))?\b`).exec(text))) {
     const q = ({ first: 1, '1st': 1, second: 2, '2nd': 2, third: 3, '3rd': 3, fourth: 4, '4th': 4 } as Record<string, number>)[m[1].toLowerCase()];
-    const y = m[2] ? Number(m[2]) : q > curQ ? t.y - 1 : t.y;
-    return { range: quarterRange(q, y), matched: m[0] };
+    const y = m[2] ? startYearOfNamed(Number(m[2])) : q > curQ ? fy.startY - 1 : fy.startY;
+    return { range: quarter(q, y), matched: m[0] };
   }
   if ((m = re(String.raw`\b${PREP}(last|previous|prior|this|current)\s+quarter\b`).exec(text))) {
     const last = !/this|current/i.test(m[1]);
     const q = last ? (curQ === 1 ? 4 : curQ - 1) : curQ;
-    const y = last && curQ === 1 ? t.y - 1 : t.y;
-    const r = quarterRange(q, y);
+    const y = last && curQ === 1 ? fy.startY - 1 : fy.startY;
+    const r = quarter(q, y);
     return { range: { ...r, label: `${last ? 'last' : 'this'} quarter (${r.label})` }, matched: m[0] };
   }
 
@@ -171,9 +243,13 @@ export function parseDateRange(text: string, today: Date): RangeMatch | null {
     return { range: { ...r, label: `${last ? 'last' : 'this'} month (${r.label})` }, matched: m[0] };
   }
 
-  // Years.
-  if ((m = re(String.raw`\b${PREP}(last|previous|prior|this|current)\s+(?:calendar\s+|fiscal\s+)?year\b`).exec(text))) {
+  // Years: the fiscal year, unless "calendar year" is said.
+  if ((m = re(String.raw`\b${PREP}(last|previous|prior|this|current)\s+(calendar\s+|fiscal\s+)?year\b`).exec(text))) {
     const last = !/this|current/i.test(m[1]);
+    if (fiscal && !/calendar/i.test(m[2] ?? '')) {
+      const y = last ? fy.startY - 1 : fy.startY;
+      return { range: { from: ymd(y, fs, 1), to: lastDay(y + 1, fs - 1), label: `${last ? 'last' : 'this'} ${fyLabel(y)}` }, matched: m[0] };
+    }
     const y = last ? t.y - 1 : t.y;
     return { range: { from: ymd(y, 0, 1), to: ymd(y, 11, 31), label: `${last ? 'last' : 'this'} year (${y})` }, matched: m[0] };
   }
@@ -222,7 +298,7 @@ export function parseDateRange(text: string, today: Date): RangeMatch | null {
   }
 
   // "in 2025" / bare year.
-  if ((m = re(String.raw`\b(?:(?:in|for|during)\s+)?((?:19|20)\d{2})\b`).exec(text))) {
+  if ((m = re(String.raw`\b(?:(?:in|for|during)\s+)?((?:19|20)\d{2})\b(?![-/]\d)`).exec(text))) {
     const y = Number(m[1]);
     return { range: { from: ymd(y, 0, 1), to: ymd(y, 11, 31), label: String(y) }, matched: m[0] };
   }
@@ -235,8 +311,7 @@ export function parseDateRange(text: string, today: Date): RangeMatch | null {
   return null;
 }
 
-/** Calendar year to date — the default period for a question that names none. */
-export function yearToDate(today: Date): DateRange {
-  const t = todayParts(today);
-  return { from: ymd(t.y, 0, 1), to: todayStr(today), label: `year to date (${t.y})` };
+/** Year to date (the fiscal year when one is given) — the default period for a question that names none. */
+export function yearToDate(today: Date, opts: DateRangeOptions = {}): DateRange {
+  return parseDateRange('ytd', today, opts)!.range;
 }

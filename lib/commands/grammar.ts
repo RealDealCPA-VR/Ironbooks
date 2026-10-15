@@ -17,7 +17,7 @@
  * PURE: `today` is injected; no I/O. The output is a CommandIntent (lib/commands/intent.ts);
  * names are left as typed — the executor matches them against the company's lists.
  */
-import { parseDateRange, parseSingleDate, yearToDate } from './dates';
+import { findDateProblem, parseDateRange, parseSingleDate, yearToDate, type DateRangeOptions } from './dates';
 import type { CommandIntent, CreateIntent, FormKind, IntentLine, ReportIntent } from './intent';
 import { isSalesForm } from './intent';
 import { NUM_TOKEN, cut, isReasonableQuantity, looksLikeMoney, parseNumber, tidy } from './text';
@@ -35,7 +35,7 @@ export function cleanCommand(input: string): string {
     .trim();
 }
 
-export function parseCommand(input: string, today: Date = new Date()): CommandIntent | null {
+export function parseCommand(input: string, today: Date = new Date(), opts: DateRangeOptions = {}): CommandIntent | null {
   const raw = cleanCommand(input);
   if (!raw || raw.length > 500) return null;
 
@@ -45,13 +45,13 @@ export function parseCommand(input: string, today: Date = new Date()): CommandIn
   // "go to …" / "open …": a report or question phrased as navigation still runs as one.
   const nav = re(String.raw`^(?:please\s+)?(?:go\s+to|goto|open(?:\s+up)?|take\s+me\s+to|navigate\s+to|jump\s+to|switch\s+to|bring\s+up)\s+(?:the\s+|my\s+|our\s+)?(.+)$`).exec(raw);
   if (nav) {
-    const inner = parseQuestion(nav[1], today) ?? parseReport(nav[1], today) ?? parseReport(raw, today);
+    const inner = parseQuestion(nav[1], today, opts) ?? parseReport(nav[1], today, opts) ?? parseReport(raw, today, opts);
     return inner ?? { kind: 'navigate', target: tidy(nav[1]) };
   }
 
-  const q = parseQuestion(raw, today);
+  const q = parseQuestion(raw, today, opts);
   if (q) return q;
-  const r = parseReport(raw, today);
+  const r = parseReport(raw, today, opts);
   if (r) return r;
   const c = parseCreate(raw, today);
   if (c) return c;
@@ -117,8 +117,8 @@ function cleanSubject(s: string | undefined): string | undefined {
   return t;
 }
 
-export function parseQuestion(raw: string, today: Date): CommandIntent | null {
-  const rm = parseDateRange(raw, today);
+export function parseQuestion(raw: string, today: Date, opts: DateRangeOptions = {}): CommandIntent | null {
+  const rm = parseDateRange(raw, today, opts);
   const rest = cleanCommand(rm ? cut(raw, rm.matched) : raw);
   let m: RegExpExecArray | null;
   let measure: 'spend' | 'income' | null = null;
@@ -145,6 +145,10 @@ export function parseQuestion(raw: string, today: Date): CommandIntent | null {
   } else if ((m = re(String.raw`^how\s+much\s+(?:went\s+(?:to|on)|was\s+spent\s+on|did\s+(?:.+?)\s+cost(?:\s+us)?)\s*(.*)$`).exec(rest))) {
     measure = 'spend';
     subject = m[1];
+  } else if (rm && !/\d/.test(rest) && (m = re(String.raw`^(?:${WHO}\s+)?(?:spent|spend|paid)\s+((?:on|at|for|with|to)\s+.+)$`).exec(rest))) {
+    // "spent on Shell Oil in July": a period but no amount — a question, not a new expense.
+    measure = 'spend';
+    subject = m[1];
   } else if (rm || /^total\b/i.test(rest)) {
     // Terse forms need a period (or "total") so a page name like "expenses" still navigates.
     if ((m = re(String.raw`^(?:total\s+)?(.*?)\s*${SPEND_N}(?:\s+(?:on|for|at|with)\s+(.+))?$`).exec(rest))) {
@@ -159,8 +163,9 @@ export function parseQuestion(raw: string, today: Date): CommandIntent | null {
     }
   }
   if (!measure) return null;
-  const range = rm?.range ?? yearToDate(today);
+  const range = rm?.range ?? yearToDate(today, opts);
   const s = cleanSubject(subject);
+  const problem = findDateProblem(raw, today);
   return {
     kind: 'question',
     measure,
@@ -168,6 +173,7 @@ export function parseQuestion(raw: string, today: Date): CommandIntent | null {
     from: range.from,
     to: range.to,
     rangeLabel: range.label,
+    ...(problem ? { dateProblem: problem } : {}),
   };
 }
 
@@ -190,7 +196,14 @@ function parseOverDays(s: string): { days: number; matched: string } | null {
   return null;
 }
 
-export function parseReport(raw: string, today: Date): ReportIntent | null {
+export function parseReport(raw: string, today: Date, opts: DateRangeOptions = {}): ReportIntent | null {
+  const r = parseReportInner(raw, today, opts);
+  if (!r) return null;
+  const problem = findDateProblem(raw, today);
+  return problem ? { ...r, dateProblem: problem } : r;
+}
+
+function parseReportInner(raw: string, today: Date, opts: DateRangeOptions): ReportIntent | null {
   let s = cleanCommand(
     raw.replace(re(String.raw`^(?:please\s+)?(?:show|list|find|view|display|see|give|pull\s+up|run|get|print)\s+(?:me\s+)?(?:a\s+list\s+of\s+)?(?:all\s+)?(?:the\s+|my\s+|our\s+)?`), ''),
   );
@@ -198,7 +211,7 @@ export function parseReport(raw: string, today: Date): ReportIntent | null {
   if (over) s = cut(s, over.matched);
   const overdueWord = /\b(?:overdue|past[\s-]due|late)\b/i.test(s);
 
-  const rm = parseDateRange(s, today);
+  const rm = parseDateRange(s, today, opts);
   const withRange = (r: ReportIntent): ReportIntent =>
     rm ? { ...r, from: rm.range.from, to: rm.range.to, period: rm.range.label } : r;
 
@@ -267,49 +280,105 @@ export function parseLine(s: string, form: FormKind): IntentLine | null {
   let quantity: string | undefined;
   let rate: string | undefined;
   let amount: string | undefined;
+  let amountMaybeCount = false;
+  const unclear: string[] = [];
   let m: RegExpExecArray | null;
+  /** A typed number that has no place on the line is kept for a note, never silently dropped. */
+  const keep = (tok: string) => {
+    const k = tidy(tok);
+    if (k && unclear.length < 5) unclear.push(k.slice(0, 40));
+  };
+  /** Parse a token; zero is never a usable quantity, rate or amount. */
+  const num = (tok: string): string | null => {
+    const v = parseNumber(tok);
+    if (v === null) return null;
+    if (!/[1-9]/.test(v)) {
+      keep(tok);
+      return null;
+    }
+    return v;
+  };
+  const setAmount = (tok: string, v: string) => {
+    if (amount) keep(tok);
+    else amount = v;
+  };
+  const setQuantity = (tok: string, v: string) => {
+    if (quantity || !isReasonableQuantity(v)) keep(tok);
+    else quantity = v;
+  };
 
   // Rate: "at $150", "@ 150/hr", "$150 each", "150 per hour".
   if ((m = re(String.raw`\s*(?:@|\bat\b)\s*(${NUM_TOKEN})(?:\s*(?:each|ea|per\s+\w+|an?\s+(?:hour|unit|item|piece|day)|\/\s*\w+))?`).exec(t))) {
-    rate = parseNumber(m[1]) ?? undefined;
+    rate = num(m[1]) ?? undefined;
     t = cut(t, m[0]);
   } else if ((m = re(String.raw`(${NUM_TOKEN})\s*(?:each|ea|per\s+\w+|\/\s*(?:hr|hour|h|unit|ea|each|item|piece|pc|day))\b`).exec(t))) {
-    rate = parseNumber(m[1]) ?? undefined;
+    rate = num(m[1]) ?? undefined;
     t = cut(t, m[0]);
   }
   // Total: "consulting for $500", "= 500".
   if ((m = re(String.raw`\s*(?:\bfor\b|\btotal(?:l?ing)?\b|=)\s*(${NUM_TOKEN})\s*$`).exec(t)) && !re(String.raw`^${UNIT}\b`).test(t.slice(m.index + m[0].length))) {
-    amount = parseNumber(m[1]) ?? undefined;
+    amount = num(m[1]) ?? undefined;
     t = cut(t, m[0]);
   }
-  // Leading number: quantity (sales / with a unit / "2 x") or amount (purchases, "$").
-  if ((m = re(String.raw`^(${NUM_TOKEN})\s*(x\b|×|\*)?\s*(${UNIT}\b)?\s*(?:of\b)?\s*`).exec(t)) && m[0].trim()) {
-    const tok = m[1];
-    const v = parseNumber(tok);
-    if (v !== null) {
-      const isQty = !looksLikeMoney(tok) && (!!m[2] || !!m[3] || (sales && !/\.\d{2}$/.test(tok)));
-      if (isQty && isReasonableQuantity(v)) quantity = v;
-      else if (!amount) amount = v;
-      t = tidy(t.slice(m[0].length));
+
+  // Leading number ("3 hours consulting", "$80 repair") and/or trailing number ("office
+  // supplies 120", "2 widgets $100"). Both are read — a typed amount is never ignored.
+  let lead: { tok: string; x: boolean; unit: boolean } | null = null;
+  if ((m = re(String.raw`^(${NUM_TOKEN})\s*(x\b|×|\*)?\s*(${UNIT}\b)?\s*(?:of\b)?\s*`).exec(t)) && m[0].trim() && parseNumber(m[1]) !== null) {
+    lead = { tok: m[1], x: !!m[2], unit: !!m[3] };
+    t = tidy(t.slice(m[0].length));
+  }
+  let trail: { tok: string; unit: boolean } | null = null;
+  if ((m = re(String.raw`\s(${NUM_TOKEN})\s*(${UNIT})?\s*$`).exec(` ${t}`)) && parseNumber(m[1]) !== null) {
+    trail = { tok: m[1], unit: !!m[2] };
+    t = tidy(` ${t}`.slice(0, m.index));
+  }
+  const bareWhole = (tok: string) => !looksLikeMoney(tok) && /^\d+$/.test(parseNumber(tok) ?? '');
+
+  if (lead && trail) {
+    // "2 widgets $100": the first number counts, the last one is the line total.
+    const lv = num(lead.tok);
+    const tv = num(trail.tok);
+    const leadIsMoney = looksLikeMoney(lead.tok) && !lead.x && !lead.unit;
+    if (leadIsMoney) {
+      // "$100 widgets 2" / "$100 consulting 3 hours".
+      if (lv) setAmount(lead.tok, lv);
+      if (tv) {
+        if (!looksLikeMoney(trail.tok)) setQuantity(trail.tok, tv);
+        else keep(trail.tok);
+      }
+    } else {
+      if (lv) setQuantity(lead.tok, lv);
+      if (tv) {
+        if (trail.unit) keep(trail.tok);
+        else setAmount(trail.tok, tv);
+      }
     }
-  } else if ((m = re(String.raw`\s(${NUM_TOKEN})\s*(${UNIT})?\s*$`).exec(` ${t}`))) {
-    // Trailing number: "office supplies 120", "consulting 3 hours".
-    const tok = m[1];
-    const v = parseNumber(tok);
+  } else if (lead || trail) {
+    const tok = (lead ?? trail)!.tok;
+    const v = num(tok);
     if (v !== null) {
-      const isQty = !looksLikeMoney(tok) && (!!m[2] || (sales && !/\.\d{2}$/.test(tok)));
-      if (isQty && isReasonableQuantity(v)) quantity = v;
-      else if (!amount) amount = v;
-      t = tidy(` ${t}`.slice(0, m.index));
+      const unitish = lead ? lead.x || lead.unit : trail!.unit;
+      const isQty = !looksLikeMoney(tok) && (unitish || (sales && !/\.\d{2}$/.test(tok)));
+      if (isQty && isReasonableQuantity(v)) setQuantity(tok, v);
+      else if (!amount) {
+        amount = v;
+        // Purchases: "3 widgets" may be three widgets, not $3 — the executor decides once it
+        // knows whether the words name an item.
+        if (!sales && bareWhole(tok) && !quantity && !rate && isReasonableQuantity(v)) amountMaybeCount = true;
+      } else if (!quantity && !looksLikeMoney(tok) && isReasonableQuantity(v)) quantity = v; // "3 widgets for $500"
+      else keep(tok);
     }
   }
   const text = tidy(t.replace(/^(?:of|for|on|in|worth\s+of)\s+/i, '').replace(/\s+(?:for|at|on|of)$/i, ''));
-  if (!text && !quantity && !rate && !amount) return null;
+  if (!text && !quantity && !rate && !amount && !unclear.length) return null;
   return {
     ...(text ? { text } : {}),
     ...(quantity ? { quantity } : {}),
     ...(rate ? { rate } : {}),
     ...(amount ? { amount } : {}),
+    ...(amountMaybeCount && amount ? { amountMaybeCount: true } : {}),
+    ...(unclear.length ? { unclear } : {}),
   };
 }
 

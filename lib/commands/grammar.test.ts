@@ -4,7 +4,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { parseCommand, parseLine } from './grammar';
-import { parseDateRange, parseSingleDate, parseExplicitDate } from './dates';
+import { parseDateRange, parseSingleDate, parseExplicitDate, fiscalStartMonthFromYearEnd, yearToDate } from './dates';
+import { REPORT_CATALOG } from '@/lib/reports/catalog';
+import { reportParamsSchema } from '@/lib/validation/reports';
 import { pickName, rankNames } from './match';
 import { parseNumber } from './text';
 import { commandIntentSchema, describeIntent, aiIntentReplySchema } from './intent';
@@ -68,7 +70,7 @@ describe('create commands', () => {
       kind: 'create',
       form: 'bill',
       party: 'Staples',
-      lines: [{ text: 'office supplies', amount: '120' }],
+      lines: [{ text: 'office supplies', amount: '120', amountMaybeCount: true }],
     });
   });
 
@@ -77,7 +79,7 @@ describe('create commands', () => {
     ['bill Staples $1,200 for printer paper', 'Staples', { text: 'printer paper', amount: '1200' }],
     ['got a bill from Comcast 89.99 internet', 'Comcast', { text: 'internet', amount: '89.99' }],
     ['vendor bill Staples 5 boxes paper at 30', 'Staples', { text: 'paper', quantity: '5', rate: '30' }],
-    ['bill 120 office supplies from Staples', 'Staples', { text: 'office supplies', amount: '120' }],
+    ['bill 120 office supplies from Staples', 'Staples', { text: 'office supplies', amount: '120', amountMaybeCount: true }],
   ])('%s', (cmd, party, line) => {
     const r = p(cmd);
     expect(r).toMatchObject({ kind: 'create', form: 'bill', party });
@@ -91,7 +93,7 @@ describe('create commands', () => {
       party: 'Staples',
       date: '2026-10-03',
       memo: 'toner reorder',
-      lines: [{ text: 'office supplies', amount: '120' }],
+      lines: [{ text: 'office supplies', amount: '120', amountMaybeCount: true }],
     });
     expect(p('bill from Staples 120 office supplies yesterday')).toMatchObject({ date: '2026-10-14' });
   });
@@ -128,7 +130,7 @@ describe('create commands', () => {
   it('parseLine handles units, rates and money', () => {
     expect(parseLine('2.5 hrs bookkeeping @ $60/hr', 'invoice')).toEqual({ text: 'bookkeeping', quantity: '2.5', rate: '60' });
     expect(parseLine('$1.2k equipment', 'bill')).toEqual({ text: 'equipment', amount: '1200' });
-    expect(parseLine('office supplies 120', 'bill')).toEqual({ text: 'office supplies', amount: '120' });
+    expect(parseLine('office supplies 120', 'bill')).toEqual({ text: 'office supplies', amount: '120', amountMaybeCount: true });
     expect(parseLine('10 widgets 4 each', 'invoice')).toEqual({ text: 'widgets', quantity: '10', rate: '4' });
   });
 });
@@ -425,5 +427,163 @@ describe('permission filtering of actions and pages', () => {
     expect(canOpenHref('/reconcile', salesClerk)).toBe(false);
     expect(canOpenHref('/invoices?new=1', salesClerk)).toBe(true);
     expect(canOpenHref('/help', salesClerk)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1 fixes
+// ---------------------------------------------------------------------------
+
+describe('every typed amount is placed or reported (never silently dropped)', () => {
+  const lines = (cmd: string) => {
+    const r = p(cmd);
+    return r && r.kind === 'create' ? r.lines : null;
+  };
+  it.each([
+    // leading count + trailing total
+    ['invoice acme 2 widgets $100', [{ text: 'widgets', quantity: '2', amount: '100' }]],
+    ['bill from Staples 2 widgets $100', [{ text: 'widgets', quantity: '2', amount: '100' }]],
+    ['check to Shell Oil 2 widgets $10', [{ text: 'widgets', quantity: '2', amount: '10' }]],
+    ['sold 3 widgets to Acme 45', [{ text: 'widgets', quantity: '3', amount: '45' }]],
+    ['invoice Acme 3 hours consulting 450', [{ text: 'consulting', quantity: '3', amount: '450' }]],
+    ['bill from Staples 4 boxes paper $120.50', [{ text: 'paper', quantity: '4', amount: '120.5' }]],
+    // money first, count last
+    ['bill from Staples $100 widgets 2', [{ text: 'widgets', quantity: '2', amount: '100' }]],
+    // a zero is never a usable number — the rest still lands and the zero is reported
+    ['bill from Staples 0 widgets $100', [{ text: 'widgets', amount: '100', unclear: ['0'] }]],
+    ['invoice Acme 0 widgets', [{ text: 'widgets', unclear: ['0'] }]],
+    ['invoice Acme 2 widgets at $0', [{ text: 'widgets', quantity: '2', unclear: ['$0'] }]],
+    // a third number that has no place is reported, not lost
+    ['invoice Acme 2 widgets $50 for $100', [{ text: 'widgets', quantity: '2', amount: '100', unclear: ['$50'] }]],
+    ['invoice Acme 3 hours consulting 2 days', [{ text: 'consulting', quantity: '3', unclear: ['2'] }]],
+    // purchases: a bare whole count is flagged so an item line reads it as a quantity
+    ['bill from Staples 3 widgets', [{ text: 'widgets', amount: '3', amountMaybeCount: true }]],
+    ['bill from Staples $3 widgets', [{ text: 'widgets', amount: '3' }]],
+    ['bill from Staples 3.50 widgets', [{ text: 'widgets', amount: '3.5' }]],
+    // "3 widgets for $500" on a purchase: 3 is the count
+    ['bill from Staples 3 widgets for $500', [{ text: 'widgets', quantity: '3', amount: '500' }]],
+  ])('%s', (cmd, expected) => {
+    expect(lines(cmd)).toEqual(expected);
+  });
+
+  it('existing single-number phrasings are unchanged', () => {
+    expect(lines('invoice Acme 3 hours consulting')).toEqual([{ text: 'consulting', quantity: '3' }]);
+    expect(lines('check to Shell $45.20 fuel')).toEqual([{ text: 'fuel', amount: '45.2' }]);
+    expect(lines('quote Acme 10 widgets at $12')).toEqual([{ text: 'widgets', quantity: '10', rate: '12' }]);
+    expect(lines('invoice Acme 3 hours consulting for $450')).toEqual([{ text: 'consulting', quantity: '3', amount: '450' }]);
+  });
+
+  it('the live preview mentions numbers it could not place', () => {
+    const r = p('bill from Staples 0 widgets $100')!;
+    expect(describeIntent(r)).toMatch(/not sure about 0/);
+  });
+});
+
+describe('intent schema rejects zero and bad dates (400, not 500)', () => {
+  const create = (line: Record<string, unknown>) =>
+    commandIntentSchema.safeParse({ kind: 'create', form: 'invoice', lines: [{ text: 'widget', ...line }] }).success;
+  it('zero quantity, rate or amount', () => {
+    expect(create({ quantity: '0', amount: '100' })).toBe(false);
+    expect(create({ quantity: '0.0', rate: '5' })).toBe(false);
+    expect(create({ rate: 0 })).toBe(false);
+    expect(create({ amount: '$0.00' })).toBe(false);
+    expect(create({ quantity: '0.5', amount: '100' })).toBe(true);
+  });
+  it('more than 13 integer digits', () => {
+    expect(create({ amount: '99999999999999' })).toBe(false);
+    expect(create({ amount: '9999999999999' })).toBe(true);
+  });
+  it('calendar dates must exist', () => {
+    const rep = (to: string) => commandIntentSchema.safeParse({ kind: 'report', report: 'profit_loss', from: '2026-02-01', to }).success;
+    expect(rep('2026-02-31')).toBe(false);
+    expect(rep('2026-13-01')).toBe(false);
+    expect(rep('2026-02-28')).toBe(true);
+    expect(rep('2028-02-29')).toBe(true);
+    expect(aiIntentReplySchema.safeParse({ intent: { kind: 'question', measure: 'spend', from: '2026-04-31', to: '2026-05-31' } }).success).toBe(false);
+  });
+});
+
+describe('invalid or inverted periods are reported, not replaced', () => {
+  it('start after end', () => {
+    const r = p('what did we spend on fuel from 2026-08-01 to 2026-07-01');
+    expect(r).toMatchObject({ kind: 'question', measure: 'spend', subject: 'fuel' });
+    expect(r && r.kind === 'question' && r.dateProblem).toMatch(/start date \(2026-08-01\) is after the end date \(2026-07-01\)/);
+    expect(describeIntent(r!)).toMatch(/after the end date/);
+  });
+  it('a date that is not on the calendar', () => {
+    const r = p('what did we spend on fuel in 2026-02-30');
+    expect(r && r.kind === 'question' && r.dateProblem).toMatch(/“2026-02-30” isn't a real date/);
+    expect(p('p&l from 2/30/2026 to 3/31/2026')).toMatchObject({ kind: 'report', dateProblem: expect.stringMatching(/2\/30\/2026/) });
+    expect(p('how much did we spend on fuel since Feb 30')).toMatchObject({ dateProblem: expect.stringMatching(/Feb 30/) });
+  });
+  it('a bare year is not read out of an ISO date', () => {
+    expect(parseDateRange('in 2026-02-30', TODAY)).toBeNull();
+  });
+  it('valid ranges carry no problem', () => {
+    const r = p('what did we spend on fuel from 2026-07-01 to 2026-08-01');
+    expect(r).toMatchObject({ from: '2026-07-01', to: '2026-08-01' });
+    expect(r && r.kind === 'question' && r.dateProblem).toBeFalsy();
+    expect(p('fuel expenses in July 2026')).not.toHaveProperty('dateProblem');
+  });
+});
+
+describe('"spent on X in <period>" is a question', () => {
+  it.each([
+    ['spent on Shell Oil in july', 'Shell Oil', '2026-07-01', '2026-07-31'],
+    ['we spent on fuel last month', 'fuel', '2026-09-01', '2026-09-30'],
+    ['spent at Staples in Q3', 'Staples', '2026-07-01', '2026-09-30'],
+    ['paid to Shell Oil this year', 'Shell Oil', '2026-01-01', '2026-12-31'],
+  ])('%s', (cmd, subject, from, to) => {
+    expect(p(cmd)).toMatchObject({ kind: 'question', measure: 'spend', subject, from, to });
+  });
+  it('with an amount it is still a new expense', () => {
+    expect(p('spent $45 on fuel at Shell yesterday')).toMatchObject({ kind: 'create', form: 'expense', date: '2026-10-14' });
+    expect(p('spent on fuel')).toMatchObject({ kind: 'create', form: 'expense' });
+  });
+});
+
+describe('fiscal year (company fiscal year starting July)', () => {
+  const fy = { fiscalStartMonth: 6 };
+  const r = (s: string, today = TODAY) => parseDateRange(s, today, fy)?.range;
+  it('reads the start month from the fiscal year end setting', () => {
+    expect(fiscalStartMonthFromYearEnd('06-30')).toBe(6);
+    expect(fiscalStartMonthFromYearEnd('12-31')).toBe(0);
+    expect(fiscalStartMonthFromYearEnd('09-30')).toBe(9);
+    expect(fiscalStartMonthFromYearEnd('02-28')).toBe(2);
+    expect(fiscalStartMonthFromYearEnd('06-15')).toBe(0);
+    expect(fiscalStartMonthFromYearEnd(undefined)).toBe(0);
+  });
+  it('quarters follow the fiscal year (named by the year it ends in)', () => {
+    expect(r('Q1')).toMatchObject({ from: '2026-07-01', to: '2026-09-30', label: expect.stringMatching(/fiscal Q1 FY2027/) });
+    expect(r('Q2')).toMatchObject({ from: '2026-10-01', to: '2026-12-31' });
+    expect(r('Q3')).toMatchObject({ from: '2026-01-01', to: '2026-03-31' }); // most recent Q3 that has started
+    expect(r('Q3 2027')).toMatchObject({ from: '2027-01-01', to: '2027-03-31' });
+    expect(r('this quarter')).toMatchObject({ from: '2026-10-01', to: '2026-12-31' });
+    expect(r('last quarter')).toMatchObject({ from: '2026-07-01', to: '2026-09-30' });
+    expect(r('QTD')).toMatchObject({ from: '2026-10-01', to: '2026-10-15' });
+  });
+  it('this year, last year and YTD follow the fiscal year; "calendar year" does not', () => {
+    expect(r('this year')).toMatchObject({ from: '2026-07-01', to: '2027-06-30', label: expect.stringMatching(/FY2027/) });
+    expect(r('last year')).toMatchObject({ from: '2025-07-01', to: '2026-06-30' });
+    expect(r('YTD')).toMatchObject({ from: '2026-07-01', to: '2026-10-15' });
+    expect(r('YTD', new Date(Date.UTC(2026, 2, 5)))).toMatchObject({ from: '2025-07-01', to: '2026-03-05' });
+    expect(r('last calendar year')).toMatchObject({ from: '2025-01-01', to: '2025-12-31' });
+    expect(yearToDate(TODAY, fy)).toMatchObject({ from: '2026-07-01', to: '2026-10-15' });
+  });
+  it('the grammar passes it through', () => {
+    expect(parseCommand('what did we spend on fuel in Q1', TODAY, fy)).toMatchObject({ from: '2026-07-01', to: '2026-09-30' });
+    expect(parseCommand('what did we spend on fuel in Q1', TODAY)).toMatchObject({ from: '2026-01-01', to: '2026-03-31' });
+  });
+});
+
+describe('report filters for overdue items', () => {
+  it('the Collections Report shows the "more than N days past due" filter', () => {
+    expect(REPORT_CATALOG.find((e) => e.key === 'collections-report')?.controls).toContain('overdue');
+  });
+  it('overDays is range-checked (0 to 3650)', () => {
+    expect(reportParamsSchema.safeParse({ overDays: '0' }).success).toBe(true);
+    expect(reportParamsSchema.safeParse({ overDays: '3650' }).success).toBe(true);
+    expect(reportParamsSchema.safeParse({ overDays: '3651' }).success).toBe(false);
+    expect(reportParamsSchema.safeParse({ overDays: '-1' }).success).toBe(false);
   });
 });

@@ -21,6 +21,7 @@ import {
   accounts,
   bankAccounts,
   bills,
+  companies,
   creditMemos,
   customers,
   expenses,
@@ -38,7 +39,14 @@ import { can, type Action, type Area } from '@/lib/permissions/model';
 import { searchPages } from '@/lib/nav';
 import { AiError } from '@/lib/ai/types';
 import { parseCommand, cleanCommand } from '@/lib/commands/grammar';
-import { parseDateRange, todayStr, yearToDate, type DateRange } from '@/lib/commands/dates';
+import {
+  fiscalStartMonthFromYearEnd,
+  parseDateRange,
+  todayStr,
+  yearToDate,
+  type DateRange,
+  type DateRangeOptions,
+} from '@/lib/commands/dates';
 import {
   ACTION_TITLES,
   FORM_LABELS,
@@ -150,7 +158,7 @@ export async function runCommand(
   if (!text) throw validation('Type what you want to do.');
   if (text.length > 500) throw validation('That is too long for a command — keep it under 500 characters.');
 
-  const intent = parseCommand(text, today);
+  const intent = parseCommand(text, today, await dateOptsFor(ctx));
   if (intent) return withMeta(await executeIntent(ctx, intent, input.hints ?? {}, today), 'grammar', intent);
 
   // Fuzzy fallback: only when asked, only when this company has an eligible AI model.
@@ -192,6 +200,16 @@ export async function runCommand(
     source: 'none',
     aiAvailable,
   };
+}
+
+/** Date options for this company: quarters / "this year" / YTD follow its fiscal year. */
+async function dateOptsFor(ctx: ServiceContext): Promise<DateRangeOptions> {
+  const [row] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId))
+    .limit(1);
+  return { fiscalStartMonth: fiscalStartMonthFromYearEnd(row?.settings?.fiscalYearEnd) };
 }
 
 function withMeta(out: CommandOutcome, source: CommandResult['source'], intent: CommandIntent): CommandResult {
@@ -366,6 +384,27 @@ function decStr(v: Decimal): string {
   return v.toDecimalPlaces(4).toFixed().replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 }
 
+const TOO_LARGE = 'That amount is too large — use at most 13 digits before the decimal point.';
+/** A computed quantity / unit rate that must fit a form field (≤ 13 integer digits). */
+function fitDec(v: Decimal): string {
+  if (!v.isFinite() || v.isNegative()) throw validation(TOO_LARGE);
+  const s = decStr(v);
+  if (!/^\d{1,13}(\.\d{1,4})?$/.test(s)) throw validation(TOO_LARGE);
+  return s;
+}
+/** A computed line amount that must fit a form field and the ledger (≤ 13 integer digits, 2 dp). */
+function fitAmount(v: Decimal): string {
+  if (!v.isFinite() || v.isNegative()) throw validation(TOO_LARGE);
+  const s = toAmountString(v);
+  if (!/^\d{1,13}\.\d{2}$/.test(s)) throw validation(TOO_LARGE);
+  return s;
+}
+/** amount ÷ quantity, refusing a zero quantity instead of producing Infinity. */
+function perUnit(amount: string, qty: string): string {
+  if (Money.isZero(qty)) throw validation("A quantity of zero can't be used — enter 1 or more.");
+  return fitDec(Money.div(amount, qty));
+}
+
 // ---------------------------------------------------------------------------
 // create → prefilled form
 // ---------------------------------------------------------------------------
@@ -473,6 +512,10 @@ async function executeCreate(ctx: ServiceContext, intent: CreateIntent, hints: R
     const l = intent.lines[i];
     const key = String(i);
     const text = l.text?.trim();
+    if (l.unclear?.length) {
+      const what = l.unclear.map((u) => `“${u}”`).join(' and ');
+      notes.push(`I couldn't tell what ${what} was for on line ${i + 1}, so ${l.unclear.length === 1 ? 'it was' : 'they were'} left out — check the amounts on the form.`);
+    }
     if (sales) {
       const salesItems = itemList.filter((it) => SALES_ITEM_TYPES.has(it.type));
       let item: ItemRow | undefined;
@@ -496,6 +539,7 @@ async function executeCreate(ctx: ServiceContext, intent: CreateIntent, hints: R
         } else notes.push(`No item matches “${text}” — choose the item on line ${i + 1}.`);
       }
       const { quantity, rate } = salesQtyRate(l, item);
+      if (rate) fitAmount(Money.mul(quantity, rate)); // the form's line total must fit too
       const line: PrefillLine = {
         ...(item ? { itemId: item.id, itemName: item.name, itemType: item.type, taxable: item.taxable } : {}),
         description: item ? (item.description || item.name) : (text ?? ''),
@@ -545,17 +589,21 @@ async function executeCreate(ctx: ServiceContext, intent: CreateIntent, hints: R
         }
       }
       if (item) {
-        const qty = l.quantity ?? '1';
-        const unit = l.rate ?? (l.amount ? decStr(Money.div(l.amount, qty)) : item.purchaseCost ?? undefined);
-        const amount = l.amount ?? (unit ? toAmountString(Money.mul(qty, unit)) : undefined);
+        // "bill from Staples 3 widgets": a bare whole number on an ITEM line is a count, not $3.
+        const asCount = l.amountMaybeCount && l.amount && !l.quantity && !l.rate;
+        const qty = (asCount ? l.amount : l.quantity) ?? '1';
+        const typedAmount = asCount ? undefined : l.amount;
+        const unit = l.rate ?? (typedAmount ? perUnit(typedAmount, qty) : item.purchaseCost ?? undefined);
+        const amount = typedAmount ?? (unit ? fitAmount(Money.mul(qty, unit)) : undefined);
+        if (!unit) notes.push(`Line ${i + 1} has no cost yet — enter it on the form.`);
         prefill.lines.push({
           itemId: item.id,
           itemName: item.name,
           itemType: item.type,
           description: text && normalizeEq(text, item.name) ? item.name : (text ?? item.name),
-          quantity: decStr(Money.of(qty)),
-          ...(unit ? { rate: decStr(Money.of(unit)) } : {}),
-          ...(amount ? { amount: toAmountString(amount) } : {}),
+          quantity: fitDec(Money.of(qty)),
+          ...(unit ? { rate: fitDec(Money.of(unit)) } : {}),
+          ...(amount ? { amount: fitAmount(Money.of(amount)) } : {}),
         });
         continue;
       }
@@ -567,12 +615,12 @@ async function executeCreate(ctx: ServiceContext, intent: CreateIntent, hints: R
       } else if (!account) {
         notes.push(`Choose the expense account on line ${i + 1}.`);
       }
-      const amount = l.amount ?? (l.quantity && l.rate ? toAmountString(Money.mul(l.quantity, l.rate)) : undefined);
+      const amount = l.amount ?? (l.rate ? fitAmount(Money.mul(l.quantity ?? '1', l.rate)) : undefined);
       if (!amount) notes.push(`Line ${i + 1} has no amount yet — enter it on the form.`);
       prefill.lines.push({
         ...(account ? { accountId: account.id } : {}),
         description: text ?? '',
-        ...(amount ? { amount: toAmountString(amount) } : {}),
+        ...(amount ? { amount: fitAmount(Money.of(amount)) } : {}),
       });
     }
   }
@@ -619,8 +667,15 @@ async function executeCreate(ctx: ServiceContext, intent: CreateIntent, hints: R
     .join('; ');
   const summary = `${title}${lineWords ? `: ${lineWords}` : ''}${total.isZero() ? '' : ` — total ${formatCurrency(toAmountString(total))}`}. Nothing is saved until you review it and click Save.`;
   prefill.note = 'Filled in from the command bar — check everything, then save.';
-  const valid = formPrefillSchema.parse(prefill);
+  const valid = checkedPrefill(prefill);
   return { type: 'prefill', form, href: PREFILL_PATHS[form], title, summary, notes, prefill: valid };
+}
+
+/** Validate a prefill before handing it to a form: a bad value is a 400, never a 500. */
+function checkedPrefill(prefill: unknown): FormPrefill {
+  const parsed = formPrefillSchema.safeParse(prefill);
+  if (!parsed.success) throw validation("Some of those values can't be filled into the form. Check the amounts and try again.");
+  return parsed.data;
 }
 
 /** Words typed after a record's full name ("Acme Corporation consulting" → "consulting"). */
@@ -661,11 +716,11 @@ function normalizeEq(a: string, b: string): boolean {
 
 /** Sales quantity / unit rate from what was typed (and the item's price when not typed). */
 function salesQtyRate(l: IntentLine, item: ItemRow | undefined): { quantity: string; rate?: string } {
-  if (l.rate) return { quantity: l.quantity ?? '1', rate: decStr(Money.of(l.rate)) };
-  if (l.amount && l.quantity) return { quantity: l.quantity, rate: decStr(Money.div(l.amount, l.quantity)) };
-  if (l.amount) return { quantity: '1', rate: decStr(Money.of(l.amount)) };
+  if (l.rate) return { quantity: fitDec(Money.of(l.quantity ?? '1')), rate: fitDec(Money.of(l.rate)) };
+  if (l.amount && l.quantity) return { quantity: fitDec(Money.of(l.quantity)), rate: perUnit(l.amount, l.quantity) };
+  if (l.amount) return { quantity: '1', rate: fitDec(Money.of(l.amount)) };
   const price = item?.salesPrice;
-  return { quantity: l.quantity ?? '1', ...(price ? { rate: decStr(Money.of(price)) } : {}) };
+  return { quantity: fitDec(Money.of(l.quantity ?? '1')), ...(price ? { rate: fitDec(Money.of(price)) } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -686,19 +741,27 @@ function reportTotals(r: StdReport): { count: number; total: string } {
   return { count, total };
 }
 
-function resolveRange(i: { from?: string; to?: string; period?: string }, today: Date): DateRange | null {
-  if (i.from && i.to) return { from: i.from, to: i.to, label: i.period ?? `${i.from} to ${i.to}` };
-  if (i.period) {
-    const m = parseDateRange(i.period, today);
-    if (m) return m.range;
-  }
-  return null;
+/**
+ * The period an intent names. A period the grammar flagged (not a real date, start after end)
+ * or an inverted from/to is reported to the user — never replaced by some other period.
+ */
+async function resolveRange(
+  ctx: ServiceContext,
+  i: { from?: string; to?: string; period?: string; dateProblem?: string },
+  today: Date,
+): Promise<DateRange | null> {
+  if (i.dateProblem) throw validation(i.dateProblem);
+  let r: DateRange | null = null;
+  if (i.from && i.to) r = { from: i.from, to: i.to, label: i.period ?? `${i.from} to ${i.to}` };
+  else if (i.period) r = parseDateRange(i.period, today, await dateOptsFor(ctx))?.range ?? null;
+  if (r && r.from > r.to) throw validation(`The start date (${r.from}) is after the end date (${r.to}). Swap them and try again.`);
+  return r;
 }
 
 async function executeReport(ctx: ServiceContext, intent: ReportIntent, hints: ResolveHints, today: Date): Promise<CommandOutcome> {
   const over = intent.overDays !== undefined ? String(intent.overDays) : undefined;
   const overWords = intent.overDays !== undefined ? (intent.overDays === 0 ? ' that are past due' : ` more than ${intent.overDays} days past due`) : '';
-  const range = resolveRange(intent, today);
+  const range = await resolveRange(ctx, intent, today);
 
   if (intent.report === 'unpaid_bills' || intent.report === 'unpaid_invoices') {
     const bills = intent.report === 'unpaid_bills';
@@ -787,10 +850,8 @@ async function executeQuestion(ctx: ServiceContext, intent: QuestionIntent, hint
   if (!allowed(ctx, 'reports_financial', 'view')) return denied('reports_financial', 'see what was spent or earned');
   const spend = intent.measure === 'spend';
   const range: DateRange =
-    intent.from && intent.to
-      ? { from: intent.from, to: intent.to, label: intent.rangeLabel ?? intent.period ?? `${intent.from} to ${intent.to}` }
-      : resolveRange(intent, today) ?? yearToDate(today);
-  if (range.from > range.to) throw validation('The start of that period is after its end.');
+    (await resolveRange(ctx, { ...intent, period: intent.from && intent.to ? (intent.rangeLabel ?? intent.period) : intent.period }, today)) ??
+    yearToDate(today, await dateOptsFor(ctx));
 
   const accts = await loadAccounts(ctx);
   const plAccts = accts.filter((a) => a.type === (spend ? 'expense' : 'revenue'));
@@ -1030,7 +1091,7 @@ async function executeAction(ctx: ServiceContext, intent: ActionIntent, hints: R
         };
       }
     }
-    const prefill = formPrefillSchema.parse({ kind: 'reconcile', bankAccountId: chosen.id, lines: [] });
+    const prefill = checkedPrefill({ kind: 'reconcile', bankAccountId: chosen.id, lines: [] });
     return {
       type: 'prefill',
       form: 'reconcile',
@@ -1060,7 +1121,7 @@ async function executeAction(ctx: ServiceContext, intent: ActionIntent, hints: R
       }
     }
     if (chosen) {
-      const prefill = formPrefillSchema.parse({ kind: 'payment', customerId: chosen.id, lines: [] });
+      const prefill = checkedPrefill({ kind: 'payment', customerId: chosen.id, lines: [] });
       return {
         type: 'prefill',
         form: 'payment',
