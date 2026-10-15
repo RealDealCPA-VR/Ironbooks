@@ -85,7 +85,7 @@ describe('client: ApiError.fixes', () => {
         ),
       ),
     );
-    const err = await api.post('/api/journal-entries', {}).catch((e) => e);
+    const err = (await api.post('/api/journal-entries', {}).catch((e: unknown) => e)) as ApiError;
     expect(err).toBeInstanceOf(ApiError);
     expect(err.fixes).toEqual([fix]);
     expect(errorFixes(err)).toEqual([fix]);
