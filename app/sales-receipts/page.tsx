@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { Receipt, Plus, Trash2, PlusCircle, MinusCircle, Pencil } from 'lucide-react';
 import {
   AmountInput,
@@ -56,6 +56,7 @@ import {
 // wave2 prefs: Payments > default deposit account; Memorize (Ctrl+M)
 import { usePreferences } from '@/lib/usePreferences';
 import MemorizeButton from '@/components/MemorizeButton';
+import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -108,6 +109,7 @@ interface SalesReceipt {
 interface SalesReceiptDetail extends SalesReceipt {
   depositAccountId: string | null;
   taxRateId: string | null;
+  classId?: string | null;
   memo: string | null;
   shipDate?: string | null;
   shipVia?: string | null;
@@ -212,9 +214,16 @@ function NewReceiptModal({
   const [depositAccountId, setDepositAccountId] = useState('');
   const [reference, setReference] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
+  const [classId, setClassId] = useState('');
+  const [classes, setClasses] = useState<Array<{ id: string; name: string }>>([]);
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
+  // Smart defaults (lib/useSmartDefaults.ts): default date + recall the customer's last receipt.
+  const smart = useSmartDefaults('sales_receipt');
+  const [recallText, setRecallText] = useState('');
+  /** Tax item recalled from the last receipt — wins over the customer's default tax item. */
+  const recalledTaxRef = useRef<string | null>(null);
   const [saving, setSaving] = useState(false);
   const docNumber = useDocNumber('sales_receipt', open, editing ? docNo(editing.refNumber, editing.receiptNumber) : null);
   const dupConfirm = useDuplicateNumberConfirm();
@@ -222,7 +231,7 @@ function NewReceiptModal({
   const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
   useEffect(() => {
     if (!custDefaults || editing) return;
-    setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
+    setTaxRateId(custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? '') : '');
     const st = defaultShipToState(custDefaults);
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -238,6 +247,7 @@ function NewReceiptModal({
       setDepositAccountId(editing.depositAccountId ?? '');
       setReference(editing.reference ?? '');
       setTaxRateId(editing.taxRateId ?? '');
+      setClassId(editing.classId ?? '');
       setMemo(editing.memo ?? '');
       setShip(shippingFromDoc(editing));
       setLines(
@@ -255,16 +265,76 @@ function NewReceiptModal({
     if (open) {
       setShip(shippingFromDoc(null));
       setCustomerId('');
-      setDate(new Date().toISOString().slice(0, 10));
+      // My Preferences > General "Default date": today, or the last receipt date entered this session.
+      setDate(smart.defaultDate());
       setMethod('cash');
       setDepositAccountId(defaultDepositId);
       setReference('');
       setTaxRateId('');
+      setClassId('');
       setMemo('');
       setLines([{ ...EMPTY_LINE }]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing]);
+
+  // Classes for the Class field (shown while class tracking is on).
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    api
+      .get<Array<{ id: string; name: string }>>('/api/classes')
+      .then((r) => live && setClasses(Array.isArray(r) ? r : []))
+      .catch(() => live && setClasses([]));
+    return () => {
+      live = false;
+    };
+  }, [open]);
+
+  // QB "Recall the last transaction for a name" (My Preferences > General): a NEW receipt for
+  // this customer starts from their last one — items, rates, class, tax item and memo. Lines the
+  // user already typed are kept.
+  const { recall } = smart;
+  useEffect(() => {
+    setRecallText('');
+    recalledTaxRef.current = null;
+    if (!open || editing || !customerId) return;
+    let live = true;
+    void recall(customerId).then((d) => {
+      if (!live || !d) return;
+      const h = d.header;
+      if (h.classId) setClassId(h.classId);
+      if (h.taxRateId) {
+        recalledTaxRef.current = h.taxRateId;
+        setTaxRateId(h.taxRateId);
+      }
+      if (h.memo) {
+        const m = h.memo;
+        setMemo((prev) => prev || m);
+      }
+      if (d.lines.length > 0) {
+        setLines((prev) =>
+          prev.every((l) => !l.itemId && !l.description && !l.quantity && !l.rate)
+            ? d.lines.map((l) => ({
+                ...EMPTY_LINE,
+                itemId: l.itemId ?? '',
+                description: l.description ?? '',
+                quantity: l.quantity ? String(Number(l.quantity)) : '1',
+                rate: l.rate ? String(Number(l.rate)) : '',
+                taxable: l.taxable ?? true,
+                // QB recall keeps last time's rates: automatic pricing must not replace them.
+                rateManual: true,
+              }))
+            : prev,
+        );
+      }
+      setRecallText(recallNote(d));
+    });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editing, customerId, recall]);
 
   function updateLine(idx: number, patch: Partial<LineRow>) {
     setLines((prev) => {
@@ -343,6 +413,7 @@ function NewReceiptModal({
       depositAccountId: depositAccountId || null,
       reference: reference || null,
       taxRateId: taxRateId || null,
+      classId: classId || null,
       memo: memo || null,
       lines: validLines.map((l) => ({
         itemId: l.itemId || null,
@@ -378,6 +449,7 @@ function NewReceiptModal({
           : api.post<SalesReceipt>('/api/sales-receipts', { ...body, allowDuplicateNumber }),
       );
       if (saved === undefined) return;
+      if (!editing) smart.rememberDate(date);
       if (editing) {
         toast(`Sales Receipt #${docNo(saved.refNumber, saved.receiptNumber)} updated.`, 'success');
       } else {
@@ -451,6 +523,7 @@ function NewReceiptModal({
                 <option key={c.id} value={c.id}>{c.displayName}</option>
               ))}
             </Select>
+            {recallText && <p className="mt-1 text-xs text-electric" role="status">{recallText}</p>}
           </div>
           <div>
             <Label htmlFor="sr-date" required>Sale Date</Label>
@@ -625,6 +698,20 @@ function NewReceiptModal({
               onChange={(e) => setMemo(e.target.value)}
             />
           </div>
+          {/* Class fields are hidden while "Use class tracking" is off (QB); a saved class still shows. */}
+          {(prefs.company.classTrackingEnabled || classId) && (
+            <div>
+              <Label htmlFor="sr-class">Class (optional)</Label>
+              <Select id="sr-class" value={classId} onChange={(e) => setClassId(e.target.value)}>
+                <option value="">No class</option>
+                {classes.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          )}
         </div>
 
         <ShippingSection value={ship} onChange={setShip} shipTos={custDefaults?.shipTos} idPrefix="sr-ship" />

@@ -5,7 +5,8 @@
  *  - save-time prompts through the API client's write hooks: past/future date warning for the
  *    forms that don't ask themselves, and "Warn when editing a transaction";
  *  - after a transaction saves: "Beep when recording a transaction", remember the date for
- *    "Default date = the last date I entered", and tell other open report windows the data
+ *    "Default date = the last date I entered" (per form type, this session — lib/smartDefaults),
+ *    and tell other open report windows the data
  *    changed (Reports "When report data changes");
  *  - keyboard/field behaviour: "Pressing Enter moves between fields", "Automatically place the
  *    decimal point" (amount fields), and the remembered default date on new transaction forms.
@@ -15,15 +16,15 @@ import { usePathname } from 'next/navigation';
 import { setWriteHooks } from '@/lib/client';
 import { usePreferences } from '@/lib/usePreferences';
 import {
-  LAST_DATE_STORAGE_KEY,
-  TRANSACTION_PAGES,
   autoDecimal,
   bodyDate,
   isMoneyField,
   isNewTransactionDateField,
   promptsBeforeSave,
   recordsTransaction,
+  transactionTarget,
 } from '@/lib/prefBehaviors';
+import { PAGE_FORM_KEYS, formKeyForSave, recallFormDate, rememberFormDate } from '@/lib/smartDefaults';
 
 const DATA_CHANGED_KEY = 'bka:dataChangedAt';
 
@@ -80,8 +81,11 @@ export default function PreferenceBehaviors() {
         const p = ref.current;
         if (p.my.beepOnRecord) beep();
         const date = bodyDate(info.body);
+        // "Default date = the last date I entered": remembered per form type for this session.
+        const target = transactionTarget(info.path);
+        const formKey = target && info.method === 'POST' ? formKeyForSave(target.base, info.body) : null;
+        if (date && formKey) rememberFormDate(formKey, date);
         try {
-          if (date) localStorage.setItem(LAST_DATE_STORAGE_KEY, date);
           localStorage.setItem(DATA_CHANGED_KEY, String(Date.now()));
         } catch {
           /* storage unavailable */
@@ -136,16 +140,14 @@ export default function PreferenceBehaviors() {
     };
   }, []);
 
-  // ---- Default date = the last date I entered (new transaction forms) ----
-  const onTransactionPage = TRANSACTION_PAGES.some((p) => pathname === p || pathname.startsWith(p + '/'));
+  // ---- Default date = the last date I entered on this form type (new transaction forms) ----
+  // Bills, checks/expenses and the sales forms pick their own date (lib/useSmartDefaults.ts);
+  // the other transaction pages get it filled in here.
+  const pageFormKey =
+    Object.entries(PAGE_FORM_KEYS).find(([p]) => pathname === p || pathname.startsWith(p + '/'))?.[1] ?? null;
   React.useEffect(() => {
-    if (!onTransactionPage || prefs.my.defaultDate !== 'last') return;
-    let last: string | null = null;
-    try {
-      last = localStorage.getItem(LAST_DATE_STORAGE_KEY);
-    } catch {
-      return;
-    }
+    if (!pageFormKey || prefs.my.defaultDate !== 'last') return;
+    const last = recallFormDate(pageFormKey);
     if (!last || last === prefs.today) return;
     const done = new WeakSet<Element>();
     const apply = () => {
@@ -156,14 +158,14 @@ export default function PreferenceBehaviors() {
         if (!first || first.value !== prefs.today || first.disabled || first.readOnly) return;
         const label = labelTextFor(first);
         if (!isNewTransactionDateField({ name: first.name, id: first.id, ariaLabel: first.getAttribute('aria-label'), labelText: label })) return;
-        setNativeValue(first, last!);
+        setNativeValue(first, last);
       });
     };
     apply();
     const obs = new MutationObserver(apply);
     obs.observe(document.body, { childList: true, subtree: true });
     return () => obs.disconnect();
-  }, [onTransactionPage, prefs.my.defaultDate, prefs.today]);
+  }, [pageFormKey, prefs.my.defaultDate, prefs.today]);
 
   // ---- Reports: when report data changes (another window saved a transaction) ----
   const onReport = pathname === '/reports' || pathname.startsWith('/reports/');

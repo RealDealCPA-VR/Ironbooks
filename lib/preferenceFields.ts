@@ -75,8 +75,8 @@ export const FIELD_META: Record<string, FieldMeta> = {
   autoDecimalPoint: { label: 'Automatically place the decimal point', help: 'Typing 1234 enters 12.34.', type: 'bool' },
   warnWhenEditing: { label: 'Warn when editing a transaction', help: 'Asks before saving changes to a transaction that was already recorded.', type: 'bool' },
   warnWhenDeleting: { label: 'Warn when deleting a transaction or unused list item', type: 'bool', fixed: 'Always on: Ironbooks always asks before deleting or voiding, because it cannot be undone.' },
-  defaultDate: { label: 'Default date for new transactions', help: '"The last date I entered" uses the date of the last transaction you saved on this computer.', type: 'select', options: [['today', "Today's date"], ['last', 'The last date I entered']] },
-  autoRecallLastTransaction: { label: 'Recall the last transaction for a name', help: 'Bills and checks fill in the accounts you used last time for that vendor.', type: 'bool' },
+  defaultDate: { label: 'Default date for new transactions', help: '"The last date I entered" uses the date you last saved on the same kind of form (a check, an invoice, ...) since you opened the app.', type: 'select', options: [['today', "Today's date"], ['last', 'The last date I entered']] },
+  autoRecallLastTransaction: { label: 'Recall the last transaction for a name', help: 'When you pick a name on a new bill, check, expense, card charge, invoice, sales receipt, estimate or sales order, the lines, terms, class, sales rep, tax and memo from the last one for that name are filled in.', type: 'bool' },
   showHomeWorkflow: { label: 'Show the home workflow on the dashboard', type: 'bool' },
   navMode: { label: 'Menu style', help: 'Simple shows only everyday tasks. Advanced shows every screen. You can also switch at the top of the menu.', type: 'select', options: [['simple', 'Simple (everyday tasks)'], ['advanced', 'Advanced (every screen)']] },
   // Jobs & Estimates

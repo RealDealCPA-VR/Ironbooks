@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { Banknote, Pencil, Plus, Receipt, Trash2 } from 'lucide-react';
 import {
@@ -48,6 +48,8 @@ import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
+import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
+import type { SmartLine } from '@/lib/smartDefaults';
 import AttachmentPanel from '@/components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,7 @@ interface Bill {
   status: 'open' | 'partial' | 'paid' | 'void';
   memo: string | null;
   terms?: string | null;
+  classId?: string | null;
   currency?: string | null;
   exchangeRate?: string | null;
 }
@@ -102,6 +105,11 @@ interface Account {
   code: string;
   name: string;
   type: string;
+}
+
+interface ClassRow {
+  id: string;
+  name: string;
 }
 
 interface Item {
@@ -168,6 +176,20 @@ function emptyLine(mode: LineMode = 'expense'): LineRow {
   return { mode, accountId: '', amount: '', itemId: '', quantity: '', unitCost: '', description: '' };
 }
 
+/** A recalled line (smart defaults) as a form row. */
+function rowFromRecall(l: SmartLine): LineRow {
+  if (l.kind === 'item' && l.itemId) {
+    return {
+      ...emptyLine('item'),
+      itemId: l.itemId,
+      quantity: l.quantity ?? '1',
+      unitCost: l.rate ?? '',
+      description: l.description ?? '',
+    };
+  }
+  return { ...emptyLine('expense'), accountId: l.accountId ?? '', amount: l.amount, description: l.description ?? '' };
+}
+
 /** Display amount for a line: explicit amount (expense) or qty x cost (item). */
 function lineAmount(line: LineRow): number {
   if (line.mode === 'item') {
@@ -184,7 +206,10 @@ export default function BillsPage() {
   const [bills, setBills] = useState<Bill[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const prefs = usePreferences();
+  // Smart defaults: recall the vendor's last bill, default date (lib/useSmartDefaults.ts).
+  const smart = useSmartDefaults('bill');
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [classes, setClasses] = useState<ClassRow[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -203,8 +228,11 @@ export default function BillsPage() {
   // Terms list entries (custom and date-driven terms included); the built-in set until it loads.
   const termsChoices = useTermsChoices(TERMS_CHOICES);
   const [memo, setMemo] = useState('');
+  const [classId, setClassId] = useState('');
   const [exchangeRate, setExchangeRate] = useState('');
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
+  /** The vendor the form currently shows (guards late recall responses). */
+  const vendorRef = useRef('');
   /** Shown under the vendor picker after accounts were pre-filled (QB vendor pre-fill). */
   const [prefillNote, setPrefillNote] = useState('');
 
@@ -242,6 +270,10 @@ export default function BillsPage() {
         setVendors(vendorData);
         setAccounts(accountData);
         setItems(itemData.items ?? []);
+        api
+          .get<ClassRow[]>('/api/classes')
+          .then(setClasses)
+          .catch(() => setClasses([]));
       } catch (err) {
         toastError(err, 'Failed to load data');
       } finally {
@@ -266,11 +298,14 @@ export default function BillsPage() {
   function openModal() {
     setEditingId(null);
     setVendorId('');
+    vendorRef.current = '';
     setBillNumber('');
-    setDate(new Date().toISOString().slice(0, 10));
+    // My Preferences > General "Default date": today, or the last bill date entered this session.
+    setDate(smart.defaultDate());
     setDueDate('');
     setTerms('');
     setMemo('');
+    setClassId('');
     setExchangeRate('');
     setLines([emptyLine()]);
     setPrefillNote('');
@@ -293,28 +328,51 @@ export default function BillsPage() {
 
   async function handleVendorChange(id: string) {
     setVendorId(id);
+    vendorRef.current = id;
     setPrefillNote('');
     if (!id || editingId) return;
     const vendor = vendors.find((v) => v.id === id);
     setTerms(vendor?.terms ?? '');
     // Due date from the vendor's terms on the Terms list (else Preferences > Bills default terms).
     void fetchDueDateForTerms(date, vendor?.terms || prefs.company.defaultVendorTerms).then((due) => {
-      if (due) setDueDate(due);
+      if (due && vendorRef.current === id) setDueDate(due);
     });
     const blank = (ls: LineRow[]) =>
       ls.every((l) => l.mode === 'expense' && !l.accountId && !l.amount && !l.description);
+    // My Preferences > General 'Recall the last transaction for a name' (QB auto-fill): the
+    // vendor's last bill gives the terms, class, memo and lines (null when the preference is off).
+    const recalled = await smart.recall(id);
+    if (vendorRef.current !== id) return; // another vendor was picked meanwhile
+    if (recalled) {
+      const h = recalled.header;
+      if (h.terms) {
+        const t = h.terms;
+        setTerms(t);
+        void fetchDueDateForTerms(date, t).then((due) => {
+          if (due && vendorRef.current === id) setDueDate(due);
+        });
+      }
+      if (h.classId) setClassId((prev) => prev || h.classId || '');
+      if (h.memo) setMemo((prev) => prev || h.memo || '');
+    }
     if (!blank(lines)) return;
-    // The vendor's own pre-fill accounts (up to 3) win over learned suggestions.
+    // The vendor's own pre-fill accounts (up to 3) win over recalled / learned lines.
     const own = vendorPrefillAccountIds(vendor);
     if (own.length > 0) {
       setLines(own.map((accountId) => ({ ...emptyLine('expense'), accountId })));
       setPrefillNote("Accounts pre-filled from the vendor's pre-fill accounts.");
       return;
     }
-    // My Preferences > General 'Recall the last transaction for a name'.
+    if (recalled && recalled.lines.length > 0) {
+      setLines((prev) => (blank(prev) ? recalled.lines.map(rowFromRecall) : prev));
+      setPrefillNote(recallNote(recalled));
+      return;
+    }
+    if (recalled) setPrefillNote(recallNote(recalled));
     if (!prefs.my.autoRecallLastTransaction) return;
+    // Nothing usable on file for this vendor: the learned categorizer's suggestion (local model).
     const pf = await fetchVendorPrefill({ vendorId: id });
-    if (!pf) return;
+    if (!pf || vendorRef.current !== id) return;
     setLines((prev) => {
       if (!blank(prev)) return prev; // user started typing while we fetched
       return pf.lines.map((l) => ({ ...emptyLine('expense'), accountId: l.accountId }));
@@ -329,11 +387,13 @@ export default function BillsPage() {
       const detail = await api.get<Bill & { lines: BillDetailLine[] }>(`/api/bills/${bill.id}`);
       setEditingId(bill.id);
       setVendorId(detail.vendorId);
+      vendorRef.current = detail.vendorId;
       setBillNumber(detail.billNumber ?? '');
       setDate(detail.date.slice(0, 10));
       setDueDate(detail.dueDate ? detail.dueDate.slice(0, 10) : '');
       setTerms(detail.terms ?? '');
       setMemo(detail.memo ?? '');
+      setClassId(detail.classId ?? '');
       setExchangeRate(detail.currency && detail.exchangeRate ? String(Number(detail.exchangeRate)) : '');
       setLines(
         detail.lines.length === 0
@@ -485,6 +545,7 @@ export default function BillsPage() {
         dueDate: dueDate || undefined,
         terms: terms || undefined,
         memo: memo.trim() || undefined,
+        classId: classId || (editingId ? null : undefined),
         exchangeRate: selectedVendor?.currency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
         lines: lines.map((l) =>
           l.mode === 'item'
@@ -509,6 +570,7 @@ export default function BillsPage() {
           : api.post('/api/bills', { ...payload, allowDuplicateNumber }),
       );
       if (saved === null) return;
+      if (!editingId) smart.rememberDate(date);
       toast(editingId ? 'Bill updated.' : 'Bill created.', 'success');
       setModalOpen(false);
       await fetchBills();
@@ -777,9 +839,24 @@ export default function BillsPage() {
             </div>
           )}
 
-          <div>
-            <Label htmlFor="bill-memo">Memo</Label>
-            <Input id="bill-memo" placeholder="Optional note" value={memo} onChange={(e) => setMemo(e.target.value)} />
+          <div className={prefs.company.classTrackingEnabled || classId ? 'grid grid-cols-2 gap-3' : ''}>
+            <div>
+              <Label htmlFor="bill-memo">Memo</Label>
+              <Input id="bill-memo" placeholder="Optional note" value={memo} onChange={(e) => setMemo(e.target.value)} />
+            </div>
+            {(prefs.company.classTrackingEnabled || classId) && (
+              <div>
+                <Label htmlFor="bill-class">Class (optional)</Label>
+                <Select id="bill-class" value={classId} onChange={(e) => setClassId(e.target.value)}>
+                  <option value="">No class</option>
+                  {classes.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            )}
           </div>
 
           {/* Line items */}
