@@ -520,3 +520,20 @@ export function renumberRowMessage(text: string, rowNumber: (i: number) => numbe
     return `Rows ${from}–${rowNumber(Number(b) - 1)}:`;
   });
 }
+
+/**
+ * After a partial save the grid drops saved and blank rows, so the kept rows move up. Re-key the
+ * per-row errors from old grid index to new index (keptOldIdx[k] is the old index of new row k) and
+ * renumber the "Row N:" / "Rows N–M:" prefixes, which carry 1-based old grid row numbers, so each
+ * message still names the row it sits on.
+ */
+export function compactRowErrors(errs: Map<number, string[]>, keptOldIdx: number[]): Map<number, string[]> {
+  const oldToNew = new Map(keptOldIdx.map((oldIdx, k) => [oldIdx, k]));
+  const rowNumber = (j: number) => (oldToNew.get(j) ?? j) + 1;
+  const out = new Map<number, string[]>();
+  keptOldIdx.forEach((oldIdx, k) => {
+    const e = errs.get(oldIdx);
+    if (e) out.set(k, e.map((m) => renumberRowMessage(m, rowNumber)));
+  });
+  return out;
+}

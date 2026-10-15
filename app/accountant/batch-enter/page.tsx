@@ -64,6 +64,7 @@ import {
 import {
   type BatchLookupLists,
   type ResolvedBatchJob,
+  compactRowErrors,
   createBatchMatchers,
   renumberRowMessage,
   resolveBatchRows,
@@ -317,11 +318,7 @@ export default function BatchEnterPage() {
       }
       // Saved rows leave the grid; rows that failed stay with their reason.
       const keep = rows.map((r, i) => ({ r, i })).filter(({ r, i }) => !savedGridRows.has(i) && !isBlankBatchRow(r));
-      const nextErrs = new Map<number, string[]>();
-      keep.forEach(({ i }, k) => {
-        const e = errs.get(i);
-        if (e) nextErrs.set(k, e);
-      });
+      const nextErrs = compactRowErrors(errs, keep.map(({ i }) => i));
       const nextRows = keep.map(({ r }) => r);
       setRows(nextRows.length < START_ROWS ? [...nextRows, ...Array.from({ length: START_ROWS - nextRows.length }, blank)] : nextRows);
       setServerErrors(nextErrs);
