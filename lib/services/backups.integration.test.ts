@@ -31,6 +31,15 @@ vi.mock('next/headers', () => ({
   headers: async () => new Headers([...h.headers.entries()]),
 }));
 
+// Bank-feed downloads (Plaid) are allowed for this test company without touching its saved
+// network policy; fetch itself is stubbed in the test, so nothing leaves the machine.
+vi.mock('./networkPolicy', () => ({
+  getNetworkPolicy: async () => ({
+    mode: 'allow-cloud',
+    cloudOptIn: { ai: false, email: false, 'bank-feeds': true, updates: false },
+  }),
+}));
+
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-team-backups');
 const TEST_DIR = path.join(ROOT, 'company');
 const BACKUP_DIR = path.join(ROOT, 'backups');
@@ -40,7 +49,8 @@ process.env.BKA_AUTH_SECRET = 'team-backups-secret';
 process.env.BKA_INTERNAL_TOKEN = 'team-backups-internal-token';
 
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, journalEntries, users } from '@/lib/db/schema';
+import { accounts, bankAccounts, journalEntries, users } from '@/lib/db/schema';
+import { syncTransactions } from './plaid';
 import { createSessionToken, hashPassword, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE, getServerContext } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
@@ -51,7 +61,7 @@ import { addUser } from './users';
 import { createBackup, ensurePreOpBackup } from './backup';
 import { readBackupHistory, saveBackupSettings, type BackupRecord } from './backupHistory';
 import { currentFingerprint } from './backupFingerprint';
-import { runScheduledBackupIfDue, runVersionedBackup, stopBackupScheduler } from './backupSchedule';
+import { isSchedulerRunning, runScheduledBackupIfDue, runVersionedBackup, stopBackupScheduler } from './backupSchedule';
 import { PREVIEW_DIR_PREFIX, previewBackup } from './backupPreview';
 import type { ServiceContext } from './_base';
 import { GET as fullBackupGET } from '@/app/api/backup/route';
@@ -68,6 +78,7 @@ let companyId: string;
 let ownerId: string;
 let trusted: ServiceContext;
 let cash: string;
+let finId: string;
 let income: string;
 const HOUR = 60 * 60 * 1000;
 
@@ -229,6 +240,40 @@ describe('backups you can see and trust', () => {
     });
   });
 
+  describe('"skip when unchanged" sees every kind of change', () => {
+    it('downloaded bank-feed lines (Plaid) change the fingerprint, so the next scheduled backup is not skipped', async () => {
+      const [bank] = await db
+        .insert(bankAccounts)
+        .values({ companyId, accountId: cash, bankName: 'Test Bank', accountNumber: '****1234' })
+        .returning();
+      const before = currentFingerprint(TEST_DIR);
+      const saved = { id: process.env.PLAID_CLIENT_ID, secret: process.env.PLAID_SECRET, env: process.env.PLAID_ENV };
+      const realFetch = globalThis.fetch;
+      process.env.PLAID_CLIENT_ID = 'cid';
+      process.env.PLAID_SECRET = 'sec';
+      process.env.PLAID_ENV = 'sandbox';
+      globalThis.fetch = vi.fn(async () =>
+        new Response(
+          JSON.stringify({ added: [{ transaction_id: 'plaid-tx-1', date: '2026-05-03', name: 'Coffee', merchant_name: null, amount: 4.5 }] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      ) as typeof fetch;
+      try {
+        const out = await syncTransactions(trusted, { accessToken: 'access-x', bankAccountId: bank.id });
+        expect(out.imported).toBe(1);
+      } finally {
+        globalThis.fetch = realFetch;
+        for (const [k, v] of [['PLAID_CLIENT_ID', saved.id], ['PLAID_SECRET', saved.secret], ['PLAID_ENV', saved.env]] as const) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+      const after = currentFingerprint(TEST_DIR);
+      expect(after).not.toBeNull();
+      expect(after).not.toBe(before);
+    });
+  });
+
   describe('rotation', () => {
     it('keeps only the last N automatic versions; manual copies stay', async () => {
       saveBackupSettings({ keep: 2 }, TEST_DIR);
@@ -286,6 +331,7 @@ describe('backups you can see and trust', () => {
       as(ownerId, 'POST', '/api/users');
       const adminCtx = await getServerContext();
       const fin = await addUser(adminCtx, { name: 'Finn', login: 'finn', password: 'finnpass123', roleKeys: ['full_access'] });
+      finId = fin.userId;
       as(fin.userId, 'PUT', '/api/backups');
       expect((await backupsPUT(req('/api/backups', { method: 'PUT', json: true, body: JSON.stringify({ schedule: 'off' }) }))).status).toBe(403);
       as(fin.userId, 'POST', '/api/backups/run');
@@ -294,6 +340,64 @@ describe('backups you can see and trust', () => {
       expect((await previewPOST(req('/api/backups/preview', { method: 'POST', body: Buffer.from('x') }))).status).toBe(403);
       as(fin.userId, 'POST', '/api/backups/restore');
       expect((await restorePOST(req('/api/backups/restore', { method: 'POST', json: true, body: JSON.stringify({ id: 'x' }) }))).status).toBe(403);
+    });
+  });
+
+  describe('the schedule runs whoever uses the app', () => {
+    it('a Bookkeeper (no File Utilities) gets 403 from the status route, but the backup timer still starts', async () => {
+      as(ownerId, 'POST', '/api/users');
+      const adminCtx = await getServerContext();
+      const bk = await addUser(adminCtx, { name: 'Bo', login: 'bo', password: 'bopass12345', roleKeys: ['bookkeeper'] });
+      stopBackupScheduler();
+      expect(isSchedulerRunning()).toBe(false);
+      as(bk.userId, 'GET', '/api/backups/status');
+      const res = await statusGET();
+      expect(res.status).toBe(403);
+      expect(isSchedulerRunning()).toBe(true);
+      stopBackupScheduler();
+    });
+
+    it('the desktop shell starts the timer at launch with its internal token (?start=1), making no backup', async () => {
+      stopBackupScheduler();
+      const before = history().length;
+      as(null, 'POST', '/api/dashboard/auto-backup');
+      const res = await autoBackupPOST(
+        req('/api/dashboard/auto-backup?start=1', { method: 'POST', headers: { 'x-bka-internal': 'team-backups-internal-token' } }),
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ status: 'started' });
+      expect(isSchedulerRunning()).toBe(true);
+      expect(history().length).toBe(before);
+      stopBackupScheduler();
+      // Without the token (and no session) nothing starts.
+      const denied = await autoBackupPOST(req('/api/dashboard/auto-backup?start=1', { method: 'POST' }));
+      expect(denied.status).toBeGreaterThanOrEqual(400);
+      expect(isSchedulerRunning()).toBe(false);
+    });
+
+    it('GET /api/backups shows absolute paths on this computer only to a file Admin', async () => {
+      as(ownerId, 'GET', '/api/backups');
+      const admin = await (await backupsGET()).json();
+      expect(admin.canManage).toBe(true);
+      expect(admin.folder).toBe(BACKUP_DIR);
+      expect(admin.history.some((r: BackupRecord) => r.path && path.isAbsolute(r.path))).toBe(true);
+
+      as(finId, 'GET', '/api/backups'); // File Utilities access, but not an Admin of the file
+      const res = await backupsGET();
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.canManage).toBe(false);
+      expect(body.folder).toBeNull();
+      expect(body.defaultFolder).toBeNull();
+      expect(body.settings.folder).toBeNull();
+      const withFiles = body.history.filter((r: BackupRecord) => r.path);
+      expect(withFiles.length).toBeGreaterThan(0);
+      for (const r of withFiles) {
+        expect(r.path).toBe(r.filename);
+        expect(r.path).not.toContain(ROOT);
+      }
+      expect(JSON.stringify(body)).not.toContain(JSON.stringify(BACKUP_DIR).slice(1, -1));
+      stopBackupScheduler();
     });
   });
 

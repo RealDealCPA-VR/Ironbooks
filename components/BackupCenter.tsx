@@ -34,10 +34,15 @@ interface BackupSettingsDto {
   folder: string | null;
 }
 
+/** Mirrors MANUAL_VERSIONS_KEEP in lib/services/backupHistory.ts (server-only module). */
+const MANUAL_COPIES_KEPT = 30;
+
 interface BackupsResponse {
   settings: BackupSettingsDto;
-  folder: string;
-  defaultFolder: string;
+  /** Absolute folder paths are only sent to an Admin of every company in the file. */
+  folder: string | null;
+  defaultFolder: string | null;
+  canManage: boolean;
   status: BackupStatusDto;
   history: BackupHistoryRow[];
 }
@@ -163,7 +168,12 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
           </Button>
           {data && (
             <p className="mt-2 text-xs text-navy/50 break-all">
-              Saved to <span className="font-mono">{data.folder}</span>
+              Saved to {data.folder ? <span className="font-mono">{data.folder}</span> : 'the backup folder'}
+            </p>
+          )}
+          {data && !data.canManage && (
+            <p className="mt-1 text-xs text-navy/60">
+              Only an Admin of every company in this file can back up, restore or change these settings.
             </p>
           )}
         </div>
@@ -174,7 +184,8 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
         <p className="text-sm text-navy/60">
           While Ironbooks is open it saves a copy of the whole company file on this schedule, and again when you
           close the app. A copy is skipped when nothing has changed since the last one. Older copies are removed
-          so only the most recent ones are kept.
+          so only the most recent ones are kept. Copies you make with Back up now are kept separately (the newest{' '}
+          {MANUAL_COPIES_KEPT}).
         </p>
         <form onSubmit={saveSettings} className="flex flex-col gap-3">
           <div className="flex flex-wrap gap-3 items-end">

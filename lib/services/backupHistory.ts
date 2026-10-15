@@ -80,6 +80,11 @@ export const DEFAULT_BACKUP_SETTINGS: BackupSettings = {
 
 /** Sources whose files are versions in the backup folder and are rotated (keep last N). */
 export const ROTATED_SOURCES: readonly BackupSource[] = ['scheduled', 'quit'];
+/**
+ * "Back up now" copies saved in the backup folder are rotated separately, under this larger cap,
+ * so they never pile up without limit but a person's own copies outlast the automatic ones.
+ */
+export const MANUAL_VERSIONS_KEEP = 30;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -157,9 +162,29 @@ export function readBackupHistory(dataDir?: string): BackupRecord[] {
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 }
 
+/**
+ * Trim the history to BACKUP_HISTORY_LIMIT records, oldest first — but never drop a record whose
+ * file is still on disk (it could then never be found, previewed or rotated again). Only records
+ * without a file (downloads, pruned or deleted versions) make room.
+ */
+export function trimHistory(
+  records: BackupRecord[],
+  limit: number = BACKUP_HISTORY_LIMIT,
+  fileExists: (p: string) => boolean = fs.existsSync,
+): BackupRecord[] {
+  const sorted = [...records].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  if (sorted.length <= limit) return sorted;
+  const keep = new Set<BackupRecord>();
+  for (const r of sorted) if (r.path && !r.prunedAt && fileExists(r.path)) keep.add(r);
+  for (const r of sorted) {
+    if (keep.size >= limit) break;
+    keep.add(r);
+  }
+  return sorted.filter((r) => keep.has(r));
+}
+
 function writeBackupHistory(records: BackupRecord[], dataDir?: string): void {
-  const sorted = [...records].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, BACKUP_HISTORY_LIMIT);
-  writeJsonAtomic(historyPath(dataDir), { version: 1, records: sorted });
+  writeJsonAtomic(historyPath(dataDir), { version: 1, records: trimHistory(records) });
 }
 
 export type NewBackupRecord = Omit<BackupRecord, 'id' | 'at'> & { at?: string };
@@ -289,6 +314,12 @@ export function saveBackupSettings(
   const dir = resolveDataDir(dataDir);
   const next = normalizeBackupSettings(patch, readBackupSettings(dir));
   if (next.folder) {
+    // Check BEFORE creating anything: a folder made inside the data directory would travel inside
+    // every backup.
+    const inside = path.relative(dir, next.folder);
+    if (!inside.startsWith('..') && !path.isAbsolute(inside)) {
+      throw new ServiceError('VALIDATION', 'The backup folder cannot be inside the company file folder.');
+    }
     const probe = path.join(next.folder, `.ironbooks-write-test-${process.pid}-${Date.now()}`);
     try {
       fs.mkdirSync(next.folder, { recursive: true });
@@ -296,10 +327,6 @@ export function saveBackupSettings(
       fs.rmSync(probe, { force: true });
     } catch {
       throw new ServiceError('VALIDATION', 'Ironbooks cannot save files in that folder. Choose a folder you can write to.');
-    }
-    const inside = path.relative(dir, next.folder);
-    if (!inside.startsWith('..') && !path.isAbsolute(inside)) {
-      throw new ServiceError('VALIDATION', 'The backup folder cannot be inside the company file folder.');
     }
   }
   writeJsonAtomic(settingsPath(dir), next);
@@ -361,14 +388,21 @@ export function shouldSkipUnchanged(currentFingerprint: string | null, records: 
 
 /**
  * Rotation: of the versioned backups (scheduled + quit-time) that still have files, keep the
- * newest `keep`; returns the older ones to delete. Manual and pre-operation backups are never
- * rotated here (pre-op copies rotate on their own in backup.ts).
+ * newest `keep`; of the "Back up now" copies saved in the folder, keep the newest
+ * `manualKeep` (MANUAL_VERSIONS_KEEP). Returns the older ones to delete. Downloads (no path)
+ * and pre-operation backups are never rotated here (pre-op copies rotate on their own in
+ * backup.ts).
  */
-export function planRotation(records: BackupRecord[], keep: number): BackupRecord[] {
-  const versions = records
-    .filter((r) => r.kind === 'full' && ROTATED_SOURCES.includes(r.source) && r.path && !r.prunedAt)
-    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
-  return versions.slice(Math.max(1, keep));
+export function planRotation(
+  records: BackupRecord[],
+  keep: number,
+  manualKeep: number = MANUAL_VERSIONS_KEEP,
+): BackupRecord[] {
+  const saved = (r: BackupRecord) => r.kind === 'full' && Boolean(r.path) && !r.prunedAt;
+  const byNewest = (a: BackupRecord, b: BackupRecord) => Date.parse(b.at) - Date.parse(a.at);
+  const versions = records.filter((r) => saved(r) && ROTATED_SOURCES.includes(r.source)).sort(byNewest);
+  const manual = records.filter((r) => saved(r) && r.source === 'manual').sort(byNewest);
+  return [...versions.slice(Math.max(1, keep)), ...manual.slice(Math.max(1, manualKeep))];
 }
 
 export type BackupHealthState = 'ok' | 'warning' | 'never';

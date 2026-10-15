@@ -52,7 +52,7 @@ export function indicatorDetail(s: BackupStatusDto): string {
     ? `No backup for ${s.daysSince} days and the books have changed since. Click to back up now.`
     : s.upToDate
       ? 'Nothing has changed since then.'
-      : 'Backups are up to date.';
+      : 'Changes made since then will be included in the next backup.';
   return `Last backup ${when}${how}. ${state}`;
 }
 

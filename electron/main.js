@@ -941,8 +941,25 @@ function runDueScheduledReports(url) {
     .catch((err) => console.error('[scheduled-reports] run failed:', err?.message || err));
 }
 
+// Start the server's scheduled-backup timer at launch, whoever signs in (the backup status route
+// also starts it, but only after a page load). Internal token, like the recurring run.
+function startBackupScheduler(url) {
+  fetch(`${url}/api/dashboard/auto-backup?start=1`, {
+    method: 'POST',
+    headers: { 'x-bka-internal': internalToken },
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.error(`[backup] could not start the backup schedule: HTTP ${res.status} ${body.slice(0, 200)}`);
+      }
+    })
+    .catch((err) => console.error('[backup] could not start the backup schedule:', err?.message || err));
+}
+
 function scheduleBackgroundJobs(url) {
   if (scheduledReportsTimer || recurringTimer) return;
+  if (!remoteHostOrigin) startBackupScheduler(url);
   scheduledReportsTimer = setInterval(() => runDueScheduledReports(url), SCHEDULED_REPORTS_EVERY_MS);
   recurringTimer = setInterval(() => runDueRecurring(url), RECURRING_EVERY_MS);
   // First scheduled-reports check shortly after launch (the server is warm by then).

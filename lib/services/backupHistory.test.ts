@@ -9,6 +9,8 @@ import path from 'node:path';
 import {
   BACKUP_WARNING_DAYS,
   DEFAULT_BACKUP_SETTINGS,
+  MANUAL_VERSIONS_KEEP,
+  trimHistory,
   backupHealth,
   isBackupDue,
   nextBackupDueAt,
@@ -22,7 +24,7 @@ import {
   type BackupRecord,
   type BackupSettings,
 } from './backupHistory';
-import { bannerDismissed, formatAge, indicatorText, BANNER_DISMISS_MS } from '@/lib/backupStatusText';
+import { bannerDismissed, formatAge, indicatorDetail, indicatorText, BANNER_DISMISS_MS } from '@/lib/backupStatusText';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -107,10 +109,22 @@ describe('planRotation', () => {
     expect(stale.map((r) => r.id)).toEqual([versions[4].id, versions[5].id]);
   });
 
-  it('never rotates manual copies, safety copies, downloads or already-pruned versions', () => {
+  it('rotates "Back up now" copies under their own cap, separate from the automatic versions', () => {
+    const autos = Array.from({ length: 3 }, (_, i) => rec({ ageMs: (i + 1) * HOUR }));
+    const manuals = Array.from({ length: MANUAL_VERSIONS_KEEP + 2 }, (_, i) => rec({ ageMs: (i + 1) * DAY, source: 'manual' }));
+    const stale = planRotation([...autos, ...manuals], 14);
+    // Automatic versions are within keep; only the two oldest manual copies go.
+    expect(stale.map((r) => r.id)).toEqual([manuals[MANUAL_VERSIONS_KEEP].id, manuals[MANUAL_VERSIONS_KEEP + 1].id]);
+    // Manual copies do not count against the automatic keep.
+    expect(planRotation([...autos, ...manuals.slice(0, 5)], 3)).toEqual([]);
+    // A custom manual cap.
+    expect(planRotation(manuals.slice(0, 5), 14, 2).map((r) => r.id)).toEqual(manuals.slice(2, 5).map((r) => r.id));
+  });
+
+  it('never rotates downloads, safety copies or already-pruned versions', () => {
     const records = [
       rec({ ageMs: 1 * HOUR }),
-      rec({ ageMs: 2 * HOUR, source: 'manual' }),
+      rec({ ageMs: 2 * HOUR, source: 'manual', path: null }),
       rec({ ageMs: 3 * HOUR, source: 'pre-op' }),
       rec({ ageMs: 4 * HOUR, source: 'quit', path: null }),
       rec({ ageMs: 5 * HOUR, prunedAt: NOW.toISOString() }),
@@ -121,6 +135,24 @@ describe('planRotation', () => {
 
   it('always keeps at least one version', () => {
     expect(planRotation([rec({ ageMs: HOUR }), rec({ ageMs: 2 * HOUR })], 0)).toHaveLength(1);
+  });
+});
+
+describe('trimHistory', () => {
+  it('drops the oldest records past the limit, but never a record whose file is still on disk', () => {
+    const onDisk = rec({ ageMs: 100 * DAY, source: 'manual' }); // oldest, file still there
+    const downloads = Array.from({ length: 5 }, (_, i) => rec({ ageMs: (i + 1) * DAY, source: 'manual', path: null }));
+    const pruned = rec({ ageMs: 50 * DAY, prunedAt: NOW.toISOString() });
+    const all = [onDisk, ...downloads, pruned];
+    const exists = (p: string) => p === onDisk.path;
+    const kept = trimHistory(all, 3, exists);
+    expect(kept).toHaveLength(3);
+    expect(kept.map((r) => r.id)).toContain(onDisk.id);
+    expect(kept.map((r) => r.id)).toEqual([downloads[0].id, downloads[1].id, onDisk.id]);
+    // Under the limit nothing is dropped.
+    expect(trimHistory(all, 100, exists)).toHaveLength(all.length);
+    // A record whose file is gone can be dropped like any other.
+    expect(trimHistory(all, 3, () => false).map((r) => r.id)).not.toContain(onDisk.id);
   });
 });
 
@@ -197,6 +229,8 @@ describe('history + settings files', () => {
     expect(readBackupSettings(DATA)).toEqual(saved);
     expect(fs.readdirSync(folder)).toEqual([]); // the write test cleaned up after itself
     expect(() => saveBackupSettings({ folder: path.join(DATA, 'inside') }, DATA)).toThrow(/cannot be inside/);
+    // The refused folder is not created inside the company file (it would travel in every backup).
+    expect(fs.existsSync(path.join(DATA, 'inside'))).toBe(false);
     expect(saveBackupSettings({ folder: null }, DATA).folder).toBeNull();
   });
 });
@@ -210,6 +244,16 @@ describe('indicator text', () => {
     expect(formatAge(new Date(NOW.getTime() - 9 * DAY).toISOString(), NOW)).toBe('9 days ago');
     const status = { ...backupHealth([rec({ ageMs: 2 * HOUR })], NOW, null), schedule: 'daily' as const, nextDueAt: null, running: false };
     expect(indicatorText(status, NOW)).toBe('Last backup: 2 hours ago');
+  });
+
+  it('says honestly whether the books changed since the last backup', () => {
+    const base = { schedule: 'daily' as const, nextDueAt: null, running: false };
+    const same = { ...backupHealth([rec({ ageMs: 2 * HOUR, fingerprint: 'a' })], NOW, 'a'), ...base };
+    expect(indicatorDetail(same)).toMatch(/Nothing has changed since then\.$/);
+    const changed = { ...backupHealth([rec({ ageMs: 2 * HOUR, fingerprint: 'a' })], NOW, 'b'), ...base };
+    expect(changed.upToDate).toBe(false);
+    expect(indicatorDetail(changed)).toMatch(/Changes made since then will be included in the next backup\.$/);
+    expect(indicatorDetail(changed)).not.toMatch(/up to date/i);
   });
 
   it('a dismissed banner stays hidden for a day', () => {

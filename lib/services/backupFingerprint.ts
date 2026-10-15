@@ -8,6 +8,15 @@
  *
  * Returns null when the file has no transaction log yet; callers treat null as "unknown" and
  * never skip a backup because of it.
+ *
+ * Coverage: writes reach the log through writeAudit / logTransaction. Writes that do not call it
+ * themselves are covered when they run inside an audited operation: billable-cost stamps
+ * (billables.addBillablesToInvoice, inside the audited invoice create) and FX relief rows
+ * (fxSubledger.recordPaymentFxRelief, inside the audited payment). Bank-feed downloads
+ * (plaid.syncTransactions) write their own audit record. Remaining gap: a raw write that bypasses
+ * writeAudit entirely (e.g. a future service that forgets to audit) would not count as a change,
+ * so a scheduled or quit-time backup could be skipped until the next audited change.
+ * "Back up now" always backs up.
  */
 import fs from 'node:fs';
 import { resolveDataDir } from '@/lib/db';

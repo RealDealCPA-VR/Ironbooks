@@ -8,8 +8,10 @@
  *    (backupFingerprint.ts).
  *  - `startBackupScheduler()` starts a timer (once per process) that checks every few minutes
  *    whether the schedule (off / daily / every N hours) says a backup is due. It is started by
- *    the backup status route, which the sidebar indicator calls on every page load — so it runs
- *    while the app is open, in the desktop app and in plain web mode alike. The desktop shell's
+ *    the backup status route BEFORE its permission check (the sidebar indicator calls it on every
+ *    page load, whatever the user's role), and by the desktop shell at launch
+ *    (POST /api/dashboard/auto-backup?start=1) — so it runs while the app is open, in the desktop
+ *    app and in plain web mode alike. The desktop shell's
  *    quit-time backup goes through the same function (POST /api/dashboard/auto-backup?save=1).
  *
  * State lives on globalThis so a hot reload in `next dev` cannot start a second timer or lose
@@ -74,7 +76,8 @@ function versionFilename(source: VersionedSource, companyName: string | null, at
 }
 
 /**
- * Delete versioned backups beyond `keep` (oldest first). Only files this company file recorded
+ * Delete versioned backups beyond `keep` (oldest first), and "Back up now" copies beyond
+ * MANUAL_VERSIONS_KEEP. Only files this company file recorded
  * in its own history are ever deleted, so other company files sharing the folder and the
  * person's own files there are never touched.
  */

@@ -17,7 +17,7 @@
 import { and, eq, inArray } from 'drizzle-orm';
 import { bankTransactions, bankAccounts } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
-import { type ServiceContext, ServiceError, validation } from './_base';
+import { type ServiceContext, ServiceError, validation, writeAudit } from './_base';
 import { policyFetch } from '@/lib/net/guard';
 
 // ---------------------------------------------------------------------------
@@ -238,6 +238,14 @@ export async function syncTransactions(
         matched: false,
       })),
     );
+    // Audit + transaction log: downloaded bank lines are a change to the books' data, and the
+    // log head is how scheduled backups know something changed (backupFingerprint.ts).
+    await writeAudit(ctx, {
+      action: 'create',
+      entityType: 'bank_feed_import',
+      entityId: params.bankAccountId,
+      newValues: { imported: toInsert.length, source: 'plaid' },
+    });
   }
 
   return { imported: toInsert.length, total: incoming.length };

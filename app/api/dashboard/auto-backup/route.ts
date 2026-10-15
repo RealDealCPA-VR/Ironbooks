@@ -6,6 +6,10 @@
  * { status: 'unchanged' }) when nothing changed since the newest version. Never overlaps a
  * scheduled backup that is already running.
  *
+ * POST /api/dashboard/auto-backup?start=1 — the Electron shell calls this at launch so the
+ * in-process scheduled-backup timer runs whoever signs in (lib/services/backupSchedule.ts);
+ * returns { status: 'started' } and makes no backup.
+ *
  * POST /api/dashboard/auto-backup (no ?save) — legacy: returns the .bka bytes for the caller to
  * store (older shells); recorded in the history as a quit-time backup with no path.
  *
@@ -31,7 +35,7 @@ import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { requireFileAdmin } from '@/lib/services/access';
 import { recordBackup } from '@/lib/services/backupHistory';
 import { currentFingerprint } from '@/lib/services/backupFingerprint';
-import { runVersionedBackup } from '@/lib/services/backupSchedule';
+import { ensureBackupScheduler, runVersionedBackup } from '@/lib/services/backupSchedule';
 
 /** Constant-time check of the x-bka-internal header against BKA_INTERNAL_TOKEN. */
 async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
@@ -60,6 +64,11 @@ export async function POST(req: NextRequest) {
       // same gate: an active Admin of every company in the file.
       ctx = await getServerContext();
       await requireFileAdmin(ctx);
+    }
+
+    if (req.nextUrl.searchParams.get('start') === '1') {
+      ensureBackupScheduler();
+      return NextResponse.json({ status: 'started' });
     }
 
     // Company name is cosmetic (filename slug only).

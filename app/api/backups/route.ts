@@ -7,12 +7,17 @@
  * Backups cover the whole company file (every company in it), so changing where and how often it
  * is copied needs an Admin of every company in the file (requireFileAdmin), like backup/restore.
  * Both run with damaged-file access so a damaged file's backups can still be managed.
+ *
+ * GET is readable with File Utilities view, but absolute paths on this computer (the backup
+ * folder, where each version is stored) are only returned to a file Admin; other callers get the
+ * file name only and `canManage: false` (on a hosted file they may be remote users).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { invalidJsonBody, readJsonObject, routeError } from '@/lib/routeErrors';
 import { withDamagedFileAccess } from '@/lib/db';
 import { requireFileAdmin } from '@/lib/services/access';
+import { ServiceError } from '@/lib/services/errors';
 import {
   backupFolder,
   defaultBackupFolder,
@@ -23,16 +28,25 @@ import { ensureBackupScheduler, getBackupStatus, listBackupHistory } from '@/lib
 
 export async function GET() {
   return withDamagedFileAccess(async () => {
+    ensureBackupScheduler();
     try {
-      await getServerContext();
-      ensureBackupScheduler();
+      const ctx = await getServerContext();
+      let canManage = true;
+      try {
+        await requireFileAdmin(ctx);
+      } catch (err) {
+        if (!(err instanceof ServiceError) || err.code !== 'FORBIDDEN') throw err;
+        canManage = false;
+      }
       const settings = readBackupSettings();
+      const history = listBackupHistory();
       return NextResponse.json({
-        settings,
-        folder: backupFolder(settings),
-        defaultFolder: defaultBackupFolder(),
+        settings: canManage ? settings : { ...settings, folder: null },
+        folder: canManage ? backupFolder(settings) : null,
+        defaultFolder: canManage ? defaultBackupFolder() : null,
+        canManage,
         status: getBackupStatus(),
-        history: listBackupHistory(),
+        history: canManage ? history : history.map((r) => ({ ...r, path: r.path ? r.filename : null })),
       });
     } catch (err) {
       return routeError(err, 'backups');
