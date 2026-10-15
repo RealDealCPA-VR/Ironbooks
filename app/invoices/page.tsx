@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
 import { FileText, Plus, Trash2, PlusCircle, MinusCircle, Download, Mail, Package, Pencil, Send } from 'lucide-react';
 import {
   AmountInput,
@@ -57,6 +57,8 @@ import { confirmClassAssigned, confirmStockAvailable, confirmTransactionDate } f
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
+import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
+import { type SmartLine, fillRecalledItems, invoiceFieldsFromRecall, lineClassOverride } from '@/lib/smartDefaults';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -137,6 +139,7 @@ interface Invoice {
 interface InvoiceDetail extends Invoice {
   taxRateId: string | null;
   classId: string | null;
+  salesRepId?: string | null;
   discount: string;
   discountType: 'amount' | 'percent' | null;
   /** Retainage held back (contractors): percent of the total and the held amount. */
@@ -154,6 +157,8 @@ interface InvoiceDetail extends Invoice {
     rate: string;
     taxable: boolean;
     jobId: string | null;
+    /** The line's class (stored as its own class, or the invoice's when it had none). */
+    classId?: string | null;
     /** Progress invoicing: the estimate line this invoice line bills. */
     estimateLineId?: string | null;
     itemName: string | null;
@@ -179,6 +184,8 @@ interface LineRow {
   rate: string;
   taxable: boolean;
   jobId: string;
+  /** The line's own class when it differs from the invoice's ('' / absent = the invoice class). */
+  classId?: string;
   /** Discount items only: interpret `rate` as a % of the preceding body lines. */
   discountPercent: boolean;
   /** Advanced Inventory: site / bin / serials / lot the stock is sold from. */
@@ -347,6 +354,15 @@ const EMPTY_LINE: LineRow = {
   discountPercent: false,
 };
 
+/**
+ * A recalled line (smart defaults: the customer's last invoice) as a form row. The item id is
+ * kept even before the item list has loaded (its name is filled in when it arrives), and so is
+ * a line class that differs from the recalled invoice class.
+ */
+function rowFromRecall(l: SmartLine, items: Item[], headerClassId: string | null): LineRow {
+  return { ...EMPTY_LINE, ...invoiceFieldsFromRecall(l, items, headerClassId) };
+}
+
 // ---------------------------------------------------------------------------
 // Invoice Modal (create + edit)
 // ---------------------------------------------------------------------------
@@ -385,6 +401,14 @@ function InvoiceModal({
   const termsChoices = useTermsChoices();
   const [taxRateId, setTaxRateId] = useState('');
   const [classId, setClassId] = useState('');
+  const [salesRepId, setSalesRepId] = useState('');
+  const [salesReps, setSalesReps] = useState<Array<{ id: string; name: string; isActive?: boolean }>>([]);
+  /** Smart defaults: what was recalled from the customer's last invoice (shown under Customer). */
+  const [recallText, setRecallText] = useState('');
+  /** Tax item recalled from the last invoice — wins over the customer's default tax item. */
+  const recalledTaxRef = useRef<string | null>(null);
+  /** Current terms (so a late due-date lookup for replaced terms is ignored). */
+  const termsRef = useRef('');
   const [discount, setDiscount] = useState('');
   const [discountType, setDiscountType] = useState<DiscountType>('amount');
   const [currency, setCurrency] = useState('');
@@ -393,6 +417,11 @@ function InvoiceModal({
   const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const creditLimit = useCreditLimitConfirm();
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
+  // Recalled lines keep their item id even when the item list had not loaded yet: show the
+  // item's name / type / unit once it arrives.
+  useEffect(() => {
+    setLines((prev) => fillRecalledItems(prev, items));
+  }, [items]);
   const [saving, setSaving] = useState(false);
   const [saveAsPending, setSaveAsPending] = useState(false);
   const [customValues, setCustomValues] = useState<Record<string, string>>({});
@@ -413,7 +442,7 @@ function InvoiceModal({
   const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
   useEffect(() => {
     if (!custDefaults || editing) return;
-    setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
+    setTaxRateId(custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? '') : '');
     const st = defaultShipToState(custDefaults);
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -421,6 +450,22 @@ function InvoiceModal({
 
   const itemNameById = new Map(items.map((it) => [it.id, it.name]));
   const prefs = usePreferences();
+  // Smart defaults (lib/useSmartDefaults.ts): default date + recall the customer's last invoice.
+  const smart = useSmartDefaults('invoice');
+  termsRef.current = terms;
+
+  // Sales reps for the Rep field (list permission may be missing: then the field just hides).
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    api
+      .get<Array<{ id: string; name: string; isActive?: boolean }>>('/api/sales-reps')
+      .then((r) => live && setSalesReps(Array.isArray(r) ? r : []))
+      .catch(() => live && setSalesReps([]));
+    return () => {
+      live = false;
+    };
+  }, [open]);
 
   // Reset / prefill form when the modal opens.
   useEffect(() => {
@@ -432,6 +477,7 @@ function InvoiceModal({
       setTerms(editing.terms ?? '');
       setTaxRateId(editing.taxRateId ?? '');
       setClassId(editing.classId ?? '');
+      setSalesRepId(editing.salesRepId ?? '');
       // The stored discount is the resolved dollar amount — prefill as a flat amount.
       setDiscount(Number(editing.discount) > 0 ? editing.discount : '');
       setDiscountType('amount');
@@ -457,6 +503,7 @@ function InvoiceModal({
           rate: String(Number(l.rate)),
           taxable: l.taxable,
           jobId: l.jobId ?? '',
+          classId: lineClassOverride(l.classId, editing.classId),
           discountPercent: false,
           inv: invFromLine(l),
           // Saved invoices keep their stored rates; the badge still flags rule differences.
@@ -466,11 +513,13 @@ function InvoiceModal({
       );
     } else {
       setCustomerId('');
-      setDate(new Date().toISOString().slice(0, 10));
+      // My Preferences > General "Default date": today, or the last invoice date entered this session.
+      setDate(smart.defaultDate());
       setDueDate('');
       setTerms('');
       setTaxRateId('');
       setClassId('');
+      setSalesRepId('');
       setDiscount('');
       setDiscountType('amount');
       setCurrency('');
@@ -483,6 +532,8 @@ function InvoiceModal({
       setCustomValues({});
       setLines([{ ...EMPTY_LINE }]);
     }
+    setRecallText('');
+    recalledTaxRef.current = null;
     setBillables(null);
     setSelectedCostIds(new Set());
     setSelectedTimeIds(new Set());
@@ -500,13 +551,60 @@ function InvoiceModal({
     // Terms list entries (Standard or Date-Driven) via /api/terms/compute.
     let live = true;
     void fetchDueDateForTerms(date, custTerms).then((due) => {
-      if (live && due) setDueDate(due);
+      if (live && due && termsRef.current === (custTerms ?? '')) setDueDate(due);
     });
     return () => {
       live = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing, customerId]);
+
+  // QB "Recall the last transaction for a name" (My Preferences > General): a NEW invoice for
+  // this customer starts from their last one — items, rates, terms, sales rep, class, tax item
+  // and memo. Never replaces lines the user already typed.
+  const { recall } = smart;
+  useEffect(() => {
+    setRecallText('');
+    recalledTaxRef.current = null;
+    if (!open || editing || !customerId) return;
+    let live = true;
+    void recall(customerId).then((d) => {
+      if (!live || !d) return;
+      const h = d.header;
+      if (h.terms) {
+        const t = h.terms;
+        setTerms(t);
+        termsRef.current = t;
+        if (date) {
+          void fetchDueDateForTerms(date, t).then((due) => {
+            if (live && due && termsRef.current === t) setDueDate(due);
+          });
+        }
+      }
+      if (h.salesRepId) setSalesRepId(h.salesRepId);
+      if (h.classId) setClassId(h.classId);
+      if (h.taxRateId) {
+        recalledTaxRef.current = h.taxRateId;
+        setTaxRateId(h.taxRateId);
+      }
+      if (h.memo) {
+        const m = h.memo;
+        setMemo((prev) => (!prev.trim() || prev === (prefs.company.defaultInvoiceMemo ?? '') ? m : prev));
+      }
+      if (d.lines.length > 0) {
+        setLines((prev) =>
+          prev.every((l) => !l.itemId && !l.itemName.trim() && !l.description.trim() && !l.rate)
+            ? d.lines.map((l) => rowFromRecall(l, items, h.classId))
+            : prev,
+        );
+      }
+      setRecallText(recallNote(d));
+    });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editing, customerId, recall]);
 
   /** Terms picked on the form: the due date follows them. */
   function handleTermsChange(value: string) {
@@ -760,6 +858,7 @@ function InvoiceModal({
       terms: terms || undefined,
       taxRateId: taxRateId || undefined,
       classId: classId || undefined,
+      salesRepId: salesRepId || (editing ? null : undefined),
       discount: discount || undefined,
       discountType,
       currency: currency || undefined,
@@ -783,6 +882,7 @@ function InvoiceModal({
             rate: totals.amounts[idx].toFixed(2),
             taxable: l.taxable,
             jobId: l.jobId || null,
+            classId: l.classId || null,
             ...(editing ? { estimateLineId: l.estimateLineId ?? null } : {}),
           };
         }
@@ -793,6 +893,7 @@ function InvoiceModal({
           rate: l.rate,
           taxable: l.taxable,
           jobId: l.jobId || null,
+          classId: l.classId || null,
           ...inventoryLinePayload(l.inv),
           // Edits send each row's estimate link back so progress billing stays on the right line.
           ...(editing ? { estimateLineId: l.estimateLineId ?? null } : {}),
@@ -846,6 +947,7 @@ function InvoiceModal({
           : api.post('/api/invoices', { ...payload, overrideCreditLimit: override, allowOverBilling }),
       );
       if (saved === undefined) return; // user chose not to go over the limit
+      if (!editing) smart.rememberDate(date);
       if (editing) {
         toast(`Invoice #${refNumber.trim() || editing.refNumber || editing.invoiceNumber} updated.`, 'success');
       } else {
@@ -950,6 +1052,7 @@ function InvoiceModal({
               <option key={c.id} value={c.id}>{c.displayName}</option>
             ))}
           </Select>
+          {recallText && <p className="mt-1 text-xs text-electric" role="status">{recallText}</p>}
         </div>
 
         {/* Invoice number (QB "Invoice #"): pre-filled with the next number, letters allowed */}
@@ -997,6 +1100,22 @@ function InvoiceModal({
               ))}
             </Select>
           </div>
+          {/* Sales rep (Lists > Sales Rep): shown once the company has reps; a saved rep still shows. */}
+          {(salesReps.length > 0 || salesRepId) && (
+            <div>
+              <Label htmlFor="inv-rep">Sales rep (optional)</Label>
+              <Select id="inv-rep" value={salesRepId} onChange={(e) => setSalesRepId(e.target.value)}>
+                <option value="">No rep</option>
+                {salesReps
+                  .filter((r) => r.isActive !== false || r.id === salesRepId)
+                  .map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.name}
+                    </option>
+                  ))}
+              </Select>
+            </div>
+          )}
         </div>
 
         {/* Tax rate + class */}

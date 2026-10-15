@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { FileCheck, Plus, ArrowRight, Printer, PackageCheck, Pencil } from 'lucide-react';
 import Link from 'next/link';
 import {
@@ -21,6 +21,8 @@ import {
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
+import { salesRowsFromRecall } from '@/lib/smartDefaults';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import {
@@ -156,9 +158,11 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
   const dupConfirm = useDuplicateNumberConfirm();
   // Customer defaults (new orders): tax item, non-taxable tax code, default ship-to.
   const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
+  /** Tax item recalled from the last order — wins over the customer's default tax item. */
+  const recalledTaxRef = useRef<string | null>(null);
   useEffect(() => {
     if (!custDefaults || editing) return;
-    setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
+    setTaxRateId(custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? '') : '');
     const st = defaultShipToState(custDefaults);
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -168,6 +172,9 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
   const [lines, setLines] = useState<EditableLine[]>([emptyPricedLine()]);
   const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const [saving, setSaving] = useState(false);
+  // Smart defaults (lib/useSmartDefaults.ts): default date + recall the customer's last order.
+  const smart = useSmartDefaults('sales_order');
+  const [recallText, setRecallText] = useState('');
 
   useEffect(() => {
     if (!open) return;
@@ -191,13 +198,45 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
       );
     } else {
       setCustomerId('');
-      setDate(new Date().toISOString().slice(0, 10));
+      // My Preferences > General "Default date": today, or the last order date entered this session.
+      setDate(smart.defaultDate());
       setMemo('');
       setShip(shippingFromDoc(null));
       setTaxRateId('');
       setLines([emptyPricedLine()]);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing]);
+
+  // QB "Recall the last transaction for a name" (My Preferences > General): a NEW order for this
+  // customer starts from their last one — items, rates, tax item and memo. Typed lines are kept.
+  const { recall } = smart;
+  useEffect(() => {
+    setRecallText('');
+    recalledTaxRef.current = null;
+    if (!open || editing || !customerId) return;
+    let live = true;
+    void recall(customerId).then((d) => {
+      if (!live || !d) return;
+      if (d.header.taxRateId) {
+        recalledTaxRef.current = d.header.taxRateId;
+        setTaxRateId(d.header.taxRateId);
+      }
+      const m = d.header.memo;
+      if (m) setMemo((prev) => prev || m);
+      if (d.lines.length > 0) {
+        setLines((prev) =>
+          prev.every((l) => !l.itemId && !l.description && !l.rate)
+            ? salesRowsFromRecall(d.lines)
+            : prev,
+        );
+      }
+      setRecallText(recallNote(d));
+    });
+    return () => {
+      live = false;
+    };
+  }, [open, editing, customerId, recall]);
 
   const selectedRate = taxRates.find((t) => t.id === taxRateId);
   const liveTotal = computeTotal(lines, selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
@@ -242,6 +281,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
           : api.post<SalesOrder>('/api/sales-orders', { ...body, allowDuplicateNumber }),
       );
       if (saved === undefined) return;
+      if (!editing) smart.rememberDate(date);
       if (editing) {
         toast(`Sales Order #${docNo(saved.refNumber, saved.orderNumber)} updated.`, 'success');
       } else {
@@ -287,6 +327,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
               <option key={c.id} value={c.id}>{c.displayName}</option>
             ))}
           </Select>
+          {recallText && <p className="mt-1 text-xs text-electric" role="status">{recallText}</p>}
         </div>
 
         {/* S.O. No. + Date */}

@@ -17,7 +17,7 @@
  */
 
 import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
-import { Suspense, useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { Banknote, Paperclip, Pencil, Plus, Trash2 } from 'lucide-react';
 import {
@@ -56,6 +56,8 @@ import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { visibleOtherNames, type OtherNameEntry } from '@/lib/lists/otherNameOptions';
+import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
+import type { SmartForm, SmartLine } from '@/lib/smartDefaults';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -164,6 +166,38 @@ function emptyLine(mode: LineRow['mode'] = 'expense'): LineRow {
   return { mode, accountId: '', itemId: '', quantity: '', unitCost: '', description: '', amount: '', classId: '', customerId: '' };
 }
 
+/** Entry type → the smart-defaults form whose history is recalled (a card credit recalls charges). */
+const ENTRY_SMART_FORM: Record<EntryType, SmartForm> = {
+  check: 'check',
+  cash: 'expense',
+  cc_charge: 'credit_card',
+  cc_credit: 'credit_card',
+};
+
+/** Entry type → the form key its "last date entered" is remembered under (lib/smartDefaults). */
+const ENTRY_DATE_KEY: Record<EntryType, string> = {
+  check: 'check',
+  cash: 'expense',
+  cc_charge: 'credit_card',
+  cc_credit: 'credit_card_credit',
+};
+
+/** A recalled line (smart defaults) as a form row. */
+function rowFromRecall(l: SmartLine): LineRow {
+  const shared = { description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '' };
+  if (l.kind === 'item' && l.itemId) {
+    return {
+      ...emptyLine('item'),
+      ...shared,
+      itemId: l.itemId,
+      quantity: l.quantity ?? '1',
+      unitCost: l.rate ?? '',
+      amount: l.rate ? '' : l.amount,
+    };
+  }
+  return { ...emptyLine('expense'), ...shared, accountId: l.accountId ?? '', amount: l.amount };
+}
+
 /** Display amount of a line (qty x cost on the Items tab). */
 function lineTotal(l: LineRow): number {
   const dec = (v: string) => {
@@ -218,6 +252,12 @@ function ExpensesPageContent() {
   const [payeeName, setPayeeName] = useState('');
   const [paymentAccountId, setPaymentAccountId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  /** The user typed a date on this new entry (smart default dates leave it alone then). */
+  const dateTouched = useRef(false);
+  /** Bumped after each save so the next check number is looked up again. */
+  const [checkNoTick, setCheckNoTick] = useState(0);
+  /** The payee the form currently shows (guards late recall responses). */
+  const payeeRef = useRef('');
   const [reference, setReference] = useState('');
   const [toPrint, setToPrint] = useState(false);
   const [memo, setMemo] = useState('');
@@ -225,7 +265,17 @@ function ExpensesPageContent() {
   /** Shown under the payee after accounts were pre-filled (QB vendor pre-fill). */
   const [prefillNote, setPrefillNote] = useState('');
   const prefs = usePreferences();
+  // Smart defaults (lib/useSmartDefaults.ts): recall the payee's last check / expense / card
+  // charge, next check number per bank account, default date per form type.
+  const smart = useSmartDefaults(ENTRY_SMART_FORM[entryType], ENTRY_DATE_KEY[entryType]);
   const [attachFor, setAttachFor] = useState<string | null>(null);
+  // My Preferences > General "Default date": today, or the last date entered on this kind of
+  // entry this session — on a new entry whose date the user has not typed.
+  useEffect(() => {
+    if (!prefs.loaded || editingId || dateTouched.current) return;
+    setDate(smart.defaultDate());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefs.loaded, entryType, smart.defaultDate]);
   // My Preferences > Checking: "Start with payee field on check" (else the bank account).
   useEffect(() => {
     if (!prefs.loaded || typeof document === 'undefined') return;
@@ -303,25 +353,19 @@ function ExpensesPageContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCC]);
 
-  // Auto-suggest the next check number for checks not queued for printing.
+  // Auto-suggest the next check number for the bank account (checks not queued for printing):
+  // the highest number used on that account + 1 (lib/smartDefaults nextCheckNumberFrom).
+  const { nextCheckNumber } = smart;
   useEffect(() => {
     let cancelled = false;
-    async function loadNext() {
-      if (entryType !== 'check' || toPrint || !paymentAccountId || editingId) return;
-      try {
-        const data = await api.get<{ next: string }>(
-          `/api/check-numbers/next?paymentAccountId=${paymentAccountId}`,
-        );
-        if (!cancelled) setReference(data.next);
-      } catch {
-        /* non-fatal — the user can type a number */
-      }
-    }
-    loadNext();
+    if (entryType !== 'check' || toPrint || !paymentAccountId || editingId) return;
+    void nextCheckNumber(paymentAccountId).then((next) => {
+      if (!cancelled && next) setReference(next); // null: non-fatal — the user can type a number
+    });
     return () => {
       cancelled = true;
     };
-  }, [entryType, toPrint, paymentAccountId, editingId]);
+  }, [entryType, toPrint, paymentAccountId, editingId, checkNoTick, nextCheckNumber]);
 
   // ── line helpers ──────────────────────────────────────────────────────────
 
@@ -399,7 +443,11 @@ function ExpensesPageContent() {
     setEditingId(null);
     setExchangeRate('');
     setPayeeSel('');
+    payeeRef.current = '';
     setPayeeName('');
+    dateTouched.current = false;
+    setDate(smart.defaultDate());
+    setCheckNoTick((n) => n + 1);
     setReference('');
     setToPrint(false);
     setMemo('');
@@ -413,21 +461,39 @@ function ExpensesPageContent() {
    */
   async function prefillFor(q: { vendorId?: string; payee?: string }) {
     setPrefillNote('');
+    const key = q.vendorId ?? `payee:${q.payee ?? ''}`;
+    payeeRef.current = key;
     const blank = (ls: LineRow[]) => ls.every((l) => !l.accountId && !l.itemId && !l.amount && !l.description);
-    if (!blank(lines) || editingId) return;
-    // The vendor's own pre-fill accounts (up to 3) win over learned suggestions.
+    if (editingId) return;
+    // Preferences > Checking: "Autofill payee account number / last account used" gates the
+    // last-transaction / learned suggestions (the vendor's own pre-fill accounts always apply).
+    // My Preferences > General 'Recall the last transaction for a name' must be on too.
+    const recallOn = prefs.company.autofillPayeeAccount && prefs.my.autoRecallLastTransaction;
+    // QB auto-fill: the vendor's last check / expense / card charge (lines, class, memo).
+    const recalled = recallOn && q.vendorId ? await smart.recall(q.vendorId) : null;
+    if (payeeRef.current !== key) return; // another payee was picked meanwhile
+    if (recalled?.header.memo) {
+      const m = recalled.header.memo;
+      setMemo((prev) => prev || m);
+    }
+    if (!blank(lines)) return;
+    // The vendor's own pre-fill accounts (up to 3) win over recalled / learned suggestions.
     const own = vendorPrefillAccountIds(vendors.find((v) => v.id === q.vendorId));
     if (own.length > 0) {
       setLines(own.map((accountId) => ({ ...emptyLine(), accountId })));
       setPrefillNote("Accounts pre-filled from the vendor's pre-fill accounts.");
       return;
     }
-    // Preferences > Checking: "Autofill payee account number / last account used" gates the
-    // last-transaction / learned suggestions (the vendor's own pre-fill accounts always apply).
-    // My Preferences > General 'Recall the last transaction for a name' must be on too.
-    if (!prefs.company.autofillPayeeAccount || !prefs.my.autoRecallLastTransaction) return;
+    if (recalled && recalled.lines.length > 0) {
+      setLines((prev) => (blank(prev) ? recalled.lines.map(rowFromRecall) : prev));
+      setPrefillNote(recallNote(recalled));
+      return;
+    }
+    if (recalled) setPrefillNote(recallNote(recalled));
+    if (!recallOn) return;
+    // Nothing usable on file (or a typed payee): the learned categorizer's suggestion.
     const pf = await fetchVendorPrefill(q);
-    if (!pf) return;
+    if (!pf || payeeRef.current !== key) return;
     setLines((prev) => {
       if (!blank(prev)) return prev; // user started typing while we fetched
       return pf.lines.map((l) => ({
@@ -535,6 +601,7 @@ function ExpensesPageContent() {
           : api.post('/api/expenses', { ...body, allowDuplicateNumber }),
       );
       if (saved === null) return;
+      if (!editingId) smart.rememberDate(date);
       toast(
         editingId
           ? 'Changes saved.'
@@ -698,7 +765,14 @@ function ExpensesPageContent() {
 
           <div>
             <Label htmlFor="exp-date" required>Date</Label>
-            <DateInput id="exp-date" value={date} onChange={(e) => setDate(e.target.value)} />
+            <DateInput
+              id="exp-date"
+              value={date}
+              onChange={(e) => {
+                dateTouched.current = true;
+                setDate(e.target.value);
+              }}
+            />
           </div>
         </div>
 

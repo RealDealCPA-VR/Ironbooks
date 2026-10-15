@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { ClipboardList, Plus, ArrowRight, Percent, Pencil } from 'lucide-react';
 import {
   Button,
@@ -23,6 +23,8 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { usePreferences } from '@/lib/usePreferences';
+import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
+import { salesRowsFromRecall } from '@/lib/smartDefaults';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { PricedLinesEditor, type PricedLineItem } from '@/components/PricedLinesEditor';
@@ -170,6 +172,7 @@ function EstimateFormBody({
   classes,
   onChange,
   onLinesChange,
+  recallText,
 }: {
   form: EstimateForm;
   customers: Customer[];
@@ -178,6 +181,8 @@ function EstimateFormBody({
   classes: Array<{ id: string; name: string }>;
   onChange: (field: keyof EstimateForm, value: string) => void;
   onLinesChange: (lines: EstimateLineForm[]) => void;
+  /** Smart defaults: what was filled in from the customer's last estimate. */
+  recallText?: string;
 }) {
   const subtotal = form.lines.reduce(
     (sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0),
@@ -212,6 +217,7 @@ function EstimateFormBody({
               </option>
             ))}
           </Select>
+          {recallText && <p className="mt-1 text-xs text-electric" role="status">{recallText}</p>}
         </div>
         <div>
           <Label htmlFor="date">Date *</Label>
@@ -317,16 +323,51 @@ export default function EstimatesPage() {
   const dupConfirm = useDuplicateNumberConfirm();
   // Customer defaults: tax item and ship-to address (new estimates).
   const custDefaults = useCustomerSalesDefaults(addOpen ? addForm.customerId : null);
+  /** Tax item recalled from the last estimate — wins over the customer's default tax item. */
+  const recalledTaxRef = useRef<string | null>(null);
   useEffect(() => {
     if (!custDefaults || editingId) return;
     setAddForm((prev) => ({
       ...prev,
-      taxRateId: custDefaults.taxable ? (custDefaults.taxRateId ?? prev.taxRateId) : '',
+      taxRateId: custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? prev.taxRateId) : '',
     }));
     const st = defaultShipToState(custDefaults);
     if (st) setSendFlags((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [custDefaults]);
+
+  // Smart defaults (lib/useSmartDefaults.ts): default date + QB "Recall the last transaction for
+  // a name" — a NEW estimate for this customer starts from their last one (items, rates, class,
+  // tax item, memo). Typed lines are kept.
+  const smart = useSmartDefaults('estimate');
+  const [recallText, setRecallText] = useState('');
+  const { recall } = smart;
+  useEffect(() => {
+    setRecallText('');
+    recalledTaxRef.current = null;
+    const customerId = addForm.customerId;
+    if (!addOpen || editingId || !customerId) return;
+    let live = true;
+    void recall(customerId).then((d) => {
+      if (!live || !d) return;
+      const tax = d.header.taxRateId;
+      if (tax) recalledTaxRef.current = tax;
+      const m = d.header.memo;
+      setAddForm((prev) => ({
+        ...prev,
+        taxRateId: tax ?? prev.taxRateId,
+        memo: prev.memo || m || '',
+        lines:
+          d.lines.length > 0 && prev.lines.every((l) => !l.itemId && !l.description.trim() && !l.rate)
+            ? salesRowsFromRecall(d.lines)
+            : prev.lines,
+      }));
+      setRecallText(recallNote(d));
+    });
+    return () => {
+      live = false;
+    };
+  }, [addOpen, editingId, addForm.customerId, recall]);
 
   // Convert confirm modal.
   const [convertTarget, setConvertTarget] = useState<Estimate | null>(null);
@@ -408,7 +449,8 @@ export default function EstimatesPage() {
   // ---------------------------------------------------------------------------
 
   function openAddModal() {
-    setAddForm({ ...EMPTY_FORM, date: today(), lines: [{ ...EMPTY_LINE }] });
+    // My Preferences > General "Default date": today, or the last estimate date entered this session.
+    setAddForm({ ...EMPTY_FORM, date: smart.defaultDate(), lines: [{ ...EMPTY_LINE }] });
     setEditingId(null);
     setEditingNumber(null);
     setSendFlags(shippingFromDoc(null));
@@ -488,6 +530,7 @@ export default function EstimatesPage() {
           : api.post('/api/estimates', { ...body, allowDuplicateNumber }),
       );
       if (saved === undefined) return; // kept the form open to change the number
+      if (!editingId) smart.rememberDate(addForm.date);
       if (editingId) {
         toast(`Estimate #${docNumber.payload ?? editingNumber} updated`, 'success');
       } else {
@@ -802,6 +845,7 @@ export default function EstimatesPage() {
           classes={classList}
           onChange={handleFormChange}
           onLinesChange={(lines) => setAddForm((prev) => ({ ...prev, lines }))}
+          recallText={editingId ? '' : recallText}
         />
         <div className="mt-4">
           <ShippingSection

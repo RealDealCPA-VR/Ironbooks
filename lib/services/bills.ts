@@ -29,7 +29,7 @@
  */
 import { and, asc, desc, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
-import { accounts, bills, billLines, inventoryLayers, items, loanPayments, vendors } from '@/lib/db/schema';
+import { accounts, bills, billLines, classes, customers, inventoryLayers, items, jobs, loanPayments, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type DiscountInfo, discountFor, dueDateFromTerms } from './billTerms';
 import { computeDiscount, computeDueDate, dueDateFromTermsList, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
@@ -47,6 +47,7 @@ import { assertNoActiveLandedCost } from './landedCost';
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
@@ -250,6 +251,16 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
   // --- Validate lines ---
   if (!input.lines || input.lines.length === 0) {
     throw validation('A bill must have at least one line.');
+  }
+
+  // Class (bill and line) and billable customer:job must belong to this company.
+  const refs: Array<[typeof classes | typeof customers | typeof jobs, Array<string | null | undefined>, string]> = [
+    [classes, [input.classId, ...input.lines.map((l) => l.classId)], 'Class'],
+    [customers, input.lines.map((l) => l.customerId), 'Customer'],
+    [jobs, input.lines.map((l) => l.jobId), 'Job'],
+  ];
+  for (const [table, ids, label] of refs) {
+    for (const id of new Set(ids.filter((v): v is string => !!v))) await assertRefInCompany(ctx, table, id, label);
   }
 
   // Pre-load referenced items (debit routing + inventory typing).

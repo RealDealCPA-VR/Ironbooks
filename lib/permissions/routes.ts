@@ -414,6 +414,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/expenses/[id]/print': r('banking', 'POST:print'),
   '/api/checks/pdf': r('banking', 'POST:print'),
   '/api/check-numbers/next': r('banking', 'GET'),
+  // ux smartdefaults: recall a name's last transaction (+ next check number) for new forms.
+  '/api/smart-defaults/bills': r('vendors', 'GET'),
+  '/api/smart-defaults/expenses': r('banking', 'GET'),
+  '/api/smart-defaults/sales': r('customers', 'GET'),
   // wave2 purchases: duplicate check numbers, unified print queue, printer setup, Loan Manager,
   // bank / card account currency.
   '/api/check-numbers/duplicate': r('banking', 'GET'),

@@ -1,8 +1,10 @@
 /**
  * Check-number sequencing + duplicate detection.
  *
- * nextCheckNumber — scans billPayments.reference, expenses.reference (checks) and
- *   paychecks.checkNumber for the highest numeric value and returns max+1 as a string.
+ * nextCheckNumber — scans billPayments.reference, expenses.reference (checks only — card,
+ *   cash and EFT references are not check numbers) and paychecks.checkNumber for the highest
+ *   check number and returns the next one (lib/smartDefaults nextCheckNumberFrom: "1001A"
+ *   counts as 1001, leading zeros are kept, gaps are not back-filled).
  *   Optionally filtered to a specific paymentAccountId so you get the next check number per
  *   bank account (paychecks are drawn on 1000 Checking, so they count for that account).
  *
@@ -20,15 +22,8 @@ import { and, eq, isNull, ne, sql } from 'drizzle-orm';
 import { accounts, billPayments, expenses, journalEntries, paychecks, paymentChecks } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError } from './_base';
 import { getPreferences } from './company';
+import { nextCheckNumberFrom } from '@/lib/smartDefaults';
 
-/** Parse a string reference as a non-negative integer. Returns null if non-numeric. */
-function parseRef(ref: string | null | undefined): number | null {
-  if (!ref) return null;
-  const trimmed = ref.trim();
-  if (!/^\d+$/.test(trimmed)) return null;
-  const n = parseInt(trimmed, 10);
-  return isNaN(n) ? null : n;
-}
 
 /** Paychecks are paid from 1000 Checking: they share that account's check sequence. */
 async function paychecksDrawOn(ctx: ServiceContext, paymentAccountId?: string): Promise<boolean> {
@@ -59,6 +54,7 @@ export async function nextCheckNumber(
     .where(
       and(
         eq(billPayments.companyId, ctx.companyId),
+        eq(billPayments.method, 'check'),
         ...(paymentAccountId ? [eq(billPayments.paymentAccountId, paymentAccountId)] : []),
       ),
     );
@@ -69,6 +65,7 @@ export async function nextCheckNumber(
     .where(
       and(
         eq(expenses.companyId, ctx.companyId),
+        eq(expenses.method, 'check'),
         ...(paymentAccountId ? [eq(expenses.paymentAccountId, paymentAccountId)] : []),
       ),
     );
@@ -99,13 +96,7 @@ export async function nextCheckNumber(
     allRefs.push(...pcRefs.map((r) => r.reference));
   }
 
-  let max = 0;
-  for (const ref of allRefs) {
-    const n = parseRef(ref);
-    if (n !== null && n > max) max = n;
-  }
-
-  return String(max > 0 ? max + 1 : 1001);
+  return nextCheckNumberFrom(allRefs);
 }
 
 /**

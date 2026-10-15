@@ -8,8 +8,9 @@
  *    lib/formPrefs.confirmTransactionDate themselves are covered here, at save time.
  *  - "Warn when editing a transaction": asks before saving changes to a recorded transaction.
  *  - "Beep when recording a transaction": a short local tone after a transaction saves.
- *  - "Default date for new transactions = the last date I entered": remembers the date of the
- *    last transaction saved and fills it into the date of the next new transaction form.
+ *  - "Default date for new transactions = the last date I entered": the date of the last
+ *    transaction saved on each form type this session (lib/smartDefaults.ts) fills the date of
+ *    the next new form of that type.
  *  - "Pressing Enter moves between fields" and "Automatically place the decimal point".
  *  - Reports "When report data changes": refresh automatically, ask, or don't.
  */
@@ -143,27 +144,6 @@ export function isNewTransactionDateField(
   const text = [el.name, el.id, el.ariaLabel, el.labelText].filter(Boolean).join(' ');
   return !/due|ship|expir|from|\bto\b|start|end|through|as of|period|filter|birth|hire/i.test(text);
 }
-
-/** Pages whose "new" forms take the remembered date. */
-export const TRANSACTION_PAGES = [
-  '/invoices',
-  '/bills',
-  '/expenses',
-  '/journal',
-  '/payments',
-  '/sales-receipts',
-  '/credit-memos',
-  '/estimates',
-  '/sales-orders',
-  '/purchase-orders',
-  '/deposits',
-  '/transfers',
-  '/item-receipts',
-  '/vendor-credits',
-  '/pay-bills',
-];
-
-export const LAST_DATE_STORAGE_KEY = 'bka:lastTransactionDate';
 
 /**
  * Accounting > 'Automatically number journal entries': the next Entry No. after the highest
