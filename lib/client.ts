@@ -56,6 +56,8 @@ export interface MutateOpts {
   closingPassword?: string;
   /** Extra headers to merge into the request. */
   headers?: Record<string, string>;
+  /** Don't offer an Undo toast for this write (the Undo button's own request, scripts). */
+  noUndo?: boolean;
 }
 
 /** What the closing-date password prompt is told about why it is being shown. */
@@ -352,6 +354,25 @@ export function setWriteHooks(hooks: WriteHooks | null): void {
 /** Code of the error thrown when a write hook cancels a save. */
 export const CANCELLED_CODE = 'CANCELLED';
 
+// ---- Undo for everything (ux/undo, lib/undoClient.ts) ----
+
+/**
+ * Registered once by components/UndoToast.tsx. `before` runs ahead of every write (it snapshots
+ * the record server-side for updates / voids / deletes) and `after` runs once the write succeeded
+ * (it arms the undo and shows the 30-second Undo toast). Neither can fail or slow down a save
+ * beyond the snapshot request: errors are swallowed.
+ */
+export interface UndoTracker {
+  before(info: WriteInfo): Promise<unknown>;
+  after(info: WriteInfo, data: unknown, prepared: unknown): void;
+}
+let undoTracker: UndoTracker | null = null;
+
+/** Register (or clear) the app-wide undo tracker. */
+export function setUndoTracker(tracker: UndoTracker | null): void {
+  undoTracker = tracker;
+}
+
 /**
  * Run a mutating request; on PERIOD_CLOSED, ask the registered prompt for the closing-date
  * password and retry exactly once. Explicitly supplied passwords are never re-prompted.
@@ -368,6 +389,8 @@ async function mutate<T>(
   }
   const hasBody = body !== undefined;
   const version = versionFor(method, url, body);
+  const tracker = opts?.noUndo ? null : undoTracker;
+  const undoPrep = tracker ? await tracker.before(info).catch(() => null) : null;
   const run = (o?: MutateOpts) => {
     const headers = mutateHeaders(o, hasBody);
     if (version && !headers[EXPECTED_VERSION_HEADER]) headers[EXPECTED_VERSION_HEADER] = version;
@@ -384,6 +407,11 @@ async function mutate<T>(
           writeHooks?.after?.(info, data);
         } catch {
           /* a preference side effect (beep, remembered date) must never fail a save */
+        }
+        try {
+          tracker?.after(info, data, undoPrep);
+        } catch {
+          /* an Undo toast must never fail a save */
         }
         return data;
       });

@@ -21,6 +21,7 @@ import ReportToolbar, { type ExportTable } from './ReportToolbar';
 import StdReportTable, { useCollapse } from './StdReportTable';
 import ReportFilters, { hasAdvancedFilters, type Params } from './ReportFilters';
 import NumberFormatPanel, { useNumberFormat } from './NumberFormatPanel';
+import { ReportWhyChanged } from '@/components/WhyChanged';
 
 interface MemorizedRow {
   id: string;
@@ -230,6 +231,8 @@ export default function StdReportView({
           </div>
         )}
       </Card>
+
+      {report && <ReportWhyChanged reportKey={reportKey} params={params} basis={report.basis} />}
 
       {report?.balanced === false && (
         <div role="alert" className="mb-4 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">

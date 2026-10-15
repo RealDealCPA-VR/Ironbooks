@@ -31,6 +31,7 @@ import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
+import WhyChanged from '@/components/WhyChanged';
 
 // ---------------------------------------------------------------------------
 // Types (mirror GET /api/registers/[accountId])
@@ -311,7 +312,13 @@ function RegisterPageInner() {
                 }`}
               >
                 {formatCurrency(account.balance)}
-              </span>
+              </span>{' '}
+              <WhyChanged
+                title={`the ${account.name} balance`}
+                label="Why did it change?"
+                query={{ accounts: [account.id] }}
+                storageKey={`account:${account.id}`}
+              />
             </span>
           </>
         )}
