@@ -75,7 +75,9 @@ import {
 } from './_base';
 import { allowLedgerRewrite } from './posting';
 import { assertWrite } from './rbac';
-import { BACKUP_MANIFEST_ENTRY, createBackup, ensurePreOpBackup, restoreBackup } from './backup';
+import { BACKUP_MANIFEST_ENTRY, FILE_LOCAL_FILES, createBackup, ensurePreOpBackup, restoreBackup } from './backup';
+import { recordBackup } from './backupHistory';
+import { currentFingerprint } from './backupFingerprint';
 import { logTransaction } from './transactionLog';
 import { journalOpenItems } from './journal';
 
@@ -659,6 +661,7 @@ async function runCondense(
  */
 function writeCondenseArchive(companyName: string | undefined, dataDir?: string): string {
   const dir = resolveDataDir(dataDir);
+  const fingerprint = currentFingerprint(dir);
   const { buffer, filename } = createBackup(companyName, dir);
   const outDir = condenseArchiveDir(dir);
   fs.mkdirSync(outDir, { recursive: true });
@@ -671,7 +674,7 @@ function writeCondenseArchive(companyName: string | undefined, dataDir?: string)
     const entries = zip.getEntries();
     const names = new Set(entries.map((e) => e.entryName.replace(/\\/g, '/')));
     const fileEntries = entries.filter((e) => !e.isDirectory).length - 1; // minus the manifest
-    if (!names.has('PG_VERSION') || !names.has(BACKUP_MANIFEST_ENTRY) || fileEntries < countFiles(dir)) {
+    if (!names.has('PG_VERSION') || !names.has(BACKUP_MANIFEST_ENTRY) || fileEntries < countFiles(dir, true)) {
       throw new Error('archive is incomplete');
     }
     // Force a full read of every entry (CRC-checked by adm-zip) so a truncated write fails here.
@@ -683,12 +686,26 @@ function writeCondenseArchive(companyName: string | undefined, dataDir?: string)
       `Condense stopped: the archive copy could not be verified (${(err as Error).message}). Nothing was changed.`,
     );
   }
+  recordBackup(
+    {
+      source: 'pre-op',
+      kind: 'full',
+      filename: path.basename(outPath),
+      path: outPath,
+      sizeBytes: buffer.byteLength,
+      fingerprint,
+      note: 'Archive copy made before condensing',
+    },
+    dir,
+  );
   return outPath;
 }
 
-function countFiles(dir: string): number {
+/** Files a backup of `dir` must contain (root-level FILE_LOCAL_FILES never go into a backup). */
+function countFiles(dir: string, root = false): number {
   let n = 0;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (root && !entry.isDirectory() && FILE_LOCAL_FILES.includes(entry.name)) continue;
     n += entry.isDirectory() ? countFiles(path.join(dir, entry.name)) : 1;
   }
   return n;

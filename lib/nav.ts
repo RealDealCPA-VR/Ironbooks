@@ -37,6 +37,7 @@ import { Bell, CalendarDays, Contact, Mail, LayoutTemplate } from 'lucide-react'
 import { Home, PenLine, FilePlus2 } from 'lucide-react';
 import { Inbox } from 'lucide-react'; // team home: Needs attention inbox
 import { ScanLine } from 'lucide-react'; // receipt capture
+import { ArchiveRestore } from 'lucide-react'; // team backups
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -204,6 +205,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: Building2, label: 'Companies', path: '/companies', qb: 'Open or Restore Company', keywords: 'company file switch' },
       { icon: HardDrive, label: 'Company File', path: '/company-file', qb: 'Back Up Company', keywords: 'backup restore' },
+      { icon: ArchiveRestore, label: 'Back Up & Restore', path: '/backup', qb: 'Back Up Company / Restore Previous Local Backup', keywords: 'backup restore automatic schedule versions' }, // team backups
       { icon: Users, label: 'Users & Roles', path: '/users', qb: 'Set Up Users and Roles', keywords: 'permissions access' },
       { icon: FileSpreadsheet, label: 'Migrate from QuickBooks', path: '/qb-import', qb: 'Import IIF / Convert', keywords: 'import iif convert' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security', qb: 'Security', keywords: 'two factor password' },

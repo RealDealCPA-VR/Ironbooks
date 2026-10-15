@@ -1,6 +1,17 @@
 /**
- * POST /api/dashboard/auto-backup — produce a .bka backup for the Electron shell's
- * quit-time auto-backup (electron/main.js writes it to userData/backups with rotation).
+ * POST /api/dashboard/auto-backup?save=1 — the Electron shell's quit-time auto-backup: the
+ * server writes a versioned .bka into the configured backup folder (default userData/backups,
+ * passed as BKA_BACKUP_DIR), records it in the backup history as a quit-time backup and rotates
+ * the folder to the last N versions (lib/services/backupSchedule.ts). Skipped (200,
+ * { status: 'unchanged' }) when nothing changed since the newest version. Never overlaps a
+ * scheduled backup that is already running.
+ *
+ * POST /api/dashboard/auto-backup?start=1 — the Electron shell calls this at launch so the
+ * in-process scheduled-backup timer runs whoever signs in (lib/services/backupSchedule.ts);
+ * returns { status: 'started' } and makes no backup.
+ *
+ * POST /api/dashboard/auto-backup (no ?save) — legacy: returns the .bka bytes for the caller to
+ * store (older shells); recorded in the history as a quit-time backup with no path.
  *
  * Auth: the Electron main process has no session cookie, so it authenticates with the
  * per-launch random internal token it generated itself and passed to this server as
@@ -23,6 +34,9 @@ import { createBackup } from '@/lib/services/backup';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { requireFileAdmin } from '@/lib/services/access';
 import { recordBackup } from '@/lib/services/attention';
+import { recordBackup } from '@/lib/services/backupHistory';
+import { currentFingerprint } from '@/lib/services/backupFingerprint';
+import { ensureBackupScheduler, runVersionedBackup } from '@/lib/services/backupSchedule';
 
 /** Constant-time check of the x-bka-internal header against BKA_INTERNAL_TOKEN. */
 async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
@@ -53,6 +67,11 @@ export async function POST(req: NextRequest) {
       await requireFileAdmin(ctx);
     }
 
+    if (req.nextUrl.searchParams.get('start') === '1') {
+      ensureBackupScheduler();
+      return NextResponse.json({ status: 'started' });
+    }
+
     // Company name is cosmetic (filename slug only).
     let companyName: string | undefined;
     try {
@@ -61,8 +80,19 @@ export async function POST(req: NextRequest) {
       /* proceed without it */
     }
 
+    if (req.nextUrl.searchParams.get('save') === '1') {
+      const result = await runVersionedBackup('quit', { companyName: companyName ?? null });
+      return NextResponse.json(
+        result.status === 'created'
+          ? { status: 'created', filename: result.record.filename, path: result.record.path, sizeBytes: result.record.sizeBytes, pruned: result.pruned }
+          : result,
+      );
+    }
+
+    const fingerprint = currentFingerprint();
     const { buffer, filename } = createBackup(companyName);
     await recordBackup(ctx.db, { kind: 'auto', userId: ctx.userId, filename }); // inbox: last backup
+    recordBackup({ source: 'quit', kind: 'full', filename, path: null, sizeBytes: buffer.byteLength, fingerprint, note: 'Automatic backup when the app closed' });
     const arrayBuf: ArrayBuffer = buffer.buffer.slice(
       buffer.byteOffset,
       buffer.byteOffset + buffer.byteLength,

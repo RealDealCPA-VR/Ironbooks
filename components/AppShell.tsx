@@ -25,6 +25,7 @@ import PreferenceBehaviors from './PreferenceBehaviors';
 import AttentionBadge from './AttentionBadge'; // team home: count on the "Needs attention" link
 import UndoToast from './UndoToast';
 import ReceiptDropZone from './ReceiptDropZone'; // receipt capture: drop a receipt anywhere
+import { BackupIndicator, BackupWarningBanner } from './BackupStatus'; // team backups
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
@@ -647,6 +648,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           )}
         </nav>
         <div className="shrink-0 pt-3 mt-1 border-t border-slate-100">
+          <BackupIndicator />
           <button
             onClick={logout}
             className="flex items-center justify-center lg:justify-start gap-3 text-navy/60 hover:text-red-500 hover:bg-red-50 font-medium px-2 lg:px-3 py-2 rounded-lg w-full transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
@@ -690,6 +692,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </button>
           <CompanyChip company={company} onCompany={setCompany} />
         </header>
+        <BackupWarningBanner />
         {blockedGate ? <FeatureOff gate={blockedGate} /> : children}
       </main>
       <CommandPalette />

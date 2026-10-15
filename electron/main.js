@@ -47,6 +47,7 @@ const hostingCore = require('./hostingCore');
 const hosting = require('./hosting');
 const security = require('./security');
 const { promptForHost } = require('./connectPrompt');
+const { pruneLegacyAutoBackups } = require('./legacyBackups');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
@@ -147,9 +148,11 @@ app.on('open-file', (event, filePath) => {
 // ---------------------------------------------------------------------------
 // App config (JSON in userData/config.json)
 //
-//   backupIntervalHours  scheduled auto-backup cadence while the app runs
-//                        (default 24; 0/negative disables the timer — the
-//                        on-quit backup still runs)
+//   backupIntervalHours  initial scheduled auto-backup cadence for a company file that has no
+//                        backup settings yet (passed to the server as BKA_BACKUP_INTERVAL_HOURS;
+//                        0/negative = off). The schedule itself now lives with each company
+//                        file and is changed on the Back Up & Restore page; the server process
+//                        runs it (lib/services/backupSchedule.ts).
 //   dataDir              active company data directory (multi-company support);
 //                        the BKA_DATA_DIR env var overrides it for one launch
 //   recentCompanies      most-recently-opened company directories (File menu)
@@ -276,16 +279,18 @@ function trackWindowState(win) {
 }
 
 // ---------------------------------------------------------------------------
-// Quit-time auto-backup (rotating, keep last N in userData/backups)
+// Quit-time auto-backup (versioned, keep last N in the company file's backup folder)
 //
 // The main process has no session cookie, so it authenticates with the per-launch
-// internal token against POST /api/dashboard/auto-backup (same trusted-local pattern
-// as the launch-time recurring run). In dev the server was not spawned by us, the
-// token will not match, and the backup is skipped with a log line.
+// internal token against POST /api/dashboard/auto-backup?save=1 (same trusted-local pattern
+// as the launch-time recurring run). The SERVER writes the .bka into the backup folder
+// (default userData/backups, passed as BKA_BACKUP_DIR), records it in the backup history,
+// rotates to the configured number of versions and skips when nothing changed since the
+// last backup. In dev the server was not spawned by us, the token will not match, and the
+// backup is skipped with a log line.
 // ---------------------------------------------------------------------------
 
-const AUTO_BACKUP_KEEP = 10;
-
+/** The existing backups folder: default destination for versioned backups. */
 function backupsDir() {
   const dir = path.join(app.getPath('userData'), 'backups');
   fs.mkdirSync(dir, { recursive: true });
@@ -293,37 +298,24 @@ function backupsDir() {
 }
 
 async function runAutoBackup() {
+  // Pre-history versions wrote `auto-backup-<ts>.bka` here and rotated them in this process;
+  // the server's rotation only touches files in a company file's history, so keep pruning
+  // those legacy files to the newest 10 (as the old AUTO_BACKUP_KEEP did).
+  const legacyRemoved = pruneLegacyAutoBackups(backupsDir());
+  if (legacyRemoved.length) console.log(`[auto-backup] removed ${legacyRemoved.length} old-style backup(s)`);
   if (!serverUrl || remoteHostOrigin) return; // a client never backs up the host's file
-  const res = await fetch(`${serverUrl}/api/dashboard/auto-backup`, {
+  const res = await fetch(`${serverUrl}/api/dashboard/auto-backup?save=1`, {
     method: 'POST',
     headers: { 'x-bka-internal': internalToken },
-    signal: AbortSignal.timeout(20000),
+    signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`HTTP ${res.status} ${body}`.trim());
   }
-  const bytes = Buffer.from(await res.arrayBuffer());
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const dir = backupsDir();
-  const file = path.join(dir, `auto-backup-${ts}.bka`);
-  fs.writeFileSync(file, bytes);
-  rotateAutoBackups(dir);
-  console.log(`[auto-backup] wrote ${file} (${bytes.length} bytes)`);
-}
-
-function rotateAutoBackups(dir) {
-  try {
-    const files = fs
-      .readdirSync(dir)
-      .filter((f) => /^auto-backup-.*\.bka$/.test(f))
-      .sort(); // timestamped names sort chronologically
-    for (const f of files.slice(0, Math.max(files.length - AUTO_BACKUP_KEEP, 0))) {
-      fs.rmSync(path.join(dir, f), { force: true });
-    }
-  } catch (err) {
-    console.error('[auto-backup] rotation failed:', err);
-  }
+  const result = await res.json().catch(() => ({}));
+  if (result.status === 'created') console.log(`[auto-backup] wrote ${result.path} (${result.sizeBytes} bytes)`);
+  else console.log('[auto-backup] skipped: nothing changed since the last backup');
 }
 
 function companiesRoot() {
@@ -347,27 +339,15 @@ function activeCompanyDir() {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduled auto-backups (same endpoint/rotation as the on-quit backup)
+// Scheduled auto-backups run inside the server process (lib/services/backupSchedule.ts) on the
+// company file's own schedule (Back Up & Restore page). The legacy config.json
+// backupIntervalHours only seeds that schedule for files that have none yet.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_BACKUP_INTERVAL_HOURS = 24;
-let backupTimer = null;
-
-function scheduleAutoBackups() {
-  const cfg = loadConfig();
-  const hours = Number.isFinite(cfg.backupIntervalHours)
-    ? cfg.backupIntervalHours
-    : DEFAULT_BACKUP_INTERVAL_HOURS;
-  if (!(hours > 0)) {
-    console.log('[auto-backup] scheduled backups disabled (backupIntervalHours <= 0)');
-    return;
-  }
-  backupTimer = setInterval(() => {
-    runAutoBackup().catch((err) =>
-      console.error('[auto-backup] scheduled run failed:', err?.message || err),
-    );
-  }, hours * 60 * 60 * 1000);
-  console.log(`[auto-backup] scheduled every ${hours}h of uptime`);
+/** BKA_BACKUP_INTERVAL_HOURS for the server ('' when config.json does not set one). */
+function legacyBackupIntervalEnv() {
+  const hours = loadConfig().backupIntervalHours;
+  return Number.isFinite(hours) ? String(hours) : '';
 }
 
 function findFreePort() {
@@ -399,6 +379,10 @@ async function startNextServer() {
       // surface a password-reset token directly in the local HTTP response.
       BKA_OFFLINE: '1',
       BKA_INTERNAL_TOKEN: internalToken,
+      // Versioned automatic backups go to the existing backups folder unless the company file
+      // chooses another one (Back Up & Restore page).
+      BKA_BACKUP_DIR: backupsDir(),
+      BKA_BACKUP_INTERVAL_HOURS: legacyBackupIntervalEnv(),
       ELECTRON_RUN_AS_NODE: '1',
       // Local-only: no Next.js telemetry (it is build/CLI-time, but make sure).
       NEXT_TELEMETRY_DISABLED: '1',
@@ -893,7 +877,6 @@ async function createWindow() {
   rememberRecentCompany(activeDir);
   buildMenu();
   runDueRecurring(url);
-  scheduleAutoBackups();
   scheduleBackgroundJobs(url);
   refreshRendererAllowlist();
   if (hostingConfig().enabled) setHosting(true, { quiet: true });
@@ -964,8 +947,25 @@ function runDueScheduledReports(url) {
     .catch((err) => console.error('[scheduled-reports] run failed:', err?.message || err));
 }
 
+// Start the server's scheduled-backup timer at launch, whoever signs in (the backup status route
+// also starts it, but only after a page load). Internal token, like the recurring run.
+function startBackupScheduler(url) {
+  fetch(`${url}/api/dashboard/auto-backup?start=1`, {
+    method: 'POST',
+    headers: { 'x-bka-internal': internalToken },
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.error(`[backup] could not start the backup schedule: HTTP ${res.status} ${body.slice(0, 200)}`);
+      }
+    })
+    .catch((err) => console.error('[backup] could not start the backup schedule:', err?.message || err));
+}
+
 function scheduleBackgroundJobs(url) {
   if (scheduledReportsTimer || recurringTimer) return;
+  if (!remoteHostOrigin) startBackupScheduler(url);
   scheduledReportsTimer = setInterval(() => runDueScheduledReports(url), SCHEDULED_REPORTS_EVERY_MS);
   recurringTimer = setInterval(() => runDueRecurring(url), RECURRING_EVERY_MS);
   // First scheduled-reports check shortly after launch (the server is warm by then).
@@ -1266,7 +1266,6 @@ app.on('before-quit', (event) => {
   if (!quittingAfterBackup) {
     quittingAfterBackup = true;
     event.preventDefault();
-    if (backupTimer) clearInterval(backupTimer);
     runAutoBackup()
       .catch((err) => console.error('[auto-backup] skipped:', err?.message || err))
       .finally(() => app.quit());
