@@ -1,9 +1,15 @@
 /**
- * Customer-specific price lists (price levels).
+ * Customer-specific item prices (the /customer-pricing screen; the legacy "price level" path).
  *
- * The `customerPrices` table holds per-customer overrides for item prices.
- * When an invoice line is being priced, the caller should call `getPrice` first;
- * if it returns null, fall back to the item's `salesPrice`.
+ * The `customerPrices` table holds per-customer prices for items. Since B12 these are NOT applied
+ * by any form on its own: they are one candidate inside the advanced pricing engine
+ * (lib/services/pricing.ts, source 'customer_price'), next to the customer's price level
+ * (customers.priceLevelId, set on the customer form or in Advanced Pricing) and price rules.
+ * Every sales form — invoice, sales receipt, estimate, sales order, credit memo — asks that one
+ * engine for a quote (/api/pricing/quote) and the document services re-price server-side with
+ * resolveLinePricing, so a customer price and a price level can never disagree between screens:
+ * the company's conflict setting ('lowest' price wins, or rule 'priority') decides between them.
+ * `getPrice` is kept for direct lookups only (no form uses it to price a line).
  *
  * No GL impact — this is master-data only. An audit log row is written on every
  * mutation so price changes are traceable.

@@ -41,6 +41,8 @@ export const createCustomerSchema = z.object({
   salesTaxCodeId: zUuid.nullish(),
   resaleNumber: z.string().max(50).nullish(),
   taxExemptionReason: z.string().max(100).nullish(),
+  /** B12: the customer's price level (null clears it). */
+  priceLevelId: zUuid.nullish(),
 });
 export type CreateCustomerBody = z.infer<typeof createCustomerSchema>;
 

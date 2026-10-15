@@ -32,6 +32,7 @@ import {
   items,
   journalEntries,
   journalEntryLines,
+  otherNames,
   paycheckLines,
   paychecks,
   paymentChecks,
@@ -106,6 +107,35 @@ function vendorCheckName(v: { displayName: string | null; printOnCheckAs: string
   return (v?.printOnCheckAs ?? '').trim() || (v?.displayName ?? '').trim() || fallback;
 }
 
+/**
+ * Payee of a Write Checks / expense check: the vendor's "print on check as" name, the Other Names
+ * entry's current name (B3), else the typed payee.
+ */
+function expensePayee(
+  e: { payeeName: string | null },
+  v: { displayName: string | null; printOnCheckAs: string | null } | null,
+  o: { name: string } | null,
+  fallback: string,
+): string {
+  if (v) return vendorCheckName(v, e.payeeName ?? fallback);
+  if (o?.name?.trim()) return o.name.trim();
+  return e.payeeName ?? fallback;
+}
+
+/**
+ * QB prints the payee's account number on the memo line when the memo is blank. The payee is a
+ * vendor or an Other Names entry (B3); both lists carry an account number.
+ */
+function expenseMemo(
+  e: { memo: string | null },
+  v: { accountNumber: string | null } | null,
+  o: { accountNumber: string | null } | null,
+): string | null {
+  if (e.memo?.trim()) return e.memo;
+  const acct = (v?.accountNumber ?? o?.accountNumber ?? '').trim();
+  return acct ? `Acct # ${acct}` : (e.memo ?? null);
+}
+
 /** Everything waiting to be printed, oldest first (optionally for one bank account). */
 export async function listPrintQueue(
   ctx: ServiceContext,
@@ -114,9 +144,10 @@ export async function listPrintQueue(
   const out: PrintQueueItem[] = [];
 
   const expRows = await ctx.db
-    .select({ e: expenses, v: vendors, acctName: accounts.name })
+    .select({ e: expenses, v: vendors, o: otherNames, acctName: accounts.name })
     .from(expenses)
     .leftJoin(vendors, eq(expenses.vendorId, vendors.id))
+    .leftJoin(otherNames, eq(expenses.otherNameId, otherNames.id))
     .leftJoin(accounts, eq(expenses.paymentAccountId, accounts.id))
     .where(
       and(
@@ -132,9 +163,9 @@ export async function listPrintQueue(
       source: 'expense',
       id: r.e.id,
       date: r.e.date,
-      payee: r.v ? vendorCheckName(r.v, r.e.payeeName ?? '') : (r.e.payeeName ?? ''),
+      payee: expensePayee(r.e, r.v, r.o, ''),
       amount: toAmountString(Money.of(r.e.total).abs()),
-      memo: r.e.memo,
+      memo: expenseMemo(r.e, r.v, r.o),
       paymentAccountId: r.e.paymentAccountId,
       paymentAccountName: r.acctName ?? null,
     });
@@ -386,9 +417,10 @@ export async function checkPrintData(
 ): Promise<CheckPrintData> {
   if (source === 'expense') {
     const [row] = await ctx.db
-      .select({ e: expenses, v: vendors })
+      .select({ e: expenses, v: vendors, o: otherNames })
       .from(expenses)
       .leftJoin(vendors, eq(expenses.vendorId, vendors.id))
+      .leftJoin(otherNames, eq(expenses.otherNameId, otherNames.id))
       .where(and(eq(expenses.companyId, ctx.companyId), eq(expenses.id, id)));
     if (!row) throw notFound('Check');
     const lines = await ctx.db
@@ -399,12 +431,12 @@ export async function checkPrintData(
       .where(eq(expenseLines.expenseId, id))
       .orderBy(asc(expenseLines.lineOrder));
     return {
-      payee: row.v ? vendorCheckName(row.v, row.e.payeeName ?? 'Payee') : (row.e.payeeName ?? 'Payee'),
+      payee: expensePayee(row.e, row.v, row.o, 'Payee'),
       amount: toAmountString(Money.of(row.e.total).abs()),
       date: new Date(row.e.date).toISOString().slice(0, 10),
-      memo: row.e.memo ?? (row.v?.accountNumber ? `Acct # ${row.v.accountNumber}` : null),
+      memo: expenseMemo(row.e, row.v, row.o),
       checkNumber: row.e.reference,
-      payeeAddress: addressLines(row.v?.address),
+      payeeAddress: addressLines(row.v?.address ?? row.o?.address),
       voucher: lines.map((r) => ({
         account: r.l.itemId && r.itemName ? `Item: ${r.itemName}` : `${r.code ?? ''} – ${r.name ?? 'Account'}`,
         description: r.l.description,

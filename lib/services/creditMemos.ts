@@ -14,6 +14,10 @@
  * is frozen), so per-line taxable flags affect the computation at create time
  * but are not persisted on the line rows.
  *
+ * Pricing (B12): item lines sent without a rate are priced server-side by the advanced pricing
+ * engine (price rules, the customer's price level, customer-specific prices) and every item line
+ * records its provenance on credit_memo_lines.pricing (drizzle/0055) — same as invoices.
+ *
  * Inventory restocking (QB parity — a credit memo returns items to stock):
  * when a line references an inventory item and `restock` is not false, the
  * quantity goes back on hand and the original COGS is reversed:
@@ -75,6 +79,7 @@ import {
 } from './_base';
 import { applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
+import { type AppliedPricing, resolveLinePricing } from './pricing';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -88,7 +93,13 @@ export interface CreditMemoLineInput extends InventoryLineDetail {
   itemId?: string | null;
   description?: string | null;
   quantity: string | number;
-  rate: string | number;
+  /**
+   * Unit price. Omit on item lines to price server-side like invoices (B12: price rules, the
+   * customer's price level, customer-specific prices — lib/services/pricing.ts).
+   */
+  rate?: string | number | null;
+  /** Internal callers (conversions) may tag where a carried-over price came from. */
+  pricing?: { origin?: string | null } | null;
   /** Income account to debit (default: item.incomeAccountId, then code '4000'). */
   accountId?: string | null;
   /** Whether this line participates in tax computation. Defaults true. */
@@ -269,14 +280,23 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
     taxable: boolean;
     restock: boolean;
     lineOrder: number;
+    pricing: AppliedPricing | null;
   };
+
+  // B12 advanced pricing: fill omitted item rates (price rules / price level / customer price)
+  // and record which rule or level priced each line, exactly as invoices and sales receipts do.
+  const pricedLines = await resolveLinePricing(
+    ctx,
+    { customerId: input.customerId, date: input.date },
+    input.lines,
+  );
 
   let subtotal = Money.zero();
   let taxableSubtotal = Money.zero();
   const computedLines: ComputedLine[] = [];
 
-  for (let i = 0; i < input.lines.length; i++) {
-    const l = input.lines[i];
+  for (let i = 0; i < pricedLines.length; i++) {
+    const l = pricedLines[i];
     // Quantity and rate are stored at 4 decimals (the column scale); compute the
     // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
     const qty = Money.of(l.quantity).toDecimalPlaces(4);
@@ -322,6 +342,7 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
       taxable,
       restock: l.restock !== false, // default true (returned to stock)
       lineOrder: i,
+      pricing: l.pricing,
     });
   }
 
@@ -373,6 +394,7 @@ async function postCreditMemoDocument(
         lineOrder: cl.lineOrder,
         taxable: cl.taxable,
         restock: cl.restock,
+        pricing: cl.pricing as Record<string, unknown> | null,
       })),
     )
     .returning();

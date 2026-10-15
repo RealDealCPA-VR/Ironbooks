@@ -51,6 +51,7 @@ import {
   jobs,
   journalEntries,
   loanPayments,
+  otherNames,
   vendors,
 } from '@/lib/db/schema';
 import {
@@ -98,8 +99,10 @@ export interface ExpenseLineInput extends InventoryLineDetail {
 }
 
 export interface CreateExpenseInput {
-  /** Either a vendor or a free-text payee name (at least one required). */
+  /** A vendor, an Other Names entry, or a free-text payee name (at least one required). */
   vendorId?: string | null;
+  /** B3: payee from the Other Names list (QB "Other" name). Not together with vendorId. */
+  otherNameId?: string | null;
   payeeName?: string | null;
   date: Date;
   method: ExpenseMethod;
@@ -151,6 +154,8 @@ type ResolvedExpenseLine = {
 
 interface PreparedExpense {
   payeeDisplay: string;
+  /** Other Names payee (B3), validated to belong to the company. */
+  otherNameId: string | null;
   isRefund: boolean;
   /** Absolute transaction-currency total. */
   absTotal: Decimal;
@@ -173,7 +178,11 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
   return row.id;
 }
 
-async function prepareExpense(ctx: ServiceContext, input: CreateExpenseInput): Promise<PreparedExpense> {
+async function prepareExpense(
+  ctx: ServiceContext,
+  input: CreateExpenseInput,
+  opts: { keepOtherNameId?: string | null } = {},
+): Promise<PreparedExpense> {
   // ── payee ─────────────────────────────────────────────────────────────────
   let payeeDisplay = input.payeeName?.trim() || '';
   // undefined = free-text payee (any account currency); null = home-currency vendor.
@@ -187,8 +196,23 @@ async function prepareExpense(ctx: ServiceContext, input: CreateExpenseInput): P
     if (!payeeDisplay) payeeDisplay = vendor.name;
     vendorCurrency = vendor.currency ?? null;
   }
+  // B3: a payee from the Other Names list. Free-text payees and other names have no currency.
+  let otherNameId: string | null = null;
+  if (input.otherNameId) {
+    if (input.vendorId) throw validation('Pick either a vendor or an Other Names entry as the payee, not both.');
+    const [other] = await ctx.db
+      .select({ id: otherNames.id, name: otherNames.name, isActive: otherNames.isActive })
+      .from(otherNames)
+      .where(and(eq(otherNames.id, input.otherNameId), eq(otherNames.companyId, ctx.companyId)));
+    if (!other) throw notFound('Other name');
+    if (!other.isActive && other.id !== opts.keepOtherNameId) {
+      throw validation(`"${other.name}" is inactive on the Other Names list. Make it active again or pick another payee.`);
+    }
+    otherNameId = other.id;
+    if (!payeeDisplay) payeeDisplay = other.name;
+  }
   if (!payeeDisplay) {
-    throw validation('A vendor or a payee name is required.');
+    throw validation('A vendor, an Other Names entry or a payee name is required.');
   }
 
   if (!['check', 'cash', 'credit_card'].includes(input.method)) {
@@ -394,6 +418,7 @@ async function prepareExpense(ctx: ServiceContext, input: CreateExpenseInput): P
 
   return {
     payeeDisplay,
+    otherNameId,
     isRefund,
     absTotal,
     homeTotalStr: toAmountString(home.total),
@@ -537,6 +562,7 @@ export async function createExpense(ctx: ServiceContext, input: CreateExpenseInp
       .values({
         companyId: tx.companyId,
         vendorId: input.vendorId ?? null,
+        otherNameId: prep.otherNameId,
         payeeName: prep.payeeDisplay,
         date: input.date,
         method: input.method,
@@ -575,6 +601,8 @@ export async function createExpense(ctx: ServiceContext, input: CreateExpenseInp
       entityId: expense.id,
       newValues: {
         payee: prep.payeeDisplay,
+        vendorId: input.vendorId ?? null,
+        otherNameId: prep.otherNameId,
         method: input.method,
         reference,
         paymentAccountId: input.paymentAccountId,
@@ -614,7 +642,8 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
   if (!existing) throw notFound('Expense');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This transaction is void and cannot be edited.');
 
-  const prep = await prepareExpense(ctx, input);
+  // An inactive Other Names payee already on this check may stay on it.
+  const prep = await prepareExpense(ctx, input, { keepOtherNameId: existing.otherNameId });
 
   // Check number: keep the saved one unless the user typed another; print-later clears it.
   const toPrint = Boolean(input.toPrint) && input.method === 'check';
@@ -659,6 +688,7 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
 
     const header = {
       vendorId: input.vendorId ?? null,
+      otherNameId: prep.otherNameId,
       payeeName: prep.payeeDisplay,
       date: input.date,
       method: input.method,
@@ -731,6 +761,8 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
       entityId: id,
       oldValues: {
         payee: cur.payeeName,
+        vendorId: cur.vendorId,
+        otherNameId: cur.otherNameId,
         date: cur.date,
         method: cur.method,
         reference: cur.reference,
@@ -742,6 +774,8 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
       },
       newValues: {
         payee: prep.payeeDisplay,
+        vendorId: input.vendorId ?? null,
+        otherNameId: prep.otherNameId,
         date: input.date,
         method: input.method,
         reference,
@@ -822,6 +856,8 @@ export async function getExpense(ctx: ServiceContext, id: string) {
 
 export interface ListExpensesOptions {
   vendorId?: string;
+  /** B3: only checks / charges paid to this Other Names entry. */
+  otherNameId?: string;
   method?: ExpenseMethod;
   paymentAccountId?: string;
   /** Only checks queued for printing (method='check', toPrint=true, not void). */
@@ -837,6 +873,7 @@ export interface ListExpensesOptions {
 export async function listExpenses(ctx: ServiceContext, opts?: ListExpensesOptions) {
   const conditions = [eq(expenses.companyId, ctx.companyId)];
   if (opts?.vendorId) conditions.push(eq(expenses.vendorId, opts.vendorId));
+  if (opts?.otherNameId) conditions.push(eq(expenses.otherNameId, opts.otherNameId));
   if (opts?.method) conditions.push(eq(expenses.method, opts.method));
   if (opts?.paymentAccountId) conditions.push(eq(expenses.paymentAccountId, opts.paymentAccountId));
   if (opts?.toPrint) {
@@ -851,10 +888,12 @@ export async function listExpenses(ctx: ServiceContext, opts?: ListExpensesOptio
     .select({
       expense: expenses,
       vendorName: vendors.displayName,
+      otherName: otherNames.name,
       paymentAccountName: accounts.name,
     })
     .from(expenses)
     .leftJoin(vendors, eq(expenses.vendorId, vendors.id))
+    .leftJoin(otherNames, eq(expenses.otherNameId, otherNames.id))
     .leftJoin(accounts, eq(expenses.paymentAccountId, accounts.id))
     .where(and(...conditions))
     .orderBy(desc(expenses.date), desc(expenses.createdAt))
@@ -864,6 +903,8 @@ export async function listExpenses(ctx: ServiceContext, opts?: ListExpensesOptio
   return rows.map((r) => ({
     ...r.expense,
     vendorName: r.vendorName ?? null,
+    /** B3: current name of the Other Names payee (null for vendor / free-text payees). */
+    otherName: r.otherName ?? null,
     paymentAccountName: r.paymentAccountName ?? null,
   }));
 }

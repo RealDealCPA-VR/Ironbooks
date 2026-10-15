@@ -10,7 +10,8 @@ export const creditMemoLineSchema = z.object({
   itemId: zUuid.nullish(),
   description: z.string().nullish(),
   quantity: zDecimal,
-  rate: zDecimal,
+  /** Omit on item lines to price server-side (price rules / price level; lib/services/pricing.ts). */
+  rate: zDecimal.nullish(),
   accountId: zUuid.nullish(),
   /** Defaults to true in the service. */
   taxable: z.boolean().optional(),

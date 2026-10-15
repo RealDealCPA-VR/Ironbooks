@@ -21,6 +21,12 @@
  *                  inventory assembly, non-inventory, other charge, discount, payment, sales tax
  *                  item / group, group, subtotal); group components and assembly BOMs from
  *                  INVITEMCOMP rows when present; STAX items also create sales-tax rates.
+ *                  G1: QNTY (quantity on hand) with VALUE (total value; else QNTY x COST) and an
+ *                  optional ASOFDATE becomes the item's opening stock through the New Item path
+ *                  (lib/services/lists/openingStock.ts: Dr Inventory Asset / Cr Opening Balance
+ *                  Equity + a FIFO layer). It is NOT posted when the same file already carries
+ *                  that inventory asset account's balance (an ACCNT OBAMOUNT or TRNS rows on it),
+ *                  which would count the stock twice; an issue explains it instead.
  *       Other lists through a REGISTRY (IIF_LIST_REGISTRY): CTYPE / VTYPE / SALESREP / BUD
  *                  import into their tables (OTHERNAME, JOBTYPE, TERMS, SHIPMETH, PAYMETH, CUSTMSG,
  *                  SALESTAXCODE, TODO, VEH, PRICELEVEL via qbIifLists.ts); unknown sections are parsed and
@@ -61,7 +67,8 @@ import { createAccount } from './accounts';
 import { createCustomer, type CustomerAddress } from './customers';
 import { createVendor } from './vendors';
 import { createClass } from './dimensions';
-import { createItem, type ItemType } from './items';
+import { createItem, type CreateItemInput, type ItemType } from './items';
+import { createItemWithOpeningStock, planOpeningStock, type OpeningStockInput } from './lists/openingStock';
 import { setBom } from './assemblies';
 import { createJob } from './jobs';
 import { createEmployee, updateEmployee } from './payroll';
@@ -262,6 +269,12 @@ export interface IIFItem {
   hidden?: boolean;
   reorderPoint?: string;
   preferredVendor?: string;
+  /** G1: QNTY - quantity on hand (inventory items). */
+  quantityOnHand?: string;
+  /** G1: VALUE / TOTALVALUE - total value of the quantity on hand (else QNTY x COST). */
+  totalValue?: string;
+  /** G1: ASOFDATE - as-of date of the quantity on hand (else the file's opening-balance date). */
+  asOf?: string;
   raw?: Record<string, string>;
 }
 
@@ -561,6 +574,9 @@ export function parseIIF(content: string): ParsedIIF {
             hidden: yes(row.HIDDEN),
             reorderPoint: row.REORDERPOINT ?? undefined,
             preferredVendor: row.PREFVEND ?? undefined,
+            quantityOnHand: row.QNTY ?? row.QTYONHAND ?? undefined,
+            totalValue: row.VALUE ?? row.TOTALVALUE ?? undefined,
+            asOf: row.ASOFDATE ?? row.ASOF ?? undefined,
             raw: row,
           });
         }
@@ -802,6 +818,8 @@ export interface ImportCounts {
   deferred: DeferredList[];
   /** Open invoices / bills converted to real documents (when requested). */
   openItems?: { invoices: number; bills: number; credits: number; skipped: number };
+  /** G1: inventory items imported with an opening quantity on hand, and its total value. */
+  openingStock?: { items: number; value: string };
   skipped: number;
   /** One entry per skipped row (and per remap/auto-create), so users can see WHY. */
   issues: ImportIssue[];
@@ -1413,7 +1431,22 @@ export async function importIIF(
   await importIifVendors(ctx, counts, parsed.vendors);
 
   // ---- Items (INVITEM) + group / assembly components ----
-  await importIifItems(ctx, counts, lookup, parsed.items, parsed.itemComponents);
+  // Inventory asset accounts whose balance this file already brings in (opening balance or
+  // transactions): item QNTY on those accounts is not posted again (it would double the stock).
+  const carriedAccountIds = new Set<string>();
+  for (const a of parsed.accounts) {
+    const ob = parseIifAmount(a.obAmount);
+    if (!ob || Money.of(ob).isZero()) continue;
+    const r = resolveAccountRef(lookup, a.name);
+    if (r && !('ambiguous' in r && r.ambiguous)) carriedAccountIds.add((r as AccountRef).id);
+  }
+  for (const t of parsed.transactions) {
+    for (const l of t.lines) {
+      const r = resolveAccountRef(lookup, l.accnt);
+      if (r && !('ambiguous' in r && r.ambiguous)) carriedAccountIds.add((r as AccountRef).id);
+    }
+  }
+  await importIifItems(ctx, counts, lookup, parsed.items, parsed.itemComponents, { obDate, carriedAccountIds });
 
   // ---- Employees (EMP) ----
   await importIifEmployees(ctx, counts, parsed.employees);
@@ -1874,6 +1907,7 @@ async function importIifItems(
   lookup: AccountLookup,
   rows: IIFItem[],
   components: IIFItemComponent[],
+  openingOpts: { obDate: Date; carriedAccountIds: Set<string> } = { obDate: new Date(), carriedAccountIds: new Set() },
 ) {
   const rates = await nameMap(ctx, taxRates);
   for (const item of rows) {
@@ -1905,6 +1939,8 @@ async function importIifItems(
       taxable: item.taxable,
       inactive: item.hidden,
       reorderPoint: item.reorderPoint ? parseIifAmount(item.reorderPoint) : null,
+      opening: openingFromRow(item.quantityOnHand, item.totalValue, purchaseCost, item.asOf, openingOpts.obDate),
+      carriedAccountIds: openingOpts.carriedAccountIds,
     });
     // A sales tax item (STAX) is also a sales tax RATE so invoices can charge it.
     if (created && type === 'sales_tax' && pct && (item.itemType ?? '').toUpperCase().replace(/\s/g, '') === 'STAX') {
@@ -1969,6 +2005,51 @@ async function importIifItems(
 
 type Decimalish = ReturnType<typeof Money.zero>;
 
+/** Parsed opening stock of an imported item (G1), or the reason it cannot be read. */
+type ImportedOpening = OpeningStockInput | { error: string } | null;
+
+/** Quantity cell -> decimal string (QNTY is not money: no 2-dp rounding); null = blank, 'bad' = not a number. */
+function parseQuantityCell(raw: string | undefined): string | null | 'bad' {
+  const s = (raw ?? '').trim().replace(/,/g, '');
+  if (!s) return null;
+  const neg = /^\(.*\)$/.test(s);
+  const body = neg ? s.slice(1, -1) : s;
+  if (!/^-?(\d+(\.\d+)?|\.\d+)$/.test(body)) return 'bad';
+  const n = Money.of(body);
+  return (neg ? n.negated() : n).toString();
+}
+
+/**
+ * Opening stock from quantity / total value / cost / as-of cells (IIF INVITEM or CSV columns).
+ * The total value wins over the cost; the as-of date defaults to `defaultAsOf`. Null when there
+ * is no (or a zero) quantity.
+ */
+export function openingFromRow(
+  qtyRaw: string | undefined,
+  valueRaw: string | undefined,
+  unitCost: string | null | undefined,
+  asOfRaw: string | undefined,
+  defaultAsOf: Date,
+): ImportedOpening {
+  if (!qtyRaw?.trim()) return null;
+  const qty = parseQuantityCell(qtyRaw);
+  if (qty === 'bad') return { error: `"${qtyRaw}" is not a number.` };
+  if (qty === null || Money.of(qty).isZero()) return null;
+  let asOf = defaultAsOf;
+  if (asOfRaw?.trim()) {
+    const d = parseIifDate(asOfRaw);
+    if (!d) return { error: `the as-of date "${asOfRaw}" is not a date.` };
+    asOf = d;
+  }
+  if (valueRaw?.trim()) {
+    const v = parseIifAmount(valueRaw);
+    if (v === null) return { error: `the total value "${valueRaw}" is not a number.` };
+    return { openingQuantity: qty, openingValue: v, openingAsOf: asOf };
+  }
+  if (unitCost != null && unitCost !== '') return { openingQuantity: qty, openingUnitCost: unitCost, openingAsOf: asOf };
+  return { error: 'there is no total value and the item has no cost.' };
+}
+
 async function importItemRow(
   ctx: ServiceContext,
   counts: ImportCounts,
@@ -1986,6 +2067,10 @@ async function importItemRow(
     taxable?: boolean;
     inactive?: boolean;
     reorderPoint?: string | null;
+    /** G1: opening quantity on hand / value / as-of (inventory items). */
+    opening?: ImportedOpening;
+    /** Inventory asset accounts whose balance the same import already carries (no double count). */
+    carriedAccountIds?: Set<string>;
   },
 ): Promise<string | null> {
   const name = input.name.trim();
@@ -2032,19 +2117,67 @@ async function importItemRow(
   const expenseAccountId = resolveLink(input.expenseAccountRef, 'expense', 'Expense/COGS');
   const assetAccountId = resolveLink(input.assetAccountRef, 'asset', 'Inventory asset');
 
+  const itemInput: CreateItemInput = {
+    name,
+    sku: input.sku ?? null,
+    type: input.type,
+    description: input.description ?? null,
+    salesPrice: input.salesPrice ?? null,
+    purchaseCost: input.purchaseCost ?? null,
+    incomeAccountId,
+    expenseAccountId,
+    assetAccountId,
+    ...(input.taxable !== undefined ? { taxable: input.taxable } : {}),
+  };
+
+  // G1: opening quantity on hand, posted through the New Item path when it can be.
+  let opening: OpeningStockInput | null = null;
+  if (input.opening) {
+    const skip = (message: string) =>
+      counts.issues.push({ entity: 'item', name, reason: 'note', message: `Quantity on hand not imported: ${message}` });
+    if (input.type !== 'inventory') skip('only inventory items carry a quantity on hand.');
+    else if ('error' in input.opening) skip(input.opening.error);
+    else {
+      const assetId = assetAccountId ?? lookup.byCode.get('1300')?.id ?? null;
+      if (assetId && input.carriedAccountIds?.has(assetId)) {
+        skip(
+          'this file already brings in the balance of the inventory asset account, so adding the stock again would count it twice. Enter it with Adjust inventory if needed.',
+        );
+      } else {
+        try {
+          planOpeningStock(input.opening, input.type);
+          opening = input.opening;
+        } catch (err) {
+          if (err instanceof ServiceError && err.code === 'VALIDATION') skip(err.message);
+          else throw err;
+        }
+      }
+    }
+  }
+
   try {
-    const row = await createItem(ctx, {
-      name,
-      sku: input.sku ?? null,
-      type: input.type,
-      description: input.description ?? null,
-      salesPrice: input.salesPrice ?? null,
-      purchaseCost: input.purchaseCost ?? null,
-      incomeAccountId,
-      expenseAccountId,
-      assetAccountId,
-      ...(input.taxable !== undefined ? { taxable: input.taxable } : {}),
-    });
+    let row: Awaited<ReturnType<typeof createItem>>;
+    if (opening) {
+      try {
+        row = (await createItemWithOpeningStock(ctx, { ...itemInput, ...opening })).item;
+      } catch (err) {
+        // e.g. the as-of date is on or before the closing date: import the item without stock.
+        if (!(err instanceof ServiceError) || err.code === 'VALIDATION') throw err;
+        counts.issues.push({ entity: 'item', name, reason: 'note', message: `Quantity on hand not imported: ${err.message}` });
+        opening = null;
+        row = await createItem(ctx, itemInput);
+      }
+    } else {
+      row = await createItem(ctx, itemInput);
+    }
+    if (opening) {
+      const plan = planOpeningStock(opening, input.type);
+      const prev = counts.openingStock ?? { items: 0, value: '0.00' };
+      counts.openingStock = {
+        items: prev.items + 1,
+        value: toAmountString(Money.of(prev.value).plus(plan ? plan.value : 0)),
+      };
+    }
     counts.items++;
     const patch: Partial<typeof itemsTable.$inferInsert> = {};
     if (input.inactive) patch.isActive = false;
@@ -2517,12 +2650,20 @@ export interface ItemsCsvMapping {
   incomeAccount?: string;
   expenseAccount?: string;
   assetAccount?: string;
+  /** G1: quantity on hand for new inventory items (posted as opening stock). */
+  quantityOnHand?: string;
+  /** G1: total value of that quantity (blank = quantity x purchase cost). */
+  totalValue?: string;
+  /** G1: as-of date of the quantity on hand (blank = today). */
+  asOfDate?: string;
 }
 
 async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCsvMapping): Promise<ImportCounts> {
   const counts = emptyCounts();
   const lookup = await loadAccountLookup(ctx);
   const col = (key: keyof ItemsCsvMapping, row: Row): string => (mapping[key] ? (row[mapping[key]!] ?? '').trim() : '');
+  const now = new Date();
+  const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   for (const row of rows) {
     const name = col('name', row);
     if (!name) {
@@ -2530,16 +2671,19 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
       counts.issues.push({ entity: 'item', name: '(blank)', reason: 'validation', message: 'Row has no item name value.' });
       continue;
     }
+    const purchaseCost = parseIifAmount(col('purchaseCost', row)) ?? null;
     await importItemRow(ctx, counts, lookup, {
       name,
       sku: col('sku', row) || null,
       type: mapIifItemType(col('type', row)),
       description: col('description', row) || null,
       salesPrice: parseIifAmount(col('salesPrice', row)) ?? null,
-      purchaseCost: parseIifAmount(col('purchaseCost', row)) ?? null,
+      purchaseCost,
       incomeAccountRef: col('incomeAccount', row) || undefined,
       expenseAccountRef: col('expenseAccount', row) || undefined,
       assetAccountRef: col('assetAccount', row) || undefined,
+      // G1: opening quantity on hand / value (or cost) / as-of date.
+      opening: openingFromRow(col('quantityOnHand', row), col('totalValue', row), purchaseCost, col('asOfDate', row), today),
     });
   }
   return counts;

@@ -18,6 +18,7 @@
 
 import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { Suspense, useEffect, useState, useCallback } from 'react';
+import Link from 'next/link';
 import { Banknote, Paperclip, Pencil, Plus, Trash2 } from 'lucide-react';
 import {
   AmountInput,
@@ -61,6 +62,9 @@ interface Expense {
   id: string;
   vendorId: string | null;
   vendorName: string | null;
+  /** B3: payee from the Other Names list. */
+  otherNameId?: string | null;
+  otherName?: string | null;
   payeeName: string | null;
   date: string;
   method: string;
@@ -140,6 +144,22 @@ const ENTRY_LABEL: Record<EntryType, string> = {
 };
 
 const OTHER_PAYEE = '__other__';
+/** Payee select values for Other Names entries are "other:<id>" (vendors use the bare id). */
+const OTHER_NAME_PREFIX = 'other:';
+
+interface OtherNameOption {
+  id: string;
+  name: string;
+  accountNumber?: string | null;
+}
+
+/** Decode the payee select (+ typed name) into the API's vendorId / otherNameId / payeeName. */
+function payeeFields(sel: string, typed: string): { vendorId?: string; otherNameId?: string; payeeName?: string } {
+  if (!sel) return {};
+  if (sel === OTHER_PAYEE) return typed.trim() ? { payeeName: typed.trim() } : {};
+  if (sel.startsWith(OTHER_NAME_PREFIX)) return { otherNameId: sel.slice(OTHER_NAME_PREFIX.length) };
+  return { vendorId: sel };
+}
 
 function emptyLine(mode: LineRow['mode'] = 'expense'): LineRow {
   return { mode, accountId: '', itemId: '', quantity: '', unitCost: '', description: '', amount: '', classId: '', customerId: '' };
@@ -175,6 +195,7 @@ function isCreditCard(a: Account): boolean {
 function ExpensesPageContent() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
+  const [otherNames, setOtherNames] = useState<OtherNameOption[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [classes, setClasses] = useState<ClassRow[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -238,6 +259,11 @@ function ExpensesPageContent() {
           .get<{ items: Item[] }>('/api/items')
           .then((d) => setItems(d.items ?? []))
           .catch(() => setItems([]));
+        // QB "Other Names" can be payees too (optional: the list may be hidden by permissions).
+        api
+          .get<{ entries: OtherNameOption[] }>('/api/lists/other-names')
+          .then((d) => setOtherNames(d.entries ?? []))
+          .catch(() => setOtherNames([]));
         setExpenses(expData.expenses);
         setVendors(vendorData);
         setAccounts(accountData);
@@ -338,8 +364,8 @@ function ExpensesPageContent() {
       setEditingId(e.id);
       const isCredit = d.method === 'credit_card' && Number(d.total) < 0;
       setEntryType(d.method === 'cash' ? 'cash' : d.method === 'credit_card' ? (isCredit ? 'cc_credit' : 'cc_charge') : 'check');
-      setPayeeSel(d.vendorId ?? OTHER_PAYEE);
-      setPayeeName(d.vendorId ? '' : (d.payeeName ?? ''));
+      setPayeeSel(d.vendorId ?? (d.otherNameId ? `${OTHER_NAME_PREFIX}${d.otherNameId}` : OTHER_PAYEE));
+      setPayeeName(d.vendorId || d.otherNameId ? '' : (d.payeeName ?? ''));
       setPaymentAccountId(d.paymentAccountId);
       setDate(d.date.slice(0, 10));
       setReference(d.reference ?? '');
@@ -408,10 +434,9 @@ function ExpensesPageContent() {
   // ── submit ────────────────────────────────────────────────────────────────
 
   async function handleSubmit() {
-    const vendorId = payeeSel && payeeSel !== OTHER_PAYEE ? payeeSel : undefined;
-    const freePayee = payeeSel === OTHER_PAYEE ? payeeName.trim() : '';
-    if (!vendorId && !freePayee) {
-      toast('Select a vendor or enter a payee name.', 'danger');
+    const payee = payeeFields(payeeSel, payeeName);
+    if (!payee.vendorId && !payee.otherNameId && !payee.payeeName) {
+      toast('Select a payee or enter a payee name.', 'danger');
       return;
     }
     if (!paymentAccountId) {
@@ -460,8 +485,7 @@ function ExpensesPageContent() {
     setSubmitting(true);
     try {
       const body = {
-        vendorId,
-        payeeName: freePayee || undefined,
+        ...payee,
         date,
         method: entryType === 'cash' ? 'cash' : isCC ? 'credit_card' : 'check',
         isRefund: entryType === 'cc_credit',
@@ -597,17 +621,36 @@ function ExpensesPageContent() {
               onChange={(e) => {
                 const v = e.target.value;
                 setPayeeSel(v);
-                if (v && v !== OTHER_PAYEE) prefillFor({ vendorId: v });
+                if (v && v !== OTHER_PAYEE && !v.startsWith(OTHER_NAME_PREFIX)) prefillFor({ vendorId: v });
+                else if (v.startsWith(OTHER_NAME_PREFIX)) {
+                  const o = otherNames.find((x) => `${OTHER_NAME_PREFIX}${x.id}` === v);
+                  if (o) prefillFor({ payee: o.name });
+                }
               }}
             >
               <option value="">Select payee…</option>
-              {vendors.map((v) => (
-                <option key={v.id} value={v.id}>
-                  {v.displayName}
-                </option>
-              ))}
-              <option value={OTHER_PAYEE}>Other (type a name)…</option>
+              <optgroup label="Vendors">
+                {vendors.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.displayName}
+                  </option>
+                ))}
+              </optgroup>
+              {otherNames.length > 0 && (
+                <optgroup label="Other Names">
+                  {otherNames.map((o) => (
+                    <option key={o.id} value={`${OTHER_NAME_PREFIX}${o.id}`}>
+                      {o.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              <option value={OTHER_PAYEE}>Someone else (type a name)…</option>
             </Select>
+            <p className="mt-1 text-xs text-navy/50">
+              Paying someone who is not a vendor? Add them to the{' '}
+              <Link href="/lists?list=other-names" className="text-electric hover:underline">Other Names list</Link>.
+            </p>
             {payeeSel === OTHER_PAYEE && (
               <Input
                 className="mt-2"
@@ -874,17 +917,21 @@ function ExpensesPageContent() {
         <div className="flex justify-end gap-2 pt-1">
           <MemorizeButton
             docType={entryType === 'check' ? 'check' : 'expense'}
-            defaultName={payeeSel === OTHER_PAYEE ? payeeName : vendors.find((v) => v.id === payeeSel)?.displayName}
+            defaultName={
+              payeeSel === OTHER_PAYEE
+                ? payeeName
+                : payeeSel.startsWith(OTHER_NAME_PREFIX)
+                  ? otherNames.find((o) => `${OTHER_NAME_PREFIX}${o.id}` === payeeSel)?.name
+                  : vendors.find((v) => v.id === payeeSel)?.displayName
+            }
             getTemplate={() => {
-              const vendorId = payeeSel && payeeSel !== OTHER_PAYEE ? payeeSel : undefined;
-              const freePayee = payeeSel === OTHER_PAYEE ? payeeName.trim() : '';
-              if (!vendorId && !freePayee) return 'Pick a payee before memorizing.';
+              const payee = payeeFields(payeeSel, payeeName);
+              if (!payee.vendorId && !payee.otherNameId && !payee.payeeName) return 'Pick a payee before memorizing.';
               if (!paymentAccountId) return 'Pick the account you pay from before memorizing.';
               const rows = lines.filter((l) => l.accountId && Number(l.amount) > 0);
               if (rows.length === 0) return 'Add at least one line before memorizing.';
               return {
-                vendorId,
-                payeeName: freePayee || undefined,
+                ...payee,
                 date,
                 method: entryType === 'cash' ? 'cash' : isCC ? 'credit_card' : 'check',
                 isRefund: entryType === 'cc_credit',
@@ -944,7 +991,7 @@ function ExpensesPageContent() {
                       <span className="text-navy/30 italic">{e.toPrint ? 'to print' : '—'}</span>
                     )}
                   </Td>
-                  <Td className="font-medium">{e.vendorName ?? e.payeeName ?? '—'}</Td>
+                  <Td className="font-medium">{e.vendorName ?? e.otherName ?? e.payeeName ?? '—'}</Td>
                   <Td>{e.paymentAccountName ?? '—'}</Td>
                   <Td>{methodBadge(e)}</Td>
                   <Td numeric className="font-semibold">
@@ -998,7 +1045,7 @@ function ExpensesPageContent() {
       <ConfirmDialog
         open={!!pendingVoid}
         title="Void transaction?"
-        message={`Void this transaction for ${formatCurrency(pendingVoid?.total ?? '0')} to ${pendingVoid?.vendorName ?? pendingVoid?.payeeName ?? 'the payee'}? This reverses the posted entry and cannot be undone.`}
+        message={`Void this transaction for ${formatCurrency(pendingVoid?.total ?? '0')} to ${pendingVoid?.vendorName ?? pendingVoid?.otherName ?? pendingVoid?.payeeName ?? 'the payee'}? This reverses the posted entry and cannot be undone.`}
         confirmLabel="Void"
         tone="danger"
         loading={!!pendingVoid && voidingId === pendingVoid.id}

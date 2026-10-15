@@ -27,6 +27,7 @@ import {
   inventoryLots,
   items,
   itemSiteSettings,
+  journalEntryLines,
   otherNames,
   paychecks,
   priceLevelItems,
@@ -34,7 +35,7 @@ import {
 } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { Money, toAmountString } from '@/lib/money';
-import { postJournalEntry } from '../posting';
+import { allowLedgerRewrite, postJournalEntry } from '../posting';
 import { moveNotesAndTodos } from './notes';
 import { repointForeignKeys } from './references';
 
@@ -348,14 +349,31 @@ export async function mergeOtherNames(ctx: ServiceContext, { fromId, toId }: { f
   const from = await load(fromId);
   const to = await load(toId);
   return inTransaction(ctx, async (tx) => {
+    // Re-points expenses.other_name_id (B3, drizzle/0055) and every other foreign key.
     const reassigned = await repointForeignKeys(tx, 'other_names', fromId, toId);
-    // Checks / expenses written to an other name carry the payee as text (no vendor link).
+    // Checks / expenses written to an other name also carry the payee as text: rename those
+    // linked to the merged entry, and legacy free-text checks typed with its name.
     const renamed = await tx.db
       .update(expenses)
       .set({ payeeName: to.name })
-      .where(and(eq(expenses.companyId, tx.companyId), sql`${expenses.vendorId} IS NULL`, eq(expenses.payeeName, from.name)))
+      .where(
+        and(
+          eq(expenses.companyId, tx.companyId),
+          sql`${expenses.vendorId} IS NULL`,
+          sql`(${expenses.otherNameId} = ${toId} AND ${expenses.payeeName} = ${from.name} OR ${expenses.otherNameId} IS NULL AND ${expenses.payeeName} = ${from.name})`,
+        ),
+      )
       .returning({ id: expenses.id });
     reassigned.expensesPayee = renamed.length;
+    // The QB "Name" column on journal lines (General Journal lines naming an other name). The id
+    // was verified to belong to this company; accounts and amounts are untouched.
+    await allowLedgerRewrite(tx, 'merge');
+    const lines = await tx.db
+      .update(journalEntryLines)
+      .set({ entityId: toId })
+      .where(and(eq(journalEntryLines.entityType, 'other'), eq(journalEntryLines.entityId, fromId)))
+      .returning({ id: journalEntryLines.id });
+    if (lines.length) reassigned.journalLineNames = lines.length;
     const moved = await moveNotesAndTodos(tx, 'other_name', fromId, toId);
     reassigned.notes = moved.notes;
     reassigned.todos = moved.todos;

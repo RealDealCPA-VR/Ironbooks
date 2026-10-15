@@ -749,6 +749,8 @@ export const expenses = pgTable('expenses', {
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   vendorId: uuid('vendor_id').references(() => vendors.id),
   payeeName: varchar('payee_name', { length: 255 }),
+  /** drizzle/0055 (B3): payee from the Other Names list (QB "Other" name); null = vendor / free text. */
+  otherNameId: uuid('other_name_id').references((): any => otherNames.id),
   date: timestamp('date').notNull(),
   method: paymentMethodEnum('method').notNull().default('check'),
   reference: varchar('reference', { length: 100 }),
@@ -1060,6 +1062,8 @@ export const creditMemoLines = pgTable('credit_memo_lines', {
   /** wave2 sales: persisted so an edit recomputes tax / restocking exactly. */
   taxable: boolean('taxable').notNull().default(true),
   restock: boolean('restock').notNull().default(true),
+  /** drizzle/0055 (B12): which price rule/level priced this line (lib/services/pricing.ts). */
+  pricing: jsonb('pricing').$type<Record<string, unknown>>(),
 });
 
 // ---- Vendor credits (A/P credits) ----

@@ -32,6 +32,7 @@ import {
   itemReceipts,
   journalEntries,
   journalEntryLines,
+  otherNames,
   paychecks,
   paymentsReceived,
   salesReceipts,
@@ -925,10 +926,24 @@ export async function resolveEntryNames(
   const expIds = ids('expense');
   if (expIds.length) {
     const rows = await ctx.db
-      .select({ id: expenses.id, nameId: expenses.vendorId, payee: expenses.payeeName, num: expenses.reference })
+      .select({
+        id: expenses.id,
+        nameId: expenses.vendorId,
+        otherNameId: expenses.otherNameId,
+        payee: expenses.payeeName,
+        num: expenses.reference,
+      })
       .from(expenses)
       .where(and(eq(expenses.companyId, c), inArray(expenses.id, expIds)));
-    for (const r of rows) docs.set(`exp:${r.id}`, { nameType: r.nameId ? 'vendor' : 'other', nameId: r.nameId, num: r.num, payee: r.payee });
+    // B3: a check written to an Other Names entry carries that name (type 'other').
+    for (const r of rows) {
+      docs.set(`exp:${r.id}`, {
+        nameType: r.nameId ? 'vendor' : 'other',
+        nameId: r.nameId ?? r.otherNameId ?? null,
+        num: r.num,
+        payee: r.payee,
+      });
+    }
   }
   const pcIds = ids('paycheck');
   if (pcIds.length) {
@@ -968,11 +983,21 @@ export async function resolveEntryNames(
   const custIds = new Set<string>(ids('customer'));
   const vendIds = new Set<string>(ids('vendor'));
   const empIds = new Set<string>();
+  const otherIds = new Set<string>();
   for (const d of docs.values()) {
     if (!d.nameId) continue;
     if (d.nameType === 'customer') custIds.add(d.nameId);
     else if (d.nameType === 'vendor') vendIds.add(d.nameId);
     else if (d.nameType === 'employee') empIds.add(d.nameId);
+    else if (d.nameType === 'other') otherIds.add(d.nameId);
+  }
+  const otherNameById = new Map<string, string>();
+  if (otherIds.size) {
+    const rows = await ctx.db
+      .select({ id: otherNames.id, name: otherNames.name })
+      .from(otherNames)
+      .where(and(eq(otherNames.companyId, c), inArray(otherNames.id, [...otherIds])));
+    for (const r of rows) otherNameById.set(r.id, r.name);
   }
   const custNames = custIds.size ? await customerNames(ctx) : new Map<string, { name: string }>();
   const vendNames = new Map<string, string>();
@@ -996,6 +1021,7 @@ export async function resolveEntryNames(
     if (t === 'customer') return custNames.get(id)?.name ?? '';
     if (t === 'vendor') return vendNames.get(id) ?? '';
     if (t === 'employee') return empNames.get(id) ?? '';
+    if (t === 'other') return otherNameById.get(id) ?? '';
     return '';
   };
 

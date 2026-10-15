@@ -217,11 +217,6 @@ interface Billables {
   time: BillableTime[];
 }
 
-interface CustomerPrice {
-  itemId: string;
-  price: string;
-}
-
 interface CustomFieldDef {
   name: string;
 }
@@ -402,9 +397,6 @@ function InvoiceModal({
   const [saveAsPending, setSaveAsPending] = useState(false);
   const [customValues, setCustomValues] = useState<Record<string, string>>({});
 
-  // Customer price levels: itemId → custom price for the selected customer.
-  const [customerPrices, setCustomerPrices] = useState<Map<string, string>>(new Map());
-
   // Billable time & costs (create mode only).
   const [billables, setBillables] = useState<Billables | null>(null);
   const [selectedCostIds, setSelectedCostIds] = useState<Set<string>>(new Set());
@@ -525,10 +517,10 @@ function InvoiceModal({
     });
   }
 
-  // When a customer is selected: load their price level + unbilled billables.
+  // When a customer is selected: load their unbilled billables. Prices (price level, price rules
+  // and customer-specific prices) come from the pricing engine via usePriceQuotes below (B12).
   useEffect(() => {
     if (!open || !customerId) {
-      setCustomerPrices(new Map());
       setBillables(null);
       setSelectedCostIds(new Set());
       setSelectedTimeIds(new Set());
@@ -536,16 +528,6 @@ function InvoiceModal({
     }
     let cancelled = false;
     (async () => {
-      try {
-        const res = await api.get<{ prices: CustomerPrice[] }>(
-          `/api/customer-prices?customerId=${customerId}`,
-        );
-        if (!cancelled) {
-          setCustomerPrices(new Map((res.prices ?? []).map((p) => [p.itemId, p.price])));
-        }
-      } catch {
-        // Non-fatal — fall back to item sales prices.
-      }
       if (!editing) {
         try {
           const b = await api.get<Billables>(`/api/billables?customerId=${customerId}`);
@@ -611,10 +593,8 @@ function InvoiceModal({
         unitOfMeasure: c.unitOfMeasure,
         description: `${bundle.name}: ${c.description ?? c.name}`,
         quantity: String(Number(c.quantity)),
-        rate:
-          customerPrices.get(c.componentItemId) != null
-            ? String(Number(customerPrices.get(c.componentItemId)))
-            : (c.salesPrice ?? '0'),
+        // Base price first; the customer's price level / rules replace it via the quotes.
+        rate: c.salesPrice ?? '0',
         taxable: c.taxable,
         jobId: '',
         discountPercent: false,
@@ -631,7 +611,8 @@ function InvoiceModal({
   }
 
   /** Item field changed: resolve exact (case-insensitive) name → auto-fill the line.
-   *  Price levels: a customer-specific price (customer_prices) wins over salesPrice.
+   *  Prices: the base sales price is filled at once; the pricing engine's quote (customer price
+   *  level, price rules, customer-specific prices) then replaces it (B12, usePriceQuotes).
    *  Bundles expand into their component lines. Special types pre-fill sensibly. */
   function handleItemInput(idx: number, value: string) {
     const match = items.find((it) => it.name.toLowerCase() === value.trim().toLowerCase());
@@ -641,7 +622,6 @@ function InvoiceModal({
         void expandBundle(idx, match);
         return;
       }
-      const customerPrice = customerPrices.get(match.id);
       const isSpecial =
         match.type === 'discount' || match.type === 'subtotal' ||
         match.type === 'payment' || match.type === 'sales_tax';
@@ -651,20 +631,12 @@ function InvoiceModal({
         itemType: match.type,
         unitOfMeasure: match.unitOfMeasure,
         description: match.description ?? match.name,
-        rate:
-          match.type === 'subtotal'
-            ? ''
-            : customerPrice != null
-              ? String(Number(customerPrice))
-              : (match.salesPrice ?? ''),
+        rate: match.type === 'subtotal' ? '' : (match.salesPrice ?? ''),
         taxable: isSpecial ? match.type === 'discount' && match.taxable : match.taxable,
         quantity: match.type === 'subtotal' ? '' : lines[idx].quantity || '1',
         discountPercent: false,
         rateManual: false,
       });
-      if (customerPrice != null && !isSpecial) {
-        toast(`Customer price applied for ${match.name}: ${formatCurrency(customerPrice)}`, 'info');
-      }
     } else {
       // No item match — stays a manual description line (itemId null).
       updateLine(idx, { itemName: value, itemId: null, itemType: null, unitOfMeasure: null });
@@ -1104,7 +1076,7 @@ function InvoiceModal({
           <datalist id="inv-item-options">
             {items.map((it) => {
               const typeTag = KIND_BADGES[it.type]?.label;
-              const price = formatCurrency(customerPrices.get(it.id) ?? it.salesPrice ?? '0');
+              const price = formatCurrency(it.salesPrice ?? '0');
               const detail =
                 it.type === 'inventory'
                   ? `${price} · ${Number(it.quantityOnHand ?? 0)} on hand`
