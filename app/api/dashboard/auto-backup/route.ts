@@ -36,6 +36,7 @@ import { requireFileAdmin } from '@/lib/services/access';
 import { recordBackup } from '@/lib/services/backupHistory';
 import { currentFingerprint } from '@/lib/services/backupFingerprint';
 import { ensureBackupScheduler, runVersionedBackup } from '@/lib/services/backupSchedule';
+import { assertNotSandbox } from '@/lib/services/sandboxState';
 
 /** Constant-time check of the x-bka-internal header against BKA_INTERNAL_TOKEN. */
 async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
@@ -65,6 +66,10 @@ export async function POST(req: NextRequest) {
       ctx = await getServerContext();
       await requireFileAdmin(ctx);
     }
+    // Sandbox mode: the quit-time / scheduled auto-backup is of the REAL file only — never of a
+    // practice copy (it would rotate real backups out of the backups folder). Checked before
+    // every mode: ?start=1 (scheduler), ?save=1 (versioned quit-time backup) and the legacy bytes.
+    assertNotSandbox('Automatic backup');
 
     if (req.nextUrl.searchParams.get('start') === '1') {
       ensureBackupScheduler();

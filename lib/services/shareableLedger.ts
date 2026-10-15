@@ -12,6 +12,7 @@
  */
 import { asc, eq } from 'drizzle-orm';
 import { PDFDocument } from 'pdf-lib';
+import { tagSandbox } from '@/lib/pdf/sandboxStamp';
 import {
   accounts,
   classes,
@@ -310,6 +311,7 @@ export async function buildShareableLedgerPdf(ctx: ServiceContext): Promise<Shar
     const pages = await merged.copyPages(doc, doc.getPageIndices());
     for (const p of pages) merged.addPage(p);
   }
+  tagSandbox(merged); // its pages were stamped by buildReportPdf
   return {
     buffer: Buffer.from(await merged.save()),
     filename: `${slug(data.company.name)}-ledger-summary-${iso(data.exportedAt)}.pdf`,

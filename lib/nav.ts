@@ -40,6 +40,7 @@ import { ScanLine } from 'lucide-react'; // receipt capture
 import { ArchiveRestore } from 'lucide-react'; // team backups
 import { CalendarCheck } from 'lucide-react'; // month-end close
 import { KeyRound } from 'lucide-react'; // gapsb K: Change My Password
+import { FlaskConical } from 'lucide-react'; // sandbox mode: Try it on a copy
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -211,6 +212,7 @@ export const navGroups: NavGroup[] = [
       { icon: Building2, label: 'Companies', path: '/companies', qb: 'Open or Restore Company', keywords: 'company file switch' },
       { icon: HardDrive, label: 'Company File', path: '/company-file', qb: 'Back Up Company', keywords: 'backup restore' },
       { icon: ArchiveRestore, label: 'Back Up & Restore', path: '/backup', qb: 'Back Up Company / Restore Previous Local Backup', keywords: 'backup restore automatic schedule versions' }, // team backups
+      { icon: FlaskConical, label: 'Try it on a copy', path: '/sandbox', qb: 'Sandbox / practice file', keywords: 'sandbox practice training test copy experiment safe' },
       { icon: Users, label: 'Users & Roles', path: '/users', qb: 'Set Up Users and Roles', keywords: 'permissions access' },
       { icon: FileSpreadsheet, label: 'Migrate from QuickBooks', path: '/qb-import', qb: 'Import IIF / Convert', keywords: 'import iif convert' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security', qb: 'Security', keywords: 'two factor password' },

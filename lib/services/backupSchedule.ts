@@ -14,6 +14,11 @@
  *    app and in plain web mode alike. The desktop shell's
  *    quit-time backup goes through the same function (POST /api/dashboard/auto-backup?save=1).
  *
+ * Sandbox mode (sandboxState.ts): a sandbox / training copy carries a copy of the real file's
+ * backup history and settings (same backup folder), so a versioned backup or rotation run on it
+ * could delete the REAL file's versions. Versioned backups of such a copy are refused, and the
+ * scheduler skips its ticks while the active file (or the timer's file) is a copy.
+ *
  * State lives on globalThis so a hot reload in `next dev` cannot start a second timer or lose
  * the in-flight lock.
  */
@@ -25,6 +30,7 @@ import { companies } from '@/lib/db/schema';
 import { ServiceError } from './errors';
 import { createBackup } from './backup';
 import { currentFingerprint } from './backupFingerprint';
+import { readSandboxMarker, sandboxBlockedError } from './sandboxState';
 import {
   backupFolder,
   backupHealth,
@@ -154,6 +160,8 @@ export function runVersionedBackup(
   opts: VersionedBackupOptions = {},
 ): Promise<VersionedBackupResult> {
   const dir = resolveDataDir(opts.dataDir);
+  const marker = readSandboxMarker(dir);
+  if (marker) return Promise.reject(sandboxBlockedError('Backing up to the backup folder', marker.kind));
   const s = state();
   const running = s.inflight.get(dir);
   if (running) return running;
@@ -178,6 +186,9 @@ export async function runScheduledBackupIfDue(
 ): Promise<'off' | 'not-due' | 'busy' | VersionedBackupResult['status']> {
   const dir = resolveDataDir(opts.dataDir);
   if (!fs.existsSync(dir)) return 'not-due';
+  // Never from a sandbox / training copy, nor while the server is switched to one (the real
+  // file's handle is held closed until the user leaves the sandbox).
+  if (readSandboxMarker(dir) || readSandboxMarker()) return 'off';
   const now = opts.now ?? new Date();
   const settings = readBackupSettings(dir);
   if (settings.schedule === 'off') return 'off';

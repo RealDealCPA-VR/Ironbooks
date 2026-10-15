@@ -18,6 +18,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { getNetworkPolicy } from '@/lib/services/networkPolicy';
 import { decideOutbound, type OutboundDecision, type OutboundPurpose } from './policy';
 import { verifyTailnetUrls } from './tailnetVerify';
+import { applySandboxToDecision } from '@/lib/services/sandboxState';
 
 export type PolicyCtx = Pick<ServiceContext, 'db' | 'companyId'>;
 
@@ -66,7 +67,8 @@ export async function checkOutbound(
   const policy = await getNetworkPolicy(ctx);
   // A *.ts.net name is tailnet only if it resolves to tailnet addresses (Funnel names are public).
   await verifyTailnetUrls([url]);
-  const decision = decideOutbound(policy, url, purpose);
+  // Sandbox mode: email, bank feeds and update checks stay off in a practice copy.
+  const decision = applySandboxToDecision(decideOutbound(policy, url, purpose));
   log(ctx.companyId, decision);
   return decision;
 }

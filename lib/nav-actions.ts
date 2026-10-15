@@ -150,6 +150,15 @@ export const navIntents: NavIntent[] = [
     description: 'Plain-language answers: what A/R, undeposited funds, reconciling and more mean.',
     phrases: ['help', 'what does this mean', 'glossary', 'explain a term'],
   },
+  {
+    label: 'Try it on a copy',
+    href: '/sandbox',
+    description: 'Practise or test a change on a throwaway copy of your books — your real books stay untouched.',
+    phrases: [
+      'try it on a copy', 'practice', 'practise', 'sandbox', 'test without changing my books',
+      'training file', 'try something safely',
+    ],
+  },
 ];
 
 const STOP_WORDS = new Set([

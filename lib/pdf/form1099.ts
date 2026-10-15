@@ -16,6 +16,7 @@
  */
 
 import { PDFDocument, PDFPage, PDFFont, StandardFonts, rgb, PageSizes } from 'pdf-lib';
+import { stampSandbox } from './sandboxStamp';
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -412,5 +413,6 @@ export async function render1099NecPdf(data: Form1099NecPdfData): Promise<Uint8A
     color: COLOR_GRAY,
   });
 
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }

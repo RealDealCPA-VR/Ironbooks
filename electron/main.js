@@ -161,6 +161,8 @@ app.on('open-file', (event, filePath) => {
 //                        set by the UI; it must be edited in deliberately
 //   remoteHost           when set, open the company hosted at this tailnet/LAN URL instead of a
 //                        local company file (File > Open company on host… / Disconnect)
+//   sandbox              { dir, realDir } while the active file (dataDir) is a "Try it on a copy"
+//                        sandbox copy of realDir (see the sandbox section below)
 // ---------------------------------------------------------------------------
 
 function configPath() {
@@ -304,6 +306,9 @@ async function runAutoBackup() {
   const legacyRemoved = pruneLegacyAutoBackups(backupsDir());
   if (legacyRemoved.length) console.log(`[auto-backup] removed ${legacyRemoved.length} old-style backup(s)`);
   if (!serverUrl || remoteHostOrigin) return; // a client never backs up the host's file
+  // Sandbox mode: auto-backups are of the REAL file only, never of a practice copy (the server
+  // refuses too). The real file is backed up as usual once the user leaves the sandbox.
+  if (sandboxActive()) return;
   const res = await fetch(`${serverUrl}/api/dashboard/auto-backup?save=1`, {
     method: 'POST',
     headers: { 'x-bka-internal': internalToken },
@@ -339,9 +344,104 @@ function activeCompanyDir() {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox mode ("Try it on a copy" - lib/services/sandbox.ts)
+//
+// The local server makes the copy (POST /api/sandbox: PGlite closed, data dir copied) and
+// switches itself to it; the renderer then calls sandbox:entered and the shell relaunches into
+// the copy like File > Open Company, with config.sandbox = { dir, realDir } as its flag. While the
+// active file is a sandbox / training copy (marker file, electron/companyFile.js) the shell skips
+// auto-backups, scheduled reports, multi-user hosting, Recent Companies and update prompts.
+// Leaving (discard / keep as training file) is done by the server; sandbox:left relaunches into
+// the real file recorded in config.sandbox.realDir - never a path supplied by the renderer.
+// ---------------------------------------------------------------------------
+
+function sandboxRoot() {
+  return path.join(app.getPath('userData'), 'sandboxes');
+}
+
+/** The active company file's sandbox marker (null for a real company file). */
+function sandboxActive() {
+  if (remoteHostOrigin) return null;
+  try {
+    return companyFile.readSandboxMarker(activeCompanyDir());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Before anything opens the active dir: a sandbox copy that no longer exists (discarded while the
+ * app was not running it, or deleted by hand) sends the shell back to the real file instead of
+ * re-creating an empty folder; a stale flag for a different active file is dropped.
+ */
+function reconcileSandboxConfig() {
+  const cfg = loadConfig();
+  const sb = cfg.sandbox;
+  if (!sb || typeof sb !== 'object') return;
+  if (typeof sb.dir !== 'string' || typeof sb.realDir !== 'string' || cfg.dataDir !== sb.dir) {
+    saveConfig({ sandbox: null });
+    return;
+  }
+  if (!fs.existsSync(sb.dir) || !companyFile.readSandboxMarker(sb.dir)) {
+    saveConfig({ dataDir: sb.realDir, sandbox: null });
+  }
+}
+
+function samePath(a, b) {
+  const na = path.resolve(a);
+  const nb = path.resolve(b);
+  return process.platform === 'win32' ? na.toLowerCase() === nb.toLowerCase() : na === nb;
+}
+
+ipcMain.handle('sandbox:entered', (e, dir) => {
+  if (!fromLocalApp(e) || typeof dir !== 'string' || !dir) return false;
+  const marker = companyFile.readSandboxMarker(dir);
+  // Only a sandbox copy of the file this shell has open (the server just made it).
+  if (!marker || marker.kind !== 'sandbox') return false;
+  if (!isDev && !samePath(marker.realDataDir, activeCompanyDir())) return false;
+  saveConfig({ dataDir: dir, sandbox: { dir, realDir: marker.realDataDir } });
+  setImmediate(() => {
+    app.relaunch();
+    app.quit();
+  });
+  return true;
+});
+
+ipcMain.handle('sandbox:left', (e, opts) => {
+  if (!fromLocalApp(e)) return false;
+  const sb = loadConfig().sandbox;
+  if (!sb || typeof sb.realDir !== 'string') return false;
+  saveConfig({ dataDir: sb.realDir, sandbox: null });
+  const trainingDir = opts && typeof opts.trainingDir === 'string' ? opts.trainingDir : null;
+  const kept = trainingDir ? companyFile.readSandboxMarker(trainingDir) : null;
+  // A kept training file shows up under File > Recent Companies (it opens like any other file).
+  if (kept && kept.kind === 'training') rememberRecentCompany(trainingDir);
+  rememberRecentCompany(sb.realDir);
+  setImmediate(() => {
+    app.relaunch();
+    app.quit();
+  });
+  return true;
+});
+
+/** File / Help menu: one click "Try it on a copy" (or "Leave the sandbox" while in one). */
+function sandboxMenuItem() {
+  const sb = sandboxActive();
+  if (sb && sb.kind === 'sandbox') return { label: 'Leave the Sandbox…', click: () => navigate('/sandbox') };
+  if (sb) return { label: 'About This Training File…', click: () => navigate('/sandbox') };
+  return {
+    label: 'Try It on a Copy (Sandbox)',
+    enabled: !remoteHostOrigin,
+    click: () => mainWindow?.webContents.send('menu', 'sandbox-start'),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Scheduled auto-backups run inside the server process (lib/services/backupSchedule.ts) on the
 // company file's own schedule (Back Up & Restore page). The legacy config.json
 // backupIntervalHours only seeds that schedule for files that have none yet.
+// Not from a sandbox / training file: createWindow does not start the scheduler there, and the
+// server skips scheduled backups of such a copy (backupSchedule.ts) whoever starts the timer.
 // ---------------------------------------------------------------------------
 
 /** BKA_BACKUP_INTERVAL_HOURS for the server ('' when config.json does not set one). */
@@ -374,6 +474,9 @@ async function startNextServer() {
       PORT: String(port),
       HOSTNAME: '127.0.0.1',
       BKA_DATA_DIR: activeCompanyDir(),
+      // Sandbox mode: where "Try it on a copy" puts copies, and the PDF "SANDBOX" stamp flag.
+      BKA_SANDBOX_ROOT: sandboxRoot(),
+      BKA_SANDBOX: sandboxActive() ? '1' : '',
       BKA_MIGRATIONS_DIR: path.join(process.resourcesPath, 'app', 'drizzle'),
       // Offline desktop build: the server is bound to 127.0.0.1 only, so it is safe to
       // surface a password-reset token directly in the local HTTP response.
@@ -585,6 +688,10 @@ function hostingStatus() {
 /** Start/stop sharing this company file on the tailnet. Never available in client mode. */
 async function setHosting(enable, { quiet = false } = {}) {
   if (remoteHostOrigin) return hostingStatus();
+  if (enable && sandboxActive()) {
+    if (!quiet) dialog.showErrorBox('Not available in the sandbox', 'Leave the sandbox to share your company file with other people.');
+    return hostingStatus();
+  }
   const cfg = hostingConfig();
   if (enable && !hostingState) {
     try {
@@ -737,7 +844,7 @@ function buildMenu() {
           label: 'Host multi-user access',
           type: 'checkbox',
           checked: Boolean(hostingState),
-          enabled: !remoteHostOrigin,
+          enabled: !remoteHostOrigin && !sandboxActive(),
           click: (item) => { setHosting(item.checked); },
         },
         { label: 'Open company on host…', click: () => { openOnHostFlow(); } },
@@ -745,6 +852,8 @@ function buildMenu() {
           ? [{ label: `Disconnect from ${new URL(remoteHostOrigin).hostname}`, click: () => disconnectFromHost() }]
           : []),
         { label: 'Multi-user status…', click: () => navigate('/multi-user') },
+        { type: 'separator' },
+        sandboxMenuItem(),
         { type: 'separator' },
         { label: 'Import Bank File…', click: () => mainWindow?.webContents.send('menu', 'import') },
         { label: 'Migrate from QuickBooks…', click: () => navigate('/qb-import') },
@@ -786,6 +895,7 @@ function buildMenu() {
       label: 'Help',
       submenu: [
         { label: 'Run Setup Interview…', click: () => navigate('/onboarding') },
+        sandboxMenuItem(),
         { type: 'separator' },
         { label: 'Check for Updates…', click: () => { checkForUpdates({ manual: true }); } },
         { label: 'Ironbooks on the web', click: () => shell.openExternal('https://github.com/RealDealCPA-VR/Ironbooks') },
@@ -809,6 +919,7 @@ async function createWindow() {
     return n.ok ? n : null;
   })();
   remoteHostOrigin = remote ? remote.origin : null;
+  if (!remoteHostOrigin) reconcileSandboxConfig();
   const url = remote ? remote.url : await startNextServer();
   serverUrl = url;
 
@@ -874,12 +985,19 @@ async function createWindow() {
   const activeDir = activeCompanyDir();
   companyFile.ensureManifest(activeDir);
   companyFile.writeManifest(activeDir, { lastOpenedAt: new Date().toISOString() });
-  rememberRecentCompany(activeDir);
+  const inSandbox = Boolean(sandboxActive());
+  // A sandbox copy is not a company file to come back to (a kept training file is added to
+  // Recent Companies when it is kept).
+  if (!inSandbox) rememberRecentCompany(activeDir);
   buildMenu();
   runDueRecurring(url);
-  scheduleBackgroundJobs(url);
+  if (!inSandbox) {
+    // Sandbox mode: no auto-backups (the server-side backup scheduler is started from
+    // scheduleBackgroundJobs), scheduled reports or multi-user hosting from a practice copy.
+    scheduleBackgroundJobs(url);
+    if (hostingConfig().enabled) setHosting(true, { quiet: true });
+  }
   refreshRendererAllowlist();
-  if (hostingConfig().enabled) setHosting(true, { quiet: true });
 
   // Deliver a double-clicked .bka after the renderer has had a moment to mount the
   // DesktopBridge listener (loadURL resolves at load, React hydrates just after).
@@ -1180,6 +1298,11 @@ async function checkForUpdates({ manual = false } = {}) {
     if (manual) updateDialog('Update checks are off in development builds.');
     return;
   }
+  // Sandbox mode: no update prompts while practising on a copy (checked again after leaving).
+  if (sandboxActive()) {
+    if (manual) updateDialog('Update checks are paused in the sandbox.', 'Leave the sandbox to check for updates.');
+    return;
+  }
   // Already found / downloading / staged: just show the banner again.
   if (['available', 'downloading', 'ready'].includes(updateState.state)) {
     if (manual) mainWindow?.webContents.send('update', { ...updateState, reshow: true });
@@ -1227,6 +1350,7 @@ ipcMain.handle('app:downloadUpdate', () => {
 // Returns false if no update is staged (the UI then tells the user to restart manually).
 ipcMain.handle('app:quitAndInstall', () => {
   if (!autoUpdater || updateState.state !== 'ready') return false;
+  if (sandboxActive()) return false; // sandbox mode: no installs from a practice copy
   // Defer so the IPC reply is sent before the app tears down; relaunch after install.
   setImmediate(() => {
     try {

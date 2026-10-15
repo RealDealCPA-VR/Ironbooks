@@ -48,6 +48,15 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     switch: (dir) => ipcRenderer.invoke('company:switch', dir),
     setProtected: (val) => ipcRenderer.invoke('company:setProtected', val),
   },
+  /**
+   * Sandbox mode ("Try it on a copy"): after the local server made the copy (POST /api/sandbox)
+   * or left it, tell the shell so it relaunches into the right company file with its sandbox flag.
+   * Resolve false when the shell refused (the page then just reloads).
+   */
+  sandbox: {
+    entered: (dir) => ipcRenderer.invoke('sandbox:entered', dir),
+    left: (opts) => ipcRenderer.invoke('sandbox:left', opts || {}),
+  },
   /** Multi-user hosting (QB Enterprise "Host multi-user access") — see electron/hosting.js. */
   hosting: {
     status: () => ipcRenderer.invoke('hosting:status'),

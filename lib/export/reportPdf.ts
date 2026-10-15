@@ -8,6 +8,7 @@
  * Supports portrait and landscape US Letter.
  */
 import { PDFDocument, PDFFont, PDFPage, StandardFonts, rgb } from 'pdf-lib';
+import { stampSandbox } from '@/lib/pdf/sandboxStamp';
 
 export interface PdfColumn {
   header: string;
@@ -195,5 +196,6 @@ export async function buildReportPdf(input: ReportPdfInput): Promise<Uint8Array>
     p.drawText(generated, { x: MARGIN, y: MARGIN / 2, size: 8, font, color: GRAY });
   });
 
+  await stampSandbox(doc); // printed from a sandbox copy: stamped SANDBOX
   return doc.save();
 }

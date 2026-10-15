@@ -46,6 +46,7 @@
  */
 
 import { PDFDocument, StandardFonts, rgb, PageSizes, type PDFFont, type PDFPage } from 'pdf-lib';
+import { stampSandbox } from './sandboxStamp';
 import { Money } from '@/lib/money';
 import {
   CHECKS_PER_STANDARD_SHEET,
@@ -325,6 +326,7 @@ export async function renderChecksPdf(checks: CheckPdfData[], settings: CheckRen
       slot,
     });
   }
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }
 

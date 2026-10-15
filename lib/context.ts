@@ -24,6 +24,7 @@ import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
 import { PASSWORD_CHANGE_REQUIRED_MESSAGE } from '@/lib/passwordPolicy';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
+import { ensureSandboxEnvSynced } from '@/lib/services/sandboxState';
 
 export const COMPANY_COOKIE = 'bka_company';
 
@@ -135,6 +136,8 @@ export async function getSessionGate(opts: SessionGateOptions = {}): Promise<Ses
 }
 
 export async function getServerContext(): Promise<ServiceContext> {
+  // PDFs printed from a sandbox / training file are stamped (lib/pdf/sandboxStamp.ts).
+  ensureSandboxEnvSynced();
   const db = await getDb();
 
   await assertFileUnlocked(db);

@@ -8,6 +8,7 @@
  */
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
 import type { OpenItemStatement } from '@/lib/services/statements';
+import { stampSandbox } from '@/lib/pdf/sandboxStamp';
 
 function fmt(value: string | number): string {
   const n = typeof value === 'string' ? parseFloat(value) : value;
@@ -188,6 +189,7 @@ export async function renderOpenItemStatementPdf(
     x: Math.max(MARGIN_L, (PAGE_W - ftW) / 2), y: FOOTER_Y, font: regular, size: 8, color: COLOR_GRAY,
   });
 
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }
 

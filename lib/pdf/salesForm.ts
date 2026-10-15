@@ -8,6 +8,7 @@
  * continues on a new page when it runs out of room.
  */
 import { PDFDocument, PageSizes, StandardFonts, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
+import { stampSandbox } from './sandboxStamp';
 
 export interface SalesShippingInfo {
   shipDate?: string | null;
@@ -243,5 +244,6 @@ export async function renderSalesFormPdf(data: SalesFormPdfData): Promise<Uint8A
   for (const p of pdfDoc.getPages()) {
     p.drawLine({ start: { x: MARGIN_L, y: 32 }, end: { x: MARGIN_R, y: 32 }, thickness: 0.5, color: COLOR_LIGHT });
   }
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }

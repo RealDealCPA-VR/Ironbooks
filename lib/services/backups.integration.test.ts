@@ -64,6 +64,7 @@ import { currentFingerprint } from './backupFingerprint';
 import { isSchedulerRunning, runScheduledBackupIfDue, runVersionedBackup, stopBackupScheduler } from './backupSchedule';
 import { PREVIEW_DIR_PREFIX, previewBackup } from './backupPreview';
 import { trialBalance } from './reports';
+import { SANDBOX_MARKER, SANDBOX_MARKER_SCHEMA, writeSandboxMarker } from './sandboxState';
 import type { ServiceContext } from './_base';
 import { GET as fullBackupGET } from '@/app/api/backup/route';
 import { GET as companyBackupGET } from '@/app/api/backup/company/route';
@@ -230,6 +231,31 @@ describe('backups you can see and trust', () => {
       const b = runVersionedBackup('scheduled', { dataDir: TEST_DIR, force: true });
       const [ra, rb] = await Promise.all([a, b]);
       expect(ra).toBe(rb); // the second call joined the running one
+    });
+
+    it('sandbox / training copy: no versioned, scheduled or quit-time backup (its history is a copy of the real one)', async () => {
+      writeSandboxMarker(TEST_DIR, {
+        schema: SANDBOX_MARKER_SCHEMA,
+        kind: 'sandbox',
+        realDataDir: path.join(ROOT, 'real'),
+        sourceName: 'Backup Bakery',
+        createdAt: new Date().toISOString(),
+      });
+      try {
+        const before = history().length;
+        await postSale('5.00', '2026-04-03');
+        expect(await runScheduledBackupIfDue({ dataDir: TEST_DIR, now: new Date(Date.now() + 100 * HOUR) })).toBe('off');
+        await expect(runVersionedBackup('manual', { dataDir: TEST_DIR, force: true })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+        as(null, 'POST', '/api/dashboard/auto-backup');
+        const headers = { 'x-bka-internal': 'team-backups-internal-token' };
+        for (const q of ['?save=1', '?start=1', '']) {
+          const res = await autoBackupPOST(req(`/api/dashboard/auto-backup${q}`, { method: 'POST', headers }));
+          expect(res.status).toBe(403);
+        }
+        expect(history().length).toBe(before);
+      } finally {
+        fs.rmSync(path.join(TEST_DIR, SANDBOX_MARKER), { force: true });
+      }
     });
 
     it('the history and settings files never travel inside a backup', async () => {

@@ -623,6 +623,15 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/attention/state': kind('member', 'POST'),
   '/api/attention/invoice-reminder': r('customers', 'POST:print'), // like /api/invoices/[id]/email
   '/api/attention/backup': r('file_utilities', 'POST:create'), // + file Admin (service), like /api/backup
+  // Sandbox mode ("Try it on a copy", lib/services/sandbox.ts): copying / switching the whole file
+  // is a file utility (the service also requires an Admin of every company); leaving is checked
+  // against the REAL file's admins by the service, so it is open to any member of the copy; the
+  // banner flag is public so it shows on the sign-in page of a sandbox too.
+  '/api/sandbox': r('file_utilities', 'GET POST'),
+  '/api/sandbox/status': kind('public', 'GET'),
+  '/api/sandbox/discard': kind('member', 'POST'),
+  '/api/sandbox/keep': kind('member', 'POST'),
+  '/api/sandbox/leftovers/[id]': r('file_utilities', 'POST:create DELETE'),
 };
 
 const ANY_REPORT: Area[] = [
@@ -782,6 +791,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/reports/pivot': 'reports_financial',
   '/reports/schedules': 'file_utilities',
   '/find': 'reports_financial',
+  '/sandbox': 'file_utilities', // Try it on a copy
 };
 
 // ---------------------------------------------------------------------------

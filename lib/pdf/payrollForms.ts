@@ -14,6 +14,7 @@
 
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
 import type { Form941Lines } from '@/lib/services/payrollReports';
+import { stampSandbox } from './sandboxStamp';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -298,6 +299,7 @@ export async function renderW2Pdf(input: W2PdfInput): Promise<Uint8Array> {
   const ftW = regular.widthOfTextAtSize(footerStr, 7);
   page.drawText(footerStr, { x: (PAGE_W - ftW) / 2, y: cursor, font: regular, size: 7, color: C_GRAY });
 
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }
 
@@ -504,6 +506,7 @@ export async function render941Pdf(input: Form941PdfInput): Promise<Uint8Array> 
     p.drawText(footer, { x: (PAGE_W - w) / 2, y: 32, font: regular, size: 7, color: C_GRAY });
   }
 
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }
 
@@ -724,6 +727,7 @@ export async function render940Pdf(input: Form940PdfInput): Promise<Uint8Array> 
   const ftW940 = regular.widthOfTextAtSize(footerStr940, 7);
   page.drawText(footerStr940, { x: (PAGE_W - ftW940) / 2, y: cursor, font: regular, size: 7, color: C_GRAY });
 
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }
 
@@ -864,5 +868,6 @@ export async function renderW3Pdf(input: W3PdfInput): Promise<Uint8Array> {
   const ftWW3 = regular.widthOfTextAtSize(footerStrW3, 7);
   page.drawText(footerStrW3, { x: (PAGE_W - ftWW3) / 2, y: cursor, font: regular, size: 7, color: C_GRAY });
 
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }

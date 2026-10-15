@@ -17,6 +17,7 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { getNetworkPolicy } from '@/lib/services/networkPolicy';
 import { decideOutbound, isOutboundPurpose } from '@/lib/net/policy';
+import { applySandboxToDecision } from '@/lib/services/sandboxState';
 
 async function internalContext(
   req: NextRequest,
@@ -49,7 +50,8 @@ export async function GET(req: NextRequest) {
     }
     const ctx = (await internalContext(req)) ?? (await getServerContext());
     // A question, not a connection — decided without adding to the outbound activity log.
-    return NextResponse.json(decideOutbound(await getNetworkPolicy(ctx), url, purpose));
+    // Sandbox mode: update checks / bank feeds / email are off in a practice copy.
+    return NextResponse.json(applySandboxToDecision(decideOutbound(await getNetworkPolicy(ctx), url, purpose)));
   } catch (err) {
     if (err instanceof ServiceError) {
       const status = err.code === 'FORBIDDEN' ? 403 : err.code === 'VALIDATION' ? 400 : 500;
