@@ -172,6 +172,8 @@ interface PaymentDetail extends Payment {
   journalApplications?: Array<{ kind: string; journalLineId: string; invoiceId: string | null; amount: string }>;
   /** P1: General Journal credits it applied to General Journal charges. */
   journalOffsets?: Array<{ journalLineId: string; chargeLineId: string; amount: string }>;
+  /** C1: the bank deposit this payment is in (edits must keep the amount, or take it out). */
+  deposit?: { id: string; date: string; total: string } | null;
 }
 
 /** I11: an open General Journal A/R line (a charge to pay, or a credit to apply). */
@@ -246,6 +248,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   const [journalAmounts, setJournalAmounts] = useState<Record<string, string>>({});
 
   const [saving, setSaving] = useState(false);
+  // C1: editing a payment that is already in a bank deposit.
+  const [removeFromDeposit, setRemoveFromDeposit] = useState(false);
 
   const depositAccounts = depositTargets(accounts);
   const discountAccounts = accounts.filter((a) => a.type === 'revenue' || a.type === 'expense');
@@ -305,6 +309,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     // Preferences > Payments auto-apply / auto-calculate never overwrite an edited payment's amounts.
     setAmountTouched(!!editing);
     setAppsTouched(!!editing);
+    setRemoveFromDeposit(false);
   }, [open, editing, today]);
 
   useEffect(() => {
@@ -612,6 +617,10 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
 
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
+    if (depositBlocked) {
+      toast('This payment is in a bank deposit. Keep the amount, or tick "Take it out of the deposit" to save this change.', 'danger');
+      return;
+    }
     if (!date) { toast('Please enter a date.', 'danger'); return; }
     const amt = Number(amount || 0);
     if (amt < 0) { toast('The amount received cannot be negative.', 'danger'); return; }
@@ -673,6 +682,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       journalOffsets,
       // C4: earlier unapplied payments, on a new payment AND while editing (no longer dropped).
       paymentCredits: paymentCreditApps,
+      ...(depositChange && removeFromDeposit ? { removeFromDeposit: true } : {}),
     };
     setSaving(true);
     try {
@@ -691,6 +701,18 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       setSaving(false);
     }
   }
+
+  // C1: a deposited payment keeps its amount, customer, currency and Undeposited Funds; changing
+  // any of them needs it taken out of the deposit first (done in the same save).
+  const inDeposit = editing?.deposit ?? null;
+  const depositChange =
+    !!inDeposit &&
+    !!editing &&
+    (Number(amount || 0).toFixed(2) !== Number(editing.amount).toFixed(2) ||
+      customerId !== editing.customerId ||
+      currency !== (editing.currency ?? '').toUpperCase() ||
+      (depositAccountId || '') !== (editing.depositAccountId ?? '') && !!depositAccountId);
+  const depositBlocked = depositChange && !removeFromDeposit;
 
   const homeValue = foreign && Number(amount) > 0 && Number(exchangeRate) > 0 ? Number(amount) * Number(exchangeRate) : null;
 
@@ -716,6 +738,33 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
             Saving changes re-posts this payment so your books stay balanced. Invoices get their old
             amounts back first, then the new amounts are applied.
+          </div>
+        )}
+        {inDeposit && (
+          <div
+            role="status"
+            className="rounded-lg bg-blue-50 border border-blue-200 px-3 py-2 text-xs text-blue-900 space-y-2"
+          >
+            <p>
+              This payment is part of the bank deposit made on {inDeposit.date.slice(0, 10)}. You can
+              apply it to different invoices and change the date (up to the deposit date), method,
+              reference and memo. The amount must stay {formatCurrency(editing!.amount)}.
+            </p>
+            {depositChange && (
+              <label className="flex items-start gap-2 font-medium">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={removeFromDeposit}
+                  onChange={(e) => setRemoveFromDeposit(e.target.checked)}
+                />
+                <span>
+                  Take it out of the deposit so this change can be saved. The deposit keeps its other
+                  items (a deposit with nothing else in it is voided), and the payment goes back to
+                  Undeposited Funds to be deposited again.
+                </span>
+              </label>
+            )}
           </div>
         )}
         {/* Customer + currency */}

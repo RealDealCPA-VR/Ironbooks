@@ -86,6 +86,11 @@ export const receivePaymentSchema = z.object({
   currency: z.string().trim().length(3, 'currency must be a 3-letter ISO 4217 code').nullish(),
   /** FX rates carry more than 2 decimal places. */
   exchangeRate: zDecimalPositive.nullish(),
+  /**
+   * Edit only (C1): the payment is in a bank deposit and its amount changes — take it out of the
+   * deposit (the rest of the deposit stays) and save the edit, in one step.
+   */
+  removeFromDeposit: z.boolean().optional(),
 });
 export type ReceivePaymentBody = z.infer<typeof receivePaymentSchema>;
 

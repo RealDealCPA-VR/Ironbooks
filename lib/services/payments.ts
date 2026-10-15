@@ -51,6 +51,7 @@ import { assertPeriodOpen } from './fiscalPeriods';
 import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
 import { docRef } from './docNumbers';
+import { removePaymentFromDeposit } from './deposits';
 import { computeDiscount, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
 import { getHomeCurrencyCode } from './currencies';
 import {
@@ -146,6 +147,12 @@ export interface ReceivePaymentInput {
    * (no GL — both lines sit in A/R). QB lets any open credit be applied to any open charge.
    */
   journalOffsets?: JournalOffsetInput[] | null;
+  /**
+   * Edit only (C1): the payment is in a bank deposit and its amount (or customer, currency,
+   * deposit account) changes — take it out of the deposit first, then save the edit. Without it
+   * such an edit is refused; edits that keep the amount never need it.
+   */
+  removeFromDeposit?: boolean;
 }
 
 export interface PaymentCreditFromPaymentInput {
@@ -1121,7 +1128,10 @@ export async function getPayment(ctx: ServiceContext, id: string) {
   // P1: General Journal credits it applied to General Journal charges (credit line -> charge line).
   const journalOffsets = await journalOffsetsOf(ctx, { paymentId: id });
 
-  return { ...payment, applications, credits, journalApplications, journalOffsets, bounced: bounced ?? null };
+  // C1: the bank deposit it is in (an edit then has to keep the amount).
+  const deposit = await paymentDepositOf(ctx, id);
+
+  return { ...payment, applications, credits, journalApplications, journalOffsets, bounced: bounced ?? null, deposit };
 }
 
 // ---- Corrections: void / unapply / apply-later / refund -----------------------
@@ -1233,6 +1243,7 @@ async function assertPaymentReversible(
   ctx: ServiceContext,
   payment: { id: string; bouncedAt: Date | null },
   verb: 'voided' | 'edited',
+  opts: { allowDeposited?: boolean } = {},
 ) {
   if (payment.bouncedAt) {
     throw new ServiceError(
@@ -1240,13 +1251,9 @@ async function assertPaymentReversible(
       `This payment was recorded as a bounced check, so it cannot be ${verb}.`,
     );
   }
-  // Guard: payment already swept into a deposit (a void deposit releases it again).
-  const [deposited] = await ctx.db
-    .select({ id: depositLines.id })
-    .from(depositLines)
-    .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
-    .where(and(eq(depositLines.paymentId, payment.id), isNull(deposits.voidedAt)))
-    .limit(1);
+  // Guard: payment already swept into a deposit (a void deposit releases it again). An edit that
+  // keeps the deposited amount is checked by assertDepositedEditAllowed instead (C1).
+  const deposited = opts.allowDeposited ? null : await paymentDepositOf(ctx, payment.id);
   if (deposited) {
     throw new ServiceError(
       'CONFLICT',
@@ -1270,6 +1277,76 @@ async function assertPaymentReversible(
     throw new ServiceError(
       'CONFLICT',
       `Part of this payment was refunded to the customer, so it cannot be ${verb}. Void the refund first.`,
+    );
+  }
+}
+
+/** The (non-void) bank deposit a received payment was swept into, or null. */
+export async function paymentDepositOf(
+  ctx: ServiceContext,
+  paymentId: string,
+): Promise<{ id: string; date: Date; total: string } | null> {
+  const [row] = await ctx.db
+    .select({ id: deposits.id, date: deposits.date, total: deposits.total })
+    .from(depositLines)
+    .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
+    .where(
+      and(
+        eq(depositLines.paymentId, paymentId),
+        eq(deposits.companyId, ctx.companyId),
+        isNull(deposits.voidedAt),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
+}
+
+const ymd = (d: Date) => new Date(d).toISOString().slice(0, 10);
+
+/**
+ * C1: what may change on a payment that is already in a bank deposit (QB lets you re-apply it,
+ * change the date, method, reference and memo). The deposit took exactly this amount out of
+ * Undeposited Funds, so the edit must put the same home amount back there: same amount, currency,
+ * exchange rate and "Deposit to" account (Undeposited Funds), same customer, dated on or before
+ * the deposit. Anything else is refused with a plain message (details.canRemoveFromDeposit tells
+ * the form it can offer "take it out of the deposit and save").
+ */
+async function assertDepositedEditAllowed(
+  ctx: ServiceContext,
+  payment: typeof paymentsReceived.$inferSelect,
+  deposit: { id: string; date: Date },
+  input: ReceivePaymentInput,
+) {
+  const on = ymd(deposit.date);
+  const refuse = (why: string) =>
+    new ServiceError(
+      'CONFLICT',
+      `This payment is part of the bank deposit made on ${on}, so ${why} To change that, take the payment out of the deposit (Save with "Remove from deposit"), or edit the deposit first.`,
+      { deposited: true, depositId: deposit.id, canRemoveFromDeposit: true },
+    );
+  if (!Money.round2(input.amount).equals(Money.round2(payment.amount))) {
+    throw refuse(`its amount must stay ${toAmountString(payment.amount)}.`);
+  }
+  if (input.customerId !== payment.customerId) {
+    throw refuse('it must stay with the same customer.');
+  }
+  const { currency, rate } = await resolvePaymentCurrency(ctx, {
+    currency: input.currency,
+    exchangeRate: input.exchangeRate,
+  });
+  const oldCurrency = await normalizeCurrency(ctx, payment.currency);
+  if (currency !== oldCurrency || !rate.equals(Money.of(payment.exchangeRate ?? 1))) {
+    throw refuse('its currency and exchange rate cannot change.');
+  }
+  const depositTo = input.depositAccountId ?? (await getUndepositedFundsId(ctx));
+  if (depositTo !== payment.depositAccountId) {
+    throw refuse('it must stay in Undeposited Funds (the deposit moved it to the bank).');
+  }
+  if (ymd(input.date) > on) {
+    throw new ServiceError(
+      'CONFLICT',
+      `This payment is part of the bank deposit made on ${on}, so its date cannot be later than the deposit date.`,
+      { deposited: true, depositId: deposit.id },
     );
   }
 }
@@ -1402,9 +1479,20 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
     .where(and(eq(paymentsReceived.id, id), eq(paymentsReceived.companyId, ctx.companyId)));
   if (!payment) throw notFound('Payment');
   if (payment.voidedAt) throw new ServiceError('CONFLICT', 'Cannot edit a voided payment.');
-  await assertPaymentReversible(ctx, payment, 'edited');
+  // C1: a deposited payment can still be re-applied / re-dated (same amount); otherwise it has to
+  // come out of the deposit first, which removeFromDeposit does inside the same transaction.
+  const deposit = await paymentDepositOf(ctx, id);
+  const takeOut = !!deposit && input.removeFromDeposit === true;
+  // A deposited foreign payment keeps its stored rate unless one is typed (the list rate may have
+  // moved since, which would change the home amount the deposit took out of Undeposited Funds).
+  if (deposit && !takeOut && (input.exchangeRate === undefined || input.exchangeRate === null || String(input.exchangeRate).trim() === '')) {
+    input = { ...input, exchangeRate: payment.exchangeRate };
+  }
+  if (deposit && !takeOut) await assertDepositedEditAllowed(ctx, payment, deposit, input);
+  await assertPaymentReversible(ctx, payment, 'edited', { allowDeposited: !!deposit });
 
   return inTransaction(ctx, async (tx) => {
+    if (deposit && takeOut) await removePaymentFromDeposit(tx, deposit.id, id);
     const oldCredits = await tx.db
       .select({ creditMemoId: creditApplications.creditMemoId, invoiceId: creditApplications.invoiceId, amount: creditApplications.amount })
       .from(creditApplications)
@@ -1427,8 +1515,9 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
         postedEntryId: payment.postedEntryId,
         applications: oldApps.map((a) => ({ invoiceId: a.invoiceId, amountApplied: a.amountApplied, discountAmount: a.discountAmount })),
         credits: oldCredits,
+        depositId: deposit?.id ?? null,
       },
-      newValues: { action: 'edit' },
+      newValues: { action: 'edit', ...(deposit ? { deposit: takeOut ? 'removed' : 'kept' } : {}) },
     });
     // C4: earlier unapplied payments picked while editing are applied too (they used to be
     // dropped silently). They are applied from their own payment, exactly as on a new payment.
