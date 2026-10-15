@@ -100,7 +100,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/credit-memos': {
     title: 'Credit Memos',
     what: 'Give a customer a credit (for a return or a mistake) that lowers what they owe, or refund them.',
-    first: 'Click "New credit memo", pick the customer and add what you are crediting. Prices follow the price level set on the customer, like on invoices.',
+    first: 'Click "New credit memo", pick the customer and add what you are crediting. Prices follow the price level set on the customer.',
     qb: 'Create Credit Memos/Refunds',
   },
   '/leads': {

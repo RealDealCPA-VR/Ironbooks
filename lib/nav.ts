@@ -241,7 +241,6 @@ export const simpleNavGroups: NavGroup[] = [
     links: [
       { icon: Home, label: 'Home', path: '/dashboard', qb: 'Home page', keywords: 'dashboard start' },
       { icon: Inbox, label: 'Needs attention', path: '/attention', qb: 'Company Snapshot alerts', keywords: 'inbox alerts urgent caught up' },
-      { icon: ClipboardCheck, label: 'To Do list', path: '/todos', qb: 'To Do List', keywords: 'task reminder' },
       { icon: ScanLine, label: 'Receipts', path: '/receipts', qb: 'Doc Center (receipts)', keywords: 'receipt photo scan snap phone' },
     ],
   },
