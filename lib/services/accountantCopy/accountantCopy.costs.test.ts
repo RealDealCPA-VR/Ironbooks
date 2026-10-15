@@ -36,7 +36,9 @@ import { startReconciliation } from '../reconcile';
 import { trialBalance } from '../reports';
 import { createAccountantCopy, importChangesFile, reviewChangesFile } from './client';
 import { accountantChanges, exportChangesFile, openAccountantCopyFile } from './accountant';
-import { parseChangesFile } from './format';
+import { parseChangesFile, serializeChangesFile } from './format';
+import { averageAfter } from './inventoryCost';
+import Decimal from 'decimal.js';
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-acctcopy-costs');
 const CLIENT_DIR = path.join(ROOT, 'client');
@@ -171,6 +173,53 @@ describe("Accountant's Copy — inventory costed as in the accountant's file", (
     // Client now: 18 Widgets worth $280 (8 at $10 + 10 at $20) → average $15.5556.
     expect(inv.note).toMatch(/Inventory cost \$20\.00 is kept from your accountant's file \(your current average cost would make it \$31\.11\)/);
     expect(review.items.find((i) => i.key === `credit_memo:add:${N.cm}`)?.after?.join(' ')).toMatch(/restocked at \$10\.00/);
+  });
+
+  it('client: a tampered inventory cost is refused before anything is applied, naming the change', async () => {
+    const { sha256: _s, ...body } = parseChangesFile(changes);
+    type Line = { cost?: string; restock?: boolean; itemId?: string | null };
+    const docAfter = (b: typeof body, id: string) => (b.documents.find((x) => x.id === id) as unknown as { after: { lines: Line[]; total: string } }).after;
+    const tamper = (mutate: (b: typeof body) => void) => {
+      const copy = JSON.parse(JSON.stringify(body)) as typeof body;
+      mutate(copy);
+      return serializeChangesFile(copy);
+    };
+    const parseCases: Array<[Buffer, RegExp]> = [
+      // A negative restock cost (it skipped the GL entry yet moved the item's average and value).
+      [tamper((b) => { docAfter(b, N.cm).lines[0].cost = '-50.00'; }), /line 1 of the new credit memo #CM-10 dated 2026-03-12 has a negative inventory cost \(-50\.00\)/],
+      [tamper((b) => { docAfter(b, N.inv).lines[0].cost = '-0.01'; }), /line 1 of the new invoice #AC-10 dated 2026-03-10 has a negative inventory cost/],
+      // A negative removal value.
+      [
+        tamper((b) => { (b.documents.find((x) => x.type === 'inventory_adjustment') as unknown as { after: { total: string } }).after.total = '-10.00'; }),
+        /the new inventory adjustment dated 2026-03-15 has a negative value \(-10\.00\)/,
+      ],
+      // A cost on a credit memo line that does not restock, and on a line without an item.
+      [tamper((b) => { docAfter(b, N.cm).lines[0].restock = false; }), /line 1 of the new credit memo #CM-10 .* does not restock the item/],
+      [tamper((b) => { docAfter(b, N.estInv).lines[0].cost = '5.00'; }), /line 1 of the new invoice #AC-11 .* carries an inventory cost but no item/],
+    ];
+    for (const [file, message] of parseCases) {
+      await expect(reviewChangesFile(client.ctx, file)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(message) });
+      await expect(importChangesFile(client.ctx, file)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(message) });
+    }
+
+    // Well-formed but more than the client's whole stock is worth: refused on import (inside the
+    // transaction) instead of clamping the item's average to 0; nothing is applied.
+    const before = await tbByCode(client.ctx);
+    const huge = tamper((b) => { docAfter(b, N.sr).lines[0].cost = '100000.00'; });
+    await expect(importChangesFile(client.ctx, huge)).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/SR-10[\s\S]*more than the value of the item's stock in your file[\s\S]*below zero/),
+    });
+    expect(await tbByCode(client.ctx)).toEqual(before);
+    expect(await widgetValue(client.ctx, R.widget)).toEqual({ qty: '18.0000', value: '280.00' });
+  });
+
+  it('averageAfter refuses a value below zero (no clamping) and tolerates cent rounding', () => {
+    const D = (v: string) => new Decimal(v);
+    expect(() => averageAfter(D('2'), D('10'), D('1'), D('-25'))).toThrow(/below zero/);
+    expect(() => averageAfter(D('2'), D('10'), D('0'), D('-25'))).toThrow(/below zero/);
+    expect(averageAfter(D('3'), D('3.3333'), D('0'), D('-10.00')).toString()).toBe('3.3333');
+    expect(averageAfter(D('2'), D('10'), D('1'), D('-12')).toString()).toBe('8');
   });
 
   it('client: after the import the dividing-date trial balance equals the accountant’s, and everything equals the reference', async () => {

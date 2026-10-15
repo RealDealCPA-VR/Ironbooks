@@ -1231,6 +1231,26 @@ function describeTxn(t: TxnChange): string {
   return `${verb} ${what}${date}`;
 }
 
+/**
+ * An accountant's inventory cost may only value an inventory item's stock (parseChangesFile has
+ * already refused negative costs and costs on lines that neither sell nor restock).
+ */
+async function assertInventoryCostItems(ctx: ServiceContext, costs: Array<{ itemId: string }>): Promise<void> {
+  const ids = [...new Set(costs.map((c) => c.itemId))];
+  if (!ids.length) return;
+  const rows = await ctx.db
+    .select({ id: itemsTable.id, name: itemsTable.name, type: itemsTable.type })
+    .from(itemsTable)
+    .where(and(eq(itemsTable.companyId, ctx.companyId), inArray(itemsTable.id, ids)));
+  for (const id of ids) {
+    const it = rows.find((r) => r.id === id);
+    if (!it) throw validation('A line carries an inventory cost for an item that is not in your file.');
+    if (it.type !== 'inventory') {
+      throw validation(`A line carries an inventory cost for "${it.name}", which is not an inventory item.`);
+    }
+  }
+}
+
 /** One unit of the import: applied in its own savepoint so a refused step leaves nothing behind. */
 interface Step {
   label: string;
@@ -1463,7 +1483,9 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
         run: async (c) => {
           const input = await decodePayload(d.after, DOC_SHAPES[d.type], helpers(c));
           // Inventory lines are costed as the accountant's file costed them (inventoryCost.ts).
-          await withAccountantCosts(accountantCostsOf(d.type, input), async () => {
+          const costs = accountantCostsOf(d.type, input);
+          await assertInventoryCostItems(c, costs);
+          await withAccountantCosts(costs, async () => {
             if (d.op === 'add') {
               idMap.set(d.id, await createDoc(c, d.type, input));
             } else {

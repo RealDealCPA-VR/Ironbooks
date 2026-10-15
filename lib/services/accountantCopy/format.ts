@@ -19,6 +19,7 @@
  *    import creates), which are dates and which are General Journal line references.
  */
 import { createHash } from 'node:crypto';
+import Decimal from 'decimal.js';
 import { ServiceError } from '../errors';
 import { NAME_COLUMNS } from './digest';
 
@@ -336,7 +337,48 @@ export function parseChangesFile(buffer: Buffer): ChangesFile {
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(parsed.dividingDate ?? '')) throw notChanges('the dividing date is missing');
   if (!wellFormed(parsed)) throw notChanges('it is incomplete');
+  const costError = inventoryCostProblem(parsed.documents);
+  if (costError) {
+    throw new ServiceError('VALIDATION', `The changes file can't be imported: ${costError}. Nothing was imported.`);
+  }
   return parsed;
+}
+
+const COST_DOC_NAME: Partial<Record<DocType, string>> = {
+  invoice: 'invoice',
+  sales_receipt: 'sales receipt',
+  credit_memo: 'credit memo',
+  inventory_adjustment: 'inventory adjustment',
+};
+
+/**
+ * The accountant's inventory costs (a line's `cost`, a removal's `total`) are amounts the import
+ * values stock with, so they must make sense before anything is applied: never negative, and only
+ * on a line that sells an item (invoice, sales receipt) or restocks one (credit memo, restock
+ * ticked). Returns the failing change, described, or null.
+ */
+export function inventoryCostProblem(documents: DocChange[]): string | null {
+  for (const d of documents) {
+    if (d.op === 'void') continue;
+    const name = COST_DOC_NAME[d.type];
+    const ref = d.after.refNumber ? ` #${String(d.after.refNumber)}` : '';
+    const what = `the ${d.op === 'add' ? 'new' : 'changed'} ${name ?? d.type.replace(/_/g, ' ')}${ref} dated ${String(d.after.date).slice(0, 10)}`;
+    if (d.type === 'inventory_adjustment') {
+      if (isDec(d.after.total) && new Decimal(d.after.total).isNegative()) return `${what} has a negative value (${d.after.total})`;
+      continue;
+    }
+    const lines = Array.isArray(d.after.lines) ? (d.after.lines as Rec[]) : [];
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      if (l.cost === undefined || l.cost === null) continue;
+      const at = `line ${i + 1} of ${what}`;
+      if (!name) return `${at} carries an inventory cost, which only a sale or a credit memo restock can`;
+      if (!isId(l.itemId)) return `${at} carries an inventory cost but no item`;
+      if (d.type === 'credit_memo' && l.restock !== true) return `${at} carries an inventory cost but does not restock the item`;
+      if (isDec(l.cost) && new Decimal(l.cost).isNegative()) return `${at} has a negative inventory cost (${l.cost})`;
+    }
+  }
+  return null;
 }
 
 // ---- Structural checks (a file can pass its checksum and still be malformed) ----

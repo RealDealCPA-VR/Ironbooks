@@ -65,13 +65,28 @@ export function extrasBaselineSql(copyId: string, companyId: string) {
         FROM journal_item_applications a
        WHERE a.company_id = ${companyId}::uuid AND a.payment_id IS NULL AND a.bill_payment_id IS NULL`,
     sql`INSERT INTO accountant_copy_baseline (copy_id, entity_type, entity_id, version, digest, state)
-      SELECT ${copyId}::uuid, 'reconciliation', r.id, r.completed_at, NULL, r.status
+      SELECT ${copyId}::uuid, 'reconciliation', r.id, r.completed_at,
+             CASE WHEN r.status = 'in_progress' THEN ${sql.raw(RECON_MARKS_SQL)} END, r.status
         FROM reconciliations r JOIN bank_accounts b ON b.id = r.bank_account_id
        WHERE b.company_id = ${companyId}::uuid`,
   ];
 }
 
 type BaseRow = typeof accountantCopyBaseline.$inferSelect;
+
+/**
+ * 'YYYY-MM-DD|md5' (alias r: statement date, then a digest) of an in-progress reconciliation's statement and cleared marks. Kept in the
+ * baseline for reconciliations the client had already started, so the export can tell when the
+ * accountant changed their marks (which can't travel: the client's file holds its own session).
+ */
+const RECON_MARKS_SQL = `to_char(r.statement_date, 'YYYY-MM-DD') || '|' || md5(to_char(r.statement_date, 'YYYY-MM-DD') || '|' || r.statement_balance::text || '|' || COALESCE((
+    SELECT string_agg(i.journal_entry_line_id::text, ',' ORDER BY i.journal_entry_line_id::text)
+      FROM reconciliation_items i WHERE i.reconciliation_id = r.id AND i.is_cleared), ''))`;
+
+async function reconMarksDigest(ctx: ServiceContext, id: string): Promise<string | null> {
+  const res = await ctx.db.execute(sql`SELECT ${sql.raw(RECON_MARKS_SQL)} AS d FROM reconciliations r WHERE r.id = ${id}::uuid`);
+  return (res as unknown as { rows: Array<{ d: string | null }> }).rows[0]?.d ?? null;
+}
 
 // ---------------------------------------------------------------------------
 // Delta (accountant side)
@@ -271,6 +286,12 @@ export async function reconciliationChanges(
         warnings.push(
           `The reconciliation of the statement ending ${ymd(r.statementDate)} that was already in progress when this copy was made was finished in this copy. It can't be sent back: tell your client which transactions to clear, and they will finish it in their file.`,
         );
+      } else if (b.state === 'in_progress' && r.status === 'in_progress' && b.digest && (await reconMarksDigest(ctx, r.id)) !== b.digest) {
+        // The client's own unfinished reconciliation, still open here, with marks or the statement
+        // changed: the client's file keeps its own session, so these changes can't be sent back.
+        warnings.push(
+          `The reconciliation of the statement ending ${ymd(r.statementDate)} that was already in progress when this copy was made had transactions cleared or uncleared (or its statement changed) in this copy. Those changes can't be sent back: tell your client which transactions to clear, and they will finish it in their file.`,
+        );
       }
       continue;
     }
@@ -335,6 +356,15 @@ export async function reconciliationChanges(
         interestEarned,
       },
     });
+  }
+  // The client's unfinished reconciliations cancelled in the copy: the client's file still has them.
+  const current = new Set(rows.map((r) => r.id));
+  for (const [id, b] of baseRecon) {
+    if (current.has(id) || b.state !== 'in_progress') continue;
+    const ending = b.digest?.slice(0, 10);
+    warnings.push(
+      `The reconciliation${ending ? ` of the statement ending ${ending}` : ''} that was already in progress when this copy was made was cancelled in this copy. That can't be sent back: it is still in progress in your client's file, so tell your client whether to finish or cancel it.`,
+    );
   }
   // Undo newest first (Undo LAST Reconciliation), then the new ones in the order they were done.
   undos.sort((a, b) => b.statementDate.localeCompare(a.statementDate));

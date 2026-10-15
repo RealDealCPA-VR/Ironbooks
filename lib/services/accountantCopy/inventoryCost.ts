@@ -20,6 +20,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import Decimal from 'decimal.js';
+import { ServiceError } from '../errors';
 
 const scope = new AsyncLocalStorage<{ queues: Map<string, string[]> }>();
 
@@ -43,15 +44,30 @@ export function hasAccountantCost(itemId: string): boolean {
 export function takeAccountantCost(itemId: string): Decimal | null {
   const q = scope.getStore()?.queues.get(itemId);
   if (!q || !q.length) return null;
-  return new Decimal(q.shift()!);
+  const cost = new Decimal(q.shift()!);
+  // parseChangesFile already refuses these; kept here so no caller can value stock below zero.
+  if (cost.isNegative()) throw new ServiceError('VALIDATION', "The accountant's inventory cost for this line is negative.");
+  return cost;
 }
+
+/** Half a cent: what rounding the value to cents can leave below zero. */
+const ROUNDING = new Decimal('0.005');
 
 /**
  * Average cost after taking `cost` out of (qty, avg) stock and leaving `newQty` (removal), or after
  * adding `cost` for `newQty - qty` units (restock). Unchanged when nothing is left.
+ *
+ * Refuses (instead of clamping the average to 0) when the accountant's cost would leave the item's
+ * inventory value below zero: the item's value would no longer tie to the inventory account.
  */
 export function averageAfter(qty: Decimal, avg: Decimal, newQty: Decimal, valueChange: Decimal): Decimal {
-  if (newQty.lessThanOrEqualTo(0)) return avg;
   const value = qty.times(avg).plus(valueChange);
+  if (value.lessThan(ROUNDING.negated())) {
+    throw new ServiceError(
+      'VALIDATION',
+      `The accountant's inventory cost (${valueChange.abs().toFixed(2)}) is more than the value of the item's stock in your file (${qty.times(avg).toFixed(2)}), so it would leave the item's inventory value below zero.`,
+    );
+  }
+  if (newQty.lessThanOrEqualTo(0)) return avg;
   return value.isNegative() ? new Decimal(0) : value.dividedBy(newQty);
 }
