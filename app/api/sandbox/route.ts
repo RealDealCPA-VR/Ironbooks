@@ -8,10 +8,11 @@
  *                      Returns { dir, realDir, id, sourceName, createdAt }; the desktop shell then
  *                      relaunches into `dir` (window.bookkeeper.sandbox.entered).
  */
-import { NextResponse } from 'next/server';
+import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { routeError } from '@/lib/routeErrors';
 import { getSandboxStatus, startSandbox } from '@/lib/services/sandbox';
+import { heldUnlock, reissueUnlockCookie } from '@/lib/sandboxUnlock';
 
 export async function GET() {
   try {
@@ -22,10 +23,12 @@ export async function GET() {
   }
 }
 
-export async function POST() {
+export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    return NextResponse.json(await startSandbox(ctx), { status: 201 });
+    const held = await heldUnlock();
+    const res = NextResponse.json(await startSandbox(ctx), { status: 201 });
+    return reissueUnlockCookie(res, held, req.headers);
   } catch (err) {
     return routeError(err, 'sandbox');
   }

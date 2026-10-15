@@ -22,6 +22,7 @@ import { getSessionInfo, hasValidUnlockCookie } from '@/lib/auth';
 import { assertSessionAllowed } from '@/lib/services/sessions';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
+import { ensureSandboxEnvSynced } from '@/lib/services/sandboxState';
 
 export const COMPANY_COOKIE = 'bka_company';
 
@@ -117,6 +118,8 @@ export async function getSessionGate(): Promise<SessionGate> {
 }
 
 export async function getServerContext(): Promise<ServiceContext> {
+  // PDFs printed from a sandbox / training file are stamped (lib/pdf/sandboxStamp.ts).
+  ensureSandboxEnvSynced();
   const db = await getDb();
 
   await assertFileUnlocked(db);

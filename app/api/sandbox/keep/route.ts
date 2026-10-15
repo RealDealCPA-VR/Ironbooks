@@ -9,13 +9,15 @@ import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { invalidJsonBody, readJsonObject, routeError } from '@/lib/routeErrors';
 import { keepSandboxAsTraining } from '@/lib/services/sandbox';
+import { heldUnlock, reissueUnlockCookie } from '@/lib/sandboxUnlock';
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await readJsonObject(req);
     if (!body) return invalidJsonBody();
-    return NextResponse.json(await keepSandboxAsTraining(ctx, body.name));
+    const held = await heldUnlock();
+    return reissueUnlockCookie(NextResponse.json(await keepSandboxAsTraining(ctx, body.name)), held, req.headers);
   } catch (err) {
     return routeError(err, 'sandbox/keep');
   }

@@ -4,7 +4,8 @@
  *  - start / leave fail closed without a session; an accountant cannot start or leave;
  *  - the owner starts a sandbox (201), the public status flag turns on, the auto-backup route
  *    refuses while in the sandbox, keep validates the name, discard returns to the real file;
- *  - leftover routes resume and delete a copy.
+ *  - leftover routes resume and delete a copy, also when its id has a "%" ("50% Off LLC");
+ *  - a held file-password unlock is re-issued for the folder the server switched to.
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
@@ -17,7 +18,7 @@ const REAL = path.join(ROOT, 'Route Co.ironbooks');
 process.env.BKA_DATA_DIR = REAL;
 process.env.BKA_SANDBOX_ROOT = path.join(ROOT, 'sandboxes');
 
-const session = vi.hoisted(() => ({ userId: null as string | null, headers: new Map<string, string>() }));
+const session = vi.hoisted(() => ({ userId: null as string | null, headers: new Map<string, string>(), unlock: undefined as string | undefined }));
 vi.mock('@/lib/auth', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/auth')>();
   return {
@@ -27,7 +28,11 @@ vi.mock('@/lib/auth', async (importOriginal) => {
   };
 });
 vi.mock('next/headers', () => ({
-  cookies: async () => ({ get: () => undefined, set: () => undefined, delete: () => undefined }),
+  cookies: async () => ({
+    get: (name: string) => (name === 'bka_unlock' && session.unlock ? { name, value: session.unlock } : undefined),
+    set: () => undefined,
+    delete: () => undefined,
+  }),
   headers: async () => new Headers([...session.headers.entries()]),
 }));
 function route(method: string, routePath: string) {
@@ -37,6 +42,7 @@ function route(method: string, routePath: string) {
 
 import { closeDb, getDb, resolveDataDir } from '@/lib/db';
 import { userCompanies, users } from '@/lib/db/schema';
+import { UNLOCK_COOKIE, createUnlockToken, verifyUnlockToken } from '@/lib/auth';
 import { createCompany } from '@/lib/services/company';
 import { switchActiveDataDir } from '@/lib/services/sandbox';
 import { GET as sandboxGET, POST as sandboxPOST } from '@/app/api/sandbox/route';
@@ -83,13 +89,13 @@ describe('sandbox API routes', () => {
   it('fails closed without a session and refuses an accountant', async () => {
     session.userId = null;
     route('POST', '/api/sandbox');
-    expect((await sandboxPOST()).status).toBe(403);
+    expect((await sandboxPOST(req('/api/sandbox', { method: 'POST' }))).status).toBe(403);
     route('POST', '/api/sandbox/discard');
-    expect((await discardPOST()).status).toBe(403);
+    expect((await discardPOST(req('/api/sandbox/discard', { method: 'POST' }))).status).toBe(403);
 
     session.userId = accountantId;
     route('POST', '/api/sandbox');
-    expect((await sandboxPOST()).status).toBe(403);
+    expect((await sandboxPOST(req('/api/sandbox', { method: 'POST' }))).status).toBe(403);
     expect(fs.existsSync(path.join(ROOT, 'sandboxes'))).toBe(false);
   });
 
@@ -99,7 +105,7 @@ describe('sandbox API routes', () => {
     expect(await (await sandboxGET()).json()).toMatchObject({ active: false, leftovers: [] });
 
     route('POST', '/api/sandbox');
-    const started = await sandboxPOST();
+    const started = await sandboxPOST(req('/api/sandbox', { method: 'POST' }));
     expect(started.status).toBe(201);
     const { dir, realDir } = await started.json();
     expect(realDir).toBe(path.resolve(REAL));
@@ -123,7 +129,7 @@ describe('sandbox API routes', () => {
     // An accountant (not an Admin of the real file) cannot leave; bad keep bodies are refused.
     session.userId = accountantId;
     route('POST', '/api/sandbox/discard');
-    expect((await discardPOST()).status).toBe(403);
+    expect((await discardPOST(req('/api/sandbox/discard', { method: 'POST' }))).status).toBe(403);
     session.userId = ownerId;
     route('POST', '/api/sandbox/keep');
     expect((await keepPOST(req('/api/sandbox/keep', { method: 'POST', body: 'not json' }))).status).toBe(400);
@@ -131,8 +137,12 @@ describe('sandbox API routes', () => {
     expect(resolveDataDir()).toBe(path.resolve(dir));
 
     route('POST', '/api/sandbox/discard');
-    const left = await discardPOST();
+    // Holding the unlock for the copy: the response re-issues it for the real file.
+    session.unlock = createUnlockToken();
+    const left = await discardPOST(req('/api/sandbox/discard', { method: 'POST' }));
+    session.unlock = undefined;
     expect(left.status).toBe(200);
+    expect(verifyUnlockToken(left.cookies.get(UNLOCK_COOKIE)?.value)).toBe(true);
     expect((await left.json()).realDir).toBe(path.resolve(REAL));
     expect(resolveDataDir()).toBe(path.resolve(REAL));
     expect(fs.existsSync(dir)).toBe(false);
@@ -143,7 +153,7 @@ describe('sandbox API routes', () => {
   it('resumes and deletes a left-over copy', async () => {
     session.userId = ownerId;
     route('POST', '/api/sandbox');
-    const { dir } = await (await sandboxPOST()).json();
+    const { dir } = await (await sandboxPOST(req('/api/sandbox', { method: 'POST' }))).json();
     await closeDb(dir);
     switchActiveDataDir(REAL); // as after a server restart
     route('GET', '/api/sandbox');
@@ -152,7 +162,7 @@ describe('sandbox API routes', () => {
     const id = status.leftovers[0].id as string;
 
     route('POST', '/api/sandbox/leftovers/[id]');
-    const resumed = await leftoverPOST(req(`/api/sandbox/leftovers/${encodeURIComponent(id)}`, { method: 'POST' }), params(encodeURIComponent(id)));
+    const resumed = await leftoverPOST(req(`/api/sandbox/leftovers/${encodeURIComponent(id)}`, { method: 'POST' }), params(id));
     expect(resumed.status).toBe(200);
     expect(resolveDataDir()).toBe(path.resolve(dir));
 
@@ -161,8 +171,39 @@ describe('sandbox API routes', () => {
     route('DELETE', '/api/sandbox/leftovers/[id]');
     const missing = await leftoverDELETE(req('/api/sandbox/leftovers/nope', { method: 'DELETE' }), params('nope'));
     expect(missing.status).toBe(404);
-    const deleted = await leftoverDELETE(req(`/api/sandbox/leftovers/${encodeURIComponent(id)}`, { method: 'DELETE' }), params(encodeURIComponent(id)));
+    const deleted = await leftoverDELETE(req(`/api/sandbox/leftovers/${encodeURIComponent(id)}`, { method: 'DELETE' }), params(id));
     expect(deleted.status).toBe(200);
     expect(fs.existsSync(path.dirname(dir))).toBe(false);
+  }, 180_000);
+
+  it('resumes and deletes a left-over copy whose id has a "%" in it', async () => {
+    const manifest = path.join(REAL, 'bookkeeper-company.json');
+    fs.writeFileSync(manifest, JSON.stringify({ name: '50% Off LLC' }), 'utf8');
+    try {
+      session.userId = ownerId;
+      route('POST', '/api/sandbox');
+      const { dir } = await (await sandboxPOST(req('/api/sandbox', { method: 'POST' }))).json();
+      await closeDb(dir);
+      switchActiveDataDir(REAL);
+      route('GET', '/api/sandbox');
+      const [left] = (await (await sandboxGET()).json()).leftovers as { id: string }[];
+      expect(left.id).toContain('50% Off LLC');
+
+      // Next.js hands the param already decoded; the route must not decode it again.
+      route('POST', '/api/sandbox/leftovers/[id]');
+      const resumed = await leftoverPOST(req(`/api/sandbox/leftovers/${encodeURIComponent(left.id)}`, { method: 'POST' }), params(left.id));
+      expect(resumed.status).toBe(200);
+      expect(resolveDataDir()).toBe(path.resolve(dir));
+
+      await closeDb(dir);
+      switchActiveDataDir(REAL);
+      route('DELETE', '/api/sandbox/leftovers/[id]');
+      expect((await leftoverDELETE(req('/api/sandbox/leftovers/x', { method: 'DELETE' }), params('%E0%A4%A'))).status).toBe(404);
+      const deleted = await leftoverDELETE(req(`/api/sandbox/leftovers/${encodeURIComponent(left.id)}`, { method: 'DELETE' }), params(left.id));
+      expect(deleted.status).toBe(200);
+      expect(fs.existsSync(path.dirname(dir))).toBe(false);
+    } finally {
+      fs.rmSync(manifest, { force: true });
+    }
   }, 180_000);
 });

@@ -6,7 +6,10 @@
  *  - PDFs printed from the sandbox (checks, invoices) are stamped SANDBOX;
  *  - discard deletes the copy and returns to the real file; keep moves it to a training file;
  *  - copies left over after a restart can be resumed or deleted;
- *  - backups never carry the sandbox marker.
+ *  - backups never carry the sandbox marker;
+ *  - a refused leave never points the server at the real file (no sandbox write can leak in);
+ *  - a server started directly on a sandbox / training folder stamps from the first request;
+ *  - the file-password unlock is re-issued for the folder the server switched to.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
@@ -15,7 +18,7 @@ import AdmZip from 'adm-zip';
 import { PDFDocument } from 'pdf-lib';
 import { and, eq } from 'drizzle-orm';
 import { closeDb, getDb, resolveDataDir } from '@/lib/db';
-import { auditLogs, customers, users } from '@/lib/db/schema';
+import { auditLogs, customers, userCompanies, users } from '@/lib/db/schema';
 import { createCompany } from './company';
 import { createCustomer } from './customers';
 import type { ServiceContext } from './_base';
@@ -41,12 +44,17 @@ import { checkOutbound } from '@/lib/net/guard';
 import { renderCheckPdf } from '@/lib/pdf/check';
 import { renderFormPdf, sampleFormDocument } from '@/lib/pdf/template';
 import { GET as statusGET } from '@/app/api/sandbox/status/route';
+import { NextResponse } from 'next/server';
+import { UNLOCK_COOKIE, createUnlockToken, verifyUnlockToken } from '@/lib/auth';
+import { reissueUnlockCookie } from '@/lib/sandboxUnlock';
+import { getServerContext } from '@/lib/context';
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', `test-sandbox-${process.pid}`);
 const REAL = path.join(ROOT, 'Real Co.ironbooks');
 const SANDBOXES = path.join(ROOT, 'sandboxes');
 
 let ownerId: string;
+let accountantId: string;
 let companyId: string;
 const realCtx = async (): Promise<ServiceContext> => ({ db: await getDb(REAL), companyId, userId: ownerId });
 const activeCtx = async (): Promise<ServiceContext> => ({ db: await getDb(), companyId, userId: ownerId });
@@ -71,6 +79,12 @@ describe('sandbox mode', () => {
     ownerId = owner.id;
     const company = await createCompany(db, { name: 'Real Co', ownerId });
     companyId = company.id;
+    const [accountant] = await db
+      .insert(users)
+      .values({ email: 'accountant@sandbox.test', name: 'Sandbox Accountant', passwordHash: 'hash' })
+      .returning();
+    accountantId = accountant.id;
+    await db.insert(userCompanies).values({ userId: accountantId, companyId, role: 'accountant' });
     await createCustomer({ db, companyId, userId: ownerId }, { displayName: 'Real Customer' });
     // The file id sessions are bound to (lib/auth.ts companyFileId writes it on first sign-in).
     fs.writeFileSync(path.join(REAL, '.file-id'), 'real-file-id');
@@ -167,6 +181,43 @@ describe('sandbox mode', () => {
     expect(await pdfIsStamped(invoice)).toBe(true);
   });
 
+  it('a refused leave never points the server at the real file', async () => {
+    const sandboxDir = resolveDataDir();
+    const realCount = async () => {
+      const rows = await (await getDb(REAL)).select().from(customers).where(eq(customers.companyId, companyId));
+      await closeDb(REAL);
+      return rows.length;
+    };
+    const before = await realCount();
+    let sawReal = false;
+    const watch = setInterval(() => {
+      if (resolveDataDir() !== sandboxDir) sawReal = true;
+    }, 0);
+    try {
+      // An accountant (not an Admin of the real file) asks to leave; the owner keeps working.
+      const leaving = discardSandbox({ db: await getDb(), companyId, userId: accountantId });
+      expect(resolveDataDir()).toBe(sandboxDir);
+      const write = (async () => {
+        const db = await getDb();
+        await createCustomer({ db, companyId, userId: ownerId }, { displayName: 'Leaked' });
+      })();
+      await expect(leaving).rejects.toMatchObject({ code: 'FORBIDDEN' });
+      await write;
+    } finally {
+      clearInterval(watch);
+    }
+    expect(sawReal).toBe(false);
+    expect(resolveDataDir()).toBe(sandboxDir);
+    expect(isSandboxActive()).toBe(true);
+    // The write went to the copy, never to the real file; and the copy's handle is still usable.
+    const inCopy = await (await getDb()).select().from(customers).where(eq(customers.companyId, companyId));
+    expect(inCopy.map((c) => c.displayName)).toContain('Leaked');
+    expect(await realCount()).toBe(before);
+    const realNames = (await (await getDb(REAL)).select().from(customers)).map((c) => c.displayName);
+    await closeDb(REAL);
+    expect(realNames).not.toContain('Leaked');
+  }, 180_000);
+
   it('never puts the sandbox marker in a backup', () => {
     const zip = new AdmZip(createBackup('Real Co').buffer);
     expect(zip.getEntry(SANDBOX_MARKER)).toBeNull();
@@ -175,7 +226,15 @@ describe('sandbox mode', () => {
   it('discard deletes the copy and returns to the untouched real file', async () => {
     const dir = resolveDataDir();
     const container = path.dirname(dir);
+    const unlockedCopy = createUnlockToken();
+    expect(verifyUnlockToken(unlockedCopy)).toBe(true);
     const r = await discardSandbox(await activeCtx());
+    // The copy's unlock is not valid on the real file; the routes re-issue it only when held.
+    expect(verifyUnlockToken(unlockedCopy)).toBe(false);
+    const hdrs = new Headers();
+    expect(reissueUnlockCookie(NextResponse.json({}), false, hdrs).cookies.get(UNLOCK_COOKIE)).toBeUndefined();
+    const reissued = reissueUnlockCookie(NextResponse.json({}), true, hdrs).cookies.get(UNLOCK_COOKIE)?.value;
+    expect(verifyUnlockToken(reissued)).toBe(true);
     expect(r.realDir).toBe(path.resolve(REAL));
     expect(resolveDataDir()).toBe(path.resolve(REAL));
     expect(fs.existsSync(container)).toBe(false);
@@ -229,6 +288,19 @@ describe('sandbox mode', () => {
       .sort();
     expect(trainingNames).toEqual(['Real Customer', 'Training Customer']);
     await closeDb(kept.trainingDir);
+
+    // A server started directly on the training folder stamps from its first request.
+    delete process.env.BKA_SANDBOX;
+    process.env.BKA_DATA_DIR = kept.trainingDir;
+    try {
+      await getServerContext().catch(() => undefined);
+      expect(process.env.BKA_SANDBOX).toBe('1');
+      expect(await pdfIsStamped(await renderCheckPdf({ company: { name: 'Real Co' }, payee: 'X', amountNumeric: '1.00', date: '2026-01-01' }))).toBe(true);
+    } finally {
+      switchActiveDataDir(REAL);
+      await closeDb(kept.trainingDir).catch(() => undefined);
+    }
+    expect(process.env.BKA_SANDBOX).toBeUndefined();
   }, 180_000);
 
   it('lists, resumes and deletes copies left over after a restart', async () => {
@@ -253,4 +325,5 @@ describe('sandbox mode', () => {
     expect(fs.existsSync(path.dirname(first.dir))).toBe(false);
     expect(listLeftoverSandboxes()).toEqual([]);
   }, 180_000);
+
 });

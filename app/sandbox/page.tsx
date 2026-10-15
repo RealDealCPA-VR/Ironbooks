@@ -246,7 +246,9 @@ export default function SandboxPage() {
             )}
             <p className="text-xs text-navy/50 mt-3">
               Everyone else must be signed out first. In a web browser (not the desktop app) the sandbox lasts until the
-              Ironbooks server restarts; the copy then shows below so you can open it again or delete it.
+              Ironbooks server restarts; the copy then shows below so you can open it again or delete it. If your
+              company file has a file password, the desktop app asks for it again when it opens the copy and when it
+              returns to your real books (the copy has the same password).
             </p>
           </Card>
 

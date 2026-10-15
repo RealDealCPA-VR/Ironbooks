@@ -80,3 +80,9 @@ On boot the DB migrator runs `drizzle/` against the local company file.
   comes back on the real file; the copy is then listed on the Sandbox page ("Copies left over")
   to open again or delete. `BKA_SANDBOX_ROOT` overrides where copies go (default: an
   `Ironbooks Sandboxes` folder next to the real file).
+- File password: the unlock is bound to the active data dir and the launch. On the desktop the
+  shell relaunches into the copy (and back), so you are asked for the file password again (the
+  copy has the same password). Web / dev: the sandbox routes re-issue the unlock cookie for the
+  new folder when the request held a valid one, so no new prompt (`lib/sandboxUnlock.ts`).
+- PDF stamp: `getServerContext` syncs `BKA_SANDBOX` the first time a request runs against a data
+  dir, so a server started directly on a sandbox / training folder stamps from the first print.

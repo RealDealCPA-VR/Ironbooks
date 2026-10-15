@@ -408,13 +408,16 @@ async function leaveToRealFile(
   }
   precheck?.(marker);
   const dir = resolveDataDir();
-  switchActiveDataDir(marker.realDataDir);
+  // Check the caller against the REAL file through an explicit handle BEFORE switching: the
+  // active data dir (which every other request's getDb() and session lookup follow) must stay on
+  // the sandbox until the leave is certain, or a refused leave would let concurrent sandbox
+  // writes land in the real books.
   let realDb: DB;
   try {
     realDb = await getDb(marker.realDataDir);
     await requireFileAdmin({ db: realDb, userId: ctx.userId });
   } catch (err) {
-    switchActiveDataDir(dir);
+    // Nothing but this check used the real handle (the server is still on the sandbox).
     await closeDb(marker.realDataDir).catch(() => undefined);
     if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
       throw new ServiceError(
@@ -424,6 +427,7 @@ async function leaveToRealFile(
     }
     throw err;
   }
+  switchActiveDataDir(marker.realDataDir);
   await closeDb(dir);
   return { dir, container: path.dirname(dir), marker, realDb };
 }

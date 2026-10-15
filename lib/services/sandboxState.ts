@@ -86,6 +86,19 @@ export function writeSandboxMarker(dir: string, marker: SandboxMarker): void {
 export function syncSandboxEnv(marker: SandboxMarker | null = readSandboxMarker()): void {
   if (marker) process.env.BKA_SANDBOX = '1';
   else delete process.env.BKA_SANDBOX;
+  syncedDir = resolveDataDir();
+}
+
+/** Data dir the stamp flag was last synced for (null: never synced in this process). */
+let syncedDir: string | null = null;
+
+/**
+ * Sync the PDF stamp flag the first time a request runs against a data directory (called from
+ * getServerContext), so a server started directly on a sandbox / training folder (BKA_DATA_DIR)
+ * stamps its printouts from the very first request, not only after the banner asked for status.
+ */
+export function ensureSandboxEnvSynced(): void {
+  if (syncedDir !== resolveDataDir()) syncSandboxEnv();
 }
 
 /** The active data directory's sandbox marker (and refresh the PDF stamp flag). */
