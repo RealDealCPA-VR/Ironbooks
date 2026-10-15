@@ -39,7 +39,7 @@ import {
 } from '@/lib/validation/lists';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { isReferenced } from './references';
-import { assertListDeleteAllowed } from '../accountantCopy/guard';
+import { assertAccountantListEdit, assertListDeleteAllowed } from '../accountantCopy/guard';
 
 export const SIMPLE_LIST_KEYS = [
   'other-names',
@@ -389,6 +389,7 @@ export async function updateEntry(ctx: ServiceContext, key: SimpleListKey, id: s
   const def = DEFS[key];
   const before = await getEntry(ctx, key, id);
   const patch = parse(def, body, true);
+  if (key === 'other-names') await assertAccountantListEdit(ctx, 'other_name', before, patch); // Accountant's Copy (I1)
   // Re-validate the whole record as it will be after the update.
   const merged: Record<string, unknown> = {};
   for (const k of Object.keys(def.schema.shape)) merged[k] = k in patch ? patch[k] : before[k];

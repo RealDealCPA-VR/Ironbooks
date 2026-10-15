@@ -18,7 +18,7 @@ import { getPreferences } from './preferences';
 import { maskForContext } from './access';
 import { resolvePartyTerms } from './lists/fields';
 import { type VendorPurchaseFieldsInput, resolveVendorPurchaseFields } from './vendorPurchaseFields';
-import { assertListDeleteAllowed } from './accountantCopy/guard';
+import { assertAccountantListEdit, assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -184,6 +184,7 @@ export async function updateVendor(
   patch: UpdateVendorInput,
 ) {
   const before = await loadVendor(ctx, id);
+  await assertAccountantListEdit(ctx, 'vendor', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
 
   // Re-validate displayName only if the caller is changing it.
   const newDisplayName = patch.displayName !== undefined
@@ -273,6 +274,7 @@ export async function deactivateVendor(ctx: ServiceContext, id: string) {
  */
 export async function reactivateVendor(ctx: ServiceContext, id: string) {
   const before = await loadVendor(ctx, id);
+  await assertAccountantListEdit(ctx, 'vendor', before as Record<string, unknown>, { isActive: true }); // I1
   const [row] = await ctx.db
     .update(vendors)
     .set({ isActive: true, updatedAt: new Date() })

@@ -21,6 +21,7 @@
  *   UPDATE on quantityBilled inside the transaction. convertedBillId is stamped
  *   with the bill that completes (closes) the PO.
  */
+import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { accounts, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -107,6 +108,7 @@ export async function createPurchaseOrder(
   // Enforced here, not only on the API path: memorized POs and reorder-list POs are entered
   // without an HTTP request (QB has no purchase orders while "Use purchase orders" is off).
   await assertFeatureOn(ctx, 'purchaseOrdersEnabled');
+  await assertDividingDateOpen(ctx, input.date); // Accountant's Copy (I1)
   if (!input.lines || input.lines.length === 0) {
     throw validation('A purchase order must have at least one line.');
   }
@@ -278,6 +280,9 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
       .from(purchaseOrders)
       .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.companyId, tx.companyId)));
     if (!po) throw notFound('Purchase order');
+    // Accountant's Copy (I1): both the order's date and the new one.
+    await assertDividingDateOpen(tx, po.date);
+    await assertDividingDateOpen(tx, input.date);
     if (po.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided purchase order.');
     if (po.status === 'closed') {
       throw new ServiceError('CONFLICT', 'This purchase order is closed. Closed purchase orders cannot be edited.');
@@ -427,6 +432,7 @@ export async function updateStatus(
     .from(purchaseOrders)
     .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.companyId, ctx.companyId)));
   if (!po) throw notFound('Purchase order');
+  await assertDividingDateOpen(ctx, po.date); // Accountant's Copy (I1)
 
   if (po.status === 'closed' && status !== 'closed') {
     throw new ServiceError(
@@ -516,6 +522,7 @@ export async function convertToBill(
   poId: string,
   opts?: ConvertToBillOptions,
 ) {
+  await assertAccountantMayConvert(ctx, 'Turning a purchase order into a bill'); // Accountant's Copy (I1)
   const [po] = await ctx.db
     .select()
     .from(purchaseOrders)

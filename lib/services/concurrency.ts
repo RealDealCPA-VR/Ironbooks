@@ -168,6 +168,11 @@ function formatWhen(d: Date): string {
   }
 }
 
+/** The record's current version (null when it does not exist in this company). */
+export async function currentVersion(ctx: ServiceContext, entity: VersionedEntity, id: string): Promise<Date | null> {
+  return (await loadVersion(ctx, entity, id))?.updatedAt ?? null;
+}
+
 /**
  * Throw CONFLICT (409) unless the record's current version equals `expected`. Versions are
  * compared at millisecond precision (what JSON round-trips). NOT_FOUND if the record is gone.

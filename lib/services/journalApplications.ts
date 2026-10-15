@@ -45,10 +45,47 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { isSubledgerSource } from './posting';
 import { assertPeriodOpen } from './fiscalPeriods';
-import { assertAccountantMayApplyJournalItems } from './accountantCopy/guard';
+import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { getHomeCurrencyCode } from './currencies';
 import { journalOpenItems, resolveEntityNames } from './journal';
 import { markPaidAmount } from './invoices';
+
+/**
+ * Accountant's Copy (I1): in the accountant's copy an application may only touch records dated on
+ * or before the dividing date (the journal entries, invoice, bill or payment involved).
+ */
+async function assertCopyDates(
+  tx: ServiceContext,
+  refs: { lineIds?: Array<string | null | undefined>; invoiceId?: string | null; billId?: string | null; paymentId?: string | null },
+): Promise<void> {
+  const dates: Date[] = [];
+  const lineIds = (refs.lineIds ?? []).filter((x): x is string => !!x);
+  if (lineIds.length) {
+    for (const r of await tx.db
+      .select({ date: journalEntries.date })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+      .where(and(inArray(journalEntryLines.id, lineIds), eq(journalEntries.companyId, tx.companyId)))) {
+      dates.push(r.date);
+    }
+  }
+  if (refs.invoiceId) {
+    const [r] = await tx.db.select({ date: invoices.date }).from(invoices).where(and(eq(invoices.id, refs.invoiceId), eq(invoices.companyId, tx.companyId)));
+    if (r) dates.push(r.date);
+  }
+  if (refs.billId) {
+    const [r] = await tx.db.select({ date: bills.date }).from(bills).where(and(eq(bills.id, refs.billId), eq(bills.companyId, tx.companyId)));
+    if (r) dates.push(r.date);
+  }
+  if (refs.paymentId) {
+    const [r] = await tx.db
+      .select({ date: paymentsReceived.date })
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.id, refs.paymentId), eq(paymentsReceived.companyId, tx.companyId)));
+    if (r) dates.push(r.date);
+  }
+  await assertAccountantDatesOpen(tx, dates, 'A record this application changes');
+}
 
 export type JournalApplicationKind = 'payment' | 'invoice_credit' | 'bill_payment' | 'bill_credit' | 'journal_offset';
 type Side = 'ar' | 'ap';
@@ -668,7 +705,7 @@ export async function applyJournalCredit(
     throw validation('Pick the invoice, bill or General Journal charge to apply the credit to.');
   }
   return inTransaction(ctx, async (tx) => {
-    await assertAccountantMayApplyJournalItems(tx);
+    await assertCopyDates(tx, { lineIds: [input.journalLineId, input.chargeLineId], invoiceId: input.invoiceId, billId: input.billId });
     await assertPeriodOpen(tx, date);
     let rows: ApplicationRow[];
     if (input.chargeLineId) {
@@ -726,7 +763,6 @@ export async function applyJournalCredit(
  */
 export async function unapplyJournalApplication(ctx: ServiceContext, applicationId: string) {
   return inTransaction(ctx, async (tx) => {
-    await assertAccountantMayApplyJournalItems(tx);
     const [app] = await tx.db
       .select()
       .from(journalItemApplications)
@@ -742,6 +778,7 @@ export async function unapplyJournalApplication(ctx: ServiceContext, application
       const [p] = await tx.db.select().from(paymentsReceived).where(eq(paymentsReceived.id, app.paymentId));
       if (p?.voidedAt || p?.bouncedAt) throw new ServiceError('CONFLICT', 'That payment is void or bounced.');
     }
+    await assertCopyDates(tx, { lineIds: [app.journalLineId], invoiceId: app.invoiceId, billId: app.billId, paymentId: app.paymentId });
     await assertPeriodOpen(tx, app.date, { movable: false });
     // A General Journal credit applied to a General Journal charge is one application in two rows.
     const rows =
@@ -779,7 +816,7 @@ export async function applyPaymentToJournalCharges(
   input: { paymentId: string; items: JournalItemPaymentInput[] },
 ) {
   return inTransaction(ctx, async (tx) => {
-    await assertAccountantMayApplyJournalItems(tx);
+    await assertCopyDates(tx, { lineIds: input.items.map((i) => i.journalLineId), paymentId: input.paymentId });
     const [payment] = await tx.db
       .select()
       .from(paymentsReceived)

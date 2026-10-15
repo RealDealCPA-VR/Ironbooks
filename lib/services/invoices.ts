@@ -29,6 +29,7 @@
  * restoring stock), re-creates the lines, and re-posts — all inside ONE
  * transaction — preserving invoiceNumber and createdAt.
  */
+import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { creditLimitFixes } from '@/lib/errorFixes';
@@ -2231,6 +2232,8 @@ export async function markPaidAmount(
   if (invoice.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot apply payment to a voided invoice.');
   }
+  // Accountant's Copy (I1): the accountant can't change what is paid on the client's later invoices.
+  await assertAccountantDatesOpen(ctx, [invoice.date], `Invoice ${invoice.refNumber ?? invoice.invoiceNumber}`);
 
   const newAmountPaid = Money.round2(Money.of(invoice.amountPaid).plus(Money.of(amountPaidDelta)));
   if (newAmountPaid.lessThan(0)) {

@@ -15,6 +15,37 @@ describe("Accountant's Copy route gate", () => {
       '/api/deposits/abc',
       '/api/accounts/abc',
       '/api/classes',
+      // Format 3: sales, purchases, payments, applications, reconciliations, names and items.
+      '/api/invoices',
+      '/api/invoices/abc',
+      '/api/invoices/abc/post',
+      '/api/invoices/batch',
+      '/api/invoices/statement-charges',
+      '/api/sales-receipts/abc',
+      '/api/credit-memos',
+      '/api/credit-memos/abc',
+      '/api/payments',
+      '/api/payments/abc',
+      '/api/payments/journal-items',
+      '/api/bills/abc',
+      '/api/bill-payments',
+      '/api/bill-payments/journal-items',
+      '/api/vendor-credits/abc',
+      '/api/item-receipts',
+      '/api/estimates/abc',
+      '/api/sales-orders',
+      '/api/purchase-orders/abc',
+      '/api/inventory',
+      '/api/reconciliations',
+      '/api/reconciliations/abc',
+      '/api/reconciliations/undo',
+      '/api/customers',
+      '/api/customers/abc',
+      '/api/vendors/abc',
+      '/api/items',
+      '/api/lists/other-names',
+      '/api/lists/other-names/abc',
+      // Housekeeping.
       '/api/accountant-copy/changes',
       '/api/auth/logout',
       '/api/preferences/my',
@@ -28,21 +59,47 @@ describe("Accountant's Copy route gate", () => {
     }
   });
 
-  it('refuses saves that could not be sent back to the client', () => {
-    for (const p of ['/api/invoices', '/api/payments', '/api/bills/abc', '/api/customers', '/api/merge', '/api/preferences', '/api/accountant/reclassify', '/api/journal-entriesX', '/api/payments/journal-items', '/api/bill-payments/journal-items', '/api/inventory-transfers', '/api/bank-rules', '/api/receipts/abc/save', '/api/month-end-close/close', '/api/attention/invoice-reminder']) {
+  it('refuses saves that could not be sent back to the client (and what QB forbids)', () => {
+    for (const p of [
+      '/api/merge',
+      '/api/preferences',
+      '/api/accountant/reclassify',
+      '/api/accountant/write-off',
+      '/api/journal-entriesX',
+      '/api/invoicesX',
+      '/api/inventory-transfers',
+      '/api/inventory/physical-count',
+      '/api/inventory/value-adjust',
+      '/api/inventory/batch-count',
+      '/api/invoices/retainage',
+      '/api/estimates/expire',
+      '/api/reconciliations/abc/pay',
+      '/api/customers/bulk',
+      '/api/items/bulk',
+      '/api/vendors/bulk',
+      '/api/items/change-prices',
+      '/api/lists/terms',
+      '/api/lists/payment-methods/abc',
+      '/api/receiving/bill',
+      '/api/payroll/run',
+      '/api/bank-rules',
+      '/api/bank-accounts',
+      '/api/receipts/abc/save',
+      '/api/month-end-close/close',
+      '/api/attention/invoice-reminder',
+      '/api/condense',
+      '/api/employees',
+    ]) {
       expect(accountantCopyAllowsApi(p), p).toBe(false);
     }
   });
 
-  it('only General Journal entries, reversals, checks / expenses, transfers and deposits may post in the copy', () => {
-    expect(accountantMayPost(null)).toBe(true);
-    expect(accountantMayPost('manual')).toBe(true);
-    expect(accountantMayPost('reversal:1')).toBe(true);
-    expect(accountantMayPost('expense:1')).toBe(true);
-    expect(accountantMayPost('deposit:1')).toBe(true);
-    expect(accountantMayPost('deposit:pending')).toBe(true);
-    expect(accountantMayPost('invoice:1')).toBe(false);
-    expect(accountantMayPost('payment:1')).toBe(false);
-    expect(accountantMayPost('condense:1')).toBe(false);
+  it('only sources the changes file carries may post in the copy', () => {
+    for (const ok of [null, 'manual', 'reversal:1', 'expense:1', 'deposit:1', 'deposit:pending', 'invoice:1', 'invoice-cogs:1', 'salesreceipt:1', 'credit_memo:1', 'creditmemo-cogs:1', 'customer:1', 'payment:1', 'bill:1', 'vendor:1', 'vendor_credit:1', 'item_receipt:1', 'item:1', 'reconciliation:1']) {
+      expect(accountantMayPost(ok), String(ok)).toBe(true);
+    }
+    for (const no of ['refund:1', 'bounced:1', 'paycheck:1', 'condense:1', 'loan:1', 'fixed_asset:1', 'account:1', 'hca:1', 'qbgl:x', 'cc-payment:1', 'tax_agency:1']) {
+      expect(accountantMayPost(no), no).toBe(false);
+    }
   });
 });

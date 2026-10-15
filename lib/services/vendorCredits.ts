@@ -24,6 +24,7 @@
  *   - Voiding (or a ledger-changing edit) puts the returned stock back at the cost it left with.
  */
 
+import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { and, asc, desc, eq, inArray } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
@@ -803,6 +804,8 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
   if (credit.vendorId !== bill.vendorId) {
     throw validation('Vendor credit and bill must belong to the same vendor.');
   }
+  // Accountant's Copy (I1): records dated after the dividing date belong to the client.
+  await assertAccountantDatesOpen(ctx, [credit.date, bill.date], 'The vendor credit or bill');
 
   // Currencies: blank or the home code (any case) is home. A home credit only applies to a home
   // bill; a foreign credit / bill is applied at each side's booked rate with a realized exchange
@@ -932,6 +935,7 @@ export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBil
   if (bill.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot unapply a credit from a voided bill.');
   }
+  await assertAccountantDatesOpen(ctx, [credit.date, bill.date], 'The vendor credit or bill');
   if (credit.vendorId !== bill.vendorId) {
     throw validation('Vendor credit and bill must belong to the same vendor.');
   }

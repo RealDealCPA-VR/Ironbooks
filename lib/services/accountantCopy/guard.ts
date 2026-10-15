@@ -11,8 +11,13 @@
  *      - work AFTER the dividing date carries on as usual.
  *  - ACCOUNTANT file (side 'accountant'): the opposite date rule — only transactions dated ON OR
  *    BEFORE the dividing date — and only the kinds of change the changes file (.ibcx) can carry
- *    back: General Journal entries, checks / expenses, transfers, deposits, chart-of-accounts
- *    edits and new accounts and classes. Other saves are refused before they run by the route gate (routeGate.ts).
+ *    back: General Journal entries, checks / expenses / credit card charges, transfers, deposits,
+ *    invoices, sales receipts, credit memos, received payments, bills, bill payments, vendor
+ *    credits, item receipts, inventory adjustments, estimates / sales orders / purchase orders,
+ *    credit and journal applications, bank reconciliations, chart-of-accounts edits, new classes
+ *    and new / edited customers, vendors, items and other names. Other saves are refused before
+ *    they run by the route gate (routeGate.ts) or here (conversions, refunds, bounced checks,
+ *    structural list edits, anything touching a record dated after the dividing date).
  *
  * The closing-date password never bypasses the dividing date. The only bypass is the client's
  * own import of the accountant's changes (runAccountantImport), which re-applies them through the
@@ -95,28 +100,171 @@ function importing(copy: ActiveCopy): boolean {
 
 /**
  * Ledger sources an accountant may post in an Accountant's Copy (what the changes file carries):
- * General Journal entries and reversals, checks / expenses, deposits, and transfers (which post
- * without a source, like a General Journal entry).
+ * General Journal entries and reversals, transfers (which post without a source), checks /
+ * expenses, deposits, sales forms and their COGS, received payments (posted as customer:<id> /
+ * payment:<id>), bills, bill payments (vendor:<id>), vendor credits, item receipts, inventory
+ * adjustments (item:<id>) and a reconciliation's service charge / interest. Refunds, bounced
+ * checks, paychecks, loans, fixed assets, condense, imports … are not carried back.
  */
+const ACCOUNTANT_SOURCES = [
+  'reversal:',
+  'expense:',
+  'deposit:',
+  'invoice:',
+  'invoice-cogs:',
+  'salesreceipt:',
+  'credit_memo:',
+  'creditmemo-cogs:',
+  'customer:',
+  'payment:',
+  'bill:',
+  'vendor:',
+  'vendor_credit:',
+  'item_receipt:',
+  'item_receipt_edit:',
+  'item_receipt_void:',
+  'item_receipt_claim',
+  'item:',
+  'reconciliation:',
+];
+
 export function accountantMayPost(sourceRef: string | null): boolean {
   if (sourceRef === null || sourceRef === 'manual') return true;
-  return sourceRef.startsWith('reversal:') || sourceRef.startsWith('expense:') || sourceRef.startsWith('deposit:');
+  return ACCOUNTANT_SOURCES.some((p) => sourceRef.startsWith(p));
 }
 
+/** What an accountant can do in the copy (used in refusals). */
+export const ACCOUNTANT_CAN =
+  "In an Accountant's Copy you can enter and fix journal entries, checks, expenses and credit card charges, transfers, deposits, " +
+  'invoices, sales receipts, credit memos, received payments, bills, bill payments, vendor credits, item receipts, inventory adjustments, ' +
+  'estimates, sales orders and purchase orders, apply credits, reconcile, and add or edit accounts, classes, customers, vendors, items and other names.';
+
 /**
- * Accountant side: applying a General Journal A/R or A/P line to an invoice, bill or another
- * journal line (journal_item_applications) can't be sent back in the changes file, so it is
- * refused in the copy. The route gate already refuses the screens that do it; this covers every
- * other caller of the service.
+ * Accountant side: a conversion (estimate / sales order → invoice, purchase order / item receipt
+ * → bill) links two forms in a way the changes file can't rebuild on the client's side — refused
+ * in the copy; enter the invoice or bill directly.
  */
-export async function assertAccountantMayApplyJournalItems(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<void> {
+export async function assertAccountantMayConvert(ctx: Pick<ServiceContext, 'db' | 'companyId'>, what: string): Promise<void> {
   const copy = await activeCopy(ctx.db, ctx.companyId);
   if (!copy || copy.side !== 'accountant') return;
   throw new ServiceError(
     'FORBIDDEN',
-    "Applying a journal entry line to an invoice, bill or another journal line can't be done in an Accountant's Copy because it can't be sent back to your client. " +
-      'Note it for your client in the changes file.',
+    `${what} can't be done in an Accountant's Copy (the link between the two forms can't be sent back to your client). Enter the invoice or bill directly instead.`,
     { accountantCopy: true, side: copy.side },
+  );
+}
+
+/**
+ * Accountant side: changing a record dated after the dividing date (applying a credit or payment
+ * to an invoice / bill the client entered after it) is refused — that record belongs to the client.
+ */
+export async function assertAccountantDatesOpen(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  dates: Array<Date | string | null | undefined>,
+  what: string,
+): Promise<void> {
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (!copy || copy.side !== 'accountant' || importing(copy)) return;
+  for (const d of dates) {
+    if (!d) continue;
+    const day = new Date(d).toISOString().slice(0, 10);
+    if (day > copy.dividingDate) {
+      const when = formatDividingDate(copy.dividingDate);
+      throw new ServiceError(
+        'CONFLICT',
+        `${what} is dated after the dividing date (${when}), so it belongs to your client and can't be changed in this Accountant's Copy.`,
+        { accountantCopy: true, side: copy.side, dividingDate: copy.dividingDate },
+      );
+    }
+  }
+}
+
+/**
+ * Bank reconciliations: in the client's file a statement dated on or before the dividing date
+ * can't be reconciled or un-reconciled while the copy is out; in the accountant's copy only those
+ * statements can.
+ */
+export async function assertReconciliationDateOpen(ctx: Pick<ServiceContext, 'db' | 'companyId'>, statementDate: Date): Promise<void> {
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (!copy || importing(copy)) return;
+  const day = new Date(statementDate).toISOString().slice(0, 10);
+  const when = formatDividingDate(copy.dividingDate);
+  if (copy.side === 'client' && day <= copy.dividingDate) {
+    throw new ServiceError(
+      'CONFLICT',
+      `Your accountant is working on statements dated on or before ${when} (Accountant's Copy), so this statement can't be reconciled or un-reconciled here until you import their changes or cancel the copy.`,
+      { accountantCopy: true, side: copy.side, dividingDate: copy.dividingDate },
+    );
+  }
+  if (copy.side === 'accountant' && day > copy.dividingDate) {
+    throw new ServiceError(
+      'CONFLICT',
+      `In this Accountant's Copy you can only reconcile statements dated on or before ${when}; your client reconciles the later ones.`,
+      { accountantCopy: true, side: copy.side, dividingDate: copy.dividingDate },
+    );
+  }
+}
+
+const NUM_RE = /^-?\d+(\.\d+)?$/;
+const same = (a: unknown, b: unknown): boolean => {
+  const norm = (v: unknown) => (v === undefined || v === null || v === '' ? null : typeof v === 'number' ? String(v) : v);
+  const x = norm(a);
+  const y = norm(b);
+  if (x === null || y === null) return x === y;
+  if (typeof x === 'string' && typeof y === 'string' && NUM_RE.test(x) && NUM_RE.test(y)) return Number(x) === Number(y);
+  return JSON.stringify(x) === JSON.stringify(y);
+};
+
+/** Structural fields of list records (QB: hierarchy, active status, item type / accounts / tracking, vendor currency). */
+const STRUCTURAL: Record<string, Array<[string, string]>> = {
+  customer: [
+    ['parentId', 'its place in the customer list (sub-customer of)'],
+    ['isActive', 'whether it is active'],
+    ['priceLevelId', 'its price level'],
+    ['shipToAddresses', 'its list of ship-to addresses'],
+  ],
+  vendor: [
+    ['isActive', 'whether it is active'],
+    ['currency', 'its currency'],
+    ['taxId', 'its tax ID'],
+    ['vendorTypeId', 'its vendor type'],
+    ['billingRateLevelId', 'its billing rate level'],
+  ],
+  item: [
+    ['type', 'its type'],
+    ['incomeAccountId', 'its income account'],
+    ['expenseAccountId', 'its expense / COGS account'],
+    ['assetAccountId', 'its inventory asset account'],
+    ['trackingMode', 'serial / lot tracking'],
+    ['uomSetId', 'its unit of measure set'],
+    ['isActive', 'whether it is active'],
+  ],
+  other_name: [
+    ['isActive', 'whether it is active'],
+    ['billingRateLevelId', 'its billing rate level'],
+  ],
+};
+
+/**
+ * Accountant side: a customer, vendor, item or other name can be added and its everyday fields
+ * (name, contact details, terms, prices, notes…) edited — they travel in the changes file — but its
+ * structure can't change in the copy (QB: no deletes, merges or inactivation; here also no moves
+ * in the hierarchy, type, account or currency changes).
+ */
+export async function assertAccountantListEdit(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  entity: 'customer' | 'vendor' | 'item' | 'other_name',
+  before: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const changed = STRUCTURAL[entity].find(([k]) => patch[k] !== undefined && !same(patch[k], before[k]));
+  if (!changed) return;
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (!copy || copy.side !== 'accountant' || importing(copy)) return;
+  throw new ServiceError(
+    'FORBIDDEN',
+    `In an Accountant's Copy you can't change ${changed[1]} (it can't be sent back to your client). You can change its name, contact details, terms, prices and notes. Ask your client to make this change in their file.`,
+    { accountantCopy: true, side: copy.side, field: changed[0] },
   );
 }
 
@@ -159,8 +307,7 @@ export async function assertDividingDateOpen(
   if (opts.sourceRef !== undefined && !accountantMayPost(opts.sourceRef)) {
     throw new ServiceError(
       'FORBIDDEN',
-      "This kind of transaction can't be entered in an Accountant's Copy because it can't be sent back to your client. " +
-        'You can make journal entries, write or edit checks and expenses, transfers and deposits, and add or edit accounts and classes.',
+      "This kind of transaction can't be entered in an Accountant's Copy because it can't be sent back to your client. " + ACCOUNTANT_CAN,
       { accountantCopy: true, side: copy.side, sourceRef: opts.sourceRef },
     );
   }

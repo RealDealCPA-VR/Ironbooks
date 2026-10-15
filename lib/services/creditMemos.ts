@@ -43,6 +43,7 @@
  * reverses the main GL entry AND every restock entry, removing the restocked
  * quantity from stock again.
  */
+import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
@@ -702,6 +703,8 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
   if (memo.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot apply a voided credit memo.');
   }
+  // Accountant's Copy (I1): a credit memo dated after the dividing date belongs to the client.
+  await assertAccountantDatesOpen(ctx, [memo.date], 'The credit memo');
 
   const unapplied = Money.of(memo.unapplied);
   if (amount.greaterThan(unapplied)) {
@@ -852,6 +855,7 @@ export async function unapplyCreditApplication(ctx: ServiceContext, applicationI
       .from(creditMemos)
       .where(and(eq(creditMemos.companyId, tx.companyId), eq(creditMemos.id, app.creditMemoId)));
     if (!memo) throw notFound('Credit memo');
+    await assertAccountantDatesOpen(tx, [memo.date], 'The credit memo');
     const amount = Money.of(app.amount);
 
     await markPaidAmount(tx, app.invoiceId, toAmountString(amount.negated()));

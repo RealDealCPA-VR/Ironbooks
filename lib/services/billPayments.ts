@@ -25,6 +25,7 @@
  * Multi-tenant safety: every query is scoped by ctx.companyId.
  * Money: all arithmetic uses Money/toAmountString — never JS floats.
  */
+import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { overAppliedFixes } from '@/lib/errorFixes';
 import { isPaymentSourceAccount } from '@/lib/accountTypes';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
@@ -268,10 +269,13 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
         status: bills.status,
         currency: bills.currency,
         exchangeRate: bills.exchangeRate,
+        date: bills.date,
       })
       .from(bills)
       .where(and(eq(bills.id, app.billId), eq(bills.companyId, ctx.companyId)));
     if (!bill) throw notFound(`Bill ${app.billId}`);
+    // Accountant's Copy (I1): bills dated after the dividing date belong to the client.
+    await assertAccountantDatesOpen(ctx, [bill.date], 'A bill this payment pays');
     bill.currency = billCurrencyOf(bill.currency);
     if (bill.vendorId !== input.vendorId) {
       throw validation(`Bill ${app.billId} does not belong to the specified vendor.`);

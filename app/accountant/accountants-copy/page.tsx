@@ -6,7 +6,10 @@
  *                is locked; import the accountant's changes file (.ibcx) after reviewing every
  *                change; or cancel the copy.
  * Accountant:    open a client's .ibac as a new company file; in that copy, see the changes made
- *                so far and save the changes file for the client.
+ *                so far (journal entries, checks, transfers, deposits, invoices, sales receipts,
+ *                credit memos, payments, bills, bill payments, vendor credits, item receipts,
+ *                inventory adjustments, estimates / orders, applied credits, reconciliations,
+ *                accounts, classes, names and items) and save the changes file for the client.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowRightLeft, FileDown, FileUp, FolderInput, Lock, Send, XCircle } from 'lucide-react';
@@ -29,7 +32,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { desktopBridge, niceDate, postAndSave } from '@/lib/accountantCopyClient';
-import { Money, formatCurrency, toAmountString } from '@/lib/money';
+import { formatCurrency } from '@/lib/money';
 import { BackToCenter } from '../_shared';
 
 interface CopyRow {
@@ -44,7 +47,7 @@ interface CopyRow {
   importedAt: string | null;
   cancelledAt: string | null;
   accountantNote: string | null;
-  result: { applied?: { accounts: number; classes: number; added: number; changed: number; voided: number } } | null;
+  result: { applied?: Applied } | null;
 }
 interface Status {
   mode: 'none' | 'client' | 'accountant';
@@ -52,10 +55,21 @@ interface Status {
   history: CopyRow[];
   closingDate: string | null;
 }
+type Op = 'add' | 'edit' | 'void' | 'apply' | 'unapply' | 'reconcile' | 'undo';
+interface Applied {
+  accounts: number;
+  classes: number;
+  names?: number;
+  added: number;
+  changed: number;
+  voided: number;
+  applications?: number;
+  reconciliations?: number;
+}
 interface ReviewItem {
   key: string;
-  group: 'account' | 'class' | 'transaction';
-  op: 'add' | 'edit' | 'void';
+  group: 'account' | 'class' | 'name' | 'transaction' | 'application' | 'reconciliation';
+  op: Op;
   kind: string;
   date: string | null;
   title: string;
@@ -63,6 +77,7 @@ interface ReviewItem {
   before: string[] | null;
   after: string[] | null;
   problem: string | null;
+  note?: string | null;
 }
 interface Review {
   companyName: string;
@@ -72,38 +87,25 @@ interface Review {
   note: string | null;
   warnings: string[];
   items: ReviewItem[];
-  counts: { added: number; changed: number; voided: number; lists: number };
+  counts: { added: number; changed: number; voided: number; lists: number; applications?: number; reconciliations?: number };
   canImport: boolean;
   closingDate: string | null;
   needsClosingPassword: boolean;
+  formatVersion?: number;
 }
-interface TxnChange {
-  op: 'add' | 'edit' | 'void';
-  type: 'journal_entry' | 'expense' | 'transfer' | 'deposit';
-  id: string;
-  after?: {
-    date: string;
-    description?: string;
-    payeeName?: string | null;
-    memo?: string | null;
-    total?: string;
-    amount?: string;
-    lines?: Array<{ debit?: string | null; amount?: string }>;
-  };
+interface SummaryRow {
+  key: string;
+  op: Op;
+  kind: string;
+  title: string;
+  date: string | null;
+  amount: string | null;
 }
-
-const TXN_KIND: Record<TxnChange['type'], string> = {
-  journal_entry: 'Journal entry',
-  expense: 'Check / expense',
-  transfer: 'Transfer',
-  deposit: 'Deposit',
-};
 interface AccountantChanges {
   copy: { dividingDate: string; openedAt: string | null; exportedAt: string | null; exportCount: number; note: string | null };
-  accounts: Array<{ op: 'add' | 'edit'; id: string; after: { code: string; name: string } }>;
-  classes: Array<{ id: string; name: string }>;
-  transactions: TxnChange[];
   warnings: string[];
+  /** Every change in plain language (what the client will see in their review). */
+  summary: SummaryRow[];
 }
 interface TransferInfo {
   companyName: string;
@@ -119,8 +121,37 @@ interface Opened {
   dividingDate: string;
 }
 
-const OP_LABEL = { add: 'Added', edit: 'Changed', void: 'Voided' } as const;
-const OP_TONE = { add: 'success', edit: 'info', void: 'warning' } as const;
+const OP_LABEL: Record<Op, string> = {
+  add: 'Added',
+  edit: 'Changed',
+  void: 'Voided',
+  apply: 'Applied',
+  unapply: 'Unapplied',
+  reconcile: 'Reconciled',
+  undo: 'Undone',
+};
+const OP_TONE: Record<Op, 'success' | 'info' | 'warning' | 'neutral'> = {
+  add: 'success',
+  edit: 'info',
+  void: 'warning',
+  apply: 'success',
+  unapply: 'warning',
+  reconcile: 'success',
+  undo: 'warning',
+};
+
+/** "3 added, 2 changed, 1 voided, 4 list change(s), 2 application(s), 1 reconciliation(s)". */
+function appliedText(a: Applied): string {
+  const parts = [
+    `${a.added} added`,
+    `${a.changed} changed`,
+    `${a.voided} voided`,
+    `${a.accounts + a.classes + (a.names ?? 0)} list change(s)`,
+  ];
+  if (a.applications) parts.push(`${a.applications} application(s)`);
+  if (a.reconciliations) parts.push(`${a.reconciliations} reconciliation(s)`);
+  return parts.join(', ');
+}
 
 function lastMonthEnd(): string {
   const d = new Date();
@@ -234,7 +265,8 @@ function ClientStart({ status, onChanged }: { status: Status; onChanged: () => v
           <ul className="mt-2 list-disc space-y-1 pl-5">
             <li>You can&apos;t add, change or void transactions dated on or before {niceDate(dividingDate) || 'the dividing date'}.</li>
             <li>You can keep entering everything dated after it.</li>
-            <li>List entries (customers, vendors, items, accounts…) can&apos;t be deleted or merged, and accounts used on or before the dividing date can&apos;t be changed. You can still add new ones.</li>
+            <li>Bank statements dated on or before it can&apos;t be reconciled (or un-reconciled) — your accountant does those.</li>
+            <li>List entries (customers, vendors, items, accounts…) can&apos;t be deleted or merged, and accounts used on or before the dividing date can&apos;t be changed. You can still add new ones and edit names.</li>
           </ul>
           <p className="mt-3 text-xs text-navy/50">
             The file holds every user and password of this company file — only an admin can create it. Keep it private.
@@ -285,15 +317,8 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
     if (!fileJson) return;
     setBusy('import');
     try {
-      const res = await api.post<{ applied: { accounts: number; classes: number; added: number; changed: number; voided: number } }>(
-        '/api/accountant-copy/changes/import',
-        fileJson,
-      );
-      const a = res.applied;
-      toast(
-        `Imported: ${a.added} added, ${a.changed} changed, ${a.voided} voided, ${a.accounts + a.classes} list change(s). Your books are unlocked.`,
-        'success',
-      );
+      const res = await api.post<{ applied: Applied }>('/api/accountant-copy/changes/import', fileJson);
+      toast(`Imported: ${appliedText(res.applied)}. Your books are unlocked.`, 'success');
       setReview(null);
       setFileJson(null);
       onChanged();
@@ -333,6 +358,7 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
         <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-navy/70">
           <li>Transactions dated on or before {niceDate(copy.dividingDate)} are locked until you import your accountant&apos;s changes or cancel the copy.</li>
           <li>Keep entering transactions dated after {niceDate(copy.dividingDate)} as usual.</li>
+          <li>Statements dated on or before {niceDate(copy.dividingDate)} can&apos;t be reconciled here for now.</li>
           <li>List entries can&apos;t be deleted or merged for now, and accounts used on or before the dividing date can&apos;t be changed.</li>
         </ul>
         <div className="mt-5 flex flex-wrap gap-2">
@@ -361,7 +387,12 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
               <p className="text-sm text-navy/60">
                 {review.preparedBy ? `From ${review.preparedBy}, ` : ''}saved {new Date(review.createdAt).toLocaleString('en-US')} ·{' '}
                 {review.counts.added} added · {review.counts.changed} changed · {review.counts.voided} voided · {review.counts.lists} list change(s)
+                {review.counts.applications ? ` · ${review.counts.applications} application(s)` : ''}
+                {review.counts.reconciliations ? ` · ${review.counts.reconciliations} reconciliation(s)` : ''}
               </p>
+              {review.formatVersion !== undefined && review.formatVersion < 3 && (
+                <p className="text-xs text-navy/50">Made with an earlier version of Ironbooks (journal entries, checks, transfers, deposits, accounts and classes only).</p>
+              )}
             </div>
             <div className="flex gap-2">
               <Button variant="secondary" onClick={() => setReview(null)} disabled={busy === 'import'}>
@@ -415,6 +446,7 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
                       <p className="mt-1 text-sm font-medium">{i.title}</p>
                       <p className="text-xs text-navy/50">{i.kind}</p>
                       {i.problem && <p className="mt-1 text-xs font-semibold text-red-600">{i.problem}</p>}
+                      {i.note && <p className="mt-1 text-xs text-yellow-800">{i.note}</p>}
                     </Td>
                     <Td className="align-top whitespace-nowrap text-sm">{niceDate(i.date)}</Td>
                     <Td numeric className="align-top text-sm">{i.amount ? formatCurrency(i.amount) : ''}</Td>
@@ -501,8 +533,10 @@ function OpenTransferFile() {
         </h2>
         <p className="mt-1 max-w-2xl text-sm text-navy/60">
           Opening an <span className="font-mono">.ibac</span> file creates a <strong>new</strong> company file next to this one (this file is not
-          changed). In it you can make journal entries, write or fix checks and expenses, transfers and deposits, and add or edit accounts and classes — all dated on
-          or before the dividing date. Then you save a changes file for your client.
+          changed). In it you can enter and fix journal entries, checks, expenses and credit card charges, transfers, deposits, invoices, sales receipts, credit
+          memos, payments, bills, bill payments, vendor credits, item receipts, inventory adjustments, estimates and orders, apply credits, reconcile,
+          and add or edit accounts, classes, customers, vendors, items and other names — all dated on or before the dividing date. Then you save a
+          changes file for your client.
         </p>
         <Button className="mt-4" variant="secondary" onClick={() => inputRef.current?.click()} loading={busy === 'inspect'}>
           <FolderInput className="h-4 w-4" aria-hidden="true" /> Open Accountant&apos;s Copy…
@@ -569,21 +603,6 @@ function OpenTransferFile() {
   );
 }
 
-function describeTxn(t: TxnChange): string {
-  const what = TXN_KIND[t.type] ?? 'Transaction';
-  if (!t.after) return `${what} voided`;
-  const label =
-    t.type === 'journal_entry' ? t.after.description : t.type === 'expense' ? t.after.payeeName || 'check / expense' : t.after.memo || niceDate(t.after.date.slice(0, 10));
-  return `${what}: ${label ?? ''}`;
-}
-
-function txnAmount(t: TxnChange): string {
-  if (!t.after) return '';
-  if (t.type === 'expense' || t.type === 'deposit') return formatCurrency(Money.abs(t.after.total ?? '0'));
-  if (t.type === 'transfer') return formatCurrency(t.after.amount ?? '0');
-  return formatCurrency(toAmountString(Money.add(...(t.after.lines ?? []).map((l) => l.debit ?? 0))));
-}
-
 function AccountantSide({ copy, closingDate }: { copy: CopyRow; closingDate: string | null }) {
   const [changes, setChanges] = useState<AccountantChanges | null>(null);
   const [note, setNote] = useState(copy.accountantNote ?? '');
@@ -616,7 +635,7 @@ function AccountantSide({ copy, closingDate }: { copy: CopyRow; closingDate: str
     }
   }
 
-  const total = changes ? changes.accounts.length + changes.classes.length + changes.transactions.length : 0;
+  const total = changes ? changes.summary.length : 0;
 
   return (
     <>
@@ -624,7 +643,17 @@ function AccountantSide({ copy, closingDate }: { copy: CopyRow; closingDate: str
         <h2 className="text-lg font-bold text-navy">You are working in an Accountant&apos;s Copy</h2>
         <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-navy/70">
           <li>Dividing date: <strong>{niceDate(copy.dividingDate)}</strong>. You can only work on transactions dated on or before it.</li>
-          <li>You can make journal entries, write, fix or void checks and expenses, transfers and deposits, and add or edit accounts and classes. Other changes can&apos;t be sent back, so they are not available here.</li>
+          <li>
+            You can enter, change and void journal entries, checks, expenses and credit card charges, transfers, deposits, invoices, sales receipts,
+            credit memos, received payments, bills, bill payments, vendor credits and item receipts; add inventory adjustments; work on estimates, sales
+            orders and purchase orders; apply credits and journal entry lines; reconcile (and undo the last reconciliation of) statements; and add or edit
+            accounts, classes, customers, vendors, items and other names.
+          </li>
+          <li>
+            Not available here, because they can&apos;t be sent back: deleting, merging or making list entries inactive, changing a list entry&apos;s type,
+            accounts or place in the list, turning estimates, orders or item receipts into invoices or bills, refunds, bounced checks, payroll, and anything
+            dated after the dividing date.
+          </li>
           {closingDate && <li>The client&apos;s closing date ({niceDate(closingDate)}) still applies; changes on or before it need the closing date password.</li>}
           <li>When you are done, save the changes file and send it to your client. You can save it again later if you make more changes.</li>
         </ul>
@@ -652,31 +681,14 @@ function AccountantSide({ copy, closingDate }: { copy: CopyRow; closingDate: str
                 </tr>
               </thead>
               <tbody>
-                {changes.accounts.map((a) => (
-                  <Tr key={`a-${a.id}`}>
+                {changes.summary.map((r) => (
+                  <Tr key={r.key}>
                     <Td>
-                      <Badge tone={OP_TONE[a.op]}>{OP_LABEL[a.op]}</Badge> Account {a.after.code} · {a.after.name}
+                      <Badge tone={OP_TONE[r.op]}>{OP_LABEL[r.op]}</Badge> {r.title}
+                      <span className="block text-xs text-navy/50">{r.kind}</span>
                     </Td>
-                    <Td />
-                    <Td />
-                  </Tr>
-                ))}
-                {changes.classes.map((c) => (
-                  <Tr key={`c-${c.id}`}>
-                    <Td>
-                      <Badge tone="success">Added</Badge> Class {c.name}
-                    </Td>
-                    <Td />
-                    <Td />
-                  </Tr>
-                ))}
-                {changes.transactions.map((t) => (
-                  <Tr key={`${t.type}-${t.op}-${t.id}`}>
-                    <Td>
-                      <Badge tone={OP_TONE[t.op]}>{OP_LABEL[t.op]}</Badge> {describeTxn(t)}
-                    </Td>
-                    <Td className="whitespace-nowrap">{t.after ? niceDate(t.after.date) : ''}</Td>
-                    <Td numeric>{txnAmount(t)}</Td>
+                    <Td className="whitespace-nowrap">{r.date ? niceDate(r.date) : ''}</Td>
+                    <Td numeric>{r.amount ? formatCurrency(r.amount) : ''}</Td>
                   </Tr>
                 ))}
               </tbody>
@@ -738,7 +750,7 @@ function History({ rows }: { rows: CopyRow[] }) {
                   <Badge tone={s.tone}>{s.text}</Badge>
                 </Td>
                 <Td className="text-sm text-navy/70">
-                  {a ? `${a.added} added, ${a.changed} changed, ${a.voided} voided, ${a.accounts + a.classes} list change(s)` : ''}
+                  {a ? appliedText(a) : ''}
                   {r.importedAt ? ` on ${new Date(r.importedAt).toLocaleDateString('en-US')}` : ''}
                   {r.cancelledAt ? `Cancelled ${new Date(r.cancelledAt).toLocaleDateString('en-US')}` : ''}
                   {r.accountantNote ? <span className="block text-xs text-navy/50">Note: {r.accountantNote}</span> : null}

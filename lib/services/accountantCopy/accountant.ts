@@ -12,11 +12,15 @@
  *    chain "entry → its replacement → …" collapses into one change of the client's entry.
  *    Transfers post a source-less entry like a General Journal entry; those entries travel as
  *    the transfer, never as journal entries of their own.
+ *    Format 3 adds the forms of docs.ts (sales / purchase forms, payments, inventory adjustments,
+ *    estimates / orders), new and edited names and items, applications and reconciliations
+ *    (extras.ts). A form whose version only moved because something was applied to it (its digest
+ *    — digest.ts — is unchanged) is not reported as edited.
  *  - exportChangesFile: the .ibcx the client imports.
  */
 import fs from 'node:fs';
 import AdmZip from 'adm-zip';
-import { and, asc, eq, gt, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, eq, isNotNull, sql } from 'drizzle-orm';
 import { closeDb, getDb } from '@/lib/db';
 import {
   accountantCopies,
@@ -29,7 +33,6 @@ import {
   expenses,
   journalEntries,
   journalEntryLines,
-  journalItemApplications,
   transfers,
   users,
 } from '@/lib/db/schema';
@@ -47,15 +50,35 @@ import {
   TRANSFER_ENTRY,
   type AccountChange,
   type AccountPayload,
+  type ApplicationChange,
   type ChangesFileBody,
   type ClassChange,
+  type DocChange,
+  type DocType,
   type ExpensePayload,
   type JournalPayload,
+  type NameChange,
+  type NameType,
+  type ReconciliationChange,
   type TransferManifest,
   type TxnChange,
   safeCompanyName,
   serializeChangesFile,
 } from './format';
+import { DIGEST_TYPES, baselineInsertSql, recordStates } from './digest';
+import {
+  DOC_LABEL,
+  DOC_ORDER,
+  NAME_LABEL,
+  adjustmentEntriesSince,
+  describeDoc,
+  describeName,
+  docPayload,
+  namePayload,
+  type Labels,
+} from './docs';
+import { applicationChanges, describeApplication, describeReconciliation, extrasBaselineSql, reconciliationChanges } from './extras';
+import { addFileLabels, labelsOf, loadLabelMaps } from './labels';
 
 // ---------------------------------------------------------------------------
 // Open the transfer file (.ibac)
@@ -154,6 +177,10 @@ export async function openAccountantCopyFile(buffer: Buffer, targetDir: string):
         SELECT ${m.copyId}::uuid, 'account', id, edited_at FROM accounts WHERE company_id = ${m.companyId}::uuid
         UNION ALL
         SELECT ${m.copyId}::uuid, 'class', id, created_at FROM classes WHERE company_id = ${m.companyId}::uuid`);
+      // Format 3: forms, names and items (version + substance digest + state), applications and
+      // reconciliations.
+      for (const type of DIGEST_TYPES) await tx.execute(baselineInsertSql(type, m.copyId, m.companyId));
+      for (const q of extrasBaselineSql(m.copyId, m.companyId)) await tx.execute(q);
       await writeAudit(
         { db: tx as never, companyId: m.companyId, userId: null },
         {
@@ -218,26 +245,44 @@ function isGeneralJournal(sourceRef: string | null): boolean {
 }
 
 /**
- * Entity types that are business data but that the changes file can't carry (warned about).
- * 'journal_item_application': applying a General Journal A/R or A/P line to an invoice, bill or
- * another journal line — refused in the copy (guard.ts), listed here in case one gets through.
+ * Entity types that are business data but that the changes file can't carry (warned about). The
+ * route gate and the services refuse most of these in the copy; this catches anything that got
+ * through so nothing is silently lost.
  */
 const NOT_CARRIED = new Set([
-  'invoice', 'bill', 'payment_received', 'bill_payment', 'sales_receipt', 'credit_memo', 'vendor_credit',
-  'journal_item_application', 'paycheck', 'pay_run', 'item_receipt', 'purchase_order', 'sales_order', 'estimate',
-  'inventory_transfer', 'inventory_layer', 'reconciliation', 'bank_transaction', 'time_entry', 'expense_report',
+  'paycheck', 'pay_run', 'inventory_transfer', 'bank_transaction', 'time_entry', 'expense_report',
   'loan_payment', 'landed_cost_allocation', 'home_currency_adjustment', 'sales_tax_adjustment',
-  'invoice_write_off', 'customer', 'vendor', 'item', 'employee', 'other_name', 'job', 'location', 'sales_rep',
+  'invoice_write_off', 'employee', 'job', 'location', 'sales_rep', 'bank_account',
   'payroll_item', 'tax_rate', 'tax_agency', 'price_level', 'fixed_asset', 'company', 'company_settings', 'fiscal_period',
 ]);
+
+/** One line of the accountant's "changes so far" list. */
+export interface ChangeSummaryRow {
+  key: string;
+  op: 'add' | 'edit' | 'void' | 'apply' | 'unapply' | 'reconcile' | 'undo';
+  kind: string;
+  title: string;
+  date: string | null;
+  amount: string | null;
+}
 
 export interface AccountantChanges {
   copy: { id: string; dividingDate: string; openedAt: string | null; exportedAt: string | null; exportCount: number; note: string | null };
   accounts: AccountChange[];
   classes: ClassChange[];
   transactions: TxnChange[];
+  names: NameChange[];
+  documents: DocChange[];
+  applications: ApplicationChange[];
+  reconciliations: ReconciliationChange[];
   warnings: string[];
+  /** Every change in plain language (what the client will see in their review). */
+  summary: ChangeSummaryRow[];
 }
+
+/** Sales / purchase orders: status changes a user makes (partial / closed by receiving count as open). */
+const userState = (type: DocType, state: string) =>
+  type === 'sales_order' || type === 'purchase_order' ? (state === 'void' ? 'void' : state === 'closed' ? 'closed' : 'open') : state;
 
 async function journalPayload(ctx: ServiceContext, entry: typeof journalEntries.$inferSelect): Promise<JournalPayload> {
   const lines = await ctx.db
@@ -251,6 +296,7 @@ async function journalPayload(ctx: ServiceContext, entry: typeof journalEntries.
     reference: entry.reference,
     isAdjusting: entry.isAdjusting,
     entryNumber: entry.entryNumber,
+    postedId: entry.id,
     lines: lines.map((l) => ({
       accountId: l.accountId,
       debit: l.debit != null && Number(l.debit) !== 0 ? toAmountString(l.debit) : null,
@@ -333,6 +379,12 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
     base.get(r.entityType)!.set(r.entityId, r.version);
   }
   const baseOf = (t: string) => base.get(t) ?? new Map<string, Date | null>();
+  const full = new Map<string, Map<string, (typeof baseRows)[number]>>();
+  for (const r of baseRows) {
+    if (!full.has(r.entityType)) full.set(r.entityType, new Map());
+    full.get(r.entityType)!.set(r.entityId, r);
+  }
+  const fullOf = (t: string) => full.get(t) ?? new Map<string, (typeof baseRows)[number]>();
 
   // ---- Accounts (parents first) ----
   const accountChanges: AccountChange[] = [];
@@ -469,10 +521,10 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
       const v = baseTr.get(t.id) ?? null;
       if (sameVersion(t.updatedAt, v)) continue;
       if (t.voidedAt) txns.push({ op: 'void', type: 'transfer', id: t.id, baseVersion: iso(v) });
-      else txns.push({ op: 'edit', type: 'transfer', id: t.id, baseVersion: iso(v), after: transferPayloadOf(t) });
+      else txns.push({ op: 'edit', type: 'transfer', id: t.id, baseVersion: iso(v), after: { ...transferPayloadOf(t), postedEntryId: t.postedEntryId } });
       continue;
     }
-    if (!t.voidedAt) txns.push({ op: 'add', type: 'transfer', id: t.id, after: transferPayloadOf(t) });
+    if (!t.voidedAt) txns.push({ op: 'add', type: 'transfer', id: t.id, after: { ...transferPayloadOf(t), postedEntryId: t.postedEntryId } });
   }
 
   // ---- Deposits ----
@@ -493,21 +545,77 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
     if (!x.voidedAt) txns.push({ op: 'add', type: 'deposit', id: x.id, after: await depositPayloadOf(ctx, x.id) });
   }
 
-  // ---- Anything in the transaction log the file can't carry ----
   const warnings: string[] = [];
-  // Journal item applications (General Journal A/R / A/P line applied to an invoice, bill or
-  // journal line) audit as their journal entry / payment, so they are found in their own table.
-  if (copy.openedAt) {
-    const [apps] = await ctx.db
-      .select({ n: sql<number>`count(*)::int` })
-      .from(journalItemApplications)
-      .where(and(eq(journalItemApplications.companyId, ctx.companyId), gt(journalItemApplications.createdAt, copy.openedAt)));
-    if (apps && apps.n > 0) {
-      warnings.push(
-        `${apps.n} journal entry line application(s) (a General Journal A/R or A/P line applied to an invoice, bill or another journal line) were made in this copy and can't be sent back. Tell your client what to apply.`,
-      );
+
+  // ---- Names and items (new ones, parents first; edits of the fields a copy may change) ----
+  const names: NameChange[] = [];
+  for (const type of ['customer', 'vendor', 'other_name', 'item'] as NameType[]) {
+    const b = fullOf(type);
+    const states = await recordStates(ctx, type);
+    const added: Array<{ id: string; after: Record<string, unknown> }> = [];
+    for (const st of states.values()) {
+      const row = b.get(st.id);
+      if (!row) {
+        added.push({ id: st.id, after: await namePayload(ctx, type, st.id) });
+        continue;
+      }
+      if (row.digest !== null && st.digest === row.digest) continue;
+      if (row.digest === null) continue; // baseline from an older copy: nothing to compare against
+      names.push({ op: 'edit', type, id: st.id, baseVersion: iso(row.version), baseDigest: row.digest, after: await namePayload(ctx, type, st.id, true) });
+    }
+    // Sub-customers after their parent.
+    const ids = new Set(added.map((a) => a.id));
+    const placedNames = new Set<string>();
+    while (placedNames.size < added.length) {
+      const before = placedNames.size;
+      for (const a of added) {
+        if (placedNames.has(a.id)) continue;
+        const parent = a.after.parentId as string | null | undefined;
+        if (parent && ids.has(parent) && !placedNames.has(parent)) continue;
+        names.push({ op: 'add', type, id: a.id, after: a.after });
+        placedNames.add(a.id);
+      }
+      if (placedNames.size === before) break;
     }
   }
+
+  // ---- Sales / purchase forms, payments, inventory adjustments ----
+  const documents: DocChange[] = [];
+  for (const type of DOC_ORDER) {
+    if (type === 'inventory_adjustment') {
+      if (copy.openedAt) {
+        for (const entryId of await adjustmentEntriesSince(ctx, copy.openedAt)) {
+          documents.push({ op: 'add', type, id: entryId, after: await docPayload(ctx, type, entryId) });
+        }
+      }
+      continue;
+    }
+    const b = fullOf(type);
+    const states = [...(await recordStates(ctx, type)).values()].sort((x, y) => (x.day ?? '').localeCompare(y.day ?? ''));
+    for (const st of states) {
+      const row = b.get(st.id);
+      if (!row) {
+        if (st.state !== 'void') documents.push({ op: 'add', type, id: st.id, after: await docPayload(ctx, type, st.id) });
+        continue;
+      }
+      const was = userState(type, row.state ?? 'live');
+      const now = userState(type, st.state);
+      if (row.digest === st.digest && was === now) continue;
+      if (was === 'void') continue; // a void record can't be changed back
+      if (now === 'void') {
+        documents.push({ op: 'void', type, id: st.id, baseVersion: iso(row.version), baseDigest: row.digest });
+        continue;
+      }
+      documents.push({ op: 'edit', type, id: st.id, baseVersion: iso(row.version), baseDigest: row.digest, after: await docPayload(ctx, type, st.id) });
+    }
+  }
+
+  // ---- Applications and reconciliations ----
+  const applications = await applicationChanges(ctx, full, copy.openedAt);
+  const recon = await reconciliationChanges(ctx, full);
+  warnings.push(...recon.warnings);
+
+  // ---- Anything in the transaction log the file can't carry ----
   const dir = dataDirOf(ctx.db);
   if (dir && copy.baselineLogSeq != null) {
     const seen = new Map<string, number>();
@@ -521,7 +629,7 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
     }
   }
 
-  return {
+  const out: Omit<AccountantChanges, 'summary'> = {
     copy: {
       id: copy.id,
       dividingDate: copy.dividingDate,
@@ -533,8 +641,80 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
     accounts: accountChanges,
     classes: classChanges,
     transactions: txns,
+    names,
+    documents,
+    applications,
+    reconciliations: recon.changes,
     warnings,
   };
+  const maps = await loadLabelMaps(ctx);
+  addFileLabels(maps, out);
+  return { ...out, summary: summarize(out, labelsOf(maps)) };
+}
+
+const TXN_KIND: Record<TxnChange['type'], string> = {
+  journal_entry: 'Journal entry',
+  expense: 'Check / expense',
+  transfer: 'Transfer',
+  deposit: 'Deposit',
+};
+
+/** The changes in plain language, in the order the client's import applies them. */
+export function summarize(c: Omit<AccountantChanges, 'summary'>, L: Labels): ChangeSummaryRow[] {
+  const rows: ChangeSummaryRow[] = [];
+  for (const a of c.accounts) {
+    rows.push({ key: `account:${a.id}`, op: a.op, kind: 'Account', title: `${a.op === 'add' ? 'New' : 'Changed'} account ${a.after.code} · ${a.after.name}`, date: null, amount: null });
+  }
+  for (const k of c.classes) rows.push({ key: `class:${k.id}`, op: 'add', kind: 'Class', title: `New class ${k.name}`, date: null, amount: null });
+  for (const n of c.names) {
+    const d = describeName(n.type, n.after, L);
+    rows.push({ key: `${n.type}:${n.id}`, op: n.op, kind: NAME_LABEL[n.type], title: `${n.op === 'add' ? 'New' : 'Changed'} ${d.title.charAt(0).toLowerCase()}${d.title.slice(1)}`, date: null, amount: null });
+  }
+  for (const t of c.transactions) {
+    const verb = t.op === 'add' ? 'New' : t.op === 'edit' ? 'Changed' : 'Voided';
+    let title = `${verb} ${TXN_KIND[t.type].toLowerCase()}`;
+    let amount: string | null = null;
+    if (t.op !== 'void') {
+      if (t.type === 'journal_entry') {
+        title += `: ${t.after.description}`;
+        amount = toAmountString(t.after.lines.reduce((s, l) => s + Number(l.debit ?? 0), 0));
+      } else if (t.type === 'expense') {
+        title += ` to ${t.after.vendorId ? L.name(t.after.vendorId) : t.after.payeeName ?? 'payee'}`;
+        amount = toAmountString(t.after.total.replace(/^-/, ''));
+      } else if (t.type === 'transfer') {
+        title += ` from ${L.account(t.after.fromAccountId)} to ${L.account(t.after.toAccountId)}`;
+        amount = toAmountString(t.after.amount);
+      } else {
+        title += ` to ${L.account(t.after.depositAccountId)}`;
+        amount = toAmountString(t.after.total);
+      }
+    }
+    rows.push({ key: `${t.type}:${t.op}:${t.id}`, op: t.op, kind: TXN_KIND[t.type], title, date: t.op === 'void' ? null : ymd(new Date(t.after.date)), amount });
+  }
+  for (const d of c.documents) {
+    if (d.op === 'void') {
+      rows.push({ key: `${d.type}:void:${d.id}`, op: 'void', kind: DOC_LABEL[d.type], title: `Voided ${DOC_LABEL[d.type].toLowerCase()} (${L.doc(d.id)})`, date: null, amount: null });
+      continue;
+    }
+    const x = describeDoc(d.type, d.after, L);
+    rows.push({
+      key: `${d.type}:${d.op}:${d.id}`,
+      op: d.op,
+      kind: DOC_LABEL[d.type],
+      title: `${d.op === 'add' ? 'New' : 'Changed'}: ${x.title}`,
+      date: ymd(new Date(String(d.after.date))),
+      amount: x.amount,
+    });
+  }
+  for (const a of c.applications) {
+    const x = describeApplication(a, L);
+    rows.push({ key: `application:${a.kind}:${a.op}:${a.id}`, op: a.op, kind: 'Application', title: x.title, date: ymd(new Date(a.date)), amount: toAmountString(a.amount) });
+  }
+  for (const r of c.reconciliations) {
+    const x = describeReconciliation(r, L);
+    rows.push({ key: `reconciliation:${r.op}:${r.id}`, op: r.op, kind: 'Reconciliation', title: x.title, date: ymd(new Date(r.statementDate)), amount: toAmountString(r.statementBalance) });
+  }
+  return rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -544,14 +724,30 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
 export interface ChangesFileResult {
   buffer: Buffer;
   filename: string;
-  counts: { accounts: number; classes: number; transactions: number };
+  counts: {
+    accounts: number;
+    classes: number;
+    transactions: number;
+    names: number;
+    documents: number;
+    applications: number;
+    reconciliations: number;
+  };
 }
 
 export async function exportChangesFile(ctx: ServiceContext, input: { note?: string | null } = {}): Promise<ChangesFileResult> {
   const copy = await accountantSideCopy(ctx);
   const changes = await accountantChanges(ctx);
   const note = input.note?.trim() ? input.note.trim().slice(0, 20_000) : null;
-  if (!changes.accounts.length && !changes.classes.length && !changes.transactions.length && !note) {
+  const total =
+    changes.accounts.length +
+    changes.classes.length +
+    changes.transactions.length +
+    changes.names.length +
+    changes.documents.length +
+    changes.applications.length +
+    changes.reconciliations.length;
+  if (!total && !note) {
     throw validation('There are no changes to send yet. Make your journal entries or other changes first, or add a note for your client.');
   }
   const [co] = await ctx.db.select({ name: companies.name }).from(companies).where(eq(companies.id, ctx.companyId));
@@ -573,6 +769,10 @@ export async function exportChangesFile(ctx: ServiceContext, input: { note?: str
     accounts: changes.accounts,
     classes: changes.classes,
     transactions: changes.transactions,
+    names: changes.names,
+    documents: changes.documents,
+    applications: changes.applications,
+    reconciliations: changes.reconciliations,
     warnings: changes.warnings,
   };
   const buffer = serializeChangesFile(body);
@@ -597,6 +797,10 @@ export async function exportChangesFile(ctx: ServiceContext, input: { note?: str
           accounts: changes.accounts.length,
           classes: changes.classes.length,
           transactions: changes.transactions.length,
+          names: changes.names.length,
+          documents: changes.documents.length,
+          applications: changes.applications.length,
+          reconciliations: changes.reconciliations.length,
         },
       },
     );
@@ -605,6 +809,14 @@ export async function exportChangesFile(ctx: ServiceContext, input: { note?: str
   return {
     buffer,
     filename: `${safeCompanyName(body.companyName)} (Accountant Changes ${stamp}).${CHANGES_EXTENSION}`,
-    counts: { accounts: changes.accounts.length, classes: changes.classes.length, transactions: changes.transactions.length },
+    counts: {
+      accounts: changes.accounts.length,
+      classes: changes.classes.length,
+      transactions: changes.transactions.length,
+      names: changes.names.length,
+      documents: changes.documents.length,
+      applications: changes.applications.length,
+      reconciliations: changes.reconciliations.length,
+    },
   };
 }

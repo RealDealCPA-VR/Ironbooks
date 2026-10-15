@@ -373,8 +373,8 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   // ---- Accountant's Copy (I1) / Period Copy (I7) ----
   '/accountant/accountants-copy': {
     title: "Accountant's Copy",
-    what: 'Send your books to your accountant while you keep working. They fix things dated on or before a dividing date; you keep entering everything after it, then bring their changes in after reviewing them.',
-    first: 'Pick the dividing date and create the copy. When the changes come back, import them here.',
+    what: 'Your accountant fixes anything dated on or before a dividing date (entries, sales, bills, payments, reconciliations) while you keep working after it; then you review and import their changes.',
+    first: 'Pick the dividing date and create the copy. When the changes file comes back, open it here, check each change, then import.',
     qb: "Accountant's Copy",
   },
   '/accountant/period-copy': {
