@@ -30,6 +30,7 @@ import {
   PageHeader,
   toast,
   toastError,
+  useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 // wave2 prefs: Memorize (Ctrl+M)
@@ -237,6 +238,9 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
     setLines((prev) => (prev[idx]?.billed ? prev : prev.filter((_, i) => i !== idx)));
   }
 
+  // Line-grid keys: Enter / Down next line (adds one at the end), Ctrl+Insert, Ctrl+D.
+  const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
+
   const liveTotal = computeTotal(lines);
 
   // Only expense/asset accounts are valid targets for PO lines.
@@ -413,7 +417,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
             </Button>
           </div>
 
-          <div className="rounded-lg border border-slate-200 overflow-hidden">
+          <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
             {/* Header row */}
             <div className="grid grid-cols-[1.1fr_1.1fr_1fr_70px_80px_28px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
               <span>Item</span>
@@ -427,6 +431,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
             {lines.map((line, idx) => (
               <div
                 key={idx}
+                data-grid-row
                 className="grid grid-cols-[1.1fr_1.1fr_1fr_70px_80px_28px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
               >
                 <Select

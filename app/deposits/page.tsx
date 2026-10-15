@@ -21,6 +21,7 @@ import {
   Modal,
   PageHeader,
   toast, toastError,
+  useGridKeys,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
@@ -256,6 +257,13 @@ function MakeDepositModal({
       return next;
     });
   }
+
+  // Line-grid keys for the additional lines: Enter / Down next line (adds one), Ctrl+Insert, Ctrl+D.
+  const extraGrid = useGridKeys({
+    addRow: () => setExtraLines((prev) => [...prev, emptyExtraLine()]),
+    removeRow: (i) => setExtraLines((prev) => prev.filter((_, k) => k !== i)),
+    disabled: saving,
+  });
 
   function patchExtraLine(index: number, patch: Partial<ExtraLine>) {
     setExtraLines((prev) => prev.map((l, i) => (i === index ? { ...l, ...patch } : l)));
@@ -551,9 +559,9 @@ function MakeDepositModal({
               For funds not in Undeposited Funds — e.g. an owner contribution or refund.
             </p>
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-2" onKeyDown={extraGrid.onKeyDown}>
               {extraLines.map((l, idx) => (
-                <div key={idx} className="flex gap-2 items-center">
+                <div key={idx} data-grid-row className="flex gap-2 items-center">
                   <div className="flex-1 min-w-0">
                     <Select
                       value={l.accountId}

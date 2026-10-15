@@ -21,6 +21,7 @@ import {
   PageHeader,
   toast,
   toastError,
+  useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { Money, formatCurrency } from '@/lib/money';
@@ -256,6 +257,18 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editId]);
 
+  // Line-grid keys: Enter / Down next line (adds one at the end), Ctrl+Insert, Ctrl+D.
+  const expenseGrid = useGridKeys({
+    addRow: () => setLines((p) => [...p, { ...EMPTY_LINE }]),
+    removeRow: (idx) => setLines((p) => (p.length === 1 ? [{ ...EMPTY_LINE }] : p.filter((_, i) => i !== idx))),
+    disabled: saving,
+  });
+  const itemGrid = useGridKeys({
+    addRow: () => setItemLines((p) => [...p, { ...EMPTY_ITEM_LINE }]),
+    removeRow: (idx) => setItemLines((p) => (p.length === 1 ? [{ ...EMPTY_ITEM_LINE }] : p.filter((_, i) => i !== idx))),
+    disabled: saving,
+  });
+
   function updateLine(idx: number, field: keyof CreditLine, value: string) {
     setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, [field]: value, ...(field === 'customerId' ? { jobId: '' } : {}) } : l)));
   }
@@ -481,7 +494,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
           </div>
 
           {tab === 'expenses' ? (
-            <div className="rounded-lg border border-slate-200 overflow-x-auto">
+            <div className="rounded-lg border border-slate-200 overflow-x-auto" onKeyDown={expenseGrid.onKeyDown}>
               <div className="grid min-w-[760px] grid-cols-[1.3fr_1fr_90px_1fr_1.3fr_28px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
                 <span>Account</span>
                 <span>Memo</span>
@@ -493,6 +506,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
               {lines.map((line, idx) => (
                 <div
                   key={idx}
+                  data-grid-row
                   className="grid min-w-[760px] grid-cols-[1.3fr_1fr_90px_1fr_1.3fr_28px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
                 >
                   <Select aria-label="Account" value={line.accountId} onChange={(e) => updateLine(idx, 'accountId', e.target.value)}>
@@ -518,7 +532,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
               ))}
             </div>
           ) : (
-            <div className="rounded-lg border border-slate-200 overflow-x-auto">
+            <div className="rounded-lg border border-slate-200 overflow-x-auto" onKeyDown={itemGrid.onKeyDown}>
               <div className="grid min-w-[880px] grid-cols-[1.3fr_1fr_70px_80px_90px_1fr_1.3fr_28px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
                 <span>Item</span>
                 <span>Description</span>
@@ -532,6 +546,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
               {itemLines.map((line, idx) => (
                 <div
                   key={idx}
+                  data-grid-row
                   className="grid min-w-[880px] grid-cols-[1.3fr_1fr_70px_80px_90px_1fr_1.3fr_28px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
                 >
                   <Select aria-label="Item" value={line.itemId} onChange={(e) => updateItemLine(idx, 'itemId', e.target.value)}>

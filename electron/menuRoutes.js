@@ -92,6 +92,7 @@ const MENU_SECTIONS = [
       { label: 'Reconcile', route: '/reconcile' },
       { label: 'Bank Feeds', route: '/bank-feeds' },
       { label: 'Print Checks', route: '/print-checks' },
+      { label: 'Enter Batch Transactions', route: '/accountant/batch-enter' },
     ],
   },
   {

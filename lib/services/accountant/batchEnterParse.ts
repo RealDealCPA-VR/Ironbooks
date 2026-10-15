@@ -1,6 +1,7 @@
 /**
  * Batch Enter Transactions — pure helpers shared by the grid UI and the service (no DB imports).
- * Column layouts per transaction type and a tolerant "paste from Excel" (tab-separated) parser.
+ * Column layouts per transaction type, a tolerant "paste from Excel / Google Sheets" parser with
+ * header-based column mapping, and spreadsheet-style block paste.
  */
 
 export const BATCH_ENTER_TYPES = [
@@ -77,51 +78,215 @@ export const BATCH_COLUMN_LABELS: Record<BatchColumn, string> = {
   dueDate: 'Due date',
 };
 
-const HEADER_HINTS = /^(date|txn date|transaction date)$/i;
+// ---------------------------------------------------------------------------
+// Clipboard grid parsing + column mapping ("Paste from Excel / Google Sheets")
+// ---------------------------------------------------------------------------
+
+/**
+ * Split clipboard text into rows of cells. Excel and Google Sheets copy cells as TSV: a tab
+ * between cells, CR/LF between rows, and a cell that itself holds a tab, line break or quote is
+ * wrapped in double quotes with "" escapes. Text without any tab is read as CSV (commas).
+ * Blank rows are dropped; cell text is trimmed.
+ */
+export function parseClipboardGrid(text: string): string[][] {
+  const src = text.replace(/\r\n?/g, '\n');
+  const delim = src.includes('\t') ? '\t' : ',';
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let quoted = false;
+  let atCellStart = true;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (quoted) {
+      if (ch === '"' && src[i + 1] === '"') {
+        cell += '"';
+        i++;
+      } else if (ch === '"') quoted = false;
+      else cell += ch;
+      continue;
+    }
+    if (ch === '"' && atCellStart) {
+      quoted = true;
+      atCellStart = false;
+    } else if (ch === delim) {
+      row.push(cell);
+      cell = '';
+      atCellStart = true;
+    } else if (ch === '\n') {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+      atCellStart = true;
+    } else {
+      cell += ch;
+      if (ch !== ' ') atCellStart = false;
+    }
+  }
+  if (cell !== '' || row.length > 0) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows.map((r) => r.map((c) => c.trim())).filter((r) => r.some((c) => c !== ''));
+}
+
+/** Spreadsheet header words people actually use, per grid column (compared after normalizing). */
+export const BATCH_COLUMN_ALIASES: Record<BatchColumn, string[]> = {
+  date: ['date', 'txn date', 'transaction date', 'trans date', 'posting date', 'posted', 'check date', 'bill date', 'invoice date', 'entry date'],
+  ref: ['ref', 'ref no', 'ref #', 'reference', 'no', 'num', 'number', '#', 'check no', 'check #', 'check number', 'chk', 'chk #', 'bill no', 'bill #', 'bill number', 'invoice no', 'invoice #', 'invoice number', 'doc no', 'document', 'entry no', 'entry #', 'je no', 'je #'],
+  name: ['name', 'payee', 'vendor', 'supplier', 'customer', 'customer job', 'client', 'received from', 'pay to', 'paid to', 'pay to the order of', 'merchant', 'from'],
+  account: ['account', 'acct', 'account no', 'account number', 'account name', 'gl account', 'category', 'expense account', 'income account', 'from account', 'split'],
+  amount: ['amount', 'amt', 'total', 'value', 'sum', 'payment', 'charge', 'deposit'],
+  debit: ['debit', 'debits', 'dr', 'debit amount'],
+  credit: ['credit', 'credits', 'cr', 'credit amount'],
+  memo: ['memo', 'description', 'desc', 'note', 'notes', 'details', 'detail', 'comment'],
+  className: ['class', 'department', 'dept', 'division'],
+  dueDate: ['due', 'due date', 'date due', 'due on'],
+};
+
+function normHeader(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9#]+/g, ' ')
+    .trim();
+}
+
+/** The grid column a spreadsheet header names, or null. */
+export function columnForHeader(header: string): BatchColumn | null {
+  const h = normHeader(header);
+  if (!h) return null;
+  for (const [col, aliases] of Object.entries(BATCH_COLUMN_ALIASES) as Array<[BatchColumn, string[]]>) {
+    if (aliases.some((a) => normHeader(a) === h)) return col;
+  }
+  return null;
+}
+
+/** Columns a type can receive from a paste (journal entries may also take one signed Amount). */
+export function mappableColumns(type: BatchEnterType): BatchColumn[] {
+  const cols = batchColumns(type);
+  return type === 'journal' ? [...cols, 'amount'] : cols;
+}
+
+export interface ColumnMappingGuess {
+  /** True when the first pasted row is a header row (it is then not imported). */
+  hasHeader: boolean;
+  /** Target grid column for each pasted column (null = ignore that column). */
+  mapping: Array<BatchColumn | null>;
+}
+
+/** A cell that is clearly data (a date or a formatted amount), so its row is not a header. */
+function looksLikeData(cell: string): boolean {
+  if (/^\d{1,5}$/.test(cell)) return false; // could be a header like "#" neighbour or a number column
+  if (normalizeDate(cell) !== null) return true;
+  return /\d/.test(cell) && /[.,$]/.test(cell) && normalizeAmount(cell) !== null;
+}
+
+/**
+ * Guess how pasted columns map onto the grid. A first row whose cells read like headers
+ * ("Date", "Payee", "Check #", "Amount"...) is a header row and maps columns by name, in any
+ * order; columns with unknown headers are ignored. Without a header the columns are taken in the
+ * grid's own order (batchColumns).
+ */
+export function guessColumnMapping(grid: string[][], type: BatchEnterType): ColumnMappingGuess {
+  const width = grid.reduce((w, r) => Math.max(w, r.length), 0);
+  const allowed = new Set(mappableColumns(type));
+  const first = grid[0] ?? [];
+  const named = first.map((c) => columnForHeader(c));
+  const recognised = named.filter((c) => c !== null).length;
+  const hasHeader = recognised > 0 && !first.some(looksLikeData);
+  if (hasHeader) {
+    const used = new Set<BatchColumn>();
+    const mapping = Array.from({ length: width }, (_, i) => {
+      let col = named[i] ?? null;
+      // "Debit"/"Credit" headers on a single-amount type fold into Amount (first one wins).
+      if (col && !allowed.has(col)) {
+        col = (col === 'debit' || col === 'credit') && allowed.has('amount') ? 'amount' : null;
+      }
+      if (col && used.has(col)) col = null;
+      if (col) used.add(col);
+      return col;
+    });
+    return { hasHeader, mapping };
+  }
+  const cols = batchColumns(type);
+  return { hasHeader: false, mapping: Array.from({ length: width }, (_, i) => cols[i] ?? null) };
+}
+
+/**
+ * Turn pasted cells into grid rows using a column mapping. Rows with nothing in any mapped
+ * column are skipped. For journal entries a mapped signed "Amount" fills Debit (positive) or
+ * Credit (negative) when that row has neither.
+ */
+export function applyColumnMapping(
+  grid: string[][],
+  mapping: Array<BatchColumn | null>,
+  options: { hasHeader: boolean; type: BatchEnterType },
+): BatchEnterRow[] {
+  const out: BatchEnterRow[] = [];
+  const data = options.hasHeader ? grid.slice(1) : grid;
+  for (const cells of data) {
+    const row: BatchEnterRow = { date: '', account: '' };
+    let any = false;
+    mapping.forEach((col, j) => {
+      const v = (cells[j] ?? '').trim();
+      if (!col || v === '') return;
+      (row as unknown as Record<string, string>)[col] = v;
+      any = true;
+    });
+    if (!any) continue;
+    if (options.type === 'journal' && row.amount !== undefined) {
+      const amt = normalizeAmount(row.amount);
+      if (!row.debit && !row.credit && amt !== null) {
+        if (amt.startsWith('-')) row.credit = amt.slice(1);
+        else row.debit = amt;
+      }
+      delete row.amount;
+    }
+    out.push(row);
+  }
+  return out;
+}
 
 /**
  * Parse text copied from Excel / Google Sheets (tab-separated; comma-separated accepted when no
- * tabs are present). A first row whose first cell reads "Date" is treated as a header and skipped.
- * Blank lines are ignored.
+ * tabs are present) into grid rows. A header row is recognised and used to map the columns;
+ * without one the columns follow the grid's order. Blank lines are ignored.
  */
 export function parseBatchPaste(text: string, type: BatchEnterType): BatchEnterRow[] {
-  const cols = batchColumns(type);
-  const lines = text.replace(/\r\n?/g, '\n').split('\n').filter((l) => l.trim() !== '');
-  const useTabs = lines.some((l) => l.includes('\t'));
-  const rows: BatchEnterRow[] = [];
-  lines.forEach((line, i) => {
-    const cells = (useTabs ? line.split('\t') : splitCsv(line)).map((c) => c.trim());
-    if (i === 0 && HEADER_HINTS.test(cells[0] ?? '')) return;
-    const row: BatchEnterRow = { date: '', account: '' };
-    cols.forEach((c, j) => {
-      const v = cells[j];
-      if (v !== undefined && v !== '') (row as unknown as Record<string, string>)[c] = v;
-    });
-    rows.push(row);
-  });
-  return rows;
+  const grid = parseClipboardGrid(text);
+  const guess = guessColumnMapping(grid, type);
+  return applyColumnMapping(grid, guess.mapping, { hasHeader: guess.hasHeader, type });
 }
 
-function splitCsv(line: string): string[] {
-  const out: string[] = [];
-  let cur = '';
-  let q = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (q) {
-      if (ch === '"' && line[i + 1] === '"') {
-        cur += '"';
-        i++;
-      } else if (ch === '"') q = false;
-      else cur += ch;
-    } else if (ch === '"') q = true;
-    else if (ch === ',') {
-      out.push(cur);
-      cur = '';
-    } else cur += ch;
-  }
-  out.push(cur);
-  return out;
+/**
+ * Paste a block of cells into the grid at a cell, the way a spreadsheet does: the block's top
+ * left cell lands on (row, col) and the rest fills right and down, adding rows as needed. Cells
+ * that fall past the last column are dropped. Returns the new rows (the input is not changed).
+ */
+export function pasteBlockAt(
+  rows: BatchEnterRow[],
+  at: { row: number; col: number },
+  block: string[][],
+  type: BatchEnterType,
+): BatchEnterRow[] {
+  const cols = batchColumns(type);
+  const next = rows.map((r) => ({ ...r }));
+  block.forEach((cells, i) => {
+    const r = at.row + i;
+    while (next.length <= r) next.push({ date: '', account: '' });
+    cells.forEach((v, j) => {
+      const col = cols[at.col + j];
+      if (!col) return;
+      (next[r] as unknown as Record<string, string>)[col] = v;
+    });
+  });
+  return next;
+}
+
+/** True when nothing is typed in the row. */
+export function isBlankBatchRow(row: BatchEnterRow): boolean {
+  return !Object.values(row).some((v) => typeof v === 'string' && v.trim() !== '');
 }
 
 /**
