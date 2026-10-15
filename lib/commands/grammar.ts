@@ -20,7 +20,7 @@
 import { findDateProblem, parseDateRange, parseSingleDate, yearToDate, type DateRangeOptions } from './dates';
 import type { CommandIntent, CreateIntent, FormKind, IntentLine, ReportIntent } from './intent';
 import { isSalesForm } from './intent';
-import { NUM_TOKEN, cut, isReasonableQuantity, looksLikeMoney, parseNumber, tidy } from './text';
+import { NEG_NUM_TOKEN, NUM_TOKEN, cut, isReasonableQuantity, looksLikeMoney, parseNumber, tidy } from './text';
 
 const re = (src: string, flags = 'i') => new RegExp(src, flags);
 
@@ -117,9 +117,57 @@ function cleanSubject(s: string | undefined): string | undefined {
   return t;
 }
 
+/**
+ * Words that name a period the date parser could not read ("in Q5", "for Q0 2026", "next
+ * quarter", "in Septmber 2026", "fifth quarter", "FY27"). Without this the question would be
+ * answered for year to date — a silent replacement of what was asked.
+ */
+const UNKNOWN_PERIOD = re(
+  // Forward-looking phrases ("next quarter") need no preposition; the rest do ("in Q5").
+  String.raw`\b(?:(?:in|during|for|over|of)\s+(?:the\s+)?)?((?:next|coming|following|upcoming)\s+(?:\d+\s+)?(?:days?|weeks?|months?|quarters?|years?|fiscal\s+years?|half|periods?))` +
+    String.raw`(?=\s*$|\s+(?:on|for|at|with|from|to|by)\b)|` +
+    String.raw`\b(?:in|during|for|over|of)\s+(?:the\s+)?(` +
+    [
+      String.raw`q\d+(?:\s*(?:of\s+|,\s*)?(?:\d{4}|'\d{2}))?`,
+      String.raw`(?:fy|fiscal\s+year)\s*'?\d{2,4}`,
+      String.raw`h[1-4](?:\s+\d{4})?`,
+      String.raw`(?:first|second|third|fourth|fifth|sixth|\d+(?:st|nd|rd|th))\s+(?:quarter|half)(?:\s+(?:of\s+)?\d{4})?`,
+      String.raw`(?:next|coming|following|upcoming|last|this|previous|prior|current|past)\s+(?:\d+\s+)?(?:days?|weeks?|months?|quarters?|years?|fiscal\s+years?|calendar\s+years?|half|periods?|seasons?)`,
+      String.raw`\d{1,4}(?:[-/]\d{1,2}){1,2}`,
+      String.raw`(?:1[0-8]|2[1-9])\d{2}`,
+      String.raw`[a-z]{3,}\s+(?:19|20)\d{2}`,
+    ].join('|') +
+    String.raw`)(?=\s*$|\s+(?:on|for|at|with|from|to|by)\b)`,
+  'gi',
+);
+
+/**
+ * Period words in `text` that the date parser cannot read in full ("Q5", "Q0 2026", "Septmber
+ * 2026", "next quarter"), or null. "Q3 2025" or "July 2026" are read in full, so they pass.
+ */
+export function findUnknownPeriod(text: string, today: Date, opts: DateRangeOptions = {}): { words: string; matched: string } | null {
+  const norm = (x: string) => x.trim().replace(/\s+/g, ' ').toLowerCase();
+  UNKNOWN_PERIOD.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = UNKNOWN_PERIOD.exec(text))) {
+    const words = m[1] ?? m[2];
+    const known = parseDateRange(words, today, opts);
+    if (known && norm(known.matched) === norm(words)) continue;
+    return { words, matched: m[0] };
+  }
+  return null;
+}
+
+function unknownPeriodMessage(words: string): string {
+  return `I don't know the period “${words.slice(0, 40)}” — use Q1–Q4, a month, “last month”, “this year”, or from/to dates.`;
+}
+
 export function parseQuestion(raw: string, today: Date, opts: DateRangeOptions = {}): CommandIntent | null {
   const rm = parseDateRange(raw, today, opts);
-  const rest = cleanCommand(rm ? cut(raw, rm.matched) : raw);
+  // A period that is there but unreadable ("in Q5") is reported, never replaced by year to date.
+  const unknown = findUnknownPeriod(raw, today, opts);
+  const base = unknown ? cut(raw, unknown.matched) : raw;
+  const rest = cleanCommand(rm && base.includes(rm.matched) ? cut(base, rm.matched) : base);
   let m: RegExpExecArray | null;
   let measure: 'spend' | 'income' | null = null;
   let subject: string | undefined;
@@ -145,11 +193,11 @@ export function parseQuestion(raw: string, today: Date, opts: DateRangeOptions =
   } else if ((m = re(String.raw`^how\s+much\s+(?:went\s+(?:to|on)|was\s+spent\s+on|did\s+(?:.+?)\s+cost(?:\s+us)?)\s*(.*)$`).exec(rest))) {
     measure = 'spend';
     subject = m[1];
-  } else if (rm && !/\d/.test(rest) && (m = re(String.raw`^(?:${WHO}\s+)?(?:spent|spend|paid)\s+((?:on|at|for|with|to)\s+.+)$`).exec(rest))) {
+  } else if ((rm || unknown) && !/\d/.test(rest) && (m =re(String.raw`^(?:${WHO}\s+)?(?:spent|spend|paid)\s+((?:on|at|for|with|to)\s+.+)$`).exec(rest))) {
     // "spent on Shell Oil in July": a period but no amount — a question, not a new expense.
     measure = 'spend';
     subject = m[1];
-  } else if (rm || /^total\b/i.test(rest)) {
+  } else if (rm || unknown || /^total\b/i.test(rest)) {
     // Terse forms need a period (or "total") so a page name like "expenses" still navigates.
     if ((m = re(String.raw`^(?:total\s+)?(.*?)\s*${SPEND_N}(?:\s+(?:on|for|at|with)\s+(.+))?$`).exec(rest))) {
       measure = 'spend';
@@ -165,7 +213,7 @@ export function parseQuestion(raw: string, today: Date, opts: DateRangeOptions =
   if (!measure) return null;
   const range = rm?.range ?? yearToDate(today, opts);
   const s = cleanSubject(subject);
-  const problem = findDateProblem(raw, today);
+  const problem = findDateProblem(raw, today) ?? (unknown ? unknownPeriodMessage(unknown.words) : null);
   return {
     kind: 'question',
     measure,
@@ -181,17 +229,21 @@ export function parseQuestion(raw: string, today: Date, opts: DateRangeOptions =
 // Reports: "show unpaid bills over 60 days"
 // ---------------------------------------------------------------------------
 
+/** The most "days past due" a report filter accepts (the same limit as the report params). */
+export const MAX_OVER_DAYS = 3650;
+
 function parseOverDays(s: string): { days: number; matched: string } | null {
   let m: RegExpExecArray | null;
-  if ((m = re(String.raw`\b(?:that\s+are\s+|which\s+are\s+)?(over|more\s+than|older\s+than|greater\s+than|longer\s+than|beyond|past|at\s+least|>=?)\s*(\d{1,4})\s*\+?\s*days?(?:\s+(?:old|overdue|past\s+due|late))?`).exec(s))) {
-    const n = Number(m[2]);
-    return { days: /least|>=/i.test(m[1]) ? Math.max(0, n - 1) : n, matched: m[0] };
+  // Any number of digits is read, so an out-of-range filter is reported instead of vanishing.
+  const n = (tok: string) => Number(tok.replace(/,/g, ''));
+  if ((m = re(String.raw`\b(?:that\s+are\s+|which\s+are\s+)?(over|more\s+than|older\s+than|greater\s+than|longer\s+than|beyond|past|at\s+least|>=?)\s*(\d[\d,]*)\s*\+?\s*days?(?:\s+(?:old|overdue|past\s+due|late))?`).exec(s))) {
+    return { days: /least|>=/i.test(m[1]) ? Math.max(0, n(m[2]) - 1) : n(m[2]), matched: m[0] };
   }
-  if ((m = re(String.raw`(\d{1,4})\s*\+\s*days?(?:\s+(?:old|overdue|past\s+due|late))?`).exec(s))) {
-    return { days: Math.max(0, Number(m[1]) - 1), matched: m[0] };
+  if ((m = re(String.raw`(\d[\d,]*)\s*\+\s*days?(?:\s+(?:old|overdue|past\s+due|late))?`).exec(s))) {
+    return { days: Math.max(0, n(m[1]) - 1), matched: m[0] };
   }
-  if ((m = re(String.raw`\b(\d{1,4})\s+days?\s+(?:overdue|past\s+due|late|old)`).exec(s))) {
-    return { days: Math.max(0, Number(m[1]) - 1), matched: m[0] };
+  if ((m = re(String.raw`\b(\d[\d,]*)\s+days?\s+(?:overdue|past\s+due|late|old)`).exec(s))) {
+    return { days: Math.max(0, n(m[1]) - 1), matched: m[0] };
   }
   return null;
 }
@@ -203,7 +255,21 @@ export function parseReport(raw: string, today: Date, opts: DateRangeOptions = {
   return problem ? { ...r, dateProblem: problem } : r;
 }
 
+/** A report as parsed, before the overdue filter is range-checked. */
+type ReportDraft = Omit<ReportIntent, 'overDays'> & { overDays?: number };
+
 function parseReportInner(raw: string, today: Date, opts: DateRangeOptions): ReportIntent | null {
+  const r = parseReportDraft(raw, today, opts);
+  if (!r) return null;
+  // A filter beyond the limit is never dropped (that would list every unpaid bill): it is reported.
+  if (r.overDays !== undefined && r.overDays > MAX_OVER_DAYS) {
+    const { overDays, ...rest } = r;
+    return { ...rest, dateProblem: `“${overDays} days” is more than the overdue filter allows — use ${MAX_OVER_DAYS} days or fewer.` };
+  }
+  return r as ReportIntent;
+}
+
+function parseReportDraft(raw: string, today: Date, opts: DateRangeOptions): ReportDraft | null {
   let s = cleanCommand(
     raw.replace(re(String.raw`^(?:please\s+)?(?:show|list|find|view|display|see|give|pull\s+up|run|get|print)\s+(?:me\s+)?(?:a\s+list\s+of\s+)?(?:all\s+)?(?:the\s+|my\s+|our\s+)?`), ''),
   );
@@ -212,8 +278,13 @@ function parseReportInner(raw: string, today: Date, opts: DateRangeOptions): Rep
   const overdueWord = /\b(?:overdue|past[\s-]due|late)\b/i.test(s);
 
   const rm = parseDateRange(s, today, opts);
-  const withRange = (r: ReportIntent): ReportIntent =>
-    rm ? { ...r, from: rm.range.from, to: rm.range.to, period: rm.range.label } : r;
+  const unknown = findUnknownPeriod(s, today, opts);
+  const withRange = (r: ReportDraft): ReportDraft =>
+    unknown
+      ? { ...r, dateProblem: unknownPeriodMessage(unknown.words) }
+      : rm
+        ? { ...r, from: rm.range.from, to: rm.range.to, period: rm.range.label }
+        : r;
 
   if (re(String.raw`\b(?:p\s*&\s*l|p\s+and\s+l|pnl|profit\s+(?:and|&)\s+loss|income\s+statement)\b`).test(s)) {
     return withRange({ kind: 'report', report: 'profit_loss' });
@@ -276,7 +347,7 @@ const UNIT = String.raw`(?:hours?|hrs?|h|units?|pcs?|pieces?|items?|ea|each|days
 
 export function parseLine(s: string, form: FormKind): IntentLine | null {
   const sales = isSalesForm(form);
-  let t = tidy(s);
+  let t = s.replace(/\s+/g, ' ').trim();
   let quantity: string | undefined;
   let rate: string | undefined;
   let amount: string | undefined;
@@ -306,6 +377,14 @@ export function parseLine(s: string, form: FormKind): IntentLine | null {
     if (quantity || !isReasonableQuantity(v)) keep(tok);
     else quantity = v;
   };
+
+  // Negative numbers ("-5 widgets", "($20) refund") are a credit, not a charge: never filled in
+  // with the sign dropped. They are reported (the executor refuses them with a clear message).
+  t = t.replace(re(String.raw`(^|\s)(${NEG_NUM_TOKEN})(?=\s|$|[a-z])`, 'gi'), (_all, pre: string, tok: string) => {
+    keep(tok);
+    return `${pre} `;
+  });
+  t = tidy(t);
 
   // Rate: "at $150", "@ 150/hr", "$150 each", "150 per hour".
   if ((m = re(String.raw`\s*(?:@|\bat\b)\s*(${NUM_TOKEN})(?:\s*(?:each|ea|per\s+\w+|an?\s+(?:hour|unit|item|piece|day)|\/\s*\w+))?`).exec(t))) {
@@ -382,8 +461,14 @@ export function parseLine(s: string, form: FormKind): IntentLine | null {
   };
 }
 
-const LINE_SPLIT = re(String.raw`\s*(?:,\s+|,(?!\d{3}(?:\D|$))|;|\band\b|\bplus\b|\+)\s*(?=\$?\d)`);
-const STARTS_NUM = re(String.raw`^${NUM_TOKEN}`);
+/** Start of a number, signed or not ("5", "$5", "-5", "−$5", "(5)"). */
+const NUM_START = String.raw`(?:[-−(]\s?)?\$?\s?[-−]?\d`;
+const LINE_SPLIT = re(String.raw`\s*(?:,\s+|,(?!\d{3}(?:\D|$))|;|\band\b|\bplus\b|\+)\s*(?=${NUM_START})`);
+const STARTS_NUM = re(String.raw`^(?:${NEG_NUM_TOKEN}|${NUM_TOKEN})`);
+/** Words that make "from X" a bank or card ("from Amex", "from the business checking"). */
+const PAY_ACCOUNT_WORD = re(
+  String.raw`\b(?:card|credit|debit|bank|checking|chequing|savings|account|acct|amex|american\s+express|visa|master\s?card|mc|discover|petty\s+cash|cash)\b`,
+);
 
 function parseLines(s: string, form: FormKind): IntentLine[] {
   const out: IntentLine[] = [];
@@ -420,6 +505,21 @@ export function parseCreate(raw: string, today: Date): CreateIntent | null {
     if (pay && !/\d/.test(pay[1])) {
       intent.paymentAccount = tidy(pay[1]);
       body = tidy(body.slice(0, pay.index));
+    } else {
+      // A trailing "from <bank/card>": "check to Shell Oil 45.20 fuel from Amex". "from" also
+      // introduces the payee ("expense 45 fuel from Shell"), so it is the payment account only
+      // when the words name a bank or card, or when the payee is already named elsewhere.
+      const from = re(String.raw`\s+from\s+(?:the\s+|my\s+|our\s+)?([a-z][\w&' -]*?)(?:\s+(?:card|account|acct))?$`).exec(body);
+      if (from && !/\d/.test(from[1])) {
+        const before = body.slice(0, from.index);
+        const prefixNamesPayee = /\b(?:to|at|from)\s*$/i.test(prefix.m[0]);
+        const payeeMarker = re(String.raw`(?:^|\s)(?:to|at|payable\s+to)\s+(?![-−(]?\$?\s?\d)`).test(before);
+        const partyFirst = !prefix.p.mode && !STARTS_NUM.test(before) && !re(String.raw`^(?:from|to|at|payable\s+to)\s`).test(before) && /\d/.test(before);
+        if (PAY_ACCOUNT_WORD.test(from[0]) || prefixNamesPayee || payeeMarker || partyFirst) {
+          intent.paymentAccount = tidy(from[1]);
+          body = tidy(before);
+        }
+      }
     }
   }
 
@@ -428,7 +528,8 @@ export function parseCreate(raw: string, today: Date): CreateIntent | null {
 
   if (mode === 'party-first') {
     // Party = the words before the first number ("Acme Corp 3 hours consulting").
-    const num = re(String.raw`(?:^|\s)(?:for\s+|-\s*|:\s*)?(${NUM_TOKEN})(?=\s|$|[a-z])`).exec(body);
+    // "-5" right against the number is a minus sign; "Acme - 5 widgets" is a separator.
+    const num = re(String.raw`(?:^|\s)(?:for\s+|-\s+|:\s*)?(${NEG_NUM_TOKEN}|${NUM_TOKEN})(?=\s|$|[a-z])`).exec(body);
     if (num) {
       intent.party = tidy(body.slice(0, num.index).replace(/\s+(?:for|-|:)$/i, '')) || undefined;
       intent.lines = parseLines(body.slice(num.index + num[0].length - num[1].length), form);
@@ -444,7 +545,7 @@ export function parseCreate(raw: string, today: Date): CreateIntent | null {
     }
   } else {
     // Marker mode: the party follows "to/for" (sales) or "from/to/at" (purchases).
-    const pm = re(String.raw`(?:^|\s)${markers}\s+(?!\$?\s?\d)(.+?)(?=\s+(?:for|on|with|@)\s|\s+\$?\d|$)`).exec(body);
+    const pm = re(String.raw`(?:^|\s)${markers}\s+(?!${NUM_START})(.+?)(?=\s+(?:for|on|with|@)\s|\s+${NUM_START}|$)`).exec(body);
     if (pm) {
       intent.party = tidy(pm[1]);
       body = tidy(body.slice(0, pm.index) + ' ' + body.slice(pm.index + pm[0].length));

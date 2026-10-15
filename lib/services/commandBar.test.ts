@@ -653,3 +653,132 @@ describe('periods are never silently replaced', () => {
     expect(cal.range).toMatchObject({ from: '2026-01-01', to: '2026-03-31' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Review round 2 (P2) fixes
+// ---------------------------------------------------------------------------
+
+describe('review round 2: nothing typed is silently replaced', () => {
+  it('an unknown period ("in Q5") is reported, not answered for year to date', async () => {
+    await expect(run('what did we spend on fuel in Q5')).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/I don't know the period “Q5”/),
+    });
+    await expect(run('what did we spend on fuel in Q0')).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(run('p&l for Q5')).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/“Q5”/) });
+  });
+
+  it('an overdue filter above 3650 days is reported, not dropped (which listed every bill)', async () => {
+    await expect(run('show unpaid bills over 99999 days')).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/use 3650 days or fewer/),
+    });
+    // At the limit it still runs (and finds nothing that old).
+    const max = expectType(await run('show unpaid bills over 3650 days'), 'navigate');
+    expect(max.href).toBe('/reports/std/unpaid-bills-detail?overDays=3650');
+    expect(max.summary).toMatch(/^0 unpaid bills more than 3650 days past due/);
+  });
+
+  it('a negative amount is refused with where to enter it, and nothing is filled in', async () => {
+    const before = await writeCounts();
+    await expect(run('invoice Acme Corporation -5 widgets')).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/“-5” is a negative amount.*credit memo/),
+    });
+    await expect(run('bill from Staples ($20) printer paper')).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/vendor credit/),
+    });
+    // The same intent arriving from the AI / a choice is refused too.
+    await expect(
+      runCommand(ctx, { intent: { kind: 'create', form: 'invoice', party: 'Acme Corporation', lines: [{ text: 'widget', unclear: ['-5'] }] } }, { today: TODAY }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect(await writeCounts()).toEqual(before);
+  });
+
+  it('"go to nowhere-page" says the page was not found (no weak fuzzy hit)', async () => {
+    const r = expectType(await run('go to nowhere-page'), 'unknown');
+    expect(r.message).toBe('I couldn\'t find a page called “nowhere-page” that you can open.');
+    expectType(await run('go to purple elephants'), 'unknown');
+    // Real pages still open, by name, QuickBooks name or keywords.
+    expect(expectType(await run('go to chart of accounts'), 'navigate').href).toBe('/accounts');
+    expect(expectType(await run('go to invoices'), 'navigate').href).toBe('/invoices');
+    expect(expectType(await run('go to p&l'), 'navigate').href).toBe('/reports/profit-loss');
+    expect(expectType(await run('open home'), 'navigate').href).toBe('/dashboard');
+  });
+
+  it('the preview and the prefill agree on an item count ("bill from Staples 3 printer paper")', async () => {
+    const r = expectType(await run('bill from Staples 3 printer paper'), 'prefill');
+    expect(r.prefill.lines).toEqual([expect.objectContaining({ itemId: item.paper, quantity: '3', rate: '30', amount: '90.00' })]);
+    expect(r.understood).toContain("3 printer paper (a count if it's an item, otherwise $3)");
+    expect(r.understood).not.toMatch(/printer paper \$3/);
+  });
+
+  it('"check to Shell Oil 45.20 fuel from Amex" pays from Amex', async () => {
+    const r = expectType(await run('check to Shell Oil 45.20 fuel from Amex'), 'prefill');
+    expect(r.prefill).toMatchObject({
+      kind: 'expense',
+      vendorId: vend.shell,
+      paymentAccountId: acct.amex,
+      lines: [{ accountId: acct.fuel, amount: '45.20', description: 'fuel' }],
+    });
+  });
+});
+
+describe('AI fallback uses the company fiscal year', () => {
+  beforeAll(async () => {
+    await updateSettings(ctx, {
+      cloudEnabled: false,
+      taskPolicies: { assistant: 'local-only' },
+      providers: [{ kind: 'ollama', label: 'GPU box 2', baseUrl: 'http://gpu-box.tail1234.ts.net:11434', model: 'qwen2.5:14b', enabled: true }],
+    });
+  });
+
+  async function withFiscalJuly<T>(fn: () => Promise<T>): Promise<T> {
+    const [row] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
+    await db.update(companies).set({ settings: { ...(row.settings ?? {}), fiscalYearEnd: '06-30' } }).where(eq(companies.id, ctx.companyId));
+    try {
+      return await fn();
+    } finally {
+      await db.update(companies).set({ settings: row.settings }).where(eq(companies.id, ctx.companyId));
+    }
+  }
+  const systemPrompt = (m: ReturnType<typeof ollama>) => m.calls.find((c) => c.url.endsWith('/api/chat'))!.body.messages[0].content;
+  const TEXT = 'how much did fuel set us back in the first quarter of the year';
+
+  it('the prompt states the fiscal year, and the period is resolved on the server', async () => {
+    // The model "helpfully" computes calendar Q1 dates; the server's fiscal Q1 wins.
+    const m = ollama(() =>
+      JSON.stringify({ intent: { kind: 'question', measure: 'spend', subject: 'fuel', period: 'first quarter', from: '2026-01-01', to: '2026-03-31' } }),
+    );
+    const r = await withFiscalJuly(() => run(TEXT, { allowAi: true }, ctx, { deps: { fetch: m.fetch } }));
+    const a = expectType(r, 'answer');
+    expect(a.source).toBe('ai');
+    expect(a.range).toMatchObject({ from: '2026-07-01', to: '2026-09-30' });
+    expect(a.amount).toBe('125.50');
+    expect(systemPrompt(m)).toMatch(/fiscal year starts in July: Q1 is July–September/);
+    expect(systemPrompt(m)).not.toMatch(/calendar quarters/);
+  });
+
+  it('calendar-year companies are told so', async () => {
+    const m = ollama(() => JSON.stringify({ intent: { kind: 'question', measure: 'spend', subject: 'fuel', period: 'Q1' } }));
+    const a = expectType(await run(TEXT, { allowAi: true }, ctx, { deps: { fetch: m.fetch } }), 'answer');
+    expect(a.range).toMatchObject({ from: '2026-01-01', to: '2026-03-31' });
+    expect(systemPrompt(m)).toMatch(/fiscal year is the calendar year/);
+  });
+
+  it('a period the server cannot read is reported, not guessed', async () => {
+    const m = ollama(() => JSON.stringify({ intent: { kind: 'question', measure: 'spend', subject: 'fuel', period: 'Q5 2026' } }));
+    await expect(run(TEXT, { allowAi: true }, ctx, { deps: { fetch: m.fetch } })).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/“Q5 2026”/),
+    });
+  });
+
+  it('exact dates from the model (no period) are used as given', async () => {
+    const m = ollama(() => JSON.stringify({ intent: { kind: 'question', measure: 'spend', subject: 'fuel', from: '2026-09-01', to: '2026-09-30' } }));
+    const a = expectType(await run(TEXT, { allowAi: true }, ctx, { deps: { fetch: m.fetch } }), 'answer');
+    expect(a.range).toMatchObject({ from: '2026-09-01', to: '2026-09-30' });
+    expect(a.amount).toBe('60.00');
+  });
+});

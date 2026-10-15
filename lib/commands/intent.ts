@@ -8,7 +8,7 @@
  * save, open a report or page, or answer a read-only question. Nothing here can write data.
  */
 import { z } from 'zod';
-import { parseNumber } from './text';
+import { isNegativeToken, parseNumber } from './text';
 
 export const FORM_KINDS = ['invoice', 'bill', 'expense', 'estimate', 'sales_receipt'] as const;
 export type FormKind = (typeof FORM_KINDS)[number];
@@ -104,14 +104,17 @@ const zCreate = z.object({
 const zReport = z.object({
   kind: z.literal('report'),
   report: z.enum(REPORT_KINDS),
-  /** Only documents MORE than this many days past due. */
+  /** Only documents MORE than this many days past due (a typed value above 3650 becomes a dateProblem). */
   overDays: z.coerce.number().int().min(0).max(3650).optional(),
   party: zText().optional(),
   from: zDay.optional(),
   to: zDay.optional(),
   /** Free-text period ("Q3", "last month"), resolved by the executor when from/to are absent. */
   period: zText(60).optional(),
-  /** The typed period was not valid (inverted / not a real date) — the executor reports it. */
+  /**
+   * The typed period or filter can't be used as-is (inverted / not a real date / unknown period
+   * / overdue filter above the limit) — the executor reports it instead of running the report.
+   */
   dateProblem: zText(200).optional(),
 });
 
@@ -186,12 +189,29 @@ export type ResolveHints = z.infer<typeof resolveHintsSchema>;
 
 function lineText(l: IntentLine): string {
   const parts: string[] = [];
+  // Purchases: a bare whole number ("3 printer paper") is a COUNT when the words name an item
+  // and dollars otherwise — the executor decides, so the preview must not promise "$3".
+  const maybeCount = !!(l.amountMaybeCount && l.amount && !l.quantity && !l.rate);
   if (l.quantity) parts.push(`${l.quantity} ×`);
+  if (maybeCount) parts.push(l.amount!);
   if (l.text) parts.push(l.text);
   if (l.rate) parts.push(`at $${l.rate}`);
-  if (l.amount) parts.push(`$${l.amount}`);
+  if (l.amount && !maybeCount) parts.push(`$${l.amount}`);
+  if (maybeCount) parts.push(`(a count if it's an item, otherwise $${l.amount})`);
+  // (Negative numbers never get here: describeIntent reports them for the whole command.)
   if (l.unclear?.length) parts.push(`(not sure about ${l.unclear.join(', ')})`);
   return parts.join(' ');
+}
+
+/** Typed negative numbers on any line of a create intent ("-5"), for the refusal message. */
+export function negativeTokens(i: CommandIntent): string[] {
+  return i.kind === 'create' ? i.lines.flatMap((l) => (l.unclear ?? []).filter(isNegativeToken)) : [];
+}
+
+/** Why a negative line can't be prefilled, and where to enter it instead. */
+export function negativeMessage(form: FormKind, tokens: string[]): string {
+  const where = isSalesForm(form) ? 'a credit memo (or a refund receipt)' : 'a vendor credit';
+  return `${tokens.map((t) => `“${t}”`).join(' and ')} ${tokens.length === 1 ? 'is a negative amount' : 'are negative amounts'}. Negative amounts aren't filled in from the command bar — use ${where}, or enter the line on the form yourself.`;
 }
 
 const REPORT_TITLES: Record<ReportKind, string> = {
@@ -218,6 +238,8 @@ export const ACTION_TITLES: Record<ActionKey, string> = {
 export function describeIntent(i: CommandIntent): string {
   switch (i.kind) {
     case 'create': {
+      const neg = negativeTokens(i);
+      if (neg.length) return negativeMessage(i.form, neg);
       const who = i.party ? (isSalesForm(i.form) ? ` for “${i.party}”` : ` from “${i.party}”`) : '';
       const what = i.lines.map(lineText).filter(Boolean).join(', ');
       return `Fill in a new ${FORM_LABELS[i.form]}${who}${what ? ` — ${what}` : ''} (you review and save)`;

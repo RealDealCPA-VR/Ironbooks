@@ -189,3 +189,15 @@ describe('Home workflow follows permissions and feature switches', () => {
     for (const h of steps) expect(h.startsWith('#') || allowed.has(h), h).toBe(true);
   });
 });
+
+describe('strict page search (acted on without a list to pick from)', () => {
+  it('a weak partial hit is not a match', () => {
+    expect(searchPages('nowhere-page', { limit: 1 }).length).toBe(1); // loose search still offers something
+    expect(searchPages('nowhere-page', { limit: 1, strict: true })).toEqual([]);
+    expect(searchPages('purple elephants', { limit: 1, strict: true })).toEqual([]);
+  });
+  it('real page names still match', () => {
+    expect(searchPages('chart of accounts', { limit: 1, strict: true })[0]?.href).toBe('/accounts');
+    expect(searchPages('invoices', { limit: 1, strict: true })[0]?.href).toBe('/invoices');
+  });
+});

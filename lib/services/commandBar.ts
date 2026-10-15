@@ -54,6 +54,8 @@ import {
   commandIntentSchema,
   describeIntent,
   isSalesForm,
+  negativeMessage,
+  negativeTokens,
   type ActionIntent,
   type CommandIntent,
   type CreateIntent,
@@ -158,7 +160,8 @@ export async function runCommand(
   if (!text) throw validation('Type what you want to do.');
   if (text.length > 500) throw validation('That is too long for a command — keep it under 500 characters.');
 
-  const intent = parseCommand(text, today, await dateOptsFor(ctx));
+  const dateOpts = await dateOptsFor(ctx);
+  const intent = parseCommand(text, today, dateOpts);
   if (intent) return withMeta(await executeIntent(ctx, intent, input.hints ?? {}, today), 'grammar', intent);
 
   // Fuzzy fallback: only when asked, only when this company has an eligible AI model.
@@ -168,11 +171,12 @@ export async function runCommand(
     aiAvailable = router.isAvailable('assistant');
     if (aiAvailable) {
       try {
-        const res = await router.chatJson('assistant', aiMessages(text, today), aiIntentReplySchema);
+        const res = await router.chatJson('assistant', aiMessages(text, today, dateOpts), aiIntentReplySchema);
         if (res.data.intent) {
-          const out = await executeIntent(ctx, res.data.intent, {}, today);
+          const aiIntent = serverPeriod(res.data.intent, today, dateOpts);
+          const out = await executeIntent(ctx, aiIntent, {}, today);
           return {
-            ...withMeta(out, 'ai', res.data.intent),
+            ...withMeta(out, 'ai', aiIntent),
             aiAvailable,
             ai: { providerId: res.providerId, locality: res.locality, redacted: res.redacted },
           };
@@ -220,16 +224,24 @@ function withMeta(out: CommandOutcome, source: CommandResult['source'], intent: 
 // AI fallback prompt
 // ---------------------------------------------------------------------------
 
-function aiMessages(text: string, today: Date) {
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+function aiMessages(text: string, today: Date, dateOpts: DateRangeOptions = {}) {
   const day = today.toISOString().slice(0, 10);
+  const fs = dateOpts.fiscalStartMonth ?? 0;
+  const yearRule =
+    fs === 0
+      ? 'The fiscal year is the calendar year (quarters are calendar quarters).'
+      : `This company's fiscal year starts in ${MONTH_NAMES[fs]}: Q1 is ${MONTH_NAMES[fs]}–${MONTH_NAMES[(fs + 2) % 12]}, and "this year", "last year" and YTD mean fiscal years.`;
   const system = [
     'You turn one short request typed into an accounting app\'s command bar into a JSON intent.',
     'You never perform anything yourself; the app shows the user a form or report to confirm.',
-    `Today is ${day}. Dates are YYYY-MM-DD. Quarters are calendar quarters.`,
+    `Today is ${day}. Dates are YYYY-MM-DD. ${yearRule}`,
+    'For a period, put the user\'s own words in "period" (e.g. "Q1", "first quarter", "last month", "this year", "ytd", "September 2026") and leave out from/to — the app works out the dates. Use from/to only for exact dates the user typed.',
     'Reply with ONLY a JSON object {"intent": <intent or null>} — null when the request is not one of these:',
     '{"kind":"create","form":"invoice|bill|expense|estimate|sales_receipt","party":"customer or vendor name as typed","lines":[{"text":"item or expense category","quantity":"3","rate":"150","amount":"450"}],"date":"YYYY-MM-DD","memo":"…","paymentAccount":"bank/card for expenses"}',
-    '{"kind":"report","report":"unpaid_bills|unpaid_invoices|profit_loss|balance_sheet|ap_aging|ar_aging","overDays":60,"party":"name","from":"YYYY-MM-DD","to":"YYYY-MM-DD"}',
-    '{"kind":"question","measure":"spend|income","subject":"account, vendor or customer words","from":"YYYY-MM-DD","to":"YYYY-MM-DD","rangeLabel":"Q3 2026"}',
+    '{"kind":"report","report":"unpaid_bills|unpaid_invoices|profit_loss|balance_sheet|ap_aging|ar_aging","overDays":60,"party":"name","period":"last quarter"}',
+    '{"kind":"question","measure":"spend|income","subject":"account, vendor or customer words","period":"Q3"}',
     '{"kind":"action","action":"pay_bills|reconcile|record_deposit|receive_payment|transfer_funds|journal_entry|run_payroll|bank_feeds","target":"account or customer"}',
     '{"kind":"navigate","target":"page name"}',
     'Omit fields you do not know. Amounts are plain numbers without currency symbols. Keep names exactly as typed.',
@@ -238,6 +250,23 @@ function aiMessages(text: string, today: Date) {
     { role: 'system' as const, content: system },
     { role: 'user' as const, content: text },
   ];
+}
+
+/**
+ * A model-supplied period phrase is resolved HERE with the company's fiscal year, so "Q1" means
+ * the same thing whichever path understood the command. When the phrase is readable it wins
+ * over any from/to the model computed itself (models tend to assume calendar quarters).
+ */
+function serverPeriod(intent: CommandIntent, today: Date, dateOpts: DateRangeOptions): CommandIntent {
+  if ((intent.kind !== 'question' && intent.kind !== 'report') || !intent.period) return intent;
+  const norm = (s: string) => s.trim().replace(/\s+/g, ' ').replace(/^(?:(?:in|for|during|over|of|the)\s+)+/i, '').toLowerCase();
+  const rm = parseDateRange(intent.period, today, dateOpts);
+  // Only a phrase read in full counts: "Q5 2026" must not quietly become "2026".
+  if (!rm || norm(rm.matched) !== norm(intent.period)) {
+    return { ...intent, dateProblem: `I don't know the period “${intent.period}” — use Q1–Q4, a month, “last month”, “this year”, or from/to dates.` };
+  }
+  const range = { from: rm.range.from, to: rm.range.to };
+  return intent.kind === 'question' ? { ...intent, ...range, rangeLabel: rm.range.label } : { ...intent, ...range };
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +442,9 @@ async function executeCreate(ctx: ServiceContext, intent: CreateIntent, hints: R
   const form: FormKind = hints.form ?? intent.form;
   const needs = FORM_NEEDS[form];
   if (!allowed(ctx, needs.area, needs.action)) return denied(needs.area, `create ${/^[aeiou]/.test(FORM_LABELS[form]) ? 'an' : 'a'} ${FORM_LABELS[form]}`);
+  // A negative line is a credit: refuse it rather than fill it in with the sign dropped.
+  const negative = negativeTokens(intent);
+  if (negative.length) throw validation(negativeMessage(form, negative));
   const sales = isSalesForm(form);
   const notes: string[] = [];
   const prefill: FormPrefill = { kind: form, lines: [] };
@@ -1043,7 +1075,10 @@ async function nameActivity(
 
 function executeNavigate(ctx: ServiceContext, intent: NavigateIntent): CommandOutcome {
   const permissions = ctx.access?.permissions ?? null;
-  const [page] = searchPages(intent.target, { permissions, limit: 1 });
+  // Only a page that really answers to the words typed — every word in its name, QuickBooks name
+  // or keywords, or a whole plain-language phrase. A loose partial hit ("go to nowhere-page" →
+  // Home) is not a match: the user is told the page wasn't found instead.
+  const [page] = searchPages(intent.target, { permissions, limit: 1, strict: true });
   if (page) return { type: 'navigate', href: page.href, title: page.label, summary: page.description };
   const q = intent.target.toLowerCase();
   const act = COMMAND_ACTIONS.find(

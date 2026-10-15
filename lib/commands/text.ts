@@ -34,11 +34,14 @@ export function stem(w: string): string {
   return w;
 }
 
-/** Collapse whitespace and trim stray separators/prepositions at either end. */
+/**
+ * Collapse whitespace and trim stray separators at either end. A leading minus sign that is
+ * part of a number ("-5 widgets") is kept — it is a sign, not a separator.
+ */
 export function tidy(s: string): string {
   return s
     .replace(/\s+/g, ' ')
-    .replace(/^[\s,;:.\-–—]+|[\s,;:\-–—]+$/g, '')
+    .replace(/^(?:[\s,;:.]|[-–—](?!\$?\d))+|[\s,;:\-–—]+$/g, '')
     .trim();
 }
 
@@ -55,6 +58,19 @@ export function cut(s: string, part: string): string {
 
 /** One numeric token: "$1,200.50", "1200", "2.5", "1.2k", "$45". */
 export const NUM_TOKEN = String.raw`\$?\s?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?k?`;
+
+/**
+ * One NEGATIVE numeric token: "-5", "−5" (minus sign), "-$5", "$-5", "(5)", "($45.20)". The
+ * grammar never fills these in — a negative line is a credit, which belongs on a credit memo /
+ * vendor credit — but it reports them instead of dropping the sign.
+ */
+const UNSIGNED = String.raw`(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?k?`;
+export const NEG_NUM_TOKEN = String.raw`(?:[-−]\s?\$?\s?${UNSIGNED}|\$\s?[-−]\s?${UNSIGNED}|\(\s?\$?\s?${UNSIGNED}\s?\))`;
+
+/** True for a token written as a negative number (see {@link NEG_NUM_TOKEN}). */
+export function isNegativeToken(token: string): boolean {
+  return new RegExp(String.raw`^\s*${NEG_NUM_TOKEN}\s*$`).test(token);
+}
 
 /**
  * Parse a money/quantity token into a canonical decimal string ("1200.50" → "1200.50",

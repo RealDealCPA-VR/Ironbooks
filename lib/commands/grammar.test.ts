@@ -462,6 +462,10 @@ describe('every typed amount is placed or reported (never silently dropped)', ()
     ['bill from Staples 3.50 widgets', [{ text: 'widgets', amount: '3.5' }]],
     // "3 widgets for $500" on a purchase: 3 is the count
     ['bill from Staples 3 widgets for $500', [{ text: 'widgets', quantity: '3', amount: '500' }]],
+    // a negative number keeps its sign and is reported (the executor refuses it) — never flipped
+    ['invoice Acme Corporation -5 widgets', [{ text: 'widgets', unclear: ['-5'] }]],
+    ['invoice Acme Corporation −5 widgets', [{ text: 'widgets', unclear: ['−5'] }]],
+    ['bill from Staples ($20) printer paper', [{ text: 'printer paper', unclear: ['($20)'] }]],
   ])('%s', (cmd, expected) => {
     expect(lines(cmd)).toEqual(expected);
   });
@@ -585,5 +589,134 @@ describe('report filters for overdue items', () => {
     expect(reportParamsSchema.safeParse({ overDays: '3650' }).success).toBe(true);
     expect(reportParamsSchema.safeParse({ overDays: '3651' }).success).toBe(false);
     expect(reportParamsSchema.safeParse({ overDays: '-1' }).success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review round 2 (P2) fixes
+// ---------------------------------------------------------------------------
+
+describe('an unreadable period is reported, never replaced by year to date', () => {
+  it('what did we spend on fuel in Q5', () => {
+    const r = p('what did we spend on fuel in Q5');
+    expect(r).toMatchObject({ kind: 'question', measure: 'spend', subject: 'fuel' });
+    expect(r && r.kind === 'question' && r.dateProblem).toBe("I don't know the period “Q5” — use Q1–Q4, a month, “last month”, “this year”, or from/to dates.");
+    expect(describeIntent(r!)).toMatch(/don't know the period “Q5”/);
+  });
+  it.each([
+    ['what did we spend on fuel in Q0', 'Q0'],
+    ['how much did we spend on fuel in Q9', 'Q9'],
+    ['what did we spend on fuel in Q5 2026', 'Q5 2026'],
+    ['fuel expenses for Q6', 'Q6'],
+    ['how much did we spend at Staples next quarter', 'next quarter'],
+    ['what did we spend on fuel in the fifth quarter', 'fifth quarter'],
+    ['what did we spend on fuel in Septmber 2026', 'Septmber 2026'],
+    ['how much did we make in H1', 'H1'],
+    ['spent on fuel in Q5', 'Q5'],
+  ])('%s', (cmd, words) => {
+    expect(p(cmd)).toMatchObject({ kind: 'question', dateProblem: expect.stringContaining(`“${words}”`) });
+  });
+  it('the period words are not left in the subject', () => {
+    expect(p('what did we spend on fuel in Q5 2026')).toMatchObject({ subject: 'fuel' });
+    expect(p('fuel expenses for Q6')).toMatchObject({ subject: 'fuel' });
+  });
+  it('reports too: "p&l for Q5" is not an unfiltered P&L', () => {
+    expect(p('p&l for Q5')).toMatchObject({ kind: 'report', report: 'profit_loss', dateProblem: expect.stringMatching(/“Q5”/) });
+    expect(p('p&l for Q5')).not.toHaveProperty('from');
+  });
+  it.each([
+    'what did we spend on fuel in Q3',
+    'what was our fuel spending in Q1 2025',
+    'fuel expenses in July 2026',
+    'how much did we spend on meals in the last 30 days',
+    'how much did we spend for fuel',
+    'what did we spend on fuel this year',
+    'p&l for last quarter',
+  ])('readable periods carry no problem: %s', (cmd) => {
+    expect(p(cmd)).not.toHaveProperty('dateProblem');
+  });
+  it('fiscal quarters are readable periods', () => {
+    expect(parseCommand('what did we spend on fuel in Q1', TODAY, { fiscalStartMonth: 6 })).not.toHaveProperty('dateProblem');
+  });
+});
+
+describe('an overdue filter above the limit is reported, never dropped', () => {
+  it('show unpaid bills over 99999 days', () => {
+    const r = p('show unpaid bills over 99999 days');
+    expect(r).toMatchObject({ kind: 'report', report: 'unpaid_bills', dateProblem: expect.stringMatching(/“99999 days”.*use 3650 days or fewer/) });
+    expect(r).not.toHaveProperty('overDays');
+    expect(commandIntentSchema.safeParse(r).success).toBe(true);
+    expect(describeIntent(r!)).toMatch(/3650 days or fewer/);
+  });
+  it.each([
+    ['unpaid invoices over 3651 days', undefined],
+    ['bills 5000+ days overdue', undefined],
+    ['unpaid bills over 10,000 days', undefined],
+    ['unpaid bills over 3650 days', 3650],
+    ['unpaid bills at least 3651 days old', 3650],
+  ])('%s', (cmd, overDays) => {
+    const r = p(cmd);
+    if (overDays === undefined) {
+      expect(r).toMatchObject({ kind: 'report', dateProblem: expect.stringMatching(/3650 days or fewer/) });
+      expect(r).not.toHaveProperty('overDays');
+    } else {
+      expect(r).toMatchObject({ kind: 'report', overDays });
+      expect(r).not.toHaveProperty('dateProblem');
+    }
+  });
+});
+
+describe('negative amounts are reported, never filled in with the sign dropped', () => {
+  const create = (cmd: string) => {
+    const r = p(cmd);
+    return r && r.kind === 'create' ? r : null;
+  };
+  it.each([
+    ['invoice Acme Corporation -5 widgets', 'Acme Corporation', [{ text: 'widgets', unclear: ['-5'] }]],
+    ['invoice Acme Corporation −5 widgets', 'Acme Corporation', [{ text: 'widgets', unclear: ['−5'] }]],
+    ['invoice Acme 2 widgets ($24)', 'Acme', [{ text: 'widgets', quantity: '2', unclear: ['($24)'] }]],
+    ['bill from Staples -$20 refund', 'Staples', [{ text: 'refund', unclear: ['-$20'] }]],
+    ['bill from Staples $-20 refund', 'Staples', [{ text: 'refund', unclear: ['$-20'] }]],
+    ['sold -2 widgets to Acme', 'Acme', [{ text: 'widgets', unclear: ['-2'] }]],
+    ['invoice Acme 3 hours consulting, -1 widget', 'Acme', [{ text: 'consulting', quantity: '3' }, { text: 'widget', unclear: ['-1'] }]],
+    // a spaced dash is still a separator, not a sign
+    ['invoice Acme - 5 widgets', 'Acme', [{ text: 'widgets', quantity: '5' }]],
+  ])('%s', (cmd, party, lines) => {
+    const r = create(cmd);
+    expect(r?.party).toBe(party);
+    expect(r?.lines).toEqual(lines);
+  });
+  it('the live preview says it will not be filled in, and where to enter it', () => {
+    expect(describeIntent(p('invoice Acme Corporation -5 widgets')!)).toMatch(/“-5” is a negative amount.*credit memo/);
+    expect(describeIntent(p('bill from Staples -$20 refund')!)).toMatch(/vendor credit/);
+  });
+});
+
+describe('the live preview matches what a purchase line will contain', () => {
+  it('a bare count on a purchase is not shown as dollars', () => {
+    const d = describeIntent(p('bill from Staples 3 printer paper')!);
+    expect(d).toContain("— 3 printer paper (a count if it's an item, otherwise $3)");
+    expect(d).not.toMatch(/printer paper \$3/);
+  });
+  it('typed money is still money', () => {
+    expect(describeIntent(p('bill from Staples $3 printer paper')!)).toContain('printer paper $3');
+    expect(describeIntent(p('bill from Staples 3 widgets for $500')!)).toContain('3 × widgets $500');
+  });
+});
+
+describe('"from <card or bank>" on a check or expense is the payment account', () => {
+  it.each([
+    ['check to Shell Oil 45.20 fuel from Amex', { party: 'Shell Oil', paymentAccount: 'Amex', lines: [{ text: 'fuel', amount: '45.2' }] }],
+    ['check to Shell 45 fuel from the business checking account', { party: 'Shell', paymentAccount: 'business checking' }],
+    ['check Shell Oil 45.20 fuel from Petty Box', { party: 'Shell Oil', paymentAccount: 'Petty Box' }],
+    ['spent $45 on fuel at Shell from Amex', { party: 'Shell', paymentAccount: 'Amex' }],
+    ['check to Shell $45.20 fuel with Amex', { party: 'Shell', paymentAccount: 'Amex' }],
+  ])('%s', (cmd, expected) => {
+    expect(p(cmd)).toMatchObject({ kind: 'create', form: 'expense', ...expected });
+  });
+  it('"from <name>" is still the payee when nothing else names one', () => {
+    const r = p('expense 45 fuel from Shell');
+    expect(r).toMatchObject({ kind: 'create', form: 'expense', party: 'Shell', lines: [{ text: 'fuel', amount: '45', amountMaybeCount: true }] });
+    expect(r).not.toHaveProperty('paymentAccount');
   });
 });
