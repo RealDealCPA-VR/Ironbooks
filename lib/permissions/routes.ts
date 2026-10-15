@@ -233,6 +233,18 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // document in lib/services/attachments.ts, so the routes only require company membership.
   '/api/attachments': kind('member', 'GET POST'),
   '/api/attachments/[id]': kind('member', 'GET PATCH DELETE'),
+  // Receipt capture: receipts sit in the Doc Center inbox (Lists). Saving one creates an expense
+  // (Banking) or bill (Vendors) — checked in lib/services/receipts.ts, so save is 'member'. The
+  // phone link route is the one public route: its token (15 min, one company, limited uploads)
+  // is the credential and it can only add files to that company's inbox.
+  '/api/receipts': r('lists', 'GET POST'),
+  '/api/receipts/[id]': r('lists', 'GET DELETE'),
+  '/api/receipts/[id]/extract': r('lists', 'POST:create'),
+  '/api/receipts/[id]/save': kind('member', 'POST'),
+  '/api/receipts/settings': { ...r('lists', 'GET'), ...r('company', 'PUT:modify') },
+  '/api/receipts/upload-links': r('lists', 'GET POST'),
+  '/api/receipts/upload-links/[id]': r('lists', 'DELETE:create'),
+  '/api/receipts/mobile/[token]': kind('public', 'GET POST'),
   '/api/recurring': r('lists', 'GET POST'),
   '/api/recurring/[id]': r('lists', 'GET PATCH DELETE'),
   '/api/recurring/run': r('accounting', 'POST'),
@@ -598,6 +610,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/tracking': 'lists',
   '/recurring': 'lists',
   '/attachments': 'lists',
+  '/receipts': 'lists', // receipt capture (the phone page /m/receipt/<token> has no session)
   '/letters': 'lists',
   '/leads': 'customers',
   '/templates': 'company',

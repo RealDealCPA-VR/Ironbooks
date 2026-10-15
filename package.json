@@ -30,6 +30,7 @@
     "@anthropic-ai/sdk": "^0.101.0",
     "@electric-sql/pglite": "^0.5.1",
     "@neondatabase/serverless": "^0.10.4",
+    "@tesseract.js-data/eng": "^1.0.0",
     "adm-zip": "^0.6.1",
     "bcryptjs": "^3.0.3",
     "clsx": "^2.1.1",
@@ -50,6 +51,7 @@
     "react-dom": "^19.0.0",
     "tailwind-merge": "^2.6.0",
     "tailwindcss-animate": "^1.0.7",
+    "tesseract.js": "^7.0.0",
     "xml2js": "^0.6.2",
     "zod": "^3.24.1"
   },
@@ -104,7 +106,7 @@
     "files": [
       "electron/**/*",
       "drizzle/**/*",
-      "!node_modules/{next,@next,@img,sharp,@swc,react,react-dom,scheduler,@electric-sql,pdfjs-dist,pdf-lib,@pdf-lib,@anthropic-ai,@neondatabase,drizzle-orm,next-auth,@auth,date-fns,lucide-react,zod,nodemailer,papaparse,fast-xml-parser,xml2js,decimal.js,qrcode.react,adm-zip,bcryptjs,tailwind-merge,tailwindcss-animate,clsx,typescript}/**"
+      "!node_modules/{next,@next,@img,sharp,@swc,react,react-dom,scheduler,@electric-sql,pdfjs-dist,pdf-lib,@pdf-lib,@anthropic-ai,@neondatabase,drizzle-orm,next-auth,@auth,date-fns,lucide-react,zod,nodemailer,papaparse,fast-xml-parser,xml2js,decimal.js,qrcode.react,adm-zip,bcryptjs,tailwind-merge,tailwindcss-animate,clsx,typescript,tesseract.js,tesseract.js-core,@tesseract.js-data}/**"
     ],
     "extraResources": [
       {

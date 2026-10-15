@@ -33,6 +33,18 @@ const securityHeaders = [
   { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=(), payment=(), usb=()' },
 ]
 
+/** Offline OCR engine + language data (see outputFileTracingIncludes below). */
+const ocrAssets = [
+  './node_modules/tesseract.js/**/*',
+  './node_modules/tesseract.js-core/package.json',
+  './node_modules/tesseract.js-core/index.js',
+  './node_modules/tesseract.js-core/*-lstm.js',
+  './node_modules/tesseract.js-core/*-lstm.wasm',
+  './node_modules/@tesseract.js-data/eng/package.json',
+  './node_modules/@tesseract.js-data/eng/4.0.0_best_int/**/*',
+  './node_modules/{bmp-js,idb-keyval,is-url,node-fetch,whatwg-url,tr46,webidl-conversions,regenerator-runtime,wasm-feature-detect,zlibjs}/**/*',
+]
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   // App version for the sidebar footer, from package.json (the version electron-updater compares).
@@ -51,7 +63,15 @@ const nextConfig = {
   // PGlite ships a wasm/native asset; keep it external so Next traces it for standalone.
   // pdfjs-dist (QuickBooks PDF report import) loads its worker module at runtime; bundling it
   // breaks that lookup, so it is required from node_modules as-is.
-  serverExternalPackages: ['@electric-sql/pglite', 'pdfjs-dist'],
+  serverExternalPackages: ['@electric-sql/pglite', 'pdfjs-dist', 'tesseract.js'],
+  // Receipt capture reads photos with offline OCR (lib/receipts/ocr.ts): tesseract.js starts a
+  // worker thread that loads the WebAssembly engine and the bundled English language data from
+  // node_modules at runtime, which file tracing can't see. Ship them with the receipt routes so
+  // the packaged desktop app never needs to download anything (LSTM engine builds only).
+  outputFileTracingIncludes: {
+    '/api/receipts': ocrAssets,
+    '/api/receipts/**': ocrAssets,
+  },
   // No "X-Powered-By: Next.js" fingerprint on a server that may be shared on the tailnet.
   poweredByHeader: false,
   async headers() {

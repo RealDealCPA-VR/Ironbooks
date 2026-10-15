@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/headers';
+import { isMobileReceiptPage } from '@/lib/receipts/mobilePath';
 
 /**
  * Route protection. Edge-safe: only checks for the presence of the session cookie (signature is
@@ -40,6 +41,11 @@ export function middleware(req: NextRequest) {
     }
     return pass(req);
   }
+
+  // Receipt capture phone page: opened from a QR code on a phone that has no session and can't
+  // unlock the file. The page is static; the token in its URL is checked by its one API route
+  // (/api/receipts/mobile/[token], mapped 'public'), which can only add receipts to one company.
+  if (isMobileReceiptPage(pathname)) return pass(req);
 
   // Company-file lock (QB-style "open this file" password). If this launch hasn't been unlocked,
   // send page navigation to /unlock — which auto-passes instantly when no file password is set,

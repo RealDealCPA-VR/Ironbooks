@@ -13,7 +13,7 @@ import {
   type NavMode,
   type PageSearchResult,
 } from '@/lib/nav';
-import { useMe } from '@/lib/usePermissions';
+import { canDo, useMe } from '@/lib/usePermissions';
 import { refreshPreferences, usePreferences } from '@/lib/usePreferences';
 import { api } from '@/lib/client';
 import { Help } from '@/components/Help';
@@ -22,6 +22,7 @@ import type { Area } from '@/lib/permissions/model';
 import { blockingFeatureGate, featureHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
 import PreferenceBehaviors from './PreferenceBehaviors';
+import ReceiptDropZone from './ReceiptDropZone'; // receipt capture: drop a receipt anywhere
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
@@ -33,7 +34,7 @@ import { Modal, toast } from '@/components/ui';
 import { Briefcase, Building2, ChevronDown, ChevronRight, LogOut, Search, Sparkles } from 'lucide-react';
 
 // Routes that render without the app chrome (full-screen).
-const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock'];
+const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock', '/m'];
 
 interface CompanyRow {
   id: string;
@@ -692,6 +693,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <AssistantPanel open={assistantOpen} onClose={closeAssistant} />
       <GlobalShortcuts />
       <PreferenceBehaviors />
+      <ReceiptDropZone enabled={canDo(me, 'lists', 'create')} />
       <TitleSync company={company?.name ?? null} />
     </div>
   );
