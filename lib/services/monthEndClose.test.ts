@@ -35,9 +35,11 @@ import { createBill } from './bills';
 import { postJournalEntry } from './posting';
 import { completeReconciliation, listClearable, startReconciliation, toggleCleared } from './reconcile';
 import { createCompany, verifyClosingDatePassword } from './company';
+import { createDeposit } from './deposits';
 import { trialBalance } from './reports';
 import {
   MONTH_END_STEP_KEYS,
+  RECON_NO_ACCESS,
   buildMonthEndReportPack,
   closeMonth,
   getMonthEndChecklist,
@@ -71,6 +73,10 @@ let customerId: string;
 
 function roleCtx(key: string): ServiceContext {
   return { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === key)) };
+}
+/** A custom role with exactly these grants. */
+function customCtx(permissions: Record<string, ('view' | 'create' | 'modify' | 'delete' | 'print')[]>): ServiceContext {
+  return { ...ctx, access: unionRoles([{ key: 'custom', name: 'Custom', description: '', builtin: false, permissions, flags: {} }]) };
 }
 const stepOf = (c: MonthEndChecklist, key: string) => c.steps.find((s) => s.key === key)!;
 
@@ -252,6 +258,49 @@ describe('month-end close: step computations', () => {
     expect(stepOf(await getMonthEndChecklist(ctx, PERIOD), 'receivables').status).toBe('done');
   });
 
+  it('Undeposited Funds is aged as of the period end and ties to the account balance', async () => {
+    const co = await createCompany(t.db, { name: 'Deposits Co', ownerId: ctx.userId! });
+    const dctx: ServiceContext = { db: t.db, companyId: co.id, userId: ctx.userId };
+    const da = Object.fromEntries(
+      (await t.db.select().from(accounts).where(eq(accounts.companyId, co.id))).map((r) => [r.code, r.id]),
+    );
+    const cust = (await createCustomer(dctx, { displayName: 'Late Deposit LLC' })).id;
+    const inv = await createInvoice(dctx, { customerId: cust, date: d('2026-03-01'), dueDate: d('2026-03-31'), lines: [{ description: 'Work', quantity: 1, rate: '400' }] });
+    // Received Mar 20 into Undeposited Funds, deposited Apr 2: still waiting on Mar 31.
+    const pmt = await receivePayment(dctx, { customerId: cust, date: d('2026-03-20'), method: 'check', amount: '400', applications: [{ invoiceId: inv.id, amountApplied: '400' }] });
+    await createDeposit(dctx, { depositAccountId: da['1000'], date: d('2026-04-02'), paymentIds: [pmt.payment.id] });
+
+    const march = stepOf(await getMonthEndChecklist(dctx, PERIOD), 'undeposited');
+    expect(march.status).toBe('attention'); // 11 days old on Mar 31
+    expect(march.rows).toHaveLength(1);
+    expect(march.rows[0].label).toMatch(/^Late Deposit LLC: payment of Mar 20, 2026/);
+    expect(march.rows[0].detail).toMatch(/11 days old/);
+    expect(march.figures.find((f) => f.label === '8 - 30 days')!.value).toBe('400.00');
+    expect(march.figures.find((f) => f.label.startsWith('Undeposited Funds balance'))!.value).toBe('400.00');
+    expect(march.summary).not.toMatch(/do not match/);
+    // By April's end it was deposited: nothing waiting, and still tied.
+    const april = stepOf(await getMonthEndChecklist(dctx, '2026-04-30'), 'undeposited');
+    expect(april.status).toBe('done');
+    expect(april.rows).toEqual([]);
+    expect(april.figures.find((f) => f.label.startsWith('Undeposited Funds balance'))!.value).toBe('0.00');
+
+    // Money put into Undeposited Funds outside a payment / sales receipt breaks the tie-out.
+    await postJournalEntry(dctx, {
+      date: d('2026-04-10'),
+      description: 'Cash moved to UF by hand',
+      lines: [
+        { accountId: da['1050'], debit: '30.00' },
+        { accountId: da['1000'], credit: '30.00' },
+      ],
+    });
+    const off = stepOf(await getMonthEndChecklist(dctx, '2026-04-30'), 'undeposited');
+    expect(off.status).toBe('attention');
+    expect(off.summary).toMatch(/do not match the Undeposited Funds account \(30\.00\)/);
+    expect(off.rows[0].label).toMatch(/does not tie/);
+    expect(off.rows[0].amount).toBe('30.00');
+    expect(off.rows[0].href).toBe(`/registers/${da['1050']}`);
+  });
+
   it('a completed reconciliation through the period end marks the account done', async () => {
     const recon = await startReconciliation(ctx, { bankAccountId: checkingBankId, statementDate: d(PERIOD), statementBalance: '950.00' });
     const lines = await listClearable(ctx, checkingBankId, new Date(`${PERIOD}T23:59:59.999Z`), recon.id);
@@ -290,8 +339,33 @@ describe('month-end close: step visibility follows permissions', () => {
       expect(scan.figures.some((f) => f.label === 'Verify Data')).toBe(false);
       expect(scan.figures.some((f) => f.label === 'Open possible errors')).toBe(true);
     }
-    // The owner still sees Verify Data and a payroll reason that is not about access.
+    // Banking has no Customers & Sales / Vendors & Purchases reports: aging tie-out figures only,
+    // no per-customer or per-vendor rows and no link to the aging reports.
+    const banking = await getMonthEndChecklist(roleCtx('banking'), PERIOD);
+    for (const key of ['receivables', 'payables']) {
+      const step = stepOf(banking, key);
+      expect(step.status, key).toBe('done');
+      expect(step.rows, key).toEqual([]);
+      expect(step.action, key).toBeNull();
+      expect(step.figures.find((f) => f.label === 'Aging total'), key).toBeDefined();
+      expect(step.figures.some((f) => f.label.endsWith('account balance')), key).toBe(true);
+    }
+    expect(stepOf(banking, 'receivables').figures.find((f) => f.label === 'Aging total')!.value).toBe('300.00');
+    expect(JSON.stringify(stepOf(banking, 'receivables'))).not.toContain('Acme Corp');
+    expect(JSON.stringify(stepOf(banking, 'payables'))).not.toContain('Paper Co');
+    // Banking makes deposits, so it sees who the waiting payments are from ...
+    expect(stepOf(banking, 'undeposited').rows[0].label).toMatch(/^Acme Corp: payment/);
+    // ... a role without Banking sees the amounts only.
+    const noBanking = await getMonthEndChecklist(customCtx({ accounting: ['view'] }), PERIOD);
+    const ufRow = stepOf(noBanking, 'undeposited').rows[0];
+    expect(ufRow.label).toBe('Payment of Mar 2, 2026');
+    expect(ufRow.amount).toBe('200.00');
+    expect(stepOf(noBanking, 'receivables').rows).toEqual([]);
+    // The owner still sees the names, Verify Data and a payroll reason that is not about access.
     const own = await getMonthEndChecklist(ctx, PERIOD);
+    expect(stepOf(own, 'receivables').rows.map((r) => r.label)).toContain('Acme Corp');
+    expect(stepOf(own, 'payables').rows.map((r) => r.label)).toContain('Paper Co');
+    expect(stepOf(own, 'receivables').action?.href).toMatch(/ar-aging-summary/);
     expect(stepOf(own, 'error_scan').rows.some((r) => r.label.startsWith('Verify Data'))).toBe(true);
     expect(stepOf(own, 'payroll').statusReason ?? '').not.toMatch(/access to payroll/);
   });
@@ -424,6 +498,27 @@ describe('month-end close: closing the books', () => {
     await expect(closeMonth(ctx, { periodEnd: future })).rejects.toMatchObject({ code: 'VALIDATION' });
   });
 
+  it('a period is over only after its last LOCAL day: no early close in the evening west of UTC', async () => {
+    const tz = process.env.TZ;
+    process.env.TZ = 'America/Los_Angeles';
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      // 8 pm on Mar 30 in Los Angeles: already Mar 31 in UTC, but March is not over.
+      vi.setSystemTime(new Date('2026-03-31T03:00:00.000Z'));
+      await expect(closeMonth(ctx, { periodEnd: PERIOD })).rejects.toThrow(/has not happened yet/);
+      // 8 pm on Mar 31 local (Apr 1 UTC): the last day itself is still running.
+      vi.setSystemTime(new Date('2026-04-01T03:00:00.000Z'));
+      await expect(closeMonth(ctx, { periodEnd: PERIOD })).rejects.toThrow(/is not over yet/);
+      // Local Apr 1: past the date check (now it is the open steps that stop the close).
+      vi.setSystemTime(new Date('2026-04-01T08:00:00.000Z'));
+      await expect(closeMonth(ctx, { periodEnd: PERIOD })).rejects.toThrow(/Finish, review or skip/);
+    } finally {
+      vi.useRealTimers();
+      if (tz === undefined) delete process.env.TZ;
+      else process.env.TZ = tz;
+    }
+  });
+
   it('sets the closing date (with the closing-date password) once every step is resolved', async () => {
     let c = await getMonthEndChecklist(ctx, PERIOD);
     for (const key of c.outstanding) {
@@ -543,6 +638,21 @@ describe('month-end close: report pack', () => {
     expect(text).toContain('950.00'); // statement ending balance
     expect(text).toMatch(/Credit Card|2100/); // trial balance lists the card
     expect(text).toContain('Books closed through Mar 31, 2026.');
+  });
+
+  it('leaves the reconciliation figures out for people without Sensitive Accounting: print', async () => {
+    const reportsOnly = customCtx({ reports_financial: ['view', 'print'], reports_sales: ['view'], reports_purchases: ['view'] });
+    const pack = await buildMonthEndReportPack(reportsOnly, PERIOD);
+    expect(pack.sections).toEqual(TITLES);
+    const text = pdfText(pack.bytes);
+    expect(text).toContain(RECON_NO_ACCESS);
+    expect(text).not.toContain('1000 Checking');
+    expect(text).toContain('Acme Corp'); // the aging summaries they may see are still there
+    // With accounting: print the figures are back.
+    const withRecon = customCtx({ reports_financial: ['view', 'print'], reports_sales: ['view'], reports_purchases: ['view'], accounting: ['view', 'print'] });
+    const full = pdfText((await buildMonthEndReportPack(withRecon, PERIOD)).bytes);
+    expect(full).toContain('1000 Checking');
+    expect(full).not.toContain(RECON_NO_ACCESS);
   });
 
   it('needs the customer and vendor report areas too, and downloads through the API', async () => {

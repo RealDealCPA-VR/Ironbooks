@@ -52,6 +52,7 @@ import { Money, type MoneyInput, toAmountString } from '@/lib/money';
 import { reportToTable, type StdReport } from '@/lib/reports/types';
 import type { ReportParams } from '@/lib/validation/reports';
 import { buildReportPdf, type PdfCell } from '@/lib/export/reportPdf';
+import { localDay } from '@/lib/monthEnd';
 import {
   type ServiceContext,
   ServiceError,
@@ -480,16 +481,19 @@ const UF_BUCKETS = [
 ];
 
 async function stepUndeposited({ ctx, periodEnd, asOf, accounts: accts, ledger }: StepInput): Promise<Computed> {
-  let items: Awaited<ReturnType<typeof listUndepositedPayments>>;
+  let inPeriod: Awaited<ReturnType<typeof listUndepositedPayments>>;
   try {
-    items = await listUndepositedPayments(ctx);
+    // What was waiting AT the period end: received by then and not deposited by then (a deposit
+    // dated after the period end does not take a payment out of this month's aging).
+    inPeriod = await listUndepositedPayments(ctx, { asOf });
   } catch (err) {
     if (err instanceof ServiceError && err.code === 'NOT_FOUND') {
       return { status: 'skipped', reason: 'This company has no Undeposited Funds account.', summary: 'No Undeposited Funds account.', rows: [] };
     }
     throw err;
   }
-  const inPeriod = items.filter((i) => i.date.getTime() <= asOf.getTime());
+  // Customer names come from the Make Deposits list (Banking area); others see the amounts only.
+  const showNames = await canAccess(ctx, 'banking', 'view');
   const totals = UF_BUCKETS.map(() => Money.zero());
   const rows: StepRow[] = [];
   let stale = 0;
@@ -498,8 +502,11 @@ async function stepUndeposited({ ctx, periodEnd, asOf, accounts: accts, ledger }
     const b = UF_BUCKETS.findIndex((k) => age >= k.min && age <= k.max);
     totals[b] = totals[b].plus(Money.of(i.amount));
     if (age > 7) stale++;
+    const what = i.kind === 'payment' ? 'payment' : 'sales receipt';
     rows.push({
-      label: `${i.customerName ?? 'Walk-in customer'}: ${i.kind === 'payment' ? 'payment' : 'sales receipt'} of ${prettyDay(dayOf(i.date)!)}`,
+      label: showNames
+        ? `${i.customerName ?? 'Walk-in customer'}: ${what} of ${prettyDay(dayOf(i.date)!)}`
+        : `${what[0].toUpperCase()}${what.slice(1)} of ${prettyDay(dayOf(i.date)!)}`,
       detail: `${plural(age, 'day')} old on ${prettyDay(periodEnd)}${i.currency ? ` (${i.currency})` : ''}.`,
       amount: toAmountString(i.amount),
       status: age > 7 ? 'attention' : 'done',
@@ -507,23 +514,52 @@ async function stepUndeposited({ ctx, periodEnd, asOf, accounts: accts, ledger }
   }
   const uf = accts.find((a) => a.subtype === 'undeposited_funds' || a.code === '1050');
   const figures: StepFigure[] = UF_BUCKETS.map((k, idx) => ({ label: k.label, value: toAmountString(totals[idx]), kind: 'money' as const }));
-  if (uf) figures.push({ label: `Undeposited Funds balance on ${prettyDay(periodEnd)}`, value: toAmountString(naturalBalance(uf, ledger)), kind: 'money' });
   const total = totals.reduce((s, t) => s.plus(t), Money.zero());
+  const ledgerBal = uf ? naturalBalance(uf, ledger) : null;
+  if (ledgerBal) figures.push({ label: `Undeposited Funds balance on ${prettyDay(periodEnd)}`, value: toAmountString(ledgerBal), kind: 'money' });
+  const action = { href: '/deposits', label: 'Make deposits' };
+
+  // Tie-out: the payments waiting must add up to the Undeposited Funds account at the period end.
+  // Foreign-currency payments are aged in their own currency, so they cannot be compared 1:1.
+  const comparable = !inPeriod.some((i) => i.currency);
+  if (uf && ledgerBal && comparable && !ledgerBal.equals(total)) {
+    const diff = ledgerBal.minus(total);
+    return {
+      status: 'attention',
+      summary: `The payments waiting (${fmtMoney(total)}) do not match the Undeposited Funds account (${fmtMoney(ledgerBal)}) on ${prettyDay(periodEnd)}; difference ${fmtMoney(diff)}.`,
+      rows: [
+        {
+          label: 'Undeposited Funds does not tie to the payments waiting',
+          detail: 'A journal entry, transfer or deposit line that hits Undeposited Funds directly (not through a customer payment or sales receipt) usually causes this. Look at the Undeposited Funds register.',
+          amount: toAmountString(diff),
+          status: 'attention',
+          href: `/registers/${uf.id}`,
+          hrefLabel: 'Open register',
+        },
+        ...rows.slice(0, 50),
+      ],
+      figures,
+      action,
+    };
+  }
   if (!inPeriod.length) {
-    return { status: 'done', summary: 'Nothing is waiting in Undeposited Funds.', rows, figures };
+    return { status: 'done', summary: `Nothing was waiting in Undeposited Funds on ${prettyDay(periodEnd)}.`, rows, figures };
   }
   return {
     status: stale ? 'attention' : 'done',
     summary: stale
-      ? `${plural(stale, 'payment')} older than a week ${stale === 1 ? 'is' : 'are'} still waiting to be deposited (${fmtMoney(total)} in total).`
+      ? `${plural(stale, 'payment')} older than a week ${stale === 1 ? 'was' : 'were'} still waiting to be deposited on ${prettyDay(periodEnd)} (${fmtMoney(total)} in total).`
       : `${plural(inPeriod.length, 'recent payment')} (${fmtMoney(total)}) waiting — deposit ${inPeriod.length === 1 ? 'it' : 'them'} when ${inPeriod.length === 1 ? 'it reaches' : 'they reach'} the bank.`,
     rows: rows.slice(0, 50),
     figures,
-    action: { href: '/deposits', label: 'Make deposits' },
+    action,
   };
 }
 
 async function stepAging(side: 'ar' | 'ap', { ctx, periodEnd, accounts: accts, ledger }: StepInput): Promise<Computed> {
+  // Per-customer / per-vendor balances belong to the Customers & Sales / Vendors & Purchases
+  // reports (as in the report pack); without that area only the tie-out figures are shown.
+  const showNames = await canAccess(ctx, side === 'ar' ? 'reports_sales' : 'reports_purchases', 'view');
   const report = await agingSummary(ctx, { asOf: periodEnd } as ReportParams, side);
   const grand = report.rows.find((r) => r.id === 'ag:grand');
   const agingTotal = Money.of((grand?.cells.total as string | null) ?? 0);
@@ -543,11 +579,13 @@ async function stepAging(side: 'ar' | 'ap', { ctx, periodEnd, accounts: accts, l
   const overKey = moneyCols.find((c) => c.header.startsWith('>'))?.key;
   const over = overKey ? Money.of((grand?.cells[overKey] as string | null) ?? 0) : Money.zero();
   const rows: StepRow[] = report.rows
-    .filter((r) => r.kind === 'data')
+    .filter((r) => showNames && r.kind === 'data')
     .map((r) => ({ label: String(r.cells.label ?? ''), amount: toAmountString((r.cells.total as string | null) ?? 0), href: r.href ?? undefined, hrefLabel: 'Details' }))
     .sort((a, b) => Money.of(b.amount).abs().comparedTo(Money.of(a.amount).abs()))
     .slice(0, 15);
   const reportHref = `/reports/std/${side === 'ar' ? 'ar-aging-summary' : 'ap-aging-summary'}?asOf=${periodEnd}`;
+  const reportLink = showNames ? { href: reportHref, hrefLabel: 'Open aging report' } : {};
+  const action = showNames ? { href: reportHref, label: 'Open aging report' } : null;
   if (!agingTotal.equals(control)) {
     const diff = control.minus(agingTotal);
     return {
@@ -559,19 +597,18 @@ async function stepAging(side: 'ar' | 'ap', { ctx, periodEnd, accounts: accts, l
           detail: `A journal entry or transfer that hits ${acctName} without a ${side === 'ar' ? 'customer' : 'vendor'}, or a transaction dated differently, usually causes this. Run Verify Data and look at the ${acctName} register.`,
           amount: toAmountString(diff),
           status: 'attention',
-          href: reportHref,
-          hrefLabel: 'Open aging report',
+          ...reportLink,
         },
         ...rows,
       ],
       figures,
-      action: { href: reportHref, label: 'Open aging report' },
+      action,
     };
   }
   const summary = agingTotal.isZero()
     ? `${who === 'Customers' ? 'No customer owes you money' : 'You owe no vendor money'} on ${prettyDay(periodEnd)}; ${acctName} is zero.`
     : `${who} ${side === 'ar' ? 'owe you' : 'are owed'} ${fmtMoney(agingTotal)}${over.isZero() ? '' : ` (${fmtMoney(over)} more than 90 days overdue)`}; it matches the ${acctName} account.`;
-  return { status: 'done', summary, rows, figures, action: { href: reportHref, label: 'Open aging report' } };
+  return { status: 'done', summary, rows, figures, action };
 }
 
 async function stepPayroll({ ctx, periodEnd, asOf }: StepInput): Promise<Computed> {
@@ -1111,9 +1148,13 @@ export interface CloseMonthResult {
 export async function closeMonth(ctx: ServiceContext, input: CloseMonthInput): Promise<CloseMonthResult> {
   await requireEffectivePermission(ctx, 'closing', 'modify');
   const periodEnd = parsePeriodEnd(input.periodEnd);
-  const today = new Date().toISOString().slice(0, 10);
-  if (periodEnd > today) {
-    throw validation(`${prettyDay(periodEnd)} has not happened yet. You can close a period once it has ended.`);
+  // The local calendar day (the desktop app's clock, the same one the page builds its month ends
+  // from, not UTC), and the period end must be over: its last day itself is still too early.
+  const today = localDay();
+  if (periodEnd >= today) {
+    throw validation(
+      `${prettyDay(periodEnd)} ${periodEnd === today ? 'is not over yet' : 'has not happened yet'}. You can close a period once it has ended.`,
+    );
   }
   if (input.password != null && input.password.length > 200) throw validation('The closing date password is too long.');
   const current = await getClosingDateSettings(ctx);
@@ -1190,6 +1231,9 @@ function stdToPdfRows(report: StdReport): { columns: { header: string; numeric?:
   };
 }
 
+export const RECON_NO_ACCESS =
+  'Left out: reconciliation reports need Sensitive Accounting (print) access.';
+
 async function reconciliationSummary(ctx: ServiceContext, periodStart: string, periodEnd: string) {
   const banks = await ctx.db
     .select({ id: bankAccounts.id, code: accounts.code, name: accounts.name, last: bankAccounts.lastReconciledDate })
@@ -1261,7 +1305,12 @@ export async function buildMonthEndReportPack(ctx: ServiceContext, periodEndInpu
     await agingSummary(ctx, asOf, 'ap'),
   ];
   const reconTitle = 'Reconciliation Summary';
-  const reconRows = await reconciliationSummary(ctx, periodStart, periodEnd);
+  // Reconciliation reports are Sensitive Accounting: print (/api/reconciliations/[id]/report);
+  // without it the section stays in the pack with a note instead of the figures.
+  const reconAllowed = await canAccess(ctx, 'accounting', 'print');
+  const reconRows: PdfCell[][] = reconAllowed
+    ? await reconciliationSummary(ctx, periodStart, periodEnd)
+    : [[RECON_NO_ACCESS, '', '', '', '', '', '', '']];
 
   const coverTitle = 'Month-End Report Pack';
   const sections = [coverTitle, ...std.map((r) => r.title), reconTitle];

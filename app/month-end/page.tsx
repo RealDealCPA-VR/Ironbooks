@@ -40,6 +40,7 @@ import {
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { closePasswordProblem, monthEndBefore } from '@/lib/monthEnd';
 import type {
   MonthEndChecklist,
   MonthEndHistoryRow,
@@ -54,12 +55,8 @@ interface Payload {
 
 const CLOSE_KEY = 'close';
 
-/** Last day of the month `back` months before the current one ('YYYY-MM-DD', UTC calendar). */
-function monthEnd(back: number): string {
-  const now = new Date();
-  const d = new Date(Date.UTC(now.getFullYear(), now.getMonth() - back + 1, 0));
-  return d.toISOString().slice(0, 10);
-}
+/** Last day of the month `back` months before the current (local) one, 'YYYY-MM-DD'. */
+const monthEnd = (back: number) => monthEndBefore(back);
 
 function monthLabel(day: string): string {
   const d = new Date(`${day}T12:00:00Z`);
@@ -345,12 +342,9 @@ function ClosePanel({
   const laterClosed = !!checklist.closingDate && checklist.closingDate > checklist.periodEnd;
 
   function check(): boolean {
-    if (mode === 'set' && checklist.hasClosingPassword && !password) {
-      toast('Type the new password, or choose Keep the current password.', 'danger');
-      return false;
-    }
-    if (mode === 'set' && password !== confirmPw) {
-      toast('The two passwords do not match.', 'danger');
+    const problem = closePasswordProblem({ mode, password, confirm: confirmPw, hasClosingPassword: checklist.hasClosingPassword });
+    if (problem) {
+      toast(problem, 'danger');
       return false;
     }
     return true;
