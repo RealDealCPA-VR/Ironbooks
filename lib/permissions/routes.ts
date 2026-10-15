@@ -585,6 +585,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // wave2 reports: one route serves every standard report; runStandardReport checks the
   // report's own area (financial / sales / purchases / time). Graphs check per graph kind.
   '/api/reports/std/[report]': kind('member', 'GET'),
+  // reportexplain: number explanations / drill-down and the one-line summary; the services
+  // check each report's own area (view) via prepareStandardReport, like /api/reports/std.
+  '/api/reports/drilldown/[report]': kind('member', 'GET'),
+  '/api/reports/summary/[report]': kind('member', 'GET'),
   '/api/reports/graphs': kind('member', 'GET'),
   '/api/reports/filter-options': kind('member', 'GET'), // names only; service requires a report area
   '/api/reports/pivot': r('reports_financial', 'GET'),
@@ -768,6 +772,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   // wave2 reports. The standard report viewer, memorized reports and graphs host reports from
   // several areas; their APIs check each report's own area (runStandardReport / graph kind).
   '/reports/std': [...ANY_REPORT, 'time'],
+  '/reports/drilldown': ANY_REPORT, // reportexplain: QuickZoom list; the API checks the report's area
   '/reports/memorized': ANY_REPORT,
   '/reports/graphs': ['reports_financial', 'reports_sales', 'reports_purchases'],
   '/reports/pivot': 'reports_financial',

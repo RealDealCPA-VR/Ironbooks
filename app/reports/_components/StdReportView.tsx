@@ -22,6 +22,9 @@ import StdReportTable, { useCollapse } from './StdReportTable';
 import ReportFilters, { hasAdvancedFilters, type Params } from './ReportFilters';
 import NumberFormatPanel, { useNumberFormat } from './NumberFormatPanel';
 import { ReportWhyChanged } from '@/components/WhyChanged';
+import ReportSummaryBar from './ReportSummaryBar';
+import { clearExplainCache } from './AmountExplain';
+import { isSummaryReport } from '@/lib/reports/drilldown';
 
 interface MemorizedRow {
   id: string;
@@ -80,17 +83,62 @@ export default function StdReportView({
   const [memorized, setMemorized] = useState<MemorizedRow | null>(null);
   const [format, setFormat] = useNumberFormat(memorized?.config.display?.numberFormat);
   const [memoOpen, setMemoOpen] = useState(false);
-  const { collapsed, toggle, collapsible, allCollapsed, collapseAll, expandAll } = useCollapse(report);
+  const { collapsed, setCollapsed, toggle, collapsible, allCollapsed, collapseAll, expandAll } = useCollapse(report);
 
   // Re-read params when the URL changes (QuickZoom Back / Forward).
   const searchKey = search?.toString() ?? '';
+  // The report's own options (the summary's "compare with" choice does not re-run the report).
+  const optionsKey = (() => {
+    const q = new URLSearchParams(searchKey);
+    q.delete('summaryVs');
+    return q.toString();
+  })();
   useEffect(() => {
     setParams({ ...(entry?.defaults ?? {}), ...paramsFromSearch(search) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchKey, reportKey]);
+  }, [optionsKey, reportKey]);
+
+  // reportexplain: the options the report runs with (drill-downs and the summary reuse them).
+  const ranParams = useMemo(() => {
+    const p: Params = { ...(entry?.defaults ?? {}), ...paramsFromSearch(search) };
+    if (fixedBasis) p.basis = fixedBasis;
+    return p;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [optionsKey, reportKey, fixedBasis]);
+  const backHref = `${pathname}${searchKey ? `?${searchKey}` : ''}`;
+  const viewStateKey = `reportView:${backHref}`;
+  const summaryVs = search?.get('summaryVs') === 'prior_year' ? 'prior_year' : 'prior_period';
+  // Before a QuickZoom drill-down: remember where the reader was, so Back lands on the same row.
+  const saveViewState = () => {
+    try {
+      sessionStorage.setItem(viewStateKey, JSON.stringify({ scrollY: window.scrollY, collapsed: [...collapsed] }));
+    } catch {
+      /* storage unavailable: Back still restores the report's options from the URL */
+    }
+  };
+  // After coming Back: restore the scroll position and collapsed rows once the report is drawn.
+  useEffect(() => {
+    if (loading || !report) return;
+    let saved: { scrollY?: number; collapsed?: string[] } | null = null;
+    try {
+      const raw = sessionStorage.getItem(viewStateKey);
+      if (raw) {
+        sessionStorage.removeItem(viewStateKey);
+        saved = JSON.parse(raw);
+      }
+    } catch {
+      saved = null;
+    }
+    if (!saved) return;
+    if (Array.isArray(saved.collapsed)) setCollapsed(new Set(saved.collapsed.filter((x): x is string => typeof x === 'string')));
+    const y = typeof saved.scrollY === 'number' ? saved.scrollY : 0;
+    requestAnimationFrame(() => window.scrollTo({ top: y }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, report, viewStateKey]);
 
   const run = useCallback(async (p: Params) => {
     if (fixedBasis) p = { ...p, basis: fixedBasis };
+    clearExplainCache();
     setLoading(true);
     setError(null);
     try {
@@ -110,7 +158,7 @@ export default function StdReportView({
   useEffect(() => {
     run({ ...(entry?.defaults ?? {}), ...paramsFromSearch(search) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchKey, reportKey]);
+  }, [optionsKey, reportKey]);
 
   useEffect(() => {
     if (!memorizedId) return;
@@ -123,6 +171,7 @@ export default function StdReportView({
   const applyParams = (p: Params) => {
     const qs = new URLSearchParams(p);
     if (memorizedId) qs.set('mem', memorizedId);
+    if (search?.get('summaryVs')) qs.set('summaryVs', search.get('summaryVs')!);
     const s = qs.toString();
     const target = `${pathname}${s ? `?${s}` : ''}`;
     if (target === `${pathname}${searchKey ? `?${searchKey}` : ''}`) run(p);
@@ -237,6 +286,20 @@ export default function StdReportView({
       </Card>
 
       {report && <ReportWhyChanged reportKey={reportKey} params={runParams} basis={report.basis} range={report.range} />}
+      {isSummaryReport(reportKey) && !error && (
+        <ReportSummaryBar
+          reportKey={reportKey}
+          params={ranParams}
+          vs={summaryVs}
+          onVsChange={(v) => {
+            const qs = new URLSearchParams(search?.toString() ?? '');
+            if (v === 'prior_year') qs.set('summaryVs', v);
+            else qs.delete('summaryVs');
+            const s = qs.toString();
+            router.replace(`${pathname}${s ? `?${s}` : ''}`, { scroll: false });
+          }}
+        />
+      )}
 
       {report?.balanced === false && (
         <div role="alert" className="mb-4 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">
@@ -260,7 +323,14 @@ export default function StdReportView({
           </div>
         )}
         {!loading && !error && report && (
-          <StdReportTable report={report} format={format} collapsed={collapsed} onToggle={toggle} hiddenColumns={hidden} />
+          <StdReportTable
+            report={report}
+            format={format}
+            collapsed={collapsed}
+            onToggle={toggle}
+            hiddenColumns={hidden}
+            explain={{ reportKey, params: ranParams, backHref, onNavigate: saveViewState }}
+          />
         )}
       </Card>
       {report?.notes?.map((n) => (
@@ -269,7 +339,7 @@ export default function StdReportView({
         </p>
       ))}
       <p className="text-xs text-navy/40 mt-2 print-hidden">
-        Tip: click an amount to see the transactions behind it (QuickZoom). Double-click a transaction row to open it.
+        Tip: point at (or tab to) an amount to see what it is made of; click it or press Enter to see the transactions behind it (QuickZoom). Double-click a transaction row to open it.
       </p>
 
       <MemorizeDialog

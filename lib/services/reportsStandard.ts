@@ -91,7 +91,7 @@ const isMonthEnd = (d: Date) => d.getUTCDate() === lastDayOfMonth(d.getUTCFullYe
  * (Mar 31 − 1 month = Feb 28, Feb 29 − 12 months = Feb 28) and a month-end date stays a month
  * end (Feb 28 − 1 month = Jan 31). Time of day is kept.
  */
-function shiftMonths(d: Date, months: number): Date {
+export function shiftMonths(d: Date, months: number): Date {
   const y = d.getUTCFullYear();
   const m = d.getUTCMonth() + months;
   const ty = y + Math.floor(m / 12);
@@ -101,7 +101,7 @@ function shiftMonths(d: Date, months: number): Date {
   return new Date(Date.UTC(ty, tm, day, d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds()));
 }
 
-function shiftYears(d: Date, years: number): Date {
+export function shiftYears(d: Date, years: number): Date {
   return shiftMonths(d, years * 12);
 }
 
@@ -110,7 +110,7 @@ function shiftYears(d: Date, years: number): Date {
  * month end) compares with the same number of whole months before it, like QuickBooks
  * (September vs August, Q2 vs Q1); any other range uses the equal-length window just before it.
  */
-function previousPeriod(from: Date, to: Date): { from: Date; to: Date } {
+export function previousPeriod(from: Date, to: Date): { from: Date; to: Date } {
   if (from.getUTCDate() === 1 && isMonthEnd(to)) {
     const months = (to.getUTCFullYear() - from.getUTCFullYear()) * 12 + (to.getUTCMonth() - from.getUTCMonth()) + 1;
     if (months >= 1) return { from: shiftMonths(from, -months), to: shiftMonths(to, -months) };

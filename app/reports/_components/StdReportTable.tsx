@@ -13,8 +13,33 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 import EntryDetailModal from '@/components/EntryDetailModal';
 import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
 import { FONT_CLASS, FONT_SIZE_CLASS, formatAmount, type NumberFormat } from '@/lib/reports/format';
+import { drilldownApiUrl, drilldownHref, isDrilldownReport } from '@/lib/reports/drilldown';
+import { formatCurrency } from '@/lib/money';
+import AmountExplain from './AmountExplain';
 
 const NUMERIC = new Set(['money', 'number', 'percent']);
+
+/** Explanations for the amounts (reportexplain). */
+export interface ExplainContext {
+  reportKey: string;
+  /** The options the report ran with (they travel in the drill-down URL). */
+  params: Record<string, string>;
+  /** The report page to come back to. */
+  backHref: string;
+  /** Called before following a drill-down link (save scroll / collapse state). */
+  onNavigate?: () => void;
+}
+
+/** Tooltip for one transaction line on a report without server explanations. */
+function singleText(r: StdRow): string {
+  const c = r.cells;
+  const amount = c.amount ?? c.open ?? c.debit ?? c.credit ?? null;
+  const what = [c.type, c.num ? `#${String(c.num).replace(/^#/, '')}` : ''].filter(Boolean).join(' ') || 'transaction';
+  const who = c.name ? ` with ${c.name}` : '';
+  const when = typeof c.date === 'string' && c.date ? ` on ${fmtDate(c.date)}` : '';
+  const amt = amount !== null && amount !== '' ? ` for ${formatCurrency(String(amount))}` : '';
+  return `One transaction: ${what}${who}${when}${amt}.`;
+}
 
 function fmtDate(v: CellValue): string {
   if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(v)) return v == null ? '' : String(v);
@@ -46,16 +71,20 @@ export default function StdReportTable({
   collapsed,
   onToggle,
   hiddenColumns,
+  explain,
 }: {
   report: StdReport;
   format: NumberFormat;
   collapsed: Set<string>;
   onToggle: (id: string) => void;
   hiddenColumns?: Set<string>;
+  /** Explain every amount (hover / focus tooltip + drill-down). */
+  explain?: ExplainContext;
 }) {
   const [entryId, setEntryId] = useState<string | null>(null);
   const byId = useMemo(() => new Map(report.rows.map((r) => [r.id, r])), [report]);
   const columns = report.columns.filter((c, i) => i === 0 || !hiddenColumns?.has(c.key));
+  const explainAll = !!explain && isDrilldownReport(explain.reportKey);
 
   const isHidden = (r: StdRow): boolean => {
     if (r.totalOf && collapsed.has(r.totalOf)) return true;
@@ -134,7 +163,30 @@ export default function StdReportTable({
                   const numeric = c.type && NUMERIC.has(c.type);
                   const cellHref = r.hrefs?.[c.key] ?? (i === 0 || (numeric && r.kind === 'data') ? r.href : null);
                   let inner: React.ReactNode = content;
-                  if (cellHref && content !== '') {
+                  const explainable = !!explain && numeric && c.type !== 'number' && v !== null && v !== '';
+                  if (explainable && explainAll) {
+                    // reportexplain: every amount explains itself and drills to its transactions.
+                    const cellLabel = `${String(cells[columns[0].key] ?? r.cells.type ?? '')}${c.header ? `, ${c.header}` : ''}`.trim();
+                    const single = !!openEntry && c.key !== 'balance';
+                    inner = (
+                      <AmountExplain
+                        apiUrl={drilldownApiUrl(explain!.reportKey, explain!.params, r.id, c.key, true)}
+                        href={single ? undefined : drilldownHref(explain!.reportKey, explain!.params, r.id, c.key, explain!.backHref)}
+                        onActivate={single ? openEntry : undefined}
+                        onNavigate={explain!.onNavigate}
+                        label={cellLabel}
+                      >
+                        {content}
+                      </AmountExplain>
+                    );
+                  } else if (explainable && openEntry) {
+                    // Other reports: a transaction line is one transaction — explain it locally.
+                    inner = (
+                      <AmountExplain onActivate={openEntry} localText={singleText(r)} label={String(r.cells.type ?? 'Transaction')}>
+                        {content}
+                      </AmountExplain>
+                    );
+                  } else if (cellHref && content !== '') {
                     inner = (
                       <Link href={cellHref} className="hover:text-electric hover:underline" title="QuickZoom: open the detail behind this amount">
                         {content}

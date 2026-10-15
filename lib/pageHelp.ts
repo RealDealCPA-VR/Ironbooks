@@ -320,6 +320,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Pick the date at the top; click any amount to see the details.',
     qb: 'Balance Sheet Standard',
   },
+  '/reports/drilldown': {
+    title: "What's behind this number",
+    what: 'Every transaction that adds up to the amount you clicked on a report, using the same dates, basis and filters as the report.',
+    first: 'Click a date to open that transaction and its original document; use Back to return to the report where you left it.',
+    qb: 'QuickZoom',
+  },
   '/accounts': {
     title: 'Chart of Accounts',
     what: 'The categories your money is sorted into: bank accounts, income, expenses, what you own and owe.',
