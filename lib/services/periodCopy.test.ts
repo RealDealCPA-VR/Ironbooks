@@ -9,7 +9,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq, gt } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, auditLogs, companies, expenses, invoices, journalEntries, paymentsReceived, users } from '@/lib/db/schema';
+import { accountantCopies, accounts, auditLogs, companies, expenses, invoices, journalEntries, paymentsReceived, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createCustomer } from './customers';
@@ -21,10 +21,12 @@ import { createManualEntry, voidEntry } from './journal';
 import { trialBalance } from './reports';
 import { restorePortableCompanyFile } from './portableFile';
 import { createPeriodCopy } from './periodCopy';
+import { accountantCopyStatus, createAccountantCopy } from './accountantCopy/client';
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-period-copy');
 const SRC = path.join(ROOT, 'source');
 const OUT = path.join(ROOT, 'copy');
+const OUT2 = path.join(ROOT, 'copy-while-acctcopy');
 
 const d = (s: string) => new Date(`${s}T12:00:00.000Z`);
 const endOfDay = (s: string) => new Date(`${s}T23:59:59.999Z`);
@@ -152,5 +154,23 @@ describe('Period Copy', () => {
     // A/R in the copy = the open invoices on Mar 31 (500 February + 75 December).
     const tb = await trialBalance(cctx);
     expect(tb.rows.find((r) => r.code === '1200')?.debit).toBe('575.00');
+  });
+
+  it("works while an Accountant's Copy is out, and the auditor's copy does not inherit it", async () => {
+    await createAccountantCopy(ctx, { dividingDate: '2026-03-31', dataDir: SRC });
+    expect((await accountantCopyStatus(ctx)).mode).toBe('client');
+    const res = await createPeriodCopy(ctx, { from: '2026-01-01', to: '2026-03-31', dataDir: SRC });
+    await restorePortableCompanyFile(res.buffer, OUT2);
+    const db2 = await getDb(OUT2);
+    try {
+      const c2: ServiceContext = { db: db2, companyId: ctx.companyId, userId: ctx.userId };
+      expect(await db2.select().from(accountantCopies)).toHaveLength(0);
+      expect((await accountantCopyStatus(c2)).mode).toBe('none');
+      expect(await tbRows(c2, endOfDay('2026-03-31'))).toEqual(await tbRows(ctx, endOfDay('2026-03-31')));
+      // The original still has its outstanding copy.
+      expect((await accountantCopyStatus(ctx)).mode).toBe('client');
+    } finally {
+      await closeDb(OUT2).catch(() => undefined);
+    }
   });
 });

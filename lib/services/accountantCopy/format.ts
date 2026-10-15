@@ -179,7 +179,78 @@ export function parseChangesFile(buffer: Buffer): ChangesFile {
     if (!Array.isArray(parsed[k])) throw notChanges(`"${k}" is missing`);
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(parsed.dividingDate ?? '')) throw notChanges('the dividing date is missing');
+  if (!wellFormed(parsed)) throw notChanges('it is incomplete');
   return parsed;
+}
+
+// ---- Structural checks (a file can pass its checksum and still be malformed) ----
+
+type Rec = Record<string, unknown>;
+const isObj = (v: unknown): v is Rec => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isStr = (v: unknown): v is string => typeof v === 'string';
+const optStr = (v: unknown) => v === undefined || v === null || typeof v === 'string';
+const isDate = (v: unknown) => isStr(v) && /^\d{4}-\d{2}-\d{2}/.test(v);
+const isVersion = (v: unknown) => v === null || isStr(v);
+
+function journalOk(a: unknown): boolean {
+  if (!isObj(a) || !isDate(a.date) || !optStr(a.description) || !optStr(a.reference) || !Array.isArray(a.lines)) return false;
+  return a.lines.every(
+    (l) =>
+      isObj(l) &&
+      isStr(l.accountId) &&
+      optStr(l.debit) &&
+      optStr(l.credit) &&
+      optStr(l.memo) &&
+      optStr(l.classId) &&
+      optStr(l.entityType) &&
+      optStr(l.entityId),
+  );
+}
+
+function expenseOk(a: unknown): boolean {
+  if (!isObj(a) || !isDate(a.date) || !isStr(a.method) || !isStr(a.paymentAccountId) || !optStr(a.vendorId)) return false;
+  if (!optStr(a.payeeName) || !optStr(a.reference) || !optStr(a.memo) || !Array.isArray(a.lines)) return false;
+  return a.lines.every(
+    (l) => isObj(l) && isStr(l.amount) && optStr(l.accountId) && optStr(l.itemId) && optStr(l.description) && optStr(l.classId),
+  );
+}
+
+function txnOk(t: unknown): boolean {
+  if (!isObj(t) || !isStr(t.id)) return false;
+  if (t.type !== 'journal_entry' && t.type !== 'expense') return false;
+  if (t.op === 'void') return isVersion(t.baseVersion);
+  if (t.op !== 'add' && t.op !== 'edit') return false;
+  if (t.op === 'edit' && !isVersion(t.baseVersion)) return false;
+  return t.type === 'journal_entry' ? journalOk(t.after) : expenseOk(t.after);
+}
+
+function accountOk(a: unknown): boolean {
+  if (!isObj(a) || !isStr(a.id) || (a.op !== 'add' && a.op !== 'edit')) return false;
+  if (a.op === 'edit' && !isVersion(a.baseVersion)) return false;
+  const p = a.after;
+  return (
+    isObj(p) &&
+    isStr(p.code) &&
+    isStr(p.name) &&
+    isStr(p.qbType) &&
+    isStr(p.subtype) &&
+    optStr(p.parentId) &&
+    optStr(p.description) &&
+    optStr(p.taxLine) &&
+    typeof p.isActive === 'boolean'
+  );
+}
+
+const classOk = (c: unknown) => isObj(c) && c.op === 'add' && isStr(c.id) && isStr(c.name) && optStr(c.parentId);
+
+function wellFormed(f: ChangesFile): boolean {
+  if (!isStr(f.copyId) || !isStr(f.companyId) || !isStr(f.fileToken) || !optStr(f.note)) return false;
+  return (
+    f.transactions.every(txnOk) &&
+    f.accounts.every(accountOk) &&
+    f.classes.every(classOk) &&
+    f.warnings.every(isStr)
+  );
 }
 
 /** Filesystem-safe base name for the company. */

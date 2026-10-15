@@ -78,6 +78,7 @@ import { assertWrite } from './rbac';
 import { BACKUP_MANIFEST_ENTRY, createBackup, ensurePreOpBackup, restoreBackup } from './backup';
 import { logTransaction } from './transactionLog';
 import { journalOpenItems } from './journal';
+import { activeCopy } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -474,6 +475,15 @@ export async function condensePeriod(
   const cutoff = input.beforeDate;
   if (!(cutoff instanceof Date) || isNaN(cutoff.getTime())) {
     throw validation('beforeDate must be a valid date.');
+  }
+  // Condense deletes and summarizes old transactions, so it would destroy entries an
+  // Accountant's Copy has locked (and its changes file could no longer be imported).
+  if (await activeCopy(ctx.db, ctx.companyId)) {
+    throw new ServiceError(
+      'CONFLICT',
+      "Condense Data isn't available while an Accountant's Copy is out. Import your accountant's changes or cancel the Accountant's Copy first.",
+      { accountantCopy: true },
+    );
   }
 
   const plan = await computePlan(ctx, cutoff);

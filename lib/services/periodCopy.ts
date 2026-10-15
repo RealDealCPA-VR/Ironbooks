@@ -192,6 +192,12 @@ async function trimCopy(db: DB, companyId: string, to: string): Promise<TrimCoun
     const has = (t: string, c: string) => cols.get(t)?.has(c) ?? false;
     const counts: TrimCounts = { journalEntries: 0, documents: 0, otherCompanies: 0 };
 
+    // ---- Accountant's Copy records ----
+    // A Period Copy is a standalone file for an auditor: it must not inherit the original's
+    // outstanding Accountant's Copy (its dividing-date lock, banner or file token). Cleared before
+    // condensePeriod runs on the copy, which refuses while a copy is outstanding.
+    if (cols.has('accountant_copies')) await tx.exec('DELETE FROM accountant_copies');
+
     // ---- Other companies in the file ----
     const others = await tx.query<{ id: string }>('SELECT id::text AS id FROM companies WHERE id <> $1', [companyId]);
     if (others.rows.length) {

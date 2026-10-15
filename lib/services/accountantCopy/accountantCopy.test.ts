@@ -21,6 +21,8 @@ import { createInvoice } from '../invoices';
 import { createManualEntry, updateEntry, voidEntry } from '../journal';
 import { mergeAccounts } from '../merge';
 import { trialBalance } from '../reports';
+import { setClosingDate } from '../company';
+import { condensePeriod } from '../condense';
 import { accountantCopyStatus, cancelAccountantCopy, createAccountantCopy, importChangesFile, reviewChangesFile } from './client';
 import { accountantChanges, exportChangesFile, inspectTransferFile, openAccountantCopyFile } from './accountant';
 import { parseChangesFile, serializeChangesFile } from './format';
@@ -145,6 +147,23 @@ describe("Accountant's Copy", () => {
     await expect(updateAccount(ctx, fresh.id, { isActive: false })).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 
+  it('client: Condense Data is refused while the copy is out (it would delete locked transactions)', async () => {
+    await setClosingDate(ctx, { closingDate: '2026-01-31' });
+    try {
+      await expect(condensePeriod(ctx, { beforeDate: new Date('2026-02-01T00:00:00.000Z'), dataDir: CLIENT_DIR })).rejects.toMatchObject({
+        code: 'CONFLICT',
+        details: expect.objectContaining({ accountantCopy: true }),
+      });
+      await expect(
+        condensePeriod(ctx, { beforeDate: new Date('2026-03-01T00:00:00.000Z'), dataDir: CLIENT_DIR, dryRun: true }),
+      ).rejects.toMatchObject({ code: 'CONFLICT' });
+    } finally {
+      await setClosingDate(ctx, { closingDate: null });
+    }
+    const [still] = await db.select().from(journalEntries).where(eq(journalEntries.id, febEntryId));
+    expect(still.status).toBe('posted');
+  });
+
   it('accountant: opens the copy and may only work on or before the dividing date', async () => {
     const opened = await openAccountantCopyFile(transfer, ACCT_DIR);
     expect(opened).toMatchObject({ companyName: 'Copy Client Co', dividingDate: '2026-03-31' });
@@ -220,6 +239,29 @@ describe("Accountant's Copy", () => {
     await expect(importChangesFile({ ...ctx, companyId: otherCo.id }, changesFile)).rejects.toMatchObject({ code: 'VALIDATION' });
     const foreign = serializeChangesFile({ ...body, fileToken: 'not-the-token' });
     await expect(importChangesFile(ctx, foreign)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/different company file/) });
+  });
+
+  it('client: a changes file with a valid checksum but a broken structure is refused cleanly (400, not a crash)', async () => {
+    const { sha256: _s, ...body } = parseChangesFile(changesFile);
+    const broken = (mutate: (b: typeof body) => void) => {
+      const copy = JSON.parse(JSON.stringify(body)) as typeof body;
+      mutate(copy);
+      return serializeChangesFile(copy);
+    };
+    const cases = [
+      broken((b) => { delete (b.transactions.find((t) => t.op !== 'void') as { after?: unknown }).after; }),
+      broken((b) => { (b.transactions[0] as { op: string }).op = 'merge'; }),
+      broken((b) => { (b.transactions[0] as { type: string }).type = 'invoice'; }),
+      broken((b) => { (b.transactions.find((t) => t.op !== 'void') as { after: { lines: unknown } }).after.lines = 'nope'; }),
+      broken((b) => { b.transactions.push(null as never); }),
+      broken((b) => { (b.accounts[0] as { after: unknown }).after = {}; }),
+      broken((b) => { (b.classes[0] as { name: unknown }).name = 42; }),
+    ];
+    for (const file of cases) {
+      await expect(reviewChangesFile(ctx, file)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/incomplete/) });
+      await expect(importChangesFile(ctx, file)).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+    expect((await accountantCopyStatus(ctx)).mode).toBe('client');
   });
 
   it('client: reviews and imports the changes through the normal services, books stay balanced', async () => {
