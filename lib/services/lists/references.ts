@@ -38,7 +38,7 @@ async function rows<T>(db: Db, query: ReturnType<typeof sql>): Promise<T[]> {
 }
 
 /** Tables whose contents never count as a "use" of a record. */
-const IGNORED_TABLES = new Set(['audit_logs', 'list_seeds', 'transaction_log_anchor', 'user_sessions', 'single_user_mode']);
+const IGNORED_TABLES = new Set(['audit_logs', 'list_seeds', 'transaction_log_anchor', 'user_sessions', 'single_user_mode', 'undo_actions']);
 
 interface CatalogColumns {
   uuidCols: ColumnRef[];

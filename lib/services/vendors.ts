@@ -263,3 +263,30 @@ export async function deactivateVendor(ctx: ServiceContext, id: string) {
 
   return row;
 }
+
+
+/**
+ * Make an inactive vendor active again (the inverse of deactivateVendor; used by Undo).
+ * Audited as an update of isActive.
+ */
+export async function reactivateVendor(ctx: ServiceContext, id: string) {
+  const before = await loadVendor(ctx, id);
+  const [row] = await ctx.db
+    .update(vendors)
+    .set({ isActive: true, updatedAt: new Date() })
+    .where(and(eq(vendors.id, id), eq(vendors.companyId, ctx.companyId)))
+    .returning();
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'vendor',
+    entityId: id,
+    oldValues: { isActive: before.isActive },
+    newValues: { isActive: true },
+  });
+  return maskForContext(ctx, row);
+}
+
+/** Unmasked vendor row for internal snapshots (Undo restores it through updateVendor). */
+export async function loadVendorUnmasked(ctx: ServiceContext, id: string) {
+  return loadVendor(ctx, id);
+}

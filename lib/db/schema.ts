@@ -2542,3 +2542,30 @@ export const workersCompCodes = pgTable('workers_comp_codes', {
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+/**
+ * Undo tokens (ux/undo, drizzle/0057): one per save / void / delete made from a form. Holds the
+ * record as it was before the action (`snapshot`) and its version right after (`afterVersion`),
+ * so lib/services/undo.ts can apply the inverse through the normal services — once, by the same
+ * user, within 30 seconds, and only while nobody has changed the record since.
+ */
+export const undoActions = pgTable('undo_actions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  userId: uuid('user_id').references(() => users.id),
+  entityType: varchar('entity_type', { length: 40 }).notNull(),
+  /** The record the undo acts on (for a journal-entry edit: the replacement entry). */
+  entityId: varchar('entity_id', { length: 64 }),
+  /** 'create' | 'update' | 'void' | 'delete' */
+  kind: varchar('kind', { length: 10 }).notNull(),
+  /** 'pending' (snapshot taken, action not confirmed) | 'armed' | 'undone' */
+  status: varchar('status', { length: 12 }).notNull().default('pending'),
+  label: text('label'),
+  snapshot: jsonb('snapshot'),
+  afterVersion: timestamp('after_version'),
+  result: jsonb('result'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  armedAt: timestamp('armed_at'),
+  expiresAt: timestamp('expires_at'),
+  undoneAt: timestamp('undone_at'),
+});

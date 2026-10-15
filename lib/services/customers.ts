@@ -397,6 +397,27 @@ export async function deactivateCustomer(ctx: ServiceContext, id: string) {
   return row;
 }
 
+/**
+ * Make an inactive customer active again (the inverse of deactivateCustomer; used by Undo).
+ * Audited as an update of isActive.
+ */
+export async function reactivateCustomer(ctx: ServiceContext, id: string) {
+  const before = await getCustomer(ctx, id);
+  const [row] = await ctx.db
+    .update(customers)
+    .set({ isActive: true, updatedAt: new Date() })
+    .where(and(eq(customers.id, id), eq(customers.companyId, ctx.companyId)))
+    .returning();
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'customer',
+    entityId: id,
+    oldValues: { isActive: before.isActive },
+    newValues: { isActive: true },
+  });
+  return row;
+}
+
 // ---------------------------------------------------------------------------
 // Balance summary (optional — reads invoices.balance_due, not the raw GL)
 // ---------------------------------------------------------------------------
