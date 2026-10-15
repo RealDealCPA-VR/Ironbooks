@@ -58,6 +58,9 @@ import {
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
 import { logTransaction, resetTransactionLogCache } from './transactionLog';
+import { BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE, recordBackup } from './backupHistory';
+import { currentFingerprint } from './backupFingerprint';
+import { APP_VERSION } from '@/lib/appVersion';
 import type { EffectiveAccess } from '@/lib/permissions/model';
 import { isMaskedValue, isSensitiveKey, maskSensitive } from '@/lib/permissions/mask';
 
@@ -78,6 +81,8 @@ interface BackupManifest {
   kind?: BackupKind;
   companyName: string | null;
   createdAt: string;
+  /** Ironbooks version that made the backup (absent on backups made before it was stamped). */
+  appVersion?: string;
   /**
    * Per-company archives only: true when SSNs / tax IDs or account numbers were masked because
    * the exporting user lacked the sensitive-data flags. Those fields restore as empty.
@@ -97,6 +102,14 @@ interface BackupManifest {
  * issued for.
  */
 export const FILE_LOCAL_SECRETS = ['.auth-secret', '.file-id'];
+
+/**
+ * Every root file that belongs to THIS file location rather than its data: the secrets above plus
+ * the backup history and automatic-backup settings (backupHistory.ts). None of them travel inside
+ * a backup, and a restore keeps the current copies — so "Last backup" never jumps back to the
+ * restored copy's age and the schedule survives a restore.
+ */
+export const FILE_LOCAL_FILES = [...FILE_LOCAL_SECRETS, BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE];
 
 export interface BackupResult {
   buffer: Buffer;
@@ -124,7 +137,7 @@ export function createBackup(companyName?: string, dataDir?: string): BackupResu
   // secrets (FILE_LOCAL_SECRETS): a backup may be downloaded by any role with
   // File Utilities, and the session signing secret would let them forge an
   // Admin session.
-  zip.addLocalFolder(dir, '', (p: string) => !FILE_LOCAL_SECRETS.includes(p.replace(/\\/g, '/')));
+  zip.addLocalFolder(dir, '', (p: string) => !FILE_LOCAL_FILES.includes(p.replace(/\\/g, '/')));
 
   // Embed a manifest so restoreBackup can verify the archive is really a
   // Ironbooks backup (and reject backups from a newer, incompatible format).
@@ -134,6 +147,7 @@ export function createBackup(companyName?: string, dataDir?: string): BackupResu
     kind: 'full',
     companyName: companyName ?? null,
     createdAt: new Date().toISOString(),
+    appVersion: APP_VERSION,
   };
   zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
 
@@ -164,6 +178,17 @@ export const PRE_OP_BACKUP_KEEP = 5;
 export function preOpBackupDir(dataDir?: string): string {
   const dir = resolveDataDir(dataDir);
   return path.join(path.dirname(dir), 'pre-op-backups');
+}
+
+/** Plain-language reason shown in the backup history for a pre-operation safety copy. */
+function preOpNote(label: string): string {
+  const known: Record<string, string> = {
+    restore: 'Safety copy made before restoring a backup',
+    'restore-company': 'Safety copy made before restoring a company',
+    condense: 'Safety copy made before condensing old detail',
+    'year-end-close': 'Safety copy made before closing the year',
+  };
+  return known[label] ?? `Safety copy made before: ${label}`;
 }
 
 export interface PreOpBackupResult {
@@ -213,6 +238,18 @@ export function ensurePreOpBackup(
   const filename = `preop-${slug}-${Date.now()}-${preOpSeq}.bka`;
   const outPath = path.join(outDir, filename);
   fs.writeFileSync(outPath, buffer);
+  recordBackup(
+    {
+      source: 'pre-op',
+      kind: 'full',
+      filename,
+      path: outPath,
+      sizeBytes: buffer.byteLength,
+      fingerprint: currentFingerprint(dir),
+      note: preOpNote(label),
+    },
+    dir,
+  );
 
   // Rotate: keep only the newest PRE_OP_BACKUP_KEEP pre-op backups overall.
   try {
@@ -252,7 +289,7 @@ const notABackup = (detail: string) =>
  * Accepts archives with a valid manifest, or (for pre-manifest .bka files)
  * archives whose entry list looks like a PGlite data directory.
  */
-function validateBackupZip(buffer: Buffer): AdmZip {
+export function validateBackupZip(buffer: Buffer): AdmZip {
   let zip: AdmZip;
   try {
     zip = new AdmZip(buffer);
@@ -410,9 +447,9 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
     }
     // The manifest is archive metadata, not a database file — keep it out of the data dir.
     fs.rmSync(path.join(tmpDir, BACKUP_MANIFEST_ENTRY), { force: true });
-    // Keep THIS file's signing secret + file id (FILE_LOCAL_SECRETS); never adopt ones from the
-    // archive (older backups included them).
-    for (const name of FILE_LOCAL_SECRETS) {
+    // Keep THIS file's signing secret + file id and its backup history/settings
+    // (FILE_LOCAL_FILES); never adopt ones from the archive (older backups included the secrets).
+    for (const name of FILE_LOCAL_FILES) {
       const restored = path.join(tmpDir, name);
       const live = path.join(dir, name);
       fs.rmSync(restored, { force: true });

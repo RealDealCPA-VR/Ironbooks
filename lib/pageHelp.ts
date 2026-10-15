@@ -315,6 +315,13 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Open a category on the left, change what you need and save.',
     qb: 'Edit > Preferences',
   },
+  // team backups
+  '/backup': {
+    title: 'Back Up & Restore',
+    what: 'Keeps safe copies of your company file, automatically on a schedule and whenever you ask. Look inside any copy before you restore it.',
+    first: 'Check the automatic backup schedule, then click "Back up now" to make a copy today.',
+    qb: 'Back Up Company / Restore Previous Local Backup',
+  },
 };
 
 /** The help for a path (longest matching prefix, so /registers/abc gets the Registers help). */

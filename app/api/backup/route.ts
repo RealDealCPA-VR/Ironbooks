@@ -23,6 +23,8 @@ import { ServiceError } from '@/lib/services/_base';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { requireFileAdmin } from '@/lib/services/access';
 import { withDamagedFileAccess } from '@/lib/db';
+import { recordBackup } from '@/lib/services/backupHistory';
+import { currentFingerprint } from '@/lib/services/backupFingerprint';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -71,7 +73,10 @@ async function handleGet(_req: NextRequest) {
       // The name lookup is cosmetic; proceed without it.
     }
 
+    const fingerprint = currentFingerprint();
     const { buffer, filename } = createBackup(companyName);
+    // Backup history ("Last backup: …" indicator): a browser download has no path on this machine.
+    recordBackup({ source: 'manual', kind: 'full', filename, path: null, sizeBytes: buffer.byteLength, fingerprint, note: 'Downloaded' });
 
     // NextResponse body must be a BodyInit-compatible type. Copy the Buffer
     // bytes into a fresh concrete ArrayBuffer to satisfy the type constraint.

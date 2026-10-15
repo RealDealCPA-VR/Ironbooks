@@ -13,6 +13,9 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { BackupCenter, type BackupHistoryRow } from '@/components/BackupCenter';
+import { BackupPreviewModal, type BackupPreviewDto } from '@/components/BackupPreviewModal';
+import { notifyBackupChanged } from '@/components/BackupStatus';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -91,10 +94,14 @@ export default function BackupPage() {
   const [downloading, setDownloading] = useState(false);
   const [downloadingCompany, setDownloadingCompany] = useState(false);
 
-  // ---- Full-restore confirm modal ----
+  // ---- Full restore: preview (look inside the backup) then confirm ----
   const [restoreModalOpen, setRestoreModalOpen] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [pendingVersion, setPendingVersion] = useState<BackupHistoryRow | null>(null);
   const [restoring, setRestoring] = useState(false);
+  const [preview, setPreview] = useState<BackupPreviewDto | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   // ---- Company-restore confirm modal ----
   const [companyRestoreModalOpen, setCompanyRestoreModalOpen] = useState(false);
@@ -157,6 +164,7 @@ export default function BackupPage() {
       }
       await downloadResponse(res, 'ironbooks-backup.bka');
       toast('Full backup downloaded successfully.', 'success');
+      notifyBackupChanged();
     } catch {
       toast('Backup failed. Please try again.', 'danger');
     } finally {
@@ -234,25 +242,68 @@ export default function BackupPage() {
   // Full restore — file selection (opens confirm modal)
   // ---------------------------------------------------------------------------
 
+  /** Open the backup read-only on the server and show what is inside before restoring. */
+  async function startPreview(request: () => Promise<Response>) {
+    setPreview(null);
+    setPreviewError(null);
+    setPreviewLoading(true);
+    setRestoreModalOpen(true);
+    try {
+      const res = await request();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPreviewError(data?.error ?? 'This backup could not be opened.');
+        return;
+      }
+      setPreview(data as BackupPreviewDto);
+    } catch {
+      setPreviewError('This backup could not be opened. Please try again.');
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0] ?? null;
     // Reset input so same file can be selected again after a cancel.
     e.target.value = '';
     if (!file) return;
     setPendingFile(file);
-    setRestoreModalOpen(true);
+    setPendingVersion(null);
+    void startPreview(async () =>
+      fetch('/api/backups/preview', {
+        method: 'POST',
+        body: await file.arrayBuffer(),
+        headers: { 'Content-Type': 'application/octet-stream' },
+      }),
+    );
+  }
+
+  function handlePreviewVersion(row: BackupHistoryRow) {
+    setPendingVersion(row);
+    setPendingFile(null);
+    void startPreview(() =>
+      fetch(`/api/backups/preview?id=${encodeURIComponent(row.id)}`, { method: 'POST' }),
+    );
   }
 
   async function handleRestoreConfirm() {
-    if (!pendingFile) return;
+    if (!pendingFile && !pendingVersion) return;
     setRestoring(true);
     try {
-      const arrayBuffer = await pendingFile.arrayBuffer();
-      const res = await fetch('/api/backup', {
-        method: 'POST',
-        body: arrayBuffer,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
+      // Same restore path as always (integrity checks, safety copy, single-user mode); a version
+      // from the history is read by the server from its own backup folder.
+      const res = pendingVersion
+        ? await fetch('/api/backups/restore', {
+            method: 'POST',
+            body: JSON.stringify({ id: pendingVersion.id }),
+            headers: { 'Content-Type': 'application/json' },
+          })
+        : await fetch('/api/backup', {
+            method: 'POST',
+            body: await pendingFile!.arrayBuffer(),
+            headers: { 'Content-Type': 'application/octet-stream' },
+          });
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -261,14 +312,14 @@ export default function BackupPage() {
       }
 
       const data = (await res.json().catch(() => ({}))) as { notices?: string[] };
-      toast(
-        'Restore complete. Please restart the application to see the restored data.',
-        'success',
-      );
+      toast('Restore complete. Reloading with the restored books…', 'success');
       // The books balance, but Verify Data found something to tidy up (e.g. A/R vs open invoices).
       if (data.notices?.length) toast(data.notices.join(' '), 'info');
       setRestoreModalOpen(false);
       setPendingFile(null);
+      setPendingVersion(null);
+      notifyBackupChanged();
+      setTimeout(() => window.location.reload(), 1500);
     } catch {
       toast('Restore failed. Please check the file and try again.', 'danger');
     } finally {
@@ -279,6 +330,9 @@ export default function BackupPage() {
   function handleRestoreCancel() {
     setRestoreModalOpen(false);
     setPendingFile(null);
+    setPendingVersion(null);
+    setPreview(null);
+    setPreviewError(null);
   }
 
   // ---------------------------------------------------------------------------
@@ -365,6 +419,11 @@ export default function BackupPage() {
       <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
         <PageHeader title="Backup & Restore" icon={ArchiveRestore} />
 
+        {/* Status, automatic backups and backup history (team backups) */}
+        <div className="max-w-3xl flex flex-col gap-6 mb-6">
+          <BackupCenter onPreviewVersion={handlePreviewVersion} />
+        </div>
+
         <div className="max-w-xl flex flex-col gap-6">
           {/* Per-company backup card */}
           <Card className="p-6 flex flex-col gap-3">
@@ -438,8 +497,9 @@ export default function BackupPage() {
             <h2 className="text-lg font-bold text-navy">Restore Full Backup</h2>
             <p className="text-sm text-navy/60">
               Overwrite <span className="font-semibold">all</span> company data with a previously
-              saved full <span className="font-mono text-navy/80">.bka</span> backup. This cannot
-              be undone — to bring back just one company without touching the others, use{' '}
+              saved full <span className="font-mono text-navy/80">.bka</span> backup. You will see
+              what is inside the backup (companies, transactions, totals) before anything changes.
+              To bring back just one company without touching the others, use{' '}
               <span className="font-semibold">Restore Company as New</span> above.
             </p>
             <div>
@@ -650,37 +710,21 @@ export default function BackupPage() {
           </div>
         </Modal>
 
-        {/* Full-restore confirmation modal */}
-        <Modal
+        {/* Full restore: look inside the backup first, then confirm */}
+        <BackupPreviewModal
           open={restoreModalOpen}
-          onClose={handleRestoreCancel}
-          title="Restore Full Backup?"
-          footer={
-            <>
-              <Button variant="secondary" onClick={handleRestoreCancel} disabled={restoring}>
-                Cancel
-              </Button>
-              <Button variant="danger" onClick={handleRestoreConfirm} loading={restoring}>
-                Yes, Overwrite &amp; Restore
-              </Button>
-            </>
+          source={
+            pendingVersion
+              ? `${new Date(pendingVersion.at).toLocaleString('en-US')} — ${pendingVersion.filename}`
+              : pendingFile?.name ?? ''
           }
-        >
-          <div className="flex flex-col gap-3 text-sm text-navy/70">
-            <p>
-              You are about to restore from{' '}
-              <span className="font-semibold text-navy break-all">{pendingFile?.name}</span>.
-            </p>
-            <p className="text-red-600 font-medium">
-              This will overwrite ALL current company data and cannot be undone.
-            </p>
-            <p>
-              After restoring, you must restart the application for the restored data to become
-              active.
-            </p>
-            <p>Are you sure you want to continue?</p>
-          </div>
-        </Modal>
+          loading={previewLoading}
+          preview={preview}
+          error={previewError}
+          restoring={restoring}
+          onCancel={handleRestoreCancel}
+          onConfirm={handleRestoreConfirm}
+        />
 
         {/* Company-restore confirmation modal */}
         <Modal

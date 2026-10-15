@@ -17,6 +17,7 @@ import { createCompanyBackup, restoreCompanyBackup } from '@/lib/services/backup
 import { ServiceError } from '@/lib/services/_base';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { requireAccessInCompany, requirePermission } from '@/lib/services/access';
+import { recordBackup } from '@/lib/services/backupHistory';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -44,6 +45,8 @@ export async function GET(req: NextRequest) {
     const access = await requireAccessInCompany(ctx, companyId, 'file_utilities', 'create');
 
     const { buffer, filename } = await createCompanyBackup(ctx.db, companyId, { access });
+    // Backup history: a one-company copy (does not count as a backup of the whole file).
+    recordBackup({ source: 'manual', kind: 'company', filename, path: null, sizeBytes: buffer.byteLength, fingerprint: null, note: 'Company backup downloaded' });
     const arrayBuf: ArrayBuffer = buffer.buffer.slice(
       buffer.byteOffset,
       buffer.byteOffset + buffer.byteLength,

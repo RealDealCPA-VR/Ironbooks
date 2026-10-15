@@ -177,6 +177,12 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/backup': r('file_utilities', 'GET:create POST:delete'),
   '/api/backup/company': r('file_utilities', 'GET:create POST:delete'),
   '/api/dashboard/auto-backup': r('file_utilities', 'POST'),
+  // team backups: history/schedule (PUT, run, preview and restore also require requireFileAdmin)
+  '/api/backups': r('file_utilities', 'GET PUT:modify'),
+  '/api/backups/status': r('file_utilities', 'GET'),
+  '/api/backups/run': r('file_utilities', 'POST:create'),
+  '/api/backups/preview': r('file_utilities', 'POST:create'),
+  '/api/backups/restore': r('file_utilities', 'POST:delete'),
   '/api/condense': r('file_utilities', 'POST:delete'),
   '/api/condense/archives': r('file_utilities', 'GET POST:delete'), // POST restores the whole file
   '/api/integrity/books-in-balance': r('file_utilities', 'GET'),
