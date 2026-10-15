@@ -13,7 +13,8 @@
  * Printing stamps the check number on the document (and its journal entry reference) through
  * the owning service, so numbering and duplicate-number protection live in one place.
  *
- * Also owns the per-company check printer setup (style + alignment offsets) and builds the data
+ * Also owns the per-company check printer setup (style, paper, alignment offsets, check position,
+ * field layout, check height, paper size — drizzle/0047) and builds the data
  * a check PDF needs: "print on check as" name, vendor account number on the memo line, voucher
  * detail (expense lines / bills paid / paycheck lines).
  */
@@ -24,6 +25,7 @@ import {
   billPayments,
   bills,
   checkPrintSettings,
+  customers,
   employees,
   expenseLines,
   expenses,
@@ -45,6 +47,24 @@ import {
   type CheckStyle,
   type VoucherLine,
 } from '@/lib/pdf/check';
+import {
+  CHECK_FIELD_KEYS,
+  CHECK_FIELD_LABELS,
+  CHECK_PAGE_SIZES,
+  CHECK_POSITIONS,
+  DEFAULT_CHECK_HEIGHT_IN,
+  MAX_CHECK_HEIGHT_IN,
+  MIN_CHECK_HEIGHT_IN,
+  checkWidthIn,
+  diffCheckLayout,
+  normalizeCheckHeight,
+  normalizeFirstSheetRemaining,
+  resolveCheckLayout,
+  validateCheckLayout,
+  type CheckLayoutOverrides,
+  type CheckPageSize,
+  type CheckPosition,
+} from '@/lib/pdf/checkLayout';
 import {
   type ServiceContext,
   ServiceError,
@@ -338,6 +358,20 @@ export interface CheckPrintData {
   memo: string | null;
   checkNumber: string | null;
   voucher: VoucherLine[];
+  /** Payee mailing address lines (vendor / employee / customer), for window envelopes. */
+  payeeAddress: string[];
+}
+
+/** Address jsonb ({ line1, line2, city, state, zip, … }) → printable lines. */
+function addressLines(addr: unknown): string[] {
+  if (!addr || typeof addr !== 'object' || Array.isArray(addr)) return [];
+  const a = addr as Record<string, unknown>;
+  const g = (...keys: string[]) =>
+    keys.map((k) => a[k]).find((v): v is string => typeof v === 'string' && v.trim() !== '')?.trim() ?? '';
+  const cityLine = [g('city'), [g('state', 'region'), g('zip', 'postalCode', 'postal_code')].filter(Boolean).join(' ')]
+    .filter(Boolean)
+    .join(', ');
+  return [g('line1', 'street', 'address1', 'addressLine1'), g('line2', 'address2', 'addressLine2'), cityLine, g('country')].filter(Boolean);
 }
 
 /**
@@ -370,6 +404,7 @@ export async function checkPrintData(
       date: new Date(row.e.date).toISOString().slice(0, 10),
       memo: row.e.memo ?? (row.v?.accountNumber ? `Acct # ${row.v.accountNumber}` : null),
       checkNumber: row.e.reference,
+      payeeAddress: addressLines(row.v?.address),
       voucher: lines.map((r) => ({
         account: r.l.itemId && r.itemName ? `Item: ${r.itemName}` : `${r.code ?? ''} – ${r.name ?? 'Account'}`,
         description: r.l.description,
@@ -395,6 +430,7 @@ export async function checkPrintData(
       date: new Date(row.p.date).toISOString().slice(0, 10),
       memo: row.v?.accountNumber ? `Acct # ${row.v.accountNumber}` : null,
       checkNumber: row.p.reference,
+      payeeAddress: addressLines(row.v?.address),
       voucher: apps.map((r) => ({
         account: `Bill ${r.billNumber ?? ''}`.trim(),
         description: new Date(r.billDate).toISOString().slice(0, 10),
@@ -404,7 +440,7 @@ export async function checkPrintData(
   }
   if (source === 'payment_check') {
     const [row] = await ctx.db
-      .select({ c: paymentChecks, agencyName: taxAgencies.name })
+      .select({ c: paymentChecks, agencyName: taxAgencies.name, agencyVendorId: taxAgencies.vendorId })
       .from(paymentChecks)
       .leftJoin(taxAgencies, eq(paymentChecks.agencyId, taxAgencies.id))
       .where(and(eq(paymentChecks.companyId, ctx.companyId), eq(paymentChecks.id, id)));
@@ -419,6 +455,22 @@ export async function checkPrintData(
           .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
           .where(and(eq(journalEntryLines.journalEntryId, c.postedEntryId), sql`COALESCE(${journalEntryLines.debit}, 0) > 0`))
       : [];
+    // Window-envelope address: the payee vendor (or the agency's vendor), else the refund customer.
+    let payeeAddress: string[] = [];
+    const vendorId = c.vendorId ?? row.agencyVendorId;
+    if (vendorId) {
+      const [v] = await ctx.db
+        .select({ address: vendors.address })
+        .from(vendors)
+        .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.id, vendorId)));
+      payeeAddress = addressLines(v?.address);
+    } else if (c.customerId) {
+      const [cu] = await ctx.db
+        .select({ billing: customers.billingAddress, shipping: customers.shippingAddress })
+        .from(customers)
+        .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, c.customerId)));
+      payeeAddress = addressLines(cu?.billing ?? cu?.shipping);
+    }
     const label =
       c.kind === 'sales_tax' ? 'Sales Tax Payment' : c.kind === 'payroll_liability' ? 'Liability Check' : 'Refund';
     return {
@@ -427,6 +479,7 @@ export async function checkPrintData(
       date: new Date(c.date).toISOString().slice(0, 10),
       memo: c.memo,
       checkNumber: c.reference,
+      payeeAddress,
       voucher:
         lines.length > 0
           ? lines.map((l) => ({
@@ -438,7 +491,7 @@ export async function checkPrintData(
     };
   }
   const [row] = await ctx.db
-    .select({ p: paychecks, first: employees.firstName, last: employees.lastName })
+    .select({ p: paychecks, first: employees.firstName, last: employees.lastName, address: employees.address })
     .from(paychecks)
     .innerJoin(employees, eq(paychecks.employeeId, employees.id))
     .where(and(eq(paychecks.companyId, ctx.companyId), eq(paychecks.id, id)));
@@ -450,6 +503,7 @@ export async function checkPrintData(
     date: new Date(row.p.payDate).toISOString().slice(0, 10),
     memo: 'Paycheck',
     checkNumber: row.p.checkNumber,
+    payeeAddress: addressLines(row.address),
     voucher: [
       { account: 'Gross pay', description: null, amount: toAmountString(row.p.grossPay) },
       ...lines
@@ -469,6 +523,15 @@ export interface CheckPrintSettings {
   stock: CheckStock;
   offsetX: string;
   offsetY: string;
+  /** Voucher / wallet stock: which third of the sheet holds the check. */
+  position: CheckPosition;
+  /** Field-position overrides (only what differs from the standard positions); null = standard. */
+  layout: CheckLayoutOverrides | null;
+  /** Standard checks: unused checks left on the first sheet (1-3). */
+  firstSheetRemaining: number;
+  pageSize: CheckPageSize;
+  /** Height of one check, inches ("3.50"). */
+  checkHeight: string;
 }
 
 export async function getCheckPrintSettings(ctx: ServiceContext): Promise<CheckPrintSettings> {
@@ -476,17 +539,97 @@ export async function getCheckPrintSettings(ctx: ServiceContext): Promise<CheckP
     .select()
     .from(checkPrintSettings)
     .where(eq(checkPrintSettings.companyId, ctx.companyId));
+  const style = (row?.style as CheckStyle) ?? 'voucher';
+  const layout = validateCheckLayout(row?.layout ?? null);
   return {
-    style: (row?.style as CheckStyle) ?? 'voucher',
+    style,
     stock: row?.stock === 'blank' ? 'blank' : 'preprinted',
     offsetX: row ? Money.of(row.offsetX).toFixed(2) : '0.00',
     offsetY: row ? Money.of(row.offsetY).toFixed(2) : '0.00',
+    position: CHECK_POSITIONS.includes(row?.checkPosition as CheckPosition) ? (row!.checkPosition as CheckPosition) : 'top',
+    layout: layout.ok ? layout.value : null,
+    firstSheetRemaining: normalizeFirstSheetRemaining(row?.firstSheetRemaining),
+    pageSize: row?.pageSize === 'legal' ? 'legal' : 'letter',
+    checkHeight: normalizeCheckHeight(row?.checkHeight ?? DEFAULT_CHECK_HEIGHT_IN).toFixed(2),
+  };
+}
+
+export interface CheckPrintSettingsInput {
+  style: string;
+  stock?: string | null;
+  offsetX: string | number;
+  offsetY: string | number;
+  position?: string | null;
+  pageSize?: string | null;
+  checkHeight?: string | number | null;
+  firstSheetRemaining?: string | number | null;
+  /** undefined = keep the saved positions; null = back to the standard positions. */
+  layout?: unknown;
+}
+
+/**
+ * Validate the printer-setup fields beyond style / stock / offsets (shared by save and the
+ * alignment test, which prints with unsaved settings). Returns the normalised values.
+ */
+export function parseCheckLayoutSettings(
+  input: Omit<CheckPrintSettingsInput, 'style' | 'stock' | 'offsetX' | 'offsetY'>,
+  style: string,
+  before?: Pick<CheckPrintSettings, 'position' | 'pageSize' | 'checkHeight' | 'firstSheetRemaining' | 'layout'>,
+) {
+  if (input.position != null && !CHECK_POSITIONS.includes(input.position as CheckPosition)) {
+    throw validation('Choose where the check is on the page: top, middle or bottom.');
+  }
+  if (input.pageSize != null && !CHECK_PAGE_SIZES.includes(input.pageSize as CheckPageSize)) {
+    throw validation('Choose the paper size: Letter or Legal.');
+  }
+  let checkHeight = before ? Number(before.checkHeight) : DEFAULT_CHECK_HEIGHT_IN;
+  if (input.checkHeight != null && String(input.checkHeight).trim() !== '') {
+    let h;
+    try {
+      h = Money.of(String(input.checkHeight).trim());
+    } catch {
+      h = null;
+    }
+    if (!h || !h.isFinite() || h.lessThan(MIN_CHECK_HEIGHT_IN) || h.greaterThan(MAX_CHECK_HEIGHT_IN)) {
+      throw validation(`Check height must be between ${MIN_CHECK_HEIGHT_IN} and ${MAX_CHECK_HEIGHT_IN} inches.`);
+    }
+    checkHeight = h.toNumber();
+  }
+  let firstSheetRemaining = before?.firstSheetRemaining ?? 3;
+  if (input.firstSheetRemaining != null && String(input.firstSheetRemaining).trim() !== '') {
+    const n = Number(input.firstSheetRemaining);
+    if (n !== 1 && n !== 2 && n !== 3) throw validation('Checks left on the first sheet must be 1, 2 or 3.');
+    firstSheetRemaining = n;
+  }
+  let layout = before?.layout ?? null;
+  if (input.layout !== undefined) {
+    const v = validateCheckLayout(input.layout);
+    if (!v.ok) throw validation(v.error);
+    layout = diffCheckLayout(style, v.value);
+  }
+  // Every field has to land on the check.
+  const resolved = resolveCheckLayout(style, layout);
+  const width = checkWidthIn(style);
+  for (const k of CHECK_FIELD_KEYS) {
+    if (resolved[k].y > checkHeight + 1e-9) {
+      throw validation(`${CHECK_FIELD_LABELS[k]}: Down must be within the check height (${checkHeight}").`);
+    }
+    if (resolved[k].x > width + 1e-9) {
+      throw validation(`${CHECK_FIELD_LABELS[k]}: Across must be within the check width (${width}").`);
+    }
+  }
+  return {
+    position: (input.position as CheckPosition | null | undefined) ?? before?.position ?? 'top',
+    pageSize: (input.pageSize as CheckPageSize | null | undefined) ?? before?.pageSize ?? 'letter',
+    checkHeight,
+    firstSheetRemaining,
+    layout,
   };
 }
 
 export async function saveCheckPrintSettings(
   ctx: ServiceContext,
-  input: { style: string; stock?: string | null; offsetX: string | number; offsetY: string | number },
+  input: CheckPrintSettingsInput,
 ): Promise<CheckPrintSettings> {
   if (!CHECK_STYLES.includes(input.style as CheckStyle)) {
     throw validation('Choose a check style: voucher, standard or wallet.');
@@ -501,6 +644,8 @@ export async function saveCheckPrintSettings(
       throw validation(`Alignment can move the print at most ${MAX_CHECK_OFFSET_IN} inch in each direction.`);
     }
   }
+  const current = await getCheckPrintSettings(ctx);
+  const extra = parseCheckLayoutSettings(input, input.style, current);
   return inTransaction(ctx, async (tx) => {
     const before = await getCheckPrintSettings(tx);
     const [existing] = await tx.db
@@ -512,6 +657,11 @@ export async function saveCheckPrintSettings(
       stock: (input.stock as CheckStock | null | undefined) ?? before.stock,
       offsetX: x.toFixed(3),
       offsetY: y.toFixed(3),
+      checkPosition: extra.position,
+      layout: extra.layout as Record<string, Record<string, number | boolean>> | null,
+      firstSheetRemaining: extra.firstSheetRemaining,
+      pageSize: extra.pageSize,
+      checkHeight: extra.checkHeight.toFixed(3),
       updatedAt: new Date(),
     };
     let id: string;

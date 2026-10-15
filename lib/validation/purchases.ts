@@ -57,6 +57,13 @@ export const checkPrintSettingsSchema = z.object({
   stock: z.enum(['preprinted', 'blank']).nullish(),
   offsetX: zDecimal,
   offsetY: zDecimal,
+  /** drizzle/0047 — check stock layout (validated in saveCheckPrintSettings). */
+  position: z.enum(['top', 'middle', 'bottom']).nullish(),
+  pageSize: z.enum(['letter', 'legal']).nullish(),
+  checkHeight: zDecimal.nullish(),
+  firstSheetRemaining: z.union([z.number(), z.string()]).nullish(),
+  /** Field-position overrides; null resets to the standard positions. */
+  layout: z.unknown().optional(),
 });
 
 export const accountCurrencySchema = z.object({

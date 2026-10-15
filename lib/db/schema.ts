@@ -2226,6 +2226,16 @@ export const checkPrintSettings = pgTable('check_print_settings', {
   offsetY: decimal('offset_y', { precision: 6, scale: 3 }).notNull().default('0'),
   /** p1 purchases: 'preprinted' (print only the variable fields) | 'blank' (full check layout). */
   stock: varchar('stock', { length: 20 }).notNull().default('preprinted'),
+  /** drizzle/0047: 'top' | 'middle' | 'bottom' — where the check sits on voucher / wallet stock. */
+  checkPosition: varchar('check_position', { length: 10 }).notNull().default('top'),
+  /** drizzle/0047: field-position overrides (lib/pdf/checkLayout CheckLayoutOverrides); null = QB defaults. */
+  layout: jsonb('layout').$type<Record<string, Record<string, number | boolean>>>(),
+  /** drizzle/0047: standard checks (3 per sheet) — unused checks left on the first sheet (1-3). */
+  firstSheetRemaining: integer('first_sheet_remaining').notNull().default(3),
+  /** drizzle/0047: 'letter' | 'legal'. */
+  pageSize: varchar('page_size', { length: 10 }).notNull().default('letter'),
+  /** drizzle/0047: height of one check in inches (2.75-3.67). */
+  checkHeight: decimal('check_height', { precision: 5, scale: 3 }).notNull().default('3.5'),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
 

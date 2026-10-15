@@ -1,6 +1,7 @@
 /**
  * GET /api/checks/settings — check printer setup (style + alignment offsets, inches)
- * PUT /api/checks/settings { style: 'voucher'|'standard'|'wallet', offsetX, offsetY }
+ * PUT /api/checks/settings { style: 'voucher'|'standard'|'wallet', stock?, offsetX, offsetY, position?, pageSize?,
+ *     checkHeight?, firstSheetRemaining?, layout? (field positions; null = standard positions) }
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';

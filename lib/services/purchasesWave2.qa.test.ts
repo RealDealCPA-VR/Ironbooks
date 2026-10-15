@@ -717,7 +717,7 @@ describe('wave2 purchases — QA', () => {
 
     it('printer setup rejects malformed values and keeps the last good settings', async () => {
       const good = await saveCheckPrintSettings(ctx, { style: 'standard', offsetX: '-1', offsetY: '1' });
-      expect(good).toEqual({ style: 'standard', stock: 'preprinted', offsetX: '-1.00', offsetY: '1.00' });
+      expect(good).toEqual({ style: 'standard', stock: 'preprinted', offsetX: '-1.00', offsetY: '1.00', position: 'top', layout: null, firstSheetRemaining: 3, pageSize: 'letter', checkHeight: '3.50' });
       await expect(saveCheckPrintSettings(ctx, { style: 'fancy', offsetX: '0', offsetY: '0' })).rejects.toBeInstanceOf(ServiceError);
       await expect(saveCheckPrintSettings(ctx, { style: 'wallet', offsetX: '1.001', offsetY: '0' })).rejects.toBeInstanceOf(ServiceError);
       await expect(saveCheckPrintSettings(ctx, { style: 'wallet', offsetX: 'NaN', offsetY: '0' })).rejects.toBeInstanceOf(ServiceError);

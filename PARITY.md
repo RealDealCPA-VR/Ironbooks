@@ -58,6 +58,12 @@ Bug fixes, a security sweep and dependency updates before the next release. Veri
   - Malformed JSON returns 400.
 - **Dependencies:** next 15.5.28 (Windows RCE and middleware-bypass advisories), next-auth beta.32 / @auth/core 0.41.3, adm-zip 0.6.1 (untrusted .bka zips), nodemailer 10, fast-xml-parser 4.5.7. An npm `overrides` entry resolves next-auth's nodemailer peer conflict.
   - Advisories still open, judged not reachable: drizzle identifier escaping (identifiers are constants), the fast-xml-parser XMLBuilder advisory (only XMLParser is used), sharp (next/image is unused), and the build-time postcss and tailwind tooling.
+- **Check printing on any pre-cut stock** (migration 0047):
+  - **Position and sheets:** the check can sit at the top, middle or bottom of a voucher sheet. Standard checks print 3 per sheet, with a "checks left on the first sheet" setting so a partly used sheet can be reused.
+  - **Field positions:** every field (date, payee, amount, words, memo) can be moved in inches and given its own text size. Payee address (window envelopes), check number and company block are optional.
+  - **Paper:** Letter or Legal, and a check height from 2.75" to 3.67".
+  - **Printing:** printing several selected checks gives one PDF. The alignment test uses unsaved settings.
+  - Defaults are unchanged.
 - **Release and CI:** a CI workflow runs typecheck, tests and build on every push and PR. The app icons are now tracked, so a clean checkout builds with them. Server-only packages are kept out of `app.asar`; they already ship in `resources/app/node_modules`.
 
 ## P0 fix round (2026-10-12): all 11 P0s fixed

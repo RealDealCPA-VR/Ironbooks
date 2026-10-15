@@ -11,8 +11,12 @@
  *  2. Add paychecks — paychecks that were never printed can be added to the queue.
  *     Add refund checks — customer refunds paid from a bank account (D3) can be added too.
  *     Sales Tax Payment and Liability checks saved "To be printed" appear in the queue directly.
- *  3. Printer setup — check style (voucher / standard / wallet) and alignment nudges, with an
- *     alignment test page.
+ *  3. Printer setup — check paper, check style (voucher / standard / wallet), where the check is
+ *     on the sheet, checks left on a partly used sheet, paper size, check height, alignment nudges
+ *     and (advanced) the position of every printed field, with an alignment test page that uses
+ *     the unsaved setup. Works with any pre-cut / pre-printed check stock.
+ *  Printing several selected checks records their numbers one by one (asking before reusing a
+ *  number) and produces ONE PDF (standard checks three to a sheet).
  *  4. Quick Check — ad-hoc check PDF that is not recorded.
  */
 
@@ -36,6 +40,19 @@ import {
   toastError,
 } from '@/components/ui';
 import { numberToWords } from '@/lib/pdf/check';
+import {
+  CHECK_FIELD_KEYS,
+  CHECK_FIELD_LABELS,
+  OPTIONAL_CHECK_FIELDS,
+  defaultCheckLayout,
+  diffCheckLayout,
+  resolveCheckLayout,
+  type CheckFieldKey,
+  type CheckLayout,
+  type CheckLayoutOverrides,
+  type CheckPageSize,
+  type CheckPosition,
+} from '@/lib/pdf/checkLayout';
 import { api } from '@/lib/client';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { formatCurrency } from '@/lib/money';
@@ -82,7 +99,66 @@ interface PrintSettings {
   stock: CheckStock;
   offsetX: string;
   offsetY: string;
+  position: CheckPosition;
+  pageSize: CheckPageSize;
+  checkHeight: string;
+  firstSheetRemaining: number;
+  layout: CheckLayoutOverrides | null;
 }
+
+/** Field positions as edited in the form (inches / points as typed). */
+type LayoutDraft = Record<CheckFieldKey, { x: string; y: string; size: string; show: boolean }>;
+
+function toDraft(l: CheckLayout): LayoutDraft {
+  const out = {} as LayoutDraft;
+  for (const k of CHECK_FIELD_KEYS) out[k] = { x: String(l[k].x), y: String(l[k].y), size: String(l[k].size), show: l[k].show };
+  return out;
+}
+
+/** The draft as layout overrides (blank inputs fall back to the standard position). */
+function fromDraft(d: LayoutDraft): CheckLayoutOverrides {
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const k of CHECK_FIELD_KEYS) {
+    const f: Record<string, unknown> = {};
+    for (const p of ['x', 'y', 'size'] as const) if (d[k][p].trim() !== '') f[p] = d[k][p].trim();
+    if (OPTIONAL_CHECK_FIELDS.includes(k)) f.show = d[k].show;
+    out[k] = f;
+  }
+  return out as CheckLayoutOverrides;
+}
+
+/** Same layout as numbers (for switching styles); unparsable values are dropped. */
+function draftNumbers(d: LayoutDraft): CheckLayoutOverrides {
+  const out: CheckLayoutOverrides = {};
+  for (const k of CHECK_FIELD_KEYS) {
+    const f: { x?: number; y?: number; size?: number; show?: boolean } = {};
+    for (const p of ['x', 'y', 'size'] as const) {
+      const n = Number(d[k][p]);
+      if (d[k][p].trim() !== '' && Number.isFinite(n)) f[p] = n;
+    }
+    if (OPTIONAL_CHECK_FIELDS.includes(k)) f.show = d[k].show;
+    out[k] = f;
+  }
+  return out;
+}
+
+const DEFAULT_SETTINGS: PrintSettings = {
+  style: 'voucher',
+  stock: 'preprinted',
+  offsetX: '0',
+  offsetY: '0',
+  position: 'top',
+  pageSize: 'letter',
+  checkHeight: '3.50',
+  firstSheetRemaining: 3,
+  layout: null,
+};
+
+const POSITION_HELP: Record<CheckPosition, string> = {
+  top: 'The check is the top part of the sheet; the stubs are below it.',
+  middle: 'The check is in the middle of the sheet, between two stubs.',
+  bottom: 'The check is the bottom part of the sheet; the stubs are above it.',
+};
 
 const SOURCE_LABEL: Record<PrintSource, string> = {
   expense: 'Check',
@@ -145,7 +221,14 @@ export default function PrintChecksPage() {
   const [queuingPaychecks, setQueuingPaychecks] = useState(false);
 
   // ── Printer setup ─────────────────────────────────────────────────────────
-  const [settings, setSettings] = useState<PrintSettings>({ style: 'voucher', stock: 'preprinted', offsetX: '0', offsetY: '0' });
+  const [settings, setSettings] = useState<PrintSettings>(DEFAULT_SETTINGS);
+  const [layoutDraft, setLayoutDraft] = useState<LayoutDraft>(() => toDraft(defaultCheckLayout('voucher')));
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // ── Printing several checks into one PDF ──────────────────────────────────
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [runRemaining, setRunRemaining] = useState(3);
+  const [printingBatch, setPrintingBatch] = useState(false);
 
   // ── Customer refunds not yet printed (D3) ─────────────────────────────────
   const [refunds, setRefunds] = useState<UnprintedRefund[]>([]);
@@ -178,6 +261,7 @@ export default function PrintChecksPage() {
       setUnprinted(pcData.paychecks);
       setRefunds(refundData.items);
       setPicked(new Set());
+      setSelected(new Set());
     } catch (err) {
       toastError(err, 'Failed to load the print queue.');
     } finally {
@@ -189,7 +273,12 @@ export default function PrintChecksPage() {
     refreshQueue();
     api
       .get<PrintSettings>('/api/checks/settings')
-      .then((s) => setSettings(s))
+      .then((s) => {
+        const merged = { ...DEFAULT_SETTINGS, ...s };
+        setSettings(merged);
+        setLayoutDraft(toDraft(resolveCheckLayout(merged.style, merged.layout)));
+        setRunRemaining(merged.firstSheetRemaining);
+      })
       .catch(() => {
         /* defaults are fine */
       });
@@ -215,8 +304,10 @@ export default function PrintChecksPage() {
         api.post('/api/print-queue', { source: item.source, id: item.id, checkNumber: num, allowDuplicateNumber }),
       );
       if (saved === null) return; // user chose a different number
-      await openCheckPdf({ source: item.source, id: item.id, checkNumber: num });
+      await openCheckPdf({ source: item.source, id: item.id, checkNumber: num, firstSheetRemaining: runRemaining });
       toast(`Check #${num} printed and recorded.`, 'success');
+      // Standard checks: one fewer left on the sheet (a fresh sheet after the last one).
+      if (settings.style === 'standard') setRunRemaining((r) => (r <= 1 ? 3 : r - 1));
 
       // Advance the number for the next check in the run.
       const parsed = parseInt(num, 10);
@@ -226,6 +317,75 @@ export default function PrintChecksPage() {
       toast(errMsg(err, 'Failed to print check.'), 'danger');
     } finally {
       setPrintingId(null);
+    }
+  }
+
+  // ── Print the selected checks into ONE PDF ────────────────────────────────
+
+  const itemKey = (q: QueueItem) => `${q.source}:${q.id}`;
+
+  async function handlePrintSelected() {
+    const items = queue.filter((q) => selected.has(itemKey(q)));
+    if (items.length === 0) {
+      toast('Tick the checks you want to print.', 'danger');
+      return;
+    }
+    const num = nextNumber.trim();
+    if (!num) {
+      toast('Enter the number printed on the first check in the printer.', 'danger');
+      return;
+    }
+    const start = parseInt(num, 10);
+    const numeric = !isNaN(start) && String(start) === num;
+    if (items.length > 1 && !numeric) {
+      toast('To print several checks at once, the next check number must be a plain number (e.g. 1001).', 'danger');
+      return;
+    }
+    setPrintingBatch(true);
+    const printed: Array<{ item: QueueItem; checkNumber: string }> = [];
+    try {
+      // 1. Record each number in order (asks before reusing a number). Stop at the first check the
+      //    user does not confirm, so the numbers stay in step with the check paper.
+      for (let i = 0; i < items.length; i++) {
+        const checkNumber = numeric ? String(start + i) : num;
+        const item = items[i];
+        const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+          api.post('/api/print-queue', { source: item.source, id: item.id, checkNumber, allowDuplicateNumber }),
+        );
+        if (saved === null) break; // user chose a different number
+        printed.push({ item, checkNumber });
+      }
+    } catch (err) {
+      toast(errMsg(err, 'Failed to record a check number.'), 'danger');
+    }
+    try {
+      if (printed.length === 0) return;
+      // 2. One PDF for every recorded check.
+      await openCheckPdf({
+        items: printed.map((p) => ({ source: p.item.source, id: p.item.id, checkNumber: p.checkNumber })),
+        firstSheetRemaining: runRemaining,
+      });
+      const first = printed[0].checkNumber;
+      const last = printed[printed.length - 1].checkNumber;
+      toast(
+        printed.length === 1 ? `Check #${first} printed and recorded.` : `Checks #${first}–${last} printed and recorded.`,
+        'success',
+      );
+      if (printed.length < items.length) toast('Printing stopped early; the other checks are still in the queue.', 'danger');
+      // Standard checks: what is left of the last sheet is the next run's first sheet.
+      if (settings.style === 'standard') {
+        const left = (3 - ((3 - runRemaining + printed.length) % 3)) % 3;
+        setRunRemaining(left === 0 ? 3 : left);
+      }
+    } catch (err) {
+      toast(errMsg(err, 'The checks were recorded but the PDF could not be opened.'), 'danger');
+    } finally {
+      // Advance the number past every check that was recorded.
+      if (printed.length > 0 && numeric) setNextNumber(String(start + printed.length));
+      const done = new Set(printed.map((p) => itemKey(p.item)));
+      setQueue((prev) => prev.filter((q) => !done.has(itemKey(q))));
+      setSelected((prev) => new Set([...prev].filter((k) => !done.has(k))));
+      setPrintingBatch(false);
     }
   }
 
@@ -277,8 +437,21 @@ export default function PrintChecksPage() {
     }
     setSavingSettings(true);
     try {
-      const saved = await api.put<PrintSettings>('/api/checks/settings', settings);
-      setSettings(saved);
+      const saved = await api.put<PrintSettings>('/api/checks/settings', {
+        style: settings.style,
+        stock: settings.stock,
+        offsetX: settings.offsetX,
+        offsetY: settings.offsetY,
+        position: settings.position,
+        pageSize: settings.pageSize,
+        checkHeight: settings.checkHeight,
+        firstSheetRemaining: settings.firstSheetRemaining,
+        layout: fromDraft(layoutDraft),
+      });
+      const merged = { ...DEFAULT_SETTINGS, ...saved };
+      setSettings(merged);
+      setLayoutDraft(toDraft(resolveCheckLayout(merged.style, merged.layout)));
+      setRunRemaining(merged.firstSheetRemaining);
       toast('Printer setup saved.', 'success');
     } catch (err) {
       toastError(err, 'Could not save the printer setup.');
@@ -300,12 +473,33 @@ export default function PrintChecksPage() {
         stock: settings.stock,
         offsetX: settings.offsetX,
         offsetY: settings.offsetY,
+        position: settings.position,
+        pageSize: settings.pageSize,
+        checkHeight: settings.checkHeight,
+        firstSheetRemaining: settings.firstSheetRemaining,
+        layout: fromDraft(layoutDraft),
       });
     } catch (err) {
       toast(errMsg(err, 'Could not print the test page.'), 'danger');
     } finally {
       setTesting(false);
     }
+  }
+
+  /** Switching styles keeps the fields you moved and puts the rest at the new style's positions. */
+  function changeStyle(style: CheckStyle) {
+    const custom = diffCheckLayout(settings.style, draftNumbers(layoutDraft));
+    setLayoutDraft(toDraft(resolveCheckLayout(style, custom)));
+    setSettings((s) => ({ ...s, style }));
+  }
+
+  function resetLayout() {
+    setLayoutDraft(toDraft(defaultCheckLayout(settings.style)));
+    toast('Field positions are back to the standard positions. Save the setup to keep them.', 'success');
+  }
+
+  function setField(k: CheckFieldKey, patch: Partial<LayoutDraft[CheckFieldKey]>) {
+    setLayoutDraft((d) => ({ ...d, [k]: { ...d[k], ...patch } }));
   }
 
   // ── Quick-check generator (ad-hoc, not recorded) ──────────────────────────
@@ -357,7 +551,8 @@ export default function PrintChecksPage() {
               <h2 className="text-lg font-bold text-navy">Checks to Print</h2>
               <p className="text-sm text-navy/50">
                 Checks written with &quot;Print later&quot;, bill payments marked &quot;To be printed&quot;, and
-                paychecks you added below. Printing records the check number on the transaction.
+                paychecks you added below. Printing records the check number on the transaction. Tick several
+                checks and use &quot;Print selected&quot; to get them all in one PDF.
               </p>
             </div>
             <Button variant="secondary" size="sm" onClick={refreshQueue} disabled={queueLoading}>
@@ -376,10 +571,26 @@ export default function PrintChecksPage() {
                 onChange={(e) => setNextNumber(e.target.value)}
               />
             </div>
+            {settings.style === 'standard' && queue.length > 0 && (
+              <div className="w-56">
+                <Label htmlFor="run-remaining">Checks left on the first sheet</Label>
+                <Select id="run-remaining" value={String(runRemaining)} onChange={(e) => setRunRemaining(Number(e.target.value))}>
+                  <option value="3">3 (a full sheet)</option>
+                  <option value="2">2 (top check used)</option>
+                  <option value="1">1 (top two used)</option>
+                </Select>
+              </div>
+            )}
             {queue.length > 0 && (
               <Badge tone="warning">
                 {queue.length} check{queue.length === 1 ? '' : 's'} queued
               </Badge>
+            )}
+            {queue.length > 0 && (
+              <Button className="ml-auto" onClick={handlePrintSelected} loading={printingBatch} disabled={selected.size === 0}>
+                <Printer className="h-4 w-4" />
+                Print selected ({selected.size})
+              </Button>
             )}
           </div>
 
@@ -397,6 +608,15 @@ export default function PrintChecksPage() {
             <Table>
               <thead>
                 <tr>
+                  <Th>
+                    <input
+                      type="checkbox"
+                      aria-label="Select all checks"
+                      className="h-4 w-4 accent-electric"
+                      checked={queue.length > 0 && queue.every((q) => selected.has(itemKey(q)))}
+                      onChange={(e) => setSelected(e.target.checked ? new Set(queue.map(itemKey)) : new Set())}
+                    />
+                  </Th>
                   <Th>Date</Th>
                   <Th>Type</Th>
                   <Th>Pay to</Th>
@@ -408,7 +628,23 @@ export default function PrintChecksPage() {
               </thead>
               <tbody>
                 {queue.map((q) => (
-                  <Tr key={`${q.source}:${q.id}`}>
+                  <Tr key={itemKey(q)}>
+                    <Td>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select check to ${q.payee || 'payee'}`}
+                        className="h-4 w-4 accent-electric"
+                        checked={selected.has(itemKey(q))}
+                        onChange={(e) =>
+                          setSelected((prev) => {
+                            const next = new Set(prev);
+                            if (e.target.checked) next.add(itemKey(q));
+                            else next.delete(itemKey(q));
+                            return next;
+                          })
+                        }
+                      />
+                    </Td>
                     <Td>{q.date ? formatDate(q.date, 'MMM d, yyyy') : '—'}</Td>
                     <Td>
                       <Badge
@@ -552,8 +788,10 @@ export default function PrintChecksPage() {
             <h2 className="text-lg font-bold text-navy">Printer Setup</h2>
           </div>
           <p className="text-sm text-navy/50">
-            Pick the kind of check paper you use. If the printing lands a little off on the paper, nudge it:
-            positive numbers move the print right / up, negative numbers left / down (in inches, at most 1).
+            Works with any check paper (Deluxe, Intuit, Costco, Harland, blank check stock and others). Pick your
+            paper and where the check sits on the sheet. If the printing lands a little off, nudge it: positive
+            numbers move the print right / up, negative numbers left / down (in inches, at most 1). If only one item
+            is off, move it under Advanced.
           </p>
           <div>
             <Label htmlFor="chk-stock">Check paper</Label>
@@ -573,13 +811,68 @@ export default function PrintChecksPage() {
               <Select
                 id="chk-style"
                 value={settings.style}
-                onChange={(e) => setSettings((s) => ({ ...s, style: e.target.value as CheckStyle }))}
+                onChange={(e) => changeStyle(e.target.value as CheckStyle)}
               >
                 <option value="voucher">Voucher</option>
-                <option value="standard">Standard</option>
+                <option value="standard">Standard (3 checks per sheet)</option>
                 <option value="wallet">Wallet</option>
               </Select>
               <p className="mt-1 text-xs text-navy/50">{STYLE_HELP[settings.style]}</p>
+            </div>
+            {settings.style === 'standard' ? (
+              <div>
+                <Label htmlFor="chk-remaining">How many checks are left on the first sheet?</Label>
+                <Select
+                  id="chk-remaining"
+                  value={String(settings.firstSheetRemaining)}
+                  onChange={(e) => setSettings((s) => ({ ...s, firstSheetRemaining: Number(e.target.value) }))}
+                >
+                  <option value="3">3 (a full sheet)</option>
+                  <option value="2">2 (the top check was used)</option>
+                  <option value="1">1 (only the bottom check is left)</option>
+                </Select>
+                <p className="mt-1 text-xs text-navy/50">
+                  Lets you reuse a partly used sheet. You can also change it just before printing.
+                </p>
+              </div>
+            ) : (
+              <div>
+                <Label htmlFor="chk-position">Where is the check on the page?</Label>
+                <Select
+                  id="chk-position"
+                  value={settings.position}
+                  onChange={(e) => setSettings((s) => ({ ...s, position: e.target.value as CheckPosition }))}
+                >
+                  <option value="top">Top</option>
+                  <option value="middle">Middle</option>
+                  <option value="bottom">Bottom</option>
+                </Select>
+                <p className="mt-1 text-xs text-navy/50">{POSITION_HELP[settings.position]}</p>
+              </div>
+            )}
+            <div>
+              <Label htmlFor="chk-pagesize">Paper size</Label>
+              <Select
+                id="chk-pagesize"
+                value={settings.pageSize}
+                onChange={(e) => setSettings((s) => ({ ...s, pageSize: e.target.value as CheckPageSize }))}
+              >
+                <option value="letter">Letter (8.5 × 11 in)</option>
+                <option value="legal">Legal (8.5 × 14 in)</option>
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="chk-height">How tall is one check? (inches)</Label>
+              <Input
+                id="chk-height"
+                type="number"
+                step="0.01"
+                min="2.75"
+                max="3.67"
+                value={settings.checkHeight}
+                onChange={(e) => setSettings((s) => ({ ...s, checkHeight: e.target.value }))}
+              />
+              <p className="mt-1 text-xs text-navy/50">Most checks are 3.5 in. Measure from the top edge to the perforation.</p>
             </div>
             <div>
               <Label htmlFor="chk-offx">Move right (inches)</Label>
@@ -606,6 +899,107 @@ export default function PrintChecksPage() {
               />
             </div>
           </div>
+
+          {/* Advanced: field positions */}
+          <div className="rounded-lg border border-navy/10">
+            <button
+              type="button"
+              className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-navy"
+              aria-expanded={showAdvanced}
+              onClick={() => setShowAdvanced((v) => !v)}
+            >
+              <span>Advanced: field positions</span>
+              <span className="text-navy/40">{showAdvanced ? 'Hide' : 'Show'}</span>
+            </button>
+            {showAdvanced && (
+              <div className="px-4 pb-4 space-y-3">
+                <p className="text-xs text-navy/50">
+                  If one item lands in the wrong place on your checks, move just that item. Measure in inches from the
+                  top-left corner of the check: &quot;Across&quot; is from the left edge, &quot;Down&quot; is from the top
+                  edge to the bottom of the text. The amount in numbers is placed by its right end. Changing the check
+                  style keeps the items you moved.
+                </p>
+                <Table>
+                  <thead>
+                    <tr>
+                      <Th>Item</Th>
+                      <Th>Print it?</Th>
+                      <Th>Across (in)</Th>
+                      <Th>Down (in)</Th>
+                      <Th>Text size</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {CHECK_FIELD_KEYS.map((k) => {
+                      const optional = OPTIONAL_CHECK_FIELDS.includes(k);
+                      const f = layoutDraft[k];
+                      return (
+                        <Tr key={k}>
+                          <Td className="font-medium">{CHECK_FIELD_LABELS[k]}</Td>
+                          <Td>
+                            {optional ? (
+                              <input
+                                type="checkbox"
+                                aria-label={`Print ${CHECK_FIELD_LABELS[k]}`}
+                                className="h-4 w-4 accent-electric"
+                                checked={f.show}
+                                onChange={(e) => setField(k, { show: e.target.checked })}
+                              />
+                            ) : (
+                              <span className="text-xs text-navy/40">Always</span>
+                            )}
+                          </Td>
+                          <Td>
+                            <Input
+                              aria-label={`${CHECK_FIELD_LABELS[k]} across`}
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              max="8.5"
+                              value={f.x}
+                              onChange={(e) => setField(k, { x: e.target.value })}
+                            />
+                          </Td>
+                          <Td>
+                            <Input
+                              aria-label={`${CHECK_FIELD_LABELS[k]} down`}
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              max="3.67"
+                              value={f.y}
+                              onChange={(e) => setField(k, { y: e.target.value })}
+                            />
+                          </Td>
+                          <Td>
+                            <Input
+                              aria-label={`${CHECK_FIELD_LABELS[k]} text size`}
+                              type="number"
+                              step="0.5"
+                              min="6"
+                              max="16"
+                              value={f.size}
+                              onChange={(e) => setField(k, { size: e.target.value })}
+                            />
+                          </Td>
+                        </Tr>
+                      );
+                    })}
+                  </tbody>
+                </Table>
+                <p className="text-xs text-navy/50">
+                  Payee address is for window envelopes. Turn on the check number or your company name only if your
+                  checks don&apos;t already show them.
+                </p>
+                <div className="flex justify-end">
+                  <Button variant="secondary" size="sm" onClick={resetLayout}>
+                    Reset to standard positions
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={handleAlignmentTest} loading={testing}>
               Print alignment test
@@ -692,6 +1086,7 @@ export default function PrintChecksPage() {
           <ul className="text-sm text-navy/60 space-y-1 list-disc list-inside">
             <li>The PDF opens in a new tab — use your browser&apos;s print dialog to send it to your printer.</li>
             <li>Print the alignment test on plain paper first and hold it over a blank check to compare.</li>
+            <li>The alignment test uses the setup shown above, even before you save it.</li>
             <li>Printing a queued check stamps its number onto the recorded transaction and journal entry.</li>
           </ul>
         </Card>

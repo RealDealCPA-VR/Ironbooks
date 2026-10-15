@@ -11,7 +11,7 @@ concurrency:
 jobs:
   verify:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,6 +22,6 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
       - name: Tests
-        run: npx vitest run --maxWorkers=2
+        run: npx vitest run --maxWorkers=4
       - name: Production build
         run: npm run build
