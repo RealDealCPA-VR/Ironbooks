@@ -11,6 +11,7 @@ import { and, eq, lte, gte } from 'drizzle-orm';
 import { companies, fiscalPeriods } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, notFound, writeAudit } from './_base';
 import { assertWrite } from './rbac';
+import { assertDividingDateOpen } from './accountantCopy/guard';
 
 export async function listPeriods(ctx: ServiceContext) {
   return ctx.db
@@ -81,7 +82,13 @@ export interface PeriodCheck {
  * before the closing date, the result carries `closingDateException` so the caller can record it
  * with `recordClosingDateException` inside its transaction (Closing Date Exception report, J11).
  */
-export async function assertPeriodOpen(ctx: ServiceContext, date: Date): Promise<PeriodCheck> {
+export async function assertPeriodOpen(
+  ctx: ServiceContext,
+  date: Date,
+  opts: { sourceRef?: string | null } = {},
+): Promise<PeriodCheck> {
+  // Accountant's Copy dividing date (I1): checked first — the closing-date password never bypasses it.
+  await assertDividingDateOpen(ctx, date, opts);
   const closed = await ctx.db
     .select({ id: fiscalPeriods.id })
     .from(fiscalPeriods)

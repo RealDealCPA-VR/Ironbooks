@@ -16,6 +16,7 @@ import { items, uomSetUnits, uomSets } from '@/lib/db/schema';
 import { uomSetSchema } from '@/lib/validation/lists';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { isReferenced } from './references';
+import { assertListDeleteAllowed } from '../accountantCopy/guard';
 
 function parseOrThrow<T>(r: { success: true; data: T } | { success: false; error: { issues: Array<{ path: (string | number)[]; message: string }> } }): T {
   if (r.success) return r.data;
@@ -153,6 +154,7 @@ export async function updateUomSet(ctx: ServiceContext, id: string, body: unknow
 }
 
 export async function deleteUomSet(ctx: ServiceContext, id: string) {
+  await assertListDeleteAllowed(ctx, 'delete', 'unit of measure sets'); // Accountant's Copy (I1)
   const before = await getUomSet(ctx, id);
   const [used] = await ctx.db.select({ id: items.id }).from(items).where(eq(items.uomSetId, id)).limit(1);
   return inTransaction(ctx, async (tx) => {

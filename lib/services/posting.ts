@@ -341,7 +341,7 @@ export function assertControlAccountNames(
 /** Create a balanced journal entry. If posted, the DB trigger updates cached account balances. */
 export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEntryInput) {
   assertBalanced(input.lines);
-  const periodCheck = await assertPeriodOpen(ctx, input.date); // refuse to post into a closed period
+  const periodCheck = await assertPeriodOpen(ctx, input.date, { sourceRef: input.sourceRef ?? null }); // refuse to post into a closed period
   const status = input.status ?? 'posted';
 
   // Verify every referenced account belongs to this company and load its type.
@@ -728,7 +728,7 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, tx.companyId)));
     if (!entry) throw notFound('Journal entry');
     if (entry.status === 'void') return entry;
-    const periodCheck = await assertPeriodOpen(tx, entry.date); // cannot void an entry in a closed period
+    const periodCheck = await assertPeriodOpen(tx, entry.date, { sourceRef: entry.sourceRef }); // cannot void an entry in a closed period
 
     const lines = await tx.db
       .select()

@@ -37,6 +37,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from '../posting';
 import { moveNotesAndTodos } from './notes';
 import { repointForeignKeys } from './references';
+import { assertListDeleteAllowed } from '../accountantCopy/guard';
 
 export interface ListMergeResult {
   reassigned: Record<string, number>;
@@ -85,6 +86,7 @@ async function hasLayers(ctx: ServiceContext, itemId: string): Promise<boolean> 
 }
 
 export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId: string; toId: string }): Promise<ListMergeResult> {
+  await assertListDeleteAllowed(ctx, 'merge', 'items'); // Accountant's Copy (I1)
   if (fromId === toId) throw validation('Cannot merge an item with itself.');
   const load = async (id: string) => {
     const [row] = await ctx.db.select().from(items).where(and(eq(items.id, id), eq(items.companyId, ctx.companyId)));
@@ -262,6 +264,7 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
 // ---------------------------------------------------------------------------
 
 export async function mergeClasses(ctx: ServiceContext, { fromId, toId }: { fromId: string; toId: string }): Promise<ListMergeResult> {
+  await assertListDeleteAllowed(ctx, 'merge', 'classes'); // Accountant's Copy (I1)
   if (fromId === toId) throw validation('Cannot merge a class with itself.');
   const load = async (id: string) => {
     const [row] = await ctx.db.select().from(classes).where(and(eq(classes.id, id), eq(classes.companyId, ctx.companyId)));
@@ -295,6 +298,7 @@ export async function mergeClasses(ctx: ServiceContext, { fromId, toId }: { from
 // ---------------------------------------------------------------------------
 
 export async function mergeEmployees(ctx: ServiceContext, { fromId, toId }: { fromId: string; toId: string }): Promise<ListMergeResult> {
+  await assertListDeleteAllowed(ctx, 'merge', 'employees'); // Accountant's Copy (I1)
   if (fromId === toId) throw validation('Cannot merge an employee with themselves.');
   const load = async (id: string) => {
     const [row] = await ctx.db.select().from(employees).where(and(eq(employees.id, id), eq(employees.companyId, ctx.companyId)));
@@ -339,6 +343,7 @@ export async function mergeEmployees(ctx: ServiceContext, { fromId, toId }: { fr
 // ---------------------------------------------------------------------------
 
 export async function mergeOtherNames(ctx: ServiceContext, { fromId, toId }: { fromId: string; toId: string }): Promise<ListMergeResult> {
+  await assertListDeleteAllowed(ctx, 'merge', 'other names'); // Accountant's Copy (I1)
   if (fromId === toId) throw validation('Cannot merge a name with itself.');
   const load = async (id: string) => {
     const [row] = await ctx.db.select().from(otherNames).where(and(eq(otherNames.id, id), eq(otherNames.companyId, ctx.companyId)));

@@ -63,6 +63,7 @@ import { allowLedgerRewrite } from './posting';
 import { qbAccountTypeOf } from '@/lib/accountTypes';
 import { repointForeignKeys } from './lists/references';
 import { moveNotesAndTodos } from './lists/notes';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -109,6 +110,7 @@ export async function mergeCustomers(
   ctx: ServiceContext,
   { fromId, toId }: MergeCustomersInput,
 ): Promise<MergeResult> {
+  await assertListDeleteAllowed(ctx, 'merge', 'customers'); // Accountant's Copy (I1)
   if (fromId === toId) {
     throw validation('Cannot merge a customer with itself.');
   }
@@ -332,6 +334,7 @@ export async function mergeVendors(
   ctx: ServiceContext,
   { fromId, toId }: MergeVendorsInput,
 ): Promise<MergeResult> {
+  await assertListDeleteAllowed(ctx, 'merge', 'vendors'); // Accountant's Copy (I1)
   if (fromId === toId) {
     throw validation('Cannot merge a vendor with itself.');
   }
@@ -497,6 +500,7 @@ export async function mergeAccounts(
   ctx: ServiceContext,
   { fromId, toId }: MergeAccountsInput,
 ): Promise<MergeAccountsResult> {
+  await assertListDeleteAllowed(ctx, 'merge', 'accounts'); // Accountant's Copy (I1)
   if (fromId === toId) {
     throw validation('Cannot merge an account with itself.');
   }

@@ -28,6 +28,7 @@ import {
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry } from './posting';
 import { resolveCompanyPreferences } from '@/lib/preferences';
+import { assertAccountChangeAllowed } from './accountantCopy/guard';
 
 type AccountType = BaseAccountType;
 
@@ -373,6 +374,8 @@ export async function updateAccount(
   },
 ) {
   const before = await getAccount(ctx, id);
+  // Accountant's Copy (I1): client can't edit accounts the accountant is working with.
+  await assertAccountChangeAllowed(ctx, id, { deactivate: patch.isActive === false && before.isActive });
   let type: AccountType = before.type;
   let subtype: string = before.subtype;
   if (patch.qbType) {

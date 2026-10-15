@@ -20,6 +20,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -102,6 +103,7 @@ export async function createClass(
 
 /** Soft-delete a class by setting isActive = false. */
 export async function deactivateClass(ctx: ServiceContext, id: string): Promise<ClassRow> {
+  await assertListDeleteAllowed(ctx, 'delete', 'classes'); // Accountant's Copy (I1)
   const [existing] = await ctx.db
     .select()
     .from(classes)
@@ -176,6 +178,7 @@ export async function createLocation(
 
 /** Soft-delete a location by setting isActive = false. */
 export async function deactivateLocation(ctx: ServiceContext, id: string): Promise<LocationRow> {
+  await assertListDeleteAllowed(ctx, 'delete', 'locations'); // Accountant's Copy (I1)
   const [existing] = await ctx.db
     .select()
     .from(locations)

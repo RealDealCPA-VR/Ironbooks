@@ -9,6 +9,7 @@
 import { and, asc, eq } from 'drizzle-orm';
 import { customerTypes, customers, vendorTypes, vendors } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 export type TypeListKind = 'customer' | 'vendor';
 
@@ -106,6 +107,7 @@ export async function deleteType(
   kind: TypeListKind,
   id: string,
 ): Promise<{ deleted: boolean; deactivated: boolean }> {
+  await assertListDeleteAllowed(ctx, 'delete', 'list entries'); // Accountant's Copy (I1)
   const before = await loadType(ctx, kind, id);
   const inUse =
     kind === 'customer'

@@ -18,6 +18,7 @@ import { assertItemTypeAllowed } from '@/lib/featureGate';
 import { assertNotControlLineAccount } from './posting';
 import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
 import { assertUomSet, assertVendor, resolveSalesTaxCode } from './lists/fields';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -461,6 +462,7 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
  * remain on historical documents. Hard delete is intentionally not exposed.
  */
 export async function deactivateItem(ctx: ServiceContext, id: string) {
+  await assertListDeleteAllowed(ctx, 'delete', 'items'); // Accountant's Copy (I1)
   return updateItem(ctx, id, { isActive: false });
 }
 

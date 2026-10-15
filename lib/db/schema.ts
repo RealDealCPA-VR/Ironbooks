@@ -2542,3 +2542,42 @@ export const workersCompCodes = pgTable('workers_comp_codes', {
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+// ---- Accountant's Copy (0053, PARITY I1) ----
+// One row per Accountant's Copy. The client's row (side 'client', status 'outstanding') locks
+// transactions dated on/before dividingDate; the accountant's working copy carries the same row
+// flipped to side 'accountant'. See lib/services/accountantCopy/.
+export const accountantCopies = pgTable('accountant_copies', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** 'client' | 'accountant' */
+  side: varchar('side', { length: 12 }).notNull().default('client'),
+  /** client: 'outstanding' | 'imported' | 'cancelled'; accountant: 'open' */
+  status: varchar('status', { length: 16 }).notNull().default('outstanding'),
+  /** 'YYYY-MM-DD' */
+  dividingDate: varchar('dividing_date', { length: 10 }).notNull(),
+  fileToken: varchar('file_token', { length: 64 }).notNull(),
+  createdBy: uuid('created_by'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  openedAt: timestamp('opened_at'),
+  baselineLogSeq: integer('baseline_log_seq'),
+  exportedAt: timestamp('exported_at'),
+  exportCount: integer('export_count').notNull().default(0),
+  importedAt: timestamp('imported_at'),
+  importedBy: uuid('imported_by'),
+  cancelledAt: timestamp('cancelled_at'),
+  cancelledBy: uuid('cancelled_by'),
+  accountantNote: text('accountant_note'),
+  result: jsonb('result').$type<Record<string, unknown>>(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** Accountant side: record versions at the moment the copy was opened (the delta baseline). */
+export const accountantCopyBaseline = pgTable('accountant_copy_baseline', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  copyId: uuid('copy_id').references(() => accountantCopies.id, { onDelete: 'cascade' }).notNull(),
+  /** 'journal_entry' | 'expense' | 'account' | 'class' */
+  entityType: varchar('entity_type', { length: 20 }).notNull(),
+  entityId: uuid('entity_id').notNull(),
+  version: timestamp('version'),
+});

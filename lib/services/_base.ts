@@ -15,6 +15,7 @@ import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
 import { ServiceError } from './errors';
 import { logTransaction } from './transactionLog';
+import { auditBackstop } from './accountantCopy/guard';
 import type { EffectiveAccess } from '@/lib/permissions/model';
 
 export interface ServiceContext {
@@ -108,6 +109,7 @@ export async function writeAudit(
   },
 ): Promise<void> {
   assertNotViewer(ctx); // RBAC: viewers cannot mutate (see assertNotViewer above)
+  await auditBackstop(ctx, params); // Accountant's Copy: no list deletes (accountantCopy/guard.ts)
   await ctx.db.insert(auditLogs).values({
     companyId: ctx.companyId,
     userId: ctx.userId,

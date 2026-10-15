@@ -35,6 +35,7 @@ import {
   writeAudit,
   inTransaction,
 } from './_base';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -193,6 +194,7 @@ export async function updateJob(ctx: ServiceContext, id: string, input: UpdateJo
 }
 
 export async function deactivateJob(ctx: ServiceContext, id: string) {
+  await assertListDeleteAllowed(ctx, 'delete', 'jobs'); // Accountant's Copy (I1)
   const existing = await getJob(ctx, id);
   return inTransaction(ctx, async (tx) => {
     const [updated] = await tx.db
