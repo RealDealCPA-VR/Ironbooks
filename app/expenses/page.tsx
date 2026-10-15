@@ -58,6 +58,8 @@ import AttachmentPanel from '@/components/AttachmentPanel';
 import { visibleOtherNames, type OtherNameEntry } from '@/lib/lists/otherNameOptions';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import type { SmartForm, SmartLine } from '@/lib/smartDefaults';
+// cmdbar: forms accept a prefill from the Ctrl+K command bar.
+import { usePrefill } from '@/lib/commands/usePrefill';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -229,6 +231,8 @@ function ExpensesPageContent() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [otherNames, setOtherNames] = useState<OtherNameOption[]>([]);
+  /** The Other Names list has answered (a command-bar prefill waits for it to match a payee). */
+  const [otherNamesReady, setOtherNamesReady] = useState(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [classes, setClasses] = useState<ClassRow[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -317,7 +321,8 @@ function ExpensesPageContent() {
         api
           .get<{ entries: OtherNameOption[] }>('/api/lists/other-names?includeInactive=true')
           .then((d) => setOtherNames(d.entries ?? []))
-          .catch(() => setOtherNames([]));
+          .catch(() => setOtherNames([]))
+          .finally(() => setOtherNamesReady(true));
         setExpenses(expData.expenses);
         setVendors(vendorData);
         setAccounts(accountData);
@@ -393,6 +398,53 @@ function ExpensesPageContent() {
   useNewParam(() => {
     document.getElementById('exp-payee')?.focus();
   });
+
+  // cmdbar: "check to Shell $45 fuel" fills in a NEW check / expense (once the lists have
+  // loaded); the user reviews it and clicks Save.
+  usePrefill(
+    'expense',
+    (p) => {
+      resetForm();
+      const pay = accounts.find((a) => a.id === p.paymentAccountId);
+      if (pay) {
+        setEntryType(isCreditCard(pay) ? 'cc_charge' : 'check');
+        setPaymentAccountId(pay.id);
+      }
+      if (p.vendorId) setPayeeSel(p.vendorId);
+      else if (p.payeeName) {
+        // gapsa Other Names: a typed payee that IS an active Other Name is picked from that list
+        // (saved with its otherNameId, like choosing it in the payee field); else a one-off payee.
+        const typed = p.payeeName.trim().toLowerCase();
+        const other = otherNames.find((o) => o.isActive !== false && o.name.trim().toLowerCase() === typed);
+        if (other) {
+          setPayeeSel(`${OTHER_NAME_PREFIX}${other.id}`);
+        } else {
+          setPayeeSel(OTHER_PAYEE);
+          setPayeeName(p.payeeName);
+        }
+      }
+      if (p.date) {
+        // A date typed in the command wins over the smart default date (which would otherwise
+        // re-apply when the entry type switches to a card charge just above).
+        dateTouched.current = true;
+        setDate(p.date);
+      }
+      if (p.memo) setMemo(p.memo);
+      if (p.lines.length) {
+        setLines(
+          p.lines.map((l) =>
+            l.itemId
+              ? { ...emptyLine('item'), itemId: l.itemId, quantity: l.quantity ?? '1', unitCost: l.rate ?? '', amount: l.amount ?? '', description: l.description ?? '' }
+              : { ...emptyLine('expense'), accountId: l.accountId ?? '', amount: l.amount ?? '', description: l.description ?? '' },
+          ),
+        );
+      }
+      setPrefillNote(p.note ?? '');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      setTimeout(() => document.getElementById('exp-payee')?.focus(), 50);
+    },
+    !loading && otherNamesReady,
+  );
 
   const runningTotal = lines.reduce((sum, l) => sum + lineTotal(l), 0);
   const selectedVendor = vendors.find((v) => v.id === payeeSel);

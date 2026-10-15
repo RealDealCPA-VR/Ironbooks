@@ -59,6 +59,10 @@ import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { type SmartLine, fillRecalledItems, invoiceFieldsFromRecall, lineClassOverride } from '@/lib/smartDefaults';
+// cmdbar: forms accept a prefill from the Ctrl+K command bar.
+import PrefillNotice from '@/components/PrefillNotice';
+import { usePrefill } from '@/lib/commands/usePrefill';
+import type { FormPrefill } from '@/lib/commands/prefill';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -379,6 +383,8 @@ interface InvoiceModalProps {
   jobs: Job[];
   customFieldDefs: CustomFieldDef[];
   onSaved: () => void;
+  /** cmdbar: values from the command bar for a NEW invoice (the user still reviews and saves). */
+  prefill?: FormPrefill | null;
 }
 
 function InvoiceModal({
@@ -392,6 +398,7 @@ function InvoiceModal({
   jobs,
   customFieldDefs,
   onSaved,
+  prefill = null,
 }: InvoiceModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -531,6 +538,27 @@ function InvoiceModal({
       setRetainagePercent('');
       setCustomValues({});
       setLines([{ ...EMPTY_LINE }]);
+      // cmdbar: a command-bar prefill ("invoice Acme 3 hours consulting").
+      if (prefill) {
+        setCustomerId(prefill.customerId ?? '');
+        if (prefill.date) setDate(prefill.date);
+        if (prefill.memo) setMemo(prefill.memo);
+        if (prefill.lines.length) {
+          setLines(
+            prefill.lines.map((l) => ({
+              ...EMPTY_LINE,
+              itemName: l.itemName ?? '',
+              itemId: l.itemId ?? null,
+              itemType: (l.itemType as ItemType | undefined) ?? null,
+              description: l.description ?? '',
+              quantity: l.quantity ?? '',
+              rate: l.rate ?? '',
+              taxable: l.taxable ?? true,
+              rateManual: !!l.rateFromUser,
+            })),
+          );
+        }
+      }
     }
     setRecallText('');
     recalledTaxRef.current = null;
@@ -540,7 +568,7 @@ function InvoiceModal({
     // Preferences > Time & Expenses: default markup on billable costs.
     setMarkupPercent(prefs.company.defaultMarkupPercent > 0 ? String(prefs.company.defaultMarkupPercent) : '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, editing]);
+  }, [open, editing, prefill]);
 
   // New invoice: due date follows the customer's terms (else the default terms preference).
   useEffect(() => {
@@ -1024,6 +1052,7 @@ function InvoiceModal({
       }
     >
       <div className="space-y-4">
+        {!editing && <PrefillNotice note={prefill?.note} />}
         {editing && editing.status !== 'draft' && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
             Saving changes re-posts this invoice (and any cost of goods) so your books stay
@@ -1656,6 +1685,13 @@ function InvoicesPageContent() {
     setEditTarget(null);
     setShowNew(true);
   });
+  // cmdbar: the command bar opens a NEW invoice filled in for the user to review and save.
+  const [prefill, setPrefill] = useState<FormPrefill | null>(null);
+  usePrefill('invoice', (p) => {
+    setEditTarget(null);
+    setPrefill(p);
+    setShowNew(true);
+  });
 
   // Scroll to + highlight the row when arriving via global search (?focus=<id>)
   const [focusedId, setFocusedId] = useState<string | null>(null);
@@ -1949,7 +1985,8 @@ function InvoicesPageContent() {
       <InvoiceModal
         open={showNew || !!editTarget}
         editing={editTarget}
-        onClose={() => { setShowNew(false); setEditTarget(null); }}
+        onClose={() => { setShowNew(false); setEditTarget(null); setPrefill(null); }}
+        prefill={editTarget ? null : prefill}
         customers={customers}
         items={items}
         taxRates={taxRates}

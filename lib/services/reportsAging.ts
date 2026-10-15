@@ -352,7 +352,10 @@ async function byCustomerReport(
   // QB ages both of these from the due date.
   const { asOf, items } = await openItems(ctx, 'ar', { ...p, agingFrom: 'due_date' });
   const collections = kind === 'collections-report';
-  const list = collections ? items.filter((i) => i.aging !== null && i.aging > 0) : items;
+  const overDays = p.overDays !== undefined ? Number(p.overDays) : null;
+  const list = (collections ? items.filter((i) => i.aging !== null && i.aging > 0) : items).filter(
+    (i) => overDays === null || (i.aging !== null && i.aging > overDays),
+  );
   const contact = new Map<string, { phone: string | null; email: string | null }>();
   if (collections && list.length) {
     const ids = [...new Set(list.map((i) => i.entityId))];
@@ -387,7 +390,7 @@ async function byCustomerReport(
   return {
     key: kind,
     title: collections ? 'Collections Report' : 'Open Invoices',
-    subtitle: `As of ${fmtDay(asOf)}`,
+    subtitle: `As of ${fmtDay(asOf)}${overDays !== null ? ` · more than ${overDays} days past due` : ''}`,
     columns,
     rows,
     notes: collections ? ['Overdue invoices and charges only, with each customer’s phone and email.'] : undefined,

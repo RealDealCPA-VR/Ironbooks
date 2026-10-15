@@ -35,7 +35,9 @@ export type ReportControl =
   | 'view'
   | 'vehicle'
   /** Aging reports: Interval (days), Through (days past due), aging from due / transaction date. */
-  | 'aging';
+  | 'aging'
+  /** Open-item reports: only items more than N days past due (cmdbar). */
+  | 'overdue';
 
 export type ReportGroup =
   | 'Company & Financial'
@@ -99,8 +101,8 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   // ---- Customers & Receivables / Sales ----
   { key: 'ar-aging-summary', title: 'A/R Aging Summary', description: 'What each customer owes, by how many days past due.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'aging', 'customer', 'class'] },
   { key: 'ar-aging-detail', title: 'A/R Aging Detail', description: 'Each open invoice and credit under its aging column.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'aging', 'customer', 'class'] },
-  { key: 'open-invoices', title: 'Open Invoices', description: 'Unpaid invoices and credits by customer, as of a date.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customer', 'class'] },
-  { key: 'collections-report', title: 'Collections Report', description: 'Overdue invoices by customer, with phone and email.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customer', 'class'] },
+  { key: 'open-invoices', title: 'Open Invoices', description: 'Unpaid invoices and credits by customer, as of a date.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customer', 'class', 'overdue'] },
+  { key: 'collections-report', title: 'Collections Report', description: 'Overdue invoices by customer, with phone and email.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customer', 'class', 'overdue'] },
   { key: 'customer-balance-summary', title: 'Customer Balance Summary', description: 'What each customer owes you.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf'] },
   { key: 'customer-balance-detail', title: 'Customer Balance Detail', description: 'Every invoice and payment behind each customer balance.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['optionalRange', 'customer', 'sort'] },
   { key: 'transaction-list-by-customer', title: 'Transaction List by Customer', description: 'All transactions, grouped by customer.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['range', 'customer', 'txnType', 'amount', 'memo', 'number', 'sort'] },
@@ -133,7 +135,7 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'sales-tax-liability', title: 'Sales Tax Liability', description: 'Sales tax collected, paid and still owed, by tax agency.', group: 'Vendors & Payables', area: 'sales_tax', controls: ['range'] },
   { key: 'vendor-balance-summary', title: 'Vendor Balance Summary', description: 'What you owe each vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf'] },
   { key: 'vendor-balance-detail', title: 'Vendor Balance Detail', description: 'Every bill and payment behind each vendor balance.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['optionalRange', 'vendor', 'sort'] },
-  { key: 'unpaid-bills-detail', title: 'Unpaid Bills Detail', description: 'Open bills and credits by vendor, with days past due.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'vendor'] },
+  { key: 'unpaid-bills-detail', title: 'Unpaid Bills Detail', description: 'Open bills and credits by vendor, with days past due.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'vendor', 'overdue'] },
   { key: 'bills-applied-payments', title: 'Bills & Applied Payments', description: 'Each bill with the payments and credits applied to it.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'vendor'] },
   { key: 'transaction-list-by-vendor', title: 'Transaction List by Vendor', description: 'All transactions, grouped by vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'vendor', 'txnType', 'amount', 'memo', 'number', 'sort'] },
   { key: 'expenses-by-vendor-summary', title: 'Expenses by Vendor Summary', description: 'Total spending per vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'class'], basis: true },

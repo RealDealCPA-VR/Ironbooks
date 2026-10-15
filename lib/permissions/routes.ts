@@ -116,6 +116,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/month-end-close/report-pack': r('reports_financial', 'GET:print'),
   '/api/dashboard': r('reports_financial', 'GET'),
   '/api/search': kind('member', 'GET'), // results filtered per area in the route
+  '/api/command-bar': kind('member', 'POST'), // cmdbar: read-only; every result checked per area in lib/services/commandBar.ts
   '/api/memorized-reports': kind('member', 'GET POST'),
   // wave2 reports: memorized report groups / Process Multiple Reports run each report through
   // runStandardReport, which checks that report's own area — so these are member routes.

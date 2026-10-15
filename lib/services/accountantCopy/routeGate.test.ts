@@ -22,6 +22,7 @@ describe("Accountant's Copy route gate", () => {
       '/api/backups/run',
       '/api/attention/state',
       '/api/sandbox/discard',
+      '/api/command-bar',
     ]) {
       expect(accountantCopyAllowsApi(p), p).toBe(true);
     }

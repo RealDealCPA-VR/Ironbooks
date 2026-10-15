@@ -248,6 +248,11 @@ export default function ReportFilters({
           </Field>
         </>
       )}
+      {has('overdue') && (
+        <Field id="rf-overdays" label="More than (days past due)">
+          <Input id="rf-overdays" inputMode="numeric" placeholder="Any" value={params.overDays ?? ''} onChange={(e) => set('overDays', e.target.value.replace(/[^0-9]/g, ''))} />
+        </Field>
+      )}
       {has('class') && pick('classId', 'Class', opts?.classes, <Help term="class" />)}
       {has('customer') && pick('customerId', 'Customer:Job', opts?.customers)}
       {has('vendor') && pick('vendorId', 'Vendor', opts?.vendors)}

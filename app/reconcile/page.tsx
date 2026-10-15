@@ -24,6 +24,8 @@ import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
 import { formatDate as fmtDate } from '@/lib/dates';
+// cmdbar: "reconcile checking" opens this page with the account picked.
+import { usePrefill } from '@/lib/commands/usePrefill';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -156,6 +158,16 @@ function StartForm({
   const [info, setInfo] = useState<ReconcileInfo | null>(null);
   const [undoing, setUndoing] = useState(false);
   const [confirmUndo, setConfirmUndo] = useState(false);
+  usePrefill(
+    'reconcile',
+    (p) => {
+      if (p.bankAccountId && bankAccounts.some((b) => b.id === p.bankAccountId)) {
+        setBankAccountId(p.bankAccountId);
+        setTimeout(() => document.getElementById('recon-statement-date')?.focus(), 50);
+      }
+    },
+    bankAccounts.length > 0,
+  );
 
   // Deep links: Needs attention > Reconcile (?account=<bank account id>&through=YYYY-MM-DD) and the
   // month-end close checklist (?bankAccountId=...&statementDate=YYYY-MM-DD) pick the account and date.

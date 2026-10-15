@@ -58,6 +58,10 @@ import { usePreferences } from '@/lib/usePreferences';
 import MemorizeButton from '@/components/MemorizeButton';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { recallNumber, recallQuantity } from '@/lib/smartDefaults';
+// cmdbar: forms accept a prefill from the Ctrl+K command bar.
+import PrefillNotice from '@/components/PrefillNotice';
+import { usePrefill } from '@/lib/commands/usePrefill';
+import type { FormPrefill } from '@/lib/commands/prefill';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -186,6 +190,8 @@ interface NewReceiptModalProps {
   accounts: Account[];
   taxRates: TaxRate[];
   onCreated: () => void;
+  /** cmdbar: values from the command bar for a NEW receipt (the user still reviews and saves). */
+  prefill?: FormPrefill | null;
 }
 
 function NewReceiptModal({
@@ -197,6 +203,7 @@ function NewReceiptModal({
   accounts,
   taxRates,
   onCreated,
+  prefill = null,
 }: NewReceiptModalProps) {
   // QB lists bank, Undeposited Funds and other current assets in "Deposit to" — never A/R.
   const depositAccounts = accounts.filter((a) => isDepositTargetAccount(a));
@@ -275,9 +282,28 @@ function NewReceiptModal({
       setClassId('');
       setMemo('');
       setLines([{ ...EMPTY_LINE }]);
+      // cmdbar: a command-bar prefill ("sold 2 widgets to Acme").
+      if (prefill) {
+        setCustomerId(prefill.customerId ?? '');
+        if (prefill.date) setDate(prefill.date);
+        if (prefill.memo) setMemo(prefill.memo);
+        if (prefill.lines.length) {
+          setLines(
+            prefill.lines.map((l) => ({
+              ...EMPTY_LINE,
+              itemId: l.itemId ?? '',
+              description: l.description ?? '',
+              quantity: l.quantity ?? '1',
+              rate: l.rate ?? '',
+              taxable: l.taxable ?? true,
+              rateManual: !!l.rateFromUser,
+            })),
+          );
+        }
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, editing]);
+  }, [open, editing, prefill]);
 
   // Classes for the Class field (shown while class tracking is on).
   useEffect(() => {
@@ -503,6 +529,11 @@ function NewReceiptModal({
         </>
       }
     >
+      {!editing && prefill?.note && (
+        <div className="mb-3">
+          <PrefillNotice note={prefill.note} />
+        </div>
+      )}
       <div className="space-y-4">
         {editing && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
@@ -753,6 +784,13 @@ export default function SalesReceiptsPage() {
   const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
+  // cmdbar: the command bar opens a NEW sales receipt filled in for the user to save.
+  const [prefill, setPrefill] = useState<FormPrefill | null>(null);
+  usePrefill('sales_receipt', (p) => {
+    setEditTarget(null);
+    setPrefill(p);
+    setShowNew(true);
+  });
 
   // Void state
   const [voidTarget, setVoidTarget] = useState<SalesReceipt | null>(null);
@@ -921,7 +959,9 @@ export default function SalesReceiptsPage() {
         onClose={() => {
           setShowNew(false);
           setEditTarget(null);
+          setPrefill(null);
         }}
+        prefill={editTarget ? null : prefill}
         customers={customers}
         items={items}
         accounts={accounts}

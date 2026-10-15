@@ -194,7 +194,10 @@ export const vendorBalanceDetail = (ctx: ServiceContext, p: ReportParams) => bal
 export async function unpaidBillsDetail(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
   const aging = await apAgingDetail(ctx, asOf);
-  const docs = aging.rows.filter((r) => !p.vendorId || r.entityId === p.vendorId);
+  const overDays = p.overDays !== undefined ? Number(p.overDays) : null;
+  const docs = aging.rows.filter(
+    (r) => (!p.vendorId || r.entityId === p.vendorId) && (overDays === null || r.daysPastDue > overDays),
+  );
   const refs = docs.map((r) => `${r.docType === 'bill' ? 'bill' : 'vendor_credit'}:${r.docId}`);
   const entryIds = await entryIdsForSourceRefs(ctx, refs);
   const byVendor = new Map<string, typeof docs>();
@@ -233,7 +236,7 @@ export async function unpaidBillsDetail(ctx: ServiceContext, p: ReportParams): P
   return {
     key: 'unpaid-bills-detail',
     title: 'Unpaid Bills Detail',
-    subtitle: `As of ${fmtDay(asOf)}`,
+    subtitle: `As of ${fmtDay(asOf)}${overDays !== null ? ` · more than ${overDays} days past due` : ''}`,
     columns: [
       { key: 'label', header: '' },
       { key: 'type', header: 'Type' },

@@ -49,6 +49,9 @@ export const ACCOUNTANT_COPY_ALLOWED_API = [
   // Undo tokens never change the books; performing an undo is checked against the gate for the
   // inverse action's route (assertAccountantCopyAllowsPath in lib/services/undo.ts).
   '/api/undo',
+  // Ctrl+K command bar: a read-only parse (POST only to carry the typed text); forms it opens
+  // save through their own routes, which this gate checks as usual.
+  '/api/command-bar',
 ];
 
 export function accountantCopyAllowsApi(path: string): boolean {

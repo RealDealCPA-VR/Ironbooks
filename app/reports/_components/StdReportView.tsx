@@ -43,6 +43,7 @@ const PARAM_KEYS = [
   'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
   'classId', 'budgetId', 'txnType', 'amountMin', 'amountMax', 'cleared', 'memo', 'number', 'sortBy', 'sortDir',
   'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates', 'interval', 'through', 'agingFrom',
+  'overDays',
 ];
 
 function paramsFromSearch(sp: URLSearchParams | null): Params {

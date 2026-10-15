@@ -440,6 +440,12 @@ export function searchPages(
     permissions?: Partial<Record<Area, readonly string[]>> | null;
     hiddenPaths?: ReadonlySet<string>;
     limit?: number;
+    /**
+     * Only confident matches: the name contains what was typed, a whole plain-language phrase,
+     * or every meaningful word found in the name / keywords. Loose partial hits are left out
+     * (used where the top hit is acted on without a list to pick from, e.g. "go to …").
+     */
+    strict?: boolean;
   } = {},
 ): PageSearchResult[] {
   const q = query.trim().toLowerCase();
@@ -476,6 +482,7 @@ export function searchPages(
   //    Late-payment charges, "make a deposit" -> Make Deposits). A full keyword match beats a
   //    loose plain-language guess, so it ranks above the partial intents.
   ranked.filter((s) => s.score >= 50 && s.score < 70).forEach(pushPage);
+  if (opts.strict) return out.slice(0, limit);
   // 4. Looser plain-language intents.
   intents.filter((i) => i.score < 100).forEach(pushIntent);
   // 5. Pages where only some of the words match.
