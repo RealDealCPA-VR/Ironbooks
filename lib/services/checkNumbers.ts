@@ -20,6 +20,7 @@ import { and, eq, isNull, ne, sql } from 'drizzle-orm';
 import { accounts, billPayments, expenses, journalEntries, paychecks, paymentChecks } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError } from './_base';
 import { getPreferences } from './company';
+import { duplicateNumberFixes } from '@/lib/errorFixes';
 
 /** Parse a string reference as a non-negative integer. Returns null if non-numeric. */
 function parseRef(ref: string | null | undefined): number | null {
@@ -218,6 +219,8 @@ export async function assertCheckNumberAvailable(
     number: string | null | undefined;
     exclude?: { source: CheckNumberUse['source']; id: string };
     allowDuplicate?: boolean;
+    /** Request-body field holding the number, for the "use the next number" fix (default 'reference'). */
+    numberField?: string;
   },
 ): Promise<void> {
   if (params.allowDuplicate) return;
@@ -230,6 +233,14 @@ export async function assertCheckNumberAvailable(
       'CONFLICT',
       `Check number ${num} is already used on this bank account. Use a different number, or confirm that you want to keep the duplicate.`,
       { duplicateNumber: true, number: num, matches },
+    ).withFixes(
+      duplicateNumberFixes({
+        number: num,
+        nextNumber: await nextCheckNumber(ctx, params.paymentAccountId),
+        field: params.numberField ?? 'reference',
+        overrideFlag: { path: 'allowDuplicateNumber', value: true },
+        label: 'check number',
+      }),
     );
   }
 }

@@ -20,6 +20,7 @@ import {
   type CompanyPreferences,
 } from '@/lib/preferences';
 import { currentRequestInfo } from '@/lib/permissions/enforce';
+import { removeTaxFixes } from '@/lib/errorFixes';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 
 /** FORBIDDEN error for a feature that is turned off (friendlyErrors shows it as "turned off"). */
@@ -79,12 +80,20 @@ export async function assertSalesTaxAllowed(
   keep: ReadonlyArray<string | null | undefined> = [],
 ): Promise<void> {
   const kept = new Set(keep.filter(Boolean) as string[]);
-  const used = [input.taxRateId, ...(input.lines ?? []).map((l) => (l as { taxRateId?: string | null }).taxRateId)].filter(
-    (id): id is string => !!id && !kept.has(id),
-  );
+  const isNew = (id: string | null | undefined): id is string => !!id && !kept.has(id);
+  const lineTax = (input.lines ?? []).map((l) => (l as { taxRateId?: string | null }).taxRateId);
+  const used = [input.taxRateId, ...lineTax].filter(isNew);
   if (used.length === 0) return;
   const prefs = await companyPrefs(ctx.db, ctx.companyId);
-  if (prefs.salesTaxEnabled === false) throw gateError('salesTaxEnabled');
+  if (prefs.salesTaxEnabled === false) {
+    // Fix: take the tax off the form (header tax rate + any line tax rates), or turn tax back on.
+    throw gateError('salesTaxEnabled').withFixes(
+      removeTaxFixes({
+        headerTax: isNew(input.taxRateId),
+        linePaths: lineTax.flatMap((id, i) => (isNew(id) ? [`lines.${i}.taxRateId`] : [])),
+      }),
+    );
+  }
 }
 
 /** Is the company's sales tax feature on? (Customer tax defaults are skipped while it is off.) */

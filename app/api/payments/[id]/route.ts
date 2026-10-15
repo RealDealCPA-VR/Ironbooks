@@ -12,6 +12,7 @@
  * DELETE — void the payment (reverses GL, rolls back invoice balances)
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { serviceErrorBody } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import {
@@ -43,7 +44,7 @@ function errorStatus(code: ServiceError['code']): number {
 function errorResponse(err: unknown, label: string) {
   if (err instanceof ServiceError) {
     return NextResponse.json(
-      { error: err.message, code: err.code, details: err.details },
+      serviceErrorBody(err),
       { status: errorStatus(err.code) },
     );
   }

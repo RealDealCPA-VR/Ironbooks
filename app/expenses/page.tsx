@@ -41,15 +41,19 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
-import { api, ApiError } from '@/lib/client';
+import { api } from '@/lib/client';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { useNewParam } from '@/lib/useFocusParam';
-import { type PurchaseVendor, saveWithDuplicateCheck, vendorPrefillAccountIds } from '@/lib/purchasesClient';
+import { type PurchaseVendor, vendorPrefillAccountIds } from '@/lib/purchasesClient';
+import { useErrorFixes } from '@/components/ErrorFixPanel';
+import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
+import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { amountMessage, collectErrors, dateMessage, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
 // wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
-import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
+import { confirmTransactionDate } from '@/lib/formPrefs';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 
@@ -141,6 +145,9 @@ const ENTRY_LABEL: Record<EntryType, string> = {
 
 const OTHER_PAYEE = '__other__';
 
+/** Body sent to /api/expenses (fix patches address its paths, e.g. "reference", "lines.0.accountId"). */
+type ExpenseBody = Record<string, unknown>;
+
 function emptyLine(mode: LineRow['mode'] = 'expense'): LineRow {
   return { mode, accountId: '', itemId: '', quantity: '', unitCost: '', description: '', amount: '', classId: '', customerId: '' };
 }
@@ -184,6 +191,9 @@ function ExpensesPageContent() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [exchangeRate, setExchangeRate] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  // Fix errors where they happen: server fix suggestions + inline field messages.
+  const fixer = useErrorFixes<ExpenseBody>();
+  const [showErrors, setShowErrors] = useState(false);
   const [pendingVoid, setPendingVoid] = useState<Expense | null>(null);
   const [voidingId, setVoidingId] = useState<string | null>(null);
 
@@ -361,6 +371,8 @@ function ExpensesPageContent() {
   }
 
   function resetForm() {
+    fixer.clear();
+    setShowErrors(false);
     setEditingId(null);
     setExchangeRate('');
     setPayeeSel('');
@@ -405,61 +417,94 @@ function ExpensesPageContent() {
     setPrefillNote(`Accounts pre-filled ${PREFILL_SOURCE_LABEL[pf.source]}.`);
   }
 
+  // ── inline validation (lib/fieldValidation.ts) ───────────────────────────
+
+  /**
+   * Plain messages next to each field. A line with no account is reported but does not block the
+   * save: the server answers with a "Use <default account>" fix (vendor / Preferences default).
+   */
+  function validateForm(): { errors: FieldErrors; blocking: boolean } {
+    const entries: Record<string, string | null> = {
+      payee: payeeSel === OTHER_PAYEE
+        ? requiredMessage(payeeName, 'Type the payee name.')
+        : requiredMessage(payeeSel, 'Choose who you paid (or pick Other and type a name).'),
+      account: requiredMessage(paymentAccountId, isCC ? 'Choose the credit card account.' : 'Choose the bank account the money came from.'),
+      date: dateMessage(date, 'Date'),
+    };
+    lines.forEach((line, i) => {
+      const n = i + 1;
+      if (line.mode === 'item') {
+        entries[`line-${i}-item`] = requiredMessage(line.itemId, `Line ${n}: choose an item.`);
+        entries[`line-${i}-qty`] = !(Number(line.quantity) > 0)
+          ? `Line ${n}: the quantity must be more than zero.`
+          : lineTotal(line) <= 0
+            ? `Line ${n}: enter what each one cost.`
+            : null;
+        return;
+      }
+      entries[`line-${i}-account`] = requiredMessage(line.accountId, `Line ${n}: choose an account.`);
+      entries[`line-${i}-amount`] = amountMessage(line.amount, { label: `Line ${n} amount`, required: true });
+    });
+    const errors = collectErrors(entries);
+    const blocking = Object.keys(errors).some((k) => !/^line-\d+-account$/.test(k));
+    return { errors, blocking };
+  }
+  const fieldErrors: FieldErrors = showErrors ? validateForm().errors : {};
+
+  /** Copy a fix's changes (request-body paths) back onto the form. */
+  function applyToForm(patched: ExpenseBody, fix: ErrorFix) {
+    for (const op of fix.patch ?? []) {
+      const value = getPath(patched, op.path);
+      if (op.path === 'date' && typeof value === 'string') setDate(value);
+      else if (op.path === 'reference') setReference(typeof value === 'string' ? value : '');
+      else if (op.path === 'paymentAccountId' && typeof value === 'string') setPaymentAccountId(value);
+      else {
+        const lp = parseLinePath(op.path);
+        if (lp?.collection === 'lines' && (lp.field === 'accountId' || lp.field === 'amount' || lp.field === 'classId')) {
+          updateLine(lp.index, lp.field, typeof value === 'string' ? value : '');
+        }
+      }
+    }
+  }
+
+  /** Save the check / charge. Throws on failure (the fix presenter shows it). */
+  async function send(body: ExpenseBody) {
+    setSubmitting(true);
+    try {
+      await (editingId ? api.patch(`/api/expenses/${editingId}`, body) : api.post('/api/expenses', body));
+      toast(
+        editingId
+          ? 'Changes saved.'
+          : entryType === 'check' && toPrint
+            ? 'Check saved and added to the print queue.'
+            : `${ENTRY_LABEL[entryType]} recorded.`,
+        'success',
+      );
+      resetForm();
+      await fetchExpenses();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   // ── submit ────────────────────────────────────────────────────────────────
 
   async function handleSubmit() {
     const vendorId = payeeSel && payeeSel !== OTHER_PAYEE ? payeeSel : undefined;
     const freePayee = payeeSel === OTHER_PAYEE ? payeeName.trim() : '';
-    if (!vendorId && !freePayee) {
-      toast('Select a vendor or enter a payee name.', 'danger');
+    setShowErrors(true);
+    const check = validateForm();
+    if (check.blocking) {
+      focusFirstError('exp', check.errors);
       return;
-    }
-    if (!paymentAccountId) {
-      toast(isCC ? 'Select a credit card account.' : 'Select a bank account.', 'danger');
-      return;
-    }
-    if (!date) {
-      toast('Date is required.', 'danger');
-      return;
-    }
-    for (const [i, line] of lines.entries()) {
-      if (line.mode === 'item') {
-        if (!line.itemId) {
-          toast(`Line ${i + 1}: select an item.`, 'danger');
-          return;
-        }
-        if (!line.quantity || Number(line.quantity) <= 0) {
-          toast(`Line ${i + 1}: quantity must be greater than zero.`, 'danger');
-          return;
-        }
-        if (lineTotal(line) <= 0) {
-          toast(`Line ${i + 1}: enter a cost.`, 'danger');
-          return;
-        }
-        continue;
-      }
-      if (!line.accountId) {
-        toast(`Line ${i + 1}: select an expense account.`, 'danger');
-        return;
-      }
-      if (!line.amount || Number(line.amount) <= 0) {
-        toast(`Line ${i + 1}: amount must be greater than zero.`, 'danger');
-        return;
-      }
     }
 
     if (!confirmTransactionDate(date, prefs)) return;
-    // Preferences > Checking: "Warn about duplicate check numbers" (same bank account).
-    if (entryType === 'check' && !toPrint) {
-      const dupCheck = findDuplicateNumber(reference, expenses, (e) => e.reference, {
-        sameScope: (e) => e.method === 'check' && e.paymentAccountId === paymentAccountId && !e.voidedAt,
-      });
-      if (!confirmUniqueNumber(prefs.company.warnDuplicateCheckNumbers, 'Check number', dupCheck, reference)) return;
-    }
+    // Duplicate check numbers (Preferences > Checking) are caught by the server, which offers
+    // "Use the next free check number" / "Keep it anyway" fixes.
 
-    setSubmitting(true);
-    try {
-      const body = {
+    {
+      const body: ExpenseBody = {
         vendorId,
         payeeName: freePayee || undefined,
         date,
@@ -495,27 +540,11 @@ function ExpensesPageContent() {
               },
         ),
       };
-      // Duplicate check numbers: warn and let the user keep the number (QB behaviour).
-      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-        editingId
-          ? api.patch(`/api/expenses/${editingId}`, { ...body, allowDuplicateNumber })
-          : api.post('/api/expenses', { ...body, allowDuplicateNumber }),
-      );
-      if (saved === null) return;
-      toast(
-        editingId
-          ? 'Changes saved.'
-          : entryType === 'check' && toPrint
-            ? 'Check saved and added to the print queue.'
-            : `${ENTRY_LABEL[entryType]} recorded.`,
-        'success',
-      );
-      resetForm();
-      await fetchExpenses();
-    } catch (err) {
-      toastError(err, 'Failed to save expense.');
-    } finally {
-      setSubmitting(false);
+      try {
+        await send(body);
+      } catch (err) {
+        fixer.report(err, { payload: body, resubmit: send, applyToForm, fallback: 'Failed to save expense.' });
+      }
     }
   }
 
@@ -587,6 +616,7 @@ function ExpensesPageContent() {
           </div>
         </div>
 
+        {fixer.panel}
         {/* Payee + payment account + date */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
@@ -599,6 +629,8 @@ function ExpensesPageContent() {
                 setPayeeSel(v);
                 if (v && v !== OTHER_PAYEE) prefillFor({ vendorId: v });
               }}
+              aria-required="true"
+              {...fieldA11y('exp', 'payee', fieldErrors)}
             >
               <option value="">Select payee…</option>
               {vendors.map((v) => (
@@ -615,8 +647,10 @@ function ExpensesPageContent() {
                 value={payeeName}
                 onChange={(e) => setPayeeName(e.target.value)}
                 onBlur={() => payeeName.trim() && prefillFor({ payee: payeeName })}
+                aria-label="Payee name"
               />
             )}
+            <FieldError formId="exp" name="payee" errors={fieldErrors} />
             {prefillNote && <p className="mt-1 text-xs text-electric">{prefillNote}</p>}
           </div>
 
@@ -628,6 +662,8 @@ function ExpensesPageContent() {
               id="exp-account"
               value={paymentAccountId}
               onChange={(e) => setPaymentAccountId(e.target.value)}
+              aria-required="true"
+              {...fieldA11y('exp', 'account', fieldErrors)}
             >
               <option value="">Select account…</option>
               {paymentAccounts.map((a) => (
@@ -636,6 +672,7 @@ function ExpensesPageContent() {
                 </option>
               ))}
             </Select>
+            <FieldError formId="exp" name="account" errors={fieldErrors} />
             {isCC && paymentAccounts.length === 0 && (
               <p className="mt-1 text-xs text-navy/40">
                 No credit-card accounts found. Add one (liability / credit card) in the chart of
@@ -646,7 +683,14 @@ function ExpensesPageContent() {
 
           <div>
             <Label htmlFor="exp-date" required>Date</Label>
-            <DateInput id="exp-date" value={date} onChange={(e) => setDate(e.target.value)} />
+            <DateInput
+              id="exp-date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              aria-required="true"
+              {...fieldA11y('exp', 'date', fieldErrors)}
+            />
+            <FieldError formId="exp" name="date" errors={fieldErrors} />
           </div>
         </div>
 
@@ -762,7 +806,12 @@ function ExpensesPageContent() {
                 className="grid grid-cols-1 md:grid-cols-[2fr_2fr_1fr_1.5fr_1.5fr_24px] gap-2 items-start"
               >
                 {line.mode === 'item' ? (
-                  <Select value={line.itemId} onChange={(e) => pickItem(idx, e.target.value)} aria-label="Item">
+                  <Select
+                    value={line.itemId}
+                    onChange={(e) => pickItem(idx, e.target.value)}
+                    aria-label={`Line ${idx + 1} item`}
+                    {...fieldA11y('exp', `line-${idx}-item`, fieldErrors)}
+                  >
                     <option value="">Item…</option>
                     {items.map((it) => (
                       <option key={it.id} value={it.id}>
@@ -775,6 +824,8 @@ function ExpensesPageContent() {
                   <Select
                     value={line.accountId}
                     onChange={(e) => updateLine(idx, 'accountId', e.target.value)}
+                    aria-label={`Line ${idx + 1} account`}
+                    {...fieldA11y('exp', `line-${idx}-account`, fieldErrors)}
                   >
                     <option value="">Account…</option>
                     {lineAccounts.map((a) => (
@@ -790,7 +841,8 @@ function ExpensesPageContent() {
                     <Input
                       placeholder="Qty"
                       inputMode="decimal"
-                      aria-label="Quantity"
+                      aria-label={`Line ${idx + 1} quantity`}
+                      {...fieldA11y('exp', `line-${idx}-qty`, fieldErrors)}
                       value={line.quantity}
                       onChange={(e) => updateLine(idx, 'quantity', e.target.value)}
                     />
@@ -813,11 +865,15 @@ function ExpensesPageContent() {
                 {line.mode === 'item' ? (
                   <div className="px-3 py-2 text-sm tabular-nums text-navy/70">{formatCurrency(lineTotal(line).toFixed(2))}</div>
                 ) : (
-                  <AmountInput
-                    placeholder="0.00"
-                    value={line.amount}
-                    onChange={(e) => updateLine(idx, 'amount', e.target.value)}
-                  />
+                  <div>
+                    <AmountInput
+                      placeholder="0.00"
+                      aria-label={`Line ${idx + 1} amount`}
+                      {...fieldA11y('exp', `line-${idx}-amount`, fieldErrors)}
+                      value={line.amount}
+                      onChange={(e) => updateLine(idx, 'amount', e.target.value)}
+                    />
+                  </div>
                 )}
 
                 {prefs.company.classTrackingEnabled || line.classId ? (
@@ -860,6 +916,12 @@ function ExpensesPageContent() {
               </div>
             ))}
           </div>
+          {/* Line messages (each input points at its own message via aria-describedby). */}
+          {Object.keys(fieldErrors)
+            .filter((k) => k.startsWith('line-'))
+            .map((k) => (
+              <FieldError key={k} formId="exp" name={k} errors={fieldErrors} />
+            ))}
 
           <div className="mt-3 flex items-center justify-end gap-2">
             <span className="text-sm text-navy/50">

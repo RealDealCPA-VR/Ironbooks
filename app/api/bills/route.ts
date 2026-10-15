@@ -3,10 +3,11 @@
  * POST /api/bills          — create a new bill
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { zodErrorWithFixes } from '@/lib/fixRoutes';
+import { serviceErrorBody } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { createBill, listBills } from '@/lib/services/bills';
 import { ServiceError } from '@/lib/services/_base';
-import { zodErrorBody } from '@/lib/validation/helpers';
 import { createBillSchema } from '@/lib/validation/bills';
 
 function errorResponse(err: unknown) {
@@ -21,7 +22,7 @@ function errorResponse(err: unknown) {
             : err.code === 'CONFLICT'
               ? 409
               : 500;
-    return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+    return NextResponse.json(serviceErrorBody(err), { status });
   }
   console.error('[bills/route]', err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
@@ -46,7 +47,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => ({}));
     const parsed = createBillSchema.safeParse(body);
     if (!parsed.success) {
-      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+      return zodErrorWithFixes(ctx, parsed.error, body, 'expense');
     }
 
     // QB duplicate vendor-reference warning: refused (409, details.duplicateNumber) unless confirmed.

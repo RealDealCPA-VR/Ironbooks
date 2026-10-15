@@ -13,7 +13,7 @@ import { and, eq } from 'drizzle-orm';
 import type { PgColumn, PgTable } from 'drizzle-orm/pg-core';
 import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
-import { ServiceError } from './errors';
+import { ServiceError, type ServiceErrorFix } from './errors';
 import { logTransaction } from './transactionLog';
 import type { EffectiveAccess } from '@/lib/permissions/model';
 
@@ -48,11 +48,11 @@ export interface ServiceContext {
   access?: EffectiveAccess;
 }
 
-export { ServiceError, type ServiceErrorCode } from './errors';
+export { ServiceError, type ServiceErrorCode, type ServiceErrorFix } from './errors';
 
 export const notFound = (what: string) => new ServiceError('NOT_FOUND', `${what} not found`);
-export const validation = (msg: string, details?: unknown) =>
-  new ServiceError('VALIDATION', msg, details);
+export const validation = (msg: string, details?: unknown, fixes?: ServiceErrorFix[]) =>
+  new ServiceError('VALIDATION', msg, details, fixes);
 
 const REF_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

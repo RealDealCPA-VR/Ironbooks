@@ -29,6 +29,7 @@ import {
 } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, validation, writeAudit } from './_base';
 import { resolveCompanyPreferences } from '@/lib/preferences';
+import { duplicateNumberFixes } from '@/lib/errorFixes';
 
 export const DOC_TYPES = [
   'invoice',
@@ -152,6 +153,14 @@ export async function assertUniqueDocNumber(
       'CONFLICT',
       `${DOC_TYPE_LABELS[docType]} number ${ref} is already used. Use a different number, or confirm to keep the duplicate.`,
       { duplicateDocNumber: true, docType, refNumber: ref },
+    ).withFixes(
+      duplicateNumberFixes({
+        number: ref,
+        nextNumber: await nextDocNumber(ctx, docType),
+        field: 'refNumber',
+        overrideFlag: { path: 'allowDuplicateNumber', value: true },
+        label: `${DOC_TYPE_LABELS[docType].toLowerCase()} number`,
+      }),
     );
   }
   return { duplicate };

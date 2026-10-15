@@ -33,6 +33,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertPeriodOpen } from './fiscalPeriods';
+import { balanceFixes, balanceSummary } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
 import {
@@ -162,7 +163,35 @@ async function autoJournalNumber(ctx: ServiceContext): Promise<string | null> {
   return nextJournalNumber(rows.map((r) => r.reference));
 }
 
+/**
+ * Fix errors where they happen: an out-of-balance entry gets a plain message ("Debits are $40.00
+ * more than credits.") and fixes that add the difference to a line (lib/errorFixes.ts). Manual
+ * entry lines map 1:1 onto the request body's `lines`, so the patch paths match what the form sent.
+ */
+async function withBalanceFixes<T>(lines: ManualEntryInput['lines'], run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof ServiceError && err.code === 'UNBALANCED' && !err.fixes) {
+      const summary = balanceSummary(lines ?? []);
+      if (summary.message) {
+        err.message = `${summary.message} An entry must have equal debits and credits.`;
+        err.details = { ...(err.details as object | undefined), difference: summary.difference };
+      }
+      err.withFixes(balanceFixes(lines ?? []));
+    }
+    throw err;
+  }
+}
+
 export async function createManualEntry(
+  ctx: ServiceContext,
+  input: ManualEntryInput,
+) {
+  return withBalanceFixes(input.lines, () => createManualEntryInner(ctx, input));
+}
+
+async function createManualEntryInner(
   ctx: ServiceContext,
   input: ManualEntryInput,
 ) {
@@ -537,6 +566,10 @@ export async function assertNoJournalApplications(
  * as a voided entry, and the audit log links old → new.
  */
 export async function updateEntry(ctx: ServiceContext, id: string, input: UpdateEntryInput) {
+  return withBalanceFixes(input.lines, () => updateEntryInner(ctx, id, input));
+}
+
+async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEntryInput) {
   if (!input.description?.trim()) {
     throw validation('Description is required.');
   }
@@ -561,7 +594,7 @@ export async function updateEntry(ctx: ServiceContext, id: string, input: Update
   // the new date is where they get re-posted. (postJournalEntry/voidJournalEntry
   // re-check these inside the transaction; checking up front gives a clean error
   // before any work begins.)
-  await assertPeriodOpen(ctx, before.date);
+  await assertPeriodOpen(ctx, before.date, { movable: false });
   await assertPeriodOpen(ctx, input.date);
   // Names already on the entry may stay even if they were made inactive since (QB lets you
   // edit an old entry without re-picking its names); new names must be active.

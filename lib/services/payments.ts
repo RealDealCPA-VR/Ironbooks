@@ -17,6 +17,7 @@
  * (in transaction currency, via invoices.markPaidAmount).
  * The returned paymentsReceived row's `postedEntryId` links back to the journal entry.
  */
+import { appliedExceedsPaymentFixes, fixMoney, overAppliedFixes } from '@/lib/errorFixes';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { and, desc, eq, gte, ilike, inArray, isNull, lt, ne, or, sql, type SQL } from 'drizzle-orm';
 import {
@@ -611,6 +612,24 @@ async function postPayment(
   if (sumApplied.plus(sumJournal).greaterThan(totalAmount)) {
     throw validation(
       `Sum of applications (${toAmountString(sumApplied.plus(sumJournal))}) exceeds payment amount (${toAmountString(totalAmount)}).`,
+      undefined,
+      // Fix: raise the amount received to what was applied, or trim the last invoice application.
+      appliedExceedsPaymentFixes({
+        paymentAmount: totalAmount.minus(sumJournal),
+        applications: input.applications.map((a, i) => ({
+          path: `applications.${i}.amountApplied`,
+          amount: Money.round2(a.amountApplied ?? 0),
+          label: 'the last invoice',
+        })),
+      }).map((f) =>
+        f.id === 'payment-raise'
+          ? {
+              ...f,
+              label: `Change the amount received to ${fixMoney(sumApplied.plus(sumJournal))}`,
+              patch: [{ op: 'set' as const, path: 'amount', value: toAmountString(sumApplied.plus(sumJournal)) }],
+            }
+          : f,
+      ),
     );
   }
   let sumCredits = Money.zero();
@@ -700,8 +719,20 @@ async function postPayment(
   for (const [invoiceId, requested] of requestedByInvoice) {
     const inv = invoiceById.get(invoiceId)!;
     if (requested.greaterThan(Money.of(inv.balanceDue))) {
+      // Fix: apply exactly what the invoice still owes (after its discount and credits).
+      const appIdx = input.applications.findIndex((a) => a.invoiceId === invoiceId);
+      const cash = appIdx >= 0 ? Money.round2(input.applications[appIdx].amountApplied ?? 0) : Money.zero();
       throw validation(
         `Cash, discount and credits on invoice #${docRef(inv.refNumber, inv.invoiceNumber)} (${toAmountString(requested)}) add up to more than its balance due (${toAmountString(inv.balanceDue)}).`,
+        { invoiceId, balanceDue: toAmountString(inv.balanceDue), requested: toAmountString(requested) },
+        appIdx >= 0
+          ? overAppliedFixes({
+              path: `applications.${appIdx}.amountApplied`,
+              balanceDue: inv.balanceDue,
+              otherApplied: requested.minus(cash),
+              label: `invoice #${docRef(inv.refNumber, inv.invoiceNumber)}`,
+            })
+          : [],
       );
     }
   }

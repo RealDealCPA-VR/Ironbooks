@@ -33,6 +33,7 @@ import { accounts, bills, billLines, inventoryLayers, items, loanPayments, vendo
 import { Money, toAmountString } from '@/lib/money';
 import { type DiscountInfo, discountFor, dueDateFromTerms } from './billTerms';
 import { computeDiscount, computeDueDate, dueDateFromTermsList, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
+import { duplicateNumberFixes } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
@@ -138,6 +139,15 @@ async function assertBillNumberAvailable(ctx: ServiceContext, input: CreateBillI
       'CONFLICT',
       `This vendor already has a bill with reference number ${num}. Check that this is not the same bill entered twice, or confirm to keep the duplicate.`,
       { duplicateNumber: true, number: num, matches },
+    ).withFixes(
+      // A vendor's own reference number has no "next" value: offer keeping it (existing override).
+      duplicateNumberFixes({
+        number: num,
+        nextNumber: null,
+        field: 'billNumber',
+        overrideFlag: { path: 'allowDuplicateNumber', value: true },
+        label: 'reference number',
+      }),
     );
   }
 }

@@ -32,12 +32,31 @@ const STATUS: Record<string, number> = {
   CONFLICT: 409,
 };
 
+/** HTTP status for a ServiceError code. */
+export function serviceErrorStatus(code: string): number {
+  return STATUS[code] ?? 500;
+}
+
+/**
+ * JSON body for a ServiceError: `{ error, code, details, fixes? }`. `fixes` (lib/errorFixes.ts)
+ * is only present when the service suggested any, so existing clients see the same shape.
+ * `code` may be overridden for soft warnings (lib/salesRouteErrors.ts).
+ */
+export function serviceErrorBody(
+  err: ServiceError,
+  code: string = err.code,
+): { error: string; code: string; details: unknown; fixes?: ServiceError['fixes'] } {
+  return {
+    error: err.message,
+    code,
+    details: err.details,
+    ...(err.fixes && err.fixes.length ? { fixes: err.fixes } : {}),
+  };
+}
+
 export function routeError(err: unknown, tag: string): NextResponse {
   if (err instanceof ServiceError) {
-    return NextResponse.json(
-      { error: err.message, code: err.code, details: err.details },
-      { status: STATUS[err.code] ?? 500 },
-    );
+    return NextResponse.json(serviceErrorBody(err), { status: serviceErrorStatus(err.code) });
   }
   // A malformed request body (`await req.json()` on invalid JSON) is the caller's fault, not ours.
   if (err instanceof SyntaxError) {

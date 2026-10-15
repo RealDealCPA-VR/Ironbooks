@@ -20,6 +20,8 @@
  *   → 201 { expense: Expense }
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { zodErrorWithFixes } from '@/lib/fixRoutes';
+import { serviceErrorBody } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import {
   createExpense,
@@ -27,7 +29,6 @@ import {
   type ExpenseMethod,
 } from '@/lib/services/expenses';
 import { ServiceError } from '@/lib/services/_base';
-import { zodErrorBody } from '@/lib/validation/helpers';
 import { createExpenseSchema } from '@/lib/validation/expenses';
 
 function errorStatus(code: string): number {
@@ -50,7 +51,7 @@ function errorStatus(code: string): number {
 function errorResponse(err: unknown, route: string) {
   if (err instanceof ServiceError) {
     return NextResponse.json(
-      { error: err.message, code: err.code, details: err.details ?? null },
+      { ...serviceErrorBody(err), details: err.details ?? null },
       { status: errorStatus(err.code) },
     );
   }
@@ -89,7 +90,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => ({}));
     const parsed = createExpenseSchema.safeParse(body);
     if (!parsed.success) {
-      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+      return zodErrorWithFixes(ctx, parsed.error, body, 'expense');
     }
 
     // QB duplicate check-number warning: refused (409, details.duplicateNumber) unless confirmed.

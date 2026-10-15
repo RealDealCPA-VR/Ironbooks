@@ -42,11 +42,15 @@ import { useNewParam } from '@/lib/useFocusParam';
 import EntryDetailModal from '@/components/EntryDetailModal';
 // wave2 prefs: Preferences-driven labels/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
-import { confirmClassAssigned, confirmTransactionDate } from '@/lib/formPrefs';
+import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { formatAccountLabel } from '@/lib/preferences';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
+import { useErrorFixes } from '@/components/ErrorFixPanel';
+import { FieldError, fieldA11y } from '@/components/FieldError';
+import { applyFixPatch, balanceFixes, missingClassFixes, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { collectErrors, dateMessage, requiredMessage } from '@/lib/fieldValidation';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -151,6 +155,23 @@ function emptyLine(id: number): LineRow {
 
 let lineCounter = 0;
 
+/** Body sent to /api/journal-entries (fix patches address its paths). */
+interface JournalPayload {
+  date: string;
+  description: string;
+  reference: string | null;
+  isAdjusting: boolean;
+  lines: Array<{
+    accountId: string;
+    debit: string | undefined;
+    credit: string | undefined;
+    memo: string | null;
+    classId: string | null;
+    entityType: string | null;
+    entityId: string | null;
+  }>;
+}
+
 interface EntryFormModalProps {
   open: boolean;
   onClose: () => void;
@@ -181,6 +202,10 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
   ]);
   const [saving, setSaving] = useState(false);
   const prefs = usePreferences();
+  const fixer = useErrorFixes<JournalPayload>();
+  /** Fields the user has left (inline messages show after the first visit, not while typing). */
+  const [touched, setTouched] = useState<Record<string, boolean>>({});
+  const touch = (k: string) => setTouched((t) => (t[k] ? t : { ...t, [k]: true }));
 
   const editing = !!editEntry;
 
@@ -218,6 +243,9 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       setLines([emptyLine(++lineCounter), emptyLine(++lineCounter)]);
     }
     setSaving(false);
+    setTouched({});
+    fixer.clear();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editEntry]);
 
   const updateLine = (id: number, field: keyof LineRow, value: string) => {
@@ -267,34 +295,48 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
   const blocker = missingHeader ?? nameBlocker ?? bal.blocker;
   const canSubmit = bal.canSave && !missingHeader && !nameBlocker;
 
-  const handleSubmit = async () => {
-    if (!canSubmit) return;
-    // Preferences: date range warning; class tracking "warn when a line has no class".
-    if (!confirmTransactionDate(date, prefs)) return;
-    if (lines.some((l) => l.accountId && !l.classId) && !confirmClassAssigned(null, prefs)) return;
+  // Inline field messages (lib/fieldValidation.ts), shown once the field has been visited.
+  const fieldErrors = collectErrors({
+    date: touched.date ? dateMessage(date, 'Date') : null,
+    description: touched.description
+      ? requiredMessage(description, 'Enter a description so you can find this entry later.')
+      : null,
+  });
+
+  // Fix-it for an out-of-balance entry, right where the difference shows: the same builder the
+  // server uses (lib/errorFixes.ts), applied to the form's own lines.
+  const formBalanceFixes: ErrorFix[] =
+    !bal.balanced && bal.invalidLines.length === 0 && Number(bal.difference) !== 0 ? balanceFixes(lines) : [];
+  const applyFormBalanceFix = (fix: ErrorFix) => {
+    setLines((prev) => applyFixPatch({ lines: prev }, fix.patch).lines);
+  };
+
+  // Which form line each payload line came from (the payload skips lines without an account).
+  const payloadLineIds = lines.filter((l) => l.accountId).map((l) => l.id);
+
+  /** Copy a fix's changes (request-body paths) back onto the form. */
+  const applyToForm = (patched: JournalPayload, fix: ErrorFix) => {
+    for (const op of fix.patch ?? []) {
+      if (op.path === 'date' && typeof patched.date === 'string') setDate(patched.date);
+      const lp = parseLinePath(op.path);
+      if (!lp || lp.collection !== 'lines') continue;
+      const id = payloadLineIds[lp.index];
+      const pl = patched.lines[lp.index];
+      if (id === undefined || !pl) continue;
+      setLines((prev) =>
+        prev.map((l) =>
+          l.id === id
+            ? { ...l, accountId: pl.accountId, debit: pl.debit ?? '', credit: pl.credit ?? '', classId: pl.classId ?? '' }
+            : l,
+        ),
+      );
+    }
+  };
+
+  /** Post / update. Throws on failure (the fix presenter shows it). */
+  const send = async (payload: JournalPayload) => {
     setSaving(true);
     try {
-      const payload = {
-        date,
-        description: description.trim(),
-        reference: reference.trim() || null,
-        isAdjusting,
-        lines: lines
-          .filter((l) => l.accountId)
-          .map((l) => {
-            const [entityType, entityId] = l.name ? l.name.split(':') : [null, null];
-            return {
-              accountId: l.accountId,
-              // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
-              debit: journalPayloadAmount(l.debit),
-              credit: journalPayloadAmount(l.credit),
-              memo: l.memo.trim() || null,
-              classId: l.classId || null,
-              entityType: entityType || null,
-              entityId: entityId || null,
-            };
-          }),
-      };
       if (editing && editEntry) {
         await api.patch(`/api/journal-entries/${editEntry.id}`, payload);
         toast('Journal entry updated', 'success');
@@ -302,12 +344,61 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
         await api.post('/api/journal-entries', payload);
         toast('Journal entry posted', 'success');
       }
+      fixer.clear();
       onSaved();
       onClose();
-    } catch (err: unknown) {
-      toastError(err, 'Failed to save entry.');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSubmit = async () => {
+    setTouched({ date: true, description: true });
+    if (!canSubmit) return;
+    // Preferences: date range warning.
+    if (!confirmTransactionDate(date, prefs)) return;
+    const payload: JournalPayload = {
+      date,
+      description: description.trim(),
+      reference: reference.trim() || null,
+      isAdjusting,
+      lines: lines
+        .filter((l) => l.accountId)
+        .map((l) => {
+          const [entityType, entityId] = l.name ? l.name.split(':') : [null, null];
+          return {
+            accountId: l.accountId,
+            // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
+            debit: journalPayloadAmount(l.debit),
+            credit: journalPayloadAmount(l.credit),
+            memo: l.memo.trim() || null,
+            classId: l.classId || null,
+            entityType: entityType || null,
+            entityId: entityId || null,
+          };
+        }),
+    };
+    const ctx = { payload, resubmit: send, applyToForm, fallback: 'Failed to save entry.' };
+    // Class tracking "warn when a line has no class" (lib/formPrefs.ts): offer fixes instead of a
+    // yes/no box — use the class already on another line, or save without one.
+    const classless = payload.lines.flatMap((l, i) => (l.classId ? [] : [`lines.${i}.classId`]));
+    if (classless.length && classWarningApplies(null, prefs)) {
+      const used = payload.lines.find((l) => l.classId)?.classId;
+      const suggested = classes.find((c) => c.id === used) ?? (classes.length === 1 ? classes[0] : null);
+      fixer.offer(
+        {
+          title: 'Some lines have no class',
+          message: `${classless.length === 1 ? 'One line has' : `${classless.length} lines have`} no class, and your preferences ask for one.`,
+        },
+        missingClassFixes({ paths: classless, suggested: suggested ? { id: suggested.id, name: suggested.name } : null }),
+        ctx,
+      );
+      return;
+    }
+    try {
+      await send(payload);
+    } catch (err: unknown) {
+      fixer.report(err, ctx);
     }
   };
 
@@ -361,6 +452,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
         </>
       }
     >
+      {fixer.panel}
       {editing && (
         <p className="mb-4 rounded-lg bg-gold/10 border border-gold/30 px-3 py-2 text-xs text-navy/80">
           Saving voids the original entry and posts a corrected one; the audit trail keeps both
@@ -377,7 +469,11 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
             autoFocus
             value={date}
             onChange={(e) => setDate(e.target.value)}
+            onBlur={() => touch('date')}
+            aria-required="true"
+            {...fieldA11y('je', 'date', fieldErrors)}
           />
+          <FieldError formId="je" name="date" errors={fieldErrors} />
         </div>
         <div>
           <Label htmlFor="je-ref">Reference (optional)</Label>
@@ -395,8 +491,11 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
             placeholder="Memo / narration"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
+            onBlur={() => touch('description')}
             aria-required="true"
+            {...fieldA11y('je', 'description', fieldErrors)}
           />
+          <FieldError formId="je" name="description" errors={fieldErrors} />
         </div>
         <label className="col-span-2 inline-flex items-center gap-2 text-sm text-navy/80">
           <input
@@ -590,6 +689,15 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
             <p id="je-save-blocker" className="text-xs text-navy/60 text-right max-w-md">
               {blocker}
             </p>
+          )}
+          {blocker === bal.blocker && formBalanceFixes.length > 0 && (
+            <div className="flex flex-wrap justify-end gap-2" role="group" aria-label="Ways to balance this entry">
+              {formBalanceFixes.map((fix) => (
+                <Button key={fix.id} type="button" size="sm" variant="secondary" onClick={() => applyFormBalanceFix(fix)}>
+                  Fix: {fix.label}
+                </Button>
+              ))}
+            </div>
           )}
         </div>
       </div>

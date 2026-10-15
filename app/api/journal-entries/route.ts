@@ -9,6 +9,7 @@
  *   offset  number (default 0).
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { serviceErrorBody } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { createManualEntry, listEntries } from '@/lib/services/journal';
@@ -57,14 +58,14 @@ function mapError(err: unknown): NextResponse {
     const status =
       err.code === 'NOT_FOUND'
         ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
+        : err.code === 'VALIDATION' || err.code === 'UNBALANCED' || err.code === 'PERIOD_CLOSED'
           ? 400
           : err.code === 'FORBIDDEN'
             ? 403
             : err.code === 'CONFLICT'
               ? 409
               : 500;
-    return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+    return NextResponse.json(serviceErrorBody(err), { status });
   }
   console.error('[journal-entries] Unexpected error:', err);
   return NextResponse.json({ error: 'Internal server error.' }, { status: 500 });

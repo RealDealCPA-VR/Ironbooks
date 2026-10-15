@@ -24,7 +24,7 @@ import {
   toast, toastError,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
-import { api, ApiError } from '@/lib/client';
+import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
@@ -53,7 +53,14 @@ import {
 import { useDocNumber } from '@/components/sales/DocNumberField';
 // wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
-import { confirmClassAssigned, confirmStockAvailable, confirmTransactionDate } from '@/lib/formPrefs';
+import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
+import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
+import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
+import { getPath, missingClassFixes, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
+
+/** Body sent to /api/invoices (fix patches address its paths, e.g. "refNumber", "lines.2.quantity"). */
+type InvoiceBody = Record<string, unknown>;
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
@@ -414,7 +421,10 @@ function InvoiceModal({
   const invNumber = useDocNumber('invoice', open, editing ? (editing.refNumber || String(editing.invoiceNumber)) : null);
   const refNumber = invNumber.value;
   const setRefNumber = invNumber.setValue;
-  const [dupNumberPrompt, setDupNumberPrompt] = useState<string | null>(null);
+  // Fix errors where they happen: server fix suggestions (duplicate number, closed period, not
+  // enough stock, sales tax off, ...) + inline field messages.
+  const fixer = useErrorFixes<InvoiceBody>();
+  const [showErrors, setShowErrors] = useState(false);
   // Retainage (contractors): % of the total held back in Retainage Receivable until billed.
   const [retainagePercent, setRetainagePercent] = useState('');
   // Customer defaults (new invoices): tax item / non-taxable tax code and default ship-to.
@@ -492,6 +502,8 @@ function InvoiceModal({
       setLines([{ ...EMPTY_LINE }]);
     }
     setBillables(null);
+    fixer.clear();
+    setShowErrors(false);
     setSelectedCostIds(new Set());
     setSelectedTimeIds(new Set());
     // Preferences > Time & Expenses: default markup on billable costs.
@@ -752,9 +764,89 @@ function InvoiceModal({
     return Math.round(totals.total * Math.min(pct, 100)) / 100;
   })();
 
+  /** Inline field messages (lib/fieldValidation.ts), keyed by field / form line index. */
+  function validateForm(): FieldErrors {
+    const entries: Record<string, string | null> = {
+      customer: requiredMessage(customerId, 'Choose the customer you are billing.'),
+      date: dateMessage(date, 'Invoice date'),
+      due: dateMessage(dueDate, 'Due date', {
+        required: false,
+        notBefore: date ? { value: date, what: 'the invoice date' } : undefined,
+      }),
+    };
+    lines.forEach((l, idx) => {
+      if (!(l.itemId || l.description || l.quantity || l.rate)) return;
+      const kind = lineKind(l);
+      const n = idx + 1;
+      if (kind === 'subtotal') return; // computed server-side
+      if (kind === 'discount') {
+        if (!l.rate || (parseFloat(l.rate) || 0) === 0) {
+          entries[`line-${idx}-rate`] = `Line ${n}: enter a discount ${l.discountPercent ? 'percent' : 'amount'}.`;
+        }
+        return;
+      }
+      entries[`line-${idx}-qty`] = Number(l.quantity) > 0 ? null : `Line ${n}: the quantity must be more than zero.`;
+      entries[`line-${idx}-rate`] = !l.rate.trim()
+        ? `Line ${n}: enter the rate (price each).`
+        : !Number.isFinite(Number(l.rate))
+          ? `Line ${n}: the rate must be a number like 125.00.`
+          : Number(l.rate) < 0
+            ? `Line ${n}: the rate can't be negative (use a discount item instead).`
+            : null;
+    });
+    return collectErrors(entries);
+  }
+  const fieldErrors: FieldErrors = showErrors ? validateForm() : {};
+
+  /** Copy a fix's changes (request-body paths) back onto the form. `lineIdx` maps body → form lines. */
+  function applyToForm(patched: InvoiceBody, fix: ErrorFix, lineIdx: number[]) {
+    for (const op of fix.patch ?? []) {
+      const value = getPath(patched, op.path);
+      const str = typeof value === 'string' ? value : value == null ? '' : String(value);
+      if (op.path === 'date') setDate(str);
+      else if (op.path === 'refNumber') setRefNumber(str);
+      else if (op.path === 'taxRateId') setTaxRateId(str);
+      else if (op.path === 'classId') setClassId(str);
+      else {
+        const lp = parseLinePath(op.path);
+        if (lp?.collection === 'lines' && lp.field === 'quantity' && lineIdx[lp.index] !== undefined) {
+          updateLine(lineIdx[lp.index], { quantity: str });
+        }
+      }
+    }
+  }
+
+  /** Save the invoice. Throws on failure (the fix presenter shows it). */
+  async function send(payload: InvoiceBody) {
+    setSaving(true);
+    try {
+      // Over the customer's credit limit → "Save anyway?" (recorded in the audit trail).
+      const saved = await creditLimit.run((override, allowOverBilling) => {
+        const body = { ...payload, overrideCreditLimit: override || payload.overrideCreditLimit === true, allowOverBilling };
+        return editing ? api.patch(`/api/invoices/${editing.id}`, body) : api.post('/api/invoices', body);
+      });
+      if (saved === undefined) return; // user chose not to go over the limit
+      const shownNumber = (payload.refNumber as string | undefined) || editing?.refNumber || editing?.invoiceNumber;
+      if (editing) {
+        toast(`Invoice #${shownNumber} updated.`, 'success');
+      } else {
+        toast(saveAsPending ? 'Pending invoice saved (not posted).' : 'Invoice created.', 'success');
+      }
+      fixer.clear();
+      onSaved();
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function handleSubmit(allowDuplicateNumber = false) {
-    if (!customerId) { toast('Please select a customer.', 'danger'); return; }
-    if (!date) { toast('Please enter an invoice date.', 'danger'); return; }
+    setShowErrors(true);
+    const errs = validateForm();
+    if (hasErrors(errs)) {
+      focusFirstError('inv', errs);
+      return;
+    }
 
     // Pair each line with its index so per-line live amounts stay aligned.
     const indexed = lines
@@ -762,23 +854,6 @@ function InvoiceModal({
       .filter(({ l }) => l.itemId || l.description || l.quantity || l.rate);
     if (indexed.length === 0 && !hasBillablesSelected) {
       toast('Add at least one line item or select billables.', 'danger'); return;
-    }
-    for (let i = 0; i < indexed.length; i++) {
-      const { l } = indexed[i];
-      const kind = lineKind(l);
-      if (kind === 'subtotal') continue; // computed server-side
-      if (kind === 'discount') {
-        if (!l.rate || (parseFloat(l.rate) || 0) === 0) {
-          toast(`Line ${i + 1}: enter a discount ${l.discountPercent ? 'percent' : 'amount'}.`, 'danger'); return;
-        }
-        continue;
-      }
-      if (!l.quantity || parseFloat(l.quantity) <= 0) {
-        toast(`Line ${i + 1}: quantity must be a positive number.`, 'danger'); return;
-      }
-      if (!l.rate || parseFloat(l.rate) < 0) {
-        toast(`Line ${i + 1}: rate cannot be negative.`, 'danger'); return;
-      }
     }
 
     const payload: Record<string, unknown> = {
@@ -851,44 +926,33 @@ function InvoiceModal({
       };
     }
 
-    // Preferences: date range, class, and not-enough-inventory warnings.
+    // Preferences: date range warning.
     if (!confirmTransactionDate(date, prefs)) return;
-    if (!confirmClassAssigned(classId, prefs)) return;
-    if (
-      !confirmStockAvailable(
-        indexed.map(({ l }) => ({ itemId: l.itemId, quantity: l.quantity })),
-        items,
-        prefs,
-        editing?.lines.map((l) => ({ itemId: l.itemId, quantity: l.quantity })) ?? [],
-      )
-    ) {
+    // Not enough inventory to sell: the server warns (NEGATIVE_STOCK) with fixes — sell anyway,
+    // sell only what is on hand, or adjust quantity on hand. Pending invoices relieve no stock.
+    if (!(editing ? editing.status === 'draft' : saveAsPending)) payload.checkStock = true;
+
+    const lineIdx = indexed.map(({ idx }) => idx);
+    const ctx: FixContext<InvoiceBody> = {
+      payload,
+      resubmit: send,
+      applyToForm: (patched, fix) => applyToForm(patched, fix, lineIdx),
+      fallback: 'Failed to save invoice.',
+    };
+    // Class tracking "warn when a transaction has no class": offer fixes instead of a yes/no box.
+    if (classWarningApplies(classId, prefs)) {
+      fixer.offer(
+        { title: 'This invoice has no class', message: 'Your preferences ask for a class on every transaction.' },
+        missingClassFixes({ paths: ['classId'], suggested: classes.length === 1 ? classes[0] : null }),
+        ctx,
+      );
       return;
     }
-
-    setSaving(true);
     try {
-      // Over the customer's credit limit → "Save anyway?" (recorded in the audit trail).
-      const saved = await creditLimit.run((override, allowOverBilling) =>
-        editing
-          ? api.patch(`/api/invoices/${editing.id}`, { ...payload, overrideCreditLimit: override, allowOverBilling })
-          : api.post('/api/invoices', { ...payload, overrideCreditLimit: override, allowOverBilling }),
-      );
-      if (saved === undefined) return; // user chose not to go over the limit
-      if (editing) {
-        toast(`Invoice #${refNumber.trim() || editing.refNumber || editing.invoiceNumber} updated.`, 'success');
-      } else {
-        toast(saveAsPending ? 'Pending invoice saved (not posted).' : 'Invoice created.', 'success');
-      }
-      onSaved();
-      onClose();
+      await send(payload);
     } catch (err: unknown) {
-      if (err instanceof ApiError && err.status === 409 && /number .* is already used/i.test(err.message)) {
-        setDupNumberPrompt(err.message);
-        return;
-      }
-      toastError(err, 'Failed to save invoice.');
-    } finally {
-      setSaving(false);
+      // Duplicate invoice number, closed period, sales tax off, not enough stock, ... → Fix buttons.
+      fixer.report(err, ctx);
     }
   }
 
@@ -950,6 +1014,7 @@ function InvoiceModal({
       }
     >
       <div className="space-y-4">
+        {fixer.panel}
         {editing && editing.status !== 'draft' && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
             Saving changes re-posts this invoice (and any cost of goods) so your books stay
@@ -972,12 +1037,15 @@ function InvoiceModal({
             value={customerId}
             onChange={(e) => setCustomerId(e.target.value)}
             autoFocus
+            aria-required="true"
+            {...fieldA11y('inv', 'customer', fieldErrors)}
           >
             <option value="">Select a customer…</option>
             {customers.map((c) => (
               <option key={c.id} value={c.id}>{c.displayName}</option>
             ))}
           </Select>
+          <FieldError formId="inv" name="customer" errors={fieldErrors} />
         </div>
 
         {/* Invoice number (QB "Invoice #"): pre-filled with the next number, letters allowed */}
@@ -1000,7 +1068,10 @@ function InvoiceModal({
               id="inv-date"
               value={date}
               onChange={(e) => setDate(e.target.value)}
+              aria-required="true"
+              {...fieldA11y('inv', 'date', fieldErrors)}
             />
+            <FieldError formId="inv" name="date" errors={fieldErrors} />
           </div>
           <div>
             <Label htmlFor="inv-due">Due Date</Label>
@@ -1008,7 +1079,9 @@ function InvoiceModal({
               id="inv-due"
               value={dueDate}
               onChange={(e) => setDueDate(e.target.value)}
+              {...fieldA11y('inv', 'due', fieldErrors)}
             />
+            <FieldError formId="inv" name="due" errors={fieldErrors} />
           </div>
         </div>
 
@@ -1099,6 +1172,12 @@ function InvoiceModal({
               </button>
             </div>
           </div>
+          {/* Line messages (each input points at its own message via aria-describedby). */}
+          {Object.keys(fieldErrors)
+            .filter((k) => k.startsWith('line-'))
+            .map((k) => (
+              <FieldError key={k} formId="inv" name={k} errors={fieldErrors} />
+            ))}
 
           {/* Find-as-you-type item options shared by all line rows */}
           <datalist id="inv-item-options">
@@ -1157,12 +1236,16 @@ function InvoiceModal({
                 <div className="grid grid-cols-[64px_84px_1fr_52px_76px] gap-2 items-center">
                   <AmountInput
                     placeholder="Qty"
+                    aria-label={`Line ${idx + 1} quantity`}
+                    {...fieldA11y('inv', `line-${idx}-qty`, fieldErrors)}
                     value={kind === 'subtotal' ? '' : line.quantity}
                     disabled={kind === 'subtotal' || (kind === 'discount' && line.discountPercent)}
                     onChange={(e) => updateLine(idx, { quantity: e.target.value })}
                   />
                   <AmountInput
                     placeholder={kind === 'discount' ? (line.discountPercent ? '%' : 'Amount') : 'Rate'}
+                    aria-label={`Line ${idx + 1} ${kind === 'discount' ? 'discount' : 'rate'}`}
+                    {...fieldA11y('inv', `line-${idx}-rate`, fieldErrors)}
                     value={kind === 'subtotal' ? '' : line.rate}
                     disabled={kind === 'subtotal'}
                     onChange={(e) => updateLine(idx, { rate: e.target.value, rateManual: true })}
@@ -1468,17 +1551,6 @@ function InvoiceModal({
         <AttachmentPanel className="mt-4" entityType="invoice" entityId={editing?.id} />
       )}
     </Modal>
-    <ConfirmDialog
-      open={dupNumberPrompt !== null}
-      title="Number already used"
-      message={dupNumberPrompt ?? undefined}
-      confirmLabel="Keep this number"
-      onClose={() => setDupNumberPrompt(null)}
-      onConfirm={() => {
-        setDupNumberPrompt(null);
-        void handleSubmit(true);
-      }}
-    />
     </>
   );
 }

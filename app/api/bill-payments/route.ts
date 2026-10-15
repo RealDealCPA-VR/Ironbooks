@@ -30,6 +30,7 @@
  *   else        → 500
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { serviceErrorBody } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { payBillsWithCredits, listBillPayments } from '@/lib/services/billPayments';
 import { ServiceError } from '@/lib/services/_base';
@@ -64,7 +65,7 @@ export async function GET(req: NextRequest) {
   } catch (err) {
     if (err instanceof ServiceError) {
       return NextResponse.json(
-        { error: err.message, code: err.code, details: err.details ?? null },
+        { ...serviceErrorBody(err), details: err.details ?? null },
         { status: errorStatus(err.code) },
       );
     }
@@ -92,7 +93,7 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     if (err instanceof ServiceError) {
       return NextResponse.json(
-        { error: err.message, code: err.code, details: err.details ?? null },
+        { ...serviceErrorBody(err), details: err.details ?? null },
         { status: errorStatus(err.code) },
       );
     }

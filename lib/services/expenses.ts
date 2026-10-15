@@ -901,6 +901,7 @@ export async function markExpensePrinted(
     number: checkNumber,
     exclude: { source: 'expense', id: expense.id },
     allowDuplicate: input.allowDuplicateNumber,
+    numberField: 'checkNumber',
   });
 
   return inTransaction(ctx, async (tx) => {
