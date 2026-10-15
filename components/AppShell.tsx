@@ -21,6 +21,7 @@ import { pageHelpFor } from '@/lib/pageHelp';
 import type { Area } from '@/lib/permissions/model';
 import { blockingFeatureGate, featureHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
+import AccountantCopyBanner from './AccountantCopyBanner';
 import PreferenceBehaviors from './PreferenceBehaviors';
 import {
   AMOUNT_KEY_HELP,
@@ -686,6 +687,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </button>
           <CompanyChip company={company} onCompany={setCompany} />
         </header>
+        <AccountantCopyBanner pathname={pathname} />
         {blockedGate ? <FeatureOff gate={blockedGate} /> : children}
       </main>
       <CommandPalette />

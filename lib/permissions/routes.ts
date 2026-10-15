@@ -428,6 +428,15 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/accountant/client-data-review': r('accounting', 'GET POST:modify'),
   '/api/accountant/closing-date-exceptions': r('closing', 'GET'),
   '/api/accountant/voided-deleted': r('reports_financial', 'GET'),
+  // Accountant's Copy (I1) + Period Copy (I7). Creating a copy / opening one carries every user
+  // of the file, so those handlers also require a file admin (requireFileAdmin / owner-admin).
+  '/api/accountant-copy': { ...r('accounting', 'GET'), ...r('file_utilities', 'POST:create') },
+  '/api/accountant-copy/cancel': r('file_utilities', 'POST:modify'),
+  '/api/accountant-copy/open': r('file_utilities', 'POST:create'),
+  '/api/accountant-copy/changes': r('accounting', 'GET POST:create'),
+  '/api/accountant-copy/changes/review': r('accounting', 'POST:view'),
+  '/api/accountant-copy/changes/import': r('accounting', 'POST:modify'),
+  '/api/period-copy': r('file_utilities', 'POST:create'),
 
   // ---- Inventory ----
   '/api/inventory': r('inventory', 'GET POST'),
@@ -664,6 +673,8 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/accountant/working-trial-balance': 'reports_financial',
   '/accountant/fix-sales-tax': 'sales_tax',
   '/accountant/sales-tax-adjustment': 'sales_tax',
+  '/accountant/accountants-copy': 'accounting',
+  '/accountant/period-copy': 'file_utilities',
   '/integrity': 'file_utilities',
   '/backup': 'file_utilities',
   '/qb-import': 'file_utilities',

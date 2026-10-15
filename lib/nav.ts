@@ -163,6 +163,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: FileClock, label: 'Audit Trail', path: '/audit-trail', qb: 'Audit Trail', keywords: 'history who changed' },
       { icon: BriefcaseIcon, label: 'Accountant Center', path: '/accountant', qb: 'Accountant Center', keywords: 'accountant' }, // wave2 accountant
+      { icon: ArrowLeftRight, label: "Accountant's Copy", path: '/accountant/accountants-copy', qb: "Accountant's Copy", keywords: 'send books to accountant dividing date transfer changes import' }, // I1
       { icon: ScrollText, label: 'Transaction Log', path: '/transaction-log', qb: 'Transaction Log', keywords: 'log' },
       { icon: Paperclip, label: 'Attached documents', path: '/attachments', qb: 'Doc Center', keywords: 'attachments receipts files scan' },
       { icon: Bell, label: 'Reminders', path: '/reminders', qb: 'Reminders', keywords: 'due overdue' },
@@ -200,6 +201,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: Building2, label: 'Companies', path: '/companies', qb: 'Open or Restore Company', keywords: 'company file switch' },
       { icon: HardDrive, label: 'Company File', path: '/company-file', qb: 'Back Up Company', keywords: 'backup restore' },
+      { icon: CalendarRange, label: 'Period Copy', path: '/accountant/period-copy', qb: 'Period Copy', keywords: 'audit copy date range auditor' }, // I7
       { icon: Users, label: 'Users & Roles', path: '/users', qb: 'Set Up Users and Roles', keywords: 'permissions access' },
       { icon: FileSpreadsheet, label: 'Migrate from QuickBooks', path: '/qb-import', qb: 'Import IIF / Convert', keywords: 'import iif convert' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security', qb: 'Security', keywords: 'two factor password' },

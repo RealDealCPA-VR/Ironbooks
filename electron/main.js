@@ -776,6 +776,9 @@ function buildMenu() {
           ],
         },
         { label: 'View Transaction Log', click: () => navigate('/transaction-log') },
+        // QB File > Send Company File > Accountant's Copy (I1) and File > Create Copy > Period Copy (I7).
+        { label: "Accountant's Copy…", click: () => navigate('/accountant/accountants-copy') },
+        { label: 'Create Period Copy…', click: () => navigate('/accountant/period-copy') },
         { type: 'separator' },
         { role: 'quit' },
       ],
