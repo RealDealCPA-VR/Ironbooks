@@ -3,7 +3,12 @@ import { z } from 'zod';
 import { MONTH_END_STEP_KEYS } from '@/lib/services/monthEndClose';
 
 const zPeriodEnd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be a date (YYYY-MM-DD)');
-const zVersion = z.string().max(40).nullable().optional();
+const zVersion = z
+  .string()
+  .max(40)
+  .refine((v) => !Number.isNaN(Date.parse(v)), 'version must be a timestamp')
+  .nullable()
+  .optional();
 
 export const monthEndStepSchema = z
   .object({

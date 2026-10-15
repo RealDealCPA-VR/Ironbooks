@@ -345,7 +345,11 @@ function ClosePanel({
   const laterClosed = !!checklist.closingDate && checklist.closingDate > checklist.periodEnd;
 
   function check(): boolean {
-    if (mode === 'set' && password && password !== confirmPw) {
+    if (mode === 'set' && checklist.hasClosingPassword && !password) {
+      toast('Type the new password, or choose Keep the current password.', 'danger');
+      return false;
+    }
+    if (mode === 'set' && password !== confirmPw) {
       toast('The two passwords do not match.', 'danger');
       return false;
     }

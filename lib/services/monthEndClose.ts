@@ -575,6 +575,10 @@ async function stepAging(side: 'ar' | 'ap', { ctx, periodEnd, accounts: accts, l
 }
 
 async function stepPayroll({ ctx, periodEnd, asOf }: StepInput): Promise<Computed> {
+  if (!(await canAccess(ctx, 'payroll', 'view'))) {
+    const reason = 'You do not have access to payroll; ask someone who does to review this step.';
+    return { status: 'skipped', reason, summary: reason, rows: [] };
+  }
   const prefs = await getPreferences(ctx);
   if (prefs.payrollEnabled === false) {
     return { status: 'skipped', reason: 'Payroll is turned off in Preferences.', summary: 'Payroll is turned off.', rows: [] };
@@ -613,7 +617,9 @@ async function stepPayroll({ ctx, periodEnd, asOf }: StepInput): Promise<Compute
 }
 
 async function stepErrorScan({ ctx, scanRanAt }: StepInput): Promise<Computed> {
-  const integrity = await verifyIntegrity(ctx);
+  // Verify Data belongs to File Utilities (/api/integrity); people without it see only the scan.
+  const showIntegrity = await canAccess(ctx, 'file_utilities', 'view');
+  const integrity = showIntegrity ? await verifyIntegrity(ctx) : { allOk: true, checks: [] as Awaited<ReturnType<typeof verifyIntegrity>>['checks'] };
   const open = await listErrors(ctx, { resolved: false });
   const rows: StepRow[] = integrity.checks.map((c) => ({
     label: `Verify Data: ${c.name}`,
@@ -625,7 +631,9 @@ async function stepErrorScan({ ctx, scanRanAt }: StepInput): Promise<Computed> {
     rows.push({ label: `Possible error (${e.severity})`, detail: e.description, status: 'attention', href: '/errors', hrefLabel: 'Review' });
   }
   const figures: StepFigure[] = [
-    { label: 'Verify Data', value: integrity.allOk ? 'No problems found' : `${integrity.checks.filter((c) => !c.ok).length} problem(s)`, kind: 'text' },
+    ...(showIntegrity
+      ? [{ label: 'Verify Data', value: integrity.allOk ? 'No problems found' : `${integrity.checks.filter((c) => !c.ok).length} problem(s)`, kind: 'text' as const }]
+      : []),
     { label: 'Open possible errors', value: String(open.length), kind: 'text' },
     { label: 'Error scan last run', value: scanRanAt ? scanRanAt.toISOString() : 'Not run for this period', kind: 'text' },
   ];
@@ -637,9 +645,11 @@ async function stepErrorScan({ ctx, scanRanAt }: StepInput): Promise<Computed> {
     return { status: 'attention', summary: `${plural(open.length, 'possible error')} to look at.`, rows, figures, action };
   }
   if (!scanRanAt) {
-    return { status: 'attention', summary: 'Verify Data found no problems. Run the error scan for this period.', rows, figures, action };
+    const summary = showIntegrity ? 'Verify Data found no problems. Run the error scan for this period.' : 'Run the error scan for this period.';
+    return { status: 'attention', summary, rows, figures, action };
   }
-  return { status: 'done', summary: 'The error scan and Verify Data found no problems.', rows, figures, action };
+  const summary = showIntegrity ? 'The error scan and Verify Data found no problems.' : 'The error scan found no problems.';
+  return { status: 'done', summary, rows, figures, action };
 }
 
 async function stepOpenItems({ ctx, periodEnd, asOf }: StepInput): Promise<Computed> {
@@ -794,7 +804,9 @@ async function userName(ctx: ServiceContext, id: string | null | undefined): Pro
 async function assertVersion(ctx: ServiceContext, row: CloseRow | null, version: string | null | undefined) {
   if (version === undefined) return;
   const current = row ? row.updatedAt.toISOString() : null;
-  const want = version ? new Date(version).toISOString() : null;
+  const t = version ? new Date(version) : null;
+  if (t && Number.isNaN(t.getTime())) throw validation('This checklist is out of date. Reload and try again.');
+  const want = t ? t.toISOString() : null;
   if (current === want) return;
   const by = row ? await lastChangedBy(ctx, row.id) : null;
   throw new ServiceError(
@@ -853,14 +865,23 @@ async function saveRow(
   return row;
 }
 
-async function canSetClosingDate(ctx: ServiceContext): Promise<boolean> {
+/** True when the user has the permission; false (not an error) when they lack it. */
+async function canAccess(
+  ctx: ServiceContext,
+  area: Parameters<typeof requireEffectivePermission>[1],
+  level: Parameters<typeof requireEffectivePermission>[2],
+): Promise<boolean> {
   try {
-    await requireEffectivePermission(ctx, 'closing', 'modify');
+    await requireEffectivePermission(ctx, area, level);
     return true;
   } catch (err) {
     if (err instanceof ServiceError && err.code === 'FORBIDDEN') return false;
     throw err;
   }
+}
+
+function canSetClosingDate(ctx: ServiceContext): Promise<boolean> {
+  return canAccess(ctx, 'closing', 'modify');
 }
 
 function effectiveStatus(row: CloseRow | null, closingDate: string | null, periodEnd: string): 'open' | 'closed' {
@@ -1044,9 +1065,16 @@ export async function runMonthEndErrorScan(
 ): Promise<{ found: number; checklist: MonthEndChecklist }> {
   assertWrite(ctx);
   const periodEnd = parsePeriodEnd(input.periodEnd);
+  const closedMsg = (d: string) => `The books are already closed through ${prettyDay(d)}. Move the closing date back to run the scan for this period.`;
+  const closing = await getClosingDateSettings(ctx);
+  if (effectiveStatus(await loadRow(ctx, periodEnd), closing.closingDate, periodEnd) === 'closed') {
+    throw validation(closedMsg(closing.closingDate!));
+  }
   const created = await detectErrors(ctx);
   await inTransaction(ctx, async (tx) => {
     const row = await loadRow(tx, periodEnd);
+    const nowClosing = await getClosingDateSettings(tx);
+    if (effectiveStatus(row, nowClosing.closingDate, periodEnd) === 'closed') throw validation(closedMsg(nowClosing.closingDate!));
     const saved = await saveRow(tx, periodEnd, row, { scanRanAt: new Date() });
     await writeAudit(tx, {
       action: row ? 'update' : 'create',
@@ -1107,6 +1135,21 @@ export async function closeMonth(ctx: ServiceContext, input: CloseMonthInput): P
   const settings = await inTransaction(ctx, async (tx) => {
     const row = await loadRow(tx, periodEnd);
     await assertVersion(tx, row, input.version);
+    // Re-check readiness against the progress as saved now (a concurrent un-review / un-skip
+    // between the check above and this transaction must not let the close through).
+    const savedSteps = (row?.steps ?? {}) as Record<string, MonthEndStepState>;
+    const stillOpen = checklist.steps.filter((st) => {
+      const state = savedSteps[st.key] ?? {};
+      const status: StepStatus = state.skipReason?.trim() ? 'skipped' : st.computedStatus;
+      return !(status !== 'attention' || state.reviewed === true || st.optional);
+    });
+    if (stillOpen.length) {
+      throw new ServiceError(
+        'VALIDATION',
+        `Finish, review or skip these steps first: ${stillOpen.map((st) => st.title).join('; ')}.`,
+        { outstanding: stillOpen.map((st) => st.key) },
+      );
+    }
     const s = await setClosingDate(tx, { closingDate: periodEnd, password: input.password });
     const saved = await saveRow(tx, periodEnd, row, { status: 'closed', closedAt: new Date(), closedBy: tx.userId });
     await writeAudit(tx, {

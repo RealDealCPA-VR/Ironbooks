@@ -54,6 +54,11 @@ vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) 
 import * as reportPackRoute from '@/app/api/month-end-close/report-pack/route';
 import * as closeRoute from '@/app/api/month-end-close/close/route';
 import * as checklistRoute from '@/app/api/month-end-close/route';
+import * as stepsRoute from '@/app/api/month-end-close/steps/route';
+
+function jsonReq(url: string, method: string, body: unknown) {
+  return new NextRequest(`http://localhost${url}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+}
 
 const PERIOD = '2026-03-31';
 const d = (s: string) => new Date(`${s}T12:00:00.000Z`);
@@ -272,7 +277,42 @@ describe('month-end close: step computations', () => {
   });
 });
 
+describe('month-end close: step visibility follows permissions', () => {
+  it('people without payroll access get the payroll step skipped; without File Utilities, no Verify Data rows', async () => {
+    for (const role of ['bookkeeper', 'banking']) {
+      const c = await getMonthEndChecklist(roleCtx(role), PERIOD);
+      const payroll = stepOf(c, 'payroll');
+      expect(payroll.status).toBe('skipped');
+      expect(payroll.statusReason).toMatch(/do not have access to payroll/);
+      expect(payroll.figures).toEqual([]);
+      const scan = stepOf(c, 'error_scan');
+      expect(scan.rows.some((r) => r.label.startsWith('Verify Data'))).toBe(false);
+      expect(scan.figures.some((f) => f.label === 'Verify Data')).toBe(false);
+      expect(scan.figures.some((f) => f.label === 'Open possible errors')).toBe(true);
+    }
+    // The owner still sees Verify Data and a payroll reason that is not about access.
+    const own = await getMonthEndChecklist(ctx, PERIOD);
+    expect(stepOf(own, 'error_scan').rows.some((r) => r.label.startsWith('Verify Data'))).toBe(true);
+    expect(stepOf(own, 'payroll').statusReason ?? '').not.toMatch(/access to payroll/);
+  });
+});
+
 describe('month-end close: saved progress', () => {
+  it('a malformed version is a 400 (validation), not a crash', async () => {
+    await expect(
+      updateMonthEndStep(ctx, { periodEnd: PERIOD, stepKey: 'bank_feed', action: 'review', version: 'garbage' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    const patch = await stepsRoute.PATCH(
+      jsonReq('/api/month-end-close/steps', 'PATCH', { periodEnd: PERIOD, stepKey: 'bank_feed', action: 'review', version: 'garbage' }),
+    );
+    expect(patch.status).toBe(400);
+    const close = await closeRoute.POST(jsonReq('/api/month-end-close/close', 'POST', { periodEnd: PERIOD, version: 'garbage' }));
+    expect(close.status).toBe(400);
+    // Nothing was saved by the refused calls.
+    const c = await getMonthEndChecklist(ctx, PERIOD);
+    expect(stepOf(c, 'bank_feed').reviewed).toBe(false);
+  });
+
   it('is stored by migration 0051 (registered as idx 51, safe to re-run)', async () => {
     const j = JSON.parse(fs.readFileSync(path.resolve('drizzle/meta/_journal.json'), 'utf8')) as {
       entries: Array<{ idx: number; tag: string }>;
@@ -390,6 +430,38 @@ describe('month-end close: closing the books', () => {
       c = await updateMonthEndStep(ctx, { periodEnd: PERIOD, stepKey: key, action: 'review', note: `Checked ${key}`, version: c.version });
     }
     expect(c.ready).toBe(true);
+
+    // A step un-reviewed by someone else after the readiness check but before the close's
+    // transaction (simulated by flipping it right as the transaction starts, keeping the version)
+    // must still block the close.
+    const [rowBefore] = await t.db
+      .select()
+      .from(monthEndCloses)
+      .where(and(eq(monthEndCloses.companyId, ctx.companyId), eq(monthEndCloses.periodEnd, PERIOD)));
+    const flipKey = c.steps.find((s) => s.reviewed && !s.optional && s.computedStatus === 'attention')!.key;
+    const flipped = { ...(rowBefore.steps as Record<string, Record<string, unknown>>) };
+    flipped[flipKey] = { ...flipped[flipKey], reviewed: false };
+    const realDb = ctx.db;
+    const racingDb = new Proxy(realDb, {
+      get(target, prop) {
+        if (prop === 'transaction') {
+          return async (fn: Parameters<typeof realDb.transaction>[0]) => {
+            await target.update(monthEndCloses).set({ steps: flipped, updatedAt: rowBefore.updatedAt }).where(eq(monthEndCloses.id, rowBefore.id));
+            return target.transaction(fn);
+          };
+        }
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+    await expect(closeMonth({ ...ctx, db: racingDb }, { periodEnd: PERIOD })).rejects.toMatchObject({
+      code: 'VALIDATION',
+      details: { outstanding: [flipKey] },
+    });
+    await t.db.update(monthEndCloses).set({ steps: rowBefore.steps, updatedAt: rowBefore.updatedAt }).where(eq(monthEndCloses.id, rowBefore.id));
+    const [co0] = await t.db.select().from(companies).where(eq(companies.id, ctx.companyId));
+    expect((co0.settings as Record<string, unknown> | null)?.closingDate).toBeUndefined();
+
     // The close version check: a stale screen is refused.
     await expect(closeMonth(ctx, { periodEnd: PERIOD, password: 'march-secret', version: '2020-01-01T00:00:00.000Z' })).rejects.toMatchObject({ code: 'CONFLICT' });
     const res = await closeMonth(ctx, { periodEnd: PERIOD, password: 'march-secret', version: c.version });
@@ -431,6 +503,15 @@ describe('month-end close: closing the books', () => {
     expect(res.closingDate).toBe(PERIOD);
     expect(res.hasPassword).toBe(true);
     expect(await verifyClosingDatePassword(t.db, ctx.companyId, 'march-secret')).toBe(true);
+  });
+
+  it('the error scan cannot be re-run for a closed period', async () => {
+    const where = and(eq(monthEndCloses.companyId, ctx.companyId), eq(monthEndCloses.periodEnd, PERIOD));
+    const [before] = await t.db.select().from(monthEndCloses).where(where);
+    await expect(runMonthEndErrorScan(ctx, { periodEnd: PERIOD })).rejects.toMatchObject({ code: 'VALIDATION' });
+    const [after] = await t.db.select().from(monthEndCloses).where(where);
+    expect(after.scanRanAt?.toISOString()).toBe(before.scanRanAt?.toISOString());
+    expect(after.updatedAt.toISOString()).toBe(before.updatedAt.toISOString());
   });
 });
 
