@@ -14,7 +14,7 @@
  * made, and new completed reconciliations (statement, the lines cleared, the service charge /
  * interest the statement added). Only statements dated on or before the dividing date.
  */
-import { and, asc, eq, gt, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, ne, sql } from 'drizzle-orm';
 import {
   accountantCopyBaseline,
   auditLogs,
@@ -432,8 +432,73 @@ async function bankAccountFor(tx: ServiceContext, glAccountId: string): Promise<
   return ba.id;
 }
 
+/**
+ * Why the accountant's reconciliation change can't go into the client's file as it is now, or null.
+ *
+ * While the copy is out the client may reconcile statements dated AFTER the dividing date — and
+ * clear lines dated on or before it (an outstanding check). A completed reconciliation of the same
+ * account with a later statement then sits on top of the accountant's (an earlier statement can't
+ * be reconciled or undone under a later one), and lines it cleared can't be cleared again. Names
+ * the cause and the way out: undo those reconciliations, import, then redo them.
+ *
+ * `undoneInFile`: reconciliations the changes file itself undoes before this change.
+ */
+export async function reconciliationBlocker(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  r: ReconciliationChange,
+  opts: { mapId: (id: string) => string; undoneInFile: Set<string>; accountLabel: string },
+): Promise<string | null> {
+  const [ba] = await ctx.db
+    .select({ id: bankAccounts.id })
+    .from(bankAccounts)
+    .where(and(eq(bankAccounts.companyId, ctx.companyId), eq(bankAccounts.accountId, opts.mapId(r.accountId))));
+  if (!ba) return null;
+  const completed = (
+    await ctx.db
+      .select({ id: reconciliations.id, statementDate: reconciliations.statementDate })
+      .from(reconciliations)
+      .where(and(eq(reconciliations.bankAccountId, ba.id), eq(reconciliations.status, 'completed'), ne(reconciliations.id, r.id)))
+  ).filter((x) => !opts.undoneInFile.has(x.id));
+  const later = completed.filter((x) => ymd(x.statementDate) > ymd(r.statementDate)).map((x) => ymd(x.statementDate)).sort();
+  let alreadyCleared = 0;
+  if (r.op === 'reconcile' && r.cleared.length && completed.length) {
+    const rows = await ctx.db
+      .select({ line: reconciliationItems.journalEntryLineId })
+      .from(reconciliationItems)
+      .where(
+        and(
+          inArray(reconciliationItems.reconciliationId, completed.map((x) => x.id)),
+          inArray(reconciliationItems.journalEntryLineId, r.cleared.map((c) => c.lineId)),
+          eq(reconciliationItems.isCleared, true),
+        ),
+      );
+    alreadyCleared = new Set(rows.map((x) => x.line)).size;
+  }
+  if (!later.length && !alreadyCleared) return null;
+  const what = r.op === 'reconcile' ? 'reconciliation' : 'undo of the reconciliation';
+  const parts: string[] = [];
+  if (later.length) {
+    parts.push(
+      `Your file has a completed reconciliation of ${opts.accountLabel} for a later statement (ending ${later.join(', ')}), ` +
+        `so your accountant's ${what} of the statement ending ${ymd(r.statementDate)} can't go in underneath it.`,
+    );
+  }
+  if (alreadyCleared) {
+    parts.push(`${alreadyCleared} of the transactions your accountant cleared are already cleared in one of your reconciliations.`);
+  }
+  const back = later.length ? later[0] : null;
+  parts.push(
+    `To import: open Reconcile for ${opts.accountLabel} and use Undo Last Reconciliation` +
+      (back ? ` until the statement ending ${back} is undone` : ' on the reconciliation that cleared them') +
+      ', import these changes, then reconcile those statements again.',
+  );
+  return parts.join(' ');
+}
+
 export async function applyReconciliation(tx: ServiceContext, r: ReconciliationChange, h: ApplyHelpers): Promise<void> {
   const bankAccountId = await bankAccountFor(tx, h.mapId(r.accountId));
+  const blocked = await reconciliationBlocker(tx, r, { mapId: h.mapId, undoneInFile: new Set(), accountLabel: 'this account' });
+  if (blocked) throw new ServiceError('CONFLICT', blocked);
   if (r.op === 'undo') {
     const [latest] = await tx.db
       .select({ id: reconciliations.id })

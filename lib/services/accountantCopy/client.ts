@@ -100,7 +100,7 @@ import {
   updateName,
   voidDoc,
 } from './docs';
-import { applicationTargets, applyApplication, applyReconciliation, describeApplication, describeReconciliation } from './extras';
+import { applicationTargets, applyApplication, applyReconciliation, describeApplication, describeReconciliation, reconciliationBlocker } from './extras';
 import { addFileLabels, labelsOf, loadLabelMaps } from './labels';
 import { resolveLineRef, type IdMap, type LineMap } from './lineRefs';
 
@@ -627,6 +627,91 @@ async function currentRecordDay(
   return (await recordStates(ctx, type, [id])).get(id)?.day ?? null;
 }
 
+const withArticle = (w: string) => `${/^[aeiou]/i.test(w) ? 'an' : 'a'} ${w}`;
+
+const DAY_TYPES = new Set<string>(['journal_entry', 'expense', 'transfer', 'deposit', ...Object.keys(DOC_LABEL)]);
+
+/** Ids of the client's forms a payment / bill payment payload applies to (dividing-date check). */
+function paymentTargets(p: Record<string, unknown>): Array<{ type: DocType; id: string }> {
+  const out: Array<{ type: DocType; id: string }> = [];
+  const arr = (k: string) => (Array.isArray(p[k]) ? (p[k] as Array<Record<string, unknown>>) : []);
+  for (const a of [...arr('applications'), ...arr('journalCredits')]) {
+    if (typeof a.invoiceId === 'string') out.push({ type: 'invoice', id: a.invoiceId });
+    if (typeof a.billId === 'string') out.push({ type: 'bill', id: a.billId });
+  }
+  for (const c of arr('credits')) {
+    if (typeof c.creditMemoId === 'string') out.push({ type: 'credit_memo', id: c.creditMemoId });
+    if (typeof c.invoiceId === 'string') out.push({ type: 'invoice', id: c.invoiceId });
+  }
+  return out;
+}
+
+/** General Journal lines a payment / bill payment payload pays, applies or offsets. */
+function paymentLineRefs(p: Record<string, unknown>): LineRef[] {
+  const out: LineRef[] = [];
+  for (const k of ['journalItems', 'journalCredits', 'journalOffsets']) {
+    if (!Array.isArray(p[k])) continue;
+    for (const x of p[k] as Array<{ line?: LineRef; chargeLine?: LineRef }>) {
+      if (x.line) out.push(x.line);
+      if (x.chargeLine) out.push(x.chargeLine);
+    }
+  }
+  return out;
+}
+
+/** Date of the client's entry holding a journal line (company-scoped; null when it isn't in this file). */
+async function journalLineDay(ctx: Pick<ServiceContext, 'db' | 'companyId'>, lineId: string): Promise<string | null> {
+  const [row] = await ctx.db
+    .select({ date: journalEntries.date })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+    .where(and(eq(journalEntryLines.id, lineId), eq(journalEntries.companyId, ctx.companyId)));
+  return row ? day(row.date) : null;
+}
+
+/**
+ * The latest date a journal line reference can land on in the client's file: the line itself when
+ * the client has it, the record that owns it when the client has that, and the date the reference
+ * carries (the import only matches lines of entries on that date).
+ */
+async function lineRefDay(ctx: Pick<ServiceContext, 'db' | 'companyId'>, ref: LineRef): Promise<string> {
+  const days = [day(ref.date)];
+  const own = await journalLineDay(ctx, ref.lineId);
+  if (own) days.push(own);
+  if (ref.owner && DAY_TYPES.has(ref.owner.type)) {
+    const cur = await currentRecordDay(ctx, ref.owner.type as TxnType | DocType, ref.owner.id);
+    if (cur) days.push(cur);
+  }
+  return days.sort().at(-1)!;
+}
+
+/**
+ * Latest date a journal entry credit application the file removes touches in the client's file:
+ * the application itself (and its pair), the entries of its lines and the invoice / bill it pays.
+ */
+async function journalApplicationDay(ctx: Pick<ServiceContext, 'db' | 'companyId'>, id: string): Promise<string | null> {
+  const [row] = await ctx.db
+    .select()
+    .from(journalItemApplications)
+    .where(and(eq(journalItemApplications.id, id), eq(journalItemApplications.companyId, ctx.companyId)));
+  if (!row) return null;
+  const rows = row.pairId
+    ? await ctx.db
+        .select()
+        .from(journalItemApplications)
+        .where(and(eq(journalItemApplications.companyId, ctx.companyId), eq(journalItemApplications.pairId, row.pairId)))
+    : [row];
+  const days: string[] = [];
+  for (const r of rows.some((x) => x.id === row.id) ? rows : [...rows, row]) {
+    days.push(day(r.date));
+    const lineDay = await journalLineDay(ctx, r.journalLineId);
+    if (lineDay) days.push(lineDay);
+    if (r.invoiceId) days.push((await currentRecordDay(ctx, 'invoice', r.invoiceId)) ?? '');
+    if (r.billId) days.push((await currentRecordDay(ctx, 'bill', r.billId)) ?? '');
+  }
+  return days.sort().at(-1) ?? null;
+}
+
 const KIND_LABEL: Record<TxnType, string> = {
   journal_entry: 'journal entry',
   expense: 'check / expense',
@@ -660,10 +745,34 @@ async function assertChangesWithinDividingDate(
     const cur = await currentRecordDay(ctx, d.type, d.id);
     if (cur && cur > copy.dividingDate) throw refuse(`${d.op === 'void' ? 'void' : 'change'} a ${DOC_LABEL[d.type].toLowerCase()}`, cur);
   }
+  // Payments and bill payments name the invoices / bills / credits / General Journal lines they
+  // apply to inside their own payload: every one must be a record dated on or before the dividing date.
+  for (const d of file.documents) {
+    if (d.op === 'void' || (d.type !== 'payment_received' && d.type !== 'bill_payment')) continue;
+    const label = DOC_LABEL[d.type].toLowerCase();
+    for (const t of paymentTargets(d.after as Record<string, unknown>)) {
+      const cur = await currentRecordDay(ctx, t.type, t.id);
+      if (cur && cur > copy.dividingDate) throw refuse(`apply a ${label} to ${withArticle(DOC_LABEL[t.type].toLowerCase())}`, cur);
+    }
+    for (const ref of paymentLineRefs(d.after as Record<string, unknown>)) {
+      const cur = await lineRefDay(ctx, ref);
+      if (cur > copy.dividingDate) throw refuse(`apply a ${label} to a journal entry line`, cur);
+    }
+  }
   for (const a of file.applications) {
     for (const t of applicationTargets(a)) {
       const cur = await currentRecordDay(ctx, t.type, t.id);
       if (cur && cur > copy.dividingDate) throw refuse(`apply a credit to or remove one from a ${DOC_LABEL[t.type].toLowerCase()}`, cur);
+    }
+    if (a.kind === 'journal' && a.op === 'apply') {
+      for (const ref of [a.line, ...(a.chargeLine ? [a.chargeLine] : [])]) {
+        const cur = await lineRefDay(ctx, ref);
+        if (cur > copy.dividingDate) throw refuse('apply a journal entry credit to or from a journal entry line', cur);
+      }
+    }
+    if (a.kind === 'journal' && a.op === 'unapply') {
+      const cur = await journalApplicationDay(ctx, a.id);
+      if (cur && cur > copy.dividingDate) throw refuse('remove a journal entry credit application', cur);
     }
   }
   for (const r of file.reconciliations) {
@@ -1135,11 +1244,14 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
   }
 
   // ---- Reconciliations ----
+  const undoneInFile = new Set<string>();
   for (const r of file.reconciliations) {
     counts.reconciliations++;
     const x = describeReconciliation(r, L);
     let problem: string | null = null;
     if (day(r.statementDate) > copy.dividingDate) problem = afterDividing;
+    // The client's own later reconciliations (after the dividing date) that sit on top of it.
+    problem ??= await reconciliationBlocker(ctx, r, { mapId: (id) => id, undoneInFile, accountLabel: L.account(r.accountId) });
     if (r.op === 'undo') {
       const [latest] = await ctx.db
         .select({ id: reconciliations.id })
@@ -1156,6 +1268,7 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
           .where(eq(reconciliations.id, r.id));
         if (!exists || exists.status !== 'completed') problem = 'That reconciliation is no longer in your file (it was undone or changed).';
       }
+      undoneInFile.add(r.id);
     }
     items.push({
       key: `reconciliation:${r.op}:${r.id}`,
@@ -1295,7 +1408,18 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
       const helpers = (c: ServiceContext) => ({
         mapId: (id: string) => idMap.get(id) ?? id,
         toDate,
-        line: (ref: LineRef) => resolveLineRef(c, ref, idMap, lineMap),
+        line: async (ref: LineRef) => {
+          const id = await resolveLineRef(c, ref, idMap, lineMap);
+          // Backstop for the dividing-date check: never land on a line of the client's later work.
+          const lineDay = await journalLineDay(c, id);
+          if (lineDay && lineDay > copy.dividingDate) {
+            throw new ServiceError(
+              'CONFLICT',
+              `The journal line it refers to is in a transaction of yours dated ${lineDay}, after the dividing date (${formatDividingDate(copy.dividingDate)}).`,
+            );
+          }
+          return id;
+        },
       });
 
       const wrap = (label: string, err: unknown): unknown => {

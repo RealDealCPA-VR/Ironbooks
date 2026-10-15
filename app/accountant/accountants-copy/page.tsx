@@ -270,6 +270,7 @@ function ClientStart({ status, onChanged }: { status: Status; onChanged: () => v
             <li>You can&apos;t add, change or void transactions dated on or before {niceDate(dividingDate) || 'the dividing date'}.</li>
             <li>You can keep entering everything dated after it.</li>
             <li>Bank statements dated on or before it can&apos;t be reconciled (or un-reconciled) — your accountant does those.</li>
+            <li>You can reconcile later statements, but if your accountant also reconciles that account, undo your later reconciliations before importing their changes (the review tells you which), then redo them.</li>
             <li>List entries (customers, vendors, items, accounts…) can&apos;t be deleted or merged, and accounts used on or before the dividing date can&apos;t be changed. You can still add new ones and edit names.</li>
           </ul>
           <p className="mt-3 text-xs text-navy/50">
@@ -372,7 +373,7 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
         <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-navy/70">
           <li>Transactions dated on or before {niceDate(copy.dividingDate)} are locked until you import your accountant&apos;s changes or cancel the copy.</li>
           <li>Keep entering transactions dated after {niceDate(copy.dividingDate)} as usual.</li>
-          <li>Statements dated on or before {niceDate(copy.dividingDate)} can&apos;t be reconciled here for now.</li>
+          <li>Statements dated on or before {niceDate(copy.dividingDate)} can&apos;t be reconciled here for now. If you reconcile a later statement of an account your accountant also reconciles, the review asks you to undo it before importing (then redo it).</li>
           <li>List entries can&apos;t be deleted or merged for now, and accounts used on or before the dividing date can&apos;t be changed.</li>
         </ul>
         <div className="mt-5 flex flex-wrap gap-2">
@@ -685,7 +686,8 @@ function AccountantSide({ copy, closingDate }: { copy: CopyRow; closingDate: str
           <li>
             Not available here, because they can&apos;t be sent back: deleting, merging or making list entries inactive, changing a list entry&apos;s type,
             accounts or place in the list, turning estimates, orders or item receipts into invoices or bills, adding billable time and costs to an
-            invoice, voiding or changing an inventory adjustment (enter a new one that corrects the quantity), refunds, bounced checks, payroll, and
+            invoice, voiding or changing an inventory adjustment (enter a new one that corrects the quantity), a quantity on hand typed on a new item
+            (save the item, then enter an inventory adjustment), refunds, bounced checks, payroll, and
             anything dated after the dividing date.
           </li>
           {closingDate && <li>The client&apos;s closing date ({niceDate(closingDate)}) still applies; changes on or before it need the closing date password.</li>}

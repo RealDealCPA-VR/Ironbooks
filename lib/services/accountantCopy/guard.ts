@@ -195,6 +195,24 @@ export async function assertAccountantMayBillCosts(ctx: Pick<ServiceContext, 'db
 }
 
 /**
+ * Accountant side: an opening quantity on hand typed on a NEW inventory item (New Item: On Hand /
+ * Total Value / As of) posts an "Opening quantity" entry and a FIFO layer that the changes file
+ * can't carry back (only the item itself travels), so the stock would be silently lost on the
+ * client's side — refused in the copy. The accountant creates the item without a quantity and
+ * enters an inventory adjustment (which travels) instead.
+ */
+export async function assertAccountantMayEnterOpeningStock(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<void> {
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (!copy || copy.side !== 'accountant' || importing(copy)) return;
+  throw new ServiceError(
+    'FORBIDDEN',
+    `A quantity on hand can't be entered on a new item in an Accountant's Copy (it can't be sent back to your client). ` +
+      `Save the item without a quantity, then enter an inventory adjustment dated on or before ${formatDividingDate(copy.dividingDate)} to add the stock — that is sent back.`,
+    { accountantCopy: true, side: copy.side, field: 'openingQuantity' },
+  );
+}
+
+/**
  * Accountant side: changing a record dated after the dividing date (applying a credit or payment
  * to an invoice / bill the client entered after it) is refused — that record belongs to the client.
  */
