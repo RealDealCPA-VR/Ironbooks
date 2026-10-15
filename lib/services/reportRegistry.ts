@@ -176,15 +176,17 @@ export function standardReportEntry(key: string) {
 }
 
 /**
- * Run a standard report by key with raw (string) parameters. Checks the report's area
- * permission (view) for the caller, applies catalog defaults, validates parameters.
+ * Validate and normalize a standard report's raw (string) parameters exactly as
+ * runStandardReport does: checks the report's area permission (view), applies catalog defaults,
+ * resolves relative dates and the default basis. Shared with the report explanations
+ * (reportDrilldown.ts / reportSummary.ts) so they see the very same options the report ran with.
  */
-export async function runStandardReport(
+export async function prepareStandardReport(
   ctx: ServiceContext,
   key: string,
   rawParams: URLSearchParams | Record<string, unknown>,
   opts?: { now?: Date },
-): Promise<StdReport> {
+): Promise<{ entry: (typeof CATALOG_BY_KEY)[string]; runner: Runner; params: ReportParams }> {
   if (!isStandardReport(key)) throw notFound('Report');
   const entry = CATALOG_BY_KEY[key];
   const runner = REPORT_RUNNERS[key];
@@ -210,8 +212,22 @@ export async function runStandardReport(
     const issue = parsed.error.issues[0];
     throw validation(`${issue?.path?.join('.') || 'Report option'}: ${issue?.message ?? 'invalid value'}`, parsed.error.issues);
   }
-  const report = await runner(ctx, parsed.data);
-  if (entry.basis) report.basis = parsed.data.basis === 'cash' ? 'cash' : 'accrual';
+  return { entry, runner, params: parsed.data };
+}
+
+/**
+ * Run a standard report by key with raw (string) parameters. Checks the report's area
+ * permission (view) for the caller, applies catalog defaults, validates parameters.
+ */
+export async function runStandardReport(
+  ctx: ServiceContext,
+  key: string,
+  rawParams: URLSearchParams | Record<string, unknown>,
+  opts?: { now?: Date },
+): Promise<StdReport> {
+  const { entry, runner, params } = await prepareStandardReport(ctx, key, rawParams, opts);
+  const report = await runner(ctx, params);
+  if (entry.basis) report.basis = params.basis === 'cash' ? 'cash' : 'accrual';
   return report;
 }
 
