@@ -124,6 +124,12 @@ export const navIntents: NavIntent[] = [
     phrases: ['went to the bank', 'deposit checks', 'deposit money', 'put money in the bank'],
   },
   {
+    label: 'Bank rules',
+    href: '/bank-rules',
+    description: 'Tell the app where repeating bank charges go, so they categorize themselves.',
+    phrases: ['always categorize', 'auto categorize', 'bank rule', 'stop asking me', 'same category every time'],
+  },
+  {
     label: 'Reconcile',
     href: '/reconcile',
     description: 'Check your books against your bank statement.',

@@ -304,6 +304,13 @@
       "breakpoints": true
     },
     {
+      "idx": 48,
+      "version": "7",
+      "when": 1781400048000,
+      "tag": "0048_bankrules",
+      "breakpoints": true
+    },
+    {
       "idx": 50,
       "version": "7",
       "when": 1781400050000,

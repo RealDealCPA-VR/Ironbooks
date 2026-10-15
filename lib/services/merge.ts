@@ -63,6 +63,7 @@ import { allowLedgerRewrite } from './posting';
 import { qbAccountTypeOf } from '@/lib/accountTypes';
 import { repointForeignKeys } from './lists/references';
 import { moveNotesAndTodos } from './lists/notes';
+import { repointBankRuleAccount } from './bankRules';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -595,6 +596,8 @@ export async function mergeAccounts(
         .where(eq(transactionRules.setAccountId, fromId))
         .returning({ id: transactionRules.id }),
     );
+    // bankrules: rule splits, learning history and "no thanks" dismissals follow the account.
+    reassigned.bankRuleLearning = await repointBankRuleAccount(tx, fromId, toId);
 
     // --- Item + vendor + tax-agency account mappings. ---
     await count(

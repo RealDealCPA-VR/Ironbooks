@@ -611,7 +611,7 @@ export async function importTransactions(
       // Apply rules to get the suggested account and any payee override.
       const match = await matchRule(
         ctx,
-        { description: txn.description, payee: undefined, amount: txn.amount },
+        { description: txn.description, payee: undefined, amount: txn.amount, bankAccountId: input.bankAccountId },
         rules,
       );
 

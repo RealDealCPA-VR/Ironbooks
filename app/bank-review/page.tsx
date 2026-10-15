@@ -18,11 +18,18 @@
  * rule suggestion and shows its calibrated confidence; low-confidence rows can "Ask AI"
  * (LLM router, existing accounts only, never auto-posted); "Auto-apply confident" posts
  * rows at/above the company threshold through the normal categorize service.
+ *
+ * Bank rules (team bankrules): every row shows ONE suggestion with a confidence % and the reason
+ * (rule > your history > AI, see /api/bank-transactions/suggestions). Tick rows and "Accept
+ * selected", or "Accept all high-confidence (>=90%)" — each line posts through the normal
+ * categorize service in its own transaction; failures are listed and skipped. Repeating a choice
+ * triggers "Always categorize SHELL OIL as Fuel?" which creates a rule in one click. Rules set to
+ * "Add automatically" run when the account is opened.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { CheckCircle, CreditCard, Inbox, Link2, Sparkles } from 'lucide-react';
+import { CheckCircle, CreditCard, Inbox, Link2, SlidersHorizontal, Sparkles } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -42,6 +49,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { mergePrefills } from '@/lib/bankRules/core';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,6 +113,44 @@ interface AiSuggestionsResponse {
   autoApplyEnabled: boolean;
 }
 
+/** bankrules: one merged suggestion per line (rule > history > AI) with confidence + reason. */
+interface LineSuggestion {
+  bankTransactionId: string;
+  pattern: string;
+  accountId: string | null;
+  accountName: string | null;
+  classId: string | null;
+  payee: string | null;
+  memo: string | null;
+  splits: { accountId: string; classId?: string | null; percent: string }[] | null;
+  confidence: number;
+  reason: string;
+  source: 'rule' | 'history' | 'ai' | null;
+  ruleId: string | null;
+  ruleName: string | null;
+}
+
+interface RuleOffer {
+  pattern: string;
+  direction: 'in' | 'out';
+  accountId: string;
+  accountName: string;
+  count: number;
+  question: string;
+}
+
+interface BulkResult {
+  accepted: { bankTransactionId: string }[];
+  failed: { bankTransactionId: string; reason: string }[];
+  offers: RuleOffer[];
+}
+
+interface ClassRow {
+  id: string;
+  name: string;
+  isActive?: boolean;
+}
+
 type ReviewTab = 'unreviewed' | 'matched' | 'excluded';
 type RowMode = 'add' | 'match';
 
@@ -135,6 +181,9 @@ export default function BankReviewPage() {
 
   // Per-row state
   const [rowAccountId, setRowAccountId] = useState<Record<string, string>>({});
+  // Rows whose account / class picker the user set by hand: suggestions never overwrite those.
+  const touchedAccount = useRef<Set<string>>(new Set());
+  const touchedClass = useRef<Set<string>>(new Set());
   const [rowMode, setRowMode] = useState<Record<string, RowMode>>({});
   const [rowCandidates, setRowCandidates] = useState<Record<string, MatchCandidate[]>>({});
   const [rowCandidateId, setRowCandidateId] = useState<Record<string, string>>({});
@@ -151,6 +200,15 @@ export default function BankReviewPage() {
     autoApplyEnabled: false,
   });
   const [askingId, setAskingId] = useState<string | null>(null);
+  // bankrules: merged suggestions, selection for bulk accept, learning offers, classes.
+  const [sugg, setSugg] = useState<Record<string, LineSuggestion>>({});
+  const [highConfidence, setHighConfidence] = useState(90);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [offers, setOffers] = useState<RuleOffer[]>([]);
+  const [bulkFailures, setBulkFailures] = useState<BulkResult['failed']>([]);
+  const [classList, setClassList] = useState<ClassRow[]>([]);
+  const [rowClassId, setRowClassId] = useState<Record<string, string>>({});
+  const [askingAll, setAskingAll] = useState(false);
   // p1 fx: exchange rate for adding feed lines of a foreign-currency account (blank = list rate).
   const [fxRate, setFxRate] = useState('');
   const feedCurrency = bankAccounts.find((b) => b.id === selectedBankAccountId)?.currency ?? null;
@@ -181,6 +239,32 @@ export default function BankReviewPage() {
     }
   }, []);
 
+  const fetchSuggestions = useCallback(async (bankAccountId: string, ai = false) => {
+    try {
+      const res = await api.get<{ suggestions: LineSuggestion[]; highConfidence: number }>(
+        `/api/bank-transactions/suggestions?bankAccountId=${bankAccountId}${ai ? '&ai=1' : ''}`,
+      );
+      const map: Record<string, LineSuggestion> = {};
+      // null = the server has nothing for this row (any older pre-fill on an untouched row goes).
+      const accts: Record<string, string | null> = {};
+      const cls: Record<string, string | null> = {};
+      for (const sg of res.suggestions) {
+        map[sg.bankTransactionId] = sg;
+        if (!sg.accountId) accts[sg.bankTransactionId] = null;
+        else if (sg.source === 'rule' || sg.confidence >= 40) accts[sg.bankTransactionId] = sg.accountId;
+        cls[sg.bankTransactionId] = sg.classId ?? null;
+      }
+      setSugg(map);
+      setHighConfidence(res.highConfidence);
+      // The latest suggestion (rules as they are now) drives every row the user has not touched;
+      // an explicit AI re-ask may also update rows the user picked.
+      setRowAccountId((prev) => mergePrefills(prev, accts, touchedAccount.current, { overrideTouched: ai }));
+      setRowClassId((prev) => mergePrefills(prev, cls, touchedClass.current));
+    } catch {
+      setSugg({});
+    }
+  }, []);
+
   const fetchTransactions = useCallback(async (bankAccountId: string) => {
     if (!bankAccountId) return;
     setLoadingTxns(true);
@@ -190,12 +274,12 @@ export default function BankReviewPage() {
       );
       setTransactions(data);
 
-      // Pre-fill per-row account selections from suggestedAccountId.
-      const initialAccounts: Record<string, string> = {};
-      for (const txn of data) {
-        if (txn.suggestedAccountId) initialAccounts[txn.id] = txn.suggestedAccountId;
-      }
-      setRowAccountId((prev) => ({ ...initialAccounts, ...prev }));
+      // No pre-fill from txn.suggestedAccountId: it was written at import time and may come from a
+      // rule switched off since. The merged suggestions below re-check the live rules.
+      setSelected(new Set());
+
+      // bankrules: merged rule / history / AI suggestion with confidence for every row.
+      await fetchSuggestions(bankAccountId);
 
       // Learned-categorizer suggestions (best-effort — the page works without them).
       try {
@@ -212,7 +296,7 @@ export default function BankReviewPage() {
         }
         setAiSugg(map);
         setAiMeta({ threshold: ai.threshold, autoApplyEnabled: ai.autoApplyEnabled });
-        setRowAccountId((prev) => ({ ...aiAccounts, ...initialAccounts, ...prev }));
+        setRowAccountId((prev) => ({ ...aiAccounts, ...prev }));
       } catch {
         setAiSugg({});
       }
@@ -255,17 +339,52 @@ export default function BankReviewPage() {
     } finally {
       setLoadingTxns(false);
     }
+  }, [fetchSuggestions]);
+
+  const fetchOffers = useCallback(async () => {
+    try {
+      const res = await api.get<{ offers: RuleOffer[] }>('/api/bank-rules/offers');
+      setOffers(res.offers);
+    } catch {
+      setOffers([]);
+    }
   }, []);
 
   useEffect(() => {
     fetchBankAccounts();
     fetchAccounts();
-  }, [fetchBankAccounts, fetchAccounts]);
+    fetchOffers();
+    api
+      .get<ClassRow[]>('/api/classes')
+      .then((rows) => setClassList(rows.filter((c) => c.isActive !== false)))
+      .catch(() => setClassList([]));
+  }, [fetchBankAccounts, fetchAccounts, fetchOffers]);
 
   useEffect(() => {
-    if (selectedBankAccountId) {
-      fetchTransactions(selectedBankAccountId);
-    }
+    if (!selectedBankAccountId) return;
+    let cancelled = false;
+    (async () => {
+      // bankrules: rules set to "Add automatically" run when the account is opened.
+      try {
+        const auto = await api.post<{ applied: unknown[]; skipped: unknown[] }>('/api/bank-rules/run', {
+          bankAccountId: selectedBankAccountId,
+        });
+        if (!cancelled && auto.applied.length > 0) {
+          toast(
+            `Your rules added ${auto.applied.length} transaction(s) automatically` +
+              (auto.skipped.length ? ` (${auto.skipped.length} could not be added)` : '') +
+              '. See Matched / Added.',
+            'success',
+          );
+        }
+      } catch {
+        // Read-only users or nothing to run — review continues normally.
+      }
+      if (!cancelled) await fetchTransactions(selectedBankAccountId);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [selectedBankAccountId, fetchTransactions]);
 
   // ------------------------------------------------------------------
@@ -290,14 +409,27 @@ export default function BankReviewPage() {
       toast('Select an account first.', 'danger');
       return;
     }
+    const sg = sugg[txn.id];
+    const keepsSuggestion = !!sg && sg.accountId === accountId;
+    const classId = rowClassId[txn.id] || null;
     withBusy(txn.id, async () => {
-      await api.post('/api/bank-transactions/categorize', {
+      const res = await api.post<{ ruleOffer: RuleOffer | null }>('/api/bank-transactions/categorize', {
         bankTransactionId: txn.id,
         accountId,
+        ...(classId ? { classId } : {}),
+        // bankrules: keep the suggestion's payee / memo / split when the user kept its account.
+        ...(keepsSuggestion && sg.payee ? { payee: sg.payee } : {}),
+        ...(keepsSuggestion && sg.memo ? { memo: sg.memo } : {}),
+        // The row class is the default for split lines that have no class of their own.
+        ...(keepsSuggestion && sg.splits ? { splits: sg.splits } : {}),
         // p1 fx: a foreign-currency account posts at the stated rate (blank = currency list rate).
         ...(feedCurrency && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
       });
       toast('Transaction added to register.', 'success');
+      if (res?.ruleOffer) {
+        const offer = res.ruleOffer;
+        setOffers((prev) => [offer, ...prev.filter((o) => !(o.pattern === offer.pattern && o.direction === offer.direction))]);
+      }
     });
   };
 
@@ -344,7 +476,11 @@ export default function BankReviewPage() {
         action: 'llm',
         bankTransactionId: txn.id,
       });
-      if (r.accountId) setRowAccountId((prev) => ({ ...prev, [txn.id]: r.accountId! }));
+      if (r.accountId) {
+        // The user asked for this row's answer: treat it as their pick.
+        touchedAccount.current.add(txn.id);
+        setRowAccountId((prev) => ({ ...prev, [txn.id]: r.accountId! }));
+      }
       setAiSugg((prev) => ({ ...prev, [txn.id]: { ...r, source: 'llm', autoApplyEligible: false } }));
       toast('AI suggestion selected — review it, then click Add.', 'info');
     } catch (err) {
@@ -376,6 +512,99 @@ export default function BankReviewPage() {
     }
   }
 
+  // ------------------------------------------------------------------
+  // bankrules: bulk accept + learning offers
+  // ------------------------------------------------------------------
+
+  async function runBulkAccept(body: Record<string, unknown>, what: string) {
+    setBulkRunning(true);
+    setBulkFailures([]);
+    try {
+      const r = await api.post<BulkResult>('/api/bank-transactions/bulk-accept', {
+        ...body,
+        ...(feedCurrency && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
+      });
+      toast(
+        `${what}: added ${r.accepted.length} transaction(s)` +
+          (r.failed.length ? `, ${r.failed.length} could not be added (listed above the table)` : '') +
+          '.',
+        r.failed.length && !r.accepted.length ? 'danger' : 'success',
+      );
+      setBulkFailures(r.failed);
+      if (r.offers) setOffers(r.offers);
+      await fetchTransactions(selectedBankAccountId);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Bulk accept failed.', 'danger');
+    } finally {
+      setBulkRunning(false);
+    }
+  }
+
+  function handleAcceptSelected() {
+    const ids = [...selected].filter((id) => unreviewedIds.has(id));
+    if (ids.length === 0) {
+      toast('Tick the transactions to accept first.', 'danger');
+      return;
+    }
+    const missing = ids.filter((id) => !rowAccountId[id]);
+    if (missing.length) {
+      toast(`${missing.length} selected transaction(s) have no account yet — choose one or untick them.`, 'danger');
+      return;
+    }
+    const items = ids.map((id) => {
+      const sg = sugg[id];
+      const accountId = rowAccountId[id];
+      const classId = rowClassId[id] || null;
+      const keeps = !!sg && sg.accountId === accountId;
+      return {
+        bankTransactionId: id,
+        accountId,
+        classId,
+        payee: keeps ? sg.payee : null,
+        memo: keeps ? sg.memo : null,
+        splits: keeps && sg.splits ? sg.splits : null,
+      };
+    });
+    runBulkAccept({ items }, 'Accept selected');
+  }
+
+  function handleAcceptHighConfidence() {
+    if (!selectedBankAccountId) return;
+    runBulkAccept({ bankAccountId: selectedBankAccountId, allHighConfidence: true }, 'Accept all high-confidence');
+  }
+
+  async function handleAskAiAll() {
+    if (!selectedBankAccountId) return;
+    setAskingAll(true);
+    try {
+      await fetchSuggestions(selectedBankAccountId, true);
+      toast('Asked the AI model about the least certain lines (only if one is set up in Settings).', 'info');
+    } finally {
+      setAskingAll(false);
+    }
+  }
+
+  async function handleOffer(o: RuleOffer, action: 'accept' | 'auto' | 'dismiss') {
+    try {
+      if (action === 'dismiss') {
+        await api.post('/api/bank-rules/offers', { action: 'dismiss', pattern: o.pattern, accountId: o.accountId, direction: o.direction });
+      } else {
+        await api.post('/api/bank-rules/offers', {
+          action: 'accept',
+          pattern: o.pattern,
+          accountId: o.accountId,
+          direction: o.direction,
+          mode: action === 'auto' ? 'auto' : 'suggest',
+        });
+        toast(`Rule created: ${o.pattern} goes to ${o.accountName}.`, 'success');
+        if (selectedBankAccountId) await fetchSuggestions(selectedBankAccountId);
+      }
+      setOffers((prev) => prev.filter((x) => !(x.pattern === o.pattern && x.direction === o.direction && x.accountId === o.accountId)));
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not save that.', 'danger');
+    }
+  }
+
   async function handleBulk(action: 'applyRules' | 'categorizeSuggested') {
     if (!selectedBankAccountId) return;
     setBulkRunning(true);
@@ -402,6 +631,19 @@ export default function BankReviewPage() {
   // ------------------------------------------------------------------
 
   const unreviewedRows = transactions.filter((t) => !t.matched && !t.excluded);
+  const unreviewedIds = new Set(unreviewedRows.map((t) => t.id));
+  const highCount = unreviewedRows.filter(
+    (t) => !!sugg[t.id]?.accountId && (sugg[t.id]?.confidence ?? 0) >= highConfidence,
+  ).length;
+  const selectedCount = [...selected].filter((id) => unreviewedIds.has(id)).length;
+  const allSelected = unreviewedRows.length > 0 && selectedCount === unreviewedRows.length;
+  const toggleRow = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const matchedRows = transactions.filter((t) => t.matched);
   const excludedRows = transactions.filter((t) => t.excluded && !t.matched);
 
@@ -475,15 +717,19 @@ export default function BankReviewPage() {
           </button>
         </div>
 
+        {/* bankrules: the merged suggestion and why */}
+        {mode === 'add' && renderSuggestionNote(txn)}
+
         {/* Mode panel */}
         {mode === 'add' ? (
           <div className="flex items-center gap-2 flex-wrap">
             <Select
               className="min-w-[180px]"
               value={rowAccountId[txn.id] ?? ''}
-              onChange={(e) =>
-                setRowAccountId((prev) => ({ ...prev, [txn.id]: e.target.value }))
-              }
+              onChange={(e) => {
+                touchedAccount.current.add(txn.id);
+                setRowAccountId((prev) => ({ ...prev, [txn.id]: e.target.value }));
+              }}
             >
               <option value="">Select account…</option>
               {allAccounts.map((a) => (
@@ -492,6 +738,24 @@ export default function BankReviewPage() {
                 </option>
               ))}
             </Select>
+            {classList.length > 0 && (
+              <Select
+                aria-label="Class"
+                className="min-w-[120px] w-auto"
+                value={rowClassId[txn.id] ?? ''}
+                onChange={(e) => {
+                  touchedClass.current.add(txn.id);
+                  setRowClassId((prev) => ({ ...prev, [txn.id]: e.target.value }));
+                }}
+              >
+                <option value="">No class</option>
+                {classList.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </Select>
+            )}
             <Button
               size="sm"
               loading={busy}
@@ -543,6 +807,34 @@ export default function BankReviewPage() {
     );
   }
 
+  /** bankrules: "Fuel · 95% sure · Matched rule "Shell"" under the account picker. */
+  function renderSuggestionNote(txn: BankTransaction) {
+    const sg = sugg[txn.id];
+    if (!sg || !sg.accountId) return null;
+    const differs = rowAccountId[txn.id] && rowAccountId[txn.id] !== sg.accountId;
+    return (
+      <div className="text-xs text-navy/60 max-w-[460px]">
+        <span className="font-semibold text-navy/80">Suggested: {sg.accountName ?? 'account'}</span>
+        {sg.splits ? ' (split)' : ''} · {sg.confidence}% sure · <span title={sg.reason}>{sg.reason}</span>
+        {differs && (
+          <>
+            {' '}
+            <button
+              type="button"
+              className="text-electric underline"
+              onClick={() => {
+                touchedAccount.current.add(txn.id);
+                setRowAccountId((prev) => ({ ...prev, [txn.id]: sg.accountId! }));
+              }}
+            >
+              Use suggestion
+            </button>
+          </>
+        )}
+      </div>
+    );
+  }
+
   /** "Ask AI" for low-confidence rows, or the AI's one-line reason after it answered. */
   function renderAiAssist(txn: BankTransaction, busy: boolean) {
     const sg = aiSugg[txn.id];
@@ -589,7 +881,20 @@ export default function BankReviewPage() {
         </span>
       );
     }
-    if (txn.suggestedAccountId) return <Badge tone="info">Suggested</Badge>;
+    const merged = sugg[txn.id];
+    if (merged && merged.accountId && !aiSugg[txn.id]?.reason) {
+      const tone = merged.confidence >= highConfidence ? 'success' : merged.confidence >= 60 ? 'info' : 'warning';
+      const label =
+        merged.source === 'rule' ? 'Rule' : merged.source === 'history' ? 'History' : 'AI';
+      return (
+        <span title={merged.reason}>
+          <Badge tone={tone}>
+            {label} {merged.confidence}%
+          </Badge>
+          <span className="sr-only">: {merged.reason}</span>
+        </span>
+      );
+    }
     const sg = aiSugg[txn.id];
     if (sg && sg.accountId && sg.source !== 'rule' && sg.confidence >= 0.4) {
       const tone =
@@ -617,7 +922,50 @@ export default function BankReviewPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Bank Review" icon={CreditCard} />
+      <PageHeader
+        title="Bank Review"
+        icon={CreditCard}
+        action={
+          <Link
+            href="/bank-rules"
+            className="inline-flex items-center justify-center gap-2 rounded-lg font-semibold bg-white text-navy border border-slate-200 hover:bg-slate-50 px-3 py-1.5 text-sm"
+          >
+            <SlidersHorizontal className="h-4 w-4" aria-hidden="true" /> Bank rules
+          </Link>
+        }
+      />
+
+      {/* bankrules: learning offers ("Always categorize SHELL OIL as Fuel?") */}
+      {offers.length > 0 && (
+        <Card className="p-4 mb-6" aria-live="polite">
+          <h2 className="text-sm font-bold text-navy mb-2 flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-electric" aria-hidden="true" /> Make it automatic?
+          </h2>
+          <ul className="divide-y divide-slate-100">
+            {offers.slice(0, 5).map((o) => (
+              <li key={`${o.pattern}|${o.direction}|${o.accountId}`} className="py-2 flex flex-wrap items-center gap-2">
+                <span className="flex-1 min-w-[220px] text-sm text-navy">
+                  {o.question} <span className="text-xs text-navy/50">(you chose it {o.count} times)</span>
+                </span>
+                <Button size="sm" onClick={() => handleOffer(o, 'accept')}>
+                  Yes, create rule
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => handleOffer(o, 'auto')}>
+                  Yes, and add automatically
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => handleOffer(o, 'dismiss')}>
+                  No thanks
+                </Button>
+              </li>
+            ))}
+          </ul>
+          {offers.length > 5 && (
+            <Link href="/bank-rules" className="text-xs text-electric underline">
+              {offers.length - 5} more on the Bank rules page
+            </Link>
+          )}
+        </Card>
+      )}
 
       {/* ------------------------------------------------------------------ */}
       {/* Bank account selector + bulk actions                                 */}
@@ -637,10 +985,16 @@ export default function BankReviewPage() {
                 onChange={(e) => {
                   setSelectedBankAccountId(e.target.value);
                   setRowAccountId({});
+                  touchedAccount.current = new Set();
+                  touchedClass.current = new Set();
                   setRowMode({});
                   setRowCandidates({});
                   setRowCandidateId({});
                   setAiSugg({});
+                  setSugg({});
+                  setRowClassId({});
+                  setSelected(new Set());
+                  setBulkFailures([]);
                 }}
               >
                 {bankAccounts.length === 0 && (
@@ -658,6 +1012,32 @@ export default function BankReviewPage() {
           </div>
 
           <div className="flex items-center gap-2 flex-wrap">
+            <Button
+              size="sm"
+              disabled={bulkRunning || !selectedBankAccountId || highCount === 0}
+              onClick={handleAcceptHighConfidence}
+              title="Add every line whose suggestion is at least this sure, each through the normal review step"
+            >
+              <CheckCircle className="h-4 w-4" /> Accept all high-confidence (≥{highConfidence}%) ({highCount})
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={bulkRunning || selectedCount === 0}
+              onClick={handleAcceptSelected}
+            >
+              Accept selected ({selectedCount})
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              loading={askingAll}
+              disabled={bulkRunning || !selectedBankAccountId}
+              onClick={handleAskAiAll}
+              title="Ask the AI model you set up (Settings → AI & Automation) about the least certain lines"
+            >
+              <Sparkles className="h-4 w-4" /> Ask AI about unsure lines
+            </Button>
             <Button
               variant="secondary"
               size="sm"
@@ -753,6 +1133,21 @@ export default function BankReviewPage() {
           />
         ) : (
           <>
+          {bulkFailures.length > 0 && tab === 'unreviewed' && (
+            <div role="alert" className="mb-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <div className="font-semibold mb-1">These lines could not be added — fix them one by one:</div>
+              <ul className="list-disc pl-5">
+                {bulkFailures.map((f) => {
+                  const t = transactions.find((x) => x.id === f.bankTransactionId);
+                  return (
+                    <li key={f.bankTransactionId}>
+                      {t ? `${formatDate(t.date)} ${t.payee || t.description || ''}` : 'Transaction'}: {f.reason}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
           {feedCurrency && tab === 'unreviewed' && (
             <div className="flex flex-wrap items-center gap-3 px-4 py-3 border-b border-slate-100 text-sm text-navy/70">
               <span>
@@ -775,6 +1170,17 @@ export default function BankReviewPage() {
           <Table>
             <thead>
               <Tr>
+                {tab === 'unreviewed' && (
+                  <Th>
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-electric"
+                      aria-label="Select all transactions to review"
+                      checked={allSelected}
+                      onChange={() => setSelected(allSelected ? new Set() : new Set(unreviewedRows.map((t) => t.id)))}
+                    />
+                  </Th>
+                )}
                 <Th>Date</Th>
                 <Th>Description / Payee</Th>
                 <Th numeric>Amount</Th>
@@ -789,6 +1195,17 @@ export default function BankReviewPage() {
 
                 return (
                   <Tr key={txn.id} className={txn.matched ? 'opacity-70' : undefined}>
+                    {tab === 'unreviewed' && (
+                      <Td>
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 accent-electric"
+                          aria-label={`Select ${txn.payee || txn.description || 'transaction'} ${formatDate(txn.date)}`}
+                          checked={selected.has(txn.id)}
+                          onChange={() => toggleRow(txn.id)}
+                        />
+                      </Td>
+                    )}
                     {/* Date */}
                     <Td className="whitespace-nowrap text-sm">{formatDate(txn.date)}</Td>
 

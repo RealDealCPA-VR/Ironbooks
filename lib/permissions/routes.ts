@@ -390,6 +390,15 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/bank-transactions/match': r('banking', 'POST:modify'),
   '/api/bank-transactions/unmatch': r('banking', 'POST:modify'),
   '/api/rules': r('banking', 'GET POST'),
+  // bankrules: self-learning bank feed rules, suggestions with confidence, bulk accept.
+  '/api/bank-rules': r('banking', 'GET POST'),
+  '/api/bank-rules/[id]': r('banking', 'GET PUT DELETE'),
+  '/api/bank-rules/reorder': r('banking', 'POST:modify'),
+  '/api/bank-rules/test': r('banking', 'POST:view'),
+  '/api/bank-rules/offers': r('banking', 'GET POST'),
+  '/api/bank-rules/run': r('banking', 'POST'),
+  '/api/bank-transactions/suggestions': r('banking', 'GET'),
+  '/api/bank-transactions/bulk-accept': r('banking', 'POST'),
   // AI categorization of bank feed lines (team ai): auto-apply posts through categorize.
   '/api/ai/bank-suggestions': r('banking', 'GET POST'),
   '/api/ai/categorizer': r('banking', 'GET POST:modify'),
@@ -665,6 +674,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/registers': 'banking',
   '/bank-feeds': 'banking',
   '/bank-review': 'banking',
+  '/bank-rules': 'banking',
   '/deposits': 'banking',
   '/transactions': 'banking',
   '/reconcile': 'accounting',
