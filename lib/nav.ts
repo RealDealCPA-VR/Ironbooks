@@ -36,6 +36,7 @@ import { Bell, CalendarDays, Contact, Mail, LayoutTemplate } from 'lucide-react'
 // p1 ux: Simple mode
 import { Home, PenLine, FilePlus2 } from 'lucide-react';
 import { Inbox } from 'lucide-react'; // team home: Needs attention inbox
+import { ScanLine } from 'lucide-react'; // receipt capture
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -95,6 +96,7 @@ export const navGroups: NavGroup[] = [
       { icon: Receipt, label: 'Enter Bills', path: '/bills', qb: 'Enter Bills', keywords: 'bill vendor invoice owe' },
       { icon: HandCoins, label: 'Pay Bills', path: '/pay-bills', qb: 'Pay Bills', keywords: 'pay vendor supplier' },
       { icon: Banknote, label: 'Write Checks', path: '/expenses', qb: 'Write Checks', keywords: 'check cheque expense spend debit card purchase' },
+      { icon: ScanLine, label: 'Receipts', path: '/receipts', qb: 'Doc Center (receipts)', keywords: 'receipt photo scan snap ocr phone upload capture' },
       { icon: RotateCcw, label: 'Vendor Credits', path: '/vendor-credits', qb: 'Enter Credit from Vendor', keywords: 'vendor refund return' },
       { icon: Percent, label: 'Pay Sales Tax', path: '/sales-tax', qb: 'Pay Sales Tax', keywords: 'sales tax liability agency remit' }, // p1 purchases
       { icon: Printer, label: 'Print Checks', path: '/print-checks', qb: 'Print Checks', keywords: 'print cheques' },
@@ -228,6 +230,7 @@ export const simpleNavGroups: NavGroup[] = [
       { icon: Home, label: 'Home', path: '/dashboard', qb: 'Home page', keywords: 'dashboard start' },
       { icon: Inbox, label: 'Needs attention', path: '/attention', qb: 'Company Snapshot alerts', keywords: 'inbox alerts urgent caught up' },
       { icon: ClipboardCheck, label: 'To Do list', path: '/todos', qb: 'To Do List', keywords: 'task reminder' },
+      { icon: ScanLine, label: 'Receipts', path: '/receipts', qb: 'Doc Center (receipts)', keywords: 'receipt photo scan snap phone' },
     ],
   },
   {

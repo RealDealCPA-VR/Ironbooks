@@ -187,6 +187,11 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Click "New check", pick the bank account, the payee and the expense.',
     qb: 'Write Checks',
   },
+  '/receipts': {
+    title: 'Receipts',
+    what: 'Photos and PDFs of receipts waiting to be entered. Ironbooks reads them on this computer and fills in a new expense or bill for you to check.',
+    first: 'Drag a receipt anywhere in the app, or click Add receipts or Send from your phone.',
+  },
   '/vendor-credits': {
     title: 'Vendor Credits',
     what: 'A credit from a vendor (for a return or overcharge) that lowers what you owe them.',

@@ -161,6 +161,8 @@ describe('API permission map coverage', () => {
         '/api/portal/login',
         '/api/portal/logout',
         '/api/portal/me',
+        // Receipt capture phone link: token-scoped (one company, 15 min, limited uploads, add-only).
+        '/api/receipts/mobile/[token]',
         '/api/unlock',
       ].sort(),
     );

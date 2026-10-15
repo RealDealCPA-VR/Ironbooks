@@ -108,6 +108,20 @@ at once (further sign-ins over the network are refused until someone logs out).
   The company data stays on the host. A client never backs up, hosts or updates on the host's
   behalf.
 
+## Receipts (photos and PDFs)
+
+- Receipts are read **on this computer**: PDF text with pdf.js, photos with the bundled offline
+  text recognition (tesseract.js; the engine and English language data ship with the app, nothing
+  is downloaded). A company can instead pick its own AI model on this computer, the LAN or the
+  tailnet (an Ollama vision model). Photos are never sent to a cloud AI service, even when cloud
+  AI is turned on, because a picture cannot be redacted.
+- **Send receipts from your phone** makes a QR code for a link that works for one company only,
+  for 15 minutes and up to 20 uploads, and can be turned off early. Only a hash of the link's
+  secret is stored. The phone needs to reach this computer over the tailnet (multi-user hosting).
+  The link can only add files to that company's receipts inbox; it can't read anything. Guessing
+  links is rate-limited, and files are checked by their content (photos and PDFs only, up to
+  15 MB).
+
 ## Data at rest
 
 - The company file is a local PGlite (embedded Postgres) folder.

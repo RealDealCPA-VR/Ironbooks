@@ -304,6 +304,13 @@
       "breakpoints": true
     },
     {
+      "idx": 50,
+      "version": "7",
+      "when": 1781400050000,
+      "tag": "0050_receipts",
+      "breakpoints": true
+    },
+    {
       "idx": 54,
       "version": "7",
       "when": 1781400054000,
