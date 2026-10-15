@@ -21,6 +21,9 @@
  *
  * `applyToForm(patched, fix)` copies the changed request-body paths back into the form's state
  * so what the user sees matches what was saved. Errors without fixes just toast as before.
+ * An error WITH fixes is shown once: in the inline panel (no toast repeating it, so screen readers
+ * announce it once). A form that does not render `fixer.panel` passes `{ panel: false }` and gets
+ * the Fix buttons on the toast instead (lib/errorFixFlow.ts).
  * `offer` shows fixes the form computed itself (checks run before saving, e.g. a payment applied
  * beyond an invoice's balance).
  */
@@ -29,7 +32,8 @@ import { useRouter } from 'next/navigation';
 import { Wrench, X } from 'lucide-react';
 import { Button, toastError } from '@/components/ui';
 import { errorFixes } from '@/lib/client';
-import { retryPayloads, type ErrorFix } from '@/lib/errorFixes';
+import { type ErrorFix } from '@/lib/errorFixes';
+import { reportMode, runFix } from '@/lib/errorFixFlow';
 import { describeError, type FriendlyError } from '@/lib/friendlyErrors';
 
 export interface ErrorFixPanelProps {
@@ -124,7 +128,8 @@ interface FixState<P> {
   ctx: FixContext<P>;
 }
 
-export function useErrorFixes<P>() {
+export function useErrorFixes<P>(opts: { panel?: boolean } = {}) {
+  const hasPanel = opts.panel !== false;
   const router = useRouter();
   const [state, setState] = React.useState<FixState<P> | null>(null);
   const [busyId, setBusyId] = React.useState<string | null>(null);
@@ -149,44 +154,44 @@ export function useErrorFixes<P>() {
     }
     const f = describeError(err, ctx.fallback);
     setState({ problem: { title: f.title, message: f.message, nextStep: f.nextStep }, fixes, ctx });
-    toastError(err, ctx.fallback, { onFix: (fix) => applyRef.current(fix) });
+    // Shown once: the inline panel is the alert; only forms without one toast the Fix buttons.
+    if (reportMode(fixes.length, hasPanel) === 'toast-with-fixes') {
+      toastError(err, ctx.fallback, { onFix: (fix) => applyRef.current(fix) });
+    }
     return true;
-  }, []);
+  }, [hasPanel]);
 
   /** Show fixes the form computed itself (a check that runs before saving). */
   const offer = React.useCallback(
     (problem: { title: string; message: string; nextStep?: string }, fixes: ErrorFix[], ctx: FixContext<P>) => {
       setState({ problem: { nextStep: '', ...problem }, fixes, ctx });
+      if (reportMode(fixes.length, hasPanel) === 'toast-with-fixes') {
+        // No inline panel on this form: the toast carries the Fix buttons.
+        toastError(Object.assign(new Error(problem.message), { fixes }), problem.message, {
+          onFix: (fix) => applyRef.current(fix),
+        });
+      }
     },
-    [],
+    [hasPanel],
   );
 
   const apply = React.useCallback(
     async (fix: ErrorFix) => {
       const cur = stateRef.current;
       if (!cur) return;
-      if (fix.kind === 'navigate') {
-        if (fix.href) router.push(fix.href);
-        return;
-      }
-      const { patched, sent } = retryPayloads(cur.ctx.payload, fix.patch, cur.ctx.prepare);
-      cur.ctx.applyToForm?.(patched, fix);
-      setBusyId(fix.id);
-      try {
-        await cur.ctx.resubmit(sent);
-        setState(null);
-      } catch (err) {
+      await runFix(fix, cur.ctx, {
+        navigate: (href) => router.push(href),
+        setBusy: setBusyId,
+        onSaved: () => setState(null),
         // Report against the body the server actually saw, so its patch indexes match.
-        report(err, { ...cur.ctx, payload: sent });
-      } finally {
-        setBusyId(null);
-      }
+        onError: (err, sent) => report(err, { ...cur.ctx, payload: sent }),
+      });
     },
     [router, report],
   );
   applyRef.current = (fix) => void apply(fix);
 
-  const panel = state ? (
+  const panel = state && hasPanel ? (
     <ErrorFixPanel
       className="mb-4"
       problem={state.problem}

@@ -44,14 +44,14 @@ import {
 } from '@/lib/purchasesClient';
 import { useErrorFixes } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
-import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { getPath, missingClassCheck, missingClassFixes, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { amountMessage, collectErrors, dateMessage, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
 
 /** Body sent to /api/bills (fix patches address its paths, e.g. "billNumber", "lines.0.accountId"). */
 type BillBody = Record<string, unknown>;
 // wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
-import { confirmTransactionDate } from '@/lib/formPrefs';
+import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
@@ -84,6 +84,7 @@ interface BillDetailLine {
   description: string | null;
   quantity: string;
   amount: string;
+  classId?: string | null;
   // Advanced Inventory detail (present only when stored for the line)
   siteId?: string | null;
   binId?: string | null;
@@ -119,6 +120,11 @@ interface Item {
   trackingMode?: string | null;
 }
 
+interface ClassRow {
+  id: string;
+  name: string;
+}
+
 type LineMode = 'expense' | 'item';
 
 interface LineRow {
@@ -132,6 +138,8 @@ interface LineRow {
   unitCost: string;
   // Shared
   description: string;
+  /** Class (class tracking); '' = none. */
+  classId: string;
   /** Advanced Inventory: receiving site / bin / serials / lot (inventory item lines). */
   inv?: InvDetail;
 }
@@ -171,7 +179,7 @@ function statusLabel(status: Bill['status']): string {
 // ---------------------------------------------------------------------------
 
 function emptyLine(mode: LineMode = 'expense'): LineRow {
-  return { mode, accountId: '', amount: '', itemId: '', quantity: '', unitCost: '', description: '' };
+  return { mode, accountId: '', amount: '', itemId: '', quantity: '', unitCost: '', description: '', classId: '' };
 }
 
 /** Display amount for a line: explicit amount (expense) or qty x cost (item). */
@@ -192,6 +200,7 @@ export default function BillsPage() {
   const prefs = usePreferences();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [items, setItems] = useState<Item[]>([]);
+  const [classes, setClasses] = useState<ClassRow[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Modal state — editingId set means the modal is editing an existing bill.
@@ -241,13 +250,15 @@ export default function BillsPage() {
     async function init() {
       setLoading(true);
       try {
-        const [billData, vendorData, accountData, itemData] = await Promise.all([
+        const [billData, vendorData, accountData, itemData, classData] = await Promise.all([
           api.get<Bill[]>('/api/bills'),
           api.get<Vendor[]>('/api/vendors'),
           api.get<Account[]>('/api/accounts'),
           api.get<{ items: Item[] }>('/api/items'),
+          api.get<ClassRow[]>('/api/classes').catch(() => [] as ClassRow[]),
         ]);
         setBills(billData);
+        setClasses(classData);
         setVendors(vendorData);
         setAccounts(accountData);
         setItems(itemData.items ?? []);
@@ -361,6 +372,7 @@ export default function BillsPage() {
                   quantity: String(qty),
                   unitCost: String(parseFloat(unitCost.toFixed(4))),
                   description: l.description ?? '',
+                  classId: l.classId ?? '',
                   inv: invFromLine(l),
                 };
               }
@@ -372,6 +384,7 @@ export default function BillsPage() {
                 quantity: '',
                 unitCost: '',
                 description: l.description ?? '',
+                classId: l.classId ?? '',
               };
             }),
       );
@@ -478,7 +491,7 @@ export default function BillsPage() {
       else if (op.path === 'billNumber') setBillNumber(typeof value === 'string' ? value : '');
       else {
         const lp = parseLinePath(op.path);
-        if (lp?.collection === 'lines' && (lp.field === 'accountId' || lp.field === 'amount')) {
+        if (lp?.collection === 'lines' && (lp.field === 'accountId' || lp.field === 'amount' || lp.field === 'classId')) {
           updateLine(lp.index, { [lp.field]: typeof value === 'string' ? value : '' });
         }
       }
@@ -527,24 +540,37 @@ export default function BillsPage() {
                 quantity: l.quantity,
                 unitCost: l.unitCost,
                 description: l.description.trim() || undefined,
+                classId: l.classId || undefined,
                 ...inventoryLinePayload(l.inv),
               }
             : {
                 accountId: l.accountId,
                 description: l.description.trim() || undefined,
                 amount: l.amount,
+                classId: l.classId || undefined,
               },
         ),
       };
+      const ctx = {
+        payload,
+        resubmit: send,
+        applyToForm,
+        fallback: editingId ? 'Failed to update bill.' : 'Failed to create bill.',
+      };
+      // Class tracking "warn when a transaction has no class" (lib/formPrefs.ts): offer fixes
+      // instead of a yes/no box — use the class already on another line (or the only class), or
+      // save without one.
+      const classless = classWarningApplies(null, prefs)
+        ? missingClassCheck(payload.lines as { classId?: string }[], classes)
+        : null;
+      if (classless) {
+        fixer.offer({ title: classless.title, message: classless.message }, missingClassFixes(classless), ctx);
+        return;
+      }
       try {
         await send(payload);
       } catch (err) {
-        fixer.report(err, {
-          payload,
-          resubmit: send,
-          applyToForm,
-          fallback: editingId ? 'Failed to update bill.' : 'Failed to create bill.',
-        });
+        fixer.report(err, ctx);
       }
     }
   }
@@ -955,6 +981,24 @@ export default function BillsPage() {
                         />
                       </div>
                     </>
+                  )}
+
+                  {/* Class (shown while class tracking is on, or when the line already has one) */}
+                  {(prefs.company.classTrackingEnabled || line.classId) && (
+                    <div className="w-28 shrink-0">
+                      <Select
+                        value={line.classId}
+                        onChange={(e) => updateLine(idx, { classId: e.target.value })}
+                        aria-label={`Line ${idx + 1} class`}
+                      >
+                        <option value="">Class…</option>
+                        {classes.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
                   )}
 
                   {/* Remove */}

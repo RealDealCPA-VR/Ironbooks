@@ -49,7 +49,7 @@ import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { useErrorFixes } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y } from '@/components/FieldError';
-import { applyFixPatch, balanceFixes, missingClassFixes, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { applyFixPatch, balanceFixes, formLineUpdates, missingClassCheck, missingClassFixes, type ErrorFix } from '@/lib/errorFixes';
 import { collectErrors, dateMessage, requiredMessage } from '@/lib/fieldValidation';
 
 // ---------------------------------------------------------------------------
@@ -316,21 +316,18 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
 
   /** Copy a fix's changes (request-body paths) back onto the form. */
   const applyToForm = (patched: JournalPayload, fix: ErrorFix) => {
-    for (const op of fix.patch ?? []) {
-      if (op.path === 'date' && typeof patched.date === 'string') setDate(patched.date);
-      const lp = parseLinePath(op.path);
-      if (!lp || lp.collection !== 'lines') continue;
-      const id = payloadLineIds[lp.index];
-      const pl = patched.lines[lp.index];
-      if (id === undefined || !pl) continue;
-      setLines((prev) =>
-        prev.map((l) =>
-          l.id === id
-            ? { ...l, accountId: pl.accountId, debit: pl.debit ?? '', credit: pl.credit ?? '', classId: pl.classId ?? '' }
-            : l,
-        ),
-      );
-    }
+    if ((fix.patch ?? []).some((op) => op.path === 'date') && typeof patched.date === 'string') setDate(patched.date);
+    const updates = formLineUpdates<JournalPayload['lines'][number], number>(fix, patched, 'lines', payloadLineIds);
+    if (updates.length === 0) return;
+    const byId = new Map(updates.map((u) => [u.key, u.line]));
+    setLines((prev) =>
+      prev.map((l) => {
+        const pl = byId.get(l.id);
+        return pl
+          ? { ...l, accountId: pl.accountId, debit: pl.debit ?? '', credit: pl.credit ?? '', classId: pl.classId ?? '' }
+          : l;
+      }),
+    );
   };
 
   /** Post / update. Throws on failure (the fix presenter shows it). */
@@ -381,16 +378,11 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
     const ctx = { payload, resubmit: send, applyToForm, fallback: 'Failed to save entry.' };
     // Class tracking "warn when a line has no class" (lib/formPrefs.ts): offer fixes instead of a
     // yes/no box — use the class already on another line, or save without one.
-    const classless = payload.lines.flatMap((l, i) => (l.classId ? [] : [`lines.${i}.classId`]));
-    if (classless.length && classWarningApplies(null, prefs)) {
-      const used = payload.lines.find((l) => l.classId)?.classId;
-      const suggested = classes.find((c) => c.id === used) ?? (classes.length === 1 ? classes[0] : null);
+    const classless = classWarningApplies(null, prefs) ? missingClassCheck(payload.lines, classes) : null;
+    if (classless) {
       fixer.offer(
-        {
-          title: 'Some lines have no class',
-          message: `${classless.length === 1 ? 'One line has' : `${classless.length} lines have`} no class, and your preferences ask for one.`,
-        },
-        missingClassFixes({ paths: classless, suggested: suggested ? { id: suggested.id, name: suggested.name } : null }),
+        { title: 'Some lines have no class', message: classless.message },
+        missingClassFixes(classless),
         ctx,
       );
       return;

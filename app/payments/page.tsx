@@ -24,14 +24,14 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
-import { formatCurrency, toDecimal } from '@/lib/money';
+import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useNewParam } from '@/lib/useFocusParam';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 // wave2 prefs: Payments > auto-apply / auto-calculate / Undeposited Funds; date warnings
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate } from '@/lib/formPrefs';
-import { autoApplyPayment, cashDue, sumApplied } from '@/lib/paymentApply';
+import { appliedExceedsReceived, autoApplyPayment, cashApplied, cashDue, moneyDec as dec, sumApplied, sumMoney } from '@/lib/paymentApply';
 import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
 import {
@@ -50,15 +50,6 @@ type PaymentBody = Record<string, unknown> & {
   journalItems: Array<{ journalLineId: string; amount: string }>;
 };
 
-/** Decimal of an entered amount; blank or not-a-number counts as 0 (field validation reports those). */
-function dec(v: string | number | null | undefined) {
-  try {
-    return toDecimal(v || 0);
-  } catch {
-    return toDecimal(0);
-  }
-}
-
 /** What the API receives: only real applications (a fix may set one to 0.00). */
 function cleanPaymentBody(body: PaymentBody): PaymentBody {
   return {
@@ -66,11 +57,6 @@ function cleanPaymentBody(body: PaymentBody): PaymentBody {
     applications: body.applications.filter((a) => dec(a.amountApplied).greaterThan(0) || dec(a.discountAmount).greaterThan(0)),
     journalItems: body.journalItems.filter((j) => dec(j.amount).greaterThan(0)),
   };
-}
-
-/** Decimal sum of entered amounts (blank counts as 0). */
-function sumMoney(values: ReadonlyArray<string | number | null | undefined>) {
-  return values.reduce<ReturnType<typeof toDecimal>>((s, v) => s.plus(dec(v)), dec(0));
 }
 
 // ---------------------------------------------------------------------------
@@ -772,11 +758,12 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         return true;
       }
     }
-    if (appliedTotal > Number(amount || 0) + 0.005) {
+    // Same exact Decimal comparison the server makes (no float tolerance).
+    if (appliedExceedsReceived(body, amount)) {
       fixer.offer(
         {
           title: 'You applied more than you received',
-          message: `The amounts applied (${formatCurrency(appliedTotal.toFixed(2))}) are more than the amount received (${formatCurrency(amount || '0')}).`,
+          message: `The amounts applied (${formatCurrency(cashApplied(body).toFixed(2))}) are more than the amount received (${formatCurrency(amount || '0')}).`,
         },
         appliedExceedsPaymentFixes({
           paymentAmount: amount || '0',
@@ -1401,13 +1388,14 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
   async function handleApply() {
     if (!payment) return;
     if (applications.length === 0) { toast('Enter an amount to apply.', 'danger'); return; }
-    if (appliedTotal > unapplied + 0.005) {
+    // Exact Decimal comparisons, like the server (no float tolerance).
+    if (sumMoney(applications.map((a) => a.amountApplied)).greaterThan(dec(payment.unapplied))) {
       toast('Total applied exceeds the unapplied balance.', 'danger');
       return;
     }
     for (const a of applications) {
       const inv = invoices.find((i) => i.id === a.invoiceId);
-      if (inv && Number(a.amountApplied) > Number(inv.balanceDue) + 0.005) {
+      if (inv && dec(a.amountApplied).greaterThan(dec(inv.balanceDue))) {
         toast(`Invoice #${invNo(inv)} only owes ${money(inv.balanceDue, cur)}.`, 'danger');
         return;
       }

@@ -15,7 +15,10 @@ import {
   friendlyDate,
   getPath,
   missingAccountFixes,
+  missingClassCheck,
   missingClassFixes,
+  formLineUpdates,
+  progressOverbillFixes,
   negativeStockFixes,
   negativeStockMessage,
   nextDay,
@@ -365,5 +368,97 @@ describe('retrying a fix (pure)', () => {
       overrideCreditLimit: true,
     });
     expect(stickyFlags({}, ['checkStock'])).toEqual({});
+  });
+});
+
+describe('formLineUpdates (fix paths → the form rows they came from)', () => {
+  it('journal: the payload skips lines without an account, so payload index ≠ form index', () => {
+    // Form rows (ids 11..14); row 12 has no account and is not sent → payloadLineIds = [11, 13, 14].
+    const payloadLineIds = [11, 13, 14];
+    const patched = {
+      lines: [
+        { accountId: 'a', debit: '100.00', credit: undefined },
+        { accountId: 'b', debit: undefined, credit: '60.00' },
+        { accountId: 'c', debit: undefined, credit: '40.00' }, // fix added $40 to body line 2
+      ],
+    };
+    const fix = { patch: [{ op: 'add' as const, path: 'lines.2.credit', amount: '40.00' }] };
+    const ups = formLineUpdates<(typeof patched.lines)[number], number>(fix, patched, 'lines', payloadLineIds);
+    expect(ups).toEqual([{ key: 14, index: 2, field: 'credit', line: patched.lines[2] }]);
+  });
+
+  it('invoice: lineIdx maps body lines to form rows (blank rows skipped)', () => {
+    const lineIdx = [0, 2, 5];
+    const patched = { lines: [{ quantity: 1 }, { quantity: '3' }, { quantity: 2, taxRateId: undefined }] };
+    const fix = {
+      patch: [
+        { op: 'set' as const, path: 'lines.1.quantity', value: '3' },
+        { op: 'remove' as const, path: 'lines.2.taxRateId' },
+        { op: 'set' as const, path: 'refNumber', value: 'INV-9' }, // header path: not a line
+        { op: 'set' as const, path: 'applications.0.amountApplied', value: '1' }, // other collection
+      ],
+    };
+    const ups = formLineUpdates<Record<string, unknown>, number>(fix, patched, 'lines', lineIdx);
+    expect(ups.map((u) => [u.key, u.field])).toEqual([
+      [2, 'quantity'],
+      [5, 'taxRateId'],
+    ]);
+    expect(ups[0].line.quantity).toBe('3');
+  });
+
+  it('ignores indexes with no form row or no patched line', () => {
+    const fix = { patch: [{ op: 'set' as const, path: 'lines.3.classId', value: 'x' }] };
+    expect(formLineUpdates(fix, { lines: [{}, {}] }, 'lines', [0, 1, 2, 3])).toEqual([]);
+    expect(formLineUpdates(fix, { lines: [{}, {}, {}, {}] }, 'lines', [0, 1])).toEqual([]);
+    expect(formLineUpdates(fix, { lines: 'nope' }, 'lines', [0, 1, 2, 3])).toEqual([]);
+    expect(formLineUpdates({}, { lines: [] }, 'lines', [])).toEqual([]);
+  });
+
+  it('a missing-class fix maps every classless line back (bill / expense / journal)', () => {
+    const lines = [{ classId: 'c1' }, { classId: null }, {}];
+    const check = missingClassCheck(lines, [{ id: 'c1', name: 'East' }, { id: 'c2', name: 'West' }])!;
+    const [use] = missingClassFixes(check);
+    const patched = applyFixPatch({ lines }, use.patch);
+    const ups = formLineUpdates<{ classId?: string | null }, number>(use, patched, 'lines', [0, 1, 2]);
+    expect(ups.map((u) => [u.key, u.line.classId])).toEqual([
+      [1, 'c1'],
+      [2, 'c1'],
+    ]);
+  });
+});
+
+describe('missingClassCheck', () => {
+  const classes = [
+    { id: 'c1', name: 'East' },
+    { id: 'c2', name: 'West' },
+  ];
+  it('null when every line has a class', () => {
+    expect(missingClassCheck([{ classId: 'c1' }, { classId: 'c2' }], classes)).toBeNull();
+  });
+  it('suggests the class already on another line', () => {
+    const r = missingClassCheck([{ classId: undefined }, { classId: 'c2' }], classes)!;
+    expect(r.paths).toEqual(['lines.0.classId']);
+    expect(r.suggested).toEqual({ id: 'c2', name: 'West' });
+    expect(r.message).toBe('One line has no class, and your preferences ask for one.');
+    expect(missingClassFixes(r).map((f) => f.label)).toEqual(['Use class West', 'Save without a class']);
+  });
+  it('suggests the only class, or none when there are several and no line has one', () => {
+    expect(missingClassCheck([{}, {}], [classes[0]])!.suggested).toEqual(classes[0]);
+    const none = missingClassCheck([{}, { classId: '' }], classes)!;
+    expect(none.suggested).toBeNull();
+    expect(none.paths).toEqual(['lines.0.classId', 'lines.1.classId']);
+    expect(none.message).toBe('2 lines have no class, and your preferences ask for one.');
+    expect(missingClassFixes(none).map((f) => f.id)).toEqual(['class-skip']);
+  });
+  it('a class id that is not in the list is not suggested', () => {
+    expect(missingClassCheck([{ classId: 'gone' }, {}], [])!.suggested).toBeNull();
+  });
+});
+
+describe('progressOverbillFixes', () => {
+  it('Save anyway sets allowOverBilling (a sticky invoice flag)', () => {
+    const [f] = progressOverbillFixes();
+    expect(f).toMatchObject({ id: 'progress-overbill-allow', kind: 'retry' });
+    expect(stickyFlags(f, ['overrideCreditLimit', 'allowOverBilling', 'checkStock'])).toEqual({ allowOverBilling: true });
   });
 });

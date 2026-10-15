@@ -213,6 +213,44 @@ export function parseLinePath(path: string): { collection: string; index: number
   return m ? { collection: m[1], index: Number(m[2]), field: m[3] } : null;
 }
 
+/** A form row a fix changed: the form's own row key, the request-body line and the field. */
+export interface FormLineUpdate<L, K> {
+  /** The form row (its id, index, ...) the request-body line came from. */
+  key: K;
+  /** Index in the request body's collection. */
+  index: number;
+  /** Field the fix changed ("credit", "classId", ...). */
+  field: string;
+  /** The patched request-body line. */
+  line: L;
+}
+
+/**
+ * Map a fix's line paths ("lines.2.credit") back to the form rows they came from. Forms usually
+ * send only some of their rows (blank rows are skipped), so `rowKeys[i]` names the form row behind
+ * request-body line i (the journal's line ids, the invoice's row indexes, ...). Paths in other
+ * collections, or with no matching row / patched line, are ignored.
+ */
+export function formLineUpdates<L, K>(
+  fix: Pick<ErrorFix, 'patch'>,
+  patched: unknown,
+  collection: string,
+  rowKeys: readonly K[],
+): FormLineUpdate<L, K>[] {
+  const out: FormLineUpdate<L, K>[] = [];
+  const list = getPath(patched, collection);
+  if (!Array.isArray(list)) return out;
+  for (const op of fix.patch ?? []) {
+    const lp = parseLinePath(op.path);
+    if (!lp || lp.collection !== collection) continue;
+    if (lp.index >= rowKeys.length) continue;
+    const line = list[lp.index] as L | undefined;
+    if (line === undefined || line === null) continue;
+    out.push({ key: rowKeys[lp.index], index: lp.index, field: lp.field, line });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Builders: each returns the fixes for one common error (Decimal-exact)
 // ---------------------------------------------------------------------------
@@ -416,6 +454,19 @@ export function creditLimitFixes(opts: { customerId?: string | null } = {}): Err
   return fixes;
 }
 
+/** Billing more than 100% of an estimate line: save anyway with the existing override (audited). */
+export function progressOverbillFixes(): ErrorFix[] {
+  return [
+    {
+      id: 'progress-overbill-allow',
+      kind: 'retry',
+      label: 'Bill more than the estimate anyway',
+      patch: [{ op: 'set', path: 'allowOverBilling', value: true }],
+      hint: 'Billing past the estimate is recorded in the audit trail.',
+    },
+  ];
+}
+
 /** A required account left empty: use the default account. */
 export function missingAccountFixes(opts: {
   paths: readonly string[];
@@ -438,6 +489,34 @@ export function missingAccountFixes(opts: {
       patch: opts.paths.map((p) => ({ op: 'set' as const, path: p, value: opts.account!.id })),
     },
   ];
+}
+
+/**
+ * The lines of a request body that have no class (for "warn when a transaction has no class"),
+ * plus the class to suggest: the one already used on another line, or the company's only class.
+ * Null when every line has a class. Forms pass the result to `missingClassFixes`.
+ */
+export function missingClassCheck(
+  lines: readonly { classId?: string | null }[],
+  classes: readonly { id: string; name: string }[],
+  collection = 'lines',
+): {
+  paths: string[];
+  suggested: { id: string; name: string } | null;
+  title: string;
+  message: string;
+} | null {
+  const paths = lines.flatMap((l, i) => (l.classId ? [] : [`${collection}.${i}.classId`]));
+  if (paths.length === 0) return null;
+  const used = lines.find((l) => l.classId)?.classId;
+  const found = classes.find((c) => c.id === used) ?? (classes.length === 1 ? classes[0] : null);
+  const n = paths.length;
+  return {
+    paths,
+    suggested: found ? { id: found.id, name: found.name } : null,
+    title: n === 1 && lines.length === 1 ? 'This line has no class' : 'Some lines have no class',
+    message: `${n === 1 ? 'One line has' : `${n} lines have`} no class, and your preferences ask for one.`,
+  };
 }
 
 /** Lines without a class while "warn when a transaction has no class" is on. */

@@ -17,7 +17,8 @@ import { and, eq } from 'drizzle-orm';
 import path from 'node:path';
 import fs from 'node:fs';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, companies, customers, items, users, vendors } from '@/lib/db/schema';
+import { accounts, companies, customers, items, journalEntryLines, users, vendors } from '@/lib/db/schema';
+import { reclassifyLines } from './accountant/reclassify';
 import { applyFixPatch, type ErrorFix } from '@/lib/errorFixes';
 import { type ServiceContext, ServiceError } from './_base';
 import { createCompany } from './company';
@@ -28,7 +29,8 @@ import { receivePayment } from './payments';
 import { createDeposit } from './deposits';
 import { createExpense } from './expenses';
 import { createBill } from './bills';
-import { payBills } from './billPayments';
+import { payBills, payBillsWithCredits } from './billPayments';
+import { overBillingError } from './estimateBilling';
 import { assertStockAvailable, findStockShortfalls } from './stockWarning';
 import { defaultAccountFor, missingAccountFixesForIssues } from './errorFixes';
 
@@ -172,6 +174,47 @@ describe('error fixes (server-side)', () => {
     // A NEW transaction dated in the closed period still gets the move fix.
     const fresh = await caught(createInvoice(ctx, julInput));
     expect(fresh.fixes?.map((f) => f.id)).toContain('period-move-date');
+  });
+
+  it('reclassifying a line whose entry is in a closed period: no "move the date" fix', async () => {
+    const entry = await createManualEntry(ctx, {
+      date: new Date('2026-01-12'),
+      description: 'Reclass me',
+      lines: [
+        { accountId: acct['6300'], debit: '9.00' },
+        { accountId: acct['1000'], credit: '9.00' },
+      ],
+    });
+    const [line] = await db
+      .select({ id: journalEntryLines.id })
+      .from(journalEntryLines)
+      .where(and(eq(journalEntryLines.journalEntryId, entry.id), eq(journalEntryLines.accountId, acct['6300'])));
+    await setSettings({ closingDate: '2026-01-31' });
+    try {
+      // Closing date: only the password (the entry's date is not the user's to change here).
+      const err = await caught(reclassifyLines(ctx, { lineIds: [line.id], newAccountId: acct['6100'] }));
+      expect(err.code).toBe('PERIOD_CLOSED');
+      expect(err.fixes?.map((f) => f.id)).toEqual(['period-password']);
+    } finally {
+      await setSettings({ closingDate: null });
+    }
+    // Closed fiscal period: reopen it — still no "move the date".
+    const dec = await createManualEntry(ctx, {
+      date: new Date('2025-12-12'),
+      description: 'Reclass me too',
+      lines: [
+        { accountId: acct['6300'], debit: '4.00' },
+        { accountId: acct['1000'], credit: '4.00' },
+      ],
+    });
+    const [decLine] = await db
+      .select({ id: journalEntryLines.id })
+      .from(journalEntryLines)
+      .where(and(eq(journalEntryLines.journalEntryId, dec.id), eq(journalEntryLines.accountId, acct['6300'])));
+    await closePeriod(ctx, { periodStart: new Date('2025-12-01'), periodEnd: new Date('2025-12-31') });
+    const closed = await caught(reclassifyLines(ctx, { lineIds: [decLine.id], newAccountId: acct['6100'] }));
+    expect(closed.code).toBe('PERIOD_CLOSED');
+    expect(closed.fixes?.map((f) => f.id)).toEqual(['period-reopen']);
   });
 
   it('duplicate invoice number: next free number or keep it', async () => {
@@ -325,6 +368,38 @@ describe('error fixes (server-side)', () => {
     const exact = fixById(err, 'apply-exact');
     expect(exact.patch).toEqual([{ op: 'set', path: 'applications.0.amountApplied', value: '45.50' }]);
     await expect(payBills(ctx, applyFixPatch(input, exact.patch))).resolves.toBeTruthy();
+  });
+
+  it('Pay Bills duplicate check number: next check number (reference) or keep it — no client confirm needed', async () => {
+    const b1 = await createBill(ctx, { vendorId, date: new Date('2026-06-09'), lines: [{ accountId: acct['6300'], amount: '11.00' }] });
+    const b2 = await createBill(ctx, { vendorId, date: new Date('2026-06-09'), lines: [{ accountId: acct['6300'], amount: '12.00' }] });
+    const base = {
+      vendorId,
+      date: new Date('2026-06-10'),
+      method: 'check' as const,
+      paymentAccountId: acct['1000'],
+      reference: '7001',
+      checkDuplicateNumber: true,
+    };
+    await payBillsWithCredits(ctx, { ...base, applications: [{ billId: b1.id, amountApplied: '11.00' }] });
+    const input = { ...base, applications: [{ billId: b2.id, amountApplied: '12.00' }] };
+    const err = await caught(payBillsWithCredits(ctx, input));
+    expect(err.code).toBe('CONFLICT');
+    const next = fixById(err, 'docnum-next');
+    expect(next.patch).toEqual([{ op: 'set', path: 'reference', value: '7002' }]);
+    // "Keep it anyway" sets the request flag the route maps to checkDuplicateNumber: false.
+    expect(fixById(err, 'docnum-keep').patch).toEqual([{ op: 'set', path: 'allowDuplicateNumber', value: true }]);
+    const paid = await payBillsWithCredits(ctx, applyFixPatch(input, next.patch));
+    expect(paid.payment?.reference).toBe('7002');
+  });
+
+  it('billing past an estimate (PROGRESS_OVERBILL) carries a "Save anyway" fix → allowOverBilling', () => {
+    const err = overBillingError([
+      { lineId: 'l1', description: 'Framing', estimateAmount: '100.00', invoicedToDate: '80.00', thisInvoice: '40.00', percentBilled: '120.00' },
+    ]);
+    const allow = fixById(err, 'progress-overbill-allow');
+    expect(allow.kind).toBe('retry');
+    expect(applyFixPatch({ customerId: 'c' } as Record<string, unknown>, allow.patch)).toEqual({ customerId: 'c', allowOverBilling: true });
   });
 
   it('deposit / Undeposited Funds mismatch: take already-deposited payments off; deposit to a bank', async () => {

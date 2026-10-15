@@ -15,6 +15,7 @@ import { and, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
 import { estimateLines, estimates, invoiceLines, invoices } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError } from './_base';
+import { progressOverbillFixes } from '@/lib/errorFixes';
 
 /** Soft-warning code for billing more than 100% of an estimate line. */
 export const PROGRESS_OVERBILL_WARNING = 'PROGRESS_OVERBILL';
@@ -136,6 +137,7 @@ export function overBillingError(over: OverBilledLine[]) {
     'VALIDATION',
     `This invoice would bill more than 100% of the estimate for ${names}. Save anyway?`,
     { warning: PROGRESS_OVERBILL_WARNING, lines: over },
+    progressOverbillFixes(),
   );
 }
 

@@ -40,7 +40,6 @@ import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
 import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
-import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 // wave2 prefs: Checking > default account for Pay Bills
 import { usePreferences } from '@/lib/usePreferences';
 
@@ -466,14 +465,10 @@ export default function PayBillsPage() {
 
   /** Save a Pay Bills batch. Throws on failure (the fix presenter shows it). */
   async function sendPay(body: BillPaymentBody) {
-    const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-      api.post('/api/bill-payments', { ...body, allowDuplicateNumber }),
-    );
+    // A duplicate check number comes back with Fix buttons ("Use the next check number" /
+    // "Keep it anyway" → allowDuplicateNumber), like every other error on this screen.
+    await api.post('/api/bill-payments', body);
     payFixer.clear();
-    if (saved === null) {
-      await loadVendorData(vendorId);
-      return;
-    }
     const paidCount = body.applications.length + ((body.journalItems as unknown[] | undefined)?.length ?? 0);
     const cash = body.applications.reduce((sum, a) => sum + num(a.amountApplied), 0);
     toast(
@@ -576,10 +571,8 @@ export default function PayBillsPage() {
   async function sendEdit(id: string, body: BillPaymentBody) {
     setSavingEdit(true);
     try {
-      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-        api.patch(`/api/bill-payments/${id}`, { ...body, allowDuplicateNumber }),
-      );
-      if (saved === null) return;
+      // Duplicate check number → the server's docnum-next / docnum-keep fixes in the Fix panel.
+      await api.patch(`/api/bill-payments/${id}`, body);
       editFixer.clear();
       toast('Payment updated.', 'success');
       setEditPay(null);

@@ -56,13 +56,13 @@ import { usePreferences } from '@/lib/usePreferences';
 import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
-import { getPath, missingClassFixes, parseLinePath, stickyFlags, type ErrorFix } from '@/lib/errorFixes';
+import { getPath, missingClassFixes, formLineUpdates, stickyFlags, type ErrorFix } from '@/lib/errorFixes';
 import { collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
 
 /** Body sent to /api/invoices (fix patches address its paths, e.g. "refNumber", "lines.2.quantity"). */
 type InvoiceBody = Record<string, unknown>;
 /** Request flags a fix can set that have no field on the invoice form. */
-const INVOICE_FIX_FLAGS = ['overrideCreditLimit', 'checkStock'] as const;
+const INVOICE_FIX_FLAGS = ['overrideCreditLimit', 'allowOverBilling', 'checkStock'] as const;
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
@@ -405,7 +405,6 @@ function InvoiceModal({
   const [exchangeRate, setExchangeRate] = useState('');
   const [memo, setMemo] = useState('');
   const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
-  const creditLimit = useCreditLimitConfirm();
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [saving, setSaving] = useState(false);
   const [saveAsPending, setSaveAsPending] = useState(false);
@@ -814,15 +813,12 @@ function InvoiceModal({
       else if (op.path === 'refNumber') setRefNumber(str);
       else if (op.path === 'taxRateId') setTaxRateId(str);
       else if (op.path === 'classId') setClassId(str);
-      else {
-        const lp = parseLinePath(op.path);
-        if (lp?.collection === 'lines' && lp.field === 'quantity' && lineIdx[lp.index] !== undefined) {
-          updateLine(lineIdx[lp.index], { quantity: str });
-        } else if (lp?.collection === 'lines' && lp.field === 'taxRateId' && lineIdx[lp.index] !== undefined && !str) {
-          // "Remove the sales tax": the line no longer charges tax.
-          updateLine(lineIdx[lp.index], { taxable: false });
-        }
-      }
+    }
+    for (const u of formLineUpdates<Record<string, unknown>, number>(fix, patched, 'lines', lineIdx)) {
+      const v = u.line[u.field];
+      if (u.field === 'quantity') updateLine(u.key, { quantity: v == null ? '' : String(v) });
+      // "Remove the sales tax": the line no longer charges tax.
+      else if (u.field === 'taxRateId' && (v == null || v === '')) updateLine(u.key, { taxable: false });
     }
   }
 
@@ -830,12 +826,11 @@ function InvoiceModal({
   async function send(payload: InvoiceBody) {
     setSaving(true);
     try {
-      // Over the customer's credit limit → "Save anyway?" (recorded in the audit trail).
-      const saved = await creditLimit.run((override, allowOverBilling) => {
-        const body = { ...payload, overrideCreditLimit: override || payload.overrideCreditLimit === true, allowOverBilling };
-        return editing ? api.patch(`/api/invoices/${editing.id}`, body) : api.post('/api/invoices', body);
-      });
-      if (saved === undefined) return; // user chose not to go over the limit
+      // Over the customer's credit limit / past the estimate: the server's CREDIT_LIMIT and
+      // PROGRESS_OVERBILL warnings carry "Save anyway" fixes (overrideCreditLimit /
+      // allowOverBilling, both audited), shown in the Fix panel like every other error.
+      if (editing) await api.patch(`/api/invoices/${editing.id}`, payload);
+      else await api.post('/api/invoices', payload);
       const shownNumber = (payload.refNumber as string | undefined) || editing?.refNumber || editing?.invoiceNumber;
       if (editing) {
         toast(`Invoice #${shownNumber} updated.`, 'success');
@@ -1148,7 +1143,6 @@ function InvoiceModal({
 
         {/* Shipping + print/email queue (wave2 sales) */}
         <ShippingSection value={ship} onChange={setShip} shipTos={custDefaults?.shipTos} idPrefix="inv-ship" />
-        {creditLimit.dialog}
 
         {/* Custom fields (company-defined) */}
         {customFieldDefs.length > 0 && (

@@ -49,11 +49,11 @@ import { useNewParam } from '@/lib/useFocusParam';
 import { type PurchaseVendor, vendorPrefillAccountIds } from '@/lib/purchasesClient';
 import { useErrorFixes } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
-import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { getPath, missingClassCheck, missingClassFixes, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { amountMessage, collectErrors, dateMessage, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
 // wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
-import { confirmTransactionDate } from '@/lib/formPrefs';
+import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 
@@ -504,6 +504,25 @@ function ExpensesPageContent() {
     // "Use the next free check number" / "Keep it anyway" fixes.
 
     {
+      const bodyLines = lines.map((l) =>
+        l.mode === 'item'
+          ? {
+              itemId: l.itemId,
+              quantity: l.quantity,
+              unitCost: l.unitCost || undefined,
+              amount: l.unitCost ? undefined : l.amount || undefined,
+              description: l.description.trim() || undefined,
+              classId: l.classId || undefined,
+              customerId: l.customerId || undefined,
+            }
+          : {
+              accountId: l.accountId,
+              description: l.description.trim() || undefined,
+              amount: l.amount,
+              classId: l.classId || undefined,
+              customerId: l.customerId || undefined,
+            },
+      );
       const body: ExpenseBody = {
         vendorId,
         payeeName: freePayee || undefined,
@@ -520,30 +539,21 @@ function ExpensesPageContent() {
         paymentAccountId,
         memo: memo.trim() || undefined,
         exchangeRate: docCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
-        lines: lines.map((l) =>
-          l.mode === 'item'
-            ? {
-                itemId: l.itemId,
-                quantity: l.quantity,
-                unitCost: l.unitCost || undefined,
-                amount: l.unitCost ? undefined : l.amount || undefined,
-                description: l.description.trim() || undefined,
-                classId: l.classId || undefined,
-                customerId: l.customerId || undefined,
-              }
-            : {
-                accountId: l.accountId,
-                description: l.description.trim() || undefined,
-                amount: l.amount,
-                classId: l.classId || undefined,
-                customerId: l.customerId || undefined,
-              },
-        ),
+        lines: bodyLines,
       };
+      const ctx = { payload: body, resubmit: send, applyToForm, fallback: 'Failed to save expense.' };
+      // Class tracking "warn when a transaction has no class" (lib/formPrefs.ts): offer fixes
+      // instead of a yes/no box — use the class already on another line (or the only class), or
+      // save without one.
+      const classless = classWarningApplies(null, prefs) ? missingClassCheck(bodyLines, classes) : null;
+      if (classless) {
+        fixer.offer({ title: classless.title, message: classless.message }, missingClassFixes(classless), ctx);
+        return;
+      }
       try {
         await send(body);
       } catch (err) {
-        fixer.report(err, { payload: body, resubmit: send, applyToForm, fallback: 'Failed to save expense.' });
+        fixer.report(err, ctx);
       }
     }
   }
