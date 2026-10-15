@@ -370,6 +370,19 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Check the automatic backup schedule, then click "Back up now" to make a copy today.',
     qb: 'Back Up Company / Restore Previous Local Backup',
   },
+  // ---- Accountant's Copy (I1) / Period Copy (I7) ----
+  '/accountant/accountants-copy': {
+    title: "Accountant's Copy",
+    what: 'Send your books to your accountant while you keep working. They fix things dated on or before a dividing date; you keep entering everything after it, then bring their changes in after reviewing them.',
+    first: 'Pick the dividing date and create the copy. When the changes come back, import them here.',
+    qb: "Accountant's Copy",
+  },
+  '/accountant/period-copy': {
+    title: 'Period Copy',
+    what: 'A separate copy of your company file that shows only one period, for an auditor: opening balances for everything before it and nothing after it. Your own file is not changed.',
+    first: 'Pick the first and last day of the period and click "Create Period Copy".',
+    qb: 'Period Copy',
+  },
 };
 
 /** The help for a path (longest matching prefix, so /registers/abc gets the Registers help). */

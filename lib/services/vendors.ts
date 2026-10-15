@@ -18,6 +18,7 @@ import { getPreferences } from './preferences';
 import { maskForContext } from './access';
 import { resolvePartyTerms } from './lists/fields';
 import { type VendorPurchaseFieldsInput, resolveVendorPurchaseFields } from './vendorPurchaseFields';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -245,6 +246,7 @@ export async function updateVendor(
  * lists and cannot be selected for new documents.
  */
 export async function deactivateVendor(ctx: ServiceContext, id: string) {
+  await assertListDeleteAllowed(ctx, 'delete', 'vendors'); // Accountant's Copy (I1)
   const before = await loadVendor(ctx, id);
 
   const [row] = await ctx.db

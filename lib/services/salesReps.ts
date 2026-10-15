@@ -16,6 +16,7 @@ import { invoices, salesReps } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { assertClosedPeriodEdit } from './postedEdit';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -187,6 +188,7 @@ export async function updateSalesRep(
 // ---------------------------------------------------------------------------
 
 export async function deactivateSalesRep(ctx: ServiceContext, id: string) {
+  await assertListDeleteAllowed(ctx, 'delete', 'sales reps'); // Accountant's Copy (I1)
   const existing = await getSalesRep(ctx, id);
   if (!existing.isActive) return existing;
 

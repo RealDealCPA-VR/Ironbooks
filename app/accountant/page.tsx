@@ -14,6 +14,7 @@ import {
   Ban,
   Percent,
 } from 'lucide-react';
+import { ArrowRightLeft, CalendarRange } from 'lucide-react'; // Accountant's Copy (I1), Period Copy (I7)
 import { Badge, Card, PageHeader, Table, Td, Th, Tr } from '@/components/ui';
 import { getPageContext } from '@/lib/context';
 import { formatCurrency } from '@/lib/money';
@@ -31,6 +32,8 @@ const TOOLS = [
   { href: '/accountant/list-changes', icon: ListChecks, title: 'Review List Changes', text: 'See what changed in accounts, items, customers, vendors and payroll items.' },
   { href: '/accountant/fix-sales-tax', icon: ShieldAlert, title: 'Fix Incorrectly Recorded Sales Tax', text: 'Find sales tax paid by check or journal entry and tie it to the right agency.' },
   { href: '/accountant/sales-tax-adjustment', icon: SlidersHorizontal, title: 'Adjust Sales Tax Due', text: 'Record a discount, rounding, penalty or interest against an agency.' },
+  { href: '/accountant/accountants-copy', icon: ArrowRightLeft, title: "Accountant's Copy", text: 'Send the books to your accountant with a dividing date, then review and import their changes.' },
+  { href: '/accountant/period-copy', icon: CalendarRange, title: 'Period Copy', text: 'A company file with only one period (opening balances, nothing after) for an auditor.' },
 ];
 
 const REPORTS = [

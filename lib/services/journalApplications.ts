@@ -45,6 +45,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { isSubledgerSource } from './posting';
 import { assertPeriodOpen } from './fiscalPeriods';
+import { assertAccountantMayApplyJournalItems } from './accountantCopy/guard';
 import { getHomeCurrencyCode } from './currencies';
 import { journalOpenItems, resolveEntityNames } from './journal';
 import { markPaidAmount } from './invoices';
@@ -667,6 +668,7 @@ export async function applyJournalCredit(
     throw validation('Pick the invoice, bill or General Journal charge to apply the credit to.');
   }
   return inTransaction(ctx, async (tx) => {
+    await assertAccountantMayApplyJournalItems(tx);
     await assertPeriodOpen(tx, date);
     let rows: ApplicationRow[];
     if (input.chargeLineId) {
@@ -724,6 +726,7 @@ export async function applyJournalCredit(
  */
 export async function unapplyJournalApplication(ctx: ServiceContext, applicationId: string) {
   return inTransaction(ctx, async (tx) => {
+    await assertAccountantMayApplyJournalItems(tx);
     const [app] = await tx.db
       .select()
       .from(journalItemApplications)
@@ -776,6 +779,7 @@ export async function applyPaymentToJournalCharges(
   input: { paymentId: string; items: JournalItemPaymentInput[] },
 ) {
   return inTransaction(ctx, async (tx) => {
+    await assertAccountantMayApplyJournalItems(tx);
     const [payment] = await tx.db
       .select()
       .from(paymentsReceived)

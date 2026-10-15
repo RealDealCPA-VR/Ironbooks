@@ -23,6 +23,7 @@ import { journalBalancesByEntity } from './journal';
 import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
 import { getPreferences } from './preferences';
 import { defaultShipTo, normalizeShipToAddresses, shipToAddressFields, type ShipToAddress } from '@/lib/shipTo';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 /** Validate the named ship-to list; the default one also becomes `shippingAddress`. */
 function resolveShipTos(list: Array<Partial<ShipToAddress>> | null | undefined): ShipToAddress[] | null {
@@ -395,6 +396,7 @@ export async function updateCustomer(
  * in active customer pick-lists.
  */
 export async function deactivateCustomer(ctx: ServiceContext, id: string) {
+  await assertListDeleteAllowed(ctx, 'delete', 'customers'); // Accountant's Copy (I1)
   const before = await getCustomer(ctx, id);
 
   const [row] = await ctx.db

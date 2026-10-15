@@ -21,6 +21,7 @@ import { Money } from '@/lib/money';
 import { billingRateLevelSchema } from '@/lib/validation/lists';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { isReferenced } from './references';
+import { assertListDeleteAllowed } from '../accountantCopy/guard';
 
 function parseOrThrow<T>(r: { success: true; data: T } | { success: false; error: { issues: Array<{ path: (string | number)[]; message: string }> } }): T {
   if (r.success) return r.data;
@@ -122,6 +123,7 @@ export async function updateBillingRateLevel(ctx: ServiceContext, id: string, bo
 
 /** Delete when no one uses the level, otherwise deactivate. */
 export async function deleteBillingRateLevel(ctx: ServiceContext, id: string) {
+  await assertListDeleteAllowed(ctx, 'delete', 'billing rate levels'); // Accountant's Copy (I1)
   const before = await getBillingRateLevel(ctx, id);
   // Its own per-item rates are part of the level, not a "use" of it.
   const assigned =

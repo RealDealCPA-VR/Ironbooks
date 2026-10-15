@@ -54,6 +54,7 @@ import {
 import { can } from '@/lib/permissions/model';
 import { apiRuleFor } from '@/lib/permissions/routes';
 import { permissionDenied } from './access';
+import { assertAccountantCopyAllowsPath } from './accountantCopy/routeGate';
 import {
   type ServiceContext,
   ServiceError,
@@ -1321,6 +1322,8 @@ export async function performUndo(ctx: ServiceContext, token: string): Promise<U
   const entityId = tok.entityId;
   const [path, method] = inversePermission(a, kind, entityId);
   assertRoutePermission(ctx, path, method);
+  // Accountant's Copy (accountant side): only undo what the copy could have saved itself.
+  await assertAccountantCopyAllowsPath(ctx.db, ctx.companyId, path);
 
   const result = await inTransaction(ctx, async (tx) => {
     // Claim the token first: a second click (or a second tab) finds nothing to claim.

@@ -21,6 +21,7 @@ import { pageHelpFor } from '@/lib/pageHelp';
 import type { Area } from '@/lib/permissions/model';
 import { blockingFeatureGate, featureHiddenPaths, multiCurrencyHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
+import AccountantCopyBanner from './AccountantCopyBanner';
 import PreferenceBehaviors from './PreferenceBehaviors';
 import AttentionBadge from './AttentionBadge'; // team home: count on the "Needs attention" link
 import UndoToast from './UndoToast';
@@ -711,6 +712,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           <CompanyChip company={company} onCompany={setCompany} />
         </header>
         <BackupWarningBanner />
+        <AccountantCopyBanner pathname={pathname} />
         {blockedGate ? <FeatureOff gate={blockedGate} /> : children}
       </main>
       <CommandPalette />

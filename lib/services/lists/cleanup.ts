@@ -30,6 +30,7 @@ import {
 } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, writeAudit } from '../_base';
 import { findReferences } from './references';
+import { assertListDeleteAllowed } from '../accountantCopy/guard';
 
 export type CleanupList =
   | 'customers' | 'vendors' | 'items' | 'classes' | 'other-names' | 'job-types' | 'terms'
@@ -125,6 +126,7 @@ export async function runCleanup(
   ctx: ServiceContext,
   opts: { lists?: CleanupList[]; ids?: string[] } = {},
 ) {
+  await assertListDeleteAllowed(ctx, 'delete', 'list entries'); // Accountant's Copy (I1)
   const lists = opts.lists?.length ? opts.lists : CLEANUP_LIST_KEYS;
   const only = opts.ids ? new Set(opts.ids.map((i) => i.toLowerCase())) : null;
   const removed: CleanupCandidate[] = [];

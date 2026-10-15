@@ -39,6 +39,7 @@ import {
 } from '@/lib/validation/lists';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { isReferenced } from './references';
+import { assertListDeleteAllowed } from '../accountantCopy/guard';
 
 export const SIMPLE_LIST_KEYS = [
   'other-names',
@@ -422,6 +423,7 @@ export async function removeEntry(
   key: SimpleListKey,
   id: string,
 ): Promise<{ deleted: boolean; deactivated: boolean }> {
+  await assertListDeleteAllowed(ctx, 'delete', 'list entries'); // Accountant's Copy (I1)
   const def = DEFS[key];
   const before = await getEntry(ctx, key, id);
   const used = await isReferenced(ctx, def.tableName, id);

@@ -153,6 +153,7 @@ export async function assertClosedPeriodEdit(
   let entryNumber: number | null = null;
   let description: string | null = null;
   let sourceRef: string | null = null;
+  let knownSource = false;
   if (params.entryId) {
     const [entry] = await ctx.db
       .select()
@@ -163,10 +164,11 @@ export async function assertClosedPeriodEdit(
       entryNumber = entry.entryNumber ?? null;
       description = entry.description ?? null;
       sourceRef = entry.sourceRef ?? null;
+      knownSource = true;
     }
   }
   if (!date) return;
-  const check = await assertPeriodOpen(ctx, date);
+  const check = await assertPeriodOpen(ctx, date, knownSource ? { sourceRef } : {});
   if (params.entryId) {
     await recordClosingDateException(ctx, check, {
       entryId: params.entryId,

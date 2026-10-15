@@ -65,6 +65,7 @@ import {
 } from '@/lib/pricingShared';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { requirePermission } from './access';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // Types and constants shared with the UI live in lib/pricingShared.ts (no DB imports).
 export * from '@/lib/pricingShared';
@@ -600,6 +601,7 @@ export async function updatePriceLevel(ctx: ServiceContext, id: string, input: P
 
 /** Delete a price level: unassigns it from customers and removes its item prices. */
 export async function deletePriceLevel(ctx: ServiceContext, id: string) {
+  await assertListDeleteAllowed(ctx, 'delete', 'price levels'); // Accountant's Copy (I1)
   const before = await loadLevel(ctx, id);
   await inTransaction(ctx, async (tx) => {
     await tx.db
