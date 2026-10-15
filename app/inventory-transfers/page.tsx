@@ -25,6 +25,7 @@ import {
   Th,
   Tr,
   toast,
+  useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatDate } from '@/lib/utils';
@@ -235,6 +236,13 @@ function NewTransferModal({
 
   const toBins = adv.bins.filter((b) => b.siteId === toSiteId && b.isActive);
 
+  // Line grid keys: Enter / Down next line (adds one at the end), Up previous, Ctrl+Insert insert,
+  // Ctrl+D delete (the last remaining line is kept, as with the remove button).
+  const addLine = useCallback(() => setLines((p) => [...p, emptyLine()]), []);
+  const insertLine = useCallback((at: number) => setLines((p) => [...p.slice(0, at), emptyLine(), ...p.slice(at)]), []);
+  const removeLine = useCallback((idx: number) => setLines((p) => (p.length > 1 ? p.filter((_, i) => i !== idx) : p)), []);
+  const grid = useGridKeys({ addRow: addLine, insertRow: insertLine, removeRow: removeLine, disabled: saving });
+
   function update(idx: number, patch: Partial<LineRow>) {
     setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
   }
@@ -353,16 +361,16 @@ function NewTransferModal({
             <Label className="mb-0">Items</Label>
             <div className="flex items-center gap-2">
               <BarcodeScanInput onItem={addScanned} />
-              <Button size="sm" variant="ghost" onClick={() => setLines((p) => [...p, emptyLine()])}>
+              <Button size="sm" variant="ghost" onClick={addLine}>
                 <PlusCircle className="h-4 w-4" /> Add line
               </Button>
             </div>
           </div>
-          <div className="space-y-2">
+          <div className="space-y-2" onKeyDown={grid.onKeyDown}>
             {lines.map((line, idx) => {
               const item = items.find((i) => i.id === line.itemId);
               return (
-                <div key={idx} className="space-y-1 rounded-lg border border-slate-200 p-2">
+                <div key={idx} data-grid-row className="space-y-1 rounded-lg border border-slate-200 p-2">
                   <div className="grid grid-cols-[1fr_90px_150px_28px] items-center gap-2">
                     <Select value={line.itemId} onChange={(e) => update(idx, { itemId: e.target.value, from: { siteId: fromSiteId } })}>
                       <option value="">Item…</option>
@@ -397,7 +405,7 @@ function NewTransferModal({
                       type="button"
                       aria-label="Remove line"
                       disabled={lines.length === 1}
-                      onClick={() => setLines((p) => p.filter((_, i) => i !== idx))}
+                      onClick={() => removeLine(idx)}
                       className="flex items-center justify-center text-navy/30 hover:text-red-500 disabled:opacity-20"
                     >
                       <MinusCircle className="h-4 w-4" />

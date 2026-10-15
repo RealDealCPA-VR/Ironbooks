@@ -17,6 +17,7 @@ import { trialBalance } from '../reports';
 import { emptyPermissionSet, type EffectiveAccess, type Area } from '@/lib/permissions/model';
 import { batchEnterLookups, batchEnterTransactions } from './batchEnter';
 import { parseBatchPaste } from './batchEnterParse';
+import { API_ROUTE_PERMISSIONS } from '@/lib/permissions/routes';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-batch-enter-keyboard');
 let db: DB;
@@ -176,6 +177,14 @@ describe('Enter Batch Transactions — paste, post, per-row report', () => {
       }),
     ).rejects.toMatchObject({ code: 'FORBIDDEN' });
     expect((await db.select().from(expenses).where(eq(expenses.companyId, ctx.companyId))).length).toBe(before);
+  });
+
+  it('lookups (full customer and vendor lists) need the same right as batch entry, not just view', async () => {
+    expect(API_ROUTE_PERMISSIONS['/api/accountant/batch-enter/lookups'].GET).toEqual({ area: 'accounting', action: 'create' });
+    expect(API_ROUTE_PERMISSIONS['/api/accountant/batch-enter'].POST).toEqual({ area: 'accounting', action: 'create' });
+    await expect(batchEnterLookups({ ...ctx, access: only({ accounting: ['view'] }) })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    const l = await batchEnterLookups({ ...ctx, access: only({ accounting: ['view', 'create'] }) });
+    expect(l.vendors.length).toBe(2);
   });
 
   it("another company's bank account is refused", async () => {

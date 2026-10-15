@@ -105,6 +105,9 @@ export interface BatchEnterLookups extends BatchLookupLists {
  * (GET /api/accountant/batch-enter/lookups). Company-scoped; read-only.
  */
 export async function batchEnterLookups(ctx: ServiceContext): Promise<BatchEnterLookups> {
+  // The full customer and vendor lists are only for people who may batch-enter (the same right
+  // the POST needs), not for anyone who can merely view the books.
+  requirePermission(ctx, 'accounting', 'create');
   const lists = await loadLists(ctx);
   const closing = await getClosingDateSettings(ctx);
   const ap = lists.accounts.find((a) => a.code === '2000');

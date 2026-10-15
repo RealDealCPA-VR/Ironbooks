@@ -4,12 +4,15 @@
 import { describe, it, expect } from 'vitest';
 import {
   applyColumnMapping,
+  blankKeyedRow,
   columnForHeader,
   guessColumnMapping,
   isBlankBatchRow,
   parseBatchPaste,
   parseClipboardGrid,
   pasteBlockAt,
+  stripRowKey,
+  withRowKeys,
 } from './batchEnterParse';
 
 describe('parseClipboardGrid', () => {
@@ -115,5 +118,21 @@ describe('pasteBlockAt (spreadsheet-style paste into a cell)', () => {
   it('isBlankBatchRow', () => {
     expect(isBlankBatchRow({ date: '', account: ' ' })).toBe(true);
     expect(isBlankBatchRow({ date: '', account: '', memo: 'x' })).toBe(false);
+  });
+});
+
+describe('stable grid row keys (review P2)', () => {
+  it('keeps existing keys, gives new rows fresh ones, and never sends them to the server', () => {
+    const a = blankKeyedRow();
+    const b = blankKeyedRow();
+    expect(a._key).not.toBe(b._key);
+    // Pasting fills rows (copies keep their key) and adds rows without one.
+    const pasted = withRowKeys(pasteBlockAt([a, b], { row: 1, col: 0 }, [['3/1/2026'], ['3/2/2026'], ['3/3/2026']], 'check'));
+    expect(pasted.map((r) => r._key).slice(0, 2)).toEqual([a._key, b._key]);
+    expect(new Set(pasted.map((r) => r._key)).size).toBe(4);
+    // A key alone does not make a row "filled".
+    expect(isBlankBatchRow(a)).toBe(true);
+    expect(stripRowKey(pasted[1])).toEqual({ date: '3/1/2026', account: '' });
+    expect('_key' in stripRowKey(pasted[1])).toBe(false);
   });
 });

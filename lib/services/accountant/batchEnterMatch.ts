@@ -46,41 +46,121 @@ export interface BatchMatchers {
 
 export const normName = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ');
 
-/** Edit distance (Levenshtein), capped for speed on long strings. */
-export function editDistance(a: string, b: string): number {
+/**
+ * Edit distance (Levenshtein). With `max`, gives up as soon as the distance must exceed it and
+ * returns `max + 1` (exact whenever the true distance is <= max).
+ */
+export function editDistance(a: string, b: string, max = Infinity): number {
   if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > max) return max + 1;
   if (!a.length) return b.length;
   if (!b.length) return a.length;
   let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
   for (let i = 1; i <= a.length; i++) {
     const cur = [i];
+    let rowMin = i;
     for (let j = 1; j <= b.length; j++) {
       cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (cur[j] < rowMin) rowMin = cur[j];
     }
+    if (rowMin > max) return max + 1;
     prev = cur;
   }
   return prev[b.length];
 }
 
-/** Best near match among labels: prefix/contains first, then a small edit distance. */
-export function closestLabel(query: string, labels: string[]): string | null {
-  const q = normName(query);
-  if (!q) return null;
-  const starts = labels.filter((l) => normName(l).startsWith(q));
-  if (starts.length === 1) return starts[0];
-  const contains = labels.filter((l) => normName(l).includes(q));
-  if (contains.length === 1) return contains[0];
-  let best: { label: string; d: number } | null = null;
-  for (const l of labels) {
-    const d = editDistance(q, normName(l));
-    if (!best || d < best.d) best = { label: l, d };
+/** Character counts in 37 buckets (a–z, 0–9, everything else) for a cheap edit-distance bound. */
+function charBag(s: string): Uint16Array {
+  const bag = new Uint16Array(37);
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    bag[c >= 97 && c <= 122 ? c - 97 : c >= 48 && c <= 57 ? c - 22 : 36]++;
   }
-  if (!best) return null;
-  return best.d <= Math.max(2, Math.floor(q.length / 4)) ? best.label : null;
+  return bag;
+}
+/** Bag distance: a lower bound of the edit distance (each edit changes at most one count each way). */
+function bagDistance(a: Uint16Array, b: Uint16Array): number {
+  let more = 0;
+  let less = 0;
+  for (let i = 0; i < 37; i++) {
+    const d = a[i] - b[i];
+    if (d > 0) more += d;
+    else less -= d;
+  }
+  return more > less ? more : less;
 }
 
-export function createBatchMatchers(lists: BatchLookupLists): BatchMatchers {
+/**
+ * A reusable "closest label" search over a fixed list: labels are normalized once, and the
+ * near-miss pass skips labels that their length or letter counts already rule out, and stops each
+ * comparison as soon as it can't beat the best so far — so a miss costs a quick scan of the list,
+ * not a full Levenshtein per name.
+ */
+export function closestMatcher(labels: string[]): (query: string) => string | null {
+  const norms = labels.map(normName);
+  const bags = norms.map(charBag);
+  return (query: string) => {
+    const q = normName(query);
+    if (!q) return null;
+    let startHit = -1;
+    let starts = 0;
+    let containsHit = -1;
+    let contains = 0;
+    for (let i = 0; i < norms.length; i++) {
+      if (norms[i].startsWith(q)) {
+        if (starts++ === 0) startHit = i;
+      }
+      if (norms[i].includes(q)) {
+        if (contains++ === 0) containsHit = i;
+      }
+    }
+    if (starts === 1) return labels[startHit];
+    if (contains === 1) return labels[containsHit];
+    const limit = Math.max(2, Math.floor(q.length / 4));
+    const qBag = charBag(q);
+    let best = -1;
+    let bestD = limit + 1; // only distances within the limit count
+    for (let i = 0; i < norms.length && bestD > 0; i++) {
+      if (Math.abs(norms[i].length - q.length) >= bestD) continue;
+      if (bagDistance(qBag, bags[i]) >= bestD) continue;
+      const d = editDistance(q, norms[i], bestD - 1);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    return best >= 0 ? labels[best] : null;
+  };
+}
+
+/** Best near match among labels: prefix/contains first, then a small edit distance. */
+export function closestLabel(query: string, labels: string[]): string | null {
+  return closestMatcher(labels)(query);
+}
+
+/**
+ * Build the matchers for a company's lists. Every lookup (`account`, `customer`, `vendor`,
+ * `className`, `suggest`) is memoized per input for the life of the matchers: the grid re-checks
+ * every row on each keystroke and the "did you mean" search is O(list size), so without the cache
+ * a pasted batch of one-time payees costs rows × list size per keystroke. With it, only the cell
+ * that changed is matched again.
+ */
+export function createBatchMatchers(
+  lists: BatchLookupLists,
+  opts: { /** Called on every cache miss (tests use it to prove lookups are cached). */ onMiss?: (kind: string) => void } = {},
+): BatchMatchers {
   const acct = lists.accounts;
+  const memo = <R>(kind: string, fn: (s: string) => R, key: (s: string) => string = normName) => {
+    const cache = new Map<string, R>();
+    return (s: string): R => {
+      const k = `${kind}|${key(s)}`;
+      if (cache.has(k)) return cache.get(k) as R;
+      opts.onMiss?.(kind);
+      const v = fn(s);
+      cache.set(k, v);
+      return v;
+    };
+  };
   const byName = (rows: BatchNamedRef[]) => {
     const m = new Map<string, string | null>();
     for (const r of rows) {
@@ -92,48 +172,53 @@ export function createBatchMatchers(lists: BatchLookupLists): BatchMatchers {
   };
   const labels = (rows: BatchNamedRef[]) => rows.map((r) => r.name ?? '').filter(Boolean);
   const accountLabel = (a: BatchAccountRef) => `${a.code} · ${a.name}`;
+  const byId = new Map(acct.map((a) => [a.id, a]));
+  const closestAcctName = closestMatcher(acct.map((a) => a.name));
+  const closestAcctLabel = closestMatcher(acct.map(accountLabel));
+  const closestCustomer = closestMatcher(labels(lists.customers));
+  const closestVendor = closestMatcher(labels(lists.vendors));
+  const closestClass = closestMatcher(labels(lists.classes));
+  const suggesters: Record<MatchKind, (s: string) => string | null> = {
+    account: memo('suggest-account', (s) => {
+      // Compare against the bare names first ("Ofice Suplies"), then "number · name".
+      const name = closestAcctName(s);
+      const hit = name ? acct.find((a) => a.name === name) : undefined;
+      return hit ? accountLabel(hit) : closestAcctLabel(s);
+    }),
+    customer: memo('suggest-customer', closestCustomer),
+    vendor: memo('suggest-vendor', closestVendor),
+    class: memo('suggest-class', closestClass),
+  };
+  // Account codes are compared exactly, so that cache is keyed by the trimmed text, not the
+  // case-folded name.
+  const matchAccount = (s: string) => {
+    const t = s.trim();
+    if (!t) return null;
+    const code = t.split(/\s*[·:\-–]\s+|\s+/)[0];
+    return (
+      acct.find((a) => a.code === t)?.id ??
+      acct.find((a) => normName(a.name) === normName(t))?.id ??
+      acct.find((a) => normName(accountLabel(a)) === normName(t) || normName(`${a.code} ${a.name}`) === normName(t))?.id ??
+      acct.find((a) => a.code === code && t.length > code.length && normName(t).endsWith(normName(a.name)))?.id ??
+      null
+    );
+  };
   return {
-    account: (s: string) => {
-      const t = s.trim();
-      if (!t) return null;
-      const code = t.split(/\s*[·:\-–]\s+|\s+/)[0];
-      return (
-        acct.find((a) => a.code === t)?.id ??
-        acct.find((a) => normName(a.name) === normName(t))?.id ??
-        acct.find((a) => normName(accountLabel(a)) === normName(t) || normName(`${a.code} ${a.name}`) === normName(t))?.id ??
-        acct.find((a) => a.code === code && t.length > code.length && normName(t).endsWith(normName(a.name)))?.id ??
-        null
-      );
-    },
+    account: memo('account', matchAccount, (s) => s.trim()),
     accountLabel: (id: string) => {
-      const a = acct.find((x) => x.id === id);
+      const a = byId.get(id);
       return a ? accountLabel(a) : '';
     },
     controlSide: (id: string) => {
-      const a = acct.find((x) => x.id === id);
+      const a = byId.get(id);
       if (a?.type === 'asset' && a.subtype === 'accounts_receivable') return 'ar';
       if (a?.type === 'liability' && a.subtype === 'accounts_payable') return 'ap';
       return null;
     },
-    className: byName(lists.classes),
-    customer: byName(lists.customers),
-    vendor: byName(lists.vendors),
-    suggest: (kind: MatchKind, s: string) => {
-      switch (kind) {
-        case 'account': {
-          // Compare against the bare names first ("Ofice Suplies"), then "number · name".
-          const name = closestLabel(s, acct.map((a) => a.name));
-          const hit = name ? acct.find((a) => a.name === name) : undefined;
-          return hit ? accountLabel(hit) : closestLabel(s, acct.map(accountLabel));
-        }
-        case 'customer':
-          return closestLabel(s, labels(lists.customers));
-        case 'vendor':
-          return closestLabel(s, labels(lists.vendors));
-        case 'class':
-          return closestLabel(s, labels(lists.classes));
-      }
-    },
+    className: memo('class', byName(lists.classes)),
+    customer: memo('customer', byName(lists.customers)),
+    vendor: memo('vendor', byName(lists.vendors)),
+    suggest: (kind: MatchKind, s: string) => suggesters[kind](s),
   };
 }
 
@@ -212,6 +297,9 @@ export interface ResolveBatchOptions {
 }
 
 const didYouMean = (s: string | null) => (s ? ` Did you mean "${s}"?` : '');
+/** More than 2 decimal places (e.g. "0.001") — money is kept to the cent, so such a row is refused. */
+const subCent = (v: string | null) => v !== null && /\.\d{3,}$/.test(v);
+const SUB_CENT = 'amounts can have at most 2 decimals.';
 
 /** Validate and resolve every row into the document it will create (no writes). */
 export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opts: ResolveBatchOptions = {}): ResolvedBatchJob[] {
@@ -254,6 +342,7 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
         const credit = normalizeAmount(r.credit);
         if (r.debit && debit === null) errors.push(`Row ${i + 1}: debit "${r.debit}" is not a number.`);
         if (r.credit && credit === null) errors.push(`Row ${i + 1}: credit "${r.credit}" is not a number.`);
+        if (subCent(debit) || subCent(credit)) errors.push(`Row ${i + 1}: ${SUB_CENT}`);
         if (!debit && !credit) errors.push(`Row ${i + 1}: enter a debit or a credit.`);
         const classId = r.className ? M.className(r.className) : null;
         if (r.className && !classId) errors.push(`Row ${i + 1}: class "${r.className}" was not found.${didYouMean(M.suggest('class', r.className))}`);
@@ -323,6 +412,7 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
     else if (bank && accountId === bank) errors.push(`${n}: the account can't be the same as the ${t.startsWith('cc') ? 'credit card' : 'bank'} account.`);
     const amount = normalizeAmount(r.amount);
     if (amount === null) errors.push(`${n}: amount "${r.amount ?? ''}" is not a number.`);
+    else if (subCent(amount)) errors.push(`${n}: ${SUB_CENT}`);
     else if (!Money.gt(amount, 0)) errors.push(`${n}: amount must be greater than zero.`);
     const classId = r.className ? M.className(r.className) : null;
     if (r.className && !classId) errors.push(`${n}: class "${r.className}" was not found.${didYouMean(M.suggest('class', r.className))}`);

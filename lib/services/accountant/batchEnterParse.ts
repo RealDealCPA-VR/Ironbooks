@@ -284,9 +284,29 @@ export function pasteBlockAt(
   return next;
 }
 
-/** True when nothing is typed in the row. */
+/** True when nothing is typed in the row (the grid's internal `_key` does not count). */
 export function isBlankBatchRow(row: BatchEnterRow): boolean {
-  return !Object.values(row).some((v) => typeof v === 'string' && v.trim() !== '');
+  return !Object.entries(row).some(([k, v]) => k !== '_key' && typeof v === 'string' && v.trim() !== '');
+}
+
+/**
+ * A grid row with a stable identity (`_key`) so React keeps each row's picker state and
+ * aria ids with the row when lines are inserted or deleted above it. Never sent to the server.
+ */
+export type KeyedBatchRow = BatchEnterRow & { _key: string };
+let rowKeySeq = 0;
+export const newRowKey = () => `row-${++rowKeySeq}`;
+/** A blank grid row with a fresh key. */
+export const blankKeyedRow = (): KeyedBatchRow => ({ date: '', account: '', _key: newRowKey() });
+/** Give every row that has no key yet (pasted or mapped rows) a fresh one; keyed rows keep theirs. */
+export function withRowKeys(rows: Array<BatchEnterRow & { _key?: string }>): KeyedBatchRow[] {
+  return rows.map((r) => (r._key ? (r as KeyedBatchRow) : { ...r, _key: newRowKey() }));
+}
+/** The row as the server expects it (without the grid's `_key`). */
+export function stripRowKey(row: BatchEnterRow & { _key?: string }): BatchEnterRow {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { _key, ...rest } = row;
+  return rest;
 }
 
 /**

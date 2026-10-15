@@ -47,6 +47,8 @@ import {
   type BatchColumn,
   type BatchEnterRow,
   type BatchEnterType,
+  type KeyedBatchRow,
+  blankKeyedRow,
   applyColumnMapping,
   batchColumns,
   guessColumnMapping,
@@ -56,6 +58,8 @@ import {
   normalizeDate,
   parseClipboardGrid,
   pasteBlockAt,
+  stripRowKey,
+  withRowKeys,
 } from '@/lib/services/accountant/batchEnterParse';
 import {
   type BatchLookupLists,
@@ -92,7 +96,7 @@ interface ReportLine {
 }
 
 const START_ROWS = 10;
-const blank = (): BatchEnterRow => ({ date: '', account: '' });
+const blank = blankKeyedRow;
 const NEEDS_BANK: BatchEnterType[] = ['check', 'deposit', 'cc_charge', 'cc_credit'];
 const MONEY_COLS: BatchColumn[] = ['amount', 'debit', 'credit'];
 const DATE_COLS: BatchColumn[] = ['date', 'dueDate'];
@@ -121,13 +125,15 @@ export default function BatchEnterPage() {
   const [lookups, setLookups] = useState<Lookups>(EMPTY_LOOKUPS);
   const [type, setType] = useState<BatchEnterType>('check');
   const [bankAccountId, setBankAccountId] = useState('');
-  const [rows, setRows] = useState<BatchEnterRow[]>(() => Array.from({ length: START_ROWS }, blank));
+  const [rows, setRows] = useState<KeyedBatchRow[]>(() => Array.from({ length: START_ROWS }, blank));
   const [mode, setMode] = useState<'all' | 'row'>('row');
   const [serverErrors, setServerErrors] = useState<Map<number, string[]>>(new Map());
   const [report, setReport] = useState<ReportLine[] | null>(null);
   const [busy, setBusy] = useState<'check' | 'save' | null>(null);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteText, setPasteText] = useState('');
+  /** Where the paste dialog puts rows by default: below what is already typed, so nothing is lost. */
+  const [pasteWhere, setPasteWhere] = useState<'replace' | 'append'>('replace');
   const [closingPassword, setClosingPassword] = useState('');
 
   useEffect(() => {
@@ -222,6 +228,12 @@ export default function BatchEnterPage() {
     setReport(null);
   }
 
+  /** Open the mapping dialog; it adds below existing rows by default when the grid isn't empty. */
+  function openPaste() {
+    setPasteWhere(rows.some((r) => !isBlankBatchRow(r)) ? 'append' : 'replace');
+    setPasteOpen(true);
+  }
+
   /** Paste a copied block into the grid at a cell (spreadsheet style), or map it when it has headers. */
   function onCellPaste(e: React.ClipboardEvent<HTMLInputElement>, rowIdx: number, colIdx: number) {
     const text = e.clipboardData.getData('text/plain');
@@ -231,10 +243,10 @@ export default function BatchEnterPage() {
     if (block.length === 0) return;
     if (guessColumnMapping(block, type).hasHeader) {
       setPasteText(text);
-      setPasteOpen(true);
+      openPaste();
       return;
     }
-    setRows((rs) => pasteBlockAt(rs, { row: rowIdx, col: colIdx }, block, type));
+    setRows((rs) => withRowKeys(pasteBlockAt(rs, { row: rowIdx, col: colIdx }, block, type)));
     setServerErrors(new Map());
     toast(`Pasted ${block.length} row${block.length === 1 ? '' : 's'}. Check the marks on the right, then save.`, 'success');
   }
@@ -243,7 +255,7 @@ export default function BatchEnterPage() {
     if (mapped.length === 0) return toast('Nothing to paste: no column is mapped, or the rows are empty.', 'info');
     setRows((rs) => {
       const kept = where === 'append' ? rs.filter((r) => !isBlankBatchRow(r)) : [];
-      const next = [...kept, ...mapped];
+      const next = [...kept, ...withRowKeys(mapped)];
       return next.length < START_ROWS ? [...next, ...Array.from({ length: START_ROWS - next.length }, blank)] : [...next, blank()];
     });
     setServerErrors(new Map());
@@ -259,7 +271,7 @@ export default function BatchEnterPage() {
     if (NEEDS_BANK.includes(type) && !bankAccountId) {
       return toast(`Choose the ${isCard ? 'credit card' : 'bank'} account first.`, 'info');
     }
-    const data = filledIdx.map((i) => rows[i]);
+    const data = filledIdx.map((i) => stripRowKey(rows[i]));
     setBusy(validateOnly ? 'check' : 'save');
     try {
       const res = await api.post<BatchResult>(
@@ -375,7 +387,7 @@ export default function BatchEnterPage() {
               <option value="all">Save nothing until every row is right</option>
             </Select>
           </div>
-          <Button variant="secondary" accessKey="p" onClick={() => setPasteOpen(true)}>
+          <Button variant="secondary" accessKey="p" onClick={openPaste}>
             <ClipboardPaste className="h-4 w-4" /> <AccessKeyText text="Paste from Excel" accessKey="p" />
           </Button>
         </div>
@@ -444,9 +456,9 @@ export default function BatchEnterPage() {
                 const errs = serverErrors.get(i) ?? msgs?.errors ?? [];
                 const warns = msgs?.warnings ?? [];
                 const filled = !isBlankBatchRow(r);
-                const msgId = `be-row-${i}-msg`;
+                const msgId = `be-row-${r._key}-msg`;
                 return (
-                  <tr key={i} data-grid-row className={filled && errs.length ? 'bg-red-50/70' : undefined}>
+                  <tr key={r._key} data-grid-row className={filled && errs.length ? 'bg-red-50/70' : undefined}>
                     <td className="px-2 pt-3 align-top text-xs text-navy/40">{i + 1}</td>
                     {cols.map((c, ci) => {
                       const v = (r[c] as string | undefined) ?? '';
@@ -597,6 +609,7 @@ export default function BatchEnterPage() {
 
       <PasteDialog
         open={pasteOpen}
+        initialWhere={pasteWhere}
         type={type}
         text={pasteText}
         onText={setPasteText}
@@ -611,6 +624,7 @@ export default function BatchEnterPage() {
 /** "Paste from Excel / Google Sheets" with a column mapping step and a preview. */
 function PasteDialog({
   open,
+  initialWhere,
   type,
   text,
   onText,
@@ -619,6 +633,8 @@ function PasteDialog({
   columnLabel,
 }: {
   open: boolean;
+  /** 'append' when the grid already has rows, so Use / Ctrl+S never silently throws them away. */
+  initialWhere: 'replace' | 'append';
   type: BatchEnterType;
   text: string;
   onText: (t: string) => void;
@@ -630,7 +646,10 @@ function PasteDialog({
   const guess = useMemo(() => guessColumnMapping(grid, type), [grid, type]);
   const [hasHeader, setHasHeader] = useState(false);
   const [mapping, setMapping] = useState<Array<BatchColumn | null>>([]);
-  const [where, setWhere] = useState<'replace' | 'append'>('replace');
+  const [where, setWhere] = useState<'replace' | 'append'>(initialWhere);
+  useEffect(() => {
+    if (open) setWhere(initialWhere);
+  }, [open, initialWhere]);
 
   // Re-guess whenever the pasted text or the type changes.
   useEffect(() => {
