@@ -457,6 +457,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/accountant/reclassify': r('accounting', 'GET POST:modify'),
   '/api/accountant/write-off': r('customers', 'GET POST'),
   '/api/accountant/batch-enter': r('accounting', 'POST'),
+  '/api/accountant/batch-enter/lookups': r('accounting', 'GET:create'), // team keyboard: grid matching (same right as the POST)
   '/api/accountant/batch-void': r('accounting', 'GET POST:delete'),
   '/api/accountant/working-trial-balance': { GET: { area: 'reports_financial', action: 'view' }, ...r('accounting', 'PUT:modify POST') },
   '/api/accountant/list-changes': r('accounting', 'GET POST:modify'),

@@ -33,6 +33,7 @@ import {
   PageHeader,
   toast,
   toastError,
+  useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import {
@@ -325,6 +326,9 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
     setLines((prev) => prev.filter((_, i) => i !== idx));
   }
 
+  // Line-grid keys: Enter / Down next line (adds one at the end), Ctrl+Insert, Ctrl+D.
+  const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
+
   const liveTotal = computeTotal(lines);
 
   async function handleSubmit() {
@@ -493,7 +497,7 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
               <Spinner className="h-4 w-4" /> Loading purchase order lines…
             </div>
           ) : (
-            <div className="rounded-lg border border-slate-200 overflow-hidden">
+            <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
               <div className="grid grid-cols-[1.3fr_1.2fr_80px_90px_90px_28px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
                 <span>Item</span>
                 <span>Description</span>
@@ -508,6 +512,7 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
                 return (
                   <div
                     key={idx}
+                    data-grid-row
                     className="grid grid-cols-[1.3fr_1.2fr_80px_90px_90px_28px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
                   >
                     {poId ? (

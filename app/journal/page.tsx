@@ -18,7 +18,6 @@ import {
   Card,
   DateInput,
   Input,
-  Select,
   Label,
   Badge,
   Table,
@@ -35,6 +34,8 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
+import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import type { TypeaheadChoice } from '@/lib/typeahead';
 import { computeJournalBalance, journalPayloadAmount } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -173,6 +174,8 @@ interface EntryFormModalProps {
 }
 
 /** Which kind of name a line's account requires (QB: A/R needs a customer, A/P a vendor). */
+const NAME_HINT = { customer: 'Customer', vendor: 'Vendor', employee: 'Employee' } as const;
+
 function requiredNameKind(acct: Account | undefined): 'customer' | 'vendor' | null {
   if (!acct) return null;
   if (acct.type === 'asset' && acct.subtype === 'accounts_receivable') return 'customer';
@@ -245,6 +248,15 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
   const addLine = () => setLines((prev) => [...prev, emptyLine(++lineCounter)]);
   const removeLine = (id: number) =>
     setLines((prev) => (prev.length > 2 ? prev.filter((l) => l.id !== id) : prev));
+
+  // Find-as-you-type pickers for the line grid (type a name or account number, then Tab).
+  const accountChoices: TypeaheadChoice[] = accounts
+    .filter((a) => a.subtype !== 'non_posting')
+    .map((a) => ({ id: a.id, label: formatAccountLabel(a, prefs.company), terms: [a.code, a.name] }));
+  const classChoices: TypeaheadChoice[] = classes.map((c) => ({ id: c.id, label: c.name }));
+  /** A/R lines list only customers and A/P lines only vendors (as the server requires). */
+  const nameChoicesFor = (need: 'customer' | 'vendor' | null): TypeaheadChoice[] =>
+    names.filter((n) => !need || n.kind === need).map((n) => ({ id: n.value, label: n.label, hint: NAME_HINT[n.kind] }));
 
   // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
   const grid = useGridKeys({
@@ -452,29 +464,19 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
         <div className="flex flex-col gap-2" onKeyDown={grid.onKeyDown}>
           {lines.map((line, idx) => (
             <div key={line.id} data-grid-row className={`grid ${gridCols} gap-2 items-center`}>
-              <Select
+              <TypeaheadSelect
                 aria-label={`Line ${idx + 1} account`}
+                placeholder="— Select account —"
                 value={line.accountId}
-                onChange={(e) => updateLine(line.id, 'accountId', e.target.value)}
-              >
-                <option value="">— Select account —</option>
-                {accounts
-                  .filter((a) => a.subtype !== 'non_posting')
-                  .map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {formatAccountLabel(a, prefs.company)}
-                    </option>
-                  ))}
-              </Select>
+                onChange={(id) => updateLine(line.id, 'accountId', id)}
+                choices={accountChoices}
+              />
 
-              <Select
+              <TypeaheadSelect
                 aria-label={`Line ${idx + 1} name`}
                 aria-invalid={nameProblemIdx === idx || undefined}
-                value={line.name}
-                onChange={(e) => updateLine(line.id, 'name', e.target.value)}
-              >
-                <option value="">
-                  {requiredNameKind(accountById.get(line.accountId)) === 'customer'
+                placeholder={
+                  requiredNameKind(accountById.get(line.accountId)) === 'customer'
                     ? '— Pick customer —'
                     : requiredNameKind(accountById.get(line.accountId)) === 'vendor'
                       ? '— Pick vendor —'
@@ -496,20 +498,21 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
                   );
                 })}
               </Select>
+                      : '— No name —'
+                }
+                value={line.name}
+                onChange={(id) => updateLine(line.id, 'name', id)}
+                choices={nameChoicesFor(requiredNameKind(accountById.get(line.accountId)))}
+              />
 
               {prefs.company.classTrackingEnabled || line.classId ? (
-                <Select
+                <TypeaheadSelect
                   aria-label={`Line ${idx + 1} class`}
+                  placeholder="— No class —"
                   value={line.classId}
-                  onChange={(e) => updateLine(line.id, 'classId', e.target.value)}
-                >
-                  <option value="">— No class —</option>
-                  {classes.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </Select>
+                  onChange={(id) => updateLine(line.id, 'classId', id)}
+                  choices={classChoices}
+                />
               ) : (
                 <span />
               )}

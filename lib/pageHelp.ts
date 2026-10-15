@@ -270,6 +270,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Add a loan with its amount, rate and term.',
     qb: 'Loan Manager',
   },
+  '/accountant/batch-enter': {
+    title: 'Enter many transactions',
+    what: 'Type or paste lots of checks, deposits, card charges, bills, invoices or journal entries in one spreadsheet-style grid. Each row is checked as you go and saved as its own transaction.',
+    first: 'Pick the transaction type, then type rows or paste them from Excel or Google Sheets. Fix rows marked red, then save.',
+    qb: 'Batch Enter Transactions',
+  },
   // ---- Employees ----
   '/pay-runs': {
     title: 'Run payroll',

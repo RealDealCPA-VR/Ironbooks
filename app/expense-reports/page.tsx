@@ -20,6 +20,7 @@ import {
   Modal,
   PageHeader,
   toast,
+  useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -141,6 +142,9 @@ function NewReportModal({
     setLines((prev) => prev.filter((_, i) => i !== idx));
   }
 
+  // Line-grid keys: Enter / Down next line (adds one at the end), Ctrl+Insert, Ctrl+D.
+  const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
+
   function updateLine(idx: number, field: keyof LineFormState, value: string) {
     setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, [field]: value } : l)));
   }
@@ -245,10 +249,11 @@ function NewReportModal({
             </Button>
           </div>
 
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-2" onKeyDown={grid.onKeyDown}>
             {lines.map((line, idx) => (
               <div
                 key={idx}
+                data-grid-row
                 className="grid grid-cols-[1.4fr_140px_1.4fr_110px_auto] gap-2 items-start rounded-lg border border-slate-100 bg-slate-50 p-2"
               >
                 {/* Account */}

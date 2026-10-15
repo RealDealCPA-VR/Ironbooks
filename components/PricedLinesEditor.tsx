@@ -7,10 +7,12 @@
  */
 import { useEffect, useRef } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
-import { AmountInput, Button, Input, Select, useGridKeys } from '@/components/ui';
+import { AmountInput, Button, Input, useGridKeys } from '@/components/ui';
 import { formatCurrency } from '@/lib/money';
 import { usePriceQuotes, samePrice, type QuoteHeader } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
+import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import type { TypeaheadChoice } from '@/lib/typeahead';
 
 export interface PricedLineItem {
   id: string;
@@ -59,6 +61,9 @@ export function PricedLinesEditor({
   const latest = useRef(lines);
   latest.current = lines;
   const sellable = items.filter((i) => i.isActive !== false && !SPECIAL.has(i.type));
+  // Find-as-you-type pickers (type part of a name, then Tab).
+  const itemChoices: TypeaheadChoice[] = sellable.map((it) => ({ id: it.id, label: it.name }));
+  const classChoices: TypeaheadChoice[] = (classes ?? []).map((c) => ({ id: c.id, label: c.name, hint: 'Class' }));
   const byId = new Map(items.map((i) => [i.id, i]));
 
   const quotes = usePriceQuotes(
@@ -113,14 +118,13 @@ export function PricedLinesEditor({
         return (
           <div key={idx} data-grid-row className="grid grid-cols-12 gap-2 items-start mb-2">
             <div className="col-span-3">
-              <Select value={line.itemId} onChange={(e) => pickItem(idx, e.target.value)} aria-label="Item">
-                <option value="">— No item —</option>
-                {sellable.map((it) => (
-                  <option key={it.id} value={it.id}>
-                    {it.name}
-                  </option>
-                ))}
-              </Select>
+              <TypeaheadSelect
+                aria-label={`Line ${idx + 1} item`}
+                placeholder="— No item —"
+                value={line.itemId}
+                onChange={(id) => pickItem(idx, id)}
+                choices={itemChoices}
+              />
             </div>
             <div className={showTaxable ? 'col-span-3' : 'col-span-4'}>
               <Input
@@ -177,18 +181,13 @@ export function PricedLinesEditor({
             </div>
             {classes && classes.length > 0 && (
               <div className="col-span-12 sm:col-start-4 sm:col-span-4 -mt-1">
-                <Select
+                <TypeaheadSelect
+                  aria-label={`Line ${idx + 1} class`}
+                  placeholder="— No class —"
                   value={line.classId ?? ''}
-                  onChange={(e) => patch(idx, { classId: e.target.value })}
-                  aria-label="Class"
-                >
-                  <option value="">— No class —</option>
-                  {classes.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      Class: {c.name}
-                    </option>
-                  ))}
-                </Select>
+                  onChange={(id) => patch(idx, { classId: id })}
+                  choices={classChoices}
+                />
               </div>
             )}
           </div>

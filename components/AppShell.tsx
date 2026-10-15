@@ -26,9 +26,11 @@ import AttentionBadge from './AttentionBadge'; // team home: count on the "Needs
 import UndoToast from './UndoToast';
 import ReceiptDropZone from './ReceiptDropZone'; // receipt capture: drop a receipt anywhere
 import { BackupIndicator, BackupWarningBanner } from './BackupStatus'; // team backups
+import FormShortcuts from './FormShortcuts';
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
+  FORM_KEY_HELP,
   GLOBAL_SHORTCUTS,
   GRID_KEY_HELP,
   isEditableTarget,
@@ -243,7 +245,7 @@ function GlobalShortcuts() {
 
   React.useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (isEditableTarget(e.target)) return;
+      if (e.defaultPrevented || isEditableTarget(e.target)) return;
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
         const sc = GLOBAL_SHORTCUTS.find((s) => s.ctrlKey === e.key.toLowerCase());
         if (sc?.href) {
@@ -269,6 +271,14 @@ function GlobalShortcuts() {
             Anywhere
           </div>
           {GLOBAL_SHORTCUTS.map((s) => (
+            <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
+          ))}
+        </div>
+        <div>
+          <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40 mb-1">
+            Forms
+          </div>
+          {FORM_KEY_HELP.map((s) => (
             <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
           ))}
         </div>
@@ -710,6 +720,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <PreferenceBehaviors />
       <UndoToast />
       <ReceiptDropZone enabled={canDo(me, 'lists', 'create')} />
+      <FormShortcuts />
       <TitleSync company={company?.name ?? null} />
     </div>
   );

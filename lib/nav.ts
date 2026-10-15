@@ -117,6 +117,7 @@ export const navGroups: NavGroup[] = [
       { icon: Banknote, label: 'Reconcile', path: '/reconcile', qb: 'Reconcile', keywords: 'bank statement balance checkbook' },
       { icon: ArrowLeftRight, label: 'Transfer Funds', path: '/transfers', qb: 'Transfer Funds', keywords: 'move money transfer' },
       { icon: Landmark, label: 'Loans', path: '/loans', qb: 'Loan Manager', keywords: 'loan mortgage' },
+      { icon: Table2, label: 'Enter many transactions', path: '/accountant/batch-enter', qb: 'Batch Enter Transactions', keywords: 'batch paste excel google sheets spreadsheet grid bulk checks deposits bills journal' }, // team keyboard
     ],
   },
   {
