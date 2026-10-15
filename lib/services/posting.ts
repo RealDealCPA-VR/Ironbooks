@@ -728,7 +728,8 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, tx.companyId)));
     if (!entry) throw notFound('Journal entry');
     if (entry.status === 'void') return entry;
-    const periodCheck = await assertPeriodOpen(tx, entry.date, { sourceRef: entry.sourceRef }); // cannot void an entry in a closed period
+    // The ORIGINAL date: moving the form date cannot unlock it, so no "move the date" fix.
+    const periodCheck = await assertPeriodOpen(tx, entry.date, { sourceRef: entry.sourceRef, movable: false }); // cannot void an entry in a closed period
 
     const lines = await tx.db
       .select()

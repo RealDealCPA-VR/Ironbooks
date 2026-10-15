@@ -74,8 +74,13 @@ export function confirmStockAvailable(
   );
 }
 
+/** True when "warn when a transaction has no class" applies (class tracking on, warning on, no class). */
+export function classWarningApplies(classId: string | null | undefined, prefs: PreferencesState): boolean {
+  return Boolean(prefs.company.classTrackingEnabled && prefs.company.warnUnassignedClass && !classId);
+}
+
 export function confirmClassAssigned(classId: string | null | undefined, prefs: PreferencesState): boolean {
-  if (!prefs.company.classTrackingEnabled || !prefs.company.warnUnassignedClass || classId) return true;
+  if (!classWarningApplies(classId, prefs)) return true;
   return ask('This transaction has no class.');
 }
 

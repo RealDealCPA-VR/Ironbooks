@@ -29,6 +29,8 @@ export const sendFlagFields = {
 /** The user saw the "over credit limit" warning and chose to save anyway. */
 export const creditLimitOverrideField = {
   overrideCreditLimit: z.boolean().optional(),
+  /** Warn (NEGATIVE_STOCK, with fixes) when an inventory line sells more than is on hand. */
+  checkStock: z.boolean().optional(),
 };
 
 /** POST/PUT statement charge (wave2 sales C5). */

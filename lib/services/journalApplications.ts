@@ -742,7 +742,7 @@ export async function unapplyJournalApplication(ctx: ServiceContext, application
       const [p] = await tx.db.select().from(paymentsReceived).where(eq(paymentsReceived.id, app.paymentId));
       if (p?.voidedAt || p?.bouncedAt) throw new ServiceError('CONFLICT', 'That payment is void or bounced.');
     }
-    await assertPeriodOpen(tx, app.date);
+    await assertPeriodOpen(tx, app.date, { movable: false });
     // A General Journal credit applied to a General Journal charge is one application in two rows.
     const rows =
       app.kind === 'journal_offset' && app.pairId
@@ -796,7 +796,7 @@ export async function applyPaymentToJournalCharges(
         `The payment only has ${toAmountString(payment.unapplied)} unapplied (tried to use ${toAmountString(total)}).`,
       );
     }
-    await assertPeriodOpen(tx, payment.date);
+    await assertPeriodOpen(tx, payment.date, { movable: false });
     const rows = await recordJournalChargesPaid(tx, {
       paymentId: payment.id,
       customerId: payment.customerId,

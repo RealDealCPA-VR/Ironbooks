@@ -31,6 +31,13 @@ import { formatDate } from '@/lib/dates';
 import { useNewParam } from '@/lib/useFocusParam';
 // wave2 prefs: Checking > default account for Make Deposits; date warnings
 import { usePreferences } from '@/lib/usePreferences';
+import { useErrorFixes } from '@/components/ErrorFixPanel';
+import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
+import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { amountMessage, collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
+
+/** Body sent to /api/deposits (fix patches address its paths, e.g. "paymentIds", "depositAccountId"). */
+type DepositBody = Record<string, unknown> & { paymentIds: string[]; salesReceiptIds: string[] };
 
 // ---------------------------------------------------------------------------
 // Types
@@ -206,6 +213,9 @@ function MakeDepositModal({
   const [cashBackAccountId, setCashBackAccountId] = useState('');
   const [cashBackAmount, setCashBackAmount] = useState('');
   const [saving, setSaving] = useState(false);
+  // Fix errors where they happen: server fix suggestions + inline field messages.
+  const fixer = useErrorFixes<DepositBody>();
+  const [showErrors, setShowErrors] = useState(false);
 
   // Reset when modal opens.
   useEffect(() => {
@@ -223,7 +233,10 @@ function MakeDepositModal({
       setCashBackAccountId(editing?.cashBackAccountId ?? '');
       setCashBackAmount(editing?.cashBackAmount ?? '');
       setFxRate('');
+      fixer.clear();
+      setShowErrors(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing]);
 
   // QB groups "Payments to Deposit" by method — offer a method filter.
@@ -276,31 +289,78 @@ function MakeDepositModal({
   const cashBackNum = Number(cashBackAmount) || 0;
   const netTotal = selectedTotal + extraTotal - cashBackNum;
 
-  async function handleSubmit() {
-    if (!depositAccountId) {
-      toast('Please select a bank account.', 'danger');
-      return;
-    }
-    if (!date) {
-      toast('Please enter a deposit date.', 'danger');
-      return;
-    }
-    if (selectedIds.size === 0 && extraLines.length === 0) {
-      toast('Select at least one payment or add a deposit line.', 'danger');
-      return;
-    }
-    for (const [i, l] of extraLines.entries()) {
-      if (!l.accountId || !(Number(l.amount) > 0)) {
-        toast(`Additional line ${i + 1}: choose an account and a positive amount.`, 'danger');
-        return;
+  /** Inline field messages (lib/fieldValidation.ts). */
+  function validateForm(): FieldErrors {
+    const entries: Record<string, string | null> = {
+      account: requiredMessage(depositAccountId, 'Choose the bank account the money goes into.'),
+      date: dateMessage(date, 'Deposit date'),
+      cashBackAmount: amountMessage(cashBackAmount, { label: 'Cash back' }),
+      cashBackAccount: cashBackNum > 0 && !cashBackAccountId ? 'Choose the account that cash back goes to.' : null,
+      total:
+        selectedIds.size === 0 && extraLines.length === 0
+          ? 'Select at least one payment or add a deposit line.'
+          : netTotal <= 0
+            ? 'Cash back is as much as the deposit itself. Lower the cash back or add more to deposit.'
+            : null,
+    };
+    extraLines.forEach((l, i) => {
+      entries[`extra-${i}-account`] = requiredMessage(l.accountId, `Additional line ${i + 1}: choose where the money came from.`);
+      entries[`extra-${i}-amount`] = amountMessage(l.amount, { label: `Additional line ${i + 1} amount`, required: true });
+    });
+    return collectErrors(entries);
+  }
+  const fieldErrors: FieldErrors = showErrors ? validateForm() : {};
+
+  /** Copy a fix's changes (request-body paths) back onto the form. */
+  function applyToForm(patched: DepositBody, fix: ErrorFix) {
+    for (const op of fix.patch ?? []) {
+      const value = getPath(patched, op.path);
+      const str = typeof value === 'string' ? value : value == null ? '' : String(value);
+      if (op.path === 'depositAccountId') setDepositAccountId(str);
+      else if (op.path === 'date') setDate(str);
+      else if (op.path === 'cashBack' && value == null) {
+        setCashBackAccountId('');
+        setCashBackAmount('');
+      } else if (op.op === 'pull' && (op.path === 'paymentIds' || op.path === 'salesReceiptIds')) {
+        const removed = String(op.value);
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          next.delete(removed);
+          return next;
+        });
+      } else {
+        const lp = parseLinePath(op.path);
+        if (lp?.collection === 'extraLines' && (lp.field === 'accountId' || lp.field === 'amount')) {
+          patchExtraLine(lp.index, { [lp.field]: str });
+        }
       }
     }
-    if (cashBackNum > 0 && !cashBackAccountId) {
-      toast('Choose the account that cash back goes to.', 'danger');
-      return;
+  }
+
+  /** Save the deposit. Throws on failure (the fix presenter shows it). */
+  async function send(body: DepositBody) {
+    setSaving(true);
+    try {
+      if (editing) {
+        await api.patch(`/api/deposits/${editing.id}`, body);
+        toast('Deposit updated.', 'success');
+      } else {
+        await api.post('/api/deposits', body);
+        toast('Deposit created successfully.', 'success');
+      }
+      fixer.clear();
+      onCreated();
+      onClose();
+    } finally {
+      setSaving(false);
     }
-    if (netTotal <= 0) {
-      toast('Net deposit must be greater than zero.', 'danger');
+  }
+
+  async function handleSubmit() {
+    setShowErrors(true);
+    const errs = validateForm();
+    if (hasErrors(errs)) {
+      focusFirstError('dep', errs);
       return;
     }
 
@@ -311,9 +371,8 @@ function MakeDepositModal({
       .filter((p) => p.kind === 'sales_receipt' && selectedIds.has(p.id))
       .map((p) => p.id);
 
-    setSaving(true);
-    try {
-      const body = {
+    {
+      const body: DepositBody = {
         depositAccountId,
         date,
         paymentIds,
@@ -330,19 +389,12 @@ function MakeDepositModal({
         memo: memo || undefined,
         ...(depCur && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
       };
-      if (editing) {
-        await api.patch(`/api/deposits/${editing.id}`, body);
-        toast('Deposit updated.', 'success');
-      } else {
-        await api.post('/api/deposits', body);
-        toast('Deposit created successfully.', 'success');
+      try {
+        await send(body);
+      } catch (err: unknown) {
+        // Already deposited / not in Undeposited Funds / wrong account → Fix buttons.
+        fixer.report(err, { payload: body, resubmit: send, applyToForm, fallback: 'Failed to save deposit.' });
       }
-      onCreated();
-      onClose();
-    } catch (err: unknown) {
-      toastError(err, 'Failed to create deposit.');
-    } finally {
-      setSaving(false);
     }
   }
 
@@ -395,6 +447,7 @@ function MakeDepositModal({
       }
     >
       <div className="space-y-5">
+        {fixer.panel}
         {editing && (
           <div className="rounded-lg border border-electric/30 bg-electric/5 px-4 py-3 text-sm text-navy/80">
             You are changing a saved deposit. Uncheck a payment to send it back to Undeposited
@@ -409,6 +462,8 @@ function MakeDepositModal({
             autoFocus
             value={depositAccountId}
             onChange={(e) => setDepositAccountId(e.target.value)}
+            aria-required="true"
+            {...fieldA11y('dep', 'account', fieldErrors)}
           >
             <option value="">Select bank account…</option>
             {bankAccounts.map((a) => (
@@ -417,6 +472,7 @@ function MakeDepositModal({
               </option>
             ))}
           </Select>
+          <FieldError formId="dep" name="account" errors={fieldErrors} />
         </div>
 
         {/* p1 fx: foreign-currency bank account */}
@@ -446,7 +502,10 @@ function MakeDepositModal({
             id="dep-date"
             value={date}
             onChange={(e) => setDate(e.target.value)}
+            aria-required="true"
+            {...fieldA11y('dep', 'date', fieldErrors)}
           />
+          <FieldError formId="dep" name="date" errors={fieldErrors} />
         </div>
 
         {/* Memo */}
@@ -567,6 +626,7 @@ function MakeDepositModal({
                       value={l.accountId}
                       onChange={(e) => patchExtraLine(idx, { accountId: e.target.value })}
                       aria-label={`Extra line ${idx + 1} account`}
+                      {...fieldA11y('dep', `extra-${idx}-account`, fieldErrors)}
                     >
                       <option value="">From account…</option>
                       {allAccounts.map((a) => (
@@ -586,6 +646,8 @@ function MakeDepositModal({
                   <div className="w-28 shrink-0">
                     <AmountInput
                       placeholder="0.00"
+                      aria-label={`Extra line ${idx + 1} amount`}
+                      {...fieldA11y('dep', `extra-${idx}-amount`, fieldErrors)}
                       value={l.amount}
                       onChange={(e) => patchExtraLine(idx, { amount: e.target.value })}
                     />
@@ -600,6 +662,11 @@ function MakeDepositModal({
                   </button>
                 </div>
               ))}
+              {Object.keys(fieldErrors)
+                .filter((k) => k.startsWith('extra-'))
+                .map((k) => (
+                  <FieldError key={k} formId="dep" name={k} errors={fieldErrors} />
+                ))}
             </div>
           )}
         </div>
@@ -613,6 +680,7 @@ function MakeDepositModal({
                 value={cashBackAccountId}
                 onChange={(e) => setCashBackAccountId(e.target.value)}
                 aria-label="Cash back goes to"
+                {...fieldA11y('dep', 'cashBackAccount', fieldErrors)}
               >
                 <option value="">Cash back goes to…</option>
                 {allAccounts
@@ -627,11 +695,16 @@ function MakeDepositModal({
             <div className="w-28 shrink-0">
               <AmountInput
                 placeholder="0.00"
+                aria-label="Cash back amount"
+                {...fieldA11y('dep', 'cashBackAmount', fieldErrors)}
                 value={cashBackAmount}
                 onChange={(e) => setCashBackAmount(e.target.value)}
               />
             </div>
           </div>
+          <FieldError formId="dep" name="cashBackAccount" errors={fieldErrors} />
+          <FieldError formId="dep" name="cashBackAmount" errors={fieldErrors} />
+          <FieldError formId="dep" name="total" errors={fieldErrors} />
         </div>
 
         {/* Live total */}

@@ -31,7 +31,33 @@ import { isDepositTargetAccount } from '@/lib/accountTypes';
 // wave2 prefs: Payments > auto-apply / auto-calculate / Undeposited Funds; date warnings
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate } from '@/lib/formPrefs';
-import { autoApplyPayment, cashDue, sumApplied } from '@/lib/paymentApply';
+import { appliedExceedsReceived, autoApplyPayment, cashApplied, cashDue, moneyDec as dec, sumApplied, sumMoney } from '@/lib/paymentApply';
+import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
+import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
+import {
+  appliedExceedsPaymentFixes,
+  fixMoney,
+  getPath,
+  overAppliedFixes,
+  parseLinePath,
+  type ErrorFix,
+} from '@/lib/errorFixes';
+import { amountMessage, collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
+
+/** Body sent to /api/payments (fix patches address its paths, e.g. "amount", "applications.0.amountApplied"). */
+type PaymentBody = Record<string, unknown> & {
+  applications: Array<{ invoiceId: string; amountApplied: string; discountAmount: string | null }>;
+  journalItems: Array<{ journalLineId: string; amount: string }>;
+};
+
+/** What the API receives: only real applications (a fix may set one to 0.00). */
+function cleanPaymentBody(body: PaymentBody): PaymentBody {
+  return {
+    ...body,
+    applications: body.applications.filter((a) => dec(a.amountApplied).greaterThan(0) || dec(a.discountAmount).greaterThan(0)),
+    journalItems: body.journalItems.filter((j) => dec(j.amount).greaterThan(0)),
+  };
+}
 // cmdbar: "receive payment from Acme" opens Receive Payments with the customer picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
 
@@ -254,6 +280,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   const [saving, setSaving] = useState(false);
   // C1: editing a payment that is already in a bank deposit.
   const [removeFromDeposit, setRemoveFromDeposit] = useState(false);
+  // Fix errors where they happen: fix suggestions (client checks + server) and inline messages.
+  const fixer = useErrorFixes<PaymentBody>();
+  const [showErrors, setShowErrors] = useState(false);
 
   const depositAccounts = depositTargets(accounts);
   const discountAccounts = accounts.filter((a) => a.type === 'revenue' || a.type === 'expense');
@@ -314,6 +343,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     setAmountTouched(!!editing);
     setAppsTouched(!!editing);
     setRemoveFromDeposit(false);
+    fixer.clear();
+    setShowErrors(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing, today, prefillCustomerId]);
 
   useEffect(() => {
@@ -514,6 +546,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   /** Credits entered against one invoice (or `je:<line>` charge). */
   const creditOn = (target: string) =>
     allCreditApps.filter((c) => c.invoiceId === target).reduce((s, c) => s + Number(c.amount), 0);
+  /** The credit amounts on one target, as entered (summed with Decimal by the fix builders). */
+  const creditPartsOn = (target: string) =>
+    allCreditApps.filter((c) => c.invoiceId === target).map((c) => c.amount || '0');
 
   const applications = visibleInvoices
     .map((inv) => ({
@@ -621,42 +656,161 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     }
   }
 
+  /** Inline field messages (lib/fieldValidation.ts). */
+  function validateForm(): FieldErrors {
+    const nothing = !(Number(amount || 0) > 0) && creditTotal === 0 && discountTotal === 0;
+    return collectErrors({
+      customer: requiredMessage(customerId, 'Choose the customer who paid.'),
+      date: dateMessage(date, 'Payment date'),
+      amount:
+        amountMessage(amount, { label: 'Amount received', allowZero: true }) ??
+        (nothing ? 'Enter the amount received, or apply a credit or discount.' : null),
+      rate: foreign && !(Number(exchangeRate) > 0)
+        ? `Enter the exchange rate: how much 1 ${currency} is worth in your home currency.`
+        : null,
+      deposit: !prefs.company.useUndepositedFunds && !depositAccountId
+        ? 'Choose the bank account this payment goes into.'
+        : null,
+    });
+  }
+  const fieldErrors: FieldErrors = showErrors ? validateForm() : {};
+
+  /** Copy a fix's changes (request-body paths) back onto the form. */
+  function applyToForm(patched: PaymentBody, fix: ErrorFix) {
+    for (const op of fix.patch ?? []) {
+      const value = getPath(patched, op.path);
+      const str = typeof value === 'string' ? value : value == null ? '' : String(value);
+      if (op.path === 'amount') {
+        setAmount(str);
+        setAmountTouched(true);
+      } else if (op.path === 'date') setDate(str);
+      else if (op.path === 'reference') setReference(str);
+      else if (op.path === 'depositAccountId') setDepositAccountId(str);
+      else if (op.path === 'removeFromDeposit') setRemoveFromDeposit(value === true); // C1
+      else {
+        const lp = parseLinePath(op.path);
+        if (lp?.collection === 'applications' && lp.field === 'amountApplied') {
+          const invoiceId = patched.applications[lp.index]?.invoiceId;
+          if (invoiceId) {
+            setAppsTouched(true);
+            setApplicationAmounts((prev) => ({ ...prev, [invoiceId]: str === '0.00' ? '' : str }));
+          }
+        } else if (lp?.collection === 'journalItems' && lp.field === 'amount') {
+          const lineId = patched.journalItems[lp.index]?.journalLineId;
+          if (lineId) setJournalAmounts((prev) => ({ ...prev, [lineId]: str === '0.00' ? '' : str }));
+        }
+      }
+    }
+  }
+
+  /** Save the payment. Throws on failure (the fix presenter shows it). */
+  async function send(body: PaymentBody) {
+    const clean = cleanPaymentBody(body);
+    setSaving(true);
+    try {
+      if (editing) {
+        await api.put(`/api/payments/${editing.id}`, clean);
+        toast('Payment updated.', 'success');
+      } else {
+        await api.post('/api/payments', clean);
+        toast('Payment recorded successfully.', 'success');
+      }
+      fixer.clear();
+      onSaved();
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /**
+   * Over-application checks before saving, each with exact (Decimal) fixes from lib/errorFixes.ts:
+   * apply exactly the balance due, raise the amount received, or trim the last application.
+   * Returns true when it showed a problem.
+   */
+  function offerOverApplied(body: PaymentBody, ctx: FixContext<PaymentBody>): boolean {
+    for (const [k, a] of body.applications.entries()) {
+      const inv = visibleInvoices.find((i) => i.id === a.invoiceId);
+      if (!inv) continue;
+      const onInvoice = [a.amountApplied, a.discountAmount ?? 0, ...creditPartsOn(inv.id)];
+      if (sumMoney(onInvoice).greaterThan(dec(inv.balanceDue))) {
+        fixer.offer(
+          {
+            title: 'More than the invoice owes',
+            message: `Invoice #${invNo(inv)} owes ${fixMoney(inv.balanceDue)}, but cash, discount and credits on it add up to more.`,
+          },
+          overAppliedFixes({
+            path: `applications.${k}.amountApplied`,
+            balanceDue: inv.balanceDue,
+            otherApplied: [a.discountAmount ?? 0, ...creditPartsOn(inv.id)],
+            label: `invoice #${invNo(inv)}`,
+          }),
+          ctx,
+        );
+        return true;
+      }
+    }
+    for (const [k, j] of body.journalItems.entries()) {
+      const c = shownCharges.find((x) => x.journalLineId === j.journalLineId);
+      if (!c) continue;
+      if (sumMoney([j.amount, ...creditPartsOn(JE_PREFIX + c.journalLineId)]).greaterThan(dec(c.open))) {
+        fixer.offer(
+          {
+            title: 'More than what is still open',
+            message: `${c.ref}: the payment and credits are more than what is still open (${formatCurrency(c.open)}).`,
+          },
+          overAppliedFixes({
+            path: `journalItems.${k}.amount`,
+            balanceDue: c.open,
+            otherApplied: creditPartsOn(JE_PREFIX + c.journalLineId),
+            label: c.ref,
+          }),
+          ctx,
+        );
+        return true;
+      }
+    }
+    // Same exact Decimal comparison the server makes (no float tolerance).
+    if (appliedExceedsReceived(body, amount)) {
+      fixer.offer(
+        {
+          title: 'You applied more than you received',
+          message: `The amounts applied (${formatCurrency(cashApplied(body).toFixed(2))}) are more than the amount received (${formatCurrency(amount || '0')}).`,
+        },
+        appliedExceedsPaymentFixes({
+          paymentAmount: amount || '0',
+          applications: [
+            ...body.applications.map((a, k) => {
+              const inv = visibleInvoices.find((i) => i.id === a.invoiceId);
+              return { path: `applications.${k}.amountApplied`, amount: a.amountApplied, label: `invoice #${inv ? invNo(inv) : k + 1}` };
+            }),
+            ...body.journalItems.map((j, k) => ({
+              path: `journalItems.${k}.amount`,
+              amount: j.amount,
+              label: shownCharges.find((c) => c.journalLineId === j.journalLineId)?.ref ?? 'the journal charge',
+            })),
+          ],
+        }),
+        ctx,
+      );
+      return true;
+    }
+    return false;
+  }
+
   async function handleSubmit() {
-    if (!customerId) { toast('Please select a customer.', 'danger'); return; }
+    setShowErrors(true);
+    const errs = validateForm();
+    if (hasErrors(errs)) {
+      focusFirstError('pm', errs);
+      return;
+    }
+    // C1: a deposited payment keeps its amount / customer / currency unless taken out of the deposit.
     if (depositBlocked) {
       toast('This payment is in a bank deposit. Keep the amount, or tick "Take it out of the deposit" to save this change.', 'danger');
       return;
     }
-    if (!date) { toast('Please enter a date.', 'danger'); return; }
     const amt = Number(amount || 0);
-    if (amt < 0) { toast('The amount received cannot be negative.', 'danger'); return; }
-    if (amt === 0 && creditTotal === 0 && discountTotal === 0) {
-      toast('Enter the amount received, or apply a credit or discount.', 'danger');
-      return;
-    }
-    if (foreign && !(Number(exchangeRate) > 0)) {
-      toast(`Enter the exchange rate: how much 1 ${currency} is worth in your home currency.`, 'danger');
-      return;
-    }
-    if (appliedTotal > amt + 0.005) {
-      toast('You applied more cash than you received. Lower an amount or raise the total.', 'danger');
-      return;
-    }
-    for (const c of shownCharges) {
-      const cash = Number(journalAmounts[c.journalLineId] || 0);
-      if (cash + creditOn(JE_PREFIX + c.journalLineId) > Number(c.open) + 0.005) {
-        toast(`${c.ref}: the payment and credits are more than what is still open (${formatCurrency(c.open)}).`, 'danger');
-        return;
-      }
-    }
-    for (const inv of visibleInvoices) {
-      const cash = Number(applicationAmounts[inv.id] || 0);
-      const disc = Number(discountAmounts[inv.id] || 0);
-      if (cash + disc + creditOn(inv.id) > Number(inv.balanceDue) + 0.005) {
-        toast(`Invoice #${invNo(inv)}: cash, discount and credits add up to more than it owes.`, 'danger');
-        return;
-      }
-    }
     for (const c of shownCredits) {
       const u = creditUse[c.id];
       if (u && Number(u.amount) > Number(c.available) + 0.005) {
@@ -664,13 +818,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         return;
       }
     }
-    if (!prefs.company.useUndepositedFunds && !depositAccountId) {
-      toast('Choose the account to deposit this payment to.', 'danger');
-      return;
-    }
-    if (!confirmTransactionDate(date, prefs)) return;
 
-    const body = {
+    const body: PaymentBody = {
       customerId,
       date,
       method,
@@ -690,21 +839,19 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       paymentCredits: paymentCreditApps,
       ...(depositChange && removeFromDeposit ? { removeFromDeposit: true } : {}),
     };
-    setSaving(true);
+    const ctx: FixContext<PaymentBody> = {
+      payload: cleanPaymentBody(body),
+      resubmit: send,
+      prepare: cleanPaymentBody,
+      applyToForm,
+      fallback: 'Failed to save payment',
+    };
+    if (offerOverApplied(body, ctx)) return;
+    if (!confirmTransactionDate(date, prefs)) return;
     try {
-      if (editing) {
-        await api.put(`/api/payments/${editing.id}`, body);
-        toast('Payment updated.', 'success');
-      } else {
-        await api.post('/api/payments', body);
-        toast('Payment recorded successfully.', 'success');
-      }
-      onSaved();
-      onClose();
+      await send(body);
     } catch (err: unknown) {
-      toastError(err, 'Failed to save payment');
-    } finally {
-      setSaving(false);
+      fixer.report(err, ctx);
     }
   }
 
@@ -740,6 +887,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       }
     >
       <div className="space-y-4">
+        {fixer.panel}
         {editing && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
             Saving changes re-posts this payment so your books stay balanced. Invoices get their old
@@ -782,6 +930,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
               value={customerId}
               onChange={(e) => setCustomerId(e.target.value)}
               autoFocus
+              aria-required="true"
+              {...fieldA11y('pm', 'customer', fieldErrors)}
             >
               <option value="">— Select customer —</option>
               {customers.map((c) => (
@@ -790,6 +940,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                 </option>
               ))}
             </Select>
+            <FieldError formId="pm" name="customer" errors={fieldErrors} />
           </div>
           {showCurrency && (
             <>
@@ -824,7 +975,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                   placeholder={foreign ? 'e.g. 1.10' : '1'}
                   value={foreign ? exchangeRate : '1'}
                   onChange={(e) => setExchangeRate(e.target.value)}
+                  {...fieldA11y('pm', 'rate', fieldErrors)}
                 />
+                <FieldError formId="pm" name="rate" errors={fieldErrors} />
               </div>
             </>
           )}
@@ -841,7 +994,14 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         <div className="grid grid-cols-3 gap-3">
           <div>
             <Label htmlFor="pm-date" required>Payment Date</Label>
-            <DateInput id="pm-date" value={date} onChange={(e) => setDate(e.target.value)} />
+            <DateInput
+              id="pm-date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              aria-required="true"
+              {...fieldA11y('pm', 'date', fieldErrors)}
+            />
+            <FieldError formId="pm" name="date" errors={fieldErrors} />
           </div>
           <div>
             <Label htmlFor="pm-method">Method</Label>
@@ -858,7 +1018,12 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
             <Label htmlFor="pm-deposit" required={!prefs.company.useUndepositedFunds}>
               Deposit to <Help term="undeposited-funds" />
             </Label>
-            <Select id="pm-deposit" value={depositAccountId} onChange={(e) => setDepositAccountId(e.target.value)}>
+            <Select
+              id="pm-deposit"
+              value={depositAccountId}
+              onChange={(e) => setDepositAccountId(e.target.value)}
+              {...fieldA11y('pm', 'deposit', fieldErrors)}
+            >
               {/* Preferences > Payments: with Undeposited Funds off, a bank account must be picked. */}
               <option value="">
                 {prefs.company.useUndepositedFunds ? 'Undeposited Funds (deposit later)' : 'Select a bank account…'}
@@ -871,6 +1036,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                   </option>
                 ))}
             </Select>
+            <FieldError formId="pm" name="deposit" errors={fieldErrors} />
           </div>
         </div>
 
@@ -878,7 +1044,14 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         <div className="grid grid-cols-3 gap-3">
           <div>
             <Label htmlFor="pm-amount" required>Amount Received{foreign ? ` (${currency})` : ''}</Label>
-            <AmountInput id="pm-amount" placeholder="0.00" value={amount} onChange={(e) => changeAmount(e.target.value)} />
+            <AmountInput
+              id="pm-amount"
+              placeholder="0.00"
+              value={amount}
+              onChange={(e) => changeAmount(e.target.value)}
+              {...fieldA11y('pm', 'amount', fieldErrors)}
+            />
+            <FieldError formId="pm" name="amount" errors={fieldErrors} />
           </div>
           <div>
             <Label htmlFor="pm-ref">Reference / Check #</Label>
@@ -1272,13 +1445,14 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
   async function handleApply() {
     if (!payment) return;
     if (applications.length === 0) { toast('Enter an amount to apply.', 'danger'); return; }
-    if (appliedTotal > unapplied + 0.005) {
+    // Exact Decimal comparisons, like the server (no float tolerance).
+    if (sumMoney(applications.map((a) => a.amountApplied)).greaterThan(dec(payment.unapplied))) {
       toast('Total applied exceeds the unapplied balance.', 'danger');
       return;
     }
     for (const a of applications) {
       const inv = invoices.find((i) => i.id === a.invoiceId);
-      if (inv && Number(a.amountApplied) > Number(inv.balanceDue) + 0.005) {
+      if (inv && dec(a.amountApplied).greaterThan(dec(inv.balanceDue))) {
         toast(`Invoice #${invNo(inv)} only owes ${money(inv.balanceDue, cur)}.`, 'danger');
         return;
       }

@@ -134,6 +134,21 @@ export function describeError(err: unknown, fallback = 'That didn’t work.'): F
     };
   }
 
+  // Soft warnings the user can confirm (lib/salesRouteErrors.ts): not failures, just a question.
+  if (err.code === 'CREDIT_LIMIT' || err.code === 'NEGATIVE_STOCK' || err.code === 'PROGRESS_OVERBILL') {
+    return {
+      code: 'CONFLICT',
+      title:
+        err.code === 'CREDIT_LIMIT'
+          ? 'Over the customer’s credit limit'
+          : err.code === 'NEGATIVE_STOCK'
+            ? 'Not enough inventory'
+            : 'More than the estimate',
+      message: specific || 'Please confirm before saving.',
+      nextStep: 'Choose a fix below, or change the form and save again.',
+    };
+  }
+
   switch (code) {
     case 'UNBALANCED':
       return {

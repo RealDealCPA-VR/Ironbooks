@@ -25,6 +25,7 @@
  * Multi-tenant safety: every query is scoped by ctx.companyId.
  * Money: all arithmetic uses Money/toAmountString — never JS floats.
  */
+import { overAppliedFixes } from '@/lib/errorFixes';
 import { isPaymentSourceAccount } from '@/lib/accountTypes';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
@@ -249,7 +250,7 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
     const v = (code ?? '').trim().toUpperCase();
     return v === '' || v === homeCode ? null : v;
   };
-  for (const app of input.applications) {
+  for (const [appIdx, app] of input.applications.entries()) {
     const applied = Money.of(app.amountApplied);
     const discount = Money.of(app.discountTaken ?? 0);
     if (applied.lessThanOrEqualTo(0)) {
@@ -287,6 +288,15 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
       throw validation(
         `Amount applied plus discount (${toAmountString(settled)}) exceeds balance due ` +
           `(${toAmountString(balance)}) on bill ${app.billId}.`,
+        { billId: app.billId, balanceDue: toAmountString(balance), requested: toAmountString(settled) },
+        // Fix: pay exactly what the bill still owes after its discount.
+        overAppliedFixes({
+          path: `applications.${appIdx}.amountApplied`,
+          balanceDue: balance,
+          otherApplied: discount,
+          label: 'this bill',
+          allowZero: false,
+        }),
       );
     }
     billRows.push({ bill, applied, discount });
@@ -880,6 +890,7 @@ export async function markBillPaymentPrinted(
     number: checkNumber,
     exclude: { source: 'bill_payment', id: payment.id },
     allowDuplicate: input.allowDuplicateNumber,
+    numberField: 'checkNumber',
   });
 
   return inTransaction(ctx, async (tx) => {

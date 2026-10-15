@@ -7,6 +7,7 @@
  * POST — record a new payment received from a customer
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { serviceErrorBody } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { receivePayment, searchPayments } from '@/lib/services/payments';
 import { ServiceError } from '@/lib/services/_base';
@@ -59,7 +60,7 @@ export async function GET(req: NextRequest) {
   } catch (err) {
     if (err instanceof ServiceError) {
       return NextResponse.json(
-        { error: err.message, code: err.code, details: err.details },
+        serviceErrorBody(err),
         { status: errorStatus(err.code) },
       );
     }
@@ -99,7 +100,7 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     if (err instanceof ServiceError) {
       return NextResponse.json(
-        { error: err.message, code: err.code, details: err.details },
+        serviceErrorBody(err),
         { status: errorStatus(err.code) },
       );
     }

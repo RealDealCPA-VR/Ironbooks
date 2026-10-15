@@ -22,20 +22,31 @@
  *
  * Friendly errors: ApiError.friendly (and toastError in components/ui.tsx) translate the
  * server's ServiceError code into plain language with a next step — see lib/friendlyErrors.ts.
+ * ApiError.fixes carries the server's fix suggestions (lib/errorFixes.ts), rendered as Fix
+ * buttons by components/ErrorFixPanel.tsx.
  */
 import { describeError, type FriendlyError } from '@/lib/friendlyErrors';
 import { isPasswordChangeRequiredError } from '@/lib/passwordPolicy';
+import { parseFixes, type ErrorFix } from '@/lib/errorFixes';
 
 export class ApiError extends Error {
+  /**
+   * Fix suggestions the server sent with the error (`fixes` in the body; lib/errorFixes.ts).
+   * Empty when none. Shown as Fix buttons by components/ErrorFixPanel.tsx and toastError.
+   */
+  public fixes: ErrorFix[];
+
   constructor(
     public status: number,
     message: string,
     public code?: string,
     /** The server's structured details (e.g. { staleVersion, changedBy } on a record-lock 409). */
     public details?: unknown,
+    fixes?: unknown,
   ) {
     super(message);
     this.name = 'ApiError';
+    this.fixes = parseFixes(fixes);
   }
 
   /**
@@ -196,7 +207,7 @@ async function handle<T>(res: Response): Promise<T> {
         '/login?next=' + encodeURIComponent(window.location.pathname + window.location.search),
       );
     }
-    throw new ApiError(res.status, message, data?.code, data?.details);
+    throw new ApiError(res.status, message, data?.code, data?.details, data?.fixes);
   }
   return data as T;
 }
@@ -451,6 +462,8 @@ async function mutate<T>(
           retryErr.status,
           'That closing date password is not correct, or your role is not allowed to change transactions on or before the closing date.',
           retryErr.code,
+          retryErr.details,
+          retryErr.fixes,
         );
       }
     }
@@ -474,3 +487,8 @@ export const api = {
     mutate<T>('PUT', url, body, opts),
   del: <T = unknown>(url: string, opts?: MutateOpts) => mutate<T>('DELETE', url, undefined, opts),
 };
+
+/** The fix suggestions carried by any thrown value (empty when it is not an ApiError or has none). */
+export function errorFixes(err: unknown): ErrorFix[] {
+  return err instanceof ApiError ? err.fixes : [];
+}

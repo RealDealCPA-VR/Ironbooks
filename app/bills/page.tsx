@@ -27,7 +27,7 @@ import {
 import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
-import { api, ApiError } from '@/lib/client';
+import { api } from '@/lib/client';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import {
   BarcodeScanInput,
@@ -42,12 +42,18 @@ import { formatDate } from '@/lib/utils';
 import {
   TERMS_CHOICES,
   type PurchaseVendor,
-  saveWithDuplicateCheck,
   vendorPrefillAccountIds,
 } from '@/lib/purchasesClient';
+import { useErrorFixes } from '@/components/ErrorFixPanel';
+import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
+import { getPath, missingClassCheck, missingClassFixes, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { amountMessage, collectErrors, dateMessage, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
+
+/** Body sent to /api/bills (fix patches address its paths, e.g. "billNumber", "lines.0.accountId"). */
+type BillBody = Record<string, unknown>;
 // wave2 prefs: Preferences-driven defaults/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
-import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
+import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
@@ -234,6 +240,9 @@ export default function BillsPage() {
   // Modal state — editingId set means the modal is editing an existing bill.
   const [modalOpen, setModalOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // Fix errors where they happen: server fix suggestions + inline field messages.
+  const fixer = useErrorFixes<BillBody>();
+  const [showErrors, setShowErrors] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [loadingEditId, setLoadingEditId] = useState<string | null>(null);
 
@@ -278,20 +287,18 @@ export default function BillsPage() {
     async function init() {
       setLoading(true);
       try {
-        const [billData, vendorData, accountData, itemData] = await Promise.all([
+        const [billData, vendorData, accountData, itemData, classData] = await Promise.all([
           api.get<Bill[]>('/api/bills'),
           api.get<Vendor[]>('/api/vendors'),
           api.get<Account[]>('/api/accounts'),
           api.get<{ items: Item[] }>('/api/items'),
+          api.get<ClassRow[]>('/api/classes').catch(() => [] as ClassRow[]),
         ]);
         setBills(billData);
+        setClasses(classData);
         setVendors(vendorData);
         setAccounts(accountData);
         setItems(itemData.items ?? []);
-        api
-          .get<ClassRow[]>('/api/classes')
-          .then(setClasses)
-          .catch(() => setClasses([]));
         api
           .get<CustomerRow[]>('/api/customers')
           .then(setCustomers)
@@ -350,6 +357,8 @@ export default function BillsPage() {
   // ---------------------------------------------------------------------------
 
   function openModal() {
+    fixer.clear();
+    setShowErrors(false);
     setEditingId(null);
     setVendorId('');
     vendorRef.current = '';
@@ -563,52 +572,77 @@ export default function BillsPage() {
   // Submit new bill
   // ---------------------------------------------------------------------------
 
-  async function handleSubmit() {
-    if (!vendorId) {
-      toast('Please select a vendor.', 'danger');
-      return;
-    }
-    if (!date) {
-      toast('Bill date is required.', 'danger');
-      return;
-    }
-    for (const [i, line] of lines.entries()) {
+  /**
+   * Inline field messages (lib/fieldValidation.ts). A line with no account is reported but does
+   * not block the save: the server answers with a "Use <default account>" fix.
+   */
+  function validateForm(): { errors: FieldErrors; blocking: boolean } {
+    const entries: Record<string, string | null> = {
+      vendor: requiredMessage(vendorId, 'Choose the vendor who sent this bill.'),
+      date: dateMessage(date, 'Bill date'),
+      due: dateMessage(dueDate, 'Due date', { required: false, notBefore: date ? { value: date, what: 'the bill date' } : undefined }),
+    };
+    lines.forEach((line, i) => {
+      const n = i + 1;
       if (line.mode === 'item') {
-        if (!line.itemId) {
-          toast(`Line ${i + 1}: select an item.`, 'danger');
-          return;
-        }
-        if (!line.quantity || Number(line.quantity) <= 0) {
-          toast(`Line ${i + 1}: quantity must be greater than zero.`, 'danger');
-          return;
-        }
-        if (!line.unitCost || Number(line.unitCost) <= 0) {
-          toast(`Line ${i + 1}: cost must be greater than zero.`, 'danger');
-          return;
-        }
-      } else {
-        if (!line.accountId) {
-          toast(`Line ${i + 1}: select an account.`, 'danger');
-          return;
-        }
-        if (!line.amount || Number(line.amount) <= 0) {
-          toast(`Line ${i + 1}: amount must be greater than zero.`, 'danger');
-          return;
+        entries[`line-${i}-item`] = requiredMessage(line.itemId, `Line ${n}: choose an item.`);
+        entries[`line-${i}-qty`] = Number(line.quantity) > 0 ? null : `Line ${n}: the quantity must be more than zero.`;
+        entries[`line-${i}-cost`] = Number(line.unitCost) > 0 ? null : `Line ${n}: enter what each one cost.`;
+        return;
+      }
+      entries[`line-${i}-account`] = requiredMessage(line.accountId, `Line ${n}: choose an account.`);
+      entries[`line-${i}-amount`] = amountMessage(line.amount, { label: `Line ${n} amount`, required: true });
+    });
+    const errors = collectErrors(entries);
+    return { errors, blocking: Object.keys(errors).some((k) => !/^line-\d+-account$/.test(k)) };
+  }
+  const fieldErrors: FieldErrors = showErrors ? validateForm().errors : {};
+
+  /** Copy a fix's changes (request-body paths) back onto the form. */
+  function applyToForm(patched: BillBody, fix: ErrorFix) {
+    for (const op of fix.patch ?? []) {
+      const value = getPath(patched, op.path);
+      if (op.path === 'date' && typeof value === 'string') setDate(value);
+      else if (op.path === 'billNumber') setBillNumber(typeof value === 'string' ? value : '');
+      else {
+        const lp = parseLinePath(op.path);
+        if (lp?.collection === 'lines' && (lp.field === 'accountId' || lp.field === 'amount' || lp.field === 'classId')) {
+          updateLine(lp.index, { [lp.field]: typeof value === 'string' ? value : '' });
         }
       }
     }
+  }
 
-    if (!confirmTransactionDate(date, prefs)) return;
-    // Preferences > Bills: "Warn about duplicate bill numbers from same vendor".
-    const dupBill = findDuplicateNumber(billNumber, bills, (b) => b.billNumber, {
-      excludeId: editingId,
-      sameScope: (b) => b.vendorId === vendorId && b.status !== 'void',
-    });
-    if (!confirmUniqueNumber(prefs.company.warnDuplicateBillNumbers, 'Bill number', dupBill, billNumber)) return;
-
+  /** Save the bill. Throws on failure (the fix presenter shows it). */
+  async function send(body: BillBody) {
     setSubmitting(true);
     try {
-      const payload = {
+      await (editingId ? api.patch(`/api/bills/${editingId}`, body) : api.post('/api/bills', body));
+      // Smart default date: the date this new bill was saved with (a "move the date" fix included).
+      if (!editingId) smart.rememberDate(typeof body.date === 'string' ? body.date : date);
+      toast(editingId ? 'Bill updated.' : 'Bill created.', 'success');
+      fixer.clear();
+      setModalOpen(false);
+      await fetchBills();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleSubmit() {
+    setShowErrors(true);
+    const check = validateForm();
+    if (check.blocking) {
+      focusFirstError('bill', check.errors);
+      return;
+    }
+
+    if (!confirmTransactionDate(date, prefs)) return;
+    // Duplicate vendor reference numbers (Preferences > Bills) are caught by the server, which
+    // offers a "Keep it anyway" fix.
+
+    {
+      const payload: BillBody = {
         vendorId,
         billNumber: billNumber.trim() || undefined,
         date,
@@ -641,21 +675,27 @@ export default function BillsPage() {
               };
         }),
       };
-      // Duplicate vendor reference number: warn and let the user keep it (QB behaviour).
-      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-        editingId
-          ? api.patch(`/api/bills/${editingId}`, { ...payload, allowDuplicateNumber })
-          : api.post('/api/bills', { ...payload, allowDuplicateNumber }),
-      );
-      if (saved === null) return;
-      if (!editingId) smart.rememberDate(date);
-      toast(editingId ? 'Bill updated.' : 'Bill created.', 'success');
-      setModalOpen(false);
-      await fetchBills();
-    } catch (err) {
-      toastError(err, editingId ? 'Failed to update bill.' : 'Failed to create bill.');
-    } finally {
-      setSubmitting(false);
+      const ctx = {
+        payload,
+        resubmit: send,
+        applyToForm,
+        fallback: editingId ? 'Failed to update bill.' : 'Failed to create bill.',
+      };
+      // Class tracking "warn when a transaction has no class" (lib/formPrefs.ts): offer fixes
+      // instead of a yes/no box — use the class already on another line (or the only class), or
+      // save without one. A bill-level class covers every line left blank (the service fills it).
+      const classless = classWarningApplies(classId || null, prefs)
+        ? missingClassCheck(payload.lines as { classId?: string | null }[], classes)
+        : null;
+      if (classless) {
+        fixer.offer({ title: classless.title, message: classless.message }, missingClassFixes(classless), ctx);
+        return;
+      }
+      try {
+        await send(payload);
+      } catch (err) {
+        fixer.report(err, ctx);
+      }
     }
   }
 
@@ -827,6 +867,7 @@ export default function BillsPage() {
         }
       >
         <div className="space-y-4">
+          {fixer.panel}
           {editingId && (
             <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
               Saving re-posts the bill&apos;s journal entry on the new date and re-receives any
@@ -841,6 +882,8 @@ export default function BillsPage() {
               autoFocus
               value={vendorId}
               onChange={(e) => handleVendorChange(e.target.value)}
+              aria-required="true"
+              {...fieldA11y('bill', 'vendor', fieldErrors)}
             >
               <option value="">Select vendor…</option>
               {vendors.map((v) => (
@@ -849,6 +892,7 @@ export default function BillsPage() {
                 </option>
               ))}
             </Select>
+            <FieldError formId="bill" name="vendor" errors={fieldErrors} />
             {prefillNote && <p className="mt-1 text-xs text-electric">{prefillNote}</p>}
           </div>
 
@@ -869,7 +913,10 @@ export default function BillsPage() {
                 id="bill-date"
                 value={date}
                 onChange={(e) => setDate(e.target.value)}
+                aria-required="true"
+                {...fieldA11y('bill', 'date', fieldErrors)}
               />
+              <FieldError formId="bill" name="date" errors={fieldErrors} />
             </div>
           </div>
 
@@ -892,7 +939,9 @@ export default function BillsPage() {
                 id="bill-due"
                 value={dueDate}
                 onChange={(e) => setDueDate(e.target.value)}
+                {...fieldA11y('bill', 'due', fieldErrors)}
               />
+              <FieldError formId="bill" name="due" errors={fieldErrors} />
               <p className="mt-1 text-xs text-navy/40">Leave blank to work it out from the terms.</p>
             </div>
           </div>
@@ -993,6 +1042,7 @@ export default function BillsPage() {
                           value={line.itemId}
                           onChange={(id) => pickItem(idx, id)}
                           choices={itemChoices}
+                          {...fieldA11y('bill', `line-${idx}-item`, fieldErrors)}
                         />
                       </div>
 
@@ -1000,6 +1050,8 @@ export default function BillsPage() {
                       <div className="w-16 shrink-0">
                         <AmountInput
                           placeholder="Qty"
+                          aria-label={`Line ${idx + 1} quantity`}
+                          {...fieldA11y('bill', `line-${idx}-qty`, fieldErrors)}
                           value={line.quantity}
                           onChange={(e) => updateLine(idx, { quantity: e.target.value })}
                         />
@@ -1009,6 +1061,8 @@ export default function BillsPage() {
                       <div className="w-24 shrink-0">
                         <AmountInput
                           placeholder="Cost"
+                          aria-label={`Line ${idx + 1} cost each`}
+                          {...fieldA11y('bill', `line-${idx}-cost`, fieldErrors)}
                           value={line.unitCost}
                           onChange={(e) => updateLine(idx, { unitCost: e.target.value })}
                         />
@@ -1029,6 +1083,7 @@ export default function BillsPage() {
                           value={line.accountId}
                           onChange={(id) => updateLine(idx, { accountId: id })}
                           choices={accountChoices}
+                          {...fieldA11y('bill', `line-${idx}-account`, fieldErrors)}
                         />
                       </div>
 
@@ -1045,6 +1100,8 @@ export default function BillsPage() {
                       <div className="w-24 shrink-0">
                         <AmountInput
                           placeholder="0.00"
+                          aria-label={`Line ${idx + 1} amount`}
+                          {...fieldA11y('bill', `line-${idx}-amount`, fieldErrors)}
                           value={line.amount}
                           onChange={(e) => updateLine(idx, { amount: e.target.value })}
                         />
@@ -1115,6 +1172,12 @@ export default function BillsPage() {
                 </div>
               ))}
             </div>
+            {/* Line messages (each input points at its own message via aria-describedby). */}
+            {Object.keys(fieldErrors)
+              .filter((k) => k.startsWith('line-'))
+              .map((k) => (
+                <FieldError key={k} formId="bill" name={k} errors={fieldErrors} />
+              ))}
 
             {/* Running total */}
             <div className="mt-3 flex justify-end">

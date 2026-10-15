@@ -31,6 +31,8 @@
  */
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
+import { creditLimitFixes } from '@/lib/errorFixes';
+import { assertStockAvailable } from './stockWarning';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -195,6 +197,12 @@ export interface CreateInvoiceInput {
    */
   overrideCreditLimit?: boolean;
   /**
+   * Fix errors where they happen: the form asks the server to warn (soft NEGATIVE_STOCK warning
+   * with fixes, lib/services/stockWarning.ts) when an inventory line sells more than is on hand.
+   * The "Sell anyway" fix retries with false. Omitted = no check (QB lets stock go negative).
+   */
+  checkStock?: boolean;
+  /**
    * Lines that bill estimate lines (estimateLineId) may not push a line past 100% of the
    * estimate without this flag (QB warns, then lets you): the save is refused with a
    * VALIDATION error whose details carry `{ warning: 'PROGRESS_OVERBILL', lines }`.
@@ -299,6 +307,7 @@ export function creditLimitError(breach: CreditLimitBreach): ServiceError {
     'VALIDATION',
     `Credit limit exceeded: this customer's balance would be ${breach.newBalance}, which is ${breach.overBy} over their credit limit of ${breach.creditLimit}. Save anyway?`,
     breach,
+    creditLimitFixes(),
   );
 }
 
@@ -1407,6 +1416,7 @@ function termsColumn(terms: string | null | undefined): string | null {
 export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
   input = await applyTermsDueDate(ctx, input);
   await assertSalesTaxAllowed(ctx, input);
+  if (input.checkStock && input.status !== 'draft') await assertStockAvailable(ctx, input.lines ?? []);
   // Customer's tax item when the form left it out; non-taxable customer → untaxed lines.
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   input = await applyCustomerShipToDefault(ctx, input);
@@ -1781,6 +1791,14 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     .from(invoiceLines)
     .where(eq(invoiceLines.invoiceId, id));
   await assertSalesTaxAllowed(ctx, input, [existing.taxRateId, ...keptTaxLines.map((l) => l.taxRateId)]);
+  if (input.checkStock && existing.status !== 'draft') {
+    // The stock this invoice already relieved comes back before the edited lines are re-sold.
+    const sold = await ctx.db
+      .select({ itemId: invoiceLines.itemId, quantity: invoiceLines.quantity })
+      .from(invoiceLines)
+      .where(eq(invoiceLines.invoiceId, id));
+    await assertStockAvailable(ctx, input.lines ?? [], sold);
+  }
 
   // An edit that does not mention the sales rep keeps the current one (it was usually set
   // via assignInvoiceRep, and it is also a price-rule condition).

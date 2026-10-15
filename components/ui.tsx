@@ -12,6 +12,7 @@ import {
   isMathExpression,
 } from '@/lib/shortcuts';
 import { describeError } from '@/lib/friendlyErrors';
+import type { ErrorFix } from '@/lib/errorFixes';
 
 // Re-export the line-grid keyboard hook so pages can import it from the kit.
 export { useGridKeys, type GridKeysOptions } from '@/lib/shortcuts';
@@ -547,6 +548,8 @@ type Toast = {
   title?: string;
   /** Optional "what to do next" line (friendly errors). */
   nextStep?: string;
+  /** Optional Fix buttons (server fix suggestions, lib/errorFixes.ts). */
+  actions?: { label: string; onClick: () => void }[];
 };
 let pushToastFn: ((t: Omit<Toast, 'id'>) => void) | null = null;
 export function toast(message: string, tone: Toast['tone'] = 'info') {
@@ -559,14 +562,41 @@ export function toast(message: string, tone: Toast['tone'] = 'info') {
  * NOT_FOUND, …) via lib/friendlyErrors.ts. `fallback` is the action-specific message used
  * when the error carries no useful text (e.g. "Failed to save invoice.").
  */
-export function toastError(err: unknown, fallback?: string) {
+export function toastError(
+  err: unknown,
+  fallback?: string,
+  /**
+   * Fix errors where they happen: when the error carries fix suggestions (ApiError.fixes),
+   * `onFix` turns them into buttons on the toast. Without it, "go to" (navigate) fixes are still
+   * offered as buttons that open the page.
+   */
+  opts?: { onFix?: (fix: ErrorFix) => void },
+) {
   const f = describeError(err, fallback);
   // A save the user cancelled at a Preferences prompt is not an error.
   if ((err as { code?: string } | null)?.code === 'CANCELLED') {
     pushToastFn?.({ tone: 'info', message: (err as Error).message });
     return;
   }
-  pushToastFn?.({ tone: 'danger', title: f.title, message: f.message, nextStep: f.nextStep });
+  const fixes = (err as { fixes?: unknown } | null)?.fixes;
+  const list = Array.isArray(fixes) ? (fixes as ErrorFix[]) : [];
+  const actions = list
+    .filter((fix) => opts?.onFix || (fix.kind === 'navigate' && fix.href))
+    .slice(0, 3)
+    .map((fix) => ({
+      label: fix.label,
+      onClick: () => {
+        if (opts?.onFix) opts.onFix(fix);
+        else if (fix.href && typeof window !== 'undefined') window.location.assign(fix.href);
+      },
+    }));
+  pushToastFn?.({
+    tone: 'danger',
+    title: f.title,
+    message: f.message,
+    nextStep: f.nextStep,
+    ...(actions.length ? { actions } : {}),
+  });
 }
 
 export function Toaster() {
@@ -580,8 +610,11 @@ export function Toaster() {
     pushToastFn = (t) => {
       const id = ++n;
       setToasts((prev) => [...prev, { ...t, id }]);
-      // Guidance needs reading time: errors with a next step stay up longer.
-      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), t.nextStep ? 9000 : 4000);
+      // Guidance needs reading time: errors with a next step stay up longer (with Fix buttons longer still).
+      setTimeout(
+        () => setToasts((prev) => prev.filter((x) => x.id !== id)),
+        t.actions?.length ? 15000 : t.nextStep ? 9000 : 4000,
+      );
     };
     return () => {
       pushToastFn = null;
@@ -601,6 +634,23 @@ export function Toaster() {
           {t.title && <div className="font-bold">{t.title}</div>}
           <div className={t.title ? 'font-normal' : undefined}>{t.message}</div>
           {t.nextStep && <div className="mt-1 font-normal text-white/90">{t.nextStep}</div>}
+          {t.actions && t.actions.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {t.actions.map((a) => (
+                <button
+                  key={a.label}
+                  type="button"
+                  onClick={() => {
+                    dismiss(t.id);
+                    a.onClick();
+                  }}
+                  className="rounded-md bg-white/95 px-2.5 py-1 text-xs font-semibold text-navy hover:bg-white focus:outline-none focus:ring-2 focus:ring-white/70"
+                >
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          )}
           <button
             type="button"
             onClick={() => dismiss(t.id)}

@@ -4,11 +4,12 @@
  * DELETE /api/bills/:id   — void a bill (and reverse its GL entry)
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { zodErrorWithFixes } from '@/lib/fixRoutes';
+import { serviceErrorBody } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { getBill, updateBill, voidBill } from '@/lib/services/bills';
 import { ServiceError } from '@/lib/services/_base';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
-import { zodErrorBody } from '@/lib/validation/helpers';
 import { createBillSchema } from '@/lib/validation/bills';
 
 function errorResponse(err: unknown) {
@@ -23,7 +24,7 @@ function errorResponse(err: unknown) {
             : err.code === 'CONFLICT'
               ? 409
               : 500;
-    return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+    return NextResponse.json(serviceErrorBody(err), { status });
   }
   console.error('[bills/[id]/route]', err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
@@ -49,7 +50,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const body = await req.json().catch(() => ({}));
     const parsed = createBillSchema.safeParse(body);
     if (!parsed.success) {
-      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+      return zodErrorWithFixes(ctx, parsed.error, body, 'expense');
     }
 
     // Multi-user: 409 if someone else saved this bill since it was loaded.

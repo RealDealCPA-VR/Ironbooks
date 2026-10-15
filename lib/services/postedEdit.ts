@@ -168,7 +168,8 @@ export async function assertClosedPeriodEdit(
     }
   }
   if (!date) return;
-  const check = await assertPeriodOpen(ctx, date, knownSource ? { sourceRef } : {});
+  // The existing transaction's date: no "move the date" fix (it would not unlock the edit).
+  const check = await assertPeriodOpen(ctx, date, { ...(knownSource ? { sourceRef } : {}), movable: false });
   if (params.entryId) {
     await recordClosingDateException(ctx, check, {
       entryId: params.entryId,

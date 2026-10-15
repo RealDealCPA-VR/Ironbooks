@@ -159,6 +159,10 @@ describe('C1: editing a deposited payment', () => {
     expect(err.message).toMatch(/part of the bank deposit made on 2026-03-12/);
     expect(err.message).toMatch(/amount must stay 80\.00/);
     expect(err.message).toMatch(/Remove from deposit/);
+    // fixit: the same way out as a Fix button (resend with removeFromDeposit).
+    expect(err.fixes).toEqual([
+      expect.objectContaining({ id: 'deposit-remove', kind: 'retry', patch: [{ op: 'set', path: 'removeFromDeposit', value: true }] }),
+    ]);
 
     expect(Number((await getPayment(ctx, p.id)).amount)).toBeCloseTo(80, 2);
     expect(await balanceDue(inv)).toBeCloseTo(0, 2);

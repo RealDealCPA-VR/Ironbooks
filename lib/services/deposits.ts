@@ -28,6 +28,8 @@
  * (and cash back / extra lines) at the deposit's rate, and the difference is the realized exchange
  * gain or loss (6900 Exchange Gain/Loss).
  */
+import { depositMismatchFixes, missingAccountFixes } from '@/lib/errorFixes';
+import { defaultAccountFor } from './errorFixes';
 import { and, eq, inArray, isNull, like, lte, ne, notInArray } from 'drizzle-orm';
 import {
   accounts,
@@ -291,6 +293,12 @@ export async function listUndepositedPayments(
 // createDeposit
 // ---------------------------------------------------------------------------
 
+/** "Deposit to <default bank account>" fix for a missing / wrong deposit account. */
+async function bankAccountFix(ctx: ServiceContext) {
+  const account = await defaultAccountFor(ctx, 'bank', { purpose: 'deposit' });
+  return missingAccountFixes({ paths: ['depositAccountId'], account });
+}
+
 interface PreparedDeposit {
   glLines: PostingLine[];
   /** Deposit lines WITHOUT depositId. Invariant: sum(amount) === netStr. */
@@ -325,7 +333,7 @@ async function prepareDeposit(
     );
   }
   if (!input.depositAccountId) {
-    throw validation('depositAccountId is required.');
+    throw validation('Choose the bank account to deposit to.', undefined, await bankAccountFix(ctx));
   }
   if (new Set(paymentIds).size !== paymentIds.length) {
     throw validation('Duplicate paymentId in deposit.');
@@ -338,7 +346,7 @@ async function prepareDeposit(
 
   // The deposit target must not be the UF account itself.
   if (input.depositAccountId === ufId) {
-    throw validation('Cannot deposit into Undeposited Funds. Choose a bank account.');
+    throw validation('Cannot deposit into Undeposited Funds. Choose a bank account.', undefined, await bankAccountFix(ctx));
   }
 
   // Verify deposit account belongs to this company.
@@ -389,11 +397,17 @@ async function prepareDeposit(
   }
   for (const p of payRows) {
     if (p.voidedAt) {
-      throw validation(`Payment ${p.id} is voided and cannot be deposited.`);
+      throw validation(
+        `Payment ${p.id} is voided and cannot be deposited.`,
+        undefined,
+        depositMismatchFixes({ paymentIds: [p.id], reason: 'voided' }),
+      );
     }
     if (p.depositAccountId !== ufId) {
       throw validation(
         `Payment ${p.id} was not deposited to Undeposited Funds and cannot be re-deposited.`,
+        undefined,
+        depositMismatchFixes({ paymentIds: [p.id], reason: 'not_undeposited' }),
       );
     }
     const payCur = foreignCode(p.currency, home);
@@ -423,11 +437,17 @@ async function prepareDeposit(
   }
   for (const r of srRows) {
     if (r.status === 'void') {
-      throw validation(`Sales receipt ${r.id} is voided and cannot be deposited.`);
+      throw validation(
+        `Sales receipt ${r.id} is voided and cannot be deposited.`,
+        undefined,
+        depositMismatchFixes({ salesReceiptIds: [r.id], reason: 'voided' }),
+      );
     }
     if (r.depositAccountId !== ufId) {
       throw validation(
         `Sales receipt ${r.id} was not received into Undeposited Funds and cannot be re-deposited.`,
+        undefined,
+        depositMismatchFixes({ salesReceiptIds: [r.id], reason: 'not_undeposited' }),
       );
     }
     if (depCur) {
@@ -444,6 +464,8 @@ async function prepareDeposit(
       throw new ServiceError(
         'CONFLICT',
         `One or more payments have already been deposited: ${used.join(', ')}`,
+        { alreadyDeposited: used },
+        depositMismatchFixes({ paymentIds: used, reason: 'already_deposited' }),
       );
     }
   }
@@ -455,6 +477,8 @@ async function prepareDeposit(
       throw new ServiceError(
         'CONFLICT',
         `One or more sales receipts have already been deposited: ${used.join(', ')}`,
+        { alreadyDeposited: used },
+        depositMismatchFixes({ salesReceiptIds: used, reason: 'already_deposited' }),
       );
     }
   }
@@ -511,7 +535,9 @@ async function prepareDeposit(
   const net = gross.minus(cashBackAmt); // what actually lands in the bank
 
   if (cashBackAmt.greaterThanOrEqualTo(gross)) {
-    throw validation('Cash back cannot equal or exceed the deposit subtotal.');
+    throw validation('Cash back cannot equal or exceed the deposit subtotal.', undefined, [
+      { id: 'deposit-no-cashback', kind: 'patch', label: 'Remove the cash back', patch: [{ op: 'set', path: 'cashBack', value: null }] },
+    ]);
   }
   if (net.lessThanOrEqualTo(0)) {
     throw validation('Total deposit amount must be greater than zero.');

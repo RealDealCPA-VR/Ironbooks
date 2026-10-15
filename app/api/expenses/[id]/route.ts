@@ -3,11 +3,11 @@
  * DELETE /api/expenses/:id   — void the expense (reverses its GL entry)
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { zodErrorWithFixes } from '@/lib/fixRoutes';
 import { getServerContext } from '@/lib/context';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getExpense, updateExpense, voidExpense } from '@/lib/services/expenses';
-import { routeError } from '@/lib/routeErrors';
-import { zodErrorBody } from '@/lib/validation/helpers';
+import { routeError, serviceErrorBody } from '@/lib/routeErrors';
 import { createExpenseSchema } from '@/lib/validation/expenses';
 import { ServiceError } from '@/lib/services/_base';
 
@@ -24,7 +24,7 @@ function errorResponse(err: unknown) {
               ? 409
               : 500;
     return NextResponse.json(
-      { error: err.message, code: err.code, details: err.details ?? null },
+      { ...serviceErrorBody(err), details: err.details ?? null },
       { status },
     );
   }
@@ -66,7 +66,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const ctx = await getServerContext();
     const body = await req.json().catch(() => ({}));
     const parsed = createExpenseSchema.safeParse(body);
-    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    if (!parsed.success) return zodErrorWithFixes(ctx, parsed.error, body, 'expense');
     const { allowDuplicateNumber, ...input } = parsed.data;
     const expense = await withVersionCheck(ctx, 'expense', id, expectedVersion(req), (c) => updateExpense(c, id, { ...input, checkDuplicateNumber: !allowDuplicateNumber }));
     return NextResponse.json({ expense });

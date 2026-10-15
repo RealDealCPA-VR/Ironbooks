@@ -263,7 +263,7 @@ export async function reclassifyLines(ctx: ServiceContext, input: ReclassifyInpu
     const byEntry = new Map<string, typeof lines>();
     for (const l of lines) byEntry.set(l.entryId, [...(byEntry.get(l.entryId) ?? []), l]);
     const checks = new Map<string, Awaited<ReturnType<typeof assertPeriodOpen>>>();
-    for (const [entryId, ls] of byEntry) checks.set(entryId, await assertPeriodOpen(tx, ls[0].date));
+    for (const [entryId, ls] of byEntry) checks.set(entryId, await assertPeriodOpen(tx, ls[0].date, { movable: false }));
 
     // Keep each entry's source document in step — or refuse before anything is written.
     const plans: DocSyncPlan[] = [];

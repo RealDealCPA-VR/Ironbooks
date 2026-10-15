@@ -6,11 +6,11 @@
  *          the Undeposited Funds picker)
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { zodErrorWithFixes } from '@/lib/fixRoutes';
 import { getServerContext } from '@/lib/context';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getDeposit, updateDeposit, voidDeposit } from '@/lib/services/deposits';
-import { routeError } from '@/lib/routeErrors';
-import { zodErrorBody } from '@/lib/validation/helpers';
+import { routeError, serviceErrorBody } from '@/lib/routeErrors';
 import { createDepositSchema } from '@/lib/validation/deposits';
 import { ServiceError } from '@/lib/services/_base';
 
@@ -29,7 +29,7 @@ function errorStatus(code: ServiceError['code']): number {
 function errorResponse(err: unknown, label: string) {
   if (err instanceof ServiceError) {
     return NextResponse.json(
-      { error: err.message, code: err.code, details: err.details },
+      serviceErrorBody(err),
       { status: errorStatus(err.code) },
     );
   }
@@ -68,7 +68,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     const ctx = await getServerContext();
     const body = await req.json().catch(() => ({}));
     const parsed = createDepositSchema.safeParse(body);
-    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    if (!parsed.success) return zodErrorWithFixes(ctx, parsed.error, body, 'bank', { purpose: 'deposit' });
     const deposit = await withVersionCheck(ctx, 'deposit', id, expectedVersion(req), (c) => updateDeposit(c, id, parsed.data));
     return NextResponse.json(deposit);
   } catch (err) {

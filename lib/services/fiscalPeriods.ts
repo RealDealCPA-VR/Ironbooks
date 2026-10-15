@@ -7,11 +7,12 @@
  * valid closing-date password (ctx.closingDateOverride, set by getServerContext from the
  * x-closing-password header — see lib/services/company.ts setClosingDate).
  */
+import { closedPeriodFixes, nextDay } from '@/lib/errorFixes';
 import { and, eq, lte, gte } from 'drizzle-orm';
 import { companies, fiscalPeriods } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, notFound, writeAudit } from './_base';
 import { assertWrite } from './rbac';
-import { assertDividingDateOpen } from './accountantCopy/guard';
+import { activeCopy, assertDividingDateOpen } from './accountantCopy/guard';
 
 export async function listPeriods(ctx: ServiceContext) {
   return ctx.db
@@ -85,10 +86,16 @@ export interface PeriodCheck {
 export async function assertPeriodOpen(
   ctx: ServiceContext,
   date: Date,
-  opts: { sourceRef?: string | null } = {},
+  /**
+   * `sourceRef`: the posting's source (Accountant's Copy rules, I1).
+   * `movable: false` when the date cannot simply be changed (e.g. the ORIGINAL date of a
+   * transaction being edited or voided): the "move to the first open date" fix is then omitted.
+   */
+  opts: { sourceRef?: string | null; movable?: boolean } = {},
 ): Promise<PeriodCheck> {
   // Accountant's Copy dividing date (I1): checked first — the closing-date password never bypasses it.
   await assertDividingDateOpen(ctx, date, opts);
+  const movable = opts.movable !== false;
   const closed = await ctx.db
     .select({ id: fiscalPeriods.id })
     .from(fiscalPeriods)
@@ -105,6 +112,11 @@ export async function assertPeriodOpen(
     throw new ServiceError(
       'PERIOD_CLOSED',
       `The accounting period containing ${date.toISOString().slice(0, 10)} is closed. Reopen it under Fiscal Periods to post.`,
+    ).withFixes(
+      closedPeriodFixes({
+        reason: 'fiscalPeriod',
+        firstOpenDate: movable ? await firstOpenDate(ctx, date) : null,
+      }),
     );
   }
 
@@ -122,12 +134,55 @@ export async function assertPeriodOpen(
         throw new ServiceError(
           'PERIOD_CLOSED',
           `The books are closed through ${closingDate}. Transactions dated on or before the closing date require the closing-date password (or clear the closing date in Settings).`,
+          { closingDate },
+        ).withFixes(
+          closingDateFixes(movable ? await firstOpenDate(ctx, date) : null),
         );
       }
       return { closingDateException: closingDate };
     }
   }
   return { closingDateException: null };
+}
+
+/**
+ * First date on or after `from` that can be posted without a password: after the company closing
+ * date and outside every closed fiscal period ('YYYY-MM-DD'; null when none is found within 50
+ * consecutive closed periods). Used for the "Move the date to the first open date" fix.
+ */
+export async function firstOpenDate(ctx: ServiceContext, from: Date): Promise<string | null> {
+  const [company] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  const closingDate = (company?.settings as Record<string, unknown> | null)?.closingDate;
+  let candidate = from.toISOString().slice(0, 10);
+  if (typeof closingDate === 'string' && closingDate && candidate <= closingDate) candidate = nextDay(closingDate);
+  // Accountant's Copy (I1): the client can only post AFTER the dividing date, so the suggested
+  // date is past it too; in the accountant's copy only dates on or before it can post, so a
+  // later date is no fix at all.
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (copy?.side === 'client' && candidate <= copy.dividingDate) candidate = nextDay(copy.dividingDate);
+  const usable = (d: string) => !(copy?.side === 'accountant' && d > copy.dividingDate);
+  const periods = await ctx.db
+    .select({ start: fiscalPeriods.periodStart, end: fiscalPeriods.periodEnd })
+    .from(fiscalPeriods)
+    .where(and(eq(fiscalPeriods.companyId, ctx.companyId), eq(fiscalPeriods.isClosed, true)));
+  const ranges = periods.map((p) => ({
+    start: p.start.toISOString().slice(0, 10),
+    end: p.end.toISOString().slice(0, 10),
+  }));
+  for (let i = 0; i <= 50; i++) {
+    const hit = ranges.find((r) => r.start <= candidate && candidate <= r.end);
+    if (!hit) return usable(candidate) ? candidate : null;
+    candidate = nextDay(hit.end);
+  }
+  return null;
+}
+
+/** Closing-date lock fixes: move the date (when possible) or enter the closing-date password. */
+function closingDateFixes(openDate: string | null) {
+  return closedPeriodFixes({ reason: 'closingDate', firstOpenDate: openDate });
 }
 
 /**

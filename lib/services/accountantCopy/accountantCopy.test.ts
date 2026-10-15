@@ -40,6 +40,7 @@ import { mergeAccounts } from '../merge';
 import { trialBalance } from '../reports';
 import { setClosingDate } from '../company';
 import { condensePeriod } from '../condense';
+import { firstOpenDate } from '../fiscalPeriods';
 import { accountantCopyStatus, cancelAccountantCopy, createAccountantCopy, importChangesFile, reviewChangesFile } from './client';
 import { accountantChanges, exportChangesFile, inspectTransferFile, openAccountantCopyFile } from './accountant';
 import { parseChangesFile, serializeChangesFile } from './format';
@@ -184,6 +185,8 @@ describe("Accountant's Copy", () => {
   it('client: Condense Data is refused while the copy is out (it would delete locked transactions)', async () => {
     await setClosingDate(ctx, { closingDate: '2026-01-31' });
     try {
+      // fixit "move to the first open date" suggests a date past the dividing date, not just the closing date.
+      expect(await firstOpenDate(ctx, new Date('2026-01-15T00:00:00.000Z'))).toBe('2026-04-01');
       await expect(condensePeriod(ctx, { beforeDate: new Date('2026-02-01T00:00:00.000Z'), dataDir: CLIENT_DIR })).rejects.toMatchObject({
         code: 'CONFLICT',
         details: expect.objectContaining({ accountantCopy: true }),

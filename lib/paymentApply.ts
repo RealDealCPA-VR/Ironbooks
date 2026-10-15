@@ -4,6 +4,7 @@
  *    customer's open invoices, oldest first (QB applies to an exact-amount match first).
  *  - sumApplied: "Automatically calculate payments" — the payment amount is the total applied.
  */
+import type Decimal from 'decimal.js';
 import { Money, toAmountString } from '@/lib/money';
 
 export interface OpenDoc {
@@ -89,4 +90,38 @@ export function cashDue<T extends OpenDoc>(docs: T[], deductions: Record<string,
     if (left.gt(0)) out.push({ ...d, balanceDue: toAmountString(left) });
   }
   return out;
+}
+
+/** Decimal of an entered amount; blank or not-a-number counts as 0 (field validation reports those). */
+export function moneyDec(v: string | number | null | undefined): Decimal {
+  try {
+    const d = Money.of(v || 0);
+    return d.isFinite() ? d : Money.of(0);
+  } catch {
+    return Money.of(0);
+  }
+}
+
+/** Decimal sum of entered amounts (blank / invalid count as 0). */
+export function sumMoney(values: ReadonlyArray<string | number | null | undefined>): Decimal {
+  return values.reduce<Decimal>((s, v) => s.plus(moneyDec(v)), Money.of(0));
+}
+
+/**
+ * Receive Payments: cash applied to invoices plus cash applied to General Journal charges — the
+ * same Decimal total the server compares with the amount received.
+ */
+export function cashApplied(body: {
+  applications: ReadonlyArray<{ amountApplied: string | number | null | undefined }>;
+  journalItems: ReadonlyArray<{ amount: string | number | null | undefined }>;
+}): Decimal {
+  return sumMoney([...body.applications.map((a) => a.amountApplied), ...body.journalItems.map((j) => j.amount)]);
+}
+
+/** True when the cash applied is more than the amount received (exact Decimal, no float tolerance). */
+export function appliedExceedsReceived(
+  body: Parameters<typeof cashApplied>[0],
+  amountReceived: string | number | null | undefined,
+): boolean {
+  return cashApplied(body).greaterThan(moneyDec(amountReceived));
 }
