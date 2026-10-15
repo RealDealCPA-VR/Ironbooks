@@ -563,6 +563,13 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/reports/1099-xml': r('reports_purchases', 'GET:print'),
   '/api/reports/inventory-valuation': r('reports_inventory', 'GET'),
   '/api/reports/inventory-valuation/detail': r('reports_inventory', 'GET'),
+  // team home: "Needs attention" inbox. The list/count/snooze are per person (the service only
+  // returns items the member's roles can act on); the actions keep their own areas.
+  '/api/attention': kind('member', 'GET'),
+  '/api/attention/count': kind('member', 'GET'),
+  '/api/attention/state': kind('member', 'POST'),
+  '/api/attention/invoice-reminder': r('customers', 'POST:print'), // like /api/invoices/[id]/email
+  '/api/attention/backup': r('file_utilities', 'POST:create'), // + file Admin (service), like /api/backup
 };
 
 const ANY_REPORT: Area[] = [

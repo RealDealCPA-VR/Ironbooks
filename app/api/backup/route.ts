@@ -23,6 +23,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { requireFileAdmin } from '@/lib/services/access';
 import { withDamagedFileAccess } from '@/lib/db';
+import { recordBackup } from '@/lib/services/attention';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -72,6 +73,7 @@ async function handleGet(_req: NextRequest) {
     }
 
     const { buffer, filename } = createBackup(companyName);
+    await recordBackup(ctx.db, { kind: 'full', userId: ctx.userId, filename }); // inbox: last backup
 
     // NextResponse body must be a BodyInit-compatible type. Copy the Buffer
     // bytes into a fresh concrete ArrayBuffer to satisfy the type constraint.

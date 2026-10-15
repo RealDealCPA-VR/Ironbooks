@@ -2542,3 +2542,30 @@ export const workersCompCodes = pgTable('workers_comp_codes', {
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+// ---- team home (0054): "Needs attention" inbox ----
+
+/** Per-user snooze / dismiss of a "Needs attention" item (key built by lib/services/attention.ts). */
+export const attentionItemStates = pgTable('attention_item_states', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+  itemKey: varchar('item_key', { length: 200 }).notNull(),
+  /** Hidden until this moment (snooze). */
+  snoozedUntil: timestamp('snoozed_until'),
+  /** Hidden for good (until the item's key changes). */
+  dismissedAt: timestamp('dismissed_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/** When a backup of the company file was made (feeds the inbox's "back up" reminder). */
+export const backupLog = pgTable('backup_log', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  userId: uuid('user_id').references(() => users.id),
+  /** 'full' (whole file) | 'company' (one company) | 'auto' (desktop app) | 'quick' (Back up now) */
+  kind: varchar('kind', { length: 20 }).notNull(),
+  filename: varchar('filename', { length: 255 }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
