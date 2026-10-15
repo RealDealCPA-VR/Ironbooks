@@ -33,7 +33,7 @@ import { createEntry, listEntries, updateEntry } from './lists/simpleLists';
 import { activeOrSelected, otherNameLabel, visibleOtherNames } from '@/lib/lists/otherNameOptions';
 import { mergeOtherNames } from './lists/mergeLists';
 import { createCreditMemo, getCreditMemo } from './creditMemos';
-import { createPriceLevel } from './pricing';
+import { assignCustomerPricing, createPriceLevel } from './pricing';
 import { setCustomerPrice } from './customerPricing';
 import { bulkSave } from './lists/bulk';
 import { importIIF, importItemsCSV } from './qbImport';
@@ -408,6 +408,27 @@ describe('B12 price levels on credit memos and the customer form', () => {
     await expect(updateCustomer(noPricing, c.id, { priceLevelId: null })).rejects.toMatchObject({ code: 'FORBIDDEN' });
     const same = await updateCustomer(noPricing, c.id, { priceLevelId: levelId, notes: 'same level' });
     expect(same.priceLevelId).toBe(levelId);
+    expect((await getCustomer(ctx, c.id)).priceLevelId).toBe(levelId);
+  });
+
+  it('applies the same lists-view rule on the Advanced Pricing route (PATCH /api/pricing/customers/:id)', async () => {
+    const full = fullAccess();
+    const noPricing: ServiceContext = {
+      ...ctx,
+      access: { ...full, isAdmin: false, permissions: { ...full.permissions, lists: [] } },
+    };
+    const withPricing: ServiceContext = { ...ctx, access: full };
+    const c = await createCustomer(ctx, { displayName: 'Pricing Route Customer' });
+    // Setting a level: refused without lists view.
+    await expect(assignCustomerPricing(noPricing, c.id, { priceLevelId: levelId })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect((await getCustomer(ctx, c.id)).priceLevelId).toBeNull();
+    // Resending the current (empty) value or omitting it passes.
+    await assignCustomerPricing(noPricing, c.id, { priceLevelId: null });
+    await assignCustomerPricing(noPricing, c.id, {});
+    // With lists view: set works; then clearing without lists view is refused.
+    expect((await assignCustomerPricing(withPricing, c.id, { priceLevelId: levelId })).priceLevelId).toBe(levelId);
+    await expect(assignCustomerPricing(noPricing, c.id, { priceLevelId: null })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect((await assignCustomerPricing(noPricing, c.id, { priceLevelId: levelId })).priceLevelId).toBe(levelId);
     expect((await getCustomer(ctx, c.id)).priceLevelId).toBe(levelId);
   });
 

@@ -64,6 +64,7 @@ import {
   type RoundingMode,
 } from '@/lib/pricingShared';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { requirePermission } from './access';
 
 // Types and constants shared with the UI live in lib/pricingShared.ts (no DB imports).
 export * from '@/lib/pricingShared';
@@ -669,6 +670,23 @@ export async function setPriceLevelItems(
 // Customer assignment (type + price level)
 // ---------------------------------------------------------------------------
 
+/**
+ * A customer's price level belongs to Advanced Pricing (/api/pricing/levels: lists view). Every
+ * path that writes customers.price_level_id (the customer routes and PATCH
+ * /api/pricing/customers/:id, both in the customers area) refuses to set or clear it for users
+ * without lists view. Resending the current value is harmless and passes. Trusted contexts
+ * (no `access`: imports, system jobs, tests) pass.
+ */
+export function requirePriceLevelChangeAccess(
+  ctx: ServiceContext,
+  next: string | null | undefined,
+  current: string | null | undefined,
+): void {
+  if (next === undefined) return;
+  if ((next ?? null) === (current ?? null)) return;
+  requirePermission(ctx, 'lists', 'view');
+}
+
 export async function assignCustomerPricing(
   ctx: ServiceContext,
   customerId: string,
@@ -679,6 +697,7 @@ export async function assignCustomerPricing(
     .from(customers)
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
   if (!before) throw notFound('Customer');
+  requirePriceLevelChangeAccess(ctx, patch.priceLevelId, before.priceLevelId);
   if (patch.priceLevelId) await loadLevel(ctx, patch.priceLevelId);
   if (patch.customerTypeId) {
     const [t] = await ctx.db
