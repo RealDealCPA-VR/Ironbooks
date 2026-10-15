@@ -1,0 +1,388 @@
+/**
+ * Deterministic plain-English grammar for the command bar (Ctrl+K). Runs FIRST for every
+ * command — in the browser for the live preview row and on the server before anything else —
+ * and only when it recognizes nothing may the optional AI fallback be asked.
+ *
+ * Recognized (examples, not an exhaustive list):
+ *   create   "invoice Acme 3 hours consulting", "quote Acme 10 widgets at $12",
+ *            "bill from Staples 120 office supplies", "check to Shell $45.20 fuel",
+ *            "spent $45 on fuel at Shell", "sold 2 widgets to Acme", "sales receipt Acme $80 repair"
+ *   report   "show unpaid bills over 60 days", "overdue invoices from Acme", "who owes us",
+ *            "p&l for last quarter", "a/p aging"
+ *   question "what did we spend on fuel in Q3", "how much did we spend at Staples last month",
+ *            "fuel expenses ytd", "how much did we make from Acme this year"
+ *   action   "pay bills", "reconcile checking", "record deposit", "receive payment from Acme"
+ *   navigate "go to chart of accounts", "open payroll"
+ *
+ * PURE: `today` is injected; no I/O. The output is a CommandIntent (lib/commands/intent.ts);
+ * names are left as typed — the executor matches them against the company's lists.
+ */
+import { parseDateRange, parseSingleDate, yearToDate } from './dates';
+import type { CommandIntent, CreateIntent, FormKind, IntentLine, ReportIntent } from './intent';
+import { isSalesForm } from './intent';
+import { NUM_TOKEN, cut, isReasonableQuantity, looksLikeMoney, parseNumber, tidy } from './text';
+
+const re = (src: string, flags = 'i') => new RegExp(src, flags);
+
+/** Clean a command before parsing: trim, single spaces, no trailing punctuation. */
+export function cleanCommand(input: string): string {
+  return input
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[?!.;,]+$/, '')
+    .trim();
+}
+
+export function parseCommand(input: string, today: Date = new Date()): CommandIntent | null {
+  const raw = cleanCommand(input);
+  if (!raw || raw.length > 500) return null;
+
+  const action = parseAction(raw);
+  if (action) return action;
+
+  // "go to …" / "open …": a report or question phrased as navigation still runs as one.
+  const nav = re(String.raw`^(?:please\s+)?(?:go\s+to|goto|open(?:\s+up)?|take\s+me\s+to|navigate\s+to|jump\s+to|switch\s+to|bring\s+up)\s+(?:the\s+|my\s+|our\s+)?(.+)$`).exec(raw);
+  if (nav) {
+    const inner = parseQuestion(nav[1], today) ?? parseReport(nav[1], today) ?? parseReport(raw, today);
+    return inner ?? { kind: 'navigate', target: tidy(nav[1]) };
+  }
+
+  const q = parseQuestion(raw, today);
+  if (q) return q;
+  const r = parseReport(raw, today);
+  if (r) return r;
+  const c = parseCreate(raw, today);
+  if (c) return c;
+
+  const show = re(String.raw`^(?:show|see|view|display|find)\s+(?:me\s+)?(?:the\s+|my\s+|our\s+)?(.+)$`).exec(raw);
+  if (show) return { kind: 'navigate', target: tidy(show[1]) };
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+function parseAction(raw: string): CommandIntent | null {
+  let m: RegExpExecArray | null;
+  if (re(String.raw`^(?:i\s+(?:need|want)\s+to\s+)?pay(?:ing)?\s+(?:the\s+|my\s+|our\s+|some\s+|all\s+)?(?:open\s+|unpaid\s+)?(?:bills?|vendors?|suppliers?)(?:\s+(?:due|now|today))?$`).test(raw)) {
+    return { kind: 'action', action: 'pay_bills' };
+  }
+  if ((m = re(String.raw`^(?:start\s+(?:a\s+)?|do\s+(?:a\s+)?|begin\s+(?:a\s+)?)?reconcil(?:e|iation|ing)\b(?:\s+(?:the|my|our|for))?\s*(.*)$`).exec(raw))) {
+    const target = tidy(m[1].replace(/\b(?:account|statement|bank\s+statement)\b/gi, ''));
+    return { kind: 'action', action: 'reconcile', ...(target ? { target } : {}) };
+  }
+  if ((m = re(String.raw`^(?:(?:record|make|enter|new|add|create)\s+(?:an?\s+)?(?:bank\s+)?)?deposits?(?:\s+(?:to|into|in)\s+(?:the\s+|my\s+|our\s+)?(.+))?$`).exec(raw))) {
+    return { kind: 'action', action: 'record_deposit', ...(m[1] ? { target: tidy(m[1]) } : {}) };
+  }
+  if ((m = re(String.raw`^(?:(?:receive|record|enter|new|add|take)\s+(?:an?\s+)?)?(?:customer\s+)?payments?(?:\s+(?:from|by|for)\s+(.+))?$`).exec(raw))) {
+    return { kind: 'action', action: 'receive_payment', ...(m[1] ? { target: tidy(m[1]) } : {}) };
+  }
+  if ((m = re(String.raw`^(?:i\s+|we\s+)?got\s+paid(?:\s+(?:by|from)\s+(.+))?$`).exec(raw))) {
+    return { kind: 'action', action: 'receive_payment', ...(m[1] ? { target: tidy(m[1]) } : {}) };
+  }
+  if (re(String.raw`^(?:transfer|move)\s+(?:some\s+)?(?:money|funds|cash)\b`).test(raw) || re(String.raw`^transfer(?:\s+funds)?$`).test(raw)) {
+    return { kind: 'action', action: 'transfer_funds' };
+  }
+  if (re(String.raw`^(?:(?:new|make|create|record|enter|add)\s+(?:an?\s+)?)?(?:general\s+)?journal(?:\s+entry)?$|^(?:new\s+)?je$`).test(raw)) {
+    return { kind: 'action', action: 'journal_entry' };
+  }
+  if (re(String.raw`^(?:run|do|process|start)\s+(?:the\s+)?payroll$|^pay\s+(?:my\s+|the\s+|our\s+)?(?:employees|staff|team)$`).test(raw)) {
+    return { kind: 'action', action: 'run_payroll' };
+  }
+  if (re(String.raw`^(?:bank\s+feeds?|download\s+(?:bank\s+)?transactions|import\s+(?:bank\s+)?(?:transactions|statement))$`).test(raw)) {
+    return { kind: 'action', action: 'bank_feeds' };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Questions: "what did we spend on fuel in Q3"
+// ---------------------------------------------------------------------------
+
+const FILLER = /\b(?:money|in\s+total|total|altogether|overall|so\s+far|all\s+together|exactly|roughly|approximately)\b/gi;
+
+function cleanSubject(s: string | undefined): string | undefined {
+  if (!s) return undefined;
+  const t = tidy(
+    s
+      .replace(FILLER, ' ')
+      .replace(/^(?:on|for|at|with|to|in|from|by|of|the|our|my)\s+/i, '')
+      .replace(/^(?:on|for|at|with|to|in|from|by|of|the|our|my)\s+/i, '')
+      .replace(/\s+(?:on|for|at|with|to|in|from|by)$/i, ''),
+  );
+  if (!t || /^(?:everything|anything|all|stuff|things|it|that|this)$/i.test(t)) return undefined;
+  return t;
+}
+
+export function parseQuestion(raw: string, today: Date): CommandIntent | null {
+  const rm = parseDateRange(raw, today);
+  const rest = cleanCommand(rm ? cut(raw, rm.matched) : raw);
+  let m: RegExpExecArray | null;
+  let measure: 'spend' | 'income' | null = null;
+  let subject: string | undefined;
+
+  const WHO = String.raw`(?:we|i|you|the\s+company|the\s+business|they)`;
+  const SPEND_V = String.raw`(?:spend|spent|pay|paid|pay\s+out|paid\s+out|shell\s+out)`;
+  const INCOME_V = String.raw`(?:make|made|earn|earned|sell|sold|bring\s+in|brought\s+in|take\s+in|took\s+in|bill|billed|invoice|invoiced|collect|collected|get|got)`;
+  const SPEND_N = String.raw`(?:spending|spend|expenses?|expenditures?|costs?|outgoings?)`;
+  const INCOME_N = String.raw`(?:income|revenue|sales|earnings|takings)`;
+
+  if ((m = re(String.raw`^(?:so\s+)?(?:what|how\s+much)\s+(?:money\s+)?(?:did|have|has|do|does)\s+${WHO}\s+${SPEND_V}\b\s*(.*)$`).exec(rest))) {
+    measure = 'spend';
+    subject = m[1];
+  } else if ((m = re(String.raw`^(?:so\s+)?(?:what|how\s+much)\s+(?:money\s+)?(?:did|have|has|do|does)\s+${WHO}\s+${INCOME_V}\b\s*(.*)$`).exec(rest))) {
+    measure = 'income';
+    subject = m[1];
+  } else if ((m = re(String.raw`^(?:what|how\s+much)\s+(?:was|were|is|are|did)\s+(?:our|my|the|we)?\s*(?:total\s+)?(.*?)\s*${SPEND_N}(?:\s+(?:on|for|at|with)\s+(.+))?$`).exec(rest))) {
+    measure = 'spend';
+    subject = m[2] ?? m[1];
+  } else if ((m = re(String.raw`^(?:what|how\s+much)\s+(?:was|were|is|are|did)\s+(?:our|my|the|we)?\s*(?:total\s+)?(.*?)\s*${INCOME_N}(?:\s+(?:from|for|on|with)\s+(.+))?$`).exec(rest))) {
+    measure = 'income';
+    subject = m[2] ?? m[1];
+  } else if ((m = re(String.raw`^how\s+much\s+(?:went\s+(?:to|on)|was\s+spent\s+on|did\s+(?:.+?)\s+cost(?:\s+us)?)\s*(.*)$`).exec(rest))) {
+    measure = 'spend';
+    subject = m[1];
+  } else if (rm || /^total\b/i.test(rest)) {
+    // Terse forms need a period (or "total") so a page name like "expenses" still navigates.
+    if ((m = re(String.raw`^(?:total\s+)?(.*?)\s*${SPEND_N}(?:\s+(?:on|for|at|with)\s+(.+))?$`).exec(rest))) {
+      measure = 'spend';
+      subject = m[2] ?? m[1];
+    } else if ((m = re(String.raw`^(?:total\s+)?${SPEND_N}\s+(?:on|for|at|with)\s+(.+)$`).exec(rest))) {
+      measure = 'spend';
+      subject = m[1];
+    } else if ((m = re(String.raw`^(?:total\s+)?(.*?)\s*${INCOME_N}(?:\s+(?:from|for|on|with)\s+(.+))?$`).exec(rest))) {
+      measure = 'income';
+      subject = m[2] ?? m[1];
+    }
+  }
+  if (!measure) return null;
+  const range = rm?.range ?? yearToDate(today);
+  const s = cleanSubject(subject);
+  return {
+    kind: 'question',
+    measure,
+    ...(s ? { subject: s } : {}),
+    from: range.from,
+    to: range.to,
+    rangeLabel: range.label,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reports: "show unpaid bills over 60 days"
+// ---------------------------------------------------------------------------
+
+function parseOverDays(s: string): { days: number; matched: string } | null {
+  let m: RegExpExecArray | null;
+  if ((m = re(String.raw`\b(?:that\s+are\s+|which\s+are\s+)?(over|more\s+than|older\s+than|greater\s+than|longer\s+than|beyond|past|at\s+least|>=?)\s*(\d{1,4})\s*\+?\s*days?(?:\s+(?:old|overdue|past\s+due|late))?`).exec(s))) {
+    const n = Number(m[2]);
+    return { days: /least|>=/i.test(m[1]) ? Math.max(0, n - 1) : n, matched: m[0] };
+  }
+  if ((m = re(String.raw`(\d{1,4})\s*\+\s*days?(?:\s+(?:old|overdue|past\s+due|late))?`).exec(s))) {
+    return { days: Math.max(0, Number(m[1]) - 1), matched: m[0] };
+  }
+  if ((m = re(String.raw`\b(\d{1,4})\s+days?\s+(?:overdue|past\s+due|late|old)`).exec(s))) {
+    return { days: Math.max(0, Number(m[1]) - 1), matched: m[0] };
+  }
+  return null;
+}
+
+export function parseReport(raw: string, today: Date): ReportIntent | null {
+  let s = cleanCommand(
+    raw.replace(re(String.raw`^(?:please\s+)?(?:show|list|find|view|display|see|give|pull\s+up|run|get|print)\s+(?:me\s+)?(?:a\s+list\s+of\s+)?(?:all\s+)?(?:the\s+|my\s+|our\s+)?`), ''),
+  );
+  const over = parseOverDays(s);
+  if (over) s = cut(s, over.matched);
+  const overdueWord = /\b(?:overdue|past[\s-]due|late)\b/i.test(s);
+
+  const rm = parseDateRange(s, today);
+  const withRange = (r: ReportIntent): ReportIntent =>
+    rm ? { ...r, from: rm.range.from, to: rm.range.to, period: rm.range.label } : r;
+
+  if (re(String.raw`\b(?:p\s*&\s*l|p\s+and\s+l|pnl|profit\s+(?:and|&)\s+loss|income\s+statement)\b`).test(s)) {
+    return withRange({ kind: 'report', report: 'profit_loss' });
+  }
+  if (re(String.raw`\bbalance\s+sheet\b`).test(s)) {
+    return withRange({ kind: 'report', report: 'balance_sheet' });
+  }
+
+  const ovr = over ? { overDays: over.days } : overdueWord ? { overDays: 0 } : {};
+  const party = (str: string, doc: RegExp): string | undefined => {
+    const left = cut(str, (doc.exec(str) ?? [''])[0]);
+    const pm = re(String.raw`(?:^|\s)(?:from|for|to|with|by|of)\s+(?:vendor\s+|customer\s+)?(.+)$`).exec(left);
+    const p = pm ? tidy(pm[1]) : undefined;
+    return p && !/^(?:me|us|we|them|everyone|anyone|all)$/i.test(p) ? p : undefined;
+  };
+
+  if (re(String.raw`\b(?:a\/?p|ap|payables?)\s+aging\b`).test(s)) return { kind: 'report', report: 'ap_aging', ...ovr };
+  if (re(String.raw`\b(?:a\/?r|ar|receivables?)\s+aging\b`).test(s)) return { kind: 'report', report: 'ar_aging', ...ovr };
+
+  const BILL_DOC = re(String.raw`\b(?:(?:unpaid|open|outstanding|overdue|past[\s-]due|late|due)\s+(?:vendor\s+)?bills?|bills?\s+(?:that\s+are\s+|which\s+are\s+|still\s+)?(?:unpaid|overdue|past[\s-]due|outstanding|open|due|not\s+(?:yet\s+)?paid|to\s+pay|we\s+owe)|bills?\b(?=.*\b(?:overdue|past[\s-]due|late|unpaid)\b))`);
+  const INV_DOC = re(String.raw`\b(?:(?:unpaid|open|outstanding|overdue|past[\s-]due|late)\s+(?:customer\s+)?invoices?|invoices?\s+(?:that\s+are\s+|which\s+are\s+|still\s+)?(?:unpaid|overdue|past[\s-]due|outstanding|open|not\s+(?:yet\s+)?paid)|invoices?\b(?=.*\b(?:overdue|past[\s-]due|late|unpaid)\b))`);
+
+  if (BILL_DOC.test(s) || (over && /^bills?\b/i.test(s))) {
+    const p = party(s, BILL_DOC);
+    return { kind: 'report', report: 'unpaid_bills', ...ovr, ...(p ? { party: p } : {}) };
+  }
+  if (INV_DOC.test(s) || (over && /^invoices?\b/i.test(s))) {
+    const p = party(s, INV_DOC);
+    return { kind: 'report', report: 'unpaid_invoices', ...ovr, ...(p ? { party: p } : {}) };
+  }
+  if (re(String.raw`^(?:who|what)\s+do\s+(?:we|i)\s+owe(?:\s+money)?(?:\s+to)?$|^(?:what|who)\s+(?:we|i)\s+owe$`).test(s)) {
+    return { kind: 'report', report: 'unpaid_bills', ...ovr };
+  }
+  if (re(String.raw`^who\s+(?:still\s+)?owes\s+(?:me|us)(?:\s+money)?$|^(?:overdue|late)\s+customers$|^who\s+hasn'?t\s+paid(?:\s+(?:me|us))?$`).test(s)) {
+    return { kind: 'report', report: 'unpaid_invoices', ...ovr };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Create forms: "invoice Acme 3 hours consulting"
+// ---------------------------------------------------------------------------
+
+type Mode = 'party-first' | 'marker';
+
+const CREATE_PREFIXES: Array<{ re: RegExp; form: FormKind; mode?: Mode }> = [
+  { re: re(String.raw`^(?:(?:new|create|make|start|draft|send|write|prepare|add)\s+(?:an?\s+)?)?invoice\b(?:\s+(?:to|for)\b)?`), form: 'invoice' },
+  { re: re(String.raw`^(?:charge|bill)\s+(?:the\s+)?(?:customer|client)\b`), form: 'invoice' },
+  { re: re(String.raw`^charge\b`), form: 'invoice' },
+  { re: re(String.raw`^(?:(?:new|create|make|start|draft|prepare|send|write|add)\s+(?:an?\s+)?)?(?:estimate|quote|bid|proposal)\b(?:\s+(?:to|for)\b)?`), form: 'estimate' },
+  { re: re(String.raw`^(?:(?:new|create|make|record|enter|ring\s+up|add)\s+(?:an?\s+)?)?(?:sales\s+receipt|cash\s+sale)\b(?:\s+(?:to|for)\b)?`), form: 'sales_receipt' },
+  { re: re(String.raw`^(?:i\s+|we\s+)?sold\b`), form: 'sales_receipt', mode: 'marker' },
+  { re: re(String.raw`^(?:(?:new|create|make|record|enter|add)\s+(?:an?\s+)?|(?:i\s+|we\s+)?(?:got|received)\s+(?:an?\s+)?)?(?:vendor\s+)?bill\b(?:\s+(?:from|for|to)\b)?`), form: 'bill' },
+  { re: re(String.raw`^(?:(?:new|write|create|make|record|enter|add)\s+(?:an?\s+)?)?(?:check|cheque|expense)\b(?:\s+(?:payable\s+to|to|for|from|at)\b)?`), form: 'expense' },
+  { re: re(String.raw`^(?:i\s+|we\s+)?(?:spent|bought|purchased)\b`), form: 'expense', mode: 'marker' },
+  { re: re(String.raw`^(?:i\s+|we\s+)?paid\b(?!\s+(?:for\s+)?(?:the\s+)?bills?\b)`), form: 'expense' },
+];
+
+const UNIT = String.raw`(?:hours?|hrs?|h|units?|pcs?|pieces?|items?|ea|each|days?|boxes?|cases?|bags?|lbs?|pounds?|gallons?|gal|sessions?|visits?|months?|weeks?|licen[cs]es?|seats?|users?)`;
+
+export function parseLine(s: string, form: FormKind): IntentLine | null {
+  const sales = isSalesForm(form);
+  let t = tidy(s);
+  let quantity: string | undefined;
+  let rate: string | undefined;
+  let amount: string | undefined;
+  let m: RegExpExecArray | null;
+
+  // Rate: "at $150", "@ 150/hr", "$150 each", "150 per hour".
+  if ((m = re(String.raw`\s*(?:@|\bat\b)\s*(${NUM_TOKEN})(?:\s*(?:each|ea|per\s+\w+|an?\s+(?:hour|unit|item|piece|day)|\/\s*\w+))?`).exec(t))) {
+    rate = parseNumber(m[1]) ?? undefined;
+    t = cut(t, m[0]);
+  } else if ((m = re(String.raw`(${NUM_TOKEN})\s*(?:each|ea|per\s+\w+|\/\s*(?:hr|hour|h|unit|ea|each|item|piece|pc|day))\b`).exec(t))) {
+    rate = parseNumber(m[1]) ?? undefined;
+    t = cut(t, m[0]);
+  }
+  // Total: "consulting for $500", "= 500".
+  if ((m = re(String.raw`\s*(?:\bfor\b|\btotal(?:l?ing)?\b|=)\s*(${NUM_TOKEN})\s*$`).exec(t)) && !re(String.raw`^${UNIT}\b`).test(t.slice(m.index + m[0].length))) {
+    amount = parseNumber(m[1]) ?? undefined;
+    t = cut(t, m[0]);
+  }
+  // Leading number: quantity (sales / with a unit / "2 x") or amount (purchases, "$").
+  if ((m = re(String.raw`^(${NUM_TOKEN})\s*(x\b|×|\*)?\s*(${UNIT}\b)?\s*(?:of\b)?\s*`).exec(t)) && m[0].trim()) {
+    const tok = m[1];
+    const v = parseNumber(tok);
+    if (v !== null) {
+      const isQty = !looksLikeMoney(tok) && (!!m[2] || !!m[3] || (sales && !/\.\d{2}$/.test(tok)));
+      if (isQty && isReasonableQuantity(v)) quantity = v;
+      else if (!amount) amount = v;
+      t = tidy(t.slice(m[0].length));
+    }
+  } else if ((m = re(String.raw`\s(${NUM_TOKEN})\s*(${UNIT})?\s*$`).exec(` ${t}`))) {
+    // Trailing number: "office supplies 120", "consulting 3 hours".
+    const tok = m[1];
+    const v = parseNumber(tok);
+    if (v !== null) {
+      const isQty = !looksLikeMoney(tok) && (!!m[2] || (sales && !/\.\d{2}$/.test(tok)));
+      if (isQty && isReasonableQuantity(v)) quantity = v;
+      else if (!amount) amount = v;
+      t = tidy(` ${t}`.slice(0, m.index));
+    }
+  }
+  const text = tidy(t.replace(/^(?:of|for|on|in|worth\s+of)\s+/i, '').replace(/\s+(?:for|at|on|of)$/i, ''));
+  if (!text && !quantity && !rate && !amount) return null;
+  return {
+    ...(text ? { text } : {}),
+    ...(quantity ? { quantity } : {}),
+    ...(rate ? { rate } : {}),
+    ...(amount ? { amount } : {}),
+  };
+}
+
+const LINE_SPLIT = re(String.raw`\s*(?:,\s+|,(?!\d{3}(?:\D|$))|;|\band\b|\bplus\b|\+)\s*(?=\$?\d)`);
+const STARTS_NUM = re(String.raw`^${NUM_TOKEN}`);
+
+function parseLines(s: string, form: FormKind): IntentLine[] {
+  const out: IntentLine[] = [];
+  for (const part of s.split(LINE_SPLIT)) {
+    const l = parseLine(part, form);
+    if (l) out.push(l);
+  }
+  return out;
+}
+
+export function parseCreate(raw: string, today: Date): CreateIntent | null {
+  const prefix = CREATE_PREFIXES.map((p) => ({ p, m: p.re.exec(raw) })).find((x) => x.m);
+  if (!prefix || !prefix.m) return null;
+  const form = prefix.p.form;
+  const sales = isSalesForm(form);
+  let body = tidy(raw.slice(prefix.m[0].length));
+  const intent: CreateIntent = { kind: 'create', form, lines: [] };
+
+  // "bill" followed by a report-ish word is not a create ("bills over 60 days" handled earlier).
+  const d = parseSingleDate(body, today);
+  if (d) {
+    intent.date = d.date;
+    body = cut(body, d.matched);
+  }
+  let m: RegExpExecArray | null;
+  if ((m = re(String.raw`\s*\b(?:memo|note|notes)\b\s*[:\-]?\s*(.+)$`).exec(body))) {
+    intent.memo = tidy(m[1].replace(/^["']|["']$/g, ''));
+    body = tidy(body.slice(0, m.index));
+  }
+  if (form === 'expense') {
+    const pay =
+      re(String.raw`\s+(?:paid\s+)?(?:with|using|via)\s+(?:the\s+|my\s+|our\s+)?([a-z][\w&' -]*?)(?:\s+(?:card|account|acct))?$`).exec(body) ??
+      re(String.raw`\s+(?:on|by)\s+(?:the\s+|my\s+|our\s+)?([a-z][\w&' -]*?)\s+(?:credit\s+card|debit\s+card|card)$`).exec(body);
+    if (pay && !/\d/.test(pay[1])) {
+      intent.paymentAccount = tidy(pay[1]);
+      body = tidy(body.slice(0, pay.index));
+    }
+  }
+
+  const markers = sales ? String.raw`(?:to|for)` : String.raw`(?:from|to|at|payable\s+to)`;
+  const mode: Mode = prefix.p.mode ?? (STARTS_NUM.test(body) || re(`^${markers}\\s`).test(body) ? 'marker' : 'party-first');
+
+  if (mode === 'party-first') {
+    // Party = the words before the first number ("Acme Corp 3 hours consulting").
+    const num = re(String.raw`(?:^|\s)(?:for\s+|-\s*|:\s*)?(${NUM_TOKEN})(?=\s|$|[a-z])`).exec(body);
+    if (num) {
+      intent.party = tidy(body.slice(0, num.index).replace(/\s+(?:for|-|:)$/i, '')) || undefined;
+      intent.lines = parseLines(body.slice(num.index + num[0].length - num[1].length), form);
+    } else {
+      const forSplit = re(String.raw`\s+(?:for|-|:)\s+`).exec(body);
+      if (forSplit) {
+        intent.party = tidy(body.slice(0, forSplit.index)) || undefined;
+        const l = parseLine(body.slice(forSplit.index + forSplit[0].length), form);
+        if (l) intent.lines = [l];
+      } else if (body) {
+        intent.party = body;
+      }
+    }
+  } else {
+    // Marker mode: the party follows "to/for" (sales) or "from/to/at" (purchases).
+    const pm = re(String.raw`(?:^|\s)${markers}\s+(?!\$?\s?\d)(.+?)(?=\s+(?:for|on|with|@)\s|\s+\$?\d|$)`).exec(body);
+    if (pm) {
+      intent.party = tidy(pm[1]);
+      body = tidy(body.slice(0, pm.index) + ' ' + body.slice(pm.index + pm[0].length));
+    }
+    if (body) intent.lines = parseLines(body, form);
+  }
+  if (intent.party && /^(?:a|an|the|new|one)$/i.test(intent.party)) delete intent.party;
+  if (!intent.party) delete intent.party;
+  return intent;
+}

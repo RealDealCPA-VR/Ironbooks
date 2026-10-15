@@ -43,6 +43,9 @@ import {
   useDocNumber,
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
+// cmdbar: forms accept a prefill from the Ctrl+K command bar.
+import PrefillNotice from '@/components/PrefillNotice';
+import { usePrefill } from '@/lib/commands/usePrefill';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -407,7 +410,32 @@ export default function EstimatesPage() {
   // New estimate
   // ---------------------------------------------------------------------------
 
+  // cmdbar: "quote Acme 10 widgets" opens a NEW estimate filled in for the user to save.
+  const [prefillNote, setPrefillNote] = useState<string | null>(null);
+  usePrefill('estimate', (p) => {
+    openAddModal();
+    setAddForm({
+      ...EMPTY_FORM,
+      customerId: p.customerId ?? '',
+      date: p.date ?? today(),
+      memo: p.memo ?? '',
+      lines: p.lines.length
+        ? p.lines.map((l) => ({
+            ...EMPTY_LINE,
+            itemId: l.itemId ?? '',
+            description: l.description ?? '',
+            quantity: l.quantity ?? '1',
+            rate: l.rate ?? '',
+            taxable: l.taxable ?? true,
+            rateManual: !!l.rateFromUser,
+          }))
+        : [{ ...EMPTY_LINE }],
+    });
+    setPrefillNote(p.note ?? null);
+  });
+
   function openAddModal() {
+    setPrefillNote(null);
     setAddForm({ ...EMPTY_FORM, date: today(), lines: [{ ...EMPTY_LINE }] });
     setEditingId(null);
     setEditingNumber(null);
@@ -791,6 +819,11 @@ export default function EstimatesPage() {
           </>
         }
       >
+        {!editingId && prefillNote && (
+          <div className="mb-3">
+            <PrefillNotice note={prefillNote} />
+          </div>
+        )}
         <div className="mb-4 grid grid-cols-2 gap-3">
           <DocNumberField id="est-number" label="Estimate No." value={docNumber.value} onChange={docNumber.setValue} />
         </div>

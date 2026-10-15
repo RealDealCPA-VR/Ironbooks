@@ -2,7 +2,7 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import CommandPalette from './CommandPalette';
+import CommandPalette, { CommandBarButton } from './CommandPalette';
 import AssistantPanel from './AssistantPanel';
 import {
   linkHref,
@@ -675,6 +675,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             className="relative w-48 sm:w-64 lg:hidden"
           />
           <MenuModeToggle mode={navMode} onChange={changeMode} className="flex lg:hidden w-40" />
+          <CommandBarButton />
           <button
             type="button"
             onClick={() => setAssistantOpen(true)}
@@ -688,7 +689,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </header>
         {blockedGate ? <FeatureOff gate={blockedGate} /> : children}
       </main>
-      <CommandPalette />
+      <CommandPalette permissions={me?.permissions} hiddenPaths={hiddenPaths} />
       <AssistantPanel open={assistantOpen} onClose={closeAssistant} />
       <GlobalShortcuts />
       <PreferenceBehaviors />

@@ -52,6 +52,8 @@ import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
+// cmdbar: forms accept a prefill from the Ctrl+K command bar.
+import { usePrefill } from '@/lib/commands/usePrefill';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -314,6 +316,40 @@ function ExpensesPageContent() {
   useNewParam(() => {
     document.getElementById('exp-payee')?.focus();
   });
+
+  // cmdbar: "check to Shell $45 fuel" fills in a NEW check / expense (once the lists have
+  // loaded); the user reviews it and clicks Save.
+  usePrefill(
+    'expense',
+    (p) => {
+      resetForm();
+      const pay = accounts.find((a) => a.id === p.paymentAccountId);
+      if (pay) {
+        setEntryType(isCreditCard(pay) ? 'cc_charge' : 'check');
+        setPaymentAccountId(pay.id);
+      }
+      if (p.vendorId) setPayeeSel(p.vendorId);
+      else if (p.payeeName) {
+        setPayeeSel(OTHER_PAYEE);
+        setPayeeName(p.payeeName);
+      }
+      if (p.date) setDate(p.date);
+      if (p.memo) setMemo(p.memo);
+      if (p.lines.length) {
+        setLines(
+          p.lines.map((l) =>
+            l.itemId
+              ? { ...emptyLine('item'), itemId: l.itemId, quantity: l.quantity ?? '1', unitCost: l.rate ?? '', amount: l.amount ?? '', description: l.description ?? '' }
+              : { ...emptyLine('expense'), accountId: l.accountId ?? '', amount: l.amount ?? '', description: l.description ?? '' },
+          ),
+        );
+      }
+      setPrefillNote(p.note ?? '');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      setTimeout(() => document.getElementById('exp-payee')?.focus(), 50);
+    },
+    !loading,
+  );
 
   const runningTotal = lines.reduce((sum, l) => sum + lineTotal(l), 0);
   const selectedVendor = vendors.find((v) => v.id === payeeSel);

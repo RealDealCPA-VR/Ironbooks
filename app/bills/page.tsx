@@ -49,6 +49,8 @@ import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
+// cmdbar: forms accept a prefill from the Ctrl+K command bar.
+import { usePrefill } from '@/lib/commands/usePrefill';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -250,6 +252,37 @@ export default function BillsPage() {
     }
     init();
   }, []);
+
+  // cmdbar: "bill from Staples 120 office supplies" opens a NEW bill filled in (once the
+  // vendor/account lists have loaded); the user reviews and saves it as usual.
+  usePrefill(
+    'bill',
+    (p) => {
+      openModal();
+      const vendor = vendors.find((v) => v.id === p.vendorId);
+      const billDate = p.date ?? new Date().toISOString().slice(0, 10);
+      if (p.vendorId) setVendorId(p.vendorId);
+      setDate(billDate);
+      if (p.memo) setMemo(p.memo);
+      if (vendor) {
+        setTerms(vendor.terms ?? '');
+        void fetchDueDateForTerms(billDate, vendor.terms || prefs.company.defaultVendorTerms).then((due) => {
+          if (due) setDueDate(due);
+        });
+      }
+      if (p.lines.length) {
+        setLines(
+          p.lines.map((l) =>
+            l.itemId
+              ? { ...emptyLine('item'), itemId: l.itemId, quantity: l.quantity ?? '1', unitCost: l.rate ?? '', description: l.description ?? '' }
+              : { ...emptyLine('expense'), accountId: l.accountId ?? '', amount: l.amount ?? '', description: l.description ?? '' },
+          ),
+        );
+      }
+      setPrefillNote(p.note ?? '');
+    },
+    !loading,
+  );
 
   // ---------------------------------------------------------------------------
   // ID -> Name lookup helpers

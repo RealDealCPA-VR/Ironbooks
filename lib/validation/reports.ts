@@ -91,6 +91,8 @@ export const reportParamsSchema = z
     through: z.string().regex(/^[0-9]{1,4}$/, 'must be a whole number of days').refine((v) => +v >= 1 && +v <= 3650, 'must be 1 to 3650 days').optional(),
     /** Aging reports: age from the due date (QB default) or the transaction date. */
     agingFrom: z.enum(['due_date', 'transaction_date']).optional(),
+    /** Open-item reports (unpaid bills / open invoices): only items MORE than N days past due (cmdbar). */
+    overDays: z.string().regex(/^[0-9]{1,4}$/, 'must be a whole number of days').optional(),
     /** Relative date range (resolved to from / to / asOf when the report runs). */
     dates: z
       .enum([

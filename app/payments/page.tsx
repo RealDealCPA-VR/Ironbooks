@@ -32,6 +32,8 @@ import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate } from '@/lib/formPrefs';
 import { autoApplyPayment, cashDue, sumApplied } from '@/lib/paymentApply';
+// cmdbar: "receive payment from Acme" opens Receive Payments with the customer picked.
+import { usePrefill } from '@/lib/commands/usePrefill';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -207,12 +209,14 @@ interface ReceivePaymentModalProps {
   onSaved: () => void;
   customers: Customer[];
   accounts: Account[];
+  /** cmdbar: customer picked from the command bar for a NEW payment. */
+  prefillCustomerId?: string | null;
 }
 
 /** "Apply to" targets in the credits table: an invoice id, or `je:<line id>` for a JE charge. */
 const JE_PREFIX = 'je:';
 
-function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accounts }: ReceivePaymentModalProps) {
+function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accounts, prefillCustomerId = null }: ReceivePaymentModalProps) {
   const today = new Date().toISOString().slice(0, 10);
   const prefs = usePreferences();
   // Preferences > Payments: once the user edits one side by hand, stop recalculating it.
@@ -284,7 +288,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       setCurrency((editing.currency ?? '').toUpperCase());
       setExchangeRate(editing.currency && editing.exchangeRate ? String(Number(editing.exchangeRate)) : '');
     } else {
-      setCustomerId('');
+      setCustomerId(prefillCustomerId ?? '');
       setDate(today);
       setMethod('check');
       setAmount('');
@@ -305,7 +309,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     // Preferences > Payments auto-apply / auto-calculate never overwrite an edited payment's amounts.
     setAmountTouched(!!editing);
     setAppsTouched(!!editing);
-  }, [open, editing, today]);
+  }, [open, editing, today, prefillCustomerId]);
 
   useEffect(() => {
     // Preferences > Payments: with Undeposited Funds off, a NEW payment starts on the default bank.
@@ -1530,6 +1534,12 @@ function PaymentsPageContent() {
 
   // Quick Actions navigate here with ?new=1 — open the Receive Payment modal.
   useNewParam(() => setModalOpen(true));
+  const [prefillCustomerId, setPrefillCustomerId] = useState<string | null>(null);
+  usePrefill('payment', (p) => {
+    setEditTarget(null);
+    setPrefillCustomerId(p.customerId ?? null);
+    setModalOpen(true);
+  });
 
   async function handleVoid() {
     if (!voidTarget) return;
@@ -1746,7 +1756,9 @@ function PaymentsPageContent() {
         onClose={() => {
           setModalOpen(false);
           setEditTarget(null);
+          setPrefillCustomerId(null);
         }}
+        prefillCustomerId={editTarget ? null : prefillCustomerId}
         onSaved={fetchPayments}
         customers={customers}
         accounts={accounts}
