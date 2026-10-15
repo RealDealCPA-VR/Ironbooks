@@ -30,11 +30,14 @@ export default function ReportSummaryBar({
   const [data, setData] = useState<ReportSummaryResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
+  /** The "Say it in plain words" request failed (the deterministic sentence stays on screen). */
+  const [aiError, setAiError] = useState<string | null>(null);
   const qs = new URLSearchParams({ ...reportOptions(params), vs }).toString();
 
   useEffect(() => {
     let live = true;
     setError(null);
+    setAiError(null);
     api
       .get<ReportSummaryResult>(`/api/reports/summary/${encodeURIComponent(reportKey)}?${qs}`)
       .then((d) => live && setData(d))
@@ -50,10 +53,11 @@ export default function ReportSummaryBar({
 
   const phrase = async () => {
     setAiBusy(true);
+    setAiError(null);
     try {
       setData(await api.get<ReportSummaryResult>(`/api/reports/summary/${encodeURIComponent(reportKey)}?${qs}&ai=1`));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'The AI model could not answer.');
+      setAiError(err instanceof ApiError ? err.message : 'The AI model could not answer.');
     } finally {
       setAiBusy(false);
     }
@@ -73,6 +77,27 @@ export default function ReportSummaryBar({
       </p>
     );
   }
+  return (
+    <ReportSummaryContent data={data} vs={vs} onVsChange={onVsChange} onPhrase={phrase} aiBusy={aiBusy} aiError={aiError} />
+  );
+}
+
+/** The summary bar once the summary is known (separate so it can be rendered on its own). */
+export function ReportSummaryContent({
+  data,
+  vs,
+  onVsChange,
+  onPhrase,
+  aiBusy,
+  aiError,
+}: {
+  data: ReportSummaryResult;
+  vs: 'prior_period' | 'prior_year';
+  onVsChange: (vs: 'prior_period' | 'prior_year') => void;
+  onPhrase: () => void;
+  aiBusy: boolean;
+  aiError: string | null;
+}) {
   const sentence = data.ai?.text ?? data.text;
   return (
     <section aria-label="Report summary" className="mb-4 rounded-xl border border-electric/20 bg-white/80 px-4 py-3 shadow-sm">
@@ -95,7 +120,7 @@ export default function ReportSummaryBar({
             <option value="prior_year">Same period last year</option>
           </select>
           {data.aiAvailable && !data.ai && (
-            <Button type="button" variant="secondary" size="sm" onClick={phrase} loading={aiBusy}>
+            <Button type="button" variant="secondary" size="sm" onClick={onPhrase} loading={aiBusy}>
               <Sparkles className="h-4 w-4" />
               Say it in plain words
             </Button>
@@ -109,6 +134,11 @@ export default function ReportSummaryBar({
         </p>
       )}
       {data.aiNotice && <p className="mt-1 text-xs text-navy/50">{data.aiNotice}</p>}
+      {aiError && (
+        <p className="mt-1 text-xs text-red-600" role="alert">
+          Could not word it in plain words: {aiError}
+        </p>
+      )}
     </section>
   );
 }

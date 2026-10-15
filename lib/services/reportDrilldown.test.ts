@@ -15,7 +15,7 @@ import { closeDb, getDb, type DB } from '@/lib/db';
 import { accounts, users } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import type { StdReport } from '@/lib/reports/types';
-import { DRILLDOWN_REPORTS, SUMMARY_REPORTS, drilldownApiUrl, drilldownHref, reportOptions, safeBackHref } from '@/lib/reports/drilldown';
+import { DRILLDOWN_REPORTS, SUMMARY_REPORTS, drilldownApiUrl, drilldownHref, drilldownListNotes, explainNote, reportOptions, safeBackHref } from '@/lib/reports/drilldown';
 import { API_ROUTE_PERMISSIONS, apiRuleFor, pageAreasFor } from '@/lib/permissions/routes';
 import { builtinRole, can, unionRoles } from '@/lib/permissions/model';
 import { pageHelpFor } from '@/lib/pageHelp';
@@ -34,8 +34,8 @@ import { payBills } from './billPayments';
 import { createSalesReceipt } from './salesReceipts';
 import { createExpense } from './expenses';
 import { postJournalEntry } from './posting';
-import { runStandardReport } from './reportRegistry';
-import { drilldownCell, explainText, treeMembers } from './reportDrilldown';
+import { REPORT_RUN_MEMO_TTL_MS, clearReportRunMemo, prepareStandardReport, recentReportRun, runStandardReport } from './reportRegistry';
+import { basisScopeLabel, drilldownCell, explainText, treeMembers } from './reportDrilldown';
 import { aiReplyKeepsNumbers, reportSummary, summaryText } from './reportSummary';
 import { loadAccountMeta } from './reportEngine';
 import { profitAndLossReport, balanceSheetReport } from './reportsStandard';
@@ -274,8 +274,51 @@ describe('drill-down details', () => {
     expect(brief.largest).not.toBeNull();
     const capped = await drilldownCell(ctx, 'profit-loss', p, 'pl:net', 'total', { limit: 2 });
     expect(capped.transactions).toHaveLength(2);
-    expect(capped.truncated).toBe(true);
+    expect(capped.listTruncated).toBe(true);
+    expect(capped.incomplete).toBe(false);
+    expect(capped.ties).toBe(true);
     expect(capped.count).toBe(brief.count);
+    // A list cut by the page's limit: the total still covers everything.
+    const notes = drilldownListNotes(capped);
+    expect(notes.incomplete).toBeUndefined();
+    expect(notes.listed).toBe('Only the first 2 transactions are listed; the total and count cover all of them. Narrow the report dates to see fewer.');
+    expect(explainNote(capped)).toBeUndefined();
+  }, 120_000);
+
+  it('a ledger read that hits its line cap is reported as incomplete (not as a short list), and never as tying', async () => {
+    const p = { ...H1, basis: 'accrual' };
+    const res = await drilldownCell(ctx, 'profit-loss', p, 'pl:net', 'total', { lineCap: 2 });
+    expect(res.incomplete).toBe(true);
+    expect(res.listTruncated).toBe(false); // the list is not what was cut
+    expect(res.ties).toBe(false);
+    expect(res.explanation).toBe('Too many transactions to add up here; narrow the report dates to see them.');
+    const notes = drilldownListNotes(res);
+    expect(notes.listed).toBeUndefined(); // never "the total covers all of them"
+    expect(notes.incomplete).toMatch(/Too many transactions to add up: the total and count above cover only part of them/);
+    // The tooltip says to narrow the dates, not that the books changed.
+    expect(explainNote(res)).toBe('Too many transactions to add up; narrow the report dates.');
+    // Balance sheet / trial balance / expenses-by-vendor reads report it too.
+    expect((await drilldownCell(ctx, 'balance-sheet', { asOf: '2026-06-30', basis: 'accrual' }, 'bs:assets:total', 'total', { lineCap: 2 })).incomplete).toBe(true);
+    expect((await drilldownCell(ctx, 'trial-balance', { asOf: '2026-06-30' }, 'tb:total', 'debit', { lineCap: 2 })).incomplete).toBe(true);
+    expect((await drilldownCell(ctx, 'expenses-by-vendor-summary', p, 'ebv:grand', 'amount', { lineCap: 2 })).incomplete).toBe(true);
+    // Uncapped, the same cell is complete and ties.
+    const full = await drilldownCell(ctx, 'profit-loss', p, 'pl:net', 'total');
+    expect(full.incomplete).toBe(false);
+    expect(full.ties).toBe(true);
+  }, 120_000);
+
+  it('the scope line names the basis from the basis itself, not from the subtitle', async () => {
+    expect(basisScopeLabel('cash', 'January 1 - June 30, 2026')).toBe('Cash basis'); // a subtitle without "Cash"
+    expect(basisScopeLabel('cash', 'January 1 - June 30, 2026 · Cash Basis')).toBe('');
+    expect(basisScopeLabel('accrual', 'January 1 - June 30, 2026')).toBe('Accrual basis');
+    expect(basisScopeLabel('accrual', 'Accrual Basis')).toBe('');
+    expect(basisScopeLabel(undefined, 'January 2026')).toBe('');
+    const cash = await drilldownCell(ctx, 'profit-loss', { ...H1, basis: 'cash' }, 'pl:net', 'total');
+    expect(cash.scope).toMatch(/cash basis/i);
+    expect(cash.scope).not.toMatch(/accrual/i);
+    const acc = await drilldownCell(ctx, 'profit-loss', { ...H1, basis: 'accrual' }, 'pl:net', 'total');
+    expect(acc.scope).toMatch(/Accrual basis/);
+    expect(acc.scope).not.toMatch(/cash/i);
   }, 120_000);
 
   it('rejects unknown reports, reports without explanations, unknown lines and text columns', async () => {
@@ -390,4 +433,62 @@ describe('one-line summary (deterministic, AI off)', () => {
   it('summary is refused for reports without one', async () => {
     await expect(reportSummary(ctx, 'trial-balance', { asOf: '2026-06-30' })).rejects.toMatchObject({ code: 'VALIDATION' });
   });
+});
+
+describe('tooltips reuse the report run the page made (no full re-run per hover)', () => {
+  it('brief explanations use the remembered run; the drill-down page and every report run refresh it', async () => {
+    clearReportRunMemo();
+    // 2027: after every other test's dates, so their expected amounts are untouched.
+    const p = { from: '2027-01-01', to: '2027-01-31', basis: 'accrual' };
+    const fee = (amt: string) =>
+      postJournalEntry(ctx, { date: d('2027-01-15'), description: 'Bank fee', lines: [{ accountId: code['6100'], debit: amt }, { accountId: code['1000'], credit: amt }] });
+    const rowId = `pl:expense:a:${code['6100']}`;
+    await fee('10');
+    const page = await runStandardReport(ctx, 'profit-loss', p); // the report page's run
+    expect(page.rows.find((r) => r.id === rowId)?.cells.total).toBe('10.00');
+    const { params } = await prepareStandardReport(ctx, 'profit-loss', p);
+    expect(recentReportRun(ctx, 'profit-loss', params)?.report).toBe(page);
+
+    await fee('5'); // the books change after the page ran
+    const tip = await drilldownCell(ctx, 'profit-loss', p, rowId, 'total', { brief: true });
+    expect(tip.cell).toBe('10.00'); // the remembered run: the report was NOT run again
+    expect(tip.total).toBe('15.00'); // the transactions are read fresh
+    expect(tip.ties).toBe(false);
+    expect(explainNote(tip)).toMatch(/The books changed since the report ran/);
+    // Hovering the next cell reuses the same run and its account metadata.
+    const meta = recentReportRun(ctx, 'profit-loss', params)!.meta;
+    expect(meta).toBeDefined();
+    await drilldownCell(ctx, 'profit-loss', p, 'pl:net', 'total', { brief: true });
+    expect(recentReportRun(ctx, 'profit-loss', params)!.report).toBe(page);
+    expect(recentReportRun(ctx, 'profit-loss', params)!.meta).toBe(meta);
+
+    // The drill-down page always runs fresh, and refreshes what tooltips use.
+    const full = await drilldownCell(ctx, 'profit-loss', p, rowId, 'total');
+    expect(full.cell).toBe('15.00');
+    expect(full.ties).toBe(true);
+    const tip2 = await drilldownCell(ctx, 'profit-loss', p, rowId, 'total', { brief: true });
+    expect(tip2.cell).toBe('15.00');
+    expect(tip2.ties).toBe(true);
+
+    // Re-running the report (the page's Run / refresh) replaces the remembered run as well.
+    await fee('1');
+    const rerun = await runStandardReport(ctx, 'profit-loss', p);
+    const tip3 = await drilldownCell(ctx, 'profit-loss', p, rowId, 'total', { brief: true });
+    expect(recentReportRun(ctx, 'profit-loss', params)!.report).toBe(rerun);
+    expect(tip3.cell).toBe('16.00');
+    expect(tip3.ties).toBe(true);
+
+    // Scoped to the company, the user, the report and its options; and short-lived.
+    expect(recentReportRun({ ...ctx, userId: 'someone-else' }, 'profit-loss', params)).toBeNull();
+    expect(recentReportRun({ ...ctx, companyId: 'another-company' }, 'profit-loss', params)).toBeNull();
+    expect(recentReportRun(ctx, 'profit-loss', { ...params, basis: 'cash' })).toBeNull();
+    expect(recentReportRun(ctx, 'profit-loss-percent', params)).toBeNull();
+    expect(recentReportRun(ctx, 'profit-loss', params, Date.now() + REPORT_RUN_MEMO_TTL_MS + 1000)).toBeNull();
+    // Expired: the next tooltip runs the report again.
+    expect(recentReportRun(ctx, 'profit-loss', params)).toBeNull();
+    const tip4 = await drilldownCell(ctx, 'profit-loss', p, rowId, 'total', { brief: true });
+    expect(tip4.cell).toBe('16.00');
+    expect(recentReportRun(ctx, 'profit-loss', params)!.report).not.toBe(rerun);
+    clearReportRunMemo();
+  }, 120_000);
 });

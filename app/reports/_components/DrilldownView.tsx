@@ -18,9 +18,24 @@ import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { CATALOG_BY_KEY, stdReportHref } from '@/lib/reports/catalog';
-import { drilldownApiUrl, reportOptions, safeBackHref, type CellDrilldown } from '@/lib/reports/drilldown';
+import { drilldownApiUrl, drilldownListNotes, reportOptions, safeBackHref, type CellDrilldown } from '@/lib/reports/drilldown';
 
 const mdy = (s: string) => `${s.slice(5, 7)}/${s.slice(8, 10)}/${s.slice(0, 4)}`;
+
+/** Footer under the list: a list cut short (the total still covers all) vs. too many to add up. */
+export function DrilldownListNotes({ data }: { data: Pick<CellDrilldown, 'listTruncated' | 'incomplete' | 'transactions'> }) {
+  const notes = drilldownListNotes(data);
+  return (
+    <>
+      {notes.incomplete && (
+        <p className="text-xs text-amber-700 mt-2" role="status">
+          {notes.incomplete}
+        </p>
+      )}
+      {notes.listed && <p className="text-xs text-navy/50 mt-2">{notes.listed}</p>}
+    </>
+  );
+}
 
 export default function DrilldownView() {
   const router = useRouter();
@@ -114,7 +129,9 @@ export default function DrilldownView() {
                 <p className="text-2xl font-extrabold text-navy tabular-nums">
                   {data.cell === null ? '—' : data.kind === 'formula' && /%|pct/i.test(data.column) ? `${data.cell}%` : formatCurrency(data.cell)}
                 </p>
-                {data.kind === 'transactions' ? (
+                {data.incomplete ? (
+                  <Badge tone="warning">Too many transactions to add up</Badge>
+                ) : data.kind === 'transactions' ? (
                   data.ties ? (
                     <Badge tone="success">Adds up to the report</Badge>
                   ) : (
@@ -219,11 +236,7 @@ export default function DrilldownView() {
               </div>
             )}
           </Card>
-          {data.truncated && (
-            <p className="text-xs text-navy/50 mt-2">
-              Only the first {data.transactions.length.toLocaleString('en-US')} transactions are listed; the total and count cover all of them. Narrow the report dates to see fewer.
-            </p>
-          )}
+          <DrilldownListNotes data={data} />
           <p className="text-xs text-navy/40 mt-2 print-hidden">
             Tip: click a date (or double-click a row) to open the transaction, with its lines, history and a link to the original document.
           </p>

@@ -5,6 +5,8 @@ export default defineConfig({
   resolve: {
     alias: { '@': path.resolve(__dirname, '.') },
   },
+  // Component tests (react-dom/server) need the TSX transform; tsconfig keeps jsx: preserve for Next.
+  oxc: { jsx: { runtime: 'automatic' } },
   test: {
     environment: 'node',
     include: ['lib/**/*.test.ts', 'test/**/*.test.ts'],

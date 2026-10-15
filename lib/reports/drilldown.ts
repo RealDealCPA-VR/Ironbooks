@@ -9,6 +9,7 @@
  *
  * The server side lives in lib/services/reportDrilldown.ts and lib/services/reportSummary.ts.
  */
+import { formatCurrency } from '@/lib/money';
 
 /** Reports whose every amount cell is explained by GET /api/reports/drilldown/[report]. */
 export const DRILLDOWN_REPORTS: readonly string[] = [
@@ -104,9 +105,15 @@ export interface CellDrilldown {
   /** Number of transactions behind the number. */
   count: number;
   largest: DrillTransaction | null;
-  /** The transactions, by date (capped at `limit`; `truncated` says when more exist). */
+  /** The transactions, by date (capped at `limit`; `listTruncated` says when more exist). */
   transactions: DrillTransaction[];
-  truncated: boolean;
+  /** Only the first `limit` transactions are listed; `total` and `count` still cover all of them. */
+  listTruncated: boolean;
+  /**
+   * Too many ledger lines to read: `total` and `count` do NOT cover everything behind the number
+   * (and `ties` is false). The viewer should narrow the report dates.
+   */
+  incomplete: boolean;
   /** Plain-language one-liner for the tooltip. */
   explanation: string;
   /** What the number covers ("Rent · 01/01/2026 – 03/31/2026 · Cash basis"). */
@@ -206,4 +213,30 @@ export function drilldownApiUrl(
 export function safeBackHref(back: string | null | undefined): string | null {
   if (!back || !back.startsWith('/') || back.startsWith('//') || back.includes('\\')) return null;
   return back;
+}
+
+/**
+ * Footer notes under the drill-down list. A list cut by the page's limit still has a total that
+ * covers everything; a ledger read that hit its cap does not, so that case says so instead.
+ */
+export function drilldownListNotes(d: Pick<CellDrilldown, 'listTruncated' | 'incomplete' | 'transactions'>): { listed?: string; incomplete?: string } {
+  const out: { listed?: string; incomplete?: string } = {};
+  if (d.incomplete) {
+    out.incomplete = 'Too many transactions to add up: the total and count above cover only part of them. Narrow the report dates to see them all.';
+  } else if (d.listTruncated) {
+    out.listed = `Only the first ${d.transactions.length.toLocaleString('en-US')} transactions are listed; the total and count cover all of them. Narrow the report dates to see fewer.`;
+  }
+  return out;
+}
+
+/**
+ * Second line of an amount's tooltip, when its transactions do not add up to it: too many to add
+ * up (narrow the dates), or the books changed since the report ran (run it again).
+ */
+export function explainNote(d: Pick<CellDrilldown, 'kind' | 'ties' | 'cell' | 'total' | 'incomplete'>): string | undefined {
+  if (d.incomplete) return 'Too many transactions to add up; narrow the report dates.';
+  if (d.kind === 'transactions' && !d.ties && d.cell !== null) {
+    return `These add up to ${formatCurrency(d.total)}; the report shows ${formatCurrency(d.cell)}. The books changed since the report ran — run it again.`;
+  }
+  return undefined;
 }

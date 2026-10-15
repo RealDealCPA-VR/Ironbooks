@@ -30,7 +30,7 @@ import type { StdReport, StdRow } from '@/lib/reports/types';
 import type { ReportParams } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { notFound, validation } from './_base';
-import { prepareStandardReport } from './reportRegistry';
+import { executePreparedReport, prepareStandardReport, recentReportRun, rememberReportRun } from './reportRegistry';
 import { eq } from 'drizzle-orm';
 import { classes } from '@/lib/db/schema';
 import {
@@ -83,7 +83,8 @@ interface DrillItem {
 
 interface Resolved {
   items: DrillItem[];
-  truncated: boolean;
+  /** A ledger read hit its line cap: the items do not cover every transaction behind the cell. */
+  incomplete: boolean;
 }
 
 interface Formula {
@@ -100,6 +101,8 @@ interface ResolveInput {
   row: StdRow;
   column: string;
   meta: Map<string, AccountMeta>;
+  /** Most ledger lines one read may return (LINE_CAP; lowered by tests). */
+  cap: number;
 }
 
 /** A report family: turns (row, column) into its transactions, or a formula over a base column. */
@@ -134,8 +137,8 @@ function itemsFrom(lines: GlLine[], contrib: (l: GlLine) => Decimal | null): Dri
   return out;
 }
 
-async function lines(ctx: ServiceContext, meta: Map<string, AccountMeta>, f: GlLineFilter) {
-  return fetchGlLines(ctx, meta, { ...f, limit: f.limit ?? LINE_CAP });
+async function lines(ctx: ServiceContext, meta: Map<string, AccountMeta>, cap: number, f: GlLineFilter) {
+  return fetchGlLines(ctx, meta, { ...f, limit: f.limit ?? cap });
 }
 
 /**
@@ -288,7 +291,7 @@ const plFamily: Family = {
     return null;
   },
   resolve: async (i) => {
-    const { ctx, key, p, row, meta } = i;
+    const { ctx, key, p, row, meta, cap } = i;
     const signs = plRowSigns(row, meta);
     const basis = p.basis === 'cash' ? 'cash' : undefined;
     // Class filter: every P&L variant except By Class (which spreads classes into columns).
@@ -296,19 +299,21 @@ const plFamily: Family = {
     const accountIds = [...meta.values()].filter((a) => isPLSection(a.section) && signs(a) !== 0).map((a) => a.id);
     // By Job needs the whole period's lines to rebuild its column order.
     let jobLines: GlLine[] | null = null;
+    let incomplete = false;
     if (key === 'profit-loss-by-job') {
       const { from, to } = await resolveRange(ctx, p);
       const f = glFilterFromParams(meta, { basis: p.basis, classId: p.classId }, { from, to });
       f.sections = [...PL_SECTIONS];
       f.excludeClose = true;
-      jobLines = (await lines(ctx, meta, f)).lines;
+      const all = await lines(ctx, meta, cap, f);
+      jobLines = all.lines;
+      incomplete = all.truncated; // the column order itself may be off
     }
     const windows = await plWindows(i, jobLines);
     const items: DrillItem[] = [];
-    let truncated = false;
     for (const w of windows) {
-      const got = await lines(ctx, meta, { from: w.from, to: w.to, classId, excludeClose: true, basis, accountIds });
-      truncated ||= got.truncated;
+      const got = await lines(ctx, meta, cap, { from: w.from, to: w.to, classId, excludeClose: true, basis, accountIds });
+      incomplete ||= got.truncated;
       items.push(
         ...itemsFrom(got.lines, (l) => {
           const s = signs(l.account);
@@ -317,7 +322,7 @@ const plFamily: Family = {
         }),
       );
     }
-    return { items, truncated };
+    return { items, incomplete };
   },
 };
 
@@ -397,7 +402,7 @@ function bsSelection(row: StdRow, meta: Map<string, AccountMeta>): BsSelection {
 
 const bsFamily: Family = {
   formulas: (column) => (column === 'pctchg' ? { formula: 'Percent change: the $ change divided by the earlier balance', base: 'chg' } : null),
-  resolve: async ({ ctx, key, p, row, column, meta }) => {
+  resolve: async ({ ctx, key, p, row, column, meta, cap }) => {
     const sel = bsSelection(row, meta);
     const basis = p.basis === 'cash' ? 'cash' : undefined;
     const dates = await bsColumnDates(ctx, key, p);
@@ -413,11 +418,11 @@ const bsFamily: Family = {
       .filter((a) => (isPL(a) ? sel.priorPL || sel.currentPL : sel.account(a)))
       .map((a) => a.id);
     const items: DrillItem[] = [];
-    let truncated = false;
+    let incomplete = false;
     for (const w of windows) {
       const fyStart = await fiscalYearStartFor(ctx, w.asOf);
-      const got = await lines(ctx, meta, { to: w.asOf, basis, accountIds });
-      truncated ||= got.truncated;
+      const got = await lines(ctx, meta, cap, { to: w.asOf, basis, accountIds });
+      incomplete ||= got.truncated;
       items.push(
         ...itemsFrom(got.lines, (l) => {
           if (isPL(l.account)) {
@@ -429,7 +434,7 @@ const bsFamily: Family = {
         }),
       );
     }
-    return { items, truncated };
+    return { items, incomplete };
   },
 };
 
@@ -438,13 +443,13 @@ const bsFamily: Family = {
 // ===========================================================================
 
 const tbFamily: Family = {
-  resolve: async ({ ctx, p, row, column, meta }) => {
+  resolve: async ({ ctx, p, row, column, meta, cap }) => {
     if (column !== 'debit' && column !== 'credit') throw validation('That column has no amounts to explain.');
     const asOf = resolveAsOf(p);
     const basis = p.basis === 'cash' ? 'cash' : undefined;
     const sign = column === 'debit' ? 1 : -1;
     if (row.id === 'tb:total') {
-      const got = await lines(ctx, meta, { to: asOf, basis });
+      const got = await lines(ctx, meta, cap, { to: asOf, basis });
       const bal = new Map<string, Decimal>();
       for (const l of got.lines) bal.set(l.accountId, (bal.get(l.accountId) ?? Money.zero()).plus(l.amount));
       // TOTAL Debit = every account with a debit balance; TOTAL Credit = every credit balance.
@@ -452,12 +457,12 @@ const tbFamily: Family = {
         const b = bal.get(id) ?? Money.zero();
         return column === 'debit' ? b.greaterThan(0) : b.lessThan(0);
       };
-      return { items: itemsFrom(got.lines, (l) => (keep(l.accountId) ? l.amount.times(sign) : null)), truncated: got.truncated };
+      return { items: itemsFrom(got.lines, (l) => (keep(l.accountId) ? l.amount.times(sign) : null)), incomplete: got.truncated };
     }
     const members = accountRowMembers(row, meta);
     if (!members) throw validation('This line has no transactions behind it.');
-    const got = await lines(ctx, meta, { to: asOf, basis, accountIds: [...members] });
-    return { items: itemsFrom(got.lines, (l) => l.amount.times(sign)), truncated: got.truncated };
+    const got = await lines(ctx, meta, cap, { to: asOf, basis, accountIds: [...members] });
+    return { items: itemsFrom(got.lines, (l) => l.amount.times(sign)), incomplete: got.truncated };
   },
 };
 
@@ -466,7 +471,7 @@ const tbFamily: Family = {
 // ===========================================================================
 
 const glFamily: Family = {
-  resolve: async ({ ctx, p, report, row, column, meta }) => {
+  resolve: async ({ ctx, p, report, row, column, meta, cap }) => {
     if (!['debit', 'credit', 'amount', 'balance'].includes(column)) throw validation('That column has no amounts to explain.');
     const { from, to } = await resolveRange(ctx, p);
     const f = glFilterFromParams(meta, p, { from, to });
@@ -484,7 +489,7 @@ const glFamily: Family = {
       const l = byId.get(lm[1]);
       if (!l) throw notFound('Report line');
       groupId = row.parentId ?? '';
-      if (column !== 'balance') return { items: itemsFrom([l], value), truncated: false };
+      if (column !== 'balance') return { items: itemsFrom([l], value), incomplete: false };
       // Running balance: the opening balance plus every line of the group up to this one.
       lineIds = [];
       for (const r of report.rows) {
@@ -511,22 +516,30 @@ const glFamily: Family = {
     );
     // Beginning balance (only shown when no line filter is on — see generalLedgerReport).
     const hasOpening = report.rows.some((r) => r.id === `${groupId}:open`);
+    let openingCut = false;
     if (withOpening && hasOpening) {
       const a = meta.get(accountId);
       if (a) {
         const dayBefore = new Date(from.getTime() - 1);
         const basis = f.basis;
-        let opening: GlLine[];
+        let opening: GlLine[] = [];
         if (isPLSection(a.section)) {
           const fyStart = fiscalWindowFor(from, await companyFiscalYearEnd(ctx)).start;
-          opening = fyStart < from ? (await lines(ctx, meta, { from: fyStart, to: dayBefore, accountIds: [accountId], basis, excludeClose: true })).lines : [];
+          if (fyStart < from) {
+            const o = await lines(ctx, meta, cap, { from: fyStart, to: dayBefore, accountIds: [accountId], basis, excludeClose: true });
+            opening = o.lines;
+            openingCut = o.truncated;
+          }
         } else {
-          opening = (await lines(ctx, meta, { to: dayBefore, accountIds: [accountId], basis })).lines;
+          const o = await lines(ctx, meta, cap, { to: dayBefore, accountIds: [accountId], basis });
+          opening = o.lines;
+          openingCut = o.truncated;
         }
         items.unshift(...itemsFrom(opening, (l) => l.natural));
       }
     }
-    return { items, truncated: got.truncated };
+    // The report's own read was capped (its 10,000 lines), or the opening balance read was.
+    return { items, incomplete: got.truncated || openingCut };
   },
 };
 
@@ -591,7 +604,7 @@ function agingFamily(side: 'ar' | 'ap', kind: 'summary' | 'detail' | 'open-invoi
           else throw validation('This line has no transactions behind it.');
         }
       }
-      return { items: items.filter(pick).map(openItem).filter((x) => !x.value.isZero()), truncated: false };
+      return { items: items.filter(pick).map(openItem).filter((x) => !x.value.isZero()), incomplete: false };
     },
   };
 }
@@ -664,7 +677,7 @@ function salesFamily(by: 'customer' | 'item'): Family {
             value: l.amount,
           };
         });
-      return { items, truncated: false };
+      return { items, incomplete: false };
     },
   };
 }
@@ -676,13 +689,13 @@ function salesFamily(by: 'customer' | 'item'): Family {
 const EXPENSE_SECTIONS: SectionKey[] = ['cogs', 'expense', 'other_expense'];
 
 const expensesFamily: Family = {
-  resolve: async ({ ctx, p, row, column, meta }) => {
+  resolve: async ({ ctx, p, row, column, meta, cap }) => {
     if (column !== 'amount') throw validation('That column has no amounts to explain.');
     const { from, to } = await resolveRange(ctx, p);
     const f = glFilterFromParams(meta, { ...p, vendorId: undefined }, { from, to });
     f.sections = EXPENSE_SECTIONS;
     f.excludeClose = true;
-    const got = await lines(ctx, meta, f);
+    const got = await lines(ctx, meta, cap, f);
     let pick: (l: GlLine) => boolean;
     if (row.id === 'ebv:grand') pick = () => true;
     else {
@@ -691,7 +704,7 @@ const expensesFamily: Family = {
       const id = m[1] === 'none' ? '' : m[1];
       pick = (l) => (l.nameType === 'vendor' && l.nameId ? l.nameId : '') === id;
     }
-    return { items: itemsFrom(got.lines, (l) => (pick(l) ? l.natural : null)), truncated: got.truncated };
+    return { items: itemsFrom(got.lines, (l) => (pick(l) ? l.natural : null)), incomplete: got.truncated };
   },
 };
 
@@ -739,6 +752,8 @@ export interface DrilldownOptions {
   /** Tooltip mode: count, total and largest only (no transaction list). */
   brief?: boolean;
   now?: Date;
+  /** Most ledger lines one read may return (default 50,000). Tests lower it. */
+  lineCap?: number;
 }
 
 function toTxn(t: { key: string; entryId: string | null; sourceRef: string | null; date: Date; type: string; num: string; name: string; memo: string; accounts: Set<string>; value: Decimal }): DrillTransaction {
@@ -786,6 +801,21 @@ export function explainText(count: number, largest: DrillTransaction | null): st
   return count === 1 ? `Made of 1 transaction: ${detail}.` : `Made of ${count.toLocaleString('en-US')} transactions, largest ${detail}.`;
 }
 
+/**
+ * The basis part of a drill-down's scope line, from the basis itself (never inferred from the
+ * subtitle): nothing when the subtitle already names it, "Cash basis" / "Accrual basis" otherwise,
+ * and nothing for reports that are not offered on both bases.
+ */
+export function basisScopeLabel(basis: 'accrual' | 'cash' | undefined, subtitle: string | undefined): string {
+  if (!basis) return '';
+  const sub = (subtitle ?? '').toLowerCase();
+  if (basis === 'cash') return sub.includes('cash') ? '' : 'Cash basis';
+  return sub.includes('accrual') ? '' : 'Accrual basis';
+}
+
+/** Explanation when a ledger read hit its line cap (the total cannot be trusted). */
+export const INCOMPLETE_EXPLANATION = 'Too many transactions to add up here; narrow the report dates to see them.';
+
 /** Value of a cell, including a collapsed heading's rolled-up amount. */
 function cellOf(row: StdRow, column: string): string | null {
   const v = row.cells[column] ?? (row.kind === 'section' ? row.collapsedCells?.[column] : undefined) ?? null;
@@ -812,19 +842,28 @@ export async function drilldownCell(
   if (typeof rowId !== 'string' || !rowId || rowId.length > 300) throw validation('Choose a line of the report.');
   if (typeof column !== 'string' || !column || column.length > 60) throw validation('Choose a column of the report.');
 
-  const report = await runner(ctx, params);
+  // A tooltip reuses the report run the page just made (the same numbers the viewer sees), so
+  // hovering across a row does not re-run the whole report per amount. The drill-down page
+  // always runs it fresh.
+  const recent = opts.brief ? recentReportRun(ctx, key, params) : null;
+  const memo = recent ?? rememberReportRun(ctx, key, params, await executePreparedReport(ctx, key, { entry, runner, params }));
+  const report = memo.report;
   const row = report.rows.find((r) => r.id === rowId);
   if (!row) throw notFound('Report line');
   const col = report.columns.find((c) => c.key === column);
   if (!col || (col.type !== 'money' && col.type !== 'percent')) throw validation('That column has no amounts to explain.');
-  const meta = await loadAccountMeta(ctx);
+  if (!memo.meta) {
+    memo.meta = loadAccountMeta(ctx);
+    memo.meta.catch(() => (memo.meta = undefined));
+  }
+  const meta = await memo.meta;
 
   const formula = family.formulas?.(column) ?? null;
   const resolvedColumn = formula ? formula.base : column;
   if (formula && !report.columns.some((c) => c.key === resolvedColumn)) throw validation('That column has no amounts to explain.');
   if (!formula && col.type !== 'money') throw validation('That column has no amounts to explain.');
 
-  const { items, truncated } = await family.resolve({ ctx, key, p: params, report, row, column: resolvedColumn, meta });
+  const { items, incomplete } = await family.resolve({ ctx, key, p: params, report, row, column: resolvedColumn, meta, cap: opts.lineCap ?? LINE_CAP });
   const txns = groupTransactions(items);
   const total = items.reduce((s, it) => s.plus(it.value), Money.zero());
   let largest: DrillTransaction | null = null;
@@ -839,10 +878,10 @@ export async function drilldownCell(
     'This line';
   const columnLabel = col.header || report.title;
   const basis = entry.basis ? (params.basis === 'cash' ? 'cash' : 'accrual') : undefined;
-  const scope = [rowLabel, col.header && col.header !== report.subtitle ? col.header : '', report.subtitle ?? '', basis && !report.subtitle?.includes('Cash') ? 'Accrual basis' : '']
+  const scope = [rowLabel, col.header && col.header !== report.subtitle ? col.header : '', report.subtitle ?? '', basisScopeLabel(basis, report.subtitle)]
     .filter(Boolean)
     .join(' · ');
-  let explanation = explainText(txns.length, largest);
+  let explanation = incomplete ? INCOMPLETE_EXPLANATION : explainText(txns.length, largest);
   if (formula) explanation = `${formula.formula}. ${explanation}`;
   const limit = opts.brief ? 0 : Math.max(0, Math.min(opts.limit ?? 1000, 5000));
   return {
@@ -855,11 +894,12 @@ export async function drilldownCell(
     formula: formula?.formula,
     cell,
     total: toAmountString(total),
-    ties: formula ? baseCell !== null && Money.eq(total, baseCell) : cell !== null ? Money.eq(total, cell) : total.isZero(),
+    ties: incomplete ? false : formula ? baseCell !== null && Money.eq(total, baseCell) : cell !== null ? Money.eq(total, cell) : total.isZero(),
     count: txns.length,
     largest,
     transactions: txns.slice(0, limit),
-    truncated: truncated || txns.length > limit,
+    listTruncated: txns.length > limit,
+    incomplete,
     explanation,
     scope,
     basis,

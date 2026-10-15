@@ -10,7 +10,7 @@ import { parseReportParams, type ReportParams } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { notFound, validation } from './_base';
 import { requirePermission } from './access';
-import { DATE_MACROS, companyFiscalYearEnd, resolveDateMacro, type DateMacro } from './reportEngine';
+import { DATE_MACROS, companyFiscalYearEnd, resolveDateMacro, type AccountMeta, type DateMacro } from './reportEngine';
 import {
   balanceSheetDetail,
   balanceSheetReport,
@@ -225,10 +225,92 @@ export async function runStandardReport(
   rawParams: URLSearchParams | Record<string, unknown>,
   opts?: { now?: Date },
 ): Promise<StdReport> {
-  const { entry, runner, params } = await prepareStandardReport(ctx, key, rawParams, opts);
+  return executePreparedReport(ctx, key, await prepareStandardReport(ctx, key, rawParams, opts));
+}
+
+/**
+ * Run a report already checked and normalized by prepareStandardReport, and remember the run
+ * (recentReportRun) so the amount tooltips on the page explain exactly the numbers it shows.
+ */
+export async function executePreparedReport(
+  ctx: ServiceContext,
+  key: string,
+  prepared: { entry: (typeof CATALOG_BY_KEY)[string]; runner: Runner; params: ReportParams },
+): Promise<StdReport> {
+  const { entry, runner, params } = prepared;
   const report = await runner(ctx, params);
   if (entry.basis) report.basis = params.basis === 'cash' ? 'cash' : 'accrual';
+  rememberReportRun(ctx, key, params, report);
   return report;
+}
+
+// ---------------------------------------------------------------------------
+// Short-lived memo of recent report runs (report explanations)
+// ---------------------------------------------------------------------------
+//
+// Hovering across a row of a report asks for one tooltip per amount; each needs the report's
+// rows (row membership, the cell value). Re-running the whole report per tooltip is wasteful on
+// large books, so tooltip ("brief") explanations reuse the latest run of the same report with
+// the same options by the same user in the same company, for a short time. Every real run
+// (the report page, the drill-down page) replaces the entry, so a tooltip compares against the
+// numbers the viewer is looking at; if the books changed since, the tooltip says so.
+
+/** How long a remembered run serves tooltips. */
+export const REPORT_RUN_MEMO_TTL_MS = 60_000;
+const REPORT_RUN_MEMO_MAX = 16;
+
+export interface ReportRunMemo {
+  at: number;
+  report: StdReport;
+  /** Chart-of-accounts metadata loaded alongside (lazily, by the first tooltip that needs it). */
+  meta?: Promise<Map<string, AccountMeta>>;
+}
+
+const reportRuns = new Map<string, ReportRunMemo>();
+
+function stableJson(v: unknown): string {
+  if (v instanceof Date) return JSON.stringify(v.toISOString());
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(',')}]`;
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .filter((k) => o[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(v ?? null);
+}
+
+const runMemoKey = (ctx: ServiceContext, key: string, params: ReportParams) =>
+  `${ctx.companyId}|${ctx.userId ?? ''}|${ctx.role ?? ''}|${key}|${stableJson(params)}`;
+
+/** Remember a report run (replaces any earlier run of the same report and options). */
+export function rememberReportRun(ctx: ServiceContext, key: string, params: ReportParams, report: StdReport, now = Date.now()): ReportRunMemo {
+  const k = runMemoKey(ctx, key, params);
+  reportRuns.delete(k);
+  for (const [other, m] of reportRuns) if (now - m.at > REPORT_RUN_MEMO_TTL_MS) reportRuns.delete(other);
+  const memo: ReportRunMemo = { at: now, report };
+  reportRuns.set(k, memo);
+  while (reportRuns.size > REPORT_RUN_MEMO_MAX) reportRuns.delete(reportRuns.keys().next().value!);
+  return memo;
+}
+
+/** The run remembered for this report and options, if it is recent enough; otherwise null. */
+export function recentReportRun(ctx: ServiceContext, key: string, params: ReportParams, now = Date.now()): ReportRunMemo | null {
+  const k = runMemoKey(ctx, key, params);
+  const memo = reportRuns.get(k);
+  if (!memo) return null;
+  if (now - memo.at > REPORT_RUN_MEMO_TTL_MS || now < memo.at) {
+    reportRuns.delete(k);
+    return null;
+  }
+  return memo;
+}
+
+/** Forget every remembered run (tests; company switch). */
+export function clearReportRunMemo() {
+  reportRuns.clear();
 }
 
 /** The company's default report basis (companies.settings.reportBasis; accrual when unset). */

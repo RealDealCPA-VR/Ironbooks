@@ -15,8 +15,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import Link from 'next/link';
 import { api, ApiError } from '@/lib/client';
-import type { CellDrilldown } from '@/lib/reports/drilldown';
-import { formatCurrency } from '@/lib/money';
+import { explainNote, type CellDrilldown } from '@/lib/reports/drilldown';
 
 const cache = new Map<string, Promise<CellDrilldown>>();
 
@@ -64,7 +63,11 @@ export default function AmountExplain({
   hint?: string;
   /** Called just before following `href` (the report saves its scroll position). */
   onNavigate?: () => void;
-  /** Accessible name prefix, e.g. "Rent, Jan 2026". */
+  /**
+   * What the amount is, e.g. "Rent, Jan 2026". Screen readers hear it before the amount and the
+   * action after it ("Rent, Jan 2026: $1,200.00. See the transactions behind this amount"); the
+   * amount itself stays part of the accessible name.
+   */
   label?: string;
 }) {
   const id = useId();
@@ -97,13 +100,7 @@ export default function AmountExplain({
     if (!apiUrl) return;
     setTip((t) => (t?.status === 'done' ? t : { status: 'loading', text: 'Adding up the transactions…' }));
     fetchExplanation(apiUrl)
-      .then((d) => {
-        const note =
-          d.kind === 'transactions' && !d.ties && d.cell !== null
-            ? `These add up to ${formatCurrency(d.total)}; the report shows ${formatCurrency(d.cell)}. The books changed since the report ran — run it again.`
-            : undefined;
-        setTip({ status: 'done', text: d.explanation, note });
-      })
+      .then((d) => setTip({ status: 'done', text: d.explanation, note: explainNote(d) }))
       .catch((err) => setTip({ status: 'error', text: err instanceof ApiError ? err.message : 'Could not explain this amount.' }));
   };
 
@@ -150,9 +147,10 @@ export default function AmountExplain({
         hide();
         onNavigate?.();
       }}
-      aria-label={label ? `${label}: see the transactions behind this amount` : undefined}
     >
+      {label && <span className="sr-only">{label}: </span>}
       {children}
+      <span className="sr-only">. See the transactions behind this amount</span>
     </Link>
   ) : (
     <button
@@ -165,9 +163,10 @@ export default function AmountExplain({
         hide();
         onActivate?.();
       }}
-      aria-label={label ? `${label}: open this transaction` : undefined}
     >
+      {label && <span className="sr-only">{label}: </span>}
       {children}
+      <span className="sr-only">. Open this transaction</span>
     </button>
   );
 
