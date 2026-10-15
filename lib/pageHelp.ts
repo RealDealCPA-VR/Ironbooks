@@ -100,7 +100,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/credit-memos': {
     title: 'Credit Memos',
     what: 'Give a customer a credit (for a return or a mistake) that lowers what they owe, or refund them.',
-    first: 'Click "New credit memo", pick the customer and add what you are crediting.',
+    first: 'Click "New credit memo", pick the customer and add what you are crediting. Prices follow the price level set on the customer, like on invoices.',
     qb: 'Create Credit Memos/Refunds',
   },
   '/leads': {
@@ -184,7 +184,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/expenses': {
     title: 'Write Checks',
     what: 'Record money you paid right away by check, debit card or cash, and what it was for.',
-    first: 'Click "New check", pick the bank account, the payee and the expense.',
+    first: 'Click "New check", pick the bank account, the payee and the expense. The payee can be a vendor or someone on the Other Names list.',
     qb: 'Write Checks',
   },
   '/receipts': {

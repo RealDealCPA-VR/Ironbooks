@@ -9,8 +9,10 @@ export interface BulkColumn {
   key: string;
   label: string;
   required?: boolean;
-  kind?: 'text' | 'money' | 'decimal' | 'bool' | 'enum';
+  kind?: 'text' | 'money' | 'decimal' | 'bool' | 'enum' | 'date';
   options?: readonly string[];
+  /** Only for rows that ADD a record (read-only on existing records in edit mode). */
+  newOnly?: boolean;
   /** Plain-language hint shown in the grid header tooltip. */
   hint?: string;
   width?: number;
@@ -62,6 +64,10 @@ export const BULK_COLUMNS: Record<BulkList, BulkColumn[]> = {
     { key: 'preferredVendor', label: 'Preferred vendor', width: 160 },
     { key: 'reorderPoint', label: 'Reorder point', kind: 'decimal', width: 100 },
     { key: 'unitOfMeasure', label: 'U/M', width: 70 },
+    // G1: opening stock for NEW inventory items (Dr Inventory Asset / Cr Opening Balance Equity).
+    { key: 'openingQuantity', label: 'Qty on hand', kind: 'decimal', newOnly: true, hint: 'New inventory items: how many you have now', width: 100 },
+    { key: 'openingValue', label: 'Total value', kind: 'money', newOnly: true, hint: 'What that stock cost in total (blank = Qty on hand × Cost)', width: 110 },
+    { key: 'openingAsOf', label: 'As of date', kind: 'date', newOnly: true, hint: 'Date you counted it, e.g. 2026-01-01 or 1/1/2026 (blank = today)', width: 110 },
   ],
 };
 
@@ -158,6 +164,30 @@ export function pastedRowsToRecords(
     return rec;
   });
   return { records, mappedColumns: mapping.filter((m): m is string => !!m), usedHeader };
+}
+
+/**
+ * "2026-01-31", "1/31/2026" or "01/31/26" (US month/day order, as QuickBooks writes it) → a UTC
+ * midnight Date; null when blank or not a real calendar date.
+ */
+export function parseDateCell(v: string): Date | null {
+  const s = v.trim();
+  if (!s) return null;
+  let y: number;
+  let m: number;
+  let d: number;
+  let match = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s);
+  if (match) {
+    [y, m, d] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  } else {
+    match = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2}|\d{4})$/.exec(s);
+    if (!match) return null;
+    [m, d, y] = [Number(match[1]), Number(match[2]), Number(match[3])];
+    if (y < 100) y += 2000;
+  }
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;
+  return dt;
 }
 
 /** "yes"/"y"/"true"/"1"/"x" → true, "no"/"n"/"false"/"0"/"" → false, else null (invalid). */

@@ -9,6 +9,12 @@
  * set quantityOnHand / averageCost. The layer's value (quantity × 4-dp unit cost) always equals
  * the posted amount exactly — a total value that cannot be expressed that way is refused with the
  * nearest exact values, so inventory valuation and the general ledger can never drift apart.
+ *
+ * `{ postToLedger: false }` (IIF import only): the general ledger already carries the stock's
+ * value because the same import brings in the Inventory Asset account's balance (QuickBooks
+ * exports it as the account's OBAMOUNT). The item, FIFO layer and quantityOnHand / averageCost
+ * are created exactly the same way but NO journal entry is posted, which would count the value
+ * twice. Matching the item values to that imported balance is then the file's responsibility.
  */
 import { and, eq } from 'drizzle-orm';
 import Decimal from 'decimal.js';
@@ -90,7 +96,17 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
 }
 
 /** Create an item, optionally with an opening quantity on hand (see module doc). */
-export async function createItemWithOpeningStock(ctx: ServiceContext, input: CreateItemInput & OpeningStockInput) {
+export interface OpeningStockOptions {
+  /** False = the ledger already carries the value (see module doc); default true. */
+  postToLedger?: boolean;
+}
+
+export async function createItemWithOpeningStock(
+  ctx: ServiceContext,
+  input: CreateItemInput & OpeningStockInput,
+  options: OpeningStockOptions = {},
+) {
+  const postToLedger = options.postToLedger ?? true;
   const { openingQuantity, openingValue, openingUnitCost, openingAsOf, ...itemInput } = input;
   const plan = planOpeningStock(
     { openingQuantity, openingValue, openingUnitCost, openingAsOf },
@@ -102,7 +118,7 @@ export async function createItemWithOpeningStock(ctx: ServiceContext, input: Cre
   return inTransaction(ctx, async (tx) => {
     const item = await createItem(tx, itemInput);
     let entryId: string | null = null;
-    if (plan.value.greaterThan(0)) {
+    if (postToLedger && plan.value.greaterThan(0)) {
       const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
       const obe = await findOrCreateOpeningBalanceEquity(tx);
       const amount = toAmountString(plan.value);
@@ -140,6 +156,7 @@ export async function createItemWithOpeningStock(ctx: ServiceContext, input: Cre
       asOf: plan.asOf,
       entryId,
       layerId: layer.id,
+      ...(postToLedger ? {} : { ledgerCarried: true }),
     };
     await writeAudit(tx, {
       action: 'update',

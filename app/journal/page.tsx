@@ -47,6 +47,7 @@ import { formatAccountLabel } from '@/lib/preferences';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
+import { activeOrSelected, otherNameLabel, type OtherNameEntry } from '@/lib/lists/otherNameOptions';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -96,12 +97,21 @@ interface Account {
   subtype?: string;
 }
 
-/** A customer / vendor / employee for the QB "Name" column. value = "<kind>:<id>". */
+/** A customer / vendor / employee / Other Names entry for the QB "Name" column. value = "<kind>:<id>". */
 interface NameOption {
   value: string;
   label: string;
-  kind: 'customer' | 'vendor' | 'employee';
+  kind: 'customer' | 'vendor' | 'employee' | 'other';
+  /** Inactive entries are offered only on the line that already uses them. */
+  inactive?: boolean;
 }
+
+const NAME_GROUP_LABEL: Record<NameOption['kind'], string> = {
+  customer: 'Customers',
+  vendor: 'Vendors',
+  employee: 'Employees',
+  other: 'Other Names',
+};
 
 interface ClassOption {
   id: string;
@@ -470,16 +480,13 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
                       ? '— Pick vendor —'
                       : '— No name —'}
                 </option>
-                {(['customer', 'vendor', 'employee'] as const).map((kind) => {
+                {(['customer', 'vendor', 'employee', 'other'] as const).map((kind) => {
                   const need = requiredNameKind(accountById.get(line.accountId));
                   if (need && need !== kind) return null;
-                  const opts = names.filter((n) => n.kind === kind);
+                  const opts = activeOrSelected(names.filter((n) => n.kind === kind), line.name);
                   if (opts.length === 0) return null;
                   return (
-                    <optgroup
-                      key={kind}
-                      label={kind === 'customer' ? 'Customers' : kind === 'vendor' ? 'Vendors' : 'Employees'}
-                    >
+                    <optgroup key={kind} label={NAME_GROUP_LABEL[kind]}>
                       {opts.map((n) => (
                         <option key={n.value} value={n.value}>
                           {n.label}
@@ -719,10 +726,15 @@ function JournalPageContent() {
 
   // Names for the QB "Name" column. Each list is optional (permissions may hide one).
   const fetchNames = useCallback(async () => {
-    const [cust, vend, emp] = await Promise.all([
+    const [cust, vend, emp, other] = await Promise.all([
       api.get<Array<{ id: string; displayName: string }>>('/api/customers').catch(() => []),
       api.get<Array<{ id: string; displayName: string }>>('/api/vendors').catch(() => []),
       api.get<Array<{ id: string; firstName: string; lastName: string }>>('/api/employees').catch(() => []),
+      // QB "Other Names" (payees that are not customers, vendors or employees).
+      api
+        .get<{ entries: OtherNameEntry[] }>('/api/lists/other-names?includeInactive=true')
+        .then((d) => d.entries)
+        .catch(() => []),
     ]);
     const list = (v: unknown) => (Array.isArray(v) ? v : []);
     setNames([
@@ -732,6 +744,12 @@ function JournalPageContent() {
         value: `employee:${e.id}`,
         label: `${e.firstName} ${e.lastName}`.trim(),
         kind: 'employee' as const,
+      })),
+      ...list(other).map((o: OtherNameEntry) => ({
+        value: `other:${o.id}`,
+        label: otherNameLabel(o),
+        kind: 'other' as const,
+        inactive: o.isActive === false,
       })),
     ]);
   }, []);

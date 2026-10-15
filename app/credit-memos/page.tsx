@@ -51,6 +51,8 @@ import {
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
 import { usePreferences } from '@/lib/usePreferences';
+import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
+import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -131,6 +133,8 @@ interface LineRow {
   taxable: boolean;
   /** Inventory items only: true = return to stock, false = damaged write-off. */
   restock: boolean;
+  /** Advanced pricing (B12): the user typed the rate, so automatic prices leave it alone. */
+  rateManual?: boolean;
   /** Advanced Inventory: site / bin / serials / lot the returned goods go back to. */
   inv?: InvDetail;
 }
@@ -228,6 +232,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
           rate: String(Number(l.rate)),
           taxable: l.taxable !== false,
           restock: l.restock !== false,
+          // Saved prices stay as they are; the badge still offers the current quote.
+          rateManual: true,
         })),
       );
       return;
@@ -275,11 +281,32 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
     updateLine(idx, {
       itemId,
       description: lines[idx].description || item.name,
-      rate: lines[idx].rate || (item.salesPrice ?? ''),
+      // The base price shows at once; the customer's price level / price rules replace it below.
+      rate: item.salesPrice ?? '',
+      rateManual: false,
       taxable: item.taxable,
       restock: true,
     });
   }
+
+  // Advanced pricing (B12): price rules / the customer's price level / customer prices per line,
+  // from the same server engine the credit memo service re-runs on save.
+  const quotes = usePriceQuotes(
+    { customerId: customerId || null, date },
+    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1' })),
+  );
+  useEffect(() => {
+    setLines((prev) => {
+      let changed = false;
+      const next = prev.map((l, i) => {
+        const qt = quotes[i];
+        if (!qt || l.rateManual || l.itemId !== qt.itemId || samePrice(l.rate, qt.price)) return l;
+        changed = true;
+        return { ...l, rate: String(Number(qt.price)) };
+      });
+      return changed ? next : prev;
+    });
+  }, [quotes]);
 
   const selectedRate = taxRates.find((t) => t.id === taxRateId);
   const liveSubtotal = computeSubtotal(lines);
@@ -523,11 +550,19 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
                     value={line.quantity}
                     onChange={(e) => updateLine(idx, { quantity: e.target.value })}
                   />
-                  <AmountInput
-                    placeholder="0.00"
-                    value={line.rate}
-                    onChange={(e) => updateLine(idx, { rate: e.target.value })}
-                  />
+                  <div>
+                    <AmountInput
+                      placeholder="0.00"
+                      aria-label={`Line ${idx + 1} rate`}
+                      value={line.rate}
+                      onChange={(e) => updateLine(idx, { rate: e.target.value, rateManual: true })}
+                    />
+                    <PriceSourceBadge
+                      quote={quotes[idx]}
+                      rate={line.rate}
+                      onUseQuoted={(price) => updateLine(idx, { rate: String(Number(price)), rateManual: false })}
+                    />
+                  </div>
                   <span className="flex items-center justify-center">
                     <input
                       type="checkbox"

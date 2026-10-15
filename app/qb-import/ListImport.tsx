@@ -31,6 +31,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { formatCurrency } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,6 +67,8 @@ interface ImportCounts {
   lists?: Record<string, number>;
   deferred?: DeferredList[];
   openItems?: { invoices: number; bills: number; credits: number; skipped: number };
+  /** G1: inventory items brought in with a quantity on hand, and its total value. */
+  openingStock?: { items: number; value: string; unposted?: number };
   skipped: number;
   issues: ImportIssue[];
 }
@@ -118,6 +121,10 @@ const CSV_FIELDS: Record<CsvKind, Array<{ key: string; label: string }>> = {
     { key: 'incomeAccount', label: 'Income Account (name or code)' },
     { key: 'expenseAccount', label: 'Expense/COGS Account (name or code)' },
     { key: 'assetAccount', label: 'Inventory Asset Account (name or code)' },
+    // G1: opening stock for inventory items (Inventory Asset vs Opening Balance Equity).
+    { key: 'quantityOnHand', label: 'Quantity on Hand (inventory items)' },
+    { key: 'totalValue', label: 'Total Value of that quantity (blank = quantity × cost)' },
+    { key: 'asOfDate', label: 'As of Date for the quantity (blank = today)' },
   ],
   accounts: [
     { key: 'name', label: 'Account Name *' },
@@ -481,6 +488,20 @@ export function ListImport() {
             <ResultBadge label="Vendors" count={result.vendors} />
             <ResultBadge label="Skipped" count={result.skipped} tone="neutral" />
           </div>
+          {result.openingStock && result.openingStock.items > 0 && (
+            <p className="text-sm text-navy/70">
+              {result.openingStock.items} inventory item{result.openingStock.items === 1 ? '' : 's'} started with a
+              quantity on hand worth {formatCurrency(result.openingStock.value)} in total (added to Inventory Asset
+              against Opening Balance Equity).
+              {(result.openingStock.unposted ?? 0) > 0 && (
+                <>
+                  {' '}
+                  For {result.openingStock.unposted} of them the file already brings in the inventory asset balance, so
+                  their stock was set up without a journal entry.
+                </>
+              )}
+            </p>
+          )}
 
           {(result.deferred ?? []).length > 0 && (
             <div className="rounded-lg border border-gold/40 bg-gold/10 p-3 space-y-1">

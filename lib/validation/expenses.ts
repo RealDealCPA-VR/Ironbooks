@@ -34,6 +34,8 @@ export const expenseLineSchema = z
 export const createExpenseSchema = z
   .object({
     vendorId: zUuid.nullish(),
+    /** B3: payee from the Other Names list (instead of a vendor). */
+    otherNameId: zUuid.nullish(),
     payeeName: z.string().nullish(),
     date: zDate,
     method: z.enum(['check', 'cash', 'credit_card'], {
@@ -51,8 +53,12 @@ export const createExpenseSchema = z
     allowDuplicateNumber: z.boolean().optional(),
     lines: zLines(expenseLineSchema),
   })
-  .refine((e) => Boolean(e.vendorId) || Boolean(e.payeeName?.trim()), {
-    message: 'Provide a vendorId or a payeeName.',
+  .refine((e) => Boolean(e.vendorId) || Boolean(e.otherNameId) || Boolean(e.payeeName?.trim()), {
+    message: 'Provide a vendorId, an otherNameId or a payeeName.',
     path: ['payeeName'],
+  })
+  .refine((e) => !(e.vendorId && e.otherNameId), {
+    message: 'Pick either a vendor or an Other Names entry as the payee, not both.',
+    path: ['otherNameId'],
   });
 export type CreateExpenseBody = z.infer<typeof createExpenseSchema>;

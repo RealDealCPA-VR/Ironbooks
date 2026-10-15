@@ -1,13 +1,14 @@
 /**
  * API route: /api/expenses — Write Checks / direct expenses / credit card charges.
  *
- * GET  /api/expenses[?vendorId=&method=&paymentAccountId=&toPrint=true&includeVoided=true&limit=&offset=]
+ * GET  /api/expenses[?vendorId=&otherNameId=&method=&paymentAccountId=&toPrint=true&includeVoided=true&limit=&offset=]
  *   → 200 { expenses: Expense[] }   (vendorName/paymentAccountName joined in)
  *
  * POST /api/expenses
  *   Body: {
  *     vendorId?:        string,
- *     payeeName?:       string,              // required when no vendorId
+ *     otherNameId?:     string,              // payee from the Other Names list (not with vendorId)
+ *     payeeName?:       string,              // required when no vendorId / otherNameId
  *     date:             string (ISO),
  *     method:           'check'|'cash'|'credit_card',
  *     reference?:       string,              // check no.; auto-assigned when omitted (method=check)
@@ -68,6 +69,7 @@ export async function GET(req: NextRequest) {
     const method = searchParams.get('method') ?? undefined;
     const rows = await listExpenses(ctx, {
       vendorId: searchParams.get('vendorId') ?? undefined,
+      otherNameId: /^[0-9a-f-]{36}$/i.test(searchParams.get('otherNameId') ?? '') ? searchParams.get('otherNameId')! : undefined,
       method: method as ExpenseMethod | undefined,
       paymentAccountId: searchParams.get('paymentAccountId') ?? undefined,
       toPrint: searchParams.get('toPrint') === 'true' || undefined,

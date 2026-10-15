@@ -53,7 +53,26 @@ interface Customer {
   taxExemptionReason?: string | null;
   /** Default sales tax item (QB "Tax Item"). */
   taxRateId?: string | null;
+  /** B12: price level used on this customer's sales forms. */
+  priceLevelId?: string | null;
   shipToAddresses?: ShipToAddress[] | null;
+}
+
+/** Price levels from Advanced Pricing (GET /api/pricing/levels). */
+interface PriceLevelOption {
+  id: string;
+  name: string;
+  type: string;
+  percent: string;
+  isActive: boolean;
+}
+
+/** Plain-language summary of a price level, e.g. "10% off" / "5% more" / "custom item prices". */
+function priceLevelSummary(l: PriceLevelOption): string {
+  if (l.type === 'per_item') return 'custom item prices';
+  const pct = Number(l.percent);
+  if (!pct) return 'same as base price';
+  return pct < 0 ? `${Math.abs(pct)}% off` : `${pct}% more`;
 }
 
 interface TaxRateOption {
@@ -93,6 +112,7 @@ interface CustomerFormState {
   resaleNumber: string;
   taxExemptionReason: string;
   taxRateId: string;
+  priceLevelId: string;
   notes: string;
 }
 
@@ -107,6 +127,7 @@ const EMPTY_FORM: CustomerFormState = {
   resaleNumber: '',
   taxExemptionReason: '',
   taxRateId: '',
+  priceLevelId: '',
   notes: '',
 };
 
@@ -135,11 +156,14 @@ function CustomerForm({
   termsList,
   taxCodes,
   taxRates,
+  priceLevels,
   shipTos,
   onShipTosChange,
 }: {
   form: CustomerFormState;
   onChange: (field: keyof CustomerFormState, value: string) => void;
+  /** null = price levels could not be loaded (no access): the field is hidden. */
+  priceLevels: PriceLevelOption[] | null;
   termsList: ListOption[];
   taxCodes: ListOption[];
   taxRates: TaxRateOption[];
@@ -239,6 +263,29 @@ function CustomerForm({
         </Select>
         <p className="mt-1 text-xs text-navy/50">New invoices and other sales forms for this customer use this tax.</p>
       </div>
+      {priceLevels && (
+        <div>
+          <Label htmlFor="priceLevel">Price level</Label>
+          <Select id="priceLevel" value={form.priceLevelId} onChange={(e) => onChange('priceLevelId', e.target.value)}>
+            <option value="">— Regular prices —</option>
+            {priceLevels
+              .filter((l) => l.isActive || l.id === form.priceLevelId)
+              .map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.name} ({priceLevelSummary(l)}){l.isActive ? '' : ' — inactive'}
+                </option>
+              ))}
+          </Select>
+          <p className="mt-1 text-xs text-navy/50">
+            Invoices, sales receipts, estimates, sales orders and credit memos for this customer use these prices.
+            Set up levels in{' '}
+            <Link href="/advanced-pricing" className="text-electric hover:underline">
+              Advanced Pricing
+            </Link>
+            .
+          </p>
+        </div>
+      )}
       {form.salesTaxCodeId && taxCodes.find((t) => t.id === form.salesTaxCodeId)?.taxable === false && (
         <div className="grid grid-cols-2 gap-3">
           <div>
@@ -423,6 +470,7 @@ function CustomersPageContent() {
   const [termsList, setTermsList] = useState<ListOption[]>([]);
   const [taxCodes, setTaxCodes] = useState<ListOption[]>([]);
   const [taxRates, setTaxRates] = useState<TaxRateOption[]>([]);
+  const [priceLevels, setPriceLevels] = useState<PriceLevelOption[] | null>(null);
   const [addShipTos, setAddShipTos] = useState<ShipToRow[]>([]);
   const [editShipTos, setEditShipTos] = useState<ShipToRow[]>([]);
   useEffect(() => {
@@ -430,6 +478,11 @@ function CustomersPageContent() {
       .get<TaxRateOption[]>('/api/tax-rates')
       .then((d) => setTaxRates(Array.isArray(d) ? d : []))
       .catch(() => {});
+    // B12: price levels (hidden when the user cannot read Advanced Pricing).
+    api
+      .get<{ levels: PriceLevelOption[] }>('/api/pricing/levels')
+      .then((d) => setPriceLevels(Array.isArray(d.levels) ? d.levels : []))
+      .catch(() => setPriceLevels(null));
     api
       .get<{ entries: ListOption[] }>('/api/lists/terms?includeInactive=true')
       .then((d) => setTermsList(d.entries))
@@ -531,6 +584,7 @@ function CustomersPageContent() {
         resaleNumber: addForm.resaleNumber.trim() || undefined,
         taxExemptionReason: addForm.taxExemptionReason.trim() || undefined,
         taxRateId: addForm.taxRateId || undefined,
+        priceLevelId: addForm.priceLevelId || undefined,
         shipToAddresses: shipToRowsPayload(addShipTos),
         notes: addForm.notes.trim() || undefined,
       });
@@ -571,6 +625,7 @@ function CustomersPageContent() {
       resaleNumber: customer.resaleNumber ?? '',
       taxExemptionReason: customer.taxExemptionReason ?? '',
       taxRateId: customer.taxRateId ?? '',
+      priceLevelId: customer.priceLevelId ?? '',
       notes: customer.notes ?? '',
     });
     setEditShipTos(shipToRowsFrom(customer.shipToAddresses));
@@ -604,6 +659,8 @@ function CustomersPageContent() {
         resaleNumber: editForm.resaleNumber.trim() || null,
         taxExemptionReason: editForm.taxExemptionReason.trim() || null,
         taxRateId: editForm.taxRateId || null,
+        // Only when the levels loaded, so a user without Advanced Pricing access never clears it.
+        ...(priceLevels ? { priceLevelId: editForm.priceLevelId || null } : {}),
         shipToAddresses: shipToRowsPayload(editShipTos),
         notes: editForm.notes.trim() || null,
       });
@@ -837,6 +894,7 @@ function CustomersPageContent() {
           termsList={termsList}
           taxCodes={taxCodes}
           taxRates={taxRates}
+          priceLevels={priceLevels}
           shipTos={addShipTos}
           onShipTosChange={setAddShipTos}
           customFieldNames={customFieldNames}
@@ -871,6 +929,7 @@ function CustomersPageContent() {
           termsList={termsList}
           taxCodes={taxCodes}
           taxRates={taxRates}
+          priceLevels={priceLevels}
           shipTos={editShipTos}
           onShipTosChange={setEditShipTos}
           customFieldNames={customFieldNames}

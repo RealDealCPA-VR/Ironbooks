@@ -10,13 +10,14 @@
  */
 import { and, eq } from 'drizzle-orm';
 import { accounts, salesTaxCodes, vendors } from '@/lib/db/schema';
-import { BULK_COLUMNS, type BulkList, ITEM_TYPES_FOR_BULK, parseAmount, parseBool } from '@/lib/lists/bulk';
+import { BULK_COLUMNS, type BulkList, ITEM_TYPES_FOR_BULK, parseAmount, parseBool, parseDateCell } from '@/lib/lists/bulk';
 import { type ServiceContext, ServiceError, inTransaction, validation } from '../_base';
 import { createCustomer, updateCustomer } from '../customers';
 import { setReorderPoint } from '../inventory';
 import { type ItemType, createItem, updateItem } from '../items';
 import { createVendor, updateVendor } from '../vendors';
 import { ensureSeeded } from './simpleLists';
+import { createItemWithOpeningStock } from './openingStock';
 import { resolveTermsRef } from './terms';
 
 export interface BulkRowError {
@@ -244,6 +245,45 @@ async function saveItem(ctx: ServiceContext, row: RawRow, lk: Lookups): Promise<
     preferredVendorId,
     unitOfMeasure: optText(row, 'unitOfMeasure', editing),
   };
+  // G1: opening quantity on hand / total value / as-of date (new inventory items only). Posted
+  // by the same path as the New Item form (lib/services/lists/openingStock.ts): Dr Inventory
+  // Asset / Cr Opening Balance Equity plus a FIFO layer, so the ledger stays balanced.
+  const openQty = has(row, 'openingQuantity') ? str(row.openingQuantity) : '';
+  const openValueRaw = has(row, 'openingValue') ? str(row.openingValue) : '';
+  const openAsOfRaw = has(row, 'openingAsOf') ? str(row.openingAsOf) : '';
+  const anyOpening = openQty !== '' || openValueRaw !== '' || openAsOfRaw !== '';
+  let opening: { openingQuantity: string; openingValue?: string; openingUnitCost?: string; openingAsOf?: Date } | null = null;
+  if (anyOpening) {
+    if (editing) {
+      const field = openQty !== '' ? 'openingQuantity' : openValueRaw !== '' ? 'openingValue' : 'openingAsOf';
+      throw new FieldError(field, 'Quantity on hand can only be entered for a new item. To change stock of an existing item, use Adjust inventory.');
+    }
+    if (openQty === '') throw new FieldError('openingQuantity', 'Enter the quantity on hand along with its value and date.');
+    const q = parseAmount(openQty);
+    if (q === null) throw new FieldError('openingQuantity', `Qty on hand: "${openQty}" is not a number.`);
+    if ((type ?? 'service') !== 'inventory') {
+      throw new FieldError('openingQuantity', 'Only inventory items can start with a quantity on hand (set Type to inventory).');
+    }
+    let openingValue: string | undefined;
+    let openingUnitCost: string | undefined;
+    if (openValueRaw !== '') {
+      const v = parseAmount(openValueRaw);
+      if (v === null) throw new FieldError('openingValue', `Total value: "${openValueRaw}" is not a number.`);
+      openingValue = v;
+    } else if (input.purchaseCost) {
+      // No total value: value the stock at the item's cost (QB uses the cost the same way).
+      openingUnitCost = input.purchaseCost;
+    } else {
+      throw new FieldError('openingValue', "Enter the total value of the quantity on hand (or the item's Cost).");
+    }
+    let openingAsOf: Date | undefined;
+    if (openAsOfRaw !== '') {
+      const dt = parseDateCell(openAsOfRaw);
+      if (!dt) throw new FieldError('openingAsOf', `As of date: "${openAsOfRaw}" is not a date (use 2026-01-31 or 1/31/2026).`);
+      openingAsOf = dt;
+    }
+    opening = { openingQuantity: q, openingValue, openingUnitCost, openingAsOf };
+  }
   let itemId: string;
   let created: boolean;
   if (editing) {
@@ -254,7 +294,10 @@ async function saveItem(ctx: ServiceContext, row: RawRow, lk: Lookups): Promise<
     created = false;
   } else {
     if (!input.name) throw new FieldError('name', 'Item name is required.');
-    itemId = (await createItem(ctx, { ...input, name: input.name, type: type ?? 'service' } as Parameters<typeof createItem>[1])).id;
+    const itemInput = { ...input, name: input.name, type: type ?? 'service' } as Parameters<typeof createItem>[1];
+    itemId = opening
+      ? (await createItemWithOpeningStock(ctx, { ...itemInput, ...opening })).item.id
+      : (await createItem(ctx, itemInput)).id;
     created = true;
   }
   if (reorder !== undefined && (reorder !== '' || editing)) {

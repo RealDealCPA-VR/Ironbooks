@@ -23,15 +23,15 @@
  *   no candidates -> the item's base sales price.
  * Special item types (discount / subtotal / payment / sales_tax) are never repriced.
  *
- * Document integration (resolveLinePricing): estimates, sales orders, invoices and sales
- * receipts call it server-side before computing totals. The server ALWAYS recomputes the
+ * Document integration (resolveLinePricing): estimates, sales orders, invoices, sales
+ * receipts and credit memos (B12) call it server-side before computing totals. The server ALWAYS recomputes the
  * expected price — the client's claim about which rule applied is never trusted:
  *   - rate omitted   -> the line is priced automatically (rule/level/base).
  *   - rate == expected -> stored provenance says which rule/level priced it.
  *   - rate != expected -> accepted as a manual override (QB lets users type over any price),
  *                         flagged `overridden: true` with the expected price kept for audit.
  * Provenance is persisted on the line's `pricing` jsonb column.
- * Known limitation: estimates and sales orders carry no class / sales rep / job, and sales
+ * Known limitation: estimates, sales orders and credit memos carry no class / sales rep / job, and sales
  * receipts carry only a class, so rules conditioned on those never match there (the rule
  * editor says so).
  */

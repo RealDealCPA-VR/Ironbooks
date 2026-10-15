@@ -18,6 +18,7 @@ import {
   journalEntries,
   journalEntryLines,
   journalItemApplications,
+  otherNames,
   vendors,
   invoices,
   bills,
@@ -229,17 +230,12 @@ export async function resolveEntityNames(
     for (const r of rows) out.set(`employee:${r.id}`, `${r.first} ${r.last}`.trim());
   }
   if (other.length) {
-    // TODO(lists team): the "Other Names" list. Resolved only when its table exists
-    // (expected: other_names(id, company_id, name)).
-    const [{ exists }] = (
-      await ctx.db.execute(sql`SELECT to_regclass('public.other_names') IS NOT NULL AS exists`)
-    ).rows as Array<{ exists: boolean }>;
-    if (exists) {
-      const res = await ctx.db.execute(
-        sql`SELECT id::text AS id, name FROM other_names WHERE company_id = ${ctx.companyId} AND id::text IN (${sql.join(other.map((o) => sql`${o}`), sql`, `)})`,
-      );
-      for (const r of res.rows as Array<{ id: string; name: string }>) out.set(`other:${r.id}`, r.name);
-    }
+    // B3: the QB "Other Names" list (lib/services/lists/simpleLists.ts).
+    const rows = await ctx.db
+      .select({ id: otherNames.id, name: otherNames.name })
+      .from(otherNames)
+      .where(and(eq(otherNames.companyId, ctx.companyId), inArray(otherNames.id, other)));
+    for (const r of rows) out.set(`other:${r.id}`, r.name);
   }
   return out;
 }
@@ -267,6 +263,14 @@ async function inactiveNames(
   const cust = ids('customer');
   const vend = ids('vendor');
   const emp = ids('employee');
+  const other = ids('other');
+  if (other.length) {
+    const rows = await ctx.db
+      .select({ id: otherNames.id })
+      .from(otherNames)
+      .where(and(eq(otherNames.companyId, ctx.companyId), inArray(otherNames.id, other), eq(otherNames.isActive, false)));
+    for (const r of rows) out.add(`other:${r.id}`);
+  }
   if (cust.length) {
     const rows = await ctx.db
       .select({ id: customers.id })
@@ -310,13 +314,15 @@ export async function followMergedNames<L extends { entityType?: string | null; 
   const target = new Map<string, string>();
   for (const key of inactive) {
     const [type, startId] = key.split(':');
-    if (type !== 'customer' && type !== 'vendor') continue;
+    if (type !== 'customer' && type !== 'vendor' && type !== 'other') continue;
+    // Other Names merges are audited as 'other_name' (lib/services/lists/mergeLists.ts).
+    const auditType = type === 'other' ? 'other_name' : type;
     let cur = startId;
     const seen = new Set<string>([cur]);
     for (let hop = 0; hop < 10; hop++) {
       const res = await ctx.db.execute(
         sql`SELECT new_values->>'mergedInto' AS to_id FROM audit_logs
-            WHERE company_id = ${ctx.companyId} AND entity_type = ${type} AND entity_id = ${cur}
+            WHERE company_id = ${ctx.companyId} AND entity_type = ${auditType} AND entity_id = ${cur}
               AND new_values->>'mergedInto' IS NOT NULL
             ORDER BY created_at DESC LIMIT 1`,
       );
@@ -374,7 +380,7 @@ export async function assertJournalNames(
       const key = `${l.entityType}:${l.entityId}`;
       if (inactive.has(key) && !opts.allowInactive?.has(key)) {
         throw validation(
-          `Line ${i + 1}: "${names.get(key)}" is inactive (or was merged into another ${l.entityType}). Pick an active name, or make this one active again first.`,
+          `Line ${i + 1}: "${names.get(key)}" is inactive (or was merged into another ${l.entityType === 'other' ? 'name' : l.entityType}). Pick an active name, or make this one active again first.`,
         );
       }
     }

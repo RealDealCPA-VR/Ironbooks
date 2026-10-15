@@ -187,6 +187,8 @@ export default function AddEditMultiplePage() {
         <p className="mb-4 text-sm text-navy/60">
           Tip: copy cells in Excel and paste them into the first cell — include the header row to match columns by name.
           Nothing is saved unless every row is correct. {mode === 'edit' && 'Only the rows you change are saved.'}
+          {list === 'items' &&
+            ' New inventory items can start with a quantity on hand: enter Qty on hand, its Total value (or a Cost) and the As of date — the stock is added to your Inventory Asset account against Opening Balance Equity.'}
         </p>
         {lastCheck && !errors.length && (
           <p className="mb-3 text-sm text-emerald">
@@ -232,7 +234,8 @@ export default function AddEditMultiplePage() {
                       </td>
                       {columns.map((c, ci) => {
                         const bad = rowErrs?.some((e) => e.field === c.key);
-                        const readOnly = mode === 'edit' && c.key === 'type' && !!r.id;
+                        // Type and opening stock (Qty on hand / value / as of) are set only when adding.
+                        const readOnly = mode === 'edit' && (c.key === 'type' || !!c.newOnly) && !!r.id;
                         return (
                           <td key={c.key} className="border border-slate-100 p-0">
                             <input
