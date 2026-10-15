@@ -3,11 +3,11 @@
 > The app shipped instead as an offline **Electron + PGlite** desktop application.
 > See [README.md](README.md) for the current architecture, [INSTALL.md](INSTALL.md) for setup, and [TODO.md](TODO.md) for the roadmap.
 
-# BookKeeper AI - Implementation Guide
+# Ironbooks - Implementation Guide
 
 ## 🎯 Overview
 
-This guide explains how to complete the BookKeeper AI implementation, a white-label QuickBooks alternative with .QBO file support and LLM-powered error correction, built using the autonomous coding pattern from Anthropic's Claude quickstart.
+This guide explains how to complete the Ironbooks implementation, a white-label QuickBooks alternative with .QBO file support and LLM-powered error correction, built using the autonomous coding pattern from Anthropic's Claude quickstart.
 
 ## 📋 What's Been Created
 
@@ -109,7 +109,7 @@ import './globals.css';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'BookKeeper AI - Smart Accounting Software',
+  title: 'Ironbooks - Smart Accounting Software',
   description: 'White-label accounting software with AI-powered error correction',
 };
 

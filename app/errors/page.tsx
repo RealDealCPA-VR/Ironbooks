@@ -382,7 +382,7 @@ export default function ErrorsPage() {
 
       {/* Hero description */}
       <p className="text-navy/50 text-sm mb-6 -mt-2 max-w-xl">
-        BookKeeper AI scans your journal for unbalanced entries, duplicates, missing
+        Ironbooks scans your journal for unbalanced entries, duplicates, missing
         fields, and statistical outliers — then suggests corrections with step-by-step
         guidance.
       </p>

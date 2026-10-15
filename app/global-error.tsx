@@ -41,7 +41,7 @@ export default function GlobalError({
             ⚠️
           </div>
           <h1 style={{ margin: '16px 0 0', fontSize: 24, fontWeight: 800, color: '#0b1f3a' }}>
-            BookKeeper AI hit a snag
+            Ironbooks hit a snag
           </h1>
           <p style={{ margin: '8px 0 0', fontSize: 14, color: 'rgba(11,31,58,0.6)' }}>
             The application shell failed to load. Your company file on disk is not affected.

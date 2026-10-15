@@ -45,7 +45,7 @@ describe('damaged company file', () => {
 
   it('recognizes the refusal message (error page + client)', () => {
     const msg =
-      'This company file is damaged, so BookKeeper will not open it: Entry 12 is out of balance. Restore your most recent backup.';
+      'This company file is damaged, so Ironbooks will not open it: Entry 12 is out of balance. Restore your most recent backup.';
     expect(isDamagedFileMessage(msg)).toBe(true);
     expect(isDamagedFileMessage('Something else')).toBe(false);
     expect(isDamagedFileError(409, msg)).toBe(true);
@@ -58,7 +58,7 @@ describe('damaged company file', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
-        new Response(JSON.stringify({ error: 'This company file is damaged, so BookKeeper will not open it.', code: 'CONFLICT' }), {
+        new Response(JSON.stringify({ error: 'This company file is damaged, so Ironbooks will not open it.', code: 'CONFLICT' }), {
           status: 409,
         }),
       ),

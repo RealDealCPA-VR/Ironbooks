@@ -161,7 +161,7 @@ export default function ShareCompanyFileCard() {
           <section>
             <p className="font-semibold text-navy">Shareable ledger</p>
             <p className="text-sm text-navy/60 mt-1 max-w-xl">
-              A read-only copy anyone can open without BookKeeper: an Excel workbook (company info, chart of accounts,
+              A read-only copy anyone can open without Ironbooks: an Excel workbook (company info, chart of accounts,
               trial balance, general ledger with running balances, journal, customers, vendors, items) or a PDF summary.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
@@ -204,7 +204,7 @@ export default function ShareCompanyFileCard() {
           <div className="space-y-3 text-sm text-navy/70">
             <p>
               <span className="font-semibold text-navy">{s.companyName}</span> — created{' '}
-              {new Date(s.createdAt).toLocaleString('en-US')} (BookKeeper {s.appVersion}).
+              {new Date(s.createdAt).toLocaleString('en-US')} (Ironbooks {s.appVersion}).
             </p>
             <ul className="list-disc pl-5">
               <li>{(s.rowCounts.journal_entries ?? 0).toLocaleString()} journal entries</li>

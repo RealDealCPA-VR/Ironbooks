@@ -41,7 +41,7 @@ describe('normalizePolicy', () => {
 });
 
 describe('update checks (on by default)', () => {
-  const FEED = 'https://github.com/RealDealCPA-VR/Open-Source-QB/releases';
+  const FEED = 'https://github.com/RealDealCPA-VR/Ironbooks/releases';
   it('reach the release feed in tailnet-only and allow-cloud modes by default', () => {
     expect(decideOutbound(normalizePolicy(undefined), FEED, 'updates', undefined).allowed).toBe(true);
     expect(decideOutbound(policy('allow-cloud'), FEED, 'updates', undefined).allowed).toBe(true);

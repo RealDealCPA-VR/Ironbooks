@@ -418,7 +418,7 @@ function StepWelcome({ onNext, rerun }: { onNext: () => void; rerun: boolean }) 
       </div>
       <div>
         <h2 className="text-2xl font-extrabold text-navy mb-2" tabIndex={-1} data-step-heading>
-          {rerun ? 'Setup interview' : 'Welcome to BookKeeper AI'}
+          {rerun ? 'Setup interview' : 'Welcome to Ironbooks'}
         </h2>
         <p className="text-navy/60 text-sm max-w-sm leading-relaxed mx-auto">
           {rerun
@@ -947,7 +947,7 @@ function Interview() {
           <div className="h-9 w-9 rounded-xl bg-electric flex items-center justify-center">
             <BookOpen className="h-5 w-5 text-white" aria-hidden="true" />
           </div>
-          <span className="text-xl font-extrabold text-navy tracking-tight">BookKeeper AI</span>
+          <span className="text-xl font-extrabold text-navy tracking-tight">Ironbooks</span>
         </div>
 
         {!done && <StepIndicator current={step} />}

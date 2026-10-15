@@ -135,7 +135,7 @@ export default function PrivacyNetworkPage() {
       <Card className="p-6 mb-6">
         <p className="text-navy font-semibold">Your books stay on this computer.</p>
         <p className="text-sm text-navy/60 mt-1">
-          BookKeeper AI keeps the company file on this machine and never stores client data in the
+          Ironbooks keeps the company file on this machine and never stores client data in the
           cloud. These settings decide whether the app may connect to anything else, and for what.
           {readOnly && ' Only an owner or admin can change them.'}
         </p>

@@ -3,7 +3,7 @@
 > The app shipped instead as an offline **Electron + PGlite** desktop application.
 > For actual setup see [README.md](README.md) and [INSTALL.md](INSTALL.md); for the roadmap see [TODO.md](TODO.md).
 
-# Getting Started with BookKeeper AI
+# Getting Started with Ironbooks
 
 ## 🎉 Welcome!
 

@@ -176,7 +176,7 @@ export default function DesktopBridge() {
   }
 
   const current = process.env.NEXT_PUBLIC_APP_VERSION;
-  const newVersion = update.version ? `BookKeeper AI ${update.version}` : 'A new version of BookKeeper AI';
+  const newVersion = update.version ? `Ironbooks ${update.version}` : 'A new version of Ironbooks';
   const later = () => setDismissed(key);
 
   let title: string;

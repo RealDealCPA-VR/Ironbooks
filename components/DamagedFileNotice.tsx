@@ -14,7 +14,7 @@ export default function DamagedFileNotice({ problems = [] }: { problems?: string
           This company file is damaged
         </h1>
         <p className="mt-3 text-sm text-navy/70">
-          BookKeeper checked the books when it opened this file and found problems it can&apos;t
+          Ironbooks checked the books when it opened this file and found problems it can&apos;t
           safely work with (for example, entries that don&apos;t balance). To protect your records,
           the file won&apos;t open until it is replaced.
         </p>

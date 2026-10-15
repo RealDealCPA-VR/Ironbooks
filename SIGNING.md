@@ -28,7 +28,7 @@ npm run desktop:dist
 Regenerate the self-signed cert:
 ```powershell
 $p = ConvertTo-SecureString "bookkeeper-dev" -Force -AsPlainText
-$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=BookKeeper AI (Self-Signed)" -CertStoreLocation Cert:\CurrentUser\My
+$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Ironbooks (Self-Signed)" -CertStoreLocation Cert:\CurrentUser\My
 Export-PfxCertificate -Cert $c -FilePath build\code-sign.pfx -Password $p
 Remove-Item "Cert:\CurrentUser\My\$($c.Thumbprint)"
 ```

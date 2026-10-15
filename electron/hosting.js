@@ -2,7 +2,7 @@
 //
 // The Next server that owns the company file stays bound to 127.0.0.1. Hosting starts a small
 // reverse proxy on this machine's Tailscale address that forwards to it, so teammates on the
-// same tailnet can open the company in their own BookKeeper AI app (File > Open company on
+// same tailnet can open the company in their own Ironbooks app (File > Open company on
 // host…) or a browser. PGlite is single-process, so this one server remains the only writer.
 //
 // What the proxy guarantees (the server relies on it — see lib/net/requestInfo.ts):
@@ -146,7 +146,7 @@ function createProxyHandler(upstreamPort, { secure }) {
     );
     upstream.on('error', () => {
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end('The BookKeeper AI host is not responding.');
+      res.end('The Ironbooks host is not responding.');
     });
     req.pipe(upstream);
   };

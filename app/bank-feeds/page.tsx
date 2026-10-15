@@ -5,7 +5,7 @@
  * Behaviour:
  *   - On mount: checks GET /api/plaid/status to see if Plaid is configured.
  *   - Configured: loads the Plaid Link JS from CDN, lets the user pick a
- *     bank account from the BookKeeper bank-account list, then opens Plaid
+ *     bank account from the Ironbooks bank-account list, then opens Plaid
  *     Link. On success, exchanges the public token and runs a sync into the
  *     selected bank account.
  *   - Not configured: shows setup instructions (which env vars to set) with
@@ -257,7 +257,7 @@ export default function BankFeedsPage() {
           <h2 className="text-xl font-bold text-navy mb-2">Bank feeds are off for this company</h2>
           <p className="text-navy/60 text-sm mb-4">{policyBlock}</p>
           <p className="text-navy/60 text-sm mb-6">
-            Live bank feeds connect to Plaid over the internet. BookKeeper AI keeps your books on this
+            Live bank feeds connect to Plaid over the internet. Ironbooks keeps your books on this
             computer, so cloud bank feeds stay off until an admin opts in. You can always import bank
             files (OFX/QFX/CSV) instead — nothing leaves this machine.
           </p>
@@ -308,7 +308,7 @@ export default function BankFeedsPage() {
               <h2 className="text-xl font-bold text-navy mb-2">Optional: live feeds (Plaid not configured)</h2>
               <p className="text-navy/60 text-sm mb-6">
                 Live bank feeds use the Plaid API, an online service, and are usually set up by
-                whoever installs BookKeeper for you. Set the following environment variables and
+                whoever installs Ironbooks for you. Set the following environment variables and
                 restart the app to enable this feature.
               </p>
 

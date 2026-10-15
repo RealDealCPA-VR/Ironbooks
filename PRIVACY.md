@@ -1,6 +1,6 @@
 # Privacy & Network
 
-BookKeeper AI is **local-first**. Your company file is a folder on your computer (or on a
+Ironbooks is **local-first**. Your company file is a folder on your computer (or on a
 drive you choose). Client data is never stored in the cloud, and the app makes no network
 connection you have not turned on.
 
@@ -75,7 +75,7 @@ of that cap and the company setting. A value that is set but not recognised coun
   - Next.js telemetry is disabled for the app server (`NEXT_TELEMETRY_DISABLED=1`).
 
 User actions that open your system browser are not data transfers by the app. These are
-**Help → BookKeeper AI on the web**, the IRS FIRE upload link and the Plaid sign-up link.
+**Help → Ironbooks on the web**, the IRS FIRE upload link and the Plaid sign-up link.
 
 ## Multi-user hosting (tailnet only)
 

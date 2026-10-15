@@ -113,7 +113,7 @@ export async function createLinkToken(ctx: ServiceContext): Promise<string> {
 
   const data = await plaidPost<{ link_token: string }>(ctx, '/link/token/create', {
     user: { client_user_id: ctx.companyId },
-    client_name: 'BookKeeper AI',
+    client_name: 'Ironbooks',
     products: ['transactions'],
     country_codes: ['US'],
     language: 'en',

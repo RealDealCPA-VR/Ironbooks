@@ -1,7 +1,7 @@
 /**
  * Local-only network policy — the single rulebook for every server-side outbound call.
  *
- * BookKeeper AI is local-first: client data lives in the company file on this machine and is
+ * Ironbooks is local-first: client data lives in the company file on this machine and is
  * never stored in the cloud. The only code allowed to open a connection off the machine is code
  * that asks this module first (via lib/net/guard.ts: assertOutboundAllowed / policyFetch).
  *
@@ -54,7 +54,7 @@ export const PURPOSE_INFO: Record<
   ai: {
     label: 'AI assistance',
     sends:
-      'The specific transaction(s) you ask the AI to review (description, accounts, amounts, dates). Nothing else, and nothing is stored by BookKeeper AI off this machine.',
+      'The specific transaction(s) you ask the AI to review (description, accounts, amounts, dates). Nothing else, and nothing is stored by Ironbooks off this machine.',
     destinations: 'The configured AI provider (e.g. api.anthropic.com), or a model server on your LAN/tailnet.',
   },
   email: {

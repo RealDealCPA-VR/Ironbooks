@@ -1,6 +1,6 @@
 'use client';
 /**
- * Shared UI kit for BookKeeper AI. Lightweight Tailwind primitives matching the brand palette
+ * Shared UI kit for Ironbooks. Lightweight Tailwind primitives matching the brand palette
  * (navy / electric / emerald / gold / offwhite). Import from '@/components/ui'.
  */
 import * as React from 'react';

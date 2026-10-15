@@ -26,7 +26,7 @@ export interface FieldMeta {
   dependsOn?: string;
   /**
    * Fixed behaviour: the setting is shown checked and locked with this plain explanation
-   * (BookKeeper AI always does this, for the reason given).
+   * (Ironbooks always does this, for the reason given).
    */
   fixed?: string;
 }
@@ -74,7 +74,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   beepOnRecord: { label: 'Beep when recording a transaction', help: 'Plays a short tone after a transaction is saved.', type: 'bool' },
   autoDecimalPoint: { label: 'Automatically place the decimal point', help: 'Typing 1234 enters 12.34.', type: 'bool' },
   warnWhenEditing: { label: 'Warn when editing a transaction', help: 'Asks before saving changes to a transaction that was already recorded.', type: 'bool' },
-  warnWhenDeleting: { label: 'Warn when deleting a transaction or unused list item', type: 'bool', fixed: 'Always on: BookKeeper AI always asks before deleting or voiding, because it cannot be undone.' },
+  warnWhenDeleting: { label: 'Warn when deleting a transaction or unused list item', type: 'bool', fixed: 'Always on: Ironbooks always asks before deleting or voiding, because it cannot be undone.' },
   defaultDate: { label: 'Default date for new transactions', help: '"The last date I entered" uses the date of the last transaction you saved on this computer.', type: 'select', options: [['today', "Today's date"], ['last', 'The last date I entered']] },
   autoRecallLastTransaction: { label: 'Recall the last transaction for a name', help: 'Bills and checks fill in the accounts you used last time for that vendor.', type: 'bool' },
   showHomeWorkflow: { label: 'Show the home workflow on the dashboard', type: 'bool' },
@@ -123,9 +123,9 @@ export const FIELD_META: Record<string, FieldMeta> = {
   sendForms: { label: 'Email wording for each form', type: 'sendForms' },
   // Spelling
   spellCheckEnabled: { label: 'Check spelling as I type (memos and descriptions)', help: 'Uses the spell checker built into your computer. Right-click a word for suggestions.', type: 'bool' },
-  spellIgnoreUppercase: { label: 'Ignore words in UPPERCASE', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; BookKeeper AI cannot change it." },
-  spellIgnoreWithNumbers: { label: 'Ignore words with numbers', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; BookKeeper AI cannot change it." },
-  spellIgnoreInternetAddresses: { label: 'Ignore internet addresses', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; BookKeeper AI cannot change it." },
+  spellIgnoreUppercase: { label: 'Ignore words in UPPERCASE', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; Ironbooks cannot change it." },
+  spellIgnoreWithNumbers: { label: 'Ignore words with numbers', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; Ironbooks cannot change it." },
+  spellIgnoreInternetAddresses: { label: 'Ignore internet addresses', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; Ironbooks cannot change it." },
   // Time & Expenses
   timeTrackingEnabled: { label: 'Track time', type: 'bool' },
   firstDayOfWeek: { label: 'First day of the work week', type: 'select', options: [['monday', 'Monday'], ['sunday', 'Sunday']], dependsOn: 'timeTrackingEnabled' },

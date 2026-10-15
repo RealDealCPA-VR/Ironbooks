@@ -126,7 +126,7 @@ describe('company-file API routes', () => {
     const result = await res.json();
     expect(fs.existsSync(evil)).toBe(false);
     expect(path.dirname(result.dataDir)).toBe(ROOT);
-    expect(path.basename(result.dataDir)).toMatch(/^Active Co \(restored .+\)\.bookkeeper$/);
+    expect(path.basename(result.dataDir)).toMatch(/^Active Co \(restored .+\)\.ironbooks$/);
     expect(result.verified.ledgersBalanced).toBe(true);
   });
 

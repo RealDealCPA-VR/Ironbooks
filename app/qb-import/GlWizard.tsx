@@ -500,7 +500,7 @@ function TypesStep({
         <p className="text-sm text-navy/70 mt-1">
           A General Ledger doesn’t say what kind each account is, so we worked it out from its number, its name, and
           how it’s used. {toCheck > 0 ? `${toCheck} need a quick look.` : 'Everything looks clear.'} If an account
-          already exists in BookKeeper, its money goes there instead of creating a duplicate.
+          already exists in Ironbooks, its money goes there instead of creating a duplicate.
         </p>
       </div>
       {preview.errors.length > 0 && <Problems errors={preview.errors} warnings={[]} />}
@@ -820,7 +820,7 @@ function ProofView({ proof }: { proof: GlProof }) {
               <tr>
                 <Th>Account</Th>
                 <Th numeric>QuickBooks</Th>
-                <Th numeric>BookKeeper</Th>
+                <Th numeric>Ironbooks</Th>
                 <Th numeric>Difference</Th>
                 {proof.trialBalanceCompared && <Th numeric>Trial Balance</Th>}
               </tr>

@@ -1,6 +1,6 @@
 <div align="center">
 
-# 📒 BookKeeper AI
+# 📒 Ironbooks
 
 ### QuickBooks Desktop Enterprise power. Your machine. Your AI. No subscription.
 
@@ -15,16 +15,16 @@ refuses to let your books go out of balance.**
 ![platforms](https://img.shields.io/badge/desktop-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![stack](https://img.shields.io/badge/Next.js%2015%20%C2%B7%20Electron%20%C2%B7%20Postgres-black)
 
-[Why](#-why-bookkeeper-ai) · [Features](#-what-you-get) · [Switching from QuickBooks](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Quick start](#-quick-start) · [Roadmap](#-roadmap)
+[Why](#-why-ironbooks) · [Features](#-what-you-get) · [Switching from QuickBooks](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Quick start](#-quick-start) · [Roadmap](#-roadmap)
 
 </div>
 
 ---
 
-## 💡 Why BookKeeper AI
+## 💡 Why Ironbooks
 
 QuickBooks Desktop runs on rising subscriptions and a shrinking product line. Cloud accounting
-puts your clients' books on someone else's server. BookKeeper AI is the third option:
+puts your clients' books on someone else's server. Ironbooks is the third option:
 
 - 🔒 **Your books never leave your computer.** The company file is a folder you own. There's no
   account, no telemetry and no lock-in.
@@ -38,7 +38,7 @@ puts your clients' books on someone else's server. BookKeeper AI is the third op
 
 ## 🆚 At a glance
 
-| | QuickBooks Desktop Enterprise | Cloud accounting | **BookKeeper AI** |
+| | QuickBooks Desktop Enterprise | Cloud accounting | **Ironbooks** |
 |---|:---:|:---:|:---:|
 | Data stays on your machine | ✅ | ❌ | ✅ |
 | No subscription | ❌ | ❌ | ✅ |

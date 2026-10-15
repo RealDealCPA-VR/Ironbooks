@@ -1,4 +1,4 @@
-// Electron main process for BookKeeper AI (desktop).
+// Electron main process for Ironbooks (desktop).
 //
 // Architecture: the React/Next.js UI and the accounting engine (PGlite local DB) run inside a
 // Next.js server. In production we launch the Next standalone server as a child process on a free
@@ -8,6 +8,33 @@
 // server so lib/db persists there. This keeps all financial data on the user's machine (offline).
 
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell, session } = require('electron');
+
+// --- legacy userData location (product rename BookKeeper AI -> Ironbooks) ---
+// Electron derives app.getPath('userData') from the app name: build.productName for packaged
+// builds (%APPDATA%\BookKeeper AI before the rename, %APPDATA%\Ironbooks after) and the
+// package.json "name" in dev runs (bookkeeper-ai before, ironbooks after). That folder holds
+// config.json (active company), the default companies/ folder, quit-time backups, TLS certs and
+// window state. If the new folder doesn't exist yet but a legacy one does, keep using the legacy
+// folder so existing users don't lose their companies/config/backups on upgrade. This must run
+// before anything reads userData, including requestSingleInstanceLock() (its lock lives there),
+// and app.setPath is allowed before 'ready'.
+(function useLegacyUserDataIfPresent() {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  try {
+    if (fs.existsSync(app.getPath('userData'))) return;
+    const appData = app.getPath('appData');
+    for (const legacyName of ['BookKeeper AI', 'bookkeeper-ai']) {
+      const legacyDir = path.join(appData, legacyName);
+      if (fs.existsSync(legacyDir)) {
+        app.setPath('userData', legacyDir);
+        return;
+      }
+    }
+  } catch {
+    // Fall back to the default (new) userData location.
+  }
+})();
 const { buildSectionMenus } = require('./menuRoutes');
 const spelling = require('./spelling');
 const path = require('node:path');
@@ -413,13 +440,13 @@ async function createCompanyFlow() {
     title: 'New Company File',
     message: 'Choose a name and location for the new company file',
     buttonLabel: 'Create',
-    defaultPath: path.join(app.getPath('documents'), 'My Company.bookkeeper'),
-    filters: [{ name: 'BookKeeper Company', extensions: ['bookkeeper'] }],
+    defaultPath: path.join(app.getPath('documents'), 'My Company.ironbooks'),
+    filters: [{ name: 'Ironbooks Company', extensions: ['ironbooks', 'bookkeeper'] }],
     properties: ['createDirectory', 'showOverwriteConfirmation'],
   });
   if (res.canceled || !res.filePath) return;
   const target = res.filePath;
-  const name = path.basename(target).replace(/\.bookkeeper$/i, '');
+  const name = path.basename(target).replace(/\.(ironbooks|bookkeeper)$/i, '');
   try {
     if (fs.existsSync(target) && fs.readdirSync(target).length > 0) {
       dialog.showErrorBox(
@@ -475,7 +502,7 @@ async function openPortableFlow(filePath) {
   if (!filePath) {
     const res = await dialog.showOpenDialog(mainWindow, {
       title: 'Open Portable Company File',
-      filters: [{ name: 'BookKeeper Portable Company File', extensions: ['bkp'] }],
+      filters: [{ name: 'Ironbooks Portable Company File', extensions: ['bkp'] }],
       properties: ['openFile'],
       defaultPath: app.getPath('documents'),
     });
@@ -494,8 +521,8 @@ async function openPortableFlow(filePath) {
     title: 'Restore Portable Company File',
     message: 'Choose a name and location for the restored company file',
     buttonLabel: 'Restore',
-    defaultPath: path.join(app.getPath('documents'), `${base}.bookkeeper`),
-    filters: [{ name: 'BookKeeper Company', extensions: ['bookkeeper'] }],
+    defaultPath: path.join(app.getPath('documents'), `${base}.ironbooks`),
+    filters: [{ name: 'Ironbooks Company', extensions: ['ironbooks', 'bookkeeper'] }],
     properties: ['createDirectory', 'showOverwriteConfirmation'],
   });
   if (save.canceled || !save.filePath) return;
@@ -634,7 +661,7 @@ async function openOnHostFlow() {
       if (!(await probeHost(n.origin))) {
         return {
           ok: false,
-          error: `Couldn't reach ${n.origin}. Check that the host computer is on, BookKeeper AI there is hosting multi-user access, and both computers are signed in to Tailscale.`,
+          error: `Couldn't reach ${n.origin}. Check that the host computer is on, Ironbooks there is hosting multi-user access, and both computers are signed in to Tailscale.`,
         };
       }
       saveConfig({ remoteHost: n.origin, lastRemoteHost: value.trim() });
@@ -777,8 +804,8 @@ function buildMenu() {
         { label: 'Run Setup Interview…', click: () => navigate('/onboarding') },
         { type: 'separator' },
         { label: 'Check for Updates…', click: () => { checkForUpdates({ manual: true }); } },
-        { label: 'BookKeeper AI on the web', click: () => shell.openExternal('https://github.com/') },
-        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { message: 'BookKeeper AI', detail: `Version ${app.getVersion()}\nOpen-source desktop accounting with AI error correction.` }) },
+        { label: 'Ironbooks on the web', click: () => shell.openExternal('https://github.com/RealDealCPA-VR/Ironbooks') },
+        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { message: 'Ironbooks', detail: `Version ${app.getVersion()}\nOpen-source desktop accounting with AI error correction.` }) },
       ],
     },
   ];
@@ -811,7 +838,7 @@ async function createWindow() {
     ...(usePosition ? { x: state.x, y: state.y } : {}),
     minWidth: 1024,
     minHeight: 700,
-    title: 'BookKeeper AI',
+    title: 'Ironbooks',
     backgroundColor: '#0b1f3a',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -839,7 +866,7 @@ async function createWindow() {
         type: 'warning',
         message: `Can't reach the host at ${remoteHostOrigin}`,
         detail:
-          'Make sure the host computer is on, BookKeeper AI there has "Host multi-user access" turned on, and both computers are signed in to Tailscale.\n\n' +
+          'Make sure the host computer is on, Ironbooks there has "Host multi-user access" turned on, and both computers are signed in to Tailscale.\n\n' +
           String((err && err.message) || err),
         buttons: ['Try Again', 'Open My Local Company Instead', 'Quit'],
         defaultId: 0,
@@ -1173,7 +1200,7 @@ async function checkForUpdates({ manual = false } = {}) {
     const result = await updater.checkForUpdates();
     // 'update-available' has already moved the state on when there is something new.
     if (manual && !result?.isUpdateAvailable) {
-      updateDialog('You have the latest version.', `BookKeeper AI ${app.getVersion()} is up to date.`);
+      updateDialog('You have the latest version.', `Ironbooks ${app.getVersion()} is up to date.`);
     }
   } catch (err) {
     console.log('[updates] check failed:', err?.message || err);

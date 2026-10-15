@@ -1,5 +1,5 @@
 /**
- * Shareable ledger — a read-only copy of the books that opens WITHOUT BookKeeper
+ * Shareable ledger — a read-only copy of the books that opens WITHOUT Ironbooks
  * (for an accountant, auditor, lender or the next bookkeeper):
  *
  *  - an .xlsx workbook: Company Info, Chart of Accounts, Trial Balance, General Ledger
@@ -123,7 +123,7 @@ async function collect(ctx: ServiceContext): Promise<LedgerData> {
     ['Trial balance — total credits', tb.totalCredit],
     ['Trial balance in balance', tb.balanced ? 'Yes' : 'NO — investigate'],
     ...Object.entries(counts).map(([k, v]) => [k, v] as XlsxCell[]),
-    ['Note', 'Read-only copy exported from BookKeeper AI. Amounts are in the company currency.'],
+    ['Note', 'Read-only copy exported from Ironbooks. Amounts are in the company currency.'],
   ];
 
   const sheets: XlsxSheetInput[] = [
@@ -304,7 +304,7 @@ export async function buildShareableLedgerPdf(ctx: ServiceContext): Promise<Shar
 
   const merged = await PDFDocument.create();
   merged.setTitle(`${data.company.name} — Ledger Summary`);
-  merged.setProducer('BookKeeper AI');
+  merged.setProducer('Ironbooks');
   for (const bytes of parts) {
     const doc = await PDFDocument.load(bytes);
     const pages = await merged.copyPages(doc, doc.getPageIndices());

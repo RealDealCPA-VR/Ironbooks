@@ -662,7 +662,7 @@ function writeCondenseArchive(companyName: string | undefined, dataDir?: string)
   const { buffer, filename } = createBackup(companyName, dir);
   const outDir = condenseArchiveDir(dir);
   fs.mkdirSync(outDir, { recursive: true });
-  const outPath = path.join(outDir, filename.replace(/^bookkeeper-backup/, 'condense-archive'));
+  const outPath = path.join(outDir, filename.replace(/^(ironbooks|bookkeeper)-backup/, 'condense-archive'));
   fs.writeFileSync(outPath, buffer);
 
   // Verify the archive on disk is a complete, readable copy before anything is deleted.

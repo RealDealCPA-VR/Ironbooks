@@ -1,7 +1,7 @@
 /**
  * Local-first database client.
  *
- * BookKeeper AI is a DESKTOP app: data lives on the user's machine, not in a cloud Postgres.
+ * Ironbooks is a DESKTOP app: data lives on the user's machine, not in a cloud Postgres.
  * We use PGlite (embedded Postgres compiled to WASM) so the existing `pg-core` Drizzle schema
  * runs verbatim, fully offline, persisted to a local directory.
  *
@@ -40,7 +40,7 @@ export class LedgerDamagedError extends ServiceError {
   constructor(public problems: LedgerProblem[]) {
     super(
       'CONFLICT',
-      `This company file is damaged, so BookKeeper will not open it: ${problems
+      `This company file is damaged, so Ironbooks will not open it: ${problems
         .map((p) => p.detail)
         .join(' ')} Restore your most recent backup (File > Back Up and Restore) or open a different company file.`,
       { problems },

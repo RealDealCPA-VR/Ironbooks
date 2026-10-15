@@ -54,7 +54,7 @@ export function verifyTotp(secret: string, token: string, timeMs: number, window
 }
 
 /** otpauth:// URI for QR provisioning. */
-export function otpauthUrl(secret: string, account: string, issuer = 'BookKeeper AI'): string {
+export function otpauthUrl(secret: string, account: string, issuer = 'Ironbooks'): string {
   const label = encodeURIComponent(`${issuer}:${account}`);
   const params = new URLSearchParams({ secret, issuer, algorithm: 'SHA1', digits: '6', period: '30' });
   return `otpauth://totp/${label}?${params.toString()}`;

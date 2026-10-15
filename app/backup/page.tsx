@@ -155,7 +155,7 @@ export default function BackupPage() {
         toast(data?.error ?? 'Backup failed. Please try again.', 'danger');
         return;
       }
-      await downloadResponse(res, 'bookkeeper-backup.bka');
+      await downloadResponse(res, 'ironbooks-backup.bka');
       toast('Full backup downloaded successfully.', 'success');
     } catch {
       toast('Backup failed. Please try again.', 'danger');
@@ -184,7 +184,7 @@ export default function BackupPage() {
         toast(data?.error ?? 'Company backup failed. Please try again.', 'danger');
         return;
       }
-      await downloadResponse(res, 'bookkeeper-company.bka');
+      await downloadResponse(res, 'ironbooks-company.bka');
       toast('Company backup downloaded successfully.', 'success');
     } catch {
       toast('Company backup failed. Please try again.', 'danger');

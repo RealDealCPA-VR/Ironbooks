@@ -331,7 +331,7 @@ export async function createPortableCompanyFile(
 // ---------------------------------------------------------------------------
 
 const notPortable = (detail: string) =>
-  new ServiceError('VALIDATION', `Not a BookKeeper portable company file (${detail}).`);
+  new ServiceError('VALIDATION', `Not an Ironbooks portable company file (${detail}).`);
 
 interface OpenedPortable {
   zip: AdmZip;
@@ -371,7 +371,7 @@ export function openPortableFile(buffer: Buffer): OpenedPortable {
   if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > PORTABLE_FORMAT_VERSION) {
     throw new ServiceError(
       'VALIDATION',
-      'This portable company file was created by a newer version of BookKeeper. Update the app, then open it.',
+      'This portable company file was created by a newer version of Ironbooks. Update the app, then open it.',
     );
   }
 
@@ -513,7 +513,7 @@ export async function restorePortableCompanyFile(
       (target.lastMigrationAt == null || manifest.schemaVersion.lastMigrationAt > target.lastMigrationAt)
     ) {
       return await fail(
-        'This portable company file was created by a newer version of BookKeeper (its database layout is newer than this app). Update the app, then open it.',
+        'This portable company file was created by a newer version of Ironbooks (its database layout is newer than this app). Update the app, then open it.',
       );
     }
 
@@ -705,15 +705,15 @@ export async function restorePortableCompanyFile(
 
 /**
  * Default destination for a restore requested from the browser UI: a new sibling folder of
- * the active company file, e.g. `<parent>/Acme Corp (restored 2026-10-10 1405).bookkeeper`.
+ * the active company file, e.g. `<parent>/Acme Corp (restored 2026-10-10 1405).ironbooks`.
  */
 export function defaultPortableRestoreDir(companyName: string, activeDataDir?: string): string {
   const parent = path.dirname(resolveDataDir(activeDataDir));
   const safe = companyName.replace(/[\\/:*?"<>|\u0000-\u001F]/g, '-').trim() || 'Company';
   const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '');
-  let candidate = path.join(parent, `${safe} (restored ${stamp}).bookkeeper`);
+  let candidate = path.join(parent, `${safe} (restored ${stamp}).ironbooks`);
   for (let i = 2; !isEmptyDir(candidate); i++) {
-    candidate = path.join(parent, `${safe} (restored ${stamp} ${i}).bookkeeper`);
+    candidate = path.join(parent, `${safe} (restored ${stamp} ${i}).ironbooks`);
   }
   return candidate;
 }

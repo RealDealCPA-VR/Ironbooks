@@ -3,11 +3,11 @@
 > The app shipped instead as an offline **Electron + PGlite** desktop application.
 > See [README.md](README.md) for the current architecture, [INSTALL.md](INSTALL.md) for setup, and [TODO.md](TODO.md) for the roadmap.
 
-# BookKeeper AI - White Label Accounting SaaS
+# Ironbooks - White Label Accounting SaaS
 
 ## Project Overview
 
-BookKeeper AI is a white-label QuickBooks alternative built with Next.js, featuring native .QBO file support and autonomous LLM-powered error correction. This application enables businesses to manage their accounting with intelligent automation that detects and fixes common bookkeeping errors.
+Ironbooks is a white-label QuickBooks alternative built with Next.js, featuring native .QBO file support and autonomous LLM-powered error correction. This application enables businesses to manage their accounting with intelligent automation that detects and fixes common bookkeeping errors.
 
 ## Core Technology Stack
 

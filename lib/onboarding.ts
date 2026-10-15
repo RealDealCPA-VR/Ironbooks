@@ -419,7 +419,7 @@ export interface InterviewAnswers {
   entityType?: EntityType;
   /** First month of the income-tax year, 1-12 (defaults to the fiscal year's). */
   taxYearStartMonth?: number;
-  /** Date you start tracking finances in BookKeeper AI ('YYYY-MM-DD'). */
+  /** Date you start tracking finances in Ironbooks ('YYYY-MM-DD'). */
   startDate?: string;
   /** Feature questions. Undefined = not asked: the preference is left as it is. */
   estimates?: boolean;

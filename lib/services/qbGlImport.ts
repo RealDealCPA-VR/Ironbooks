@@ -492,7 +492,7 @@ export async function runGlImport(
       };
 
       // ---- 1. Chart of accounts ------------------------------------------------
-      const bkIdOf = new Map<string, string>(); // GL key → BookKeeper account id
+      const bkIdOf = new Map<string, string>(); // GL key → Ironbooks account id
       const bkTypeOf = new Map<string, string>();
       const takenCodes = new Set(p.existing.map((e) => e.code));
       const typeById = new Map(p.existing.map((e) => [e.id, e.type]));
@@ -875,7 +875,7 @@ export async function runGlImport(
       const drifted = proof.rows.filter((r) => !Money.of(r.actual).equals(full.get(r.accountId) ?? Money.zero()));
       if (drifted.length) {
         warnings.push(
-          `${drifted.length} account(s) also hold entries that weren't part of this import, so their balance in BookKeeper differs from QuickBooks: ${drifted
+          `${drifted.length} account(s) also hold entries that weren't part of this import, so their balance in Ironbooks differs from QuickBooks: ${drifted
             .slice(0, 5)
             .map((r) => `${r.code} ${r.name} (${toAmountString(full.get(r.accountId) ?? 0)} here vs ${r.expected} in QuickBooks)`)
             .join('; ')}${drifted.length > 5 ? '; …' : ''}.`,

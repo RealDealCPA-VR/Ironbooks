@@ -1,7 +1,7 @@
-# Migrating from QuickBooks Desktop to BookKeeper AI
+# Migrating from QuickBooks Desktop to Ironbooks
 
 A practical, step-by-step guide for moving a company file from QuickBooks
-Desktop (Pro/Premier/Enterprise) into BookKeeper AI.
+Desktop (Pro/Premier/Enterprise) into Ironbooks.
 
 > **TL;DR:** Export your lists as IIF and a Trial Balance report from QuickBooks,
 > import them in the order *Chart of Accounts → Customers/Vendors → Items →
@@ -14,7 +14,7 @@ Desktop (Pro/Premier/Enterprise) into BookKeeper AI.
 
 ### Known limitations
 
-- **No direct `.QBB` / `.QBW` read.** BookKeeper AI cannot open QuickBooks
+- **No direct `.QBB` / `.QBW` read.** Ironbooks cannot open QuickBooks
   company files (`.QBW`) or QuickBooks backups (`.QBB`) directly — these are
   proprietary, encrypted formats. Migration goes through QuickBooks' own
   **IIF exports** (lists) and **reports** (balances).
@@ -31,7 +31,7 @@ Desktop (Pro/Premier/Enterprise) into BookKeeper AI.
 
 ### What maps where
 
-| QuickBooks Desktop            | BookKeeper AI                                  |
+| QuickBooks Desktop            | Ironbooks                                  |
 | ----------------------------- | ---------------------------------------------- |
 | Chart of Accounts             | Chart of Accounts (`Accounts` page)            |
 | Customers & Jobs              | Customers (jobs become Jobs / sub-customers)   |
@@ -67,12 +67,12 @@ All exports below are from the QuickBooks Desktop menus.
 4. **Inventory valuation** (if you track inventory):
    `Reports → Inventory → Inventory Valuation Summary` as of the cutover date.
 5. **Optional — bank history:** download the last 30–90 days from your bank as
-   **QFX/OFX/QBO/CSV** for re-import into BookKeeper's Banking module.
+   **QFX/OFX/QBO/CSV** for re-import into Ironbooks' Banking module.
 
 Close the books in QuickBooks as of the cutover date so nothing changes under
 you while migrating.
 
-## 3. Import into BookKeeper AI — in this order
+## 3. Import into Ironbooks — in this order
 
 Order matters: each step references records created by the previous one.
 
@@ -84,7 +84,7 @@ Order matters: each step references records created by the previous one.
 3. **Customers and Vendors** — IIF (`!CUST`, `!VEND`) or CSV list import.
    Jobs/sub-customers come in under their parent customers.
 4. **Items** — IIF (`!INVITEM`) or CSV. Check that each item's income/expense
-   (and inventory asset/COGS) account mapping survived. BookKeeper supports
+   (and inventory asset/COGS) account mapping survived. Ironbooks supports
    the full QB item-type set including other charge, discount, subtotal,
    payment, and sales-tax items.
 5. **Classes** — IIF (`!CLASS`) or create manually (usually a short list).
@@ -122,7 +122,7 @@ File → Migrate from QuickBooks…):
    (`Reports → List → Account Listing`, or your IIF chart of accounts) so every account type is
    exact, and a **Trial Balance** as of the last day for a second check.
 3. **Preview** — accounts, transaction count, date range, totals, and anything that needs review.
-4. **Account types** — a GL doesn't say what kind each account is; BookKeeper works it out from
+4. **Account types** — a GL doesn't say what kind each account is; Ironbooks works it out from
    QB's section order, account numbers, names, running-balance direction and how each account is
    used. Confirm or change them, and map accounts onto ones that already exist (no duplicates).
 5. **Dry run** — the whole import runs and is proven, then rolled back.
@@ -156,7 +156,7 @@ Notes:
 
 ## 4. Verify-your-data checklist
 
-Run these checks in BookKeeper AI against the same reports from QuickBooks
+Run these checks in Ironbooks against the same reports from QuickBooks
 **as of the cutover date** before you stop using the old file:
 
 - [ ] **Trial Balance** matches QuickBooks line for line (run Reports → Trial
@@ -184,7 +184,7 @@ period; historical detail you didn't migrate lives there.
 
 - **Backups:** `.bka` files are portable zip archives. A *full backup* covers
   every company in the data directory; a *company backup* is a single tenant
-  you can restore as a new company anywhere. BookKeeper also writes automatic
+  you can restore as a new company anywhere. Ironbooks also writes automatic
   **pre-operation backups** (last 5 kept) before restores and condense runs.
 - **Condense/Archive** (QB "Condense Data" equivalent) lives on the Backup &
   Restore page: it summarizes closed-period detail to one entry per month and

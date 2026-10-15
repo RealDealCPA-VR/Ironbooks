@@ -140,7 +140,7 @@ export default function ReportToolbar({
     const subject = encodeURIComponent(effTitle(table));
     const body = encodeURIComponent(
       `${effTitle(table)}${effSubtitle(table) ? ` (${effSubtitle(table)})` : ''}\n\n` +
-        'Export the report from BookKeeper AI (CSV, Excel or PDF) and attach the downloaded file to this email.',
+        'Export the report from Ironbooks (CSV, Excel or PDF) and attach the downloaded file to this email.',
     );
     window.location.href = `mailto:?subject=${subject}&body=${body}`;
   };

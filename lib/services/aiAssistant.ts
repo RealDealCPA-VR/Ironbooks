@@ -612,7 +612,7 @@ function systemPrompt(today: string): string {
   const tools = Object.entries(TOOLS)
     .map(([name, t]) => `- ${name}: ${t.description} Args: ${t.argsHelp}`)
     .join('\n');
-  return `You are the bookkeeping assistant inside BookKeeper AI, a double-entry accounting app. Today is ${today}.
+  return `You are the bookkeeping assistant inside Ironbooks, a double-entry accounting app. Today is ${today}.
 
 You answer questions about THIS company's books using ONLY these read-only tools (computed locally from the ledger):
 ${tools}

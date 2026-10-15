@@ -32,7 +32,7 @@ export default function SignupPage() {
             <Briefcase className="text-gold h-6 w-6" />
           </div>
           <h1 className="text-2xl font-extrabold text-navy">Create your account</h1>
-          <p className="text-sm text-navy/50">Set up BookKeeper AI in seconds</p>
+          <p className="text-sm text-navy/50">Set up Ironbooks in seconds</p>
         </div>
         <form onSubmit={submit} className="space-y-4">
           <div>

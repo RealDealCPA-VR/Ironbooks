@@ -1,7 +1,7 @@
 /**
  * AI layer — shared types.
  *
- * BookKeeper AI is local-first: the default model lives on a machine on the workstation's
+ * Ironbooks is local-first: the default model lives on a machine on the workstation's
  * Tailscale tailnet (Ollama, LM Studio, vLLM, llama.cpp). Cloud models (Anthropic, any
  * OpenAI-compatible API) are optional, opt-in per company, and every cloud call is redacted
  * (lib/ai/redact.ts) before it leaves the machine.

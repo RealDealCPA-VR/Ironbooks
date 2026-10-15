@@ -3,11 +3,11 @@
 > The app shipped instead as an offline **Electron + PGlite** desktop application.
 > See [README.md](README.md) for the current architecture, [INSTALL.md](INSTALL.md) for setup, and [TODO.md](TODO.md) for the roadmap.
 
-# BookKeeper AI - Project Summary
+# Ironbooks - Project Summary
 
 ## 🎉 What Has Been Built
 
-I've created a comprehensive foundation for **BookKeeper AI**, a white-label QuickBooks alternative with .QBO file support and LLM-powered error correction, following the autonomous coding pattern from Anthropic's Claude quickstart repository.
+I've created a comprehensive foundation for **Ironbooks**, a white-label QuickBooks alternative with .QBO file support and LLM-powered error correction, following the autonomous coding pattern from Anthropic's Claude quickstart repository.
 
 ## 📦 Deliverables
 

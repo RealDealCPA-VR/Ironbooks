@@ -1,4 +1,4 @@
-// Electron hardening for BookKeeper AI (local-only data guarantee).
+// Electron hardening for Ironbooks (local-only data guarantee).
 //
 //  - Renderer windows can only load the app's own origin (the local server, or the multi-user
 //    host the user explicitly connected to). Navigation / new windows to any other origin are

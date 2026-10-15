@@ -1,5 +1,5 @@
 /**
- * Jobs / Projects service — job costing for BookKeeper AI.
+ * Jobs / Projects service — job costing for Ironbooks.
  *
  * Jobs are tracking dimensions that sit across invoices, bills, and expenses,
  * letting you see per-project revenue, cost, and profit without changing the GL

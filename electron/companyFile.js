@@ -36,11 +36,11 @@ function writeManifest(dir, data) {
   }
 }
 
-/** Human name for a company file: manifest name, else folder basename (sans a .bookkeeper suffix). */
+/** Human name for a company file: manifest name, else folder basename (sans an .ironbooks / legacy .bookkeeper suffix). */
 function companyName(dir) {
   const m = readManifest(dir);
   if (m && typeof m.name === 'string' && m.name.trim()) return m.name.trim();
-  return path.basename(dir).replace(/\.bookkeeper$/i, '');
+  return path.basename(dir).replace(/\.(ironbooks|bookkeeper)$/i, '');
 }
 
 /** True if the folder is (or could become) a usable company file. */
@@ -63,7 +63,7 @@ function looksLikeCompany(dir) {
 function ensureManifest(dir) {
   if (!readManifest(dir)) {
     writeManifest(dir, {
-      name: path.basename(dir).replace(/\.bookkeeper$/i, ''),
+      name: path.basename(dir).replace(/\.(ironbooks|bookkeeper)$/i, ''),
       createdAt: new Date().toISOString(),
     });
   }

@@ -67,7 +67,7 @@ export async function fetchAndSave(
 
 export function savePortableCompanyFile(): Promise<string | null> {
   return fetchAndSave('/api/portable', 'Company.bkp', {
-    name: 'BookKeeper Portable Company File',
+    name: 'Ironbooks Portable Company File',
     extensions: ['bkp'],
   });
 }

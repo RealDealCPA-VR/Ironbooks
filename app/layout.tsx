@@ -14,7 +14,7 @@ const inter = Inter({
 });
 
 export const metadata = {
-  title: "BookKeeper AI",
+  title: "Ironbooks",
   description: "Open-source desktop accounting with AI error correction.",
 };
 

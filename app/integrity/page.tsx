@@ -316,7 +316,7 @@ export default function IntegrityPage() {
       <div className="mt-8">
         <div className="flex items-center gap-2 mb-3">
           <Lock className="h-5 w-5 text-navy/70" />
-          <h2 className="text-lg font-bold text-navy">What BookKeeper guarantees</h2>
+          <h2 className="text-lg font-bold text-navy">What Ironbooks guarantees</h2>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
           {GUARANTEES.map((g) => (

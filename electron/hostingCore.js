@@ -153,7 +153,7 @@ function normalizeHostAddress(input, defaultPort = DEFAULT_HOSTING_PORT) {
     return {
       ok: false,
       error:
-        'For your privacy, BookKeeper AI only connects to hosts on your own network or tailnet (a 100.x.y.z address or a name ending in .ts.net).',
+        'For your privacy, Ironbooks only connects to hosts on your own network or tailnet (a 100.x.y.z address or a name ending in .ts.net).',
     };
   }
   // The URL parser drops a scheme's default port (":80"/":443"), so read an explicit port from

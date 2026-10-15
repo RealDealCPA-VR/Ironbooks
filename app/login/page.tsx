@@ -42,7 +42,7 @@ export default function LoginPage() {
             <Briefcase className="text-gold h-6 w-6" />
           </div>
           <h1 className="text-2xl font-extrabold text-navy">Welcome back</h1>
-          <p className="text-sm text-navy/50">Sign in to BookKeeper AI</p>
+          <p className="text-sm text-navy/50">Sign in to Ironbooks</p>
         </div>
         <form onSubmit={submit} className="space-y-4">
           <div>

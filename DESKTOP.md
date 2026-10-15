@@ -1,6 +1,6 @@
-# BookKeeper AI — Desktop App
+# Ironbooks — Desktop App
 
-BookKeeper AI runs as a native desktop application (Windows/macOS/Linux) via Electron. All data
+Ironbooks runs as a native desktop application (Windows/macOS/Linux) via Electron. All data
 lives **locally** in an embedded Postgres (PGlite) — fully offline, you own your data.
 
 ## Architecture

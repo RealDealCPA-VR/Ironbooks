@@ -6,7 +6,7 @@ import { describe, it, expect } from 'vitest';
 import { renderPackingSlipPdf, type PackingSlipData } from './packingSlip';
 
 const BASE: PackingSlipData = {
-  company: { name: 'BookKeeper Test Co' },
+  company: { name: 'Ironbooks Test Co' },
   customerName: 'Acme Corp',
   shipToLines: ['123 Main St', 'Suite 4', 'Springfield, IL 62704'],
   slip: { invoiceNumber: 1042, date: '2026-06-09', orderNumber: 17 },

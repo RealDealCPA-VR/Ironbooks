@@ -132,7 +132,7 @@ describe('per-company backup/restore', () => {
 
   it('createCompanyBackup produces a valid company .bka archive', async () => {
     const { buffer, filename } = await createCompanyBackup(db, companyAId);
-    expect(filename).toMatch(/^bookkeeper-company-alpha-co-.*\.bka$/);
+    expect(filename).toMatch(/^ironbooks-company-alpha-co-.*\.bka$/);
     backupBuffer = buffer;
 
     const roundTrip = readCompanyBackup(buffer);

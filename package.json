@@ -1,10 +1,10 @@
 {
-  "name": "bookkeeper-ai",
+  "name": "ironbooks",
   "version": "1.2.0",
   "private": true,
   "license": "MIT",
-  "description": "Open-source desktop accounting — a QuickBooks competitor with AI-powered error correction.",
-  "author": "BookKeeper AI",
+  "description": "Ironbooks: open-source desktop accounting — a QuickBooks competitor with AI-powered error correction.",
+  "author": "Ironbooks",
   "main": "electron/main.js",
   "scripts": {
     "dev": "next dev",
@@ -75,7 +75,7 @@
   },
   "build": {
     "appId": "com.bookkeeperai.desktop",
-    "productName": "BookKeeper AI",
+    "productName": "Ironbooks",
     "directories": {
       "output": "release"
     },
@@ -83,21 +83,21 @@
       {
         "provider": "github",
         "owner": "RealDealCPA-VR",
-        "repo": "Open-Source-QB",
+        "repo": "Ironbooks",
         "releaseType": "release"
       }
     ],
     "fileAssociations": [
       {
         "ext": "bka",
-        "name": "BookKeeper AI Company Backup",
-        "description": "BookKeeper AI Company Backup",
+        "name": "Ironbooks Company Backup",
+        "description": "Ironbooks Company Backup",
         "role": "Editor"
       },
       {
         "ext": "bkp",
-        "name": "BookKeeper AI Portable Company File",
-        "description": "BookKeeper AI Portable Company File",
+        "name": "Ironbooks Portable Company File",
+        "description": "Ironbooks Portable Company File",
         "role": "Editor"
       }
     ],
@@ -150,7 +150,7 @@
       "allowToChangeInstallationDirectory": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "BookKeeper AI",
+      "shortcutName": "Ironbooks",
       "runAfterFinish": true,
       "deleteAppDataOnUninstall": false
     },

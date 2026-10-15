@@ -1,8 +1,8 @@
 /**
  * Backup/restore service for a company data directory.
  *
- * A BookKeeper backup (.bka) is a zip archive of the PGlite data directory plus a
- * `bookkeeper-manifest.json` entry identifying the archive as a BookKeeper backup.
+ * An Ironbooks backup (.bka) is a zip archive of the PGlite data directory plus a
+ * `bookkeeper-manifest.json` entry identifying the archive as an Ironbooks backup.
  *
  * adm-zip operates entirely in memory, keeping the backup path simple and
  * portable across Electron / Next dev / CI.
@@ -109,7 +109,7 @@ export interface BackupResult {
  * @param companyName  Optional name embedded in the filename for clarity.
  * @param dataDir      Optional path override; defaults to the active company
  *                     data dir via resolveDataDir().
- * @returns { buffer, filename } — filename is 'bookkeeper-backup-<slug>.bka'.
+ * @returns { buffer, filename } — filename is 'ironbooks-backup-<slug>.bka'.
  */
 export function createBackup(companyName?: string, dataDir?: string): BackupResult {
   const dir = resolveDataDir(dataDir);
@@ -127,7 +127,7 @@ export function createBackup(companyName?: string, dataDir?: string): BackupResu
   zip.addLocalFolder(dir, '', (p: string) => !FILE_LOCAL_SECRETS.includes(p.replace(/\\/g, '/')));
 
   // Embed a manifest so restoreBackup can verify the archive is really a
-  // BookKeeper backup (and reject backups from a newer, incompatible format).
+  // Ironbooks backup (and reject backups from a newer, incompatible format).
   const manifest: BackupManifest = {
     app: 'bookkeeper-ai',
     formatVersion: BACKUP_FORMAT_VERSION,
@@ -137,7 +137,7 @@ export function createBackup(companyName?: string, dataDir?: string): BackupResu
   };
   zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
 
-  return { buffer: zip.toBuffer(), filename: buildBackupFilename('bookkeeper-backup', companyName) };
+  return { buffer: zip.toBuffer(), filename: buildBackupFilename('ironbooks-backup', companyName) };
 }
 
 /** Build a timestamped, slugged .bka filename. */
@@ -245,7 +245,7 @@ export interface RestoreResult {
 }
 
 const notABackup = (detail: string) =>
-  new ServiceError('VALIDATION', `Not a BookKeeper backup file (${detail}).`);
+  new ServiceError('VALIDATION', `Not an Ironbooks backup file (${detail}).`);
 
 /**
  * Parse + validate a candidate .bka buffer WITHOUT touching the data dir.
@@ -277,7 +277,7 @@ function validateBackupZip(buffer: Buffer): AdmZip {
       throw notABackup('manifest is unreadable');
     }
     if (manifest.app !== 'bookkeeper-ai') {
-      throw notABackup('manifest does not identify a BookKeeper backup');
+      throw notABackup('manifest does not identify an Ironbooks backup');
     }
     if (
       typeof manifest.formatVersion !== 'number' ||
@@ -285,7 +285,7 @@ function validateBackupZip(buffer: Buffer): AdmZip {
     ) {
       throw new ServiceError(
         'VALIDATION',
-        'This backup was created by a newer version of BookKeeper. Update the app, then restore.',
+        'This backup was created by a newer version of Ironbooks. Update the app, then restore.',
       );
     }
     if (manifest.kind === 'company') {
@@ -302,7 +302,7 @@ function validateBackupZip(buffer: Buffer): AdmZip {
     entryNames.includes('PG_VERSION') &&
     entryNames.some((n) => n.startsWith('base/') || n === 'global/pg_control');
   if (!looksLikePglite) {
-    throw notABackup('archive does not contain a BookKeeper company file');
+    throw notABackup('archive does not contain an Ironbooks company file');
   }
   return zip;
 }
@@ -406,7 +406,7 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
 
     // Verify extraction actually produced a PGlite data dir.
     if (!fs.existsSync(path.join(tmpDir, 'PG_VERSION'))) {
-      throw notABackup('archive does not contain a BookKeeper company file');
+      throw notABackup('archive does not contain an Ironbooks company file');
     }
     // The manifest is archive metadata, not a database file — keep it out of the data dir.
     fs.rmSync(path.join(tmpDir, BACKUP_MANIFEST_ENTRY), { force: true });
@@ -790,7 +790,7 @@ export async function createCompanyBackup(
 
   return {
     buffer: zip.toBuffer(),
-    filename: buildBackupFilename('bookkeeper-company', data.company.name),
+    filename: buildBackupFilename('ironbooks-company', data.company.name),
   };
 }
 
@@ -810,7 +810,7 @@ export function readCompanyBackup(buffer: Buffer): CompanyExportData {
   } catch {
     throw notABackup('manifest is unreadable');
   }
-  if (manifest.app !== 'bookkeeper-ai') throw notABackup('manifest does not identify a BookKeeper backup');
+  if (manifest.app !== 'bookkeeper-ai') throw notABackup('manifest does not identify an Ironbooks backup');
   if (manifest.kind !== 'company') {
     throw new ServiceError(
       'VALIDATION',
@@ -820,7 +820,7 @@ export function readCompanyBackup(buffer: Buffer): CompanyExportData {
   if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > BACKUP_FORMAT_VERSION) {
     throw new ServiceError(
       'VALIDATION',
-      'This backup was created by a newer version of BookKeeper. Update the app, then restore.',
+      'This backup was created by a newer version of Ironbooks. Update the app, then restore.',
     );
   }
   const dataEntry = zip.getEntry(COMPANY_DATA_ENTRY);

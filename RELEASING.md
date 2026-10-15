@@ -1,6 +1,6 @@
 # Releasing & Auto-Update
 
-BookKeeper AI desktop ships auto-update via [`electron-updater`](https://www.electron.build/auto-update)
+Ironbooks desktop ships auto-update via [`electron-updater`](https://www.electron.build/auto-update)
 against **GitHub Releases**. Installed apps check the repo's Releases at launch, every 4 hours, and
 from **Help → Check for Updates…**. When a newer release is published they show an in-app
 **"Update available"** banner (`components/DesktopBridge.tsx`) offering **Download & install** or
@@ -9,7 +9,7 @@ from **Help → Check for Updates…**. When a newer release is published they s
 Update checks are on by default (version + platform only); a company can turn them off in
 Privacy & Network, and Offline mode blocks them.
 
-- **Feed:** configured in `package.json` → `build.publish` (`github` / `RealDealCPA-VR` / `Open-Source-QB`).
+- **Feed:** configured in `package.json` → `build.publish` (`github` / `RealDealCPA-VR` / `Ironbooks`).
 - **Renderer wiring:** `electron/main.js` `checkForUpdates()` → `update` IPC channel (`available` →
   `downloading` → `ready` / `error`) → `components/DesktopBridge.tsx` banner; the user's choices go
   back over `app:downloadUpdate` / `app:quitAndInstall`.
@@ -19,7 +19,7 @@ Privacy & Network, and Offline mode blocks them.
 ## One-time setup
 
 1. **GitHub token.** Create a fine-grained or classic PAT with **`repo`** scope (it needs to create
-   releases and upload assets on `RealDealCPA-VR/Open-Source-QB`). Keep it out of git.
+   releases and upload assets on `RealDealCPA-VR/Ironbooks`). Keep it out of git.
 2. Make the repo's **Releases public** (the repo can be private, but a private repo's update feed
    requires every client to ship a token — for a normal distributable app, use public releases).
 

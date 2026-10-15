@@ -633,7 +633,7 @@ export async function checkLedgerHealth(
   if (extra.length) {
     problems.push({
       kind: 'guards',
-      detail: `${extra.length} unexpected database trigger${extra.length === 1 ? ' was' : 's were'} added to the ledger tables outside BookKeeper (${sample(
+      detail: `${extra.length} unexpected database trigger${extra.length === 1 ? ' was' : 's were'} added to the ledger tables outside Ironbooks (${sample(
         extra.map((t) => `${t.tgname} on ${t.tbl}`),
       )}).`,
     });

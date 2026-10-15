@@ -1,9 +1,9 @@
 > **⚠️ HISTORICAL DOCUMENT — December 2025; the push described below already happened.**
-> The real remote is `https://github.com/RealDealCPA-VR/Open-Source-QB.git` and the repo now has ~766 tracked files (not the 15-16 listed here).
+> The real remote is `https://github.com/RealDealCPA-VR/Ironbooks.git` and the repo now has ~766 tracked files (not the 15-16 listed here).
 > The app shipped as an offline **Electron + PGlite** desktop application, not the cloud SaaS described in these docs.
 > See [README.md](README.md) for the current project; for setup see [INSTALL.md](INSTALL.md), and for the roadmap [TODO.md](TODO.md).
 
-# Push BookKeeper AI to GitHub
+# Push Ironbooks to GitHub
 
 ## Your repository is ready to push! 🚀
 
@@ -87,7 +87,7 @@ git push -u origin main
 ## Commit Message
 
 ```
-Initial commit: BookKeeper AI - White-label QuickBooks alternative with QBO support and LLM error correction
+Initial commit: Ironbooks - White-label QuickBooks alternative with QBO support and LLM error correction
 
 - Complete database schema with Drizzle ORM
 - Next.js 15 + TypeScript + Tailwind CSS setup

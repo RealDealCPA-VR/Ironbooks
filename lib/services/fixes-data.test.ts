@@ -74,7 +74,7 @@ describe('backup service — restore validation and atomic swap', () => {
     expect(fs.existsSync(BK_DIR)).toBe(false);
   });
 
-  it('rejects a valid zip that is not a BookKeeper backup', async () => {
+  it('rejects a valid zip that is not an Ironbooks backup', async () => {
     const zip = new AdmZip();
     zip.addFile('readme.txt', Buffer.from('just some random archive'));
     await expect(restoreBackup(zip.toBuffer(), BK_DIR)).rejects.toMatchObject({ code: 'VALIDATION' });

@@ -103,9 +103,9 @@ export function describeError(err: unknown, fallback = 'That didn’t work.'): F
   if (err instanceof TypeError && NETWORK_RE.test(err.message)) {
     return {
       code: 'NETWORK',
-      title: 'Can’t reach BookKeeper',
+      title: 'Can’t reach Ironbooks',
       message: 'The app could not talk to its accounting engine, so nothing was saved.',
-      nextStep: 'Wait a moment and try again. If it keeps happening, restart BookKeeper AI.',
+      nextStep: 'Wait a moment and try again. If it keeps happening, restart Ironbooks.',
     };
   }
 

@@ -558,7 +558,7 @@ export default function AiSettingsPage() {
             <span className="block text-xs text-navy/60">
               Off by default. When on, tasks set to use the cloud send REDACTED text (no names, contact details, tax IDs,
               account numbers or addresses). Cloud providers are asked not to store requests; nothing is saved by
-              BookKeeper AI outside this computer.
+              Ironbooks outside this computer.
             </span>
           </span>
         </label>

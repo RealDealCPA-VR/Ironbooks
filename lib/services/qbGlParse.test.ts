@@ -94,7 +94,7 @@ describe('value parsing', () => {
     expect(parseAccountLabel('Checking')).toEqual({ name: 'Checking' });
   });
 
-  it('maps QB types to BookKeeper types', () => {
+  it('maps QB types to Ironbooks types', () => {
     expect(toBookkeeperType('Bank', 'Savings')).toEqual({ type: 'asset', subtype: 'savings' });
     expect(toBookkeeperType('Accounts Payable')).toEqual({ type: 'liability', subtype: 'accounts_payable' });
     expect(toBookkeeperType('Equity', 'Retained Earnings')).toEqual({ type: 'equity', subtype: 'retained_earnings' });

@@ -1,6 +1,6 @@
 /**
  * GET /api/portable/shareable?format=xlsx|pdf — "Shareable ledger": a read-only copy of the
- * books that opens without BookKeeper. xlsx = workbook (Company Info, Chart of Accounts, Trial
+ * books that opens without Ironbooks. xlsx = workbook (Company Info, Chart of Accounts, Trial
  * Balance, General Ledger, Journal, Customers, Vendors, Items); pdf = summary (company info,
  * Trial Balance, Balance Sheet).
  *

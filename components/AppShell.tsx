@@ -53,14 +53,14 @@ function pageLabelFor(pathname: string): string | null {
 
 /**
  * Keeps document.title in sync with the active page + company:
- * "BookKeeper AI — <page label> — <company>". The Electron window title
+ * "Ironbooks — <page label> — <company>". The Electron window title
  * follows document.title automatically, so the native title bar updates too.
  */
 function TitleSync({ company }: { company: string | null }) {
   const pathname = usePathname() || '';
   React.useEffect(() => {
     const label = pageLabelFor(pathname);
-    document.title = ['BookKeeper AI', label, company].filter(Boolean).join(' — ');
+    document.title = ['Ironbooks', label, company].filter(Boolean).join(' — ');
   }, [pathname, company]);
   return null;
 }
@@ -616,7 +616,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <Briefcase className="text-gold h-6 w-6" />
           </div>
           <h1 className="text-navy font-extrabold text-2xl tracking-tight leading-tight hidden lg:block">
-            BookKeeper AI
+            Ironbooks
           </h1>
         </div>
         <MenuModeToggle mode={navMode} onChange={changeMode} />
@@ -651,7 +651,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <span className="hidden lg:inline-block text-sm">Sign out</span>
           </button>
           <div className="hidden lg:block px-3 pt-2 text-[10px] text-navy/30">
-            BookKeeper AI v{process.env.NEXT_PUBLIC_APP_VERSION}
+            Ironbooks v{process.env.NEXT_PUBLIC_APP_VERSION}
           </div>
         </div>
       </aside>

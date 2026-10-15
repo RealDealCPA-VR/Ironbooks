@@ -419,7 +419,7 @@ async function ledgerGuardStatus(ctx: ServiceContext): Promise<{ missing: string
                   : 'rules changed'
           })`,
       ),
-      ...extraTriggers.map((t) => `unexpected trigger ${t.tgname} on ${t.tbl} (added outside BookKeeper)`),
+      ...extraTriggers.map((t) => `unexpected trigger ${t.tgname} on ${t.tbl} (added outside Ironbooks)`),
     ],
     total: expected.length,
   };
@@ -438,7 +438,7 @@ async function checkLedgerGuards(ctx: ServiceContext): Promise<IntegrityCheck> {
   return {
     name,
     ok: false,
-    detail: `${missing.length} database guard${missing.length === 1 ? ' is' : 's are'} missing or disabled: ${missing.join(', ')}. Close and reopen the company file: BookKeeper re-installs every ledger guard when a file is opened.`,
+    detail: `${missing.length} database guard${missing.length === 1 ? ' is' : 's are'} missing or disabled: ${missing.join(', ')}. Close and reopen the company file: Ironbooks re-installs every ledger guard when a file is opened.`,
   };
 }
 

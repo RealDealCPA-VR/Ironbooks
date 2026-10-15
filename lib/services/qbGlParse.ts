@@ -103,7 +103,7 @@ export function normalizeQbType(raw: string | undefined | null): QbAccountType |
   return QB_TYPE_ALIASES[key] ?? null;
 }
 
-/** BookKeeper account type + subtype for a QB account type (name refines a few subtypes). */
+/** Ironbooks account type + subtype for a QB account type (name refines a few subtypes). */
 export function toBookkeeperType(
   qbType: QbAccountType,
   name = '',
