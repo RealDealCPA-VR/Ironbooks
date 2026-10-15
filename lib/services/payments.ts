@@ -1324,7 +1324,7 @@ async function reversePaymentEffects(
     await voidJournalEntry(tx, payment.postedEntryId);
   } else {
     // Credits-only payment: no entry to void, so check the closing date here.
-    await assertPeriodOpen(tx, payment.date);
+    await assertPeriodOpen(tx, payment.date, { movable: false });
   }
   // FX plugs posted by later apply/unapply of this payment.
   const fxEntries = await tx.db

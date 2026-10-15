@@ -36,7 +36,8 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
-import { describeError } from '@/lib/friendlyErrors';
+import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
+import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
@@ -125,6 +126,17 @@ interface RowState {
   credit: string;
 }
 
+/** Body sent to /api/bill-payments (fix patches address its paths, e.g. "applications.0.amountApplied"). */
+type BillPaymentBody = Record<string, unknown> & {
+  applications: Array<{ billId: string; amountApplied: string; discountTaken?: string }>;
+};
+
+/** A patched value as the form's string state. */
+function fixValue(patched: unknown, path: string): string {
+  const v = getPath(patched, path);
+  return typeof v === 'string' ? v : v == null ? '' : String(v);
+}
+
 function emptyRow(): RowState {
   return { checked: false, payAmount: '', discount: '', credit: '' };
 }
@@ -183,6 +195,9 @@ export default function PayBillsPage() {
   const [editBills, setEditBills] = useState<Record<string, { billNumber: string | null; balanceDue: string }>>({});
   const [savingEdit, setSavingEdit] = useState(false);
   const [pendingVoid, setPendingVoid] = useState<BillPayment | null>(null);
+  // Fix errors where they happen: server fixes (pay exactly what the bill owes, closed period, ...).
+  const payFixer = useErrorFixes<BillPaymentBody>();
+  const editFixer = useErrorFixes<BillPaymentBody>();
 
   // ── data loading ──────────────────────────────────────────────────────────
 
@@ -416,45 +431,75 @@ export default function PayBillsPage() {
       // 2. One save: vendor credits, General Journal credits and the cash payment (with discounts)
       //    are applied in a single transaction — if anything is refused, nothing is saved.
       const queued = method === 'check' && toPrint;
-      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-        api.post('/api/bill-payments', {
-          vendorId,
-          date,
-          method,
-          reference: queued ? undefined : reference.trim() || undefined,
-          toPrint: queued,
-          paymentAccountId: paymentAccountId || undefined,
-          discountAccountId: discountTotal > 0 ? discountAccountId : undefined,
-          exchangeRate: billCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
-          applications,
-          journalItems,
-          vendorCredits: vendorCreditApps,
-          journalCredits: journalCreditApps,
-          journalOffsets,
-          allowDuplicateNumber,
-        }),
-      );
-      if (saved === null) {
-        await loadVendorData(vendorId);
-        return;
+      const body: BillPaymentBody = {
+        vendorId,
+        date,
+        method,
+        reference: queued ? undefined : reference.trim() || undefined,
+        toPrint: queued,
+        paymentAccountId: paymentAccountId || undefined,
+        discountAccountId: discountTotal > 0 ? discountAccountId : undefined,
+        exchangeRate: billCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
+        applications,
+        journalItems,
+        vendorCredits: vendorCreditApps,
+        journalCredits: journalCreditApps,
+        journalOffsets,
+      };
+      const ctx: FixContext<BillPaymentBody> = {
+        payload: body,
+        resubmit: sendPay,
+        applyToForm: applyPayFix,
+        fallback: 'Failed to pay bills.',
+      };
+      try {
+        await sendPay(body);
+      } catch (err) {
+        // Nothing was saved (credits and payment go in one transaction), so the screen keeps the
+        // user's entries; errors with fixes (pay exactly what the bill owes, ...) show Fix buttons.
+        payFixer.report(err, ctx);
       }
-
-      const paidCount = applications.length + journalItems.length;
-      toast(
-        paidCount > 0
-          ? `Paid ${paidCount} item${paidCount !== 1 ? 's' : ''} — ${formatCurrency(cashTotal.toFixed(2))}.`
-          : 'Vendor credits applied.',
-        'success',
-      );
-      setReference('');
-      await loadVendorData(vendorId);
-    } catch (err) {
-      // Nothing was saved (credits and payment go in one transaction), so the screen keeps the
-      // user's entries to fix and try again.
-      const f = describeError(err, 'Failed to pay bills.');
-      toast(`${f.title}: ${f.message} ${f.nextStep}`, 'danger');
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  /** Save a Pay Bills batch. Throws on failure (the fix presenter shows it). */
+  async function sendPay(body: BillPaymentBody) {
+    const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+      api.post('/api/bill-payments', { ...body, allowDuplicateNumber }),
+    );
+    payFixer.clear();
+    if (saved === null) {
+      await loadVendorData(vendorId);
+      return;
+    }
+    const paidCount = body.applications.length + ((body.journalItems as unknown[] | undefined)?.length ?? 0);
+    const cash = body.applications.reduce((sum, a) => sum + num(a.amountApplied), 0);
+    toast(
+      paidCount > 0
+        ? `Paid ${paidCount} item${paidCount !== 1 ? 's' : ''} — ${formatCurrency(cash.toFixed(2))}.`
+        : 'Vendor credits applied.',
+      'success',
+    );
+    setReference('');
+    await loadVendorData(vendorId);
+  }
+
+  /** Copy a fix's changes (request-body paths) back onto the Pay Bills rows and fields. */
+  function applyPayFix(patched: BillPaymentBody, fix: ErrorFix) {
+    for (const op of fix.patch ?? []) {
+      const str = fixValue(patched, op.path);
+      if (op.path === 'date') setDate(str);
+      else if (op.path === 'reference') setReference(str);
+      else if (op.path === 'paymentAccountId') setPaymentAccountId(str);
+      else {
+        const lp = parseLinePath(op.path);
+        const billId = lp?.collection === 'applications' ? patched.applications[lp.index]?.billId : undefined;
+        if (billId && lp?.field === 'amountApplied') {
+          setRows((prev) => ({ ...prev, [billId]: { ...(prev[billId] ?? emptyRow()), payAmount: str } }));
+        }
+      }
     }
   }
 
@@ -477,6 +522,7 @@ export default function PayBillsPage() {
       setEditDate(detail.date.slice(0, 10));
       setEditRef(detail.reference ?? '');
       setEditAccount(detail.paymentAccountId ?? '');
+      editFixer.clear();
       setEditPay(detail);
     } catch (err) {
       toastError(err, 'Failed to load the payment.');
@@ -500,31 +546,61 @@ export default function PayBillsPage() {
       toast('Enter an amount for at least one bill (or void the payment).', 'danger');
       return;
     }
+    const body: BillPaymentBody = {
+      vendorId,
+      date: editDate,
+      method: editPay.method,
+      reference: editPay.toPrint ? undefined : editRef.trim() || undefined,
+      toPrint: editPay.toPrint,
+      paymentAccountId: editAccount,
+      exchangeRate: editPay.currency && editPay.exchangeRate ? editPay.exchangeRate : undefined,
+      applications,
+      journalItems: keptJournalItems,
+      journalCredits: keptJournalCredits,
+    };
+    const paymentId = editPay.id;
+    const ctx: FixContext<BillPaymentBody> = {
+      payload: body,
+      resubmit: (b) => sendEdit(paymentId, b),
+      applyToForm: applyEditFix,
+      fallback: 'Failed to update the payment.',
+    };
+    try {
+      await sendEdit(paymentId, body);
+    } catch (err) {
+      editFixer.report(err, ctx);
+    }
+  }
+
+  /** Save an edited bill payment. Throws on failure (the fix presenter shows it). */
+  async function sendEdit(id: string, body: BillPaymentBody) {
     setSavingEdit(true);
     try {
       const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-        api.patch(`/api/bill-payments/${editPay.id}`, {
-          vendorId,
-          date: editDate,
-          method: editPay.method,
-          reference: editPay.toPrint ? undefined : editRef.trim() || undefined,
-          toPrint: editPay.toPrint,
-          paymentAccountId: editAccount,
-          exchangeRate: editPay.currency && editPay.exchangeRate ? editPay.exchangeRate : undefined,
-          applications,
-          journalItems: keptJournalItems,
-          journalCredits: keptJournalCredits,
-          allowDuplicateNumber,
-        }),
+        api.patch(`/api/bill-payments/${id}`, { ...body, allowDuplicateNumber }),
       );
       if (saved === null) return;
+      editFixer.clear();
       toast('Payment updated.', 'success');
       setEditPay(null);
       await loadVendorData(vendorId);
-    } catch (err) {
-      toastError(err, 'Failed to update the payment.');
     } finally {
       setSavingEdit(false);
+    }
+  }
+
+  /** Copy a fix's changes back onto the Edit Bill Payment fields. */
+  function applyEditFix(patched: BillPaymentBody, fix: ErrorFix) {
+    for (const op of fix.patch ?? []) {
+      const str = fixValue(patched, op.path);
+      if (op.path === 'date') setEditDate(str);
+      else if (op.path === 'reference') setEditRef(str);
+      else if (op.path === 'paymentAccountId') setEditAccount(str);
+      else {
+        const lp = parseLinePath(op.path);
+        const billId = lp?.collection === 'applications' ? patched.applications[lp.index]?.billId : undefined;
+        if (billId && lp?.field === 'amountApplied') setEditAmounts((prev) => ({ ...prev, [billId]: str }));
+      }
     }
   }
 
@@ -909,7 +985,11 @@ export default function PayBillsPage() {
 
       <Modal
         open={!!editPay}
-        onClose={() => !savingEdit && setEditPay(null)}
+        onClose={() => {
+          if (savingEdit) return;
+          editFixer.clear();
+          setEditPay(null);
+        }}
         title="Edit Bill Payment"
         footer={
           <>
@@ -924,6 +1004,7 @@ export default function PayBillsPage() {
       >
         {editPay && (
           <div className="space-y-4">
+            {editFixer.panel}
             <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
               Changing only the check number keeps the original entry. Changing amounts, the account or
               the date replaces the entry (not allowed once the check is reconciled).
@@ -995,6 +1076,7 @@ export default function PayBillsPage() {
       {/* Totals + action bar — sticky so the primary action stays on screen */}
       {vendorId && (bills.length > 0 || journalPayables.length > 0) && (
         <div className="sticky bottom-0 z-10 -mx-8 mt-4 border-t border-slate-200 bg-white/90 px-8 py-3 backdrop-blur">
+          {payFixer.panel}
           <div className="flex flex-wrap items-center justify-end gap-6">
             <div className="text-sm text-navy/60">
               Credits: <span className="font-semibold tabular-nums">{formatCurrency(creditTotal.toFixed(2))}</span>

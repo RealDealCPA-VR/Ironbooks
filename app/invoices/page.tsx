@@ -56,11 +56,13 @@ import { usePreferences } from '@/lib/usePreferences';
 import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
-import { getPath, missingClassFixes, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
+import { getPath, missingClassFixes, parseLinePath, stickyFlags, type ErrorFix } from '@/lib/errorFixes';
 import { collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
 
 /** Body sent to /api/invoices (fix patches address its paths, e.g. "refNumber", "lines.2.quantity"). */
 type InvoiceBody = Record<string, unknown>;
+/** Request flags a fix can set that have no field on the invoice form. */
+const INVOICE_FIX_FLAGS = ['overrideCreditLimit', 'checkStock'] as const;
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
@@ -425,6 +427,8 @@ function InvoiceModal({
   // enough stock, sales tax off, ...) + inline field messages.
   const fixer = useErrorFixes<InvoiceBody>();
   const [showErrors, setShowErrors] = useState(false);
+  // Flags a fix set that have no form field ("Save anyway", "Sell anyway"): kept for the next save.
+  const [fixFlags, setFixFlags] = useState<Record<string, unknown>>({});
   // Retainage (contractors): % of the total held back in Retainage Receivable until billed.
   const [retainagePercent, setRetainagePercent] = useState('');
   // Customer defaults (new invoices): tax item / non-taxable tax code and default ship-to.
@@ -503,6 +507,7 @@ function InvoiceModal({
     }
     setBillables(null);
     fixer.clear();
+    setFixFlags({});
     setShowErrors(false);
     setSelectedCostIds(new Set());
     setSelectedTimeIds(new Set());
@@ -800,6 +805,8 @@ function InvoiceModal({
 
   /** Copy a fix's changes (request-body paths) back onto the form. `lineIdx` maps body → form lines. */
   function applyToForm(patched: InvoiceBody, fix: ErrorFix, lineIdx: number[]) {
+    const flags = stickyFlags(fix, INVOICE_FIX_FLAGS);
+    if (Object.keys(flags).length) setFixFlags((prev) => ({ ...prev, ...flags }));
     for (const op of fix.patch ?? []) {
       const value = getPath(patched, op.path);
       const str = typeof value === 'string' ? value : value == null ? '' : String(value);
@@ -811,6 +818,9 @@ function InvoiceModal({
         const lp = parseLinePath(op.path);
         if (lp?.collection === 'lines' && lp.field === 'quantity' && lineIdx[lp.index] !== undefined) {
           updateLine(lineIdx[lp.index], { quantity: str });
+        } else if (lp?.collection === 'lines' && lp.field === 'taxRateId' && lineIdx[lp.index] !== undefined && !str) {
+          // "Remove the sales tax": the line no longer charges tax.
+          updateLine(lineIdx[lp.index], { taxable: false });
         }
       }
     }
@@ -931,6 +941,8 @@ function InvoiceModal({
     // Not enough inventory to sell: the server warns (NEGATIVE_STOCK) with fixes — sell anyway,
     // sell only what is on hand, or adjust quantity on hand. Pending invoices relieve no stock.
     if (!(editing ? editing.status === 'draft' : saveAsPending)) payload.checkStock = true;
+    // Fixes chosen earlier on this form (Save anyway / Sell anyway) still apply.
+    Object.assign(payload, fixFlags);
 
     const lineIdx = indexed.map(({ idx }) => idx);
     const ctx: FixContext<InvoiceBody> = {

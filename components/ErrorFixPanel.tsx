@@ -29,7 +29,7 @@ import { useRouter } from 'next/navigation';
 import { Wrench, X } from 'lucide-react';
 import { Button, toastError } from '@/components/ui';
 import { errorFixes } from '@/lib/client';
-import { applyFixPatch, type ErrorFix } from '@/lib/errorFixes';
+import { retryPayloads, type ErrorFix } from '@/lib/errorFixes';
 import { describeError, type FriendlyError } from '@/lib/friendlyErrors';
 
 export interface ErrorFixPanelProps {
@@ -104,8 +104,14 @@ export function ErrorFixPanel({ problem, fixes, busyId, onFix, onDismiss, classN
 export interface FixContext<P> {
   /** The request body that failed. Fix patches apply to it. */
   payload: P;
-  /** Save again with the (patched) body. Must throw on failure. */
+  /** Save again with the (patched, prepared) body. Must throw on failure. */
   resubmit: (patched: P) => Promise<unknown>;
+  /**
+   * Turn a patched body into exactly what `resubmit` sends (e.g. drop zero applications). The
+   * retried body is then the payload of any further error, so the server's patch paths line up.
+   * `payload` itself must already be in this sent shape.
+   */
+  prepare?: (body: P) => P;
   /** Copy the patched values back into the form state. */
   applyToForm?: (patched: P, fix: ErrorFix) => void;
   /** Action-specific fallback message ("Failed to save invoice."). */
@@ -163,14 +169,15 @@ export function useErrorFixes<P>() {
         if (fix.href) router.push(fix.href);
         return;
       }
-      const patched = applyFixPatch(cur.ctx.payload, fix.patch);
+      const { patched, sent } = retryPayloads(cur.ctx.payload, fix.patch, cur.ctx.prepare);
       cur.ctx.applyToForm?.(patched, fix);
       setBusyId(fix.id);
       try {
-        await cur.ctx.resubmit(patched);
+        await cur.ctx.resubmit(sent);
         setState(null);
       } catch (err) {
-        report(err, { ...cur.ctx, payload: patched });
+        // Report against the body the server actually saw, so its patch indexes match.
+        report(err, { ...cur.ctx, payload: sent });
       } finally {
         setBusyId(null);
       }

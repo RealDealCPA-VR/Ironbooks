@@ -173,6 +173,35 @@ export function applyFixPatch<T>(target: T, patch: readonly FixPatchOp[] | undef
   return out as T;
 }
 
+/**
+ * The bodies for retrying a save after a patch fix. `patched` is the reported payload with the
+ * fix applied (its indexes match the patch, so forms copy it back with `applyToForm`); `sent` is
+ * what actually goes to the server after the form's `prepare` (e.g. dropping zero applications).
+ * A second failure must be reported against `sent`, because the server's new patch paths
+ * ("applications.1...") index the body it received, not the uncleaned one.
+ */
+export function retryPayloads<T>(
+  payload: T,
+  patch: readonly FixPatchOp[] | undefined,
+  prepare?: (body: T) => T,
+): { patched: T; sent: T } {
+  const patched = applyFixPatch(payload, patch);
+  return { patched, sent: prepare ? prepare(patched) : patched };
+}
+
+/**
+ * Top-level request flags a fix sets ("Save anyway" → overrideCreditLimit: true, "Sell anyway" →
+ * checkStock: false) that have no field on the form. Forms keep them and merge them into the next
+ * save, so a fix the user chose is not lost if the retry fails for another reason.
+ */
+export function stickyFlags(fix: Pick<ErrorFix, 'patch'>, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const op of fix.patch ?? []) {
+    if (op.op === 'set' && keys.includes(op.path)) out[op.path] = op.value;
+  }
+  return out;
+}
+
 /** Paths a fix changes (forms use this to copy the new values back into their own state). */
 export function patchedPaths(fix: Pick<ErrorFix, 'patch'>): string[] {
   return (fix.patch ?? []).map((p) => p.path);
@@ -505,8 +534,11 @@ export interface OverApplication {
   path: string;
   /** What the document still owes. */
   balanceDue: Decimal.Value;
-  /** Discount + credits also going onto the same document (they use up part of the balance). */
-  otherApplied?: Decimal.Value;
+  /**
+   * Discount + credits also going onto the same document (they use up part of the balance).
+   * Pass the parts as a list to have them summed here with Decimal (no float sums in the caller).
+   */
+  otherApplied?: Decimal.Value | readonly Decimal.Value[];
   /** Document label for the button, e.g. "invoice #1042". */
   label: string;
   /** False when a zero application is not allowed (bill payments): no fix then. */
@@ -515,7 +547,10 @@ export interface OverApplication {
 
 /** One document received more than its balance: apply exactly what is still owed. */
 export function overAppliedFixes(o: OverApplication): ErrorFix[] {
-  const exact = amt(o.balanceDue).minus(amt(o.otherApplied ?? 0));
+  const other = Array.isArray(o.otherApplied)
+    ? (o.otherApplied as readonly Decimal.Value[]).reduce<Decimal>((sum, v) => sum.plus(amt(v)), new Decimal(0))
+    : amt((o.otherApplied as Decimal.Value | undefined) ?? 0);
+  const exact = amt(o.balanceDue).minus(other);
   if (exact.lessThan(0) || (exact.isZero() && o.allowZero === false)) return [];
   return [
     {

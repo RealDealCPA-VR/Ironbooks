@@ -23,6 +23,8 @@ import {
   parseFixes,
   parseLinePath,
   removeTaxFixes,
+  retryPayloads,
+  stickyFlags,
   type ErrorFix,
 } from './errorFixes';
 
@@ -288,6 +290,9 @@ describe('other builders', () => {
     expect(fix.patch).toEqual([{ op: 'set', path: 'applications.0.amountApplied', value: '90.05' }]);
     expect(overAppliedFixes({ path: 'x', balanceDue: '5', otherApplied: '6', label: 'y' })).toEqual([]);
     expect(overAppliedFixes({ path: 'x', balanceDue: '5', otherApplied: '5', label: 'y', allowZero: false })).toEqual([]);
+    // Discount + several credits passed as parts: summed with Decimal (0.1 + 0.2 is exactly 0.30).
+    const [parts] = overAppliedFixes({ path: 'applications.1.amountApplied', balanceDue: '100.00', otherApplied: ['0.10', '0.20', null as unknown as string, ''], label: 'invoice #8' });
+    expect(parts.patch).toEqual([{ op: 'set', path: 'applications.1.amountApplied', value: '99.70' }]);
   });
 
   it('applications exceed the payment: raise the amount, or trim the last application', () => {
@@ -313,5 +318,52 @@ describe('other builders', () => {
       salesReceiptIds: [],
     });
     expect(depositMismatchFixes({ reason: 'voided' })).toEqual([]);
+  });
+});
+
+describe('retrying a fix (pure)', () => {
+  type Body = { amount: string; applications: { invoiceId: string; amountApplied: string }[] };
+  const clean = (b: Body): Body => ({ ...b, applications: b.applications.filter((a) => Number(a.amountApplied) > 0) });
+
+  it('a second error is reported against the body the server saw (zero applications dropped)', () => {
+    const payload: Body = {
+      amount: '50.00',
+      applications: [
+        { invoiceId: 'A', amountApplied: '10.00' },
+        { invoiceId: 'B', amountApplied: '30.00' },
+        { invoiceId: 'C', amountApplied: '20.00' },
+      ],
+    };
+    // Fix 1 sets invoice A to 0.00: the form keeps the row (patched), the server never sees it (sent).
+    const first = retryPayloads(payload, [{ op: 'set', path: 'applications.0.amountApplied', value: '0.00' }], clean);
+    expect(first.patched.applications.map((a) => a.invoiceId)).toEqual(['A', 'B', 'C']);
+    expect(first.sent.applications.map((a) => a.invoiceId)).toEqual(['B', 'C']);
+    // The server's next fix indexes the sent body: applications.1 is invoice C, not B.
+    const second = retryPayloads(first.sent, [{ op: 'set', path: 'applications.1.amountApplied', value: '15.00' }], clean);
+    expect(second.patched.applications).toEqual([
+      { invoiceId: 'B', amountApplied: '30.00' },
+      { invoiceId: 'C', amountApplied: '15.00' },
+    ]);
+  });
+
+  it('without prepare the sent body is the patched body', () => {
+    const body = { date: '2026-01-10' };
+    const r = retryPayloads(body, [{ op: 'set', path: 'date', value: '2026-02-01' }]);
+    expect(r.sent).toBe(r.patched);
+    expect(r.sent.date).toBe('2026-02-01');
+  });
+
+  it('stickyFlags keeps the request flags a fix set (Save anyway / Sell anyway)', () => {
+    const fix: Pick<ErrorFix, 'patch'> = {
+      patch: [
+        { op: 'set', path: 'checkStock', value: false },
+        { op: 'set', path: 'lines.0.quantity', value: 2 },
+      ],
+    };
+    expect(stickyFlags(fix, ['overrideCreditLimit', 'checkStock'])).toEqual({ checkStock: false });
+    expect(stickyFlags({ patch: [{ op: 'set', path: 'overrideCreditLimit', value: true }] }, ['overrideCreditLimit'])).toEqual({
+      overrideCreditLimit: true,
+    });
+    expect(stickyFlags({}, ['checkStock'])).toEqual({});
   });
 });

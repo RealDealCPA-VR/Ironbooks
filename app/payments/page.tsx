@@ -24,7 +24,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, toDecimal } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useNewParam } from '@/lib/useFocusParam';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
@@ -49,6 +49,29 @@ type PaymentBody = Record<string, unknown> & {
   applications: Array<{ invoiceId: string; amountApplied: string; discountAmount: string | null }>;
   journalItems: Array<{ journalLineId: string; amount: string }>;
 };
+
+/** Decimal of an entered amount; blank or not-a-number counts as 0 (field validation reports those). */
+function dec(v: string | number | null | undefined) {
+  try {
+    return toDecimal(v || 0);
+  } catch {
+    return toDecimal(0);
+  }
+}
+
+/** What the API receives: only real applications (a fix may set one to 0.00). */
+function cleanPaymentBody(body: PaymentBody): PaymentBody {
+  return {
+    ...body,
+    applications: body.applications.filter((a) => dec(a.amountApplied).greaterThan(0) || dec(a.discountAmount).greaterThan(0)),
+    journalItems: body.journalItems.filter((j) => dec(j.amount).greaterThan(0)),
+  };
+}
+
+/** Decimal sum of entered amounts (blank counts as 0). */
+function sumMoney(values: ReadonlyArray<string | number | null | undefined>) {
+  return values.reduce<ReturnType<typeof toDecimal>>((s, v) => s.plus(dec(v)), dec(0));
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -526,6 +549,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   /** Credits entered against one invoice (or `je:<line>` charge). */
   const creditOn = (target: string) =>
     allCreditApps.filter((c) => c.invoiceId === target).reduce((s, c) => s + Number(c.amount), 0);
+  /** The credit amounts on one target, as entered (summed with Decimal by the fix builders). */
+  const creditPartsOn = (target: string) =>
+    allCreditApps.filter((c) => c.invoiceId === target).map((c) => c.amount || '0');
 
   const applications = visibleInvoices
     .map((inv) => ({
@@ -681,12 +707,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
 
   /** Save the payment. Throws on failure (the fix presenter shows it). */
   async function send(body: PaymentBody) {
-    // A fix may set an application to 0: the API wants only real applications.
-    const clean: PaymentBody = {
-      ...body,
-      applications: body.applications.filter((a) => Number(a.amountApplied) > 0 || Number(a.discountAmount ?? 0) > 0),
-      journalItems: body.journalItems.filter((j) => Number(j.amount) > 0),
-    };
+    const clean = cleanPaymentBody(body);
     setSaving(true);
     try {
       if (editing) {
@@ -713,8 +734,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     for (const [k, a] of body.applications.entries()) {
       const inv = visibleInvoices.find((i) => i.id === a.invoiceId);
       if (!inv) continue;
-      const other = Number(a.discountAmount ?? 0) + creditOn(inv.id);
-      if (Number(a.amountApplied) + other > Number(inv.balanceDue) + 0.005) {
+      const onInvoice = [a.amountApplied, a.discountAmount ?? 0, ...creditPartsOn(inv.id)];
+      if (sumMoney(onInvoice).greaterThan(dec(inv.balanceDue))) {
         fixer.offer(
           {
             title: 'More than the invoice owes',
@@ -723,7 +744,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           overAppliedFixes({
             path: `applications.${k}.amountApplied`,
             balanceDue: inv.balanceDue,
-            otherApplied: (Number(a.discountAmount ?? 0) + creditOn(inv.id)).toFixed(2),
+            otherApplied: [a.discountAmount ?? 0, ...creditPartsOn(inv.id)],
             label: `invoice #${invNo(inv)}`,
           }),
           ctx,
@@ -734,7 +755,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     for (const [k, j] of body.journalItems.entries()) {
       const c = shownCharges.find((x) => x.journalLineId === j.journalLineId);
       if (!c) continue;
-      if (Number(j.amount) + creditOn(JE_PREFIX + c.journalLineId) > Number(c.open) + 0.005) {
+      if (sumMoney([j.amount, ...creditPartsOn(JE_PREFIX + c.journalLineId)]).greaterThan(dec(c.open))) {
         fixer.offer(
           {
             title: 'More than what is still open',
@@ -743,7 +764,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           overAppliedFixes({
             path: `journalItems.${k}.amount`,
             balanceDue: c.open,
-            otherApplied: creditOn(JE_PREFIX + c.journalLineId).toFixed(2),
+            otherApplied: creditPartsOn(JE_PREFIX + c.journalLineId),
             label: c.ref,
           }),
           ctx,
@@ -813,7 +834,13 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       // C4: earlier unapplied payments, on a new payment AND while editing (no longer dropped).
       paymentCredits: paymentCreditApps,
     };
-    const ctx: FixContext<PaymentBody> = { payload: body, resubmit: send, applyToForm, fallback: 'Failed to save payment' };
+    const ctx: FixContext<PaymentBody> = {
+      payload: cleanPaymentBody(body),
+      resubmit: send,
+      prepare: cleanPaymentBody,
+      applyToForm,
+      fallback: 'Failed to save payment',
+    };
     if (offerOverApplied(body, ctx)) return;
     if (!confirmTransactionDate(date, prefs)) return;
     try {

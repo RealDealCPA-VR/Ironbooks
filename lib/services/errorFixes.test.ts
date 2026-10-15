@@ -23,7 +23,7 @@ import { type ServiceContext, ServiceError } from './_base';
 import { createCompany } from './company';
 import { createManualEntry } from './journal';
 import { closePeriod, firstOpenDate } from './fiscalPeriods';
-import { createInvoice } from './invoices';
+import { createInvoice, updateInvoice, voidInvoice } from './invoices';
 import { receivePayment } from './payments';
 import { createDeposit } from './deposits';
 import { createExpense } from './expenses';
@@ -141,6 +141,37 @@ describe('error fixes (server-side)', () => {
     const entry = await createManualEntry(ctx, { ...moved, date: new Date(moved.date) });
     expect(entry.id).toBeTruthy();
     await setSettings({ closingDate: null });
+  });
+
+  it('editing/voiding a transaction whose ORIGINAL date is closed: no "move the date" fix', async () => {
+    // Closing date: only the password can unlock the original entry.
+    const input = { customerId, date: new Date('2026-01-10'), lines: [{ accountId: acct['4000'], quantity: 1, rate: '25.00' }] };
+    const inv = await createInvoice(ctx, input);
+    await setSettings({ closingDate: '2026-01-31' });
+    const edit = await caught(updateInvoice(ctx, inv.id, { ...input, date: new Date('2026-06-10') }));
+    expect(edit.code).toBe('PERIOD_CLOSED');
+    expect(edit.fixes?.map((f) => f.id)).toEqual(['period-password']);
+    const voided = await caught(voidInvoice(ctx, inv.id));
+    expect(voided.fixes?.map((f) => f.id)).toEqual(['period-password']);
+    // The password still works for the edit.
+    const ok = await updateInvoice({ ...ctx, closingDateOverride: true }, inv.id, {
+      ...input,
+      lines: [{ accountId: acct['4000'], quantity: 1, rate: '26.00' }],
+    });
+    expect(ok.total).toBe('26.00');
+    await setSettings({ closingDate: null });
+
+    // Closed fiscal period: reopen it (and still no "move the date").
+    const julInput = { ...input, date: new Date('2025-07-10') };
+    const jul = await createInvoice(ctx, julInput);
+    await closePeriod(ctx, { periodStart: new Date('2025-07-01'), periodEnd: new Date('2025-07-31') });
+    const julEdit = await caught(updateInvoice(ctx, jul.id, { ...julInput, date: new Date('2026-06-10') }));
+    expect(julEdit.code).toBe('PERIOD_CLOSED');
+    expect(julEdit.fixes?.map((f) => f.id)).toEqual(['period-reopen']);
+
+    // A NEW transaction dated in the closed period still gets the move fix.
+    const fresh = await caught(createInvoice(ctx, julInput));
+    expect(fresh.fixes?.map((f) => f.id)).toContain('period-move-date');
   });
 
   it('duplicate invoice number: next free number or keep it', async () => {

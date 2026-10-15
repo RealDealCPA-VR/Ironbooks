@@ -208,7 +208,7 @@ export async function voidInventoryTransfer(ctx: ServiceContext, id: string) {
   return inTransaction(ctx, async (tx) => {
     const transfer = await getInventoryTransfer(tx, id);
     if (transfer.status === 'void') return transfer;
-    await assertPeriodOpen(tx, transfer.date);
+    await assertPeriodOpen(tx, transfer.date, { movable: false });
     try {
       await reverseSourceMovements(tx, 'transfer', id);
     } catch (err) {
