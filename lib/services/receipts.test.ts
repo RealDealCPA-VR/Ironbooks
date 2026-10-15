@@ -21,6 +21,7 @@ import { listAttachments, listUnfiledAttachments, updateAttachment } from './att
 import type { ServiceContext } from './_base';
 import {
   deleteReceipt,
+  effectiveReceiptStatus,
   extractReceipt,
   getReceipt,
   listReceipts,
@@ -203,6 +204,46 @@ describe('receipt capture (integration)', () => {
       const r = await extractReceipt(t.ctx, up.id);
       expect(r).toMatchObject({ status: 'failed', method: 'none', total: null });
       expect(r.message).toMatch(/not installed/);
+    });
+
+    it('a read abandoned mid-way (app closed during OCR) is offered again and finishes', async () => {
+      setOcrEngineForTests({ recognize: async () => RECEIPT_TEXT });
+      const r = await uploadReceipt(t.ctx, { filename: 'photo.jpg', bytes: jpegBytes() });
+      const old = new Date(Date.now() - 10 * 60_000);
+      await t.db
+        .update(receiptScans)
+        .set({ status: 'processing', processingStartedAt: old, updatedAt: old })
+        .where(eq(receiptScans.id, r.id));
+      // Shown as waiting, so the inbox and the review page ask to read it again...
+      expect((await getReceipt(t.ctx, r.id)).status).toBe('pending');
+      expect((await listReceipts(t.ctx)).find((x) => x.id === r.id)?.status).toBe('pending');
+      // ...and a plain (not forced) read reclaims the abandoned claim and finishes it.
+      const done = await extractReceipt(t.ctx, r.id);
+      expect(done.status).toBe('ready');
+      expect(done.total).toBe('22.79');
+    });
+
+    it('a receipt being read right now is left alone', async () => {
+      let calls = 0;
+      setOcrEngineForTests({ recognize: async () => (calls++, RECEIPT_TEXT) });
+      const r = await uploadReceipt(t.ctx, { filename: 'photo.jpg', bytes: jpegBytes() });
+      const now = new Date();
+      await t.db
+        .update(receiptScans)
+        .set({ status: 'processing', processingStartedAt: now, updatedAt: now })
+        .where(eq(receiptScans.id, r.id));
+      expect((await getReceipt(t.ctx, r.id)).status).toBe('processing');
+      expect((await extractReceipt(t.ctx, r.id)).status).toBe('processing');
+      expect(calls).toBe(0);
+    });
+
+    it('effectiveReceiptStatus: only a processing claim older than 3 minutes counts as abandoned', () => {
+      const now = new Date('2026-10-15T12:00:00Z');
+      const ago = (min: number) => new Date(now.getTime() - min * 60_000);
+      expect(effectiveReceiptStatus({ status: 'processing', processingStartedAt: ago(2), updatedAt: ago(2) }, now)).toBe('processing');
+      expect(effectiveReceiptStatus({ status: 'processing', processingStartedAt: ago(4), updatedAt: ago(1) }, now)).toBe('pending');
+      expect(effectiveReceiptStatus({ status: 'processing', processingStartedAt: null, updatedAt: ago(5) }, now)).toBe('pending');
+      expect(effectiveReceiptStatus({ status: 'ready', processingStartedAt: ago(60), updatedAt: ago(60) }, now)).toBe('ready');
     });
 
     it('an OCR failure is reported, not thrown', async () => {

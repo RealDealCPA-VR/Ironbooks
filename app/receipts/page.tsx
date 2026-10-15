@@ -78,7 +78,8 @@ export default function ReceiptsPage() {
   }, [load]);
 
   // Read any receipt still waiting (e.g. sent from a phone while the app was busy), and poll
-  // while something is being read.
+  // while something is being read. A read abandoned mid-way (app closed during OCR) comes back
+  // from the server as 'pending' after a few minutes (effectiveReceiptStatus), so it is retried here.
   useEffect(() => {
     if (!rows) return;
     for (const r of rows) {

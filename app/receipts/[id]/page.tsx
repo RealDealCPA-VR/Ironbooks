@@ -127,6 +127,7 @@ export default function ReviewReceiptPage() {
   }, [load]);
 
   // Still being read: ask to read it now (no-op when someone else is already reading) and poll.
+  // An abandoned read is reported as 'pending' by the server (effectiveReceiptStatus), so it restarts.
   useEffect(() => {
     if (!receipt || (receipt.status !== 'pending' && receipt.status !== 'processing')) return;
     let cancelled = false;

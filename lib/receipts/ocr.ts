@@ -58,6 +58,12 @@ let queue: Promise<unknown> = Promise.resolve();
 
 async function loadTesseract(): Promise<TesseractModule | null> {
   try {
+    // Typed through the local TesseractModule above. The ignore covers only this line, for a
+    // checkout that hasn't run `npm install` since tesseract.js was added (no ambient
+    // `declare module` stub, which would hide the package's own types everywhere once installed);
+    // at runtime a missing package lands in the catch and OCR reports itself unavailable.
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore TS2307 until tesseract.js is installed
     const mod = (await import('tesseract.js')) as unknown as { default?: TesseractModule } & TesseractModule;
     return typeof mod.createWorker === 'function' ? mod : (mod.default ?? null);
   } catch {

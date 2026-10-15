@@ -72,7 +72,7 @@ export default function MobileReceiptUploadPage() {
         const body = await res.json().catch(() => null);
         if (!res.ok) {
           update({ state: 'error', error: body?.error ?? `Not sent (${res.status}).` });
-          if (res.status === 410 || res.status === 404 || res.status === 403) {
+          if (res.status === 410 || res.status === 404 || res.status === 403 || res.status === 423) {
             setProblem(body?.error ?? 'This link does not work any more.');
             break;
           }

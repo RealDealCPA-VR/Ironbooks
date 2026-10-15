@@ -14,6 +14,7 @@ import { MOBILE_MAX_BYTES } from '@/lib/receipts/files';
 import { setOcrEngineForTests } from '@/lib/receipts/ocr';
 import { createCompany } from './company';
 import { updateSettings } from './aiSettings';
+import { removeFilePassword, setFilePassword } from './fileLock';
 import {
   createUploadToken,
   extractReceipt,
@@ -23,6 +24,7 @@ import {
   listUploadTokens,
   revokeUploadToken,
   setReceiptSettings,
+  setServerStartedAtForTests,
   uploadLinkStatus,
   uploadReceipt,
   uploadWithToken,
@@ -166,6 +168,49 @@ describe('receipt capture: phone upload links (integration)', () => {
 
   it('view-only members cannot make links', async () => {
     await expect(createUploadToken({ ...t.ctx, role: 'viewer' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+
+  describe('company-file password (the phone has no unlock cookie)', () => {
+    afterEach(async () => {
+      setServerStartedAtForTests(undefined);
+      await removeFilePassword(t.db, 'file-pass-123').catch(() => {});
+    });
+
+    it('a link made before the app was restarted is refused while the file has a password', async () => {
+      const before = await createUploadToken(t.ctx, { maxUploads: 3 });
+      await setFilePassword(t.db, 'file-pass-123');
+      // The app restarts: the file is locked again until someone opens it on the computer.
+      setServerStartedAtForTests(new Date(Date.now() + 1000));
+      await expect(uploadLinkStatus(t.db, before.token)).rejects.toMatchObject({ problem: 'locked' });
+      await expect(uploadWithToken(t.db, before.token, file())).rejects.toMatchObject({ problem: 'locked' });
+      // Nothing was added and no upload was used up.
+      const [row] = await t.db.select().from(receiptUploadTokens).where(eq(receiptUploadTokens.id, before.id));
+      expect(row.uploadCount).toBe(0);
+
+      const gotStatus = await linkGET(new NextRequest(`http://localhost/api/receipts/mobile/${before.token}`), params(before.token));
+      expect(gotStatus.status).toBe(423);
+      expect((await gotStatus.json()).error).toMatch(/Open the company on your computer first/);
+      const posted = await linkPOST(await toNextRequest(multipart(before.token, png())), params(before.token));
+      expect(posted.status).toBe(423);
+      expect((await t.db.select().from(receiptUploadTokens).where(eq(receiptUploadTokens.id, before.id)))[0].uploadCount).toBe(0);
+
+      // Once the company is opened again (unlocked to make a new link), the new link works.
+      setServerStartedAtForTests(new Date(Date.now() - 1000));
+      const fresh = await createUploadToken(t.ctx);
+      await expect(uploadWithToken(t.db, fresh.token, file())).resolves.toMatchObject({ remaining: fresh.maxUploads - 1 });
+    });
+
+    it('without a file password a restart does not cut off a live link', async () => {
+      const link = await createUploadToken(t.ctx);
+      setServerStartedAtForTests(new Date(Date.now() + 1000));
+      await expect(uploadLinkStatus(t.db, link.token)).resolves.toMatchObject({ remaining: link.maxUploads });
+    });
+
+    it('a link made in this launch keeps working with a file password set', async () => {
+      await setFilePassword(t.db, 'file-pass-123');
+      const link = await createUploadToken(t.ctx);
+      await expect(uploadWithToken(t.db, link.token, file())).resolves.toMatchObject({ remaining: link.maxUploads - 1 });
+    });
   });
 
   describe('the public route /api/receipts/mobile/[token]', () => {

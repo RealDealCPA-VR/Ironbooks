@@ -76,6 +76,7 @@ import { createBill } from './bills';
 import { createVendor } from './vendors';
 import { vendorPrefill } from './aiCategorizer';
 import { buildProviders, loadSettings } from './aiSettings';
+import { getFileLockStatus } from './fileLock';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -210,6 +211,22 @@ const viewColumns = {
   sizeBytes: attachments.sizeBytes,
 };
 
+/**
+ * The status a receipt is shown with. A 'processing' claim older than STALE_PROCESSING_MS was
+ * abandoned (the app closed or the server stopped mid-read): it is reported as 'pending', so the
+ * inbox and the review page ask to read it again (extractReceipt reclaims stale claims) instead
+ * of showing "being read" forever.
+ */
+export function effectiveReceiptStatus(
+  scan: Pick<typeof receiptScans.$inferSelect, 'status' | 'processingStartedAt' | 'updatedAt'>,
+  now: Date = new Date(),
+): ReceiptStatus {
+  const status = scan.status as ReceiptStatus;
+  if (status !== 'processing') return status;
+  const startedAt = scan.processingStartedAt ?? scan.updatedAt;
+  return startedAt.getTime() < now.getTime() - STALE_PROCESSING_MS ? 'pending' : 'processing';
+}
+
 function toView(r: { scan: typeof receiptScans.$inferSelect; filename: string; mimeType: string | null; sizeBytes: number | null }): ReceiptView {
   const s = r.scan;
   return {
@@ -219,7 +236,7 @@ function toView(r: { scan: typeof receiptScans.$inferSelect; filename: string; m
     mimeType: r.mimeType,
     sizeBytes: r.sizeBytes,
     source: s.source === 'phone' ? 'phone' : 'desktop',
-    status: s.status as ReceiptStatus,
+    status: effectiveReceiptStatus(s),
     method: (s.method as ReceiptMethod | null) ?? null,
     message: s.message,
     vendorName: s.vendorName,
@@ -477,7 +494,13 @@ export async function extractReceipt(
   const staleBefore = new Date(Date.now() - STALE_PROCESSING_MS);
   const claimable = or(
     inArray(receiptScans.status, opts.force ? ['pending', 'failed', 'ready'] : ['pending', 'failed']),
-    and(eq(receiptScans.status, 'processing'), lt(receiptScans.processingStartedAt, staleBefore)),
+    and(
+      eq(receiptScans.status, 'processing'),
+      or(
+        lt(receiptScans.processingStartedAt, staleBefore),
+        and(isNull(receiptScans.processingStartedAt), lt(receiptScans.updatedAt, staleBefore)),
+      ),
+    ),
   );
   const [claimed] = await ctx.db
     .update(receiptScans)
@@ -896,7 +919,7 @@ export async function revokeUploadToken(ctx: ServiceContext, id: string): Promis
   });
 }
 
-export type TokenProblem = 'invalid' | 'expired' | 'used_up' | 'revoked' | 'not_allowed';
+export type TokenProblem = 'invalid' | 'expired' | 'used_up' | 'revoked' | 'not_allowed' | 'locked';
 
 export class UploadTokenError extends ServiceError {
   constructor(public readonly problem: TokenProblem) {
@@ -910,7 +933,28 @@ const TOKEN_MESSAGES: Record<TokenProblem, string> = {
   used_up: 'This upload link has been used for as many receipts as it allows. Make a new one on the Receipts page.',
   revoked: 'This upload link was turned off. Make a new one on the Receipts page.',
   not_allowed: 'The person who made this link can no longer add receipts to this company.',
+  locked: 'Open the company on your computer first, then make a new upload link on the Receipts page.',
 };
+
+/**
+ * When this server process started. The company-file password (lib/services/fileLock.ts) has to
+ * be entered again on every launch, and a phone link has no unlock cookie of its own — so with a
+ * file password set, only links made since this launch (i.e. after the file was unlocked again)
+ * work. A link made before a restart can't add files to a file that is locked again.
+ */
+let serverStartedAt = new Date(Date.now() - Math.floor(process.uptime() * 1000));
+
+/** Tests only: pretend the server started at `at` (undefined restores the real start time). */
+export function setServerStartedAtForTests(at: Date | undefined): void {
+  serverStartedAt = at ?? new Date(Date.now() - Math.floor(process.uptime() * 1000));
+}
+
+/** 'locked' when the file has a password and the link predates this launch. */
+async function lockProblem(db: DB, row: TokenRow): Promise<TokenProblem | null> {
+  if (row.createdAt.getTime() >= serverStartedAt.getTime()) return null;
+  const lock = await getFileLockStatus(db);
+  return lock.enabled ? 'locked' : null;
+}
 
 type TokenRow = typeof receiptUploadTokens.$inferSelect;
 
@@ -950,7 +994,7 @@ export interface UploadLinkStatus {
 /** What the phone page shows: which company, how long, how many uploads are left. */
 export async function uploadLinkStatus(db: DB, token: string, now: Date = new Date()): Promise<UploadLinkStatus> {
   const row = await findToken(db, token);
-  const problem = problemOf(row, now);
+  const problem = problemOf(row, now) ?? (await lockProblem(db, row!));
   if (problem) throw new UploadTokenError(problem);
   await tokenContext(db, row!);
   const [company] = await db.select({ name: companies.name }).from(companies).where(eq(companies.id, row!.companyId));
@@ -975,7 +1019,7 @@ export async function uploadWithToken(
   now: Date = new Date(),
 ): Promise<{ receipt: ReceiptView; remaining: number; ctx: ServiceContext }> {
   const row = await findToken(db, token);
-  const problem = problemOf(row, now);
+  const problem = problemOf(row, now) ?? (await lockProblem(db, row!));
   if (problem) throw new UploadTokenError(problem);
   try {
     checkReceiptFile(file, { maxBytes: MOBILE_MAX_BYTES });

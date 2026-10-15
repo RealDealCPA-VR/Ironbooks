@@ -10,6 +10,10 @@
  * reads data back (the answer is only "received" and how many uploads are left). Invalid or
  * expired tokens count against the caller's address (lib/net/rateLimit.ts) so tokens can't be
  * guessed; files are checked by their bytes and size (lib/receipts/files.ts).
+ *
+ * Company-file password: this route has no unlock cookie, so when the file has a password a link
+ * made before the app was last started is refused (423 'locked') until the company is opened on
+ * the computer again and a new link is made (lib/services/receipts.ts lockProblem).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
@@ -46,8 +50,10 @@ async function guard(): Promise<{ keys: string[]; blocked: NextResponse | null }
 
 function answerError(err: unknown, keys: string[], tag: string): NextResponse {
   if (err instanceof UploadTokenError) {
-    limiter().recordFailure(keys);
-    const status = err.problem === 'invalid' ? 404 : err.problem === 'not_allowed' ? 403 : 410;
+    // 'locked' means a real link for a company file that was closed since: not a guess.
+    if (err.problem !== 'locked') limiter().recordFailure(keys);
+    const status =
+      err.problem === 'invalid' ? 404 : err.problem === 'not_allowed' ? 403 : err.problem === 'locked' ? 423 : 410;
     return NextResponse.json({ error: err.message, code: err.problem }, { status, headers: HEADERS });
   }
   const res = routeError(err, tag);
