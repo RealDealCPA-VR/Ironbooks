@@ -9,6 +9,10 @@ describe("Accountant's Copy route gate", () => {
       '/api/journal-entries',
       '/api/journal-entries/abc/reverse',
       '/api/expenses/abc',
+      '/api/transfers',
+      '/api/transfers/abc',
+      '/api/deposits',
+      '/api/deposits/abc',
       '/api/accounts/abc',
       '/api/classes',
       '/api/accountant-copy/changes',
@@ -20,16 +24,18 @@ describe("Accountant's Copy route gate", () => {
   });
 
   it('refuses saves that could not be sent back to the client', () => {
-    for (const p of ['/api/invoices', '/api/payments', '/api/bills/abc', '/api/customers', '/api/merge', '/api/preferences', '/api/accountant/reclassify', '/api/journal-entriesX']) {
+    for (const p of ['/api/invoices', '/api/payments', '/api/bills/abc', '/api/customers', '/api/merge', '/api/preferences', '/api/accountant/reclassify', '/api/journal-entriesX', '/api/payments/journal-items', '/api/bill-payments/journal-items', '/api/inventory-transfers']) {
       expect(accountantCopyAllowsApi(p), p).toBe(false);
     }
   });
 
-  it('only General Journal entries, reversals and checks / expenses may post in the copy', () => {
+  it('only General Journal entries, reversals, checks / expenses, transfers and deposits may post in the copy', () => {
     expect(accountantMayPost(null)).toBe(true);
     expect(accountantMayPost('manual')).toBe(true);
     expect(accountantMayPost('reversal:1')).toBe(true);
     expect(accountantMayPost('expense:1')).toBe(true);
+    expect(accountantMayPost('deposit:1')).toBe(true);
+    expect(accountantMayPost('deposit:pending')).toBe(true);
     expect(accountantMayPost('invoice:1')).toBe(false);
     expect(accountantMayPost('payment:1')).toBe(false);
     expect(accountantMayPost('condense:1')).toBe(false);

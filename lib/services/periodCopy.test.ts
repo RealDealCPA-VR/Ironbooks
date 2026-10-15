@@ -9,7 +9,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq, gt } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accountantCopies, accounts, auditLogs, companies, expenses, invoices, journalEntries, paymentsReceived, users } from '@/lib/db/schema';
+import { accountantCopies, accounts, auditLogs, companies, expenses, inventoryLayers, invoices, items, journalEntries, paymentsReceived, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createCustomer } from './customers';
@@ -22,6 +22,9 @@ import { trialBalance } from './reports';
 import { restorePortableCompanyFile } from './portableFile';
 import { createPeriodCopy } from './periodCopy';
 import { accountantCopyStatus, createAccountantCopy } from './accountantCopy/client';
+import { createItem } from './items';
+import { createSite, ensureDefaultSite, siteQuantities } from './inventorySites';
+import { adjustQuantityAtSite } from './inventorySiteOps';
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-period-copy');
 const SRC = path.join(ROOT, 'source');
@@ -35,6 +38,9 @@ let db: DB;
 let ctx: ServiceContext;
 const acct: Record<string, string> = {};
 let rangeInvoiceId: string;
+let fifoItemId: string;
+let avgItemId: string;
+let eastSiteId: string;
 let copyDb: DB;
 let cctx: ServiceContext;
 
@@ -74,6 +80,21 @@ describe('Period Copy', () => {
     await createManualEntry(ctx, je('2026-02-01', acct['6300'], acct['1000'], '125.50', 'February supplies'));
     rangeInvoiceId = (await createInvoice(ctx, { customerId, date: d('2026-02-10'), lines: [{ description: 'February work', quantity: 1, rate: '500' }] })).id;
     await createExpense(ctx, { vendorId, date: d('2026-03-05'), method: 'check', paymentAccountId: acct['1000'], lines: [{ accountId: acct['6000'], amount: '60.00' }] });
+
+    // Inventory: stocked in the period (FIFO item at two sites, an average-cost item).
+    await ensureDefaultSite(ctx);
+    eastSiteId = (await createSite(ctx, { name: 'East Store' })).id;
+    fifoItemId = (await createItem(ctx, { name: 'Widget', type: 'inventory', incomeAccountId: acct['4000'] })).id;
+    avgItemId = (await createItem(ctx, { name: 'Gadget', type: 'inventory', incomeAccountId: acct['4000'] })).id;
+    await adjustQuantityAtSite(ctx, { itemId: fifoItemId, quantityChange: 10, unitCost: 5, date: d('2026-02-05'), costing: 'fifo' });
+    await adjustQuantityAtSite(ctx, { itemId: fifoItemId, quantityChange: 4, unitCost: 6, date: d('2026-02-06'), siteId: eastSiteId });
+    await adjustQuantityAtSite(ctx, { itemId: avgItemId, quantityChange: 8, unitCost: 3, date: d('2026-02-07') });
+    // ...sold, adjusted and restocked after it.
+    await createInvoice(ctx, { customerId, date: d('2026-04-10'), lines: [{ itemId: fifoItemId, quantity: 3, rate: 20 }, { itemId: avgItemId, quantity: 2, rate: 9 }] });
+    await adjustQuantityAtSite(ctx, { itemId: fifoItemId, quantityChange: -1, date: d('2026-04-12'), siteId: eastSiteId });
+    await adjustQuantityAtSite(ctx, { itemId: fifoItemId, quantityChange: 5, unitCost: 7, date: d('2026-04-20') });
+    // A dearer restock of the average-cost item moves its average cost after the period.
+    await adjustQuantityAtSite(ctx, { itemId: avgItemId, quantityChange: 2, unitCost: 9, date: d('2026-04-22') });
 
     // After the period: pays the February invoice, more activity.
     await receivePayment(ctx, { customerId, date: d('2026-04-05'), method: 'check', amount: '500', depositAccountId: acct['1000'], applications: [{ invoiceId: rangeInvoiceId, amountApplied: '500' }] });
@@ -154,6 +175,30 @@ describe('Period Copy', () => {
     // A/R in the copy = the open invoices on Mar 31 (500 February + 75 December).
     const tb = await trialBalance(cctx);
     expect(tb.rows.find((r) => r.code === '1200')?.debit).toBe('575.00');
+  });
+
+  it('inventory reads as of the end date: on-hand, per-site quantities and FIFO layers before the later sales', async () => {
+    // The original moved on: 10 + 4 - 3 - 1 + 5 = 15 Widgets, 8 - 2 + 2 = 8 Gadgets at (6x3 + 2x9) / 8 = 4.50.
+    const [orig] = await db.select().from(items).where(eq(items.id, fifoItemId));
+    expect(orig.quantityOnHand).toBe('15.0000');
+    const [origG] = await db.select().from(items).where(eq(items.id, avgItemId));
+    expect(origG.averageCost).toBe('4.5000');
+    const [w] = await copyDb.select().from(items).where(eq(items.id, fifoItemId));
+    const [g] = await copyDb.select().from(items).where(eq(items.id, avgItemId));
+    expect(w.quantityOnHand).toBe('14.0000');
+    expect(g.quantityOnHand).toBe('8.0000');
+    expect(g.averageCost).toBe('3.0000');
+    const layers = await copyDb.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, fifoItemId));
+    expect(layers.map((l) => [l.unitCost, l.quantityRemaining]).sort()).toEqual([
+      ['5.0000', '10.0000'],
+      ['6.0000', '4.0000'],
+    ]);
+    // The original: 3 left East (4 - 1), the rest at the default site.
+    expect((await siteQuantities(ctx, [fifoItemId])).get(fifoItemId)!.get(eastSiteId)?.toFixed(4)).toBe('3.0000');
+    const sites = (await siteQuantities(cctx, [fifoItemId])).get(fifoItemId)!;
+    expect(sites.get(eastSiteId)?.toFixed(4)).toBe('4.0000');
+    const total = [...sites.values()].reduce((s, q) => s + Number(q), 0);
+    expect(total).toBe(14);
   });
 
   it("works while an Accountant's Copy is out, and the auditor's copy does not inherit it", async () => {

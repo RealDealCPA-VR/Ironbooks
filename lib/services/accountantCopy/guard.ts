@@ -11,8 +11,8 @@
  *      - work AFTER the dividing date carries on as usual.
  *  - ACCOUNTANT file (side 'accountant'): the opposite date rule — only transactions dated ON OR
  *    BEFORE the dividing date — and only the kinds of change the changes file (.ibcx) can carry
- *    back: General Journal entries, checks / expenses, chart-of-accounts edits and new accounts
- *    and classes. Other saves are refused before they run by the route gate (routeGate.ts).
+ *    back: General Journal entries, checks / expenses, transfers, deposits, chart-of-accounts
+ *    edits and new accounts and classes. Other saves are refused before they run by the route gate (routeGate.ts).
  *
  * The closing-date password never bypasses the dividing date. The only bypass is the client's
  * own import of the accountant's changes (runAccountantImport), which re-applies them through the
@@ -93,10 +93,31 @@ function importing(copy: ActiveCopy): boolean {
 // Dividing date
 // ---------------------------------------------------------------------------
 
-/** Ledger sources an accountant may post in an Accountant's Copy (what the changes file carries). */
+/**
+ * Ledger sources an accountant may post in an Accountant's Copy (what the changes file carries):
+ * General Journal entries and reversals, checks / expenses, deposits, and transfers (which post
+ * without a source, like a General Journal entry).
+ */
 export function accountantMayPost(sourceRef: string | null): boolean {
   if (sourceRef === null || sourceRef === 'manual') return true;
-  return sourceRef.startsWith('reversal:') || sourceRef.startsWith('expense:');
+  return sourceRef.startsWith('reversal:') || sourceRef.startsWith('expense:') || sourceRef.startsWith('deposit:');
+}
+
+/**
+ * Accountant side: applying a General Journal A/R or A/P line to an invoice, bill or another
+ * journal line (journal_item_applications) can't be sent back in the changes file, so it is
+ * refused in the copy. The route gate already refuses the screens that do it; this covers every
+ * other caller of the service.
+ */
+export async function assertAccountantMayApplyJournalItems(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<void> {
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (!copy || copy.side !== 'accountant') return;
+  throw new ServiceError(
+    'FORBIDDEN',
+    "Applying a journal entry line to an invoice, bill or another journal line can't be done in an Accountant's Copy because it can't be sent back to your client. " +
+      'Note it for your client in the changes file.',
+    { accountantCopy: true, side: copy.side },
+  );
 }
 
 export function dividingDateError(copy: ActiveCopy): ServiceError {
@@ -139,7 +160,7 @@ export async function assertDividingDateOpen(
     throw new ServiceError(
       'FORBIDDEN',
       "This kind of transaction can't be entered in an Accountant's Copy because it can't be sent back to your client. " +
-        'You can make journal entries, write or edit checks and expenses, and add or edit accounts and classes.',
+        'You can make journal entries, write or edit checks and expenses, transfers and deposits, and add or edit accounts and classes.',
       { accountantCopy: true, side: copy.side, sourceRef: opts.sourceRef },
     );
   }

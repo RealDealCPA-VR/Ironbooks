@@ -79,10 +79,25 @@ interface Review {
 }
 interface TxnChange {
   op: 'add' | 'edit' | 'void';
-  type: 'journal_entry' | 'expense';
+  type: 'journal_entry' | 'expense' | 'transfer' | 'deposit';
   id: string;
-  after?: { date: string; description?: string; payeeName?: string | null; total?: string; lines: Array<{ debit?: string | null; amount?: string }> };
+  after?: {
+    date: string;
+    description?: string;
+    payeeName?: string | null;
+    memo?: string | null;
+    total?: string;
+    amount?: string;
+    lines?: Array<{ debit?: string | null; amount?: string }>;
+  };
 }
+
+const TXN_KIND: Record<TxnChange['type'], string> = {
+  journal_entry: 'Journal entry',
+  expense: 'Check / expense',
+  transfer: 'Transfer',
+  deposit: 'Deposit',
+};
 interface AccountantChanges {
   copy: { dividingDate: string; openedAt: string | null; exportedAt: string | null; exportCount: number; note: string | null };
   accounts: Array<{ op: 'add' | 'edit'; id: string; after: { code: string; name: string } }>;
@@ -486,7 +501,7 @@ function OpenTransferFile() {
         </h2>
         <p className="mt-1 max-w-2xl text-sm text-navy/60">
           Opening an <span className="font-mono">.ibac</span> file creates a <strong>new</strong> company file next to this one (this file is not
-          changed). In it you can make journal entries, write or fix checks and expenses, and add or edit accounts and classes — all dated on
+          changed). In it you can make journal entries, write or fix checks and expenses, transfers and deposits, and add or edit accounts and classes — all dated on
           or before the dividing date. Then you save a changes file for your client.
         </p>
         <Button className="mt-4" variant="secondary" onClick={() => inputRef.current?.click()} loading={busy === 'inspect'}>
@@ -555,16 +570,18 @@ function OpenTransferFile() {
 }
 
 function describeTxn(t: TxnChange): string {
-  const what = t.type === 'journal_entry' ? 'Journal entry' : 'Check / expense';
+  const what = TXN_KIND[t.type] ?? 'Transaction';
   if (!t.after) return `${what} voided`;
-  const label = t.type === 'journal_entry' ? t.after.description : t.after.payeeName || 'check / expense';
+  const label =
+    t.type === 'journal_entry' ? t.after.description : t.type === 'expense' ? t.after.payeeName || 'check / expense' : t.after.memo || niceDate(t.after.date.slice(0, 10));
   return `${what}: ${label ?? ''}`;
 }
 
 function txnAmount(t: TxnChange): string {
   if (!t.after) return '';
-  if (t.type === 'expense') return formatCurrency(Money.abs(t.after.total ?? '0'));
-  return formatCurrency(toAmountString(Money.add(...t.after.lines.map((l) => l.debit ?? 0))));
+  if (t.type === 'expense' || t.type === 'deposit') return formatCurrency(Money.abs(t.after.total ?? '0'));
+  if (t.type === 'transfer') return formatCurrency(t.after.amount ?? '0');
+  return formatCurrency(toAmountString(Money.add(...(t.after.lines ?? []).map((l) => l.debit ?? 0))));
 }
 
 function AccountantSide({ copy, closingDate }: { copy: CopyRow; closingDate: string | null }) {
@@ -607,7 +624,7 @@ function AccountantSide({ copy, closingDate }: { copy: CopyRow; closingDate: str
         <h2 className="text-lg font-bold text-navy">You are working in an Accountant&apos;s Copy</h2>
         <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-navy/70">
           <li>Dividing date: <strong>{niceDate(copy.dividingDate)}</strong>. You can only work on transactions dated on or before it.</li>
-          <li>You can make journal entries, write, fix or void checks and expenses, and add or edit accounts and classes. Other changes can&apos;t be sent back, so they are not available here.</li>
+          <li>You can make journal entries, write, fix or void checks and expenses, transfers and deposits, and add or edit accounts and classes. Other changes can&apos;t be sent back, so they are not available here.</li>
           {closingDate && <li>The client&apos;s closing date ({niceDate(closingDate)}) still applies; changes on or before it need the closing date password.</li>}
           <li>When you are done, save the changes file and send it to your client. You can save it again later if you make more changes.</li>
         </ul>

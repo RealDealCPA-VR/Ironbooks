@@ -9,7 +9,20 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accountantCopies, accounts, classes, expenses, expenseLines, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
+import {
+  accountantCopies,
+  accounts,
+  classes,
+  depositLines,
+  deposits,
+  expenses,
+  expenseLines,
+  journalEntries,
+  journalEntryLines,
+  journalItemApplications,
+  transfers,
+  users,
+} from '@/lib/db/schema';
 import type { ServiceContext } from '../_base';
 import { createCompany } from '../company';
 import { createAccount, updateAccount } from '../accounts';
@@ -19,6 +32,10 @@ import { createClass } from '../dimensions';
 import { createExpense, updateExpense, voidExpense } from '../expenses';
 import { createInvoice } from '../invoices';
 import { createManualEntry, updateEntry, voidEntry } from '../journal';
+import { createTransfer, updateTransfer, voidTransfer } from '../transfers';
+import { createDeposit, voidDeposit } from '../deposits';
+import { receivePayment } from '../payments';
+import { applyJournalCredit } from '../journalApplications';
 import { mergeAccounts } from '../merge';
 import { trialBalance } from '../reports';
 import { setClosingDate } from '../company';
@@ -45,6 +62,11 @@ let vendorId: string;
 let febEntryId: string;
 let febEntry2Id: string;
 let marchCheckId: string;
+let febTransferId: string;
+let febDepositId: string;
+let paymentBId: string;
+let aprilEntryId: string;
+let aprilTransferId: string;
 
 async function expectBalanced(c: ServiceContext) {
   const tb = await trialBalance(c);
@@ -93,6 +115,13 @@ describe("Accountant's Copy", () => {
         lines: [{ accountId: acct['6000'], amount: '50.00', description: 'Paper' }],
       })
     ).id;
+    febTransferId = (await createTransfer(ctx, { date: d('2026-02-10'), fromAccountId: acct['1000'], toAccountId: acct['1010'], amount: '200.00', memo: 'To savings' })).id;
+    // Two customer payments land in Undeposited Funds; the client deposits the first one.
+    const inv = await createInvoice(ctx, { customerId, date: d('2026-02-01'), lines: [{ description: 'February work', quantity: 1, rate: '500' }] });
+    const payA = await receivePayment(ctx, { customerId, date: d('2026-02-05'), method: 'check', reference: 'A-1', amount: '200.00', depositAccountId: acct['1050'], applications: [{ invoiceId: inv.id, amountApplied: '200.00' }] });
+    const payB = await receivePayment(ctx, { customerId, date: d('2026-02-06'), method: 'check', reference: 'B-2', amount: '300.00', depositAccountId: acct['1050'], applications: [{ invoiceId: inv.id, amountApplied: '300.00' }] });
+    paymentBId = payB.payment.id;
+    febDepositId = (await createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-02-08'), paymentIds: [payA.payment.id], memo: 'Feb deposit' })).id;
   });
 
   afterAll(async () => {
@@ -132,6 +161,11 @@ describe("Accountant's Copy", () => {
     // After the dividing date the client keeps working.
     const april = await createManualEntry(ctx, je('2026-04-05', acct['6300'], acct['1000'], '25.00', 'April supplies'));
     expect(april.status).toBe('posted');
+    aprilEntryId = april.id;
+    aprilTransferId = (await createTransfer(ctx, { date: d('2026-04-06'), fromAccountId: acct['1000'], toAccountId: acct['1010'], amount: '15.00' })).id;
+    // Transfers and deposits on or before the dividing date are locked too.
+    await expect(voidTransfer(ctx, febTransferId)).rejects.toMatchObject(locked);
+    await expect(voidDeposit(ctx, febDepositId)).rejects.toMatchObject(locked);
     await expectBalanced(ctx);
   });
 
@@ -179,6 +213,17 @@ describe("Accountant's Copy", () => {
     ).rejects.toMatchObject({ code: 'FORBIDDEN' });
     // No list deletes in the copy either.
     await expect(deactivateCustomer(actx, customerId)).rejects.toMatchObject({ code: 'CONFLICT' });
+    // Applying a General Journal A/R / A/P line can't be sent back, so it is refused in the copy
+    // (before anything is looked up) — on the client the same call is an ordinary not-found.
+    const noLine = '00000000-0000-4000-8000-000000000001';
+    const noInvoice = '00000000-0000-4000-8000-000000000002';
+    await expect(applyJournalCredit(actx, { journalLineId: noLine, invoiceId: noInvoice, amount: '1.00', date: d('2026-03-01') })).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+      details: expect.objectContaining({ accountantCopy: true }),
+    });
+    await expect(applyJournalCredit(ctx, { journalLineId: noLine, invoiceId: noInvoice, amount: '1.00', date: d('2026-04-20') })).rejects.not.toMatchObject({
+      code: 'FORBIDDEN',
+    });
     // Status of the original entry is untouched by the refused work.
     const [e] = await adb.select().from(journalEntries).where(eq(journalEntries.id, febEntryId));
     expect(e.status).toBe('posted');
@@ -213,19 +258,70 @@ describe("Accountant's Copy", () => {
       paymentAccountId: acct['1000'],
       lines: [{ accountId: acct['6300'], amount: '12.34', description: 'Pens' }],
     });
+    // Transfers and deposits: fix the February transfer, add one, void the client's deposit and
+    // deposit the other payment (with cash back) instead.
+    await updateTransfer(actx, febTransferId, { date: d('2026-02-10'), fromAccountId: acct['1000'], toAccountId: acct['1010'], amount: '250.00', memo: 'To savings (corrected)' });
+    await createTransfer(actx, { date: d('2026-03-30'), fromAccountId: acct['1010'], toAccountId: acct['1000'], amount: '75.00', memo: 'Back to checking' });
+    await voidDeposit(actx, febDepositId);
+    await createDeposit(actx, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-29'),
+      paymentIds: [paymentBId],
+      extraLines: [{ accountId: acct['3000'], amount: '5.00', description: 'Owner top-up' }],
+      cashBack: { accountId: acct['1010'], amount: '20.00', memo: 'Petty' },
+      memo: 'March deposit',
+    });
     await expectBalanced(actx);
 
     const changes = await accountantChanges(actx);
     expect(changes.accounts.map((a) => a.op)).toEqual(['add']);
     expect(changes.classes).toHaveLength(1);
     const kinds = changes.transactions.map((t) => `${t.type}:${t.op}`).sort();
-    expect(kinds).toEqual(['expense:add', 'expense:edit', 'journal_entry:add', 'journal_entry:edit', 'journal_entry:void']);
+    // The transfers' own entries travel as the transfers, never as journal entries.
+    expect(kinds).toEqual([
+      'deposit:add',
+      'deposit:void',
+      'expense:add',
+      'expense:edit',
+      'journal_entry:add',
+      'journal_entry:edit',
+      'journal_entry:void',
+      'transfer:add',
+      'transfer:edit',
+    ]);
+    const dep = changes.transactions.find((t) => t.type === 'deposit' && t.op === 'add');
+    expect(dep?.op === 'add' && dep.type === 'deposit' && dep.after).toMatchObject({
+      total: '285.00',
+      paymentIds: [paymentBId],
+      salesReceiptIds: [],
+      extraLines: [{ accountId: acct['3000'], amount: '5.00', description: 'Owner top-up' }],
+      cashBack: { accountId: acct['1010'], amount: '20.00', memo: 'Petty' },
+    });
     expect(changes.warnings).toEqual([]);
 
     const out = await exportChangesFile(actx, { note: 'Please review the audit accrual.' });
     expect(out.filename).toMatch(/\.ibcx$/);
-    expect(out.counts).toEqual({ accounts: 1, classes: 1, transactions: 5 });
+    expect(out.counts).toEqual({ accounts: 1, classes: 1, transactions: 9 });
     changesFile = out.buffer;
+  });
+
+  it('accountant: a journal line application that got into the copy is warned about (it is not carried back)', async () => {
+    const [line] = await adb
+      .select({ id: journalEntryLines.id, entryId: journalEntryLines.journalEntryId })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.description, 'Year-end audit fee accrual'), eq(journalEntryLines.accountId, acct['2000'])));
+    const [app] = await adb
+      .insert(journalItemApplications)
+      .values({ companyId: ctx.companyId, side: 'ap', kind: 'journal_offset', pairId: line.id, journalEntryId: line.entryId, journalLineId: line.id, amount: '1.00', date: d('2026-03-31') })
+      .returning();
+    try {
+      const changes = await accountantChanges(actx);
+      expect(changes.warnings.join(' ')).toMatch(/journal entry line application/);
+    } finally {
+      await adb.delete(journalItemApplications).where(eq(journalItemApplications.id, app.id));
+    }
+    expect((await accountantChanges(actx)).warnings).toEqual([]);
   });
 
   it('client: refuses a damaged changes file and one meant for another company file', async () => {
@@ -256,6 +352,26 @@ describe("Accountant's Copy", () => {
       broken((b) => { b.transactions.push(null as never); }),
       broken((b) => { (b.accounts[0] as { after: unknown }).after = {}; }),
       broken((b) => { (b.classes[0] as { name: unknown }).name = 42; }),
+      // Ids must be UUIDs (anything else reached a uuid query and crashed it).
+      broken((b) => { b.copyId = 'x'; }),
+      broken((b) => { b.companyId = 'not-a-uuid'; }),
+      broken((b) => { (b.transactions[0] as { id: string }).id = '42'; }),
+      broken((b) => {
+        const t = b.transactions.find((x) => x.type === 'journal_entry' && x.op !== 'void') as { after: { lines: Array<{ entityId: string | null }> } };
+        t.after.lines[0].entityId = 'nobody';
+      }),
+      broken((b) => { (b.transactions.find((x) => x.type === 'expense' && x.op !== 'void') as { after: { vendorId: unknown } }).after.vendorId = 'v1'; }),
+      // Money must be decimal strings.
+      broken((b) => { delete (b.transactions.find((x) => x.type === 'expense' && x.op !== 'void') as { after: { total?: unknown } }).after.total; }),
+      broken((b) => { (b.transactions.find((x) => x.type === 'expense' && x.op !== 'void') as { after: { total: unknown } }).after.total = 'lots'; }),
+      broken((b) => { (b.transactions.find((x) => x.type === 'expense' && x.op !== 'void') as { after: { lines: Array<{ amount: unknown }> } }).after.lines[0].amount = 12; }),
+      broken((b) => {
+        const t = b.transactions.find((x) => x.type === 'journal_entry' && x.op !== 'void') as { after: { lines: Array<{ debit: unknown; credit: unknown }> } };
+        const l = t.after.lines[0];
+        if (l.debit) l.debit = '1e5'; else l.credit = '1e5';
+      }),
+      broken((b) => { (b.transactions.find((x) => x.type === 'transfer' && x.op !== 'void') as { after: { amount: unknown } }).after.amount = null; }),
+      broken((b) => { (b.transactions.find((x) => x.type === 'deposit' && x.op !== 'void') as { after: { paymentIds: unknown } }).after.paymentIds = ['p1']; }),
     ];
     for (const file of cases) {
       await expect(reviewChangesFile(ctx, file)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/incomplete/) });
@@ -264,16 +380,51 @@ describe("Accountant's Copy", () => {
     expect((await accountantCopyStatus(ctx)).mode).toBe('client');
   });
 
+  it('client: a changes file that edits or voids client work dated after the dividing date is refused', async () => {
+    // A normal export never does this; the checksum is unkeyed, so a hand-made file could.
+    const { sha256: _s, ...body } = parseChangesFile(changesFile);
+    const [april] = await db.select().from(journalEntries).where(eq(journalEntries.id, aprilEntryId));
+    const [aprilTr] = await db.select().from(transfers).where(eq(transfers.id, aprilTransferId));
+    const craft = (t: (typeof body.transactions)[number]) => serializeChangesFile({ ...body, transactions: [...body.transactions, t] });
+    const files = [
+      craft({ op: 'void', type: 'journal_entry', id: aprilEntryId, baseVersion: april.updatedAt.toISOString() }),
+      craft({
+        op: 'edit',
+        type: 'journal_entry',
+        id: aprilEntryId,
+        baseVersion: april.updatedAt.toISOString(),
+        after: { date: d('2026-03-31').toISOString(), description: 'Moved', reference: null, isAdjusting: false, entryNumber: april.entryNumber, lines: [{ accountId: acct['6300'], debit: '1.00', credit: null, memo: null, classId: null, entityType: null, entityId: null }, { accountId: acct['1000'], debit: null, credit: '1.00', memo: null, classId: null, entityType: null, entityId: null }] },
+      }),
+      craft({ op: 'void', type: 'transfer', id: aprilTransferId, baseVersion: aprilTr.updatedAt.toISOString() }),
+    ];
+    for (const f of files) {
+      await expect(reviewChangesFile(ctx, f)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/dated after the dividing date/) });
+      await expect(importChangesFile(ctx, f)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/dated after the dividing date/) });
+    }
+    const [still] = await db.select().from(journalEntries).where(eq(journalEntries.id, aprilEntryId));
+    expect(still.status).toBe('posted');
+    const [stillTr] = await db.select().from(transfers).where(eq(transfers.id, aprilTransferId));
+    expect(stillTr.voidedAt).toBeNull();
+    expect((await accountantCopyStatus(ctx)).mode).toBe('client');
+  });
+
   it('client: reviews and imports the changes through the normal services, books stay balanced', async () => {
     const review = await reviewChangesFile(ctx, changesFile);
     expect(review.canImport).toBe(true);
     expect(review.note).toBe('Please review the audit accrual.');
-    expect(review.counts).toEqual({ added: 2, changed: 2, voided: 1, lists: 2 });
+    expect(review.counts).toEqual({ added: 4, changed: 3, voided: 2, lists: 2 });
     expect(review.items.find((i) => i.op === 'edit' && i.kind === 'Journal entry')?.before?.join(' ')).toMatch(/100\.00/);
+    const trEdit = review.items.find((i) => i.op === 'edit' && i.kind === 'Transfer');
+    expect(trEdit?.before?.join(' ')).toMatch(/200\.00/);
+    expect(trEdit?.after?.join(' ')).toMatch(/250\.00/);
+    const depAdd = review.items.find((i) => i.op === 'add' && i.kind === 'Deposit');
+    expect(depAdd?.amount).toBe('285.00');
+    expect(depAdd?.after?.join(' ')).toMatch(/Payment #B-2 — \$300\.00 \(Steady Customer\)/);
+    expect(review.items.find((i) => i.op === 'void' && i.kind === 'Deposit')?.before?.join(' ')).toMatch(/Payment #A-1/);
 
     const before = await trialBalance(ctx);
     const res = await importChangesFile(ctx, changesFile);
-    expect(res.applied).toEqual({ accounts: 1, classes: 1, added: 2, changed: 2, voided: 1 });
+    expect(res.applied).toEqual({ accounts: 1, classes: 1, added: 4, changed: 3, voided: 2 });
     expect(res.trialBalance.balanced).toBe(true);
     expect(before.balanced).toBe(true);
     await expectBalanced(ctx);
@@ -299,10 +450,25 @@ describe("Accountant's Copy", () => {
     expect(line.accountId).toBe(acct['6300']);
     const store = await db.select().from(expenses).where(and(eq(expenses.companyId, ctx.companyId), eq(expenses.payeeName, 'Corner Store')));
     expect(store).toHaveLength(1);
+    // Transfer edited in place (record-locked), new transfer added; no stray journal entries.
+    const [tr] = await db.select().from(transfers).where(eq(transfers.id, febTransferId));
+    expect(tr.amount).toBe('250.00');
+    expect(tr.memo).toBe('To savings (corrected)');
+    const back = await db.select().from(transfers).where(and(eq(transfers.companyId, ctx.companyId), eq(transfers.memo, 'Back to checking')));
+    expect(back).toHaveLength(1);
+    // Client deposit voided; payment B deposited with the extra line and cash back.
+    const [d1] = await db.select().from(deposits).where(eq(deposits.id, febDepositId));
+    expect(d1.voidedAt).not.toBeNull();
+    const [d2] = await db.select().from(deposits).where(and(eq(deposits.companyId, ctx.companyId), eq(deposits.memo, 'March deposit')));
+    expect(d2.total).toBe('285.00');
+    const d2Lines = await db.select().from(depositLines).where(eq(depositLines.depositId, d2.id));
+    expect(d2Lines.find((l) => l.paymentId)?.paymentId).toBe(paymentBId);
+    expect(d2Lines.find((l) => l.description?.startsWith('cashback:'))?.amount).toBe('-20.00');
 
     // Restriction lifted.
     expect((await accountantCopyStatus(ctx)).mode).toBe('none');
     await createManualEntry(ctx, je('2026-03-15', acct['6300'], acct['1000'], '10.00', 'Now allowed'));
+    await voidTransfer(ctx, febTransferId);
     await deactivateCustomer(ctx, customerId);
     // The same file can't be imported twice.
     await expect(importChangesFile(ctx, changesFile)).rejects.toMatchObject({ code: 'CONFLICT' });

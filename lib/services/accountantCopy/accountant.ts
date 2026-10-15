@@ -4,17 +4,19 @@
  *  - openAccountantCopyFile: restore a .ibac transfer file into a NEW company file (the Portable
  *    Company File restore, which verifies every table, the trial balance and the transaction
  *    log), then turn it into the accountant's working copy: the copy's row flips to side
- *    'accountant' and the version of every journal entry, check / expense, account and class is
- *    recorded as the baseline the changes are measured against.
+ *    'accountant' and the version of every journal entry, check / expense, transfer, deposit,
+ *    account and class is recorded as the baseline the changes are measured against.
  *  - accountantChanges: the delta made in the copy so far — derived from the audit trail /
  *    running transaction log (which entries were voided, replaced or added, and what replaced
  *    what) checked against the baseline versions. General Journal edits are void + re-post, so a
  *    chain "entry → its replacement → …" collapses into one change of the client's entry.
+ *    Transfers post a source-less entry like a General Journal entry; those entries travel as
+ *    the transfer, never as journal entries of their own.
  *  - exportChangesFile: the .ibcx the client imports.
  */
 import fs from 'node:fs';
 import AdmZip from 'adm-zip';
-import { and, asc, eq, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, isNotNull, sql } from 'drizzle-orm';
 import { closeDb, getDb } from '@/lib/db';
 import {
   accountantCopies,
@@ -23,9 +25,12 @@ import {
   auditLogs,
   classes,
   companies,
+  deposits,
   expenses,
   journalEntries,
   journalEntryLines,
+  journalItemApplications,
+  transfers,
   users,
 } from '@/lib/db/schema';
 import { dataDirOf } from '@/lib/db/txHooks';
@@ -35,6 +40,7 @@ import { type ServiceContext, ServiceError, validation, writeAudit } from '../_b
 import { getExpense } from '../expenses';
 import { defaultPortableRestoreDir, readPortableManifest, restorePortableCompanyFile } from '../portableFile';
 import { readAllTransactionLog, entityLabel } from '../transactionLog';
+import { depositPayloadOf, transferPayloadOf } from './client';
 import {
   CHANGES_EXTENSION,
   CHANGES_FORMAT_VERSION,
@@ -141,6 +147,10 @@ export async function openAccountantCopyFile(buffer: Buffer, targetDir: string):
         UNION ALL
         SELECT ${m.copyId}::uuid, 'expense', id, updated_at FROM expenses WHERE company_id = ${m.companyId}::uuid
         UNION ALL
+        SELECT ${m.copyId}::uuid, 'transfer', id, updated_at FROM transfers WHERE company_id = ${m.companyId}::uuid
+        UNION ALL
+        SELECT ${m.copyId}::uuid, 'deposit', id, updated_at FROM deposits WHERE company_id = ${m.companyId}::uuid
+        UNION ALL
         SELECT ${m.copyId}::uuid, 'account', id, edited_at FROM accounts WHERE company_id = ${m.companyId}::uuid
         UNION ALL
         SELECT ${m.copyId}::uuid, 'class', id, created_at FROM classes WHERE company_id = ${m.companyId}::uuid`);
@@ -207,10 +217,14 @@ function isGeneralJournal(sourceRef: string | null): boolean {
   return sourceRef === null || sourceRef === 'manual' || sourceRef.startsWith('reversal:');
 }
 
-/** Entity types that are business data but that the changes file can't carry (warned about). */
+/**
+ * Entity types that are business data but that the changes file can't carry (warned about).
+ * 'journal_item_application': applying a General Journal A/R or A/P line to an invoice, bill or
+ * another journal line — refused in the copy (guard.ts), listed here in case one gets through.
+ */
 const NOT_CARRIED = new Set([
   'invoice', 'bill', 'payment_received', 'bill_payment', 'sales_receipt', 'credit_memo', 'vendor_credit',
-  'deposit', 'transfer', 'paycheck', 'pay_run', 'item_receipt', 'purchase_order', 'sales_order', 'estimate',
+  'journal_item_application', 'paycheck', 'pay_run', 'item_receipt', 'purchase_order', 'sales_order', 'estimate',
   'inventory_transfer', 'inventory_layer', 'reconciliation', 'bank_transaction', 'time_entry', 'expense_report',
   'loan_payment', 'landed_cost_allocation', 'home_currency_adjustment', 'sales_tax_adjustment',
   'invoice_write_off', 'customer', 'vendor', 'item', 'employee', 'other_name', 'job', 'location', 'sales_rep',
@@ -361,10 +375,29 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
   }
 
   // ---- General Journal entries ----
+  // Entries a transfer posted (now or before an edit re-posted / a void reversed it) are carried
+  // by the transfer itself.
+  const transferEntryIds = new Set<string>();
+  for (const t of await ctx.db
+    .select({ id: transfers.postedEntryId })
+    .from(transfers)
+    .where(eq(transfers.companyId, ctx.companyId))) {
+    if (t.id) transferEntryIds.add(t.id);
+  }
+  for (const r of await ctx.db
+    .select({
+      a: sql<string | null>`${auditLogs.oldValues}->>'postedEntryId'`,
+      b: sql<string | null>`${auditLogs.newValues}->>'postedEntryId'`,
+    })
+    .from(auditLogs)
+    .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'transfer')))) {
+    if (r.a) transferEntryIds.add(r.a);
+    if (r.b) transferEntryIds.add(r.b);
+  }
   const txns: TxnChange[] = [];
   const jeRows = (
     await ctx.db.select().from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))
-  ).filter((e) => isGeneralJournal(e.sourceRef));
+  ).filter((e) => isGeneralJournal(e.sourceRef) && !transferEntryIds.has(e.id));
   const jeById = new Map(jeRows.map((e) => [e.id, e]));
   // Edits are void + re-post; the audit trail links each voided entry to its replacement.
   const repl = await ctx.db
@@ -424,8 +457,57 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
     if (!x.voidedAt) txns.push({ op: 'add', type: 'expense', id: x.id, after: await expensePayload(ctx, x.id) });
   }
 
+  // ---- Transfers ----
+  const baseTr = baseOf('transfer');
+  const trRows = await ctx.db
+    .select()
+    .from(transfers)
+    .where(eq(transfers.companyId, ctx.companyId))
+    .orderBy(asc(transfers.date), asc(transfers.createdAt));
+  for (const t of trRows) {
+    if (baseTr.has(t.id)) {
+      const v = baseTr.get(t.id) ?? null;
+      if (sameVersion(t.updatedAt, v)) continue;
+      if (t.voidedAt) txns.push({ op: 'void', type: 'transfer', id: t.id, baseVersion: iso(v) });
+      else txns.push({ op: 'edit', type: 'transfer', id: t.id, baseVersion: iso(v), after: transferPayloadOf(t) });
+      continue;
+    }
+    if (!t.voidedAt) txns.push({ op: 'add', type: 'transfer', id: t.id, after: transferPayloadOf(t) });
+  }
+
+  // ---- Deposits ----
+  const baseDep = baseOf('deposit');
+  const depRows = await ctx.db
+    .select({ id: deposits.id, updatedAt: deposits.updatedAt, voidedAt: deposits.voidedAt })
+    .from(deposits)
+    .where(eq(deposits.companyId, ctx.companyId))
+    .orderBy(asc(deposits.date), asc(deposits.createdAt));
+  for (const x of depRows) {
+    if (baseDep.has(x.id)) {
+      const v = baseDep.get(x.id) ?? null;
+      if (sameVersion(x.updatedAt, v)) continue;
+      if (x.voidedAt) txns.push({ op: 'void', type: 'deposit', id: x.id, baseVersion: iso(v) });
+      else txns.push({ op: 'edit', type: 'deposit', id: x.id, baseVersion: iso(v), after: await depositPayloadOf(ctx, x.id) });
+      continue;
+    }
+    if (!x.voidedAt) txns.push({ op: 'add', type: 'deposit', id: x.id, after: await depositPayloadOf(ctx, x.id) });
+  }
+
   // ---- Anything in the transaction log the file can't carry ----
   const warnings: string[] = [];
+  // Journal item applications (General Journal A/R / A/P line applied to an invoice, bill or
+  // journal line) audit as their journal entry / payment, so they are found in their own table.
+  if (copy.openedAt) {
+    const [apps] = await ctx.db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(journalItemApplications)
+      .where(and(eq(journalItemApplications.companyId, ctx.companyId), gt(journalItemApplications.createdAt, copy.openedAt)));
+    if (apps && apps.n > 0) {
+      warnings.push(
+        `${apps.n} journal entry line application(s) (a General Journal A/R or A/P line applied to an invoice, bill or another journal line) were made in this copy and can't be sent back. Tell your client what to apply.`,
+      );
+    }
+  }
   const dir = dataDirOf(ctx.db);
   if (dir && copy.baselineLogSeq != null) {
     const seen = new Map<string, number>();

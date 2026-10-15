@@ -33,6 +33,8 @@ import type { PGlite, Transaction } from '@electric-sql/pglite';
 import { eq } from 'drizzle-orm';
 import { closeDb, getDb, resolveDataDir, type DB } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
+import Decimal from 'decimal.js';
+import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, validation, writeAudit } from './_base';
 import { allowLedgerRewriteRaw } from './posting';
 import { condensePeriod } from './condense';
@@ -179,6 +181,163 @@ async function sweepOrphans(q: Queryable): Promise<void> {
       changed += res.affectedRows ?? 0;
     }
     if (!changed) return;
+  }
+}
+
+/**
+ * The cached on-hand quantities (items.quantity_on_hand) and the FIFO layers' remaining
+ * quantities are running totals: without this they would show today's stock in a copy that ends
+ * months ago. Runs inside trimCopy BEFORE the dated rows are deleted, because it reads them:
+ *
+ *  - On hand as of the end date = on hand now − Σ inventory movements dated after the end date
+ *    (every quantity-changing document writes a signed movement, reversals included) − the
+ *    quantity changes of physical counts dated after the end date (the one path that sets the
+ *    total without a movement; it records old/new quantity in the audit trail).
+ *    Per-site quantities need nothing more: a non-default site is the sum of its (kept)
+ *    movements and the default site is the remainder of this total.
+ *  - Average cost goes back to its value before the first later receipt / cost change.
+ *  - FIFO layers kept in the copy get back what documents dated after the end date consumed
+ *    from them: first exactly, from the consumption record (audit trail of fifo.consumeStock,
+ *    tied to its COGS entry's date); then any remaining difference between the kept layers and
+ *    the on-hand total is settled the FIFO way — added back to the oldest layer still holding
+ *    stock (the one later sales were eating into), or, when the layers hold too much, taken
+ *    from the oldest layers first.
+ *
+ * The ledger itself needs no help: the inventory asset balance comes from the kept entries.
+ */
+async function restoreInventoryAsOf(
+  tx: Queryable,
+  companyId: string,
+  cutoff: string,
+  has: (t: string, c: string) => boolean,
+): Promise<void> {
+  const P = [companyId, cutoff];
+  const cutoffDate = new Date(`${cutoff.slice(0, 10)}T00:00:00.000Z`);
+  const delta = new Map<string, Decimal>(); // itemId -> quantity change after the end date
+  const add = (itemId: string, q: string | Decimal) => delta.set(itemId, (delta.get(itemId) ?? Money.zero()).plus(Money.of(q)));
+
+  for (const r of (
+    await tx.query<{ item_id: string; q: string }>(
+      `SELECT item_id::text AS item_id, SUM(quantity)::text AS q FROM inventory_movements
+        WHERE company_id = $1 AND date >= $2 GROUP BY item_id`,
+      P,
+    )
+  ).rows) {
+    add(r.item_id, r.q);
+  }
+
+  const audit = has('audit_logs', 'new_values');
+  if (audit) {
+    const counts = await tx.query<{ item_id: string; old_q: string | null; new_q: string | null; at: string | null }>(
+      `SELECT entity_id::text AS item_id, old_values->>'quantityOnHand' AS old_q, new_values->>'quantityOnHand' AS new_q,
+              new_values->>'physicalCountDate' AS at
+         FROM audit_logs
+        WHERE company_id = $1 AND entity_type = 'item' AND new_values ? 'physicalCountDate'`,
+      [companyId],
+    );
+    for (const r of counts.rows) {
+      if (!r.at || new Date(r.at).getTime() < cutoffDate.getTime() || r.new_q == null) continue;
+      add(r.item_id, Money.of(r.new_q).minus(Money.of(r.old_q ?? '0')));
+    }
+  }
+
+  for (const [itemId, change] of delta) {
+    if (change.isZero()) continue;
+    await tx.query(
+      `UPDATE items SET quantity_on_hand = COALESCE(quantity_on_hand, 0) - $3::numeric WHERE id = $2 AND company_id = $1`,
+      [companyId, itemId, change.toFixed(4)],
+    );
+  }
+
+  // Average cost as of the end date: the value it had just before the first later event that
+  // moved it — a receipt dated after the end date (a positive movement) or a dated cost change
+  // (an audited averageCost change tied to an entry dated after it). Every such event writes its
+  // audit row in the same transaction as its movement / entry, so they share created_at.
+  if (audit && has('items', 'average_cost')) {
+    const avg = await tx.query<{ item_id: string; avg: string | null }>(
+      `WITH later AS (
+         SELECT item_id, MIN(created_at) AS t FROM (
+           SELECT item_id, created_at FROM inventory_movements
+            WHERE company_id = $1 AND date >= $2 AND quantity > 0
+           UNION ALL
+           SELECT a.entity_id AS item_id, a.created_at FROM audit_logs a
+             JOIN journal_entries je ON je.id::text = a.new_values->>'postedEntryId'
+            WHERE a.company_id = $1 AND a.entity_type = 'item' AND a.old_values ? 'averageCost' AND je.date >= $2
+         ) x GROUP BY item_id
+       )
+       SELECT DISTINCT ON (a.entity_id) a.entity_id::text AS item_id, a.old_values->>'averageCost' AS avg
+         FROM audit_logs a JOIN later l ON l.item_id = a.entity_id
+        WHERE a.company_id = $1 AND a.entity_type = 'item' AND a.old_values ? 'averageCost' AND a.created_at >= l.t
+        ORDER BY a.entity_id, a.created_at, a.id`,
+      P,
+    );
+    for (const r of avg.rows) {
+      await tx.query('UPDATE items SET average_cost = $3::numeric WHERE id = $2 AND company_id = $1', [
+        companyId,
+        r.item_id,
+        r.avg == null ? null : Money.of(r.avg).toFixed(4),
+      ]);
+    }
+  }
+
+  if (!has('inventory_layers', 'quantity_remaining')) return;
+
+  // FIFO 1: exact give-back of what later documents consumed from kept layers.
+  if (audit) {
+    const consumed = await tx.query<{ layer_id: string; q: string }>(
+      `SELECT l->>'layerId' AS layer_id, SUM((l->>'quantityTaken')::numeric)::text AS q
+         FROM audit_logs a
+         JOIN journal_entries je ON je.id::text = a.new_values->>'entryId'
+         CROSS JOIN LATERAL jsonb_array_elements(a.new_values->'layers') l
+        WHERE a.company_id = $1 AND a.entity_type = 'item' AND jsonb_typeof(a.new_values->'layers') = 'array'
+          AND je.date >= $2
+        GROUP BY l->>'layerId'`,
+      P,
+    );
+    for (const r of consumed.rows) {
+      await tx.query(
+        `UPDATE inventory_layers SET quantity_remaining = quantity_remaining + $3::numeric
+          WHERE company_id = $1 AND id::text = $4 AND date < $2`,
+        [companyId, cutoff, r.q, r.layer_id],
+      );
+    }
+  }
+
+  // FIFO 2: the kept layers of every FIFO item must hold exactly its on-hand quantity.
+  const layers = await tx.query<{ id: string; item_id: string; q: string; qoh: string | null }>(
+    `SELECT l.id::text AS id, l.item_id::text AS item_id, l.quantity_remaining::text AS q, i.quantity_on_hand::text AS qoh
+       FROM inventory_layers l JOIN items i ON i.id = l.item_id
+      WHERE l.company_id = $1 AND l.date < $2
+      ORDER BY l.item_id, l.date, l.created_at, l.id`,
+    P,
+  );
+  const byItem = new Map<string, Array<{ id: string; q: Decimal }>>();
+  const target = new Map<string, Decimal>();
+  for (const r of layers.rows) {
+    if (!byItem.has(r.item_id)) byItem.set(r.item_id, []);
+    byItem.get(r.item_id)!.push({ id: r.id, q: Money.of(r.q) });
+    target.set(r.item_id, Money.of(r.qoh ?? '0'));
+  }
+  for (const [itemId, list] of byItem) {
+    const want = Decimal.max(target.get(itemId)!, 0);
+    const held = list.reduce((s, l) => s.plus(l.q), Money.zero());
+    if (held.eq(want)) continue;
+    if (held.lessThan(want)) {
+      // Later sales ate into the oldest layer still holding stock (or the newest, when all are empty).
+      const boundary = list.find((l) => l.q.greaterThan(0)) ?? list[list.length - 1];
+      boundary.q = boundary.q.plus(want.minus(held));
+    } else {
+      let excess = held.minus(want);
+      for (const l of list) {
+        if (excess.lessThanOrEqualTo(0)) break;
+        const take = Decimal.min(l.q, excess);
+        l.q = l.q.minus(take);
+        excess = excess.minus(take);
+      }
+    }
+    for (const l of list) {
+      await tx.query('UPDATE inventory_layers SET quantity_remaining = $2::numeric WHERE id::text = $1', [l.id, l.q.toFixed(4)]);
+    }
   }
 }
 
@@ -413,6 +572,11 @@ async function trimCopy(db: DB, companyId: string, to: string): Promise<TrimCoun
           WHERE id = ANY($1::uuid[]) AND status NOT IN ('void', 'draft')`,
         [[...touchedBills]],
       );
+    }
+
+    // ---- Inventory quantities as of the end date (before the dated rows they derive from go) ----
+    if (has('items', 'quantity_on_hand') && has('inventory_movements', 'date')) {
+      await restoreInventoryAsOf(tx, companyId, cutoff, has);
     }
 
     // ---- Journal entries after the end date (lines first: the balance triggers read the entry) ----

@@ -8,9 +8,11 @@
  *    voided transactions, account and class changes, the accountant's note) next to what this
  *    file has now, flagging anything that can't be applied.
  *  - importChangesFile: apply the changes through the normal services (createManualEntry,
- *    updateEntry, createExpense, updateAccount, ...) in ONE transaction — the closing date,
+ *    updateEntry, createExpense, createTransfer, createDeposit, updateAccount, ...) in ONE transaction — the closing date,
  *    reconciliation, record-locking (version) and ledger-balance guards all stay on; only this
- *    copy's dividing-date lock is lifted for the import. Then the restriction is removed.
+ *    copy's dividing-date lock is lifted for the import, and only for changes to records dated on
+ *    or before the dividing date (an edit / void naming a later record refuses the whole file).
+ *    Then the restriction is removed.
  *  - cancelAccountantCopy: remove the restriction without importing; that copy's changes file is
  *    refused from then on.
  */
@@ -23,11 +25,15 @@ import {
   classes,
   companies,
   customers,
+  deposits,
   employees,
   expenses,
   journalEntries,
   journalEntryLines,
   otherNames,
+  paymentsReceived,
+  salesReceipts,
+  transfers,
   users,
   vendors,
 } from '@/lib/db/schema';
@@ -37,6 +43,8 @@ import { createAccount, updateAccount } from '../accounts';
 import { createClass } from '../dimensions';
 import { createExpense, getExpense, updateExpense, voidExpense, type CreateExpenseInput, type ExpenseMethod } from '../expenses';
 import { createManualEntry, updateEntry, voidEntry } from '../journal';
+import { createTransfer, updateTransfer, voidTransfer, type CreateTransferInput } from '../transfers';
+import { createDeposit, updateDeposit, voidDeposit, getDeposit, CASHBACK_LINE_PREFIX, RECEIPT_LINE_PREFIX, type CreateDepositInput } from '../deposits';
 import type { PostingLine } from '../posting';
 import { withVersionCheck } from '../concurrency';
 import { createPortableCompanyFile } from '../portableFile';
@@ -47,10 +55,13 @@ import {
   TRANSFER_EXTENSION,
   type AccountChange,
   type ChangesFile,
+  type DepositPayload,
   type ExpensePayload,
   type JournalPayload,
   type TransferManifest,
+  type TransferPayload,
   type TxnChange,
+  type TxnType,
   parseChangesFile,
   safeCompanyName,
 } from './format';
@@ -300,6 +311,8 @@ type NameMaps = {
   accounts: Map<string, { code: string; name: string }>;
   classes: Map<string, string>;
   names: Map<string, string>;
+  /** Payments / sales receipts a deposit holds, as "Payment #ref — $x (Customer)". */
+  docs: Map<string, string>;
 };
 
 async function nameMaps(ctx: ServiceContext, file: ChangesFile): Promise<NameMaps> {
@@ -313,10 +326,36 @@ async function nameMaps(ctx: ServiceContext, file: ChangesFile): Promise<NameMap
   for (const c of file.classes) cls.set(c.id, c.name);
   const names = new Map<string, string>();
   const ids = new Set<string>();
+  const payIds = new Set<string>();
+  const srIds = new Set<string>();
   for (const t of file.transactions) {
     if (t.op === 'void') continue;
     if (t.type === 'journal_entry') for (const l of t.after.lines) if (l.entityId) ids.add(l.entityId);
     if (t.type === 'expense' && t.after.vendorId) ids.add(t.after.vendorId);
+    if (t.type === 'deposit') {
+      for (const id of t.after.paymentIds) payIds.add(id);
+      for (const id of t.after.salesReceiptIds) srIds.add(id);
+    }
+  }
+  const docs = new Map<string, string>();
+  const docCustomers: Array<[string, string | null, string]> = [];
+  if (payIds.size) {
+    for (const r of await ctx.db
+      .select({ id: paymentsReceived.id, customerId: paymentsReceived.customerId, reference: paymentsReceived.reference, amount: paymentsReceived.amount })
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.companyId, ctx.companyId), inArray(paymentsReceived.id, [...payIds])))) {
+      docCustomers.push([r.id, r.customerId, `Payment${r.reference ? ` #${r.reference}` : ''} — ${formatCurrency(r.amount)}`]);
+      ids.add(r.customerId);
+    }
+  }
+  if (srIds.size) {
+    for (const r of await ctx.db
+      .select({ id: salesReceipts.id, customerId: salesReceipts.customerId, n: salesReceipts.receiptNumber, ref: salesReceipts.refNumber, total: salesReceipts.total })
+      .from(salesReceipts)
+      .where(and(eq(salesReceipts.companyId, ctx.companyId), inArray(salesReceipts.id, [...srIds])))) {
+      docCustomers.push([r.id, r.customerId, `Sales receipt #${r.ref ?? r.n} — ${formatCurrency(r.total)}`]);
+      if (r.customerId) ids.add(r.customerId);
+    }
   }
   if (ids.size) {
     const list = [...ids];
@@ -325,7 +364,10 @@ async function nameMaps(ctx: ServiceContext, file: ChangesFile): Promise<NameMap
     for (const r of await ctx.db.select({ id: employees.id, f: employees.firstName, l: employees.lastName }).from(employees).where(and(eq(employees.companyId, ctx.companyId), inArray(employees.id, list)))) names.set(r.id, `${r.f} ${r.l}`.trim());
     for (const r of await ctx.db.select({ id: otherNames.id, n: otherNames.name }).from(otherNames).where(and(eq(otherNames.companyId, ctx.companyId), inArray(otherNames.id, list)))) names.set(r.id, r.n);
   }
-  return { accounts: accts, classes: cls, names };
+  for (const [id, customerId, text] of docCustomers) {
+    docs.set(id, `${text}${customerId && names.has(customerId) ? ` (${names.get(customerId)})` : ''}`);
+  }
+  return { accounts: accts, classes: cls, names, docs };
 }
 
 const day = (iso: string | Date) => new Date(iso).toISOString().slice(0, 10);
@@ -401,6 +443,133 @@ async function currentExpense(ctx: ServiceContext, m: NameMaps, id: string) {
   return { row: x, text: [`${day(x.date)}${x.voidedAt ? ' (void)' : ''}`, ...expenseLines(m, p)] };
 }
 
+function transferText(m: NameMaps, p: TransferPayload): string[] {
+  return [
+    `Transfer ${formatCurrency(p.amount)} from ${acctLabel(m, p.fromAccountId)} to ${acctLabel(m, p.toAccountId)}`,
+    ...(p.toAmount ? [`Arrived: ${formatCurrency(p.toAmount)}`] : []),
+    ...(p.memo ? [`Memo: ${p.memo}`] : []),
+  ];
+}
+
+function depositText(m: NameMaps, p: DepositPayload): string[] {
+  return [
+    `Deposit to ${acctLabel(m, p.depositAccountId)}`,
+    ...[...p.paymentIds, ...p.salesReceiptIds].map((id) => m.docs.get(id) ?? 'A payment that is not in your file'),
+    ...p.extraLines.map((l) => `${acctLabel(m, l.accountId)} — ${formatCurrency(l.amount)}${l.description ? ` (${l.description})` : ''}`),
+    ...(p.cashBack ? [`Cash back to ${acctLabel(m, p.cashBack.accountId)} — ${formatCurrency(p.cashBack.amount)}`] : []),
+    ...(p.memo ? [`Memo: ${p.memo}`] : []),
+  ];
+}
+
+/** The payload of a saved transfer (what the accountant's side sends; also the review's "before"). */
+export function transferPayloadOf(t: typeof transfers.$inferSelect): TransferPayload {
+  const fx = Boolean(t.currency || t.toCurrency);
+  return {
+    date: new Date(t.date).toISOString(),
+    fromAccountId: t.fromAccountId,
+    toAccountId: t.toAccountId,
+    amount: toAmountString(t.amount),
+    memo: t.memo,
+    toAmount: fx && t.toAmount != null ? toAmountString(t.toAmount) : null,
+    homeAmount: fx && t.homeAmount != null ? toAmountString(t.homeAmount) : null,
+  };
+}
+
+/** The payload of a saved deposit, rebuilt from its lines (the cash-back memo from its entry line). */
+export async function depositPayloadOf(ctx: ServiceContext, id: string): Promise<DepositPayload> {
+  const dep = await getDeposit(ctx, id);
+  const paymentIds: string[] = [];
+  const salesReceiptIds: string[] = [];
+  const extraLines: DepositPayload['extraLines'] = [];
+  let cashBack: DepositPayload['cashBack'] = null;
+  for (const l of dep.lines) {
+    const desc = l.description ?? '';
+    if (l.paymentId) paymentIds.push(l.paymentId);
+    else if (desc.startsWith(RECEIPT_LINE_PREFIX)) salesReceiptIds.push(desc.slice(RECEIPT_LINE_PREFIX.length));
+    else if (desc.startsWith(CASHBACK_LINE_PREFIX)) {
+      cashBack = { accountId: desc.slice(CASHBACK_LINE_PREFIX.length), amount: toAmountString(Money.abs(l.amount)), memo: null };
+    } else if (l.accountId) {
+      extraLines.push({ accountId: l.accountId, amount: toAmountString(l.amount), description: l.description });
+    }
+  }
+  if (cashBack && dep.postedEntryId) {
+    const [gl] = await ctx.db
+      .select({ memo: journalEntryLines.memo })
+      .from(journalEntryLines)
+      .where(and(eq(journalEntryLines.journalEntryId, dep.postedEntryId), eq(journalEntryLines.accountId, cashBack.accountId)));
+    const prefix = 'Cash back — ';
+    if (gl?.memo?.startsWith(prefix)) cashBack.memo = gl.memo.slice(prefix.length);
+  }
+  return {
+    date: new Date(dep.date).toISOString(),
+    depositAccountId: dep.depositAccountId,
+    memo: dep.memo,
+    exchangeRate: dep.currency && dep.exchangeRate != null ? String(dep.exchangeRate) : null,
+    total: toAmountString(dep.total),
+    paymentIds,
+    salesReceiptIds,
+    extraLines,
+    cashBack,
+  };
+}
+
+async function currentTransfer(ctx: ServiceContext, m: NameMaps, id: string) {
+  const [t] = await ctx.db.select().from(transfers).where(and(eq(transfers.id, id), eq(transfers.companyId, ctx.companyId)));
+  if (!t) return null;
+  return { row: t, text: [`${day(t.date)}${t.voidedAt ? ' (void)' : ''}`, ...transferText(m, transferPayloadOf(t))] };
+}
+
+async function currentDeposit(ctx: ServiceContext, m: NameMaps, id: string) {
+  const [x] = await ctx.db.select().from(deposits).where(and(eq(deposits.id, id), eq(deposits.companyId, ctx.companyId)));
+  if (!x) return null;
+  const p = await depositPayloadOf(ctx, id);
+  if ([...p.paymentIds, ...p.salesReceiptIds].some((d) => !m.docs.has(d))) {
+    // Label the payments this deposit holds now (the file only names those of the accountant's version).
+    const now = await nameMaps(ctx, { accounts: [], classes: [], transactions: [{ op: 'add', type: 'deposit', id, after: p }] } as unknown as ChangesFile);
+    for (const [k, v] of now.docs) m.docs.set(k, v);
+  }
+  return { row: x, text: [`${day(x.date)}${x.voidedAt ? ' (void)' : ''}`, ...depositText(m, p)] };
+}
+
+/** Date of the record an edit / void names, company-scoped (null when it isn't in this file). */
+async function currentRecordDate(ctx: Pick<ServiceContext, 'db' | 'companyId'>, type: TxnType, id: string): Promise<Date | null> {
+  const table = { journal_entry: journalEntries, expense: expenses, transfer: transfers, deposit: deposits }[type];
+  const [row] = await ctx.db
+    .select({ date: table.date })
+    .from(table)
+    .where(and(eq(table.id, id), eq(table.companyId, ctx.companyId)));
+  return row ? row.date : null;
+}
+
+const KIND_LABEL: Record<TxnType, string> = {
+  journal_entry: 'journal entry',
+  expense: 'check / expense',
+  transfer: 'transfer',
+  deposit: 'deposit',
+};
+
+/**
+ * The import lifts the dividing-date lock, so this is what keeps a changes file from editing or
+ * voiding the client's own work dated AFTER the dividing date (an export never produces that; a
+ * hand-made file could, since the checksum only proves the file is intact).
+ */
+async function assertChangesWithinDividingDate(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  file: ChangesFile,
+  copy: AccountantCopyRow,
+): Promise<void> {
+  for (const t of file.transactions) {
+    if (t.op === 'add') continue;
+    const cur = await currentRecordDate(ctx, t.type, t.id);
+    if (cur && day(cur) > copy.dividingDate) {
+      throw validation(
+        `The changes file would ${t.op === 'void' ? 'void' : 'change'} a ${KIND_LABEL[t.type]} of yours dated ${day(cur)}, which is dated after the dividing date (${formatDividingDate(copy.dividingDate)}). ` +
+          "An accountant's changes can only touch transactions dated on or before the dividing date, so this file can't be used. Nothing was imported.",
+      );
+    }
+  }
+}
+
 const sameVersion = (a: Date | null | undefined, b: string | null) =>
   !b || (a ? a.getTime() : null) === new Date(b).getTime();
 
@@ -410,6 +579,7 @@ const changedElsewhere = 'This record was changed in your file after the Account
 export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Promise<ChangesReview> {
   const file = parseChangesFile(buffer);
   const copy = await matchCopy(ctx, file);
+  await assertChangesWithinDividingDate(ctx, file, copy);
   const m = await nameMaps(ctx, file);
   const closingDate = await getClosingDate(ctx);
   const items: ReviewItem[] = [];
@@ -487,6 +657,51 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         after: t.op === 'void' ? null : [`${day(t.after.date)} — ${t.after.description}${t.after.isAdjusting ? ' (adjusting)' : ''}`, ...journalLines(m, t.after)],
         problem,
       });
+    } else if (t.type === 'transfer') {
+      const cur = t.op === 'add' ? null : await currentTransfer(ctx, m, t.id);
+      if (t.op !== 'add') {
+        if (!cur) problem = 'This transfer no longer exists in your file.';
+        else if (cur.row.voidedAt) problem = 'This transfer is already void in your file.';
+        else if (!sameVersion(cur.row.updatedAt, t.baseVersion)) problem = changedElsewhere;
+        if (cur) touchesClosed(cur.row.date.toISOString());
+      }
+      const kindTitle = t.op === 'add' ? 'New transfer' : t.op === 'edit' ? 'Changed transfer' : 'Voided transfer';
+      items.push({
+        key,
+        group: 'transaction',
+        op: t.op,
+        kind: 'Transfer',
+        date: afterDate ? day(afterDate) : cur ? day(cur.row.date) : null,
+        title: kindTitle,
+        amount: t.op === 'void' ? (cur ? toAmountString(cur.row.amount) : null) : toAmountString(t.after.amount),
+        before: cur?.text ?? null,
+        after: t.op === 'void' ? null : [day(t.after.date), ...transferText(m, t.after)],
+        problem,
+      });
+    } else if (t.type === 'deposit') {
+      const cur = t.op === 'add' ? null : await currentDeposit(ctx, m, t.id);
+      if (t.op !== 'add') {
+        if (!cur) problem = 'This deposit no longer exists in your file.';
+        else if (cur.row.voidedAt) problem = 'This deposit is already void in your file.';
+        else if (!sameVersion(cur.row.updatedAt, t.baseVersion)) problem = changedElsewhere;
+        if (cur) touchesClosed(cur.row.date.toISOString());
+      }
+      if (!problem && t.op !== 'void' && [...t.after.paymentIds, ...t.after.salesReceiptIds].some((x) => !m.docs.has(x))) {
+        problem = 'This deposit holds a payment or sales receipt that is not in your file.';
+      }
+      const kindTitle = t.op === 'add' ? 'New deposit' : t.op === 'edit' ? 'Changed deposit' : 'Voided deposit';
+      items.push({
+        key,
+        group: 'transaction',
+        op: t.op,
+        kind: 'Deposit',
+        date: afterDate ? day(afterDate) : cur ? day(cur.row.date) : null,
+        title: kindTitle,
+        amount: t.op === 'void' ? (cur ? toAmountString(cur.row.total) : null) : toAmountString(t.after.total),
+        before: cur?.text ?? null,
+        after: t.op === 'void' ? null : [day(t.after.date), ...depositText(m, t.after)],
+        problem,
+      });
     } else {
       const cur = t.op === 'add' ? null : await currentExpense(ctx, m, t.id);
       if (t.op !== 'add') {
@@ -544,7 +759,7 @@ const toDate = (iso: string) => {
 };
 
 function describeTxn(t: TxnChange): string {
-  const what = t.type === 'journal_entry' ? 'journal entry' : 'check / expense';
+  const what = KIND_LABEL[t.type];
   const verb = t.op === 'add' ? 'new' : t.op === 'edit' ? 'changed' : 'voided';
   const date = t.op === 'void' ? '' : ` dated ${day(t.after.date)}`;
   return `${verb} ${what}${date}`;
@@ -563,8 +778,12 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
     }
   }
 
+  await assertChangesWithinDividingDate(ctx, file, copy);
+
   return runAccountantImport(copy.id, () =>
     inTransaction(ctx, async (tx) => {
+      // Again inside the import's transaction, where the dividing-date lock is lifted.
+      await assertChangesWithinDividingDate(tx, file, copy);
       const idMap = new Map<string, string>();
       const mapId = <T extends string | null | undefined>(id: T): T => (id ? ((idMap.get(id) ?? id) as T) : id);
       const applied = { accounts: 0, classes: 0, added: 0, changed: 0, voided: 0 };
@@ -684,12 +903,40 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         })),
       });
 
+      const transferInput = (p: TransferPayload): CreateTransferInput => ({
+        date: toDate(p.date),
+        fromAccountId: mapId(p.fromAccountId),
+        toAccountId: mapId(p.toAccountId),
+        amount: p.amount,
+        memo: p.memo,
+        toAmount: p.toAmount,
+        homeAmount: p.homeAmount,
+      });
+      const depositInput = (p: DepositPayload): CreateDepositInput => ({
+        date: toDate(p.date),
+        depositAccountId: mapId(p.depositAccountId),
+        memo: p.memo,
+        exchangeRate: p.exchangeRate,
+        paymentIds: p.paymentIds,
+        salesReceiptIds: p.salesReceiptIds,
+        extraLines: p.extraLines.map((l) => ({ accountId: mapId(l.accountId), amount: l.amount, description: l.description })),
+        cashBack: p.cashBack ? { accountId: mapId(p.cashBack.accountId), amount: p.cashBack.amount, memo: p.cashBack.memo } : null,
+      });
+
       for (const t of txns) {
         await step(describeTxn(t), async () => {
           if (t.type === 'journal_entry') {
             if (t.op === 'add') await createManualEntry(tx, journalInput(t.after));
             else if (t.op === 'edit') await withVersionCheck(tx, 'journal_entry', t.id, t.baseVersion, (c) => updateEntry(c, t.id, journalInput(t.after)));
             else await withVersionCheck(tx, 'journal_entry', t.id, t.baseVersion, (c) => voidEntry(c, t.id));
+          } else if (t.type === 'transfer') {
+            if (t.op === 'add') await createTransfer(tx, transferInput(t.after));
+            else if (t.op === 'edit') await withVersionCheck(tx, 'transfer', t.id, t.baseVersion, (c) => updateTransfer(c, t.id, transferInput(t.after)));
+            else await withVersionCheck(tx, 'transfer', t.id, t.baseVersion, (c) => voidTransfer(c, t.id));
+          } else if (t.type === 'deposit') {
+            if (t.op === 'add') await createDeposit(tx, depositInput(t.after));
+            else if (t.op === 'edit') await withVersionCheck(tx, 'deposit', t.id, t.baseVersion, (c) => updateDeposit(c, t.id, depositInput(t.after)));
+            else await withVersionCheck(tx, 'deposit', t.id, t.baseVersion, (c) => voidDeposit(c, t.id));
           } else {
             if (t.op === 'add') await createExpense(tx, expenseInput(t.after));
             else if (t.op === 'edit') await withVersionCheck(tx, 'expense', t.id, t.baseVersion, (c) => updateExpense(c, t.id, expenseInput(t.after)));

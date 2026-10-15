@@ -2,7 +2,8 @@
  * Accountant's Copy route gate (PARITY I1), called by getServerContext for every API request.
  *
  * In the ACCOUNTANT's working copy only the saves the changes file (.ibcx) can carry back to the
- * client are allowed: General Journal entries, checks / expenses, chart of accounts and classes —
+ * client are allowed: General Journal entries, checks / expenses, transfers, deposits, chart of
+ * accounts and classes —
  * plus housekeeping that never changes the books (signing in/out, your own preferences, saved
  * reports, notes, to-dos, backups, the Accountant's Copy screens themselves). Any other save is
  * refused BEFORE it runs, with a plain message, so nothing is done in the copy that would be
@@ -18,6 +19,8 @@ import { activeCopy } from './guard';
 export const ACCOUNTANT_COPY_ALLOWED_API = [
   '/api/journal-entries',
   '/api/expenses',
+  '/api/transfers',
+  '/api/deposits',
   '/api/accounts',
   '/api/classes',
   '/api/accountant-copy',
@@ -54,7 +57,7 @@ export async function enforceAccountantCopyGate(db: DB, companyId: string): Prom
   throw new ServiceError(
     'FORBIDDEN',
     "That isn't available in an Accountant's Copy because it can't be sent back to your client. " +
-      'In this copy you can make journal entries, write or edit checks and expenses, and add or edit accounts and classes. ' +
+      'In this copy you can make journal entries, write or edit checks and expenses, transfers and deposits, and add or edit accounts and classes. ' +
       'Note anything else for your client in the changes file.',
     { accountantCopy: true },
   );
