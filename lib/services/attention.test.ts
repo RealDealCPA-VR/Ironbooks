@@ -7,10 +7,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { BUILTIN_ROLES, unionRoles } from '@/lib/permissions/model';
 import { apiRuleFor } from '@/lib/permissions/routes';
-import { bankAccounts, bankTransactions, companies, errorDetections } from '@/lib/db/schema';
+import { attentionItemStates, bankAccounts, bankTransactions, companies, errorDetections, invoices, users } from '@/lib/db/schema';
+import { createCompany } from './company';
 import { createCustomer } from './customers';
 import { createVendor } from './vendors';
 import { createInvoice } from './invoices';
@@ -249,6 +250,37 @@ describe('Needs attention inbox (integration)', () => {
     await expect(setAttentionState(t.ctx, { key, action: 'snooze', days: 3 })).rejects.toMatchObject({ code: 'VALIDATION' });
   });
 
+  it('only stores keys in the shape their kind uses (a bad id never reaches a uuid query)', async () => {
+    const bad = [
+      'bank_txn:not-a-uuid',
+      'overdue_invoice:123',
+      `todo:${ids.todo}:extra`,
+      `reconcile:${ids.bankAccount}`,
+      'reconcile:not-a-uuid:2026-05-31',
+      `reconcile:${ids.bankAccount}:2026-13-31`,
+      'payroll_tax:2026-5',
+      'backup:yesterday',
+      `unknown_kind:${ids.todo}`,
+    ];
+    for (const key of bad) {
+      await expect(setAttentionState(t.ctx, { key, action: 'dismiss' }, NOW), key).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+    const good = [`bank_txn:${ids.coffee}`, `reconcile:${ids.bankAccount}:2026-05-31`, 'payroll_tax:2026-05', 'backup:never', 'backup:2026-06-01'];
+    for (const key of good) {
+      await setAttentionState(t.ctx, { key, action: 'snooze', days: 1 }, NOW);
+      await setAttentionState(t.ctx, { key, action: 'restore' }, NOW);
+    }
+
+    // Even a malformed bank key already in the table (older build, direct DB write) can't empty
+    // the bank list: it is ignored by the uuid query and cleaned up.
+    await t.db.insert(attentionItemStates).values({ companyId: t.ctx.companyId, userId: t.ctx.userId!, itemKey: 'bank_txn:not-a-uuid', dismissedAt: NOW, updatedAt: NOW });
+    const r = await getAttention(t.ctx, { today: TODAY, now: NOW });
+    expect(r.counts.bank_txn).toBe(2);
+    expect(ofKind(r.items, 'bank_txn')).toHaveLength(2);
+    const left = await t.db.select().from(attentionItemStates).where(eq(attentionItemStates.itemKey, 'bank_txn:not-a-uuid'));
+    expect(left).toEqual([]);
+  });
+
   it('only lists what the person can act on', async () => {
     const sales = await getAttention(roleCtx('sales'), { today: TODAY, now: NOW });
     expect([...kinds(sales.items)].sort()).toEqual(['overdue_invoice', 'todo']);
@@ -277,6 +309,19 @@ describe('Needs attention inbox (integration)', () => {
     // Categorize inline with the suggestion.
     let r = await getAttention(t.ctx, { today: TODAY, now: NOW });
     const coffee = r.items.find((i) => i.key === `bank_txn:${ids.coffee}`)!;
+    // Dismiss the bank line and the to-do first: once they are handled the dismissals must go
+    // (they would otherwise pile up in every bank-feed NOT IN list forever).
+    await setAttentionState(t.ctx, { key: `bank_txn:${ids.coffee}`, action: 'dismiss' }, NOW);
+    await setAttentionState(t.ctx, { key: `todo:${ids.todo}`, action: 'dismiss' }, NOW);
+    const myStates = () =>
+      t.db
+        .select({ key: attentionItemStates.itemKey })
+        .from(attentionItemStates)
+        .where(and(eq(attentionItemStates.companyId, t.ctx.companyId), eq(attentionItemStates.userId, t.ctx.userId!)));
+    // Still waiting: kept (a role that can't see bank lines doesn't touch them either).
+    await getAttention(roleCtx('sales'), { today: TODAY, now: NOW });
+    await getAttention(t.ctx, { today: TODAY, now: NOW });
+    expect((await myStates()).map((s) => s.key).sort()).toEqual([`bank_txn:${ids.coffee}`, `todo:${ids.todo}`].sort());
     await categorize(t.ctx, { bankTransactionId: ids.coffee, accountId: coffee.data.suggestedAccountId as string });
     // Mark the to-do done.
     await updateTodo(t.ctx, ids.todo, { done: true });
@@ -288,8 +333,11 @@ describe('Needs attention inbox (integration)', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-    r = await getAttention(t.ctx, { today: TODAY, now: NOW });
+    r = await getAttention(t.ctx, { today: TODAY, now: NOW, includeHidden: true });
     expect(r.items.some((i) => i.key === `bank_txn:${ids.coffee}`)).toBe(false);
+    // The sorted line's and the finished to-do's dismissals were cleaned up.
+    expect(await myStates()).toEqual([]);
+    expect(r.hiddenCount).toBe(0);
     expect(ofKind(r.items, 'todo')).toHaveLength(0);
     expect(ofKind(r.items, 'backup')).toHaveLength(0);
     // A week later the backup is stale again (new key, so an old dismissal wouldn't hide it).
@@ -314,16 +362,59 @@ describe('Needs attention inbox (integration)', () => {
     await expect(sendPaymentReminder(t.ctx, '00000000-0000-0000-0000-000000000000')).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
-  it('is company-scoped', async () => {
-    const t2 = await makeTestCompany('attention-other');
+  it('payment reminder uses the invoice currency, else the home currency', async () => {
+    const base = { customerName: 'Late Payer LLC', invoiceNumber: '1001', balance: '300.00', dueDate: '2026-05-01', daysOverdue: 45, companyName: 'Acme' };
+    expect(paymentReminderText({ ...base, currency: 'EUR' }).body).toMatch(/for €300\.00 was due/);
+    expect(paymentReminderText({ ...base, currency: 'GBP' }).body).toMatch(/for £300\.00 was due/);
+    expect(paymentReminderText(base).body).toMatch(/for \$300\.00 was due/);
+
+    await t.db.update(invoices).set({ currency: 'EUR' }).where(eq(invoices.id, ids.inv1));
     try {
-      const r = await getAttention(t2.ctx, { today: TODAY, now: NOW });
-      expect(r.items.filter((i) => i.kind !== 'backup')).toEqual([]);
-      await expect(sendPaymentReminder(t2.ctx, ids.inv1)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+      const r = await getAttention(t.ctx, { today: TODAY, now: NOW });
+      expect(r.homeCurrency).toBe('USD');
+      const eur = r.items.find((i) => i.data.invoiceId === ids.inv1)!;
+      expect(eur.data.currency).toBe('EUR');
+      expect((eur.data.reminder as { body: string }).body).toMatch(/for €300\.00/);
+      expect((eur.data.reminder as { body: string }).body).not.toMatch(/\$/);
+      // The home-currency invoice keeps the home currency.
+      const usd = r.items.find((i) => i.data.invoiceId === ids.inv2)!;
+      expect(usd.data.currency).toBeNull();
+      expect((usd.data.reminder as { body: string }).body).toMatch(/for \$150\.00/);
     } finally {
-      await t2.cleanup();
-      process.env.BKA_DATA_DIR = t.dir;
+      await t.db.update(invoices).set({ currency: null }).where(eq(invoices.id, ids.inv1));
     }
+  });
+
+  it('is company-scoped (a second company in the SAME database sees none of it)', async () => {
+    const [owner2] = await t.db
+      .insert(users)
+      .values({ email: `attention-other-${Date.now()}@test.local`, name: 'Other owner', passwordHash: 'x' })
+      .returning();
+    const c2 = await createCompany(t.db, { name: 'Other Co', ownerId: owner2.id });
+    const ctx2: ServiceContext = { db: t.db, companyId: c2.id, userId: owner2.id };
+    // Sanity: the first company still has items of these kinds in this very database.
+    const mine = await getAttention(t.ctx, { today: TODAY, now: NOW });
+    expect(mine.counts.bank_txn).toBeGreaterThan(0);
+    expect(mine.counts.overdue_invoice).toBeGreaterThan(0);
+    expect(mine.counts.ai_error).toBeGreaterThan(0);
+
+    const r = await getAttention(ctx2, { today: TODAY, now: NOW, includeHidden: true });
+    expect(r.counts.bank_txn).toBe(0);
+    expect(r.counts.overdue_invoice).toBe(0);
+    expect(r.counts.bill_due).toBe(0);
+    expect(r.counts.ai_error).toBe(0);
+    expect(r.counts.todo).toBe(0);
+    expect(r.counts.reconcile).toBe(0);
+    expect(r.counts.payroll_tax).toBe(0);
+    expect(r.counts.undeposited).toBe(0);
+    expect(r.items.filter((i) => i.kind !== 'backup')).toEqual([]);
+    expect(r.hiddenCount).toBe(0);
+    expect(r.accountOptions).toEqual([]);
+    await expect(sendPaymentReminder(ctx2, ids.inv1)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    // And a dismissal in the other company doesn't hide anything here.
+    await setAttentionState(ctx2, { key: `overdue_invoice:${ids.inv1}`, action: 'dismiss' }, NOW);
+    const after = await getAttention(t.ctx, { today: TODAY, now: NOW });
+    expect(after.counts.overdue_invoice).toBe(mine.counts.overdue_invoice);
   });
 });
 

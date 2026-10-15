@@ -56,7 +56,8 @@ import { requireFileAdmin } from './access';
 import { isConfigured as emailIsConfigured, sendMail } from './email';
 import { createBackup } from './backup';
 import { buildInvoicePdf } from '@/lib/pdf/forms';
-import { ATTENTION_KINDS, type AttentionKind } from '@/lib/attentionKinds';
+import { ATTENTION_KINDS, UUID_RE, parseAttentionKey, type AttentionKind } from '@/lib/attentionKinds';
+import { getHomeCurrencyCode } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,6 +121,8 @@ export interface AttentionResult {
   accountOptions: AccountOption[];
   /** Whether outgoing email (SMTP) is set up on this computer. */
   emailConfigured: boolean;
+  /** The company's home currency (amounts are in it unless the item's data.currency says otherwise). */
+  homeCurrency: string;
 }
 
 export interface AttentionOptions {
@@ -149,6 +152,18 @@ const OPEN_DOC_STATUSES = ['open', 'partial', 'overdue'] as const;
 
 function allowed(ctx: ServiceContext, area: Area, action: Action = 'view'): boolean {
   return !ctx.access || can(ctx.access, area, action);
+}
+
+/** The company's home currency code: the multi-currency base, else Company settings, else USD. */
+async function resolveHomeCurrency(ctx: ServiceContext, settingsCurrency: unknown): Promise<string> {
+  let code: string | null = null;
+  try {
+    code = await getHomeCurrencyCode(ctx);
+  } catch {
+    /* fall back below */
+  }
+  const pick = [code, settingsCurrency].find((c) => typeof c === 'string' && /^[A-Z]{3}$/.test(c));
+  return (pick as string | undefined) ?? 'USD';
 }
 
 function isoDay(d: Date | string | null | undefined): string | null {
@@ -227,8 +242,10 @@ export function paymentReminderText(p: {
   dueDate: string | null;
   daysOverdue: number;
   companyName: string;
+  /** The invoice's currency (its own, or the company's home currency). Defaults to USD. */
+  currency?: string | null;
 }): { subject: string; body: string } {
-  const amount = formatCurrency(p.balance);
+  const amount = formatCurrency(p.balance, p.currency || 'USD');
   const due = p.dueDate ? ` was due on ${shortDate(p.dueDate)}` : ' is past due';
   const late = p.daysOverdue > 0 ? ` (${plural(p.daysOverdue, 'day')} ago)` : '';
   return {
@@ -258,6 +275,7 @@ interface SourceEnv {
   hiddenKeys: Set<string>;
   undepositedDays: number;
   companyName: string;
+  homeCurrency: string;
   companyCreatedAt: Date | null;
   payrollLiabilityAccountId: string | null;
 }
@@ -275,7 +293,11 @@ type Source = (env: SourceEnv) => Promise<SourceResult>;
 
 /** Bank-feed lines not yet sorted: oldest first, with a suggestion from the rules or history. */
 const bankTxnSource: Source = async ({ ctx, today, countOnly, hiddenKeys }) => {
-  const hiddenIds = [...hiddenKeys].filter((k) => k.startsWith('bank_txn:')).map((k) => k.slice('bank_txn:'.length));
+  // Only well-formed ids reach the uuid column (a malformed one would make the query throw).
+  const hiddenIds = [...hiddenKeys]
+    .filter((k) => k.startsWith('bank_txn:'))
+    .map((k) => k.slice('bank_txn:'.length))
+    .filter((id) => UUID_RE.test(id));
   const base = and(
     eq(bankTransactions.companyId, ctx.companyId),
     eq(bankTransactions.matched, false),
@@ -377,7 +399,7 @@ const bankTxnSource: Source = async ({ ctx, today, countOnly, hiddenKeys }) => {
 };
 
 /** Invoices past due with money still owed. */
-const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName }) => {
+const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName, homeCurrency }) => {
   const rows = await ctx.db
     .select({
       id: invoices.id,
@@ -434,6 +456,7 @@ const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName
           dueDate: due,
           daysOverdue: days,
           companyName,
+          currency: r.currency || homeCurrency,
         });
     const sentOn = lastSent.get(r.id);
     return item({
@@ -472,6 +495,7 @@ const billSource: Source = async ({ ctx, today }) => {
       billNumber: bills.billNumber,
       due: dueExpr,
       balanceDue: bills.balanceDue,
+      currency: bills.currency,
       vendorId: vendors.id,
       vendorName: vendors.displayName,
     })
@@ -503,7 +527,7 @@ const billSource: Source = async ({ ctx, today }) => {
       urgency: late + 3,
       href,
       action: { type: 'open', label: 'Pay', href },
-      data: { billId: r.id, vendorId: r.vendorId, vendorName: r.vendorName, daysOverdue: Math.max(late, 0) },
+      data: { billId: r.id, vendorId: r.vendorId, vendorName: r.vendorName, daysOverdue: Math.max(late, 0), currency: r.currency },
     });
   });
   return { items };
@@ -841,6 +865,7 @@ export async function getAttention(ctx: ServiceContext, opts: AttentionOptions =
   const now = opts.now ?? new Date();
   const [prefs, company] = await Promise.all([getPreferences(ctx), getCompany(ctx)]);
   const today = opts.today ?? todayInTimeZone(prefs.timezone, now);
+  const homeCurrency = await resolveHomeCurrency(ctx, company?.settings?.currency);
 
   // This person's snoozes / dismissals.
   const states = ctx.userId
@@ -863,6 +888,7 @@ export async function getAttention(ctx: ServiceContext, opts: AttentionOptions =
     hiddenKeys: new Set(hiddenState.keys()),
     undepositedDays: opts.undepositedDays ?? DEFAULT_UNDEPOSITED_DAYS,
     companyName: company?.name ?? 'Your company',
+    homeCurrency,
     companyCreatedAt: company?.createdAt ?? null,
     payrollLiabilityAccountId: prefs.payrollLiabilityAccountId ?? null,
   };
@@ -871,13 +897,44 @@ export async function getAttention(ctx: ServiceContext, opts: AttentionOptions =
   const results = await Promise.all(
     SOURCES.filter((s) => kinds.has(s.kind)).map(async (s) => {
       try {
-        return { kind: s.kind, result: await s.source(env) };
+        return { kind: s.kind, ok: true, result: await s.source(env) };
       } catch (err) {
         console.warn(`[attention] ${s.kind} unavailable:`, err instanceof Error ? err.message : err);
-        return { kind: s.kind, result: { items: [] } as SourceResult };
+        return { kind: s.kind, ok: false, result: { items: [] } as SourceResult };
       }
     }),
   );
+
+  // Housekeeping: forget this person's snoozes / dismissals of items that no longer exist (the
+  // bank line was sorted, the invoice paid, last month's reconcile superseded...). Sources list
+  // every hidden item that still waits, so a hidden key a source did not return is stale. Only
+  // kinds whose source ran and succeeded are checked; keeps the bank feed's NOT IN list short.
+  if (ctx.userId && states.length) {
+    const returned = new Set(results.flatMap((r) => r.result.items.map((i) => i.key)));
+    const checked = new Set(results.filter((r) => r.ok).map((r) => r.kind));
+    const stale = states
+      .map((s) => s.key)
+      .filter((k) => hiddenState.has(k) && !returned.has(k))
+      .filter((k) => {
+        const p = parseAttentionKey(k);
+        return !p || checked.has(p.kind);
+      });
+    if (stale.length) {
+      try {
+        await ctx.db
+          .delete(attentionItemStates)
+          .where(
+            and(
+              eq(attentionItemStates.companyId, ctx.companyId),
+              eq(attentionItemStates.userId, ctx.userId),
+              inArray(attentionItemStates.itemKey, stale),
+            ),
+          );
+      } catch (err) {
+        console.warn('[attention] could not clean up old snoozes:', err instanceof Error ? err.message : err);
+      }
+    }
+  }
 
   const counts = Object.fromEntries(ATTENTION_KINDS.map((k) => [k, 0])) as Record<AttentionKind, number>;
   const visible: AttentionItem[] = [];
@@ -913,6 +970,7 @@ export async function getAttention(ctx: ServiceContext, opts: AttentionOptions =
     ...(opts.includeHidden ? { hidden: hidden.sort(compareItems) } : {}),
     accountOptions,
     emailConfigured: emailIsConfigured(),
+    homeCurrency,
   };
 }
 
@@ -924,8 +982,6 @@ export async function attentionCount(ctx: ServiceContext, opts: Omit<AttentionOp
 // ---------------------------------------------------------------------------
 // Snooze / dismiss (per person)
 // ---------------------------------------------------------------------------
-
-const KEY_RE = /^([a-z_]+):[A-Za-z0-9._:-]{1,180}$/;
 
 export type AttentionStateAction = 'snooze' | 'dismiss' | 'restore';
 
@@ -957,8 +1013,8 @@ export async function setAttentionState(
   now: Date = new Date(),
 ): Promise<{ key: string; snoozedUntil: string | null; dismissed: boolean }> {
   if (!ctx.userId) throw validation('Sign in to snooze or dismiss items.');
-  const m = KEY_RE.exec(input.key ?? '');
-  if (!m || !(ATTENTION_KINDS as readonly string[]).includes(m[1])) throw validation('Unknown item.');
+  // Each kind has one key shape (a record id, '<account id>:<month end>', 'YYYY-MM'...).
+  if (!parseAttentionKey(input.key)) throw validation('Unknown item.');
   const where = and(
     eq(attentionItemStates.companyId, ctx.companyId),
     eq(attentionItemStates.userId, ctx.userId),
@@ -1023,6 +1079,7 @@ export async function sendPaymentReminder(
       refNumber: invoices.refNumber,
       dueDate: invoices.dueDate,
       balanceDue: invoices.balanceDue,
+      currency: invoices.currency,
       status: invoices.status,
       customerName: customers.displayName,
       customerEmail: customers.email,
@@ -1053,6 +1110,7 @@ export async function sendPaymentReminder(
     dueDate: due,
     daysOverdue: due ? Math.max(daysBetween(due, today), 0) : 0,
     companyName: company?.name ?? 'Your company',
+    currency: inv.currency || (await resolveHomeCurrency(ctx, company?.settings?.currency)),
   });
   const { bytes } = await buildInvoicePdf(ctx, inv.id);
   await sendMail(

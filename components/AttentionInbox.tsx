@@ -11,7 +11,7 @@
  *    the record already picked
  * Every item can be snoozed (tomorrow / next week) or dismissed, per person.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   CheckCircle2,
@@ -33,7 +33,14 @@ import {
 import { Badge, Button, Card, Input, Label, Select, Spinner, toast, toastError } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
-import { ATTENTION_CHANGED_EVENT, ATTENTION_KIND_LABELS, ATTENTION_KINDS, type AttentionKind } from '@/lib/attentionKinds';
+import {
+  ATTENTION_CHANGED_EVENT,
+  ATTENTION_KIND_LABELS,
+  ATTENTION_KINDS,
+  attentionAmountCurrency,
+  type AttentionKind,
+} from '@/lib/attentionKinds';
+import { nextMenuIndex } from '@/lib/menuKeys';
 import type { AttentionItem, AttentionResult } from '@/lib/services/attention';
 import { cn } from '@/lib/utils';
 
@@ -368,7 +375,9 @@ function InboxItem({
           <p className="mt-0.5 text-[11px] font-semibold uppercase tracking-wide text-navy/30">{ATTENTION_KIND_LABELS[it.kind]}</p>
         </div>
         {it.amount && (
-          <div className="shrink-0 text-right text-base font-semibold tabular-nums text-navy">{formatCurrency(it.amount)}</div>
+          <div className="shrink-0 text-right text-base font-semibold tabular-nums text-navy">
+            {formatCurrency(it.amount, attentionAmountCurrency(it.data, data.homeCurrency ?? 'USD'))}
+          </div>
         )}
         <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
           {primary}
@@ -394,40 +403,107 @@ function InboxItem({
   );
 }
 
-/** Snooze (tomorrow / next week) and Dismiss, tucked behind one "Later" button. */
+/**
+ * Snooze (tomorrow / next week) and Dismiss, tucked behind one "Later" button. A real menu button
+ * (WAI-ARIA): opening it moves focus to the first item, Up / Down / Home / End move between items,
+ * Escape closes it and returns focus to the button, Tab closes it and moves on.
+ */
 function LaterMenu({ title, onSnooze, onDismiss }: { title: string; onSnooze: (days: 1 | 7) => void; onDismiss: () => void }) {
   const [open, setOpen] = useState(false);
+  // Which item to focus when the menu opens (Up arrow on the button opens at the last one).
+  const [startAt, setStartAt] = useState<'first' | 'last'>('first');
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  const choices: Array<{ label: string; danger?: boolean; run: () => void }> = [
+    { label: 'Remind me tomorrow', run: () => onSnooze(1) },
+    { label: 'Remind me next week', run: () => onSnooze(7) },
+    { label: 'Dismiss', danger: true, run: onDismiss },
+  ];
+
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false);
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open]);
-  const item = 'block w-full px-3 py-2 text-left text-sm text-navy hover:bg-electric/5 outline-none focus-visible:bg-electric/10';
+    const items = itemRefs.current.filter(Boolean) as HTMLButtonElement[];
+    (startAt === 'last' ? items[items.length - 1] : items[0])?.focus();
+  }, [open, startAt]);
+
+  const close = (refocus: boolean) => {
+    setOpen(false);
+    if (refocus) buttonRef.current?.focus();
+  };
+
+  function openAt(at: 'first' | 'last') {
+    setStartAt(at);
+    setOpen(true);
+  }
+
+  function onButtonKey(e: React.KeyboardEvent<HTMLButtonElement>) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      openAt(e.key === 'ArrowUp' ? 'last' : 'first');
+    }
+  }
+
+  function onMenuKey(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      close(true);
+      return;
+    }
+    if (e.key === 'Tab') {
+      setOpen(false);
+      return;
+    }
+    const items = itemRefs.current.filter(Boolean) as HTMLButtonElement[];
+    const next = nextMenuIndex(e.key, items.indexOf(document.activeElement as HTMLButtonElement), items.length);
+    if (next !== null) {
+      e.preventDefault();
+      items[next].focus();
+    }
+  }
+
+  const item = 'block w-full px-3 py-2 text-left text-sm text-navy hover:bg-electric/5 outline-none focus-visible:bg-electric/10 focus:bg-electric/10';
   return (
     <div className="relative" onBlur={(e) => !e.currentTarget.contains(e.relatedTarget as Node) && setOpen(false)}>
       <button
+        ref={buttonRef}
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={`Later or dismiss: ${title}`}
         title="Snooze or dismiss"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => (open ? setOpen(false) : openAt('first'))}
+        onKeyDown={onButtonKey}
         className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-semibold text-navy/70 hover:bg-slate-50 outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
       >
         Later <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
       </button>
       {open && (
-        <div role="menu" className="absolute right-0 z-20 mt-1 w-48 rounded-xl border border-slate-100 bg-white py-1 shadow-xl">
-          <button type="button" role="menuitem" className={item} onClick={() => { setOpen(false); onSnooze(1); }}>
-            Remind me tomorrow
-          </button>
-          <button type="button" role="menuitem" className={item} onClick={() => { setOpen(false); onSnooze(7); }}>
-            Remind me next week
-          </button>
-          <button type="button" role="menuitem" className={cn(item, 'text-red-600')} onClick={() => { setOpen(false); onDismiss(); }}>
-            Dismiss
-          </button>
+        <div
+          role="menu"
+          aria-label={`Later or dismiss: ${title}`}
+          onKeyDown={onMenuKey}
+          className="absolute right-0 z-20 mt-1 w-48 rounded-xl border border-slate-100 bg-white py-1 shadow-xl"
+        >
+          {choices.map((c, i) => (
+            <button
+              key={c.label}
+              ref={(el) => {
+                itemRefs.current[i] = el;
+              }}
+              type="button"
+              role="menuitem"
+              tabIndex={-1}
+              className={c.danger ? cn(item, 'text-red-600') : item}
+              onClick={() => {
+                close(true);
+                c.run();
+              }}
+            >
+              {c.label}
+            </button>
+          ))}
         </div>
       )}
     </div>

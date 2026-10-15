@@ -1,37 +1,57 @@
 'use client';
 /**
  * Count bubble on the sidebar's "Needs attention" link (team home). Reads GET /api/attention/count
- * on load, every two minutes, when the window regains focus and whenever the inbox changes
- * something (ATTENTION_CHANGED_EVENT). Shows nothing while zero or unavailable.
+ * on load and whenever the inbox changes something (ATTENTION_CHANGED_EVENT, at once). Page
+ * navigation, window focus and the two-minute timer also refresh it, but at most once every 30
+ * seconds (lib/throttledRefresh.ts): the count runs every inbox query, so it must not run on
+ * every click. A refresh that comes too soon is folded into one shortly after, so the number
+ * still catches up (e.g. after paying a bill on its own screen). Shows nothing while zero or
+ * unavailable.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { ATTENTION_CHANGED_EVENT } from '@/lib/attentionKinds';
+import { createThrottledRefresh, type ThrottledRefresh } from '@/lib/throttledRefresh';
 
 export default function AttentionBadge() {
   const [count, setCount] = useState<number | null>(null);
   const pathname = usePathname();
+  const refresher = useRef<ThrottledRefresh | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    const load = () =>
+    const r = createThrottledRefresh(() =>
       fetch('/api/attention/count', { cache: 'no-store' })
-        .then((r) => (r.ok ? r.json() : null))
+        .then((res) => (res.ok ? res.json() : null))
         .then((d) => {
           if (!cancelled) setCount(typeof d?.count === 'number' ? d.count : null);
-        })
-        .catch(() => undefined);
-    load();
-    const timer = window.setInterval(load, 120_000);
-    window.addEventListener(ATTENTION_CHANGED_EVENT, load);
-    window.addEventListener('focus', load);
+        }),
+    );
+    refresher.current = r;
+    r.request(true);
+    const routine = () => r.request(false);
+    const changed = () => r.request(true);
+    const timer = window.setInterval(routine, 120_000);
+    window.addEventListener(ATTENTION_CHANGED_EVENT, changed);
+    window.addEventListener('focus', routine);
     return () => {
       cancelled = true;
+      r.cancel();
+      refresher.current = null;
       window.clearInterval(timer);
-      window.removeEventListener(ATTENTION_CHANGED_EVENT, load);
-      window.removeEventListener('focus', load);
+      window.removeEventListener(ATTENTION_CHANGED_EVENT, changed);
+      window.removeEventListener('focus', routine);
     };
-    // Navigating (e.g. after paying a bill on its own screen) refreshes the count too.
+  }, []);
+
+  // Navigating (e.g. after paying a bill on its own screen) refreshes the count too (throttled).
+  const firstPath = useRef(true);
+  useEffect(() => {
+    if (firstPath.current) {
+      firstPath.current = false;
+      return;
+    }
+    refresher.current?.request(false);
   }, [pathname]);
 
   if (!count) return null;
