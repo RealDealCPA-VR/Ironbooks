@@ -15,7 +15,8 @@
  */
 import { and, eq } from 'drizzle-orm';
 import { companies, companyRoles, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
-import { hashPassword, MIN_PASSWORD_LENGTH } from '@/lib/auth';
+import { hashPassword } from '@/lib/auth';
+import { assertPasswordAllowed, storeUserPassword } from './passwordPolicy';
 import {
   ADMIN_ROLE_KEY,
   BUILTIN_ROLES,
@@ -294,7 +295,14 @@ async function writeRoleAssignments(
  */
 export async function addUser(
   ctx: ServiceContext,
-  input: { name: string; login: string; password?: string; roleKeys: string[] },
+  input: {
+    name: string;
+    login: string;
+    password?: string;
+    roleKeys: string[];
+    /** gapsb K: the new user must choose their own password at first sign-in. */
+    requireChange?: boolean;
+  },
 ): Promise<CompanyUser> {
   requirePermission(ctx, 'users', 'create');
   const login = normLogin(input.login);
@@ -312,15 +320,17 @@ export async function addUser(
       }
       id = existing.id;
     } else {
-      if (!input.password || input.password.length < MIN_PASSWORD_LENGTH) {
-        throw validation(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
-      }
+      if (!input.password) throw validation('A password is required for a new login.');
+      // gapsb K: the file's password policy (length, letters + numbers, symbol).
+      await assertPasswordAllowed(tx.db, input.password);
       const [created] = await tx.db
         .insert(users)
         .values({
           name: input.name.trim(),
           email: login,
           passwordHash: await hashPassword(input.password),
+          passwordChangedAt: new Date(),
+          mustChangePassword: input.requireChange === true,
         })
         .returning({ id: users.id });
       id = created.id;
@@ -445,25 +455,22 @@ export async function resetUserPassword(
   ctx: ServiceContext,
   userId: string,
   password: string,
+  opts: { requireChange?: boolean } = {},
 ): Promise<void> {
   requirePermission(ctx, 'users', 'modify');
   if (!(await getMembership(ctx, userId))) throw notFound('User');
   await assertCanManageUser(ctx, userId);
   await assertCanChangeSharedLogin(ctx, userId);
-  if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
-    throw validation(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
-  }
-  const hash = await hashPassword(password);
+  if (typeof password !== 'string') throw validation('A new password is required.');
+  // gapsb K: the file's password policy, including "don't reuse the last N passwords".
+  await assertPasswordAllowed(ctx.db, password, { userId });
   await inTransaction(ctx, async (tx) => {
-    await tx.db
-      .update(users)
-      .set({ passwordHash: hash, resetToken: null, resetExpires: null, updatedAt: new Date() })
-      .where(eq(users.id, userId));
+    await storeUserPassword(tx.db, userId, password, { mustChange: opts.requireChange === true });
     await writeAudit(tx, {
       action: 'update',
       entityType: 'user',
       entityId: userId,
-      newValues: { passwordReset: true },
+      newValues: { passwordReset: true, mustChangeAtNextSignIn: opts.requireChange === true },
     });
   });
 }

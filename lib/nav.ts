@@ -35,6 +35,7 @@ import { Bookmark, LineChart, Grid3x3, Search } from 'lucide-react'; // wave2 re
 import { Bell, CalendarDays, Contact, Mail, LayoutTemplate } from 'lucide-react';
 // p1 ux: Simple mode
 import { Home, PenLine, FilePlus2 } from 'lucide-react';
+import { KeyRound } from 'lucide-react'; // gapsb K: Change My Password
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -203,6 +204,7 @@ export const navGroups: NavGroup[] = [
       { icon: Users, label: 'Users & Roles', path: '/users', qb: 'Set Up Users and Roles', keywords: 'permissions access' },
       { icon: FileSpreadsheet, label: 'Migrate from QuickBooks', path: '/qb-import', qb: 'Import IIF / Convert', keywords: 'import iif convert' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security', qb: 'Security', keywords: 'two factor password' },
+      { icon: KeyRound, label: 'Change My Password', path: '/change-password', qb: 'Change Your Password', keywords: 'new password expired' }, // gapsb K
       { icon: Network, label: 'Privacy & Network', path: '/privacy', qb: 'Privacy', keywords: 'internet offline' },
       { icon: Users, label: 'Multi-user', path: '/multi-user', qb: 'Multi-user mode', keywords: 'network share host' },
       { icon: Settings, label: 'Preferences', path: '/settings', qb: 'Edit > Preferences', keywords: 'settings options company info' },

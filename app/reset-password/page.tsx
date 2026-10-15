@@ -4,13 +4,14 @@ import Link from 'next/link';
 import { KeyRound } from 'lucide-react';
 import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { api } from '@/lib/client';
-import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
+import { PasswordRulesHint, meetsPolicy, usePasswordPolicy } from '@/components/PasswordRules';
 
 export default function ResetPasswordPage() {
   const [email, setEmail] = useState('');
   const [token, setToken] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
+  const policy = usePasswordPolicy();
 
   async function requestToken() {
     setBusy(true);
@@ -79,18 +80,25 @@ export default function ResetPasswordPage() {
               <Input value={token} onChange={(e) => setToken(e.target.value)} placeholder="paste token" />
             </div>
             <div>
-              <Label>New password</Label>
-              <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={MIN_PASSWORD_LENGTH} />
+              <Label htmlFor="rp-new">New password</Label>
+              <Input
+                id="rp-new"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password"
+                aria-describedby="rp-new-rules"
+              />
+              <PasswordRulesHint id="rp-new-rules" password={password} policy={policy} />
             </div>
-            <Button type="submit" className="w-full" loading={busy} disabled={!token || password.length < MIN_PASSWORD_LENGTH}>
+            <Button type="submit" className="w-full" loading={busy} disabled={!token || !meetsPolicy(password, policy)}>
               Set new password
             </Button>
           </form>
         </div>
         <p className="mt-4 text-xs text-navy/60">
           Self-service reset is only for a company file with a single user. If your file has
-          several users, ask an Admin to reset your password in Users &amp; Roles. New passwords
-          need at least {MIN_PASSWORD_LENGTH} characters.
+          several users, ask an Admin to reset your password in Users &amp; Roles.
         </p>
         <p className="mt-6 text-center text-sm text-navy/50">
           <Link href="/login" className="text-electric font-semibold hover:underline">Back to sign in</Link>

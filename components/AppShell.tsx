@@ -19,7 +19,7 @@ import { api } from '@/lib/client';
 import { Help } from '@/components/Help';
 import { pageHelpFor } from '@/lib/pageHelp';
 import type { Area } from '@/lib/permissions/model';
-import { blockingFeatureGate, featureHiddenPaths } from '@/lib/preferences';
+import { blockingFeatureGate, featureHiddenPaths, multiCurrencyHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
 import PreferenceBehaviors from './PreferenceBehaviors';
 import {
@@ -33,7 +33,7 @@ import { Modal, toast } from '@/components/ui';
 import { Briefcase, Building2, ChevronDown, ChevronRight, LogOut, Search, Sparkles } from 'lucide-react';
 
 // Routes that render without the app chrome (full-screen).
-const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock'];
+const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock', '/change-password'];
 
 interface CompanyRow {
   id: string;
@@ -546,7 +546,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // units of measure) drop out of the sidebar like QB's menus, their pages show a plain
   // 'turned off' message, and the server refuses their saves (lib/featureGate.ts).
   const prefs = usePreferences(!bare);
-  const hiddenPaths = React.useMemo(() => featureHiddenPaths(prefs.company), [prefs.company]);
+  const hiddenPaths = React.useMemo(
+    () =>
+      new Set([
+        ...featureHiddenPaths(prefs.company),
+        // gapsb A2: Currencies is hidden while Multiple Currencies is off.
+        ...(prefs.loaded ? multiCurrencyHiddenPaths(prefs.company) : []),
+      ]),
+    [prefs.company, prefs.loaded],
+  );
   // Menu style (My Preferences > General > Menu style, or the switch in the sidebar). The last
   // choice is cached locally so the menu doesn't flicker while preferences load.
   const [localMode, setLocalMode] = React.useState<NavMode | null>(null);

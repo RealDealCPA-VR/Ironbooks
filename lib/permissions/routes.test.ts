@@ -147,9 +147,11 @@ describe('API permission map coverage', () => {
         '/api/auth/2fa/disable',
         '/api/auth/2fa/enable',
         '/api/auth/2fa/setup',
+        '/api/auth/change-password', // gapsb K: own password (also when expired)
         '/api/auth/login',
         '/api/auth/logout',
         '/api/auth/me',
+        '/api/auth/password-policy', // gapsb K: the rules only, for the sign-up / reset forms
         '/api/auth/request-reset',
         '/api/auth/reset',
         '/api/auth/signup',

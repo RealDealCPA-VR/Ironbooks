@@ -20,6 +20,8 @@ import { enforceFeatureGate } from '@/lib/featureGate';
 import { companies, userCompanies, users } from '@/lib/db/schema';
 import { getSessionInfo, hasValidUnlockCookie } from '@/lib/auth';
 import { assertSessionAllowed } from '@/lib/services/sessions';
+import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
+import { PASSWORD_CHANGE_REQUIRED_MESSAGE } from '@/lib/passwordPolicy';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 
@@ -126,6 +128,9 @@ export async function getServerContext(): Promise<ServiceContext> {
   const userId = session?.userId ?? null;
 
   if (userId) {
+    // gapsb K: a password that must be changed (expired / Admin asked) blocks everything except
+    // choosing a new one (/api/auth/change-password uses getSessionGate, not this).
+    await assertPasswordChangeNotRequired(db, userId);
     // Only ACTIVE memberships select a company (deactivated users are locked out).
     const active = and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true));
     const sel = await selectedCompanyCookie();
@@ -244,6 +249,9 @@ export async function getPageContext(nextPath: string): Promise<ServiceContext> 
       }
       if (err.message === 'Authentication required.' || err.message === DEACTIVATED_MESSAGE) {
         redirect('/login?next=' + encodeURIComponent(nextPath));
+      }
+      if (err.message === PASSWORD_CHANGE_REQUIRED_MESSAGE) {
+        redirect('/change-password?next=' + encodeURIComponent(nextPath));
       }
       // Role lacks access to this page (lib/permissions/routes.ts PAGE_AREAS).
       if (err.message.startsWith(PERMISSION_DENIED_PREFIX)) {

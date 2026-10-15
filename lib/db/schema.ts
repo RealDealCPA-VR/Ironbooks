@@ -35,6 +35,10 @@ export const users = pgTable('users', {
   resetExpires: timestamp('reset_expires'),
   totpSecret: text('totp_secret'),
   totpEnabled: boolean('totp_enabled').notNull().default(false),
+  /** gapsb (0056): when the password was last set — password expiry counts from here. */
+  passwordChangedAt: timestamp('password_changed_at'),
+  /** gapsb (0056): the next sign-in must choose a new password (expired / admin asked). */
+  mustChangePassword: boolean('must_change_password').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -2540,5 +2544,13 @@ export const workersCompCodes = pgTable('workers_comp_codes', {
   /** Premium per $100 of wages, e.g. 1.2500. */
   ratePer100: decimal('rate_per_100', { precision: 9, scale: 4 }).notNull().default('0'),
   isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- gapsb (0056): password policy — earlier password hashes (bcrypt) for "don't reuse" ----
+export const passwordHistory = pgTable('password_history', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  passwordHash: text('password_hash').notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

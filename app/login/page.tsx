@@ -16,7 +16,7 @@ export default function LoginPage() {
     e.preventDefault();
     setBusy(true);
     try {
-      const res = await api.post<{ requires2fa?: boolean }>('/api/auth/login', {
+      const res = await api.post<{ requires2fa?: boolean; mustChangePassword?: boolean; passwordChangeReason?: string }>('/api/auth/login', {
         email,
         password,
         totp: totp || undefined,
@@ -27,6 +27,12 @@ export default function LoginPage() {
         return;
       }
       const next = new URLSearchParams(window.location.search).get('next') || '/dashboard';
+      // gapsb K: an expired password (or one an Admin asked to change) must be replaced first.
+      if (res?.mustChangePassword) {
+        window.location.href =
+          '/change-password?next=' + encodeURIComponent(next) + '&reason=' + encodeURIComponent(res.passwordChangeReason ?? 'required');
+        return;
+      }
       window.location.href = next;
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Login failed', 'danger');

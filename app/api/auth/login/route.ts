@@ -27,6 +27,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { startSession } from '@/lib/services/sessions';
 import { loginSchema } from '@/lib/validation/users';
+import { passwordStatusAtSignIn } from '@/lib/services/passwordPolicy';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 
@@ -114,6 +115,10 @@ async function handlePost(req: NextRequest) {
       companyId = owned?.id;
     }
 
+    // gapsb K: an old password still signs in; when it has expired (file password policy) or an
+    // Admin asked for a new one, the session can only choose a new password (/change-password).
+    const passwordChange = await passwordStatusAtSignIn(db, user);
+
     const session = await startSession(db, {
       userId: user.id,
       companyId: companyId ?? null,
@@ -122,7 +127,13 @@ async function handlePost(req: NextRequest) {
       viaHost: origin.remote,
     });
 
-    const res = NextResponse.json({ id: user.id, name: user.name, email: user.email, companyId });
+    const res = NextResponse.json({
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      companyId,
+      ...(passwordChange ? { mustChangePassword: true, passwordChangeReason: passwordChange } : {}),
+    });
     const opts = { httpOnly: true, secure: cookieSecure(origin), sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
     res.cookies.set(SESSION_COOKIE, createSessionToken(user.id, 'user', session.id), opts);
     if (companyId) res.cookies.set(COMPANY_COOKIE, companyId, opts);
