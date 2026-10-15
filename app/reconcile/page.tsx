@@ -157,22 +157,14 @@ function StartForm({
   const [undoing, setUndoing] = useState(false);
   const [confirmUndo, setConfirmUndo] = useState(false);
 
-  // Deep link (Needs attention > Reconcile): ?account=<bank account id>&through=YYYY-MM-DD picks
-  // the account and the statement date.
+  // Deep links: Needs attention > Reconcile (?account=<bank account id>&through=YYYY-MM-DD) and the
+  // month-end close checklist (?bankAccountId=...&statementDate=YYYY-MM-DD) pick the account and date.
   useEffect(() => {
     const q = new URLSearchParams(window.location.search);
-    const account = q.get('account');
-    const through = q.get('through');
+    const account = q.get('account') ?? q.get('bankAccountId');
+    const through = q.get('through') ?? q.get('statementDate');
     if (account && bankAccounts.some((b) => b.id === account)) setBankAccountId(account);
     if (through && /^\d{4}-\d{2}-\d{2}$/.test(through)) setStatementDate(through);
-  // Deep link from the month-end close checklist: ?bankAccountId=…&statementDate=YYYY-MM-DD
-  // pre-fills the account and statement date.
-  useEffect(() => {
-    const q = new URLSearchParams(window.location.search);
-    const ba = q.get('bankAccountId');
-    const sd = q.get('statementDate');
-    if (ba && bankAccounts.some((b) => b.id === ba)) setBankAccountId(ba);
-    if (sd && /^\d{4}-\d{2}-\d{2}$/.test(sd)) setStatementDate(sd);
   }, [bankAccounts]);
 
   // Load Begin-Reconciliation info (beginning balance, last reconciled,

@@ -325,15 +325,10 @@ describe('Needs attention inbox (integration)', () => {
     await categorize(t.ctx, { bankTransactionId: ids.coffee, accountId: coffee.data.suggestedAccountId as string });
     // Mark the to-do done.
     await updateTodo(t.ctx, ids.todo, { done: true });
-    // Back up now (to a scratch folder beside the test company).
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bka-attention-backups-'));
-    try {
-      const b = await backupNow(t.ctx, { dir, dataDir: t.dir });
-      expect(fs.existsSync(path.join(dir, b.filename))).toBe(true);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-    r = await getAttention(t.ctx, { today: TODAY, now: NOW, includeHidden: true });
+    // Back up now: a versioned backup in the company file's backup folder, recorded in the history.
+    const b = await backupNow(t.ctx, { dataDir: t.dir });
+    expect(fs.existsSync(path.join(b.folder, b.filename))).toBe(true);
+    r = await getAttention(t.ctx, { today: TODAY, now: NOW, includeHidden: true, dataDir: t.dir });
     expect(r.items.some((i) => i.key === `bank_txn:${ids.coffee}`)).toBe(false);
     // The sorted line's and the finished to-do's dismissals were cleaned up.
     expect(await myStates()).toEqual([]);
@@ -341,7 +336,7 @@ describe('Needs attention inbox (integration)', () => {
     expect(ofKind(r.items, 'todo')).toHaveLength(0);
     expect(ofKind(r.items, 'backup')).toHaveLength(0);
     // A week later the backup is stale again (new key, so an old dismissal wouldn't hide it).
-    const later = await getAttention(t.ctx, { today: '2026-12-01', now: new Date('2026-12-01T12:00:00Z') });
+    const later = await getAttention(t.ctx, { today: '2026-12-01', now: new Date('2026-12-01T12:00:00Z'), dataDir: t.dir });
     const backup = ofKind(later.items, 'backup')[0];
     expect(backup.key).not.toBe('backup:never');
   });

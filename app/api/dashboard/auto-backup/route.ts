@@ -33,7 +33,6 @@ import { getCompany } from '@/lib/services/company';
 import { createBackup } from '@/lib/services/backup';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { requireFileAdmin } from '@/lib/services/access';
-import { recordBackup } from '@/lib/services/attention';
 import { recordBackup } from '@/lib/services/backupHistory';
 import { currentFingerprint } from '@/lib/services/backupFingerprint';
 import { ensureBackupScheduler, runVersionedBackup } from '@/lib/services/backupSchedule';
@@ -91,7 +90,6 @@ export async function POST(req: NextRequest) {
 
     const fingerprint = currentFingerprint();
     const { buffer, filename } = createBackup(companyName);
-    await recordBackup(ctx.db, { kind: 'auto', userId: ctx.userId, filename }); // inbox: last backup
     recordBackup({ source: 'quit', kind: 'full', filename, path: null, sizeBytes: buffer.byteLength, fingerprint, note: 'Automatic backup when the app closed' });
     const arrayBuf: ArrayBuffer = buffer.buffer.slice(
       buffer.byteOffset,

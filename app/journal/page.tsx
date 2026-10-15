@@ -174,7 +174,7 @@ interface EntryFormModalProps {
 }
 
 /** Which kind of name a line's account requires (QB: A/R needs a customer, A/P a vendor). */
-const NAME_HINT = { customer: 'Customer', vendor: 'Vendor', employee: 'Employee' } as const;
+const NAME_HINT = { customer: 'Customer', vendor: 'Vendor', employee: 'Employee', other: 'Other name' } as const;
 
 function requiredNameKind(acct: Account | undefined): 'customer' | 'vendor' | null {
   if (!acct) return null;
@@ -255,8 +255,11 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
     .map((a) => ({ id: a.id, label: formatAccountLabel(a, prefs.company), terms: [a.code, a.name] }));
   const classChoices: TypeaheadChoice[] = classes.map((c) => ({ id: c.id, label: c.name }));
   /** A/R lines list only customers and A/P lines only vendors (as the server requires). */
-  const nameChoicesFor = (need: 'customer' | 'vendor' | null): TypeaheadChoice[] =>
-    names.filter((n) => !need || n.kind === need).map((n) => ({ id: n.value, label: n.label, hint: NAME_HINT[n.kind] }));
+  /** Inactive names are offered only on the line that already uses them (gapsa). */
+  const nameChoicesFor = (need: 'customer' | 'vendor' | null, selected?: string | null): TypeaheadChoice[] =>
+    activeOrSelected(names, selected)
+      .filter((n) => !need || n.kind === need)
+      .map((n) => ({ id: n.value, label: n.label, hint: NAME_HINT[n.kind] }));
 
   // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
   const grid = useGridKeys({
@@ -480,29 +483,11 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
                     ? '— Pick customer —'
                     : requiredNameKind(accountById.get(line.accountId)) === 'vendor'
                       ? '— Pick vendor —'
-                      : '— No name —'}
-                </option>
-                {(['customer', 'vendor', 'employee', 'other'] as const).map((kind) => {
-                  const need = requiredNameKind(accountById.get(line.accountId));
-                  if (need && need !== kind) return null;
-                  const opts = activeOrSelected(names.filter((n) => n.kind === kind), line.name);
-                  if (opts.length === 0) return null;
-                  return (
-                    <optgroup key={kind} label={NAME_GROUP_LABEL[kind]}>
-                      {opts.map((n) => (
-                        <option key={n.value} value={n.value}>
-                          {n.label}
-                        </option>
-                      ))}
-                    </optgroup>
-                  );
-                })}
-              </Select>
                       : '— No name —'
                 }
                 value={line.name}
                 onChange={(id) => updateLine(line.id, 'name', id)}
-                choices={nameChoicesFor(requiredNameKind(accountById.get(line.accountId)))}
+                choices={nameChoicesFor(requiredNameKind(accountById.get(line.accountId)), line.name)}
               />
 
               {prefs.company.classTrackingEnabled || line.classId ? (

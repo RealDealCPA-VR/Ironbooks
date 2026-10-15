@@ -23,7 +23,6 @@ import { ServiceError } from '@/lib/services/_base';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { requireFileAdmin } from '@/lib/services/access';
 import { withDamagedFileAccess } from '@/lib/db';
-import { recordBackup } from '@/lib/services/attention';
 import { recordBackup } from '@/lib/services/backupHistory';
 import { currentFingerprint } from '@/lib/services/backupFingerprint';
 
@@ -76,7 +75,6 @@ async function handleGet(_req: NextRequest) {
 
     const fingerprint = currentFingerprint();
     const { buffer, filename } = createBackup(companyName);
-    await recordBackup(ctx.db, { kind: 'full', userId: ctx.userId, filename }); // inbox: last backup
     // Backup history ("Last backup: …" indicator): a browser download has no path on this machine.
     recordBackup({ source: 'manual', kind: 'full', filename, path: null, sizeBytes: buffer.byteLength, fingerprint, note: 'Downloaded' });
 

@@ -29,7 +29,6 @@ import {
   accounts,
   attentionItemStates,
   auditLogs,
-  backupLog,
   bankAccounts,
   bankTransactions,
   bills,
@@ -54,7 +53,8 @@ import { listUndepositedPayments } from './deposits';
 import { canSeeTodoLink } from './todos';
 import { requireFileAdmin } from './access';
 import { isConfigured as emailIsConfigured, sendMail } from './email';
-import { createBackup } from './backup';
+import { lastFullBackup, readBackupHistory } from './backupHistory';
+import { runVersionedBackup } from './backupSchedule';
 import { buildInvoicePdf } from '@/lib/pdf/forms';
 import { ATTENTION_KINDS, UUID_RE, parseAttentionKey, type AttentionKind } from '@/lib/attentionKinds';
 import { getHomeCurrencyCode } from './currencies';
@@ -136,6 +136,8 @@ export interface AttentionOptions {
   countOnly?: boolean;
   /** Undeposited Funds older than this many days are flagged (default 3). */
   undepositedDays?: number;
+  /** Company file data folder for the backup history (tests); default = the open file. */
+  dataDir?: string;
 }
 
 export const BILL_HORIZON_DAYS = 7;
@@ -278,6 +280,8 @@ interface SourceEnv {
   homeCurrency: string;
   companyCreatedAt: Date | null;
   payrollLiabilityAccountId: string | null;
+  /** Company file data folder (backup history lives there); default = the open file. */
+  dataDir?: string;
 }
 
 interface SourceResult {
@@ -753,7 +757,7 @@ const todoSource: Source = async ({ ctx, today }) => {
 };
 
 /** No backup of the company file for more than a week. */
-const backupSource: Source = async ({ ctx, today, companyCreatedAt }) => {
+const backupSource: Source = async ({ ctx, today, companyCreatedAt, dataDir }) => {
   if (ctx.access) {
     try {
       await requireFileAdmin(ctx);
@@ -761,11 +765,10 @@ const backupSource: Source = async ({ ctx, today, companyCreatedAt }) => {
       return { items: [] }; // only a file Admin can back up the whole file
     }
   }
-  const [row] = await ctx.db
-    .select({ at: sql<string | null>`MAX(${backupLog.createdAt})` })
-    .from(backupLog)
-    .where(eq(backupLog.companyId, ctx.companyId));
-  const last = isoDay(row?.at ?? null);
+  // Backup history is kept by lib/services/backupHistory.ts (every manual, scheduled, quit-time
+  // and Back up now copy of the whole file).
+  const newestFull = lastFullBackup(readBackupHistory(dataDir));
+  const last = isoDay(newestFull?.at ?? null);
   const since = last ?? isoDay(companyCreatedAt) ?? today;
   const age = daysBetween(since, today);
   if (age <= BACKUP_STALE_DAYS) return { items: [] };
@@ -891,6 +894,7 @@ export async function getAttention(ctx: ServiceContext, opts: AttentionOptions =
     homeCurrency,
     companyCreatedAt: company?.createdAt ?? null,
     payrollLiabilityAccountId: prefs.payrollLiabilityAccountId ?? null,
+    dataDir: opts.dataDir,
   };
 
   const kinds = new Set(attentionKindsFor(ctx));
@@ -1141,65 +1145,16 @@ export async function sendPaymentReminder(
 // Backups
 // ---------------------------------------------------------------------------
 
-/**
- * Note that a backup was made. A whole-file backup ('full' / 'auto' / 'quick') covers every
- * company in the file; a per-company one only that company. Never throws (bookkeeping only).
- */
-export async function recordBackup(
-  db: DB,
-  input: { kind: 'full' | 'company' | 'auto' | 'quick'; companyId?: string; userId?: string | null; filename?: string | null },
-): Promise<void> {
-  try {
-    const ids =
-      input.kind === 'company' && input.companyId
-        ? [input.companyId]
-        : (await db.select({ id: companies.id }).from(companies)).map((c) => c.id);
-    if (!ids.length) return;
-    await db.insert(backupLog).values(
-      ids.map((companyId) => ({
-        companyId,
-        userId: input.userId ?? null,
-        kind: input.kind,
-        filename: input.filename ? input.filename.slice(0, 255) : null,
-      })),
-    );
-  } catch (err) {
-    console.warn('[attention] could not record backup:', err instanceof Error ? err.message : err);
-  }
-}
-
-/** Folder for Back up now copies: beside the company data folder, never inside it. */
-export function quickBackupDir(dataDir?: string): string {
-  return path.join(path.dirname(resolveDataDir(dataDir)), 'Ironbooks Backups');
-}
-
-export const QUICK_BACKUP_KEEP = 20;
-
-/**
- * Back up now: write a full backup (.bka) of the company file to the backups folder on this
- * computer (nothing leaves the machine), keep the newest QUICK_BACKUP_KEEP, and record it.
- * Only an Admin of every company in the file may do this (the archive holds all of them).
- */
 export async function backupNow(
   ctx: ServiceContext,
-  opts: { dir?: string; dataDir?: string } = {},
+  opts: { dataDir?: string } = {},
 ): Promise<{ filename: string; folder: string; createdAt: string }> {
   await requireFileAdmin(ctx);
   const company = await getCompany(ctx);
-  const { buffer, filename } = createBackup(company?.name ?? undefined, opts.dataDir);
-  const folder = opts.dir ?? quickBackupDir(opts.dataDir);
-  fs.mkdirSync(folder, { recursive: true });
-  fs.writeFileSync(path.join(folder, filename), buffer);
-  try {
-    const files = fs
-      .readdirSync(folder)
-      .filter((f) => f.startsWith('ironbooks-backup') && f.endsWith('.bka'))
-      .map((f) => ({ f, t: fs.statSync(path.join(folder, f)).mtimeMs }))
-      .sort((a, b) => b.t - a.t || b.f.localeCompare(a.f));
-    for (const old of files.slice(QUICK_BACKUP_KEEP)) fs.rmSync(path.join(folder, old.f), { force: true });
-  } catch {
-    /* pruning is best effort */
-  }
-  await recordBackup(ctx.db, { kind: 'quick', userId: ctx.userId, filename });
-  return { filename, folder, createdAt: new Date().toISOString() };
+  // Same versioned backup as Backup > Back up now: saved in the backup folder, rotated, and
+  // recorded in the backup history that drives "Last backup" and this inbox item.
+  const result = await runVersionedBackup('manual', { dataDir: opts.dataDir, companyName: company?.name ?? null, force: true });
+  if (result.status !== 'created') throw new Error('Backup was not created');
+  const rec = result.record;
+  return { filename: rec.filename, folder: rec.path ? path.dirname(rec.path) : '', createdAt: rec.at };
 }

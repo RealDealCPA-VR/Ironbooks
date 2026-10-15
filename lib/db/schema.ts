@@ -2563,41 +2563,6 @@ export const attentionItemStates = pgTable('attention_item_states', {
   snoozedUntil: timestamp('snoozed_until'),
   /** Hidden for good (until the item's key changes). */
   dismissedAt: timestamp('dismissed_at'),
-// ---- receipt capture (0050): local OCR + phone upload ----
-/**
- * One receipt photo / PDF in the Doc Center inbox and what was read from it. The file is an
- * `attachments` row (unfiled until saved, then filed to the transaction it became).
- * `version` is the record-locking counter (re-reading and saving must name it).
- */
-export const receiptScans = pgTable('receipt_scans', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  companyId: uuid('company_id').references(() => companies.id).notNull(),
-  attachmentId: uuid('attachment_id').references(() => attachments.id, { onDelete: 'cascade' }).notNull(),
-  /** 'desktop' | 'phone' */
-  source: varchar('source', { length: 20 }).notNull().default('desktop'),
-  /** 'pending' | 'processing' | 'ready' | 'failed' | 'saved' */
-  status: varchar('status', { length: 20 }).notNull().default('pending'),
-  /** How the text was read: 'pdf-text' | 'ocr' | 'vision' | 'none' */
-  method: varchar('method', { length: 20 }),
-  /** Plain-language note shown on the review screen (why nothing could be read, ...). */
-  message: text('message'),
-  vendorName: varchar('vendor_name', { length: 255 }),
-  /** ISO day yyyy-mm-dd as printed on the receipt. */
-  receiptDate: varchar('receipt_date', { length: 10 }),
-  total: decimal('total', { precision: 15, scale: 2 }),
-  subtotal: decimal('subtotal', { precision: 15, scale: 2 }),
-  tax: decimal('tax', { precision: 15, scale: 2 }),
-  cardLast4: varchar('card_last4', { length: 4 }),
-  cardBrand: varchar('card_brand', { length: 40 }),
-  reference: varchar('reference', { length: 60 }),
-  confidence: jsonb('confidence').$type<Record<string, number>>(),
-  rawText: text('raw_text'),
-  /** The transaction the receipt became: 'expense' (check / cash / card charge) | 'bill'. */
-  txnType: varchar('txn_type', { length: 20 }),
-  txnId: uuid('txn_id'),
-  createdBy: uuid('created_by'),
-  version: integer('version').notNull().default(1),
-  processingStartedAt: timestamp('processing_started_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -2639,6 +2604,46 @@ export const undoActions = pgTable('undo_actions', {
   expiresAt: timestamp('expires_at'),
   undoneAt: timestamp('undone_at'),
 });
+
+// ---- receipt capture (0050): local OCR + phone upload ----
+/**
+ * One receipt photo / PDF in the Doc Center inbox and what was read from it. The file is an
+ * `attachments` row (unfiled until saved, then filed to the transaction it became).
+ * `version` is the record-locking counter (re-reading and saving must name it).
+ */
+export const receiptScans = pgTable('receipt_scans', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  attachmentId: uuid('attachment_id').references(() => attachments.id, { onDelete: 'cascade' }).notNull(),
+  /** 'desktop' | 'phone' */
+  source: varchar('source', { length: 20 }).notNull().default('desktop'),
+  /** 'pending' | 'processing' | 'ready' | 'failed' | 'saved' */
+  status: varchar('status', { length: 20 }).notNull().default('pending'),
+  /** How the text was read: 'pdf-text' | 'ocr' | 'vision' | 'none' */
+  method: varchar('method', { length: 20 }),
+  /** Plain-language note shown on the review screen (why nothing could be read, ...). */
+  message: text('message'),
+  vendorName: varchar('vendor_name', { length: 255 }),
+  /** ISO day yyyy-mm-dd as printed on the receipt. */
+  receiptDate: varchar('receipt_date', { length: 10 }),
+  total: decimal('total', { precision: 15, scale: 2 }),
+  subtotal: decimal('subtotal', { precision: 15, scale: 2 }),
+  tax: decimal('tax', { precision: 15, scale: 2 }),
+  cardLast4: varchar('card_last4', { length: 4 }),
+  cardBrand: varchar('card_brand', { length: 40 }),
+  reference: varchar('reference', { length: 60 }),
+  confidence: jsonb('confidence').$type<Record<string, number>>(),
+  rawText: text('raw_text'),
+  /** The transaction the receipt became: 'expense' (check / cash / card charge) | 'bill'. */
+  txnType: varchar('txn_type', { length: 20 }),
+  txnId: uuid('txn_id'),
+  createdBy: uuid('created_by'),
+  version: integer('version').notNull().default(1),
+  processingStartedAt: timestamp('processing_started_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
 /** Short-lived phone upload links (only the SHA-256 of the token is stored). */
 export const receiptUploadTokens = pgTable('receipt_upload_tokens', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -2652,6 +2657,7 @@ export const receiptUploadTokens = pgTable('receipt_upload_tokens', {
   lastUsedAt: timestamp('last_used_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
 // ---- month-end close (drizzle/0051_monthend.sql) ----
 /** What one person recorded about one month-end checklist step (lib/services/monthEndClose.ts). */
 export interface MonthEndStepState {
@@ -2681,6 +2687,7 @@ export const monthEndCloses = pgTable('month_end_closes', {
   /** Record-locking version. */
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
+
 // ---- gapsb (0056): password policy — earlier password hashes (bcrypt) for "don't reuse" ----
 export const passwordHistory = pgTable('password_history', {
   id: uuid('id').primaryKey().defaultRandom(),
