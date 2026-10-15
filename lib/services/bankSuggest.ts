@@ -159,10 +159,11 @@ export async function suggestForAccount(
     const ruleAccount = rule ? rule.setAccountId ?? rule.splits?.[0]?.accountId ?? null : null;
     if (rule && ruleAccount) {
       signals.push({ source: 'rule', accountId: ruleAccount, classId: rule.setClassId, confidence: RULE_CONFIDENCE, reason: `Matched rule "${rule.name}"` });
-    } else if (t.suggestedAccountId && usable.has(t.suggestedAccountId)) {
-      rule = null;
-      signals.push({ source: 'rule', accountId: t.suggestedAccountId, confidence: 0.9, reason: 'Suggested by a rule when the line was imported' });
     }
+    // NOTE: bank_transactions.suggested_account_id (stamped by a rule at import time) is
+    // deliberately NOT used here. Every live rule was just evaluated above, so that stale value
+    // only differs when its rule has since been switched off, deleted or edited — exactly when
+    // it is wrong — and it must never feed "Accept all high-confidence".
 
     // 2. History of the same pattern + direction.
     const events = history
@@ -352,7 +353,8 @@ export async function bulkAccept(
       }
       const splits = explicit ? item.splits ?? null : s?.splits ?? null;
       // A line counts as "accepted from the rule" only if the user took the rule's choice as-is.
-      const fromRule = !!s?.ruleId && (!explicit || (accountId === s.accountId && !item.splits));
+      const sameSplits = !item.splits || (!!s?.splits && JSON.stringify(item.splits) === JSON.stringify(s.splits));
+      const fromRule = !!s?.ruleId && (!explicit || (accountId === s.accountId && sameSplits));
       const r = await inTransaction(ctx, async (tx) => {
         const res = await categorize(tx, {
           bankTransactionId: item.bankTransactionId,

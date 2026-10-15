@@ -38,7 +38,7 @@ export const ruleBodySchema = z.object({
   splits: z.array(splitSchema).max(20).nullable().optional(),
   mode: z.enum(RULE_MODES as unknown as [string, ...string[]]).optional(),
   enabled: z.boolean().optional(),
-  priority: z.number().int().optional(),
+  priority: z.number().int().min(-1_000_000, 'Priority is too small.').max(1_000_000, 'Priority is too large.').optional(),
 });
 
 export const ruleUpdateSchema = ruleBodySchema.partial().extend({

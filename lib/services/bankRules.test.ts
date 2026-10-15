@@ -18,6 +18,7 @@ import {
   accounts,
   bankAccounts,
   bankCategorizationHistory,
+  bankRuleDismissals,
   bankTransactions,
   classes,
   companies,
@@ -45,6 +46,7 @@ import {
 } from './bankRules';
 import { bulkAccept, runAutoRules, suggestForAccount } from './bankSuggest';
 import { matchRule } from './rules';
+import { ruleBodySchema } from '@/lib/bankRules/schemas';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-bankrules');
 
@@ -447,6 +449,77 @@ describe('bank rules that learn', () => {
     });
   });
 
+  describe('review fixes (round 2)', () => {
+    it('a rule switched off (or deleted) after import never drives a suggestion or "accept all high-confidence"', async () => {
+      // Own bank account so other suites' leftover lines cannot be swept up.
+      const ba = (await db.insert(bankAccounts).values({ companyId: ctx.companyId, accountId: checkingGl, bankName: 'Probe Bank', accountNumber: '3333' }).returning())[0].id;
+      const rule = await createBankRule(ctx, { name: 'Burger → Meals', matchValue: 'zorbo burger', setAccountId: meals });
+      const line = await feed('ZORBO BURGER 5521', '-18.00', '2025-03-28', ba);
+      // What the import-time rule pass leaves behind.
+      await db.update(bankTransactions).set({ suggestedAccountId: meals }).where(eq(bankTransactions.id, line));
+      const live = await suggestForAccount(ctx, ba, { localModel: false });
+      expect(live[0].source).toBe('rule');
+      expect(live[0].confidence).toBeGreaterThanOrEqual(90);
+
+      await updateBankRule(ctx, rule.id, { enabled: false });
+      const [off] = await suggestForAccount(ctx, ba, { localModel: false });
+      expect(off.source).not.toBe('rule');
+      expect(off.ruleId).toBeNull();
+      expect(off.confidence).toBeLessThan(90);
+      const res = await bulkAccept(ctx, { bankAccountId: ba, allHighConfidence: true }, { localModel: false });
+      expect(res.accepted).toHaveLength(0);
+
+      await deleteBankRule(ctx, rule.id);
+      const [gone] = await suggestForAccount(ctx, ba, { localModel: false });
+      expect(gone.source).not.toBe('rule');
+      expect(gone.confidence).toBeLessThan(90);
+      expect((await bulkAccept(ctx, { bankAccountId: ba, allHighConfidence: true }, { localModel: false })).accepted).toHaveLength(0);
+      const [row] = await db.select().from(bankTransactions).where(eq(bankTransactions.id, line));
+      expect(row.matched).toBe(false);
+    });
+
+    it('a kept split suggestion posts as a split, with the row class as default for unclassed split lines', async () => {
+      await createBankRule(ctx, {
+        name: 'Internet split',
+        matchValue: 'comcast',
+        splits: [
+          { accountId: office, percent: '50' },
+          { accountId: fuel, classId: classB, percent: '50' },
+        ],
+      });
+      const line = await feed('COMCAST CABLE 0912', '-80.00', '2025-03-28');
+      const [sg] = await suggestForAccount(ctx, bankAccountId, { bankTransactionIds: [line], localModel: false });
+      expect(sg.splits).toHaveLength(2);
+      // What the review screen now sends for "Accept selected" when the user kept the suggestion
+      // and the row's Class picker holds a class.
+      const res = await bulkAccept(
+        ctx,
+        { items: [{ bankTransactionId: line, accountId: sg.accountId!, classId: classA, splits: sg.splits }] },
+        { localModel: false },
+      );
+      expect(res.failed).toEqual([]);
+      const lines = await entryLines(res.accepted[0].entryId);
+      expect(lines.find((l) => l.accountId === office)?.debit).toBe('40.00');
+      expect(lines.find((l) => l.accountId === office)?.classId).toBe(classA);
+      expect(lines.find((l) => l.accountId === fuel)?.debit).toBe('40.00');
+      expect(lines.find((l) => l.accountId === fuel)?.classId).toBe(classB);
+      expect((await listBankRules(ctx)).find((r) => r.name === 'Internet split')!.appliedCount).toBe(1);
+      await expectBalanced(ctx);
+    });
+
+    it('rule priority must be a sane whole number (API schema and service)', async () => {
+      const base = { name: 'P', matchValue: 'x', setAccountId: fuel };
+      const bad = ruleBodySchema.safeParse({ ...base, priority: 1e12 });
+      expect(bad.success).toBe(false);
+      expect(bad.error!.issues[0].path).toEqual(['priority']);
+      expect(ruleBodySchema.safeParse({ ...base, priority: 1_000_000 }).success).toBe(true);
+      await expect(createBankRule(ctx, { ...base, priority: 1e12 })).rejects.toThrow(/Priority must be/);
+      const r = await createBankRule(ctx, { ...base, name: 'Priority probe', matchValue: 'qqqprobe' });
+      await expect(updateBankRule(ctx, r.id, { priority: -5_000_000 })).rejects.toThrow(/Priority must be/);
+      await deleteBankRule(ctx, r.id);
+    });
+  });
+
   describe('auto-apply rules', () => {
     it('posts lines whose first matching rule is in auto mode, through categorize', async () => {
       const rule = await createBankRule(ctx, {
@@ -498,7 +571,15 @@ describe('bank rules that learn', () => {
       .from(bankCategorizationHistory)
       .where(and(eq(bankCategorizationHistory.companyId, ctx.companyId), eq(bankCategorizationHistory.accountId, meals)));
     expect(before.length).toBeGreaterThan(0);
+    // The same pattern dismissed for both accounts must not break the merge (unique index).
+    await dismissOffer(ctx, { pattern: 'DUP PATTERN', accountId: meals });
+    await dismissOffer(ctx, { pattern: 'DUP PATTERN', accountId: office });
+    await dismissOffer(ctx, { pattern: 'ONLY MEALS', accountId: meals });
     await mergeAccounts(ctx, { fromId: meals, toId: office });
+    const dismissals = await db.select().from(bankRuleDismissals).where(eq(bankRuleDismissals.companyId, ctx.companyId));
+    expect(dismissals.some((d) => d.accountId === meals)).toBe(false);
+    expect(dismissals.filter((d) => d.pattern === 'DUP PATTERN').map((d) => d.accountId)).toEqual([office]);
+    expect(dismissals.filter((d) => d.pattern === 'ONLY MEALS').map((d) => d.accountId)).toEqual([office]);
     const after = await db
       .select()
       .from(bankCategorizationHistory)

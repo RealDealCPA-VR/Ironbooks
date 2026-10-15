@@ -417,7 +417,8 @@ export default function BankReviewPage() {
         // bankrules: keep the suggestion's payee / memo / split when the user kept its account.
         ...(keepsSuggestion && sg.payee ? { payee: sg.payee } : {}),
         ...(keepsSuggestion && sg.memo ? { memo: sg.memo } : {}),
-        ...(keepsSuggestion && sg.splits && !classId ? { splits: sg.splits } : {}),
+        // The row class is the default for split lines that have no class of their own.
+        ...(keepsSuggestion && sg.splits ? { splits: sg.splits } : {}),
         // p1 fx: a foreign-currency account posts at the stated rate (blank = currency list rate).
         ...(feedCurrency && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
       });
@@ -554,7 +555,7 @@ export default function BankReviewPage() {
         classId,
         payee: keeps ? sg.payee : null,
         memo: keeps ? sg.memo : null,
-        splits: keeps && sg.splits && !classId ? sg.splits : null,
+        splits: keeps && sg.splits ? sg.splits : null,
       };
     });
     runBulkAccept({ items }, 'Accept selected');

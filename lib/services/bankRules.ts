@@ -81,6 +81,15 @@ export interface BankRuleInput {
 }
 
 const MAX_TEXT = 255;
+/** Rule priorities are small integers; anything outside this range is a client bug. */
+export const MAX_PRIORITY = 1_000_000;
+
+function checkPriority(priority: number | undefined | null): void {
+  if (priority === undefined || priority === null) return;
+  if (!Number.isInteger(priority) || Math.abs(priority) > MAX_PRIORITY) {
+    throw validation(`Priority must be a whole number between -${MAX_PRIORITY.toLocaleString('en-US')} and ${MAX_PRIORITY.toLocaleString('en-US')}.`);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Queries
@@ -224,6 +233,7 @@ async function topPriority(ctx: ServiceContext): Promise<number> {
 }
 
 export async function createBankRule(ctx: ServiceContext, input: BankRuleInput): Promise<BankRule> {
+  checkPriority(input.priority);
   const values = await validateInput(ctx, input);
   return inTransaction(ctx, async (tx) => {
     const priority = Number.isInteger(input.priority) ? input.priority! : (await topPriority(tx)) + 1;
@@ -246,6 +256,7 @@ export async function updateBankRule(
   input: Partial<BankRuleInput>,
   expectedUpdatedAt?: string | Date | null,
 ): Promise<BankRule> {
+  checkPriority(input.priority);
   const before = await getBankRule(ctx, id);
   const merged: BankRuleInput = {
     name: input.name ?? before.name,
@@ -376,6 +387,7 @@ export async function testBankRule(
   draft: BankRuleInput & { id?: string | null },
   opts: { days?: number; limit?: number } = {},
 ): Promise<{ checked: number; hits: RuleTestHit[] }> {
+  checkPriority(draft.priority);
   const values = await validateInput(ctx, draft, { conditionsOnly: true });
   const days = Math.min(Math.max(opts.days ?? 365, 1), 3650);
   const limit = Math.min(Math.max(opts.limit ?? 500, 1), 2000);
@@ -673,6 +685,20 @@ export async function repointBankRuleAccount(ctx: ServiceContext, fromId: string
       .set({ accountId: toId })
       .where(and(eq(bankCategorizationHistory.companyId, ctx.companyId), eq(bankCategorizationHistory.accountId, fromId)))
       .returning({ id: bankCategorizationHistory.id })
+  ).length;
+  // A pattern dismissed for BOTH accounts would collide on bank_rule_dismissals_uq once
+  // repointed: drop the old account's duplicate first (the surviving dismissal still applies).
+  touched += (
+    await ctx.db
+      .delete(bankRuleDismissals)
+      .where(
+        and(
+          eq(bankRuleDismissals.companyId, ctx.companyId),
+          eq(bankRuleDismissals.accountId, fromId),
+          sql`exists (select 1 from bank_rule_dismissals e where e.company_id = ${ctx.companyId} and e.pattern = ${bankRuleDismissals.pattern} and e.account_id = ${toId})`,
+        ),
+      )
+      .returning({ id: bankRuleDismissals.id })
   ).length;
   touched += (
     await ctx.db

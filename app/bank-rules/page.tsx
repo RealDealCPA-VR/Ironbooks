@@ -196,7 +196,7 @@ function draftToBody(d: Draft) {
     amountMax: d.amountKind === 'any' ? null : d.amountKind === 'equals' ? d.amountMin || null : d.amountMax || null,
     bankAccountId: d.bankAccountId || null,
     setAccountId: d.useSplit ? null : d.setAccountId || null,
-    setClassId: d.setClassId || null,
+    setClassId: d.useSplit ? null : d.setClassId || null,
     setPayee: d.setPayee || null,
     setMemo: d.setMemo || null,
     splits: d.useSplit
