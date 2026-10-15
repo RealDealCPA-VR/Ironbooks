@@ -18,7 +18,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import AdmZip from 'adm-zip';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   accountantCopies,
   accounts,
@@ -30,6 +30,8 @@ import {
   deposits,
   employees,
   expenses,
+  inventoryLayers,
+  items as itemsTable,
   journalEntries,
   journalEntryLines,
   journalItemApplications,
@@ -77,15 +79,18 @@ import {
   safeCompanyName,
 } from './format';
 import { formatDividingDate, runAccountantImport } from './guard';
+import { withAccountantCosts } from './inventoryCost';
 import { NAME_COLUMNS, changedNameFields, recordStates } from './digest';
 import {
   DOC_LABEL,
   DOC_ORDER,
+  accountantCostsOf,
   NAME_LABEL,
   createDoc,
   createName,
   decodePayload,
   describeDoc,
+  mapEstimateLines,
   describeName,
   docPayload,
   nameEditSummary,
@@ -753,6 +758,80 @@ async function nameTaken(ctx: ServiceContext, type: NameType, name: string): Pro
 }
 
 /** Document numbers the client already uses (a reused number is imported, but pointed out). */
+/**
+ * What the client's file would cost a form's inventory lines at now, against what the accountant's
+ * file costed them (the changes file's line `cost` / a removal's `total`). Average-cost lines and
+ * restocks are imported at the accountant's cost (inventoryCost.ts) — the note says what the
+ * client's current average would have made it. FIFO sales and removals take the oldest stock left
+ * in the client's file, so a difference there is what the client's books will show.
+ */
+export async function inventoryCostNote(ctx: ServiceContext, type: DocType, p: Record<string, unknown>): Promise<string | null> {
+  type Ln = { itemId: string; qty: ReturnType<typeof Money.of>; cost: ReturnType<typeof Money.of>; consume: boolean };
+  const lines: Ln[] = [];
+  if (type === 'inventory_adjustment') {
+    const q = Money.of(String(p.quantityChange ?? '0'));
+    if (q.isNegative() && p.total != null) lines.push({ itemId: String(p.itemId), qty: q.abs(), cost: Money.of(String(p.total)), consume: true });
+  } else if (type === 'invoice' || type === 'sales_receipt' || type === 'credit_memo') {
+    for (const l of (p.lines as Array<Record<string, unknown>> | undefined) ?? []) {
+      if (!l.itemId || l.cost == null) continue;
+      lines.push({ itemId: String(l.itemId), qty: Money.of(String(l.quantity ?? '1')), cost: Money.of(String(l.cost)), consume: type !== 'credit_memo' });
+    }
+  }
+  if (!lines.length) return null;
+  let keptTheirs = Money.zero();
+  let keptOurs = Money.zero();
+  let fifoTheirs = Money.zero();
+  let fifoOurs = Money.zero();
+  for (const l of lines) {
+    const [item] = await ctx.db
+      .select({ avg: itemsTable.averageCost })
+      .from(itemsTable)
+      .where(and(eq(itemsTable.companyId, ctx.companyId), eq(itemsTable.id, l.itemId)));
+    if (!item) continue; // an item the accountant added: it has no history in this file yet
+    const layers = (
+      await ctx.db
+        .select({ qty: inventoryLayers.quantityRemaining, unitCost: inventoryLayers.unitCost })
+        .from(inventoryLayers)
+        .where(and(eq(inventoryLayers.companyId, ctx.companyId), eq(inventoryLayers.itemId, l.itemId)))
+        .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt))
+    ).filter((x) => Money.of(x.qty).greaterThan(0));
+    const fifo = layers.length > 0;
+    if (fifo && l.consume) {
+      let left = l.qty;
+      let ours = Money.zero();
+      for (const x of layers) {
+        if (left.lessThanOrEqualTo(0)) break;
+        const take = Money.of(x.qty).lessThan(left) ? Money.of(x.qty) : left;
+        ours = ours.plus(Money.round2(take.times(Money.of(x.unitCost))));
+        left = left.minus(take);
+      }
+      if (left.greaterThan(0)) continue; // not enough stock: the import itself will say so
+      fifoTheirs = fifoTheirs.plus(l.cost);
+      fifoOurs = fifoOurs.plus(ours);
+    } else {
+      const unit = fifo
+        ? layers.reduce((v, x) => v.plus(Money.of(x.qty).times(Money.of(x.unitCost))), Money.zero()).dividedBy(
+            layers.reduce((q, x) => q.plus(Money.of(x.qty)), Money.zero()),
+          )
+        : Money.of(item.avg ?? '0');
+      keptTheirs = keptTheirs.plus(l.cost);
+      keptOurs = keptOurs.plus(Money.round2(l.qty.times(unit)));
+    }
+  }
+  const out: string[] = [];
+  if (!keptTheirs.equals(keptOurs)) {
+    out.push(
+      `Inventory cost ${formatCurrency(toAmountString(keptTheirs))} is kept from your accountant's file (your current average cost would make it ${formatCurrency(toAmountString(keptOurs))}).`,
+    );
+  }
+  if (!fifoTheirs.equals(fifoOurs)) {
+    out.push(
+      `Inventory cost will be ${formatCurrency(toAmountString(fifoOurs))} in your file vs ${formatCurrency(toAmountString(fifoTheirs))} in your accountant's: FIFO items are taken from the oldest stock left in your file.`,
+    );
+  }
+  return out.length ? out.join(' ') : null;
+}
+
 async function numberTaken(ctx: ServiceContext, type: DocType, p: Record<string, unknown>): Promise<boolean> {
   const spec: Partial<Record<DocType, [string, string, string]>> = {
     invoice: ['invoices', 'ref_number', 'refNumber'],
@@ -1005,6 +1084,8 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
     if (d.op === 'add' && (await numberTaken(ctx, d.type, d.after))) {
       note = `Your file already has a ${label.toLowerCase()} numbered ${String(d.after.refNumber)}; this one keeps the accountant's number.`;
     }
+    const costNote = d.op === 'void' ? null : await inventoryCostNote(ctx, d.type, d.after);
+    if (costNote) note = note ? `${note} ${costNote}` : costNote;
     const verb = d.op === 'add' ? 'New' : d.op === 'edit' ? 'Changed' : 'Voided';
     items.push({
       key: `${d.type}:${d.op}:${d.id}`,
@@ -1381,20 +1462,29 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
         count: d.op === 'add' ? 'added' : 'changed',
         run: async (c) => {
           const input = await decodePayload(d.after, DOC_SHAPES[d.type], helpers(c));
-          if (d.op === 'add') {
-            idMap.set(d.id, await createDoc(c, d.type, input));
-            return;
-          }
-          await locked(c, d.type as VersionedEntity, d.id, d.baseVersion, (cc) => updateDoc(cc, d.type, d.id, input));
+          // Inventory lines are costed as the accountant's file costed them (inventoryCost.ts).
+          await withAccountantCosts(accountantCostsOf(d.type, input), async () => {
+            if (d.op === 'add') {
+              idMap.set(d.id, await createDoc(c, d.type, input));
+            } else {
+              await locked(c, d.type as VersionedEntity, d.id, d.baseVersion, (cc) => updateDoc(cc, d.type, d.id, input));
+            }
+            // Estimate lines made in the copy → the client's new lines (an invoice may bill them).
+            if (d.type === 'estimate') await mapEstimateLines(c, mapId(d.id), (d.after.lines as Array<Record<string, unknown>>) ?? [], idMap);
+          });
         },
       });
       const txnOf = (op: 'edit' | 'add', types: TxnType[]) =>
         file.transactions
           .filter((t): t is Extract<TxnChange, { op: 'edit' | 'add' }> => t.op === op && types.includes(t.type))
           .sort(byDate);
+      // New estimates / sales orders / purchase orders first (they post nothing, and a changed
+      // invoice may bill a line of an estimate made in the copy).
+      const nonPosting = (d: DocChange) => d.type === 'estimate' || d.type === 'sales_order' || d.type === 'purchase_order';
+      for (const d of editsAndAdds('add', false).filter(nonPosting)) steps.push(docStep(d));
       for (const d of editsAndAdds('edit', false)) steps.push(docStep(d));
       for (const t of txnOf('edit', ['journal_entry', 'expense', 'transfer'])) steps.push(txnStep(t));
-      for (const d of editsAndAdds('add', false)) steps.push(docStep(d));
+      for (const d of editsAndAdds('add', false).filter((d) => !nonPosting(d))) steps.push(docStep(d));
       for (const t of txnOf('add', ['journal_entry', 'expense', 'transfer'])) steps.push(txnStep(t));
 
       // 6. Payments (received / bill payments) — they apply to the forms above.

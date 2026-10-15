@@ -143,12 +143,42 @@ async function lineRef(ctx: ServiceContext, lineId: string): Promise<LineRef> {
   return ref;
 }
 
+/**
+ * Inventory cost each line of a form was posted at in THIS file, by the posting's reference (the
+ * invoice's "cogs:<lineOrder>", a sales receipt / credit memo line id): the debit side of the line's
+ * COGS (or restock) entry. Carried in the changes file so the client's import costs the line the
+ * same (inventoryCost.ts) instead of at the client's current average cost.
+ */
+async function postedLineCosts(ctx: ServiceContext, sourceRef: string): Promise<Map<string, string>> {
+  const rows = await ctx.db
+    .select({ reference: journalEntries.reference, debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)` })
+    .from(journalEntries)
+    .innerJoin(journalEntryLines, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, sourceRef), eq(journalEntries.status, 'posted')))
+    .groupBy(journalEntries.reference);
+  const out = new Map<string, string>();
+  for (const r of rows) if (r.reference) out.set(r.reference, toAmountString(String(r.debit)));
+  return out;
+}
+
+/** Ids of the inventory-type items among `ids`. */
+async function inventoryItemIds(ctx: ServiceContext, ids: Array<string | null | undefined>): Promise<Set<string>> {
+  const list = [...new Set(ids.filter((x): x is string => !!x))];
+  if (!list.length) return new Set();
+  const rows = await ctx.db
+    .select({ id: items.id })
+    .from(items)
+    .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, list), eq(items.type, 'inventory')));
+  return new Set(rows.map((r) => r.id));
+}
+
 // ---------------------------------------------------------------------------
 // Payloads (record → service input)
 // ---------------------------------------------------------------------------
 
 async function invoicePayload(ctx: ServiceContext, id: string): Promise<P> {
   const r = await getInvoice(ctx, id);
+  const costs = await postedLineCosts(ctx, `invoice-cogs:${id}`);
   return {
     refNumber: r.refNumber ?? String(r.invoiceNumber),
     customerId: r.customerId,
@@ -194,12 +224,16 @@ async function invoicePayload(ctx: ServiceContext, id: string): Promise<P> {
       // Progress-invoicing link (the invoice form round-trips it; removing it travels too).
       estimateLineId: l.estimateLineId ?? null,
       ...invOf(l as P),
+      // What this file's COGS entry for the line cost (posted inventory lines only).
+      ...(l.itemType === 'inventory' && costs.has(`cogs:${l.lineOrder}`) ? { cost: costs.get(`cogs:${l.lineOrder}`) } : {}),
     })),
   };
 }
 
 async function salesReceiptPayload(ctx: ServiceContext, id: string): Promise<P> {
   const r = await getSalesReceipt(ctx, id);
+  const costs = await postedLineCosts(ctx, `salesreceipt:${id}`);
+  const inventory = await inventoryItemIds(ctx, r.lines.map((l) => l.itemId));
   return {
     refNumber: r.refNumber ?? String(r.receiptNumber),
     customerId: r.customerId,
@@ -228,12 +262,15 @@ async function salesReceiptPayload(ctx: ServiceContext, id: string): Promise<P> 
       taxable: l.taxable,
       taxRateId: l.taxRateId,
       ...invOf(l as P),
+      ...(l.itemId && inventory.has(l.itemId) && costs.has(l.id) ? { cost: costs.get(l.id) } : {}),
     })),
   };
 }
 
 async function creditMemoPayload(ctx: ServiceContext, id: string): Promise<P> {
   const r = await getCreditMemo(ctx, id);
+  const costs = await postedLineCosts(ctx, `creditmemo-cogs:${id}`);
+  const inventory = await inventoryItemIds(ctx, r.lines.map((l) => l.itemId));
   return {
     refNumber: r.refNumber ?? String(r.memoNumber),
     customerId: r.customerId,
@@ -252,6 +289,8 @@ async function creditMemoPayload(ctx: ServiceContext, id: string): Promise<P> {
       taxable: l.taxable,
       restock: l.restock,
       ...invOf(l as P),
+      // Restocked inventory: what the restock was valued at here (no entry = $0).
+      ...(l.restock && l.itemId && inventory.has(l.itemId) ? { cost: costs.get(l.id) ?? '0.00' } : {}),
     })),
   };
 }
@@ -443,6 +482,7 @@ async function estimatePayload(ctx: ServiceContext, id: string): Promise<P> {
     status: r.status,
     total: toAmountString(r.total),
     lines: r.lines.map((l) => ({
+      id: l.id,
       itemId: l.itemId,
       description: l.description,
       quantity: dec(l.quantity) ?? '1',
@@ -541,7 +581,9 @@ export async function inventoryAdjustmentPayload(ctx: ServiceContext, entryId: s
   return {
     itemId,
     quantityChange: qty.toFixed(4),
-    unitCost: qty.greaterThan(0) ? total.dividedBy(qty).toDecimalPlaces(8).toString() : null,
+    // The unit cost this file used (removals too: the import takes a removal out at this file's
+    // value, the adjustment's total, not at the client's current average cost).
+    unitCost: qty.isZero() ? null : total.dividedBy(qty.abs()).toDecimalPlaces(8).toString(),
     date: iso(entry?.date ?? own[0].date),
     memo: own[0].memo,
     adjustmentAccountId: offset?.accountId ?? null,
@@ -745,8 +787,28 @@ function withoutDisplay(p: P): P {
   return rest;
 }
 
+/**
+ * The accountant's inventory costs a decoded payload carries, in line order (item ids already
+ * mapped): sales lines' COGS, credit memo restocks, and a quantity removal's total.
+ */
+export function accountantCostsOf(type: DocType, p: P): Array<{ itemId: string; amount: string }> {
+  if (type === 'inventory_adjustment') {
+    const qty = Money.of(String(p.quantityChange ?? '0'));
+    return qty.isNegative() && p.total != null ? [{ itemId: p.itemId as string, amount: String(p.total) }] : [];
+  }
+  if (type !== 'invoice' && type !== 'sales_receipt' && type !== 'credit_memo') return [];
+  return ((p.lines as P[] | undefined) ?? [])
+    .filter((l) => l.itemId && l.cost != null)
+    .map((l) => ({ itemId: l.itemId as string, amount: String(l.cost) }));
+}
+
+/** Lines without the accountant's cost (it reaches the services through inventoryCost.ts, not their input). */
+const withoutCosts = (p: P): P =>
+  Array.isArray(p.lines) ? { ...p, lines: (p.lines as P[]).map(({ cost: _c, ...l }) => l) } : p;
+
 /** Service input of a decoded document payload. */
-function docInput(type: DocType, p: P): P {
+function docInput(type: DocType, raw: P): P {
+  const p = withoutCosts(raw);
   switch (type) {
     case 'invoice':
       return {
@@ -775,6 +837,9 @@ function docInput(type: DocType, p: P): P {
     }
     case 'inventory_adjustment': {
       const { total: _t, ...rest } = p;
+      // A removal's unit cost is for display: the import queues the accountant's total instead
+      // (accountantCostsOf), and the service values the removal with it.
+      if (Money.of(String(p.quantityChange ?? '0')).isNegative()) rest.unitCost = null;
       return rest;
     }
     default:
@@ -803,7 +868,8 @@ export async function createDoc(tx: ServiceContext, type: DocType, p: P): Promis
     case 'item_receipt':
       return (await createItemReceipt(tx, asInput<CreateItemReceiptInput>(input))).id;
     case 'estimate': {
-      const row = await createEstimate(tx, asInput<CreateEstimateInput>(input));
+      const lines = ((input.lines as P[]) ?? []).map(({ id: _id, ...l }) => l);
+      const row = await createEstimate(tx, asInput<CreateEstimateInput>({ ...input, lines }));
       await setNonPostingStatus(tx, type, row.id, p.status as string);
       return row.id;
     }
@@ -822,6 +888,22 @@ export async function createDoc(tx: ServiceContext, type: DocType, p: P): Promis
     case 'inventory_adjustment':
       return (await adjustQuantityAtSite(tx, asInput<SiteAdjustmentInput>(input))).entryId;
   }
+}
+
+/**
+ * Map the accountant-file ids of an estimate's lines (`lines[].id` of its payload, in order) to the
+ * client's lines of the estimate the import just created / re-lined (same order), so an invoice line
+ * that bills one of them finds it.
+ */
+export async function mapEstimateLines(tx: ServiceContext, estimateId: string, accountantLines: P[], idMap: Map<string, string>): Promise<void> {
+  const res = await tx.db.execute(
+    sql`SELECT l.id::text AS id FROM estimate_lines l JOIN estimates e ON e.id = l.estimate_id
+         WHERE e.company_id = ${tx.companyId}::uuid AND l.estimate_id = ${estimateId}::uuid ORDER BY l.line_order`,
+  );
+  const ours = (res as unknown as { rows: Array<{ id: string }> }).rows;
+  accountantLines.forEach((l, i) => {
+    if (typeof l.id === 'string' && ours[i] && l.id !== ours[i].id) idMap.set(l.id, ours[i].id);
+  });
 }
 
 /** Status changes of non-posting forms that a user makes (derived ones — partial, closed by conversion — are left alone). */
@@ -881,7 +963,7 @@ export async function updateDoc(tx: ServiceContext, type: DocType, id: string, p
       await updateItemReceipt(tx, id, asInput<CreateItemReceiptInput>(input));
       return;
     case 'estimate':
-      await updateEstimate(tx, id, asInput<CreateEstimateInput>(input));
+      await updateEstimate(tx, id, asInput<CreateEstimateInput>({ ...input, lines: ((input.lines as P[]) ?? []).map(({ id: _id, ...l }) => l) }));
       await setNonPostingStatus(tx, type, id, p.status as string);
       return;
     case 'sales_order':
@@ -1074,7 +1156,12 @@ const qtyText = (v: unknown) => {
 function salesLine(L: Labels, l: P): string {
   const what = l.itemId ? L.item(l.itemId) : L.account(l.accountId);
   const amount = l.rate != null ? Money.mul(String(l.quantity ?? '1'), String(l.rate)) : null;
-  const extras = [l.description, l.classId ? `class ${L.cls(l.classId)}` : null, l.estimateLineId ? 'bills an estimate line' : null].filter(Boolean);
+  const extras = [
+    l.description,
+    l.classId ? `class ${L.cls(l.classId)}` : null,
+    l.estimateLineId ? 'bills an estimate line' : null,
+    l.cost != null ? `${l.restock ? 'restocked at' : 'cost of goods'} ${money(l.cost)}` : null,
+  ].filter(Boolean);
   return `${what} — ${qtyText(l.quantity)} × ${money(l.rate ?? 0)}${amount ? ` = ${money(toAmountString(amount))}` : ''}${extras.length ? ` (${extras.join(', ')})` : ''}`;
 }
 
@@ -1176,7 +1263,7 @@ export function describeDoc(type: DocType, p: P, L: Labels): Described {
         amount: toAmountString(String(p.total ?? '0')),
         lines: [
           head,
-          ...(p.unitCost ? [`At ${money(toAmountString(Money.round2(p.unitCost as string)))} each`] : ['At average cost']),
+          ...(p.unitCost ? [`At ${money(toAmountString(Money.round2(p.unitCost as string)))} each (value ${money(p.total)})`] : ['At average cost']),
           ...(p.adjustmentAccountId ? [`Adjustment account: ${L.account(p.adjustmentAccountId)}`] : []),
           ...memo,
         ],

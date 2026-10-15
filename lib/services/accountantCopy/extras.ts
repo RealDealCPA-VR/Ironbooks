@@ -265,7 +265,20 @@ export async function reconciliationChanges(
     if (b) {
       if (b.state === 'completed' && r.status === 'undone') {
         undos.push({ op: 'undo', id: r.id, accountId: r.glAccountId, statementDate: iso(r.statementDate), statementBalance: toAmountString(r.statementBalance) });
+      } else if (b.state === 'in_progress' && r.status === 'completed') {
+        // The client's own unfinished reconciliation, finished here: the client's file still has it
+        // open with the client's marks, so it can't be finished from the changes file.
+        warnings.push(
+          `The reconciliation of the statement ending ${ymd(r.statementDate)} that was already in progress when this copy was made was finished in this copy. It can't be sent back: tell your client which transactions to clear, and they will finish it in their file.`,
+        );
       }
+      continue;
+    }
+    if (r.status === 'in_progress') {
+      // Started here but not finished: only completed reconciliations travel.
+      warnings.push(
+        `The reconciliation of the statement ending ${ymd(r.statementDate)} is still in progress in this copy. Finish it before saving the changes file, or its cleared marks (and any service charge or interest it entered) won't be sent to your client.`,
+      );
       continue;
     }
     if (r.status !== 'completed') {

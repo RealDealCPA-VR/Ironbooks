@@ -535,6 +535,12 @@ const INV: Shape = { siteId: 'id?', binId: 'id?', serialNumbers: 'strs?', lotNum
 const JOURNAL_ITEM: Shape = { line: 'lineRef', amount: 'dec' };
 const JOURNAL_OFFSET: Shape = { line: 'lineRef', chargeLine: 'lineRef', amount: 'dec' };
 
+/**
+ * Sales lines (invoice, sales receipt) and restocked credit memo lines of inventory items carry
+ * `cost`: what the accountant's file posted for the line (COGS / restock value). The import costs
+ * the line at that amount (inventoryCost.ts), not at the client's current average cost. A quantity
+ * removal (inventory adjustment) is likewise taken out at its `total`.
+ */
 export const DOC_SHAPES: Record<DocType, Shape> = {
   invoice: {
     refNumber: 'str?', customerId: 'id', date: 'date', dueDate: 'date?', terms: 'str?', taxRateId: 'id?', classId: 'id?',
@@ -545,7 +551,7 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
     lines: {
       arr: {
         itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?',
-        taxRateId: 'id?', classId: 'id?', jobId: 'id?', estimateLineId: 'id?', ...INV,
+        taxRateId: 'id?', classId: 'id?', jobId: 'id?', estimateLineId: 'id?', cost: 'dec?', ...INV,
       },
     },
   },
@@ -554,14 +560,14 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
     reference: 'str?', memo: 'str?', classId: 'id?', shipDate: 'date?', shipVia: 'str?', fob: 'str?',
     trackingNumber: 'str?', shipTo: 'strmap?', poNumber: 'str?', toBePrinted: 'bool?', toBeEmailed: 'bool?', total: 'dec',
     lines: {
-      arr: { itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', taxRateId: 'id?', ...INV },
+      arr: { itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', taxRateId: 'id?', cost: 'dec?', ...INV },
     },
   },
   credit_memo: {
     refNumber: 'str?', customerId: 'id', date: 'date', taxRateId: 'id?', memo: 'str?', toBePrinted: 'bool?',
     toBeEmailed: 'bool?', total: 'dec',
     lines: {
-      arr: { itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', restock: 'bool?', ...INV },
+      arr: { itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', restock: 'bool?', cost: 'dec?', ...INV },
     },
   },
   payment_received: {
@@ -607,7 +613,9 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
   estimate: {
     refNumber: 'str?', customerId: 'id', date: 'date', expirationDate: 'date?', taxRateId: 'id?', memo: 'str?',
     shipTo: 'strmap?', toBePrinted: 'bool?', toBeEmailed: 'bool?', status: 'str', total: 'dec',
-    lines: { arr: { itemId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', classId: 'id?' } },
+    // Line ids (the accountant file's): an invoice line made in the copy may bill an estimate line
+    // made there; the import maps them to the client's new lines by position.
+    lines: { arr: { id: 'id?', itemId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', classId: 'id?' } },
   },
   sales_order: {
     refNumber: 'str?', customerId: 'id', date: 'date', memo: 'str?', taxRateId: 'id?', shipDate: 'date?', shipVia: 'str?',

@@ -30,6 +30,7 @@
  * transaction — preserving invoiceNumber and createdAt.
  */
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
+import { hasAccountantCost } from './accountantCopy/inventoryCost';
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { creditLimitFixes } from '@/lib/errorFixes';
@@ -1203,7 +1204,8 @@ async function postInvoiceCOGS(
         .select({ averageCost: items.averageCost })
         .from(items)
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, cl.itemId)));
-      if (!itemRow || Money.of(itemRow.averageCost ?? '0').lessThanOrEqualTo(0)) {
+      // (An Accountant's Copy import carrying the accountant's cost for this line needs no average.)
+      if (!itemRow || (Money.of(itemRow.averageCost ?? '0').lessThanOrEqualTo(0) && !hasAccountantCost(cl.itemId))) {
         throw validation(
           `Inventory item "${info.name}" has no average cost. Receive stock with a unit cost (bill or inventory adjustment) before selling it.`,
         );
