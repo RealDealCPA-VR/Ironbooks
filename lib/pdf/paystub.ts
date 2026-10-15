@@ -16,6 +16,7 @@
  */
 
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
+import { stampSandbox } from './sandboxStamp';
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -396,5 +397,6 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
     color: COLOR_GRAY,
   });
 
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }

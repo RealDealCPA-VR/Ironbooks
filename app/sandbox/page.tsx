@@ -6,7 +6,7 @@
  * In the sandbox: leave by discarding the copy or keeping it as a training file.
  * In a training file: explains how to get back to the real books.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { FlaskConical, Trash2, Save, RotateCcw, ShieldCheck, Ban } from 'lucide-react';
 import {
@@ -25,7 +25,10 @@ import {
 import {
   discardSandbox,
   fetchSandboxBanner,
+  isDesktopApp,
   keepSandbox,
+  keepTrainingHelp,
+  leaveTrainingHelp,
   resumeLeftoverSandbox,
   startSandbox,
   type SandboxBannerStatus,
@@ -58,6 +61,15 @@ export default function SandboxPage() {
   const [keepName, setKeepName] = useState('');
   const [keepError, setKeepError] = useState<string | null>(null);
   const [deleteLeftover, setDeleteLeftover] = useState<string | null>(null);
+  // Desktop vs browser changes how another company file is opened (read after mount: no SSR mismatch).
+  const [isDesktop, setIsDesktop] = useState(false);
+  // Keep succeeded in leaving but the copy could not be moved: shown before the app reloads.
+  const [keepWarning, setKeepWarning] = useState<string | null>(null);
+  const keepWarningSeen = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    setIsDesktop(isDesktopApp());
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -102,8 +114,15 @@ export default function SandboxPage() {
     }
     setBusy('keep');
     try {
-      const r = await keepSandbox(keepName.trim());
-      toast(`Kept as the training file "${r.name}". You are back in your real books.`, 'success');
+      const r = await keepSandbox(keepName.trim(), {
+        onWarning: (warning) =>
+          new Promise<void>((resolve) => {
+            setKeepOpen(false);
+            keepWarningSeen.current = resolve;
+            setKeepWarning(warning);
+          }),
+      });
+      if (!r.warning) toast(`Kept as the training file "${r.name}". You are back in your real books.`, 'success');
     } catch (err) {
       setKeepError(err instanceof ApiError || err instanceof Error ? err.message : 'The copy could not be kept.');
       setBusy(null);
@@ -134,13 +153,17 @@ export default function SandboxPage() {
             {status?.sourceName ? <> &ldquo;{status.sourceName}&rdquo;</> : ' your company file'}. Nothing you do here
             changes your real books, and emails, bank feeds, scheduled reports and automatic backups stay off.
           </p>
-          <p className="text-sm text-navy/70">
-            To go back to your real books, open your real company file from the{' '}
-            <Link href="/company-file" className="text-electric font-semibold hover:underline">
-              Company File
-            </Link>{' '}
-            page (desktop: File &gt; Open Company or Recent Companies).
-          </p>
+          {isDesktop ? (
+            <p className="text-sm text-navy/70">
+              To go back to your real books, open your real company file from the{' '}
+              <Link href="/company-file" className="text-electric font-semibold hover:underline">
+                Company File
+              </Link>{' '}
+              page or File &gt; Open Company (or Recent Companies).
+            </p>
+          ) : (
+            <p className="text-sm text-navy/70">{leaveTrainingHelp(false)}</p>
+          )}
         </Card>
       )}
 
@@ -354,10 +377,22 @@ export default function SandboxPage() {
             autoFocus
           />
           <p id="sandbox-keep-help" className={`text-xs mt-2 ${keepError ? 'text-red-600' : 'text-navy/60'}`} role={keepError ? 'alert' : undefined}>
-            {keepError ??
-              'It is saved next to your real company file and opens like any other company file (File > Open Company). It stays a practice copy: emails and bank feeds stay off there too.'}
+            {keepError ?? keepTrainingHelp(isDesktop)}
           </p>
         </form>
+      </Modal>
+
+      <Modal
+        open={keepWarning !== null}
+        onClose={() => keepWarningSeen.current?.()}
+        title="The training file could not be saved"
+        footer={
+          <Button onClick={() => keepWarningSeen.current?.()}>OK</Button>
+        }
+      >
+        <p className="text-sm text-navy/80" role="alert">
+          {keepWarning}
+        </p>
       </Modal>
     </div>
   );

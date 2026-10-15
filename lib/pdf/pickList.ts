@@ -10,6 +10,7 @@
  */
 import { PDFDocument, StandardFonts, rgb, PageSizes, type PDFFont, type PDFPage } from 'pdf-lib';
 import { renderPackingSlipPdf, type PackingSlipData } from './packingSlip';
+import { stampSandbox, tagSandbox } from './sandboxStamp';
 
 export interface PickListOrderRef {
   orderNumber: number | string;
@@ -133,6 +134,7 @@ export async function renderPickListPdf(data: PickListData): Promise<Uint8Array>
   ensure(20);
   text('Picked by: ____________________     Checked by: ____________________', MARGIN_L, y, regular, 9, COLOR_GRAY);
 
+  await stampSandbox(pdf); // printed from a sandbox copy: stamped SANDBOX
   return pdf.save();
 }
 
@@ -146,5 +148,6 @@ export async function renderPackingSlipsPdf(slips: PackingSlipData[]): Promise<U
     for (const p of pages) out.addPage(p);
   }
   if (out.getPageCount() === 0) out.addPage([PAGE_W, PAGE_H]);
+  tagSandbox(out); // its pages were stamped by renderPackingSlipPdf
   return out.save();
 }

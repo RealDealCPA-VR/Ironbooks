@@ -9,15 +9,19 @@
  *  - backups never carry the sandbox marker;
  *  - a refused leave never points the server at the real file (no sandbox write can leak in);
  *  - a server started directly on a sandbox / training folder stamps from the first request;
- *  - the file-password unlock is re-issued for the folder the server switched to.
+ *  - the file-password unlock is re-issued for the folder the server switched to;
+ *  - training-file names that are Windows device names (CON, NUL, COM1, ...) are refused up front;
+ *  - name checks (e.g. "already exists") answer only an Admin of the real file;
+ *  - a request between closing the real file and switching to the copy never re-opens the real file;
+ *  - a keep whose move fails after leaving still completes the leave (with a warning).
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import AdmZip from 'adm-zip';
 import { PDFDocument } from 'pdf-lib';
 import { and, eq } from 'drizzle-orm';
-import { closeDb, getDb, resolveDataDir } from '@/lib/db';
+import { closeDb, getDb, holdDbOpen, isDbOpen, openDb, resolveDataDir } from '@/lib/db';
 import { auditLogs, customers, userCompanies, users } from '@/lib/db/schema';
 import { createCompany } from './company';
 import { createCustomer } from './customers';
@@ -31,8 +35,10 @@ import {
   listLeftoverSandboxes,
   readSandboxMarker,
   resumeSandbox,
+  sandboxFs,
   startSandbox,
   switchActiveDataDir,
+  trainingTarget,
   SANDBOX_MARKER,
 } from './sandbox';
 import { isSandboxActive } from './sandboxState';
@@ -264,10 +270,26 @@ describe('sandbox mode', () => {
     await expect(keepSandboxAsTraining(ctx, 'Real Co')).rejects.toThrow(/real company file/);
     fs.mkdirSync(path.join(ROOT, 'Taken.ironbooks'));
     await expect(keepSandboxAsTraining(ctx, 'Taken')).rejects.toThrow(/already exists/);
+    // Windows device names: "CON.ironbooks" never "exists", but nothing can be created there.
+    for (const reserved of ['CON', 'nul', 'Prn', 'aux', 'COM1', 'lpt9', 'NUL.backup', 'con ']) {
+      await expect(keepSandboxAsTraining(ctx, reserved)).rejects.toMatchObject({
+        code: 'VALIDATION',
+        message: 'That name is reserved by Windows. Pick another name.',
+      });
+    }
+    // Name checks answer only an Admin of the real file: a member of the copy learns nothing
+    // (not even whether "Taken.ironbooks" exists) and the real file is not left open.
+    const member = { db: await getDb(), companyId, userId: accountantId };
+    for (const probe of ['Taken', 'CON', 'Free Name']) {
+      await expect(keepSandboxAsTraining(member, probe)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    }
+    expect(isDbOpen(REAL)).toBe(false);
     // Still in the sandbox after a refused name.
     expect(resolveDataDir()).toBe(path.resolve(started.dir));
 
-    const kept = await keepSandboxAsTraining(ctx, 'Practice: Year End');
+    const result = await keepSandboxAsTraining(ctx, 'Practice: Year End');
+    expect(result.warning).toBeUndefined();
+    const kept = { ...result, trainingDir: result.trainingDir as string };
     expect(kept.name).toBe('Practice- Year End');
     expect(kept.trainingDir).toBe(path.join(ROOT, 'Practice- Year End.ironbooks'));
     expect(resolveDataDir()).toBe(path.resolve(REAL));
@@ -326,4 +348,90 @@ describe('sandbox mode', () => {
     expect(listLeftoverSandboxes()).toEqual([]);
   }, 180_000);
 
+  it('refuses Windows device names as training-file names before anything is switched', () => {
+    for (const reserved of ['CON', 'con', 'PRN', 'AUX', 'NUL', 'COM1', 'com9', 'LPT1', 'Lpt5', 'CONIN$', 'conout$', 'NUL.txt', 'aux .x']) {
+      expect(() => trainingTarget(REAL, reserved)).toThrow('That name is reserved by Windows. Pick another name.');
+    }
+    // Names that merely contain or start with one are fine.
+    for (const ok of ['Console', 'CON practice', 'COM10', 'LPT0', 'Nullify', 'my CON']) {
+      expect(trainingTarget(REAL, ok).name).toBe(ok);
+    }
+  });
+
+  it('holds a company file closed: getDb waits for the release, openDb refuses', async () => {
+    await getDb(REAL);
+    await closeDb(REAL);
+    const release = holdDbOpen(REAL);
+    let opened = false;
+    let pending: Promise<unknown> = Promise.resolve();
+    try {
+      expect(() => openDb(REAL)).toThrow(/being switched/);
+      pending = getDb(REAL).then(() => {
+        opened = true;
+      });
+      for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+      expect(opened).toBe(false);
+      expect(isDbOpen(REAL)).toBe(false);
+    } finally {
+      release();
+    }
+    await pending;
+    expect(opened).toBe(true);
+    expect(isDbOpen(REAL)).toBe(true);
+  }, 180_000);
+
+  it('a request between closing the real file and switching never re-opens the real file', async () => {
+    expect(resolveDataDir()).toBe(path.resolve(REAL));
+    const realHandle = openDb(REAL);
+    await realHandle.migrated;
+    const client = realHandle.client as unknown as { close: () => Promise<void> };
+    const close = client.close.bind(client);
+    let probed = false;
+    let probe: Promise<unknown> = Promise.resolve();
+    // Right after the real handle is closed and forgotten, before startSandbox resumes and
+    // switches, another request asks for "the" database, as getServerContext() does.
+    client.close = async () => {
+      await close();
+      void (async () => {
+        for (let i = 0; i < 100 && !probed; i++) {
+          await Promise.resolve();
+          if (!isDbOpen(REAL) && resolveDataDir() === path.resolve(REAL)) {
+            probed = true;
+            probe = getDb().catch(() => undefined);
+          }
+        }
+      })();
+    };
+    const started = await startSandbox(await realCtx());
+    await probe;
+    expect(probed).toBe(true);
+    // The request waited for the switch and got the copy; the real file stayed closed.
+    expect(isDbOpen(REAL)).toBe(false);
+    expect(resolveDataDir()).toBe(path.resolve(started.dir));
+    await discardSandbox(await activeCtx());
+  }, 180_000);
+
+  it('a keep whose move fails after leaving still completes the leave, with a warning', async () => {
+    const started = await startSandbox(await realCtx());
+    const move = vi.spyOn(sandboxFs, 'moveDir').mockImplementationOnce(() => {
+      throw new Error('EBUSY: resource busy or locked');
+    });
+    try {
+      const r = await keepSandboxAsTraining(await activeCtx(), 'Busy Practice');
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(r).toMatchObject({ realDir: path.resolve(REAL), trainingDir: null, name: 'Busy Practice' });
+      expect(r.warning).toMatch(/back in your real books/);
+      expect(r.warning).toMatch(/Copies left over/);
+    } finally {
+      move.mockRestore();
+    }
+    // The server is on the real file; the copy is listed as left over; no training file appeared.
+    expect(resolveDataDir()).toBe(path.resolve(REAL));
+    expect(isSandboxActive()).toBe(false);
+    expect(fs.existsSync(path.join(ROOT, 'Busy Practice.ironbooks'))).toBe(false);
+    const left = listLeftoverSandboxes();
+    expect(left.map((l) => l.id)).toEqual([path.basename(path.dirname(started.dir))]);
+    await discardLeftoverSandbox(await realCtx(), left[0].id);
+    expect(listLeftoverSandboxes()).toEqual([]);
+  }, 180_000);
 });

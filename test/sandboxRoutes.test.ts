@@ -5,7 +5,9 @@
  *  - the owner starts a sandbox (201), the public status flag turns on, the auto-backup route
  *    refuses while in the sandbox, keep validates the name, discard returns to the real file;
  *  - leftover routes resume and delete a copy, also when its id has a "%" ("50% Off LLC");
- *  - a held file-password unlock is re-issued for the folder the server switched to.
+ *  - a held file-password unlock is re-issued for the folder the server switched to;
+ *  - keep: a Windows device name is a 400, a non-Admin gets 403 whatever the name, and a copy
+ *    that cannot be moved after leaving answers 200 with trainingDir null and a warning.
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
@@ -44,7 +46,7 @@ import { closeDb, getDb, resolveDataDir } from '@/lib/db';
 import { userCompanies, users } from '@/lib/db/schema';
 import { UNLOCK_COOKIE, createUnlockToken, verifyUnlockToken } from '@/lib/auth';
 import { createCompany } from '@/lib/services/company';
-import { switchActiveDataDir } from '@/lib/services/sandbox';
+import { sandboxFs, switchActiveDataDir } from '@/lib/services/sandbox';
 import { GET as sandboxGET, POST as sandboxPOST } from '@/app/api/sandbox/route';
 import { GET as statusGET } from '@/app/api/sandbox/status/route';
 import { POST as discardPOST } from '@/app/api/sandbox/discard/route';
@@ -205,5 +207,44 @@ describe('sandbox API routes', () => {
     } finally {
       fs.rmSync(manifest, { force: true });
     }
+  }, 180_000);
+  it('keep: reserved names are a 400, non-Admins a 403, and a failed move still completes the leave', async () => {
+    session.userId = ownerId;
+    route('POST', '/api/sandbox');
+    const { dir } = await (await sandboxPOST(req('/api/sandbox', { method: 'POST' }))).json();
+    fs.mkdirSync(path.join(ROOT, 'Taken.ironbooks'), { recursive: true });
+    const keep = (name: string) => keepPOST(req('/api/sandbox/keep', { method: 'POST', body: JSON.stringify({ name }) }));
+
+    route('POST', '/api/sandbox/keep');
+    const reserved = await keep('NUL');
+    expect(reserved.status).toBe(400);
+    expect((await reserved.json()).error).toMatch(/reserved by Windows/);
+    expect((await keep('Taken')).status).toBe(400);
+    // An accountant cannot learn which names are taken next to the real file.
+    session.userId = accountantId;
+    for (const name of ['Taken', 'NUL', 'Anything']) expect((await keep(name)).status).toBe(403);
+    session.userId = ownerId;
+    expect(resolveDataDir()).toBe(path.resolve(dir));
+
+    const move = vi.spyOn(sandboxFs, 'moveDir').mockImplementationOnce(() => {
+      throw new Error('EPERM: operation not permitted');
+    });
+    try {
+      const res = await keep('Locked Practice');
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ realDir: path.resolve(REAL), trainingDir: null, name: 'Locked Practice' });
+      expect(body.warning).toMatch(/could not be saved as the training file/);
+    } finally {
+      move.mockRestore();
+    }
+    expect(resolveDataDir()).toBe(path.resolve(REAL));
+    route('GET', '/api/sandbox');
+    const status = await (await sandboxGET()).json();
+    expect(status).toMatchObject({ active: false });
+    expect(status.leftovers).toHaveLength(1);
+    route('DELETE', '/api/sandbox/leftovers/[id]');
+    const id = status.leftovers[0].id as string;
+    expect((await leftoverDELETE(req(`/api/sandbox/leftovers/${encodeURIComponent(id)}`, { method: 'DELETE' }), params(id))).status).toBe(200);
   }, 180_000);
 });

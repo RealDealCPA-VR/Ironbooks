@@ -3,7 +3,9 @@
  * Leave the sandbox but keep the copy as a training file named `name`, next to the real file
  * (never merged back), and switch back to the real company file. Same permission model as
  * /api/sandbox/discard (Admin of the REAL file, checked by the service).
- * Returns { realDir, trainingDir, name }.
+ * Returns { realDir, trainingDir, name }. When the server is already back on the real file but the
+ * copy could not be moved, the leave still succeeded: 200 with { realDir, trainingDir: null, name,
+ * warning } so the client still tells the desktop shell it left (the copy is listed as left over).
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';

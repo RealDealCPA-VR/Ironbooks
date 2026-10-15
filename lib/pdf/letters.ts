@@ -10,6 +10,7 @@
  */
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { pdfSafe, wrapText } from './template';
+import { stampSandbox } from './sandboxStamp';
 
 const LETTER_W = 612;
 const LETTER_H = 792;
@@ -51,6 +52,7 @@ export async function renderLettersPdf(letters: Array<{ body: string }>, letterh
     }
   }
   if (letters.length === 0) pdf.addPage([LETTER_W, LETTER_H]);
+  await stampSandbox(pdf); // printed from a sandbox copy: stamped SANDBOX
   return pdf.save();
 }
 
@@ -92,6 +94,7 @@ export async function renderLabelsPdf(addresses: string[][], opts: { startPositi
     });
     slot++;
   }
+  await stampSandbox(pdf); // printed from a sandbox copy: stamped SANDBOX
   return pdf.save();
 }
 
@@ -119,5 +122,6 @@ export async function renderEnvelopesPdf(addresses: string[][], returnAddress: s
     });
   }
   if (addresses.length === 0) pdf.addPage([ENV_W, ENV_H]);
+  await stampSandbox(pdf); // printed from a sandbox copy: stamped SANDBOX
   return pdf.save();
 }

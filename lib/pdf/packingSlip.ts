@@ -19,6 +19,7 @@
  */
 
 import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
+import { stampSandbox } from './sandboxStamp';
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -356,5 +357,6 @@ export async function renderPackingSlipPdf(data: PackingSlipData): Promise<Uint8
     color: COLOR_GRAY,
   });
 
+  await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();
 }

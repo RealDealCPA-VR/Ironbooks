@@ -37,7 +37,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { asc, eq } from 'drizzle-orm';
-import { closeDb, getDb, resolveDataDir, type DB } from '@/lib/db';
+import { closeDb, getDb, holdDbOpen, resolveDataDir, type DB } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import { ServiceError, inTransaction, writeAudit, type ServiceContext } from './_base';
 import { requireFileAdmin } from './access';
@@ -134,16 +134,23 @@ function removeContainer(container: string): void {
   fs.rmSync(container, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
-/** Move a directory, falling back to copy + delete across drives (EXDEV). */
-function moveDir(from: string, to: string): void {
-  try {
-    fs.renameSync(from, to);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
-    fs.cpSync(from, to, { recursive: true, errorOnExist: true, force: false });
-    fs.rmSync(from, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  }
-}
+/**
+ * File-system steps that can fail for reasons outside the app's control (a folder in use, a drive
+ * removed). Kept on an object so tests can make them fail.
+ * @internal
+ */
+export const sandboxFs = {
+  /** Move a directory, falling back to copy + delete across drives (EXDEV). */
+  moveDir(from: string, to: string): void {
+    try {
+      fs.renameSync(from, to);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+      fs.cpSync(from, to, { recursive: true, errorOnExist: true, force: false });
+      fs.rmSync(from, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  },
+};
 
 /** The company to attribute an audit entry to in `db` (the caller's, else the file's oldest). */
 async function auditCompanyIn(db: DB, preferred: string): Promise<string | null> {
@@ -343,8 +350,23 @@ export async function startSandbox(ctx: ServiceContext, opts: { now?: Date } = {
   fs.writeFileSync(path.join(container, SANDBOX_CONTAINER_MARKER), createdAt, 'utf8');
 
   // Consistent snapshot: release the real file's handle (PGlite checkpoints + flushes on close),
-  // then copy synchronously so no request runs until the copy is complete.
-  await closeDb(realDir);
+  // then copy synchronously so no request runs until the copy is complete. The real file is held
+  // closed from here until the server points at the copy: a request that runs between the close
+  // and the switch waits (getDb) instead of re-opening the real file, so no handle to it can
+  // linger - and take writes - while the server is in the sandbox.
+  const release = holdDbOpen(realDir);
+  try {
+    await closeDb(realDir);
+    makeCopy(realDir, dir, container, sourceName, createdAt);
+    await openAndVerify(dir, realDir, container);
+  } finally {
+    release();
+  }
+  return { dir, realDir: path.resolve(realDir), id, sourceName, createdAt };
+}
+
+/** Copy the real file into the sandbox container (synchronously) and mark the copy. */
+function makeCopy(realDir: string, dir: string, container: string, sourceName: string, createdAt: string): void {
   try {
     fs.cpSync(realDir, dir, {
       recursive: true,
@@ -369,9 +391,6 @@ export async function startSandbox(ctx: ServiceContext, opts: { now?: Date } = {
     }
     throw new ServiceError('INTERNAL', `The copy could not be made: ${(err as Error).message}. Your real file was not changed.`);
   }
-
-  await openAndVerify(dir, realDir, container);
-  return { dir, realDir: path.resolve(realDir), id, sourceName, createdAt };
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +409,9 @@ interface ActiveSandboxInfo {
  * leaving acts on the REAL file, so it needs an Admin of every company there — checked against
  * the real file, opened only now (the real file is never opened while in the sandbox), so
  * whatever was changed in the copy (e.g. a demoted user) does not count. When the check fails
- * the server goes straight back to the sandbox. `precheck` runs before anything is switched.
+ * the server stays on the sandbox. `precheck` (e.g. the training-file name) runs only once the
+ * caller is known to be such an Admin - so nobody else learns anything from its messages, such
+ * as which folders exist next to the real file - and still before anything is switched.
  */
 async function leaveToRealFile(
   ctx: ServiceContext,
@@ -406,7 +427,6 @@ async function leaveToRealFile(
       `Your real company file is no longer at ${marker.realDataDir}. Reconnect the drive it is on, then try again.`,
     );
   }
-  precheck?.(marker);
   const dir = resolveDataDir();
   // Check the caller against the REAL file through an explicit handle BEFORE switching: the
   // active data dir (which every other request's getDb() and session lookup follow) must stay on
@@ -416,8 +436,9 @@ async function leaveToRealFile(
   try {
     realDb = await getDb(marker.realDataDir);
     await requireFileAdmin({ db: realDb, userId: ctx.userId });
+    precheck?.(marker);
   } catch (err) {
-    // Nothing but this check used the real handle (the server is still on the sandbox).
+    // Nothing but these checks used the real handle (the server is still on the sandbox).
     await closeDb(marker.realDataDir).catch(() => undefined);
     if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
       throw new ServiceError(
@@ -444,6 +465,9 @@ export async function discardSandbox(ctx: ServiceContext): Promise<{ realDir: st
   return { realDir: marker.realDataDir };
 }
 
+/** Device names Windows reserves (also with any extension, e.g. "NUL.txt"). */
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|conin\$|conout\$|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])$/i;
+
 /** Validate a training-file name and return its target folder next to the real file. */
 export function trainingTarget(realDataDir: string, name: unknown): { name: string; dir: string } {
   if (typeof name !== 'string' || !name.trim()) {
@@ -454,6 +478,11 @@ export function trainingTarget(realDataDir: string, name: unknown): { name: stri
   }
   const clean = safeName(name, '');
   if (!clean) throw new ServiceError('VALIDATION', 'Use letters or numbers in the name.');
+  // Windows device names: "CON.ironbooks" does not "exist", yet nothing can be created there, so
+  // the move would fail only after the server had already left the sandbox.
+  if (WINDOWS_RESERVED_NAME.test(clean.split('.')[0].trimEnd())) {
+    throw new ServiceError('VALIDATION', 'That name is reserved by Windows. Pick another name.');
+  }
   const dir = path.join(path.dirname(path.resolve(realDataDir)), `${clean}.ironbooks`);
   if (samePath(dir, realDataDir)) {
     throw new ServiceError('VALIDATION', 'That is the name of your real company file. Pick another name.');
@@ -464,15 +493,25 @@ export function trainingTarget(realDataDir: string, name: unknown): { name: stri
   return { name: clean, dir };
 }
 
+export interface KeepSandboxResult {
+  realDir: string;
+  /** The training file's folder; null when the copy could not be moved (see `warning`). */
+  trainingDir: string | null;
+  name: string;
+  /**
+   * Set when the server is back on the real file but the copy could not be moved: the leave
+   * itself succeeded (the desktop shell must still be told, or it would relaunch into the copy),
+   * and the copy is listed under "Copies left over" on the Sandbox page.
+   */
+  warning?: string;
+}
+
 /**
  * Keep the sandbox as a training file: switch back to the real file, then move the copy next to
  * the real file under `name`. The training file is a separate company file (its own file id, so
  * a session from it is never valid on the real file) and is never merged back.
  */
-export async function keepSandboxAsTraining(
-  ctx: ServiceContext,
-  name: unknown,
-): Promise<{ realDir: string; trainingDir: string; name: string }> {
+export async function keepSandboxAsTraining(ctx: ServiceContext, name: unknown): Promise<KeepSandboxResult> {
   let target: { name: string; dir: string } | null = null;
   const { dir, container, marker, realDb } = await leaveToRealFile(ctx, (m) => {
     target = trainingTarget(m.realDataDir, name);
@@ -480,12 +519,20 @@ export async function keepSandboxAsTraining(
   if (!target) throw new ServiceError('VALIDATION', 'Give the training file a name.');
   const t: { name: string; dir: string } = target;
   try {
-    moveDir(dir, t.dir);
+    sandboxFs.moveDir(dir, t.dir);
   } catch (err) {
-    throw new ServiceError(
-      'INTERNAL',
-      `You are back in your real books, but the copy could not be moved (${(err as Error).message}). It is listed under "Copies left over" on the Sandbox page.`,
-    );
+    // The server is already on the real file: report a completed leave with a warning (not an
+    // error), so the client still hands off to the desktop shell and the shell stops treating
+    // the copy as the open file.
+    const reason = (err as Error).message;
+    console.warn('[sandbox] the copy could not be moved to the training file:', reason);
+    await auditReal(realDb, ctx, 'update', { event: 'sandbox_keep_failed', name: t.name });
+    return {
+      realDir: marker.realDataDir,
+      trainingDir: null,
+      name: t.name,
+      warning: `You are back in your real books, but the copy could not be saved as the training file "${t.name}" (${reason}). It is listed under "Copies left over" on the Sandbox page, where you can open it again or delete it.`,
+    };
   }
   writeSandboxMarker(t.dir, {
     ...marker,
@@ -525,14 +572,20 @@ export async function resumeSandbox(ctx: ServiceContext, id: unknown): Promise<S
   await assertExclusiveAccess(ctx, 'Opening the sandbox', { scope: 'file' });
   const hit = findLeftover(id);
   const realDir = path.resolve(resolveDataDir());
-  await closeDb(realDir);
-  switchActiveDataDir(hit.dir);
+  // Held closed until the switch, as in startSandbox.
+  const release = holdDbOpen(realDir);
   try {
-    await getDb(hit.dir);
-  } catch (err) {
-    switchActiveDataDir(realDir);
-    await closeDb(hit.dir).catch(() => undefined);
-    throw err instanceof ServiceError ? err : new ServiceError('INTERNAL', `That copy could not be opened: ${(err as Error).message}`);
+    await closeDb(realDir);
+    switchActiveDataDir(hit.dir);
+    try {
+      await getDb(hit.dir);
+    } catch (err) {
+      switchActiveDataDir(realDir);
+      await closeDb(hit.dir).catch(() => undefined);
+      throw err instanceof ServiceError ? err : new ServiceError('INTERNAL', `That copy could not be opened: ${(err as Error).message}`);
+    }
+  } finally {
+    release();
   }
   return {
     dir: hit.dir,

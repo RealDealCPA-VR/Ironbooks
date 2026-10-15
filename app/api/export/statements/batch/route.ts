@@ -15,6 +15,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import AdmZip from 'adm-zip';
 import { PDFDocument } from 'pdf-lib';
+import { tagSandbox } from '@/lib/pdf/sandboxStamp';
 import { getServerContext } from '@/lib/context';
 import {
   batchStatements,
@@ -105,6 +106,7 @@ export async function GET(req: NextRequest) {
       const pages = await combined.copyPages(doc, doc.getPageIndices());
       for (const p of pages) combined.addPage(p);
     }
+    tagSandbox(combined); // each statement's pages were stamped when it was rendered
     const merged = await combined.save();
     const buffer = merged.buffer.slice(
       merged.byteOffset,

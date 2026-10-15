@@ -1,8 +1,12 @@
 /**
  * "SANDBOX" stamp for PDFs printed from a sandbox / training file ("Try it on a copy",
- * lib/services/sandbox.ts). Checks, invoices and every other form that prints through
- * renderChecksPdf / renderFormPdf / renderSalesFormPdf call stampSandbox() just before saving,
- * so a check or invoice printed from a practice copy can never pass for a real one.
+ * lib/services/sandbox.ts). Every PDF the app renders calls stampSandbox() just before saving —
+ * checks, invoices and the other sales / template forms, paystubs, W-2 / W-3 / 941 / 940,
+ * 1099-NEC, collection letters, labels and envelopes, packing slips, pick lists, open-item
+ * statements and report PDFs — so nothing printed from a practice copy can pass for a real one.
+ * Documents merged from already-stamped parts (combined packing slips, batch statements, the
+ * shareable ledger summary) call tagSandbox() instead, which marks the document without
+ * drawing the stamp a second time.
  *
  * lib/pdf is shared with client bundles, so this module never touches the file system: the
  * server keeps process.env.BKA_SANDBOX in step with the active company file
@@ -47,5 +51,15 @@ export async function stampSandbox(pdf: PDFDocument, force: boolean = sandboxSta
     page.drawRectangle({ x: 0, y: height - 14, width, height: 14, color: rgb(1, 0.93, 0.8), opacity: 0.9 });
     page.drawText(SANDBOX_STAMP_NOTE, { x: 12, y: height - 10.5, size: noteSize, font: bold, color: red });
   }
-  pdf.setKeywords([...(pdf.getKeywords()?.split(/\s+/).filter(Boolean) ?? []), 'SANDBOX']);
+  tagSandbox(pdf, true);
+}
+
+/**
+ * Mark a document as printed from a sandbox (the SANDBOX keyword) without drawing on it — for
+ * documents merged from parts that stampSandbox() already stamped.
+ */
+export function tagSandbox(pdf: PDFDocument, force: boolean = sandboxStampActive()): void {
+  if (!force) return;
+  const keywords = pdf.getKeywords()?.split(/\s+/).filter(Boolean) ?? [];
+  if (!keywords.includes(SANDBOX_STAMP)) pdf.setKeywords([...keywords, SANDBOX_STAMP]);
 }

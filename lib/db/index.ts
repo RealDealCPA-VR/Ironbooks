@@ -61,6 +61,46 @@ export function withDamagedFileAccess<T>(fn: () => Promise<T>): Promise<T> {
 
 const handles = new Map<string, DbHandle>();
 
+/**
+ * Company files that must not be (re)opened right now: the sandbox switch (lib/services/sandbox.ts)
+ * holds the REAL file from just before it closes its handle until the server points at the copy,
+ * so no request that slips in between can open a fresh handle to the real file and keep writing
+ * to it while the server is in the sandbox. getDb() waits for the hold to end and then opens
+ * whichever file is active by then; the synchronous openDb() refuses instead.
+ */
+const openHolds = new Map<string, Promise<void>>();
+
+/** Keep `dataDir` from being opened until the returned release function is called. */
+export function holdDbOpen(dataDir: string): () => void {
+  const dir = resolveDataDir(dataDir);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  openHolds.set(dir, gate);
+  return () => {
+    if (openHolds.get(dir) === gate) openHolds.delete(dir);
+    release();
+  };
+}
+
+/** The hold that would block opening the file a call resolves to right now (none: open it). */
+function openHoldFor(dataDir?: string): Promise<void> | undefined {
+  const dir = resolveDataDir(dataDir);
+  return handles.has(dir) ? undefined : openHolds.get(dir);
+}
+
+/** Wait while the company file a call would open is held by holdDbOpen(). */
+async function waitForOpenHold(dataDir?: string): Promise<void> {
+  // Re-resolve after each wait: without an explicit dataDir the active file has usually changed.
+  for (let gate = openHoldFor(dataDir); gate; gate = openHoldFor(dataDir)) await gate;
+}
+
+/** Whether a handle for `dataDir` is open in this process. */
+export function isDbOpen(dataDir?: string): boolean {
+  return handles.has(resolveDataDir(dataDir));
+}
+
 /** Resolve the data directory for the active (or a named) company file. */
 export function resolveDataDir(dataDir?: string): string {
   if (dataDir) return path.resolve(dataDir);
@@ -79,6 +119,9 @@ export function openDb(dataDir?: string): DbHandle {
   const dir = resolveDataDir(dataDir);
   const existing = handles.get(dir);
   if (existing) return existing;
+  if (openHolds.has(dir)) {
+    throw new ServiceError('CONFLICT', 'The company file is being switched. Try again in a moment.');
+  }
 
   fs.mkdirSync(dir, { recursive: true });
   // Postgres data errors (malformed uuid 22P02, numeric overflow 22003) become ServiceErrors for
@@ -118,6 +161,8 @@ export function openDb(dataDir?: string): DbHandle {
 
 /** Ledger problems found when the company file was opened (null = healthy). */
 export async function getLedgerDamage(dataDir?: string): Promise<LedgerProblem[] | null> {
+  // Only a held file costs an extra tick: otherwise the file is resolved at call time, as before.
+  if (openHoldFor(dataDir)) await waitForOpenHold(dataDir);
   const handle = openDb(dataDir);
   await handle.migrated;
   return handle.damage;
@@ -128,6 +173,8 @@ export async function getLedgerDamage(dataDir?: string): Promise<LedgerProblem[]
  * ledger is damaged (LedgerDamagedError) except inside withDamagedFileAccess().
  */
 export async function getDb(dataDir?: string): Promise<DB> {
+  // Only a held file costs an extra tick: otherwise the file is resolved at call time, as before.
+  if (openHoldFor(dataDir)) await waitForOpenHold(dataDir);
   const handle = openDb(dataDir);
   await handle.migrated;
   if (handle.damage && !damagedFileAccess.getStore()) throw new LedgerDamagedError(handle.damage);
