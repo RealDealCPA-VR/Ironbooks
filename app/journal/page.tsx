@@ -47,6 +47,7 @@ import { formatAccountLabel } from '@/lib/preferences';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
+import { activeOrSelected, otherNameLabel, type OtherNameEntry } from '@/lib/lists/otherNameOptions';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -101,6 +102,8 @@ interface NameOption {
   value: string;
   label: string;
   kind: 'customer' | 'vendor' | 'employee' | 'other';
+  /** Inactive entries are offered only on the line that already uses them. */
+  inactive?: boolean;
 }
 
 const NAME_GROUP_LABEL: Record<NameOption['kind'], string> = {
@@ -480,7 +483,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
                 {(['customer', 'vendor', 'employee', 'other'] as const).map((kind) => {
                   const need = requiredNameKind(accountById.get(line.accountId));
                   if (need && need !== kind) return null;
-                  const opts = names.filter((n) => n.kind === kind);
+                  const opts = activeOrSelected(names.filter((n) => n.kind === kind), line.name);
                   if (opts.length === 0) return null;
                   return (
                     <optgroup key={kind} label={NAME_GROUP_LABEL[kind]}>
@@ -729,7 +732,7 @@ function JournalPageContent() {
       api.get<Array<{ id: string; firstName: string; lastName: string }>>('/api/employees').catch(() => []),
       // QB "Other Names" (payees that are not customers, vendors or employees).
       api
-        .get<{ entries: Array<{ id: string; name: string }> }>('/api/lists/other-names')
+        .get<{ entries: OtherNameEntry[] }>('/api/lists/other-names?includeInactive=true')
         .then((d) => d.entries)
         .catch(() => []),
     ]);
@@ -742,7 +745,12 @@ function JournalPageContent() {
         label: `${e.firstName} ${e.lastName}`.trim(),
         kind: 'employee' as const,
       })),
-      ...list(other).map((o) => ({ value: `other:${o.id}`, label: o.name, kind: 'other' as const })),
+      ...list(other).map((o: OtherNameEntry) => ({
+        value: `other:${o.id}`,
+        label: otherNameLabel(o),
+        kind: 'other' as const,
+        inactive: o.isActive === false,
+      })),
     ]);
   }, []);
 

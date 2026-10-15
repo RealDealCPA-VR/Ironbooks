@@ -53,6 +53,7 @@ import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate, confirmUniqueNumber, findDuplicateNumber } from '@/lib/formPrefs';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
+import { visibleOtherNames, type OtherNameEntry } from '@/lib/lists/otherNameOptions';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -147,11 +148,7 @@ const OTHER_PAYEE = '__other__';
 /** Payee select values for Other Names entries are "other:<id>" (vendors use the bare id). */
 const OTHER_NAME_PREFIX = 'other:';
 
-interface OtherNameOption {
-  id: string;
-  name: string;
-  accountNumber?: string | null;
-}
+type OtherNameOption = OtherNameEntry;
 
 /** Decode the payee select (+ typed name) into the API's vendorId / otherNameId / payeeName. */
 function payeeFields(sel: string, typed: string): { vendorId?: string; otherNameId?: string; payeeName?: string } {
@@ -211,6 +208,11 @@ function ExpensesPageContent() {
   // Form state
   const [entryType, setEntryType] = useState<EntryType>('check');
   const [payeeSel, setPayeeSel] = useState('');
+  // Active Other Names, plus the saved payee when it has since been made inactive.
+  const payeeOtherNames = visibleOtherNames(
+    otherNames,
+    payeeSel.startsWith(OTHER_NAME_PREFIX) ? payeeSel.slice(OTHER_NAME_PREFIX.length) : null,
+  );
   const [payeeName, setPayeeName] = useState('');
   const [paymentAccountId, setPaymentAccountId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -261,7 +263,7 @@ function ExpensesPageContent() {
           .catch(() => setItems([]));
         // QB "Other Names" can be payees too (optional: the list may be hidden by permissions).
         api
-          .get<{ entries: OtherNameOption[] }>('/api/lists/other-names')
+          .get<{ entries: OtherNameOption[] }>('/api/lists/other-names?includeInactive=true')
           .then((d) => setOtherNames(d.entries ?? []))
           .catch(() => setOtherNames([]));
         setExpenses(expData.expenses);
@@ -624,7 +626,7 @@ function ExpensesPageContent() {
                 if (v && v !== OTHER_PAYEE && !v.startsWith(OTHER_NAME_PREFIX)) prefillFor({ vendorId: v });
                 else if (v.startsWith(OTHER_NAME_PREFIX)) {
                   const o = otherNames.find((x) => `${OTHER_NAME_PREFIX}${x.id}` === v);
-                  if (o) prefillFor({ payee: o.name });
+                  if (o && o.isActive !== false) prefillFor({ payee: o.name });
                 }
               }}
             >
@@ -636,11 +638,11 @@ function ExpensesPageContent() {
                   </option>
                 ))}
               </optgroup>
-              {otherNames.length > 0 && (
+              {payeeOtherNames.length > 0 && (
                 <optgroup label="Other Names">
-                  {otherNames.map((o) => (
+                  {payeeOtherNames.map((o) => (
                     <option key={o.id} value={`${OTHER_NAME_PREFIX}${o.id}`}>
-                      {o.name}
+                      {o.label}
                     </option>
                   ))}
                 </optgroup>

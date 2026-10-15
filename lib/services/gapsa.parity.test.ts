@@ -21,20 +21,23 @@ import {
 } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
-import { createCustomer, updateCustomer } from './customers';
+import { createCustomer, getCustomer, updateCustomer } from './customers';
+import { fullAccess } from '@/lib/permissions/model';
 import { createItem } from './items';
 import { trialBalance } from './reports';
 import { createExpense, getExpense, listExpenses, updateExpense } from './expenses';
 import { checkPrintData, listPrintQueue } from './printQueue';
 import { createManualEntry, getEntry } from './journal';
 import { fetchGlLines, loadAccountMeta } from './reportEngine';
-import { createEntry, updateEntry } from './lists/simpleLists';
+import { createEntry, listEntries, updateEntry } from './lists/simpleLists';
+import { activeOrSelected, otherNameLabel, visibleOtherNames } from '@/lib/lists/otherNameOptions';
 import { mergeOtherNames } from './lists/mergeLists';
 import { createCreditMemo, getCreditMemo } from './creditMemos';
 import { createPriceLevel } from './pricing';
 import { setCustomerPrice } from './customerPricing';
 import { bulkSave } from './lists/bulk';
 import { importIIF, importItemsCSV } from './qbImport';
+import { createItemWithOpeningStock } from './lists/openingStock';
 import { createExpenseSchema } from '@/lib/validation/expenses';
 import { createCreditMemoSchema } from '@/lib/validation/creditMemos';
 import { createCustomerSchema } from '@/lib/validation/customers';
@@ -313,6 +316,47 @@ describe('B3 Other Names as payees and journal names', () => {
     ).toBe(false);
     expect(createExpenseSchema.safeParse(base).success).toBe(false);
   });
+
+  it('pickers still show a saved payee / journal name that has since been made inactive', async () => {
+    const landlord = await createEntry(ctx, 'other-names', { name: 'Former Landlord' });
+    const landlordId = String(landlord.id);
+    const checkInput = {
+      date: d('2026-03-06'),
+      method: 'check' as const,
+      paymentAccountId: acct['1000'],
+      otherNameId: landlordId,
+      lines: [{ accountId: acct['6300'], amount: '9.00' }],
+    };
+    const check = await createExpense(ctx, checkInput);
+    await updateEntry(ctx, 'other-names', landlordId, { isActive: false });
+
+    // What the pickers load: /api/lists/other-names?includeInactive=true
+    const entries = (await listEntries(ctx, 'other-names', { includeInactive: true })).map((e) => ({
+      id: String(e.id),
+      name: String(e.name),
+      isActive: e.isActive,
+    }));
+    // Check form editing that check: the inactive payee is offered, labelled, so the select shows it.
+    const saved = await getExpense(ctx, check.id);
+    const forCheck = visibleOtherNames(entries, saved.otherNameId);
+    expect(forCheck.find((o) => o.id === landlordId)?.label).toBe('Former Landlord — inactive');
+    expect(forCheck.find((o) => o.id === ownerId)?.label).toBe('Pat Owner');
+    // A new check: inactive names are not offered.
+    expect(visibleOtherNames(entries, null).some((o) => o.id === landlordId)).toBe(false);
+    expect(visibleOtherNames(entries, ownerId).some((o) => o.id === landlordId)).toBe(false);
+    // The server still accepts saving the check with its (now inactive) payee unchanged.
+    const resaved = await updateExpense(ctx, check.id, { ...checkInput, memo: 'still the landlord' });
+    expect(resaved.otherNameId).toBe(landlordId);
+
+    // Journal Name column: same rule per line.
+    const journalOpts = entries.map((e) => ({
+      value: `other:${e.id}`,
+      label: otherNameLabel(e),
+      inactive: e.isActive === false,
+    }));
+    expect(activeOrSelected(journalOpts, `other:${landlordId}`).map((o) => o.label)).toContain('Former Landlord — inactive');
+    expect(activeOrSelected(journalOpts, '').some((o) => o.value === `other:${landlordId}`)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -343,6 +387,28 @@ describe('B12 price levels on credit memos and the customer form', () => {
     const foreign = await createPriceLevel(other, { name: 'Theirs', type: 'fixed_percent', percent: -50 });
     await expect(updateCustomer(ctx, plain.id, { priceLevelId: foreign.id })).rejects.toMatchObject({ code: 'VALIDATION' });
     expect(createCustomerSchema.safeParse({ displayName: 'x', priceLevelId: levelId }).success).toBe(true);
+  });
+
+  it('only users with Advanced Pricing access (lists view) can set or clear a customer price level', async () => {
+    const full = fullAccess();
+    const noPricing: ServiceContext = {
+      ...ctx,
+      access: { ...full, isAdmin: false, permissions: { ...full.permissions, lists: [] } },
+    };
+    const withPricing: ServiceContext = { ...ctx, access: full };
+    // Create: refused with a level, fine without one.
+    await expect(createCustomer(noPricing, { displayName: 'No Pricing Create', priceLevelId: levelId })).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    const c = await createCustomer(noPricing, { displayName: 'No Pricing Plain' });
+    // Edit: setting and clearing refused; other fields and resending the same value are fine.
+    await expect(updateCustomer(noPricing, c.id, { priceLevelId: levelId })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect((await updateCustomer(noPricing, c.id, { notes: 'ok', priceLevelId: null })).notes).toBe('ok');
+    await updateCustomer(withPricing, c.id, { priceLevelId: levelId });
+    await expect(updateCustomer(noPricing, c.id, { priceLevelId: null })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    const same = await updateCustomer(noPricing, c.id, { priceLevelId: levelId, notes: 'same level' });
+    expect(same.priceLevelId).toBe(levelId);
+    expect((await getCustomer(ctx, c.id)).priceLevelId).toBe(levelId);
   });
 
   it('prices a credit memo line from the customer\'s price level server-side and records provenance', async () => {
@@ -531,9 +597,31 @@ describe('G1 opening quantity on hand and value', () => {
     const counts = await importIIF(ctx, iif);
     const carried = await itemByName('Iif Carried');
     expect(carried).toBeDefined();
-    expect(Number(carried.quantityOnHand ?? 0)).toBe(0);
+    // The stock itself arrives (quantity, average cost, FIFO layer)...
+    expect(carried.quantityOnHand).toBe('10.0000');
+    expect(carried.averageCost).toBe('50.0000');
+    const layers = await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, carried.id));
+    expect(layers.map((l) => [l.quantityRemaining, l.unitCost])).toEqual([['10.0000', '50.0000']]);
+    // ...but no journal entry: the ledger already carries the 500.00 through the account's OBAMOUNT.
     expect(await openingEntry(carried.id)).toBeUndefined();
-    expect(counts.issues.some((i) => i.name === 'Iif Carried' && /count it twice/.test(i.message))).toBe(true);
+    expect(counts.openingStock).toEqual({ items: 1, value: '500.00', unposted: 1 });
+    expect(counts.issues.some((i) => i.name === 'Iif Carried' && /without a journal entry/.test(i.message))).toBe(true);
+    const stockAcct = (await db.select().from(accounts).where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.name, 'Iif Stock'))))[0];
+    const stockLines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.accountId, stockAcct.id));
+    const stockBalance = stockLines.reduce((s, l) => s + Number(l.debit ?? 0) - Number(l.credit ?? 0), 0);
+    expect(stockBalance).toBe(500); // counted once: valuation (10 x 50) == ledger
+    await assertBooksBalance();
+  });
+
+  it('createItemWithOpeningStock({ postToLedger: false }) builds the layer without posting', async () => {
+    const { item, opening } = await createItemWithOpeningStock(
+      ctx,
+      { name: 'Carried Direct', type: 'inventory', openingQuantity: '4', openingValue: '10.00', openingAsOf: d('2026-01-05') },
+      { postToLedger: false },
+    );
+    expect(item.quantityOnHand).toBe('4.0000');
+    expect(opening?.entryId).toBeNull();
+    expect(await openingEntry(item.id)).toBeUndefined();
     await assertBooksBalance();
   });
 });

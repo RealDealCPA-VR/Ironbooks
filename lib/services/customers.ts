@@ -17,6 +17,7 @@ import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { customers, invoices, priceLevels, taxRates } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, assertRefInCompany, notFound, validation, writeAudit } from './_base';
+import { requirePermission } from './access';
 import { unappliedPaymentsByCustomer } from './customerCredits';
 import { journalBalancesByEntity } from './journal';
 import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
@@ -163,6 +164,16 @@ export async function getCustomer(ctx: ServiceContext, id: string) {
 // ---------------------------------------------------------------------------
 
 /** Create a new customer record (no GL impact — only master data). */
+/**
+ * A customer's price level belongs to Advanced Pricing: the customer form only shows it to users
+ * who can open the price levels (/api/pricing/levels: lists view), so the customer routes
+ * (customers area) refuse to set or clear it for anyone else. Trusted contexts (no `access`:
+ * imports, system jobs, tests) pass.
+ */
+function requirePriceLevelAccess(ctx: ServiceContext): void {
+  requirePermission(ctx, 'lists', 'view');
+}
+
 export async function createCustomer(ctx: ServiceContext, input: CreateCustomerInput) {
   validateInput(input);
 
@@ -195,7 +206,10 @@ export async function createCustomer(ctx: ServiceContext, input: CreateCustomerI
   }
 
   if (input.taxRateId) await assertRefInCompany(ctx, taxRates, input.taxRateId, 'Sales tax rate');
-  if (input.priceLevelId) await assertRefInCompany(ctx, priceLevels, input.priceLevelId, 'Price level');
+  if (input.priceLevelId) {
+    requirePriceLevelAccess(ctx);
+    await assertRefInCompany(ctx, priceLevels, input.priceLevelId, 'Price level');
+  }
 
   const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
   const taxCode = input.salesTaxCodeId ? await resolveSalesTaxCode(ctx, input.salesTaxCodeId) : null;
@@ -298,6 +312,11 @@ export async function updateCustomer(
   }
 
   if (patch.taxRateId) await assertRefInCompany(ctx, taxRates, patch.taxRateId, 'Sales tax rate');
+  // Changing (setting or clearing) the price level needs Advanced Pricing access; resending the
+  // current value is harmless.
+  if (patch.priceLevelId !== undefined && (patch.priceLevelId ?? null) !== (before.priceLevelId ?? null)) {
+    requirePriceLevelAccess(ctx);
+  }
   if (patch.priceLevelId) await assertRefInCompany(ctx, priceLevels, patch.priceLevelId, 'Price level');
 
   const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });

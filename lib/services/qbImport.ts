@@ -24,9 +24,10 @@
  *                  G1: QNTY (quantity on hand) with VALUE (total value; else QNTY x COST) and an
  *                  optional ASOFDATE becomes the item's opening stock through the New Item path
  *                  (lib/services/lists/openingStock.ts: Dr Inventory Asset / Cr Opening Balance
- *                  Equity + a FIFO layer). It is NOT posted when the same file already carries
- *                  that inventory asset account's balance (an ACCNT OBAMOUNT or TRNS rows on it),
- *                  which would count the stock twice; an issue explains it instead.
+ *                  Equity + a FIFO layer). When the same file already carries that inventory asset
+ *                  account's balance (an ACCNT OBAMOUNT or TRNS rows on it - the usual QuickBooks
+ *                  export) the item still gets its FIFO layer, quantity on hand and average cost,
+ *                  but NO journal entry is posted (it would count the value twice); a note says so.
  *       Other lists through a REGISTRY (IIF_LIST_REGISTRY): CTYPE / VTYPE / SALESREP / BUD
  *                  import into their tables (OTHERNAME, JOBTYPE, TERMS, SHIPMETH, PAYMETH, CUSTMSG,
  *                  SALESTAXCODE, TODO, VEH, PRICELEVEL via qbIifLists.ts); unknown sections are parsed and
@@ -818,8 +819,12 @@ export interface ImportCounts {
   deferred: DeferredList[];
   /** Open invoices / bills converted to real documents (when requested). */
   openItems?: { invoices: number; bills: number; credits: number; skipped: number };
-  /** G1: inventory items imported with an opening quantity on hand, and its total value. */
-  openingStock?: { items: number; value: string };
+  /**
+   * G1: inventory items imported with an opening quantity on hand, and its total value.
+   * `unposted` of them were brought in without a journal entry because the file already
+   * carries their inventory asset account's balance.
+   */
+  openingStock?: { items: number; value: string; unposted?: number };
   skipped: number;
   /** One entry per skipped row (and per remap/auto-create), so users can see WHY. */
   issues: ImportIssue[];
@@ -2138,28 +2143,25 @@ async function importItemRow(
     if (input.type !== 'inventory') skip('only inventory items carry a quantity on hand.');
     else if ('error' in input.opening) skip(input.opening.error);
     else {
-      const assetId = assetAccountId ?? lookup.byCode.get('1300')?.id ?? null;
-      if (assetId && input.carriedAccountIds?.has(assetId)) {
-        skip(
-          'this file already brings in the balance of the inventory asset account, so adding the stock again would count it twice. Enter it with Adjust inventory if needed.',
-        );
-      } else {
-        try {
-          planOpeningStock(input.opening, input.type);
-          opening = input.opening;
-        } catch (err) {
-          if (err instanceof ServiceError && err.code === 'VALIDATION') skip(err.message);
-          else throw err;
-        }
+      try {
+        planOpeningStock(input.opening, input.type);
+        opening = input.opening;
+      } catch (err) {
+        if (err instanceof ServiceError && err.code === 'VALIDATION') skip(err.message);
+        else throw err;
       }
     }
   }
+  // The file already brings in the inventory asset account's balance: create the stock (layer,
+  // quantity, average cost) without posting it again.
+  const assetIdForStock = assetAccountId ?? lookup.byCode.get('1300')?.id ?? null;
+  const ledgerCarried = !!opening && !!assetIdForStock && !!input.carriedAccountIds?.has(assetIdForStock);
 
   try {
     let row: Awaited<ReturnType<typeof createItem>>;
     if (opening) {
       try {
-        row = (await createItemWithOpeningStock(ctx, { ...itemInput, ...opening })).item;
+        row = (await createItemWithOpeningStock(ctx, { ...itemInput, ...opening }, { postToLedger: !ledgerCarried })).item;
       } catch (err) {
         // e.g. the as-of date is on or before the closing date: import the item without stock.
         if (!(err instanceof ServiceError) || err.code === 'VALIDATION') throw err;
@@ -2176,7 +2178,18 @@ async function importItemRow(
       counts.openingStock = {
         items: prev.items + 1,
         value: toAmountString(Money.of(prev.value).plus(plan ? plan.value : 0)),
+        ...(ledgerCarried || prev.unposted ? { unposted: (prev.unposted ?? 0) + (ledgerCarried ? 1 : 0) } : {}),
       };
+      if (ledgerCarried) {
+        counts.issues.push({
+          entity: 'item',
+          name,
+          reason: 'note',
+          message:
+            'Quantity on hand imported without a journal entry: this file already brings in the balance of the inventory asset account, ' +
+            'so posting the stock again would count it twice. Check that the item values add up to that balance.',
+        });
+      }
     }
     counts.items++;
     const patch: Partial<typeof itemsTable.$inferInsert> = {};

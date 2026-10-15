@@ -68,7 +68,7 @@ interface ImportCounts {
   deferred?: DeferredList[];
   openItems?: { invoices: number; bills: number; credits: number; skipped: number };
   /** G1: inventory items brought in with a quantity on hand, and its total value. */
-  openingStock?: { items: number; value: string };
+  openingStock?: { items: number; value: string; unposted?: number };
   skipped: number;
   issues: ImportIssue[];
 }
@@ -493,6 +493,13 @@ export function ListImport() {
               {result.openingStock.items} inventory item{result.openingStock.items === 1 ? '' : 's'} started with a
               quantity on hand worth {formatCurrency(result.openingStock.value)} in total (added to Inventory Asset
               against Opening Balance Equity).
+              {(result.openingStock.unposted ?? 0) > 0 && (
+                <>
+                  {' '}
+                  For {result.openingStock.unposted} of them the file already brings in the inventory asset balance, so
+                  their stock was set up without a journal entry.
+                </>
+              )}
             </p>
           )}
 
