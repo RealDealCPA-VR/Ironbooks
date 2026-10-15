@@ -22,9 +22,15 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   // ---- Home / everyday ----
   '/dashboard': {
     title: 'Home',
-    what: 'Your starting point: the arrows show the order money moves, from vendors and customers to the bank. Click any step to do it.',
-    first: 'Pick the task you need, such as Create Invoices or Pay Bills, and check Reminders for anything due.',
+    what: 'Your starting point: "Needs attention" lists what is waiting on you, most urgent first; "Overview" shows how money moves, and you click any step to do it.',
+    first: 'Work down Needs attention, or on Overview pick a task such as Create Invoices or Pay Bills.',
     qb: 'Home page',
+  },
+  '/attention': {
+    title: 'Needs attention',
+    what: 'Everything waiting on you, most urgent first: bank transactions to sort, late customers, bills due, reconciling, payroll taxes, to-dos and backups.',
+    first: 'Use the button on each line (Sort it, Send reminder, Pay, Done). Not now? Choose Later to snooze or dismiss it.',
+    qb: 'Company Snapshot / Reminders',
   },
   '/todos': {
     title: 'To Do list',

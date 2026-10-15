@@ -22,6 +22,7 @@ import type { Area } from '@/lib/permissions/model';
 import { blockingFeatureGate, featureHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
 import PreferenceBehaviors from './PreferenceBehaviors';
+import AttentionBadge from './AttentionBadge'; // team home: count on the "Needs attention" link
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
@@ -517,7 +518,7 @@ function NavItems({
                     prefetch={false}
                     title={nav.qb && nav.qb !== nav.label ? `${nav.label} (QuickBooks: ${nav.qb})` : nav.label}
                     aria-current={active ? 'page' : undefined}
-                    className={`flex items-center justify-center lg:justify-start gap-3 px-2 lg:px-3 py-2 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
+                    className={`relative flex items-center justify-center lg:justify-start gap-3 px-2 lg:px-3 py-2 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
                       active
                         ? 'bg-electric/10 text-electric font-semibold shadow-[inset_3px_0_0_0_theme(colors.electric)]'
                         : 'text-navy/80 font-medium hover:text-electric hover:bg-electric/5'
@@ -525,6 +526,7 @@ function NavItems({
                   >
                     <Icon className="h-[18px] w-[18px] shrink-0" />
                     <span className="hidden lg:inline-block text-sm">{nav.label}</span>
+                    {nav.path === '/attention' && <AttentionBadge />}
                   </Link>
                 );
               })}

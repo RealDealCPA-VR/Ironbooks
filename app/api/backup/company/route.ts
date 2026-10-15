@@ -14,6 +14,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createCompanyBackup, restoreCompanyBackup } from '@/lib/services/backup';
+import { recordBackup } from '@/lib/services/attention';
 import { ServiceError } from '@/lib/services/_base';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { requireAccessInCompany, requirePermission } from '@/lib/services/access';
@@ -44,6 +45,7 @@ export async function GET(req: NextRequest) {
     const access = await requireAccessInCompany(ctx, companyId, 'file_utilities', 'create');
 
     const { buffer, filename } = await createCompanyBackup(ctx.db, companyId, { access });
+    await recordBackup(ctx.db, { kind: 'company', companyId, userId: ctx.userId, filename }); // inbox: last backup
     const arrayBuf: ArrayBuffer = buffer.buffer.slice(
       buffer.byteOffset,
       buffer.byteOffset + buffer.byteLength,

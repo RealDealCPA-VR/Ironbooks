@@ -32,6 +32,11 @@ import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { Card, PageHeader } from '@/components/ui';
 import { can } from '@/lib/permissions/model';
+// team home: "Needs attention" is Home's first tab (Simple mode lands on it).
+import HomeTabs from '@/components/HomeTabs';
+import AttentionInbox from '@/components/AttentionInbox';
+import { getAttention } from '@/lib/services/attention';
+import { homeTabFor } from '@/lib/homeTabs';
 
 export const dynamic = 'force-dynamic';
 
@@ -61,8 +66,11 @@ async function allowedWorkflowHrefs(ctx: ServiceContext): Promise<string[]> {
   });
 }
 
-export default async function DashboardPage() {
+export default async function DashboardPage({ searchParams }: { searchParams: Promise<{ tab?: string }> }) {
   const ctx = await getPageContext('/dashboard');
+  if (homeTabFor((await searchParams).tab, (await getMyPreferences(ctx)).navMode) === 'attention') {
+    return <AttentionHome data={await getAttention(ctx)} />;
+  }
   const allowedHrefs = await allowedWorkflowHrefs(ctx);
   // Users & Roles: the financial snapshot needs Reports — Financial (QB Company Snapshot parity).
   // Everyone else gets the Home workflow (only the tasks they can do) and their reminders.
@@ -93,6 +101,7 @@ export default async function DashboardPage() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Home" action={<QuickActions />} />
+      <HomeTabs active="overview" />
 
       {/* QuickBooks-style workflow diagram: click any step to start that task
           (My Preferences > General can hide it). */}
@@ -160,10 +169,22 @@ export default async function DashboardPage() {
 // Quick actions
 // ---------------------------------------------------------------------------
 
+/** Home's "Needs attention" tab: the inbox (lib/services/attention.ts). */
+function AttentionHome({ data }: { data: Awaited<ReturnType<typeof getAttention>> }) {
+  return (
+    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+      <PageHeader title="Home" />
+      <HomeTabs active="attention" attentionCount={data.total} />
+      <AttentionInbox initial={data} />
+    </main>
+  );
+}
+
 function LimitedHome({ allowedHrefs }: { allowedHrefs: string[] | null }) {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Home" />
+      <HomeTabs active="overview" />
       <Card className="p-6 max-w-xl mb-6">
         <p className="text-navy/70 text-sm">
           Welcome! Click a task below, or use the menu on the left, to get to the parts of the

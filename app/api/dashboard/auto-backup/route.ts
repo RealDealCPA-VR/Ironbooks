@@ -22,6 +22,7 @@ import { getCompany } from '@/lib/services/company';
 import { createBackup } from '@/lib/services/backup';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { requireFileAdmin } from '@/lib/services/access';
+import { recordBackup } from '@/lib/services/attention';
 
 /** Constant-time check of the x-bka-internal header against BKA_INTERNAL_TOKEN. */
 async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
@@ -61,6 +62,7 @@ export async function POST(req: NextRequest) {
     }
 
     const { buffer, filename } = createBackup(companyName);
+    await recordBackup(ctx.db, { kind: 'auto', userId: ctx.userId, filename }); // inbox: last backup
     const arrayBuf: ArrayBuffer = buffer.buffer.slice(
       buffer.byteOffset,
       buffer.byteOffset + buffer.byteLength,
