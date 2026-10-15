@@ -538,7 +538,8 @@ function creditMemoInput(s: Snap): CreateCreditMemoInput {
   };
 }
 
-function purchaseOrderInput(s: Snap, keepLineIds: boolean): UpdatePurchaseOrderInput {
+/** `keepLineIds`: line ids still on the PO (so received / billed lines keep their link). */
+function purchaseOrderInput(s: Snap, keepLineIds: Set<string> | null): UpdatePurchaseOrderInput {
   return {
     refNumber: str(s.refNumber),
     allowDuplicateNumber: true,
@@ -547,7 +548,7 @@ function purchaseOrderInput(s: Snap, keepLineIds: boolean): UpdatePurchaseOrderI
     expectedDate: date(s.expectedDate),
     memo: str(s.memo),
     lines: arr(s.lines).map((l) => ({
-      ...(keepLineIds && l.id ? { id: String(l.id) } : {}),
+      ...(keepLineIds && l.id && keepLineIds.has(String(l.id)) ? { id: String(l.id) } : {}),
       itemId: str(l.itemId),
       accountId: str(l.accountId),
       description: str(l.description),
@@ -861,8 +862,9 @@ const ADAPTERS: Record<string, Adapter> = {
       await updatePurchaseOrderStatus(ctx, id, 'void');
       return { message: `Undone: ${this.describe(snap)} was voided (purchase orders can't be deleted).` };
     },
-    async restore(ctx, id, before) {
-      await updatePurchaseOrder(ctx, id, purchaseOrderInput(before, true));
+    async restore(ctx, id, before, now) {
+      const current = new Set(arr(now.lines).map((l) => String(l.id)));
+      await updatePurchaseOrder(ctx, id, purchaseOrderInput(before, current));
       return { message: `Undone: your changes to ${this.describe(before)} were reversed.` };
     },
     async undoVoid(ctx, id, before) {
@@ -1104,6 +1106,17 @@ async function pruneOld(ctx: ServiceContext): Promise<void> {
     .where(and(eq(undoActions.companyId, ctx.companyId), lt(undoActions.createdAt, new Date(Date.now() - PRUNE_AFTER_MS))));
 }
 
+/** True when the newest audit-trail row for the record was written by someone else. */
+async function lastChangedByOther(ctx: ServiceContext, entity: string, id: string, userId: string): Promise<boolean> {
+  const [row] = await ctx.db
+    .select({ userId: auditLogs.userId })
+    .from(auditLogs)
+    .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, entity), eq(auditLogs.entityId, id)))
+    .orderBy(desc(auditLogs.createdAt))
+    .limit(1);
+  return Boolean(row && row.userId !== userId);
+}
+
 /** Newest audit-trail row for the record written by this user at/after `since`. */
 async function auditSince(
   ctx: ServiceContext,
@@ -1184,6 +1197,8 @@ export async function commitUndo(
       id = row?.entityId ?? null;
     }
     if (!created || !id) throw notDone();
+    // Someone else already changed the new record: undoing would throw their work away.
+    if (await lastChangedByOther(ctx, a.entity, id, userId)) throw notDone();
     const snap = await a.snapshot(ctx, id);
     const version = await currentVersion(ctx, a.entity, id);
     await pruneOld(ctx);
@@ -1216,7 +1231,7 @@ export async function commitUndo(
   if (tok.status !== 'pending' || tok.kind !== input.kind || tok.entityType !== a.entity) throw notDone();
   let entityId = tok.entityId!;
   const audit = await auditSince(ctx, a.entity, entityId, userId, tok.createdAt);
-  if (!audit) throw notDone();
+  if (!audit || (await lastChangedByOther(ctx, a.entity, entityId, userId))) throw notDone();
   // Editing a journal entry replaces it with a new entry (lib/services/journal.ts updateEntry).
   if (a.entity === 'journal_entry' && input.kind === 'update') {
     const replacedBy = (audit.newValues as { replacedBy?: unknown } | null)?.replacedBy;

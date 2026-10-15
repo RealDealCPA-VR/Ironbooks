@@ -24,6 +24,15 @@ import { createCustomer, updateCustomer, deactivateCustomer, getCustomer } from 
 import { updateVendor } from './vendors';
 import { createItem, updateItem, getItem } from './items';
 import { setClosingDate } from './company';
+import { createDeposit, getDeposit, voidDeposit } from './deposits';
+import { createSalesReceipt, getSalesReceipt, voidSalesReceipt } from './salesReceipts';
+import { createCreditMemo, getCreditMemo, updateCreditMemo } from './creditMemos';
+import { createVendorCredit, getVendorCredit } from './vendorCredits';
+import { payBills, getBillPayment, voidBillPayment } from './billPayments';
+import { updateEstimate } from './estimates';
+import { updatePurchaseOrder } from './purchaseOrders';
+import { deactivateVendor, getVendor } from './vendors';
+import { updateExpense } from './expenses';
 import { commitUndo, performUndo, prepareUndo, type UndoKind } from './undo';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-undo');
@@ -312,6 +321,152 @@ describe('undo service', () => {
     const ad = await track('accounts', 'delete', a.id, () => deactivateAccount(ctx, a.id));
     await performUndo(ctx, ad.token);
     expect((await getAccount(ctx, a.id)).isActive).toBe(true);
+  });
+
+  it('deposits: undo of a void re-enters the deposit; undo of a create voids it', async () => {
+    const bank = await balance('1000');
+    const dep = await createDeposit(ctx, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-09'),
+      memo: 'Owner top-up',
+      extraLines: [{ accountId: acct['3000'], amount: '40.00', description: 'Top-up' }],
+    });
+    const v = await track('deposits', 'void', dep.id, () => voidDeposit(ctx, dep.id));
+    const out = await performUndo(ctx, v.token);
+    expect(out.copy).toBe(true);
+    const copy = await getDeposit(ctx, out.newId!);
+    expect(copy.total).toBe('40.00');
+    expect(copy.memo).toBe('Owner top-up');
+    const c = await track('deposits', 'create', null, () =>
+      createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-09'), extraLines: [{ accountId: acct['3000'], amount: '15.00' }] }),
+    );
+    await performUndo(ctx, c.token);
+    expect((await getDeposit(ctx, c.result.id)).voidedAt).not.toBeNull();
+    expect(Number(await balance('1000'))).toBeCloseTo(Number(bank) + 40, 2);
+    await expectBalanced();
+  });
+
+  it('sales receipts and credit memos: void re-entered with the same number, edit restored', async () => {
+    const sr = await createSalesReceipt(ctx, {
+      customerId,
+      refNumber: 'SR-77',
+      date: d('2026-03-10'),
+      depositAccountId: acct['1000'],
+      lines: [{ accountId: acct['4000'], description: 'Counter sale', quantity: '2', rate: '12.50', taxable: false }],
+    });
+    const v = await track('sales-receipts', 'void', sr.id, () => voidSalesReceipt(ctx, sr.id));
+    const out = await performUndo(ctx, v.token);
+    const copy = await getSalesReceipt(ctx, out.newId!);
+    expect(copy.refNumber).toBe('SR-77');
+    expect(copy.total).toBe('25.00');
+    expect((await getSalesReceipt(ctx, sr.id)).status).toBe('void');
+
+    const cm = await createCreditMemo(ctx, {
+      customerId,
+      date: d('2026-03-10'),
+      lines: [{ accountId: acct['4000'], description: 'Refund', quantity: '1', rate: '9.00', taxable: false }],
+    });
+    const u = await track('credit-memos', 'update', cm.id, () =>
+      updateCreditMemo(ctx, cm.id, {
+        customerId,
+        date: d('2026-03-10'),
+        lines: [{ accountId: acct['4000'], description: 'Refund', quantity: '1', rate: '19.00', taxable: false }],
+      }),
+    );
+    await performUndo(ctx, u.token);
+    expect((await getCreditMemo(ctx, cm.id)).total).toBe('9.00');
+    await expectBalanced();
+  });
+
+  it('vendor credits and bill payments', async () => {
+    const vc = await track('vendor-credits', 'create', null, () =>
+      createVendorCredit(ctx, { vendorId, date: d('2026-03-11'), refNumber: 'VC-1', lines: [{ accountId: acct['6300'], amount: '7.00' }] }),
+    );
+    await performUndo(ctx, vc.token);
+    expect((await getVendorCredit(ctx, vc.result.id)).status).toBe('void');
+
+    const bill = await createBill(ctx, { vendorId, date: d('2026-03-11'), lines: [{ accountId: acct['6300'], amount: '50.00' }] });
+    const bp = await payBills(ctx, {
+      vendorId,
+      date: d('2026-03-12'),
+      method: 'check',
+      reference: '2001',
+      paymentAccountId: acct['1000'],
+      applications: [{ billId: bill.id, amountApplied: '50.00' }],
+    });
+    const bank = await balance('1000');
+    const v = await track('bill-payments', 'void', bp.id, () => voidBillPayment(ctx, bp.id));
+    expect((await getBill(ctx, bill.id)).balanceDue).toBe('50.00');
+    const out = await performUndo(ctx, v.token);
+    const copy = await getBillPayment(ctx, out.newId!);
+    expect(copy.reference).toBe('2001');
+    expect((await getBill(ctx, bill.id)).balanceDue).toBe('0.00');
+    expect(await balance('1000')).toBe(bank);
+    await expectBalanced();
+  });
+
+  it('estimates, purchase orders, checks, vendors, items and accounts', async () => {
+    const est = await createEstimate(ctx, { customerId, date: d('2026-03-13'), lines: [{ description: 'Quote', quantity: '1', rate: '100' }] });
+    const eu = await track('estimates', 'update', est.id, () =>
+      updateEstimate(ctx, est.id, { customerId, date: d('2026-03-13'), memo: 'bigger', lines: [{ description: 'Quote', quantity: '2', rate: '100' }] }),
+    );
+    await performUndo(ctx, eu.token);
+    const eb = await getEstimate(ctx, est.id);
+    expect(eb.total).toBe('100.00');
+    expect(eb.memo).toBeNull();
+
+    const po = await createPurchaseOrder(ctx, {
+      vendorId,
+      date: d('2026-03-13'),
+      lines: [{ accountId: acct['6300'], description: 'Ink', quantity: '1', rate: '30' }],
+    });
+    const pu = await track('purchase-orders', 'update', po.id, () =>
+      updatePurchaseOrder(ctx, po.id, {
+        vendorId,
+        date: d('2026-03-13'),
+        lines: [{ accountId: acct['6300'], description: 'Ink', quantity: '3', rate: '30' }],
+      }),
+    );
+    await performUndo(ctx, pu.token);
+    expect((await getPurchaseOrder(ctx, po.id)).total).toBe('30.00');
+
+    const exp = await createExpense(ctx, {
+      vendorId,
+      date: d('2026-03-14'),
+      method: 'check',
+      reference: '1500',
+      paymentAccountId: acct['1000'],
+      lines: [{ accountId: acct['6300'], amount: '12.00' }],
+    });
+    const xu = await track('expenses', 'update', exp.id, () =>
+      updateExpense(ctx, exp.id, {
+        vendorId,
+        date: d('2026-03-14'),
+        method: 'check',
+        reference: '1500',
+        paymentAccountId: acct['1000'],
+        lines: [{ accountId: acct['6400'], amount: '21.00' }],
+      }),
+    );
+    await performUndo(ctx, xu.token);
+    const xb = await getExpense(ctx, exp.id);
+    expect(xb.total).toBe('12.00');
+    expect(xb.lines[0].accountId).toBe(acct['6300']);
+
+    const vd = await track('vendors', 'delete', vendorId, () => deactivateVendor(ctx, vendorId));
+    await performUndo(ctx, vd.token);
+    expect((await getVendor(ctx, vendorId)).isActive).toBe(true);
+
+    const ic = await track('items', 'create', null, () => createItem(ctx, { name: 'Gadget', type: 'service', incomeAccountId: acct['4000'] }));
+    await performUndo(ctx, ic.token);
+    expect((await getItem(ctx, ic.result.id)).isActive).toBe(false);
+
+    const ac = await track('accounts', 'create', null, () =>
+      createAccount(ctx, { code: '6998', name: 'Temp', type: 'expense' as never, subtype: 'operating_expenses' }),
+    );
+    await performUndo(ctx, ac.token);
+    expect((await getAccount(ctx, ac.result.id)).isActive).toBe(false);
+    await expectBalanced();
   });
 
   it('refuses a second undo, another user, an expired token and a record changed since', async () => {

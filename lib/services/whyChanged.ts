@@ -454,7 +454,10 @@ export async function whyChanged(ctx: ServiceContext, input: WhyChangedInput): P
       key,
       kind,
       type: entityLabel(g.type),
-      label: newest.description + (newest.reference ? ` (${newest.reference})` : ''),
+      // References that are internal ids (sales-receipt COGS lines) are not shown.
+      label:
+        newest.description +
+        (newest.reference && !UUID.test(newest.reference) && newest.reference.length <= 24 ? ` (ref ${newest.reference})` : ''),
       date: newest.date.toISOString().slice(0, 10),
       entryId: newest.id,
       entryNumber: newest.entryNumber,
