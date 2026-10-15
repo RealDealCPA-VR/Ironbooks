@@ -1538,7 +1538,7 @@ export const userSessions = pgTable('user_sessions', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
   lastSeenAt: timestamp('last_seen_at').defaultNow().notNull(),
   endedAt: timestamp('ended_at'),
-  /** 'logout' | 'signed_out_by_admin' | 'expired' */
+  /** 'logout' | 'signed_out_by_admin' | 'expired' | 'password_reset' | 'password_changed' */
   endReason: varchar('end_reason', { length: 50 }),
 });
 

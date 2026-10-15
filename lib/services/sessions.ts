@@ -98,14 +98,22 @@ export async function endSession(db: DB, sessionId: string, reason = 'logout'): 
 
 /**
  * End every live session of one user (e.g. after a self-service password reset, so whoever
- * held the old password is signed out everywhere). Returns how many sessions were ended.
+ * held the old password is signed out everywhere). `exceptSessionId` keeps one session open —
+ * the person's own, when they changed their password while signed in. Returns how many sessions
+ * were ended.
  */
-export async function endUserSessions(db: DB, userId: string, reason = 'password_reset'): Promise<number> {
+export async function endUserSessions(
+  db: DB,
+  userId: string,
+  reason = 'password_reset',
+  exceptSessionId?: string,
+): Promise<number> {
   if (!isUuid(userId)) return 0;
+  const keep = exceptSessionId && isUuid(exceptSessionId) ? ne(userSessions.id, exceptSessionId) : undefined;
   const ended = await db
     .update(userSessions)
     .set({ endedAt: new Date(), endReason: reason })
-    .where(and(eq(userSessions.userId, userId), isNull(userSessions.endedAt)))
+    .where(and(eq(userSessions.userId, userId), isNull(userSessions.endedAt), keep))
     .returning({ id: userSessions.id });
   const ids = ended.map((r) => r.id);
   if (ids.length) await db.delete(singleUserMode).where(inArray(singleUserMode.sessionId, ids));

@@ -85,6 +85,18 @@ export interface SessionGate {
   db: DB;
   /** Verified session user (token bound to THIS company file), or null without a session. */
   userId: string | null;
+  /** The live server-side session id, when the cookie carries one. */
+  sessionId?: string;
+}
+
+export interface SessionGateOptions {
+  /**
+   * gapsb K: let a session whose password must be changed (expired / an Admin asked) through.
+   * Only /api/auth/change-password sets this — every other 'self' route (2FA, company select,
+   * company file management) is refused with PASSWORD_CHANGE_REQUIRED_MESSAGE, exactly like
+   * getServerContext. (/api/auth/logout doesn't use the gate at all, so signing out always works.)
+   */
+  allowPasswordChangeRequired?: boolean;
 }
 
 /**
@@ -95,16 +107,19 @@ export interface SessionGate {
  *  - the request must be mapped 'self'/'public' in the route map (unmapped → denied);
  *  - the company-file password (file lock);
  *  - the session token's file binding (verifySessionToken rejects other files' sessions);
- *  - a user deactivated in every company of this file is refused (DEACTIVATED_MESSAGE).
+ *  - a user deactivated in every company of this file is refused (DEACTIVATED_MESSAGE);
+ *  - a session whose password must be changed is refused (PASSWORD_CHANGE_REQUIRED_MESSAGE)
+ *    unless the caller opts out (only /api/auth/change-password does).
  * Per-company authorization (e.g. rename needs company:modify) stays with the handler, which
  * resolves the caller's effective permissions in the company named by the URL.
  */
-export async function getSessionGate(): Promise<SessionGate> {
+export async function getSessionGate(opts: SessionGateOptions = {}): Promise<SessionGate> {
   await enforceSelfRoute();
   const db = await getDb();
   await assertFileUnlocked(db);
   // Verified cookie + live server-side session (multi-user hosting: a signed-out session is refused).
-  const userId = (await getSessionInfo())?.userId ?? null;
+  const session = await getSessionInfo();
+  const userId = session?.userId ?? null;
   if (!userId) return { db, userId: null };
   const [user] = await db.select({ id: users.id }).from(users).where(eq(users.id, userId));
   if (!user) throw new ServiceError('FORBIDDEN', 'Authentication required.');
@@ -115,7 +130,8 @@ export async function getSessionGate(): Promise<SessionGate> {
   if (memberships.length && !memberships.some((m) => m.isActive !== false)) {
     throw new ServiceError('FORBIDDEN', DEACTIVATED_MESSAGE);
   }
-  return { db, userId };
+  if (!opts.allowPasswordChangeRequired) await assertPasswordChangeNotRequired(db, userId);
+  return { db, userId, sessionId: session?.sessionId };
 }
 
 export async function getServerContext(): Promise<ServiceContext> {
@@ -129,7 +145,8 @@ export async function getServerContext(): Promise<ServiceContext> {
 
   if (userId) {
     // gapsb K: a password that must be changed (expired / Admin asked) blocks everything except
-    // choosing a new one (/api/auth/change-password uses getSessionGate, not this).
+    // choosing a new one (/api/auth/change-password uses getSessionGate with
+    // allowPasswordChangeRequired; the gate refuses it on every other 'self' route).
     await assertPasswordChangeNotRequired(db, userId);
     // Only ACTIVE memberships select a company (deactivated users are locked out).
     const active = and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true));

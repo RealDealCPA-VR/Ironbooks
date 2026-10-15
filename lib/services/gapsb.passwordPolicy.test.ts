@@ -29,9 +29,10 @@ process.env.BKA_DATA_DIR = TEST_DIR;
 process.env.BKA_AUTH_SECRET = 'gapsb-password-policy-secret';
 
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { passwordHistory, users } from '@/lib/db/schema';
+import { passwordHistory, userSessions, users } from '@/lib/db/schema';
 import { createSessionToken, hashPassword, SESSION_COOKIE, verifyPassword } from '@/lib/auth';
-import { COMPANY_COOKIE, getServerContext } from '@/lib/context';
+import { COMPANY_COOKIE, getServerContext, getSessionGate } from '@/lib/context';
+import { startSession } from './sessions';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
 import {
   DEFAULT_PASSWORD_POLICY,
@@ -58,19 +59,22 @@ import { POST as changePOST } from '@/app/api/auth/change-password/route';
 import { GET as policyGET } from '@/app/api/auth/password-policy/route';
 import { PUT as adminPolicyPUT } from '@/app/api/users/password-policy/route';
 import { POST as resetPOST } from '@/app/api/auth/reset/route';
+import { POST as twoFaSetupPOST } from '@/app/api/auth/2fa/setup/route';
+import { POST as selectCompanyPOST } from '@/app/api/companies/select/route';
+import { POST as logoutPOST } from '@/app/api/auth/logout/route';
 
 let db: DB;
 let ownerId: string;
 let companyId: string;
 let owner: ServiceContext;
 
-function as(userId: string | null, method: string, routePath: string) {
+function as(userId: string | null, method: string, routePath: string, sessionId?: string) {
   h.headers.clear();
   h.headers.set(ROUTE_PATH_HEADER, routePath);
   h.headers.set(ROUTE_METHOD_HEADER, method);
   h.cookies.clear();
   if (userId) {
-    h.cookies.set(SESSION_COOKIE, createSessionToken(userId, 'user'));
+    h.cookies.set(SESSION_COOKIE, createSessionToken(userId, 'user', sessionId));
     h.cookies.set(COMPANY_COOKIE, companyId);
   }
 }
@@ -237,10 +241,30 @@ describe('enforced wherever a password is set', () => {
     await expect(changeOwnPassword(db, carl.userId, { currentPassword: 'carlpass1', newPassword: 'carlpass1' })).rejects.toThrow(
       /different from the current one/,
     );
-    as(carl.userId, 'POST', '/api/auth/change-password');
+    // Carl is signed in on this machine and somewhere else; he changes it from this session.
+    const here = await startSession(db, { userId: carl.userId, companyId, remoteAddr: 'local', userAgent: 'here', viaHost: false });
+    const elsewhere = await startSession(db, { userId: carl.userId, companyId, remoteAddr: 'local', userAgent: 'there', viaHost: false });
+    const otherUser = await startSession(db, { userId: ownerId, companyId, remoteAddr: 'local', userAgent: 'owner', viaHost: false });
+    as(carl.userId, 'POST', '/api/auth/change-password', here.id);
     const res = await changePOST(jsonRequest('/api/auth/change-password', { currentPassword: 'carlpass1', newPassword: 'carlpass2' }));
     expect(res.status).toBe(200);
     expect(await verifyPassword('carlpass2', (await userRow(carl.userId)).passwordHash)).toBe(true);
+    // Same as reset by token: whoever held the old password elsewhere is signed out ...
+    const sess = async (id: string) => (await db.select().from(userSessions).where(eq(userSessions.id, id)))[0];
+    expect(await sess(elsewhere.id)).toMatchObject({ endReason: 'password_changed', endedAt: expect.any(Date) });
+    // ... the session that made the change stays signed in, and other people are untouched.
+    expect((await sess(here.id)).endedAt).toBeNull();
+    expect((await sess(otherUser.id)).endedAt).toBeNull();
+    as(carl.userId, 'GET', '/api/company', here.id);
+    await expect(getServerContext()).resolves.toMatchObject({ userId: carl.userId });
+    as(carl.userId, 'GET', '/api/company', elsewhere.id);
+    await expect(getServerContext()).rejects.toMatchObject({ code: 'FORBIDDEN', message: 'Authentication required.' });
+    // A failed change ends nothing.
+    const third = await startSession(db, { userId: carl.userId, companyId, remoteAddr: 'local', userAgent: 'third', viaHost: false });
+    as(carl.userId, 'POST', '/api/auth/change-password', here.id);
+    const bad = await changePOST(jsonRequest('/api/auth/change-password', { currentPassword: 'carlpass2', newPassword: 'nodigits' }));
+    expect(bad.status).toBe(400);
+    expect((await sess(third.id)).endedAt).toBeNull();
     expect((await login('carl@pp.local', 'carlpass2')).status).toBe(200);
   });
 });
@@ -282,6 +306,25 @@ describe('existing users and expiry', () => {
     as(dana.id, 'GET', '/api/company');
     await expect(getServerContext()).rejects.toMatchObject({ code: 'FORBIDDEN', message: PASSWORD_CHANGE_REQUIRED_MESSAGE });
 
+    // The 'self' routes (getSessionGate) are refused too — 2FA setup / disable, company select ...
+    as(dana.id, 'POST', '/api/auth/2fa/setup');
+    await expect(getSessionGate()).rejects.toMatchObject({ code: 'FORBIDDEN', message: PASSWORD_CHANGE_REQUIRED_MESSAGE });
+    const setup = await twoFaSetupPOST();
+    expect(setup.status).toBe(403);
+    expect((await setup.json()).error).toBe(PASSWORD_CHANGE_REQUIRED_MESSAGE);
+    expect((await userRow(dana.id)).totpSecret).toBeNull();
+    as(dana.id, 'POST', '/api/auth/2fa/disable');
+    await expect(getSessionGate()).rejects.toMatchObject({ message: PASSWORD_CHANGE_REQUIRED_MESSAGE });
+    as(dana.id, 'POST', '/api/companies/select');
+    const sel = await selectCompanyPOST(jsonRequest('/api/companies/select', { companyId }));
+    expect(sel.status).toBe(403);
+    expect((await sel.json()).error).toBe(PASSWORD_CHANGE_REQUIRED_MESSAGE);
+    // ... while changing the password (the one opt-in) and signing out still work.
+    as(dana.id, 'POST', '/api/auth/change-password');
+    await expect(getSessionGate({ allowPasswordChangeRequired: true })).resolves.toMatchObject({ userId: dana.id });
+    as(dana.id, 'POST', '/api/auth/logout');
+    expect((await logoutPOST()).status).toBe(200);
+
     as(dana.id, 'POST', '/api/auth/change-password');
     const res = await changePOST(jsonRequest('/api/auth/change-password', { currentPassword: 'danapass1', newPassword: 'danapass2' }));
     expect(res.status).toBe(200);
@@ -291,6 +334,8 @@ describe('existing users and expiry', () => {
 
     as(dana.id, 'GET', '/api/company');
     await expect(getServerContext()).resolves.toMatchObject({ userId: dana.id });
+    as(dana.id, 'POST', '/api/auth/2fa/setup');
+    await expect(getSessionGate()).resolves.toMatchObject({ userId: dana.id });
     const again = await login('dana@pp.local', 'danapass2');
     expect(again.body.mustChangePassword).toBeUndefined();
     await setPolicy({});
@@ -308,7 +353,9 @@ describe('existing users and expiry', () => {
     await setPolicy({});
   });
 
-  it('sign-up checks the rules before creating anything', async () => {
+  // The sign-up ROUTE itself is tested in gapsb.signupPolicy.test.ts (it needs a file with no
+  // users yet); this covers the shared helper.
+  it('assertPasswordAllowed applies the file policy', async () => {
     await expect(assertPasswordAllowed(db, 'password')).rejects.toThrow(/needs a number/);
     await expect(assertPasswordAllowed(db, 'passw0rd')).resolves.toMatchObject({ minLength: 8 });
   });

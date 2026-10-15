@@ -3,13 +3,17 @@
  * Body: { currentPassword, newPassword }. The file's password policy applies (length, letters +
  * numbers, symbol, no reuse of recent passwords). This is also how an expired password (or one an
  * Admin asked to be changed) is replaced: such a session is refused everywhere else
- * (getServerContext), so this route uses getSessionGate. Wrong current passwords are rate-limited
- * like sign-in.
+ * (getServerContext and every other getSessionGate route), so this route alone opts in with
+ * getSessionGate({ allowPasswordChangeRequired: true }). Wrong current passwords are rate-limited
+ * like sign-in. After a successful change the person's OTHER sessions are ended (same as reset by
+ * token, /api/auth/reset), so whoever held the old password elsewhere is signed out; the session
+ * that made the change stays signed in.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { changeOwnPassword } from '@/lib/services/passwordPolicy';
+import { endUserSessions } from '@/lib/services/sessions';
 import { changePasswordSchema } from '@/lib/validation/users';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { originFromHeaders } from '@/lib/net/requestInfo';
@@ -19,12 +23,12 @@ import { routeError } from '@/lib/routeErrors';
 export async function POST(req: NextRequest) {
   let gate;
   try {
-    gate = await getSessionGate();
+    gate = await getSessionGate({ allowPasswordChangeRequired: true });
   } catch (err) {
     if (err instanceof ServiceError) return NextResponse.json({ error: err.message, code: err.code }, { status: 403 });
     throw err;
   }
-  const { db, userId } = gate;
+  const { db, userId, sessionId } = gate;
   if (!userId) return NextResponse.json({ error: 'Authentication required.', code: 'FORBIDDEN' }, { status: 401 });
 
   const parsed = changePasswordSchema.safeParse(await req.json().catch(() => null));
@@ -42,6 +46,8 @@ export async function POST(req: NextRequest) {
   try {
     await changeOwnPassword(db, userId, parsed.data);
     limiter.recordSuccess(keys.slice(0, -1));
+    // Sign the person out everywhere else (keep this session — it just proved the password).
+    await endUserSessions(db, userId, 'password_changed', sessionId);
     return NextResponse.json({ ok: true });
   } catch (err) {
     if (err instanceof ServiceError && /current password is not correct/.test(err.message)) {

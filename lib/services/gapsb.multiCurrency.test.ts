@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { eq, sql } from 'drizzle-orm';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, companies, currencies, invoices, users } from '@/lib/db/schema';
+import { accounts, companies, currencies, invoices, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import { multiCurrencyHiddenPaths } from '@/lib/preferences';
 import type { ServiceContext } from './_base';
 import { createCompany, getPreferences, NEW_COMPANY_SETTINGS, updateCompany } from './company';
@@ -171,6 +171,31 @@ describe('A2: Multiple Currencies preference', () => {
     await db.delete(currencies).where(sql`${currencies.companyId} = ${withFx.ctx.companyId} AND ${currencies.isBase} = false`);
     const plain = await company();
     const chosen = await company({ multiCurrencyEnabled: true });
+    // Only foreign data: one General Journal line in GBP (no currency list, no foreign documents).
+    // The runtime check counts journal lines, so the backfill must too (P2 review fix).
+    const journalOnly = await company();
+    const [je] = await db
+      .insert(journalEntries)
+      .values({ companyId: journalOnly.ctx.companyId, entryNumber: 1, date: D('2026-02-01'), description: 'FX journal', createdBy: ownerId })
+      .returning();
+    await db.insert(journalEntryLines).values([
+      { journalEntryId: je.id, accountId: journalOnly.code['1000'], debit: '10.00', currency: 'GBP', foreignAmount: '8.00', exchangeRate: '1.25' },
+      { journalEntryId: je.id, accountId: journalOnly.code['4000'], credit: '10.00' },
+    ]);
+    // A home-currency journal line (lower case + padded) does not count as foreign.
+    const journalHome = await company();
+    await setBaseCurrency(journalHome.ctx, { code: 'USD', name: 'US Dollar' });
+    const [jh] = await db
+      .insert(journalEntries)
+      .values({ companyId: journalHome.ctx.companyId, entryNumber: 1, date: D('2026-02-01'), description: 'Home journal', createdBy: ownerId })
+      .returning();
+    await db.insert(journalEntryLines).values([
+      { journalEntryId: jh.id, accountId: journalHome.code['1000'], debit: '10.00', currency: 'usd' },
+      { journalEntryId: jh.id, accountId: journalHome.code['4000'], credit: '10.00', currency: '' },
+    ]);
+    // Both sides agree before the backfill runs.
+    expect(await hasForeignCurrencyData(db, journalOnly.ctx.companyId)).toBe(true);
+    expect(await hasForeignCurrencyData(db, journalHome.ctx.companyId)).toBe(false);
 
     const file = fs.readFileSync(path.resolve('drizzle/0056_gapsb.sql'), 'utf8');
     const backfill = file.split('--> statement-breakpoint').map((s) => s.trim()).find((s) => s.startsWith('UPDATE "companies"'))!;
@@ -182,6 +207,8 @@ describe('A2: Multiple Currencies preference', () => {
     expect((await settingsOf(withFx.ctx.companyId)).multiCurrencyEnabled).toBe(true);
     expect((await settingsOf(plain.ctx.companyId)).multiCurrencyEnabled).toBe(false);
     expect((await settingsOf(chosen.ctx.companyId)).multiCurrencyEnabled).toBe(true);
+    expect((await settingsOf(journalOnly.ctx.companyId)).multiCurrencyEnabled).toBe(true);
+    expect((await settingsOf(journalHome.ctx.companyId)).multiCurrencyEnabled).toBe(false);
 
     const journal = JSON.parse(fs.readFileSync(path.resolve('drizzle/meta/_journal.json'), 'utf8')) as {
       entries: Array<{ idx: number; tag: string; when: number }>;

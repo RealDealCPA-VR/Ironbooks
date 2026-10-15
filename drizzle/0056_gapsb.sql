@@ -9,7 +9,9 @@
 -- password_history keeps earlier password hashes (bcrypt, never plaintext) so "don't reuse the
 -- last N passwords" can be enforced.
 -- companies.settings.multiCurrencyEnabled is made explicit for every existing company: ON when it
--- already has foreign-currency data or foreign currencies in its list, OFF otherwise. New
+-- already has foreign-currency data (the same tables as lib/services/multiCurrency.ts
+-- hasForeignCurrencyData, General Journal lines included) or foreign currencies in its list, OFF
+-- otherwise. New
 -- companies are created with it OFF (lib/services/company.ts NEW_COMPANY_SETTINGS).
 ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "password_changed_at" timestamp;
 --> statement-breakpoint
@@ -43,11 +45,15 @@ SET "settings" = COALESCE(c."settings", '{}'::jsonb) || jsonb_build_object(
       UNION ALL SELECT "currency" FROM "vendor_credits" WHERE "company_id" = c."id"
       UNION ALL SELECT "currency" FROM "deposits" WHERE "company_id" = c."id"
       UNION ALL SELECT "currency" FROM "loans" WHERE "company_id" = c."id"
+      UNION ALL
+      SELECT l."currency" FROM "journal_entry_lines" l
+      JOIN "journal_entries" e ON e."id" = l."journal_entry_id"
+      WHERE e."company_id" = c."id"
     ) used
     WHERE used."currency" IS NOT NULL
       AND btrim(used."currency") <> ''
       AND upper(btrim(used."currency")) <> COALESCE(
-        (SELECT upper(cb."code") FROM "currencies" cb WHERE cb."company_id" = c."id" AND cb."is_base" = true LIMIT 1),
+        (SELECT upper(btrim(cb."code")) FROM "currencies" cb WHERE cb."company_id" = c."id" AND cb."is_base" = true LIMIT 1),
         upper(NULLIF(btrim(c."settings"->>'currency'), '')),
         'USD'
       )
