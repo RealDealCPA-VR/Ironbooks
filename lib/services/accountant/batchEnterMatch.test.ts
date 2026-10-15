@@ -3,7 +3,7 @@
  * the service share these rules).
  */
 import { describe, it, expect } from 'vitest';
-import { closestLabel, closestMatcher, createBatchMatchers, editDistance, normName, messagesByRow, renumberRowMessage, resolveBatchRows, type BatchLookupLists } from './batchEnterMatch';
+import { closestLabel, compactRowErrors, closestMatcher, createBatchMatchers, editDistance, normName, messagesByRow, renumberRowMessage, resolveBatchRows, type BatchLookupLists } from './batchEnterMatch';
 import { isBlankBatchRow } from './batchEnterParse';
 import type { BatchEnterRow } from './batchEnterParse';
 
@@ -358,5 +358,24 @@ describe('row numbers match the grid when blank rows are skipped (review P2)', (
     );
     expect(renumberRowMessage('Rows 1-3: x', rowNumber)).toBe('Rows 3–6: x');
     expect(renumberRowMessage('Nothing to renumber in Row 1: here', rowNumber)).toBe('Nothing to renumber in Row 1: here');
+  });
+
+  it('compactRowErrors re-keys kept rows and renumbers their messages to the new grid rows', () => {
+    // Rows 1–4 saved, row 5 failed: it moves to # 1 and its message must say Row 1.
+    const errs = new Map<number, string[]>([[4, ['Row 5: the period is closed.']]]);
+    expect([...compactRowErrors(errs, [4])]).toEqual([[0, ['Row 1: the period is closed.']]]);
+    // A failed journal over old rows 3, 5 (row 4 blank) plus a failed check on old row 8.
+    const errs2 = new Map<number, string[]>([
+      [2, ['Rows 3–5: debits (1.00) and credits (2.00) must be equal.']],
+      [4, ['Rows 3–5: debits (1.00) and credits (2.00) must be equal.']],
+      [7, ['Row 8: payee is required.', 'a note without a row prefix']],
+    ]);
+    const out = compactRowErrors(errs2, [2, 4, 7]);
+    expect([...out.keys()]).toEqual([0, 1, 2]);
+    expect(out.get(0)).toEqual(['Rows 1–2: debits (1.00) and credits (2.00) must be equal.']);
+    expect(out.get(1)).toEqual(['Rows 1–2: debits (1.00) and credits (2.00) must be equal.']);
+    expect(out.get(2)).toEqual(['Row 3: payee is required.', 'a note without a row prefix']);
+    // Kept rows without errors get no entry.
+    expect(compactRowErrors(new Map(), [0, 1]).size).toBe(0);
   });
 });
