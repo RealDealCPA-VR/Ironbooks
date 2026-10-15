@@ -71,6 +71,8 @@ export default function StdReportView({
   const memorizedId = search?.get('mem') ?? null;
   const [params, setParams] = useState<Params>(() => ({ ...(entry?.defaults ?? {}), ...paramsFromSearch(search) }));
   const [report, setReport] = useState<StdReport | null>(null);
+  // Parameters of the last completed run (the report on screen), not the unapplied form.
+  const [runParams, setRunParams] = useState<Params>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [panel, setPanel] = useState<'none' | 'filters' | 'format'>('none');
@@ -93,7 +95,9 @@ export default function StdReportView({
     setError(null);
     try {
       const qs = new URLSearchParams(p).toString();
-      setReport(await api.get<StdReport>(`/api/reports/std/${reportKey}${qs ? `?${qs}` : ''}`));
+      const r = await api.get<StdReport>(`/api/reports/std/${reportKey}${qs ? `?${qs}` : ''}`);
+      setReport(r);
+      setRunParams(p);
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'The report could not be run.';
       setError(msg);
@@ -232,7 +236,7 @@ export default function StdReportView({
         )}
       </Card>
 
-      {report && <ReportWhyChanged reportKey={reportKey} params={params} basis={report.basis} />}
+      {report && <ReportWhyChanged reportKey={reportKey} params={runParams} basis={report.basis} range={report.range} />}
 
       {report?.balanced === false && (
         <div role="alert" className="mb-4 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">

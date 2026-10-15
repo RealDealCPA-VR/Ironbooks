@@ -20,6 +20,9 @@ import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { cn } from '@/lib/utils';
+import type { StdReport } from '@/lib/reports/types';
+import { canExplainChanges, reportWhyChangedWindow } from '@/lib/reports/whyChangedWindow';
+import type { Me } from '@/lib/usePermissions';
 
 export interface WhyChangedQuery {
   /** Report total: assets | liabilities | equity | income | expenses | net_income | all */
@@ -94,6 +97,35 @@ function writeSeen(key: string, d: Date): void {
   }
 }
 
+// One /api/auth/me lookup shared by every button on the page (a Chart of Accounts has one per
+// row), refreshed after a minute so a permission change is picked up.
+let meCache: { at: number; p: Promise<Me | null> } | null = null;
+function loadMe(): Promise<Me | null> {
+  if (!meCache || Date.now() - meCache.at > 60_000) {
+    meCache = { at: Date.now(), p: api.get<Me | null>('/api/auth/me').catch(() => null) };
+  }
+  return meCache.p;
+}
+
+/**
+ * Whether this user may look up changes (financial report access, which GET /api/why-changed
+ * requires). Hidden until known, so people without report access never see a button that
+ * would only say "not allowed".
+ */
+function useCanExplain(): boolean {
+  const [ok, setOk] = React.useState(false);
+  React.useEffect(() => {
+    let live = true;
+    void loadMe().then((me) => {
+      if (live) setOk(canExplainChanges(me?.permissions));
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return ok;
+}
+
 const money = (v: string) => formatCurrency(v);
 const signed = (v: string) => (Number(v) > 0 ? `+${money(v)}` : money(v));
 const when = (iso: string) =>
@@ -125,6 +157,7 @@ export default function WhyChanged({
   const [error, setError] = React.useState<string | null>(null);
   const [zoom, setZoom] = React.useState<string | null>(null);
   const lastSeen = React.useRef<Date | null>(null);
+  const allowed = useCanExplain();
 
   // Remember when this number was viewed; the previous visit becomes the default "since".
   React.useEffect(() => {
@@ -191,6 +224,8 @@ export default function WhyChanged({
         : query.to
           ? `transactions dated on or before ${day(query.to)}`
           : 'transactions of any date';
+
+  if (!allowed) return null;
 
   return (
     <>
@@ -384,24 +419,26 @@ const REPORT_LINES: Record<string, Array<{ title: string; preset: string }>> = {
 
 /**
  * The strip of "Why did this change?" buttons under a Balance Sheet / Profit & Loss / Trial
- * Balance (rendered by app/reports/_components/StdReportView). Uses the report's own dates.
+ * Balance (rendered by app/reports/_components/StdReportView). Uses the dates and filters of the
+ * last completed run (`report.range` resolves relative "Dates" presets), not unapplied form edits.
  * Hidden for cash-basis runs and class-filtered runs, whose totals the ledger view can't explain.
  */
 export function ReportWhyChanged({
   reportKey,
   params,
   basis,
+  range,
 }: {
   reportKey: string;
+  /** The parameters of the last completed run. */
   params: Record<string, string | undefined>;
   basis?: 'accrual' | 'cash';
+  /** The dates that run covered (StdReport.range). */
+  range?: StdReport['range'];
 }) {
   const lines = REPORT_LINES[reportKey];
   if (!lines || basis === 'cash' || params.basis === 'cash' || params.classId) return null;
-  const today = new Date().toISOString().slice(0, 10);
-  const isRange = reportKey === 'profit-loss';
-  const from = isRange ? params.from || null : null;
-  const to = isRange ? params.to || today : params.asOf || params.to || today;
+  const { from, to, fiscalYearToDate } = reportWhyChangedWindow(reportKey, params, range);
   return (
     <div className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-slate-200 bg-white/70 px-4 py-2 print-hidden">
       <span className="text-sm text-navy/70">Why did a total change?</span>
@@ -410,7 +447,7 @@ export function ReportWhyChanged({
           key={l.preset}
           title={l.title}
           label={l.title}
-          query={{ preset: l.preset, from, to, fiscalYearToDate: isRange && !from }}
+          query={{ preset: l.preset, from, to, fiscalYearToDate }}
           storageKey={`report:${reportKey}:${l.preset}`}
         />
       ))}

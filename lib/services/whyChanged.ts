@@ -171,11 +171,17 @@ function presetSpec(p: WhyPreset): { types: string[]; measure: WhyChangedResult[
 
 const dayStart = (s: string) => new Date(`${s}T00:00:00.000Z`);
 const dayEnd = (s: string) => new Date(`${s}T23:59:59.999Z`);
+/** A YYYY-MM-DD string that is a real calendar date (not 2026-13-45, not 2026-02-31). */
+const isRealDay = (s: string) => {
+  if (!DAY.test(s)) return false;
+  const d = dayStart(s);
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+};
 
 export async function whyChanged(ctx: ServiceContext, input: WhyChangedInput): Promise<WhyChangedResult> {
   if (!(input.since instanceof Date) || isNaN(input.since.getTime())) throw validation('Choose a valid "since" date and time.');
-  if (input.from && !DAY.test(input.from)) throw validation('The "from" date must look like 2026-01-31.');
-  if (input.to && !DAY.test(input.to)) throw validation('The "to" date must look like 2026-01-31.');
+  if (input.from && !isRealDay(input.from)) throw validation('The "from" date must be a real date, like 2026-01-31.');
+  if (input.to && !isRealDay(input.to)) throw validation('The "to" date must be a real date, like 2026-01-31.');
   const since = input.since;
 
   // ---- 1. The account set and how each account's lines count ----

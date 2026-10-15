@@ -14,6 +14,10 @@ import { createInvoice, updateInvoice, voidInvoice } from './invoices';
 import { createExpense } from './expenses';
 import { createManualEntry, updateEntry } from './journal';
 import { whyChanged } from './whyChanged';
+import { runStandardReport } from './reportRegistry';
+import { WHY_CHANGED_AREA, canExplainChanges, reportWhyChangedWindow } from '@/lib/reports/whyChangedWindow';
+import { apiRuleFor } from '@/lib/permissions/routes';
+import type { PermissionSet } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-why-changed');
 let db: DB;
@@ -163,5 +167,68 @@ describe('whyChanged', () => {
     await expect(whyChanged(ctx, { since: new Date('x'), preset: 'assets' })).rejects.toThrow(/since/);
     await expect(whyChanged(ctx, { since })).rejects.toThrow(/Choose an account/);
     await expect(whyChanged(ctx, { since, accountIds: ['nope'] })).rejects.toThrow(/not valid/);
+  });
+
+  it('refuses impossible calendar dates with a validation error (not a crash)', async () => {
+    for (const bad of ['2026-13-45', '2026-02-31', '2026-00-10']) {
+      await expect(whyChanged(ctx, { since, preset: 'assets', from: bad })).rejects.toMatchObject({ code: 'VALIDATION' });
+      await expect(whyChanged(ctx, { since, preset: 'assets', to: bad })).rejects.toMatchObject({
+        code: 'VALIDATION',
+        message: expect.stringMatching(/real date/),
+      });
+    }
+    // Real dates still work (leap day).
+    await expect(whyChanged(ctx, { since, preset: 'income', from: '2024-02-29', to: '2026-12-31' })).resolves.toBeTruthy();
+  });
+
+  it('report buttons use the dates the report actually ran with ("Dates" presets resolved)', async () => {
+    const now = new Date('2026-10-15T12:00:00Z');
+    // P&L run for "Last month": the form only carries dates=last_month (no from / to).
+    const pl = await runStandardReport(ctx, 'profit-loss', { dates: 'last_month' }, { now });
+    expect(pl.range).toMatchObject({ from: '2026-09-01', to: '2026-09-30' });
+    const w = reportWhyChangedWindow('profit-loss', { dates: 'last_month' }, pl.range, '2026-10-15');
+    expect(w).toEqual({ from: '2026-09-01', to: '2026-09-30', fiscalYearToDate: false });
+    // The explained "Now" figure is the number on the report (Net Income), for presets with activity too.
+    for (const dates of ['last_month', 'this_year', 'last_year'] as const) {
+      const r = await runStandardReport(ctx, 'profit-loss', { dates }, { now });
+      const win = reportWhyChangedWindow('profit-loss', { dates }, r.range, '2026-10-15');
+      const net = await whyChanged(ctx, { since, preset: 'net_income', from: win.from, to: win.to });
+      const shown = r.rows.find((x) => x.id === 'pl:net')!.cells.total;
+      expect(Number(net.totalNow)).toBe(Number(shown ?? 0));
+    }
+    // Balance Sheet "as of last month end": the as-of date, not today.
+    const bs = await runStandardReport(ctx, 'balance-sheet', { dates: 'last_month' }, { now });
+    expect(reportWhyChangedWindow('balance-sheet', { dates: 'last_month' }, bs.range, '2026-10-15')).toEqual({
+      from: null,
+      to: '2026-09-30',
+      fiscalYearToDate: false,
+    });
+
+    // No dates at all: P&L is the fiscal year to date, resolved explicitly by the server.
+    const plDefault = await runStandardReport(ctx, 'profit-loss', { to: '2026-06-30' });
+    expect(plDefault.range).toMatchObject({ from: '2026-01-01', to: '2026-06-30' });
+  });
+
+  it('window helper falls back to explicit run params when the server sent no range', () => {
+    expect(reportWhyChangedWindow('profit-loss', { from: '2026-01-01', to: '2026-03-31' }, undefined, '2026-10-15')).toEqual({
+      from: '2026-01-01',
+      to: '2026-03-31',
+      fiscalYearToDate: false,
+    });
+    expect(reportWhyChangedWindow('profit-loss', {}, undefined, '2026-10-15')).toEqual({
+      from: null,
+      to: '2026-10-15',
+      fiscalYearToDate: true,
+    });
+    expect(reportWhyChangedWindow('trial-balance', { asOf: '2026-05-31' }, undefined, '2026-10-15').to).toBe('2026-05-31');
+  });
+
+  it('buttons are hidden for users who cannot open /api/why-changed', () => {
+    expect(apiRuleFor('/api/why-changed', 'GET')).toEqual({ area: WHY_CHANGED_AREA, action: 'view' });
+    const banking = { banking: ['view', 'create'] } as unknown as PermissionSet;
+    const reports = { banking: ['view'], [WHY_CHANGED_AREA]: ['view'] } as unknown as PermissionSet;
+    expect(canExplainChanges(banking)).toBe(false);
+    expect(canExplainChanges(reports)).toBe(true);
+    expect(canExplainChanges(null)).toBe(true); // unknown: server decides
   });
 });

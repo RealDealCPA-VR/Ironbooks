@@ -78,6 +78,12 @@ export interface StdReport {
   notes?: string[];
   /** Reports offered on both bases: the basis this run used (set by runStandardReport). */
   basis?: 'accrual' | 'cash';
+  /**
+   * The dates this run actually covered (set by runStandardReport after relative "Dates"
+   * presets and defaults are resolved), as YYYY-MM-DD: `from`..`to` for period reports,
+   * `asOf` for point-in-time reports. Used by "Why did this change?" to explain the same number.
+   */
+  range?: { from: string; to: string; asOf: string };
 }
 
 /** Flatten a report into an export table (labels indented with spaces by depth). */

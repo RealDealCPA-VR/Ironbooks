@@ -503,6 +503,22 @@ describe('undo service', () => {
     expect(row.status).toBe('pending');
   });
 
+  it('a create with a supplied id never falls back to a different record', async () => {
+    const mine = await createInvoice(ctx, invoiceInput('18.00'));
+    // A supplied id that is not a record this user just created (e.g. a wrong nested id from the
+    // response): refused, even though `mine` was created a moment ago and would match the fallback.
+    const otherInv = await createInvoice(other, invoiceInput('19.00'));
+    await expect(commitUndo(ctx, { resource: 'invoices', kind: 'create', id: otherInv.id })).rejects.toThrow(/nothing to undo/);
+    await expect(commitUndo(ctx, { resource: 'invoices', kind: 'create', id: '00000000-0000-4000-8000-000000000000' })).rejects.toThrow(
+      /nothing to undo/,
+    );
+    await expect(commitUndo(ctx, { resource: 'invoices', kind: 'create', id: 'not-a-uuid' })).rejects.toThrow(/nothing to undo/);
+    // No id at all: the newest record this user created a moment ago is used.
+    const armed = await commitUndo(ctx, { resource: 'invoices', kind: 'create', id: null });
+    const [row] = await db.select().from(undoActions).where(eq(undoActions.id, armed.token));
+    expect(row.entityId).toBe(mine.id);
+  });
+
   it('respects the closing date: undo of a closed-period change needs the closing-date password', async () => {
     const inv = await createInvoice(ctx, { ...invoiceInput('70.00'), date: d('2026-01-15') });
     const { token } = await track('invoices', 'update', inv.id, () =>

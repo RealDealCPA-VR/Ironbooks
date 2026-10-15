@@ -1158,7 +1158,8 @@ const VERB: Record<UndoKind, string> = { create: 'saved', update: 'changed', voi
 /**
  * Arm an undo once the action succeeded. For update / void / delete pass the token from
  * prepareUndo; for a create pass the new record's id (or nothing: the newest record of that
- * type this user created in the last few seconds is used). The audit trail must show that THIS
+ * type this user created in the last few seconds is used — only when no id is supplied; a
+ * supplied id that this user did not just create is refused, never swapped for another record). The audit trail must show that THIS
  * user changed the record after the snapshot — otherwise nothing is armed.
  */
 export async function commitUndo(
@@ -1174,11 +1175,17 @@ export async function commitUndo(
     new ServiceError('CONFLICT', `There is nothing to undo: the ${a.noun} was not changed by you just now.`);
 
   if (input.kind === 'create') {
-    let id = typeof input.id === 'string' && UUID_RE.test(input.id) ? input.id : null;
+    const supplied = input.id !== undefined && input.id !== null && input.id !== '';
+    let id = supplied && typeof input.id === 'string' && UUID_RE.test(input.id) ? input.id : null;
     const recent = new Date(Date.now() - CREATE_MATCH_MS);
+    // An id was given but it is not a record this user just created (a wrong nested id, or two
+    // quick saves): never guess another record — offering to undo something else is worse than
+    // offering nothing.
+    if (supplied && !id) throw notDone();
     let created = id ? await auditSince(ctx, a.entity, id, userId, recent, ['create']) : null;
-    if (!created) {
-      // Fall back to the newest record of this type the user created a moment ago.
+    if (supplied && !created) throw notDone();
+    if (!supplied) {
+      // No id in the response: use the newest record of this type the user created a moment ago.
       const [row] = await ctx.db
         .select()
         .from(auditLogs)
