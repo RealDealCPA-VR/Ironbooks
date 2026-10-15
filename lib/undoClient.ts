@@ -173,3 +173,27 @@ export function createUndoTracker(fetcher?: FetchLike): UndoTracker {
     },
   };
 }
+
+/** Error codes after which an undo token can never succeed (used, expired, someone else's, gone). */
+const FINAL_UNDO_ERRORS = new Set(['CONFLICT', 'FORBIDDEN', 'NOT_FOUND']);
+
+/**
+ * What the toast keeps after a failed undo. The server rolls back its claim when the inverse
+ * fails (closing-date password cancelled, network error, validation refusal), so the token is
+ * still usable: the toast comes back with its Undo button while time is left. It goes away only
+ * when the server says the token is finished for good, or the time is up.
+ */
+export function afterFailedUndo<T extends { token: string; deadline: number; busy: boolean }>(
+  shown: T[],
+  token: string,
+  err: unknown,
+  now: number = Date.now(),
+): T[] {
+  const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  const final = typeof code === 'string' && FINAL_UNDO_ERRORS.has(code);
+  return shown.flatMap((p) => {
+    if (p.token !== token) return [p];
+    if (final || p.deadline <= now) return [];
+    return [{ ...p, busy: false }];
+  });
+}

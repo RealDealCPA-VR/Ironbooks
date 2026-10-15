@@ -124,7 +124,9 @@ import {
 import { deactivateCustomer, getCustomer, reactivateCustomer, updateCustomer, type UpdateCustomerInput } from './customers';
 import { deactivateVendor, loadVendorUnmasked, reactivateVendor, updateVendor, type UpdateVendorInput } from './vendors';
 import { deactivateItem, getItem, updateItem, type UpdateItemInput } from './items';
+import { setReorderPoint } from './inventory';
 import { deactivateAccount, getAccount, updateAccount } from './accounts';
+import { qbAccountTypeOf } from '@/lib/accountTypes';
 import { formatCurrency, Money } from '@/lib/money';
 
 /** How long an undo stays available after the action (the toast shows the same countdown). */
@@ -935,8 +937,14 @@ const ADAPTERS: Record<string, Adapter> = {
       await deactivateItem(ctx, id);
       return { message: `Undone: ${this.describe(snap)} was removed from your active items (made inactive).` };
     },
-    async restore(ctx, id, before) {
+    async restore(ctx, id, before, now) {
       await updateItem(ctx, id, itemPatch(before));
+      // The items PATCH route sets the reorder point through setReorderPoint, not updateItem.
+      const was = str(before.reorderPoint);
+      const is = str(now.reorderPoint);
+      if ((was === null ? null : Money.of(was).toFixed(4)) !== (is === null ? null : Money.of(is).toFixed(4))) {
+        await setReorderPoint(ctx, id, was);
+      }
       return { message: `Undone: your changes to ${this.describe(before)} were reversed.` };
     },
     async undoDelete(ctx, id, before) {
@@ -956,10 +964,17 @@ const ADAPTERS: Record<string, Adapter> = {
       await deactivateAccount(ctx, id);
       return { message: `Undone: ${this.describe(snap)} was removed from your active accounts (made inactive).` };
     },
-    async restore(ctx, id, before) {
+    async restore(ctx, id, before, now) {
+      // A subtype alone is read against the account's CURRENT type, so when the change moved
+      // the account to another QB account type, pass the earlier QB type too. (Left out when the
+      // type did not change, so legacy type/subtype pairs restore exactly as stored.)
+      const subtype = str(before.subtype);
+      const wasQb = qbAccountTypeOf({ type: reqStr(before.type), subtype });
+      const isQb = qbAccountTypeOf({ type: reqStr(now.type), subtype: str(now.subtype) });
       await updateAccount(ctx, id, {
         name: reqStr(before.name),
-        subtype: str(before.subtype),
+        ...(wasQb !== isQb ? { qbType: wasQb } : {}),
+        subtype,
         parentId: str(before.parentId),
         description: str(before.description),
         taxLine: str(before.taxLine),

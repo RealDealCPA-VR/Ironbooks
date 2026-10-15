@@ -16,7 +16,7 @@
 import * as React from 'react';
 import { RotateCcw, X } from 'lucide-react';
 import { api, setUndoTracker } from '@/lib/client';
-import { createUndoTracker, onUndoArmed, type ArmedUndo } from '@/lib/undoClient';
+import { afterFailedUndo, createUndoTracker, onUndoArmed, type ArmedUndo } from '@/lib/undoClient';
 import { isEditableTarget } from '@/lib/shortcuts';
 import { toastError } from '@/components/ui';
 
@@ -79,7 +79,9 @@ export default function UndoToast() {
         /* storage blocked: open reports just won't auto-refresh */
       }
     } catch (err) {
-      setShown((prev) => prev.filter((p) => p.token !== u.token));
+      // The token is still usable after most failures (e.g. the closing-date password prompt
+      // was cancelled), so keep the toast and its Undo button while time is left.
+      setShown((prev) => afterFailedUndo(prev, u.token, err));
       toastError(err, 'Could not undo that change.');
     }
   }, []);

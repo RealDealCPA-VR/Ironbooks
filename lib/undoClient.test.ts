@@ -3,7 +3,7 @@
  * commit sequence the API client runs around them.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { announceUndo, classifyWrite, createUndoTracker, createdIdOf, onUndoArmed, UNDO_RESOURCES, type ArmedUndo } from './undoClient';
+import { afterFailedUndo, announceUndo, classifyWrite, createUndoTracker, createdIdOf, onUndoArmed, UNDO_RESOURCES, type ArmedUndo } from './undoClient';
 import { UNDOABLE_RESOURCES } from './services/undo';
 
 const ID = '0a1b2c3d-1111-4222-8333-944455556666';
@@ -103,5 +103,33 @@ describe('createUndoTracker', () => {
     expect(got).toEqual(['t-1']);
     a();
     b();
+  });
+});
+
+describe('afterFailedUndo (toast after a failed undo)', () => {
+  const now = 1_000_000;
+  const shown = [
+    { token: 'a', deadline: now + 20_000, busy: true },
+    { token: 'b', deadline: now + 20_000, busy: false },
+  ];
+
+  it('keeps the toast with its Undo button when the token is still usable (password cancelled, network error)', () => {
+    for (const err of [{ code: 'PERIOD_CLOSED' }, { code: 'VALIDATION' }, new TypeError('Failed to fetch'), undefined]) {
+      expect(afterFailedUndo(shown, 'a', err, now)).toEqual([
+        { token: 'a', deadline: now + 20_000, busy: false },
+        { token: 'b', deadline: now + 20_000, busy: false },
+      ]);
+    }
+  });
+
+  it('removes the toast when the server says the token is finished (CONFLICT, FORBIDDEN, NOT_FOUND)', () => {
+    for (const code of ['CONFLICT', 'FORBIDDEN', 'NOT_FOUND']) {
+      expect(afterFailedUndo(shown, 'a', { code }, now)).toEqual([shown[1]]);
+    }
+  });
+
+  it('removes the toast when its time is up, whatever the error', () => {
+    const late = [{ token: 'a', deadline: now - 1, busy: true }];
+    expect(afterFailedUndo(late, 'a', { code: 'PERIOD_CLOSED' }, now)).toEqual([]);
   });
 });

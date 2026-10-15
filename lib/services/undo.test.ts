@@ -10,7 +10,9 @@ import { and, eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { users, companies, customers, vendors, undoActions, invoices, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
-import { createAccount, getAccount, deactivateAccount } from './accounts';
+import { createAccount, getAccount, deactivateAccount, updateAccount } from './accounts';
+import { setReorderPoint } from './inventory';
+import { qbAccountTypeOf } from '@/lib/accountTypes';
 import { trialBalance } from './reports';
 import { createInvoice, getInvoice, updateInvoice, voidInvoice } from './invoices';
 import { createBill, getBill, updateBill } from './bills';
@@ -321,6 +323,42 @@ describe('undo service', () => {
     const ad = await track('accounts', 'delete', a.id, () => deactivateAccount(ctx, a.id));
     await performUndo(ctx, ad.token);
     expect((await getAccount(ctx, a.id)).isActive).toBe(true);
+  });
+
+  it('account edit that changed the QB account type (Other Current Asset -> Other Current Liability) is fully undone', async () => {
+    const a = await createAccount(ctx, { code: '1499', name: 'Prepaid Misc', qbType: 'other_current_asset' } as never);
+    expect(qbAccountTypeOf(a)).toBe('other_current_asset');
+    const u = await track('accounts', 'update', a.id, () =>
+      updateAccount(ctx, a.id, { name: 'Accrued Misc', qbType: 'other_current_liability' }),
+    );
+    const moved = await getAccount(ctx, a.id);
+    expect(moved.type).toBe('liability');
+    await performUndo(ctx, u.token);
+    const back = await getAccount(ctx, a.id);
+    expect(back.name).toBe('Prepaid Misc');
+    expect(back.type).toBe('asset');
+    expect(back.subtype).toBe(a.subtype);
+    expect(qbAccountTypeOf(back)).toBe('other_current_asset');
+  });
+
+  it('item edit that changed the reorder point (as the items PATCH route does) restores it', async () => {
+    const item = await createItem(ctx, { name: 'Reorder Widget', type: 'service', salesPrice: '5.00', incomeAccountId: acct['4000'] });
+    await setReorderPoint(ctx, item.id, '4');
+    // Same sequence as PATCH /api/items/:id: updateItem, then setReorderPoint.
+    const u = await track('items', 'update', item.id, async () => {
+      await updateItem(ctx, item.id, { salesPrice: '6.00' });
+      return setReorderPoint(ctx, item.id, '10');
+    });
+    await performUndo(ctx, u.token);
+    const back = await getItem(ctx, item.id);
+    expect(back.salesPrice).toBe('5.00');
+    expect(Number(back.reorderPoint)).toBe(4);
+
+    // Clearing an unset reorder point back to none.
+    const item2 = await createItem(ctx, { name: 'Reorder Gadget', type: 'service', incomeAccountId: acct['4000'] });
+    const u2 = await track('items', 'update', item2.id, () => setReorderPoint(ctx, item2.id, '7'));
+    await performUndo(ctx, u2.token);
+    expect((await getItem(ctx, item2.id)).reorderPoint).toBeNull();
   });
 
   it('deposits: undo of a void re-enters the deposit; undo of a create voids it', async () => {
