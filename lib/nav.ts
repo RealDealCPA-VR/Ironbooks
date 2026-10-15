@@ -38,6 +38,7 @@ import { Home, PenLine, FilePlus2 } from 'lucide-react';
 import { Inbox } from 'lucide-react'; // team home: Needs attention inbox
 import { ScanLine } from 'lucide-react'; // receipt capture
 import { ArchiveRestore } from 'lucide-react'; // team backups
+import { CalendarCheck } from 'lucide-react'; // month-end close
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -168,6 +169,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: FileClock, label: 'Audit Trail', path: '/audit-trail', qb: 'Audit Trail', keywords: 'history who changed' },
       { icon: BriefcaseIcon, label: 'Accountant Center', path: '/accountant', qb: 'Accountant Center', keywords: 'accountant' }, // wave2 accountant
+      { icon: CalendarCheck, label: 'Close the month', path: '/month-end', qb: 'Month-End Close / Set Closing Date', keywords: 'month end close checklist books closing' }, // month-end close
       { icon: ScrollText, label: 'Transaction Log', path: '/transaction-log', qb: 'Transaction Log', keywords: 'log' },
       { icon: Paperclip, label: 'Attached documents', path: '/attachments', qb: 'Doc Center', keywords: 'attachments receipts files scan' },
       { icon: Bell, label: 'Reminders', path: '/reminders', qb: 'Reminders', keywords: 'due overdue' },
@@ -277,6 +279,7 @@ export const simpleNavGroups: NavGroup[] = [
     links: [
       { icon: BookOpen, label: 'Chart of Accounts', path: '/accounts', qb: 'Chart of Accounts', keywords: 'accounts' },
       { icon: Package, label: 'Items', path: '/items', qb: 'Item List', keywords: 'products services' },
+      { icon: CalendarCheck, label: 'Close the month', path: '/month-end', qb: 'Month-End Close / Set Closing Date', keywords: 'month end close checklist books closing' }, // month-end close
     ],
   },
 ];

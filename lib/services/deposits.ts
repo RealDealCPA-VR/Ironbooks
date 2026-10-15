@@ -28,7 +28,7 @@
  * (and cash back / extra lines) at the deposit's rate, and the difference is the realized exchange
  * gain or loss (6900 Exchange Gain/Loss).
  */
-import { and, eq, inArray, isNull, like, ne, notInArray } from 'drizzle-orm';
+import { and, eq, inArray, isNull, like, lte, ne, notInArray } from 'drizzle-orm';
 import {
   accounts,
   bouncedChecks,
@@ -147,7 +147,7 @@ async function getUFAccountId(ctx: ServiceContext): Promise<string> {
 }
 
 /** Payment IDs already consumed by a NON-VOIDED deposit. */
-async function usedPaymentIds(ctx: ServiceContext, excludeDepositId?: string): Promise<string[]> {
+async function usedPaymentIds(ctx: ServiceContext, excludeDepositId?: string, asOf?: Date): Promise<string[]> {
   const rows = await ctx.db
     .select({ paymentId: depositLines.paymentId })
     .from(depositLines)
@@ -157,13 +157,14 @@ async function usedPaymentIds(ctx: ServiceContext, excludeDepositId?: string): P
         eq(deposits.companyId, ctx.companyId),
         isNull(deposits.voidedAt),
         ...(excludeDepositId ? [ne(deposits.id, excludeDepositId)] : []),
+        ...(asOf ? [lte(deposits.date, asOf)] : []),
       ),
     );
   return rows.map((r) => r.paymentId).filter((id): id is string => id !== null);
 }
 
 /** Sales-receipt IDs already consumed by a NON-VOIDED deposit (via description encoding). */
-async function usedSalesReceiptIds(ctx: ServiceContext, excludeDepositId?: string): Promise<string[]> {
+async function usedSalesReceiptIds(ctx: ServiceContext, excludeDepositId?: string, asOf?: Date): Promise<string[]> {
   const rows = await ctx.db
     .select({ description: depositLines.description })
     .from(depositLines)
@@ -173,6 +174,7 @@ async function usedSalesReceiptIds(ctx: ServiceContext, excludeDepositId?: strin
         eq(deposits.companyId, ctx.companyId),
         isNull(deposits.voidedAt),
         ...(excludeDepositId ? [ne(deposits.id, excludeDepositId)] : []),
+        ...(asOf ? [lte(deposits.date, asOf)] : []),
         like(depositLines.description, `${RECEIPT_LINE_PREFIX}%`),
       ),
     );
@@ -204,16 +206,25 @@ async function customerNameMap(
  *  - salesReceipts rows (kind 'sales_receipt'), not voided
  * Both must have depositAccountId = the UF (1050) account and must not be
  * referenced by any deposit line of a non-voided deposit.
+ *
+ * With `asOf`, the list is what was waiting in Undeposited Funds at that moment instead of today:
+ * items dated on or before `asOf` that no non-voided deposit dated on or before `asOf` consumed
+ * (a payment received Mar 20 and deposited Apr 2 was still waiting on Mar 31).
  */
-export async function listUndepositedPayments(ctx: ServiceContext): Promise<UndepositedItem[]> {
+export async function listUndepositedPayments(
+  ctx: ServiceContext,
+  opts: { asOf?: Date } = {},
+): Promise<UndepositedItem[]> {
   const ufId = await getUFAccountId(ctx);
+  const { asOf } = opts;
 
   // ── payments ─────────────────────────────────────────────────────────────
-  const usedPmtIds = await usedPaymentIds(ctx);
+  const usedPmtIds = await usedPaymentIds(ctx, undefined, asOf);
   const pmtConditions = [
     eq(paymentsReceived.companyId, ctx.companyId),
     eq(paymentsReceived.depositAccountId, ufId),
     isNull(paymentsReceived.voidedAt),
+    ...(asOf ? [lte(paymentsReceived.date, asOf)] : []),
   ];
   if (usedPmtIds.length > 0) {
     pmtConditions.push(notInArray(paymentsReceived.id, usedPmtIds));
@@ -225,11 +236,12 @@ export async function listUndepositedPayments(ctx: ServiceContext): Promise<Unde
     .orderBy(paymentsReceived.date);
 
   // ── sales receipts ──────────────────────────────────────────────────────
-  const usedSrIds = await usedSalesReceiptIds(ctx);
+  const usedSrIds = await usedSalesReceiptIds(ctx, undefined, asOf);
   const srConditions = [
     eq(salesReceipts.companyId, ctx.companyId),
     eq(salesReceipts.depositAccountId, ufId),
     ne(salesReceipts.status, 'void'),
+    ...(asOf ? [lte(salesReceipts.date, asOf)] : []),
   ];
   if (usedSrIds.length > 0) {
     srConditions.push(notInArray(salesReceipts.id, usedSrIds));

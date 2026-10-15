@@ -2644,3 +2644,32 @@ export const receiptUploadTokens = pgTable('receipt_upload_tokens', {
   lastUsedAt: timestamp('last_used_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+// ---- month-end close (drizzle/0051_monthend.sql) ----
+/** What one person recorded about one month-end checklist step (lib/services/monthEndClose.ts). */
+export interface MonthEndStepState {
+  reviewed?: boolean;
+  reviewedBy?: string | null;
+  reviewedByName?: string | null;
+  reviewedAt?: string | null;
+  note?: string | null;
+  /** Set when the step was skipped on purpose; the reason is required. */
+  skipReason?: string | null;
+}
+
+/** Guided month-end close: review progress per company + period end. */
+export const monthEndCloses = pgTable('month_end_closes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  /** 'YYYY-MM-DD' period end. Unique per company. */
+  periodEnd: varchar('period_end', { length: 10 }).notNull(),
+  /** 'open' | 'closed' */
+  status: varchar('status', { length: 20 }).notNull().default('open'),
+  steps: jsonb('steps').$type<Record<string, MonthEndStepState>>().notNull().default({}),
+  scanRanAt: timestamp('scan_ran_at'),
+  closedAt: timestamp('closed_at'),
+  closedBy: uuid('closed_by').references(() => users.id),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  /** Record-locking version. */
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});

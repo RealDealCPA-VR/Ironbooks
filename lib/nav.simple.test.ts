@@ -60,7 +60,7 @@ describe('Simple mode menu', () => {
     expect(byGroup.Banking).toEqual(['Write Check', 'Bank Feeds / Import', 'Reconcile', 'Make Deposit']);
     expect(byGroup.Employees).toEqual(['Run Payroll']);
     expect(byGroup.Reports).toEqual(['Profit & Loss', 'Balance Sheet', 'Report Center']);
-    expect(byGroup.Company).toEqual(['Chart of Accounts', 'Items']);
+    expect(byGroup.Company).toEqual(['Chart of Accounts', 'Items', 'Close the month']);
     expect(byGroup['']).toContain('Home');
     for (const l of all) expect(pageExists(linkHref(l)), linkHref(l)).toBe(true);
     // Simple mode is a strict subset of the full menu's pages (search reaches the rest).

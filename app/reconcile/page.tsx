@@ -165,6 +165,14 @@ function StartForm({
     const through = q.get('through');
     if (account && bankAccounts.some((b) => b.id === account)) setBankAccountId(account);
     if (through && /^\d{4}-\d{2}-\d{2}$/.test(through)) setStatementDate(through);
+  // Deep link from the month-end close checklist: ?bankAccountId=…&statementDate=YYYY-MM-DD
+  // pre-fills the account and statement date.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    const ba = q.get('bankAccountId');
+    const sd = q.get('statementDate');
+    if (ba && bankAccounts.some((b) => b.id === ba)) setBankAccountId(ba);
+    if (sd && /^\d{4}-\d{2}-\d{2}$/.test(sd)) setStatementDate(sd);
   }, [bankAccounts]);
 
   // Load Begin-Reconciliation info (beginning balance, last reconciled,

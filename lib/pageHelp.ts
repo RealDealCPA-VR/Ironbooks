@@ -246,6 +246,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Tick the payments you deposited, choose the bank account and save.',
     qb: 'Make Deposits',
   },
+  '/month-end': {
+    title: 'Close the month',
+    what: 'A guided checklist for the end of each month: reconcile, tidy up, review balances, then lock the books.',
+    first: 'Pick the month, work through each step, then close the books and download the report pack.',
+    qb: 'Month-End Close / Set Closing Date',
+  },
   '/reconcile': {
     title: 'Reconcile',
     what: 'Check your books against your bank statement so you know every transaction is right.',
