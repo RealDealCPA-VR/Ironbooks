@@ -104,6 +104,13 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/fiscal-periods': r('closing', 'GET POST:modify'),
   '/api/fiscal-periods/[id]': r('closing', 'PATCH'),
   '/api/year-end-close': r('closing', 'POST:modify'),
+  // month-end close wizard (lib/services/monthEndClose.ts): checklist + review progress are
+  // Sensitive Accounting; the close itself sets the closing date; the PDF pack is a report print.
+  '/api/month-end-close': r('accounting', 'GET'),
+  '/api/month-end-close/steps': r('accounting', 'PATCH'),
+  '/api/month-end-close/scan': r('accounting', 'POST'),
+  '/api/month-end-close/close': r('closing', 'POST:modify'),
+  '/api/month-end-close/report-pack': r('reports_financial', 'GET:print'),
   '/api/dashboard': r('reports_financial', 'GET'),
   '/api/search': kind('member', 'GET'), // results filtered per area in the route
   '/api/memorized-reports': kind('member', 'GET POST'),
@@ -640,6 +647,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/sales-tax': 'sales_tax', // p1 purchases: Pay Sales Tax
   '/fiscal-periods': 'closing',
   '/year-end': 'closing',
+  '/month-end': 'accounting', // month-end close wizard
   '/budgets': 'company',
   '/settings': 'company',
   '/doc-numbers': 'company', // wave2 foundation: starting document numbers

@@ -54,6 +54,8 @@ import {
   payrollStateSettings, workersCompCodes,
   // p1 fx
   homeCurrencyAdjustments, vendorCreditApplications, paymentFxReliefs,
+  // month-end close
+  monthEndCloses,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
@@ -720,6 +722,8 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'workingTbNotes', table: workingTbNotes, joins: [], companyCol: workingTbNotes.companyId },
   { name: 'listChangeReviews', table: listChangeReviews, joins: [], companyCol: listChangeReviews.companyId },
   { name: 'clientReviewTasks', table: clientReviewTasks, joins: [], companyCol: clientReviewTasks.companyId },
+  // month-end close: review progress per period (drizzle/0051_monthend.sql)
+  { name: 'monthEndCloses', table: monthEndCloses, joins: [], companyCol: monthEndCloses.companyId },
 ];
 
 /**
