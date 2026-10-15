@@ -10,7 +10,15 @@ import { parseReportParams, type ReportParams } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { notFound, validation } from './_base';
 import { requirePermission } from './access';
-import { DATE_MACROS, companyFiscalYearEnd, resolveDateMacro, type DateMacro } from './reportEngine';
+import {
+  DATE_MACROS,
+  companyFiscalYearEnd,
+  dayStr,
+  fiscalWindowFor,
+  parseDay,
+  resolveDateMacro,
+  type DateMacro,
+} from './reportEngine';
 import {
   balanceSheetDetail,
   balanceSheetReport,
@@ -212,7 +220,25 @@ export async function runStandardReport(
   }
   const report = await runner(ctx, parsed.data);
   if (entry.basis) report.basis = parsed.data.basis === 'cash' ? 'cash' : 'accrual';
+  report.range = await resolvedRange(ctx, parsed.data);
   return report;
+}
+
+/**
+ * The dates a run covered, resolved the same way the report runners do (resolveRange /
+ * resolveAsOf in reportEngine): no "to" means today; no "from" means the start of the fiscal
+ * year containing "to"; "asOf" falls back to "to".
+ */
+async function resolvedRange(ctx: ServiceContext, p: ReportParams): Promise<StdReport['range']> {
+  try {
+    const today = dayStr(new Date());
+    const to = p.to ?? today;
+    const asOf = p.asOf ?? p.to ?? today;
+    const from = p.from ?? dayStr(fiscalWindowFor(parseDay(to, true)!, await companyFiscalYearEnd(ctx)).start);
+    return { from, to, asOf };
+  } catch {
+    return undefined;
+  }
 }
 
 /** The company's default report basis (companies.settings.reportBasis; accrual when unset). */

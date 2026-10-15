@@ -23,6 +23,7 @@ import {
   toast,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
+import WhyChanged from '@/components/WhyChanged';
 import { api, ApiError } from '@/lib/client';
 import { Money, formatCurrency } from '@/lib/money';
 import {
@@ -603,7 +604,15 @@ function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
           )}
         </Td>
         <Td numeric className="font-semibold text-navy">
-          <div>{formatCurrency(node.balance)}</div>
+          <div className="inline-flex items-center gap-1">
+            {formatCurrency(node.balance)}
+            <WhyChanged
+              compact
+              title={`the ${node.name} balance`}
+              query={{ accounts: [node.id] }}
+              storageKey={`account:${node.id}`}
+            />
+          </div>
           {hasChildren && (
             <div className="text-xs font-normal text-navy/50">
               Total {formatCurrency(rolledUp)}

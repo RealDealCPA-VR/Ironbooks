@@ -23,6 +23,7 @@ import { blockingFeatureGate, featureHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
 import PreferenceBehaviors from './PreferenceBehaviors';
 import AttentionBadge from './AttentionBadge'; // team home: count on the "Needs attention" link
+import UndoToast from './UndoToast';
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
@@ -694,6 +695,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <AssistantPanel open={assistantOpen} onClose={closeAssistant} />
       <GlobalShortcuts />
       <PreferenceBehaviors />
+      <UndoToast />
       <TitleSync company={company?.name ?? null} />
     </div>
   );

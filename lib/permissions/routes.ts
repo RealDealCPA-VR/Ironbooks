@@ -417,6 +417,12 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/ai/proposals/[id]': r('accounting', 'POST'),
   '/api/audit-trail': r('reports_financial', 'GET'),
   '/api/audit-trail/[id]': r('reports_financial', 'GET'),
+  // ux/undo: Undo toasts (the service checks the permission of the record / inverse action) and
+  // "Why did this number change?" on report totals and account balances.
+  '/api/undo/prepare': kind('member', 'POST'),
+  '/api/undo/commit': kind('member', 'POST'),
+  '/api/undo/[id]': kind('member', 'POST'),
+  '/api/why-changed': r('reports_financial', 'GET'),
   // wave2 accountant: Accountant Center tools.
   '/api/accountant/center': r('accounting', 'GET'),
   '/api/accountant/reclassify': r('accounting', 'GET POST:modify'),
