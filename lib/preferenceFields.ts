@@ -132,7 +132,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   trackReimbursedAsIncome: { label: 'Track reimbursed expenses as income', help: 'On: costs you bill back to customers go to an income account named "Reimbursed Expenses Income". Off: they reduce the original expense account.', type: 'bool' },
   defaultMarkupPercent: { label: 'Default markup percentage', type: 'number' },
   // Multiple currencies
-  multiCurrencyEnabled: { label: 'I use more than one currency', help: 'Turning this on cannot be undone in QuickBooks; here it only shows the currency fields on forms.', type: 'bool' },
+  multiCurrencyEnabled: { label: 'I use more than one currency', help: 'Adds currency and exchange-rate fields to forms and the Currencies list. While off, they are hidden and foreign-currency entries are refused. Once you have foreign-currency data it can no longer be turned off (as in QuickBooks).', type: 'bool' },
   // Payroll
   payrollEnabled: { label: 'Use payroll (Full payroll)', help: 'Off ("No payroll"): pay runs, paychecks, payroll liabilities and payroll tax forms are hidden and cannot be saved. Your employee list stays.', type: 'bool' },
   payrollPayPeriod: { label: 'Usual pay period', type: 'select', options: [['weekly', 'Weekly'], ['biweekly', 'Every two weeks'], ['semimonthly', 'Twice a month'], ['monthly', 'Monthly']] },

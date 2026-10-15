@@ -19,6 +19,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation } from './_base';
 import { foreignCode, homeCode } from './fxLines';
 import { getOrCreateExchangeGainLossAccount } from './currencies';
+import { assertForeignCurrencyAllowed } from './multiCurrency';
 import type { PostingLine } from './posting';
 
 export { foreignCode, homeCode };
@@ -56,6 +57,7 @@ export async function currencyRate(
   const home = await homeCode(ctx);
   const cur = foreignCode(code, home);
   if (!cur) return { currency: null, rate: Money.of(1) };
+  await assertForeignCurrencyAllowed(ctx, cur); // A2: Multiple Currencies off
   const given = parseRate(stated);
   if (given) return { currency: cur, rate: given };
   const [row] = await ctx.db

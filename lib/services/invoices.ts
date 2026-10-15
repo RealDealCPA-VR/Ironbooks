@@ -57,6 +57,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { assertForeignCurrencyAllowed } from './multiCurrency';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS } from './inventory';
 import { consumeStock } from './fifo';
@@ -548,6 +549,7 @@ async function prepareInvoice(
   // only home amounts are rounded to cents.
   const exchangeRate = Money.of(Money.of(input.exchangeRate ?? 1).toFixed(8));
   if (exchangeRate.lessThanOrEqualTo(0)) throw validation('Exchange rate must be positive.');
+  await assertForeignCurrencyAllowed(ctx, input.currency); // A2: Multiple Currencies off
 
   // Verify customer belongs to company; also load creditLimit for the credit check.
   const [customer] = await ctx.db

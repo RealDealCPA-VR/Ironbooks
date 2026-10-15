@@ -479,6 +479,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     () => [...new Set(['', ...invoices.map((i) => normCur(i.currency)), currency])],
     [invoices, currency, normCur],
   );
+  // A2: currency fields only while Preferences > Multiple Currencies is on (or the payment is foreign).
+  const showCurrency = currencyChoices.length > 1 && (prefs.company.multiCurrencyEnabled || currency !== '');
   // Credits and General Journal items are home-currency only.
   const shownCredits = foreign ? [] : credits;
   const shownCharges = foreign ? [] : journalCharges;
@@ -768,8 +770,8 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           </div>
         )}
         {/* Customer + currency */}
-        <div className={currencyChoices.length > 1 ? 'grid grid-cols-3 gap-3' : undefined}>
-          <div className={currencyChoices.length > 1 ? 'col-span-1' : undefined}>
+        <div className={showCurrency ? 'grid grid-cols-3 gap-3' : undefined}>
+          <div className={showCurrency ? 'col-span-1' : undefined}>
             <Label htmlFor="pm-customer" required>Customer</Label>
             <Select
               id="pm-customer"
@@ -785,7 +787,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
               ))}
             </Select>
           </div>
-          {currencyChoices.length > 1 && (
+          {showCurrency && (
             <>
               <div>
                 <Label htmlFor="pm-currency">Currency</Label>

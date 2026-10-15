@@ -52,6 +52,7 @@ import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
 import { docRef } from './docNumbers';
 import { removePaymentFromDeposit } from './deposits';
+import { assertForeignCurrencyAllowed } from './multiCurrency';
 import { computeDiscount, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
 import { getHomeCurrencyCode } from './currencies';
 import {
@@ -546,6 +547,7 @@ export async function resolvePaymentCurrency(
 ): Promise<{ currency: string | null; rate: ReturnType<typeof Money.of> }> {
   const currency = await normalizeCurrency(ctx, input.currency);
   if (!currency) return { currency: null, rate: Money.of(1) };
+  await assertForeignCurrencyAllowed(ctx, currency); // A2: Multiple Currencies off
   let rate: ReturnType<typeof Money.of>;
   if (input.exchangeRate !== undefined && input.exchangeRate !== null && String(input.exchangeRate).trim() !== '') {
     rate = Money.of(input.exchangeRate);

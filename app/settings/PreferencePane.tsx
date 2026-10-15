@@ -23,6 +23,7 @@ import {
 } from '@/lib/preferences';
 import { refreshPreferences, usePreferences } from '@/lib/usePreferences';
 import { FIELD_META, type Account as PrefAccount, type FieldMeta } from '@/lib/preferenceFields';
+import MultiCurrencyPreference from './MultiCurrencyPreference';
 
 type Account = PrefAccount;
 
@@ -250,6 +251,10 @@ export default function PreferencePane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [categoryId]);
 
+  // A2: the Multiple Currencies switch asks before turning on and locks once foreign data exists.
+  if (categoryId === 'currencies' && companyKeys.includes('multiCurrencyEnabled')) {
+    return <MultiCurrencyPreference canEdit={canEditCompany} />;
+  }
   if (!category || (companyKeys.length === 0 && myKeys.length === 0)) return null;
 
   const keys = scope === 'company' ? companyKeys : myKeys;

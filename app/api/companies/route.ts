@@ -16,6 +16,7 @@ import {
   listCompanies,
   listCompaniesForUser,
   createCompany,
+  NEW_COMPANY_SETTINGS,
   ensureDevCompany,
 } from '@/lib/services/company';
 
@@ -91,7 +92,7 @@ export async function POST(req: NextRequest) {
     }
     // Owner = the authenticated user; first-run only, fall back to the seeded dev user.
     const ownerId = sessionUserId ?? (await ensureDevCompany(db)).userId;
-    const company = await createCompany(db, { name, ownerId });
+    const company = await createCompany(db, { name, ownerId, settings: { ...NEW_COMPANY_SETTINGS } });
     return NextResponse.json(company, { status: 201 });
   } catch (err) {
     return errorResponse(err);
