@@ -18,6 +18,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, validation } from './_base';
+import { assertForeignCurrencyAllowed } from './multiCurrency';
 import { getHomeCurrencyCode } from './currencies';
 import { currencies } from '@/lib/db/schema';
 
@@ -108,6 +109,7 @@ export async function resolveVendorPurchaseFields(
     let next = (input.currency ?? '').trim().toUpperCase() || null;
     if (next && home && next === home) next = null;
     if (next) {
+      await assertForeignCurrencyAllowed(ctx, next); // A2: Multiple Currencies off
       const [cur] = await ctx.db
         .select({ id: currencies.id })
         .from(currencies)

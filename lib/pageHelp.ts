@@ -326,6 +326,13 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Save a transaction as recurring from its form, then set how often.',
     qb: 'Memorized Transactions',
   },
+  // gapsb K
+  '/change-password': {
+    title: 'Change My Password',
+    what: 'Choose a new password for signing in, following the password rules an Admin set under Users & Roles. When your password expires, you come here first.',
+    first: 'Type your current password, then the new one twice, and click Change password.',
+    qb: 'Change Your Password',
+  },
   '/settings': {
     title: 'Preferences',
     what: 'Settings for the whole company and just for you, such as features you use and the menu style.',

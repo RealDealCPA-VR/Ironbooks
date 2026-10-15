@@ -248,7 +248,13 @@ export async function getCurrentUser() {
   if (!userId) return null;
   const db = await getDb();
   const [user] = await db
-    .select({ id: users.id, email: users.email, name: users.name, totpEnabled: users.totpEnabled })
+    .select({
+      id: users.id,
+      email: users.email,
+      name: users.name,
+      totpEnabled: users.totpEnabled,
+      mustChangePassword: users.mustChangePassword, // gapsb K
+    })
     .from(users)
     .where(eq(users.id, userId));
   return user ?? null;

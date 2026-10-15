@@ -5,10 +5,12 @@ import { Briefcase } from 'lucide-react';
 import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { api } from '@/lib/client';
 import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
+import { PasswordRulesHint, usePasswordPolicy } from '@/components/PasswordRules';
 
 export default function SignupPage() {
   const [form, setForm] = useState({ name: '', email: '', password: '', companyName: '' });
   const [busy, setBusy] = useState(false);
+  const policy = usePasswordPolicy();
   const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) => setForm({ ...form, [k]: e.target.value });
 
   async function submit(e: React.FormEvent) {
@@ -48,8 +50,18 @@ export default function SignupPage() {
             <Input type="email" value={form.email} onChange={set('email')} required />
           </div>
           <div>
-            <Label>Password</Label>
-            <Input type="password" value={form.password} onChange={set('password')} required minLength={MIN_PASSWORD_LENGTH} />
+            <Label htmlFor="su-password">Password</Label>
+            <Input
+              id="su-password"
+              type="password"
+              value={form.password}
+              onChange={set('password')}
+              required
+              minLength={Math.max(MIN_PASSWORD_LENGTH, policy.minLength)}
+              aria-describedby="su-password-rules"
+              autoComplete="new-password"
+            />
+            <PasswordRulesHint id="su-password-rules" password={form.password} policy={policy} />
           </div>
           <Button type="submit" className="w-full" loading={busy}>
             Create account

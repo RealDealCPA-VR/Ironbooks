@@ -22,6 +22,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -407,6 +408,7 @@ declare global {
 }
 
 export default function BankingPage() {
+  const prefs = usePreferences();
   // Data state
   const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
   const [glAccounts, setGlAccounts] = useState<Account[]>([]);
@@ -551,7 +553,8 @@ export default function BankingPage() {
   }, [fetchBankAccounts, fetchRules, fetchAccounts]);
 
   // Multi-currency: a bank / card account can hold a foreign currency (only before it is used).
-  const multiCurrency = currencyList.length > 1;
+  // A2: the currency column / picker only while Preferences > Multiple Currencies is on.
+  const multiCurrency = currencyList.length > 1 && prefs.company.multiCurrencyEnabled;
   const homeCode = currencyList.find((c) => c.isBase)?.code ?? '';
   async function changeAccountCurrency(accountId: string, code: string) {
     try {

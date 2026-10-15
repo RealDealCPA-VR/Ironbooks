@@ -908,3 +908,65 @@ export async function getDeposit(ctx: ServiceContext, id: string) {
 
   return { ...deposit, lines };
 }
+
+// ---------------------------------------------------------------------------
+// removePaymentFromDeposit — C1: take one received payment back out of its deposit
+// ---------------------------------------------------------------------------
+
+/**
+ * Take a received payment out of a saved deposit (QB: open the deposit and delete the line), so
+ * the payment goes back to Undeposited Funds and can be edited freely. The rest of the deposit
+ * is kept: payments, sales receipts, extra lines and cash back are re-sent through updateDeposit
+ * (same validation, re-post and audit as an edit on the deposit window). A deposit that held only
+ * this payment is voided instead (a deposit needs at least one line).
+ */
+export async function removePaymentFromDeposit(
+  ctx: ServiceContext,
+  depositId: string,
+  paymentId: string,
+): Promise<{ voided: boolean }> {
+  const deposit = await getDeposit(ctx, depositId);
+  if (deposit.voidedAt) return { voided: true };
+  if (!deposit.lines.some((l) => l.paymentId === paymentId)) {
+    throw validation('That payment is not part of this deposit.');
+  }
+  const paymentIds: string[] = [];
+  const salesReceiptIds: string[] = [];
+  const extraLines: ExtraDepositLineInput[] = [];
+  let cashBack: CashBackInput | null = null;
+  for (const l of deposit.lines) {
+    const desc = l.description ?? '';
+    if (l.paymentId) {
+      if (l.paymentId !== paymentId) paymentIds.push(l.paymentId);
+    } else if (desc.startsWith(RECEIPT_LINE_PREFIX)) {
+      salesReceiptIds.push(desc.slice(RECEIPT_LINE_PREFIX.length));
+    } else if (desc.startsWith(CASHBACK_LINE_PREFIX)) {
+      cashBack = {
+        accountId: desc.slice(CASHBACK_LINE_PREFIX.length),
+        amount: toAmountString(Money.of(l.amount).abs()),
+      };
+    } else if (l.accountId) {
+      extraLines.push({ accountId: l.accountId, amount: l.amount, description: l.description });
+    } else {
+      throw new ServiceError(
+        'CONFLICT',
+        'This deposit has a line from an older version that cannot be re-saved automatically. Open the deposit and remove the payment there.',
+      );
+    }
+  }
+  if (paymentIds.length === 0 && salesReceiptIds.length === 0 && extraLines.length === 0) {
+    await voidDeposit(ctx, depositId);
+    return { voided: true };
+  }
+  await updateDeposit(ctx, depositId, {
+    depositAccountId: deposit.depositAccountId,
+    date: deposit.date,
+    paymentIds,
+    salesReceiptIds,
+    extraLines,
+    cashBack,
+    memo: deposit.memo,
+    exchangeRate: deposit.currency ? deposit.exchangeRate : null,
+  });
+  return { voided: false };
+}

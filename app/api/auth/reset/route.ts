@@ -6,7 +6,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { and, eq, gt } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { users } from '@/lib/db/schema';
-import { hashPassword, hasValidUnlockCookie, MIN_PASSWORD_LENGTH } from '@/lib/auth';
+import { hasValidUnlockCookie, MIN_PASSWORD_LENGTH } from '@/lib/auth';
+import { ServiceError } from '@/lib/services/_base';
+import { assertPasswordAllowed, storeUserPassword } from '@/lib/services/passwordPolicy';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { endUserSessions } from '@/lib/services/sessions';
 import { logTransaction } from '@/lib/services/transactionLog';
@@ -60,15 +62,17 @@ export async function POST(req: NextRequest) {
       limiter.recordFailure(keys, Date.now(), weights);
       return NextResponse.json({ error: 'Invalid or expired reset token.', code: 'FORBIDDEN' }, { status: 400 });
     }
-    await db
-      .update(users)
-      .set({
-        passwordHash: await hashPassword(password),
-        resetToken: null,
-        resetExpires: null,
-        updatedAt: new Date(),
-      })
-      .where(eq(users.id, user.id));
+    // gapsb K: the file's password policy (incl. "don't reuse the last N passwords").
+    try {
+      await assertPasswordAllowed(db, password, { userId: user.id });
+    } catch (err) {
+      if (err instanceof ServiceError) {
+        return NextResponse.json({ error: err.message, code: err.code }, { status: 400 });
+      }
+      throw err;
+    }
+    // New hash + change date; clears the token and any "must change" flag.
+    await storeUserPassword(db, user.id, password);
     // Whoever held the old password is signed out everywhere (server-side session rows).
     await endUserSessions(db, user.id, 'password_reset');
     // Running transaction log: user/security changes are logged (never the password itself).

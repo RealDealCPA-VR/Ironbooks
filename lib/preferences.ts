@@ -843,6 +843,18 @@ export function featureHiddenPaths(prefs: Pick<CompanyPreferences, FeatureKey>):
   return hidden;
 }
 
+/**
+ * A2: pages hidden while Multiple Currencies is off (Preferences > Multiple Currencies). Kept
+ * apart from FEATURE_GATES because this switch is OFF by default and, once foreign-currency data
+ * exists, can never be turned off again; its saves are refused in the services
+ * (lib/services/multiCurrency.ts), not by route prefix.
+ */
+export const MULTI_CURRENCY_PAGES = ['/currencies'] as const;
+
+export function multiCurrencyHiddenPaths(prefs: Pick<CompanyPreferences, 'multiCurrencyEnabled'>): Set<string> {
+  return new Set(prefs.multiCurrencyEnabled ? [] : MULTI_CURRENCY_PAGES);
+}
+
 /** Pay periods per year for the payroll pay-period preference. */
 export const PAY_PERIODS_PER_YEAR: Record<CompanyPreferences['payrollPayPeriod'], number> = {
   weekly: 52,

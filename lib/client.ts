@@ -24,6 +24,7 @@
  * server's ServiceError code into plain language with a next step — see lib/friendlyErrors.ts.
  */
 import { describeError, type FriendlyError } from '@/lib/friendlyErrors';
+import { isPasswordChangeRequiredError } from '@/lib/passwordPolicy';
 
 export class ApiError extends Error {
   constructor(
@@ -174,6 +175,16 @@ async function handle<T>(res: Response): Promise<T> {
       !DAMAGED_FILE_PAGES.includes(window.location.pathname)
     ) {
       window.location.assign('/damaged-file');
+    }
+    // gapsb K: the password expired (or an Admin asked for a new one): choose one first.
+    else if (
+      isPasswordChangeRequiredError(res.status, message) &&
+      typeof window !== 'undefined' &&
+      window.location.pathname !== '/change-password'
+    ) {
+      window.location.assign(
+        '/change-password?next=' + encodeURIComponent(window.location.pathname + window.location.search),
+      );
     }
     // Session not valid for this company file (e.g. after switching files): back to sign-in.
     else if (

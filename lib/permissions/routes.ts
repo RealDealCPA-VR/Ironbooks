@@ -73,6 +73,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/auth/2fa/setup': kind('self', 'POST'),
   '/api/auth/2fa/enable': kind('self', 'POST'),
   '/api/auth/2fa/disable': kind('self', 'POST'),
+  '/api/auth/change-password': kind('self', 'POST'), // gapsb K: change own password (also when expired)
+  '/api/auth/password-policy': kind('public', 'GET'), // gapsb K: the file's password rules for the forms
   '/api/unlock': kind('public', 'POST'),
   '/api/file-lock': { GET: 'member', ...r('users', 'POST:modify') },
   '/api/portal/login': kind('public', 'POST'),
@@ -87,6 +89,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/companies/select': kind('self', 'POST'),
   '/api/company': { GET: 'member', ...r('company', 'PATCH') },
   '/api/company/closing-date': r('closing', 'GET PATCH'),
+  '/api/company/multi-currency': { GET: 'member' }, // gapsb A2: Multiple Currencies status / lock
   // P1 setup: EasyStep interview (apply answers / skip) for the active company.
   '/api/company/setup-interview': { GET: 'member', ...r('company', 'POST:modify') },
   // wave2 foundation: document numbering (next number for forms; starting numbers).
@@ -171,6 +174,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/users': r('users', 'GET POST'),
   '/api/users/[id]': r('users', 'GET PATCH'),
   '/api/users/[id]/reset-password': r('users', 'POST:modify'),
+  '/api/users/password-policy': r('users', 'GET PUT:modify'), // gapsb K: Admin-only save (requireFileAdmin)
   '/api/roles': r('users', 'GET POST'),
   '/api/roles/[id]': r('users', 'GET PATCH DELETE'),
   // Multi-user hosting (team hosting): who is logged in / sign-out / single-user mode. Every

@@ -30,6 +30,8 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import type { Action, Area, Flag, PermissionGrant, PermissionSet, RoleFlags } from '@/lib/permissions/model';
+import { PasswordRulesHint, meetsPolicy, usePasswordPolicy } from '@/components/PasswordRules';
+import PasswordPolicyEditor from './PasswordPolicyEditor';
 
 interface CompanyUser {
   userId: string;
@@ -87,7 +89,15 @@ function expand(grant: PermissionGrant, actions: Action[]): Record<string, Set<A
 }
 
 export default function UsersAndRolesPage() {
-  const [tab, setTab] = useState<'users' | 'roles'>('users');
+  const [tab, setTab] = useState<'users' | 'roles' | 'passwords'>('users');
+  // gapsb K: the password-rules editor is for Admins only (the server checks too).
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    api
+      .get<{ isAdmin?: boolean } | null>('/api/auth/me')
+      .then((m) => setIsAdmin(Boolean(m?.isAdmin)))
+      .catch(() => setIsAdmin(false));
+  }, []);
   const [users, setUsers] = useState<CompanyUser[] | null>(null);
   const [roles, setRoles] = useState<Role[]>([]);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
@@ -117,7 +127,7 @@ export default function UsersAndRolesPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Users & Roles" icon={Users} />
       <div className="mb-4 flex gap-2" role="tablist">
-        {(['users', 'roles'] as const).map((t) => (
+        {(isAdmin ? (['users', 'roles', 'passwords'] as const) : (['users', 'roles'] as const)).map((t) => (
           <button
             key={t}
             role="tab"
@@ -127,7 +137,7 @@ export default function UsersAndRolesPage() {
               tab === t ? 'bg-electric text-white' : 'bg-white text-navy hover:bg-electric/5'
             }`}
           >
-            {t === 'users' ? 'Users' : 'Roles'}
+            {t === 'users' ? 'Users' : t === 'roles' ? 'Roles' : 'Password rules'}
           </button>
         ))}
       </div>
@@ -136,7 +146,9 @@ export default function UsersAndRolesPage() {
           {error}
         </Card>
       )}
-      {users === null || !catalog ? (
+      {tab === 'passwords' && isAdmin ? (
+        <PasswordPolicyEditor />
+      ) : users === null || !catalog ? (
         error ? null : <PageSkeleton />
       ) : tab === 'users' ? (
         <UsersTab users={users} roles={roles} catalog={catalog} reload={load} />
@@ -347,7 +359,9 @@ function UserEditor({
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [roleKeys, setRoleKeys] = useState<string[]>(user?.roleKeys ?? []);
+  const [requireChange, setRequireChange] = useState(true);
   const [busy, setBusy] = useState(false);
+  const policy = usePasswordPolicy();
 
   async function save() {
     if (!user && password !== confirm) {
@@ -360,7 +374,13 @@ function UserEditor({
         await api.patch(`/api/users/${user.userId}`, { name, login, roleKeys });
         toast('User updated.', 'success');
       } else {
-        await api.post('/api/users', { name, login, password: password || undefined, roleKeys });
+        await api.post('/api/users', {
+          name,
+          login,
+          password: password || undefined,
+          roleKeys,
+          ...(password ? { requireChange } : {}),
+        });
         toast('User added.', 'success');
       }
       await onSaved();
@@ -402,14 +422,16 @@ function UserEditor({
         {!user && (
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
-              <Label htmlFor="u-pw">Password (min 8 characters)</Label>
+              <Label htmlFor="u-pw">Password</Label>
               <Input
                 id="u-pw"
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 autoComplete="new-password"
+                aria-describedby="u-pw-rules"
               />
+              <PasswordRulesHint id="u-pw-rules" password={password} policy={policy} />
             </div>
             <div>
               <Label htmlFor="u-pw2">Confirm password</Label>
@@ -421,6 +443,10 @@ function UserEditor({
                 autoComplete="new-password"
               />
             </div>
+            <label className="sm:col-span-2 flex items-center gap-2 text-sm text-navy">
+              <input type="checkbox" checked={requireChange} onChange={(e) => setRequireChange(e.target.checked)} />
+              Ask them to choose their own password when they first sign in
+            </label>
           </div>
         )}
         <div>
@@ -435,7 +461,9 @@ function UserEditor({
 function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => void }) {
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
+  const [requireChange, setRequireChange] = useState(true);
   const [busy, setBusy] = useState(false);
+  const policy = usePasswordPolicy();
   async function save() {
     if (password !== confirm) {
       toast('Passwords do not match.', 'danger');
@@ -443,7 +471,7 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
     }
     setBusy(true);
     try {
-      await api.post(`/api/users/${user.userId}/reset-password`, { password });
+      await api.post(`/api/users/${user.userId}/reset-password`, { password, requireChange });
       toast(`Password reset for ${user.name}.`, 'success');
       onClose();
     } catch (e) {
@@ -462,7 +490,7 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button onClick={save} loading={busy} disabled={password.length < 8}>
+          <Button onClick={save} loading={busy} disabled={!meetsPolicy(password, policy)}>
             Reset password
           </Button>
         </>
@@ -470,13 +498,26 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
     >
       <div className="space-y-4">
         <div>
-          <Label htmlFor="rp-1">New password (min 8 characters)</Label>
-          <Input id="rp-1" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoFocus autoComplete="new-password" />
+          <Label htmlFor="rp-1">New password</Label>
+          <Input
+            id="rp-1"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoFocus
+            autoComplete="new-password"
+            aria-describedby="rp-1-rules"
+          />
+          <PasswordRulesHint id="rp-1-rules" password={password} policy={policy} />
         </div>
         <div>
           <Label htmlFor="rp-2">Confirm new password</Label>
           <Input id="rp-2" type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" />
         </div>
+        <label className="flex items-center gap-2 text-sm text-navy">
+          <input type="checkbox" checked={requireChange} onChange={(e) => setRequireChange(e.target.checked)} />
+          Ask {user.name} to choose a new password at their next sign-in
+        </label>
       </div>
     </Modal>
   );

@@ -4,7 +4,7 @@
  * active database; multi-file management is layered on in the Electron shell.
  */
 import { and, eq } from 'drizzle-orm';
-import { accounts, companies, users, userCompanies } from '@/lib/db/schema';
+import { accounts, companies, currencies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
@@ -13,6 +13,8 @@ import { requireEffectivePermission } from './access';
 import type { DB } from '@/lib/db';
 import { logTransaction } from './transactionLog';
 import { assertPreferenceAccounts } from './prefAccounts';
+import { assertMultiCurrencyChangeAllowed, resolveMultiCurrency } from './multiCurrency';
+import { setBaseCurrency } from './currencies';
 import {
   COMPANY_PREFERENCE_KEYS,
   resolveCompanyPreferences,
@@ -79,11 +81,17 @@ export async function listCompaniesForUser(
 
 export async function createCompany(
   db: DB,
-  input: { name: string; ownerId: string; seedCoa?: boolean },
+  input: {
+    name: string;
+    ownerId: string;
+    seedCoa?: boolean;
+    /** Initial settings, e.g. NEW_COMPANY_SETTINGS for a company file made in the app. */
+    settings?: Record<string, unknown>;
+  },
 ) {
   const [company] = await db
     .insert(companies)
-    .values({ name: input.name, ownerId: input.ownerId })
+    .values({ name: input.name, ownerId: input.ownerId, ...(input.settings ? { settings: input.settings } : {}) })
     .returning();
 
   await db
@@ -126,6 +134,12 @@ export async function createCompany(
 }
 
 /**
+ * Settings every company created in the app starts with: Multiple Currencies is OFF until an
+ * administrator turns it on (QB default). Files from older builds were set by migration 0056.
+ */
+export const NEW_COMPANY_SETTINGS: Readonly<Record<string, unknown>> = { multiCurrencyEnabled: false };
+
+/**
  * Dev/first-run helper: ensure there is at least one user + company so the UI has a context.
  * In production this is replaced by the onboarding wizard + auth.
  */
@@ -147,7 +161,7 @@ export async function ensureDevCompany(db: DB): Promise<{ companyId: string; use
     summary: 'Created the first-run user "Demo User"',
     data: { new: { name: user.name, email: user.email } },
   });
-  const company = await createCompany(db, { name: 'Demo Company', ownerId: user.id });
+  const company = await createCompany(db, { name: 'Demo Company', ownerId: user.id, settings: { ...NEW_COMPANY_SETTINGS } });
   return { companyId: company.id, userId: user.id };
 }
 
@@ -269,7 +283,12 @@ export async function getPreferences(ctx: ServiceContext): Promise<CompanyPrefer
     .select({ settings: companies.settings })
     .from(companies)
     .where(eq(companies.id, ctx.companyId));
-  return resolveCompanyPreferences(row?.settings ?? {});
+  const prefs = resolveCompanyPreferences(row?.settings ?? {});
+  // A2: a company that never chose is "on" exactly when it already uses foreign currencies.
+  if (typeof (row?.settings as Record<string, unknown> | null)?.multiCurrencyEnabled !== 'boolean') {
+    prefs.multiCurrencyEnabled = await resolveMultiCurrency(ctx.db, ctx.companyId, row?.settings ?? {});
+  }
+  return prefs;
 }
 
 export interface UpdateCompanyInput {
@@ -295,6 +314,11 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
   // Account-valued preferences must name the right kind of account (a paycheck account that is
   // A/R or a wages account that is A/P would break the subledger == control-account rule).
   await assertPreferenceAccounts(ctx, settingsPatch);
+  // A2: Multiple Currencies can't be turned off once foreign-currency data exists (QB lock).
+  const multiCurrency =
+    'multiCurrencyEnabled' in settingsPatch
+      ? await assertMultiCurrencyChangeAllowed(ctx, existing.settings as Record<string, unknown>, settingsPatch.multiCurrencyEnabled)
+      : null;
 
   const mergedSettings = {
     ...(existing.settings ?? {}),
@@ -311,6 +335,10 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
     .where(eq(companies.id, ctx.companyId))
     .returning();
 
+  // Turning Multiple Currencies on: the home currency goes into the currency list (QB shows it
+  // there as soon as the preference is on) so foreign currencies can be added next to it.
+  if (multiCurrency === 'on') await ensureHomeCurrency(ctx, mergedSettings);
+
   await writeAudit(ctx, {
     action: 'update',
     entityType: 'company',
@@ -320,6 +348,20 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
   });
 
   return updated;
+}
+
+/** Put the home currency (Preferences currency, default USD) in the currency list if missing. */
+async function ensureHomeCurrency(ctx: ServiceContext, settings: Record<string, unknown>): Promise<void> {
+  const [base] = await ctx.db
+    .select({ id: currencies.id })
+    .from(currencies)
+    .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+  if (base) return;
+  const code = (typeof settings.currency === 'string' && settings.currency.trim() ? settings.currency : 'USD')
+    .trim()
+    .toUpperCase()
+    .slice(0, 3);
+  await setBaseCurrency(ctx, { code, name: code });
 }
 
 // ---------------------------------------------------------------------------

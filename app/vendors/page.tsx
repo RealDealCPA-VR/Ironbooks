@@ -580,7 +580,7 @@ function VendorsPageContent() {
           </div>
 
           {/* Currency (multi-currency) */}
-          {foreignCurrencies.length > 0 && (
+          {foreignCurrencies.length > 0 && (prefs.company.multiCurrencyEnabled || !!form.currency) && (
             <div>
               <Label htmlFor="currency">Currency</Label>
               <Select

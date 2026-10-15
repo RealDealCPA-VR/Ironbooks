@@ -1328,7 +1328,8 @@ function InvoiceModal({
           )}
         </div>
 
-        {/* Foreign currency (optional) */}
+        {/* Foreign currency (optional) — A2: only while Preferences > Multiple Currencies is on. */}
+        {(prefs.company.multiCurrencyEnabled || currency) && (
         <div className="grid grid-cols-2 gap-3">
           <div>
             <Label htmlFor="inv-currency">Currency (optional)</Label>
@@ -1354,6 +1355,7 @@ function InvoiceModal({
             />
           </div>
         </div>
+        )}
 
         {/* Retainage (contractors): part of the total held back until the work is accepted */}
         <div className="grid grid-cols-2 gap-3">

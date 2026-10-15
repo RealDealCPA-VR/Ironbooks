@@ -24,6 +24,8 @@ export const createUserSchema = z.object({
   login,
   password: passwordSchema.optional(),
   roleKeys,
+  /** gapsb K: ask the new user to choose their own password at first sign-in. */
+  requireChange: z.boolean().optional(),
 });
 
 export const updateUserSchema = z
@@ -35,7 +37,28 @@ export const updateUserSchema = z
   })
   .strict();
 
-export const resetPasswordSchema = z.object({ password: passwordSchema });
+export const resetPasswordSchema = z.object({
+  password: passwordSchema,
+  /** gapsb K: the user must choose a new password at their next sign-in. */
+  requireChange: z.boolean().optional(),
+});
+
+/** gapsb K: POST /api/auth/change-password (a person changing their own password). */
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'is required').max(200),
+  newPassword: z.string().min(1, 'is required').max(200),
+});
+
+/** gapsb K: PUT /api/users/password-policy (Admin). */
+export const passwordPolicySchema = z
+  .object({
+    minLength: z.number().int().optional(),
+    requireLettersAndNumbers: z.boolean().optional(),
+    requireSymbol: z.boolean().optional(),
+    expiryDays: z.number().int().optional(),
+    historyCount: z.number().int().optional(),
+  })
+  .strict();
 
 /** POST /api/auth/login body. `email` is the login (an email address or a plain user name). */
 export const loginSchema = z.object({

@@ -21,6 +21,7 @@ import { currencies, accounts, journalEntryLines } from '@/lib/db/schema';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { type ServiceContext, ServiceError, validation, notFound, writeAudit } from './_base';
+import { assertForeignCurrencyAllowed } from './multiCurrency';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -159,6 +160,7 @@ export async function upsertCurrency(
 
   const rate = Money.of(rateToBase);
   if (!rate.greaterThan(0)) throw validation('rateToBase must be greater than zero.');
+  await assertForeignCurrencyAllowed(ctx, code); // A2: Multiple Currencies off
 
   const [existing] = await ctx.db
     .select()
@@ -373,6 +375,7 @@ export async function resolveDocumentCurrency(
     );
   }
   if (!currency) return { currency: null, rate: Money.of(1) };
+  await assertForeignCurrencyAllowed(ctx, currency); // A2: Multiple Currencies off
 
   let rate: Decimal;
   if (hasText(input.exchangeRate)) {
@@ -455,6 +458,7 @@ export async function setAccountCurrency(
   let next: string | null = (code ?? '').trim().toUpperCase() || null;
   if (next && home && next === home) next = null;
   if (next) {
+    await assertForeignCurrencyAllowed(ctx, next); // A2: Multiple Currencies off
     const [cur] = await ctx.db
       .select({ id: currencies.id })
       .from(currencies)

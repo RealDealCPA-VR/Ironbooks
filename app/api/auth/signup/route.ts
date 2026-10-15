@@ -10,7 +10,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { eq, ne } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { users } from '@/lib/db/schema';
-import { createCompany } from '@/lib/services/company';
+import { createCompany, NEW_COMPANY_SETTINGS } from '@/lib/services/company';
 import {
   hashPassword,
   createSessionToken,
@@ -19,6 +19,8 @@ import {
   MIN_PASSWORD_LENGTH,
 } from '@/lib/auth';
 import { invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
+import { getPasswordPolicy } from '@/lib/services/passwordPolicy';
+import { passwordProblemMessage, passwordProblems } from '@/lib/passwordPolicy';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { COMPANY_COOKIE } from '@/lib/context';
 import { logTransaction } from '@/lib/services/transactionLog';
@@ -72,6 +74,11 @@ export async function POST(req: NextRequest) {
       { status: 403 },
     );
   }
+  // gapsb K: the file's password policy (defaults: 8+ characters with letters and numbers).
+  const problems = passwordProblems(password, await getPasswordPolicy(db));
+  if (problems.length) {
+    return NextResponse.json({ error: passwordProblemMessage(problems), code: 'VALIDATION' }, { status: 400 });
+  }
   const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, email.trim().toLowerCase()));
   if (existing.length) {
     return NextResponse.json({ error: 'An account with that email already exists.', code: 'CONFLICT' }, { status: 409 });
@@ -79,7 +86,12 @@ export async function POST(req: NextRequest) {
 
   const [user] = await db
     .insert(users)
-    .values({ name: name.trim(), email: email.trim().toLowerCase(), passwordHash: await hashPassword(password) })
+    .values({
+      name: name.trim(),
+      email: email.trim().toLowerCase(),
+      passwordHash: await hashPassword(password),
+      passwordChangedAt: new Date(),
+    })
     .returning();
   await logTransaction(db, {
     userId: user.id,
@@ -90,7 +102,11 @@ export async function POST(req: NextRequest) {
     data: { new: { name: user.name, email: user.email } },
   });
 
-  const company = await createCompany(db, { name: (companyName.trim() || `${name}'s Company`), ownerId: user.id });
+  const company = await createCompany(db, {
+    name: companyName.trim() || `${name}'s Company`,
+    ownerId: user.id,
+    settings: { ...NEW_COMPANY_SETTINGS },
+  });
 
   const res = NextResponse.json({ id: user.id, name: user.name, email: user.email, companyId: company.id }, { status: 201 });
   const session = await startSession(db, {

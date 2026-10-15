@@ -30,6 +30,19 @@ import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import { HomeCurrencyAdjustmentHistory, HomeCurrencyAdjustmentModal } from './HomeCurrencyAdjustment';
+import FeatureOff from '@/components/FeatureOff';
+import { usePreferences } from '@/lib/usePreferences';
+import type { FeatureGate } from '@/lib/preferences';
+
+/** A2: shown instead of the list while Preferences > Multiple Currencies is off. */
+const MULTI_CURRENCY_OFF: FeatureGate = {
+  key: 'multiCurrencyEnabled' as FeatureGate['key'],
+  label: 'Multiple currencies',
+  category: 'Multiple Currencies',
+  setting: 'I use more than one currency',
+  pages: ['/currencies'],
+  apis: [],
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -341,6 +354,7 @@ function FxAdjustmentModal({
 // ---------------------------------------------------------------------------
 
 export default function CurrenciesPage() {
+  const prefs = usePreferences();
   const [currencies, setCurrencies] = useState<Currency[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -385,6 +399,8 @@ export default function CurrenciesPage() {
   }
 
   const baseCurrency = currencies.find((c) => c.isBase);
+
+  if (prefs.loaded && !prefs.company.multiCurrencyEnabled) return <FeatureOff gate={MULTI_CURRENCY_OFF} />;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">

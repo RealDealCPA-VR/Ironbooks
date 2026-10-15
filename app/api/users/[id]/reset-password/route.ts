@@ -30,7 +30,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const body = await req.json().catch(() => ({}));
     const parsed = resetPasswordSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    await resetUserPassword(ctx, id, parsed.data.password);
+    await resetUserPassword(ctx, id, parsed.data.password, { requireChange: parsed.data.requireChange });
     return NextResponse.json({ ok: true });
   } catch (err) {
     return errorResponse(err);

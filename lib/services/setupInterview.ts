@@ -25,6 +25,7 @@ import {
 import { companySettingsSchema } from '@/lib/validation/company';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { getCompany, updateCompany } from './company';
+import { hasForeignCurrencyData } from './multiCurrency';
 import { createAccount, listAccounts, setIncomeTaxForm, updateAccount } from './accounts';
 
 export type SetupInterviewStatus = 'done' | 'skipped';
@@ -140,6 +141,17 @@ export async function applySetupInterview(
     }
     if (plan.settings.payrollEnabled === true && plan.settings.payrollPayPeriod === undefined) {
       plan.summary = plan.summary.map((r) => (r.startsWith('Payroll: on') ? 'Payroll: on (your pay period is kept)' : r));
+    }
+
+    // A2 (gapsb): "No" to multiple currencies can't undo it once foreign-currency data exists
+    // (QB lock) — keep it on rather than failing the whole interview.
+    if (plan.settings.multiCurrencyEnabled === false && (await hasForeignCurrencyData(tx.db, tx.companyId, current))) {
+      delete plan.settings.multiCurrencyEnabled;
+      plan.summary = plan.summary.map((r) =>
+        r.startsWith('More than one currency:')
+          ? 'More than one currency: yes (kept on: this company already has foreign-currency records)'
+          : r,
+      );
     }
 
     // 1. Settings through the Preferences schema + updateCompany whitelist.
