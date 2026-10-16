@@ -6,7 +6,9 @@ _Status re-checked 2026-10-13 after the P0 and P1 rounds (release v1.1.0). The f
 
 _Re-checked 2026-10-13 against `main` after the P0 and P1 rounds (one read-only auditor per area). The 2026-10-12 audit figures are in brackets._
 
-**Original gaps:** 109. Done **71** (52) · partial **38** (46) · buggy **0** (9) · missing **0** (2).
+**Original gaps:** 109. Done **75** (52) · partial **34** (46) · buggy **0** (9) · missing **0** (2).
+
+_Updated 2026-10-15 after the Ironbooks UX round: I1 Accountant's Copy and I7 Period Copy were built, and B3, B12, G1 and C1 were completed. The per-area table below is the 2026-10-13 re-check._
 **New gaps from the audit (68) still open or only partly fixed:** P0 **0** (9) · P1 **3** (34) · P2 **18** (25).
 
 | Area | Done | Partial | Buggy | Missing | Open new gaps P0/P1/P2 |
