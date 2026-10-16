@@ -35,8 +35,43 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const DEACTIVATED_MESSAGE =
   'Your user account has been deactivated for this company. Contact your administrator.';
 
+/**
+ * FORBIDDEN message for a user whose every active company in this file has been archived
+ * (login route + lib/client.ts isAuthError + getPageContext match it).
+ */
+export const ARCHIVED_ONLY_MESSAGE =
+  'Every company you belong to in this file has been archived. Contact your administrator.';
+
+/** True when a company row's settings mark it archived (soft-deleted, settings.archived). */
+export function isArchivedCompany(settings: unknown): boolean {
+  return Boolean(
+    settings && typeof settings === 'object' && (settings as { archived?: unknown }).archived === true,
+  );
+}
+
 /** Header carrying the closing-date password for this request (QB Set Closing Date override). */
 export const CLOSING_PASSWORD_HEADER = 'x-closing-password';
+
+/**
+ * True when the request's Host header names a loopback host (localhost / 127.x / [::1], any
+ * port). No Host header (outside a request scope, scripts, tests) counts as loopback.
+ */
+export function isLoopbackHostHeader(host: string | null | undefined): boolean {
+  if (host === null || host === undefined) return true;
+  const h = host.trim().toLowerCase();
+  const name = h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.replace(/:\d*$/, '');
+  if (name === 'localhost' || name === '[::1]') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name);
+}
+
+async function requestHostIsLoopback(): Promise<boolean> {
+  try {
+    const h = await headers();
+    return isLoopbackHostHeader(h.get('host'));
+  } catch {
+    return true; // not inside a request (tests, scripts)
+  }
+}
 
 async function selectedCompanyCookie(): Promise<string | undefined> {
   try {
@@ -153,37 +188,31 @@ export async function getServerContext(): Promise<ServiceContext> {
     // allowPasswordChangeRequired; the gate refuses it on every other 'self' route).
     await assertPasswordChangeNotRequired(db, userId);
     // Only ACTIVE memberships select a company (deactivated users are locked out).
-    const active = and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true));
+    // Archived (soft-deleted) companies are never selected — not from a stale cookie, not as the
+    // fallback (lib/context isArchivedCompany; archiving lives in app/api/companies/[id]/manage.ts).
+    const activeRows = await db
+      .select({ companyId: userCompanies.companyId, settings: companies.settings })
+      .from(userCompanies)
+      .innerJoin(companies, eq(companies.id, userCompanies.companyId))
+      .where(and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true)));
+    const usable = activeRows.filter((r) => !isArchivedCompany(r.settings));
     const sel = await selectedCompanyCookie();
-    let companyId: string | undefined;
-    if (sel) {
-      const [m] = await db
-        .select({ companyId: userCompanies.companyId })
-        .from(userCompanies)
-        .where(and(active, eq(userCompanies.companyId, sel)));
-      if (m) companyId = sel;
-    }
+    let companyId: string | undefined =
+      (sel && usable.find((r) => r.companyId === sel)?.companyId) || usable[0]?.companyId;
     if (!companyId) {
-      const [m] = await db
-        .select({ companyId: userCompanies.companyId })
-        .from(userCompanies)
-        .where(active)
-        .limit(1);
-      companyId = m?.companyId;
-    }
-    if (!companyId) {
+      // Every active membership is in an archived company: no usable company in this file.
+      if (activeRows.length) throw new ServiceError('FORBIDDEN', ARCHIVED_ONLY_MESSAGE);
       const [anyMembership] = await db
         .select({ companyId: userCompanies.companyId })
         .from(userCompanies)
         .where(eq(userCompanies.userId, userId))
         .limit(1);
       if (anyMembership) throw new ServiceError('FORBIDDEN', DEACTIVATED_MESSAGE);
-      const [owned] = await db
-        .select({ id: companies.id })
+      const owned = await db
+        .select({ id: companies.id, settings: companies.settings })
         .from(companies)
-        .where(eq(companies.ownerId, userId))
-        .limit(1);
-      companyId = owned?.id;
+        .where(eq(companies.ownerId, userId));
+      companyId = owned.find((c) => !isArchivedCompany(c.settings))?.id;
     }
     if (companyId) {
       // Multi-user: while an admin holds single-user mode for this company, other sessions are refused.
@@ -223,6 +252,12 @@ export async function getServerContext(): Promise<ServiceContext> {
   // Requests from OTHER machines (through the multi-user host proxy) never get the first-run /
   // dev fallback — the host must be set up locally, with a real account, before it is shared.
   if ((await getRequestOrigin()).remote) {
+    throw new ServiceError('FORBIDDEN', 'Authentication required.');
+  }
+  // DNS-rebinding guard: a web page whose name resolves to 127.0.0.1 reaches this server with
+  // ITS host name in the Host header. The session-less owner fallback only answers requests
+  // addressed to a loopback host (the desktop shell and `next dev` use 127.0.0.1 / localhost).
+  if (!(await requestHostIsLoopback())) {
     throw new ServiceError('FORBIDDEN', 'Authentication required.');
   }
   const allowDevFallback = process.env.BKA_ALLOW_DEV_FALLBACK === '1';
@@ -271,7 +306,11 @@ export async function getPageContext(nextPath: string): Promise<ServiceContext> 
       if (/company file is locked/i.test(err.message)) {
         redirect('/unlock?next=' + encodeURIComponent(nextPath));
       }
-      if (err.message === 'Authentication required.' || err.message === DEACTIVATED_MESSAGE) {
+      if (
+        err.message === 'Authentication required.' ||
+        err.message === DEACTIVATED_MESSAGE ||
+        err.message === ARCHIVED_ONLY_MESSAGE
+      ) {
         redirect('/login?next=' + encodeURIComponent(nextPath));
       }
       if (err.message === PASSWORD_CHANGE_REQUIRED_MESSAGE) {

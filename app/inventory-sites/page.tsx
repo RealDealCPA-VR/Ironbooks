@@ -39,6 +39,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import {
   type AdjustmentFieldValues,
   EMPTY_ADJUSTMENT_FIELDS,
@@ -101,7 +102,7 @@ interface InvariantCheck {
 
 type Tab = 'sites' | 'adjust' | 'reorder' | 'check';
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 const errMsg = (err: unknown, fallback: string) => (err instanceof ApiError ? err.message : fallback);
 
 // ── Page ──────────────────────────────────────────────────────────────────────

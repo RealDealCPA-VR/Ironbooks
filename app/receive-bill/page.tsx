@@ -26,6 +26,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 
@@ -177,7 +178,7 @@ export default function ReceiveBillPage() {
   const [rows, setRows] = useState<Record<string, Row>>({});
   const [loading, setLoading] = useState(false);
   const [billNumber, setBillNumber] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [dueDate, setDueDate] = useState('');
   const [memo, setMemo] = useState('');
   const [preview, setPreview] = useState<Preview | null>(null);

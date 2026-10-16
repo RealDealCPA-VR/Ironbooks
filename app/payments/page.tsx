@@ -24,6 +24,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useNewParam } from '@/lib/useFocusParam';
@@ -245,7 +246,7 @@ interface ReceivePaymentModalProps {
 const JE_PREFIX = 'je:';
 
 function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accounts, prefillCustomerId = null }: ReceivePaymentModalProps) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayISO();
   const prefs = usePreferences();
   // Preferences > Payments: once the user edits one side by hand, stop recalculating it.
   const [amountTouched, setAmountTouched] = useState(false);
@@ -1286,7 +1287,7 @@ function BouncedCheckModal({
   onClose: () => void;
   onDone: () => void;
 }) {
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(todayISO());
   const [bankFee, setBankFee] = useState('');
   const [bankFeeAccountId, setBankFeeAccountId] = useState('');
   const [customerFee, setCustomerFee] = useState('');
@@ -1294,7 +1295,7 @@ function BouncedCheckModal({
   const [saving, setSaving] = useState(false);
   useEffect(() => {
     if (!payment) return;
-    setDate(new Date().toISOString().slice(0, 10));
+    setDate(todayISO());
     setBankFee('');
     setBankFeeAccountId('');
     setCustomerFee('');

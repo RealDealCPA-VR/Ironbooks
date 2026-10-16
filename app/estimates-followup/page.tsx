@@ -28,6 +28,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import { toDisplayDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,8 +57,13 @@ interface ExpiredSummary {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** The expiration day as local midnight (the API sends it as UTC midnight; lib/format.ts). */
+function expirationDay(dateStr: string): Date {
+  return toDisplayDate(dateStr) ?? new Date(NaN);
+}
+
 function daysUntil(dateStr: string): number {
-  const expDate = new Date(dateStr);
+  const expDate = expirationDay(dateStr);
   const now = new Date();
   now.setHours(0, 0, 0, 0);
   expDate.setHours(0, 0, 0, 0);
@@ -135,7 +141,7 @@ export default function EstimatesFollowupPage() {
         .filter((e) => {
           if (!e.expirationDate) return false;
           if (!actionable.includes(e.status)) return false;
-          const exp = new Date(e.expirationDate);
+          const exp = expirationDay(e.expirationDate);
           return exp <= cutoff30;
         })
         .map((e) => ({
@@ -151,7 +157,7 @@ export default function EstimatesFollowupPage() {
       setExpiring30(mapped);
       setExpiring7Days(
         mapped.filter((e) => {
-          const exp = new Date(e.expirationDate);
+          const exp = expirationDay(e.expirationDate);
           return exp <= cutoff7;
         }),
       );

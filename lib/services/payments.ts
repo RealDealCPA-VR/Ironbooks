@@ -2189,6 +2189,13 @@ export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInp
   // date (a refund backdated before applies / later refunds entered earlier), and dated plugs
   // (postPaymentCreditFxPlugs) re-telescope the later steps, so A/R equals the aging on every date.
   const refundDate = input.date ?? new Date();
+  // The credit only exists from the payment's date: a refund dated earlier would debit A/R on
+  // days when the customer held no credit (A/R and the aging would disagree in between).
+  if (ymd(refundDate) < ymd(payment.date)) {
+    throw validation(
+      `The refund date (${ymd(refundDate)}) is before the payment date (${ymd(payment.date)}). Date the refund on or after the payment.`,
+    );
+  }
   const todayAmount = Money.round2(homeAt(unapplied, rate).minus(homeAt(Money.round2(unapplied.minus(amount)), rate)));
   let baseAmount = todayAmount;
   if (!rate.equals(1)) {

@@ -19,7 +19,10 @@ import {
   customers,
   journalEntries,
   journalEntryLines,
+  paycheckLines,
+  paychecks,
   paymentChecks,
+  payrollItems,
   paymentsReceived,
   taxAgencies,
   vendors,
@@ -31,6 +34,7 @@ import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
 import { assertClosedPeriodEdit } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import { getPreferences } from './company';
+import { accountFitsKind } from './prefAccounts';
 import {
   type SalesTaxBasis,
   type SalesTaxDueRow,
@@ -84,6 +88,83 @@ async function creditBalance(ctx: ServiceContext, accountId: string): Promise<st
   // Credit-normal: natural balance = credit - debit
   const net = Money.sub(row.totalCredit, row.totalDebit);
   return toAmountString(net);
+}
+
+// ── Payroll liability accounts (shared with paycheck posting and the payroll forms) ─────────
+
+/**
+ * The default account paychecks credit withholdings to — the same rule as runPaycheck: the
+ * Preferences payroll liabilities account when it is set, active and of the right kind, else
+ * 2300 Payroll Liabilities.
+ */
+export async function defaultPayrollLiabilityAccountId(ctx: ServiceContext): Promise<string> {
+  const prefs = await getPreferences(ctx);
+  const preferredId = prefs.payrollLiabilityAccountId ?? null;
+  if (preferredId && UUID_RE.test(preferredId)) {
+    const [row] = await ctx.db
+      .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, code: accounts.code, isActive: accounts.isActive })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, preferredId)));
+    if (row?.isActive && accountFitsKind(row, 'payroll_liability')) return row.id;
+  }
+  return accountIdByCode(ctx, CODE_PAYROLL_LIABILITIES);
+}
+
+/**
+ * Every account a paycheck can credit a payroll liability to: 2300, the Preferences payroll
+ * liabilities account, and each payroll item's liability account.
+ */
+export async function payrollLiabilityAccountIds(ctx: ServiceContext): Promise<string[]> {
+  const ids = new Set<string>();
+  const [base] = await ctx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, CODE_PAYROLL_LIABILITIES)));
+  if (base) ids.add(base.id);
+  try {
+    ids.add(await defaultPayrollLiabilityAccountId(ctx));
+  } catch {
+    /* no 2300 and no preferred account */
+  }
+  const itemAccts = await ctx.db
+    .select({ id: payrollItems.liabilityAccountId })
+    .from(payrollItems)
+    .where(eq(payrollItems.companyId, ctx.companyId));
+  for (const i of itemAccts) if (i.id) ids.add(i.id);
+  return [...ids];
+}
+
+/** Strip a "(…)" suffix ("State Withholding (CA)" → "State Withholding"), as the balances report does. */
+function liabilityBaseName(name: string): string {
+  return name.replace(/\s*\(.*\)\s*$/, '').trim().toLowerCase();
+}
+
+/**
+ * The account an itemized liability payment relieves: the liability account of the payroll item
+ * the paychecks credited for this item name (the item named so, else the item on the latest
+ * paycheck line of that name), otherwise the default payroll liabilities account.
+ */
+async function liabilityAccountForItem(ctx: ServiceContext, name: string, fallbackId: string): Promise<string> {
+  const key = liabilityBaseName(name);
+  const items = await ctx.db
+    .select({ id: payrollItems.id, name: payrollItems.name, liabilityAccountId: payrollItems.liabilityAccountId })
+    .from(payrollItems)
+    .where(eq(payrollItems.companyId, ctx.companyId));
+  const named = items.find((i) => i.liabilityAccountId && liabilityBaseName(i.name) === key);
+  if (named?.liabilityAccountId) return named.liabilityAccountId;
+  const itemIds = items.filter((i) => i.liabilityAccountId).map((i) => i.id);
+  if (itemIds.length) {
+    const lines = await ctx.db
+      .select({ name: paycheckLines.name, itemId: paycheckLines.payrollItemId, payDate: paychecks.payDate })
+      .from(paycheckLines)
+      .innerJoin(paychecks, eq(paycheckLines.paycheckId, paychecks.id))
+      .where(and(eq(paychecks.companyId, ctx.companyId), inArray(paycheckLines.payrollItemId, itemIds)))
+      .orderBy(desc(paychecks.payDate));
+    const hit = lines.find((l) => liabilityBaseName(l.name) === key);
+    const acct = hit && items.find((i) => i.id === hit.itemId)?.liabilityAccountId;
+    if (acct) return acct;
+  }
+  return fallbackId;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -742,7 +823,9 @@ export async function payPayrollLiabilities(
   ctx: ServiceContext,
   input: PayPayrollLiabilitiesInput,
 ) {
-  const payrollAccountId = await accountIdByCode(ctx, CODE_PAYROLL_LIABILITIES);
+  // Relieve the account(s) the paychecks credited (Preferences account / item accounts), not
+  // always 2300 — otherwise the real liability never clears and 2300 goes negative.
+  const payrollAccountId = await defaultPayrollLiabilityAccountId(ctx);
   const items = input.items ?? [];
 
   // ── Itemized payment ──────────────────────────────────────────────────────
@@ -768,7 +851,7 @@ export async function payPayrollLiabilities(
       }
       total = total.plus(amt);
       debitLines.push({
-        accountId: payrollAccountId,
+        accountId: await liabilityAccountForItem(ctx, name, payrollAccountId),
         debit: toAmountString(amt),
         memo: name,
       });
@@ -914,12 +997,16 @@ export async function salesTaxDue(ctx: ServiceContext): Promise<string> {
 }
 
 /**
- * Current credit balance of account 2300 (Payroll Liabilities).
+ * Current credit balance of the payroll liability accounts (2300, the Preferences payroll
+ * liabilities account and every payroll item's liability account — wherever paychecks credit).
  * A positive number means the company owes that amount in payroll taxes/withholdings.
  */
 export async function payrollLiabilitiesDue(ctx: ServiceContext): Promise<string> {
-  const accountId = await accountIdByCode(ctx, CODE_PAYROLL_LIABILITIES);
-  return creditBalance(ctx, accountId);
+  const ids = await payrollLiabilityAccountIds(ctx);
+  if (!ids.length) await accountIdByCode(ctx, CODE_PAYROLL_LIABILITIES); // same error as before
+  let total = Money.zero();
+  for (const id of ids) total = total.plus(Money.of(await creditBalance(ctx, id)));
+  return toAmountString(total);
 }
 
 // ── Sales tax by agency (QB Pay Sales Tax grid) ──────────────────────────────

@@ -157,9 +157,10 @@ function appliedText(a: Applied): string {
   return parts.join(', ');
 }
 
+/** Last day of the month before the current LOCAL month (UTC month flipped early west of UTC). */
 function lastMonthEnd(): string {
   const d = new Date();
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 0)).toISOString().slice(0, 10);
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), 0)).toISOString().slice(0, 10);
 }
 
 function statusLabel(r: CopyRow): { text: string; tone: 'success' | 'warning' | 'neutral' | 'info' } {

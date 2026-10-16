@@ -45,6 +45,7 @@ import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -265,7 +266,7 @@ function ExpensesPageContent() {
   );
   const [payeeName, setPayeeName] = useState('');
   const [paymentAccountId, setPaymentAccountId] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   /** The user typed a date on this new entry (smart default dates leave it alone then). */
   const dateTouched = useRef(false);
   /** Bumped after each save so the next check number is looked up again. */

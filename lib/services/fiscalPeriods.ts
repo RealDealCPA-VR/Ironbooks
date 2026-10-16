@@ -96,6 +96,11 @@ export async function assertPeriodOpen(
   // Accountant's Copy dividing date (I1): checked first — the closing-date password never bypasses it.
   await assertDividingDateOpen(ctx, date, opts);
   const movable = opts.movable !== false;
+  // Calendar-day comparison (UTC, like the closing-date check below): a period closed through
+  // 12-31 is stored at 12-31T00:00Z, and a posting at 12-31T23:59:59Z (the year-end closing entry,
+  // anything dated with a time of day) is still on that closed day.
+  const dayStart = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayEnd = new Date(dayStart.getTime() + 86_400_000 - 1);
   const closed = await ctx.db
     .select({ id: fiscalPeriods.id })
     .from(fiscalPeriods)
@@ -103,8 +108,8 @@ export async function assertPeriodOpen(
       and(
         eq(fiscalPeriods.companyId, ctx.companyId),
         eq(fiscalPeriods.isClosed, true),
-        lte(fiscalPeriods.periodStart, date),
-        gte(fiscalPeriods.periodEnd, date),
+        lte(fiscalPeriods.periodStart, dayEnd),
+        gte(fiscalPeriods.periodEnd, dayStart),
       ),
     )
     .limit(1);

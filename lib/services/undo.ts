@@ -413,6 +413,21 @@ function billPaymentInput(s: Snap): PayBillsInput {
   const journal = arr(s.journalApplications);
   const apps = arr(s.applications);
   const discount = isZero(s.discountTotal) ? null : String(s.discountTotal);
+  if (discount) {
+    // Each application's amountApplied is the full settlement (cash + discount), and the discount
+    // is known only as one total (from the GL, in home currency). It can be given back exactly
+    // only for a single home-currency bill; never guess a split.
+    const rate = num(s.exchangeRate);
+    const foreign = !!str(s.currency) && rate !== null && !Money.of(rate).equals(1);
+    if (apps.length !== 1 || foreign) {
+      throw new ServiceError(
+        'CONFLICT',
+        apps.length !== 1
+          ? `Can't undo: this bill payment took an early-payment discount across ${apps.length} bills, and the discount can't be split back onto each bill exactly. Open the payment to change it by hand.`
+          : `Can't undo: this bill payment took an early-payment discount in a foreign currency, which can't be re-entered exactly. Open the payment to change it by hand.`,
+      );
+    }
+  }
   return {
     vendorId: reqStr(s.vendorId),
     date: reqDate(s.date),
@@ -420,11 +435,11 @@ function billPaymentInput(s: Snap): PayBillsInput {
     reference: str(s.reference),
     paymentAccountId: reqStr(s.paymentAccountId),
     discountAccountId: discount ? str(s.discountAccountId) : null,
-    // Discounts are stored as one total on the entry; it goes back on the first bill.
-    applications: apps.map((a, i) => ({
+    // A discounted payment has exactly one bill here (checked above): cash = settled − discount.
+    applications: apps.map((a) => ({
       billId: String(a.billId),
-      amountApplied: String(a.amountApplied),
-      ...(i === 0 && discount ? { discountTaken: discount } : {}),
+      amountApplied: discount ? Money.of(String(a.amountApplied)).minus(discount).toFixed(2) : String(a.amountApplied),
+      ...(discount ? { discountTaken: discount } : {}),
     })),
     toPrint: bool(s.toPrint),
     exchangeRate: num(s.exchangeRate),

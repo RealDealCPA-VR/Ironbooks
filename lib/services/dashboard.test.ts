@@ -245,7 +245,7 @@ describe('Dashboard insights (getDashboardInsights)', () => {
     expect(d.kpis.revenueYtd).toBe('1500.00'); // 500 (Apr) + 1000 (Jun); Dec 2025 excluded
     expect(d.kpis.netProfitYtd).toBe('1300.00'); // 1500 - 200
     expect(d.kpis.cash).toBe('1350.00'); // all-time checking balance: 50 + 500 + 1000 - 200
-    expect(new Date(d.kpis.ytdFrom).getFullYear()).toBe(2026);
+    expect(new Date(d.kpis.ytdFrom).getUTCFullYear()).toBe(2026); // UTC-midnight bound
   });
 
   it('summarizes A/R aging buckets', async () => {

@@ -223,8 +223,12 @@ export async function memorizeSuggestion(ctx: ServiceContext, input: MemorizeInp
       paymentAccountId: e.paymentAccountId,
       memo: e.memo,
       // Check numbers come from the sequence at run time — never reuse the old one.
+      // Item lines keep the item (stock is received on every run); the item routes the account.
       lines: e.lines.map((l) => ({
-        accountId: l.accountId,
+        accountId: l.itemId ? null : l.accountId,
+        itemId: l.itemId ?? null,
+        quantity: l.itemId ? l.quantity : null,
+        unitCost: l.itemId ? l.unitCost : null,
         description: l.description,
         amount: l.amount,
         classId: l.classId,

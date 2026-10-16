@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Button, Card, Input, Label, Modal, Table, Th, Td, Tr, Badge, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatDate } from '@/lib/dates';
+import { formatDate, todayISO } from '@/lib/dates';
 
 interface CurrencyLite {
   code: string;
@@ -68,7 +68,7 @@ export function HomeCurrencyAdjustmentModal({
   currencies: CurrencyLite[];
 }) {
   const foreign = currencies.filter((c) => !c.isBase);
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [rates, setRates] = useState<Record<string, string>>({});
   const [memo, setMemo] = useState('');
   const [preview, setPreview] = useState<HcaPreview | null>(null);

@@ -42,7 +42,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
-import { formatDate } from '@/lib/dates';
+import { formatDate, todayISO } from '@/lib/dates';
 import Decimal from 'decimal.js';
 
 // ---------------------------------------------------------------------------
@@ -150,7 +150,7 @@ export default function PayRunsPage() {
   const [runs, setRuns] = useState<PayRunSummary[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const [payDate, setPayDate] = useState(new Date().toISOString().slice(0, 10));
+  const [payDate, setPayDate] = useState(todayISO());
   const [periodStart, setPeriodStart] = useState('');
   const [periodEnd, setPeriodEnd] = useState('');
   const [memo, setMemo] = useState('');

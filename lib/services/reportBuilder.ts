@@ -58,10 +58,13 @@ export async function runReport(
     conds.push(sql`${journalEntries.date} >= ${fromDate}`);
   }
   if (config.to) {
+    // Include the whole to-day: the end of that UTC calendar day (stored dates are UTC; a
+    // local-time setHours ended the day hours early west of UTC, dropping e.g. the 23:59:59Z
+    // year-end closing entry).
     const toDate = new Date(config.to);
-    // include the whole to-day by going to end-of-day
-    const toEnd = new Date(toDate);
-    toEnd.setHours(23, 59, 59, 999);
+    const toEnd = new Date(
+      Date.UTC(toDate.getUTCFullYear(), toDate.getUTCMonth(), toDate.getUTCDate() + 1) - 1,
+    );
     conds.push(sql`${journalEntries.date} <= ${toEnd}`);
   }
 

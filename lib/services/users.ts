@@ -17,6 +17,7 @@ import { and, eq } from 'drizzle-orm';
 import { companies, companyRoles, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
 import { hashPassword } from '@/lib/auth';
 import { assertPasswordAllowed, storeUserPassword } from './passwordPolicy';
+import { endUserSessions } from './sessions';
 import {
   ADMIN_ROLE_KEY,
   BUILTIN_ROLES,
@@ -466,6 +467,15 @@ export async function resetUserPassword(
   await assertPasswordAllowed(ctx.db, password, { userId });
   await inTransaction(ctx, async (tx) => {
     await storeUserPassword(tx.db, userId, password, { mustChange: opts.requireChange === true });
+    // Whoever held the old password is signed out everywhere (also releases any single-user
+    // hold of those sessions) — same as the self-service reset and change-password routes.
+    // An Admin resetting their own password keeps the session they did it from.
+    await endUserSessions(
+      tx.db,
+      userId,
+      'password_reset',
+      ctx.userId === userId ? ctx.sessionId : undefined,
+    );
     await writeAudit(tx, {
       action: 'update',
       entityType: 'user',

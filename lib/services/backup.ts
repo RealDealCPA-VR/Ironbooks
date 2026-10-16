@@ -11,7 +11,7 @@ import AdmZip from 'adm-zip';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { eq, getTableColumns } from 'drizzle-orm';
+import { eq, getTableColumns, getTableName } from 'drizzle-orm';
 import {
   resolveDataDir,
   closeDb,
@@ -56,6 +56,12 @@ import {
   homeCurrencyAdjustments, vendorCreditApplications, paymentFxReliefs,
   // month-end close
   monthEndCloses,
+  // wave2 lists + other company-scoped tables (company restore coverage)
+  billingRateLevelItems, billingRateLevels, customerMessages, customerTypes, entityNotes,
+  formTemplates, itemReceiptBillLines, jobTypes, leads, letterTemplates, listSeeds,
+  memorizedReportGroups, otherNames, payRuns, paymentMethods, paymentTerms, payrollItems,
+  priceLevelItems, priceLevels, priceRules, qbGlImports, receiptScans, reportSchedules,
+  salesTaxCodes, shipViaMethods, todoItems, todos, uomSetUnits, uomSets, vehicles, vendorTypes,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewrite } from './posting';
@@ -589,6 +595,31 @@ interface CompanyTableSpec {
 const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'accounts', table: accounts, joins: [], companyCol: accounts.companyId, selfParentKey: 'parentId' },
   { name: 'classes', table: classes, joins: [], companyCol: classes.companyId, selfParentKey: 'parentId' },
+  // Lists referenced by customers / vendors / employees / items / jobs / expenses / paychecks /
+  // mileage logs / memorized reports, so they are inserted first.
+  { name: 'paymentTerms', table: paymentTerms, joins: [], companyCol: paymentTerms.companyId },
+  { name: 'salesTaxCodes', table: salesTaxCodes, joins: [], companyCol: salesTaxCodes.companyId },
+  { name: 'billingRateLevels', table: billingRateLevels, joins: [], companyCol: billingRateLevels.companyId },
+  { name: 'customerTypes', table: customerTypes, joins: [], companyCol: customerTypes.companyId, selfParentKey: 'parentId' },
+  { name: 'vendorTypes', table: vendorTypes, joins: [], companyCol: vendorTypes.companyId, selfParentKey: 'parentId' },
+  { name: 'jobTypes', table: jobTypes, joins: [], companyCol: jobTypes.companyId, selfParentKey: 'parentId' },
+  { name: 'paymentMethods', table: paymentMethods, joins: [], companyCol: paymentMethods.companyId },
+  { name: 'shipViaMethods', table: shipViaMethods, joins: [], companyCol: shipViaMethods.companyId },
+  { name: 'customerMessages', table: customerMessages, joins: [], companyCol: customerMessages.companyId },
+  { name: 'priceLevels', table: priceLevels, joins: [], companyCol: priceLevels.companyId },
+  { name: 'priceRules', table: priceRules, joins: [], companyCol: priceRules.companyId },
+  { name: 'uomSets', table: uomSets, joins: [], companyCol: uomSets.companyId },
+  { name: 'uomSetUnits', table: uomSetUnits, joins: [], companyCol: uomSetUnits.companyId },
+  { name: 'vehicles', table: vehicles, joins: [], companyCol: vehicles.companyId },
+  { name: 'otherNames', table: otherNames, joins: [], companyCol: otherNames.companyId },
+  { name: 'payrollItems', table: payrollItems, joins: [], companyCol: payrollItems.companyId },
+  { name: 'payRuns', table: payRuns, joins: [], companyCol: payRuns.companyId },
+  { name: 'memorizedReportGroups', table: memorizedReportGroups, joins: [], companyCol: memorizedReportGroups.companyId },
+  { name: 'formTemplates', table: formTemplates, joins: [], companyCol: formTemplates.companyId },
+  { name: 'letterTemplates', table: letterTemplates, joins: [], companyCol: letterTemplates.companyId },
+  // "Defaults already seeded" markers ("<companyId>:<list>", remapped below), so default list
+  // entries the user deleted are not re-seeded in the restored company.
+  { name: 'listSeeds', table: listSeeds, joins: [], companyCol: listSeeds.companyId },
   { name: 'locations', table: locations, joins: [], companyCol: locations.companyId },
   { name: 'customers', table: customers, joins: [], companyCol: customers.companyId, selfParentKey: 'parentId' },
   { name: 'vendors', table: vendors, joins: [], companyCol: vendors.companyId },
@@ -602,6 +633,9 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'items', table: items, joins: [], companyCol: items.companyId },
   { name: 'assemblyComponents', table: assemblyComponents, joins: [], companyCol: assemblyComponents.companyId },
   { name: 'customerPrices', table: customerPrices, joins: [], companyCol: customerPrices.companyId },
+  { name: 'priceLevelItems', table: priceLevelItems, joins: [], companyCol: priceLevelItems.companyId },
+  { name: 'billingRateLevelItems', table: billingRateLevelItems, joins: [], companyCol: billingRateLevelItems.companyId },
+  { name: 'leads', table: leads, joins: [], companyCol: leads.companyId },
   { name: 'inventoryLayers', table: inventoryLayers, joins: [], companyCol: inventoryLayers.companyId },
   { name: 'journalEntries', table: journalEntries, joins: [], companyCol: journalEntries.companyId },
   {
@@ -726,6 +760,8 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
     name: 'itemReceiptLines', table: itemReceiptLines, companyCol: itemReceipts.companyId,
     joins: [{ table: itemReceipts, on: [itemReceiptLines.itemReceiptId, itemReceipts.id] }],
   },
+  // Which item-receipt lines a bill has picked up (after bills and item receipt lines).
+  { name: 'itemReceiptBillLines', table: itemReceiptBillLines, joins: [], companyCol: itemReceiptBillLines.companyId },
   { name: 'pendingBuilds', table: pendingBuilds, joins: [], companyCol: pendingBuilds.companyId },
   { name: 'inventorySites', table: inventorySites, joins: [], companyCol: inventorySites.companyId },
   { name: 'inventoryBins', table: inventoryBins, joins: [], companyCol: inventoryBins.companyId },
@@ -767,14 +803,93 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'clientReviewTasks', table: clientReviewTasks, joins: [], companyCol: clientReviewTasks.companyId },
   // month-end close: review progress per period (drizzle/0051_monthend.sql)
   { name: 'monthEndCloses', table: monthEndCloses, joins: [], companyCol: monthEndCloses.companyId },
+  // Notes, to-dos, report schedules, GL-import history and the receipt-scan inbox (after
+  // everything they can point at).
+  { name: 'entityNotes', table: entityNotes, joins: [], companyCol: entityNotes.companyId },
+  { name: 'todos', table: todos, joins: [], companyCol: todos.companyId },
+  { name: 'todoItems', table: todoItems, joins: [], companyCol: todoItems.companyId },
+  { name: 'reportSchedules', table: reportSchedules, joins: [], companyCol: reportSchedules.companyId },
+  { name: 'qbGlImports', table: qbGlImports, joins: [], companyCol: qbGlImports.companyId },
+  { name: 'receiptScans', table: receiptScans, joins: [], companyCol: receiptScans.companyId },
 ];
+
+/** SQL names of the tables a per-company backup carries (coverage guard test). */
+export const COMPANY_BACKUP_TABLE_NAMES: string[] = COMPANY_TABLES.map((t) => getTableName(t.table));
+
+/**
+ * Company-scoped tables deliberately NOT carried by a per-company backup, each with its reason.
+ * lib/services/data.review.test.ts fails when a company-scoped table is in neither list.
+ */
+export const COMPANY_BACKUP_EXCLUDED_TABLES: Record<string, string> = {
+  user_companies: 'users are machine-local; the restoring user becomes the sole owner',
+  user_role_assignments: 'users are machine-local; their role assignments cannot follow them',
+  user_preferences: 'per-user UI preferences of machine-local users',
+  user_sessions: 'login sessions are machine-local and must never travel',
+  attention_item_states: 'per-user dismiss/snooze state of machine-local users',
+  undo_actions: 'session undo stack; restored rows get new ids, so old undo actions are invalid',
+  backup_log: 'backup history of the source machine',
+  receipt_upload_tokens: 'short-lived phone-upload tokens; must not be replayable elsewhere',
+  accountant_copies: "Accountant's Copy transfer state belongs to the source file",
+  ai_settings: 'AI provider config holds API keys encrypted with a machine-local key',
+  ai_categorizer_models: 'learned categorizer cache, rebuilt from use',
+  ai_proposals: 'pending AI suggestion queue (ephemeral, regenerated)',
+  ai_auto_applied: 'AI auto-apply undo log keyed to bank-feed rows of the source session',
+  bank_categorization_history: 'bank-feed learning history (derived, rebuilt from use)',
+  bank_rule_dismissals: 'bank-feed "do not suggest" learning state (derived, rebuilt from use)',
+  client_review_snapshots: 'balances keyed by account id; restore remaps ids, so a snapshot would misreport',
+};
 
 /**
  * Opaque "soft pointer" columns: they may name rows that are not exported (users, the company
  * itself, deleted records), so they are remapped when possible and otherwise kept verbatim —
  * never treated as a hard foreign key.
  */
-const SOFT_REF_KEYS: Record<string, Set<string>> = { auditLogs: new Set(['entityId']) };
+const SOFT_REF_KEYS: Record<string, Set<string>> = {
+  auditLogs: new Set(['entityId']),
+  // Polymorphic "attached to" pointers: remapped when the target is in the backup, else kept.
+  entityNotes: new Set(['entityId']),
+  todos: new Set(['entityId']),
+  todoItems: new Set(['entityId']),
+  receiptScans: new Set(['txnId']),
+};
+
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+/**
+ * Remap ids embedded in text / JSON values: `*_ref` source links ("invoice-cogs:<id>",
+ * "deposit:<id>"), deposit-line markers ("salesReceipt:<id>", "cashback:<accountId>" and any other
+ * "<prefix>:<id>" convention), recurring-template / memorized-report JSON, company settings, the
+ * list-seed marker "<companyId>:<list>". Only uuids that are ids of exported rows (or the source
+ * company id) are rewritten — they are random v4 uuids, so a match can only be one of this
+ * backup's own ids. Anything else is left verbatim.
+ */
+function remapEmbeddedIds(
+  v: unknown,
+  idMap: Map<string, string>,
+  oldCompanyId?: string,
+  newCompanyId?: string,
+): unknown {
+  if (typeof v === 'string') {
+    if (v.length < 36) return v;
+    return v.replace(UUID_RE, (m) => {
+      const k = m.toLowerCase();
+      const mapped = idMap.get(k) ?? idMap.get(m);
+      if (mapped) return mapped;
+      if (oldCompanyId && newCompanyId && k === oldCompanyId.toLowerCase()) return newCompanyId;
+      return m;
+    });
+  }
+  if (Array.isArray(v)) return v.map((x) => remapEmbeddedIds(x, idMap, oldCompanyId, newCompanyId));
+  if (v && typeof v === 'object' && !(v instanceof Date)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      out[remapEmbeddedIds(k, idMap, oldCompanyId, newCompanyId) as string] =
+        remapEmbeddedIds(x, idMap, oldCompanyId, newCompanyId);
+    }
+    return out;
+  }
+  return v;
+}
 
 /** Columns that reference users.id — users are NOT exported, so on restore these map to the restoring user. */
 const USER_REF_KEYS = new Set([
@@ -960,6 +1075,10 @@ function reviveRow(
         } else {
           v = null; // optional dangling link (e.g. soft pointer) — drop it
         }
+      } else if (col.columnType !== 'PgUUID' && (typeof v === 'string' || col.dataType === 'json')) {
+        // Ids embedded in text / JSON (source refs, deposit-line markers, template JSON, the
+        // list-seed marker) follow the remap too.
+        v = remapEmbeddedIds(v, idMap, oldCompanyId, newCompanyId);
       }
     }
     out[key] = v;
@@ -1026,7 +1145,7 @@ export async function restoreCompanyBackup(
       .values({
         name,
         ownerId: opts.ownerId,
-        settings: (data.company.settings ?? null) as never,
+        settings: (remapEmbeddedIds(data.company.settings ?? null, idMap) ?? null) as never,
       })
       .returning();
     await tx

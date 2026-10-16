@@ -27,7 +27,7 @@ import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
-import { formatDate } from '@/lib/dates';
+import { formatDate, todayISO } from '@/lib/dates';
 import { useNewParam } from '@/lib/useFocusParam';
 // wave2 prefs: Checking > default account for Make Deposits; date warnings
 import { usePreferences } from '@/lib/usePreferences';
@@ -37,7 +37,11 @@ import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { amountMessage, collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
 
 /** Body sent to /api/deposits (fix patches address its paths, e.g. "paymentIds", "depositAccountId"). */
-type DepositBody = Record<string, unknown> & { paymentIds: string[]; salesReceiptIds: string[] };
+type DepositBody = Record<string, unknown> & {
+  paymentIds: string[];
+  salesReceiptIds: string[];
+  invoicePaymentIds?: string[];
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,7 +58,8 @@ interface Account {
 
 interface UndepositedItem {
   id: string;
-  kind: 'payment' | 'sales_receipt';
+  /** invoice_payment = payment-item lines recorded on an invoice (id = the invoice). */
+  kind: 'payment' | 'sales_receipt' | 'invoice_payment';
   customerId: string | null;
   customerName: string | null;
   date: string;
@@ -102,6 +107,7 @@ function emptyExtraLine(): ExtraLine {
 }
 
 const RECEIPT_PREFIX = 'salesReceipt:';
+const INVOICE_PAYMENT_PREFIX = 'invoicePayment:';
 const CASHBACK_PREFIX = 'cashback:';
 
 /** A saved deposit loaded into the modal for editing. */
@@ -144,6 +150,17 @@ function depositToEdit(dep: Deposit): DepositEdit {
         customerName: 'Already on this deposit',
         date: dep.date,
         method: 'sales receipt',
+        reference: null,
+        amount: l.amount,
+      });
+    } else if (desc.startsWith(INVOICE_PAYMENT_PREFIX)) {
+      items.push({
+        id: desc.slice(INVOICE_PAYMENT_PREFIX.length),
+        kind: 'invoice_payment',
+        customerId: null,
+        customerName: 'Already on this deposit',
+        date: dep.date,
+        method: 'invoice payment',
         reference: null,
         amount: l.amount,
       });
@@ -205,7 +222,7 @@ function MakeDepositModal({
   const [fxRate, setFxRate] = useState('');
   const money = (v: string | number) => formatCurrency(v, depCur ?? undefined);
   const prefs = usePreferences();
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [memo, setMemo] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [methodFilter, setMethodFilter] = useState('all');
@@ -225,7 +242,7 @@ function MakeDepositModal({
       setDepositAccountId(
         editing ? (editing.depositAccountId ?? '') : def && bankAccounts.some((a) => a.id === def) ? def : '',
       );
-      setDate(editing?.date ?? new Date().toISOString().slice(0, 10));
+      setDate(editing?.date ?? todayISO());
       setMemo(editing?.memo ?? '');
       setSelectedIds(new Set(editing?.items.map((i) => i.id) ?? []));
       setMethodFilter('all');
@@ -321,7 +338,7 @@ function MakeDepositModal({
       else if (op.path === 'cashBack' && value == null) {
         setCashBackAccountId('');
         setCashBackAmount('');
-      } else if (op.op === 'pull' && (op.path === 'paymentIds' || op.path === 'salesReceiptIds')) {
+      } else if (op.op === 'pull' && (op.path === 'paymentIds' || op.path === 'salesReceiptIds' || op.path === 'invoicePaymentIds')) {
         const removed = String(op.value);
         setSelectedIds((prev) => {
           const next = new Set(prev);
@@ -370,6 +387,9 @@ function MakeDepositModal({
     const salesReceiptIds = undepositedItems
       .filter((p) => p.kind === 'sales_receipt' && selectedIds.has(p.id))
       .map((p) => p.id);
+    const invoicePaymentIds = undepositedItems
+      .filter((p) => p.kind === 'invoice_payment' && selectedIds.has(p.id))
+      .map((p) => p.id);
 
     {
       const body: DepositBody = {
@@ -377,6 +397,7 @@ function MakeDepositModal({
         date,
         paymentIds,
         salesReceiptIds,
+        invoicePaymentIds,
         extraLines: extraLines.map((l) => ({
           accountId: l.accountId,
           amount: l.amount,
@@ -580,7 +601,11 @@ function MakeDepositModal({
                           {p.customerName ?? p.customerId ?? 'No customer'}
                           <span className="ml-2 inline-block">
                             <Badge tone={p.kind === 'sales_receipt' ? 'info' : 'neutral'}>
-                              {p.kind === 'sales_receipt' ? 'Sales Receipt' : 'Payment'}
+                              {p.kind === 'sales_receipt'
+                                ? 'Sales Receipt'
+                                : p.kind === 'invoice_payment'
+                                  ? 'Invoice Payment'
+                                  : 'Payment'}
                             </Badge>
                           </span>
                         </span>

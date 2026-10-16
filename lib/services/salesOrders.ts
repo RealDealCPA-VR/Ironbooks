@@ -35,6 +35,7 @@ import {
 } from './_base';
 import { createInvoice, shippingColumns } from './invoices';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { SalesLineTotals, salesLineKind } from './salesLineKinds';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
@@ -133,38 +134,62 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
     input.lines,
   );
 
-  let subtotal = Money.zero();
-  let taxableSubtotal = Money.zero();
+  // Item types: same discount / subtotal / sales-tax semantics as the invoice it becomes.
+  const itemIds = [...new Set(pricedLines.map((l) => l.itemId).filter((x): x is string => !!x))];
+  const itemTypes = new Map<string, string>();
+  if (itemIds.length > 0) {
+    const rows = await ctx.db
+      .select({ id: items.id, type: items.type })
+      .from(items)
+      .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)));
+    for (const r of rows) itemTypes.set(r.id, r.type);
+  }
+
+  const totals = new SalesLineTotals();
   const computedLines: ComputedLine[] = [];
 
   for (let i = 0; i < pricedLines.length; i++) {
     const l = pricedLines[i];
+    const kind = salesLineKind(l.itemId ? itemTypes.get(l.itemId) : null, i + 1, 'sales order');
+    if (kind === 'subtotal') {
+      // Non-posting: the sum of the body lines above it, excluded from every total.
+      const sub = totals.takeSubtotal();
+      computedLines.push({
+        itemId: l.itemId ?? null,
+        description: l.description ?? 'Subtotal',
+        quantity: '1.0000',
+        rate: sub,
+        amount: sub,
+        taxable: false,
+        lineOrder: i,
+        pricing: null,
+      });
+      continue;
+    }
     // Quantity and rate are stored at 4 decimals (the column scale); compute the
     // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
     const qty = Money.of(l.quantity).toDecimalPlaces(4);
     const rate = Money.of(l.rate).toDecimalPlaces(4);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
-    if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
+    if (kind !== 'discount' && rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
 
-    const amount = Money.round2(Money.mul(qty, rate));
-    subtotal = subtotal.plus(amount);
-    const taxable = input.lines[i].taxable !== false;
-    if (taxable) taxableSubtotal = taxableSubtotal.plus(amount);
+    const added = totals.addLine(kind, Money.round2(Money.mul(qty, rate)), input.lines[i].taxable !== false);
 
     computedLines.push({
       itemId: l.itemId ?? null,
       description: l.description ?? null,
       quantity: qty.toFixed(4),
       rate: rate.toFixed(4),
-      amount: toAmountString(amount),
-      taxable,
+      amount: toAmountString(added.amount),
+      taxable: added.taxable,
       lineOrder: i,
-      pricing: l.pricing,
+      pricing: kind === 'income' ? l.pricing : null,
     });
   }
 
-  // Sales tax — identical to the invoice computation: taxableSubtotal * rate, 2dp.
-  const taxAmount = Money.round2(Money.mul(taxableSubtotal, taxRateDecimal));
+  // Sales tax — identical to the invoice computation: taxableSubtotal * rate, 2dp (+ tax items).
+  const subtotal = totals.subtotal;
+  const taxAmount = totals.taxAmount(taxRateDecimal);
   const total = Money.round2(subtotal.plus(taxAmount));
 
   return { computedLines, subtotal, taxAmount, total };

@@ -24,7 +24,7 @@ import { api } from '@/lib/client';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
-import { formatDate } from '@/lib/dates';
+import { formatDate, todayISO } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -74,7 +74,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTr
   const [fromAccountId, setFromAccountId] = useState('');
   const [toAccountId, setToAccountId] = useState('');
   const [amount, setAmount] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [memo, setMemo] = useState('');
   const [saving, setSaving] = useState(false);
   // p1 fx: foreign-currency accounts.
@@ -92,7 +92,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTr
       setFromAccountId(editing?.fromAccountId ?? '');
       setToAccountId(editing?.toAccountId ?? '');
       setAmount(editing?.amount ?? '');
-      setDate(editing ? editing.date.slice(0, 10) : new Date().toISOString().slice(0, 10));
+      setDate(editing ? editing.date.slice(0, 10) : todayISO());
       setMemo(editing?.memo ?? '');
       setToAmount(editing?.toCurrency !== editing?.currency ? (editing?.toAmount ?? '') : '');
       setRate('');

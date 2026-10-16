@@ -1,16 +1,26 @@
 import { type ClassValue, clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { format, parseISO, isValid } from 'date-fns';
+import { isCalendarDay, toDisplayDate } from '@/lib/format';
 
 /** Tailwind-aware className merge. */
 export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs));
 }
 
-/** Format a date (Date | ISO string) for display. */
+/**
+ * Format a date (Date | ISO string) for display. Calendar days the API sends as UTC midnight
+ * ("2026-06-09T00:00:00.000Z") show as the day they name (lib/format.ts), not the day before in
+ * US time zones; other timestamps are real instants shown in local time.
+ */
 export function formatDate(date: Date | string | null | undefined, fmt = 'MM/dd/yyyy'): string {
   if (!date) return '';
-  const d = typeof date === 'string' ? parseISO(date) : date;
+  const d =
+    typeof date === 'string'
+      ? isCalendarDay(date)
+        ? (toDisplayDate(date) ?? new Date(NaN))
+        : parseISO(date)
+      : date;
   return isValid(d) ? format(d, fmt) : '';
 }
 

@@ -23,7 +23,7 @@ import {
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
-import { formatDate as fmtDate } from '@/lib/dates';
+import { formatDate as fmtDate, todayISO } from '@/lib/dates';
 // cmdbar: "reconcile checking" opens this page with the account picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
 
@@ -389,7 +389,7 @@ function ReconcileSession({
   const [showPayCC, setShowPayCC] = useState(false);
   const [payAccountId, setPayAccountId] = useState('');
   const [payAmount, setPayAmount] = useState('');
-  const [payDate, setPayDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [payDate, setPayDate] = useState(() => todayISO());
   const [paying, setPaying] = useState(false);
 
   // Load account info (beginning balance / CC detection) + GL accounts for the

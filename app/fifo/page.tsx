@@ -19,6 +19,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import {
@@ -76,7 +77,7 @@ const EMPTY_RECEIVE: ReceiveForm = {
   itemId: '',
   quantity: '',
   unitCost: '',
-  date: new Date().toISOString().slice(0, 10),
+  date: todayISO(),
   memo: '',
 };
 
@@ -94,7 +95,7 @@ interface ConsumeForm {
 const EMPTY_CONSUME: ConsumeForm = {
   itemId: '',
   quantity: '',
-  date: new Date().toISOString().slice(0, 10),
+  date: todayISO(),
   memo: '',
 };
 

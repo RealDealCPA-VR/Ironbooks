@@ -28,6 +28,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatDate } from '@/lib/utils';
 import {
   BarcodeScanInput,
@@ -218,7 +219,7 @@ function NewTransferModal({
   onCreated: () => Promise<void>;
 }) {
   const adv = useAdvancedInventory(open);
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [fromSiteId, setFromSiteId] = useState('');
   const [toSiteId, setToSiteId] = useState('');
   const [memo, setMemo] = useState('');
@@ -227,7 +228,7 @@ function NewTransferModal({
 
   useEffect(() => {
     if (!open) return;
-    setDate(new Date().toISOString().slice(0, 10));
+    setDate(todayISO());
     setFromSiteId(sites.find((s) => s.isDefault)?.id ?? '');
     setToSiteId('');
     setMemo('');

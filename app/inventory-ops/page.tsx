@@ -30,6 +30,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency, Money } from '@/lib/money';
 import { CreatePosFromReorder, StockStatusByVendor } from '@/components/lists/ReorderTools';
 import {
@@ -136,7 +137,7 @@ interface StockStatusData {
 }
 
 function todayStr(): string {
-  return new Date().toISOString().slice(0, 10);
+  return todayISO();
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { NotebookText, Pencil, Trash2 } from 'lucide-react';
 import { Button, ConfirmDialog, DateInput, Spinner, toastError } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 
 interface Note {
   id: string;
@@ -25,7 +26,7 @@ export function EntityNotes({
   const [notes, setNotes] = useState<Note[]>([]);
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState('');
-  const [draftDate, setDraftDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [draftDate, setDraftDate] = useState(() => todayISO());
   const [saving, setSaving] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [editBody, setEditBody] = useState('');

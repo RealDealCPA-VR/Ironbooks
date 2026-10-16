@@ -21,6 +21,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -334,7 +335,7 @@ export default function MileagePage() {
   // ---------------------------------------------------------------------------
 
   function openLogModal() {
-    setLogForm({ ...EMPTY_FORM, date: new Date().toISOString().slice(0, 10) });
+    setLogForm({ ...EMPTY_FORM, date: todayISO() });
     setLogOpen(true);
   }
 

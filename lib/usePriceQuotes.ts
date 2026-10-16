@@ -11,6 +11,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import type { PriceQuote } from '@/lib/pricingShared';
 
 export interface QuoteLine {
@@ -37,7 +38,7 @@ export function usePriceQuotes(header: QuoteHeader, lines: QuoteLine[], delayMs 
   const [quotes, setQuotes] = useState<Array<PriceQuote | null>>([]);
   const seq = useRef(0);
 
-  const date = header.date && /^\d{4}-\d{2}-\d{2}$/.test(header.date) ? header.date : new Date().toISOString().slice(0, 10);
+  const date = header.date && /^\d{4}-\d{2}-\d{2}$/.test(header.date) ? header.date : todayISO();
   const wanted = lines.map((l, idx) => ({ idx, itemId: l.itemId, qty: qtyOf(l.quantity), classId: l.classId ?? null }));
   const key = JSON.stringify([header.customerId ?? null, date, header.classId ?? null, header.salesRepId ?? null, header.jobId ?? null, wanted]);
 

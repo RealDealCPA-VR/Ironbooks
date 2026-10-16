@@ -21,6 +21,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency, Money } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -59,7 +60,7 @@ interface LogTimeForm {
 
 const emptyForm: LogTimeForm = {
   customerId: '',
-  date: new Date().toISOString().slice(0, 10),
+  date: todayISO(),
   hours: '',
   rate: '',
   description: '',

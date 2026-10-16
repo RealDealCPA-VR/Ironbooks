@@ -698,9 +698,11 @@ async function pruneHistory(db: DB, companyId: string, dir: string): Promise<voi
     }
     await sweepOrphans(tx);
   });
+  // Stored paths may use either separator (older Windows rows hold backslashes): compare in one form.
+  const slashPath = (p: string) => path.posix.normalize(p.split(/[\\/]+/).filter(Boolean).join('/'));
   const keep = new Set(
     (await rawClient(db).query<{ p: string }>('SELECT storage_path AS p FROM attachments')).rows.map((r) =>
-      path.normalize(r.p),
+      slashPath(r.p),
     ),
   );
   const attDir = path.join(dir, 'attachments');
@@ -715,7 +717,7 @@ async function pruneHistory(db: DB, companyId: string, dir: string): Promise<voi
     for (const e of entries) {
       const r = path.join(rel, e.name);
       if (e.isDirectory()) walk(r);
-      else if (!keep.has(path.normalize(r))) fs.rmSync(path.join(dir, r), { force: true });
+      else if (!keep.has(slashPath(r))) fs.rmSync(path.join(dir, r), { force: true });
     }
   };
   if (fs.existsSync(attDir)) walk('attachments');

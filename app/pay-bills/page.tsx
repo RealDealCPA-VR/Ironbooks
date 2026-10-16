@@ -36,6 +36,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { localDateISO, todayISO } from '@/lib/dates';
 import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
 import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { formatCurrency } from '@/lib/money';
@@ -169,7 +170,7 @@ export default function PayBillsPage() {
   const prefs = usePreferences();
   const [discountAccountId, setDiscountAccountId] = useState('');
   const [method, setMethod] = useState('check');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [reference, setReference] = useState('');
   const [toPrint, setToPrint] = useState(false);
   const [exchangeRate, setExchangeRate] = useState('');
@@ -180,7 +181,7 @@ export default function PayBillsPage() {
   const [dueOnOrBefore, setDueOnOrBefore] = useState(() => {
     const d = new Date();
     d.setDate(d.getDate() + 10);
-    return d.toISOString().slice(0, 10);
+    return localDateISO(d);
   });
   const [discountOnly, setDiscountOnly] = useState(false);
 

@@ -33,6 +33,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
@@ -161,7 +162,7 @@ interface NewPoModalProps {
 
 function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId }: NewPoModalProps) {
   const [vendorId, setVendorId] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [expectedDate, setExpectedDate] = useState('');
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
@@ -177,7 +178,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
   useEffect(() => {
     if (!open) return;
     setVendorId('');
-    setDate(new Date().toISOString().slice(0, 10));
+    setDate(todayISO());
     setExpectedDate('');
     setMemo('');
     setLines([{ ...EMPTY_LINE }]);

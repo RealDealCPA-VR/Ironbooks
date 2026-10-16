@@ -101,30 +101,30 @@ describe('ytdRange', () => {
 
   it('defaults to Jan 1 of the current calendar year', () => {
     const { from, to } = ytdRange(undefined, now);
-    expect(from).toEqual(new Date(2026, 0, 1));
-    expect(to).toEqual(now);
+    expect(from).toEqual(new Date(Date.UTC(2026, 0, 1)));
+    expect(to).toEqual(new Date(Date.UTC(2026, 5, 9, 23, 59, 59, 999))); // end of the day, UTC bounds
   });
 
   it('honors a 12-31 fiscal year end (same as calendar)', () => {
     const { from } = ytdRange('12-31', now);
-    expect(from).toEqual(new Date(2026, 0, 1));
+    expect(from).toEqual(new Date(Date.UTC(2026, 0, 1)));
   });
 
   it('starts the day after the most recent fiscal year end (06-30)', () => {
     const { from } = ytdRange('06-30', now);
     // Most recent completed FYE before 2026-06-09 is 2025-06-30 -> start 2025-07-01.
-    expect(from).toEqual(new Date(2025, 6, 1));
+    expect(from).toEqual(new Date(Date.UTC(2025, 6, 1)));
   });
 
   it('treats a fiscal year ending today as still open', () => {
     const { from } = ytdRange('06-30', new Date(2026, 5, 30));
-    expect(from).toEqual(new Date(2025, 6, 1));
+    expect(from).toEqual(new Date(Date.UTC(2025, 6, 1)));
   });
 
   it('falls back to Jan 1 on malformed settings', () => {
-    expect(ytdRange('June 30', now).from).toEqual(new Date(2026, 0, 1));
-    expect(ytdRange('', now).from).toEqual(new Date(2026, 0, 1));
-    expect(ytdRange('13-40', now).from).toEqual(new Date(2026, 0, 1));
+    expect(ytdRange('June 30', now).from).toEqual(new Date(Date.UTC(2026, 0, 1)));
+    expect(ytdRange('', now).from).toEqual(new Date(Date.UTC(2026, 0, 1)));
+    expect(ytdRange('13-40', now).from).toEqual(new Date(Date.UTC(2026, 0, 1)));
   });
 });
 

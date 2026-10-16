@@ -138,7 +138,9 @@ export function isFileLockError(status: number, message: string): boolean {
 export function isAuthError(status: number, message: string): boolean {
   return (
     (status === 401 || status === 403) &&
-    (message === 'Authentication required.' || /account has been deactivated/i.test(message))
+    (message === 'Authentication required.' ||
+      /account has been deactivated/i.test(message) ||
+      /you belong to in this file has been archived/i.test(message))
   );
 }
 

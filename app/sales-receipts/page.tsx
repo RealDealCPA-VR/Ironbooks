@@ -25,6 +25,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import {
   BarcodeScanInput,
@@ -60,6 +61,7 @@ import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { recallNumber, recallQuantity } from '@/lib/smartDefaults';
 // cmdbar: forms accept a prefill from the Ctrl+K command bar.
 import PrefillNotice from '@/components/PrefillNotice';
+import { previewSalesTotals } from '@/lib/salesLineMath';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import type { FormPrefill } from '@/lib/commands/prefill';
 
@@ -160,20 +162,13 @@ function methodLabel(value: string): string {
   return METHODS.find((m) => m.value === value)?.label ?? value;
 }
 
-function computeLineTotal(line: LineRow): number {
-  const qty = parseFloat(line.quantity) || 0;
-  const rate = parseFloat(line.rate) || 0;
-  return qty * rate;
-}
-
-function computeTotals(lines: LineRow[], taxRate: TaxRate | undefined) {
-  const subtotal = lines.reduce((sum, l) => sum + computeLineTotal(l), 0);
-  const taxableSubtotal = lines.reduce(
-    (sum, l) => sum + (l.taxable ? computeLineTotal(l) : 0),
-    0,
+/** Same item-type math as the service: discount items subtract, subtotal items add nothing. */
+function computeTotals(lines: LineRow[], taxRate: TaxRate | undefined, items: Item[]) {
+  const { subtotal, tax, total } = previewSalesTotals(
+    lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+    taxRate ? parseFloat(taxRate.rate) || 0 : 0,
   );
-  const tax = taxRate ? taxableSubtotal * (parseFloat(taxRate.rate) || 0) : 0;
-  return { subtotal, tax, total: subtotal + tax };
+  return { subtotal, tax, total };
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +212,7 @@ function NewReceiptModal({
   })();
 
   const [customerId, setCustomerId] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [method, setMethod] = useState('cash');
   const [depositAccountId, setDepositAccountId] = useState('');
   const [reference, setReference] = useState('');
@@ -430,7 +425,7 @@ function NewReceiptModal({
   const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
 
   const selectedTaxRate = taxRates.find((t) => t.id === taxRateId);
-  const { subtotal, tax, total } = computeTotals(lines, selectedTaxRate);
+  const { subtotal, tax, total } = computeTotals(lines, selectedTaxRate, items);
 
   function receiptPayload(validLines: LineRow[]) {
     return {

@@ -57,6 +57,20 @@ function attachmentsDir(): string {
   return path.join(dataDir, 'attachments');
 }
 
+/**
+ * Stored attachment paths are relative to the data directory and always use forward slashes, so a
+ * company file moves between Windows and macOS/Linux. Rows written by older Windows builds hold
+ * backslashes (`attachments\<file>`); both separators are accepted when reading.
+ */
+export function normalizeStoragePath(storagePath: string): string {
+  return storagePath.split(/[\\/]+/).filter(Boolean).join('/');
+}
+
+/** Absolute on-disk path of a stored (relative) attachment path, on any platform. */
+export function attachmentAbsolutePath(dataDir: string, storagePath: string): string {
+  return path.join(dataDir, ...normalizeStoragePath(storagePath).split('/'));
+}
+
 /** Ensure the storage folder exists (idempotent). */
 function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
@@ -275,7 +289,7 @@ export async function saveAttachment(
   fs.writeFileSync(absolutePath, buffer);
 
   // Store a relative path so the record doesn't break if BKA_DATA_DIR changes.
-  const storagePath = path.join('attachments', diskName);
+  const storagePath = `attachments/${diskName}`;
 
   const [row] = await ctx.db
     .insert(attachments)
@@ -442,7 +456,7 @@ export async function getAttachmentFile(
   assertCanSee(ctx, row.entityType);
 
   const dataDir = resolveDataDir();
-  const absolutePath = path.join(dataDir, row.storagePath);
+  const absolutePath = attachmentAbsolutePath(dataDir, row.storagePath);
 
   if (!fs.existsSync(absolutePath)) {
     throw notFound('Attachment file on disk');
@@ -486,7 +500,7 @@ export async function deleteAttachment(ctx: ServiceContext, id: string): Promise
   // Best-effort file removal.
   try {
     const dataDir = resolveDataDir();
-    const absolutePath = path.join(dataDir, row.storagePath);
+    const absolutePath = attachmentAbsolutePath(dataDir, row.storagePath);
     if (fs.existsSync(absolutePath)) {
       fs.unlinkSync(absolutePath);
     }

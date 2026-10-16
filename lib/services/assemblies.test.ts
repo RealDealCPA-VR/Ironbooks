@@ -66,7 +66,7 @@ describe('Assemblies service (end-to-end)', () => {
         companyId: company.id,
         name: 'Bike Kit',
         sku: 'BIKE-KIT',
-        type: 'bundle',
+        type: 'inventory',
         quantityOnHand: '0',
         averageCost: '0',
       })

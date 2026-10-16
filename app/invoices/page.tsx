@@ -26,6 +26,8 @@ import {
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { liveLineTotals } from '@/lib/invoiceLineMath';
+import { todayISO } from '@/lib/dates';
 import { formatDate } from '@/lib/format';
 import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
 import {
@@ -301,42 +303,22 @@ function computeTotals(
   taxRate: number,
   billablesAmount: number,
 ): LiveTotals {
-  let subtotal = 0;
-  let taxableSubtotal = 0;
-  let payments = 0;
-  let manualTax = 0;
-  let running = 0;
-  const amounts: number[] = [];
-
-  for (const l of lines) {
-    const kind = lineKind(l);
-    if (kind === 'subtotal') {
-      amounts.push(running);
-      running = 0;
-      continue;
-    }
-    const qty = parseFloat(l.quantity) || 0;
-    const rate = parseFloat(l.rate) || 0;
-    let amt: number;
-    if (kind === 'discount') {
-      amt = l.discountPercent
-        ? -(running * (Math.abs(rate) / 100))
-        : -Math.abs((qty || 1) * rate);
-    } else {
-      amt = qty * rate;
-    }
-    amounts.push(amt);
-
-    if (kind === 'income' || kind === 'discount') {
-      subtotal += amt;
-      running += amt;
-      if (l.taxable) taxableSubtotal += amt;
-    } else if (kind === 'payment') {
-      payments += amt;
-    } else if (kind === 'sales_tax') {
-      manualTax += amt;
-    }
-  }
+  // Line amounts in Decimal, rounded like the server (lib/invoiceLineMath.ts): a %-discount
+  // line's amount is sent as its flat rate, so float rounding would save the wrong cent.
+  const live = liveLineTotals(
+    lines.map((l) => ({
+      kind: lineKind(l),
+      quantity: l.quantity,
+      rate: l.rate,
+      taxable: l.taxable,
+      discountPercent: l.discountPercent,
+    })),
+  );
+  const amounts = live.amounts.map((a) => a.toNumber());
+  let subtotal = live.subtotal.toNumber();
+  const taxableSubtotal = live.taxableSubtotal.toNumber();
+  const payments = live.payments.toNumber();
+  const manualTax = live.manualTax.toNumber();
 
   subtotal += billablesAmount;
   const discValue = parseFloat(discount) || 0;
@@ -410,7 +392,7 @@ function InvoiceModal({
   prefill = null,
 }: InvoiceModalProps) {
   const [customerId, setCustomerId] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [dueDate, setDueDate] = useState('');
   const [terms, setTerms] = useState('');
   // Terms list entries (custom and date-driven terms included).
@@ -492,7 +474,7 @@ function InvoiceModal({
     if (!open) return;
     if (editing) {
       setCustomerId(editing.customerId);
-      setDate(editing.date ? editing.date.slice(0, 10) : new Date().toISOString().slice(0, 10));
+      setDate(editing.date ? editing.date.slice(0, 10) : todayISO());
       setDueDate(editing.dueDate ? editing.dueDate.slice(0, 10) : '');
       setTerms(editing.terms ?? '');
       setTaxRateId(editing.taxRateId ?? '');

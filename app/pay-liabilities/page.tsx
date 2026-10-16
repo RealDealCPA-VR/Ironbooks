@@ -32,6 +32,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { Money, formatCurrency } from '@/lib/money';
 import { isBankAccount } from '@/lib/accountTypes';
@@ -98,7 +99,7 @@ interface PayForm {
   toPrint: boolean;
 }
 
-const today = () => new Date().toISOString().split('T')[0];
+const today = () => todayISO();
 
 const EMPTY_FORM: PayForm = {
   amount: '',

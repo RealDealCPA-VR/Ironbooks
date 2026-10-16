@@ -27,6 +27,7 @@ import {
 } from '@/components/ui';
 import { ReceiptStatusBadge, type ReceiptRow } from '@/components/ReceiptStatus';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import { formatCurrency, Money } from '@/lib/money';
@@ -155,7 +156,7 @@ export default function ReviewReceiptPage() {
         setVendorChoice(NEW_VENDOR);
         setNewName(r.vendorName);
       } else setVendorChoice(NO_VENDOR);
-      setDate(r.date ?? new Date().toISOString().slice(0, 10));
+      setDate(r.date ?? todayISO());
       setTotal(r.total ?? '');
       setTax(r.tax ?? '');
       setSplitTax(false);

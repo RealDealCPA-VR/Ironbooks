@@ -149,10 +149,15 @@ async function computeClearedBalance(
       journalEntryLines,
       eq(reconciliationItems.journalEntryLineId, journalEntryLines.id),
     )
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
     .where(
       and(
         eq(reconciliationItems.reconciliationId, reconciliationId),
         eq(reconciliationItems.isCleared, true),
+        // A line cleared in this (in-progress) session whose entry was voided afterwards is no
+        // longer in the account — it must not count toward the cleared balance (voidJournalEntry
+        // only blocks voids of lines in COMPLETED reconciliations).
+        eq(journalEntries.status, 'posted'),
       ),
     );
 
@@ -1098,15 +1103,20 @@ export async function getReconciliationReport(
   let depositsCount = 0;
   let paymentsCount = 0;
 
+  // An in-progress session counts only still-posted lines (as getProgress / complete do); a
+  // completed session reports what was reconciled, flagging later-voided legacy lines.
+  const countVoided = recon.status !== 'in_progress';
   const lines: ReconciliationReportLine[] = rows.map((r) => {
     const amount = naturalAmount(meta.glType, r.debit, r.credit);
-    clearedTotal = clearedTotal.plus(amount);
-    if (amount.greaterThanOrEqualTo(0)) {
-      depositsCount += 1;
-      depositsTotal = depositsTotal.plus(amount);
-    } else {
-      paymentsCount += 1;
-      paymentsTotal = paymentsTotal.plus(amount.abs());
+    if (r.jeStatus === 'posted' || countVoided) {
+      clearedTotal = clearedTotal.plus(amount);
+      if (amount.greaterThanOrEqualTo(0)) {
+        depositsCount += 1;
+        depositsTotal = depositsTotal.plus(amount);
+      } else {
+        paymentsCount += 1;
+        paymentsTotal = paymentsTotal.plus(amount.abs());
+      }
     }
     return {
       lineId: r.lineId,

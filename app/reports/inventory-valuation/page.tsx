@@ -28,6 +28,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatShortDate } from '@/lib/format';
 import { downloadCsv, todayStr, yearStartStr } from '../_components/shared';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -224,7 +225,7 @@ export default function InventoryValuationPage() {
       rows.push(['TOTAL', '', '', '', '', summary.grandTotal]);
       downloadCsv(
         'inventory-valuation-asof.csv',
-        `Inventory Valuation as of ${new Date(summary.asOf!).toLocaleDateString('en-US')}`,
+        `Inventory Valuation as of ${formatShortDate(summary.asOf)}`,
         ['Item', 'SKU', 'Method', 'Qty (approx)', 'Unit Cost Used', 'Value'],
         rows,
       );
@@ -255,7 +256,7 @@ export default function InventoryValuationPage() {
       for (const m of item.movements) {
         rows.push([
           item.name,
-          new Date(m.date).toLocaleDateString('en-US'),
+          formatShortDate(m.date),
           `JE #${m.entryNumber}`,
           m.description,
           m.delta,
@@ -393,7 +394,7 @@ export default function InventoryValuationPage() {
                     <Th>Method</Th>
                     <Th numeric>Qty (approx)</Th>
                     <Th numeric>Unit Cost Used</Th>
-                    <Th numeric>Value as of {new Date(summary.asOf!).toLocaleDateString('en-US')}</Th>
+                    <Th numeric>Value as of {formatShortDate(summary.asOf)}</Th>
                   </Tr>
                 </thead>
                 <tbody>
@@ -563,7 +564,7 @@ export default function InventoryValuationPage() {
                       <tbody>
                         {item.movements.map((m) => (
                           <Tr key={m.entryId}>
-                            <Td className="text-navy/70">{new Date(m.date).toLocaleDateString('en-US')}</Td>
+                            <Td className="text-navy/70">{formatShortDate(m.date)}</Td>
                             <Td>
                               <Link
                                 href={`/journal?focus=${m.entryId}`}

@@ -17,6 +17,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
@@ -128,7 +129,7 @@ function isCharge(line: { type: string; amount: string }): boolean {
 }
 
 export default function CustomerStatementsPage() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayISO();
 
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [customersLoading, setCustomersLoading] = useState(true);

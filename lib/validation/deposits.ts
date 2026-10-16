@@ -22,6 +22,7 @@ export const createDepositSchema = z
     date: zDate,
     paymentIds: z.array(zUuid).optional(),
     salesReceiptIds: z.array(zUuid).optional(),
+    invoicePaymentIds: z.array(zUuid).optional(),
     extraLines: z.array(extraDepositLineSchema).optional(),
     cashBack: cashBackSchema.nullish(),
     memo: z.string().nullish(),
@@ -30,7 +31,10 @@ export const createDepositSchema = z
   })
   .refine(
     (d) =>
-      (d.paymentIds?.length ?? 0) + (d.salesReceiptIds?.length ?? 0) + (d.extraLines?.length ?? 0) >
+      (d.paymentIds?.length ?? 0) +
+        (d.salesReceiptIds?.length ?? 0) +
+        (d.invoicePaymentIds?.length ?? 0) +
+        (d.extraLines?.length ?? 0) >
       0,
     { message: 'Provide at least one of paymentIds, salesReceiptIds, or extraLines.' },
   );

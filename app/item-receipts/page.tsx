@@ -36,6 +36,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import {
   BarcodeScanInput,
   InventoryLineFields,
@@ -156,7 +157,7 @@ interface NewReceiptModalProps {
 
 function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: NewReceiptModalProps) {
   const [vendorId, setVendorId] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [reference, setReference] = useState('');
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
@@ -189,7 +190,7 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
   useEffect(() => {
     if (!open) return;
     setVendorId('');
-    setDate(new Date().toISOString().slice(0, 10));
+    setDate(todayISO());
     setReference('');
     setMemo('');
     setLines([{ ...EMPTY_LINE }]);
@@ -633,7 +634,7 @@ function ConvertModal({ receipt, vendorName, onClose, onConverted }: ConvertModa
   useEffect(() => {
     if (receipt) {
       setBillNumber(receipt.reference ?? '');
-      setDate(receipt.date ? receipt.date.slice(0, 10) : new Date().toISOString().slice(0, 10));
+      setDate(receipt.date ? receipt.date.slice(0, 10) : todayISO());
       setDueDate('');
     }
   }, [receipt]);

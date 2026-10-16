@@ -212,12 +212,10 @@ export async function profitAndLossByMonth(
 ): Promise<ProfitAndLossByMonth> {
   // Build Jan–Dec date ranges for the year.
   const ranges = Array.from({ length: 12 }, (_, m) => {
-    const from = new Date(year, m, 1);
-    const lastDay = new Date(year, m + 1, 0); // day 0 of next month = last day of this month
-    const to = new Date(year, m + 1, 0, 23, 59, 59, 999);
-    // Use last day correctly — make it end-of-day
-    to.setFullYear(year, m, lastDay.getDate());
-    to.setHours(23, 59, 59, 999);
+    // UTC bounds: stored document dates are UTC midnight of their calendar day, so local-time
+    // bounds would move each month's first-day activity into the previous month west of UTC.
+    const from = new Date(Date.UTC(year, m, 1));
+    const to = new Date(Date.UTC(year, m + 1, 1) - 1); // last instant of the month
     return { from, to };
   });
 

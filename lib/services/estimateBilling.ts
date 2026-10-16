@@ -12,7 +12,7 @@
  * Kept separate from estimates.ts so invoices.ts can call it without a circular import.
  */
 import { and, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
-import { estimateLines, estimates, invoiceLines, invoices } from '@/lib/db/schema';
+import { estimateLines, estimates, invoiceLines, invoices, items } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError } from './_base';
 import { progressOverbillFixes } from '@/lib/errorFixes';
@@ -189,7 +189,8 @@ export async function checkEstimateOverBilling(
       lineId: el.id,
       description: el.description,
       quantity: el.quantity,
-      amount: el.amount,
+      // Discount lines are stored negative; invoiced-to-date is measured by magnitude.
+      amount: toAmountString(Money.abs(Money.of(el.amount))),
       qtyInvoicedToDate: p?.qtyInvoiced ?? Money.zero(),
       invoicedToDate: p?.amountInvoiced ?? Money.zero(),
       thisQty: b.qty,
@@ -254,10 +255,18 @@ export async function refreshEstimateBilling(
     .from(estimates)
     .where(and(eq(estimates.companyId, ctx.companyId), eq(estimates.id, estimateId)));
   if (!est) return null;
-  const lines = await ctx.db
-    .select({ id: estimateLines.id, quantity: estimateLines.quantity, amount: estimateLines.amount })
+  const allLines = await ctx.db
+    .select({
+      id: estimateLines.id,
+      quantity: estimateLines.quantity,
+      amount: estimateLines.amount,
+      itemType: items.type,
+    })
     .from(estimateLines)
+    .leftJoin(items, eq(items.id, estimateLines.itemId))
     .where(eq(estimateLines.estimateId, estimateId));
+  // Subtotal items only add up the lines above them; they are never billed themselves.
+  const lines = allLines.filter((l) => l.itemType !== 'subtotal');
   const progress = await estimateLineProgress(ctx, estimateId);
 
   // Totals of the posted invoices that bill this estimate (tax included, as the customer sees it).
@@ -286,7 +295,7 @@ export async function refreshEstimateBilling(
     const amt = p?.amountInvoiced ?? Money.zero();
     const qty = p?.qtyInvoiced ?? Money.zero();
     if (amt.greaterThan(0) || qty.greaterThan(0)) anyBilled = true;
-    const lineAmount = Money.of(l.amount);
+    const lineAmount = Money.abs(Money.of(l.amount)); // discount lines are stored negative
     const done = lineAmount.greaterThan(0)
       ? !amt.lessThan(lineAmount)
       : !qty.lessThan(Money.of(l.quantity));

@@ -25,6 +25,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 
@@ -107,7 +108,7 @@ export default function SoFulfillmentPage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   /** lineId -> quantity to ship (string as typed). Defaults to "can ship". */
   const [shipQty, setShipQty] = useState<Record<string, string>>({});
-  const [invoiceDate, setInvoiceDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [invoiceDate, setInvoiceDate] = useState(() => todayISO());
   const [invoicing, setInvoicing] = useState(false);
   const [results, setResults] = useState<BatchResult[] | null>(null);
   const [showItems, setShowItems] = useState(false);

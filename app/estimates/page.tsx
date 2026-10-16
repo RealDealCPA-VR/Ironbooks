@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { ClipboardList, Plus, ArrowRight, Percent, Pencil } from 'lucide-react';
+import { previewSalesTotals } from '@/lib/salesLineMath';
 import {
   Button,
   Card,
@@ -22,6 +23,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { usePreferences } from '@/lib/usePreferences';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { salesRowsFromRecall } from '@/lib/smartDefaults';
@@ -133,7 +135,7 @@ const EMPTY_LINE: EstimateLineForm = {
   taxable: true,
 };
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 
 const EMPTY_FORM: EstimateForm = {
   customerId: '',
@@ -187,19 +189,18 @@ function EstimateFormBody({
   /** Smart defaults: what was filled in from the customer's last estimate. */
   recallText?: string;
 }) {
-  const subtotal = form.lines.reduce(
-    (sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0),
-    0,
-  );
-  // Mirror the service/invoice math: tax applies to taxable lines only.
-  const taxableSubtotal = form.lines.reduce(
-    (sum, l) => sum + (l.taxable ? (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0) : 0),
-    0,
-  );
+  // Mirror the service/invoice math (item-type aware): tax applies to taxable lines only,
+  // discount items subtract, subtotal items add nothing.
   const selectedRate = taxRates.find((t) => t.id === form.taxRateId);
   const { salesTaxEnabled: salesTaxOn, classTrackingEnabled: classTrackingOn } = usePreferences().company;
-  const taxAmount = taxableSubtotal * (selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
-  const total = subtotal + taxAmount;
+  const {
+    subtotal,
+    tax: taxAmount,
+    total,
+  } = previewSalesTotals(
+    form.lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+    selectedRate ? parseFloat(selectedRate.rate) || 0 : 0,
+  );
 
   return (
     <div className="flex flex-col gap-4">

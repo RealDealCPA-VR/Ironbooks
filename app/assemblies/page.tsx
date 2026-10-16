@@ -21,6 +21,8 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
+import { formatShortDate } from '@/lib/format';
+import { todayISO } from '@/lib/dates';
 import {
   InventoryLineFields,
   type InvDetail,
@@ -175,7 +177,7 @@ function PendingBuildsSection({
                   {b.memo ? <p className="text-xs font-normal text-navy/40">{b.memo}</p> : null}
                 </Td>
                 <Td numeric className="tabular-nums">{parseFloat(b.quantity).toFixed(2)}</Td>
-                <Td className="text-navy/60 text-sm">{new Date(b.date).toLocaleDateString('en-US')}</Td>
+                <Td className="text-navy/60 text-sm">{formatShortDate(b.date)}</Td>
                 <Td>
                   <Badge
                     tone={b.status === 'pending' ? 'warning' : b.status === 'built' ? 'success' : 'neutral'}
@@ -430,7 +432,7 @@ export default function AssembliesPage() {
       const data = await api.post<{ build: PendingBuild }>('/api/assemblies/pending', {
         assemblyItemId: selectedAssemblyId,
         quantity: buildQty,
-        date: new Date().toISOString().slice(0, 10),
+        date: todayISO(),
       });
       setPendingRefresh((n) => n + 1);
       toast(

@@ -21,6 +21,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { fmtDate } from '../_components/shared';
 
@@ -196,7 +197,7 @@ function buildLiabilitiesCsv(l: LiabilitiesResult): string {
 // ---------------------------------------------------------------------------
 
 export default function PayrollSummaryPage() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayISO();
   const yearStart = `${today.slice(0, 4)}-01-01`;
 
   const [from, setFrom] = useState(yearStart);

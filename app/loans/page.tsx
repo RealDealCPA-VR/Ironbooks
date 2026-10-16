@@ -28,6 +28,7 @@ import {
   toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
@@ -99,7 +100,7 @@ const FREQUENCIES: Array<[number, string]> = [
   [1, 'Yearly'],
 ];
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 
 function emptyForm() {
   return {

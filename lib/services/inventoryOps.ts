@@ -352,7 +352,7 @@ export async function physicalCount(
           },
         ];
 
-    const entry = await postJournalEntry(tx, {
+    const entry = glAmount.isZero() ? null : await postJournalEntry(tx, {
       date: input.date,
       description: `Physical inventory count adjustment — ${item.name}`,
       lines: postingLines,
@@ -379,7 +379,7 @@ export async function physicalCount(
       newValues: {
         quantityOnHand: counted.toFixed(4),
         physicalCountDate: input.date.toISOString(),
-        postedEntryId: entry.id,
+        postedEntryId: entry?.id ?? null,
       },
     });
 
@@ -389,7 +389,7 @@ export async function physicalCount(
       countedQty: counted.toFixed(4),
       delta: delta.toFixed(4),
       glAmount: toAmountString(glAmount),
-      journalEntryId: entry.id,
+      journalEntryId: entry?.id ?? null,
       adjustmentAccountId,
       updatedQty: counted.toFixed(4),
     };

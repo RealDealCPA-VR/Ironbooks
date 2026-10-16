@@ -256,12 +256,11 @@ describe('journal tools (updateEntry / reverseEntry / mergeAccounts)', () => {
   // -------------------------------------------------------------------------
 
   it('defaultReversalDate is the 1st of the next month (incl. year rollover)', () => {
-    expect(defaultReversalDate(new Date('2025-03-15T12:00:00'))).toEqual(
-      new Date(2025, 3, 1),
-    );
-    expect(defaultReversalDate(new Date('2025-12-31T12:00:00'))).toEqual(
-      new Date(2026, 0, 1),
-    );
+    // Ledger dates are calendar days at UTC midnight, so the default is UTC midnight too.
+    expect(defaultReversalDate(new Date('2025-03-15T12:00:00Z'))).toEqual(new Date(Date.UTC(2025, 3, 1)));
+    expect(defaultReversalDate(new Date('2025-12-31T12:00:00Z'))).toEqual(new Date(Date.UTC(2026, 0, 1)));
+    // An entry dated the 1st (stored 00:00Z) must not reverse on that same day west of UTC.
+    expect(defaultReversalDate(new Date('2025-03-01'))).toEqual(new Date(Date.UTC(2025, 3, 1)));
   });
 
   it('creates a reversing entry: swapped debits/credits, REV reference, next-month date', async () => {
@@ -278,7 +277,7 @@ describe('journal tools (updateEntry / reverseEntry / mergeAccounts)', () => {
 
     const rev = await reverseEntry(ctx, accrual.id);
     expect(rev.reference).toBe(`REV of #${accrual.entryNumber}`);
-    expect(new Date(rev.date)).toEqual(new Date(2025, 6, 1)); // July 1st
+    expect(new Date(rev.date)).toEqual(new Date(Date.UTC(2025, 6, 1))); // July 1st (UTC calendar day)
 
     const revDetail = await getEntry(ctx, rev.id);
     const creditLine = revDetail.lines.find((l) => l.accountId === acct['6000']);

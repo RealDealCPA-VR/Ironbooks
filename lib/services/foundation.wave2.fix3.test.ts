@@ -123,7 +123,9 @@ describe('I11 central guard on A/R and A/P lines', () => {
       lines: [{ accountId: code['4000'], quantity: 1, rate: '25.00' }],
     });
     expect(inv.postedEntryId).toBeTruthy();
-    await expect(reverseEntry(ctx, inv.postedEntryId!, DAY)).rejects.toThrow(/customer name/);
+    // Refused up front as a document-posted entry (reverse it through the invoice), before the
+    // A/R name check that used to be what refused it.
+    await expect(reverseEntry(ctx, inv.postedEntryId!, DAY)).rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringMatching(/source document/) });
 
     const je = await createManualEntry(ctx, {
       date: DAY,

@@ -9,6 +9,7 @@ import { useState } from 'react';
 import { Grid3x3 } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, Select, Spinner, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import type { StdReport } from '@/lib/reports/types';
 import ReportToolbar from '../_components/ReportToolbar';
 import StdReportTable, { useCollapse } from '../_components/StdReportTable';
@@ -55,7 +56,7 @@ export default function PivotPage() {
   const [measure, setMeasure] = useState('amount');
   const [section, setSection] = useState('income,cogs,expense,other_income,other_expense');
   const [from, setFrom] = useState(`${year}-01-01`);
-  const [to, setTo] = useState(new Date().toISOString().slice(0, 10));
+  const [to, setTo] = useState(todayISO());
   const [report, setReport] = useState<StdReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [format] = useNumberFormat();

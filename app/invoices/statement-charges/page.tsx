@@ -28,6 +28,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useCreditLimitConfirm } from '@/components/sales/SalesExtras';
@@ -57,7 +58,7 @@ interface Charge {
   line: { itemId: string | null; itemName: string | null; description: string | null; quantity: string; rate: string } | null;
 }
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 
 export default function StatementChargesPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);

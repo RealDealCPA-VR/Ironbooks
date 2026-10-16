@@ -10,6 +10,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { CalendarClock, Pause, Play, Plus, Trash2 } from 'lucide-react';
 import { Badge, Button, Card, EmptyState, Input, Label, Modal, PageHeader, Select, Table, Td, Th, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 
 interface Schedule {
   id: string;
@@ -30,7 +31,7 @@ interface Option {
   name: string;
 }
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 
 export default function ScheduledReportsPage() {
   const [schedules, setSchedules] = useState<Schedule[]>([]);

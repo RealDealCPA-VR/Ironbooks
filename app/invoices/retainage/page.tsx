@@ -30,6 +30,7 @@ import {
   toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useCreditLimitConfirm } from '@/components/sales/SalesExtras';
@@ -61,7 +62,7 @@ interface RetainageReport {
   ties: boolean;
 }
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 
 export default function RetainagePage() {
   const [asOf, setAsOf] = useState(today());

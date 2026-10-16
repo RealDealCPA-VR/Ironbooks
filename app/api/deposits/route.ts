@@ -6,6 +6,7 @@
  *     date: string (ISO),
  *     paymentIds?: string[],        // paymentsReceived rows in UF
  *     salesReceiptIds?: string[],   // salesReceipts rows in UF
+ *     invoicePaymentIds?: string[], // invoices whose payment-item lines sit in UF
  *     extraLines?: Array<{ accountId, amount, description? }>, // e.g. owner contribution
  *     cashBack?: { accountId, amount, memo? },                 // QB "Cash back goes to"
  *     memo?: string

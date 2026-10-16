@@ -38,6 +38,7 @@ import { assertAccountantMayVoidEntry } from './accountantCopy/guard';
 import { balanceFixes, balanceSummary } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
+import { isJournalScreenEntry } from '@/lib/journalScreen';
 import {
   type JournalEntityType,
   type PostingLine,
@@ -657,9 +658,24 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
 // reverseEntry — QB "Reverse" button on Make General Journal Entries
 // ---------------------------------------------------------------------------
 
-/** QB default for a reversing entry: the 1st of the month after the entry date. */
+/**
+ * QB default for a reversing entry: the 1st of the month after the entry date. Ledger dates are
+ * calendar days stored at UTC midnight, so UTC getters are used (local getters put the reversal
+ * of an entry dated the 1st on that same day in timezones behind UTC).
+ */
 export function defaultReversalDate(entryDate: Date): Date {
-  return new Date(entryDate.getFullYear(), entryDate.getMonth() + 1, 1);
+  return new Date(Date.UTC(entryDate.getUTCFullYear(), entryDate.getUTCMonth() + 1, 1));
+}
+
+/** Refuse to void / reverse a document-posted entry from the journal screen (lib/journalScreen.ts). */
+function assertJournalScreenEntry(sourceRef: string | null | undefined, op: 'void' | 'reverse'): void {
+  if (isJournalScreenEntry(sourceRef, op)) return;
+  throw new ServiceError(
+    'CONFLICT',
+    op === 'void'
+      ? 'This entry was posted by a source document. Void the source document instead.'
+      : 'This entry was posted by a source document, so it can’t be reversed here. Void or edit the source document instead.',
+  );
 }
 
 /**
@@ -673,6 +689,7 @@ export async function reverseEntry(ctx: ServiceContext, id: string, asOfDate?: D
   if (original.status !== 'posted') {
     throw new ServiceError('CONFLICT', 'Only posted journal entries can be reversed.');
   }
+  assertJournalScreenEntry(original.sourceRef, 'reverse');
   const date = asOfDate ?? defaultReversalDate(original.date);
   if (isNaN(date.getTime())) {
     throw validation('A valid reversal date is required.');
@@ -728,6 +745,7 @@ export async function voidEntry(ctx: ServiceContext, id: string) {
 
   if (!entry) throw notFound('Journal entry');
   await assertAccountantMayVoidEntry(ctx, entry.sourceRef); // Accountant's Copy (I1): only GJ voids travel
+  assertJournalScreenEntry(entry.sourceRef, 'void'); // documents are voided through the document
   await assertNoJournalApplications(ctx, id, 'voided');
 
   return voidJournalEntry(ctx, id);

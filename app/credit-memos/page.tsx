@@ -24,6 +24,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
@@ -53,6 +54,7 @@ import {
 import { usePreferences } from '@/lib/usePreferences';
 import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
+import { previewSalesTotals } from '@/lib/salesLineMath';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -113,7 +115,8 @@ interface Account {
 interface Item {
   id: string;
   name: string;
-  type: 'service' | 'inventory' | 'non_inventory' | 'bundle';
+  /** service | inventory | non_inventory | bundle | other_charge | discount | subtotal | sales_tax | … */
+  type: string;
   salesPrice: string | null;
   taxable: boolean;
   trackingMode?: string | null;
@@ -155,21 +158,15 @@ function statusLabel(status: CreditMemo['status']): string {
   return 'Void';
 }
 
-function computeLineTotal(line: LineRow): number {
-  return (parseFloat(line.quantity) || 0) * (parseFloat(line.rate) || 0);
-}
-
-function computeSubtotal(lines: LineRow[]): number {
-  return lines.reduce((sum, l) => sum + computeLineTotal(l), 0);
-}
-
-/** Mirror the service math: tax applies to taxable lines only. */
-function computeTax(lines: LineRow[], taxRate: number): number {
-  const taxableSubtotal = lines.reduce(
-    (sum, l) => sum + (l.taxable ? computeLineTotal(l) : 0),
-    0,
+/**
+ * Mirror the service math (item-type aware): discount items subtract, subtotal items add
+ * nothing, sales-tax items add to the tax; the rate's tax applies to taxable lines only.
+ */
+function computeLiveTotals(lines: LineRow[], items: Item[], taxRate: number) {
+  return previewSalesTotals(
+    lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+    taxRate,
   );
-  return taxableSubtotal * taxRate;
 }
 
 const EMPTY_LINE: LineRow = {
@@ -198,7 +195,7 @@ interface NewMemoModalProps {
 
 function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCreated }: NewMemoModalProps) {
   const [customerId, setCustomerId] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [memoNote, setMemoNote] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
   const salesTaxOn = usePreferences().company.salesTaxEnabled;
@@ -242,7 +239,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
       setFlags(shippingFromDoc(null));
       setApplications([]);
       setCustomerId('');
-      setDate(new Date().toISOString().slice(0, 10));
+      setDate(todayISO());
       setMemoNote('');
       setTaxRateId('');
       setLines([{ ...EMPTY_LINE }]);
@@ -309,9 +306,10 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
   }, [quotes]);
 
   const selectedRate = taxRates.find((t) => t.id === taxRateId);
-  const liveSubtotal = computeSubtotal(lines);
-  const liveTax = selectedRate ? computeTax(lines, parseFloat(selectedRate.rate) || 0) : 0;
-  const liveTotal = liveSubtotal + liveTax;
+  const live = computeLiveTotals(lines, items, selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
+  const liveSubtotal = live.subtotal;
+  const liveTax = live.tax;
+  const liveTotal = live.total;
 
   function addLine() {
     setLines((prev) => [...prev, { ...EMPTY_LINE }]);

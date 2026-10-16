@@ -29,6 +29,7 @@ import {
   toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { isBankAccount } from '@/lib/accountTypes';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -78,7 +79,7 @@ const FREQ_LABEL: Record<Screen['frequency'], string> = {
   annually: 'yearly',
 };
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 
 async function openCheckPdf(id: string) {
   const res = await fetch('/api/checks/pdf', {

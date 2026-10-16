@@ -37,6 +37,7 @@ import {
   type TaxTracking,
 } from './payrollTaxTracking';
 import { getCompany } from './company';
+import { payrollLiabilityAccountIds } from './liabilityPayments';
 
 // ---------------------------------------------------------------------------
 // Wage bases: the Social Security wage base is YEAR-KEYED data in payrollTax.ts
@@ -170,11 +171,16 @@ function addCheck(f: EmployeeYearFigures, grossPay: string, lines: ReportLine[])
   for (const l of taxLines) if (lineTracking(l) === 'state_withholding') f.stateLineNames.push(l.name);
 }
 
-const BOX12_ORDER = ['D', 'E', 'G', 'S', 'W', 'DD'];
+/** W-2 Box 12 codes in the order the IRS lists them (alphabetical, single letters first). */
+const BOX12_ORDER = ['D', 'E', 'G', 'S', 'W', 'AA', 'BB', 'DD', 'EE'];
+const box12Rank = (code: string) => {
+  const i = BOX12_ORDER.indexOf(code);
+  return i < 0 ? BOX12_ORDER.length : i;
+};
 function box12List(m: Map<string, Dec>): Array<{ code: string; amount: string }> {
   return [...m.entries()]
     .filter(([, v]) => v.greaterThan(0))
-    .sort((a, b) => BOX12_ORDER.indexOf(a[0]) - BOX12_ORDER.indexOf(b[0]))
+    .sort((a, b) => box12Rank(a[0]) - box12Rank(b[0]) || a[0].localeCompare(b[0]))
     .map(([code, v]) => ({ code, amount: toAmountString(v) }));
 }
 function box14List(m: Map<string, Dec>): Array<{ label: string; amount: string }> {
@@ -199,7 +205,7 @@ export interface W2DataInput {
 }
 
 export interface W2StateBoxes {
-  /** Box 15: two-letter state code (from the employee address, else parsed from the
+  /** Box 15: two-letter state code (the employee's work state — W-4 state, else address — else parsed from the
    * state tax line name, e.g. "State Income Tax (CA)"). Null when unknown. */
   code: string | null;
   /** Box 16: state wages (Box 1 wages when any state withholding/code exists). */
@@ -288,16 +294,10 @@ export async function w2Data(
   for (const p of yearPaychecks) addCheck(f, p.grossPay, byCheck.get(p.id) ?? []);
 
   const employerInfo = companyProfile(company);
-  const addressState = (() => {
-    const addr = (employee.address ?? {}) as Record<string, unknown>;
-    return typeof addr.state === 'string' && /^[A-Za-z]{2}$/.test(addr.state.trim())
-      ? addr.state.trim().toUpperCase()
-      : null;
-  })();
-
-  // Box 15 state code: prefer the employee's address state; otherwise parse a
-  // "(XX)" suffix from a state tax line name (e.g. "State Income Tax (CA)").
-  let stateCode = addressState;
+  // Box 15 state code: the employee's work state — the same state withholding uses
+  // (W-4 state, else address state; employeeWorkState) — otherwise parse a "(XX)" suffix
+  // from a state tax line name (e.g. "State Income Tax (CA)").
+  let stateCode = employeeWorkState(employee as Parameters<typeof employeeWorkState>[0]);
   if (!stateCode) {
     for (const n of f.stateLineNames) {
       const m = n.match(/\(([A-Za-z]{2})\)/);
@@ -782,16 +782,9 @@ async function payrollTaxPayments(
   to: Date,
   isItem: (memo: string) => boolean,
 ): Promise<Form941Deposit[]> {
-  // Payroll liability accounts: 2300 plus every account a payroll item posts its liability to.
-  const base = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2300')));
-  const itemAccts = await ctx.db
-    .select({ id: payrollItems.liabilityAccountId })
-    .from(payrollItems)
-    .where(eq(payrollItems.companyId, ctx.companyId));
-  const liabAccounts = [...new Set([...base.map((b) => b.id), ...itemAccts.map((i) => i.id).filter((x): x is string => !!x)])].map((id) => ({ id }));
+  // Payroll liability accounts: 2300, the Preferences payroll liabilities account and every
+  // account a payroll item posts its liability to.
+  const liabAccounts = (await payrollLiabilityAccountIds(ctx)).map((id) => ({ id }));
   if (!liabAccounts.length) return [];
   const rows = await ctx.db
     .select({
@@ -1570,11 +1563,9 @@ export async function payrollLiabilityBalances(
   //    the matching item; memo-less (lump-sum) debits count toward the total only.
   let totalPaid = Money.zero();
   const paidByName = new Map<string, Dec>();
-  const [liabAccount] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2300')));
-  if (liabAccount) {
+  // Every account paychecks credit (2300, the Preferences account, payroll items' accounts).
+  const liabAccountIds = await payrollLiabilityAccountIds(ctx);
+  if (liabAccountIds.length) {
     const paymentLines = await ctx.db
       .select({ debit: journalEntryLines.debit, memo: journalEntryLines.memo })
       .from(journalEntryLines)
@@ -1583,7 +1574,7 @@ export async function payrollLiabilityBalances(
         and(
           eq(journalEntries.companyId, ctx.companyId),
           eq(journalEntries.status, 'posted'),
-          eq(journalEntryLines.accountId, liabAccount.id),
+          inArray(journalEntryLines.accountId, liabAccountIds),
           lte(journalEntries.date, asOf),
           // Paycheck / payroll-adjustment entries are accruals (already counted from their
           // lines above), never payments — even a negative liability adjustment's debit.

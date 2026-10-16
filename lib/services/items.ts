@@ -12,8 +12,9 @@
  * the item record and validates the linked account references.
  */
 import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
-import { accounts, assemblyComponents, items } from '@/lib/db/schema';
+import { accounts, assemblyComponents, inventoryLayers, inventoryMovements, items } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { Money } from '@/lib/money';
 import { assertItemTypeAllowed } from '@/lib/featureGate';
 import { assertNotControlLineAccount } from './posting';
 import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
@@ -321,6 +322,39 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
 }
 
 /**
+ * An inventory item can only change to another type while it carries no stock history: once it
+ * has quantity on hand, FIFO cost layers or site movements, its value sits in the inventory asset
+ * account, and every inventory report / COGS path only looks at type 'inventory' items — the
+ * change would strand that value in the GL (QB likewise refuses to convert an Inventory Part).
+ */
+async function assertInventoryTypeChangeAllowed(
+  ctx: ServiceContext,
+  item: { id: string; name: string; quantityOnHand: string | null },
+): Promise<void> {
+  const hasStock = !Money.of(item.quantityOnHand ?? '0').isZero();
+  const [layer] = hasStock
+    ? [undefined]
+    : await ctx.db
+        .select({ id: inventoryLayers.id })
+        .from(inventoryLayers)
+        .where(and(eq(inventoryLayers.companyId, ctx.companyId), eq(inventoryLayers.itemId, item.id)))
+        .limit(1);
+  const [movement] = hasStock || layer
+    ? [undefined]
+    : await ctx.db
+        .select({ id: inventoryMovements.id })
+        .from(inventoryMovements)
+        .where(and(eq(inventoryMovements.companyId, ctx.companyId), eq(inventoryMovements.itemId, item.id)))
+        .limit(1);
+  if (hasStock || layer || movement) {
+    throw validation(
+      `"${item.name}" is an inventory item with ${hasStock ? 'quantity on hand' : 'inventory history'}, so its type cannot change. ` +
+        'Create a new item of the type you need and make this one inactive instead.',
+    );
+  }
+}
+
+/**
  * Patch an existing item. Only supplied fields are changed. Validates name
  * uniqueness (if being changed) and account-link types.
  */
@@ -328,6 +362,9 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
   const before = await getItem(ctx, id);
   await assertAccountantListEdit(ctx, 'item', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
   if (patch.type !== undefined && patch.type !== before.type) await assertItemTypeAllowed(ctx, patch.type);
+  if (patch.type !== undefined && patch.type !== before.type && before.type === 'inventory') {
+    await assertInventoryTypeChangeAllowed(ctx, before);
+  }
 
   // ── Name validation ──────────────────────────────────────────────────────
   let newName = before.name;

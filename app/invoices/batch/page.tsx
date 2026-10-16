@@ -24,6 +24,7 @@ import {
   toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import {
   PricedLinesEditor,
@@ -61,7 +62,7 @@ export default function BatchInvoicingPage() {
   const [typeFilter, setTypeFilter] = useState('');
   const [search, setSearch] = useState('');
   const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(todayISO());
   const [dueDate, setDueDate] = useState('');
   const [taxMode, setTaxMode] = useState('customer');
   const [memo, setMemo] = useState('');

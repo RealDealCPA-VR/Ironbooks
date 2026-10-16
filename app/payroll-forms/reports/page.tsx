@@ -9,6 +9,7 @@ import { Fragment, useCallback, useEffect, useState } from 'react';
 import { ClipboardList } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, Select, Table, Td, Th, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 
 type ReportKey = 'earnings-summary' | 'item-detail' | 'transactions-by-payee' | 'workers-comp' | 'state-wage';
 
@@ -58,7 +59,7 @@ export default function PayrollReportsPage() {
   const year = new Date().getFullYear();
   const [report, setReport] = useState<ReportKey>('earnings-summary');
   const [from, setFrom] = useState(`${year}-01-01`);
-  const [to, setTo] = useState(new Date().toISOString().slice(0, 10));
+  const [to, setTo] = useState(todayISO());
   const [state, setState] = useState('');
   const [quarter, setQuarter] = useState(String(Math.floor(new Date().getMonth() / 3) + 1));
   const [wyear, setWyear] = useState(String(year));

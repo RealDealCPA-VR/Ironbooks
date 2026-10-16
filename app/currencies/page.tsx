@@ -28,7 +28,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
-import { formatDate } from '@/lib/dates';
+import { formatDate, todayISO } from '@/lib/dates';
 import { HomeCurrencyAdjustmentHistory, HomeCurrencyAdjustmentModal } from './HomeCurrencyAdjustment';
 import FeatureOff from '@/components/FeatureOff';
 import { usePreferences } from '@/lib/usePreferences';
@@ -213,7 +213,7 @@ function FxAdjustmentModal({
   const [accountId, setAccountId] = useState('');
   const [amount, setAmount] = useState('');
   const [gain, setGain] = useState(true);
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [memo, setMemo] = useState('');
   const [saving, setSaving] = useState(false);
 

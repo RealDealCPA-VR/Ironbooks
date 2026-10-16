@@ -26,6 +26,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import {
   ROUNDING_LABELS,
@@ -1082,7 +1083,7 @@ function PriceCheck({ items, customers, lookups }: { items: Item[]; customers: C
   const [customerId, setCustomerId] = useState('');
   const [itemId, setItemId] = useState('');
   const [qty, setQty] = useState('1');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [classId, setClassId] = useState('');
   const [repId, setRepId] = useState('');
   const [quote, setQuote] = useState<PriceQuote | null>(null);

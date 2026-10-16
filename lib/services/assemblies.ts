@@ -133,6 +133,21 @@ function buildMovements(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Builds move stock value between items with no GL posting, which only stays tied to the GL when
+ * both sides are stock-tracked ('inventory') items — any other type is invisible to inventory
+ * valuation and COGS relief, so its share of the value would vanish from the reports.
+ */
+function assertInventoryType(item: { name: string; type: string }, role: 'assembly' | 'component'): void {
+  if (item.type !== 'inventory') {
+    throw validation(
+      role === 'assembly'
+        ? `Only inventory items can be built or unbuilt; "${item.name}" is type "${item.type}".`
+        : `Component "${item.name}" is type "${item.type}"; assembly components must be inventory items.`,
+    );
+  }
+}
+
 async function loadItem(ctx: ServiceContext, itemId: string) {
   const [row] = await ctx.db
     .select()
@@ -367,6 +382,7 @@ export async function buildAssembly(
   }
 
   const assembly = await loadItem(ctx, input.assemblyItemId);
+  assertInventoryType(assembly, 'assembly');
   const bom = await getBom(ctx, input.assemblyItemId);
 
   if (bom.length === 0) {
@@ -394,6 +410,7 @@ export async function buildAssembly(
   for (const bomLine of bom) {
     const comp = componentMap.get(bomLine.componentItemId);
     if (!comp) throw notFound(`Component item ${bomLine.componentItemId}`);
+    assertInventoryType(comp, 'component');
 
     const required = buildQty.times(Money.of(bomLine.quantity));
     const onHand = Money.of(comp.quantityOnHand ?? '0');
@@ -512,6 +529,7 @@ export async function unbuildAssembly(
   }
 
   const assembly = await loadItem(ctx, input.assemblyItemId);
+  assertInventoryType(assembly, 'assembly');
   const currentAssemblyQty = Money.of(assembly.quantityOnHand ?? '0');
 
   if (unbuildQty.greaterThan(currentAssemblyQty)) {
@@ -550,6 +568,7 @@ export async function unbuildAssembly(
   const returnLines = bom.map((bomLine) => {
     const comp = componentMap.get(bomLine.componentItemId);
     if (!comp) throw notFound(`Component item ${bomLine.componentItemId}`);
+    assertInventoryType(comp, 'component');
     const returned = unbuildQty.times(Money.of(bomLine.quantity));
     const currentValue = returned.times(Money.of(comp.averageCost ?? '0'));
     return { comp, returned, currentValue };

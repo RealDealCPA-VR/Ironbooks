@@ -26,6 +26,7 @@ import {
   toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 
@@ -65,7 +66,7 @@ export default function SendFormsPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [stmtCustomer, setStmtCustomer] = useState('');
   const [stmtFrom, setStmtFrom] = useState('');
-  const [stmtTo, setStmtTo] = useState(new Date().toISOString().slice(0, 10));
+  const [stmtTo, setStmtTo] = useState(todayISO());
   const [stmtEmail, setStmtEmail] = useState('');
 
   const key = (i: QueueItem) => `${i.kind}:${i.id}`;

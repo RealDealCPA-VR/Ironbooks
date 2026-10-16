@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ArrowLeft } from 'lucide-react';
 import { api } from '@/lib/client';
+import { localDateISO, todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 
 export interface AccountOpt {
@@ -52,12 +53,14 @@ export function money(v: string | number | null | undefined): string {
   return formatCurrency(v ?? 0);
 }
 
+/** Today's local calendar date (lib/dates.ts todayISO). */
 export function today(): string {
-  return new Date().toISOString().slice(0, 10);
+  return todayISO();
 }
 
+/** The local calendar date n months ago. */
 export function monthsAgo(n: number): string {
   const d = new Date();
-  d.setUTCMonth(d.getUTCMonth() - n);
-  return d.toISOString().slice(0, 10);
+  d.setMonth(d.getMonth() - n);
+  return localDateISO(d);
 }

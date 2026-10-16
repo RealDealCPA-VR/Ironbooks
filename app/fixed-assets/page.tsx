@@ -18,6 +18,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency, Money } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -70,7 +71,7 @@ interface AssetForm {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 
 const EMPTY_FORM: AssetForm = {
   name: '',

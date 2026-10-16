@@ -23,6 +23,7 @@ import { CornerDownRight, ExternalLink, History } from 'lucide-react';
 import { Badge, Button, Modal, Table, Th, Td, Tr } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
 // sourceRef → route mapping (QuickZoom to the source document)
@@ -111,13 +112,8 @@ function statusTone(status: string): 'success' | 'void' | 'neutral' {
   return 'neutral';
 }
 
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString('en-US', {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-  });
-}
+// Entry dates are calendar days: formatDate (lib/format.ts) shows them without the UTC
+// off-by-one that `new Date(iso).toLocaleDateString()` had in US time zones.
 
 export interface EntryDetailModalProps {
   /** Journal entry to show; null hides the modal. */

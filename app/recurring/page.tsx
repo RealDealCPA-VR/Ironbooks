@@ -22,7 +22,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatDate } from '@/lib/dates';
+import { formatDate, todayISO } from '@/lib/dates';
 import RecurringSuggestions from '@/components/RecurringSuggestions';
 
 // ---------------------------------------------------------------------------
@@ -165,7 +165,7 @@ const DOC_BADGES: Record<DocType, { label: string; tone: 'neutral' | 'success' |
 // ---------------------------------------------------------------------------
 
 function todayIso(): string {
-  return new Date().toISOString().split('T')[0];
+  return todayISO();
 }
 
 function modeOf(tpl: RecurringTemplate): Mode {

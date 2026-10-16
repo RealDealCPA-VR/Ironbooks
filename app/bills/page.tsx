@@ -28,6 +28,7 @@ import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import {
   BarcodeScanInput,
@@ -249,7 +250,7 @@ export default function BillsPage() {
   // Form fields
   const [vendorId, setVendorId] = useState('');
   const [billNumber, setBillNumber] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [dueDate, setDueDate] = useState('');
   const [terms, setTerms] = useState('');
   // Terms list entries (custom and date-driven terms included); the built-in set until it loads.

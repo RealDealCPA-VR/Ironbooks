@@ -1102,6 +1102,84 @@ const THRESHOLD_1099 = Money.of('600');
  *
  * Only vendors with total >= $600 are returned.
  */
+/**
+ * 1099s report cash paid. A bill payment application stores the FULL settlement of the bill
+ * (cash + early-payment discount taken); the discount lives only on the payment's journal entry
+ * (the "Early-payment discounts" credit line, see billPayments.buildPaymentLines). Returns, per
+ * payment, the share of each application that was cash: (applied - discount) / applied, with the
+ * discount prorated across the payment's applications. Payments without a discount map to 1.
+ */
+async function billPaymentCashFactors(
+  ctx: ServiceContext,
+  paymentIds: string[],
+): Promise<Map<string, ReturnType<typeof Money.zero>>> {
+  const out = new Map<string, ReturnType<typeof Money.zero>>();
+  if (paymentIds.length === 0) return out;
+  const pays = await ctx.db
+    .select({
+      id: billPayments.id,
+      postedEntryId: billPayments.postedEntryId,
+      paymentAccountId: billPayments.paymentAccountId,
+      currency: billPayments.currency,
+      exchangeRate: billPayments.exchangeRate,
+    })
+    .from(billPayments)
+    .where(and(eq(billPayments.companyId, ctx.companyId), inArray(billPayments.id, paymentIds)));
+  const entryIds = pays.map((p) => p.postedEntryId).filter((v): v is string => !!v);
+  if (entryIds.length === 0) return out;
+  const discLines = await ctx.db
+    .select({
+      entryId: journalEntryLines.journalEntryId,
+      accountId: journalEntryLines.accountId,
+      credit: journalEntryLines.credit,
+    })
+    .from(journalEntryLines)
+    .where(
+      and(
+        inArray(journalEntryLines.journalEntryId, entryIds),
+        sql`${journalEntryLines.memo} LIKE 'Early-payment discounts%'`,
+      ),
+    );
+  if (discLines.length === 0) return out;
+  const appSums = await ctx.db
+    .select({
+      billPaymentId: billPaymentApplications.billPaymentId,
+      total: sql<string>`COALESCE(SUM(${billPaymentApplications.amountApplied}), 0)`,
+    })
+    .from(billPaymentApplications)
+    .where(inArray(billPaymentApplications.billPaymentId, paymentIds))
+    .groupBy(billPaymentApplications.billPaymentId);
+  const appSumById = new Map(appSums.map((r) => [r.billPaymentId, Money.of(r.total)]));
+  for (const p of pays) {
+    if (!p.postedEntryId) continue;
+    let discHome = Money.zero();
+    for (const l of discLines) {
+      if (l.entryId !== p.postedEntryId || l.accountId === p.paymentAccountId) continue;
+      discHome = discHome.plus(Money.of(l.credit ?? 0));
+    }
+    if (!discHome.greaterThan(0)) continue;
+    // The discount line is in home currency; applications are in the bills' currency.
+    const disc = p.currency && p.exchangeRate && Money.of(p.exchangeRate).greaterThan(0)
+      ? Money.round2(discHome.dividedBy(Money.of(p.exchangeRate)))
+      : discHome;
+    const applied = appSumById.get(p.id) ?? Money.zero();
+    if (!applied.greaterThan(0)) continue;
+    const cash = applied.minus(disc);
+    out.set(p.id, cash.lessThanOrEqualTo(0) ? Money.zero() : cash.dividedBy(applied));
+  }
+  return out;
+}
+
+/** Cash part of one application (see billPaymentCashFactors). */
+function cashOfApplication(
+  factors: Map<string, ReturnType<typeof Money.zero>>,
+  billPaymentId: string,
+  amountApplied: string,
+): ReturnType<typeof Money.zero> {
+  const f = factors.get(billPaymentId);
+  return f ? Money.round2(Money.of(amountApplied).times(f)) : Money.of(amountApplied);
+}
+
 export async function vendor1099Report(
   ctx: ServiceContext,
   { year }: { year: number },
@@ -1123,6 +1201,7 @@ export async function vendor1099Report(
       vendorId: vendors.id,
       vendorName: vendors.displayName,
       taxId: vendors.taxId,
+      billPaymentId: billPaymentApplications.billPaymentId,
       amountApplied: billPaymentApplications.amountApplied,
     })
     .from(billPaymentApplications)
@@ -1159,6 +1238,7 @@ export async function vendor1099Report(
         eq(vendors.is1099, true),
         gte(expenses.date, yearStart),
         lt(expenses.date, yearEnd),
+        isNull(expenses.voidedAt),
         // Same card-settled exclusion as bill payments.
         ne(expenses.method, 'credit_card'),
         fundingAccountNotCreditCard,
@@ -1178,8 +1258,14 @@ export async function vendor1099Report(
     totals.get(vendorId)!.total = totals.get(vendorId)!.total.plus(Money.of(amount));
   }
 
+  const cashFactors = await billPaymentCashFactors(ctx, [...new Set(billPaymentRows.map((r) => r.billPaymentId))]);
   for (const r of billPaymentRows) {
-    accumulate(r.vendorId, r.vendorName, r.taxId ?? null, r.amountApplied);
+    accumulate(
+      r.vendorId,
+      r.vendorName,
+      r.taxId ?? null,
+      toAmountString(cashOfApplication(cashFactors, r.billPaymentId, r.amountApplied)),
+    );
   }
   for (const r of expenseRows) {
     accumulate(r.vendorId, r.vendorName, r.taxId ?? null, r.total);
@@ -1392,6 +1478,7 @@ export async function vendor1099Worksheet(
       vendorId: vendors.id,
       vendorName: vendors.displayName,
       taxId: vendors.taxId,
+      billPaymentId: billPaymentApplications.billPaymentId,
       amountApplied: billPaymentApplications.amountApplied,
     })
     .from(billPaymentApplications)
@@ -1479,9 +1566,10 @@ export async function vendor1099Worksheet(
   }
 
   // Bill payments: prorate each application across the bill's lines by amount.
+  const cashFactors = await billPaymentCashFactors(ctx, [...new Set(applicationRows.map((r) => r.billPaymentId))]);
   for (const app of applicationRows) {
     const lines = linesByBill.get(app.billId) ?? [];
-    const applied = Money.of(app.amountApplied);
+    const applied = cashOfApplication(cashFactors, app.billPaymentId, app.amountApplied);
     if (applied.lessThanOrEqualTo(0)) continue;
     const lineSum = lines.reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero());
     if (lines.length === 0 || lineSum.lessThanOrEqualTo(0)) {

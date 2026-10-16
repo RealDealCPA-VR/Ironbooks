@@ -31,7 +31,7 @@
  */
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { hasAccountantCost } from './accountantCopy/inventoryCost';
-import { and, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { creditLimitFixes } from '@/lib/errorFixes';
 import { assertStockAvailable } from './stockWarning';
@@ -53,6 +53,7 @@ import {
   salesReps,
   taxRates,
 } from '@/lib/db/schema';
+import { depositLines, deposits } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -389,6 +390,26 @@ async function storedPaymentLineTotal(ctx: ServiceContext, invoiceId: string) {
     .innerJoin(items, eq(items.id, invoiceLines.itemId))
     .where(and(eq(invoiceLines.invoiceId, invoiceId), eq(items.type, 'payment')));
   return rows.reduce((sum, r) => sum.plus(Money.of(r.amount)), Money.zero());
+}
+
+/**
+ * The (non-void) bank deposit that took this invoice's payment-item lines out of Undeposited
+ * Funds (deposit line `invoicePayment:<id>`, lib/services/deposits.ts), or null.
+ */
+async function invoicePaymentDepositOf(ctx: ServiceContext, invoiceId: string) {
+  const [row] = await ctx.db
+    .select({ id: deposits.id, date: deposits.date })
+    .from(depositLines)
+    .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
+    .where(
+      and(
+        eq(deposits.companyId, ctx.companyId),
+        isNull(deposits.voidedAt),
+        eq(depositLines.description, `invoicePayment:${invoiceId}`),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
 }
 
 /** True when the invoice has payments applied beyond its own payment-item lines. */
@@ -1811,6 +1832,21 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   // current balance from the credit-limit exposure — it is being replaced.
   const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
   assertEditKeepsApplications(existing, input, prep, externalPaidPre);
+  // The payment-item lines are in a bank deposit: that deposit took exactly their amount out of
+  // Undeposited Funds, so the edit must keep it (same amount, currency and rate).
+  if (existing.status !== 'draft' && (await invoicePaymentDepositOf(ctx, id))) {
+    const oldPayments = await storedPaymentLineTotal(ctx, id);
+    if (
+      !Money.round2(oldPayments).equals(Money.round2(prep.paymentTotal)) ||
+      (input.currency ?? null) !== (existing.currency ?? null) ||
+      !Money.eq(prep.exchangeRate, Money.of(existing.exchangeRate ?? 1))
+    ) {
+      throw new ServiceError(
+        'CONFLICT',
+        'The payment recorded on this invoice is part of a bank deposit, so its amount, currency and exchange rate cannot change. Remove it from the deposit (or void the deposit) first.',
+      );
+    }
+  }
 
   // ── Drafts: editing a pending invoice is a simple row update — nothing was
   //    ever posted, so there is no GL/COGS to void or re-post. ──
@@ -2173,6 +2209,14 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
     throw new ServiceError(
       'CONFLICT',
       'Cannot void an invoice that has payments applied. Unapply payments first.',
+    );
+  }
+  // Its payment-item lines were swept into a bank deposit: voiding would take that money out of
+  // Undeposited Funds a second time.
+  if (await invoicePaymentDepositOf(ctx, id)) {
+    throw new ServiceError(
+      'CONFLICT',
+      'The payment recorded on this invoice has been included in a deposit, so the invoice cannot be voided. Remove it from the deposit (or void the deposit) first.',
     );
   }
 

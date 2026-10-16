@@ -22,7 +22,7 @@ import {
   SESSION_COOKIE,
 } from '@/lib/auth';
 import { verifyTotp } from '@/lib/totp';
-import { COMPANY_COOKIE, DEACTIVATED_MESSAGE } from '@/lib/context';
+import { ARCHIVED_ONLY_MESSAGE, COMPANY_COOKIE, DEACTIVATED_MESSAGE, isArchivedCompany } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { startSession } from '@/lib/services/sessions';
@@ -101,18 +101,32 @@ async function handlePost(req: NextRequest) {
     limiter.recordSuccess(keys.slice(0, -1)); // keep the global counter
 
     // Find a company for this user (ACTIVE membership first, else owned).
+    // Archived (soft-deleted) companies are never picked (same rule as getServerContext).
     const memberships = await db
-      .select({ companyId: userCompanies.companyId, isActive: userCompanies.isActive })
+      .select({
+        companyId: userCompanies.companyId,
+        isActive: userCompanies.isActive,
+        settings: companies.settings,
+      })
       .from(userCompanies)
+      .innerJoin(companies, eq(companies.id, userCompanies.companyId))
       .where(eq(userCompanies.userId, user.id));
-    let companyId = memberships.find((m) => m.isActive)?.companyId;
+    const activeMemberships = memberships.filter((m) => m.isActive);
+    let companyId = activeMemberships.find((m) => !isArchivedCompany(m.settings))?.companyId;
+    if (!companyId && activeMemberships.length) {
+      // Every company this user is active in has been archived — no session.
+      return NextResponse.json({ error: ARCHIVED_ONLY_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
+    }
     if (!companyId && memberships.length) {
       // Deactivated in every company of this file (Users & Roles) — no session.
       return NextResponse.json({ error: DEACTIVATED_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
     }
     if (!companyId) {
-      const [owned] = await db.select({ id: companies.id }).from(companies).where(eq(companies.ownerId, user.id)).limit(1);
-      companyId = owned?.id;
+      const owned = await db
+        .select({ id: companies.id, settings: companies.settings })
+        .from(companies)
+        .where(eq(companies.ownerId, user.id));
+      companyId = owned.find((c) => !isArchivedCompany(c.settings))?.id;
     }
 
     // gapsb K: an old password still signs in; when it has expired (file password policy) or an

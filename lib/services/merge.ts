@@ -14,7 +14,7 @@
  * reference the correct A/R / A/P accounts; only the customer/vendor FK on the
  * sub-ledger documents is updated. The GL and trial balance remain balanced.
  */
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, like, sql } from 'drizzle-orm';
 import {
   bouncedChecks,
   collectionNotes,
@@ -56,6 +56,8 @@ import {
   fixedAssets,
   recurringTemplates,
   memorizedReports,
+  depositLines,
+  workingTbNotes,
 } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, inTransaction, writeAudit } from './_base';
@@ -839,6 +841,56 @@ export async function mergeAccounts(
       }
     }
     reassigned['memorizedReports'] = memorizedCount;
+
+    // --- Columns without a foreign key and ids embedded in text. ---
+    // Early-payment discount account on received payments (plain uuid column, no FK).
+    await count(
+      'paymentsReceivedDiscount',
+      tx.db
+        .update(paymentsReceived)
+        .set({ discountAccountId: toId })
+        .where(and(eq(paymentsReceived.discountAccountId, fromId), eq(paymentsReceived.companyId, tx.companyId)))
+        .returning({ id: paymentsReceived.id }),
+    );
+    // Deposit-line markers ("cashback:<accountId>", any "<prefix>:<accountId>"): re-saving a
+    // deposit rebuilds its GL from these, so they must name the survivor.
+    await count(
+      'depositLineMarkers',
+      tx.db
+        .update(depositLines)
+        .set({ description: sql`replace(${depositLines.description}, ${fromId}, ${toId})` })
+        .where(
+          and(
+            like(depositLines.description, `%:${fromId}`),
+            inArray(
+              depositLines.depositId,
+              tx.db.select({ id: deposits.id }).from(deposits).where(eq(deposits.companyId, tx.companyId)),
+            ),
+          ),
+        )
+        .returning({ id: depositLines.id }),
+    );
+    // Working trial balance notes are unique per (account, period): fold a duplicate period's
+    // note into the survivor's before the sweep re-points the rest.
+    const fromNotes = await tx.db.select().from(workingTbNotes).where(eq(workingTbNotes.accountId, fromId));
+    for (const n of fromNotes) {
+      const [keep] = await tx.db
+        .select()
+        .from(workingTbNotes)
+        .where(and(eq(workingTbNotes.accountId, toId), eq(workingTbNotes.periodEnd, n.periodEnd)));
+      if (!keep) continue;
+      const note = [keep.note, n.note].filter((x) => x && x.trim()).join('\n') || null;
+      await tx.db
+        .update(workingTbNotes)
+        .set({ note, workpaperRef: keep.workpaperRef ?? n.workpaperRef, updatedAt: new Date() })
+        .where(eq(workingTbNotes.id, keep.id));
+      await tx.db.delete(workingTbNotes).where(eq(workingTbNotes.id, n.id));
+    }
+    // Every other FOREIGN KEY to accounts (deposit lines, payroll items, loans, bounced checks,
+    // check documents, landed cost, AI auto-apply log, working TB notes, and any table added
+    // later) follows the survivor. The hierarchy was handled above.
+    const swept = await repointForeignKeys(tx, 'accounts', fromId, toId, { skip: ['accounts.parent_id'] });
+    for (const [k, n] of Object.entries(swept)) reassigned[`fk:${k}`] = n;
 
     // --- Cached balances: the DB trigger already moved the balance along with the
     // re-pointed lines (survivor = full ledger, source = 0). Read the survivor's

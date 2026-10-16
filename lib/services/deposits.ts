@@ -22,6 +22,11 @@
  * sourceRef traceability). Cash-back lines use `cashback:<accountId>` with a
  * NEGATIVE amount so that sum(lines) always equals deposits.total (net).
  *
+ * Invoice payment-item lines (money taken at the time of the sale and recorded on the invoice
+ * itself) also land in Undeposited Funds, inside the invoice's own entry. They are deposited the
+ * same way as sales receipts: one line per invoice described `invoicePayment:<invoiceId>`, for
+ * the sum of the invoice's payment-item lines.
+ *
  * p1 fx — a deposit is in its bank account's currency (QB Make Deposits shows only the payments
  * in that currency). Amounts on the deposit and its lines stay in that currency; the GL gets home
  * values: Undeposited Funds is relieved at the home value each payment was received at, the bank
@@ -30,13 +35,16 @@
  */
 import { depositMismatchFixes, missingAccountFixes } from '@/lib/errorFixes';
 import { defaultAccountFor } from './errorFixes';
-import { and, eq, inArray, isNull, like, lte, ne, notInArray } from 'drizzle-orm';
+import { and, eq, inArray, isNull, like, lte, ne, notInArray, sql } from 'drizzle-orm';
 import {
   accounts,
   bouncedChecks,
   customers,
   deposits,
   depositLines,
+  invoiceLines,
+  invoices,
+  items,
   journalEntries,
   journalEntryLines,
   paymentsReceived,
@@ -84,6 +92,7 @@ async function postedUndepositedHome(
 
 export const RECEIPT_LINE_PREFIX = 'salesReceipt:';
 export const CASHBACK_LINE_PREFIX = 'cashback:';
+export const INVOICE_PAYMENT_LINE_PREFIX = 'invoicePayment:';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,6 +120,8 @@ export interface CreateDepositInput {
   paymentIds?: string[];
   /** IDs of salesReceipts rows (sitting in UF) to include in this deposit. */
   salesReceiptIds?: string[];
+  /** IDs of invoices whose payment-item lines (sitting in UF) are included in this deposit. */
+  invoicePaymentIds?: string[];
   /** Additional non-UF deposit lines (e.g. owner contribution: Dr bank / Cr equity). */
   extraLines?: ExtraDepositLineInput[];
   /** QB "Cash back goes to": Dr cash account, reduces the net bank deposit. */
@@ -123,7 +134,7 @@ export interface CreateDepositInput {
 /** Unified row shape for the "Payments to Deposit" picker. */
 export interface UndepositedItem {
   id: string;
-  kind: 'payment' | 'sales_receipt';
+  kind: 'payment' | 'sales_receipt' | 'invoice_payment';
   customerId: string | null;
   customerName: string | null;
   date: Date;
@@ -183,6 +194,59 @@ async function usedSalesReceiptIds(ctx: ServiceContext, excludeDepositId?: strin
   return rows
     .map((r) => (r.description ?? '').slice(RECEIPT_LINE_PREFIX.length))
     .filter((id) => id.length > 0);
+}
+
+/** Invoice IDs whose payment-item lines a NON-VOIDED deposit consumed (via description encoding). */
+async function usedInvoicePaymentIds(ctx: ServiceContext, excludeDepositId?: string, asOf?: Date): Promise<string[]> {
+  const rows = await ctx.db
+    .select({ description: depositLines.description })
+    .from(depositLines)
+    .innerJoin(deposits, eq(depositLines.depositId, deposits.id))
+    .where(
+      and(
+        eq(deposits.companyId, ctx.companyId),
+        isNull(deposits.voidedAt),
+        ...(excludeDepositId ? [ne(deposits.id, excludeDepositId)] : []),
+        ...(asOf ? [lte(deposits.date, asOf)] : []),
+        like(depositLines.description, `${INVOICE_PAYMENT_LINE_PREFIX}%`),
+      ),
+    );
+  return rows
+    .map((r) => (r.description ?? '').slice(INVOICE_PAYMENT_LINE_PREFIX.length))
+    .filter((id) => id.length > 0);
+}
+
+/**
+ * Invoices with payment-item lines: the amount those lines put in Undeposited Funds, in the
+ * invoice's currency. Optionally only `ids`, or only invoices dated on or before `asOf`.
+ */
+async function invoicePaymentRows(ctx: ServiceContext, opts: { ids?: string[]; asOf?: Date } = {}) {
+  if (opts.ids && opts.ids.length === 0) return [];
+  return ctx.db
+    .select({
+      id: invoices.id,
+      customerId: invoices.customerId,
+      date: invoices.date,
+      status: invoices.status,
+      invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
+      currency: invoices.currency,
+      exchangeRate: invoices.exchangeRate,
+      postedEntryId: invoices.postedEntryId,
+      amount: sql<string>`COALESCE(SUM(CAST(${invoiceLines.amount} AS NUMERIC)), 0)`,
+    })
+    .from(invoiceLines)
+    .innerJoin(invoices, eq(invoices.id, invoiceLines.invoiceId))
+    .innerJoin(items, eq(items.id, invoiceLines.itemId))
+    .where(
+      and(
+        eq(invoices.companyId, ctx.companyId),
+        eq(items.type, 'payment'),
+        ...(opts.ids ? [inArray(invoices.id, opts.ids)] : []),
+        ...(opts.asOf ? [lte(invoices.date, opts.asOf)] : []),
+      ),
+    )
+    .groupBy(invoices.id);
 }
 
 async function customerNameMap(
@@ -254,10 +318,22 @@ export async function listUndepositedPayments(
     .where(and(...srConditions))
     .orderBy(salesReceipts.date);
 
+  // ── invoice payment-item lines (posted invoices only; a void one took them back out) ──
+  const usedInvIds = new Set(await usedInvoicePaymentIds(ctx, undefined, asOf));
+  const invRows = (await invoicePaymentRows(ctx, { asOf })).filter(
+    (r) =>
+      r.status !== 'void' &&
+      r.status !== 'draft' &&
+      r.postedEntryId &&
+      Money.of(r.amount).greaterThan(0) &&
+      !usedInvIds.has(r.id),
+  );
+
   // ── unify + enrich with customer names ──────────────────────────────────
   const custMap = await customerNameMap(ctx, [
     ...pmtRows.map((r) => r.customerId),
     ...srRows.map((r) => r.customerId),
+    ...invRows.map((r) => r.customerId),
   ]);
   const home = await homeCode(ctx);
 
@@ -284,6 +360,17 @@ export async function listUndepositedPayments(
       amount: r.total,
       currency: null,
     })),
+    ...invRows.map((r) => ({
+      id: r.id,
+      kind: 'invoice_payment' as const,
+      customerId: r.customerId,
+      customerName: custMap.get(r.customerId) ?? null,
+      date: r.date,
+      method: 'payment',
+      reference: `Invoice #${r.refNumber || r.invoiceNumber}`,
+      amount: toAmountString(r.amount),
+      currency: foreignCode(r.currency, home),
+    })),
   ];
 
   return items.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
@@ -306,6 +393,7 @@ interface PreparedDeposit {
   netStr: string;
   paymentIds: string[];
   salesReceiptIds: string[];
+  invoicePaymentIds: string[];
   extraLines: ExtraDepositLineInput[];
   cashBackAmt: ReturnType<typeof Money.zero>;
   /** p1 fx: deposit currency (null = home), rate, home value of the net deposit. */
@@ -325,9 +413,15 @@ async function prepareDeposit(
 ): Promise<PreparedDeposit> {
   const paymentIds = input.paymentIds ?? [];
   const salesReceiptIds = input.salesReceiptIds ?? [];
+  const invoicePaymentIds = input.invoicePaymentIds ?? [];
   const extraLines = input.extraLines ?? [];
 
-  if (paymentIds.length === 0 && salesReceiptIds.length === 0 && extraLines.length === 0) {
+  if (
+    paymentIds.length === 0 &&
+    salesReceiptIds.length === 0 &&
+    invoicePaymentIds.length === 0 &&
+    extraLines.length === 0
+  ) {
     throw validation(
       'A deposit must include at least one payment, sales receipt, or additional line.',
     );
@@ -340,6 +434,9 @@ async function prepareDeposit(
   }
   if (new Set(salesReceiptIds).size !== salesReceiptIds.length) {
     throw validation('Duplicate salesReceiptId in deposit.');
+  }
+  if (new Set(invoicePaymentIds).size !== invoicePaymentIds.length) {
+    throw validation('Duplicate invoice payment in deposit.');
   }
 
   const ufId = await getUFAccountId(ctx);
@@ -457,6 +554,26 @@ async function prepareDeposit(
     }
   }
 
+  // ── invoice payment-item lines: ownership + posted + currency ────────────
+  const invRows = await invoicePaymentRows(ctx, { ids: invoicePaymentIds });
+  if (invRows.length !== invoicePaymentIds.length) {
+    throw notFound('One or more invoice payments');
+  }
+  for (const r of invRows) {
+    const label = `Invoice #${r.refNumber || r.invoiceNumber}`;
+    if (r.status === 'void') throw validation(`${label} is voided, so its payment cannot be deposited.`);
+    if (r.status === 'draft' || !r.postedEntryId) {
+      throw validation(`${label} is still pending, so its payment is not in Undeposited Funds yet.`);
+    }
+    if (!Money.of(r.amount).greaterThan(0)) throw validation(`${label} has no payment to deposit.`);
+    const invCur = foreignCode(r.currency, home);
+    if (invCur !== depCur) {
+      throw validation(
+        `The payment on ${label} is in ${invCur ?? home ?? 'your home currency'}. Deposit it into a ${invCur ?? 'home-currency'} bank account — a deposit holds payments in its account's currency only.`,
+      );
+    }
+  }
+
   // ── double-deposit guards (against non-voided deposits only) ─────────────
   if (paymentIds.length > 0) {
     const used = (await usedPaymentIds(ctx, excludeDepositId)).filter((id) => paymentIds.includes(id));
@@ -483,6 +600,19 @@ async function prepareDeposit(
     }
   }
 
+  if (invoicePaymentIds.length > 0) {
+    const used = (await usedInvoicePaymentIds(ctx, excludeDepositId)).filter((id) =>
+      invoicePaymentIds.includes(id),
+    );
+    if (used.length > 0) {
+      throw new ServiceError(
+        'CONFLICT',
+        `The payment on one or more invoices has already been deposited: ${used.join(', ')}`,
+        { alreadyDeposited: used },
+      );
+    }
+  }
+
   // ── extra lines: account ownership + positive amounts ───────────────────
   for (const [i, line] of extraLines.entries()) {
     if (!line.accountId) {
@@ -492,7 +622,11 @@ async function prepareDeposit(
       throw validation(`Extra line ${i + 1}: amount must be greater than zero.`);
     }
     const desc = line.description ?? '';
-    if (desc.startsWith(RECEIPT_LINE_PREFIX) || desc.startsWith(CASHBACK_LINE_PREFIX)) {
+    if (
+      desc.startsWith(RECEIPT_LINE_PREFIX) ||
+      desc.startsWith(CASHBACK_LINE_PREFIX) ||
+      desc.startsWith(INVOICE_PAYMENT_LINE_PREFIX)
+    ) {
       throw validation(`Extra line ${i + 1}: description uses a reserved prefix.`);
     }
     const [lineAcct] = await ctx.db
@@ -527,6 +661,7 @@ async function prepareDeposit(
   let ufTotal = Money.zero(); // payments + receipts sitting in UF
   for (const p of payRows) ufTotal = ufTotal.plus(Money.of(p.amount));
   for (const r of srRows) ufTotal = ufTotal.plus(Money.of(r.total));
+  for (const r of invRows) ufTotal = ufTotal.plus(Money.round2(r.amount));
 
   let extraTotal = Money.zero();
   for (const l of extraLines) extraTotal = extraTotal.plus(Money.round2(l.amount));
@@ -560,6 +695,13 @@ async function prepareDeposit(
     ufHome = ufHome.plus(fx ? (postedUf.get(p.id) ?? toHome(p.amount, p.exchangeRate ?? 1)) : Money.of(p.amount));
   }
   for (const r of srRows) ufHome = ufHome.plus(Money.of(r.total));
+  // Invoice payment lines: the home amount the invoice's own entry put into Undeposited Funds.
+  const postedInvUf = fx ? await postedUndepositedHome(ctx, invRows, ufId) : new Map<string, Decimal>();
+  for (const r of invRows) {
+    ufHome = ufHome.plus(
+      fx ? (postedInvUf.get(r.id) ?? toHome(r.amount, r.exchangeRate ?? 1)) : Money.round2(r.amount),
+    );
+  }
   const extraHome = homeAmounts(
     extraLines.map((l) => Money.round2(l.amount)),
     rate,
@@ -615,6 +757,11 @@ async function prepareDeposit(
       description: `${RECEIPT_LINE_PREFIX}${r.id}`,
       amount: r.total,
     })),
+    ...invRows.map((r) => ({
+      paymentId: null,
+      description: `${INVOICE_PAYMENT_LINE_PREFIX}${r.id}`,
+      amount: toAmountString(Money.round2(r.amount)),
+    })),
     ...extraLines.map((l) => ({
       paymentId: null,
       description: l.description ?? 'Additional deposit line',
@@ -638,6 +785,7 @@ async function prepareDeposit(
     netStr,
     paymentIds,
     salesReceiptIds,
+    invoicePaymentIds,
     extraLines,
     cashBackAmt,
     currency: depCur,
@@ -664,7 +812,7 @@ function fxHeader(prep: PreparedDeposit) {
 
 export async function createDeposit(ctx: ServiceContext, input: CreateDepositInput) {
   const prep = await prepareDeposit(ctx, input);
-  const { netStr, paymentIds, salesReceiptIds, extraLines, cashBackAmt } = prep;
+  const { netStr, paymentIds, salesReceiptIds, invoicePaymentIds, extraLines, cashBackAmt } = prep;
 
   return inTransaction(ctx, async (tx) => {
     // 1. Post GL.
@@ -711,6 +859,7 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
         total: netStr,
         paymentIds,
         salesReceiptIds,
+        invoicePaymentIds,
         extraLines: extraLines.map((l) => ({
           accountId: l.accountId,
           amount: toAmountString(Money.round2(l.amount)),
@@ -723,7 +872,7 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
       },
     });
 
-    return { ...deposit, lines: [...paymentIds, ...salesReceiptIds] };
+    return { ...deposit, lines: [...paymentIds, ...salesReceiptIds, ...invoicePaymentIds] };
   });
 }
 
@@ -958,6 +1107,7 @@ export async function removePaymentFromDeposit(
   }
   const paymentIds: string[] = [];
   const salesReceiptIds: string[] = [];
+  const invoicePaymentIds: string[] = [];
   const extraLines: ExtraDepositLineInput[] = [];
   let cashBack: CashBackInput | null = null;
   for (const l of deposit.lines) {
@@ -966,6 +1116,8 @@ export async function removePaymentFromDeposit(
       if (l.paymentId !== paymentId) paymentIds.push(l.paymentId);
     } else if (desc.startsWith(RECEIPT_LINE_PREFIX)) {
       salesReceiptIds.push(desc.slice(RECEIPT_LINE_PREFIX.length));
+    } else if (desc.startsWith(INVOICE_PAYMENT_LINE_PREFIX)) {
+      invoicePaymentIds.push(desc.slice(INVOICE_PAYMENT_LINE_PREFIX.length));
     } else if (desc.startsWith(CASHBACK_LINE_PREFIX)) {
       cashBack = {
         accountId: desc.slice(CASHBACK_LINE_PREFIX.length),
@@ -980,7 +1132,12 @@ export async function removePaymentFromDeposit(
       );
     }
   }
-  if (paymentIds.length === 0 && salesReceiptIds.length === 0 && extraLines.length === 0) {
+  if (
+    paymentIds.length === 0 &&
+    salesReceiptIds.length === 0 &&
+    invoicePaymentIds.length === 0 &&
+    extraLines.length === 0
+  ) {
     await voidDeposit(ctx, depositId);
     return { voided: true };
   }
@@ -989,6 +1146,7 @@ export async function removePaymentFromDeposit(
     date: deposit.date,
     paymentIds,
     salesReceiptIds,
+    invoicePaymentIds,
     extraLines,
     cashBack,
     memo: deposit.memo,

@@ -13,6 +13,7 @@ import { useRouter } from 'next/navigation';
 import { PieChart } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, Select, Spinner, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 
 interface GraphData {
   kind: string;
@@ -173,7 +174,7 @@ export default function GraphsPage() {
   const year = new Date().getFullYear();
   const [kind, setKind] = useState('income-expense');
   const [from, setFrom] = useState(`${year}-01-01`);
-  const [to, setTo] = useState(new Date().toISOString().slice(0, 10));
+  const [to, setTo] = useState(todayISO());
   const [budgetId, setBudgetId] = useState('');
   const [budgets, setBudgets] = useState<{ id: string; name: string; fiscalYear: number }[]>([]);
   const [data, setData] = useState<GraphData | null>(null);

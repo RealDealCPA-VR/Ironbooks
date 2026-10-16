@@ -54,6 +54,7 @@ import {
   type CheckPosition,
 } from '@/lib/pdf/checkLayout';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -239,7 +240,7 @@ export default function PrintChecksPage() {
   // ── Quick-check form state ────────────────────────────────────────────────
   const [payee, setPayee] = useState('');
   const [amount, setAmount] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [memo, setMemo] = useState('');
   const [checkNumber, setCheckNumber] = useState('');
   const [generating, setGenerating] = useState(false);

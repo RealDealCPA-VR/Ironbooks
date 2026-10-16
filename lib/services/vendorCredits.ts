@@ -26,10 +26,11 @@
 
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import {
   accounts,
+  auditLogs,
   bills,
   classes,
   customers,
@@ -900,6 +901,32 @@ export interface UnapplyFromBillInput {
  * This makes the "unapply first" instructions in voidBill / voidVendorCredit
  * actually satisfiable.
  */
+/**
+ * Net amount a vendor credit has applied to one bill (applications minus unapplications), from the
+ * audit trail applyToBill / unapplyFromBill (home and foreign) write in the same transaction.
+ */
+export async function netAppliedToBill(ctx: ServiceContext, vendorCreditId: string, billId: string): Promise<Decimal> {
+  const rows = await ctx.db
+    .select({ newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'vendor_credit'),
+        eq(auditLogs.entityId, vendorCreditId),
+        sql`${auditLogs.newValues}->>'billId' = ${billId}`,
+        sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
+      ),
+    );
+  let net = Money.zero();
+  for (const r of rows) {
+    const nv = (r.newValues ?? {}) as { action?: string; amount?: string };
+    const a = Money.of(nv.amount ?? '0');
+    net = nv.action === 'applied_to_bill' ? net.plus(a) : net.minus(a);
+  }
+  return Money.round2(net);
+}
+
 export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBillInput) {
   const unapplyAmount = Money.round2(input.amount);
 
@@ -944,6 +971,14 @@ export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBil
   if (unapplyAmount.greaterThan(billCredited)) {
     throw validation(
       `Unapply amount ${toAmountString(unapplyAmount)} exceeds the bill's credited amount ${toAmountString(billCredited)}.`,
+    );
+  }
+  // Only what THIS credit applied to THIS bill can come off it (refunds are not applications).
+  const pairApplied = await netAppliedToBill(ctx, credit.id, bill.id);
+  if (unapplyAmount.greaterThan(pairApplied)) {
+    throw validation(
+      `Unapply amount ${toAmountString(unapplyAmount)} exceeds the ${toAmountString(pairApplied)} this vendor credit has applied to this bill.`,
+      { appliedToBill: toAmountString(pairApplied) },
     );
   }
   const creditCurrency = await foreignCurrencyOf(ctx, credit.currency);

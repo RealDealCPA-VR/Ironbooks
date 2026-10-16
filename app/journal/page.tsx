@@ -39,6 +39,8 @@ import type { TypeaheadChoice } from '@/lib/typeahead';
 import { computeJournalBalance, journalPayloadAmount } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/format';
+import { firstOfNextMonthISO, todayISO } from '@/lib/dates';
 import { useNewParam } from '@/lib/useFocusParam';
 import EntryDetailModal from '@/components/EntryDetailModal';
 // wave2 prefs: Preferences-driven labels/warnings, memorize (Ctrl+M), attachments
@@ -53,6 +55,7 @@ import { useErrorFixes } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y } from '@/components/FieldError';
 import { applyFixPatch, balanceFixes, formLineUpdates, missingClassCheck, missingClassFixes, type ErrorFix } from '@/lib/errorFixes';
 import { collectErrors, dateMessage, requiredMessage } from '@/lib/fieldValidation';
+import { isJournalScreenEntry } from '@/lib/journalScreen';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -138,17 +141,8 @@ interface LineRow {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function todayISO(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-/** QB default reversing date: the 1st of the month after the entry date. */
-function nextMonthFirstISO(entryDateISO: string): string {
-  const d = new Date(entryDateISO);
-  const next = new Date(d.getFullYear(), d.getMonth() + 1, 1);
-  const mm = String(next.getMonth() + 1).padStart(2, '0');
-  return `${next.getFullYear()}-${mm}-01`;
-}
+// todayISO (local date) and firstOfNextMonthISO (QB default reversing date, UTC year-month like
+// the server's defaultReversalDate) live in lib/dates.ts.
 
 function statusTone(status: string): 'success' | 'void' | 'neutral' {
   if (status === 'posted') return 'success';
@@ -709,7 +703,7 @@ function ReverseModal({ entry, onClose, onReversed }: ReverseModalProps) {
 
   useEffect(() => {
     if (entry) {
-      setAsOfDate(nextMonthFirstISO(entry.date));
+      setAsOfDate(firstOfNextMonthISO(entry.date));
       setLoading(false);
     }
   }, [entry]);
@@ -884,9 +878,8 @@ function JournalPageContent() {
     }
   };
 
-  const formatDate = (iso: string) =>
-    new Date(iso).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
-
+  // Entry dates are calendar days (UTC midnight from the API): lib/format.ts formatDate shows
+  // the day they name ("Jun 9, 2026"), not the day before in US time zones.
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
@@ -978,6 +971,8 @@ function JournalPageContent() {
                           <Pencil className="h-3.5 w-3.5" />
                           Edit
                         </button>
+                        {/* Document-posted entries are reversed / voided through their document. */}
+                        {isJournalScreenEntry(entry.sourceRef, 'reverse') && (
                         <button
                           type="button"
                           onClick={(e) => {
@@ -990,6 +985,8 @@ function JournalPageContent() {
                           <Undo2 className="h-3.5 w-3.5" />
                           Reverse
                         </button>
+                        )}
+                        {isJournalScreenEntry(entry.sourceRef, 'void') && (
                         <button
                           type="button"
                           onClick={(e) => {
@@ -1002,6 +999,7 @@ function JournalPageContent() {
                           <Trash2 className="h-3.5 w-3.5" />
                           Void
                         </button>
+                        )}
                       </span>
                     )}
                     {entry.status === 'void' && (

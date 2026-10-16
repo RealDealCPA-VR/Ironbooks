@@ -176,7 +176,7 @@ export async function seedRichCompany(db: DB, dataDir: string, name = 'Rich Test
     entityType: 'bill',
     entityId: bill.id,
     filename: 'receipt.txt',
-    storagePath: path.join('attachments', diskName),
+    storagePath: `attachments/${diskName}`,
     mimeType: 'text/plain',
     sizeBytes: 37,
   });

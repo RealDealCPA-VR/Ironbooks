@@ -335,7 +335,11 @@ export async function setDefaultSite(ctx: ServiceContext, id: string): Promise<S
       .groupBy(inventoryMovements.itemId);
     const ownByItem = new Map(ownSums.map((r) => [r.itemId, Money.of(r.qty)]));
     const now = new Date();
-    for (const [itemId, qty] of derived) {
+    // Union of both key sets: siteQuantities omits items whose derived quantity is 0, but their
+    // own movement total at the old default may still be non-zero and must be zeroed out.
+    const itemIds = new Set<string>([...derived.keys(), ...ownByItem.keys()]);
+    for (const itemId of itemIds) {
+      const qty = derived.get(itemId) ?? Money.zero();
       const diff = qty.minus(ownByItem.get(itemId) ?? Money.zero());
       if (diff.isZero()) continue;
       await tx.db.insert(inventoryMovements).values({

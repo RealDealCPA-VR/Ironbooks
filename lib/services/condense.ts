@@ -141,6 +141,13 @@ interface SummaryLine {
   classId: string | null;
   debit: string | null;
   credit: string | null;
+  /**
+   * p1 fx: foreign-currency columns carried onto the summary so a foreign-currency account keeps
+   * its balance in its own currency (fxLedger reads COALESCE(foreign_amount, home amount)).
+   */
+  currency: string | null;
+  foreignAmount: string | null;
+  exchangeRate: string | null;
 }
 
 interface MonthGroup {
@@ -342,8 +349,16 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
   const postedIds = posted.map((e) => e.id);
   const entryById = new Map(posted.map((e) => [e.id, e]));
   const lineIds: string[] = [];
-  // monthKey -> groupKey(account|class) -> running totals
-  const monthTotals = new Map<string, Map<string, { accountId: string; classId: string | null; debit: ReturnType<typeof Money.zero>; credit: ReturnType<typeof Money.zero> }>>();
+  // monthKey -> groupKey(account|class|currency) -> running totals. Foreign totals use the same
+  // COALESCE(foreign_amount, home amount) reading as fxLedger, so the account-currency balance of a
+  // foreign account is exactly preserved; hasForeign = at least one line carried a foreign amount.
+  type Totals = {
+    accountId: string; classId: string | null; currency: string | null;
+    debit: ReturnType<typeof Money.zero>; credit: ReturnType<typeof Money.zero>;
+    fDebit: ReturnType<typeof Money.zero>; fCredit: ReturnType<typeof Money.zero>;
+    hasForeign: boolean;
+  };
+  const monthTotals = new Map<string, Map<string, Totals>>();
   const monthDates = new Map<string, Date>();
 
   for (const idChunk of chunks(postedIds)) {
@@ -355,6 +370,8 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
         classId: journalEntryLines.classId,
         debit: journalEntryLines.debit,
         credit: journalEntryLines.credit,
+        currency: journalEntryLines.currency,
+        foreignAmount: journalEntryLines.foreignAmount,
       })
       .from(journalEntryLines)
       .where(inArray(journalEntryLines.journalEntryId, idChunk));
@@ -370,14 +387,20 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
         groups = new Map();
         monthTotals.set(mk, groups);
       }
-      const gk = `${line.accountId}|${line.classId ?? ''}`;
+      const gk = `${line.accountId}|${line.classId ?? ''}|${line.currency ?? ''}`;
       let g = groups.get(gk);
       if (!g) {
-        g = { accountId: line.accountId, classId: line.classId ?? null, debit: Money.zero(), credit: Money.zero() };
+        g = {
+          accountId: line.accountId, classId: line.classId ?? null, currency: line.currency ?? null,
+          debit: Money.zero(), credit: Money.zero(), fDebit: Money.zero(), fCredit: Money.zero(), hasForeign: false,
+        };
         groups.set(gk, g);
       }
       g.debit = g.debit.plus(Money.of(line.debit));
       g.credit = g.credit.plus(Money.of(line.credit));
+      if (line.foreignAmount != null) g.hasForeign = true;
+      if (line.debit != null) g.fDebit = g.fDebit.plus(Money.of(line.foreignAmount ?? line.debit));
+      if (line.credit != null) g.fCredit = g.fCredit.plus(Money.of(line.foreignAmount ?? line.credit));
     }
   }
 
@@ -398,11 +421,22 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
     .map(([key, groups]) => {
       const lines: SummaryLine[] = [];
       for (const g of groups.values()) {
-        if (g.debit.greaterThan(0)) {
-          lines.push({ accountId: g.accountId, classId: g.classId, debit: toAmountString(g.debit), credit: null });
+        const fx = (home: ReturnType<typeof Money.zero>, foreign: ReturnType<typeof Money.zero>) =>
+          g.hasForeign
+            ? {
+                currency: g.currency,
+                foreignAmount: toAmountString(foreign),
+                exchangeRate: foreign.isZero() ? null : home.dividedBy(foreign).toFixed(8),
+              }
+            : { currency: g.currency, foreignAmount: null, exchangeRate: null };
+        // A side with no home amount can still carry a foreign amount (never in practice, but a
+        // revaluation-style line is the reverse: home amount, foreign 0). Emit a side whenever
+        // either total is non-zero so neither ledger loses anything.
+        if (g.debit.greaterThan(0) || (g.hasForeign && !g.fDebit.isZero())) {
+          lines.push({ accountId: g.accountId, classId: g.classId, debit: toAmountString(g.debit), credit: null, ...fx(g.debit, g.fDebit) });
         }
-        if (g.credit.greaterThan(0)) {
-          lines.push({ accountId: g.accountId, classId: g.classId, debit: null, credit: toAmountString(g.credit) });
+        if (g.credit.greaterThan(0) || (g.hasForeign && !g.fCredit.isZero())) {
+          lines.push({ accountId: g.accountId, classId: g.classId, debit: null, credit: toAmountString(g.credit), ...fx(g.credit, g.fCredit) });
         }
       }
       return { key, date: monthDates.get(key)!, lines };
@@ -639,6 +673,9 @@ async function runCondense(
             classId: l.classId,
             debit: l.debit,
             credit: l.credit,
+            currency: l.currency,
+            foreignAmount: l.foreignAmount,
+            exchangeRate: l.exchangeRate,
             memo: 'Condensed activity',
           })),
         );

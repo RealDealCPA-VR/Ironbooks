@@ -24,6 +24,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatShortDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -62,10 +63,8 @@ interface DiscrepancyRow {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function fmtDate(iso: string | null | undefined) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleDateString('en-US');
-}
+/** Short US date; calendar days (statement / entry dates) without the UTC off-by-one. */
+const fmtDate = formatShortDate;
 
 function statusTone(status: string): 'info' | 'success' | 'warning' | 'neutral' {
   if (status === 'in_progress') return 'info';

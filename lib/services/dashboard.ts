@@ -116,17 +116,23 @@ const SETTLED_STATUSES = ['void', 'draft', 'paid', 'closed'] as const;
 
 const DUE_SOON_HORIZON_DAYS = 7;
 
-/** Local-time start of day for `d`. */
+/**
+ * Today's calendar day on this computer, at UTC midnight — the convention stored document dates
+ * (due dates, transaction dates) use. Local-midnight bounds would shift every comparison by the
+ * UTC offset (e.g. an invoice due today counted as overdue west of UTC).
+ */
 function startOfDay(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
 }
 
+/** `d` (a UTC-midnight day) plus whole days. */
 function addDays(d: Date, days: number): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + days);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + days));
 }
 
+/** "YYYY-MM" of a UTC-midnight date (matches to_char on the stored UTC dates). */
 function monthKey(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,11 +145,13 @@ export async function getDashboardInsights(
 ): Promise<DashboardInsights> {
   const today = startOfDay(now);
   const weekEnd = addDays(today, DUE_SOON_HORIZON_DAYS);
+  /** Last instant of today's calendar day (UTC convention), like the as-of reports. */
+  const endOfToday = new Date(addDays(today, 1).getTime() - 1);
 
   const [kpis, aging, plTrend, overdue, dueThisWeek, lowStockCount, lastReconciliation] =
     await Promise.all([
       kpiCards(ctx, now),
-      arAging(ctx, now),
+      arAging(ctx, endOfToday),
       profitLossTrend(ctx, now),
       overdueInvoices(ctx, today),
       billsDueThisWeek(ctx, today, weekEnd),
@@ -222,7 +230,9 @@ async function kpiCards(ctx: ServiceContext, now: Date): Promise<DashboardKpis> 
  * so closed-year history isn't wiped (same rule as profitAndLoss).
  */
 async function profitLossTrend(ctx: ServiceContext, now: Date): Promise<PlTrendPoint[]> {
-  const start = new Date(now.getFullYear(), now.getMonth() - 5, 1);
+  // UTC bounds over the computer's current calendar month (stored dates are UTC midnight).
+  const start = new Date(Date.UTC(now.getFullYear(), now.getMonth() - 5, 1));
+  const end = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate() + 1) - 1);
 
   const rows = await ctx.db
     .select({
@@ -240,7 +250,7 @@ async function profitLossTrend(ctx: ServiceContext, now: Date): Promise<PlTrendP
         eq(journalEntries.status, 'posted'),
         notFiscalCloseEntry(),
         gte(journalEntries.date, start),
-        lte(journalEntries.date, now),
+        lte(journalEntries.date, end),
         sql`${accounts.type} IN ('revenue', 'expense')`,
       ),
     )
@@ -249,7 +259,7 @@ async function profitLossTrend(ctx: ServiceContext, now: Date): Promise<PlTrendP
   // Materialize all 6 months so the sparkline always has a stable x-axis.
   const byMonth = new Map<string, { income: ReturnType<typeof Money.zero>; expenses: ReturnType<typeof Money.zero> }>();
   for (let i = 5; i >= 0; i--) {
-    byMonth.set(monthKey(new Date(now.getFullYear(), now.getMonth() - i, 1)), {
+    byMonth.set(monthKey(new Date(Date.UTC(now.getFullYear(), now.getMonth() - i, 1))), {
       income: Money.zero(),
       expenses: Money.zero(),
     });
@@ -298,7 +308,8 @@ async function overdueInvoices(ctx: ServiceContext, today: Date) {
     invoiceNumber: r.invoiceNumber,
     customerName: r.customerName,
     dueDate: r.dueDate!.toISOString(),
-    daysOverdue: Math.floor((today.getTime() - r.dueDate!.getTime()) / 86_400_000),
+    // Whole calendar days (UTC convention) from the due day to today; time of day ignored.
+    daysOverdue: Math.round((today.getTime() - addDays(r.dueDate!, 0).getTime()) / 86_400_000),
     balanceDue: toAmountString(r.balanceDue),
   }));
 

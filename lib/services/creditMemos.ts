@@ -82,6 +82,7 @@ import {
 import { applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
+import { type SalesLineKind, SalesLineTotals, salesLineKind } from './salesLineKinds';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -236,7 +237,6 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
   // Resolve standing accounts
   const arAccountId = await accountIdByCode(ctx, '1200');
   const defaultIncomeId = await accountIdByCode(ctx, '4000');
-  const taxPayableId = input.taxRateId ? await accountIdByCode(ctx, '2200') : null;
 
   // Pre-load referenced items (income account fallback + inventory typing for restock).
   const itemIds = [...new Set(input.lines.filter((l) => l.itemId).map((l) => l.itemId as string))];
@@ -283,6 +283,7 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
     restock: boolean;
     lineOrder: number;
     pricing: AppliedPricing | null;
+    kind: SalesLineKind;
   };
 
   // B12 advanced pricing: fill omitted item rates (price rules / price level / customer price)
@@ -293,22 +294,16 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
     input.lines,
   );
 
-  let subtotal = Money.zero();
-  let taxableSubtotal = Money.zero();
+  // Same item-type semantics as invoices (discount / subtotal / sales-tax items).
+  const totals = new SalesLineTotals();
   const computedLines: ComputedLine[] = [];
 
   for (let i = 0; i < pricedLines.length; i++) {
     const l = pricedLines[i];
-    // Quantity and rate are stored at 4 decimals (the column scale); compute the
-    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
-    const qty = Money.of(l.quantity).toDecimalPlaces(4);
-    const rate = Money.of(l.rate).toDecimalPlaces(4);
-    if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
-    if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
-
-    const amount = Money.round2(Money.mul(qty, rate));
+    const kind = salesLineKind(l.itemId ? itemMap.get(l.itemId)?.type : null, i + 1, 'credit memo');
 
     // Resolve income account: explicit accountId > item.incomeAccountId > 4000
+    // (for a discount line: the discount account, credited back by the memo)
     let resolvedAccountId = defaultIncomeId;
     if (l.accountId) {
       const [acctRow] = await ctx.db
@@ -330,9 +325,33 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
       if (lineAcct) assertNotControlLineAccount(lineAcct, `Line ${i + 1}`);
     }
 
-    const taxable = l.taxable !== false; // default true
-    subtotal = subtotal.plus(amount);
-    if (taxable) taxableSubtotal = taxableSubtotal.plus(amount);
+    if (kind === 'subtotal') {
+      // Non-posting: the sum of the body lines above it, excluded from every total.
+      const sub = totals.takeSubtotal();
+      computedLines.push({
+        itemId: l.itemId ?? null,
+        accountId: resolvedAccountId,
+        description: l.description ?? 'Subtotal',
+        quantity: '1.0000',
+        rate: sub,
+        amount: sub,
+        taxable: false,
+        restock: false,
+        lineOrder: i,
+        pricing: null,
+        kind,
+      });
+      continue;
+    }
+
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
+    if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
+    if (kind !== 'discount' && rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
+
+    const added = totals.addLine(kind, Money.round2(Money.mul(qty, rate)), l.taxable !== false);
 
     computedLines.push({
       itemId: l.itemId ?? null,
@@ -340,16 +359,21 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
       description: l.description ?? null,
       quantity: qty.toFixed(4),
       rate: rate.toFixed(4),
-      amount: toAmountString(amount),
-      taxable,
-      restock: l.restock !== false, // default true (returned to stock)
+      amount: toAmountString(added.amount),
+      taxable: added.taxable,
+      restock: kind === 'income' && l.restock !== false, // default true (returned to stock)
       lineOrder: i,
-      pricing: l.pricing,
+      pricing: kind === 'income' ? l.pricing : null,
+      kind,
     });
   }
 
-  const taxAmount = Money.round2(Money.mul(taxableSubtotal, taxRateDecimal));
+  const subtotal = totals.subtotal;
+  const grossIncome = totals.grossIncome;
+  const taxAmount = totals.taxAmount(taxRateDecimal);
   const total = Money.round2(subtotal.plus(taxAmount));
+  const taxPayableId =
+    input.taxRateId || totals.salesTaxLines.greaterThan(0) ? await accountIdByCode(ctx, '2200') : null;
   if (total.lessThanOrEqualTo(0)) {
     throw validation('Credit memo total must be greater than zero.');
   }
@@ -361,6 +385,7 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
     itemMap,
     computedLines,
     subtotal,
+    grossIncome,
     taxAmount,
     total,
   };
@@ -378,7 +403,7 @@ async function postCreditMemoDocument(
   input: CreateCreditMemoInput,
   prep: PreparedCreditMemo,
 ) {
-  const { arAccountId, taxPayableId, itemMap, computedLines, subtotal, taxAmount, total } = prep;
+  const { arAccountId, taxPayableId, itemMap, computedLines, grossIncome, taxAmount, total } = prep;
   // The number shown on the GL: the typed ref number, else the legacy integer.
   const shownNumber = docRef(memo.refNumber ?? null, memo.memoNumber);
   // 2) Insert credit memo lines (returning ids so restock entries can reference them)
@@ -410,12 +435,17 @@ async function postCreditMemoDocument(
   //
   // entryBase = subtotal + taxAmount = total; both sides are penny-allocated
   // against the same anchor so rounding can never unbalance the entry.
-  const entryBase = Money.round2(subtotal.plus(taxAmount));
+  // Discount item lines are the reverse of an invoice's: they CREDIT their discount account,
+  // so entryBase = income lines + tax = total + discounts. Subtotal lines post nothing.
+  const entryBase = Money.round2(grossIncome.plus(taxAmount));
 
   const incomeDebits = new Map<string, ReturnType<typeof Money.zero>>();
+  const discountCredits = new Map<string, ReturnType<typeof Money.zero>>();
   for (const cl of computedLines) {
-    const prev = incomeDebits.get(cl.accountId) ?? Money.zero();
-    incomeDebits.set(cl.accountId, prev.plus(Money.of(cl.amount)));
+    if (cl.kind !== 'income' && cl.kind !== 'discount') continue;
+    const map = cl.kind === 'income' ? incomeDebits : discountCredits;
+    const prev = map.get(cl.accountId) ?? Money.zero();
+    map.set(cl.accountId, prev.plus(Money.abs(Money.of(cl.amount))));
   }
 
   const debitSpecs: Array<{
@@ -441,7 +471,11 @@ async function postCreditMemoDocument(
     accountId: string;
     weight: ReturnType<typeof Money.zero>;
     memo: string;
-  }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${shownNumber}` }];
+    controlLine?: boolean;
+  }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${shownNumber}`, controlLine: true }];
+  for (const [acctId, amount] of discountCredits) {
+    creditSpecs.push({ accountId: acctId, weight: amount, memo: `Credit Memo #${shownNumber} — discount reversal` });
+  }
 
   const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
   const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
@@ -460,12 +494,12 @@ async function postCreditMemoDocument(
   });
   creditSpecs.forEach((s, i) => {
     if (creditAlloc[i].greaterThan(0)) {
-      // The only credit spec is the memo's own A/R line (posting.ts PostingLine.controlLine).
+      // The memo's own A/R line is the control line (posting.ts PostingLine.controlLine).
       postingLines.push({
         accountId: s.accountId,
         credit: toAmountString(creditAlloc[i]),
         memo: s.memo,
-        controlLine: true,
+        ...(s.controlLine ? { controlLine: true } : {}),
       });
     }
   });
@@ -953,6 +987,14 @@ export async function refundCreditMemo(ctx: ServiceContext, input: RefundCreditM
 
   const arAccountId = await accountIdByCode(ctx, '1200');
   const refundDate = input.date ?? new Date();
+  // The credit only exists from the memo's date: a refund dated earlier would debit A/R on days
+  // when the customer held no credit.
+  const day = (d: Date) => new Date(d).toISOString().slice(0, 10);
+  if (day(refundDate) < day(memo.date)) {
+    throw validation(
+      `The refund date (${day(refundDate)}) is before the credit memo date (${day(memo.date)}). Date the refund on or after the credit memo.`,
+    );
+  }
 
   return inTransaction(ctx, async (tx) => {
     // 1. Post the refund check.

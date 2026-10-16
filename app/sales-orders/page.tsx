@@ -21,10 +21,12 @@ import {
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { salesRowsFromRecall } from '@/lib/smartDefaults';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
+import { previewSalesTotals } from '@/lib/salesLineMath';
 import {
   PricedLinesEditor,
   emptyPricedLine,
@@ -125,13 +127,13 @@ function statusLabel(status: string): string {
   return status;
 }
 
-function computeTotal(lines: PricedLineValue[], taxRate = 0): number {
-  const sub = lines.reduce((sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0), 0);
-  const taxable = lines.reduce(
-    (sum, l) => sum + (l.taxable ? (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0) : 0),
-    0,
+/** Same item-type math as the service: discount items subtract, subtotal items add nothing. */
+function computeTotal(lines: PricedLineValue[], items: PricedLineItem[], taxRate = 0): number {
+  const t = previewSalesTotals(
+    lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+    taxRate,
   );
-  return sub + Math.round(taxable * taxRate * 100) / 100;
+  return t.subtotal + Math.round(t.tax * 100) / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +169,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [custDefaults]);
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<EditableLine[]>([emptyPricedLine()]);
   const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
@@ -239,7 +241,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
   }, [open, editing, customerId, recall]);
 
   const selectedRate = taxRates.find((t) => t.id === taxRateId);
-  const liveTotal = computeTotal(lines, selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
+  const liveTotal = computeTotal(lines, items, selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
 
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }

@@ -4,7 +4,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { companies, userCompanies } from '@/lib/db/schema';
 import { and, eq } from 'drizzle-orm';
-import { COMPANY_COOKIE, DEACTIVATED_MESSAGE, getSessionGate } from '@/lib/context';
+import { COMPANY_COOKIE, DEACTIVATED_MESSAGE, getSessionGate, isArchivedCompany } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { stampLastOpened } from '../[id]/manage';
@@ -46,7 +46,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: DEACTIVATED_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
   }
   const [c] = await db.select().from(companies).where(eq(companies.id, companyId));
-  if (!c) {
+  // Archived (soft-deleted) companies can't be opened (same rule as getServerContext).
+  if (!c || isArchivedCompany(c.settings)) {
     return NextResponse.json({ error: 'Company not found', code: 'NOT_FOUND' }, { status: 404 });
   }
   // Recency ordering for the companies page: stamp settings.lastOpenedAt on every open.

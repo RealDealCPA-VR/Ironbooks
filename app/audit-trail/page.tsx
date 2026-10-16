@@ -21,6 +21,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatDate } from '@/lib/utils';
+import { localDayEndIso, localDayStartIso } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -340,12 +341,11 @@ export default function AuditTrailPage() {
       const params = new URLSearchParams();
       if (filterAction) params.set('action', filterAction);
       if (filterEntityType) params.set('entityType', filterEntityType);
-      if (filterFrom) params.set('from', new Date(filterFrom).toISOString());
-      if (filterTo) {
-        const d = new Date(filterTo);
-        d.setHours(23, 59, 59, 999);
-        params.set('to', d.toISOString());
-      }
+      // Local start / end of the picked days (audit timestamps are real instants).
+      const fromIso = localDayStartIso(filterFrom);
+      const toIso = localDayEndIso(filterTo);
+      if (fromIso) params.set('from', fromIso);
+      if (toIso) params.set('to', toIso);
       params.set('limit', String(PAGE_SIZE));
       params.set('offset', String(currentPage * PAGE_SIZE));
 

@@ -36,7 +36,8 @@ export interface YearEndCloseInput {
  * Compute the UTC window [yearStart, yearEnd) and the closing-entry date for a
  * fiscal year, honoring the company's configured fiscal year end ('MM-DD').
  * `fiscalYear` is the year the fiscal year ends in. Defaults to 12-31 (calendar
- * year). Feb-29 style edges are clamped to the month's last valid day.
+ * year). A month-end year end follows the real month end (02-28 -> Feb 29 in leap
+ * years); other days are clamped to the month's last valid day. Windows are contiguous.
  */
 export function fiscalYearWindow(
   fiscalYear: number,
@@ -53,16 +54,21 @@ export function fiscalYearWindow(
       day = d;
     }
   }
-  // Clamp the day to the month's last valid day for this year (e.g. Feb 29 -> 28).
-  const lastDay = new Date(Date.UTC(fiscalYear, month, 0)).getUTCDate();
-  const endDay = Math.min(day, lastDay);
+  // A year end on the last day of its month means "month end" (onboarding stores a fiscal year
+  // starting in March as '02-28'), so it follows the month's real last day: Feb 29 in leap years.
+  // Any other day is clamped to the month's last valid day for the year (e.g. 02-29 -> 28).
+  const lastDayOf = (y: number) => new Date(Date.UTC(y, month, 0)).getUTCDate();
+  const monthEnd = day >= new Date(Date.UTC(2001, month, 0)).getUTCDate(); // 2001: a common year
+  const endDayOf = (y: number) => (monthEnd ? lastDayOf(y) : Math.min(day, lastDayOf(y)));
+  const endDay = endDayOf(fiscalYear);
 
   const closingDate = new Date(Date.UTC(fiscalYear, month - 1, endDay, 23, 59, 59, 0));
   // Exclusive upper bound: midnight after the fiscal year end (Date.UTC handles overflow).
   const yearEnd = new Date(Date.UTC(fiscalYear, month - 1, endDay + 1));
-  const yearStart = new Date(
-    Date.UTC(yearEnd.getUTCFullYear() - 1, yearEnd.getUTCMonth(), yearEnd.getUTCDate()),
-  );
+  // Inclusive start: the day after the PREVIOUS fiscal year's end (its exclusive upper bound), so
+  // consecutive windows are contiguous (shifting this year's end back a year is not when the
+  // two years' February lengths differ, which used to leave Feb 29 in no fiscal year).
+  const yearStart = new Date(Date.UTC(fiscalYear - 1, month - 1, endDayOf(fiscalYear - 1) + 1));
   return { yearStart, yearEnd, closingDate };
 }
 
@@ -147,7 +153,7 @@ export async function yearEndClose(
     accountId: string;
     code: string;
     name: string;
-    netBalance: string; // always non-negative (natural balance)
+    netBalance: string; // signed natural balance (negative = on the non-normal side)
   }
   const revenueAccounts: PLAccount[] = [];
   const expenseAccounts: PLAccount[] = [];
@@ -215,18 +221,25 @@ export async function yearEndClose(
   const netIncome = totalRevenue.minus(totalExpenses);
   const lines: PostingLine[] = [];
 
+  // A net balance can be on the account's non-normal side (a contra-revenue "Sales Discounts"
+  // income account with a net debit, a "Purchase Discounts" expense account with a net credit).
+  // Zeroing it then takes the opposite side, for the absolute amount (lines are never negative).
   for (const r of revenueAccounts) {
+    const net = Money.of(r.netBalance);
+    const amt = toAmountString(net.abs());
     lines.push({
       accountId: r.accountId,
-      debit: r.netBalance,
+      ...(net.isNegative() ? { credit: amt } : { debit: amt }),
       memo: `Close ${fiscalYear} revenue: ${r.code} ${r.name}`,
     });
   }
 
   for (const e of expenseAccounts) {
+    const net = Money.of(e.netBalance);
+    const amt = toAmountString(net.abs());
     lines.push({
       accountId: e.accountId,
-      credit: e.netBalance,
+      ...(net.isNegative() ? { debit: amt } : { credit: amt }),
       memo: `Close ${fiscalYear} expense: ${e.code} ${e.name}`,
     });
   }

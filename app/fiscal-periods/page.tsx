@@ -20,6 +20,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { formatDate } from '@/lib/format';
 
 // ---- Types ----------------------------------------------------------------
 
@@ -33,13 +34,8 @@ interface FiscalPeriod {
 
 // ---- Helpers ---------------------------------------------------------------
 
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-  });
-}
+// Period start/end are calendar days: formatDate (lib/format.ts) shows them without the UTC
+// off-by-one that `new Date(iso).toLocaleDateString()` had in US time zones.
 
 // ---- Close Period Modal -----------------------------------------------------
 

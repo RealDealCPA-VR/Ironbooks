@@ -7,6 +7,7 @@
  */
 import type { StdReport } from './types';
 import type { PermissionSet } from '@/lib/permissions/model';
+import { todayISO } from '@/lib/dates';
 
 export interface ReportWindow {
   from: string | null;
@@ -22,7 +23,7 @@ export function reportWhyChangedWindow(
   reportKey: string,
   runParams: Record<string, string | undefined>,
   range?: StdReport['range'],
-  today: string = new Date().toISOString().slice(0, 10),
+  today: string = todayISO(),
 ): ReportWindow {
   const isRange = PERIOD_REPORTS.has(reportKey);
   if (range) {

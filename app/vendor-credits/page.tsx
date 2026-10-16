@@ -24,6 +24,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -158,7 +159,7 @@ interface SavedLine {
 /** QB Enter Bills (Credit): Expenses and Items tabs, Ref. No., Class and Customer:Job per line. */
 function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }: NewCreditModalProps) {
   const [vendorId, setVendorId] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayISO());
   const [refNumber, setRefNumber] = useState('');
   const [memo, setMemo] = useState('');
   const [tab, setTab] = useState<'expenses' | 'items'>('expenses');
@@ -196,7 +197,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
   useEffect(() => {
     if (!open) return;
     setVendorId('');
-    setDate(new Date().toISOString().slice(0, 10));
+    setDate(todayISO());
     setRefNumber('');
     setMemo('');
     setTab('expenses');

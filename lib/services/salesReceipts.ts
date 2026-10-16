@@ -62,6 +62,7 @@ import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import { shippingColumns } from './invoices';
+import { type SalesLineKind, SalesLineTotals, salesLineKind } from './salesLineKinds';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -288,6 +289,7 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
     taxRateId: string | null;
     lineOrder: number;
     pricing: AppliedPricing | null;
+    kind: SalesLineKind;
   };
 
   // Advanced pricing: fill omitted item rates and record rule/level provenance.
@@ -297,22 +299,16 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
     input.lines,
   );
 
-  let subtotal = Money.zero();
-  let taxableSubtotal = Money.zero();
+  // Same item-type semantics as invoices (discount / subtotal / sales-tax items).
+  const totals = new SalesLineTotals();
   const computedLines: ComputedLine[] = [];
 
   for (let i = 0; i < pricedLines.length; i++) {
     const l = pricedLines[i];
-    // Quantity and rate are stored at 4 decimals (the column scale); compute the
-    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
-    const qty = Money.of(l.quantity).toDecimalPlaces(4);
-    const rate = Money.of(l.rate).toDecimalPlaces(4);
-    if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
-    if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
-
-    const amount = Money.round2(Money.mul(qty, rate));
+    const kind = salesLineKind(l.itemId ? itemMap.get(l.itemId)?.type : null, i + 1, 'sales receipt');
 
     // Resolve income account: explicit accountId > item.incomeAccountId > 4000.
+    // (For a discount line this is the discount account that gets debited.)
     let resolvedAccountId = defaultIncomeId;
     if (l.accountId) {
       const [acctRow] = await ctx.db
@@ -326,15 +322,38 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
       if (itemIncomeId) resolvedAccountId = itemIncomeId;
     }
 
-    const taxable = l.taxable !== false; // default true
-    subtotal = subtotal.plus(amount);
-    if (taxable) {
-      if (l.taxRateId) {
-        perLineTax = perLineTax.plus(Money.round2(Money.mul(amount, lineTaxRateMap.get(l.taxRateId)!)));
-      } else {
-        taxableSubtotal = taxableSubtotal.plus(amount);
-      }
+    if (kind === 'subtotal') {
+      // Non-posting: the sum of the body lines above it, excluded from every total.
+      const sub = totals.takeSubtotal();
+      computedLines.push({
+        itemId: l.itemId ?? null,
+        accountId: resolvedAccountId,
+        description: l.description ?? 'Subtotal',
+        quantity: '1.0000',
+        rate: sub,
+        amount: sub,
+        taxable: false,
+        taxRateId: null,
+        lineOrder: i,
+        pricing: null,
+        kind,
+      });
+      continue;
     }
+
+    // Quantity and rate are stored at 4 decimals (the column scale); compute the
+    // amount from the stored values so a later rebuild (convert, copy) re-prices exactly.
+    const qty = Money.of(l.quantity).toDecimalPlaces(4);
+    const rate = Money.of(l.rate).toDecimalPlaces(4);
+    if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
+    if (kind !== 'discount' && rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
+
+    const added = totals.addLine(kind, Money.round2(Money.mul(qty, rate)), l.taxable !== false, {
+      ownRate: l.taxRateId ? lineTaxRateMap.get(l.taxRateId)! : null,
+      perLineTax: (t) => {
+        perLineTax = perLineTax.plus(t);
+      },
+    });
 
     computedLines.push({
       itemId: l.itemId ?? null,
@@ -342,22 +361,25 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
       description: l.description ?? null,
       quantity: qty.toFixed(4),
       rate: rate.toFixed(4),
-      amount: toAmountString(amount),
-      taxable,
-      taxRateId: l.taxRateId ?? null,
+      amount: toAmountString(added.amount),
+      taxable: added.taxable,
+      taxRateId: kind === 'income' ? (l.taxRateId ?? null) : null,
       lineOrder: i,
-      pricing: l.pricing,
+      pricing: kind === 'income' ? l.pricing : null,
+      kind,
     });
   }
 
-  const taxAmount = Money.round2(Money.mul(taxableSubtotal, taxRateDecimal)).plus(perLineTax);
+  const subtotal = totals.subtotal;
+  const grossIncome = totals.grossIncome;
+  const taxAmount = totals.taxAmount(taxRateDecimal, perLineTax);
   const total = Money.round2(subtotal.plus(taxAmount));
 
   if (total.lessThanOrEqualTo(0)) {
     throw validation('Sales receipt total must be greater than zero.');
   }
 
-  return { method, depositAccountId, taxPayableId, itemMap, computedLines, subtotal, taxAmount, total };
+  return { method, depositAccountId, taxPayableId, itemMap, computedLines, subtotal, grossIncome, taxAmount, total };
 }
 
 type PreparedSalesReceipt = Awaited<ReturnType<typeof prepareSalesReceipt>>;
@@ -372,7 +394,7 @@ async function postSalesReceiptDocument(
   input: CreateSalesReceiptInput,
   prep: PreparedSalesReceipt,
 ) {
-  const { depositAccountId, taxPayableId, itemMap, computedLines, subtotal, taxAmount, total } = prep;
+  const { depositAccountId, taxPayableId, itemMap, computedLines, grossIncome, taxAmount, total } = prep;
   // The number shown on the GL: the typed ref number, else the legacy integer.
   const shownNumber = docRef(receipt.refNumber ?? null, receipt.receiptNumber);
   // 2) Insert receipt lines (returning ids so COGS entries can reference them).
@@ -400,22 +422,29 @@ async function postSalesReceiptDocument(
   // 3) Post the income/payment entry.
   //
   //   Dr <deposit account>   total
-  //   Cr <income accounts>   subtotal (per account)
-  //   Cr 2200 Tax Payable    taxAmount
+  //   Dr <discount accounts> discount item lines (per account)
+  //   Cr <income accounts>   income lines (per account)
+  //   Cr 2200 Tax Payable    taxAmount (rate tax + sales-tax item lines)
   //
-  // entryBase = subtotal + taxAmount = total; both sides are penny-allocated
-  // against the same anchor so the entry is always balanced.
-  const entryBase = Money.round2(subtotal.plus(taxAmount));
+  // entryBase = grossIncome + taxAmount = total + discounts; both sides are penny-allocated
+  // against the same anchor so the entry is always balanced. Subtotal lines post nothing.
+  const entryBase = Money.round2(grossIncome.plus(taxAmount));
 
   const incomeCredits = new Map<string, ReturnType<typeof Money.zero>>();
+  const discountDebits = new Map<string, ReturnType<typeof Money.zero>>();
   for (const cl of computedLines) {
-    const prev = incomeCredits.get(cl.accountId) ?? Money.zero();
-    incomeCredits.set(cl.accountId, prev.plus(Money.of(cl.amount)));
+    if (cl.kind !== 'income' && cl.kind !== 'discount') continue;
+    const map = cl.kind === 'income' ? incomeCredits : discountDebits;
+    const prev = map.get(cl.accountId) ?? Money.zero();
+    map.set(cl.accountId, prev.plus(Money.abs(Money.of(cl.amount))));
   }
 
   const debitSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [
     { accountId: depositAccountId, weight: total, memo: `Sales Receipt #${shownNumber}` },
   ];
+  for (const [acctId, amount] of discountDebits) {
+    debitSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — discount` });
+  }
   const creditSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [];
   for (const [acctId, amount] of incomeCredits) {
     creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — income` });

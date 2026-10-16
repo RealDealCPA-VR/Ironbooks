@@ -17,6 +17,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 
@@ -69,7 +70,7 @@ interface AssessResult {
 // ---------------------------------------------------------------------------
 
 export default function FinanceChargesPage() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayISO();
 
   // Settings
   const [settings, setSettings] = useState<FinanceChargeSettings | null>(null);

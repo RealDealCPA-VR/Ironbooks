@@ -104,6 +104,46 @@ export async function receiveStock(
     const offsetAccountId = await resolveAdjustmentAccount(tx, input.adjustmentAccountId);
     const dims = await adjustmentPostingFields(tx, input);
 
+    // First FIFO receipt on an item that already holds average-cost stock: seed an opening
+    // layer for that stock (on hand @ averageCost) so it is not orphaned — otherwise the layers
+    // (valuation, consumption) would ignore units the GL and quantityOnHand still carry. The
+    // value is already in the GL from the average-cost postings, so no entry is posted for it.
+    const [anyLayer] = await tx.db
+      .select({ id: inventoryLayers.id })
+      .from(inventoryLayers)
+      .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, input.itemId)))
+      .limit(1);
+    if (!anyLayer) {
+      const [current] = await tx.db
+        .select({ quantityOnHand: items.quantityOnHand, averageCost: items.averageCost })
+        .from(items)
+        .where(eq(items.id, input.itemId));
+      const openingQty = Money.of(current?.quantityOnHand ?? '0');
+      if (openingQty.greaterThan(0)) {
+        const [opening] = await tx.db
+          .insert(inventoryLayers)
+          .values({
+            companyId: tx.companyId,
+            itemId: input.itemId,
+            date: input.date,
+            quantityRemaining: openingQty.toFixed(4),
+            unitCost: Money.of(current?.averageCost ?? '0').toFixed(4),
+          })
+          .returning();
+        await writeAudit(tx, {
+          action: 'create',
+          entityType: 'inventory_layer',
+          entityId: opening.id,
+          newValues: {
+            itemId: input.itemId,
+            quantity: openingQty.toFixed(4),
+            unitCost: Money.of(current?.averageCost ?? '0').toFixed(4),
+            reason: 'opening layer for existing average-cost stock',
+          },
+        });
+      }
+    }
+
     // Post GL: Dr Inventory, Cr Adjustment Account
     const entry = await postJournalEntry(tx, {
       date: input.date,

@@ -27,7 +27,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 import { formatCurrency } from '@/lib/money';
-import { formatDate } from '@/lib/dates';
+import { formatDate, todayISO } from '@/lib/dates';
 import { EditPaycheckModal } from './EditPaycheckModal';
 import {
   TAX_TRACKING_LABELS,
@@ -323,7 +323,7 @@ const EMPTY_ACCRUAL_FORM: AccrualFormState = {
 
 const EMPTY_PAYROLL_FORM: PayrollFormState = {
   employeeId: '',
-  payDate: new Date().toISOString().slice(0, 10),
+  payDate: todayISO(),
   periodStart: '',
   periodEnd: '',
   periodsPerYear: '26',
@@ -1384,7 +1384,7 @@ export default function EmployeesPage() {
     setPayrollForm({
       ...EMPTY_PAYROLL_FORM,
       employeeId: target?.id ?? '',
-      payDate: new Date().toISOString().slice(0, 10),
+      payDate: todayISO(),
       earnings: defaultEarningsFor(target),
     });
     setPayrollOpen(true);

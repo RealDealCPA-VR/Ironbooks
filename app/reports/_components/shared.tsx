@@ -6,6 +6,8 @@
  * underscore folder so Next.js does not treat it as a route.
  */
 import { Button, Input, Label } from '@/components/ui';
+import { formatShortDate } from '@/lib/format';
+import { todayISO } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // CSV download
@@ -35,16 +37,18 @@ export function downloadCsv(filename: string, title: string, headers: string[], 
 // Date helpers
 // ---------------------------------------------------------------------------
 
-/** Format an ISO timestamp as a short US date ('' for null). */
+/**
+ * Format an API date as a short US date, e.g. "6/9/2026" ('' for null). Calendar days sent as
+ * UTC midnight show as the day they name (lib/format.ts); real timestamps in local time.
+ */
 export function fmtDate(iso: string | null | undefined): string {
   if (!iso) return '';
-  return new Date(iso).toLocaleDateString('en-US');
+  return formatShortDate(iso);
 }
 
 /** Today as a YYYY-MM-DD input value (local time). */
 export function todayStr(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return todayISO();
 }
 
 /** Jan 1 of the current year as a YYYY-MM-DD input value. */
