@@ -10,11 +10,16 @@
  *  - an edit / void of a transaction whose lines one of the client's completed reconciliations
  *    cleared (an edit that leaves the ledger as it is — a memo, a check number — still goes in);
  *  - a void (or a refused edit) of an invoice, bill, credit memo, vendor credit or payment the client
- *    has since paid, applied, deposited, refunded or recorded as bounced;
+ *    has since paid, applied, deposited, refunded or recorded as bounced; of an item receipt the
+ *    client has since billed; of a General Journal entry whose lines the client has since applied;
  *  - a payment, credit or application that no longer fits because the client's later payments
  *    and credits have already used up the invoice's / bill's balance or the credit
  *    (walked in the import's order, after the file's own removals);
- *  - a deposit holding a payment or sales receipt the client has already deposited.
+ *  - a deposit holding a payment or sales receipt the client has already deposited (a deposit the
+ *    file voids or edits to let it go does not count);
+ *  - a change that takes stock out — a void or edit of the bill / receipt / check that brought it
+ *    in, a new or changed sale, a return — when the client has since sold or used that stock
+ *    (each item's quantity on hand walked in the import's order).
  *
  * clientWorkConflicts names each one in plain language — the client's own record and the way out —
  * keyed by the review item it belongs to. The review shows the text as that item's problem and the
@@ -25,7 +30,7 @@ import { formatCurrency, Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from '../_base';
 import { expensePayload } from './accountant';
 import { depositPayloadOf } from './client';
-import { DOC_LABEL, docPayload, type Labels } from './docs';
+import { DOC_LABEL, DOC_ORDER, docPayload, type Labels } from './docs';
 import type { ApplicationChange, ChangesFile, DocChange, DocType, LineRef, TxnType } from './format';
 
 type Ctx = Pick<ServiceContext, 'db' | 'companyId'>;
@@ -62,7 +67,7 @@ function joinList(xs: string[]): string {
 // The client's later work on one record
 // ---------------------------------------------------------------------------
 
-type LaterKind = 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit' | 'payment' | 'sales_receipt' | 'line';
+type LaterKind = 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit' | 'payment' | 'sales_receipt' | 'item_receipt' | 'entry' | 'line';
 
 interface Later {
   text: string;
@@ -77,7 +82,55 @@ class LaterWork {
     private ctx: Ctx,
     private dividingDate: string,
     private L: Labels,
+    /** When the copy was made: a home-currency vendor credit application is only in the audit trail. */
+    private copyMadeAt: Date | null = null,
   ) {}
+
+  /**
+   * Vendor credits applied to bills (net per credit and bill) after the dividing date. A foreign
+   * credit's applications are dated rows; a home credit's are only in the audit trail — the ones
+   * made while the copy is out (or on a bill dated after the dividing date) are the client's,
+   * shown on the later of the credit's and the bill's date.
+   */
+  private async vendorCreditApps(by: { creditId: string } | { billId: string }): Promise<Array<{ creditId: string; billId: string; amount: Dec; last: string }>> {
+    const c = this.ctx.companyId;
+    const net = new Map<string, { creditId: string; billId: string; amount: Dec; last: string }>();
+    const add = (creditId: string, billId: string, amount: Dec, d: string) => {
+      const k = `${creditId}|${billId}`;
+      const cur = net.get(k) ?? { creditId, billId, amount: Money.zero(), last: '' };
+      net.set(k, { creditId, billId, amount: cur.amount.plus(amount), last: [cur.last, d].sort().at(-1)! });
+    };
+    const dated = new Set<string>();
+    for (const r of await q(
+      this.ctx,
+      sql`SELECT a.vendor_credit_id, a.bill_id, a.amount, a.date FROM vendor_credit_applications a
+          WHERE a.company_id = ${c}::uuid AND ${'creditId' in by ? sql`a.vendor_credit_id = ${by.creditId}::uuid` : sql`a.bill_id = ${by.billId}::uuid`}`,
+    )) {
+      dated.add(`${r.vendor_credit_id}|${r.bill_id}`);
+      if (this.later(r.date)) add(String(r.vendor_credit_id), String(r.bill_id), dec(r.amount), day(r.date));
+    }
+    for (const r of await q(
+      this.ctx,
+      sql`SELECT x.entity_id AS vendor_credit_id, x.new_values->>'billId' AS bill_id, x.new_values->>'action' AS action,
+                 x.new_values->>'amount' AS amount, x.created_at, vc.date AS credit_date, b.date AS bill_date
+          FROM audit_logs x
+          JOIN vendor_credits vc ON vc.id = x.entity_id
+          JOIN bills b ON b.id = CAST(x.new_values->>'billId' AS UUID)
+          WHERE x.company_id = ${c}::uuid AND x.entity_type = 'vendor_credit'
+            AND x.new_values->>'action' IN ('applied_to_bill', 'unapplied_from_bill')
+            AND ${'creditId' in by ? sql`x.entity_id = ${by.creditId}::uuid` : sql`x.new_values->>'billId' = ${by.billId}`}`,
+    )) {
+      const k = `${r.vendor_credit_id}|${r.bill_id}`;
+      if (dated.has(k)) continue;
+      // Shown on the later of the credit's and the bill's date (the application itself carries none).
+      const when = [day(r.credit_date), day(r.bill_date)].sort().at(-1)!;
+      const duringCopy = this.copyMadeAt ? new Date(r.created_at as string) > this.copyMadeAt : false;
+      if (!duringCopy && !(when > this.dividingDate)) continue;
+      add(String(r.vendor_credit_id), String(r.bill_id), r.action === 'applied_to_bill' ? dec(r.amount) : dec(r.amount).negated(), when);
+    }
+    return [...net.values()].filter((x) => x.amount.greaterThan(0));
+  }
+
 
   private later(d: unknown): boolean {
     return d != null && day(d) > this.dividingDate;
@@ -135,17 +188,8 @@ class LaterWork {
         if (!this.later(r.date)) continue;
         out.push({ text: `your ${L.doc(r.id)} dated ${day(r.date)} (${money(dec(r.amount_applied))} applied)`, amount: dec(r.amount_applied) });
       }
-      const byCredit = new Map<string, { amount: Dec; last: string }>();
-      for (const r of await q(
-        this.ctx,
-        sql`SELECT vendor_credit_id, amount, date FROM vendor_credit_applications WHERE bill_id = ${id}::uuid AND company_id = ${c}::uuid`,
-      )) {
-        if (!this.later(r.date)) continue;
-        const cur = byCredit.get(String(r.vendor_credit_id)) ?? { amount: Money.zero(), last: '' };
-        byCredit.set(String(r.vendor_credit_id), { amount: cur.amount.plus(dec(r.amount)), last: [cur.last, day(r.date)].sort().at(-1)! });
-      }
-      for (const [vc, x] of byCredit) {
-        if (x.amount.greaterThan(0)) out.push({ text: `your ${L.doc(vc)} applied ${x.last} (${money(x.amount)})`, amount: x.amount });
+      for (const x of await this.vendorCreditApps({ billId: id })) {
+        out.push({ text: `your ${L.doc(x.creditId)} applied ${x.last} (${money(x.amount)})`, amount: x.amount });
       }
       out.push(...(await this.journalApps(sql`a.bill_id = ${id}::uuid`, 'applied')));
     } else if (kind === 'credit_memo') {
@@ -158,17 +202,8 @@ class LaterWork {
       }
       out.push(...(await this.refunds(id)));
     } else if (kind === 'vendor_credit') {
-      const byBill = new Map<string, { amount: Dec; last: string }>();
-      for (const r of await q(
-        this.ctx,
-        sql`SELECT bill_id, amount, date FROM vendor_credit_applications WHERE vendor_credit_id = ${id}::uuid AND company_id = ${c}::uuid`,
-      )) {
-        if (!this.later(r.date)) continue;
-        const cur = byBill.get(String(r.bill_id)) ?? { amount: Money.zero(), last: '' };
-        byBill.set(String(r.bill_id), { amount: cur.amount.plus(dec(r.amount)), last: [cur.last, day(r.date)].sort().at(-1)! });
-      }
-      for (const [bill, x] of byBill) {
-        if (x.amount.greaterThan(0)) out.push({ text: `${money(x.amount)} applied to your ${L.doc(bill)} on ${x.last}`, amount: x.amount });
+      for (const x of await this.vendorCreditApps({ creditId: id })) {
+        out.push({ text: `${money(x.amount)} applied to your ${L.doc(x.billId)} on ${x.last}`, amount: x.amount });
       }
       out.push(...(await this.refunds(id)));
     } else if (kind === 'payment') {
@@ -217,6 +252,17 @@ class LaterWork {
           depositDay: day(r.date),
         });
       }
+    } else if (kind === 'item_receipt') {
+      for (const r of await q(
+        this.ctx,
+        sql`SELECT DISTINCT b.id, b.date FROM item_receipt_bill_lines l JOIN bills b ON b.id = l.bill_id
+            WHERE l.item_receipt_id = ${id}::uuid AND l.company_id = ${c}::uuid AND b.status <> 'void'`,
+      )) {
+        if (!this.later(r.date)) continue;
+        out.push({ text: `your ${L.doc(r.id)} dated ${day(r.date)}`, amount: Money.zero() });
+      }
+    } else if (kind === 'entry') {
+      out.push(...(await this.journalApps(sql`a.journal_entry_id = ${id}::uuid`, 'applied')));
     } else {
       out.push(...(await this.journalApps(sql`a.journal_line_id = ${id}::uuid`, 'used')));
     }
@@ -328,14 +374,18 @@ const same = (a: Row, b: Row) => JSON.stringify(norm(a)) === JSON.stringify(norm
 /**
  * Whether the accountant's edit changes what the service would re-post. Journal entries, sales /
  * purchase forms and received payments are always voided and re-posted on an edit; checks,
- * transfers, deposits and vendor credits keep their entry when the date and ledger lines stay;
- * a bill payment when only its number / print flag change.
+ * transfers, deposits and vendor credits keep their entry when the date and ledger lines stay (a
+ * check also its method, items and quantities; a vendor credit its vendor); a bill payment only on
+ * a header-only edit (number / print flag; never with a discount or General Journal credits).
  */
 async function editChangesLedger(ctx: ServiceContext, type: string, id: string, after: Row): Promise<boolean> {
   try {
     if (type === 'expense') {
-      const keys = ['date', 'paymentAccountId', 'total', 'currency', 'exchangeRate', 'lines'];
-      return !same(pick((await expensePayload(ctx, id)) as unknown as Row, keys, ['accountId', 'itemId', 'amount', 'classId']), pick(after, keys, ['accountId', 'itemId', 'amount', 'classId']));
+      // updateExpense keeps the entry only when the ledger lines and date stay AND the items, their
+      // quantities, the currency and the method (check / cash / card) stay.
+      const keys = ['date', 'method', 'paymentAccountId', 'total', 'currency', 'exchangeRate', 'lines'];
+      const lk = ['accountId', 'itemId', 'quantity', 'amount', 'classId'];
+      return !same(pick((await expensePayload(ctx, id)) as unknown as Row, keys, lk), pick(after, keys, lk));
     }
     if (type === 'transfer') {
       const [r] = await q(ctx, sql`SELECT date, from_account_id, to_account_id, amount FROM transfers WHERE id = ${id}::uuid AND company_id = ${ctx.companyId}::uuid`);
@@ -350,18 +400,24 @@ async function editChangesLedger(ctx: ServiceContext, type: string, id: string, 
       return !same(pick((await depositPayloadOf(ctx, id)) as unknown as Row, keys, ['accountId', 'amount']), pick(after, keys, ['accountId', 'amount']));
     }
     if (type === 'vendor_credit') {
-      const keys = ['date', 'total', 'exchangeRate', 'lines'];
+      // updateVendorCredit re-posts on a new vendor too (and item credits on any item / quantity / cost).
+      const keys = ['vendorId', 'date', 'total', 'exchangeRate', 'lines'];
       const lk = ['accountId', 'itemId', 'amount', 'quantity', 'unitCost', 'classId'];
       return !same(pick(await docPayload(ctx, 'vendor_credit', id), keys, lk), pick(after, keys, lk));
     }
     if (type === 'bill_payment') {
-      const cur = { ...(await docPayload(ctx, 'bill_payment', id)) };
-      const nxt = { ...after };
-      for (const k of ['reference', 'toPrint']) {
-        delete cur[k];
-        delete nxt[k];
-      }
-      return !same(cur, nxt);
+      // updateBillPayment keeps the entry only for a header-only edit: no discount and no General
+      // Journal applications on either version, the amount equal to what it applies, and the same
+      // bills / amounts, account, method, date and rate.
+      const cur = await docPayload(ctx, 'bill_payment', id);
+      const discounted = (p: Row) => arr(p, 'applications').some((a) => !dec(a.discountTaken).isZero());
+      const journal = (p: Row) => ['journalItems', 'journalCredits', 'journalOffsets'].some((k) => arr(p, k).length > 0);
+      if (discounted(cur) || discounted(after) || journal(cur) || journal(after)) return true;
+      const applied = arr(cur, 'applications').reduce((s, a) => s.plus(dec(a.amountApplied)), Money.zero());
+      if (!dec(cur.amount).equals(applied)) return true;
+      const keys = ['date', 'method', 'paymentAccountId', 'applications', ...(after.exchangeRate == null ? [] : ['exchangeRate'])];
+      const lk = ['billId', 'amountApplied'];
+      return !same(pick(cur, keys, lk), pick(after, keys, lk));
     }
   } catch {
     return true;
@@ -495,14 +551,14 @@ function applicationUses(a: ApplicationChange): Use[] {
 export async function clientWorkConflicts(
   ctx: ServiceContext,
   file: ChangesFile,
-  copy: { dividingDate: string },
+  copy: { dividingDate: string; createdAt?: Date | string | null },
   L: Labels,
 ): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   const flag = (key: string, text: string) => {
     if (!out.has(key)) out.set(key, text);
   };
-  const later = new LaterWork(ctx, copy.dividingDate, L);
+  const later = new LaterWork(ctx, copy.dividingDate, L, copy.createdAt ? new Date(copy.createdAt) : null);
   const undone = new Set(file.reconciliations.filter((r) => r.op === 'undo').map((r) => r.id));
   const label = (kind: BalKind, id: string) => (kind === 'line' ? 'General Journal credit' : L.doc(id));
   const texts = (xs: Later[]) => joinList(xs.map((x) => x.text));
@@ -521,7 +577,7 @@ export async function clientWorkConflicts(
     flag(
       key,
       `This ${what} was cleared in your reconciliation of ${acct} for the statement ending ${ends}, so ` +
-        (op === 'void' ? "your accountant's void of it can't be made" : "your accountant's change to its amount, accounts or date can't be made") +
+        (op === 'void' ? "your accountant's void of it can't be made" : "your accountant's change to it (more than a memo, payee or number) can't be made") +
         ` while it stays reconciled. To import: open Reconcile for ${acct} and use Undo Last Reconciliation until the statement ending ${first.statementDay} is undone, ` +
         `import these changes, then reconcile that statement again — or ask your accountant to leave this ${what} as it is.`,
     );
@@ -570,12 +626,28 @@ export async function clientWorkConflicts(
       if (xs.length) blocked(xs, `it can't be ${verb}`, `take ${them(xs)} off this bill (unapply or void ${them(xs)})`);
     } else if (d.type === 'credit_memo') {
       const xs = await later.of('credit_memo', d.id);
-      if (xs.length && d.op === 'void') blocked(xs, "it can't be voided", `take that credit off again (unapply it, or void the refund)`);
+      if (!xs.length) continue;
+      if (d.op === 'void') {
+        blocked(xs, "it can't be voided", `take that credit off again (unapply it, or void the refund)`);
+        continue;
+      }
+      const cur = await current('credit_memos', d.id);
+      if (cur && String(d.after.customerId) !== String(cur.customer_id)) {
+        blocked(xs, "its customer can't be changed", `take that credit off again (unapply it, or void the refund)`);
+      }
+    } else if (d.type === 'item_receipt') {
+      const xs = await later.of('item_receipt', d.id);
+      if (!xs.length) continue;
+      flag(
+        key,
+        `Your file has ${texts(xs)} entered against this item receipt, dated after the dividing date, so the item receipt can't be ${verb}. ` +
+          `To import: void ${them(xs)}, import these changes, then enter ${them(xs)} again against the receipt — or ask your accountant to leave this item receipt as it is.`,
+      );
     } else if (d.type === 'vendor_credit') {
       const xs = await later.of('vendor_credit', d.id);
       if (!xs.length) continue;
       if (d.op === 'void' || (await editChangesLedger(ctx, 'vendor_credit', d.id, d.after))) {
-        blocked(xs, d.op === 'void' ? "it can't be voided" : "its amount and accounts can't be changed", 'take that credit off again (unapply it, or void the refund)');
+        blocked(xs, d.op === 'void' ? "it can't be voided" : "its vendor, amount and accounts can't be changed", 'take that credit off again (unapply it, or void the refund)');
       }
     } else if (d.type === 'payment_received') {
       const xs = await later.of('payment', d.id);
@@ -610,6 +682,18 @@ export async function clientWorkConflicts(
         blocked(xs, "its total and deposit account can't be changed", 'remove it from your deposit (or void that deposit)');
       }
     }
+  }
+
+  //    General Journal entries whose customer / vendor lines the client has since applied.
+  for (const t of file.transactions) {
+    if (t.type !== 'journal_entry' || t.op === 'add') continue;
+    const xs = await later.of('entry', t.id);
+    if (!xs.length) continue;
+    flag(
+      `${t.type}:${t.op}:${t.id}`,
+      `Your file has ${texts(xs)}, dated after the dividing date, so this journal entry can't be ${t.op === 'void' ? 'voided' : 'changed'}. ` +
+        `To import: take ${them(xs)} off (in Receive Payments or Pay Bills), import these changes, then apply ${them(xs)} again — or ask your accountant to leave this journal entry as it is.`,
+    );
   }
 
   // 3. Balances: walk the file in the import's order; a payment, credit or application that takes
@@ -701,7 +785,15 @@ export async function clientWorkConflicts(
   }
 
   // 4. Deposits holding a payment / sales receipt the client already deposited.
+  //    Deposit voids and edits run first: a deposit the file voids, or edits so that it no longer
+  //    holds the payment, frees it; only the client's own later deposits stand in the way.
   const voidedDeposits = new Set(file.transactions.filter((t) => t.type === 'deposit' && t.op === 'void').map((t) => t.id));
+  const editedDeposits = new Map<string, Set<string>>();
+  for (const t of file.transactions) {
+    if (t.type === 'deposit' && t.op === 'edit') editedDeposits.set(t.id, new Set([...t.after.paymentIds, ...t.after.salesReceiptIds]));
+  }
+  const stillHolds = (depositId: string, heldId: string) =>
+    !voidedDeposits.has(depositId) && (!editedDeposits.has(depositId) || editedDeposits.get(depositId)!.has(heldId));
   for (const t of file.transactions) {
     if (t.type !== 'deposit' || t.op === 'void') continue;
     const key = `${t.type}:${t.op}:${t.id}`;
@@ -717,7 +809,7 @@ export async function clientWorkConflicts(
           sql`SELECT d.id, d.date, d.total, d.deposit_account_id FROM deposit_lines dl JOIN deposits d ON d.id = dl.deposit_id
               WHERE ${h.where} AND d.company_id = ${ctx.companyId}::uuid AND d.voided_at IS NULL`,
         )
-      ).filter((r) => String(r.id) !== t.id && !voidedDeposits.has(String(r.id)));
+      ).filter((r) => String(r.id) !== t.id && day(r.date) > copy.dividingDate && stillHolds(String(r.id), h.id));
       if (!rows.length) continue;
       const r = rows[0];
       flag(
@@ -729,6 +821,244 @@ export async function clientWorkConflicts(
     }
   }
 
+  // 5. Inventory the client has sold or used since the dividing date.
+  await inventoryConflicts(ctx, file, copy, L, flag);
+
   return out;
 }
 
+
+// ---------------------------------------------------------------------------
+// Inventory on hand (the import's order)
+// ---------------------------------------------------------------------------
+
+/** Where a document's stock movements are filed (inventory_movements.source_type). */
+const STOCK_SOURCE: Partial<Record<string, string>> = {
+  invoice: 'invoice',
+  sales_receipt: 'sales_receipt',
+  credit_memo: 'credit_memo',
+  bill: 'bill',
+  vendor_credit: 'vendor_credit',
+  item_receipt: 'item_receipt',
+  expense: 'expense',
+};
+
+type StockDelta = Map<string, Dec>;
+
+const qtyText = (v: Dec) => v.toDecimalPlaces(4).toString();
+
+function addDelta(m: StockDelta, itemId: unknown, v: Dec) {
+  if (typeof itemId !== 'string' || !itemId || v.isZero()) return;
+  m.set(itemId, (m.get(itemId) ?? Money.zero()).plus(v));
+}
+
+/** What a version of a record (the file's payload) moves in (+) or out (-) of stock, per item. */
+function stockOf(type: string, p: Row): StockDelta {
+  const m: StockDelta = new Map();
+  const qty = (l: Row) => dec(l.quantity ?? '1').abs();
+  const lines = arr(p, 'lines');
+  if (type === 'invoice') {
+    if (p.status === 'draft') return m; // a pending invoice relieves no stock
+    for (const l of lines) addDelta(m, l.itemId, qty(l).negated());
+  } else if (type === 'sales_receipt' || type === 'vendor_credit') {
+    for (const l of lines) addDelta(m, l.itemId, qty(l).negated());
+  } else if (type === 'credit_memo') {
+    for (const l of lines) if (l.restock !== false) addDelta(m, l.itemId, qty(l));
+  } else if (type === 'bill' || type === 'item_receipt' || type === 'expense') {
+    for (const l of lines) addDelta(m, l.itemId, qty(l));
+  } else if (type === 'inventory_adjustment') {
+    addDelta(m, p.itemId, dec(p.quantityChange));
+  }
+  return m;
+}
+
+const negate = (m: StockDelta): StockDelta => new Map([...m].map(([k, v]) => [k, v.negated()]));
+
+interface StockStep {
+  key: string;
+  /** "change to bill #B-1 (Supplier Co)", "void of invoice #F-10 (Acme)", "new invoice" … */
+  what: string;
+  /** The record, for "ask your accountant to change …": "this bill", "this new invoice". */
+  subject: string;
+  /** Applied one after another (an edit first takes the old version out, then puts the new one in). */
+  phases: StockDelta[];
+}
+
+/**
+ * Walk each inventory item's quantity on hand through the changes in the import's order (with its
+ * retries): a change that would take out more than is on hand — because the client has sold or used
+ * the stock since the dividing date — is named with those sales and the way out.
+ *
+ * Stock out: a void of a bill / item receipt / check / restocking credit memo, an edit of one (its
+ * old stock comes out before the new goes in), new or changed sales forms, returns on vendor credits
+ * and quantity removals. Stock back: voids of sales and of vendor credits, restocking credit memos.
+ */
+async function inventoryConflicts(
+  ctx: ServiceContext,
+  file: ChangesFile,
+  copy: { dividingDate: string },
+  L: Labels,
+  flag: (key: string, text: string) => void,
+): Promise<void> {
+  const onHand = new Map<string, Dec>();
+  for (const r of await q(ctx, sql`SELECT id, quantity_on_hand FROM items WHERE company_id = ${ctx.companyId}::uuid AND type = 'inventory'`)) {
+    onHand.set(String(r.id), dec(r.quantity_on_hand));
+  }
+  if (!onHand.size) return;
+
+  /** What the record moves in the client's file now (its stock movements not yet reversed). */
+  const currentStock = async (type: string, id: string): Promise<StockDelta> => {
+    const m: StockDelta = new Map();
+    const source = STOCK_SOURCE[type];
+    if (!source || !/^[0-9a-f-]{36}$/i.test(id)) return m;
+    for (const r of await q(
+      ctx,
+      sql`SELECT item_id, SUM(CAST(quantity AS NUMERIC)) AS qty FROM inventory_movements
+          WHERE company_id = ${ctx.companyId}::uuid AND source_type = ${source} AND source_id = ${id}::uuid
+            AND reversal_of_id IS NULL AND reversed_at IS NULL
+          GROUP BY item_id`,
+    )) {
+      addDelta(m, String(r.item_id), dec(r.qty));
+    }
+    return m;
+  };
+
+  const kindWord = (type: string) => (type === 'expense' ? TXN_WHAT.expense : docWhat(type as DocType));
+  const named = (type: string, id: string) => {
+    const l = L.doc(id);
+    return l === '(a form not in this file)' ? `this ${kindWord(type)}` : l;
+  };
+  const docRank = (t: DocType) => DOC_ORDER.indexOf(t);
+  const byDate = (a: { after: unknown }, b: { after: unknown }) =>
+    String((a.after as { date?: unknown }).date).localeCompare(String((b.after as { date?: unknown }).date));
+
+  const steps: StockStep[] = [];
+  // Removals: the file's voids (checks first, then forms, as the import runs them).
+  for (const t of file.transactions) {
+    if (t.type !== 'expense' || t.op !== 'void') continue;
+    steps.push({ key: `expense:void:${t.id}`, what: `void of ${named('expense', t.id)}`, subject: `this ${kindWord('expense')}`, phases: [negate(await currentStock('expense', t.id))] });
+  }
+  for (const d of file.documents) {
+    if (d.op !== 'void' || !STOCK_SOURCE[d.type]) continue;
+    steps.push({ key: `${d.type}:void:${d.id}`, what: `void of ${named(d.type, d.id)}`, subject: `this ${kindWord(d.type)}`, phases: [negate(await currentStock(d.type, d.id))] });
+  }
+  // Form edits: each re-posts (the old version's stock is reversed, then the new one's posted).
+  const docEdits = file.documents
+    .filter((d): d is Extract<DocChange, { op: 'edit' }> => d.op === 'edit' && Boolean(STOCK_SOURCE[d.type]))
+    .sort((a, b) => docRank(a.type) - docRank(b.type) || byDate(a, b));
+  for (const d of docEdits) {
+    // A vendor credit that keeps its entry keeps its stock.
+    if (d.type === 'vendor_credit' && !(await editChangesLedger(ctx, 'vendor_credit', d.id, d.after))) continue;
+    steps.push({
+      key: `${d.type}:edit:${d.id}`,
+      what: `change to ${named(d.type, d.id)}`,
+      subject: `this ${kindWord(d.type)}`,
+      phases: [negate(await currentStock(d.type, d.id)), stockOf(d.type, d.after)],
+    });
+  }
+  // Checks / expenses changed: only one that re-posts moves stock.
+  const expenseEdits = file.transactions.filter((t): t is Extract<ChangesFile['transactions'][number], { op: 'edit' }> => t.type === 'expense' && t.op === 'edit').sort(byDate);
+  for (const t of expenseEdits) {
+    const after = t.after as unknown as Row;
+    if (!(await editChangesLedger(ctx, 'expense', t.id, after))) continue;
+    steps.push({
+      key: `expense:edit:${t.id}`,
+      what: `change to ${named('expense', t.id)}`,
+      subject: `this ${kindWord('expense')}`,
+      phases: [negate(await currentStock('expense', t.id)), stockOf('expense', after)],
+    });
+  }
+  // New forms (quantity adjustments among them), then new checks.
+  const docAdds = file.documents
+    .filter((d): d is Extract<DocChange, { op: 'add' }> => d.op === 'add' && (Boolean(STOCK_SOURCE[d.type]) || d.type === 'inventory_adjustment'))
+    .sort((a, b) => docRank(a.type) - docRank(b.type) || byDate(a, b));
+  for (const d of docAdds) {
+    const w = d.type === 'inventory_adjustment' ? 'inventory adjustment' : kindWord(d.type);
+    steps.push({ key: `${d.type}:add:${d.id}`, what: `new ${w}`, subject: `this new ${w}`, phases: [stockOf(d.type, d.after)] });
+  }
+  const expenseAdds = file.transactions.filter((t): t is Extract<ChangesFile['transactions'][number], { op: 'add' }> => t.type === 'expense' && t.op === 'add').sort(byDate);
+  for (const t of expenseAdds) {
+    steps.push({ key: `expense:add:${t.id}`, what: `new ${kindWord('expense')}`, subject: `this new ${kindWord('expense')}`, phases: [stockOf('expense', t.after as unknown as Row)] });
+  }
+
+  // Run them as the import does: a refused change is retried after the others, until a pass makes
+  // no progress.
+  type Short = { itemId: string; have: Dec; need: Dec };
+  const short = new Map<StockStep, Short>();
+  let pending = steps.filter((s) => s.phases.some((ph) => [...ph.keys()].some((k) => onHand.has(k))));
+  while (pending.length) {
+    const refused: StockStep[] = [];
+    for (const s of pending) {
+      const trial = new Map<string, Dec>();
+      let bad: Short | null = null;
+      for (const ph of s.phases) {
+        for (const [itemId, delta] of ph) {
+          if (!onHand.has(itemId)) continue;
+          const have = trial.get(itemId) ?? onHand.get(itemId)!;
+          const next = have.plus(delta);
+          if (!bad && delta.lessThan(0) && next.lessThan(-0.00005)) bad = { itemId, have, need: delta.negated() };
+          trial.set(itemId, next);
+        }
+        if (bad) break;
+      }
+      if (bad) {
+        refused.push(s);
+        short.set(s, bad);
+      } else {
+        for (const [k, v] of trial) onHand.set(k, v);
+        short.delete(s);
+      }
+    }
+    if (refused.length === pending.length) break;
+    pending = refused;
+  }
+
+  for (const s of pending) {
+    const b = short.get(s);
+    if (!b) continue;
+    const uses = await laterStockUses(ctx, copy.dividingDate, b.itemId, L);
+    if (!uses.length) continue;
+    const item = L.item(b.itemId);
+    const shown = uses.length > 4 ? [...uses.slice(0, 4), `${uses.length - 4} more`] : uses;
+    const have = b.have.greaterThan(0) ? b.have : Money.zero();
+    flag(
+      s.key,
+      `Since the dividing date your file has sold or used "${item}": ${joinList(shown)}. So only ${qtyText(have)} of "${item}" ${have.equals(1) ? 'is' : 'are'} on hand, ` +
+        `and your accountant's ${s.what} would take ${qtyText(b.need)} out of stock. ` +
+        `To import: undo or change those sales or uses (void or edit them), import these changes, then enter them again — or ask your accountant to change ${s.subject}.`,
+    );
+  }
+}
+
+/** The client's own sales and uses of an item dated after the dividing date (from its stock movements). */
+async function laterStockUses(ctx: Ctx, dividingDate: string, itemId: string, L: Labels): Promise<string[]> {
+  const rows = await q(
+    ctx,
+    sql`SELECT source_type, source_id, MIN(date) AS date, SUM(CAST(quantity AS NUMERIC)) AS qty FROM inventory_movements
+        WHERE company_id = ${ctx.companyId}::uuid AND item_id = ${itemId}::uuid
+          AND reversal_of_id IS NULL AND reversed_at IS NULL
+          AND source_type NOT IN ('transfer', 'site_rebalance')
+        GROUP BY source_type, source_id
+        ORDER BY MIN(date)`,
+  );
+  const out: string[] = [];
+  for (const r of rows) {
+    const qty = dec(r.qty);
+    if (!qty.lessThan(0) || day(r.date) <= dividingDate) continue;
+    const type = String(r.source_type);
+    const doc = r.source_id ? L.doc(r.source_id) : '(a form not in this file)';
+    const what =
+      doc !== '(a form not in this file)'
+        ? doc
+        : type === 'expense'
+          ? TXN_WHAT.expense
+          : type === 'adjustment'
+            ? 'inventory adjustment'
+            : type === 'build' || type === 'unbuild'
+              ? 'assembly build'
+              : type.replace(/_/g, ' ');
+    const verb = type === 'invoice' || type === 'sales_receipt' ? 'sold' : type === 'vendor_credit' ? 'returned' : type === 'adjustment' ? 'removed' : 'used';
+    out.push(`your ${what} dated ${day(r.date)} (${qtyText(qty.negated())} ${verb})`);
+  }
+  return out;
+}
