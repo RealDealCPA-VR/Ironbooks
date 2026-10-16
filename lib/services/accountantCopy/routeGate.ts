@@ -2,13 +2,17 @@
  * Accountant's Copy route gate (PARITY I1), called by getServerContext for every API request.
  *
  * In the ACCOUNTANT's working copy only the saves the changes file (.ibcx) can carry back to the
- * client are allowed: General Journal entries, checks / expenses, transfers, deposits, chart of
- * accounts and classes —
+ * client are allowed: General Journal entries, checks / expenses / credit card charges, transfers,
+ * deposits, invoices, sales receipts, credit memos, received payments, bills, bill payments,
+ * vendor credits, item receipts, inventory quantity adjustments, estimates, sales orders, purchase
+ * orders, credits and General Journal lines applied, bank reconciliations, the chart of accounts,
+ * classes, customers, vendors, items and other names —
  * plus housekeeping that never changes the books (signing in/out, your own preferences, saved
  * reports, notes, to-dos, backups, the Accountant's Copy screens themselves). Any other save is
  * refused BEFORE it runs, with a plain message, so nothing is done in the copy that would be
- * silently lost. Reads (GET) are never restricted. The dividing date itself is enforced in the
- * services (guard.ts, via assertPeriodOpen).
+ * silently lost. Reads (GET) are never restricted. The dividing date itself, conversions,
+ * refunds, structural list edits and records dated after the dividing date are enforced in the
+ * services (guard.ts).
  */
 import type { DB } from '@/lib/db';
 import { currentRequestInfo } from '@/lib/permissions/enforce';
@@ -23,6 +27,25 @@ export const ACCOUNTANT_COPY_ALLOWED_API = [
   '/api/deposits',
   '/api/accounts',
   '/api/classes',
+  // Sales and purchases (format 3 of the changes file).
+  '/api/invoices',
+  '/api/sales-receipts',
+  '/api/credit-memos',
+  '/api/payments', // incl. /api/payments/journal-items (General Journal A/R lines applied)
+  '/api/bills',
+  '/api/bill-payments', // incl. /api/bill-payments/journal-items
+  '/api/vendor-credits',
+  '/api/item-receipts',
+  '/api/estimates',
+  '/api/sales-orders',
+  '/api/purchase-orders',
+  '/api/reconciliations',
+  // Names and items (adding them, and editing their everyday fields — guard.ts refuses the rest).
+  '/api/customers',
+  '/api/vendors',
+  '/api/items',
+  '/api/lists/other-names',
+  // Housekeeping.
   '/api/accountant-copy',
   '/api/accountant/working-trial-balance',
   '/api/accountant/list-changes',
@@ -54,7 +77,29 @@ export const ACCOUNTANT_COPY_ALLOWED_API = [
   '/api/command-bar',
 ];
 
+/** Paths allowed only exactly (not their sub-paths). */
+export const ACCOUNTANT_COPY_ALLOWED_EXACT = [
+  // Adjust Quantity on Hand (action 'adjust' / 'cogs'): carried as an inventory adjustment. Physical
+  // counts, value adjustments and batch counts (its sub-paths) are not.
+  '/api/inventory',
+];
+
+/**
+ * Sub-paths of allowed prefixes that are still refused: they change several records at once
+ * outside the forms the changes file carries, or post something it can't (retainage release,
+ * paying a credit card from a reconciliation, bulk list edits, estimate expiry sweeps).
+ */
+export const ACCOUNTANT_COPY_DENIED_API: RegExp[] = [
+  /^\/api\/invoices\/retainage(\/|$)/,
+  /^\/api\/estimates\/expire(\/|$)/,
+  /^\/api\/reconciliations\/[^/]+\/pay(\/|$)/,
+  /^\/api\/(customers|vendors|items)\/bulk(\/|$)/,
+  /^\/api\/items\/change-prices(\/|$)/,
+];
+
 export function accountantCopyAllowsApi(path: string): boolean {
+  if (ACCOUNTANT_COPY_DENIED_API.some((re) => re.test(path))) return false;
+  if (ACCOUNTANT_COPY_ALLOWED_EXACT.includes(path)) return true;
   return ACCOUNTANT_COPY_ALLOWED_API.some((p) => path === p || path.startsWith(`${p}/`));
 }
 
@@ -77,7 +122,9 @@ export async function assertAccountantCopyAllowsPath(db: DB, companyId: string, 
   throw new ServiceError(
     'FORBIDDEN',
     "That isn't available in an Accountant's Copy because it can't be sent back to your client. " +
-      'In this copy you can make journal entries, write or edit checks and expenses, transfers and deposits, and add or edit accounts and classes. ' +
+      'In this copy you can enter and fix journal entries, checks, expenses and credit card charges, transfers, deposits, invoices, ' +
+      'sales receipts, credit memos, payments, bills, bill payments, vendor credits, item receipts, inventory adjustments, estimates, ' +
+      'sales and purchase orders, apply credits, reconcile, and add or edit accounts, classes, customers, vendors, items and other names. ' +
       'Note anything else for your client in the changes file.',
     { accountantCopy: true },
   );

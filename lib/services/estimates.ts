@@ -11,6 +11,7 @@
  * `convertToInvoice` is the only mutation that touches the GL, and it does so
  * by delegating entirely to `createInvoice` from the invoices service.
  */
+import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, eq, inArray } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import { estimates, estimateLines, customers, taxRates, classes, items } from '@/lib/db/schema';
@@ -227,6 +228,7 @@ async function prepareEstimate(ctx: ServiceContext, input: CreateEstimateInput) 
 }
 
 export async function createEstimate(ctx: ServiceContext, input: CreateEstimateInput) {
+  await assertDividingDateOpen(ctx, input.date); // Accountant's Copy (I1)
   await assertSalesTaxAllowed(ctx, input);
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   input = await applyCustomerShipToDefault(ctx, input);
@@ -355,6 +357,7 @@ export async function updateEstimateStatus(
   if (estimate.status === 'closed') {
     throw new ServiceError('CONFLICT', 'Cannot change the status of a closed (converted) estimate.');
   }
+  await assertDividingDateOpen(ctx, estimate.date); // Accountant's Copy (I1)
   if (estimate.status === 'partial') {
     throw new ServiceError(
       'CONFLICT',
@@ -409,6 +412,7 @@ export async function convertToInvoice(
   // estimate still open and convertible again (duplicate invoice + revenue).
   // Re-loading the estimate inside the transaction also closes the
   // read-then-write race between concurrent converts.
+  await assertAccountantMayConvert(ctx, 'Turning an estimate into an invoice'); // Accountant's Copy (I1)
   return inTransaction(ctx, async (tx) => {
     const estimate = await getEstimate(tx, estimateId);
 
@@ -513,6 +517,7 @@ export async function createProgressInvoice(
 ) {
   // Preferences > Jobs & Estimates 'Use progress invoicing'.
   await assertFeatureOn(ctx, 'progressInvoicingEnabled');
+  await assertAccountantMayConvert(ctx, 'Progress invoicing from an estimate'); // Accountant's Copy (I1)
   // Everything (estimate re-read, invoice creation, billing refresh) runs in ONE transaction so
   // concurrent progress bills see each other.
   return inTransaction(ctx, async (tx) => {
@@ -716,6 +721,9 @@ export async function createProgressInvoice(
 export async function updateEstimate(ctx: ServiceContext, id: string, input: CreateEstimateInput) {
   input = await applyCustomerTaxDefaults(ctx, input);
   const existing = await getEstimate(ctx, id);
+  // Accountant's Copy (I1): both the estimate's date and the new one.
+  await assertDividingDateOpen(ctx, existing.date);
+  await assertDividingDateOpen(ctx, input.date);
   if (existing.status === 'closed' || existing.convertedInvoiceId) {
     throw new ServiceError(
       'CONFLICT',

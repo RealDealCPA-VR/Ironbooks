@@ -23,7 +23,7 @@ import { journalBalancesByEntity } from './journal';
 import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
 import { getPreferences } from './preferences';
 import { defaultShipTo, normalizeShipToAddresses, shipToAddressFields, type ShipToAddress } from '@/lib/shipTo';
-import { assertListDeleteAllowed } from './accountantCopy/guard';
+import { assertAccountantListEdit, assertListDeleteAllowed } from './accountantCopy/guard';
 
 /** Validate the named ship-to list; the default one also becomes `shippingAddress`. */
 function resolveShipTos(list: Array<Partial<ShipToAddress>> | null | undefined): ShipToAddress[] | null {
@@ -261,6 +261,7 @@ export async function updateCustomer(
   patch: UpdateCustomerInput,
 ) {
   const before = await getCustomer(ctx, id); // also verifies company ownership
+  await assertAccountantListEdit(ctx, 'customer', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
 
   // Validate incoming values only when present in patch.
   if (patch.displayName !== undefined) {
@@ -422,6 +423,7 @@ export async function deactivateCustomer(ctx: ServiceContext, id: string) {
  */
 export async function reactivateCustomer(ctx: ServiceContext, id: string) {
   const before = await getCustomer(ctx, id);
+  await assertAccountantListEdit(ctx, 'customer', before as Record<string, unknown>, { isActive: true }); // I1
   const [row] = await ctx.db
     .update(customers)
     .set({ isActive: true, updatedAt: new Date() })

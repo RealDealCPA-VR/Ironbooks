@@ -21,6 +21,7 @@
  *   the invoice that completes (closes) the order. `backorderReport` exposes
  *   the remaining (backordered) quantity per open sales-order line.
  */
+import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import { customers, items, salesOrders, salesOrderLines, taxRates } from '@/lib/db/schema';
@@ -170,6 +171,7 @@ async function prepareSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInp
 }
 
 export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOrderInput) {
+  await assertDividingDateOpen(ctx, input.date); // Accountant's Copy (I1)
   await assertSalesTaxAllowed(ctx, input);
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   input = await applyCustomerShipToDefault(ctx, input);
@@ -273,6 +275,7 @@ export async function updateStatus(
     .from(salesOrders)
     .where(and(eq(salesOrders.companyId, ctx.companyId), eq(salesOrders.id, id)));
   if (!order) throw notFound('Sales order');
+  await assertDividingDateOpen(ctx, order.date); // Accountant's Copy (I1)
 
   if (order.status === 'closed' && status !== 'closed') {
     throw new ServiceError('CONFLICT', 'Cannot reopen a closed (converted) sales order.');
@@ -359,6 +362,7 @@ export async function convertToInvoice(
   salesOrderId: string,
   opts?: ConvertToInvoiceOptions,
 ) {
+  await assertAccountantMayConvert(ctx, 'Turning a sales order into an invoice'); // Accountant's Copy (I1)
   // Invoice creation and order stamping must commit or roll back TOGETHER —
   // otherwise a failure after createInvoice leaves a posted GL invoice with the
   // order still open and convertible again (duplicate invoice + revenue).
@@ -614,6 +618,9 @@ export async function backorderReport(ctx: ServiceContext): Promise<BackorderRep
 export async function updateSalesOrder(ctx: ServiceContext, id: string, input: CreateSalesOrderInput) {
   input = await applyCustomerTaxDefaults(ctx, input);
   const existing = await getSalesOrder(ctx, id);
+  // Accountant's Copy (I1): both the order's date and the new one.
+  await assertDividingDateOpen(ctx, existing.date);
+  await assertDividingDateOpen(ctx, input.date);
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided sales order.');
   if (existing.status === 'closed') {
     throw new ServiceError(

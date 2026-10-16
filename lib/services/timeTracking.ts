@@ -23,6 +23,7 @@ import {
   writeAudit,
 } from './_base';
 import { createInvoice } from './invoices';
+import { assertAccountantMayBillCosts } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -244,6 +245,7 @@ export async function billTimeToInvoice(
   ctx: ServiceContext,
   { customerId }: { customerId: string },
 ) {
+  await assertAccountantMayBillCosts(ctx); // Accountant's Copy (I1): the time-entry links can't travel back
   // Verify customer.
   const [cust] = await ctx.db
     .select({ id: customers.id })

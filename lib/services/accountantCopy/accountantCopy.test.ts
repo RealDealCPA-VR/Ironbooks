@@ -19,7 +19,6 @@ import {
   expenseLines,
   journalEntries,
   journalEntryLines,
-  journalItemApplications,
   transfers,
   users,
 } from '@/lib/db/schema';
@@ -210,21 +209,17 @@ describe("Accountant's Copy", () => {
 
     const locked = { code: 'CONFLICT', details: expect.objectContaining({ accountantCopy: true, side: 'accountant' }) };
     await expect(createManualEntry(actx, je('2026-04-01', acct['6300'], acct['1000'], '10.00', 'After'))).rejects.toMatchObject(locked);
-    // Work the changes file can't carry back is refused (an invoice posts from its own source).
+    // Invoices travel in the changes file now, but only on or before the dividing date.
     await expect(
-      createInvoice(actx, { customerId, date: d('2026-03-01'), lines: [{ description: 'Work', quantity: 1, rate: '10' }] }),
-    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+      createInvoice(actx, { customerId, date: d('2026-04-02'), lines: [{ description: 'Work', quantity: 1, rate: '10' }] }),
+    ).rejects.toMatchObject(locked);
     // No list deletes in the copy either.
     await expect(deactivateCustomer(actx, customerId)).rejects.toMatchObject({ code: 'CONFLICT' });
-    // Applying a General Journal A/R / A/P line can't be sent back, so it is refused in the copy
-    // (before anything is looked up) — on the client the same call is an ordinary not-found.
+    // Applying a General Journal credit is carried too, so it is no longer refused up front (an
+    // unknown line is an ordinary not-found, as on the client).
     const noLine = '00000000-0000-4000-8000-000000000001';
     const noInvoice = '00000000-0000-4000-8000-000000000002';
-    await expect(applyJournalCredit(actx, { journalLineId: noLine, invoiceId: noInvoice, amount: '1.00', date: d('2026-03-01') })).rejects.toMatchObject({
-      code: 'FORBIDDEN',
-      details: expect.objectContaining({ accountantCopy: true }),
-    });
-    await expect(applyJournalCredit(ctx, { journalLineId: noLine, invoiceId: noInvoice, amount: '1.00', date: d('2026-04-20') })).rejects.not.toMatchObject({
+    await expect(applyJournalCredit(actx, { journalLineId: noLine, invoiceId: noInvoice, amount: '1.00', date: d('2026-03-01') })).rejects.not.toMatchObject({
       code: 'FORBIDDEN',
     });
     // Status of the original entry is untouched by the refused work.
@@ -304,27 +299,8 @@ describe("Accountant's Copy", () => {
 
     const out = await exportChangesFile(actx, { note: 'Please review the audit accrual.' });
     expect(out.filename).toMatch(/\.ibcx$/);
-    expect(out.counts).toEqual({ accounts: 1, classes: 1, transactions: 9 });
+    expect(out.counts).toEqual({ accounts: 1, classes: 1, transactions: 9, names: 0, documents: 0, applications: 0, reconciliations: 0 });
     changesFile = out.buffer;
-  });
-
-  it('accountant: a journal line application that got into the copy is warned about (it is not carried back)', async () => {
-    const [line] = await adb
-      .select({ id: journalEntryLines.id, entryId: journalEntryLines.journalEntryId })
-      .from(journalEntryLines)
-      .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
-      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.description, 'Year-end audit fee accrual'), eq(journalEntryLines.accountId, acct['2000'])));
-    const [app] = await adb
-      .insert(journalItemApplications)
-      .values({ companyId: ctx.companyId, side: 'ap', kind: 'journal_offset', pairId: line.id, journalEntryId: line.entryId, journalLineId: line.id, amount: '1.00', date: d('2026-03-31') })
-      .returning();
-    try {
-      const changes = await accountantChanges(actx);
-      expect(changes.warnings.join(' ')).toMatch(/journal entry line application/);
-    } finally {
-      await adb.delete(journalItemApplications).where(eq(journalItemApplications.id, app.id));
-    }
-    expect((await accountantChanges(actx)).warnings).toEqual([]);
   });
 
   it('client: refuses a damaged changes file and one meant for another company file', async () => {
@@ -415,7 +391,7 @@ describe("Accountant's Copy", () => {
     const review = await reviewChangesFile(ctx, changesFile);
     expect(review.canImport).toBe(true);
     expect(review.note).toBe('Please review the audit accrual.');
-    expect(review.counts).toEqual({ added: 4, changed: 3, voided: 2, lists: 2 });
+    expect(review.counts).toEqual({ added: 4, changed: 3, voided: 2, lists: 2, applications: 0, reconciliations: 0 });
     expect(review.items.find((i) => i.op === 'edit' && i.kind === 'Journal entry')?.before?.join(' ')).toMatch(/100\.00/);
     const trEdit = review.items.find((i) => i.op === 'edit' && i.kind === 'Transfer');
     expect(trEdit?.before?.join(' ')).toMatch(/200\.00/);
@@ -427,7 +403,7 @@ describe("Accountant's Copy", () => {
 
     const before = await trialBalance(ctx);
     const res = await importChangesFile(ctx, changesFile);
-    expect(res.applied).toEqual({ accounts: 1, classes: 1, added: 4, changed: 3, voided: 2 });
+    expect(res.applied).toEqual({ accounts: 1, classes: 1, names: 0, added: 4, changed: 3, voided: 2, applications: 0, reconciliations: 0 });
     expect(res.trialBalance.balanced).toBe(true);
     expect(before.balanced).toBe(true);
     await expectBalanced(ctx);

@@ -2778,8 +2778,12 @@ export const accountantCopies = pgTable('accountant_copies', {
 export const accountantCopyBaseline = pgTable('accountant_copy_baseline', {
   id: uuid('id').primaryKey().defaultRandom(),
   copyId: uuid('copy_id').references(() => accountantCopies.id, { onDelete: 'cascade' }).notNull(),
-  /** 'journal_entry' | 'expense' | 'account' | 'class' */
-  entityType: varchar('entity_type', { length: 20 }).notNull(),
+  /** 'journal_entry' | 'expense' | 'account' | 'class' | 'invoice' | 'customer' | ... (accountantCopy/docs.ts) */
+  entityType: varchar('entity_type', { length: 40 }).notNull(),
   entityId: uuid('entity_id').notNull(),
   version: timestamp('version'),
+  /** 0058: md5 of the record's substance (derived values left out), see accountantCopy/docs.ts. */
+  digest: text('digest'),
+  /** 0058: 'void' | 'draft' | 'live', or the status of an estimate / sales order / purchase order. */
+  state: varchar('state', { length: 20 }),
 });

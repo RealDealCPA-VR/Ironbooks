@@ -7,18 +7,30 @@
  *    dividing date). The copy's own accountant_copies row travels inside the checksummed data, so
  *    the flag can't be edited without the file failing its integrity check on open.
  *  - Changes file `<Company> (Accountant Changes YYYY-MM-DD).ibcx` — accountant → client.
- *    JSON: the delta the accountant made (journal entries, checks / expenses, transfers,
- *    deposits, accounts, classes, a note), bound to the copy by copy id + the copy's random file token, with a SHA-256 of the
- *    body so a damaged or edited file is refused.
+ *    JSON: the delta the accountant made, bound to the copy by copy id + the copy's random file
+ *    token, with a SHA-256 of the body so a damaged or edited file is refused:
+ *      format 2: journal entries, checks / expenses, transfers, deposits, accounts, classes, note;
+ *      format 3: also new / edited customers, vendors, items and other names (`names`), sales and
+ *      purchase forms, payments and inventory adjustments (`documents`), credit / journal
+ *      applications (`applications`) and bank reconciliations (`reconciliations`).
+ *    Format 2 files still import (the new arrays are simply empty).
+ *    Every payload is checked against a declared shape (PAYLOAD_SHAPES) before any query runs:
+ *    the same shape tells the import which fields are record ids (mapped to the ids of records the
+ *    import creates), which are dates and which are General Journal line references.
  */
 import { createHash } from 'node:crypto';
+import Decimal from 'decimal.js';
 import { ServiceError } from '../errors';
+import { NAME_COLUMNS } from './digest';
 
 export const TRANSFER_EXTENSION = 'ibac';
 export const CHANGES_EXTENSION = 'ibcx';
 export const TRANSFER_ENTRY = 'accountant-copy.json';
-/** 2: transfers and deposits travel too (an older app refuses the file as "made by a newer version"). */
-export const CHANGES_FORMAT_VERSION = 2;
+/**
+ * 2: transfers and deposits travel too (an older app refuses the file as "made by a newer version").
+ * 3: names, sales / purchase forms, payments, applications, reconciliations (format 2 still reads).
+ */
+export const CHANGES_FORMAT_VERSION = 3;
 
 export interface TransferManifest {
   app: 'ironbooks';
@@ -52,6 +64,8 @@ export interface JournalPayload {
   lines: JournalLinePayload[];
   /** Accountant-file entry number (shown in the review only). */
   entryNumber: number;
+  /** Format 3: the accountant-file id of the posted entry (maps General Journal line references). */
+  postedId?: string | null;
 }
 
 export interface ExpenseLinePayload {
@@ -99,6 +113,8 @@ export interface TransferPayload {
   toAmount: string | null;
   /** Foreign transfers: the home-currency value both ledger lines carry. */
   homeAmount: string | null;
+  /** Format 3: the accountant-file id of the transfer's posted entry (maps line references). */
+  postedEntryId?: string | null;
 }
 
 /** A bank deposit (Make Deposits). Payment / sales-receipt ids are the same records in both files. */
@@ -148,6 +164,105 @@ export interface ClassChange {
   parentId: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Format 3: names, documents, applications, reconciliations
+// ---------------------------------------------------------------------------
+
+/**
+ * A General Journal line as the accountant's file knows it. Lines of records that existed when the
+ * copy was made keep their id in the client's file; lines of entries the accountant posted (or
+ * re-posted) are found on import from the record that owns the entry (mapped to the record the
+ * import created) and the line's account / amount / name.
+ */
+export interface LineRef {
+  lineId: string;
+  entryId: string;
+  sourceRef: string | null;
+  /** 'YYYY-MM-DD…' of the entry. */
+  date: string;
+  accountId: string;
+  debit: string | null;
+  credit: string | null;
+  entityId: string | null;
+  /** The record whose posting this is ('journal_entry', 'transfer', 'invoice', 'payment_received', …). */
+  owner: { type: string; id: string } | null;
+}
+
+export type NameType = 'customer' | 'vendor' | 'item' | 'other_name';
+export type NameChange =
+  | { op: 'add'; type: NameType; id: string; after: Record<string, unknown> }
+  | {
+      op: 'edit';
+      type: NameType;
+      id: string;
+      baseVersion: string | null;
+      baseDigest: string | null;
+      after: Record<string, unknown>;
+      /**
+       * The fields the accountant changed (NAME_COLUMNS keys). Only these are applied, and the
+       * client's own edits of OTHER fields of the same record are not a conflict. Absent in files
+       * from copies made before it existed: the whole record is compared then.
+       */
+      fields?: string[];
+    };
+
+export type DocType =
+  | 'invoice'
+  | 'sales_receipt'
+  | 'credit_memo'
+  | 'payment_received'
+  | 'bill'
+  | 'bill_payment'
+  | 'vendor_credit'
+  | 'item_receipt'
+  | 'estimate'
+  | 'sales_order'
+  | 'purchase_order'
+  | 'inventory_adjustment';
+
+export type DocChange =
+  | { op: 'add'; type: DocType; id: string; after: Record<string, unknown> }
+  | { op: 'edit'; type: DocType; id: string; baseVersion: string | null; baseDigest: string | null; after: Record<string, unknown> }
+  | { op: 'void'; type: DocType; id: string; baseVersion: string | null; baseDigest: string | null };
+
+export type ApplicationChange =
+  /** A credit memo applied to an invoice outside Receive Payments (id: the application). */
+  | { op: 'apply'; kind: 'credit_memo'; id: string; creditMemoId: string; invoiceId: string; amount: string; date: string }
+  /** id: the client's application (it existed when the copy was made). */
+  | { op: 'unapply'; kind: 'credit_memo'; id: string; creditMemoId: string; invoiceId: string; amount: string; date: string }
+  /** Net vendor credit applied to / taken off a bill (id: the vendor credit). */
+  | { op: 'apply' | 'unapply'; kind: 'vendor_credit'; id: string; vendorCreditId: string; billId: string; amount: string; date: string }
+  /** A General Journal credit applied to an invoice, a bill or a General Journal charge (id: the application). */
+  | {
+      op: 'apply';
+      kind: 'journal';
+      id: string;
+      line: LineRef;
+      invoiceId: string | null;
+      billId: string | null;
+      chargeLine: LineRef | null;
+      amount: string;
+      date: string;
+    }
+  /** id: the client's application. */
+  | { op: 'unapply'; kind: 'journal'; id: string; amount: string; date: string };
+
+export type ReconciliationChange =
+  | {
+      op: 'reconcile';
+      /** The accountant-file reconciliation. */
+      id: string;
+      /** GL account of the bank / credit card account. */
+      accountId: string;
+      statementDate: string;
+      statementBalance: string;
+      cleared: LineRef[];
+      serviceCharge: { amount: string; accountId: string } | null;
+      interestEarned: { amount: string; accountId: string } | null;
+    }
+  /** Undo Last Reconciliation of a reconciliation that existed when the copy was made. */
+  | { op: 'undo'; id: string; accountId: string; statementDate: string; statementBalance: string };
+
 export interface ChangesFileBody {
   app: 'ironbooks';
   kind: 'accountant-changes';
@@ -163,6 +278,11 @@ export interface ChangesFileBody {
   accounts: AccountChange[];
   classes: ClassChange[];
   transactions: TxnChange[];
+  /** Format 3 (absent in format 2 files; read as []). */
+  names: NameChange[];
+  documents: DocChange[];
+  applications: ApplicationChange[];
+  reconciliations: ReconciliationChange[];
   /** Changes made in the copy that the file can't carry (shown to the client in the review). */
   warnings: string[];
 }
@@ -210,9 +330,55 @@ export function parseChangesFile(buffer: Buffer): ChangesFile {
   for (const k of ['accounts', 'classes', 'transactions', 'warnings'] as const) {
     if (!Array.isArray(parsed[k])) throw notChanges(`"${k}" is missing`);
   }
+  for (const k of ['names', 'documents', 'applications', 'reconciliations'] as const) {
+    // Format 2 files have none of these (they were made before the file could carry them).
+    if (parsed.formatVersion < 3 && parsed[k] === undefined) parsed[k] = [];
+    if (!Array.isArray(parsed[k])) throw notChanges(`"${k}" is missing`);
+  }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(parsed.dividingDate ?? '')) throw notChanges('the dividing date is missing');
   if (!wellFormed(parsed)) throw notChanges('it is incomplete');
+  const costError = inventoryCostProblem(parsed.documents);
+  if (costError) {
+    throw new ServiceError('VALIDATION', `The changes file can't be imported: ${costError}. Nothing was imported.`);
+  }
   return parsed;
+}
+
+const COST_DOC_NAME: Partial<Record<DocType, string>> = {
+  invoice: 'invoice',
+  sales_receipt: 'sales receipt',
+  credit_memo: 'credit memo',
+  inventory_adjustment: 'inventory adjustment',
+};
+
+/**
+ * The accountant's inventory costs (a line's `cost`, a removal's `total`) are amounts the import
+ * values stock with, so they must make sense before anything is applied: never negative, and only
+ * on a line that sells an item (invoice, sales receipt) or restocks one (credit memo, restock
+ * ticked). Returns the failing change, described, or null.
+ */
+export function inventoryCostProblem(documents: DocChange[]): string | null {
+  for (const d of documents) {
+    if (d.op === 'void') continue;
+    const name = COST_DOC_NAME[d.type];
+    const ref = d.after.refNumber ? ` #${String(d.after.refNumber)}` : '';
+    const what = `the ${d.op === 'add' ? 'new' : 'changed'} ${name ?? d.type.replace(/_/g, ' ')}${ref} dated ${String(d.after.date).slice(0, 10)}`;
+    if (d.type === 'inventory_adjustment') {
+      if (isDec(d.after.total) && new Decimal(d.after.total).isNegative()) return `${what} has a negative value (${d.after.total})`;
+      continue;
+    }
+    const lines = Array.isArray(d.after.lines) ? (d.after.lines as Rec[]) : [];
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      if (l.cost === undefined || l.cost === null) continue;
+      const at = `line ${i + 1} of ${what}`;
+      if (!name) return `${at} carries an inventory cost, which only a sale or a credit memo restock can`;
+      if (!isId(l.itemId)) return `${at} carries an inventory cost but no item`;
+      if (d.type === 'credit_memo' && l.restock !== true) return `${at} carries an inventory cost but does not restock the item`;
+      if (isDec(l.cost) && new Decimal(l.cost).isNegative()) return `${at} has a negative inventory cost (${l.cost})`;
+    }
+  }
+  return null;
 }
 
 // ---- Structural checks (a file can pass its checksum and still be malformed) ----
@@ -245,7 +411,7 @@ function journalOk(a: unknown): boolean {
       optId(l.classId) &&
       optStr(l.entityType) &&
       optId(l.entityId),
-  );
+  ) && optId(a.postedId);
 }
 
 function expenseOk(a: unknown): boolean {
@@ -265,7 +431,10 @@ function expenseOk(a: unknown): boolean {
       optId(l.customerId) &&
       optId(l.jobId) &&
       optId(l.siteId) &&
-      optId(l.binId),
+      optId(l.binId) &&
+      (l.serialNumbers === undefined || l.serialNumbers === null || (Array.isArray(l.serialNumbers) && l.serialNumbers.every(isStr))) &&
+      optStr(l.lotNumber) &&
+      (l.lotExpiration === undefined || l.lotExpiration === null || isDate(l.lotExpiration)),
   );
 }
 
@@ -278,7 +447,8 @@ function transferOk(a: unknown): boolean {
     isDec(a.amount) &&
     optStr(a.memo) &&
     optDec(a.toAmount) &&
-    optDec(a.homeAmount)
+    optDec(a.homeAmount) &&
+    optId(a.postedEntryId)
   );
 }
 
@@ -325,12 +495,296 @@ function accountOk(a: unknown): boolean {
 
 const classOk = (c: unknown) => isObj(c) && c.op === 'add' && isId(c.id) && isStr(c.name) && optId(c.parentId);
 
+// ---------------------------------------------------------------------------
+// Declared payload shapes (format 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * One field of a payload: 'id' (record id, mapped on import), 'dec' (decimal string), 'date'
+ * (ISO date, a Date on import), 'str', 'bool', 'strmap' (an address / custom fields object of
+ * strings), 'strs' (list of strings), 'ids' (list of record ids), 'lineRef' (a General Journal line,
+ * resolved on import); a trailing '?' allows null / missing. { arr } is a list of objects,
+ * { obj } one object (optional with opt: true).
+ */
+export type FieldSpec =
+  | 'id' | 'id?' | 'dec' | 'dec?' | 'date' | 'date?' | 'str' | 'str?' | 'bool' | 'bool?'
+  | 'strmap?' | 'strs?' | 'ids?' | 'lineRef' | 'lineRef?'
+  | { arr: Shape; opt?: boolean }
+  | { obj: Shape; opt?: boolean };
+export type Shape = { readonly [key: string]: FieldSpec };
+
+const isStrMap = (v: unknown) => isObj(v) && Object.values(v).every((x) => typeof x === 'string' || typeof x === 'boolean' || x === null);
+
+export const LINE_REF_SHAPE: Shape = {
+  lineId: 'id',
+  entryId: 'id',
+  sourceRef: 'str?',
+  date: 'date',
+  accountId: 'id',
+  debit: 'dec?',
+  credit: 'dec?',
+  entityId: 'id?',
+  owner: { obj: { type: 'str', id: 'id' }, opt: true },
+};
+
+/** True when `v` matches `shape` exactly (no unknown keys, every field of the right kind). */
+export function matchesShape(v: unknown, shape: Shape): boolean {
+  if (!isObj(v)) return false;
+  for (const k of Object.keys(v)) if (!Object.prototype.hasOwnProperty.call(shape, k)) return false;
+  for (const [k, spec] of Object.entries(shape)) {
+    if (!fieldOk(v[k], spec)) return false;
+  }
+  return true;
+}
+
+function fieldOk(v: unknown, spec: FieldSpec): boolean {
+  if (typeof spec === 'object') {
+    if ('arr' in spec) {
+      if (spec.opt && (v === undefined || v === null)) return true;
+      return Array.isArray(v) && v.every((x) => matchesShape(x, spec.arr));
+    }
+    if (spec.opt && (v === undefined || v === null)) return true;
+    return matchesShape(v, spec.obj);
+  }
+  const optional = spec.endsWith('?');
+  if (optional && (v === undefined || v === null)) return true;
+  switch (spec.replace('?', '')) {
+    case 'id':
+      return isId(v);
+    case 'dec':
+      return isDec(v);
+    case 'date':
+      return isDate(v);
+    case 'str':
+      return isStr(v);
+    case 'bool':
+      return typeof v === 'boolean';
+    case 'strmap':
+      return isStrMap(v);
+    case 'strs':
+      return Array.isArray(v) && v.every(isStr);
+    case 'ids':
+      return idList(v);
+    case 'lineRef':
+      return matchesShape(v, LINE_REF_SHAPE);
+    default:
+      return false;
+  }
+}
+
+/** Inventory site / bin / serial / lot of a document line (InventoryLineDetail). */
+const INV: Shape = { siteId: 'id?', binId: 'id?', serialNumbers: 'strs?', lotNumber: 'str?', lotExpiration: 'date?' };
+const JOURNAL_ITEM: Shape = { line: 'lineRef', amount: 'dec' };
+const JOURNAL_OFFSET: Shape = { line: 'lineRef', chargeLine: 'lineRef', amount: 'dec' };
+
+/**
+ * Sales lines (invoice, sales receipt) and restocked credit memo lines of inventory items carry
+ * `cost`: what the accountant's file posted for the line (COGS / restock value). The import costs
+ * the line at that amount (inventoryCost.ts), not at the client's current average cost. A quantity
+ * removal (inventory adjustment) is likewise taken out at its `total`.
+ */
+export const DOC_SHAPES: Record<DocType, Shape> = {
+  invoice: {
+    refNumber: 'str?', customerId: 'id', date: 'date', dueDate: 'date?', terms: 'str?', taxRateId: 'id?', classId: 'id?',
+    jobId: 'id?', salesRepId: 'id?', discount: 'dec?', discountType: 'str?', retainagePercent: 'dec?', memo: 'str?',
+    currency: 'str?', exchangeRate: 'dec?', status: 'str', customFields: 'strmap?', shipDate: 'date?', shipVia: 'str?',
+    fob: 'str?', trackingNumber: 'str?', shipTo: 'strmap?', poNumber: 'str?', toBePrinted: 'bool?', toBeEmailed: 'bool?',
+    isStatementCharge: 'bool?', total: 'dec',
+    lines: {
+      arr: {
+        itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?',
+        taxRateId: 'id?', classId: 'id?', jobId: 'id?', estimateLineId: 'id?', cost: 'dec?', ...INV,
+      },
+    },
+  },
+  sales_receipt: {
+    refNumber: 'str?', customerId: 'id?', date: 'date', taxRateId: 'id?', depositAccountId: 'id?', method: 'str?',
+    reference: 'str?', memo: 'str?', classId: 'id?', shipDate: 'date?', shipVia: 'str?', fob: 'str?',
+    trackingNumber: 'str?', shipTo: 'strmap?', poNumber: 'str?', toBePrinted: 'bool?', toBeEmailed: 'bool?', total: 'dec',
+    lines: {
+      arr: { itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', taxRateId: 'id?', cost: 'dec?', ...INV },
+    },
+  },
+  credit_memo: {
+    refNumber: 'str?', customerId: 'id', date: 'date', taxRateId: 'id?', memo: 'str?', toBePrinted: 'bool?',
+    toBeEmailed: 'bool?', total: 'dec',
+    lines: {
+      arr: { itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', restock: 'bool?', cost: 'dec?', ...INV },
+    },
+  },
+  payment_received: {
+    customerId: 'id', date: 'date', method: 'str', reference: 'str?', amount: 'dec', depositAccountId: 'id?',
+    discountAccountId: 'id?', memo: 'str?', currency: 'str?', exchangeRate: 'dec?',
+    applications: { arr: { invoiceId: 'id', amountApplied: 'dec', discountAmount: 'dec?' } },
+    credits: { arr: { creditMemoId: 'id', invoiceId: 'id', amount: 'dec' } },
+    journalItems: { arr: JOURNAL_ITEM },
+    journalCredits: { arr: { line: 'lineRef', invoiceId: 'id', amount: 'dec' } },
+    journalOffsets: { arr: JOURNAL_OFFSET },
+  },
+  bill: {
+    vendorId: 'id', billNumber: 'str?', date: 'date', dueDate: 'date?', terms: 'str?', memo: 'str?', classId: 'id?',
+    currency: 'str?', exchangeRate: 'dec?', total: 'dec',
+    lines: {
+      arr: {
+        accountId: 'id?', itemId: 'id?', description: 'str?', quantity: 'dec?', unitCost: 'dec?', amount: 'dec?',
+        classId: 'id?', customerId: 'id?', jobId: 'id?', ...INV,
+      },
+    },
+  },
+  bill_payment: {
+    vendorId: 'id', date: 'date', method: 'str', reference: 'str?', paymentAccountId: 'id', discountAccountId: 'id?',
+    toPrint: 'bool?', exchangeRate: 'dec?', amount: 'dec',
+    applications: { arr: { billId: 'id', amountApplied: 'dec', discountTaken: 'dec?' } },
+    journalItems: { arr: JOURNAL_ITEM },
+    journalCredits: { arr: { line: 'lineRef', billId: 'id', amount: 'dec' } },
+    journalOffsets: { arr: JOURNAL_OFFSET },
+  },
+  vendor_credit: {
+    vendorId: 'id', date: 'date', memo: 'str?', refNumber: 'str?', currency: 'str?', exchangeRate: 'dec?', total: 'dec',
+    lines: {
+      arr: {
+        accountId: 'id?', itemId: 'id?', quantity: 'dec?', unitCost: 'dec?', description: 'str?', amount: 'dec?',
+        classId: 'id?', customerId: 'id?', jobId: 'id?',
+      },
+    },
+  },
+  item_receipt: {
+    vendorId: 'id', date: 'date', reference: 'str?', memo: 'str?', purchaseOrderId: 'id?', total: 'dec',
+    lines: { arr: { itemId: 'id', description: 'str?', quantity: 'dec', unitCost: 'dec', ...INV } },
+  },
+  estimate: {
+    refNumber: 'str?', customerId: 'id', date: 'date', expirationDate: 'date?', taxRateId: 'id?', memo: 'str?',
+    shipTo: 'strmap?', toBePrinted: 'bool?', toBeEmailed: 'bool?', status: 'str', total: 'dec',
+    // Line ids (the accountant file's): an invoice line made in the copy may bill an estimate line
+    // made there; the import maps them to the client's new lines by position.
+    lines: { arr: { id: 'id?', itemId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', classId: 'id?' } },
+  },
+  sales_order: {
+    refNumber: 'str?', customerId: 'id', date: 'date', memo: 'str?', taxRateId: 'id?', shipDate: 'date?', shipVia: 'str?',
+    fob: 'str?', trackingNumber: 'str?', shipTo: 'strmap?', poNumber: 'str?', toBePrinted: 'bool?', toBeEmailed: 'bool?',
+    status: 'str', total: 'dec',
+    lines: { arr: { id: 'id?', itemId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?' } },
+  },
+  purchase_order: {
+    refNumber: 'str?', vendorId: 'id', date: 'date', expectedDate: 'date?', memo: 'str?', status: 'str', total: 'dec',
+    lines: { arr: { id: 'id?', itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec' } },
+  },
+  inventory_adjustment: {
+    itemId: 'id', quantityChange: 'dec', unitCost: 'dec?', date: 'date', memo: 'str?', adjustmentAccountId: 'id?',
+    classId: 'id?', customerId: 'id?', jobId: 'id?', total: 'dec', ...INV,
+  },
+};
+
+/** One of a customer's ship-to addresses (lib/shipTo.ts). */
+const SHIP_TO: Shape = {
+  name: 'str', line1: 'str?', line2: 'str?', city: 'str?', state: 'str?', zip: 'str?', country: 'str?', isDefault: 'bool?',
+};
+
+export const NAME_SHAPES: Record<NameType, Shape> = {
+  customer: {
+    displayName: 'str', companyName: 'str?', email: 'str?', phone: 'str?', billingAddress: 'strmap?',
+    shippingAddress: 'strmap?', terms: 'str?', termsId: 'id?', creditLimit: 'dec?', taxable: 'bool?', taxRateId: 'id?',
+    salesTaxCodeId: 'id?', resaleNumber: 'str?', taxExemptionReason: 'str?', notes: 'str?',
+    customFields: 'strmap?', customerTypeId: 'id?',
+    // New customers only (a job's place in the customer list, its price level and ship-to list are
+    // structural: guard.ts refuses changing them in the copy).
+    parentId: 'id?', priceLevelId: 'id?', shipToAddresses: { arr: SHIP_TO, opt: true },
+  },
+  vendor: {
+    displayName: 'str', companyName: 'str?', email: 'str?', phone: 'str?', address: 'strmap?', terms: 'str?',
+    termsId: 'id?', is1099: 'bool?', defaultExpenseAccountId: 'id?', notes: 'str?', printOnCheckAs: 'str?',
+    accountNumber: 'str?', prefillAccountIds: 'ids?', customFields: 'strmap?',
+    // New vendors only.
+    currency: 'str?',
+  },
+  item: {
+    name: 'str', sku: 'str?', description: 'str?', salesPrice: 'dec?', purchaseCost: 'dec?', taxable: 'bool?',
+    salesTaxCodeId: 'id?', unitOfMeasure: 'str?', barcode: 'str?', weight: 'dec?', preferredVendorId: 'id?',
+    reorderPoint: 'dec?', customFields: 'strmap?',
+    // New items only (type, accounts and tracking are structural).
+    type: 'str?', incomeAccountId: 'id?', expenseAccountId: 'id?', assetAccountId: 'id?', trackingMode: 'str?', uomSetId: 'id?',
+  },
+  other_name: {
+    name: 'str', companyName: 'str?', email: 'str?', phone: 'str?', address: 'strmap?', accountNumber: 'str?', notes: 'str?',
+  },
+};
+
+/** Fields a new name / item may carry but an edit may not (QB: hierarchy, type, accounts, currency). */
+export const NAME_ADD_ONLY: Record<NameType, readonly string[]> = {
+  customer: ['parentId', 'priceLevelId', 'shipToAddresses'],
+  vendor: ['currency'],
+  item: ['type', 'incomeAccountId', 'expenseAccountId', 'assetAccountId', 'trackingMode', 'uomSetId'],
+  other_name: [],
+};
+
+const isBaseDigest = (v: unknown) => v === null || isStr(v);
+
+function nameOk(n: unknown): boolean {
+  if (!isObj(n) || !isId(n.id) || !isStr(n.type) || !Object.prototype.hasOwnProperty.call(NAME_SHAPES, n.type)) return false;
+  const type = n.type as NameType;
+  if (n.op === 'edit') {
+    if (!isVersion(n.baseVersion) || !isBaseDigest(n.baseDigest)) return false;
+    if (isObj(n.after) && NAME_ADD_ONLY[type].some((k) => (n.after as Rec)[k] !== undefined)) return false;
+    if (n.fields !== undefined) {
+      const cols = NAME_COLUMNS[type].cols;
+      if (!Array.isArray(n.fields) || !n.fields.every((k) => isStr(k) && Object.prototype.hasOwnProperty.call(cols, k))) return false;
+    }
+  } else if (n.op !== 'add') return false;
+  return matchesShape(n.after, NAME_SHAPES[type]);
+}
+
+function docOk(d: unknown): boolean {
+  if (!isObj(d) || !isId(d.id) || !isStr(d.type) || !Object.prototype.hasOwnProperty.call(DOC_SHAPES, d.type)) return false;
+  if (d.op === 'void') return isVersion(d.baseVersion) && isBaseDigest(d.baseDigest) && d.after === undefined;
+  if (d.op === 'edit') {
+    if (!isVersion(d.baseVersion) || !isBaseDigest(d.baseDigest)) return false;
+  } else if (d.op !== 'add') return false;
+  return matchesShape(d.after, DOC_SHAPES[d.type as DocType]);
+}
+
+const APPLICATION_SHAPES: Record<string, Shape> = {
+  credit_memo: { op: 'str', kind: 'str', id: 'id', creditMemoId: 'id', invoiceId: 'id', amount: 'dec', date: 'date' },
+  vendor_credit: { op: 'str', kind: 'str', id: 'id', vendorCreditId: 'id', billId: 'id', amount: 'dec', date: 'date' },
+  journal_apply: {
+    op: 'str', kind: 'str', id: 'id', line: 'lineRef', invoiceId: 'id?', billId: 'id?', chargeLine: 'lineRef?', amount: 'dec', date: 'date',
+  },
+  journal_unapply: { op: 'str', kind: 'str', id: 'id', amount: 'dec', date: 'date' },
+};
+
+function applicationOk(a: unknown): boolean {
+  if (!isObj(a) || (a.op !== 'apply' && a.op !== 'unapply')) return false;
+  if (a.kind === 'credit_memo' || a.kind === 'vendor_credit') return matchesShape(a, APPLICATION_SHAPES[a.kind]);
+  if (a.kind !== 'journal') return false;
+  if (a.op === 'unapply') return matchesShape(a, APPLICATION_SHAPES.journal_unapply);
+  if (!matchesShape(a, APPLICATION_SHAPES.journal_apply)) return false;
+  // Exactly one target: an invoice, a bill or a General Journal charge.
+  return [a.invoiceId, a.billId, a.chargeLine].filter((x) => x !== null && x !== undefined).length === 1;
+}
+
+const ADJUSTMENT: FieldSpec = { obj: { amount: 'dec', accountId: 'id' }, opt: true };
+const RECONCILE_SHAPE: Shape = {
+  op: 'str', id: 'id', accountId: 'id', statementDate: 'date', statementBalance: 'dec',
+  cleared: { arr: LINE_REF_SHAPE }, serviceCharge: ADJUSTMENT, interestEarned: ADJUSTMENT,
+};
+const UNDO_SHAPE: Shape = { op: 'str', id: 'id', accountId: 'id', statementDate: 'date', statementBalance: 'dec' };
+
+function reconciliationOk(r: unknown): boolean {
+  if (!isObj(r)) return false;
+  if (r.op === 'reconcile') return matchesShape(r, RECONCILE_SHAPE);
+  if (r.op === 'undo') return matchesShape(r, UNDO_SHAPE);
+  return false;
+}
+
 function wellFormed(f: ChangesFile): boolean {
   if (!isId(f.copyId) || !isId(f.companyId) || !isStr(f.fileToken) || !optStr(f.note) || !optStr(f.preparedBy)) return false;
   return (
     f.transactions.every(txnOk) &&
     f.accounts.every(accountOk) &&
     f.classes.every(classOk) &&
+    f.names.every(nameOk) &&
+    f.documents.every(docOk) &&
+    f.applications.every(applicationOk) &&
+    f.reconciliations.every(reconciliationOk) &&
     f.warnings.every(isStr)
   );
 }

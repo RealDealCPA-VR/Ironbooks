@@ -18,7 +18,7 @@ import { assertItemTypeAllowed } from '@/lib/featureGate';
 import { assertNotControlLineAccount } from './posting';
 import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
 import { assertUomSet, assertVendor, resolveSalesTaxCode } from './lists/fields';
-import { assertListDeleteAllowed } from './accountantCopy/guard';
+import { assertAccountantListEdit, assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -326,6 +326,7 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
  */
 export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateItemInput) {
   const before = await getItem(ctx, id);
+  await assertAccountantListEdit(ctx, 'item', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
   if (patch.type !== undefined && patch.type !== before.type) await assertItemTypeAllowed(ctx, patch.type);
 
   // ── Name validation ──────────────────────────────────────────────────────

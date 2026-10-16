@@ -3,6 +3,8 @@
  * Applies every change through the normal services in one transaction, then removes the
  * Accountant's Copy restriction. Changes dated on or before the closing date need the
  * closing-date password (x-closing-password), like any other edit of a closed period.
+ * ?keep=<review key>,<review key>: names / items both sides changed where the client keeps their
+ * version (of the fields both changed) — see ImportOptions.keepMine.
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -16,7 +18,12 @@ export async function POST(req: NextRequest) {
     if (!buffer.byteLength) {
       return NextResponse.json({ error: 'Choose the changes file first.', code: 'VALIDATION' }, { status: 400 });
     }
-    return NextResponse.json(await importChangesFile(ctx, buffer));
+    const keep = (req.nextUrl.searchParams.get('keep') ?? '')
+      .split(',')
+      .map((k) => k.trim())
+      .filter(Boolean)
+      .slice(0, 5000);
+    return NextResponse.json(await importChangesFile(ctx, buffer, { keepMine: keep }));
   } catch (err) {
     return routeError(err, '/api/accountant-copy/changes/import');
   }

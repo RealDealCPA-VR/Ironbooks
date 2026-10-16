@@ -64,6 +64,7 @@ export async function assertNotFifoTracked(ctx: ServiceContext, itemId: string):
   }
 }
 import { assertNotControlLineAccount, postJournalEntry } from './posting';
+import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost';
 
 // ---------------------------------------------------------------------------
 // Adjustment Account / Class / Customer:Job (QB Adjust Quantity/Value on Hand) — p1 purchases
@@ -318,11 +319,16 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
       : oldValue.plus(newValue).dividedBy(newQty);
     glAmount = Money.round2(qtyChange.times(unitCost));
   } else {
-    // Removing stock — value at current average cost
+    // Removing stock — value at current average cost (or, in an Accountant's Copy import, at the
+    // cost the accountant's file used; the average is then re-derived from what is left).
     const absQty = qtyChange.abs();
-    glAmount = Money.round2(absQty.times(currentAvgCost));
+    const atAverage = Money.round2(absQty.times(currentAvgCost));
+    const accountantCost = takeAccountantCost(input.itemId);
+    glAmount = accountantCost ? Money.round2(accountantCost) : atAverage;
     newQty = currentQty.plus(qtyChange); // qtyChange is negative
-    newAvgCost = currentAvgCost; // average cost unchanged on removals
+    newAvgCost = glAmount.equals(atAverage)
+      ? currentAvgCost // average cost unchanged on removals
+      : averageAfter(currentQty, currentAvgCost, newQty, glAmount.negated());
   }
 
   return inTransaction(ctx, async (tx) => {
@@ -443,8 +449,15 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
     );
   }
 
-  const cogsAmount = Money.round2(qty.times(avgCost));
   const newQty = currentQty.minus(qty);
+  // Accountant's Copy import: the cost the accountant's file used (null otherwise). The average is
+  // re-derived from what is left so the item's value stays equal to the ledger.
+  const accountantCost = takeAccountantCost(input.itemId);
+  const cogsAmount = accountantCost ? Money.round2(accountantCost) : Money.round2(qty.times(avgCost));
+  const newAvgCost =
+    accountantCost && !cogsAmount.equals(Money.round2(qty.times(avgCost)))
+      ? averageAfter(currentQty, avgCost, newQty, cogsAmount.negated())
+      : avgCost;
 
   return inTransaction(ctx, async (tx) => {
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
@@ -473,6 +486,7 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
       .update(items)
       .set({
         quantityOnHand: newQty.toFixed(4),
+        ...(newAvgCost.equals(avgCost) ? {} : { averageCost: newAvgCost.toFixed(4) }),
         updatedAt: new Date(),
       })
       .where(eq(items.id, input.itemId));
@@ -481,12 +495,16 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
       action: 'update',
       entityType: 'item',
       entityId: input.itemId,
-      oldValues: { quantityOnHand: item.quantityOnHand },
-      newValues: { quantityOnHand: newQty.toFixed(4), postedEntryId: entry.id },
+      oldValues: { quantityOnHand: item.quantityOnHand, ...(newAvgCost.equals(avgCost) ? {} : { averageCost: item.averageCost }) },
+      newValues: {
+        quantityOnHand: newQty.toFixed(4),
+        ...(newAvgCost.equals(avgCost) ? {} : { averageCost: newAvgCost.toFixed(4) }),
+        postedEntryId: entry.id,
+      },
     });
 
     return {
-      item: { id: input.itemId, quantityOnHand: newQty.toFixed(4), averageCost: avgCost.toFixed(4) },
+      item: { id: input.itemId, quantityOnHand: newQty.toFixed(4), averageCost: newAvgCost.toFixed(4) },
       entry,
       cogsAmount: toAmountString(cogsAmount),
     };

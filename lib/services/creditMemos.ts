@@ -43,6 +43,8 @@
  * reverses the main GL entry AND every restock entry, removing the restocked
  * quantity from stock again.
  */
+import { assertAccountantDatesOpen } from './accountantCopy/guard';
+import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
@@ -495,8 +497,24 @@ async function postCreditMemoDocument(
 
     const qty = Money.of(line.quantity);
     const fifoTracked = await isFifoTracked(tx, line.itemId);
-    const unitCost = await restockUnitCost(tx, meta, fifoTracked);
-    const cost = Money.round2(qty.times(unitCost));
+    // Accountant's Copy import: restock at the cost the accountant's file used (null otherwise).
+    const accountantCost = takeAccountantCost(line.itemId);
+    const currentUnitCost = await restockUnitCost(tx, meta, fifoTracked);
+    const cost = accountantCost ? Money.round2(accountantCost) : Money.round2(qty.times(currentUnitCost));
+    const unitCost = accountantCost && qty.greaterThan(0) ? cost.dividedBy(qty) : currentUnitCost;
+    if (accountantCost && !fifoTracked && !cost.equals(Money.round2(qty.times(currentUnitCost)))) {
+      // Average-cost item restocked at a different cost: re-derive its average from the new value.
+      const [cur] = await tx.db
+        .select({ qty: items.quantityOnHand, avg: items.averageCost })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+      const curQty = Money.of(cur?.qty ?? '0');
+      const avg = averageAfter(curQty, Money.of(cur?.avg ?? '0'), curQty.plus(qty), cost);
+      await tx.db
+        .update(items)
+        .set({ averageCost: avg.toFixed(4), updatedAt: new Date() })
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+    }
 
     // Reverse COGS only when there is a real cost (postJournalEntry rejects $0 entries).
     if (cost.greaterThan(0)) {
@@ -702,6 +720,8 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
   if (memo.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot apply a voided credit memo.');
   }
+  // Accountant's Copy (I1): a credit memo dated after the dividing date belongs to the client.
+  await assertAccountantDatesOpen(ctx, [memo.date], 'The credit memo');
 
   const unapplied = Money.of(memo.unapplied);
   if (amount.greaterThan(unapplied)) {
@@ -852,6 +872,7 @@ export async function unapplyCreditApplication(ctx: ServiceContext, applicationI
       .from(creditMemos)
       .where(and(eq(creditMemos.companyId, tx.companyId), eq(creditMemos.id, app.creditMemoId)));
     if (!memo) throw notFound('Credit memo');
+    await assertAccountantDatesOpen(tx, [memo.date], 'The credit memo');
     const amount = Money.of(app.amount);
 
     await markPaidAmount(tx, app.invoiceId, toAmountString(amount.negated()));

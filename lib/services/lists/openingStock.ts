@@ -24,6 +24,7 @@ import { type ServiceContext, inTransaction, notFound, validation, writeAudit } 
 import { findOrCreateOpeningBalanceEquity } from '../accounts';
 import { type CreateItemInput, createItem } from '../items';
 import { postJournalEntry } from '../posting';
+import { assertAccountantMayEnterOpeningStock } from '../accountantCopy/guard';
 
 export interface OpeningStockInput {
   openingQuantity?: string | number | null;
@@ -114,6 +115,8 @@ export async function createItemWithOpeningStock(
     itemInput.trackingMode,
   );
   if (!plan) return { item: await createItem(ctx, itemInput), opening: null };
+  // Accountant's Copy: the opening entry and layer can't travel back to the client (PARITY I1).
+  await assertAccountantMayEnterOpeningStock(ctx);
 
   return inTransaction(ctx, async (tx) => {
     const item = await createItem(tx, itemInput);

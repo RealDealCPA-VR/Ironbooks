@@ -12,6 +12,7 @@
  * matching / confirmation step.  The GL lines being reconciled were already
  * posted by other services (invoices, expenses, transfers, etc.).
  */
+import { assertReconciliationDateOpen } from './accountantCopy/guard';
 import { and, desc, eq, inArray, isNull, lt, lte, ne, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -223,6 +224,7 @@ export async function startReconciliation(
       ),
     );
   if (!bankAcct) throw notFound('Bank account');
+  await assertReconciliationDateOpen(ctx, input.statementDate); // Accountant's Copy (I1)
 
   // Guard: only one in_progress reconciliation per bank account at a time.
   const [existing] = await ctx.db
@@ -531,6 +533,7 @@ export async function updateStatement(
   if (input.statementBalance == null && !input.statementDate) {
     throw validation('Provide statementBalance and/or statementDate to update.');
   }
+  await assertReconciliationDateOpen(ctx, input.statementDate ?? recon.statementDate); // Accountant's Copy (I1)
 
   return inTransaction(ctx, async (tx) => {
     const [updated] = await tx.db
@@ -582,6 +585,7 @@ export async function completeReconciliation(
   if (recon.status !== 'in_progress') {
     throw validation(`Reconciliation is already ${recon.status}.`);
   }
+  await assertReconciliationDateOpen(ctx, recon.statementDate); // Accountant's Copy (I1)
 
   const clearedBalance = await computeClearedBalance(ctx, reconciliationId);
   const statementBalance = Money.of(recon.statementBalance);
@@ -928,6 +932,7 @@ export async function undoLastReconciliation(
     throw notFound('Completed reconciliation');
   }
   const [latest, previous] = completed;
+  await assertReconciliationDateOpen(ctx, latest.statementDate); // Accountant's Copy (I1)
 
   return inTransaction(ctx, async (tx) => {
     const now = new Date();
