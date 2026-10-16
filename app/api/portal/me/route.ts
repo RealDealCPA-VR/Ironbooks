@@ -10,7 +10,7 @@ export async function GET() {
   if (!employeeId) return NextResponse.json({ error: 'Not authenticated', code: 'FORBIDDEN' }, { status: 401 });
   const db = await getDb();
   const [emp] = await db.select().from(employees).where(eq(employees.id, employeeId));
-  // getPortalEmployeeId already requires an active employee with a current portal password;
+  // getPortalEmployeeId already requires an active employee (of a non-archived company) with a current portal password;
   // re-check here so this route never serves a deactivated employee's data.
   if (!emp || !emp.isActive || !emp.portalPasswordHash) {
     return NextResponse.json({ error: 'Not authenticated', code: 'FORBIDDEN' }, { status: 401 });

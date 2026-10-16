@@ -275,9 +275,23 @@ export async function mergeClasses(ctx: ServiceContext, { fromId, toId }: { from
   const from = await load(fromId);
   const to = await load(toId);
   return inTransaction(ctx, async (tx) => {
-    // If the survivor sat under the duplicate, lift it to the duplicate's parent first.
-    if (to.parentId === fromId) {
-      await tx.db.update(classes).set({ parentId: from.parentId ?? null }).where(eq(classes.id, toId));
+    // If the survivor sits anywhere under the duplicate (child, grandchild, ...), lift it to the
+    // duplicate's parent first; otherwise re-pointing the duplicate's children onto it would
+    // close a loop (B under C under B).
+    const tree = await tx.db
+      .select({ id: classes.id, parentId: classes.parentId })
+      .from(classes)
+      .where(eq(classes.companyId, tx.companyId));
+    const parentOf = new Map(tree.map((r) => [r.id, r.parentId]));
+    const seen = new Set<string>();
+    let cur: string | null | undefined = to.parentId;
+    while (cur && !seen.has(cur)) {
+      if (cur === fromId) {
+        await tx.db.update(classes).set({ parentId: from.parentId ?? null }).where(eq(classes.id, toId));
+        break;
+      }
+      seen.add(cur);
+      cur = parentOf.get(cur);
     }
     const reassigned = await repointForeignKeys(tx, 'classes', fromId, toId);
     reassigned.recurringTemplates = await rewriteTemplates(tx, fromId, toId);

@@ -301,6 +301,20 @@ export async function updateCustomer(
         ),
       );
     if (!parent) throw notFound('Parent customer');
+    // Walk up from the new parent: reaching this customer means it would sit under one of its
+    // own sub-customers (a loop with no top-level customer).
+    const all = await ctx.db
+      .select({ id: customers.id, parentId: customers.parentId })
+      .from(customers)
+      .where(eq(customers.companyId, ctx.companyId));
+    const parentOf = new Map(all.map((r) => [r.id, r.parentId]));
+    const seen = new Set<string>();
+    let cur: string | null | undefined = patch.parentId;
+    while (cur && !seen.has(cur)) {
+      if (cur === id) throw validation('A customer cannot be placed under one of its own sub-customers or jobs.');
+      seen.add(cur);
+      cur = parentOf.get(cur);
+    }
   }
 
   if (patch.taxRateId) await assertRefInCompany(ctx, taxRates, patch.taxRateId, 'Sales tax rate');

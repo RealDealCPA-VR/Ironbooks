@@ -1210,6 +1210,11 @@ export async function voidBill(ctx: ServiceContext, id: string) {
     // and unwind any inventory cost adjustments made by price variances (GL reversed above).
     await releaseReceiptBilling(tx, id);
 
+    // Bills converted from a purchase order: the PO gets the quantities back (it reopens).
+    // Imported lazily: purchaseOrders.ts imports this module (createBill).
+    const { releasePoBillingForBill } = await import('./purchaseOrders');
+    await releasePoBillingForBill(tx, id);
+
     // Flip bill status to void and zero balanceDue.
     const [updated] = await tx.db
       .update(bills)

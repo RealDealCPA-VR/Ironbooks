@@ -17,6 +17,7 @@
  * CSV / Excel. (The IIF export writes them only for users allowed to see them in full.)
  */
 import { asc, eq } from 'drizzle-orm';
+import { csvMinimal } from '@/lib/csv';
 import {
   accounts,
   classes,
@@ -107,14 +108,13 @@ const IIF_SECTION: Partial<Record<ExportableList, IifListName>> = {
 
 export type ExportFormat = 'csv' | 'xlsx' | 'iif';
 
-/** Escape a single CSV cell per RFC 4180 (quote when it contains , " or newlines). */
+/**
+ * Escape a single CSV cell per RFC 4180 (quote when it contains , " or newlines), with
+ * spreadsheet formula-injection protection (lib/csv.ts).
+ */
 export function csvEscape(value: unknown): string {
   if (value === null || value === undefined) return '';
-  const s = String(value);
-  if (/[",\r\n]/.test(s)) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
+  return csvMinimal(typeof value === 'number' || typeof value === 'boolean' ? value : String(value));
 }
 
 /** Build a CSV document from a header row + data rows (CRLF lines, UTF-8 BOM). */

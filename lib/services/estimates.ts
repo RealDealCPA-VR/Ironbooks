@@ -566,10 +566,15 @@ export async function createProgressInvoice(
       for (const r of rows) itemTypes.set(r.id, r.type);
     }
     // Discount lines are stored negative; bill them by magnitude, like the invoice line amounts
-    // invoiced-to-date is measured in (the invoice makes them negative again).
+    // invoiced-to-date is measured in (the invoice makes them negative again). The rate may have
+    // been entered negative; use its magnitude too, so the pro-rated amount matches qty x rate.
     const estLines = estimate.lines.map((l) =>
       l.itemId && itemTypes.get(l.itemId) === 'discount'
-        ? { ...l, amount: toAmountString(Money.abs(Money.of(l.amount))) }
+        ? {
+            ...l,
+            amount: toAmountString(Money.abs(Money.of(l.amount))),
+            rate: Money.abs(Money.of(l.rate)).toFixed(4),
+          }
         : l,
     );
     const billable = estLines.filter((l) => !(l.itemId && itemTypes.get(l.itemId) === 'subtotal'));

@@ -276,7 +276,8 @@ async function loadDoc(ctx: ServiceContext, kind: DocKind, id: string): Promise<
   const lines: DocLine[] = [];
   for (const r of rows) {
     const desc = r.description ?? '';
-    if (r.paymentId || desc.startsWith('salesReceipt:')) continue; // Undeposited Funds (control)
+    // Undeposited Funds (control): payments, sales receipts and invoice payment-item lines.
+    if (r.paymentId || desc.startsWith('salesReceipt:') || desc.startsWith('invoicePayment:')) continue;
     if (desc.startsWith('cashback:')) {
       lines.push({
         table: kind,

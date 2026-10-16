@@ -536,18 +536,23 @@ async function postCreditMemoDocument(
     const currentUnitCost = await restockUnitCost(tx, meta, fifoTracked);
     const cost = accountantCost ? Money.round2(accountantCost) : Money.round2(qty.times(currentUnitCost));
     const unitCost = accountantCost && qty.greaterThan(0) ? cost.dividedBy(qty) : currentUnitCost;
-    if (accountantCost && !fifoTracked && !cost.equals(Money.round2(qty.times(currentUnitCost)))) {
-      // Average-cost item restocked at a different cost: re-derive its average from the new value.
+    if (!fifoTracked) {
+      // Average-cost item restocked at a cost other than qty x its stored average (an Accountant's
+      // Copy cost, or the purchaseCost fallback when no average exists yet): re-derive its average
+      // from the new value so the item stays tied to the GL.
       const [cur] = await tx.db
         .select({ qty: items.quantityOnHand, avg: items.averageCost })
         .from(items)
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
       const curQty = Money.of(cur?.qty ?? '0');
-      const avg = averageAfter(curQty, Money.of(cur?.avg ?? '0'), curQty.plus(qty), cost);
-      await tx.db
-        .update(items)
-        .set({ averageCost: avg.toFixed(4), updatedAt: new Date() })
-        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+      const curAvg = Money.of(cur?.avg ?? '0');
+      if (!cost.equals(Money.round2(qty.times(curAvg)))) {
+        const avg = averageAfter(curQty, curAvg, curQty.plus(qty), cost);
+        await tx.db
+          .update(items)
+          .set({ averageCost: avg.toFixed(4), updatedAt: new Date() })
+          .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+      }
     }
 
     // Reverse COGS only when there is a real cost (postJournalEntry rejects $0 entries).
@@ -1180,11 +1185,29 @@ async function reverseCreditMemoPostings(
       }
     }
 
+    // Average cost: the GL loses exactly the restock cost, which differs from qty x today's
+    // average once the average has moved — back that cost out of the average.
+    let newAvgCost: string | undefined;
+    if (!(await isFifoTracked(tx, line.itemId))) {
+      const [cur] = await tx.db
+        .select({ qty: items.quantityOnHand, avg: items.averageCost })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+      const curQty = Money.of(cur?.qty ?? '0');
+      const curAvg = Money.of(cur?.avg ?? '0');
+      const newQty = curQty.minus(qty);
+      const remainingValue = curQty.times(curAvg).minus(cost);
+      if (newQty.greaterThan(0)) {
+        newAvgCost = (remainingValue.isNegative() ? Money.zero() : remainingValue.dividedBy(newQty)).toFixed(4);
+      }
+    }
+
     // Both costing methods: take the quantity back off hand.
     await tx.db
       .update(items)
       .set({
         quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) - ${qty.toFixed(4)}`,
+        ...(newAvgCost !== undefined ? { averageCost: newAvgCost } : {}),
         updatedAt: new Date(),
       })
       .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
@@ -1263,6 +1286,29 @@ export async function voidCreditMemo(ctx: ServiceContext, id: string) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Earliest day (YYYY-MM-DD) the memo's credit was used: a posted refund or a recorded
+ * application. Computed as a day string in SQL so no driver time-zone parsing is involved.
+ */
+async function firstCreditUseDay(ctx: ServiceContext, memoId: string): Promise<string | null> {
+  const [refund] = await ctx.db
+    .select({ d: sql<string | null>`to_char(MIN(${journalEntries.date}), 'YYYY-MM-DD')` })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.sourceRef, `refund:${memoId}`),
+        eq(journalEntries.status, 'posted'),
+      ),
+    );
+  const [app] = await ctx.db
+    .select({ d: sql<string | null>`to_char(MIN(${creditApplications.date}), 'YYYY-MM-DD')` })
+    .from(creditApplications)
+    .where(and(eq(creditApplications.companyId, ctx.companyId), eq(creditApplications.creditMemoId, memoId)));
+  const days = [refund?.d, app?.d].filter((v): v is string => !!v).sort();
+  return days[0] ?? null;
+}
+
+/**
  * Edit a saved credit memo in place (QB "edit any saved transaction").
  *
  * Sanctioned void/repost pattern, all inside ONE transaction: reverse every posting of the
@@ -1271,7 +1317,8 @@ export async function voidCreditMemo(ctx: ServiceContext, id: string) {
  * and audit old + new values. memoNumber and createdAt are preserved.
  *
  * Credit already used (applied to invoices or refunded) stays used, so the edit must keep it
- * valid: same customer, and the new total cannot drop below what has been used.
+ * valid: same customer, the new total cannot drop below what has been used, and the memo cannot be
+ * dated after the first refund / application of it.
  */
 export async function updateCreditMemo(
   ctx: ServiceContext,
@@ -1309,6 +1356,16 @@ export async function updateCreditMemo(
         throw new ServiceError(
           'CONFLICT',
           `${toAmountString(used)} of this credit has already been applied or refunded, so the new total (${toAmountString(prep.total)}) cannot be less than that. Unapply some of the credit first.`,
+        );
+      }
+      // The credit must exist on the day it was first used (same rule as refundCreditMemo):
+      // re-dating the memo after a refund / application would leave A/R debited on days when the
+      // customer held no credit.
+      const firstUse = await firstCreditUseDay(tx, id);
+      const newDay = new Date(input.date).toISOString().slice(0, 10);
+      if (firstUse && newDay > firstUse) {
+        throw validation(
+          `This credit was already used on ${firstUse}, so the credit memo cannot be dated after that (${newDay}). Date it on or before ${firstUse}, or unapply the credit first.`,
         );
       }
     }

@@ -254,18 +254,26 @@ export async function mergeCustomers(
     // Wave-2 lists: sweep every remaining foreign key to the customer (sales receipts, tables
     // added by other modules, ...) and carry dated notes / to-dos over. The sub-customer
     // hierarchy is handled explicitly so the survivor can never become its own parent.
-    const [toCust] = await tx.db
-      .select({ parentId: customers.parentId })
+    // The survivor may sit anywhere below the duplicate (child, grandchild, ...): re-pointing the
+    // duplicate's children onto it would then close a loop (B under C under B). Lift the
+    // survivor to the duplicate's own parent first.
+    const tree = await tx.db
+      .select({ id: customers.id, parentId: customers.parentId })
       .from(customers)
-      .where(eq(customers.id, toId));
-    if (toCust?.parentId === fromId) {
-      const [fromCust] = await tx.db
-        .select({ parentId: customers.parentId })
-        .from(customers)
-        .where(eq(customers.id, fromId));
+      .where(eq(customers.companyId, tx.companyId));
+    const parentOf = new Map(tree.map((r) => [r.id, r.parentId]));
+    const seen = new Set<string>();
+    let cur: string | null | undefined = parentOf.get(toId);
+    let survivorBelowDuplicate = false;
+    while (cur && !seen.has(cur)) {
+      if (cur === fromId) { survivorBelowDuplicate = true; break; }
+      seen.add(cur);
+      cur = parentOf.get(cur);
+    }
+    if (survivorBelowDuplicate) {
       await tx.db
         .update(customers)
-        .set({ parentId: fromCust?.parentId ?? null, updatedAt: new Date() })
+        .set({ parentId: parentOf.get(fromId) ?? null, updatedAt: new Date() })
         .where(eq(customers.id, toId));
     }
     const sweptCustomer = await repointForeignKeys(tx, 'customers', fromId, toId);

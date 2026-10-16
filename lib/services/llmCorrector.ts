@@ -17,7 +17,7 @@
  *     posting.ts (closing date + password, ledger guards, audit), links the posted entry to
  *     the correction and resolves the detection — all in one transaction.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import {
   errorCorrections,
@@ -33,6 +33,7 @@ import type { JournalEntityType, PostingLine } from './posting';
 import { Money, toAmountString } from '@/lib/money';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { AiError } from '@/lib/ai/types';
+import { liveDuplicateSiblings } from './errorDetection';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -127,7 +128,17 @@ export async function analyzeError(
         .from(journalEntryLines)
         .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
         .where(eq(journalEntryLines.journalEntryId, entry.id));
-      if (detection.errorType === 'duplicate') reversal = await reversalProposal(ctx, entry.id);
+      if (detection.errorType === 'duplicate') {
+        reversal = await reversalProposal(ctx, entry.id);
+        // A duplicate whose twin was voided or already reversed is no longer a duplicate:
+        // proposing its reversal would wipe out the real transaction. (Only checked for this
+        // company's own posted entry; anything else gets no reversal and is refused on apply.)
+        if (reversal && (await liveDuplicateSiblings(ctx, entry.id)).length === 0) {
+          throw validation(
+            'This entry is no longer a duplicate: its matching entry was already corrected or voided. Nothing needs to be reversed.',
+          );
+        }
+      }
 
       entryContext = `
 Journal Entry #${entry.entryNumber}:
@@ -255,6 +266,7 @@ export async function applyCorrection(
     };
     const entry = opts.entry ?? data.entry ?? null;
     let posted: { id: string; entryNumber: number } | null = null;
+    let duplicateSiblings: string[] = [];
     if (entry) {
       if (opts.approved !== true) {
         throw validation('Review the correcting journal entry and approve it to post it.');
@@ -277,6 +289,16 @@ export async function applyCorrection(
           throw validation(
             'The entry this correction was made for has been voided or changed since. Ask for a new suggestion instead.',
           );
+        }
+        // Both copies of a duplicate pair are flagged. Once one copy has been reversed (or the
+        // twin voided), reversing this one too would erase the real transaction.
+        if (row.detection.errorType === 'duplicate') {
+          duplicateSiblings = await liveDuplicateSiblings(tx, row.detection.journalEntryId);
+          if (duplicateSiblings.length === 0) {
+            throw validation(
+              'This entry is no longer a duplicate: its matching entry was already corrected or voided. Nothing needs to be reversed.',
+            );
+          }
         }
       }
       const date = new Date(`${entry.date}T12:00:00Z`);
@@ -326,6 +348,25 @@ export async function applyCorrection(
       .update(errorDetections)
       .set({ resolvedAt: now })
       .where(eq(errorDetections.id, row.correction.errorDetectionId));
+
+    // A twin that is no longer a duplicate of anything (this copy is now reversed) has its open
+    // 'duplicate' detection resolved too, so nobody follows it and reverses the real entry.
+    if (posted) {
+      for (const sibling of duplicateSiblings) {
+        if ((await liveDuplicateSiblings(tx, sibling)).length > 0) continue;
+        await tx.db
+          .update(errorDetections)
+          .set({ resolvedAt: now })
+          .where(
+            and(
+              eq(errorDetections.companyId, tx.companyId),
+              eq(errorDetections.journalEntryId, sibling),
+              eq(errorDetections.errorType, 'duplicate'),
+              isNull(errorDetections.resolvedAt),
+            ),
+          );
+      }
+    }
 
     // Audit trail (the posted entry has its own audit rows from the posting engine).
     await writeAudit(tx, {

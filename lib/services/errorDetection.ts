@@ -11,8 +11,9 @@
  *
  * Multi-tenant: every query is scoped by ctx.companyId.
  */
-import { and, eq, isNull, isNotNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, isNotNull, sql } from 'drizzle-orm';
 import {
+  errorCorrections,
   errorDetections,
   journalEntries,
   journalEntryLines,
@@ -156,10 +157,15 @@ async function detectDuplicates(
     )
     .groupBy(journalEntries.id, journalEntries.date, journalEntries.description);
 
+  // A copy whose duplicate fix (a posted reversing entry) is in place no longer counts: it must
+  // not be flagged again, and its twin is no longer a duplicate of anything.
+  const corrected = await correctedDuplicateEntryIds(ctx);
+
   // Group in-memory to find duplicates (avoids a complex SQL self-join in PGlite).
   const groups = new Map<string, typeof entryTotals>();
   for (const row of entryTotals) {
-    const key = `${row.date?.toISOString?.() ?? row.date}|${row.description}|${toAmountString(row.totalDebit)}`;
+    if (corrected.has(row.entryId)) continue;
+    const key = duplicateKey(row);
     const group = groups.get(key) ?? [];
     group.push(row);
     groups.set(key, group);
@@ -358,6 +364,87 @@ async function alreadyDetected(
     )
     .limit(1);
   return existing.length > 0;
+}
+
+/** The duplicate-group key: same date + description + total debit. */
+function duplicateKey(row: { date: Date | null; description: string | null; totalDebit: string }): string {
+  return `${row.date?.toISOString?.() ?? row.date}|${row.description}|${toAmountString(row.totalDebit)}`;
+}
+
+/**
+ * Entries already fixed as duplicates: an APPLIED correction of a 'duplicate' detection on the
+ * entry whose correcting (reversing) entry is still posted. If that reversal was voided since,
+ * the copy is live again and counts as a duplicate once more.
+ */
+export async function correctedDuplicateEntryIds(ctx: ServiceContext): Promise<Set<string>> {
+  const rows = await ctx.db
+    .select({ entryId: errorDetections.journalEntryId, data: errorCorrections.correctionData })
+    .from(errorCorrections)
+    .innerJoin(errorDetections, eq(errorCorrections.errorDetectionId, errorDetections.id))
+    .where(
+      and(
+        eq(errorDetections.companyId, ctx.companyId),
+        eq(errorDetections.errorType, 'duplicate'),
+        eq(errorCorrections.status, 'applied'),
+        isNotNull(errorDetections.journalEntryId),
+      ),
+    );
+  const postedBy = new Map<string, string>();
+  for (const r of rows) {
+    const posted = (r.data as { postedEntryId?: string } | null)?.postedEntryId;
+    if (r.entryId && posted) postedBy.set(posted, r.entryId);
+  }
+  const out = new Set<string>();
+  if (postedBy.size === 0) return out;
+  const live = await ctx.db
+    .select({ id: journalEntries.id })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        inArray(journalEntries.id, [...postedBy.keys()]),
+      ),
+    );
+  for (const l of live) out.add(postedBy.get(l.id)!);
+  return out;
+}
+
+/**
+ * The other live copies of a duplicate entry: posted entries with the same date, description
+ * and total debit that have not themselves been fixed as duplicates. Empty means the entry is
+ * no longer a duplicate (its twin was voided or already reversed) — reversing it now would
+ * wipe out the real transaction.
+ */
+export async function liveDuplicateSiblings(ctx: ServiceContext, journalEntryId: string): Promise<string[]> {
+  const totalsOf = (cond: ReturnType<typeof and>) =>
+    ctx.db
+      .select({
+        entryId: journalEntries.id,
+        date: journalEntries.date,
+        description: journalEntries.description,
+        totalDebit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}::numeric), 0)`,
+      })
+      .from(journalEntries)
+      .innerJoin(journalEntryLines, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .where(cond)
+      .groupBy(journalEntries.id, journalEntries.date, journalEntries.description);
+  const [self] = await totalsOf(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.id, journalEntryId)));
+  if (!self) return [];
+  const candidates = await totalsOf(
+    and(
+      eq(journalEntries.companyId, ctx.companyId),
+      eq(journalEntries.status, 'posted'),
+      eq(journalEntries.date, self.date),
+      eq(journalEntries.description, self.description),
+    ),
+  );
+  const corrected = await correctedDuplicateEntryIds(ctx);
+  if (corrected.has(journalEntryId)) return []; // this copy was already reversed
+  const key = duplicateKey(self);
+  return candidates
+    .filter((c) => c.entryId !== journalEntryId && !corrected.has(c.entryId) && duplicateKey(c) === key)
+    .map((c) => c.entryId);
 }
 
 function fmtDate(d: Date | null | undefined): string {

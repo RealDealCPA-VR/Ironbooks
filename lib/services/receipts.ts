@@ -979,6 +979,10 @@ async function findToken(db: DB, token: string): Promise<TokenRow | undefined> {
  */
 async function tokenContext(db: DB, row: TokenRow): Promise<ServiceContext> {
   if (!row.createdBy) throw new UploadTokenError('not_allowed');
+  // An archived (soft-deleted) company takes no more uploads (lib/context isArchivedCompany).
+  const [company] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, row.companyId));
+  const settings = company?.settings as { archived?: unknown } | null | undefined;
+  if (!company || settings?.archived === true) throw new UploadTokenError('not_allowed');
   const resolved = await resolveAccess(db, row.companyId, row.createdBy);
   if (!resolved.active || !can(resolved.access, 'lists', 'create')) throw new UploadTokenError('not_allowed');
   return { db, companyId: row.companyId, userId: row.createdBy, access: resolved.access, role: legacyRoleFor(resolved.access, resolved.isOwner) };

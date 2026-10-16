@@ -27,7 +27,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
-import { formatCurrency } from '@/lib/money';
+import { Money, formatCurrency } from '@/lib/money';
 import {
   ROUNDING_LABELS,
   ROUNDING_MODES,
@@ -616,7 +616,8 @@ function LevelModal({
     const next: Record<string, string> = {};
     for (const it of sellable) {
       if (it.salesPrice == null) continue;
-      next[it.id] = (Math.round(Number(it.salesPrice) * (100 + n)) / 100).toFixed(2);
+      // Decimal, half-up: the float version made $1.15 +10% = 1.26 (1.15 × 110 = 126.4999…).
+      next[it.id] = Money.round2(Money.div(Money.mul(it.salesPrice, 100 + n), 100)).toFixed(2);
     }
     setPrices(next);
   }

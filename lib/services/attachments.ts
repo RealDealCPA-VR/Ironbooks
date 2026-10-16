@@ -71,6 +71,51 @@ export function attachmentAbsolutePath(dataDir: string, storagePath: string): st
   return path.join(dataDir, ...normalizeStoragePath(storagePath).split('/'));
 }
 
+/**
+ * The absolute path of a stored attachment, or null when the stored path does not resolve to a
+ * file inside `<dataDir>/attachments` (e.g. "../../secret" from a crafted backup). Every read,
+ * delete and restore goes through this, so a row can never name a file outside the store.
+ */
+export function safeAttachmentPath(dataDir: string, storagePath: string): string | null {
+  if (typeof storagePath !== 'string' || !storagePath.trim()) return null;
+  const root = path.resolve(dataDir, 'attachments');
+  const abs = path.resolve(attachmentAbsolutePath(dataDir, storagePath));
+  const rel = path.relative(root, abs);
+  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+  return abs;
+}
+
+/**
+ * Per-company restore: give a restored attachment row its OWN copy of the file under a fresh
+ * disk name, so the restored company and the company it was backed up from (when both live in
+ * the same data directory) never share — and never delete — each other's files.
+ * Throws VALIDATION for a stored path outside `<dataDir>/attachments`. A file that is not on
+ * this disk keeps its (normalized) path; `createdPath` is the new file to remove if the restore
+ * is rolled back.
+ */
+export function cloneAttachmentFileForRestore(
+  dataDir: string,
+  storagePath: string,
+): { storagePath: string; createdPath: string | null } {
+  const abs = safeAttachmentPath(dataDir, storagePath);
+  if (!abs) {
+    throw validation('Backup contains an attachment stored outside the attachments folder and cannot be restored.');
+  }
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+    return { storagePath: normalizeStoragePath(storagePath), createdPath: null };
+  }
+  const original = path
+    .basename(abs)
+    .replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i, '')
+    .replace(/[^a-zA-Z0-9._-]/g, '_');
+  const diskName = `${randomUUID()}-${original || 'file'}`;
+  const dir = path.join(dataDir, 'attachments');
+  fs.mkdirSync(dir, { recursive: true });
+  const createdPath = path.join(dir, diskName);
+  fs.copyFileSync(abs, createdPath);
+  return { storagePath: `attachments/${diskName}`, createdPath };
+}
+
 /** Ensure the storage folder exists (idempotent). */
 function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
@@ -456,9 +501,9 @@ export async function getAttachmentFile(
   assertCanSee(ctx, row.entityType);
 
   const dataDir = resolveDataDir();
-  const absolutePath = attachmentAbsolutePath(dataDir, row.storagePath);
+  const absolutePath = safeAttachmentPath(dataDir, row.storagePath);
 
-  if (!fs.existsSync(absolutePath)) {
+  if (!absolutePath || !fs.existsSync(absolutePath)) {
     throw notFound('Attachment file on disk');
   }
 
@@ -497,11 +542,23 @@ export async function deleteAttachment(ctx: ServiceContext, id: string): Promise
     oldValues: { entityType: row.entityType, entityId: row.entityId, filename: row.filename },
   });
 
-  // Best-effort file removal.
+  // Best-effort file removal — only for a path inside the attachments store, and only when no
+  // other attachment row (any company in this data dir, e.g. one restored from a company backup
+  // by an older build) still names the same file.
   try {
     const dataDir = resolveDataDir();
-    const absolutePath = attachmentAbsolutePath(dataDir, row.storagePath);
-    if (fs.existsSync(absolutePath)) {
+    const absolutePath = safeAttachmentPath(dataDir, row.storagePath);
+    const normalized = normalizeStoragePath(row.storagePath);
+    const [shared] = absolutePath
+      ? await ctx.db
+          .select({ id: attachments.id })
+          .from(attachments)
+          .where(
+            sql`trim(both '/' from regexp_replace(${attachments.storagePath}, '[\\\\/]+', '/', 'g')) = ${normalized}`,
+          )
+          .limit(1)
+      : [];
+    if (absolutePath && !shared && fs.existsSync(absolutePath)) {
       fs.unlinkSync(absolutePath);
     }
   } catch {

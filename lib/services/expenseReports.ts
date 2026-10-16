@@ -17,6 +17,8 @@ import { Money, toAmountString } from '@/lib/money';
 import { accounts, employees, expenseReports, expenseReportLines } from '@/lib/db/schema';
 import {
   type ServiceContext,
+  ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
@@ -78,6 +80,8 @@ export async function createReport(ctx: ServiceContext, input: CreateReportInput
   let total = Money.zero();
   for (const [i, line] of input.lines.entries()) {
     if (!line.accountId) throw validation(`Line ${i + 1}: accountId is required.`);
+    // The account must belong to THIS company (never store another company's account id).
+    await assertRefInCompany(ctx, accounts, line.accountId, `Line ${i + 1}: Account`);
     const amt = Money.of(line.amount);
     if (amt.isNegative()) throw validation(`Line ${i + 1}: amount cannot be negative.`);
     if (amt.isZero()) throw validation(`Line ${i + 1}: amount must be greater than zero.`);
@@ -159,11 +163,15 @@ export async function submitReport(ctx: ServiceContext, id: string) {
     throw validation(`Cannot submit a report with status "${report.status}". Only draft reports can be submitted.`);
   }
 
+  // Conditional on the status so a concurrent submit/approve can't move the report twice.
   const [updated] = await ctx.db
     .update(expenseReports)
     .set({ status: 'submitted', submittedAt: new Date() })
-    .where(eq(expenseReports.id, id))
+    .where(and(eq(expenseReports.id, id), eq(expenseReports.companyId, ctx.companyId), eq(expenseReports.status, 'draft')))
     .returning();
+  if (!updated) {
+    throw new ServiceError('CONFLICT', 'This expense report was changed by another request. Reload and try again.');
+  }
 
   await writeAudit(ctx, {
     action: 'update',
@@ -214,6 +222,17 @@ export async function approveAndReimburse(ctx: ServiceContext, id: string) {
   const checkingId = await checkingAccountId(ctx);
 
   return inTransaction(ctx, async (tx) => {
+    // Claim the report first (conditional on 'submitted') so two concurrent approvals can never
+    // both post a reimbursement; the loser gets CONFLICT and its transaction rolls back.
+    const [claimed] = await tx.db
+      .update(expenseReports)
+      .set({ status: 'reimbursed' })
+      .where(and(eq(expenseReports.id, id), eq(expenseReports.companyId, tx.companyId), eq(expenseReports.status, 'submitted')))
+      .returning({ id: expenseReports.id });
+    if (!claimed) {
+      throw new ServiceError('CONFLICT', 'This expense report was already reimbursed or changed by another request.');
+    }
+
     // Build posting lines: one debit per expense line, one credit to Checking.
     const postingLines: Array<{
       accountId: string;

@@ -22,6 +22,8 @@ import {
   vendors,
   invoices,
   bills,
+  depreciationEntries,
+  fixedAssets,
 } from '@/lib/db/schema';
 import { REGISTER_SUBTYPES as REGISTER_SUBTYPE_LIST } from '@/lib/accountTypes';
 import { Money, toAmountString } from '@/lib/money';
@@ -433,10 +435,21 @@ export async function assertJournalNames(
 // ---------------------------------------------------------------------------
 
 /** List posted + voided journal entries for this company with optional date range paging. */
+/**
+ * Inclusive "to" date filter for ledger dates: the WHOLE UTC calendar day of `to`. Ledger dates are
+ * calendar days at UTC midnight, but some entries carry a time of day (the year-end closing entry
+ * at 23:59:59Z, opening balances dated "now"), and a date-only `to` ('2024-12-31' = midnight)
+ * would leave those out of their own day.
+ */
+function onOrBeforeDay(to: Date) {
+  const nextDay = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate() + 1));
+  return lt(journalEntries.date, nextDay);
+}
+
 export async function listEntries(ctx: ServiceContext, opts: ListEntriesOptions = {}) {
   const conds = [eq(journalEntries.companyId, ctx.companyId)];
   if (opts.from) conds.push(gte(journalEntries.date, opts.from));
-  if (opts.to) conds.push(lte(journalEntries.date, opts.to));
+  if (opts.to) conds.push(onOrBeforeDay(opts.to));
 
   const limit = opts.limit ?? 100;
   const offset = opts.offset ?? 0;
@@ -748,7 +761,46 @@ export async function voidEntry(ctx: ServiceContext, id: string) {
   assertJournalScreenEntry(entry.sourceRef, 'void'); // documents are voided through the document
   await assertNoJournalApplications(ctx, id, 'voided');
 
+  if (entry.sourceRef?.startsWith('fixed_asset:')) {
+    return inTransaction(ctx, async (tx) => {
+      const voided = await voidJournalEntry(tx, id);
+      await removeDepreciationForEntry(tx, id);
+      return voided;
+    });
+  }
   return voidJournalEntry(ctx, id);
+}
+
+/**
+ * A voided depreciation entry (sourceRef `fixed_asset:<assetId>`, fixedAssets.ts postDepreciation)
+ * takes its period off the asset: the depreciation_entries row is removed (so the period can be
+ * posted again) and the asset's accumulated depreciation drops by its amount, keeping the schedule,
+ * the asset and the Accumulated Depreciation account in agreement. Inside the void's transaction.
+ */
+async function removeDepreciationForEntry(tx: ServiceContext, entryId: string): Promise<void> {
+  const rows = await tx.db
+    .select({ id: depreciationEntries.id, assetId: depreciationEntries.fixedAssetId, amount: depreciationEntries.amount })
+    .from(depreciationEntries)
+    .where(and(eq(depreciationEntries.companyId, tx.companyId), eq(depreciationEntries.postedEntryId, entryId)));
+  for (const r of rows) {
+    const [asset] = await tx.db
+      .select({ accumulated: fixedAssets.accumulatedDepreciation })
+      .from(fixedAssets)
+      .where(and(eq(fixedAssets.id, r.assetId), eq(fixedAssets.companyId, tx.companyId)));
+    await tx.db.delete(depreciationEntries).where(eq(depreciationEntries.id, r.id));
+    if (!asset) continue;
+    const before = Money.of(asset.accumulated);
+    const after = Money.round2(before.minus(Money.of(r.amount)));
+    const next = toAmountString(after.isNegative() ? Money.zero() : after);
+    await tx.db.update(fixedAssets).set({ accumulatedDepreciation: next }).where(eq(fixedAssets.id, r.assetId));
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'fixed_asset',
+      entityId: r.assetId,
+      oldValues: { accumulatedDepreciation: toAmountString(before) },
+      newValues: { accumulatedDepreciation: next, depreciationVoided: r.id, journalEntryId: entryId },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +849,7 @@ export async function generalLedger(
     eq(journalEntries.status, 'posted'),
   ];
   if (opts.from) entryConds.push(gte(journalEntries.date, opts.from));
-  if (opts.to) entryConds.push(lte(journalEntries.date, opts.to));
+  if (opts.to) entryConds.push(onOrBeforeDay(opts.to));
 
   // Pull all relevant lines in one query, joining entry header for date/entryNumber/description.
   const accountIds = acctRows.map((a) => a.id);
@@ -1068,7 +1120,7 @@ export async function accountRegister(
     eq(journalEntries.status, 'posted'),
   ];
   if (opts.from) entryConds.push(gte(journalEntries.date, opts.from));
-  if (opts.to) entryConds.push(lte(journalEntries.date, opts.to));
+  if (opts.to) entryConds.push(onOrBeforeDay(opts.to));
 
   const lineRows = await ctx.db
     .select({
@@ -1168,7 +1220,7 @@ export async function getAdjustingEntries(
       : eq(journalEntries.status, 'posted'),
   );
   if (opts.from) conds.push(gte(journalEntries.date, opts.from));
-  if (opts.to) conds.push(lte(journalEntries.date, opts.to));
+  if (opts.to) conds.push(onOrBeforeDay(opts.to));
   const heads = await ctx.db
     .select({ id: journalEntries.id })
     .from(journalEntries)

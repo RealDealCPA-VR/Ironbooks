@@ -2,8 +2,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { eq } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
-import { employees } from '@/lib/db/schema';
-import { verifyPassword, createPortalToken, PORTAL_COOKIE } from '@/lib/auth';
+import { companies, employees } from '@/lib/db/schema';
+import { verifyPassword, createPortalToken, isArchivedSettings, PORTAL_COOKIE } from '@/lib/auth';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 
@@ -25,7 +25,13 @@ export async function POST(req: NextRequest) {
   }
   try {
     const db = await getDb();
-    const matches = await db.select().from(employees).where(eq(employees.email, email.trim().toLowerCase()));
+    const rows = await db
+      .select({ emp: employees, companySettings: companies.settings })
+      .from(employees)
+      .innerJoin(companies, eq(companies.id, employees.companyId))
+      .where(eq(employees.email, email.trim().toLowerCase()));
+    // Employees of an archived (soft-deleted) company can no longer sign in to the portal.
+    const matches = rows.filter((r) => !isArchivedSettings(r.companySettings)).map((r) => r.emp);
     for (const emp of matches) {
       if (emp.portalPasswordHash && emp.isActive && (await verifyPassword(password, emp.portalPasswordHash))) {
         limiter.recordSuccess(keys.slice(0, -1));

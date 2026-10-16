@@ -612,6 +612,28 @@ export async function completeReconciliation(
   return inTransaction(ctx, async (tx) => {
     const now = new Date();
 
+    // A line cleared in this session whose entry was voided before completion was never part of
+    // the reconciled balance (computeClearedBalance skips it) — un-clear it, so the completed
+    // session's report and the discrepancy report don't count it as reconciled-then-voided.
+    const voidedCleared = await tx.db
+      .select({ id: reconciliationItems.id })
+      .from(reconciliationItems)
+      .innerJoin(journalEntryLines, eq(reconciliationItems.journalEntryLineId, journalEntryLines.id))
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .where(
+        and(
+          eq(reconciliationItems.reconciliationId, reconciliationId),
+          eq(reconciliationItems.isCleared, true),
+          ne(journalEntries.status, 'posted'),
+        ),
+      );
+    if (voidedCleared.length) {
+      await tx.db
+        .update(reconciliationItems)
+        .set({ isCleared: false, clearedDate: null })
+        .where(inArray(reconciliationItems.id, voidedCleared.map((r) => r.id)));
+    }
+
     const [updated] = await tx.db
       .update(reconciliations)
       .set({

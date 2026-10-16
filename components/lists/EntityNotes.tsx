@@ -8,6 +8,7 @@ import { NotebookText, Pencil, Trash2 } from 'lucide-react';
 import { Button, ConfirmDialog, DateInput, Spinner, toastError } from '@/components/ui';
 import { api } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
+import { formatShortDate } from '@/lib/format';
 
 interface Note {
   id: string;
@@ -116,7 +117,8 @@ export function EntityNotes({
           {notes.map((n) => (
             <li key={n.id} className="rounded-lg bg-slate-50 px-3 py-2 text-sm text-navy">
               <div className="mb-1 flex items-center justify-between text-xs text-navy/50">
-                <span>{new Date(n.noteDate).toLocaleDateString()}</span>
+                {/* A picked note date is saved as UTC midnight: show the day it names. */}
+                <span>{formatShortDate(n.noteDate)}</span>
                 <span>
                   <button type="button" aria-label="Edit note" className="mr-2 hover:text-navy" onClick={() => { setEditId(n.id); setEditBody(n.body); }}>
                     <Pencil className="inline h-3.5 w-3.5" />

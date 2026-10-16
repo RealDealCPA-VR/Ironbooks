@@ -25,6 +25,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatShortDate } from '@/lib/format';
+import { csvMinimal } from '@/lib/csv';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -80,11 +81,9 @@ function statusLabel(status: string): string {
   return status;
 }
 
+/** Formula-safe CSV cell (lib/csv.ts). */
 function toCsvCell(value: string | number | null | undefined): string {
-  const s = String(value ?? '');
-  return s.includes(',') || s.includes('"') || s.includes('\n')
-    ? `"${s.replace(/"/g, '""')}"`
-    : s;
+  return csvMinimal(value);
 }
 
 function toCsvRow(...cells: (string | number | null | undefined)[]): string {

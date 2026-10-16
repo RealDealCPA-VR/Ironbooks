@@ -866,6 +866,9 @@ function InvoiceModal({
       if (kind === 'discount') {
         if (!l.rate || (parseFloat(l.rate) || 0) === 0) {
           entries[`line-${idx}-rate`] = `Line ${n}: enter a discount ${l.discountPercent ? 'percent' : 'amount'}.`;
+        } else if (l.discountPercent && Math.abs(totals.amounts[idx] ?? 0) < 0.005) {
+          // The % is saved as its dollar amount: a % of nothing would save a $0.00 discount.
+          entries[`line-${idx}-rate`] = `Line ${n}: this percent discount comes to $0.00 — put it under the lines (or the Subtotal item) it discounts.`;
         }
         return;
       }
@@ -1907,7 +1910,8 @@ function InvoicesPageContent() {
                 const overdue =
                   (inv.status === 'open' || inv.status === 'partial') &&
                   !!inv.dueDate &&
-                  new Date(inv.dueDate) < new Date();
+                  // Calendar days (the due date is UTC midnight): overdue only after the due day.
+                  inv.dueDate.slice(0, 10) < todayISO();
                 return (
                 <Tr
                   key={inv.id}

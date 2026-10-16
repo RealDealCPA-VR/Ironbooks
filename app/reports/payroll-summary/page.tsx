@@ -24,6 +24,7 @@ import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { fmtDate } from '../_components/shared';
+import { csvMinimal } from '@/lib/csv';
 
 // ---------------------------------------------------------------------------
 // Types (mirror lib/services/payrollReports.ts)
@@ -110,11 +111,9 @@ const KIND_LABELS: Record<LiabilityItem['kind'], string> = {
 // CSV helpers
 // ---------------------------------------------------------------------------
 
+/** Formula-safe CSV cell (lib/csv.ts). */
 function toCsvCell(value: string | number | null | undefined): string {
-  const s = String(value ?? '');
-  return s.includes(',') || s.includes('"') || s.includes('\n')
-    ? `"${s.replace(/"/g, '""')}"`
-    : s;
+  return csvMinimal(value);
 }
 
 function toCsvRow(...cells: (string | number | null | undefined)[]): string {

@@ -447,6 +447,13 @@ interface SalesLine {
   amount: Decimal;
 }
 
+/**
+ * Lines that are sales: every line except subtotal items (non-posting; their amount repeats the
+ * lines above them), payment items (money received, not sales) and manual sales-tax items (owed
+ * to the tax agency). Discount lines stay — they reduce sales. Needs `items` joined on the line.
+ */
+const SALES_LINE_ONLY = sql`COALESCE(${items.type}::text, '') NOT IN ('subtotal', 'payment', 'sales_tax')`;
+
 /** Item sales lines (invoices, sales receipts, credit memos as negatives) in a date range. */
 export async function salesLines(
   ctx: ServiceContext,
@@ -457,7 +464,7 @@ export async function salesLines(
 ): Promise<SalesLine[]> {
   const c = ctx.companyId;
   const out: SalesLine[] = [];
-  const invConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft'])];
+  const invConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), SALES_LINE_ONLY];
   if (scope) invConds.push(scope.invoiceIds.length ? inArray(invoices.id, scope.invoiceIds) : sql`false`);
   else invConds.push(gte(invoices.date, range.from), lte(invoices.date, range.to));
   if (filter.customerId) invConds.push(eq(invoices.customerId, filter.customerId));
@@ -483,7 +490,7 @@ export async function salesLines(
     .where(and(...invConds))) {
     out.push({ id: r.id, type: 'Invoice', sourceRef: `invoice:${r.docId}`, date: r.date, num: docRef(r.ref, r.num), customerId: r.customerId, itemId: r.itemId, item: r.item ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), price: Money.of(r.rate), amount: Money.of(r.amount) });
   }
-  const srConds: SQL[] = [eq(salesReceipts.companyId, c), ne(salesReceipts.status, 'void'), gte(salesReceipts.date, range.from), lte(salesReceipts.date, range.to)];
+  const srConds: SQL[] = [eq(salesReceipts.companyId, c), ne(salesReceipts.status, 'void'), SALES_LINE_ONLY, gte(salesReceipts.date, range.from), lte(salesReceipts.date, range.to)];
   if (scope) srConds.push(sql`false`);
   if (filter.customerId) srConds.push(eq(salesReceipts.customerId, filter.customerId));
   if (filter.itemId) srConds.push(eq(salesReceiptLines.itemId, filter.itemId));
@@ -509,7 +516,7 @@ export async function salesLines(
     out.push({ id: r.id, type: 'Sales Receipt', sourceRef: `salesreceipt:${r.docId}`, date: r.date, num: docRef(r.ref, r.num), customerId: r.customerId, itemId: r.itemId, item: r.item ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), price: Money.of(r.rate), amount: Money.of(r.amount) });
   }
   if (!filter.classId) {
-    const cmConds: SQL[] = [eq(creditMemos.companyId, c), ne(creditMemos.status, 'void')];
+    const cmConds: SQL[] = [eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), SALES_LINE_ONLY];
     if (scope) cmConds.push(scope.creditMemoIds.length ? inArray(creditMemos.id, scope.creditMemoIds) : sql`false`);
     else cmConds.push(gte(creditMemos.date, range.from), lte(creditMemos.date, range.to));
     if (filter.customerId) cmConds.push(eq(creditMemos.customerId, filter.customerId));
@@ -835,7 +842,9 @@ export async function salesByItemSummary(ctx: ServiceContext, p: ReportParams): 
 }
 
 async function openSalesOrders(ctx: ServiceContext, p: ReportParams, by: 'customer' | 'item'): Promise<StdReport> {
-  const conds: SQL[] = [eq(salesOrders.companyId, ctx.companyId), notInArray(salesOrders.status, ['void', 'closed', 'paid'])];
+  // Subtotal / sales-tax lines are not ordered goods: they are never invoiced, so they would
+  // show as permanently "backordered" and inflate the open amount.
+  const conds: SQL[] = [eq(salesOrders.companyId, ctx.companyId), notInArray(salesOrders.status, ['void', 'closed', 'paid']), SALES_LINE_ONLY];
   if (p.customerId) conds.push(eq(salesOrders.customerId, p.customerId));
   if (p.itemId) conds.push(eq(salesOrderLines.itemId, p.itemId));
   const dbRows = await ctx.db

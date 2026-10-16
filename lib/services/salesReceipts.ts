@@ -732,16 +732,29 @@ async function reverseSalesReceiptPostings(
         quantityRemaining: qty.toFixed(4),
         unitCost: unitCost.toFixed(4),
       });
+      await tx.db
+        .update(items)
+        .set({
+          quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) + ${qty.toFixed(4)}`,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+    } else {
+      // Average cost: weight the restored COGS back into averageCost (the GL gets the original
+      // COGS back, which differs from qty x today's average once the average has moved).
+      const [cur] = await tx.db
+        .select({ qty: items.quantityOnHand, avg: items.averageCost })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+      const curQty = Money.of(cur?.qty ?? '0');
+      const curAvg = Money.of(cur?.avg ?? '0');
+      const newQty = curQty.plus(qty);
+      const newAvg = newQty.isZero() ? curAvg : curQty.times(curAvg).plus(cogs).dividedBy(newQty);
+      await tx.db
+        .update(items)
+        .set({ quantityOnHand: newQty.toFixed(4), averageCost: newAvg.toFixed(4), updatedAt: new Date() })
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
     }
-
-    // Both costing methods: put the quantity back on hand.
-    await tx.db
-      .update(items)
-      .set({
-        quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) + ${qty.toFixed(4)}`,
-        updatedAt: new Date(),
-      })
-      .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
   }
 
   // Put the stock back at the site/bin/serial it was sold from.
@@ -761,8 +774,8 @@ async function reverseSalesReceiptPostings(
  *  - FIFO items get a NEW layer dated at the receipt date whose unit cost is the
  *    voided entry's COGS / quantity (value restored exactly matches the GL
  *    reversal; lot identity of the consumed layers is not resurrected).
- *  - Average-cost items get quantityOnHand bumped back (averageCost unchanged —
- *    symmetric with recordCOGS, which does not change averageCost on removal).
+ *  - Average-cost items get quantityOnHand bumped back, with the restored COGS
+ *    weighted into averageCost so the item value stays tied to the GL.
  */
 export async function voidSalesReceipt(ctx: ServiceContext, id: string) {
   const [receipt] = await ctx.db
@@ -773,6 +786,13 @@ export async function voidSalesReceipt(ctx: ServiceContext, id: string) {
 
   if (receipt.status === 'void') {
     throw new ServiceError('CONFLICT', 'Sales receipt is already voided.');
+  }
+  // Swept into a bank deposit: voiding would take the money out of Undeposited Funds a second time.
+  if (await isDeposited(ctx, id)) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This sales receipt has been included in a deposit, so it cannot be voided. Remove it from the deposit (or void the deposit) first.',
+    );
   }
 
   return inTransaction(ctx, async (tx) => {

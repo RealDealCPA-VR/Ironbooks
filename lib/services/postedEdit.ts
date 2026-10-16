@@ -37,10 +37,15 @@ function lineKey(l: {
   debit?: string | number | null;
   credit?: string | number | null;
   classId?: string | null;
+  entityType?: string | null;
+  entityId?: string | null;
 }): string {
   const d = Money.round2(l.debit ?? 0);
   const c = Money.round2(l.credit ?? 0);
-  return `${l.accountId}|${d.toFixed(2)}|${c.toFixed(2)}|${l.classId ?? ''}`;
+  // The line's name (customer / vendor / ...) is ledger data too: A/R / A/P by name reads it, so a
+  // changed name must re-post. posting.ts stores entityId only together with entityType.
+  const entity = l.entityType ? `${l.entityType}:${l.entityId ?? ''}` : '';
+  return `${l.accountId}|${d.toFixed(2)}|${c.toFixed(2)}|${l.classId ?? ''}|${entity}`;
 }
 
 /** True when two sets of posting lines are the same multiset (order-insensitive). */
@@ -108,6 +113,8 @@ export async function planPostedEdit(
     debit: l.debit,
     credit: l.credit,
     classId: l.classId,
+    entityType: (l.entityType ?? null) as PostingLine['entityType'],
+    entityId: l.entityId ?? null,
   }));
   if (sameDay(entry.date, params.date) && sameLedgerLines(oldLines, params.lines)) {
     // The entry stays, so voidJournalEntry's period check never runs: check it here.

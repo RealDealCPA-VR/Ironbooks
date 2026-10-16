@@ -69,6 +69,7 @@ import { createBill, getBill, updateBill, voidBill, type CreateBillInput } from 
 import { createExpense, getExpense, updateExpense, voidExpense, type CreateExpenseInput } from './expenses';
 import {
   CASHBACK_LINE_PREFIX,
+  INVOICE_PAYMENT_LINE_PREFIX,
   RECEIPT_LINE_PREFIX,
   createDeposit,
   getDeposit,
@@ -351,6 +352,7 @@ function expenseInput(s: Snap): CreateExpenseInput {
 function depositInput(s: Snap): CreateDepositInput {
   const paymentIds: string[] = [];
   const salesReceiptIds: string[] = [];
+  const invoicePaymentIds: string[] = [];
   const extraLines: NonNullable<CreateDepositInput['extraLines']> = [];
   let cashBack: CreateDepositInput['cashBack'] = null;
   for (const l of arr(s.lines)) {
@@ -358,6 +360,8 @@ function depositInput(s: Snap): CreateDepositInput {
     if (l.paymentId) paymentIds.push(String(l.paymentId));
     else if (desc.startsWith(RECEIPT_LINE_PREFIX)) {
       salesReceiptIds.push(desc.slice(RECEIPT_LINE_PREFIX.length).trim());
+    } else if (desc.startsWith(INVOICE_PAYMENT_LINE_PREFIX)) {
+      invoicePaymentIds.push(desc.slice(INVOICE_PAYMENT_LINE_PREFIX.length).trim());
     } else if (desc.startsWith(CASHBACK_LINE_PREFIX)) {
       cashBack = { accountId: desc.slice(CASHBACK_LINE_PREFIX.length).trim(), amount: Money.of(String(l.amount)).negated().toFixed(2) };
     } else if (l.accountId) {
@@ -369,6 +373,7 @@ function depositInput(s: Snap): CreateDepositInput {
     date: reqDate(s.date),
     paymentIds,
     salesReceiptIds,
+    invoicePaymentIds,
     extraLines,
     cashBack,
     memo: str(s.memo),

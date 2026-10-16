@@ -13,7 +13,7 @@ import { cookies } from 'next/headers';
 import bcrypt from 'bcryptjs';
 import { eq } from 'drizzle-orm';
 import { getDb, resolveDataDir } from '@/lib/db';
-import { employees, users } from '@/lib/db/schema';
+import { companies, employees, users } from '@/lib/db/schema';
 import { touchSession } from '@/lib/services/sessions';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 
@@ -288,6 +288,16 @@ export function createPortalToken(employeeId: string, portalPasswordHash: string
  * issued under that same password (see portalPasswordVersion) — so deactivating the employee or
  * changing/removing their portal password ends existing portal sessions.
  */
+/**
+ * True when a company row's settings mark it archived. Same rule as lib/context
+ * isArchivedCompany (not imported: lib/context imports this module).
+ */
+export function isArchivedSettings(settings: unknown): boolean {
+  return Boolean(
+    settings && typeof settings === 'object' && (settings as { archived?: unknown }).archived === true,
+  );
+}
+
 export async function getPortalEmployeeId(): Promise<string | null> {
   let token: { userId: string; pv?: string } | null;
   try {
@@ -299,10 +309,18 @@ export async function getPortalEmployeeId(): Promise<string | null> {
   if (!token?.pv) return null; // legacy portal tokens (no password version) are not honored
   const db = await getDb();
   const [emp] = await db
-    .select({ id: employees.id, isActive: employees.isActive, portalPasswordHash: employees.portalPasswordHash })
+    .select({
+      id: employees.id,
+      isActive: employees.isActive,
+      portalPasswordHash: employees.portalPasswordHash,
+      companySettings: companies.settings,
+    })
     .from(employees)
+    .innerJoin(companies, eq(companies.id, employees.companyId))
     .where(eq(employees.id, token.userId));
   if (!emp || !emp.isActive || !emp.portalPasswordHash) return null;
+  // An archived (soft-deleted) company's employees lose portal access (lib/context isArchivedCompany).
+  if (isArchivedSettings(emp.companySettings)) return null;
   const expected = Buffer.from(portalPasswordVersion(emp.portalPasswordHash));
   const got = Buffer.from(token.pv);
   if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) return null;

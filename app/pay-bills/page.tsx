@@ -632,7 +632,8 @@ export default function PayBillsPage() {
   const dueTone = useMemo(
     () => (dueDate: string | null) => {
       if (!dueDate) return 'text-navy/40';
-      return new Date(dueDate) < new Date() ? 'text-red-600 font-semibold' : 'text-navy/70';
+      // Calendar days (the due date is UTC midnight): past due only after the due day.
+      return dueDate.slice(0, 10) < todayISO() ? 'text-red-600 font-semibold' : 'text-navy/70';
     },
     [],
   );

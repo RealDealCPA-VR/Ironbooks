@@ -11,7 +11,7 @@
  * Revenue comes from invoices and sales receipts (credit memos reduce it); cost from bills and
  * direct expenses (checks / card charges). Void documents never count.
  */
-import { and, eq, gte, isNull, lte, ne, notInArray, or, isNotNull, type SQL } from 'drizzle-orm';
+import { and, eq, gte, isNull, lte, ne, notInArray, or, isNotNull, sql, type SQL } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import {
   accounts,
@@ -75,6 +75,13 @@ async function jobLabels(ctx: ServiceContext) {
   return { label, names, jobRows };
 }
 
+/**
+ * Revenue lines only: not subtotal items (non-posting; their amount repeats the lines above),
+ * payment items (money received) or manual sales-tax items (owed to the agency). Discounts stay.
+ * Needs `items` joined on the line.
+ */
+const REVENUE_LINE_ONLY = sql`COALESCE(${items.type}::text, '') NOT IN ('subtotal', 'payment', 'sales_tax')`;
+
 const keyOf = (jobId: string | null, customerId: string | null) =>
   jobId ? `job:${jobId}` : customerId ? `cust:${customerId}` : null;
 
@@ -93,7 +100,7 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
     .leftJoin(items, and(eq(invoiceLines.itemId, items.id), eq(items.companyId, c)))
-    .where(and(eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), ...dateConds(invoices.date)))) {
+    .where(and(eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), REVENUE_LINE_ONLY, ...dateConds(invoices.date)))) {
     const k = keyOf(r.jobId ?? r.headJob, r.customerId);
     if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Invoice', num: docRef(r.ref, r.num), sourceRef: `invoice:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
   }
@@ -102,7 +109,7 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .from(salesReceiptLines)
     .innerJoin(salesReceipts, eq(salesReceiptLines.salesReceiptId, salesReceipts.id))
     .leftJoin(items, and(eq(salesReceiptLines.itemId, items.id), eq(items.companyId, c)))
-    .where(and(eq(salesReceipts.companyId, c), ne(salesReceipts.status, 'void'), ...dateConds(salesReceipts.date)))) {
+    .where(and(eq(salesReceipts.companyId, c), ne(salesReceipts.status, 'void'), REVENUE_LINE_ONLY, ...dateConds(salesReceipts.date)))) {
     const k = keyOf(r.jobId, r.customerId);
     if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Sales Receipt', num: docRef(r.ref, r.num), sourceRef: `salesreceipt:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
   }
@@ -111,7 +118,7 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .from(creditMemoLines)
     .innerJoin(creditMemos, eq(creditMemoLines.creditMemoId, creditMemos.id))
     .leftJoin(items, and(eq(creditMemoLines.itemId, items.id), eq(items.companyId, c)))
-    .where(and(eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), ...dateConds(creditMemos.date)))) {
+    .where(and(eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), REVENUE_LINE_ONLY, ...dateConds(creditMemos.date)))) {
     out.push({ kind: 'revenue', jobKey: `cust:${r.customerId}`, date: r.date, type: 'Credit Memo', num: docRef(r.ref, r.num), sourceRef: `credit_memo:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty).negated(), amount: Money.of(r.amount).negated() });
   }
   for (const r of await ctx.db
@@ -237,7 +244,7 @@ export async function jobProfitabilityDetail(ctx: ServiceContext, p: ReportParam
 
 /** Estimate lines (accepted / open / closed estimates; rejected and void are excluded). */
 async function estimateFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }) {
-  const conds: SQL[] = [eq(estimates.companyId, ctx.companyId), notInArray(estimates.status, ['void', 'rejected', 'draft'])];
+  const conds: SQL[] = [eq(estimates.companyId, ctx.companyId), notInArray(estimates.status, ['void', 'rejected', 'draft']), REVENUE_LINE_ONLY];
   if (range.from) conds.push(gte(estimates.date, range.from));
   if (range.to) conds.push(lte(estimates.date, range.to));
   return ctx.db

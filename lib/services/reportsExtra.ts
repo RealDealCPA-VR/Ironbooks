@@ -2081,6 +2081,9 @@ export interface SalesByItemReport {
   totals: { quantity: string; revenue: string; cogs: string; margin: string; marginPct: string | null };
 }
 
+/** Sales items only: not subtotal (non-posting), payment or manual sales-tax items. Needs `items` joined. */
+const SALES_ITEM_ONLY = sql`${items.type}::text NOT IN ('subtotal', 'payment', 'sales_tax')`;
+
 /**
  * Sales by Item (summary) — quantity / revenue / COGS / margin per item across
  * invoices AND sales receipts in the period (voided/draft documents excluded).
@@ -2098,6 +2101,9 @@ export async function salesByItem(
     ne(invoices.status, 'void'),
     ne(invoices.status, 'draft'),
     isNotNull(invoiceLines.itemId),
+    // Subtotal (non-posting, repeats the lines above), payment and manual sales-tax items are
+    // not sales. Discount items stay (they reduce sales).
+    SALES_ITEM_ONLY,
   ];
   if (range?.from) invConds.push(gte(invoices.date, range.from));
   if (range?.to) invConds.push(lte(invoices.date, range.to));
@@ -2109,6 +2115,7 @@ export async function salesByItem(
     })
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
+    .innerJoin(items, eq(invoiceLines.itemId, items.id))
     .where(and(...invConds))
     .groupBy(invoiceLines.itemId);
 
@@ -2116,6 +2123,7 @@ export async function salesByItem(
     eq(salesReceipts.companyId, ctx.companyId),
     ne(salesReceipts.status, 'void'),
     isNotNull(salesReceiptLines.itemId),
+    SALES_ITEM_ONLY,
   ];
   if (range?.from) srConds.push(gte(salesReceipts.date, range.from));
   if (range?.to) srConds.push(lte(salesReceipts.date, range.to));
@@ -2127,6 +2135,7 @@ export async function salesByItem(
     })
     .from(salesReceiptLines)
     .innerJoin(salesReceipts, eq(salesReceiptLines.salesReceiptId, salesReceipts.id))
+    .innerJoin(items, eq(salesReceiptLines.itemId, items.id))
     .where(and(...srConds))
     .groupBy(salesReceiptLines.itemId);
 

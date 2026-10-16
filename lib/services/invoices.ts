@@ -53,7 +53,7 @@ import {
   salesReps,
   taxRates,
 } from '@/lib/db/schema';
-import { depositLines, deposits } from '@/lib/db/schema';
+import { billLines, depositLines, deposits, expenseLines, timeEntries } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -2237,6 +2237,14 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
       .set({ status: 'void', balanceDue: '0.00', updatedAt: new Date() })
       .where(eq(invoices.id, id))
       .returning();
+
+    // Billable time & costs it billed become unbilled again (QB: voiding the invoice puts them
+    // back on the Time/Costs list), so they can be billed on another invoice.
+    await tx.db.update(timeEntries).set({ invoicedInvoiceId: null }).where(
+      and(eq(timeEntries.companyId, tx.companyId), eq(timeEntries.invoicedInvoiceId, id)),
+    );
+    await tx.db.update(billLines).set({ billedInvoiceId: null }).where(eq(billLines.billedInvoiceId, id));
+    await tx.db.update(expenseLines).set({ billedInvoiceId: null }).where(eq(expenseLines.billedInvoiceId, id));
 
     // Progress invoicing: what this invoice billed goes back onto its estimate(s).
     for (const estimateId of await estimatesBilledByInvoice(tx, id)) {

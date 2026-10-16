@@ -49,6 +49,7 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { getEmployee } from './payroll';
+import { defaultPayrollLiabilityAccountId } from './liabilityPayments';
 import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
 import { inferEmployeeTaxTracking, inferEmployerTracking } from './payrollTaxTracking';
 
@@ -98,6 +99,19 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   return row?.id ?? null;
+}
+
+/**
+ * The payroll liabilities account paychecks credit when a line has no item account (the
+ * Preferences payroll liabilities account, else 2300) — adjustments must post there too, or
+ * Pay Liabilities relieves one account while the adjustment sits in another. Null when neither exists.
+ */
+async function payrollLiabilityAccountId(ctx: ServiceContext): Promise<string | null> {
+  try {
+    return await defaultPayrollLiabilityAccountId(ctx);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -246,7 +260,7 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
   let posting: PostingLine[] | null = null;
   if (input.affectsAccounts) {
     const expense = await accountIdByCode(ctx, '6500');
-    const liab = await accountIdByCode(ctx, '2300');
+    const liab = await payrollLiabilityAccountId(ctx);
     const bank = input.bankAccountId
       ? await requireAccount(ctx, input.bankAccountId, 'Bank account', 'bank')
       : await accountIdByCode(ctx, '1000');
@@ -348,7 +362,7 @@ export async function createLiabilityAdjustment(ctx: ServiceContext, input: Liab
 
   let posting: PostingLine[] | null = null;
   if (input.affectsAccounts) {
-    const liab = await accountIdByCode(ctx, '2300');
+    const liab = await payrollLiabilityAccountId(ctx);
     if (!liab) throw validation('Posting needs account 2300 Payroll Liabilities.');
     const offset = input.offsetAccountId
       ? await requireAccount(ctx, input.offsetAccountId, 'Offset account', 'expense')

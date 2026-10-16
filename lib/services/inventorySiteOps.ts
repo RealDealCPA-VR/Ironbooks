@@ -15,7 +15,7 @@ import { accounts, inventoryLayers, itemSiteSettings, items } from '@/lib/db/sch
 import { Money } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { type AdjustmentDimensions, adjustInventory } from './inventory';
-import { consumeStock, receiveStock } from './fifo';
+import { consumeStock, receiveStock, seedOpeningLayer } from './fifo';
 import { type InventoryLineDetail, getSite, recordMovements } from './inventorySites';
 
 export interface SiteAdjustmentInput extends InventoryLineDetail, AdjustmentDimensions {
@@ -93,6 +93,9 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
         entryId = res.entryId;
         glAmount = res.totalCost;
       } else {
+        // costing 'fifo' on an average-cost item: its on-hand stock becomes the opening layer
+        // first, so the removal draws on it (receiveStock does the same on the add side).
+        if (!layer) await seedOpeningLayer(tx, item.id, input.date);
         const res = await consumeStock(tx, {
           itemId: item.id,
           quantity: qty.abs().toFixed(4),

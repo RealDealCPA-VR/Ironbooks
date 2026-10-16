@@ -61,6 +61,7 @@ import {
   reconciliationItems,
   reconciliations,
   salesReceipts,
+  salesTaxLineLinks,
   transfers,
   vendorCredits,
 } from '@/lib/db/schema';
@@ -254,6 +255,15 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
   for (const side of ['ar', 'ap'] as const) {
     for (const item of await journalOpenItems(ctx, side)) protectedIds.add(item.journalEntryId);
   }
+  // 2b'. Entries with a line attributed to a sales tax agency ("Fix Incorrectly Recorded Sales
+  //      Tax" links): the link is the agency's liability history and is deleted with its line
+  //      (ON DELETE CASCADE), so those entries stay in detail.
+  const taxLinked = await ctx.db
+    .selectDistinct({ id: journalEntryLines.journalEntryId })
+    .from(salesTaxLineLinks)
+    .innerJoin(journalEntryLines, eq(journalEntryLines.id, salesTaxLineLinks.journalEntryLineId))
+    .where(eq(salesTaxLineLinks.companyId, ctx.companyId));
+  for (const row of taxLinked) protectedIds.add(row.id);
   // 2c. Keep applications consistent: a journal entry applied to (or paid by) a document whose
   //     entry is kept must stay too — deleting the entry would cascade-delete the application
   //     while the document still counts it.
@@ -579,6 +589,82 @@ export async function condensePeriod(
   return { ...preview, dryRun: false, archivePath, runId };
 }
 
+/**
+ * NOT NULL referrers that are pure derived / undo state and may be deleted with the entry or
+ * bank-feed row they describe. ai_auto_applied is the AI auto-categorize undo log (bank-feed row
+ * + the entry it created): once the entry is condensed that undo can no longer happen.
+ */
+const DERIVED_REFERRER_TABLES = new Set(['ai_auto_applied']);
+
+const UUID_ONLY_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const quoteIdent = (s: string) => `"${s.replace(/"/g, '""')}"`;
+
+/**
+ * Release every single-column FOREIGN KEY that would block deleting `ids` from `targetTable`
+ * (ON DELETE NO ACTION / RESTRICT; CASCADE and SET NULL keys are left to the database):
+ * a nullable reference is set to NULL, a NOT NULL one means the row only describes the removed
+ * row (e.g. an AI auto-apply undo record of a condensed entry) and is deleted — after its own
+ * referrers are released the same way. Columns in `skip` ("table.column") are handled by the
+ * caller.
+ */
+async function detachForeignReferences(
+  tx: ServiceContext,
+  targetTable: string,
+  ids: string[],
+  skip: string[] = [],
+  depth = 0,
+): Promise<void> {
+  if (ids.length === 0) return;
+  if (depth > 8) throw new ServiceError('INTERNAL', 'Condense: foreign key chain is too deep.');
+  for (const id of ids) {
+    if (!UUID_ONLY_RE.test(id)) throw new ServiceError('INTERNAL', `Condense: not a uuid: ${id}`);
+  }
+  const res = await tx.db.execute(sql`
+    SELECT src.relname AS child, att.attname AS col, att.attnotnull AS notnull,
+           EXISTS (SELECT 1 FROM pg_attribute ia WHERE ia.attrelid = con.conrelid AND ia.attname = 'id' AND NOT ia.attisdropped) AS has_id
+      FROM pg_constraint con
+      JOIN pg_class src ON src.oid = con.conrelid
+      JOIN pg_class ref ON ref.oid = con.confrelid
+      JOIN pg_namespace ns ON ns.oid = ref.relnamespace
+      JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = con.conkey[1]
+     WHERE con.contype = 'f'
+       AND array_length(con.conkey, 1) = 1
+       AND con.confdeltype IN ('a', 'r')
+       AND ref.relname = ${targetTable}
+       AND ns.nspname = current_schema()
+     ORDER BY 1, 2`);
+  const fks = ((res as unknown as { rows?: unknown[] }).rows ?? []) as Array<{
+    child: string; col: string; notnull: boolean; has_id: boolean;
+  }>;
+  const list = ids.map((id) => `'${id}'::uuid`).join(', ');
+  const skipSet = new Set(skip);
+  for (const fk of fks) {
+    if (skipSet.has(`${fk.child}.${fk.col}`)) continue;
+    const where = `${quoteIdent(fk.col)} IN (${list})`;
+    if (!fk.notnull) {
+      await tx.db.execute(sql.raw(`UPDATE ${quoteIdent(fk.child)} SET ${quoteIdent(fk.col)} = NULL WHERE ${where}`));
+      continue;
+    }
+    // A NOT NULL referrer cannot outlive the removed row. Only rows that are pure derived / undo
+    // state may be removed with it; anything else would silently change history, so refuse.
+    if (!DERIVED_REFERRER_TABLES.has(fk.child)) {
+      const hit = await tx.db.execute(sql.raw(`SELECT 1 FROM ${quoteIdent(fk.child)} WHERE ${where} LIMIT 1`));
+      if ((((hit as unknown as { rows?: unknown[] }).rows) ?? []).length === 0) continue;
+      throw validation(
+        `Condense cannot remove these transactions: records in "${fk.child}" still depend on them. ` +
+          'Nothing was changed. Pick an earlier date, or contact support.',
+      );
+    }
+    if (fk.has_id) {
+      const found = await tx.db.execute(sql.raw(`SELECT id::text AS id FROM ${quoteIdent(fk.child)} WHERE ${where}`));
+      const childIds = (((found as unknown as { rows?: unknown[] }).rows ?? []) as Array<{ id: string }>).map((r) => r.id);
+      if (childIds.length === 0) continue;
+      await detachForeignReferences(tx, fk.child, childIds, [], depth + 1);
+    }
+    await tx.db.execute(sql.raw(`DELETE FROM ${quoteIdent(fk.child)} WHERE ${where}`));
+  }
+}
+
 /** The destructive part of condensePeriod, in one transaction. */
 async function runCondense(
   ctx: ServiceContext,
@@ -602,14 +688,20 @@ async function runCondense(
         .where(inArray(reconciliationItems.journalEntryLineId, idChunk));
     }
 
-    // b) Matched bank-feed staging rows linked to removed entries.
+    // b) Matched bank-feed staging rows linked to removed entries. Anything else pointing at
+    //    those rows (the AI auto-apply undo log, ...) is detached / removed first.
     for (const idChunk of chunks(deletedIds)) {
-      await tx.db
-        .delete(bankTransactions)
+      const feedRows = await tx.db
+        .select({ id: bankTransactions.id })
+        .from(bankTransactions)
         .where(and(
           eq(bankTransactions.companyId, tx.companyId),
           inArray(bankTransactions.matchedEntryId, idChunk),
         ));
+      const feedIds = feedRows.map((r) => r.id);
+      if (feedIds.length === 0) continue;
+      await detachForeignReferences(tx, 'bank_transactions', feedIds);
+      await tx.db.delete(bankTransactions).where(inArray(bankTransactions.id, feedIds));
     }
 
     // c) Detach soft references so FKs allow the entry deletes. Document rows
@@ -628,6 +720,16 @@ async function runCondense(
           .set({ postedEntryId: null })
           .where(and(eq(t.companyCol, tx.companyId), inArray(t.refCol, idChunk)));
       }
+    }
+    // c2) Every other FOREIGN KEY to the removed lines / entries (Sales Tax Payment and
+    //     liability checks, bounced checks, landed cost allocations, the AI auto-apply log, and
+    //     any table added later), found from the database catalogue: optional links are
+    //     cleared, rows that cannot exist without the entry are removed.
+    for (const idChunk of chunks(plan.lineIds)) {
+      await detachForeignReferences(tx, 'journal_entry_lines', idChunk);
+    }
+    for (const idChunk of chunks(deletedIds)) {
+      await detachForeignReferences(tx, 'journal_entries', idChunk, ['journal_entry_lines.journal_entry_id']);
     }
 
     // d) Delete the detail lines, then the entries.

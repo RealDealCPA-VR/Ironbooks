@@ -8,6 +8,7 @@
 import { Button, Input, Label } from '@/components/ui';
 import { formatShortDate } from '@/lib/format';
 import { todayISO } from '@/lib/dates';
+import { csvQuoted } from '@/lib/csv';
 
 // ---------------------------------------------------------------------------
 // CSV download
@@ -17,9 +18,10 @@ export type CsvCell = string | number | null | undefined;
 
 /** Build a CSV (title line + header + rows) and trigger a browser download. */
 export function downloadCsv(filename: string, title: string, headers: string[], rows: CsvCell[][]) {
-  const escape = (v: CsvCell) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  // Always quoted, formula-safe (lib/csv.ts).
+  const escape = (v: CsvCell) => csvQuoted(v);
   const lines = [
-    `"${title.replace(/"/g, '""')}"`,
+    csvQuoted(title),
     '',
     headers.map(escape).join(','),
     ...rows.map((row) => row.map(escape).join(',')),

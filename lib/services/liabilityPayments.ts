@@ -11,7 +11,7 @@
  * pay-from account, voidable, one check per tax agency when several agencies are paid at once.
  * The journal entry stays the ledger record (sales tax: sourceRef "tax_agency:<agencyId>").
  */
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { isBankAccount } from '@/lib/accountTypes';
 import {
   accounts,
@@ -140,9 +140,12 @@ function liabilityBaseName(name: string): string {
 }
 
 /**
- * The account an itemized liability payment relieves: the liability account of the payroll item
- * the paychecks credited for this item name (the item named so, else the item on the latest
- * paycheck line of that name), otherwise the default payroll liabilities account.
+ * The account an itemized liability payment relieves: the account the paychecks actually credited
+ * for this item name — the latest paycheck line of that name posts to its payroll item's liability
+ * account, or (no item / no item account) to the default payroll liabilities account. Only when no
+ * paycheck line has that name does the payroll item named so decide. A same-named item the
+ * paychecks never used (e.g. the seeded "Social Security" item while engine lines carry no item)
+ * must not win, or the payment relieves an account that was never credited.
  */
 async function liabilityAccountForItem(ctx: ServiceContext, name: string, fallbackId: string): Promise<string> {
   const key = liabilityBaseName(name);
@@ -150,21 +153,19 @@ async function liabilityAccountForItem(ctx: ServiceContext, name: string, fallba
     .select({ id: payrollItems.id, name: payrollItems.name, liabilityAccountId: payrollItems.liabilityAccountId })
     .from(payrollItems)
     .where(eq(payrollItems.companyId, ctx.companyId));
-  const named = items.find((i) => i.liabilityAccountId && liabilityBaseName(i.name) === key);
-  if (named?.liabilityAccountId) return named.liabilityAccountId;
-  const itemIds = items.filter((i) => i.liabilityAccountId).map((i) => i.id);
-  if (itemIds.length) {
-    const lines = await ctx.db
-      .select({ name: paycheckLines.name, itemId: paycheckLines.payrollItemId, payDate: paychecks.payDate })
-      .from(paycheckLines)
-      .innerJoin(paychecks, eq(paycheckLines.paycheckId, paychecks.id))
-      .where(and(eq(paychecks.companyId, ctx.companyId), inArray(paycheckLines.payrollItemId, itemIds)))
-      .orderBy(desc(paychecks.payDate));
-    const hit = lines.find((l) => liabilityBaseName(l.name) === key);
-    const acct = hit && items.find((i) => i.id === hit.itemId)?.liabilityAccountId;
-    if (acct) return acct;
+  const lines = await ctx.db
+    .select({ name: paycheckLines.name, itemId: paycheckLines.payrollItemId, payDate: paychecks.payDate })
+    .from(paycheckLines)
+    .innerJoin(paychecks, eq(paycheckLines.paycheckId, paychecks.id))
+    .where(and(eq(paychecks.companyId, ctx.companyId), ne(paycheckLines.kind, 'earning')))
+    .orderBy(desc(paychecks.payDate));
+  const hit = lines.find((l) => liabilityBaseName(l.name) === key);
+  if (hit) {
+    const item = hit.itemId ? items.find((i) => i.id === hit.itemId) : undefined;
+    return item?.liabilityAccountId ?? fallbackId;
   }
-  return fallbackId;
+  const named = items.find((i) => i.liabilityAccountId && liabilityBaseName(i.name) === key);
+  return named?.liabilityAccountId ?? fallbackId;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

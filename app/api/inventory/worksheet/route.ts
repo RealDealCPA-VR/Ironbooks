@@ -7,9 +7,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { physicalWorksheet } from '@/lib/services/inventoryOps';
 import { ServiceError } from '@/lib/services/_base';
+import { csvQuoted } from '@/lib/csv';
 
+/** Always-quoted, formula-safe cell (lib/csv.ts). */
 function csvEscape(value: string | null | undefined): string {
-  return `"${String(value ?? '').replace(/"/g, '""')}"`;
+  return csvQuoted(value);
 }
 
 export async function GET(req: NextRequest): Promise<NextResponse> {

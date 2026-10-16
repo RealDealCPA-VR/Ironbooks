@@ -70,7 +70,17 @@ function joinList(xs: string[]): string {
 // The client's later work on one record
 // ---------------------------------------------------------------------------
 
-type LaterKind = 'invoice' | 'bill' | 'credit_memo' | 'vendor_credit' | 'payment' | 'sales_receipt' | 'item_receipt' | 'entry' | 'line';
+type LaterKind =
+  | 'invoice'
+  | 'invoice_payment'
+  | 'bill'
+  | 'credit_memo'
+  | 'vendor_credit'
+  | 'payment'
+  | 'sales_receipt'
+  | 'item_receipt'
+  | 'entry'
+  | 'line';
 
 interface Later {
   text: string;
@@ -241,6 +251,21 @@ class LaterWork {
         if (!this.later(r.date)) continue;
         out.push({ text: `your bounced check record of ${day(r.date)}`, amount: dec(r.amount) });
       }
+    } else if (kind === 'invoice_payment') {
+      // The client's deposits of the payment-item lines recorded on this invoice.
+      for (const r of await q(
+        this.ctx,
+        sql`SELECT d.id, d.date, d.total, d.deposit_account_id, dl.amount FROM deposit_lines dl
+            JOIN deposits d ON d.id = dl.deposit_id
+            WHERE dl.description = ${`invoicePayment:${id}`} AND d.company_id = ${c}::uuid AND d.voided_at IS NULL`,
+      )) {
+        if (!this.later(r.date)) continue;
+        out.push({
+          text: `your deposit of ${money(dec(r.total))} on ${day(r.date)} to ${L.account(r.deposit_account_id)} (it holds the payment recorded on this invoice)`,
+          amount: dec(r.amount),
+          depositDay: day(r.date),
+        });
+      }
     } else if (kind === 'sales_receipt') {
       for (const r of await q(
         this.ctx,
@@ -399,7 +424,7 @@ async function editChangesLedger(ctx: ServiceContext, type: string, id: string, 
       );
     }
     if (type === 'deposit') {
-      const keys = ['date', 'depositAccountId', 'total', 'exchangeRate', 'paymentIds', 'salesReceiptIds', 'extraLines', 'cashBack'];
+      const keys = ['date', 'depositAccountId', 'total', 'exchangeRate', 'paymentIds', 'salesReceiptIds', 'invoicePaymentIds', 'extraLines', 'cashBack'];
       return !same(pick((await depositPayloadOf(ctx, id)) as unknown as Row, keys, ['accountId', 'amount']), pick(after, keys, ['accountId', 'amount']));
     }
     if (type === 'vendor_credit') {
@@ -613,6 +638,12 @@ export async function clientWorkConflicts(
           `To import: ${undo}, import these changes, then redo ${them(xs)} — or ask your accountant to leave this ${what} as it is.`,
       );
     if (d.type === 'invoice') {
+      // voidInvoice also refuses while the payment recorded on the invoice is in a deposit.
+      const deps = d.op === 'void' ? await later.of('invoice_payment', d.id) : [];
+      if (deps.length) {
+        blocked(deps, "it can't be voided", 'remove its payment from your deposit (or void that deposit)');
+        continue;
+      }
       const xs = await later.of('invoice', d.id);
       if (!xs.length) continue;
       if (d.op === 'void') {
@@ -793,19 +824,41 @@ export async function clientWorkConflicts(
   const voidedDeposits = new Set(file.transactions.filter((t) => t.type === 'deposit' && t.op === 'void').map((t) => t.id));
   const editedDeposits = new Map<string, Set<string>>();
   for (const t of file.transactions) {
-    if (t.type === 'deposit' && t.op === 'edit') editedDeposits.set(t.id, new Set([...t.after.paymentIds, ...t.after.salesReceiptIds]));
+    if (t.type === 'deposit' && t.op === 'edit') {
+      editedDeposits.set(t.id, new Set([...t.after.paymentIds, ...t.after.salesReceiptIds, ...(t.after.invoicePaymentIds ?? [])]));
+    }
   }
   const stillHolds = (depositId: string, heldId: string) =>
     !voidedDeposits.has(depositId) && (!editedDeposits.has(depositId) || editedDeposits.get(depositId)!.has(heldId));
   for (const t of file.transactions) {
     if (t.type !== 'deposit' || t.op === 'void') continue;
     const key = `${t.type}:${t.op}:${t.id}`;
-    const held: Array<{ id: string; where: SQL }> = [
+    const held: Array<{ id: string; where: SQL; invoice?: boolean }> = [
       ...t.after.paymentIds.map((id) => ({ id, where: sql`dl.payment_id = ${id}::uuid` })),
       ...t.after.salesReceiptIds.map((id) => ({ id, where: sql`dl.description = ${`salesReceipt:${id}`}` })),
+      ...(t.after.invoicePaymentIds ?? []).map((id) => ({ id, where: sql`dl.description = ${`invoicePayment:${id}`}`, invoice: true })),
     ];
     for (const h of held) {
       if (!/^[0-9a-f-]{36}$/i.test(h.id)) continue;
+      if (h.invoice) {
+        // The money recorded on the invoice is only in Undeposited Funds while the invoice is
+        // posted and still has its payment lines: the client voiding it (or taking the payment
+        // off) since the dividing date leaves nothing for the accountant's deposit to hold.
+        const [inv] = await q(
+          ctx,
+          sql`SELECT i.status, COALESCE((SELECT SUM(CAST(l.amount AS NUMERIC)) FROM invoice_lines l JOIN items it ON it.id = l.item_id
+                WHERE l.invoice_id = i.id AND it.type = 'payment'), 0) AS paid
+              FROM invoices i WHERE i.id = ${h.id}::uuid AND i.company_id = ${ctx.companyId}::uuid`,
+        );
+        if (inv && (inv.status === 'void' || inv.status === 'draft' || !dec(inv.paid).greaterThan(0))) {
+          flag(
+            key,
+            `Your ${L.doc(h.id)} ${inv.status === 'void' ? 'has been voided' : inv.status === 'draft' ? 'is pending' : 'no longer records a payment'} in your file, so the payment on it is no longer in Undeposited Funds and your accountant's deposit can't hold it. ` +
+              `To import: ask your accountant to take it out of this deposit — or ${inv.status === 'void' ? 'enter the invoice and its payment again' : 'record the payment on the invoice again'}, then import these changes.`,
+          );
+          break;
+        }
+      }
       const rows = (
         await q(
           ctx,
@@ -817,7 +870,7 @@ export async function clientWorkConflicts(
       const r = rows[0];
       flag(
         key,
-        `Your ${L.doc(h.id)} is already in your deposit of ${money(dec(r.total))} on ${day(r.date)} to ${L.account(r.deposit_account_id)}, so your accountant's deposit can't hold it too. ` +
+        `Your ${h.invoice ? `payment on ${L.doc(h.id)}` : L.doc(h.id)} is already in your deposit of ${money(dec(r.total))} on ${day(r.date)} to ${L.account(r.deposit_account_id)}, so your accountant's deposit can't hold it too. ` +
           `To import: remove it from your deposit (or void that deposit), import these changes, then deposit anything still waiting in Undeposited Funds — or ask your accountant to take it out of this deposit.`,
       );
       break;

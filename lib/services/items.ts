@@ -355,6 +355,50 @@ async function assertInventoryTypeChangeAllowed(
 }
 
 /**
+ * An inventory item's asset account can only change while it holds no stock value: the value of
+ * its stock was debited to the current account, and every later COGS / adjustment credits the
+ * new one — the old account would keep value the item no longer carries and the new one would
+ * go negative. (Stock = quantity on hand or FIFO layers with quantity remaining.)
+ */
+async function assertAssetAccountChangeAllowed(
+  ctx: ServiceContext,
+  item: { id: string; name: string; type: string; quantityOnHand: string | null; assetAccountId: string | null },
+  newAssetAccountId: string | null,
+): Promise<void> {
+  if (item.type !== 'inventory') return;
+  // A null asset account means the 1300 fallback used by every posting path.
+  const effective = async (accountId: string | null) => {
+    if (accountId) return accountId;
+    const [row] = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300')));
+    return row?.id ?? null;
+  };
+  if ((await effective(item.assetAccountId)) === (await effective(newAssetAccountId))) return;
+  const hasStock = !Money.of(item.quantityOnHand ?? '0').isZero();
+  const [layer] = hasStock
+    ? [undefined]
+    : await ctx.db
+        .select({ id: inventoryLayers.id })
+        .from(inventoryLayers)
+        .where(
+          and(
+            eq(inventoryLayers.companyId, ctx.companyId),
+            eq(inventoryLayers.itemId, item.id),
+            sql`${inventoryLayers.quantityRemaining} <> 0`,
+          ),
+        )
+        .limit(1);
+  if (hasStock || layer) {
+    throw validation(
+      `"${item.name}" has stock on hand, so its inventory asset account cannot change. ` +
+        'Adjust its quantity to zero first, or create a new item that uses the other account.',
+    );
+  }
+}
+
+/**
  * Patch an existing item. Only supplied fields are changed. Validates name
  * uniqueness (if being changed) and account-link types.
  */
@@ -364,6 +408,9 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
   if (patch.type !== undefined && patch.type !== before.type) await assertItemTypeAllowed(ctx, patch.type);
   if (patch.type !== undefined && patch.type !== before.type && before.type === 'inventory') {
     await assertInventoryTypeChangeAllowed(ctx, before);
+  }
+  if (patch.assetAccountId !== undefined && patch.assetAccountId !== before.assetAccountId) {
+    await assertAssetAccountChangeAllowed(ctx, before, patch.assetAccountId);
   }
 
   // ── Name validation ──────────────────────────────────────────────────────

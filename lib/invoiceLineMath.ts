@@ -1,7 +1,8 @@
 /**
  * Live line amounts for the invoice form (app/invoices/page.tsx computeTotals), Decimal-safe and
  * rounded the way lib/services/invoices.ts rounds them: quantity and rate at 4 decimals, each
- * line amount = round2(qty × rate) (half-up), a %-discount line = round2(running body × % / 100).
+ * line amount = round2(qty × rate) (half-up), a %-discount line = round2(running body × % / 100)
+ * — or, directly under a Subtotal item, round2(that subtotal × % / 100).
  *
  * The %-discount amount is SENT to the server as the line's flat rate, so it must be exact: the
  * float version (`-(running * pct / 100)).toFixed(2)`) saved 15% of 10.10 as -1.51, not -1.52.
@@ -49,20 +50,26 @@ export function liveLineTotals(lines: LiveLineInput[]): LiveLineTotals {
   let payments = Money.zero();
   let manualTax = Money.zero();
   let running = Money.zero();
+  // QB: a discount placed directly under a Subtotal item discounts that subtotal. The subtotal
+  // resets the running group, so remember its amount for an immediately following %-discount.
+  let subtotalAbove: Decimal | null = null;
   const amounts: Decimal[] = [];
 
   for (const l of lines) {
     if (l.kind === 'subtotal') {
       amounts.push(running);
+      subtotalAbove = running;
       running = Money.zero();
       continue;
     }
+    const pctBase = subtotalAbove ?? running;
+    subtotalAbove = null;
     const qty = typedNumber(l.quantity).toDecimalPlaces(4);
     const rate = typedNumber(l.rate).toDecimalPlaces(4);
     let amt: Decimal;
     if (l.kind === 'discount') {
       amt = l.discountPercent
-        ? Money.round2(running.times(rate.abs()).dividedBy(100)).negated()
+        ? Money.round2(pctBase.times(rate.abs()).dividedBy(100)).negated()
         : Money.round2((qty.isZero() ? new Decimal(1) : qty).times(rate)).abs().negated();
     } else {
       amt = Money.round2(qty.times(rate));

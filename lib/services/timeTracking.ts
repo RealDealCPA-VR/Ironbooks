@@ -324,15 +324,23 @@ export async function billTimeToInvoice(
       date: new Date(),
       lines,
     });
-    await tx.db
+    // Re-check "still unbilled" in the UPDATE and count the rows: the entries were read before
+    // this transaction, so a concurrent biller may have invoiced them since. Any shortfall rolls
+    // back this invoice instead of billing the same hours twice.
+    const stamped = await tx.db
       .update(timeEntries)
       .set({ invoicedInvoiceId: invoice.id })
       .where(
         and(
           eq(timeEntries.companyId, ctx.companyId),
           inArray(timeEntries.id, entries.map((e) => e.id)),
+          isNull(timeEntries.invoicedInvoiceId),
         ),
-      );
+      )
+      .returning({ id: timeEntries.id });
+    if (stamped.length !== entries.length) {
+      throw new ServiceError('CONFLICT', 'One or more time entries were already invoiced.');
+    }
     return invoice;
   });
 }

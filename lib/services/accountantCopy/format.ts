@@ -128,6 +128,11 @@ export interface DepositPayload {
   total: string;
   paymentIds: string[];
   salesReceiptIds: string[];
+  /**
+   * Invoices whose payment-item lines (money recorded on the invoice itself, in Undeposited
+   * Funds) the deposit holds. Optional: older files have none, and it is left out when empty.
+   */
+  invoicePaymentIds?: string[];
   extraLines: Array<{ accountId: string; amount: string; description: string | null }>;
   cashBack: { accountId: string; amount: string; memo: string | null } | null;
 }
@@ -455,6 +460,7 @@ function transferOk(a: unknown): boolean {
 function depositOk(a: unknown): boolean {
   if (!isObj(a) || !isDate(a.date) || !isId(a.depositAccountId) || !optStr(a.memo) || !optDec(a.exchangeRate) || !isDec(a.total)) return false;
   if (!idList(a.paymentIds) || !idList(a.salesReceiptIds) || !Array.isArray(a.extraLines)) return false;
+  if (a.invoicePaymentIds !== undefined && !idList(a.invoicePaymentIds)) return false;
   if (!a.extraLines.every((l) => isObj(l) && isId(l.accountId) && isDec(l.amount) && optStr(l.description))) return false;
   const cb = a.cashBack;
   return cb === null || cb === undefined || (isObj(cb) && isId(cb.accountId) && isDec(cb.amount) && optStr(cb.memo));

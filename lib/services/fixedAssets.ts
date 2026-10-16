@@ -299,7 +299,17 @@ export async function postDepreciation(ctx: ServiceContext, input: PostDepreciat
 
   // Clamp to remaining depreciable amount to avoid over-depreciation.
   const remaining = depreciableBase.minus(alreadyAccumulated);
-  const periodAmount = monthlyAmount.greaterThan(remaining) ? Money.round2(remaining) : monthlyAmount;
+  // The asset's last useful-life period takes whatever remains (as depreciationSchedule does), so
+  // a rounded-down monthly amount never leaves a cent to depreciate after the useful life ends.
+  const postedPeriods = (
+    await ctx.db
+      .select({ id: depreciationEntries.id })
+      .from(depreciationEntries)
+      .where(and(eq(depreciationEntries.companyId, ctx.companyId), eq(depreciationEntries.fixedAssetId, assetId)))
+  ).length;
+  const isLastPeriod = postedPeriods + 1 >= asset.usefulLifeMonths;
+  const periodAmount =
+    isLastPeriod || monthlyAmount.greaterThan(remaining) ? Money.round2(remaining) : monthlyAmount;
 
   // Resolve GL accounts (use overrides if the asset has them; otherwise get-or-create defaults).
   const depExpenseAccountId =

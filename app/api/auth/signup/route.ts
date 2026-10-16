@@ -22,10 +22,25 @@ import { invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
 import { getPasswordPolicy } from '@/lib/services/passwordPolicy';
 import { passwordProblemMessage, passwordProblems } from '@/lib/passwordPolicy';
 import { getFileLockStatus } from '@/lib/services/fileLock';
-import { COMPANY_COOKIE } from '@/lib/context';
+import { COMPANY_COOKIE, isLoopbackHostHeader } from '@/lib/context';
 import { logTransaction } from '@/lib/services/transactionLog';
 import { startSession } from '@/lib/services/sessions';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
+
+/**
+ * True when the browser sent no Origin (same-origin navigation / non-browser clients) or an
+ * Origin whose host matches the request's Host header. A cross-site page posting to
+ * 127.0.0.1 sends its own Origin.
+ */
+function isSameOriginOrNone(req: NextRequest): boolean {
+  const origin = req.headers.get('origin');
+  if (origin === null) return true;
+  try {
+    return new URL(origin).host.toLowerCase() === (req.headers.get('host') ?? '').toLowerCase();
+  } catch {
+    return false;
+  }
+}
 
 export async function POST(req: NextRequest) {
   const body = await readJsonObject(req);
@@ -46,6 +61,15 @@ export async function POST(req: NextRequest) {
   // hosted company file (not even the first account — that would let a tailnet peer claim a
   // file whose owner works without sign-in). An admin adds them under Users instead.
   const origin = originFromHeaders(req.headers);
+  // DNS-rebinding / CSRF guard (same rule as the session-less fallback in lib/context.ts): the
+  // first account owns the file, so only a request addressed to a loopback host, and not sent
+  // by a page from another site, may create it.
+  if (!isLoopbackHostHeader(req.headers.get('host')) || !isSameOriginOrNone(req)) {
+    return NextResponse.json(
+      { error: 'Open Ironbooks on this computer to create the first account.', code: 'FORBIDDEN' },
+      { status: 403 },
+    );
+  }
   if (origin.remote) {
     return NextResponse.json(
       { error: 'Ask an administrator of this company file to add you as a user.', code: 'FORBIDDEN' },

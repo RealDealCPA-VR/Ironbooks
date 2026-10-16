@@ -67,6 +67,8 @@ export async function renameCompany(
 
   const { company, access } = await getAccessInCompany(db, userId, companyId);
   if (!can(access, 'company', 'modify')) throw permissionDenied('company', 'modify');
+  // Archived files are hidden from the companies page and can't be opened; don't edit them either.
+  if (isArchived(company.settings)) throw notFound('company');
 
   const [updated] = await db
     .update(companies)

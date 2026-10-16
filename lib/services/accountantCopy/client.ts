@@ -31,6 +31,8 @@ import {
   employees,
   expenses,
   inventoryLayers,
+  invoiceLines,
+  invoices,
   items as itemsTable,
   journalEntries,
   journalEntryLines,
@@ -50,7 +52,7 @@ import { createClass } from '../dimensions';
 import { createExpense, getExpense, updateExpense, voidExpense, type CreateExpenseInput, type ExpenseMethod } from '../expenses';
 import { createManualEntry, updateEntry, voidEntry } from '../journal';
 import { createTransfer, updateTransfer, voidTransfer, type CreateTransferInput } from '../transfers';
-import { createDeposit, updateDeposit, voidDeposit, getDeposit, CASHBACK_LINE_PREFIX, RECEIPT_LINE_PREFIX, type CreateDepositInput } from '../deposits';
+import { createDeposit, updateDeposit, voidDeposit, getDeposit, CASHBACK_LINE_PREFIX, INVOICE_PAYMENT_LINE_PREFIX, RECEIPT_LINE_PREFIX, type CreateDepositInput } from '../deposits';
 import type { PostingLine } from '../posting';
 import { currentVersion, withVersionCheck, type VersionedEntity } from '../concurrency';
 import { createPortableCompanyFile } from '../portableFile';
@@ -379,6 +381,7 @@ async function nameMaps(ctx: ServiceContext, file: ChangesFile): Promise<NameMap
   const ids = new Set<string>();
   const payIds = new Set<string>();
   const srIds = new Set<string>();
+  const invPayIds = new Set<string>();
   for (const t of file.transactions) {
     if (t.op === 'void') continue;
     if (t.type === 'journal_entry') for (const l of t.after.lines) if (l.entityId) ids.add(l.entityId);
@@ -386,9 +389,14 @@ async function nameMaps(ctx: ServiceContext, file: ChangesFile): Promise<NameMap
     if (t.type === 'deposit') {
       for (const id of t.after.paymentIds) payIds.add(id);
       for (const id of t.after.salesReceiptIds) srIds.add(id);
+      for (const id of t.after.invoicePaymentIds ?? []) invPayIds.add(id);
     }
   }
-  const fileDocs = (file.documents ?? []).filter((d) => d.op === 'add' && (d.type === 'payment_received' || d.type === 'sales_receipt'));
+  const fileDocs = (file.documents ?? []).filter(
+    (d) =>
+      d.op === 'add' &&
+      (d.type === 'payment_received' || d.type === 'sales_receipt' || (d.type === 'invoice' && invPayIds.has(d.id))),
+  );
   for (const d of fileDocs) if (d.op === 'add' && typeof d.after.customerId === 'string') ids.add(d.after.customerId);
   const docs = new Map<string, string>();
   const docCustomers: Array<[string, string | null, string]> = [];
@@ -410,6 +418,25 @@ async function nameMaps(ctx: ServiceContext, file: ChangesFile): Promise<NameMap
       if (r.customerId) ids.add(r.customerId);
     }
   }
+  if (invPayIds.size) {
+    // Invoice payment-item lines: the money recorded on the invoice itself (its payment items).
+    for (const r of await ctx.db
+      .select({
+        id: invoices.id,
+        customerId: invoices.customerId,
+        n: invoices.invoiceNumber,
+        ref: invoices.refNumber,
+        paid: sql<string>`COALESCE(SUM(CASE WHEN ${itemsTable.type} = 'payment' THEN CAST(${invoiceLines.amount} AS NUMERIC) ELSE 0 END), 0)`,
+      })
+      .from(invoices)
+      .leftJoin(invoiceLines, eq(invoiceLines.invoiceId, invoices.id))
+      .leftJoin(itemsTable, eq(itemsTable.id, invoiceLines.itemId))
+      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, [...invPayIds])))
+      .groupBy(invoices.id)) {
+      docCustomers.push([r.id, r.customerId, `Payment on invoice #${r.ref ?? r.n} — ${formatCurrency(toAmountString(r.paid))}`]);
+      ids.add(r.customerId);
+    }
+  }
   if (ids.size) {
     const list = [...ids];
     for (const r of await ctx.db.select({ id: customers.id, n: customers.displayName }).from(customers).where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, list)))) names.set(r.id, r.n);
@@ -429,7 +456,9 @@ async function nameMaps(ctx: ServiceContext, file: ChangesFile): Promise<NameMap
       d.id,
       d.type === 'payment_received'
         ? `New payment${d.after.reference ? ` #${d.after.reference}` : ''} — ${formatCurrency(String(d.after.amount))}${who} (in these changes)`
-        : `New sales receipt${d.after.refNumber ? ` #${d.after.refNumber}` : ''} — ${formatCurrency(String(d.after.total))}${who} (in these changes)`,
+        : d.type === 'invoice'
+          ? `Payment on new invoice${d.after.refNumber ? ` #${d.after.refNumber}` : ''}${who} (in these changes)`
+          : `New sales receipt${d.after.refNumber ? ` #${d.after.refNumber}` : ''} — ${formatCurrency(String(d.after.total))}${who} (in these changes)`,
     );
   }
   return { accounts: accts, classes: cls, names, docs };
@@ -519,7 +548,7 @@ function transferText(m: NameMaps, p: TransferPayload): string[] {
 function depositText(m: NameMaps, p: DepositPayload): string[] {
   return [
     `Deposit to ${acctLabel(m, p.depositAccountId)}`,
-    ...[...p.paymentIds, ...p.salesReceiptIds].map((id) => m.docs.get(id) ?? 'A payment that is not in your file'),
+    ...depositHeldIds(p).map((id) => m.docs.get(id) ?? 'A payment that is not in your file'),
     ...p.extraLines.map((l) => `${acctLabel(m, l.accountId)} — ${formatCurrency(l.amount)}${l.description ? ` (${l.description})` : ''}`),
     ...(p.cashBack ? [`Cash back to ${acctLabel(m, p.cashBack.accountId)} — ${formatCurrency(p.cashBack.amount)}`] : []),
     ...(p.memo ? [`Memo: ${p.memo}`] : []),
@@ -545,12 +574,15 @@ export async function depositPayloadOf(ctx: ServiceContext, id: string): Promise
   const dep = await getDeposit(ctx, id);
   const paymentIds: string[] = [];
   const salesReceiptIds: string[] = [];
+  const invoicePaymentIds: string[] = [];
   const extraLines: DepositPayload['extraLines'] = [];
   let cashBack: DepositPayload['cashBack'] = null;
   for (const l of dep.lines) {
     const desc = l.description ?? '';
     if (l.paymentId) paymentIds.push(l.paymentId);
     else if (desc.startsWith(RECEIPT_LINE_PREFIX)) salesReceiptIds.push(desc.slice(RECEIPT_LINE_PREFIX.length));
+    // Invoice payment-item lines (no account on the row): carried so the deposit is rebuilt whole.
+    else if (desc.startsWith(INVOICE_PAYMENT_LINE_PREFIX)) invoicePaymentIds.push(desc.slice(INVOICE_PAYMENT_LINE_PREFIX.length));
     else if (desc.startsWith(CASHBACK_LINE_PREFIX)) {
       cashBack = { accountId: desc.slice(CASHBACK_LINE_PREFIX.length), amount: toAmountString(Money.abs(l.amount)), memo: null };
     } else if (l.accountId) {
@@ -573,9 +605,16 @@ export async function depositPayloadOf(ctx: ServiceContext, id: string): Promise
     total: toAmountString(dep.total),
     paymentIds,
     salesReceiptIds,
+    // Optional on the wire (older files have none); only present when the deposit holds some.
+    ...(invoicePaymentIds.length ? { invoicePaymentIds } : {}),
     extraLines,
     cashBack,
   };
+}
+
+/** Everything a deposit payload holds from Undeposited Funds (payments, receipts, invoice payments). */
+export function depositHeldIds(p: DepositPayload): string[] {
+  return [...p.paymentIds, ...p.salesReceiptIds, ...(p.invoicePaymentIds ?? [])];
 }
 
 async function currentTransfer(ctx: ServiceContext, m: NameMaps, id: string) {
@@ -588,7 +627,7 @@ async function currentDeposit(ctx: ServiceContext, m: NameMaps, id: string) {
   const [x] = await ctx.db.select().from(deposits).where(and(eq(deposits.id, id), eq(deposits.companyId, ctx.companyId)));
   if (!x) return null;
   const p = await depositPayloadOf(ctx, id);
-  if ([...p.paymentIds, ...p.salesReceiptIds].some((d) => !m.docs.has(d))) {
+  if (depositHeldIds(p).some((d) => !m.docs.has(d))) {
     // Label the payments this deposit holds now (the file only names those of the accountant's version).
     const now = await nameMaps(ctx, { accounts: [], classes: [], transactions: [{ op: 'add', type: 'deposit', id, after: p }] } as unknown as ChangesFile);
     for (const [k, v] of now.docs) m.docs.set(k, v);
@@ -1120,7 +1159,7 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         else if (!sameVersion(cur.row.updatedAt, t.baseVersion)) problem = changedElsewhere;
         if (cur) touchesClosed(cur.row.date.toISOString());
       }
-      if (!problem && t.op !== 'void' && [...t.after.paymentIds, ...t.after.salesReceiptIds].some((x) => !m.docs.has(x))) {
+      if (!problem && t.op !== 'void' && depositHeldIds(t.after).some((x) => !m.docs.has(x))) {
         problem = 'This deposit holds a payment or sales receipt that is not in your file.';
       }
       const kindTitle = t.op === 'add' ? 'New deposit' : t.op === 'edit' ? 'Changed deposit' : 'Voided deposit';
@@ -1783,6 +1822,7 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
           exchangeRate: p.exchangeRate,
           paymentIds: p.paymentIds.map((x) => mapId(x)),
           salesReceiptIds: p.salesReceiptIds.map((x) => mapId(x)),
+          invoicePaymentIds: (p.invoicePaymentIds ?? []).map((x) => mapId(x)),
           extraLines: p.extraLines.map((l) => ({ accountId: mapId(l.accountId), amount: l.amount, description: l.description })),
           cashBack: p.cashBack ? { accountId: mapId(p.cashBack.accountId), amount: p.cashBack.amount, memo: p.cashBack.memo } : null,
         };

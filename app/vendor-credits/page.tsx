@@ -287,7 +287,9 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
         if (field === 'itemId' || field === 'quantity' || field === 'unitCost') {
           const q = parseFloat(next.quantity);
           const c = parseFloat(next.unitCost);
-          if (!isNaN(q) && !isNaN(c)) next.amount = (Math.round(q * c * 100) / 100).toFixed(2);
+          // Decimal, half-up like the server (round2(qty × cost)); the float version saved
+          // 1 × 1.005 as 1.00, not 1.01.
+          if (Number.isFinite(q) && Number.isFinite(c)) next.amount = Money.round2(Money.mul(q, c)).toFixed(2);
         }
         return next;
       }),

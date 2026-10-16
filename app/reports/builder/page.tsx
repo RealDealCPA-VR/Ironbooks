@@ -26,6 +26,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import type { ReportConfig, ReportResult } from '@/lib/services/reportBuilder';
+import { csvMinimal } from '@/lib/csv';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -46,11 +47,9 @@ type AccountType = (typeof ACCOUNT_TYPES)[number];
 // CSV helpers
 // ---------------------------------------------------------------------------
 
+/** Formula-safe CSV cell (lib/csv.ts). */
 function csvCell(val: string | number | null | undefined): string {
-  const s = String(val ?? '');
-  return s.includes(',') || s.includes('"') || s.includes('\n')
-    ? `"${s.replace(/"/g, '""')}"`
-    : s;
+  return csvMinimal(val);
 }
 
 function buildCsv(result: ReportResult): string {

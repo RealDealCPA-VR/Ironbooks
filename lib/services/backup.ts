@@ -64,6 +64,7 @@ import {
   salesTaxCodes, shipViaMethods, todoItems, todos, uomSetUnits, uomSets, vehicles, vendorTypes,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
+import { cloneAttachmentFileForRestore } from './attachments';
 import { allowLedgerRewrite } from './posting';
 import { logTransaction, resetTransactionLogCache } from './transactionLog';
 import { BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE, recordBackup } from './backupHistory';
@@ -1134,6 +1135,32 @@ export async function restoreCompanyBackup(
   const clash = await db.select({ id: companies.id }).from(companies).where(eq(companies.name, name));
   if (clash.length) name = `${name} (Restored ${new Date().toISOString().slice(0, 10)})`;
 
+  // Attachment files copied for the restored company (removed again if the restore fails).
+  const copiedFiles: string[] = [];
+  const attachmentsDataDir = resolveDataDir();
+  try {
+    return await restoreCompanyRows(db, data, idMap, name, opts, attachmentsDataDir, copiedFiles);
+  } catch (err) {
+    for (const f of copiedFiles) {
+      try {
+        fs.rmSync(f, { force: true });
+      } catch {
+        /* a leftover copy is harmless */
+      }
+    }
+    throw err;
+  }
+}
+
+async function restoreCompanyRows(
+  db: DB,
+  data: CompanyExportData,
+  idMap: Map<string, string>,
+  name: string,
+  opts: { ownerId: string; name?: string },
+  attachmentsDataDir: string,
+  copiedFiles: string[],
+): Promise<RestoreCompanyResult> {
   return db.transaction(async (tx) => {
     // Re-inserting a backup's posted ledger is a sanctioned rewrite (lines are added to
     // entries that were not created "now"). Every restored posted entry is still verified
@@ -1160,6 +1187,16 @@ export async function restoreCompanyBackup(
       // Cached balances are never restored verbatim: accounts start at zero and the DB
       // balance triggers rebuild them from the restored posted journal lines.
       if (spec.name === 'accounts') for (const r of revived) r.balance = '0.00';
+      // Attachments: the stored path must stay inside the attachments folder, and the restored
+      // company gets its own copy of every file present here (never a file shared with the
+      // company it was backed up from, which deleting a document in either would destroy).
+      if (spec.name === 'attachments') {
+        for (const r of revived) {
+          const cloned = cloneAttachmentFileForRestore(attachmentsDataDir, String(r.storagePath ?? ''));
+          if (cloned.createdPath) copiedFiles.push(cloned.createdPath);
+          r.storagePath = cloned.storagePath;
+        }
+      }
       // Chunked inserts keep parameter counts well under PG limits.
       for (let i = 0; i < revived.length; i += 200) {
         await tx.insert(spec.table).values(revived.slice(i, i + 200) as never);

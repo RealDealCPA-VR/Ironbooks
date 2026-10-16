@@ -8,7 +8,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { asc } from 'drizzle-orm';
-import { getServerContext } from '@/lib/context';
+import { getServerContext, isArchivedCompany } from '@/lib/context';
 import { getDb } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import { runDue, runGroup, runTemplateNow } from '@/lib/services/recurring';
@@ -23,7 +23,7 @@ import { runRecurringSchema } from '@/lib/validation/recurring';
  * is bound to 127.0.0.1 and the token never leaves the machine, so this does not reopen the
  * unauthenticated-impersonation hole closed in lib/context.ts.
  */
-async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
+async function internalContexts(req: NextRequest): Promise<ServiceContext[] | null> {
   const token = process.env.BKA_INTERNAL_TOKEN;
   const header = req.headers.get('x-bka-internal');
   if (!token || !header) return null;
@@ -31,13 +31,34 @@ async function internalContext(req: NextRequest): Promise<ServiceContext | null>
   const b = Buffer.from(token);
   if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
   const db = await getDb();
-  const [company] = await db
-    .select({ id: companies.id, ownerId: companies.ownerId })
+  const rows = await db
+    .select({ id: companies.id, ownerId: companies.ownerId, settings: companies.settings })
     .from(companies)
-    .orderBy(asc(companies.createdAt))
-    .limit(1);
-  if (!company) return null;
-  return { db, companyId: company.id, userId: company.ownerId };
+    .orderBy(asc(companies.createdAt), asc(companies.id));
+  // One context per company in the file (oldest first), each acting as that company's owner.
+  // Archived (soft-deleted) companies no longer enter memorized transactions — same rule as
+  // the scheduled-reports timer (app/api/report-schedules/_internal.ts internalContexts).
+  return rows
+    .filter((c) => !isArchivedCompany(c.settings))
+    .map((c) => ({ db, companyId: c.id, userId: c.ownerId }));
+}
+
+type DueResult = Awaited<ReturnType<typeof runDue>>;
+
+/** Trusted timer: run every due template in EVERY non-archived company; one failure never stops the rest. */
+async function runDueForCompanies(ctxs: ServiceContext[], asOf: Date | undefined): Promise<DueResult> {
+  const out: DueResult = { generated: [], reminders: [], failed: [] };
+  for (const ctx of ctxs) {
+    try {
+      const r = await runDue(ctx, asOf);
+      out.generated.push(...r.generated);
+      out.reminders.push(...r.reminders);
+      out.failed.push(...r.failed);
+    } catch (err) {
+      console.error(`[recurring/run] company ${ctx.companyId} failed:`, err);
+    }
+  }
+  return out;
 }
 
 function errorResponse(err: unknown) {
@@ -62,12 +83,23 @@ function errorResponse(err: unknown) {
 
 export async function POST(req: NextRequest) {
   try {
-    const ctx = (await internalContext(req)) ?? (await getServerContext());
+    const internal = await internalContexts(req);
     const body = await req.json().catch(() => ({}));
     const parsed = runRecurringSchema.safeParse(body);
     if (!parsed.success) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
+    if (internal) {
+      // The desktop shell's launch-time / hourly run: due templates only, across every company.
+      if (parsed.data.id || parsed.data.group) {
+        return NextResponse.json(
+          { error: 'The internal run only enters due templates.', code: 'VALIDATION' },
+          { status: 400 },
+        );
+      }
+      return NextResponse.json(await runDueForCompanies(internal, parsed.data.asOf ?? undefined));
+    }
+    const ctx = await getServerContext();
 
     // If an explicit template id is provided, run just that one immediately.
     if (parsed.data.id) {

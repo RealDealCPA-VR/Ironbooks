@@ -18,6 +18,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money, toAmountString } from '@/lib/money';
+import { csvQuoted } from '@/lib/csv';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -74,7 +75,7 @@ function downloadCsv(rows: WorksheetRow[], year: number) {
     'NEC Required',
     'MISC Required',
   ];
-  const escape = (v: string) => `"${v.replace(/"/g, '""')}"`;
+  const escape = (v: string) => csvQuoted(v); // formula-safe (lib/csv.ts)
 
   const lines = [
     `"1099 Worksheet — Calendar Year ${year}"`,

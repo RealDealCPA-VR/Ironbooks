@@ -23,7 +23,7 @@
  */
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
-import { accounts, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
+import { accounts, auditLogs, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { createBill } from '@/lib/services/bills';
 import {
@@ -698,6 +698,82 @@ export async function convertToBill(
 
     return bill;
   });
+}
+
+/**
+ * A bill converted from a purchase order is being voided (call INSIDE voidBill's transaction):
+ * give the PO lines back the quantities that bill claimed, so the PO can be billed again (QB
+ * reopens the PO). The claim is read from convertToBill's audit row ({ billId, billedQuantities }),
+ * which is written in the same transaction as the claim. A PO whose status the user set by hand
+ * (e.g. closed early) keeps it; otherwise the status is recomputed from the lines.
+ */
+export async function releasePoBillingForBill(ctx: ServiceContext, billId: string): Promise<void> {
+  const rows = await ctx.db
+    .select({ entityId: auditLogs.entityId, newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'purchase_order'),
+        sql`${auditLogs.newValues}->>'billId' = ${billId}`,
+        sql`${auditLogs.newValues}->'billedQuantities' IS NOT NULL`,
+      ),
+    );
+  for (const row of rows) {
+    const poId = row.entityId;
+    const nv = (row.newValues ?? {}) as { billedQuantities?: Array<{ lineId?: string; quantity?: string }> };
+    const claims = (nv.billedQuantities ?? []).filter((c) => c.lineId && Money.of(c.quantity ?? 0).greaterThan(0));
+    if (!poId || claims.length === 0) continue;
+    const [po] = await ctx.db
+      .select()
+      .from(purchaseOrders)
+      .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
+    if (!po || po.status === 'void') continue;
+
+    const { enhancedReceiving } = await getReceivingSettings(ctx);
+    const linesNow = async () =>
+      ctx.db
+        .select({
+          quantity: purchaseOrderLines.quantity,
+          quantityBilled: purchaseOrderLines.quantityBilled,
+          quantityReceivedUnbilled: purchaseOrderLines.quantityReceivedUnbilled,
+        })
+        .from(purchaseOrderLines)
+        .where(eq(purchaseOrderLines.purchaseOrderId, poId));
+    // Status the lines imply before the release; a different stored status was set by hand.
+    const derivedBefore = poStatusFromLines(await linesNow(), enhancedReceiving);
+
+    for (const c of claims) {
+      const qtyStr = Money.of(c.quantity!).toFixed(4);
+      await ctx.db
+        .update(purchaseOrderLines)
+        .set({ quantityBilled: sql`GREATEST(${purchaseOrderLines.quantityBilled} - ${qtyStr}::numeric, 0)` })
+        .where(and(eq(purchaseOrderLines.id, c.lineId!), eq(purchaseOrderLines.purchaseOrderId, poId)));
+    }
+
+    const derivedAfter = poStatusFromLines(await linesNow(), enhancedReceiving);
+    const keepManualStatus = po.status !== derivedBefore;
+    const newStatus = keepManualStatus ? po.status : derivedAfter;
+    await ctx.db
+      .update(purchaseOrders)
+      .set({
+        status: newStatus as never,
+        ...(po.convertedBillId === billId ? { convertedBillId: null } : {}),
+      })
+      .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'purchase_order',
+      entityId: poId,
+      oldValues: { status: po.status },
+      newValues: {
+        status: newStatus,
+        reason: 'bill_voided',
+        voidedBillId: billId,
+        releasedQuantities: claims.map((c) => ({ lineId: c.lineId, quantity: Money.of(c.quantity!).toFixed(4) })),
+      },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@
  *  - name is required and non-empty.
  *  - Deactivation is soft-delete (isActive = false).
  */
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, ne, notInArray, sql } from 'drizzle-orm';
 import {
   jobs,
   invoices,
@@ -25,6 +25,7 @@ import {
   expenses,
   expenseLines,
   customers,
+  items,
 } from '@/lib/db/schema';
 import { toAmountString, Money } from '@/lib/money';
 import {
@@ -218,6 +219,17 @@ export async function deactivateJob(ctx: ServiceContext, id: string) {
 // Profitability
 // ---------------------------------------------------------------------------
 
+/*
+ * Which documents count toward job revenue / cost — the same rules as the Job reports
+ * (lib/services/reportsJobsTime.ts): void and draft invoices, void bills and voided checks are
+ * not revenue or cost, and subtotal / payment / sales-tax item lines are not revenue. Needs
+ * `items` left-joined on the invoice line.
+ */
+const REVENUE_LINE_ONLY = sql`COALESCE(${items.type}::text, '') NOT IN ('subtotal', 'payment', 'sales_tax')`;
+const LIVE_INVOICE = notInArray(invoices.status, ['void', 'draft']);
+const LIVE_BILL = ne(bills.status, 'void');
+const LIVE_EXPENSE = isNull(expenses.voidedAt);
+
 /**
  * Compute per-job revenue (from invoiceLines), cost (from billLines + expenseLines),
  * and profit for a specific job. Returns a full line-item breakdown.
@@ -235,10 +247,13 @@ export async function jobProfitability(ctx: ServiceContext, jobId: string): Prom
     })
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
+    .leftJoin(items, and(eq(invoiceLines.itemId, items.id), eq(items.companyId, ctx.companyId)))
     .where(
       and(
         eq(invoices.companyId, ctx.companyId),
         eq(invoiceLines.jobId, jobId),
+        LIVE_INVOICE,
+        REVENUE_LINE_ONLY,
       ),
     );
 
@@ -255,6 +270,7 @@ export async function jobProfitability(ctx: ServiceContext, jobId: string): Prom
       and(
         eq(bills.companyId, ctx.companyId),
         eq(billLines.jobId, jobId),
+        LIVE_BILL,
       ),
     );
 
@@ -271,6 +287,7 @@ export async function jobProfitability(ctx: ServiceContext, jobId: string): Prom
       and(
         eq(expenses.companyId, ctx.companyId),
         eq(expenseLines.jobId, jobId),
+        LIVE_EXPENSE,
       ),
     );
 
@@ -357,10 +374,13 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
     })
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
+    .leftJoin(items, and(eq(invoiceLines.itemId, items.id), eq(items.companyId, ctx.companyId)))
     .where(
       and(
         eq(invoices.companyId, ctx.companyId),
         inArray(invoiceLines.jobId, jobIds),
+        LIVE_INVOICE,
+        REVENUE_LINE_ONLY,
       ),
     )
     .groupBy(invoiceLines.jobId);
@@ -377,6 +397,7 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
       and(
         eq(bills.companyId, ctx.companyId),
         inArray(billLines.jobId, jobIds),
+        LIVE_BILL,
       ),
     )
     .groupBy(billLines.jobId);
@@ -393,6 +414,7 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
       and(
         eq(expenses.companyId, ctx.companyId),
         inArray(expenseLines.jobId, jobIds),
+        LIVE_EXPENSE,
       ),
     )
     .groupBy(expenseLines.jobId);

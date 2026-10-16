@@ -205,6 +205,7 @@ export async function previewFinanceCharges(
       date: invoices.date,
       dueDate: invoices.dueDate,
       balanceDue: invoices.balanceDue,
+      exchangeRate: invoices.exchangeRate,
       displayName: customers.displayName,
     })
     .from(invoices)
@@ -243,9 +244,10 @@ export async function previewFinanceCharges(
     // Chargeable only once past the grace period; interest accrues from the due date.
     if (daysOverdue <= settings.graceDays) continue;
 
-    const charge = Money.round2(
-      Money.mul(Money.mul(Money.of(r.balanceDue), dailyRate), daysOverdue),
-    );
+    // balanceDue is in the invoice's own currency; the finance-charge invoice is in home
+    // currency, so the interest is charged on the balance's home value (balance x booked rate).
+    const homeBalance = Money.round2(Money.mul(Money.of(r.balanceDue), Money.of(r.exchangeRate ?? 1)));
+    const charge = Money.round2(Money.mul(Money.mul(homeBalance, dailyRate), daysOverdue));
     if (charge.lessThanOrEqualTo(0)) continue;
 
     let entry = byCustomer.get(r.customerId);
@@ -266,7 +268,7 @@ export async function previewFinanceCharges(
       invoiceNumber: r.invoiceNumber,
       refNumber: docRef(r.refNumber, r.invoiceNumber),
       dueDate: effDue.toISOString().slice(0, 10),
-      balanceDue: toAmountString(r.balanceDue),
+      balanceDue: toAmountString(homeBalance), // home currency, the base the charge is on
       daysOverdue,
       charge: toAmountString(charge),
     });

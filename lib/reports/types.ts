@@ -10,6 +10,7 @@
  * (QB "Collapse Rows"). Money cells are 2dp decimal strings (never floats); the viewer formats
  * them with the user's number-format preferences (lib/reports/format.ts).
  */
+import { csvQuoted } from '@/lib/csv';
 
 export type CellValue = string | number | null;
 
@@ -110,7 +111,8 @@ export function reportToTable(report: StdReport): {
 /** Build the CSV text for a report (title line, blank line, header, rows). */
 export function reportToCsv(report: StdReport): string {
   const t = reportToTable(report);
-  const esc = (v: CellValue) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  // Always quoted, formula-safe (lib/csv.ts).
+  const esc = (v: CellValue) => csvQuoted(v);
   const title = report.subtitle ? `${report.title} — ${report.subtitle}` : report.title;
   return [
     esc(title),
