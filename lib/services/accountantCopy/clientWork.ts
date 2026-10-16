@@ -19,7 +19,9 @@
  *    file voids or edits to let it go does not count);
  *  - a change that takes stock out — a void or edit of the bill / receipt / check that brought it
  *    in, a new or changed sale, a return — when the client has since sold or used that stock
- *    (each item's quantity on hand walked in the import's order).
+ *    (each item's quantity on hand walked in the import's order, and each site's, bin's,
+ *    serial number's and lot's as the services check them); a posting into a site or bin the
+ *    client has since made inactive; a serial number the client has since received again.
  *
  * clientWorkConflicts names each one in plain language — the client's own record and the way out —
  * keyed by the review item it belongs to. The review shows the text as that item's problem and the
@@ -32,6 +34,7 @@ import { expensePayload } from './accountant';
 import { depositPayloadOf } from './client';
 import { DOC_LABEL, DOC_ORDER, docPayload, type Labels } from './docs';
 import type { ApplicationChange, ChangesFile, DocChange, DocType, LineRef, TxnType } from './format';
+import { currentMoves, type Move, type Short, StockPlaces, versionMoves } from './stockPlaces';
 
 type Ctx = Pick<ServiceContext, 'db' | 'companyId'>;
 type Row = Record<string, unknown>;
@@ -843,36 +846,9 @@ const STOCK_SOURCE: Partial<Record<string, string>> = {
   expense: 'expense',
 };
 
-type StockDelta = Map<string, Dec>;
-
 const qtyText = (v: Dec) => v.toDecimalPlaces(4).toString();
 
-function addDelta(m: StockDelta, itemId: unknown, v: Dec) {
-  if (typeof itemId !== 'string' || !itemId || v.isZero()) return;
-  m.set(itemId, (m.get(itemId) ?? Money.zero()).plus(v));
-}
-
-/** What a version of a record (the file's payload) moves in (+) or out (-) of stock, per item. */
-function stockOf(type: string, p: Row): StockDelta {
-  const m: StockDelta = new Map();
-  const qty = (l: Row) => dec(l.quantity ?? '1').abs();
-  const lines = arr(p, 'lines');
-  if (type === 'invoice') {
-    if (p.status === 'draft') return m; // a pending invoice relieves no stock
-    for (const l of lines) addDelta(m, l.itemId, qty(l).negated());
-  } else if (type === 'sales_receipt' || type === 'vendor_credit') {
-    for (const l of lines) addDelta(m, l.itemId, qty(l).negated());
-  } else if (type === 'credit_memo') {
-    for (const l of lines) if (l.restock !== false) addDelta(m, l.itemId, qty(l));
-  } else if (type === 'bill' || type === 'item_receipt' || type === 'expense') {
-    for (const l of lines) addDelta(m, l.itemId, qty(l));
-  } else if (type === 'inventory_adjustment') {
-    addDelta(m, p.itemId, dec(p.quantityChange));
-  }
-  return m;
-}
-
-const negate = (m: StockDelta): StockDelta => new Map([...m].map(([k, v]) => [k, v.negated()]));
+const negate = (ms: Move[]): Move[] => ms.map((m) => ({ ...m, qty: m.qty.negated(), posting: false }));
 
 interface StockStep {
   key: string;
@@ -881,13 +857,15 @@ interface StockStep {
   /** The record, for "ask your accountant to change …": "this bill", "this new invoice". */
   subject: string;
   /** Applied one after another (an edit first takes the old version out, then puts the new one in). */
-  phases: StockDelta[];
+  phases: Move[][];
 }
 
 /**
- * Walk each inventory item's quantity on hand through the changes in the import's order (with its
- * retries): a change that would take out more than is on hand — because the client has sold or used
- * the stock since the dividing date — is named with those sales and the way out.
+ * Walk the stock through the changes in the import's order (with its retries): each item's total
+ * on hand and — as the services check them — each site's, bin's, serial number's and lot's. A
+ * change that would leave one short because the client has sold or used the stock since the
+ * dividing date (or that would receive a serial number the client has since received) is named
+ * with the client's own records and the way out.
  *
  * Stock out: a void of a bill / item receipt / check / restocking credit memo, an edit of one (its
  * old stock comes out before the new goes in), new or changed sales forms, returns on vendor credits
@@ -900,27 +878,12 @@ async function inventoryConflicts(
   L: Labels,
   flag: (key: string, text: string) => void,
 ): Promise<void> {
-  const onHand = new Map<string, Dec>();
-  for (const r of await q(ctx, sql`SELECT id, quantity_on_hand FROM items WHERE company_id = ${ctx.companyId}::uuid AND type = 'inventory'`)) {
-    onHand.set(String(r.id), dec(r.quantity_on_hand));
-  }
-  if (!onHand.size) return;
+  const places = await StockPlaces.load(ctx);
+  if (!places.items.size) return;
 
-  /** What the record moves in the client's file now (its stock movements not yet reversed). */
-  const currentStock = async (type: string, id: string): Promise<StockDelta> => {
-    const m: StockDelta = new Map();
+  const currentStock = (type: string, id: string): Promise<Move[]> => {
     const source = STOCK_SOURCE[type];
-    if (!source || !/^[0-9a-f-]{36}$/i.test(id)) return m;
-    for (const r of await q(
-      ctx,
-      sql`SELECT item_id, SUM(CAST(quantity AS NUMERIC)) AS qty FROM inventory_movements
-          WHERE company_id = ${ctx.companyId}::uuid AND source_type = ${source} AND source_id = ${id}::uuid
-            AND reversal_of_id IS NULL AND reversed_at IS NULL
-          GROUP BY item_id`,
-    )) {
-      addDelta(m, String(r.item_id), dec(r.qty));
-    }
-    return m;
+    return source ? currentMoves(ctx, source, id) : Promise.resolve([]);
   };
 
   const kindWord = (type: string) => (type === 'expense' ? TXN_WHAT.expense : docWhat(type as DocType));
@@ -953,7 +916,7 @@ async function inventoryConflicts(
       key: `${d.type}:edit:${d.id}`,
       what: `change to ${named(d.type, d.id)}`,
       subject: `this ${kindWord(d.type)}`,
-      phases: [negate(await currentStock(d.type, d.id)), stockOf(d.type, d.after)],
+      phases: [negate(await currentStock(d.type, d.id)), await versionMoves(ctx, d.type, d.after, places, { id: d.id })],
     });
   }
   // Checks / expenses changed: only one that re-posts moves stock.
@@ -965,7 +928,7 @@ async function inventoryConflicts(
       key: `expense:edit:${t.id}`,
       what: `change to ${named('expense', t.id)}`,
       subject: `this ${kindWord('expense')}`,
-      phases: [negate(await currentStock('expense', t.id)), stockOf('expense', after)],
+      phases: [negate(await currentStock('expense', t.id)), await versionMoves(ctx, 'expense', after, places, { id: t.id })],
     });
   }
   // New forms (quantity adjustments among them), then new checks.
@@ -974,38 +937,26 @@ async function inventoryConflicts(
     .sort((a, b) => docRank(a.type) - docRank(b.type) || byDate(a, b));
   for (const d of docAdds) {
     const w = d.type === 'inventory_adjustment' ? 'inventory adjustment' : kindWord(d.type);
-    steps.push({ key: `${d.type}:add:${d.id}`, what: `new ${w}`, subject: `this new ${w}`, phases: [stockOf(d.type, d.after)] });
+    steps.push({ key: `${d.type}:add:${d.id}`, what: `new ${w}`, subject: `this new ${w}`, phases: [await versionMoves(ctx, d.type, d.after, places, null)] });
   }
   const expenseAdds = file.transactions.filter((t): t is Extract<ChangesFile['transactions'][number], { op: 'add' }> => t.type === 'expense' && t.op === 'add').sort(byDate);
   for (const t of expenseAdds) {
-    steps.push({ key: `expense:add:${t.id}`, what: `new ${kindWord('expense')}`, subject: `this new ${kindWord('expense')}`, phases: [stockOf('expense', t.after as unknown as Row)] });
+    steps.push({ key: `expense:add:${t.id}`, what: `new ${kindWord('expense')}`, subject: `this new ${kindWord('expense')}`, phases: [await versionMoves(ctx, 'expense', t.after as unknown as Row, places, null)] });
   }
 
   // Run them as the import does: a refused change is retried after the others, until a pass makes
   // no progress.
-  type Short = { itemId: string; have: Dec; need: Dec };
   const short = new Map<StockStep, Short>();
-  let pending = steps.filter((s) => s.phases.some((ph) => [...ph.keys()].some((k) => onHand.has(k))));
+  let pending = steps.filter((s) => s.phases.some((ph) => ph.some((m) => places.isInventory(m.itemId))));
   while (pending.length) {
     const refused: StockStep[] = [];
     for (const s of pending) {
-      const trial = new Map<string, Dec>();
-      let bad: Short | null = null;
-      for (const ph of s.phases) {
-        for (const [itemId, delta] of ph) {
-          if (!onHand.has(itemId)) continue;
-          const have = trial.get(itemId) ?? onHand.get(itemId)!;
-          const next = have.plus(delta);
-          if (!bad && delta.lessThan(0) && next.lessThan(-0.00005)) bad = { itemId, have, need: delta.negated() };
-          trial.set(itemId, next);
-        }
-        if (bad) break;
-      }
+      const bad = places.tryPhases(s.phases);
       if (bad) {
         refused.push(s);
         short.set(s, bad);
       } else {
-        for (const [k, v] of trial) onHand.set(k, v);
+        places.commit();
         short.delete(s);
       }
     }
@@ -1016,35 +967,109 @@ async function inventoryConflicts(
   for (const s of pending) {
     const b = short.get(s);
     if (!b) continue;
-    const uses = await laterStockUses(ctx, copy.dividingDate, b.itemId, L);
-    if (!uses.length) continue;
-    const item = L.item(b.itemId);
-    const shown = uses.length > 4 ? [...uses.slice(0, 4), `${uses.length - 4} more`] : uses;
-    const have = b.have.greaterThan(0) ? b.have : Money.zero();
-    flag(
-      s.key,
-      `Since the dividing date your file has sold or used "${item}": ${joinList(shown)}. So only ${qtyText(have)} of "${item}" ${have.equals(1) ? 'is' : 'are'} on hand, ` +
-        `and your accountant's ${s.what} would take ${qtyText(b.need)} out of stock. ` +
-        `To import: undo or change those sales or uses (void or edit them), import these changes, then enter them again — or ask your accountant to change ${s.subject}.`,
-    );
+    const text = await shortText(ctx, copy.dividingDate, places, L, s, b);
+    if (text) flag(s.key, text);
   }
 }
 
-/** The client's own sales and uses of an item dated after the dividing date (from its stock movements). */
-async function laterStockUses(ctx: Ctx, dividingDate: string, itemId: string, L: Labels): Promise<string[]> {
+/** The plain-language problem of a refused stock change (null when the client's own work is not why). */
+async function shortText(ctx: Ctx, dividingDate: string, places: StockPlaces, L: Labels, s: StockStep, b: Short): Promise<string | null> {
+  const item = L.item(b.itemId);
+  const site = 'siteId' in b ? (places.siteName.get(b.siteId) ?? 'the default site') : '';
+  const remedy = (also = '') =>
+    `To import: undo or change those sales or uses (void or edit them), import these changes, then enter them again${also} — or ask your accountant to change ${s.subject}.`;
+  const are = (v: Dec) => (v.equals(1) ? 'is' : 'are');
+  const shown = (uses: string[]) => joinList(uses.length > 4 ? [...uses.slice(0, 4), `${uses.length - 4} more`] : uses);
+  const have = (v: Dec) => (v.greaterThan(0) ? v : Money.zero());
+
+  if (b.kind === 'inactiveSite' || b.kind === 'inactiveBin') {
+    const place = b.kind === 'inactiveSite' ? `inventory site "${site}"` : `bin "${places.binName.get(b.binId) ?? ''}" at site "${site}"`;
+    const again = b.kind === 'inactiveSite' ? `"${site}"` : `bin "${places.binName.get(b.binId) ?? ''}"`;
+    return (
+      `Your file has made ${place} inactive since this copy was made, so your accountant's ${s.what} can't move "${item}" there. ` +
+      `To import: make ${again} active again, import these changes, then make it inactive again — or ask your accountant to change ${s.subject}.`
+    );
+  }
+  if (b.kind === 'total') {
+    const uses = await laterStockUses(ctx, dividingDate, b.itemId, L);
+    if (!uses.length) return null;
+    const h = have(b.have);
+    return (
+      `Since the dividing date your file has sold or used "${item}": ${shown(uses)}. So only ${qtyText(h)} of "${item}" ${are(h)} on hand, ` +
+      `and your accountant's ${s.what} would take ${qtyText(b.need)} out of stock. ` +
+      remedy()
+    );
+  }
+  if (b.kind === 'site' || b.kind === 'bin') {
+    const binId = b.kind === 'bin' ? b.binId : undefined;
+    const uses = await laterStockUses(ctx, dividingDate, b.itemId, L, { siteId: b.siteId, binId });
+    if (!uses.length) return null;
+    const where = binId ? `in bin "${places.binName.get(binId) ?? ''}" at site "${site}"` : `at site "${site}"`;
+    const h = have(b.have);
+    return (
+      `Since the dividing date your file has sold or used "${item}" ${where}: ${shown(uses)}. So only ${qtyText(h)} of "${item}" ${are(h)} on hand ${where}, ` +
+      `and your accountant's ${s.what} would take ${qtyText(b.need)} out of stock there. ` +
+      remedy(binId ? '' : ` (or transfer stock to "${site}" first)`)
+    );
+  }
+  if (b.kind === 'serial') {
+    const uses = await laterStockUses(ctx, dividingDate, b.itemId, L, { siteId: b.siteId, serial: b.serial });
+    if (!uses.length) return null;
+    return (
+      `Since the dividing date your file has sold or used serial number "${b.serial}" of "${item}": ${shown(uses)}. ` +
+      `So "${b.serial}" is no longer in stock at site "${site}", and your accountant's ${s.what} would take it out of stock. ` +
+      remedy()
+    );
+  }
+  if (b.kind === 'serialTwice') {
+    const uses = await laterStockUses(ctx, dividingDate, b.itemId, L, { serial: b.serial, dir: 'in' });
+    if (!uses.length) return null;
+    return (
+      `Since the dividing date your file has received serial number "${b.serial}" of "${item}": ${shown(uses)}. ` +
+      `So "${b.serial}" is already in stock, and your accountant's ${s.what} would put it in stock a second time. ` +
+      `To import: undo or change those records (void or edit them), import these changes, then enter them again — or ask your accountant to change ${s.subject}.`
+    );
+  }
+  const uses = await laterStockUses(ctx, dividingDate, b.itemId, L, { siteId: b.siteId, lot: b.lot });
+  if (!uses.length) return null;
+  const h = have(b.have);
+  return (
+    `Since the dividing date your file has sold or used lot "${b.lot}" of "${item}" at site "${site}": ${shown(uses)}. ` +
+    `So only ${qtyText(h)} of lot "${b.lot}" ${are(h)} on hand there, and your accountant's ${s.what} would take ${qtyText(b.need)} of it out of stock. ` +
+    remedy()
+  );
+}
+
+/**
+ * The client's own records dated after the dividing date that took an item out of stock (or, with
+ * `dir: 'in'`, put it in) — from its stock movements, narrowed to a site, bin, serial number or lot.
+ * Transfers between sites count only where a site is named (they leave the item's total as it is).
+ */
+async function laterStockUses(
+  ctx: Ctx,
+  dividingDate: string,
+  itemId: string,
+  L: Labels,
+  f: { siteId?: string; binId?: string; serial?: string; lot?: string; dir?: 'in' | 'out' } = {},
+): Promise<string[]> {
   const rows = await q(
     ctx,
     sql`SELECT source_type, source_id, MIN(date) AS date, SUM(CAST(quantity AS NUMERIC)) AS qty FROM inventory_movements
         WHERE company_id = ${ctx.companyId}::uuid AND item_id = ${itemId}::uuid
           AND reversal_of_id IS NULL AND reversed_at IS NULL
-          AND source_type NOT IN ('transfer', 'site_rebalance')
+          AND source_type <> 'site_rebalance'
+          ${f.siteId ? sql`AND site_id = ${f.siteId}::uuid` : sql`AND source_type <> 'transfer'`}
+          ${f.binId ? sql`AND bin_id = ${f.binId}::uuid` : sql``}
+          ${f.serial ? sql`AND serial_number = ${f.serial}` : sql``}
+          ${f.lot ? sql`AND lot_number = ${f.lot}` : sql``}
         GROUP BY source_type, source_id
         ORDER BY MIN(date)`,
   );
+  const into = f.dir === 'in';
   const out: string[] = [];
   for (const r of rows) {
     const qty = dec(r.qty);
-    if (!qty.lessThan(0) || day(r.date) <= dividingDate) continue;
+    if (!(into ? qty.greaterThan(0) : qty.lessThan(0)) || day(r.date) <= dividingDate) continue;
     const type = String(r.source_type);
     const doc = r.source_id ? L.doc(r.source_id) : '(a form not in this file)';
     const what =
@@ -1056,9 +1081,27 @@ async function laterStockUses(ctx: Ctx, dividingDate: string, itemId: string, L:
             ? 'inventory adjustment'
             : type === 'build' || type === 'unbuild'
               ? 'assembly build'
-              : type.replace(/_/g, ' ');
-    const verb = type === 'invoice' || type === 'sales_receipt' ? 'sold' : type === 'vendor_credit' ? 'returned' : type === 'adjustment' ? 'removed' : 'used';
-    out.push(`your ${what} dated ${day(r.date)} (${qtyText(qty.negated())} ${verb})`);
+              : type === 'transfer'
+                ? 'inventory transfer'
+                : type.replace(/_/g, ' ');
+    const verb = into
+      ? type === 'credit_memo'
+        ? 'returned'
+        : type === 'adjustment'
+          ? 'added'
+          : type === 'transfer'
+            ? 'moved in'
+            : 'received'
+      : type === 'invoice' || type === 'sales_receipt'
+        ? 'sold'
+        : type === 'vendor_credit'
+          ? 'returned'
+          : type === 'adjustment'
+            ? 'removed'
+            : type === 'transfer'
+              ? 'moved to another site'
+              : 'used';
+    out.push(`your ${what} dated ${day(r.date)} (${qtyText(into ? qty : qty.negated())} ${verb})`);
   }
   return out;
 }
