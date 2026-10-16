@@ -9,13 +9,15 @@
  *  - a NON-default site's quantity is the sum of its movements; the DEFAULT site's is the item's
  *    total on hand less the other sites (checked only while another site holds stock — the
  *    service's single-site rule);
- *  - a bin's quantity is the sum of its movements and may not exceed its site's;
+ *  - a bin's quantity is the sum of its movements, and the site's bins together may not hold more
+ *    than the site (at every site, the default one too, whenever the site is not negative);
  *  - a serial number sits at the (site, bin) whose movements sum to 1; never below 0 there and
  *    never above 1 company-wide;
  *  - a lot's quantity is the sum of its movements per site (and per bin).
  *
  * A change's moves are applied in phases (an edit first reverses the record's own movements, then
- * posts the new version's lines, as the services do) and each phase is checked like the service
+ * posts the new version's lines, as the services do; a reversal copies the record's own movements
+ * exactly, while a posting out without a bin is planned like planOutboundDraws) and each phase is checked like the service
  * checks it. A posting into a site or bin the client has made inactive is refused by the service
  * too, and is reported as such.
  */
@@ -54,6 +56,8 @@ export type Short =
   | { kind: 'serial'; itemId: string; siteId: string; serial: string }
   | { kind: 'serialTwice'; itemId: string; serial: string }
   | { kind: 'lot'; itemId: string; siteId: string; lot: string; have: Dec; need: Dec }
+  /** The site's bins would hold more than the site (stock taken out of the site's unbinned stock). */
+  | { kind: 'binsOver'; itemId: string; siteId: string; binTotal: Dec; siteQty: Dec }
   | { kind: 'inactiveSite'; itemId: string; siteId: string }
   | { kind: 'inactiveBin'; itemId: string; siteId: string; binId: string };
 
@@ -175,6 +179,12 @@ export class StockPlaces {
     const serial = m.serial ? m.serial.trim() : null;
     const lot = m.lot ? m.lot.trim() || null : null;
 
+    // A reversal of the record's own movements copies them exactly (reverseSourceMovements): same
+    // site, bin, serial and lot — no bin planning.
+    if (!m.posting) {
+      this.record(this.trial, item, site, m.binId, serial, lot, m.qty);
+      return;
+    }
     if (serial) {
       // A serial leaving without a bin leaves from the bin it sits in at that site.
       let bin = m.binId;
@@ -297,8 +307,10 @@ export class StockPlaces {
         if (b.qty.lessThan(EPS)) return { kind: 'bin', itemId: item, siteId: site, binId: b.bin, have: had(bk), need: taken(bk) };
         binTotal = binTotal.plus(b.qty);
       }
-      if (policed && qty.greaterThanOrEqualTo(0) && binTotal.minus(qty).greaterThan(0.00005)) {
-        return { kind: 'site', itemId: item, siteId: site, have: had(key), need: taken(key) };
+      // The bins may not hold more than the site (assertMovementState checks this at every site,
+      // the default one too, whenever the site is not negative).
+      if (qty.greaterThanOrEqualTo(0) && binTotal.minus(qty).greaterThan(0.00005)) {
+        return { kind: 'binsOver', itemId: item, siteId: site, binTotal, siteQty: qty };
       }
     }
     // 3. Serial numbers.

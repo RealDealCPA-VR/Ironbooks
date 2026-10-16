@@ -12,7 +12,11 @@
  *  - a February bill into bin A-01 voided after the client sold from A-01 (and bought into B-01);
  *  - a new March invoice selling Gizmo at East, where the client sold all of East's in April;
  *  - a February invoice of Phone SN5 voided after the client took SN5 back on an April credit memo;
- *  - a new March bill receiving into a site the client has made inactive.
+ *  - a new March bill receiving into a site the client has made inactive;
+ *  - a February bill of 10 Bracket at East (the default site) outside any bin voided after the client
+ *    received 10 into bin D-01 and sold 10 at East without naming a bin (the sale took the stock
+ *    held outside any bin, so the bins would hold more than the site); the same for Clip at West
+ *    (bin W-01), and a change of a February bill of Elbow at East from 10 down to 4.
  *
  * And no false refusal: a February bill at West voided where the client's April sale was at East.
  */
@@ -29,7 +33,7 @@ import { createVendor } from '../vendors';
 import { createItem } from '../items';
 import { createInvoice, voidInvoice } from '../invoices';
 import { createCreditMemo } from '../creditMemos';
-import { createBill, voidBill } from '../bills';
+import { createBill, updateBill, voidBill } from '../bills';
 import { createBin, createSite, updateSite } from '../inventorySites';
 import { trialBalance } from '../reports';
 import { accountantCopyStatus, createAccountantCopy, importChangesFile, reviewChangesFile, type ChangesReview } from './client';
@@ -111,6 +115,11 @@ describe("Accountant's Copy — stock the client used up at a site, bin, serial 
     R.bolt = (await createItem(ctx, { name: 'Bolt', type: 'inventory', purchaseCost: '1', ...inv })).id;
     R.gizmo = (await createItem(ctx, { name: 'Gizmo', type: 'inventory', purchaseCost: '5', ...inv })).id;
     R.nut = (await createItem(ctx, { name: 'Nut', type: 'inventory', purchaseCost: '1', ...inv })).id;
+    R.bracket = (await createItem(ctx, { name: 'Bracket', type: 'inventory', purchaseCost: '1', ...inv })).id;
+    R.clip = (await createItem(ctx, { name: 'Clip', type: 'inventory', purchaseCost: '1', ...inv })).id;
+    R.elbow = (await createItem(ctx, { name: 'Elbow', type: 'inventory', purchaseCost: '1', ...inv })).id;
+    R.binD = (await createBin(ctx, { siteId: R.east, name: 'D-01' })).id;
+    R.binW = (await createBin(ctx, { siteId: R.west, name: 'W-01' })).id;
 
     const bill = async (ref: string, date: string, line: Record<string, unknown>) =>
       (await createBill(ctx, { vendorId: R.supplier, billNumber: ref, date: d(date), lines: [line as never] })).id;
@@ -127,6 +136,9 @@ describe("Accountant's Copy — stock the client used up at a site, bin, serial 
     R.billG1 = await bill('B-G1', '2026-01-15', { itemId: R.gizmo, quantity: 5, unitCost: '5', siteId: R.east });
     R.billG2 = await bill('B-G2', '2026-02-15', { itemId: R.gizmo, quantity: 5, unitCost: '5', siteId: R.west });
     R.billN = await bill('B-N', '2026-02-15', { itemId: R.nut, quantity: 4, unitCost: '1', siteId: R.west });
+    R.billK = await bill('B-K', '2026-02-15', { itemId: R.bracket, quantity: 10, unitCost: '1', siteId: R.east });
+    R.billC = await bill('B-C', '2026-02-15', { itemId: R.clip, quantity: 10, unitCost: '1', siteId: R.west });
+    R.billE = await bill('B-E', '2026-02-15', { itemId: R.elbow, quantity: 10, unitCost: '1', siteId: R.east });
 
     const transfer = (await createAccountantCopy(ctx, { dividingDate: DIVIDING, dataDir: CLIENT_DIR })).buffer;
     await openAccountantCopyFile(transfer, ACCT_DIR);
@@ -149,10 +161,18 @@ describe("Accountant's Copy — stock the client used up at a site, bin, serial 
     await invoice(ctx, 'A-N', '2026-04-10', { itemId: R.nut, quantity: 4, rate: '2', siteId: R.west });
     await bill('B-N2', '2026-04-11', { itemId: R.nut, quantity: 4, unitCost: '1', siteId: R.east });
     await updateSite(ctx, R.north, { isActive: false });
+    // Received into a bin, then sold without naming a bin (taken from the stock outside any bin).
+    await bill('B-K2', '2026-04-11', { itemId: R.bracket, quantity: 10, unitCost: '1', siteId: R.east, binId: R.binD });
+    await invoice(ctx, 'A-K', '2026-04-12', { itemId: R.bracket, quantity: 10, rate: '3', siteId: R.east });
+    await bill('B-C2', '2026-04-11', { itemId: R.clip, quantity: 10, unitCost: '1', siteId: R.west, binId: R.binW });
+    await invoice(ctx, 'A-C', '2026-04-12', { itemId: R.clip, quantity: 10, rate: '3', siteId: R.west });
+    await bill('B-E2', '2026-04-11', { itemId: R.elbow, quantity: 10, unitCost: '1', siteId: R.east, binId: R.binD });
+    await invoice(ctx, 'A-E', '2026-04-12', { itemId: R.elbow, quantity: 10, rate: '3', siteId: R.east });
 
     // ---- The accountant's changes, all dated on or before the dividing date ----
     await invoice(actx, 'M-G', '2026-03-20', { itemId: R.gizmo, quantity: 3, rate: '12', siteId: R.east });
-    for (const id of [R.billW, R.billP, R.billS, R.billB, R.billG2, R.billN]) await voidBill(actx, id);
+    for (const id of [R.billW, R.billP, R.billS, R.billB, R.billG2, R.billN, R.billK, R.billC]) await voidBill(actx, id);
+    await updateBill(actx, R.billE, { vendorId: R.supplier, billNumber: 'B-E', date: d('2026-02-15'), lines: [{ itemId: R.elbow, quantity: 4, unitCost: '1', siteId: R.east } as never] });
     await voidInvoice(actx, R.invP5);
     await createBill(actx, { vendorId: R.supplier, billNumber: 'M-N', date: d('2026-03-25'), lines: [{ itemId: R.widget, quantity: 1, unitCost: '10', siteId: R.north } as never] });
 
@@ -222,6 +242,29 @@ describe("Accountant's Copy — stock the client used up at a site, bin, serial 
     expect(item.problem).toMatch(/Your file has made inventory site "North" inactive since this copy was made, so your accountant's new bill can't move "Widget" there/);
     expect(item.problem).toMatch(/To import: make "North" active again, import these changes, then make it inactive again/);
     await refusesWith(buf, item.problem!);
+  });
+
+  it('a bill of 10 Bracket at East (default site, no bin) voided after the client received 10 into bin D-01 and sold 10 there without a bin: flagged, the import refuses alike', async () => {
+    const { buf, p } = await voidCase('bill', R.billK);
+    expect(p).toMatch(/Since the dividing date your file has put "Bracket" into bins at site "East" or sold or used it there without naming a bin: your bill #B-K2 \(Supplier Co\) dated 2026-04-11 \(10 received\) and your invoice #A-K \(Acme Corp\) dated 2026-04-12 \(10 sold\)/);
+    expect(p).toMatch(/So after your accountant's void of bill #B-K \(Supplier Co\), the bins at site "East" would hold 10 of "Bracket" while only 0 would be at the site/);
+    expect(p).toMatch(/To import: enter the bin your sale or use took the stock from \(edit it\), or undo it \(void it\), import these changes, then enter it again — or ask your accountant to change this bill\.$/);
+    await refusesWith(buf, p!);
+  });
+
+  it('the same at West (Clip, bin W-01): flagged, the import refuses alike', async () => {
+    const { buf, p } = await voidCase('bill', R.billC);
+    expect(p).toMatch(/your file has put "Clip" into bins at site "West" or sold or used it there without naming a bin: your bill #B-C2 \(Supplier Co\) dated 2026-04-11 \(10 received\) and your invoice #A-C \(Acme Corp\) dated 2026-04-12 \(10 sold\)/);
+    expect(p).toMatch(/the bins at site "West" would hold 10 of "Clip" while only 0 would be at the site/);
+    await refusesWith(buf, p!);
+  });
+
+  it('a February bill of 10 Elbow at East changed to 4, the client having binned 10 and sold 10 without a bin: flagged, the import refuses alike', async () => {
+    const buf = only((x) => x.type === 'bill' && x.op === 'edit' && x.id === R.billE);
+    const p = problemOf(await reviewOf(buf), `bill:edit:${R.billE}`);
+    expect(p).toMatch(/your file has put "Elbow" into bins at site "East" or sold or used it there without naming a bin: your bill #B-E2 \(Supplier Co\) dated 2026-04-11 \(10 received\) and your invoice #A-E \(Acme Corp\) dated 2026-04-12 \(10 sold\)/);
+    expect(p).toMatch(/So after your accountant's change to bill #B-E \(Supplier Co\), the bins at site "East" would hold 10 of "Elbow" while only 0 would be at the site/);
+    await refusesWith(buf, p!);
   });
 
   it('a bill at West voided where the client sold at East (nothing used at West): not flagged, and it imports', async () => {

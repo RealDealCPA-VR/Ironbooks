@@ -1012,6 +1012,19 @@ async function shortText(ctx: Ctx, dividingDate: string, places: StockPlaces, L:
       remedy(binId ? '' : ` (or transfer stock to "${site}" first)`)
     );
   }
+  if (b.kind === 'binsOver') {
+    // The client received stock into the site's bins and sold or used stock there without naming a
+    // bin (it came out of the stock held outside any bin, which this change now takes away).
+    const into = await laterStockUses(ctx, dividingDate, b.itemId, L, { siteId: b.siteId, binned: true, dir: 'in' });
+    const outOf = await laterStockUses(ctx, dividingDate, b.itemId, L, { siteId: b.siteId, binned: false });
+    if (!into.length && !outOf.length) return null;
+    const uses = [...into, ...outOf];
+    return (
+      `Since the dividing date your file has put "${item}" into bins at site "${site}" or sold or used it there without naming a bin: ${shown(uses)}. ` +
+      `So after your accountant's ${s.what}, the bins at site "${site}" would hold ${qtyText(b.binTotal)} of "${item}" while only ${qtyText(have(b.siteQty))} would be at the site. ` +
+      `To import: enter the bin your sale or use took the stock from (edit it), or undo it (void it), import these changes, then enter it again — or ask your accountant to change ${s.subject}.`
+    );
+  }
   if (b.kind === 'serial') {
     const uses = await laterStockUses(ctx, dividingDate, b.itemId, L, { siteId: b.siteId, serial: b.serial });
     if (!uses.length) return null;
@@ -1050,7 +1063,7 @@ async function laterStockUses(
   dividingDate: string,
   itemId: string,
   L: Labels,
-  f: { siteId?: string; binId?: string; serial?: string; lot?: string; dir?: 'in' | 'out' } = {},
+  f: { siteId?: string; binId?: string; binned?: boolean; serial?: string; lot?: string; dir?: 'in' | 'out' } = {},
 ): Promise<string[]> {
   const rows = await q(
     ctx,
@@ -1060,6 +1073,7 @@ async function laterStockUses(
           AND source_type <> 'site_rebalance'
           ${f.siteId ? sql`AND site_id = ${f.siteId}::uuid` : sql`AND source_type <> 'transfer'`}
           ${f.binId ? sql`AND bin_id = ${f.binId}::uuid` : sql``}
+          ${f.binned === true ? sql`AND bin_id IS NOT NULL` : f.binned === false ? sql`AND bin_id IS NULL` : sql``}
           ${f.serial ? sql`AND serial_number = ${f.serial}` : sql``}
           ${f.lot ? sql`AND lot_number = ${f.lot}` : sql``}
         GROUP BY source_type, source_id
