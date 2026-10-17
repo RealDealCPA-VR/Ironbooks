@@ -284,16 +284,6 @@ export function isNonPosting(a: { subtype?: string | null }): boolean {
   return a.subtype === 'non_posting';
 }
 /**
- * Accounts that get a QB register: every balance-sheet type except equity (bank, credit card,
- * A/R, A/P, other current asset incl. Undeposited Funds and inventory, fixed / other asset,
- * other current and long-term liabilities).
- */
-export const REGISTER_SUBTYPES: readonly AccountSubtype[] = [
-  'checking', 'savings', 'credit_card', 'accounts_receivable', 'accounts_payable',
-  'undeposited_funds', 'other_current_asset', 'inventory', 'fixed_assets', 'other_asset',
-  'other_current_liability', 'long_term_liability',
-];
-/**
  * Accounts money can be paid FROM (Write Checks / Pay Bills / Expenses): banks and credit cards.
  * QB parity: checks come from bank accounts, card charges from credit-card accounts. Legacy
  * charts where a cash-like account was given an unusual subtype are not supported here on purpose.

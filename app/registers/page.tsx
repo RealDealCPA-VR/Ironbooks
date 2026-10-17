@@ -2,9 +2,10 @@
 /**
  * Registers index — QB "Use Register" account picker.
  *
- * Lists bank (checking/savings), credit-card, A/R and A/P accounts with their
- * current balances, grouped by category. Each row opens the account's register
- * at /registers/<accountId>.
+ * Lists every posting account with its current balance, grouped by category
+ * (banks and cards first, then the rest of the balance sheet, equity, income and
+ * expenses). Each row opens the account's register at /registers/<accountId>,
+ * where new transactions can be typed straight into the register.
  */
 import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { useEffect, useState } from 'react';
@@ -25,15 +26,21 @@ interface RegisterAccount {
   isActive: boolean;
 }
 
-const GROUPS: { title: string; subtypes: string[] }[] = [
-  { title: 'Bank Accounts', subtypes: ['checking', 'savings'] },
-  { title: 'Credit Cards', subtypes: ['credit_card'] },
-  { title: 'Accounts Receivable', subtypes: ['accounts_receivable'] },
-  { title: 'Accounts Payable', subtypes: ['accounts_payable'] },
-  { title: 'Other Current Assets', subtypes: ['undeposited_funds', 'other_current_asset', 'inventory'] },
-  { title: 'Fixed & Other Assets', subtypes: ['fixed_assets', 'other_asset'] },
-  { title: 'Other Liabilities', subtypes: ['other_current_liability', 'long_term_liability'] },
+const GROUPS: { title: string; match: (a: RegisterAccount) => boolean }[] = [
+  { title: 'Bank Accounts', match: (a) => ['checking', 'savings'].includes(a.subtype) },
+  { title: 'Credit Cards', match: (a) => a.subtype === 'credit_card' },
+  { title: 'Accounts Receivable', match: (a) => a.subtype === 'accounts_receivable' },
+  { title: 'Accounts Payable', match: (a) => a.subtype === 'accounts_payable' },
+  { title: 'Other Current Assets', match: (a) => ['undeposited_funds', 'other_current_asset', 'inventory'].includes(a.subtype) },
+  { title: 'Fixed & Other Assets', match: (a) => ['fixed_assets', 'other_asset'].includes(a.subtype) },
+  { title: 'Other Liabilities', match: (a) => ['other_current_liability', 'long_term_liability'].includes(a.subtype) },
+  { title: 'Equity', match: (a) => a.type === 'equity' },
+  { title: 'Income', match: (a) => a.type === 'revenue' },
+  { title: 'Expenses', match: (a) => a.type === 'expense' },
 ];
+
+/** Accounts no group above claims still get listed (nothing in the chart is unreachable). */
+const OTHER_GROUP = { title: 'Other Accounts', match: (a: RegisterAccount) => !GROUPS.some((g) => g.match(a)) };
 
 function subtypeLabel(subtype: string): string {
   return SUBTYPE_LABELS[subtype as keyof typeof SUBTYPE_LABELS] ?? subtype;
@@ -70,8 +77,8 @@ export default function RegistersIndexPage() {
         <Card>
           <EmptyState
             icon={BookOpen}
-            title="No register accounts found"
-            message="Create bank, credit card, A/R or A/P accounts in the Chart of Accounts to use registers."
+            title="No accounts yet"
+            message="Add accounts in the Chart of Accounts, then open any of them here as a register."
             action={
               <Link
                 href="/accounts"
@@ -85,8 +92,8 @@ export default function RegistersIndexPage() {
       )}
 
       {!loading &&
-        GROUPS.map((group) => {
-          const rows = accounts.filter((a) => group.subtypes.includes(a.subtype));
+        [...GROUPS, OTHER_GROUP].map((group) => {
+          const rows = accounts.filter(group.match);
           if (rows.length === 0) return null;
           return (
             <div key={group.title} className="mb-8">

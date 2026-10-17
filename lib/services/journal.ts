@@ -9,7 +9,7 @@
  * that touched an account together with a running balance. The running balance respects the
  * natural sign convention (debit-normal for asset/expense, credit-normal for liability/equity/revenue).
  */
-import { and, asc, desc, eq, gte, inArray, lt, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lt, lte, ne, sql } from 'drizzle-orm';
 import {
   accounts,
   classes,
@@ -25,7 +25,6 @@ import {
   depreciationEntries,
   fixedAssets,
 } from '@/lib/db/schema';
-import { REGISTER_SUBTYPES as REGISTER_SUBTYPE_LIST } from '@/lib/accountTypes';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -967,14 +966,6 @@ export async function generalLedger(
 // Account registers (QB-style "Use Register" view) — additive query helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Account subtypes that get a register in the registers index: bank, credit card, A/R, A/P,
- * plus the other balance-sheet types QuickBooks gives registers (other current asset incl.
- * Undeposited Funds, other asset, fixed asset, other current / long-term liability). The
- * shared list lives in lib/accountTypes.ts.
- */
-export const REGISTER_SUBTYPES = REGISTER_SUBTYPE_LIST;
-
 export interface RegisterAccountSummary {
   id: string;
   code: string;
@@ -987,10 +978,11 @@ export interface RegisterAccountSummary {
 }
 
 /**
- * List the accounts that should appear on the registers index page:
- * bank (checking/savings), credit card, A/R and A/P accounts with their
- * current cached balances. Inactive accounts are excluded — a register for
- * a deactivated account is still reachable directly by id via accountRegister.
+ * List the accounts that should appear on the registers index page: every active posting
+ * account (banks, cards, A/R, A/P, other assets and liabilities, equity, income and expense),
+ * with its current cached balance. Non-posting accounts (estimates, purchase orders) have no
+ * ledger lines and are left out. Inactive accounts are excluded — a register for a deactivated
+ * account is still reachable directly by id via accountRegister.
  */
 export async function listRegisterAccounts(
   ctx: ServiceContext,
@@ -1009,7 +1001,7 @@ export async function listRegisterAccounts(
     .where(
       and(
         eq(accounts.companyId, ctx.companyId),
-        inArray(accounts.subtype, [...REGISTER_SUBTYPES]),
+        ne(accounts.subtype, 'non_posting'),
         eq(accounts.isActive, true),
       ),
     )
@@ -1035,6 +1027,11 @@ export interface RegisterRow {
   credit: string | null;
   /** True running natural balance of the account up through this line (unaffected by search). */
   runningBalance: string;
+  /**
+   * The register's Account column: the other account on the entry ("1000 · Checking"), or
+   * "-split-" (id null) when the entry has several other accounts. Null when there is none.
+   */
+  otherAccount?: { id: string | null; label: string } | null;
 }
 
 export interface AccountRegisterOptions {
@@ -1173,8 +1170,30 @@ export async function accountRegister(
 
   // Paging over the filtered ascending set.
   const offset = Math.max(0, opts.offset ?? 0);
-  const rows =
+  const page =
     opts.limit != null ? filtered.slice(offset, offset + opts.limit) : filtered.slice(offset);
+
+  // Account column: the other side of each entry on this page (QB shows "-split-" for several).
+  const entryIds = [...new Set(page.map((r) => r.journalEntryId))];
+  const others = new Map<string, Map<string, string>>();
+  for (let i = 0; i < entryIds.length; i += 500) {
+    const chunk = entryIds.slice(i, i + 500);
+    const otherLines = await ctx.db
+      .select({ entryId: journalEntryLines.journalEntryId, id: accounts.id, code: accounts.code, name: accounts.name })
+      .from(journalEntryLines)
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(and(inArray(journalEntryLines.journalEntryId, chunk), ne(journalEntryLines.accountId, accountId)));
+    for (const l of otherLines) {
+      const m = others.get(l.entryId) ?? new Map<string, string>();
+      m.set(l.id, l.code ? `${l.code} · ${l.name}` : l.name);
+      others.set(l.entryId, m);
+    }
+  }
+  const rows = page.map((r) => {
+    const m = others.get(r.journalEntryId);
+    const otherAccount = !m || m.size === 0 ? null : m.size === 1 ? { id: [...m.keys()][0], label: [...m.values()][0] } : { id: null, label: '-split-' };
+    return { ...r, otherAccount };
+  });
 
   return {
     account: { ...acct, balance: toAmountString(acct.balance) },

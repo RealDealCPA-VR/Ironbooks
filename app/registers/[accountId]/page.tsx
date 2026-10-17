@@ -2,9 +2,14 @@
 /**
  * Account register — QB-style "Use Register" grid for a single account.
  *
- * Columns: date / number / payee-description / memo / payment-deposit (labels
- * adapt to the account class) / running balance. Oldest first, newest at the
- * bottom (auto-scrolled into view), with date-range + search filters.
+ * Columns: date / number / payee-description / account (the other side, or
+ * "-split-") / memo / payment-deposit (labels adapt to the account class, with
+ * the debit / credit side under each) / running balance. Oldest first, newest at
+ * the bottom (auto-scrolled into view), with date-range + search filters.
+ *
+ * The blank row at the bottom (RegisterEntryRow) takes a new transaction without
+ * leaving the register: it is saved as a check, deposit, transfer, card charge /
+ * credit or journal entry (lib/registerEntryPlan.ts).
  *
  * QuickZoom: clicking a row opens its source document page when the entry has a
  * mapped sourceRef (invoice:/bill:/deposit:/…), otherwise it opens the
@@ -31,6 +36,7 @@ import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
+import { RegisterEntryRow } from '@/components/RegisterEntryRow';
 import WhyChanged from '@/components/WhyChanged';
 
 // ---------------------------------------------------------------------------
@@ -45,6 +51,7 @@ interface RegisterAccount {
   subtype: string;
   balance: string;
   isActive: boolean;
+  currency?: string | null;
 }
 
 interface RegisterRow {
@@ -59,6 +66,8 @@ interface RegisterRow {
   debit: string | null;
   credit: string | null;
   runningBalance: string;
+  /** The other account on the entry, or "-split-" (id null) for several. */
+  otherAccount?: { id: string | null; label: string } | null;
   /** p1 fx: account-currency columns (foreign-currency bank / card accounts only). */
   foreignDebit?: string | null;
   foreignCredit?: string | null;
@@ -148,6 +157,12 @@ function amountFor(row: RegisterRow, accountType: string, key: AmountKey, foreig
   const increase = debitNormal ? dr : cr;
   const decrease = debitNormal ? cr : dr;
   return key === 'increase' ? increase : decrease;
+}
+
+/** "Debit" / "Credit": the side of this account an amount column posts to. */
+function sideLabel(accountType: string, key: AmountKey): string {
+  const debitNormal = accountType === 'asset' || accountType === 'expense';
+  return (key === 'increase') === debitNormal ? 'Debit' : 'Credit';
 }
 
 function subtypeLabel(subtype: string): string {
@@ -381,9 +396,17 @@ function RegisterPageInner() {
                     <Th>Date</Th>
                     <Th>Number</Th>
                     <Th>Payee / Description</Th>
+                    <Th>Account</Th>
                     <Th>Memo</Th>
-                    <Th numeric>{config.columns[0].label}{fxCur ? ` (${fxCur})` : ''}</Th>
-                    <Th numeric>{config.columns[1].label}{fxCur ? ` (${fxCur})` : ''}</Th>
+                    {config.columns.map((col) => (
+                      <Th key={col.key} numeric>
+                        {col.label}
+                        {fxCur ? ` (${fxCur})` : ''}
+                        <span className="block text-[10px] font-normal normal-case tracking-normal text-navy/40">
+                          {sideLabel(result.account.type, col.key)}
+                        </span>
+                      </Th>
+                    ))}
                     <Th numeric>Balance{fxCur ? ` (${fxCur})` : ''}</Th>
                     {fxCur && <Th numeric>Balance ({result.homeCurrency ?? 'home'})</Th>}
                   </tr>
@@ -394,6 +417,7 @@ function RegisterPageInner() {
                       <Td className="whitespace-nowrap text-navy/60">{formatDate(resultFrom)}</Td>
                       <Td />
                       <Td className="italic text-navy/60">Opening Balance</Td>
+                      <Td />
                       <Td />
                       <Td />
                       <Td />
@@ -411,7 +435,7 @@ function RegisterPageInner() {
 
                   {result.rows.length === 0 && (
                     <tr>
-                      <Td colSpan={fxCur ? 8 : 7} className="py-12 text-center text-navy/40">
+                      <Td colSpan={fxCur ? 9 : 8} className="py-12 text-center text-navy/40">
                         No transactions in this register for the selected filters.
                       </Td>
                     </tr>
@@ -440,8 +464,12 @@ function RegisterPageInner() {
                             </span>
                           )}
                         </Td>
+                        <Td className="text-navy/70 text-xs max-w-[200px] truncate" title={row.otherAccount?.label ?? ''}>
+                          {row.otherAccount?.label ?? ''}
+                        </Td>
+                        {/* A line memo that only repeats the description (checks write "Check — payee") adds nothing. */}
                         <Td className="text-navy/50 text-xs max-w-[180px] truncate" title={row.memo ?? ''}>
-                          {row.memo ?? ''}
+                          {row.memo && row.memo !== row.description ? row.memo : ''}
                         </Td>
                         {config.columns.map((col) => {
                           const amount = amountFor(row, result.account.type, col.key, !!fxCur);
@@ -470,6 +498,14 @@ function RegisterPageInner() {
                       </tr>
                     );
                   })}
+                  {!search.trim() && (
+                    <RegisterEntryRow
+                      register={result.account}
+                      columns={config.columns}
+                      colSpanAfter={fxCur ? 2 : 1}
+                      onSaved={() => load(from, to, search)}
+                    />
+                  )}
                 </tbody>
               </table>
             </div>

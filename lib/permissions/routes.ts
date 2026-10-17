@@ -431,7 +431,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/loans/[id]/payments': r('banking', 'POST DELETE'), // p1 fx: DELETE voids a payment + its FX entry
   '/api/banking/account-currency': r('accounting', 'POST:modify'),
   '/api/registers': r('banking', 'GET'),
-  '/api/registers/[accountId]': r('banking', 'GET'),
+  '/api/registers/[accountId]': r('banking', 'GET POST'),
 
   // ---- Sensitive accounting ----
   '/api/journal-entries': r('accounting', 'GET POST'),

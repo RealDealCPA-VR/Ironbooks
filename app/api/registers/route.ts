@@ -1,9 +1,9 @@
 /**
  * GET /api/registers
  *
- * Lists the accounts that get a QB-style register — bank (checking/savings),
- * credit card, A/R and A/P — with their current cached balances, for the
- * registers index page.
+ * Lists the accounts that get a QB-style register — every active posting account (banks,
+ * cards, A/R, A/P, assets, liabilities, equity, income, expense) — with their current cached
+ * balances, for the registers index page.
  */
 import { NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';

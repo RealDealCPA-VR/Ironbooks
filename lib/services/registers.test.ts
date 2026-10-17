@@ -120,15 +120,12 @@ describe('Account registers (listRegisterAccounts + accountRegister)', () => {
   // listRegisterAccounts
   // -------------------------------------------------------------------------
 
-  it('lists only bank/CC/AR/AP accounts, sorted by code, with cached balances', async () => {
+  it('lists every posting account, sorted by code, with cached balances', async () => {
     const rows = await listRegisterAccounts(ctx);
     const codes = rows.map((r) => r.code);
 
-    expect(codes).toEqual(['1000', '1100', '1200', '2000', '2100']);
-    // Equity / revenue / expense accounts never get registers.
-    expect(codes).not.toContain('3000');
-    expect(codes).not.toContain('4000');
-    expect(codes).not.toContain('6000');
+    // Any account can be opened as a register (equity, income and expense included).
+    expect(codes).toEqual(['1000', '1100', '1200', '2000', '2100', '3000', '4000', '6000']);
 
     const checking = rows.find((r) => r.code === '1000')!;
     // 10000 - 100 + 1200 = 11100
