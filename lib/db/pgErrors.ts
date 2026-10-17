@@ -10,6 +10,8 @@
  *  - 22003 numeric_value_out_of_range — e.g. a posting that would push a cached account
  *    balance past numeric(15,2). VALIDATION with a friendly "too large" message. The statement
  *    failed, so the transaction rolls back as before.
+ *  - 22007 invalid_datetime_format / 22008 datetime_field_overflow / 22009 time zone
+ *    displacement — a date Postgres cannot store (e.g. year 10000). VALIDATION.
  * Every other error passes through unchanged (ledger BK00x codes are translated in
  * lib/services/_base.ts inTransaction, where deferred checks surface at COMMIT).
  */
@@ -24,6 +26,15 @@ export function translatePgError(err: unknown): unknown {
       return new ServiceError('NOT_FOUND', 'No record matches that id.', { sqlstate: code });
     }
     return new ServiceError('VALIDATION', `Invalid value: ${message}`, { sqlstate: code });
+  }
+  if (code === '22007' || code === '22008' || code === '22009') {
+    // invalid_datetime_format / datetime_field_overflow / invalid_time_zone_displacement_value —
+    // a year-10000 Date serializes as "+010000-01-01T…Z", which Postgres reports as 22009.
+    return new ServiceError(
+      'VALIDATION',
+      'That date is not valid: use a real calendar day in years 1900-9999.',
+      { sqlstate: code },
+    );
   }
   if (code === '22003') {
     return new ServiceError(

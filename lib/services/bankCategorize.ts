@@ -13,7 +13,7 @@
  * IMPORTANT: GL writes happen ONLY through `postJournalEntry` (posting.ts).
  * All money arithmetic uses '@/lib/money'.
  */
-import { and, desc, eq, gte, isNotNull, lte } from 'drizzle-orm';
+import { and, desc, eq, gte, isNotNull, lte, ne } from 'drizzle-orm';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -275,8 +275,11 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
   // a live GL entry with the staging row still unmatched — re-categorizing such
   // a row would post the same money twice.
   return inTransaction(ctx, async (tx) => {
+    // Post on the feed line's calendar day (UTC midnight): older staged rows may carry a time of
+    // day, which would push the entry outside "as of <that day>" reports.
+    const feedDay = new Date(txn.date);
     const entry = await postJournalEntry(tx, {
-      date: new Date(txn.date),
+      date: new Date(Date.UTC(feedDay.getUTCFullYear(), feedDay.getUTCMonth(), feedDay.getUTCDate())),
       description,
       reference: input.memo ?? undefined,
       sourceRef: `bank_transaction:${txn.id}`,
@@ -504,14 +507,17 @@ export async function suggestMatches(
   const from = new Date(txnDate.getTime() - MATCH_WINDOW_DAYS * DAY_MS);
   const to = new Date(txnDate.getTime() + MATCH_WINDOW_DAYS * DAY_MS);
 
-  // Entries already linked by ANY feed line (whether matched or created via
-  // categorize) are taken — a register transaction clears the bank only once.
+  // Entries already linked by a feed line OF THIS BANK ACCOUNT (whether matched or created via
+  // categorize) are taken — a register transaction clears each bank only once. A transfer between
+  // two feed-connected accounts is one entry that appears on both feeds, so the other account's
+  // link does not take it.
   const takenRows = await ctx.db
     .select({ entryId: bankTransactions.matchedEntryId })
     .from(bankTransactions)
     .where(
       and(
         eq(bankTransactions.companyId, ctx.companyId),
+        eq(bankTransactions.bankAccountId, txn.bankAccountId),
         isNotNull(bankTransactions.matchedEntryId),
       ),
     );
@@ -667,13 +673,15 @@ export async function matchTransaction(
     );
   }
 
-  // One register transaction can clear the bank feed only once.
+  // One register transaction can clear each bank account's feed only once (a transfer's entry
+  // may be matched once on each of its two accounts' feeds).
   const [alreadyTaken] = await ctx.db
     .select({ id: bankTransactions.id })
     .from(bankTransactions)
     .where(
       and(
         eq(bankTransactions.companyId, ctx.companyId),
+        eq(bankTransactions.bankAccountId, txn.bankAccountId),
         eq(bankTransactions.matchedEntryId, entry.id),
       ),
     )
@@ -805,6 +813,28 @@ export async function unmatch(ctx: ServiceContext, bankTransactionId: string) {
       ),
     );
   const ownEntry = !!entry && entry.sourceRef === `bank_transaction:${txn.id}`;
+
+  // A categorized transfer can also be matched on the other account's feed. Voiding it here would
+  // leave that feed line linked to a void entry — unmatch the other line first.
+  if (ownEntry) {
+    const [otherLink] = await ctx.db
+      .select({ id: bankTransactions.id })
+      .from(bankTransactions)
+      .where(
+        and(
+          eq(bankTransactions.companyId, ctx.companyId),
+          eq(bankTransactions.matchedEntryId, txn.matchedEntryId),
+          ne(bankTransactions.id, txn.id),
+        ),
+      )
+      .limit(1);
+    if (otherLink) {
+      throw new ServiceError(
+        'CONFLICT',
+        'This transaction is also matched on another bank account’s feed. Undo that match first.',
+      );
+    }
+  }
 
   // Void + flag-clear + audit in ONE transaction so the GL entry and the staging
   // row can never diverge. Note: voidJournalEntry throws CONFLICT if any of the

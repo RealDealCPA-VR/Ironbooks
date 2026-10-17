@@ -1511,8 +1511,10 @@ export async function payrollLiabilityBalances(
   ctx: ServiceContext,
   opts?: { asOf?: Date },
 ): Promise<PayrollLiabilityBalancesResult> {
-  const asOf = opts?.asOf ?? new Date();
-  if (isNaN(asOf.getTime())) throw validation('Invalid asOf date.');
+  const asOfInput = opts?.asOf ?? new Date();
+  if (isNaN(asOfInput.getTime())) throw validation('Invalid asOf date.');
+  // Whole as-of day (the trial balance bound): checks and payments later on that day count.
+  const asOf = new Date(Date.UTC(asOfInput.getUTCFullYear(), asOfInput.getUTCMonth(), asOfInput.getUTCDate() + 1) - 1);
 
   // 1) Accruals from paycheck lines (posted, non-void checks, payDate <= asOf) plus liability
   //    adjustments. Historical YTD amounts entered WITHOUT affecting accounts are excluded:

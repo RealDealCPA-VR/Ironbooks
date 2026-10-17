@@ -266,7 +266,9 @@ export async function takeFromLayers(
     const layerQty = Money.of(layer.quantityRemaining);
     const unitCost = Money.of(layer.unitCost);
     const take = remaining.lessThanOrEqualTo(layerQty) ? remaining : layerQty;
-    const layerCost = Money.round2(take.times(unitCost));
+    // The layer's value before minus after (each rounded to the cent): telescopes over partial
+    // draws, so emptying a layer relieves exactly the value it still carried (no stranded cent).
+    const layerCost = Money.round2(layerQty.times(unitCost)).minus(Money.round2(layerQty.minus(take).times(unitCost)));
     cost = cost.plus(layerCost);
     taken.push({
       layerId: layer.id,

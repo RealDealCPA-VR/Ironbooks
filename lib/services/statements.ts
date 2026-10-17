@@ -30,7 +30,9 @@ import {
   customers,
   expenseLines,
   expenses,
+  invoiceLines,
   invoices,
+  items,
   journalEntries,
   journalEntryLines,
   paymentsReceived,
@@ -483,6 +485,13 @@ async function homeCurrencyStatement(
   };
 }
 
+/**
+ * Payment-item lines on an invoice (correlated on invoices.id). They are received with the
+ * invoice — the invoice's entry debits Undeposited Funds for them instead of A/R — so the amount
+ * an invoice charges to A/R is total − retainage − these lines.
+ */
+const invoicePaymentLinesSql = sql`(SELECT COALESCE(SUM(CAST(${invoiceLines.amount} AS NUMERIC)), 0) FROM ${invoiceLines} INNER JOIN ${items} ON ${items.id} = ${invoiceLines.itemId} WHERE ${invoiceLines.invoiceId} = ${invoices.id} AND ${items.type} = 'payment')`;
+
 export async function customerStatement(
   ctx: ServiceContext,
   customerId: string,
@@ -514,10 +523,11 @@ export async function customerStatement(
 
   if (range?.from) {
     // Invoices before range start (posted, non-void). Only the billed base hits A/R —
-    // retainage held back sits in Retainage Receivable (an Other Current Asset).
+    // retainage held back sits in Retainage Receivable (an Other Current Asset), and payment-item
+    // lines went to Undeposited Funds.
     const [priorInvoiceRow] = await ctx.db
       .select({
-        total: sql<string>`COALESCE(SUM(CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC)), 0)`,
+        total: sql<string>`COALESCE(SUM(CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC) - ${invoicePaymentLinesSql}), 0)`,
       })
       .from(invoices)
       .where(
@@ -619,8 +629,9 @@ export async function customerStatement(
       date: invoices.date,
       invoiceNumber: invoices.invoiceNumber,
       refNumber: invoices.refNumber,
-      // Billed base (total minus retainage) — the amount actually charged to A/R.
-      total: sql<string>`CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC)`,
+      // Billed base (total minus retainage, minus payment-item lines received with the
+      // invoice) — the amount actually charged to A/R.
+      total: sql<string>`CAST(${invoices.total} AS NUMERIC) - CAST(COALESCE(${invoices.retainageAmount}, '0') AS NUMERIC) - ${invoicePaymentLinesSql}`,
       isStatementCharge: invoices.isStatementCharge,
     })
     .from(invoices)
@@ -1180,6 +1191,16 @@ function cashOfApplication(
   return f ? Money.round2(Money.of(amountApplied).times(f)) : Money.of(amountApplied);
 }
 
+/**
+ * Home-currency value of a 1099 amount: foreign bill payments / checks store their amounts in the
+ * transaction currency, and 1099s are filed in home currency (null rate = home document).
+ */
+function home1099(amount: ReturnType<typeof Money.zero>, rate: string | null): ReturnType<typeof Money.zero> {
+  if (!rate) return amount;
+  const r = Money.of(rate);
+  return r.greaterThan(0) && !r.equals(1) ? Money.round2(amount.times(r)) : amount;
+}
+
 export async function vendor1099Report(
   ctx: ServiceContext,
   { year }: { year: number },
@@ -1203,6 +1224,7 @@ export async function vendor1099Report(
       taxId: vendors.taxId,
       billPaymentId: billPaymentApplications.billPaymentId,
       amountApplied: billPaymentApplications.amountApplied,
+      rate: billPayments.exchangeRate,
     })
     .from(billPaymentApplications)
     .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
@@ -1228,6 +1250,7 @@ export async function vendor1099Report(
       vendorName: vendors.displayName,
       taxId: vendors.taxId,
       total: expenses.total,
+      rate: expenses.exchangeRate,
     })
     .from(expenses)
     .innerJoin(vendors, eq(expenses.vendorId, vendors.id))
@@ -1264,11 +1287,11 @@ export async function vendor1099Report(
       r.vendorId,
       r.vendorName,
       r.taxId ?? null,
-      toAmountString(cashOfApplication(cashFactors, r.billPaymentId, r.amountApplied)),
+      toAmountString(home1099(cashOfApplication(cashFactors, r.billPaymentId, r.amountApplied), r.rate)),
     );
   }
   for (const r of expenseRows) {
-    accumulate(r.vendorId, r.vendorName, r.taxId ?? null, r.total);
+    accumulate(r.vendorId, r.vendorName, r.taxId ?? null, toAmountString(home1099(Money.of(r.total), r.rate)));
   }
 
   // --- Filter to >= $600 ---
@@ -1480,6 +1503,7 @@ export async function vendor1099Worksheet(
       taxId: vendors.taxId,
       billPaymentId: billPaymentApplications.billPaymentId,
       amountApplied: billPaymentApplications.amountApplied,
+      rate: billPayments.exchangeRate,
     })
     .from(billPaymentApplications)
     .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
@@ -1521,6 +1545,7 @@ export async function vendor1099Worksheet(
       taxId: vendors.taxId,
       accountId: expenseLines.accountId,
       amount: expenseLines.amount,
+      rate: expenses.exchangeRate,
     })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
@@ -1569,7 +1594,8 @@ export async function vendor1099Worksheet(
   const cashFactors = await billPaymentCashFactors(ctx, [...new Set(applicationRows.map((r) => r.billPaymentId))]);
   for (const app of applicationRows) {
     const lines = linesByBill.get(app.billId) ?? [];
-    const applied = cashOfApplication(cashFactors, app.billPaymentId, app.amountApplied);
+    // Cash share (in the payment's currency) at the payment's rate = home cash paid.
+    const applied = home1099(cashOfApplication(cashFactors, app.billPaymentId, app.amountApplied), app.rate);
     if (applied.lessThanOrEqualTo(0)) continue;
     const lineSum = lines.reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero());
     if (lines.length === 0 || lineSum.lessThanOrEqualTo(0)) {
@@ -1585,7 +1611,7 @@ export async function vendor1099Worksheet(
 
   // Expense lines: direct account → box.
   for (const l of expenseLineRows) {
-    add(l.vendorId, l.vendorName, l.taxId ?? null, boxFor(l.accountId), Money.of(l.amount));
+    add(l.vendorId, l.vendorName, l.taxId ?? null, boxFor(l.accountId), home1099(Money.of(l.amount), l.rate));
   }
 
   // --- Build rows + thresholds ---

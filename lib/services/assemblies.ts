@@ -6,22 +6,18 @@
  *
  * --- GL treatment for buildAssembly / unbuildAssembly ---
  *
- * Both sides of the transaction live in account 1300 (Inventory Asset):
- *   - Component items DECREASE in value  (their qty * averageCost moves out)
+ *   - Component items DECREASE in value  (their book value before minus after moves out)
  *   - Assembly item   INCREASES in value (receives that same total cost)
  *
- * Net impact on account 1300 = $0.  A Dr 1300 / Cr 1300 journal entry would be
- * a zero-net wash that adds noise to the GL without changing any balance.
- * Therefore we skip GL posting entirely for assembly builds and instead update
- * item-level quantities and averageCost directly — consistent with how
- * QuickBooks handles assembly builds when the BOM only moves inventory between
- * items on the same asset account.
+ * Like QB's Build Assembly, each build posts to the GL: one entry per component,
+ *   Dr assembly's inventory asset account / Cr component's inventory asset account,
+ * tagged sourceRef `assembly_build:<buildId>:<componentId>:<assemblyId>` (unbuild: the reverse,
+ * `assembly_unbuild:<id>:<assemblyId>:<componentId>`). When both items use the same account the
+ * entry nets to $0 there, but it still lets the inventory valuation reports attribute the value
+ * to each item; when the accounts differ (e.g. Raw Materials vs Finished Goods) it is what keeps
+ * each account equal to the value of the items it carries.
  *
- * If your chart of accounts uses SEPARATE asset accounts per item, you would
- * need per-account postings; this service intentionally keeps it simple and
- * mirrors the common single-account approach.
- *
- * The zero-net wash only holds if total item-level value is conserved, so:
+ * Item-level value is conserved exactly, so:
  *   - unbuildAssembly distributes the assembly's removed value back to the
  *     components (instead of restoring them at their possibly-drifted current
  *     averageCost) — see unbuildAssembly's doc comment.
@@ -31,8 +27,8 @@
  */
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, inArray } from 'drizzle-orm';
-import { assemblyComponents, items, pendingBuilds } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import { accounts, assemblyComponents, items, pendingBuilds } from '@/lib/db/schema';
+import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
   inTransaction,
@@ -40,7 +36,8 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { assertNotFifoTracked } from './inventory';
+import { assertNotFifoTracked, bookValueRelief } from './inventory';
+import { postJournalEntry } from './posting';
 import { type InventoryLineDetail, type MovementRequest, recordMovements } from './inventorySites';
 
 // ---------------------------------------------------------------------------
@@ -134,8 +131,8 @@ function buildMovements(
 // ---------------------------------------------------------------------------
 
 /**
- * Builds move stock value between items with no GL posting, which only stays tied to the GL when
- * both sides are stock-tracked ('inventory') items — any other type is invisible to inventory
+ * Builds move stock value between items' inventory asset accounts, which only stays tied to the
+ * valuation when both sides are stock-tracked ('inventory') items — any other type is invisible to inventory
  * valuation and COGS relief, so its share of the value would vanish from the reports.
  */
 function assertInventoryType(item: { name: string; type: string }, role: 'assembly' | 'component'): void {
@@ -155,6 +152,50 @@ async function loadItem(ctx: ServiceContext, itemId: string) {
     .where(and(eq(items.companyId, ctx.companyId), eq(items.id, itemId)));
   if (!row) throw notFound('Item');
   return row;
+}
+
+/** The item's inventory asset account (item.assetAccountId ?? code 1300). */
+async function inventoryAccountOf(ctx: ServiceContext, item: { assetAccountId: string | null }): Promise<string> {
+  if (item.assetAccountId) return item.assetAccountId;
+  const [row] = await ctx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300')));
+  if (!row) throw notFound('Account with code 1300');
+  return row.id;
+}
+
+/**
+ * Post the value one item hands to another in a build / unbuild: Dr the receiving item's
+ * inventory asset account, Cr the giving item's. One entry per component, tagged
+ * `assembly_build:<buildId>:<fromItemId>:<toItemId>` (or assembly_unbuild) so the inventory
+ * valuation reports attribute each side to its item. QB posts Build Assembly to the GL too;
+ * when both items share an account the entry nets to zero on that account.
+ */
+async function postValueMove(
+  tx: ServiceContext,
+  args: {
+    kind: 'build' | 'unbuild';
+    buildId: string;
+    date: Date;
+    assemblyName: string;
+    from: { id: string; name: string; assetAccountId: string | null };
+    to: { id: string; name: string; assetAccountId: string | null };
+    amount: ReturnType<typeof Money.zero>;
+  },
+): Promise<void> {
+  if (!args.amount.greaterThan(0)) return;
+  const amount = toAmountString(args.amount);
+  const label = args.kind === 'build' ? 'Build' : 'Unbuild';
+  await postJournalEntry(tx, {
+    date: args.date,
+    description: `${label} assembly — ${args.assemblyName}`,
+    sourceRef: `assembly_${args.kind}:${args.buildId}:${args.from.id}:${args.to.id}`,
+    lines: [
+      { accountId: await inventoryAccountOf(tx, args.to), debit: amount, memo: `${label} assembly — ${args.to.name}` },
+      { accountId: await inventoryAccountOf(tx, args.from), credit: amount, memo: `${label} assembly — ${args.from.name}` },
+    ],
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -354,16 +395,14 @@ export async function getBom(ctx: ServiceContext, assemblyItemId: string): Promi
  * For each BOM component:
  *   - Requires quantityOnHand >= quantity * componentQty
  *   - Reduces component quantityOnHand by quantity * componentQty
- *   - Adds component cost (componentQty * averageCost) to the running total
+ *   - Adds the component's value moved (book value before minus after) to the running total
  *
  * Updates assembly item:
  *   - Increases quantityOnHand by `quantity`
  *   - Sets averageCost = totalComponentCost / quantity  (weighted into existing stock)
  *
- * GL: No journal entry is posted. Both sides are account 1300 (Inventory Asset),
- * so the net GL impact is $0.  Moving the cost between items is captured in the
- * item-level averageCost and quantityOnHand fields, which drive the inventory
- * valuation report. An audit log entry documents the build for traceability.
+ * GL: one entry per component, Dr the assembly's inventory asset account / Cr the
+ * component's (see postValueMove), so every asset account keeps the value of its items.
  */
 export async function buildAssembly(
   ctx: ServiceContext,
@@ -407,6 +446,7 @@ export async function buildAssembly(
 
   // Validate sufficient stock for all components
   let totalCost = Money.zero();
+  const compCosts = new Map<string, ReturnType<typeof Money.zero>>();
   for (const bomLine of bom) {
     const comp = componentMap.get(bomLine.componentItemId);
     if (!comp) throw notFound(`Component item ${bomLine.componentItemId}`);
@@ -421,8 +461,10 @@ export async function buildAssembly(
       );
     }
 
-    // Accumulate cost: componentQtyPerUnit * buildQty * averageCost
-    const compCost = required.times(Money.of(comp.averageCost ?? '0'));
+    // Value leaving the component: its book value before minus after (cent-exact, telescoping —
+    // the same rule as COGS), so the GL entry and the item valuation move by the same amount.
+    const compCost = bookValueRelief(onHand, onHand.minus(required), Money.of(comp.averageCost ?? '0'));
+    compCosts.set(comp.id, compCost);
     totalCost = totalCost.plus(compCost);
   }
 
@@ -453,7 +495,7 @@ export async function buildAssembly(
     // Increase assembly quantityOnHand and recalculate weighted averageCost
     const existingQty = Money.of(assembly.quantityOnHand ?? '0');
     const existingAvgCost = Money.of(assembly.averageCost ?? '0');
-    const existingValue = existingQty.times(existingAvgCost);
+    const existingValue = Money.round2(existingQty.times(existingAvgCost));
     const newAssemblyQty = existingQty.plus(buildQty);
     const newAssemblyAvgCost = newAssemblyQty.isZero()
       ? Money.zero()
@@ -484,9 +526,24 @@ export async function buildAssembly(
       },
     });
 
-    // Advanced Inventory: components leave, finished goods arrive, at the build's site.
+    // GL: each component's value moves to the assembly's inventory asset account.
     const buildId = randomUUID();
-    await recordMovements(tx, buildMovements(input, bom, buildQty, 1, 'build', buildId));
+    const buildDate = input.date ?? new Date();
+    for (const bomLine of bom) {
+      const comp = componentMap.get(bomLine.componentItemId)!;
+      await postValueMove(tx, {
+        kind: 'build',
+        buildId,
+        date: buildDate,
+        assemblyName: assembly.name,
+        from: comp,
+        to: assembly,
+        amount: compCosts.get(comp.id) ?? Money.zero(),
+      });
+    }
+
+    // Advanced Inventory: components leave, finished goods arrive, at the build's site.
+    await recordMovements(tx, buildMovements({ ...input, date: buildDate }, bom, buildQty, 1, 'build', buildId));
 
     return {
       assemblyItemId: input.assemblyItemId,
@@ -511,9 +568,8 @@ export async function buildAssembly(
  * share, and each component's averageCost is recalculated as a weighted
  * average of its existing stock and the returned units at that distributed
  * unit cost. Total item-level inventory value is therefore conserved exactly,
- * which is what keeps the no-GL-posting design sound: account 1300 is
- * unchanged and item-level valuation still ties to it even when component
- * costs have drifted since the build.
+ * and the per-component entries (Dr component account / Cr assembly account) keep each
+ * inventory asset account tied to its items even when component costs have drifted.
  */
 export async function unbuildAssembly(
   ctx: ServiceContext,
@@ -560,7 +616,12 @@ export async function unbuildAssembly(
   // Value being removed from the assembly item. The returned components must
   // absorb exactly this value (not their current averageCost) so that total
   // inventory value is conserved without a GL posting.
-  const removedValue = unbuildQty.times(Money.of(assembly.averageCost ?? '0'));
+  // Cent-exact book value before minus after (the same telescoping rule as COGS).
+  const removedValue = bookValueRelief(
+    currentAssemblyQty,
+    currentAssemblyQty.minus(unbuildQty),
+    Money.of(assembly.averageCost ?? '0'),
+  );
 
   // Distribute removedValue across components proportionally to their
   // current-cost share; if every component carries a $0 averageCost,
@@ -583,21 +644,25 @@ export async function unbuildAssembly(
     Money.zero(),
   );
 
+  // Penny-exact split of the removed value (current-cost shares, else returned quantities).
+  const parts = allocate(
+    removedValue,
+    returnLines.map((l) =>
+      totalCurrentValue.greaterThan(0) ? l.currentValue : totalReturnedQty.greaterThan(0) ? l.returned : Money.of(1),
+    ),
+  );
+
   return inTransaction(ctx, async (tx) => {
+    const unbuildId = randomUUID();
+    const unbuildDate = input.date ?? new Date();
     // Restore each component's quantityOnHand, weighting the returned value
     // share into the component's averageCost.
-    for (const line of returnLines) {
+    for (const [idx, line] of returnLines.entries()) {
       const { comp, returned } = line;
-
-      const share = totalCurrentValue.greaterThan(0)
-        ? line.currentValue.dividedBy(totalCurrentValue)
-        : totalReturnedQty.greaterThan(0)
-          ? returned.dividedBy(totalReturnedQty)
-          : Money.zero();
-      const valueReturned = removedValue.times(share);
+      const valueReturned = parts[idx];
 
       const oldQty = Money.of(comp.quantityOnHand ?? '0');
-      const oldValue = oldQty.times(Money.of(comp.averageCost ?? '0'));
+      const oldValue = Money.round2(oldQty.times(Money.of(comp.averageCost ?? '0')));
       const newQty = oldQty.plus(returned);
       const newAvgCost = newQty.isZero()
         ? Money.zero()
@@ -627,6 +692,17 @@ export async function unbuildAssembly(
           reason: `assembly_unbuild:${input.assemblyItemId}`,
         },
       });
+
+      // GL: the value moves back from the assembly's inventory account to the component's.
+      await postValueMove(tx, {
+        kind: 'unbuild',
+        buildId: unbuildId,
+        date: unbuildDate,
+        assemblyName: assembly.name,
+        from: assembly,
+        to: comp,
+        amount: valueReturned,
+      });
     }
 
     // Reduce assembly quantityOnHand (averageCost stays the same)
@@ -652,7 +728,7 @@ export async function unbuildAssembly(
     });
 
     // Advanced Inventory: finished goods leave, components return, at the site.
-    await recordMovements(tx, buildMovements(input, bom, unbuildQty, -1, 'unbuild', randomUUID()));
+    await recordMovements(tx, buildMovements({ ...input, date: unbuildDate }, bom, unbuildQty, -1, 'unbuild', unbuildId));
 
     return {
       assemblyItemId: input.assemblyItemId,

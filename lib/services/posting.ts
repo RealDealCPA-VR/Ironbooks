@@ -563,8 +563,55 @@ async function restoreRefundedCustomerCredit(
     .from(vendorCredits)
     .where(and(eq(vendorCredits.companyId, tx.companyId), eq(vendorCredits.id, docId)));
   if (credit && credit.status !== 'void') {
-    const unapplied = Money.round2(Money.of(credit.unapplied).plus(base));
-    const refunded = Money.round2(Money.of(credit.refundedAmount).minus(base));
+    // p1 fx: a foreign credit's unapplied / refunded amounts are in its currency, while `base` is
+    // the entry's home debit total (bank + any exchange loss). Give back the FOREIGN amount the
+    // refund consumed (recorded on its audit row) and the home relief it took off A/P (its A/P
+    // credit line) to homeUnapplied.
+    let amount = base;
+    let homeRelief: ReturnType<typeof Money.zero> | null = null;
+    if (credit.currency) {
+      const creditAccountIds = [...new Set(lines.filter((l) => Money.gt(l.credit ?? '0', 0)).map((l) => l.accountId))];
+      const apIds = new Set(
+        creditAccountIds.length
+          ? (
+              await tx.db
+                .select({ id: accounts.id })
+                .from(accounts)
+                .where(
+                  and(
+                    inArray(accounts.id, creditAccountIds),
+                    sql`(${accounts.subtype} = 'accounts_payable' OR ${accounts.code} = '2000')`,
+                  ),
+                )
+            ).map((a) => a.id)
+          : [],
+      );
+      homeRelief = Money.round2(
+        lines.filter((l) => apIds.has(l.accountId)).reduce((s, l) => s.plus(Money.of(l.credit ?? '0')), Money.zero()),
+      );
+      const [refundAudit] = await tx.db
+        .select({ newValues: auditLogs.newValues })
+        .from(auditLogs)
+        .where(
+          and(
+            eq(auditLogs.companyId, tx.companyId),
+            eq(auditLogs.entityType, 'vendor_credit'),
+            eq(auditLogs.entityId, credit.id),
+            sql`${auditLogs.newValues}->>'action' = 'refund'`,
+            sql`${auditLogs.newValues}->>'postedEntryId' = ${entryId}`,
+          ),
+        )
+        .limit(1);
+      const recorded = (refundAudit?.newValues as { amount?: string } | null)?.amount;
+      const rate = Money.of(credit.exchangeRate ?? 1);
+      amount = recorded
+        ? Money.round2(Money.of(recorded))
+        : rate.greaterThan(0)
+          ? Money.round2(Money.div(homeRelief, rate))
+          : homeRelief;
+    }
+    const unapplied = Money.round2(Money.of(credit.unapplied).plus(amount));
+    const refunded = Money.round2(Money.of(credit.refundedAmount).minus(amount));
     const status = unapplied.greaterThanOrEqualTo(Money.of(credit.total)) ? 'open' : 'partial';
     await tx.db
       .update(vendorCredits)
@@ -572,6 +619,9 @@ async function restoreRefundedCustomerCredit(
         unapplied: toAmountString(unapplied),
         refundedAmount: toAmountString(refunded.lessThan(0) ? Money.zero() : refunded),
         status: status as never,
+        ...(homeRelief !== null && credit.homeUnapplied != null
+          ? { homeUnapplied: toAmountString(Money.round2(Money.of(credit.homeUnapplied).plus(homeRelief))) }
+          : {}),
       })
       .where(eq(vendorCredits.id, credit.id));
     await writeAudit(tx, {

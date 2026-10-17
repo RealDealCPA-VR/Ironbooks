@@ -35,6 +35,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
+import { assertPeriodOpen } from './fiscalPeriods';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
@@ -241,7 +242,11 @@ export async function vendorCreditApplicationDate(
     );
   }
   // Same day but an earlier time of day: take the later moment so the order is kept.
-  return date < floor ? floor : date;
+  const result = date < floor ? floor : date;
+  // A dated (un)application moves the bill's and the credit's open balances on that day: one dated
+  // in a closed period would change that period's A/P aging, even when no exchange entry posts.
+  await assertPeriodOpen(ctx, result);
+  return result;
 }
 
 /**

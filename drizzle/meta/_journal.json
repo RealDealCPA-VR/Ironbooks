@@ -365,6 +365,13 @@
       "when": 1781400058000,
       "tag": "0058_acctcopy2",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1781400059000,
+      "tag": "0059_deposit_line_accounts",
+      "breakpoints": true
     }
   ]
 }

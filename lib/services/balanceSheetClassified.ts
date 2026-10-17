@@ -15,8 +15,9 @@
  * Equity and net income are included unchanged (same logic as balanceSheet in reports.ts).
  * The report queries posted GL activity, not cached account balances, for accuracy.
  */
-import { and, eq, lte, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import { onOrBeforeDay } from './journal';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { isCurrentAsset, isCurrentLiability } from '@/lib/accountTypes';
@@ -78,7 +79,7 @@ async function classifiedAccountActivity(ctx: ServiceContext, asOf?: Date) {
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
   ];
-  if (asOf) conds.push(lte(journalEntries.date, asOf));
+  if (asOf) conds.push(onOrBeforeDay(asOf)); // whole day (entries with a time of day)
 
   const rows = await ctx.db
     .select({

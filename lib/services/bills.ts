@@ -888,6 +888,34 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
       .where(eq(billLines.billId, id))
       .orderBy(asc(billLines.lineOrder));
 
+    // Billable lines already pulled onto a customer invoice keep that link (so they are not
+    // offered for billing again) when the edit leaves them financially unchanged; changing one
+    // is refused, as for checks/expenses (expenses.ts).
+    const billedLinkByNewIdx = new Map<number, string>();
+    const billedOld = oldLines.filter((l) => l.billedInvoiceId);
+    if (billedOld.length) {
+      const sameCurrency = (prep.currency ?? null) === (bill.currency ?? null);
+      for (const o of billedOld) {
+        const idx = prep.resolvedLines.findIndex(
+          (n, i) =>
+            !billedLinkByNewIdx.has(i) &&
+            n.accountId === o.accountId &&
+            (n.itemId ?? null) === (o.itemId ?? null) &&
+            Money.eq(n.amount, o.amount) &&
+            Money.eq(n.quantity, o.quantity) &&
+            (n.customerId ?? null) === (o.customerId ?? null) &&
+            (n.jobId ?? null) === (o.jobId ?? null),
+        );
+        if (!sameCurrency || idx === -1) {
+          throw new ServiceError(
+            'CONFLICT',
+            'A line of this bill was already billed to a customer on an invoice. Remove it from that invoice before changing its amount, account, item, quantity, customer or job.',
+          );
+        }
+        billedLinkByNewIdx.set(idx, o.billedInvoiceId!);
+      }
+    }
+
     // 1) Void the original journal entry (assertPeriodOpen runs on its date).
     if (bill.postedEntryId) {
       await voidJournalEntry(tx, bill.postedEntryId);
@@ -911,6 +939,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
         classId: line.classId,
         customerId: line.customerId,
         jobId: line.jobId,
+        billedInvoiceId: billedLinkByNewIdx.get(idx) ?? null,
         lineOrder: idx,
       })),
     );
@@ -1162,6 +1191,12 @@ export async function getBill(ctx: ServiceContext, id: string) {
 // ---------------------------------------------------------------------------
 
 export async function voidBill(ctx: ServiceContext, id: string) {
+  // Load + validate in the same transaction as the void: a second concurrent void then sees the
+  // bill already void (idempotent) instead of releasing its PO / receipt quantities again.
+  return inTransaction(ctx, (tx) => voidBillInTx(tx, id));
+}
+
+async function voidBillInTx(ctx: ServiceContext, id: string) {
   // Fetch the bill and verify company ownership.
   const [bill] = await ctx.db
     .select()

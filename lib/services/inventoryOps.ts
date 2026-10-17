@@ -40,6 +40,7 @@ import {
   type AdjustmentDimensions,
   adjustmentPostingFields,
   assertNotFifoTracked,
+  bookValueRelief,
   resolveAdjustmentAccount,
 } from './inventory';
 import { postJournalEntry } from './posting';
@@ -292,7 +293,6 @@ export async function physicalCount(
   const avgCost = Money.of(item.averageCost ?? '0');
 
   const delta = counted.minus(currentQty);
-  const absDelta = delta.abs();
 
   // No change — update qty to match counted (no-op if equal) and return early
   if (delta.isZero()) {
@@ -308,7 +308,8 @@ export async function physicalCount(
     };
   }
 
-  const glAmount = Money.round2(absDelta.times(avgCost));
+  // Book value before minus after (telescopes: counting to zero clears the item's value exactly).
+  const glAmount = bookValueRelief(currentQty, counted, avgCost).abs();
 
   return inTransaction(ctx, async (tx) => {
     // Resolve the inventory asset account

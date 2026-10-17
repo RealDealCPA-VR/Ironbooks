@@ -13,7 +13,7 @@
  *    re-plugged on their own dates, so GL A/R equals the aging as of every date with no void.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { and, eq, lte, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import path from 'node:path';
 import fs from 'node:fs';
 import Dec from 'decimal.js';
@@ -30,6 +30,7 @@ import {
 import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { trialBalance, balanceSheet } from './reports';
+import { onOrBeforeDay } from './journal';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { upsertCurrency, setBaseCurrency, setAccountCurrency } from './currencies';
 import { createInvoice } from './invoices';
@@ -56,13 +57,16 @@ async function bal(code: string): Promise<string> {
   const [row] = await db.select().from(accounts).where(eq(accounts.id, acct[code]));
   return Money.of(row.balance).toFixed(2);
 }
-/** Natural GL balance of an account from posted lines dated on/before `asOf` (A/P: credit +). */
+/**
+ * Natural GL balance of an account from posted lines dated on/before `asOf`'s whole UTC day
+ * (A/P: credit +) — the trial balance / balance sheet / aging bound (review3).
+ */
 async function balAsOf(code: string, asOf: Date): Promise<string> {
   const [row] = await db
     .select({ d: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`, c: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)` })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .where(and(eq(journalEntryLines.accountId, acct[code]), eq(journalEntries.status, 'posted'), lte(journalEntries.date, asOf)));
+    .where(and(eq(journalEntryLines.accountId, acct[code]), eq(journalEntries.status, 'posted'), onOrBeforeDay(asOf)));
   const net = Money.of(row.d).minus(Money.of(row.c));
   return (code.startsWith('1') ? net : net.negated()).toFixed(2);
 }

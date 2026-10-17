@@ -13,7 +13,7 @@ import { serviceErrorBody } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { createManualEntry, listEntries } from '@/lib/services/journal';
-import { zodErrorBody } from '@/lib/validation/helpers';
+import { queryDate, queryInt, zodErrorBody } from '@/lib/validation/helpers';
 import { createJournalEntrySchema } from '@/lib/validation/journal';
 
 export async function GET(req: NextRequest) {
@@ -21,10 +21,10 @@ export async function GET(req: NextRequest) {
     const ctx = await getServerContext();
     const sp = req.nextUrl.searchParams;
 
-    const from = sp.get('from') ? new Date(sp.get('from')!) : undefined;
-    const to = sp.get('to') ? new Date(sp.get('to')!) : undefined;
-    const limit = Math.min(Number(sp.get('limit') ?? 100), 500);
-    const offset = Number(sp.get('offset') ?? 0);
+    const from = queryDate(sp, 'from');
+    const to = queryDate(sp, 'to');
+    const limit = queryInt(sp, 'limit', 100, 500);
+    const offset = queryInt(sp, 'offset', 0);
 
     const entries = await listEntries(ctx, { from, to, limit, offset });
     return NextResponse.json({ entries });

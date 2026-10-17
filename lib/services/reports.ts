@@ -2,8 +2,9 @@
  * Financial reports computed from the journal (the source of truth), not cached balances.
  * Start with Trial Balance, P&L, and Balance Sheet — the foundation set.
  */
-import { and, eq, lte, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import { onOrBeforeDay } from './journal';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { fiscalYearWindow } from './fiscalClose';
@@ -42,7 +43,9 @@ async function accountActivity(ctx: ServiceContext, asOf?: Date, since?: Date) {
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
   ];
-  if (asOf) conds.push(lte(journalEntries.date, asOf));
+  // Whole-day bound: postings with a time of day (year-end close at 23:59:59Z, bank-feed
+  // entries, older data) belong to their own day.
+  if (asOf) conds.push(onOrBeforeDay(asOf));
   const sinceCond = since ? sql`${journalEntries.date} >= ${since}` : sql`FALSE`;
 
   const rows = await ctx.db
@@ -137,7 +140,7 @@ export async function profitAndLoss(
     notFiscalCloseEntry(),
   ];
   if (range?.from) conds.push(sql`${journalEntries.date} >= ${range.from}`);
-  if (range?.to) conds.push(lte(journalEntries.date, range.to));
+  if (range?.to) conds.push(onOrBeforeDay(range.to));
   if (opts?.classId) conds.push(eq(journalEntryLines.classId, opts.classId));
 
   const rows = await ctx.db

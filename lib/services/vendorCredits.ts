@@ -50,8 +50,9 @@ import {
 } from '@/lib/services/posting';
 import { receivePurchasedStock } from './bills';
 import { takeFromLayers } from './fifo';
+import { bookValueRelief } from './inventory';
 import { postDocumentInventory, reverseDocumentInventory } from './inventorySites';
-import { planPostedEdit, retitleEntry } from './postedEdit';
+import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import {
   applyForeignVendorCredit,
@@ -317,7 +318,8 @@ async function relieveReturnedStock(
     .limit(1);
   const cost = layer
     ? (await takeFromLayers(tx, itemId, qty)).cost
-    : Money.round2(qty.times(Money.of(item.averageCost ?? '0')));
+    : // Average cost: book value before minus after, so returning the last units clears it.
+      bookValueRelief(onHand, onHand.minus(qty), Money.of(item.averageCost ?? '0'));
   const newQty = onHand.minus(qty);
   await tx.db
     .update(items)
@@ -626,6 +628,9 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
 
     let entryId = cur.postedEntryId;
     if (plan === 'unchanged') {
+      // Item-line credits decide "unchanged" without planPostedEdit, so its closing-date check
+      // (closing-date password + Closing Date Exception report) has to run here.
+      if (hasItems) await assertClosedPeriodEdit(tx, { entryId: cur.postedEntryId, what: 'vendor credit', date: cur.date });
       // Keep the entry and the stock; carry each line's relieved cost forward.
       const costs = new Map<number, Decimal>();
       oldLines.forEach((l, i) => {
@@ -759,6 +764,12 @@ export async function getVendorCredit(ctx: ServiceContext, id: string) {
  * bill is reduced and the credit is consumed.
  */
 export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) {
+  // Load + validate in the same transaction as the write: two concurrent applies must not both
+  // see the full unapplied credit / bill balance.
+  return inTransaction(ctx, (tx) => applyToBillInTx(tx, input));
+}
+
+async function applyToBillInTx(ctx: ServiceContext, input: ApplyToBillInput) {
   const applyAmount = Money.round2(input.amount);
 
   if (!applyAmount.greaterThan(0)) {
@@ -928,6 +939,11 @@ export async function netAppliedToBill(ctx: ServiceContext, vendorCreditId: stri
 }
 
 export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBillInput) {
+  // Load + validate in the same transaction as the write (no lost update between two unapplies).
+  return inTransaction(ctx, (tx) => unapplyFromBillInTx(tx, input));
+}
+
+async function unapplyFromBillInTx(ctx: ServiceContext, input: UnapplyFromBillInput) {
   const unapplyAmount = Money.round2(input.amount);
 
   if (!unapplyAmount.greaterThan(0)) {
@@ -1076,6 +1092,11 @@ export interface RefundVendorCreditInput {
  * open-bill / open-credit subledger.
  */
 export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendorCreditInput) {
+  // Load + validate in the same transaction as the write (no double refund of one credit).
+  return inTransaction(ctx, (tx) => refundVendorCreditInTx(tx, input));
+}
+
+async function refundVendorCreditInTx(ctx: ServiceContext, input: RefundVendorCreditInput) {
   const [credit] = await ctx.db
     .select()
     .from(vendorCredits)

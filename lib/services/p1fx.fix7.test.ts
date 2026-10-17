@@ -14,7 +14,7 @@
  *            credit with a blank rate keeps its saved rate and stays ledger-neutral.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { and, eq, lte, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
@@ -32,6 +32,7 @@ import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createAccount } from './accounts';
 import { trialBalance } from './reports';
+import { onOrBeforeDay } from './journal';
 import { upsertCurrency, setBaseCurrency, setAccountCurrency } from './currencies';
 import { createVendor } from './vendors';
 import { createCustomer } from './customers';
@@ -68,13 +69,17 @@ const days = (from: string, to: string) => {
 };
 const home = (amt: string, rate: string) => Money.round2(Money.of(amt).times(Money.of(rate)));
 
-/** GL A/P (credit-positive) from posted lines dated on/before `asOf`. */
+/**
+ * GL A/P (credit-positive) from posted lines dated on/before `asOf`'s whole UTC day — the same
+ * bound as the trial balance / balance sheet and the aging (a same-day unapply is sequenced after
+ * its apply, e.g. at 16:00, and belongs to that day).
+ */
 async function apAsOf(asOf: Date): Promise<string> {
   const [row] = await db
     .select({ d: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`, c: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)` })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .where(and(eq(journalEntryLines.accountId, acct['2000']), eq(journalEntries.status, 'posted'), lte(journalEntries.date, asOf)));
+    .where(and(eq(journalEntryLines.accountId, acct['2000']), eq(journalEntries.status, 'posted'), onOrBeforeDay(asOf)));
   return Money.of(row.c).minus(Money.of(row.d)).toFixed(2);
 }
 async function arAsOf(asOf: Date): Promise<string> {
@@ -82,7 +87,7 @@ async function arAsOf(asOf: Date): Promise<string> {
     .select({ d: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`, c: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)` })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .where(and(eq(journalEntryLines.accountId, acct['1200']), eq(journalEntries.status, 'posted'), lte(journalEntries.date, asOf)));
+    .where(and(eq(journalEntryLines.accountId, acct['1200']), eq(journalEntries.status, 'posted'), onOrBeforeDay(asOf)));
   return Money.of(row.d).minus(Money.of(row.c)).toFixed(2);
 }
 async function apMismatches(dates: Date[]): Promise<string[]> {

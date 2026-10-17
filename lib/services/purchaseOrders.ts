@@ -137,8 +137,10 @@ export async function createPurchaseOrder(
 
   for (let i = 0; i < input.lines.length; i++) {
     const l = input.lines[i];
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
+    // Quantity and rate are stored at 4 places (numeric(15,4)); the amount is worked out from the
+    // stored values so an edit or Convert to Bill (qty x stored rate) gives the same amount.
+    const qty = Money.of(Money.of(l.quantity).toFixed(4));
+    const rate = Money.of(Money.of(l.rate).toFixed(4));
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
     if (!l.accountId && !l.itemId) {
@@ -152,8 +154,8 @@ export async function createPurchaseOrder(
       itemId: l.itemId ?? null,
       accountId: l.accountId ?? null,
       description: l.description ?? null,
-      quantity: toAmountString(qty),
-      rate: toAmountString(rate),
+      quantity: qty.toFixed(4),
+      rate: rate.toFixed(4),
       amount: toAmountString(amount),
       lineOrder: i,
     });
@@ -306,8 +308,9 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
     let total = Money.zero();
     const keepIds = new Set<string>();
     const computed = input.lines.map((l, i) => {
-      const qty = Money.of(l.quantity);
-      const rate = Money.of(l.rate);
+      // Stored at 4 places; the amount is worked out from the stored values (see create).
+      const qty = Money.of(Money.of(l.quantity).toFixed(4));
+      const rate = Money.of(Money.of(l.rate).toFixed(4));
       if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
       if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
       if (!l.accountId && !l.itemId) throw validation(`Line ${i + 1}: select an account or an item.`);
@@ -333,8 +336,8 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
         itemId: l.itemId ?? null,
         accountId: l.accountId ?? null,
         description: l.description ?? null,
-        quantity: toAmountString(qty),
-        rate: toAmountString(rate),
+        quantity: qty.toFixed(4),
+        rate: rate.toFixed(4),
         amount: toAmountString(amount),
         lineOrder: i,
       };
@@ -652,7 +655,9 @@ export async function convertToBill(
       vendorId: po.vendorId,
       billNumber: opts?.billNumber ?? null,
       date: opts?.date ?? po.date,
-      dueDate: po.expectedDate ?? null,
+      // The PO's expected date is a DELIVERY date, not a payment due date: leave it blank so
+      // createBill works the due date out from the vendor's terms (QB parity).
+      dueDate: null,
       memo: po.memo,
       lines: billLineInputs,
     });

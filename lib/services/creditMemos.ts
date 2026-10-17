@@ -64,6 +64,7 @@ import {
 import { Money, allocate, toAmountString } from '@/lib/money';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { getHomeCurrencyCode } from './currencies';
 import {
   type InventoryLineDetail,
@@ -745,6 +746,12 @@ export async function getCreditMemo(ctx: ServiceContext, id: string) {
  * adjusting balanceDue and status on both documents.
  */
 export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceInput) {
+  // Load + validate in the same transaction as the write: two concurrent applies must not both
+  // see the full unapplied balance.
+  return inTransaction(ctx, (tx) => applyToInvoiceInTx(tx, input));
+}
+
+async function applyToInvoiceInTx(ctx: ServiceContext, input: ApplyToInvoiceInput) {
   const amount = Money.round2(input.amount);
   if (!amount.greaterThan(0)) {
     throw validation('Apply amount must be greater than zero.');
@@ -761,6 +768,9 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
   }
   // Accountant's Copy (I1): a credit memo dated after the dividing date belongs to the client.
   await assertAccountantDatesOpen(ctx, [memo.date], 'The credit memo');
+  // The application is dated: one back-dated into a closed period would change its A/R aging.
+  const applicationDate = input.date ?? new Date();
+  const periodCheck = await assertPeriodOpen(ctx, applicationDate);
 
   const unapplied = Money.of(memo.unapplied);
   if (amount.greaterThan(unapplied)) {
@@ -839,9 +849,15 @@ export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceI
         invoiceId: invoice.id,
         paymentId: input.paymentId ?? null,
         amount: toAmountString(amount),
-        date: input.date ?? new Date(),
+        date: applicationDate,
       })
       .returning();
+    await recordClosingDateException(tx, periodCheck, {
+      entryId: memo.id,
+      operation: 'apply',
+      transactionDate: applicationDate,
+      sourceRef: `credit_application:${application.id}`,
+    });
 
     await writeAudit(tx, {
       action: 'update',
@@ -899,13 +915,22 @@ export async function listCreditApplications(
  * again. No GL entry (applying posted none either — the memo credited A/R when it was saved).
  */
 export async function unapplyCreditApplication(ctx: ServiceContext, applicationId: string) {
-  const [app] = await ctx.db
-    .select()
-    .from(creditApplications)
-    .where(and(eq(creditApplications.companyId, ctx.companyId), eq(creditApplications.id, applicationId)));
-  if (!app) throw notFound('Credit application');
-
   return inTransaction(ctx, async (tx) => {
+    // Loaded inside the transaction: a second concurrent undo of the same application finds it gone.
+    const [app] = await tx.db
+      .select()
+      .from(creditApplications)
+      .where(and(eq(creditApplications.companyId, tx.companyId), eq(creditApplications.id, applicationId)));
+    if (!app) throw notFound('Credit application');
+    // The application is dated: removing one from a closed period changes that period's A/R aging.
+    const periodCheck = await assertPeriodOpen(tx, app.date, { movable: false });
+    await recordClosingDateException(tx, periodCheck, {
+      entryId: app.creditMemoId,
+      operation: 'unapply',
+      transactionDate: app.date,
+      sourceRef: `credit_application:${app.id}`,
+    });
+
     const [memo] = await tx.db
       .select()
       .from(creditMemos)
@@ -961,6 +986,11 @@ export interface RefundCreditMemoInput {
  * and the subledger no longer carries the credit. Control account == subledger.
  */
 export async function refundCreditMemo(ctx: ServiceContext, input: RefundCreditMemoInput) {
+  // Load + validate in the same transaction as the write (no double refund of one credit).
+  return inTransaction(ctx, (tx) => refundCreditMemoInTx(tx, input));
+}
+
+async function refundCreditMemoInTx(ctx: ServiceContext, input: RefundCreditMemoInput) {
   const [memo] = await ctx.db
     .select()
     .from(creditMemos)
@@ -1232,6 +1262,12 @@ async function reverseCreditMemoPostings(
  * remove), which would otherwise drive quantityOnHand negative.
  */
 export async function voidCreditMemo(ctx: ServiceContext, id: string) {
+  // Load + validate in the same transaction as the void: a concurrent refund/apply cannot slip
+  // in between the "nothing used" check and the void.
+  return inTransaction(ctx, (tx) => voidCreditMemoInTx(tx, id));
+}
+
+async function voidCreditMemoInTx(ctx: ServiceContext, id: string) {
   const [memo] = await ctx.db
     .select()
     .from(creditMemos)

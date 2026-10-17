@@ -29,6 +29,7 @@ import {
   writeAudit,
 } from './_base';
 import { requireEffectivePermission } from './access';
+import { can, type Area } from '@/lib/permissions/model';
 import { createInvoice, type CreateInvoiceInput } from './invoices';
 import { createBill, type CreateBillInput } from './bills';
 import { createManualEntry, type ManualEntryInput } from './journal';
@@ -56,6 +57,37 @@ export const DOC_TYPES = [
   'purchase_order',
 ] as const;
 export type DocType = (typeof DOC_TYPES)[number];
+
+/**
+ * Permission area whose 'create' entering a memorized document needs (the same area as the
+ * document's own create route in lib/permissions/routes.ts). /api/recurring/run only requires
+ * Accounting, so Enter Now / Enter Group / Run due must also hold the document's own right.
+ */
+const DOC_AREA: Record<DocType, Area> = {
+  invoice: 'customers',
+  sales_receipt: 'customers',
+  credit_memo: 'customers',
+  bill: 'vendors',
+  purchase_order: 'vendors',
+  expense: 'banking',
+  check: 'banking',
+  deposit: 'banking',
+  journal_entry: 'accounting',
+  transfer: 'accounting',
+};
+
+const DOC_LABEL_PLURAL: Record<DocType, string> = {
+  invoice: 'invoices',
+  sales_receipt: 'sales receipts',
+  credit_memo: 'credit memos',
+  bill: 'bills',
+  purchase_order: 'purchase orders',
+  expense: 'expenses',
+  check: 'checks',
+  deposit: 'deposits',
+  journal_entry: 'journal entries',
+  transfer: 'transfers',
+};
 
 export const FREQUENCIES = [
   'never',
@@ -550,6 +582,15 @@ async function generateFromTemplate(
 ): Promise<GeneratedDoc> {
   const payload = payloadOf(template.template as Record<string, unknown>);
   let docId: string;
+  // No-op for trusted contexts without `access` (the desktop launch-time / hourly run).
+  const area = DOC_AREA[template.docType as DocType];
+  if (area && ctx.access && !can(ctx.access, area, 'create')) {
+    throw new ServiceError(
+      'FORBIDDEN',
+      `You don't have permission to create ${DOC_LABEL_PLURAL[template.docType as DocType]}.`,
+      { area, action: 'create', docPermission: true },
+    );
+  }
 
   switch (template.docType as DocType) {
     case 'invoice': {
@@ -696,6 +737,15 @@ function isFeatureOff(err: ServiceError): boolean {
   return (err.details as { featureOff?: boolean } | undefined)?.featureOff === true;
 }
 
+/**
+ * A refusal that only concerns THIS template — the feature is off, or the user lacks the
+ * document's own create permission — is recorded in `failed` and the run continues. Any other
+ * FORBIDDEN (view-only role, no access to the company) stops the run.
+ */
+function skipsTemplate(err: ServiceError): boolean {
+  return isFeatureOff(err) || (err.details as { docPermission?: boolean } | undefined)?.docPermission === true;
+}
+
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -766,7 +816,7 @@ export async function runDue(
       );
       if (doc) generated.push(doc);
     } catch (err) {
-      if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !isFeatureOff(err)) throw err;
+      if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !skipsTemplate(err)) throw err;
       failed.push({ templateId: template.id, templateName: template.name, error: errMessage(err) });
     }
   }
@@ -821,7 +871,7 @@ export async function runGroup(
     try {
       generated.push(await runTemplateNow(ctx, t.id));
     } catch (err) {
-      if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !isFeatureOff(err)) throw err;
+      if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !skipsTemplate(err)) throw err;
       failed.push({ templateId: t.id, templateName: t.name, error: errMessage(err) });
     }
   }

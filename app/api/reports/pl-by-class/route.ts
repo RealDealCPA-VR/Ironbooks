@@ -12,14 +12,15 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { profitAndLossByClass } from '@/lib/services/classReports';
+import { queryDate } from '@/lib/validation/helpers';
 
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const sp = req.nextUrl.searchParams;
 
-    const from = sp.get('from') ? new Date(sp.get('from')!) : undefined;
-    const to = sp.get('to') ? new Date(sp.get('to')!) : undefined;
+    const from = queryDate(sp, 'from');
+    const to = queryDate(sp, 'to');
 
     const report = await profitAndLossByClass(ctx, { from, to });
     return NextResponse.json(report);

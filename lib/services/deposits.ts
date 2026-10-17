@@ -811,10 +811,12 @@ function fxHeader(prep: PreparedDeposit) {
 }
 
 export async function createDeposit(ctx: ServiceContext, input: CreateDepositInput) {
-  const prep = await prepareDeposit(ctx, input);
-  const { netStr, paymentIds, salesReceiptIds, invoicePaymentIds, extraLines, cashBackAmt } = prep;
-
   return inTransaction(ctx, async (tx) => {
+    // Validate inside the transaction ("already deposited" etc.), so two concurrent deposits of
+    // the same payment cannot both pass (updateDeposit does the same).
+    const prep = await prepareDeposit(tx, input);
+    const { netStr, paymentIds, salesReceiptIds, invoicePaymentIds, extraLines, cashBackAmt } = prep;
+
     // 1. Post GL.
     const entry = await postJournalEntry(tx, {
       date: input.date,

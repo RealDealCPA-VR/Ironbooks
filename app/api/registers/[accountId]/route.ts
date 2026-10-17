@@ -17,6 +17,7 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { accountRegister } from '@/lib/services/journal';
 import { withAccountCurrency } from '@/lib/services/fxLedger';
+import { queryDate } from '@/lib/validation/helpers';
 
 type Params = { params: Promise<{ accountId: string }> };
 
@@ -26,8 +27,8 @@ export async function GET(req: NextRequest, { params }: Params) {
     const ctx = await getServerContext();
     const sp = req.nextUrl.searchParams;
 
-    const from = sp.get('from') ? new Date(sp.get('from')!) : undefined;
-    const to = sp.get('to') ? new Date(sp.get('to')!) : undefined;
+    const from = queryDate(sp, 'from');
+    const to = queryDate(sp, 'to');
     const search = sp.get('search') ?? undefined;
     const limitRaw = sp.get('limit');
     const offsetRaw = sp.get('offset');

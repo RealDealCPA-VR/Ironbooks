@@ -462,8 +462,10 @@ describe('inventory suite (value adjust, counts, commitment, pending builds, val
     expect(byId.get(avgId)?.quantityAsOf).toBe('8.0000'); // exact: cost unchanged since
     // FIFO: 60 + 40 = 100
     expect(byId.get(fifoId)?.valueAsOf).toBe('100.00');
-    // CMP keeps its GL value (assembly build posts no GL — documented)
-    expect(byId.get(cmpId)?.valueAsOf).toBe('10.00');
+    // review3: the build posts Dr assembly / Cr component, so the value moved with the units:
+    // CMP keeps 1 unit @ $2 and the kit carries the $8 of components it consumed.
+    expect(byId.get(cmpId)?.valueAsOf).toBe('2.00');
+    expect(byId.get(asmId)?.valueAsOf).toBe('8.00');
   });
 
   it('inventoryValuationDetail lists movements with a running balance', async () => {

@@ -24,7 +24,7 @@
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { customers, items, salesOrders, salesOrderLines, taxRates } from '@/lib/db/schema';
+import { auditLogs, customers, items, salesOrders, salesOrderLines, taxRates } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -549,8 +549,10 @@ export async function convertToInvoice(
       newValues: {
         status: newStatus,
         invoiceId: invoice.id,
+        // Read back by releaseSalesOrderInvoicingForInvoice when this invoice is voided.
         invoicedQuantities: plan.map(({ line, qty }) => ({
           lineId: line.id,
+          itemId: line.itemId ?? null,
           quantity: qty.toFixed(4),
         })),
       },
@@ -558,6 +560,115 @@ export async function convertToInvoice(
 
     return invoice;
   });
+}
+
+/** Order status the line quantities imply (closed = fully invoiced, partial = some invoiced). */
+function soStatusFromLines(lines: Array<{ quantity: string; quantityInvoiced: string | null }>) {
+  const invoiced = lines.map((l) => Money.of(l.quantityInvoiced ?? '0'));
+  if (lines.length > 0 && lines.every((l, i) => !Money.of(l.quantity).minus(invoiced[i]).greaterThan(0))) {
+    return 'closed' as const;
+  }
+  return invoiced.some((q) => q.greaterThan(0)) ? ('partial' as const) : ('open' as const);
+}
+
+/**
+ * Voiding an invoice made by convertToInvoice gives the sales-order lines back the quantities it
+ * invoiced, so the order can be invoiced again (QB reopens the sales order) — the same approach
+ * as releasePoBillingForBill for purchase orders. The claim is read from convertToInvoice's audit
+ * row ({ invoiceId, invoicedQuantities }), written in the same transaction as the claim. Editing
+ * the invoice later does not change what it claimed, so the void releases the original claim
+ * (never below zero). A line that no longer has its id (orders edited before ids were kept) is
+ * matched by item. An order the user closed by hand (backorder cancelled) stays closed; otherwise
+ * the status is recomputed from the lines.
+ */
+export async function releaseSalesOrderInvoicingForInvoice(ctx: ServiceContext, invoiceId: string): Promise<void> {
+  const rows = await ctx.db
+    .select({ entityId: auditLogs.entityId, newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'sales_order'),
+        sql`${auditLogs.newValues}->>'invoiceId' = ${invoiceId}`,
+        sql`${auditLogs.newValues}->'invoicedQuantities' IS NOT NULL`,
+      ),
+    );
+  for (const row of rows) {
+    const soId = row.entityId;
+    const nv = (row.newValues ?? {}) as {
+      invoicedQuantities?: Array<{ lineId?: string; itemId?: string | null; quantity?: string }>;
+    };
+    const claims = (nv.invoicedQuantities ?? []).filter((c) => Money.of(c.quantity ?? 0).greaterThan(0));
+    if (!soId || claims.length === 0) continue;
+    const [order] = await ctx.db
+      .select()
+      .from(salesOrders)
+      .where(and(eq(salesOrders.id, soId), eq(salesOrders.companyId, ctx.companyId)));
+    if (!order || order.status === 'void') continue;
+
+    const linesNow = async () =>
+      ctx.db
+        .select({
+          id: salesOrderLines.id,
+          itemId: salesOrderLines.itemId,
+          quantity: salesOrderLines.quantity,
+          quantityInvoiced: salesOrderLines.quantityInvoiced,
+        })
+        .from(salesOrderLines)
+        .where(eq(salesOrderLines.salesOrderId, soId))
+        .orderBy(asc(salesOrderLines.lineOrder));
+    const before = await linesNow();
+    const derivedBefore = soStatusFromLines(before);
+
+    // Remaining invoiced quantity per line as we release (caps every release at what is there).
+    const left = new Map(before.map((l) => [l.id, Money.of(l.quantityInvoiced ?? '0')]));
+    const released: Array<{ lineId: string; quantity: string }> = [];
+    const take = async (lineId: string, qty: ReturnType<typeof Money.of>) => {
+      const have = left.get(lineId) ?? Money.zero();
+      const q = qty.greaterThan(have) ? have : qty;
+      if (!q.greaterThan(0)) return Money.zero();
+      left.set(lineId, have.minus(q));
+      const qtyStr = q.toFixed(4);
+      await ctx.db
+        .update(salesOrderLines)
+        .set({ quantityInvoiced: sql`GREATEST(${salesOrderLines.quantityInvoiced} - ${qtyStr}::numeric, 0)` })
+        .where(and(eq(salesOrderLines.id, lineId), eq(salesOrderLines.salesOrderId, soId)));
+      released.push({ lineId, quantity: qtyStr });
+      return q;
+    };
+    for (const c of claims) {
+      let rest = Money.of(c.quantity!);
+      if (c.lineId && left.has(c.lineId)) {
+        rest = rest.minus(await take(c.lineId, rest));
+        continue;
+      }
+      // Line id gone: release from the order's lines for the same item, in line order.
+      for (const l of before) {
+        if (!rest.greaterThan(0)) break;
+        if ((l.itemId ?? null) !== (c.itemId ?? null) || c.itemId === undefined) continue;
+        rest = rest.minus(await take(l.id, rest));
+      }
+    }
+    if (released.length === 0) continue;
+
+    const derivedAfter = soStatusFromLines(await linesNow());
+    const keepManualStatus = order.status !== derivedBefore;
+    const newStatus = keepManualStatus ? order.status : derivedAfter;
+    await ctx.db
+      .update(salesOrders)
+      .set({
+        status: newStatus as never,
+        ...(order.convertedInvoiceId === invoiceId ? { convertedInvoiceId: null } : {}),
+      })
+      .where(and(eq(salesOrders.id, soId), eq(salesOrders.companyId, ctx.companyId)));
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'sales_order',
+      entityId: soId,
+      oldValues: { status: order.status },
+      newValues: { status: newStatus, reason: 'invoice_voided', voidedInvoiceId: invoiceId, releasedQuantities: released },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +815,9 @@ export async function updateSalesOrder(ctx: ServiceContext, id: string, input: C
     await tx.db.delete(salesOrderLines).where(eq(salesOrderLines.salesOrderId, id));
     await tx.db.insert(salesOrderLines).values(
       computedLines.map((cl, i) => ({
+        // Kept lines keep their id: convertToInvoice's claims (audit trail) name them, so voiding
+        // an earlier invoice can still give the quantity back to the right line.
+        ...(input.lines[i].id && oldById.has(input.lines[i].id!) ? { id: input.lines[i].id! } : {}),
         salesOrderId: id,
         itemId: cl.itemId,
         description: cl.description,

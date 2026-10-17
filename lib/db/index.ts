@@ -20,6 +20,9 @@ import { translatePgErrors } from './pgErrors';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ServiceError } from '@/lib/services/errors';
 import { OPEN_BLOCKING, checkLedgerHealth, ensureLedgerGuards, type LedgerProblem } from './ledgerGuards';
+import { acquireDirLock, releaseDirLock } from './dirLock';
+
+export { CompanyFileInUseError, LOCK_FILE } from './dirLock';
 
 export type DB = PgliteDatabase<typeof schema>;
 
@@ -124,9 +127,18 @@ export function openDb(dataDir?: string): DbHandle {
   }
 
   fs.mkdirSync(dir, { recursive: true });
+  // Refuse a company file another process has open (PGlite has no lock of its own, so two
+  // writers on one folder silently lose each other's transactions) — lib/db/dirLock.ts.
+  acquireDirLock(dir);
   // Postgres data errors (malformed uuid 22P02, numeric overflow 22003) become ServiceErrors for
   // every query, so bad input answers 4xx instead of 500 (lib/db/pgErrors.ts).
-  const client = translatePgErrors(new PGlite(dir));
+  let client: PGlite;
+  try {
+    client = translatePgErrors(new PGlite(dir));
+  } catch (err) {
+    releaseDirLock(dir);
+    throw err;
+  }
   const db = drizzle(client, { schema });
   // Commit tracking for the running transaction log (appends only after COMMIT).
   instrumentDb(db, dir);
@@ -197,6 +209,7 @@ export async function closeDb(dataDir?: string): Promise<void> {
       await handle.client.close();
     } finally {
       handles.delete(dir);
+      releaseDirLock(dir);
     }
   }
 }

@@ -13,6 +13,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { generalLedger } from '@/lib/services/journal';
+import { queryDate } from '@/lib/validation/helpers';
 
 export async function GET(req: NextRequest) {
   try {
@@ -20,8 +21,8 @@ export async function GET(req: NextRequest) {
     const sp = req.nextUrl.searchParams;
 
     const accountId = sp.get('accountId') ?? undefined;
-    const from = sp.get('from') ? new Date(sp.get('from')!) : undefined;
-    const to = sp.get('to') ? new Date(sp.get('to')!) : undefined;
+    const from = queryDate(sp, 'from');
+    const to = queryDate(sp, 'to');
 
     const ledger = await generalLedger(ctx, { accountId, from, to });
     return NextResponse.json({ ledger });

@@ -143,6 +143,19 @@ interface LineRow {
   amount: string;
   classId: string;
   customerId: string;
+  /**
+   * Item lines loaded for edit: the stored amount and the item / qty / unit cost shown with it.
+   * The stored unit cost is rounded to 4 places, so while those are untouched the line re-sends
+   * the stored amount instead of letting the server recompute qty x rounded cost.
+   */
+  loaded?: { itemId: string; quantity: string; unitCost: string; amount: string };
+}
+
+/** The stored amount of an item line loaded for edit, while its item / qty / cost are untouched. */
+function loadedItemAmount(l: LineRow): string | null {
+  const o = l.loaded;
+  if (!o || l.mode !== 'item') return null;
+  return l.itemId === o.itemId && l.quantity === o.quantity && l.unitCost === o.unitCost ? o.amount : null;
 }
 
 /** UI entry type → service method + refund flag. */
@@ -218,7 +231,13 @@ function lineTotal(l: LineRow): number {
       return Money.zero();
     }
   };
-  if (l.mode === 'item' && !l.amount) return Money.round2(dec(l.quantity).times(dec(l.unitCost))).toNumber();
+  if (l.mode === 'item') {
+    // Mirrors what Save sends: the stored amount of an untouched loaded line, else qty x cost
+    // when a cost is entered, else the typed amount.
+    const kept = loadedItemAmount(l);
+    if (kept != null) return Money.round2(dec(kept)).toNumber();
+    if (l.unitCost || !l.amount) return Money.round2(dec(l.quantity).times(dec(l.unitCost))).toNumber();
+  }
   return Money.round2(dec(l.amount)).toNumber();
 }
 
@@ -491,7 +510,15 @@ function ExpensesPageContent() {
       setLines(
         d.lines.map((l) =>
           l.itemId
-            ? { ...emptyLine('item'), itemId: l.itemId, quantity: String(Number(l.quantity ?? 1)), unitCost: l.unitCost ? String(Number(l.unitCost)) : '', amount: String(Math.abs(Number(l.amount)).toFixed(2)), description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '' }
+            ? (() => {
+                const shown = {
+                  itemId: l.itemId,
+                  quantity: String(Number(l.quantity ?? 1)),
+                  unitCost: l.unitCost ? String(Number(l.unitCost)) : '',
+                  amount: String(Math.abs(Number(l.amount)).toFixed(2)),
+                };
+                return { ...emptyLine('item'), ...shown, description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '', loaded: shown };
+              })()
             : { ...emptyLine('expense'), accountId: l.accountId, amount: isCredit ? String(Math.abs(Number(l.amount)).toFixed(2)) : l.amount, description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '' },
         ),
       );
@@ -667,8 +694,10 @@ function ExpensesPageContent() {
           ? {
               itemId: l.itemId,
               quantity: l.quantity,
-              unitCost: l.unitCost || undefined,
-              amount: l.unitCost ? undefined : l.amount || undefined,
+              // An untouched loaded line re-sends its stored amount (the server derives the cost).
+              ...(loadedItemAmount(l) != null
+                ? { amount: loadedItemAmount(l)! }
+                : { unitCost: l.unitCost || undefined, amount: l.unitCost ? undefined : l.amount || undefined }),
               description: l.description.trim() || undefined,
               classId: l.classId || undefined,
               customerId: l.customerId || undefined,

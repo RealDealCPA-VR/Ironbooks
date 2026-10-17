@@ -1278,6 +1278,8 @@ async function postPaycheckEntry(
   paycheckId: string,
   payDate: Date,
   bankAccountId?: string | null,
+  /** Check number already stamped on the paycheck (Print Checks); default: the id prefix. */
+  checkNumber?: string | null,
 ) {
   const { employee, itemFor } = prep;
   const { payrollExpenseId, payrollTaxExpenseId, payrollLiabId, checkingId } = prep.accountsUsed;
@@ -1342,7 +1344,7 @@ async function postPaycheckEntry(
   return postJournalEntry(tx, {
     date: payDate,
     description: `Payroll — ${fullName}`,
-    reference: paycheckId.slice(0, 8),
+    reference: checkNumber?.trim() || paycheckId.slice(0, 8),
     sourceRef: `paycheck:${paycheckId}`,
     lines: postingLines,
   });
@@ -1486,7 +1488,8 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
     if (lineValues.length > 0) await tx.db.insert(paycheckLines).values(lineValues);
 
     // 3) Re-post.
-    const entry = await postPaycheckEntry(tx, prep, paycheckId, input.payDate);
+    // A printed paycheck keeps its check number on the re-posted entry (registers show it).
+    const entry = await postPaycheckEntry(tx, prep, paycheckId, input.payDate, null, pc.checkNumber);
     const [updated] = await tx.db
       .update(paychecks)
       .set({

@@ -13,7 +13,8 @@
  * posted by other services (invoices, expenses, transfers, etc.).
  */
 import { assertReconciliationDateOpen } from './accountantCopy/guard';
-import { and, desc, eq, inArray, isNull, lt, lte, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
+import { onOrBeforeDay } from './journal';
 import {
   accounts,
   bankAccounts,
@@ -333,7 +334,8 @@ export async function listClearable(
         eq(journalEntries.companyId, ctx.companyId),
         eq(journalEntries.status, 'posted'),
         ne(journalEntries.status, 'void'),
-        lte(journalEntries.date, asOf),
+        // Whole statement day: entries carrying a time of day belong to their own day.
+        onOrBeforeDay(asOf),
       ),
     );
 

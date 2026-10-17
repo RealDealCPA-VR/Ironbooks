@@ -250,7 +250,10 @@ export async function incomeTracker(
       const daysOverdue = Math.floor((today.getTime() - startOfDay(due).getTime()) / DAY_MS);
       const overdue = daysOverdue > 0;
       const billed = Money.of(i.total).minus(Money.of(i.retainage ?? '0'));
-      const status = overdue ? 'overdue' : Money.of(a.openBalance).lessThan(billed) ? 'partial' : 'open';
+      // openBalance is home currency; a foreign invoice compares its foreign open amount with its
+      // (foreign) billed total.
+      const openInDocCurrency = Money.of(a.foreignOpenBalance ?? a.openBalance);
+      const status = overdue ? 'overdue' : openInDocCurrency.lessThan(billed) ? 'partial' : 'open';
       rows.push({
         bucket: overdue ? 'overdue' : 'unpaid', type: i.sc ? 'statement_charge' : 'invoice', id: i.id,
         customerId: a.entityId, customerName: '', number: docRef(i.ref, i.num), date: iso(i.date)!, dueDate: iso(due),
@@ -274,13 +277,15 @@ export async function incomeTracker(
   ];
   if (custFilter) payConds.push(eq(paymentsReceived.customerId, custFilter));
   for (const p of await ctx.db
-    .select({ id: paymentsReceived.id, customerId: paymentsReceived.customerId, ref: paymentsReceived.reference, date: paymentsReceived.date, amount: paymentsReceived.amount, method: paymentsReceived.method })
+    .select({ id: paymentsReceived.id, customerId: paymentsReceived.customerId, ref: paymentsReceived.reference, date: paymentsReceived.date, amount: paymentsReceived.amount, method: paymentsReceived.method, rate: paymentsReceived.exchangeRate })
     .from(paymentsReceived)
     .where(and(...payConds))) {
     if (!Money.of(p.amount).greaterThan(0)) continue;
+    // Like invoice rows: amount in the payment's currency, openBalance (summed into the bar) in home.
+    const home = p.rate && !Money.eq(Money.of(p.rate), 1) ? Money.round2(Money.of(p.amount).times(Money.of(p.rate))) : Money.of(p.amount);
     rows.push({
       bucket: 'paid', type: 'payment', id: p.id, customerId: p.customerId, customerName: '', number: p.ref,
-      date: iso(p.date)!, dueDate: null, amount: toAmountString(p.amount), openBalance: toAmountString(p.amount),
+      date: iso(p.date)!, dueDate: null, amount: toAmountString(p.amount), openBalance: toAmountString(home),
       status: p.method, daysOverdue: null,
     });
   }

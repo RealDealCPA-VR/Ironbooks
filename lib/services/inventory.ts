@@ -20,7 +20,8 @@
  *
  * averageCost is maintained as a weighted average: updated on positive receipts only.
  */
-import { and, asc, eq, inArray, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { onOrBeforeDay } from './journal';
 import Decimal from 'decimal.js';
 import {
   items,
@@ -35,6 +36,14 @@ import {
   purchaseOrderLines,
   journalEntries,
   journalEntryLines,
+  invoiceLines,
+  salesReceiptLines,
+  creditMemoLines,
+  billLines,
+  expenseLines,
+  itemReceiptLines,
+  itemReceiptBillLines,
+  vendorCreditLines,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
@@ -274,6 +283,16 @@ export interface AdjustInventoryInput extends AdjustmentDimensions {
   memo?: string | null;
 }
 
+/**
+ * Value relieved when an average-cost item goes from `oldQty` to `newQty` units on hand: its book
+ * value before minus after (each rounded to the cent, as inventoryValuation reports it). Unlike
+ * round2(qty × avg) this telescopes over successive removals, so selling out clears the item's
+ * inventory value to exactly zero (QB relieves the last unit at the value that remains).
+ */
+export function bookValueRelief(oldQty: Decimal, newQty: Decimal, avg: Decimal): Decimal {
+  return Money.round2(oldQty.times(avg)).minus(Money.round2(newQty.times(avg)));
+}
+
 export async function adjustInventory(ctx: ServiceContext, input: AdjustInventoryInput) {
   const qtyChange = Money.of(input.quantityChange);
   if (qtyChange.isZero()) throw validation('quantityChange cannot be zero.');
@@ -321,8 +340,7 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
   } else {
     // Removing stock — value at current average cost (or, in an Accountant's Copy import, at the
     // cost the accountant's file used; the average is then re-derived from what is left).
-    const absQty = qtyChange.abs();
-    const atAverage = Money.round2(absQty.times(currentAvgCost));
+    const atAverage = bookValueRelief(currentQty, currentQty.plus(qtyChange), currentAvgCost);
     const accountantCost = takeAccountantCost(input.itemId);
     glAmount = accountantCost ? Money.round2(accountantCost) : atAverage;
     newQty = currentQty.plus(qtyChange); // qtyChange is negative
@@ -453,9 +471,10 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
   // Accountant's Copy import: the cost the accountant's file used (null otherwise). The average is
   // re-derived from what is left so the item's value stays equal to the ledger.
   const accountantCost = takeAccountantCost(input.itemId);
-  const cogsAmount = accountantCost ? Money.round2(accountantCost) : Money.round2(qty.times(avgCost));
+  const atAverage = bookValueRelief(currentQty, newQty, avgCost);
+  const cogsAmount = accountantCost ? Money.round2(accountantCost) : atAverage;
   const newAvgCost =
-    accountantCost && !cogsAmount.equals(Money.round2(qty.times(avgCost)))
+    accountantCost && !cogsAmount.equals(atAverage)
       ? averageAfter(currentQty, avgCost, newQty, cogsAmount.negated())
       : avgCost;
 
@@ -771,23 +790,28 @@ export async function stockStatus(ctx: ServiceContext): Promise<StockStatusResul
 // As-of-date valuation + valuation detail (GL-derived)
 // ---------------------------------------------------------------------------
 //
-// Every quantity-affecting inventory operation that touches the GL (average
-// receipts/removals via adjustInventory, COGS via recordCOGS, FIFO receipts/
-// consumption via fifo.ts, physical counts and value adjustments via
-// inventoryOps.ts) posts a journal entry tagged sourceRef = `item:<itemId>`
-// with a line on the item's inventory asset account. That makes the item's
-// inventory VALUE at any past date exactly reconstructable from the ledger:
-//   valueAsOf = SUM(debit - credit) over those lines dated <= asOf.
+// An item's inventory VALUE at any past date is reconstructed from the posted lines on the
+// inventory asset accounts, attributed to items by the document that posted them
+// (loadItemGlMovements):
+//   - `item:<id>` entries (adjustments, FIFO receipts / consumption, physical counts, value
+//     adjustments, landed cost, opening stock): the item named in the tag.
+//   - COGS / restock entries posted per line (`invoice-cogs:` + reference cogs:<lineOrder>,
+//     `salesreceipt:` / `creditmemo-cogs:` + reference = the line id): that line's item.
+//   - `assembly_build:` / `assembly_unbuild:<id>:<fromItem>:<toItem>`: credit -> from, debit -> to.
+//   - Purchase documents (`bill:`, `expense:`, `item_receipt:`, `vendor_credit:`): the asset
+//     account's amount is split over the document's inventory item lines on that account (bill /
+//     check / receipt line amounts, receive-items price variance capitalized, vendor-credit return
+//     cost); foreign-currency line amounts are scaled to the posted home amount.
+//   valueAsOf = SUM(attributed debit - credit) over entries dated <= asOf.
 //
 // Documented approximations:
 //   - QUANTITY as of a past date is approximated as valueAsOf / currentUnitCost
 //     (current averageCost for average items; remaining-layer effective cost
 //     for FIFO items). It is exact whenever the unit cost has not changed
 //     since the as-of date, and is reported null when the current cost is $0.
-//   - Assembly builds/unbuilds post no GL (both sides are the same inventory
-//     asset account), so value moved between an assembly and its components
-//     stays attributed to the component items in this report. The company-wide
-//     grand total still ties to the GL inventory asset balance.
+//   - Entries with no item detail (manual journal entries on an inventory account, condensed
+//     summaries, imported GL history) are not attributed to any item, so the per-item values then
+//     no longer add up to the GL balance.
 
 interface ItemGlMovement {
   entryId: string;
@@ -798,22 +822,62 @@ interface ItemGlMovement {
   credit: Decimal;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Split a signed `net` over signed `weights` (exact when they already sum to it; else scaled, penny-exact). */
+function splitByWeights(net: Decimal, weights: Map<string, Decimal>): Map<string, Decimal> {
+  const out = new Map<string, Decimal>();
+  const entries = [...weights.entries()].filter(([, w]) => !w.isZero());
+  if (entries.length === 0) return out;
+  const sum = entries.reduce((s, [, w]) => s.plus(w), Money.zero());
+  if (sum.equals(net)) {
+    for (const [k, w] of entries) out.set(k, w);
+    return out;
+  }
+  if (sum.isZero()) return out;
+  let allocated = Money.zero();
+  let largest = entries[0][0];
+  let largestAbs = Money.zero();
+  for (const [k, w] of entries) {
+    const part = Money.round2(net.times(w).dividedBy(sum));
+    out.set(k, part);
+    allocated = allocated.plus(part);
+    if (w.abs().greaterThan(largestAbs)) {
+      largestAbs = w.abs();
+      largest = k;
+    }
+  }
+  const rest = net.minus(allocated);
+  if (!rest.isZero()) out.set(largest, out.get(largest)!.plus(rest));
+  return out;
+}
+
 /**
- * Load all posted inventory-asset GL movements tagged `item:<id>`, grouped by
- * item id, optionally limited to entries dated <= asOf. Only lines hitting the
- * item's own inventory asset account (assetAccountId ?? code 1300) count.
+ * Load all posted inventory-asset GL movements attributed to items (see the module notes above),
+ * grouped by item id, optionally limited to entries dated <= asOf. Only items in
+ * `itemAccountById` are returned, and only value on each item's own inventory asset account.
  */
 async function loadItemGlMovements(
   ctx: ServiceContext,
   itemAccountById: Map<string, string | null>,
   asOf?: Date,
 ): Promise<Map<string, ItemGlMovement[]>> {
+  // Every inventory item's asset account (attribution needs all of them, not only the report's).
+  const allItems = await ctx.db
+    .select({ id: items.id, assetAccountId: items.assetAccountId })
+    .from(items)
+    .where(and(eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')));
+  const accountOf = await inventoryAccountMap(ctx, allItems);
+  const invAccounts = [...new Set([...accountOf.values()].filter((v): v is string => !!v))];
+  if (invAccounts.length === 0) return new Map();
+
   const conditions = [
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
-    sql`${journalEntries.sourceRef} LIKE 'item:%'`,
+    inArray(journalEntryLines.accountId, invAccounts),
   ];
-  if (asOf) conditions.push(lte(journalEntries.date, asOf));
+  // Whole as-of day (the trial balance / balance sheet bound): entries with a time of day count.
+  if (asOf) conditions.push(onOrBeforeDay(asOf));
 
   const lines = await ctx.db
     .select({
@@ -822,6 +886,7 @@ async function loadItemGlMovements(
       date: journalEntries.date,
       description: journalEntries.description,
       sourceRef: journalEntries.sourceRef,
+      reference: journalEntries.reference,
       createdAt: journalEntries.createdAt,
       accountId: journalEntryLines.accountId,
       debit: journalEntryLines.debit,
@@ -832,21 +897,193 @@ async function loadItemGlMovements(
     .where(and(...conditions))
     .orderBy(asc(journalEntries.date), asc(journalEntries.createdAt));
 
+  // --- Document line detail for the purchase / per-line COGS sources -----------------------
+  const refsOf = (prefix: string) => [
+    ...new Set(
+      lines
+        .filter((l) => (l.sourceRef ?? '').startsWith(prefix))
+        .map((l) => (l.sourceRef ?? '').slice(prefix.length))
+        .filter((id) => UUID_RE.test(id)),
+    ),
+  ];
+  const lineRefsOf = (prefix: string) => [
+    ...new Set(
+      lines
+        .filter((l) => (l.sourceRef ?? '').startsWith(prefix) && UUID_RE.test(l.reference ?? ''))
+        .map((l) => l.reference!),
+    ),
+  ];
+
+  const invoiceIds = refsOf('invoice-cogs:');
+  const invoiceLineItem = new Map<string, string>(); // `${invoiceId}|${lineOrder}` -> itemId
+  if (invoiceIds.length) {
+    const rows = await ctx.db
+      .select({ invoiceId: invoiceLines.invoiceId, lineOrder: invoiceLines.lineOrder, itemId: invoiceLines.itemId })
+      .from(invoiceLines)
+      .where(inArray(invoiceLines.invoiceId, invoiceIds));
+    for (const r of rows) if (r.itemId) invoiceLineItem.set(`${r.invoiceId}|${r.lineOrder}`, r.itemId);
+  }
+  const lineItem = new Map<string, string>(); // sales receipt / credit memo line id -> itemId
+  const srLineIds = lineRefsOf('salesreceipt:');
+  if (srLineIds.length) {
+    const rows = await ctx.db
+      .select({ id: salesReceiptLines.id, itemId: salesReceiptLines.itemId })
+      .from(salesReceiptLines)
+      .where(inArray(salesReceiptLines.id, srLineIds));
+    for (const r of rows) if (r.itemId) lineItem.set(r.id, r.itemId);
+  }
+  const cmLineIds = lineRefsOf('creditmemo-cogs:');
+  if (cmLineIds.length) {
+    const rows = await ctx.db
+      .select({ id: creditMemoLines.id, itemId: creditMemoLines.itemId })
+      .from(creditMemoLines)
+      .where(inArray(creditMemoLines.id, cmLineIds));
+    for (const r of rows) if (r.itemId) lineItem.set(r.id, r.itemId);
+  }
+
+  // Signed weights per source document: sourceRef -> itemId -> weight (on the item's own account).
+  const docWeights = new Map<string, Map<string, Decimal>>();
+  const addWeight = (sourceRef: string, itemId: string | null, amount: string | Decimal | null) => {
+    if (!itemId || amount == null || !accountOf.has(itemId)) return;
+    const m = docWeights.get(sourceRef) ?? new Map<string, Decimal>();
+    m.set(itemId, (m.get(itemId) ?? Money.zero()).plus(Money.of(amount)));
+    docWeights.set(sourceRef, m);
+  };
+  const billIds = refsOf('bill:');
+  if (billIds.length) {
+    const rows = await ctx.db
+      .select({ billId: billLines.billId, itemId: billLines.itemId, accountId: billLines.accountId, amount: billLines.amount })
+      .from(billLines)
+      .where(inArray(billLines.billId, billIds));
+    for (const r of rows) {
+      if (r.itemId && accountOf.get(r.itemId) === r.accountId) addWeight(`bill:${r.billId}`, r.itemId, r.amount);
+    }
+    const variances = await ctx.db
+      .select({
+        billId: itemReceiptBillLines.billId,
+        itemId: itemReceiptBillLines.itemId,
+        amount: itemReceiptBillLines.inventoryVariance,
+      })
+      .from(itemReceiptBillLines)
+      .where(and(eq(itemReceiptBillLines.companyId, ctx.companyId), inArray(itemReceiptBillLines.billId, billIds)));
+    for (const r of variances) addWeight(`bill:${r.billId}`, r.itemId, r.amount);
+  }
+  const expenseIds = refsOf('expense:');
+  if (expenseIds.length) {
+    const rows = await ctx.db
+      .select({
+        expenseId: expenseLines.expenseId,
+        itemId: expenseLines.itemId,
+        accountId: expenseLines.accountId,
+        amount: expenseLines.amount,
+      })
+      .from(expenseLines)
+      .where(inArray(expenseLines.expenseId, expenseIds));
+    for (const r of rows) {
+      if (r.itemId && accountOf.get(r.itemId) === r.accountId) addWeight(`expense:${r.expenseId}`, r.itemId, r.amount);
+    }
+  }
+  const receiptIds = refsOf('item_receipt:');
+  if (receiptIds.length) {
+    const rows = await ctx.db
+      .select({ receiptId: itemReceiptLines.itemReceiptId, itemId: itemReceiptLines.itemId, amount: itemReceiptLines.amount })
+      .from(itemReceiptLines)
+      .where(inArray(itemReceiptLines.itemReceiptId, receiptIds));
+    for (const r of rows) addWeight(`item_receipt:${r.receiptId}`, r.itemId, r.amount);
+  }
+  const creditIds = refsOf('vendor_credit:');
+  if (creditIds.length) {
+    const rows = await ctx.db
+      .select({ creditId: vendorCreditLines.vendorCreditId, itemId: vendorCreditLines.itemId, cost: vendorCreditLines.costAmount })
+      .from(vendorCreditLines)
+      .where(inArray(vendorCreditLines.vendorCreditId, creditIds));
+    for (const r of rows) {
+      if (r.cost != null) addWeight(`vendor_credit:${r.creditId}`, r.itemId, Money.of(r.cost).negated());
+    }
+  }
+
+  // --- Attribute entry by entry ---------------------------------------------------------------
+  type Line = (typeof lines)[number];
+  const byEntry = new Map<string, Line[]>();
+  for (const l of lines) {
+    const list = byEntry.get(l.entryId) ?? [];
+    list.push(l);
+    byEntry.set(l.entryId, list);
+  }
+
   const byItem = new Map<string, ItemGlMovement[]>();
-  for (const line of lines) {
-    const itemId = (line.sourceRef ?? '').slice('item:'.length);
-    if (!itemAccountById.has(itemId)) continue;
-    if (line.accountId !== itemAccountById.get(itemId)) continue;
+  const push = (itemId: string, head: Line, debit: Decimal, credit: Decimal) => {
+    if (!itemAccountById.has(itemId)) return;
+    if (debit.isZero() && credit.isZero()) return;
     const list = byItem.get(itemId) ?? [];
     list.push({
-      entryId: line.entryId,
-      entryNumber: line.entryNumber,
-      date: line.date,
-      description: line.description,
-      debit: Money.of(line.debit ?? '0'),
-      credit: Money.of(line.credit ?? '0'),
+      entryId: head.entryId,
+      entryNumber: head.entryNumber,
+      date: head.date,
+      description: head.description,
+      debit,
+      credit,
     });
     byItem.set(itemId, list);
+  };
+  const pushNet = (itemId: string, head: Line, net: Decimal) =>
+    push(itemId, head, net.greaterThan(0) ? net : Money.zero(), net.lessThan(0) ? net.negated() : Money.zero());
+  /** Lines of the entry on `itemId`'s own account go to that item, line by line. */
+  const toItem = (itemId: string | undefined, entryLines: Line[]) => {
+    if (!itemId) return;
+    for (const l of entryLines) {
+      if (l.accountId !== accountOf.get(itemId)) continue;
+      push(itemId, l, Money.of(l.debit ?? '0'), Money.of(l.credit ?? '0'));
+    }
+  };
+
+  for (const entryLines of byEntry.values()) {
+    const head = entryLines[0];
+    const ref = head.sourceRef ?? '';
+    const colon = ref.indexOf(':');
+    const kind = colon >= 0 ? ref.slice(0, colon) : ref;
+    const rest = colon >= 0 ? ref.slice(colon + 1) : '';
+    switch (kind) {
+      case 'item':
+        toItem(rest, entryLines);
+        break;
+      case 'invoice-cogs': {
+        const m = /^cogs:(\d+)$/.exec(head.reference ?? '');
+        if (m) toItem(invoiceLineItem.get(`${rest}|${m[1]}`), entryLines);
+        break;
+      }
+      case 'salesreceipt':
+      case 'creditmemo-cogs':
+        toItem(lineItem.get(head.reference ?? ''), entryLines);
+        break;
+      case 'assembly_build':
+      case 'assembly_unbuild': {
+        const [, fromId, toId] = rest.split(':');
+        for (const l of entryLines) {
+          const credit = Money.of(l.credit ?? '0');
+          const debit = Money.of(l.debit ?? '0');
+          if (credit.greaterThan(0) && fromId && l.accountId === accountOf.get(fromId)) push(fromId, l, Money.zero(), credit);
+          if (debit.greaterThan(0) && toId && l.accountId === accountOf.get(toId)) push(toId, l, debit, Money.zero());
+        }
+        break;
+      }
+      default: {
+        const weights = docWeights.get(ref);
+        if (!weights) break;
+        // Net per inventory account, split over that account's items on the document.
+        const netByAccount = new Map<string, Decimal>();
+        for (const l of entryLines) {
+          netByAccount.set(
+            l.accountId,
+            (netByAccount.get(l.accountId) ?? Money.zero()).plus(Money.of(l.debit ?? '0')).minus(Money.of(l.credit ?? '0')),
+          );
+        }
+        for (const [accountId, net] of netByAccount) {
+          const onAccount = new Map([...weights].filter(([itemId]) => accountOf.get(itemId) === accountId));
+          for (const [itemId, amount] of splitByWeights(net, onAccount)) pushNet(itemId, head, amount);
+        }
+      }
+    }
   }
   return byItem;
 }
@@ -990,7 +1227,7 @@ export async function inventoryValuationAsOf(
     notes: [
       'Values are reconstructed exactly from posted journal entries on each item’s inventory asset account.',
       'Quantities are approximated as value ÷ current unit cost (exact when the unit cost has not changed since the as-of date).',
-      'Assembly builds post no GL (net $0 within the inventory account), so value moved between an assembly and its components remains attributed to the component items here; the grand total still ties to the GL.',
+      'Each posting is attributed to its item through the document that made it (bills, checks, item receipts, vendor credits, sales COGS, restocks, adjustments, assembly builds); manual journal entries on an inventory account are not attributed to any item.',
     ],
   };
 }
@@ -1111,9 +1348,9 @@ export async function inventoryValuationDetail(
     to: opts?.to ? opts.to.toISOString() : null,
     items: resultItems,
     notes: [
-      'Movements are the posted journal-entry lines on each item’s inventory asset account (sourceRef item:<id>).',
+      'Movements are the posted journal-entry lines on each item’s inventory asset account, attributed to the item by the document that posted them.',
       'Approx. qty is derived as value ÷ current unit cost — exact when the unit cost has not changed.',
-      'Assembly builds/unbuilds move value between items without GL postings and therefore do not appear as movements.',
+      'Manual journal entries on an inventory account carry no item and do not appear as movements.',
     ],
   };
 }

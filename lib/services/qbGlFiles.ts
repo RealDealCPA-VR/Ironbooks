@@ -21,6 +21,7 @@
 import AdmZip from 'adm-zip';
 import { XMLParser } from 'fast-xml-parser';
 import Papa from 'papaparse';
+import { csvUnsafeText } from '@/lib/csv';
 import { ServiceError } from './_base';
 
 export interface GridRow {
@@ -73,7 +74,8 @@ export function readCsv(text: string): GridRow[] {
   const clean = text.replace(/^﻿/, '');
   // Tab-separated text (Excel "Text (Tab delimited)") is common too — let papaparse sniff.
   const parsed = Papa.parse<string[]>(clean, { skipEmptyLines: false, delimiter: '' });
-  return parsed.data.map((r) => ({ cells: (r ?? []).map((c) => (c == null ? '' : String(c))) }));
+  // csvUnsafeText: our own report exports prefix formula-like cells ("-Acme") with an apostrophe.
+  return parsed.data.map((r) => ({ cells: (r ?? []).map((c) => (c == null ? '' : csvUnsafeText(String(c)))) }));
 }
 
 // ---------------------------------------------------------------------------

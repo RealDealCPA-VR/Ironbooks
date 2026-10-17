@@ -441,7 +441,7 @@ export async function assertJournalNames(
  * at 23:59:59Z, opening balances dated "now"), and a date-only `to` ('2024-12-31' = midnight)
  * would leave those out of their own day.
  */
-function onOrBeforeDay(to: Date) {
+export function onOrBeforeDay(to: Date) {
   const nextDay = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate() + 1));
   return lt(journalEntries.date, nextDay);
 }
@@ -1383,7 +1383,12 @@ export async function journalOpenItems(
     eq(accounts.type, side === 'ar' ? 'asset' : 'liability'),
     eq(journalEntryLines.entityType, entityType),
   ];
-  if (opts.asOf) conds.push(lte(journalEntries.date, opts.asOf));
+  // Whole as-of day (the trial balance / aging bound): the last instant of asOf's UTC day, used for
+  // both the lines and their applications so they stay consistent.
+  const asOf = opts.asOf
+    ? new Date(Date.UTC(opts.asOf.getUTCFullYear(), opts.asOf.getUTCMonth(), opts.asOf.getUTCDate() + 1) - 1)
+    : undefined;
+  if (asOf) conds.push(lte(journalEntries.date, asOf));
   if (opts.entityId) conds.push(eq(journalEntryLines.entityId, opts.entityId));
   const rows = await ctx.db
     .select({
@@ -1406,7 +1411,7 @@ export async function journalOpenItems(
     .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
   const named = rows.filter((r) => r.entityId);
   const appliedByLine = await journalAppliedByLine(ctx, side, {
-    asOf: opts.asOf,
+    asOf,
     lineIds: opts.entityId ? named.map((r) => r.lineId) : undefined,
   });
   const out: JournalOpenItem[] = [];

@@ -161,7 +161,7 @@ export async function getDashboardInsights(
 
   // A/P due soon = everything overdue + everything coming due within the horizon.
   const apDueSoonRows = await ctx.db
-    .select({ balanceDue: bills.balanceDue })
+    .select({ balanceDue: bills.balanceDue, exchangeRate: bills.exchangeRate })
     .from(bills)
     .where(
       and(
@@ -179,7 +179,7 @@ export async function getDashboardInsights(
     arAging: aging.totals,
     apDueSoon: {
       count: apDueSoonRows.length,
-      total: toAmountString(Money.add(...apDueSoonRows.map((r) => r.balanceDue))),
+      total: homeTotal(apDueSoonRows),
       horizonDays: DUE_SOON_HORIZON_DAYS,
     },
     plTrend,
@@ -281,6 +281,23 @@ async function profitLossTrend(ctx: ServiceContext, now: Date): Promise<PlTrendP
 
 const TOP_N = 5;
 
+/**
+ * Home-currency total of open document balances. A foreign invoice / bill keeps balanceDue in its
+ * own currency; the KPI totals are home currency (like the A/R aging tile), so each foreign
+ * balance counts at the rate it was booked at.
+ */
+function homeTotal(rows: Array<{ balanceDue: string; exchangeRate: string | null }>): string {
+  return toAmountString(
+    Money.add(
+      ...rows.map((r) =>
+        r.exchangeRate && !Money.eq(Money.of(r.exchangeRate), 1)
+          ? Money.round2(Money.of(r.balanceDue).times(Money.of(r.exchangeRate)))
+          : Money.of(r.balanceDue),
+      ),
+    ),
+  );
+}
+
 async function overdueInvoices(ctx: ServiceContext, today: Date) {
   const rows = await ctx.db
     .select({
@@ -289,6 +306,7 @@ async function overdueInvoices(ctx: ServiceContext, today: Date) {
       customerName: customers.displayName,
       dueDate: invoices.dueDate,
       balanceDue: invoices.balanceDue,
+      exchangeRate: invoices.exchangeRate,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
@@ -316,7 +334,7 @@ async function overdueInvoices(ctx: ServiceContext, today: Date) {
   return {
     top,
     count: rows.length,
-    total: toAmountString(Money.add(...rows.map((r) => r.balanceDue))),
+    total: homeTotal(rows),
   };
 }
 
@@ -328,6 +346,7 @@ async function billsDueThisWeek(ctx: ServiceContext, today: Date, weekEnd: Date)
       vendorName: vendors.displayName,
       dueDate: bills.dueDate,
       balanceDue: bills.balanceDue,
+      exchangeRate: bills.exchangeRate,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
@@ -354,7 +373,7 @@ async function billsDueThisWeek(ctx: ServiceContext, today: Date, weekEnd: Date)
   return {
     top,
     count: rows.length,
-    total: toAmountString(Money.add(...rows.map((r) => r.balanceDue))),
+    total: homeTotal(rows),
   };
 }
 

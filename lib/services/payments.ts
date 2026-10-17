@@ -48,7 +48,7 @@ import {
 } from './_base';
 import { assertNotControlAccount, postJournalEntry, postPaymentCreditFxPlugs, voidJournalEntry } from './posting';
 import { paymentCreditEvents, unappliedAsOf } from './customerCredits'; // p1 fx
-import { assertPeriodOpen } from './fiscalPeriods';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
 import { docRef } from './docNumbers';
@@ -1838,6 +1838,11 @@ export interface UnapplyFromInvoiceInput {
  * was booked at a different rate than the payment settled at.
  */
 export async function unapplyFromInvoice(ctx: ServiceContext, input: UnapplyFromInvoiceInput) {
+  // Load + validate in the same transaction as the write (no lost update between two unapplies).
+  return inTransaction(ctx, (tx) => unapplyFromInvoiceInTx(tx, input));
+}
+
+async function unapplyFromInvoiceInTx(ctx: ServiceContext, input: UnapplyFromInvoiceInput) {
   const [payment] = await ctx.db
     .select()
     .from(paymentsReceived)
@@ -1848,6 +1853,15 @@ export async function unapplyFromInvoice(ctx: ServiceContext, input: UnapplyFrom
   if (payment.voidedAt) {
     throw new ServiceError('CONFLICT', 'Cannot unapply a voided payment.');
   }
+  // The application is part of the payment as of its date: removing it changes a closed period's
+  // A/R aging (same rule as journalApplications).
+  const periodCheck = await assertPeriodOpen(ctx, payment.date, { movable: false });
+  await recordClosingDateException(ctx, periodCheck, {
+    entryId: payment.id,
+    operation: 'unapply',
+    transactionDate: payment.date,
+    sourceRef: `payment:${payment.id}`,
+  });
 
   const [app] = await ctx.db
     .select()
@@ -1965,6 +1979,12 @@ export interface ApplyPaymentInput {
  * credited to A/R at receive time — except for an FX plug when rates differ.
  */
 export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput) {
+  // Load + validate in the same transaction as the write: two concurrent applies must not both
+  // see the full unapplied amount.
+  return inTransaction(ctx, (tx) => applyPaymentInTx(tx, input));
+}
+
+async function applyPaymentInTx(ctx: ServiceContext, input: ApplyPaymentInput) {
   if (!input.applications || input.applications.length === 0) {
     throw validation('At least one application is required.');
   }
@@ -1979,6 +1999,15 @@ export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput
   if (payment.voidedAt) {
     throw new ServiceError('CONFLICT', 'Cannot apply a voided payment.');
   }
+  // Applications belong to the payment's date: adding one changes a closed period's A/R aging
+  // (same rule as applyPaymentToJournalCharges).
+  const periodCheck = await assertPeriodOpen(ctx, payment.date, { movable: false });
+  await recordClosingDateException(ctx, periodCheck, {
+    entryId: payment.id,
+    operation: 'apply',
+    transactionDate: payment.date,
+    sourceRef: `payment:${payment.id}`,
+  });
 
   // Validate and sum amounts.
   let sumApplied = Money.zero();
@@ -2149,6 +2178,11 @@ export interface RefundPaymentInput {
  * A/R control stays equal to the open-invoice / open-credit subledger.
  */
 export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInput) {
+  // Load + validate in the same transaction as the write (no double refund of one overpayment).
+  return inTransaction(ctx, (tx) => refundPaymentInTx(tx, input));
+}
+
+async function refundPaymentInTx(ctx: ServiceContext, input: RefundPaymentInput) {
   const [payment] = await ctx.db
     .select()
     .from(paymentsReceived)

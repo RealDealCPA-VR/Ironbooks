@@ -37,7 +37,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/services/reports';
 import type { ServiceContext } from './_base';
 import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
-import { journalCreditsAppliedAfter, journalOpenItems, resolveEntityNames } from './journal';
+import { journalCreditsAppliedAfter, journalOpenItems, onOrBeforeDay, resolveEntityNames } from './journal';
 import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
 import { vendorCreditHomeByBill, vendorCreditRefundsAfter } from './vendorCreditsFx';
@@ -295,6 +295,16 @@ function blankBuckets(): BucketAccum {
   };
 }
 
+/**
+ * The last instant of the as-of date's UTC day. As-of reports cover the WHOLE day (the trial balance
+ * and balance sheet use journal.ts onOrBeforeDay), so postings and applications made later on the
+ * as-of day — FX plugs dated "now", year-end close at 23:59:59Z, bank-feed entries — count in the
+ * aging too and the A/R / A/P control accounts tie to it. Idempotent for an end-of-day input.
+ */
+function endOfAsOfDay(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 1);
+}
+
 function ms_to_days(ms: number): number {
   return Math.floor(ms / (1000 * 60 * 60 * 24));
 }
@@ -346,7 +356,7 @@ async function addBouncedApplicationsAsOf(ctx: ServiceContext, upTo: Date, map: 
  * creditMemoApplicationsAfter) and General Journal credits applied after it are added back.
  */
 export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
-  const cutoff = asOf ?? new Date();
+  const cutoff = endOfAsOfDay(asOf ?? new Date());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   // Invoices dated on/before the cutoff. Do NOT exclude 'paid' — an invoice paid
@@ -663,7 +673,7 @@ async function vendorCreditsOpenAsOf(
 }
 
 export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
-  const cutoff = asOf ?? new Date();
+  const cutoff = endOfAsOfDay(asOf ?? new Date());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -879,7 +889,8 @@ export async function cashFlow(
     notFiscalCloseEntry(),
   ];
   if (range?.from) conds.push(sql`${journalEntries.date} >= ${range.from}`);
-  if (range?.to) conds.push(lte(journalEntries.date, range.to));
+  // Whole "to" day (the balance sheet bound), so the cash change ties to the balance sheets.
+  if (range?.to) conds.push(onOrBeforeDay(range.to));
 
   // Net movement per account over the period.
   const rows = await ctx.db
@@ -1197,7 +1208,7 @@ function buildAgingDetailReport(rows: AgingDetailRow[], cutoff: Date): AgingDeta
  * 'current' rows, mirroring QB's AR Aging Detail.
  */
 export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
-  const cutoff = asOf ?? new Date();
+  const cutoff = endOfAsOfDay(asOf ?? new Date());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -1343,7 +1354,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
  * negative 'current' rows.
  */
 export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
-  const cutoff = asOf ?? new Date();
+  const cutoff = endOfAsOfDay(asOf ?? new Date());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -1489,6 +1500,7 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
       terms: invoices.terms,
       total: invoices.total,
       balanceDue: invoices.balanceDue,
+      exchangeRate: invoices.exchangeRate,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
@@ -1504,7 +1516,12 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
 
   let totalOpen = Money.zero();
   const out: OpenInvoiceRow[] = rows.map((r) => {
-    totalOpen = totalOpen.plus(Money.of(r.balanceDue));
+    // Rows show each invoice in its own currency; the grand total is home currency (a foreign
+    // balance at the invoice's booked rate), so currencies are never added together.
+    const rate = r.exchangeRate ? Money.of(r.exchangeRate) : null;
+    totalOpen = totalOpen.plus(
+      rate && !rate.equals(1) ? Money.round2(Money.of(r.balanceDue).times(rate)) : Money.of(r.balanceDue),
+    );
     const effectiveDue = r.dueDate ?? r.date;
     return {
       invoiceId: r.invoiceId,
@@ -1561,7 +1578,7 @@ export interface CollectionsReport {
  * the invoice date) is strictly before the as-of date and it still has a balance.
  */
 export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promise<CollectionsReport> {
-  const cutoff = asOf ?? new Date();
+  const cutoff = endOfAsOfDay(asOf ?? new Date());
   const rows = await ctx.db
     .select({
       invoiceId: invoices.id,

@@ -289,10 +289,19 @@ export async function checkCreditLimit(
     .select({ balanceDue: invoices.balanceDue, exchangeRate: invoices.exchangeRate })
     .from(invoices)
     .where(and(...openConds));
-  const outstanding = rows.reduce(
+  const openCharges = rows.reduce(
     (sum, row) => sum.plus(Money.round2(Money.mul(Money.of(row.balanceDue), Money.of(row.exchangeRate ?? 1)))),
     Money.zero(),
   );
+  // QB checks the customer's BALANCE: open credits (unapplied credit memos, unapplied payments,
+  // General Journal A/R credits — all home currency) reduce it. Same source as Receive Payments.
+  // Imported lazily: payments.ts imports this module.
+  const { listAvailableCredits } = await import('./payments');
+  const openCredits = (await listAvailableCredits(ctx, customerId)).reduce(
+    (sum, c) => sum.plus(Money.of(c.available)),
+    Money.zero(),
+  );
+  const outstanding = Money.round2(openCharges.minus(openCredits));
   const newBalance = outstanding.plus(additionalBase);
   if (!newBalance.greaterThan(creditLimit)) return null;
   return {
@@ -542,11 +551,13 @@ interface PreparedInvoice {
  *
  * `opts.excludeInvoiceId` removes one invoice from the credit-limit exposure
  * (the invoice being edited — its old balance is replaced by the new total).
+ * `opts.alreadyApplied` (transaction currency) is what Receive Payments / credits have already
+ * applied to that invoice; it stays applied, so it is not new exposure.
  */
 async function prepareInvoice(
   ctx: ServiceContext,
   input: CreateInvoiceInput,
-  opts?: { excludeInvoiceId?: string },
+  opts?: { excludeInvoiceId?: string; alreadyApplied?: ReturnType<typeof Money.zero> },
 ): Promise<PreparedInvoice> {
   // --- Validate inputs ---
   if (!input.lines || input.lines.length === 0) {
@@ -936,11 +947,13 @@ async function prepareInvoice(
     : null;
 
   // --- Credit limit check (QB warns; the user may save anyway — C2) ---
-  // Exposure added by this document = what will be open on it (balance after payment lines).
+  // Exposure added by this document = what will be open on it (balance after payment lines,
+  // and — on an edit — after the payments / credits already applied to it, which stay applied).
   let creditLimitOverride: CreditLimitBreach | null = null;
   if (customer.creditLimit != null) {
+    const alreadyApplied = opts?.alreadyApplied ?? Money.zero();
     const newExposureBase = Money.round2(
-      Money.mul(dueNow.minus(paymentTotal).plus(retainageAmount), exchangeRate),
+      Money.mul(dueNow.minus(paymentTotal).minus(alreadyApplied).plus(retainageAmount), exchangeRate),
     );
     const breach = await checkCreditLimit(ctx, input.customerId, newExposureBase, {
       excludeInvoiceId: opts?.excludeInvoiceId,
@@ -1830,7 +1843,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
 
   // Validate + compute the new document (read-only). Exclude this invoice's own
   // current balance from the credit-limit exposure — it is being replaced.
-  const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
+  const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id, alreadyApplied: externalPaidPre });
   assertEditKeepsApplications(existing, input, prep, externalPaidPre);
   // The payment-item lines are in a bank deposit: that deposit took exactly their amount out of
   // Undeposited Funds, so the edit must keep it (same amount, currency and rate).
@@ -2221,6 +2234,26 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
+    // Retainage held on this invoice that has already been billed (retainage.ts billRetainage):
+    // voiding would take more out of Retainage Receivable than is left there for the customer.
+    if (Money.of(invoice.retainageAmount ?? '0').greaterThan(0) && invoice.status !== 'draft') {
+      // Same lock as billRetainage, so a release and this void cannot interleave.
+      await tx.db.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${invoice.customerId}`}))`,
+      );
+      // Imported lazily: retainage.ts imports this module (createInvoice).
+      const { retainageReport } = await import('./retainage');
+      const rep = await retainageReport(tx, { customerId: invoice.customerId });
+      const row = rep.rows[0];
+      const held = row?.documents.find((d) => d.kind === 'held' && d.invoiceId === id);
+      if (row && held && Money.of(row.open).minus(Money.of(held.amount)).lessThan(0)) {
+        throw new ServiceError(
+          'CONFLICT',
+          `The retainage held on this invoice has already been billed, so voiding it would leave Retainage Receivable negative. Void the retainage billing invoice first.`,
+        );
+      }
+    }
+
     // Reverse the GL entry.
     if (invoice.postedEntryId) {
       await voidJournalEntry(tx, invoice.postedEntryId);
@@ -2230,6 +2263,11 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
     // createInvoice and put the relieved stock back on hand (and at its site).
     await reverseInvoiceCOGS(tx, { id, date: invoice.date });
     await reverseDocumentInventory(tx, 'invoice', id);
+
+    // Invoices made from a sales order give the order back the quantities they invoiced.
+    // Imported lazily: salesOrders.ts imports this module (createInvoice).
+    const { releaseSalesOrderInvoicingForInvoice } = await import('./salesOrders');
+    await releaseSalesOrderInvoicingForInvoice(tx, id);
 
     // Mark invoice void.
     const [updated] = await tx.db
@@ -2301,6 +2339,14 @@ export async function markPaidAmount(
     Money.of(invoice.total).minus(Money.of(invoice.retainageAmount ?? '0')),
   );
   const newBalance = Money.round2(billedBase.minus(newAmountPaid));
+  // A payment / credit larger than what is still due is refused (re-checked here, inside the
+  // caller's transaction, so two concurrent applications cannot both settle the same balance).
+  if (Money.of(amountPaidDelta).greaterThan(0) && newBalance.lessThan(0)) {
+    throw new ServiceError(
+      'CONFLICT',
+      `Invoice ${invoice.refNumber ?? invoice.invoiceNumber} has only ${toAmountString(Money.round2(billedBase.minus(Money.of(invoice.amountPaid))))} due. It may have just been paid by someone else; reload and try again.`,
+    );
+  }
   const newStatus = newBalance.lessThanOrEqualTo(0)
     ? 'paid'
     : newAmountPaid.greaterThan(0)

@@ -873,6 +873,27 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
         'This sales receipt is already part of a bank deposit, so its total and deposit account cannot change. Remove it from the deposit first, or change only the other details.',
       );
     }
+    // The deposit took the money out of Undeposited Funds on its date, so the receipt cannot be
+    // dated after it (same rule as a deposited received payment).
+    const [dep] = await ctx.db
+      .select({ date: deposits.date })
+      .from(depositLines)
+      .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
+      .where(
+        and(
+          eq(deposits.companyId, ctx.companyId),
+          isNull(deposits.voidedAt),
+          eq(depositLines.description, `salesReceipt:${id}`),
+        ),
+      )
+      .limit(1);
+    const day = (d: Date) => new Date(d).toISOString().slice(0, 10);
+    if (dep && day(input.date) > day(dep.date)) {
+      throw new ServiceError(
+        'CONFLICT',
+        `This sales receipt is part of the bank deposit made on ${day(dep.date)}, so its date cannot be later than the deposit date.`,
+      );
+    }
   }
 
   return inTransaction(ctx, async (tx) => {

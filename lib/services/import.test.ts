@@ -173,7 +173,9 @@ describe('Banking import module', () => {
       const [t1, t2] = txns;
 
       expect(t1.fitId).toBe('TXN001');
-      expect(t1.date).toEqual(new Date('2024-01-05T12:00:00Z'));
+      // DTPOSTED 20240105120000: the posting DAY at UTC midnight (the time of day is dropped so
+      // the line counts in "as of Jan 5" reports and reconciliations — review3).
+      expect(t1.date).toEqual(new Date('2024-01-05T00:00:00Z'));
       expect(t1.amount).toBe('1500.00');
       expect(t1.description).toContain('ACME CORP PAYROLL');
 

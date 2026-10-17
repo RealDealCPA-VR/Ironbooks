@@ -22,6 +22,7 @@ import {
   type DB,
 } from '@/lib/db';
 import { checkLedgerHealth } from '@/lib/db/ledgerGuards';
+import { LOCK_FILE } from '@/lib/db/dirLock';
 import { booksInBalance, verifyIntegrity } from './integrity';
 import {
   accounts, assemblyComponents, attachments, auditLogs, bankAccounts, bankTransactions,
@@ -124,7 +125,9 @@ export const FILE_LOCAL_SECRETS = [
  * a backup, and a restore keeps the current copies — so "Last backup" never jumps back to the
  * restored copy's age and the schedule survives a restore.
  */
-export const FILE_LOCAL_FILES = [...FILE_LOCAL_SECRETS, BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE];
+// The open-file lock (lib/db/dirLock.ts) is this location's too: a backup never carries it, so a
+// restore on another PC is not refused as "open elsewhere".
+export const FILE_LOCAL_FILES = [...FILE_LOCAL_SECRETS, BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE, LOCK_FILE];
 
 export interface BackupResult {
   buffer: Buffer;

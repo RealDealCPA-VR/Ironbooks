@@ -162,6 +162,19 @@ interface LineRow {
   jobId: string;
   /** Advanced Inventory: receiving site / bin / serials / lot (inventory item lines). */
   inv?: InvDetail;
+  /**
+   * Item lines loaded for edit: the stored amount and the quantity / unit cost shown for it.
+   * The shown unit cost is rounded (amount / qty), so while they are untouched the line saves
+   * (and displays) the stored amount instead of qty x rounded cost.
+   */
+  loaded?: { itemId: string; quantity: string; unitCost: string; amount: string };
+}
+
+/** The stored amount of an item line loaded for edit, while its item / qty / cost are untouched. */
+function loadedItemAmount(line: LineRow): string | null {
+  const l = line.loaded;
+  if (!l || line.mode !== 'item') return null;
+  return line.itemId === l.itemId && line.quantity === l.quantity && line.unitCost === l.unitCost ? l.amount : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +229,8 @@ function emptyLine(mode: LineMode = 'expense'): LineRow {
 /** Display amount for a line: explicit amount (expense) or qty x cost (item). */
 function lineAmount(line: LineRow): number {
   if (line.mode === 'item') {
+    const kept = loadedItemAmount(line);
+    if (kept != null) return Number(kept) || 0;
     return (Number(line.quantity) || 0) * (Number(line.unitCost) || 0);
   }
   return Number(line.amount) || 0;
@@ -472,16 +487,17 @@ export default function BillsPage() {
               if (l.itemId) {
                 const qty = Number(l.quantity) || 1;
                 const unitCost = Number(l.amount) / qty;
+                const shown = { quantity: String(qty), unitCost: String(parseFloat(unitCost.toFixed(4))) };
                 return {
                   mode: 'item' as LineMode,
                   accountId: '',
                   amount: '',
                   itemId: l.itemId,
-                  quantity: String(qty),
-                  unitCost: String(parseFloat(unitCost.toFixed(4))),
+                  ...shown,
                   description: l.description ?? '',
                   ...dims,
                   inv: invFromLine(l),
+                  loaded: { itemId: l.itemId, ...shown, amount: l.amount },
                 };
               }
               return {
@@ -659,11 +675,15 @@ export default function BillsPage() {
             customerId: l.customerId || null,
             jobId: (l.customerId && l.jobId) || null,
           };
+          // An untouched loaded item line re-sends its stored amount (the server derives the
+          // exact unit cost from it) — the shown cost is rounded, and qty x rounded cost can
+          // differ from the stored amount by a cent or more.
+          const keptAmount = loadedItemAmount(l);
           return l.mode === 'item'
             ? {
                 itemId: l.itemId,
                 quantity: l.quantity,
-                unitCost: l.unitCost,
+                ...(keptAmount != null ? { amount: keptAmount } : { unitCost: l.unitCost }),
                 description: l.description.trim() || undefined,
                 ...dims,
                 ...inventoryLinePayload(l.inv),

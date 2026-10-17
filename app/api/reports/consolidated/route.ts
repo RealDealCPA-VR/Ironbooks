@@ -17,6 +17,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { consolidatedPL, consolidatedBalanceSheet } from '@/lib/services/consolidation';
+import { queryDate } from '@/lib/validation/helpers';
 
 export async function GET(req: NextRequest) {
   try {
@@ -26,14 +27,14 @@ export async function GET(req: NextRequest) {
     const type = (sp.get('type') ?? 'pl').toLowerCase();
 
     if (type === 'bs') {
-      const asOf = sp.get('asOf') ? new Date(sp.get('asOf')!) : undefined;
+      const asOf = queryDate(sp, 'asOf');
       const result = await consolidatedBalanceSheet(ctx, asOf);
       return NextResponse.json(result);
     }
 
     // Default: P&L
-    const from = sp.get('from') ? new Date(sp.get('from')!) : undefined;
-    const to = sp.get('to') ? new Date(sp.get('to')!) : undefined;
+    const from = queryDate(sp, 'from');
+    const to = queryDate(sp, 'to');
     const result = await consolidatedPL(ctx, from || to ? { from, to } : undefined);
     return NextResponse.json(result);
   } catch (err) {

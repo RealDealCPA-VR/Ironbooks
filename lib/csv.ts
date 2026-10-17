@@ -23,6 +23,19 @@ export function csvSafeText(value: CsvValue): string {
   return s;
 }
 
+/**
+ * Inverse of csvSafeText for importers that read our own CSV exports: drops the one leading
+ * apostrophe csvSafeText adds in front of a formula-like cell ("'-Acme" → "-Acme"). Any other
+ * text is returned unchanged.
+ */
+export function csvUnsafeText(value: string): string {
+  if (value.startsWith("'")) {
+    const rest = value.slice(1);
+    if (FORMULA_START.test(rest) && !PLAIN_NUMBER.test(rest)) return rest;
+  }
+  return value;
+}
+
 /** Always-quoted CSV cell ("..."), formula-safe. */
 export function csvQuoted(value: CsvValue): string {
   return `"${csvSafeText(value).replace(/"/g, '""')}"`;

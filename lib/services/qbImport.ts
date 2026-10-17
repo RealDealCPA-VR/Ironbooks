@@ -48,6 +48,7 @@
  */
 import Papa from 'papaparse';
 import { and, eq } from 'drizzle-orm';
+import { csvUnsafeText } from '@/lib/csv';
 import {
   accounts,
   classes as classesTable,
@@ -2542,8 +2543,9 @@ function parseCsvRows(content: string): Row[] {
   const parsed = Papa.parse<Row>(content, {
     header: true,
     skipEmptyLines: true,
-    transformHeader: (h) => h.trim(),
-    transform: (v) => v.trim(),
+    transformHeader: (h) => csvUnsafeText(h.trim()),
+    // Our own list exports (lib/csv.ts) prefix formula-like cells ("-Acme") with an apostrophe.
+    transform: (v) => csvUnsafeText(v.trim()),
   });
   return parsed.data;
 }
