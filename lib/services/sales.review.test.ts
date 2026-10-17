@@ -54,7 +54,7 @@ async function entryLines(sourceRef: string) {
 
 describe('sales review regressions', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [user] = await db.insert(users).values({ email: 'r@sales.test', name: 'R', passwordHash: 'x' }).returning();
     const [company] = await db.insert(companies).values({ name: 'Review Sales', ownerId: user.id }).returning();
@@ -94,7 +94,7 @@ describe('sales review regressions', () => {
 
   afterAll(async () => {
     await closeDb();
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
   const lines = () => [

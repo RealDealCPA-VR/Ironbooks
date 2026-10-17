@@ -45,7 +45,7 @@ async function balance(code: string): Promise<string> {
 
 describe('review2 sales', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [user] = await db.insert(users).values({ email: 'r2@sales.test', name: 'R', passwordHash: 'x' }).returning();
     const [company] = await db.insert(companies).values({ name: 'Review2 Sales', ownerId: user.id }).returning();
@@ -81,7 +81,7 @@ describe('review2 sales', () => {
 
   afterAll(async () => {
     await closeDb();
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
   it('a sales receipt already in a bank deposit cannot be voided (UF would be relieved twice)', async () => {

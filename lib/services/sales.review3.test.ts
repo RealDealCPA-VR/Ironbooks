@@ -45,7 +45,7 @@ async function soState(soId: string) {
 
 describe('review3 sales', () => {
   beforeAll(async () => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [user] = await db.insert(users).values({ email: 'r3@sales.test', name: 'R', passwordHash: 'x' }).returning();
     const [company] = await db.insert(companies).values({ name: 'Review3 Sales', ownerId: user.id }).returning();
@@ -76,7 +76,7 @@ describe('review3 sales', () => {
 
   afterAll(async () => {
     await closeDb();
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
   it('credit limit: editing a partly paid invoice counts only what is still open on it', async () => {
