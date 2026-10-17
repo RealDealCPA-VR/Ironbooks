@@ -63,7 +63,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { allocateCheckNumber, assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { receivePurchasedStock, reversePurchasedStock } from './bills';
 import {
@@ -549,14 +549,20 @@ export async function createExpense(ctx: ServiceContext, input: CreateExpenseInp
     // keep whatever reference the user typed (e.g. CC slip number)
   } else if (toPrint) {
     reference = null; // number is stamped at print time
-  } else if (!reference) {
-    reference = await nextCheckNumber(ctx, input.paymentAccountId);
-  } else if (input.checkDuplicateNumber) {
-    await assertCheckNumberAvailable(ctx, { paymentAccountId: input.paymentAccountId, number: reference });
   }
 
   // ── transaction: insert expense + lines, post GL, link entry ─────────────
   return inTransaction(ctx, async (tx) => {
+    // A check gets its number inside the transaction (the next number when none was typed; a
+    // typed one is checked for duplicates when asked), so two checks written at once never
+    // share a number.
+    if (input.method === 'check' && !toPrint) {
+      reference = await allocateCheckNumber(tx, {
+        paymentAccountId: input.paymentAccountId,
+        number: reference,
+        allowDuplicate: !reference || !input.checkDuplicateNumber,
+      });
+    }
     const [expense] = await tx.db
       .insert(expenses)
       .values({
@@ -926,6 +932,15 @@ export async function markExpensePrinted(
   ctx: ServiceContext,
   input: { expenseId: string; checkNumber?: string; allowDuplicateNumber?: boolean },
 ) {
+  // Load, number and stamp in one transaction: two checks printed at once never get the same
+  // next number, and a check is not printed twice.
+  return inTransaction(ctx, (tx) => markExpensePrintedInTx(tx, input));
+}
+
+async function markExpensePrintedInTx(
+  ctx: ServiceContext,
+  input: { expenseId: string; checkNumber?: string; allowDuplicateNumber?: boolean },
+) {
   const [expense] = await ctx.db
     .select()
     .from(expenses)
@@ -935,11 +950,9 @@ export async function markExpensePrinted(
   if (expense.method !== 'check') throw validation('Only check expenses can be printed.');
   if (!expense.toPrint) throw new ServiceError('CONFLICT', 'This check is not in the print queue.');
 
-  const checkNumber =
-    input.checkNumber?.trim() || (await nextCheckNumber(ctx, expense.paymentAccountId));
-  await assertCheckNumberAvailable(ctx, {
+  const checkNumber = await allocateCheckNumber(ctx, {
     paymentAccountId: expense.paymentAccountId,
-    number: checkNumber,
+    number: input.checkNumber,
     exclude: { source: 'expense', id: expense.id },
     allowDuplicate: input.allowDuplicateNumber,
     numberField: 'checkNumber',
@@ -988,6 +1001,12 @@ export async function markExpensePrinted(
  * lines back out, and stamp voidedAt.
  */
 export async function voidExpense(ctx: ServiceContext, id: string) {
+  // Load + validate in the same transaction as the void: a double-submitted void must find the
+  // check already void instead of taking its stock out twice.
+  return inTransaction(ctx, (tx) => voidExpenseInTx(tx, id));
+}
+
+async function voidExpenseInTx(ctx: ServiceContext, id: string) {
   const [expense] = await ctx.db
     .select()
     .from(expenses)

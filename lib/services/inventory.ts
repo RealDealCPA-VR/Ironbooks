@@ -20,7 +20,7 @@
  *
  * averageCost is maintained as a weighted average: updated on positive receipts only.
  */
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, exists, inArray, sql } from 'drizzle-orm';
 import { onOrBeforeDay } from './journal';
 import Decimal from 'decimal.js';
 import {
@@ -39,13 +39,16 @@ import {
   invoiceLines,
   salesReceiptLines,
   creditMemoLines,
+  bills,
   billLines,
+  expenses,
   expenseLines,
   itemReceiptLines,
   itemReceiptBillLines,
   vendorCreditLines,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
+import { homeAmounts } from './currencies';
 import {
   type ServiceContext,
   ServiceError,
@@ -293,6 +296,78 @@ export function bookValueRelief(oldQty: Decimal, newQty: Decimal, avg: Decimal):
   return Money.round2(oldQty.times(avg)).minus(Money.round2(newQty.times(avg)));
 }
 
+/**
+ * Book value of one FIFO cost layer: quantity × unit cost rounded to the cent. An item's FIFO
+ * value is the SUM of its layers' values (fifo.ts fifoValuation lists them so), and
+ * fifo.ts takeFromLayers relieves each layer's value before minus after under the same rule, so
+ * the inventory GL ties to the valuation reports. Every report that values layers uses this
+ * (or fifoLayerValueSql), never round2(SUM(qty × cost)).
+ */
+export function fifoLayerValue(qty: Decimal | string, unitCost: Decimal | string): Decimal {
+  return Money.round2(Money.of(qty).times(Money.of(unitCost)));
+}
+
+/** SQL aggregate of fifoLayerValue over the selected inventory_layers rows. */
+export function fifoLayerValueSql() {
+  return sql<string>`COALESCE(SUM(ROUND(${inventoryLayers.quantityRemaining} * ${inventoryLayers.unitCost}, 2)), 0)`;
+}
+
+/** The item fields behind an average-cost item's value remainder (schema items.valueRemainder). */
+export interface ValueRemainderFields {
+  averageCost: string | null;
+  valueRemainder: string | null;
+  valueRemainderAvg: string | null;
+}
+
+/**
+ * The cents the inventory GL still carries for an average-cost item beyond its book value
+ * round2(qty × averageCost) — recorded by the receipts the 4dp average cannot represent exactly
+ * (3000 units for $1000: average 0.3333, book value 999.90, GL 1000.00). Zero when a path that
+ * does not record remainders re-derived the average since (the stamp no longer matches).
+ */
+export function carriedValueRemainder(item: ValueRemainderFields): Decimal {
+  if (item.valueRemainderAvg == null) return Money.zero();
+  if (!Money.of(item.valueRemainderAvg).equals(Money.of(item.averageCost ?? '0'))) return Money.zero();
+  return Money.of(item.valueRemainder ?? '0');
+}
+
+/**
+ * Remainder fields to store after an average-cost receipt (or its reversal) moved the item from
+ * `oldQty` to `newQty` and re-derived the average as `newAvg` (stored to 4dp), while the
+ * document posted `posted` to the inventory account: what the GL carries beyond the new book value.
+ */
+export function valueRemainderAfter(
+  item: ValueRemainderFields,
+  oldQty: Decimal,
+  newQty: Decimal,
+  newAvg: Decimal,
+  posted: Decimal,
+): { valueRemainder: string; valueRemainderAvg: string } {
+  const stored = Money.of(newAvg.toFixed(4));
+  const oldBook = Money.round2(oldQty.times(Money.of(item.averageCost ?? '0')));
+  const newBook = Money.round2(newQty.times(stored));
+  const remainder = carriedValueRemainder(item).plus(Money.round2(posted)).minus(newBook.minus(oldBook));
+  return { valueRemainder: toAmountString(remainder), valueRemainderAvg: stored.toFixed(4) };
+}
+
+/**
+ * Value relieved when an average-cost removal takes the item to zero: its book value plus the
+ * remainder the GL still carries for it, so selling out clears the inventory GL to exactly $0
+ * (QB relieves the last unit at the value that remains). Falls back to the book value when that
+ * would not leave a positive amount (a $0 / negative relief cannot be posted as a removal).
+ */
+export function sellOutRelief(
+  item: ValueRemainderFields,
+  newQty: Decimal,
+  atBookValue: Decimal,
+): { relief: Decimal; remainderRelieved: boolean } {
+  if (!newQty.isZero()) return { relief: atBookValue, remainderRelieved: false };
+  const carried = carriedValueRemainder(item);
+  const withRemainder = atBookValue.plus(carried);
+  if (carried.isZero() || !withRemainder.greaterThan(0)) return { relief: atBookValue, remainderRelieved: false };
+  return { relief: withRemainder, remainderRelieved: true };
+}
+
 export async function adjustInventory(ctx: ServiceContext, input: AdjustInventoryInput) {
   const qtyChange = Money.of(input.quantityChange);
   if (qtyChange.isZero()) throw validation('quantityChange cannot be zero.');
@@ -320,6 +395,8 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
   let glAmount: Decimal;
   let newQty: Decimal;
   let newAvgCost: Decimal;
+  // The item's value remainder after this adjustment (undefined = unchanged).
+  let remainder: { valueRemainder: string; valueRemainderAvg: string | null } | undefined;
 
   if (qtyChange.greaterThan(0)) {
     // Receiving stock
@@ -337,16 +414,24 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
       ? unitCost
       : oldValue.plus(newValue).dividedBy(newQty);
     glAmount = Money.round2(qtyChange.times(unitCost));
+    // What the 4dp average cannot represent of this receipt stays on record for the sell-out.
+    remainder = valueRemainderAfter(item, currentQty, newQty, newAvgCost, glAmount);
   } else {
     // Removing stock — value at current average cost (or, in an Accountant's Copy import, at the
     // cost the accountant's file used; the average is then re-derived from what is left).
-    const atAverage = bookValueRelief(currentQty, currentQty.plus(qtyChange), currentAvgCost);
-    const accountantCost = takeAccountantCost(input.itemId);
-    glAmount = accountantCost ? Money.round2(accountantCost) : atAverage;
     newQty = currentQty.plus(qtyChange); // qtyChange is negative
-    newAvgCost = glAmount.equals(atAverage)
-      ? currentAvgCost // average cost unchanged on removals
-      : averageAfter(currentQty, currentAvgCost, newQty, glAmount.negated());
+    const atAverage = bookValueRelief(currentQty, newQty, currentAvgCost);
+    const accountantCost = takeAccountantCost(input.itemId);
+    // Removing the last units also relieves the value remainder (the GL then holds exactly $0).
+    const sellOut = sellOutRelief(item, newQty, atAverage);
+    glAmount = accountantCost ? Money.round2(accountantCost) : sellOut.relief;
+    if (accountantCost && !glAmount.equals(atAverage)) {
+      newAvgCost = averageAfter(currentQty, currentAvgCost, newQty, glAmount.negated());
+      remainder = { valueRemainder: '0.00', valueRemainderAvg: null }; // average re-derived
+    } else {
+      newAvgCost = currentAvgCost; // average cost unchanged on removals
+      if (!accountantCost && sellOut.remainderRelieved) remainder = { valueRemainder: '0.00', valueRemainderAvg: newAvgCost.toFixed(4) };
+    }
   }
 
   return inTransaction(ctx, async (tx) => {
@@ -414,6 +499,7 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
       .set({
         quantityOnHand: newQty.toFixed(4),
         averageCost: newAvgCost.toFixed(4),
+        ...(remainder ?? {}),
         updatedAt: new Date(),
       })
       .where(eq(items.id, input.itemId));
@@ -450,6 +536,27 @@ export interface RecordCOGSInput {
   quantity: string | number;
   date: Date;
   memo?: string | null;
+  /** Class of the sale (P&L by Class): carried onto the COGS line. */
+  classId?: string | null;
+}
+
+/**
+ * The COGS account an inventory item's sale posts to: the item's own COGS account
+ * (items.expenseAccountId, QB "COGS Account") when it is an active expense account of the
+ * company, else 5000 Cost of Goods Sold. Used by every COGS posting (average cost, FIFO, returns).
+ */
+export async function cogsAccountForItem(
+  ctx: ServiceContext,
+  item: { expenseAccountId?: string | null },
+): Promise<string> {
+  if (item.expenseAccountId) {
+    const [acct] = await ctx.db
+      .select({ id: accounts.id, type: accounts.type, isActive: accounts.isActive })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, item.expenseAccountId)));
+    if (acct && acct.isActive && String(acct.type) === 'expense') return acct.id;
+  }
+  return accountIdByCode(ctx, '5000');
 }
 
 export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
@@ -472,15 +579,22 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
   // re-derived from what is left so the item's value stays equal to the ledger.
   const accountantCost = takeAccountantCost(input.itemId);
   const atAverage = bookValueRelief(currentQty, newQty, avgCost);
-  const cogsAmount = accountantCost ? Money.round2(accountantCost) : atAverage;
+  // Selling the last units also relieves the value remainder (the GL then holds exactly $0).
+  const sellOut = sellOutRelief(item, newQty, atAverage);
+  const cogsAmount = accountantCost ? Money.round2(accountantCost) : sellOut.relief;
   const newAvgCost =
     accountantCost && !cogsAmount.equals(atAverage)
       ? averageAfter(currentQty, avgCost, newQty, cogsAmount.negated())
       : avgCost;
+  const remainder = !newAvgCost.equals(avgCost)
+    ? { valueRemainder: '0.00', valueRemainderAvg: null } // average re-derived (Accountant's Copy cost)
+    : !accountantCost && sellOut.remainderRelieved
+      ? { valueRemainder: '0.00', valueRemainderAvg: avgCost.toFixed(4) }
+      : undefined;
 
   return inTransaction(ctx, async (tx) => {
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
-    const cogsAccountId = await accountIdByCode(tx, '5000');
+    const cogsAccountId = await cogsAccountForItem(tx, item);
 
     // Dr COGS, Cr Inventory Asset
     const entry = await postJournalEntry(tx, {
@@ -491,6 +605,7 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
           accountId: cogsAccountId,
           debit: toAmountString(cogsAmount),
           memo: input.memo ?? 'COGS',
+          ...(input.classId ? { classId: input.classId } : {}),
         },
         {
           accountId: inventoryAccountId,
@@ -506,6 +621,7 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
       .set({
         quantityOnHand: newQty.toFixed(4),
         ...(newAvgCost.equals(avgCost) ? {} : { averageCost: newAvgCost.toFixed(4) }),
+        ...(remainder ?? {}),
         updatedAt: new Date(),
       })
       .where(eq(items.id, input.itemId));
@@ -583,7 +699,7 @@ export async function inventoryValuation(ctx: ServiceContext): Promise<Inventory
     .select({
       itemId: inventoryLayers.itemId,
       layerQty: sql<string>`COALESCE(SUM(${inventoryLayers.quantityRemaining}), 0)`,
-      layerValue: sql<string>`COALESCE(SUM(${inventoryLayers.quantityRemaining} * ${inventoryLayers.unitCost}), 0)`,
+      layerValue: fifoLayerValueSql(),
     })
     .from(inventoryLayers)
     .where(eq(inventoryLayers.companyId, ctx.companyId))
@@ -798,20 +914,23 @@ export async function stockStatus(ctx: ServiceContext): Promise<StockStatusResul
 //   - COGS / restock entries posted per line (`invoice-cogs:` + reference cogs:<lineOrder>,
 //     `salesreceipt:` / `creditmemo-cogs:` + reference = the line id): that line's item.
 //   - `assembly_build:` / `assembly_unbuild:<id>:<fromItem>:<toItem>`: credit -> from, debit -> to.
-//   - Purchase documents (`bill:`, `expense:`, `item_receipt:`, `vendor_credit:`): the asset
-//     account's amount is split over the document's inventory item lines on that account (bill /
-//     check / receipt line amounts, receive-items price variance capitalized, vendor-credit return
-//     cost); foreign-currency line amounts are scaled to the posted home amount.
+//   - Purchase documents (`bill:`, `expense:`, `item_receipt:`, `vendor_credit:`): each inventory
+//     item line's POSTED home amount (bill / check lines: homeAmounts over the document's lines,
+//     exactly as they were posted; receipt line amounts; receive-items price variance
+//     capitalized; vendor-credit return cost). A line without an item on an inventory account
+//     (e.g. freight coded to Inventory Asset) is not attributed to any item.
 //   valueAsOf = SUM(attributed debit - credit) over entries dated <= asOf.
+//   Document lines are found with joins from the entries in scope (never id lists — a statement
+//   can carry at most 65535 bind parameters).
 //
 // Documented approximations:
 //   - QUANTITY as of a past date is approximated as valueAsOf / currentUnitCost
 //     (current averageCost for average items; remaining-layer effective cost
 //     for FIFO items). It is exact whenever the unit cost has not changed
 //     since the as-of date, and is reported null when the current cost is $0.
-//   - Entries with no item detail (manual journal entries on an inventory account, condensed
-//     summaries, imported GL history) are not attributed to any item, so the per-item values then
-//     no longer add up to the GL balance.
+//   - Entries and lines with no item detail (manual journal entries on an inventory account,
+//     expense-tab lines coded to it, condensed summaries, imported GL history) are not attributed
+//     to any item, so the per-item values then no longer add up to the GL balance.
 
 interface ItemGlMovement {
   entryId: string;
@@ -820,36 +939,6 @@ interface ItemGlMovement {
   description: string;
   debit: Decimal;
   credit: Decimal;
-}
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/** Split a signed `net` over signed `weights` (exact when they already sum to it; else scaled, penny-exact). */
-function splitByWeights(net: Decimal, weights: Map<string, Decimal>): Map<string, Decimal> {
-  const out = new Map<string, Decimal>();
-  const entries = [...weights.entries()].filter(([, w]) => !w.isZero());
-  if (entries.length === 0) return out;
-  const sum = entries.reduce((s, [, w]) => s.plus(w), Money.zero());
-  if (sum.equals(net)) {
-    for (const [k, w] of entries) out.set(k, w);
-    return out;
-  }
-  if (sum.isZero()) return out;
-  let allocated = Money.zero();
-  let largest = entries[0][0];
-  let largestAbs = Money.zero();
-  for (const [k, w] of entries) {
-    const part = Money.round2(net.times(w).dividedBy(sum));
-    out.set(k, part);
-    allocated = allocated.plus(part);
-    if (w.abs().greaterThan(largestAbs)) {
-      largestAbs = w.abs();
-      largest = k;
-    }
-  }
-  const rest = net.minus(allocated);
-  if (!rest.isZero()) out.set(largest, out.get(largest)!.plus(rest));
-  return out;
 }
 
 /**
@@ -897,110 +986,164 @@ async function loadItemGlMovements(
     .where(and(...conditions))
     .orderBy(asc(journalEntries.date), asc(journalEntries.createdAt));
 
-  // --- Document line detail for the purchase / per-line COGS sources -----------------------
-  const refsOf = (prefix: string) => [
-    ...new Set(
-      lines
-        .filter((l) => (l.sourceRef ?? '').startsWith(prefix))
-        .map((l) => (l.sourceRef ?? '').slice(prefix.length))
-        .filter((id) => UUID_RE.test(id)),
+  // --- Document line detail for the per-line COGS and purchase sources ----------------------
+  // Every lookup is a JOIN from the entries in scope to the document lines (matched on the
+  // entry's sourceRef / reference), never an id list built from the history: a statement can
+  // carry at most 65535 bind parameters, which a busy company passes in a year or two.
+  const entryConds = [
+    eq(journalEntries.companyId, ctx.companyId),
+    eq(journalEntries.status, 'posted'),
+    // Correlated (index on journal_entry_lines.journal_entry_id), so it stays a semi-join however
+    // many entries touch the inventory accounts.
+    exists(
+      ctx.db
+        .select({ one: sql`1` })
+        .from(journalEntryLines)
+        .where(and(eq(journalEntryLines.journalEntryId, journalEntries.id), inArray(journalEntryLines.accountId, invAccounts))),
     ),
   ];
-  const lineRefsOf = (prefix: string) => [
-    ...new Set(
-      lines
-        .filter((l) => (l.sourceRef ?? '').startsWith(prefix) && UUID_RE.test(l.reference ?? ''))
-        .map((l) => l.reference!),
-    ),
-  ];
+  if (asOf) entryConds.push(onOrBeforeDay(asOf));
+  const refLike = (prefix: string) => sql`${journalEntries.sourceRef} LIKE ${`${prefix}%`}`;
 
-  const invoiceIds = refsOf('invoice-cogs:');
-  const invoiceLineItem = new Map<string, string>(); // `${invoiceId}|${lineOrder}` -> itemId
-  if (invoiceIds.length) {
-    const rows = await ctx.db
-      .select({ invoiceId: invoiceLines.invoiceId, lineOrder: invoiceLines.lineOrder, itemId: invoiceLines.itemId })
-      .from(invoiceLines)
-      .where(inArray(invoiceLines.invoiceId, invoiceIds));
-    for (const r of rows) if (r.itemId) invoiceLineItem.set(`${r.invoiceId}|${r.lineOrder}`, r.itemId);
-  }
-  const lineItem = new Map<string, string>(); // sales receipt / credit memo line id -> itemId
-  const srLineIds = lineRefsOf('salesreceipt:');
-  if (srLineIds.length) {
-    const rows = await ctx.db
-      .select({ id: salesReceiptLines.id, itemId: salesReceiptLines.itemId })
-      .from(salesReceiptLines)
-      .where(inArray(salesReceiptLines.id, srLineIds));
-    for (const r of rows) if (r.itemId) lineItem.set(r.id, r.itemId);
-  }
-  const cmLineIds = lineRefsOf('creditmemo-cogs:');
-  if (cmLineIds.length) {
-    const rows = await ctx.db
-      .select({ id: creditMemoLines.id, itemId: creditMemoLines.itemId })
-      .from(creditMemoLines)
-      .where(inArray(creditMemoLines.id, cmLineIds));
-    for (const r of rows) if (r.itemId) lineItem.set(r.id, r.itemId);
-  }
+  // Per-line COGS / restock entries -> the item of the line they were posted for.
+  const entryItem = new Map<string, string>();
+  const cogsSources = await Promise.all([
+    // Invoices: sourceRef invoice-cogs:<invoiceId>, reference cogs:<lineOrder>.
+    ctx.db
+      .select({ entryId: journalEntries.id, itemId: invoiceLines.itemId })
+      .from(journalEntries)
+      .innerJoin(
+        invoiceLines,
+        and(
+          sql`${journalEntries.sourceRef} = 'invoice-cogs:' || ${invoiceLines.invoiceId}::text`,
+          sql`${journalEntries.reference} = 'cogs:' || ${invoiceLines.lineOrder}::text`,
+        ),
+      )
+      .where(and(...entryConds, refLike('invoice-cogs:'))),
+    // Sales receipts: sourceRef salesreceipt:<receiptId>, reference = the receipt line id.
+    ctx.db
+      .select({ entryId: journalEntries.id, itemId: salesReceiptLines.itemId })
+      .from(journalEntries)
+      .innerJoin(
+        salesReceiptLines,
+        and(
+          sql`${journalEntries.sourceRef} = 'salesreceipt:' || ${salesReceiptLines.salesReceiptId}::text`,
+          sql`${journalEntries.reference} = ${salesReceiptLines.id}::text`,
+        ),
+      )
+      .where(and(...entryConds, refLike('salesreceipt:'))),
+    // Credit memo restocks: sourceRef creditmemo-cogs:<memoId>, reference = the memo line id.
+    ctx.db
+      .select({ entryId: journalEntries.id, itemId: creditMemoLines.itemId })
+      .from(journalEntries)
+      .innerJoin(
+        creditMemoLines,
+        and(
+          sql`${journalEntries.sourceRef} = 'creditmemo-cogs:' || ${creditMemoLines.creditMemoId}::text`,
+          sql`${journalEntries.reference} = ${creditMemoLines.id}::text`,
+        ),
+      )
+      .where(and(...entryConds, refLike('creditmemo-cogs:'))),
+  ]);
+  for (const rows of cogsSources) for (const r of rows) if (r.itemId) entryItem.set(r.entryId, r.itemId);
 
-  // Signed weights per source document: sourceRef -> itemId -> weight (on the item's own account).
-  const docWeights = new Map<string, Map<string, Decimal>>();
-  const addWeight = (sourceRef: string, itemId: string | null, amount: string | Decimal | null) => {
-    if (!itemId || amount == null || !accountOf.has(itemId)) return;
-    const m = docWeights.get(sourceRef) ?? new Map<string, Decimal>();
-    m.set(itemId, (m.get(itemId) ?? Money.zero()).plus(Money.of(amount)));
-    docWeights.set(sourceRef, m);
+  // Purchase documents -> the posted HOME amount of each inventory item line (entry id -> item ->
+  // signed value). Lines without an item (an expense-tab line on an inventory account) are left
+  // unattributed, like manual journal entries.
+  const purchaseValue = new Map<string, Map<string, Decimal>>();
+  const addPurchase = (entryId: string, itemId: string | null, amount: Decimal) => {
+    if (!itemId || !accountOf.has(itemId) || amount.isZero()) return;
+    const m = purchaseValue.get(entryId) ?? new Map<string, Decimal>();
+    m.set(itemId, (m.get(itemId) ?? Money.zero()).plus(amount));
+    purchaseValue.set(entryId, m);
   };
-  const billIds = refsOf('bill:');
-  if (billIds.length) {
-    const rows = await ctx.db
-      .select({ billId: billLines.billId, itemId: billLines.itemId, accountId: billLines.accountId, amount: billLines.amount })
-      .from(billLines)
-      .where(inArray(billLines.billId, billIds));
+  /**
+   * Bills and checks post one debit per line at its home amount: homeAmounts over ALL the
+   * document's lines in line order (one anchor penny-allocated), exactly as prepareBill /
+   * prepareExpense posted it (and as their stock reversal re-derives it).
+   */
+  const addPostedLines = (
+    rows: Array<{
+      entryId: string;
+      currency: string | null;
+      rate: string | null;
+      itemId: string | null;
+      accountId: string;
+      amount: string;
+      lineOrder: number;
+    }>,
+  ) => {
+    const byDoc = new Map<string, typeof rows>();
     for (const r of rows) {
-      if (r.itemId && accountOf.get(r.itemId) === r.accountId) addWeight(`bill:${r.billId}`, r.itemId, r.amount);
+      const list = byDoc.get(r.entryId);
+      if (list) list.push(r);
+      else byDoc.set(r.entryId, [r]);
     }
-    const variances = await ctx.db
+    for (const [entryId, docLines] of byDoc) {
+      docLines.sort((a, b) => a.lineOrder - b.lineOrder);
+      const head = docLines[0];
+      const home = homeAmounts(
+        docLines.map((l) => Money.of(l.amount).abs()),
+        head.currency ? (head.rate ?? 1) : 1,
+      );
+      docLines.forEach((l, i) => {
+        if (l.itemId && accountOf.get(l.itemId) === l.accountId) addPurchase(entryId, l.itemId, home.lines[i]);
+      });
+    }
+  };
+  const [billRows, varianceRows, expenseRows, receiptRows, creditRows] = await Promise.all([
+    ctx.db
       .select({
-        billId: itemReceiptBillLines.billId,
-        itemId: itemReceiptBillLines.itemId,
-        amount: itemReceiptBillLines.inventoryVariance,
+        entryId: journalEntries.id,
+        currency: bills.currency,
+        rate: bills.exchangeRate,
+        itemId: billLines.itemId,
+        accountId: billLines.accountId,
+        amount: billLines.amount,
+        lineOrder: billLines.lineOrder,
       })
-      .from(itemReceiptBillLines)
-      .where(and(eq(itemReceiptBillLines.companyId, ctx.companyId), inArray(itemReceiptBillLines.billId, billIds)));
-    for (const r of variances) addWeight(`bill:${r.billId}`, r.itemId, r.amount);
-  }
-  const expenseIds = refsOf('expense:');
-  if (expenseIds.length) {
-    const rows = await ctx.db
+      .from(journalEntries)
+      .innerJoin(bills, sql`${journalEntries.sourceRef} = 'bill:' || ${bills.id}::text`)
+      .innerJoin(billLines, eq(billLines.billId, bills.id))
+      .where(and(...entryConds, refLike('bill:'))),
+    // Receive-items bills: the price variance capitalized into each item (home, signed).
+    ctx.db
+      .select({ entryId: journalEntries.id, itemId: itemReceiptBillLines.itemId, amount: itemReceiptBillLines.inventoryVariance })
+      .from(journalEntries)
+      .innerJoin(itemReceiptBillLines, sql`${journalEntries.sourceRef} = 'bill:' || ${itemReceiptBillLines.billId}::text`)
+      .where(and(...entryConds, refLike('bill:'), eq(itemReceiptBillLines.companyId, ctx.companyId))),
+    ctx.db
       .select({
-        expenseId: expenseLines.expenseId,
+        entryId: journalEntries.id,
+        currency: expenses.currency,
+        rate: expenses.exchangeRate,
         itemId: expenseLines.itemId,
         accountId: expenseLines.accountId,
         amount: expenseLines.amount,
+        lineOrder: expenseLines.lineOrder,
       })
-      .from(expenseLines)
-      .where(inArray(expenseLines.expenseId, expenseIds));
-    for (const r of rows) {
-      if (r.itemId && accountOf.get(r.itemId) === r.accountId) addWeight(`expense:${r.expenseId}`, r.itemId, r.amount);
-    }
-  }
-  const receiptIds = refsOf('item_receipt:');
-  if (receiptIds.length) {
-    const rows = await ctx.db
-      .select({ receiptId: itemReceiptLines.itemReceiptId, itemId: itemReceiptLines.itemId, amount: itemReceiptLines.amount })
-      .from(itemReceiptLines)
-      .where(inArray(itemReceiptLines.itemReceiptId, receiptIds));
-    for (const r of rows) addWeight(`item_receipt:${r.receiptId}`, r.itemId, r.amount);
-  }
-  const creditIds = refsOf('vendor_credit:');
-  if (creditIds.length) {
-    const rows = await ctx.db
-      .select({ creditId: vendorCreditLines.vendorCreditId, itemId: vendorCreditLines.itemId, cost: vendorCreditLines.costAmount })
-      .from(vendorCreditLines)
-      .where(inArray(vendorCreditLines.vendorCreditId, creditIds));
-    for (const r of rows) {
-      if (r.cost != null) addWeight(`vendor_credit:${r.creditId}`, r.itemId, Money.of(r.cost).negated());
-    }
-  }
+      .from(journalEntries)
+      .innerJoin(expenses, sql`${journalEntries.sourceRef} = 'expense:' || ${expenses.id}::text`)
+      .innerJoin(expenseLines, eq(expenseLines.expenseId, expenses.id))
+      .where(and(...entryConds, refLike('expense:'))),
+    // Item receipts post each line's amount (home) to its item's inventory account.
+    ctx.db
+      .select({ entryId: journalEntries.id, itemId: itemReceiptLines.itemId, amount: itemReceiptLines.amount })
+      .from(journalEntries)
+      .innerJoin(itemReceiptLines, sql`${journalEntries.sourceRef} = 'item_receipt:' || ${itemReceiptLines.itemReceiptId}::text`)
+      .where(and(...entryConds, refLike('item_receipt:'))),
+    // Vendor credits credit each returned item's inventory account with its cost (home).
+    ctx.db
+      .select({ entryId: journalEntries.id, itemId: vendorCreditLines.itemId, cost: vendorCreditLines.costAmount })
+      .from(journalEntries)
+      .innerJoin(vendorCreditLines, sql`${journalEntries.sourceRef} = 'vendor_credit:' || ${vendorCreditLines.vendorCreditId}::text`)
+      .where(and(...entryConds, refLike('vendor_credit:'))),
+  ]);
+  addPostedLines(billRows);
+  addPostedLines(expenseRows);
+  for (const r of varianceRows) if (r.amount != null) addPurchase(r.entryId, r.itemId, Money.of(r.amount));
+  for (const r of receiptRows) addPurchase(r.entryId, r.itemId, Money.of(r.amount));
+  for (const r of creditRows) if (r.cost != null) addPurchase(r.entryId, r.itemId, Money.of(r.cost).negated());
 
   // --- Attribute entry by entry ---------------------------------------------------------------
   type Line = (typeof lines)[number];
@@ -1047,14 +1190,10 @@ async function loadItemGlMovements(
       case 'item':
         toItem(rest, entryLines);
         break;
-      case 'invoice-cogs': {
-        const m = /^cogs:(\d+)$/.exec(head.reference ?? '');
-        if (m) toItem(invoiceLineItem.get(`${rest}|${m[1]}`), entryLines);
-        break;
-      }
+      case 'invoice-cogs':
       case 'salesreceipt':
       case 'creditmemo-cogs':
-        toItem(lineItem.get(head.reference ?? ''), entryLines);
+        toItem(entryItem.get(head.entryId), entryLines);
         break;
       case 'assembly_build':
       case 'assembly_unbuild': {
@@ -1068,19 +1207,12 @@ async function loadItemGlMovements(
         break;
       }
       default: {
-        const weights = docWeights.get(ref);
-        if (!weights) break;
-        // Net per inventory account, split over that account's items on the document.
-        const netByAccount = new Map<string, Decimal>();
-        for (const l of entryLines) {
-          netByAccount.set(
-            l.accountId,
-            (netByAccount.get(l.accountId) ?? Money.zero()).plus(Money.of(l.debit ?? '0')).minus(Money.of(l.credit ?? '0')),
-          );
-        }
-        for (const [accountId, net] of netByAccount) {
-          const onAccount = new Map([...weights].filter(([itemId]) => accountOf.get(itemId) === accountId));
-          for (const [itemId, amount] of splitByWeights(net, onAccount)) pushNet(itemId, head, amount);
+        // Purchase documents: each inventory item line's posted home amount (no scaling, so a
+        // line without an item on the same account stays unattributed).
+        const values = purchaseValue.get(head.entryId);
+        if (!values) break;
+        for (const [itemId, amount] of values) {
+          if (entryLines.some((l) => l.accountId === accountOf.get(itemId))) pushNet(itemId, head, amount);
         }
       }
     }
@@ -1140,7 +1272,7 @@ async function currentUnitCosts(
       for (const l of layers) {
         const q = Money.of(l.quantityRemaining);
         qty = qty.plus(q);
-        value = value.plus(q.times(Money.of(l.unitCost)));
+        value = value.plus(fifoLayerValue(q, l.unitCost)); // same rule as inventoryValuation
       }
       let cost: Decimal | null = null;
       if (qty.greaterThan(0)) cost = value.dividedBy(qty);

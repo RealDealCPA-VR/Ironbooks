@@ -14,19 +14,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { markExpensePrinted } from '@/lib/services/expenses';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json(
       { error: err.message, code: err.code, details: err.details ?? null },
       { status },
@@ -42,7 +34,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as {
+    const body = (await requireJsonObject(req, { optional: true })) as {
       checkNumber?: unknown;
       allowDuplicateNumber?: unknown;
     };

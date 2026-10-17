@@ -18,7 +18,7 @@
 import { and, eq, gte, lt, sql } from 'drizzle-orm';
 import { accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, ServiceError } from './_base';
+import { type ServiceContext, ServiceError, inTransaction } from './_base';
 import { ensurePreOpBackup } from './backup';
 import { type PostingLine, postJournalEntry } from './posting';
 
@@ -108,6 +108,12 @@ export async function yearEndClose(
     console.warn('[fiscalClose] pre-op backup before year-end close failed (continuing):', err);
   }
 
+  // Aggregate + post in ONE transaction: a second close running at the same time sees the first
+  // closing entry (the year then nets to zero) instead of posting a second one.
+  return inTransaction(ctx, (tx) => yearEndCloseInTx(tx, fiscalYear));
+}
+
+async function yearEndCloseInTx(ctx: ServiceContext, fiscalYear: number): Promise<YearEndCloseResult> {
   // Honor the company's configured fiscal year end (settings.fiscalYearEnd, 'MM-DD').
   // Defaults to 12-31 (calendar year) when unset.
   const [companyRow] = await ctx.db
@@ -177,6 +183,21 @@ export async function yearEndClose(
   }
 
   if (revenueAccounts.length === 0 && expenseAccounts.length === 0) {
+    // Nothing left to close because this year's closing entry already zeroed it.
+    const [closed] = await ctx.db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          eq(journalEntries.status, 'posted'),
+          eq(journalEntries.sourceRef, `fiscal-close:${fiscalYear}`),
+        ),
+      )
+      .limit(1);
+    if (closed) {
+      throw new ServiceError('CONFLICT', `Fiscal year ${fiscalYear} is already closed. Nothing left to close.`);
+    }
     throw new ServiceError(
       'VALIDATION',
       `No posted revenue or expense activity found for fiscal year ${fiscalYear}. Nothing to close.`,

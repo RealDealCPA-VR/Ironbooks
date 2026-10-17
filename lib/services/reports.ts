@@ -46,7 +46,11 @@ async function accountActivity(ctx: ServiceContext, asOf?: Date, since?: Date) {
   // Whole-day bound: postings with a time of day (year-end close at 23:59:59Z, bank-feed
   // entries, older data) belong to their own day.
   if (asOf) conds.push(onOrBeforeDay(asOf));
-  const sinceCond = since ? sql`${journalEntries.date} >= ${since}` : sql`FALSE`;
+  // The current-year split leaves out a year-end closing entry dated inside the window (it is dated
+  // on the fiscal year's LAST day): a balance sheet as of that day still shows the year's Net
+  // Income, with the closing entry's Retained Earnings credit offset in prior-years earnings, like
+  // QuickBooks and the P&L its Net Income line zooms to. Totals are unchanged.
+  const sinceCond = since ? sql`${journalEntries.date} >= ${since} AND ${notFiscalCloseEntry()}` : sql`FALSE`;
 
   const rows = await ctx.db
     .select({

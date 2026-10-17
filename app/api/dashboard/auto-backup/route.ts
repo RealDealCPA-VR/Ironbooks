@@ -37,6 +37,7 @@ import { recordBackup } from '@/lib/services/backupHistory';
 import { currentFingerprint } from '@/lib/services/backupFingerprint';
 import { ensureBackupScheduler, runVersionedBackup } from '@/lib/services/backupSchedule';
 import { assertNotSandbox } from '@/lib/services/sandboxState';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 /** Constant-time check of the x-bka-internal header against BKA_INTERNAL_TOKEN. */
 async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
@@ -110,7 +111,7 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     if (err instanceof ServiceError) {
-      const status = err.code === 'FORBIDDEN' ? 403 : err.code === 'VALIDATION' ? 400 : 500;
+      const status = serviceErrorStatus(err.code);
       return NextResponse.json({ error: err.message, code: err.code }, { status });
     }
     // Do not leak raw error text (may contain absolute data-dir paths).

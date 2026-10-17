@@ -7,6 +7,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { findItemByBarcode } from '@/lib/services/items';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 export async function GET(req: NextRequest) {
   try {
@@ -22,7 +23,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(item);
   } catch (err) {
     if (err instanceof ServiceError) {
-      const status = err.code === 'FORBIDDEN' ? 403 : err.code === 'NOT_FOUND' ? 404 : 400;
+      const status = serviceErrorStatus(err.code);
       return NextResponse.json({ error: err.message, code: err.code }, { status });
     }
     console.error('[items/barcode]', err);

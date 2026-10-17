@@ -5,6 +5,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { budgetVsActual } from '@/lib/services/budgets';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -12,11 +13,7 @@ interface RouteParams {
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[budgets/[id]/vs-actual] unexpected error:', err);

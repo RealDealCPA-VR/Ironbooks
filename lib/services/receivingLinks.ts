@@ -28,6 +28,7 @@ import {
 } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, writeAudit } from './_base';
+import { valueRemainderAfter } from './inventory';
 
 // ---------------------------------------------------------------------------
 // Preferences
@@ -330,7 +331,12 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
         const newAvg = value.lessThan(0) ? Money.zero() : value.dividedBy(onHand);
         await ctx.db
           .update(items)
-          .set({ averageCost: newAvg.toFixed(4), updatedAt: new Date() })
+          .set({
+            averageCost: newAvg.toFixed(4),
+            // The voided bill took invVariance back off the inventory account (value remainder, 0061).
+            ...valueRemainderAfter(item, onHand, onHand, newAvg, invVariance.negated()),
+            updatedAt: new Date(),
+          })
           .where(eq(items.id, item.id));
         await writeAudit(ctx, {
           action: 'update',

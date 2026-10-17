@@ -87,6 +87,18 @@ export const Money = {
  */
 export function allocate(total: MoneyInput, weights: MoneyInput[]): Decimal[] {
   const t = Money.round2(total);
+  // A negative total is the mirror image of the positive one: allocate |total| and negate, so the
+  // leftover cents go to the largest remainders exactly as they do for the positive amount (a
+  // credit memo splits its tax over agencies the same way as the invoice it reverses). Rounding
+  // a negative share toward zero and then handing out the remainder by fractional part would
+  // otherwise give the extra cent to the SMALLEST remainder.
+  if (t.isNegative()) {
+    return allocateNonNegative(t.negated(), weights).map((v) => (v.isZero() ? new Decimal(0) : v.negated()));
+  }
+  return allocateNonNegative(t, weights);
+}
+
+function allocateNonNegative(t: Decimal, weights: MoneyInput[]): Decimal[] {
   const ws = weights.map(toDecimal);
   const sum = ws.reduce<Decimal>((a, w) => a.plus(w), new Decimal(0));
   if (sum.isZero()) {

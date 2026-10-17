@@ -9,15 +9,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createReport, listReports } from '@/lib/services/expenseReports';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject, assertStringFields } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[expense-reports] unexpected error:', err);
@@ -37,7 +33,15 @@ export async function GET(_req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
+    assertStringFields(body, ['title']);
+    // Every line must be an object (a null / number line used to throw a TypeError → 500).
+    if (Array.isArray(body.lines) && body.lines.some((l: unknown) => !l || typeof l !== 'object' || Array.isArray(l))) {
+      return NextResponse.json({ error: 'Each expense line must be an object.', code: 'VALIDATION' }, { status: 400 });
+    }
+    if (Array.isArray(body.lines) && body.lines.some((l: Record<string, unknown>) => l.date && Number.isNaN(new Date(l.date as string).getTime()))) {
+      return NextResponse.json({ error: 'An expense line date is not a valid date.', code: 'VALIDATION' }, { status: 400 });
+    }
 
     const lines = Array.isArray(body.lines)
       ? body.lines.map((l: Record<string, unknown>) => ({

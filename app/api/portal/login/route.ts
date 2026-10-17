@@ -6,9 +6,11 @@ import { companies, employees } from '@/lib/db/schema';
 import { verifyPassword, createPortalToken, isArchivedSettings, PORTAL_COOKIE } from '@/lib/auth';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
+import { readJsonObject } from '@/lib/routeErrors';
 
 export async function POST(req: NextRequest) {
-  const { email, password } = await req.json().catch(() => ({}));
+  // Malformed JSON, `null` or a non-object body reads as {} (→ 400 below), never a TypeError → 500.
+  const { email, password }: Record<string, unknown> = (await readJsonObject(req)) ?? {};
   if (typeof email !== 'string' || !email.trim() || typeof password !== 'string' || !password) {
     return NextResponse.json({ error: 'Email and password are required.', code: 'VALIDATION' }, { status: 400 });
   }

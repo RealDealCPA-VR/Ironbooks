@@ -153,6 +153,9 @@ export function createUndoTracker(fetcher?: FetchLike): UndoTracker {
       const p = prepared as Prepared | null;
       if (!p) return;
       const id = p.write.kind === 'create' ? createdIdOf(data) : p.write.id;
+      // A create whose response carries no record id saved no new document Undo could reverse
+      // (e.g. Pay Bills that only applied credits): offer nothing rather than let the server guess.
+      if (!id) return;
       void postJson(doFetch, '/api/undo/commit', {
         resource: p.write.resource,
         kind: p.write.kind,

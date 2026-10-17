@@ -9,7 +9,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import {
   createHomeCurrencyAdjustment,
   listHomeCurrencyAdjustments,
@@ -28,7 +28,7 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as {
+    const body = (await requireJsonObject(req, { optional: true })) as {
       date?: string;
       rates?: Record<string, string | number>;
       memo?: string | null;

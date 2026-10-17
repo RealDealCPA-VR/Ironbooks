@@ -10,8 +10,8 @@ import { eq } from 'drizzle-orm';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { users, companies, paychecks, timeEntries } from '@/lib/db/schema';
-import type { ServiceContext } from './_base';
+import { users, companies, paychecks, payRuns, timeEntries } from '@/lib/db/schema';
+import { ServiceError, type ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { trialBalance } from './reports';
 import {
@@ -123,12 +123,19 @@ describe('Pay runs + time link', () => {
   });
 
   it('records a failure for a commission employee without an amount', async () => {
-    const { results } = await createPayRun(ctx, {
+    // Every check refused → the run is refused as a whole (no empty pay-run header is saved);
+    // the per-employee results travel in the error details.
+    const before = (await db.select().from(payRuns)).length;
+    const err = await createPayRun(ctx, {
       payDate: new Date('2025-01-31'),
       employees: [{ employeeId: carl.id }],
-    });
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(ServiceError);
+    expect(err.code).toBe('VALIDATION');
+    const results = (err.details as { results: Array<{ ok: boolean; error?: string }> }).results;
     expect(results[0].ok).toBe(false);
     expect(results[0].error).toMatch(/amount/i);
+    expect((await db.select().from(payRuns)).length).toBe(before);
   });
 
   it('lists past runs with paychecks and non-void totals', async () => {
@@ -209,9 +216,11 @@ describe('Pay runs + time link', () => {
     const again = await createPayRun(ctx, {
       payDate: new Date('2025-02-28'),
       employees: [{ employeeId: hank.id, timeEntryIds: [e1.id] }],
-    });
-    expect(again.results[0].ok).toBe(false);
-    expect(again.results[0].error).toMatch(/already paid/i);
+    }).catch((e) => e);
+    expect(again).toBeInstanceOf(ServiceError);
+    const againResults = (again.details as { results: Array<{ ok: boolean; error?: string }> }).results;
+    expect(againResults[0].ok).toBe(false);
+    expect(againResults[0].error).toMatch(/already paid/i);
   });
 
   it('rejects duplicate employees in one run and stamps payRunId via runPaycheck input', async () => {

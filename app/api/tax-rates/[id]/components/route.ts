@@ -6,17 +6,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listComponents, setComponents } from '@/lib/services/combinedTax';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[tax-rates/components] error:', err);
@@ -43,7 +37,7 @@ export async function PATCH(
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
     const components = body?.components;
     if (!Array.isArray(components)) {
       return NextResponse.json(

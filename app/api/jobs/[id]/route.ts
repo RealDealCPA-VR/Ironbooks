@@ -12,15 +12,11 @@ import { getJob, updateJob, deactivateJob, jobProfitability } from '@/lib/servic
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateJobSchema } from '@/lib/validation/jobs';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[api/jobs/[id]] unexpected error:', err);
@@ -54,7 +50,7 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json().catch(() => ({}));
+    const body = await requireJsonObject(req, { optional: true });
     // zod strip mode keeps absent keys absent — only provided fields are updated.
     const parsed = updateJobSchema.safeParse(body);
     if (!parsed.success) {

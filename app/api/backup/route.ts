@@ -25,15 +25,12 @@ import { requireFileAdmin } from '@/lib/services/access';
 import { withDamagedFileAccess } from '@/lib/db';
 import { recordBackup } from '@/lib/services/backupHistory';
 import { currentFingerprint } from '@/lib/services/backupFingerprint';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
     const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+      serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   // Do not leak raw error text (may contain absolute data-dir paths / OS details).

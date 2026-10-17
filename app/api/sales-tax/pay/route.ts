@@ -13,7 +13,7 @@
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import { paySalesTaxAgencies, paySalesTaxScreen } from '@/lib/services/liabilityPayments';
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -34,7 +34,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = (await requireJsonObject(req, { optional: true })) as Record<string, unknown>;
     const bad = (error: string) => NextResponse.json({ error, code: 'VALIDATION' }, { status: 400 });
     if (typeof body.date !== 'string' || Number.isNaN(new Date(body.date).getTime())) return bad('Enter the check date.');
     if (typeof body.paymentAccountId !== 'string' || !body.paymentAccountId) return bad('Pick the bank account to pay from.');

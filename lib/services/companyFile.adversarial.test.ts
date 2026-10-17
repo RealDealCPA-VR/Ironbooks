@@ -270,8 +270,10 @@ describe('portable company file — adversarial', () => {
     });
 
     it('GL running balances are consistent and closing balances tie to the trial balance', async () => {
+      // Columns: A Account, B Date, C Entry #, D Description, E Reference, F Name (customer/vendor,
+      // added so the GL re-imports through the QB GL import), G Debit, H Credit, I Balance.
       const rows = readSheet(zip.readAsText('xl/worksheets/sheet4.xml'));
-      const headerIdx = rows.findIndex((r) => r.A === 'Account' && r.H === 'Balance');
+      const headerIdx = rows.findIndex((r) => r.A === 'Account' && r.I === 'Balance');
       expect(headerIdx).toBeGreaterThanOrEqual(0);
       const byAcct = new Map<string, Array<Record<string, string>>>();
       for (const r of rows.slice(headerIdx + 1)) {
@@ -288,20 +290,20 @@ describe('portable company file — adversarial', () => {
       for (const [label, list] of byAcct) {
         expect(list[0].D, label).toBe('Opening balance');
         expect(list.at(-1)!.D, label).toBe('Closing balance');
-        let bal = Money.of(list[0].H ?? '0');
+        let bal = Money.of(list[0].I ?? '0');
         let sign: number | null = null;
         for (const l of list.slice(1, -1)) {
-          const delta = Money.sub(l.H ?? '0', bal);
-          const dc = Money.sub(l.F || '0', l.G || '0');
+          const delta = Money.sub(l.I ?? '0', bal);
+          const dc = Money.sub(l.G || '0', l.H || '0');
           if (!dc.isZero()) {
             const s = delta.equals(dc) ? 1 : delta.equals(dc.negated()) ? -1 : 0;
             expect(s, `${label}: running balance step ${delta} vs debit-credit ${dc}`).not.toBe(0);
             if (sign === null) sign = s;
             expect(s, `${label}: inconsistent sign`).toBe(sign);
           }
-          bal = Money.of(l.H ?? '0');
+          bal = Money.of(l.I ?? '0');
         }
-        expect(Money.of(list.at(-1)!.H ?? '0').equals(bal), `${label}: closing != last running`).toBe(true);
+        expect(Money.of(list.at(-1)!.I ?? '0').equals(bal), `${label}: closing != last running`).toBe(true);
         const code = label.split(' · ')[0];
         // The TB omits accounts whose activity nets to zero.
         const net = tbNet.get(code) ?? Money.zero();

@@ -24,6 +24,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { listGlImports, previewGlImport, runGlImport } from '@/lib/services/qbGlImport';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { qbGlImportSchema } from '@/lib/validation/qbGlImport';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 // Large reports take a while to post; never let the platform cache or time-box this route.
 export const dynamic = 'force-dynamic';
@@ -31,12 +32,7 @@ export const maxDuration = 300;
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'CONFLICT' || err.code === 'PERIOD_CLOSED' ? 409
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
+    const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
     return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
   }
   console.error('[qb-import/gl] unexpected error:', err);

@@ -23,6 +23,7 @@ import {
 } from '@/lib/db';
 import { checkLedgerHealth } from '@/lib/db/ledgerGuards';
 import { LOCK_FILE } from '@/lib/db/dirLock';
+import { withPlannerStats } from '@/lib/db/plannerStats';
 import { booksInBalance, verifyIntegrity } from './integrity';
 import {
   accounts, assemblyComponents, attachments, auditLogs, bankAccounts, bankTransactions,
@@ -65,7 +66,7 @@ import {
   salesTaxCodes, shipViaMethods, todoItems, todos, uomSetUnits, uomSets, vehicles, vendorTypes,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
-import { cloneAttachmentFileForRestore } from './attachments';
+import { cloneAttachmentFileForRestore, normalizeStoragePath, safeAttachmentPath } from './attachments';
 import { allowLedgerRewrite } from './posting';
 import { logTransaction, resetTransactionLogCache } from './transactionLog';
 import { BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE, recordBackup } from './backupHistory';
@@ -934,7 +935,11 @@ export async function exportCompanyData(db: DB, companyId: string): Promise<Comp
 export async function createCompanyBackup(
   db: DB,
   companyId: string,
-  opts: { access?: Pick<EffectiveAccess, 'flags'> | null } = {},
+  opts: {
+    access?: Pick<EffectiveAccess, 'flags'> | null;
+    /** Data dir holding the company's attachment files (default: the active company file). */
+    dataDir?: string;
+  } = {},
 ): Promise<BackupResult> {
   const raw = await exportCompanyData(db, companyId);
   const data = maskSensitive(raw, opts.access);
@@ -953,11 +958,71 @@ export async function createCompanyBackup(
   };
   zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
   zip.addFile(COMPANY_DATA_ENTRY, Buffer.from(JSON.stringify(data), 'utf8'));
+  // The attachment FILES travel too (files/<stored path>): restored on another PC, the rows
+  // would otherwise point at files that do not exist there. Only files inside the attachments
+  // folder are read (safeAttachmentPath), so a crafted row cannot pull another file in.
+  const dir = resolveDataDir(opts.dataDir);
+  const added = new Set<string>();
+  for (const row of raw.tables.attachments ?? []) {
+    const stored = String(row.storagePath ?? '');
+    const abs = safeAttachmentPath(dir, stored);
+    const key = normalizeStoragePath(stored);
+    if (!abs || added.has(key)) continue;
+    try {
+      if (!fs.statSync(abs).isFile()) continue;
+      zip.addFile(`${COMPANY_FILES_PREFIX}${key}`, fs.readFileSync(abs));
+      added.add(key);
+    } catch {
+      /* a file missing on this disk restores as a missing file, as before */
+    }
+  }
 
   return {
     buffer: zip.toBuffer(),
     filename: buildBackupFilename('ironbooks-company', data.company.name),
   };
+}
+
+/** Folder inside a per-company .bka holding the attachment files, by stored path. */
+const COMPANY_FILES_PREFIX = 'files/';
+
+/** The attachment files carried in a per-company .bka (normalized stored path → bytes). */
+function readCompanyBackupFiles(buffer: Buffer): Map<string, Buffer> {
+  const out = new Map<string, Buffer>();
+  let zip: AdmZip;
+  try {
+    zip = new AdmZip(buffer);
+  } catch {
+    return out;
+  }
+  for (const e of zip.getEntries()) {
+    const name = e.entryName.replace(/\\/g, '/');
+    if (e.isDirectory || !name.startsWith(COMPANY_FILES_PREFIX)) continue;
+    out.set(normalizeStoragePath(name.slice(COMPANY_FILES_PREFIX.length)), e.getData());
+  }
+  return out;
+}
+
+/**
+ * Write an attachment file carried in a per-company backup into `<dataDir>/attachments` under a
+ * fresh disk name (the same naming as cloneAttachmentFileForRestore). The stored path must stay
+ * inside the attachments folder, or the restore is refused.
+ */
+function writeRestoredAttachment(dataDir: string, storagePath: string, bytes: Buffer): { storagePath: string; createdPath: string } {
+  const abs = safeAttachmentPath(dataDir, storagePath);
+  if (!abs) {
+    throw new ServiceError('VALIDATION', 'Backup contains an attachment stored outside the attachments folder and cannot be restored.');
+  }
+  const original = path
+    .basename(abs)
+    .replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i, '')
+    .replace(/[^a-zA-Z0-9._-]/g, '_');
+  const diskName = `${randomUUID()}-${original || 'file'}`;
+  const dir = path.join(dataDir, 'attachments');
+  fs.mkdirSync(dir, { recursive: true });
+  const createdPath = path.join(dir, diskName);
+  fs.writeFileSync(createdPath, bytes);
+  return { storagePath: `attachments/${diskName}`, createdPath };
 }
 
 /** Validate + parse a per-company .bka buffer. Throws VALIDATION for anything else. */
@@ -1113,14 +1178,20 @@ export interface RestoreCompanyResult {
 export async function restoreCompanyBackup(
   db: DB,
   buffer: Buffer,
-  opts: { ownerId: string; name?: string },
+  opts: {
+    ownerId: string;
+    name?: string;
+    /** Data dir of `db` (where attachment files are written; default: the active company file). */
+    dataDir?: string;
+  },
 ): Promise<RestoreCompanyResult> {
   const data = readCompanyBackup(buffer);
+  const files = readCompanyBackupFiles(buffer);
 
   // Backup-before-destructive: company restore only inserts a brand-new company,
   // but it still mutates the shared data dir — snapshot it first (best-effort).
   try {
-    ensurePreOpBackup(null, 'restore-company');
+    ensurePreOpBackup(null, 'restore-company', opts.dataDir);
   } catch (err) {
     console.warn('[backup] pre-op backup before company restore failed (continuing):', err);
   }
@@ -1140,9 +1211,12 @@ export async function restoreCompanyBackup(
 
   // Attachment files copied for the restored company (removed again if the restore fails).
   const copiedFiles: string[] = [];
-  const attachmentsDataDir = resolveDataDir();
+  const attachmentsDataDir = resolveDataDir(opts.dataDir);
   try {
-    return await restoreCompanyRows(db, data, idMap, name, opts, attachmentsDataDir, copiedFiles);
+    // A bulk load into the shared file: fresh planner statistics afterwards (best-effort).
+    return await withPlannerStats(db, 'company restore', () =>
+      restoreCompanyRows(db, data, idMap, name, opts, attachmentsDataDir, copiedFiles, files),
+    );
   } catch (err) {
     for (const f of copiedFiles) {
       try {
@@ -1163,6 +1237,7 @@ async function restoreCompanyRows(
   opts: { ownerId: string; name?: string },
   attachmentsDataDir: string,
   copiedFiles: string[],
+  files: Map<string, Buffer> = new Map(),
 ): Promise<RestoreCompanyResult> {
   return db.transaction(async (tx) => {
     // Re-inserting a backup's posted ledger is a sanctioned rewrite (lines are added to
@@ -1193,12 +1268,19 @@ async function restoreCompanyRows(
       // Attachments: the stored path must stay inside the attachments folder, and the restored
       // company gets its own copy of every file present here (never a file shared with the
       // company it was backed up from, which deleting a document in either would destroy).
+      // The file comes from the backup itself when it carries it (restored on another PC), else
+      // from this data dir (an older backup restored into the file it was made from). Looked up
+      // by the ORIGINAL stored path: the revived one may have had an embedded id remapped.
       if (spec.name === 'attachments') {
-        for (const r of revived) {
-          const cloned = cloneAttachmentFileForRestore(attachmentsDataDir, String(r.storagePath ?? ''));
+        revived.forEach((r, i) => {
+          const stored = String(rows[i].storagePath ?? r.storagePath ?? '');
+          const bytes = files.get(normalizeStoragePath(stored));
+          const cloned = bytes
+            ? writeRestoredAttachment(attachmentsDataDir, stored, bytes)
+            : cloneAttachmentFileForRestore(attachmentsDataDir, stored);
           if (cloned.createdPath) copiedFiles.push(cloned.createdPath);
           r.storagePath = cloned.storagePath;
-        }
+        });
       }
       // Chunked inserts keep parameter counts well under PG limits.
       for (let i = 0; i < revived.length; i += 200) {

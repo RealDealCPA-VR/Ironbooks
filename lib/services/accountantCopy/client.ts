@@ -30,6 +30,7 @@ import {
   deposits,
   employees,
   expenses,
+  fiscalPeriods,
   inventoryLayers,
   invoiceLines,
   invoices,
@@ -46,6 +47,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { formatCurrency, Money, toAmountString } from '@/lib/money';
+import { getQbAccountTypeInfo, isQbAccountType, resolveQbAccountType } from '@/lib/accountTypes';
 import { type ServiceContext, ServiceError, inTransaction, validation, writeAudit } from '../_base';
 import { createAccount, updateAccount } from '../accounts';
 import { createClass } from '../dimensions';
@@ -64,6 +66,7 @@ import {
   TRANSFER_ENTRY,
   TRANSFER_EXTENSION,
   type AccountChange,
+  type AccountPayload,
   type ChangesFile,
   type DepositPayload,
   type DocChange,
@@ -177,21 +180,23 @@ export async function createAccountantCopy(
   if (!DATE_RE.test(dividingDate) || isNaN(new Date(`${dividingDate}T00:00:00.000Z`).getTime())) {
     throw validation('Enter the dividing date as a date (YYYY-MM-DD).');
   }
-  const status = await accountantCopyStatus(ctx);
-  if (status.mode === 'accountant') {
-    throw new ServiceError('CONFLICT', "This file is itself an Accountant's Copy. Only your client's original file can create one.");
-  }
-  if (status.mode === 'client') {
-    throw new ServiceError(
-      'CONFLICT',
-      `An Accountant's Copy (dividing date ${formatDividingDate(status.current!.dividingDate)}) is already out. Import its changes or cancel it before creating another.`,
-    );
-  }
   const [co] = await ctx.db.select({ name: companies.name }).from(companies).where(eq(companies.id, ctx.companyId));
   if (!co) throw new ServiceError('NOT_FOUND', 'Company not found');
   const [me] = ctx.userId ? await ctx.db.select({ name: users.name }).from(users).where(eq(users.id, ctx.userId)) : [];
 
   const row = await inTransaction(ctx, async (tx) => {
+    // "One copy out at a time" is checked in the same transaction as the insert, so two creates
+    // at once cannot leave two outstanding copies.
+    const status = await accountantCopyStatus(tx);
+    if (status.mode === 'accountant') {
+      throw new ServiceError('CONFLICT', "This file is itself an Accountant's Copy. Only your client's original file can create one.");
+    }
+    if (status.mode === 'client') {
+      throw new ServiceError(
+        'CONFLICT',
+        `An Accountant's Copy (dividing date ${formatDividingDate(status.current!.dividingDate)}) is already out. Import its changes or cancel it before creating another.`,
+      );
+    }
     const [created] = await tx.db
       .insert(accountantCopies)
       .values({
@@ -213,25 +218,7 @@ export async function createAccountantCopy(
   });
 
   try {
-    const portable = await createPortableCompanyFile(ctx, { dataDir: input.dataDir });
-    const zip = new AdmZip(portable.buffer);
-    const manifest: TransferManifest = {
-      app: 'ironbooks',
-      kind: 'accountant-copy',
-      formatVersion: 1,
-      copyId: row.id,
-      companyId: ctx.companyId,
-      companyName: co.name,
-      dividingDate,
-      createdAt: row.createdAt.toISOString(),
-      createdBy: me?.name ?? null,
-    };
-    zip.addFile(TRANSFER_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
-    return {
-      buffer: zip.toBuffer(),
-      filename: `${safeCompanyName(co.name)} (Accountant's Copy ${dividingDate}).${TRANSFER_EXTENSION}`,
-      copy: publicCopy(row),
-    };
+    return await buildTransferFile(ctx, row, co.name, me?.name ?? null, input.dataDir);
   } catch (err) {
     // The file could not be built: nothing went out, so the restriction is lifted again.
     await ctx.db
@@ -240,6 +227,68 @@ export async function createAccountantCopy(
       .where(eq(accountantCopies.id, row.id));
     throw err;
   }
+}
+
+/** The .ibac of a copy row: a Portable Company File of this file plus the copy's manifest. */
+async function buildTransferFile(
+  ctx: ServiceContext,
+  row: AccountantCopyRow,
+  companyName: string,
+  createdBy: string | null,
+  dataDir: string | undefined,
+): Promise<TransferFileResult> {
+  const portable = await createPortableCompanyFile(ctx, { dataDir });
+  const zip = new AdmZip(portable.buffer);
+  const manifest: TransferManifest = {
+    app: 'ironbooks',
+    kind: 'accountant-copy',
+    formatVersion: 1,
+    copyId: row.id,
+    companyId: row.companyId,
+    companyName,
+    dividingDate: row.dividingDate,
+    createdAt: row.createdAt.toISOString(),
+    createdBy,
+  };
+  zip.addFile(TRANSFER_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+  return {
+    buffer: zip.toBuffer(),
+    filename: `${safeCompanyName(companyName)} (Accountant's Copy ${row.dividingDate}).${TRANSFER_EXTENSION}`,
+    copy: publicCopy(row),
+  };
+}
+
+/**
+ * Save the transfer file of the outstanding copy again (the first one was never saved — the Save
+ * dialog was cancelled — or was lost). It is a fresh Portable Company File of this file with the
+ * SAME copy id, file token and dividing date, so it opens as the same Accountant's Copy and its
+ * changes file is matched exactly like the first one's. Everything dated on or before the dividing
+ * date has been locked since the copy was made, so the accountant gets the same period to work
+ * on; later work in this file only travels as context (it stays locked in the accountant's copy).
+ * Only one changes file of the copy can ever be imported.
+ */
+export async function saveTransferFileAgain(ctx: ServiceContext, input: { dataDir?: string } = {}): Promise<TransferFileResult> {
+  assertOwnerOrAdmin(ctx, "save the Accountant's Copy (it contains every user and password of the file)");
+  const status = await accountantCopyStatus(ctx);
+  if (status.mode === 'accountant') {
+    throw new ServiceError('CONFLICT', "This file is itself an Accountant's Copy. Only your client's original file can save its transfer file.");
+  }
+  if (status.mode !== 'client' || !status.current) {
+    throw new ServiceError('NOT_FOUND', "There is no Accountant's Copy out. Create one first.");
+  }
+  const [row] = await ctx.db
+    .select()
+    .from(accountantCopies)
+    .where(and(eq(accountantCopies.id, status.current.id), eq(accountantCopies.companyId, ctx.companyId), eq(accountantCopies.status, 'outstanding')));
+  if (!row) throw new ServiceError('CONFLICT', "This Accountant's Copy was already imported or cancelled.");
+  const [co] = await ctx.db.select({ name: companies.name }).from(companies).where(eq(companies.id, ctx.companyId));
+  if (!co) throw new ServiceError('NOT_FOUND', 'Company not found');
+  const [creator] = row.createdBy ? await ctx.db.select({ name: users.name }).from(users).where(eq(users.id, row.createdBy)) : [];
+  const out = await buildTransferFile(ctx, row, co.name, creator?.name ?? null, input.dataDir);
+  await inTransaction(ctx, (tx) =>
+    writeAudit(tx, { action: 'update', entityType: 'accountant_copy', entityId: row.id, newValues: { transferFileSavedAgain: true } }),
+  );
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1050,106 @@ async function numberTaken(ctx: ServiceContext, type: DocType, p: Record<string,
   return (res as unknown as { rows: unknown[] }).rows.length > 0;
 }
 
+/** The field holding a name / item's (unique) name. */
+const NAME_FIELD: Record<NameType, string> = { customer: 'displayName', vendor: 'displayName', item: 'name', other_name: 'name' };
+
+/** Another record of that list already has the name (names are unique per list, case-insensitive). */
+async function nameTakenByOther(ctx: ServiceContext, type: NameType, name: string, selfId: string): Promise<boolean> {
+  const { table } = NAME_COLUMNS[type];
+  const col = type === 'customer' || type === 'vendor' ? 'display_name' : 'name';
+  const res = await ctx.db.execute(
+    sql`SELECT 1 FROM ${sql.raw(table)} WHERE company_id = ${ctx.companyId}::uuid AND id <> ${selfId}::uuid AND lower(${sql.raw(col)}) = lower(${name.trim()}) LIMIT 1`,
+  );
+  return (res as unknown as { rows: unknown[] }).rows.length > 0;
+}
+
+/** The item of this file that has the barcode, other than `selfId` (barcodes are unique). */
+async function barcodeOwner(ctx: ServiceContext, code: string, selfId: string | null): Promise<string | null> {
+  const [row] = await ctx.db
+    .select({ id: itemsTable.id, name: itemsTable.name })
+    .from(itemsTable)
+    .where(and(eq(itemsTable.companyId, ctx.companyId), eq(itemsTable.barcode, code.trim())));
+  return row && row.id !== selfId ? row.name : null;
+}
+
+/**
+ * A name / item the import would give a name (or an item a barcode) that another record of the
+ * client's file has since taken: the services refuse the duplicate. Returns the field and the
+ * plain-language problem, or null.
+ */
+async function nameCollision(
+  ctx: ServiceContext,
+  type: NameType,
+  selfId: string | null,
+  applied: Record<string, unknown>,
+  before: Record<string, unknown> | null,
+): Promise<{ field: string; text: string } | null> {
+  const label = NAME_LABEL[type].toLowerCase();
+  const key = NAME_FIELD[type];
+  const name = applied[key];
+  if (selfId && typeof name === 'string' && name.trim() && name.trim().toLowerCase() !== String(before?.[key] ?? '').trim().toLowerCase()) {
+    if (await nameTakenByOther(ctx, type, name, selfId)) {
+      return {
+        field: key,
+        text: `Your file already has another ${label} named "${name.trim()}", so this ${label} can't be renamed to it. To import: rename one of them in your file, or ask your accountant to pick another name.`,
+      };
+    }
+  }
+  const code = applied.barcode;
+  if (type === 'item' && typeof code === 'string' && code.trim() && code.trim() !== String(before?.barcode ?? '').trim()) {
+    const owner = await barcodeOwner(ctx, code, selfId);
+    if (owner) {
+      return {
+        field: 'barcode',
+        text: `Your item "${owner}" already has the barcode ${code.trim()}, so this item can't have it too. To import: change the barcode of your item, or ask your accountant to use another one.`,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * The accountant's account edit changes the account between debit- and credit-normal types, into
+ * or out of A/R / A/P, or into or out of non-posting — which the service refuses for an account
+ * with transactions — and the client's file has some (the client posted to it after the copy was
+ * made; the accountant's copy had none, or the change could not have been made there).
+ */
+async function accountTypeBlocker(ctx: ServiceContext, cur: typeof accounts.$inferSelect, after: AccountPayload): Promise<string | null> {
+  const qb = after.qbType?.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (!qb || !isQbAccountType(qb)) return null;
+  const next = resolveQbAccountType(qb, after.subtype?.trim().toLowerCase() || null);
+  const subledger = (s: string) => s === 'accounts_receivable' || s === 'accounts_payable';
+  const changes =
+    next.type !== cur.type ||
+    (next.subtype !== cur.subtype && (subledger(next.subtype) || subledger(cur.subtype))) ||
+    (next.subtype === 'non_posting') !== (cur.subtype === 'non_posting');
+  if (!changes) return null;
+  const [used] = await ctx.db
+    .select({ date: journalEntries.date })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+    .where(and(eq(journalEntryLines.accountId, cur.id), eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted')))
+    .orderBy(asc(journalEntries.date))
+    .limit(1);
+  if (!used) return null;
+  return (
+    `Your file has transactions in this account (the first dated ${day(used.date)}), so its account type can't be changed to ${getQbAccountTypeInfo(qb)?.label ?? qb}. ` +
+    "To import: ask your accountant to leave this account's type as it is and create a new account of that type instead."
+  );
+}
+
+/** Closed fiscal periods of this file ('YYYY-MM-DD' ranges). */
+async function closedFiscalPeriods(ctx: ServiceContext): Promise<Array<{ start: string; end: string }>> {
+  const rows = await ctx.db
+    .select({ start: fiscalPeriods.periodStart, end: fiscalPeriods.periodEnd })
+    .from(fiscalPeriods)
+    .where(and(eq(fiscalPeriods.companyId, ctx.companyId), eq(fiscalPeriods.isClosed, true)));
+  return rows.map((r) => ({ start: day(r.start), end: day(r.end) }));
+}
+
+/** Forms that never post (no period lock applies to them). */
+const NON_POSTING_DOCS = new Set<DocType>(['estimate', 'sales_order', 'purchase_order']);
+
 /** Build the plain-language review of a changes file (nothing is changed). */
 export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Promise<ChangesReview> {
   const file = parseChangesFile(buffer);
@@ -1018,6 +1167,24 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
     if (d && closingDate && day(d) <= closingDate) needsClosingPassword = true;
   };
   const afterDividing = 'This change is dated after the dividing date and will not be imported.';
+  // A fiscal period the client closed (Fiscal Periods) can't be posted into, with or without the
+  // closing-date password. Closing one on or before the dividing date is refused while the copy is
+  // out, but a copy made before that rule (or a period closed before the copy) can still have one.
+  const periods = await closedFiscalPeriods(ctx);
+  const closedOn = (...dates: Array<string | Date | null | undefined>): string | null => {
+    for (const d of dates) {
+      if (!d) continue;
+      const x = day(d);
+      const p = periods.find((r) => r.start <= x && x <= r.end);
+      if (p) {
+        return (
+          `Your accounting period ${formatDividingDate(p.start)} – ${formatDividingDate(p.end)} is closed (Fiscal Periods), so this change dated ${x} can't be posted into it. ` +
+          'To import: reopen that period under Fiscal Periods, import these changes, then close it again.'
+        );
+      }
+    }
+    return null;
+  };
 
   const existingCodes = new Set([...(await ctx.db.select({ code: accounts.code }).from(accounts).where(eq(accounts.companyId, ctx.companyId)))].map((r) => r.code));
   for (const a of file.accounts) {
@@ -1048,7 +1215,11 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         amount: null,
         before,
         after: [`${a.after.code} · ${a.after.name}`, `Active: ${a.after.isActive ? 'yes' : 'no'}`, ...(a.after.description ? [a.after.description] : [])],
-        problem: !cur ? 'This account no longer exists in your file.' : !sameVersion(cur.editedAt, a.baseVersion) ? changedElsewhere : null,
+        problem: !cur
+          ? 'This account no longer exists in your file.'
+          : !sameVersion(cur.editedAt, a.baseVersion)
+            ? changedElsewhere
+            : await accountTypeBlocker(ctx, cur, a.after),
       });
     }
   }
@@ -1073,13 +1244,19 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         amount: null,
         before: null,
         after: d.lines,
-        problem: (await nameTaken(ctx, n.type, label)) ? `Your file already has a ${NAME_LABEL[n.type].toLowerCase()} named "${label}".` : null,
+        problem: (await nameTaken(ctx, n.type, label))
+          ? `Your file already has a ${NAME_LABEL[n.type].toLowerCase()} named "${label}".`
+          : ((await nameCollision(ctx, n.type, null, n.after, null))?.text ?? null),
       });
       continue;
     }
     const chk = await nameEditCheck(ctx, n);
     const before = chk.state === 'missing' ? null : await namePayload(ctx, n.type, n.id, true);
     const shown = nameEditPayload(n, undefined) ?? n.after;
+    // A new name / barcode another of the client's records has since taken: the service refuses
+    // it. Keeping your version only helps when that field is one you both changed.
+    const collision = chk.state === 'missing' ? null : await nameCollision(ctx, n.type, n.id, shown, before);
+    const keepHelps = !collision || !n.fields || chk.conflicts.length === 0 || chk.conflicts.includes(collision.field);
     items.push({
       key: `${n.type}:edit:${n.id}`,
       group: 'name',
@@ -1093,10 +1270,10 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       problem:
         chk.state === 'missing'
           ? `This ${NAME_LABEL[n.type].toLowerCase()} no longer exists in your file.`
-          : chk.state === 'changed'
+          : chk.state === 'changed' && keepHelps
             ? nameConflictText(n, chk.conflicts)
-            : null,
-      ...(chk.state === 'changed' ? { keepable: true, conflictFields: chk.conflicts } : {}),
+            : (collision?.text ?? (chk.state === 'changed' ? nameConflictText(n, chk.conflicts) : null)),
+      ...(chk.state === 'changed' && keepHelps ? { keepable: true, conflictFields: chk.conflicts } : {}),
     });
   }
 
@@ -1117,6 +1294,7 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         else if (!sameVersion(cur.row.updatedAt, t.baseVersion)) problem = changedElsewhere;
         if (cur) touchesClosed(cur.row.date.toISOString());
       }
+      problem ??= closedOn(afterDate, cur?.row.date);
       const kindTitle = t.op === 'add' ? 'New journal entry' : t.op === 'edit' ? 'Changed journal entry' : 'Voided journal entry';
       items.push({
         key,
@@ -1138,6 +1316,7 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         else if (!sameVersion(cur.row.updatedAt, t.baseVersion)) problem = changedElsewhere;
         if (cur) touchesClosed(cur.row.date.toISOString());
       }
+      problem ??= closedOn(afterDate, cur?.row.date);
       const kindTitle = t.op === 'add' ? 'New transfer' : t.op === 'edit' ? 'Changed transfer' : 'Voided transfer';
       items.push({
         key,
@@ -1162,6 +1341,7 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
       if (!problem && t.op !== 'void' && depositHeldIds(t.after).some((x) => !m.docs.has(x))) {
         problem = 'This deposit holds a payment or sales receipt that is not in your file.';
       }
+      problem ??= closedOn(afterDate, cur?.row.date);
       const kindTitle = t.op === 'add' ? 'New deposit' : t.op === 'edit' ? 'Changed deposit' : 'Voided deposit';
       items.push({
         key,
@@ -1183,6 +1363,7 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         else if (!sameVersion(cur.row.updatedAt, t.baseVersion)) problem = changedElsewhere;
         if (cur) touchesClosed(cur.row.date.toISOString());
       }
+      problem ??= closedOn(afterDate, cur?.row.date);
       const kindTitle = t.op === 'add' ? 'New check / expense' : t.op === 'edit' ? 'Changed check / expense' : 'Voided check / expense';
       items.push({
         key,
@@ -1210,9 +1391,11 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
     let before: string[] | null = null;
     let beforeAmount: string | null = null;
     let curDay: string | null = null;
+    let curPosts = false;
     if (d.op !== 'add') {
       const state = await recordUnchanged(ctx, d.type, d.id, d.baseVersion, d.baseDigest);
       const st = d.type === 'inventory_adjustment' ? null : (await recordStates(ctx, d.type, [d.id])).get(d.id);
+      curPosts = !NON_POSTING_DOCS.has(d.type) && st?.state !== 'draft';
       if (state === 'missing') problem = `This ${label.toLowerCase()} no longer exists in your file.`;
       else if (st?.state === 'void') problem = `This ${label.toLowerCase()} is already void in your file.`;
       else if (state === 'changed') problem = changedElsewhere;
@@ -1232,6 +1415,8 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
     const afterDay = d.op === 'void' ? null : day(String(d.after.date));
     if (afterDay && afterDay > copy.dividingDate) problem = afterDividing;
     touchesClosed(afterDay);
+    const afterPosts = d.op !== 'void' && !NON_POSTING_DOCS.has(d.type) && d.after.status !== 'draft';
+    problem ??= closedOn(afterPosts ? afterDay : null, curPosts ? curDay : null);
     if (d.op === 'add' && (await numberTaken(ctx, d.type, d.after))) {
       note = `Your file already has a ${label.toLowerCase()} numbered ${String(d.after.refNumber)}; this one keeps the accountant's number.`;
     }
@@ -1271,6 +1456,8 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         .where(and(eq(journalItemApplications.id, a.id), eq(journalItemApplications.companyId, ctx.companyId)));
       if (!row) problem = 'That journal entry credit is no longer applied in your file.';
     }
+    // Credit memo and General Journal applications are dated (their services check the period).
+    if (a.kind !== 'vendor_credit') problem ??= closedOn(a.date);
     items.push({
       key: applicationKey(a),
       group: 'application',
@@ -1294,6 +1481,8 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
     if (day(r.statementDate) > copy.dividingDate) problem = afterDividing;
     // The client's own later reconciliations (after the dividing date) that sit on top of it.
     problem ??= await reconciliationBlocker(ctx, r, { mapId: (id) => id, undoneInFile, accountLabel: L.account(r.accountId) });
+    // The statement's service charge / interest posts on the statement date.
+    if (r.op === 'reconcile' && (r.serviceCharge || r.interestEarned)) problem ??= closedOn(r.statementDate);
     if (r.op === 'undo') {
       const [latest] = await ctx.db
         .select({ id: reconciliations.id })
@@ -1746,7 +1935,13 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
               if (t.op === 'add') idMap.set(t.id, (await createExpense(c, expenseInput(t.after))).id);
               else if (t.op === 'edit') {
                 const after = t.after;
-                await withVersionCheck(c, 'expense', t.id, t.baseVersion, (cc) => updateExpense(cc, t.id, expenseInput(after)));
+                // Files made before the Other Names payee travelled keep the payee the check has.
+                let keepOtherName: string | null = null;
+                if (after.otherNameId === undefined && !after.vendorId) {
+                  const [cur] = await c.db.select({ id: expenses.otherNameId }).from(expenses).where(and(eq(expenses.id, t.id), eq(expenses.companyId, c.companyId)));
+                  keepOtherName = cur?.id ?? null;
+                }
+                await withVersionCheck(c, 'expense', t.id, t.baseVersion, (cc) => updateExpense(cc, t.id, expenseInput(after, keepOtherName)));
               } else await withVersionCheck(c, 'expense', t.id, t.baseVersion, (cc) => voidExpense(cc, t.id));
             }
           },
@@ -1772,9 +1967,11 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
           ),
         };
       }
-      function expenseInput(p: ExpensePayload): CreateExpenseInput {
+      function expenseInput(p: ExpensePayload, keepOtherNameId: string | null = null): CreateExpenseInput {
         return {
           vendorId: mapId(p.vendorId),
+          // B3: the Other Names payee (an Other Name made in the copy maps to the client's new one).
+          otherNameId: p.otherNameId !== undefined ? mapId(p.otherNameId) : keepOtherNameId,
           payeeName: p.payeeName,
           date: toDate(p.date),
           method: p.method as ExpenseMethod,

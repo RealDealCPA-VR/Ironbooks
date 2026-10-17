@@ -49,6 +49,7 @@
 import Papa from 'papaparse';
 import { and, eq } from 'drizzle-orm';
 import { csvUnsafeText } from '@/lib/csv';
+import { withPlannerStats } from '@/lib/db/plannerStats';
 import {
   accounts,
   classes as classesTable,
@@ -174,6 +175,29 @@ function mapIifType(iifType: string, name?: string): { type: string; subtype: st
   if (mapped.subtype === 'other_current_asset' && name && /undeposited/i.test(name)) {
     return { type: 'asset', subtype: 'undeposited_funds' };
   }
+  // IIF ACCNTTYPE has no detail type: QuickBooks writes a savings account as BANK, Inventory Asset
+  // as OCASSET, Retained Earnings as EQUITY, … Refine it from the account's own name, with the
+  // same rules as the General Ledger import (qbGlParse.toBookkeeperType), so a round trip keeps
+  // the detail type.
+  const leaf = (name ?? '').split(':').pop()!.trim().toLowerCase();
+  if (leaf) {
+    if (mapped.type === 'asset' && mapped.subtype === 'checking' && /saving|money market/.test(leaf)) {
+      return { type: 'asset', subtype: 'savings' };
+    }
+    if (mapped.type === 'asset' && mapped.subtype === 'other_current_asset' && /inventory/.test(leaf)) {
+      return { type: 'asset', subtype: 'inventory' };
+    }
+    if (mapped.type === 'equity' && mapped.subtype === 'owners_equity' && /retained earnings/.test(leaf)) {
+      return { type: 'equity', subtype: 'retained_earnings' };
+    }
+    if (mapped.type === 'revenue' && mapped.subtype === 'sales' && /service|consult|fee/.test(leaf)) {
+      return { type: 'revenue', subtype: 'service_revenue' };
+    }
+    if (mapped.type === 'expense' && mapped.subtype === 'operating_expenses') {
+      if (/payroll|wage|salar/.test(leaf)) return { type: 'expense', subtype: 'payroll' };
+      if (/\btax/.test(leaf)) return { type: 'expense', subtype: 'taxes' };
+    }
+  }
   return mapped;
 }
 
@@ -277,6 +301,8 @@ export interface IIFItem {
   totalValue?: string;
   /** G1: ASOFDATE - as-of date of the quantity on hand (else the file's opening-balance date). */
   asOf?: string;
+  /** CUSTFLD1..n values under their CUSTITEMDICT labels (item custom fields). */
+  customFields?: Record<string, string>;
   raw?: Record<string, string>;
 }
 
@@ -356,13 +382,19 @@ export interface ParsedIIF {
   /** Every other list section keyed by its row type (CTYPE, TERMS, BUD, …). */
   lists: Record<string, IIFListRows>;
   /** CUSTNAMEDICT custom-field labels by CUSTFLD index, per name list. */
-  customFieldLabels: { customer: Record<number, string>; vendor: Record<number, string>; employee: Record<number, string> };
+  customFieldLabels: {
+    customer: Record<number, string>;
+    vendor: Record<number, string>;
+    employee: Record<number, string>;
+    /** Item custom-field labels (CUSTITEMDICT). */
+    item?: Record<number, string>;
+  };
 }
 
 /** Sections parsed by dedicated code (everything else lands in `lists`). */
 const CORE_SECTIONS = new Set([
   'ACCNT', 'CUST', 'VEND', 'CLASS', 'INVITEM', 'INVITEMCOMP', 'EMP', 'TRNS', 'SPL', 'ENDTRNS',
-  'CUSTNAMEDICT', 'HDR',
+  'CUSTNAMEDICT', 'CUSTITEMDICT', 'HDR',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -483,7 +515,7 @@ export function parseIIF(content: string): ParsedIIF {
     employees: [],
     transactions: [],
     lists: {},
-    customFieldLabels: { customer: {}, vendor: {}, employee: {} },
+    customFieldLabels: { customer: {}, vendor: {}, employee: {}, item: {} },
   };
 
   const lines = content
@@ -602,6 +634,12 @@ export function parseIIF(content: string): ParsedIIF {
         }
         break;
       }
+      case 'CUSTITEMDICT': {
+        // Item custom-field labels: INDEX (0-based) + LABEL — values are INVITEM CUSTFLDn.
+        const idx = Number(row.INDEX);
+        if (Number.isInteger(idx) && row.LABEL) (result.customFieldLabels.item ??= {})[idx + 1] = row.LABEL;
+        break;
+      }
       case 'TRNS':
         if (currentTxn) result.transactions.push(currentTxn); // missing ENDTRNS — close defensively
         currentTxn = {
@@ -629,6 +667,12 @@ export function parseIIF(content: string): ParsedIIF {
   if (currentTxn) result.transactions.push(currentTxn); // file ended without ENDTRNS
 
   const labels = result.customFieldLabels;
+  // Item custom fields (INVITEM CUSTFLDn under CUSTITEMDICT labels), once every label is read.
+  for (const item of result.items) {
+    if (!item.raw) continue;
+    const fields = customFieldsOf(item.raw, labels.item ?? {});
+    if (Object.keys(fields).length) item.customFields = fields;
+  }
   for (const row of custRows) {
     const billing = parseIifAddress(
       [row.BADDR1, row.BADDR2, row.BADDR3, row.BADDR4, row.BADDR5],
@@ -1040,6 +1084,15 @@ export function resolveAccountRef(
   // "10100 · Checking" style labels from reports: try the number.
   const num = /^([A-Za-z0-9][\w.-]*)\s*[·•]\s*(.+)$/.exec(trimmed);
   if (num && lookup.byCode.get(num[1])) return lookup.byCode.get(num[1])!;
+  // "1300 Inventory Asset" (number, space, name — how our own list export writes an item's
+  // accounts): the number only counts when the rest is that account's own name or full path,
+  // so a name that merely starts with digits never resolves to an unrelated account.
+  const spaced = /^([A-Za-z0-9][\w.-]*)\s+(.+)$/.exec(trimmed);
+  if (spaced) {
+    const acct = lookup.byCode.get(spaced[1]);
+    const rest = normPath(spaced[2]);
+    if (acct && (rest === acct.name.trim().replace(/\s+/g, ' ').toLowerCase() || rest === normPath(acct.path))) return acct;
+  }
   const exact = lookup.byLowerName.get(trimmed.toLowerCase()) ?? [];
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) return { ambiguous: true, candidates: exact };
@@ -1410,6 +1463,15 @@ export async function importIIF(
   ctx: ServiceContext,
   content: string,
   opts: ImportIifOptions = {},
+): Promise<ImportCounts> {
+  // A bulk load: fresh planner statistics afterwards (PGlite has no autovacuum; best-effort).
+  return withPlannerStats(ctx.db, 'IIF import', () => importIIFRows(ctx, content, opts));
+}
+
+async function importIIFRows(
+  ctx: ServiceContext,
+  content: string,
+  opts: ImportIifOptions,
 ): Promise<ImportCounts> {
   const parsed = parseIIF(content);
   const counts = emptyCounts();
@@ -1947,6 +2009,7 @@ async function importIifItems(
       reorderPoint: item.reorderPoint ? parseIifAmount(item.reorderPoint) : null,
       opening: openingFromRow(item.quantityOnHand, item.totalValue, purchaseCost, item.asOf, openingOpts.obDate),
       carriedAccountIds: openingOpts.carriedAccountIds,
+      customFields: item.customFields,
     });
     // A sales tax item (STAX) is also a sales tax RATE so invoices can charge it.
     if (created && type === 'sales_tax' && pct && (item.itemType ?? '').toUpperCase().replace(/\s/g, '') === 'STAX') {
@@ -2077,6 +2140,8 @@ async function importItemRow(
     opening?: ImportedOpening;
     /** Inventory asset accounts whose balance the same import already carries (no double count). */
     carriedAccountIds?: Set<string>;
+    /** Item custom-field values ({ label: value }). */
+    customFields?: Record<string, string>;
   },
 ): Promise<string | null> {
   const name = input.name.trim();
@@ -2196,6 +2261,7 @@ async function importItemRow(
     const patch: Partial<typeof itemsTable.$inferInsert> = {};
     if (input.inactive) patch.isActive = false;
     if (input.reorderPoint && input.type === 'inventory') patch.reorderPoint = input.reorderPoint;
+    if (input.customFields && Object.keys(input.customFields).length) patch.customFields = input.customFields;
     if (Object.keys(patch).length) {
       await ctx.db.update(itemsTable).set({ ...patch, updatedAt: new Date() }).where(eq(itemsTable.id, row.id));
       await writeAudit(ctx, { action: 'update', entityType: 'item', entityId: row.id, newValues: patch });
@@ -2524,6 +2590,7 @@ export interface CsvColumnMapping {
   email?: string;
   phone?: string;
   billingAddress_line1?: string;
+  billingAddress_line2?: string;
   billingAddress_city?: string;
   billingAddress_state?: string;
   billingAddress_zip?: string;
@@ -2535,9 +2602,19 @@ export interface CsvColumnMapping {
   address_zip?: string;
   address_country?: string;
   notes?: string;
+  /** Payment terms ("Net 30", "net_30", "Due on receipt"). */
+  terms?: string;
+  /** Vendors: 1099 vendor (Y / N). */
+  is1099?: string;
 }
 
 type Row = Record<string, string>;
+
+/** An address object with only the parts that have a value (no empty-string keys). */
+function addressOf(parts: Record<string, string>): Record<string, string> | null {
+  const out = Object.fromEntries(Object.entries(parts).map(([k, v]) => [k, (v ?? '').trim()]).filter(([, v]) => v));
+  return Object.keys(out).length ? out : null;
+}
 
 function parseCsvRows(content: string): Row[] {
   const parsed = Papa.parse<Row>(content, {
@@ -2568,19 +2645,25 @@ async function importCustomerRows(ctx: ServiceContext, rows: Row[], mapping: Csv
       counts.issues.push({ entity: 'customer', name: displayName, reason: 'duplicate', message: `Customer "${displayName}" already exists.` });
       continue;
     }
-    const line1 = mapping.billingAddress_line1 ? (row[mapping.billingAddress_line1] ?? '') : '';
-    const city = mapping.billingAddress_city ? (row[mapping.billingAddress_city] ?? '') : '';
-    const state = mapping.billingAddress_state ? (row[mapping.billingAddress_state] ?? '') : '';
-    const zip = mapping.billingAddress_zip ? (row[mapping.billingAddress_zip] ?? '') : '';
-    const country = mapping.billingAddress_country ? (row[mapping.billingAddress_country] ?? '') : '';
+    const part = (key: keyof CsvColumnMapping) => (mapping[key] ? (row[mapping[key]!] ?? '') : '');
+    const terms = normalizeTerms(part('terms'));
     try {
       await createCustomer(ctx, {
         displayName,
         companyName: mapping.companyName ? (row[mapping.companyName] || null) : null,
         email: mapping.email ? (row[mapping.email] || null) : null,
         phone: mapping.phone ? (row[mapping.phone] || null) : null,
-        billingAddress: line1 || city ? { line1, city, state, zip, country } : null,
+        // Only the parts the file has (a street-less "Springfield" is still an address).
+        billingAddress: addressOf({
+          line1: part('billingAddress_line1'),
+          line2: part('billingAddress_line2'),
+          city: part('billingAddress_city'),
+          state: part('billingAddress_state'),
+          zip: part('billingAddress_zip'),
+          country: part('billingAddress_country'),
+        }),
         notes: mapping.notes ? (row[mapping.notes] || null) : null,
+        ...(terms ? { terms } : {}),
       });
       counts.customers++;
     } catch (err) {
@@ -2597,7 +2680,7 @@ async function importCustomerRows(ctx: ServiceContext, rows: Row[], mapping: Csv
 
 /** Parse a CSV string and insert customers using the supplied column mapping. */
 export async function importCustomersCSV(ctx: ServiceContext, content: string, mapping: CsvColumnMapping): Promise<ImportCounts> {
-  return importCustomerRows(ctx, parseCsvRows(content), mapping);
+  return withPlannerStats(ctx.db, 'customer import', () => importCustomerRows(ctx, parseCsvRows(content), mapping));
 }
 
 async function importVendorRows(ctx: ServiceContext, rows: Row[], mapping: CsvColumnMapping): Promise<ImportCounts> {
@@ -2623,6 +2706,8 @@ async function importVendorRows(ctx: ServiceContext, rows: Row[], mapping: CsvCo
     const state = mapping.address_state ? (row[mapping.address_state] ?? '') : '';
     const zip = mapping.address_zip ? (row[mapping.address_zip] ?? '') : '';
     const country = mapping.address_country ? (row[mapping.address_country] ?? '') : '';
+    const terms = normalizeTerms(mapping.terms ? row[mapping.terms] : '');
+    const is1099 = mapping.is1099 ? (row[mapping.is1099] ?? '').trim() : '';
     try {
       await createVendor(ctx, {
         displayName,
@@ -2631,6 +2716,8 @@ async function importVendorRows(ctx: ServiceContext, rows: Row[], mapping: CsvCo
         phone: mapping.phone ? (row[mapping.phone] || null) : null,
         address: street || city ? { street, city, state, zip, country } : null,
         notes: mapping.notes ? (row[mapping.notes] || null) : null,
+        ...(terms ? { terms } : {}),
+        ...(is1099 ? { is1099: yes(is1099) } : {}),
       });
       counts.vendors++;
     } catch (err) {
@@ -2647,7 +2734,7 @@ async function importVendorRows(ctx: ServiceContext, rows: Row[], mapping: CsvCo
 
 /** Parse a CSV string and insert vendors using the supplied column mapping. */
 export async function importVendorsCSV(ctx: ServiceContext, content: string, mapping: CsvColumnMapping): Promise<ImportCounts> {
-  return importVendorRows(ctx, parseCsvRows(content), mapping);
+  return withPlannerStats(ctx.db, 'vendor import', () => importVendorRows(ctx, parseCsvRows(content), mapping));
 }
 
 /**
@@ -2671,6 +2758,8 @@ export interface ItemsCsvMapping {
   totalValue?: string;
   /** G1: as-of date of the quantity on hand (blank = today). */
   asOfDate?: string;
+  /** Taxable (Y / N); blank keeps the default. */
+  taxable?: string;
 }
 
 async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCsvMapping): Promise<ImportCounts> {
@@ -2687,7 +2776,9 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
       continue;
     }
     const purchaseCost = parseIifAmount(col('purchaseCost', row)) ?? null;
+    const taxable = col('taxable', row);
     await importItemRow(ctx, counts, lookup, {
+      ...(taxable ? { taxable: yes(taxable) } : {}),
       name,
       sku: col('sku', row) || null,
       type: mapIifItemType(col('type', row)),
@@ -2706,7 +2797,7 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
 
 /** Parse a CSV string and insert items using the supplied column mapping. */
 export async function importItemsCSV(ctx: ServiceContext, content: string, mapping: ItemsCsvMapping): Promise<ImportCounts> {
-  return importItemRows(ctx, parseCsvRows(content), mapping);
+  return withPlannerStats(ctx.db, 'item import', () => importItemRows(ctx, parseCsvRows(content), mapping));
 }
 
 export interface AccountsCsvMapping {
@@ -2784,7 +2875,7 @@ async function importAccountRows(ctx: ServiceContext, rows: Row[], mapping: Acco
  * silently dropped.
  */
 export async function importAccountsCSV(ctx: ServiceContext, content: string, mapping: AccountsCsvMapping): Promise<ImportCounts> {
-  return importAccountRows(ctx, parseCsvRows(content), mapping);
+  return withPlannerStats(ctx.db, 'account import', () => importAccountRows(ctx, parseCsvRows(content), mapping));
 }
 
 // ---------------------------------------------------------------------------
@@ -2828,18 +2919,21 @@ export async function importListXlsx(
     if (err instanceof ServiceError) throw err;
     throw new ServiceError('VALIDATION', 'This file could not be read as an Excel workbook (.xlsx).');
   }
-  switch (kind) {
-    case 'customers':
-      return importCustomerRows(ctx, rows, mapping as CsvColumnMapping);
-    case 'vendors':
-      return importVendorRows(ctx, rows, mapping as CsvColumnMapping);
-    case 'items':
-      return importItemRows(ctx, rows, mapping as ItemsCsvMapping);
-    case 'accounts':
-      return importAccountRows(ctx, rows, mapping as AccountsCsvMapping);
-    default:
-      throw new ServiceError('VALIDATION', `Unknown list "${kind as string}".`);
-  }
+  const run = (): Promise<ImportCounts> => {
+    switch (kind) {
+      case 'customers':
+        return importCustomerRows(ctx, rows, mapping as CsvColumnMapping);
+      case 'vendors':
+        return importVendorRows(ctx, rows, mapping as CsvColumnMapping);
+      case 'items':
+        return importItemRows(ctx, rows, mapping as ItemsCsvMapping);
+      case 'accounts':
+        return importAccountRows(ctx, rows, mapping as AccountsCsvMapping);
+      default:
+        throw new ServiceError('VALIDATION', `Unknown list "${kind as string}".`);
+    }
+  };
+  return withPlannerStats(ctx.db, `${kind} import`, run);
 }
 
 // ---------------------------------------------------------------------------

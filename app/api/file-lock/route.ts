@@ -18,19 +18,11 @@ import {
 } from '@/lib/services/fileLock';
 import { ServiceError, writeAudit } from '@/lib/services/_base';
 import { requireFileAdmin } from '@/lib/services/access';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[file-lock]', err);

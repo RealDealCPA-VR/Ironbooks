@@ -21,7 +21,8 @@
  *  [F2] invoice paid partly at receipt and the rest by a later full apply from another payment.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { and, eq, lte, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
+import { onOrBeforeDay } from './journal';
 import path from 'node:path';
 import fs from 'node:fs';
 import Dec from 'decimal.js';
@@ -72,7 +73,10 @@ async function balAsOf(code: string, asOf: Date): Promise<string> {
     .select({ d: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`, c: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)` })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .where(and(eq(journalEntryLines.accountId, acct[code]), eq(journalEntries.status, 'posted'), lte(journalEntries.date, asOf)));
+    // Whole as-of day, like the trial balance (journal.ts onOrBeforeDay) and the agings: an exact
+    // instant made "today" (local midnight) miss postings made later today, so the test failed or
+    // passed depending on the time of day it ran.
+    .where(and(eq(journalEntryLines.accountId, acct[code]), eq(journalEntries.status, 'posted'), onOrBeforeDay(asOf)));
   const net = Money.of(row.d).minus(Money.of(row.c));
   return (code.startsWith('1') ? net : net.negated()).toFixed(2);
 }

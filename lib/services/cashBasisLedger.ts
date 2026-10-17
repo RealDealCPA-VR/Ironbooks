@@ -172,6 +172,16 @@ const controlSide = (a: { type: string; subtype: string | null }) =>
       : null;
 
 /**
+ * The last instant of `d`'s UTC day. The accrual reports count the WHOLE as-of / "to" day
+ * (journal.ts onOrBeforeDay), so cash-basis reports that layer these adjustments on an accrual
+ * figure must bound them the same way (a payment at 15:00 on the as-of day settles in it).
+ * Idempotent for an end-of-day input.
+ */
+export function endOfUtcDay(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 1);
+}
+
+/**
  * Build the cash-basis adjustments for the company, through `to` (inclusive) when given.
  * Adjustments dated after `to` are omitted; callers filter further by date / class / account.
  */

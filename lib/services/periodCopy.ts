@@ -32,6 +32,7 @@ import { randomUUID } from 'node:crypto';
 import type { PGlite, Transaction } from '@electric-sql/pglite';
 import { eq } from 'drizzle-orm';
 import { closeDb, getDb, resolveDataDir, type DB } from '@/lib/db';
+import { refreshPlannerStats } from '@/lib/db/plannerStats';
 import { companies } from '@/lib/db/schema';
 import Decimal from 'decimal.js';
 import { Money } from '@/lib/money';
@@ -772,6 +773,8 @@ export async function createPeriodCopy(ctx: ServiceContext, input: PeriodCopyInp
     const wctx: ServiceContext = { db, companyId: ctx.companyId, userId: ctx.userId };
 
     const trimmed = await trimCopy(db, ctx.companyId, to);
+    // Trimming removes most of the copy's rows: fresh planner statistics (best-effort).
+    await refreshPlannerStats(db, 'Period Copy');
 
     // Opening balances: condense everything before the start date (the copy is closed through
     // the day before the start date for the duration, as Condense requires).

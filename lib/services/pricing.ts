@@ -582,6 +582,8 @@ export async function createPriceLevel(ctx: ServiceContext, input: PriceLevelInp
 export async function updatePriceLevel(ctx: ServiceContext, id: string, input: PriceLevelInput) {
   const before = await loadLevel(ctx, id);
   const v = normalizeLevel(input);
+  // Making a price level inactive is deleting it: refused while an Accountant's Copy is out (I1).
+  if (input.isActive === false && before.isActive) await assertListDeleteAllowed(ctx, 'delete', 'price levels');
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
       .update(priceLevels)

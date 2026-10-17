@@ -45,6 +45,7 @@
  */
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost';
+import { cogsAccountForItem, fifoLayerValue, valueRemainderAfter } from './inventory';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
@@ -64,8 +65,9 @@ import {
 import { Money, allocate, toAmountString } from '@/lib/money';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
-import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
+import { assertPeriodOpen, recordClosingDateException, type PeriodCheck } from './fiscalPeriods';
 import { getHomeCurrencyCode } from './currencies';
+import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
 import {
   type InventoryLineDetail,
   attachInventoryDetails,
@@ -159,6 +161,11 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
   return row.id;
 }
 
+/** inventory_layers.source_ref of the FIFO layer a credit memo line's restock creates. */
+function restockLayerRef(memoId: string, lineId: string): string {
+  return `creditmemo-cogs:${memoId}:${lineId}`;
+}
+
 /**
  * Is this item FIFO-tracked? Any inventoryLayers row means fifo.ts owns its
  * costing. Mirrors the detection used by salesReceipts.ts / inventory.ts
@@ -197,7 +204,7 @@ async function restockUnitCost(
       const q = Money.of(l.qty);
       if (q.lessThanOrEqualTo(0)) continue;
       totalQty = totalQty.plus(q);
-      totalValue = totalValue.plus(q.times(Money.of(l.unitCost)));
+      totalValue = totalValue.plus(fifoLayerValue(q, l.unitCost)); // the valuation reports' rule
     }
     if (totalQty.greaterThan(0)) return totalValue.dividedBy(totalQty);
   }
@@ -403,6 +410,8 @@ async function postCreditMemoDocument(
   memo: { id: string; memoNumber: number; refNumber?: string | null },
   input: CreateCreditMemoInput,
   prep: PreparedCreditMemo,
+  /** Edit: what the previous version restocked per item (see restockCostsByItem). */
+  priorRestock?: Map<string, PriorRestock>,
 ) {
   const { arAccountId, taxPayableId, itemMap, computedLines, grossIncome, taxAmount, total } = prep;
   // The number shown on the GL: the typed ref number, else the legacy integer.
@@ -535,31 +544,61 @@ async function postCreditMemoDocument(
     // Accountant's Copy import: restock at the cost the accountant's file used (null otherwise).
     const accountantCost = takeAccountantCost(line.itemId);
     const currentUnitCost = await restockUnitCost(tx, meta, fifoTracked);
-    const cost = accountantCost ? Money.round2(accountantCost) : Money.round2(qty.times(currentUnitCost));
-    const unitCost = accountantCost && qty.greaterThan(0) ? cost.dividedBy(qty) : currentUnitCost;
+    // Edit: an item the previous version already restocked keeps that version's restock unit
+    // cost (the cost the returned units came back at), so editing a memo — or undoing an edit —
+    // never re-values its returns at today's average. Same quantity = exactly the same cost.
+    const prior = accountantCost ? undefined : priorRestock?.get(line.itemId);
+    const priorCost =
+      prior && prior.qty.greaterThan(0) && qty.greaterThan(0)
+        ? qty.equals(prior.qty)
+          ? prior.cost
+          : Money.round2(prior.cost.times(qty).dividedBy(prior.qty))
+        : null;
+    const cost = accountantCost ? Money.round2(accountantCost) : priorCost ?? Money.round2(qty.times(currentUnitCost));
+    const unitCost = (accountantCost || priorCost) && qty.greaterThan(0) ? cost.dividedBy(qty) : currentUnitCost;
     if (!fifoTracked) {
       // Average-cost item restocked at a cost other than qty x its stored average (an Accountant's
       // Copy cost, or the purchaseCost fallback when no average exists yet): re-derive its average
       // from the new value so the item stays tied to the GL.
       const [cur] = await tx.db
-        .select({ qty: items.quantityOnHand, avg: items.averageCost })
+        .select({
+          qty: items.quantityOnHand,
+          avg: items.averageCost,
+          valueRemainder: items.valueRemainder,
+          valueRemainderAvg: items.valueRemainderAvg,
+        })
         .from(items)
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
       const curQty = Money.of(cur?.qty ?? '0');
       const curAvg = Money.of(cur?.avg ?? '0');
-      if (!cost.equals(Money.round2(qty.times(curAvg)))) {
-        const avg = averageAfter(curQty, curAvg, curQty.plus(qty), cost);
-        await tx.db
-          .update(items)
-          .set({ averageCost: avg.toFixed(4), updatedAt: new Date() })
-          .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
-      }
+      const avg = cost.equals(Money.round2(qty.times(curAvg))) ? curAvg : averageAfter(curQty, curAvg, curQty.plus(qty), cost);
+      await tx.db
+        .update(items)
+        .set({
+          averageCost: avg.toFixed(4),
+          // The restock put `cost` on the inventory account; what the book value round2(qty x
+          // average) does not show of it stays on record as the value remainder (0061).
+          ...valueRemainderAfter(
+            { averageCost: cur?.avg ?? null, valueRemainder: cur?.valueRemainder ?? null, valueRemainderAvg: cur?.valueRemainderAvg ?? null },
+            curQty,
+            curQty.plus(qty),
+            avg,
+            cost,
+          ),
+          updatedAt: new Date(),
+        })
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
     }
 
     // Reverse COGS only when there is a real cost (postJournalEntry rejects $0 entries).
     if (cost.greaterThan(0)) {
       const inventoryAccountId = meta.assetAccountId ?? (await accountIdByCode(tx, '1300'));
-      const cogsAccountId = await accountIdByCode(tx, '5000');
+      // Reverse onto the item's own COGS account (the one its sale debited; 5000 by default).
+      const [cogsItem] = await tx.db
+        .select({ expenseAccountId: items.expenseAccountId })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+      const cogsAccountId = await cogsAccountForItem(tx, cogsItem ?? {});
       const restockEntry = await postJournalEntry(tx, {
         date: input.date,
         description: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
@@ -581,7 +620,8 @@ async function postCreditMemoDocument(
       restockEntries.push({ entryId: restockEntry.id, lineId: line.id, itemId: line.itemId, cost: toAmountString(cost) });
     }
 
-    // FIFO items: restore stock value as a new layer at the restock cost.
+    // FIFO items: restore stock value as a new layer at the restock cost, tagged with the memo
+    // line so a void / edit takes exactly this layer back out (restockLayerRef).
     if (fifoTracked) {
       await tx.db.insert(inventoryLayers).values({
         companyId: tx.companyId,
@@ -589,6 +629,7 @@ async function postCreditMemoDocument(
         date: input.date,
         quantityRemaining: qty.toFixed(4),
         unitCost: unitCost.toFixed(4),
+        sourceRef: restockLayerRef(memo.id, line.id),
       });
     }
 
@@ -745,6 +786,35 @@ export async function getCreditMemo(ctx: ServiceContext, id: string) {
  * We simply transfer `amount` from the memo's unapplied to the invoice's amountPaid,
  * adjusting balanceDue and status on both documents.
  */
+/**
+ * Date of a credit application, checked against the closing date / closed periods / the
+ * Accountant's Copy dividing date. A date the caller gives is used as is. Without one the
+ * application takes the later of the memo's and the invoice's dates (when both documents exist,
+ * as QuickBooks links them) — so an accountant can apply credits in an Accountant's Copy, where
+ * "today" is after the dividing date. When that day cannot be posted (a closed period, or the
+ * client's side of an outstanding Accountant's Copy) the application is dated today instead, as
+ * it always was before applications carried a checked date.
+ */
+async function creditApplicationDate(
+  ctx: ServiceContext,
+  memoDate: Date,
+  invoiceDate: Date,
+  date: Date | null | undefined,
+): Promise<{ applicationDate: Date; periodCheck: PeriodCheck }> {
+  if (date) return { applicationDate: date, periodCheck: await assertPeriodOpen(ctx, date) };
+  const natural = memoDate > invoiceDate ? memoDate : invoiceDate;
+  try {
+    return { applicationDate: natural, periodCheck: await assertPeriodOpen(ctx, natural) };
+  } catch (err) {
+    const locked =
+      err instanceof ServiceError &&
+      (err.code === 'PERIOD_CLOSED' || (err.details as { accountantCopy?: boolean } | undefined)?.accountantCopy === true);
+    if (!locked) throw err;
+  }
+  const today = new Date();
+  return { applicationDate: today, periodCheck: await assertPeriodOpen(ctx, today) };
+}
+
 export async function applyToInvoice(ctx: ServiceContext, input: ApplyToInvoiceInput) {
   // Load + validate in the same transaction as the write: two concurrent applies must not both
   // see the full unapplied balance.
@@ -768,9 +838,6 @@ async function applyToInvoiceInTx(ctx: ServiceContext, input: ApplyToInvoiceInpu
   }
   // Accountant's Copy (I1): a credit memo dated after the dividing date belongs to the client.
   await assertAccountantDatesOpen(ctx, [memo.date], 'The credit memo');
-  // The application is dated: one back-dated into a closed period would change its A/R aging.
-  const applicationDate = input.date ?? new Date();
-  const periodCheck = await assertPeriodOpen(ctx, applicationDate);
 
   const unapplied = Money.of(memo.unapplied);
   if (amount.greaterThan(unapplied)) {
@@ -819,6 +886,9 @@ async function applyToInvoiceInTx(ctx: ServiceContext, input: ApplyToInvoiceInpu
       `Apply amount ${toAmountString(amount)} exceeds invoice balance due ${toAmountString(balanceDue)}.`,
     );
   }
+
+  // The application is dated: one back-dated into a closed period would change its A/R aging.
+  const { applicationDate, periodCheck } = await creditApplicationDate(ctx, memo.date, invoice.date, input.date);
 
   return inTransaction(ctx, async (tx) => {
     // Update invoice — delegate to the canonical helper so balanceDue is computed
@@ -1091,6 +1161,47 @@ async function refundCreditMemoInTx(ctx: ServiceContext, input: RefundCreditMemo
   });
 }
 
+/** What a saved credit memo restocked of one item: quantity and the cost it posted. */
+interface PriorRestock {
+  qty: ReturnType<typeof Money.zero>;
+  cost: ReturnType<typeof Money.zero>;
+}
+
+/**
+ * The memo's posted restock (COGS-reversal) entries per item: the quantity of the restocked line
+ * each entry belongs to (reference = memo line id) and the entry's cost (its inventory debit).
+ */
+async function restockCostsByItem(
+  tx: ServiceContext,
+  memoId: string,
+  lines: Array<typeof creditMemoLines.$inferSelect>,
+): Promise<Map<string, PriorRestock>> {
+  const lineById = new Map(lines.map((l) => [l.id, l]));
+  const out = new Map<string, PriorRestock>();
+  const entries = await tx.db
+    .select({ id: journalEntries.id, reference: journalEntries.reference })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, tx.companyId),
+        eq(journalEntries.sourceRef, `creditmemo-cogs:${memoId}`),
+        eq(journalEntries.status, 'posted'),
+      ),
+    );
+  for (const e of entries) {
+    const line = e.reference ? lineById.get(e.reference) : undefined;
+    if (!line?.itemId) continue;
+    const debits = await tx.db
+      .select({ debit: journalEntryLines.debit })
+      .from(journalEntryLines)
+      .where(eq(journalEntryLines.journalEntryId, e.id));
+    const cost = debits.reduce((s, l) => s.plus(Money.of(l.debit)), Money.zero());
+    const prev = out.get(line.itemId) ?? { qty: Money.zero(), cost: Money.zero() };
+    out.set(line.itemId, { qty: prev.qty.plus(Money.of(line.quantity)), cost: prev.cost.plus(cost) });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // voidCreditMemo
 // ---------------------------------------------------------------------------
@@ -1175,9 +1286,22 @@ async function reverseCreditMemoPostings(
     const cost = entryLines.reduce((s, l) => s.plus(Money.of(l.debit)), Money.zero());
     const unitCost = qty.isZero() ? Money.zero() : cost.dividedBy(qty);
 
-    if (await isFifoTracked(tx, line.itemId)) {
-      // Deplete layers, preferring the exact layer the restock created
-      // (matching unit cost), then oldest-first for any remainder.
+    const fifoTracked = await isFifoTracked(tx, line.itemId);
+    // The layer this restock created (tagged with the memo line): exactly what it added back,
+    // or a CONFLICT when those units were sold / revalued since (fifo.ts takeFromDocumentLayers).
+    const own = fifoTracked
+      ? await takeFromDocumentLayers(tx, {
+          itemId: line.itemId,
+          itemName: (await tx.db.select({ name: items.name }).from(items).where(eq(items.id, line.itemId)))[0]?.name ?? 'item',
+          sourceRefs: [restockLayerRef(memo.id, line.id)],
+          qty,
+          expectedValue: cost,
+          action: 'void this credit memo (or change its restocked lines)',
+        })
+      : null;
+    if (fifoTracked && !own) {
+      // Older data (restock layers not tagged): deplete layers, preferring the layer the restock
+      // created (matching unit cost), then oldest-first for any remainder.
       const layers = await tx.db
         .select()
         .from(inventoryLayers)
@@ -1218,18 +1342,41 @@ async function reverseCreditMemoPostings(
     // Average cost: the GL loses exactly the restock cost, which differs from qty x today's
     // average once the average has moved — back that cost out of the average.
     let newAvgCost: string | undefined;
+    let remainderAfter: { valueRemainder: string; valueRemainderAvg: string } | undefined;
     if (!(await isFifoTracked(tx, line.itemId))) {
       const [cur] = await tx.db
-        .select({ qty: items.quantityOnHand, avg: items.averageCost })
+        .select({
+          qty: items.quantityOnHand,
+          avg: items.averageCost,
+          valueRemainder: items.valueRemainder,
+          valueRemainderAvg: items.valueRemainderAvg,
+        })
         .from(items)
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
       const curQty = Money.of(cur?.qty ?? '0');
       const curAvg = Money.of(cur?.avg ?? '0');
       const newQty = curQty.minus(qty);
       const remainingValue = curQty.times(curAvg).minus(cost);
+      // Refuse rather than clamp the average to 0 when the stock left is worth less than the
+      // restock cost the void takes off the GL (written down / sold at a lower average since).
+      if (remainingValue.lessThan(layerRoundingTolerance(curQty).negated())) {
+        throw new ServiceError(
+          'CONFLICT',
+          `Cannot void this credit memo (or change its restocked lines): the stock on hand is valued at ${toAmountString(Money.round2(curQty.times(curAvg)))}, less than the ${toAmountString(cost)} the restock added (its cost was written down or the units sold since). Reverse the value adjustment or those sales first.`,
+        );
+      }
       if (newQty.greaterThan(0)) {
         newAvgCost = (remainingValue.isNegative() ? Money.zero() : remainingValue.dividedBy(newQty)).toFixed(4);
       }
+      // The voided restock took `cost` off the inventory account: keep the value remainder (0061)
+      // equal to what the GL carries beyond the new book value.
+      remainderAfter = valueRemainderAfter(
+        { averageCost: cur?.avg ?? null, valueRemainder: cur?.valueRemainder ?? null, valueRemainderAvg: cur?.valueRemainderAvg ?? null },
+        curQty,
+        newQty,
+        Money.of(newAvgCost ?? curAvg),
+        cost.negated(),
+      );
     }
 
     // Both costing methods: take the quantity back off hand.
@@ -1238,6 +1385,7 @@ async function reverseCreditMemoPostings(
       .set({
         quantityOnHand: sql`COALESCE(${items.quantityOnHand}, 0) - ${qty.toFixed(4)}`,
         ...(newAvgCost !== undefined ? { averageCost: newAvgCost } : {}),
+        ...(remainderAfter ?? {}),
         updatedAt: new Date(),
       })
       .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
@@ -1417,6 +1565,10 @@ export async function updateCreditMemo(
       input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
     );
 
+    // The old version's restock per item (quantity + cost): returned units keep the cost they
+    // came back at, so an edit (or an undo of one) does not re-value them at today's average.
+    const priorRestock = await restockCostsByItem(tx, id, oldLines);
+
     // 1) Reverse the old version's postings (restock + A/R entry).
     await reverseCreditMemoPostings(tx, memo);
 
@@ -1431,6 +1583,7 @@ export async function updateCreditMemo(
       },
       input,
       prep,
+      priorRestock,
     );
 
     const newUnapplied = Money.round2(prep.total.minus(used));

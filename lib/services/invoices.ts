@@ -64,7 +64,7 @@ import {
 } from './_base';
 import { assertForeignCurrencyAllowed } from './multiCurrency';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
-import { recordCOGS } from './inventory';
+import { recordCOGS, valueRemainderAfter } from './inventory';
 import { consumeStock } from './fifo';
 import {
   type DocumentInventoryLine,
@@ -1003,7 +1003,7 @@ async function prepareInvoice(
  *   Dr 1200 A/R              = total * fx
  *   Cr <income accounts>     = subtotal * fx   (gross line amounts)
  *   Cr 2200 Tax Payable      = taxAmount * fx  (0 if no tax)
- *   Dr 4000 Sales contra     = discount * fx   (0 if no discount)
+ *   Dr <income accounts>     = discount * fx   (header discount, split over the income lines; 0 if none)
  *
  *   Debit  total*fx + discount*fx  = (subtotal - discount + taxAmount)*fx + discount*fx
  *                                  = (subtotal + taxAmount)*fx
@@ -1092,12 +1092,20 @@ async function postInvoiceGL(
     });
   }
   if (discount.greaterThan(0)) {
-    debitSpecs.push({
-      accountId: defaultIncomeId,
-      weight: discount,
-      memo: `Invoice #${invoiceNumber} — discount`,
-      classId: headerClassId,
-    });
+    // The header discount reduces the income it discounts: split over the invoice's income
+    // accounts (and classes) in proportion to their amounts — a service invoice's discount
+    // reduces Service Income, not 4000. No income lines: the default income account.
+    const incomeParts = [...incomeCredits.values()].filter((sp) => sp.amount.greaterThan(0));
+    if (incomeParts.length === 0) {
+      debitSpecs.push({ accountId: defaultIncomeId, weight: discount, memo: `Invoice #${invoiceNumber} — discount`, classId: headerClassId });
+    } else {
+      const shares = allocate(discount, incomeParts.map((sp) => sp.amount));
+      incomeParts.forEach((sp, i) => {
+        if (shares[i].greaterThan(0)) {
+          debitSpecs.push({ accountId: sp.accountId, weight: shares[i], memo: `Invoice #${invoiceNumber} — discount`, classId: sp.classId ?? headerClassId });
+        }
+      });
+    }
   }
   for (const spec of discountDebits.values()) {
     if (spec.amount.greaterThan(0)) {
@@ -1229,6 +1237,7 @@ async function postInvoiceCOGS(
         quantity: cl.quantity,
         date,
         memo: cogsMemo,
+        classId: cl.classId, // COGS carries the sale's class (P&L by Class)
       });
       cogsEntryId = res.entryId;
     } else {
@@ -1249,6 +1258,7 @@ async function postInvoiceCOGS(
         quantity: cl.quantity,
         date,
         memo: cogsMemo,
+        classId: cl.classId, // COGS carries the sale's class (P&L by Class)
       });
       cogsEntryId = res.entry.id;
     }
@@ -1355,16 +1365,22 @@ async function reverseInvoiceCOGS(
         .where(eq(items.id, line.itemId));
     } else {
       // Average-cost: weight the restored value back into averageCost so the
-      // item valuation stays tied to the restored GL balance.
+      // item valuation stays tied to the restored GL balance. The base is the item's BOOK value
+      // (round2(qty x average) — what the relief was taken from, see bookValueRelief), not the
+      // unrounded product: otherwise an edit and an edit back move the average by 0.0001 and the
+      // valuation by a cent.
       const currentAvg = Money.of(item.averageCost ?? '0');
       const newAvg = newQty.isZero()
         ? currentAvg
-        : currentQty.times(currentAvg).plus(cogsAmount).dividedBy(newQty);
+        : Money.round2(currentQty.times(currentAvg)).plus(cogsAmount).dividedBy(newQty);
       await tx.db
         .update(items)
         .set({
           quantityOnHand: newQty.toFixed(4),
           averageCost: newAvg.toFixed(4),
+          // The void put cogsAmount back on the inventory account; what the new book value does not
+          // show of it stays on record as the value remainder (0061), as for receipts.
+          ...valueRemainderAfter(item, currentQty, newQty, newAvg, cogsAmount),
           updatedAt: new Date(),
         })
         .where(eq(items.id, line.itemId));

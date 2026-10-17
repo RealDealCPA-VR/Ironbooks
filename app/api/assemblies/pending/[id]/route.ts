@@ -13,17 +13,10 @@ import { cancelPendingBuild, finalizePendingBuild } from '@/lib/services/assembl
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { buildSiteFieldsSchema } from '@/lib/validation/inventorySites';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
-  const statusMap: Record<string, number> = {
-    NOT_FOUND: 404,
-    VALIDATION: 400,
-    UNBALANCED: 400,
-    FORBIDDEN: 403,
-    CONFLICT: 409,
-    PERIOD_CLOSED: 409,
-  };
-  const status = statusMap[err.code] ?? 500;
+  const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
   return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
 }
 
@@ -35,7 +28,7 @@ export async function POST(req: NextRequest, { params }: RouteParams): Promise<N
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = (await req.json()) as { action?: string };
+    const body = (await requireJsonObject(req)) as { action?: string };
 
     if (body.action === 'finalize') {
       // Optional Advanced Inventory fields: build site / bins / serials / lots.

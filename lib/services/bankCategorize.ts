@@ -622,6 +622,16 @@ export async function matchTransaction(
   bankTransactionId: string,
   journalEntryId: string,
 ) {
+  // "Entry already matched on this feed" is checked in the same transaction as the match, so two
+  // feed lines matched at once cannot both clear the same register transaction.
+  return inTransaction(ctx, (tx) => matchTransactionInTx(tx, bankTransactionId, journalEntryId));
+}
+
+async function matchTransactionInTx(
+  ctx: ServiceContext,
+  bankTransactionId: string,
+  journalEntryId: string,
+) {
   const txn = await loadTransaction(ctx, bankTransactionId);
   if (txn.matched) {
     throw new ServiceError('CONFLICT', 'Bank transaction is already matched/categorized.');

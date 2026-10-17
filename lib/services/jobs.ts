@@ -176,6 +176,9 @@ export async function updateJob(ctx: ServiceContext, id: string, input: UpdateJo
     if (input.startDate !== undefined) patch.startDate = input.startDate;
     if (input.endDate !== undefined) patch.endDate = input.endDate;
     if (input.status !== undefined) patch.status = input.status;
+    // Nothing to change (e.g. PATCH {}): a no-op save, not drizzle's "No values to set" → 500.
+    // Still inside inTransaction, so the modify permission is enforced as for a real edit.
+    if (Object.keys(patch).length === 0) return existing;
 
     const [updated] = await tx.db
       .update(jobs)

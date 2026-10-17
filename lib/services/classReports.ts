@@ -13,6 +13,9 @@ import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { notFound } from './_base';
 import { notFiscalCloseEntry } from './reports';
+import { onOrBeforeDay } from './journal';
+import { fiscalYearWindow } from './fiscalClose';
+import { companyFiscalYearEnd } from './reportEngine';
 
 // ---------------------------------------------------------------------------
 // Shared constants
@@ -64,7 +67,8 @@ export async function profitAndLossByClass(
     notFiscalCloseEntry(),
   ];
   if (range?.from) entryConds.push(sql`${journalEntries.date} >= ${range.from}`);
-  if (range?.to) entryConds.push(lte(journalEntries.date, range.to));
+  // Whole "to" day — the Profit & Loss bound — so the class columns add up to the P&L.
+  if (range?.to) entryConds.push(onOrBeforeDay(range.to));
 
   const rows = await ctx.db
     .select({
@@ -285,8 +289,11 @@ export async function budgetVsActualByClass(
   // Not restricted to budgeted accounts: actuals with no matching budget line must
   // still appear (with budget 0.00) so totals reflect real activity. Closing
   // entries are excluded so a closed year keeps its actuals.
-  const from = new Date(`${budget.fiscalYear}-01-01T00:00:00.000Z`);
-  const to = new Date(`${budget.fiscalYear}-12-31T23:59:59.999Z`);
+  // The company's fiscal year (settings.fiscalYearEnd): FY2026 of a June 30 company is
+  // Jul 2025 – Jun 2026, not calendar 2026.
+  const window = fiscalYearWindow(budget.fiscalYear, await companyFiscalYearEnd(ctx));
+  const from = window.yearStart;
+  const to = new Date(window.yearEnd.getTime() - 1);
 
   const actualRows = await ctx.db
     .select({

@@ -23,16 +23,13 @@ import { createPayRun, listPayRuns } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createPayRunSchema } from '@/lib/validation/payroll';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
+    const status = serviceErrorStatus(err.code);
+    // details.results: each employee's outcome when no paycheck could be created (lib/services/payroll.ts createPayRun).
+    return NextResponse.json({ error: err.message, code: err.code, details: err.details ?? null }, { status });
   }
   console.error('[payroll/pay-runs] unexpected error:', err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

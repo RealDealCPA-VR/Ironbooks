@@ -531,16 +531,19 @@ describe('report suite', () => {
     // 2 from invoice #1 + 1 from sales receipt.
     expect(widget.quantity).toBe('3');
     expect(widget.revenue).toBe('320.00'); // 200 + 120
-    expect(widget.cogs).toBe('120.00'); // 3 x 40 average cost
-    expect(widget.margin).toBe('200.00');
-    expect(widget.marginPct).toBe('62.50');
+    // Review 4: COGS is the COGS each sale POSTED (it ties to the COGS accounts), no longer
+    // quantity x today's average cost. These documents are seeded straight into the tables and
+    // posted no COGS entries, so their COGS is 0 (tieout.review4.test.ts covers posted COGS).
+    expect(widget.cogs).toBe('0.00');
+    expect(widget.margin).toBe('320.00');
+    expect(widget.marginPct).toBe('100.00');
 
     const consulting = report.rows.find((r) => r.itemId === serviceItemId)!;
     expect(consulting.revenue).toBe('300.00');
     expect(consulting.cogs).toBe('0.00'); // services have no COGS
 
     expect(report.totals.revenue).toBe('620.00');
-    expect(report.totals.cogs).toBe('120.00');
+    expect(report.totals.cogs).toBe('0.00');
   });
 
   it('salesByItem respects the date range', async () => {

@@ -7,7 +7,7 @@
  * POST — record a new payment received from a customer
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { serviceErrorBody } from '@/lib/routeErrors';
+import { serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { receivePayment, searchPayments } from '@/lib/services/payments';
 import { ServiceError } from '@/lib/services/_base';
@@ -16,15 +16,7 @@ import { receivePaymentSchema } from '@/lib/validation/payments';
 
 // Map ServiceError codes to HTTP status codes.
 function errorStatus(code: ServiceError['code']): number {
-  switch (code) {
-    case 'NOT_FOUND':     return 404;
-    case 'VALIDATION':    return 400;
-    case 'UNBALANCED':    return 400;
-    case 'FORBIDDEN':     return 403;
-    case 'CONFLICT':      return 409;
-    case 'PERIOD_CLOSED': return 422;
-    default:              return 500;
-  }
+  return serviceErrorStatus(code, { PERIOD_CLOSED: 422 });
 }
 
 // ---- GET /api/payments -------------------------------------------------------

@@ -17,6 +17,12 @@
  *    measured against a probe file written in the same folder, so clock differences between
  *    computers on a network share do not matter.
  * No file descriptor is kept open, so the folder can still be renamed (restore) once closed.
+ *
+ * A holder that stops renewing for STALE_MS while it still has the file open (the computer slept,
+ * the event loop was blocked) can be taken over. It finds out at its next heartbeat, or when it
+ * next commits a transaction (assertDirLockHeld), and then calls the `onLost` callback given to
+ * acquireDirLock: lib/db/index.ts makes that handle unusable, so this process never writes the
+ * folder again while the other one owns it.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -38,6 +44,8 @@ interface HeldLock {
   file: string;
   info: LockInfo;
   timer: ReturnType<typeof setInterval>;
+  /** Called once when another process is found holding the lock (`host`: its computer). */
+  onLost?: (host: string) => void;
 }
 
 /** Locks this process holds, by resolved data directory. */
@@ -122,8 +130,9 @@ function installExitHook() {
  * Take the lock on `dir` (already resolved and created) for this process. Throws
  * CompanyFileInUseError when another live process holds it. A folder where no lock file can be
  * created at all (read-only media, …) is opened without one rather than refused.
+ * `onLost` is called (once) if another process later takes the lock over while this one holds it.
  */
-export function acquireDirLock(dir: string): void {
+export function acquireDirLock(dir: string, onLost?: (host: string) => void): void {
   if (held.has(dir)) return;
   const file = path.join(dir, LOCK_FILE);
   const now = new Date().toISOString();
@@ -132,7 +141,7 @@ export function acquireDirLock(dir: string): void {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       fs.writeFileSync(file, JSON.stringify(info), { flag: 'wx' });
-      startHeartbeat(dir, file, info);
+      startHeartbeat(dir, file, info, onLost);
       return;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
@@ -154,16 +163,37 @@ export function acquireDirLock(dir: string): void {
   throw new CompanyFileInUseError(holder ?? 'another computer');
 }
 
-function startHeartbeat(dir: string, file: string, info: LockInfo) {
+/**
+ * Another process holds the lock this process had (it judged ours stale): stop claiming it and
+ * tell the owner of the handle, which must stop using the folder. Returns the other holder's host.
+ */
+function lose(dir: string, lock: HeldLock, current: { info: LockInfo | null }): string {
+  clearInterval(lock.timer);
+  if (held.get(dir) === lock) held.delete(dir);
+  const host = current.info?.hostname ?? 'another computer';
+  console.error(
+    `[db] the company file lock in ${dir} was taken over by ${host}` +
+      `${current.info ? ` (process ${current.info.pid})` : ''} after this process stopped renewing it ` +
+      `(the computer slept or the app was busy for over ${Math.round(STALE_MS / 60_000)} minutes). ` +
+      'This process will not read or write the company file again; reopen it once it is closed there.',
+  );
+  try {
+    lock.onLost?.(host);
+  } catch (err) {
+    console.error('[db] handling the lost company file lock failed:', err);
+  }
+  return host;
+}
+
+function startHeartbeat(dir: string, file: string, info: LockInfo, onLost?: (host: string) => void) {
   installExitHook();
-  const timer = setInterval(() => {
+  const lock: HeldLock = { file, info, timer: undefined as unknown as ReturnType<typeof setInterval>, onLost };
+  lock.timer = setInterval(() => {
     try {
       const current = readLock(file);
       if (current && !isOwn(current.info)) {
-        // Someone else took it over (we were judged stale): stop claiming it.
-        clearInterval(timer);
-        held.delete(dir);
-        console.error(`[db] the company file lock in ${dir} was taken over by another process`);
+        // Someone else took it over (we were judged stale): stop claiming it, stop using the file.
+        lose(dir, lock, current);
         return;
       }
       info.heartbeatAt = new Date().toISOString();
@@ -172,8 +202,26 @@ function startHeartbeat(dir: string, file: string, info: LockInfo) {
       /* folder gone / unreachable for a moment: try again next beat */
     }
   }, HEARTBEAT_MS);
-  timer.unref?.();
-  held.set(dir, { file, info, timer });
+  lock.timer.unref?.();
+  held.set(dir, lock);
+}
+
+/**
+ * Before a transaction commits: throw CompanyFileInUseError (after running the lost handling)
+ * when another process has taken over this process's lock on `dir`, so the write is rolled back
+ * instead of landing in a folder someone else now owns. No-op when no lock is held (a folder
+ * opened without one) or the lock file cannot be read for a moment (the heartbeat decides).
+ */
+export function assertDirLockHeld(dir: string): void {
+  const lock = held.get(dir);
+  if (!lock) return;
+  let current: ReturnType<typeof readLock>;
+  try {
+    current = readLock(lock.file);
+  } catch {
+    return;
+  }
+  if (current && !isOwn(current.info)) throw new CompanyFileInUseError(lose(dir, lock, current));
 }
 
 /** Release this process's lock on `dir` (no-op when it holds none). */

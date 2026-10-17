@@ -49,7 +49,7 @@ import {
   type CheckStock,
   type CheckStyle,
 } from '@/lib/pdf/check';
-import { pdfResponse, routeError } from '@/lib/routeErrors';
+import { pdfResponse, routeError, requireJsonObject } from '@/lib/routeErrors';
 import { validation } from '@/lib/services/_base';
 
 /** Most checks accepted in one batch PDF. */
@@ -59,7 +59,7 @@ const str = (v: unknown) => (v != null && String(v).trim() !== '' ? String(v).tr
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
-    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = (await requireJsonObject(req, { optional: true })) as Record<string, unknown>;
 
     const ctx = await getServerContext();
     const company = await getCompany(ctx);

@@ -50,7 +50,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
-import { recordCOGS } from './inventory';
+import { recordCOGS, valueRemainderAfter } from './inventory';
 import { consumeStock } from './fifo';
 import {
   type InventoryLineDetail,
@@ -439,15 +439,17 @@ async function postSalesReceiptDocument(
     map.set(cl.accountId, prev.plus(Money.abs(Money.of(cl.amount))));
   }
 
-  const debitSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [
+  // The receipt's class goes on its income and discount lines (P&L by Class), as on invoices.
+  const classId = input.classId ?? null;
+  const debitSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string; classId?: string | null }> = [
     { accountId: depositAccountId, weight: total, memo: `Sales Receipt #${shownNumber}` },
   ];
   for (const [acctId, amount] of discountDebits) {
-    debitSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — discount` });
+    debitSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — discount`, classId });
   }
-  const creditSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string }> = [];
+  const creditSpecs: Array<{ accountId: string; weight: ReturnType<typeof Money.zero>; memo: string; classId?: string | null }> = [];
   for (const [acctId, amount] of incomeCredits) {
-    creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — income` });
+    creditSpecs.push({ accountId: acctId, weight: amount, memo: `Sales Receipt #${shownNumber} — income`, classId });
   }
   if (taxAmount.greaterThan(0)) {
     creditSpecs.push({
@@ -460,15 +462,15 @@ async function postSalesReceiptDocument(
   const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
   const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
 
-  const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [];
+  const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string; classId?: string | null }> = [];
   debitSpecs.forEach((s, i) => {
     if (debitAlloc[i].greaterThan(0)) {
-      postingLines.push({ accountId: s.accountId, debit: toAmountString(debitAlloc[i]), memo: s.memo });
+      postingLines.push({ accountId: s.accountId, debit: toAmountString(debitAlloc[i]), memo: s.memo, ...(s.classId ? { classId: s.classId } : {}) });
     }
   });
   creditSpecs.forEach((s, i) => {
     if (creditAlloc[i].greaterThan(0)) {
-      postingLines.push({ accountId: s.accountId, credit: toAmountString(creditAlloc[i]), memo: s.memo });
+      postingLines.push({ accountId: s.accountId, credit: toAmountString(creditAlloc[i]), memo: s.memo, ...(s.classId ? { classId: s.classId } : {}) });
     }
   });
 
@@ -502,6 +504,7 @@ async function postSalesReceiptDocument(
         quantity: line.quantity,
         date: input.date,
         memo,
+        classId, // COGS carries the receipt's class (P&L by Class)
       });
       entryId = res.entryId;
       cogs = res.totalCOGS;
@@ -511,6 +514,7 @@ async function postSalesReceiptDocument(
         quantity: line.quantity,
         date: input.date,
         memo,
+        classId,
       });
       entryId = res.entry.id;
       cogs = res.cogsAmount;
@@ -743,7 +747,12 @@ async function reverseSalesReceiptPostings(
       // Average cost: weight the restored COGS back into averageCost (the GL gets the original
       // COGS back, which differs from qty x today's average once the average has moved).
       const [cur] = await tx.db
-        .select({ qty: items.quantityOnHand, avg: items.averageCost })
+        .select({
+          qty: items.quantityOnHand,
+          avg: items.averageCost,
+          valueRemainder: items.valueRemainder,
+          valueRemainderAvg: items.valueRemainderAvg,
+        })
         .from(items)
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
       const curQty = Money.of(cur?.qty ?? '0');
@@ -752,7 +761,20 @@ async function reverseSalesReceiptPostings(
       const newAvg = newQty.isZero() ? curAvg : curQty.times(curAvg).plus(cogs).dividedBy(newQty);
       await tx.db
         .update(items)
-        .set({ quantityOnHand: newQty.toFixed(4), averageCost: newAvg.toFixed(4), updatedAt: new Date() })
+        .set({
+          quantityOnHand: newQty.toFixed(4),
+          averageCost: newAvg.toFixed(4),
+          // The void put `cogs` back on the inventory account; keep the value remainder (0061) equal
+          // to what the GL carries beyond the new book value.
+          ...valueRemainderAfter(
+            { averageCost: cur?.avg ?? null, valueRemainder: cur?.valueRemainder ?? null, valueRemainderAvg: cur?.valueRemainderAvg ?? null },
+            curQty,
+            newQty,
+            newAvg,
+            Money.of(cogs),
+          ),
+          updatedAt: new Date(),
+        })
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
     }
   }

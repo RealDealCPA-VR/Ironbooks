@@ -12,7 +12,7 @@ import { and, eq, lte, gte } from 'drizzle-orm';
 import { companies, fiscalPeriods } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, notFound, writeAudit } from './_base';
 import { assertWrite } from './rbac';
-import { activeCopy, assertDividingDateOpen } from './accountantCopy/guard';
+import { activeCopy, assertDividingDateOpen, formatDividingDate } from './accountantCopy/guard';
 
 export async function listPeriods(ctx: ServiceContext) {
   return ctx.db
@@ -26,6 +26,18 @@ export async function closePeriod(
   input: { periodStart: Date; periodEnd: Date },
 ) {
   assertWrite(ctx); // reject viewers before the insert (writeAudit runs after it)
+  // Accountant's Copy (I1): the accountant is working on everything dated on or before the
+  // dividing date. Closing a period there would make their changes impossible to import.
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (copy?.side === 'client' && new Date(input.periodStart).toISOString().slice(0, 10) <= copy.dividingDate) {
+    const when = formatDividingDate(copy.dividingDate);
+    throw new ServiceError(
+      'CONFLICT',
+      `Your accountant is working on transactions dated on or before ${when} (Accountant's Copy), so a period that starts on or before then can't be closed ` +
+        "until you import your accountant's changes or cancel the Accountant's Copy. You can close periods that start after it.",
+      { accountantCopy: true, side: copy.side, dividingDate: copy.dividingDate },
+    );
+  }
   const [row] = await ctx.db
     .insert(fiscalPeriods)
     .values({

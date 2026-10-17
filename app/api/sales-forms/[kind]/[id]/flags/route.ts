@@ -5,7 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { isSalesFormKind, setSendFlags } from '@/lib/services/salesForms';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 
 type RouteContext = { params: Promise<{ kind: string; id: string }> };
 
@@ -16,7 +16,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     if (!isSalesFormKind(kind)) {
       return NextResponse.json({ error: `Unknown form type "${kind}"`, code: 'NOT_FOUND' }, { status: 404 });
     }
-    const body = (await req.json().catch(() => ({}))) as { toBePrinted?: unknown; toBeEmailed?: unknown };
+    const body = (await requireJsonObject(req, { optional: true })) as { toBePrinted?: unknown; toBeEmailed?: unknown };
     const flags: { toBePrinted?: boolean; toBeEmailed?: boolean } = {};
     if (typeof body.toBePrinted === 'boolean') flags.toBePrinted = body.toBePrinted;
     if (typeof body.toBeEmailed === 'boolean') flags.toBeEmailed = body.toBeEmailed;

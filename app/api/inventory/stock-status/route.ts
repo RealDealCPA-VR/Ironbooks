@@ -10,6 +10,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { stockStatus } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 export async function GET(_req: NextRequest): Promise<NextResponse> {
   try {
@@ -20,7 +21,7 @@ export async function GET(_req: NextRequest): Promise<NextResponse> {
     if (err instanceof ServiceError) {
       return NextResponse.json(
         { error: err.message, code: err.code },
-        { status: err.code === 'FORBIDDEN' ? 403 : 400 },
+        { status: serviceErrorStatus(err.code) },
       );
     }
     console.error('[GET /api/inventory/stock-status]', err);

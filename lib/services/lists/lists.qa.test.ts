@@ -189,7 +189,7 @@ describe('G1 opening stock: closing date, rollback, subledger', () => {
     await assertInvariants();
   });
 
-  it('zero-value opening stock posts nothing but still opens a layer; invariants hold', async () => {
+  it('zero-value opening stock posts nothing; invariants hold', async () => {
     const before = (await db.select().from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))).length;
     const { item, opening } = await createItemWithOpeningStock(ctx, {
       name: 'Free Samples',
@@ -256,8 +256,8 @@ describe('B16 merges keep the books and the inventory subledger intact', () => {
   });
 
   it('merging two FIFO items moves layers; valuation and GL unchanged', async () => {
-    const x = await createItemWithOpeningStock(ctx, { name: 'Fifo X', type: 'inventory', assetAccountId: acct['1300'], openingQuantity: '4', openingValue: '10.00', openingAsOf: d('2026-01-05') });
-    const y = await createItemWithOpeningStock(ctx, { name: 'Fifo Y', type: 'inventory', assetAccountId: acct['1300'], openingQuantity: '6', openingValue: '30.00', openingAsOf: d('2026-01-05') });
+    const x = await createItemWithOpeningStock(ctx, { name: 'Fifo X', type: 'inventory', assetAccountId: acct['1300'], openingQuantity: '4', openingValue: '10.00', openingAsOf: d('2026-01-05'), openingCosting: 'fifo' });
+    const y = await createItemWithOpeningStock(ctx, { name: 'Fifo Y', type: 'inventory', assetAccountId: acct['1300'], openingQuantity: '6', openingValue: '30.00', openingAsOf: d('2026-01-05'), openingCosting: 'fifo' });
     const before = (await inventoryValuation(ctx)).grandTotal;
     const tbBefore = await trialBalance(ctx);
     await mergeItems(ctx, { fromId: x.item.id, toId: y.item.id });
@@ -278,7 +278,7 @@ describe('B16 merges keep the books and the inventory subledger intact', () => {
     const theirs = await createItem(other, { name: 'Tenant theirs', type: 'service' });
     await expect(mergeItems(ctx, { fromId: theirs.id, toId: mine.id })).rejects.toThrow(/not found/i);
     await expect(mergeItems(ctx, { fromId: mine.id, toId: theirs.id })).rejects.toThrow(/not found/i);
-    const fifo = await createItemWithOpeningStock(ctx, { name: 'Mix fifo', type: 'inventory', assetAccountId: acct['1300'], openingQuantity: '1', openingValue: '1.00', openingAsOf: d('2026-01-05') });
+    const fifo = await createItemWithOpeningStock(ctx, { name: 'Mix fifo', type: 'inventory', assetAccountId: acct['1300'], openingQuantity: '1', openingValue: '1.00', openingAsOf: d('2026-01-05'), openingCosting: 'fifo' });
     const avg = await createItem(ctx, { name: 'Mix avg', type: 'inventory', assetAccountId: acct['1300'] });
     await adjustInventory(ctx, { itemId: avg.id, quantityChange: 2, unitCost: 3, date: d('2026-02-01') });
     await expect(mergeItems(ctx, { fromId: fifo.item.id, toId: avg.id })).rejects.toMatchObject({ code: 'VALIDATION' });

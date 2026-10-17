@@ -35,7 +35,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { assertPeriodOpen } from './fiscalPeriods';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
@@ -245,7 +245,16 @@ export async function vendorCreditApplicationDate(
   const result = date < floor ? floor : date;
   // A dated (un)application moves the bill's and the credit's open balances on that day: one dated
   // in a closed period would change that period's A/P aging, even when no exchange entry posts.
-  await assertPeriodOpen(ctx, result);
+  // Entered with the closing-date password, it is listed on the Closing Date Exception report
+  // (callers run this inside the transaction that writes the (un)application, so a refused write
+  // takes the record with it).
+  const periodCheck = await assertPeriodOpen(ctx, result);
+  await recordClosingDateException(ctx, periodCheck, {
+    entryId: credit.id,
+    operation: kind,
+    transactionDate: result,
+    sourceRef: `vendor_credit_application:${credit.id}:${bill.id}`,
+  });
   return result;
 }
 

@@ -1174,6 +1174,14 @@ export async function closeMonth(ctx: ServiceContext, input: CloseMonthInput): P
   }
 
   const settings = await inTransaction(ctx, async (tx) => {
+    // Re-check the closing date here too: a later month closed at the same time must not be
+    // moved back to this earlier period end.
+    const nowClosing = await getClosingDateSettings(tx);
+    if (nowClosing.closingDate && nowClosing.closingDate > periodEnd) {
+      throw validation(
+        `The books are already closed through ${prettyDay(nowClosing.closingDate)}, which is later than ${prettyDay(periodEnd)}. Nothing to do.`,
+      );
+    }
     const row = await loadRow(tx, periodEnd);
     await assertVersion(tx, row, input.version);
     // Re-check readiness against the progress as saved now (a concurrent un-review / un-skip
@@ -1197,7 +1205,7 @@ export async function closeMonth(ctx: ServiceContext, input: CloseMonthInput): P
       action: row ? 'update' : 'create',
       entityType: 'month_end_close',
       entityId: saved.id,
-      oldValues: { periodEnd, status: row?.status ?? null, closingDate: current.closingDate },
+      oldValues: { periodEnd, status: row?.status ?? null, closingDate: nowClosing.closingDate },
       newValues: { periodEnd, status: 'closed', closingDate: s.closingDate, hasPassword: s.hasPassword },
     });
     return s;

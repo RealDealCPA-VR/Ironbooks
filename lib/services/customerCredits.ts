@@ -23,8 +23,11 @@ import type Decimal from 'decimal.js';
 import {
   accounts,
   auditLogs,
+  bouncedChecks,
+  invoices,
   journalEntries,
   journalEntryLines,
+  paymentApplications,
   paymentFxReliefs,
   paymentsReceived,
 } from '@/lib/db/schema';
@@ -156,7 +159,116 @@ export async function paymentsUnappliedAsOf(
 ): Promise<Map<string, Decimal>> {
   if (!asOf) return new Map(payments.map((p) => [p.id, Money.round2(Money.of(p.unapplied))]));
   const events = await paymentCreditEvents(ctx, payments, { after: asOf });
-  return new Map(payments.map((p) => [p.id, unappliedAsOf(p.unapplied, events.get(p.id), asOf)]));
+  const ids = payments.map((p) => p.id);
+  const later = await homeAppliedToLaterInvoices(ctx, ids, asOf);
+  const bounced = await bouncedCreditAfter(ctx, ids, asOf);
+  return new Map(
+    payments.map((p) => [
+      p.id,
+      unappliedAsOf(p.unapplied, events.get(p.id), asOf)
+        .plus(later.get(p.id) ?? Money.zero())
+        .plus(bounced.get(p.id) ?? Money.zero()),
+    ]),
+  );
+}
+
+/**
+ * Credit a payment still held on `asOf` when it bounced AFTER that date (payments.ts
+ * recordBouncedCheck zeroes `unapplied` and deletes the payment's applications, undated): what was
+ * unapplied when it bounced (audit oldValues.unapplied), the General Journal charges it paid (reopened
+ * by the bounce, so open again in every as-of aging), and its invoice applications to invoices dated
+ * after `asOf` (not yet applied then — see homeAppliedToLaterInvoices). The bounce entry re-charges
+ * A/R on its own date, so before it the GL still carries the whole payment as a credit.
+ */
+async function bouncedCreditAfter(ctx: ServiceContext, paymentIds: string[], asOf: Date): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>();
+  for (let i = 0; i < paymentIds.length; i += 2000) {
+    const chunk = paymentIds.slice(i, i + 2000);
+    const rows = await ctx.db
+      .select({ paymentId: bouncedChecks.paymentId, applications: bouncedChecks.applications })
+      .from(bouncedChecks)
+      .where(and(eq(bouncedChecks.companyId, ctx.companyId), inArray(bouncedChecks.paymentId, chunk), gt(bouncedChecks.date, asOf)));
+    if (rows.length === 0) continue;
+    const bouncedIds = [...new Set(rows.map((r) => r.paymentId))];
+    const audits = await ctx.db
+      .select({ entityId: auditLogs.entityId, oldValues: auditLogs.oldValues, newValues: auditLogs.newValues })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, ctx.companyId),
+          eq(auditLogs.entityType, 'payment_received'),
+          inArray(auditLogs.entityId, bouncedIds),
+          sql`${auditLogs.newValues}->>'action' = 'bounced'`,
+        ),
+      );
+    const heldAtBounce = new Map<string, Decimal>();
+    for (const a of audits) {
+      if (!a.entityId) continue;
+      const unapplied = Money.of((a.oldValues as { unapplied?: string } | null)?.unapplied ?? 0);
+      const journal = ((a.newValues as { journalChargesReopened?: Array<{ amount?: string }> } | null)?.journalChargesReopened ?? [])
+        .reduce((s, j) => s.plus(Money.of(j.amount ?? 0)), Money.zero());
+      heldAtBounce.set(a.entityId, unapplied.plus(journal));
+    }
+    const invIds = [...new Set(rows.flatMap((r) => (r.applications ?? []).map((x) => x.invoiceId)).filter((x): x is string => !!x))];
+    // Invoices the reopened applications cannot be shown against on `asOf`: dated after it, or voided
+    // since the bounce (a void takes the invoice off A/R at every date — the payment's money was then
+    // a credit on the customer's account).
+    const notAgedThen = new Set<string>();
+    for (let j = 0; j < invIds.length; j += 2000) {
+      for (const inv of await ctx.db
+        .select({ id: invoices.id, date: invoices.date, status: invoices.status })
+        .from(invoices)
+        .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invIds.slice(j, j + 2000))))) {
+        if (inv.status === 'void' || inv.date.getTime() > asOf.getTime()) notAgedThen.add(inv.id);
+      }
+    }
+    for (const r of rows) {
+      let credit = heldAtBounce.get(r.paymentId) ?? Money.zero();
+      for (const app of r.applications ?? []) {
+        // Cash and early-payment discount both came off A/R on the payment date.
+        if (app.invoiceId && notAgedThen.has(app.invoiceId)) {
+          credit = credit.plus(Money.of(app.amountApplied ?? 0)).plus(Money.of(app.discountAmount ?? 0));
+        }
+      }
+      out.set(r.paymentId, (out.get(r.paymentId) ?? Money.zero()).plus(credit));
+    }
+  }
+  return out;
+}
+
+/**
+ * Home-currency payment credit applied to invoices dated AFTER `asOf`, per payment. On that date the
+ * invoice did not exist yet, so the credit was still unapplied: an application takes effect on the
+ * later of the payment's and the invoice's dates (the A/R aging leaves invoices dated after its
+ * cutoff out, and the GL credited the whole payment to A/R on the payment date). A prepayment later
+ * applied to a new invoice therefore stays a credit in every as-of aging before that invoice.
+ * Foreign payments record their applications as dated FX reliefs (paymentCreditEvents) instead.
+ */
+async function homeAppliedToLaterInvoices(ctx: ServiceContext, paymentIds: string[], asOf: Date): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>();
+  for (let i = 0; i < paymentIds.length; i += 2000) {
+    const chunk = paymentIds.slice(i, i + 2000);
+    const rows = await ctx.db
+      .select({
+        paymentId: paymentApplications.paymentId,
+        // Cash and early-payment discount both came off A/R on the payment date.
+        amount: sql<string>`COALESCE(SUM(CAST(${paymentApplications.amountApplied} AS NUMERIC) + CAST(${paymentApplications.discountAmount} AS NUMERIC)), 0)`,
+      })
+      .from(paymentApplications)
+      .innerJoin(invoices, eq(paymentApplications.invoiceId, invoices.id))
+      .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
+      .where(
+        and(
+          eq(paymentsReceived.companyId, ctx.companyId),
+          inArray(paymentApplications.paymentId, chunk),
+          isNull(paymentsReceived.currency),
+          gt(invoices.date, asOf),
+        ),
+      )
+      .groupBy(paymentApplications.paymentId);
+    for (const r of rows) out.set(r.paymentId, Money.of(r.amount));
+  }
+  return out;
 }
 
 /**

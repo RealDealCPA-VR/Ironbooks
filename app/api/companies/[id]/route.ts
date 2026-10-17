@@ -13,15 +13,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { archiveCompany, renameCompany } from './manage';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[companies/[id]] unexpected error:', err);

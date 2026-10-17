@@ -428,6 +428,14 @@ export const items = pgTable('items', {
   quantityOnHand: decimal('quantity_on_hand', { precision: 15, scale: 4 }).default('0'),
   reorderPoint: decimal('reorder_point', { precision: 15, scale: 4 }),
   averageCost: decimal('average_cost', { precision: 15, scale: 4 }),
+  /**
+   * Average cost: the cents the inventory GL carries for the item beyond its book value
+   * round2(quantityOnHand × averageCost) — a receipt the 4dp average cannot represent (3000 for
+   * $1000). Relieved with the last unit (lib/services/inventory.ts valueRemainderAfter /
+   * carriedValueRemainder). Only valid while averageCost equals valueRemainderAvg (0061).
+   */
+  valueRemainder: decimal('value_remainder', { precision: 15, scale: 2 }).notNull().default('0'),
+  valueRemainderAvg: decimal('value_remainder_avg', { precision: 15, scale: 4 }),
   isActive: boolean('is_active').notNull().default(true),
   /** Values for company-defined custom fields ({ [fieldName]: value }). */
   customFields: jsonb('custom_fields').$type<Record<string, string>>(),

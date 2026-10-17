@@ -40,6 +40,10 @@ const ocrAssets = [
   './node_modules/tesseract.js-core/index.js',
   './node_modules/tesseract.js-core/*-lstm.js',
   './node_modules/tesseract.js-core/*-lstm.wasm',
+  // tesseract.js 7.0.0's Node worker hands getCore() the boolean `lstmOnly` where it expects an
+  // OEM number, so it always loads the full (legacy + LSTM) core for the CPU's SIMD level, even
+  // with OEM 1. Ship those builds too, or OCR aborts with ENOENT on the missing .wasm.
+  './node_modules/tesseract.js-core/tesseract-core{,-simd,-relaxedsimd}.{js,wasm}',
   './node_modules/@tesseract.js-data/eng/package.json',
   './node_modules/@tesseract.js-data/eng/4.0.0_best_int/**/*',
   './node_modules/{bmp-js,idb-keyval,is-url,node-fetch,whatwg-url,tr46,webidl-conversions,regenerator-runtime,wasm-feature-detect,zlibjs}/**/*',
@@ -67,7 +71,8 @@ const nextConfig = {
   // Receipt capture reads photos with offline OCR (lib/receipts/ocr.ts): tesseract.js starts a
   // worker thread that loads the WebAssembly engine and the bundled English language data from
   // node_modules at runtime, which file tracing can't see. Ship them with the receipt routes so
-  // the packaged desktop app never needs to download anything (LSTM engine builds only).
+  // the packaged desktop app never needs to download anything (see ocrAssets for which engine
+  // builds are shipped and why).
   outputFileTracingIncludes: {
     '/api/receipts': ocrAssets,
     '/api/receipts/**': ocrAssets,

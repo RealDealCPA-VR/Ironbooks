@@ -25,7 +25,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, users } from '@/lib/db/schema';
+import { accounts, inventorySites, users } from '@/lib/db/schema';
 import type { ServiceContext } from '../_base';
 import { createCompany } from '../company';
 import { createCustomer } from '../customers';
@@ -160,7 +160,11 @@ describe("Accountant's Copy — stock the client used up at a site, bin, serial 
     await invoice(ctx, 'A-G', '2026-04-10', { itemId: R.gizmo, quantity: 5, rate: '12', siteId: R.east });
     await invoice(ctx, 'A-N', '2026-04-10', { itemId: R.nut, quantity: 4, rate: '2', siteId: R.west });
     await bill('B-N2', '2026-04-11', { itemId: R.nut, quantity: 4, unitCost: '1', siteId: R.east });
-    await updateSite(ctx, R.north, { isActive: false });
+    // Making a site inactive while the copy is out is refused since review round 4 (updateSite →
+    // assertListDeleteAllowed); a file from before that rule can still have one, which the review
+    // must name — set it directly.
+    expect(await updateSite(ctx, R.north, { isActive: false }).then(() => 'made inactive', (e: Error) => e.message)).toMatch(/Accountant's Copy/);
+    await db.update(inventorySites).set({ isActive: false }).where(eq(inventorySites.id, R.north));
     // Received into a bin, then sold without naming a bin (taken from the stock outside any bin).
     await bill('B-K2', '2026-04-11', { itemId: R.bracket, quantity: 10, unitCost: '1', siteId: R.east, binId: R.binD });
     await invoice(ctx, 'A-K', '2026-04-12', { itemId: R.bracket, quantity: 10, rate: '3', siteId: R.east });

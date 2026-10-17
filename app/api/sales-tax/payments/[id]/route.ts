@@ -4,7 +4,7 @@
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import { getPaymentCheck, voidPaymentCheck } from '@/lib/services/liabilityPayments';
 import { type ServiceContext, notFound } from '@/lib/services/_base';
 
@@ -30,7 +30,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   try {
     const ctx = await getServerContext();
     const { id } = await params;
-    const body = (await req.json().catch(() => ({}))) as { action?: string };
+    const body = (await requireJsonObject(req, { optional: true })) as { action?: string };
     if (body.action !== 'void') {
       return NextResponse.json({ error: 'action must be "void".', code: 'VALIDATION' }, { status: 400 });
     }

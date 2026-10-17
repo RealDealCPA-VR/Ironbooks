@@ -8,22 +8,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getBillPayment, updateBillPayment, voidBillPayment } from '@/lib/services/billPayments';
-import { routeError, serviceErrorBody } from '@/lib/routeErrors';
+import { routeError, serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { payBillsSchema } from '@/lib/validation/billPayments';
 import { ServiceError } from '@/lib/services/_base';
 
 // Map ServiceError codes to HTTP status codes.
 function errorStatus(code: ServiceError['code']): number {
-  switch (code) {
-    case 'NOT_FOUND':     return 404;
-    case 'VALIDATION':    return 400;
-    case 'UNBALANCED':    return 400;
-    case 'FORBIDDEN':     return 403;
-    case 'CONFLICT':      return 409;
-    case 'PERIOD_CLOSED': return 422;
-    default:              return 500;
-  }
+  return serviceErrorStatus(code, { PERIOD_CLOSED: 422 });
 }
 
 function errorResponse(err: unknown, label: string) {

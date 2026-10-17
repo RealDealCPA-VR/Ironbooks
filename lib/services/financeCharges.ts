@@ -358,16 +358,19 @@ export async function assessFinanceCharges(
   const preview = await previewFinanceCharges(ctx, { asOf: opts.asOf, settings: opts.settings });
   const onlySet = opts.customerIds ? new Set(opts.customerIds) : null;
 
-  const arAccountId = await getOrCreateAccountByCode(ctx, '1200', {
-    name: 'Accounts Receivable',
-    type: 'asset',
-    subtype: 'accounts_receivable',
-  });
-  const fcIncomeId = await getOrCreateAccountByCode(ctx, FC_INCOME_CODE, {
-    name: FC_INCOME_NAME,
-    type: 'revenue',
-    subtype: 'other_income',
-  });
+  // Find-or-create in one transaction, so two runs at once cannot both create the account.
+  const { arAccountId, fcIncomeId } = await inTransaction(ctx, async (tx) => ({
+    arAccountId: await getOrCreateAccountByCode(tx, '1200', {
+      name: 'Accounts Receivable',
+      type: 'asset',
+      subtype: 'accounts_receivable',
+    }),
+    fcIncomeId: await getOrCreateAccountByCode(tx, FC_INCOME_CODE, {
+      name: FC_INCOME_NAME,
+      type: 'revenue',
+      subtype: 'other_income',
+    }),
+  }));
 
   const assessed: AssessedFinanceCharge[] = [];
   const skipped: AssessFinanceChargesResult['skipped'] = [];
@@ -387,6 +390,21 @@ export async function assessFinanceCharges(
 
     try {
       const result = await inTransaction(ctx, async (tx) => {
+        // The preview was read outside this transaction: re-check inside it, so two runs at once
+        // (a double-click on Assess) cannot both charge this customer for the period.
+        const [already] = await tx.db
+          .select({ id: invoices.id })
+          .from(invoices)
+          .where(
+            and(
+              eq(invoices.companyId, tx.companyId),
+              eq(invoices.customerId, row.customerId),
+              ne(invoices.status, 'void'),
+              like(invoices.memo, `%${fcMarker(preview.periodKey)}%`),
+            ),
+          )
+          .limit(1);
+        if (already) throw new ServiceError('CONFLICT', `Already assessed for ${preview.periodKey}.`);
         // Same numbering as every other invoice (QB: finance-charge invoices take the next
         // invoice number): the last number used with its trailing digits + 1, prefix kept
         // ("INV-1002" -> "INV-1003"), under the per-company allocation lock.

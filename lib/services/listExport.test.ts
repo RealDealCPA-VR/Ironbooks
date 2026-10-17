@@ -163,14 +163,18 @@ describe('listExport service (integration)', () => {
     const { filename, csv } = await exportListCsv(ctx, 'customers');
     expect(filename).toMatch(/^customers-\d{4}-\d{2}-\d{2}\.csv$/);
     const lines = rows(csv);
+    // Review round 4 (round-trip fidelity): the billing address is exported in its parts, as in
+    // QuickBooks' list export, instead of one flattened "Billing Address" column — a list import
+    // maps each part back, which a single comma-joined column could not do reliably.
     expect(lines[0]).toBe(
-      'Name,Company,Email,Phone,Billing Address,Shipping Address,Terms,Credit Limit,Taxable,Customer Type,Parent,Balance,Notes,Active',
+      'Name,Company,Email,Phone,Billing Street 1,Billing Street 2,Billing City,Billing State,Billing ZIP,Billing Country,' +
+        'Shipping Address,Terms,Credit Limit,Taxable,Customer Type,Parent,Balance,Notes,Active',
     );
     expect(lines).toHaveLength(3); // header + 2 customers
     // CSV-hostile name correctly escaped
     expect(csv).toContain('"Acme, Inc. ""The Best"""');
-    // Address flattened
-    expect(csv).toContain('"1 Main St, Springfield, IL, 62701"');
+    // Billing address in its parts (street, street 2, city, state, ZIP, country)
+    expect(csv).toContain(',1 Main St,,Springfield,IL,62701,,');
     // Inactive customer included, flagged N
     const beta = lines.find((l) => l.startsWith('Beta LLC'));
     expect(beta).toBeDefined();

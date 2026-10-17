@@ -13,7 +13,7 @@
  */
 import { and, asc, eq, ne, sql } from 'drizzle-orm';
 import { accounts, vendors } from '@/lib/db/schema';
-import { type ServiceContext, assertRefInCompany, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, assertRefInCompany, inTransaction, notFound, validation, writeAudit } from './_base';
 import { getPreferences } from './preferences';
 import { maskForContext } from './access';
 import { resolvePartyTerms } from './lists/fields';
@@ -128,6 +128,12 @@ const isMaskedValue = (v: string | null | undefined) =>
 
 /** Create a new vendor record for the company. */
 export async function createVendor(ctx: ServiceContext, input: CreateVendorInput) {
+  // The unique-name check runs in the same transaction as the insert (two creates at once must
+  // not both add the same name).
+  return inTransaction(ctx, (tx) => createVendorInTx(tx, input));
+}
+
+async function createVendorInTx(ctx: ServiceContext, input: CreateVendorInput) {
   // A masked placeholder (e.g. copied from a vendor shown to a role without the sensitive flag)
   // is not a TIN -- storing it would corrupt 1099 reporting.
   if (isMaskedValue(input.taxId)) {

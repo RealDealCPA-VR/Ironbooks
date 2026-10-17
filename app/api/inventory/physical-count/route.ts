@@ -14,24 +14,17 @@ import { getServerContext } from '@/lib/context';
 import { physicalCount } from '@/lib/services/inventoryOps';
 import { assertPhysicalCountable } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
-  const statusMap: Record<string, number> = {
-    NOT_FOUND: 404,
-    VALIDATION: 400,
-    UNBALANCED: 400,
-    FORBIDDEN: 403,
-    CONFLICT: 409,
-    PERIOD_CLOSED: 409,
-  };
-  const status = statusMap[err.code] ?? 500;
+  const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
   return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
 }
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
     const ctx = await getServerContext();
-    const body = await req.json() as {
+    const body = await requireJsonObject(req) as {
       itemId?: string;
       countedQty?: string | number;
       date?: string;

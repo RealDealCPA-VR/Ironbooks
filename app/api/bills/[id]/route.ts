@@ -5,7 +5,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { zodErrorWithFixes } from '@/lib/fixRoutes';
-import { serviceErrorBody } from '@/lib/routeErrors';
+import { serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { getBill, updateBill, voidBill } from '@/lib/services/bills';
 import { ServiceError } from '@/lib/services/_base';
@@ -14,16 +14,7 @@ import { createBillSchema } from '@/lib/validation/bills';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json(serviceErrorBody(err), { status });
   }
   console.error('[bills/[id]/route]', err);

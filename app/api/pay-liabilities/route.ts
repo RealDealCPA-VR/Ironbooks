@@ -28,16 +28,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { payrollLiabilitiesDue, payPayrollLiabilities } from '@/lib/services/liabilityPayments';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorStatus(code: string): number {
-  switch (code) {
-    case 'NOT_FOUND':   return 404;
-    case 'VALIDATION':
-    case 'UNBALANCED':  return 400;
-    case 'FORBIDDEN':   return 403;
-    case 'CONFLICT':    return 409;
-    default:            return 500;
-  }
+  return serviceErrorStatus(code);
 }
 
 function serviceError(err: unknown): NextResponse {
@@ -67,7 +61,7 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
 
     const { type, amount, date, paymentAccountId, memo } = body as {
       type?: string;

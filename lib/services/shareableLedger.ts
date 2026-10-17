@@ -95,6 +95,17 @@ async function collect(ctx: ServiceContext): Promise<LedgerData> {
     .from(vendors)
     .where(eq(vendors.companyId, ctx.companyId))
     .orderBy(asc(vendors.displayName));
+  // The customer / vendor named on a journal line (GL "Name" column).
+  const lineById = new Map(lines.map(({ line }) => [line.id, line]));
+  const custName = new Map(custRows.map((c) => [c.id, c.displayName]));
+  const vendName = new Map(vendRows.map((v) => [v.id, v.displayName]));
+  const nameOfLine = (lineId: string): string => {
+    const l = lineById.get(lineId);
+    if (!l?.entityId) return '';
+    if (l.entityType === 'customer') return custName.get(l.entityId) ?? '';
+    if (l.entityType === 'vendor') return vendName.get(l.entityId) ?? '';
+    return '';
+  };
   const itemRows = await ctx.db
     .select()
     .from(items)
@@ -161,18 +172,20 @@ async function collect(ctx: ServiceContext): Promise<LedgerData> {
       sheetName: 'General Ledger',
       title: 'General Ledger',
       subtitle: 'Posted entries, running balance per account (debit-normal for assets/expenses)',
+      // Name = the line's customer / vendor (QB's GL "Name" column): an A/R or A/P line needs it
+      // when this workbook is read back by the General Ledger import (qbGlFiles.fromIronbooksLedger).
       columns: [
         { header: 'Account' }, { header: 'Date' }, { header: 'Entry #' }, { header: 'Description' },
-        { header: 'Reference' }, { header: 'Debit', numeric: true }, { header: 'Credit', numeric: true },
+        { header: 'Reference' }, { header: 'Name' }, { header: 'Debit', numeric: true }, { header: 'Credit', numeric: true },
         { header: 'Balance', numeric: true },
       ],
       rows: gl.flatMap((acct) => {
         if (!acct.lines.length) return [];
         const label = `${acct.accountCode} · ${acct.accountName}`;
         return [
-          [label, '', '', 'Opening balance', '', '', '', acct.openingBalance] as XlsxCell[],
-          ...acct.lines.map((l) => [label, iso(l.date), l.entryNumber, l.description, l.reference ?? '', l.debit ?? '', l.credit ?? '', l.runningBalance] as XlsxCell[]),
-          [label, '', '', 'Closing balance', '', '', '', acct.closingBalance] as XlsxCell[],
+          [label, '', '', 'Opening balance', '', '', '', '', acct.openingBalance] as XlsxCell[],
+          ...acct.lines.map((l) => [label, iso(l.date), l.entryNumber, l.description, l.reference ?? '', nameOfLine(l.lineId), l.debit ?? '', l.credit ?? '', l.runningBalance] as XlsxCell[]),
+          [label, '', '', 'Closing balance', '', '', '', '', acct.closingBalance] as XlsxCell[],
         ];
       }),
     },

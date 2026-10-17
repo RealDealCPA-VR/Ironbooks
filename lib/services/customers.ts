@@ -16,7 +16,7 @@
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { customers, invoices, priceLevels, taxRates } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, assertRefInCompany, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, assertRefInCompany, inTransaction, notFound, validation, writeAudit } from './_base';
 import { requirePriceLevelChangeAccess } from './pricing';
 import { unappliedPaymentsByCustomer } from './customerCredits';
 import { journalBalancesByEntity } from './journal';
@@ -166,6 +166,12 @@ export async function getCustomer(ctx: ServiceContext, id: string) {
 
 /** Create a new customer record (no GL impact — only master data). */
 export async function createCustomer(ctx: ServiceContext, input: CreateCustomerInput) {
+  // The unique-name check runs in the same transaction as the insert (two creates at once must
+  // not both add the same name).
+  return inTransaction(ctx, (tx) => createCustomerInTx(tx, input));
+}
+
+async function createCustomerInTx(ctx: ServiceContext, input: CreateCustomerInput) {
   validateInput(input);
 
   // Enforce unique displayName per company so the pick-list stays unambiguous.

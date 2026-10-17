@@ -20,7 +20,8 @@ import { translatePgErrors } from './pgErrors';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ServiceError } from '@/lib/services/errors';
 import { OPEN_BLOCKING, checkLedgerHealth, ensureLedgerGuards, type LedgerProblem } from './ledgerGuards';
-import { acquireDirLock, releaseDirLock } from './dirLock';
+import { CompanyFileInUseError, acquireDirLock, assertDirLockHeld, releaseDirLock } from './dirLock';
+import { refreshPlannerStats } from './plannerStats';
 
 export { CompanyFileInUseError, LOCK_FILE } from './dirLock';
 
@@ -32,6 +33,48 @@ interface DbHandle {
   migrated: Promise<void>;
   /** Set when the file's ledger is damaged (see ledgerGuards.ts); getDb then refuses it. */
   damage: LedgerProblem[] | null;
+  /** Set when another process took the company file lock over (dirLock.ts); the handle is dead. */
+  lost: CompanyFileInUseError | null;
+}
+
+/**
+ * Make every statement on `client` refuse once `lostOf()` reports the file lost, and re-check the
+ * lock just before each transaction commits (assertDirLockHeld), so a write that is in flight when
+ * another process takes the file over is rolled back instead of landing in a folder the other
+ * process now owns. Statements PGlite runs for itself (BEGIN / COMMIT / ROLLBACK) are not routed
+ * through these methods, so a refused transaction still rolls back cleanly.
+ */
+function refuseWhenLost(client: PGlite, dir: string, lostOf: () => CompanyFileInUseError | null): void {
+  const check = () => {
+    const lost = lostOf();
+    if (lost) throw lost;
+  };
+  const guard = (target: Record<string, unknown>) => {
+    for (const name of ['query', 'exec'] as const) {
+      const fn = target[name];
+      if (typeof fn !== 'function') continue;
+      const bound = (fn as (...a: unknown[]) => Promise<unknown>).bind(target);
+      target[name] = async (...args: unknown[]) => {
+        check();
+        return bound(...args);
+      };
+    }
+  };
+  const c = client as unknown as Record<string, unknown>;
+  guard(c);
+  const transaction = (c.transaction as (fn: (t: object) => Promise<unknown>) => Promise<unknown>).bind(c);
+  c.transaction = async (fn: (t: object) => Promise<unknown>) => {
+    check();
+    return transaction(async (t) => {
+      guard(t as Record<string, unknown>);
+      const result = await fn(t);
+      // Last moment before COMMIT: a takeover found now (or by the heartbeat meanwhile) throws,
+      // and PGlite rolls the transaction back.
+      assertDirLockHeld(dir);
+      check();
+      return result;
+    });
+  };
 }
 
 /**
@@ -129,7 +172,18 @@ export function openDb(dataDir?: string): DbHandle {
   fs.mkdirSync(dir, { recursive: true });
   // Refuse a company file another process has open (PGlite has no lock of its own, so two
   // writers on one folder silently lose each other's transactions) — lib/db/dirLock.ts.
-  acquireDirLock(dir);
+  // If another process later takes the lock over (this one stopped renewing it: sleep, a long
+  // pause), this handle dies: it is dropped, so getDb() re-checks the lock (CompanyFileInUseError
+  // while the other process has it), and every statement still sent through it is refused.
+  // It is deliberately NOT closed: closing PGlite checkpoints, which would write this process's
+  // buffers into files the other process now owns.
+  let handle: DbHandle | undefined;
+  acquireDirLock(dir, (host) => {
+    if (!handle || handle.lost) return;
+    handle.lost = new CompanyFileInUseError(host);
+    if (handles.get(dir) === handle) handles.delete(dir);
+    console.error(`[db] company file ${dir} was taken over by ${host}; this process stopped using it.`);
+  });
   // Postgres data errors (malformed uuid 22P02, numeric overflow 22003) become ServiceErrors for
   // every query, so bad input answers 4xx instead of 500 (lib/db/pgErrors.ts).
   let client: PGlite;
@@ -139,12 +193,14 @@ export function openDb(dataDir?: string): DbHandle {
     releaseDirLock(dir);
     throw err;
   }
+  refuseWhenLost(client, dir, () => handle?.lost ?? null);
   const db = drizzle(client, { schema });
   // Commit tracking for the running transaction log (appends only after COMMIT).
   instrumentDb(db, dir);
 
-  const handle: DbHandle = { client, db, migrated: Promise.resolve(), damage: null };
-  handle.migrated = (async () => {
+  const opened: DbHandle = { client, db, migrated: Promise.resolve(), damage: null, lost: null };
+  handle = opened;
+  opened.migrated = (async () => {
     // PGlite's session time zone follows the host (e.g. Etc/GMT+5), so now() / defaultNow()
     // wrote local wall-clock time into `timestamp` columns, which drizzle reads back as UTC —
     // every DB-stamped time came back hours early (and a day early just after midnight).
@@ -158,17 +214,20 @@ export function openDb(dataDir?: string): DbHandle {
       // off or replaced outside the app would stay unguarded. Re-install them on every open,
       // then refuse a file whose ledger is already damaged.
       await ensureLedgerGuards(client, MIGRATIONS_FOLDER);
+      // PGlite has no autovacuum: give tables that hold data but were never analyzed (or changed
+      // a lot since) planner statistics, or large files get quadratic plans (plannerStats.ts).
+      await refreshPlannerStats(db, 'open', { staleOnly: true });
       const health = await checkLedgerHealth(client, MIGRATIONS_FOLDER, { includeCachedBalances: false });
       const blocking = health.problems.filter((p) => OPEN_BLOCKING.has(p.kind));
       if (blocking.length) {
-        handle.damage = blocking;
+        opened.damage = blocking;
         console.error('[db] company file ledger is damaged:', dir, blocking.map((p) => p.detail).join(' '));
       }
     }
   })();
 
-  handles.set(dir, handle);
-  return handle;
+  handles.set(dir, opened);
+  return opened;
 }
 
 /** Ledger problems found when the company file was opened (null = healthy). */
@@ -189,6 +248,8 @@ export async function getDb(dataDir?: string): Promise<DB> {
   if (openHoldFor(dataDir)) await waitForOpenHold(dataDir);
   const handle = openDb(dataDir);
   await handle.migrated;
+  // Taken over by another process while it was opening (dirLock.ts): never hand it out.
+  if (handle.lost) throw handle.lost;
   if (handle.damage && !damagedFileAccess.getStore()) throw new LedgerDamagedError(handle.damage);
   return handle.db;
 }

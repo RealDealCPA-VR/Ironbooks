@@ -3,7 +3,7 @@
  *
  *  - D8 Sales Tax Adjustment — QB "Adjust Sales Tax Due": reduce what is owed (vendor discount for
  *    paying on time, rounding) or increase it (penalty, interest). Posts a balanced entry through
- *    postJournalEntry against the agency's liability account (else 2200), stamped
+ *    postJournalEntry against 2200 Sales Tax Payable (see agencyLiabilityAccountId), stamped
  *    "sales_tax_adj:<agencyId>" so the liability engine attributes it to the agency.
  *
  *  - I2 Fix Incorrectly Recorded Sales Tax — finds sales-tax activity recorded outside Pay Sales
@@ -13,7 +13,7 @@
  *    account. Fixes:
  *      (a) linkSalesTaxLine — attribute the existing line to an agency as a payment, adjustment
  *          or collected tax (sales_tax_line_links; the posted line itself never changes);
- *      (b) reclassifySalesTaxPayment — post a correcting entry Dr agency liability / Cr the
+ *      (b) reclassifySalesTaxPayment — post a correcting entry Dr 2200 Sales Tax Payable / Cr the
  *          expense account, stamped "tax_agency:<id>", so the money counts as a tax payment.
  */
 import { and, eq, inArray, sql } from 'drizzle-orm';
@@ -49,10 +49,15 @@ async function loadAgency(ctx: ServiceContext, agencyId: string) {
   return agency;
 }
 
-/** The liability account an agency's activity posts to: its own account, else 2200. */
+/**
+ * The liability account an agency's payments, adjustments and fixes post to: always 2200 Sales Tax
+ * Payable, the account every invoice / sales receipt / credit memo credits its tax to (QB keeps all
+ * sales tax in one Sales Tax Payable account). An agency's own liabilityAccountId (API-only, no
+ * screen sets it) is not posted to: debiting it while the sales sat in 2200 drove it negative and
+ * left 2200 overstated. The ledger still reads it, so activity posted there earlier keeps counting.
+ */
 export async function agencyLiabilityAccountId(ctx: ServiceContext, agencyId: string): Promise<string> {
-  const agency = await loadAgency(ctx, agencyId);
-  if (agency.liabilityAccountId) return agency.liabilityAccountId;
+  await loadAgency(ctx, agencyId);
   const [row] = await ctx.db
     .select({ id: accounts.id })
     .from(accounts)

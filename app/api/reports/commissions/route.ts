@@ -10,14 +10,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { commissionReport } from '@/lib/services/salesReps';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseRange } from '../_lib';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[reports/commissions] unexpected error:', err);
@@ -27,17 +25,9 @@ function errorResponse(err: unknown) {
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const { searchParams } = req.nextUrl;
-    const fromStr = searchParams.get('from');
-    const toStr = searchParams.get('to');
-
-    const range =
-      fromStr || toStr
-        ? {
-            from: fromStr ? new Date(fromStr) : undefined,
-            to: toStr ? new Date(toStr) : undefined,
-          }
-        : undefined;
+    // parseRange answers 400 for an unparseable date (a raw new Date('garbage') reached the query
+    // as Invalid Date → RangeError → 500).
+    const range = parseRange(req.nextUrl.searchParams);
 
     const report = await commissionReport(ctx, range);
     return NextResponse.json(report);

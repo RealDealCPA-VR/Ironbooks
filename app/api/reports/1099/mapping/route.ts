@@ -15,15 +15,11 @@ import {
   type Tax1099Mapping,
 } from '@/lib/services/statements';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[1099/mapping] Unexpected error', err);
@@ -43,7 +39,7 @@ export async function GET() {
 export async function PATCH(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json()) as { boxes?: unknown };
+    const body = (await requireJsonObject(req)) as { boxes?: unknown };
     if (!Array.isArray(body.boxes)) {
       return NextResponse.json(
         { error: 'boxes must be an array of { box, accountIds[] }.', code: 'VALIDATION' },

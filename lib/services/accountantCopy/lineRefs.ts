@@ -15,6 +15,7 @@ import { journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError } from '../_base';
 import type { LineRef } from './format';
+import { isGeneralJournalSource } from './guard';
 
 /** Records whose own row names the entry they posted (posted_entry_id). */
 const OWNER_TABLES: Record<string, string> = {
@@ -76,7 +77,7 @@ async function ownerOfEntry(
   const res = await ctx.db.execute(sql`${sql.join(parts, sql` UNION ALL `)} LIMIT 1`);
   const found = (res as unknown as { rows: Array<{ type: string; id: string }> }).rows[0];
   if (found) return { type: found.type, id: found.id };
-  if (sourceRef === null || sourceRef === 'manual' || sourceRef.startsWith('reversal:')) return { type: 'journal_entry', id: entryId };
+  if (isGeneralJournalSource(sourceRef)) return { type: 'journal_entry', id: entryId };
   return null;
 }
 

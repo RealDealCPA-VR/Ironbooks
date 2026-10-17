@@ -20,7 +20,7 @@ import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { assertBalanceSheetBalanced } from './ledgerAssert';
 import { balanceSheet, type BalanceSheet, type ReportLine } from './reports';
-import { cashBasisLedger } from './cashBasisLedger';
+import { cashBasisLedger, endOfUtcDay } from './cashBasisLedger';
 
 export interface AdjustedLine {
   accountId: string;
@@ -75,7 +75,9 @@ export async function cashBasisBalanceSheet(ctx: ServiceContext, asOf?: Date): P
 async function build(ctx: ServiceContext, asOf?: Date) {
   const accrual = await balanceSheet(ctx, asOf);
   const fyStart = accrual.fiscalYearStart ? new Date(accrual.fiscalYearStart) : new Date(0);
-  const { adjustments } = await cashBasisLedger(ctx, { to: asOf });
+  // The accrual sheet counts the whole as-of day; the adjustments must use the same bound.
+  const dayEnd = asOf ? endOfUtcDay(asOf) : undefined;
+  const { adjustments } = await cashBasisLedger(ctx, { to: dayEnd });
   const meta = new Map(
     (
       await ctx.db
@@ -89,7 +91,7 @@ async function build(ctx: ServiceContext, asOf?: Date) {
   let earnings = Money.zero();
   let current = Money.zero();
   for (const a of adjustments) {
-    if (asOf && a.date > asOf) continue;
+    if (dayEnd && a.date > dayEnd) continue;
     const t = meta.get(a.accountId)?.type;
     if (t === 'revenue' || t === 'expense') {
       earnings = earnings.minus(a.net); // earnings = credits − debits

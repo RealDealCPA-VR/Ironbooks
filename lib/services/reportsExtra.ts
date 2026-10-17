@@ -42,6 +42,7 @@ import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
 import { vendorCreditHomeByBill, vendorCreditRefundsAfter } from './vendorCreditsFx';
 import { foreignInvoiceHomeOpen } from './fxSubledger';
+import { foreignCode, homeCode } from './fxLines';
 import { getHomeCurrencyCode } from './currencies';
 
 /**
@@ -315,9 +316,20 @@ function ms_to_days(ms: number): number {
  * bounce, that payment still paid those invoices — add the snapshot back so past aging
  * does not change after the fact.
  */
-async function addBouncedApplicationsAsOf(ctx: ServiceContext, upTo: Date, map: Map<string, string>) {
+async function addBouncedApplicationsAsOf(
+  ctx: ServiceContext,
+  upTo: Date,
+  map: Map<string, string>,
+  /** Optional: invoiceId → the bounced payment(s) whose snapshot was added, with their part. */
+  payers?: Map<string, BouncedPayer[]>,
+) {
   const rows = await ctx.db
-    .select({ applications: bouncedChecks.applications })
+    .select({
+      applications: bouncedChecks.applications,
+      paymentId: bouncedChecks.paymentId,
+      reference: paymentsReceived.reference,
+      date: paymentsReceived.date,
+    })
     .from(bouncedChecks)
     .innerJoin(paymentsReceived, eq(bouncedChecks.paymentId, paymentsReceived.id))
     .where(
@@ -332,8 +344,41 @@ async function addBouncedApplicationsAsOf(ctx: ServiceContext, upTo: Date, map: 
       if (!a.invoiceId) continue;
       const add = Money.of(a.amountApplied ?? 0).plus(Money.of(a.discountAmount ?? 0));
       map.set(a.invoiceId, toAmountString(Money.of(map.get(a.invoiceId) ?? 0).plus(add)));
+      if (payers) {
+        payers.set(a.invoiceId, [
+          ...(payers.get(a.invoiceId) ?? []),
+          { paymentId: r.paymentId, reference: r.reference, date: r.date, amount: add },
+        ]);
+      }
     }
   }
+}
+
+interface BouncedPayer {
+  paymentId: string;
+  reference: string | null;
+  date: Date;
+  amount: ReturnType<typeof Money.zero>;
+}
+
+/**
+ * The part of the bounced snapshots added back to an invoice (addBouncedApplicationsAsOf) that it
+ * cannot absorb as of the cutoff — an invoice reopened by the bounce and then edited down below what
+ * the bounced payment had applied to it. The payment credited A/R in full on its date, so before the
+ * bounce that excess was a credit of the customer's (QB shows it as the payment's credit). Split over
+ * the bounced payments, latest first. `amount` is the invoice's as-of open amount (negative here).
+ */
+function bouncedExcessCredits(amount: ReturnType<typeof Money.zero>, payers: BouncedPayer[] | undefined) {
+  const out: Array<BouncedPayer> = [];
+  if (!payers?.length || !amount.isNegative()) return out;
+  let excess = amount.negated();
+  for (const p of [...payers].sort((a, b) => b.date.getTime() - a.date.getTime())) {
+    if (!excess.greaterThan(0)) break;
+    const part = excess.lessThan(p.amount) ? excess : p.amount;
+    if (part.greaterThan(0)) out.push({ ...p, amount: part });
+    excess = excess.minus(part);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +431,7 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     );
 
   // Cash payment applications per invoice: as of the cutoff and all-time.
-  async function paymentAppliedByInvoice(upTo?: Date): Promise<Map<string, string>> {
+  async function paymentAppliedByInvoice(upTo?: Date, payers?: Map<string, BouncedPayer[]>): Promise<Map<string, string>> {
     const conds = [eq(paymentsReceived.companyId, ctx.companyId)];
     if (upTo) conds.push(lte(paymentsReceived.date, upTo));
     const appRows = await ctx.db
@@ -400,17 +445,19 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
       .where(and(...conds))
       .groupBy(paymentApplications.invoiceId);
     const map = new Map(appRows.map((r) => [r.invoiceId, r.applied]));
-    if (upTo) await addBouncedApplicationsAsOf(ctx, upTo, map);
+    if (upTo) await addBouncedApplicationsAsOf(ctx, upTo, map, payers);
     return map;
   }
 
+  const bouncedPayers = new Map<string, BouncedPayer[]>();
   const [appliedAsOf, appliedAllTime] = await Promise.all([
-    paymentAppliedByInvoice(cutoff),
+    paymentAppliedByInvoice(cutoff, bouncedPayers),
     paymentAppliedByInvoice(),
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
   // p1 fx: foreign invoices are aged at the HOME amount A/R still carries (ties to the account).
   const foreignOpen = await foreignInvoiceHomeOpen(ctx, cutoff);
+  const homeCur = await homeCode(ctx);
   const memoAppsLater = await creditMemoApplicationsAfter(ctx, cutoff);
 
   // Accumulate per customer.
@@ -436,13 +483,28 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     // after the cutoff had not reduced it yet), so whether it was open is decided from its as-of
     // foreign open amount, and it is aged at the home amount A/R still carries for it.
     const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    // A foreign invoice the FX subledger does not list was settled (foreign and home) as of the
+    // cutoff — never age it through the home-currency path (that would count today's foreign open
+    // amount, after later unapplies, as home currency).
+    if (!fo && foreignCode(row.currency, homeCur)) continue;
     // Legacy home memos on a foreign invoice are already off its foreign open amount.
     if (fo && fo.memoApplied.greaterThan(0)) {
       creditResidual = creditResidual.minus(fo.memoApplied);
       if (creditResidual.lessThan(0)) creditResidual = Money.zero();
     }
     let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
-    if (!amount.greaterThan(0)) continue;
+    if (!amount.greaterThan(0)) {
+      // Over-applied as of the cutoff by a bounced payment's snapshot (the invoice was edited down
+      // after the bounce): the excess was the customer's credit then.
+      if (!fo) {
+        for (const ex of bouncedExcessCredits(amount, bouncedPayers.get(row.invoiceId))) {
+          if (!byCustomer.has(row.customerId)) byCustomer.set(row.customerId, { name: row.customerName, buckets: blankBuckets() });
+          const b = byCustomer.get(row.customerId)!.buckets;
+          b.current = b.current.minus(ex.amount);
+        }
+      }
+      continue;
+    }
     if (fo) amount = fo.homeOpen;
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
@@ -1060,14 +1122,15 @@ export async function salesByCustomer(
     .select({
       customerId: invoices.customerId,
       customerName: customers.displayName,
-      totalSales: sql<string>`COALESCE(SUM(CAST(${invoices.total} AS NUMERIC)), 0)`,
+      // Home currency: a foreign invoice counts at its own exchange rate.
+      totalSales: sql<string>`COALESCE(SUM(ROUND(CAST(${invoices.total} AS NUMERIC) * COALESCE(${invoices.exchangeRate}, 1), 2)), 0)`,
       invoiceCount: sql<number>`COUNT(${invoices.id})`,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
     .where(and(...conds))
     .groupBy(invoices.customerId, customers.displayName)
-    .orderBy(sql`SUM(CAST(${invoices.total} AS NUMERIC)) DESC`);
+    .orderBy(sql`SUM(ROUND(CAST(${invoices.total} AS NUMERIC) * COALESCE(${invoices.exchangeRate}, 1), 2)) DESC`);
 
   return rows.map((r) => ({
     customerId: r.customerId,
@@ -1236,7 +1299,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       ),
     );
 
-  async function paymentAppliedByInvoice(upTo?: Date): Promise<Map<string, string>> {
+  async function paymentAppliedByInvoice(upTo?: Date, payers?: Map<string, BouncedPayer[]>): Promise<Map<string, string>> {
     const conds = [eq(paymentsReceived.companyId, ctx.companyId)];
     if (upTo) conds.push(lte(paymentsReceived.date, upTo));
     const appRows = await ctx.db
@@ -1250,16 +1313,18 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
       .where(and(...conds))
       .groupBy(paymentApplications.invoiceId);
     const map = new Map(appRows.map((r) => [r.invoiceId, r.applied]));
-    if (upTo) await addBouncedApplicationsAsOf(ctx, upTo, map);
+    if (upTo) await addBouncedApplicationsAsOf(ctx, upTo, map, payers);
     return map;
   }
 
+  const bouncedPayers = new Map<string, BouncedPayer[]>();
   const [appliedAsOf, appliedAllTime] = await Promise.all([
-    paymentAppliedByInvoice(cutoff),
+    paymentAppliedByInvoice(cutoff, bouncedPayers),
     paymentAppliedByInvoice(),
   ]);
   const journalCreditsLater = await journalCreditsAppliedAfter(ctx, 'ar', cutoff);
   const foreignOpen = await foreignInvoiceHomeOpen(ctx, cutoff);
+  const homeCur = await homeCode(ctx);
   const memoAppsLater = await creditMemoApplicationsAfter(ctx, cutoff);
 
   const detail: AgingDetailRow[] = [];
@@ -1279,13 +1344,35 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     // invoice was open is decided from its as-of foreign open amount (payments count on the date
     // they were applied), as in arAging.
     const fo = row.currency ? foreignOpen.get(row.invoiceId) : undefined;
+    // Settled as of the cutoff (not in the FX subledger): never through the home-currency path.
+    if (!fo && foreignCode(row.currency, homeCur)) continue;
     // Legacy home memos on a foreign invoice are already off its foreign open amount.
     if (fo && fo.memoApplied.greaterThan(0)) {
       creditResidual = creditResidual.minus(fo.memoApplied);
       if (creditResidual.lessThan(0)) creditResidual = Money.zero();
     }
     let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
-    if (!amount.greaterThan(0)) continue;
+    if (!amount.greaterThan(0)) {
+      // Over-applied as of the cutoff by a bounced payment's snapshot (edited down after the
+      // bounce): the excess was the payment's credit then, shown as in arAging.
+      if (!fo) {
+        for (const ex of bouncedExcessCredits(amount, bouncedPayers.get(row.invoiceId))) {
+          detail.push({
+            docId: ex.paymentId,
+            docNumber: ex.reference ? `Payment ${ex.reference}` : 'Payment',
+            docType: 'payment',
+            entityId: row.customerId,
+            entityName: row.customerName,
+            date: ex.date.toISOString(),
+            dueDate: null,
+            daysPastDue: 0,
+            bucket: 'current',
+            openBalance: toAmountString(ex.amount.negated()),
+          });
+        }
+      }
+      continue;
+    }
     if (fo) amount = fo.homeOpen;
 
     const effectiveDue = ageFromTxnDate ? row.date : (row.dueDate ?? row.date);
@@ -2084,7 +2171,7 @@ export interface SalesByItemRow {
   type: string;
   quantity: string;
   revenue: string;
-  /** COGS estimated as quantity x current average cost for inventory items ('0.00' otherwise). */
+  /** COGS the sales posted (the cost relieved at the time of each sale; '0.00' for services). */
   cogs: string;
   margin: string;
   /** Margin as a % of revenue (2dp), null when revenue is zero. */
@@ -2098,84 +2185,41 @@ export interface SalesByItemReport {
   totals: { quantity: string; revenue: string; cogs: string; margin: string; marginPct: string | null };
 }
 
-/** Sales items only: not subtotal (non-posting), payment or manual sales-tax items. Needs `items` joined. */
-const SALES_ITEM_ONLY = sql`${items.type}::text NOT IN ('subtotal', 'payment', 'sales_tax')`;
-
 /**
- * Sales by Item (summary) — quantity / revenue / COGS / margin per item across
- * invoices AND sales receipts in the period (voided/draft documents excluded).
- *
- * COGS uses the item's current average cost (quantity x averageCost) for
- * inventory items — a close approximation of the perpetual-inventory postings,
- * which are not stored per line.
+ * Sales by Item (summary) — quantity / revenue / COGS / margin per item across invoices, sales
+ * receipts and credit memos (returns, as negatives) in the period (voided / draft documents
+ * excluded). The same sales lines as the standard Sales by Item reports (reportsLists.ts
+ * salesLines): home currency for foreign invoices, and lines without an item (account lines and
+ * invoice header discounts) on one "(no item)" row, so revenue ties to the income accounts.
+ * COGS is what each sale actually posted (postedCogsBySalesLine), not today's average cost.
  */
 export async function salesByItem(
   ctx: ServiceContext,
   range?: { from?: Date; to?: Date },
 ): Promise<SalesByItemReport> {
-  const invConds = [
-    eq(invoices.companyId, ctx.companyId),
-    ne(invoices.status, 'void'),
-    ne(invoices.status, 'draft'),
-    isNotNull(invoiceLines.itemId),
-    // Subtotal (non-posting, repeats the lines above), payment and manual sales-tax items are
-    // not sales. Discount items stay (they reduce sales).
-    SALES_ITEM_ONLY,
-  ];
-  if (range?.from) invConds.push(gte(invoices.date, range.from));
-  if (range?.to) invConds.push(lte(invoices.date, range.to));
-  const invRows = await ctx.db
-    .select({
-      itemId: invoiceLines.itemId,
-      quantity: sql<string>`COALESCE(SUM(CAST(${invoiceLines.quantity} AS NUMERIC)), 0)`,
-      revenue: sql<string>`COALESCE(SUM(CAST(${invoiceLines.amount} AS NUMERIC)), 0)`,
-    })
-    .from(invoiceLines)
-    .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
-    .innerJoin(items, eq(invoiceLines.itemId, items.id))
-    .where(and(...invConds))
-    .groupBy(invoiceLines.itemId);
+  // Loaded on demand: reportsLists imports this module.
+  const { salesLines, postedCogsBySalesLine, cogsOfSalesLine } = await import('./reportsLists');
+  const lines = await salesLines(ctx, {
+    from: range?.from ?? new Date(Date.UTC(1900, 0, 1)),
+    to: range?.to ?? new Date(Date.UTC(9999, 11, 31, 23, 59, 59, 999)),
+  });
+  const posted = await postedCogsBySalesLine(ctx, lines);
 
-  const srConds = [
-    eq(salesReceipts.companyId, ctx.companyId),
-    ne(salesReceipts.status, 'void'),
-    isNotNull(salesReceiptLines.itemId),
-    SALES_ITEM_ONLY,
-  ];
-  if (range?.from) srConds.push(gte(salesReceipts.date, range.from));
-  if (range?.to) srConds.push(lte(salesReceipts.date, range.to));
-  const srRows = await ctx.db
-    .select({
-      itemId: salesReceiptLines.itemId,
-      quantity: sql<string>`COALESCE(SUM(CAST(${salesReceiptLines.quantity} AS NUMERIC)), 0)`,
-      revenue: sql<string>`COALESCE(SUM(CAST(${salesReceiptLines.amount} AS NUMERIC)), 0)`,
-    })
-    .from(salesReceiptLines)
-    .innerJoin(salesReceipts, eq(salesReceiptLines.salesReceiptId, salesReceipts.id))
-    .innerJoin(items, eq(salesReceiptLines.itemId, items.id))
-    .where(and(...srConds))
-    .groupBy(salesReceiptLines.itemId);
-
-  // Merge invoice + sales-receipt activity per item.
-  const acc = new Map<string, { qty: ReturnType<typeof Money.zero>; revenue: ReturnType<typeof Money.zero> }>();
-  for (const r of [...invRows, ...srRows]) {
-    if (!r.itemId) continue;
-    if (!acc.has(r.itemId)) acc.set(r.itemId, { qty: Money.zero(), revenue: Money.zero() });
-    const a = acc.get(r.itemId)!;
-    a.qty = a.qty.plus(Money.of(r.quantity));
-    a.revenue = a.revenue.plus(Money.of(r.revenue));
+  type Acc = { qty: ReturnType<typeof Money.zero>; revenue: ReturnType<typeof Money.zero>; cogs: ReturnType<typeof Money.zero> };
+  const acc = new Map<string, Acc>();
+  for (const l of lines) {
+    const k = l.itemId ?? '';
+    if (!acc.has(k)) acc.set(k, { qty: Money.zero(), revenue: Money.zero(), cogs: Money.zero() });
+    const a = acc.get(k)!;
+    a.qty = a.qty.plus(l.qty);
+    a.revenue = a.revenue.plus(l.amount);
+    a.cogs = a.cogs.plus(cogsOfSalesLine(l, posted));
   }
 
-  const itemIds = [...acc.keys()];
+  const itemIds = [...acc.keys()].filter(Boolean);
   const itemRows = itemIds.length
     ? await ctx.db
-        .select({
-          id: items.id,
-          name: items.name,
-          sku: items.sku,
-          type: items.type,
-          averageCost: items.averageCost,
-        })
+        .select({ id: items.id, name: items.name, sku: items.sku, type: items.type })
         .from(items)
         .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)))
     : [];
@@ -2187,24 +2231,21 @@ export async function salesByItem(
 
   const rows: SalesByItemRow[] = [];
   for (const [itemId, a] of acc) {
-    const item = itemById.get(itemId);
-    if (!item) continue;
-    const cogs =
-      item.type === 'inventory' && item.averageCost
-        ? Money.round2(a.qty.times(Money.of(item.averageCost)))
-        : Money.zero();
-    const margin = a.revenue.minus(cogs);
+    const item = itemId ? itemById.get(itemId) : undefined;
+    if (itemId && !item) continue;
+    if (!itemId && a.revenue.isZero() && a.qty.isZero()) continue;
+    const margin = a.revenue.minus(a.cogs);
     totQty = totQty.plus(a.qty);
     totRevenue = totRevenue.plus(a.revenue);
-    totCogs = totCogs.plus(cogs);
+    totCogs = totCogs.plus(a.cogs);
     rows.push({
       itemId,
-      itemName: item.name,
-      sku: item.sku,
-      type: item.type,
+      itemName: item?.name ?? '(no item)',
+      sku: item?.sku ?? null,
+      type: item?.type ?? 'other',
       quantity: a.qty.toString(),
       revenue: toAmountString(a.revenue),
-      cogs: toAmountString(cogs),
+      cogs: toAmountString(a.cogs),
       margin: toAmountString(margin),
       marginPct: a.revenue.isZero() ? null : margin.dividedBy(a.revenue).times(100).toFixed(2),
     });
@@ -2362,7 +2403,8 @@ export async function transactionDetail(
     eq(journalEntries.status, 'posted'),
   ];
   if (filters.from) conds.push(gte(journalEntries.date, filters.from));
-  if (filters.to) conds.push(lte(journalEntries.date, filters.to));
+  // Whole "to" day (the P&L / balance sheet bound), so a QuickZoom adds up to the report line.
+  if (filters.to) conds.push(onOrBeforeDay(filters.to));
   if (filters.accountId) conds.push(eq(journalEntryLines.accountId, filters.accountId));
   if (filters.classId) conds.push(eq(journalEntryLines.classId, filters.classId));
   if (filters.search) {

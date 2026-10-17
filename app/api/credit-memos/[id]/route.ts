@@ -1,7 +1,7 @@
 /**
  * GET    /api/credit-memos/:id              — fetch credit memo with lines
  * POST   /api/credit-memos/:id              — actions:
- *           { action: 'apply',  invoiceId, amount }
+ *           { action: 'apply',  invoiceId, amount, date? }
  *           { action: 'refund', bankAccountId, amount, date?, memo? }
  *           { action: 'unapply', applicationId }      — undo one credit application (wave2 sales)
  * PUT/PATCH /api/credit-memos/:id           — edit the memo (void + re-post, wave2 sales C1)
@@ -20,21 +20,13 @@ import {
   unapplyCreditApplication,
 } from '@/lib/services/creditMemos';
 import { ServiceError } from '@/lib/services/_base';
-import { zodErrorBody } from '@/lib/validation/helpers';
+import { parseDateInput, zodErrorBody } from '@/lib/validation/helpers';
 import { createCreditMemoSchema } from '@/lib/validation/creditMemos';
+import { requireJsonObject, serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED' || err.code === 'PERIOD_CLOSED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
   }
   console.error('[credit-memos/[id]/route]', err);
@@ -59,7 +51,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
 
     if (body.action === 'apply') {
       if (!body.invoiceId) {
@@ -69,10 +61,21 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         return NextResponse.json({ error: 'amount is required', code: 'VALIDATION' }, { status: 400 });
       }
 
+      // Optional application date; without it the service dates the application on the later of
+      // the memo's and the invoice's dates.
+      let date: Date | null = null;
+      if (body.date != null && String(body.date).trim() !== '') {
+        date = typeof body.date === 'string' ? parseDateInput(body.date) : null;
+        if (!date) {
+          return NextResponse.json({ error: `date: "${body.date}" is not a valid date`, code: 'VALIDATION' }, { status: 400 });
+        }
+      }
+
       const result = await applyToInvoice(ctx, {
         creditMemoId: id,
         invoiceId: body.invoiceId,
         amount: body.amount,
+        date,
       });
 
       return NextResponse.json(result);

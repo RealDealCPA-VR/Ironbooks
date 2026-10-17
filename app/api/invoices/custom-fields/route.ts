@@ -8,6 +8,7 @@ import { NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getInvoiceCustomFieldDefs } from '@/lib/services/invoices';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 export async function GET() {
   try {
@@ -18,7 +19,7 @@ export async function GET() {
     if (err instanceof ServiceError) {
       return NextResponse.json(
         { error: err.message, code: err.code },
-        { status: err.code === 'FORBIDDEN' ? 403 : 400 },
+        { status: serviceErrorStatus(err.code) },
       );
     }
     console.error('[GET /api/invoices/custom-fields]', err);

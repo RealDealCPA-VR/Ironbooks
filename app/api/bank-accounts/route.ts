@@ -6,15 +6,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listBankAccounts, createBankAccount } from '@/lib/services/bankAccounts';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[bank-accounts] error:', err);
@@ -35,8 +31,8 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    return NextResponse.json(await createBankAccount(ctx, body), { status: 201 });
+    const body = await requireJsonObject(req);
+    return NextResponse.json(await createBankAccount(ctx, body as Parameters<typeof createBankAccount>[1]), { status: 201 });
   } catch (err) {
     return errorResponse(err);
   }

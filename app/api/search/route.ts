@@ -12,6 +12,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { runGlobalSearch } from './queries';
 import { buildResults } from './results';
 import { can, type Area } from '@/lib/permissions/model';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 /** Result type → the area whose 'view' it needs (Users & Roles). Unknown types are dropped. */
 const RESULT_AREA: Record<string, Area> = {
@@ -40,8 +41,8 @@ export async function GET(req: NextRequest) {
     });
     return NextResponse.json({ results });
   } catch (err) {
-    if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
-      return NextResponse.json({ error: err.message, code: err.code }, { status: 403 });
+    if (err instanceof ServiceError) {
+      return NextResponse.json({ error: err.message, code: err.code }, { status: serviceErrorStatus(err.code) });
     }
     console.error('[search] unexpected error:', err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

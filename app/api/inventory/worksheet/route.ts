@@ -8,6 +8,7 @@ import { getServerContext } from '@/lib/context';
 import { physicalWorksheet } from '@/lib/services/inventoryOps';
 import { ServiceError } from '@/lib/services/_base';
 import { csvQuoted } from '@/lib/csv';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 /** Always-quoted, formula-safe cell (lib/csv.ts). */
 function csvEscape(value: string | null | undefined): string {
@@ -50,7 +51,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     if (err instanceof ServiceError) {
       return NextResponse.json(
         { error: err.message, code: err.code },
-        { status: err.code === 'FORBIDDEN' ? 403 : 400 },
+        { status: serviceErrorStatus(err.code) },
       );
     }
     console.error('[GET /api/inventory/worksheet]', err);

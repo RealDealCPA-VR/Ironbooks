@@ -12,7 +12,7 @@ import {
   sendQueuedEmails,
   type SalesFormKind,
 } from '@/lib/services/salesForms';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 
 export async function GET(req: NextRequest) {
   try {
@@ -27,7 +27,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as { action?: unknown; items?: unknown };
+    const body = (await requireJsonObject(req, { optional: true })) as { action?: unknown; items?: unknown };
     const raw = Array.isArray(body.items) ? body.items : [];
     const items: Array<{ kind: SalesFormKind; id: string; to?: string | null }> = [];
     for (const it of raw as Array<Record<string, unknown>>) {

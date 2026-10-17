@@ -16,19 +16,12 @@ import { getServerContext } from '@/lib/context';
 import { inventoryValuation } from '@/lib/services/inventory';
 import { adjustQuantityAtSite } from '@/lib/services/inventorySiteOps';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
-  const statusMap: Record<string, number> = {
-    NOT_FOUND: 404,
-    VALIDATION: 400,
-    UNBALANCED: 400,
-    FORBIDDEN: 403,
-    CONFLICT: 409,
-    PERIOD_CLOSED: 409,
-  };
-  const status = statusMap[err.code] ?? 500;
+  const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
   return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
 }
 
@@ -67,7 +60,7 @@ export async function GET(_req: NextRequest): Promise<NextResponse> {
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
     const { action } = body as { action?: string };
 
     if (!action) {

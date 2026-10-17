@@ -7,19 +7,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getInventoryTransfer, voidInventoryTransfer } from '@/lib/services/inventoryTransfers';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT' || err.code === 'PERIOD_CLOSED'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
     return NextResponse.json(
       { error: err.message, code: err.code, details: err.details },
       { status },
@@ -47,7 +39,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as { action?: string };
+    const body = (await requireJsonObject(req, { optional: true })) as { action?: string };
     if (body.action !== 'void') {
       return NextResponse.json({ error: 'action must be "void"', code: 'VALIDATION' }, { status: 400 });
     }

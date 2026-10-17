@@ -5,7 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { addCollectionNote, listCollectionNotes } from '@/lib/services/incomeTracker';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 
 export async function GET(req: NextRequest) {
   try {
@@ -23,7 +23,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const b = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    const b = (await requireJsonObject(req, { optional: true })) as Record<string, unknown>;
     if (typeof b.customerId !== 'string') {
       return NextResponse.json({ error: 'customerId is required', code: 'VALIDATION' }, { status: 400 });
     }

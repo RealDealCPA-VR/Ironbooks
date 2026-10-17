@@ -14,6 +14,13 @@
 -- untouched (only rows whose account actually changes are written). Groups where the number of
 -- extra lines and matching credit lines differ are ambiguous and left as they are.
 --
+-- Home-currency deposits only. A foreign-currency deposit's lines are in the deposit currency while
+-- its entry credits home amounts, and those are allocated from the converted total (largest
+-- remainder), so neither the raw amount nor round2(amount x rate) pairs its lines reliably: a line
+-- whose foreign amount equals another line's home amount would take that line's account. None
+-- needs repair either: 0037 ran before foreign-currency deposits existed (0043 added
+-- deposits.currency), and every later deposit stores its lines' accounts itself.
+--
 -- Idempotent: once a group matches its entry, re-running pairs it identically and writes nothing.
 -- Only deposit_lines is written; the ledger is read, never changed.
 WITH dl AS (
@@ -28,6 +35,7 @@ WITH dl AS (
 	JOIN "deposits" d ON d."id" = l."deposit_id"
 	WHERE l."payment_id" IS NULL
 		AND d."posted_entry_id" IS NOT NULL
+		AND d."currency" IS NULL
 		AND COALESCE(l."description", '') NOT LIKE 'salesReceipt:%'
 		AND COALESCE(l."description", '') NOT LIKE 'invoicePayment:%'
 		AND COALESCE(l."description", '') NOT LIKE 'cashback:%'

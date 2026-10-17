@@ -574,6 +574,26 @@ async function prepareDeposit(
     }
   }
 
+  // ── dates: money cannot be banked before it was received ──────────────────
+  // A deposit dated before a payment / receipt in it would take it out of Undeposited Funds before
+  // it got there (negative Undeposited Funds, and a bank balance before the money existed).
+  const dayOf = (d: Date | string) => new Date(d).toISOString().slice(0, 10);
+  const depositDay = input.date && !Number.isNaN(new Date(input.date).getTime()) ? dayOf(input.date) : null;
+  if (depositDay) {
+    const items = [
+      ...payRows.map((p) => ({ date: p.date, label: `the payment${p.reference ? ` #${p.reference}` : ''}` })),
+      ...srRows.map((r) => ({ date: r.date, label: `Sales Receipt #${r.refNumber || r.receiptNumber}` })),
+      ...invRows.map((r) => ({ date: r.date, label: `the payment on Invoice #${r.refNumber || r.invoiceNumber}` })),
+    ];
+    const late = items.filter((x) => dayOf(x.date) > depositDay).sort((a, b) => dayOf(b.date).localeCompare(dayOf(a.date)))[0];
+    if (late) {
+      throw validation(
+        `The deposit date (${depositDay}) is before ${late.label}, received ${dayOf(late.date)}. Date the deposit on or after the day the money was received.`,
+        { field: 'date', earliest: dayOf(late.date) },
+      );
+    }
+  }
+
   // ── double-deposit guards (against non-voided deposits only) ─────────────
   if (paymentIds.length > 0) {
     const used = (await usedPaymentIds(ctx, excludeDepositId)).filter((id) => paymentIds.includes(id));

@@ -57,6 +57,8 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertNoActiveLandedCost } from './landedCost';
+import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
+import { valueRemainderAfter } from './inventory';
 import {
   type ServiceContext,
   ServiceError,
@@ -207,6 +209,9 @@ async function receiveStock(
       .set({
         quantityOnHand: newQty.toFixed(4),
         averageCost: newAvg.toFixed(4),
+        // The cents the 4dp average cannot represent stay on record (as bills.ts receivePurchasedStock):
+        // the receipt's entry put round2(qty x unit cost) on the inventory account.
+        ...valueRemainderAfter(item, currentQty, newQty, newAvg, Money.round2(qty.times(unitCost))),
         updatedAt: new Date(),
       })
       .where(eq(items.id, itemId));
@@ -253,8 +258,28 @@ async function reverseStock(
     );
   }
   const newQty = currentQty.minus(qty);
+  const fifoTracked = await isFifoTracked(ctx, itemId);
+  // The receipt's own layers (receiveStock tags them item_receipt:<id>; the reason ends with the id):
+  // exactly what it added, or a CONFLICT when its units were sold / revalued since.
+  const own = fifoTracked
+    ? await takeFromDocumentLayers(ctx, {
+        itemId,
+        itemName: item.name,
+        sourceRefs: [`item_receipt:${reason.slice(reason.lastIndexOf(':') + 1)}`],
+        qty,
+        expectedValue: Money.round2(qty.times(unitCost)),
+        unitCost,
+        action: 'void this item receipt',
+      })
+    : null;
 
-  if (await isFifoTracked(ctx, itemId)) {
+  if (own) {
+    await ctx.db
+      .update(items)
+      .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
+      .where(eq(items.id, itemId));
+  } else if (fifoTracked) {
+    // Older data (layers not tagged with their receipt): cost match, then oldest-first.
     const layers = await ctx.db
       .select()
       .from(inventoryLayers)
@@ -291,6 +316,15 @@ async function reverseStock(
   } else {
     const currentAvg = Money.of(item.averageCost ?? '0');
     const remainingValue = currentQty.times(currentAvg).minus(qty.times(unitCost));
+    // The voided entry takes the receipt's full cost off the inventory account; refuse when the
+    // stock left is worth less (written down / sold at a lower average since) instead of clamping
+    // the average to 0 and leaving the GL below the item's value.
+    if (remainingValue.lessThan(layerRoundingTolerance(currentQty).negated())) {
+      throw new ServiceError(
+        'CONFLICT',
+        `Cannot void this item receipt: the "${item.name}" on hand are valued at ${toAmountString(Money.round2(currentQty.times(currentAvg)))}, less than the ${toAmountString(Money.round2(qty.times(unitCost)))} it added (their cost was written down or the units sold since). Reverse the value adjustment or those sales first.`,
+      );
+    }
     const newAvg = newQty.isZero()
       ? Money.zero()
       : remainingValue.lessThan(0)
@@ -301,6 +335,8 @@ async function reverseStock(
       .set({
         quantityOnHand: newQty.toFixed(4),
         averageCost: newAvg.toFixed(4),
+        // The voided entry took round2(qty x unit cost) off the inventory account.
+        ...valueRemainderAfter(item, currentQty, newQty, newAvg, Money.round2(qty.times(unitCost)).negated()),
         updatedAt: new Date(),
       })
       .where(eq(items.id, itemId));
@@ -784,6 +820,13 @@ export async function convertToBill(
 // ---------------------------------------------------------------------------
 
 export async function voidItemReceipt(ctx: ServiceContext, id: string) {
+  // Load + validate in the same transaction as the void: a double-submitted void (or a void
+  // racing the conversion to a bill) must see the receipt's current status, not take its stock
+  // out and release the PO quantities twice.
+  return inTransaction(ctx, (tx) => voidItemReceiptInTx(tx, id));
+}
+
+async function voidItemReceiptInTx(ctx: ServiceContext, id: string) {
   const [receipt] = await ctx.db
     .select()
     .from(itemReceipts)

@@ -467,10 +467,15 @@ export async function setReviewTaskStatus(
   });
 }
 
-/** Apply an unapplied customer payment / credit memo to the customer's oldest open invoices. */
+/**
+ * Apply an unapplied customer payment / credit memo to the customer's oldest open invoices.
+ * `date` dates the credit-memo applications; without it each one takes the later of the memo's
+ * and the invoice's dates (applyToInvoice), never "today" — which would be refused in an
+ * Accountant's Copy, where today is after the dividing date.
+ */
 export async function autoApplyCustomerCredit(
   ctx: ServiceContext,
-  input: { refType: 'payment' | 'credit_memo'; refId: string },
+  input: { refType: 'payment' | 'credit_memo'; refId: string; date?: Date | null },
 ): Promise<{ applied: string; invoices: number }> {
   let customerId: string;
   let available: ReturnType<typeof Money.zero>;
@@ -511,7 +516,9 @@ export async function autoApplyCustomerCredit(
     if (input.refType === 'payment') {
       await applyPayment(tx, { paymentId: input.refId, applications: apps.map((a) => ({ invoiceId: a.invoiceId, amountApplied: a.amount })) });
     } else {
-      for (const a of apps) await applyToInvoice(tx, { creditMemoId: input.refId, invoiceId: a.invoiceId, amount: a.amount });
+      for (const a of apps) {
+        await applyToInvoice(tx, { creditMemoId: input.refId, invoiceId: a.invoiceId, amount: a.amount, date: input.date ?? null });
+      }
     }
   });
   return { applied: toAmountString(available.minus(left)), invoices: apps.length };

@@ -45,6 +45,8 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertNoActiveLandedCost } from './landedCost';
+import { valueRemainderAfter } from './inventory';
+import { layerRoundingTolerance, purchaseLayerRefs, takeFromDocumentLayers } from './fifo';
 import {
   type ServiceContext,
   ServiceError,
@@ -435,6 +437,8 @@ export interface PurchasedStockLine {
   isInventory: boolean;
   quantity: string | number;
   unitCost: ReturnType<typeof Money.zero> | null;
+  /** The HOME amount the document posted for the line (default round2(quantity × unitCost)). */
+  homeAmount?: string | ReturnType<typeof Money.zero> | null;
 }
 
 /**
@@ -484,11 +488,14 @@ export async function receivePurchasedStock(
       const newAvg = newQty.isZero()
         ? line.unitCost
         : currentQty.times(currentAvg).plus(qty.times(line.unitCost)).dividedBy(newQty);
+      // The cents the 4dp average cannot represent stay on record and leave with the last unit.
+      const posted = line.homeAmount != null ? Money.of(line.homeAmount) : Money.round2(qty.times(line.unitCost));
       await tx.db
         .update(items)
         .set({
           quantityOnHand: newQty.toFixed(4),
           averageCost: newAvg.toFixed(4),
+          ...valueRemainderAfter(item, currentQty, newQty, newAvg, posted),
           updatedAt: new Date(),
         })
         .where(eq(items.id, line.itemId));
@@ -528,7 +535,13 @@ export async function reversePurchasedStock(
   lines: ReceivedStockLine[],
   reason: string,
   docLabel = "this bill's",
+  /**
+   * inventory_layers.source_ref the document's receipt tagged its FIFO layers with (bill:<id>,
+   * expense:<id>). Default: derived from the reason's trailing document id.
+   */
+  layerSourceRef?: string,
 ) {
+  const ownRefs = layerSourceRef ? [layerSourceRef] : purchaseLayerRefs(reason);
   for (const line of lines) {
     if (!line.itemId) continue;
     const [item] = await tx.db
@@ -550,9 +563,28 @@ export async function reversePurchasedStock(
     }
     const newQty = currentQty.minus(qty);
 
-    if (await isFifoTracked(tx, line.itemId)) {
-      // Remove the received quantity from layers — prefer layers at this document's unit cost
-      // (the ones it created), newest first, then fall back to FIFO (oldest-first).
+    const fifoTracked = await isFifoTracked(tx, line.itemId);
+    // The document's own layers (tagged with its sourceRef when received): exactly what it added,
+    // or a CONFLICT when its units were sold / revalued since (fifo.ts takeFromDocumentLayers).
+    const own = fifoTracked
+      ? await takeFromDocumentLayers(tx, {
+          itemId: line.itemId,
+          itemName: item.name,
+          sourceRefs: ownRefs,
+          qty,
+          expectedValue: Money.of(line.homeAmount),
+          unitCost,
+          action: `reverse ${docLabel} receipt`,
+        })
+      : null;
+    if (own) {
+      await tx.db
+        .update(items)
+        .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
+        .where(eq(items.id, line.itemId));
+    } else if (fifoTracked) {
+      // Older data (layers not tagged with their document): prefer layers at this document's unit
+      // cost, newest first, then fall back to FIFO (oldest-first).
       const layers = await tx.db
         .select()
         .from(inventoryLayers)
@@ -595,6 +627,15 @@ export async function reversePurchasedStock(
       // Reverse the weighted-average receipt: back the line's value out of the pool.
       const currentAvg = Money.of(item.averageCost ?? '0');
       const remainingValue = currentQty.times(currentAvg).minus(qty.times(unitCost));
+      // The voided entry takes the line's full amount off the inventory account. When the stock
+      // left is worth less than that (written down, or sold at a lower average since), the GL
+      // would go below the item's value — refuse rather than clamp the average and split them.
+      if (remainingValue.lessThan(layerRoundingTolerance(currentQty).negated())) {
+        throw new ServiceError(
+          'CONFLICT',
+          `Cannot reverse ${docLabel} receipt: the "${item.name}" on hand are valued at ${toAmountString(Money.round2(currentQty.times(currentAvg)))}, less than the ${toAmountString(line.homeAmount)} it added (their cost was written down or the units sold since). Reverse the value adjustment or those sales first.`,
+        );
+      }
       const newAvg = newQty.isZero()
         ? Money.zero()
         : remainingValue.lessThan(0)
@@ -605,6 +646,8 @@ export async function reversePurchasedStock(
         .set({
           quantityOnHand: newQty.toFixed(4),
           averageCost: newAvg.toFixed(4),
+          // The reversal took the line's home amount off the GL.
+          ...valueRemainderAfter(item, currentQty, newQty, newAvg, Money.of(line.homeAmount).negated()),
           updatedAt: new Date(),
         })
         .where(eq(items.id, line.itemId));

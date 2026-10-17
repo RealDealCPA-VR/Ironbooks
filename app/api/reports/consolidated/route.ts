@@ -18,6 +18,7 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { consolidatedPL, consolidatedBalanceSheet } from '@/lib/services/consolidation';
 import { queryDate } from '@/lib/validation/helpers';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 export async function GET(req: NextRequest) {
   try {
@@ -44,16 +45,7 @@ export async function GET(req: NextRequest) {
 
 function mapError(err: unknown): NextResponse {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json(
       { error: err.message, code: err.code, details: err.details },
       { status },

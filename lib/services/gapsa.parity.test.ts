@@ -514,7 +514,7 @@ describe('G1 opening quantity on hand and value', () => {
     expect(keys).toEqual(['openingQuantity', 'openingValue', 'openingAsOf']);
   });
 
-  it('Add/Edit Multiple: posts Dr Inventory Asset / Cr Opening Balance Equity with a FIFO layer', async () => {
+  it('Add/Edit Multiple: posts Dr Inventory Asset / Cr Opening Balance Equity (average cost, no FIFO layer)', async () => {
     const res = await bulkSave(ctx, 'items', [
       { name: 'Bulk Bolt', type: 'inventory', salesPrice: '2.00', openingQuantity: '100', openingValue: '125.00', openingAsOf: '1/15/2026' },
       { name: 'Bulk Nut', type: 'inventory', purchaseCost: '0.40', openingQuantity: '50', openingAsOf: '2026-01-15' },
@@ -534,8 +534,9 @@ describe('G1 opening quantity on hand and value', () => {
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.name, 'Opening Balance Equity')));
     expect(lines.find((l) => l.accountId === obe.id)?.credit).toBe('125.00');
-    const [layer] = await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, bolt.id));
-    expect(layer.quantityRemaining).toBe('100.0000');
+    // Opening stock is average-cost by default (lib/services/lists/openingStock.ts): no FIFO layer,
+    // so the item can still be built, counted and revalued.
+    expect(await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, bolt.id))).toHaveLength(0);
 
     // Value blank: the item's cost values the stock (50 x 0.40).
     const nut = await itemByName('Bulk Nut');
@@ -618,11 +619,11 @@ describe('G1 opening quantity on hand and value', () => {
     const counts = await importIIF(ctx, iif);
     const carried = await itemByName('Iif Carried');
     expect(carried).toBeDefined();
-    // The stock itself arrives (quantity, average cost, FIFO layer)...
+    // The stock itself arrives (quantity, average cost; average-cost item, so no FIFO layer)...
     expect(carried.quantityOnHand).toBe('10.0000');
     expect(carried.averageCost).toBe('50.0000');
     const layers = await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, carried.id));
-    expect(layers.map((l) => [l.quantityRemaining, l.unitCost])).toEqual([['10.0000', '50.0000']]);
+    expect(layers).toHaveLength(0);
     // ...but no journal entry: the ledger already carries the 500.00 through the account's OBAMOUNT.
     expect(await openingEntry(carried.id)).toBeUndefined();
     expect(counts.openingStock).toEqual({ items: 1, value: '500.00', unposted: 1 });
@@ -634,7 +635,7 @@ describe('G1 opening quantity on hand and value', () => {
     await assertBooksBalance();
   });
 
-  it('createItemWithOpeningStock({ postToLedger: false }) builds the layer without posting', async () => {
+  it('createItemWithOpeningStock({ postToLedger: false }) sets the stock without posting', async () => {
     const { item, opening } = await createItemWithOpeningStock(
       ctx,
       { name: 'Carried Direct', type: 'inventory', openingQuantity: '4', openingValue: '10.00', openingAsOf: d('2026-01-05') },

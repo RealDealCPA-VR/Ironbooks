@@ -79,6 +79,7 @@ import {
 } from './docs';
 import { applicationChanges, describeApplication, describeReconciliation, extrasBaselineSql, reconciliationChanges } from './extras';
 import { addFileLabels, labelsOf, loadLabelMaps } from './labels';
+import { isGeneralJournalSource } from './guard';
 
 // ---------------------------------------------------------------------------
 // Open the transfer file (.ibac)
@@ -240,9 +241,8 @@ const ymd = (d: Date) => new Date(d).toISOString().slice(0, 10);
 const sameVersion = (a: Date | null, b: Date | null) => (a ? a.getTime() : null) === (b ? b.getTime() : null);
 const iso = (d: Date | null) => (d ? new Date(d).toISOString() : null);
 
-function isGeneralJournal(sourceRef: string | null): boolean {
-  return sourceRef === null || sourceRef === 'manual' || sourceRef.startsWith('reversal:');
-}
+/** General Journal entries, reversals and Working Trial Balance adjustments (guard.ts). */
+const isGeneralJournal = isGeneralJournalSource;
 
 /**
  * Entity types that are business data but that the changes file can't carry (warned about). The
@@ -254,6 +254,7 @@ const NOT_CARRIED = new Set([
   'loan_payment', 'landed_cost_allocation', 'home_currency_adjustment', 'sales_tax_adjustment',
   'invoice_write_off', 'employee', 'job', 'location', 'sales_rep', 'bank_account',
   'payroll_item', 'tax_rate', 'tax_agency', 'price_level', 'fixed_asset', 'company', 'company_settings', 'fiscal_period',
+  'working_tb_note',
 ]);
 
 /** One line of the accountant's "changes so far" list. */
@@ -314,6 +315,8 @@ export async function expensePayload(ctx: ServiceContext, id: string): Promise<E
   const total = String(e.total);
   return {
     vendorId: e.vendorId,
+    // B3: a payee from the Other Names list (the printed payee text stays in payeeName).
+    otherNameId: e.otherNameId ?? null,
     payeeName: e.vendorId ? null : e.payeeName,
     date: new Date(e.date).toISOString(),
     method: e.method,
@@ -636,6 +639,13 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
       seen.set(r.entityType, (seen.get(r.entityType) ?? 0) + 1);
     }
     for (const [t, n] of seen) {
+      if (t === 'working_tb_note') {
+        // Workpaper references / notes are the accountant's own working papers.
+        warnings.push(
+          `${n} Working Trial Balance workpaper reference(s) / note(s) were saved in this copy. They are not sent back to your client: keep them with your working papers, or put what your client needs in the note of this changes file. (Adjusting entries made from the Working Trial Balance are sent back.)`,
+        );
+        continue;
+      }
       warnings.push(`${n} change(s) to ${entityLabel(t)} records were made in this copy and can't be sent back. Tell your client what to change.`);
     }
   }

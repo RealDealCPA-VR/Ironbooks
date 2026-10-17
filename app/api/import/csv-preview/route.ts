@@ -21,6 +21,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { previewCSV, type CsvMapping } from '@/lib/services/import';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 export async function POST(req: NextRequest) {
   try {
@@ -49,7 +50,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(result, { status: 200 });
   } catch (err) {
     if (err instanceof ServiceError) {
-      const status = err.code === 'FORBIDDEN' ? 403 : err.code === 'VALIDATION' ? 400 : 500;
+      const status = serviceErrorStatus(err.code);
       return NextResponse.json({ error: err.message, code: err.code }, { status });
     }
     console.error('[import/csv-preview]', err);

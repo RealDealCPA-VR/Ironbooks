@@ -22,15 +22,11 @@ import { getServerContext } from '@/lib/context';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { importIIF, importCustomersCSV, importVendorsCSV } from '@/lib/services/qbImport';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'CONFLICT' ? 409
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[qb-import] unexpected error:', err);
@@ -42,7 +38,7 @@ export async function POST(req: NextRequest) {
     const ctx = await getServerContext();
     // QuickBooks list/transaction import: owner/admin, single-user while others are on.
     await assertExclusiveAccess(ctx, 'Import');
-    const body = await req.json() as {
+    const body = await requireJsonObject(req) as {
       format: string;
       kind?: string;
       content: string;

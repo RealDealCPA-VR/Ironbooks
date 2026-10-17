@@ -38,12 +38,14 @@ import AdmZip from 'adm-zip';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { and, eq, inArray, lt, ne, or, sql } from 'drizzle-orm';
+import { and, eq, gte, inArray, lt, ne, or, sql } from 'drizzle-orm';
 import {
   bankTransactions,
+  billPaymentApplications,
   billPayments,
   bills,
   companies,
+  creditApplications,
   creditMemos,
   deposits,
   depreciationEntries,
@@ -57,15 +59,18 @@ import {
   journalEntryLines,
   journalItemApplications,
   paychecks,
+  paymentApplications,
   paymentsReceived,
   reconciliationItems,
   reconciliations,
   salesReceipts,
   salesTaxLineLinks,
   transfers,
+  vendorCreditApplications,
   vendorCredits,
 } from '@/lib/db/schema';
 import { resolveDataDir } from '@/lib/db';
+import { withPlannerStats } from '@/lib/db/plannerStats';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -82,6 +87,8 @@ import { currentFingerprint } from './backupFingerprint';
 import { logTransaction } from './transactionLog';
 import { journalOpenItems } from './journal';
 import { activeCopy } from './accountantCopy/guard';
+import { inventoryValuationDetail } from './inventory';
+import { salesTaxActivity } from './accountant/salesTaxLedger';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -149,12 +156,31 @@ interface SummaryLine {
   currency: string | null;
   foreignAmount: string | null;
   exchangeRate: string | null;
+  /**
+   * Sales tax attribution of a line on a sales-tax liability account (the agency + kind the
+   * condensed lines were attributed to). A sales_tax_line_links row carries it onto the summary
+   * line, so the Sales Tax Liability report keeps owing each agency what it did.
+   */
+  tax?: { agencyId: string | null; kind: 'collected' | 'payment' | 'adjustment' } | null;
 }
+
+/**
+ * What a summary entry stands for. 'main' = the month's general summary. Inventory activity is
+ * summarized per item ('item' → sourceRef item:<id>) or per assembly component move
+ * ('assembly_build' / 'assembly_unbuild' → <kind>:<run>:<from>:<to>), the same source refs the
+ * documents themselves post with, so Inventory Valuation (as of a date) still attributes every
+ * dollar on an inventory asset account to its item after the detail is gone.
+ */
+type SummaryRef =
+  | { kind: 'main' }
+  | { kind: 'item'; itemId: string }
+  | { kind: 'assembly_build' | 'assembly_unbuild'; from: string; to: string };
 
 interface MonthGroup {
   key: string; // YYYY-MM
-  /** Summary entry date: the latest condensed entry date within the month. */
+  /** Summary entry date: the latest condensed entry date within the month (and group). */
   date: Date;
+  ref: SummaryRef;
   lines: SummaryLine[];
 }
 
@@ -216,6 +242,7 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
       id: journalEntries.id,
       date: journalEntries.date,
       status: journalEntries.status,
+      sourceRef: journalEntries.sourceRef,
     })
     .from(journalEntries)
     .where(and(eq(journalEntries.companyId, ctx.companyId), lt(journalEntries.date, cutoff)));
@@ -225,21 +252,99 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
   // 2. Protected entries — documents with an OPEN balance keep their detail.
   const protectedIds = new Set<string>();
   const openStatuses = ['open', 'partial', 'overdue'] as const;
+  // Kept A/R and A/P documents by id: their COGS / restock / refund entries stay with them.
+  const keep = {
+    invoice: new Set<string>(),
+    creditMemo: new Set<string>(),
+    bill: new Set<string>(),
+    vendorCredit: new Set<string>(),
+  };
+  const keepDocs = (set: Set<string>, rows: Array<{ id: string | null; entry: string | null }>) => {
+    for (const r of rows) {
+      if (r.id) set.add(r.id);
+      if (r.entry) protectedIds.add(r.entry);
+    }
+  };
+  keepDocs(keep.invoice, await ctx.db.select({ id: invoices.id, entry: invoices.postedEntryId }).from(invoices)
+    .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.status, [...openStatuses]))));
+  keepDocs(keep.bill, await ctx.db.select({ id: bills.id, entry: bills.postedEntryId }).from(bills)
+    .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.status, [...openStatuses]))));
+  keepDocs(keep.creditMemo, await ctx.db.select({ id: creditMemos.id, entry: creditMemos.postedEntryId }).from(creditMemos)
+    .where(and(
+      eq(creditMemos.companyId, ctx.companyId),
+      or(inArray(creditMemos.status, [...openStatuses]), sql`${creditMemos.unapplied} <> 0`),
+    )));
+  keepDocs(keep.vendorCredit, await ctx.db.select({ id: vendorCredits.id, entry: vendorCredits.postedEntryId }).from(vendorCredits)
+    .where(and(
+      eq(vendorCredits.companyId, ctx.companyId),
+      or(inArray(vendorCredits.status, [...openStatuses]), sql`${vendorCredits.unapplied} <> 0`),
+    )));
+  // 2a. A document settled ON or AFTER the cutoff (a payment, credit, vendor credit, General
+  //     Journal credit or refund dated then) was still open at the cutoff — QB never condenses a
+  //     transaction linked to one after the condense date. Cash-basis reports recognize its income
+  //     / expense on those later settlement dates from its own posted lines, so its detail stays.
+  const late = await Promise.all([
+    ctx.db.select({ invoiceId: paymentApplications.invoiceId }).from(paymentApplications)
+      .innerJoin(paymentsReceived, eq(paymentsReceived.id, paymentApplications.paymentId))
+      .where(and(eq(paymentsReceived.companyId, ctx.companyId), gte(paymentsReceived.date, cutoff))),
+    ctx.db.select({ invoiceId: creditApplications.invoiceId, memoId: creditApplications.creditMemoId }).from(creditApplications)
+      .where(and(eq(creditApplications.companyId, ctx.companyId), gte(creditApplications.date, cutoff))),
+    ctx.db.select({ billId: billPaymentApplications.billId }).from(billPaymentApplications)
+      .innerJoin(billPayments, eq(billPayments.id, billPaymentApplications.billPaymentId))
+      .where(and(eq(billPayments.companyId, ctx.companyId), gte(billPayments.date, cutoff))),
+    ctx.db.select({ billId: vendorCreditApplications.billId, creditId: vendorCreditApplications.vendorCreditId }).from(vendorCreditApplications)
+      .where(and(eq(vendorCreditApplications.companyId, ctx.companyId), gte(vendorCreditApplications.date, cutoff))),
+    ctx.db.select({ invoiceId: journalItemApplications.invoiceId, billId: journalItemApplications.billId }).from(journalItemApplications)
+      .where(and(eq(journalItemApplications.companyId, ctx.companyId), gte(journalItemApplications.date, cutoff))),
+    ctx.db.select({ sourceRef: journalEntries.sourceRef }).from(journalEntries)
+      .where(and(
+        eq(journalEntries.companyId, ctx.companyId),
+        gte(journalEntries.date, cutoff),
+        sql`${journalEntries.sourceRef} LIKE 'refund:%'`,
+      )),
+  ]);
+  const lateInvoices = new Set<string>();
+  const lateBills = new Set<string>();
+  const lateMemos = new Set<string>();
+  const lateCredits = new Set<string>();
+  for (const r of late[0]) lateInvoices.add(r.invoiceId);
+  for (const r of late[1]) { lateInvoices.add(r.invoiceId); lateMemos.add(r.memoId); }
+  for (const r of late[2]) lateBills.add(r.billId);
+  for (const r of late[3]) { lateBills.add(r.billId); lateCredits.add(r.creditId); }
+  for (const r of late[4]) { if (r.invoiceId) lateInvoices.add(r.invoiceId); if (r.billId) lateBills.add(r.billId); }
+  for (const r of late[5]) {
+    const id = (r.sourceRef ?? '').slice('refund:'.length);
+    if (UUID_ONLY_RE.test(id)) { lateMemos.add(id); lateCredits.add(id); }
+  }
+  const lateDocs: Array<[Set<string>, Set<string>, typeof invoices | typeof bills | typeof creditMemos | typeof vendorCredits]> = [
+    [lateInvoices, keep.invoice, invoices],
+    [lateBills, keep.bill, bills],
+    [lateMemos, keep.creditMemo, creditMemos],
+    [lateCredits, keep.vendorCredit, vendorCredits],
+  ];
+  for (const [ids, set, table] of lateDocs) {
+    for (const idChunk of chunks([...ids])) {
+      keepDocs(set, await ctx.db.select({ id: table.id, entry: table.postedEntryId }).from(table)
+        .where(and(eq(table.companyId, ctx.companyId), inArray(table.id, idChunk))));
+    }
+  }
+  //     The COGS entries of a kept invoice (invoice-cogs:<id>), the restock entries of a kept credit
+  //     memo (creditmemo-cogs:<id>) and the refunds of a kept credit belong to the document: the
+  //     cash basis defers and recognizes them with it.
+  for (const e of candidates) {
+    const ref = e.sourceRef ?? '';
+    const i = ref.indexOf(':');
+    const kind = i >= 0 ? ref.slice(0, i) : '';
+    const id = i >= 0 ? ref.slice(i + 1) : '';
+    if (
+      (kind === 'invoice-cogs' && keep.invoice.has(id)) ||
+      (kind === 'creditmemo-cogs' && keep.creditMemo.has(id)) ||
+      (kind === 'refund' && (keep.creditMemo.has(id) || keep.vendorCredit.has(id)))
+    ) {
+      protectedIds.add(e.id);
+    }
+  }
   const protectorQueries = [
-    ctx.db.select({ id: invoices.postedEntryId }).from(invoices)
-      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.status, [...openStatuses]))),
-    ctx.db.select({ id: bills.postedEntryId }).from(bills)
-      .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.status, [...openStatuses]))),
-    ctx.db.select({ id: creditMemos.postedEntryId }).from(creditMemos)
-      .where(and(
-        eq(creditMemos.companyId, ctx.companyId),
-        or(inArray(creditMemos.status, [...openStatuses]), sql`${creditMemos.unapplied} <> 0`),
-      )),
-    ctx.db.select({ id: vendorCredits.postedEntryId }).from(vendorCredits)
-      .where(and(
-        eq(vendorCredits.companyId, ctx.companyId),
-        or(inArray(vendorCredits.status, [...openStatuses]), sql`${vendorCredits.unapplied} <> 0`),
-      )),
     ctx.db.select({ id: paymentsReceived.postedEntryId }).from(paymentsReceived)
       .where(and(eq(paymentsReceived.companyId, ctx.companyId), sql`${paymentsReceived.unapplied} <> 0`)),
     ctx.db.select({ id: itemReceipts.postedEntryId }).from(itemReceipts)
@@ -264,6 +369,35 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
     .innerJoin(journalEntryLines, eq(journalEntryLines.id, salesTaxLineLinks.journalEntryLineId))
     .where(eq(salesTaxLineLinks.companyId, ctx.companyId));
   for (const row of taxLinked) protectedIds.add(row.id);
+  // 2b''. Inventory: which item(s) each candidate entry's inventory-asset postings belong to
+  //       (Inventory Valuation's own attribution). Entries of one item are summarized per item,
+  //       assembly moves per (component, assembly) pair; a document spread over several items
+  //       (a bill / check / receipt for many items) keeps its detail, since a summary could not
+  //       say which item each dollar belongs to.
+  const itemsByEntry = new Map<string, Set<string>>();
+  for (const it of (await inventoryValuationDetail(ctx, { to: cutoff })).items) {
+    for (const m of it.movements) {
+      const set = itemsByEntry.get(m.entryId) ?? new Set<string>();
+      set.add(it.itemId);
+      itemsByEntry.set(m.entryId, set);
+    }
+  }
+  const inventoryRef = new Map<string, SummaryRef>();
+  for (const e of candidates) {
+    const itemSet = itemsByEntry.get(e.id);
+    if (!itemSet || e.status !== 'posted') continue;
+    const ref = e.sourceRef ?? '';
+    const kind = ref.slice(0, Math.max(0, ref.indexOf(':')));
+    if (kind === 'assembly_build' || kind === 'assembly_unbuild') {
+      const [, from, to] = ref.slice(kind.length + 1).split(':');
+      if (from && to) {
+        inventoryRef.set(e.id, { kind, from, to });
+        continue;
+      }
+    }
+    if (itemSet.size === 1) inventoryRef.set(e.id, { kind: 'item', itemId: [...itemSet][0] });
+    else protectedIds.add(e.id);
+  }
   // 2c. Keep applications consistent: a journal entry applied to (or paid by) a document whose
   //     entry is kept must stay too — deleting the entry would cascade-delete the application
   //     while the document still counts it.
@@ -367,9 +501,24 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
     debit: ReturnType<typeof Money.zero>; credit: ReturnType<typeof Money.zero>;
     fDebit: ReturnType<typeof Money.zero>; fCredit: ReturnType<typeof Money.zero>;
     hasForeign: boolean;
+    tax: SummaryLine['tax'];
   };
+  // Summary key (month + what the summary stands for) -> group key -> running totals.
   const monthTotals = new Map<string, Map<string, Totals>>();
   const monthDates = new Map<string, Date>();
+  const summaryInfo = new Map<string, { month: string; ref: SummaryRef }>();
+  const refKey = (r: SummaryRef) =>
+    r.kind === 'main' ? 'main' : r.kind === 'item' ? `item|${r.itemId}` : `${r.kind}|${r.from}|${r.to}`;
+  // Sales tax attribution of every liability line (salesTaxActivity: by document, rate and agency).
+  const LINK_KIND = { collected: 'collected', credited: 'collected', paid: 'payment', adjustment: 'adjustment' } as const;
+  const taxByLine = new Map<string, Array<{ tax: NonNullable<SummaryLine['tax']>; amount: ReturnType<typeof Money.zero> }>>();
+  for (const r of await salesTaxActivity(ctx, { to: cutoff })) {
+    const kind = LINK_KIND[r.kind as keyof typeof LINK_KIND];
+    if (!kind) continue; // unattributed: stays a plain line, as it was
+    const list = taxByLine.get(r.lineId) ?? [];
+    list.push({ tax: { agencyId: r.agencyId, kind }, amount: Money.of(r.amount) });
+    taxByLine.set(r.lineId, list);
+  }
 
   for (const idChunk of chunks(postedIds)) {
     const lines = await ctx.db
@@ -389,23 +538,48 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
       lineIds.push(line.id);
       const entry = entryById.get(line.journalEntryId)!;
       const mk = monthKey(entry.date);
-      const prevDate = monthDates.get(mk);
-      if (!prevDate || entry.date > prevDate) monthDates.set(mk, entry.date);
+      const ref = inventoryRef.get(entry.id) ?? { kind: 'main' as const };
+      const sk = `${mk}|${refKey(ref)}`;
+      if (!summaryInfo.has(sk)) summaryInfo.set(sk, { month: mk, ref });
+      const prevDate = monthDates.get(sk);
+      if (!prevDate || entry.date > prevDate) monthDates.set(sk, entry.date);
 
-      let groups = monthTotals.get(mk);
+      let groups = monthTotals.get(sk);
       if (!groups) {
         groups = new Map();
-        monthTotals.set(mk, groups);
+        monthTotals.set(sk, groups);
       }
-      const gk = `${line.accountId}|${line.classId ?? ''}|${line.currency ?? ''}`;
-      let g = groups.get(gk);
-      if (!g) {
-        g = {
-          accountId: line.accountId, classId: line.classId ?? null, currency: line.currency ?? null,
-          debit: Money.zero(), credit: Money.zero(), fDebit: Money.zero(), fCredit: Money.zero(), hasForeign: false,
-        };
-        groups.set(gk, g);
+      const group = (tax: SummaryLine['tax']) => {
+        const gk = `${line.accountId}|${line.classId ?? ''}|${line.currency ?? ''}|${tax ? `${tax.agencyId ?? ''}:${tax.kind}` : ''}`;
+        let g = groups!.get(gk);
+        if (!g) {
+          g = {
+            accountId: line.accountId, classId: line.classId ?? null, currency: line.currency ?? null,
+            debit: Money.zero(), credit: Money.zero(), fDebit: Money.zero(), fCredit: Money.zero(), hasForeign: false,
+            tax: tax ?? null,
+          };
+          groups!.set(gk, g);
+        }
+        return g;
+      };
+      // A one-sided home-currency line on a sales-tax liability account is split by the agency
+      // (and kind) it was attributed to, so each agency keeps its balance on the summary.
+      const taxParts = taxByLine.get(line.id);
+      const oneSided = (line.debit == null || Money.of(line.debit).isZero()) !== (line.credit == null || Money.of(line.credit).isZero());
+      if (taxParts && line.foreignAmount == null && oneSided) {
+        for (const p of taxParts) {
+          const g = group(p.tax);
+          if (p.amount.greaterThan(0)) {
+            g.credit = g.credit.plus(p.amount);
+            g.fCredit = g.fCredit.plus(p.amount);
+          } else {
+            g.debit = g.debit.plus(p.amount.negated());
+            g.fDebit = g.fDebit.plus(p.amount.negated());
+          }
+        }
+        continue;
       }
+      const g = group(null);
       g.debit = g.debit.plus(Money.of(line.debit));
       g.credit = g.credit.plus(Money.of(line.credit));
       if (line.foreignAmount != null) g.hasForeign = true;
@@ -428,7 +602,7 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
   //    emitted as up-to-two one-sided lines so debit/credit column totals survive).
   const months: MonthGroup[] = [...monthTotals.entries()]
     .sort(([a], [b]) => (a < b ? -1 : 1))
-    .map(([key, groups]) => {
+    .map(([sk, groups]) => {
       const lines: SummaryLine[] = [];
       for (const g of groups.values()) {
         const fx = (home: ReturnType<typeof Money.zero>, foreign: ReturnType<typeof Money.zero>) =>
@@ -442,14 +616,16 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
         // A side with no home amount can still carry a foreign amount (never in practice, but a
         // revaluation-style line is the reverse: home amount, foreign 0). Emit a side whenever
         // either total is non-zero so neither ledger loses anything.
+        const tax = g.tax ? { tax: g.tax } : {};
         if (g.debit.greaterThan(0) || (g.hasForeign && !g.fDebit.isZero())) {
-          lines.push({ accountId: g.accountId, classId: g.classId, debit: toAmountString(g.debit), credit: null, ...fx(g.debit, g.fDebit) });
+          lines.push({ accountId: g.accountId, classId: g.classId, debit: toAmountString(g.debit), credit: null, ...fx(g.debit, g.fDebit), ...tax });
         }
         if (g.credit.greaterThan(0) || (g.hasForeign && !g.fCredit.isZero())) {
-          lines.push({ accountId: g.accountId, classId: g.classId, debit: null, credit: toAmountString(g.credit), ...fx(g.credit, g.fCredit) });
+          lines.push({ accountId: g.accountId, classId: g.classId, debit: null, credit: toAmountString(g.credit), ...fx(g.credit, g.fCredit), ...tax });
         }
       }
-      return { key, date: monthDates.get(key)!, lines };
+      const info = summaryInfo.get(sk)!;
+      return { key: info.month, ref: info.ref, date: monthDates.get(sk)!, lines };
     })
     .filter((m) => m.lines.length > 0);
 
@@ -491,7 +667,7 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
 function toPreview(cutoff: Date, plan: CondensePlan): CondensePreview {
   return {
     beforeDate: cutoff.toISOString().slice(0, 10),
-    months: plan.months.map((m) => m.key),
+    months: [...new Set(plan.months.map((m) => m.key))],
     entriesToCondense: plan.postedIds.length,
     linesToCondense: plan.lineIds.length,
     voidEntriesToDelete: plan.voidIds.length,
@@ -515,6 +691,36 @@ function toPreview(cutoff: Date, plan: CondensePlan): CondensePreview {
  * function writes first. Pass `dryRun: true` for a read-only preview.
  */
 export async function condensePeriod(
+  ctx: ServiceContext,
+  input: CondenseInput,
+): Promise<CondenseResult> {
+  if (input.dryRun) return condensePeriodUnlocked(ctx, input);
+  // One condense at a time per company: a double-submitted condense waits for the first one
+  // (so the two never write the same archive file) and then finds nothing new to condense.
+  // Condensing shrinks the ledger tables: fresh planner statistics afterwards (best-effort).
+  return serializeCondense(ctx.companyId, () =>
+    withPlannerStats(ctx.db, 'condense', () => condensePeriodUnlocked(ctx, input)),
+  );
+}
+
+/** Per-company queue of running condenses (this process; a company folder has one process). */
+const condenseRuns = new Map<string, Promise<unknown>>();
+
+function serializeCondense<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = condenseRuns.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  condenseRuns.set(key, tail);
+  void tail.then(() => {
+    if (condenseRuns.get(key) === tail) condenseRuns.delete(key);
+  });
+  return run;
+}
+
+async function condensePeriodUnlocked(
   ctx: ServiceContext,
   input: CondenseInput,
 ): Promise<CondenseResult> {
@@ -543,6 +749,8 @@ export async function condensePeriod(
   if (plan.postedIds.length === 0 && plan.voidIds.length === 0) {
     throw validation('Nothing to condense before that date.');
   }
+  // Only the summaries of an earlier condense are left: re-condensing them changes nothing.
+  if (await onlyCondensedSummaries(ctx, plan)) throw new ServiceError('CONFLICT', ALREADY_CONDENSED);
   if (!ctx.userId) {
     throw new ServiceError('FORBIDDEN', 'Condense requires an authenticated user.');
   }
@@ -558,10 +766,10 @@ export async function condensePeriod(
   const archivePath = writeCondenseArchive(co?.name, input.dataDir);
 
   const runId = randomUUID();
-  const deletedIds = [...plan.postedIds, ...plan.voidIds];
 
+  let condensed: CondensePreview;
   try {
-    await runCondense(ctx, plan, preview, runId, deletedIds, archivePath);
+    condensed = await runCondense(ctx, cutoff, runId, archivePath);
   } catch (err) {
     // Nothing was condensed (the transaction rolled back) — the archive copy is not needed.
     try {
@@ -581,12 +789,12 @@ export async function condensePeriod(
     dataDir: resolveDataDir(input.dataDir),
     companyId: ctx.companyId,
     companyName: co?.name ?? null,
-    beforeDate: preview.beforeDate,
-    entriesCondensed: preview.entriesToCondense,
+    beforeDate: condensed.beforeDate,
+    entriesCondensed: condensed.entriesToCondense,
     sizeBytes: fs.statSync(archivePath).size,
   });
 
-  return { ...preview, dryRun: false, archivePath, runId };
+  return { ...condensed, dryRun: false, archivePath, runId };
 }
 
 /**
@@ -665,16 +873,47 @@ async function detachForeignReferences(
   }
 }
 
-/** The destructive part of condensePeriod, in one transaction. */
+const ALREADY_CONDENSED =
+  'Everything before that date has already been condensed. Nothing new to condense.';
+
+/** True when every entry a plan would condense is already a condense summary (nothing new). */
+async function onlyCondensedSummaries(ctx: ServiceContext, plan: CondensePlan): Promise<boolean> {
+  if (plan.voidIds.length > 0) return false;
+  for (const idChunk of chunks(plan.postedIds)) {
+    const [row] = await ctx.db
+      .select({ n: sql<number>`COUNT(*)::int` })
+      .from(journalEntries)
+      .where(and(
+        inArray(journalEntries.id, idChunk),
+        sql`COALESCE(${journalEntries.sourceRef}, '') NOT LIKE 'condense:%'`,
+        // Per-item / assembly summaries carry the item's source ref and the run in `reference`.
+        sql`COALESCE(${journalEntries.reference}, '') NOT LIKE 'condense:%'`,
+      ));
+    if ((row?.n ?? 0) > 0) return false;
+  }
+  return true;
+}
+
+/**
+ * The destructive part of condensePeriod, in one transaction. The plan is computed again INSIDE
+ * the transaction (the preview outside it can be stale), so a condense that ran in the meantime
+ * is seen and nothing is summarized twice. Returns the preview of what was actually condensed.
+ */
 async function runCondense(
   ctx: ServiceContext,
-  plan: CondensePlan,
-  preview: CondensePreview,
+  cutoff: Date,
   runId: string,
-  deletedIds: string[],
   archivePath: string,
-): Promise<void> {
-  await inTransaction(ctx, async (tx) => {
+): Promise<CondensePreview> {
+  return inTransaction(ctx, async (tx) => {
+    const plan = await computePlan(tx, cutoff);
+    if (plan.postedIds.length === 0 && plan.voidIds.length === 0) {
+      throw validation('Nothing to condense before that date.');
+    }
+    if (await onlyCondensedSummaries(tx, plan)) throw new ServiceError('CONFLICT', ALREADY_CONDENSED);
+    const preview = toPreview(cutoff, plan);
+    const deletedIds = [...plan.postedIds, ...plan.voidIds];
+
     // Condense is a sanctioned ledger rewrite: it deletes posted lines/entries and replaces
     // them with summaries. The DB still verifies every summary balances at COMMIT, and the
     // balance triggers net the deletes against the inserts (zero change per account).
@@ -755,32 +994,56 @@ async function runCondense(
     let entryNumber = (maxRow?.max ?? 0) + 1;
 
     for (const month of plan.months) {
+      const ref = month.ref;
       const [entry] = await tx.db
         .insert(journalEntries)
         .values({
           companyId: tx.companyId,
           entryNumber: entryNumber++,
           date: month.date,
-          description: `Condensed detail for ${month.key} (condensed through ${preview.beforeDate})`,
+          description:
+            ref.kind === 'main'
+              ? `Condensed detail for ${month.key} (condensed through ${preview.beforeDate})`
+              : `Condensed inventory activity for ${month.key} (condensed through ${preview.beforeDate})`,
           status: 'posted',
-          sourceRef: `condense:${runId}`,
+          // Inventory summaries post under the item's / assembly move's own source ref (that is how
+          // Inventory Valuation attributes them); the run id goes in `reference`.
+          sourceRef:
+            ref.kind === 'main'
+              ? `condense:${runId}`
+              : ref.kind === 'item'
+                ? `item:${ref.itemId}`
+                : `${ref.kind}:${runId}:${ref.from}:${ref.to}`,
+          reference: ref.kind === 'main' ? null : `condense:${runId}`,
           createdBy: tx.userId!,
         })
         .returning();
-      for (const lineChunk of chunks(month.lines, 200)) {
-        await tx.db.insert(journalEntryLines).values(
-          lineChunk.map((l) => ({
-            journalEntryId: entry.id,
-            accountId: l.accountId,
-            classId: l.classId,
-            debit: l.debit,
-            credit: l.credit,
-            currency: l.currency,
-            foreignAmount: l.foreignAmount,
-            exchangeRate: l.exchangeRate,
-            memo: 'Condensed activity',
-          })),
-        );
+      const lineValues = (l: SummaryLine) => ({
+        journalEntryId: entry.id,
+        accountId: l.accountId,
+        classId: l.classId,
+        debit: l.debit,
+        credit: l.credit,
+        currency: l.currency,
+        foreignAmount: l.foreignAmount,
+        exchangeRate: l.exchangeRate,
+        memo: 'Condensed activity',
+      });
+      const plain = month.lines.filter((l) => !l.tax);
+      for (const lineChunk of chunks(plain, 200)) {
+        await tx.db.insert(journalEntryLines).values(lineChunk.map(lineValues));
+      }
+      // Sales tax summary lines keep their agency through a sales_tax_line_links row.
+      for (const l of month.lines.filter((x) => x.tax)) {
+        const [row] = await tx.db.insert(journalEntryLines).values(lineValues(l)).returning({ id: journalEntryLines.id });
+        await tx.db.insert(salesTaxLineLinks).values({
+          companyId: tx.companyId,
+          journalEntryLineId: row.id,
+          agencyId: l.tax!.agencyId,
+          kind: l.tax!.kind,
+          note: `Condensed sales tax activity for ${month.key}`,
+          createdBy: tx.userId!,
+        });
       }
       // Running transaction log: the summary entries are new posted entries.
       await logTransaction(tx.db, {
@@ -801,6 +1064,7 @@ async function runCondense(
       entityId: runId,
       newValues: { ...preview, archivePath },
     });
+    return preview;
   });
 }
 

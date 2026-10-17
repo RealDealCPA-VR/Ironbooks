@@ -31,20 +31,13 @@ import {
   listClearable,
   addStatementAdjustments,
 } from '@/lib/services/reconcile';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 /** Map ServiceErrorCode to an HTTP status. */
 function errResponse(err: ServiceError): NextResponse {
-  const statusMap: Record<string, number> = {
-    NOT_FOUND: 404,
-    VALIDATION: 400,
-    UNBALANCED: 400,
-    FORBIDDEN: 403,
-    CONFLICT: 409,
-    PERIOD_CLOSED: 400,
-  };
   return NextResponse.json(
     { error: err.message, code: err.code, details: err.details ?? null },
-    { status: statusMap[err.code] ?? 500 },
+    { status: serviceErrorStatus(err.code) },
   );
 }
 
@@ -77,7 +70,7 @@ export async function PATCH(
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
     const { action } = body ?? {};
 
     if (action === 'complete') {

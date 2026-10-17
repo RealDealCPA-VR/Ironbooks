@@ -257,7 +257,7 @@ describe('notes, to-dos, billing rates, U/M, tax rate edit, vehicles', () => {
 
 // ---------------------------------------------------------------------------
 describe('opening quantity on hand (G1)', () => {
-  it('posts Inventory vs Opening Balance Equity, opens a FIFO layer, and keeps the books balanced', async () => {
+  it('posts Inventory vs Opening Balance Equity, opens a FIFO layer (openingCosting fifo), and keeps the books balanced', async () => {
     const { item, opening } = await createItemWithOpeningStock(ctx, {
       name: 'Opening Widget',
       type: 'inventory',
@@ -265,7 +265,9 @@ describe('opening quantity on hand (G1)', () => {
       openingQuantity: '10',
       openingValue: '125.50',
       openingAsOf: d('2026-01-01'),
+      openingCosting: 'fifo',
     });
+    expect(opening?.costing).toBe('fifo');
     expect(item.quantityOnHand).toBe('10.0000');
     expect(opening?.value).toBe('125.50');
     const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, opening!.entryId!));
@@ -275,6 +277,22 @@ describe('opening quantity on hand (G1)', () => {
     const layers = await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, item.id));
     expect(layers).toHaveLength(1);
     expect(layers[0].unitCost).toBe('12.5500');
+    await assertBooksBalance();
+  });
+
+  it('defaults to average cost: no FIFO layer, the value rides on averageCost', async () => {
+    const { item, opening } = await createItemWithOpeningStock(ctx, {
+      name: 'Opening Average Widget',
+      type: 'inventory',
+      assetAccountId: acct['1300'],
+      openingQuantity: '10',
+      openingValue: '125.50',
+      openingAsOf: d('2026-01-01'),
+    });
+    expect(opening?.costing).toBe('average');
+    expect(opening?.layerId).toBeNull();
+    expect(item.averageCost).toBe('12.5500');
+    expect(await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, item.id))).toHaveLength(0);
     await assertBooksBalance();
   });
 

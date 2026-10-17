@@ -45,6 +45,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
+import { valueRemainderAfter } from './inventory';
 import { ITEM_RECEIPT_ACCRUAL_CODE, getOrCreateAccrualAccount } from './itemReceipts';
 import {
   type ReceivingSettings,
@@ -831,7 +832,13 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
           const newAvg = onHand.greaterThan(0) && value.greaterThan(0) ? value.dividedBy(onHand) : Money.zero();
           await tx.db
             .update(items)
-            .set({ averageCost: newAvg.toFixed(4), updatedAt: new Date() })
+            .set({
+              averageCost: newAvg.toFixed(4),
+              // The bill capitalized invVariance on the inventory account; what the new book value
+              // does not show of it stays on record as the value remainder (0061).
+              ...valueRemainderAfter(item, onHand, onHand, newAvg, invVariance),
+              updatedAt: new Date(),
+            })
             .where(eq(items.id, l.itemId));
           // Snapshot the stock the variance was spread over so a later void can tell whether
           // any of it has since left inventory (see releaseReceiptBilling).

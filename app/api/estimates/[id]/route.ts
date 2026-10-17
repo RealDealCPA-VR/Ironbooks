@@ -26,6 +26,7 @@ import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createEstimateSchema } from '@/lib/validation/estimates';
+import { requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   // Over-billing an estimate line is a soft warning (QB asks, then lets you go ahead).
@@ -62,7 +63,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
     const { status } = body;
 
     // Full edit (C1): the body is a complete estimate form.
@@ -87,7 +88,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
     const { action } = body;
 
     if (action === 'convert') {

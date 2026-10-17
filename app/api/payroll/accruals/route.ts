@@ -17,14 +17,11 @@ import {
   setEmployeeAccrualPolicy,
   type EmployeeAccrualPolicyInput,
 } from '@/lib/services/payrollReports';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[api/payroll/accruals]', err);
@@ -45,7 +42,7 @@ export async function GET(req: NextRequest) {
 export async function PUT(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json()) as {
+    const body = (await requireJsonObject(req)) as {
       employeeId?: string;
       policy?: EmployeeAccrualPolicyInput | null;
     };

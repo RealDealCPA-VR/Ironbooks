@@ -12,7 +12,7 @@
  * DELETE — void the payment (reverses GL, rolls back invoice balances)
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { serviceErrorBody } from '@/lib/routeErrors';
+import { serviceErrorBody, serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import {
@@ -30,15 +30,7 @@ import { bouncedCheckSchema, receivePaymentSchema } from '@/lib/validation/payme
 
 // Map ServiceError codes to HTTP status codes.
 function errorStatus(code: ServiceError['code']): number {
-  switch (code) {
-    case 'NOT_FOUND':     return 404;
-    case 'VALIDATION':    return 400;
-    case 'UNBALANCED':    return 400;
-    case 'FORBIDDEN':     return 403;
-    case 'CONFLICT':      return 409;
-    case 'PERIOD_CLOSED': return 422;
-    default:              return 500;
-  }
+  return serviceErrorStatus(code, { PERIOD_CLOSED: 422 });
 }
 
 function errorResponse(err: unknown, label: string) {
@@ -69,7 +61,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
 
     switch (body.action) {
       case 'apply': {
@@ -143,7 +135,7 @@ export async function PUT(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json().catch(() => ({}));
+    const body = await requireJsonObject(req, { optional: true });
     const parsed = receivePaymentSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const result = await withVersionCheck(ctx, 'payment_received', id, expectedVersion(req), (c) => updatePayment(c, id, parsed.data));

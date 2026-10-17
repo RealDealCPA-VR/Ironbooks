@@ -53,6 +53,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
+import { valueRemainderAfter } from './inventory';
 
 export type LandedCostMethod = 'quantity' | 'value' | 'weight';
 
@@ -110,15 +111,21 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
 }
 
 /**
- * An item's book value exactly as inventoryValuation reports it (FIFO: remaining layers;
- * average: QOH × average cost; rounded to the cent per item). Landed cost posts the change in
- * this figure so the inventory GL can never drift from valuation through 4dp unit-cost rounding.
+ * An item's book value exactly as inventoryValuation reports it (FIFO: the sum of its layers'
+ * values, each rounded to the cent — inventory.ts fifoLayerValue; average: QOH × average cost
+ * rounded to the cent). Landed cost posts the change in this figure so the inventory GL can never
+ * drift from valuation through 4dp unit-cost rounding.
  */
+/** Change in an average-cost item's book value round2(qty x average) when its average moves. */
+function bookValueDelta(qty: Dec, oldAvg: string | null, newAvg: Dec): Dec {
+  return Money.round2(qty.times(Money.of(newAvg.toFixed(4)))).minus(Money.round2(qty.times(Money.of(oldAvg ?? '0'))));
+}
+
 async function itemBookValue(ctx: ServiceContext, itemId: string, fifo: boolean): Promise<Dec> {
   if (fifo) {
     const [row] = await ctx.db
       .select({
-        value: sql<string>`COALESCE(SUM(${inventoryLayers.quantityRemaining} * ${inventoryLayers.unitCost}), 0)`,
+        value: sql<string>`COALESCE(SUM(ROUND(${inventoryLayers.quantityRemaining} * ${inventoryLayers.unitCost}, 2)), 0)`,
       })
       .from(inventoryLayers)
       .where(and(eq(inventoryLayers.companyId, ctx.companyId), eq(inventoryLayers.itemId, itemId)));
@@ -629,7 +636,13 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
             .toDecimalPlaces(4, Decimal.ROUND_DOWN);
           await tx.db
             .update(items)
-            .set({ averageCost: newAvg.toFixed(4), updatedAt: new Date() })
+            .set({
+              averageCost: newAvg.toFixed(4),
+              // The GL takes exactly the book-value change (below), so the item's value remainder
+              // (0061) is unchanged — carry it over to the new average.
+              ...valueRemainderAfter(item, qoh, qoh, newAvg, bookValueDelta(qoh, item.averageCost, newAvg)),
+              updatedAt: new Date(),
+            })
             .where(eq(items.id, t.itemId));
           quantityAtAllocation = qoh;
         }
@@ -848,9 +861,16 @@ export async function voidLandedCostAllocation(ctx: ServiceContext, id: string) 
           if (!qoh.equals(Money.of(line.quantityAtAllocation)) || !qoh.greaterThan(0)) throw moved();
           const value = qoh.times(Money.of(item.averageCost ?? '0')).minus(inv);
           if (value.isNegative()) throw moved();
+          const restoredAvg = value.dividedBy(qoh);
           await tx.db
             .update(items)
-            .set({ averageCost: value.dividedBy(qoh).toFixed(4), updatedAt: new Date() })
+            .set({
+              averageCost: restoredAvg.toFixed(4),
+              // The void (with its rounding true-up below) moves the GL by exactly the book-value
+              // change, so the value remainder (0061) is carried over to the restored average.
+              ...valueRemainderAfter(item, qoh, qoh, restoredAvg, bookValueDelta(qoh, item.averageCost, restoredAvg)),
+              updatedAt: new Date(),
+            })
             .where(eq(items.id, item.id));
         }
         valueChange = (await itemBookValue(tx, line.itemId, fifoLine)).minus(valueBefore);

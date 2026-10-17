@@ -199,6 +199,27 @@ export async function findDuplicateCheckNumbers(
 }
 
 /**
+ * The number a check is written or printed with: the number the user typed (refused when it is
+ * already used on the account, unless `allowDuplicate`), else the account's next number.
+ * Call it INSIDE the transaction that stores the number: PGlite serializes transactions, so two
+ * checks numbered at the same time see each other and never get the same next number.
+ */
+export async function allocateCheckNumber(
+  tx: ServiceContext,
+  params: {
+    paymentAccountId: string;
+    number?: string | null;
+    exclude?: { source: CheckNumberUse['source']; id: string };
+    allowDuplicate?: boolean;
+    numberField?: string;
+  },
+): Promise<string> {
+  const number = params.number?.trim() || (await nextCheckNumber(tx, params.paymentAccountId));
+  await assertCheckNumberAvailable(tx, { ...params, number });
+  return number;
+}
+
+/**
  * QB duplicate check-number warning, enforced server-side: throws CONFLICT with
  * details { duplicateNumber: true, number, matches } unless `allowDuplicate` is set
  * (the user saw the warning and chose to keep the number).

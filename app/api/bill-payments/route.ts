@@ -30,7 +30,7 @@
  *   else        → 500
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { serviceErrorBody } from '@/lib/routeErrors';
+import { serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { payBillsWithCredits, listBillPayments } from '@/lib/services/billPayments';
 import { ServiceError } from '@/lib/services/_base';
@@ -39,14 +39,7 @@ import { payBillsSchema } from '@/lib/validation/billPayments';
 
 // Map ServiceError codes to HTTP status codes.
 function errorStatus(code: string): number {
-  switch (code) {
-    case 'NOT_FOUND':    return 404;
-    case 'VALIDATION':
-    case 'UNBALANCED':   return 400;
-    case 'FORBIDDEN':    return 403;
-    case 'CONFLICT':     return 409;
-    default:             return 500;
-  }
+  return serviceErrorStatus(code);
 }
 
 // ── GET ───────────────────────────────────────────────────────────────────────

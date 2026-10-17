@@ -85,7 +85,11 @@ const REVENUE_LINE_ONLY = sql`COALESCE(${items.type}::text, '') NOT IN ('subtota
 const keyOf = (jobId: string | null, customerId: string | null) =>
   jobId ? `job:${jobId}` : customerId ? `cust:${customerId}` : null;
 
-/** All revenue / cost facts tagged to a job or customer in the range. */
+/** Home-currency value of a document amount (invoices, bills and checks may be in a foreign currency). */
+const homeOf = (v: string, rate: string | null | undefined): Decimal =>
+  rate && !Money.eq(rate, 1) ? Money.round2(Money.of(v).times(Money.of(rate))) : Money.of(v);
+
+/** All revenue / cost facts tagged to a job or customer in the range (home currency). */
 async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }): Promise<JobFact[]> {
   const c = ctx.companyId;
   const out: JobFact[] = [];
@@ -96,13 +100,21 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     return conds;
   };
   for (const r of await ctx.db
-    .select({ id: invoices.id, num: invoices.invoiceNumber, ref: invoices.refNumber, date: invoices.date, customerId: invoices.customerId, headJob: invoices.jobId, jobId: invoiceLines.jobId, item: items.name, memo: invoiceLines.description, qty: invoiceLines.quantity, amount: invoiceLines.amount })
+    .select({ id: invoices.id, num: invoices.invoiceNumber, ref: invoices.refNumber, date: invoices.date, customerId: invoices.customerId, headJob: invoices.jobId, jobId: invoiceLines.jobId, item: items.name, memo: invoiceLines.description, qty: invoiceLines.quantity, amount: invoiceLines.amount, fx: invoices.exchangeRate })
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
     .leftJoin(items, and(eq(invoiceLines.itemId, items.id), eq(items.companyId, c)))
     .where(and(eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), REVENUE_LINE_ONLY, ...dateConds(invoices.date)))) {
     const k = keyOf(r.jobId ?? r.headJob, r.customerId);
-    if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Invoice', num: docRef(r.ref, r.num), sourceRef: `invoice:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
+    if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Invoice', num: docRef(r.ref, r.num), sourceRef: `invoice:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: homeOf(r.amount, r.fx) });
+  }
+  // Invoice header discounts reduce the job's revenue (posted as a debit to income).
+  for (const r of await ctx.db
+    .select({ id: invoices.id, num: invoices.invoiceNumber, ref: invoices.refNumber, date: invoices.date, customerId: invoices.customerId, jobId: invoices.jobId, discount: invoices.discount, fx: invoices.exchangeRate })
+    .from(invoices)
+    .where(and(eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), sql`${invoices.discount} <> 0`, ...dateConds(invoices.date)))) {
+    const k = keyOf(r.jobId, r.customerId);
+    if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Invoice', num: docRef(r.ref, r.num), sourceRef: `invoice:${r.id}`, itemOrAccount: 'Discount', memo: 'Invoice discount', qty: Money.zero(), amount: homeOf(r.discount, r.fx).negated() });
   }
   for (const r of await ctx.db
     .select({ id: salesReceipts.id, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber, date: salesReceipts.date, customerId: salesReceipts.customerId, jobId: salesReceiptLines.jobId, item: items.name, memo: salesReceiptLines.description, qty: salesReceiptLines.quantity, amount: salesReceiptLines.amount })
@@ -122,23 +134,23 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     out.push({ kind: 'revenue', jobKey: `cust:${r.customerId}`, date: r.date, type: 'Credit Memo', num: docRef(r.ref, r.num), sourceRef: `credit_memo:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty).negated(), amount: Money.of(r.amount).negated() });
   }
   for (const r of await ctx.db
-    .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, item: items.name, account: accounts.name, memo: billLines.description, qty: billLines.quantity, amount: billLines.amount })
+    .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, item: items.name, account: accounts.name, memo: billLines.description, qty: billLines.quantity, amount: billLines.amount, fx: bills.exchangeRate })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
     .leftJoin(items, and(eq(billLines.itemId, items.id), eq(items.companyId, c)))
     .leftJoin(accounts, and(eq(billLines.accountId, accounts.id), eq(accounts.companyId, c)))
     .where(and(eq(bills.companyId, c), ne(bills.status, 'void'), or(isNotNull(billLines.jobId), isNotNull(billLines.customerId)), ...dateConds(bills.date)))) {
     const k = keyOf(r.jobId, r.customerId);
-    if (k) out.push({ kind: 'cost', jobKey: k, date: r.date, type: 'Bill', num: r.num ?? '', sourceRef: `bill:${r.id}`, itemOrAccount: r.item ?? r.account ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
+    if (k) out.push({ kind: 'cost', jobKey: k, date: r.date, type: 'Bill', num: r.num ?? '', sourceRef: `bill:${r.id}`, itemOrAccount: r.item ?? r.account ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: homeOf(r.amount, r.fx) });
   }
   for (const r of await ctx.db
-    .select({ id: expenses.id, num: expenses.reference, date: expenses.date, customerId: expenseLines.customerId, jobId: expenseLines.jobId, account: accounts.name, memo: expenseLines.description, amount: expenseLines.amount })
+    .select({ id: expenses.id, num: expenses.reference, date: expenses.date, customerId: expenseLines.customerId, jobId: expenseLines.jobId, account: accounts.name, memo: expenseLines.description, amount: expenseLines.amount, fx: expenses.exchangeRate })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
     .leftJoin(accounts, and(eq(expenseLines.accountId, accounts.id), eq(accounts.companyId, c)))
     .where(and(eq(expenses.companyId, c), isNull(expenses.voidedAt), or(isNotNull(expenseLines.jobId), isNotNull(expenseLines.customerId)), ...dateConds(expenses.date)))) {
     const k = keyOf(r.jobId, r.customerId);
-    if (k) out.push({ kind: 'cost', jobKey: k, date: r.date, type: 'Check', num: r.num ?? '', sourceRef: `expense:${r.id}`, itemOrAccount: r.account ?? '', memo: r.memo ?? '', qty: Money.of(1), amount: Money.of(r.amount) });
+    if (k) out.push({ kind: 'cost', jobKey: k, date: r.date, type: 'Check', num: r.num ?? '', sourceRef: `expense:${r.id}`, itemOrAccount: r.account ?? '', memo: r.memo ?? '', qty: Money.of(1), amount: homeOf(r.amount, r.fx) });
   }
   return out;
 }

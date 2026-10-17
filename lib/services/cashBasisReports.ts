@@ -16,7 +16,7 @@ import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { notFiscalCloseEntry, profitAndLoss, type ReportLine } from './reports';
-import { cashActivityRows, cashBasisLedger } from './cashBasisLedger';
+import { cashActivityRows, cashBasisLedger, endOfUtcDay } from './cashBasisLedger';
 
 export interface ProfitAndLossCashBasis {
   basis: 'cash';
@@ -45,11 +45,13 @@ export async function profitAndLossCashBasis(
   opts?: { classId?: string },
 ): Promise<ProfitAndLossCashBasis> {
   const accrual = await profitAndLoss(ctx, range, opts);
-  const { adjustments } = await cashBasisLedger(ctx, { to: range?.to });
+  // Whole "to" day, the accrual P&L's bound (postings with a time of day count on their day).
+  const toEnd = range?.to ? endOfUtcDay(range.to) : undefined;
+  const { adjustments } = await cashBasisLedger(ctx, { to: toEnd });
 
   const conds = [eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted'), notFiscalCloseEntry()];
   if (range?.from) conds.push(sql`${journalEntries.date} >= ${range.from}`);
-  if (range?.to) conds.push(lte(journalEntries.date, range.to));
+  if (toEnd) conds.push(lte(journalEntries.date, toEnd));
   if (opts?.classId) conds.push(eq(journalEntryLines.classId, opts.classId));
   const posted = await ctx.db
     .select({
@@ -61,7 +63,7 @@ export async function profitAndLossCashBasis(
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
     .where(and(...conds))
     .groupBy(journalEntryLines.accountId);
-  const adj = cashActivityRows(adjustments, { from: range?.from, to: range?.to, classId: opts?.classId }, 'none');
+  const adj = cashActivityRows(adjustments, { from: range?.from, to: toEnd, classId: opts?.classId }, 'none');
 
   const meta = new Map(
     (

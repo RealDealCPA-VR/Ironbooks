@@ -5,15 +5,21 @@
  * In ONE transaction: create the item, post
  *     Dr Inventory Asset (item.assetAccountId ?? 1300)   value
  *     Cr Opening Balance Equity                          value
- * through postJournalEntry (period-closing rules apply), open a FIFO cost layer dated as-of, and
- * set quantityOnHand / averageCost. The layer's value (quantity × 4-dp unit cost) always equals
- * the posted amount exactly — a total value that cannot be expressed that way is refused with the
- * nearest exact values, so inventory valuation and the general ledger can never drift apart.
+ * through postJournalEntry (period-closing rules apply) and set quantityOnHand / averageCost. The
+ * stock's value (quantity × 4-dp unit cost) always equals the posted amount exactly — a total value
+ * that cannot be expressed that way is refused with the nearest exact values, so inventory
+ * valuation and the general ledger can never drift apart.
+ *
+ * Costing (`openingCosting`): an item is FIFO-tracked exactly when it has inventoryLayers rows,
+ * and the average-cost operations (Build Assemblies, physical count, value adjustment) refuse
+ * FIFO-tracked items. So by default ('average') NO layer is opened: the item stays average-cost,
+ * exactly like the same stock received on a bill. 'fifo' opens a FIFO cost layer dated as-of,
+ * making the item FIFO-tracked from the start.
  *
  * `{ postToLedger: false }` (IIF import only): the general ledger already carries the stock's
  * value because the same import brings in the Inventory Asset account's balance (QuickBooks
- * exports it as the account's OBAMOUNT). The item, FIFO layer and quantityOnHand / averageCost
- * are created exactly the same way but NO journal entry is posted, which would count the value
+ * exports it as the account's OBAMOUNT). The item, quantityOnHand / averageCost (and the FIFO
+ * layer when 'fifo') are created exactly the same way but NO journal entry is posted, which would count the value
  * twice. Matching the item values to that imported balance is then the file's responsibility.
  */
 import { and, eq } from 'drizzle-orm';
@@ -34,6 +40,8 @@ export interface OpeningStockInput {
   openingUnitCost?: string | number | null;
   /** As-of date (defaults to today). */
   openingAsOf?: Date | null;
+  /** 'average' (default: no FIFO layer, the item stays average-cost) or 'fifo' (see module doc). */
+  openingCosting?: 'average' | 'fifo' | null;
 }
 
 interface PlannedOpening {
@@ -108,7 +116,8 @@ export async function createItemWithOpeningStock(
   options: OpeningStockOptions = {},
 ) {
   const postToLedger = options.postToLedger ?? true;
-  const { openingQuantity, openingValue, openingUnitCost, openingAsOf, ...itemInput } = input;
+  const { openingQuantity, openingValue, openingUnitCost, openingAsOf, openingCosting, ...itemInput } = input;
+  const fifo = openingCosting === 'fifo';
   const plan = planOpeningStock(
     { openingQuantity, openingValue, openingUnitCost, openingAsOf },
     itemInput.type ?? 'service',
@@ -136,17 +145,21 @@ export async function createItemWithOpeningStock(
       });
       entryId = entry.id;
     }
-    const [layer] = await tx.db
-      .insert(inventoryLayers)
-      .values({
-        companyId: tx.companyId,
-        itemId: item.id,
-        date: plan.asOf,
-        quantityRemaining: plan.qty.toFixed(4),
-        unitCost: plan.unitCost.toFixed(4),
-        sourceRef: `item_opening:${item.id}`,
-      })
-      .returning();
+    // Average cost (default): no layer — a layer would make the item FIFO-tracked, and Build
+    // Assemblies / physical count / value adjustment would then refuse it.
+    const [layer] = fifo
+      ? await tx.db
+          .insert(inventoryLayers)
+          .values({
+            companyId: tx.companyId,
+            itemId: item.id,
+            date: plan.asOf,
+            quantityRemaining: plan.qty.toFixed(4),
+            unitCost: plan.unitCost.toFixed(4),
+            sourceRef: `item_opening:${item.id}`,
+          })
+          .returning()
+      : [null];
     const [updated] = await tx.db
       .update(items)
       .set({ quantityOnHand: plan.qty.toFixed(4), averageCost: plan.unitCost.toFixed(4), updatedAt: new Date() })
@@ -158,7 +171,8 @@ export async function createItemWithOpeningStock(
       value: toAmountString(plan.value),
       asOf: plan.asOf,
       entryId,
-      layerId: layer.id,
+      costing: fifo ? ('fifo' as const) : ('average' as const),
+      layerId: layer?.id ?? null,
       ...(postToLedger ? {} : { ledgerCarried: true }),
     };
     await writeAudit(tx, {

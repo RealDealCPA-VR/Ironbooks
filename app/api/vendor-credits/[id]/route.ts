@@ -17,23 +17,14 @@ import {
   voidVendorCredit,
   updateVendorCredit,
 } from '@/lib/services/vendorCredits';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createVendorCreditSchema } from '@/lib/validation/vendorCredits';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED' || err.code === 'PERIOD_CLOSED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
   }
   console.error('[vendor-credits/[id]/route]', err);
@@ -80,7 +71,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
 
     if (body.action === 'refund') {
       if (!body.bankAccountId) {
@@ -143,7 +134,7 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json().catch(() => ({}));
+    const body = await requireJsonObject(req, { optional: true });
     const parsed = createVendorCreditSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const credit = await withVersionCheck(ctx, 'vendor_credit', id, expectedVersion(req), (c) => updateVendorCredit(c, id, parsed.data));

@@ -54,6 +54,7 @@ import {
   vendors as vendorsTable,
 } from '@/lib/db/schema';
 import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
+import { refreshPlannerStats } from '@/lib/db/plannerStats';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { createAccount } from './accounts';
 import { createBill } from './bills';
@@ -938,6 +939,8 @@ export async function importOpenItems(ctx: ServiceContext, input: OpenItemsInput
   if (!parsed.items.length) throw validation('No open balances were found in this file.');
   const result = await runConversion(ctx, parsed.side, parsed.items, input);
   for (const w of parsed.warnings) result.issues.push({ entity: parsed.side === 'ar' ? 'invoice' : 'bill', name: 'Report', reason: 'note', message: w });
+  // A bulk load: fresh planner statistics (PGlite has no autovacuum; best-effort).
+  await refreshPlannerStats(ctx.db, 'open items import');
   return result;
 }
 

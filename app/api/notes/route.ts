@@ -7,7 +7,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import { requirePermission } from '@/lib/services/access';
 import { addNote, listNotes, type NoteEntityType } from '@/lib/services/lists/notes';
 import { NOTE_ENTITY_TYPES } from '@/lib/validation/lists';
@@ -32,7 +32,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as { entityType?: string };
+    const body = (await requireJsonObject(req, { optional: true })) as { entityType?: string };
     const area = NOTE_AREA[body.entityType as NoteEntityType];
     if (!area) return NextResponse.json({ error: 'Unknown entity type', code: 'VALIDATION' }, { status: 400 });
     requirePermission(ctx, area, 'modify');

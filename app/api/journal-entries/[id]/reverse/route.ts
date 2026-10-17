@@ -11,6 +11,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { reverseEntry } from '@/lib/services/journal';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -40,16 +41,7 @@ export async function POST(req: NextRequest, { params }: Params) {
 // ---------------------------------------------------------------------------
 function mapError(err: unknown): NextResponse {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT' || err.code === 'PERIOD_CLOSED'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
     return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
   }
   console.error('[journal-entries/[id]/reverse] Unexpected error:', err);

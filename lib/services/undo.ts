@@ -23,34 +23,46 @@
  *      An undo is refused with a plain message when: the token belongs to another user or
  *      company, it was already used, the 30 seconds have passed, or the record changed since
  *      the action (record-locking version moved).
+ *      No undo is armed at all (commitUndo refuses, so no toast) when the inverse could not
+ *      put the books back exactly: a void that released sales-order / purchase-order
+ *      quantities, billed time & costs, item-receipt billing or billed retainage (a copy would
+ *      not be linked again); a Pay Bills save that also applied vendor credits; a Receive
+ *      Payments save that also used earlier payments; a payment edit that took it out of its
+ *      deposit; a create whose response carried no new record id.
  *
  * The token claim, the stale check and the inverse run in ONE database transaction: a failed
  * inverse (closing date, reconciliation, ...) leaves the token usable, so the user can retry
  * with the closing-date password; two clicks can never undo twice.
  */
-import { and, desc, eq, gte, inArray, lt, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, lt, sql } from 'drizzle-orm';
 import {
   accounts,
   auditLogs,
+  billLines,
   billPayments,
   bills,
   creditMemos,
   customers,
   deposits,
   estimates,
+  expenseLines,
   expenses,
+  invoiceLines,
   invoices,
+  itemReceiptBillLines,
   items,
   journalEntries,
   paymentsReceived,
   purchaseOrders,
   salesReceipts,
+  timeEntries,
   transfers,
   undoActions,
   users,
   vendorCredits,
   vendors,
 } from '@/lib/db/schema';
+import { RETAINAGE_ACCOUNT_CODE } from './retainage';
 import { can } from '@/lib/permissions/model';
 import { apiRuleFor } from '@/lib/permissions/routes';
 import { permissionDenied } from './access';
@@ -169,6 +181,13 @@ interface Adapter {
   undoVoid?(ctx: ServiceContext, id: string, before: Snap): Promise<UndoOutcome>;
   /** Inverse of a delete (list records are made inactive; this makes them active again). */
   undoDelete?(ctx: ServiceContext, id: string, before: Snap): Promise<UndoOutcome>;
+  /**
+   * Links a void releases that a re-entered copy can't carry (sales-order / purchase-order
+   * quantities, billed time & costs, item-receipt billing, billed retainage). Read BEFORE the
+   * void (prepareUndo, while the links still exist); a void that released any of them is not
+   * undoable — the copy would leave the order open / the costs unbilled (double billing).
+   */
+  voidLinks?(ctx: ServiceContext, id: string): Promise<string[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +343,18 @@ function billInput(s: Snap): CreateBillInput {
 function expenseInput(s: Snap): CreateExpenseInput {
   return {
     vendorId: str(s.vendorId),
+    // B3: a payee from the Other Names list (payeeName alone would save it as free text).
+    otherNameId: str(s.otherNameId),
     payeeName: str(s.payeeName),
+    // A credit-card credit is stored with a negative total and positive lines (the form sends
+    // isRefund: true); without the flag it would be re-posted as a charge.
+    isRefund: (() => {
+      try {
+        return Money.of(String(s.total ?? 0)).isNegative();
+      } catch {
+        return false;
+      }
+    })(),
     date: reqDate(s.date),
     method: (str(s.method) ?? 'check') as CreateExpenseInput['method'],
     reference: str(s.reference),
@@ -366,6 +396,13 @@ function depositInput(s: Snap): CreateDepositInput {
       cashBack = { accountId: desc.slice(CASHBACK_LINE_PREFIX.length).trim(), amount: Money.of(String(l.amount)).negated().toFixed(2) };
     } else if (l.accountId) {
       extraLines.push({ accountId: String(l.accountId), amount: String(l.amount), description: str(l.description) });
+    } else {
+      // A line from an older version with no account: re-entering without it would change the
+      // deposit total, so refuse (as removePaymentFromDeposit does) instead of dropping it.
+      throw new ServiceError(
+        'CONFLICT',
+        'Can’t undo: this deposit has a line from an older version that can’t be re-entered automatically. Open the deposit to change it by hand.',
+      );
     }
   }
   return {
@@ -635,6 +672,8 @@ function customerPatch(s: Snap): UpdateCustomerInput {
     salesTaxCodeId: str(s.salesTaxCodeId),
     resaleNumber: str(s.resaleNumber),
     taxExemptionReason: str(s.taxExemptionReason),
+    // B12: the customer form sends the price level too (only re-checked when it changes).
+    priceLevelId: str(s.priceLevelId),
   };
 }
 
@@ -695,6 +734,7 @@ function ledgerDoc(params: {
   update: (ctx: ServiceContext, id: string, s: Snap) => Promise<unknown>;
   create: (ctx: ServiceContext, s: Snap) => Promise<unknown>;
   describe?: (s: Snap) => string;
+  voidLinks?: (ctx: ServiceContext, id: string) => Promise<string[]>;
 }): Adapter {
   const describe = params.describe ?? ((s: Snap) => named(params.noun, docNo(s, ...params.numberKeys)));
   return {
@@ -704,6 +744,7 @@ function ledgerDoc(params: {
     list: false,
     snapshot: async (ctx, id) => toJson(await params.get(ctx, id)),
     describe,
+    ...(params.voidLinks ? { voidLinks: params.voidLinks } : {}),
     async undoCreate(ctx, id, snap) {
       await params.void(ctx, id);
       return { message: `Undone: ${describe(snap)} was voided. (Saved transactions can't be deleted; the void keeps the record of it.)` };
@@ -728,6 +769,114 @@ function ledgerDoc(params: {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Links a void releases (read before the void; see Adapter.voidLinks)
+// ---------------------------------------------------------------------------
+
+/** Audit-trail claims a sales order / purchase order keeps for the documents made from it. */
+async function hasOrderClaim(
+  ctx: ServiceContext,
+  entityType: 'sales_order' | 'purchase_order',
+  docKey: 'invoiceId' | 'billId',
+  qtyKey: 'invoicedQuantities' | 'billedQuantities',
+  id: string,
+): Promise<boolean> {
+  const [row] = await ctx.db
+    .select({ id: auditLogs.id })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, entityType),
+        // Keys are fixed literals from the union types above (never user input).
+        sql`${auditLogs.newValues}->>${sql.raw(`'${docKey}'`)} = ${id}`,
+        sql`${auditLogs.newValues}->${sql.raw(`'${qtyKey}'`)} IS NOT NULL`,
+      ),
+    )
+    .limit(1);
+  return Boolean(row);
+}
+
+/** Invoice: sales-order quantities, billed time & costs, billed retainage (voidInvoice releases them). */
+async function invoiceVoidLinks(ctx: ServiceContext, id: string): Promise<string[]> {
+  const links: string[] = [];
+  if (await hasOrderClaim(ctx, 'sales_order', 'invoiceId', 'invoicedQuantities', id)) links.push('sales-order quantities');
+  const [bill] = await ctx.db.select({ id: billLines.id }).from(billLines).where(eq(billLines.billedInvoiceId, id)).limit(1);
+  const [check] = await ctx.db
+    .select({ id: expenseLines.id })
+    .from(expenseLines)
+    .where(eq(expenseLines.billedInvoiceId, id))
+    .limit(1);
+  const [time] = await ctx.db
+    .select({ id: timeEntries.id })
+    .from(timeEntries)
+    .where(and(eq(timeEntries.companyId, ctx.companyId), eq(timeEntries.invoicedInvoiceId, id)))
+    .limit(1);
+  if (bill || check || time) links.push('billable time and costs');
+  // Billing retainage = a line on Retainage Receivable (retainage.ts); the void puts it back on
+  // hold, and a copy would bill it again without the open-retainage check.
+  const [retainage] = await ctx.db
+    .select({ id: invoiceLines.id })
+    .from(invoiceLines)
+    .innerJoin(accounts, eq(accounts.id, invoiceLines.accountId))
+    .where(
+      and(
+        eq(invoiceLines.invoiceId, id),
+        eq(accounts.companyId, ctx.companyId),
+        eq(accounts.code, RETAINAGE_ACCOUNT_CODE),
+      ),
+    )
+    .limit(1);
+  if (retainage) links.push('billed retainage');
+  return links;
+}
+
+/** Bill: purchase-order quantities, item-receipt billing, lines already billed to a customer. */
+async function billVoidLinks(ctx: ServiceContext, id: string): Promise<string[]> {
+  const links: string[] = [];
+  if (await hasOrderClaim(ctx, 'purchase_order', 'billId', 'billedQuantities', id)) links.push('purchase-order quantities');
+  const [receipt] = await ctx.db
+    .select({ id: itemReceiptBillLines.id })
+    .from(itemReceiptBillLines)
+    .where(and(eq(itemReceiptBillLines.companyId, ctx.companyId), eq(itemReceiptBillLines.billId, id)))
+    .limit(1);
+  if (receipt) links.push('received items (item receipts)');
+  const [billed] = await ctx.db
+    .select({ id: billLines.id })
+    .from(billLines)
+    .where(and(eq(billLines.billId, id), isNotNull(billLines.billedInvoiceId)))
+    .limit(1);
+  if (billed) links.push('billable costs already billed to a customer');
+  return links;
+}
+
+/** Check / expense: lines already billed to a customer (a copy would offer them again). */
+async function expenseVoidLinks(ctx: ServiceContext, id: string): Promise<string[]> {
+  const [billed] = await ctx.db
+    .select({ id: expenseLines.id })
+    .from(expenseLines)
+    .where(and(eq(expenseLines.expenseId, id), isNotNull(expenseLines.billedInvoiceId)))
+    .limit(1);
+  return billed ? ['billable costs already billed to a customer'] : [];
+}
+
+/** Snapshot key holding the links found by prepareUndo for a void. */
+const VOID_LINKS_KEY = '__voidLinks';
+
+function voidLinksOf(snap: unknown): string[] {
+  const v = snap && typeof snap === 'object' ? (snap as Snap)[VOID_LINKS_KEY] : undefined;
+  return Array.isArray(v) ? v.map(String) : [];
+}
+
+function voidLinksError(a: Adapter, links: string[]): ServiceError {
+  const list = links.length > 1 ? `${links.slice(0, -1).join(', ')} and ${links[links.length - 1]}` : links[0];
+  return new ServiceError(
+    'CONFLICT',
+    `Can't undo this void: the ${a.noun} had linked ${list}, which the void released. A copy re-entered by Undo would not be linked to them again, so re-enter the ${a.noun} instead.`,
+    { voidLinks: links },
+  );
+}
+
 const ADAPTERS: Record<string, Adapter> = {
   invoices: ledgerDoc({
     entity: 'invoice',
@@ -738,6 +887,7 @@ const ADAPTERS: Record<string, Adapter> = {
     void: voidInvoice,
     update: (ctx, id, s) => updateInvoice(ctx, id, invoiceInput(s)),
     create: (ctx, s) => createInvoice(ctx, invoiceInput(s)),
+    voidLinks: invoiceVoidLinks,
   }),
   bills: ledgerDoc({
     entity: 'bill',
@@ -749,6 +899,7 @@ const ADAPTERS: Record<string, Adapter> = {
     update: (ctx, id, s) => updateBill(ctx, id, billInput(s)),
     create: (ctx, s) => createBill(ctx, billInput(s)),
     describe: (s) => (s.billNumber ? `bill ${s.billNumber}` : `bill for ${money(s.total)}`),
+    voidLinks: billVoidLinks,
   }),
   expenses: ledgerDoc({
     entity: 'expense',
@@ -759,6 +910,7 @@ const ADAPTERS: Record<string, Adapter> = {
     void: voidExpense,
     update: (ctx, id, s) => updateExpense(ctx, id, expenseInput(s)),
     create: (ctx, s) => createExpense(ctx, expenseInput(s)),
+    voidLinks: expenseVoidLinks,
     describe: (s) =>
       s.method === 'check'
         ? `check${s.reference ? ` ${s.reference}` : ''} for ${money(s.total)}`
@@ -1119,6 +1271,11 @@ export async function prepareUndo(
   assertId(input.id);
   assertRoutePermission(ctx, `/api/${a.resource}/${input.id}`, 'GET');
   const snap = await a.snapshot(ctx, input.id);
+  // A void releases these links, so they can only be seen now (commitUndo refuses to arm).
+  if (input.kind === 'void' && a.voidLinks) {
+    const links = await a.voidLinks(ctx, input.id);
+    if (links.length) snap[VOID_LINKS_KEY] = links;
+  }
   await pruneOld(ctx);
   const [row] = await ctx.db
     .insert(undoActions)
@@ -1179,6 +1336,54 @@ async function auditSince(
   return row ?? null;
 }
 
+/**
+ * Effects of the SAME save that the inverse can't take back, or null. A save runs in one
+ * database transaction, so every audit row it wrote carries the same created_at (now() is the
+ * transaction start time); compared in SQL, at full precision.
+ *   - Pay Bills: vendor credits applied to bills (not linked to the payment, so voiding it
+ *     leaves them applied).
+ *   - Receive Payments: earlier unapplied payments applied to invoices (paymentCredits).
+ *   - Payment edit: the payment was taken out of its bank deposit (removeFromDeposit).
+ */
+async function unreversibleEffects(
+  ctx: ServiceContext,
+  a: Adapter,
+  entityId: string,
+  auditId: string,
+  userId: string,
+): Promise<string | null> {
+  if (a.resource !== 'payments' && a.resource !== 'bill-payments') return null;
+  const rows = await ctx.db
+    .select({ entityType: auditLogs.entityType, entityId: auditLogs.entityId, newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.userId, userId),
+        sql`${auditLogs.createdAt} = (SELECT a2.created_at FROM audit_logs a2 WHERE a2.id = ${auditId}::uuid)`,
+      ),
+    );
+  if (a.resource === 'bill-payments') {
+    return rows.some((r) => r.entityType === 'vendor_credit')
+      ? "Can't undo: this Pay Bills save also applied vendor credits to bills, and Undo can only void the payment. Unapply the credits from the bills and void the payment by hand instead."
+      : null;
+  }
+  if (rows.some((r) => r.entityType === 'payment_received' && r.entityId !== entityId)) {
+    return "Can't undo: this save also applied the customer's earlier payments to invoices, and Undo can only reverse this payment. Unapply them and change the payment by hand instead.";
+  }
+  const tookOutOfDeposit =
+    rows.some((r) => r.entityType === 'deposit') ||
+    rows.some(
+      (r) =>
+        r.entityType === 'payment_received' &&
+        r.entityId === entityId &&
+        (r.newValues as { deposit?: unknown } | null)?.deposit === 'removed',
+    );
+  return tookOutOfDeposit
+    ? "Can't undo: this edit also took the payment out of its bank deposit, and Undo can't put it back into that deposit. Change the payment and the deposit by hand instead."
+    : null;
+}
+
 export interface ArmedUndo {
   token: string;
   label: string;
@@ -1193,10 +1398,13 @@ const VERB: Record<UndoKind, string> = { create: 'saved', update: 'changed', voi
 
 /**
  * Arm an undo once the action succeeded. For update / void / delete pass the token from
- * prepareUndo; for a create pass the new record's id (or nothing: the newest record of that
- * type this user created in the last few seconds is used — only when no id is supplied; a
- * supplied id that this user did not just create is refused, never swapped for another record). The audit trail must show that THIS
- * user changed the record after the snapshot — otherwise nothing is armed.
+ * prepareUndo; for a create pass the new record's id. A create without an id (a save that
+ * recorded no new document, e.g. Pay Bills that only applied credits) or with an id this user
+ * did not just create is refused — never guessed or swapped for another record. The audit trail
+ * must show that THIS user changed the record after the snapshot — otherwise nothing is armed.
+ * Also refused (no Undo offered) when the save had linked effects the inverse can't reverse:
+ * a void that released order / billing links, credits or earlier payments applied in the same
+ * Pay Bills / Receive Payments save, a payment edit that took it out of its deposit.
  */
 export async function commitUndo(
   ctx: ServiceContext,
@@ -1211,37 +1419,18 @@ export async function commitUndo(
     new ServiceError('CONFLICT', `There is nothing to undo: the ${a.noun} was not changed by you just now.`);
 
   if (input.kind === 'create') {
-    const supplied = input.id !== undefined && input.id !== null && input.id !== '';
-    let id = supplied && typeof input.id === 'string' && UUID_RE.test(input.id) ? input.id : null;
+    // The id must be one this user just created. No id (the save recorded no new document) or
+    // another record's id: never guess — offering to undo something else (an earlier save) is
+    // worse than offering nothing.
+    const id = typeof input.id === 'string' && UUID_RE.test(input.id) ? input.id : null;
+    if (!id) throw notDone();
     const recent = new Date(Date.now() - CREATE_MATCH_MS);
-    // An id was given but it is not a record this user just created (a wrong nested id, or two
-    // quick saves): never guess another record — offering to undo something else is worse than
-    // offering nothing.
-    if (supplied && !id) throw notDone();
-    let created = id ? await auditSince(ctx, a.entity, id, userId, recent, ['create']) : null;
-    if (supplied && !created) throw notDone();
-    if (!supplied) {
-      // No id in the response: use the newest record of this type the user created a moment ago.
-      const [row] = await ctx.db
-        .select()
-        .from(auditLogs)
-        .where(
-          and(
-            eq(auditLogs.companyId, ctx.companyId),
-            eq(auditLogs.entityType, a.entity),
-            eq(auditLogs.userId, userId),
-            eq(auditLogs.action, 'create'),
-            gte(auditLogs.createdAt, recent),
-          ),
-        )
-        .orderBy(desc(auditLogs.createdAt))
-        .limit(1);
-      created = row ?? null;
-      id = row?.entityId ?? null;
-    }
-    if (!created || !id) throw notDone();
+    const created = await auditSince(ctx, a.entity, id, userId, recent, ['create']);
+    if (!created) throw notDone();
     // Someone else already changed the new record: undoing would throw their work away.
     if (await lastChangedByOther(ctx, a.entity, id, userId)) throw notDone();
+    const effects = await unreversibleEffects(ctx, a, id, created.id, userId);
+    if (effects) throw new ServiceError('CONFLICT', effects);
     const snap = await a.snapshot(ctx, id);
     const version = await currentVersion(ctx, a.entity, id);
     await pruneOld(ctx);
@@ -1272,9 +1461,16 @@ export async function commitUndo(
     .where(and(eq(undoActions.id, input.token), eq(undoActions.companyId, ctx.companyId)));
   if (!tok || tok.userId !== userId) throw notFound('Undo');
   if (tok.status !== 'pending' || tok.kind !== input.kind || tok.entityType !== a.entity) throw notDone();
+  // A void that released order / billing links can't be undone (see Adapter.voidLinks).
+  const links = input.kind === 'void' ? voidLinksOf(tok.snapshot) : [];
+  if (links.length) throw voidLinksError(a, links);
   let entityId = tok.entityId!;
   const audit = await auditSince(ctx, a.entity, entityId, userId, tok.createdAt);
   if (!audit || (await lastChangedByOther(ctx, a.entity, entityId, userId))) throw notDone();
+  if (input.kind === 'update') {
+    const effects = await unreversibleEffects(ctx, a, entityId, audit.id, userId);
+    if (effects) throw new ServiceError('CONFLICT', effects);
+  }
   // Editing a journal entry replaces it with a new entry (lib/services/journal.ts updateEntry).
   if (a.entity === 'journal_entry' && input.kind === 'update') {
     const replacedBy = (audit.newValues as { replacedBy?: unknown } | null)?.replacedBy;
@@ -1344,6 +1540,9 @@ export async function performUndo(ctx: ServiceContext, token: string): Promise<U
   assertRoutePermission(ctx, path, method);
   // Accountant's Copy (accountant side): only undo what the copy could have saved itself.
   await assertAccountantCopyAllowsPath(ctx.db, ctx.companyId, path);
+  // A void that released order / billing links is never re-entered (commitUndo already refuses).
+  const links = kind === 'void' ? voidLinksOf(tok.snapshot) : [];
+  if (links.length) throw voidLinksError(a, links);
 
   const result = await inTransaction(ctx, async (tx) => {
     // Claim the token first: a second click (or a second tab) finds nothing to claim.

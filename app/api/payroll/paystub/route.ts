@@ -13,15 +13,12 @@ import { renderPaystubPdf } from '@/lib/pdf/paystub';
 import { payStubData } from '@/lib/services/payroll';
 import { and, eq } from 'drizzle-orm';
 import { paychecks, employees, companies } from '@/lib/db/schema';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
     const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+      serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[payroll/paystub] unexpected error:', err);

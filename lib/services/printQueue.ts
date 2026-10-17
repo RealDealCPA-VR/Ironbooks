@@ -76,7 +76,7 @@ import {
 } from './_base';
 import { markExpensePrinted } from './expenses';
 import { markBillPaymentPrinted } from './billPayments';
-import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { allocateCheckNumber } from './checkNumbers';
 import { markPaymentCheckPrinted } from './liabilityPayments';
 import { assertClosedPeriodEdit } from './postedEdit';
 
@@ -303,6 +303,14 @@ export async function markPaycheckPrinted(
   ctx: ServiceContext,
   input: { paycheckId: string; checkNumber?: string; allowDuplicateNumber?: boolean },
 ) {
+  // Load, number and stamp in one transaction (two checks printed at once get different numbers).
+  return inTransaction(ctx, (tx) => markPaycheckPrintedInTx(tx, input));
+}
+
+async function markPaycheckPrintedInTx(
+  ctx: ServiceContext,
+  input: { paycheckId: string; checkNumber?: string; allowDuplicateNumber?: boolean },
+) {
   const [pc] = await ctx.db
     .select()
     .from(paychecks)
@@ -312,10 +320,9 @@ export async function markPaycheckPrinted(
   if (!pc.toPrint) throw new ServiceError('CONFLICT', 'This paycheck is not in the print queue.');
   const checking = await checkingAccount(ctx);
   if (!checking) throw notFound('Checking account (1000)');
-  const checkNumber = input.checkNumber?.trim() || (await nextCheckNumber(ctx, checking.id));
-  await assertCheckNumberAvailable(ctx, {
+  const checkNumber = await allocateCheckNumber(ctx, {
     paymentAccountId: checking.id,
-    number: checkNumber,
+    number: input.checkNumber,
     exclude: { source: 'paycheck', id: pc.id },
     allowDuplicate: input.allowDuplicateNumber,
   });

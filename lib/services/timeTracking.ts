@@ -369,6 +369,15 @@ export async function markTimeEntriesPaidInPayroll(
   entryIds: string[],
   paycheckId: string,
 ) {
+  // Check "not paid yet" in the same transaction as the tagging (no double-pay between two runs).
+  return inTransaction(ctx, (tx) => markTimeEntriesPaidInPayrollInTx(tx, entryIds, paycheckId));
+}
+
+async function markTimeEntriesPaidInPayrollInTx(
+  ctx: ServiceContext,
+  entryIds: string[],
+  paycheckId: string,
+) {
   const ids = [...new Set(entryIds)];
   if (ids.length === 0) return [];
 

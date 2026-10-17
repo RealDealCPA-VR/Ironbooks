@@ -6,14 +6,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { runTrackerAction, type TrackerAction } from '@/lib/services/incomeTracker';
-import { routeError } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 
 const ACTIONS: TrackerAction[] = ['email', 'queue_print', 'queue_email', 'convert'];
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = (await requireJsonObject(req, { optional: true })) as Record<string, unknown>;
     if (!ACTIONS.includes(body.action as TrackerAction)) {
       return NextResponse.json({ error: 'Unknown action.', code: 'VALIDATION' }, { status: 400 });
     }

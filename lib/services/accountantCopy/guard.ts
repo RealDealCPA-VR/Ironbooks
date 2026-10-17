@@ -103,11 +103,13 @@ function importing(copy: ActiveCopy): boolean {
  * General Journal entries and reversals, transfers (which post without a source), checks /
  * expenses, deposits, sales forms and their COGS, received payments (posted as customer:<id> /
  * payment:<id>), bills, bill payments (vendor:<id>), vendor credits, item receipts, inventory
- * adjustments (item:<id>) and a reconciliation's service charge / interest. Refunds, bounced
- * checks, paychecks, loans, fixed assets, condense, imports … are not carried back.
+ * adjustments (item:<id>) and a reconciliation's service charge / interest. Working Trial Balance
+ * adjustments (adjusting:wtb) travel as General Journal entries. Refunds, bounced checks,
+ * paychecks, loans, fixed assets, condense, imports … are not carried back.
  */
 const ACCOUNTANT_SOURCES = [
   'reversal:',
+  'adjusting:',
   'expense:',
   'deposit:',
   'invoice:',
@@ -131,6 +133,15 @@ const ACCOUNTANT_SOURCES = [
 export function accountantMayPost(sourceRef: string | null): boolean {
   if (sourceRef === null || sourceRef === 'manual') return true;
   return ACCOUNTANT_SOURCES.some((p) => sourceRef.startsWith(p));
+}
+
+/**
+ * Entries the changes file carries as General Journal entries: user-authored entries, reversals
+ * and Working Trial Balance adjustments ("Make adjustments", sourceRef adjusting:wtb — the client's
+ * import posts them as adjusting General Journal entries, which the WTB counts as adjustments).
+ */
+export function isGeneralJournalSource(sourceRef: string | null): boolean {
+  return sourceRef === null || sourceRef === 'manual' || sourceRef.startsWith('reversal:') || sourceRef.startsWith('adjusting:');
 }
 
 /** What an accountant can do in the copy (used in refusals). */
@@ -165,10 +176,10 @@ export async function assertAccountantMayVoidEntry(
   ctx: Pick<ServiceContext, 'db' | 'companyId'>,
   sourceRef: string | null,
 ): Promise<void> {
-  if (sourceRef === null || sourceRef === 'manual' || sourceRef.startsWith('reversal:')) return;
+  if (isGeneralJournalSource(sourceRef)) return;
   const copy = await activeCopy(ctx.db, ctx.companyId);
   if (!copy || copy.side !== 'accountant') return;
-  const adjustment = sourceRef.startsWith('item:');
+  const adjustment = sourceRef!.startsWith('item:');
   throw new ServiceError(
     'FORBIDDEN',
     adjustment

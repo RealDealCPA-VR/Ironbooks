@@ -6,11 +6,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listTaxRates, createTaxRate } from '@/lib/services/salesTax';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject, assertStringFields } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404 : err.code === 'VALIDATION' ? 400 : err.code === 'FORBIDDEN' ? 403 : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[tax-rates] error:', err);
@@ -29,8 +29,9 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    return NextResponse.json(await createTaxRate(ctx, body), { status: 201 });
+    const body = await requireJsonObject(req);
+    assertStringFields(body, ['name']);
+    return NextResponse.json(await createTaxRate(ctx, body as Parameters<typeof createTaxRate>[1]), { status: 201 });
   } catch (err) {
     return errorResponse(err);
   }

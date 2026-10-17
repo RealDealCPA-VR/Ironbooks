@@ -3,8 +3,9 @@
  *
  *  - salesTaxLiabilityByAgency allocates collected invoice tax to agencies via
  *    combined-rate components and nets payments stamped "tax_agency:<id>".
- *  - paySalesTax debits the agency's own liabilityAccountId when set, falling
- *    back to the company-wide 2200 otherwise.
+ *  - paySalesTax always debits 2200 Sales Tax Payable, where the sales credited the tax — also
+ *    for an agency with its own liabilityAccountId (review4: debiting that account left it
+ *    negative and 2200 overstated, since invoices never post there).
  *  - createTaxAgency rejects viewer contexts without persisting a row, and
  *    rejects a liabilityAccountId owned by another company.
  */
@@ -109,7 +110,7 @@ describe('Pay Sales Tax — per-agency liability tracking', () => {
     expect(city.liabilityAccountId).toBeNull();
   });
 
-  it("paySalesTax debits the agency's own liability account when set", async () => {
+  it('paySalesTax debits 2200 (where the tax was credited) even when the agency has its own account', async () => {
     const entry = await paySalesTax(ctx, {
       amount: '40.00',
       date: new Date('2026-04-20T12:00:00.000Z'),
@@ -124,7 +125,7 @@ describe('Pay Sales Tax — per-agency liability tracking', () => {
       .from(journalEntryLines)
       .where(eq(journalEntryLines.journalEntryId, entry.id));
     const debit = lines.find((l) => Number(l.debit) > 0)!;
-    expect(debit.accountId).toBe(acct['2210']); // agency account, NOT 2200
+    expect(debit.accountId).toBe(acct['2200']); // the invoice credited the tax to 2200, not 2210
     expect(debit.debit).toBe('40.00');
 
     const tb = await trialBalance(ctx);
@@ -164,7 +165,7 @@ describe('Pay Sales Tax — per-agency liability tracking', () => {
     expect(result.totalCollected).toBe('80.00');
     expect(result.totalPaid).toBe('60.00');
     expect(result.totalBalance).toBe('20.00');
-    // 2200 (+80 −20) and the State's own 2210 (−40) together: owed == GL.
+    // 2200 (+80 −40 −20); the State's own 2210 is untouched (0): owed == GL.
     expect(result.glBalance).toBe('20.00');
     expect(result.tiesToGl).toBe(true);
   });

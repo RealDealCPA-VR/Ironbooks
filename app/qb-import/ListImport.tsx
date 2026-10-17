@@ -17,7 +17,7 @@
  * Uses window.bookkeeper?.openFile?.() when running inside the Electron shell,
  * with a plain <textarea> fallback for browser use.
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Button,
   Card,
@@ -87,54 +87,91 @@ function readFile(file: File, asBase64: boolean): Promise<string> {
   });
 }
 
-/** CSV column-mapping fields shown in the UI, per kind. */
-const CSV_FIELDS: Record<CsvKind, Array<{ key: string; label: string }>> = {
+/**
+ * CSV column-mapping fields shown in the UI, per kind. `aliases` are column headings (compared
+ * case-insensitively) that are matched to the field automatically — they include the headings of
+ * Ironbooks' own list export (lib/services/listExport.ts), so a list exported here re-imports
+ * without mapping by hand.
+ */
+type CsvField = { key: string; label: string; aliases?: string[] };
+export const CSV_FIELDS: Record<CsvKind, CsvField[]> = {
   customers: [
-    { key: 'displayName', label: 'Display Name *' },
-    { key: 'companyName', label: 'Company Name' },
-    { key: 'email', label: 'Email' },
-    { key: 'phone', label: 'Phone' },
-    { key: 'billingAddress_line1', label: 'Billing Address Line 1' },
-    { key: 'billingAddress_city', label: 'Billing City' },
-    { key: 'billingAddress_state', label: 'Billing State' },
-    { key: 'billingAddress_zip', label: 'Billing Zip' },
-    { key: 'notes', label: 'Notes' },
+    { key: 'displayName', label: 'Display Name *', aliases: ['name', 'display name', 'customer', 'customer name'] },
+    { key: 'companyName', label: 'Company Name', aliases: ['company', 'company name'] },
+    { key: 'email', label: 'Email', aliases: ['email', 'e-mail'] },
+    { key: 'phone', label: 'Phone', aliases: ['phone'] },
+    { key: 'billingAddress_line1', label: 'Billing Address Line 1', aliases: ['billing street 1', 'billing address line 1', 'bill to 1'] },
+    { key: 'billingAddress_line2', label: 'Billing Address Line 2', aliases: ['billing street 2', 'billing address line 2', 'bill to 2'] },
+    { key: 'billingAddress_city', label: 'Billing City', aliases: ['billing city'] },
+    { key: 'billingAddress_state', label: 'Billing State', aliases: ['billing state'] },
+    { key: 'billingAddress_zip', label: 'Billing Zip', aliases: ['billing zip', 'billing postal code'] },
+    { key: 'billingAddress_country', label: 'Billing Country', aliases: ['billing country'] },
+    { key: 'terms', label: 'Terms (e.g. Net 30)', aliases: ['terms'] },
+    { key: 'notes', label: 'Notes', aliases: ['notes'] },
   ],
   vendors: [
-    { key: 'displayName', label: 'Display Name *' },
-    { key: 'companyName', label: 'Company Name' },
-    { key: 'email', label: 'Email' },
-    { key: 'phone', label: 'Phone' },
-    { key: 'address_line1', label: 'Address Line 1' },
-    { key: 'address_city', label: 'City' },
-    { key: 'address_state', label: 'State' },
-    { key: 'address_zip', label: 'Zip' },
-    { key: 'notes', label: 'Notes' },
+    { key: 'displayName', label: 'Display Name *', aliases: ['name', 'display name', 'vendor', 'vendor name'] },
+    { key: 'companyName', label: 'Company Name', aliases: ['company', 'company name'] },
+    { key: 'email', label: 'Email', aliases: ['email', 'e-mail'] },
+    { key: 'phone', label: 'Phone', aliases: ['phone'] },
+    { key: 'address_line1', label: 'Address Line 1', aliases: ['street', 'address line 1'] },
+    { key: 'address_city', label: 'City', aliases: ['city'] },
+    { key: 'address_state', label: 'State', aliases: ['state'] },
+    { key: 'address_zip', label: 'Zip', aliases: ['zip', 'postal code'] },
+    { key: 'terms', label: 'Terms (e.g. Net 30)', aliases: ['terms'] },
+    { key: 'is1099', label: '1099 Vendor (Y / N)', aliases: ['1099 vendor', '1099', 'eligible for 1099'] },
+    { key: 'notes', label: 'Notes', aliases: ['notes'] },
   ],
   items: [
-    { key: 'name', label: 'Item Name *' },
-    { key: 'sku', label: 'SKU' },
-    { key: 'type', label: 'Type (service / inventory / non-inventory)' },
-    { key: 'description', label: 'Description' },
-    { key: 'salesPrice', label: 'Sales Price' },
-    { key: 'purchaseCost', label: 'Purchase Cost' },
-    { key: 'incomeAccount', label: 'Income Account (name or code)' },
-    { key: 'expenseAccount', label: 'Expense/COGS Account (name or code)' },
-    { key: 'assetAccount', label: 'Inventory Asset Account (name or code)' },
-    // G1: opening stock for inventory items (Inventory Asset vs Opening Balance Equity).
+    { key: 'name', label: 'Item Name *', aliases: ['name', 'item name', 'item'] },
+    { key: 'sku', label: 'SKU', aliases: ['sku'] },
+    { key: 'type', label: 'Type (service / inventory / non-inventory)', aliases: ['type'] },
+    { key: 'description', label: 'Description', aliases: ['description'] },
+    { key: 'salesPrice', label: 'Sales Price', aliases: ['sales price', 'price'] },
+    { key: 'purchaseCost', label: 'Purchase Cost', aliases: ['purchase cost', 'cost'] },
+    { key: 'incomeAccount', label: 'Income Account (name or code)', aliases: ['income account'] },
+    { key: 'expenseAccount', label: 'Expense/COGS Account (name or code)', aliases: ['expense account', 'cogs account'] },
+    { key: 'assetAccount', label: 'Inventory Asset Account (name or code)', aliases: ['asset account', 'inventory asset account'] },
+    { key: 'taxable', label: 'Taxable (Y / N)', aliases: ['taxable'] },
+    // G1: opening stock for inventory items (Inventory Asset vs Opening Balance Equity). Not
+    // auto-matched: mapping it posts opening stock, so the user chooses it.
     { key: 'quantityOnHand', label: 'Quantity on Hand (inventory items)' },
     { key: 'totalValue', label: 'Total Value of that quantity (blank = quantity × cost)' },
     { key: 'asOfDate', label: 'As of Date for the quantity (blank = today)' },
   ],
   accounts: [
-    { key: 'name', label: 'Account Name *' },
-    { key: 'code', label: 'Account Code / Number' },
-    { key: 'type', label: 'Type (asset / liability / … or QB type like BANK)' },
-    { key: 'subtype', label: 'Subtype' },
-    { key: 'description', label: 'Description' },
-    { key: 'parent', label: 'Parent Account (name, code or Parent:Sub)' },
+    { key: 'name', label: 'Account Name *', aliases: ['name', 'account name', 'account'] },
+    { key: 'code', label: 'Account Code / Number', aliases: ['code', 'number', 'account number', 'accnt #'] },
+    { key: 'type', label: 'Type (asset / liability / … or QB type like BANK)', aliases: ['type'] },
+    { key: 'subtype', label: 'Subtype', aliases: ['subtype', 'detail type'] },
+    { key: 'description', label: 'Description', aliases: ['description'] },
+    { key: 'parent', label: 'Parent Account (name, code or Parent:Sub)', aliases: ['parent code', 'parent', 'parent account'] },
   ],
 };
+
+/**
+ * Columns whose heading matches a field's aliases, for the fields not mapped yet (a choice the
+ * user already made is never replaced). Exported for tests.
+ */
+export function autoMapColumns(
+  fields: CsvField[],
+  headers: string[],
+  current: Record<string, string>,
+): Record<string, string> {
+  const byHeading = new Map(headers.map((h) => [h.trim().toLowerCase(), h]));
+  // Columns already taken by this kind's fields (a mapping left over from another kind doesn't count).
+  const used = new Set(fields.map((f) => current[f.key]).filter(Boolean));
+  const out: Record<string, string> = {};
+  for (const f of fields) {
+    if (current[f.key]) continue;
+    const hit = (f.aliases ?? []).map((a) => byHeading.get(a)).find((h): h is string => !!h && !used.has(h));
+    if (hit) {
+      out[f.key] = hit;
+      used.add(hit);
+    }
+  }
+  return out;
+}
 
 /** The field that must be mapped before a CSV import can run, per kind. */
 const REQUIRED_FIELD: Record<CsvKind, string> = {
@@ -183,6 +220,17 @@ export function ListImport() {
   const csvFields = CSV_FIELDS[csvKind];
   const csvHeaders = format === 'xlsx' ? xlsxHeaders : parseCsvHeaders(content);
   const hasInput = format === 'xlsx' ? !!xlsxData : !!content.trim();
+
+  // Match columns by heading as soon as a file's headings are known (or the list kind changes);
+  // only fields the user has not mapped are filled in.
+  const headerKey = csvHeaders.join('\u0001');
+  useEffect(() => {
+    if (format === 'iif' || !headerKey) return;
+    setMapping((prev) => {
+      const auto = autoMapColumns(CSV_FIELDS[csvKind], headerKey.split('\u0001'), prev);
+      return Object.keys(auto).length ? { ...prev, ...auto } : prev;
+    });
+  }, [format, csvKind, headerKey]);
 
   // ---- Browser file picker ----
   async function handlePickFile(file: File | undefined) {
@@ -415,7 +463,8 @@ export function ListImport() {
         <Card className="p-6 space-y-4">
           <h2 className="text-lg font-bold text-navy">Match the columns</h2>
           <p className="text-sm text-navy/60">
-            Match each field to the column in your file. Only the * field is required.
+            Match each field to the column in your file. Only the * field is required. Columns with a
+            matching heading (for example a list exported from Ironbooks) are matched for you.
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
             {csvFields.map(({ key, label }) => (

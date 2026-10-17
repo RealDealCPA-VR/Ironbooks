@@ -50,7 +50,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { allocateCheckNumber, assertCheckNumberAvailable } from './checkNumbers';
 import {
   getHomeCurrencyCode,
   getOrCreateExchangeGainLossAccount,
@@ -559,11 +559,12 @@ function referenceFor(input: PayBillsInput): { reference: string | null; toPrint
  */
 export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
   const { reference, toPrint } = referenceFor(input);
-  if (reference && input.method === 'check' && input.checkDuplicateNumber) {
-    await assertCheckNumberAvailable(ctx, { paymentAccountId: input.paymentAccountId, number: reference });
-  }
 
   return inTransaction(ctx, async (tx) => {
+    // Duplicate-number check inside the transaction (two payments at once see each other).
+    if (reference && input.method === 'check' && input.checkDuplicateNumber) {
+      await assertCheckNumberAvailable(tx, { paymentAccountId: input.paymentAccountId, number: reference });
+    }
     const prep = await preparePayment(tx, input);
     const entry = await postJournalEntry(tx, {
       date: input.date,
@@ -654,11 +655,12 @@ export async function payBillsWithCredits(
   const hasPayment =
     input.applications.some((a) => Money.of(a.amountApplied).greaterThan(0)) || (input.journalItems ?? []).length > 0;
   const { reference } = referenceFor(input);
-  if (hasPayment && reference && input.method === 'check' && input.checkDuplicateNumber) {
-    await assertCheckNumberAvailable(ctx, { paymentAccountId: input.paymentAccountId, number: reference });
-  }
 
   return inTransaction(ctx, async (tx) => {
+    // Duplicate-number check inside the transaction (two payments at once see each other).
+    if (hasPayment && reference && input.method === 'check' && input.checkDuplicateNumber) {
+      await assertCheckNumberAvailable(tx, { paymentAccountId: input.paymentAccountId, number: reference });
+    }
     await assertPeriodOpen(tx, input.date);
     let creditsApplied = Money.zero();
 
@@ -879,6 +881,14 @@ export async function markBillPaymentPrinted(
   ctx: ServiceContext,
   input: { billPaymentId: string; checkNumber?: string; allowDuplicateNumber?: boolean },
 ) {
+  // Load, number and stamp in one transaction (two checks printed at once get different numbers).
+  return inTransaction(ctx, (tx) => markBillPaymentPrintedInTx(tx, input));
+}
+
+async function markBillPaymentPrintedInTx(
+  ctx: ServiceContext,
+  input: { billPaymentId: string; checkNumber?: string; allowDuplicateNumber?: boolean },
+) {
   const [payment] = await ctx.db
     .select()
     .from(billPayments)
@@ -888,10 +898,9 @@ export async function markBillPaymentPrinted(
   if (!payment.toPrint) throw new ServiceError('CONFLICT', 'This payment is not in the print queue.');
   if (!payment.paymentAccountId) throw validation('This payment has no bank account to print a check on.');
 
-  const checkNumber = input.checkNumber?.trim() || (await nextCheckNumber(ctx, payment.paymentAccountId));
-  await assertCheckNumberAvailable(ctx, {
+  const checkNumber = await allocateCheckNumber(ctx, {
     paymentAccountId: payment.paymentAccountId,
-    number: checkNumber,
+    number: input.checkNumber,
     exclude: { source: 'bill_payment', id: payment.id },
     allowDuplicate: input.allowDuplicateNumber,
     numberField: 'checkNumber',

@@ -568,6 +568,147 @@ function applicationUses(a: ApplicationChange): Use[] {
   ];
 }
 
+const isUuid = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v);
+
+/**
+ * Whether the accountant's version of an invoice changes the payment recorded on it (its
+ * payment-item lines: their total, the currency or the exchange rate) — what updateInvoice refuses
+ * while that payment is in a bank deposit.
+ */
+async function invoicePaymentChanges(ctx: Ctx, id: string, after: Row): Promise<boolean> {
+  const [cur] = await q(
+    ctx,
+    sql`SELECT i.currency, i.exchange_rate,
+          COALESCE((SELECT SUM(CAST(l.amount AS NUMERIC)) FROM invoice_lines l JOIN items it ON it.id = l.item_id
+                    WHERE l.invoice_id = i.id AND it.type = 'payment'), 0) AS paid
+        FROM invoices i WHERE i.id = ${id}::uuid AND i.company_id = ${ctx.companyId}::uuid`,
+  );
+  if (!cur) return false;
+  const lines = arr(after, 'lines');
+  const ids = [...new Set(lines.map((l) => l.itemId).filter(isUuid))];
+  const payItems = new Set<string>();
+  if (ids.length) {
+    for (const r of await q(
+      ctx,
+      sql`SELECT id::text AS id FROM items WHERE company_id = ${ctx.companyId}::uuid AND type = 'payment'
+            AND id IN (${sql.join(ids.map((x) => sql`${x}::uuid`), sql`, `)})`,
+    )) {
+      payItems.add(String(r.id));
+    }
+  }
+  let paid = Money.zero();
+  for (const l of lines) {
+    if (isUuid(l.itemId) && payItems.has(l.itemId)) paid = paid.plus(Money.round2(dec(l.quantity ?? '1').times(dec(l.rate))));
+  }
+  const rate = (v: unknown) => (v == null || v === '' ? Money.of(1) : Money.of(String(v)));
+  return (
+    !Money.round2(paid).equals(Money.round2(dec(cur.paid))) ||
+    ((after.currency as string | null | undefined) ?? null) !== ((cur.currency as string | null) ?? null) ||
+    !rate(after.exchangeRate).equals(rate(cur.exchange_rate))
+  );
+}
+
+/** The client's own use of an estimate / sales order / purchase order since the copy was made. */
+async function clientUsedOrderLater(
+  ctx: Ctx,
+  type: DocType,
+  id: string,
+  copy: { dividingDate: string; createdAt?: Date | string | null },
+): Promise<boolean> {
+  const c = ctx.companyId;
+  const after = copy.dividingDate;
+  if (type === 'estimate') {
+    const [hit] = await q(
+      ctx,
+      sql`SELECT 1 FROM invoices i
+           WHERE i.company_id = ${c}::uuid AND i.status <> 'void' AND to_char(i.date, 'YYYY-MM-DD') > ${after}
+             AND (i.id = (SELECT converted_invoice_id FROM estimates WHERE id = ${id}::uuid)
+                  OR EXISTS (SELECT 1 FROM invoice_lines il JOIN estimate_lines el ON el.id = il.estimate_line_id
+                              WHERE il.invoice_id = i.id AND el.estimate_id = ${id}::uuid))
+           LIMIT 1`,
+    );
+    if (hit) return true;
+  }
+  if (type === 'purchase_order') {
+    const [hit] = await q(
+      ctx,
+      sql`SELECT 1 FROM item_receipts r WHERE r.company_id = ${c}::uuid AND r.purchase_order_id = ${id}::uuid
+            AND r.voided_at IS NULL AND to_char(r.date, 'YYYY-MM-DD') > ${after} LIMIT 1`,
+    );
+    if (hit) return true;
+  }
+  if (!copy.createdAt) return false;
+  // Conversions (bills from a purchase order, invoices from a sales order, …) are audited on the
+  // order; the client can't change an order dated on or before the dividing date in any other way.
+  const [audited] = await q(
+    ctx,
+    sql`SELECT 1 FROM audit_logs WHERE company_id = ${c}::uuid AND entity_type = ${type} AND entity_id = ${id}::uuid
+          AND created_at > ${new Date(copy.createdAt).toISOString()}::timestamp LIMIT 1`,
+  );
+  return Boolean(audited);
+}
+
+/**
+ * Why the order's own service would refuse the accountant's edit / void now that the client has
+ * received, billed or invoiced against it after the dividing date (null: it goes in). Mirrors
+ * updatePurchaseOrder / updateSalesOrder / updateEstimate and the status changes: a closed order
+ * can't change, a used line keeps its item (and account) and at least its used quantity and
+ * can't be removed, a used order keeps its vendor / customer, and a partly used or closed order
+ * can't be voided. Only flagged when the client's file shows its own use of the order since the
+ * copy was made (an invoice dated after the dividing date billing the estimate, an item receipt
+ * dated after it, a conversion recorded in the order's audit trail after the copy was made): a
+ * use the copy already had can be undone by the file's own changes (an invoice edit that takes
+ * the estimate link off), which the import's order of steps takes care of.
+ */
+async function orderUseBlock(
+  ctx: Ctx,
+  d: Extract<DocChange, { op: 'edit' | 'void' }>,
+  copy: { dividingDate: string; createdAt?: Date | string | null },
+): Promise<string | null> {
+  if (!(await clientUsedOrderLater(ctx, d.type, d.id, copy))) return null;
+  const c = ctx.companyId;
+  if (d.type === 'estimate') {
+    if (d.op === 'void') return null;
+    const [e] = await q(ctx, sql`SELECT status::text AS status, converted_invoice_id, amount_invoiced FROM estimates WHERE id = ${d.id}::uuid AND company_id = ${c}::uuid`);
+    if (!e) return null;
+    if (e.status === 'closed' || e.converted_invoice_id) return 'it has been turned into an invoice and can no longer be changed';
+    if (e.status === 'partial' || dec(e.amount_invoiced).greaterThan(0)) return 'it has progress invoices against it and its lines can no longer be changed';
+    return null;
+  }
+  const po = d.type === 'purchase_order';
+  const [o] = await q(
+    ctx,
+    po
+      ? sql`SELECT status::text AS status, vendor_id AS party FROM purchase_orders WHERE id = ${d.id}::uuid AND company_id = ${c}::uuid`
+      : sql`SELECT status::text AS status, customer_id AS party FROM sales_orders WHERE id = ${d.id}::uuid AND company_id = ${c}::uuid`,
+  );
+  if (!o || o.status === 'void') return null;
+  if (d.op === 'void') return o.status === 'closed' || o.status === 'partial' ? "it can't be voided any more" : null;
+  if (o.status === 'closed') return 'it is now closed and can no longer be changed';
+  const used = (
+    await q(
+      ctx,
+      po
+        ? sql`SELECT id::text AS id, item_id, account_id, quantity_billed AS used FROM purchase_order_lines WHERE purchase_order_id = ${d.id}::uuid`
+        : sql`SELECT id::text AS id, item_id, NULL AS account_id, quantity_invoiced AS used FROM sales_order_lines WHERE sales_order_id = ${d.id}::uuid`,
+    )
+  ).filter((l) => dec(l.used).greaterThan(0));
+  if (!used.length) return null;
+  const doneWord = po ? 'received or billed' : 'invoiced';
+  const after = d.after;
+  if (String(after[po ? 'vendorId' : 'customerId'] ?? '') !== String(o.party ?? '')) return `its ${po ? 'vendor' : 'customer'} can't change`;
+  const lines = arr(after, 'lines');
+  for (const u of used) {
+    const a = lines.find((l) => l.id === u.id);
+    if (!a) return `a line that was ${doneWord} can't be removed from it`;
+    if (String(a.itemId ?? '') !== String(u.item_id ?? '') || (po && String(a.accountId ?? '') !== String(u.account_id ?? ''))) {
+      return `the item${po ? ' or account' : ''} of a line that was ${doneWord} can't change`;
+    }
+    if (dec(a.quantity).lessThan(dec(u.used))) return `a line's quantity can't be lower than the ${dec(u.used).toFixed(2)} already ${doneWord}`;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // The check
 // ---------------------------------------------------------------------------
@@ -638,10 +779,15 @@ export async function clientWorkConflicts(
           `To import: ${undo}, import these changes, then redo ${them(xs)} — or ask your accountant to leave this ${what} as it is.`,
       );
     if (d.type === 'invoice') {
-      // voidInvoice also refuses while the payment recorded on the invoice is in a deposit.
-      const deps = d.op === 'void' ? await later.of('invoice_payment', d.id) : [];
-      if (deps.length) {
-        blocked(deps, "it can't be voided", 'remove its payment from your deposit (or void that deposit)');
+      // voidInvoice also refuses while the payment recorded on the invoice is in a deposit, and
+      // updateInvoice refuses an edit that changes that payment's amount, currency or rate.
+      const deps = await later.of('invoice_payment', d.id);
+      if (deps.length && (d.op === 'void' || (await invoicePaymentChanges(ctx, d.id, d.after)))) {
+        blocked(
+          deps,
+          d.op === 'void' ? "it can't be voided" : "the payment recorded on it can't change its amount, currency or exchange rate",
+          'remove its payment from your deposit (or void that deposit)',
+        );
         continue;
       }
       const xs = await later.of('invoice', d.id);
@@ -714,6 +860,21 @@ export async function clientWorkConflicts(
       const cur = await current('sales_receipts', d.id);
       if (cur && (!dec(d.after.total).equals(dec(cur.total)) || String(d.after.depositAccountId ?? '') !== String(cur.deposit_account_id ?? ''))) {
         blocked(xs, "its total and deposit account can't be changed", 'remove it from your deposit (or void that deposit)');
+      }
+    } else if (d.type === 'purchase_order' || d.type === 'sales_order' || d.type === 'estimate') {
+      // Receiving / billing a purchase order, invoicing a sales order or an estimate after the
+      // dividing date changes the order (its status, the quantities used) without moving its
+      // substance, so record locking lets it through — but the order's own service refuses edits
+      // that would undo what was used, and voids of a used order.
+      const why = await orderUseBlock(ctx, d, copy);
+      if (why) {
+        const used = d.type === 'purchase_order' ? 'received or billed items on' : 'invoiced';
+        const made = d.type === 'purchase_order' ? 'the bills / item receipts' : 'the invoices';
+        flag(
+          key,
+          `Since the dividing date your file has ${used} this ${what} (${L.doc(d.id)}), so ${why}. ` +
+            `To import: ask your accountant to leave this ${what} as it is — or void ${made} your file made from it, import these changes, then enter them again.`,
+        );
       }
     }
   }

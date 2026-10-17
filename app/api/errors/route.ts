@@ -6,6 +6,7 @@ import { NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { detectErrors, listErrors } from '@/lib/services/errorDetection';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 export async function GET(request: Request) {
   try {
@@ -21,16 +22,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ detections });
   } catch (err) {
     if (err instanceof ServiceError) {
-      const status =
-        err.code === 'NOT_FOUND'
-          ? 404
-          : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-          ? 403
-          : err.code === 'CONFLICT'
-          ? 409
-          : 500;
+      const status = serviceErrorStatus(err.code);
       return NextResponse.json({ error: err.message, code: err.code }, { status });
     }
     console.error('[GET /api/errors]', err);
@@ -45,16 +37,7 @@ export async function POST() {
     return NextResponse.json({ detections, count: detections.length }, { status: 201 });
   } catch (err) {
     if (err instanceof ServiceError) {
-      const status =
-        err.code === 'NOT_FOUND'
-          ? 404
-          : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-          ? 403
-          : err.code === 'CONFLICT'
-          ? 409
-          : 500;
+      const status = serviceErrorStatus(err.code);
       return NextResponse.json({ error: err.message, code: err.code }, { status });
     }
     console.error('[POST /api/errors]', err);

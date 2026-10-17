@@ -19,15 +19,11 @@ import {
 } from '@/lib/services/integrity';
 import { ServiceError } from '@/lib/services/_base';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[import/rebuild] unexpected error:', err);
@@ -57,7 +53,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json()) as { action?: string };
+    const body = (await requireJsonObject(req)) as { action?: string };
     if (!body.action || !isRebuildAction(body.action)) {
       return NextResponse.json(
         { error: 'action must be one of the rebuild actions.', code: 'VALIDATION' },

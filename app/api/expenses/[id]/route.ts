@@ -7,22 +7,13 @@ import { zodErrorWithFixes } from '@/lib/fixRoutes';
 import { getServerContext } from '@/lib/context';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getExpense, updateExpense, voidExpense } from '@/lib/services/expenses';
-import { routeError, serviceErrorBody } from '@/lib/routeErrors';
+import { routeError, serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
 import { createExpenseSchema } from '@/lib/validation/expenses';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED' || err.code === 'PERIOD_CLOSED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json(
       { ...serviceErrorBody(err), details: err.details ?? null },
       { status },

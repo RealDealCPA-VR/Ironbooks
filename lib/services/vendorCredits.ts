@@ -50,7 +50,7 @@ import {
 } from '@/lib/services/posting';
 import { receivePurchasedStock } from './bills';
 import { takeFromLayers } from './fifo';
-import { bookValueRelief } from './inventory';
+import { bookValueRelief, sellOutRelief } from './inventory';
 import { postDocumentInventory, reverseDocumentInventory } from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
@@ -316,14 +316,22 @@ async function relieveReturnedStock(
     .from(inventoryLayers)
     .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, itemId)))
     .limit(1);
-  const cost = layer
-    ? (await takeFromLayers(tx, itemId, qty)).cost
-    : // Average cost: book value before minus after, so returning the last units clears it.
-      bookValueRelief(onHand, onHand.minus(qty), Money.of(item.averageCost ?? '0'));
+  // Average cost: book value before minus after, so returning the last units clears it — together
+  // with the value remainder (0061) the GL still carries for the item, like a sell-out.
+  const avgRelief = layer
+    ? null
+    : sellOutRelief(item, onHand.minus(qty), bookValueRelief(onHand, onHand.minus(qty), Money.of(item.averageCost ?? '0')));
+  const cost = layer ? (await takeFromLayers(tx, itemId, qty)).cost : avgRelief!.relief;
   const newQty = onHand.minus(qty);
   await tx.db
     .update(items)
-    .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
+    .set({
+      quantityOnHand: newQty.toFixed(4),
+      ...(avgRelief?.remainderRelieved
+        ? { valueRemainder: '0.00', valueRemainderAvg: Money.of(item.averageCost ?? '0').toFixed(4) }
+        : {}),
+      updatedAt: new Date(),
+    })
     .where(eq(items.id, itemId));
   await writeAudit(tx, {
     action: 'update',
@@ -1210,6 +1218,12 @@ async function refundVendorCreditInTx(ctx: ServiceContext, input: RefundVendorCr
 // ---------------------------------------------------------------------------
 
 export async function voidVendorCredit(ctx: ServiceContext, id: string) {
+  // Load + validate in the same transaction as the void: a double-submitted void must find the
+  // credit already void (idempotent) instead of restoring the returned stock twice.
+  return inTransaction(ctx, (tx) => voidVendorCreditInTx(tx, id));
+}
+
+async function voidVendorCreditInTx(ctx: ServiceContext, id: string) {
   const [credit] = await ctx.db
     .select()
     .from(vendorCredits)

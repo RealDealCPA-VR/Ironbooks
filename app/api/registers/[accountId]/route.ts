@@ -18,6 +18,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { accountRegister } from '@/lib/services/journal';
 import { withAccountCurrency } from '@/lib/services/fxLedger';
 import { queryDate } from '@/lib/validation/helpers';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 type Params = { params: Promise<{ accountId: string }> };
 
@@ -56,16 +57,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 // ---------------------------------------------------------------------------
 function mapError(err: unknown): NextResponse {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
   }
   console.error('[registers/[accountId]] Unexpected error:', err);

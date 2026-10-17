@@ -6,15 +6,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getSalesRep, updateSalesRep, deactivateSalesRep } from '@/lib/services/salesReps';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject, assertStringFields } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : err.code === 'CONFLICT' ? 409
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[sales-reps/[id]] unexpected error:', err);
@@ -40,7 +36,8 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
+    assertStringFields(body, ['name', 'email']);
     const rep = await updateSalesRep(ctx, id, {
       name: body.name,
       email: body.email,

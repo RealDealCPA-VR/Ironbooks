@@ -4,7 +4,7 @@
  * DELETE /api/journal-entries/:id   — void a posted entry (reverses balances).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { serviceErrorBody } from '@/lib/routeErrors';
+import { serviceErrorBody, serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
@@ -27,7 +27,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
 
     const date = body.date ? new Date(body.date) : undefined;
     if (!date || isNaN(date.getTime())) {
@@ -66,16 +66,7 @@ export async function DELETE(req: NextRequest, { params }: Params) {
 // ---------------------------------------------------------------------------
 function mapError(err: unknown): NextResponse {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'FORBIDDEN'
-            ? 403
-            : err.code === 'CONFLICT' || err.code === 'PERIOD_CLOSED'
-              ? 409
-              : 500;
+    const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
     return NextResponse.json(serviceErrorBody(err), { status });
   }
   console.error('[journal-entries/[id]] Unexpected error:', err);

@@ -164,17 +164,25 @@ async function customersTable(ctx: ServiceContext): Promise<Table> {
   const types = await ctx.db.select().from(customerTypes).where(eq(customerTypes.companyId, ctx.companyId));
   const typePath = pathOf(types);
   const parentName = new Map(rows.map((c) => [c.id, c.displayName]));
+  // The billing address goes out in its parts (street lines, city, state, ZIP, country), as in
+  // QuickBooks' list export, so a list import can map each part back (a one-column address can't
+  // be split again reliably).
+  const bill = (c: (typeof rows)[number]) => {
+    const a = (c.billingAddress ?? {}) as Record<string, string>;
+    return [a.line1 ?? a.street ?? '', a.line2 ?? '', a.city ?? '', a.state ?? '', a.zip ?? a.postalCode ?? '', a.country ?? ''];
+  };
   return {
     header: [
-      'Name', 'Company', 'Email', 'Phone', 'Billing Address', 'Shipping Address', 'Terms',
-      'Credit Limit', 'Taxable', 'Customer Type', 'Parent', 'Balance', 'Notes', 'Active',
+      'Name', 'Company', 'Email', 'Phone',
+      'Billing Street 1', 'Billing Street 2', 'Billing City', 'Billing State', 'Billing ZIP', 'Billing Country',
+      'Shipping Address', 'Terms', 'Credit Limit', 'Taxable', 'Customer Type', 'Parent', 'Balance', 'Notes', 'Active',
     ],
     rows: rows.map((c) => [
       c.displayName,
       c.companyName,
       c.email,
       c.phone,
-      flattenAddress(c.billingAddress),
+      ...bill(c),
       flattenAddress(c.shippingAddress),
       c.terms,
       c.creditLimit ? toAmountString(c.creditLimit) : '',

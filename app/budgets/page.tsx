@@ -21,6 +21,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import { formatCurrency } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,22 @@ type PeriodMode = 'annual' | 'monthly' | 'quarterly';
 // ---------------------------------------------------------------------------
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * The budget grid's months in FISCAL order with their calendar year (a June 30 company's FY2026
+ * runs Jul 2025 – Jun 2026), like the budget reports. Each cell still stores its calendar month
+ * (1 = January).
+ */
+function fiscalMonths(fiscalYear: number, fiscalYearEnd: string | undefined): { month: number; label: string }[] {
+  const m = /^(\d{1,2})-(\d{1,2})$/.exec(fiscalYearEnd ?? '');
+  const endMonth = m && Number(m[1]) >= 1 && Number(m[1]) <= 12 ? Number(m[1]) : 12;
+  const startMonth = (endMonth % 12) + 1;
+  return Array.from({ length: 12 }, (_, i) => {
+    const month = ((startMonth - 1 + i) % 12) + 1;
+    const year = startMonth === 1 || month < startMonth ? fiscalYear : fiscalYear - 1;
+    return { month, label: startMonth === 1 ? MONTHS[month - 1] : `${MONTHS[month - 1]} ${year}` };
+  });
+}
 
 function getLineAmount(lines: BudgetLine[], accountId: string, month: number, customerId = ''): string {
   const line = lines.find(
@@ -226,6 +243,7 @@ function BudgetGrid({
 }) {
   // P&L budgets: income and expense accounts. Balance-sheet budgets: asset, liability, equity.
   const isBs = budget.kind === 'balance_sheet';
+  const months = fiscalMonths(budget.fiscalYear, usePreferences().company.fiscalYearEnd);
   const relevantAccounts = accounts.filter(
     (a) => (isBs ? !['revenue', 'expense'].includes(a.type) : a.type === 'revenue' || a.type === 'expense') && a.isActive,
   );
@@ -239,12 +257,12 @@ function BudgetGrid({
             <th className="py-2.5 px-3 text-left font-semibold text-navy/70 border-b-2 border-navy/10 sticky left-0 bg-white z-10 min-w-[180px]">
               Account
             </th>
-            {MONTHS.map((m) => (
+            {months.map((m) => (
               <th
-                key={m}
+                key={m.month}
                 className="py-2.5 px-2 text-right font-semibold text-navy/70 border-b-2 border-navy/10 min-w-[90px]"
               >
-                {m}
+                {m.label}
               </th>
             ))}
           </tr>
@@ -263,8 +281,7 @@ function BudgetGrid({
                   <span className="text-navy/50 text-xs mr-1">{acct.code}</span>
                   <span className="text-navy font-medium">{acct.name}</span>
                 </td>
-                {MONTHS.map((_, idx) => {
-                  const month = idx + 1;
+                {months.map(({ month, label }) => {
                   const current = getLineAmount(budget.lines, acct.id, month, customerId);
                   return (
                     <td key={month} className="py-1 px-1">
@@ -272,7 +289,7 @@ function BudgetGrid({
                         type="number"
                         step="0.01"
                         placeholder="—"
-                        aria-label={`${acct.name} ${MONTHS[idx]}`}
+                        aria-label={`${acct.name} ${label}`}
                         defaultValue={current || ''}
                         onBlur={(e) => {
                           const val = e.target.value.trim();

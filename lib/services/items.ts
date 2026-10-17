@@ -13,7 +13,7 @@
  */
 import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, inventoryLayers, inventoryMovements, items } from '@/lib/db/schema';
-import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { Money } from '@/lib/money';
 import { assertItemTypeAllowed } from '@/lib/featureGate';
 import { assertNotControlLineAccount } from './posting';
@@ -264,6 +264,12 @@ export async function getItem(ctx: ServiceContext, id: string) {
  *  - linked account IDs exist, belong to this company, and have the expected type
  */
 export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
+  // The unique-name check runs in the same transaction as the insert (two creates at once must
+  // not both add the same name).
+  return inTransaction(ctx, (tx) => createItemInTx(tx, input));
+}
+
+async function createItemInTx(ctx: ServiceContext, input: CreateItemInput) {
   // ── Validate name ────────────────────────────────────────────────────────
   const name = input.name?.trim();
   if (!name) throw validation('Item name is required.');
@@ -405,6 +411,9 @@ async function assertAssetAccountChangeAllowed(
 export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateItemInput) {
   const before = await getItem(ctx, id);
   await assertAccountantListEdit(ctx, 'item', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
+  // Making an item inactive (PATCH isActive: false) is deleting it: refused like deactivateItem
+  // while an Accountant's Copy is out (I1).
+  if (patch.isActive === false && before.isActive) await assertListDeleteAllowed(ctx, 'delete', 'items');
   if (patch.type !== undefined && patch.type !== before.type) await assertItemTypeAllowed(ctx, patch.type);
   if (patch.type !== undefined && patch.type !== before.type && before.type === 'inventory') {
     await assertInventoryTypeChangeAllowed(ctx, before);

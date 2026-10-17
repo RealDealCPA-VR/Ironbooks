@@ -83,6 +83,16 @@ describe('createUndoTracker', () => {
     expect(calls[0].body).toEqual({ resource: 'customers', kind: 'create', token: null, id: ID });
   });
 
+  it('offers no Undo for a create whose response has no record id (nothing new was saved)', async () => {
+    const { fetcher, calls } = fakeFetch({ '/api/undo/commit': { ...armed, kind: 'create' } });
+    const t = createUndoTracker(fetcher as never);
+    const info = { method: 'POST' as const, path: '/api/bill-payments', body: { vendorCredits: [{}] } };
+    const prep = await t.before(info);
+    t.after(info, { payment: null, creditsApplied: '50.00' }, prep);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toHaveLength(0);
+  });
+
   it('never blocks a save: a failed snapshot just means no Undo toast', async () => {
     const { fetcher, calls } = fakeFetch({});
     const t = createUndoTracker(fetcher as never);

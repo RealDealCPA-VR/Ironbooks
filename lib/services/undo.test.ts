@@ -551,8 +551,11 @@ describe('undo service', () => {
       /nothing to undo/,
     );
     await expect(commitUndo(ctx, { resource: 'invoices', kind: 'create', id: 'not-a-uuid' })).rejects.toThrow(/nothing to undo/);
-    // No id at all: the newest record this user created a moment ago is used.
-    const armed = await commitUndo(ctx, { resource: 'invoices', kind: 'create', id: null });
+    // No id at all (a save that recorded no new document): refused too — never guessed, even
+    // though `mine` was created a moment ago.
+    await expect(commitUndo(ctx, { resource: 'invoices', kind: 'create', id: null })).rejects.toThrow(/nothing to undo/);
+    // The real id still arms it.
+    const armed = await commitUndo(ctx, { resource: 'invoices', kind: 'create', id: mine.id });
     const [row] = await db.select().from(undoActions).where(eq(undoActions.id, armed.token));
     expect(row.entityId).toBe(mine.id);
   });

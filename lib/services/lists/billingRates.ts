@@ -104,6 +104,8 @@ export async function createBillingRateLevel(ctx: ServiceContext, body: unknown)
 export async function updateBillingRateLevel(ctx: ServiceContext, id: string, body: unknown) {
   const before = await getBillingRateLevel(ctx, id);
   const { input, fixedRate, rates } = await validateLevel(ctx, body, id);
+  // Making a level inactive is deleting it: refused while an Accountant's Copy is out (I1).
+  if (input.isActive === false && before.isActive) await assertListDeleteAllowed(ctx, 'delete', 'billing rate levels');
   return inTransaction(ctx, async (tx) => {
     await tx.db
       .update(billingRateLevels)

@@ -25,6 +25,7 @@ const Papa = require('papaparse') as {
 };
 import { and, eq } from 'drizzle-orm';
 import { csvUnsafeText } from '@/lib/csv';
+import { refreshPlannerStats } from '@/lib/db/plannerStats';
 import { bankAccounts, bankTransactions, fileImports } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
@@ -49,6 +50,13 @@ export interface ParsedTransaction {
    * the date fix as duplicates; never stored.
    */
   legacyDate?: Date;
+  /**
+   * The description / fitId cell exactly as earlier versions read it, when it differs (they did
+   * not drop the formula-guard apostrophe our exports add: "'-ATM" vs "-ATM"). Only used for the
+   * same duplicate check; never stored.
+   */
+  legacyDescription?: string;
+  legacyFitId?: string;
 }
 
 /** 'qfx' (Quicken/Web Connect) is structurally identical to OFX and parsed the same way. */
@@ -334,19 +342,28 @@ function parseWithFormat(rawDate: string, format: string): Date {
 }
 
 /**
- * Parse a CSV date with no format hint as a calendar DAY at UTC midnight. The engine parses
- * "01/31/2024" as LOCAL midnight (east of UTC that is the previous UTC day), while an ISO date-only
- * "2024-01-31" (or a value with an explicit zone) is parsed as UTC — take the calendar parts from the
- * matching clock so the day the bank printed is the day stored.
+ * Parse a CSV date with no format hint as a calendar DAY at UTC midnight — the day the bank
+ * printed:
+ *   - a value that starts with an ISO date ("2024-01-31", "2024-01-31T23:30:00-05:00"): that date,
+ *     whatever time or zone follows (converting "23:30 -05:00" to UTC would make it Feb 1);
+ *   - another value with an explicit zone (Z / GMT / UTC / ±hh:mm): the wall-clock day in that zone;
+ *   - anything else ("01/31/2024", parsed by the engine as LOCAL time): the local calendar day
+ *     (east of UTC, local midnight is the previous UTC day).
  */
 function parseLooseDate(rawDate: string): Date {
   const d = new Date(rawDate);
   if (isNaN(d.getTime())) return d;
   const s = rawDate.trim();
-  const utcParsed = /^\d{4}-\d{2}-\d{2}$/.test(s) || /(?:Z|[+-]\d{2}:?\d{2})$/i.test(s);
-  return utcParsed
-    ? new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
-    : new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const iso = /^(\d{4})-(\d{2})-(\d{2})(?!\d)/.exec(s);
+  if (iso) return new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
+  // The zone must follow a time of day, so a date part like "01-31-2024" is never read as one.
+  const zone = /\d:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:(Z|GMT|UTC)|(?:GMT|UTC)?([+-])(\d{2}):?(\d{2}))$/i.exec(s);
+  if (zone) {
+    const offsetMin = zone[1] ? 0 : (zone[2] === '-' ? -1 : 1) * (Number(zone[3]) * 60 + Number(zone[4]));
+    const wall = new Date(d.getTime() + offsetMin * 60_000);
+    return new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()));
+  }
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
 }
 
 /** Drop the first `skipRows` physical lines (bank-export preamble before the header). */
@@ -367,14 +384,16 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
   }
 
   return result.data.map((row, i) => {
-    // csvUnsafeText: a CSV written by our own exports prefixes formula-like cells with "'".
-    const col = (key: string | number): string => {
+    // The cell as read (earlier versions used it as is).
+    const rawCol = (key: string | number): string => {
       if (typeof key === 'number') {
         const vals = Object.values(row);
-        return csvUnsafeText(vals[key]?.trim() ?? '');
+        return vals[key]?.trim() ?? '';
       }
-      return csvUnsafeText((row[key] ?? row[key.toString()] ?? '').trim());
+      return (row[key] ?? row[key.toString()] ?? '').trim();
     };
+    // csvUnsafeText: a CSV written by our own exports prefixes formula-like cells with "'".
+    const col = (key: string | number): string => csvUnsafeText(rawCol(key));
 
     // Date — honor the caller's declared dateFormat so ambiguous values like "03/04/2024"
     // are not silently misread by the engine's locale-dependent Date parser.
@@ -414,10 +433,23 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
         ? col(mapping.fitIdCol) || undefined
         : undefined;
 
-    // Earlier versions stored a format-less date as the engine parsed it (local midnight).
+    // Earlier versions stored a format-less date as the engine parsed it (local midnight), and the
+    // description / fitId cells with the formula-guard apostrophe still on.
     const legacyDate = mapping.dateFormat ? undefined : legacyIfDifferent(date, new Date(rawDate));
+    const rawDescription = rawCol(mapping.descriptionCol) || 'Imported transaction';
+    const legacyDescription = rawDescription !== description ? rawDescription : undefined;
+    const rawFitId = mapping.fitIdCol !== undefined ? rawCol(mapping.fitIdCol) || undefined : undefined;
+    const legacyFitId = rawFitId !== fitId ? rawFitId : undefined;
 
-    return { fitId, date, description, amount, ...(legacyDate ? { legacyDate } : {}) };
+    return {
+      fitId,
+      date,
+      description,
+      amount,
+      ...(legacyDate ? { legacyDate } : {}),
+      ...(legacyDescription !== undefined ? { legacyDescription } : {}),
+      ...(legacyFitId !== undefined ? { legacyFitId } : {}),
+    };
   });
 }
 
@@ -608,9 +640,11 @@ export async function importTransactions(
 
   // 4a. Apply hash-based fitId fallback for CSV rows that have no fitId.
   //     This ensures re-importing the same CSV doesn't create duplicate rows.
-  //     Rows staged by earlier versions were hashed with the date those versions stored (OFX time
-  //     of day, format-less CSV dates at local midnight); the same line's legacy key counts as a
-  //     duplicate too, so re-importing an old file after the date fix adds nothing.
+  //     Rows staged by earlier versions were keyed with what those versions read: the date they
+  //     stored (OFX time of day, format-less CSV dates at local midnight) and the description /
+  //     fitId cell with the formula-guard apostrophe still on. The same line's legacy key counts
+  //     as a duplicate too, so re-importing an old file adds nothing. Legacy occurrence numbers
+  //     are counted over every row's legacy tuple, exactly as those versions counted them.
   const tupleCounts = new Map<string, number>();
   const legacyTupleCounts = new Map<string, number>();
   const legacyKeys = new Map<ParsedTransaction, string>();
@@ -619,13 +653,18 @@ export async function importTransactions(
       const key = `${txn.date.toISOString()}|${txn.description}|${txn.amount}`;
       const n = tupleCounts.get(key) ?? 0;
       tupleCounts.set(key, n + 1);
+      const old = {
+        date: txn.legacyDate ?? txn.date,
+        description: txn.legacyDescription ?? txn.description,
+        amount: txn.amount,
+      };
+      const lkey = `${old.date.toISOString()}|${old.description}|${old.amount}`;
+      const ln = legacyTupleCounts.get(lkey) ?? 0;
+      legacyTupleCounts.set(lkey, ln + 1);
+      if (txn.legacyDate || txn.legacyDescription !== undefined) legacyKeys.set(txn, hashFitId(old, ln));
       txn.fitId = hashFitId(txn, n);
-      if (txn.legacyDate) {
-        const lkey = `${txn.legacyDate.toISOString()}|${txn.description}|${txn.amount}`;
-        const ln = legacyTupleCounts.get(lkey) ?? 0;
-        legacyTupleCounts.set(lkey, ln + 1);
-        legacyKeys.set(txn, hashFitId({ ...txn, date: txn.legacyDate }, ln));
-      }
+    } else if (txn.legacyFitId) {
+      legacyKeys.set(txn, txn.legacyFitId);
     }
   }
 
@@ -722,6 +761,8 @@ export async function importTransactions(
       errors: errorLog.length,
     },
   });
+  // A bulk load: give the planner fresh statistics (PGlite has no autovacuum; best-effort).
+  if (importedCount > 0) await refreshPlannerStats(ctx.db, 'bank import');
 
   return {
     fileImportId: importRow.id,

@@ -372,6 +372,13 @@
       "when": 1781400059000,
       "tag": "0059_deposit_line_accounts",
       "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1781400061000,
+      "tag": "0061_item_value_remainder",
+      "breakpoints": true
     }
   ]
 }

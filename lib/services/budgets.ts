@@ -11,7 +11,7 @@ import { and, eq, isNotNull, isNull } from 'drizzle-orm';
 import { accounts, budgetLines, budgets, classes, customers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { profitAndLoss } from '@/lib/services/reports';
-import { profitAndLossByMonth, type ProfitAndLossByMonth } from '@/lib/services/reportsComparative';
+import { fiscalYearWindow } from './fiscalClose';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
 import type Decimal from 'decimal.js';
@@ -23,6 +23,7 @@ import {
   SECTION_LABELS,
   activityByAccount,
   anyNonZero,
+  companyFiscalYearEnd,
   buildAccountTree,
   buildPLRows,
   fetchGlLines,
@@ -342,6 +343,40 @@ function bucketMonths(
 
 const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+interface FiscalMonth {
+  /** Calendar year and month (1-12) of this month of the fiscal year. */
+  year: number;
+  month: number;
+  from: Date;
+  to: Date;
+}
+
+/**
+ * The budget's fiscal year (the company's fiscal year END, settings.fiscalYearEnd — e.g. FY2026 of
+ * a June 30 company is Jul 2025 – Jun 2026) and its twelve months in fiscal order. Budget lines
+ * keep their CALENDAR month (1 = January, as the budget grid enters them); each calendar month
+ * is the one month of that name inside the fiscal year, so a calendar-year company is unchanged.
+ */
+async function budgetFiscalYear(ctx: ServiceContext, fiscalYear: number) {
+  const w = fiscalYearWindow(fiscalYear, await companyFiscalYearEnd(ctx));
+  const from = w.yearStart;
+  const to = new Date(w.yearEnd.getTime() - 1);
+  const months: FiscalMonth[] = [];
+  for (let i = 0; i < 12; i++) {
+    const start = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth() + i, 1));
+    const end = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1) - 1);
+    months.push({
+      year: start.getUTCFullYear(),
+      month: start.getUTCMonth() + 1,
+      from: start < from ? from : start,
+      to: end > to ? to : end,
+    });
+  }
+  /** Fiscal position (0-11) of a calendar month (1-12). */
+  const indexOf = (calendarMonth: number) => Math.max(0, months.findIndex((m) => m.month === calendarMonth));
+  return { from, to, months, indexOf };
+}
+
 /**
  * For each account that has at least one budget line, sum the budgeted amounts
  * (all months), then fetch actual P&L for the full fiscal year and match by accountId.
@@ -349,7 +384,7 @@ const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'S
  *
  * Period columns (additive): pass opts.periods = 'monthly' | 'quarterly' to get
  * per-period budget/actual/variance cells on every row (reuses the monthly P&L
- * bucketing from profitAndLossByMonth) plus net per-period totals.
+ * bucketing in fiscal months, Q1 = the first fiscal quarter) plus net per-period totals.
  */
 export async function budgetVsActual(
   ctx: ServiceContext,
@@ -368,7 +403,10 @@ export async function budgetVsActual(
     .from(budgetLines)
     .where(eq(budgetLines.budgetId, budgetId));
 
-  // Aggregate budget by accountId (annual total + per-month for period columns).
+  // The company's fiscal year, month by month in fiscal order.
+  const fy = await budgetFiscalYear(ctx, budget.fiscalYear);
+
+  // Aggregate budget by accountId (annual total + per-month for period columns, fiscal order).
   const budgetByAccount = new Map<string, ReturnType<typeof Money.zero>>();
   const budgetMonthsByAccount = new Map<string, ReturnType<typeof Money.zero>[]>();
   for (const line of lines) {
@@ -377,20 +415,32 @@ export async function budgetVsActual(
     const months =
       budgetMonthsByAccount.get(line.accountId) ??
       Array.from({ length: 12 }, () => Money.zero());
-    months[line.month - 1] = months[line.month - 1].plus(Money.of(line.amount));
+    const i = fy.indexOf(line.month);
+    months[i] = months[i].plus(Money.of(line.amount));
     budgetMonthsByAccount.set(line.accountId, months);
   }
 
-  // Fetch full-year P&L actuals (closing entries are already excluded there).
-  const from = new Date(`${budget.fiscalYear}-01-01T00:00:00.000Z`);
-  const to = new Date(`${budget.fiscalYear}-12-31T23:59:59.999Z`);
-  const pl = await profitAndLoss(ctx, { from, to });
+  // Fetch full fiscal-year P&L actuals (closing entries are already excluded there).
+  const pl = await profitAndLoss(ctx, { from: fy.from, to: fy.to });
 
-  // Monthly actuals only when period columns were requested (12 extra queries).
+  // Monthly actuals (fiscal months) only when period columns were requested (12 extra queries).
   const periodMode = opts?.periods;
-  let monthlyPl: ProfitAndLossByMonth | null = null;
+  type MonthlyActuals = { income: { accountId: string; months: string[] }[]; expenses: { accountId: string; months: string[] }[] };
+  let monthlyPl: MonthlyActuals | null = null;
   if (periodMode) {
-    monthlyPl = await profitAndLossByMonth(ctx, budget.fiscalYear);
+    const perMonth = await Promise.all(fy.months.map((m) => profitAndLoss(ctx, { from: m.from, to: m.to })));
+    const collect = (side: 'income' | 'expenses') => {
+      const byAccount = new Map<string, string[]>();
+      perMonth.forEach((mp, i) => {
+        for (const l of mp[side]) {
+          const arr = byAccount.get(l.accountId) ?? Array<string>(12).fill('0.00');
+          arr[i] = l.amount;
+          byAccount.set(l.accountId, arr);
+        }
+      });
+      return [...byAccount].map(([accountId, months]) => ({ accountId, months }));
+    };
+    monthlyPl = { income: collect('income'), expenses: collect('expenses') };
   }
   const periodCount = periodMode === 'monthly' ? 12 : periodMode === 'quarterly' ? 4 : 0;
   const periodNetBudget = Array.from({ length: periodCount }, () => Money.zero());
@@ -517,7 +567,7 @@ export async function budgetVsActual(
     totalVariance: toAmountString(netVariance),
     periodLabels: periodMode
       ? periodMode === 'monthly'
-        ? [...MONTH_LABELS]
+        ? fy.months.map((m) => MONTH_LABELS[m.month - 1])
         : ['Q1', 'Q2', 'Q3', 'Q4']
       : undefined,
     periodNetTotals: periodMode
@@ -546,10 +596,6 @@ async function loadBudgetForReport(ctx: ServiceContext, budgetId: string | undef
   if (!budget) throw notFound('Budget');
   const lines = await ctx.db.select().from(budgetLines).where(eq(budgetLines.budgetId, budgetId));
   return { budget, lines };
-}
-
-function monthEnd(year: number, month: number): Date {
-  return new Date(Date.UTC(year, month, 1) - 1);
 }
 
 /** Rows for balance-sheet accounts grouped by section (used by balance-sheet budgets). */
@@ -592,9 +638,12 @@ export async function budgetOverviewReport(ctx: ServiceContext, p: ReportParams)
     if (!isBs) v[12] = v[12].plus(Money.of(l.amount));
     amounts.set(l.accountId, v);
   }
+  // Columns in fiscal order (a June 30 company's FY2026 starts with Jul 2025); each budget line
+  // keeps its calendar month column (m1 = January).
+  const fy = await budgetFiscalYear(ctx, budget.fiscalYear);
   const columns: StdColumn[] = [
     { key: 'label', header: '' },
-    ...MONTH_KEYS.map((k, i) => ({ key: k, header: `${MONTH_LABELS[i]} ${budget.fiscalYear}`, type: 'money' as const })),
+    ...fy.months.map((m) => ({ key: MONTH_KEYS[m.month - 1], header: `${MONTH_LABELS[m.month - 1]} ${m.year}`, type: 'money' as const })),
     ...(isBs ? [] : [{ key: 'total', header: 'TOTAL', type: 'money' as const }]),
   ];
   const keys = [...MONTH_KEYS, ...(isBs ? [] : ['total'])];
@@ -630,14 +679,19 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
   const meta = await loadAccountMeta(ctx);
   const isBs = budget.kind === 'balance_sheet';
   const year = budget.fiscalYear;
+  // The company's fiscal year (FY2026 of a June 30 company = Jul 2025 – Jun 2026), in fiscal order.
+  // Budget lines keep their calendar month (1 = January).
+  const fy = await budgetFiscalYear(ctx, year);
+  const lastFm = fy.months[11];
+  const fmOf = (month: number) => fy.months.find((m) => m.month === month) ?? lastFm;
   const periods: BvaPeriod[] =
     p.columns === 'month'
-      ? MONTH_KEYS.map((k, i) => ({ key: k, months: [i + 1], label: `${MONTH_LABELS[i]} ${year}` }))
+      ? fy.months.map((m) => ({ key: MONTH_KEYS[m.month - 1], months: [m.month], label: `${MONTH_LABELS[m.month - 1]} ${m.year}` }))
       : [
           {
             key: 'total',
-            months: isBs ? [12] : MONTH_KEYS.map((_, i) => i + 1),
-            label: isBs ? `Dec ${year}` : `FY${year}`,
+            months: isBs ? [lastFm.month] : fy.months.map((m) => m.month),
+            label: isBs ? `${MONTH_LABELS[lastFm.month - 1]} ${lastFm.year}` : `FY${year}`,
           },
         ];
   const n = periods.length * 2;
@@ -659,12 +713,12 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
     addForMonth(l.accountId, l.month, 1, Money.of(l.amount));
   }
   // Actual amounts (even slots).
-  const yearFrom = new Date(Date.UTC(year, 0, 1));
-  const yearTo = monthEnd(year, 12);
+  const yearFrom = fy.from;
+  const yearTo = fy.to;
   if (isBs) {
     for (let i = 0; i < periods.length; i++) {
       const lastMonth = periods[i].months[periods[i].months.length - 1];
-      for (const r of await activityByAccount(ctx, { to: monthEnd(year, lastMonth) })) {
+      for (const r of await activityByAccount(ctx, { to: fmOf(lastMonth).to })) {
         const a = meta.get(r.accountId);
         if (!a || isPLSection(a.section)) continue;
         add(r.accountId, i * 2, naturalAmount(a.section, r.debit, r.credit));

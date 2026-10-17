@@ -41,7 +41,11 @@ import {
   adjustmentPostingFields,
   assertNotFifoTracked,
   bookValueRelief,
+  fifoLayerValue,
   resolveAdjustmentAccount,
+  carriedValueRemainder,
+  sellOutRelief,
+  valueRemainderAfter,
 } from './inventory';
 import { postJournalEntry } from './posting';
 import { assertDefaultSiteQuantities } from './inventorySites';
@@ -265,6 +269,15 @@ export async function physicalCount(
   ctx: ServiceContext,
   input: PhysicalCountInput,
 ): Promise<PhysicalCountResult> {
+  // Load + validate in the same transaction as the write: a double-submitted count must see the
+  // quantity the first one left, not post the same shrinkage twice.
+  return inTransaction(ctx, (tx) => physicalCountInTx(tx, input));
+}
+
+async function physicalCountInTx(
+  ctx: ServiceContext,
+  input: PhysicalCountInput,
+): Promise<PhysicalCountResult> {
   const counted = Money.of(input.countedQty);
   if (counted.isNegative()) {
     throw validation('countedQty cannot be negative.');
@@ -308,8 +321,11 @@ export async function physicalCount(
     };
   }
 
-  // Book value before minus after (telescopes: counting to zero clears the item's value exactly).
-  const glAmount = bookValueRelief(currentQty, counted, avgCost).abs();
+  // Book value before minus after (telescopes: counting to zero clears the item's value exactly);
+  // counting to zero also takes the value remainder the GL still carries (0061), like a sell-out.
+  const atBook = bookValueRelief(currentQty, counted, avgCost);
+  const sellOut = delta.isNegative() ? sellOutRelief(item, counted, atBook) : { relief: atBook, remainderRelieved: false };
+  const glAmount = sellOut.relief.abs();
 
   return inTransaction(ctx, async (tx) => {
     // Resolve the inventory asset account
@@ -365,6 +381,7 @@ export async function physicalCount(
       .update(items)
       .set({
         quantityOnHand: counted.toFixed(4),
+        ...(sellOut.remainderRelieved ? { valueRemainder: '0.00', valueRemainderAvg: avgCost.toFixed(4) } : {}),
         updatedAt: new Date(),
       })
       .where(eq(items.id, input.itemId));
@@ -447,6 +464,15 @@ export async function adjustInventoryValue(
   ctx: ServiceContext,
   input: AdjustInventoryValueInput,
 ): Promise<AdjustInventoryValueResult> {
+  // Load + validate in the same transaction as the write: a double-submitted revaluation must
+  // see the value the first one left, not post the same write-up twice.
+  return inTransaction(ctx, (tx) => adjustInventoryValueInTx(tx, input));
+}
+
+async function adjustInventoryValueInTx(
+  ctx: ServiceContext,
+  input: AdjustInventoryValueInput,
+): Promise<AdjustInventoryValueResult> {
   const hasTotal = input.newTotalValue != null && input.newTotalValue !== '';
   const hasUnit = input.newUnitCost != null && input.newUnitCost !== '';
   if (hasTotal === hasUnit) {
@@ -473,13 +499,13 @@ export async function adjustInventoryValue(
   let oldValue: Decimal;
   if (isFifo) {
     quantity = openLayers.reduce((s, l) => s.plus(Money.of(l.quantityRemaining)), Money.zero());
-    oldValue = openLayers.reduce(
-      (s, l) => s.plus(Money.of(l.quantityRemaining).times(Money.of(l.unitCost))),
-      Money.zero(),
-    );
+    // The layers' book value as the valuation reports and the GL carry it (per-layer cents).
+    oldValue = openLayers.reduce((s, l) => s.plus(fifoLayerValue(l.quantityRemaining, l.unitCost)), Money.zero());
   } else {
     quantity = Money.of(item.quantityOnHand ?? '0');
-    oldValue = quantity.times(Money.of(item.averageCost ?? '0'));
+    // What the GL carries for the item: its book value plus the value remainder (0061), so the
+    // adjustment lands the inventory account on exactly the value asked for.
+    oldValue = Money.round2(quantity.times(Money.of(item.averageCost ?? '0'))).plus(carriedValueRemainder(item));
   }
 
   if (!quantity.greaterThan(0)) {
@@ -494,7 +520,27 @@ export async function adjustInventoryValue(
   const newValue = hasUnit ? quantity.times(unitCostTarget!) : Money.of(input.newTotalValue!);
   if (newValue.isNegative()) throw validation('newTotalValue cannot be negative.');
 
-  const delta = Money.round2(newValue.minus(oldValue));
+  // FIFO: each open layer's new unit cost (stored at 4dp) decides its new book value; the entry
+  // posts exactly the change in the layers' value, so the GL stays equal to the sum of the layer
+  // values (a target total the 4-decimal costs cannot hit exactly lands within a cent of it).
+  const layerCosts = new Map<string, Decimal>();
+  let bookedNewValue = newValue;
+  if (isFifo) {
+    for (const l of openLayers) {
+      const cost = unitCostTarget
+        ? unitCostTarget
+        : oldValue.greaterThan(0)
+          ? Money.of(l.unitCost).times(newValue.dividedBy(oldValue))
+          : newValue.dividedBy(quantity);
+      layerCosts.set(l.id, Money.of(cost.toFixed(4)));
+    }
+    bookedNewValue = openLayers.reduce(
+      (s, l) => s.plus(fifoLayerValue(l.quantityRemaining, layerCosts.get(l.id)!)),
+      Money.zero(),
+    );
+  }
+
+  const delta = Money.round2(bookedNewValue.minus(oldValue));
   if (delta.isZero()) {
     throw validation('The new value equals the current value — nothing to adjust.');
   }
@@ -525,40 +571,25 @@ export async function adjustInventoryValue(
 
     let effectiveUnitCost: Decimal;
     if (isFifo) {
-      // Revalue remaining layers: exact unit cost when given, else proportional scale.
-      if (unitCostTarget) {
-        for (const l of openLayers) {
-          await tx.db
-            .update(inventoryLayers)
-            .set({ unitCost: unitCostTarget.toFixed(4) })
-            .where(eq(inventoryLayers.id, l.id));
-        }
-        effectiveUnitCost = unitCostTarget;
-      } else if (oldValue.greaterThan(0)) {
-        const factor = newValue.dividedBy(oldValue);
-        for (const l of openLayers) {
-          await tx.db
-            .update(inventoryLayers)
-            .set({ unitCost: Money.of(l.unitCost).times(factor).toFixed(4) })
-            .where(eq(inventoryLayers.id, l.id));
-        }
-        effectiveUnitCost = newValue.dividedBy(quantity);
-      } else {
-        // Old value $0: spread the new value uniformly per remaining unit.
-        const uniform = newValue.dividedBy(quantity);
-        for (const l of openLayers) {
-          await tx.db
-            .update(inventoryLayers)
-            .set({ unitCost: uniform.toFixed(4) })
-            .where(eq(inventoryLayers.id, l.id));
-        }
-        effectiveUnitCost = uniform;
+      // Revalue remaining layers (costs worked out above): exact unit cost when given, else a
+      // proportional scale, else (old value $0) the new value spread uniformly per unit.
+      for (const l of openLayers) {
+        await tx.db
+          .update(inventoryLayers)
+          .set({ unitCost: layerCosts.get(l.id)!.toFixed(4) })
+          .where(eq(inventoryLayers.id, l.id));
       }
+      effectiveUnitCost = unitCostTarget ?? newValue.dividedBy(quantity);
     } else {
       effectiveUnitCost = newValue.dividedBy(quantity);
       await tx.db
         .update(items)
-        .set({ averageCost: effectiveUnitCost.toFixed(4), updatedAt: new Date() })
+        .set({
+          averageCost: effectiveUnitCost.toFixed(4),
+          // The cents the 4dp average cannot represent of the new value stay on record (0061).
+          ...valueRemainderAfter(item, quantity, quantity, effectiveUnitCost, delta),
+          updatedAt: new Date(),
+        })
         .where(eq(items.id, input.itemId));
     }
 

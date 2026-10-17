@@ -20,6 +20,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { statePerPeriod, SUPPORTED_STATE_CODES } from '@/lib/services/statePayrollTax';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status });
@@ -34,12 +35,12 @@ export async function POST(req: NextRequest) {
       if (err instanceof ServiceError) {
         return NextResponse.json(
           { error: err.message, code: err.code },
-          { status: err.code === 'FORBIDDEN' ? 403 : 400 },
+          { status: serviceErrorStatus(err.code) },
         );
       }
       throw err;
     }
-    const body = await req.json();
+    const body = await requireJsonObject(req);
 
     const { grossPerPeriod, periodsPerYear, state } = body as {
       grossPerPeriod?: unknown;
@@ -104,6 +105,10 @@ export async function POST(req: NextRequest) {
       notes: result.notes,
     });
   } catch (err) {
+    // e.g. requireJsonObject's VALIDATION for a malformed / non-object body.
+    if (err instanceof ServiceError) {
+      return NextResponse.json({ error: err.message, code: err.code }, { status: serviceErrorStatus(err.code) });
+    }
     console.error('[payroll/state-tax] unexpected error:', err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }

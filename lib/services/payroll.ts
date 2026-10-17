@@ -1678,126 +1678,153 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
   }
   const periodsPerYear = input.periodsPerYear ?? 26;
 
-  // Header row first; per-employee checks attach via paychecks.pay_run_id.
-  const [run] = await ctx.db
-    .insert(payRuns)
-    .values({
-      companyId: ctx.companyId,
-      payDate: input.payDate,
-      periodStart: input.periodStart ?? null,
-      periodEnd: input.periodEnd ?? null,
-      memo: input.memo?.trim() || null,
-    })
-    .returning();
-
-  await writeAudit(ctx, {
-    action: 'create',
-    entityType: 'pay_run',
-    entityId: run.id,
-    newValues: { payDate: input.payDate, employees: input.employees.length },
-  });
-
-  const results: PayRunEmployeeResult[] = [];
-
-  for (const empInput of input.employees) {
-    let employeeName = empInput.employeeId;
-    try {
-      const employee = await getEmployee(ctx, empInput.employeeId);
-      employeeName = `${employee.firstName} ${employee.lastName}`;
-
-      // --- Pulled time entries: validate ownership + unpaid, sum hours ---
-      let timeHours: ReturnType<typeof Money.zero> | null = null;
-      const timeEntryIds = [...new Set(empInput.timeEntryIds ?? [])];
-      if (timeEntryIds.length > 0) {
-        const rows = await ctx.db
-          .select()
-          .from(timeEntries)
-          .where(
-            and(
-              eq(timeEntries.companyId, ctx.companyId),
-              inArray(timeEntries.id, timeEntryIds),
-            ),
-          );
-        if (rows.length !== timeEntryIds.length) throw notFound('Time entry');
-        for (const r of rows) {
-          if (r.employeeId !== employee.id) {
-            throw validation('Time entry belongs to a different employee.');
-          }
-          if ((r.description ?? '').includes(PAYROLL_PAID_TAG)) {
-            throw validation('Time entry was already paid on a previous paycheck.');
-          }
-        }
-        timeHours = rows.reduce((s, r) => s.plus(Money.of(r.hours)), Money.zero());
-      }
-
-      // --- Default earnings ---
-      const earnings: EarningLineInput[] = [];
-      if (empInput.amount != null && empInput.amount !== '') {
-        earnings.push({ kind: 'regular', amount: empInput.amount });
-      } else if (employee.payType === 'hourly' || timeHours !== null) {
-        const hours =
-          timeHours ??
-          (empInput.hours != null && empInput.hours !== ''
-            ? Money.of(empInput.hours)
-            : Money.of(80));
-        earnings.push({
-          kind: 'regular',
-          hours: hours.toFixed(2),
-          rate: employee.payRate,
-        });
-      } else if (employee.payType === 'salary') {
-        const perPeriod = Money.round2(Money.div(employee.payRate, periodsPerYear));
-        earnings.push({ kind: 'regular', amount: toAmountString(perPeriod) });
-      } else {
-        throw validation('Commission employees need an explicit amount.');
-      }
-
-      // Withholding follows the employee's W-4 (filing status incl. head of household,
-      // Steps 2-4 or pre-2020 allowances) — runPaycheck reads it from the employee row.
-      const paycheck = await runPaycheck(ctx, {
-        employeeId: employee.id,
+  // The header row is created inside the FIRST employee transaction that posts a paycheck, so it
+  // commits (or rolls back) with that check: a run where every check is refused leaves no empty
+  // pay run behind. Each employee still posts in its own transaction; later checks attach to the
+  // committed header via paychecks.pay_run_id.
+  let run = null as typeof payRuns.$inferSelect | null;
+  const ensureRun = async (tx: ServiceContext) => {
+    if (run) return run;
+    const [created] = await tx.db
+      .insert(payRuns)
+      .values({
+        companyId: tx.companyId,
         payDate: input.payDate,
         periodStart: input.periodStart ?? null,
         periodEnd: input.periodEnd ?? null,
-        earnings,
-        deductions: empInput.deductions ?? [],
-        periodsPerYear,
-        payRunId: run.id,
-      });
+        memo: input.memo?.trim() || null,
+      })
+      .returning();
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'pay_run',
+      entityId: created.id,
+      newValues: { payDate: input.payDate, employees: input.employees.length },
+    });
+    run = created;
+    return created;
+  };
 
-      const result: PayRunEmployeeResult = {
-        employeeId: employee.id,
-        employeeName,
-        ok: true,
-        paycheckId: paycheck.id,
-        grossPay: paycheck.grossPay,
-        netPay: paycheck.netPay,
-        ...(paycheck.notes.length ? { notes: paycheck.notes } : {}),
-      };
+  const results: PayRunEmployeeResult[] = [];
+  let firstFailure: unknown = null;
 
-      // Tag pulled time entries AFTER the check posts. The paycheck is already
-      // committed, so a marking failure is surfaced as a warning, not a rollback.
-      if (timeEntryIds.length > 0) {
-        try {
-          await markTimeEntriesPaidInPayroll(ctx, timeEntryIds, paycheck.id);
-        } catch (err) {
-          result.warning = `Paycheck posted, but time entries could not be marked: ${
-            err instanceof Error ? err.message : 'unknown error'
-          }`;
+  for (const empInput of input.employees) {
+    let employeeName = empInput.employeeId;
+    // If this employee's transaction creates the header and then rolls back, so does the header.
+    const runBefore = run;
+    try {
+      // One transaction per employee: the "time not paid yet" check, the paycheck and the time
+      // tags commit together, so two pay runs at once cannot both pay the same hours.
+      const result = await inTransaction(ctx, async (tx) => {
+        const employee = await getEmployee(tx, empInput.employeeId);
+        employeeName = `${employee.firstName} ${employee.lastName}`;
+
+        // --- Pulled time entries: validate ownership + unpaid, sum hours ---
+        let timeHours: ReturnType<typeof Money.zero> | null = null;
+        const timeEntryIds = [...new Set(empInput.timeEntryIds ?? [])];
+        if (timeEntryIds.length > 0) {
+          const rows = await tx.db
+            .select()
+            .from(timeEntries)
+            .where(
+              and(
+                eq(timeEntries.companyId, tx.companyId),
+                inArray(timeEntries.id, timeEntryIds),
+              ),
+            );
+          if (rows.length !== timeEntryIds.length) throw notFound('Time entry');
+          for (const r of rows) {
+            if (r.employeeId !== employee.id) {
+              throw validation('Time entry belongs to a different employee.');
+            }
+            if ((r.description ?? '').includes(PAYROLL_PAID_TAG)) {
+              throw validation('Time entry was already paid on a previous paycheck.');
+            }
+          }
+          timeHours = rows.reduce((s, r) => s.plus(Money.of(r.hours)), Money.zero());
         }
-      }
+
+        // --- Default earnings ---
+        const earnings: EarningLineInput[] = [];
+        if (empInput.amount != null && empInput.amount !== '') {
+          earnings.push({ kind: 'regular', amount: empInput.amount });
+        } else if (employee.payType === 'hourly' || timeHours !== null) {
+          const hours =
+            timeHours ??
+            (empInput.hours != null && empInput.hours !== ''
+              ? Money.of(empInput.hours)
+              : Money.of(80));
+          earnings.push({
+            kind: 'regular',
+            hours: hours.toFixed(2),
+            rate: employee.payRate,
+          });
+        } else if (employee.payType === 'salary') {
+          const perPeriod = Money.round2(Money.div(employee.payRate, periodsPerYear));
+          earnings.push({ kind: 'regular', amount: toAmountString(perPeriod) });
+        } else {
+          throw validation('Commission employees need an explicit amount.');
+        }
+
+        // Withholding follows the employee's W-4 (filing status incl. head of household,
+        // Steps 2-4 or pre-2020 allowances) — runPaycheck reads it from the employee row.
+        const paycheck = await runPaycheck(tx, {
+          employeeId: employee.id,
+          payDate: input.payDate,
+          periodStart: input.periodStart ?? null,
+          periodEnd: input.periodEnd ?? null,
+          earnings,
+          deductions: empInput.deductions ?? [],
+          periodsPerYear,
+          payRunId: (await ensureRun(tx)).id,
+        });
+
+        const done: PayRunEmployeeResult = {
+          employeeId: employee.id,
+          employeeName,
+          ok: true,
+          paycheckId: paycheck.id,
+          grossPay: paycheck.grossPay,
+          netPay: paycheck.netPay,
+          ...(paycheck.notes.length ? { notes: paycheck.notes } : {}),
+        };
+
+        // Tag pulled time entries AFTER the check posts (in the same transaction). A marking
+        // failure (its own savepoint) is surfaced as a warning, not a rollback of the paycheck.
+        if (timeEntryIds.length > 0) {
+          try {
+            await markTimeEntriesPaidInPayroll(tx, timeEntryIds, paycheck.id);
+          } catch (err) {
+            done.warning = `Paycheck posted, but time entries could not be marked: ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`;
+          }
+        }
+        return done;
+      });
 
       results.push(result);
     } catch (err) {
+      run = runBefore;
       results.push({
         employeeId: empInput.employeeId,
         employeeName,
         ok: false,
         error: err instanceof Error ? err.message : 'Unknown error',
       });
+      if (!firstFailure) firstFailure = err;
     }
   }
 
+  if (!run) {
+    // No paycheck posted: nothing was saved (no header either) — refuse the run as a whole with
+    // the first employee's reason (e.g. PERIOD_CLOSED, so the client can offer the closing-date
+    // password) and every employee's result in details.
+    const first = firstFailure;
+    const code = first instanceof ServiceError && first.code !== 'INTERNAL' ? first.code : 'VALIDATION';
+    const reason = results[0]?.error ?? 'No paychecks could be created.';
+    throw new ServiceError(code, `No paychecks were created: ${reason}`, { results });
+  }
   return { payRun: run, results };
 }
 

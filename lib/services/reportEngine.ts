@@ -883,7 +883,8 @@ export async function resolveEntryNames(
       .where(and(eq(invoices.companyId, c), inArray(invoices.id, invIds)));
     for (const r of rows) docs.set(`inv:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: docRef(r.ref, r.num) });
   }
-  const payIds = ids('payment', 'refund');
+  // 'bounced:<paymentId>': a bounced check's re-charge belongs to the payment's customer.
+  const payIds = ids('payment', 'refund', 'bounced');
   if (payIds.length) {
     const rows = await ctx.db
       .select({ id: paymentsReceived.id, nameId: paymentsReceived.customerId, num: paymentsReceived.reference })
@@ -1038,6 +1039,7 @@ export async function resolveEntryNames(
           d = pick('inv');
           break;
         case 'payment':
+        case 'bounced':
           d = pick('pay');
           break;
         case 'refund':

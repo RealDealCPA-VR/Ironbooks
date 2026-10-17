@@ -24,6 +24,8 @@ import {
   invoiceLines,
   invoices,
   items,
+  journalEntries,
+  journalEntryLines,
   purchaseOrderLines,
   purchaseOrders,
   salesOrderLines,
@@ -429,7 +431,7 @@ export async function openPurchaseOrders(ctx: ServiceContext, p: ReportParams): 
 // Sales detail (by customer / by item) and open sales orders
 // ===========================================================================
 
-interface SalesLine {
+export interface SalesLine {
   id: string;
   /** Invoice / Sales Receipt / Credit Memo, or on a cash basis the settling transaction type. */
   type: string;
@@ -445,7 +447,14 @@ interface SalesLine {
   qty: Decimal;
   price: Decimal;
   amount: Decimal;
+  /** Cash basis: the accrual line this settled share comes from, and that line's full amount. */
+  baseId?: string;
+  baseAmount?: Decimal;
 }
+
+/** Home-currency value of a document amount (invoices may be in a foreign currency). */
+const homeOf = (v: Decimal, rate: string | null | undefined): Decimal =>
+  rate && !Money.eq(rate, 1) ? Money.round2(v.times(Money.of(rate))) : v;
 
 /**
  * Lines that are sales: every line except subtotal items (non-posting; their amount repeats the
@@ -483,12 +492,30 @@ export async function salesLines(
       qty: invoiceLines.quantity,
       rate: invoiceLines.rate,
       amount: invoiceLines.amount,
+      fx: invoices.exchangeRate,
     })
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
     .leftJoin(items, eq(invoiceLines.itemId, items.id))
     .where(and(...invConds))) {
-    out.push({ id: r.id, type: 'Invoice', sourceRef: `invoice:${r.docId}`, date: r.date, num: docRef(r.ref, r.num), customerId: r.customerId, itemId: r.itemId, item: r.item ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), price: Money.of(r.rate), amount: Money.of(r.amount) });
+    // Foreign-currency invoices: home currency at the invoice's rate, as the income was posted.
+    out.push({ id: r.id, type: 'Invoice', sourceRef: `invoice:${r.docId}`, date: r.date, num: docRef(r.ref, r.num), customerId: r.customerId, itemId: r.itemId, item: r.item ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), price: homeOf(Money.of(r.rate), r.fx), amount: homeOf(Money.of(r.amount), r.fx) });
+  }
+  // The invoice header discount (the invoice's Discount field) reduces sales like a discount
+  // line: it is posted as a debit to income, so the sales reports show it as a negative line.
+  if (!filter.itemId) {
+    const discConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), sql`${invoices.discount} <> 0`];
+    if (scope) discConds.push(scope.invoiceIds.length ? inArray(invoices.id, scope.invoiceIds) : sql`false`);
+    else discConds.push(gte(invoices.date, range.from), lte(invoices.date, range.to));
+    if (filter.customerId) discConds.push(eq(invoices.customerId, filter.customerId));
+    if (filter.classId) discConds.push(eq(invoices.classId, filter.classId));
+    for (const r of await ctx.db
+      .select({ id: invoices.id, date: invoices.date, num: invoices.invoiceNumber, ref: invoices.refNumber, customerId: invoices.customerId, discount: invoices.discount, fx: invoices.exchangeRate })
+      .from(invoices)
+      .where(and(...discConds))) {
+      const amount = homeOf(Money.of(r.discount), r.fx).negated();
+      out.push({ id: `disc:${r.id}`, type: 'Invoice', sourceRef: `invoice:${r.id}`, date: r.date, num: docRef(r.ref, r.num), customerId: r.customerId, itemId: null, item: 'Discount', memo: 'Invoice discount', qty: Money.zero(), price: amount, amount });
+    }
   }
   const srConds: SQL[] = [eq(salesReceipts.companyId, c), ne(salesReceipts.status, 'void'), SALES_LINE_ONLY, gte(salesReceipts.date, range.from), lte(salesReceipts.date, range.to)];
   if (scope) srConds.push(sql`false`);
@@ -616,11 +643,93 @@ export async function salesLinesOnBasis(
         prevAmt.set(l.id, a);
         prevQty.set(l.id, q);
         if (share.isZero() && qty.isZero()) continue;
-        out.push({ ...l, id: `${l.id}:cash${k}`, type: TXN_TYPE_LABELS[s.txnType], date: s.date, qty, amount: share, entryId: s.entryId });
+        out.push({ ...l, id: `${l.id}:cash${k}`, baseId: l.id, baseAmount: l.amount, type: TXN_TYPE_LABELS[s.txnType], date: s.date, qty, amount: share, entryId: s.entryId });
       }
     });
   }
   return out.sort((a, b) => a.date.getTime() - b.date.getTime() || a.num.localeCompare(b.num, undefined, { numeric: true }));
+}
+
+/**
+ * The COGS actually POSTED for each sales line (invoice line, sales receipt line, credit memo line
+ * — negative for a return), from the document's own COGS entries: invoice-cogs:<invoice> with
+ * reference cogs:<lineOrder>, salesreceipt:<receipt> / creditmemo-cogs:<memo> with the line id as
+ * reference. Their P&L (expense) side is the COGS, at the cost the sale relieved — not today's
+ * average cost — so it ties to the COGS accounts and never changes after the fact.
+ * Keyed by the accrual line id. Lines with no COGS entry (services, …) are absent.
+ */
+export async function postedCogsBySalesLine(ctx: ServiceContext, lines: SalesLine[]): Promise<Map<string, Decimal>> {
+  const refs = new Set<string>();
+  const invoiceIds = new Set<string>();
+  for (const l of lines) {
+    const [kind, id] = l.sourceRef.split(':');
+    if (kind === 'invoice') {
+      refs.add(`invoice-cogs:${id}`);
+      invoiceIds.add(id);
+    } else if (kind === 'salesreceipt') refs.add(`salesreceipt:${id}`);
+    else if (kind === 'credit_memo') refs.add(`creditmemo-cogs:${id}`);
+  }
+  const out = new Map<string, Decimal>();
+  if (refs.size === 0) return out;
+  // Invoice COGS entries name the line by its line order.
+  const invLineByOrder = new Map<string, string>();
+  const invIds = [...invoiceIds];
+  for (let i = 0; i < invIds.length; i += 2000) {
+    for (const r of await ctx.db
+      .select({ id: invoiceLines.id, invoiceId: invoiceLines.invoiceId, lineOrder: invoiceLines.lineOrder })
+      .from(invoiceLines)
+      .where(inArray(invoiceLines.invoiceId, invIds.slice(i, i + 2000)))) {
+      invLineByOrder.set(`${r.invoiceId}|${r.lineOrder}`, r.id);
+    }
+  }
+  const refList = [...refs];
+  for (let i = 0; i < refList.length; i += 2000) {
+    const rows = await ctx.db
+      .select({
+        sourceRef: journalEntries.sourceRef,
+        reference: journalEntries.reference,
+        accountType: accounts.type,
+        // A line's other side is NULL (not 0), so each side is coalesced before subtracting.
+        cogs: sql<string>`COALESCE(SUM(COALESCE(${journalEntryLines.debit}, 0) - COALESCE(${journalEntryLines.credit}, 0)), 0)`,
+      })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          eq(journalEntries.status, 'posted'),
+          inArray(journalEntries.sourceRef, refList.slice(i, i + 2000)),
+        ),
+      )
+      .groupBy(journalEntries.sourceRef, journalEntries.reference, accounts.type);
+    for (const r of rows) {
+      // The P&L (expense) side of the entry is the COGS; the inventory asset side mirrors it.
+      if (String(r.accountType) !== 'expense') continue;
+      const [kind, docId] = String(r.sourceRef).split(':');
+      let lineId: string | undefined;
+      if (kind === 'invoice-cogs') {
+        const m = /^cogs:(\d+)$/.exec(r.reference ?? '');
+        lineId = m ? invLineByOrder.get(`${docId}|${m[1]}`) : undefined;
+      } else {
+        lineId = r.reference ?? undefined;
+      }
+      if (!lineId) continue;
+      const v = Money.of(r.cogs);
+      if (!v.isZero()) out.set(lineId, (out.get(lineId) ?? Money.zero()).plus(v));
+    }
+  }
+  return out;
+}
+
+/** COGS of one (accrual or cash-basis) sales line from the posted COGS by line. */
+export function cogsOfSalesLine(l: SalesLine, posted: Map<string, Decimal>): Decimal {
+  const base = posted.get(l.baseId ?? l.id);
+  if (!base) return Money.zero();
+  if (!l.baseId) return base;
+  // Cash basis: the share of the line settled in this payment.
+  if (l.baseAmount && !l.baseAmount.isZero()) return Money.round2(base.times(l.amount).dividedBy(l.baseAmount));
+  return Money.zero();
 }
 
 async function salesDetail(ctx: ServiceContext, p: ReportParams, by: 'customer' | 'item'): Promise<StdReport> {
@@ -731,6 +840,9 @@ export async function salesByCustomerSummary(ctx: ServiceContext, p: ReportParam
   };
 }
 
+/** Sales by Item Summary row key of the invoice header discounts. */
+const DISCOUNT_KEY = '~invoice-discount';
+
 const ITEM_TYPE_LABEL: Record<string, string> = {
   inventory: 'Inventory',
   non_inventory: 'Non-inventory',
@@ -745,22 +857,26 @@ const ITEM_TYPE_LABEL: Record<string, string> = {
 
 /**
  * Sales by Item Summary (QB): per item, grouped by item type — Qty, Amount, % of Sales, Avg Price,
- * COGS, Avg COGS, Gross Margin and Gross Margin %. COGS for inventory items is quantity × the
- * item's average cost (QB uses its average cost too).
+ * COGS, Avg COGS, Gross Margin and Gross Margin %. COGS is what each sale actually posted (the
+ * average / FIFO cost relieved at the time of sale — postedCogsBySalesLine), so it ties to the
+ * COGS accounts and a later purchase at another cost never rewrites a past period.
  */
 export async function salesByItemSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
   const basis = p.basis === 'cash' ? 'cash' : undefined;
   const lines = await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis);
-  const acc = new Map<string, { qty: Decimal; amount: Decimal }>();
+  const posted = await postedCogsBySalesLine(ctx, lines);
+  const acc = new Map<string, { qty: Decimal; amount: Decimal; cogs: Decimal }>();
   for (const l of lines) {
-    const k = l.itemId ?? '';
-    const cur = acc.get(k) ?? { qty: Money.zero(), amount: Money.zero() };
+    // Invoice header discounts get their own row (they are not an item).
+    const k = l.itemId ?? (l.id.startsWith('disc:') ? DISCOUNT_KEY : '');
+    const cur = acc.get(k) ?? { qty: Money.zero(), amount: Money.zero(), cogs: Money.zero() };
     cur.qty = cur.qty.plus(l.qty);
     cur.amount = cur.amount.plus(l.amount);
+    cur.cogs = cur.cogs.plus(cogsOfSalesLine(l, posted));
     acc.set(k, cur);
   }
-  const ids = [...acc.keys()].filter(Boolean);
+  const ids = [...acc.keys()].filter((k) => k && k !== DISCOUNT_KEY);
   const meta = new Map(
     (ids.length
       ? await ctx.db
@@ -791,9 +907,9 @@ export async function salesByItemSummary(ctx: ServiceContext, p: ReportParams): 
   for (const [id, v] of acc) {
     if (v.amount.isZero() && v.qty.isZero()) continue;
     const it = id ? meta.get(id) : undefined;
-    const type = it ? (ITEM_TYPE_LABEL[it.type] ?? it.type) : 'No item';
-    const cogs = it && it.type === 'inventory' && it.averageCost ? Money.round2(v.qty.times(Money.of(it.averageCost))) : Money.zero();
-    groups.set(type, [...(groups.get(type) ?? []), { id, name: it?.name ?? '(no item)', agg: { ...v, cogs } }]);
+    const type = it ? (ITEM_TYPE_LABEL[it.type] ?? it.type) : id === DISCOUNT_KEY ? ITEM_TYPE_LABEL.discount : 'No item';
+    const name = it?.name ?? (id === DISCOUNT_KEY ? 'Invoice discounts' : '(no item)');
+    groups.set(type, [...(groups.get(type) ?? []), { id: id === DISCOUNT_KEY ? '' : id, name, agg: { ...v } }]);
   }
   const rows: StdRow[] = [];
   const grand: Agg = { qty: Money.zero(), amount: Money.zero(), cogs: Money.zero() };

@@ -550,6 +550,12 @@ export async function voidLoanPayment(ctx: ServiceContext, loanId: string, payme
 }
 
 export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, input: SetUpPaymentInput) {
+  // Load the balance / next payment in the same transaction as the payment: a double-submitted
+  // payment must see the first one (no second payment #N, no principal beyond what is owed).
+  return inTransaction(ctx, (tx) => setUpLoanPaymentInTx(tx, loanId, input));
+}
+
+async function setUpLoanPaymentInTx(ctx: ServiceContext, loanId: string, input: SetUpPaymentInput) {
   const loan = await getLoan(ctx, loanId);
   if (!loan.isActive) throw new ServiceError('CONFLICT', 'This loan is no longer in the Loan Manager.');
   const next = loan.next;

@@ -24,15 +24,11 @@ import { mergeClasses, mergeEmployees, mergeItems, mergeOtherNames } from '@/lib
 import { requirePermission } from '@/lib/services/access';
 import { ServiceError } from '@/lib/services/_base';
 import { mergeMoreSchema } from '@/lib/validation/lists';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' ? 400
-      : err.code === 'CONFLICT' ? 409
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[merge/route]', err);

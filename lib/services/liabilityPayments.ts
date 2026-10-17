@@ -30,7 +30,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
-import { assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { allocateCheckNumber } from './checkNumbers';
 import { assertClosedPeriodEdit } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import { getPreferences } from './company';
@@ -212,13 +212,12 @@ async function resolveCheckNumber(
   opts: { paymentAccountId: string; toPrint: boolean; number?: string | null; allowDuplicateNumber?: boolean },
 ): Promise<string | null> {
   if (opts.toPrint) return null;
-  const n = opts.number?.trim() || (await nextCheckNumber(ctx, opts.paymentAccountId));
-  await assertCheckNumberAvailable(ctx, {
+  // Callers run this inside their transaction (see allocateCheckNumber).
+  return allocateCheckNumber(ctx, {
     paymentAccountId: opts.paymentAccountId,
-    number: n,
+    number: opts.number,
     allowDuplicate: opts.allowDuplicateNumber,
   });
-  return n;
 }
 
 /**
@@ -314,8 +313,13 @@ export interface SalesTaxPaymentResult {
 
 /**
  * QB Pay Sales Tax: write one Sales Tax Payment check per agency.
- *   Dr <agency liability account, else 2200 Sales Tax Payable>   amount
- *   Cr <bank account>                                             amount
+ *   Dr 2200 Sales Tax Payable   amount
+ *   Cr <bank account>           amount
+ * Always 2200, the account every invoice / sales receipt / credit memo credits its tax to (QB keeps
+ * all sales tax in one Sales Tax Payable account). An agency's own liabilityAccountId (API-only, no
+ * screen sets it) is not used for posting: debiting it while the sales sat in 2200 drove it negative
+ * and left 2200 overstated. The sales tax ledger still reads that account, so payments posted there
+ * earlier keep counting for the agency.
  * The journal entry keeps sourceRef "tax_agency:<agencyId>" (the sales tax ledger attributes the
  * payment to the agency through it) and the check number as its reference, so the check shows in
  * the bank register, Check Detail and Missing Checks. The payment_checks row carries the payee
@@ -350,7 +354,7 @@ export async function paySalesTaxAgencies(
       const { agency, vendor } = await ensureAgencyVendor(tx, p.agencyId);
       resolved.push({ agency, vendor, amount: toAmountString(Money.of(p.amount)) });
     }
-    const fallback2200 = await accountIdByCode(tx, CODE_SALES_TAX_PAYABLE);
+    const salesTaxPayableId = await accountIdByCode(tx, CODE_SALES_TAX_PAYABLE);
     const checks: SalesTaxPaymentResult['checks'] = [];
     let number: string | null = input.checkNumber?.trim() || null;
     let total = Money.zero();
@@ -370,7 +374,7 @@ export async function paySalesTaxAgencies(
         reference,
         sourceRef: `tax_agency:${r.agency.id}`,
         lines: [
-          { accountId: r.agency.liabilityAccountId ?? fallback2200, debit: r.amount, memo: memo ?? `Sales tax — ${r.agency.name}` },
+          { accountId: salesTaxPayableId, debit: r.amount, memo: memo ?? `Sales tax — ${r.agency.name}` },
           { accountId: input.paymentAccountId, credit: r.amount, memo: `Sales Tax Payment — ${payee}` },
         ],
       });
@@ -551,6 +555,14 @@ export async function markPaymentCheckPrinted(
   ctx: ServiceContext,
   input: { id: string; checkNumber?: string; allowDuplicateNumber?: boolean },
 ): Promise<PaymentCheckRow> {
+  // Load, number and stamp in one transaction (two checks printed at once get different numbers).
+  return inTransaction(ctx, (tx) => markPaymentCheckPrintedInTx(tx, input));
+}
+
+async function markPaymentCheckPrintedInTx(
+  ctx: ServiceContext,
+  input: { id: string; checkNumber?: string; allowDuplicateNumber?: boolean },
+): Promise<PaymentCheckRow> {
   const check = await getPaymentCheck(ctx, input.id);
   if (check.voidedAt) throw new ServiceError('CONFLICT', 'This check is void and cannot be printed.');
   if (check.postedEntryId) {
@@ -562,10 +574,9 @@ export async function markPaymentCheckPrinted(
     if (entry?.status === 'void') throw new ServiceError('CONFLICT', 'This check is void and cannot be printed.');
   }
   if (!check.toPrint) throw new ServiceError('CONFLICT', 'This check is not in the print queue.');
-  const checkNumber = input.checkNumber?.trim() || (await nextCheckNumber(ctx, check.paymentAccountId));
-  await assertCheckNumberAvailable(ctx, {
+  const checkNumber = await allocateCheckNumber(ctx, {
     paymentAccountId: check.paymentAccountId,
-    number: checkNumber,
+    number: input.checkNumber,
     exclude: { source: 'payment_check', id: check.id },
     allowDuplicate: input.allowDuplicateNumber,
   });
@@ -599,6 +610,15 @@ export async function markPaymentCheckPrinted(
  * check to the customer. The refund itself is already posted; this only adds the check document.
  */
 export async function queueCustomerRefundCheck(
+  ctx: ServiceContext,
+  input: { entryId: string; memo?: string | null },
+): Promise<PaymentCheckRow> {
+  // "Already has a check" is checked in the same transaction as the insert, so a double-submit
+  // cannot queue two checks for one refund.
+  return inTransaction(ctx, (tx) => queueCustomerRefundCheckInTx(tx, input));
+}
+
+async function queueCustomerRefundCheckInTx(
   ctx: ServiceContext,
   input: { entryId: string; memo?: string | null },
 ): Promise<PaymentCheckRow> {

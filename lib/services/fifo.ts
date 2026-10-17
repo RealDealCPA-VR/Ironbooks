@@ -26,13 +26,14 @@ import { items, accounts, inventoryLayers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
+  ServiceError,
   inTransaction,
   notFound,
   validation,
   writeAudit,
 } from './_base';
 import { postJournalEntry } from './posting';
-import { type AdjustmentDimensions, adjustmentPostingFields, resolveAdjustmentAccount } from './inventory';
+import { type AdjustmentDimensions, adjustmentPostingFields, cogsAccountForItem, fifoLayerValue, resolveAdjustmentAccount } from './inventory';
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -266,9 +267,10 @@ export async function takeFromLayers(
     const layerQty = Money.of(layer.quantityRemaining);
     const unitCost = Money.of(layer.unitCost);
     const take = remaining.lessThanOrEqualTo(layerQty) ? remaining : layerQty;
-    // The layer's value before minus after (each rounded to the cent): telescopes over partial
-    // draws, so emptying a layer relieves exactly the value it still carried (no stranded cent).
-    const layerCost = Money.round2(layerQty.times(unitCost)).minus(Money.round2(layerQty.minus(take).times(unitCost)));
+    // The layer's value before minus after (inventory.ts fifoLayerValue, the valuation reports'
+    // rule): telescopes over partial draws, so emptying a layer relieves exactly the value it
+    // still carried, and the GL stays equal to the sum of the remaining layers' values.
+    const layerCost = fifoLayerValue(layerQty, unitCost).minus(fifoLayerValue(layerQty.minus(take), unitCost));
     cost = cost.plus(layerCost);
     taken.push({
       layerId: layer.id,
@@ -283,6 +285,143 @@ export async function takeFromLayers(
     remaining = remaining.minus(take);
   }
   return { cost: Money.round2(cost), layers: taken };
+}
+
+/**
+ * How far the value a reversal takes out of layers may differ from the amount the document posted
+ * by rounding alone: the cent, plus a 4-decimal unit cost times the quantity.
+ */
+export function layerRoundingTolerance(qty: Decimal): Decimal {
+  return Money.of('0.01').plus(qty.abs().times('0.00005'));
+}
+
+export interface DocumentLayerReversal {
+  itemId: string;
+  itemName: string;
+  /**
+   * inventory_layers.source_ref of the layers the document created (bill:<id>, expense:<id>,
+   * item_receipt:<id>, creditmemo-cogs:<memoId>:<lineId>). Several candidates may be given; the
+   * ones the document actually used are found by their layers.
+   */
+  sourceRefs: string[];
+  qty: Decimal;
+  /** The home amount the document posted for these units — what its voided entry takes off the GL. */
+  expectedValue: Decimal;
+  /** The line's unit cost (picks the closest layer when the document made several); default value / qty. */
+  unitCost?: Decimal | null;
+  /** What is refused, for the message: e.g. "void this bill", "reverse this check's receipt". */
+  action: string;
+  /** Date of the rounding true-up entry, when one is needed (default: now). */
+  trueUpDate?: Date | null;
+}
+
+/**
+ * Pull units back out of the FIFO layers ONE document created, for a void / edit of that
+ * document (whose journal entry is voided, so exactly the value it posted leaves the GL):
+ *  - the document's own layers first (closest unit cost, newest), then layers at one of their
+ *    costs (units a voided sale restored at that cost are worth the same);
+ *  - CONFLICT when they no longer hold the quantity: some of the units it received were sold or
+ *    used (QuickBooks refuses to void a purchase whose items are gone, too);
+ *  - CONFLICT when they hold it at a different value than the document posted (beyond rounding):
+ *    their cost was changed since (inventory value adjustment), so taking them out would leave the
+ *    inventory account and the valuation apart.
+ * Returns null — touching nothing — when the document created no tagged layer for the item (older
+ * data), so the caller can fall back to its legacy matching. Writes the layers only.
+ */
+export async function takeFromDocumentLayers(
+  tx: ServiceContext,
+  input: DocumentLayerReversal,
+): Promise<{ cost: Decimal } | null> {
+  const layers = await tx.db
+    .select()
+    .from(inventoryLayers)
+    .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, input.itemId)))
+    .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt));
+  const refs = new Set(input.sourceRefs);
+  const own = layers.filter((l) => l.sourceRef != null && refs.has(l.sourceRef));
+  if (own.length === 0) return null;
+
+  const qty = input.qty;
+  const open = (l: (typeof layers)[number]) => Money.of(l.quantityRemaining).greaterThan(0);
+  const target = input.unitCost ?? (qty.isZero() ? Money.zero() : input.expectedValue.dividedBy(qty));
+  const distance = (l: (typeof layers)[number]) => Money.of(l.unitCost).minus(target).abs();
+  const ownOpen = own
+    .filter(open)
+    .sort((a, b) => distance(a).comparedTo(distance(b)) || b.createdAt.getTime() - a.createdAt.getTime());
+  const ownCosts = new Set(own.map((l) => Money.of(l.unitCost).toFixed(4)));
+  const sameCost = layers
+    .filter((l) => !own.includes(l) && open(l) && ownCosts.has(Money.of(l.unitCost).toFixed(4)))
+    .reverse();
+
+  // Plan first, write after both checks pass.
+  const plan: Array<{ id: string; left: Decimal }> = [];
+  let remaining = new Decimal(qty);
+  let value = Money.zero();
+  for (const layer of [...ownOpen, ...sameCost]) {
+    if (!remaining.greaterThan(0)) break;
+    const layerQty = Money.of(layer.quantityRemaining);
+    const take = remaining.lessThanOrEqualTo(layerQty) ? remaining : layerQty;
+    value = value.plus(fifoLayerValue(layerQty, layer.unitCost).minus(fifoLayerValue(layerQty.minus(take), layer.unitCost)));
+    plan.push({ id: layer.id, left: layerQty.minus(take) });
+    remaining = remaining.minus(take);
+  }
+  if (remaining.greaterThan(0)) {
+    throw new ServiceError(
+      'CONFLICT',
+      `Cannot ${input.action}: ${remaining.toFixed(4)} of the ${qty.toFixed(4)} "${input.itemName}" it received have since been sold or used. Void or edit those transactions first.`,
+    );
+  }
+  if (Money.round2(value).minus(Money.round2(input.expectedValue)).abs().greaterThan(layerRoundingTolerance(qty))) {
+    throw new ServiceError(
+      'CONFLICT',
+      `Cannot ${input.action}: the "${input.itemName}" it received are now valued at ${toAmountString(value)}, not the ${toAmountString(input.expectedValue)} it posted (their cost was adjusted since). Reverse the inventory value adjustment first.`,
+    );
+  }
+  for (const p of plan) {
+    await tx.db
+      .update(inventoryLayers)
+      .set({ quantityRemaining: p.left.toFixed(4) })
+      .where(eq(inventoryLayers.id, p.id));
+  }
+  // Within rounding, the layers may still carry a cent more or less than the document posted (a
+  // 4-decimal unit cost times the quantity, or a value adjustment smaller than that). The voided
+  // entry takes the posted amount off the GL; true the inventory account up to the value the
+  // layers actually gave back (against the item's COGS account), so GL == valuation to the cent.
+  const trueUp = Money.round2(input.expectedValue).minus(Money.round2(value));
+  if (!trueUp.isZero()) {
+    const [item] = await tx.db
+      .select({ assetAccountId: items.assetAccountId, expenseAccountId: items.expenseAccountId })
+      .from(items)
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, input.itemId)));
+    const inventoryAccountId = item?.assetAccountId ?? (await accountIdByCode(tx, '1300'));
+    const offsetAccountId = await cogsAccountForItem(tx, item ?? {});
+    const amount = toAmountString(trueUp.abs());
+    const memo = `Rounding — ${input.itemName} (${input.action})`;
+    await postJournalEntry(tx, {
+      date: input.trueUpDate ?? new Date(),
+      description: memo,
+      sourceRef: `item:${input.itemId}`,
+      lines: trueUp.greaterThan(0)
+        ? [
+            { accountId: inventoryAccountId, debit: amount, memo },
+            { accountId: offsetAccountId, credit: amount, memo },
+          ]
+        : [
+            { accountId: offsetAccountId, debit: amount, memo },
+            { accountId: inventoryAccountId, credit: amount, memo },
+          ],
+    });
+  }
+  return { cost: Money.round2(value) };
+}
+
+/**
+ * Candidate layer source refs of a purchase document from a reversal reason such as
+ * "bill_void:<id>" / "expense_edit:<id>": the document id is the reason's last segment.
+ */
+export function purchaseLayerRefs(reason: string): string[] {
+  const id = reason.slice(reason.lastIndexOf(':') + 1);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? [`bill:${id}`, `expense:${id}`] : [];
 }
 
 export interface ConsumedLayer {
@@ -322,10 +461,11 @@ export async function consumeStock(
     // Post GL: Dr COGS (sales) / Adjustment Account (adjustments), Cr Inventory
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
     const isAdjustment = input.purpose === 'adjustment';
+    // A sale posts to the item's own COGS account (5000 by default) with the sale's class.
     const cogsAccountId = isAdjustment
       ? await resolveAdjustmentAccount(tx, input.adjustmentAccountId)
-      : await accountIdByCode(tx, '5000');
-    const dims = isAdjustment ? await adjustmentPostingFields(tx, input) : {};
+      : await cogsAccountForItem(tx, item);
+    const dims = isAdjustment ? await adjustmentPostingFields(tx, input) : input.classId ? { classId: input.classId } : {};
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
@@ -453,7 +593,7 @@ export async function fifoValuation(ctx: ServiceContext): Promise<FifoValuationR
       .map((l) => {
         const qty = Money.of(l.quantityRemaining);
         const cost = Money.of(l.unitCost);
-        const value = Money.round2(qty.times(cost));
+        const value = fifoLayerValue(qty, cost);
         itemTotal = itemTotal.plus(value);
         itemQty = itemQty.plus(qty);
         return {

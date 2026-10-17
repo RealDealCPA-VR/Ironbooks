@@ -11,15 +11,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { expireOverdueEstimates } from '@/lib/services/estimateExpiry';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
-      : err.code === 'CONFLICT' ? 409
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json(
       { error: err.message, code: err.code, details: err.details },
       { status },
@@ -33,12 +29,8 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
 
-    let body: { asOf?: string } = {};
-    try {
-      body = await req.json();
-    } catch {
-      // empty body is fine — we'll default asOf to today
-    }
+    // An empty body is fine (asOf defaults to today); malformed JSON or a non-object body is a 400.
+    const body: { asOf?: string } = await requireJsonObject(req, { optional: true });
 
     const asOf = body.asOf ? new Date(body.asOf) : new Date();
 

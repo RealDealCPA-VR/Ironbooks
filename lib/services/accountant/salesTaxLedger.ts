@@ -26,15 +26,18 @@
  * the current tax item setup); the amounts themselves always come from the posted ledger, so a
  * later rate change can move tax between an agency's components but never changes the totals.
  *
- * Cash basis (optional) recognizes invoice tax only as customers pay (pro rata by payment
- * applications, on the payment date). Sales receipts, credit memos, payments and adjustments are
- * recognized on their own date. Cash-basis figures are a report view; they intentionally do not
- * tie to the accrual GL.
+ * Cash basis (optional) recognizes invoice tax only as customers settle the invoice, pro rata to
+ * its billed base (total minus retainage), on the settlement dates cashBasisLedger.ts uses:
+ * payments (cash + early-payment discount), credits applied, payment-item lines on the invoice,
+ * and bounced checks reversed on the bounce date (see invoiceSettlements). Sales receipts, credit
+ * memos, payments and adjustments are recognized on their own date. Cash-basis figures are a
+ * report view; they intentionally do not tie to the accrual GL.
  */
 import { and, eq, inArray, lte, sql } from 'drizzle-orm';
 import {
   accounts,
-  auditLogs,
+  bouncedChecks,
+  creditApplications,
   creditMemoLines,
   creditMemos,
   customers,
@@ -372,8 +375,8 @@ async function loadDocumentShares(
       .leftJoin(customers, eq(creditMemos.customerId, customers.id))
       .where(and(eq(creditMemos.companyId, ctx.companyId), inArray(creditMemos.id, docIds.credit_memo)));
     for (const h of heads) {
-      // Memo lines carry no taxable flag / per-line rate: the whole memo tax belongs to the
-      // memo-level rate (legacy memos without one fall back to the customer's default rate).
+      // Memo lines carry no per-line rate: the whole memo tax belongs to the memo-level rate
+      // (legacy memos without one fall back to the customer's default rate).
       const rateId = h.taxRateId ?? h.custRate ?? null;
       shares.set(`credit_memo:${h.id}`, splitRate(rateId ? rates.get(rateId) : undefined, rateId, Money.of(1)));
     }
@@ -532,124 +535,208 @@ export async function salesTaxActivity(
 // ---------------------------------------------------------------------------
 
 /**
- * Re-time invoice tax onto customer payment dates (pro rata: applied / invoice total).
- * Everything else keeps its own date. Returns rows in the same shape as salesTaxActivity.
+ * Re-time invoice tax onto the dates customers settle the invoice (pro rata: settled / billed
+ * base, see invoiceSettlements). Everything else keeps its own date. Returns rows in the same
+ * shape as salesTaxActivity.
  */
 async function toCashBasis(ctx: ServiceContext, rows: SalesTaxActivity[]): Promise<SalesTaxActivity[]> {
   const invoiceIds = [...new Set(rows.filter((r) => r.docType === 'invoice' && r.docId).map((r) => r.docId!))];
   if (invoiceIds.length === 0) return rows;
-  const heads = await ctx.db
-    .select({ id: invoices.id, total: invoices.total })
-    .from(invoices)
-    .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)));
-  const totalById = new Map(heads.map((h) => [h.id, Money.of(h.total)]));
-  const invDate = new Map(
-    rows.filter((r) => r.docType === 'invoice' && r.docId).map((r) => [r.docId!, r.date] as const),
-  );
-  const apps = await invoiceSettlements(ctx, invoiceIds, invDate);
+  const heads = await loadInvoiceHeads(ctx, invoiceIds);
+  const baseById = new Map(heads.map((h) => [h.id, settledBase(h)]));
+  const byInvoice = groupByInvoice(await invoiceSettlements(ctx, heads));
   const out: SalesTaxActivity[] = [];
   for (const r of rows) {
     if (r.docType !== 'invoice' || !r.docId) {
       out.push(r);
       continue;
     }
-    const total = totalById.get(r.docId);
-    if (!total || total.isZero()) continue;
-    // Cumulative allocation: each settlement's share is round(tax * cumulativeApplied / total) minus
-    // what earlier settlements already took, so rounding never drifts. Once the invoice is fully
-    // settled the shares sum to exactly the invoice tax (cash basis == accrual).
+    const base = baseById.get(r.docId);
+    if (!base) continue;
+    if (!base.greaterThan(0)) {
+      // Nothing can ever be paid on it (e.g. 100% retainage): recognize the tax on its own date.
+      out.push(r);
+      continue;
+    }
+    // Cumulative allocation: each settlement's share is round(tax * cumulative settled / base)
+    // minus what earlier settlements already took, so rounding never drifts. Once the invoice is
+    // fully settled the shares sum to exactly the invoice tax (cash basis == accrual); a bounced
+    // check (negative settlement) takes its share back on the bounce date.
     const tax = Money.of(r.amount);
-    let cumApplied = Money.of(0);
-    let allocated = Money.of(0);
-    for (const a of apps.filter((x) => x.invoiceId === r.docId)) {
-      cumApplied = cumApplied.plus(Money.of(a.amount));
-      const target = cumApplied.greaterThanOrEqualTo(total)
+    let cum = Money.zero();
+    let allocated = Money.zero();
+    for (const a of byInvoice.get(r.docId) ?? []) {
+      cum = cum.plus(a.amount);
+      const target = cum.greaterThanOrEqualTo(base)
         ? tax
-        : Money.round2(tax.times(cumApplied).dividedBy(total));
+        : cum.lessThanOrEqualTo(0)
+          ? Money.zero()
+          : Money.round2(tax.times(cum).dividedBy(base));
       const share = target.minus(allocated);
       allocated = target;
       if (share.isZero()) continue;
-      out.push({ ...r, date: a.date, amount: toAmountString(share), description: `${r.description} (paid)` });
+      const note = a.amount.isNegative() ? 'payment reversed' : 'paid';
+      out.push({ ...r, date: a.date, amount: toAmountString(share), description: `${r.description} (${note})` });
     }
   }
   return out.sort((a, b) => a.date.getTime() - b.date.getTime());
 }
 
-/** One settlement of an invoice: a customer payment application or an applied credit memo. */
-interface InvoiceSettlement {
-  invoiceId: string;
-  amount: string;
+/** Invoice header fields the cash-basis views need. */
+interface InvoiceHead {
+  id: string;
   date: Date;
-  paymentId: string;
+  total: string;
+  retainageAmount: string | null;
+  amountPaid: string;
+}
+
+async function loadInvoiceHeads(ctx: ServiceContext, invoiceIds: string[]): Promise<InvoiceHead[]> {
+  if (invoiceIds.length === 0) return [];
+  return ctx.db
+    .select({
+      id: invoices.id,
+      date: invoices.date,
+      total: invoices.total,
+      retainageAmount: invoices.retainageAmount,
+      amountPaid: invoices.amountPaid,
+    })
+    .from(invoices)
+    .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)));
 }
 
 /**
- * Every live settlement of the given invoices (payments applied + credit memos applied), in date
- * then id order. Cash basis recognizes invoice tax (and Revenue Summary invoice sales) pro rata on
- * these dates, as QB does.
+ * What settling the invoice in full means: its billed base, total minus the retainage held back
+ * (as in cashBasisLedger.ts and QB, where retainage is a balance-sheet line of the invoice).
+ * Paying the billed base recognizes all of the invoice's tax; the retainage billing invoice that
+ * later collects the holdback carries no tax of its own.
  */
-async function invoiceSettlements(
-  ctx: ServiceContext,
-  invoiceIds: string[],
-  invDate: Map<string, Date>,
-): Promise<InvoiceSettlement[]> {
-  if (invoiceIds.length === 0) return [];
-  const apps: InvoiceSettlement[] = (
-    await ctx.db
-      .select({
-        invoiceId: paymentApplications.invoiceId,
-        amount: paymentApplications.amountApplied,
-        date: paymentsReceived.date,
-        paymentId: paymentsReceived.id,
-      })
-      .from(paymentApplications)
-      .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
-      .where(
-        and(
-          inArray(paymentApplications.invoiceId, invoiceIds),
-          eq(paymentsReceived.companyId, ctx.companyId),
-          sql`${paymentsReceived.voidedAt} IS NULL`,
-        ),
-      )
-  ).map((a) => ({ invoiceId: String(a.invoiceId), amount: String(a.amount), date: a.date, paymentId: a.paymentId }));
-  // Credit memos applied to an invoice settle it just like a payment (QB cash basis). applyToInvoice
-  // records the edge only in the audit trail (newValues.appliedToInvoice / amountApplied), so read
-  // it from there. The settlement date is the later of the memo date and the invoice date, so the
-  // invoice tax recognised by the credit lands in the same period as the memo's credited tax.
-  // KNOWN LIMIT: there is no credit-application table yet, so if an application is later edited or
-  // removed outside applyToInvoice the cash-basis view can go stale. Move to the real table once
-  // one exists (voided memos are already excluded below).
-  const creditRows = await ctx.db
-    .select({ memoId: auditLogs.entityId, newValues: auditLogs.newValues })
-    .from(auditLogs)
+function settledBase(h: Pick<InvoiceHead, 'total' | 'retainageAmount'>): Dec {
+  return Money.sub(h.total, h.retainageAmount ?? 0);
+}
+
+/** One dated settlement of an invoice (signed: a bounced check reverses on its own date). */
+interface InvoiceSettlement {
+  invoiceId: string;
+  amount: Dec;
+  date: Date;
+  /** Tie-break for a stable order. */
+  key: string;
+}
+
+function groupByInvoice(list: InvoiceSettlement[]): Map<string, InvoiceSettlement[]> {
+  const m = new Map<string, InvoiceSettlement[]>();
+  for (const s of list) {
+    const arr = m.get(s.invoiceId) ?? [];
+    arr.push(s);
+    m.set(s.invoiceId, arr);
+  }
+  return m;
+}
+
+/**
+ * Every settlement of the given invoices, dated: the same events the cash-basis ledger
+ * (cashBasisLedger.ts) recognizes invoice income on, so cash-basis tax and income agree (QB):
+ *  - payment applications: cash + early-payment discount, on the payment date;
+ *  - bounced checks: the snapshotted applications stay settled on the payment date and reverse
+ *    on the bounce date (a period already reported is never rewritten);
+ *  - credit memos applied (live credit_applications rows; an undone application is gone), on the
+ *    memo date, where the memo's own credited tax is recognized, so the two offset;
+ *  - whatever the invoice still shows as paid beyond those (payment-item lines entered on the
+ *    invoice itself, legacy credits applied before credit_applications existed), on the invoice
+ *    date.
+ * No settlement counts before the invoice date. Sorted by date, positive settlements first on the
+ * same day (a same-day bounce never dips below zero).
+ */
+async function invoiceSettlements(ctx: ServiceContext, heads: InvoiceHead[]): Promise<InvoiceSettlement[]> {
+  if (heads.length === 0) return [];
+  const ids = heads.map((h) => h.id);
+  const headById = new Map(heads.map((h) => [h.id, h]));
+  const out: InvoiceSettlement[] = [];
+  const dated = new Map<string, Dec>();
+  const push = (invoiceId: string, amount: Dec, date: Date, key: string) => {
+    const h = headById.get(invoiceId);
+    if (!h || amount.isZero()) return;
+    out.push({ invoiceId, amount, date: date < h.date ? h.date : date, key });
+    dated.set(invoiceId, (dated.get(invoiceId) ?? Money.zero()).plus(amount));
+  };
+
+  const pays = await ctx.db
+    .select({
+      invoiceId: paymentApplications.invoiceId,
+      applied: paymentApplications.amountApplied,
+      discount: paymentApplications.discountAmount,
+      date: paymentsReceived.date,
+      paymentId: paymentsReceived.id,
+    })
+    .from(paymentApplications)
+    .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
     .where(
       and(
-        eq(auditLogs.companyId, ctx.companyId),
-        eq(auditLogs.entityType, 'credit_memo'),
-        sql`${auditLogs.newValues}->>'appliedToInvoice' IS NOT NULL`,
+        inArray(paymentApplications.invoiceId, ids),
+        eq(paymentsReceived.companyId, ctx.companyId),
+        sql`${paymentsReceived.voidedAt} IS NULL`,
       ),
     );
-  const relevant = creditRows.filter((c) =>
-    invoiceIds.includes(String((c.newValues as { appliedToInvoice?: string } | null)?.appliedToInvoice ?? '')),
-  );
-  if (relevant.length > 0) {
-    const memoIds = [...new Set(relevant.map((c) => c.memoId))];
-    const memoHeads = await ctx.db
-      .select({ id: creditMemos.id, date: creditMemos.date, status: creditMemos.status })
-      .from(creditMemos)
-      .where(and(eq(creditMemos.companyId, ctx.companyId), inArray(creditMemos.id, memoIds)));
-    const memoById = new Map(memoHeads.map((m) => [m.id, m]));
-    for (const c of relevant) {
-      const nv = c.newValues as { appliedToInvoice: string; amountApplied?: string };
-      const m = memoById.get(c.memoId);
-      if (!m || m.status === 'void') continue;
-      const id = invDate.get(nv.appliedToInvoice);
-      const date = id && id.getTime() > m.date.getTime() ? id : m.date;
-      apps.push({ invoiceId: nv.appliedToInvoice, amount: nv.amountApplied ?? '0', date, paymentId: c.memoId });
+  for (const p of pays) {
+    push(String(p.invoiceId), Money.add(p.applied, p.discount ?? 0), p.date, `p:${p.paymentId}`);
+  }
+
+  // Bounced checks: recordBouncedCheck deletes the payment's applications (snapshotted on the
+  // bounced-check row) and reopens the invoices.
+  const bounced = await ctx.db
+    .select({
+      date: bouncedChecks.date,
+      applications: bouncedChecks.applications,
+      payDate: paymentsReceived.date,
+      paymentId: paymentsReceived.id,
+    })
+    .from(bouncedChecks)
+    .innerJoin(paymentsReceived, eq(bouncedChecks.paymentId, paymentsReceived.id))
+    .where(eq(bouncedChecks.companyId, ctx.companyId));
+  for (const b of bounced) {
+    for (const a of b.applications ?? []) {
+      const invoiceId = String(a.invoiceId ?? '');
+      const amount = Money.add(a.amountApplied ?? 0, a.discountAmount ?? 0);
+      if (!amount.greaterThan(0) || !headById.has(invoiceId)) continue;
+      push(invoiceId, amount, b.payDate, `p:${b.paymentId}`);
+      push(invoiceId, amount.negated(), b.date, `b:${b.paymentId}`);
     }
   }
-  apps.sort((a, b) => a.date.getTime() - b.date.getTime() || String(a.paymentId).localeCompare(String(b.paymentId)));
-  return apps;
+
+  // Credit memos applied to the invoices settle them just like a payment (QB cash basis). The live
+  // credit_applications rows say how much (an undone application is deleted, so it stops counting).
+  // The settlement is dated like the memo's own credited tax, which cash basis recognizes on the
+  // memo date: the later of the memo date and the invoice date. The two then offset in the same
+  // period. Dating it on the application day instead would leave the memo month with a negative
+  // liability whenever a credit is applied later than it was issued.
+  const credits = await ctx.db
+    .select({
+      id: creditApplications.id,
+      invoiceId: creditApplications.invoiceId,
+      amount: creditApplications.amount,
+      memoDate: creditMemos.date,
+      memoStatus: creditMemos.status,
+    })
+    .from(creditApplications)
+    .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
+    .where(and(eq(creditApplications.companyId, ctx.companyId), inArray(creditApplications.invoiceId, ids)));
+  for (const c of credits) {
+    if (c.memoStatus === 'void') continue;
+    push(c.invoiceId, Money.of(c.amount), c.memoDate, `c:${c.id}`);
+  }
+
+  // The rest of what the invoice shows as paid (payment-item lines, legacy credits).
+  for (const h of heads) {
+    const rest = Money.of(h.amountPaid).minus(dated.get(h.id) ?? Money.zero());
+    if (rest.greaterThan(0)) push(h.id, rest, h.date, 'a:own');
+  }
+
+  out.sort(
+    (a, b) =>
+      a.date.getTime() - b.date.getTime() || b.amount.comparedTo(a.amount) || a.key.localeCompare(b.key),
+  );
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -924,9 +1011,17 @@ export async function salesTaxRevenueSummary(
   };
 
   // Cash basis (QB "owe sales tax upon receipt of payment"): an invoice's sales count only as the
-  // customer pays, pro rata (settled in range / invoice total), on the payment dates.
+  // customer settles it, pro rata (settled in range / billed base), on the settlement dates.
   const invHeadsAll = await ctx.db
-    .select({ id: invoices.id, taxRateId: invoices.taxRateId, fx: invoices.exchangeRate, total: invoices.total, date: invoices.date })
+    .select({
+      id: invoices.id,
+      taxRateId: invoices.taxRateId,
+      fx: invoices.exchangeRate,
+      total: invoices.total,
+      retainageAmount: invoices.retainageAmount,
+      amountPaid: invoices.amountPaid,
+      date: invoices.date,
+    })
     .from(invoices)
     .where(
       and(
@@ -935,45 +1030,57 @@ export async function salesTaxRevenueSummary(
       ),
     );
   // Cash basis: fraction of each invoice settled before the range start and through the range end
-  // (capped at 1). Sales in range = share through end minus share before start, rounded per line on
-  // the running total (same cumulative approach as toCashBasis uses for the tax).
+  // (clamped to 0..1). Sales in range = share through end minus share before start, rounded per line
+  // on the running total (same cumulative approach as toCashBasis uses for the tax).
   const invShare = new Map<string, { before: Dec; through: Dec }>();
   if (basis === 'cash' && invHeadsAll.length) {
-    const settlements = await invoiceSettlements(
-      ctx,
-      invHeadsAll.map((h) => h.id),
-      new Map(invHeadsAll.map((h) => [h.id, h.date] as const)),
-    );
+    const byInvoice = groupByInvoice(await invoiceSettlements(ctx, invHeadsAll));
     for (const h of invHeadsAll) {
-      const total = Money.of(h.total);
-      if (!total.greaterThan(0)) continue;
+      const base = settledBase(h);
+      if (!base.greaterThan(0)) {
+        // Nothing can be paid on it (e.g. 100% retainage): its sales count on its own date.
+        if (Money.gt(h.total, 0) && inRange(h.date, range) === 'in') {
+          invShare.set(h.id, { before: Money.zero(), through: Money.of(1) });
+        }
+        continue;
+      }
       let before = Money.zero();
       let through = Money.zero();
-      for (const x of settlements) {
-        if (x.invoiceId !== h.id) continue;
+      for (const x of byInvoice.get(h.id) ?? []) {
         const where = inRange(x.date, range);
         if (where === 'after') continue;
-        through = through.plus(Money.of(x.amount));
-        if (where === 'before') before = before.plus(Money.of(x.amount));
+        through = through.plus(x.amount);
+        if (where === 'before') before = before.plus(x.amount);
       }
-      const frac = (v: Dec) => (v.greaterThanOrEqualTo(total) ? Money.of(1) : v.dividedBy(total));
-      if (through.greaterThan(before)) invShare.set(h.id, { before: frac(before), through: frac(through) });
+      const frac = (v: Dec) =>
+        v.greaterThanOrEqualTo(base) ? Money.of(1) : v.lessThanOrEqualTo(0) ? Money.zero() : v.dividedBy(base);
+      const share = { before: frac(before), through: frac(through) };
+      // A bounced check in range gives a negative share (the sales it had recognized come back off).
+      if (!share.through.equals(share.before)) invShare.set(h.id, share);
     }
   }
   const invHeads = basis === 'cash' ? invHeadsAll.filter((h) => invShare.has(h.id)) : invHeadsAll;
   if (invHeads.length) {
+    // Billed retainage (a line on Retainage Receivable, see retainage.ts billRetainage) collects a
+    // receivable the original invoice already counted as sales (and taxed): it is not a sale.
+    const [retainageAcct] = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1250')));
     const lines = await ctx.db
       .select({
         docId: invoiceLines.invoiceId,
         itemId: invoiceLines.itemId,
+        accountId: invoiceLines.accountId,
         amount: invoiceLines.amount,
         taxable: invoiceLines.taxable,
         taxRateId: invoiceLines.taxRateId,
       })
       .from(invoiceLines)
       .where(inArray(invoiceLines.invoiceId, invHeads.map((h) => h.id)));
+    const salesLines = retainageAcct ? lines.filter((l) => l.accountId !== retainageAcct.id) : lines;
     for (const h of invHeads) {
-      addDoc(h.taxRateId, lines.filter((l) => l.docId === h.id), Money.of(h.fx ?? 1), 1, invShare.get(h.id));
+      addDoc(h.taxRateId, salesLines.filter((l) => l.docId === h.id), Money.of(h.fx ?? 1), 1, invShare.get(h.id));
     }
   }
 
@@ -1010,15 +1117,23 @@ export async function salesTaxRevenueSummary(
     .where(and(...dateConds(creditMemos.companyId as never, creditMemos.date as never), sql`${creditMemos.status} <> 'void'`));
   if (cmHeads.length) {
     const lines = await ctx.db
-      .select({ docId: creditMemoLines.creditMemoId, itemId: creditMemoLines.itemId, amount: creditMemoLines.amount })
+      .select({
+        docId: creditMemoLines.creditMemoId,
+        itemId: creditMemoLines.itemId,
+        amount: creditMemoLines.amount,
+        taxable: creditMemoLines.taxable,
+      })
       .from(creditMemoLines)
       .where(inArray(creditMemoLines.creditMemoId, cmHeads.map((h) => h.id)));
     for (const h of cmHeads) {
+      // Legacy memos without a memo-level rate fall back to the customer's rate when they carry tax.
       const rateId = h.taxRateId ?? (Money.gt(h.taxAmount, 0) ? h.custRate : null) ?? null;
-      const taxed = Money.gt(h.taxAmount, 0) && rateId !== null;
       addDoc(
         rateId,
-        lines.filter((l) => l.docId === h.id).map((l) => ({ ...l, taxable: taxed, taxRateId: null })),
+        // Each line keeps its own Tax flag (a returned non-taxable line is not a taxable sale).
+        lines
+          .filter((l) => l.docId === h.id)
+          .map((l) => ({ ...l, taxable: rateId !== null && l.taxable !== false, taxRateId: null })),
         Money.of(1),
         -1,
       );

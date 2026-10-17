@@ -87,6 +87,8 @@ export interface ExpenseLinePayload {
 
 export interface ExpensePayload {
   vendorId: string | null;
+  /** B3: payee from the Other Names list (absent in files made before it travelled). */
+  otherNameId?: string | null;
   payeeName: string | null;
   date: string;
   method: string;
@@ -420,7 +422,7 @@ function journalOk(a: unknown): boolean {
 }
 
 function expenseOk(a: unknown): boolean {
-  if (!isObj(a) || !isDate(a.date) || !isStr(a.method) || !isId(a.paymentAccountId) || !optId(a.vendorId)) return false;
+  if (!isObj(a) || !isDate(a.date) || !isStr(a.method) || !isId(a.paymentAccountId) || !optId(a.vendorId) || !optId(a.otherNameId)) return false;
   if (!optStr(a.payeeName) || !optStr(a.reference) || !optStr(a.memo) || !isDec(a.total) || !optDec(a.exchangeRate)) return false;
   if (!Array.isArray(a.lines)) return false;
   return a.lines.every(

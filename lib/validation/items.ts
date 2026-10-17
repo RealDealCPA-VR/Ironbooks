@@ -52,6 +52,11 @@ export const createItemSchema = z.object({
   openingValue: zDecimal.nullish(),
   openingUnitCost: zDecimal.nullish(),
   openingAsOf: zDate.nullish(),
+  /**
+   * Costing of the opening stock: 'average' (default — the item stays average-cost, like stock
+   * received on a bill) or 'fifo' (opens a FIFO cost layer, making the item FIFO-tracked).
+   */
+  openingCosting: z.enum(['average', 'fifo']).nullish(),
 });
 export type CreateItemBody = z.infer<typeof createItemSchema>;
 

@@ -10,14 +10,11 @@ import { ServiceError } from '@/lib/services/_base';
 import { w2Data } from '@/lib/services/payrollReports';
 import { renderW2Pdf } from '@/lib/pdf/payrollForms';
 import { maskSensitive } from '@/lib/permissions/mask';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND' ? 404
-      : err.code === 'VALIDATION' ? 400
-      : err.code === 'FORBIDDEN' ? 403
-      : 500;
+    const status = serviceErrorStatus(err.code);
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[api/payroll/w2]', err);

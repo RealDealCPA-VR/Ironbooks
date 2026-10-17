@@ -150,7 +150,9 @@ export async function writeOffInvoices(
           },
         ],
       });
-      await applyToInvoice(tx, { creditMemoId: memo.id, invoiceId: inv.id, amount: toAmountString(balance) });
+      // Dated with the write-off (like its credit memo), not today: the balance is written off on
+      // that day in A/R aging, and in an Accountant's Copy "today" is after the dividing date.
+      await applyToInvoice(tx, { creditMemoId: memo.id, invoiceId: inv.id, amount: toAmountString(balance), date: input.date });
       results.push({ invoiceId: inv.id, invoiceNumber: inv.invoiceNumber, amount: toAmountString(balance), creditMemoId: memo.id });
       total = total.plus(balance);
     }

@@ -5,20 +5,13 @@
 import { NextResponse } from 'next/server';
 import { ServiceError } from '@/lib/services/_base';
 import { AiError } from '@/lib/ai/types';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 export function aiErrorResponse(err: unknown, route: string): NextResponse {
   if (err instanceof ServiceError) {
-    const statusMap: Record<string, number> = {
-      NOT_FOUND: 404,
-      VALIDATION: 400,
-      UNBALANCED: 400,
-      PERIOD_CLOSED: 400,
-      FORBIDDEN: 403,
-      CONFLICT: 409,
-    };
     return NextResponse.json(
       { error: err.message, code: err.code, details: err.details ?? null },
-      { status: statusMap[err.code] ?? 500 },
+      { status: serviceErrorStatus(err.code) },
     );
   }
   if (err instanceof AiError) {

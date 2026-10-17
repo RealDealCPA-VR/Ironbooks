@@ -237,8 +237,8 @@ function ClientStart({ status, onChanged }: { status: Status; onChanged: () => v
       toast(
         res.saved
           ? `Accountant's Copy saved: ${res.saved}. Send it to your accountant.`
-          : "The Accountant's Copy was created. Save it again from this page if you need another copy of the file.",
-        'success',
+          : "The Accountant's Copy was created but the file was not saved. Use “Save the transfer file again” on this page to save it (or cancel the copy).",
+        res.saved ? 'success' : 'info',
       );
       onChanged();
     } catch (err) {
@@ -295,7 +295,7 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
   const inputRef = useRef<HTMLInputElement>(null);
   const [fileJson, setFileJson] = useState<unknown>(null);
   const [review, setReview] = useState<Review | null>(null);
-  const [busy, setBusy] = useState<null | 'review' | 'import' | 'cancel'>(null);
+  const [busy, setBusy] = useState<null | 'review' | 'import' | 'cancel' | 'save'>(null);
   const [confirmCancel, setConfirmCancel] = useState(false);
   /** Review keys of names / items you keep your version of. */
   const [keep, setKeep] = useState<Set<string>>(new Set());
@@ -345,6 +345,22 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
     }
   }
 
+  /** The transfer file of this copy again (same copy, same dividing date) — e.g. the first Save was cancelled. */
+  async function saveAgain() {
+    setBusy('save');
+    try {
+      const res = await postAndSave('/api/accountant-copy', { saveAgain: true }, 'Company.ibac', {
+        name: "Ironbooks Accountant's Copy",
+        extensions: ['ibac'],
+      });
+      if (res.saved) toast(`Accountant's Copy saved: ${res.saved}. Send it to your accountant.`, 'success');
+    } catch (err) {
+      toastError(err, "Could not save the Accountant's Copy.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function doCancel() {
     setBusy('cancel');
     try {
@@ -375,11 +391,20 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
           <li>Transactions dated on or before {niceDate(copy.dividingDate)} are locked until you import your accountant&apos;s changes or cancel the copy.</li>
           <li>Keep entering transactions dated after {niceDate(copy.dividingDate)} as usual.</li>
           <li>Statements dated on or before {niceDate(copy.dividingDate)} can&apos;t be reconciled here for now. If you reconcile a later statement of an account your accountant also reconciles, the review asks you to undo it before importing (then redo it).</li>
-          <li>List entries can&apos;t be deleted or merged for now, and accounts used on or before the dividing date can&apos;t be changed.</li>
+          <li>List entries can&apos;t be deleted, made inactive or merged for now, and accounts used on or before the dividing date can&apos;t be changed.</li>
+          <li>Fiscal periods that start on or before {niceDate(copy.dividingDate)} can&apos;t be closed while the copy is out.</li>
         </ul>
         <div className="mt-5 flex flex-wrap gap-2">
           <Button onClick={() => inputRef.current?.click()} loading={busy === 'review'}>
             <FileUp className="h-4 w-4" aria-hidden="true" /> Import accountant&apos;s changes…
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={saveAgain}
+            loading={busy === 'save'}
+            title="Save this Accountant's Copy's transfer file again (same copy and dividing date), for example if the first save was cancelled"
+          >
+            <FileDown className="h-4 w-4" aria-hidden="true" /> Save the transfer file again…
           </Button>
           <Button variant="secondary" onClick={() => setConfirmCancel(true)}>
             <XCircle className="h-4 w-4" aria-hidden="true" /> Cancel Accountant&apos;s Copy

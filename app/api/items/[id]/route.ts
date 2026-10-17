@@ -11,19 +11,12 @@ import { ServiceError } from '@/lib/services/_base';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateItemSchema } from '@/lib/validation/items';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
-  const statusMap: Record<string, number> = {
-    NOT_FOUND: 404,
-    VALIDATION: 400,
-    UNBALANCED: 400,
-    FORBIDDEN: 403,
-    CONFLICT: 409,
-    PERIOD_CLOSED: 409,
-  };
-  const status = statusMap[err.code] ?? 500;
+  const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
   return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
 }
 

@@ -18,6 +18,7 @@ import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { getNetworkPolicy } from '@/lib/services/networkPolicy';
 import { decideOutbound, isOutboundPurpose } from '@/lib/net/policy';
 import { applySandboxToDecision } from '@/lib/services/sandboxState';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 async function internalContext(
   req: NextRequest,
@@ -54,7 +55,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(applySandboxToDecision(decideOutbound(await getNetworkPolicy(ctx), url, purpose)));
   } catch (err) {
     if (err instanceof ServiceError) {
-      const status = err.code === 'FORBIDDEN' ? 403 : err.code === 'VALIDATION' ? 400 : 500;
+      const status = serviceErrorStatus(err.code);
       return NextResponse.json({ error: err.message, code: err.code }, { status });
     }
     console.error('[network-policy/check] unexpected error:', err);

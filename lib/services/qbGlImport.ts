@@ -34,6 +34,7 @@ import {
   vendors as vendorsTable,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
+import { withPlannerStats } from '@/lib/db/plannerStats';
 import { type ServiceContext, ServiceError, inTransaction, validation, writeAudit } from './_base';
 import { createAccount } from './accounts';
 import { createCustomer } from './customers';
@@ -460,6 +461,16 @@ export async function runGlImport(
   ctx: ServiceContext,
   input: GlImportInput,
   opts: { dryRun?: boolean } = {},
+): Promise<GlImportResult> {
+  if (opts.dryRun) return runGlImportUnanalyzed(ctx, input, opts);
+  // A bulk load: fresh planner statistics afterwards (PGlite has no autovacuum; best-effort).
+  return withPlannerStats(ctx.db, 'GL import', () => runGlImportUnanalyzed(ctx, input, opts));
+}
+
+async function runGlImportUnanalyzed(
+  ctx: ServiceContext,
+  input: GlImportInput,
+  opts: { dryRun?: boolean },
 ): Promise<GlImportResult> {
   const dryRun = !!opts.dryRun;
   const p = await prepare(ctx, input);

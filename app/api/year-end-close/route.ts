@@ -13,19 +13,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { yearEndClose } from '@/lib/services/fiscalClose';
 import { ServiceError } from '@/lib/services/_base';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
-    const status =
-      err.code === 'NOT_FOUND'
-        ? 404
-        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
-          ? 400
-          : err.code === 'PERIOD_CLOSED'
-            ? 409
-            : err.code === 'FORBIDDEN'
-              ? 403
-              : 500;
+    const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
   console.error('[year-end-close] error:', err);
@@ -35,7 +27,7 @@ function errorResponse(err: unknown) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await requireJsonObject(req);
 
     const fiscalYear = Number(body.fiscalYear);
     if (!Number.isInteger(fiscalYear) || fiscalYear < 1900 || fiscalYear > 2100) {

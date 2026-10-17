@@ -57,6 +57,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -275,6 +276,8 @@ export async function updateSite(ctx: ServiceContext, id: string, patch: SitePat
       if (name.toLowerCase() !== before.name.toLowerCase()) await assertUniqueSiteName(tx, name, id);
     }
     if (patch.isActive === false && before.isActive) {
+      // Making a site inactive is deleting it from the list: refused while an Accountant's Copy is out (I1).
+      await assertListDeleteAllowed(tx, 'delete', 'inventory sites');
       if (before.isDefault) {
         throw validation('The default site cannot be made inactive. Choose another default site first.');
       }
@@ -420,6 +423,8 @@ export async function updateBin(ctx: ServiceContext, id: string, patch: { name?:
       if (!name) throw validation('Bin name cannot be empty.');
     }
     if (patch.isActive === false && before.isActive) {
+      // Making a bin inactive is deleting it from the list: refused while an Accountant's Copy is out (I1).
+      await assertListDeleteAllowed(tx, 'delete', 'bins');
       const [row] = await tx.db
         .select({ qty: sql<string>`COALESCE(SUM(${inventoryMovements.quantity}), 0)` })
         .from(inventoryMovements)

@@ -31,13 +31,15 @@ import { accounts, assemblyComponents, items, pendingBuilds } from '@/lib/db/sch
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
+  ServiceError,
   inTransaction,
   notFound,
   validation,
   writeAudit,
 } from './_base';
-import { assertNotFifoTracked, bookValueRelief } from './inventory';
+import { assertNotFifoTracked, bookValueRelief, sellOutRelief, valueRemainderAfter } from './inventory';
 import { postJournalEntry } from './posting';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { type InventoryLineDetail, type MovementRequest, recordMovements } from './inventorySites';
 
 // ---------------------------------------------------------------------------
@@ -407,18 +409,29 @@ export async function getBom(ctx: ServiceContext, assemblyItemId: string): Promi
 export async function buildAssembly(
   ctx: ServiceContext,
   input: BuildInput,
-): Promise<{
+): Promise<BuildResult> {
+  // Load + validate stock in the same transaction as the write: two builds at once must not both
+  // consume the same components (the quantities below are written from these reads).
+  return inTransaction(ctx, (tx) => buildAssemblyInTx(tx, input));
+}
+
+type BuildResult = {
   assemblyItemId: string;
   quantityBuilt: string;
   totalCost: string;
   newAssemblyQty: string;
   newAssemblyAvgCost: string;
   buildId: string;
-}> {
+};
+
+async function buildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promise<BuildResult> {
   const buildQty = Money.of(input.quantity);
   if (!buildQty.greaterThan(0)) {
     throw validation('Build quantity must be greater than zero.');
   }
+  // A build that moves no value posts no ledger entry, so posting.ts never checks its date: the
+  // closing date, closed periods and the Accountant's Copy dividing date are checked here.
+  const periodCheck = await assertPeriodOpen(ctx, input.date ?? new Date(), { sourceRef: 'assembly_build:' });
 
   const assembly = await loadItem(ctx, input.assemblyItemId);
   assertInventoryType(assembly, 'assembly');
@@ -447,6 +460,7 @@ export async function buildAssembly(
   // Validate sufficient stock for all components
   let totalCost = Money.zero();
   const compCosts = new Map<string, ReturnType<typeof Money.zero>>();
+  const compRemainderRelieved = new Set<string>();
   for (const bomLine of bom) {
     const comp = componentMap.get(bomLine.componentItemId);
     if (!comp) throw notFound(`Component item ${bomLine.componentItemId}`);
@@ -463,8 +477,12 @@ export async function buildAssembly(
 
     // Value leaving the component: its book value before minus after (cent-exact, telescoping —
     // the same rule as COGS), so the GL entry and the item valuation move by the same amount.
-    const compCost = bookValueRelief(onHand, onHand.minus(required), Money.of(comp.averageCost ?? '0'));
+    // Using the last units also takes the component's value remainder (0061), like a sell-out.
+    const atBook = bookValueRelief(onHand, onHand.minus(required), Money.of(comp.averageCost ?? '0'));
+    const sellOut = sellOutRelief(comp, onHand.minus(required), atBook);
+    const compCost = sellOut.relief;
     compCosts.set(comp.id, compCost);
+    if (sellOut.remainderRelieved) compRemainderRelieved.add(comp.id);
     totalCost = totalCost.plus(compCost);
   }
 
@@ -477,7 +495,14 @@ export async function buildAssembly(
 
       await tx.db
         .update(items)
-        .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
+        .set({
+          quantityOnHand: newQty.toFixed(4),
+          // Its last units carried the remainder off with them (see compCosts).
+          ...(compRemainderRelieved.has(comp.id)
+            ? { valueRemainder: '0.00', valueRemainderAvg: Money.of(comp.averageCost ?? '0').toFixed(4) }
+            : {}),
+          updatedAt: new Date(),
+        })
         .where(eq(items.id, comp.id));
 
       await writeAudit(tx, {
@@ -506,6 +531,8 @@ export async function buildAssembly(
       .set({
         quantityOnHand: newAssemblyQty.toFixed(4),
         averageCost: newAssemblyAvgCost.toFixed(4),
+        // The cents the 4dp average cannot represent of the build's value stay on record (0061).
+        ...valueRemainderAfter(assembly, existingQty, newAssemblyQty, newAssemblyAvgCost, totalCost),
         updatedAt: new Date(),
       })
       .where(eq(items.id, input.assemblyItemId));
@@ -541,6 +568,17 @@ export async function buildAssembly(
         amount: compCosts.get(comp.id) ?? Money.zero(),
       });
     }
+    // A $0 build posted nothing: record the closing-date password use here (posting does it
+    // for the value-move entries otherwise).
+    if (totalCost.isZero()) {
+      await recordClosingDateException(tx, periodCheck, {
+        entryId: buildId,
+        operation: 'post',
+        transactionDate: buildDate,
+        description: `Build assembly — ${assembly.name}`,
+        sourceRef: `assembly_build:${buildId}`,
+      });
+    }
 
     // Advanced Inventory: components leave, finished goods arrive, at the build's site.
     await recordMovements(tx, buildMovements({ ...input, date: buildDate }, bom, buildQty, 1, 'build', buildId));
@@ -574,15 +612,25 @@ export async function buildAssembly(
 export async function unbuildAssembly(
   ctx: ServiceContext,
   input: BuildInput,
-): Promise<{
+): Promise<UnbuildResult> {
+  // Load + validate in the same transaction as the write (two unbuilds at once must not both
+  // take apart the same finished units).
+  return inTransaction(ctx, (tx) => unbuildAssemblyInTx(tx, input));
+}
+
+type UnbuildResult = {
   assemblyItemId: string;
   quantityUnbuilt: string;
   newAssemblyQty: string;
-}> {
+};
+
+async function unbuildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promise<UnbuildResult> {
   const unbuildQty = Money.of(input.quantity);
   if (!unbuildQty.greaterThan(0)) {
     throw validation('Unbuild quantity must be greater than zero.');
   }
+  // As for builds: an unbuild that moves no value posts nothing, so its date is checked here.
+  const periodCheck = await assertPeriodOpen(ctx, input.date ?? new Date(), { sourceRef: 'assembly_unbuild:' });
 
   const assembly = await loadItem(ctx, input.assemblyItemId);
   assertInventoryType(assembly, 'assembly');
@@ -617,11 +665,13 @@ export async function unbuildAssembly(
   // absorb exactly this value (not their current averageCost) so that total
   // inventory value is conserved without a GL posting.
   // Cent-exact book value before minus after (the same telescoping rule as COGS).
-  const removedValue = bookValueRelief(
-    currentAssemblyQty,
+  // Unbuilding the last units also takes the assembly's value remainder (0061), like a sell-out.
+  const assemblySellOut = sellOutRelief(
+    assembly,
     currentAssemblyQty.minus(unbuildQty),
-    Money.of(assembly.averageCost ?? '0'),
+    bookValueRelief(currentAssemblyQty, currentAssemblyQty.minus(unbuildQty), Money.of(assembly.averageCost ?? '0')),
   );
+  const removedValue = assemblySellOut.relief;
 
   // Distribute removedValue across components proportionally to their
   // current-cost share; if every component carries a $0 averageCost,
@@ -673,6 +723,8 @@ export async function unbuildAssembly(
         .set({
           quantityOnHand: newQty.toFixed(4),
           averageCost: newAvgCost.toFixed(4),
+          // The cents the 4dp average cannot represent of the returned value stay on record (0061).
+          ...valueRemainderAfter(comp, oldQty, newQty, newAvgCost, valueReturned),
           updatedAt: new Date(),
         })
         .where(eq(items.id, comp.id));
@@ -704,6 +756,15 @@ export async function unbuildAssembly(
         amount: valueReturned,
       });
     }
+    if (!removedValue.greaterThan(0)) {
+      await recordClosingDateException(tx, periodCheck, {
+        entryId: unbuildId,
+        operation: 'post',
+        transactionDate: unbuildDate,
+        description: `Unbuild assembly — ${assembly.name}`,
+        sourceRef: `assembly_unbuild:${unbuildId}`,
+      });
+    }
 
     // Reduce assembly quantityOnHand (averageCost stays the same)
     const newAssemblyQty = currentAssemblyQty.minus(unbuildQty);
@@ -712,6 +773,9 @@ export async function unbuildAssembly(
       .update(items)
       .set({
         quantityOnHand: newAssemblyQty.toFixed(4),
+        ...(assemblySellOut.remainderRelieved
+          ? { valueRemainder: '0.00', valueRemainderAvg: Money.of(assembly.averageCost ?? '0').toFixed(4) }
+          : {}),
         updatedAt: new Date(),
       })
       .where(eq(items.id, input.assemblyItemId));
@@ -962,6 +1026,20 @@ export async function finalizePendingBuild(
   status: string;
   build: Awaited<ReturnType<typeof buildAssembly>>;
 }> {
+  // Load + check the status in the same transaction as the build: a double-submitted finalize
+  // must find the build already 'built', not build it twice.
+  return inTransaction(ctx, (tx) => finalizePendingBuildInTx(tx, id, opts));
+}
+
+async function finalizePendingBuildInTx(
+  ctx: ServiceContext,
+  id: string,
+  opts?: Omit<BuildInput, 'assemblyItemId' | 'quantity'>,
+): Promise<{
+  pendingBuildId: string;
+  status: string;
+  build: Awaited<ReturnType<typeof buildAssembly>>;
+}> {
   const row = await loadPendingBuild(ctx, id);
   if (row.status !== 'pending') {
     throw validation(`Only pending builds can be finalized (this build is "${row.status}").`);
@@ -986,10 +1064,12 @@ export async function finalizePendingBuild(
       date: opts?.date ?? row.date,
     });
 
-    await tx.db
+    const [marked] = await tx.db
       .update(pendingBuilds)
       .set({ status: 'built' })
-      .where(eq(pendingBuilds.id, id));
+      .where(and(eq(pendingBuilds.id, id), eq(pendingBuilds.status, 'pending')))
+      .returning({ id: pendingBuilds.id });
+    if (!marked) throw new ServiceError('CONFLICT', 'This pending build was already finalized or cancelled.');
 
     await writeAudit(tx, {
       action: 'update',
@@ -1014,10 +1094,13 @@ export async function cancelPendingBuild(
   }
 
   return inTransaction(ctx, async (tx) => {
-    await tx.db
+    // Only a still-pending build is cancelled (a finalize racing this cancel may have built it).
+    const [marked] = await tx.db
       .update(pendingBuilds)
       .set({ status: 'cancelled' })
-      .where(eq(pendingBuilds.id, id));
+      .where(and(eq(pendingBuilds.id, id), eq(pendingBuilds.status, 'pending')))
+      .returning({ id: pendingBuilds.id });
+    if (!marked) throw new ServiceError('CONFLICT', 'This pending build was already finalized or cancelled.');
 
     await writeAudit(tx, {
       action: 'update',

@@ -502,6 +502,108 @@ export function sniffKind(bytes: Uint8Array, fileName = ''): ReportFileKind {
   return 'csv';
 }
 
+// ---------------------------------------------------------------------------
+// Ironbooks' own shareable ledger workbook (lib/services/shareableLedger.ts)
+// ---------------------------------------------------------------------------
+
+const normCells = (cells: string[]) => cells.map((c) => (c ?? '').trim().toLowerCase());
+const sameHeader = (cells: string[], want: string[]) => {
+  const got = normCells(cells);
+  return want.every((w, i) => got[i] === w);
+};
+/** Shareable ledger "General Ledger" sheet columns. */
+const IB_GL_HEADER = ['account', 'date', 'entry #', 'description', 'reference', 'name', 'debit', 'credit', 'balance'];
+/** Shareable ledger "Chart of Accounts" sheet columns. */
+const IB_COA_HEADER = ['code', 'name', 'type', 'detail type'];
+
+/** QB account type of an Ironbooks type + detail type ("checking", "accounts receivable", …). */
+function qbTypeName(type: string, detail: string): string {
+  const d = detail.trim().toLowerCase().replace(/_/g, ' ');
+  switch (type.trim().toLowerCase()) {
+    case 'asset':
+      if (d === 'checking' || d === 'savings') return 'Bank';
+      if (d === 'accounts receivable') return 'Accounts Receivable';
+      if (d === 'fixed assets') return 'Fixed Asset';
+      if (d === 'other asset') return 'Other Asset';
+      return 'Other Current Asset';
+    case 'liability':
+      if (d === 'accounts payable') return 'Accounts Payable';
+      if (d === 'credit card') return 'Credit Card';
+      if (d === 'long term liability') return 'Long Term Liability';
+      return 'Other Current Liability';
+    case 'equity':
+      return 'Equity';
+    case 'revenue':
+      return d === 'other income' ? 'Other Income' : 'Income';
+    case 'expense':
+      if (d === 'cost of goods sold') return 'Cost of Goods Sold';
+      return d === 'other expense' ? 'Other Expense' : 'Expense';
+    default:
+      return '';
+  }
+}
+
+/**
+ * Read Ironbooks' own shareable ledger workbook like a QuickBooks export, so a ledger exported
+ * from Ironbooks can come back in through the General Ledger import:
+ *  - "General Ledger" (one row per line, account in the first column) → QB's GL layout: an
+ *    account heading, a Beginning Balance row, General Journal rows (the entry # as Num and
+ *    Trans #, so an entry's lines stay one transaction) and a "Total <account>" row;
+ *  - "Chart of Accounts" (code, name, type, detail type) → an Account Listing with QB types.
+ * Any other sheet is returned unchanged.
+ */
+function fromIronbooksLedger(sheet: GridSheet): GridSheet {
+  const glIdx = sheet.rows.findIndex((r) => sameHeader(r.cells, IB_GL_HEADER));
+  if (glIdx >= 0) {
+    const out: GridRow[] = sheet.rows.slice(0, glIdx);
+    out.push({ cells: ['', 'Type', 'Date', 'Num', 'Trans #', 'Name', 'Memo', 'Debit', 'Credit', 'Balance'] });
+    let open: string | null = null;
+    // Totals in whole cents (no binary-float drift over many lines).
+    let debit = 0;
+    let credit = 0;
+    const cents = (v: string | undefined) => Math.round(Number(v || 0) * 100);
+    const close = (balance: string) => {
+      if (open === null) return;
+      out.push({ cells: [`Total ${open}`, '', '', '', '', '', '', (debit / 100).toFixed(2), (credit / 100).toFixed(2), balance] });
+      open = null;
+    };
+    for (const r of sheet.rows.slice(glIdx + 1)) {
+      const [account, date, num, description, , name, dr, cr, balance] = r.cells.map((c) => (c ?? '').trim());
+      if (!account) continue;
+      if (account !== open) {
+        close('');
+        open = account;
+        debit = 0;
+        credit = 0;
+        out.push({ cells: [account] });
+      }
+      if (!date && /^opening balance$/i.test(description ?? '')) {
+        out.push({ cells: ['', '', '', '', '', '', 'Beginning Balance', '', '', balance ?? ''] });
+      } else if (!date && /^closing balance$/i.test(description ?? '')) {
+        close(balance ?? '');
+      } else if (date) {
+        debit += cents(dr);
+        credit += cents(cr);
+        out.push({ cells: ['', 'General Journal', date, num ?? '', num ?? '', name ?? '', description ?? '', dr ?? '', cr ?? '', balance ?? ''] });
+      }
+    }
+    close('');
+    return { name: sheet.name, rows: out };
+  }
+  const coaIdx = sheet.rows.findIndex((r) => sameHeader(r.cells, IB_COA_HEADER));
+  if (coaIdx >= 0) {
+    const out: GridRow[] = [{ cells: ['Account', 'Type', 'Accnt #'] }];
+    for (const r of sheet.rows.slice(coaIdx + 1)) {
+      const [code, name, type, detail] = r.cells.map((c) => (c ?? '').trim());
+      const qbType = qbTypeName(type ?? '', detail ?? '');
+      if (!code || !name || !qbType) continue;
+      out.push({ cells: [`${code} · ${name}`, qbType, code] });
+    }
+    return { name: sheet.name, rows: out };
+  }
+  return sheet;
+}
+
 /** True when a row of cells looks like a QuickBooks GL column header. */
 export function isGlHeaderCells(cells: string[]): boolean {
   const set = new Set(cells.map((c) => c.trim().toLowerCase()));
@@ -518,7 +620,7 @@ export async function loadGrid(
   isHeader: (cells: string[]) => boolean = isGlHeaderCells,
 ): Promise<{ kind: ReportFileKind; sheets: GridSheet[]; text?: string }> {
   const kind = sniffKind(bytes, fileName);
-  if (kind === 'xlsx') return { kind, sheets: readXlsx(bytes) };
+  if (kind === 'xlsx') return { kind, sheets: readXlsx(bytes).map(fromIronbooksLedger) };
   if (kind === 'pdf') {
     const pages = await readPdfLines(bytes);
     return { kind, sheets: [{ name: 'PDF', rows: pdfLinesToGrid(pages, isHeader) }] };

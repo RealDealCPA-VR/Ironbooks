@@ -376,6 +376,16 @@ export async function updateEstimateStatus(
   id: string,
   status: EstimateStatus,
 ) {
+  // Load + check in the same transaction as the write: a status change racing the conversion to
+  // an invoice must see the estimate closed, not reopen it.
+  return inTransaction(ctx, (tx) => updateEstimateStatusInTx(tx, id, status));
+}
+
+async function updateEstimateStatusInTx(
+  ctx: ServiceContext,
+  id: string,
+  status: EstimateStatus,
+) {
   const [estimate] = await ctx.db
     .select()
     .from(estimates)

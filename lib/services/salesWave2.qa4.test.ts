@@ -178,7 +178,10 @@ describe('wave2 sales — QA re-test round 2', () => {
       await assertBooks();
       // History: open before the payment, paid between payment and bounce, open after.
       expect(await ar(cust, '2026-05-02')).toBe('100.00');
-      expect(await ar(cust, '2026-05-05')).toBe('0.00');
+      // Between payment and bounce the customer held the 50.00 overpayment as a credit: A/R in the GL
+      // was 100 - 150 = -50.00 then (review round 4 — this used to read 0.00, the bounce having erased
+      // the credit from every earlier as-of aging, so the aging disagreed with the balance sheet).
+      expect(await ar(cust, '2026-05-05')).toBe('-50.00');
       expect(await arDetail(inv.id, '2026-05-05')).toBe('0.00');
       expect(await ar(cust, '2026-05-10')).toBe('100.00');
     });

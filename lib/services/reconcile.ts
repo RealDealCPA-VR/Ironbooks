@@ -215,6 +215,15 @@ export async function startReconciliation(
   ctx: ServiceContext,
   input: StartReconciliationInput,
 ): Promise<typeof reconciliations.$inferSelect> {
+  // The one-session-per-account check runs in the same transaction as the insert, so two starts
+  // at once cannot open two in-progress sessions.
+  return inTransaction(ctx, (tx) => startReconciliationInTx(tx, input));
+}
+
+async function startReconciliationInTx(
+  ctx: ServiceContext,
+  input: StartReconciliationInput,
+): Promise<typeof reconciliations.$inferSelect> {
   if (!input.bankAccountId?.trim()) throw validation('bankAccountId is required.');
   if (!input.statementDate) throw validation('statementDate is required.');
   if (input.statementBalance == null) throw validation('statementBalance is required.');
@@ -407,6 +416,17 @@ export async function toggleCleared(
   journalEntryLineId: string,
   isCleared: boolean,
 ): Promise<void> {
+  // Check-then-insert in one transaction: two clicks at once must not insert two rows for the
+  // same line (each would count toward the cleared balance).
+  return inTransaction(ctx, (tx) => toggleClearedInTx(tx, reconciliationId, journalEntryLineId, isCleared));
+}
+
+async function toggleClearedInTx(
+  ctx: ServiceContext,
+  reconciliationId: string,
+  journalEntryLineId: string,
+  isCleared: boolean,
+): Promise<void> {
   const recon = await loadReconciliation(ctx, reconciliationId);
   if (recon.status !== 'in_progress') {
     throw validation('Cannot modify a reconciliation that is not in_progress.');
@@ -446,10 +466,17 @@ export async function toggleCleared(
     );
 
   if (existing) {
+    // Every row for the line (a file may still hold a duplicate written before this check ran
+    // in a transaction), so the toggle never leaves a stale cleared copy behind.
     await ctx.db
       .update(reconciliationItems)
       .set({ isCleared, clearedDate: isCleared ? new Date() : null })
-      .where(eq(reconciliationItems.id, existing.id));
+      .where(
+        and(
+          eq(reconciliationItems.reconciliationId, reconciliationId),
+          eq(reconciliationItems.journalEntryLineId, journalEntryLineId),
+        ),
+      );
   } else {
     await ctx.db.insert(reconciliationItems).values({
       reconciliationId,
@@ -493,6 +520,12 @@ export async function cancelReconciliation(
   ctx: ServiceContext,
   reconciliationId: string,
 ): Promise<void> {
+  // Status check + delete in one transaction: a cancel racing the completion must not delete a
+  // session that was just completed.
+  await inTransaction(ctx, (tx) => cancelReconciliationInTx(tx, reconciliationId));
+}
+
+async function cancelReconciliationInTx(ctx: ServiceContext, reconciliationId: string): Promise<void> {
   const recon = await loadReconciliation(ctx, reconciliationId);
   if (recon.status !== 'in_progress') {
     throw validation(`Only an in-progress reconciliation can be cancelled (status: ${recon.status}).`);
@@ -584,6 +617,15 @@ export async function updateStatement(
  *   - bankAccounts.lastReconciledDate and lastReconciledBalance are updated.
  */
 export async function completeReconciliation(
+  ctx: ServiceContext,
+  reconciliationId: string,
+): Promise<typeof reconciliations.$inferSelect> {
+  // Status check, cleared balance and completion in one transaction: a completion racing a
+  // cancel (or another completion) sees the session's current state.
+  return inTransaction(ctx, (tx) => completeReconciliationInTx(tx, reconciliationId));
+}
+
+async function completeReconciliationInTx(
   ctx: ServiceContext,
   reconciliationId: string,
 ): Promise<typeof reconciliations.$inferSelect> {

@@ -263,6 +263,12 @@ export async function nextAccountNumber(ctx: ServiceContext, type: AccountType, 
 }
 
 export async function createAccount(ctx: ServiceContext, input: CreateAccountInput) {
+  // The unique-number check (and the next free number) run in the same transaction as the
+  // insert, so two creates at once cannot both take the same account number.
+  return inTransaction(ctx, (tx) => createAccountInTx(tx, input));
+}
+
+async function createAccountInTx(ctx: ServiceContext, input: CreateAccountInput) {
   if (!input.name?.trim()) throw validation('Account name is required.');
   const { type, subtype } = resolveTypeAndSubtype(input);
   if (!input.code?.trim()) {

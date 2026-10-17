@@ -17,6 +17,7 @@ import { getCompany } from '@/lib/services/company';
 import { ServiceError } from '@/lib/services/_base';
 import { buildXlsx, type XlsxCell } from '@/lib/export/xlsx';
 import { buildReportPdf } from '@/lib/export/reportPdf';
+import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
 const cellSchema = z.union([z.string(), z.number(), z.null()]);
 
@@ -43,7 +44,7 @@ function safeFilename(name: string, ext: string): string {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = bodySchema.safeParse(await req.json());
+    const parsed = bodySchema.safeParse(await requireJsonObject(req));
     if (!parsed.success) {
       return NextResponse.json(
         { error: `Invalid export payload: ${parsed.error.issues[0]?.message ?? 'bad request'}` },
@@ -89,7 +90,7 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     if (err instanceof ServiceError) {
-      const status = err.code === 'FORBIDDEN' ? 403 : err.code === 'NOT_FOUND' ? 404 : 400;
+      const status = serviceErrorStatus(err.code);
       return NextResponse.json({ error: err.message, code: err.code }, { status });
     }
     console.error('[export/reports] unexpected error:', err);

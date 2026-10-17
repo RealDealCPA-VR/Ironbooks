@@ -390,6 +390,9 @@ export async function updateEntry(ctx: ServiceContext, key: SimpleListKey, id: s
   const before = await getEntry(ctx, key, id);
   const patch = parse(def, body, true);
   if (key === 'other-names') await assertAccountantListEdit(ctx, 'other_name', before, patch); // Accountant's Copy (I1)
+  // Making an entry inactive is how a list entry is deleted (Make inactive sends isActive: false):
+  // refused like a delete while an Accountant's Copy is out (I1).
+  if (patch.isActive === false && before.isActive) await assertListDeleteAllowed(ctx, 'delete', 'list entries');
   // Re-validate the whole record as it will be after the update.
   const merged: Record<string, unknown> = {};
   for (const k of Object.keys(def.schema.shape)) merged[k] = k in patch ? patch[k] : before[k];

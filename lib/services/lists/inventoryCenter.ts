@@ -27,7 +27,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { type ServiceContext, notFound } from '../_base';
-import { stockStatus } from '../inventory';
+import { fifoLayerValueSql, stockStatus } from '../inventory';
 
 export interface InventoryCenterRow {
   id: string;
@@ -69,7 +69,7 @@ export async function inventoryCenterList(
   const layers = await ctx.db
     .select({
       itemId: inventoryLayers.itemId,
-      value: sql<string>`COALESCE(SUM(${inventoryLayers.quantityRemaining} * ${inventoryLayers.unitCost}), 0)`,
+      value: fifoLayerValueSql(), // the valuation reports' rule (per-layer cents)
       n: sql<number>`COUNT(*)`,
     })
     .from(inventoryLayers)

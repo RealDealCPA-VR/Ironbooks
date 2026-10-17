@@ -21,6 +21,7 @@ import {
   customerTypes,
   customers,
   employees,
+  inventoryLayers,
   items,
   journalEntries,
   journalEntryLines,
@@ -391,10 +392,42 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
     const bom = await ctx.db.select().from(assemblyComponents).where(eq(assemblyComponents.companyId, ctx.companyId));
     const nameOf = new Map(rows.map((i) => [i.id, i.name]));
     const hasBom = new Set(bom.map((b) => b.assemblyItemId));
+    // Quantity on hand + its value (QB INVITEM QNTY / VALUE): without them a re-import brings the
+    // inventory asset balance (journal / OBAMOUNT) but no stock behind it. FIFO items are valued
+    // at their remaining layers, average-cost items at quantity x average cost (the same figures
+    // as Inventory Valuation).
+    const layerValue = new Map<string, ReturnType<typeof Money.zero>>();
+    for (const l of await ctx.db
+      .select({ itemId: inventoryLayers.itemId, qty: inventoryLayers.quantityRemaining, cost: inventoryLayers.unitCost })
+      .from(inventoryLayers)
+      .where(eq(inventoryLayers.companyId, ctx.companyId))) {
+      layerValue.set(l.itemId, (layerValue.get(l.itemId) ?? Money.zero()).plus(Money.of(l.qty).times(Money.of(l.cost))));
+    }
+    const stockOf = (i: (typeof rows)[number]) => {
+      const qty = Money.of(i.quantityOnHand ?? '0');
+      if (i.type !== 'inventory' || qty.isZero()) return { QNTY: '', VALUE: '' };
+      const value = layerValue.get(i.id) ?? qty.times(Money.of(i.averageCost ?? '0'));
+      return { QNTY: qty.toString(), VALUE: toAmountString(Money.round2(value)) };
+    };
+    // Item custom fields: labels in CUSTITEMDICT (QB's item counterpart of CUSTNAMEDICT), values
+    // in INVITEM CUSTFLD1..n.
+    const itemLabels = [...new Set(rows.flatMap((i) => Object.keys(i.customFields ?? {})))].sort().slice(0, 15);
+    w.section(
+      'CUSTITEMDICT',
+      ['INDEX', 'LABEL', 'INUSE'],
+      itemLabels.map((l, n) => ({ INDEX: n, LABEL: l, INUSE: 'Y' })),
+    );
+    const itemFieldCells = (cf: Record<string, string> | null) =>
+      Object.fromEntries(itemLabels.map((l, n) => [`CUSTFLD${n + 1}`, cf?.[l] ?? '']));
     w.section(
       'INVITEM',
-      ['NAME', 'INVITEMTYPE', 'DESC', 'ACCNT', 'ASSETACCNT', 'COGSACCNT', 'PRICE', 'COST', 'TAXABLE', 'REORDERPOINT', 'HIDDEN'],
+      [
+        'NAME', 'INVITEMTYPE', 'DESC', 'ACCNT', 'ASSETACCNT', 'COGSACCNT', 'PRICE', 'COST', 'TAXABLE', 'REORDERPOINT', 'HIDDEN', 'QNTY', 'VALUE',
+        ...itemLabels.map((_, n) => `CUSTFLD${n + 1}`),
+      ],
       rows.map((i) => ({
+        ...stockOf(i),
+        ...itemFieldCells(i.customFields ?? null),
         NAME: i.name,
         INVITEMTYPE: qbItemType(i.type, hasBom.has(i.id) && i.type === 'inventory'),
         DESC: i.description,

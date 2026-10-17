@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { signOutSession } from '@/lib/services/sessions';
+import { serviceErrorStatus } from '@/lib/routeErrors';
 
 type RouteContext = { params: Promise<{ id: string }> };
 
@@ -17,11 +18,7 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     return NextResponse.json({ ok: true });
   } catch (err) {
     if (err instanceof ServiceError) {
-      const status =
-        err.code === 'NOT_FOUND' ? 404
-        : err.code === 'FORBIDDEN' ? 403
-        : err.code === 'CONFLICT' ? 409
-        : 500;
+      const status = serviceErrorStatus(err.code);
       return NextResponse.json({ error: err.message, code: err.code }, { status });
     }
     console.error('[sessions/[id]] unexpected error:', err);
