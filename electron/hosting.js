@@ -11,7 +11,9 @@
 //    stricter rules (sign-in required, no first-run fallback, no reset tokens in responses);
 //  - the internal shell token header (x-bka-internal) is stripped — remote clients can never
 //    present it;
-//  - connections from non-private addresses are dropped (matters only with "bind all").
+//  - connections from non-private addresses are dropped (matters only with "bind all");
+//  - redirects the app server aims at itself (http://localhost:<port>/unlock) are moved onto
+//    the address the teammate used (hostingCore.rewriteUpstreamLocation).
 //
 // TLS: when `tailscale cert` can issue a certificate for this machine's MagicDNS name, the
 // proxy serves HTTPS with it (teammates use https://<name>.ts.net:<port>). Otherwise plain HTTP
@@ -140,7 +142,14 @@ function createProxyHandler(upstreamPort, { secure }) {
     const upstream = http.request(
       { host: '127.0.0.1', port: upstreamPort, method: req.method, path: req.url, headers },
       (up) => {
-        res.writeHead(up.statusCode || 502, up.headers);
+        const outHeaders = { ...up.headers };
+        if (outHeaders.location) {
+          outHeaders.location = core.rewriteUpstreamLocation(outHeaders.location, upstreamPort, {
+            secure,
+            host: req.headers.host,
+          });
+        }
+        res.writeHead(up.statusCode || 502, outHeaders);
         up.pipe(res);
       },
     );

@@ -494,9 +494,13 @@ async function startNextServer() {
   });
 
   // wait until the port is accepting connections
-  const url = `http://127.0.0.1:${port}`;
   await waitForServer(port);
-  return url;
+  // The window (and every origin check against serverUrl) uses "localhost", not 127.0.0.1: Next.js
+  // spells loopback as "localhost" in the URLs middleware sees (NextURL), so its /unlock and /login
+  // redirects point at http://localhost:<port>/. Loaded from 127.0.0.1, that first redirect is a
+  // different origin, the navigation guard (security.js) cancels it, and the window stays blank.
+  // The server itself still listens on 127.0.0.1 only.
+  return `http://localhost:${port}`;
 }
 
 function waitForServer(port, timeoutMs = 20000) {
@@ -982,7 +986,19 @@ async function createWindow() {
   // A just-created company file opens on Create Account -> setup interview (one-shot).
   const startRoute = loadConfig().startRoute;
   if (typeof startRoute === 'string' && startRoute.startsWith('/')) saveConfig({ startRoute: null });
-  await mainWindow.loadURL(typeof startRoute === 'string' && startRoute.startsWith('/') ? url + startRoute : url);
+  try {
+    await mainWindow.loadURL(typeof startRoute === 'string' && startRoute.startsWith('/') ? url + startRoute : url);
+  } catch (err) {
+    // ERR_ABORTED only means a newer navigation (a redirect) replaced this one. Anything else
+    // would leave a blank window with no explanation, so say what happened.
+    if (!/ERR_ABORTED/.test(String(err?.message || err))) {
+      console.error('[startup] could not open the app page:', err?.message || err);
+      dialog.showErrorBox(
+        'Ironbooks could not open',
+        `The app started but its page did not load.\n\n${String(err?.message || err)}\n\nClose Ironbooks and open it again. If this keeps happening, report it with this message.`,
+      );
+    }
+  }
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
   // Ensure the active file is self-describing (manifest) and stamp its last-opened time.
   const activeDir = activeCompanyDir();

@@ -180,8 +180,36 @@ function shareUrls({ proxyHosts, port, tls, dnsName, tailnetIp }) {
   return [...new Set(urls)];
 }
 
+/**
+ * Location header the proxy hands a teammate. Next.js builds absolute redirect URLs from the
+ * address the app server is bound to and spells loopback as "localhost" (NextURL), so an /unlock
+ * or /login redirect points at http://localhost:<upstreamPort>/ — nothing on the teammate's
+ * computer. A redirect aimed at the upstream server is moved onto the origin the teammate used
+ * (scheme from the proxy, host from their request); any other Location passes through unchanged.
+ */
+function rewriteUpstreamLocation(location, upstreamPort, { secure, host }) {
+  if (typeof location !== 'string' || !location || typeof host !== 'string' || !host) return location;
+  let u;
+  try {
+    u = new URL(location);
+  } catch {
+    return location; // relative: the browser resolves it against the proxy's origin already
+  }
+  const loopback = u.hostname === 'localhost' || u.hostname === '[::1]' || /^127(\.\d{1,3}){3}$/.test(u.hostname);
+  if (u.protocol !== 'http:' || !loopback || Number(u.port) !== Number(upstreamPort)) return location;
+  let client;
+  try {
+    client = new URL(`${secure ? 'https' : 'http'}://${host}`);
+  } catch {
+    return location;
+  }
+  if (client.username || client.password || client.pathname !== '/' || client.search || client.hash) return location;
+  return `${client.origin}${u.pathname}${u.search}${u.hash}`;
+}
+
 module.exports = {
   DEFAULT_HOSTING_PORT,
+  rewriteUpstreamLocation,
   parseIPv4,
   inCidr4,
   isTailnetIPv4,
