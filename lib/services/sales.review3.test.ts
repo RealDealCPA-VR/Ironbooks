@@ -76,7 +76,11 @@ describe('review3 sales', () => {
 
   afterAll(async () => {
     await closeDb();
-    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    try {
+      fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch {
+      /* Windows may hold a handle; next run wipes it. */
+    }
   });
 
   it('credit limit: editing a partly paid invoice counts only what is still open on it', async () => {

@@ -81,7 +81,11 @@ describe('review2 sales', () => {
 
   afterAll(async () => {
     await closeDb();
-    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    try {
+      fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch {
+      /* Windows may hold a handle; next run wipes it. */
+    }
   });
 
   it('a sales receipt already in a bank deposit cannot be voided (UF would be relieved twice)', async () => {

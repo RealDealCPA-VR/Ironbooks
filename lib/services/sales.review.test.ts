@@ -94,7 +94,11 @@ describe('sales review regressions', () => {
 
   afterAll(async () => {
     await closeDb();
-    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    try {
+      fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch {
+      /* Windows may hold a handle; next run wipes it. */
+    }
   });
 
   const lines = () => [
