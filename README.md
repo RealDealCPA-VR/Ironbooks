@@ -15,7 +15,7 @@ refuses to let your books go out of balance.**
 ![platforms](https://img.shields.io/badge/desktop-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![stack](https://img.shields.io/badge/Next.js%2015%20%C2%B7%20Electron%20%C2%B7%20Postgres-black)
 
-[Why](#-why-ironbooks) · [Features](#-what-you-get) · [Switching from QuickBooks](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Quick start](#-quick-start) · [Roadmap](#-roadmap)
+[Download](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest) · [Why](#-why-ironbooks) · [Features](#-what-you-get) · [Switching from QuickBooks](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Quick start](#-quick-start) · [Roadmap](#-roadmap) · [Code signing policy](#-code-signing-policy)
 
 </div>
 
@@ -243,6 +243,26 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 ## 📜 License
 
 [MIT](./LICENSE). Use it, fork it, ship it.
+
+## 🔏 Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by
+[SignPath Foundation](https://signpath.org).
+
+Windows installers are built from this repository by GitHub Actions
+([`release.yml`](./.github/workflows/release.yml)) and signed only after a maintainer approves
+each release. Releases up to and including 1.3.1 were published unsigned, while the
+SignPath application was in progress.
+
+| Role | Members |
+| --- | --- |
+| Committers and reviewers | [@RealDealCPA-VR](https://github.com/RealDealCPA-VR) |
+| Approvers | [@RealDealCPA-VR](https://github.com/RealDealCPA-VR) |
+
+**Privacy:** Ironbooks does not send information to other networked systems unless you, the
+user, turn that feature on. Update checks (app version and platform only) are the one
+connection on by default, and you can turn them off in Privacy & Network. The full list of
+what can leave your computer, and the switch for each, is in [`PRIVACY.md`](./PRIVACY.md).
 
 ## ⚠️ Disclaimer
 
