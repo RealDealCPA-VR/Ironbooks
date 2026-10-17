@@ -13,7 +13,32 @@ jobs:
         with:
           node-version: '20'
       - run: npm ci --legacy-peer-deps
+      # One draft release up front. The nsis and portable targets publish concurrently; left to
+      # electron-builder, each could create its own release (v1.3.1 got two, and "latest" pointed
+      # at the one holding only the blockmap). Both now upload into this draft.
+      - name: Create the draft release
+        shell: bash
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft \
+            --title "Ironbooks ${GITHUB_REF_NAME#v}" \
+            --notes "Windows: download **Ironbooks-Setup-${GITHUB_REF_NAME#v}.exe** (installer) or **Ironbooks-${GITHUB_REF_NAME#v}.exe** (portable). Installed copies update themselves from here.
+
+          [Code signing policy](https://github.com/${GITHUB_REPOSITORY}#-code-signing-policy) · [Privacy](https://github.com/${GITHUB_REPOSITORY}/blob/main/PRIVACY.md)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build & publish NSIS installer + latest.yml (electron-updater)
         run: npm run desktop:publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # Actions-provided, contents:write
+      # Publish only once every file is attached, so nobody sees a release without its installer.
+      - name: Publish the release
+        shell: bash
+        run: |
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' > assets.txt
+          cat assets.txt
+          for f in "Ironbooks-Setup-${GITHUB_REF_NAME#v}.exe" "Ironbooks-Setup-${GITHUB_REF_NAME#v}.exe.blockmap" "Ironbooks-${GITHUB_REF_NAME#v}.exe" latest.yml; do
+            grep -qx "$f" assets.txt || { echo "::error::missing $f on the release"; exit 1; }
+          done
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
