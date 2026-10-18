@@ -81,6 +81,7 @@ interface CompanySettings {
   country?: string;
   phone?: string;
   email?: string;
+  businessDescription?: string;
   fiscalYearEnd?: string;
   currency?: string;
   timezone?: string;
@@ -380,6 +381,7 @@ export default function SettingsPage() {
           country: st.country ?? '',
           phone: st.phone ?? '',
           email: st.email ?? '',
+          businessDescription: st.businessDescription ?? '',
           accountNumbersEnabled: st.accountNumbersEnabled ?? true,
           reportBasis: st.reportBasis ?? 'accrual',
           defaultCustomerTerms: st.defaultCustomerTerms ?? 'net_30',
@@ -580,7 +582,7 @@ export default function SettingsPage() {
                       .filter(Boolean)
                       .join(', ');
                     void saveSettings(
-                      ['legalName', 'ein', 'addressLine1', 'addressLine2', 'city', 'state', 'zip', 'phone', 'email'],
+                      ['legalName', 'ein', 'addressLine1', 'addressLine2', 'city', 'state', 'zip', 'phone', 'email', 'businessDescription'],
                       { name: companyName, extra: { address } },
                     );
                   }}
@@ -606,6 +608,17 @@ export default function SettingsPage() {
                     <div className="col-span-2">
                       <Label htmlFor="email">Email</Label>
                       <Input id="email" type="email" value={s.email ?? ''} onChange={(e) => patch({ email: e.target.value })} placeholder="billing@acme.com" />
+                    </div>
+                    <div className="col-span-2">
+                      <Label htmlFor="business-description">What does your business do?</Label>
+                      <Input
+                        id="business-description"
+                        value={s.businessDescription ?? ''}
+                        onChange={(e) => patch({ businessDescription: e.target.value })}
+                        placeholder="e.g. Residential plumbing contractor with two vans"
+                        maxLength={500}
+                      />
+                      <p className="text-xs text-navy/50 mt-1">Optional. Helps the AI suggest the right account for payees you haven&apos;t used before.</p>
                     </div>
                     <div className="col-span-2">
                       <Label htmlFor="addr1">Address</Label>

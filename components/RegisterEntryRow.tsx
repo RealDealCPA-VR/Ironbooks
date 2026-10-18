@@ -143,6 +143,8 @@ export function RegisterEntryRow({
 
   // ---- What it will save as ----------------------------------------------------------------
   const side: RegisterSide | null = amounts.increase.trim() ? 'increase' : amounts.decrease.trim() ? 'decrease' : null;
+  const sideRef = useRef<RegisterSide | null>(null);
+  sideRef.current = side;
   const other = accounts.find((a) => a.id === accountId);
   const plan = other && side ? planRegisterEntry(register, other, side) : null;
 
@@ -151,9 +153,18 @@ export function RegisterEntryRow({
     async (q: { vendorId?: string; payee?: string }) => {
       const key = q.vendorId ?? `payee:${q.payee ?? ''}`;
       payeeKey.current = key;
-      const params = new URLSearchParams(q.vendorId ? { vendorId: q.vendorId } : { payee: q.payee ?? '' });
+      // History first (vendor default, last used, learned model); with no history at all, the AI
+      // picks from the chart using what the business does (ai=1). Bank and card registers are the
+      // account the money moved through, so the AI never suggests the register itself.
+      const throughAccount = ['checking', 'savings', 'credit_card'].includes(register.subtype);
+      const params = new URLSearchParams({
+        ...(q.vendorId ? { vendorId: q.vendorId } : { payee: q.payee ?? '' }),
+        ai: '1',
+        direction: planSuggestsVendor(register, sideRef.current ?? defaultSide(register)) ? 'out' : 'in',
+        ...(throughAccount ? { sourceAccountId: register.id } : {}),
+      });
       const res = await api
-        .get<{ source: string; lines: Array<{ accountId: string }> }>(`/api/ai/prefill?${params}`)
+        .get<{ source: string; lines: Array<{ accountId: string }>; reason?: string }>(`/api/ai/prefill?${params}`)
         .catch(() => null);
       if (payeeKey.current !== key || !res?.lines?.[0]) return;
       const id = res.lines[0].accountId;
@@ -161,14 +172,16 @@ export function RegisterEntryRow({
       if (account.current.id || account.current.text.trim()) return; // never overwrite what the user chose
       setAccountBoth(id, labelForId(accountChoices, id));
       setNote(
-          res.source === 'vendor-default'
-            ? "Account from the vendor's default."
-            : res.source === 'last-used'
-              ? 'Account from the last transaction with this payee.'
+        res.source === 'vendor-default'
+          ? "Account from the vendor's default."
+          : res.source === 'last-used'
+            ? 'Account from the last transaction with this payee.'
+            : res.source === 'ai'
+              ? `AI suggestion${res.reason ? `: ${res.reason}` : ''} Check it before you save.`
               : 'Account suggested from similar past transactions.',
       );
     },
-    [accountChoices],
+    [accountChoices, register],
   );
 
   function pickName(n: NameOption) {
@@ -429,6 +442,13 @@ export function RegisterEntryRow({
       />
     </>
   );
+}
+
+/** Before an amount is typed: banks, cards and expenses usually pay out; income usually comes in. */
+function defaultSide(register: RegisterEntryAccount): RegisterSide {
+  if (register.type === 'revenue') return 'increase';
+  if (register.type === 'asset') return 'decrease';
+  return 'increase'; // a card charge, an expense, a liability growing
 }
 
 /** Is this row paying someone (suggest Vendor for a new name) rather than receiving (Customer)? */

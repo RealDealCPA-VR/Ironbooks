@@ -202,6 +202,8 @@ export interface CompanySettings {
   phone?: string;
   email?: string;
   industry?: string;
+  /** What the business does, in its own words (helps AI suggest accounts for new payees). */
+  businessDescription?: string;
   // Accounting
   fiscalYearEnd?: string;
   currency?: string;
@@ -249,6 +251,7 @@ export const COMPANY_SETTINGS_KEYS = [
   'phone',
   'email',
   'industry',
+  'businessDescription',
   'fiscalYearEnd',
   'currency',
   'timezone',

@@ -54,6 +54,7 @@ export const companySettingsSchema = z.object({
   phone: zOptionalText,
   email: z.union([z.literal(''), z.string().email('is not a valid email address')]).optional(),
   industry: zOptionalText,
+  businessDescription: z.string().trim().max(500, 'Keep the business description under 500 characters').optional(),
   // Accounting
   currency: z.string().trim().length(3, 'currency must be a 3-letter ISO 4217 code').optional(),
   fiscalYearEnd: z

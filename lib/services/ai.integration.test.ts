@@ -45,6 +45,8 @@ import {
   retrainModel,
   suggestBankCategories,
   vendorPrefill,
+  businessContextLines,
+  suggestAccountForPayee,
 } from './aiCategorizer';
 import { detectRecurring, memorizeSuggestion } from './aiRecurring';
 import { ask, approveProposal, findUnverifiedNumbers, listProposals, rejectProposal, runTool } from './aiAssistant';
@@ -343,6 +345,60 @@ describe('AI layer — integration', () => {
     expect(learned.source).toBe('learned');
     expect(learned.lines[0].accountId).toBe(acct['6000']);
     expect(await vendorPrefill(ctx, { payee: 'Never Seen Before Inc' })).toMatchObject({ source: 'none' });
+  });
+
+  it('a payee with no history gets an AI pick that knows what the business does', async () => {
+    const [co] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
+    const before = co.settings;
+    await db
+      .update(companies)
+      .set({
+        settings: {
+          ...((before ?? {}) as Record<string, unknown>),
+          industry: 'construction',
+          businessDescription: 'Residential plumbing contractor with two vans',
+          setupInterview: { status: 'done', at: '2026-01-01', entityType: 'llc_single' },
+        },
+      })
+      .where(eq(companies.id, ctx.companyId));
+    try {
+      expect((await businessContextLines(ctx)).join(' | ')).toMatch(/Business type: .*\| Entity: .*\| What the business does: Residential plumbing/);
+
+      const m = ollama(() => '{"accountCode":"6200","confidence":0.97,"reason":"A pipe and fittings supplier."}');
+      const r = await suggestAccountForPayee(
+        ctx,
+        { payee: 'Ferguson Supply #2231', amount: '412.18', direction: 'out', sourceAccountId: acct['1000'], sourceLabel: 'Checking', ai: true },
+        { deps: { fetch: m.fetch } },
+      );
+      expect(r).toMatchObject({ source: 'ai', lines: [{ accountId: acct['6200'] }], reason: 'A pipe and fittings supplier.' });
+      expect(r.lines[0].confidence).toBeLessThanOrEqual(0.8);
+      const chat = m.calls.find((c) => c.url.endsWith('/api/chat'))!;
+      const prompt: string = chat.body.messages.at(-1).content;
+      expect(prompt).toContain('What the business does: Residential plumbing contractor with two vans');
+      expect(prompt).toContain('Payee: Ferguson Supply #2231');
+      expect(prompt).toContain('paid OUT of Checking');
+      const allowed: string[] = chat.body.format.properties.accountCode.enum;
+      // Never the account the money moved through, and never A/R or A/P (they need a customer / vendor).
+      expect(allowed).toEqual(expect.arrayContaining(['6000', '6200', '4000']));
+      for (const code of ['1000', '1200', '2000']) expect(allowed).not.toContain(code);
+    } finally {
+      await db.update(companies).set({ settings: before }).where(eq(companies.id, ctx.companyId));
+    }
+  });
+
+  it('history beats the AI, and an AI that is off means no suggestion rather than an error', async () => {
+    const m = ollama(() => '{"accountCode":"6300","confidence":0.9,"reason":"x"}');
+    const known = await suggestAccountForPayee(ctx, { vendorId: vendorDepot, ai: true }, { deps: { fetch: m.fetch } });
+    expect(known).toMatchObject({ source: 'vendor-default', lines: [{ accountId: acct['6200'] }] });
+    expect(m.calls.filter((c) => c.url.endsWith('/api/chat'))).toHaveLength(0);
+
+    await updateSettings(ctx, { llmSuggestEnabled: false });
+    try {
+      const off = await suggestAccountForPayee(ctx, { payee: 'Brand New Vendor LLC', ai: true }, { deps: { fetch: m.fetch } });
+      expect(off).toMatchObject({ source: 'none', lines: [], aiUnavailable: expect.stringMatching(/turned off/) });
+    } finally {
+      await updateSettings(ctx, { llmSuggestEnabled: true });
+    }
   });
 
   it('detects recurring rent and memorizes it as remind-only', async () => {
