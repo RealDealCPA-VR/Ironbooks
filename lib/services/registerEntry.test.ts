@@ -73,6 +73,7 @@ describe('planRegisterEntry (pure)', () => {
 
 describe('enterRegisterTransaction', () => {
   beforeAll(async () => {
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [user] = await db.insert(users).values({ email: 'reg-entry@test.local', name: 'Reg Entry', passwordHash: 'x' }).returning();
     const [company] = await db.insert(companies).values({ name: 'Register Entry Co', ownerId: user.id }).returning();
@@ -99,7 +100,11 @@ describe('enterRegisterTransaction', () => {
 
   afterAll(async () => {
     await closeDb();
-    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    try {
+      fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch {
+      /* Windows may hold a handle; next run wipes it. */
+    }
   });
 
   it('every posting account gets a register; non-posting accounts do not', async () => {

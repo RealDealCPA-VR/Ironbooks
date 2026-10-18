@@ -72,6 +72,7 @@ describe('policy: vendor lookup relays to the internet, so it always needs an ex
 
 describe('lookupVendor', () => {
   beforeAll(async () => {
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     db = await getDb(TEST_DIR);
     const [u] = await db.insert(users).values({ email: 'lookup@test.local', name: 'L', passwordHash: 'x' }).returning();
     const [c] = await db.insert(companies).values({ name: 'Lookup Co', ownerId: u.id }).returning();
