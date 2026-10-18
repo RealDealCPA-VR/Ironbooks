@@ -150,6 +150,9 @@ transactions · reminders · calendar · Lead Center · Doc Center · letters & 
 ### 🗄️ A company file you can trust
 - **Running transaction log** inside the file records every change, tamper-evident, like QB's TLG.
 - **Shareable**: a single-file portable copy, or an Excel/PDF ledger for your accountant.
+- **Your file, where you put it**: the company menu shows where the open file lives (with Show in
+  folder), and **File → Close Company** releases it and lists your recent company files with
+  their full locations, like QuickBooks' No Company Open window.
 - **Backups that restore in full**, an automatic backup before risky operations, and **Condense
   Data** that writes a restorable archive first.
 - **Per-company users, roles and permissions.** Multi-user hosting is limited to your Tailscale
@@ -253,6 +256,7 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] **UX round**: 15 doer/reviewer teams. Command bar, Needs attention home, undo and "why did this change", learning bank rules, report explanations, smart defaults, Fix buttons on errors, keyboard and batch entry, receipt capture with offline OCR, month-end close, visible backups, sandbox, Accountant's Copy and Period Copy, and the Other Names / price level / opening stock / deposited payment / multi-currency switch / password policy gaps
 - [x] **v1.4.0 release**: typed-in registers on every account, statement PDF / scan / Excel import with tie-out, AI account suggestions for new payees (business context + optional self-hosted SearXNG lookup), Plaid removed
 - [x] **v1.5.0 release**: a clean Apple-style look; light / dark / auto with eight accent colors; a themed desktop window with the menus in its title bar
+- [x] **v1.5.1 release**: File → Close Company with a No Company Open list of recent files and their locations; the open file's location in the company menu; toolbar and pop-outs no longer cut off
 - [ ] The remaining partial rows and P2 follow-ups in [`PARITY.md`](./PARITY.md)
 - [ ] Hands-on QA of the new screens, then a tagged release
 
@@ -267,7 +271,7 @@ Free code signing provided by [SignPath.io](https://signpath.io), certificate by
 
 Windows installers are built from this repository by GitHub Actions
 ([`release.yml`](./.github/workflows/release.yml)) and signed only after a maintainer approves
-each release. Releases up to and including 1.5.0 were published unsigned, while the
+each release. Releases up to and including 1.5.1 were published unsigned, while the
 SignPath application was in progress.
 
 | Role | Members |

@@ -57,6 +57,12 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     open: () => ipcRenderer.invoke('company:open'),
     switch: (dir) => ipcRenderer.invoke('company:switch', dir),
     setProtected: (val) => ipcRenderer.invoke('company:setProtected', val),
+    /** Show the open company file's folder in Explorer / Finder. */
+    reveal: () => ipcRenderer.invoke('company:reveal'),
+    /** File > Close Company: release the file and show "No Company Open". */
+    close: () => ipcRenderer.invoke('company:close'),
+    /** Record the open company's name in the file (shown in recent-file lists). */
+    setDisplayName: (name) => ipcRenderer.invoke('company:displayName', String(name)),
   },
   /**
    * Sandbox mode ("Try it on a copy"): after the local server made the copy (POST /api/sandbox)

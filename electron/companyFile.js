@@ -39,6 +39,9 @@ function writeManifest(dir, data) {
 /** Human name for a company file: manifest name, else folder basename (sans an .ironbooks / legacy .bookkeeper suffix). */
 function companyName(dir) {
   const m = readManifest(dir);
+  // The company's own name (recorded by the app when the file is open) beats the folder name:
+  // a first-run file lives in a folder called "default".
+  if (m && typeof m.displayName === 'string' && m.displayName.trim()) return m.displayName.trim();
   if (m && typeof m.name === 'string' && m.name.trim()) return m.name.trim();
   return path.basename(dir).replace(/\.(ironbooks|bookkeeper)$/i, '');
 }

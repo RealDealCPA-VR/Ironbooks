@@ -48,6 +48,18 @@ interface CompanyRow {
   name: string;
 }
 
+/** Desktop bridge for the open company FILE (electron/preload.js `company`). */
+interface CompanyFileBridge {
+  current?: () => Promise<{ dir: string; name: string } | null>;
+  reveal?: () => Promise<unknown>;
+  close?: () => Promise<unknown>;
+  setDisplayName?: (name: string) => Promise<unknown>;
+}
+function companyFileBridge(): CompanyFileBridge | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return (window as unknown as { bookkeeper?: { company?: CompanyFileBridge } }).bookkeeper?.company;
+}
+
 /** Best-matching sidebar label for the current path (longest href prefix wins). */
 function pageLabelFor(pathname: string): string | null {
   let best: { label: string; href: string } | null = null;
@@ -88,6 +100,9 @@ function CompanyChip({
   const [open, setOpen] = React.useState(false);
   const [list, setList] = React.useState<CompanyRow[] | null>(null);
   const [switching, setSwitching] = React.useState<string | null>(null);
+  // Desktop: where the open company file lives on disk (File > Company File Details shows more).
+  const [fileDir, setFileDir] = React.useState<string | null>(null);
+  const [canClose, setCanClose] = React.useState(false);
   const rootRef = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {
@@ -95,7 +110,11 @@ function CompanyChip({
     fetch('/api/company')
       .then((r) => (r.ok ? r.json() : null))
       .then((c) => {
-        if (!cancelled && c?.id) onCompany({ id: c.id, name: c.name });
+        if (!cancelled && c?.id) {
+          onCompany({ id: c.id, name: c.name });
+          // Desktop: the file's recent-list entry shows the company's name, not its folder's.
+          void companyFileBridge()?.setDisplayName?.(c.name)?.catch?.(() => {});
+        }
       })
       .catch(() => {
         /* not signed in / first run: chip stays hidden */
@@ -126,6 +145,14 @@ function CompanyChip({
   async function toggle() {
     const next = !open;
     setOpen(next);
+    const fileBridge = companyFileBridge();
+    if (next && fileBridge) {
+      setCanClose(Boolean(fileBridge.close));
+      fileBridge
+        .current?.()
+        .then((f) => setFileDir(f?.dir ?? null))
+        .catch(() => setFileDir(null));
+    }
     if (next && list === null) {
       try {
         const r = await fetch('/api/companies');
@@ -182,7 +209,7 @@ function CompanyChip({
       {open && (
         <div
           role="listbox"
-          className="absolute right-0 mt-2 w-64 rounded-xl bg-white/95 backdrop-blur-xl shadow-2xl border border-slate-200/70 p-1 z-50"
+          className="absolute right-0 mt-2 w-72 rounded-xl bg-white/95 backdrop-blur-xl shadow-2xl border border-slate-200/70 p-1 z-50"
         >
           <div className="px-3 pt-2 pb-1 text-[11px] font-semibold text-navy/40">
             Switch company
@@ -218,6 +245,46 @@ function CompanyChip({
               Manage companies…
             </Link>
           </div>
+          {(fileDir || canClose) && (
+            <div className="border-t border-slate-200/70 mt-1 pt-1" data-company-file>
+              {fileDir && (
+                <div className="px-3 pt-1.5 pb-1">
+                  <div className="text-[11px] font-semibold text-navy/40">Company file location</div>
+                  <div
+                    className="mt-0.5 break-all font-mono text-[11px] leading-snug text-navy/70 select-text"
+                    title={fileDir}
+                    data-company-file-path
+                  >
+                    {fileDir}
+                  </div>
+                </div>
+              )}
+              {fileDir && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpen(false);
+                    void companyFileBridge()?.reveal?.();
+                  }}
+                  className="block w-full rounded-md px-3 py-1.5 text-left text-sm text-navy/70 hover:bg-electric hover:text-white"
+                >
+                  Show in folder
+                </button>
+              )}
+              {canClose && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpen(false);
+                    void companyFileBridge()?.close?.();
+                  }}
+                  className="block w-full rounded-md px-3 py-1.5 text-left text-sm text-navy/70 hover:bg-electric hover:text-white"
+                >
+                  Close company file…
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

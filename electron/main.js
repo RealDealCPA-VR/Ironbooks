@@ -38,6 +38,7 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session }
 const { buildSectionMenus } = require('./menuRoutes');
 const spelling = require('./spelling');
 const windowTheme = require('./windowTheme');
+const startScreen = require('./startScreen');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -52,6 +53,8 @@ const { pruneLegacyAutoBackups } = require('./legacyBackups');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
+/** File > Close Company: the window shows "No Company Open" and no company file is loaded. */
+let startScreenMode = false;
 let serverProcess = null;
 let serverUrl = null;
 /** Set once the quit-time auto-backup has run (or been skipped) so app.quit() proceeds. */
@@ -202,7 +205,8 @@ function rememberRecentCompany(dir) {
 
 /** Persist `dir` as the active company folder and relaunch into it. */
 function openCompanyDir(dir) {
-  saveConfig({ dataDir: dir, remoteHost: null }); // opening a local file leaves any remote host
+  // Opening a local file leaves any remote host, and ends "No Company Open".
+  saveConfig({ dataDir: dir, remoteHost: null, companyClosed: false });
   rememberRecentCompany(dir);
   app.relaunch();
   app.quit(); // before-quit still snapshots the current company on the way out
@@ -424,6 +428,37 @@ ipcMain.handle('sandbox:left', (e, opts) => {
 });
 
 /** File / Help menu: one click "Try it on a copy" (or "Leave the sandbox" while in one). */
+/**
+ * File > Close Company (QuickBooks parity): release the company file and show "No Company Open"
+ * with the recent files and their locations. The app restarts without loading a file (the usual
+ * on-quit auto-backup runs on the way out), so the file can be moved, copied or backed up.
+ * Connected to a host, it disconnects.
+ */
+async function closeCompanyFlow() {
+  if (sandboxActive()) {
+    await dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      message: 'Leave the sandbox first',
+      detail: 'This is a practice copy. Leave the sandbox (File menu), then close the company file.',
+    });
+    return;
+  }
+  if (hostingState) {
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      message: 'Close the company file?',
+      detail: 'You are hosting multi-user access. Teammates who have this company file open will be disconnected.',
+      buttons: ['Close Company', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+    });
+    if (response !== 0) return;
+  }
+  saveConfig({ companyClosed: true, remoteHost: null });
+  app.relaunch();
+  app.quit();
+}
+
 function sandboxMenuItem() {
   const sb = sandboxActive();
   if (sb && sb.kind === 'sandbox') return { label: 'Leave the Sandbox…', click: () => navigate('/sandbox') };
@@ -758,7 +793,7 @@ async function openOnHostFlow() {
           error: `Couldn't reach ${n.origin}. Check that the host computer is on, Ironbooks there is hosting multi-user access, and both computers are signed in to Tailscale.`,
         };
       }
-      saveConfig({ remoteHost: n.origin, lastRemoteHost: value.trim() });
+      saveConfig({ remoteHost: n.origin, lastRemoteHost: value.trim(), companyClosed: false });
       setImmediate(() => {
         app.relaunch();
         app.quit();
@@ -770,7 +805,7 @@ async function openOnHostFlow() {
 
 /** Leave client mode and reopen the local company file. */
 function disconnectFromHost() {
-  saveConfig({ remoteHost: null });
+  saveConfig({ remoteHost: null, companyClosed: false });
   app.relaunch();
   app.quit();
 }
@@ -819,6 +854,8 @@ function buildMenu() {
             ? recentItems
             : [{ label: 'No recent companies', enabled: false }],
         },
+        { label: 'Close Company', click: () => { closeCompanyFlow(); } },
+        { label: 'Company File Details…', enabled: !remoteHostOrigin, click: () => navigate('/company-file') },
         { type: 'separator' },
         // Multi-user (QB Enterprise parity): share this file on the tailnet, or open one shared
         // by another computer.
@@ -895,7 +932,85 @@ function navigate(route) {
   mainWindow?.webContents.send('navigate', route);
 }
 
+/** The "No Company Open" window (electron/startScreen.js): no server, no company file loaded. */
+async function createStartWindow() {
+  startScreenMode = true;
+  const theme = windowTheme.normalizeTheme(loadConfig().theme);
+  nativeTheme.themeSource = theme.mode;
+  const state = loadWindowState();
+  const usePosition = state && boundsVisible(state);
+  mainWindow = new BrowserWindow({
+    width: state ? state.width : 1440,
+    height: state ? state.height : 900,
+    ...(usePosition ? { x: state.x, y: state.y } : {}),
+    minWidth: 760,
+    minHeight: 560,
+    title: 'Ironbooks — No Company Open',
+    ...windowTheme.frameOptions(process.platform, nativeTheme.shouldUseDarkColors),
+    webPreferences: {
+      preload: path.join(__dirname, 'startPreload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      webviewTag: false,
+      spellcheck: false,
+      navigateOnDragDrop: false,
+    },
+  });
+  if (state?.maximized) mainWindow.maximize();
+  trackWindowState(mainWindow);
+  buildStartMenu();
+  const html = startScreen.startScreenHtml({
+    dark: nativeTheme.shouldUseDarkColors,
+    accent: theme.accent,
+    platform: process.platform,
+  });
+  await mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+}
+
+/** Menus while no company is open: open or create one, and the basics. */
+function buildStartMenu() {
+  const recents = (Array.isArray(loadConfig().recentCompanies) ? loadConfig().recentCompanies : []).filter(
+    (d) => typeof d === 'string',
+  );
+  const template = [
+    {
+      label: 'File',
+      submenu: [
+        { label: 'New Company…', accelerator: 'CmdOrCtrl+Shift+N', click: () => { createCompanyFlow(); } },
+        { label: 'Open Company…', accelerator: 'CmdOrCtrl+O', click: () => { openCompanyFlow(); } },
+        {
+          label: 'Recent Companies',
+          submenu: recents.length
+            ? recents.map((dir) => ({ label: companyFile.companyName(dir), sublabel: dir, click: () => openCompanyDir(dir) }))
+            : [{ label: 'No recent companies', enabled: false }],
+        },
+        { label: 'Open company on host…', click: () => { openOnHostFlow(); } },
+        { type: 'separator' },
+        { role: 'quit' },
+      ],
+    },
+    { label: 'Edit', submenu: [{ role: 'copy' }, { role: 'selectAll' }] },
+    { label: 'View', submenu: [{ role: 'reload', accelerator: 'F5' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }] },
+    {
+      label: 'Help',
+      submenu: [
+        { label: 'Ironbooks on the web', click: () => shell.openExternal('https://github.com/RealDealCPA-VR/Ironbooks') },
+        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { message: 'Ironbooks', detail: `Version ${app.getVersion()}\nOpen-source desktop accounting with AI error correction.` }) },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 async function createWindow() {
+  // File > Close Company: show "No Company Open" instead of loading a file. A scripted launch
+  // that names a company folder (BKA_DATA_DIR) always opens it.
+  if (loadConfig().companyClosed === true && !process.env.BKA_DATA_DIR) {
+    await createStartWindow();
+    return;
+  }
   // Client mode: show the company hosted on another machine instead of starting a local server.
   const remote = (() => {
     const r = loadConfig().remoteHost;
@@ -1223,6 +1338,71 @@ ipcMain.handle('company:switch', (e, dir) => {
   if (fromLocalApp(e) && typeof dir === 'string' && dir) openCompanyDir(dir);
   return true;
 });
+// Show the open company file in Explorer / Finder, and File > Close Company from the page.
+ipcMain.handle('company:reveal', (e) => {
+  if (!fromLocalApp(e)) return false;
+  shell.showItemInFolder(activeCompanyDir());
+  return true;
+});
+// The open file's company name, so Recent Companies and "No Company Open" can show it.
+ipcMain.handle('company:displayName', (e, name) => {
+  if (!fromLocalApp(e) || typeof name !== 'string' || !name.trim()) return false;
+  companyFile.writeManifest(activeCompanyDir(), { displayName: name.trim().slice(0, 200) });
+  return true;
+});
+ipcMain.handle('company:close', (e) => {
+  if (!fromAppOrigin(e)) return false;
+  closeCompanyFlow();
+  return true;
+});
+
+// "No Company Open" screen: only from that window, and only for folders on the recent list.
+function fromStartScreen(e) {
+  return Boolean(startScreenMode && mainWindow && e.sender === mainWindow.webContents);
+}
+function recentCompanyDirs() {
+  const r = loadConfig().recentCompanies;
+  return Array.isArray(r) ? r.filter((d) => typeof d === 'string' && d) : [];
+}
+ipcMain.handle('start:list', (e) => {
+  if (!fromStartScreen(e)) return [];
+  return startScreen.recentEntries(recentCompanyDirs(), {
+    exists: (dir) => {
+      try {
+        return fs.statSync(dir).isDirectory();
+      } catch {
+        return false;
+      }
+    },
+    readManifest: (dir) => companyFile.readManifest(dir),
+    companyName: (dir) => companyFile.companyName(dir),
+  });
+});
+ipcMain.handle('start:open', (e, dir) => {
+  if (!fromStartScreen(e) || !recentCompanyDirs().includes(dir) || !fs.existsSync(dir)) return false;
+  openCompanyDir(dir);
+  return true;
+});
+ipcMain.handle('start:remove', (e, dir) => {
+  if (!fromStartScreen(e)) return false;
+  saveConfig({ recentCompanies: recentCompanyDirs().filter((d) => d !== dir) });
+  buildStartMenu();
+  return true;
+});
+ipcMain.handle('start:reveal', (e, dir) => {
+  if (!fromStartScreen(e) || !recentCompanyDirs().includes(dir) || !fs.existsSync(dir)) return false;
+  shell.showItemInFolder(dir);
+  return true;
+});
+ipcMain.handle('start:new', (e) => {
+  if (fromStartScreen(e)) createCompanyFlow();
+  return true;
+});
+ipcMain.handle('start:browse', (e) => {
+  if (fromStartScreen(e)) openCompanyFlow();
+  return true;
+});
+
 // Keep the manifest's display hint in sync after the file password is toggled in the UI, so
 // Open/Recent can show a lock icon without opening the database.
 ipcMain.handle('company:setProtected', (e, val) => {
@@ -1303,6 +1483,9 @@ function updateFeedUrl() {
 async function updatesAllowed() {
   if (remoteHostOrigin) {
     return { allowed: false, reason: 'This computer is connected to a host; update the app on the host computer.' };
+  }
+  if (startScreenMode) {
+    return { allowed: false, reason: "No company file is open. Update checks follow the open company file's Privacy & Network settings." };
   }
   if (!serverUrl) return { allowed: false, reason: 'The app has not finished starting.' };
   try {
