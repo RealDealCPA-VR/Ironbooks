@@ -252,6 +252,7 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] **Renamed to Ironbooks**
 - [x] **UX round**: 15 doer/reviewer teams. Command bar, Needs attention home, undo and "why did this change", learning bank rules, report explanations, smart defaults, Fix buttons on errors, keyboard and batch entry, receipt capture with offline OCR, month-end close, visible backups, sandbox, Accountant's Copy and Period Copy, and the Other Names / price level / opening stock / deposited payment / multi-currency switch / password policy gaps
 - [x] **v1.4.0 release**: typed-in registers on every account, statement PDF / scan / Excel import with tie-out, AI account suggestions for new payees (business context + optional self-hosted SearXNG lookup), Plaid removed
+- [x] **v1.5.0 release**: a clean Apple-style look; light / dark / auto with eight accent colors; a themed desktop window with the menus in its title bar
 - [ ] The remaining partial rows and P2 follow-ups in [`PARITY.md`](./PARITY.md)
 - [ ] Hands-on QA of the new screens, then a tagged release
 
@@ -266,7 +267,7 @@ Free code signing provided by [SignPath.io](https://signpath.io), certificate by
 
 Windows installers are built from this repository by GitHub Actions
 ([`release.yml`](./.github/workflows/release.yml)) and signed only after a maintainer approves
-each release. Releases up to and including 1.4.0 were published unsigned, while the
+each release. Releases up to and including 1.5.0 were published unsigned, while the
 SignPath application was in progress.
 
 | Role | Members |
