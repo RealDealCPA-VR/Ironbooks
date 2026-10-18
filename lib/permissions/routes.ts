@@ -210,6 +210,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/integrity': r('file_utilities', 'GET'),
   '/api/import': r('file_utilities', 'POST'),
   '/api/import/csv-preview': r('file_utilities', 'POST'),
+  '/api/import/extract': r('file_utilities', 'POST'),
   '/api/import/qb': r('file_utilities', 'POST'),
   '/api/import/rebuild': r('file_utilities', 'GET POST:modify'),
   '/api/qb-import': r('file_utilities', 'POST'),

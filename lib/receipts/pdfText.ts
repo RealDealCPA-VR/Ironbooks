@@ -5,9 +5,9 @@
  */
 import { encodePng, expand1bpp } from './png';
 
-/** Pages read from one PDF (receipts are short; long statements are cut off). */
+/** Pages read from one receipt PDF (receipts are short). Bank statements pass their own limits. */
 const MAX_PAGES = 5;
-/** Scanned pages handed to OCR. */
+/** Scanned receipt pages handed to OCR. */
 const MAX_SCANNED_PAGES = 3;
 /** pdf.js ImageKind */
 const GRAYSCALE_1BPP = 1;
@@ -37,7 +37,13 @@ interface Item {
   size: number;
 }
 
-function linesFromItems(items: Item[]): string[] {
+/** One visual line of a page: its text and the pieces it was built from, left to right. */
+export interface PdfLine {
+  text: string;
+  cells: Array<{ x: number; str: string }>;
+}
+
+function pdfLinesFromItems(items: Item[]): PdfLine[] {
   const sorted = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
   const lines: { y: number; items: Item[] }[] = [];
   for (const it of sorted) {
@@ -48,14 +54,11 @@ function linesFromItems(items: Item[]): string[] {
   }
   return lines
     .sort((a, b) => b.y - a.y)
-    .map((l) =>
-      l.items
-        .sort((a, b) => a.x - b.x)
-        .map((i) => i.str)
-        .join('  ')
-        .trim(),
-    )
-    .filter(Boolean);
+    .map((l) => {
+      const cells = l.items.sort((a, b) => a.x - b.x).map((i) => ({ x: i.x, str: i.str }));
+      return { text: cells.map((c) => c.str).join('  ').trim(), cells };
+    })
+    .filter((l) => l.text);
 }
 
 type PdfImage = { width: number; height: number; data?: Uint8Array | Uint8ClampedArray; kind?: number };
@@ -71,6 +74,26 @@ function imageToPng(img: PdfImage): Buffer | null {
 
 /** Read a PDF receipt. Throws Error('unreadable') when the file can't be opened. */
 export async function readPdfReceipt(bytes: Uint8Array): Promise<PdfReceiptContent> {
+  const doc = await readPdfDocument(bytes, { maxPages: MAX_PAGES, maxScannedPages: MAX_SCANNED_PAGES });
+  return { text: doc.lines.map((l) => l.text).join('\n'), pages: doc.pages, scans: doc.scans };
+}
+
+export interface PdfDocumentContent {
+  /** Every visual line of the pages read, in reading order, with x positions. */
+  lines: PdfLine[];
+  pages: number;
+  /** PNG images of scanned pages (pages with (almost) no text layer). */
+  scans: Buffer[];
+}
+
+/**
+ * Read a PDF's text layer (and the images of scanned pages) — receipts and bank statements.
+ * Throws Error('unreadable') when the file can't be opened.
+ */
+export async function readPdfDocument(
+  bytes: Uint8Array,
+  limits: { maxPages: number; maxScannedPages: number },
+): Promise<PdfDocumentContent> {
   const pdfjs = await loadPdfjs();
   let doc;
   try {
@@ -85,10 +108,10 @@ export async function readPdfReceipt(bytes: Uint8Array): Promise<PdfReceiptConte
   } catch {
     throw new Error('unreadable');
   }
-  const out: string[] = [];
+  const out: PdfLine[] = [];
   const scans: Buffer[] = [];
   try {
-    const pages = Math.min(doc.numPages, MAX_PAGES);
+    const pages = Math.min(doc.numPages, limits.maxPages);
     for (let p = 1; p <= pages; p++) {
       const page = await doc.getPage(p);
       const content = await page.getTextContent();
@@ -99,16 +122,16 @@ export async function readPdfReceipt(bytes: Uint8Array): Promise<PdfReceiptConte
         const tr = raw.transform as number[];
         items.push({ x: tr[4], y: tr[5], str, size: Math.abs(tr[3]) || Number(raw.height ?? 8) || 8 });
       }
-      const lines = linesFromItems(items);
+      const lines = pdfLinesFromItems(items);
       out.push(...lines);
       // A page without a text layer is a scan: hand its largest image to OCR.
-      if (lines.join('').replace(/\s/g, '').length < 20 && scans.length < MAX_SCANNED_PAGES) {
+      if (lines.map((l) => l.text).join('').replace(/\s/g, '').length < 20 && scans.length < limits.maxScannedPages) {
         const png = await largestImage(pdfjs, page);
         if (png) scans.push(png);
       }
       page.cleanup();
     }
-    return { text: out.join('\n'), pages: doc.numPages, scans };
+    return { lines: out, pages: doc.numPages, scans };
   } finally {
     await doc.destroy();
   }

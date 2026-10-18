@@ -22,6 +22,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { StatementReview, type StatementExtract, type ReviewedStatement } from '@/components/StatementReview';
 import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
@@ -407,6 +408,25 @@ declare global {
   }
 }
 
+/** OFX / QBO / CSV are text files; a statement (PDF or scan) and Excel are read on the server. */
+type ImportKind = 'ofx' | 'qbo' | 'csv' | 'statement' | 'xlsx';
+const BINARY_KINDS: ImportKind[] = ['statement', 'xlsx'];
+const ACCEPT: Record<ImportKind, string> = {
+  ofx: '.ofx,.qfx,.txt',
+  qbo: '.qbo,.txt',
+  csv: '.csv,.txt',
+  statement: '.pdf,.png,.jpg,.jpeg,.webp',
+  xlsx: '.xlsx',
+};
+
+/** File bytes → base64, in chunks (a long statement is several MB). */
+async function fileToBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
 export default function BankingPage() {
   const prefs = usePreferences();
   // Data state
@@ -426,7 +446,7 @@ export default function BankingPage() {
 
   // Import form
   const [importBankAccountId, setImportBankAccountId] = useState('');
-  const [importFileType, setImportFileType] = useState<'ofx' | 'qbo' | 'csv'>('ofx');
+  const [importFileType, setImportFileType] = useState<ImportKind>('ofx');
   const [importContent, setImportContent] = useState('');
   const [importFilename, setImportFilename] = useState('');
   const [importing, setImporting] = useState(false);
@@ -443,6 +463,12 @@ export default function BankingPage() {
   const [csvDateFormat, setCsvDateFormat] = useState('');
   const [csvSkipRows, setCsvSkipRows] = useState('0');
   const [csvFlipSign, setCsvFlipSign] = useState(false);
+  const [csvPayeeCol, setCsvPayeeCol] = useState('');
+  const [csvMemoCol, setCsvMemoCol] = useState('');
+  const [csvCheckCol, setCsvCheckCol] = useState('');
+  // Statement PDF / scan read on the server, waiting for review (lib/services/statementImport.ts).
+  const [statementExtract, setStatementExtract] = useState<StatementExtract | null>(null);
+  const [extracting, setExtracting] = useState(false);
 
   // CSV preview (server-side dry run via /api/import/csv-preview)
   const [csvPreview, setCsvPreview] = useState<CsvPreviewResult | null>(null);
@@ -465,6 +491,9 @@ export default function BankingPage() {
       ...(csvDateFormat ? { dateFormat: csvDateFormat } : {}),
       ...(Number.isFinite(skip) && skip > 0 ? { skipRows: skip } : {}),
       ...(csvFlipSign ? { flipSign: true } : {}),
+      ...(csvPayeeCol.trim() ? { payeeCol: csvPayeeCol.trim() } : {}),
+      ...(csvMemoCol.trim() ? { memoCol: csvMemoCol.trim() } : {}),
+      ...(csvCheckCol.trim() ? { checkNumberCol: csvCheckCol.trim() } : {}),
     };
   }
 
@@ -577,12 +606,74 @@ export default function BankingPage() {
   }, [bankAccounts, importBankAccountId]);
 
   /** Infer the import file type from a filename extension. .qfx is OFX-on-the-wire. */
-  function fileTypeFromName(name: string): 'ofx' | 'qbo' | 'csv' | null {
+  function fileTypeFromName(name: string): ImportKind | null {
     const ext = name.toLowerCase().split('.').pop() ?? '';
     if (ext === 'ofx' || ext === 'qfx') return 'ofx';
     if (ext === 'qbo') return 'qbo';
     if (ext === 'csv') return 'csv';
+    if (ext === 'xlsx') return 'xlsx';
+    if (['pdf', 'png', 'jpg', 'jpeg', 'webp'].includes(ext)) return 'statement';
     return null;
+  }
+
+  /** Statement PDF / scan or Excel: read on the server (nothing is imported yet). */
+  async function extractFile(file: File) {
+    if (!importBankAccountId) {
+      toast('Select the bank or credit card account first.', 'danger');
+      return;
+    }
+    setExtracting(true);
+    setImportSummary(null);
+    setStatementExtract(null);
+    try {
+      const result = await api.post<{ kind: 'csv'; csv: string; sheet: string } | StatementExtract>('/api/import/extract', {
+        bankAccountId: importBankAccountId,
+        filename: file.name,
+        data: await fileToBase64(file),
+      });
+      if (result.kind === 'csv') {
+        // Excel → CSV text, then the normal column mapper and preview.
+        setImportFileType('csv');
+        setImportContent(result.csv);
+        setImportFilename(file.name);
+        await runCsvPreview(result.csv);
+        toast(`Read sheet "${result.sheet}". Check the column mapping, then import.`, 'info');
+      } else {
+        setImportFileType('statement');
+        setImportFilename(file.name);
+        setStatementExtract(result);
+      }
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not read that file.', 'danger');
+    } finally {
+      setExtracting(false);
+    }
+  }
+
+  async function importStatement(reviewed: ReviewedStatement) {
+    if (!statementExtract) return;
+    setImporting(true);
+    try {
+      const summary = await api.post<ImportSummary>('/api/import', {
+        bankAccountId: importBankAccountId,
+        fileType: 'rows',
+        rows: reviewed.rows,
+        filename: importFilename || 'statement.pdf',
+        statement: {
+          kind: statementExtract.statementKind,
+          openingBalance: reviewed.openingBalance,
+          closingBalance: reviewed.closingBalance,
+          acknowledgeDifference: reviewed.acknowledgeDifference,
+        },
+      });
+      setImportSummary(summary);
+      setStatementExtract(null);
+      toast(`Import complete: ${summary.imported} imported, ${summary.skippedDupes} duplicates skipped. Review them in Review bank transactions.`, 'success');
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Import failed.', 'danger');
+    } finally {
+      setImporting(false);
+    }
   }
 
   function applyLoadedFile(content: string, filename: string) {
@@ -602,7 +693,8 @@ export default function BankingPage() {
       qbo: ['qbo'],
       csv: ['csv'],
     };
-    if (window.bookkeeper?.openFile) {
+    // Binary files (PDF, images, Excel) are read as bytes through the file chooser.
+    if (window.bookkeeper?.openFile && !BINARY_KINDS.includes(importFileType)) {
       const result = await window.bookkeeper.openFile({
         filters: [{ name: 'Bank file', extensions: extensions[importFileType] ?? ['*'] }],
       });
@@ -616,6 +708,11 @@ export default function BankingPage() {
     const file = e.target.files?.[0] ?? null;
     e.target.value = ''; // allow re-selecting the same file
     if (!file) return;
+    const kind = fileTypeFromName(file.name);
+    if (kind && BINARY_KINDS.includes(kind)) {
+      await extractFile(file);
+      return;
+    }
     try {
       const text = await file.text();
       applyLoadedFile(text, file.name);
@@ -795,13 +892,16 @@ export default function BankingPage() {
                 id="import-file-type"
                 value={importFileType}
                 onChange={(e) => {
-                  setImportFileType(e.target.value as 'ofx' | 'qbo' | 'csv');
+                  setImportFileType(e.target.value as ImportKind);
                   setImportSummary(null);
+                  setStatementExtract(null);
                 }}
               >
                 <option value="ofx">OFX / QFX</option>
                 <option value="qbo">QBO (QuickBooks Online)</option>
                 <option value="csv">CSV</option>
+                <option value="xlsx">Excel (.xlsx)</option>
+                <option value="statement">Bank statement (PDF or scan)</option>
               </Select>
             </div>
           </div>
@@ -868,6 +968,36 @@ export default function BankingPage() {
                   />
                 </div>
               )}
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <ColumnPicker
+                  id="csv-payee"
+                  label="Payee column (optional)"
+                  value={csvPayeeCol}
+                  onChange={setCsvPayeeCol}
+                  headers={csvHeaders}
+                  placeholder="(none)"
+                  allowEmpty
+                />
+                <ColumnPicker
+                  id="csv-memo"
+                  label="Memo column (optional)"
+                  value={csvMemoCol}
+                  onChange={setCsvMemoCol}
+                  headers={csvHeaders}
+                  placeholder="(none)"
+                  allowEmpty
+                />
+                <ColumnPicker
+                  id="csv-check"
+                  label="Check number column (optional)"
+                  value={csvCheckCol}
+                  onChange={setCsvCheckCol}
+                  headers={csvHeaders}
+                  placeholder="(none)"
+                  allowEmpty
+                />
+              </div>
 
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <ColumnPicker
@@ -973,8 +1103,30 @@ export default function BankingPage() {
             </div>
           )}
 
+          {BINARY_KINDS.includes(importFileType) && (
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center gap-3">
+                <Button type="button" variant="secondary" onClick={() => importFileRef.current?.click()} loading={extracting}>
+                  {importFileType === 'xlsx' ? 'Choose Excel file…' : 'Choose statement PDF or scan…'}
+                </Button>
+                <span className="text-xs text-navy/50">
+                  {importFileType === 'xlsx'
+                    ? 'The first sheet with data is read; then you map its columns.'
+                    : 'Read on this computer. You check every row and the balances before anything is imported.'}
+                </span>
+              </div>
+              {statementExtract && (
+                <StatementReview
+                  extract={statementExtract}
+                  importing={importing}
+                  onImport={importStatement}
+                  onCancel={() => setStatementExtract(null)}
+                />
+              )}
+            </div>
+          )}
           {/* File loader (Electron picker or browser file input) or paste */}
-          <div>
+          <div className={BINARY_KINDS.includes(importFileType) ? 'hidden' : undefined}>
             <div className="flex items-center justify-between mb-1">
               <Label htmlFor="import-content">File Content</Label>
               <button
@@ -989,7 +1141,7 @@ export default function BankingPage() {
             <input
               ref={importFileRef}
               type="file"
-              accept=".ofx,.qfx,.qbo,.csv,.txt"
+              accept={ACCEPT[importFileType]}
               className="hidden"
               onChange={handleBrowserFile}
             />
@@ -1006,8 +1158,8 @@ export default function BankingPage() {
             )}
           </div>
 
-          <div className="flex items-center gap-4">
-            <Button type="submit" loading={importing}>
+          <div className={`flex items-center gap-4 ${importFileType === 'statement' && !importSummary ? 'hidden' : ''}`}>
+            <Button type="submit" loading={importing} className={BINARY_KINDS.includes(importFileType) ? 'hidden' : undefined}>
               {importFileType === 'csv' ? 'Commit Import' : 'Import'}
             </Button>
             {importSummary && (

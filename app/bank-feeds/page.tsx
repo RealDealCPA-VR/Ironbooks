@@ -3,7 +3,8 @@
  * Bank Feeds / Import — where bank transactions come into Ironbooks.
  *
  * Ironbooks never connects to your bank or a third-party feed service: transactions come in from
- * the statement files you download from your bank (OFX / QFX / QBO / CSV), from a spreadsheet
+ * the statement files you get from your bank (a PDF or scan of the statement, Excel, CSV, OFX /
+ * QFX / QBO), from a spreadsheet
  * pasted into Batch Enter, or typed straight into an account register. Imported lines wait in
  * Review bank transactions, where suggested accounts (rules, your history, the learned model and
  * optional local AI) are confirmed before anything posts.
@@ -18,7 +19,7 @@ const PATHS = [
     href: '/banking',
     icon: FileUp,
     title: 'Import a statement file',
-    body: 'Download transactions from your bank’s website (OFX, QFX, QBO or CSV) and import them into a bank or credit card account. Lines already imported are skipped.',
+    body: 'Import the statement your bank gives you: a PDF or a scan of it (read and tied out to its balances on this computer), Excel, CSV, OFX, QFX or QBO. Lines already imported are skipped.',
     cta: 'Import a file',
   },
   {

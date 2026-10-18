@@ -44,6 +44,8 @@ export interface ParsedTransaction {
   description: string;
   /** Positive = credit to bank account (deposit); negative = debit (payment). */
   amount: string; // decimal string, stored directly in DB
+  /** Payee from the file (CSV payee column, or a reviewed statement row). */
+  payee?: string;
   /**
    * The date earlier versions stored for this line when it differs from `date` (OFX times of day,
    * CSV dates without a format read as local midnight). Only used to recognize rows imported before
@@ -60,7 +62,7 @@ export interface ParsedTransaction {
 }
 
 /** 'qfx' (Quicken/Web Connect) is structurally identical to OFX and parsed the same way. */
-export type FileType = 'ofx' | 'qfx' | 'qbo' | 'csv';
+export type FileType = 'ofx' | 'qfx' | 'qbo' | 'csv' | 'rows';
 
 export interface CsvMapping {
   /** Column name or 0-based index for each field. */
@@ -77,6 +79,12 @@ export interface CsvMapping {
   skipRows?: number;
   /** Flip the sign of every amount (for banks that export withdrawals as positive). */
   flipSign?: boolean;
+  /** Optional payee column (kept as the line's payee, used by rules and suggestions). */
+  payeeCol?: string | number;
+  /** Optional memo column (added to the description). */
+  memoCol?: string | number;
+  /** Optional check number column (the description starts "Check #1234"). */
+  checkNumberCol?: string | number;
 }
 
 export interface ImportSummary {
@@ -424,8 +432,14 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
       amount = toAmountString(Money.neg(amount));
     }
 
-    // Description
-    const description = col(mapping.descriptionCol) || 'Imported transaction';
+    // Description, with the optional check number and memo columns folded in.
+    const baseDescription = col(mapping.descriptionCol) || 'Imported transaction';
+    const checkNo = mapping.checkNumberCol !== undefined ? col(mapping.checkNumberCol) : '';
+    const memo = mapping.memoCol !== undefined ? col(mapping.memoCol) : '';
+    const description = [checkNo ? `Check #${checkNo}` : '', baseDescription, memo && memo !== baseDescription ? memo : '']
+      .filter(Boolean)
+      .join(' — ');
+    const payee = mapping.payeeCol !== undefined ? col(mapping.payeeCol) || undefined : undefined;
 
     // Optional fitId
     const fitId =
@@ -437,7 +451,9 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
     // description / fitId cells with the formula-guard apostrophe still on.
     const legacyDate = mapping.dateFormat ? undefined : legacyIfDifferent(date, new Date(rawDate));
     const rawDescription = rawCol(mapping.descriptionCol) || 'Imported transaction';
-    const legacyDescription = rawDescription !== description ? rawDescription : undefined;
+    // Only plain description mappings existed before; folded columns have no legacy form.
+    const folded = Boolean(checkNo || (memo && memo !== baseDescription));
+    const legacyDescription = !folded && rawDescription !== description ? rawDescription : undefined;
     const rawFitId = mapping.fitIdCol !== undefined ? rawCol(mapping.fitIdCol) || undefined : undefined;
     const legacyFitId = rawFitId !== fitId ? rawFitId : undefined;
 
@@ -446,6 +462,7 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
       date,
       description,
       amount,
+      ...(payee ? { payee } : {}),
       ...(legacyDate ? { legacyDate } : {}),
       ...(legacyDescription !== undefined ? { legacyDescription } : {}),
       ...(legacyFitId !== undefined ? { legacyFitId } : {}),
@@ -545,11 +562,46 @@ function hashFitId(
 // Import orchestrator
 // ---------------------------------------------------------------------------
 
+/** One reviewed statement row (fileType 'rows'). Positive = money into the account. */
+export interface ImportRowInput {
+  /** YYYY-MM-DD */
+  date: string;
+  description: string;
+  amount: string;
+  payee?: string | null;
+}
+
+/** Rows a person reviewed (statement PDF / scan) → the same shape every parser returns. */
+export function parseRows(rows: ImportRowInput[]): ParsedTransaction[] {
+  if (!Array.isArray(rows) || rows.length === 0) throw validation('There are no rows to import.');
+  if (rows.length > 5000) throw validation('Import at most 5,000 rows at a time.');
+  return rows.map((r, i) => {
+    const date = parseLooseDate(String(r?.date ?? ''));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(r?.date ?? '')) || isNaN(date.getTime())) {
+      throw validation(`Row ${i + 1}: the date must look like 2026-01-31.`);
+    }
+    let amount: string;
+    try {
+      amount = toAmountString(r.amount);
+    } catch {
+      throw validation(`Row ${i + 1}: "${r.amount}" is not an amount.`);
+    }
+    if (Money.isZero(amount)) throw validation(`Row ${i + 1}: the amount is zero.`);
+    const description = String(r.description ?? '').trim().slice(0, 500) || 'Statement transaction';
+    const payee = typeof r.payee === 'string' && r.payee.trim() ? r.payee.trim().slice(0, 255) : undefined;
+    return { date, description, amount, ...(payee ? { payee } : {}) };
+  });
+}
+
 export interface ImportTransactionsInput {
   bankAccountId: string;
-  /** 'ofx', 'qfx', and 'qbo' are treated identically (same parser). */
+  /** 'ofx', 'qfx', and 'qbo' are treated identically (same parser); 'rows' takes `rows`. */
   fileType: FileType;
   content: string;
+  /** fileType 'rows': the reviewed rows. */
+  rows?: ImportRowInput[];
+  /** fileType 'rows' from a statement: how it tied out (recorded in the audit trail). */
+  statementCheck?: { tieOut: { ok: boolean; difference: string | null }; acknowledgedDifference: boolean };
   csvMapping?: CsvMapping;
   /** Optional filename for audit purposes. */
   filename?: string;
@@ -597,7 +649,7 @@ export async function importTransactions(
   // Map fileType enum for the fileImports row. 'qfx' is OFX-on-the-wire and the
   // file_type enum predates it (schema is frozen), so it is stored as 'ofx'.
   const fileTypeForDb =
-    input.fileType === 'csv' ? 'csv' : input.fileType === 'qbo' ? 'qbo' : 'ofx';
+    input.fileType === 'csv' || input.fileType === 'rows' ? 'csv' : input.fileType === 'qbo' ? 'qbo' : 'ofx';
 
   // 2. Create fileImports row.
   const [importRow] = await ctx.db
@@ -621,6 +673,8 @@ export async function importTransactions(
         throw validation('csvMapping is required for CSV imports.');
       }
       parsed = parseCSV(input.content, input.csvMapping);
+    } else if (input.fileType === 'rows') {
+      parsed = parseRows(input.rows ?? []);
     } else {
       // ofx and qbo use the same parser.
       parsed = parseOFX(input.content);
@@ -711,7 +765,7 @@ export async function importTransactions(
       // Apply rules to get the suggested account and any payee override.
       const match = await matchRule(
         ctx,
-        { description: txn.description, payee: undefined, amount: txn.amount, bankAccountId: input.bankAccountId },
+        { description: txn.description, payee: txn.payee, amount: txn.amount, bankAccountId: input.bankAccountId },
         rules,
       );
 
@@ -722,7 +776,7 @@ export async function importTransactions(
         fitId: txn.fitId ?? null,
         date: txn.date,
         description: txn.description,
-        payee: match?.setPayee ?? null,
+        payee: match?.setPayee ?? txn.payee ?? null,
         amount: txn.amount,
         matched: false,
         suggestedAccountId: match?.setAccountId ?? null,
@@ -759,6 +813,9 @@ export async function importTransactions(
       imported: importedCount,
       skippedDupes,
       errors: errorLog.length,
+      ...(input.statementCheck
+        ? { tiedOut: input.statementCheck.tieOut.ok, difference: input.statementCheck.tieOut.difference, acknowledgedDifference: input.statementCheck.acknowledgedDifference }
+        : {}),
     },
   });
   // A bulk load: give the planner fresh statistics (PGlite has no autovacuum; best-effort).
