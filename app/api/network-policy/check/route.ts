@@ -1,9 +1,8 @@
 /**
- * GET /api/network-policy/check?purpose=<ai|email|bank-feeds|updates>&url=<destination>
+ * GET /api/network-policy/check?purpose=<ai|email|updates>&url=<destination>
  *
  * Ask the network policy whether a destination may be contacted. Used by the Electron shell
- * (which has no session cookie) before checking for updates, and to decide which remote
- * origins the window may load (Plaid Link, only when bank feeds are opted in).
+ * (which has no session cookie) before checking for updates.
  *
  * Auth: the per-launch internal token (x-bka-internal — same trusted-local pattern as
  * /api/dashboard/auto-backup; resolves to the file's primary company) or a normal session.
@@ -51,7 +50,7 @@ export async function GET(req: NextRequest) {
     }
     const ctx = (await internalContext(req)) ?? (await getServerContext());
     // A question, not a connection — decided without adding to the outbound activity log.
-    // Sandbox mode: update checks / bank feeds / email are off in a practice copy.
+    // Sandbox mode: update checks and email are off in a practice copy.
     return NextResponse.json(applySandboxToDecision(decideOutbound(await getNetworkPolicy(ctx), url, purpose)));
   } catch (err) {
     if (err instanceof ServiceError) {

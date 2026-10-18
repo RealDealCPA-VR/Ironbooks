@@ -74,7 +74,7 @@ describe('decideOutbound — adversarial', () => {
   });
 
   it('even an all-opted-in cloud policy refuses metadata, multicast and IPv6 link-local', () => {
-    const all = pol('allow-cloud', { ai: true, email: true, 'bank-feeds': true, updates: true });
+    const all = pol('allow-cloud', { ai: true, email: true, updates: true });
     for (const url of [
       'http://[::ffff:a9fe:a9fe]/latest/meta-data',
       'http://2852039166/',
@@ -88,7 +88,7 @@ describe('decideOutbound — adversarial', () => {
   });
 
   it('refuses non-network protocols for every purpose even to loopback', () => {
-    const all = pol('allow-cloud', { ai: true, email: true, 'bank-feeds': true, updates: true });
+    const all = pol('allow-cloud', { ai: true, email: true, updates: true });
     for (const url of ['file:///C:/Windows/win.ini', 'data:text/plain,hi', 'javascript:alert(1)', 'ws://127.0.0.1/', 'gopher://127.0.0.1/']) {
       expect(decideOutbound(all, url, 'ai', undefined).allowed, url).toBe(false);
     }
@@ -102,9 +102,9 @@ describe('decideOutbound — adversarial', () => {
   });
 
   it('a tampered stored policy cannot opt in via truthy non-booleans or prototype keys', () => {
-    const p = normalizePolicy(JSON.parse('{"mode":"allow-cloud","cloudOptIn":{"ai":"true","email":1,"__proto__":{"bank-feeds":true}}}'));
-    expect(p.cloudOptIn).toEqual({ ai: false, email: false, 'bank-feeds': false, updates: true });
-    expect(decideOutbound(p, 'https://production.plaid.com/', 'bank-feeds', undefined).allowed).toBe(false);
+    const p = normalizePolicy(JSON.parse('{"mode":"allow-cloud","cloudOptIn":{"ai":"true","email":1,"__proto__":{"email":true}}}'));
+    expect(p.cloudOptIn).toEqual({ ai: false, email: false, updates: true });
+    expect(decideOutbound(p, 'smtps://smtp.example.com:465', 'email', undefined).allowed).toBe(false);
     expect(normalizePolicy({ mode: 'ALLOW-CLOUD' }).mode).toBe('tailnet-only');
     expect(normalizePolicy('allow-cloud').mode).toBe('tailnet-only');
     expect(normalizePolicy(null).mode).toBe('tailnet-only');

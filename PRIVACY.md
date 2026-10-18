@@ -14,7 +14,7 @@ This document lists everything that can leave the machine, and what controls it.
 | Multi-user hosting | Only to devices on **your** Tailscale tailnet, and only while hosting is on | File > Host multi-user access |
 | AI (assistant, categorization, AI Review "Analyze") | Model servers on this computer, your LAN or your tailnet by default; a cloud AI provider only if opted in (and then redacted) | AI & Automation (providers) + Privacy & Network → AI assistance |
 | Emailing an invoice | Only the message and PDF you send, to your SMTP server | Privacy & Network → Email |
-| Bank feeds (Plaid) | Plaid credentials and the bank link token; transactions download into the file | Privacy & Network → Bank feeds |
+| Bank transactions | **Nothing.** Ironbooks never connects to your bank or a feed service; transactions come only from statement files you import. | — |
 | Update checks | App version and platform only (no company data); **on by default** | Privacy & Network → App updates |
 | Telemetry / analytics / crash reports | **None.** | — |
 | Web fonts / CDNs | **None.** Fonts are bundled at build time. | — |
@@ -24,7 +24,7 @@ This document lists everything that can leave the machine, and what controls it.
 Each company has a network mode (Settings → **Privacy & Network**). Owners and admins can
 change it; every change is written to the audit trail.
 
-- **Offline** — nothing leaves the computer. Email, bank feeds, AI and update checks are off.
+- **Offline** — nothing leaves the computer. Email, AI and update checks are off.
 - **Local network + tailnet** (default) — the app may talk to:
   - this computer (`127.0.0.0/8`, `::1`, `localhost`),
   - your private LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, IPv6 `fc00::/7`),
@@ -34,7 +34,7 @@ change it; every change is written to the audit trail.
   only, to GitHub Releases), which is on by default and can be turned off. This is enough for
   multi-user hosting, an SMTP relay on your network, or an AI model running on a computer you own.
 - **Allow cloud services I choose** — as above, plus the public internet **only** for the
-  purposes you switch on individually (AI, email, bank feeds). Those are off until you turn them
+  purposes you switch on individually (AI, email). Those are off until you turn them
   on; update checks stay on unless you turn them off.
 
 Hostnames other than `localhost` and `*.ts.net` are treated as public internet, because a
@@ -51,7 +51,7 @@ of that cap and the company setting. A value that is set but not recognised coun
   `lib/net/guard.ts` (`assertOutboundAllowed` and `policyFetch`), which applies the rules in
   `lib/net/policy.ts`. A blocked call fails with a plain-English message and never opens a
   connection. Redirects are checked hop by hop, so an allowed host cannot bounce a request to a
-  disallowed one. Today that covers Plaid (bank feeds), SMTP (email) and every AI provider
+  disallowed one. Today that covers SMTP (email) and every AI provider
   configured in AI & Automation (Ollama / OpenAI-compatible / Anthropic, see
   `lib/ai/providers.ts`); new integrations must use the same gate.
 - **Recent network activity:** the Privacy & Network page lists every outbound attempt since the
@@ -62,8 +62,7 @@ of that cap and the company setting. A value that is set but not recognised coun
     Navigation and pop-ups to other sites are blocked. A normal `https` link you click opens in
     your own web browser.
   - Every request the window makes is filtered. Requests to other origins (CDNs, fonts,
-    trackers) are cancelled and logged. Plaid's domains are allowed only once the company has
-    opted in to cloud bank feeds.
+    trackers, third-party bank widgets) are cancelled and logged.
   - `contextIsolation`, `sandbox` and no Node integration are on. There is no `<webview>`, no
     permission prompts (camera, microphone, location, notifications), and the spellchecker is
     off, because Chromium would otherwise download dictionaries.
@@ -75,7 +74,7 @@ of that cap and the company setting. A value that is set but not recognised coun
   - Next.js telemetry is disabled for the app server (`NEXT_TELEMETRY_DISABLED=1`).
 
 User actions that open your system browser are not data transfers by the app. These are
-**Help → Ironbooks on the web**, the IRS FIRE upload link and the Plaid sign-up link.
+**Help → Ironbooks on the web** and the IRS FIRE upload link.
 
 ## Multi-user hosting (tailnet only)
 

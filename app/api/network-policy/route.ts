@@ -3,7 +3,7 @@
  *                           (BKA_NETWORK_MODE), the per-purpose verdict for each cloud service,
  *                           and recent outbound activity (host + purpose + verdict only).
  * PUT /api/network-policy — replace the policy. Body: { mode, cloudOptIn: { ai, email,
- *                           'bank-feeds', updates } }. Owner/admin only; audited.
+ *                           updates } }. Owner/admin only; audited.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -35,7 +35,6 @@ function errorResponse(err: unknown) {
 const SAMPLE_CLOUD_URL: Record<OutboundPurpose, string> = {
   ai: 'https://api.anthropic.com/',
   email: 'smtps://smtp.example.com:465',
-  'bank-feeds': 'https://production.plaid.com/',
   updates: 'https://github.com/',
 };
 

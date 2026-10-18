@@ -12,7 +12,7 @@ import { Badge, Button, Card, PageHeader, PageSkeleton, toast } from '@/componen
 import { api, ApiError } from '@/lib/client';
 
 type Mode = 'offline' | 'tailnet-only' | 'allow-cloud';
-type Purpose = 'ai' | 'email' | 'bank-feeds' | 'updates';
+type Purpose = 'ai' | 'email' | 'updates';
 
 interface Decision {
   allowed: boolean;
@@ -47,7 +47,7 @@ const MODES: { id: Mode; title: string; body: string; icon: typeof WifiOff }[] =
   {
     id: 'offline',
     title: 'Offline',
-    body: 'Nothing leaves this computer. Email, bank feeds, AI and update checks are all off.',
+    body: 'Nothing leaves this computer. Email, AI and update checks are all off.',
     icon: WifiOff,
   },
   {
@@ -66,17 +66,12 @@ const MODES: { id: Mode; title: string; body: string; icon: typeof WifiOff }[] =
   },
 ];
 
-interface NetworkBridge {
-  network?: { refresh?: () => Promise<unknown> };
-}
-
 export default function PrivacyNetworkPage() {
   const [data, setData] = useState<PolicyResponse | null>(null);
   const [mode, setMode] = useState<Mode>('tailnet-only');
   const [optIn, setOptIn] = useState<Record<Purpose, boolean>>({
     ai: false,
     email: false,
-    'bank-feeds': false,
     updates: true,
   });
   const [saving, setSaving] = useState(false);
@@ -107,9 +102,6 @@ export default function PrivacyNetworkPage() {
       const d = await api.put<PolicyResponse>('/api/network-policy', { mode, cloudOptIn: optIn });
       setData(d);
       toast('Privacy & Network settings saved.', 'success');
-      // Desktop: let the window load Plaid Link only if bank feeds are now allowed.
-      const b = (window as unknown as { bookkeeper?: NetworkBridge }).bookkeeper;
-      b?.network?.refresh?.().catch(() => {});
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not save.', 'danger');
     } finally {

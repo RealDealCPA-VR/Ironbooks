@@ -159,7 +159,6 @@ describe('API permission map coverage', () => {
         '/api/companies/[id]',
         '/api/companies/select',
         '/api/email/status',
-        '/api/plaid/status',
         '/api/portal/login',
         '/api/portal/logout',
         '/api/portal/me',

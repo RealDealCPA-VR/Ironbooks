@@ -113,7 +113,7 @@ export const HOME_WORKFLOW: WorkflowSection[] = [
       { label: 'Write Checks', href: '/expenses', icon: 'write-checks', hint: 'Pay for something right away.' },
       { label: 'Check Register', href: '/registers', icon: 'check-register', hint: 'See every transaction in an account.' },
       { label: 'Reconcile', href: '/reconcile', icon: 'reconcile', hint: 'Match your books to the bank statement.' },
-      { label: 'Bank Feeds', href: '/bank-feeds', icon: 'bank-feeds', hint: 'Download transactions from your bank.' },
+      { label: 'Bank Feeds', href: '/bank-feeds', icon: 'bank-feeds', hint: 'Import a statement file from your bank.' },
       { label: 'Transfer Funds', href: '/transfers', icon: 'transfers', hint: 'Move money between your accounts.' },
     ],
   },

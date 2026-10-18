@@ -156,8 +156,7 @@ describe('electron/security.js — renderer filtering', () => {
   delete require.cache[secPath];
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { install } = require('../electron/security.js');
-  const allow = { plaid: false };
-  const sec = install({ getAppOrigin: () => 'http://127.0.0.1:3123', getRendererAllow: () => allow, isDev: false, log: () => {} });
+  const sec = install({ getAppOrigin: () => 'http://127.0.0.1:3123', isDev: false, log: () => {} });
 
   const decide = (url: string, webContentsId: number | undefined = 1) => {
     let r: { cancel?: boolean } = {};
@@ -182,17 +181,9 @@ describe('electron/security.js — renderer filtering', () => {
     }
   });
 
-  it('Plaid only when opted in, only https, only real plaid.com hosts', () => {
-    expect(decide('https://cdn.plaid.com/link/v2/stable/link-initialize.js')).toBe(false);
-    allow.plaid = true;
-    try {
-      expect(decide('https://cdn.plaid.com/link/v2/stable/link-initialize.js')).toBe(true);
-      expect(decide('http://cdn.plaid.com/x')).toBe(false);
-      expect(decide('https://plaid.com.evil.com/x')).toBe(false);
-      expect(decide('https://evilplaid.com/x')).toBe(false);
-      expect(decide('https://cdn.plaid.com@evil.com/x')).toBe(false);
-    } finally {
-      allow.plaid = false;
+  it('no third-party bank widget can load (Plaid was removed; bank data comes from imported statements)', () => {
+    for (const url of ['https://cdn.plaid.com/link/v2/stable/link-initialize.js', 'https://production.plaid.com/x', 'https://plaid.com/']) {
+      expect(decide(url), url).toBe(false);
     }
   });
 

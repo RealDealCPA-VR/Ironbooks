@@ -230,8 +230,8 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/bank-feeds': {
     title: 'Bank Feeds / Import',
-    what: 'Bring in transactions from your bank (download or import a file) so you do not type them.',
-    first: 'Pick the bank account and import the file from your bank, then review each line.',
+    what: 'Bring in transactions from statement files your bank gives you, so you do not type them.',
+    first: 'Import the file from your bank, then review each line.',
     qb: 'Bank Feeds',
   },
   '/bank-review': {

@@ -43,7 +43,6 @@ import {
 } from './sandbox';
 import { isSandboxActive } from './sandboxState';
 import { sendMail, emailInvoice } from './email';
-import { syncTransactions } from './plaid';
 import { runDueSchedules } from './memorizedReports';
 import { createBackup } from './backup';
 import { checkOutbound } from '@/lib/net/guard';
@@ -171,12 +170,10 @@ describe('sandbox mode', () => {
       message: expect.stringMatching(/Email is turned off in the sandbox/),
     });
     await expect(emailInvoice(ctx, '00000000-0000-0000-0000-000000000000', 'a@b.test')).rejects.toThrow(/turned off in the sandbox/);
-    // The network guard refuses email / bank feeds / updates (AI help still follows the policy).
+    // The network guard refuses email / updates (AI help still follows the policy).
     expect((await checkOutbound('smtp://127.0.0.1:2525', 'email', ctx)).allowed).toBe(false);
-    expect((await checkOutbound('http://127.0.0.1:9/', 'bank-feeds', ctx)).allowed).toBe(false);
     expect((await checkOutbound('http://127.0.0.1:9/', 'updates', ctx)).allowed).toBe(false);
     expect((await checkOutbound('http://127.0.0.1:9/', 'ai', ctx)).allowed).toBe(true);
-    await expect(syncTransactions(ctx, { accessToken: 'x', bankAccountId: 'y' })).rejects.toThrow(/Bank feed sync is turned off/);
     await expect(runDueSchedules(ctx)).rejects.toThrow(/Scheduled reports is turned off/);
   });
 

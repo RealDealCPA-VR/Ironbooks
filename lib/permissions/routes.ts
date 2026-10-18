@@ -81,7 +81,6 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/portal/logout': kind('public', 'POST'),
   '/api/portal/me': kind('self', 'GET'),
   '/api/email/status': kind('public', 'GET'),
-  '/api/plaid/status': kind('public', 'GET'),
 
   // ---- Company files / company settings ----
   '/api/companies': kind('self', 'GET POST'),
@@ -404,9 +403,6 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/ai/bank-suggestions': r('banking', 'GET POST'),
   '/api/ai/categorizer': r('banking', 'GET POST:modify'),
   '/api/demo-feed': r('banking', 'POST'),
-  '/api/plaid/exchange': r('banking', 'POST'),
-  '/api/plaid/link-token': r('banking', 'POST'),
-  '/api/plaid/sync': r('banking', 'POST'),
   '/api/deposits': r('banking', 'GET POST'),
   '/api/deposits/[id]': r('banking', 'GET PATCH DELETE'),
   '/api/deposits/undeposited': r('banking', 'GET'),

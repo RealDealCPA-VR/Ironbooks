@@ -10,7 +10,7 @@
  *   tailnet-only  — DEFAULT. Loopback, the private LAN (RFC 1918 / IPv6 ULA) and the Tailscale
  *                   tailnet (100.64.0.0/10, *.ts.net) are reachable; the public internet is not.
  *   allow-cloud   — as tailnet-only, plus public destinations for the purposes the company has
- *                   explicitly opted in to (ai, email, bank-feeds). Those purposes are OFF by
+ *                   explicitly opted in to (ai, email). Those purposes are OFF by
  *                   default, even in this mode.
  *
  * App update checks are the exception: they send no company data (app version + platform only),
@@ -29,13 +29,13 @@ import { classifyHost, isPrivateClass, normalizeHost, type HostClass } from './c
 export const NETWORK_MODES = ['offline', 'tailnet-only', 'allow-cloud'] as const;
 export type NetworkMode = (typeof NETWORK_MODES)[number];
 
-export const OUTBOUND_PURPOSES = ['ai', 'email', 'bank-feeds', 'updates'] as const;
+export const OUTBOUND_PURPOSES = ['ai', 'email', 'updates'] as const;
 export type OutboundPurpose = (typeof OUTBOUND_PURPOSES)[number];
 
 export interface NetworkPolicy {
   mode: NetworkMode;
   /**
-   * Per-purpose cloud opt-in. ai/email/bank-feeds are only consulted in 'allow-cloud' mode and
+   * Per-purpose cloud opt-in. ai/email are only consulted in 'allow-cloud' mode and
    * default to false; updates defaults to true and also applies in 'tailnet-only' mode.
    */
   cloudOptIn: Record<OutboundPurpose, boolean>;
@@ -43,7 +43,7 @@ export interface NetworkPolicy {
 
 export const DEFAULT_NETWORK_POLICY: NetworkPolicy = Object.freeze({
   mode: 'tailnet-only',
-  cloudOptIn: Object.freeze({ ai: false, email: false, 'bank-feeds': false, updates: true }),
+  cloudOptIn: Object.freeze({ ai: false, email: false, updates: true }),
 }) as NetworkPolicy;
 
 /** Human-facing description of each purpose: what would leave the machine if allowed. */
@@ -61,12 +61,6 @@ export const PURPOSE_INFO: Record<
     label: 'Email (invoices, statements)',
     sends: 'The message and PDF attachment you choose to send, to the recipient you enter.',
     destinations: 'Your configured SMTP server (SMTP_HOST). A relay on your LAN/tailnet works without cloud opt-in.',
-  },
-  'bank-feeds': {
-    label: 'Bank feeds (Plaid)',
-    sends:
-      'Plaid credentials and the bank connection token; downloads transactions into this company file.',
-    destinations: '*.plaid.com',
   },
   updates: {
     label: 'App updates',

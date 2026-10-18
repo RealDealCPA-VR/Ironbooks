@@ -765,7 +765,7 @@ const DESTRUCTIVE = new Set([
   '/api/users/[id]/reset-password', '/api/auth/reset', '/api/auth/request-reset', '/api/auth/login', '/api/auth/signup',
   '/api/unlock', '/api/portal/logout', '/api/period-copy', '/api/merge', '/api/undo/commit', '/api/undo/[id]',
   '/api/company/closing-date', '/api/demo-feed', '/api/backups', '/api/backups/run', '/api/dashboard/auto-backup', '/api/attention/backup',
-  '/api/plaid/exchange', '/api/plaid/sync', '/api/ai/test', '/api/ai/assistant', '/api/ai/settings', '/api/roles/[id]',
+  '/api/ai/test', '/api/ai/assistant', '/api/ai/settings', '/api/roles/[id]',
   '/api/cleanup', '/api/accountant/batch-void', '/api/accountant/write-off', '/api/accountant/reclassify', '/api/errors/[id]/apply',
   '/api/report-schedules/run-due', '/api/reports/schedules/run-due', '/api/invoices/[id]/email', '/api/sales-forms/[kind]/[id]/email',
   '/api/sales-forms/statement-email', '/api/fiscal-periods/[id]', '/api/backup/company', '/api/accountant-copy/changes',

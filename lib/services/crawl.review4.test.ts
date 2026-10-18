@@ -6,7 +6,7 @@
  *     serviceErrorStatus everywhere).
  *  2. PATCH /api/jobs/:id {} → drizzle "No values to set".
  *  3. GET /api/reports/commissions?from=garbage → RangeError.
- *  4. Malformed JSON / `null` / wrong-typed bodies → SyntaxError / TypeError (74 route+method pairs).
+ *  4. Malformed JSON / `null` / wrong-typed bodies → SyntaxError / TypeError (72 route+method pairs; the two Plaid routes were removed).
  *  5. A pay run where every check is refused left an empty pay-run header behind (HTTP 201).
  *  +  Opening stock opened a FIFO layer, so the item could not be built, counted or revalued.
  */
@@ -232,7 +232,7 @@ describe('other reachable 500s', () => {
   });
 });
 
-// The 74 (method, route) pairs the crawl saw answer 500 to a malformed / null / non-object body.
+// The 72 (method, route) pairs the crawl saw answer 500 to a malformed / null / non-object body.
 const INVALID_BODY_PAIRS: Array<[string, string]> = [
   ['PATCH', '/api/collections/notes/[id]'], ['PATCH', '/api/custom-fields'], ['PATCH', '/api/estimates/[id]'],
   ['PATCH', '/api/finance-charges/settings'], ['PATCH', '/api/jobs/[id]'], ['PATCH', '/api/journal-entries/[id]'],
@@ -251,8 +251,8 @@ const INVALID_BODY_PAIRS: Array<[string, string]> = [
   ['POST', '/api/inventory/batch-count'], ['POST', '/api/inventory/physical-count'], ['POST', '/api/inventory/value-adjust'],
   ['POST', '/api/landed-cost/[id]'], ['POST', '/api/notes'], ['POST', '/api/pay-liabilities'],
   ['POST', '/api/pay-liabilities/by-item'], ['POST', '/api/pay-liabilities/checks/[id]'], ['POST', '/api/payments/[id]'],
-  ['POST', '/api/payroll/calc'], ['POST', '/api/payroll/state-tax'], ['POST', '/api/plaid/exchange'],
-  ['POST', '/api/plaid/sync'], ['POST', '/api/portal/login'], ['POST', '/api/qb-import'],
+  ['POST', '/api/payroll/calc'], ['POST', '/api/payroll/state-tax'],
+  ['POST', '/api/portal/login'], ['POST', '/api/qb-import'],
   ['POST', '/api/reconciliations'], ['POST', '/api/reconciliations/[id]/pay'], ['POST', '/api/reconciliations/undo'],
   ['POST', '/api/report-builder'], ['POST', '/api/rules'], ['POST', '/api/sales-forms/queue'],
   ['POST', '/api/sales-reps'], ['POST', '/api/sales-reps/assign'], ['POST', '/api/sales-tax/pay'],
@@ -270,8 +270,8 @@ declare global {
 const routeModules = import.meta.glob('../../app/api/**/route.ts');
 
 describe('invalid request bodies answer 4xx, never 500', () => {
-  it('lists 74 distinct pairs', () => {
-    expect(new Set(INVALID_BODY_PAIRS.map((p) => p.join(' '))).size).toBe(74);
+  it('lists 72 distinct pairs', () => {
+    expect(new Set(INVALID_BODY_PAIRS.map((p) => p.join(' '))).size).toBe(72);
   });
   for (const [method, route] of INVALID_BODY_PAIRS) {
     it(`${method} ${route}`, async () => {

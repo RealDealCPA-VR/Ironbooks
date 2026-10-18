@@ -64,10 +64,6 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     openConnect: () => ipcRenderer.invoke('hosting:openConnect'),
     disconnect: () => ipcRenderer.invoke('hosting:disconnect'),
   },
-  /** Re-read the Privacy & Network policy for what the window may load (after saving it). */
-  network: {
-    refresh: () => ipcRenderer.invoke('network:refresh'),
-  },
   /** My Preferences > Spelling: turn the (local-only) spell checker on or off. */
   spellcheck: {
     setEnabled: (enabled) => ipcRenderer.invoke('spellcheck:setEnabled', Boolean(enabled)),

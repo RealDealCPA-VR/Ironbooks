@@ -25,14 +25,19 @@ describe('normalizePolicy', () => {
   it('defaults to tailnet-only with every cloud purpose off except update checks', () => {
     expect(normalizePolicy(undefined)).toEqual({
       mode: 'tailnet-only',
-      cloudOptIn: { ai: false, email: false, 'bank-feeds': false, updates: true },
+      cloudOptIn: { ai: false, email: false, updates: true },
     });
     expect(DEFAULT_NETWORK_POLICY.mode).toBe('tailnet-only');
+  });
+  it('a stored opt-in for the removed Plaid bank feeds is dropped, not carried over', () => {
+    const p = normalizePolicy({ mode: 'allow-cloud', cloudOptIn: { 'bank-feeds': true, ai: false } });
+    expect(p.cloudOptIn).toEqual({ ai: false, email: false, updates: true });
+    expect(Object.keys(p.cloudOptIn)).not.toContain('bank-feeds');
   });
   it('drops unknown modes/purposes and non-boolean opt-ins', () => {
     const p = normalizePolicy({ mode: 'yolo', cloudOptIn: { ai: 'yes', email: true, telemetry: true } });
     expect(p.mode).toBe('tailnet-only');
-    expect(p.cloudOptIn).toEqual({ ai: false, email: true, 'bank-feeds': false, updates: true });
+    expect(p.cloudOptIn).toEqual({ ai: false, email: true, updates: true });
   });
   it('keeps update checks off only when explicitly false', () => {
     expect(normalizePolicy({ cloudOptIn: { updates: false } }).cloudOptIn.updates).toBe(false);
@@ -60,9 +65,9 @@ describe('update checks (on by default)', () => {
     expect(decideOutbound(policy('tailnet-only'), FEED, 'updates', 'allow-cloud').allowed).toBe(true);
   });
   it('do not open the internet to any other purpose in tailnet-only mode', () => {
-    const pol = policy('tailnet-only', { ai: true, email: true, 'bank-feeds': true });
+    const pol = policy('tailnet-only', { ai: true, email: true });
     expect(decideOutbound(pol, 'https://api.anthropic.com/v1/messages', 'ai', undefined).allowed).toBe(false);
-    expect(decideOutbound(pol, 'https://production.plaid.com/x', 'bank-feeds', undefined).allowed).toBe(false);
+    expect(decideOutbound(pol, 'smtps://smtp.gmail.com:465', 'email', undefined).allowed).toBe(false);
   });
 });
 
@@ -117,7 +122,6 @@ describe('decideOutbound — per mode and purpose', () => {
   it('allow-cloud: public destinations only for opted-in purposes', () => {
     const pol = policy('allow-cloud', { ai: true, updates: false });
     expect(decideOutbound(pol, CLOUD, 'ai', undefined).allowed).toBe(true);
-    expect(decideOutbound(pol, 'https://production.plaid.com/x', 'bank-feeds', undefined).allowed).toBe(false);
     expect(decideOutbound(pol, 'smtps://smtp.gmail.com:465', 'email', undefined).allowed).toBe(false);
     expect(decideOutbound(pol, 'https://github.com/', 'updates', undefined).allowed).toBe(false);
     // Private destinations need no opt-in.
@@ -131,7 +135,7 @@ describe('decideOutbound — per mode and purpose', () => {
   });
 
   it('never allows unroutable/special destinations, bad protocols or URL credentials', () => {
-    const pol = policy('allow-cloud', { ai: true, 'bank-feeds': true });
+    const pol = policy('allow-cloud', { ai: true, email: true });
     expect(decideOutbound(pol, 'http://169.254.169.254/latest/meta-data', 'ai', undefined).allowed).toBe(false);
     expect(decideOutbound(pol, 'http://0.0.0.0:80/', 'ai', undefined).allowed).toBe(false);
     expect(decideOutbound(pol, 'file:///etc/passwd', 'ai', undefined).allowed).toBe(false);
@@ -173,7 +177,7 @@ describe('guard — assertOutboundAllowed / policyFetch', () => {
   it('policyFetch never contacts a blocked destination', async () => {
     stored.policy = policy('tailnet-only');
     await expect(
-      policyFetch('https://sandbox.plaid.com/link/token/create', { method: 'POST' }, { purpose: 'bank-feeds', ctx }),
+      policyFetch('https://api.anthropic.com/v1/messages', { method: 'POST' }, { purpose: 'ai', ctx }),
     ).rejects.toMatchObject({ code: 'FORBIDDEN' });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
@@ -212,7 +216,7 @@ describe('guard — assertOutboundAllowed / policyFetch', () => {
     fetchSpy
       .mockResolvedValueOnce(new Response(null, { status: 307, headers: { location: '/next' } }))
       .mockResolvedValueOnce(new Response('ok', { status: 200 }));
-    await policyFetch('http://100.100.1.2/start', { method: 'POST', body: 'x' }, { purpose: 'bank-feeds', ctx });
+    await policyFetch('http://100.100.1.2/start', { method: 'POST', body: 'x' }, { purpose: 'email', ctx });
     const [, sameInit] = fetchSpy.mock.calls[1] as [string, RequestInit];
     expect(sameInit.method).toBe('POST');
     expect(sameInit.body).toBe('x');
@@ -220,7 +224,7 @@ describe('guard — assertOutboundAllowed / policyFetch', () => {
     fetchSpy.mockReset();
     fetchSpy.mockResolvedValueOnce(new Response(null, { status: 308, headers: { location: 'http://100.100.1.3/x' } }));
     await expect(
-      policyFetch('http://100.100.1.2/start', { method: 'POST', body: '{"secret":"s"}' }, { purpose: 'bank-feeds', ctx }),
+      policyFetch('http://100.100.1.2/start', { method: 'POST', body: '{"secret":"s"}' }, { purpose: 'email', ctx }),
     ).rejects.toMatchObject({ code: 'FORBIDDEN' });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });

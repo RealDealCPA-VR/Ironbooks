@@ -3,7 +3,7 @@
  * through here:
  *
  *   await assertOutboundAllowed(url, 'ai', ctx);          // before an SDK/transport connects
- *   const res = await policyFetch(url, init, { purpose: 'bank-feeds', ctx });  // fetch wrapper
+ *   const res = await policyFetch(url, init, { purpose: 'email', ctx });  // fetch wrapper
  *
  * policyFetch re-checks every redirect hop (a redirect can never bounce a request from an
  * allowed host to a disallowed one). Blocked calls throw ServiceError('FORBIDDEN') with a
@@ -67,7 +67,7 @@ export async function checkOutbound(
   const policy = await getNetworkPolicy(ctx);
   // A *.ts.net name is tailnet only if it resolves to tailnet addresses (Funnel names are public).
   await verifyTailnetUrls([url]);
-  // Sandbox mode: email, bank feeds and update checks stay off in a practice copy.
+  // Sandbox mode: email and update checks stay off in a practice copy.
   const decision = applySandboxToDecision(decideOutbound(policy, url, purpose));
   log(ctx.companyId, decision);
   return decision;
@@ -119,8 +119,8 @@ export async function policyFetch(
     const next = new URL(location, url);
     const method = (reqInit.method ?? 'GET').toUpperCase();
     const crossOrigin = next.origin !== url.origin;
-    // A 307/308 replays the method AND body. Bodies can carry credentials (Plaid's client_id /
-    // secret travel in the JSON body), so never replay one to a different origin.
+    // A 307/308 replays the method AND body. Bodies can carry credentials (API keys and
+    // secrets often travel in a JSON body), so never replay one to a different origin.
     if (crossOrigin && (status === 307 || status === 308) && method !== 'GET' && method !== 'HEAD') {
       throw new ServiceError(
         'FORBIDDEN',

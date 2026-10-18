@@ -47,7 +47,7 @@ describe('policyFetch — cross-origin header allowlist', () => {
     ],
   ])('drops every credential-like header on a cross-origin hop (%s)', async (_n, make) => {
     fetchSpy.mockResolvedValueOnce(redirect(302, 'http://100.64.0.10/n')).mockResolvedValueOnce(new Response('ok'));
-    await policyFetch('http://100.64.0.9/x', { headers: make() }, { purpose: 'bank-feeds', ctx });
+    await policyFetch('http://100.64.0.9/x', { headers: make() }, { purpose: 'email', ctx });
     const h = hdrs(1);
     for (const k of Object.keys(secrets)) expect(h.get(k), k).toBeNull();
     expect(h.get('accept')).toBe('application/json');

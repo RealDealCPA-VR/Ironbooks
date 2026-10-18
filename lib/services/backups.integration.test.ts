@@ -31,15 +31,6 @@ vi.mock('next/headers', () => ({
   headers: async () => new Headers([...h.headers.entries()]),
 }));
 
-// Bank-feed downloads (Plaid) are allowed for this test company without touching its saved
-// network policy; fetch itself is stubbed in the test, so nothing leaves the machine.
-vi.mock('./networkPolicy', () => ({
-  getNetworkPolicy: async () => ({
-    mode: 'allow-cloud',
-    cloudOptIn: { ai: false, email: false, 'bank-feeds': true, updates: false },
-  }),
-}));
-
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-team-backups');
 const TEST_DIR = path.join(ROOT, 'company');
 const BACKUP_DIR = path.join(ROOT, 'backups');
@@ -50,7 +41,7 @@ process.env.BKA_INTERNAL_TOKEN = 'team-backups-internal-token';
 
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { accounts, bankAccounts, journalEntries, users } from '@/lib/db/schema';
-import { syncTransactions } from './plaid';
+import { importTransactions } from './import';
 import { createSessionToken, hashPassword, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE, getServerContext } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
@@ -268,33 +259,20 @@ describe('backups you can see and trust', () => {
   });
 
   describe('"skip when unchanged" sees every kind of change', () => {
-    it('downloaded bank-feed lines (Plaid) change the fingerprint, so the next scheduled backup is not skipped', async () => {
+    it('imported bank statement lines change the fingerprint, so the next scheduled backup is not skipped', async () => {
       const [bank] = await db
         .insert(bankAccounts)
         .values({ companyId, accountId: cash, bankName: 'Test Bank', accountNumber: '****1234' })
         .returning();
       const before = currentFingerprint(TEST_DIR);
-      const saved = { id: process.env.PLAID_CLIENT_ID, secret: process.env.PLAID_SECRET, env: process.env.PLAID_ENV };
-      const realFetch = globalThis.fetch;
-      process.env.PLAID_CLIENT_ID = 'cid';
-      process.env.PLAID_SECRET = 'sec';
-      process.env.PLAID_ENV = 'sandbox';
-      globalThis.fetch = vi.fn(async () =>
-        new Response(
-          JSON.stringify({ added: [{ transaction_id: 'plaid-tx-1', date: '2026-05-03', name: 'Coffee', merchant_name: null, amount: 4.5 }] }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        ),
-      ) as typeof fetch;
-      try {
-        const out = await syncTransactions(trusted, { accessToken: 'access-x', bankAccountId: bank.id });
-        expect(out.imported).toBe(1);
-      } finally {
-        globalThis.fetch = realFetch;
-        for (const [k, v] of [['PLAID_CLIENT_ID', saved.id], ['PLAID_SECRET', saved.secret], ['PLAID_ENV', saved.env]] as const) {
-          if (v === undefined) delete process.env[k];
-          else process.env[k] = v;
-        }
-      }
+      const out = await importTransactions(trusted, {
+        bankAccountId: bank.id,
+        fileType: 'csv',
+        content: ['Date,Description,Amount', '2026-05-03,Coffee,-4.50', ''].join('\n'),
+        csvMapping: { dateCol: 'Date', descriptionCol: 'Description', amountCol: 'Amount' },
+        filename: 'statement.csv',
+      });
+      expect(out.imported).toBe(1);
       const after = currentFingerprint(TEST_DIR);
       expect(after).not.toBeNull();
       expect(after).not.toBe(before);

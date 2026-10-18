@@ -9,10 +9,10 @@
  * kind 'training'.
  *
  * While the active data dir is a sandbox or training file, every outbound effect is off:
- * emails, bank-feed sync, scheduled reports, auto-backups and app-update prompts. This module
+ * emails, scheduled reports, auto-backups and app-update prompts. This module
  * answers "are we in a sandbox?" and throws the friendly error the blocked features show. It is
- * deliberately small (fs + the data-dir resolver) so the network guard and the email / bank-feed
- * services can import it without pulling in the copy machinery.
+ * deliberately small (fs + the data-dir resolver) so the network guard and the email
+ * service can import it without pulling in the copy machinery.
  *
  * The marker is listed in FILE_LOCAL_SECRETS (lib/services/backup.ts) so it never travels inside
  * a backup and a restore never adopts one: restoring a backup made in a sandbox into the real
@@ -133,18 +133,17 @@ export function assertNotSandbox(what: string): void {
 }
 
 /** Outbound purposes that stay off inside a sandbox (AI help keeps working). */
-const SANDBOX_BLOCKED_PURPOSES: ReadonlySet<OutboundPurpose> = new Set(['email', 'bank-feeds', 'updates']);
+const SANDBOX_BLOCKED_PURPOSES: ReadonlySet<OutboundPurpose> = new Set(['email', 'updates']);
 
 const PURPOSE_WORDS: Record<OutboundPurpose, string> = {
   ai: 'AI assistance',
   email: 'Email',
-  'bank-feeds': 'Bank feed sync',
   updates: 'Installing app updates',
 };
 
 /**
  * Overlay the sandbox rule on a network-policy decision (lib/net/guard.ts and
- * /api/network-policy/check): inside a sandbox, email, bank feeds and update checks are refused
+ * /api/network-policy/check): inside a sandbox, email and update checks are refused
  * whatever the company's policy says.
  */
 export function applySandboxToDecision(decision: OutboundDecision): OutboundDecision {

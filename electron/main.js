@@ -68,8 +68,6 @@ let remoteHostOrigin = null;
 /** Multi-user: this app is HOSTING its company file for the tailnet (electron/hosting.js). */
 let hostingState = null;
 let hostingError = null;
-/** Remote origins the renderer may load, from the company's network policy (security.js). */
-const rendererAllow = { plaid: false };
 
 // Per-launch secret shared with the local Next server so the main process can make
 // authenticated "system" calls (e.g. the launch-time recurring run). The server is bound to
@@ -776,27 +774,6 @@ function disconnectFromHost() {
   app.quit();
 }
 
-/**
- * Ask the local server which remote origins the window may load (currently only Plaid Link,
- * when the company opted in to cloud bank feeds). Fails closed.
- */
-async function refreshRendererAllowlist() {
-  rendererAllow.plaid = false;
-  if (!serverUrl || remoteHostOrigin) return { ...rendererAllow };
-  try {
-    const q = new URLSearchParams({ purpose: 'bank-feeds', url: 'https://cdn.plaid.com/' });
-    const res = await fetch(`${serverUrl}/api/network-policy/check?${q}`, {
-      headers: { 'x-bka-internal': internalToken },
-      signal: AbortSignal.timeout(5000),
-    });
-    const d = res.ok ? await res.json() : null;
-    rendererAllow.plaid = Boolean(d && d.allowed === true);
-  } catch {
-    rendererAllow.plaid = false;
-  }
-  return { ...rendererAllow };
-}
-
 /** True when an IPC call comes from the LOCAL app (not a remote host's pages). */
 function fromLocalApp(event) {
   if (remoteHostOrigin || !serverUrl) return false;
@@ -1016,7 +993,6 @@ async function createWindow() {
     scheduleBackgroundJobs(url);
     if (hostingConfig().enabled) setHosting(true, { quiet: true });
   }
-  refreshRendererAllowlist();
 
   // Deliver a double-clicked .bka after the renderer has had a moment to mount the
   // DesktopBridge listener (loadURL resolves at load, React hydrates just after).
@@ -1205,7 +1181,6 @@ ipcMain.handle('hosting:disconnect', (e) => {
   return true;
 });
 // After the Privacy & Network settings change, re-read what the window may load.
-ipcMain.handle('network:refresh', (e) => (fromLocalApp(e) ? refreshRendererAllowlist() : null));
 
 app.on('second-instance', (_event, argv) => {
   if (mainWindow) {
@@ -1386,7 +1361,6 @@ app.whenReady().then(async () => {
   // permission prompts, no spellcheck downloads (electron/security.js).
   security.install({
     getAppOrigin: () => serverUrl,
-    getRendererAllow: () => rendererAllow,
     isDev,
   });
   await createWindow();

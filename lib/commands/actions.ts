@@ -39,7 +39,7 @@ export const COMMAND_ACTIONS: CommandAction[] = [
   { key: 'transfer', label: 'Transfer money', href: '/transfers', description: 'Move money between your own accounts.', keywords: 'transfer funds move money savings', needs: { area: 'accounting', action: 'create' } },
   { key: 'journal-entry', label: 'New journal entry', href: '/journal?new=1', description: 'Adjust the books directly (accountants).', keywords: 'general journal adjust gl entry', needs: { area: 'accounting', action: 'create' } },
   { key: 'run-payroll', label: 'Run payroll', href: '/pay-runs', description: 'Pay your employees.', keywords: 'pay run paycheck payroll employees', needs: { area: 'payroll', action: 'create' } },
-  { key: 'bank-feeds', label: 'Download bank transactions', href: '/bank-feeds', description: 'Import transactions from your bank.', keywords: 'bank feeds import download ofx qfx csv', needs: { area: 'banking', action: 'create' } },
+  { key: 'bank-feeds', label: 'Import bank transactions', href: '/bank-feeds', description: 'Import a statement file from your bank.', keywords: 'bank feeds import download ofx qfx csv', needs: { area: 'banking', action: 'create' } },
   { key: 'unpaid-bills', label: 'Unpaid bills', href: '/reports/std/unpaid-bills-detail', description: 'Bills you still owe, by vendor.', keywords: 'unpaid open bills owe ap aging' },
   { key: 'unpaid-invoices', label: 'Unpaid invoices', href: '/reports/std/open-invoices', description: 'Invoices customers still owe you.', keywords: 'unpaid open invoices owed ar aging who owes' },
 ];

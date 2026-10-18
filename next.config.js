@@ -4,20 +4,19 @@ const isDev = process.env.NODE_ENV !== 'production'
 
 /**
  * Content-Security-Policy (local-only data guarantee). Pages may load scripts, styles, fonts,
- * images and data only from the app itself — no CDNs, web fonts or analytics. The single
- * exception is Plaid Link (bank feeds), which the server only lets start once the company has
- * opted in to cloud bank feeds; the desktop shell additionally blocks *.plaid.com in the
- * renderer until then (electron/security.js). 'unsafe-inline' scripts are required by Next's
- * inline hydration payload; 'unsafe-eval' and ws: only in `next dev` (hot reload).
+ * images and data only from the app itself — no CDNs, web fonts, analytics or third-party bank
+ * widgets (bank data comes in from statement files you import). 'unsafe-inline' scripts are
+ * required by Next's inline hydration payload; 'unsafe-eval' and ws: only in `next dev` (hot
+ * reload).
  */
 const csp = [
   "default-src 'self'",
-  `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ''} https://cdn.plaid.com`,
+  `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ''}`,
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  `connect-src 'self'${isDev ? ' ws: wss:' : ''} https://*.plaid.com`,
-  "frame-src 'self' blob: https://*.plaid.com",
+  `connect-src 'self'${isDev ? ' ws: wss:' : ''}`,
+  "frame-src 'self' blob:",
   "worker-src 'self' blob:",
   "object-src 'none'",
   "base-uri 'self'",

@@ -3,10 +3,9 @@
 //  - Renderer windows can only load the app's own origin (the local server, or the multi-user
 //    host the user explicitly connected to). Navigation / new windows to any other origin are
 //    blocked; ordinary https links the user clicks open in the system browser instead.
-//  - Every network request the renderer makes is filtered: same-origin, internal schemes
-//    (data:, blob:, devtools:, the built-in PDF viewer), and Plaid's domains ONLY when the
-//    company has opted in to cloud bank feeds (refreshed from the server's network policy).
-//    Everything else is cancelled and logged — no CDNs, web fonts, analytics or telemetry.
+//  - Every network request the renderer makes is filtered: same-origin and internal schemes
+//    (data:, blob:, devtools:, the built-in PDF viewer) only. Everything else is cancelled and
+//    logged — no CDNs, web fonts, analytics, telemetry or third-party bank widgets.
 //  - No <webview>, no permission prompts (camera, mic, geolocation, notifications…), and the
 //    spellchecker never downloads dictionaries: Windows/macOS use the OS checker, elsewhere the
 //    download URL points at localhost (electron/spelling.js).
@@ -24,7 +23,6 @@ const ALLOWED_PERMISSIONS = new Set(['clipboard-sanitized-write', 'fullscreen'])
 /**
  * @param {object} opts
  * @param {() => string|null} opts.getAppOrigin   origin the windows may load
- * @param {() => {plaid: boolean}} opts.getRendererAllow  dynamic opt-ins from the network policy
  * @param {boolean} opts.isDev
  * @param {(msg: string) => void} [opts.log]
  */
@@ -54,11 +52,6 @@ function install(opts) {
     return Boolean(u && origin && u.origin === origin);
   };
 
-  const isPlaid = (u) =>
-    opts.getRendererAllow().plaid === true &&
-    u.protocol === 'https:' &&
-    (u.hostname === 'plaid.com' || u.hostname.endsWith('.plaid.com'));
-
   function requestAllowed(url) {
     const u = parse(url);
     if (!u) return false;
@@ -70,7 +63,7 @@ function install(opts) {
       const o = new URL(origin);
       if (opts.isDev && (u.protocol === 'ws:' || u.protocol === 'wss:') && u.host === o.host) return true;
     }
-    return isPlaid(u);
+    return false;
   }
 
   function openExternally(url) {

@@ -677,7 +677,7 @@ export function buildSetupPlan(
   if (answers.employees) {
     nextSteps.push({ label: 'Add your employees', href: '/employees', why: 'Payroll needs pay rates and tax details.' });
   }
-  nextSteps.push({ label: 'Connect or import bank transactions', href: '/bank-feeds', why: 'Saves typing — review and categorize instead.' });
+  nextSteps.push({ label: 'Import bank transactions', href: '/bank-feeds', why: 'Saves typing — review and categorize instead.' });
 
   return {
     settings,

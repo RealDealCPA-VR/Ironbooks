@@ -1,6 +1,6 @@
 /**
  * Built-in demo bank feed. Lets the banking/reconciliation workflow be exercised end-to-end with
- * no external provider (Plaid is the production path; this is the always-available fallback).
+ * no external provider (real bank data comes in from imported statement files).
  * Inserts a set of realistic sample transactions into the bank_transactions staging table,
  * deduped by a stable fitId so repeated loads don't duplicate.
  */

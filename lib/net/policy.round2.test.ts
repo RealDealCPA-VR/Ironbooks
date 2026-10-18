@@ -38,9 +38,9 @@ describe('envModeCeiling — fail closed', () => {
   });
 
   it('a typo ceiling blocks an allow-cloud company with every opt-in, for every purpose and class except loopback', () => {
-    const p = pol('allow-cloud', { ai: true, email: true, 'bank-feeds': true, updates: true });
+    const p = pol('allow-cloud', { ai: true, email: true, updates: true });
     const ceiling = envModeCeiling({ BKA_NETWORK_MODE: 'Offlien' });
-    for (const purpose of ['ai', 'email', 'bank-feeds', 'updates'] as const) {
+    for (const purpose of ['ai', 'email', 'updates'] as const) {
       expect(decideOutbound(p, 'https://api.anthropic.com/v1/messages', purpose, ceiling).allowed).toBe(false);
       expect(decideOutbound(p, 'http://100.64.0.2/', purpose, ceiling).allowed).toBe(false);
       expect(decideOutbound(p, 'http://192.168.0.2/', purpose, ceiling).allowed).toBe(false);
@@ -87,7 +87,7 @@ describe('policyFetch — body / credential replay on redirect', () => {
       fetchSpy.mockReset();
       fetchSpy.mockResolvedValueOnce(redirect(status, 'http://100.64.0.10/steal'));
       await expect(
-        policyFetch('http://100.64.0.9/x', { method, body: '{"secret":"s"}' }, { purpose: 'bank-feeds', ctx }),
+        policyFetch('http://100.64.0.9/x', { method, body: '{"secret":"s"}' }, { purpose: 'email', ctx }),
       ).rejects.toMatchObject({ code: 'FORBIDDEN' });
       expect(fetchSpy).toHaveBeenCalledTimes(1);
     }
