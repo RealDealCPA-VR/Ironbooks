@@ -682,7 +682,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
       <main className="flex-1 flex flex-col min-w-0">
-        <header className="flex items-center justify-end gap-3 px-6 pt-4 -mb-2">
+        <header className="relative z-20 flex items-center justify-end gap-3 px-6 pt-4 pb-1">
           {/* "What is this page?" — plain-language help for the current screen (lib/pageHelp.ts). */}
           {pageHelpFor(pathname) ? (
             <span className="mr-auto text-sm text-navy/60">

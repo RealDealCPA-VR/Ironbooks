@@ -402,7 +402,7 @@ export function Modal({
 
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-x-0 bottom-0 top-[var(--titlebar-h)] z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/30 backdrop-blur-[2px] animate-in fade-in duration-150" onClick={onClose} />
       <div
         ref={dialogRef}
@@ -411,7 +411,7 @@ export function Modal({
         aria-labelledby={titleId}
         tabIndex={-1}
         className={cn(
-          'relative z-10 w-full p-6 max-h-[90vh] overflow-y-auto rounded-2xl bg-white shadow-2xl border border-slate-200/70 outline-none animate-in fade-in zoom-in-95 duration-150',
+          'relative z-10 w-full p-6 max-h-full overflow-y-auto rounded-2xl bg-white shadow-2xl border border-slate-200/70 outline-none animate-in fade-in zoom-in-95 duration-150',
           MODAL_SIZES[size],
         )}
       >

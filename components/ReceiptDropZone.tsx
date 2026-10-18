@@ -143,7 +143,7 @@ export default function ReceiptDropZone({ enabled }: { enabled: boolean }) {
       {dragging && (
         <div
           aria-hidden="true"
-          className="pointer-events-none fixed inset-0 z-[90] flex items-center justify-center bg-black/30 backdrop-blur-[1px]"
+          className="pointer-events-none fixed inset-x-0 bottom-0 top-[var(--titlebar-h)] z-[90] flex items-center justify-center bg-black/30 backdrop-blur-[1px]"
         >
           <div className="rounded-2xl border-4 border-dashed border-white/80 bg-white/95 px-10 py-8 text-center shadow-2xl">
             <Receipt className="mx-auto mb-3 h-10 w-10 text-electric" />

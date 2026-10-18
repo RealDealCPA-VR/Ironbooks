@@ -179,6 +179,32 @@ describe('Tailwind reads the theme', () => {
   });
 });
 
+describe('nothing hides under the desktop title bar', () => {
+  /** Every .tsx under app/ and components/. */
+  function tsxFiles(dir: string): string[] {
+    return fs.readdirSync(path.join(ROOT, dir), { withFileTypes: true }).flatMap((d) => {
+      const rel = `${dir}/${d.name}`;
+      if (d.isDirectory()) return tsxFiles(rel);
+      return d.name.endsWith('.tsx') ? [rel] : [];
+    });
+  }
+
+  it('full-window overlays (dialogs, the assistant, the command bar) start below it', () => {
+    const offenders = [...tsxFiles('app'), ...tsxFiles('components')].filter((f) =>
+      /\bfixed\s+(?:[\w:[\]/.-]+\s+)*inset-0\b/.test(read(f)),
+    );
+    expect(offenders).toEqual([]);
+    expect(read('components/ui.tsx')).toMatch(/fixed inset-x-0 bottom-0 top-\[var\(--titlebar-h\)\] z-50/);
+    expect(read('components/AssistantPanel.tsx')).toMatch(/fixed inset-x-0 bottom-0 top-\[var\(--titlebar-h\)\] z-40/);
+  });
+
+  it('the toolbar row is not overlapped by the page below it', () => {
+    const header = read('components/AppShell.tsx').match(/<header className="([^"]*)"/)?.[1] ?? '';
+    expect(header).toContain('relative z-20');
+    expect(header).not.toMatch(/-mb-\d/);
+  });
+});
+
 describe('desktop shell wiring (source pins)', () => {
   const main = read('electron/main.js');
   const preload = read('electron/preload.js');
