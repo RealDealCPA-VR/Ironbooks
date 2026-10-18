@@ -12,7 +12,7 @@ import { Badge, Button, Card, PageHeader, PageSkeleton, toast } from '@/componen
 import { api, ApiError } from '@/lib/client';
 
 type Mode = 'offline' | 'tailnet-only' | 'allow-cloud';
-type Purpose = 'ai' | 'email' | 'updates';
+type Purpose = 'ai' | 'email' | 'vendor-lookup' | 'updates';
 
 interface Decision {
   allowed: boolean;
@@ -35,7 +35,7 @@ interface LogEntry {
   reason: string;
 }
 interface PolicyResponse {
-  policy: { mode: Mode; cloudOptIn: Record<Purpose, boolean> };
+  policy: { mode: Mode; cloudOptIn: Record<Purpose, boolean>; vendorLookupUrl: string | null };
   canEdit: boolean;
   ceiling: Mode | null;
   effectiveMode: Mode;
@@ -72,8 +72,10 @@ export default function PrivacyNetworkPage() {
   const [optIn, setOptIn] = useState<Record<Purpose, boolean>>({
     ai: false,
     email: false,
+    'vendor-lookup': false,
     updates: true,
   });
+  const [lookupUrl, setLookupUrl] = useState('');
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async () => {
@@ -82,6 +84,7 @@ export default function PrivacyNetworkPage() {
       setData(d);
       setMode(d.policy.mode);
       setOptIn(d.policy.cloudOptIn);
+      setLookupUrl(d.policy.vendorLookupUrl ?? '');
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not load privacy settings.', 'danger');
     }
@@ -94,13 +97,19 @@ export default function PrivacyNetworkPage() {
   const dirty =
     data !== null &&
     (mode !== data.policy.mode ||
+      lookupUrl.trim() !== (data.policy.vendorLookupUrl ?? '') ||
       (Object.keys(optIn) as Purpose[]).some((p) => optIn[p] !== data.policy.cloudOptIn[p]));
 
   async function save() {
     setSaving(true);
     try {
-      const d = await api.put<PolicyResponse>('/api/network-policy', { mode, cloudOptIn: optIn });
+      const d = await api.put<PolicyResponse>('/api/network-policy', {
+        mode,
+        cloudOptIn: optIn,
+        vendorLookupUrl: lookupUrl.trim() || null,
+      });
       setData(d);
+      setLookupUrl(d.policy.vendorLookupUrl ?? '');
       toast('Privacy & Network settings saved.', 'success');
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not save.', 'danger');
@@ -169,12 +178,14 @@ export default function PrivacyNetworkPage() {
       <p className="text-sm text-navy/60 mb-3">
         Each service is off unless you turn it on here <em>and</em> choose “Allow cloud services I
         choose” above. App update checks are the exception: they send no company data, so they are on
-        unless you turn them off (or choose Offline).
+        unless you turn them off (or choose Offline). Vendor lookup uses your own SearXNG, so it works
+        in any mode but Offline, and only when you turn it on.
       </p>
       <Card className="divide-y divide-slate-100 mb-8">
         {data.purposes.map((p) => {
-          // Update checks work in any mode but offline; everything else needs allow-cloud.
-          const modeAllows = p.purpose === 'updates' ? mode !== 'offline' : mode === 'allow-cloud';
+          // Update checks and vendor lookup (your own SearXNG) work in any mode but offline;
+          // everything else needs allow-cloud.
+          const modeAllows = p.purpose === 'updates' || p.purpose === 'vendor-lookup' ? mode !== 'offline' : mode === 'allow-cloud';
           const enabled = modeAllows && optIn[p.purpose];
           return (
             <div key={p.purpose} className="p-5 flex gap-4 items-start justify-between">
@@ -190,6 +201,26 @@ export default function PrivacyNetworkPage() {
                   {p.sends}
                 </p>
                 <p className="text-xs text-navy/40 mt-1">To: {p.destinations}</p>
+                {p.purpose === 'vendor-lookup' && (
+                  <div className="mt-3 max-w-md">
+                    <label htmlFor="searxng-url" className="block text-xs font-medium text-navy/70 mb-1">
+                      Your SearXNG address
+                    </label>
+                    <input
+                      id="searxng-url"
+                      type="url"
+                      inputMode="url"
+                      placeholder="http://searx.your-tailnet.ts.net:8080"
+                      value={lookupUrl}
+                      disabled={readOnly}
+                      onChange={(e) => setLookupUrl(e.target.value)}
+                      className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-sm text-navy outline-none focus-visible:ring-2 focus-visible:ring-electric/50 disabled:bg-slate-50"
+                    />
+                    <p className="text-[11px] text-navy/40 mt-1">
+                      The instance must allow JSON results (search.formats: json in its settings.yml).
+                    </p>
+                  </div>
+                )}
               </div>
               <label className="flex items-center gap-2 text-sm font-medium text-navy shrink-0 pt-1">
                 <input

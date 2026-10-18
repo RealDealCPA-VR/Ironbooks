@@ -103,7 +103,7 @@ describe('decideOutbound — adversarial', () => {
 
   it('a tampered stored policy cannot opt in via truthy non-booleans or prototype keys', () => {
     const p = normalizePolicy(JSON.parse('{"mode":"allow-cloud","cloudOptIn":{"ai":"true","email":1,"__proto__":{"email":true}}}'));
-    expect(p.cloudOptIn).toEqual({ ai: false, email: false, updates: true });
+    expect(p.cloudOptIn).toEqual({ ai: false, email: false, 'vendor-lookup': false, updates: true });
     expect(decideOutbound(p, 'smtps://smtp.example.com:465', 'email', undefined).allowed).toBe(false);
     expect(normalizePolicy({ mode: 'ALLOW-CLOUD' }).mode).toBe('tailnet-only');
     expect(normalizePolicy('allow-cloud').mode).toBe('tailnet-only');

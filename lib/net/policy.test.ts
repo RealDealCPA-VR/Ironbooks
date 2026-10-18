@@ -25,19 +25,20 @@ describe('normalizePolicy', () => {
   it('defaults to tailnet-only with every cloud purpose off except update checks', () => {
     expect(normalizePolicy(undefined)).toEqual({
       mode: 'tailnet-only',
-      cloudOptIn: { ai: false, email: false, updates: true },
+      cloudOptIn: { ai: false, email: false, 'vendor-lookup': false, updates: true },
+      vendorLookupUrl: null,
     });
     expect(DEFAULT_NETWORK_POLICY.mode).toBe('tailnet-only');
   });
   it('a stored opt-in for the removed Plaid bank feeds is dropped, not carried over', () => {
     const p = normalizePolicy({ mode: 'allow-cloud', cloudOptIn: { 'bank-feeds': true, ai: false } });
-    expect(p.cloudOptIn).toEqual({ ai: false, email: false, updates: true });
+    expect(p.cloudOptIn).toEqual({ ai: false, email: false, 'vendor-lookup': false, updates: true });
     expect(Object.keys(p.cloudOptIn)).not.toContain('bank-feeds');
   });
   it('drops unknown modes/purposes and non-boolean opt-ins', () => {
     const p = normalizePolicy({ mode: 'yolo', cloudOptIn: { ai: 'yes', email: true, telemetry: true } });
     expect(p.mode).toBe('tailnet-only');
-    expect(p.cloudOptIn).toEqual({ ai: false, email: true, updates: true });
+    expect(p.cloudOptIn).toEqual({ ai: false, email: true, 'vendor-lookup': false, updates: true });
   });
   it('keeps update checks off only when explicitly false', () => {
     expect(normalizePolicy({ cloudOptIn: { updates: false } }).cloudOptIn.updates).toBe(false);
@@ -95,7 +96,8 @@ describe('decideOutbound — per mode and purpose', () => {
 
   it('offline: only loopback, for every purpose', () => {
     for (const p of OUTBOUND_PURPOSES) {
-      expect(decideOutbound(policy('offline'), LOCAL, p, undefined).allowed).toBe(true);
+      // Vendor lookup relays to public search engines, so offline refuses it even on this computer.
+      expect(decideOutbound(policy('offline', { [p]: true }), LOCAL, p, undefined).allowed).toBe(p !== 'vendor-lookup');
       expect(decideOutbound(policy('offline'), TAILNET, p, undefined).allowed).toBe(false);
       expect(decideOutbound(policy('offline'), LAN, p, undefined).allowed).toBe(false);
       expect(decideOutbound(policy('offline', { [p]: true }), CLOUD, p, undefined).allowed).toBe(false);

@@ -29,7 +29,7 @@ import { classifyHost, isPrivateClass, normalizeHost, type HostClass } from './c
 export const NETWORK_MODES = ['offline', 'tailnet-only', 'allow-cloud'] as const;
 export type NetworkMode = (typeof NETWORK_MODES)[number];
 
-export const OUTBOUND_PURPOSES = ['ai', 'email', 'updates'] as const;
+export const OUTBOUND_PURPOSES = ['ai', 'email', 'vendor-lookup', 'updates'] as const;
 export type OutboundPurpose = (typeof OUTBOUND_PURPOSES)[number];
 
 export interface NetworkPolicy {
@@ -39,11 +39,17 @@ export interface NetworkPolicy {
    * default to false; updates defaults to true and also applies in 'tailnet-only' mode.
    */
   cloudOptIn: Record<OutboundPurpose, boolean>;
+  /**
+   * Base URL of the company's own SearXNG instance for vendor lookup (null = not set up). The
+   * instance must allow format=json. Only the name of a new vendor is ever sent to it.
+   */
+  vendorLookupUrl: string | null;
 }
 
 export const DEFAULT_NETWORK_POLICY: NetworkPolicy = Object.freeze({
   mode: 'tailnet-only',
-  cloudOptIn: Object.freeze({ ai: false, email: false, updates: true }),
+  cloudOptIn: Object.freeze({ ai: false, email: false, 'vendor-lookup': false, updates: true }),
+  vendorLookupUrl: null,
 }) as NetworkPolicy;
 
 /** Human-facing description of each purpose: what would leave the machine if allowed. */
@@ -61,6 +67,13 @@ export const PURPOSE_INFO: Record<
     label: 'Email (invoices, statements)',
     sends: 'The message and PDF attachment you choose to send, to the recipient you enter.',
     destinations: 'Your configured SMTP server (SMTP_HOST). A relay on your LAN/tailnet works without cloud opt-in.',
+  },
+  'vendor-lookup': {
+    label: 'Vendor lookup (your SearXNG)',
+    sends:
+      'Only the name of a vendor you have never used, with store numbers and long digit runs removed. Never amounts, dates, accounts or anything else.',
+    destinations:
+      'The SearXNG address you enter below (e.g. on your tailnet). SearXNG then asks public search engines, so this needs your explicit OK even when SearXNG is on your own network.',
   },
   updates: {
     label: 'App updates',
@@ -90,8 +103,32 @@ export function normalizePolicy(raw: unknown): NetworkPolicy {
   for (const p of OUTBOUND_PURPOSES) cloudOptIn[p] = opt[p] === true;
   // Update checks are on unless explicitly turned off.
   cloudOptIn.updates = opt.updates !== false;
-  return { mode: isNetworkMode(r.mode) ? r.mode : DEFAULT_NETWORK_POLICY.mode, cloudOptIn };
+  return {
+    mode: isNetworkMode(r.mode) ? r.mode : DEFAULT_NETWORK_POLICY.mode,
+    cloudOptIn,
+    vendorLookupUrl: normalizeLookupUrl(r.vendorLookupUrl),
+  };
 }
+
+/** A plain http(s) base URL with no credentials, query or fragment; anything else is null. */
+export function normalizeLookupUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  let u: URL;
+  try {
+    u = new URL(raw.trim());
+  } catch {
+    return null;
+  }
+  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.username || u.password || u.search || u.hash) return null;
+  return `${u.origin}${u.pathname.replace(/[/]+$/, '')}`;
+}
+
+/**
+ * Purposes whose destination relays the request to the public internet (SearXNG searches public
+ * engines for us). They need the company's explicit opt-in in every mode but offline, even when
+ * the destination itself is on this computer, the LAN or the tailnet.
+ */
+const RELAYING_PURPOSES: ReadonlySet<OutboundPurpose> = new Set(['vendor-lookup']);
 
 /**
  * The machine-wide ceiling from BKA_NETWORK_MODE (unset/blank = no ceiling). Case-insensitive.
@@ -159,6 +196,19 @@ export function decideOutbound(
   const hostClass = classifyHost(host);
   if (hostClass === 'invalid') {
     return { ...base, allowed: false, hostClass, reason: `${host || 'That address'} is not a routable destination.` };
+  }
+  if (RELAYING_PURPOSES.has(purpose)) {
+    if (mode === 'offline') {
+      return { ...base, allowed: false, hostClass, reason: 'Offline mode: no network connections are made.' };
+    }
+    if (!policy.cloudOptIn[purpose]) {
+      return {
+        ...base,
+        allowed: false,
+        hostClass,
+        reason: `${PURPOSE_INFO[purpose].label} is turned off for this company. Turn it on in Settings → Privacy & Network.`,
+      };
+    }
   }
   if (hostClass === 'loopback') {
     return { ...base, allowed: true, hostClass, reason: 'Destination is this computer.' };

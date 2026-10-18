@@ -3,7 +3,8 @@
  *                           (BKA_NETWORK_MODE), the per-purpose verdict for each cloud service,
  *                           and recent outbound activity (host + purpose + verdict only).
  * PUT /api/network-policy — replace the policy. Body: { mode, cloudOptIn: { ai, email,
- *                           updates } }. Owner/admin only; audited.
+ *                           'vendor-lookup', updates }, vendorLookupUrl }. Owner/admin only;
+ *                           audited.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -35,6 +36,7 @@ function errorResponse(err: unknown) {
 const SAMPLE_CLOUD_URL: Record<OutboundPurpose, string> = {
   ai: 'https://api.anthropic.com/',
   email: 'smtps://smtp.example.com:465',
+  'vendor-lookup': 'https://searx.example.com/',
   updates: 'https://github.com/',
 };
 
@@ -48,7 +50,8 @@ function describe(policy: NetworkPolicy, companyId: string, canEdit: boolean) {
     purposes: OUTBOUND_PURPOSES.map((p) => ({
       purpose: p,
       ...PURPOSE_INFO[p],
-      cloud: decideOutbound(policy, SAMPLE_CLOUD_URL[p], p, ceiling),
+      // Vendor lookup: the verdict for the company's own SearXNG address once one is set.
+      cloud: decideOutbound(policy, (p === 'vendor-lookup' && policy.vendorLookupUrl) || SAMPLE_CLOUD_URL[p], p, ceiling),
     })),
     recent: recentOutbound(companyId),
   };

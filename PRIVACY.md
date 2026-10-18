@@ -15,6 +15,7 @@ This document lists everything that can leave the machine, and what controls it.
 | AI (assistant, categorization, AI Review "Analyze") | Model servers on this computer, your LAN or your tailnet by default; a cloud AI provider only if opted in (and then redacted) | AI & Automation (providers) + Privacy & Network → AI assistance |
 | Emailing an invoice | Only the message and PDF you send, to your SMTP server | Privacy & Network → Email |
 | Bank transactions | **Nothing.** Ironbooks never connects to your bank or a feed service; transactions come only from statement files you import. | — |
+| Vendor lookup (new vendors only) | Only the vendor's name (store numbers and long digit runs removed), to **your own** SearXNG, which searches public engines. **Off by default**; needs your OK even when SearXNG is on your tailnet; never in Offline mode. | Privacy & Network → Vendor lookup (your SearXNG) |
 | Update checks | App version and platform only (no company data); **on by default** | Privacy & Network → App updates |
 | Telemetry / analytics / crash reports | **None.** | — |
 | Web fonts / CDNs | **None.** Fonts are bundled at build time. | — |

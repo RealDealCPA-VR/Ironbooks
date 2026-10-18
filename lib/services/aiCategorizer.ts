@@ -38,6 +38,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { BUSINESS_TYPES, ENTITY_TYPES } from '@/lib/onboarding';
+import { lookupVendor } from './vendorLookup';
 import { type ServiceContext, ServiceError, inTransaction, notFound, writeAudit } from './_base';
 import { categorize } from './bankCategorize';
 import { buildRouter, loadSettings, type BuildRouterOptions } from './aiSettings';
@@ -558,6 +559,8 @@ export async function llmSuggestBankCategory(
     .where(and(eq(bankTransactions.id, bankTransactionId), eq(bankTransactions.companyId, ctx.companyId)));
   if (!txn) throw notFound('Bank transaction');
   const ba = await loadBankAccount(ctx, txn.bankAccountId);
+  // Same vendor lookup as forms (off unless the owner turned it on; name only).
+  const facts = txn.payee ? await lookupVendor(ctx, txn.payee) : null;
   const r = await llmSuggestAccount(
     ctx,
     {
@@ -568,6 +571,7 @@ export async function llmSuggestBankCategory(
       sourceAccountId: ba.accountId,
       sourceLabel: 'the bank account',
       date: txn.date,
+      payeeFacts: facts?.summary ?? null,
     },
     routerOpts,
   );
@@ -581,6 +585,8 @@ export interface PayeeSuggestion {
   reason?: string;
   /** Why the AI was not asked (turned off, no model) — the form just shows no suggestion. */
   aiUnavailable?: string;
+  /** Web pages the vendor lookup found (your SearXNG), when one was used. */
+  lookedUp?: Array<{ title: string; url: string }>;
 }
 
 /**
@@ -615,6 +621,9 @@ export async function suggestAccountForPayee(
   }
   if (!payee) return local;
   try {
+    // A brand-new payee: ask the company's own SearXNG what kind of business it is (only when
+    // the owner turned vendor lookup on; only the name is sent — lib/services/vendorLookup.ts).
+    const facts = input.payeeFacts ? null : await lookupVendor(ctx, payee);
     const r = await llmSuggestAccount(
       ctx,
       {
@@ -623,7 +632,7 @@ export async function suggestAccountForPayee(
         direction: input.direction ?? 'out',
         sourceAccountId: input.sourceAccountId ?? null,
         sourceLabel: input.sourceLabel,
-        payeeFacts: input.payeeFacts ?? null,
+        payeeFacts: input.payeeFacts ?? facts?.summary ?? null,
       },
       routerOpts,
     );
@@ -631,6 +640,7 @@ export async function suggestAccountForPayee(
       source: 'ai',
       lines: [{ accountId: r.accountId, classId: null, customerId: null, jobId: null, confidence: r.confidence }],
       reason: r.reason,
+      ...(facts ? { lookedUp: facts.sources.slice(0, 3) } : {}),
     };
   } catch (err) {
     if (err instanceof AiError) return { ...local, aiUnavailable: err.message };

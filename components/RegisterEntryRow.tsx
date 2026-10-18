@@ -164,7 +164,7 @@ export function RegisterEntryRow({
         ...(throughAccount ? { sourceAccountId: register.id } : {}),
       });
       const res = await api
-        .get<{ source: string; lines: Array<{ accountId: string }>; reason?: string }>(`/api/ai/prefill?${params}`)
+        .get<{ source: string; lines: Array<{ accountId: string }>; reason?: string; lookedUp?: unknown[] }>(`/api/ai/prefill?${params}`)
         .catch(() => null);
       if (payeeKey.current !== key || !res?.lines?.[0]) return;
       const id = res.lines[0].accountId;
@@ -177,7 +177,7 @@ export function RegisterEntryRow({
           : res.source === 'last-used'
             ? 'Account from the last transaction with this payee.'
             : res.source === 'ai'
-              ? `AI suggestion${res.reason ? `: ${res.reason}` : ''} Check it before you save.`
+              ? `AI suggestion${res.lookedUp?.length ? ' (looked the vendor up online)' : ''}${res.reason ? `: ${res.reason}` : ''} Check it before you save.`
               : 'Account suggested from similar past transactions.',
       );
     },

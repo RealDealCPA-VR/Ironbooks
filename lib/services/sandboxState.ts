@@ -138,6 +138,7 @@ const SANDBOX_BLOCKED_PURPOSES: ReadonlySet<OutboundPurpose> = new Set(['email',
 const PURPOSE_WORDS: Record<OutboundPurpose, string> = {
   ai: 'AI assistance',
   email: 'Email',
+  'vendor-lookup': 'Vendor lookup',
   updates: 'Installing app updates',
 };
 

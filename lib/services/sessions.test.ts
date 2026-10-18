@@ -248,7 +248,8 @@ describe('Privacy & Network policy persistence', () => {
     const owner = ctxFor(adminId, undefined, 'owner');
     expect(await getNetworkPolicy(owner)).toEqual({
       mode: 'tailnet-only',
-      cloudOptIn: { ai: false, email: false, updates: true },
+      cloudOptIn: { ai: false, email: false, 'vendor-lookup': false, updates: true },
+      vendorLookupUrl: null,
     });
 
     await expect(
@@ -257,7 +258,7 @@ describe('Privacy & Network policy persistence', () => {
     await expect(setNetworkPolicy(owner, { mode: 'everything' })).rejects.toMatchObject({ code: 'VALIDATION' });
 
     const saved = await setNetworkPolicy(owner, { mode: 'allow-cloud', cloudOptIn: { ai: true } });
-    expect(saved).toEqual({ mode: 'allow-cloud', cloudOptIn: { ai: true, email: false, updates: true } });
+    expect(saved).toEqual({ mode: 'allow-cloud', cloudOptIn: { ai: true, email: false, 'vendor-lookup': false, updates: true }, vendorLookupUrl: null });
     expect(await getNetworkPolicy(owner)).toEqual(saved);
 
     // Other company settings are untouched.

@@ -12,6 +12,7 @@ import {
   DEFAULT_NETWORK_POLICY,
   NETWORK_MODES,
   OUTBOUND_PURPOSES,
+  normalizeLookupUrl,
   normalizePolicy,
   type NetworkPolicy,
 } from '@/lib/net/policy';
@@ -43,6 +44,13 @@ export const networkPolicySchema = z.object({
     )
     .partial()
     .optional(),
+  /** Your SearXNG base URL for vendor lookup ('' or null clears it). */
+  vendorLookupUrl: z
+    .string()
+    .trim()
+    .max(500)
+    .refine((v) => v === '' || normalizeLookupUrl(v) !== null, 'Enter a plain http(s) address, e.g. http://searx.tail1234.ts.net:8080')
+    .nullish(),
 });
 export type NetworkPolicyInput = z.infer<typeof networkPolicySchema>;
 
