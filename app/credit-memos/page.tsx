@@ -963,7 +963,7 @@ export default function CreditMemosPage() {
     .reduce((s, m) => s + Number(m.unapplied), 0);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Credit Memos"
         icon={RotateCcw}

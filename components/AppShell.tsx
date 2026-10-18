@@ -3,6 +3,7 @@ import * as React from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import CommandPalette, { CommandBarButton } from './CommandPalette';
+import { AppearanceButton } from './AppearancePicker';
 import AssistantPanel from './AssistantPanel';
 import {
   linkHref,
@@ -172,7 +173,7 @@ function CompanyChip({
         aria-haspopup="listbox"
         aria-expanded={open}
         title="Active company — click to switch"
-        className="flex items-center gap-2 rounded-full bg-white border border-slate-200 pl-2.5 pr-2 py-1 text-sm font-semibold text-navy shadow-sm hover:border-electric/50 hover:text-electric transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+        className="flex h-8 items-center gap-2 rounded-full bg-white border border-slate-200 pl-2.5 pr-2 text-[13px] font-medium text-navy shadow-sm hover:bg-slate-50 transition-colors outline-none focus-visible:ring-4 focus-visible:ring-electric/25"
       >
         <Building2 className="h-4 w-4 text-electric shrink-0" />
         <span className="max-w-[220px] truncate">{company.name}</span>
@@ -181,9 +182,9 @@ function CompanyChip({
       {open && (
         <div
           role="listbox"
-          className="absolute right-0 mt-1 w-64 rounded-xl bg-white shadow-xl border border-slate-100 py-1 z-50"
+          className="absolute right-0 mt-2 w-64 rounded-xl bg-white/95 backdrop-blur-xl shadow-2xl border border-slate-200/70 p-1 z-50"
         >
-          <div className="px-3 pt-2 pb-1 text-[10px] font-bold uppercase tracking-wider text-navy/30">
+          <div className="px-3 pt-2 pb-1 text-[11px] font-semibold text-navy/40">
             Switch company
           </div>
           {list === null && (
@@ -199,20 +200,20 @@ function CompanyChip({
               aria-selected={c.id === company.id}
               disabled={switching !== null}
               onClick={() => switchTo(c)}
-              className={`w-full text-left px-3 py-2 text-sm flex items-center justify-between gap-2 hover:bg-electric/5 disabled:opacity-50 ${
+              className={`w-full text-left px-3 py-1.5 rounded-md text-sm flex items-center justify-between gap-2 hover:bg-electric hover:text-white disabled:opacity-50 group ${
                 c.id === company.id ? 'text-electric font-semibold' : 'text-navy'
               }`}
             >
               <span className="truncate">{c.name}</span>
-              {c.id === company.id && <span className="text-xs text-navy/40">active</span>}
-              {switching === c.id && <span className="text-xs text-navy/40">switching…</span>}
+              {c.id === company.id && <span className="text-xs text-navy/40 group-hover:text-white/70">active</span>}
+              {switching === c.id && <span className="text-xs text-navy/40 group-hover:text-white/70">switching…</span>}
             </button>
           ))}
-          <div className="border-t border-slate-100 mt-1 pt-1">
+          <div className="border-t border-slate-200/70 mt-1 pt-1">
             <Link
               href="/companies"
               onClick={() => setOpen(false)}
-              className="block px-3 py-2 text-sm text-navy/70 hover:bg-electric/5 hover:text-electric"
+              className="block rounded-md px-3 py-1.5 text-sm text-navy/70 hover:bg-electric hover:text-white"
             >
               Manage companies…
             </Link>
@@ -227,7 +228,7 @@ function ShortcutRow({ keys, description }: { keys: string; description: string 
   return (
     <div className="flex items-center justify-between py-1.5">
       <span className="text-sm text-navy/70">{description}</span>
-      <kbd className="rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs font-semibold text-navy whitespace-nowrap">
+      <kbd className="rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs font-medium text-navy shadow-[0_1px_0_rgb(var(--slate-200))] whitespace-nowrap">
         {keys}
       </kbd>
     </div>
@@ -350,15 +351,15 @@ function MenuModeToggle({
       aria-checked={mode === m}
       title={title}
       onClick={() => mode !== m && onChange(m)}
-      className={`flex-1 rounded-md px-2 py-1 text-xs font-semibold transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
-        mode === m ? 'bg-white text-electric shadow-sm' : 'text-navy/60 hover:text-navy'
+      className={`flex-1 rounded-md px-2 py-1 text-xs font-medium transition outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
+        mode === m ? 'bg-white text-navy shadow-sm' : 'text-navy/55 hover:text-navy'
       }`}
     >
       {label}
     </button>
   );
   return (
-    <div role="radiogroup" aria-label="Menu style" className={`${className} gap-1 rounded-lg bg-slate-100 p-1 shrink-0`}>
+    <div role="radiogroup" aria-label="Menu style" className={`${className} gap-0.5 rounded-lg bg-navy/[.06] p-0.5 shrink-0`}>
       {btn('simple', 'Simple', 'Everyday tasks only')}
       {btn('advanced', 'All menus', 'Every screen, grouped like the QuickBooks menus')}
     </div>
@@ -408,7 +409,7 @@ function SidebarSearch({
 
   return (
     <div ref={rootRef} className={`${className} shrink-0`}>
-      <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-navy/40" aria-hidden="true" />
+      <Search className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-navy/40" aria-hidden="true" />
       <input
         type="search"
         role="combobox"
@@ -439,13 +440,13 @@ function SidebarSearch({
             setOpen(false);
           }
         }}
-        className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-8 pr-2 text-sm text-navy placeholder:text-navy/40 outline-none focus:border-electric/50 focus:bg-white focus:ring-2 focus:ring-electric/30"
+        className="w-full rounded-lg border border-transparent bg-navy/[.06] py-1.5 pl-8 pr-2 text-sm text-navy placeholder:text-navy/40 outline-none transition focus:border-electric/60 focus:bg-white focus:ring-4 focus:ring-electric/20"
       />
       {open && q.trim() && (
         <div
           id={`${idPrefix}-search-results`}
           role="listbox"
-          className="absolute left-0 z-50 mt-1 w-80 max-w-[80vw] rounded-xl border border-slate-100 bg-white py-1 shadow-xl"
+          className="absolute left-0 z-50 mt-2 w-80 max-w-[80vw] rounded-xl border border-slate-200/70 bg-white/95 p-1 shadow-2xl backdrop-blur-xl"
         >
           {results.length === 0 ? (
             <div className="px-3 py-3 text-sm text-navy/50">
@@ -461,7 +462,7 @@ function SidebarSearch({
                 type="button"
                 onMouseEnter={() => setActive(i)}
                 onClick={() => go(r.href)}
-                className={`block w-full px-3 py-2 text-left ${i === active ? 'bg-electric/10' : ''}`}
+                className={`block w-full rounded-md px-3 py-2 text-left ${i === active ? 'bg-electric/[.12]' : ''}`}
               >
                 <span className="flex items-center justify-between gap-2">
                   <span className="text-sm font-medium text-navy">{r.label}</span>
@@ -507,18 +508,18 @@ function NavItems({
                     aria-expanded={!isCollapsed}
                     aria-controls={listId}
                     onClick={() => onToggle(group.heading)}
-                    className="hidden lg:flex w-full items-center justify-between rounded px-3 pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-navy/40 hover:text-navy outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+                    className="hidden lg:flex w-full items-center justify-between rounded px-3 pt-3 pb-1 text-[11px] font-semibold text-navy/40 hover:text-navy outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
                   >
                     {group.heading}
                     {isCollapsed ? <ChevronRight className="h-3 w-3" aria-hidden="true" /> : <ChevronDown className="h-3 w-3" aria-hidden="true" />}
                   </button>
                 ) : (
-                  <div className="hidden lg:block px-3 pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-navy/30">
+                  <div className="hidden lg:block px-3 pt-3 pb-1 text-[11px] font-semibold text-navy/40">
                     {group.heading}
                   </div>
                 )}
                 {/* Collapsed mode: divider stands in for the group heading. */}
-                <div className="lg:hidden mx-2 my-2 border-t border-slate-100" aria-hidden="true" />
+                <div className="lg:hidden mx-2 my-2 border-t border-slate-200/70" aria-hidden="true" />
               </>
             )}
             <div id={listId} className={isCollapsed ? 'lg:hidden' : ''}>
@@ -532,13 +533,13 @@ function NavItems({
                     prefetch={false}
                     title={nav.qb && nav.qb !== nav.label ? `${nav.label} (QuickBooks: ${nav.qb})` : nav.label}
                     aria-current={active ? 'page' : undefined}
-                    className={`relative flex items-center justify-center lg:justify-start gap-3 px-2 lg:px-3 py-2 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
+                    className={`relative flex items-center justify-center lg:justify-start gap-2.5 px-2 lg:px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
                       active
-                        ? 'bg-electric/10 text-electric font-semibold shadow-[inset_3px_0_0_0_theme(colors.electric)]'
-                        : 'text-navy/80 font-medium hover:text-electric hover:bg-electric/5'
+                        ? 'bg-electric/[.13] text-electric font-medium'
+                        : 'text-navy/80 hover:text-navy hover:bg-navy/[.05]'
                     }`}
                   >
-                    <Icon className="h-[18px] w-[18px] shrink-0" />
+                    <Icon className={`h-[17px] w-[17px] shrink-0 ${active ? '' : 'text-electric/80'}`} />
                     <span className="hidden lg:inline-block text-sm">{nav.label}</span>
                     {nav.path === '/attention' && <AttentionBadge />}
                   </Link>
@@ -633,13 +634,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className="min-h-screen flex bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100">
-      <aside className="w-20 lg:w-60 sticky top-0 h-screen bg-white shadow-xl z-10 flex flex-col py-6 px-2 lg:px-3 border-r border-slate-100">
-        <div className="flex flex-col items-center gap-3 mb-8 shrink-0">
-          <div className="rounded-xl bg-navy h-12 w-12 flex items-center justify-center shadow-md">
-            <Briefcase className="text-gold h-6 w-6" />
+    <div className="min-h-screen flex bg-offwhite">
+      <aside className="w-20 lg:w-60 sticky top-[var(--titlebar-h)] h-screen bg-chrome/80 backdrop-blur-xl z-10 flex flex-col pt-4 pb-3 px-2 lg:px-3 border-r border-slate-200/80">
+        <div className="flex items-center justify-center lg:justify-start gap-2.5 lg:px-2 mb-4 shrink-0">
+          <div className="rounded-[10px] bg-gradient-to-b from-electric/85 to-electric h-9 w-9 flex items-center justify-center shadow-sm">
+            <Briefcase className="text-white h-[18px] w-[18px]" />
           </div>
-          <h1 className="text-navy font-extrabold text-2xl tracking-tight leading-tight hidden lg:block">
+          <h1 className="text-navy font-semibold text-lg tracking-tight leading-tight hidden lg:block">
             Ironbooks
           </h1>
         </div>
@@ -666,16 +667,16 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             </button>
           )}
         </nav>
-        <div className="shrink-0 pt-3 mt-1 border-t border-slate-100">
+        <div className="shrink-0 pt-3 mt-1 border-t border-slate-200/70">
           <BackupIndicator />
           <button
             onClick={logout}
-            className="flex items-center justify-center lg:justify-start gap-3 text-navy/60 hover:text-red-500 hover:bg-red-50 font-medium px-2 lg:px-3 py-2 rounded-lg w-full transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+            className="flex items-center justify-center lg:justify-start gap-2.5 text-navy/60 hover:text-red-500 hover:bg-red-50 px-2 lg:px-2.5 py-1.5 rounded-lg w-full transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
           >
-            <LogOut className="h-[18px] w-[18px] shrink-0" />
+            <LogOut className="h-[17px] w-[17px] shrink-0" />
             <span className="hidden lg:inline-block text-sm">Sign out</span>
           </button>
-          <div className="hidden lg:block px-3 pt-2 text-[10px] text-navy/30">
+          <div className="hidden lg:block px-2.5 pt-2 text-[10px] text-navy/35">
             Ironbooks v{process.env.NEXT_PUBLIC_APP_VERSION}
           </div>
         </div>
@@ -705,11 +706,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             type="button"
             onClick={() => setAssistantOpen(true)}
             title="Ask about your books"
-            className="flex items-center gap-1.5 rounded-full bg-white border border-slate-200 px-3 py-1 text-sm font-semibold text-navy shadow-sm hover:border-electric/50 hover:text-electric transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+            className="flex h-8 items-center gap-1.5 rounded-full bg-white border border-slate-200 px-3 text-[13px] font-medium text-navy shadow-sm hover:bg-slate-50 transition-colors outline-none focus-visible:ring-4 focus-visible:ring-electric/25"
           >
             <Sparkles className="h-4 w-4 text-electric" />
             Ask AI
           </button>
+          <AppearanceButton />
           <CompanyChip company={company} onCompany={setCompany} />
         </header>
         <BackupWarningBanner />

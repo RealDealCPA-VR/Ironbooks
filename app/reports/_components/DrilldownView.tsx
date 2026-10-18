@@ -83,7 +83,7 @@ export default function DrilldownView() {
   };
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="What's behind this number"
         icon={ListTree}
@@ -126,7 +126,7 @@ export default function DrilldownView() {
               </div>
               <div className="text-right">
                 <p className="text-xs text-navy/50">{data.kind === 'formula' ? 'Calculated amount' : 'Amount on the report'}</p>
-                <p className="text-2xl font-extrabold text-navy tabular-nums">
+                <p className="text-2xl font-bold text-navy tabular-nums">
                   {data.cell === null ? '—' : data.kind === 'formula' && /%|pct/i.test(data.column) ? `${data.cell}%` : formatCurrency(data.cell)}
                 </p>
                 {data.incomplete ? (

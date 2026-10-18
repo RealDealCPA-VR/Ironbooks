@@ -55,7 +55,7 @@ export default function DocNumbersPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Document Numbers" icon={ListChecks} />
       <Card className="p-6">
         <p className="mb-4 text-sm text-navy/70 max-w-2xl">

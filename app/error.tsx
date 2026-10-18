@@ -29,9 +29,9 @@ export default function RouteError({
 
   return (
     <main className="min-h-[60vh] flex items-center justify-center p-8 font-sans">
-      <div className="max-w-lg w-full rounded-2xl bg-white shadow-xl border-b-4 border-electric p-8 text-center">
+      <div className="max-w-lg w-full rounded-2xl bg-white shadow-xl border border-slate-200/70 p-8 text-center">
         <AlertTriangle className="mx-auto h-12 w-12 text-gold" />
-        <h1 className="mt-4 text-2xl font-extrabold text-navy">Something went wrong</h1>
+        <h1 className="mt-4 text-2xl font-bold text-navy">Something went wrong</h1>
         <p className="mt-2 text-sm text-navy/60">
           This screen hit an unexpected error. Your company file is safe — nothing was
           posted. You can retry, or head back to the dashboard.

@@ -57,7 +57,7 @@ export default function QbImportPage() {
   const [showExport, setShowExport] = useState(false);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Migrate from QuickBooks" icon={Upload} />
 
       <div className="max-w-5xl mx-auto space-y-6">

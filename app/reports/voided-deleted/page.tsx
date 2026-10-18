@@ -67,7 +67,7 @@ export default async function VoidedDeletedPage({
   const qs = (d: boolean) => '?' + new URLSearchParams({ ...(p.from ? { from: p.from } : {}), ...(p.to ? { to: p.to } : {}), ...(d ? { detail: '1' } : {}) }).toString();
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <div className="max-w-6xl">
         <PageHeader
           title={`Voided/Deleted Transactions ${detail ? 'Detail' : 'Summary'}`}

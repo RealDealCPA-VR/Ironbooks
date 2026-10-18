@@ -268,7 +268,7 @@ export default function ReportToolbar({
                   type="checkbox"
                   checked={col.visible}
                   onChange={() => onToggleColumn?.(col.key)}
-                  className="accent-[#2563eb]"
+                  className="accent-electric"
                 />
                 {col.label}
               </label>

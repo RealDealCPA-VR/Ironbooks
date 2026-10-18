@@ -35,7 +35,7 @@ export default function ListsPage() {
   const spec = LIST_SPECS.find((s) => s.key === active) ?? LIST_SPECS[0];
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Lists" icon={ListChecks} />
       <div className="flex flex-col gap-6 lg:flex-row">
         <nav aria-label="Lists" className="lg:w-56 shrink-0">

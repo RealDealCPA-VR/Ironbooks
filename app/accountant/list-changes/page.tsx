@@ -72,7 +72,7 @@ export default function ListChangesPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <BackToCenter />
       <PageHeader title="Review List Changes" icon={ListChecks} action={<Badge tone={unreviewed ? 'warning' : 'success'}>{unreviewed} not reviewed</Badge>} />
       <p className="mb-4 max-w-3xl text-sm text-navy/60">

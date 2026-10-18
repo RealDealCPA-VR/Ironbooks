@@ -1,7 +1,9 @@
 'use client';
 /**
- * Shared UI kit for Ironbooks. Lightweight Tailwind primitives matching the brand palette
- * (navy / electric / emerald / gold / offwhite). Import from '@/components/ui'.
+ * Shared UI kit for Ironbooks. Lightweight Tailwind primitives in a clean, Apple-like style:
+ * hairline borders, soft shadows, the accent color for actions. Every color is a theme variable
+ * (app/globals.css), so these follow light / dark / auto and the accent color. Import from
+ * '@/components/ui'.
  */
 import * as React from 'react';
 import { cn } from '@/lib/utils';
@@ -53,16 +55,16 @@ export function Button({
   ...props
 }: ButtonProps) {
   const variants = {
-    primary: 'bg-electric text-white hover:bg-electric/90 shadow-sm',
-    secondary: 'bg-white text-navy border border-slate-200 hover:bg-slate-50',
-    ghost: 'text-navy hover:bg-navy/5',
-    danger: 'bg-red-500 text-white hover:bg-red-600',
+    primary: 'bg-electric text-white shadow-sm hover:brightness-110 active:brightness-95',
+    secondary: 'bg-white text-navy border border-slate-200 shadow-sm hover:bg-slate-50 active:bg-slate-100',
+    ghost: 'text-navy hover:bg-navy/[.06] active:bg-navy/10',
+    danger: 'bg-red-500 text-white shadow-sm hover:brightness-110 active:brightness-95',
   };
-  const sizes = { sm: 'px-3 py-1.5 text-sm', md: 'px-4 py-2 text-sm' };
+  const sizes = { sm: 'px-3 py-1.5 text-[13px]', md: 'px-4 py-2 text-sm' };
   return (
     <button
       className={cn(
-        'inline-flex items-center justify-center gap-2 rounded-lg font-semibold transition-colors disabled:opacity-50 disabled:pointer-events-none outline-none focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1',
+        'inline-flex items-center justify-center gap-2 rounded-lg font-medium transition disabled:opacity-50 disabled:pointer-events-none outline-none focus-visible:ring-4 focus-visible:ring-electric/25',
         variants[variant],
         sizes[size],
         className,
@@ -80,7 +82,7 @@ export function Button({
 export function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={cn('rounded-2xl bg-white shadow-xl border border-slate-100', className)}
+      className={cn('rounded-2xl bg-white shadow-xl border border-slate-200/70', className)}
       {...props}
     />
   );
@@ -126,7 +128,7 @@ export const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttribute
         type={type}
         onKeyDown={type === 'date' ? handleDateKeys : onKeyDown}
         className={cn(
-          'w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30 placeholder:text-navy/30',
+          'w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-navy outline-none transition-shadow focus:border-electric focus:ring-4 focus:ring-electric/20 placeholder:text-navy/35 disabled:bg-slate-50 disabled:text-navy/50',
           className,
         )}
         {...props}
@@ -212,7 +214,7 @@ export const Select = React.forwardRef<
     <select
       ref={ref}
       className={cn(
-        'w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy bg-white outline-none focus:border-electric focus:ring-2 focus:ring-electric/30',
+        'w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy bg-white outline-none transition-shadow focus:border-electric focus:ring-4 focus:ring-electric/20 disabled:bg-slate-50 disabled:text-navy/50',
         className,
       )}
       {...props}
@@ -230,7 +232,7 @@ export function Label({
   required?: boolean;
 }) {
   return (
-    <label className={cn('block text-sm font-medium text-navy/70 mb-1', className)} {...props}>
+    <label className={cn('block text-[13px] font-medium text-navy/70 mb-1', className)} {...props}>
       {children}
       {required && (
         <>
@@ -279,7 +281,7 @@ export function Badge({
   };
   return (
     <span
-      className={cn('px-2.5 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap', tones[tone], className)}
+      className={cn('px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap', tones[tone], className)}
     >
       {children}
     </span>
@@ -302,7 +304,7 @@ export function Th({
   return (
     <th
       className={cn(
-        'py-2.5 px-4 text-left font-semibold text-navy/70 text-sm border-b-2 border-navy/10',
+        'py-2.5 px-4 text-left text-xs font-semibold text-navy/55 border-b border-slate-200',
         numeric && 'text-right tabular-nums',
         className,
       )}
@@ -327,7 +329,7 @@ export function Td({
   );
 }
 export function Tr({ className, ...props }: React.HTMLAttributes<HTMLTableRowElement>) {
-  return <tr className={cn('hover:bg-electric/5', className)} {...props} />;
+  return <tr className={cn('transition-colors hover:bg-electric/[.04]', className)} {...props} />;
 }
 
 // ---- Modal ----
@@ -401,7 +403,7 @@ export function Modal({
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-navy/40 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-[2px] animate-in fade-in duration-150" onClick={onClose} />
       <div
         ref={dialogRef}
         role="dialog"
@@ -409,13 +411,17 @@ export function Modal({
         aria-labelledby={titleId}
         tabIndex={-1}
         className={cn(
-          'relative z-10 w-full p-6 max-h-[90vh] overflow-y-auto rounded-2xl bg-white shadow-xl border border-slate-100 outline-none',
+          'relative z-10 w-full p-6 max-h-[90vh] overflow-y-auto rounded-2xl bg-white shadow-2xl border border-slate-200/70 outline-none animate-in fade-in zoom-in-95 duration-150',
           MODAL_SIZES[size],
         )}
       >
         <div className="flex items-center justify-between mb-4">
-          <h2 id={titleId} className="text-xl font-bold text-navy">{title}</h2>
-          <button onClick={onClose} aria-label="Close" className="text-navy/40 hover:text-navy text-2xl leading-none">
+          <h2 id={titleId} className="text-lg font-semibold text-navy">{title}</h2>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-lg leading-none text-navy/50 transition-colors hover:bg-slate-200 hover:text-navy"
+          >
             &times;
           </button>
         </div>
@@ -504,7 +510,7 @@ export function PageSkeleton({ rows = 6 }: { rows?: number }) {
   return (
     <div className="p-8 animate-pulse" role="status" aria-label="Loading">
       <div className="mb-6 h-8 w-64 rounded-lg bg-navy/10" />
-      <div className="space-y-4 rounded-2xl border border-slate-100 bg-white p-6 shadow-xl">
+      <div className="space-y-4 rounded-2xl border border-slate-200/70 bg-white p-6 shadow-xl">
         {Array.from({ length: rows }).map((_, i) => (
           <div key={i} className="h-4 rounded bg-navy/5" style={{ width: `${85 - (i % 3) * 15}%` }} />
         ))}
@@ -530,8 +536,8 @@ export function PageHeader({
 }) {
   return (
     <div className="flex items-center justify-between mb-6">
-      <h1 className="text-3xl font-extrabold text-navy flex items-center gap-3">
-        {Icon ? <Icon className="text-electric h-8 w-8" /> : iconNode}
+      <h1 className="text-[28px] font-bold tracking-tight text-navy flex items-center gap-3">
+        {Icon ? <Icon className="text-electric h-7 w-7" /> : iconNode}
         {title}
       </h1>
       {action}
@@ -626,14 +632,22 @@ export function Toaster() {
         <div
           key={t.id}
           role={t.tone === 'danger' ? 'alert' : 'status'}
-          className={cn(
-            'relative rounded-lg px-4 py-3 pr-9 text-sm font-medium shadow-lg text-white',
-            t.tone === 'success' ? 'bg-emerald' : t.tone === 'danger' ? 'bg-red-500' : 'bg-navy',
-          )}
+          data-tone={t.tone}
+          className="relative flex gap-3 rounded-2xl border border-slate-200/70 bg-white/95 px-4 py-3 pr-9 text-sm text-navy shadow-2xl backdrop-blur-xl animate-in fade-in slide-in-from-bottom-2 duration-200"
         >
-          {t.title && <div className="font-bold">{t.title}</div>}
-          <div className={t.title ? 'font-normal' : undefined}>{t.message}</div>
-          {t.nextStep && <div className="mt-1 font-normal text-white/90">{t.nextStep}</div>}
+          <span
+            aria-hidden="true"
+            className={cn(
+              'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold text-white',
+              t.tone === 'success' ? 'bg-emerald' : t.tone === 'danger' ? 'bg-red-500' : 'bg-electric',
+            )}
+          >
+            {t.tone === 'success' ? '✓' : t.tone === 'danger' ? '!' : 'i'}
+          </span>
+          <div className="min-w-0 flex-1">
+          {t.title && <div className="font-semibold">{t.title}</div>}
+          <div className={t.title ? 'text-navy/80' : 'font-medium'}>{t.message}</div>
+          {t.nextStep && <div className="mt-1 text-navy/60">{t.nextStep}</div>}
           {t.actions && t.actions.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-2">
               {t.actions.map((a) => (
@@ -644,18 +658,19 @@ export function Toaster() {
                     dismiss(t.id);
                     a.onClick();
                   }}
-                  className="rounded-md bg-white/95 px-2.5 py-1 text-xs font-semibold text-navy hover:bg-white focus:outline-none focus:ring-2 focus:ring-white/70"
+                  className="rounded-md bg-electric px-2.5 py-1 text-xs font-semibold text-white hover:brightness-110 focus:outline-none focus-visible:ring-4 focus-visible:ring-electric/25"
                 >
                   {a.label}
                 </button>
               ))}
             </div>
           )}
+          </div>
           <button
             type="button"
             onClick={() => dismiss(t.id)}
             aria-label="Dismiss notification"
-            className="absolute right-2 top-2 rounded px-1 text-white/70 hover:text-white leading-none text-lg"
+            className="absolute right-2 top-2 rounded px-1 text-navy/35 hover:text-navy leading-none text-lg"
           >
             &times;
           </button>

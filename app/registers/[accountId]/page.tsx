@@ -295,7 +295,7 @@ function RegisterPageInner() {
   const fxCur = result?.currency ?? null;
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title={account ? `Register: ${account.name}` : 'Account Register'}
         icon={BookOpen}
@@ -516,7 +516,7 @@ function RegisterPageInner() {
                 {result.totalRows} transaction{result.totalRows === 1 ? '' : 's'}
                 {search.trim() ? ' (filtered)' : ''}
               </span>
-              <span className="font-extrabold text-navy">
+              <span className="font-bold text-navy">
                 Ending Balance:{' '}
                 <span
                   className={`tabular-nums text-lg ${
@@ -545,7 +545,7 @@ export default function RegisterPage() {
   return (
     <Suspense
       fallback={
-        <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+        <main className="min-h-screen bg-offwhite p-8 font-sans">
           <div className="py-16 flex justify-center">
             <Spinner className="text-electric" />
           </div>

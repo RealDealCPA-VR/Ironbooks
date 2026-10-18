@@ -14,7 +14,7 @@ export default function FeatureOff({ gate }: { gate: FeatureGate }) {
     <div className="p-6 lg:p-10 flex justify-center">
       <Card className="max-w-lg w-full p-8 text-center">
         <ToggleLeft className="mx-auto h-10 w-10 text-navy/30" aria-hidden="true" />
-        <h1 className="mt-3 text-xl font-extrabold text-navy">{gate.label} turned off</h1>
+        <h1 className="mt-3 text-xl font-bold text-navy">{gate.label} turned off</h1>
         <p className="mt-2 text-sm text-navy/60" role="status">
           {featureOffMessage(gate)}
         </p>

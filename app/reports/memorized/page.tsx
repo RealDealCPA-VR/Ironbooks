@@ -140,7 +140,7 @@ export default function MemorizedReportsPage() {
   };
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Memorized Reports" icon={Bookmark} />
       <p className="text-sm text-navy/60 -mt-4 mb-6">
         Save any report with its settings using the <strong>Memorize</strong> button on the report. Put related reports in a group
@@ -212,7 +212,7 @@ export default function MemorizedReportsPage() {
                     <li key={r.id} className="flex items-center gap-3 px-4 py-2 border-b border-slate-100 last:border-0">
                       <input
                         type="checkbox"
-                        className="accent-[#2563eb]"
+                        className="accent-electric"
                         aria-label={`Select ${r.name}`}
                         checked={selected.has(r.id)}
                         onChange={() =>

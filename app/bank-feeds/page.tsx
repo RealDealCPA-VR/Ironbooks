@@ -47,7 +47,7 @@ const PATHS = [
 
 export default function BankFeedsPage() {
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Bank Feeds / Import" icon={Rss} />
       <p className="text-sm text-navy/60 mb-6 max-w-3xl">
         Ironbooks does not connect to your bank or to any feed service. Your bank data comes in only from files you choose,

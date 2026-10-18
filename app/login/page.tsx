@@ -41,13 +41,13 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="min-h-screen flex items-center justify-center bg-gradient-to-br from-navy via-[#11294a] to-navy p-4 font-sans">
+    <main className="min-h-screen flex items-center justify-center bg-offwhite bg-[radial-gradient(1200px_600px_at_50%_-10%,rgb(var(--accent)/0.14),transparent)] p-4 font-sans">
       <Card className="w-full max-w-md p-8">
         <div className="flex flex-col items-center mb-6">
-          <div className="rounded-xl bg-navy h-12 w-12 flex items-center justify-center shadow-md mb-3">
-            <Briefcase className="text-gold h-6 w-6" />
+          <div className="rounded-2xl bg-gradient-to-b from-electric/85 to-electric h-12 w-12 flex items-center justify-center shadow-md mb-3">
+            <Briefcase className="text-white h-6 w-6" />
           </div>
-          <h1 className="text-2xl font-extrabold text-navy">Welcome back</h1>
+          <h1 className="text-2xl font-bold text-navy">Welcome back</h1>
           <p className="text-sm text-navy/50">Sign in to Ironbooks</p>
         </div>
         <form onSubmit={submit} className="space-y-4">

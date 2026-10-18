@@ -844,7 +844,7 @@ export default function SalesReceiptsPage() {
   const activeReceipts = receipts.filter((r) => r.status !== 'void');
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Sales Receipts"
         icon={Receipt}

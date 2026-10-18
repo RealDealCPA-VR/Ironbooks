@@ -212,7 +212,7 @@ function NewBudgetModal({
           </Select>
         </div>
         <label className="flex items-center gap-2 text-sm text-navy">
-          <input type="checkbox" className="accent-[#2563eb]" checked={isForecast} onChange={(e) => setIsForecast(e.target.checked)} />
+          <input type="checkbox" className="accent-electric" checked={isForecast} onChange={(e) => setIsForecast(e.target.checked)} />
           This is a forecast (your best guess), not a budget (your target)
         </label>
         <p className="text-xs text-navy/50">
@@ -601,7 +601,7 @@ export default function BudgetsPage() {
   // ---------------------------------------------------------------------------
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Budgets"
         icon={BarChart2}

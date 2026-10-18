@@ -144,7 +144,7 @@ function LiabilityTile({
       <div>
         <p className="text-xs text-navy/50 mb-0.5">Amount Due</p>
         <p
-          className={`text-3xl font-extrabold tabular-nums ${
+          className={`text-3xl font-bold tabular-nums ${
             isZero ? 'text-navy/25' : 'text-red-500'
           }`}
         >
@@ -653,7 +653,7 @@ export default function PayLiabilitiesPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Pay Liabilities" icon={Landmark} />
       <p className="mt-2 text-sm text-navy/50">
         Payroll taxes and deductions you withheld. Sales tax is paid on{' '}

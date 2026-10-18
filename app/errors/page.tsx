@@ -377,7 +377,7 @@ export default function ErrorsPage() {
   );
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="AI Review"
         icon={ShieldAlert}
@@ -429,7 +429,7 @@ export default function ErrorsPage() {
             >
               <Icon className={`h-8 w-8 ${kpi.accent} shrink-0`} />
               <div>
-                <div className={`text-3xl font-extrabold tabular-nums ${kpi.accent}`}>
+                <div className={`text-3xl font-bold tabular-nums ${kpi.accent}`}>
                   {kpi.value}
                 </div>
                 <div className="text-xs text-navy/50 font-medium mt-0.5">{kpi.label}</div>

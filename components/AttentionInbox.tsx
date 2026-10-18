@@ -250,7 +250,7 @@ function AllCaughtUp() {
       <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-emerald/15 text-emerald">
         <PartyPopper className="h-8 w-8" aria-hidden="true" />
       </div>
-      <h2 className="text-xl font-extrabold text-navy">All caught up!</h2>
+      <h2 className="text-xl font-bold text-navy">All caught up!</h2>
       <p className="mt-2 max-w-md text-sm text-navy/60">
         Nothing needs your attention right now: no overdue invoices, no bills about to be late, and your
         bank transactions are sorted. Nice work. New things will show up here as they come due.

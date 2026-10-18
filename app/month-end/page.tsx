@@ -504,7 +504,7 @@ function ClosedScreen({ checklist, onReview }: { checklist: MonthEndChecklist; o
   return (
     <Card className="p-8 text-center">
       <CheckCircle2 className="mx-auto h-14 w-14 text-emerald" aria-hidden="true" />
-      <h2 className="mt-4 text-2xl font-extrabold text-navy">Books are closed</h2>
+      <h2 className="mt-4 text-2xl font-bold text-navy">Books are closed</h2>
       <p className="mt-2 text-navy/70">
         {monthLabel(checklist.periodEnd)} is closed through {formatDate(checklist.periodEnd)}
         {checklist.closedByName ? ` by ${checklist.closedByName}` : ''}
@@ -619,7 +619,7 @@ export default function MonthEndPage() {
   const isClosed = checklist?.status === 'closed';
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Close the month" icon={CalendarCheck} />
 
       <Card className="p-6 mb-6">

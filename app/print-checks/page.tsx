@@ -541,7 +541,7 @@ export default function PrintChecksPage() {
   // ---------------------------------------------------------------------------
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <div className="max-w-4xl mx-auto space-y-6">
         <PageHeader title="Print Checks" icon={Printer} />
 

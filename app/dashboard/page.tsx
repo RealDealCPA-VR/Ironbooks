@@ -41,14 +41,15 @@ import { homeTabFor } from '@/lib/homeTabs';
 export const dynamic = 'force-dynamic';
 
 /**
- * Single documented chart palette — brand colors from tailwind.config.ts plus the
- * kit's red scale for negative/at-risk values (the brand defines no red).
+ * Single documented chart palette — the theme variables behind tailwind.config.ts (so the charts
+ * follow light / dark), plus the kit's red scale for negative/at-risk values. Applied through
+ * `style` (SVG presentation attributes do not read CSS variables).
  */
 const CHART = {
-  positive: '#2ECC71', // brand emerald
-  negative: '#ef4444', // red-500 — matches kit danger
-  warning: '#C89B3C', // brand gold
-  axis: '#0D1B2A', // brand navy
+  positive: 'rgb(var(--success))', // brand emerald
+  negative: 'rgb(var(--red-500))', // matches kit danger
+  warning: 'rgb(var(--gold))', // brand gold
+  axis: 'rgb(var(--ink))', // brand navy
 } as const;
 
 /**
@@ -99,7 +100,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
   ];
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Home" action={<QuickActions />} />
       <HomeTabs active="overview" />
 
@@ -125,7 +126,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
         <RemindersList compact />
       </Card>
 
-      <h2 className="mt-10 mb-4 text-xl font-extrabold text-navy">Insights</h2>
+      <h2 className="mt-10 mb-4 text-xl font-bold text-navy">Insights</h2>
 
       {/* KPI tiles */}
       <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-5 gap-6">
@@ -134,7 +135,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
           return (
             <div
               key={c.label}
-              className="rounded-2xl p-6 bg-white border-b-4 border-electric shadow-xl flex flex-col items-start hover:scale-[1.025] transition-all duration-300"
+              className="rounded-2xl p-6 bg-white border border-slate-200/70 shadow-xl flex flex-col items-start hover:-translate-y-0.5 hover:shadow-lg transition duration-200"
             >
               <Icon className="h-7 w-7 text-electric mb-2" />
               <span className="text-2xl font-semibold text-navy tabular-nums">
@@ -172,7 +173,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
 /** Home's "Needs attention" tab: the inbox (lib/services/attention.ts). */
 function AttentionHome({ data }: { data: Awaited<ReturnType<typeof getAttention>> }) {
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Home" />
       <HomeTabs active="attention" attentionCount={data.total} />
       <AttentionInbox initial={data} />
@@ -182,7 +183,7 @@ function AttentionHome({ data }: { data: Awaited<ReturnType<typeof getAttention>
 
 function LimitedHome({ allowedHrefs }: { allowedHrefs: string[] | null }) {
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Home" />
       <HomeTabs active="overview" />
       <Card className="p-6 max-w-xl mb-6">
@@ -254,7 +255,7 @@ function PlTrendCard({ trend }: { trend: DashboardInsights['plTrend'] }) {
   const latest = trend[trend.length - 1];
 
   return (
-    <div className="rounded-2xl p-6 bg-white shadow-xl border-b-4 border-emerald">
+    <div className="rounded-2xl p-6 bg-white shadow-xl border border-slate-200/70">
       <div className="flex items-center justify-between mb-2">
         <h2 className="text-sm font-bold text-navy/70 uppercase tracking-wide">
           P&amp;L Trend (6 months)
@@ -268,10 +269,10 @@ function PlTrendCard({ trend }: { trend: DashboardInsights['plTrend'] }) {
         <span className="ml-2 text-xs font-medium text-navy/40">net this month</span>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="mt-3 w-full h-16" role="img" aria-label="Net income sparkline, last 6 months">
-        <line x1={PAD} y1={zeroY} x2={W - PAD} y2={zeroY} stroke={CHART.axis} strokeOpacity="0.15" strokeDasharray="3 3" />
-        <polyline points={points} fill="none" stroke={CHART.positive} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+        <line x1={PAD} y1={zeroY} x2={W - PAD} y2={zeroY} style={{ stroke: CHART.axis }} strokeOpacity="0.15" strokeDasharray="3 3" />
+        <polyline points={points} fill="none" style={{ stroke: CHART.positive }} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
         {nets.map((v, i) => (
-          <circle key={i} cx={x(i)} cy={y(v)} r="2.5" fill={v < 0 ? CHART.negative : CHART.positive} />
+          <circle key={i} cx={x(i)} cy={y(v)} r="2.5" style={{ fill: v < 0 ? CHART.negative : CHART.positive }} />
         ))}
       </svg>
       <div className="mt-1 flex justify-between text-[10px] text-navy/40 font-medium">
@@ -291,9 +292,9 @@ function PlTrendCard({ trend }: { trend: DashboardInsights['plTrend'] }) {
 const AGING_SEGMENTS = [
   { key: 'current', label: 'Current', color: CHART.positive },
   { key: 'days1_30', label: '1–30', color: CHART.warning },
-  { key: 'days31_60', label: '31–60', color: '#f87171' },
+  { key: 'days31_60', label: '31–60', color: 'rgb(var(--red-400))' },
   { key: 'days61_90', label: '61–90', color: CHART.negative },
-  { key: 'days91plus', label: '91+', color: '#991b1b' },
+  { key: 'days91plus', label: '91+', color: '#A11D1D' },
 ] as const;
 
 function ArAgingCard({ aging }: { aging: DashboardInsights['arAging'] }) {
@@ -301,7 +302,7 @@ function ArAgingCard({ aging }: { aging: DashboardInsights['arAging'] }) {
   const total = values.reduce((a, b) => a + b, 0);
 
   return (
-    <div className="rounded-2xl p-6 bg-white shadow-xl border-b-4 border-gold">
+    <div className="rounded-2xl p-6 bg-white shadow-xl border border-slate-200/70">
       <div className="flex items-center justify-between mb-2">
         <h2 className="text-sm font-bold text-navy/70 uppercase tracking-wide">A/R Aging</h2>
         <Link href="/reports/ar-aging" className="text-xs font-semibold text-electric hover:underline">
@@ -343,7 +344,7 @@ function ArAgingCard({ aging }: { aging: DashboardInsights['arAging'] }) {
 function StatusCard({ d }: { d: DashboardInsights }) {
   const rec = d.lastReconciliation;
   return (
-    <div id="reminders" className="rounded-2xl p-6 bg-white shadow-xl border-b-4 border-navy space-y-4 scroll-mt-6">
+    <div id="reminders" className="rounded-2xl p-6 bg-white shadow-xl border border-slate-200/70 space-y-4 scroll-mt-6">
       <h2 className="text-sm font-bold text-navy/70 uppercase tracking-wide">Reminders</h2>
 
       <Link href="/bills" className="flex items-center gap-3 group">
@@ -397,7 +398,7 @@ function StatusCard({ d }: { d: DashboardInsights }) {
 
 function OverdueInvoicesCard({ d }: { d: DashboardInsights }) {
   return (
-    <div className="rounded-2xl p-6 bg-white shadow-xl border-b-4 border-electric lg:col-span-2">
+    <div className="rounded-2xl p-6 bg-white shadow-xl border border-slate-200/70 lg:col-span-2">
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-bold text-navy/70 uppercase tracking-wide">
           Overdue Invoices{' '}
@@ -438,7 +439,7 @@ function OverdueInvoicesCard({ d }: { d: DashboardInsights }) {
 
 function BillsDueCard({ d }: { d: DashboardInsights }) {
   return (
-    <div className="rounded-2xl p-6 bg-white shadow-xl border-b-4 border-gold">
+    <div className="rounded-2xl p-6 bg-white shadow-xl border border-slate-200/70">
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-bold text-navy/70 uppercase tracking-wide">
           Bills Due This Week{' '}

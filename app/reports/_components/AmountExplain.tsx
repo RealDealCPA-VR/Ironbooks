@@ -178,7 +178,7 @@ export default function AmountExplain({
           id={id}
           role="tooltip"
           style={{ position: 'fixed', left: pos.left, top: pos.top, transform: pos.above ? 'translateY(-100%)' : undefined }}
-          className="z-[60] w-72 rounded-xl bg-navy px-4 py-3 text-left text-xs font-normal normal-case tracking-normal leading-relaxed text-white shadow-xl print-hidden pointer-events-none"
+          className="z-[60] w-72 rounded-xl bg-contrast px-4 py-3 text-left text-xs font-normal normal-case tracking-normal leading-relaxed text-white shadow-xl print-hidden pointer-events-none"
         >
           <span className={`block ${tip.status === 'error' ? 'text-red-200' : 'text-white'}`}>{tip.text}</span>
           {tip.note && <span className="mt-1 block text-gold">{tip.note}</span>}

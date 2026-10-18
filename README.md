@@ -131,6 +131,9 @@ transactions · reminders · calendar · Lead Center · Doc Center · letters & 
 - **AI picks the account for a payee it has never seen**, from what your business does and,
   if you turn it on, a lookup of the vendor's name through your own SearXNG. It only suggests,
   and says why.
+- **Light, dark or auto, with your accent color.** A clean, Apple-style look: hairline borders,
+  soft shadows, one accent color. The desktop window follows too: no gray system frame, just a
+  title bar in the theme's colors with the menus in it. Printed forms always print on white.
 - **Keyboard first:** shortcuts everywhere (press `?`), and **Enter many transactions** at once in
   a grid with paste from Excel.
 - **Receipt capture:** drop a photo or PDF anywhere, or upload it from your phone over your

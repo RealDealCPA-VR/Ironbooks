@@ -144,7 +144,7 @@ export default function CompaniesPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Companies"
         icon={Building2}
@@ -174,8 +174,8 @@ export default function CompaniesPage() {
           {visible.map((c) => (
             <Card key={c.id} className="p-6 flex flex-col gap-3">
               <div className="flex items-start gap-3">
-                <div className="rounded-xl bg-navy h-10 w-10 shrink-0 flex items-center justify-center">
-                  <Building2 className="text-gold h-5 w-5" />
+                <div className="rounded-xl bg-gradient-to-b from-electric/85 to-electric h-10 w-10 shrink-0 flex items-center justify-center">
+                  <Building2 className="text-white h-5 w-5" />
                 </div>
                 <div className="min-w-0 flex-1">
                   {editingId === c.id ? (

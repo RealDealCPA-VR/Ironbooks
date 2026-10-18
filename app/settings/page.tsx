@@ -35,6 +35,7 @@ import {
   Lock,
   Mail,
   Package,
+  Palette,
   Percent,
   PieChart,
   Settings,
@@ -47,6 +48,7 @@ import {
   Wallet,
 } from 'lucide-react';
 import PreferencePane from './PreferencePane';
+import { AppearanceControls } from '@/components/AppearancePicker';
 import {
   Badge,
   Button,
@@ -190,6 +192,7 @@ const CUSTOM_FIELD_ENTITIES: Array<{ key: CustomFieldEntity; label: string }> = 
 const TABS = [
   { id: 'company', label: 'Company', icon: Building2 },
   { id: 'accounting', label: 'Accounting', icon: Calculator },
+  { id: 'appearance', label: 'Appearance', icon: Palette },
   { id: 'purchases', label: 'Bills', icon: Truck },
   { id: 'checking', label: 'Checking', icon: CreditCard },
   { id: 'general', label: 'General', icon: Settings },
@@ -532,7 +535,7 @@ export default function SettingsPage() {
   const activeTab = useMemo(() => TABS.find((t) => t.id === tab) ?? TABS[0], [tab]);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Preferences" icon={Settings} />
 
       {loading ? (
@@ -540,7 +543,7 @@ export default function SettingsPage() {
       ) : (
         <div className="flex gap-8 max-w-5xl items-start">
           {/* Tab rail (QBD Preferences category list) */}
-          <nav className="w-56 shrink-0 rounded-2xl bg-white/70 border border-slate-200 p-2 flex flex-col gap-1">
+          <nav className="w-56 shrink-0 rounded-2xl bg-white border border-slate-200/70 shadow-xl p-1.5 flex flex-col gap-0.5">
             {TABS.map((t) => {
               const Icon = t.icon;
               const active = t.id === tab;
@@ -549,8 +552,8 @@ export default function SettingsPage() {
                   key={t.id}
                   type="button"
                   onClick={() => setTab(t.id)}
-                  className={`flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-left text-sm font-medium transition-colors ${
-                    active ? 'bg-electric text-white shadow-sm' : 'text-navy/70 hover:bg-electric/10 hover:text-navy'
+                  className={`flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-sm transition-colors ${
+                    active ? 'bg-electric text-white font-medium' : 'text-navy/75 hover:bg-navy/[.05] hover:text-navy'
                   }`}
                 >
                   <Icon className="h-4 w-4 shrink-0" />
@@ -562,6 +565,18 @@ export default function SettingsPage() {
 
           {/* Active pane */}
           <div className="flex-1 flex flex-col gap-8 min-w-0">
+            {/* ── Appearance (this computer: light / dark / auto, accent color) ── */}
+            {tab === 'appearance' && (
+              <Card className="p-8">
+                <h2 className="text-lg font-bold text-navy mb-1">Appearance</h2>
+                <p className="text-sm text-navy/50 mb-6">
+                  How Ironbooks looks on this computer, the window frame included. Printed forms and
+                  reports always print on white.
+                </p>
+                <AppearanceControls />
+              </Card>
+            )}
+
             {/* ── Company ─────────────────────────────────────────────────── */}
             {tab === 'company' && (
               <Card className="p-8">

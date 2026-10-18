@@ -87,7 +87,7 @@ export default function ChangeItemPricesPage() {
   const previewById = new Map((preview ?? []).map((p) => [p.id, p]));
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Change Item Prices" icon={BadgeDollarSign} />
       <Card className="p-6">
         <div className="mb-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">

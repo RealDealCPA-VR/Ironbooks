@@ -456,7 +456,7 @@ export default function FixedAssetsPage() {
   const totalNBV = totalCost.minus(totalAccumulated);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans space-y-6">
+    <main className="min-h-screen bg-offwhite p-8 font-sans space-y-6">
       <PageHeader
         title="Fixed Assets"
         icon={Boxes}
@@ -472,15 +472,15 @@ export default function FixedAssetsPage() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card className="p-4 text-center">
           <p className="text-xs text-navy/50 mb-1">Total Cost</p>
-          <p className="text-2xl font-extrabold text-navy">{formatCurrency(totalCost)}</p>
+          <p className="text-2xl font-bold text-navy">{formatCurrency(totalCost)}</p>
         </Card>
         <Card className="p-4 text-center">
           <p className="text-xs text-navy/50 mb-1">Accumulated Depreciation</p>
-          <p className="text-2xl font-extrabold text-red-500">{formatCurrency(totalAccumulated)}</p>
+          <p className="text-2xl font-bold text-red-500">{formatCurrency(totalAccumulated)}</p>
         </Card>
         <Card className="p-4 text-center">
           <p className="text-xs text-navy/50 mb-1">Net Book Value</p>
-          <p className="text-2xl font-extrabold text-electric">{formatCurrency(totalNBV)}</p>
+          <p className="text-2xl font-bold text-electric">{formatCurrency(totalNBV)}</p>
         </Card>
       </div>
 

@@ -216,7 +216,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-40 flex justify-end" role="dialog" aria-modal="true" aria-label="Bookkeeping assistant">
-      <div className="absolute inset-0 bg-navy/20" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/20" onClick={onClose} />
       <div className="relative z-10 h-full w-full max-w-md bg-white shadow-2xl border-l border-slate-100 flex flex-col">
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100">
           <div className="flex items-center gap-2">

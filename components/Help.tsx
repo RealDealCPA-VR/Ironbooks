@@ -115,7 +115,7 @@ export function Help({
           id={id}
           role="tooltip"
           className={cn(
-            'absolute left-1/2 z-[60] w-72 max-w-[80vw] -translate-x-1/2 rounded-xl bg-navy px-4 py-3 text-left text-xs font-normal normal-case tracking-normal leading-relaxed text-white shadow-xl',
+            'absolute left-1/2 z-[60] w-72 max-w-[80vw] -translate-x-1/2 rounded-xl bg-contrast px-4 py-3 text-left text-xs font-normal normal-case tracking-normal leading-relaxed text-white shadow-xl',
             side === 'top' ? 'bottom-full mb-2' : 'top-full mt-2',
           )}
         >

@@ -149,7 +149,7 @@ export default function LettersPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Letters & Labels" icon={Mail} />
       <div className="grid gap-6 xl:grid-cols-2">
         <Card className="p-6">

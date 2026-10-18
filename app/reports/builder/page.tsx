@@ -210,7 +210,7 @@ export default function ReportBuilderPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Custom Report Builder"
         icon={Wrench}
@@ -396,7 +396,7 @@ export default function ReportBuilderPage() {
               </tbody>
               <tfoot>
                 <tr className="border-t-2 border-navy/20 bg-slate-50">
-                  <td className="py-3 px-4 font-extrabold text-navy">Totals</td>
+                  <td className="py-3 px-4 font-bold text-navy">Totals</td>
                   <td className="py-3 px-4 text-right tabular-nums font-bold text-navy">
                     {formatCurrency(result.totals.debit)}
                   </td>
@@ -404,7 +404,7 @@ export default function ReportBuilderPage() {
                     {formatCurrency(result.totals.credit)}
                   </td>
                   <td
-                    className={`py-3 px-4 text-right tabular-nums font-extrabold text-lg ${
+                    className={`py-3 px-4 text-right tabular-nums font-bold text-lg ${
                       Number(result.totals.net) < 0 ? 'text-red-600' : 'text-emerald'
                     }`}
                   >

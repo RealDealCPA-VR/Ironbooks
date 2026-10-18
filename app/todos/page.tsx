@@ -217,7 +217,7 @@ export default function TodoListPage() {
   const userName = (id: string | null) => (id ? (users.find((u) => u.id === id)?.label ?? '') : '');
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="To Do list"
         icon={ClipboardCheck}

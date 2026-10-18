@@ -188,7 +188,7 @@ export default function PreferenceBehaviors() {
   return (
     <div
       role="status"
-      className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-xl bg-navy px-4 py-2 text-sm text-white shadow-lg"
+      className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-xl bg-contrast px-4 py-2 text-sm text-white shadow-lg"
     >
       Your data changed since this report was opened.
       <button

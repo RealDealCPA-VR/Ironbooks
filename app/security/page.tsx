@@ -82,7 +82,7 @@ export default function SecurityPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Security" icon={ShieldCheck} />
       <Card className="p-6 max-w-xl">
         <h2 className="text-lg font-bold text-navy mb-1">Two-Factor Authentication (TOTP)</h2>

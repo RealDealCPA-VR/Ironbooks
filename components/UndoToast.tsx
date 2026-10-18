@@ -121,7 +121,7 @@ export default function UndoToast() {
           <div
             key={u.token}
             role="status"
-            className="flex items-center gap-3 rounded-lg bg-navy px-4 py-3 text-sm text-white shadow-lg"
+            className="flex items-center gap-3 rounded-xl bg-contrast px-4 py-3 text-sm text-white shadow-lg"
           >
             <span className="flex-1 min-w-0 truncate" title={u.message}>
               {u.message}

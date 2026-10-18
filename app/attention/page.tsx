@@ -15,7 +15,7 @@ export default async function AttentionPage() {
   const ctx = await getPageContext('/attention');
   const data = await getAttention(ctx);
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Needs attention" iconNode={<Inbox className="text-electric h-8 w-8" aria-hidden="true" />} />
       <AttentionInbox initial={data} />
     </main>

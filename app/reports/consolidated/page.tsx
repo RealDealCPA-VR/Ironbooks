@@ -167,7 +167,7 @@ function PLTable({ data }: { data: ConsolidatedPL }) {
           />
         </tbody>
         <tfoot>
-          <tr className="border-t-2 border-navy/30 text-base font-extrabold">
+          <tr className="border-t-2 border-navy/30 text-base font-bold">
             <td className="py-3 px-3 text-navy">Net Income</td>
             {companies.map((c) => {
               const net = parseFloat(c.report.netIncome);
@@ -330,7 +330,7 @@ function BSTable({ data }: { data: ConsolidatedBS }) {
               {formatCurrency(consolidated.retainedEarnings)}
             </td>
           </tr>
-          <tr className="border-t-2 border-navy/30 text-base font-extrabold">
+          <tr className="border-t-2 border-navy/30 text-base font-bold">
             <td className="py-3 px-3 text-navy">Total Equity (incl. retained earnings)</td>
             {companies.map((c) => (
               <td key={c.companyId} className="py-3 px-3 text-right tabular-nums text-navy">
@@ -404,7 +404,7 @@ export default function ConsolidatedReportPage() {
     reportType === 'pl' ? (plData?.companies.length ?? 0) : (bsData?.companies.length ?? 0);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <nav aria-label="More combined reports" className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-sm print-hidden">
         <span className="text-navy/50">More combined reports:</span>
         <Link className="text-electric hover:underline" href="/reports/std/combined-trial-balance">Trial Balance</Link>

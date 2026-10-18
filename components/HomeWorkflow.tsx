@@ -59,13 +59,13 @@ const ICONS: Record<WorkflowIcon, ComponentType<{ className?: string }>> = {
   employees: UserSquare,
 };
 
-/** Section accent colours (brand palette). */
+/** Section accent colours (brand palette): a small dot beside each section title. */
 const ACCENT: Record<WorkflowSection['id'], string> = {
-  vendors: 'border-gold',
-  customers: 'border-electric',
-  employees: 'border-emerald',
-  company: 'border-navy',
-  banking: 'border-electric',
+  vendors: 'bg-gold',
+  customers: 'bg-electric',
+  employees: 'bg-emerald',
+  company: 'bg-navy/50',
+  banking: 'bg-electric',
 };
 
 function StepTile({ step, index, total }: { step: WorkflowStep; index?: number; total?: number }) {
@@ -124,10 +124,11 @@ function Section({ section }: { section: WorkflowSection }) {
   return (
     <section
       aria-labelledby={headingId}
-      className={`rounded-2xl border-l-4 ${ACCENT[section.id]} bg-white p-5 shadow-xl`}
+      className="rounded-2xl border border-slate-200/70 bg-white p-5 shadow-xl"
     >
       <div className="mb-3 flex items-center justify-between gap-2">
-        <h2 id={headingId} className="text-sm font-bold uppercase tracking-wide text-navy/70">
+        <h2 id={headingId} className="flex items-center gap-2 text-[15px] font-semibold text-navy">
+          <span aria-hidden="true" className={`h-2 w-2 rounded-full ${ACCENT[section.id]}`} />
           {section.title}
         </h2>
         <Link
@@ -159,7 +160,7 @@ function Section({ section }: { section: WorkflowSection }) {
 
 function AccountBalancesPanel({ rows }: { rows: AccountBalanceRow[] }) {
   return (
-    <section aria-labelledby="home-balances" className="rounded-2xl border-l-4 border-emerald bg-white p-5 shadow-xl">
+    <section aria-labelledby="home-balances" className="rounded-2xl border border-slate-200/70 bg-white p-5 shadow-xl">
       <div className="mb-3 flex items-center justify-between">
         <h2 id="home-balances" className="text-sm font-bold uppercase tracking-wide text-navy/70">
           Account Balances

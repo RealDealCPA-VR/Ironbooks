@@ -376,7 +376,7 @@ export default function ReviewReceiptPage() {
                           value={k.value}
                           checked={kind === k.value}
                           onChange={() => setKind(k.value)}
-                          className="mr-2 accent-[#2563eb]"
+                          className="mr-2 accent-electric"
                         />
                         <span className="font-semibold text-navy">{k.label}</span>
                         <span className="block pl-5 text-xs text-navy/50">{k.hint}</span>

@@ -52,14 +52,14 @@ export default function PortalPage() {
   if (!me) return null;
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <div className="flex items-center justify-between mb-8 max-w-3xl">
         <div className="flex items-center gap-3">
           <div className="rounded-xl bg-emerald h-12 w-12 flex items-center justify-center">
             <UserSquare className="text-white h-6 w-6" />
           </div>
           <div>
-            <h1 className="text-2xl font-extrabold text-navy">{me.employee.name}</h1>
+            <h1 className="text-2xl font-bold text-navy">{me.employee.name}</h1>
             <p className="text-sm text-navy/50">{me.employee.email}</p>
           </div>
         </div>

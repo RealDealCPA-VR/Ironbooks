@@ -336,7 +336,7 @@ export default function BatchEnterPage() {
   return (
     <main
       data-shortcut-scope
-      className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans"
+      className="min-h-screen bg-offwhite p-8 font-sans"
     >
       <BackToCenter />
       <PageHeader title="Enter Batch Transactions" icon={Rows3} />

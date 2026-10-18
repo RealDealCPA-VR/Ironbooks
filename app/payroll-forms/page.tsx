@@ -138,7 +138,7 @@ export default function PayrollFormsPage() {
   // ---------------------------------------------------------------------------
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Payroll Tax Forms" icon={ClipboardList} />
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6 max-w-3xl">

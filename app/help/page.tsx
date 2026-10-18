@@ -100,10 +100,10 @@ const GUIDES: Guide[] = [
 
 export default function HelpPage() {
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       {/* Server component: render the header inline (PageHeader is a client component and
           component-typed props like `icon` cannot cross the server/client boundary). */}
-      <h1 className="mb-6 flex items-center gap-3 text-3xl font-extrabold text-navy">
+      <h1 className="mb-6 flex items-center gap-3 text-3xl font-bold text-navy">
         <LifeBuoy className="h-8 w-8 text-electric" aria-hidden="true" />
         Help &amp; Glossary
       </h1>
@@ -114,7 +114,7 @@ export default function HelpPage() {
       </p>
 
       <section aria-labelledby="guides" className="mb-10">
-        <h2 id="guides" className="mb-4 flex items-center gap-2 text-xl font-extrabold text-navy">
+        <h2 id="guides" className="mb-4 flex items-center gap-2 text-xl font-bold text-navy">
           <Wrench className="h-5 w-5 text-electric" aria-hidden="true" /> How do I…
         </h2>
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -140,7 +140,7 @@ export default function HelpPage() {
       </section>
 
       <section aria-labelledby="glossary">
-        <h2 id="glossary" className="mb-4 flex items-center gap-2 text-xl font-extrabold text-navy">
+        <h2 id="glossary" className="mb-4 flex items-center gap-2 text-xl font-bold text-navy">
           <BookOpenCheck className="h-5 w-5 text-electric" aria-hidden="true" /> Glossary
         </h2>
         <dl className="grid grid-cols-1 gap-4 md:grid-cols-2">

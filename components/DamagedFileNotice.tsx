@@ -8,9 +8,9 @@ import { AlertTriangle } from 'lucide-react';
 export default function DamagedFileNotice({ problems = [] }: { problems?: string[] }) {
   return (
     <main className="min-h-[60vh] flex items-center justify-center p-8 font-sans">
-      <div className="max-w-xl w-full rounded-2xl bg-white shadow-xl border-b-4 border-red-500 p-8">
+      <div className="max-w-xl w-full rounded-2xl bg-white shadow-xl border border-slate-200/70 p-8">
         <AlertTriangle className="mx-auto h-12 w-12 text-red-500" />
-        <h1 className="mt-4 text-2xl font-extrabold text-navy text-center">
+        <h1 className="mt-4 text-2xl font-bold text-navy text-center">
           This company file is damaged
         </h1>
         <p className="mt-3 text-sm text-navy/70">

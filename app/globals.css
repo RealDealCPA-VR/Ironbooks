@@ -3,15 +3,282 @@
 @tailwind utilities;
 
 /*
- * Brand palette (navy / electric / emerald / gold / offwhite) is defined ONCE in
- * tailwind.config.ts. Use Tailwind utilities (bg-navy, text-electric, shadow-xl, ...)
- * — no manual color/utility re-declarations in this file. No !important anywhere.
+ * Themes. Every brand color in tailwind.config.ts (navy / electric / emerald / gold / offwhite,
+ * plus the slate / red / amber / yellow scales and bg-white) reads one of these variables, so
+ * pages keep using bg-white, text-navy, border-slate-200 ... and follow the theme for free.
+ * Values are space-separated RGB channels so Tailwind's /opacity modifiers keep working.
+ *
+ *   data-theme  = light | dark | system   (system follows the computer)
+ *   data-accent = blue | purple | pink | red | orange | green | teal | graphite
+ *
+ * Set on <html> before the first paint by THEME_BOOT_SCRIPT (lib/theme.ts). When changing
+ * --chrome, --ink or --canvas, change WINDOW_COLORS in lib/theme.ts too (the desktop title bar).
  */
-
 @layer base {
+  /* .theme-light: wrap a preview of paper (a check, an invoice template) to keep it light. */
+  :root,
+  .theme-light {
+    color-scheme: light;
+    /* Text, surfaces */
+    --ink: 29 29 31; /* text-navy: primary text */
+    --canvas: 245 245 247; /* bg-offwhite: behind cards */
+    --surface: 255 255 255; /* bg-white: cards, inputs, menus */
+    --chrome: 236 236 240; /* title bar + sidebar */
+    --contrast: 29 29 31; /* bg-contrast: tooltips, dark chips; white text stays readable */
+    --success: 36 138 61;
+    --gold: 191 140 40;
+    /* Neutral scale (Apple system grays), used through slate-* */
+    --slate-50: 248 248 250;
+    --slate-100: 236 236 240;
+    --slate-200: 222 222 227;
+    --slate-300: 199 199 204;
+    --slate-400: 161 161 166;
+    --slate-500: 134 134 139;
+    --slate-600: 110 110 115;
+    --slate-700: 81 81 84;
+    --slate-800: 58 58 60;
+    --slate-900: 29 29 31;
+    --slate-950: 17 17 19;
+    --red-50: 255 242 241;
+    --red-100: 255 226 224;
+    --red-200: 255 199 195;
+    --red-300: 255 160 153;
+    --red-400: 255 105 97;
+    --red-500: 240 56 46;
+    --red-600: 215 0 21;
+    --red-700: 180 20 28;
+    --red-800: 148 24 30;
+    --red-900: 122 26 30;
+    --red-950: 66 8 10;
+    --amber-50: 255 248 235;
+    --amber-100: 255 238 204;
+    --amber-200: 255 221 153;
+    --amber-300: 255 199 92;
+    --amber-400: 255 176 32;
+    --amber-500: 245 150 10;
+    --amber-600: 201 110 0;
+    --amber-700: 160 82 6;
+    --amber-800: 130 64 12;
+    --amber-900: 107 53 14;
+    --amber-950: 62 28 4;
+    --yellow-50: 255 252 232;
+    --yellow-100: 255 247 196;
+    --yellow-200: 255 238 140;
+    --yellow-300: 255 224 80;
+    --yellow-400: 250 204 21;
+    --yellow-500: 230 180 0;
+    --yellow-600: 180 135 0;
+    --yellow-700: 140 100 4;
+    --yellow-800: 112 78 10;
+    --yellow-900: 94 64 14;
+    --yellow-950: 54 34 4;
+    /* Elevation: a hairline plus a soft, wide shadow */
+    --shadow-color: 0 0 0;
+    --shadow-sm: 0 1px 2px rgb(var(--shadow-color) / 0.05);
+    --shadow: 0 1px 2px rgb(var(--shadow-color) / 0.06), 0 1px 3px rgb(var(--shadow-color) / 0.04);
+    --shadow-md: 0 2px 6px rgb(var(--shadow-color) / 0.06), 0 1px 2px rgb(var(--shadow-color) / 0.04);
+    --shadow-lg: 0 8px 24px rgb(var(--shadow-color) / 0.08), 0 2px 6px rgb(var(--shadow-color) / 0.04);
+    --shadow-xl: 0 1px 2px rgb(var(--shadow-color) / 0.04), 0 4px 16px rgb(var(--shadow-color) / 0.05);
+    --shadow-2xl: 0 24px 64px rgb(var(--shadow-color) / 0.18), 0 4px 16px rgb(var(--shadow-color) / 0.06);
+  }
+  :root {
+    --titlebar-h: 0px;
+  }
+
+  /* Accents: light values here, brighter dark-mode values below. */
+  :root,
+  [data-accent='blue'] { --accent: 0 113 227; }
+  [data-accent='purple'] { --accent: 137 68 171; }
+  [data-accent='pink'] { --accent: 214 40 98; }
+  [data-accent='red'] { --accent: 215 0 21; }
+  [data-accent='orange'] { --accent: 201 82 0; }
+  [data-accent='green'] { --accent: 36 138 61; }
+  [data-accent='teal'] { --accent: 0 149 255; }
+  [data-accent='graphite'] { --accent: 99 99 104; }
+
+  /* Dark. The same block twice: chosen outright, or chosen by the computer under "Auto". */
+  [data-theme='dark'] {
+    color-scheme: dark;
+    --ink: 245 245 247;
+    --canvas: 18 18 20;
+    --surface: 30 30 32;
+    --chrome: 40 40 43;
+    --contrast: 72 72 76;
+    --success: 48 209 88;
+    --gold: 230 184 80;
+    --slate-50: 38 38 41;
+    --slate-100: 48 48 51;
+    --slate-200: 62 62 66;
+    --slate-300: 80 80 84;
+    --slate-400: 112 112 117;
+    --slate-500: 142 142 147;
+    --slate-600: 174 174 178;
+    --slate-700: 199 199 204;
+    --slate-800: 216 216 220;
+    --slate-900: 235 235 240;
+    --slate-950: 245 245 247;
+    --red-50: 52 22 22;
+    --red-100: 70 28 27;
+    --red-200: 102 38 36;
+    --red-300: 140 50 46;
+    --red-400: 220 80 72;
+    --red-500: 255 69 58;
+    --red-600: 255 105 97;
+    --red-700: 255 138 128;
+    --red-800: 255 176 168;
+    --red-900: 255 208 203;
+    --red-950: 255 232 230;
+    --amber-50: 48 34 14;
+    --amber-100: 64 44 16;
+    --amber-200: 92 62 20;
+    --amber-300: 128 86 24;
+    --amber-400: 200 132 24;
+    --amber-500: 255 159 10;
+    --amber-600: 255 179 64;
+    --amber-700: 255 196 110;
+    --amber-800: 255 214 150;
+    --amber-900: 255 230 190;
+    --amber-950: 255 242 220;
+    --yellow-50: 46 40 12;
+    --yellow-100: 60 52 14;
+    --yellow-200: 88 76 18;
+    --yellow-300: 122 104 22;
+    --yellow-400: 200 170 20;
+    --yellow-500: 255 214 10;
+    --yellow-600: 255 224 70;
+    --yellow-700: 255 232 120;
+    --yellow-800: 255 238 160;
+    --yellow-900: 255 244 196;
+    --yellow-950: 255 250 225;
+    --shadow-sm: 0 1px 2px rgb(var(--shadow-color) / 0.3);
+    --shadow: 0 1px 3px rgb(var(--shadow-color) / 0.35);
+    --shadow-md: 0 2px 8px rgb(var(--shadow-color) / 0.35);
+    --shadow-lg: 0 10px 30px rgb(var(--shadow-color) / 0.45);
+    --shadow-xl: 0 1px 2px rgb(var(--shadow-color) / 0.3), 0 6px 20px rgb(var(--shadow-color) / 0.25);
+    --shadow-2xl: 0 24px 72px rgb(var(--shadow-color) / 0.6), 0 0 0 1px rgb(255 255 255 / 0.06);
+  }
+  [data-theme='dark'][data-accent='blue'],
+  [data-theme='dark']:not([data-accent]) { --accent: 10 132 255; }
+  [data-theme='dark'][data-accent='purple'] { --accent: 191 90 242; }
+  [data-theme='dark'][data-accent='pink'] { --accent: 255 55 95; }
+  [data-theme='dark'][data-accent='red'] { --accent: 255 69 58; }
+  [data-theme='dark'][data-accent='orange'] { --accent: 255 159 10; }
+  [data-theme='dark'][data-accent='green'] { --accent: 48 209 88; }
+  [data-theme='dark'][data-accent='teal'] { --accent: 64 170 255; }
+  [data-theme='dark'][data-accent='graphite'] { --accent: 152 152 157; }
+
+  @media (prefers-color-scheme: dark) {
+    [data-theme='system'] {
+      color-scheme: dark;
+      --ink: 245 245 247;
+      --canvas: 18 18 20;
+      --surface: 30 30 32;
+      --chrome: 40 40 43;
+      --contrast: 72 72 76;
+      --success: 48 209 88;
+      --gold: 230 184 80;
+      --slate-50: 38 38 41;
+      --slate-100: 48 48 51;
+      --slate-200: 62 62 66;
+      --slate-300: 80 80 84;
+      --slate-400: 112 112 117;
+      --slate-500: 142 142 147;
+      --slate-600: 174 174 178;
+      --slate-700: 199 199 204;
+      --slate-800: 216 216 220;
+      --slate-900: 235 235 240;
+      --slate-950: 245 245 247;
+      --red-50: 52 22 22;
+      --red-100: 70 28 27;
+      --red-200: 102 38 36;
+      --red-300: 140 50 46;
+      --red-400: 220 80 72;
+      --red-500: 255 69 58;
+      --red-600: 255 105 97;
+      --red-700: 255 138 128;
+      --red-800: 255 176 168;
+      --red-900: 255 208 203;
+      --red-950: 255 232 230;
+      --amber-50: 48 34 14;
+      --amber-100: 64 44 16;
+      --amber-200: 92 62 20;
+      --amber-300: 128 86 24;
+      --amber-400: 200 132 24;
+      --amber-500: 255 159 10;
+      --amber-600: 255 179 64;
+      --amber-700: 255 196 110;
+      --amber-800: 255 214 150;
+      --amber-900: 255 230 190;
+      --amber-950: 255 242 220;
+      --yellow-50: 46 40 12;
+      --yellow-100: 60 52 14;
+      --yellow-200: 88 76 18;
+      --yellow-300: 122 104 22;
+      --yellow-400: 200 170 20;
+      --yellow-500: 255 214 10;
+      --yellow-600: 255 224 70;
+      --yellow-700: 255 232 120;
+      --yellow-800: 255 238 160;
+      --yellow-900: 255 244 196;
+      --yellow-950: 255 250 225;
+      --shadow-sm: 0 1px 2px rgb(var(--shadow-color) / 0.3);
+      --shadow: 0 1px 3px rgb(var(--shadow-color) / 0.35);
+      --shadow-md: 0 2px 8px rgb(var(--shadow-color) / 0.35);
+      --shadow-lg: 0 10px 30px rgb(var(--shadow-color) / 0.45);
+      --shadow-xl: 0 1px 2px rgb(var(--shadow-color) / 0.3), 0 6px 20px rgb(var(--shadow-color) / 0.25);
+      --shadow-2xl: 0 24px 72px rgb(var(--shadow-color) / 0.6), 0 0 0 1px rgb(255 255 255 / 0.06);
+    }
+    [data-theme='system'][data-accent='blue'] { --accent: 10 132 255; }
+    [data-theme='system'][data-accent='purple'] { --accent: 191 90 242; }
+    [data-theme='system'][data-accent='pink'] { --accent: 255 55 95; }
+    [data-theme='system'][data-accent='red'] { --accent: 255 69 58; }
+    [data-theme='system'][data-accent='orange'] { --accent: 255 159 10; }
+    [data-theme='system'][data-accent='green'] { --accent: 48 209 88; }
+    [data-theme='system'][data-accent='teal'] { --accent: 64 170 255; }
+    [data-theme='system'][data-accent='graphite'] { --accent: 152 152 157; }
+  }
+
+  /* Paper is white: printed checks, reports and forms always use the light colors. */
+  @media print {
+    :root[data-theme] {
+      color-scheme: light;
+      --ink: 29 29 31;
+      --canvas: 255 255 255;
+      --surface: 255 255 255;
+      --chrome: 255 255 255;
+      --slate-50: 248 248 250;
+      --slate-100: 236 236 240;
+      --slate-200: 222 222 227;
+      --slate-300: 199 199 204;
+      --slate-400: 161 161 166;
+      --slate-500: 134 134 139;
+      --slate-600: 110 110 115;
+      --slate-700: 81 81 84;
+      --slate-800: 58 58 60;
+      --slate-900: 29 29 31;
+      --red-600: 215 0 21;
+      --red-700: 180 20 28;
+      --success: 36 138 61;
+      --accent: 0 113 227;
+      --shadow-xl: none;
+      --shadow-lg: none;
+    }
+  }
+
+  /* The desktop window has no system frame; the app draws its own title bar (WindowTitleBar). */
+  html[data-desktop] {
+    --titlebar-h: env(titlebar-area-height, 36px);
+  }
+  html[data-desktop='darwin'] {
+    --titlebar-h: 36px;
+  }
+
   html,
   body {
     @apply min-h-screen bg-offwhite text-navy antialiased;
+  }
+  body {
+    font-feature-settings: 'cv11', 'ss01';
   }
 
   h1,
@@ -19,34 +286,59 @@
   h3,
   h4,
   h5 {
-    @apply font-bold tracking-tight;
+    @apply font-semibold tracking-tight;
   }
 
   /* Consistent, visible keyboard focus app-wide. Kit components opt into ring
      styles via `outline-none focus-visible:ring-*`, which overrides this. */
   :focus-visible {
-    outline: 2px solid theme("colors.electric");
+    outline: 2px solid rgb(var(--accent) / 0.6);
     outline-offset: 2px;
+  }
+
+  ::selection {
+    background: rgb(var(--accent) / 0.22);
+  }
+
+  /* Native checkboxes, radios and range sliders take the accent color. */
+  input[type='checkbox'],
+  input[type='radio'],
+  input[type='range'],
+  progress {
+    accent-color: rgb(var(--accent));
   }
 
   /* Subtle scrollbars */
   ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+    width: 10px;
+    height: 10px;
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: rgba(13, 27, 42, 0.2);
+    background: rgb(var(--ink) / 0.18);
     border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: rgba(13, 27, 42, 0.35);
+    background: rgb(var(--ink) / 0.32);
+    background-clip: padding-box;
   }
   * {
     scrollbar-width: thin;
-    scrollbar-color: rgba(13, 27, 42, 0.2) transparent;
+    scrollbar-color: rgb(var(--ink) / 0.2) transparent;
+  }
+}
+
+@layer components {
+  /* Window drag regions for the desktop title bar. */
+  .app-drag {
+    -webkit-app-region: drag;
+  }
+  .app-no-drag {
+    -webkit-app-region: no-drag;
   }
 }
 
@@ -66,5 +358,15 @@
   .grid-cols-3,
   .grid-cols-5 {
     grid-template-columns: repeat(1, minmax(0, 1fr));
+  }
+}
+
+/* The desktop title bar is window chrome, not part of a printed page. */
+@media print {
+  html[data-desktop] {
+    --titlebar-h: 0px;
+  }
+  html[data-desktop] .ib-titlebar {
+    display: none;
   }
 }

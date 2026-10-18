@@ -219,7 +219,7 @@ export default function GraphsPage() {
   const totals = useMemo(() => data?.series.map((s) => s.values.reduce((a, b) => a + b, 0)) ?? [], [data]);
 
   return (
-    <main className="viz-root min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="viz-root min-h-screen bg-offwhite p-8 font-sans">
       <style>{`
         .viz-root { --viz-surface:#fcfcfb; --viz-grid:#e5e7eb; --viz-axis:#9ca3af; --viz-muted:#52514e; --viz-s1:#2a78d6; --viz-s2:#eb6834; --viz-s3:#1baf7a; }
         @media (prefers-color-scheme: dark) { :root:where(:not([data-theme="light"])) .viz-root { --viz-surface:#1a1a19; --viz-grid:#3a3a38; --viz-axis:#6b6b68; --viz-muted:#c3c2b7; --viz-s1:#3987e5; --viz-s2:#d95926; --viz-s3:#199e70; } }

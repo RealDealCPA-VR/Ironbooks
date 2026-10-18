@@ -49,7 +49,7 @@ export default async function AccountantCenterPage() {
   const s = await accountantCenterSummary(ctx);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Accountant Center" iconNode={<Briefcase className="text-electric h-8 w-8" />} />
 
       <div className="grid gap-4 md:grid-cols-4 mb-6">

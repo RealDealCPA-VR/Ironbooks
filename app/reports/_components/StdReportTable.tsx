@@ -116,7 +116,7 @@ export default function StdReportTable({
       case 'total':
         return 'font-bold text-navy border-t border-navy/25 bg-navy/[0.03]';
       case 'grand':
-        return 'font-extrabold text-navy border-t-2 border-navy/40 bg-navy/5';
+        return 'font-bold text-navy border-t-2 border-navy/40 bg-navy/5';
       default:
         return 'text-navy/90 hover:bg-electric/5';
     }

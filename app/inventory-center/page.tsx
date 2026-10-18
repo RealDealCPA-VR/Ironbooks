@@ -96,7 +96,7 @@ export default function InventoryCenterPage() {
   const totalValue = useMemo(() => rows.reduce((s, r) => s + Number(r.value), 0), [rows]);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Inventory Center" icon={Warehouse} />
       <div className="flex flex-col gap-6 xl:flex-row">
         <Card className="p-4 xl:w-[28rem] shrink-0">

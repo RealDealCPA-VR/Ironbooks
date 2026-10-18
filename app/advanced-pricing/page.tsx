@@ -1263,7 +1263,7 @@ export default function AdvancedPricingPage() {
   ];
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Advanced Pricing" icon={BadgePercent} />
       {!settings.enabled && !loading && (
         <div className="mb-4 rounded-lg border border-gold/40 bg-gold/10 px-4 py-2 text-sm text-yellow-800">

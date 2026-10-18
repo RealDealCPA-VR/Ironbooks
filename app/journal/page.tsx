@@ -881,7 +881,7 @@ function JournalPageContent() {
   // Entry dates are calendar days (UTC midnight from the API): lib/format.ts formatDate shows
   // the day they name ("Jun 9, 2026"), not the day before in US time zones.
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Journal Entries"
         icon={NotebookPen}

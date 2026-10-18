@@ -301,7 +301,7 @@ export default function InventoryValuationPage() {
   ];
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Inventory Valuation"
         icon={Layers3}
@@ -329,7 +329,7 @@ export default function InventoryValuationPage() {
             onClick={() => setTab(t.id)}
             className={`flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
               tab === t.id
-                ? 'bg-navy text-white shadow'
+                ? 'bg-electric text-white shadow-sm'
                 : 'bg-white/70 text-navy/60 hover:bg-white hover:text-navy'
             }`}
           >

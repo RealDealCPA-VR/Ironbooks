@@ -95,7 +95,7 @@ export default function MobileReceiptUploadPage() {
   return (
     <main className="min-h-screen bg-offwhite px-4 py-6 text-navy">
       <div className="mx-auto max-w-md">
-        <h1 className="mb-1 flex items-center gap-2 text-2xl font-extrabold">
+        <h1 className="mb-1 flex items-center gap-2 text-2xl font-bold">
           <Receipt className="h-7 w-7 text-electric" aria-hidden="true" /> Send receipts
         </h1>
         {status && !problem && (

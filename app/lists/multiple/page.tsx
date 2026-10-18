@@ -154,7 +154,7 @@ export default function AddEditMultiplePage() {
   }, [errors]);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Add/Edit Multiple List Entries" icon={Table2} />
       <Card className="p-6">
         <div className="mb-4 flex flex-wrap items-end gap-4">

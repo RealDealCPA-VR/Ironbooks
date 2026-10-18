@@ -86,7 +86,7 @@ export default function PivotPage() {
   const t = report ? reportToTable(report) : null;
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Advanced Reporting" icon={Grid3x3} />
       <p className="text-sm text-navy/60 -mt-4 mb-4">
         Build a summary table from your own books: choose rows, columns and what to total. Click any number to see the transactions behind it.

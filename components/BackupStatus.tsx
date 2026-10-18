@@ -143,7 +143,7 @@ export function BackupWarningBanner() {
       <p className="flex-1 min-w-[12rem]">{bannerText(status)}</p>
       <Link
         href="/backup"
-        className="rounded-lg bg-navy px-3 py-1.5 font-semibold text-white hover:bg-navy/90 outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+        className="rounded-lg bg-contrast px-3 py-1.5 font-semibold text-white hover:bg-contrast/90 outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
       >
         Back up now
       </Link>

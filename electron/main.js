@@ -7,7 +7,7 @@
 // The active company file is a local data directory; we set BKA_DATA_DIR before starting the
 // server so lib/db persists there. This keeps all financial data on the user's machine (offline).
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell, session } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session } = require('electron');
 
 // --- legacy userData location (product rename BookKeeper AI -> Ironbooks) ---
 // Electron derives app.getPath('userData') from the app name: build.productName for packaged
@@ -37,6 +37,7 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, shell, session } = require('e
 })();
 const { buildSectionMenus } = require('./menuRoutes');
 const spelling = require('./spelling');
+const windowTheme = require('./windowTheme');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -911,6 +912,10 @@ async function createWindow() {
   // on any connected display (e.g. an unplugged external monitor).
   const state = loadWindowState();
   const usePosition = state && boundsVisible(state);
+  // Appearance (light / dark / auto): the window has no system frame and paints its title bar
+  // and background in the theme's colors from the first frame (electron/windowTheme.js).
+  const theme = windowTheme.normalizeTheme(loadConfig().theme);
+  nativeTheme.themeSource = theme.mode;
   mainWindow = new BrowserWindow({
     width: state ? state.width : 1440,
     height: state ? state.height : 900,
@@ -918,7 +923,7 @@ async function createWindow() {
     minWidth: 1024,
     minHeight: 700,
     title: 'Ironbooks',
-    backgroundColor: '#0b1f3a',
+    ...windowTheme.frameOptions(process.platform, nativeTheme.shouldUseDarkColors),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -934,6 +939,13 @@ async function createWindow() {
   });
   if (state?.maximized) mainWindow.maximize();
   trackWindowState(mainWindow);
+  // The page reads its theme from a cookie; hand it the saved one so the first paint matches
+  // the frame (the local server's port, and so its origin, changes every launch).
+  try {
+    await session.defaultSession.cookies.set(windowTheme.themeCookie(url, theme));
+  } catch (err) {
+    console.error('[theme] could not set the theme cookie:', err?.message || err);
+  }
   spelling.attachContextMenu(mainWindow, Menu);
 
   if (remoteHostOrigin) {
@@ -1088,6 +1100,60 @@ function scheduleBackgroundJobs(url) {
 app.on('before-quit', () => {
   if (scheduledReportsTimer) clearInterval(scheduledReportsTimer);
   if (recurringTimer) clearInterval(recurringTimer);
+});
+
+// --- Window frame: theme colors and the in-page menu bar (components/WindowTitleBar.tsx) ---
+
+/** Paint the title bar, window controls and background for the current light/dark state. */
+function applyWindowTheme() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const dark = nativeTheme.shouldUseDarkColors;
+  mainWindow.setBackgroundColor(windowTheme.WINDOW_COLORS[dark ? 'dark' : 'light'].background);
+  if (process.platform !== 'darwin') {
+    try {
+      mainWindow.setTitleBarOverlay(windowTheme.overlayFor(dark));
+    } catch {
+      /* window without an overlay */
+    }
+  }
+}
+// "Auto" follows the computer: repaint when Windows / macOS switches between light and dark.
+nativeTheme.on('updated', applyWindowTheme);
+
+// Asked once by the preload, synchronously, so the page knows before it paints whether it must
+// draw its own title bar. Only the main window is frameless.
+ipcMain.on('chrome:info', (e) => {
+  e.returnValue = {
+    frameless: Boolean(mainWindow && e.sender === mainWindow.webContents),
+    platform: process.platform,
+  };
+});
+
+ipcMain.handle('chrome:theme', (e, raw) => {
+  if (!fromAppOrigin(e)) return false;
+  const theme = windowTheme.normalizeTheme(raw);
+  saveConfig({ theme });
+  nativeTheme.themeSource = theme.mode; // fires 'updated' when the light/dark state changes
+  applyWindowTheme();
+  return true;
+});
+
+// The application menu is not shown as a bar (the window has no frame); the page lists its
+// top-level labels in the title bar and opens each one as a native popup.
+ipcMain.handle('chrome:menus', (e) => (fromAppOrigin(e) ? windowTheme.menuLabels(Menu.getApplicationMenu()) : []));
+ipcMain.handle('chrome:popupMenu', (e, index, x, y) => {
+  if (!fromAppOrigin(e) || !mainWindow) return false;
+  const item = Menu.getApplicationMenu()?.items?.[Number(index)];
+  if (!item?.submenu || !Number.isFinite(x) || !Number.isFinite(y)) return false;
+  const zoom = mainWindow.webContents.getZoomFactor() || 1; // page pixels -> window pixels
+  return new Promise((resolve) => {
+    item.submenu.popup({
+      window: mainWindow,
+      x: Math.round(x * zoom),
+      y: Math.round(y * zoom),
+      callback: () => resolve(true),
+    });
+  });
 });
 
 // My Preferences > Spelling (sent by the renderer's DesktopBridge).

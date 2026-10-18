@@ -53,7 +53,7 @@ export default function SalesTaxAdjustmentPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <BackToCenter />
       <PageHeader title="Adjust Sales Tax Due" icon={SlidersHorizontal} />
       <p className="mb-4 max-w-2xl text-sm text-navy/60">

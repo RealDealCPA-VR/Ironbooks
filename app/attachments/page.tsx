@@ -845,7 +845,7 @@ export default function DocCenterPage() {
   }, []);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Attached documents (Doc Center)" icon={Paperclip} />
       <div className="mb-6 flex gap-1 rounded-xl border border-slate-200 bg-white/70 p-1 w-fit" role="tablist">
         {DOC_TABS.map((t) => {

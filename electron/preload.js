@@ -2,6 +2,16 @@
 // Exposes a minimal, audited API on window.bookkeeper — no direct Node access in the renderer.
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Whether this window draws its own title bar (the main window has no system frame). Asked
+// synchronously so the page's first paint already reserves the title bar (lib/theme.ts).
+let chromeInfo = { frameless: false, platform: 'unknown' };
+try {
+  const info = ipcRenderer.sendSync('chrome:info');
+  if (info && typeof info === 'object') chromeInfo = { frameless: Boolean(info.frameless), platform: String(info.platform) };
+} catch {
+  /* keep the defaults: a normal framed window */
+}
+
 contextBridge.exposeInMainWorld('bookkeeper', {
   /** Open a native file picker; returns { filePath, content } or null. */
   openFile: (filters) => ipcRenderer.invoke('dialog:openFile', filters),
@@ -67,6 +77,14 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   /** My Preferences > Spelling: turn the (local-only) spell checker on or off. */
   spellcheck: {
     setEnabled: (enabled) => ipcRenderer.invoke('spellcheck:setEnabled', Boolean(enabled)),
+  },
+  /** Window frame: theme colors, and the menu bar drawn in the page's title bar. */
+  chrome: {
+    frameless: chromeInfo.frameless,
+    platform: chromeInfo.platform,
+    setTheme: (theme) => ipcRenderer.invoke('chrome:theme', theme),
+    menus: () => ipcRenderer.invoke('chrome:menus'),
+    popupMenu: (index, x, y) => ipcRenderer.invoke('chrome:popupMenu', Number(index), Number(x), Number(y)),
   },
   isDesktop: true,
 });

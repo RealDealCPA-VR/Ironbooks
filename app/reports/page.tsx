@@ -436,11 +436,11 @@ function AllStandardReports() {
 
 export default function ReportsPage() {
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Reports" icon={BarChart2} />
 
       {/* Start here: the three questions most owners ask, in plain language. */}
-      <section aria-labelledby="reports-start" className="mb-8 rounded-2xl border-l-4 border-emerald bg-white p-5 shadow-xl">
+      <section aria-labelledby="reports-start" className="mb-8 rounded-2xl border border-slate-200/70 bg-white p-5 shadow-xl">
         <h2 id="reports-start" className="text-sm font-bold uppercase tracking-wide text-navy/70 mb-3">
           New to reports? Start here
         </h2>

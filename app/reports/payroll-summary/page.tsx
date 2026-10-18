@@ -248,7 +248,7 @@ export default function PayrollSummaryPage() {
   const l = data?.liabilities;
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Payroll Reports"
         icon={Users}
@@ -364,8 +364,8 @@ export default function PayrollSummaryPage() {
               </tbody>
               <tfoot>
                 <tr className="border-t-2 border-navy/30 bg-slate-50">
-                  <td className="py-3 px-4 font-extrabold text-navy" colSpan={2}>Total</td>
-                  <td className="py-3 px-4 text-right tabular-nums font-extrabold">
+                  <td className="py-3 px-4 font-bold text-navy" colSpan={2}>Total</td>
+                  <td className="py-3 px-4 text-right tabular-nums font-bold">
                     {formatCurrency(s.totals.gross)}
                   </td>
                   <td
@@ -374,7 +374,7 @@ export default function PayrollSummaryPage() {
                   >
                     Taxes {formatCurrency(s.totals.totalTaxes)} | Deductions {formatCurrency(s.totals.totalDeductions)}
                   </td>
-                  <td className="py-3 px-4 text-right tabular-nums font-extrabold text-emerald">
+                  <td className="py-3 px-4 text-right tabular-nums font-bold text-emerald">
                     {formatCurrency(s.totals.net)}
                   </td>
                   <td
@@ -481,9 +481,9 @@ export default function PayrollSummaryPage() {
                   </td>
                 </tr>
                 <tr className="bg-slate-50 border-t border-navy/20">
-                  <td className="py-3 px-4 font-extrabold text-navy" colSpan={2}>Balance Owed</td>
+                  <td className="py-3 px-4 font-bold text-navy" colSpan={2}>Balance Owed</td>
                   <td
-                    className={`py-3 px-4 text-right tabular-nums font-extrabold text-lg ${
+                    className={`py-3 px-4 text-right tabular-nums font-bold text-lg ${
                       Number(l.balance) < 0 ? 'text-red-600' : 'text-navy'
                     }`}
                   >

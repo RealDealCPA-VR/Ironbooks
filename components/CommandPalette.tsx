@@ -434,7 +434,7 @@ export default function CommandPalette({
 
   return (
     <div className="fixed inset-0 z-[200] flex items-start justify-center pt-[10vh] p-4">
-      <div className="absolute inset-0 bg-navy/40 backdrop-blur-sm" onClick={close} aria-hidden="true" />
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={close} aria-hidden="true" />
       <div
         role="dialog"
         aria-modal="true"
@@ -491,7 +491,7 @@ export default function CommandPalette({
           >
             <div className="text-sm font-semibold text-navy">{panel.heading}</div>
             {panel.amount !== undefined && (
-              <div className="mt-1 text-3xl font-extrabold tracking-tight text-navy">{fmtMoney(panel.amount)}</div>
+              <div className="mt-1 text-3xl font-bold tracking-tight text-navy">{fmtMoney(panel.amount)}</div>
             )}
             {panel.body && <p className="mt-1 text-sm text-navy/70">{panel.body}</p>}
             {panel.breakdown && panel.breakdown.length > 1 && (

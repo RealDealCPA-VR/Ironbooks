@@ -24,7 +24,7 @@ export default async function DamagedFilePage() {
     return (
       <main className="min-h-[60vh] flex items-center justify-center p-8 font-sans">
         <div className="max-w-lg w-full rounded-2xl bg-white shadow-xl p-8 text-center">
-          <h1 className="text-2xl font-extrabold text-navy">Your company file is fine</h1>
+          <h1 className="text-2xl font-bold text-navy">Your company file is fine</h1>
           <p className="mt-2 text-sm text-navy/60">No damage was found when the file was opened.</p>
           <Link href="/dashboard" className="mt-6 inline-block text-sm font-semibold text-electric hover:underline">
             Go to the dashboard

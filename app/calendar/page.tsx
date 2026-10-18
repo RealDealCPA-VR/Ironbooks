@@ -165,7 +165,7 @@ export default function CalendarPage() {
   const selectedEvents = selected ? (days[selected] ?? []).filter((e) => show[e.type]) : [];
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Calendar"
         icon={CalendarDays}

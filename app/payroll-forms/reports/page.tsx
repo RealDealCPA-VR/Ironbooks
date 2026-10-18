@@ -91,7 +91,7 @@ export default function PayrollReportsPage() {
   const current = REPORTS.find((r) => r.key === report)!;
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Payroll reports" icon={ClipboardList} action={<Button variant="secondary" onClick={() => window.print()}>Print</Button>} />
       <div className="max-w-6xl mx-auto space-y-6">
         <Card className="p-6 space-y-4 print:hidden">

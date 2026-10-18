@@ -124,7 +124,7 @@ export default function UsersAndRolesPage() {
   }, [load]);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Users & Roles" icon={Users} />
       <div className="mb-4 flex gap-2" role="tablist">
         {(isAdmin ? (['users', 'roles', 'passwords'] as const) : (['users', 'roles'] as const)).map((t) => (

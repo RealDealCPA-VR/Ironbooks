@@ -54,7 +54,7 @@ export default function FindPage() {
   const t = report ? reportToTable(report) : null;
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Find Transactions" icon={Search} />
       <Card className="p-4 mb-4 print-hidden">
         <form

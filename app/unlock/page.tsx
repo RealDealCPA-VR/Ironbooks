@@ -77,14 +77,14 @@ function UnlockInner() {
 
   if (phase === 'checking') {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-navy via-[#0f2c4d] to-navy">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+      <div className="flex min-h-screen items-center justify-center bg-offwhite bg-[radial-gradient(1200px_600px_at_50%_-10%,rgb(var(--accent)/0.14),transparent)]">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-navy/15 border-t-electric" />
       </div>
     );
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-navy via-[#0f2c4d] to-navy p-4">
+    <div className="flex min-h-screen items-center justify-center bg-offwhite bg-[radial-gradient(1200px_600px_at_50%_-10%,rgb(var(--accent)/0.14),transparent)] p-4">
       <Card className="w-full max-w-sm p-8">
         <div className="mb-6 flex flex-col items-center text-center">
           <div className="mb-4 rounded-2xl bg-electric/10 p-4">

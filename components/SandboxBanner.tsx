@@ -38,7 +38,7 @@ export default function SandboxBanner() {
     <div
       role="status"
       aria-live="polite"
-      className="sticky top-0 z-[60] w-full border-b-2 border-orange-700 text-black shadow-md print:static print:shadow-none"
+      className="sticky top-[var(--titlebar-h)] z-[60] w-full border-b-2 border-orange-700 text-black shadow-md print:static print:shadow-none"
       style={{
         backgroundColor: '#fb923c',
         backgroundImage:
@@ -49,7 +49,7 @@ export default function SandboxBanner() {
       data-testid="sandbox-banner"
     >
       <div className="mx-auto flex max-w-screen-2xl flex-wrap items-center justify-center gap-x-4 gap-y-1 px-4 py-1.5 text-sm">
-        <span className="flex items-center gap-2 font-extrabold tracking-wide">
+        <span className="flex items-center gap-2 font-bold tracking-wide">
           <FlaskConical className="h-4 w-4 shrink-0" aria-hidden="true" />
           {training ? (
             <>

@@ -113,7 +113,7 @@ function SummaryCard({ summary }: { summary: MileageSummary | null }) {
           <p className="text-xs font-semibold text-navy/50 uppercase tracking-wider mb-1">
             Total Miles
           </p>
-          <p className="text-3xl font-extrabold text-navy">
+          <p className="text-3xl font-bold text-navy">
             {parseFloat(summary.totalMiles).toLocaleString('en-US', {
               minimumFractionDigits: 1,
               maximumFractionDigits: 1,
@@ -124,7 +124,7 @@ function SummaryCard({ summary }: { summary: MileageSummary | null }) {
           <p className="text-xs font-semibold text-navy/50 uppercase tracking-wider mb-1">
             Total Deduction
           </p>
-          <p className="text-3xl font-extrabold text-emerald">
+          <p className="text-3xl font-bold text-emerald">
             {formatCurrency(summary.totalAmount)}
           </p>
         </div>
@@ -414,7 +414,7 @@ export default function MileagePage() {
   // ---------------------------------------------------------------------------
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Mileage"
         icon={Car}

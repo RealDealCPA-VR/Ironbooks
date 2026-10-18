@@ -644,7 +644,7 @@ function ResultBadge({
 }) {
   return (
     <div className="flex flex-col items-center gap-1 min-w-[80px]">
-      <span className="text-2xl font-extrabold text-navy">{count}</span>
+      <span className="text-2xl font-bold text-navy">{count}</span>
       <Badge tone={tone}>{label}</Badge>
     </div>
   );

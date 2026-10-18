@@ -275,7 +275,7 @@ function StepHeading({ icon: Icon, title, subtitle }: { icon: typeof BookOpen; t
     <div className="flex items-start gap-3 mb-5">
       <Icon className="h-6 w-6 text-electric mt-0.5 shrink-0" aria-hidden="true" />
       <div>
-        <h2 className="text-xl font-extrabold text-navy" tabIndex={-1} data-step-heading>
+        <h2 className="text-xl font-bold text-navy" tabIndex={-1} data-step-heading>
           {title}
         </h2>
         <p className="text-navy/50 text-sm">{subtitle}</p>
@@ -417,7 +417,7 @@ function StepWelcome({ onNext, rerun }: { onNext: () => void; rerun: boolean }) 
         <BookOpen className="h-10 w-10 text-electric" aria-hidden="true" />
       </div>
       <div>
-        <h2 className="text-2xl font-extrabold text-navy mb-2" tabIndex={-1} data-step-heading>
+        <h2 className="text-2xl font-bold text-navy mb-2" tabIndex={-1} data-step-heading>
           {rerun ? 'Setup interview' : 'Welcome to Ironbooks'}
         </h2>
         <p className="text-navy/60 text-sm max-w-sm leading-relaxed mx-auto">
@@ -832,7 +832,7 @@ function StepDone({ name, nextSteps, accountsAdded }: { name: string; nextSteps:
         <CheckCircle2 className="h-12 w-12 text-emerald" aria-hidden="true" />
       </div>
       <div>
-        <h2 className="text-2xl font-extrabold text-navy mb-2" tabIndex={-1} data-step-heading>
+        <h2 className="text-2xl font-bold text-navy mb-2" tabIndex={-1} data-step-heading>
           You&apos;re all set!
         </h2>
         <p className="text-navy/60 text-sm max-w-sm leading-relaxed">
@@ -941,13 +941,13 @@ function Interview() {
   ];
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-4 sm:p-8 font-sans flex items-center justify-center">
+    <main className="min-h-screen bg-offwhite p-4 sm:p-8 font-sans flex items-center justify-center">
       <div className="w-full max-w-lg">
         <div className="flex items-center justify-center gap-2 mb-8">
           <div className="h-9 w-9 rounded-xl bg-electric flex items-center justify-center">
             <BookOpen className="h-5 w-5 text-white" aria-hidden="true" />
           </div>
-          <span className="text-xl font-extrabold text-navy tracking-tight">Ironbooks</span>
+          <span className="text-xl font-bold text-navy tracking-tight">Ironbooks</span>
         </div>
 
         {!done && <StepIndicator current={step} />}

@@ -921,7 +921,7 @@ export default function BankReviewPage() {
   // ------------------------------------------------------------------
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Bank Review"
         icon={CreditCard}
@@ -1078,7 +1078,7 @@ export default function BankReviewPage() {
                 onClick={() => setTab(t.key)}
                 className={`px-3 py-1.5 rounded-md text-sm font-semibold border ${
                   tab === t.key
-                    ? 'bg-navy text-white border-navy'
+                    ? 'bg-electric text-white border-electric'
                     : 'bg-white text-navy/70 border-navy/20 hover:bg-navy/5'
                 }`}
               >

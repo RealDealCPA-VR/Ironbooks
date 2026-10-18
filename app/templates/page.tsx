@@ -235,7 +235,7 @@ export default function TemplatesPage() {
   const fieldOrder = FORM_FIELDS[formType].map(([k]) => k);
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Form Templates" icon={FileText} />
       <p className="mb-6 max-w-3xl text-sm text-navy/60">
         Choose how your forms look when you print or email them. Make as many templates as you like and pick
