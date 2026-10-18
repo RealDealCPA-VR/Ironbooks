@@ -73,8 +73,9 @@ checks & card charges with items · **check print queue with printer
 alignment** · vendor credits · **Loan Manager** · multi-currency
 
 ### 🏦 Banking
-OFX / QBO / CSV import with rules · optional bank feeds · reconciliation ·
-deposits & transfers
+**Registers you type into** on any account · statement **PDF / scan / Excel**
+import with tie-out · OFX / QBO / CSV with rules · reconciliation · deposits &
+transfers · no bank connection, ever
 
 </td><td width="50%" valign="top">
 
@@ -120,6 +121,16 @@ transactions · reminders · calendar · Lead Center · Doc Center · letters & 
 - **Smart defaults:** last account, class, terms and items per vendor or customer, the next check
   number, and the last date you used.
 - **Errors with Fix buttons:** "Debits are $40 more than credits. Add $40 to line 3?"
+- **QuickBooks-style registers on every account:** date, number, payee, account, debit, credit
+  and a running balance. Type a row, press Enter, and it saves as the right check, deposit,
+  transfer, card charge or journal entry. A new payee asks "Customer, Vendor, Employee or
+  Other?", and a new account opens its setup right there.
+- **Bank statements without a bank connection:** import a statement PDF (scans and photos go
+  through offline OCR), an Excel file or a CSV. Every row is checked against the statement's
+  opening and closing balances before anything is imported.
+- **AI picks the account for a payee it has never seen**, from what your business does and,
+  if you turn it on, a lookup of the vendor's name through your own SearXNG. It only suggests,
+  and says why.
 - **Keyboard first:** shortcuts everywhere (press `?`), and **Enter many transactions** at once in
   a grid with paste from Excel.
 - **Receipt capture:** drop a photo or PDF anywhere, or upload it from your phone over your
@@ -237,6 +248,7 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] **Checks on any pre-cut stock**: position, 3-per-page, per-field layout, batch PDF
 - [x] **Renamed to Ironbooks**
 - [x] **UX round**: 15 doer/reviewer teams. Command bar, Needs attention home, undo and "why did this change", learning bank rules, report explanations, smart defaults, Fix buttons on errors, keyboard and batch entry, receipt capture with offline OCR, month-end close, visible backups, sandbox, Accountant's Copy and Period Copy, and the Other Names / price level / opening stock / deposited payment / multi-currency switch / password policy gaps
+- [x] **v1.4.0 release**: typed-in registers on every account, statement PDF / scan / Excel import with tie-out, AI account suggestions for new payees (business context + optional self-hosted SearXNG lookup), Plaid removed
 - [ ] The remaining partial rows and P2 follow-ups in [`PARITY.md`](./PARITY.md)
 - [ ] Hands-on QA of the new screens, then a tagged release
 
@@ -251,7 +263,7 @@ Free code signing provided by [SignPath.io](https://signpath.io), certificate by
 
 Windows installers are built from this repository by GitHub Actions
 ([`release.yml`](./.github/workflows/release.yml)) and signed only after a maintainer approves
-each release. Releases up to and including 1.3.1 were published unsigned, while the
+each release. Releases up to and including 1.4.0 were published unsigned, while the
 SignPath application was in progress.
 
 | Role | Members |
