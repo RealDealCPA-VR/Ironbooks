@@ -61,6 +61,7 @@ function cleanPaymentBody(body: PaymentBody): PaymentBody {
 }
 // cmdbar: "receive payment from Acme" opens Receive Payments with the customer picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -234,6 +235,8 @@ interface ReceivePaymentModalProps {
   open: boolean;
   /** wave2 sales (C1): payment being edited (null = new). */
   editing?: PaymentDetail | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
   onClose: () => void;
   onSaved: () => void;
   customers: Customer[];
@@ -245,7 +248,7 @@ interface ReceivePaymentModalProps {
 /** "Apply to" targets in the credits table: an invoice id, or `je:<line id>` for a JE charge. */
 const JE_PREFIX = 'je:';
 
-function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accounts, prefillCustomerId = null }: ReceivePaymentModalProps) {
+function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accounts, prefillCustomerId = null, nav = null }: ReceivePaymentModalProps) {
   const today = todayISO();
   const prefs = usePreferences();
   // Preferences > Payments: once the user edits one side by hand, stop recalculating it.
@@ -888,8 +891,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       }
     >
       <div className="space-y-4">
-        {/* Ctrl+Y / Ctrl+H: the journal entry this payment posted (components/KeyboardCommands.tsx). */}
-        {editing && <span hidden data-source-ref={`payment:${editing.id}`} />}
+        {nav}
         {fixer.panel}
         {editing && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
@@ -1695,6 +1697,15 @@ function PaymentsPageContent() {
   const [editTarget, setEditTarget] = useState<PaymentDetail | null>(null);
   const [bounceTarget, setBounceTarget] = useState<Payment | null>(null);
 
+  /** Remounts the form: Revert / Clear, and moving to another payment (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
+  const nav = useAdjacentTransactions(payments, editTarget?.id ?? null, (p) => p.date);
+  async function goTo(p: Payment) {
+    await openEdit(p);
+    setModalOpen(false);
+    setFormKey((k) => k + 1);
+  }
+
   async function openEdit(p: Payment) {
     try {
       setEditTarget(await api.get<PaymentDetail>(`/api/payments/${p.id}`));
@@ -1795,7 +1806,7 @@ function PaymentsPageContent() {
         title="Receive Payments"
         icon={HandCoins}
         action={
-          <Button onClick={() => setModalOpen(true)}>
+          <Button data-shortcut="new" onClick={() => setModalOpen(true)}>
             <Plus className="h-4 w-4" />
             Receive Payment
           </Button>
@@ -1979,8 +1990,18 @@ function PaymentsPageContent() {
       </Card>
 
       <ReceivePaymentModal
+        key={formKey}
         open={modalOpen || !!editTarget}
         editing={editTarget}
+        nav={
+          <TransactionNav
+            sourceRef={editTarget ? `payment:${editTarget.id}` : null}
+            onPrevious={nav.prev ? () => void goTo(nav.prev!) : null}
+            onNext={nav.next ? () => void goTo(nav.next!) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editTarget?.id ?? 'new'}`}
+          />
+        }
         onClose={() => {
           setModalOpen(false);
           setEditTarget(null);

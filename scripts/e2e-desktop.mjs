@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { clickNativeButton as clickHelper } from './e2e-helpers.mjs';
+import { clickNativeButton as clickHelper, onFileServer } from './e2e-helpers.mjs';
 
 const require = createRequire(import.meta.url);
 const root = process.cwd();
@@ -36,7 +36,7 @@ const SHOTS = process.env.E2E_SHOTS || path.join(tmp, 'shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 const userData = path.join(tmp, 'userData');
 const local = path.join(tmp, 'Local');
-const share = path.join(tmp, 'Server', 'Accounting');
+const share = onFileServer(path.join(tmp, 'Server', 'Accounting'));
 const companyFile = path.join(share, 'Acme Plumbing.ironbooks');
 let failures = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -176,7 +176,7 @@ async function invoicesInFile() {
 async function main() {
   if (!fs.existsSync(EXE)) throw new Error(`Packaged app not found: ${EXE} (run npx electron-builder --dir)`);
   if (await appRunning()) throw new Error('The test build of Ironbooks is already running; close it first.');
-  console.log('E2E desktop: single company file');
+  console.log(`E2E desktop: single company file on ${share}`);
 
   // A new company file on the "file server", as File > New Company writes it.
   fs.mkdirSync(share, { recursive: true });

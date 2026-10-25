@@ -138,3 +138,28 @@ export function TransactionNav({ sourceRef, onPrevious, onNext, onRevert, loadKe
 }
 
 export default TransactionNav;
+
+/**
+ * The saved transactions before / after `currentId` in date order (then `tieBreak`), for
+ * TransactionNav's Previous / Next. With no current one (a new, blank form) Previous is the latest.
+ */
+export function useAdjacentTransactions<T extends { id: string }>(
+  items: T[],
+  currentId: string | null,
+  date: (t: T) => string,
+  tieBreak: (t: T) => string | number = () => 0,
+): { prev: T | null; next: T | null } {
+  return React.useMemo(() => {
+    const ordered = [...items].sort((a, b) => {
+      const d = date(a).localeCompare(date(b));
+      if (d) return d;
+      const ta = tieBreak(a);
+      const tb = tieBreak(b);
+      return typeof ta === 'number' && typeof tb === 'number' ? ta - tb : String(ta).localeCompare(String(tb));
+    });
+    if (!currentId) return { prev: ordered[ordered.length - 1] ?? null, next: null };
+    const i = ordered.findIndex((t) => t.id === currentId);
+    return { prev: i > 0 ? ordered[i - 1] : null, next: i >= 0 && i < ordered.length - 1 ? ordered[i + 1] : null };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, currentId]);
+}

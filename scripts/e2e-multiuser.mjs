@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { appCount, clickNativeButton, connect, dumpWindows, makeAssert, sleep, stopApps, until } from './e2e-helpers.mjs';
+import { appCount, clickNativeButton, connect, dumpWindows, makeAssert, onFileServer, sleep, stopApps, until } from './e2e-helpers.mjs';
 
 const require = createRequire(import.meta.url);
 const root = process.cwd();
@@ -36,7 +36,7 @@ const PORT_B = 9342;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ib-e2e-mu-'));
 const SHOTS = process.env.E2E_SHOTS || path.join(tmp, 'shots');
 fs.mkdirSync(SHOTS, { recursive: true });
-const share = path.join(tmp, 'FileServer', 'Accounting');
+const share = onFileServer(path.join(tmp, 'FileServer', 'Accounting'));
 const companyFile = path.join(share, 'Acme Plumbing.ironbooks');
 const { assert, state } = makeAssert();
 
@@ -74,7 +74,7 @@ const postJson = (page, url, body) =>
 async function main() {
   if (!fs.existsSync(EXE)) throw new Error(`Packaged app not found: ${EXE}`);
   if ((await appCount(EXE)) > 0) throw new Error('The test build of Ironbooks is already running; close it first.');
-  console.log('E2E multi-user: two workstations, one company file on a shared folder');
+  console.log(`E2E multi-user: two workstations, one company file on ${share}`);
 
   fs.mkdirSync(share, { recursive: true });
   const fileId = randomBytes(8).toString('hex');

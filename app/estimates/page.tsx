@@ -50,6 +50,7 @@ import {
 // cmdbar: forms accept a prefill from the Ctrl+K command bar.
 import PrefillNotice from '@/components/PrefillNotice';
 import { usePrefill } from '@/lib/commands/usePrefill';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -320,6 +321,8 @@ export default function EstimatesPage() {
   /** wave2 sales (C1): the estimate being edited (null = new). */
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingNumber, setEditingNumber] = useState<string | null>(null);
+  /** Bumped each time an estimate (or a blank form) is loaded: the toolbar re-reads the form then. */
+  const [loadCount, setLoadCount] = useState(0);
   const [sendFlags, setSendFlags] = useState<ShippingState>(EMPTY_SHIPPING);
   const creditLimit = useCreditLimitConfirm();
   // Estimate No. (pre-filled with the next number; editable; duplicate → confirm).
@@ -485,6 +488,7 @@ export default function EstimatesPage() {
     setEditingNumber(null);
     setSendFlags(shippingFromDoc(null));
     setAddOpen(true);
+    setLoadCount((n) => n + 1);
   }
 
   /** Edit a saved estimate (allowed until it has been turned into an invoice). */
@@ -511,10 +515,15 @@ export default function EstimatesPage() {
       setEditingId(detail.id);
       setEditingNumber(docNo(detail.refNumber, detail.estimateNumber));
       setAddOpen(true);
+      setLoadCount((n) => n + 1);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not open the estimate', 'danger');
     }
   }
+
+  // QB Previous / Next: estimates in date and number order (Previous from a new one opens the latest).
+  const nav = useAdjacentTransactions(estimates, editingId, (e) => e.date, (e) => e.estimateNumber);
+  const editingEstimate = editingId ? estimates.find((e) => e.id === editingId) ?? null : null;
 
   function handleFormChange(field: keyof EstimateForm, value: string) {
     setAddForm((prev) => ({ ...prev, [field]: value }));
@@ -864,6 +873,15 @@ export default function EstimatesPage() {
           </>
         }
       >
+        <div className="mb-3">
+          <TransactionNav
+            sourceRef={null}
+            onPrevious={nav.prev ? () => void openEditModal(nav.prev!) : null}
+            onNext={nav.next ? () => void openEditModal(nav.next!) : null}
+            onRevert={() => (editingEstimate ? void openEditModal(editingEstimate) : openAddModal())}
+            loadKey={`${loadCount}:${editingId ?? 'new'}`}
+          />
+        </div>
         {!editingId && prefillNote && (
           <div className="mb-3">
             <PrefillNotice note={prefillNote} />

@@ -44,6 +44,7 @@ import {
   useDocNumber,
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -158,9 +159,11 @@ interface NewPoModalProps {
   onCreated: () => void;
   /** When set, edits this saved PO (PATCH) instead of creating one. */
   editId?: string | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
 }
 
-function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId }: NewPoModalProps) {
+function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId, nav = null }: NewPoModalProps) {
   const [vendorId, setVendorId] = useState('');
   const [date, setDate] = useState(() => todayISO());
   const [expectedDate, setExpectedDate] = useState('');
@@ -356,6 +359,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
       }
     >
       <div className="space-y-4">
+        {nav}
         {editId && (
           <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
             Lines you have already received or billed can&apos;t be removed, and their quantity can&apos;t go
@@ -738,6 +742,14 @@ export default function PurchaseOrdersPage() {
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
+  /** Remounts the form: Revert / Clear, and moving to another PO (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
+  const nav = useAdjacentTransactions(pos, editId, (o) => o.date, (o) => o.poNumber);
+  const goTo = (o: PurchaseOrder) => {
+    setEditId(o.id);
+    setShowNew(true);
+    setFormKey((k) => k + 1);
+  };
 
   // Receive & Bill state
   const [billTarget, setBillTarget] = useState<PurchaseOrder | null>(null);
@@ -957,7 +969,17 @@ export default function PurchaseOrdersPage() {
       )}
 
       <NewPoModal
+        key={formKey}
         open={showNew}
+        nav={
+          <TransactionNav
+            sourceRef={null}
+            onPrevious={nav.prev ? () => goTo(nav.prev!) : null}
+            onNext={nav.next ? () => goTo(nav.next!) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editId ?? 'new'}`}
+          />
+        }
         onClose={() => {
           setShowNew(false);
           setEditId(null);

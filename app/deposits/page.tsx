@@ -35,6 +35,7 @@ import { useErrorFixes } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
 import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { amountMessage, collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 /** Body sent to /api/deposits (fix patches address its paths, e.g. "paymentIds", "depositAccountId"). */
 type DepositBody = Record<string, unknown> & {
@@ -199,6 +200,8 @@ interface MakeDepositModalProps {
   loadingItems: boolean;
   /** When set, the modal edits this saved deposit (PATCH). */
   editing?: DepositEdit | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
 }
 
 function MakeDepositModal({
@@ -210,6 +213,7 @@ function MakeDepositModal({
   undepositedItems: freeItems,
   loadingItems,
   editing,
+  nav = null,
 }: MakeDepositModalProps) {
   // While editing, the items already on the deposit are selectable alongside the free ones.
   const allItems = editing
@@ -468,8 +472,7 @@ function MakeDepositModal({
       }
     >
       <div className="space-y-5">
-        {/* Ctrl+Y / Ctrl+H: the journal entry this deposit posted (components/KeyboardCommands.tsx). */}
-        {editing && <span hidden data-source-ref={`deposit:${editing.id}`} />}
+        {nav}
         {fixer.panel}
         {editing && (
           <div className="rounded-lg border border-electric/30 bg-electric/5 px-4 py-3 text-sm text-navy/80">
@@ -783,6 +786,14 @@ function DepositsPageContent() {
   const [pendingVoid, setPendingVoid] = useState<string | null>(null);
   const [editing, setEditing] = useState<DepositEdit | null>(null);
 
+  /** Remounts the form: Revert / Clear, and moving to another deposit (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
+  const nav = useAdjacentTransactions(deposits, editing?.id ?? null, (d) => d.date);
+  async function goTo(d: Deposit) {
+    await openEdit(d.id);
+    setFormKey((k) => k + 1);
+  }
+
   async function openEdit(id: string) {
     try {
       const dep = await api.get<Deposit>(`/api/deposits/${id}`);
@@ -868,7 +879,7 @@ function DepositsPageContent() {
         title="Bank Deposits"
         icon={Landmark}
         action={
-          <Button onClick={openModal}>
+          <Button data-shortcut="new" onClick={openModal}>
             <Plus className="h-4 w-4" /> Make Deposit
           </Button>
         }
@@ -1004,7 +1015,17 @@ function DepositsPageContent() {
       )}
 
       <MakeDepositModal
+        key={formKey}
         open={showModal}
+        nav={
+          <TransactionNav
+            sourceRef={editing ? `deposit:${editing.id}` : null}
+            onPrevious={nav.prev ? () => void goTo(nav.prev!) : null}
+            onNext={nav.next ? () => void goTo(nav.next!) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editing?.id ?? 'new'}`}
+          />
+        }
         onClose={() => {
           setShowModal(false);
           setEditing(null);

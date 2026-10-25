@@ -50,6 +50,7 @@ import {
   useDocNumber,
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -144,6 +145,8 @@ interface NewOrderModalProps {
   open: boolean;
   /** wave2 sales (C1): the order being edited (null = new). */
   editing?: SalesOrderDetail | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
   onClose: () => void;
   customers: Customer[];
   items: PricedLineItem[];
@@ -153,7 +156,7 @@ interface NewOrderModalProps {
 
 type EditableLine = PricedLineValue & { id?: string; invoiced?: number };
 
-function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onCreated }: NewOrderModalProps) {
+function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onCreated, nav = null }: NewOrderModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
   const docNumber = useDocNumber('sales_order', open, editing ? docNo(editing.refNumber, editing.orderNumber) : null);
@@ -315,6 +318,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
       }
     >
       <div className="space-y-4">
+        {nav}
         {/* Customer */}
         <div>
           <Label htmlFor="so-customer">Customer *</Label>
@@ -621,6 +625,8 @@ export default function SalesOrdersPage() {
   const [invoiceTarget, setInvoiceTarget] = useState<SalesOrder | null>(null);
   // Edit state (wave2 sales C1)
   const [editTarget, setEditTarget] = useState<SalesOrderDetail | null>(null);
+  /** Remounts the form: Revert / Clear, and moving to another sales order (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
 
   async function openEdit(order: SalesOrder) {
     try {
@@ -628,6 +634,13 @@ export default function SalesOrdersPage() {
     } catch (err: unknown) {
       toast(err instanceof Error ? err.message : 'Could not open the sales order.', 'danger');
     }
+  }
+
+  const nav = useAdjacentTransactions(orders, editTarget?.id ?? null, (o) => o.date, (o) => o.orderNumber);
+  async function goTo(o: SalesOrder) {
+    await openEdit(o);
+    setShowNew(false);
+    setFormKey((k) => k + 1);
   }
 
   const customerMap = Object.fromEntries(customers.map((c) => [c.id, c.displayName]));
@@ -813,6 +826,16 @@ export default function SalesOrdersPage() {
       )}
 
       <NewOrderModal
+        key={formKey}
+        nav={
+          <TransactionNav
+            sourceRef={null}
+            onPrevious={nav.prev ? () => void goTo(nav.prev!) : null}
+            onNext={nav.next ? () => void goTo(nav.next!) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editTarget?.id ?? 'new'}`}
+          />
+        }
         open={showNew || !!editTarget}
         editing={editTarget}
         onClose={() => {

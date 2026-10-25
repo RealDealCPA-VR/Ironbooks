@@ -204,3 +204,14 @@ foreach ($w in $root.FindAll([System.Windows.Automation.TreeScope]::Children, [S
 }`);
   return r.out;
 }
+
+/**
+ * E2E_UNC=1: put the "file server" folder behind this computer's own SMB server (the C$ share
+ * of localhost, as a UNC path), so every read, write, lock and rename of the company file goes
+ * over the same SMB protocol as an office file server.
+ */
+export function onFileServer(localPath) {
+  if (!process.env.E2E_UNC) return localPath;
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(localPath);
+  return m ? `\\\\localhost\\${m[1].toUpperCase()}$\\${m[2]}` : localPath;
+}

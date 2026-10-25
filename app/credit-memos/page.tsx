@@ -55,6 +55,7 @@ import { usePreferences } from '@/lib/usePreferences';
 import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 import { previewSalesTotals } from '@/lib/salesLineMath';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -186,6 +187,8 @@ interface NewMemoModalProps {
   open: boolean;
   /** wave2 sales (C1): memo being edited (null = new). */
   editing?: CreditMemoDetail | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
   onClose: () => void;
   customers: Customer[];
   items: Item[];
@@ -193,7 +196,7 @@ interface NewMemoModalProps {
   onCreated: () => void;
 }
 
-function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCreated }: NewMemoModalProps) {
+function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCreated, nav = null }: NewMemoModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => todayISO());
   const [memoNote, setMemoNote] = useState('');
@@ -438,8 +441,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
       }
     >
       <div className="space-y-4">
-        {/* Ctrl+Y / Ctrl+H: the journal entry this credit memo posted (components/KeyboardCommands.tsx). */}
-        {editing && <span hidden data-source-ref={`credit_memo:${editing.id}`} />}
+        {nav}
         {editing && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
             Saving changes re-posts this credit so your books stay balanced. Credit already applied
@@ -905,6 +907,8 @@ export default function CreditMemosPage() {
   const [refundTarget, setRefundTarget] = useState<CreditMemo | null>(null);
   const [voidTarget, setVoidTarget] = useState<CreditMemo | null>(null);
   const [editTarget, setEditTarget] = useState<CreditMemoDetail | null>(null);
+  /** Remounts the form: Revert / Clear, and moving to another credit memo (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
 
   async function openEdit(m: CreditMemo) {
     try {
@@ -914,6 +918,12 @@ export default function CreditMemosPage() {
     }
   }
   const [voiding, setVoiding] = useState(false);
+  const nav = useAdjacentTransactions(memos, editTarget?.id ?? null, (m) => m.date, (m) => m.memoNumber);
+  async function goTo(m: CreditMemo) {
+    await openEdit(m);
+    setShowNew(false);
+    setFormKey((k) => k + 1);
+  }
 
   const customerMap = Object.fromEntries(customers.map((c) => [c.id, c.displayName]));
 
@@ -1089,6 +1099,16 @@ export default function CreditMemosPage() {
       )}
 
       <NewMemoModal
+        key={formKey}
+        nav={
+          <TransactionNav
+            sourceRef={editTarget ? `credit_memo:${editTarget.id}` : null}
+            onPrevious={nav.prev ? () => void goTo(nav.prev!) : null}
+            onNext={nav.next ? () => void goTo(nav.next!) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editTarget?.id ?? 'new'}`}
+          />
+        }
         open={showNew || !!editTarget}
         editing={editTarget}
         onClose={() => {

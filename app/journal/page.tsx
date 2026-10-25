@@ -56,6 +56,7 @@ import { FieldError, fieldA11y } from '@/components/FieldError';
 import { applyFixPatch, balanceFixes, formLineUpdates, missingClassCheck, missingClassFixes, type ErrorFix } from '@/lib/errorFixes';
 import { collectErrors, dateMessage, requiredMessage } from '@/lib/fieldValidation';
 import { isJournalScreenEntry } from '@/lib/journalScreen';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -186,6 +187,8 @@ interface EntryFormModalProps {
   names: NameOption[];
   /** When set, the modal edits this entry (prefilled) instead of creating a new one. */
   editEntry: EntryDetail | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
 }
 
 /** Which kind of name a line's account requires (QB: A/R needs a customer, A/P a vendor). */
@@ -198,7 +201,7 @@ function requiredNameKind(acct: Account | undefined): 'customer' | 'vendor' | nu
   return null;
 }
 
-function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, editEntry }: EntryFormModalProps) {
+function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, editEntry, nav = null }: EntryFormModalProps) {
   const [date, setDate] = useState(todayISO());
   const [description, setDescription] = useState('');
   const [reference, setReference] = useState('');
@@ -472,6 +475,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       )}
 
       {/* Header fields */}
+      <div className="mb-4">{nav}</div>
       <div className="grid grid-cols-2 gap-4 mb-5">
         <div>
           <Label htmlFor="je-date" required>Date</Label>
@@ -772,6 +776,8 @@ function JournalPageContent() {
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editTarget, setEditTarget] = useState<EntryDetail | null>(null);
+  /** Remounts the form: Revert / Clear, and moving to another entry (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
   const [voidTarget, setVoidTarget] = useState<JournalEntry | null>(null);
   const [voiding, setVoiding] = useState(false);
   const [reverseTarget, setReverseTarget] = useState<JournalEntry | null>(null);
@@ -848,6 +854,14 @@ function JournalPageContent() {
     setEditTarget(null);
     setShowForm(true);
   });
+
+  // Previous / Next walk the general journal entries made here (not ones a document posted).
+  const manualEntries = entries.filter((e) => !e.sourceRef || e.sourceRef === 'manual');
+  const nav = useAdjacentTransactions(manualEntries, editTarget?.id ?? null, (e) => e.date, (e) => e.entryNumber);
+  const goTo = async (e: JournalEntry) => {
+    await openEdit(e);
+    setFormKey((k) => k + 1);
+  };
 
   const openEdit = async (entry: JournalEntry) => {
     try {
@@ -1015,7 +1029,17 @@ function JournalPageContent() {
       </Card>
 
       <EntryFormModal
+        key={formKey}
         open={showForm}
+        nav={
+          <TransactionNav
+            sourceRef={null}
+            onPrevious={nav.prev ? () => void goTo(nav.prev!) : null}
+            onNext={nav.next ? () => void goTo(nav.next!) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editTarget?.id ?? 'new'}`}
+          />
+        }
         onClose={() => {
           setShowForm(false);
           setEditTarget(null);

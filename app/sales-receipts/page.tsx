@@ -64,6 +64,7 @@ import PrefillNotice from '@/components/PrefillNotice';
 import { previewSalesTotals } from '@/lib/salesLineMath';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import type { FormPrefill } from '@/lib/commands/prefill';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -179,6 +180,8 @@ interface NewReceiptModalProps {
   open: boolean;
   /** wave2 sales (C1): receipt being edited (null = new). */
   editing?: SalesReceiptDetail | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
   onClose: () => void;
   customers: Customer[];
   items: Item[];
@@ -199,6 +202,7 @@ function NewReceiptModal({
   taxRates,
   onCreated,
   prefill = null,
+  nav = null,
 }: NewReceiptModalProps) {
   // QB lists bank, Undeposited Funds and other current assets in "Deposit to" — never A/R.
   const depositAccounts = accounts.filter((a) => isDepositTargetAccount(a));
@@ -530,8 +534,7 @@ function NewReceiptModal({
         </div>
       )}
       <div className="space-y-4">
-        {/* Ctrl+Y / Ctrl+H: the journal entry this receipt posted (components/KeyboardCommands.tsx). */}
-        {editing && <span hidden data-source-ref={`salesreceipt:${editing.id}`} />}
+        {nav}
         {editing && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
             Saving changes re-posts this sale (and puts back / takes out any stock) so your books stay
@@ -792,6 +795,8 @@ export default function SalesReceiptsPage() {
   // Void state
   const [voidTarget, setVoidTarget] = useState<SalesReceipt | null>(null);
   const [editTarget, setEditTarget] = useState<SalesReceiptDetail | null>(null);
+  /** Remounts the form: Revert / Clear, and moving to another receipt (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
 
   async function openEdit(r: SalesReceipt) {
     try {
@@ -801,6 +806,13 @@ export default function SalesReceiptsPage() {
     }
   }
   const [voiding, setVoiding] = useState(false);
+  const nav = useAdjacentTransactions(receipts, editTarget?.id ?? null, (r) => r.date, (r) => r.receiptNumber);
+  async function goTo(r: SalesReceipt) {
+    await openEdit(r);
+    setShowNew(false);
+    setPrefill(null);
+    setFormKey((k) => k + 1);
+  }
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -951,8 +963,18 @@ export default function SalesReceiptsPage() {
       )}
 
       <NewReceiptModal
+        key={formKey}
         open={showNew || !!editTarget}
         editing={editTarget}
+        nav={
+          <TransactionNav
+            sourceRef={editTarget ? `salesreceipt:${editTarget.id}` : null}
+            onPrevious={nav.prev ? () => void goTo(nav.prev!) : null}
+            onNext={nav.next ? () => void goTo(nav.next!) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editTarget?.id ?? 'new'}`}
+          />
+        }
         onClose={() => {
           setShowNew(false);
           setEditTarget(null);

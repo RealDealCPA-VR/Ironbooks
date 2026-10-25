@@ -27,6 +27,7 @@ import { api } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -132,6 +133,8 @@ interface NewCreditModalProps {
   onCreated: () => void;
   /** When set, the modal edits this saved credit (PATCH) instead of creating one. */
   editId?: string | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
 }
 
 interface Named {
@@ -157,7 +160,7 @@ interface SavedLine {
 }
 
 /** QB Enter Bills (Credit): Expenses and Items tabs, Ref. No., Class and Customer:Job per line. */
-function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }: NewCreditModalProps) {
+function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, nav = null }: NewCreditModalProps) {
   const [vendorId, setVendorId] = useState('');
   const [date, setDate] = useState(() => todayISO());
   const [refNumber, setRefNumber] = useState('');
@@ -422,6 +425,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId }:
       }
     >
       <div className="space-y-4">
+        {nav}
         {editId && (
           <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
             Changing amounts, items or quantities is only possible while none of the credit is applied or
@@ -852,6 +856,14 @@ export default function VendorCreditsPage() {
 
   const [showNew, setShowNew] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
+  /** Remounts the form: Revert / Clear, and moving to another credit (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
+  const nav = useAdjacentTransactions(credits, editId, (c) => c.date);
+  const goTo = (c: VendorCredit) => {
+    setEditId(c.id);
+    setShowNew(true);
+    setFormKey((k) => k + 1);
+  };
   const [applyTarget, setApplyTarget] = useState<VendorCredit | null>(null);
   const [refundTarget, setRefundTarget] = useState<VendorCredit | null>(null);
   const [voidTarget, setVoidTarget] = useState<VendorCredit | null>(null);
@@ -1048,7 +1060,17 @@ export default function VendorCreditsPage() {
       )}
 
       <NewCreditModal
+        key={formKey}
         open={showNew}
+        nav={
+          <TransactionNav
+            sourceRef={editId ? `vendor_credit:${editId}` : null}
+            onPrevious={nav.prev ? () => goTo(nav.prev!) : null}
+            onNext={nav.next ? () => goTo(nav.next!) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editId ?? 'new'}`}
+          />
+        }
         onClose={() => {
           setShowNew(false);
           setEditId(null);

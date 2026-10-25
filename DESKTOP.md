@@ -97,6 +97,23 @@ and pre-fills the last user. "I forgot my password" asks the user's challenge qu
 **Older company folders** (`*.ironbooks` folders from earlier versions) still open (File > Open
 Company Folder (Older Format)); File > Save as a Single Company File converts one.
 
+## Testing the desktop app
+
+After `npm run build && npx electron-builder --dir` (the packaged app in `release/win-unpacked`):
+
+| Command | What it drives |
+|---|---|
+| `npm run test:e2e:file` | the built server on a single company file: autosave, close, reopen elsewhere |
+| `npm run test:e2e:desktop` | the packaged app: open, lock, autosave, an access request answered on screen (Not Now, Hand It Over), No Company Open, sign-in, save on close |
+| `npm run test:e2e:keyboard` | QuickBooks keys in the packaged app (Ctrl+J/A/W/I, date keys, list keys, Previous / Next / Revert, Ctrl+Y) |
+| `npm run test:e2e:multiuser` | two copies of the app as two workstations on one company file: Ask to Come In, Let Them In, a second user working over the office network |
+
+Set `E2E_UNC=1` to put the company file behind this computer's SMB server (the `C$` share of
+`localhost` as a UNC path), so every lock, save and rename goes over the same protocol as an office file server.
+The scripts use their own settings and working-copy folders (`IRONBOOKS_USER_DATA`, `LOCALAPPDATA`),
+press keys through DevTools input (never the Windows keyboard) and click native message boxes only
+after checking, with UI Automation, that the button is really under the pointer.
+
 ## Data & backups
 
 - `BKA_DATA_DIR` overrides the active company (used by the main process + tests).

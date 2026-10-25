@@ -154,6 +154,11 @@ async function main() {
     // Two saved invoices for Previous / Next.
     await post('/api/invoices', { customerId: made[0].id, date: '2026-10-01', lines: [{ description: 'First job', quantity: 1, rate: 100, accountId: income.id }] });
     await post('/api/invoices', { customerId: made[1].id, date: '2026-10-02', lines: [{ description: 'Second job', quantity: 1, rate: 200, accountId: income.id }] });
+    // Two saved bills for Previous / Next on Enter Bills.
+    const vendor = await post('/api/vendors', { displayName: 'Ferguson Supply' }).then((r) => r.json());
+    const expense = accts.find((a) => a.type === 'expense');
+    await post('/api/bills', { vendorId: vendor.id, date: '2026-10-03', lines: [{ accountId: expense.id, amount: '75.00', description: 'Fittings' }] });
+    await post('/api/bills', { vendorId: vendor.id, date: '2026-10-04', lines: [{ accountId: expense.id, amount: '95.00', description: 'Valves' }] });
   })()`);
   await page.eval(`location.assign('/dashboard')`);
   await until(() => page.eval(`location.pathname === '/dashboard' && document.readyState === 'complete'`));
@@ -238,6 +243,38 @@ async function main() {
   const journal = await until(() => page.eval(`[...document.querySelectorAll('[role="dialog"]')].some((d) => /Debit/.test(d.innerText || '') && /Credit/.test(d.innerText || ''))`), 10_000);
   await page.shot('k5-invoice-journal');
   assert(journal, 'Ctrl+Y on an open invoice shows the journal entry it posted');
+
+  // Enter Bills: Alt+P from a new bill opens the latest saved one.
+  await page.eval(`location.assign('/bills')`);
+  await until(() => page.eval(`location.pathname === '/bills' && document.readyState === 'complete'`));
+  await sleep(2500);
+  await press('n', { ctrl: true });
+  await sleep(1500);
+  await press('p', { alt: true });
+  const billTitle = await until(async () => {
+    const t = await title();
+    return /Edit Bill/.test(t) ? t : null;
+  }, 10_000);
+  assert(billTitle, `Alt+P on a new bill opens the latest saved bill (${billTitle})`);
+  const billDesc = await page.eval(`[...document.querySelectorAll('[role="dialog"] input')].map((i) => i.value).join('|')`);
+  assert(/Valves/.test(billDesc), 'the latest bill (Valves) is the one shown');
+  await press('Escape');
+
+  // Every transaction form carries the toolbar (Previous / Next / Revert).
+  for (const route of ['/sales-receipts', '/credit-memos', '/estimates', '/sales-orders', '/purchase-orders', '/vendor-credits', '/payments', '/deposits', '/journal']) {
+    await page.eval(`location.assign('${route}')`);
+    await until(() => page.eval(`location.pathname === '${route}' && document.readyState === 'complete'`));
+    await sleep(2500);
+    await press('n', { ctrl: true });
+    const has = await until(() => page.eval(`!!document.querySelector('[role="dialog"] [data-shortcut="prev"]') && !!document.querySelector('[role="dialog"] [data-shortcut="revert"]')`), 8_000);
+    assert(has, `${route}: the form has Previous / Next / Revert`);
+    await press('Escape');
+    await sleep(500);
+  }
+  await page.eval(`location.assign('/expenses')`);
+  await until(() => page.eval(`location.pathname === '/expenses' && document.readyState === 'complete'`));
+  await sleep(2500);
+  assert(await page.eval(`!!document.querySelector('[data-shortcut-scope] [data-shortcut="prev"]')`), '/expenses: Write Checks has Previous / Next / Revert');
 
   console.log(`\nScreenshots: ${SHOTS}`);
   console.log(failures === 0 ? 'E2E KEYBOARD PASSED' : `E2E KEYBOARD FAILED (${failures})`);
