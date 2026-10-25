@@ -1,5 +1,5 @@
 import "./globals.css";
-import { Inter } from "next/font/google";
+import localFont from "next/font/local";
 import { Toaster } from "@/components/ui";
 import AppShell from "@/components/AppShell";
 import DesktopBridge from "@/components/DesktopBridge";
@@ -9,11 +9,14 @@ import WindowTitleBar from "@/components/WindowTitleBar";
 import { ThemeSync } from "@/lib/useTheme";
 import { DEFAULT_THEME, THEME_BOOT_SCRIPT } from "@/lib/theme";
 
-// Self-hosted via next/font: the woff2 is downloaded at BUILD time and served from the app
-// bundle, so the offline desktop app never phones Google Fonts at runtime.
-const inter = Inter({
-  subsets: ["latin"],
-  weight: ["400", "600", "700", "900"],
+// Inter (variable, latin), shipped in the repository (app/fonts, SIL Open Font License): served
+// from the app bundle, so neither the offline desktop app nor the build ever contacts Google Fonts
+// (a build that downloaded it failed whenever that download did).
+const inter = localFont({
+  src: "./fonts/Inter-latin-variable.woff2",
+  weight: "100 900",
+  style: "normal",
+  display: "swap",
   variable: "--font-inter",
 });
 

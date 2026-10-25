@@ -9,6 +9,7 @@ jobs:
     runs-on: windows-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Actions-provided, contents:write
+      NEXT_TELEMETRY_DISABLED: '1'
       # Code signing — with either one set up, Windows no longer warns about an unknown publisher
       # (SIGNING.md). With neither, releases are built exactly as before, unsigned.
       #  - WIN_CSC_LINK (base64 .pfx) + WIN_CSC_KEY_PASSWORD: a code-signing certificate;
@@ -25,6 +26,12 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci --legacy-peer-deps
+      # Next.js build cache: faster builds, and no "No build cache found" notice.
+      - uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('app/**', 'components/**', 'lib/**') }}
+          restore-keys: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
       # One draft release up front. The nsis and portable targets publish concurrently; left to
       # electron-builder, each could create its own release (v1.3.1 got two, and "latest" pointed
       # at the one holding only the blockmap). Both now upload into this draft.
