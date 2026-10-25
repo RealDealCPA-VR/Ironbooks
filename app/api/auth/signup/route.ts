@@ -1,10 +1,14 @@
 /**
- * POST /api/auth/signup — create the first owner user + their company, then start a session.
- * Body: { name, email, password, companyName }
+ * POST /api/auth/signup — create the company file's Admin (first owner user) + their company,
+ * then start a session.
+ * Body: { name, email, password, companyName, challengeQuestion?, challengeAnswer? } — `email` is
+ * the login: a user name such as "Admin" or an email address (no spaces).
  *
  * Users live inside the company file, and only its Admin adds more (Users & Roles), so self
  * sign-up is only open while the file has no real user yet (the seeded demo user, whose
  * password hash is the sentinel 'dev', doesn't count). The file password still applies.
+ * The challenge question (QuickBooks parity) is what "I forgot my password" asks before it
+ * resets the Admin's password (app/api/auth/request-reset).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { eq, ne } from 'drizzle-orm';
@@ -26,6 +30,7 @@ import { COMPANY_COOKIE, isLoopbackHostHeader } from '@/lib/context';
 import { logTransaction } from '@/lib/services/transactionLog';
 import { startSession } from '@/lib/services/sessions';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
+import { MIN_CHALLENGE_ANSWER, isKnownChallengeQuestion, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
 
 /**
  * True when the browser sent no Origin (same-origin navigation / non-browser clients) or an
@@ -50,9 +55,22 @@ export async function POST(req: NextRequest) {
   const email = str(body.email);
   const password = str(body.password);
   const companyName = str(body.companyName);
+  const challengeQuestion = str(body.challengeQuestion);
+  const challengeAnswer = str(body.challengeAnswer);
   if (!name.trim() || !email.trim() || password.length < MIN_PASSWORD_LENGTH) {
     return NextResponse.json(
-      { error: `Name, email and a password (min ${MIN_PASSWORD_LENGTH} chars) are required.`, code: 'VALIDATION' },
+      { error: `Your name, a user name and a password (min ${MIN_PASSWORD_LENGTH} chars) are required.`, code: 'VALIDATION' },
+      { status: 400 },
+    );
+  }
+  if (/\s/.test(email.trim())) {
+    return NextResponse.json({ error: 'The user name cannot contain spaces.', code: 'VALIDATION' }, { status: 400 });
+  }
+  // Optional for older clients; when given, both parts must be usable.
+  const wantsChallenge = Boolean(challengeQuestion || challengeAnswer);
+  if (wantsChallenge && (!isKnownChallengeQuestion(challengeQuestion) || normalizeChallengeAnswer(challengeAnswer).length < MIN_CHALLENGE_ANSWER)) {
+    return NextResponse.json(
+      { error: `Pick a challenge question and give an answer of at least ${MIN_CHALLENGE_ANSWER} characters.`, code: 'VALIDATION' },
       { status: 400 },
     );
   }
@@ -115,6 +133,9 @@ export async function POST(req: NextRequest) {
       email: email.trim().toLowerCase(),
       passwordHash: await hashPassword(password),
       passwordChangedAt: new Date(),
+      ...(wantsChallenge
+        ? { challengeQuestion, challengeAnswerHash: await hashPassword(normalizeChallengeAnswer(challengeAnswer)) }
+        : {}),
     })
     .returning();
   await logTransaction(db, {

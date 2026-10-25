@@ -25,9 +25,17 @@ describe('recent company files for "No Company Open"', () => {
   it('lists each file with its full location, most recent first', () => {
     const rows = recentEntries(['/srv/books/Acme', '/home/me/Docs/Beta'], io);
     expect(rows).toEqual([
-      { dir: '/srv/books/Acme', name: 'Acme', exists: true, lastOpenedAt: '2026-10-01T12:00:00.000Z', passwordProtected: true },
-      { dir: '/home/me/Docs/Beta', name: 'Beta', exists: true, lastOpenedAt: null, passwordProtected: false },
+      { dir: '/srv/books/Acme', name: 'Acme', exists: true, lastOpenedAt: '2026-10-01T12:00:00.000Z', passwordProtected: true, inUseBy: null },
+      { dir: '/home/me/Docs/Beta', name: 'Beta', exists: true, lastOpenedAt: null, passwordProtected: false, inUseBy: null },
     ]);
+  });
+
+  it('says who has a company file open on another computer', () => {
+    const rows = recentEntries(['/srv/books/Acme.ironbooks', '/srv/books/gone.ironbooks'], {
+      ...io,
+      inUseBy: (dir: string) => (dir.includes('Acme') ? 'Mary on FRONT-DESK' : null),
+    });
+    expect(rows.map((r: { inUseBy: string | null }) => r.inUseBy)).toEqual(['Mary on FRONT-DESK', null]);
   });
 
   it('marks a moved or deleted file instead of dropping it, and ignores junk', () => {
@@ -104,7 +112,9 @@ describe('desktop wiring (source pins)', () => {
   });
 
   it('closing releases the file: the next launch shows the start screen without starting a server', () => {
-    expect(main).toMatch(/saveConfig\(\{ companyClosed: true, remoteHost: null \}\);\s*\n\s*app\.relaunch\(\);/);
+    expect(main).toMatch(/saveConfig\(\{ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null \}\);\s*\n\s*relaunchApp\(\);/);
+    // An open single company file is saved into itself and its lock released on the way out.
+    expect(main).toMatch(/\.then\(\(\) => closeOpenCompanyFile\(\)\)/);
     const create = main.indexOf('async function createWindow()');
     const startCheck = main.indexOf("loadConfig().companyClosed === true", create);
     const server = main.indexOf('await startNextServer()', create);
@@ -113,7 +123,8 @@ describe('desktop wiring (source pins)', () => {
   });
 
   it('opening a file or a host ends the closed state', () => {
-    expect(main).toMatch(/saveConfig\(\{ dataDir: dir, remoteHost: null, companyClosed: false \}\)/);
+    expect(main).toMatch(/single \? \{ companyFile: location \} : \{ dataDir: location, companyFile: null \}/);
+    expect(main).toMatch(/remoteFile: null,\s*\n\s*companyClosed: false,/);
     expect(main).toMatch(/saveConfig\(\{ remoteHost: n\.origin, lastRemoteHost: value\.trim\(\), companyClosed: false \}\)/);
   });
 

@@ -438,6 +438,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
       }
     >
       <div className="space-y-4">
+        {/* Ctrl+Y / Ctrl+H: the journal entry this credit memo posted (components/KeyboardCommands.tsx). */}
+        {editing && <span hidden data-source-ref={`credit_memo:${editing.id}`} />}
         {editing && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
             Saving changes re-posts this credit so your books stay balanced. Credit already applied

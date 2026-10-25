@@ -254,6 +254,12 @@ export async function getServerContext(): Promise<ServiceContext> {
   if ((await getRequestOrigin()).remote) {
     throw new ServiceError('FORBIDDEN', 'Authentication required.');
   }
+  // A single company file (the desktop app's company files, lib/services/companyFileSave.ts) is
+  // set up by its Admin on /signup and is otherwise only used signed in: no first-run fallback,
+  // which would put a "Demo Company" and a demo user into the person's new file.
+  if (process.env.BKA_COMPANY_FILE) {
+    throw new ServiceError('FORBIDDEN', 'Authentication required.');
+  }
   // DNS-rebinding guard: a web page whose name resolves to 127.0.0.1 reaches this server with
   // ITS host name in the Host header. The session-less owner fallback only answers requests
   // addressed to a loopback host (the desktop shell and `next dev` use 127.0.0.1 / localhost).

@@ -937,6 +937,7 @@ function JournalPageContent() {
                   onClick={() => setDetailId(entry.id)}
                   className="cursor-pointer"
                   title="View entry detail"
+                  data-journal-entry={entry.id}
                 >
                   <Td className="font-mono text-xs text-navy/60">{entry.entryNumber}</Td>
                   <Td className="whitespace-nowrap">{formatDate(entry.date)}</Td>

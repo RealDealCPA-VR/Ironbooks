@@ -468,6 +468,8 @@ function MakeDepositModal({
       }
     >
       <div className="space-y-5">
+        {/* Ctrl+Y / Ctrl+H: the journal entry this deposit posted (components/KeyboardCommands.tsx). */}
+        {editing && <span hidden data-source-ref={`deposit:${editing.id}`} />}
         {fixer.panel}
         {editing && (
           <div className="rounded-lg border border-electric/30 bg-electric/5 px-4 py-3 text-sm text-navy/80">

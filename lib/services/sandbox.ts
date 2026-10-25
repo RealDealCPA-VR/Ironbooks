@@ -483,8 +483,13 @@ export function trainingTarget(realDataDir: string, name: unknown): { name: stri
   if (WINDOWS_RESERVED_NAME.test(clean.split('.')[0].trimEnd())) {
     throw new ServiceError('VALIDATION', 'That name is reserved by Windows. Pick another name.');
   }
-  const dir = path.join(path.dirname(path.resolve(realDataDir)), `${clean}.ironbooks`);
-  if (samePath(dir, realDataDir)) {
+  // Next to the real company file as people see it: for a single company file that is the folder
+  // holding the .ironbooks file (its database runs from a working copy elsewhere; the shell passes
+  // the file's location as BKA_REAL_COMPANY_FILE), else the folder holding the company folder.
+  const realFile = process.env.BKA_REAL_COMPANY_FILE;
+  const home = realFile ? path.dirname(path.resolve(realFile)) : path.dirname(path.resolve(realDataDir));
+  const dir = path.join(home, `${clean}.ironbooks`);
+  if (samePath(dir, realDataDir) || (realFile && samePath(dir, realFile))) {
     throw new ServiceError('VALIDATION', 'That is the name of your real company file. Pick another name.');
   }
   if (fs.existsSync(dir)) {

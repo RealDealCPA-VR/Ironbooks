@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { GLOBAL_SHORTCUTS } from '../lib/shortcuts';
 
 const require = createRequire(import.meta.url);
 const { MENU_SECTIONS, menuRoutes, buildSectionMenus } = require('../electron/menuRoutes.js');
@@ -42,6 +43,37 @@ describe('application menus', () => {
       .submenu.find((i: { label?: string }) => i.label === 'Create Invoices');
     invoices.click();
     expect(navigate).toHaveBeenCalledWith('/invoices?new=1');
+  });
+
+  it('shows the QuickBooks shortcut keys next to their items without registering them', () => {
+    const menus = buildSectionMenus(vi.fn(), 'win32');
+    const items = menus.flatMap((m: { submenu: Array<Record<string, unknown>> }) => m.submenu);
+    const keyed = items.filter((i: Record<string, unknown>) => i.accelerator);
+    expect(keyed.length).toBeGreaterThan(0);
+    for (const i of keyed) expect(i.registerAccelerator, String(i.label)).toBe(false);
+    const byLabel = (label: string) => items.find((i: Record<string, unknown>) => i.label === label)?.accelerator;
+    expect(byLabel('Write Checks')).toBe('Ctrl+W');
+    expect(byLabel('Create Invoices')).toBe('Ctrl+I');
+    expect(byLabel('Customer Center')).toBe('Ctrl+J');
+    expect(byLabel('Chart of Accounts')).toBe('Ctrl+A');
+    expect(byLabel('Use Register')).toBe('Ctrl+R');
+    expect(byLabel('Memorized Transaction List')).toBe('Ctrl+T');
+    expect(byLabel('Make Deposits')).toBeUndefined(); // no QB key: Ctrl+D is Delete
+  });
+
+  it('each shown key is the app shortcut that opens the same page', () => {
+    for (const section of MENU_SECTIONS) {
+      for (const item of section.items as Array<{ label?: string; route?: string; shortcut?: string }>) {
+        if (!item.shortcut) continue;
+        const sc = GLOBAL_SHORTCUTS.find((s) => s.keys === item.shortcut);
+        expect(sc?.href, `${item.label} ${item.shortcut}`).toBe(item.route);
+      }
+    }
+  });
+
+  it('macOS gets no key equivalents (they would take the key before the page)', () => {
+    const items = buildSectionMenus(vi.fn(), 'darwin').flatMap((m: { submenu: Array<Record<string, unknown>> }) => m.submenu);
+    expect(items.some((i: Record<string, unknown>) => i.accelerator)).toBe(false);
   });
 });
 

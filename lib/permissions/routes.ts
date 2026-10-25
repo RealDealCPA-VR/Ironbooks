@@ -75,6 +75,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/auth/2fa/disable': kind('self', 'POST'),
   '/api/auth/change-password': kind('self', 'POST'), // gapsb K: change own password (also when expired)
   '/api/auth/password-policy': kind('public', 'GET'), // gapsb K: the file's password rules for the forms
+  '/api/auth/challenge': kind('self', 'GET POST'), // own challenge question for "I forgot my password"
   '/api/unlock': kind('public', 'POST'),
   '/api/file-lock': { GET: 'member', ...r('users', 'POST:modify') },
   '/api/portal/login': kind('public', 'POST'),
@@ -203,6 +204,15 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/portable': r('file_utilities', 'GET:create'),
   '/api/portable/restore': r('file_utilities', 'POST:delete'),
   '/api/portable/shareable': r('file_utilities', 'GET:print'),
+  // Single-file company file (lib/services/companyFileSave.ts): anyone signed in sees whether it
+  // is saved and may save now; closing and Save Copy As are the desktop shell's own calls
+  // (internal token checked in the handlers, so 'public' here); the sign-in screen's file info
+  // is public like the unlock screen.
+  '/api/company-file/status': kind('member', 'GET'),
+  '/api/company-file/save': kind('member', 'POST'),
+  '/api/company-file/close': kind('public', 'POST'),
+  '/api/company-file/save-as': kind('public', 'POST'),
+  '/api/company-file/info': kind('public', 'GET'),
   '/api/transaction-log': r('reports_financial', 'GET'),
   '/api/transaction-log/verify': r('reports_financial', 'GET'),
   '/api/qb-import/gl': r('file_utilities', 'GET POST'),
@@ -437,6 +447,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/journal-entries/[id]/reverse': r('accounting', 'POST'),
   // wave2 foundation: Adjusting Journal Entries report data.
   '/api/journal-entries/adjusting': r('accounting', 'GET'),
+  // Ctrl+Y / Ctrl+H from an open document: which journal entry it posted (same view as the entry).
+  '/api/journal-entries/for-source': r('accounting', 'GET'),
   '/api/transfers': r('accounting', 'GET POST'),
   '/api/transfers/[id]': r('accounting', 'GET PATCH DELETE'), // wave2 purchases: edit / void
   '/api/reconciliations': r('accounting', 'GET POST'),

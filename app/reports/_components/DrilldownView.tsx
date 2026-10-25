@@ -8,12 +8,14 @@
  * — which restores its options from its URL and its scroll / collapsed rows from session state.
  * Each transaction opens in the QuickZoom transaction view (EntryDetailModal: lines, history and
  * the link to its source document); "Open <document>" goes straight to the document's page.
+ * QB list keys move through the transactions (useListKeys): Enter opens one, Ctrl+Y / Ctrl+H
+ * show its journal / history (components/KeyboardCommands.tsx).
  */
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { ArrowLeft, ExternalLink, ListTree } from 'lucide-react';
-import { Badge, Button, Card, EmptyState, PageHeader, Spinner } from '@/components/ui';
+import { Badge, Button, Card, EmptyState, PageHeader, Spinner, useListKeys } from '@/components/ui';
 import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -56,6 +58,7 @@ export default function DrilldownView() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [entryId, setEntryId] = useState<string | null>(null);
+  const listKeys = useListKeys<HTMLDivElement>();
 
   useEffect(() => {
     if (!report || !row || !col) {
@@ -161,7 +164,7 @@ export default function DrilldownView() {
             {data.transactions.length === 0 ? (
               <EmptyState icon={ListTree} title="No transactions" message="Nothing was recorded behind this amount for these report settings." />
             ) : (
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto" {...listKeys}>
                 <table className="w-full border-collapse text-sm">
                   <caption className="sr-only">
                     Transactions behind {data.rowLabel}, {data.columnLabel}
@@ -188,6 +191,7 @@ export default function DrilldownView() {
                           key={t.key}
                           className={`border-b border-slate-100 hover:bg-electric/5 ${t.entryId ? 'cursor-pointer' : ''}`}
                           onDoubleClick={t.entryId ? () => setEntryId(t.entryId) : undefined}
+                          data-journal-entry={t.entryId || undefined}
                         >
                           <td className="py-1.5 px-3 whitespace-nowrap">
                             {t.entryId ? (

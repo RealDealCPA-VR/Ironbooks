@@ -38,6 +38,7 @@ import { currentFingerprint } from '@/lib/services/backupFingerprint';
 import { ensureBackupScheduler, runVersionedBackup } from '@/lib/services/backupSchedule';
 import { assertNotSandbox } from '@/lib/services/sandboxState';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { isInternalRequest } from '@/lib/net/internalToken';
 
 /** Constant-time check of the x-bka-internal header against BKA_INTERNAL_TOKEN. */
 async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
@@ -61,6 +62,11 @@ export async function POST(req: NextRequest) {
   try {
     // Fail closed BEFORE producing any backup bytes.
     let ctx = await internalContext(req);
+    if (!ctx && isInternalRequest(req)) {
+      // The desktop shell, on a brand-new company file nobody has set up yet: nothing to back up,
+      // and never the session-less first-run fallback (it would put a demo company in the file).
+      return NextResponse.json({ status: 'no-company' });
+    }
     if (!ctx) {
       // A user session gets the same whole-file archive as GET /api/backup, so it needs the
       // same gate: an active Admin of every company in the file.

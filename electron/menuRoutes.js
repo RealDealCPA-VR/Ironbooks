@@ -3,13 +3,14 @@
 // that navigate through the DesktopBridge IPC ('navigate'); the Window menu is built there.
 //
 // Pure module (no electron import) so tests can check every route is a real page.
-// No accelerators here on purpose: the app's own shortcuts (Ctrl+I/E/R/J/D/M, see
-// lib/shortcuts.ts) must keep ignoring keystrokes typed into form fields, which native menu
-// accelerators would not.
+// Shortcut keys are only SHOWN next to the items (`shortcut`, rendered as an accelerator with
+// registerAccelerator: false): the app's own handlers own the QuickBooks keys (Ctrl+W/I/J/A/R/T,
+// GLOBAL_SHORTCUTS in lib/shortcuts.ts), so they keep their rules for keys typed into fields
+// (Ctrl+A still selects a field's text) instead of a native accelerator grabbing every press.
 
 'use strict';
 
-/** @typedef {{ label: string, route: string } | { separator: true }} MenuEntry */
+/** @typedef {{ label: string, route: string, shortcut?: string } | { separator: true }} MenuEntry */
 
 /** @type {Array<{ label: string, items: MenuEntry[] }>} */
 const MENU_SECTIONS = [
@@ -30,9 +31,9 @@ const MENU_SECTIONS = [
       { label: 'Users and Roles', route: '/users' },
       { label: 'Set Closing Date / Fiscal Periods', route: '/fiscal-periods' },
       { separator: true },
-      { label: 'Chart of Accounts', route: '/accounts' },
+      { label: 'Chart of Accounts', route: '/accounts', shortcut: 'Ctrl+A' },
       { label: 'Make General Journal Entries', route: '/journal' },
-      { label: 'Memorized Transaction List', route: '/recurring' },
+      { label: 'Memorized Transaction List', route: '/recurring', shortcut: 'Ctrl+T' },
       { label: 'Prepare Letters with Envelopes', route: '/letters' },
       { label: 'Budgets', route: '/budgets' },
     ],
@@ -40,8 +41,8 @@ const MENU_SECTIONS = [
   {
     label: 'Customers',
     items: [
-      { label: 'Customer Center', route: '/customers' },
-      { label: 'Create Invoices', route: '/invoices?new=1' },
+      { label: 'Customer Center', route: '/customers', shortcut: 'Ctrl+J' },
+      { label: 'Create Invoices', route: '/invoices?new=1', shortcut: 'Ctrl+I' },
       { label: 'Create Estimates', route: '/estimates' },
       { label: 'Create Sales Orders', route: '/sales-orders' },
       { label: 'Enter Sales Receipts', route: '/sales-receipts' },
@@ -85,10 +86,10 @@ const MENU_SECTIONS = [
   {
     label: 'Banking',
     items: [
-      { label: 'Write Checks', route: '/expenses?new=1' },
+      { label: 'Write Checks', route: '/expenses?new=1', shortcut: 'Ctrl+W' },
       { label: 'Make Deposits', route: '/deposits' },
       { label: 'Transfer Funds', route: '/transfers' },
-      { label: 'Use Register', route: '/registers' },
+      { label: 'Use Register', route: '/registers', shortcut: 'Ctrl+R' },
       { label: 'Reconcile', route: '/reconcile' },
       { label: 'Bank Feeds', route: '/bank-feeds' },
       { label: 'Print Checks', route: '/print-checks' },
@@ -117,10 +118,10 @@ const MENU_SECTIONS = [
   {
     label: 'Lists',
     items: [
-      { label: 'Chart of Accounts', route: '/accounts' },
+      { label: 'Chart of Accounts', route: '/accounts', shortcut: 'Ctrl+A' },
       { label: 'Item List', route: '/items' },
       { label: 'Class and Location Lists', route: '/tracking' },
-      { label: 'Memorized Transaction List', route: '/recurring' },
+      { label: 'Memorized Transaction List', route: '/recurring', shortcut: 'Ctrl+T' },
       { label: 'Templates', route: '/templates' },
       { label: 'Price Levels', route: '/advanced-pricing' },
       { label: 'Sales Rep List', route: '/sales-reps' },
@@ -140,15 +141,23 @@ function menuRoutes() {
 }
 
 /**
- * Electron menu template for the sections, given a navigate(route) callback.
+ * Electron menu template for the sections, given a navigate(route) callback. Shortcut keys are
+ * displayed, not registered (registerAccelerator: false, Windows / Linux). macOS has no such
+ * switch — a menu key equivalent would take the key before the page — so they are left off there.
  * @param {(route: string) => void} navigate
+ * @param {string} [platform] process.platform (for tests)
  */
-function buildSectionMenus(navigate) {
+function buildSectionMenus(navigate, platform = process.platform) {
+  const showKeys = platform !== 'darwin';
   return MENU_SECTIONS.map((section) => ({
     label: section.label,
-    submenu: section.items.map((item) =>
-      'separator' in item ? { type: 'separator' } : { label: item.label, click: () => navigate(item.route) },
-    ),
+    submenu: section.items.map((item) => {
+      if ('separator' in item) return { type: 'separator' };
+      const entry = { label: item.label, click: () => navigate(item.route) };
+      return item.shortcut && showKeys
+        ? { ...entry, accelerator: item.shortcut, registerAccelerator: false }
+        : entry;
+    }),
   }));
 }
 

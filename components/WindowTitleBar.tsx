@@ -12,8 +12,14 @@ import * as React from 'react';
 import { Briefcase } from 'lucide-react';
 import { chromeBridge } from '@/lib/useTheme';
 import { cn } from '@/lib/utils';
+import { formShortcutTarget } from './FormShortcuts';
+import { CompanyFileStatus } from './CompanyFileStatus';
 
-/** Alt+letter opens a menu, QuickBooks' letters (only when the page has no button on that key). */
+/**
+ * Alt+letter opens a menu, QuickBooks' letters — unless the page has a button on that key (an
+ * accesskey) or an open form takes it (Alt+S Save & New, Alt+A Save & Close, Alt+R Revert,
+ * Alt+P / Alt+N Previous / Next: components/FormShortcuts.tsx).
+ */
 const MNEMONICS: Record<string, string> = {
   File: 'f',
   Edit: 'e',
@@ -74,8 +80,10 @@ export default function WindowTitleBar() {
     function onKey(e: KeyboardEvent) {
       if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.defaultPrevented || e.key.length !== 1) return;
       const letter = e.key.toLowerCase();
-      // A button or field on the page owns Alt+<its letter> (forms: Alt+S save, ...).
+      // A button or field on the page owns Alt+<its letter> (batch entry: Alt+S save, ...).
       if (document.querySelector(`[accesskey="${letter}" i]`)) return;
+      // So does an open form with that button (Alt+R Revert, Alt+N Next, ...).
+      if (formShortcutTarget(e)) return;
       const index = menus.findIndex((m) => MNEMONICS[m] === letter);
       if (index < 0) return;
       e.preventDefault();
@@ -128,6 +136,8 @@ export default function WindowTitleBar() {
         <div className="ml-auto hidden min-w-0 truncate pl-4 text-xs text-navy/45 xl:block" title={title}>
           {pageTitle}
         </div>
+        {/* Saved / Saving… / Not saved for a single company file (nothing for older folders). */}
+        <CompanyFileStatus className={cn('shrink-0', 'ml-auto xl:ml-2')} />
       </div>
     </div>
   );

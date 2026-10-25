@@ -5,7 +5,7 @@
  * drop-in for a <Select> of records: `value` is the chosen id ('' = none) and `onChange` gets
  * the new id.
  *
- * Keys are those of <Typeahead> (typing filters, Alt+Down opens, Down / Up move, Enter / Tab take
+ * Keys are those of <Typeahead> (typing filters, Alt+Down / Ctrl+L open, Down / Up move, Enter / Tab take
  * the highlighted entry, Esc closes only the list). While the list is open the field reports
  * aria-expanded="true", so useGridKeys and FormShortcuts leave Enter and the arrows to it; while
  * it is closed, Enter / Down / Up move between lines as before.

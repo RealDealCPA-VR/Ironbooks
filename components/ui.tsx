@@ -12,12 +12,14 @@ import {
   evaluateAmountExpression,
   formatAmountResult,
   isMathExpression,
+  stepDocNumber,
+  useListKeys,
 } from '@/lib/shortcuts';
 import { describeError } from '@/lib/friendlyErrors';
 import type { ErrorFix } from '@/lib/errorFixes';
 
-// Re-export the line-grid keyboard hook so pages can import it from the kit.
-export { useGridKeys, type GridKeysOptions } from '@/lib/shortcuts';
+// Re-export the line-grid and list keyboard hooks so pages can import them from the kit.
+export { useGridKeys, useListKeys, type GridKeysOptions } from '@/lib/shortcuts';
 
 // ---- Spinner ----
 export function Spinner({ className }: { className?: string }) {
@@ -104,8 +106,9 @@ function setNativeInputValue(el: HTMLInputElement, value: string) {
 
 /**
  * Standard text input. Date inputs (type="date") additionally get the QuickBooks
- * date-entry keys: + / - next/previous day, T today, M / H first/last of month,
- * Y / R first/last of year. All other keys (and any key with a modifier held)
+ * date-entry keys: + / - next/previous day, T today, W / K first/last of week,
+ * M / H first/last of month, Y / R first/last of year, [ / ] same day last/next week,
+ * ; / ' same day last/next month. All other keys (and any key with a modifier held)
  * behave exactly as before.
  */
 export const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
@@ -144,6 +147,32 @@ export const DateInput = React.forwardRef<
 >(function DateInput(props, ref) {
   return <Input ref={ref} type="date" {...props} />;
 });
+
+/**
+ * Input for a typed document number (check no., invoice #, estimate no., …): QB's + / - step
+ * the number at the end of the text, keeping its prefix and padding (stepDocNumber in
+ * lib/shortcuts.ts). '-' after letters still types ('INV-'). Marked data-doc-number.
+ */
+export const DocNumberInput = React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
+  function DocNumberInput({ onKeyDown, ...props }, ref) {
+    return (
+      <Input
+        ref={ref}
+        data-doc-number=""
+        {...props}
+        onKeyDown={(e) => {
+          onKeyDown?.(e);
+          const el = e.currentTarget;
+          if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || el.readOnly || el.disabled) return;
+          const next = stepDocNumber(e.key, el.value);
+          if (next === null) return;
+          e.preventDefault();
+          if (next !== el.value) setNativeInputValue(el, next);
+        }}
+      />
+    );
+  },
+);
 
 // ---- AmountInput (QuickMath calculator in amount fields) ----
 
@@ -289,9 +318,17 @@ export function Badge({
 }
 
 // ---- Table primitives ----
+/**
+ * A table of records with QB list keys (useListKeys, lib/shortcuts.ts): arrows / Home / End /
+ * PgUp / PgDn move the highlighted row, Enter opens it, typing a name jumps to it, and
+ * Ctrl+E / Ctrl+D / Ctrl+Q act on it (components/KeyboardCommands.tsx). Rows can refine this
+ * with data-list-label (type-ahead text), data-row-open (Enter clicks the row),
+ * data-quick-report (Ctrl+Q target), data-journal-entry (Ctrl+Y / Ctrl+H) and data-list-skip.
+ */
 export function Table({ children }: { children: React.ReactNode }) {
+  const list = useListKeys<HTMLDivElement>();
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto" {...list}>
       <table className="w-full border-collapse">{children}</table>
     </div>
   );
@@ -342,6 +379,40 @@ const MODAL_SIZES = {
   xl: 'max-w-5xl',
 } as const;
 
+/** The form fields a dialog's first-field focus may land on. */
+const FIRST_FIELD =
+  'input:not([disabled]):not([readonly]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]):not([readonly])';
+
+/**
+ * Recently focused elements (newest last; null = focus went back to the page), so a dialog whose
+ * first field took focus on mount (autoFocus runs before the dialog's effect) still knows which
+ * element opened it and can hand focus back when it closes.
+ */
+const focusHistory: Array<HTMLElement | null> = [];
+if (typeof document !== 'undefined') {
+  const remember = (el: HTMLElement | null) => {
+    focusHistory.push(el);
+    if (focusHistory.length > 20) focusHistory.shift();
+  };
+  document.addEventListener('focusin', (e) => remember(e.target instanceof HTMLElement ? e.target : null), true);
+  document.addEventListener('focusout', (e) => {
+    if (!e.relatedTarget) remember(null);
+  }, true);
+}
+
+/** Open <Modal> dialogs, oldest first (the last one owns Esc and the Tab trap). */
+const openModals: HTMLElement[] = [];
+
+/** The element that had focus before focus moved into `dialog`, or null. */
+function openerOf(dialog: HTMLElement): HTMLElement | null {
+  for (let i = focusHistory.length - 1; i >= 0; i--) {
+    const el = focusHistory[i];
+    if (el && dialog.contains(el)) continue;
+    return el && el.isConnected ? el : null;
+  }
+  return null;
+}
+
 export function Modal({
   open,
   onClose,
@@ -361,17 +432,36 @@ export function Modal({
   const titleId = React.useId();
   const dialogRef = React.useRef<HTMLDivElement>(null);
   const restoreRef = React.useRef<HTMLElement | null>(null);
+  // Callers pass inline onClose arrows: read the latest through a ref so a re-render while the
+  // dialog is open (every keystroke in its fields) doesn't re-run the focus effect below.
+  const onCloseRef = React.useRef(onClose);
+  onCloseRef.current = onClose;
 
-  // Escape-to-close + focus management (trap inside the dialog, restore on close).
+  // Escape-to-close + focus management (first field, trap inside the dialog, restore on close).
   React.useEffect(() => {
     if (!open) return;
-    restoreRef.current = document.activeElement as HTMLElement | null;
-    dialogRef.current?.focus();
+    const dialogEl = dialogRef.current;
+    const active = document.activeElement as HTMLElement | null;
+    // QB: a form opens with the cursor in its first field (Customer / Vendor / Payee). A field
+    // with autoFocus already has it; otherwise take the first field, else the dialog itself.
+    if (dialogEl && active && dialogEl.contains(active)) {
+      restoreRef.current = openerOf(dialogEl);
+    } else {
+      restoreRef.current = active;
+      const first = Array.from(dialogEl?.querySelectorAll<HTMLElement>(FIRST_FIELD) ?? []).find(
+        (el) => el.getClientRects().length > 0,
+      );
+      (first ?? dialogEl)?.focus();
+    }
 
     function onKeyDown(e: KeyboardEvent) {
+      // Only the most recently opened dialog takes Esc / Tab (a confirm over a form closes
+      // alone, like QB's windows).
+      if (openModals[openModals.length - 1] !== dialogRef.current) return;
       if (e.key === 'Escape') {
+        if (e.defaultPrevented) return; // a picker inside used it to close its list
         e.stopPropagation();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key !== 'Tab') return;
@@ -393,12 +483,15 @@ export function Modal({
         first.focus();
       }
     }
+    if (dialogEl) openModals.push(dialogEl);
     document.addEventListener('keydown', onKeyDown);
     return () => {
       document.removeEventListener('keydown', onKeyDown);
+      const i = dialogEl ? openModals.lastIndexOf(dialogEl) : -1;
+      if (i >= 0) openModals.splice(i, 1);
       restoreRef.current?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
   return (
@@ -409,6 +502,7 @@ export function Modal({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        data-modal=""
         tabIndex={-1}
         className={cn(
           'relative z-10 w-full p-6 max-h-full overflow-y-auto rounded-2xl bg-white shadow-2xl border border-slate-200/70 outline-none animate-in fade-in zoom-in-95 duration-150',

@@ -16,8 +16,11 @@
  * invoice with its estimate source, payments applied (and the deposits that
  * banked them), credit memos, and COGS entries; manual entries show
  * reversal/replacement links.
+ *
+ * components/KeyboardCommands.tsx also opens it for the selected register / journal / report
+ * row: QB Ctrl+Y (Transaction Journal) and Ctrl+H (Transaction History, focus="history").
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { CornerDownRight, ExternalLink, History } from 'lucide-react';
 import { Badge, Button, Modal, Table, Th, Td, Tr } from '@/components/ui';
@@ -119,6 +122,11 @@ export interface EntryDetailModalProps {
   /** Journal entry to show; null hides the modal. */
   entryId: string | null;
   onClose: () => void;
+  /**
+   * What the user asked for: 'journal' (QB Ctrl+Y, Transaction Journal: the lines, the default)
+   * or 'history' (Ctrl+H, Transaction History: scrolls to the linked-transactions section).
+   */
+  focus?: 'journal' | 'history';
 }
 
 /** One row in the History tree: indented label link + date + amount. */
@@ -147,13 +155,14 @@ function HistoryRow({ node, depth }: { node: LinkedTransaction; depth: number })
   );
 }
 
-export default function EntryDetailModal({ entryId, onClose }: EntryDetailModalProps) {
+export default function EntryDetailModal({ entryId, onClose, focus = 'journal' }: EntryDetailModalProps) {
   const [entry, setEntry] = useState<EntryDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<LinkedTransaction | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const historyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!entryId) {
@@ -205,6 +214,11 @@ export default function EntryDetailModal({ entryId, onClose }: EntryDetailModalP
       cancelled = true;
     };
   }, [entryId]);
+
+  // Ctrl+H: bring the History section into view once it has loaded.
+  useEffect(() => {
+    if (focus === 'history' && entry && !historyLoading) historyRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [focus, entry, historyLoading]);
 
   const totalDebit = (entry?.lines ?? []).reduce((acc, l) => acc + Number(l.debit ?? 0), 0);
   const totalCredit = (entry?.lines ?? []).reduce((acc, l) => acc + Number(l.credit ?? 0), 0);
@@ -318,7 +332,7 @@ export default function EntryDetailModal({ entryId, onClose }: EntryDetailModalP
           </Table>
 
           {/* History — QB linked-transactions tree */}
-          <div className="mt-6">
+          <div ref={historyRef} className="mt-6">
             <div className="flex items-center gap-1.5 mb-2 text-xs font-semibold text-navy/50 uppercase tracking-wide">
               <History className="h-3.5 w-3.5" />
               History

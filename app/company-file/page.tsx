@@ -1,18 +1,25 @@
 'use client';
 /**
  * Company File management — the QuickBooks-Desktop-style "your file lives wherever you put it"
- * surface. Shows the current file, lets you create/open files anywhere (desktop), lists recent
- * files, and manages the file-open password (works in any build, enforced server-side).
+ * surface. Shows the open company file (a single "ABC Company.ironbooks" file you can copy, back
+ * up and keep on the office file server, or a company folder from an older version, with the
+ * offer to turn it into a single file), whether it is saved, the recent files, sharing it on a
+ * file server, and the optional file-open password (enforced server-side, every build).
  */
 import { useCallback, useEffect, useState } from 'react';
-import { FolderOpen, FilePlus2, Lock, Unlock, HardDrive } from 'lucide-react';
+import { FolderOpen, FilePlus2, Lock, Unlock, HardDrive, Copy, FileArchive, Network, Save } from 'lucide-react';
 import { Button, Card, Input, Label, Modal, PageHeader, Badge, toast } from '@/components/ui';
+import { CompanyFileStatus } from '@/components/CompanyFileStatus';
 import ShareCompanyFileCard from './ShareCompanyFileCard';
 
 interface CurrentFile {
   dir: string;
   name: string;
   passwordProtected: boolean;
+  /** A single company file (current format) rather than a company folder (older format). */
+  singleFile?: boolean;
+  /** Office-network multi-user mode is on (others are working in this file through this computer). */
+  multiUser?: boolean;
 }
 interface RecentFile {
   dir: string;
@@ -28,6 +35,9 @@ interface CompanyBridge {
     open: () => Promise<unknown>;
     switch: (dir: string) => Promise<unknown>;
     setProtected: (val: boolean) => Promise<unknown>;
+    reveal?: () => Promise<unknown>;
+    saveNow?: () => Promise<unknown>;
+    saveCopyAs?: (opts?: { convert?: boolean }) => Promise<unknown>;
   };
 }
 
@@ -78,23 +88,61 @@ export default function CompanyFilePage() {
         <Card className="p-6 mb-6">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
-              <p className="text-sm font-medium text-navy/60">Current company file</p>
+              <p className="text-sm font-medium text-navy/60">This company file</p>
               <p className="text-lg font-bold text-navy truncate">{current?.name ?? '—'}</p>
               {current?.dir && (
-                <p className="text-xs text-navy/40 truncate" title={current.dir}>
+                <p className="font-mono text-xs text-navy/50 break-all select-text" title={current.dir}>
                   {current.dir}
                 </p>
               )}
+              {current?.singleFile && (
+                <div className="mt-2 flex items-center gap-2 text-xs text-navy/60">
+                  <CompanyFileStatus className="-ml-2" />
+                  <span>Ironbooks saves every change into this file a few seconds after you make it, and when you close it.</span>
+                </div>
+              )}
             </div>
-            <div className="flex shrink-0 gap-2">
+            <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
               <Button variant="secondary" onClick={() => bridge()?.company?.newFile?.()}>
-                <FilePlus2 className="h-4 w-4" /> New File
+                <FilePlus2 className="h-4 w-4" /> New Company…
               </Button>
               <Button variant="secondary" onClick={() => bridge()?.company?.open?.()}>
-                <FolderOpen className="h-4 w-4" /> Open File
+                <FolderOpen className="h-4 w-4" /> Open or Restore…
               </Button>
             </div>
           </div>
+
+          {current && (
+            <div className="mt-4 flex flex-wrap gap-2">
+              <Button size="sm" variant="ghost" onClick={() => bridge()?.company?.reveal?.()}>
+                <FolderOpen className="h-4 w-4" /> Show in folder
+              </Button>
+              {current.singleFile && (
+                <Button size="sm" variant="ghost" onClick={() => bridge()?.company?.saveNow?.()}>
+                  <Save className="h-4 w-4" /> Save now
+                </Button>
+              )}
+              <Button size="sm" variant="ghost" onClick={() => bridge()?.company?.saveCopyAs?.()}>
+                <Copy className="h-4 w-4" /> Save a copy…
+              </Button>
+            </div>
+          )}
+
+          {current && current.singleFile === false && (
+            <div className="mt-5 rounded-xl border border-electric/25 bg-electric/[.06] p-4">
+              <p className="flex items-center gap-2 font-semibold text-navy">
+                <FileArchive className="h-4 w-4 text-electric" /> Make this a single company file
+              </p>
+              <p className="mt-1 text-sm text-navy/70">
+                This company is stored as a folder, the format older versions of Ironbooks used. Save it as one
+                file — like a QuickBooks .QBW — that you can copy to a USB drive, keep on your office file server
+                and share with your accountant. Your user names and passwords go with it.
+              </p>
+              <Button className="mt-3" size="sm" onClick={() => bridge()?.company?.saveCopyAs?.({ convert: true })}>
+                Save as a single company file…
+              </Button>
+            </div>
+          )}
 
           {recent.length > 1 && (
             <div className="mt-6">
@@ -123,6 +171,30 @@ export default function CompanyFilePage() {
         </Card>
       )}
 
+      {desktop && current?.singleFile && (
+        <Card className="p-6 mb-6">
+          <p className="flex items-center gap-2 text-lg font-bold text-navy">
+            <Network className="h-5 w-5 text-electric" /> Working from a file server
+          </p>
+          <div className="mt-2 space-y-2 text-sm text-navy/70">
+            <p>
+              Keep the company file on a shared drive (for example <span className="font-mono">S:\Accounting</span> or{' '}
+              <span className="font-mono">\\SERVER\Books</span>) and open it from any computer with Ironbooks.
+            </p>
+            <p>
+              While someone has it open, it is locked: anyone else who opens it sees who is in it and can ask to come in.
+              The person in the file chooses <b>Let Them In</b> (both work at the same time — multi-user mode on your office
+              network, each with their own user name), <b>Hand It Over</b>, or <b>Not Now</b>.
+            </p>
+            <p>
+              {current.multiUser
+                ? 'Multi-user mode is on: others on your network are joining through this computer, so keep Ironbooks open here while they work.'
+                : 'To let people join without asking, choose File > Switch to Multi-user Mode.'}
+            </p>
+          </div>
+        </Card>
+      )}
+
       {/* Portable company file, shareable ledger, transaction log. */}
       <ShareCompanyFileCard />
 
@@ -140,8 +212,8 @@ export default function CompanyFilePage() {
             </p>
             <p className="text-sm text-navy/60 mt-1 max-w-md">
               {lock?.enabled
-                ? 'A password is required to open this company file. It is entered when the file is opened, separate from any user sign-in.'
-                : 'Add a password that must be entered to open this company file. Anyone with the file on disk will need it to view the data.'}
+                ? 'An extra password is asked when this company file is opened, before each person signs in with their own user name.'
+                : 'Everyone already signs in with their own user name and password, stored in this company file. Add a file password if you also want one shared password asked before that.'}
             </p>
           </div>
           <Badge tone={lock?.enabled ? 'success' : 'neutral'}>

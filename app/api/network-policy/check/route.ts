@@ -18,6 +18,7 @@ import { getNetworkPolicy } from '@/lib/services/networkPolicy';
 import { decideOutbound, isOutboundPurpose } from '@/lib/net/policy';
 import { applySandboxToDecision } from '@/lib/services/sandboxState';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { isInternalRequest } from '@/lib/net/internalToken';
 
 async function internalContext(
   req: NextRequest,
@@ -48,7 +49,13 @@ export async function GET(req: NextRequest) {
         { status: 400 },
       );
     }
-    const ctx = (await internalContext(req)) ?? (await getServerContext());
+    const internal = await internalContext(req);
+    if (!internal && isInternalRequest(req)) {
+      // The desktop shell, before anyone has set up this new company file: no policy to apply yet,
+      // and never the session-less first-run fallback (it would put a demo company in the file).
+      return NextResponse.json({ allowed: false, reason: 'This company file has not been set up yet.' });
+    }
+    const ctx = internal ?? (await getServerContext());
     // A question, not a connection — decided without adding to the outbound activity log.
     // Sandbox mode: update checks and email are off in a practice copy.
     return NextResponse.json(applySandboxToDecision(decideOutbound(await getNetworkPolicy(ctx), url, purpose)));

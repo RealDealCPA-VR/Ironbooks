@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { CheckCircle2, ShieldCheck } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { Button, Card, Input, Label, PageHeader, Spinner, toast } from '@/components/ui';
+import { ChallengeQuestionCard } from '@/components/ChallengeQuestionCard';
 import { api } from '@/lib/client';
 
 interface Me {
@@ -12,7 +13,18 @@ interface Me {
   totpEnabled: boolean;
 }
 
+/** Only same-app paths for ?next= (never an open redirect). */
+function safeNext(raw: string | null): string {
+  return raw && raw.startsWith('/') && !raw.startsWith('//') ? raw : '/dashboard';
+}
+
 export default function SecurityPage() {
+  // After sign-in, someone without a challenge question is sent here once (app/login).
+  const [prompt, setPrompt] = useState<{ next: string } | null>(null);
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    if (q.get('challenge') === '1') setPrompt({ next: safeNext(q.get('next')) });
+  }, []);
   const [secret, setSecret] = useState('');
   const [otpUrl, setOtpUrl] = useState('');
   const [code, setCode] = useState('');
@@ -84,6 +96,12 @@ export default function SecurityPage() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Security" icon={ShieldCheck} />
+      <div className="mb-6">
+        <ChallengeQuestionCard
+          prompt={Boolean(prompt)}
+          onDone={prompt ? () => (window.location.href = prompt.next) : undefined}
+        />
+      </div>
       <Card className="p-6 max-w-xl">
         <h2 className="text-lg font-bold text-navy mb-1">Two-Factor Authentication (TOTP)</h2>
         <p className="text-sm text-navy/50 mb-4">

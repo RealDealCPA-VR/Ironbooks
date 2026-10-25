@@ -95,15 +95,20 @@ export function companyFileId(): string {
 /**
  * `sid` (multi-user hosting) binds the cookie to a server-side `user_sessions` row so an admin
  * can see who is logged in and sign a session out; see getSessionInfo below. `fid` binds it to
- * this company file (see companyFileId).
+ * this company file (see companyFileId). `ln` binds it to this OPEN of the file in the desktop
+ * app (the shell's per-launch token, like the unlock token below): QuickBooks asks for your user
+ * name and password every time a company file is opened, and so does Ironbooks — closing the
+ * file or the app ends every sign-in to it.
  */
 export function createSessionToken(userId: string, kind: TokenKind = 'user', sid?: string): string {
+  const ln = launchNonce();
   const payload = JSON.stringify({
     userId,
     kind,
     fid: companyFileId(),
     exp: Date.now() + SESSION_TTL_MS,
     ...(sid ? { sid } : {}),
+    ...(ln ? { ln: launchBinding(ln) } : {}),
   });
   const body = Buffer.from(payload).toString('base64url');
   return `${body}.${sign(body)}`;
@@ -132,6 +137,10 @@ export function verifySessionToken(
     // Bind the token to the company file it was issued by (legacy tokens without `fid` are
     // rejected → one re-login after upgrading).
     if (data.fid !== companyFileId()) return null;
+    // …and, in the desktop app, a company user's sign-in to this open of the file (see
+    // createSessionToken). Employee self-service portal sessions keep their own rules.
+    const ln = launchNonce();
+    if (ln && kind === 'user' && data.ln !== launchBinding(ln)) return null;
     return {
       userId: data.userId,
       ...(typeof data.sid === 'string' ? { sid: data.sid } : {}),
@@ -157,10 +166,18 @@ function launchNonce(): string {
   return process.env.BKA_INTERNAL_TOKEN || '';
 }
 
+/**
+ * What a session cookie carries to tie it to this launch: a hash, never the shell's token itself
+ * (the token authenticates the shell's own calls, and cookies can be read by the person signed in).
+ */
+function launchBinding(nonce: string): string {
+  return crypto.createHash('sha256').update(`ironbooks-session-launch:${nonce}`).digest('base64url').slice(0, 22);
+}
+
 export function createUnlockToken(): string {
   const payload = JSON.stringify({
     dir: resolveDataDir(),
-    nonce: launchNonce(),
+    nonce: launchBinding(launchNonce()),
     exp: Date.now() + UNLOCK_TTL_MS,
   });
   const body = Buffer.from(payload).toString('base64url');
@@ -182,7 +199,7 @@ export function verifyUnlockToken(token: string | undefined | null): boolean {
     const data = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
     if (typeof data.exp !== 'number' || Date.now() > data.exp) return false;
     if (data.dir !== resolveDataDir()) return false;
-    if ((data.nonce ?? '') !== launchNonce()) return false;
+    if ((data.nonce ?? '') !== launchBinding(launchNonce())) return false;
     return true;
   } catch {
     return false;

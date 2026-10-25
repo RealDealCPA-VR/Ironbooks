@@ -18,9 +18,10 @@ const ACCENT_RGB = {
 };
 
 /**
- * The recent company files as the screen lists them, most recent first.
+ * The recent company files as the screen lists them, most recent first. Each is a single company
+ * file ("ABC Company.ironbooks") or a company folder from an older version.
  * @param {unknown} recents   config.recentCompanies
- * @param {{ exists: (dir: string) => boolean, readManifest: (dir: string) => any, companyName: (dir: string) => string }} io
+ * @param {{ exists: (loc: string) => boolean, readManifest: (loc: string) => any, companyName: (loc: string) => string, inUseBy?: (loc: string) => string | null }} io
  */
 function recentEntries(recents, io) {
   return (Array.isArray(recents) ? recents : [])
@@ -28,18 +29,25 @@ function recentEntries(recents, io) {
     .map((dir) => {
       const exists = io.exists(dir);
       const m = (exists && io.readManifest(dir)) || {};
+      let inUseBy = null;
+      try {
+        inUseBy = exists && io.inUseBy ? io.inUseBy(dir) : null;
+      } catch {
+        inUseBy = null;
+      }
       return {
         dir,
         name: io.companyName(dir),
         exists,
         lastOpenedAt: typeof m.lastOpenedAt === 'string' ? m.lastOpenedAt : null,
         passwordProtected: Boolean(m.passwordProtected),
+        inUseBy: typeof inUseBy === 'string' && inUseBy ? inUseBy : null,
       };
     });
 }
 
 /** The page. Theme colors are baked in; names and paths are filled in with textContent only. */
-function startScreenHtml({ dark, accent, platform }) {
+function startScreenHtml({ dark, accent, platform, firstRun = false }) {
   const [light, darkAccent] = ACCENT_RGB[accent] || ACCENT_RGB.blue;
   const pad = platform === 'darwin' ? '80px' : '14px';
   return `<!doctype html>
@@ -75,6 +83,10 @@ function startScreenHtml({ dark, accent, platform }) {
   .missing { background: rgb(255 69 58 / .14); color: rgb(215 0 21); }
   [data-scheme='dark'] .missing { color: rgb(255 120 110); }
   .lock { background: rgb(var(--ink) / .07); color: rgb(var(--muted)); }
+  .inuse { background: rgb(255 159 10 / .16); color: rgb(160 90 0); }
+  [data-scheme='dark'] .inuse { color: rgb(255 190 90); }
+  .hint { font-size: 12px; color: rgb(var(--muted)); text-align: center; margin-top: 10px; }
+  kbd { font: 11px ui-monospace, "Cascadia Mono", Consolas, monospace; padding: 1px 5px; border: 1px solid rgb(var(--line)); border-bottom-width: 2px; border-radius: 5px; background: rgb(var(--surface)); }
   .empty { padding: 28px 24px; color: rgb(var(--muted)); text-align: center; }
   .actions { display: flex; gap: 8px; align-items: center; padding: 14px 18px; border-top: 1px solid rgb(var(--line) / .7); }
   .spacer { flex: 1; }
@@ -93,11 +105,15 @@ function startScreenHtml({ dark, accent, platform }) {
   <section class="card" aria-labelledby="title">
     <div class="head">
       <div class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg></div>
-      <div><h1 id="title">No company open</h1><p class="sub">Choose a company file to open, or create a new one.</p></div>
+      <div>${
+        firstRun
+          ? '<h1 id="title">Welcome to Ironbooks</h1><p class="sub">Create your first company file, or open one you already have (it can be on this computer, a USB drive or your office file server). Coming from QuickBooks? Create a company, then choose File &gt; Migrate from QuickBooks to bring your lists and history.</p>'
+          : '<h1 id="title">No company open</h1><p class="sub">Select a company file and press Enter, or create a new one. A company file can be on this computer, a USB drive or your office file server.</p>'
+      }</div>
     </div>
     <div class="cols" aria-hidden="true"><span>Company file and location</span><span>Last opened</span></div>
     <ul id="list" role="listbox" tabindex="0" aria-label="Recent company files"></ul>
-    <div id="empty" class="empty" hidden>No recent company files yet. Open one from its folder, or create a new company.</div>
+    <div id="empty" class="empty" hidden>No recent company files yet. Open one (it can be on your office file server), or create a new company.</div>
     <div class="actions">
       <button id="reveal" disabled>Show in folder</button>
       <button id="remove" disabled>Remove from list</button>
@@ -106,9 +122,10 @@ function startScreenHtml({ dark, accent, platform }) {
     </div>
   </section>
   <div class="foot">
-    <button id="new">Create a new company…</button>
-    <button id="browse">Open another company file…</button>
+    <button id="new"${firstRun ? ' class="primary"' : ''}>Create a new company…</button>
+    <button id="browse">Open or restore a company file…</button>
   </div>
+  <p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> choose · <kbd>Enter</kbd> open · <kbd>Ctrl</kbd>+<kbd>O</kbd> browse · <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> new company · <kbd>Delete</kbd> remove from list</p>
 </main>
 <script>
 (function () {
@@ -150,6 +167,7 @@ function startScreenHtml({ dark, accent, platform }) {
       var name = el('div', 'name');
       name.appendChild(el('span', null, r.name));
       if (!r.exists) name.appendChild(el('span', 'badge missing', 'Not found'));
+      if (r.inUseBy) name.appendChild(el('span', 'badge inuse', 'In use by ' + r.inUseBy));
       if (r.passwordProtected) name.appendChild(el('span', 'badge lock', 'Password'));
       left.appendChild(name);
       var p = el('div', 'path', r.dir);
@@ -171,7 +189,18 @@ function startScreenHtml({ dark, accent, platform }) {
   list.addEventListener('keydown', function (e) {
     if (e.key === 'ArrowDown') { e.preventDefault(); select(Math.min(selected + 1, rows.length - 1)); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); select(Math.max(selected - 1, 0)); }
+    else if (e.key === 'Home') { e.preventDefault(); select(0); }
+    else if (e.key === 'End') { e.preventDefault(); select(rows.length - 1); }
     else if (e.key === 'Enter') { e.preventDefault(); open(); }
+    else if (e.key === 'Delete') { e.preventDefault(); var r = rows[selected]; if (r) api.remove(r.dir).then(load); }
+    else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // Type the first letters of a company name to jump to it.
+      var k = e.key.toLowerCase();
+      for (var i = 1; i <= rows.length; i++) {
+        var j = (selected + i) % rows.length;
+        if (rows[j].name.toLowerCase().indexOf(k) === 0) { select(j); break; }
+      }
+    }
   });
   document.getElementById('open').addEventListener('click', open);
   document.getElementById('remove').addEventListener('click', function () {

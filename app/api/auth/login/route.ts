@@ -147,6 +147,8 @@ async function handlePost(req: NextRequest) {
       email: user.email,
       companyId,
       ...(passwordChange ? { mustChangePassword: true, passwordChangeReason: passwordChange } : {}),
+      // No challenge question yet: the sign-in screen offers to set one ("I forgot my password").
+      ...(!user.challengeQuestion || !user.challengeAnswerHash ? { challengeMissing: true } : {}),
     });
     const opts = { httpOnly: true, secure: cookieSecure(origin), sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
     res.cookies.set(SESSION_COOKIE, createSessionToken(user.id, 'user', session.id), opts);

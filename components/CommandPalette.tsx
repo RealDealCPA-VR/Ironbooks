@@ -1,6 +1,6 @@
 'use client';
 /**
- * Command bar (Ctrl+K / Cmd+K, Ctrl+F, or the "Search or type a command" button) — mounted
+ * Command bar (Ctrl+K / Cmd+K, or the "Search or type a command" button) — mounted
  * once from the app shell (components/AppShell.tsx).
  *
  * One box, five sources, all limited to what this person may use (same rules as the sidebar):
@@ -17,7 +17,7 @@
  * Keyboard: ↑/↓ move, Enter runs, Esc closes. ARIA: dialog + combobox + listbox with groups.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { Search, Sparkles, CornerDownLeft } from 'lucide-react';
 import { api, ApiError } from '@/lib/client';
 import { searchPages } from '@/lib/nav';
@@ -129,16 +129,19 @@ export default function CommandPalette({
     setActive(0);
   }, []);
 
-  // Open / close: Ctrl/Cmd+K toggles, Ctrl/Cmd+F opens (QB "Find"), the header button and
-  // openCommandBar() dispatch OPEN_COMMAND_BAR_EVENT.
+  // A QB shortcut typed in the box (Ctrl+I, Ctrl+W, …) moves to another page: close behind it.
+  const pathname = usePathname();
+  useEffect(() => setOpen(false), [pathname]);
+
+  // Open / close: Ctrl/Cmd+K toggles; the header button and openCommandBar() dispatch
+  // OPEN_COMMAND_BAR_EVENT. (Ctrl+F is QB's Find: the Find Transactions page, lib/shortcuts.ts.)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      const k = e.key.toLowerCase();
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && (k === 'k' || k === 'f')) {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setOpen((o) => {
           if (!o) restoreFocus.current = document.activeElement as HTMLElement | null;
-          return k === 'f' ? true : !o;
+          return !o;
         });
       }
     }

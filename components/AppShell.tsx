@@ -29,15 +29,19 @@ import UndoToast from './UndoToast';
 import ReceiptDropZone from './ReceiptDropZone'; // receipt capture: drop a receipt anywhere
 import { BackupIndicator, BackupWarningBanner } from './BackupStatus'; // team backups
 import FormShortcuts from './FormShortcuts';
+import KeyboardCommands from './KeyboardCommands';
 import {
   AMOUNT_KEY_HELP,
   DATE_KEY_HELP,
   FORM_KEY_HELP,
   GLOBAL_SHORTCUTS,
   GRID_KEY_HELP,
+  LIST_KEY_HELP,
+  NUMBER_KEY_HELP,
+  globalShortcutFor,
   isEditableTarget,
 } from '@/lib/shortcuts';
-import { Modal, toast } from '@/components/ui';
+import { ConfirmDialog, Modal, toast } from '@/components/ui';
 import { Briefcase, Building2, ChevronDown, ChevronRight, LogOut, Search, Sparkles } from 'lucide-react';
 
 // Routes that render without the app chrome (full-screen).
@@ -302,27 +306,57 @@ function ShortcutRow({ keys, description }: { keys: string; description: string 
   );
 }
 
+function ShortcutGroup({ title, rows }: { title: string; rows: { keys: string; description: string }[] }) {
+  return (
+    <div>
+      <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40 mb-1">{title}</div>
+      {rows.map((s) => (
+        <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
+      ))}
+    </div>
+  );
+}
+
 /**
- * App-wide keyboard shortcuts (QB parity): Ctrl+I/E/R/J/D navigation, "?" opens the
- * shortcuts help. Keystrokes inside inputs/textareas/selects are ignored; Ctrl+K /
- * Ctrl+F (palette) are handled by CommandPalette itself.
+ * Leaving the page now could drop typed work: a form dialog (with fields) is open, or the
+ * cursor is in a field on the page. The app shows one page at a time where QB would open a
+ * second window, so navigation shortcuts ask first.
+ */
+function mightLoseWork(target: EventTarget | null): boolean {
+  const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"][data-modal]'));
+  if (dialogs.some((d) => d.querySelector('input:not([type="hidden"]), select, textarea'))) return true;
+  const el = target as HTMLElement | null;
+  return isEditableTarget(el) && !!el?.closest('main') && (el as HTMLInputElement).type !== 'search';
+}
+
+/**
+ * App-wide keyboard shortcuts (QB Desktop's keys, GLOBAL_SHORTCUTS in lib/shortcuts.ts):
+ * Ctrl+W Write Checks, Ctrl+I Create Invoices, Ctrl+J Customer Center, Ctrl+A Chart of
+ * Accounts, Ctrl+R Use Register, Ctrl+T Memorized Transactions, Ctrl+F Find — from inside
+ * fields too, as in QB (except Ctrl+A, which selects a field's text) — and "?" opens the
+ * shortcuts help. The other commands (Ctrl+E / D / P / Y / H / Q / L, F1) are
+ * components/KeyboardCommands.tsx; Ctrl+K is CommandPalette; Ctrl+M is MemorizeButton.
  */
 function GlobalShortcuts() {
   const router = useRouter();
   const [helpOpen, setHelpOpen] = React.useState(false);
+  const [leaveTo, setLeaveTo] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.defaultPrevented || isEditableTarget(e.target)) return;
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
-        const sc = GLOBAL_SHORTCUTS.find((s) => s.ctrlKey === e.key.toLowerCase());
-        if (sc?.href) {
-          e.preventDefault();
-          router.push(sc.href);
-        }
+      if (e.defaultPrevented || e.isComposing) return;
+      const editable = isEditableTarget(e.target);
+      const sc = globalShortcutFor(e, editable);
+      if (sc?.href) {
+        e.preventDefault();
+        setHelpOpen(false);
+        // Already there (Ctrl+F on Find): QB just brings that window forward.
+        if (sc.href === window.location.pathname) return;
+        if (mightLoseWork(e.target)) setLeaveTo(sc.href);
+        else router.push(sc.href);
         return;
       }
-      if (e.key === '?' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (e.key === '?' && !editable && !e.ctrlKey && !e.metaKey && !e.altKey) {
         e.preventDefault();
         setHelpOpen(true);
       }
@@ -332,50 +366,34 @@ function GlobalShortcuts() {
   }, [router]);
 
   return (
-    <Modal open={helpOpen} onClose={() => setHelpOpen(false)} title="Keyboard Shortcuts" size="md">
-      <div className="space-y-4">
-        <div>
-          <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40 mb-1">
-            Anywhere
+    <>
+      <Modal open={helpOpen} onClose={() => setHelpOpen(false)} title="Keyboard Shortcuts (QuickBooks keys)" size="lg">
+        <div className="grid grid-cols-1 gap-x-8 gap-y-4 md:grid-cols-2">
+          <div className="space-y-4">
+            <ShortcutGroup title="Anywhere" rows={GLOBAL_SHORTCUTS} />
           </div>
-          {GLOBAL_SHORTCUTS.map((s) => (
-            <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
-          ))}
-        </div>
-        <div>
-          <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40 mb-1">
-            Forms
+          <div className="space-y-4">
+            <ShortcutGroup title="Forms" rows={FORM_KEY_HELP} />
+            <ShortcutGroup title="Lists, centers & registers" rows={LIST_KEY_HELP} />
+            <ShortcutGroup title="Date fields" rows={DATE_KEY_HELP} />
+            <ShortcutGroup title="Amount & number fields" rows={[...AMOUNT_KEY_HELP, ...NUMBER_KEY_HELP]} />
+            <ShortcutGroup title="Line grids" rows={GRID_KEY_HELP} />
           </div>
-          {FORM_KEY_HELP.map((s) => (
-            <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
-          ))}
         </div>
-        <div>
-          <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40 mb-1">
-            Date fields
-          </div>
-          {DATE_KEY_HELP.map((s) => (
-            <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
-          ))}
-        </div>
-        <div>
-          <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40 mb-1">
-            Amount fields
-          </div>
-          {AMOUNT_KEY_HELP.map((s) => (
-            <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
-          ))}
-        </div>
-        <div>
-          <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40 mb-1">
-            Line grids
-          </div>
-          {GRID_KEY_HELP.map((s) => (
-            <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
-          ))}
-        </div>
-      </div>
-    </Modal>
+      </Modal>
+      <ConfirmDialog
+        open={leaveTo !== null}
+        title="Leave this form?"
+        message="Ironbooks shows one window at a time. Anything typed here and not saved will be lost."
+        confirmLabel="Leave"
+        onConfirm={() => {
+          const href = leaveTo;
+          setLeaveTo(null);
+          if (href) router.push(href);
+        }}
+        onClose={() => setLeaveTo(null)}
+      />
+    </>
   );
 }
 
@@ -752,7 +770,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <header className="relative z-20 flex items-center justify-end gap-3 px-6 pt-4 pb-1">
           {/* "What is this page?" — plain-language help for the current screen (lib/pageHelp.ts). */}
           {pageHelpFor(pathname) ? (
-            <span className="mr-auto text-sm text-navy/60">
+            <span className="mr-auto text-sm text-navy/60" data-page-help>
               <Help key={pathname} page={pathname} side="bottom">
                 What is this page?
               </Help>
@@ -792,6 +810,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <UndoToast />
       <ReceiptDropZone enabled={canDo(me, 'lists', 'create')} />
       <FormShortcuts />
+      <KeyboardCommands />
       <TitleSync company={company?.name ?? null} />
     </div>
   );

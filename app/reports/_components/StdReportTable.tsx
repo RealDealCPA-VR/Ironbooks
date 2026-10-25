@@ -6,11 +6,14 @@
  * the user's number format (lib/reports/format.ts), and QuickZoom on every row:
  *  - a row / cell with an href opens that report or page,
  *  - a transaction row (entryId) opens the transaction detail (EntryDetailModal).
+ * QB list keys move through the rows (useListKeys): Enter QuickZooms the highlighted row, and
+ * Ctrl+Y / Ctrl+H show a transaction row's journal / history (components/KeyboardCommands.tsx).
  */
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import EntryDetailModal from '@/components/EntryDetailModal';
+import { useListKeys } from '@/lib/shortcuts';
 import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
 import { FONT_CLASS, FONT_SIZE_CLASS, formatAmount, type NumberFormat } from '@/lib/reports/format';
 import { drilldownApiUrl, drilldownHref, isDrilldownReport } from '@/lib/reports/drilldown';
@@ -82,6 +85,7 @@ export default function StdReportTable({
   explain?: ExplainContext;
 }) {
   const [entryId, setEntryId] = useState<string | null>(null);
+  const listKeys = useListKeys<HTMLDivElement>();
   const byId = useMemo(() => new Map(report.rows.map((r) => [r.id, r])), [report]);
   const columns = report.columns.filter((c, i) => i === 0 || !hiddenColumns?.has(c.key));
   const explainAll = !!explain && isDrilldownReport(explain.reportKey);
@@ -123,7 +127,7 @@ export default function StdReportTable({
   };
 
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto" {...listKeys}>
       <table className={`w-full border-collapse ${FONT_CLASS[format.font]} ${FONT_SIZE_CLASS[format.fontSize]}`}>
         <thead>
           <tr className="border-b-2 border-navy/20">
@@ -156,7 +160,12 @@ export default function StdReportTable({
             const canToggle = !!r.collapsedCells;
             const openEntry = r.entryId ? () => setEntryId(r.entryId!) : undefined;
             return (
-              <tr key={r.id} className={`border-b border-slate-100 ${rowClass(r)} ${openEntry ? 'cursor-pointer' : ''}`} onDoubleClick={openEntry}>
+              <tr
+                key={r.id}
+                className={`border-b border-slate-100 ${rowClass(r)} ${openEntry ? 'cursor-pointer' : ''}`}
+                onDoubleClick={openEntry}
+                data-journal-entry={r.entryId ?? undefined}
+              >
                 {columns.map((c, i) => {
                   const v = cells[c.key] ?? null;
                   const content = renderValue(c, v);

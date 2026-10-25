@@ -126,6 +126,11 @@ export default function DesktopBridge() {
         b.company?.open?.();
         return;
       }
+      // File > Save Company File Now finished.
+      if (action === 'company-file-saved') {
+        toast('Company file saved.', 'success');
+        return;
+      }
       // File / Help > Try It on a Copy: one click makes the copy and the shell relaunches into it.
       if (action === 'sandbox-start') {
         toast('Making a copy of your company file…', 'info');

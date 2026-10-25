@@ -21,6 +21,12 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session }
 (function useLegacyUserDataIfPresent() {
   const fs = require('node:fs');
   const path = require('node:path');
+  // IRONBOOKS_USER_DATA: keep this app's settings (recent files, window, backups folder) in a
+  // folder of your choosing — IT deployments, a portable setup, and the desktop tests.
+  if (process.env.IRONBOOKS_USER_DATA) {
+    app.setPath('userData', path.resolve(process.env.IRONBOOKS_USER_DATA));
+    return;
+  }
   try {
     if (fs.existsSync(app.getPath('userData'))) return;
     const appData = app.getPath('appData');
@@ -45,6 +51,10 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const net = require('node:net');
 const companyFile = require('./companyFile');
+const companyFileFormat = require('./companyFileFormat');
+const companyLock = require('./companyLock');
+const companySession = require('./companySession');
+const selfSignedCert = require('./selfSignedCert');
 const hostingCore = require('./hostingCore');
 const hosting = require('./hosting');
 const security = require('./security');
@@ -59,6 +69,23 @@ let serverProcess = null;
 let serverUrl = null;
 /** Set once the quit-time auto-backup has run (or been skipped) so app.quit() proceeds. */
 let quittingAfterBackup = false;
+/** Relaunch once the quit has finished (set by relaunchApp; a cancelled quit cancels it too). */
+let relaunchAfterQuit = false;
+
+/**
+ * Restart into another company file / mode: quit (the open company file is backed up, saved and
+ * released on the way out — before-quit), then start again. If the save fails and the person
+ * chooses to keep working, nothing restarts.
+ */
+function relaunchApp() {
+  relaunchAfterQuit = true;
+  app.quit();
+}
+
+/** The main window for a dialog's parent, if it is still there. */
+function parentWindow() {
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+}
 /** A .bka file the OS asked us to open (double-click / "Open with" / argv). */
 let pendingBkaPath = null;
 /** A .bkp portable company file the OS asked us to open. */
@@ -72,6 +99,21 @@ let remoteHostOrigin = null;
 /** Multi-user: this app is HOSTING its company file for the tailnet (electron/hosting.js). */
 let hostingState = null;
 let hostingError = null;
+/**
+ * The single company file this window has open ("ABC Company.ironbooks", QuickBooks .QBW style):
+ * { path, lock, workDir, dataDir, plan, appUser }. The app server runs on the private working
+ * copy (dataDir) and saves it back to `path` (lib/services/companyFileSave.ts); `lock` is this
+ * computer's hold on the file (electron/companyLock.js). Null for an older company folder, a
+ * multi-user client, or No Company Open.
+ */
+let openFile = null;
+/** A .ironbooks company file the OS asked us to open (double-click / "Open with" / argv). */
+let pendingCompanyPath = null;
+/**
+ * Multi-user client of a company file on the shared drive: the host's certificate fingerprint
+ * (office-network hosting serves its own certificate, which we accept only when it matches).
+ */
+let remotePin = null;
 
 // Per-launch secret shared with the local Next server so the main process can make
 // authenticated "system" calls (e.g. the launch-time recurring run). The server is bound to
@@ -108,6 +150,11 @@ function deliverPendingBka() {
   if (!pendingBkaPath || !mainWindow) return;
   const filePath = pendingBkaPath;
   pendingBkaPath = null;
+  // No company open: there is nothing to restore into, so restore it as a new company file.
+  if (startScreenMode) {
+    restoreBackupAsNewFileFlow(filePath).catch((err) => console.error('[restore] backup:', err));
+    return;
+  }
   navigate(`/backup?file=${encodeURIComponent(filePath)}`);
 }
 
@@ -133,8 +180,27 @@ function deliverPendingBkp() {
 
 pendingBkpPath = extractBkpPath(process.argv);
 
+// .ironbooks (single company file) association: open it as the company file, like double-clicking
+// a .QBW. A second launch (the app is running) forwards it through 'second-instance'.
+function extractCompanyPath(argv) {
+  for (const arg of argv.slice(1)) {
+    if (typeof arg === 'string' && !arg.startsWith('-') && arg.toLowerCase().endsWith('.ironbooks')) {
+      return path.resolve(arg);
+    }
+  }
+  return null;
+}
+
+pendingCompanyPath = extractCompanyPath(process.argv);
+
 app.on('open-file', (event, filePath) => {
   const lower = (filePath || '').toLowerCase();
+  if (lower.endsWith('.ironbooks')) {
+    event.preventDefault();
+    if (app.isReady() && mainWindow) openCompanyFromOs(filePath);
+    else pendingCompanyPath = path.resolve(filePath);
+    return;
+  }
   if (lower.endsWith('.bkp')) {
     event.preventDefault();
     pendingBkpPath = filePath;
@@ -155,9 +221,16 @@ app.on('open-file', (event, filePath) => {
 //                        0/negative = off). The schedule itself now lives with each company
 //                        file and is changed on the Back Up & Restore page; the server process
 //                        runs it (lib/services/backupSchedule.ts).
-//   dataDir              active company data directory (multi-company support);
-//                        the BKA_DATA_DIR env var overrides it for one launch
-//   recentCompanies      most-recently-opened company directories (File menu)
+//   companyFile          the active single company file ("ABC Company.ironbooks"); while set it
+//                        wins over dataDir. Opened into a working copy on this computer
+//                        (electron/companySession.js) and saved back to the file.
+//   dataDir              active company folder (older format), used when companyFile is not set;
+//                        the BKA_DATA_DIR env var overrides both for one launch
+//   recentCompanies      most-recently-opened company files and folders (File menu)
+//   lastUsers            { <company file path>: user name } — the sign-in screen pre-fills the
+//                        user name last used for that file on this computer, like QuickBooks
+//   remotePin / remoteFile  multi-user client of a company file on the shared drive: the host's
+//                        certificate fingerprint and the company file it is hosting
 //   hosting              multi-user hosting { enabled, port, tls, bindAll } — bindAll (listen
 //                        on every interface instead of only the Tailscale address) is never
 //                        set by the UI; it must be edited in deliberately
@@ -203,13 +276,38 @@ function rememberRecentCompany(dir) {
   return recents;
 }
 
-/** Persist `dir` as the active company folder and relaunch into it. */
-function openCompanyDir(dir) {
+/**
+ * Make `location` (a single company file, or an older company folder) the active company file and
+ * relaunch into it. The one open now is saved, backed up and released on the way out (before-quit).
+ */
+function openCompany(location) {
   // Opening a local file leaves any remote host, and ends "No Company Open".
-  saveConfig({ dataDir: dir, remoteHost: null, companyClosed: false });
-  rememberRecentCompany(dir);
-  app.relaunch();
-  app.quit(); // before-quit still snapshots the current company on the way out
+  const single = companyFile.isSingleFile(location);
+  saveConfig({
+    ...(single ? { companyFile: location } : { dataDir: location, companyFile: null }),
+    remoteHost: null,
+    remotePin: null,
+    remoteFile: null,
+    companyClosed: false,
+  });
+  rememberRecentCompany(location);
+  relaunchApp();
+}
+
+/** The user name last used to sign in to `location` on this computer (sign-in screen pre-fill). */
+function lastUserFor(location) {
+  const users = loadConfig().lastUsers;
+  const v = users && typeof users === 'object' ? users[location] : null;
+  return typeof v === 'string' && v ? v : null;
+}
+
+function rememberLastUser(location, name) {
+  const users = loadConfig().lastUsers;
+  const next = { ...(users && typeof users === 'object' ? users : {}), [location]: name };
+  // Keep it small: the most recent dozen files.
+  const keys = Object.keys(next);
+  for (const k of keys.slice(0, Math.max(0, keys.length - 12))) delete next[k];
+  saveConfig({ lastUsers: next });
 }
 
 // ---------------------------------------------------------------------------
@@ -338,12 +436,32 @@ function companiesRoot() {
  */
 function activeCompanyDir() {
   const cfg = loadConfig();
+  const singleFile = !process.env.BKA_DATA_DIR && typeof cfg.companyFile === 'string' && cfg.companyFile ? cfg.companyFile : null;
   const dir =
     process.env.BKA_DATA_DIR ||
+    (openFile && openFile.dataDir) ||
+    // A single company file runs on its working copy on this computer (electron/companySession.js).
+    (singleFile && companySession.dataDirOf(companySession.workingDirFor(singleFile, workingRoot()))) ||
     (typeof cfg.dataDir === 'string' && cfg.dataDir) ||
     path.join(companiesRoot(), 'default');
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Where working copies of open company files live (never a roaming profile). */
+function workingRoot() {
+  return companySession.workingRoot({ userData: app.getPath('userData') });
+}
+
+/**
+ * The open company file as people know it: the .ironbooks file (or, for an older company, its
+ * folder). This is what Recent Companies, Show in Folder and the title bar refer to.
+ */
+function currentCompanyLocation() {
+  if (openFile) return openFile.path;
+  const cfg = loadConfig();
+  if (!process.env.BKA_DATA_DIR && typeof cfg.companyFile === 'string' && cfg.companyFile) return cfg.companyFile;
+  return activeCompanyDir();
 }
 
 // ---------------------------------------------------------------------------
@@ -386,8 +504,13 @@ function reconcileSandboxConfig() {
     return;
   }
   if (!fs.existsSync(sb.dir) || !companyFile.readSandboxMarker(sb.dir)) {
-    saveConfig({ dataDir: sb.realDir, sandbox: null });
+    saveConfig({ ...realCompanyConfig(sb), sandbox: null });
   }
+}
+
+/** Config that points back at the real company file a sandbox was made from. */
+function realCompanyConfig(sb) {
+  return typeof sb.realFile === 'string' && sb.realFile ? { companyFile: sb.realFile } : { dataDir: sb.realDir, companyFile: null };
 }
 
 function samePath(a, b) {
@@ -402,10 +525,15 @@ ipcMain.handle('sandbox:entered', (e, dir) => {
   // Only a sandbox copy of the file this shell has open (the server just made it).
   if (!marker || marker.kind !== 'sandbox') return false;
   if (!isDev && !samePath(marker.realDataDir, activeCompanyDir())) return false;
-  saveConfig({ dataDir: dir, sandbox: { dir, realDir: marker.realDataDir } });
+  // From a single company file, the sandbox runs on a copy of its working copy; leaving goes
+  // back to the company file itself (realFile).
+  saveConfig({
+    dataDir: dir,
+    companyFile: null,
+    sandbox: { dir, realDir: marker.realDataDir, realFile: openFile ? openFile.path : null },
+  });
   setImmediate(() => {
-    app.relaunch();
-    app.quit();
+    relaunchApp();
   });
   return true;
 });
@@ -414,15 +542,14 @@ ipcMain.handle('sandbox:left', (e, opts) => {
   if (!fromLocalApp(e)) return false;
   const sb = loadConfig().sandbox;
   if (!sb || typeof sb.realDir !== 'string') return false;
-  saveConfig({ dataDir: sb.realDir, sandbox: null });
+  saveConfig({ ...realCompanyConfig(sb), sandbox: null });
   const trainingDir = opts && typeof opts.trainingDir === 'string' ? opts.trainingDir : null;
   const kept = trainingDir ? companyFile.readSandboxMarker(trainingDir) : null;
   // A kept training file shows up under File > Recent Companies (it opens like any other file).
   if (kept && kept.kind === 'training') rememberRecentCompany(trainingDir);
-  rememberRecentCompany(sb.realDir);
+  rememberRecentCompany(sb.realFile || sb.realDir);
   setImmediate(() => {
-    app.relaunch();
-    app.quit();
+    relaunchApp();
   });
   return true;
 });
@@ -434,17 +561,19 @@ ipcMain.handle('sandbox:left', (e, opts) => {
  * on-quit auto-backup runs on the way out), so the file can be moved, copied or backed up.
  * Connected to a host, it disconnects.
  */
-async function closeCompanyFlow() {
+async function closeCompanyFlow({ skipConfirm = false } = {}) {
   if (sandboxActive()) {
     await dialog.showMessageBox(mainWindow, {
+      noLink: true,
       type: 'info',
       message: 'Leave the sandbox first',
       detail: 'This is a practice copy. Leave the sandbox (File menu), then close the company file.',
     });
     return;
   }
-  if (hostingState) {
+  if (hostingState && !skipConfirm) {
     const { response } = await dialog.showMessageBox(mainWindow, {
+      noLink: true,
       type: 'warning',
       message: 'Close the company file?',
       detail: 'You are hosting multi-user access. Teammates who have this company file open will be disconnected.',
@@ -454,9 +583,9 @@ async function closeCompanyFlow() {
     });
     if (response !== 0) return;
   }
-  saveConfig({ companyClosed: true, remoteHost: null });
-  app.relaunch();
-  app.quit();
+  // The company file is saved and released on the way out (before-quit).
+  saveConfig({ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null });
+  relaunchApp();
 }
 
 function sandboxMenuItem() {
@@ -468,6 +597,611 @@ function sandboxMenuItem() {
     enabled: !remoteHostOrigin,
     click: () => mainWindow?.webContents.send('menu', 'sandbox-start'),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Single company file ("ABC Company.ironbooks" — QuickBooks .QBW style)
+//
+// Opening: take the "in use" lock next to the file (electron/companyLock.js), then prepare the
+// working copy on this computer (electron/companySession.js) and start the app server on it with
+// the company file's location, so it saves back there (lib/services/companyFileSave.ts).
+// While open: a heartbeat keeps the lock fresh (and shows who is signed in), and requests from
+// other workstations to come in are put to the person here: let them in (multi-user mode on the
+// office network), hand the file over, or not now.
+// Closing / quitting: the server saves everything to the company file, then the lock is released.
+// ---------------------------------------------------------------------------
+
+const LOCK_BEAT_MS = companyLock.HEARTBEAT_MS;
+const REQUEST_POLL_MS = 3000;
+let lockTimer = null;
+let requestTimer = null;
+/** Set when another computer took the file over while this one was asleep / off the network. */
+let lockLostNoticeShown = false;
+/** A company file that was in use when this launch tried to open it: ask for access once the window is up. */
+let pendingAccessRequest = null;
+
+function timeOfDay(iso) {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function agoText(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 1) return 'less than a minute ago';
+  if (m < 60) return `${m} minute${m === 1 ? '' : 's'} ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h} hour${h === 1 ? '' : 's'} ago`;
+  return `${Math.round(h / 24)} days ago`;
+}
+
+/** Plain-language reason a company file could not be opened. */
+function openErrorText(err) {
+  if (err && err.code === 'NEWER_FORMAT') return err.message;
+  if (err && err.code === 'READ_ONLY_LOCATION') return err.message;
+  if (err && err.name === 'NotACompanyFileError') return err.message;
+  if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
+    return 'The file or the folder it is in can no longer be found. If it is on a file server, check the connection.';
+  }
+  if (err && (err.code === 'EACCES' || err.code === 'EPERM')) {
+    return 'Windows did not allow Ironbooks to read or write the company file or its folder. Check that you have permission to change files in that folder.';
+  }
+  return String((err && err.message) || err);
+}
+
+/** The person who opens a file after its holder stopped responding: open it here anyway? */
+async function confirmTakeOver(filePath, holder) {
+  const owner = holder.owner || {};
+  // Our own crash on this computer: the working copy here has everything; just carry on.
+  if (holder.sameComputer && owner.osUser === companyLock.whoAmI().osUser) return true;
+  const name = companyFile.locationName(filePath);
+  const unsaved = owner.unsavedSince
+    ? `Changes made there after ${timeOfDay(owner.unsavedSince)} may not have reached the company file yet. They are kept on ${owner.computer || 'that computer'}: open the company file there first and Ironbooks will save them.\n\n`
+    : '';
+  const { response } = await dialog.showMessageBox(parentWindow(), {
+    noLink: true,
+    type: 'warning',
+    message: `${name} was open on ${companyLock.describeOwner(owner)}, but that computer stopped responding ${agoText(holder.ageMs)}.`,
+    detail:
+      unsaved +
+      'If that computer crashed, lost its network connection or was turned off, you can open the company file here. If someone is still working in it there, their next changes will be kept as a separate copy instead of being saved into the file.',
+    buttons: ['Open It Here', 'Cancel'],
+    defaultId: owner.unsavedSince ? 1 : 0,
+    cancelId: 1,
+  });
+  return response === 0;
+}
+
+/** Unsaved changes on this computer can't be combined with a newer save: keep them apart? */
+async function confirmConflict(filePath, state, manifest) {
+  const name = companyFile.locationName(filePath);
+  const sb = manifest && manifest.savedBy;
+  const by = sb ? ` from ${sb.appUser ? `${sb.appUser} on ` : ''}${sb.computer || 'another computer'}` : '';
+  const when = state.unsavedSince ? ` around ${timeOfDay(state.unsavedSince)} on ${new Date(state.unsavedSince).toLocaleDateString()}` : '';
+  const { response } = await dialog.showMessageBox(parentWindow(), {
+    noLink: true,
+    type: 'warning',
+    message: `This computer has changes to ${name} that were never saved into the company file.`,
+    detail:
+      `They were made${when}. Since then the company file was saved${by}, so the two can't be combined automatically.\n\n` +
+      'Ironbooks will keep your unsaved changes as a separate company file next to this one (its name says "unsaved changes"), then open the company file as it is now. Compare the two and re-enter what is missing.',
+    buttons: ['Keep My Changes as a Copy and Open', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  return response === 0;
+}
+
+/**
+ * Open the single company file `filePath` for this launch: lock it (asking what to do when the
+ * holder stopped responding), and prepare the working copy. Returns true when it is open; false
+ * when not (the reason already shown, or pendingAccessRequest set to ask the holder for access).
+ */
+async function openSingleFileForLaunch(filePath) {
+  if (!fs.existsSync(filePath)) {
+    await dialog.showMessageBox({
+      noLink: true,
+      type: 'warning',
+      message: `Ironbooks can't find ${path.basename(filePath)}`,
+      detail: `It was at:\n${filePath}\n\nIf it is on a file server or a USB drive, check that it is connected. Otherwise it may have been moved or renamed: use File > Open or Restore Company to find it.`,
+      buttons: ['OK'],
+    });
+    return false;
+  }
+  const info = { appVersion: app.getVersion(), appUser: lastUserFor(filePath) };
+  let res;
+  try {
+    res = companyLock.acquire(filePath, info);
+    if (!res.ok && res.holder && res.holder.stale) {
+      if (!(await confirmTakeOver(filePath, res.holder))) return false;
+      res = companyLock.takeOver(filePath, res.holder, info);
+    }
+  } catch (err) {
+    dialog.showErrorBox('Ironbooks could not open the company file', openErrorText(err));
+    return false;
+  }
+  if (!res.ok) {
+    pendingAccessRequest = { filePath, holder: res.holder };
+    return false;
+  }
+  const lock = res.lock;
+  let prep;
+  try {
+    prep = await companySession.prepareWorkingCopy(filePath, {
+      root: workingRoot(),
+      appVersion: app.getVersion(),
+      onConflict: ({ state, manifest }) => confirmConflict(filePath, state, manifest),
+    });
+  } catch (err) {
+    companyLock.release(lock);
+    dialog.showErrorBox(`Ironbooks could not open ${path.basename(filePath)}`, openErrorText(err));
+    return false;
+  }
+  if (prep.plan === 'cancelled') {
+    companyLock.release(lock);
+    return false;
+  }
+  openFile = {
+    path: filePath,
+    lock,
+    workDir: prep.workDir,
+    dataDir: prep.dataDir,
+    plan: prep.plan,
+    appUser: info.appUser,
+    conflictCopy: prep.conflictCopy || null,
+  };
+  try {
+    companySession.pruneWorkingCopies(workingRoot(), [prep.workDir]);
+  } catch {
+    /* housekeeping only */
+  }
+  return true;
+}
+
+/** Server-side save status, asked with the internal token (null when unknown). */
+async function companySaveStatus() {
+  if (!serverUrl || remoteHostOrigin) return null;
+  try {
+    const res = await fetch(`${serverUrl}/api/company-file/status`, {
+      headers: { 'x-bka-internal': internalToken },
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Keep the lock fresh and tell the shared drive who is in the file and whether it is saved. */
+async function lockHeartbeat() {
+  if (!openFile || openFile.lost) return;
+  const status = await companySaveStatus();
+  const lan = Boolean(hostingState && hostingState.lan);
+  const patch = {
+    appUser: openFile.appUser || null,
+    mode: lan ? 'multi' : 'single',
+    host: lan ? { urls: hostingState.urls, fingerprint: hostingState.fingerprint } : null,
+    ...(lan ? {} : { joinPolicy: 'ask' }),
+    ...(status ? { unsavedSince: status.unsavedSince || null, lastSavedAt: status.lastSavedAt || null } : {}),
+  };
+  const beat = companyLock.heartbeat(openFile.lock, patch);
+  if (beat.lost) {
+    openFile.lost = beat.holder || { owner: null };
+    showLockLost(beat.holder);
+  }
+}
+
+async function showLockLost(holder) {
+  if (lockLostNoticeShown || !mainWindow) return;
+  lockLostNoticeShown = true;
+  const name = companyFile.locationName(openFile ? openFile.path : '');
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    noLink: true,
+    type: 'warning',
+    message: `${companyLock.describeOwner(holder && holder.owner)} has opened ${name}.`,
+    detail:
+      'This computer stopped responding for a while (it may have been asleep or off the network), so the company file was opened somewhere else. To protect their work, Ironbooks stopped saving here. ' +
+      'Changes you made here since the last save are kept on this computer; when you open the company file again, Ironbooks keeps them as a separate copy so nothing is lost.',
+    buttons: ['Close Company', 'Keep This Window Open'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (response === 0) closeCompanyFlow({ skipConfirm: true });
+}
+
+/** Start the heartbeat and the request watch for the open company file. */
+function startLockMaintenance() {
+  if (!openFile || lockTimer) return;
+  lockTimer = setInterval(() => {
+    lockHeartbeat().catch((err) => console.warn('[lock] heartbeat failed:', err && err.message));
+  }, LOCK_BEAT_MS);
+  requestTimer = setInterval(() => {
+    serviceAccessRequests().catch((err) => console.warn('[lock] access requests:', err && err.message));
+  }, REQUEST_POLL_MS);
+  lockHeartbeat().catch(() => {});
+}
+
+function stopLockMaintenance() {
+  if (lockTimer) clearInterval(lockTimer);
+  if (requestTimer) clearInterval(requestTimer);
+  lockTimer = null;
+  requestTimer = null;
+}
+
+const answeredRequests = new Set();
+let answeringRequest = false;
+
+/** "Bob on BACK-OFFICE" for a request. */
+function describeRequester(req) {
+  return companyLock.describeOwner({ appUser: req.appUser, osUser: req.osUser, computer: req.computer });
+}
+
+async function serviceAccessRequests() {
+  if (!openFile || openFile.lost || answeringRequest || !mainWindow) return;
+  const req = companyLock.pendingRequests(openFile.lock).find((r) => !answeredRequests.has(r.id));
+  if (!req) return;
+  answeredRequests.add(req.id);
+  // Already letting people on the network join without asking: answer at once.
+  const owner = openFile.lock.owner || {};
+  if (hostingState && hostingState.lan && owner.joinPolicy === 'open') {
+    companyLock.respond(openFile.lock, req.id, {
+      decision: 'multi',
+      host: { urls: hostingState.urls, fingerprint: hostingState.fingerprint },
+    });
+    return;
+  }
+  answeringRequest = true;
+  try {
+    await answerAccessRequest(req);
+  } finally {
+    answeringRequest = false;
+  }
+}
+
+async function answerAccessRequest(req) {
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.flashFrame(true);
+  mainWindow.focus();
+  const name = companyFile.locationName(openFile.path);
+  const { response, checkboxChecked } = await dialog.showMessageBox(mainWindow, {
+    noLink: true,
+    type: 'question',
+    message: `${describeRequester(req)} wants to open ${name}.`,
+    detail:
+      'Let them in: you both work in the company file at the same time (multi-user mode). They sign in with their own user name and password, and this computer serves the file to them, so keep Ironbooks open here while they work.\n\n' +
+      'Hand it over: Ironbooks saves the company file, closes it here and opens it on their computer.',
+    buttons: ['Let Them In', 'Hand It Over', 'Not Now'],
+    defaultId: 0,
+    cancelId: 2,
+    checkboxLabel: 'Let others on this network join without asking until I close the company file',
+  });
+  mainWindow.flashFrame(false);
+  if (!openFile) return;
+  if (response === 0) {
+    const st = await setHosting(true, { quiet: true, lan: true });
+    if (!st.hosting || !st.lan) {
+      companyLock.respond(openFile.lock, req.id, { decision: 'deny', message: 'Multi-user mode could not be turned on.' });
+      dialog.showErrorBox('Could not turn on multi-user mode', st.error || 'Multi-user access could not be started on this computer.');
+      return;
+    }
+    companyLock.respond(openFile.lock, req.id, { decision: 'multi', host: { urls: st.urls, fingerprint: st.fingerprint } });
+    companyLock.heartbeat(openFile.lock, {
+      mode: 'multi',
+      host: { urls: st.urls, fingerprint: st.fingerprint },
+      joinPolicy: checkboxChecked ? 'open' : 'ask',
+    });
+  } else if (response === 1) {
+    companyLock.respond(openFile.lock, req.id, { decision: 'handoff' });
+    closeCompanyFlow({ skipConfirm: true });
+  } else {
+    companyLock.respond(openFile.lock, req.id, { decision: 'deny' });
+  }
+}
+
+/**
+ * Probe a host that serves its own certificate: reachable, and the certificate is the pinned one.
+ * Resolves true/false.
+ */
+function probePinnedHost(origin, pin) {
+  return new Promise((resolve) => {
+    let u;
+    try {
+      u = new URL(origin);
+    } catch {
+      resolve(false);
+      return;
+    }
+    const req = require('node:https').request(
+      { host: u.hostname, port: u.port || 443, path: '/login', method: 'GET', rejectUnauthorized: false, timeout: 4000 },
+      (res) => {
+        const cert = res.socket.getPeerCertificate();
+        const fp = cert && cert.fingerprint256 ? cert.fingerprint256.replace(/:/g, '').toLowerCase() : '';
+        res.resume();
+        resolve(fp === pin);
+      },
+    );
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end();
+  });
+}
+
+/** Connect to the computer hosting `filePath` (multi-user mode) and relaunch as its client. */
+async function joinHostedFile(filePath, host) {
+  const urls = (host && Array.isArray(host.urls) ? host.urls : []).filter((u) => typeof u === 'string');
+  const pin = host && typeof host.fingerprint === 'string' ? host.fingerprint.toLowerCase() : '';
+  for (const url of urls) {
+    const n = hostingCore.normalizeHostAddress(url);
+    if (!n.ok || !pin) continue;
+    if (await probePinnedHost(n.origin, pin)) {
+      saveConfig({ remoteHost: n.origin, remotePin: pin, remoteFile: filePath, lastRemoteHost: n.origin, companyClosed: false });
+      rememberRecentCompany(filePath);
+      relaunchApp();
+      return true;
+    }
+  }
+  await dialog.showMessageBox(parentWindow(), {
+    noLink: true,
+    type: 'warning',
+    message: "Couldn't connect to the computer that has the company file open",
+    detail:
+      `Tried ${urls.join(', ') || 'no address'}.\n\nBoth computers must be on the same network, and the other computer's firewall must allow Ironbooks (Windows asks the first time multi-user mode is turned on there; choose Allow on private networks).`,
+    buttons: ['OK'],
+  });
+  return false;
+}
+
+/**
+ * Someone else has `filePath` open: offer to ask them to let this computer in, wait for the
+ * answer, and act on it (join in multi-user mode, open after they hand it over, or explain).
+ */
+async function askForAccessFlow(filePath, holder) {
+  const owner = (holder && holder.owner) || {};
+  const name = companyFile.locationName(filePath);
+  const since = owner.openedAt ? ` since ${timeOfDay(owner.openedAt)}` : '';
+  const canJoin = owner.mode === 'multi' && owner.joinPolicy === 'open' && owner.host && Array.isArray(owner.host.urls);
+  const { response } = await dialog.showMessageBox(parentWindow(), {
+    noLink: true,
+    type: 'info',
+    message: `${name} is open on another computer.`,
+    detail:
+      `${companyLock.describeOwner(owner)} has had it open${since}.\n\n` +
+      (canJoin
+        ? 'They have turned on multi-user mode, so you can join now. You will sign in with your own user name and password.'
+        : 'Only one computer works in a company file at a time unless the person using it lets others in. Ask them now: they will see your request on their screen and can let you in or hand the file over.'),
+    buttons: canJoin ? ['Join', 'Cancel'] : ['Ask to Come In', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (response !== 0) return;
+  if (canJoin) {
+    await joinHostedFile(filePath, owner.host);
+    return;
+  }
+  let id;
+  try {
+    id = companyLock.requestAccess(filePath, { appUser: lastUserFor(filePath) });
+  } catch (err) {
+    dialog.showErrorBox('Could not send the request', openErrorText(err));
+    return;
+  }
+  const who = companyLock.describeOwner(owner);
+  const waiting = require('./waitPrompt').showWaiting(mainWindow, {
+    title: `Asking ${who}…`,
+    message: `Your request to open ${name} is on their screen. This window closes when they answer.`,
+  });
+  let cancelled = false;
+  waiting.cancelled.then(() => {
+    cancelled = true;
+  });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const deadline = Date.now() + 3 * 60_000;
+  let outcome = 'timeout';
+  let answer = null;
+  while (!cancelled && Date.now() < deadline) {
+    await sleep(1000);
+    answer = companyLock.readResponse(filePath, id);
+    if (answer) {
+      outcome = answer.decision;
+      break;
+    }
+    if (!companyLock.readHolder(filePath)) {
+      outcome = 'free'; // they closed the company file meanwhile
+      break;
+    }
+  }
+  if (!cancelled && outcome === 'handoff') {
+    waiting.setMessage(`${who} is saving and closing ${name}…`);
+    const until = Date.now() + 2 * 60_000;
+    while (!cancelled && Date.now() < until && companyLock.readHolder(filePath)) await sleep(1000);
+    outcome = companyLock.readHolder(filePath) ? 'stuck' : 'free';
+  }
+  waiting.close();
+  companyLock.cancelRequest(filePath, id);
+  if (cancelled) return;
+  if (outcome === 'multi') {
+    await joinHostedFile(filePath, answer.host);
+  } else if (outcome === 'free') {
+    openCompany(filePath);
+  } else if (outcome === 'deny') {
+    await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'info',
+      message: `${who} can't let you in right now.`,
+      detail: answer && answer.message ? answer.message : 'Try again later, or ask them to close the company file when they are done.',
+      buttons: ['OK'],
+    });
+  } else {
+    await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'info',
+      message: outcome === 'stuck' ? `${name} is still open on ${owner.computer || 'the other computer'}.` : `${who} hasn't answered.`,
+      detail: 'They may be away from their desk. Try again in a little while, or ask them directly.',
+      buttons: ['OK'],
+    });
+  }
+}
+
+/**
+ * Save the open company file into itself and close it (quitting, switching files, Close
+ * Company). Resolves true to go on; false when the person chose to keep working because the
+ * save failed. With unsaved changes left behind, the lock is kept (it goes stale), so the next
+ * person to open the file is told that changes may still be on this computer.
+ */
+async function closeOpenCompanyFile() {
+  if (!openFile) return true;
+  stopLockMaintenance();
+  if (openFile.lost) return true; // someone else has it now: nothing of ours to release
+  if (!serverUrl || isDev) {
+    companyLock.release(openFile.lock);
+    return true;
+  }
+  for (;;) {
+    let data = {};
+    let ok = false;
+    try {
+      const res = await fetch(`${serverUrl}/api/company-file/close`, {
+        method: 'POST',
+        headers: { 'x-bka-internal': internalToken },
+        signal: AbortSignal.timeout(10 * 60_000),
+      });
+      data = await res.json().catch(() => ({}));
+      ok = res.ok && data.ok !== false;
+    } catch (err) {
+      data = { error: String((err && err.message) || err) };
+    }
+    if (ok) {
+      companyLock.release(openFile.lock);
+      return true;
+    }
+    const { response } = await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'warning',
+      message: `Ironbooks couldn't save ${companyFile.locationName(openFile.path)} to the company file.`,
+      detail:
+        `${data.error || 'The save did not finish.'}\n\n` +
+        'Try Again after checking the connection to the file server. If you close anyway, your changes stay on this computer and are saved the next time you open the company file here.',
+      buttons: parentWindow() ? ['Try Again', 'Close Anyway', 'Keep Working'] : ['Try Again', 'Close Anyway'],
+      defaultId: 0,
+      cancelId: parentWindow() ? 2 : 1,
+    });
+    if (response === 0) continue;
+    if (response === 1) {
+      // Leave the lock in place (it goes stale): whoever opens the file next is warned.
+      companyLock.heartbeat(openFile.lock, { unsavedSince: new Date().toISOString() });
+      return true;
+    }
+    startLockMaintenance();
+    return false;
+  }
+}
+
+/** The OS asked us to open a .ironbooks file while the app is running. */
+async function openCompanyFromOs(filePath) {
+  const target = path.resolve(filePath);
+  if (openFile && samePath(openFile.path, target)) {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+    return;
+  }
+  if (!startScreenMode && (openFile || remoteHostOrigin || serverUrl)) {
+    const { response } = await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'question',
+      message: `Close ${companyFile.locationName(currentCompanyLocation())} and open ${companyFile.locationName(target)}?`,
+      detail: 'The company file that is open now is saved first.',
+      buttons: ['Open', 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response !== 0) return;
+  }
+  openCompany(target);
+}
+
+/** File > Save Copy As… (and converting an older company folder to a single company file). */
+async function saveCopyAsFlow({ convert = false } = {}) {
+  if (!serverUrl || remoteHostOrigin) return;
+  if (isDev) {
+    dialog.showErrorBox('Not available in development', 'Run the packaged app to save a copy of the company file.');
+    return;
+  }
+  const name = companyFile.locationName(currentCompanyLocation());
+  const res = await dialog.showSaveDialog(mainWindow, {
+    title: convert ? 'Save as a Single Company File' : 'Save a Copy of the Company File',
+    message: convert
+      ? 'Choose where to keep the company file. You can copy it, back it up and share it like any other file.'
+      : 'The copy is a separate company file: changes in one do not appear in the other.',
+    buttonLabel: 'Save',
+    defaultPath: path.join(
+      convert ? path.dirname(currentCompanyLocation()) : app.getPath('documents'),
+      `${name.replace(/[\\/:*?"<>|]/g, '-')}${convert ? '' : ' (copy)'}.ironbooks`,
+    ),
+    filters: [{ name: 'Ironbooks Company File', extensions: ['ironbooks'] }],
+    properties: ['createDirectory', 'showOverwriteConfirmation'],
+  });
+  if (res.canceled || !res.filePath) return;
+  let target = res.filePath;
+  if (!/\.ironbooks$/i.test(target)) target += '.ironbooks';
+  let isDir = false;
+  try {
+    isDir = fs.statSync(target).isDirectory();
+  } catch {
+    /* new file */
+  }
+  if (isDir || samePath(target, currentCompanyLocation())) {
+    dialog.showErrorBox('Choose another name', 'That name belongs to the company file that is open, or to a folder. Choose a new name for the copy.');
+    return;
+  }
+  try {
+    const r = await fetch(`${serverUrl}/api/company-file/save-as?target=${encodeURIComponent(target)}`, {
+      method: 'POST',
+      headers: { 'x-bka-internal': internalToken, 'content-type': 'application/json' },
+      body: JSON.stringify({ companyName: name }),
+      signal: AbortSignal.timeout(30 * 60_000),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || `HTTP ${r.status}`);
+  } catch (err) {
+    dialog.showErrorBox('Could not save the company file', openErrorText(err));
+    return;
+  }
+  rememberRecentCompany(target);
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    noLink: true,
+    type: 'info',
+    message: convert ? `${name} is now a single company file.` : 'The copy is saved.',
+    detail: convert
+      ? `Location: ${target}\n\nOpen it now to work in it from here on. The old company folder is left as it was; once you have checked the new file you can keep the folder as an extra backup or delete it.`
+      : `Location: ${target}`,
+    buttons: convert ? ['Open It Now', 'Later'] : ['OK', 'Show in Folder'],
+    defaultId: 0,
+    cancelId: convert ? 1 : 0,
+  });
+  if (convert && response === 0) openCompany(target);
+  else if (!convert && response === 1) shell.showItemInFolder(target);
+  else buildMenu();
+}
+
+/** File > Save Company File Now: write everything to the company file right away. */
+async function saveNowFlow() {
+  if (!openFile || !serverUrl) return;
+  try {
+    const r = await fetch(`${serverUrl}/api/company-file/save`, {
+      method: 'POST',
+      headers: { 'x-bka-internal': internalToken },
+      signal: AbortSignal.timeout(10 * 60_000),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.saved === false) throw new Error(data.error || `HTTP ${r.status}`);
+    mainWindow?.webContents.send('menu', 'company-file-saved');
+  } catch (err) {
+    dialog.showErrorBox('Could not save the company file', openErrorText(err));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +1242,14 @@ async function startNextServer() {
       PORT: String(port),
       HOSTNAME: '127.0.0.1',
       BKA_DATA_DIR: activeCompanyDir(),
+      // A single company file: the server saves its working copy back to it
+      // (lib/services/companyFileSave.ts) and checks this computer still holds its lock.
+      BKA_COMPANY_FILE: openFile ? openFile.path : '',
+      BKA_COMPANY_STATE: openFile ? path.join(openFile.workDir, companySession.STATE_FILE) : '',
+      BKA_COMPANY_LOCK: openFile ? openFile.lock.dir : '',
+      BKA_COMPANY_LOCK_TOKEN: openFile ? openFile.lock.token : '',
+      // Where the real company file lives (training copies are kept next to it), also in the sandbox.
+      BKA_REAL_COMPANY_FILE: openFile ? openFile.path : (loadConfig().sandbox && loadConfig().sandbox.realFile) || '',
       // Sandbox mode: where "Try it on a copy" puts copies, and the PDF "SANDBOX" stamp flag.
       BKA_SANDBOX_ROOT: sandboxRoot(),
       BKA_SANDBOX: sandboxActive() ? '1' : '',
@@ -556,53 +1298,192 @@ function waitForServer(port, timeoutMs = 20000) {
   });
 }
 
-// New Company: always ask for a name + location (a Save dialog), create the folder, seed a
-// manifest, and relaunch into the fresh (empty) file. The relaunch opens Create Account
-// (startRoute below), which then runs the setup interview (/onboarding) for the new company. The "file" is a self-contained folder the user can place anywhere (incl. a server
-// or network drive).
+// New Company (QuickBooks "Create a new company"): ask for a name and location, write a new,
+// empty single company file there ("My Company.ironbooks"), and relaunch into it. The relaunch
+// opens the Admin setup for the new file (/signup — its user name and password live inside the
+// file), then the setup interview (/onboarding). The file can live anywhere: a local folder, a
+// USB drive or the office file server.
 async function createCompanyFlow() {
   const res = await dialog.showSaveDialog(mainWindow, {
     title: 'New Company File',
     message: 'Choose a name and location for the new company file',
     buttonLabel: 'Create',
     defaultPath: path.join(app.getPath('documents'), 'My Company.ironbooks'),
-    filters: [{ name: 'Ironbooks Company', extensions: ['ironbooks', 'bookkeeper'] }],
+    filters: [{ name: 'Ironbooks Company File', extensions: ['ironbooks'] }],
     properties: ['createDirectory', 'showOverwriteConfirmation'],
   });
   if (res.canceled || !res.filePath) return;
-  const target = res.filePath;
-  const name = path.basename(target).replace(/\.(ironbooks|bookkeeper)$/i, '');
-  try {
-    if (fs.existsSync(target) && fs.readdirSync(target).length > 0) {
-      dialog.showErrorBox(
-        'Folder not empty',
-        'That location already contains files. Choose a new name or an empty folder for the company file.',
-      );
-      return;
-    }
-    fs.mkdirSync(target, { recursive: true });
-  } catch (e) {
-    dialog.showErrorBox('Could not create company file', String((e && e.message) || e));
+  let target = res.filePath;
+  if (!/\.ironbooks$/i.test(target)) target += '.ironbooks';
+  const name = companyFileFormat.companyFileBaseName(target);
+  if (fs.existsSync(target)) {
+    // Never replace a company file (or a folder) with an empty one.
+    dialog.showErrorBox(
+      'That name is taken',
+      `${path.basename(target)} already exists in that folder. Choose another name for the new company file, or open the existing one with File > Open or Restore Company.`,
+    );
     return;
   }
-  companyFile.writeManifest(target, { name, createdAt: new Date().toISOString() });
-  // First page of the new file: create its first user, then the setup interview.
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const fileId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    // An empty company file: the database is created the first time it opens, then saved here.
+    await companyFileFormat.writeCompanyFile(target, {
+      manifest: {
+        formatVersion: companyFileFormat.COMPANY_FILE_FORMAT_VERSION,
+        fileId,
+        companyName: name,
+        saveId: crypto.randomUUID(),
+        previousSaveId: null,
+        savedAt: now,
+        appVersion: app.getVersion(),
+      },
+      entries: [
+        { name: 'bookkeeper-company.json', data: Buffer.from(JSON.stringify({ schema: 'bookkeeper-company/v1', name, createdAt: now }, null, 2)) },
+        { name: '.file-id', data: Buffer.from(fileId) },
+      ],
+    });
+  } catch (e) {
+    dialog.showErrorBox('Could not create the company file', openErrorText(e));
+    return;
+  }
+  // First page of the new file: set up its Admin user, then the setup interview.
   saveConfig({ startRoute: '/signup' });
-  openCompanyDir(target);
+  openCompany(target);
 }
 
-// Open Company: browse to an existing company-file folder anywhere and relaunch into it.
+// Open or Restore Company (QuickBooks File > Open or Restore Company): browse to a company file
+// anywhere — this computer, a USB drive, the office file server — and relaunch into it.
 async function openCompanyFlow() {
   const res = await dialog.showOpenDialog(mainWindow, {
     title: 'Open Company File',
-    message: 'Choose a company file folder to open',
-    properties: ['openDirectory', 'createDirectory'],
+    message: 'Choose the company file to open',
+    filters: [
+      { name: 'Ironbooks Company File', extensions: ['ironbooks'] },
+      { name: 'Ironbooks Backup or Portable File', extensions: ['bka', 'bkp'] },
+    ],
+    properties: ['openFile'],
+    defaultPath: app.getPath('documents'),
+  });
+  if (res.canceled || !res.filePaths[0]) return;
+  const chosen = res.filePaths[0];
+  const lower = chosen.toLowerCase();
+  if (lower.endsWith('.bkp')) {
+    openPortableFlow(chosen);
+    return;
+  }
+  if (lower.endsWith('.bka')) {
+    await restoreBackupChoiceFlow(chosen);
+    return;
+  }
+  if (!companyFileFormat.isCompanyFile(chosen)) {
+    dialog.showErrorBox(
+      'Not a company file',
+      `${path.basename(chosen)} is not an Ironbooks company file (or it is damaged). If you have a backup of it, choose the backup (.bka) instead.`,
+    );
+    return;
+  }
+  openCompany(chosen);
+}
+
+/**
+ * A backup (.bka) chosen in Open or Restore Company: with a company open, restore it into that
+ * company (the Back Up and Restore page, with its preview and safety copy) or as a new company
+ * file; with none open, as a new company file.
+ */
+async function restoreBackupChoiceFlow(bkaPath) {
+  if (!startScreenMode && serverUrl && !remoteHostOrigin) {
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      noLink: true,
+      type: 'question',
+      message: `Restore ${path.basename(bkaPath)}`,
+      detail:
+        'As a new company file: the backup becomes its own company file and the open one is not touched.\n\n' +
+        `Into ${companyFile.locationName(currentCompanyLocation())}: replaces what is in the open company file with the backup (a safety copy is made first).`,
+      buttons: ['As a New Company File…', 'Into the Open Company…', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+    });
+    if (response === 1) {
+      pendingBkaPath = bkaPath;
+      deliverPendingBka();
+      return;
+    }
+    if (response !== 0) return;
+  }
+  await restoreBackupAsNewFileFlow(bkaPath);
+}
+
+/** QuickBooks "Restore a backup copy": a .bka becomes a new company file where you choose. */
+async function restoreBackupAsNewFileFlow(bkaPath) {
+  const base = path.basename(bkaPath).replace(/\.bka$/i, '').replace(/^(auto-)?backup-/i, '');
+  const save = await dialog.showSaveDialog(parentWindow(), {
+    title: 'Restore Backup as a Company File',
+    message: 'Choose a name and location for the restored company file',
+    buttonLabel: 'Restore',
+    defaultPath: path.join(app.getPath('documents'), `${base}.ironbooks`),
+    filters: [{ name: 'Ironbooks Company File', extensions: ['ironbooks'] }],
+    properties: ['createDirectory', 'showOverwriteConfirmation'],
+  });
+  if (save.canceled || !save.filePath) return;
+  let target = save.filePath;
+  if (!/\.ironbooks$/i.test(target)) target += '.ironbooks';
+  if (fs.existsSync(target)) {
+    dialog.showErrorBox('That name is taken', `${path.basename(target)} already exists there. Choose a new name for the restored company file.`);
+    return;
+  }
+  const scratchWork = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`);
+  const scratch = companySession.dataDirOf(scratchWork);
+  try {
+    const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch);
+    await companySession.writeWorkingCopyAs(scratchWork, target, {
+      companyName: info.companyName || companyFileFormat.companyFileBaseName(target),
+      appVersion: app.getVersion(),
+    });
+    rememberRecentCompany(target);
+    const { response } = await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'info',
+      message: 'The backup was restored as a company file.',
+      detail:
+        `Location: ${target}\n\nIronbooks checks the books when it opens the file. Sign in with the user names and passwords that were in the company file when the backup was made.`,
+      buttons: ['Open It Now', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response === 0) openCompany(target);
+    else if (startScreenMode) mainWindow?.webContents.reload();
+    else buildMenu();
+  } catch (err) {
+    try {
+      fs.rmSync(target, { force: true });
+    } catch {
+      /* nothing written */
+    }
+    dialog.showErrorBox('Could not restore the backup', openErrorText(err));
+  } finally {
+    fs.rm(scratchWork, { recursive: true, force: true }, () => {});
+  }
+}
+
+// Company files made by older versions are folders. Open one (it keeps working as it is; the File
+// menu then offers to save it as a single company file).
+async function openCompanyFolderFlow() {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: 'Open Company Folder (Older Format)',
+    message: 'Choose the company folder made by an older version of Ironbooks',
+    properties: ['openDirectory'],
     defaultPath: app.getPath('documents'),
   });
   if (res.canceled || !res.filePaths[0]) return;
   const dir = res.filePaths[0];
+  if (!companyFile.looksLikeCompany(dir)) {
+    dialog.showErrorBox('Not a company folder', `${dir} doesn't hold an Ironbooks company.`);
+    return;
+  }
   companyFile.ensureManifest(dir);
-  openCompanyDir(dir);
+  openCompany(dir);
 }
 
 // Open/Restore Portable Company File: pick the .bkp (unless the OS handed us one), pick where
@@ -647,24 +1528,24 @@ async function openPortableFlow(filePath) {
     message: 'Choose a name and location for the restored company file',
     buttonLabel: 'Restore',
     defaultPath: path.join(app.getPath('documents'), `${base}.ironbooks`),
-    filters: [{ name: 'Ironbooks Company', extensions: ['ironbooks', 'bookkeeper'] }],
+    filters: [{ name: 'Ironbooks Company File', extensions: ['ironbooks'] }],
     properties: ['createDirectory', 'showOverwriteConfirmation'],
   });
   if (save.canceled || !save.filePath) return;
-  const target = save.filePath;
-  try {
-    if (fs.existsSync(target) && fs.readdirSync(target).length > 0) {
-      dialog.showErrorBox(
-        'Folder not empty',
-        'That location already contains files. Choose a new name or an empty folder for the restored company file.',
-      );
-      return;
-    }
-  } catch {
-    /* unreadable target — let the server report it */
+  let target = save.filePath;
+  if (!/\.ironbooks$/i.test(target)) target += '.ironbooks';
+  if (fs.existsSync(target)) {
+    dialog.showErrorBox(
+      'That name is taken',
+      `${path.basename(target)} already exists there. Choose a new name for the restored company file.`,
+    );
+    return;
   }
+  // The server restores (and verifies) into a scratch folder on this computer; that folder is then
+  // packed into the single company file the person chose.
+  const scratch = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`);
   try {
-    const res = await fetch(`${serverUrl}/api/portable/restore?target=${encodeURIComponent(target)}`, {
+    const res = await fetch(`${serverUrl}/api/portable/restore?target=${encodeURIComponent(scratch)}`, {
       method: 'POST',
       headers: { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' },
       body: bytes,
@@ -675,21 +1556,32 @@ async function openPortableFlow(filePath) {
       dialog.showErrorBox('Could not open the portable company file', data.error || `HTTP ${res.status}`);
       return;
     }
+    const scratchWork = path.dirname(scratch);
+    await companySession.writeWorkingCopyAs(scratchWork, target, {
+      companyName: data.companyName || base,
+      appVersion: app.getVersion(),
+      dataDir: scratch,
+    });
     rememberRecentCompany(target);
     const choice = await dialog.showMessageBox(mainWindow, {
+      noLink: true,
       type: 'info',
       buttons: ['Open it now', 'Later'],
       defaultId: 0,
       cancelId: 1,
       message: `"${data.companyName}" was restored and verified.`,
       detail:
-        `Location: ${target}\n\nEvery table, the trial balance, attachments and the transaction log ` +
+        `Location: ${target}
+
+Every table, the trial balance, attachments and the transaction log ` +
         'match the original file. Sign in with the user names and passwords from that file.',
     });
-    if (choice.response === 0) openCompanyDir(target);
+    if (choice.response === 0) openCompany(target);
     else buildMenu(); // refresh Recent Companies
   } catch (e) {
-    dialog.showErrorBox('Could not open the portable company file', String((e && e.message) || e));
+    dialog.showErrorBox('Could not open the portable company file', openErrorText(e));
+  } finally {
+    fs.rm(scratch, { recursive: true, force: true }, () => {});
   }
 }
 
@@ -712,6 +1604,8 @@ function hostingStatus() {
   return {
     available: !remoteHostOrigin,
     hosting: Boolean(hostingState),
+    lan: Boolean(hostingState && hostingState.lan),
+    fingerprint: hostingState ? hostingState.fingerprint || null : null,
     urls: hostingState ? hostingState.urls : [],
     tls: hostingState ? hostingState.tls : false,
     dnsName: hostingState ? hostingState.dnsName : null,
@@ -724,27 +1618,52 @@ function hostingStatus() {
 }
 
 /** Start/stop sharing this company file on the tailnet. Never available in client mode. */
-async function setHosting(enable, { quiet = false } = {}) {
+/**
+ * Start/stop sharing this company file. Two ways:
+ *  - tailnet (File > Host multi-user access): on this computer's Tailscale address, remembered
+ *    for the next launch;
+ *  - office network (`lan`: someone on the same network was let into a company file on the shared
+ *    drive, or File > Switch to Multi-user Mode): every private address, HTTPS with this
+ *    computer's own certificate, which teammates pin (electron/selfSignedCert.js). Only for this
+ *    session: closing the company file ends it.
+ * Never available in client mode.
+ */
+async function setHosting(enable, { quiet = false, lan = false } = {}) {
   if (remoteHostOrigin) return hostingStatus();
   if (enable && sandboxActive()) {
     if (!quiet) dialog.showErrorBox('Not available in the sandbox', 'Leave the sandbox to share your company file with other people.');
     return hostingStatus();
   }
   const cfg = hostingConfig();
+  // Moving from tailnet-only to office-network hosting: restart the proxy (it also serves the tailnet).
+  if (enable && lan && hostingState && !hostingState.lan) {
+    await hosting.stopHosting(hostingState);
+    hostingState = null;
+  }
   if (enable && !hostingState) {
     try {
       const upstreamPort = Number(new URL(serverUrl).port);
+      const certDir = path.join(app.getPath('userData'), 'tls');
+      const lanCert = lan
+        ? selfSignedCert.loadOrCreate(certDir, {
+            names: [require('node:os').hostname()],
+            ips: hostingCore.lanIPv4s(require('node:os').networkInterfaces()),
+          })
+        : null;
       hostingState = await hosting.startHosting({
         upstreamPort,
         port: cfg.port,
         tls: cfg.tls !== false,
         bindAll: cfg.bindAll === true,
-        certDir: path.join(app.getPath('userData'), 'tls'),
+        certDir,
+        lan,
+        lanCert,
       });
       hostingError = null;
-      saveConfig({ hosting: { ...cfg, enabled: true } });
+      if (!lan) saveConfig({ hosting: { ...cfg, enabled: true } });
       if (!quiet && mainWindow) {
         dialog.showMessageBox(mainWindow, {
+          noLink: true,
           type: 'info',
           message: 'Multi-user access is on',
           detail:
@@ -795,8 +1714,7 @@ async function openOnHostFlow() {
       }
       saveConfig({ remoteHost: n.origin, lastRemoteHost: value.trim(), companyClosed: false });
       setImmediate(() => {
-        app.relaunch();
-        app.quit();
+        relaunchApp();
       });
       return { ok: true };
     },
@@ -806,8 +1724,7 @@ async function openOnHostFlow() {
 /** Leave client mode and reopen the local company file. */
 function disconnectFromHost() {
   saveConfig({ remoteHost: null, companyClosed: false });
-  app.relaunch();
-  app.quit();
+  relaunchApp();
 }
 
 /** True when an IPC call comes from the LOCAL app (not a remote host's pages). */
@@ -832,31 +1749,70 @@ function fromAppOrigin(event) {
 
 function buildMenu() {
   const cfg = loadConfig();
-  const current = activeCompanyDir();
+  const current = remoteHostOrigin ? cfg.remoteFile || null : currentCompanyLocation();
   const recents = (Array.isArray(cfg.recentCompanies) ? cfg.recentCompanies : []).filter(
     (d) => typeof d === 'string',
   );
-  const recentItems = recents.map((dir) => ({
-    label: dir === current ? `${companyFile.companyName(dir)} (current)` : companyFile.companyName(dir),
-    sublabel: dir,
-    enabled: dir !== current,
-    click: () => openCompanyDir(dir),
+  const isCurrent = (loc) => Boolean(current) && samePath(loc, current);
+  const recentItems = recents.map((loc) => ({
+    label: isCurrent(loc) ? `${companyFile.locationName(loc)} (open)` : companyFile.locationName(loc),
+    sublabel: loc,
+    enabled: !isCurrent(loc),
+    click: () => openCompany(loc),
   }));
+  const folderFormat = !remoteHostOrigin && !openFile && !sandboxActive();
   const template = [
     {
       label: 'File',
       submenu: [
         { label: 'New Company…', accelerator: 'CmdOrCtrl+Shift+N', click: () => { createCompanyFlow(); } },
-        { label: 'Open Company…', accelerator: 'CmdOrCtrl+O', click: () => { openCompanyFlow(); } },
+        { label: 'Open or Restore Company…', accelerator: 'CmdOrCtrl+O', click: () => { openCompanyFlow(); } },
         {
-          label: 'Recent Companies',
+          label: 'Open Previous Company',
           submenu: recentItems.length
             ? recentItems
             : [{ label: 'No recent companies', enabled: false }],
         },
+        { label: 'Open Company Folder (Older Format)…', click: () => { openCompanyFolderFlow(); } },
         { label: 'Close Company', click: () => { closeCompanyFlow(); } },
+        { type: 'separator' },
+        { label: 'Save Company File Now', enabled: Boolean(openFile), click: () => { saveNowFlow(); } },
+        { label: 'Save Copy As…', enabled: !remoteHostOrigin && !sandboxActive(), click: () => { saveCopyAsFlow(); } },
+        ...(folderFormat
+          ? [{ label: 'Save as a Single Company File…', click: () => { saveCopyAsFlow({ convert: true }); } }]
+          : []),
         { label: 'Company File Details…', enabled: !remoteHostOrigin, click: () => navigate('/company-file') },
         { type: 'separator' },
+        // QuickBooks: File > Switch to Multi-user Mode. Others on the office network can join this
+        // company file (each signs in with their own user name) until it is closed here.
+        ...(openFile
+          ? [
+              hostingState && hostingState.lan
+                ? { label: 'Switch to Single-user Mode', click: () => { setHosting(false); } }
+                : {
+                    label: 'Switch to Multi-user Mode',
+                    click: async () => {
+                      const st = await setHosting(true, { lan: true, quiet: true });
+                      if (st.hosting && st.lan && openFile) {
+                        companyLock.heartbeat(openFile.lock, {
+                          mode: 'multi',
+                          host: { urls: st.urls, fingerprint: st.fingerprint },
+                          joinPolicy: 'open',
+                        });
+                        dialog.showMessageBox(mainWindow, {
+                          noLink: true,
+                          type: 'info',
+                          message: 'Multi-user mode is on',
+                          detail:
+                            'People on this network can now open this company file from the shared drive at the same time as you. They sign in with their own user name and password (add users in Company > Users and Roles). Keep Ironbooks open on this computer while they work.',
+                        });
+                      } else if (st.error) {
+                        dialog.showErrorBox('Could not turn on multi-user mode', st.error);
+                      }
+                    },
+                  },
+            ]
+          : []),
         // Multi-user (QB Enterprise parity): share this file on the tailnet, or open one shared
         // by another computer.
         {
@@ -895,7 +1851,20 @@ function buildMenu() {
         { role: 'quit' },
       ],
     },
-    { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }] },
+    // Native menu shortcuts reach the window before the page, so none may take a QuickBooks key:
+    // Redo stays on Ctrl+Shift+Z here (fields still redo with Ctrl+Y; Ctrl+Y is QB's Transaction
+    // Journal) and Minimize has no shortcut on Windows / Linux (Ctrl+M is QB's Memorize).
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo', accelerator: process.platform === 'darwin' ? 'Cmd+Shift+Z' : 'Ctrl+Shift+Z' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+      ],
+    },
     // Reload on F5 (not the default Ctrl+R): Ctrl+R is the QB "Registers" shortcut in the app.
     { label: 'View', submenu: [{ role: 'reload', accelerator: 'F5' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
     // QB menus: Company, Customers, Vendors, Employees, Banking, Reports, Lists (electron/menuRoutes.js).
@@ -903,7 +1872,7 @@ function buildMenu() {
     {
       label: 'Window',
       submenu: [
-        { role: 'minimize' },
+        process.platform === 'darwin' ? { role: 'minimize' } : { label: 'Minimize', click: () => mainWindow?.minimize() },
         ...(process.platform === 'darwin' ? [{ role: 'zoom' }, { role: 'front' }] : []),
         { role: 'togglefullscreen' },
         { type: 'separator' },
@@ -921,7 +1890,7 @@ function buildMenu() {
         { type: 'separator' },
         { label: 'Check for Updates…', click: () => { checkForUpdates({ manual: true }); } },
         { label: 'Ironbooks on the web', click: () => shell.openExternal('https://github.com/RealDealCPA-VR/Ironbooks') },
-        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { message: 'Ironbooks', detail: `Version ${app.getVersion()}\nOpen-source desktop accounting with AI error correction.` }) },
+        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { noLink: true, message: 'Ironbooks', detail: `Version ${app.getVersion()}\nOpen-source desktop accounting with AI error correction.` }) },
       ],
     },
   ];
@@ -932,8 +1901,21 @@ function navigate(route) {
   mainWindow?.webContents.send('navigate', route);
 }
 
+/**
+ * A brand-new install: nothing has ever been opened (no company file, no company folder, no
+ * recent files, and no company in the old default location). Like QuickBooks, start on the
+ * No Company Open window with Create / Open rather than an empty company nobody chose.
+ */
+function isFirstRun() {
+  if (process.env.BKA_DATA_DIR) return false;
+  const cfg = loadConfig();
+  if (cfg.companyFile || cfg.dataDir || cfg.remoteHost) return false;
+  if (Array.isArray(cfg.recentCompanies) && cfg.recentCompanies.length) return false;
+  return !companyFile.looksLikeCompany(path.join(companiesRoot(), 'default'));
+}
+
 /** The "No Company Open" window (electron/startScreen.js): no server, no company file loaded. */
-async function createStartWindow() {
+async function createStartWindow({ firstRun = false } = {}) {
   startScreenMode = true;
   const theme = windowTheme.normalizeTheme(loadConfig().theme);
   nativeTheme.themeSource = theme.mode;
@@ -965,6 +1947,7 @@ async function createStartWindow() {
     dark: nativeTheme.shouldUseDarkColors,
     accent: theme.accent,
     platform: process.platform,
+    firstRun,
   });
   await mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
 }
@@ -979,13 +1962,14 @@ function buildStartMenu() {
       label: 'File',
       submenu: [
         { label: 'New Company…', accelerator: 'CmdOrCtrl+Shift+N', click: () => { createCompanyFlow(); } },
-        { label: 'Open Company…', accelerator: 'CmdOrCtrl+O', click: () => { openCompanyFlow(); } },
+        { label: 'Open or Restore Company…', accelerator: 'CmdOrCtrl+O', click: () => { openCompanyFlow(); } },
         {
-          label: 'Recent Companies',
+          label: 'Open Previous Company',
           submenu: recents.length
-            ? recents.map((dir) => ({ label: companyFile.companyName(dir), sublabel: dir, click: () => openCompanyDir(dir) }))
+            ? recents.map((loc) => ({ label: companyFile.locationName(loc), sublabel: loc, click: () => openCompany(loc) }))
             : [{ label: 'No recent companies', enabled: false }],
         },
+        { label: 'Open Company Folder (Older Format)…', click: () => { openCompanyFolderFlow(); } },
         { label: 'Open company on host…', click: () => { openOnHostFlow(); } },
         { type: 'separator' },
         { role: 'quit' },
@@ -997,18 +1981,82 @@ function buildStartMenu() {
       label: 'Help',
       submenu: [
         { label: 'Ironbooks on the web', click: () => shell.openExternal('https://github.com/RealDealCPA-VR/Ironbooks') },
-        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { message: 'Ironbooks', detail: `Version ${app.getVersion()}\nOpen-source desktop accounting with AI error correction.` }) },
+        { label: 'About', click: () => dialog.showMessageBox(mainWindow, { noLink: true, message: 'Ironbooks', detail: `Version ${app.getVersion()}\nOpen-source desktop accounting with AI error correction.` }) },
       ],
     },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+/** After opening: say so when unsaved work from last time was recovered or kept as a copy. */
+function noteRecoveredWork() {
+  if (!openFile || !mainWindow) return;
+  const name = companyFile.locationName(openFile.path);
+  if (openFile.plan === 'recover') {
+    dialog.showMessageBox(mainWindow, {
+      noLink: true,
+      type: 'info',
+      message: `Ironbooks recovered your unsaved work in ${name}.`,
+      detail:
+        'The last time this company file was open on this computer, Ironbooks closed before it could save everything into the file (the computer may have restarted or lost its connection to the file server). Nothing was lost: those changes are here and are being saved into the company file now.',
+      buttons: ['OK'],
+    });
+  } else if (openFile.conflictCopy) {
+    const copy = openFile.conflictCopy;
+    dialog
+      .showMessageBox(mainWindow, {
+        noLink: true,
+        type: 'info',
+        message: 'Your unsaved changes were kept as a separate company file.',
+        detail: `${copy}\n\nOpen it later (File > Open or Restore Company) to compare it with ${name} and re-enter anything that is missing.`,
+        buttons: ['OK', 'Show in Folder'],
+      })
+      .then(({ response }) => {
+        if (response === 1) shell.showItemInFolder(copy);
+      });
+  }
+}
+
+/**
+ * Multi-user client of a company file on the shared drive: accept the host's own certificate, and
+ * only that one (its fingerprint came through the company file's lock folder).
+ */
+function installPinnedCertificate(origin, pin) {
+  let host;
+  try {
+    host = new URL(origin).hostname;
+  } catch {
+    return;
+  }
+  session.defaultSession.setCertificateVerifyProc((request, callback) => {
+    try {
+      if (request.hostname === host && selfSignedCert.fingerprintOf(request.certificate.data) === pin) {
+        callback(0);
+        return;
+      }
+    } catch {
+      /* fall through to the normal checks */
+    }
+    callback(-3); // Chromium's own verification
+  });
+}
+
 async function createWindow() {
+  // A company file the OS asked us to open (double-click, Open with) wins over the last one used.
+  if (pendingCompanyPath) {
+    const p = pendingCompanyPath;
+    pendingCompanyPath = null;
+    saveConfig({ companyFile: p, remoteHost: null, remotePin: null, remoteFile: null, companyClosed: false, sandbox: null });
+    rememberRecentCompany(p);
+  }
   // File > Close Company: show "No Company Open" instead of loading a file. A scripted launch
   // that names a company folder (BKA_DATA_DIR) always opens it.
   if (loadConfig().companyClosed === true && !process.env.BKA_DATA_DIR) {
     await createStartWindow();
+    return;
+  }
+  if (isFirstRun()) {
+    await createStartWindow({ firstRun: true });
     return;
   }
   // Client mode: show the company hosted on another machine instead of starting a local server.
@@ -1019,7 +2067,26 @@ async function createWindow() {
     return n.ok ? n : null;
   })();
   remoteHostOrigin = remote ? remote.origin : null;
-  if (!remoteHostOrigin) reconcileSandboxConfig();
+  const pinCfg = loadConfig().remotePin;
+  remotePin = remote && typeof pinCfg === 'string' && pinCfg ? pinCfg : null;
+  if (!remoteHostOrigin) {
+    reconcileSandboxConfig();
+    // A single company file: lock it and prepare its working copy before the server starts on it.
+    const cfg = loadConfig();
+    if (!process.env.BKA_DATA_DIR && typeof cfg.companyFile === 'string' && cfg.companyFile && !cfg.sandbox) {
+      const opened = await openSingleFileForLaunch(cfg.companyFile);
+      if (!opened) {
+        await createStartWindow();
+        if (pendingAccessRequest) {
+          const r = pendingAccessRequest;
+          pendingAccessRequest = null;
+          askForAccessFlow(r.filePath, r.holder).catch((err) => console.error('[lock] access request:', err));
+        }
+        return;
+      }
+    }
+  }
+  if (remotePin) installPinnedCertificate(remoteHostOrigin, remotePin);
   const url = remote ? remote.url : await startNextServer();
   serverUrl = url;
 
@@ -1054,6 +2121,14 @@ async function createWindow() {
   });
   if (state?.maximized) mainWindow.maximize();
   trackWindowState(mainWindow);
+  // Closing the window with a company file open: keep it on screen while the file is saved into
+  // the company file (before-quit), so any question about that save has a window to appear on.
+  mainWindow.on('close', (e) => {
+    if (openFile && !quittingAfterBackup) {
+      e.preventDefault();
+      app.quit();
+    }
+  });
   // The page reads its theme from a cookie; hand it the saved one so the first paint matches
   // the frame (the local server's port, and so its origin, changes every launch).
   try {
@@ -1065,22 +2140,31 @@ async function createWindow() {
 
   if (remoteHostOrigin) {
     buildMenu();
+    // Like QuickBooks, joining a company file asks for your user name and password every time.
+    for (const name of ['bka_session', 'bka_unlock']) {
+      await session.defaultSession.cookies.remove(url, name).catch(() => {});
+    }
     try {
       await mainWindow.loadURL(url);
     } catch (err) {
+      const remoteFile = loadConfig().remoteFile;
       const { response } = await dialog.showMessageBox(mainWindow, {
+        noLink: true,
         type: 'warning',
-        message: `Can't reach the host at ${remoteHostOrigin}`,
+        message: remoteFile
+          ? `Can't reach the computer that has ${companyFile.locationName(remoteFile)} open`
+          : `Can't reach the host at ${remoteHostOrigin}`,
         detail:
-          'Make sure the host computer is on, Ironbooks there has "Host multi-user access" turned on, and both computers are signed in to Tailscale.\n\n' +
+          (remoteFile
+            ? 'It may have closed the company file or left multi-user mode. Open the company file again to ask for access.\n\n'
+            : 'Make sure the host computer is on, Ironbooks there has "Host multi-user access" turned on, and both computers are signed in to Tailscale.\n\n') +
           String((err && err.message) || err),
         buttons: ['Try Again', 'Open My Local Company Instead', 'Quit'],
         defaultId: 0,
         cancelId: 2,
       });
       if (response === 0) {
-        app.relaunch();
-        app.quit();
+        relaunchApp();
       } else if (response === 1) disconnectFromHost();
       else app.quit();
     }
@@ -1106,13 +2190,24 @@ async function createWindow() {
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
   // Ensure the active file is self-describing (manifest) and stamp its last-opened time.
   const activeDir = activeCompanyDir();
+  // A single company file's working folder is just "data": name it after the company file.
+  if (openFile && !companyFile.readManifest(activeDir)) {
+    companyFile.writeManifest(activeDir, {
+      name: companyFileFormat.companyFileBaseName(openFile.path),
+      createdAt: new Date().toISOString(),
+    });
+  }
   companyFile.ensureManifest(activeDir);
   companyFile.writeManifest(activeDir, { lastOpenedAt: new Date().toISOString() });
   const inSandbox = Boolean(sandboxActive());
   // A sandbox copy is not a company file to come back to (a kept training file is added to
   // Recent Companies when it is kept).
-  if (!inSandbox) rememberRecentCompany(activeDir);
+  if (!inSandbox) rememberRecentCompany(currentCompanyLocation());
   buildMenu();
+  if (openFile) {
+    startLockMaintenance();
+    noteRecoveredWork();
+  }
   runDueRecurring(url);
   if (!inSandbox) {
     // Sandbox mode: no auto-backups (the server-side backup scheduler is started from
@@ -1311,7 +2406,7 @@ ipcMain.handle('file:saveBytes', async (e, opts) => {
 
 ipcMain.handle('portable:open', (e) => { if (fromLocalApp(e)) openPortableFlow(); return true; });
 
-ipcMain.handle('app:dataDir', (e) => (fromLocalApp(e) ? activeCompanyDir() : null));
+ipcMain.handle('app:dataDir', (e) => (fromLocalApp(e) ? currentCompanyLocation() : null));
 
 // ---------------------------------------------------------------------------
 // Company-file management (drives the in-app "Company File" screen)
@@ -1320,28 +2415,62 @@ ipcMain.handle('app:dataDir', (e) => (fromLocalApp(e) ? activeCompanyDir() : nul
 // remote host's pages when this app is connected as a multi-user client.
 ipcMain.handle('company:current', (e) => {
   if (!fromLocalApp(e)) return null;
-  const dir = activeCompanyDir();
-  const m = companyFile.readManifest(dir) || {};
-  return { dir, name: companyFile.companyName(dir), passwordProtected: Boolean(m.passwordProtected) };
+  const location = currentCompanyLocation();
+  const m = companyFile.readManifest(activeCompanyDir()) || {};
+  return {
+    dir: location,
+    name: companyFile.locationName(location),
+    passwordProtected: Boolean(m.passwordProtected),
+    // A single company file (the current format) or a company folder (older format).
+    singleFile: Boolean(openFile),
+    multiUser: Boolean(hostingState && hostingState.lan),
+  };
 });
 ipcMain.handle('company:recent', (e) => {
   if (!fromLocalApp(e)) return [];
   const cfg = loadConfig();
-  const current = activeCompanyDir();
+  const current = currentCompanyLocation();
   return (Array.isArray(cfg.recentCompanies) ? cfg.recentCompanies : [])
     .filter((d) => typeof d === 'string')
-    .map((dir) => ({ dir, name: companyFile.companyName(dir), current: dir === current }));
+    .map((loc) => ({ dir: loc, name: companyFile.locationName(loc), current: samePath(loc, current) }));
+});
+// The signed-in user (the lock shows other workstations who has the file open, and the sign-in
+// screen pre-fills this name next time, like QuickBooks).
+ipcMain.handle('company:signedIn', (e, name) => {
+  if (!fromAppOrigin(e) || typeof name !== 'string' || !name.trim()) return false;
+  const clean = name.trim().slice(0, 120);
+  const location = remoteHostOrigin ? loadConfig().remoteFile : currentCompanyLocation();
+  if (location) rememberLastUser(location, clean);
+  if (openFile) {
+    openFile.appUser = clean;
+    lockHeartbeat().catch(() => {});
+  }
+  return true;
+});
+ipcMain.handle('company:lastUser', (e) => {
+  if (!fromAppOrigin(e)) return null;
+  const location = remoteHostOrigin ? loadConfig().remoteFile : currentCompanyLocation();
+  return location ? lastUserFor(location) : null;
+});
+ipcMain.handle('company:saveNow', (e) => {
+  if (fromLocalApp(e)) saveNowFlow();
+  return true;
+});
+ipcMain.handle('company:saveCopyAs', (e, opts) => {
+  if (fromLocalApp(e)) saveCopyAsFlow({ convert: Boolean(opts && opts.convert) });
+  return true;
 });
 ipcMain.handle('company:new', (e) => { if (fromLocalApp(e)) createCompanyFlow(); return true; });
 ipcMain.handle('company:open', (e) => { if (fromLocalApp(e)) openCompanyFlow(); return true; });
 ipcMain.handle('company:switch', (e, dir) => {
-  if (fromLocalApp(e) && typeof dir === 'string' && dir) openCompanyDir(dir);
+  // Only to a company file on the recent list (the page shows that list).
+  if (fromLocalApp(e) && typeof dir === 'string' && dir && recentCompanyDirs().some((d) => samePath(d, dir))) openCompany(dir);
   return true;
 });
 // Show the open company file in Explorer / Finder, and File > Close Company from the page.
 ipcMain.handle('company:reveal', (e) => {
   if (!fromLocalApp(e)) return false;
-  shell.showItemInFolder(activeCompanyDir());
+  shell.showItemInFolder(currentCompanyLocation());
   return true;
 });
 // The open file's company name, so Recent Companies and "No Company Open" can show it.
@@ -1367,20 +2496,19 @@ function recentCompanyDirs() {
 ipcMain.handle('start:list', (e) => {
   if (!fromStartScreen(e)) return [];
   return startScreen.recentEntries(recentCompanyDirs(), {
-    exists: (dir) => {
-      try {
-        return fs.statSync(dir).isDirectory();
-      } catch {
-        return false;
-      }
+    exists: (loc) => companyFile.locationExists(loc),
+    readManifest: (loc) => companyFile.locationDetails(loc),
+    companyName: (loc) => companyFile.locationName(loc),
+    inUseBy: (loc) => {
+      if (!companyFile.isSingleFile(loc)) return null;
+      const h = companyLock.readHolder(loc);
+      return h && !h.stale ? companyLock.describeOwner(h.owner) : null;
     },
-    readManifest: (dir) => companyFile.readManifest(dir),
-    companyName: (dir) => companyFile.companyName(dir),
   });
 });
 ipcMain.handle('start:open', (e, dir) => {
   if (!fromStartScreen(e) || !recentCompanyDirs().includes(dir) || !fs.existsSync(dir)) return false;
-  openCompanyDir(dir);
+  openCompany(dir);
   return true;
 });
 ipcMain.handle('start:remove', (e, dir) => {
@@ -1445,6 +2573,9 @@ app.on('second-instance', (_event, argv) => {
     pendingBkpPath = bkp;
     deliverPendingBkp();
   }
+  // Double-clicking a company file while Ironbooks is running.
+  const company = extractCompanyPath(argv || []);
+  if (company) openCompanyFromOs(company).catch((err) => console.error('[open] company file:', err));
 });
 
 // ---- App updates (electron-updater + the GitHub Releases feed in package.json build.publish) ----
@@ -1532,7 +2663,7 @@ function getUpdater() {
 }
 
 function updateDialog(message, detail) {
-  if (mainWindow) dialog.showMessageBox(mainWindow, { type: 'info', message, detail, buttons: ['OK'] });
+  if (mainWindow) dialog.showMessageBox(mainWindow, { noLink: true, type: 'info', message, detail, buttons: ['OK'] });
 }
 
 /** Check the release feed. `manual` (Help menu) reports every outcome in a dialog. */
@@ -1626,15 +2757,30 @@ app.on('activate', () => {
 });
 
 app.on('before-quit', (event) => {
-  // First pass: hold the quit open long enough to snapshot the company file, then
-  // re-enter quit with the flag set. Data safety: a rotating local auto-backup means
-  // a bad restore / disk hiccup never costs more than one session.
+  // First pass: hold the quit open long enough to snapshot the company file, save a single
+  // company file into itself and release its lock, then re-enter quit with the flag set. Data
+  // safety: a rotating local auto-backup means a bad restore / disk hiccup never costs more than
+  // one session, and the company file on the server is complete when the app is gone.
   if (!quittingAfterBackup) {
     quittingAfterBackup = true;
     event.preventDefault();
     runAutoBackup()
       .catch((err) => console.error('[auto-backup] skipped:', err?.message || err))
-      .finally(() => app.quit());
+      .then(() => closeOpenCompanyFile())
+      .catch((err) => {
+        console.error('[company-file] closing failed:', err?.message || err);
+        return true;
+      })
+      .then((goOn) => {
+        if (goOn === false) {
+          // The person chose to keep working (the save failed): don't quit, don't relaunch.
+          quittingAfterBackup = false;
+          relaunchAfterQuit = false;
+          return;
+        }
+        if (relaunchAfterQuit) app.relaunch();
+        app.quit();
+      });
     return;
   }
   // Second pass: backup done (or skipped) — stop hosting and shut the server down for real.

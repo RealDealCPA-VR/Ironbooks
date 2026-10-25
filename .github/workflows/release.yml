@@ -7,11 +7,23 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Actions-provided, contents:write
+      # Code signing — with either one set up, Windows no longer warns about an unknown publisher
+      # (SIGNING.md). With neither, releases are built exactly as before, unsigned.
+      #  - WIN_CSC_LINK (base64 .pfx) + WIN_CSC_KEY_PASSWORD: a code-signing certificate;
+      #    electron-builder signs every file while it builds.
+      #  - SIGNPATH_API_TOKEN (+ repository variables SIGNPATH_ORGANIZATION_ID, and optionally
+      #    SIGNPATH_PROJECT_SLUG / SIGNPATH_SIGNING_POLICY_SLUG): SignPath signs the finished
+      #    installers, then the update feed is rebuilt for the signed files.
+      CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
       - run: npm ci --legacy-peer-deps
       # One draft release up front. The nsis and portable targets publish concurrently; left to
       # electron-builder, each could create its own release (v1.3.1 got two, and "latest" pointed
@@ -24,12 +36,50 @@ jobs:
             --notes "Windows: download **Ironbooks-Setup-${GITHUB_REF_NAME#v}.exe** (installer) or **Ironbooks-${GITHUB_REF_NAME#v}.exe** (portable). Installed copies update themselves from here.
 
           [Code signing policy](https://github.com/${GITHUB_REPOSITORY}#-code-signing-policy) · [Privacy](https://github.com/${GITHUB_REPOSITORY}/blob/main/PRIVACY.md)"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build & publish NSIS installer + latest.yml (electron-updater)
+
+      # --- Certificate (or no) signing: electron-builder builds, signs and publishes in one go ---
+      - name: Build & publish NSIS installer + portable + latest.yml (electron-updater)
+        if: env.SIGNPATH_API_TOKEN == ''
         run: npm run desktop:publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # Actions-provided, contents:write
+
+      # --- SignPath: build, sign the installers, rebuild the update feed, publish ---
+      - name: Build the installers for signing
+        if: env.SIGNPATH_API_TOKEN != ''
+        run: npm run build && npx electron-builder --win nsis portable --publish never
+      - name: Hand the installers to SignPath
+        if: env.SIGNPATH_API_TOKEN != ''
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installers
+          path: |
+            release/Ironbooks-Setup-*.exe
+            release/Ironbooks-[0-9]*.exe
+          if-no-files-found: error
+      - name: Sign with SignPath
+        if: env.SIGNPATH_API_TOKEN != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'Ironbooks' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: release/signed
+      - name: Publish the signed installers with an update feed that matches them
+        if: env.SIGNPATH_API_TOKEN != ''
+        shell: bash
+        run: |
+          cp -f release/signed/*.exe release/
+          # Signing changed the installer's bytes: rebuild latest.yml (sha512, size) and the
+          # block map, or installed copies would refuse the update.
+          node scripts/refresh-update-info.mjs release
+          V="${GITHUB_REF_NAME#v}"
+          gh release upload "$GITHUB_REF_NAME" \
+            "release/Ironbooks-Setup-$V.exe" "release/Ironbooks-Setup-$V.exe.blockmap" \
+            "release/Ironbooks-$V.exe" release/latest.yml --clobber
+
       # Publish only once every file is attached, so nobody sees a release without its installer.
       - name: Publish the release
         shell: bash
@@ -40,5 +90,3 @@ jobs:
             grep -qx "$f" assets.txt || { echo "::error::missing $f on the release"; exit 1; }
           done
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

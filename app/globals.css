@@ -343,6 +343,29 @@
 }
 
 /*
+ * Keyboard lists (useListKeys in lib/shortcuts.ts): the highlighted row is QB's selected line.
+ * Tinted with the accent; stronger, with a bar on its left edge, while the list has focus.
+ */
+[data-list]:focus {
+  outline: none;
+}
+[data-list]:focus-visible {
+  outline: 2px solid rgb(var(--accent) / 0.4);
+  outline-offset: -2px;
+}
+tr[data-list-active] > td,
+tr[data-list-active] > th {
+  background-color: rgb(var(--accent) / 0.08);
+}
+[data-list]:focus tr[data-list-active] > td,
+[data-list]:focus tr[data-list-active] > th {
+  background-color: rgb(var(--accent) / 0.16);
+}
+[data-list]:focus tr[data-list-active] > :first-child {
+  box-shadow: inset 3px 0 0 rgb(var(--accent));
+}
+
+/*
  * Legacy responsive fallback: several dashboard pages still use static
  * grid-cols-3 / grid-cols-5 without breakpoint prefixes. This keeps them usable
  * on small screens WITHOUT !important (wins over @tailwind utilities above by

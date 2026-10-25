@@ -22,6 +22,7 @@ import {
   PageHeader,
   toast,
 } from '@/components/ui';
+import { quickReportHref } from '@/lib/shortcuts';
 import { Help } from '@/components/Help';
 import WhyChanged from '@/components/WhyChanged';
 import { api, ApiError } from '@/lib/client';
@@ -267,7 +268,11 @@ function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
 
   return (
     <>
-      <Tr key={node.id} className={node.isActive ? '' : 'opacity-60'}>
+      <Tr
+        key={node.id}
+        className={node.isActive ? '' : 'opacity-60'}
+        data-quick-report={quickReportHref('account', node.id)}
+      >
         {showNumbers && (
           <Td>
             <span className="font-mono text-xs text-navy/60">{node.code}</span>

@@ -17,7 +17,7 @@
  */
 
 import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
-import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { Banknote, Paperclip, Pencil, Plus, Trash2 } from 'lucide-react';
 import {
@@ -26,6 +26,7 @@ import {
   Card,
   ConfirmDialog,
   DateInput,
+  DocNumberInput,
   EmptyState,
   Input,
   Select,
@@ -59,6 +60,7 @@ import { amountMessage, collectErrors, dateMessage, requiredMessage, type FieldE
 import { usePreferences } from '@/lib/usePreferences';
 import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import MemorizeButton from '@/components/MemorizeButton';
+import { TransactionNav } from '@/components/TransactionNav';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { visibleOtherNames, type OtherNameEntry } from '@/lib/lists/otherNameOptions';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
@@ -256,6 +258,8 @@ function isCreditCard(a: Account): boolean {
 
 function ExpensesPageContent() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  /** Bumped each time a transaction (or a blank form) is loaded: the toolbar re-reads the form then. */
+  const [loadCount, setLoadCount] = useState(0);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [otherNames, setOtherNames] = useState<OtherNameOption[]>([]);
   /** The Other Names list has answered (a command-bar prefill waits for it to match a payee). */
@@ -423,7 +427,7 @@ function ExpensesPageContent() {
   const classChoices: TypeaheadChoice[] = classes.map((c) => ({ id: c.id, label: c.name }));
   const customerChoices: TypeaheadChoice[] = customers.map((c) => ({ id: c.id, label: c.displayName }));
 
-  // Ctrl+E / Quick Actions navigate here with ?new=1 — the entry form is always
+  // Ctrl+W (QB Write Checks) / Quick Actions navigate here with ?new=1 — the entry form is always
   // visible, so jump focus to the start of it (the payee field).
   useNewParam(() => {
     document.getElementById('exp-payee')?.focus();
@@ -523,6 +527,7 @@ function ExpensesPageContent() {
         ),
       );
       setPrefillNote('');
+      setLoadCount((n) => n + 1);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       toastError(err, 'Failed to load the transaction.');
@@ -545,7 +550,18 @@ function ExpensesPageContent() {
     setMemo('');
     setLines([emptyLine()]);
     setPrefillNote('');
+    setLoadCount((n) => n + 1);
   }
+
+  // QB Previous / Next: checks and charges in date order (Previous from a new one opens the latest).
+  const navOrder = useMemo(
+    () => [...expenses].sort((a, b) => a.date.localeCompare(b.date) || (a.reference ?? '').localeCompare(b.reference ?? '')),
+    [expenses],
+  );
+  const navIndex = editingId ? navOrder.findIndex((x) => x.id === editingId) : -1;
+  const navPrev = editingId ? (navIndex > 0 ? navOrder[navIndex - 1] : null) : navOrder[navOrder.length - 1] ?? null;
+  const navNext = editingId && navIndex >= 0 && navIndex < navOrder.length - 1 ? navOrder[navIndex + 1] : null;
+  const editingExpense = editingId ? expenses.find((x) => x.id === editingId) ?? null : null;
 
   /**
    * Payee chosen while the lines are still blank: pre-fill accounts (vendor default → last
@@ -783,7 +799,15 @@ function ExpensesPageContent() {
       {/* ------------------------------------------------------------------ */}
       {/* Entry form                                                          */}
       {/* ------------------------------------------------------------------ */}
-      <Card className="p-6 mb-8 space-y-5">
+      {/* data-shortcut-scope: the form keys (Ctrl+S, Alt+S, Alt+A, Esc) act on this form. */}
+      <Card className="p-6 mb-8 space-y-5" data-shortcut-scope>
+        <TransactionNav
+          sourceRef={editingId ? `expense:${editingId}` : null}
+          onPrevious={navPrev ? () => void startEdit(navPrev) : null}
+          onNext={navNext ? () => void startEdit(navNext) : null}
+          onRevert={() => (editingExpense ? void startEdit(editingExpense) : resetForm())}
+          loadKey={`${loadCount}:${editingId ?? 'new'}`}
+        />
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-bold text-navy">
             {editingId ? 'Edit Transaction' : 'New Transaction'}
@@ -917,7 +941,7 @@ function ExpensesPageContent() {
           {entryType === 'check' && (
             <div>
               <Label htmlFor="exp-checkno">Check No.</Label>
-              <Input
+              <DocNumberInput
                 id="exp-checkno"
                 placeholder="auto"
                 value={toPrint ? '' : reference}

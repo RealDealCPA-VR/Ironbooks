@@ -379,6 +379,13 @@
       "when": 1781400061000,
       "tag": "0061_item_value_remainder",
       "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1781400062000,
+      "tag": "0062_user_challenge",
+      "breakpoints": true
     }
   ]
 }

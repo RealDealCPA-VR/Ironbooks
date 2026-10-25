@@ -41,6 +41,8 @@ interface HostingStatus {
   tailnetIp: string | null;
   port: number;
   bindAll: boolean;
+  /** Office-network multi-user mode (a company file on the shared drive; teammates pin this computer's certificate). */
+  lan?: boolean;
   error: string | null;
   remoteHost: string | null;
 }
@@ -150,9 +152,9 @@ export default function MultiUserPage() {
                 <Server className="h-5 w-5 text-electric" /> Host multi-user access
               </p>
               <p className="text-sm text-navy/60 mt-1 max-w-xl">
-                Let up to 40 people on your private Tailscale network work in this company file at the
-                same time. The file never leaves this computer; each person signs in with their own user
-                account.
+                {hosting.lan
+                  ? 'Multi-user mode is on for your office network: teammates who open this company file from the shared drive are connected to it through this computer. Keep Ironbooks open here while they work.'
+                  : 'In an office, keep the company file on a shared drive: when someone else opens it while you are in it, Ironbooks asks you to let them in (multi-user mode on your office network). To work with people outside the office, host it here for your private Tailscale network. Either way up to 40 people can work at the same time, each with their own user name.'}
               </p>
             </div>
             <Badge tone={hosting.hosting ? 'success' : 'neutral'}>{hosting.hosting ? 'Hosting' : 'Off'}</Badge>
@@ -176,9 +178,11 @@ export default function MultiUserPage() {
                 </div>
               ))}
               <p className="text-xs text-navy/50 mt-2">
-                {hosting.tls
-                  ? 'Encrypted with a Tailscale HTTPS certificate.'
-                  : 'Plain HTTP inside your tailnet (Tailscale encrypts all traffic between devices). Enable HTTPS certificates in the Tailscale admin console for an extra layer.'}
+                {hosting.lan
+                  ? "Encrypted (HTTPS) with this computer's own certificate. Teammates' Ironbooks checks it is exactly this computer before connecting."
+                  : hosting.tls
+                    ? 'Encrypted with a Tailscale HTTPS certificate.'
+                    : 'Plain HTTP inside your tailnet (Tailscale encrypts all traffic between devices). Enable HTTPS certificates in the Tailscale admin console for an extra layer.'}
                 {hosting.bindAll && ' Listening on all network interfaces (private addresses only).'}
               </p>
             </div>

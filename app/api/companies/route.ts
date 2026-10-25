@@ -33,6 +33,9 @@ function errorResponse(err: unknown) {
 /** First-run carve-out: allow session-less access only before any user exists. */
 async function allowFirstRun(db: DB): Promise<boolean> {
   if (process.env.BKA_ALLOW_DEV_FALLBACK === '1') return true;
+  // A single company file is set up by its Admin on /signup, never with a seeded demo company
+  // (same rule as getServerContext in lib/context.ts).
+  if (process.env.BKA_COMPANY_FILE) return false;
   const [anyUser] = await db.select({ id: users.id }).from(users).limit(1);
   return !anyUser;
 }

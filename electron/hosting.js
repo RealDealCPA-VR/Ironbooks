@@ -179,10 +179,18 @@ async function startHosting(opts) {
   const log = opts.log || console.log;
   const port = Number(opts.port) || core.DEFAULT_HOSTING_PORT;
   const tailnetIp = await detectTailnetIPv4();
-  const bind = core.selectBindAddresses({ tailnetIp, bindAll: opts.bindAll === true });
+  // Office-network mode (opts.lan): a teammate on the same network was let into a company file on
+  // the shared drive. Listen on every interface (peers are still limited to private addresses)
+  // and always serve HTTPS with this computer's own certificate, which the teammate pins.
+  const lan = opts.lan === true && opts.lanCert && opts.lanCert.cert;
+  const bind = lan ? { ok: true, proxyHosts: ['0.0.0.0'] } : core.selectBindAddresses({ tailnetIp, bindAll: opts.bindAll === true });
   if (!bind.ok) throw new Error(bind.error);
 
-  const tlsMaterial = opts.tls === false ? null : await obtainTlsCert(opts.certDir, log);
+  const tlsMaterial = lan
+    ? { cert: opts.lanCert.cert, key: opts.lanCert.key, dnsName: null }
+    : opts.tls === false
+      ? null
+      : await obtainTlsCert(opts.certDir, log);
   const secure = Boolean(tlsMaterial);
   const handler = createProxyHandler(opts.upstreamPort, { secure });
 
@@ -213,13 +221,19 @@ async function startHosting(opts) {
     throw err;
   }
 
-  const urls = core.shareUrls({
-    proxyHosts: bind.proxyHosts,
-    port,
-    tls: secure,
-    dnsName: tlsMaterial && tlsMaterial.dnsName,
-    tailnetIp,
-  });
+  const urls = lan
+    ? core.lanShareUrls({ lanIps: core.lanIPv4s(os.networkInterfaces()), tailnetIp, port })
+    : core.shareUrls({
+        proxyHosts: bind.proxyHosts,
+        port,
+        tls: secure,
+        dnsName: tlsMaterial && tlsMaterial.dnsName,
+        tailnetIp,
+      });
+  if (lan && !urls.length) {
+    await Promise.all(servers.map((s) => new Promise((r) => s.close(() => r()))));
+    throw new Error('This computer is not connected to an office network (no private network address was found).');
+  }
   log(`[hosting] multi-user access on ${urls.join(', ')} (app server stays on 127.0.0.1)`);
   return {
     servers,
@@ -229,6 +243,8 @@ async function startHosting(opts) {
     tailnetIp,
     addresses: bind.proxyHosts,
     urls,
+    lan: Boolean(lan),
+    fingerprint: lan ? opts.lanCert.fingerprint : null,
     startedAt: new Date().toISOString(),
   };
 }

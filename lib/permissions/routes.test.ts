@@ -147,6 +147,7 @@ describe('API permission map coverage', () => {
         '/api/auth/2fa/disable',
         '/api/auth/2fa/enable',
         '/api/auth/2fa/setup',
+        '/api/auth/challenge', // own challenge question (needs the current password to set)
         '/api/auth/change-password', // gapsb K: own password (also when expired)
         '/api/auth/login',
         '/api/auth/logout',
@@ -158,6 +159,11 @@ describe('API permission map coverage', () => {
         '/api/companies',
         '/api/companies/[id]',
         '/api/companies/select',
+        // Single-file company file: close / save-as accept only the desktop shell's internal
+        // token (checked in the handler); info is the sign-in screen's name + location.
+        '/api/company-file/close',
+        '/api/company-file/info',
+        '/api/company-file/save-as',
         '/api/email/status',
         '/api/portal/login',
         '/api/portal/logout',

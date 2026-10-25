@@ -57,10 +57,18 @@ describe('rewriteUpstreamLocation', () => {
     ).toBe('https://office.tail1234.ts.net:47800/unlock');
   });
 
+  it('also moves the https://localhost:<upstream> URL Next builds behind an HTTPS proxy', () => {
+    // Next takes the scheme from x-forwarded-proto: over the office network / tailnet with TLS its
+    // /unlock redirect is https://localhost:<upstream>/… — left alone, the teammate's window was
+    // sent to its own localhost and the connection failed.
+    expect(
+      core.rewriteUpstreamLocation('https://localhost:51278/unlock?next=%2F', upstream, { secure: true, host: '192.168.1.20:47800' }),
+    ).toBe('https://192.168.1.20:47800/unlock?next=%2F');
+  });
+
   it.each([
     '/unlock?next=%2F', // relative: already resolves against the proxy origin
     'http://localhost:3000/unlock', // some other local port
-    'https://localhost:51278/unlock', // not the plain-http upstream
     'https://fire.irs.gov/upload', // external
     'http://localhost.evil.com:51278/x',
     'not a url',

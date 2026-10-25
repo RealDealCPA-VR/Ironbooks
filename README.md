@@ -26,7 +26,7 @@ refuses to let your books go out of balance.**
 QuickBooks Desktop runs on rising subscriptions and a shrinking product line. Cloud accounting
 puts your clients' books on someone else's server. Ironbooks is the third option:
 
-- 🔒 **Your books never leave your computer.** The company file is a folder you own. There's no
+- 🔒 **Your books never leave your computer.** The company file is one file you own, like a .QBW. There's no
   account, no telemetry and no lock-in.
 - ⚖️ **Unbalanced books are impossible, not just unlikely.** Ledger rules run as **database
   triggers**. An unbalanced entry, a hand-edited balance, or a change to a posted line is
@@ -134,7 +134,11 @@ transactions · reminders · calendar · Lead Center · Doc Center · letters & 
 - **Light, dark or auto, with your accent color.** A clean, Apple-style look: hairline borders,
   soft shadows, one accent color. The desktop window follows too: no gray system frame, just a
   title bar in the theme's colors with the menus in it. Printed forms always print on white.
-- **Keyboard first:** shortcuts everywhere (press `?`), and **Enter many transactions** at once in
+- **Keyboard first, with QuickBooks' keys:** Ctrl+W Write Checks, Ctrl+I Invoice, Ctrl+J Customer
+  Center, Ctrl+A Chart of Accounts, Ctrl+R Register, Ctrl+E edit, Ctrl+D delete, Ctrl+F Find, Ctrl+M
+  memorize, Ctrl+T memorized list, Ctrl+Y journal, Ctrl+Q QuickReport, Alt+S Save & New, Alt+A Save &
+  Close, date keys (+ − T W K M H Y R [ ] ; '), + / − in check numbers, and lists you drive with the
+  arrow keys and type-ahead (press `?` for all of them), and **Enter many transactions** at once in
   a grid with paste from Excel.
 - **Receipt capture:** drop a photo or PDF anywhere, or upload it from your phone over your
   tailnet. **Offline OCR** fills in the expense.
@@ -147,16 +151,31 @@ transactions · reminders · calendar · Lead Center · Doc Center · letters & 
 - **Checks on any pre-cut stock:** voucher, standard 3-per-page or wallet, the check at the top,
   middle or bottom of the sheet, and every field position adjustable.
 
-### 🗄️ A company file you can trust
+### 🗄️ A company file that works like a .QBW
+- **One file, wherever you want it**: `ABC Company.ironbooks` on this computer, a USB drive or the
+  office file server. Double-click it to open it; copy it, back it up or hand it to your accountant
+  like any other file.
+- **Built for a shared drive**: while someone is in the file it is locked, and anyone else who opens
+  it sees who has it and on which computer. They can **ask to come in**, and the person in the file
+  chooses **Let Them In** (multi-user mode on your office network, each person with their own user
+  name), **Hand It Over**, or **Not Now**. File → Switch to Multi-user Mode lets people join without
+  asking.
+- **Saved as you go, never half-written**: every change is saved into the company file a few seconds
+  after you make it and when you close it, with a new copy swapped in all at once, so a dropped
+  network connection or a power cut can't leave a damaged file. Unsaved work on a computer that
+  crashed is recovered the next time the file opens there. The title bar shows **Saved** at a glance.
+- **Passwords belong to the company file**: each person signs in with their own user name and
+  password every time the file is opened. The sign-in box shows which company and which file. The
+  users, passwords and challenge questions travel inside the file, so a copy of it is just as protected.
 - **Running transaction log** inside the file records every change, tamper-evident, like QB's TLG.
-- **Shareable**: a single-file portable copy, or an Excel/PDF ledger for your accountant.
-- **Your file, where you put it**: the company menu shows where the open file lives (with Show in
-  folder), and **File → Close Company** releases it and lists your recent company files with
-  their full locations, like QuickBooks' No Company Open window.
+- **Shareable**: Save Copy As, a portable copy (.bkp, like a .QBM), or an Excel/PDF ledger for your
+  accountant. **File → Close Company** shows your recent company files with their full locations,
+  like QuickBooks' No Company Open window, and Open or Restore Company restores a backup to a new file.
 - **Backups that restore in full**, an automatic backup before risky operations, and **Condense
   Data** that writes a restorable archive first.
-- **Per-company users, roles and permissions.** Multi-user hosting is limited to your Tailscale
+- **Per-company users, roles and permissions**, multi-user on your office network or your Tailscale
   tailnet.
+- Company folders from earlier versions still open; File → Save as a Single Company File converts one.
 
 ## 🔄 Switching from QuickBooks
 
@@ -257,6 +276,11 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] **v1.4.0 release**: typed-in registers on every account, statement PDF / scan / Excel import with tie-out, AI account suggestions for new payees (business context + optional self-hosted SearXNG lookup), Plaid removed
 - [x] **v1.5.0 release**: a clean Apple-style look; light / dark / auto with eight accent colors; a themed desktop window with the menus in its title bar
 - [x] **v1.5.1 release**: File → Close Company with a No Company Open list of recent files and their locations; the open file's location in the company menu; toolbar and pop-outs no longer cut off
+- [x] **QuickBooks-converts round (1.6.0)**: the company file is one `.ironbooks` file (like a .QBW) that
+  saves itself safely and can live on the office file server; a lock while someone is in it, with
+  Ask to Come In / Let Them In / Hand It Over; passwords that belong to the file and are asked on
+  every open, with a challenge question for a forgotten password; QuickBooks' keyboard shortcuts
+  throughout; a welcome screen on first run; clean builds
 - [ ] The remaining partial rows and P2 follow-ups in [`PARITY.md`](./PARITY.md)
 - [ ] Hands-on QA of the new screens, then a tagged release
 
@@ -272,7 +296,9 @@ Free code signing provided by [SignPath.io](https://signpath.io), certificate by
 Windows installers are built from this repository by GitHub Actions
 ([`release.yml`](./.github/workflows/release.yml)) and signed only after a maintainer approves
 each release. Releases up to and including 1.5.1 were published unsigned, while the
-SignPath application was in progress.
+SignPath application was in progress; the workflow signs with SignPath (or a certificate) as soon
+as its credentials are added — see [`SIGNING.md`](./SIGNING.md). Until a release is signed,
+Windows may show "Windows protected your PC": choose **More info → Run anyway**.
 
 | Role | Members |
 | --- | --- |

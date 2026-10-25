@@ -1,10 +1,12 @@
 // Company-file helpers for the desktop shell.
 //
-// A "company file" is a self-contained folder (the user can place it anywhere — a local disk,
-// an external drive, or a mapped network/server share) holding one embedded database plus a small
-// manifest that gives the file a human name. The actual file password lives inside the database
-// (server-enforced); the manifest only carries a `passwordProtected` display hint so Open/Recent
-// can show a lock icon without spinning up the server.
+// A company file is a single file, "ABC Company.ironbooks" (electron/companyFileFormat.js), that
+// the user can put anywhere — a local disk, a USB drive, or the office file server. Older
+// versions stored it as a self-contained folder holding the embedded database plus a small
+// manifest (`bookkeeper-company.json`) that gives it a human name; those folders still open, and
+// the manifest still lives inside the database folder of every company file. The file password
+// and the users live inside the database (server-enforced); the manifest only carries a
+// `passwordProtected` display hint so Open/Recent can show a lock icon without starting the server.
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -92,7 +94,64 @@ function readSandboxMarker(dir) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Company file locations: a single company file ("ABC Company.ironbooks", the current format —
+// electron/companyFileFormat.js) or a company folder (the older format, still fully supported).
+// Recent-file lists, menus and the No Company Open screen hold either kind.
+// ---------------------------------------------------------------------------
+
+const format = require('./companyFileFormat');
+
+/** True when `location` is a single company file (not a folder). */
+function isSingleFile(location) {
+  try {
+    return fs.statSync(location).isFile();
+  } catch {
+    return /\.ironbooks$/i.test(String(location || '')) && !String(location).endsWith(path.sep);
+  }
+}
+
+/** Whether the company file / folder is there (a file server that is offline reads as missing). */
+function locationExists(location) {
+  try {
+    const st = fs.statSync(location);
+    return st.isFile() || st.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Display name for either kind: the company name saved in it, else the file / folder name. */
+function locationName(location) {
+  if (isSingleFile(location)) {
+    const m = format.readCompanyManifest(location);
+    if (m && typeof m.companyName === 'string' && m.companyName.trim()) return m.companyName.trim();
+    return format.companyFileBaseName(location);
+  }
+  return companyName(location);
+}
+
+/** Manifest-ish details for lists: { lastOpenedAt|savedAt, passwordProtected }. */
+function locationDetails(location) {
+  if (isSingleFile(location)) {
+    const m = format.readCompanyManifest(location) || {};
+    return {
+      lastOpenedAt: typeof m.savedAt === 'string' ? m.savedAt : null,
+      passwordProtected: Boolean(m.passwordProtected),
+    };
+  }
+  const m = readManifest(location) || {};
+  return {
+    lastOpenedAt: typeof m.lastOpenedAt === 'string' ? m.lastOpenedAt : null,
+    passwordProtected: Boolean(m.passwordProtected),
+  };
+}
+
 module.exports = {
+  isSingleFile,
+  locationExists,
+  locationName,
+  locationDetails,
   SANDBOX_MARKER,
   readSandboxMarker,
   MANIFEST,

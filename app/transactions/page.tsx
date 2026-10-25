@@ -112,6 +112,7 @@ export default function TransactionsPage() {
                     key={e.id}
                     onClick={() => setSelectedId(e.id)}
                     className="cursor-pointer hover:bg-electric/5"
+                    data-journal-entry={e.id}
                   >
                     <Td className="text-navy/60 tabular-nums">{e.entryNumber}</Td>
                     <Td className="whitespace-nowrap">{formatDate(e.date)}</Td>

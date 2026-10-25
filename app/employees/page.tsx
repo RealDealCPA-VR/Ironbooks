@@ -24,6 +24,7 @@ import {
   PageHeader,
   toast,
 } from '@/components/ui';
+import { quickReportHref } from '@/lib/shortcuts';
 import { api, ApiError } from '@/lib/client';
 import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 import { formatCurrency } from '@/lib/money';
@@ -1787,7 +1788,7 @@ export default function EmployeesPage() {
             </thead>
             <tbody>
               {visibleEmployees.map((emp) => (
-                <Tr key={emp.id}>
+                <Tr key={emp.id} data-quick-report={quickReportHref('employee', emp.id)}>
                   <Td className="font-semibold text-navy">{employeeName(emp)}</Td>
                   <Td className="text-navy/70">{emp.email ?? '-'}</Td>
                   <Td className="text-navy/70">{PAY_TYPE_LABELS[emp.payType] ?? emp.payType}</Td>

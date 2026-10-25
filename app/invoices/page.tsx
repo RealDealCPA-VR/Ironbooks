@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { FileText, Plus, Trash2, PlusCircle, MinusCircle, Download, Mail, Package, Pencil, Send } from 'lucide-react';
 import {
   AmountInput,
@@ -8,6 +8,7 @@ import {
   Card,
   ConfirmDialog,
   DateInput,
+  DocNumberInput,
   EmptyState,
   Input,
   Select,
@@ -66,6 +67,7 @@ type InvoiceBody = Record<string, unknown>;
 /** Request flags a fix can set that have no field on the invoice form. */
 const INVOICE_FIX_FLAGS = ['overrideCreditLimit', 'allowOverBilling', 'checkStock'] as const;
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
+import { TransactionNav } from '@/components/TransactionNav';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
@@ -376,6 +378,8 @@ interface InvoiceModalProps {
   onSaved: () => void;
   /** cmdbar: values from the command bar for a NEW invoice (the user still reviews and saves). */
   prefill?: FormPrefill | null;
+  /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
+  nav?: React.ReactNode;
 }
 
 function InvoiceModal({
@@ -390,6 +394,7 @@ function InvoiceModal({
   customFieldDefs,
   onSaved,
   prefill = null,
+  nav = null,
 }: InvoiceModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => todayISO());
@@ -1109,6 +1114,7 @@ function InvoiceModal({
       }
     >
       <div className="space-y-4">
+        {nav}
         {!editing && <PrefillNotice note={prefill?.note} />}
         {fixer.panel}
         {editing && editing.status !== 'draft' && (
@@ -1148,7 +1154,7 @@ function InvoiceModal({
         {/* Invoice number (QB "Invoice #"): pre-filled with the next number, letters allowed */}
         <div>
           <Label htmlFor="inv-number">Invoice #</Label>
-          <Input
+          <DocNumberInput
             id="inv-number"
             value={refNumber}
             maxLength={50}
@@ -1687,6 +1693,8 @@ function InvoicesPageContent() {
 
   // Edit state — the full invoice (with lines) being edited.
   const [editTarget, setEditTarget] = useState<InvoiceDetail | null>(null);
+  /** Remounts the invoice form: Revert / Clear, and moving to another invoice (Previous / Next). */
+  const [formKey, setFormKey] = useState(0);
   const [loadingEditId, setLoadingEditId] = useState<string | null>(null);
 
   // Void state
@@ -1775,6 +1783,26 @@ function InvoicesPageContent() {
       toastError(err, 'Failed to load invoice.');
     } finally {
       setLoadingEditId(null);
+    }
+  }
+
+  // QB Previous / Next: invoices in date and number order (Previous from a new form opens the latest).
+  const navOrder = useMemo(
+    () => [...invoices].sort((a, b) => a.date.localeCompare(b.date) || a.invoiceNumber - b.invoiceNumber),
+    [invoices],
+  );
+  const navIndex = editTarget ? navOrder.findIndex((i) => i.id === editTarget.id) : -1;
+  const navPrev = editTarget ? (navIndex > 0 ? navOrder[navIndex - 1] : null) : navOrder[navOrder.length - 1] ?? null;
+  const navNext = editTarget && navIndex >= 0 && navIndex < navOrder.length - 1 ? navOrder[navIndex + 1] : null;
+  async function goToInvoice(inv: Invoice) {
+    try {
+      const detail = await api.get<InvoiceDetail>(`/api/invoices/${inv.id}`);
+      setEditTarget(detail);
+      setShowNew(false);
+      setPrefill(null);
+      setFormKey((k) => k + 1);
+    } catch (err: unknown) {
+      toastError(err, 'Failed to load invoice.');
     }
   }
 
@@ -2048,8 +2076,18 @@ function InvoicesPageContent() {
       )}
 
       <InvoiceModal
+        key={formKey}
         open={showNew || !!editTarget}
         editing={editTarget}
+        nav={
+          <TransactionNav
+            sourceRef={editTarget && editTarget.status !== 'draft' ? `invoice:${editTarget.id}` : null}
+            onPrevious={navPrev ? () => void goToInvoice(navPrev) : null}
+            onNext={navNext ? () => void goToInvoice(navNext) : null}
+            onRevert={() => setFormKey((k) => k + 1)}
+            loadKey={`${formKey}:${editTarget?.id ?? 'new'}`}
+          />
+        }
         onClose={() => { setShowNew(false); setEditTarget(null); setPrefill(null); }}
         prefill={editTarget ? null : prefill}
         customers={customers}

@@ -4,7 +4,7 @@
  * (ARIA 1.2 combobox pattern):
  *
  *   typing          filters the list (matching rules in lib/typeahead.ts) and opens it
- *   Alt+Down        opens the list without typing
+ *   Alt+Down, Ctrl+L  opens the list without typing (QB Ctrl+L)
  *   Down / Up       move through the open list (Home / End jump)
  *   Enter / Tab     take the highlighted entry (Tab then moves on as usual)
  *   Esc             closes the list (and only the list — not the dialog or form around it)
@@ -16,6 +16,7 @@
  */
 import * as React from 'react';
 import { Input } from '@/components/ui';
+import { isOpenListKey } from '@/lib/shortcuts';
 import { type TypeaheadOption, comboboxAria, filterTypeahead, initialHighlight, moveHighlight } from '@/lib/typeahead';
 
 export interface TypeaheadProps
@@ -76,11 +77,15 @@ export const Typeahead = React.forwardRef<HTMLInputElement, TypeaheadProps>(func
     onKeyDown?.(e);
     if (e.defaultPrevented) return;
     if (!expanded) {
-      if (e.key === 'ArrowDown' && e.altKey) {
+      if (isOpenListKey(e)) {
         e.preventDefault();
         setOpen(true);
         setActive(0);
       }
+      return;
+    }
+    if (isOpenListKey(e)) {
+      e.preventDefault(); // already open: keep Ctrl+L away from the global handlers
       return;
     }
     switch (e.key) {
@@ -88,7 +93,6 @@ export const Typeahead = React.forwardRef<HTMLInputElement, TypeaheadProps>(func
       case 'ArrowUp':
       case 'Home':
       case 'End':
-        if (e.key === 'ArrowDown' && e.altKey) return;
         e.preventDefault();
         setActive((i) => moveHighlight(i, results.length, e.key as 'ArrowDown' | 'ArrowUp' | 'Home' | 'End'));
         return;

@@ -41,6 +41,17 @@ describe('formShortcutFor', () => {
     expect(formShortcutFor(k('ś', { ctrlKey: true, altKey: true, code: 'KeyS' }))).toBe('save-new');
   });
 
+  it("maps QB's underlined form-button letters (Alt+S / A / R / P / N)", () => {
+    expect(formShortcutFor(k('s', { altKey: true }))).toBe('save-new');
+    expect(formShortcutFor(k('a', { altKey: true }))).toBe('save-close');
+    expect(formShortcutFor(k('r', { altKey: true }))).toBe('revert');
+    expect(formShortcutFor(k('p', { altKey: true }))).toBe('prev');
+    expect(formShortcutFor(k('n', { altKey: true }))).toBe('next');
+    expect(formShortcutFor(k('ß', { altKey: true, code: 'KeyS' }))).toBe('save-new'); // Option+S on a Mac
+    expect(formShortcutFor(k('c', { altKey: true }))).toBeNull(); // Company menu, not a form key
+    expect(formShortcutFor(k('s', { altKey: true, shiftKey: true }))).toBeNull();
+  });
+
   it('leaves everything else alone', () => {
     expect(formShortcutFor(k('s'))).toBeNull();
     expect(formShortcutFor(k('n'))).toBeNull();
@@ -69,6 +80,12 @@ describe('shouldRunFormShortcut', () => {
   });
   it('never during IME composition', () => {
     expect(shouldRunFormShortcut('save', { ...base, composing: true })).toBe(false);
+  });
+  it('Save & Close, Revert, Previous and Next work in dialogs and fields, not in an open picker', () => {
+    for (const a of ['save-close', 'revert', 'prev', 'next'] as const) {
+      expect(shouldRunFormShortcut(a, { ...base, dialogOpen: true }), a).toBe(true);
+      expect(shouldRunFormShortcut(a, { ...base, pickerOpen: true }), a).toBe(false);
+    }
   });
 });
 
@@ -110,11 +127,28 @@ describe('pickShortcutButton', () => {
     expect(pickShortcutButton(b, 'save', { unique: true })).toBe(-1);
     expect(pickShortcutButton([b[0]], 'save', { unique: true })).toBe(0);
   });
+
+  it('Save & Close prefers that button, else the plain Save (our forms close on save)', () => {
+    expect(pickShortcutButton([{ label: 'Save & New' }, { label: 'Save & Close' }], 'save-close')).toBe(1);
+    expect(pickShortcutButton(bill, 'save-close')).toBe(2);
+    expect(pickShortcutButton([{ label: 'Save & New' }], 'save-close')).toBe(0); // only choice
+  });
+
+  it('Revert / Clear, Previous and Next by label', () => {
+    const b = [{ label: 'Clear' }, { label: 'Revert' }, { label: '< Prev' }, { label: 'Next >' }, { label: 'Save' }];
+    expect(pickShortcutButton(b, 'revert')).toBe(1);
+    expect(pickShortcutButton([{ label: 'Clear' }], 'revert')).toBe(0);
+    expect(pickShortcutButton(b, 'prev')).toBe(2);
+    expect(pickShortcutButton([{ label: 'Previous' }], 'prev')).toBe(0);
+    expect(pickShortcutButton(b, 'next')).toBe(3);
+    expect(pickShortcutButton(bill, 'next')).toBe(-1);
+    expect(pickShortcutButton([{ label: 'Clear filters' }, { label: 'Go', shortcut: 'revert' }], 'revert')).toBe(1);
+  });
 });
 
 describe('gridKeyAction (line grids)', () => {
   const text = { tag: 'INPUT', type: 'text' };
-  it('Ctrl+Insert inserts; Ctrl+D and Ctrl+Delete delete the line', () => {
+  it('Ctrl+Insert inserts; Ctrl+D (QB Delete Line) and Ctrl+Delete delete the line', () => {
     expect(gridKeyAction(k('Insert', { ctrlKey: true }), text)).toBe('insert');
     expect(gridKeyAction(k('d', { ctrlKey: true }), text)).toBe('remove');
     expect(gridKeyAction(k('Delete', { ctrlKey: true }), { tag: 'SELECT' })).toBe('remove');
@@ -172,8 +206,10 @@ describe('accessKeyParts', () => {
 describe('help tables', () => {
   it('list the form and grid keys shown in the "?" overlay', () => {
     const form = FORM_KEY_HELP.map((r) => r.keys).join(' | ');
-    for (const s of ['Ctrl+N', 'Ctrl+S', 'Ctrl+Alt+S / Ctrl+Enter', 'Esc']) expect(form).toContain(s);
+    for (const s of ['Ctrl+N', 'Ctrl+S', 'Alt+S', 'Ctrl+Alt+S / Ctrl+Enter', 'Alt+A', 'Alt+R', 'Alt+P / Alt+N', 'Esc']) {
+      expect(form).toContain(s);
+    }
     const grid = GRID_KEY_HELP.map((r) => r.keys).join(' | ');
-    for (const s of ['Ctrl+Insert', 'Ctrl+D', 'Enter / Down', 'Tab']) expect(grid).toContain(s);
+    for (const s of ['Ctrl+Insert', 'Ctrl+D', 'Enter / Down', 'Tab', 'Ctrl+L']) expect(grid).toContain(s);
   });
 });

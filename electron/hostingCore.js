@@ -165,6 +165,28 @@ function normalizeHostAddress(input, defaultPort = DEFAULT_HOSTING_PORT) {
   return { ok: true, url: `${u.origin}/`, origin: u.origin, host, port, error: null };
 }
 
+/**
+ * This computer's office-network (private LAN) IPv4 addresses, os.networkInterfaces() shape.
+ * Used by office-network hosting (a teammate let into a company file on the shared drive).
+ */
+function lanIPv4s(ifaces) {
+  const out = [];
+  for (const list of Object.values(ifaces || {})) {
+    for (const i of list || []) {
+      const fam = i && (i.family === 'IPv4' || i.family === 4);
+      if (fam && !i.internal && classifyAddress(i.address) === 'lan') out.push(i.address);
+    }
+  }
+  return [...new Set(out)];
+}
+
+/** Office-network hosting URLs: every LAN address, then the tailnet one (always HTTPS). */
+function lanShareUrls({ lanIps, tailnetIp, port }) {
+  const urls = (lanIps || []).map((ip) => `https://${ip}:${port}`);
+  if (tailnetIp) urls.push(`https://${tailnetIp}:${port}`);
+  return [...new Set(urls)];
+}
+
 /** URLs teammates should use to reach this host. */
 function shareUrls({ proxyHosts, port, tls, dnsName, tailnetIp }) {
   const urls = [];
@@ -183,7 +205,7 @@ function shareUrls({ proxyHosts, port, tls, dnsName, tailnetIp }) {
 /**
  * Location header the proxy hands a teammate. Next.js builds absolute redirect URLs from the
  * address the app server is bound to and spells loopback as "localhost" (NextURL), so an /unlock
- * or /login redirect points at http://localhost:<upstreamPort>/ — nothing on the teammate's
+ * or /login redirect points at http(s)://localhost:<upstreamPort>/ — nothing on the teammate's
  * computer. A redirect aimed at the upstream server is moved onto the origin the teammate used
  * (scheme from the proxy, host from their request); any other Location passes through unchanged.
  */
@@ -196,7 +218,9 @@ function rewriteUpstreamLocation(location, upstreamPort, { secure, host }) {
     return location; // relative: the browser resolves it against the proxy's origin already
   }
   const loopback = u.hostname === 'localhost' || u.hostname === '[::1]' || /^127(\.\d{1,3}){3}$/.test(u.hostname);
-  if (u.protocol !== 'http:' || !loopback || Number(u.port) !== Number(upstreamPort)) return location;
+  // Next builds the URL with the scheme the proxy forwards (x-forwarded-proto), so over HTTPS it
+  // is https://localhost:<upstreamPort>/… — both schemes point at the app server here.
+  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || !loopback || Number(u.port) !== Number(upstreamPort)) return location;
   let client;
   try {
     client = new URL(`${secure ? 'https' : 'http'}://${host}`);
@@ -221,4 +245,6 @@ module.exports = {
   selectBindAddresses,
   normalizeHostAddress,
   shareUrls,
+  lanIPv4s,
+  lanShareUrls,
 };

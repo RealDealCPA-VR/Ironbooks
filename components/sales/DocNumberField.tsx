@@ -5,7 +5,7 @@
  *  - useDocNumber(docType, open, editingRef)  form state, pre-filled with the next number
  *                                             (GET /api/doc-numbers?docType=) on a new form, or
  *                                             the saved number when editing;
- *  - <DocNumberField>                         the labelled input;
+ *  - <DocNumberField>                         the labelled input (+ / - step the number);
  *  - useDuplicateNumberConfirm()              QB's "This number has already been used" warning:
  *                                             run(send) calls send(false); when the server
  *                                             refuses a duplicate (409) it asks, and on "Keep
@@ -13,7 +13,7 @@
  *                                             (allowDuplicateNumber). Render `dialog`.
  */
 import * as React from 'react';
-import { ConfirmDialog, Input, Label } from '@/components/ui';
+import { ConfirmDialog, DocNumberInput, Label } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 
 export type DocNumberType =
@@ -74,7 +74,7 @@ export function DocNumberField({
   return (
     <div>
       <Label htmlFor={id}>{label}</Label>
-      <Input
+      <DocNumberInput
         id={id}
         value={value}
         maxLength={50}

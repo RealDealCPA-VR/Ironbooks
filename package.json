@@ -1,6 +1,6 @@
 {
   "name": "ironbooks",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "private": true,
   "license": "MIT",
   "description": "Ironbooks: open-source desktop accounting — a QuickBooks competitor with AI-powered error correction.",
@@ -18,6 +18,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "node scripts/e2e.mjs",
+    "test:e2e:file": "node scripts/e2e-company-file.mjs",
+    "test:e2e:desktop": "node --experimental-websocket scripts/e2e-desktop.mjs",
+    "test:e2e:keyboard": "node --experimental-websocket scripts/e2e-keyboard.mjs",
+    "test:e2e:multiuser": "node --experimental-websocket scripts/e2e-multiuser.mjs",
     "test:crawl": "node scripts/crawl.mjs",
     "typecheck": "tsc --noEmit",
     "electron:dev": "electron .",
@@ -92,6 +96,12 @@
     ],
     "fileAssociations": [
       {
+        "ext": "ironbooks",
+        "name": "Ironbooks Company File",
+        "description": "Ironbooks Company File",
+        "role": "Editor"
+      },
+      {
         "ext": "bka",
         "name": "Ironbooks Company Backup",
         "description": "Ironbooks Company Backup",
@@ -148,6 +158,7 @@
       "icon": "build/icon.png"
     },
     "nsis": {
+      "artifactName": "${productName}-Setup-${version}.${ext}",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": false,
@@ -156,6 +167,9 @@
       "shortcutName": "Ironbooks",
       "runAfterFinish": true,
       "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}.${ext}"
     },
     "mac": {
       "target": [

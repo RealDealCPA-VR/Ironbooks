@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { Banknote, Pencil, Plus, Receipt, Trash2 } from 'lucide-react';
 import {
@@ -57,6 +57,7 @@ import { usePreferences } from '@/lib/usePreferences';
 import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
+import { TransactionNav } from '@/components/TransactionNav';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { billRowFromRecall, lineClassOverride } from '@/lib/smartDefaults';
 import AttachmentPanel from '@/components/AttachmentPanel';
@@ -260,6 +261,8 @@ export default function BillsPage() {
   const fixer = useErrorFixes<BillBody>();
   const [showErrors, setShowErrors] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  /** Bumped each time a bill (or a blank form) is loaded: the toolbar re-reads the form then. */
+  const [loadCount, setLoadCount] = useState(0);
   const [loadingEditId, setLoadingEditId] = useState<string | null>(null);
 
   // Form fields
@@ -389,6 +392,7 @@ export default function BillsPage() {
     setLines([emptyLine()]);
     setPrefillNote('');
     setModalOpen(true);
+    setLoadCount((n) => n + 1);
   }
 
   /**
@@ -513,6 +517,7 @@ export default function BillsPage() {
             }),
       );
       setModalOpen(true);
+      setLoadCount((n) => n + 1);
     } catch (err) {
       toastError(err, 'Failed to load bill.');
     } finally {
@@ -523,6 +528,16 @@ export default function BillsPage() {
   function closeModal() {
     if (!submitting) setModalOpen(false);
   }
+
+  // QB Previous / Next: bills in date order (Previous from a new bill opens the latest).
+  const navOrder = useMemo(
+    () => [...bills].sort((a, b) => a.date.localeCompare(b.date) || (a.billNumber ?? '').localeCompare(b.billNumber ?? '')),
+    [bills],
+  );
+  const navIndex = editingId ? navOrder.findIndex((b) => b.id === editingId) : -1;
+  const navPrev = editingId ? (navIndex > 0 ? navOrder[navIndex - 1] : null) : navOrder[navOrder.length - 1] ?? null;
+  const navNext = editingId && navIndex >= 0 && navIndex < navOrder.length - 1 ? navOrder[navIndex + 1] : null;
+  const editingBill = editingId ? bills.find((b) => b.id === editingId) ?? null : null;
 
   // Line row mutations
   function updateLine(index: number, patch: Partial<LineRow>) {
@@ -888,6 +903,13 @@ export default function BillsPage() {
         }
       >
         <div className="space-y-4">
+          <TransactionNav
+            sourceRef={editingId ? `bill:${editingId}` : null}
+            onPrevious={navPrev ? () => void openEditModal(navPrev) : null}
+            onNext={navNext ? () => void openEditModal(navNext) : null}
+            onRevert={() => (editingBill ? void openEditModal(editingBill) : openModal())}
+            loadKey={`${loadCount}:${editingId ?? 'new'}`}
+          />
           {fixer.panel}
           {editingId && (
             <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">

@@ -124,6 +124,29 @@ describe('adjustDateForKey (QB date-entry keys)', () => {
     expect(adjustDateForKey('r', base)).toBe('2026-12-31');
   });
 
+  it('w / k jump to the first / last day of the week (Sunday – Saturday, as QB)', () => {
+    // 2026-06-09 is a Tuesday.
+    expect(adjustDateForKey('w', base)).toBe('2026-06-07');
+    expect(adjustDateForKey('W', base)).toBe('2026-06-07');
+    expect(adjustDateForKey('k', base)).toBe('2026-06-13');
+    expect(adjustDateForKey('K', '2026-12-30')).toBe('2027-01-02'); // the week runs into next year
+    expect(adjustDateForKey('w', '2026-06-07')).toBe('2026-06-07'); // already Sunday
+  });
+
+  it('[ / ] move a week back / forward, keeping the weekday', () => {
+    expect(adjustDateForKey('[', base)).toBe('2026-06-02');
+    expect(adjustDateForKey(']', base)).toBe('2026-06-16');
+    expect(adjustDateForKey(']', '2026-12-29')).toBe('2027-01-05');
+  });
+
+  it("; / ' move a month back / forward, clamping to the month's last day", () => {
+    expect(adjustDateForKey(';', base)).toBe('2026-05-09');
+    expect(adjustDateForKey("'", base)).toBe('2026-07-09');
+    expect(adjustDateForKey("'", '2026-01-31')).toBe('2026-02-28');
+    expect(adjustDateForKey(';', '2026-03-31')).toBe('2026-02-28');
+    expect(adjustDateForKey("'", '2026-12-15')).toBe('2027-01-15');
+  });
+
   it('t returns today', () => {
     const today = new Date();
     const expected = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(
@@ -141,6 +164,8 @@ describe('adjustDateForKey (QB date-entry keys)', () => {
   it('returns null for non-date keys so events pass through', () => {
     expect(adjustDateForKey('a', base)).toBeNull();
     expect(adjustDateForKey('5', base)).toBeNull();
+    expect(adjustDateForKey('/', base)).toBeNull(); // typed dates use '/'
+    expect(adjustDateForKey('{', base)).toBeNull();
     expect(adjustDateForKey('Tab', base)).toBeNull();
     expect(adjustDateForKey('ArrowUp', base)).toBeNull();
     expect(adjustDateForKey('Enter', base)).toBeNull();
@@ -148,17 +173,55 @@ describe('adjustDateForKey (QB date-entry keys)', () => {
 });
 
 describe('GLOBAL_SHORTCUTS table', () => {
-  it('includes the QB navigation shortcuts with the expected destinations', () => {
+  it('uses the QuickBooks Desktop navigation keys and destinations', () => {
     const byKey = Object.fromEntries(
-      GLOBAL_SHORTCUTS.filter((s) => s.ctrlKey).map((s) => [s.ctrlKey, s.href]),
+      GLOBAL_SHORTCUTS.filter((s) => s.ctrlKey && s.href).map((s) => [s.ctrlKey, s.href]),
     );
     expect(byKey).toEqual({
-      i: '/invoices?new=1',
-      e: '/expenses?new=1',
-      r: '/registers',
-      j: '/journal',
-      d: '/deposits',
+      w: '/expenses?new=1', // Write Checks
+      i: '/invoices?new=1', // Create Invoices
+      j: '/customers', // Customer Center
+      a: '/accounts', // Chart of Accounts
+      r: '/registers', // Use Register
+      t: '/recurring', // Memorized Transaction List
+      f: '/find', // Find
     });
+  });
+
+  it('maps the QB command keys (no navigation) to their commands', () => {
+    const byKey = Object.fromEntries(
+      GLOBAL_SHORTCUTS.filter((s) => s.command).map((s) => [s.ctrlKey ?? s.key, s.command]),
+    );
+    expect(byKey).toEqual({
+      e: 'edit',
+      d: 'delete',
+      p: 'print',
+      y: 'journal',
+      h: 'history',
+      q: 'quick-report',
+      m: 'memorize',
+      l: 'open-list',
+      k: 'palette',
+      F1: 'help',
+    });
+  });
+
+  it('no longer uses the old non-QB meanings (Ctrl+E check, Ctrl+J journal, Ctrl+D deposits)', () => {
+    const find = (k: string) => GLOBAL_SHORTCUTS.find((s) => s.ctrlKey === k);
+    expect(find('e')?.href).toBeUndefined();
+    expect(find('j')?.href).not.toBe('/journal');
+    expect(find('d')?.href).toBeUndefined();
+    // Make Deposits stays reachable from the menus and the command bar, on no shortcut.
+    expect(GLOBAL_SHORTCUTS.some((s) => s.href?.startsWith('/deposits'))).toBe(false);
+    expect(navActions.some((a) => a.href.startsWith('/deposits'))).toBe(true);
+  });
+
+  it('every row has a description and a display combo', () => {
+    for (const s of GLOBAL_SHORTCUTS) {
+      expect(s.keys, JSON.stringify(s)).toBeTruthy();
+      expect(s.description, s.keys).toBeTruthy();
+      if (s.ctrlKey) expect(s.keys).toBe(`Ctrl+${s.ctrlKey.toUpperCase()}`);
+    }
   });
 
   it('navigation shortcuts point at real sidebar destinations', () => {

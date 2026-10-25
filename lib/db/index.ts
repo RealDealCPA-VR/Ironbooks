@@ -224,10 +224,38 @@ export function openDb(dataDir?: string): DbHandle {
         console.error('[db] company file ledger is damaged:', dir, blocking.map((p) => p.detail).join(' '));
       }
     }
+    await noteFirstOpenPosition(client, dir);
   })();
 
   handles.set(dir, opened);
   return opened;
+}
+
+/**
+ * Where the database's write-ahead log stood once the company file had finished opening (after
+ * migrations, ledger guards and planner statistics), for the FIRST open in this process only.
+ * lib/services/companyFileSave.ts compares against it to know whether anything was written since
+ * the single company file was opened — however late its own state is first created. A later
+ * reopen (after a restore replaced the folder) never moves it, so restored books always count as
+ * unsaved.
+ */
+const firstOpen = globalThis as typeof globalThis & { __ironbooksFirstOpenLsn?: { dir: string; lsn: string } };
+
+async function noteFirstOpenPosition(client: PGlite, dir: string): Promise<void> {
+  if (!process.env.BKA_COMPANY_FILE || firstOpen.__ironbooksFirstOpenLsn) return;
+  try {
+    const res = await client.query<{ lsn: string }>('select pg_current_wal_insert_lsn()::text as lsn');
+    const lsn = res.rows[0]?.lsn;
+    if (lsn && !firstOpen.__ironbooksFirstOpenLsn) firstOpen.__ironbooksFirstOpenLsn = { dir, lsn };
+  } catch {
+    /* unknown: the save logic then treats the database as changed */
+  }
+}
+
+/** The write position recorded when `dataDir` was first opened in this process (see above). */
+export function firstOpenWalPosition(dataDir?: string): string | null {
+  const rec = firstOpen.__ironbooksFirstOpenLsn;
+  return rec && rec.dir === resolveDataDir(dataDir) ? rec.lsn : null;
 }
 
 /** Ledger problems found when the company file was opened (null = healthy). */

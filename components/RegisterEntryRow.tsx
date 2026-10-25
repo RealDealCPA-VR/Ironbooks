@@ -13,7 +13,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
-import { AmountInput, Button, Input, toast } from '@/components/ui';
+import { AmountInput, Button, DocNumberInput, Input, toast } from '@/components/ui';
 import { Typeahead } from '@/components/Typeahead';
 import { NewNameModal, type CreatedName, type NameType } from '@/components/NewNameModal';
 import { AddAccountModal, type Account } from '@/components/accounts/AccountForm';
@@ -304,7 +304,7 @@ export function RegisterEntryRow({
           <Input ref={dateRef} type="date" aria-label="Date" value={date} onChange={(e) => setDate(e.target.value)} className="min-w-[130px]" />
         </td>
         <td className={cell}>
-          <Input aria-label="Number" placeholder={register.subtype === 'checking' || register.subtype === 'savings' ? 'Auto' : ''} value={number} onChange={(e) => setNumber(e.target.value)} className="w-20" />
+          <DocNumberInput aria-label="Number" placeholder={register.subtype === 'checking' || register.subtype === 'savings' ? 'Auto' : ''} value={number} onChange={(e) => setNumber(e.target.value)} className="w-20" />
         </td>
         <td className={cell}>
           <Typeahead

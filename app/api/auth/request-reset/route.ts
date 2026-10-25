@@ -1,19 +1,28 @@
 /**
- * POST /api/auth/request-reset — issue a password-reset token.
- * Body: { email }. Desktop app has no mail server, so in the offline desktop build the token is
- * returned directly — but ONLY as single-user self-recovery (see below). Otherwise always 200
- * with a generic message to avoid email enumeration.
+ * POST /api/auth/request-reset — issue a password-reset token ("I forgot my password").
+ * Body: { email, challengeAnswer? } — `email` is the login (user name or email address).
+ *
+ * The desktop app has no mail server, so in the offline desktop build the token is returned
+ * directly — as self-recovery that proves who is asking:
+ *  - a user with a challenge question (QuickBooks parity, set with the password) must answer it;
+ *    first call without an answer returns { challengeQuestion } so the screen can ask it;
+ *  - a user without one (files from before challenge questions) keeps the older single-user
+ *    rule: only when the file has exactly one user.
+ * Company files are portable (file server, USB drive, an accountant), so a copy of the file must
+ * not be openable by anyone who can guess the Admin's user name. Otherwise always 200 with a
+ * generic message to avoid user-name enumeration.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'node:crypto';
 import { eq, ne } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { users } from '@/lib/db/schema';
-import { hasValidUnlockCookie } from '@/lib/auth';
+import { hasValidUnlockCookie, verifyPassword } from '@/lib/auth';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, resetLimiter, tooManyResets } from '@/lib/net/rateLimit';
 import { invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
+import { normalizeChallengeAnswer } from '@/lib/challengeQuestions';
 
 const MULTI_USER_RESET_MESSAGE =
   'This company file has more than one user, so passwords cannot be reset from this screen. ' +
@@ -23,6 +32,7 @@ export async function POST(req: NextRequest) {
   const body = await readJsonObject(req);
   if (!body) return invalidJsonBody();
   const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const challengeAnswer = typeof body.challengeAnswer === 'string' ? body.challengeAnswer : '';
   const generic = { ok: true, message: 'If that account exists, a reset token has been generated.' };
   if (!email) return NextResponse.json(generic);
 
@@ -55,7 +65,21 @@ export async function POST(req: NextRequest) {
     // password. With more than one real user, an Admin resets passwords in Users & Roles
     // (/api/users/[id]/reset-password, which enforces assertCanManageUser).
     const offlineLocal = process.env.BKA_OFFLINE === '1' && !origin.remote;
-    if (offlineLocal) {
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    const hasChallenge = Boolean(user?.challengeQuestion && user?.challengeAnswerHash);
+    if (offlineLocal && hasChallenge) {
+      // Self-recovery by challenge question: ask it, then check the answer (the rate limit above
+      // counts every attempt, so the answer can't be guessed quickly).
+      if (!challengeAnswer.trim()) {
+        return NextResponse.json({ ok: false, challengeQuestion: user!.challengeQuestion });
+      }
+      if (!(await verifyPassword(normalizeChallengeAnswer(challengeAnswer), user!.challengeAnswerHash!))) {
+        return NextResponse.json(
+          { error: "That answer doesn't match. Answers are not case-sensitive; check the spelling.", code: 'FORBIDDEN', challengeQuestion: user!.challengeQuestion },
+          { status: 403 },
+        );
+      }
+    } else if (offlineLocal) {
       const realUsers = await db
         .select({ id: users.id })
         .from(users)
@@ -66,7 +90,6 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const [user] = await db.select().from(users).where(eq(users.email, email));
     // The seeded demo user (sentinel hash 'dev') is not a real account and can't be "recovered".
     if (!user || user.passwordHash === 'dev') return NextResponse.json(generic);
 

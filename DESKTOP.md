@@ -10,7 +10,8 @@ lives **locally** in an embedded Postgres (PGlite) — fully offline, you own yo
 │ Electron main (electron/main.js)             │
 │  • single-instance, app menu, native dialogs │
 │  • launches the Next.js server on a free port │
-│  • sets BKA_DATA_DIR = userData/companies/... │
+│  • locks + opens the company file, sets       │
+│    BKA_DATA_DIR = its working copy             │
 └───────────────┬─────────────────────────────┘
                 │ loads http://127.0.0.1:<port>
 ┌───────────────▼─────────────────────────────┐
@@ -46,20 +47,70 @@ npm run desktop:dist   # installers: Windows nsis+portable / mac dmg / linux App
 bundles it (plus `.next/static`, `public`, and `drizzle/` migrations) under the app resources.
 On boot the DB migrator runs `drizzle/` against the local company file.
 
+## The company file (QuickBooks .QBW style)
+
+A company file is ONE file, `ABC Company.ironbooks`, that can live anywhere: this computer, a USB
+drive, or the office file server (`S:\Accounting`, `\\SERVER\Books`). Double-click it to open it,
+copy it like any file, back it up, hand it to your accountant. It is a standard zip
+(`electron/companyFileFormat.js`): the manifest first (stored, so lists can read the company name
+from the first few KB), a `.bka`-compatible backup manifest (a company file restores like a
+backup), then the embedded database folder with its attachments and transaction log.
+
+**Opening** (`electron/main.js` `openSingleFileForLaunch`):
+
+1. **Lock.** `ABC Company.ironbooks.lock\` (hidden) is created next to the file — mkdir is atomic on
+   local disks and SMB/NAS shares, so two workstations can't both get it (`electron/companyLock.js`).
+   `owner.json` says who (Ironbooks user, Windows user, computer), since when, whether there are
+   unsaved changes, and — in multi-user mode — where to join. The holder refreshes it every 10 s;
+   its modification time is stamped by the file server, so clocks don't matter.
+2. **Working copy.** The file is opened into `%LOCALAPPDATA%\Ironbooks\Working\<name>-<hash>\data`
+   (never a roaming profile; `electron/companySession.js`). It is reused when the company file is
+   unchanged since this computer last saved it, recovered when it holds changes that never reached
+   the file (the app stopped before saving), or kept aside as `… (unsaved changes from PC, date)
+   .ironbooks` when someone else saved the file in the meantime — nothing is ever silently lost.
+3. **Server.** The app server runs on the working copy with `BKA_COMPANY_FILE`,
+   `BKA_COMPANY_STATE`, `BKA_COMPANY_LOCK` and `BKA_COMPANY_LOCK_TOKEN`.
+
+**Saving** (`lib/services/companyFileSave.ts`): a few seconds after the books change (at most 30 s
+while someone keeps typing), every 5 minutes for housekeeping-only changes, on File > Save Company
+File Now, and when the file is closed or the app quits. A save takes a consistent snapshot of the
+working copy (the database runs in the same process, so one synchronous read is exactly what a
+power cut would leave — which PostgreSQL recovers from), writes the zip to a temporary file next to
+the company file, flushes it and renames it over the company file: the file on the server is always
+the previous save or the new one. Before writing, the server checks it still holds the lock and that
+the file is still the save it started from; otherwise the changes go to a separate copy. The title
+bar shows Saved / Saving… / Not saved (`components/CompanyFileStatus.tsx`).
+
+**Someone else has it open.** Opening a locked file shows who has it and offers *Ask to Come In*. The
+request appears on the holder's screen: *Let Them In* (multi-user mode: the holder's Ironbooks serves
+the file over the office network with HTTPS and its own certificate, which the requester pins — the
+fingerprint travels through the lock folder), *Hand It Over* (the holder saves and closes; the
+requester opens it), or *Not Now*. File > Switch to Multi-user Mode lets people join without asking.
+A holder that stopped responding (crash, power cut, sleep) is reported as such and can be taken
+over; if it had unsaved changes the person opening the file is told they are still on that computer.
+
+**Passwords** belong to the company file: users, password hashes and challenge questions are inside
+it. In the desktop app every open of the file asks for the user name and password (sessions are
+bound to that launch — `lib/auth.ts`); the sign-in screen names the company and the file's location
+and pre-fills the last user. "I forgot my password" asks the user's challenge question.
+
+**Older company folders** (`*.ironbooks` folders from earlier versions) still open (File > Open
+Company Folder (Older Format)); File > Save as a Single Company File converts one.
+
 ## Data & backups
 
-- Company files: `app.getPath('userData')/companies/<name>/` (one PGlite directory per company).
-- `BKA_DATA_DIR` overrides the active company dir (used by the main process + tests).
-- Backup/restore packages a company directory into a single `.bka` archive (see Phase 10).
+- `BKA_DATA_DIR` overrides the active company (used by the main process + tests).
+- Backup/restore packages a company's database folder into a single `.bka` archive.
 - Every committed change is appended to a hash-chained running transaction log,
-  `<company dir>/transactions.bktlg` (QB .TLG parity; File > View Transaction Log).
+  `transactions.bktlg` inside the company file (QB .TLG parity; File > View Transaction Log).
 - File > Create Portable Company File writes `<Company>.bkp` (QB .QBM parity): a checksummed
   logical export of every table, attachments and the transaction log. Opening one (File menu or
-  double-click — `.bkp` is a registered file type) restores it into a NEW company folder and
+  double-click — `.bkp` is a registered file type) restores it into a NEW company file and
   refuses unless every table hash and trial balance matches the original.
+- File > Save Copy As writes an independent copy of the open company as a new company file.
 - File > Export Shareable Ledger writes an .xlsx workbook / PDF summary readable without the app.
-- Condense writes and verifies a full archive `.bka` (sibling `archives/` folder) first; the
-  Backup page lists these archive copies and can restore one.
+- Condense writes and verifies a full archive `.bka` first; the Backup page lists these archive
+  copies and can restore one.
 
 ## Sandbox mode ("Try it on a copy")
 

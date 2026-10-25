@@ -86,6 +86,30 @@ const GUIDES: Guide[] = [
     ],
   },
   {
+    id: 'company-file',
+    title: 'Your company file (like a QuickBooks .QBW)',
+    intro:
+      'Each company is one file, for example "Acme Plumbing.ironbooks". Keep it wherever you like: this computer, a USB drive or the office file server.',
+    steps: [
+      { text: 'Open it with File > Open or Restore Company (Ctrl+O), from File > Open Previous Company, or by double-clicking it.' },
+      { text: 'Ironbooks saves your work into the file a few seconds after each change and when you close it. The title bar says Saved.' },
+      { text: 'Everyone signs in with their own user name and password every time the file is opened. They are stored in the file, so they go wherever it goes.' },
+      { text: 'Copy it, back it up or send it to your accountant like any other file, or use File > Save Copy As.', href: '/company-file', linkText: 'Company File' },
+    ],
+  },
+  {
+    id: 'file-server',
+    title: 'Sharing the company file on a file server',
+    intro:
+      'Put the company file on a shared drive and open it from any computer. While someone is in it, it is locked to them, the way QuickBooks single-user mode works.',
+    steps: [
+      { text: 'If someone else has it open, Ironbooks tells you who and on which computer, and offers Ask to Come In.' },
+      { text: 'They see your request and choose Let Them In (you both work at once, multi-user mode), Hand It Over (they close it and it opens for you) or Not Now.' },
+      { text: 'To let people join without asking, the person in the file chooses File > Switch to Multi-user Mode. Each person still signs in with their own user name.' },
+      { text: 'Add a user name for each person under Company > Users and Roles.', href: '/users', linkText: 'Users and Roles' },
+    ],
+  },
+  {
     id: 'try-it-on-a-copy',
     title: 'Can I try something without changing my real books?',
     intro:
@@ -110,7 +134,9 @@ export default function HelpPage() {
       <p className="-mt-3 mb-8 max-w-2xl text-sm text-navy/60">
         Plain-language answers to common questions. Tip: press <kbd className="rounded border border-slate-300 bg-white px-1">Ctrl</kbd>
         +<kbd className="rounded border border-slate-300 bg-white px-1">K</kbd> anywhere and type what you want to do — for
-        example &ldquo;I got paid&rdquo; or &ldquo;pay a bill&rdquo;.
+        example &ldquo;I got paid&rdquo; or &ldquo;pay a bill&rdquo;. Coming from QuickBooks Desktop? Its keys work here
+        (Ctrl+W, Ctrl+I, Ctrl+J, Ctrl+A, Ctrl+E, Ctrl+D, the date keys…): press{' '}
+        <kbd className="rounded border border-slate-300 bg-white px-1">?</kbd> on any page for the full list.
       </p>
 
       <section aria-labelledby="guides" className="mb-10">

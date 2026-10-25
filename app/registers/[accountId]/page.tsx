@@ -15,6 +15,10 @@
  * mapped sourceRef (invoice:/bill:/deposit:/…), otherwise it opens the
  * journal-entry detail modal. A "New Transaction" menu shortcuts to the check,
  * deposit, transfer and journal-entry forms.
+ *
+ * Keyboard (QB): Up / Down / PgUp / PgDn / Home / End move through the transactions, Enter
+ * opens one (QuickZoom), typing a payee jumps to it, Ctrl+Y / Ctrl+H show its Transaction
+ * Journal / History (useListKeys + components/KeyboardCommands.tsx).
  */
 import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
@@ -31,6 +35,7 @@ import {
   Th,
   Td,
   toast,
+  useListKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -243,6 +248,7 @@ function RegisterPageInner() {
   const [detailId, setDetailId] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const listKeys = useListKeys({ ref: scrollRef });
 
   const load = useCallback(
     async (fromDate: string, toDate: string, q: string) => {
@@ -389,7 +395,7 @@ function RegisterPageInner() {
 
         {!loading && result && (
           <>
-            <div ref={scrollRef} className="max-h-[60vh] overflow-y-auto">
+            <div {...listKeys} className="max-h-[60vh] overflow-y-auto">
               <table className="w-full border-collapse">
                 <thead className="sticky top-0 bg-white z-10">
                   <tr>
@@ -449,6 +455,8 @@ function RegisterPageInner() {
                         onClick={() => handleRowClick(row)}
                         className="hover:bg-electric/5 cursor-pointer"
                         title={source ? `Open ${source.label}` : 'View journal entry'}
+                        data-journal-entry={row.journalEntryId}
+                        data-list-label={row.description}
                       >
                         <Td className="whitespace-nowrap">{formatDate(row.date)}</Td>
                         <Td className="text-navy/60 text-xs font-mono whitespace-nowrap">

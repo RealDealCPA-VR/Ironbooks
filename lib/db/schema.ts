@@ -39,6 +39,10 @@ export const users = pgTable('users', {
   passwordChangedAt: timestamp('password_changed_at'),
   /** gapsb (0056): the next sign-in must choose a new password (expired / admin asked). */
   mustChangePassword: boolean('must_change_password').notNull().default(false),
+  /** 0062: challenge question for "I forgot my password" (lib/challengeQuestions.ts). */
+  challengeQuestion: text('challenge_question'),
+  /** 0062: bcrypt of the normalized challenge answer. */
+  challengeAnswerHash: text('challenge_answer_hash'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });

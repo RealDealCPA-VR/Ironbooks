@@ -63,6 +63,14 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     close: () => ipcRenderer.invoke('company:close'),
     /** Record the open company's name in the file (shown in recent-file lists). */
     setDisplayName: (name) => ipcRenderer.invoke('company:displayName', String(name)),
+    /** Tell the shell who is signed in (other workstations see it; the sign-in screen pre-fills it). */
+    signedIn: (name) => ipcRenderer.invoke('company:signedIn', String(name)),
+    /** The user name last used to sign in to this company file on this computer, or null. */
+    lastUser: () => ipcRenderer.invoke('company:lastUser'),
+    /** File > Save Company File Now. */
+    saveNow: () => ipcRenderer.invoke('company:saveNow'),
+    /** File > Save Copy As… ({ convert: true } turns an older company folder into a single file). */
+    saveCopyAs: (opts) => ipcRenderer.invoke('company:saveCopyAs', opts || {}),
   },
   /**
    * Sandbox mode ("Try it on a copy"): after the local server made the copy (POST /api/sandbox)
