@@ -189,6 +189,21 @@ while ((Get-Date) -lt $deadline) {
   return r.ok && /clicked/.test(r.out);
 }
 
+/** True while one of the app's native windows shows a button named `name` (looks, never clicks). */
+export async function nativeButtonShown(exe, name) {
+  const r = await powershell(`
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$pids = @(${ownProcs(exe)} | ForEach-Object { $_.Id })
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, '${name.replace(/'/g, "''")}')
+foreach ($w in $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+  if ($pids -notcontains $w.Current.ProcessId) { continue }
+  if ($w.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)) { 'shown'; exit 0 }
+}
+'none'`);
+  return /shown/.test(r.out);
+}
+
 /** The text of the app's native windows and message boxes (diagnostics when a step fails). */
 export async function dumpWindows(exe) {
   const r = await powershell(`

@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { clickNativeButton as clickHelper, onFileServer } from './e2e-helpers.mjs';
+import { clickNativeButton as clickHelper, nativeButtonShown, onFileServer } from './e2e-helpers.mjs';
 
 const require = createRequire(import.meta.url);
 const root = process.cwd();
@@ -234,6 +234,16 @@ async function main() {
   assert(clickedNo, 'the request appears on screen and can be answered');
   const a1 = await until(() => companyLock.readResponse(companyFile, r1), 15_000);
   assert(a1?.decision === 'deny', 'Not Now tells the other workstation');
+
+  // 3b. Asks, then gives up before an answer: the question closes by itself, and nothing is handed over.
+  const r1b = companyLock.requestAccess(companyFile, { appUser: 'Bob', computer: 'BACK-OFFICE', osUser: 'bob' });
+  const shown = await until(() => nativeButtonShown(EXE, 'Hand It Over'), 30_000);
+  assert(shown, 'a second request appears on screen');
+  companyLock.cancelRequest(companyFile, r1b);
+  const closed = await until(async () => !(await nativeButtonShown(EXE, 'Hand It Over')), 20_000);
+  assert(closed, 'when the other workstation stops asking, the question closes by itself');
+  await sleep(3000);
+  assert(companyLock.readHolder(companyFile)?.owner && !companyLock.readResponse(companyFile, r1b), 'and the file stays open here, with no answer sent');
 
   // 4. Asks again; Hand It Over.
   const r2 = companyLock.requestAccess(companyFile, { appUser: 'Bob', computer: 'BACK-OFFICE', osUser: 'bob' });

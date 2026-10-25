@@ -862,20 +862,36 @@ async function answerAccessRequest(req) {
   mainWindow.flashFrame(true);
   mainWindow.focus();
   const name = companyFile.locationName(openFile.path);
-  const { response, checkboxChecked } = await dialog.showMessageBox(mainWindow, {
-    noLink: true,
-    type: 'question',
-    message: `${describeRequester(req)} wants to open ${name}.`,
-    detail:
-      'Let them in: you both work in the company file at the same time (multi-user mode). They sign in with their own user name and password, and this computer serves the file to them, so keep Ironbooks open here while they work.\n\n' +
-      'Hand it over: Ironbooks saves the company file, closes it here and opens it on their computer.',
-    buttons: ['Let Them In', 'Hand It Over', 'Not Now'],
-    defaultId: 0,
-    cancelId: 2,
-    checkboxLabel: 'Let others on this network join without asking until I close the company file',
-  });
+  // The person asking can give up (Cancel, or the request runs out): the question closes then, so
+  // nobody hands the company file over to a computer that is no longer waiting for it.
+  const lock = openFile.lock;
+  const stillAsking = () => companyLock.pendingRequests(lock).some((r) => r.id === req.id);
+  const asking = new AbortController();
+  const watch = setInterval(() => {
+    if (!openFile || !stillAsking()) asking.abort();
+  }, 2000);
+  let answer;
+  try {
+    answer = await dialog.showMessageBox(mainWindow, {
+      noLink: true,
+      type: 'question',
+      message: `${describeRequester(req)} wants to open ${name}.`,
+      detail:
+        'Let them in: you both work in the company file at the same time (multi-user mode). They sign in with their own user name and password, and this computer serves the file to them, so keep Ironbooks open here while they work.\n\n' +
+        'Hand it over: Ironbooks saves the company file, closes it here and opens it on their computer.',
+      buttons: ['Let Them In', 'Hand It Over', 'Not Now'],
+      defaultId: 0,
+      cancelId: 2,
+      checkboxLabel: 'Let others on this network join without asking until I close the company file',
+      signal: asking.signal,
+    });
+  } finally {
+    clearInterval(watch);
+  }
+  const { response, checkboxChecked } = answer;
   mainWindow.flashFrame(false);
   if (!openFile) return;
+  if (asking.signal.aborted || !stillAsking()) return; // they stopped waiting
   if (response === 0) {
     const st = await setHosting(true, { quiet: true, lan: true });
     if (!st.hosting || !st.lan) {
