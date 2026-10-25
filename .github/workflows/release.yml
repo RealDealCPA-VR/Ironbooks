@@ -10,13 +10,19 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Actions-provided, contents:write
       NEXT_TELEMETRY_DISABLED: '1'
-      # Code signing — with either one set up, Windows no longer warns about an unknown publisher
-      # (SIGNING.md). With neither, releases are built exactly as before, unsigned.
+      # Code signing — with one of these set up, Windows no longer warns about an unknown publisher
+      # (SIGNING.md). With none, releases are built exactly as before, unsigned.
+      #  - AZURE_CLIENT_ID (+ secrets AZURE_TENANT_ID, AZURE_CLIENT_SECRET and repository variables
+      #    AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT, AZURE_CERT_PROFILE, AZURE_PUBLISHER_NAME):
+      #    Azure Trusted Signing; electron-builder signs every file while it builds.
       #  - WIN_CSC_LINK (base64 .pfx) + WIN_CSC_KEY_PASSWORD: a code-signing certificate;
       #    electron-builder signs every file while it builds.
       #  - SIGNPATH_API_TOKEN (+ repository variables SIGNPATH_ORGANIZATION_ID, and optionally
       #    SIGNPATH_PROJECT_SLUG / SIGNPATH_SIGNING_POLICY_SLUG): SignPath signs the finished
       #    installers, then the update feed is rebuilt for the signed files.
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
       CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
       CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
       SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -44,10 +50,33 @@ jobs:
 
           [Code signing policy](https://github.com/${GITHUB_REPOSITORY}#-code-signing-policy) · [Privacy](https://github.com/${GITHUB_REPOSITORY}/blob/main/PRIVACY.md)"
 
-      # --- Certificate (or no) signing: electron-builder builds, signs and publishes in one go ---
+      # --- Azure Trusted Signing, a certificate, or no signing: electron-builder builds, signs and
+      # publishes in one go ---
       - name: Build & publish NSIS installer + portable + latest.yml (electron-updater)
         if: env.SIGNPATH_API_TOKEN == ''
-        run: npm run desktop:publish
+        shell: bash
+        env:
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
+          AZURE_PUBLISHER_NAME: ${{ vars.AZURE_PUBLISHER_NAME }}
+        run: |
+          if [ -z "$AZURE_CLIENT_ID" ]; then
+            npm run desktop:publish
+            exit
+          fi
+          # Azure Trusted Signing. A half-configured setup fails here rather than shipping unsigned.
+          for v in AZURE_TENANT_ID AZURE_CLIENT_SECRET AZURE_SIGNING_ENDPOINT AZURE_SIGNING_ACCOUNT AZURE_CERT_PROFILE AZURE_PUBLISHER_NAME; do
+            [ -n "${!v}" ] || { echo "::error::Azure Trusted Signing: $v is not set (see SIGNING.md)"; exit 1; }
+          done
+          npm run build
+          # publisherName is also written into the app's update settings: installed copies then
+          # accept only updates signed by this publisher.
+          npx electron-builder --publish always \
+            -c.win.azureSignOptions.endpoint="$AZURE_SIGNING_ENDPOINT" \
+            -c.win.azureSignOptions.codeSigningAccountName="$AZURE_SIGNING_ACCOUNT" \
+            -c.win.azureSignOptions.certificateProfileName="$AZURE_CERT_PROFILE" \
+            -c.win.azureSignOptions.publisherName="$AZURE_PUBLISHER_NAME"
 
       # --- SignPath: build, sign the installers, rebuild the update feed, publish ---
       - name: Build the installers for signing

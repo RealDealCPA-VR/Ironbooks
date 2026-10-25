@@ -276,13 +276,13 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
 - [x] **v1.4.0 release**: typed-in registers on every account, statement PDF / scan / Excel import with tie-out, AI account suggestions for new payees (business context + optional self-hosted SearXNG lookup), Plaid removed
 - [x] **v1.5.0 release**: a clean Apple-style look; light / dark / auto with eight accent colors; a themed desktop window with the menus in its title bar
 - [x] **v1.5.1 release**: File → Close Company with a No Company Open list of recent files and their locations; the open file's location in the company menu; toolbar and pop-outs no longer cut off
-- [x] **QuickBooks-converts round (1.6.0)**: the company file is one `.ironbooks` file (like a .QBW) that
+- [x] **v1.6.0 release — QuickBooks converts**: the company file is one `.ironbooks` file (like a .QBW) that
   saves itself safely and can live on the office file server; a lock while someone is in it, with
   Ask to Come In / Let Them In / Hand It Over; passwords that belong to the file and are asked on
   every open, with a challenge question for a forgotten password; QuickBooks' keyboard shortcuts
   throughout; a welcome screen on first run; clean builds
 - [ ] The remaining partial rows and P2 follow-ups in [`PARITY.md`](./PARITY.md)
-- [ ] Hands-on QA of the new screens, then a tagged release
+- [ ] Signed Windows installers (Azure Trusted Signing; the release workflow is ready — [`SIGNING.md`](./SIGNING.md))
 
 ## 📜 License
 
@@ -295,9 +295,9 @@ Free code signing provided by [SignPath.io](https://signpath.io), certificate by
 
 Windows installers are built from this repository by GitHub Actions
 ([`release.yml`](./.github/workflows/release.yml)) and signed only after a maintainer approves
-each release. Releases up to and including 1.5.1 were published unsigned, while the
-SignPath application was in progress; the workflow signs with SignPath (or a certificate) as soon
-as its credentials are added — see [`SIGNING.md`](./SIGNING.md). Until a release is signed,
+each release. Releases up to and including 1.6.0 were published unsigned; the workflow signs
+with Azure Trusted Signing (or SignPath, or a certificate) as soon as its credentials are added —
+see [`SIGNING.md`](./SIGNING.md). Until a release is signed,
 Windows may show "Windows protected your PC": choose **More info → Run anyway**.
 
 | Role | Members |
