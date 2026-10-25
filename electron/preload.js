@@ -84,7 +84,7 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   /** Multi-user hosting (QB Enterprise "Host multi-user access") — see electron/hosting.js. */
   hosting: {
     status: () => ipcRenderer.invoke('hosting:status'),
-    setEnabled: (enable) => ipcRenderer.invoke('hosting:setEnabled', enable),
+    setEnabled: (enable, mode) => ipcRenderer.invoke('hosting:setEnabled', enable, mode),
     openConnect: () => ipcRenderer.invoke('hosting:openConnect'),
     disconnect: () => ipcRenderer.invoke('hosting:disconnect'),
   },

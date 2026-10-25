@@ -106,6 +106,7 @@ const GUIDES: Guide[] = [
       { text: 'If someone else has it open, Ironbooks tells you who and on which computer, and offers Ask to Come In.' },
       { text: 'They see your request and choose Let Them In (you both work at once, multi-user mode), Hand It Over (they close it and it opens for you) or Not Now.' },
       { text: 'To let people join without asking, the person in the file chooses File > Switch to Multi-user Mode. Each person still signs in with their own user name.' },
+      { text: 'The first time a computer lets others in, Windows may ask whether Ironbooks can use the network: choose Allow on private networks.' },
       { text: 'Add a user name for each person under Company > Users and Roles.', href: '/users', linkText: 'Users and Roles' },
     ],
   },

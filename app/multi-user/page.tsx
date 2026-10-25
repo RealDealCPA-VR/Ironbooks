@@ -43,6 +43,8 @@ interface HostingStatus {
   bindAll: boolean;
   /** Office-network multi-user mode (a company file on the shared drive; teammates pin this computer's certificate). */
   lan?: boolean;
+  /** A single company file is open here (office-network multi-user mode needs one). */
+  companyFile?: boolean;
   error: string | null;
   remoteHost: string | null;
 }
@@ -51,7 +53,7 @@ interface HostingBridge {
   onMenu?: (cb: (action: string) => void) => () => void;
   hosting?: {
     status: () => Promise<HostingStatus | null>;
-    setEnabled: (enable: boolean) => Promise<HostingStatus>;
+    setEnabled: (enable: boolean, mode?: 'office') => Promise<HostingStatus>;
     openConnect: () => Promise<unknown>;
     disconnect: () => Promise<unknown>;
   };
@@ -74,6 +76,7 @@ export default function MultiUserPage() {
   const [hosting, setHosting] = useState<HostingStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [confirmOthers, setConfirmOthers] = useState(false);
+  const [confirmSingle, setConfirmSingle] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -121,6 +124,14 @@ export default function MultiUserPage() {
 
   const single = data.singleUser;
   const others = data.sessions.filter((s) => !s.isCurrent);
+  // People working through this computer's hosting (they are disconnected when it stops).
+  const remoteNames = [...new Set(others.filter((s) => s.viaHost).map((s) => s.userName))];
+  const stopHosting = () =>
+    run(
+      'host',
+      () => bridge()!.hosting!.setEnabled(false),
+      hosting?.lan ? 'Single-user mode: others now have to ask to come in.' : 'Multi-user access stopped.',
+    );
 
   return (
     <div className="p-8 max-w-4xl mx-auto w-full">
@@ -154,7 +165,9 @@ export default function MultiUserPage() {
               <p className="text-sm text-navy/60 mt-1 max-w-xl">
                 {hosting.lan
                   ? 'Multi-user mode is on for your office network: teammates who open this company file from the shared drive are connected to it through this computer. Keep Ironbooks open here while they work.'
-                  : 'In an office, keep the company file on a shared drive: when someone else opens it while you are in it, Ironbooks asks you to let them in (multi-user mode on your office network). To work with people outside the office, host it here for your private Tailscale network. Either way up to 40 people can work at the same time, each with their own user name.'}
+                  : hosting.companyFile
+                    ? 'In an office, keep the company file on a shared drive. While you are in it, anyone else who opens it asks you to let them in; Switch to Multi-user Mode lets them straight in. To work with people outside the office, host it on your private Tailscale network instead. Either way up to 40 people can work at the same time, each with their own user name.'
+                    : 'In an office, keep the company file on a shared drive: when someone else opens it while you are in it, Ironbooks asks you to let them in (multi-user mode on your office network). To work with people outside the office, host it here for your private Tailscale network. Either way up to 40 people can work at the same time, each with their own user name.'}
               </p>
             </div>
             <Badge tone={hosting.hosting ? 'success' : 'neutral'}>{hosting.hosting ? 'Hosting' : 'Off'}</Badge>
@@ -163,7 +176,9 @@ export default function MultiUserPage() {
           {hosting.hosting && (
             <div className="mt-4 rounded-xl bg-slate-50 border border-slate-200 p-4">
               <p className="text-sm font-semibold text-navy mb-2">
-                On each teammate&apos;s computer: File → Open company on host…, then enter
+                {hosting.lan
+                  ? 'Teammates just open the company file from the shared drive; Ironbooks connects them to this computer at'
+                  : 'On each teammate’s computer: File → Open company on host…, then enter'}
               </p>
               {hosting.urls.map((u) => (
                 <div key={u} className="flex items-center gap-2">
@@ -196,10 +211,28 @@ export default function MultiUserPage() {
               <Button
                 variant="secondary"
                 loading={busy === 'host'}
-                onClick={() => run('host', () => bridge()!.hosting!.setEnabled(false), 'Multi-user access stopped.')}
+                onClick={() => (remoteNames.length > 0 ? setConfirmSingle(true) : stopHosting())}
               >
-                Stop hosting
+                {hosting.lan ? 'Switch to Single-user Mode' : 'Stop hosting'}
               </Button>
+            ) : hosting.companyFile ? (
+              <>
+                <Button
+                  loading={busy === 'office'}
+                  disabled={!data.isAdmin}
+                  onClick={() => run('office', () => bridge()!.hosting!.setEnabled(true, 'office'))}
+                >
+                  Switch to Multi-user Mode
+                </Button>
+                <Button
+                  variant="secondary"
+                  loading={busy === 'host'}
+                  disabled={!data.isAdmin}
+                  onClick={() => run('host', () => bridge()!.hosting!.setEnabled(true))}
+                >
+                  Host on Tailscale
+                </Button>
+              </>
             ) : (
               <Button
                 loading={busy === 'host'}
@@ -222,17 +255,17 @@ export default function MultiUserPage() {
           <div>
             <p className="text-lg font-bold text-navy flex items-center gap-2">
               {single ? <Lock className="h-5 w-5 text-gold" /> : <Unlock className="h-5 w-5 text-navy/40" />}
-              {single ? 'Single-user mode' : 'Multi-user mode'}
+              Keep everyone else out
             </p>
             <p className="text-sm text-navy/60 mt-1 max-w-xl">
               {single
                 ? single.isYou
-                  ? 'You have the company file to yourself. Others are kept out until you switch back.'
-                  : `${single.userName} has the company file in single-user mode for maintenance.`
-                : 'Condense Data, Restore, Rebuild Data and Import need single-user mode while anyone else is logged in.'}
+                  ? 'You have the company file to yourself. Others are kept out until you let them back in.'
+                  : `${single.userName} is keeping everyone else out of the company file for maintenance.`
+                : "Condense Data, Restore, Rebuild Data and Import need everyone else out of the company file (QuickBooks' single-user mode). While this is on, nobody else can sign in."}
             </p>
           </div>
-          <Badge tone={single ? 'warning' : 'info'}>{single ? 'Single-user' : 'Multi-user'}</Badge>
+          <Badge tone={single ? 'warning' : 'neutral'}>{single ? 'On' : 'Off'}</Badge>
         </div>
         {data.isAdmin && (
           <div className="mt-4 flex gap-2">
@@ -241,21 +274,21 @@ export default function MultiUserPage() {
                 variant="secondary"
                 loading={busy === 'single'}
                 onClick={() =>
-                  run('single', () => api.post('/api/single-user', { enabled: false }), 'Switched to multi-user mode.')
+                  run('single', () => api.post('/api/single-user', { enabled: false }), 'Others can sign in again.')
                 }
               >
-                Switch to multi-user mode
+                Let others back in
               </Button>
             ) : (
               <Button
                 loading={busy === 'single'}
                 disabled={!data.currentSessionId}
-                title={data.currentSessionId ? undefined : 'Sign in with a user account to use single-user mode.'}
+                title={data.currentSessionId ? undefined : 'Sign in with a user account to keep everyone else out.'}
                 onClick={() =>
-                  run('single', () => api.post('/api/single-user', { enabled: true }), 'Switched to single-user mode.')
+                  run('single', () => api.post('/api/single-user', { enabled: true }), 'Everyone else is kept out.')
                 }
               >
-                Switch to single-user mode
+                Keep everyone else out
               </Button>
             )}
             {!single && others.length > 0 && (
@@ -326,6 +359,18 @@ export default function MultiUserPage() {
         )}
       </Card>
 
+      <ConfirmDialog
+        open={confirmSingle}
+        title={hosting?.lan ? 'Switch to single-user mode?' : 'Stop hosting?'}
+        message={`${remoteNames.join(', ')} ${remoteNames.length === 1 ? 'is' : 'are'} working in this company file from another computer and will be disconnected. Ask them to finish what they are entering first: anything they have not saved is lost.`}
+        confirmLabel={hosting?.lan ? 'Switch to Single-user Mode' : 'Stop hosting'}
+        tone="danger"
+        onClose={() => setConfirmSingle(false)}
+        onConfirm={() => {
+          setConfirmSingle(false);
+          stopHosting();
+        }}
+      />
       <ConfirmDialog
         open={confirmOthers}
         title="Sign out everyone else?"

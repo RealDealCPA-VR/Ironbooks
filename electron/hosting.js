@@ -192,7 +192,13 @@ async function startHosting(opts) {
       ? null
       : await obtainTlsCert(opts.certDir, log);
   const secure = Boolean(tlsMaterial);
-  const handler = createProxyHandler(opts.upstreamPort, { secure });
+  const proxy = createProxyHandler(opts.upstreamPort, { secure });
+  // When each other computer last used the file (File > Switch to Single-user Mode asks first).
+  const peers = new Map();
+  const handler = (req, res) => {
+    peers.set(req.socket.remoteAddress, Date.now());
+    return proxy(req, res);
+  };
 
   const servers = [];
   try {
@@ -246,7 +252,19 @@ async function startHosting(opts) {
     lan: Boolean(lan),
     fingerprint: lan ? opts.lanCert.fingerprint : null,
     startedAt: new Date().toISOString(),
+    peers,
   };
+}
+
+/** How many other computers used the hosted file in the last `windowMs`. */
+function activePeerCount(state, windowMs = 5 * 60 * 1000) {
+  if (!state || !state.peers) return 0;
+  const since = Date.now() - windowMs;
+  let n = 0;
+  for (const [addr, at] of state.peers) {
+    if (at >= since && !/^(127\.|::1$|::ffff:127\.)/.test(String(addr))) n++;
+  }
+  return n;
 }
 
 async function stopHosting(state) {
@@ -265,6 +283,7 @@ async function stopHosting(state) {
 module.exports = {
   startHosting,
   stopHosting,
+  activePeerCount,
   detectTailnetIPv4,
   createProxyHandler,
 };

@@ -6,7 +6,7 @@
  * offer to turn it into a single file), whether it is saved, the recent files, sharing it on a
  * file server, and the optional file-open password (enforced server-side, every build).
  */
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { FolderOpen, FilePlus2, Lock, Unlock, HardDrive, Copy, FileArchive, Network, Save } from 'lucide-react';
 import { Button, Card, Input, Label, Modal, PageHeader, Badge, toast } from '@/components/ui';
 import { CompanyFileStatus } from '@/components/CompanyFileStatus';
@@ -91,8 +91,14 @@ export default function CompanyFilePage() {
               <p className="text-sm font-medium text-navy/60">This company file</p>
               <p className="text-lg font-bold text-navy truncate">{current?.name ?? '—'}</p>
               {current?.dir && (
-                <p className="font-mono text-xs text-navy/50 break-all select-text" title={current.dir}>
-                  {current.dir}
+                <p className="font-mono text-xs text-navy/50 [overflow-wrap:anywhere] select-text" title={current.dir}>
+                  {/* Wrap long paths at the folder separators rather than inside a name. */}
+                  {current.dir.split(/(?<=[\\/])/).map((part, i) => (
+                    <Fragment key={i}>
+                      {part}
+                      <wbr />
+                    </Fragment>
+                  ))}
                 </p>
               )}
               {current?.singleFile && (

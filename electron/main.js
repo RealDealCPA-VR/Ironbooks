@@ -1605,6 +1605,7 @@ function hostingStatus() {
     available: !remoteHostOrigin,
     hosting: Boolean(hostingState),
     lan: Boolean(hostingState && hostingState.lan),
+    companyFile: Boolean(openFile),
     fingerprint: hostingState ? hostingState.fingerprint || null : null,
     urls: hostingState ? hostingState.urls : [],
     tls: hostingState ? hostingState.tls : false,
@@ -1617,7 +1618,57 @@ function hostingStatus() {
   };
 }
 
-/** Start/stop sharing this company file on the tailnet. Never available in client mode. */
+/**
+ * QuickBooks: File > Switch to Multi-user Mode. Others on the office network can open this company
+ * file from the shared drive at the same time (each signs in with their own user name) until it is
+ * closed here or switched back. Also the Multi-user page's button.
+ */
+async function switchToMultiUserFlow() {
+  const st = await setHosting(true, { lan: true, quiet: true });
+  if (st.hosting && st.lan && openFile) {
+    companyLock.heartbeat(openFile.lock, {
+      mode: 'multi',
+      host: { urls: st.urls, fingerprint: st.fingerprint },
+      joinPolicy: 'open',
+    });
+    dialog.showMessageBox(mainWindow, {
+      noLink: true,
+      type: 'info',
+      message: 'Multi-user mode is on',
+      detail:
+        'People on this network can now open this company file from the shared drive at the same time as you. They sign in with their own user name and password (add users in Company > Users and Roles). Keep Ironbooks open on this computer while they work.\n\n' +
+        'If Windows asks whether Ironbooks may use the network, choose Allow on private networks.',
+    });
+  } else if (st.error) {
+    dialog.showErrorBox('Could not turn on multi-user mode', st.error);
+  }
+  return hostingStatus();
+}
+
+/**
+ * File > Switch to Single-user Mode: stop letting others in (they have to ask again). Like
+ * QuickBooks, it doesn't silently drop people who are working: it asks first while another
+ * computer has used the file in the last few minutes.
+ */
+async function switchToSingleUserFlow() {
+  const active = hosting.activePeerCount(hostingState);
+  if (active > 0 && mainWindow) {
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      noLink: true,
+      type: 'warning',
+      message: 'Others are working in this company file',
+      detail:
+        `${active === 1 ? 'Another computer has' : `${active} other computers have`} used it in the last few minutes and will be disconnected. ` +
+        'Ask them to finish what they are entering first: anything they have not saved is lost.',
+      buttons: ['Switch to Single-user Mode', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+    });
+    if (response !== 0) return hostingStatus();
+  }
+  return setHosting(false);
+}
+
 /**
  * Start/stop sharing this company file. Two ways:
  *  - tailnet (File > Host multi-user access): on this computer's Tailscale address, remembered
@@ -1788,29 +1839,8 @@ function buildMenu() {
         ...(openFile
           ? [
               hostingState && hostingState.lan
-                ? { label: 'Switch to Single-user Mode', click: () => { setHosting(false); } }
-                : {
-                    label: 'Switch to Multi-user Mode',
-                    click: async () => {
-                      const st = await setHosting(true, { lan: true, quiet: true });
-                      if (st.hosting && st.lan && openFile) {
-                        companyLock.heartbeat(openFile.lock, {
-                          mode: 'multi',
-                          host: { urls: st.urls, fingerprint: st.fingerprint },
-                          joinPolicy: 'open',
-                        });
-                        dialog.showMessageBox(mainWindow, {
-                          noLink: true,
-                          type: 'info',
-                          message: 'Multi-user mode is on',
-                          detail:
-                            'People on this network can now open this company file from the shared drive at the same time as you. They sign in with their own user name and password (add users in Company > Users and Roles). Keep Ironbooks open on this computer while they work.',
-                        });
-                      } else if (st.error) {
-                        dialog.showErrorBox('Could not turn on multi-user mode', st.error);
-                      }
-                    },
-                  },
+                ? { label: 'Switch to Single-user Mode', click: () => { switchToSingleUserFlow(); } }
+                : { label: 'Switch to Multi-user Mode', click: () => { switchToMultiUserFlow(); } },
             ]
           : []),
         // Multi-user (QB Enterprise parity): share this file on the tailnet, or open one shared
@@ -2543,9 +2573,11 @@ ipcMain.handle('company:setProtected', (e, val) => {
 // Multi-user + network policy bridge (Multi-user and Privacy & Network pages)
 // ---------------------------------------------------------------------------
 ipcMain.handle('hosting:status', (e) => (fromAppOrigin(e) ? hostingStatus() : null));
-ipcMain.handle('hosting:setEnabled', (e, enable) =>
-  fromLocalApp(e) ? setHosting(Boolean(enable)) : hostingStatus(),
-);
+ipcMain.handle('hosting:setEnabled', (e, enable, mode) => {
+  if (!fromLocalApp(e)) return hostingStatus();
+  if (enable && mode === 'office') return openFile ? switchToMultiUserFlow() : hostingStatus();
+  return setHosting(Boolean(enable));
+});
 ipcMain.handle('hosting:openConnect', (e) => {
   if (fromAppOrigin(e)) openOnHostFlow();
   return true;

@@ -85,7 +85,9 @@ bar shows Saved / Saving… / Not saved (`components/CompanyFileStatus.tsx`).
 request appears on the holder's screen: *Let Them In* (multi-user mode: the holder's Ironbooks serves
 the file over the office network with HTTPS and its own certificate, which the requester pins — the
 fingerprint travels through the lock folder), *Hand It Over* (the holder saves and closes; the
-requester opens it), or *Not Now*. File > Switch to Multi-user Mode lets people join without asking.
+requester opens it), or *Not Now*. File > Switch to Multi-user Mode (also on the Multi-user page)
+lets people join without asking; Switch to Single-user Mode stops it, asking first while another
+computer has used the file in the last few minutes (the proxy notes when each peer last made a request).
 A holder that stopped responding (crash, power cut, sleep) is reported as such and can be taken
 over; if it had unsaved changes the person opening the file is told they are still on that computer.
 

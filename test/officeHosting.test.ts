@@ -82,3 +82,22 @@ describe('office-network addresses', () => {
     }
   });
 });
+
+describe('who is working through the host', () => {
+  const hosting = require('../electron/hosting.js');
+
+  it('counts other computers that used the file recently, not this one', () => {
+    const now = Date.now();
+    const peers = new Map<string, number>([
+      ['192.168.1.21', now - 30_000],
+      ['::ffff:192.168.1.22', now - 60_000],
+      ['192.168.1.23', now - 20 * 60_000], // left a while ago
+      ['127.0.0.1', now],
+      ['::1', now],
+      ['::ffff:127.0.0.1', now],
+    ]);
+    expect(hosting.activePeerCount({ peers })).toBe(2);
+    expect(hosting.activePeerCount({ peers }, 45_000)).toBe(1);
+    expect(hosting.activePeerCount(null)).toBe(0);
+  });
+});

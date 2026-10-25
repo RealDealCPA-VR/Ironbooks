@@ -168,6 +168,20 @@ async function main() {
   const sessions = await pageA.eval(`fetch('/api/sessions').then(r => r.ok ? r.json() : null)`);
   const names = JSON.stringify(sessions || '');
   assert(/Bob/.test(names), 'A: Multi-user status lists Bob as signed in');
+  // Switching back to single-user mode while Bob is working asks first, naming him.
+  await pageA.eval(`location.assign('/multi-user')`);
+  const switchBtn = `[...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Switch to Single-user Mode')`;
+  await until(() => pageA.eval(`Boolean(${switchBtn})`), 30_000);
+  await pageA.eval(`${switchBtn}?.click()`);
+  const warned = await until(
+    () => pageA.eval(`[...document.querySelectorAll('[role=dialog], [role=alertdialog]')].map(d => d.textContent).join(' ')`).then((t) => /Bob/.test(t) && /disconnected/.test(t) && t),
+    15_000,
+  );
+  assert(warned, 'A: Switch to Single-user Mode warns that Bob would be disconnected');
+  await pageA.shot(SHOTS, 'mu-2-A-single-user-warning');
+  await pageA.press('Escape');
+  const stillHosting = await pageA.eval(`window.bookkeeper.hosting.status().then(s => s.hosting && s.lan)`);
+  assert(stillHosting, 'A: cancelling keeps multi-user mode on');
   pageB.close();
 
   // 5. A closes the company file: saved, lock released.

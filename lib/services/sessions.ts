@@ -310,7 +310,7 @@ export async function assertSessionAllowed(
   if (holder && holder.sessionId !== sessionId) {
     throw new ServiceError(
       'FORBIDDEN',
-      `The company file is in single-user mode — ${holder.userName} is doing maintenance. Try again when they switch back to multi-user mode.`,
+      `The company file is in single-user mode — ${holder.userName} is doing maintenance. Try again when they let everyone back in.`,
       { singleUserMode: true },
     );
   }
@@ -452,7 +452,7 @@ export async function assertExclusiveAccess(
   throw new ServiceError(
     'CONFLICT',
     others.length > 0
-      ? `${utility} needs single-user mode while other people are using this company file: ${describeOthers(others, hidden)}. Switch to single-user mode (Setup → Multi-user) and try again.`
+      ? `${utility} needs single-user mode while other people are using this company file: ${describeOthers(others, hidden)}. Choose Keep everyone else out (Setup → Multi-user) and try again.`
       : `${utility} replaces the whole company file, but ${describeOthers([], hidden)}. They must log out first.`,
     {
       requiresSingleUser: others.length > 0,
