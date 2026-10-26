@@ -45,6 +45,8 @@ import { createVendor } from './vendors';
 import { createPurchaseOrder, convertToBill, updateStatus } from './purchaseOrders';
 import { checkPrintData } from './printQueue';
 import { generate1099NecFile } from './form1099Xml';
+import { vendor1099Report, vendor1099Worksheet } from './statements';
+import { createManualEntry } from './journal';
 import { createExpense } from './expenses';
 import { createItemReceipt, updateItemReceipt } from './itemReceipts';
 import { enterBillForReceivedItems } from './receiving';
@@ -616,6 +618,56 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
     const [entry] = await db.select().from(journalEntries).where(eq(journalEntries.id, receipt.postedEntryId!));
     expect(entry.status).toBe('posted');
     expect(entry.reference).toBe('PS-1B');
+  });
+
+  it('V: a memo edit of a bill / receipt in a closed period still needs the closing-date password', async () => {
+    const [u3] = await db.insert(users).values({ email: 'r5-closed@test.local', name: 'R5 C', passwordHash: 'x' }).returning();
+    const company = await createCompany(db, { name: 'R5 Closed Co', ownerId: u3.id });
+    const c3: ServiceContext = { db, companyId: company.id, userId: u3.id };
+    const a: Record<string, string> = {};
+    for (const r of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) if (r.code) a[r.code] = r.id;
+    const [v] = await db.insert(vendors).values({ companyId: company.id, displayName: 'Closed V' }).returning();
+    const item = await createItem(c3, { name: 'Closed Widget', type: 'inventory', assetAccountId: a['1300'], cogsAccountId: a['5000'] } as never);
+    const bill = await createBill(c3, { vendorId: v.id, date: d('2026-01-10'), lines: [{ accountId: a['6300'], amount: '9.00' }] });
+    const receipt = await createItemReceipt(c3, { vendorId: v.id, date: d('2026-01-11'), lines: [{ itemId: item.id, quantity: 1, unitCost: '2.00' }] });
+    const { setClosingDate } = await import('./company');
+    await setClosingDate(c3, { closingDate: '2026-01-31', password: 'close-pw' } as never);
+    const billEdit = { vendorId: v.id, date: d('2026-01-10'), memo: 'late memo', lines: [{ accountId: a['6300'], amount: '9.00' }] };
+    const receiptEdit = { vendorId: v.id, date: d('2026-01-11'), memo: 'late memo', lines: [{ itemId: item.id, quantity: 1, unitCost: '2.00' }] };
+    await expectCode(updateBill(c3, bill.id, billEdit), 'PERIOD_CLOSED');
+    await expectCode(updateItemReceipt(c3, receipt.id, receiptEdit), 'PERIOD_CLOSED');
+    const over: ServiceContext = { ...c3, closingDateOverride: true };
+    expect((await updateBill(over, bill.id, billEdit)).memo).toBe('late memo');
+    expect((await updateItemReceipt(over, receipt.id, receiptEdit)).memo).toBe('late memo');
+  });
+
+  it('W: 1099s count General Journal amounts owed that Pay Bills paid', async () => {
+    const v = await newVendor({ is1099: true, taxId: '11-2223333' });
+    // Opening balance owed to the contractor, entered as a General Journal amount (QB conversions).
+    const je = await createManualEntry(ctx, {
+      date: d('2026-02-01'),
+      description: 'Opening balance owed',
+      lines: [
+        { accountId: acct['6300'], debit: '700.00' },
+        { accountId: acct['2000'], credit: '700.00', entityType: 'vendor', entityId: v.id },
+      ],
+    } as never);
+    const [apLine] = await db
+      .select()
+      .from(journalEntryLines)
+      .where(and(eq(journalEntryLines.journalEntryId, je.id), eq(journalEntryLines.accountId, acct['2000'])));
+    await payBills(ctx, {
+      vendorId: v.id,
+      date: d('2026-02-15'),
+      method: 'check',
+      paymentAccountId: acct['1000'],
+      applications: [],
+      journalItems: [{ journalLineId: apLine.id, amount: '700.00' }],
+    });
+    const row = (await vendor1099Report(ctx, { year: 2026 })).find((r) => r.vendorId === v.id);
+    expect(row?.total ?? 'omitted').toBe('700.00');
+    const wr = (await vendor1099Worksheet(ctx, { year: 2026 })).rows.find((r) => r.vendorId === v.id);
+    expect(wr?.nec1 ?? 'omitted').toBe('700.00');
   });
 
   it('J: text longer than its column is refused with a plain message', async () => {

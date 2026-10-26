@@ -35,6 +35,7 @@ import {
   items,
   journalEntries,
   journalEntryLines,
+  journalItemApplications,
   paymentsReceived,
   vendors,
 } from '@/lib/db/schema';
@@ -1201,6 +1202,73 @@ function home1099(amount: ReturnType<typeof Money.zero>, rate: string | null): R
   return r.greaterThan(0) && !r.equals(1) ? Money.round2(amount.times(r)) : amount;
 }
 
+/**
+ * General Journal amounts owed to 1099 vendors (named A/P credits, e.g. a contractor's opening
+ * balance from a QB conversion) that a Pay Bills check paid in the year (QB I11: they are listed
+ * in Pay Bills next to the bills). Only the bill payments' applications to BILLS were counted, so
+ * that cash never reached the 1099. Home currency (journal items are paid in home currency only);
+ * card-settled payments are excluded as for bills. `accounts` = the journal entry's other (debit)
+ * lines, for the account → box mapping.
+ */
+async function journalItemsPaid1099(
+  ctx: ServiceContext,
+  yearStart: Date,
+  yearEnd: Date,
+): Promise<
+  Array<{
+    vendorId: string;
+    vendorName: string;
+    taxId: string | null;
+    amount: ReturnType<typeof Money.zero>;
+    accounts: Array<{ accountId: string; amount: string }>;
+  }>
+> {
+  const fundingAccountNotCreditCard = or(
+    isNull(accounts.id),
+    not(and(eq(accounts.type, 'liability'), eq(accounts.subtype, 'credit_card'))!),
+  );
+  const rows = await ctx.db
+    .select({
+      vendorId: vendors.id,
+      vendorName: vendors.displayName,
+      taxId: vendors.taxId,
+      journalEntryId: journalItemApplications.journalEntryId,
+      journalLineId: journalItemApplications.journalLineId,
+      amount: journalItemApplications.amount,
+    })
+    .from(journalItemApplications)
+    .innerJoin(billPayments, eq(journalItemApplications.billPaymentId, billPayments.id))
+    .innerJoin(vendors, eq(billPayments.vendorId, vendors.id))
+    .leftJoin(accounts, eq(billPayments.paymentAccountId, accounts.id))
+    .where(
+      and(
+        eq(journalItemApplications.companyId, ctx.companyId),
+        eq(journalItemApplications.kind, 'bill_payment'),
+        eq(vendors.is1099, true),
+        gte(billPayments.date, yearStart),
+        lt(billPayments.date, yearEnd),
+        isNull(billPayments.voidedAt),
+        ne(billPayments.method, 'credit_card'),
+        fundingAccountNotCreditCard,
+      ),
+    );
+  if (rows.length === 0) return [];
+  const entryIds = [...new Set(rows.map((r) => r.journalEntryId))];
+  const debitLines = await ctx.db
+    .select({ entryId: journalEntryLines.journalEntryId, id: journalEntryLines.id, accountId: journalEntryLines.accountId, debit: journalEntryLines.debit })
+    .from(journalEntryLines)
+    .where(and(inArray(journalEntryLines.journalEntryId, entryIds), sql`COALESCE(${journalEntryLines.debit}, 0) > 0`));
+  return rows.map((r) => ({
+    vendorId: r.vendorId,
+    vendorName: r.vendorName,
+    taxId: r.taxId ?? null,
+    amount: Money.of(r.amount),
+    accounts: debitLines
+      .filter((l) => l.entryId === r.journalEntryId && l.id !== r.journalLineId)
+      .map((l) => ({ accountId: l.accountId, amount: l.debit ?? '0' })),
+  }));
+}
+
 export async function vendor1099Report(
   ctx: ServiceContext,
   { year }: { year: number },
@@ -1292,6 +1360,10 @@ export async function vendor1099Report(
   }
   for (const r of expenseRows) {
     accumulate(r.vendorId, r.vendorName, r.taxId ?? null, toAmountString(home1099(Money.of(r.total), r.rate)));
+  }
+  // General Journal amounts owed paid in Pay Bills (home currency).
+  for (const j of await journalItemsPaid1099(ctx, yearStart, yearEnd)) {
+    accumulate(j.vendorId, j.vendorName, j.taxId, toAmountString(j.amount));
   }
 
   // --- Filter to >= $600 ---
@@ -1612,6 +1684,19 @@ export async function vendor1099Worksheet(
   // Expense lines: direct account → box.
   for (const l of expenseLineRows) {
     add(l.vendorId, l.vendorName, l.taxId ?? null, boxFor(l.accountId), home1099(Money.of(l.amount), l.rate));
+  }
+
+  // General Journal amounts owed paid in Pay Bills: prorated over the journal entry's other
+  // (debit) lines, so each account routes its share to its box (as bill lines do).
+  for (const j of await journalItemsPaid1099(ctx, yearStart, yearEnd)) {
+    const lineSum = j.accounts.reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero());
+    if (j.accounts.length === 0 || lineSum.lessThanOrEqualTo(0)) {
+      add(j.vendorId, j.vendorName, j.taxId, mapped ? null : 'nec_1', j.amount);
+      continue;
+    }
+    for (const line of j.accounts) {
+      add(j.vendorId, j.vendorName, j.taxId, boxFor(line.accountId), j.amount.times(Money.of(line.amount)).dividedBy(lineSum));
+    }
   }
 
   // --- Build rows + thresholds ---
