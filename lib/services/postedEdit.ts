@@ -32,7 +32,7 @@ import type { PostingLine } from './posting';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 
 /** Canonical key of a posting line (2dp amounts, nulls normalised). */
-function lineKey(l: {
+export function lineKey(l: {
   accountId: string;
   debit?: string | number | null;
   credit?: string | number | null;

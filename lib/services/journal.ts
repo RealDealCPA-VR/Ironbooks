@@ -40,9 +40,11 @@ import { balanceFixes, balanceSummary } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
 import { isJournalScreenEntry } from '@/lib/journalScreen';
+import { assertClosedPeriodEdit, lineKey, sameLedgerLines } from './postedEdit';
 import {
   type JournalEntityType,
   type PostingLine,
+  assertBalanced,
   postJournalEntry,
   voidJournalEntry,
   balanceDelta,
@@ -608,7 +610,20 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
       'This entry was posted by a source document. Edit the source document instead.',
     );
   }
-  await assertNoJournalApplications(ctx, id, 'edited');
+  // Well-formed, balanced lines first (the "did anything change?" comparison reads their amounts).
+  assertBalanced(input.lines);
+  // QB keeps the SAME entry when the date and the lines (accounts, amounts, classes, names) did
+  // not change — a memo, description, Entry No. or adjusting-flag edit, or an unchanged re-save.
+  // Voiding and re-posting it gave the entry a new number every time, lost a reconciled line's
+  // cleared mark (or was refused outright for a reconciled entry) and was refused for an entry
+  // with payments or credits applied, although none of that is touched by such an edit.
+  const unchanged =
+    before.date.toISOString().slice(0, 10) === input.date.toISOString().slice(0, 10) &&
+    sameLedgerLines(
+      before.lines.map((l) => ({ accountId: l.accountId, debit: l.debit, credit: l.credit, classId: l.classId, entityType: l.entityType, entityId: l.entityId })),
+      input.lines,
+    );
+  if (!unchanged) await assertNoJournalApplications(ctx, id, 'edited');
 
   // Period lock on BOTH dates — the old date is where balances get reversed,
   // the new date is where they get re-posted. (postJournalEntry/voidJournalEntry
@@ -639,6 +654,53 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
         'CONFLICT',
         'This journal entry was just changed or voided (by you in another window or by another user). Reload it to see the latest version.',
       );
+    }
+    if (unchanged) {
+      // Same ledger: keep the entry, change only its header and line memos. Any change to a
+      // transaction dated on/before the closing date still needs the password (and is listed on
+      // the Closing Date Exception report).
+      await assertClosedPeriodEdit(tx, { entryId: id, what: 'journal entry' });
+      const reference = input.reference === undefined ? before.reference : input.reference;
+      const [row] = await tx.db
+        .update(journalEntries)
+        .set({ description: input.description.trim(), reference, isAdjusting, updatedAt: new Date() })
+        .where(and(eq(journalEntries.id, id), eq(journalEntries.companyId, tx.companyId)))
+        .returning();
+      // Pair each submitted line with a stored line of the same account / amount / class / name.
+      const pool = new Map<string, JournalEntryLine[]>();
+      for (const l of before.lines) {
+        const k = lineKey(l);
+        pool.set(k, [...(pool.get(k) ?? []), l]);
+      }
+      for (const nl of input.lines) {
+        const old = pool.get(lineKey(nl))?.shift();
+        const memo = nl.memo?.trim() ? nl.memo : null;
+        if (old && (old.memo ?? null) !== memo) {
+          await tx.db.update(journalEntryLines).set({ memo }).where(eq(journalEntryLines.id, old.id));
+        }
+      }
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'journal_entry',
+        entityId: id,
+        oldValues: {
+          entryNumber: before.entryNumber,
+          date: before.date,
+          description: before.description,
+          reference: before.reference,
+          isAdjusting: before.isAdjusting,
+          lines: before.lines,
+        },
+        newValues: {
+          entryNumber: before.entryNumber,
+          date: before.date,
+          description: input.description.trim(),
+          reference,
+          isAdjusting,
+          lines: input.lines,
+        },
+      });
+      return row;
     }
     // 1. Void the original (reverses cached balances; guards reconciled lines).
     await voidJournalEntry(tx, id);

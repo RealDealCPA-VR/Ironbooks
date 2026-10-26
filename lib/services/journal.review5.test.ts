@@ -161,6 +161,82 @@ describe('journal entries (review round 5)', () => {
     }
   });
 
+  it('E: saving an entry whose date and amounts did not change keeps the same entry (memo / description edits)', async () => {
+    const je = await createManualEntry(ctx, {
+      date: d('2026-07-01'),
+      description: 'Accrue rent',
+      reference: 'R-1',
+      lines: [
+        { accountId: acct['6400'], debit: '80.00', memo: 'July' },
+        { accountId: acct['1000'], credit: '80.00' },
+      ],
+    });
+    const countBefore = (await db.select({ id: journalEntries.id }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))).length;
+    const saved = await updateEntry(ctx, je.id, {
+      date: d('2026-07-01'),
+      description: 'Accrue rent (July)',
+      reference: 'R-1a',
+      lines: [
+        { accountId: acct['1000'], credit: '80.00', memo: 'from checking' },
+        { accountId: acct['6400'], debit: '80.00', memo: 'July rent' },
+      ],
+    });
+    // Same entry, same number, nothing voided or added.
+    expect(saved.id).toBe(je.id);
+    expect(saved.entryNumber).toBe(je.entryNumber);
+    const after = await getEntry(ctx, je.id);
+    expect(after.status).toBe('posted');
+    expect(after.description).toBe('Accrue rent (July)');
+    expect(after.reference).toBe('R-1a');
+    expect(after.lines.map((l) => [l.accountId, l.memo]).sort()).toEqual(
+      [
+        [acct['1000'], 'from checking'],
+        [acct['6400'], 'July rent'],
+      ].sort(),
+    );
+    const countAfter = (await db.select({ id: journalEntries.id }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))).length;
+    expect(countAfter).toBe(countBefore);
+
+    // A changed amount still re-posts (new entry, original void).
+    const reposted = await updateEntry(ctx, je.id, {
+      date: d('2026-07-01'),
+      description: 'Accrue rent (July)',
+      lines: [
+        { accountId: acct['6400'], debit: '85.00' },
+        { accountId: acct['1000'], credit: '85.00' },
+      ],
+    });
+    expect(reposted.id).not.toBe(je.id);
+    expect((await getEntry(ctx, je.id)).status).toBe('void');
+  });
+
+  it('E2: an unchanged save is still refused on/before the closing date without the password', async () => {
+    const je = await createManualEntry(ctx, {
+      date: d('2026-01-15'),
+      description: 'Old accrual',
+      lines: [
+        { accountId: acct['6400'], debit: '10.00' },
+        { accountId: acct['1000'], credit: '10.00' },
+      ],
+    });
+    await db.update(companies).set({ settings: { closingDate: '2026-01-31' } }).where(eq(companies.id, ctx.companyId));
+    try {
+      const err = await updateEntry(ctx, je.id, {
+        date: d('2026-01-15'),
+        description: 'Old accrual (renamed)',
+        lines: [
+          { accountId: acct['6400'], debit: '10.00' },
+          { accountId: acct['1000'], credit: '10.00' },
+        ],
+      }).catch((e) => e);
+      expect(err).toBeInstanceOf(ServiceError);
+      expect((err as ServiceError).code).toBe('PERIOD_CLOSED');
+      expect((await getEntry(ctx, je.id)).description).toBe('Old accrual');
+    } finally {
+      await db.update(companies).set({ settings: {} }).where(eq(companies.id, ctx.companyId));
+    }
+  });
+
   it('C: a class that belongs to another company is refused on a journal line', async () => {
     const [otherUser] = await db.insert(users).values({ email: 'r5-other@journal.test', name: 'Other', passwordHash: 'x' }).returning();
     const [other] = await db.insert(companies).values({ name: 'Other Co', ownerId: otherUser.id }).returning();
