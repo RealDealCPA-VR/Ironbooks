@@ -12,6 +12,8 @@
  *     every document it entered carried that time of day.
  *  D. "Run due" (which sends the current instant) enters what is due TODAY on this computer's
  *     calendar: at 9:30 pm in New York it used to enter tomorrow's memorized transactions already.
+ *  E. A memorized transaction whose stored amounts are not numbers (templates keep the payload as
+ *     typed) is refused with a plain 400 when entered, not an "Internal server error" (500).
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
@@ -159,5 +161,26 @@ describe('memorized journal entries (review round 5)', () => {
       if (realTz === undefined) delete process.env.TZ;
       else process.env.TZ = realTz;
     }
+  });
+
+  it('E: entering a memorized transaction with a non-numeric amount is a 400 with a plain message', async () => {
+    const cust = await createCustomer(ctx, { displayName: 'Bad Amount Co' } as never);
+    const t = await createTemplate(ctx, {
+      name: 'Broken invoice',
+      docType: 'invoice',
+      frequency: 'monthly',
+      nextRunDate: '2026-11-01',
+      mode: 'remind',
+      template: { customerId: cust.id, lines: [{ accountId: acct['4100'], quantity: 1, rate: 'twelve' }] },
+    });
+    const res = await runPOST(
+      new NextRequest('http://localhost/api/recurring/run', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: t.id }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/twelve/);
   });
 });
