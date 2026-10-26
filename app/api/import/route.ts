@@ -26,7 +26,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { importTransactions } from '@/lib/services/import';
+import { importTransactions, parseRows, type ImportRowInput } from '@/lib/services/import';
 import { tieOut } from '@/lib/statements/parse';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
@@ -66,7 +66,12 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'rows and statement { kind, openingBalance, closingBalance } are required', code: 'VALIDATION' }, { status: 400 });
       }
       const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null);
-      const t = tieOut(body.rows as Array<{ amount: string }>, str(st.openingBalance), str(st.closingBalance), st.kind);
+      // Tie out the amounts exactly as the import will stage them (parseRows; a bad row is a 400).
+      // Adding up the raw cells with the statement parser read "12.5" as nothing — the rows then
+      // "tied out" and were imported with an amount the check never saw — and a numeric amount
+      // crashed it (HTTP 500).
+      const normalized = parseRows(body.rows as ImportRowInput[]);
+      const t = tieOut(normalized, str(st.openingBalance), str(st.closingBalance), st.kind);
       if (!t.ok && st.acknowledgeDifference !== true) {
         return NextResponse.json(
           { error: t.difference === null ? 'The statement balances are missing, so the rows cannot be tied out.' : `The rows are off from the statement by ${t.difference}.`, code: 'VALIDATION', details: { tieOut: t } },

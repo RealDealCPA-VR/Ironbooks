@@ -52,7 +52,8 @@ export async function POST(req: NextRequest) {
 
     const recon = await startReconciliation(ctx, {
       bankAccountId,
-      statementDate: new Date(statementDate),
+      // The day as typed: the service refuses an impossible one (new Date rolled 2026-02-30 to Mar 2).
+      statementDate,
       statementBalance,
     });
 

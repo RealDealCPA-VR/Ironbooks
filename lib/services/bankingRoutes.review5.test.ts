@@ -165,3 +165,64 @@ describe('register route on a long register', () => {
     expect(bad.status).toBe(400);
   });
 });
+
+describe('reconciliation dates typed as text', () => {
+  it('a statement or payment date that does not exist (Feb 30) is a 400, not silently March 2', async () => {
+    const savingsLink = (await db.insert(bankAccounts).values({ companyId, accountId: acct['1010'], bankName: 'Savings', accountNumber: '3333' }).returning())[0].id;
+    as(owner, 'POST', '/api/reconciliations');
+    const bad = await reconPOST(req('POST', '/api/reconciliations', { bankAccountId: savingsLink, statementDate: '2026-02-30', statementBalance: '10.00' }));
+    expect(bad.status).toBe(400);
+    const ok = await reconPOST(req('POST', '/api/reconciliations', { bankAccountId: savingsLink, statementDate: '2026-02-28', statementBalance: '10.00' }));
+    expect(ok.status).toBe(201);
+    const recon = await ok.json();
+    expect(String(recon.statementDate).slice(0, 10)).toBe('2026-02-28');
+    as(owner, 'PATCH', '/api/reconciliations/[id]');
+    const upd = await reconPATCH(req('PATCH', `/api/reconciliations/${recon.id}`, { action: 'updateStatement', statementDate: '2026-02-31' }), params(recon.id));
+    expect(upd.status).toBe(400);
+  });
+});
+
+describe('statement rows import: the tie-out is checked on the amounts that are imported', () => {
+  it('an amount the tie-out could not read ("12.5") no longer slips past it and imports anyway', async () => {
+    as(owner, 'POST', '/api/import');
+    const r = await importPOST(
+      req('POST', '/api/import', {
+        bankAccountId: checkingLink,
+        fileType: 'rows',
+        rows: [
+          { date: '2026-04-02', description: 'Deposit', amount: '100.00' },
+          { date: '2026-04-03', description: 'Fee', amount: '12.5' },
+        ],
+        statement: { kind: 'bank', openingBalance: '0.00', closingBalance: '100.00' },
+      }),
+    );
+    expect(r.status).toBe(400);
+    expect((await r.json()).error).toMatch(/off from the statement/);
+  });
+
+  it('rows with numeric amounts tie out and import; a row that is not an object is a 400 (not a 500)', async () => {
+    as(owner, 'POST', '/api/import');
+    const good = await importPOST(
+      req('POST', '/api/import', {
+        bankAccountId: checkingLink,
+        fileType: 'rows',
+        rows: [
+          { date: '2026-05-02', description: 'Deposit', amount: 100 },
+          { date: '2026-05-03', description: 'Fee', amount: -12.5 },
+        ],
+        statement: { kind: 'bank', openingBalance: '0.00', closingBalance: '87.50' },
+      }),
+    );
+    expect(good.status).toBe(201);
+    expect((await good.json()).imported).toBe(2);
+    const junk = await importPOST(
+      req('POST', '/api/import', {
+        bankAccountId: checkingLink,
+        fileType: 'rows',
+        rows: [null],
+        statement: { kind: 'bank', openingBalance: '0.00', closingBalance: '0.00', acknowledgeDifference: true },
+      }),
+    );
+    expect(junk.status).toBe(400);
+  });
+});

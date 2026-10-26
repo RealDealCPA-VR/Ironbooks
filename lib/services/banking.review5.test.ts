@@ -696,3 +696,226 @@ describe('a matched feed line whose transaction is voided or edited', () => {
     expect(row.matched).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Two imports of the same bank file at once
+// ---------------------------------------------------------------------------
+
+describe('importing the same bank file twice at once', () => {
+  const ofx = (n: number) =>
+    `OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\n\n<OFX>\n<BANKMSGSRSV1>\n<STMTTRNRS>\n<TRNUID>1\n<STMTRS>\n<CURDEF>USD\n<BANKACCTFROM>\n<ACCTID>000123456789\n</BANKACCTFROM>\n<BANKTRANLIST>\n` +
+    Array.from(
+      { length: n },
+      (_, i) => `<STMTTRN>\n<TRNTYPE>DEBIT\n<DTPOSTED>202603${String(i + 1).padStart(2, '0')}\n<TRNAMT>-${i + 10}.00\n<FITID>FIT-${i}\n<NAME>SHOP ${i}\n</STMTTRN>`,
+    ).join('\n') +
+    `\n</BANKTRANLIST>\n</STMTRS>\n</STMTTRNRS>\n</BANKMSGSRSV1>\n</OFX>`;
+
+  it('stages every bank line once (two people importing the same download used to get every line twice)', async () => {
+    const ba = await linkBank('1000');
+    const content = ofx(6);
+    const [a, b] = await Promise.all([
+      importTransactions(ctx, { bankAccountId: ba, fileType: 'ofx', content }),
+      importTransactions(ctx, { bankAccountId: ba, fileType: 'ofx', content }),
+    ]);
+    const staged = await db.select().from(bankTransactions).where(eq(bankTransactions.bankAccountId, ba));
+    expect(staged).toHaveLength(6);
+    expect(a.imported + b.imported).toBe(6);
+    expect(a.skippedDupes + b.skippedDupes).toBe(6);
+  });
+
+  const oneLine = (trn: string) =>
+    `OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\n\n<OFX>\n<BANKMSGSRSV1>\n<STMTTRNRS>\n<STMTRS>\n<CURDEF>USD\n<BANKTRANLIST>\n<STMTTRN>\n${trn}\n</STMTTRN>\n</BANKTRANLIST>\n</STMTRS>\n</STMTTRNRS>\n</BANKMSGSRSV1>\n</OFX>`;
+
+  it('reads an OFX amount written with a decimal comma (the OFX format allows it)', async () => {
+    const ba = await linkBank('1000');
+    const res = await importTransactions(ctx, {
+      bankAccountId: ba,
+      fileType: 'ofx',
+      content: oneLine('<TRNTYPE>DEBIT\n<DTPOSTED>20260305\n<TRNAMT>-12,50\n<FITID>EU-1\n<NAME>BOULANGERIE'),
+    });
+    expect(res.imported).toBe(1);
+    const staged = await db.select().from(bankTransactions).where(eq(bankTransactions.bankAccountId, ba));
+    expect(staged.map((s) => s.amount)).toEqual(['-12.50']);
+  });
+
+  it('an OFX line with an unreadable date or amount is a plain VALIDATION error (not a 500, never NaN)', async () => {
+    const ba = await linkBank('1000');
+    await expectCode(
+      importTransactions(ctx, { bankAccountId: ba, fileType: 'ofx', content: oneLine('<TRNTYPE>DEBIT\n<DTPOSTED>2026-13-45\n<TRNAMT>-1.00\n<NAME>X') }),
+      'VALIDATION',
+      /not a date/,
+    );
+    await expectCode(
+      importTransactions(ctx, { bankAccountId: ba, fileType: 'ofx', content: oneLine('<TRNTYPE>DEBIT\n<DTPOSTED>20260305\n<TRNAMT>NaN\n<FITID>N-1\n<NAME>X') }),
+      'VALIDATION',
+      /not an amount/,
+    );
+    expect(await db.select().from(bankTransactions).where(eq(bankTransactions.bankAccountId, ba))).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reconcile: the statement date moved earlier
+// ---------------------------------------------------------------------------
+
+describe('reconciliation: correcting the statement date to an earlier day', () => {
+  it('a line dated after the new statement date stops counting (it is hidden and not on that statement)', async () => {
+    const { updateStatement, getProgress } = await import('./reconcile');
+    const ba = await linkBank('1000');
+    const posts: Array<[string, string]> = [
+      ['2026-03-10', '100.00'],
+      ['2026-03-28', '50.00'],
+    ];
+    for (const [day, amt] of posts) {
+      await postJournalEntry(ctx, {
+        date: d(day),
+        description: 'Owner money ' + day,
+        lines: [
+          { accountId: acct['1000'], debit: amt },
+          { accountId: acct['3000'], credit: amt },
+        ],
+      });
+    }
+    const recon = await startReconciliation(ctx, { bankAccountId: ba, statementDate: d('2026-03-31'), statementBalance: '150.00' });
+    for (const l of await listClearable(ctx, ba, d('2026-03-31'), recon.id)) await toggleCleared(ctx, recon.id, l.journalEntryLineId, true);
+    expect((await getProgress(ctx, recon.id)).difference).toBe('0.00');
+
+    // The statement is really the Mar 20 one (ending balance still typed as 150.00).
+    await updateStatement(ctx, recon.id, { statementDate: d('2026-03-20') });
+    const visible = await listClearable(ctx, ba, d('2026-03-20'), recon.id);
+    expect(visible.map((l) => [l.debit, l.isCleared])).toEqual([['100.00', true]]);
+    const p = await getProgress(ctx, recon.id);
+    expect(p.clearedBalance).toBe('100.00');
+    expect(p.difference).toBe('50.00');
+    await expectCode(completeReconciliation(ctx, recon.id), 'VALIDATION');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Undeposited Funds / Inventory Asset are kept by their own forms
+// ---------------------------------------------------------------------------
+
+describe('Undeposited Funds and Inventory Asset keep matching their lists', () => {
+  it('Transfer Funds refuses Undeposited Funds and the Inventory Asset account on either side', async () => {
+    await expectCode(
+      createTransfer(ctx, { date: d('2026-03-02'), fromAccountId: acct['1050'], toAccountId: acct['1000'], amount: '100.00' }),
+      'VALIDATION',
+      /Undeposited Funds/,
+    );
+    await expectCode(
+      createTransfer(ctx, { date: d('2026-03-02'), fromAccountId: acct['1000'], toAccountId: acct['1050'], amount: '100.00' }),
+      'VALIDATION',
+      /Undeposited Funds/,
+    );
+    await expectCode(
+      createTransfer(ctx, { date: d('2026-03-02'), fromAccountId: acct['1000'], toAccountId: acct['1300'], amount: '100.00' }),
+      'VALIDATION',
+      /inventory/i,
+    );
+    expect(await gl('1050')).toBe('0.00');
+    expect(await gl('1300')).toBe('0.00');
+  });
+
+  it('Make Deposits refuses an extra line or cash back on Undeposited Funds or Inventory Asset', async () => {
+    const { createDeposit } = await import('./deposits');
+    await expectCode(
+      createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-02'), extraLines: [{ accountId: acct['1050'], amount: '100.00' }] }),
+      'VALIDATION',
+      /Undeposited Funds/,
+    );
+    await expectCode(
+      createDeposit(ctx, {
+        depositAccountId: acct['1000'],
+        date: d('2026-03-02'),
+        extraLines: [{ accountId: acct['3000'], amount: '100.00' }],
+        cashBack: { accountId: acct['1050'], amount: '10.00' },
+      }),
+      'VALIDATION',
+      /Undeposited Funds/,
+    );
+    await expectCode(
+      createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-02'), extraLines: [{ accountId: acct['1300'], amount: '100.00' }] }),
+      'VALIDATION',
+      /inventory/i,
+    );
+    expect(await gl('1050')).toBe('0.00');
+    expect(await gl('1300')).toBe('0.00');
+  });
+
+  it('a bank feed line cannot be added to Undeposited Funds or Inventory Asset (it is matched to the deposit instead)', async () => {
+    const ba = await linkBank('1000');
+    const dep = await feedLine(ba, '250.00', 'DEPOSIT');
+    await expectCode(categorize(ctx, { bankTransactionId: dep.id, accountId: acct['1050'] }), 'VALIDATION', /Make Deposits/);
+    await expectCode(
+      categorize(ctx, {
+        bankTransactionId: dep.id,
+        accountId: acct['4000'],
+        splits: [
+          { accountId: acct['4000'], percent: '50' },
+          { accountId: acct['1050'], percent: '50' },
+        ],
+      }),
+      'VALIDATION',
+      /Undeposited Funds/,
+    );
+    const buy = await feedLine(ba, '-80.00', 'WIDGET SUPPLY');
+    await expectCode(categorize(ctx, { bankTransactionId: buy.id, accountId: acct['1300'] }), 'VALIDATION', /inventory/i);
+    expect(await gl('1050')).toBe('0.00');
+    expect(await gl('1300')).toBe('0.00');
+  });
+
+  it('a transfer or deposit saved before the rule (on such an account) can still be re-saved', async () => {
+    const { createDeposit, updateDeposit } = await import('./deposits');
+    const { transfers, deposits, depositLines } = await import('@/lib/db/schema');
+    // Older files: a transfer out of Undeposited Funds and a deposit with an extra line on it.
+    const t = await createTransfer(ctx, { date: d('2026-03-02'), fromAccountId: acct['1010'], toAccountId: acct['1000'], amount: '40.00' });
+    await db.update(transfers).set({ fromAccountId: acct['1050'] }).where(eq(transfers.id, t.id));
+    const edited = await updateTransfer(ctx, t.id, { date: d('2026-03-02'), fromAccountId: acct['1050'], toAccountId: acct['1000'], amount: '40.00', memo: 'x' });
+    expect(edited.memo).toBe('x');
+
+    const dep = await createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-02'), extraLines: [{ accountId: acct['3000'], amount: '10.00' }] });
+    await db.update(depositLines).set({ accountId: acct['1050'] }).where(eq(depositLines.depositId, dep.id));
+    const re = await updateDeposit(ctx, dep.id, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['1050'], amount: '10.00' }],
+      memo: 'y',
+    });
+    expect(re.memo).toBe('y');
+    const [row] = await db.select().from(deposits).where(eq(deposits.id, dep.id));
+    expect(row.voidedAt).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Memo-only edits reach the register
+// ---------------------------------------------------------------------------
+
+describe('editing only the memo of a transfer or a deposit line', () => {
+  it('the transfer entry lines carry the new memo (the register Memo column used to keep the old one)', async () => {
+    const { journalEntryLines } = await import('@/lib/db/schema');
+    const t = await createTransfer(ctx, { date: d('2026-03-02'), fromAccountId: acct['1000'], toAccountId: acct['1010'], amount: '100.00', memo: 'Old memo' });
+    const edited = await updateTransfer(ctx, t.id, { date: d('2026-03-02'), fromAccountId: acct['1000'], toAccountId: acct['1010'], amount: '100.00', memo: 'Payroll float' });
+    expect(edited.postedEntryId).toBe(t.postedEntryId);
+    const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, t.postedEntryId!));
+    expect(lines.map((l) => l.memo)).toEqual(['Payroll float', 'Payroll float']);
+  });
+
+  it('a deposit extra line whose description changed shows the new text on its entry line', async () => {
+    const { journalEntryLines } = await import('@/lib/db/schema');
+    const { createDeposit, updateDeposit } = await import('./deposits');
+    const dep = await createDeposit(ctx, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['3000'], amount: '75.00', description: 'Owner money' }],
+    });
+    const re = await updateDeposit(ctx, dep.id, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['3000'], amount: '75.00', description: 'Owner loan repayment' }],
+    });
+    expect(re.postedEntryId).toBe(dep.postedEntryId);
+    const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, dep.postedEntryId!));
+    expect(lines.find((l) => l.accountId === acct['3000'])?.memo).toBe('Owner loan repayment');
+  });
+});

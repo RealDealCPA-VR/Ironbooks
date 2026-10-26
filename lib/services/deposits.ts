@@ -62,6 +62,8 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
+import { syncLineMemos } from './entryLineMemos';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 import { homeAmounts } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
 
@@ -433,6 +435,8 @@ async function prepareDeposit(
   ctx: ServiceContext,
   input: CreateDepositInput,
   excludeDepositId?: string,
+  /** Accounts the deposit being edited already uses on its extra / cash-back lines. */
+  keepAccountIds: ReadonlySet<string> = new Set(),
 ): Promise<PreparedDeposit> {
   const paymentIds = input.paymentIds ?? [];
   const salesReceiptIds = input.salesReceiptIds ?? [];
@@ -671,10 +675,15 @@ async function prepareDeposit(
       throw validation(`Extra line ${i + 1}: description uses a reserved prefix.`);
     }
     const [lineAcct] = await ctx.db
-      .select({ id: accounts.id })
+      .select({ id: accounts.id, name: accounts.name, type: accounts.type, subtype: accounts.subtype })
       .from(accounts)
       .where(and(eq(accounts.id, line.accountId), eq(accounts.companyId, ctx.companyId)));
     if (!lineAcct) throw notFound(`Extra line ${i + 1} account`);
+    // An extra line from Undeposited Funds took money out of it without any payment leaving the
+    // "Payments to Deposit" list (GL 1050 no longer equals the list); one from Inventory Asset
+    // moved its balance without the inventory valuation. Pick those payments above instead.
+    const reason = keepAccountIds.has(lineAcct.id) ? null : subledgerAccountReason(lineAcct);
+    if (reason) throw validation(`Extra line ${i + 1}: ${reason}`);
   }
 
   // ── cash back validation ─────────────────────────────────────────────────
@@ -690,12 +699,14 @@ async function prepareDeposit(
       throw validation('Cash back account must differ from the deposit account.');
     }
     const [cbAcct] = await ctx.db
-      .select({ id: accounts.id })
+      .select({ id: accounts.id, name: accounts.name, type: accounts.type, subtype: accounts.subtype })
       .from(accounts)
       .where(
         and(eq(accounts.id, input.cashBack.accountId), eq(accounts.companyId, ctx.companyId)),
       );
     if (!cbAcct) throw notFound('Cash back account');
+    const reason = keepAccountIds.has(cbAcct.id) ? null : subledgerAccountReason(cbAcct);
+    if (reason) throw validation(`Cash back: ${reason}`);
   }
 
   // ── totals ───────────────────────────────────────────────────────────────
@@ -953,8 +964,14 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
   }
 
   return inTransaction(ctx, async (tx) => {
-    const prep = await prepareDeposit(tx, input, id);
     const oldLines = await tx.db.select().from(depositLines).where(eq(depositLines.depositId, id));
+    // A deposit saved before the Undeposited Funds / Inventory Asset rule keeps its own lines.
+    const keep = new Set<string>();
+    for (const l of oldLines) {
+      if (l.accountId) keep.add(l.accountId);
+      if (l.description?.startsWith(CASHBACK_LINE_PREFIX)) keep.add(l.description.slice(CASHBACK_LINE_PREFIX.length));
+    }
+    const prep = await prepareDeposit(tx, input, id, keep);
     let plan = await planPostedEdit(tx, {
       entryId: existing.postedEntryId,
       date: input.date,
@@ -977,6 +994,8 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
       entryId = entry.id;
     } else {
       await retitleEntry(tx, entryId, { description: input.memo ? `Deposit: ${input.memo}` : 'Bank Deposit' });
+      // Line descriptions / cash-back memo are the entry lines' memos (register Memo column).
+      await syncLineMemos(tx, entryId, prep.glLines);
     }
 
     // Deposit lines are a subledger of the entry — safe to rewrite (same totals either way).

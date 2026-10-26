@@ -39,6 +39,8 @@ import {
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
 import { currencyRate, foreignCode, homeCode, parseRate, toHome } from './exchangeRates';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { syncLineMemos } from './entryLineMemos';
 import Decimal from 'decimal.js';
 
 // ---------------------------------------------------------------------------
@@ -188,14 +190,22 @@ function transferDescription(input: CreateTransferInput): string {
   return input.memo ? `Transfer: ${input.memo}` : 'Transfer between accounts';
 }
 
-/** Both accounts must belong to this company. */
-async function assertAccountsOwned(ctx: ServiceContext, input: CreateTransferInput) {
+/**
+ * Both accounts must belong to this company, and neither may be Undeposited Funds or an inventory
+ * asset account (subledgerAccountReason): a transfer out of Undeposited Funds took money out
+ * without any payment leaving the Make Deposits list (and into it, money no deposit could ever
+ * clear); one to Inventory Asset changed its balance without the inventory valuation. `keep` are
+ * the accounts a saved transfer already uses — an older transfer can still be re-saved.
+ */
+async function assertAccountsOwned(ctx: ServiceContext, input: CreateTransferInput, keep: ReadonlyArray<string> = []) {
   for (const id of [input.fromAccountId, input.toAccountId]) {
     const [row] = await ctx.db
-      .select({ id: accounts.id })
+      .select({ id: accounts.id, name: accounts.name, type: accounts.type, subtype: accounts.subtype })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
     if (!row) throw notFound('Account');
+    const reason = keep.includes(id) ? null : subledgerAccountReason(row);
+    if (reason) throw validation(`${reason} It can't be used in Transfer Funds.`);
   }
 }
 
@@ -290,13 +300,13 @@ async function withSavedRate(
 
 export async function updateTransfer(ctx: ServiceContext, id: string, input: CreateTransferInput) {
   const amountStr = validateTransfer(input);
-  await assertAccountsOwned(ctx, input);
   const [existing] = await ctx.db
     .select()
     .from(transfers)
     .where(and(eq(transfers.companyId, ctx.companyId), eq(transfers.id, id)));
   if (!existing) throw notFound('Transfer');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This transfer is void and cannot be edited.');
+  await assertAccountsOwned(ctx, input, [existing.fromAccountId, existing.toAccountId]);
   const fx = await resolveTransferFx(ctx, await withSavedRate(ctx, input, existing), amountStr);
 
   return inTransaction(ctx, async (tx) => {
@@ -323,6 +333,8 @@ export async function updateTransfer(ctx: ServiceContext, id: string, input: Cre
       entryId = entry.id;
     } else {
       await retitleEntry(tx, entryId, { description: transferDescription(input) });
+      // The memo is on both lines too (the register's Memo column): keep them in step.
+      await syncLineMemos(tx, entryId, lines);
     }
     const [updated] = await tx.db
       .update(transfers)

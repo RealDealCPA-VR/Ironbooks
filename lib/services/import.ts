@@ -28,7 +28,7 @@ import { csvUnsafeText } from '@/lib/csv';
 import { refreshPlannerStats } from '@/lib/db/plannerStats';
 import { bankAccounts, bankTransactions, fileImports } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { listRules, matchRule } from './rules';
 import { foreignCurrencyOfAccount } from './fxLedger';
 import { homeCode } from './fxLines';
@@ -291,6 +291,21 @@ function pickStatement(
 }
 
 /**
+ * An OFX TRNAMT as a 2dp string. The OFX specification lets the decimal symbol be a period OR a
+ * comma ("-12,50" from a European bank's Web Connect file used to fail the whole import with a
+ * parser error); a value that is not a number ("NaN", "", "12.5.1") is a plain VALIDATION error
+ * instead of being staged as NaN.
+ */
+function ofxAmount(raw: unknown, index: number): string {
+  let s = String(raw ?? '').trim();
+  if (/^[+-]?\d*,\d+$/.test(s)) s = s.replace(',', '.');
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) {
+    throw new ServiceError('VALIDATION', `Transaction ${index + 1}: "${s.slice(0, 40)}" is not an amount (TRNAMT).`);
+  }
+  return toAmountString(s);
+}
+
+/**
  * Parse an OFX or QBO file and return normalized transaction rows.
  * Handles SGML (unclosed tags) and arbitrary header lines before <OFX>. A file with statements
  * for several accounts yields the statement of `accountNumber` (see pickStatement).
@@ -328,8 +343,12 @@ export function parseOFX(content: string, accountNumber?: string | null): Parsed
     const dtPosted = t.DTPOSTED ?? t.DTUSER ?? '';
     if (!dtPosted) throw new ServiceError('VALIDATION', `Transaction ${i + 1}: missing DTPOSTED.`);
     const date = parseOFXDate(String(dtPosted));
-    const trnAmt = t.TRNAMT ?? '0';
-    const amount = toAmountString(String(trnAmt));
+    // An unreadable date used to reach the duplicate key (toISOString → RangeError, HTTP 500) or
+    // fail its row in the database; refuse the file plainly, as the CSV reader does.
+    if (isNaN(date.getTime())) {
+      throw new ServiceError('VALIDATION', `Transaction ${i + 1}: "${String(dtPosted).slice(0, 40)}" is not a date (DTPOSTED).`);
+    }
+    const amount = ofxAmount(t.TRNAMT, i);
     const name = String(t.NAME ?? t.PAYEE ?? '');
     const memo = String(t.MEMO ?? '');
     const description = [name, memo].filter(Boolean).join(' — ') || 'Imported transaction';
@@ -800,103 +819,112 @@ export async function importTransactions(
     }
   }
 
-  // 4b. Dedupe: collect fitIds already staged for this bank account.
-  const existingFitIds = new Set<string>();
-  {
-    const existing = await ctx.db
-      .select({ fitId: bankTransactions.fitId })
-      .from(bankTransactions)
-      .where(
-        and(
-          eq(bankTransactions.companyId, ctx.companyId),
-          eq(bankTransactions.bankAccountId, input.bankAccountId),
-        ),
-      );
-    for (const row of existing) {
-      if (row.fitId) existingFitIds.add(row.fitId);
+  // 4b-7 run in ONE transaction: the duplicate check, the inserts and the counts. Two imports of
+  // the same file at once (a double-clicked Import, two people with the same download) each used
+  // to read "nothing staged yet" before either inserted, and every line was staged twice.
+  const { importedCount, skippedDupes, errorLog } = await inTransaction(ctx, async (tx) => {
+    // 4b. Dedupe: collect fitIds already staged for this bank account.
+    const existingFitIds = new Set<string>();
+    {
+      const existing = await tx.db
+        .select({ fitId: bankTransactions.fitId })
+        .from(bankTransactions)
+        .where(
+          and(
+            eq(bankTransactions.companyId, tx.companyId),
+            eq(bankTransactions.bankAccountId, input.bankAccountId),
+          ),
+        );
+      for (const row of existing) {
+        if (row.fitId) existingFitIds.add(row.fitId);
+      }
     }
-  }
 
-  // Dedupe against both already-staged rows AND earlier rows in THIS batch, so two rows that
-  // genuinely share a fitId within one file don't both insert.
-  const seenInBatch = new Set<string>();
-  const toInsert = parsed.filter((p) => {
-    if (!p.fitId) return true;
-    if (existingFitIds.has(p.fitId) || seenInBatch.has(p.fitId)) return false;
-    const legacy = legacyKeys.get(p);
-    if (legacy && existingFitIds.has(legacy)) return false;
-    seenInBatch.add(p.fitId);
-    return true;
-  });
-  const skippedDupes = parsed.length - toInsert.length;
+    // Dedupe against both already-staged rows AND earlier rows in THIS batch, so two rows that
+    // genuinely share a fitId within one file don't both insert.
+    const seenInBatch = new Set<string>();
+    const toInsert = parsed.filter((p) => {
+      if (!p.fitId) return true;
+      if (existingFitIds.has(p.fitId) || seenInBatch.has(p.fitId)) return false;
+      const legacy = legacyKeys.get(p);
+      if (legacy && existingFitIds.has(legacy)) return false;
+      seenInBatch.add(p.fitId);
+      return true;
+    });
+    const skippedDupes = parsed.length - toInsert.length;
 
-  // 5. Pre-fetch active rules once for bulk application.
-  const rules = await listRules(ctx);
+    // 5. Pre-fetch active rules once for bulk application.
+    const rules = await listRules(tx);
 
-  // 6. Insert + apply rules row-by-row.
-  const errorLog: Array<{ line: number; error: string }> = [];
-  let importedCount = 0;
+    // 6. Insert + apply rules row-by-row. Each row in its own savepoint: a row the database refuses
+    // is logged and skipped without aborting the rest of the import.
+    const errorLog: Array<{ line: number; error: string }> = [];
+    let importedCount = 0;
 
-  for (let i = 0; i < toInsert.length; i++) {
-    const txn = toInsert[i];
-    try {
-      // Apply rules to get the suggested account and any payee override.
-      const match = await matchRule(
-        ctx,
-        { description: txn.description, payee: txn.payee, amount: txn.amount, bankAccountId: input.bankAccountId },
-        rules,
-      );
+    for (let i = 0; i < toInsert.length; i++) {
+      const txn = toInsert[i];
+      try {
+        // Apply rules to get the suggested account and any payee override.
+        const match = await matchRule(
+          tx,
+          { description: txn.description, payee: txn.payee, amount: txn.amount, bankAccountId: input.bankAccountId },
+          rules,
+        );
 
-      await ctx.db.insert(bankTransactions).values({
-        companyId: ctx.companyId,
+        await inTransaction(tx, (sp) =>
+          sp.db.insert(bankTransactions).values({
+            companyId: sp.companyId,
+            bankAccountId: input.bankAccountId,
+            fileImportId: importRow.id,
+            // payee is varchar(255): a longer cell used to fail the row (logged as an error and
+            // left out of the import). Keep it, shortened.
+            fitId: txn.fitId ?? null,
+            date: txn.date,
+            description: txn.description,
+            payee: (match?.setPayee ?? txn.payee)?.slice(0, 255) ?? null,
+            amount: txn.amount,
+            matched: false,
+            suggestedAccountId: match?.setAccountId ?? null,
+          }),
+        );
+        importedCount += 1;
+      } catch (err) {
+        errorLog.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // 7. Update fileImports with final counts.
+    const finalStatus = errorLog.length > 0 && importedCount === 0 ? 'failed' : 'completed';
+    await tx.db
+      .update(fileImports)
+      .set({
+        status: finalStatus,
+        totalTransactions: parsed.length,
+        importedTransactions: importedCount,
+        failedTransactions: errorLog.length,
+        errorLog: errorLog.length ? errorLog : null,
+        completedAt: new Date(),
+      })
+      .where(eq(fileImports.id, importRow.id));
+
+    // Audit trail.
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'file_import',
+      entityId: importRow.id,
+      newValues: {
+        fileType: input.fileType,
         bankAccountId: input.bankAccountId,
-        fileImportId: importRow.id,
-        // payee is varchar(255): a longer cell used to fail the row (logged as an error and left
-        // out of the import). Keep it, shortened.
-        fitId: txn.fitId ?? null,
-        date: txn.date,
-        description: txn.description,
-        payee: (match?.setPayee ?? txn.payee)?.slice(0, 255) ?? null,
-        amount: txn.amount,
-        matched: false,
-        suggestedAccountId: match?.setAccountId ?? null,
-      });
-      importedCount += 1;
-    } catch (err) {
-      errorLog.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
-    }
-  }
-
-  // 7. Update fileImports with final counts.
-  const finalStatus = errorLog.length > 0 && importedCount === 0 ? 'failed' : 'completed';
-  await ctx.db
-    .update(fileImports)
-    .set({
-      status: finalStatus,
-      totalTransactions: parsed.length,
-      importedTransactions: importedCount,
-      failedTransactions: errorLog.length,
-      errorLog: errorLog.length ? errorLog : null,
-      completedAt: new Date(),
-    })
-    .where(eq(fileImports.id, importRow.id));
-
-  // Audit trail.
-  await writeAudit(ctx, {
-    action: 'create',
-    entityType: 'file_import',
-    entityId: importRow.id,
-    newValues: {
-      fileType: input.fileType,
-      bankAccountId: input.bankAccountId,
-      parsed: parsed.length,
-      imported: importedCount,
-      skippedDupes,
-      errors: errorLog.length,
-      ...(input.statementCheck
-        ? { tiedOut: input.statementCheck.tieOut.ok, difference: input.statementCheck.tieOut.difference, acknowledgedDifference: input.statementCheck.acknowledgedDifference }
-        : {}),
-    },
+        parsed: parsed.length,
+        imported: importedCount,
+        skippedDupes,
+        errors: errorLog.length,
+        ...(input.statementCheck
+          ? { tiedOut: input.statementCheck.tieOut.ok, difference: input.statementCheck.tieOut.difference, acknowledgedDifference: input.statementCheck.acknowledgedDifference }
+          : {}),
+      },
+    });
+    return { importedCount, skippedDupes, errorLog };
   });
   // A bulk load: give the planner fresh statistics (PGlite has no autovacuum; best-effort).
   if (importedCount > 0) await refreshPlannerStats(ctx.db, 'bank import');

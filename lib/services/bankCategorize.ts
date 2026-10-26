@@ -40,6 +40,8 @@ import { postJournalEntry, voidJournalEntry } from './posting';
 import { applyRulesToAccount } from './rules';
 import { accountSigned, foreignCurrencyOfAccount } from './fxLedger';
 import { currencyRate, toHome } from './exchangeRates';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { isUndepositedFunds } from '@/lib/accountTypes';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -247,6 +249,24 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
   // Dr Checking / Cr Checking — the line shows as added but the books never get the money.
   if ((splits ? splits.map((sp) => sp.accountId) : [input.accountId]).includes(bankGlAccountId)) {
     throw validation('Choose a different account: this line came from this bank account, so it cannot also be the account it goes to.');
+  }
+  // Undeposited Funds / Inventory Asset belong to their own lists (Make Deposits, the inventory
+  // valuation). Adding a bank deposit "to Undeposited Funds" took money out of it while every
+  // payment stayed in the Make Deposits list — the classic double count; such a line is the bank's
+  // side of a deposit already made with Make Deposits, so it is Matched to it instead.
+  for (const accountId of new Set(splits ? splits.map((sp) => sp.accountId) : [input.accountId])) {
+    const [offset] = await ctx.db
+      .select({ name: accounts.name, type: accounts.type, subtype: accounts.subtype })
+      .from(accounts)
+      .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
+    const reason = offset ? subledgerAccountReason(offset) : null;
+    if (reason) {
+      throw validation(
+        isUndepositedFunds(offset!)
+          ? `${reason} If this bank line is the deposit of those payments, record it with Make Deposits and then Match the line to that deposit.`
+          : reason,
+      );
+    }
   }
   const offsets: { accountId: string; classId: string | null; amount: string }[] = splits
     ? allocate(homeAmt, splits.map((sp) => sp.percent))

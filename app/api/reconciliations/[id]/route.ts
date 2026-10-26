@@ -102,7 +102,7 @@ export async function PATCH(
       }
       await updateStatement(ctx, id, {
         statementBalance: statementBalance ?? undefined,
-        statementDate: statementDate ? new Date(statementDate) : undefined,
+        statementDate: statementDate || undefined,
       });
       // Return updated progress so the client can refresh in one round-trip.
       const progress = await getProgress(ctx, id);

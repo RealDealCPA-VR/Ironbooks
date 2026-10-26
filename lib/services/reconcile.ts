@@ -13,7 +13,7 @@
  * posted by other services (invoices, expenses, transfers, etc.).
  */
 import { assertReconciliationDateOpen } from './accountantCopy/guard';
-import { and, desc, eq, inArray, isNull, lt, ne, notExists, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNull, lt, ne, notExists, sql } from 'drizzle-orm';
 import { onOrBeforeDay } from './journal';
 import {
   accounts,
@@ -25,6 +25,8 @@ import {
 } from '@/lib/db/schema';
 import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
 import { canFinishReconciliation } from '@/lib/reconcileRules';
+import { MAX_DATE_YEAR, MIN_DATE_YEAR, parseDateInput } from '@/lib/validation/helpers';
+import { todayISO } from '@/lib/dates';
 import {
   type ServiceContext,
   ServiceError,
@@ -46,7 +48,8 @@ import { foreignCode, homeCode } from './fxLines';
 
 export interface StartReconciliationInput {
   bankAccountId: string;
-  statementDate: Date;
+  /** A Date, or the day as typed (YYYY-MM-DD; an impossible day is refused). */
+  statementDate: Date | string;
   /** The ending balance shown on the bank statement (positive = asset balance). */
   statementBalance: string | number;
 }
@@ -99,10 +102,17 @@ function statementAmount(value: unknown, label: string): string {
   return toAmountString(d);
 }
 
-/** A statement date that is a real date (an unparseable one used to fail in the database driver → 500). */
+/**
+ * A statement / payment date that is a real calendar day. Typed dates arrive as text and are read
+ * with parseDateInput: `new Date('2026-02-30')` silently rolled an impossible day over to March 2
+ * (the reconciliation then ran against the wrong statement date); an unparseable one used to fail
+ * in the database driver (HTTP 500).
+ */
 function statementDay(value: unknown, label = 'Statement date'): Date {
-  const d = value instanceof Date ? value : new Date(String(value ?? ''));
-  if (isNaN(d.getTime())) throw validation(`${label} is not a valid date.`);
+  const d = value instanceof Date ? value : typeof value === 'string' ? parseDateInput(value) : null;
+  if (!d || isNaN(d.getTime())) throw validation(`${label} is not a valid date.`);
+  const year = d.getUTCFullYear();
+  if (year < MIN_DATE_YEAR || year > MAX_DATE_YEAR) throw validation(`${label} is not a valid date.`);
   return d;
 }
 
@@ -599,7 +609,7 @@ async function cancelReconciliationInTx(ctx: ServiceContext, reconciliationId: s
 
 export interface UpdateStatementInput {
   statementBalance?: string | number;
-  statementDate?: Date;
+  statementDate?: Date | string;
 }
 
 /**
@@ -611,18 +621,21 @@ export async function updateStatement(
   reconciliationId: string,
   input: UpdateStatementInput,
 ): Promise<typeof reconciliations.$inferSelect> {
-  const recon = await loadReconciliation(ctx, reconciliationId);
-  if (recon.status !== 'in_progress') {
-    throw validation('Cannot modify a reconciliation that is not in_progress.');
-  }
   if (input.statementBalance == null && !input.statementDate) {
     throw validation('Provide statementBalance and/or statementDate to update.');
   }
   const newBalance = input.statementBalance != null ? statementAmount(input.statementBalance, 'The statement ending balance') : null;
   const newDate = input.statementDate ? statementDay(input.statementDate) : null;
-  await assertReconciliationDateOpen(ctx, newDate ?? recon.statementDate); // Accountant's Copy (I1)
 
+  // Status check, correction and un-clearing in one transaction (a correction racing the
+  // completion sees the session's current state).
   return inTransaction(ctx, async (tx) => {
+    const recon = await loadReconciliation(tx, reconciliationId);
+    if (recon.status !== 'in_progress') {
+      throw validation('Cannot modify a reconciliation that is not in_progress.');
+    }
+    await assertReconciliationDateOpen(tx, newDate ?? recon.statementDate); // Accountant's Copy (I1)
+
     const [updated] = await tx.db
       .update(reconciliations)
       .set({
@@ -631,6 +644,35 @@ export async function updateStatement(
       })
       .where(eq(reconciliations.id, reconciliationId))
       .returning();
+
+    // A statement date moved EARLIER: lines cleared in this session that are dated after the new
+    // date are not on that statement. They used to stay cleared — counted in the cleared balance
+    // while hidden from the list (which only shows lines up to the statement date), so the
+    // difference could not be explained or fixed. Un-clear them, as toggleCleared would refuse to
+    // clear them now.
+    let unclearedAfterDate = 0;
+    if (newDate) {
+      const nextDay = new Date(Date.UTC(newDate.getUTCFullYear(), newDate.getUTCMonth(), newDate.getUTCDate() + 1));
+      const after = await tx.db
+        .select({ id: reconciliationItems.id })
+        .from(reconciliationItems)
+        .innerJoin(journalEntryLines, eq(reconciliationItems.journalEntryLineId, journalEntryLines.id))
+        .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+        .where(
+          and(
+            eq(reconciliationItems.reconciliationId, reconciliationId),
+            eq(reconciliationItems.isCleared, true),
+            gte(journalEntries.date, nextDay),
+          ),
+        );
+      if (after.length) {
+        await tx.db
+          .update(reconciliationItems)
+          .set({ isCleared: false, clearedDate: null })
+          .where(inArray(reconciliationItems.id, after.map((r) => r.id)));
+        unclearedAfterDate = after.length;
+      }
+    }
 
     await writeAudit(tx, {
       action: 'update',
@@ -643,6 +685,7 @@ export async function updateStatement(
       newValues: {
         statementBalance: updated.statementBalance,
         statementDate: updated.statementDate,
+        ...(unclearedAfterDate ? { unclearedAfterDate } : {}),
       },
     });
 
@@ -1375,7 +1418,7 @@ async function payForeignCreditCard(
   recon: { id: string; glAccountId: string; statementBalance: string },
   cardName: string,
   cardCurrency: string,
-  input: PayCreditCardBalanceInput,
+  input: PayCreditCardBalanceInput & { date: Date },
 ) {
   const amt = Money.round2(input.amount ?? recon.statementBalance);
   if (!amt.greaterThan(0)) throw validation('Payment amount must be greater than zero.');
@@ -1414,7 +1457,7 @@ async function payForeignCreditCard(
   const homeStr = toAmountString(toHome(amt, fx.rate));
   if (!Money.gt(homeStr, 0)) throw validation('This amount is too small to convert to your home currency.');
   return postJournalEntry(ctx, {
-    date: input.date ?? new Date(),
+    date: input.date,
     description: input.memo?.trim() ? input.memo.trim() : `Credit card payment — ${cardName}`,
     sourceRef,
     currency: fx.currency,
@@ -1432,7 +1475,7 @@ export interface PayCreditCardBalanceInput {
   /** Defaults to the reconciliation's statement (ending) balance. */
   amount?: string | number;
   /** Defaults to today. */
-  date?: Date;
+  date?: Date | string;
   memo?: string | null;
   /** p1 fx: foreign-currency card — home units per 1 unit (default: the currency list's rate). */
   exchangeRate?: string | number | null;
@@ -1460,7 +1503,12 @@ export async function payCreditCardBalance(
   } else {
     input = { ...input, amount: undefined };
   }
-  if (input.date !== undefined && input.date !== null) input = { ...input, date: statementDay(input.date, 'The payment date') };
+  // Default: today's LOCAL calendar day at UTC midnight (the app's date convention) — `new Date()`
+  // dated an evening payment west of UTC on tomorrow.
+  const payDate =
+    input.date !== undefined && input.date !== null && input.date !== ''
+      ? statementDay(input.date, 'The payment date')
+      : new Date(`${todayISO()}T00:00:00.000Z`);
   if (input.memo != null && typeof input.memo !== 'string') throw validation('The memo must be text.');
 
   const [gl] = await ctx.db
@@ -1474,13 +1522,13 @@ export async function payCreditCardBalance(
 
   // p1 fx: a foreign-currency card's statement balance is in the card's currency.
   const cardCurrency = await foreignCurrencyOfAccount(ctx, recon.glAccountId);
-  if (cardCurrency) return payForeignCreditCard(ctx, recon, gl.name, cardCurrency, input);
+  if (cardCurrency) return payForeignCreditCard(ctx, recon, gl.name, cardCurrency, { ...input, date: payDate });
 
   return payCreditCard(ctx, {
     creditCardAccountId: recon.glAccountId,
     paymentAccountId: input.paymentAccountId,
     amount: input.amount ?? recon.statementBalance,
-    date: input.date ?? new Date(),
+    date: payDate,
     reconciliationId,
     memo: input.memo ?? `Credit card payment — ${gl.name}`,
   });

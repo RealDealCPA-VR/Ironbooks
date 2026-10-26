@@ -72,6 +72,24 @@ export function registerEntryBlockedReason(account: Pick<PlanAccount, 'subtype'>
   return FORM_ONLY_SUBTYPES[account.subtype] ?? null;
 }
 
+/**
+ * Accounts whose balance is a list another form keeps (QB): Undeposited Funds is the payments
+ * waiting in Make Deposits; an inventory asset account is the value of the inventory items. An
+ * amount posted there any other way — a transfer, a deposit line, cash back, a bank-feed line —
+ * makes the account's balance differ from that list for good. Why `account` can't be used on such
+ * a form, or null when it can.
+ */
+export function subledgerAccountReason(account: { type: string; subtype?: string | null; name?: string | null }): string | null {
+  const name = account.name ? `"${account.name}"` : 'That account';
+  if (isUndepositedFunds(account)) {
+    return `${name} is the Undeposited Funds account: only Receive Payments and Sales Receipts put money there, and Make Deposits takes it out. An amount moved there any other way could never be deposited.`;
+  }
+  if (account.type === 'asset' && account.subtype === 'inventory') {
+    return `${name} is an inventory asset account: its balance is the value of your inventory items, kept by purchases, sales and inventory adjustments. An amount moved there directly would not be in the inventory valuation; use Adjust Quantity/Value on Hand instead.`;
+  }
+  return null;
+}
+
 /** Debit-normal accounts grow with a debit (assets and expenses). */
 function debitNormal(a: Pick<PlanAccount, 'type'>): boolean {
   return a.type === 'asset' || a.type === 'expense';
