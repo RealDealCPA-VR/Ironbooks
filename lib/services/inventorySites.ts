@@ -421,6 +421,19 @@ export async function updateBin(ctx: ServiceContext, id: string, patch: { name?:
     if (patch.name !== undefined) {
       name = patch.name.trim();
       if (!name) throw validation('Bin name cannot be empty.');
+      // Bin names are unique within their site (as createBin checks).
+      const [dup] = await tx.db
+        .select({ id: inventoryBins.id })
+        .from(inventoryBins)
+        .where(
+          and(
+            eq(inventoryBins.companyId, tx.companyId),
+            eq(inventoryBins.siteId, before.siteId),
+            ne(inventoryBins.id, id),
+            sql`lower(${inventoryBins.name}) = lower(${name})`,
+          ),
+        );
+      if (dup) throw validation(`This site already has a bin named "${name}".`);
     }
     if (patch.isActive === false && before.isActive) {
       // Making a bin inactive is deleting it from the list: refused while an Accountant's Copy is out (I1).

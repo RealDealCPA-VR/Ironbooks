@@ -33,6 +33,7 @@ import { createItemReceipt, voidItemReceipt } from './itemReceipts';
 import { createCreditMemo, voidCreditMemo } from './creditMemos';
 import { trialBalance } from './reports';
 import { verifySiteInvariants } from './inventorySiteReports';
+import { createBin, createSite, listBins, updateBin } from './inventorySites';
 import { handleBulkPost } from '@/lib/lists/bulkRoute';
 import { builtinRole, unionRoles } from '@/lib/permissions/model';
 import { createEntry, listEntries } from './lists/simpleLists';
@@ -550,6 +551,16 @@ describe('review5 inventory', () => {
     // Renaming is still fine.
     await expect(updateType(ctx, 'vendor', t.id, { name: 'Freight & Haulage' })).resolves.toBeTruthy();
     expect((await listTypes(ctx, 'vendor')).find((x) => x.id === t.id)?.isActive).toBe(true);
+  });
+
+  it('sites: renaming a bin to the name of another bin at the same site is refused (as creating one is)', async () => {
+    const site = await createSite(ctx, { name: 'Back room' });
+    const a = await createBin(ctx, { siteId: site.id, name: 'A1' });
+    const b = await createBin(ctx, { siteId: site.id, name: 'B1' });
+    await expect(createBin(ctx, { siteId: site.id, name: 'a1' })).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(updateBin(ctx, b.id, { name: 'a1' })).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(updateBin(ctx, a.id, { name: 'a1' })).resolves.toBeTruthy(); // its own name, other case
+    expect((await listBins(ctx, { siteId: site.id })).map((x) => x.name).sort()).toEqual(['B1', 'a1']);
   });
 
   // ---- permissions ----
