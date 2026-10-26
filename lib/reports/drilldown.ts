@@ -215,6 +215,9 @@ export function drilldownApiUrl(
 /** A safe in-app "back" target (relative path only — never an absolute or protocol URL). */
 export function safeBackHref(back: string | null | undefined): string | null {
   if (!back || !back.startsWith('/') || back.startsWith('//') || back.includes('\\')) return null;
+  // Browsers drop tabs / line breaks from a URL before parsing it ('/\t/host' → '//host', another
+  // site), so no whitespace or control character may appear at all (query values arrive encoded).
+  if (/[\s\u0000-\u001f\u007f]/.test(back)) return null;
   return back;
 }
 
