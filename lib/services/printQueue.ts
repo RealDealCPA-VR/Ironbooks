@@ -18,6 +18,7 @@
  * a check PDF needs: "print on check as" name, vendor account number on the memo line, voucher
  * detail (expense lines / bills paid / paycheck lines).
  */
+import { isBankAccount } from '@/lib/accountTypes';
 import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -102,6 +103,40 @@ async function checkingAccount(ctx: ServiceContext) {
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1000')));
   return row ?? null;
+}
+
+/**
+ * The bank account each paycheck was written on, by its journal entry: the bank account its entry
+ * credits with the net pay (Preferences > Payroll paycheck account, or the pay run's). Paychecks
+ * used to be listed, numbered and printed as if they were all drawn on 1000 Checking.
+ */
+async function paycheckBankAccounts(
+  ctx: ServiceContext,
+  entryIds: string[],
+): Promise<Map<string, { id: string; name: string }>> {
+  const out = new Map<string, { id: string; name: string }>();
+  if (entryIds.length === 0) return out;
+  const rows = await ctx.db
+    .select({
+      entryId: journalEntryLines.journalEntryId,
+      id: accounts.id,
+      name: accounts.name,
+      type: accounts.type,
+      subtype: accounts.subtype,
+    })
+    .from(journalEntryLines)
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+    .where(
+      and(
+        eq(accounts.companyId, ctx.companyId),
+        inArray(journalEntryLines.journalEntryId, entryIds),
+        sql`COALESCE(${journalEntryLines.credit}, 0) > 0`,
+      ),
+    );
+  for (const r of rows) {
+    if (!out.has(r.entryId) && isBankAccount(r)) out.set(r.entryId, { id: r.id, name: r.name });
+  }
+  return out;
 }
 
 /** "Print on check as" name, else the vendor's display name. */
@@ -227,24 +262,29 @@ export async function listPrintQueue(
   }
 
   const checking = await checkingAccount(ctx);
-  if (!opts?.paymentAccountId || opts.paymentAccountId === checking?.id) {
-    const pcRows = await ctx.db
-      .select({ p: paychecks, first: employees.firstName, last: employees.lastName })
-      .from(paychecks)
-      .innerJoin(employees, eq(paychecks.employeeId, employees.id))
-      .where(and(eq(paychecks.companyId, ctx.companyId), eq(paychecks.toPrint, true), isNull(paychecks.voidedAt)));
-    for (const r of pcRows) {
-      out.push({
-        source: 'paycheck',
-        id: r.p.id,
-        date: r.p.payDate,
-        payee: `${r.first} ${r.last}`.trim(),
-        amount: toAmountString(r.p.netPay),
-        memo: 'Paycheck',
-        paymentAccountId: checking?.id ?? null,
-        paymentAccountName: checking?.name ?? null,
-      });
-    }
+  const pcRows = await ctx.db
+    .select({ p: paychecks, first: employees.firstName, last: employees.lastName })
+    .from(paychecks)
+    .innerJoin(employees, eq(paychecks.employeeId, employees.id))
+    .where(and(eq(paychecks.companyId, ctx.companyId), eq(paychecks.toPrint, true), isNull(paychecks.voidedAt)));
+  const bankOf = await paycheckBankAccounts(
+    ctx,
+    pcRows.map((r) => r.p.postedEntryId).filter((x): x is string => Boolean(x)),
+  );
+  for (const r of pcRows) {
+    // The account the paycheck was written on (1000 Checking for one with no bank line).
+    const bank = (r.p.postedEntryId ? bankOf.get(r.p.postedEntryId) : undefined) ?? checking;
+    if (opts?.paymentAccountId && bank?.id !== opts.paymentAccountId) continue;
+    out.push({
+      source: 'paycheck',
+      id: r.p.id,
+      date: r.p.payDate,
+      payee: `${r.first} ${r.last}`.trim(),
+      amount: toAmountString(r.p.netPay),
+      memo: 'Paycheck',
+      paymentAccountId: bank?.id ?? null,
+      paymentAccountName: bank?.name ?? null,
+    });
   }
 
   return out.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
@@ -320,10 +360,13 @@ async function markPaycheckPrintedInTx(
   if (!pc) throw notFound('Paycheck');
   if (pc.voidedAt) throw new ServiceError('CONFLICT', 'This paycheck is void and cannot be printed.');
   if (!pc.toPrint) throw new ServiceError('CONFLICT', 'This paycheck is not in the print queue.');
-  const checking = await checkingAccount(ctx);
-  if (!checking) throw notFound('Checking account (1000)');
+  // Numbered in the sequence of the bank account the paycheck was written on.
+  const bank =
+    (pc.postedEntryId ? (await paycheckBankAccounts(ctx, [pc.postedEntryId])).get(pc.postedEntryId) : undefined) ??
+    (await checkingAccount(ctx));
+  if (!bank) throw notFound('Checking account (1000)');
   const checkNumber = await allocateCheckNumber(ctx, {
-    paymentAccountId: checking.id,
+    paymentAccountId: bank.id,
     number: input.checkNumber,
     exclude: { source: 'paycheck', id: pc.id },
     allowDuplicate: input.allowDuplicateNumber,

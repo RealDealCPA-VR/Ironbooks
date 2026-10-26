@@ -509,6 +509,42 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect((await getPurchaseOrder(ctx, po.id)).status).toBe('open');
   });
 
+  it('M: paychecks paid from a payroll bank account print and number on THAT account', async () => {
+    const { createEmployee, runPaycheck } = await import('./payroll');
+    const { updateCompany } = await import('./company');
+    const { listPrintQueue, queuePaychecks, markPrinted } = await import('./printQueue');
+    const { nextCheckNumber } = await import('./checkNumbers');
+    const payroll = (await createAccount(ctx, { code: '1015', name: 'Payroll Checking', type: 'asset' as never, subtype: 'checking' })).id;
+    const v = await newVendor();
+    // Payroll Checking's own sequence starts at 3001; Checking (1000) is at 9001.
+    await createExpense(ctx, { vendorId: v.id, date: d('2026-11-01'), method: 'check', reference: '3001', paymentAccountId: payroll, lines: [{ accountId: acct['6300'], amount: '1.00' }] });
+    await createExpense(ctx, { vendorId: v.id, date: d('2026-11-01'), method: 'check', reference: '9001', paymentAccountId: acct['1000'], lines: [{ accountId: acct['6300'], amount: '1.00' }] });
+    await updateCompany(ctx, { settings: { defaultPaycheckAccountId: payroll } } as never);
+    const emp = await createEmployee(ctx, { firstName: 'Pat', lastName: `Payroll ${++seq}`, payType: 'salary', payRate: '52000.00' } as never);
+    const pc = await runPaycheck(ctx, {
+      employeeId: emp.id,
+      payDate: d('2026-11-06'),
+      grossPay: '1000.00',
+      taxes: [],
+      employerTaxes: [],
+      deductions: [],
+    } as never);
+    await queuePaychecks(ctx, [pc.id]);
+    // Print Checks for Payroll Checking lists the paycheck; Checking does not.
+    const onPayroll = await listPrintQueue(ctx, { paymentAccountId: payroll });
+    expect(onPayroll.some((q) => q.source === 'paycheck' && q.id === pc.id)).toBe(true);
+    expect(onPayroll.find((q) => q.id === pc.id)?.paymentAccountId).toBe(payroll);
+    const onChecking = await listPrintQueue(ctx, { paymentAccountId: acct['1000'] });
+    expect(onChecking.some((q) => q.id === pc.id)).toBe(false);
+    // Printing numbers it in Payroll Checking's sequence.
+    const printed = (await markPrinted(ctx, { source: 'paycheck', id: pc.id })) as { checkNumber: string | null };
+    expect(printed.checkNumber).toBe('3002');
+    // And the next check number of each account follows its own checks.
+    expect(await nextCheckNumber(ctx, payroll)).toBe('3003');
+    expect(await nextCheckNumber(ctx, acct['1000'])).toBe('9002');
+    await updateCompany(ctx, { settings: { defaultPaycheckAccountId: null } } as never);
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
