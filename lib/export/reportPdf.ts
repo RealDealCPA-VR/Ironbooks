@@ -73,16 +73,26 @@ export function pdfSafeText(text: string, font: PDFFont): string {
   return out;
 }
 
-/** Truncate text (with ellipsis) so it fits in maxWidth at the given size. */
-function fitText(text: string, font: PDFFont, size: number, maxWidth: number): string {
+/**
+ * Truncate text (with ellipsis) so it fits in maxWidth at the given size. The cut is found by
+ * binary search: dropping one character at a time measured the whole string again per step
+ * (quadratic), so a report with long memos took minutes to export (8,000 characters: 1.6 s for
+ * ONE cell).
+ */
+export function fitText(text: string, font: Pick<PDFFont, 'widthOfTextAtSize' | 'getCharacterSet'>, size: number, maxWidth: number): string {
   // pdf-lib's WinAnsi encoder throws on characters outside the codepage — replace them rather
   // than fail the whole export.
-  let t = pdfSafeText(text, font);
+  const t = pdfSafeText(text, font as PDFFont);
   if (font.widthOfTextAtSize(t, size) <= maxWidth) return t;
-  while (t.length > 1 && font.widthOfTextAtSize(`${t}…`, size) > maxWidth) {
-    t = t.slice(0, -1);
+  // Longest prefix (at least one character) that fits with the ellipsis.
+  let lo = 1;
+  let hi = t.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (font.widthOfTextAtSize(`${t.slice(0, mid)}…`, size) <= maxWidth) lo = mid;
+    else hi = mid - 1;
   }
-  return `${t}…`;
+  return `${t.slice(0, Math.max(1, lo))}…`;
 }
 
 /**

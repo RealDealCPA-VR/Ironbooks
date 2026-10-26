@@ -32,3 +32,35 @@ describe('buildReportPdf', () => {
     expect((await PDFDocument.load(bytes)).getPageCount()).toBe(1);
   });
 });
+
+/**
+ * Long cells: fitText dropped one character at a time and measured the whole string again at each
+ * step (quadratic). One 8,000-character memo took 1.6 s to fit; a General Ledger with long bank
+ * descriptions took minutes to export. The cut is now a binary search with the same result.
+ */
+describe('fitText on long text', () => {
+  it('measures a handful of times, not once per character, and cuts at the same place', async () => {
+    const { fitText } = await import('./reportPdf');
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    let calls = 0;
+    const counting = {
+      getCharacterSet: () => font.getCharacterSet(),
+      widthOfTextAtSize: (t: string, s: number) => {
+        calls++;
+        return font.widthOfTextAtSize(t, s);
+      },
+    };
+    const long = 'Deposit from ACME CORP ref 0042 '.repeat(250); // 8,000 characters
+    const out = fitText(long, counting, 8.5, 120);
+    expect(calls).toBeLessThan(40);
+    expect(out.endsWith('…')).toBe(true);
+    expect(font.widthOfTextAtSize(out, 8.5)).toBeLessThanOrEqual(120);
+    // The longest prefix that fits: one more character would not.
+    const kept = out.slice(0, -1);
+    expect(font.widthOfTextAtSize(`${long.slice(0, kept.length + 1)}…`, 8.5)).toBeGreaterThan(120);
+    // Short text that fits is returned as is; a single wide character still shows.
+    expect(fitText('Rent', counting, 8.5, 120)).toBe('Rent');
+    expect(fitText('WWWW', counting, 8.5, 1)).toBe('W…');
+  });
+});
