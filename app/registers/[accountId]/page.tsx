@@ -232,6 +232,9 @@ function NewTransactionMenu() {
 // Register page
 // ---------------------------------------------------------------------------
 
+/** Rows a register opens on (the newest); "Show all" loads the rest. */
+const REGISTER_PAGE_ROWS = 1000;
+
 function RegisterPageInner() {
   const { accountId } = useParams<{ accountId: string }>();
   const searchParams = useSearchParams();
@@ -246,12 +249,14 @@ function RegisterPageInner() {
   const [resultFrom, setResultFrom] = useState('');
   const [loading, setLoading] = useState(true);
   const [detailId, setDetailId] = useState<string | null>(null);
+  /** Show every row instead of the newest REGISTER_PAGE_ROWS (large registers open fast). */
+  const [showAll, setShowAll] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const listKeys = useListKeys({ ref: scrollRef });
 
   const load = useCallback(
-    async (fromDate: string, toDate: string, q: string) => {
+    async (fromDate: string, toDate: string, q: string, all = showAll) => {
       if (!accountId) return;
       setLoading(true);
       try {
@@ -259,6 +264,8 @@ function RegisterPageInner() {
         if (fromDate) params.set('from', fromDate);
         if (toDate) params.set('to', toDate);
         if (q.trim()) params.set('search', q.trim());
+        // Open on the newest rows: years of history would otherwise all be sent and drawn.
+        if (!all) params.set('last', String(REGISTER_PAGE_ROWS));
         const qs = params.toString();
         const data = await api.get<{ register: RegisterResult }>(
           `/api/registers/${accountId}${qs ? `?${qs}` : ''}`,
@@ -271,7 +278,7 @@ function RegisterPageInner() {
         setLoading(false);
       }
     },
-    [accountId],
+    [accountId, showAll],
   );
 
   // Initial load (honors ?from=&to= QuickZoom links from reports).
@@ -436,6 +443,27 @@ function RegisterPageInner() {
                         {fxCur ? formatCurrency(result.foreignOpeningBalance ?? '0', fxCur) : formatCurrency(result.openingBalance)}
                       </Td>
                       {fxCur && <Td numeric className="text-navy/60">{formatCurrency(result.openingBalance)}</Td>}
+                    </tr>
+                  )}
+
+                  {result.rows.length < result.totalRows && (
+                    <tr>
+                      <Td colSpan={fxCur ? 9 : 8} className="py-2 text-center text-xs text-navy/60">
+                        Showing the latest {result.rows.length.toLocaleString('en-US')} of{' '}
+                        {result.totalRows.toLocaleString('en-US')} transactions.{' '}
+                        <button
+                          type="button"
+                          className="text-electric font-medium hover:underline"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowAll(true);
+                            load(from, to, search, true);
+                          }}
+                        >
+                          Show all
+                        </button>{' '}
+                        or narrow the dates above.
+                      </Td>
                     </tr>
                   )}
 

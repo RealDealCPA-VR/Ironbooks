@@ -139,3 +139,29 @@ describe('banking routes: bad input is a 400', () => {
     expect(r.status).toBe(400);
   });
 });
+
+describe('register route on a long register', () => {
+  it('GET /api/registers/[accountId]?last=N sends only the newest N rows, with their true running balance', async () => {
+    const { postJournalEntry } = await import('./posting');
+    const { GET: registerGET } = await import('@/app/api/registers/[accountId]/route');
+    for (const [day, amt] of [['2026-01-05', '100.00'], ['2026-02-05', '50.00'], ['2026-03-05', '25.00']] as const) {
+      await postJournalEntry({ db, companyId, userId: owner }, {
+        date: new Date(`${day}T00:00:00.000Z`),
+        description: `Owner money ${day}`,
+        lines: [
+          { accountId: acct['1010'], debit: amt },
+          { accountId: acct['3000'], credit: amt },
+        ],
+      });
+    }
+    as(owner, 'GET', '/api/registers/[accountId]');
+    const res = await registerGET(req('GET', `/api/registers/${acct['1010']}?last=2`), { params: Promise.resolve({ accountId: acct['1010'] }) });
+    expect(res.status).toBe(200);
+    const { register } = await res.json();
+    expect(register.totalRows).toBe(3);
+    expect(register.offset).toBe(1);
+    expect(register.rows.map((r: { runningBalance: string }) => r.runningBalance)).toEqual(['150.00', '175.00']);
+    const bad = await registerGET(req('GET', `/api/registers/${acct['1010']}?last=-1`), { params: Promise.resolve({ accountId: acct['1010'] }) });
+    expect(bad.status).toBe(400);
+  });
+});
