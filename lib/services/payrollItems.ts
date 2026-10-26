@@ -29,6 +29,7 @@
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { Money } from '@/lib/money';
 import { accounts, payrollItems } from '@/lib/db/schema';
+import { assertNotControlLineAccount } from './posting';
 import {
   inferDeductionTracking,
   inferEmployeeTaxTracking,
@@ -101,10 +102,16 @@ export type PayrollItem = typeof payrollItems.$inferSelect;
 
 async function assertAccountInCompany(ctx: ServiceContext, accountId: string, label: string) {
   const [row] = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, accountId)));
   if (!row) throw validation(`${label} account does not exist in this company.`);
+  // A paycheck carries no customer / vendor name, so the posting guard refuses every paycheck
+  // that would touch A/R or A/P — refuse the mapping here, where the cause is clear.
+  assertNotControlLineAccount(row, `The ${label.toLowerCase()} account`);
+  if (row.subtype === 'non_posting') {
+    throw validation(`"${row.name}" is a non-posting account and cannot be a payroll item's ${label.toLowerCase()} account.`);
+  }
 }
 
 function normalizeRate(rate: string | number | null | undefined): string | null {

@@ -52,6 +52,8 @@ import { GET as mileageGET } from '@/app/api/mileage/route';
 import { POST as stateSettingsPOST } from '@/app/api/payroll/state-settings/route';
 import { POST as workersCompPOST } from '@/app/api/payroll/workers-comp/route';
 import { POST as expenseReportsPOST } from '@/app/api/expense-reports/route';
+import { POST as payLiabPOST } from '@/app/api/pay-liabilities/route';
+import { POST as payByItemPOST } from '@/app/api/pay-liabilities/by-item/route';
 
 let db: DB;
 let owner: string;
@@ -207,6 +209,22 @@ describe('bad input answers 400', () => {
     }
     const ok = await ownerCall(mileageGET as Handler, 'GET', '/api/mileage', { query: '?summary=true&from=2026-01-01&to=2026-12-31' });
     expect(ok.status).toBe(200);
+  });
+
+  it('POST /api/pay-liabilities and /by-item with a malformed date or amount', async () => {
+    const [bank] = await db.select().from(accounts).where(and(eq(accounts.companyId, companyId), eq(accounts.code, '1000')));
+    const lump = (body: Record<string, unknown>) =>
+      ownerCall(payLiabPOST as Handler, 'POST', '/api/pay-liabilities', { body: { type: 'payroll', paymentAccountId: bank.id, ...body } });
+    const byItem = (body: Record<string, unknown>) =>
+      ownerCall(payByItemPOST as Handler, 'POST', '/api/pay-liabilities/by-item', { body: { paymentAccountId: bank.id, ...body } });
+    for (const r of [
+      await lump({ amount: '10.00', date: 'garbage' }),
+      await lump({ amount: '10.00', date: '2026-02-30' }),
+      await lump({ amount: 'abc', date: '2026-03-15' }),
+      await byItem({ date: 'garbage', items: [{ name: 'Federal Income Tax', amount: '10.00' }] }),
+    ]) {
+      expect(r.status).toBe(400);
+    }
   });
 
   it('POST /api/payroll/state-settings, /api/payroll/workers-comp and /api/expense-reports with text for a number', async () => {

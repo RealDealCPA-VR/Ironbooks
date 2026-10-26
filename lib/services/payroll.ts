@@ -1687,8 +1687,9 @@ export interface PayRunEmployeeInput {
   /** Itemized deductions; lines may carry payrollItemId (pre-tax / garnishment / GL mapping). */
   deductions?: PaycheckLineInput[];
   /**
-   * Time entries pulled into this check. Hours = sum of entry hours, paid at the
-   * employee's pay rate (the hourly earning line). Entries are tagged
+   * Time entries pulled into this check. For an hourly employee, hours = sum of entry hours,
+   * paid at the employee's pay rate (the hourly earning line); a salaried employee is paid the
+   * period's salary. Entries are tagged
    * `[payroll:<paycheckId>]` after the check posts so they cannot be paid twice.
    */
   timeEntryIds?: string[];
@@ -1726,8 +1727,9 @@ export interface PayRunEmployeeResult {
  *
  * Defaults per employee when no override is given:
  *   hourly:     hours (input.hours, or pulled time, or 80) x payRate
- *   salary:     payRate / periodsPerYear (annual salary spread per period)
+ *   salary:     payRate / periodsPerYear (annual salary spread per period), pulled time or not
  *   commission: requires an explicit amount
+ * Pulled time entries are marked as used by the check for every pay type.
  * Withholding uses the employee's W-4 filing status and is auto-computed.
  */
 export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput) {
@@ -1814,10 +1816,14 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
         }
 
         // --- Default earnings ---
+        // Pulled time sets the HOURS of an hourly check only. A salaried employee's pay is the
+        // salary for the period whatever the timesheet says (hours x the ANNUAL salary paid
+        // $2,080,000 for a 40-hour week); a commission check still needs its amount. The time is
+        // marked as used by the check either way.
         const earnings: EarningLineInput[] = [];
         if (empInput.amount != null && empInput.amount !== '') {
           earnings.push({ kind: 'regular', amount: empInput.amount });
-        } else if (employee.payType === 'hourly' || timeHours !== null) {
+        } else if (employee.payType === 'hourly') {
           const hours =
             timeHours ??
             (empInput.hours != null && empInput.hours !== ''

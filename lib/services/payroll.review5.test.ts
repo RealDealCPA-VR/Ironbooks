@@ -139,6 +139,35 @@ describe('review5 payroll / time / mileage / expense reports', { timeout: 300_00
       expect(again.results[0].grossPay).toBe('280.00');
     });
 
+    it("pulling time into a salaried employee's check pays the salary, not hours x the annual salary", async () => {
+      const ctx = await newCompany('R5 Salary Pulled Time');
+      const emp = await createEmployee(ctx, { firstName: 'Sal', lastName: 'Aried', payType: 'salary', payRate: '52000' });
+      const t = await createTimeEntry(ctx, { employeeId: emp.id, date: d('2026-03-02'), hours: '40', billable: false });
+      const run = await createPayRun(ctx, {
+        payDate: d('2026-03-06'),
+        periodsPerYear: 26,
+        employees: [{ employeeId: emp.id, timeEntryIds: [t.id] }],
+      });
+      expect(run.results[0].ok).toBe(true);
+      expect(run.results[0].grossPay).toBe('2000.00');
+      // The time is still marked as paid by this check.
+      const period = { employeeId: emp.id, periodStart: d('2026-03-01'), periodEnd: d('2026-03-07') };
+      expect((await unpaidTimeForPayroll(ctx, period)).entries).toHaveLength(0);
+
+      // A commission employee still needs an explicit amount, pulled time or not.
+      const com = await createEmployee(ctx, { firstName: 'Com', lastName: 'Mission', payType: 'commission', payRate: '10' });
+      const t2 = await createTimeEntry(ctx, { employeeId: com.id, date: d('2026-03-02'), hours: '40', billable: false });
+      const bad = await createPayRun(ctx, { payDate: d('2026-03-06'), employees: [{ employeeId: com.id, timeEntryIds: [t2.id] }] }).catch((e) => e);
+      expect(bad).toMatchObject({ code: 'VALIDATION' });
+    });
+
+    it('time that rounds to 0.00 hours is refused (it was stored as a zero-hour entry)', async () => {
+      const ctx = await newCompany('R5 Zero Hours');
+      await expect(createTimeEntry(ctx, { date: d('2026-03-02'), hours: '0.004' })).rejects.toMatchObject({ code: 'VALIDATION' });
+      const t = await createTimeEntry(ctx, { date: d('2026-03-02'), hours: '1' });
+      await expect(updateTimeEntry(ctx, t.id, { hours: '0.001' })).rejects.toMatchObject({ code: 'VALIDATION' });
+    });
+
     it('paid time cannot change hours, date or employee, or be deleted; a description edit keeps it paid', async () => {
       const { ctx, emp, t1 } = await paidTime('R5 Paid Time Locked');
       const other = await createEmployee(ctx, { firstName: 'Ola', lastName: 'Other', payType: 'hourly', payRate: '20' });
@@ -354,6 +383,17 @@ describe('review5 payroll / time / mileage / expense reports', { timeout: 300_00
     await expect(updatePayrollItem(ctx, vision.id, { name: ' dental ' })).rejects.toMatchObject({ code: 'VALIDATION' });
     // Renaming to its own name (different case) is fine.
     expect((await updatePayrollItem(ctx, vision.id, { name: 'VISION' })).name).toBe('VISION');
+  });
+
+  it('a payroll item cannot map to A/R or A/P (every paycheck using it would be refused)', async () => {
+    const ctx = await newCompany('R5 Item Control Accounts');
+    const ar = await acct(ctx, '1200');
+    const ap = await acct(ctx, '2000');
+    const wages = await acct(ctx, '6500');
+    await expect(createPayrollItem(ctx, { name: 'Bad Liab', kind: 'deduction', liabilityAccountId: ap.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(createPayrollItem(ctx, { name: 'Bad Wage', kind: 'earning', expenseAccountId: ar.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    const ok = await createPayrollItem(ctx, { name: 'Good Wage', kind: 'earning', expenseAccountId: wages.id });
+    await expect(updatePayrollItem(ctx, ok.id, { expenseAccountId: ap.id })).rejects.toMatchObject({ code: 'VALIDATION' });
   });
 
   // -------------------------------------------------------------------------

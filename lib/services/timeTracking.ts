@@ -100,9 +100,18 @@ async function assertTimeRefsOwned(
   if (refs.serviceItemId) await assertRefInCompany(ctx, items, refs.serviceItemId, 'Service item');
 }
 
+/** Hours as stored (2 decimals): must be a finite number that is still above zero once rounded. */
+function hoursOf(raw: string | number): ReturnType<typeof Money.of> {
+  const h = Money.of(raw);
+  if (!h.isFinite()) throw validation('Hours must be a number.');
+  // hours is numeric(10,2): 0.004 used to pass the check and be saved as a 0.00-hour entry.
+  const rounded = Money.round2(h);
+  if (rounded.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
+  return rounded;
+}
+
 export async function createTimeEntry(ctx: ServiceContext, input: TimeEntryInput) {
-  const hours = Money.of(input.hours);
-  if (hours.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
+  const hours = hoursOf(input.hours);
 
   // Verify customer belongs to company if supplied.
   if (input.customerId) {
@@ -161,10 +170,7 @@ export async function updateTimeEntry(
     throw new ServiceError('CONFLICT', 'Cannot edit a time entry that has already been invoiced.');
   }
 
-  if (update.hours !== undefined) {
-    const h = Money.of(update.hours);
-    if (h.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
-  }
+  if (update.hours !== undefined) hoursOf(update.hours);
 
   // Time already paid on a paycheck: its hours, day and employee are what the check paid, so they
   // stay as they are until the paycheck is voided (which releases the entry). The description may
