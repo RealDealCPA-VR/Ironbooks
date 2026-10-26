@@ -1255,18 +1255,79 @@ export async function getAdjustingEntries(
   if (opts.from) conds.push(gte(journalEntries.date, opts.from));
   if (opts.to) conds.push(onOrBeforeDay(opts.to));
   const heads = await ctx.db
-    .select({ id: journalEntries.id })
+    .select()
     .from(journalEntries)
     .where(and(...conds))
     .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
+  // Lines and names for every entry in a few batched queries (not getEntry per entry: two or more
+  // queries each made a year of adjusting entries slow to open).
+  const linesByEntry = new Map<string, JournalEntryLine[]>();
+  const allLines: Array<JournalEntryLine & { journalEntryId: string }> = [];
+  for (let i = 0; i < heads.length; i += 500) {
+    const chunk = heads.slice(i, i + 500).map((h) => h.id);
+    const rows = await ctx.db
+      .select({
+        journalEntryId: journalEntryLines.journalEntryId,
+        id: journalEntryLines.id,
+        accountId: journalEntryLines.accountId,
+        accountCode: accounts.code,
+        accountName: accounts.name,
+        debit: journalEntryLines.debit,
+        credit: journalEntryLines.credit,
+        memo: journalEntryLines.memo,
+        classId: journalEntryLines.classId,
+        className: classes.name,
+        entityType: journalEntryLines.entityType,
+        entityId: journalEntryLines.entityId,
+      })
+      .from(journalEntryLines)
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .leftJoin(classes, eq(journalEntryLines.classId, classes.id))
+      .where(inArray(journalEntryLines.journalEntryId, chunk))
+      .orderBy(asc(journalEntryLines.createdAt));
+    for (const l of rows) {
+      allLines.push({
+        ...l,
+        debit: l.debit ?? null,
+        credit: l.credit ?? null,
+        memo: l.memo ?? null,
+        classId: l.classId ?? null,
+        className: l.className ?? null,
+        entityType: (l.entityType as JournalEntityType | null) ?? null,
+        entityId: l.entityId ?? null,
+        entityName: null,
+      });
+    }
+  }
+  const names = await resolveEntityNames(ctx, allLines);
+  for (const { journalEntryId, ...l } of allLines) {
+    const line: JournalEntryLine = {
+      ...l,
+      entityName: l.entityType && l.entityId ? (names.get(`${l.entityType}:${l.entityId}`) ?? null) : null,
+    };
+    linesByEntry.set(journalEntryId, [...(linesByEntry.get(journalEntryId) ?? []), line]);
+  }
   const entries: JournalEntryDetail[] = [];
   let debit = Money.zero();
   let credit = Money.zero();
-  for (const h of heads) {
-    const e = await getEntry(ctx, h.id);
-    entries.push(e);
-    if (e.status !== 'posted') continue;
-    for (const l of e.lines) {
+  for (const entry of heads) {
+    const lines = linesByEntry.get(entry.id) ?? [];
+    entries.push({
+      id: entry.id,
+      entryNumber: entry.entryNumber,
+      date: entry.date,
+      description: entry.description,
+      reference: entry.reference ?? null,
+      status: entry.status,
+      sourceRef: entry.sourceRef ?? null,
+      isAdjusting: entry.isAdjusting ?? false,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+      voidedAt: entry.voidedAt ?? null,
+      lines,
+    });
+    if (entry.status !== 'posted') continue;
+    for (const l of lines) {
       debit = debit.plus(Money.of(l.debit));
       credit = credit.plus(Money.of(l.credit));
     }

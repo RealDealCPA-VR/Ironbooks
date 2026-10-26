@@ -13,11 +13,11 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { NextRequest } from 'next/server';
-import { getDb, closeDb, type DB } from '@/lib/db';
+import { getDb, closeDb, openDb, type DB } from '@/lib/db';
 import { users, companies, classes, journalEntries } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { createAccount, getAccount } from './accounts';
-import { createManualEntry, getEntry, updateEntry } from './journal';
+import { createManualEntry, getAdjustingEntries, getEntry, updateEntry } from './journal';
 import { postJournalEntry } from './posting';
 
 let ctx: ServiceContext;
@@ -130,6 +130,35 @@ describe('journal entries (review round 5)', () => {
     // A well-formed edit still works.
     const res = await patch(good);
     expect(res.status).toBe(200);
+  });
+
+  it('D: the Adjusting Journal Entries report reads a constant number of queries, not 4 per entry', async () => {
+    for (let i = 0; i < 25; i++) {
+      await createManualEntry(ctx, {
+        date: d('2026-06-30'),
+        description: `Adjustment ${i}`,
+        isAdjusting: true,
+        lines: [
+          { accountId: acct['6400'], debit: `${i + 1}.00` },
+          { accountId: acct['1000'], credit: `${i + 1}.00` },
+        ],
+      });
+    }
+    const client = openDb(TEST_DIR).client;
+    const spy = vi.spyOn(client, 'query');
+    try {
+      const report = await getAdjustingEntries(ctx, { from: d('2026-06-01'), to: d('2026-06-30') });
+      expect(report.entries).toHaveLength(25);
+      expect(report.totalDebit).toBe('325.00');
+      expect(report.totalCredit).toBe('325.00');
+      expect(report.entries[3].lines.map((l) => [l.accountCode, l.debit, l.credit])).toEqual([
+        ['6400', '4.00', null],
+        ['1000', null, '4.00'],
+      ]);
+      expect(spy.mock.calls.length).toBeLessThanOrEqual(10);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('C: a class that belongs to another company is refused on a journal line', async () => {
