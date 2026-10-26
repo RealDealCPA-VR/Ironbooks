@@ -57,6 +57,7 @@ import {
   glFilterFromParams,
   isPLSection,
   layoutDetail,
+  ledgerTotalsByName,
   loadAccountMeta,
   naturalAmount,
   resolveAsOf,
@@ -92,7 +93,7 @@ async function ledgerByName(
 }
 
 function balanceSummary(
-  lines: GlLine[],
+  lines: Pick<GlLine, 'nameType' | 'nameId' | 'name' | 'natural'>[],
   nameType: NameType,
   detailKey: string,
   asOf: Date,
@@ -124,9 +125,22 @@ function balanceSummary(
   return { rows, total };
 }
 
+/**
+ * Balance per name on the A/R or A/P accounts as of a date. Accrual: summed in SQL per name
+ * (ledgerTotalsByName — every line, however large the file); cash basis: the cash-basis lines.
+ */
+async function balancesByName(ctx: ServiceContext, section: 'ar' | 'ap', p: ReportParams, asOf: Date) {
+  if (p.basis === 'cash') {
+    const { lines, truncated } = await ledgerByName(ctx, section, { ...p, customerId: undefined, vendorId: undefined }, { to: asOf });
+    return { totals: lines, truncated };
+  }
+  const meta = await loadAccountMeta(ctx);
+  return { totals: await ledgerTotalsByName(ctx, meta, { sections: [section], to: asOf, classId: p.classId }), truncated: false };
+}
+
 export async function customerBalanceSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
-  const { lines, truncated } = await ledgerByName(ctx, 'ar', { ...p, customerId: undefined }, { to: asOf });
+  const { totals: lines, truncated } = await balancesByName(ctx, 'ar', p, asOf);
   const { rows } = balanceSummary(lines, 'customer', 'customer-balance-detail', asOf);
   return {
     key: 'customer-balance-summary',
@@ -140,7 +154,7 @@ export async function customerBalanceSummary(ctx: ServiceContext, p: ReportParam
 
 export async function vendorBalanceSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
-  const { lines, truncated } = await ledgerByName(ctx, 'ap', { ...p, vendorId: undefined }, { to: asOf });
+  const { totals: lines, truncated } = await balancesByName(ctx, 'ap', p, asOf);
   const { rows } = balanceSummary(lines, 'vendor', 'vendor-balance-detail', asOf);
   return {
     key: 'vendor-balance-summary',
@@ -1139,7 +1153,8 @@ function addressLine(a: Record<string, string> | null | undefined): string {
 
 async function nameBalances(ctx: ServiceContext, section: 'ar' | 'ap', nameType: NameType): Promise<Map<string, Decimal>> {
   const meta = await loadAccountMeta(ctx);
-  const { lines } = await fetchGlLines(ctx, meta, { sections: [section], limit: 50000 });
+  // Every A/R / A/P line, summed per name in SQL (no line cap on a large file).
+  const lines = await ledgerTotalsByName(ctx, meta, { sections: [section] });
   const out = new Map<string, Decimal>();
   for (const l of lines) {
     if (l.nameType !== nameType || !l.nameId) continue;

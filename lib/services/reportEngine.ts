@@ -1192,6 +1192,8 @@ export const DEFAULT_LINE_LIMIT = 10000;
 
 /** Read caps of fetchGlLines (mutable for tests only). */
 export const GL_LIMITS = {
+  /** Most lines one fetchGlLines read returns. */
+  maxLines: 50000,
   /** Most raw lines a name / number-filtered read scans before filtering. */
   postFilterScan: 50000,
 };
@@ -1233,7 +1235,7 @@ export async function fetchGlLines(
   meta: Map<string, AccountMeta>,
   f: GlLineFilter,
 ): Promise<{ lines: GlLine[]; truncated: boolean }> {
-  const limit = Math.max(1, Math.min(f.limit ?? DEFAULT_LINE_LIMIT, 50000));
+  const limit = Math.max(1, Math.min(f.limit ?? DEFAULT_LINE_LIMIT, GL_LIMITS.maxLines));
   const conds: SQL[] = [eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted')];
   if (f.from) conds.push(gte(journalEntries.date, f.from));
   if (f.to) conds.push(lte(journalEntries.date, f.to));
@@ -1389,6 +1391,75 @@ export async function fetchGlLines(
     }
   }
   return { lines, truncated };
+}
+
+export interface NameTotal {
+  nameType: NameType | null;
+  nameId: string | null;
+  name: string;
+  /** Natural-sign total of the lines (the accounts' own section sign). */
+  natural: Decimal;
+}
+
+/**
+ * Posted totals per QB "Name" over the accounts of `sections` (accrual), summed in SQL — the
+ * same names fetchGlLines resolves (a line-level name wins over the entry's document name), but
+ * with no line cap: balance summaries on a large company file add up every line, not the first
+ * 50,000 of them. One row per (name, document, account) is read, never one per line.
+ */
+export async function ledgerTotalsByName(
+  ctx: ServiceContext,
+  meta: Map<string, AccountMeta>,
+  f: { sections: SectionKey[]; from?: Date; to?: Date; classId?: string },
+): Promise<NameTotal[]> {
+  const accountIds = [...meta.values()].filter((a) => f.sections.includes(a.section)).map((a) => a.id);
+  if (accountIds.length === 0) return [];
+  const conds: SQL[] = [eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted'), inArray(journalEntryLines.accountId, accountIds)];
+  if (f.from) conds.push(gte(journalEntries.date, f.from));
+  if (f.to) conds.push(lte(journalEntries.date, f.to));
+  if (f.classId) conds.push(eq(journalEntryLines.classId, f.classId));
+  const rows = await ctx.db
+    .select({
+      entityType: journalEntryLines.entityType,
+      entityId: journalEntryLines.entityId,
+      sourceRef: journalEntries.sourceRef,
+      accountId: journalEntryLines.accountId,
+      debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
+      credit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(...conds))
+    .groupBy(journalEntryLines.entityType, journalEntryLines.entityId, journalEntries.sourceRef, journalEntryLines.accountId);
+
+  const lineNamed = rows.filter((r) => r.entityType && r.entityId);
+  const docRefs = [...new Set(rows.filter((r) => !(r.entityType && r.entityId) && r.sourceRef).map((r) => r.sourceRef!))];
+  const docNames = await resolveEntryNames(ctx, docRefs.map((ref) => ({ id: ref, sourceRef: ref, reference: null })));
+  const lineNames = lineNamed.length ? await resolveEntityNames(ctx, lineNamed) : new Map<string, string>();
+  const custFull = lineNamed.some((r) => r.entityType === 'customer') ? await customerNames(ctx) : null;
+
+  const out = new Map<string, NameTotal>();
+  for (const r of rows) {
+    const a = meta.get(r.accountId);
+    if (!a) continue;
+    let n: { nameType: NameType | null; nameId: string | null; name: string };
+    if (r.entityType && r.entityId) {
+      n = {
+        nameType: r.entityType as NameType,
+        nameId: r.entityId,
+        name: (r.entityType === 'customer' ? custFull?.get(r.entityId)?.name : undefined) ?? lineNames.get(`${r.entityType}:${r.entityId}`) ?? '',
+      };
+    } else {
+      const d = r.sourceRef ? docNames.get(r.sourceRef) : undefined;
+      n = d ? { nameType: d.nameType, nameId: d.nameId, name: d.name } : { nameType: null, nameId: null, name: '' };
+    }
+    const key = `${n.nameType ?? ''}:${n.nameId ?? ''}`;
+    const cur = out.get(key) ?? { ...n, natural: Money.zero() };
+    cur.natural = cur.natural.plus(naturalAmount(a.section, r.debit, r.credit));
+    if (!cur.name && n.name) cur.name = n.name;
+    out.set(key, cur);
+  }
+  return [...out.values()];
 }
 
 /**

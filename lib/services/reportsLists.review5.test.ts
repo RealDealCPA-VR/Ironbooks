@@ -27,6 +27,7 @@ import { payBills } from './billPayments';
 import { createExpense } from './expenses';
 import { applyToBill, createVendorCredit } from './vendorCredits';
 import { runStandardReport } from './reportRegistry';
+import { GL_LIMITS } from './reportEngine';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-purchases');
 let db: DB;
@@ -130,5 +131,38 @@ describe('Unbilled Costs by Job', () => {
   it('a foreign bill line is shown in home currency', async () => {
     const r = await runStandardReport(ctx, 'unbilled-costs-by-job', {});
     expect(r.rows.find((x) => x.kind === 'grand')?.cells.amount).toBe('55.00'); // 50 EUR x 1.10
+  });
+});
+
+describe('balance summaries on a large file', () => {
+  it('Vendor Balance Summary and the contact list add up every A/P line, not the first N', async () => {
+    const cap = GL_LIMITS.maxLines;
+    GL_LIMITS.maxLines = 2; // stands in for the 50,000-line read on a big company file
+    try {
+      const r = await runStandardReport(ctx, 'vendor-balance-summary', { asOf: '2026-12-31' });
+      expect(cell(r, 'Local Supply', 'balance')).toBe('5.00'); // 20 billed - 10 credit - 5 paid
+      expect(cell(r, 'Euro Parts', 'balance')).toBe('385.00'); // 350 EUR at 1.10
+      expect(cell(r, 'TOTAL', 'balance')).toBe('390.00');
+      expect(r.truncated).toBeFalsy();
+      const list = await runStandardReport(ctx, 'vendor-contact-list', {});
+      expect(cell(list, 'Local Supply', 'balance')).toBe('5.00');
+      expect(cell(list, 'Euro Parts', 'balance')).toBe('385.00');
+    } finally {
+      GL_LIMITS.maxLines = cap;
+    }
+  });
+});
+
+describe('a capped report says so', () => {
+  it('Expenses by Vendor Summary that hit the line cap carries a note on the page', async () => {
+    const cap = GL_LIMITS.maxLines;
+    GL_LIMITS.maxLines = 2;
+    try {
+      const r = await runStandardReport(ctx, 'expenses-by-vendor-summary', range);
+      expect(r.truncated).toBe(true);
+      expect((r.notes ?? []).join(' ')).toMatch(/narrow/i);
+    } finally {
+      GL_LIMITS.maxLines = cap;
+    }
   });
 });
