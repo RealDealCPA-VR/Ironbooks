@@ -30,3 +30,10 @@ CREATE INDEX IF NOT EXISTS "sales_receipt_lines_receipt_idx" ON "sales_receipt_l
 CREATE INDEX IF NOT EXISTS "estimate_lines_estimate_idx" ON "estimate_lines" ("estimate_id");
 --> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "sales_order_lines_order_idx" ON "sales_order_lines" ("sales_order_id");
+--> statement-breakpoint
+-- Billable time & costs: the source an invoice line bills ({"kind":"bill_line"|"expense_line"|
+-- "time_entry","id":...}), so an invoice edit that removes the line (or moves the invoice to
+-- another customer) puts that cost or time back on the customer's Time/Costs list. NULL on lines
+-- that bill nothing and on lines saved before this column existed (those stay billed until the
+-- invoice is voided, as before).
+ALTER TABLE "invoice_lines" ADD COLUMN IF NOT EXISTS "billable_source" jsonb;

@@ -300,6 +300,8 @@ export async function billTimeToInvoice(
       quantity: e.hours,
       rate: resolvedRate,
       taxable: false as const,
+      // The invoice line remembers its time entry (an invoice edit that removes it unbills it).
+      billableSource: { kind: 'time_entry' as const, id: e.id },
     };
   });
 

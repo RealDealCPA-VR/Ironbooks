@@ -312,6 +312,8 @@ async function buildBillableLines(
       rate: t.rate,
       taxable: false,
       jobId: t.jobId,
+      // The line remembers the time it bills: an edit that removes it puts the time back.
+      billableSource: { kind: 'time_entry', id: t.id },
     });
   }
 
@@ -389,6 +391,9 @@ function costToLines(
       rate: toAmountString(base),
       taxable: false,
       jobId: cost.jobId,
+      // The cost line (not its markup line) remembers the cost it bills: an edit that removes it
+      // puts the cost back on the Time/Costs list.
+      billableSource: { kind: cost.source === 'bill' ? 'bill_line' : 'expense_line', id: cost.id },
     },
   ];
   const markupAmount = Money.round2(Money.mul(base, Money.div(markupPercent, 100)));

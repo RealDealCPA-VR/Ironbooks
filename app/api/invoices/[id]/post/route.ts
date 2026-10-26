@@ -9,6 +9,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { postDraftInvoice } from '@/lib/services/invoices';
+import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
 
 function errorResponse(err: unknown) {
@@ -25,10 +26,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       overrideCreditLimit?: unknown;
       allowOverBilling?: unknown;
     };
-    const posted = await postDraftInvoice(ctx, id, {
-      overrideCreditLimit: body?.overrideCreditLimit === true,
-      allowOverBilling: body?.allowOverBilling === true,
-    });
+    // The draft as the user opened it (version header): an edit saved since is a 409, not posted unseen.
+    const posted = await withVersionCheck(ctx, 'invoice', id, expectedVersion(req), (c) =>
+      postDraftInvoice(c, id, {
+        overrideCreditLimit: body?.overrideCreditLimit === true,
+        allowOverBilling: body?.allowOverBilling === true,
+      }),
+    );
     return NextResponse.json(posted);
   } catch (err) {
     return errorResponse(err);

@@ -285,6 +285,8 @@ function invoiceInput(s: Snap): CreateInvoiceInput {
       jobId: str(l.jobId),
       estimateLineId: str(l.estimateLineId),
       ...(l.estimateLineId && l.amount != null ? { amount: String(l.amount) } : {}),
+      // The billable cost / time the line billed: undoing an edit that removed it bills it again.
+      ...(l.billableSource !== undefined ? { billableSource: (l.billableSource as CreateInvoiceInput['lines'][number]['billableSource']) ?? null } : {}),
       ...invDetail(l),
     })),
     taxRateId: str(s.taxRateId),

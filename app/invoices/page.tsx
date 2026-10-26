@@ -178,6 +178,8 @@ interface InvoiceDetail extends Invoice {
     classId?: string | null;
     /** Progress invoicing: the estimate line this invoice line bills. */
     estimateLineId?: string | null;
+    /** Billable time & costs: the cost / time entry this line bills. */
+    billableSource?: BillableSourceRef | null;
     itemName: string | null;
     itemType: ItemType | null;
     unitOfMeasure: string | null;
@@ -212,7 +214,12 @@ interface LineRow {
   /** Progress invoicing: the estimate line this row bills (kept through an edit; cleared
    *  when the row's item changes). */
   estimateLineId?: string | null;
+  /** Billable time & costs this row bills (kept through an edit; cleared when the item changes,
+   *  and a deleted row puts the cost back on the Time/Costs list). */
+  billableSource?: BillableSourceRef | null;
 }
+
+type BillableSourceRef = { kind: 'bill_line' | 'expense_line' | 'time_entry'; id: string };
 
 /** Unbilled billable time & costs (GET /api/billables?customerId=). */
 interface BillableCost {
@@ -516,6 +523,7 @@ function InvoiceModal({
           // Saved invoices keep their stored rates; the badge still flags rule differences.
           rateManual: true,
           estimateLineId: l.estimateLineId ?? null,
+          billableSource: l.billableSource ?? null,
         })),
       );
     } else {
@@ -680,7 +688,10 @@ function InvoiceModal({
       const next = [...prev];
       const row = { ...next[idx], ...patch };
       // A row switched to a different item no longer bills its estimate line.
-      if ('itemId' in patch && patch.itemId !== next[idx].itemId) row.estimateLineId = null;
+      if ('itemId' in patch && patch.itemId !== next[idx].itemId) {
+        row.estimateLineId = null;
+        row.billableSource = null;
+      }
       next[idx] = row;
       return next;
     });
@@ -995,8 +1006,9 @@ function InvoiceModal({
           jobId: l.jobId || null,
           classId: l.classId || null,
           ...inventoryLinePayload(l.inv),
-          // Edits send each row's estimate link back so progress billing stays on the right line.
-          ...(editing ? { estimateLineId: l.estimateLineId ?? null } : {}),
+          // Edits send each row's estimate link back so progress billing stays on the right line,
+          // and its billable cost / time link so only a deleted row unbills its source.
+          ...(editing ? { estimateLineId: l.estimateLineId ?? null, billableSource: l.billableSource ?? null } : {}),
         };
       }),
     };

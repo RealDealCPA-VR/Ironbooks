@@ -118,7 +118,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       case 'bounce': {
         const parsed = bouncedCheckSchema.safeParse(body);
         if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-        const result = await recordBouncedCheck(ctx, { paymentId: id, ...parsed.data });
+        // A version header (the payment as the user opened it) refuses a bounce of a payment that
+        // was edited or voided since; without one the service still re-checks inside its transaction.
+        const result = await withVersionCheck(ctx, 'payment_received', id, expectedVersion(req), (c) =>
+          recordBouncedCheck(c, { paymentId: id, ...parsed.data }),
+        );
         return NextResponse.json(result, { status: 201 });
       }
       default:

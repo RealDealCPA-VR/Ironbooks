@@ -22,6 +22,11 @@ export const invoiceLineSchema = z.object({
   /** Progress invoicing: the estimate line this line bills (round-tripped by the edit form).
    *  The service checks it belongs to an estimate for the same customer and item. */
   estimateLineId: zUuid.nullish(),
+  /** Billable time & costs: the cost / time entry this line bills (round-tripped by the edit
+   *  form). The service keeps it only when the invoice's old lines had it. */
+  billableSource: z
+    .object({ kind: z.enum(['bill_line', 'expense_line', 'time_entry']), id: zUuid })
+    .nullish(),
   /** Advanced Inventory: site/bin/serial/lot the stock is sold from. */
   ...inventoryLineFields,
 });

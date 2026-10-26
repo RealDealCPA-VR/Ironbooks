@@ -593,6 +593,8 @@ export const invoiceLines = pgTable('invoice_lines', {
   pricing: jsonb('pricing').$type<Record<string, unknown>>(),
   /** fix/sales (0036): the estimate line this line bills (progress invoicing / conversion). */
   estimateLineId: uuid('estimate_line_id'),
+  /** r5 sales (0064): the billable cost / time this line bills (released when an edit drops it). */
+  billableSource: jsonb('billable_source').$type<{ kind: 'bill_line' | 'expense_line' | 'time_entry'; id: string }>(),
 });
 
 // ---- Payments received (A/R) ----
