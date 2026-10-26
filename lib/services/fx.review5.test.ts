@@ -169,6 +169,33 @@ describe('review5 fx', () => {
     expect(Money.of(a.balance).toFixed(2)).toBe('1250.00');
   });
 
+  it('bank / card revaluations stay in date order: no back-dated adjustment, no void under a later one', async () => {
+    const { voidHomeCurrencyAdjustment } = await import('./homeCurrencyAdjustment');
+    await postJournalEntry(ctx, {
+      date: d('2026-01-02'),
+      description: 'Opening EUR',
+      currency: 'EUR',
+      exchangeRate: '1.20',
+      lines: [
+        { accountId: acct['1020'], debit: '1200.00', foreignAmount: '1000.00' },
+        { accountId: acct['3000'], credit: '1200.00' },
+      ],
+    });
+    const homeOf = async () => Money.of((await db.select().from(accounts).where(eq(accounts.id, acct['1020'])))[0].balance).toFixed(2);
+    const jan = await createHomeCurrencyAdjustment(ctx, { date: midnight('2026-01-31'), rates: { EUR: '1.25' } });
+    const feb = await createHomeCurrencyAdjustment(ctx, { date: midnight('2026-02-28'), rates: { EUR: '1.30' } });
+    expect(await homeOf()).toBe('1300.00'); // EUR 1,000 at the last rate
+    // Back-dated under February's: Feb's revaluation was computed without it (bank would end at 1,320).
+    await expect(createHomeCurrencyAdjustment(ctx, { date: midnight('2026-01-15'), rates: { EUR: '1.22' } })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // Voiding January's under February's would leave the bank at 1,250 at February's 1.30.
+    await expect(voidHomeCurrencyAdjustment(ctx, jan.id)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await homeOf()).toBe('1300.00');
+    // Latest first is fine.
+    await voidHomeCurrencyAdjustment(ctx, feb.id);
+    await voidHomeCurrencyAdjustment(ctx, jan.id);
+    expect(await homeOf()).toBe('1200.00');
+  });
+
   it('Home Currency Adjustment as of a date revalues everything dated that day (whole as-of day)', async () => {
     const c = await createCustomer(ctx, { displayName: `EUR customer ${seq}` } as never);
     // Dated 3/31 at noon; the adjustment as of 3/31 (date picker: midnight) must include it, as

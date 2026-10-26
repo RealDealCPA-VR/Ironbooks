@@ -18,11 +18,11 @@
  * Every line is posted through postJournalEntry (balanced, closing date respected, audited).
  * Voiding an adjustment voids both entries.
  */
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import { accounts, currencies, homeCurrencyAdjustments, loans } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { getOrCreateExchangeGainLossAccount } from './currencies';
 import { foreignCode, homeCode, parseRate } from './exchangeRates';
@@ -254,6 +254,27 @@ export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: 
   };
 }
 
+const ymdOf = (d: Date) => new Date(d).toISOString().slice(0, 10);
+
+function hasAccountLines(detail: unknown): boolean {
+  return Array.isArray(detail) && detail.some((l) => (l as { kind?: string } | null)?.kind === 'account');
+}
+
+/** Posted (not voided) adjustments that revalued a bank / card account (permanent lines). */
+async function liveAccountAdjustments(ctx: ServiceContext) {
+  const rows = await ctx.db
+    .select({
+      id: homeCurrencyAdjustments.id,
+      date: homeCurrencyAdjustments.date,
+      createdAt: homeCurrencyAdjustments.createdAt,
+      detail: homeCurrencyAdjustments.detail,
+    })
+    .from(homeCurrencyAdjustments)
+    .where(and(eq(homeCurrencyAdjustments.companyId, ctx.companyId), isNull(homeCurrencyAdjustments.voidedAt)))
+    .orderBy(desc(homeCurrencyAdjustments.date));
+  return rows.filter((r) => hasAccountLines(r.detail));
+}
+
 /** The last instant of `d`'s UTC calendar day (date-only values are stored at UTC midnight). */
 function endOfUtcDay(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 1);
@@ -326,6 +347,17 @@ export async function createHomeCurrencyAdjustment(ctx: ServiceContext, input: H
     const preview = await previewHomeCurrencyAdjustment(tx, input);
     if (preview.lines.length === 0) {
       throw validation('Nothing to adjust: every foreign-currency balance is already at these rates.');
+    }
+    // review5 fx: a bank / card revaluation is permanent and each one is computed from the home
+    // value the earlier ones left. One dated before a later posted revaluation would shift that
+    // later one off its rate (the account would no longer be at foreign x the latest rate).
+    if (preview.lines.some((l) => l.kind === 'account')) {
+      const later = (await liveAccountAdjustments(tx)).find((h) => ymdOf(h.date) > ymdOf(date));
+      if (later) {
+        throw validation(
+          `A home currency adjustment dated ${ymdOf(later.date)} already revalues your foreign-currency bank and card accounts. Date this one on or after ${ymdOf(later.date)}, or void the later adjustment first.`,
+        );
+      }
     }
     const [row] = await tx.db
       .insert(homeCurrencyAdjustments)
@@ -409,6 +441,22 @@ export async function voidHomeCurrencyAdjustment(ctx: ServiceContext, id: string
     // Read in the transaction: a double-submitted void voids (and audits) it once.
     const row = await getHomeCurrencyAdjustment(tx, id);
     if (row.voidedAt) return row;
+    // review5 fx: a later bank / card revaluation was computed on top of this one; voiding this
+    // one first would leave those accounts off the later rate. Void the latest first (QB order).
+    if (hasAccountLines(row.detail)) {
+      const later = (await liveAccountAdjustments(tx)).find(
+        (h) =>
+          h.id !== row.id &&
+          (ymdOf(h.date) > ymdOf(row.date) ||
+            (ymdOf(h.date) === ymdOf(row.date) && h.createdAt.getTime() > row.createdAt.getTime())),
+      );
+      if (later) {
+        throw new ServiceError(
+          'CONFLICT',
+          `The home currency adjustment dated ${ymdOf(later.date)} revalued your bank and card accounts after this one. Void that one first.`,
+        );
+      }
+    }
     for (const entryId of [row.reversalEntryId, row.entryId]) {
       if (entryId) await voidJournalEntry(tx, entryId);
     }
