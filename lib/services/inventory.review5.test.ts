@@ -48,7 +48,7 @@ import { createAccount } from './accounts';
 import { withVersionCheck } from './concurrency';
 import { createInventoryTransfer, voidInventoryTransfer } from './inventoryTransfers';
 import { listSites, siteQuantities } from './inventorySites';
-import { serialLotInStock, transactionsBySerialLot } from './inventorySiteReports';
+import { quantityOnHandBySite, serialLotInStock, transactionsBySerialLot } from './inventorySiteReports';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-inventory-review5');
 let db: DB;
@@ -797,6 +797,32 @@ describe('review5 inventory', () => {
     expect((await itemRow(it0.id)).taxable).toBe(false);
     const [c] = await db.select().from(customersTable).where(eq(customersTable.id, cust.id));
     expect(c.taxable).toBe(false);
+  });
+
+  it('Quantity on Hand by Site: item, site and grand-total values tie to the Inventory Valuation Summary', async () => {
+    const annexSiteOf = async () => {
+      await listSites(ctx);
+      return createSite(ctx, { name: 'Value annex' });
+    };
+    const annex = await annexSiteOf();
+    const avg = await invItem('Site remainder widget');
+    await adjustInventory(ctx, { itemId: avg.id, quantityChange: 3000, unitCost: '0.33333333', date: d('2026-01-02') }); // $1,000.00
+    await createInventoryTransfer(ctx, {
+      date: d('2026-01-03'),
+      fromSiteId: (await listSites(ctx)).find((s) => s.isDefault)!.id,
+      toSiteId: annex.id,
+      lines: [{ itemId: avg.id, quantity: '1000' }],
+    });
+    const fifo = await invItem('Site FIFO widget');
+    await adjustQuantityAtSite(ctx, { itemId: fifo.id, quantityChange: '3000', unitCost: '0.33333333', date: d('2026-01-02'), costing: 'fifo' });
+    const val = await inventoryValuation(ctx);
+    const rep = await quantityOnHandBySite(ctx);
+    for (const id of [avg.id, fifo.id]) {
+      expect(rep.rows.find((r) => r.itemId === id)!.totalValue).toBe(val.items.find((r) => r.id === id)!.totalValue);
+    }
+    expect(rep.grandTotalValue).toBe(val.grandTotal);
+    const siteSum = rep.sites.reduce((s, x) => s.plus(Money.of(x.totalValue)), Money.zero());
+    expect(siteSum.toFixed(2)).toBe(val.grandTotal);
   });
 
   it('Transactions by Serial/Lot Number names checks and vendor credits (label and number)', async () => {

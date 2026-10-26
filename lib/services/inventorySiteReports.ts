@@ -12,8 +12,9 @@
  *   - serial-tracked items: serials in stock == quantity on hand; lot-tracked: Σ lots == on hand
  *   - inventory asset GL balance == inventory valuation
  *
- * Site values use the item's current unit cost (average cost, or the FIFO layers' effective
- * cost) — costing is item-level, so a site's share of value is quantity × that unit cost.
+ * Site values: costing is item-level, so each site gets its quantity's share of the item's value
+ * as the Inventory Valuation Summary carries it (split to the cent), and the report ties to the
+ * valuation and the GL; the unit cost shown is the item's current (average / FIFO effective) cost.
  * Committed (open sales orders) and on-PO quantities carry no site in this app; they are
  * attributed to the default site, where un-sited documents land.
  */
@@ -40,7 +41,7 @@ import {
   salesReceipts,
   vendorCredits,
 } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import { Money, allocate, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { inventoryValuation } from './inventory';
 import { binQuantities, ensureDefaultSite, serialsInStock, siteQuantities } from './inventorySites';
@@ -60,12 +61,6 @@ async function loadInventoryItems(ctx: ServiceContext, itemId?: string | null) {
   const conds = [eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')];
   if (itemId) conds.push(eq(items.id, itemId));
   return ctx.db.select().from(items).where(and(...conds)).orderBy(asc(items.name));
-}
-
-/** itemId → effective unit cost (average or FIFO layer cost), from the valuation report. */
-async function unitCosts(ctx: ServiceContext): Promise<Map<string, Dec>> {
-  const val = await inventoryValuation(ctx);
-  return new Map(val.items.map((r) => [r.id, Money.of(r.averageCost)]));
 }
 
 async function binNames(ctx: ServiceContext) {
@@ -103,7 +98,9 @@ export async function quantityOnHandBySite(
   const qty = await siteQuantities(ctx, itemRows.map((i) => i.id));
   const bins = await binQuantities(ctx, { itemIds: itemRows.map((i) => i.id), siteId: opts?.siteId ?? null });
   const names = await binNames(ctx);
-  const costs = await unitCosts(ctx);
+  const valuation = await inventoryValuation(ctx);
+  const costs = new Map(valuation.items.map((r) => [r.id, Money.of(r.averageCost)]));
+  const valueOf = new Map(valuation.items.map((r) => [r.id, Money.of(r.totalValue)]));
 
   const siteTotals: Record<string, { quantity: Dec; value: Dec }> = {};
   for (const s of sites) siteTotals[s.id] = { quantity: Money.zero(), value: Money.zero() };
@@ -111,22 +108,31 @@ export async function quantityOnHandBySite(
 
   const rows: QohBySiteRow[] = [];
   for (const it of itemRows) {
-    const bySiteMap = qty.get(it.id) ?? new Map();
+    const bySiteMap: Map<string, Dec> = qty.get(it.id) ?? new Map();
     const unitCost = costs.get(it.id) ?? Money.of(it.averageCost ?? '0');
+    // Each site's share of the item's value as the Inventory Valuation Summary carries it (FIFO
+    // layers' cents, the average-cost value remainder), split by quantity to the cent — not
+    // site qty x a 4dp unit cost, which left the report short of the valuation and the GL.
+    const entries = [...bySiteMap.entries()];
+    const itemValue = valueOf.get(it.id);
+    const shares =
+      itemValue && entries.length > 0 && entries.every(([, q]) => q.greaterThan(0))
+        ? allocate(itemValue, entries.map(([, q]) => q))
+        : entries.map(([, q]) => Money.round2(q.times(unitCost)));
     const bySite: Record<string, string> = {};
     let total = Money.zero();
-    for (const [siteId, q] of bySiteMap) {
-      if (opts?.siteId && siteId !== opts.siteId) continue;
+    let value = Money.zero();
+    entries.forEach(([siteId, q], i) => {
+      if (opts?.siteId && siteId !== opts.siteId) return;
       bySite[siteId] = q.toFixed(4);
       total = total.plus(q);
-      const v = Money.round2(q.times(unitCost));
+      value = value.plus(shares[i]);
       if (siteTotals[siteId]) {
         siteTotals[siteId].quantity = siteTotals[siteId].quantity.plus(q);
-        siteTotals[siteId].value = siteTotals[siteId].value.plus(v);
+        siteTotals[siteId].value = siteTotals[siteId].value.plus(shares[i]);
       }
-    }
+    });
     if (total.isZero() && !opts?.includeZero) continue;
-    const value = Money.round2(total.times(unitCost));
     grandValue = grandValue.plus(value);
     rows.push({
       itemId: it.id,
