@@ -529,16 +529,65 @@ export async function suggestMatches(
   if (txn.excluded) {
     throw new ServiceError('CONFLICT', 'Bank transaction is excluded. Restore it first.');
   }
-
   const ba = await loadBankAccount(ctx, txn.bankAccountId);
-  const amt = Money.of(txn.amount);
-  if (amt.isZero()) return [];
+  return (await matchCandidatesFor(ctx, ba, [txn])).get(txn.id) ?? [];
+}
+
+/**
+ * Match candidates for EVERY line waiting for review on a bank account (or the listed ones), in
+ * one pass: one read of the account's taken entries and one of its register around the lines'
+ * dates. The review screen used to ask suggestMatches once per line — a first import of a year of
+ * bank history fired thousands of requests, each re-reading every matched entry of the account,
+ * and the screen took minutes to open.
+ */
+export async function suggestMatchesForAccount(
+  ctx: ServiceContext,
+  bankAccountId: string,
+  opts: { bankTransactionIds?: string[] } = {},
+): Promise<Record<string, MatchCandidate[]>> {
+  const ba = await loadBankAccount(ctx, bankAccountId);
+  let txns = await ctx.db
+    .select()
+    .from(bankTransactions)
+    .where(
+      and(
+        eq(bankTransactions.companyId, ctx.companyId),
+        eq(bankTransactions.bankAccountId, bankAccountId),
+        eq(bankTransactions.matched, false),
+        eq(bankTransactions.excluded, false),
+      ),
+    );
+  if (opts.bankTransactionIds) {
+    const want = new Set(opts.bankTransactionIds);
+    txns = txns.filter((t) => want.has(t.id));
+  }
+  const byLine = await matchCandidatesFor(ctx, ba, txns);
+  return Object.fromEntries(txns.map((t) => [t.id, byLine.get(t.id) ?? []]));
+}
+
+interface EntryOnBank {
+  entryNumber: number;
+  date: Date;
+  description: string;
+  reference: string | null;
+  sourceRef: string | null;
+  net: ReturnType<typeof Money.of>;
+}
+
+async function matchCandidatesFor(
+  ctx: ServiceContext,
+  ba: { id: string; accountId: string },
+  txns: Array<{ id: string; date: Date; amount: string; description: string | null; payee: string | null }>,
+): Promise<Map<string, MatchCandidate[]>> {
+  const out = new Map<string, MatchCandidate[]>();
+  const live = txns.filter((t) => !Money.of(t.amount).isZero());
+  if (live.length === 0) return out;
   // p1 fx: a foreign-currency account's feed is compared in the account's currency.
   const foreign = !!(await foreignCurrencyOfAccount(ctx, ba.accountId));
 
-  const txnDate = new Date(txn.date);
-  const from = new Date(txnDate.getTime() - MATCH_WINDOW_DAYS * DAY_MS);
-  const to = new Date(txnDate.getTime() + MATCH_WINDOW_DAYS * DAY_MS);
+  const times = live.map((t) => new Date(t.date).getTime());
+  const from = new Date(Math.min(...times) - MATCH_WINDOW_DAYS * DAY_MS);
+  const to = new Date(Math.max(...times) + MATCH_WINDOW_DAYS * DAY_MS);
 
   // Entries already linked by a feed line OF THIS BANK ACCOUNT (whether matched or created via
   // categorize) are taken — a register transaction clears each bank only once. A transfer between
@@ -550,13 +599,13 @@ export async function suggestMatches(
     .where(
       and(
         eq(bankTransactions.companyId, ctx.companyId),
-        eq(bankTransactions.bankAccountId, txn.bankAccountId),
+        eq(bankTransactions.bankAccountId, ba.id),
         isNotNull(bankTransactions.matchedEntryId),
       ),
     );
   const taken = new Set(takenRows.map((r) => r.entryId).filter((id): id is string => !!id));
 
-  // All lines on the bank GL account from posted entries inside the date window.
+  // All lines on the bank GL account from posted entries inside the lines' date window.
   const rows = await ctx.db
     .select({
       entryId: journalEntries.id,
@@ -582,17 +631,7 @@ export async function suggestMatches(
     );
 
   // Net bank-GL effect per entry (an entry may hit the bank account on >1 line).
-  const byEntry = new Map<
-    string,
-    {
-      entryNumber: number;
-      date: Date;
-      description: string;
-      reference: string | null;
-      sourceRef: string | null;
-      net: ReturnType<typeof Money.of>;
-    }
-  >();
+  const byEntry = new Map<string, EntryOnBank>();
   for (const r of rows) {
     const existing = byEntry.get(r.entryId);
     const delta = accountSigned(r, foreign);
@@ -609,39 +648,51 @@ export async function suggestMatches(
       });
     }
   }
-
-  const candidates: MatchCandidate[] = [];
+  // Untaken entries by net amount, so each line only looks at the entries of its own amount.
+  const byAmount = new Map<string, Array<[string, EntryOnBank]>>();
   for (const [entryId, e] of byEntry) {
     if (taken.has(entryId)) continue;
-    if (!Money.eq(e.net, amt)) continue; // amount-equal AND sign-compatible
-
-    const dateDiffDays = Math.round(Math.abs(e.date.getTime() - txnDate.getTime()) / DAY_MS);
-    const refMatch = referenceMatches(e.reference, txn);
-    const score = refMatch ? 100 : Math.max(10, 90 - dateDiffDays * 5);
-    const confidence: MatchConfidence =
-      refMatch || dateDiffDays <= 3 ? 'high' : dateDiffDays <= 7 ? 'medium' : 'low';
-
-    candidates.push({
-      entryId,
-      entryNumber: e.entryNumber,
-      date: e.date,
-      description: e.description,
-      reference: e.reference,
-      sourceRef: e.sourceRef,
-      amount: toAmountString(e.net),
-      dateDiffDays,
-      referenceMatch: refMatch,
-      confidence,
-      score,
-    });
+    const key = toAmountString(e.net);
+    const list = byAmount.get(key);
+    if (list) list.push([entryId, e]);
+    else byAmount.set(key, [[entryId, e]]);
   }
 
-  candidates.sort((a, b) => {
-    if (a.referenceMatch !== b.referenceMatch) return a.referenceMatch ? -1 : 1;
-    if (a.dateDiffDays !== b.dateDiffDays) return a.dateDiffDays - b.dateDiffDays;
-    return b.entryNumber - a.entryNumber;
-  });
-  return candidates;
+  for (const txn of live) {
+    const txnDate = new Date(txn.date);
+    const candidates: MatchCandidate[] = [];
+    // Same amount key = amount-equal AND sign-compatible; then this line's own ±14-day window.
+    for (const [entryId, e] of byAmount.get(toAmountString(txn.amount)) ?? []) {
+      const diffMs = Math.abs(e.date.getTime() - txnDate.getTime());
+      if (diffMs > MATCH_WINDOW_DAYS * DAY_MS) continue;
+      const dateDiffDays = Math.round(diffMs / DAY_MS);
+      const refMatch = referenceMatches(e.reference, txn);
+      const score = refMatch ? 100 : Math.max(10, 90 - dateDiffDays * 5);
+      const confidence: MatchConfidence =
+        refMatch || dateDiffDays <= 3 ? 'high' : dateDiffDays <= 7 ? 'medium' : 'low';
+
+      candidates.push({
+        entryId,
+        entryNumber: e.entryNumber,
+        date: e.date,
+        description: e.description,
+        reference: e.reference,
+        sourceRef: e.sourceRef,
+        amount: toAmountString(e.net),
+        dateDiffDays,
+        referenceMatch: refMatch,
+        confidence,
+        score,
+      });
+    }
+    candidates.sort((a, b) => {
+      if (a.referenceMatch !== b.referenceMatch) return a.referenceMatch ? -1 : 1;
+      if (a.dateDiffDays !== b.dateDiffDays) return a.dateDiffDays - b.dateDiffDays;
+      return b.entryNumber - a.entryNumber;
+    });
+    out.set(txn.id, candidates);
+  }
+  return out;
 }
 
 /**

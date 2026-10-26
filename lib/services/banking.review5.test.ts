@@ -954,3 +954,53 @@ describe('bank rules cannot point at Undeposited Funds or Inventory Asset', () =
     expect(off.enabled).toBe(false);
   });
 });
+
+describe('bank review: match candidates for every line in one pass', () => {
+  it('gives each waiting line the same candidates as asking line by line, with a fixed number of queries', async () => {
+    const { suggestMatches, suggestMatchesForAccount, matchTransaction } = await import('./bankCategorize');
+    const ba = await linkBank('1000');
+    const post = (day: string, amt: string, ref?: string) =>
+      postJournalEntry(ctx, {
+        date: d(day),
+        description: `Owner ${day}`,
+        reference: ref,
+        lines: [
+          { accountId: acct['1000'], debit: amt },
+          { accountId: acct['3000'], credit: amt },
+        ],
+      });
+    const e1 = await post('2026-03-02', '100.00');
+    await post('2026-03-05', '100.00', '1043');
+    await post('2026-03-28', '100.00');
+    await post('2026-03-04', '55.00');
+    const lines = [
+      await feedLine(ba, '100.00', 'DEPOSIT 1043', '2026-03-03'),
+      await feedLine(ba, '55.00', 'DEPOSIT', '2026-03-20'),
+      await feedLine(ba, '100.00', 'DEPOSIT', '2026-04-08'),
+      await feedLine(ba, '-10.00', 'FEE', '2026-03-03'),
+    ];
+    // A line already matched takes its entry away from the others.
+    const taken = await feedLine(ba, '100.00', 'DEPOSIT', '2026-03-02');
+    await matchTransaction(ctx, taken.id, e1.id);
+
+    let queries = 0;
+    const counting = new Proxy(db, {
+      get(target, prop, recv) {
+        if (prop === 'select') queries += 1;
+        return Reflect.get(target, prop, recv);
+      },
+    }) as DB;
+    const all = await suggestMatchesForAccount({ ...ctx, db: counting }, ba);
+    expect(queries).toBeLessThanOrEqual(6);
+    for (const l of lines) {
+      const one = await suggestMatches(ctx, l.id);
+      expect(all[l.id].map((c) => [c.entryId, c.dateDiffDays, c.referenceMatch, c.confidence])).toEqual(
+        one.map((c) => [c.entryId, c.dateDiffDays, c.referenceMatch, c.confidence]),
+      );
+    }
+    expect(all[lines[0].id].map((c) => c.referenceMatch)).toEqual([true]); // ref 1043 first, e1 taken
+    expect(all[lines[1].id]).toEqual([]); // 16 days from the 55.00 entry
+    expect(all[lines[2].id].map((c) => c.dateDiffDays)).toEqual([11]); // the Mar 28 entry
+    expect(Object.keys(all)).not.toContain(taken.id);
+  });
+});
