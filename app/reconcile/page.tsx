@@ -23,6 +23,7 @@ import {
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
+import { canFinishReconciliation } from '@/lib/reconcileRules';
 import { formatDate as fmtDate, todayISO } from '@/lib/dates';
 // cmdbar: "reconcile checking" opens this page with the account picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
@@ -134,8 +135,8 @@ function lineAmount(line: ClearableLine): string {
 }
 
 function differenceClose(difference: string): boolean {
-  // "complete" button is enabled when |difference| <= 0.01
-  return Money.abs(difference).lessThanOrEqualTo('0.01');
+  // "Finish Reconciliation" is enabled exactly when the server completes: a 0.00 difference.
+  return canFinishReconciliation(difference);
 }
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@
  *   2. listClearable        — show un-cleared GL lines for the bank account.
  *   3. toggleCleared        — mark / un-mark individual lines as cleared.
  *   4. getProgress          — compare cleared balance to statement balance.
- *   5. completeReconciliation — finalize when difference ≤ $0.01.
+ *   5. completeReconciliation — finalize when the difference is 0.00 (lib/reconcileRules.ts).
  *
  * No journal entries are created by reconciliation itself; it is purely a
  * matching / confirmation step.  The GL lines being reconciled were already
@@ -24,6 +24,7 @@ import {
   reconciliations,
 } from '@/lib/db/schema';
 import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
+import { canFinishReconciliation } from '@/lib/reconcileRules';
 import {
   type ServiceContext,
   ServiceError,
@@ -654,7 +655,7 @@ export async function updateStatement(
  *
  * Requirements:
  *   - Status must be in_progress.
- *   - |difference| ≤ $0.01 (one cent tolerance for rounding).
+ *   - the difference is 0.00 (canFinishReconciliation — the page enables Finish on the same rule).
  *
  * On success:
  *   - reconciliations row is set to status = 'completed', completedAt = now.
@@ -684,7 +685,7 @@ async function completeReconciliationInTx(
   const statementBalance = Money.of(recon.statementBalance);
   const difference = statementBalance.minus(clearedBalance).abs();
 
-  if (!Money.equalWithinCent(difference, Money.zero())) {
+  if (!canFinishReconciliation(toAmountString(difference))) {
     throw new ServiceError(
       'VALIDATION',
       `Cannot complete: difference is ${toAmountString(statementBalance.minus(clearedBalance))}. ` +
