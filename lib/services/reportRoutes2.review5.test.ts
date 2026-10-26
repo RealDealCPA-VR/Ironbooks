@@ -80,3 +80,22 @@ describe('balance sheet route default date', () => {
     vi.useRealTimers();
   });
 });
+
+const { getDashboardInsights } = vi.hoisted(() => ({ getDashboardInsights: vi.fn(async (..._a: unknown[]) => ({})) }));
+vi.mock('@/lib/services/dashboard', async (orig) => ({ ...(await orig<object>()), getDashboardInsights }));
+import { GET as dashboardGET } from '@/app/api/dashboard/route';
+
+/**
+ * GET /api/dashboard?asOf=YYYY-MM-DD parsed the day as UTC midnight, and the dashboard reads
+ * "today" from that moment on this computer's calendar — the evening BEFORE west of UTC, so the
+ * dashboard ran a day early. Impossible days rolled over (2026-02-30 → March 2).
+ */
+describe('dashboard route asOf', () => {
+  it('a calendar day is that day on this computer; impossible days are a 400', async () => {
+    await dashboardGET(req('/api/dashboard?asOf=2026-10-26'));
+    const now = getDashboardInsights.mock.calls.at(-1)?.[1] as Date;
+    expect([now.getFullYear(), now.getMonth() + 1, now.getDate()]).toEqual([2026, 10, 26]);
+    const bad = await dashboardGET(req('/api/dashboard?asOf=2026-02-30'));
+    expect(bad.status).toBe(400);
+  });
+});
