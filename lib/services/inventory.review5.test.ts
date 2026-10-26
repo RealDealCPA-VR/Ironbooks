@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { and, eq, like } from 'drizzle-orm';
+import { and, eq, like, sql } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { accounts, assemblyComponents, items as itemsTable, journalEntries, users } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
@@ -16,6 +16,14 @@ import { adjustInventory, inventoryValuation, inventoryValuationAsOf } from './i
 import { adjustQuantityAtSite } from './inventorySiteOps';
 import { buildAssembly, getBom, setBom, unbuildAssembly } from './assemblies';
 import { mergeItems } from './lists/mergeLists';
+import { consumeStock, receiveStock } from './fifo';
+import { createCustomer } from './customers';
+import { createInvoice, updateInvoice, voidInvoice } from './invoices';
+import { createSalesReceipt, updateSalesReceipt, voidSalesReceipt } from './salesReceipts';
+import { createBill, voidBill } from './bills';
+import { createVendor } from './vendors';
+import { createItemReceipt, voidItemReceipt } from './itemReceipts';
+import { createCreditMemo, voidCreditMemo } from './creditMemos';
 import { trialBalance } from './reports';
 import { verifySiteInvariants } from './inventorySiteReports';
 import { handleBulkPost } from '@/lib/lists/bulkRoute';
@@ -192,6 +200,142 @@ describe('review5 inventory', () => {
       .where(and(eq(journalEntries.companyId, ctx.companyId), like(journalEntries.sourceRef, 'assembly%')));
     expect(entries).toHaveLength(2);
     for (const e of entries) expect(e.date.toISOString().slice(0, 10)).toBe('2026-12-31');
+  });
+
+  // ---- FIFO: a sale's units go back into the layers they came from ----
+
+  /** COGS (debit) of the posted entries tagged with a source ref. */
+  async function cogsOf(sourceRef: string): Promise<string> {
+    const rows = await db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, sourceRef), eq(journalEntries.status, 'posted')));
+    let total = Money.zero();
+    for (const r of rows) {
+      const tb = await db.execute(
+        sql`SELECT COALESCE(SUM(debit), 0) AS d FROM journal_entry_lines WHERE journal_entry_id = ${r.id}::uuid`,
+      );
+      const out = ((tb as unknown as { rows?: Array<{ d: string }> }).rows ?? []) as Array<{ d: string }>;
+      total = total.plus(Money.of(out[0]?.d ?? '0'));
+    }
+    return total.toFixed(2);
+  }
+
+  async function fifoItemWithTwoLayers(name: string) {
+    const it = await invItem(name);
+    await receiveStock(ctx, { itemId: it.id, quantity: 10, unitCost: '1.00', date: d('2026-01-01') });
+    await receiveStock(ctx, { itemId: it.id, quantity: 10, unitCost: '2.00', date: d('2026-01-05') });
+    return it.id;
+  }
+
+  it('FIFO: re-saving an unchanged invoice keeps its COGS (units return to their own layer)', async () => {
+    const item = await fifoItemWithTwoLayers('FIFO resave');
+    const c = await createCustomer(ctx, { displayName: 'FIFO buyer' } as never);
+    const input = { customerId: c.id, date: d('2026-02-01'), lines: [{ itemId: item, quantity: 10, rate: '5.00' }] };
+    const inv = await createInvoice(ctx, input as never);
+    expect(await cogsOf(`invoice-cogs:${inv.id}`)).toBe('10.00');
+    await updateInvoice(ctx, inv.id, { ...input, memo: 'typo fixed' } as never);
+    expect(await cogsOf(`invoice-cogs:${inv.id}`)).toBe('10.00');
+    await updateInvoice(ctx, inv.id, { ...input, memo: 'again' } as never);
+    expect(await cogsOf(`invoice-cogs:${inv.id}`)).toBe('10.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+    expect(await gl('1300')).toBe('20.00');
+  });
+
+  it('migration 0067: the audit trail is indexed by the record it is about (FIFO restores look it up)', async () => {
+    const res = await db.execute(sql`SELECT indexdef FROM pg_indexes WHERE indexname = 'audit_logs_company_entity_idx'`);
+    const rows = ((res as unknown as { rows?: Array<{ indexdef: string }> }).rows ?? []) as Array<{ indexdef: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].indexdef).toMatch(/\(company_id, entity_type, entity_id\)/);
+  });
+
+  it('FIFO: a voided sale puts its units back in FIFO order (the next sale is costed at the oldest cost)', async () => {
+    const item = await fifoItemWithTwoLayers('FIFO void order');
+    const c = await createCustomer(ctx, { displayName: 'FIFO void buyer' } as never);
+    const sr = await createSalesReceipt(ctx, { customerId: c.id, date: d('2026-02-01'), depositAccountId: acct['1000'], lines: [{ itemId: item, quantity: 10, rate: '5.00' }] } as never);
+    await voidSalesReceipt(ctx, sr.id);
+    const next = await consumeStock(ctx, { itemId: item, quantity: 10, date: d('2026-02-02') });
+    expect(next.totalCOGS).toBe('10.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+  });
+
+  it('FIFO: re-saving an unchanged sales receipt keeps its COGS', async () => {
+    const item = await fifoItemWithTwoLayers('FIFO SR resave');
+    const c = await createCustomer(ctx, { displayName: 'FIFO SR buyer' } as never);
+    const input = { customerId: c.id, date: d('2026-02-01'), depositAccountId: acct['1000'], lines: [{ itemId: item, quantity: 10, rate: '5.00' }] };
+    const sr = await createSalesReceipt(ctx, input as never);
+    expect(await cogsOf(`salesreceipt:${sr.id}`)).toBe('60.00'); // 50.00 sale + 10.00 COGS entry debits
+    await updateSalesReceipt(ctx, sr.id, { ...input, memo: 'edited' } as never);
+    expect(await cogsOf(`salesreceipt:${sr.id}`)).toBe('60.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+  });
+
+  it('FIFO: voiding an invoice after a newer receipt restores the oldest units first', async () => {
+    const item = await fifoItemWithTwoLayers('FIFO inv void');
+    const c = await createCustomer(ctx, { displayName: 'FIFO inv void buyer' } as never);
+    const inv = await createInvoice(ctx, { customerId: c.id, date: d('2026-02-01'), lines: [{ itemId: item, quantity: 15, rate: '5.00' }] } as never);
+    expect(await cogsOf(`invoice-cogs:${inv.id}`)).toBe('20.00'); // 10 @ 1 + 5 @ 2
+    await voidInvoice(ctx, inv.id);
+    const next = await consumeStock(ctx, { itemId: item, quantity: 12, date: d('2026-02-03') });
+    expect(next.totalCOGS).toBe('14.00'); // 10 @ 1 + 2 @ 2
+  });
+
+  // ---- FIFO: a layer is worth exactly what its document posted ----
+
+  it('FIFO: 3000 units received for $1,000.00 are valued at $1,000.00 (bill, item receipt, adjustment)', async () => {
+    const item = await invItem('FIFO thirds');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') }); // FIFO from the start
+    const v = await createVendor(ctx, { displayName: 'Thirds supplier' } as never);
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 3000, amount: '1000.00' }] } as never);
+    expect(await gl('1300')).toBe('1001.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('1001.00');
+    const receipt = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-03'), lines: [{ itemId: item.id, quantity: 3000, unitCost: '0.66666667' }] } as never);
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+    await receiveStock(ctx, { itemId: item.id, quantity: 3000, unitCost: '0.33333333', date: d('2026-01-04') });
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+    // Selling everything clears the account to exactly $0, and the purchases still void cleanly.
+    await voidItemReceipt(ctx, receipt.id);
+    await voidBill(ctx, bill.id);
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+    await consumeStock(ctx, { itemId: item.id, quantity: 3001, date: d('2026-01-05') });
+    expect(await gl('1300')).toBe('0.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('0.00');
+  });
+
+  it('item receipt: voiding a receipt with a 5-decimal unit cost takes back exactly what it posted', async () => {
+    const v = await createVendor(ctx, { displayName: 'Fine cost supplier' } as never);
+    // Average cost: 3000 x 0.33333 = 999.99 posted; the stored 4dp unit cost would say 999.90.
+    const avg = await invItem('Fine avg');
+    await adjustInventory(ctx, { itemId: avg.id, quantityChange: 10, unitCost: '1.00', date: d('2026-01-01') });
+    const r1 = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: avg.id, quantity: 3000, unitCost: '0.33333' }] } as never);
+    expect(await gl('1300')).toBe('1009.99');
+    await voidItemReceipt(ctx, r1.id);
+    expect(await gl('1300')).toBe('10.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('10.00');
+    await adjustInventory(ctx, { itemId: avg.id, quantityChange: -10, date: d('2026-01-03') });
+    expect(await gl('1300')).toBe('0.00');
+  });
+
+  it('FIFO: a large credit-memo restock is valued at exactly the cost it put back', async () => {
+    const item = await invItem('FIFO restock');
+    await receiveStock(ctx, { itemId: item.id, quantity: 3, unitCost: '1.00', date: d('2026-01-01') });
+    await receiveStock(ctx, { itemId: item.id, quantity: 4, unitCost: '1.50', date: d('2026-01-02') }); // 9.00 / 7
+    const c = await createCustomer(ctx, { displayName: 'Bulk returner' } as never);
+    const cm = await createCreditMemo(ctx, { customerId: c.id, date: d('2026-01-03'), lines: [{ itemId: item.id, quantity: 7000, rate: '2.00', restock: true }] } as never);
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+    await voidCreditMemo(ctx, cm.id);
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+    expect(await gl('1300')).toBe('9.00');
+  });
+
+  it('FIFO: switching an average-cost item with a value remainder to FIFO keeps its cents', async () => {
+    const item = await invItem('Switch to FIFO');
+    await adjustInventory(ctx, { itemId: item.id, quantityChange: 3000, unitCost: '0.33333333', date: d('2026-01-02') });
+    expect(await gl('1300')).toBe('1000.00');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-03') }); // starts FIFO
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('1001.00');
+    await consumeStock(ctx, { itemId: item.id, quantity: 3001, date: d('2026-01-04') });
+    expect(await gl('1300')).toBe('0.00');
   });
 
   // ---- valuation includes inactive items that still hold stock ----

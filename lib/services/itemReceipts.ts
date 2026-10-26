@@ -57,7 +57,7 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertNoActiveLandedCost } from './landedCost';
-import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
+import { insertLayersWorth, layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
 import { valueRemainderAfter } from './inventory';
 import {
   type ServiceContext,
@@ -186,15 +186,9 @@ async function receiveStock(
   const newQty = currentQty.plus(qty);
 
   if (await isFifoTracked(ctx, itemId)) {
-    await ctx.db.insert(inventoryLayers).values({
-      companyId: ctx.companyId,
-      itemId,
-      date,
-      quantityRemaining: qty.toFixed(4),
-      unitCost: unitCost.toFixed(4),
-      // Tag the layer with its receipt so landed cost can find (and revalue) it.
-      sourceRef: reason,
-    });
+    // Layer(s) worth exactly what the receipt posted, round2(qty x unit cost) (fifo.ts
+    // insertLayersWorth), tagged with the receipt so landed cost can find (and revalue) them.
+    await insertLayersWorth(ctx, { itemId, date, qty, value: Money.round2(qty.times(unitCost)), sourceRef: reason });
     await ctx.db
       .update(items)
       .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
@@ -242,7 +236,13 @@ async function reverseStock(
   qty: Dec,
   unitCost: Dec,
   reason: string,
+  /**
+   * The amount the receipt posted to inventory for the line (its stored `amount`). The stored
+   * unit cost is rounded to 4dp, so round2(qty x unit cost) can differ from what was posted.
+   */
+  posted?: Dec,
 ): Promise<void> {
+  const postedValue = posted ?? Money.round2(qty.times(unitCost));
   const [item] = await ctx.db
     .select()
     .from(items)
@@ -267,7 +267,7 @@ async function reverseStock(
         itemName: item.name,
         sourceRefs: [`item_receipt:${reason.slice(reason.lastIndexOf(':') + 1)}`],
         qty,
-        expectedValue: Money.round2(qty.times(unitCost)),
+        expectedValue: postedValue,
         unitCost,
         action: 'void this item receipt',
       })
@@ -315,14 +315,14 @@ async function reverseStock(
       .where(eq(items.id, itemId));
   } else {
     const currentAvg = Money.of(item.averageCost ?? '0');
-    const remainingValue = currentQty.times(currentAvg).minus(qty.times(unitCost));
+    const remainingValue = currentQty.times(currentAvg).minus(postedValue);
     // The voided entry takes the receipt's full cost off the inventory account; refuse when the
     // stock left is worth less (written down / sold at a lower average since) instead of clamping
     // the average to 0 and leaving the GL below the item's value.
     if (remainingValue.lessThan(layerRoundingTolerance(currentQty).negated())) {
       throw new ServiceError(
         'CONFLICT',
-        `Cannot void this item receipt: the "${item.name}" on hand are valued at ${toAmountString(Money.round2(currentQty.times(currentAvg)))}, less than the ${toAmountString(Money.round2(qty.times(unitCost)))} it added (their cost was written down or the units sold since). Reverse the value adjustment or those sales first.`,
+        `Cannot void this item receipt: the "${item.name}" on hand are valued at ${toAmountString(Money.round2(currentQty.times(currentAvg)))}, less than the ${toAmountString(postedValue)} it added (their cost was written down or the units sold since). Reverse the value adjustment or those sales first.`,
       );
     }
     const newAvg = newQty.isZero()
@@ -336,7 +336,7 @@ async function reverseStock(
         quantityOnHand: newQty.toFixed(4),
         averageCost: newAvg.toFixed(4),
         // The voided entry took round2(qty x unit cost) off the inventory account.
-        ...valueRemainderAfter(item, currentQty, newQty, newAvg, Money.round2(qty.times(unitCost)).negated()),
+        ...valueRemainderAfter(item, currentQty, newQty, newAvg, postedValue.negated()),
         updatedAt: new Date(),
       })
       .where(eq(items.id, itemId));
@@ -510,7 +510,7 @@ async function saveItemReceipt(
       await assertNoActiveLandedCost(tx, { itemReceiptId: existing.id });
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       for (const line of oldLines) {
-        await reverseStock(tx, line.itemId, Money.of(line.quantity), Money.of(line.unitCost), `item_receipt_edit:${existing.id}`);
+        await reverseStock(tx, line.itemId, Money.of(line.quantity), Money.of(line.unitCost), `item_receipt_edit:${existing.id}`, Money.of(line.amount));
       }
       await reverseDocumentInventory(tx, 'item_receipt', existing.id);
       if (cur.purchaseOrderId) {
@@ -866,6 +866,7 @@ async function voidItemReceiptInTx(ctx: ServiceContext, id: string) {
         Money.of(line.quantity),
         Money.of(line.unitCost),
         `item_receipt_void:${id}`,
+        Money.of(line.amount),
       );
     }
 

@@ -65,7 +65,7 @@ import {
 import { assertForeignCurrencyAllowed } from './multiCurrency';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS, valueRemainderAfter } from './inventory';
-import { consumeStock } from './fifo';
+import { consumeStock, restoreConsumedStock } from './fifo';
 import {
   type DocumentInventoryLine,
   type InventoryLineDetail,
@@ -1349,15 +1349,16 @@ async function reverseInvoiceCOGS(
       .limit(1);
 
     if (layerRow) {
-      // FIFO-tracked: post a compensating layer at the blended consumed cost
-      // (the JE void already restored the Inventory Asset GL balance).
-      const unitCost = cogsAmount.dividedBy(qty);
-      await tx.db.insert(inventoryLayers).values({
-        companyId: tx.companyId,
+      // FIFO-tracked: the units go back into the layers the sale drew them from (the JE void
+      // already restored the Inventory Asset GL balance) — see fifo.ts restoreConsumedStock.
+      await restoreConsumedStock(tx, {
         itemId: line.itemId,
+        itemName: item.name,
+        entryId: cogsEntry.id,
+        qty,
+        value: cogsAmount,
         date: invoice.date,
-        quantityRemaining: qty.toFixed(4),
-        unitCost: unitCost.toFixed(4),
+        action: 'invoice reversed',
       });
       await tx.db
         .update(items)

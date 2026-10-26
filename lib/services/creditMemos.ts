@@ -67,7 +67,7 @@ import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from 
 import { markPaidAmount } from './invoices';
 import { assertPeriodOpen, recordClosingDateException, type PeriodCheck } from './fiscalPeriods';
 import { getHomeCurrencyCode } from './currencies';
-import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
+import { insertLayersWorth, layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
 import {
   type InventoryLineDetail,
   attachInventoryDetails,
@@ -555,7 +555,6 @@ async function postCreditMemoDocument(
           : Money.round2(prior.cost.times(qty).dividedBy(prior.qty))
         : null;
     const cost = accountantCost ? Money.round2(accountantCost) : priorCost ?? Money.round2(qty.times(currentUnitCost));
-    const unitCost = (accountantCost || priorCost) && qty.greaterThan(0) ? cost.dividedBy(qty) : currentUnitCost;
     if (!fifoTracked) {
       // Average-cost item restocked at a cost other than qty x its stored average (an Accountant's
       // Copy cost, or the purchaseCost fallback when no average exists yet): re-derive its average
@@ -623,12 +622,12 @@ async function postCreditMemoDocument(
     // FIFO items: restore stock value as a new layer at the restock cost, tagged with the memo
     // line so a void / edit takes exactly this layer back out (restockLayerRef).
     if (fifoTracked) {
-      await tx.db.insert(inventoryLayers).values({
-        companyId: tx.companyId,
+      // Worth exactly the restock cost posted above (fifo.ts insertLayersWorth).
+      await insertLayersWorth(tx, {
         itemId: line.itemId,
         date: input.date,
-        quantityRemaining: qty.toFixed(4),
-        unitCost: unitCost.toFixed(4),
+        qty,
+        value: cost,
         sourceRef: restockLayerRef(memo.id, line.id),
       });
     }

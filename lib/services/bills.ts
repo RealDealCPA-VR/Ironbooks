@@ -46,7 +46,7 @@ import {
 } from './inventorySites';
 import { assertNoActiveLandedCost } from './landedCost';
 import { valueRemainderAfter } from './inventory';
-import { layerRoundingTolerance, purchaseLayerRefs, takeFromDocumentLayers } from './fifo';
+import { insertLayersWorth, layerRoundingTolerance, purchaseLayerRefs, takeFromDocumentLayers } from './fifo';
 import {
   type ServiceContext,
   ServiceError,
@@ -471,14 +471,10 @@ export async function receivePurchasedStock(
     const newQty = currentQty.plus(qty);
 
     if (await isFifoTracked(tx, line.itemId)) {
-      await tx.db.insert(inventoryLayers).values({
-        companyId: tx.companyId,
-        itemId: line.itemId,
-        date,
-        quantityRemaining: qty.toFixed(4),
-        unitCost: line.unitCost.toFixed(4),
-        sourceRef,
-      });
+      // Layer(s) worth exactly what the document posted for the line (fifo.ts insertLayersWorth:
+      // 3000 units for $1,000.00 cannot be one 4dp-cost layer).
+      const posted = line.homeAmount != null ? Money.of(line.homeAmount) : Money.round2(qty.times(line.unitCost));
+      await insertLayersWorth(tx, { itemId: line.itemId, date, qty, value: posted, sourceRef });
       await tx.db
         .update(items)
         .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })

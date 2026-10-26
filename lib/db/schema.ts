@@ -217,6 +217,7 @@ export const errorCorrections = pgTable('error_corrections', {
 });
 
 // Audit Logs
+// Indexes (hand-written migrations): (company_id, created_at) 0029; (company_id, entity_type, entity_id) 0067.
 export const auditLogs = pgTable('audit_logs', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
