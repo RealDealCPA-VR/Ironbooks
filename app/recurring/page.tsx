@@ -937,7 +937,7 @@ export default function RecurringPage() {
         generated: GeneratedDoc[];
         reminders?: TemplateReminder[];
         failed?: { templateName: string; error: string }[];
-      }>('/api/recurring/run', { asOf: new Date().toISOString() });
+      }>('/api/recurring/run', { asOf: todayISO() }); // today on this computer's calendar
       const count = result.generated.length;
       const reminders = result.reminders?.length ?? 0;
       for (const f of result.failed ?? []) {
@@ -1184,7 +1184,8 @@ export default function RecurringPage() {
               {templates.map((tpl) => {
                 const badge = DOC_BADGES[tpl.docType] ?? { label: tpl.docType, tone: 'neutral' as const };
                 const isPastDue =
-                  tpl.nextRunDate !== null && new Date(tpl.nextRunDate) <= new Date();
+                  // Calendar days (next dates are UTC midnight), compared with today's LOCAL date.
+                  tpl.nextRunDate !== null && String(tpl.nextRunDate).slice(0, 10) <= todayISO();
                 const mode = modeOf(tpl);
                 const auto = mode === 'automatic';
                 return (

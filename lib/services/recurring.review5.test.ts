@@ -10,6 +10,8 @@
  *  C. A memorized transaction saved without a next date starts TODAY on this computer's calendar
  *     (a ledger date), not at the current instant — at 9:30 pm in New York that was tomorrow, and
  *     every document it entered carried that time of day.
+ *  D. "Run due" (which sends the current instant) enters what is due TODAY on this computer's
+ *     calendar: at 9:30 pm in New York it used to enter tomorrow's memorized transactions already.
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
@@ -27,6 +29,7 @@ import { NextRequest } from 'next/server';
 
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => ctx) }));
 import { POST as recurringPOST } from '@/app/api/recurring/route';
+import { POST as runPOST } from '@/app/api/recurring/run/route';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-recurring');
 let db: DB;
@@ -120,6 +123,37 @@ describe('memorized journal entries (review round 5)', () => {
       );
       expect(res.status).toBe(201);
       expect(new Date((await res.json()).nextRunDate).toISOString()).toBe('2026-10-26T00:00:00.000Z');
+    } finally {
+      vi.useRealTimers();
+      if (realTz === undefined) delete process.env.TZ;
+      else process.env.TZ = realTz;
+    }
+  });
+
+  it("D: Run due at 9:30 pm in New York does not enter tomorrow's memorized transactions", async () => {
+    const t = await createTemplate(ctx, {
+      name: 'Tomorrow rent',
+      docType: 'journal_entry',
+      frequency: 'monthly',
+      nextRunDate: '2026-10-27',
+      mode: 'automatic',
+      template: { description: 'Rent', lines: [{ accountId: acct['6400'], debit: '5.00' }, { accountId: acct['1000'], credit: '5.00' }] },
+    });
+    const realTz = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-27T01:30:00Z')); // Oct 26, 9:30 pm in New York
+    try {
+      const res = await runPOST(
+        new NextRequest('http://localhost/api/recurring/run', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ asOf: new Date().toISOString() }),
+        }),
+      );
+      expect(res.status).toBe(200);
+      const out = await res.json();
+      expect(out.generated.map((g: { templateId: string }) => g.templateId)).not.toContain(t.id);
     } finally {
       vi.useRealTimers();
       if (realTz === undefined) delete process.env.TZ;
