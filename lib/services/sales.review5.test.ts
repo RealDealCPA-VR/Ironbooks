@@ -34,6 +34,7 @@ import {
   journalEntryLines,
   journalEntries,
   salesOrderLines,
+  salesOrders,
   salesReps,
   taxRates,
   users,
@@ -56,7 +57,8 @@ import { openItemStatement } from './statements';
 import { buildLinkedTree } from './linkedTransactions';
 import { applyToInvoice, createCreditMemo, listCreditApplications, unapplyCreditApplication } from './creditMemos';
 import { listRecipients } from './letters';
-import { convertToInvoice as convertSalesOrder, createSalesOrder } from './salesOrders';
+import { convertToInvoice as convertSalesOrder, createSalesOrder, updateSalesOrder, updateStatus as updateSalesOrderStatus } from './salesOrders';
+import { Money } from '@/lib/money';
 import { planShipments } from './fulfillment';
 import { packingSlipData } from '@/lib/fulfillmentPrint';
 import { renderSalesForm } from './salesForms';
@@ -66,6 +68,14 @@ import { setBaseCurrency, upsertCurrency } from './currencies';
 
 let routeCtx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
+const soPdfCalls: Array<Record<string, unknown>> = [];
+vi.mock('@/lib/pdf/salesOrder', async (orig) => ({
+  ...(await orig<typeof import('@/lib/pdf/salesOrder')>()),
+  renderSalesOrderPdf: vi.fn(async (data: Record<string, unknown>) => {
+    soPdfCalls.push(data);
+    return new Uint8Array([37, 80, 68, 70]);
+  }),
+}));
 const pdfCalls: Array<Record<string, unknown>> = [];
 vi.mock('@/lib/pdf/invoice', async (orig) => ({
   ...(await orig<typeof import('@/lib/pdf/invoice')>()),
@@ -692,5 +702,67 @@ describe('18. Indexes on A/R lines and applications (migration 0064)', () => {
     ]) {
       expect(names.has(n), n).toBe(true);
     }
+  });
+});
+
+describe('19. Sales order edits racing a conversion', () => {
+  async function order(label: string) {
+    const cust = await newCustomer(label);
+    const svc = await serviceItem('Boxes');
+    const so = await createSalesOrder(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      lines: [{ itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
+    });
+    const [line] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    return { cust, svc, so, line };
+  }
+
+  it('voiding an order while it is being invoiced never leaves a void order with invoiced quantities', async () => {
+    const { so, line } = await order('Void race');
+    await Promise.allSettled([
+      updateSalesOrderStatus(ctx, so.id, 'void'),
+      convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 4 }] }),
+    ]);
+    const [after] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.id, line.id));
+    const [hdr] = await db.select().from(salesOrders).where(eq(salesOrders.id, so.id));
+    expect(hdr.status === 'void' && Money.gt(after.quantityInvoiced ?? '0', 0)).toBe(false);
+  });
+
+  it('an edit saved while the order is being invoiced keeps the invoiced quantity', async () => {
+    const { cust, svc, so, line } = await order('Edit race');
+    await Promise.allSettled([
+      updateSalesOrder(ctx, so.id, {
+        customerId: cust,
+        date: d('2026-03-01'),
+        taxRateId: null,
+        memo: 'Rush',
+        lines: [{ id: line.id, itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
+      }),
+      convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 4 }] }),
+    ]);
+    const [after] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    const invoiced = await db.select().from(invoices).where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.customerId, cust)));
+    expect(after.quantityInvoiced).toBe(invoiced.length === 1 ? '4.0000' : '0.0000');
+  });
+});
+
+describe('20. Sales order PDF backorder note', () => {
+  it('prints the backordered quantity exactly', async () => {
+    const cust = await newCustomer('Backorder');
+    const svc = await serviceItem('Rope');
+    const so = await createSalesOrder(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      lines: [{ itemId: svc, description: 'Rope', quantity: '0.3', rate: '10.00', taxable: false }],
+    });
+    const [line] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    await convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: '0.1' }] });
+    soPdfCalls.length = 0;
+    await renderSalesForm(ctx, 'sales_order', so.id);
+    const lines = soPdfCalls[0]?.lines as Array<{ description: string }>;
+    expect(lines[0].description).toBe('Rope (backordered: 0.2)');
   });
 });

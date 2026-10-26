@@ -295,6 +295,16 @@ export async function updateStatus(
   id: string,
   status: 'open' | 'closed' | 'void',
 ) {
+  // Read, check and write in ONE transaction: a conversion committed between a read outside it
+  // and the write left a VOID order carrying invoiced quantities (the void rule bypassed).
+  return inTransaction(ctx, (tx) => updateStatusInTx(tx, id, status));
+}
+
+async function updateStatusInTx(
+  ctx: ServiceContext,
+  id: string,
+  status: 'open' | 'closed' | 'void',
+) {
   const [order] = await ctx.db
     .select()
     .from(salesOrders)
@@ -318,6 +328,19 @@ export async function updateStatus(
       'CONFLICT',
       'Cannot void a partially invoiced sales order. Close it instead to cancel the backorder.',
     );
+  }
+  if (status === 'void') {
+    // Whatever the header says, an order with invoiced quantities is not voided.
+    const lines = await ctx.db
+      .select({ invoiced: salesOrderLines.quantityInvoiced })
+      .from(salesOrderLines)
+      .where(eq(salesOrderLines.salesOrderId, id));
+    if (lines.some((l) => Money.gt(l.invoiced ?? '0', 0))) {
+      throw new ServiceError(
+        'CONFLICT',
+        'Part of this sales order has been invoiced, so it cannot be voided. Close it instead to cancel the backorder.',
+      );
+    }
   }
 
   const [updated] = await ctx.db
@@ -753,6 +776,20 @@ export async function backorderReport(ctx: ServiceContext): Promise<BackorderRep
  */
 export async function updateSalesOrder(ctx: ServiceContext, id: string, input: CreateSalesOrderInput) {
   input = await applyCustomerTaxDefaults(ctx, input);
+  const { computedLines, subtotal, taxAmount, total } = await prepareSalesOrder(ctx, input);
+  // The order (and its invoiced quantities) is read INSIDE the transaction that rewrites its
+  // lines: read outside it, a conversion committed in between was overwritten with the stale
+  // invoiced quantities — the order could then be invoiced again for the same units.
+  return inTransaction(ctx, (tx) => updateSalesOrderInTx(tx, id, input, { computedLines, subtotal, taxAmount, total }));
+}
+
+async function updateSalesOrderInTx(
+  ctx: ServiceContext,
+  id: string,
+  input: CreateSalesOrderInput,
+  prep: Awaited<ReturnType<typeof prepareSalesOrder>>,
+) {
+  const { computedLines, subtotal, taxAmount, total } = prep;
   const existing = await getSalesOrder(ctx, id);
   // Accountant's Copy (I1): both the order's date and the new one.
   await assertDividingDateOpen(ctx, existing.date);
@@ -764,7 +801,6 @@ export async function updateSalesOrder(ctx: ServiceContext, id: string, input: C
       'This sales order is closed (fully invoiced or cancelled), so it can no longer be changed.',
     );
   }
-  const { computedLines, subtotal, taxAmount, total } = await prepareSalesOrder(ctx, input);
 
   // Map input rows to existing lines by id.
   const oldById = new Map(existing.lines.map((l) => [l.id, l]));

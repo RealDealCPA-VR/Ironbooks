@@ -30,6 +30,7 @@ import { getCreditMemo } from './creditMemos';
 import { getSalesOrder } from './salesOrders';
 import { customerStatement } from './statements';
 import { getCompany } from './company';
+import { Money } from '@/lib/money';
 import { docRef } from './docNumbers';
 import { isConfigured, sendMail } from './email';
 import { renderEstimatePdf } from '@/lib/pdf/estimate';
@@ -250,8 +251,11 @@ export async function renderSalesForm(
         customerName: cust.name,
         order: { number: docRef(o.refNumber, o.orderNumber), date: iso(o.date), status: o.status, total: o.total, memo: o.memo },
         lines: o.lines.map((l) => {
-          const backordered = Number(l.quantity) - Number(l.quantityInvoiced ?? 0);
-          const note = Number(l.quantityInvoiced ?? 0) > 0 && backordered > 0 ? ` (backordered: ${backordered})` : '';
+          // Decimal, not float: 2.5 ordered - 1.2 invoiced printed "1.2999999999999998".
+          const invoiced = Money.of(l.quantityInvoiced ?? 0);
+          const backordered = Money.of(l.quantity).minus(invoiced);
+          const note =
+            invoiced.greaterThan(0) && backordered.greaterThan(0) ? ` (backordered: ${backordered.toDecimalPlaces(4).toString()})` : '';
           return { ...lineOf(l), description: `${l.description ?? ''}${note}` };
         }),
         shipping: shippingOf(o),

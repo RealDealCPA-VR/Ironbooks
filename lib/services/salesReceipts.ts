@@ -904,7 +904,33 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
   await assertSalesTaxAllowed(ctx, input, [existing.taxRateId, ...keptTaxLines.map((l) => l.taxRateId)]);
 
   const prep = await prepareSalesReceipt(ctx, input);
+  await assertDepositedReceiptEdit(ctx, id, existing, prep, input);
 
+  return inTransaction(ctx, async (tx) => {
+    const [receipt] = await tx.db
+      .select()
+      .from(salesReceipts)
+      .where(and(eq(salesReceipts.companyId, tx.companyId), eq(salesReceipts.id, id)));
+    if (!receipt || receipt.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Cannot edit a voided sales receipt.');
+    }
+    // Again inside the transaction: a deposit (or an edit) saved since the check above.
+    await assertDepositedReceiptEdit(tx, id, receipt, prep, input);
+    return updateSalesReceiptInTx(tx, id, input, prep, receipt);
+  });
+}
+
+/**
+ * Once the receipt is in a bank deposit its amount and deposit account are locked (the deposit
+ * moved exactly that money out of Undeposited Funds), and it cannot be dated after the deposit.
+ */
+async function assertDepositedReceiptEdit(
+  ctx: ServiceContext,
+  id: string,
+  existing: { total: string; depositAccountId: string | null },
+  prep: PreparedSalesReceipt,
+  input: CreateSalesReceiptInput,
+) {
   if (await isDeposited(ctx, id)) {
     if (!Money.eq(prep.total, existing.total) || prep.depositAccountId !== existing.depositAccountId) {
       throw new ServiceError(
@@ -934,15 +960,16 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
       );
     }
   }
+}
 
-  return inTransaction(ctx, async (tx) => {
-    const [receipt] = await tx.db
-      .select()
-      .from(salesReceipts)
-      .where(and(eq(salesReceipts.companyId, tx.companyId), eq(salesReceipts.id, id)));
-    if (!receipt || receipt.status === 'void') {
-      throw new ServiceError('CONFLICT', 'Cannot edit a voided sales receipt.');
-    }
+async function updateSalesReceiptInTx(
+  tx: ServiceContext,
+  id: string,
+  input: CreateSalesReceiptInput,
+  prep: PreparedSalesReceipt,
+  receipt: typeof salesReceipts.$inferSelect,
+) {
+  {
     const oldLines = await tx.db
       .select()
       .from(salesReceiptLines)
@@ -1020,5 +1047,5 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
     });
 
     return { ...updated, lines: insertedLines };
-  });
+  }
 }
