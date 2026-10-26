@@ -366,6 +366,15 @@ export async function deleteReceipt(ctx: ServiceContext, id: string): Promise<vo
   if (view.status === 'saved') {
     throw validation('This receipt is already saved as a transaction. Delete or void that transaction instead.');
   }
+  // Filed to a record from the Doc Center since: the file is that record's document now —
+  // deleting the receipt would delete it from the record too.
+  const [file] = await ctx.db
+    .select({ entityId: attachments.entityId })
+    .from(attachments)
+    .where(and(eq(attachments.id, view.attachmentId), eq(attachments.companyId, ctx.companyId)));
+  if (file?.entityId) {
+    throw validation('This receipt was filed to a record in the Doc Center. Remove it from that record there instead.');
+  }
   // The scan row goes with its attachment (ON DELETE CASCADE); deleteAttachment audits it.
   await deleteAttachment(ctx, view.attachmentId);
 }
@@ -685,6 +694,11 @@ const zMoneyStr = z
   .transform((v) => String(v).trim())
   .refine((v) => /^-?\d+(\.\d{1,2})?$/.test(v), 'Enter an amount like 12.34');
 const zId = z.string().regex(UUID_RE, 'Invalid id');
+/** yyyy-mm-dd of a day that exists ("2026-02-30" would silently become March 2). */
+const isRealDay = (v: string) => {
+  const d = new Date(`${v}T12:00:00.000Z`);
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v;
+};
 
 export const saveReceiptSchema = z
   .object({
@@ -695,7 +709,7 @@ export const saveReceiptSchema = z
     payeeName: z.string().trim().max(255).nullish(),
     /** Create this vendor and use it. */
     newVendorName: z.string().trim().max(255).nullish(),
-    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Enter a date'),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Enter a date').refine(isRealDay, 'Enter a real date (that day does not exist).'),
     total: zMoneyStr,
     /** Sales tax recorded on its own line (needs taxAccountId). */
     tax: zMoneyStr.nullish(),
@@ -706,7 +720,7 @@ export const saveReceiptSchema = z
     memo: z.string().max(1000).nullish(),
     /** Check number / card slip number / vendor's bill number. */
     reference: z.string().trim().max(60).nullish(),
-    dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish(),
+    dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isRealDay, 'Enter a real due date (that day does not exist).').nullish(),
     classId: zId.nullish(),
     customerId: zId.nullish(),
     /** The person confirmed a duplicate check / bill number. */
