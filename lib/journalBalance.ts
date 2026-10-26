@@ -131,3 +131,50 @@ export function computeJournalBalance(lines: JournalLineInput[]): JournalBalance
     blocker,
   };
 }
+
+/** One line of the journal-entry form (app/journal/page.tsx). */
+export interface JournalFormLine {
+  accountId: string;
+  debit: string;
+  credit: string;
+  memo: string;
+  classId: string;
+  /** QB "Name" column: "<kind>:<id>" (customer / vendor / employee / other) or ''. */
+  name: string;
+}
+
+/** One line as /api/journal-entries (and a memorized journal entry) takes it. */
+export interface JournalPayloadLine {
+  accountId: string;
+  debit: string | undefined;
+  credit: string | undefined;
+  memo: string | null;
+  classId: string | null;
+  entityType: string | null;
+  entityId: string | null;
+}
+
+/**
+ * The lines the form sends — for Save AND for Memorize, so a memorized entry is exactly what a
+ * save would post. (Memorize used to drop the Name column, so a memorized entry with an A/R or
+ * A/P line could never be entered: those lines need their customer / vendor.) Lines without an
+ * account are left out; amounts are what the Save gate validated ("1,250.00 " -> "1250.00").
+ */
+export function journalPayloadLines(lines: JournalFormLine[]): JournalPayloadLine[] {
+  return lines
+    .filter((l) => l.accountId)
+    .map((l) => {
+      const sep = l.name ? l.name.indexOf(':') : -1;
+      const entityType = sep > 0 ? l.name.slice(0, sep) : null;
+      const entityId = sep > 0 ? l.name.slice(sep + 1) : null;
+      return {
+        accountId: l.accountId,
+        debit: journalPayloadAmount(l.debit),
+        credit: journalPayloadAmount(l.credit),
+        memo: l.memo.trim() || null,
+        classId: l.classId || null,
+        entityType: entityType || null,
+        entityId: entityId || null,
+      };
+    });
+}

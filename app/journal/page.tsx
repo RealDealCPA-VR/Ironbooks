@@ -36,7 +36,7 @@ import {
 import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
-import { computeJournalBalance, journalPayloadAmount } from '@/lib/journalBalance';
+import { computeJournalBalance, journalPayloadLines } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
@@ -381,21 +381,8 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       description: description.trim(),
       reference: reference.trim() || null,
       isAdjusting,
-      lines: lines
-        .filter((l) => l.accountId)
-        .map((l) => {
-          const [entityType, entityId] = l.name ? l.name.split(':') : [null, null];
-          return {
-            accountId: l.accountId,
-            // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
-            debit: journalPayloadAmount(l.debit),
-            credit: journalPayloadAmount(l.credit),
-            memo: l.memo.trim() || null,
-            classId: l.classId || null,
-            entityType: entityType || null,
-            entityId: entityId || null,
-          };
-        }),
+      // Exactly what the Save gate validated ("1,250.00 " -> "1250.00"), names included.
+      lines: journalPayloadLines(lines),
     };
     const ctx = { payload, resubmit: send, applyToForm, fallback: 'Failed to save entry.' };
     // Class tracking "warn when a line has no class" (lib/formPrefs.ts): offer fixes instead of a
@@ -435,19 +422,13 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
             getTemplate={() => {
               if (!bal.canSave) return 'Balance the entry (debits = credits) before memorizing.';
               if (!description.trim()) return 'Enter a description before memorizing.';
+              // The same lines a save posts (the Name column too: A/R and A/P lines need it).
               return {
                 date,
                 description: description.trim(),
                 reference: reference.trim() || null,
-                lines: lines
-                  .filter((l) => l.accountId)
-                  .map((l) => ({
-                    accountId: l.accountId,
-                    debit: journalPayloadAmount(l.debit),
-                    credit: journalPayloadAmount(l.credit),
-                    memo: l.memo.trim() || null,
-                    classId: l.classId || null,
-                  })),
+                isAdjusting,
+                lines: journalPayloadLines(lines),
               };
             }}
           />

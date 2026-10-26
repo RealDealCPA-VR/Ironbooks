@@ -1,0 +1,94 @@
+/**
+ * Round-5 review regressions (memorized journal entries):
+ *  A. Memorize keeps the Name column (lib/journalBalance.ts journalPayloadLines is what both Save
+ *     and Memorize send). The journal window's Memorize used to drop it, so a memorized entry with
+ *     an A/R or A/P line could never be entered ("needs a customer in the Name column") — an
+ *     automatic one failed on every run.
+ *  B. With "Automatically assign general journal entry numbers" on (the default), each entry made
+ *     from a memorized journal entry gets the NEXT number, as in QuickBooks, instead of repeating
+ *     the number the entry had when it was memorized.
+ */
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import path from 'node:path';
+import fs from 'node:fs';
+import { eq } from 'drizzle-orm';
+import { getDb, closeDb, type DB } from '@/lib/db';
+import { users, accounts } from '@/lib/db/schema';
+import type { ServiceContext } from './_base';
+import { createCompany } from './company';
+import { createCustomer } from './customers';
+import { createManualEntry, getEntry } from './journal';
+import { createTemplate, runTemplateNow } from './recurring';
+import { journalPayloadLines } from '@/lib/journalBalance';
+
+const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-recurring');
+let db: DB;
+let ctx: ServiceContext;
+const acct: Record<string, string> = {};
+
+describe('memorized journal entries (review round 5)', () => {
+  beforeAll(async () => {
+    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    db = await getDb(TEST_DIR);
+    const [user] = await db.insert(users).values({ email: 'r5@recurring.test', name: 'Remy', passwordHash: 'x' }).returning();
+    const company = await createCompany(db, { name: 'Review5 Recurring', ownerId: user.id });
+    ctx = { db, companyId: company.id, userId: user.id };
+    for (const r of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) acct[r.code] = r.id;
+  });
+
+  afterAll(async () => {
+    await closeDb();
+    try {
+      fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch {
+      /* Windows may hold a handle; the next run wipes it */
+    }
+  });
+
+  it('A: a memorized entry with an A/R line keeps its customer and can be entered', async () => {
+    const cust = await createCustomer(ctx, { displayName: 'Monthly Fee Co' } as never);
+    // The journal window's form lines, as the user typed them.
+    const lines = journalPayloadLines([
+      { accountId: acct['1200'], debit: '1,250.00', credit: '', memo: ' Monthly fee ', classId: '', name: `customer:${cust.id}` },
+      { accountId: acct['4100'], debit: '', credit: '1250.00', memo: '', classId: '', name: '' },
+      { accountId: '', debit: '', credit: '', memo: '', classId: '', name: '' },
+    ]);
+    expect(lines).toEqual([
+      { accountId: acct['1200'], debit: '1250.00', credit: undefined, memo: 'Monthly fee', classId: null, entityType: 'customer', entityId: cust.id },
+      { accountId: acct['4100'], debit: undefined, credit: '1250.00', memo: null, classId: null, entityType: null, entityId: null },
+    ]);
+    const t = await createTemplate(ctx, {
+      name: 'Monthly fee',
+      docType: 'journal_entry',
+      frequency: 'monthly',
+      nextRunDate: '2026-11-01',
+      mode: 'remind',
+      template: { date: '2026-10-01', description: 'Monthly fee', reference: null, lines },
+    });
+    const doc = await runTemplateNow(ctx, t.id, new Date('2026-11-01T00:00:00Z'));
+    const e = await getEntry(ctx, doc.docId);
+    expect(e.lines.find((l) => l.accountId === acct['1200'])?.entityId).toBe(cust.id);
+  });
+
+  it('B: each entry from a memorized journal entry gets the next entry number', async () => {
+    const lines = [
+      { accountId: acct['6400'], debit: '900.00' },
+      { accountId: acct['1000'], credit: '900.00' },
+    ];
+    const first = await createManualEntry(ctx, { date: new Date('2026-10-01T00:00:00Z'), description: 'Rent', lines });
+    const memorizedRef = first.reference!;
+    const t = await createTemplate(ctx, {
+      name: 'Rent',
+      docType: 'journal_entry',
+      frequency: 'monthly',
+      nextRunDate: '2026-11-01',
+      mode: 'remind',
+      template: { date: '2026-10-01', description: 'Rent', reference: memorizedRef, lines },
+    });
+    const a = await getEntry(ctx, (await runTemplateNow(ctx, t.id, new Date('2026-11-01T00:00:00Z'))).docId);
+    const b = await getEntry(ctx, (await runTemplateNow(ctx, t.id, new Date('2026-12-01T00:00:00Z'))).docId);
+    const refs = [memorizedRef, a.reference, b.reference];
+    expect(new Set(refs).size).toBe(3);
+    expect(Number(b.reference)).toBe(Number(a.reference) + 1);
+  });
+});
