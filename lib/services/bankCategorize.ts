@@ -242,6 +242,11 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
     throw validation('Choose an account.');
   }
   if (input.classId) await assertRefInCompany(ctx, classes, input.classId, 'Class');
+  // The offset is the OTHER side of the bank line: categorizing to the feed's own account posts
+  // Dr Checking / Cr Checking — the line shows as added but the books never get the money.
+  if ((splits ? splits.map((sp) => sp.accountId) : [input.accountId]).includes(bankGlAccountId)) {
+    throw validation('Choose a different account: this line came from this bank account, so it cannot also be the account it goes to.');
+  }
   const offsets: { accountId: string; classId: string | null; amount: string }[] = splits
     ? allocate(homeAmt, splits.map((sp) => sp.percent))
         .map((a, i) => ({

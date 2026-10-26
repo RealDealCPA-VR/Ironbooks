@@ -167,6 +167,26 @@ describe('bank feed categorize: long memo', () => {
     expect(res.applied).toHaveLength(1);
   });
 
+  it('a feed line cannot be added to the bank account it came from (Dr Checking / Cr Checking posts nothing)', async () => {
+    const ba = await linkBank('1000');
+    const line = await feedLine(ba, '-45.00');
+    await expectCode(categorize(ctx, { bankTransactionId: line.id, accountId: acct['1000'] }), 'VALIDATION', /same account|this bank account/i);
+    await expectCode(
+      categorize(ctx, {
+        bankTransactionId: line.id,
+        accountId: acct['6300'],
+        splits: [
+          { accountId: acct['6300'], percent: '50' },
+          { accountId: acct['1000'], percent: '50' },
+        ],
+      }),
+      'VALIDATION',
+      /same account|this bank account/i,
+    );
+    const [row] = await db.select().from(bankTransactions).where(eq(bankTransactions.id, line.id));
+    expect(row.matched).toBe(false);
+  });
+
   it('a payee longer than 255 characters is refused with a plain message (not a database error)', async () => {
     const ba = await linkBank('1000');
     const line = await feedLine(ba, '-45.00');
