@@ -148,25 +148,39 @@ function liabilityBaseName(name: string): string {
  * paychecks never used (e.g. the seeded "Social Security" item while engine lines carry no item)
  * must not win, or the payment relieves an account that was never credited.
  */
-async function liabilityAccountForItem(ctx: ServiceContext, name: string, fallbackId: string): Promise<string> {
-  const key = liabilityBaseName(name);
+async function liabilityAccountResolver(ctx: ServiceContext, fallbackId: string): Promise<(name: string) => string> {
   const items = await ctx.db
     .select({ id: payrollItems.id, name: payrollItems.name, liabilityAccountId: payrollItems.liabilityAccountId })
     .from(payrollItems)
     .where(eq(payrollItems.companyId, ctx.companyId));
-  const lines = await ctx.db
-    .select({ name: paycheckLines.name, itemId: paycheckLines.payrollItemId, payDate: paychecks.payDate })
+  // The latest paycheck line of each distinct name — one row per name, not every withholding line
+  // of every paycheck in the file (which was read once per item paid: years of payroll made each
+  // Pay Liabilities save load hundreds of thousands of rows).
+  const latestByName = await ctx.db
+    .selectDistinctOn([paycheckLines.name], { name: paycheckLines.name, itemId: paycheckLines.payrollItemId, payDate: paychecks.payDate })
     .from(paycheckLines)
     .innerJoin(paychecks, eq(paycheckLines.paycheckId, paychecks.id))
     .where(and(eq(paychecks.companyId, ctx.companyId), ne(paycheckLines.kind, 'earning')))
-    .orderBy(desc(paychecks.payDate));
-  const hit = lines.find((l) => liabilityBaseName(l.name) === key);
-  if (hit) {
-    const item = hit.itemId ? items.find((i) => i.id === hit.itemId) : undefined;
-    return item?.liabilityAccountId ?? fallbackId;
+    .orderBy(paycheckLines.name, desc(paychecks.payDate));
+  // "State Withholding (CA)" and "State Withholding (NY)" share a base name: the latest of them wins.
+  const latestByBase = new Map<string, { itemId: string | null; payDate: Date }>();
+  for (const l of latestByName) {
+    const key = liabilityBaseName(l.name);
+    const prev = latestByBase.get(key);
+    if (!prev || new Date(l.payDate).getTime() > new Date(prev.payDate).getTime()) {
+      latestByBase.set(key, { itemId: l.itemId ?? null, payDate: l.payDate });
+    }
   }
-  const named = items.find((i) => i.liabilityAccountId && liabilityBaseName(i.name) === key);
-  return named?.liabilityAccountId ?? fallbackId;
+  return (name: string) => {
+    const key = liabilityBaseName(name);
+    const hit = latestByBase.get(key);
+    if (hit) {
+      const item = hit.itemId ? items.find((i) => i.id === hit.itemId) : undefined;
+      return item?.liabilityAccountId ?? fallbackId;
+    }
+    const named = items.find((i) => i.liabilityAccountId && liabilityBaseName(i.name) === key);
+    return named?.liabilityAccountId ?? fallbackId;
+  };
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -197,6 +211,17 @@ function parsePaymentAmount(value: unknown, what = 'Enter a valid amount to pay.
 function assertPaymentDate(date: unknown): asserts date is Date {
   if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
     throw validation('Enter a valid date for the payment (for example 2026-07-15).');
+  }
+}
+
+/**
+ * Optional text fields of a payment request (memo, payee, check number) must be text: a number or
+ * an object from a request body used to fail on `.trim()` with a TypeError (HTTP 500).
+ */
+function assertTextFields(input: object, fields: string[]) {
+  for (const f of fields) {
+    const v = (input as Record<string, unknown>)[f];
+    if (v != null && typeof v !== 'string') throw validation(`${f} must be text.`);
   }
 }
 
@@ -354,6 +379,7 @@ export async function paySalesTaxAgencies(
 ): Promise<SalesTaxPaymentResult> {
   if (!input.payments?.length) throw validation('Pick at least one tax agency to pay.');
   assertPaymentDate(input.date);
+  assertTextFields(input, ['memo', 'checkNumber']);
   const seen = new Set<string>();
   for (const p of input.payments) {
     if (!p.agencyId || !UUID_RE.test(p.agencyId)) throw validation('Pick the tax agency to pay.');
@@ -449,6 +475,7 @@ export interface PaySalesTaxInput {
 export async function paySalesTax(ctx: ServiceContext, input: PaySalesTaxInput) {
   const amt = parsePaymentAmount(input.amount);
   assertPaymentDate(input.date);
+  assertTextFields(input, ['memo', 'checkNumber']);
   if (!amt.greaterThan(0)) {
     throw validation('Payment amount must be greater than zero.');
   }
@@ -867,6 +894,8 @@ export async function payPayrollLiabilities(
   // Relieve the account(s) the paychecks credited (Preferences account / item accounts), not
   // always 2300 — otherwise the real liability never clears and 2300 goes negative.
   assertPaymentDate(input.date);
+  assertTextFields(input, ['memo', 'payeeName', 'checkNumber']);
+  if (input.items != null && !Array.isArray(input.items)) throw validation('items must be a list of { name, amount }.');
   const payrollAccountId = await defaultPayrollLiabilityAccountId(ctx);
   const items = input.items ?? [];
 
@@ -875,8 +904,10 @@ export async function payPayrollLiabilities(
     let total = Money.zero();
     const debitLines: Array<{ accountId: string; debit: string; memo: string }> = [];
     const seen = new Set<string>();
+    const accountFor = await liabilityAccountResolver(ctx, payrollAccountId);
     for (const item of items) {
-      const name = item.name?.trim();
+      // A request body's item may be anything (null, a number for the name): a 400, not a 500.
+      const name = typeof item?.name === 'string' ? item.name.trim() : '';
       if (!name) throw validation('Each liability item needs a name.');
       if (seen.has(name)) {
         throw validation(`Duplicate liability item "${name}" — combine into one line.`);
@@ -888,7 +919,7 @@ export async function payPayrollLiabilities(
       }
       total = total.plus(amt);
       debitLines.push({
-        accountId: await liabilityAccountForItem(ctx, name, payrollAccountId),
+        accountId: accountFor(name),
         debit: toAmountString(amt),
         memo: name,
       });
@@ -968,6 +999,7 @@ export interface PayCreditCardInput {
 export async function payCreditCard(ctx: ServiceContext, input: PayCreditCardInput) {
   const amt = parsePaymentAmount(input.amount);
   assertPaymentDate(input.date);
+  assertTextFields(input, ['memo']);
   if (!amt.greaterThan(0)) {
     throw validation('Payment amount must be greater than zero.');
   }

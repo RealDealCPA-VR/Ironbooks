@@ -307,6 +307,24 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     }
   });
 
+  it('E: Pay Liabilities / Pay Sales Tax refuse a memo or item name that is not text with a 400 (not a TypeError)', async () => {
+    const { payPayrollLiabilities, paySalesTaxAgencies, payCreditCard } = await import('./liabilityPayments');
+    const expectValidation = async (p: Promise<unknown>) => {
+      const err = await p.then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(ServiceError);
+      expect((err as ServiceError).code).toBe('VALIDATION');
+    };
+    const base = { date: d('2026-07-01'), paymentAccountId: acct['1000'] };
+    await expectValidation(payPayrollLiabilities(ctx, { ...base, amount: '10.00', memo: 42 as never }));
+    await expectValidation(payPayrollLiabilities(ctx, { ...base, items: [{ name: 7 as never, amount: '10.00' }] }));
+    await expectValidation(payPayrollLiabilities(ctx, { ...base, items: [null as never] }));
+    await expectValidation(payPayrollLiabilities(ctx, { ...base, amount: '10.00', payeeName: { a: 1 } as never }));
+    await expectValidation(
+      paySalesTaxAgencies(ctx, { ...base, payments: [{ agencyId: '00000000-0000-4000-8000-000000000001', amount: '5.00' }], memo: 5 as never }),
+    );
+    await expectValidation(payCreditCard(ctx, { ...base, creditCardAccountId: acct['2100'], amount: '5.00', memo: [] as never }));
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
