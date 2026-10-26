@@ -12,7 +12,7 @@ import { Money } from '@/lib/money';
 import { ServiceError, type ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createItem, updateItem } from './items';
-import { adjustInventory, inventoryValuation, inventoryValuationAsOf } from './inventory';
+import { adjustInventory, inventoryValuation, inventoryValuationAsOf, setReorderPoint } from './inventory';
 import { adjustQuantityAtSite } from './inventorySiteOps';
 import { buildAssembly, getBom, setBom, unbuildAssembly } from './assemblies';
 import { mergeItems } from './lists/mergeLists';
@@ -24,6 +24,10 @@ import { createBill, voidBill } from './bills';
 import { createExpense } from './expenses';
 import { createVendorCredit, updateVendorCredit, voidVendorCredit } from './vendorCredits';
 import { inventoryItemDetail } from './lists/inventoryCenter';
+import { createPurchaseOrdersFromReorder } from './lists/itemTools';
+import { createItemWithOpeningStock } from './lists/openingStock';
+
+import { purchaseOrders } from '@/lib/db/schema';
 import { createVendor } from './vendors';
 import { createItemReceipt, voidItemReceipt } from './itemReceipts';
 import { createCreditMemo, voidCreditMemo } from './creditMemos';
@@ -396,6 +400,52 @@ describe('review5 inventory', () => {
     await expect(
       createInvoice(ctx, { customerId: c.id, date: d('2026-01-05'), lines: [{ itemId: fifo.id, quantity: 1, rate: '5.00' }] } as never),
     ).rejects.toThrow(/has no cost/);
+  });
+
+  it('purchase orders from the reorder list are dated today on the local calendar (not tomorrow in UTC)', async () => {
+    const v = await createVendor(ctx, { displayName: 'Reorder supplier' } as never);
+    const it0 = await invItem('Reorder widget', { preferredVendorId: v.id, purchaseCost: '2.00' });
+    await setReorderPoint(ctx, it0.id, 5);
+    const prevTz = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    vi.useFakeTimers({ toFake: ['Date'] });
+    let poId: string;
+    try {
+      vi.setSystemTime(new Date('2027-01-01T03:00:00.000Z')); // 10 pm on Dec 31 in New York
+      const res = await createPurchaseOrdersFromReorder(ctx, {});
+      poId = (res.purchaseOrders[0] as { purchaseOrderId: string }).purchaseOrderId;
+    } finally {
+      vi.useRealTimers();
+      process.env.TZ = prevTz;
+      if (prevTz === undefined) delete process.env.TZ;
+    }
+    const [po] = await db.select().from(purchaseOrders).where(eq(purchaseOrders.id, poId));
+    expect(po.date.toISOString().slice(0, 10)).toBe('2026-12-31');
+  });
+
+  it('opening quantity on hand without an as-of date is dated today on the local calendar', async () => {
+    const prevTz = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    vi.useFakeTimers({ toFake: ['Date'] });
+    let entryId: string | null = null;
+    try {
+      vi.setSystemTime(new Date('2027-01-01T03:00:00.000Z')); // 10 pm on Dec 31 in New York
+      const res = await createItemWithOpeningStock(ctx, {
+        name: 'Year-end stock',
+        type: 'inventory',
+        assetAccountId: acct['1300'],
+        incomeAccountId: acct['4000'],
+        openingQuantity: '10',
+        openingValue: '50.00',
+      } as never);
+      entryId = res.opening!.entryId;
+    } finally {
+      vi.useRealTimers();
+      process.env.TZ = prevTz;
+      if (prevTz === undefined) delete process.env.TZ;
+    }
+    const [je] = await db.select().from(journalEntries).where(eq(journalEntries.id, entryId!));
+    expect(je.date.toISOString().slice(0, 10)).toBe('2026-12-31');
   });
 
   // ---- valuation includes inactive items that still hold stock ----

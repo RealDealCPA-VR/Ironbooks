@@ -30,6 +30,7 @@ import { type ServiceContext, inTransaction, notFound, validation, writeAudit } 
 import { findOrCreateOpeningBalanceEquity } from '../accounts';
 import { type CreateItemInput, createItem } from '../items';
 import { postJournalEntry } from '../posting';
+import { todayCalendarDay } from '../inventory';
 import { assertAccountantMayEnterOpeningStock } from '../accountantCopy/guard';
 
 export interface OpeningStockInput {
@@ -38,7 +39,7 @@ export interface OpeningStockInput {
   openingValue?: string | number | null;
   /** ...or a unit cost. */
   openingUnitCost?: string | number | null;
-  /** As-of date (defaults to today). */
+  /** As-of date (defaults to today's calendar day). */
   openingAsOf?: Date | null;
   /** 'average' (default: no FIFO layer, the item stays average-cost) or 'fifo' (see module doc). */
   openingCosting?: 'average' | 'fifo' | null;
@@ -90,7 +91,9 @@ export function planOpeningStock(input: OpeningStockInput, itemType: string, tra
   } else {
     throw validation('Enter the total value (or unit cost) of the opening quantity.');
   }
-  const asOf = input.openingAsOf ?? new Date();
+  // No as-of date: today's calendar day (the stored-date convention), not the UTC instant, which
+  // in the evening west of UTC is already tomorrow (on Dec 31, next year).
+  const asOf = input.openingAsOf ?? todayCalendarDay();
   if (Number.isNaN(asOf.getTime())) throw validation('The as-of date is not a valid date.');
   return { qty, unitCost, value, asOf };
 }
