@@ -328,3 +328,102 @@ describe('reconciliation: clearing lines', () => {
     await expectCode(toggleCleared(ctx, r1.id, bankLine.id, true), 'VALIDATION', /statement date/i);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Make Deposits on a large company file
+// ---------------------------------------------------------------------------
+
+describe('Make Deposits on a large file', () => {
+  it('lists what is waiting in Undeposited Funds when more than 65,535 payments were deposited over the years', async () => {
+    const { createCustomer } = await import('./customers');
+    const { listUndepositedPayments } = await import('./deposits');
+    const { sql } = await import('drizzle-orm');
+    const c = await createCustomer(ctx, { displayName: 'Walk-in' } as never);
+    const N = 66_000;
+    // Years of history: N payments, all deposited by one (old) deposit.
+    await db.execute(sql`
+      INSERT INTO payments_received (company_id, customer_id, date, method, amount, unapplied, deposit_account_id)
+      SELECT ${ctx.companyId}::uuid, ${c.id}::uuid, '2020-01-01'::timestamp, 'check', 1.00, 0, ${acct['1050']}::uuid
+      FROM generate_series(1, ${N})`);
+    const [dep] = (
+      await db.execute(sql`
+        INSERT INTO deposits (company_id, deposit_account_id, date, total)
+        VALUES (${ctx.companyId}::uuid, ${acct['1000']}::uuid, '2020-01-02'::timestamp, ${N})
+        RETURNING id`)
+    ).rows as Array<{ id: string }>;
+    await db.execute(sql`
+      INSERT INTO deposit_lines (deposit_id, payment_id, amount)
+      SELECT ${dep.id}::uuid, p.id, 1.00 FROM payments_received p WHERE p.company_id = ${ctx.companyId}::uuid`);
+    // The app refreshes planner statistics when a company file is opened (lib/db/index.ts).
+    const { refreshPlannerStats } = await import('@/lib/db/plannerStats');
+    await refreshPlannerStats(db, 'test: reopen');
+    // One payment still waiting.
+    const [waiting] = (
+      await db.execute(sql`
+        INSERT INTO payments_received (company_id, customer_id, date, method, amount, unapplied, deposit_account_id)
+        VALUES (${ctx.companyId}::uuid, ${c.id}::uuid, '2026-03-01'::timestamp, 'check', 25.00, 0, ${acct['1050']}::uuid)
+        RETURNING id`)
+    ).rows as Array<{ id: string }>;
+    const list = await listUndepositedPayments(ctx);
+    expect(list.map((x) => x.id)).toEqual([waiting.id]);
+  }, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// Reconcile on a large company file
+// ---------------------------------------------------------------------------
+
+describe('Reconcile on a large file', () => {
+  it('lists the lines to clear when the bank account has more than 65,535 lines of history', async () => {
+    const { sql } = await import('drizzle-orm');
+    const ba = await linkBank('1000');
+    const N = 33_000; // entries of 2 lines each on the bank account = 66,000 lines
+    // Bulk-load years of already-reconciled history directly. Test-only shortcut: the ledger
+    // triggers are switched off for the load (the lines are balanced pairs on the same account,
+    // so every entry balances and the cached balance does not change) and back on before COMMIT.
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`ALTER TABLE journal_entries DISABLE TRIGGER ALL`);
+      await tx.execute(sql`ALTER TABLE journal_entry_lines DISABLE TRIGGER ALL`);
+      await tx.execute(sql`
+        INSERT INTO journal_entries (company_id, entry_number, date, description, status, created_by)
+        SELECT ${ctx.companyId}::uuid, 100000 + g, '2019-06-01'::timestamp, 'History', 'posted', ${userId}::uuid
+        FROM generate_series(1, ${N}) g`);
+      await tx.execute(sql`
+        INSERT INTO journal_entry_lines (journal_entry_id, account_id, debit, credit)
+        SELECT e.id, ${acct['1000']}::uuid, 1.00, NULL FROM journal_entries e
+        WHERE e.company_id = ${ctx.companyId}::uuid AND e.description = 'History'
+        UNION ALL
+        SELECT e.id, ${acct['1000']}::uuid, NULL, 1.00 FROM journal_entries e
+        WHERE e.company_id = ${ctx.companyId}::uuid AND e.description = 'History'`);
+      await tx.execute(sql`ALTER TABLE journal_entries ENABLE TRIGGER ALL`);
+      await tx.execute(sql`ALTER TABLE journal_entry_lines ENABLE TRIGGER ALL`);
+      const [old] = (
+        await tx.execute(sql`
+          INSERT INTO reconciliations (bank_account_id, statement_date, statement_balance, reconciled_balance, status, created_by, completed_at)
+          VALUES (${ba}::uuid, '2019-06-30'::timestamp, 0, 0, 'completed', ${userId}::uuid, now())
+          RETURNING id`)
+      ).rows as Array<{ id: string }>;
+      await tx.execute(sql`
+        INSERT INTO reconciliation_items (reconciliation_id, journal_entry_line_id, is_cleared, cleared_date)
+        SELECT ${old.id}::uuid, l.id, true, now() FROM journal_entry_lines l
+        JOIN journal_entries e ON e.id = l.journal_entry_id
+        WHERE e.company_id = ${ctx.companyId}::uuid AND e.description = 'History'`);
+    });
+    // The app refreshes planner statistics when a company file is opened (lib/db/index.ts).
+    const { refreshPlannerStats } = await import('@/lib/db/plannerStats');
+    await refreshPlannerStats(db, 'test: reopen');
+    await db.update(bankAccounts).set({ lastReconciledDate: d('2019-06-30'), lastReconciledBalance: '0.00' }).where(eq(bankAccounts.id, ba));
+
+    const fresh = await postJournalEntry(ctx, {
+      date: d('2026-03-05'),
+      description: 'Owner money',
+      lines: [
+        { accountId: acct['1000'], debit: '500.00' },
+        { accountId: acct['3000'], credit: '500.00' },
+      ],
+    });
+    const recon = await startReconciliation(ctx, { bankAccountId: ba, statementDate: d('2026-03-31'), statementBalance: '500.00' });
+    const lines = await listClearable(ctx, ba, d('2026-03-31'), recon.id);
+    expect(lines.map((l) => l.journalEntryId)).toEqual([fresh.id]);
+  }, 180_000);
+});

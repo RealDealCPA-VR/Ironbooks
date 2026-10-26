@@ -13,7 +13,7 @@
  * posted by other services (invoices, expenses, transfers, etc.).
  */
 import { assertReconciliationDateOpen } from './accountantCopy/guard';
-import { and, desc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, lt, ne, notExists, sql } from 'drizzle-orm';
 import { onOrBeforeDay } from './journal';
 import {
   accounts,
@@ -344,11 +344,11 @@ export async function listClearable(
   const glAccountId = bankAcct.accountId;
   const foreign = !!(await foreignCurrencyOfAccount(ctx, glAccountId));
 
-  // Fetch all posted lines on the GL account up to asOf that are not yet
-  // permanently cleared (i.e. cleared in a completed reconciliation).
-  //
-  // A line is "permanently cleared" when a reconciliation_items row exists for it
-  // pointing to a completed reconciliation.  We exclude those from the list.
+  // Fetch the posted lines on the GL account up to asOf that are not yet permanently cleared
+  // (a reconciliation_items row of a COMPLETED reconciliation exists for the line). The exclusion
+  // runs in SQL: loading the account's whole history and then naming every line id in an IN
+  // list failed outright past 65,535 lines (a bind-parameter limit) — a ten-year checking account
+  // converted from QuickBooks — and read the entire history on every reconcile screen load.
   const rows = await ctx.db
     .select({
       journalEntryLineId: journalEntryLines.id,
@@ -368,9 +368,21 @@ export async function listClearable(
         eq(journalEntryLines.accountId, glAccountId),
         eq(journalEntries.companyId, ctx.companyId),
         eq(journalEntries.status, 'posted'),
-        ne(journalEntries.status, 'void'),
         // Whole statement day: entries carrying a time of day belong to their own day.
         onOrBeforeDay(asOf),
+        notExists(
+          ctx.db
+            .select({ one: sql`1` })
+            .from(reconciliationItems)
+            .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+            .where(
+              and(
+                eq(reconciliationItems.journalEntryLineId, journalEntryLines.id),
+                eq(reconciliationItems.isCleared, true),
+                eq(reconciliations.status, 'completed'),
+              ),
+            ),
+        ),
       ),
     );
 
@@ -389,32 +401,7 @@ export async function listClearable(
     for (const si of sessionItems) clearedSet.add(si.lineId);
   }
 
-  // Identify lines permanently cleared by a *completed* reconciliation so we
-  // can omit them (they are already reconciled and should not appear again).
-  const lineIds = rows.map((r) => r.journalEntryLineId);
-  const permanentlyClearedIds = new Set<string>();
-  if (lineIds.length > 0) {
-    const completed = await ctx.db
-      .select({ lineId: reconciliationItems.journalEntryLineId })
-      .from(reconciliationItems)
-      .innerJoin(
-        reconciliations,
-        eq(reconciliationItems.reconciliationId, reconciliations.id),
-      )
-      .where(
-        and(
-          // Scope to the lines under consideration — without this the query is an
-          // unbounded cross-company scan of every cleared item ever recorded.
-          inArray(reconciliationItems.journalEntryLineId, lineIds),
-          eq(reconciliations.status, 'completed'),
-          eq(reconciliationItems.isCleared, true),
-        ),
-      );
-    for (const c of completed) permanentlyClearedIds.add(c.lineId);
-  }
-
   return rows
-    .filter((r) => !permanentlyClearedIds.has(r.journalEntryLineId))
     // A Home Currency Adjustment line changes only the home value of a foreign account — it is
     // never on the bank's statement, so it is not offered for clearing (p1 fx).
     .filter((r) => !foreign || nz(r.debit) != null || nz(r.credit) != null)

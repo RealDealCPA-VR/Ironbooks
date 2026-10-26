@@ -35,7 +35,7 @@
  */
 import { depositMismatchFixes, missingAccountFixes } from '@/lib/errorFixes';
 import { defaultAccountFor } from './errorFixes';
-import { and, eq, inArray, isNull, like, lte, ne, notInArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, like, lte, ne, notExists, sql, type SQL } from 'drizzle-orm';
 import {
   accounts,
   bouncedChecks,
@@ -159,8 +159,12 @@ async function getUFAccountId(ctx: ServiceContext): Promise<string> {
   return row.id;
 }
 
-/** Payment IDs already consumed by a NON-VOIDED deposit. */
-async function usedPaymentIds(ctx: ServiceContext, excludeDepositId?: string, asOf?: Date): Promise<string[]> {
+/**
+ * Which of `paymentIds` a NON-VOIDED deposit already consumed. Only the asked-for ids are looked
+ * up (the deposit's own payments), never the company's whole deposit history.
+ */
+async function usedPaymentIds(ctx: ServiceContext, paymentIds: string[], excludeDepositId?: string): Promise<string[]> {
+  if (paymentIds.length === 0) return [];
   const rows = await ctx.db
     .select({ paymentId: depositLines.paymentId })
     .from(depositLines)
@@ -169,15 +173,16 @@ async function usedPaymentIds(ctx: ServiceContext, excludeDepositId?: string, as
       and(
         eq(deposits.companyId, ctx.companyId),
         isNull(deposits.voidedAt),
+        inArray(depositLines.paymentId, paymentIds),
         ...(excludeDepositId ? [ne(deposits.id, excludeDepositId)] : []),
-        ...(asOf ? [lte(deposits.date, asOf)] : []),
       ),
     );
-  return rows.map((r) => r.paymentId).filter((id): id is string => id !== null);
+  return [...new Set(rows.map((r) => r.paymentId).filter((id): id is string => id !== null))];
 }
 
-/** Sales-receipt IDs already consumed by a NON-VOIDED deposit (via description encoding). */
-async function usedSalesReceiptIds(ctx: ServiceContext, excludeDepositId?: string, asOf?: Date): Promise<string[]> {
+/** Which of `salesReceiptIds` a NON-VOIDED deposit already consumed (via description encoding). */
+async function usedSalesReceiptIds(ctx: ServiceContext, salesReceiptIds: string[], excludeDepositId?: string): Promise<string[]> {
+  if (salesReceiptIds.length === 0) return [];
   const rows = await ctx.db
     .select({ description: depositLines.description })
     .from(depositLines)
@@ -186,14 +191,36 @@ async function usedSalesReceiptIds(ctx: ServiceContext, excludeDepositId?: strin
       and(
         eq(deposits.companyId, ctx.companyId),
         isNull(deposits.voidedAt),
+        inArray(
+          depositLines.description,
+          salesReceiptIds.map((id) => `${RECEIPT_LINE_PREFIX}${id}`),
+        ),
         ...(excludeDepositId ? [ne(deposits.id, excludeDepositId)] : []),
-        ...(asOf ? [lte(deposits.date, asOf)] : []),
-        like(depositLines.description, `${RECEIPT_LINE_PREFIX}%`),
       ),
     );
-  return rows
-    .map((r) => (r.description ?? '').slice(RECEIPT_LINE_PREFIX.length))
-    .filter((id) => id.length > 0);
+  return [
+    ...new Set(rows.map((r) => (r.description ?? '').slice(RECEIPT_LINE_PREFIX.length)).filter((id) => id.length > 0)),
+  ];
+}
+
+/**
+ * SQL: a non-voided deposit (dated on or before `asOf`, when given) has a line matching `match`.
+ * Used as NOT EXISTS for the "Payments to Deposit" list: naming every deposited id in a NOT IN
+ * list failed outright past 65,535 deposited payments (the bind-parameter limit) on a large file.
+ */
+function depositedSql(ctx: ServiceContext, match: SQL, asOf?: Date) {
+  return ctx.db
+    .select({ one: sql`1` })
+    .from(depositLines)
+    .innerJoin(deposits, eq(depositLines.depositId, deposits.id))
+    .where(
+      and(
+        eq(deposits.companyId, ctx.companyId),
+        isNull(deposits.voidedAt),
+        ...(asOf ? [lte(deposits.date, asOf)] : []),
+        match,
+      ),
+    );
 }
 
 /** Invoice IDs whose payment-item lines a NON-VOIDED deposit consumed (via description encoding). */
@@ -285,16 +312,13 @@ export async function listUndepositedPayments(
   const { asOf } = opts;
 
   // ── payments ─────────────────────────────────────────────────────────────
-  const usedPmtIds = await usedPaymentIds(ctx, undefined, asOf);
   const pmtConditions = [
     eq(paymentsReceived.companyId, ctx.companyId),
     eq(paymentsReceived.depositAccountId, ufId),
     isNull(paymentsReceived.voidedAt),
     ...(asOf ? [lte(paymentsReceived.date, asOf)] : []),
+    notExists(depositedSql(ctx, eq(depositLines.paymentId, paymentsReceived.id), asOf)),
   ];
-  if (usedPmtIds.length > 0) {
-    pmtConditions.push(notInArray(paymentsReceived.id, usedPmtIds));
-  }
   const pmtRows = await ctx.db
     .select()
     .from(paymentsReceived)
@@ -302,16 +326,15 @@ export async function listUndepositedPayments(
     .orderBy(paymentsReceived.date);
 
   // ── sales receipts ──────────────────────────────────────────────────────
-  const usedSrIds = await usedSalesReceiptIds(ctx, undefined, asOf);
   const srConditions = [
     eq(salesReceipts.companyId, ctx.companyId),
     eq(salesReceipts.depositAccountId, ufId),
     ne(salesReceipts.status, 'void'),
     ...(asOf ? [lte(salesReceipts.date, asOf)] : []),
+    notExists(
+      depositedSql(ctx, sql`${depositLines.description} = ${RECEIPT_LINE_PREFIX} || ${salesReceipts.id}::text`, asOf),
+    ),
   ];
-  if (usedSrIds.length > 0) {
-    srConditions.push(notInArray(salesReceipts.id, usedSrIds));
-  }
   const srRows = await ctx.db
     .select()
     .from(salesReceipts)
@@ -596,7 +619,7 @@ async function prepareDeposit(
 
   // ── double-deposit guards (against non-voided deposits only) ─────────────
   if (paymentIds.length > 0) {
-    const used = (await usedPaymentIds(ctx, excludeDepositId)).filter((id) => paymentIds.includes(id));
+    const used = await usedPaymentIds(ctx, paymentIds, excludeDepositId);
     if (used.length > 0) {
       throw new ServiceError(
         'CONFLICT',
@@ -607,9 +630,7 @@ async function prepareDeposit(
     }
   }
   if (salesReceiptIds.length > 0) {
-    const used = (await usedSalesReceiptIds(ctx, excludeDepositId)).filter((id) =>
-      salesReceiptIds.includes(id),
-    );
+    const used = await usedSalesReceiptIds(ctx, salesReceiptIds, excludeDepositId);
     if (used.length > 0) {
       throw new ServiceError(
         'CONFLICT',
@@ -1065,12 +1086,15 @@ export async function listDeposits(ctx: ServiceContext) {
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, acctIds)));
   const acctMap = new Map(acctRows.map((a) => [a.id, { name: a.name, code: a.code }]));
 
-  // Attach lines (payment ids) to each deposit.
-  const depositIds = rows.map((r) => r.id);
-  const lineRows = await ctx.db
-    .select()
-    .from(depositLines)
-    .where(inArray(depositLines.depositId, depositIds));
+  // Attach lines (payment ids) to each deposit. Joined on the company rather than naming every
+  // deposit id (an IN list past 65,535 deposits fails on the bind-parameter limit).
+  const lineRows = (
+    await ctx.db
+      .select({ line: depositLines })
+      .from(depositLines)
+      .innerJoin(deposits, eq(depositLines.depositId, deposits.id))
+      .where(eq(deposits.companyId, ctx.companyId))
+  ).map((r) => r.line);
 
   const linesByDeposit = new Map<string, typeof lineRows>();
   for (const l of lineRows) {

@@ -20,3 +20,19 @@ WHERE a."entity_type" = 'transfer'
   AND a."company_id" = je."company_id"
   AND je."source_ref" IS NULL
   AND je."id"::text IN (a."old_values"->>'postedEntryId', a."new_values"->>'postedEntryId');
+--> statement-breakpoint
+-- Hot lookups on a large company file had no index: every void / posted edit checks
+-- reconciliation_items by journal line, every reconcile toggle sums a session's items, the
+-- deposit screens look up deposit lines by deposit and by payment, and the bank feed reads its
+-- lines by bank account.
+CREATE INDEX IF NOT EXISTS "reconciliation_items_line_idx" ON "reconciliation_items" ("journal_entry_line_id");
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "reconciliation_items_recon_idx" ON "reconciliation_items" ("reconciliation_id");
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "deposit_lines_deposit_idx" ON "deposit_lines" ("deposit_id");
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "deposit_lines_payment_idx" ON "deposit_lines" ("payment_id") WHERE "payment_id" IS NOT NULL;
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "bank_transactions_account_idx" ON "bank_transactions" ("company_id", "bank_account_id");
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "bank_transactions_entry_idx" ON "bank_transactions" ("matched_entry_id") WHERE "matched_entry_id" IS NOT NULL;
