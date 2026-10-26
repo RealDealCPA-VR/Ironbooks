@@ -20,6 +20,36 @@ import { stampSandbox } from './sandboxStamp';
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/** WinAnsi extras beyond Latin-1 that the standard PDF fonts can encode. */
+const WINANSI_EXTRAS = new Set('€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ');
+/** Letters without a Unicode decomposition, spelled the way a typewriter would. */
+const LETTER_FALLBACK: Record<string, string> = { Đ: 'D', đ: 'd', Ł: 'L', ł: 'l', Ø: 'O', ø: 'o', Ħ: 'H', ħ: 'h', ı: 'i' };
+
+function winAnsiChar(ch: string): boolean {
+  const code = ch.codePointAt(0) ?? 0;
+  return (code >= 32 && code <= 126) || (code >= 160 && code <= 255) || WINANSI_EXTRAS.has(ch);
+}
+
+/**
+ * Text the standard (WinAnsi) PDF fonts can draw. pdf-lib throws on anything else, so an
+ * employee named "Nguyễn Văn Trường" or a company "株式会社 …" made every pay stub / W-2 / 941
+ * answer HTTP 500. Latin-1 letters (é, ñ, ü) stay; other accented letters lose their accent
+ * (ễ → e, ư → u, Đ → D); anything else becomes "?".
+ */
+export function winAnsiText(text: string | null | undefined): string {
+  let out = '';
+  for (const ch of String(text ?? '').replace(/[\r\t]/g, ' ').replace(/\n/g, ' ')) {
+    if (winAnsiChar(ch)) {
+      out += ch;
+      continue;
+    }
+    const base = ch.normalize('NFD').replace(/[̀-ͯ]/g, '');
+    if (base && [...base].every(winAnsiChar)) out += base;
+    else out += LETTER_FALLBACK[ch] ?? '?';
+  }
+  return out;
+}
+
 /** Format a decimal string / number as USD currency. */
 function fmt(value: string | number): string {
   const n = typeof value === 'string' ? parseFloat(value) : value;
@@ -94,8 +124,9 @@ export async function renderW2Pdf(input: W2PdfInput): Promise<Uint8Array> {
     opts: { size?: number; font?: typeof regular; color?: typeof C_BLACK; rightAlign?: boolean } = {},
   ) {
     const { size = 10, font = regular, color = C_BLACK, rightAlign = false } = opts;
-    const drawX = rightAlign ? x - font.widthOfTextAtSize(s, size) : x;
-    page.drawText(s, { x: drawX, y, font, size, color });
+    const safe = winAnsiText(s);
+    const drawX = rightAlign ? x - font.widthOfTextAtSize(safe, size) : x;
+    page.drawText(safe, { x: drawX, y, font, size, color });
   }
 
   let cursor = PAGE_H - 48;
@@ -288,14 +319,8 @@ export async function renderW2Pdf(input: W2PdfInput): Promise<Uint8Array> {
   cursor -= 16;
   hRule(cursor, ML, MR, 0.5, C_LIGHT);
   cursor -= 14;
-  txt(
-    `${input.company.name}  —  W-2 for ${empName}  —  Tax Year ${input.year}`,
-    PAGE_W / 2,
-    cursor,
-    { size: 7, color: C_GRAY, rightAlign: false },
-  );
-  // center the footer
-  const footerStr = `${input.company.name}  —  W-2 for ${empName}  —  Tax Year ${input.year}`;
+  // Centered footer (drawn once — it used to also be drawn left-aligned at the center, overlapping).
+  const footerStr = winAnsiText(`${input.company.name}  —  W-2 for ${empName}  —  Tax Year ${input.year}`);
   const ftW = regular.widthOfTextAtSize(footerStr, 7);
   page.drawText(footerStr, { x: (PAGE_W - ftW) / 2, y: cursor, font: regular, size: 7, color: C_GRAY });
 
@@ -356,8 +381,9 @@ export async function render941Pdf(input: Form941PdfInput): Promise<Uint8Array> 
     opts: { size?: number; font?: typeof regular; color?: typeof C_BLACK; rightAlign?: boolean } = {},
   ) {
     const { size = 10, font = regular, color = C_BLACK, rightAlign = false } = opts;
-    const drawX = rightAlign ? x - font.widthOfTextAtSize(s, size) : x;
-    page.drawText(s, { x: drawX, y, font, size, color });
+    const safe = winAnsiText(s);
+    const drawX = rightAlign ? x - font.widthOfTextAtSize(safe, size) : x;
+    page.drawText(safe, { x: drawX, y, font, size, color });
   }
   function ensure(space: number) {
     if (cursor - space < 56) {
@@ -501,7 +527,7 @@ export async function render941Pdf(input: Form941PdfInput): Promise<Uint8Array> 
 
   // ----- Footer on every page -----
   for (const p of pdfDoc.getPages()) {
-    const footer = `${input.company.name}  -  Form 941 Q${input.quarter} ${input.year}`;
+    const footer = winAnsiText(`${input.company.name}  -  Form 941 Q${input.quarter} ${input.year}`);
     const w = regular.widthOfTextAtSize(footer, 7);
     p.drawText(footer, { x: (PAGE_W - w) / 2, y: 32, font: regular, size: 7, color: C_GRAY });
   }
@@ -570,8 +596,9 @@ export async function render940Pdf(input: Form940PdfInput): Promise<Uint8Array> 
     opts: { size?: number; font?: typeof regular; color?: typeof C_BLACK; rightAlign?: boolean } = {},
   ) {
     const { size = 10, font = regular, color = C_BLACK, rightAlign = false } = opts;
-    const drawX = rightAlign ? x - font.widthOfTextAtSize(s, size) : x;
-    page.drawText(s, { x: drawX, y, font, size, color });
+    const safe = winAnsiText(s);
+    const drawX = rightAlign ? x - font.widthOfTextAtSize(safe, size) : x;
+    page.drawText(safe, { x: drawX, y, font, size, color });
   }
 
   let cursor = PAGE_H - 48;
@@ -723,7 +750,7 @@ export async function render940Pdf(input: Form940PdfInput): Promise<Uint8Array> 
   cursor -= 24;
   hRule(cursor, ML, MR, 0.5, C_LIGHT);
   cursor -= 14;
-  const footerStr940 = `${input.company.name}  —  Form 940 ${input.year}`;
+  const footerStr940 = winAnsiText(`${input.company.name}  —  Form 940 ${input.year}`);
   const ftW940 = regular.widthOfTextAtSize(footerStr940, 7);
   page.drawText(footerStr940, { x: (PAGE_W - ftW940) / 2, y: cursor, font: regular, size: 7, color: C_GRAY });
 
@@ -774,8 +801,9 @@ export async function renderW3Pdf(input: W3PdfInput): Promise<Uint8Array> {
     opts: { size?: number; font?: typeof regular; color?: typeof C_BLACK; rightAlign?: boolean } = {},
   ) {
     const { size = 10, font = regular, color = C_BLACK, rightAlign = false } = opts;
-    const drawX = rightAlign ? x - font.widthOfTextAtSize(s, size) : x;
-    page.drawText(s, { x: drawX, y, font, size, color });
+    const safe = winAnsiText(s);
+    const drawX = rightAlign ? x - font.widthOfTextAtSize(safe, size) : x;
+    page.drawText(safe, { x: drawX, y, font, size, color });
   }
 
   let cursor = PAGE_H - 48;
@@ -864,7 +892,7 @@ export async function renderW3Pdf(input: W3PdfInput): Promise<Uint8Array> {
   cursor -= 24;
   hRule(cursor, ML, MR, 0.5, C_LIGHT);
   cursor -= 14;
-  const footerStrW3 = `${input.company.name}  —  Form W-3 ${input.year}`;
+  const footerStrW3 = winAnsiText(`${input.company.name}  —  Form W-3 ${input.year}`);
   const ftWW3 = regular.widthOfTextAtSize(footerStrW3, 7);
   page.drawText(footerStrW3, { x: (PAGE_W - ftWW3) / 2, y: cursor, font: regular, size: 7, color: C_GRAY });
 

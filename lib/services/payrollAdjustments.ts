@@ -48,7 +48,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { getEmployee } from './payroll';
+import { getEmployee, payrollDefaultAccounts } from './payroll';
 import { defaultPayrollLiabilityAccountId } from './liabilityPayments';
 import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
 import { inferEmployeeTaxTracking, inferEmployerTracking } from './payrollTaxTracking';
@@ -259,11 +259,20 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
   // GL accounts (only when posting).
   let posting: PostingLine[] | null = null;
   if (input.affectsAccounts) {
-    const expense = await accountIdByCode(ctx, '6500');
+    // The same default accounts a paycheck posts to (Preferences wages / liabilities accounts
+    // and paycheck bank, else 6500 / 2300 / 1000) — a historical check must land where the
+    // real checks do, or the P&L splits wages over two accounts.
+    let defaults: { payrollExpenseId: string | null; checkingId: string | null };
+    try {
+      defaults = await payrollDefaultAccounts(ctx);
+    } catch {
+      defaults = { payrollExpenseId: null, checkingId: null };
+    }
+    const expense = defaults.payrollExpenseId;
     const liab = await payrollLiabilityAccountId(ctx);
     const bank = input.bankAccountId
       ? await requireAccount(ctx, input.bankAccountId, 'Bank account', 'bank')
-      : await accountIdByCode(ctx, '1000');
+      : defaults.checkingId;
     if (!expense || !liab || !bank) {
       throw validation('Posting needs accounts 6500 Payroll Expense, 2300 Payroll Liabilities and a bank account.');
     }

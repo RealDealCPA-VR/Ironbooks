@@ -28,6 +28,7 @@ import {
   invoiceLines,
   invoices,
   journalEntries,
+  journalEntryLines,
   payrollStateSettings,
   timeEntries,
   users,
@@ -38,6 +39,7 @@ import { MoneyParseError } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { createCompany, updateCompany } from './company';
 import { createCustomer } from './customers';
+import { createAccount } from './accounts';
 import { createJob } from './jobs';
 import {
   createEmployee,
@@ -51,7 +53,7 @@ import {
 } from './payroll';
 import { billTimeToInvoice, createTimeEntry, deleteTimeEntry, updateTimeEntry } from './timeTracking';
 import { approveAndReimburse, createReport, submitReport } from './expenseReports';
-import { createWorkersCompCode, updateWorkersCompCode, upsertStateTaxSetting } from './payrollAdjustments';
+import { createWorkersCompCode, createYtdAdjustment, updateWorkersCompCode, upsertStateTaxSetting } from './payrollAdjustments';
 import { createPayrollItem, updatePayrollItem } from './payrollItems';
 import { logMiles } from './mileage';
 import { w2Data, w3Data } from './payrollReports';
@@ -201,6 +203,57 @@ describe('review5 payroll / time / mileage / expense reports', { timeout: 300_00
       await expect(runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-03-31'), grossPay: '100.00', periodsPerYear: 0 })).rejects.toMatchObject({ code: 'VALIDATION' });
       await expect(runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-03-31'), grossPay: '100.00', periodsPerYear: Number.NaN })).rejects.toMatchObject({ code: 'VALIDATION' });
     });
+  });
+
+  it('a YTD entry that affects accounts posts wages and net pay to the Preferences payroll accounts, like a paycheck', async () => {
+    const ctx = await newCompany('R5 YTD Pref Accounts');
+    const wages = await createAccount(ctx, { code: '6550', name: 'Salaries & Wages', type: 'expense', subtype: 'payroll' });
+    const savings = await acct(ctx, '1010');
+    expect(savings.subtype).toBe('savings');
+    await updateCompany(ctx, { settings: { payrollExpenseAccountId: wages.id, defaultPaycheckAccountId: savings.id } });
+    const e = await createEmployee(ctx, { firstName: 'Yt', lastName: 'Dee', payType: 'salary', payRate: '50000' });
+    const check = await runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-06-05'), grossPay: '1000.00', taxes: [], employerTaxes: [] });
+    const ytd = await createYtdAdjustment(ctx, {
+      employeeId: e.id,
+      date: d('2026-03-31'),
+      affectsAccounts: true,
+      lines: [
+        { kind: 'earning', name: 'Salary', amount: '3000.00' },
+        { kind: 'tax', name: 'Federal Income Tax', amount: '300.00' },
+      ],
+    });
+    const linesOf = async (entryId: string) =>
+      ctx.db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, entryId));
+    const checkLines = await linesOf(check.postedEntryId!);
+    const ytdLines = await linesOf(ytd.postedEntryId!);
+    // The paycheck debits the preferred wages account and pays from the preferred bank...
+    expect(checkLines.find((l) => l.debit && Number(l.debit) === 1000)?.accountId).toBe(wages.id);
+    expect(checkLines.find((l) => l.credit && Number(l.credit) === 1000)?.accountId).toBe(savings.id);
+    // ...and so does the YTD entry.
+    expect(ytdLines.find((l) => l.debit && Number(l.debit) === 3000)?.accountId).toBe(wages.id);
+    expect(ytdLines.find((l) => l.credit && Number(l.credit) === 2700)?.accountId).toBe(savings.id);
+  });
+
+  // -------------------------------------------------------------------------
+  // Concurrency: the wage bases are read in the same transaction that posts the check
+  // -------------------------------------------------------------------------
+  it('two checks posted at once for an employee at the Social Security wage base withhold it only once', async () => {
+    const ctx = await newCompany('R5 SS Base Race');
+    const e = await createEmployee(ctx, { firstName: 'Ra', lastName: 'Ce', payType: 'salary', payRate: '200000' });
+    // 2026 wage base 184,500: 184,000 already paid → only 500 more is subject to Social Security.
+    await createYtdAdjustment(ctx, {
+      employeeId: e.id,
+      date: d('2026-01-31'),
+      lines: [{ kind: 'earning', name: 'Salary', amount: '184000.00' }],
+    });
+    const [a, b] = await Promise.all([
+      runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-11-13'), grossPay: '1000.00' }),
+      runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-11-13'), grossPay: '1000.00' }),
+    ]);
+    const ss = (lines: Array<{ kind: string; taxTracking?: string | null; amount: string }>, t: string) =>
+      Number(lines.find((l) => l.taxTracking === t)?.amount ?? 0);
+    expect(ss(a.lines, 'social_security') + ss(b.lines, 'social_security')).toBeCloseTo(31.0, 2); // 500 x 6.2%
+    expect(ss(a.lines, 'employer_social_security') + ss(b.lines, 'employer_social_security')).toBeCloseTo(31.0, 2);
   });
 
   // -------------------------------------------------------------------------

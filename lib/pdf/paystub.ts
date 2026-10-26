@@ -15,8 +15,9 @@
  *   - Footer rule
  */
 
-import { PDFDocument, StandardFonts, rgb, PageSizes } from 'pdf-lib';
+import { PDFDocument, StandardFonts, rgb, PageSizes, degrees } from 'pdf-lib';
 import { stampSandbox } from './sandboxStamp';
+import { winAnsiText } from './payrollForms';
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -58,6 +59,8 @@ export interface PaystubPdfData {
     current: { federal: string | number; fica: string | number };
     ytd: { federal: string | number; fica: string | number };
   } | null;
+  /** The paycheck was voided: the stub is stamped VOID. */
+  isVoid?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,8 +131,10 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
     opts: { size?: number; font?: typeof regular; color?: typeof COLOR_BLACK; rightAlign?: boolean } = {},
   ) {
     const { size = 10, font = regular, color = COLOR_BLACK, rightAlign = false } = opts;
-    const drawX = rightAlign ? x - font.widthOfTextAtSize(s, size) : x;
-    page.drawText(s, { x: drawX, y, font, size, color });
+    // Standard fonts are WinAnsi only: "Nguyễn" / "株式会社" used to throw (HTTP 500).
+    const safe = winAnsiText(s);
+    const drawX = rightAlign ? x - font.widthOfTextAtSize(safe, size) : x;
+    page.drawText(safe, { x: drawX, y, font, size, color });
   }
 
   // -------------------------------------------------------------------------
@@ -387,7 +392,7 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
   const FOOTER_Y = 36;
   drawRule(FOOTER_Y + 10, COLOR_LIGHT, 0.5);
 
-  const footerText = `${data.company.name}  —  This is not a negotiable instrument.`;
+  const footerText = winAnsiText(`${data.company.name}  —  This is not a negotiable instrument.`);
   const ftW = regular.widthOfTextAtSize(footerText, 8);
   page.drawText(footerText, {
     x: (PAGE_W - ftW) / 2,
@@ -396,6 +401,22 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
     size: 8,
     color: COLOR_GRAY,
   });
+
+  // A voided paycheck was never paid: its stub says so in large letters (QB prints VOID).
+  if (data.isVoid) {
+    const voidText = 'VOID';
+    const size = 120;
+    const w = bold.widthOfTextAtSize(voidText, size);
+    page.drawText(voidText, {
+      x: (PAGE_W - w * Math.cos(Math.PI / 6)) / 2,
+      y: PAGE_H / 2 - (w * Math.sin(Math.PI / 6)) / 2,
+      font: bold,
+      size,
+      color: rgb(0.85, 0.15, 0.15),
+      opacity: 0.35,
+      rotate: degrees(30),
+    });
+  }
 
   await stampSandbox(pdfDoc); // printed from a sandbox copy: stamped SANDBOX
   return pdfDoc.save();

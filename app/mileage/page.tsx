@@ -22,6 +22,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
+import { irsMileageRateFor } from '@/lib/services/mileageRates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -84,7 +85,8 @@ const EMPTY_FORM: LogMilesForm = {
   // session never defaults to a stale day.
   date: '',
   miles: '',
-  ratePerMile: '0.67',
+  // Blank = the IRS business rate for the trip's year (the server fills it in; shown as the placeholder).
+  ratePerMile: '',
   customerId: '',
   purpose: '',
   billable: false,
@@ -186,11 +188,13 @@ function LogMilesForm({
           type="number"
           min="0"
           step="0.0001"
-          placeholder="0.67"
+          placeholder={irsMileageRateFor(form.date || undefined)}
           value={form.ratePerMile}
           onChange={(e) => onChange('ratePerMile', e.target.value)}
         />
-        <p className="text-xs text-navy/40 mt-1">Default: $0.67 (IRS standard rate)</p>
+        <p className="text-xs text-navy/40 mt-1">
+          Leave blank for the IRS business rate for the trip&apos;s year (${irsMileageRateFor(form.date || undefined)}/mi).
+        </p>
       </div>
       <div>
         <Label htmlFor="ml-customer">Customer (optional)</Label>

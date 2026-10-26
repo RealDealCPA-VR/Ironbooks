@@ -34,6 +34,13 @@ interface Customer {
   displayName: string;
 }
 
+interface Employee {
+  id: string;
+  firstName: string;
+  lastName: string;
+  isActive: boolean;
+}
+
 interface TimeEntry {
   id: string;
   customerId: string | null;
@@ -50,6 +57,8 @@ interface TimeEntry {
 }
 
 interface LogTimeForm {
+  /** QB timesheet Name: the employee whose hours these are (needed to pay them in a pay run). */
+  employeeId: string;
   customerId: string;
   date: string;
   hours: string;
@@ -58,14 +67,21 @@ interface LogTimeForm {
   billable: boolean;
 }
 
-const emptyForm: LogTimeForm = {
+const emptyForm = (): LogTimeForm => ({
+  employeeId: '',
   customerId: '',
+  // Fresh each time the form opens, so a session left open past midnight never defaults to yesterday.
   date: todayISO(),
   hours: '',
   rate: '',
   description: '',
   billable: true,
-};
+});
+
+/** Time paid on a paycheck carries a [payroll:<paycheckId>] marker in its description. */
+const PAID_TAG_RE = /\s*\[payroll:[^\]\s]+\]/g;
+const isPaidInPayroll = (e: TimeEntry) => /\[payroll:[^\]\s]+\]/.test(e.description ?? '');
+const displayDescription = (e: TimeEntry) => (e.description ?? '').replace(PAID_TAG_RE, '').trim() || '—';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -101,6 +117,7 @@ function unbilledByCustomer(entries: TimeEntry[], customers: Customer[]) {
 export default function TimeTrackingPage() {
   const [entries, setEntries] = useState<TimeEntry[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [employees, setEmployees] = useState<Employee[]>([]);
   const [loading, setLoading] = useState(true);
   const [showLog, setShowLog] = useState(false);
   const [form, setForm] = useState<LogTimeForm>(emptyForm);
@@ -126,6 +143,11 @@ export default function TimeTrackingPage() {
       ]);
       setEntries(rows);
       setCustomers(custs);
+      // Employees are optional here (a user without payroll access can still log time).
+      api
+        .get<Employee[]>('/api/employees?includeInactive=true')
+        .then(setEmployees)
+        .catch(() => setEmployees([]));
     } catch (e) {
       toast(e instanceof ApiError ? e.message : 'Failed to load time entries', 'danger');
     } finally {
@@ -145,6 +167,7 @@ export default function TimeTrackingPage() {
     setSaving(true);
     try {
       await api.post('/api/time-entries', {
+        employeeId: form.employeeId || null,
         customerId: form.customerId || null,
         date: form.date,
         hours: form.hours,
@@ -154,7 +177,7 @@ export default function TimeTrackingPage() {
       });
       toast('Time entry logged', 'success');
       setShowLog(false);
-      setForm(emptyForm);
+      setForm(emptyForm());
       load();
     } catch (e) {
       toast(e instanceof ApiError ? e.message : 'Failed to log time', 'danger');
@@ -205,6 +228,7 @@ export default function TimeTrackingPage() {
   // ---- Customer name lookup ----
 
   const custMap = new Map(customers.map((c) => [c.id, c.displayName]));
+  const empMap = new Map(employees.map((e) => [e.id, `${e.firstName} ${e.lastName}`]));
 
   const unbilled = unbilledByCustomer(entries, customers);
 
@@ -214,7 +238,7 @@ export default function TimeTrackingPage() {
         title="Time Tracking"
         icon={Timer}
         action={
-          <Button onClick={() => { setForm(emptyForm); setShowLog(true); }}>
+          <Button onClick={() => { setForm(emptyForm()); setShowLog(true); }}>
             <Plus className="h-4 w-4" />
             Log Time
           </Button>
@@ -295,7 +319,7 @@ export default function TimeTrackingPage() {
             title="No time entries yet"
             message="Log your first time entry to start tracking billable hours."
             action={
-              <Button onClick={() => { setForm(emptyForm); setShowLog(true); }}>
+              <Button onClick={() => { setForm(emptyForm()); setShowLog(true); }}>
                 <Plus className="h-4 w-4" />
                 Log Time
               </Button>
@@ -306,6 +330,7 @@ export default function TimeTrackingPage() {
             <thead>
               <tr>
                 <Th>Date</Th>
+                <Th>Employee</Th>
                 <Th>Customer</Th>
                 <Th>Description</Th>
                 <Th numeric>Hours</Th>
@@ -320,8 +345,9 @@ export default function TimeTrackingPage() {
               {entries.map((e) => (
                 <Tr key={e.id}>
                   <Td>{e.date ? formatDate(e.date) : '—'}</Td>
+                  <Td>{e.employeeId ? (empMap.get(e.employeeId) ?? '—') : '—'}</Td>
                   <Td>{e.customerId ? (custMap.get(e.customerId) ?? '—') : '—'}</Td>
-                  <Td className="max-w-xs truncate">{e.description ?? '—'}</Td>
+                  <Td className="max-w-xs truncate">{displayDescription(e)}</Td>
                   <Td numeric>{parseFloat(e.hours).toFixed(2)}</Td>
                   <Td numeric>
                     {e.rate ? formatCurrency(e.rate) : '—'}
@@ -342,9 +368,13 @@ export default function TimeTrackingPage() {
                     ) : (
                       <Badge tone="warning">Unbilled</Badge>
                     )}
+                    {isPaidInPayroll(e) && (
+                      <Badge tone="neutral" className="ml-1">Paid in payroll</Badge>
+                    )}
                   </Td>
                   <Td>
-                    {!e.invoicedInvoiceId && (
+                    {/* Invoiced or paid time can't be deleted (void the invoice / paycheck first). */}
+                    {!e.invoicedInvoiceId && !isPaidInPayroll(e) && (
                       <Button
                         variant="ghost"
                         size="sm"
@@ -387,9 +417,28 @@ export default function TimeTrackingPage() {
           className="space-y-4"
         >
           <div>
+            <Label htmlFor="time-employee">Employee</Label>
+            <Select
+              id="time-employee"
+              autoFocus
+              value={form.employeeId}
+              onChange={(e) => setForm((f) => ({ ...f, employeeId: e.target.value }))}
+            >
+              <option value="">— No employee —</option>
+              {employees
+                .filter((emp) => emp.isActive || emp.id === form.employeeId)
+                .map((emp) => (
+                  <option key={emp.id} value={emp.id}>
+                    {emp.firstName} {emp.lastName}
+                  </option>
+                ))}
+            </Select>
+            <p className="text-xs text-navy/50 mt-1">Pick the employee to pay these hours in a pay run (Pull time).</p>
+          </div>
+
+          <div>
             <Label>Customer</Label>
             <Select
-              autoFocus
               value={form.customerId}
               onChange={(e) => setForm((f) => ({ ...f, customerId: e.target.value }))}
             >

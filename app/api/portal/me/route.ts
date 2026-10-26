@@ -1,8 +1,8 @@
 /** GET /api/portal/me — the signed-in employee's profile + their paychecks. */
 import { NextResponse } from 'next/server';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, isNull } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
-import { employees, paychecks } from '@/lib/db/schema';
+import { employees, journalEntries, paychecks } from '@/lib/db/schema';
 import { getPortalEmployeeId } from '@/lib/auth';
 
 export async function GET() {
@@ -15,14 +15,24 @@ export async function GET() {
   if (!emp || !emp.isActive || !emp.portalPasswordHash) {
     return NextResponse.json({ error: 'Not authenticated', code: 'FORBIDDEN' }, { status: 401 });
   }
-  const checks = await db
-    .select()
+  const rows = await db
+    .select({ paycheck: paychecks })
     .from(paychecks)
-    // Real paychecks only — historical YTD / liability adjustments are bookkeeping entries.
-    .where(and(eq(paychecks.employeeId, employeeId), eq(paychecks.entryType, 'paycheck')))
+    .innerJoin(journalEntries, eq(journalEntries.id, paychecks.postedEntryId))
+    // Real, live paychecks only — historical YTD / liability adjustments are bookkeeping entries,
+    // and a voided check (voided_at, or its journal entry no longer posted) was never paid.
+    .where(
+      and(
+        eq(paychecks.employeeId, employeeId),
+        eq(paychecks.companyId, emp.companyId),
+        eq(paychecks.entryType, 'paycheck'),
+        isNull(paychecks.voidedAt),
+        eq(journalEntries.status, 'posted'),
+      ),
+    )
     .orderBy(desc(paychecks.payDate));
   return NextResponse.json({
     employee: { id: emp.id, name: `${emp.firstName} ${emp.lastName}`, email: emp.email, payType: emp.payType },
-    paychecks: checks,
+    paychecks: rows.map((r) => r.paycheck),
   });
 }

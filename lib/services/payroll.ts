@@ -277,6 +277,20 @@ async function preferredAccountId(
 }
 
 /**
+ * The accounts a payroll posting uses when a line has no payroll item account: Preferences >
+ * Payroll & Employees wages / liabilities accounts and Checking's paycheck account, else 6500 /
+ * 2300 / 1000. Paychecks AND historical YTD entries that affect accounts post with these, so
+ * wages and net pay land in the same accounts either way.
+ */
+export async function payrollDefaultAccounts(ctx: ServiceContext) {
+  const payPrefs = await getPreferences(ctx);
+  const payrollExpenseId = await preferredAccountId(ctx, payPrefs.payrollExpenseAccountId, '6500', 'expense', 'The payroll wages account'); // Payroll Expense
+  const payrollLiabId = await preferredAccountId(ctx, payPrefs.payrollLiabilityAccountId, '2300', 'payroll_liability', 'The payroll liabilities account'); // Payroll Liabilities
+  const checkingId = await preferredAccountId(ctx, payPrefs.defaultPaycheckAccountId, '1000', 'bank', 'The paycheck bank account'); // Checking
+  return { payrollExpenseId, payrollLiabId, checkingId };
+}
+
+/**
  * SQL predicate (use with a LEFT JOIN of journal_entries on paychecks.posted_entry_id): the
  * paycheck row counts toward payroll totals (W-2, 941, 940, YTD, wage-base limits, reports).
  *  - posted rows whose GL entry is still 'posted' and that were not voided, or
@@ -614,6 +628,8 @@ export interface PayStubData {
    * payrollReports.sickVacationBalances). Null when the employee has no accrual policy.
    */
   accruals: { sickBalance: string; vacationBalance: string } | null;
+  /** The check was voided (or its journal entry is no longer posted): the stub prints VOID. */
+  isVoid: boolean;
 }
 
 /**
@@ -634,6 +650,16 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
     .select()
     .from(paycheckLines)
     .where(eq(paycheckLines.paycheckId, paycheckId));
+
+  // Same rule as listPaychecks' isVoid.
+  let isVoid = pc.voidedAt != null || (pc.postedEntryId == null && pc.entryType === 'paycheck');
+  if (!isVoid && pc.postedEntryId) {
+    const [je] = await ctx.db
+      .select({ status: journalEntries.status })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.id, pc.postedEntryId), eq(journalEntries.companyId, ctx.companyId)));
+    isVoid = je?.status !== 'posted';
+  }
 
   const year = pc.payDate.getUTCFullYear();
   const yearStart = new Date(Date.UTC(year, 0, 1));
@@ -729,6 +755,7 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
       net: sumCol('netPay'),
     },
     accruals,
+    isVoid,
   };
 }
 
@@ -1208,10 +1235,7 @@ async function preparePaycheck(
   }
 
   // --- Resolve GL accounts ---
-  const payPrefs = await getPreferences(ctx);
-  const payrollExpenseId = await preferredAccountId(ctx, payPrefs.payrollExpenseAccountId, '6500', 'expense', 'The payroll wages account'); // Payroll Expense
-  const payrollLiabId = await preferredAccountId(ctx, payPrefs.payrollLiabilityAccountId, '2300', 'payroll_liability', 'The payroll liabilities account'); // Payroll Liabilities
-  const checkingId = await preferredAccountId(ctx, payPrefs.defaultPaycheckAccountId, '1000', 'bank', 'The paycheck bank account'); // Checking
+  const { payrollExpenseId, payrollLiabId, checkingId } = await payrollDefaultAccounts(ctx);
 
   // Employer payroll taxes post to 6510 Payroll Tax Expense when the company has one,
   // otherwise fall back to 6500 Payroll Expense (the default COA has no 6510).
@@ -1410,10 +1434,12 @@ export async function previewPaycheck(ctx: ServiceContext, input: RunPaycheckInp
 }
 
 export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) {
-  const prep = await preparePaycheck(ctx, input);
-
-  // --- Persist in a single transaction ---
+  // --- Calculate AND persist in a single transaction --- the YTD wages the wage bases (Social
+  // Security, FUTA, SUI, Additional Medicare) are applied against must be read in the same
+  // transaction that posts the check, or two checks entered at once both use the room left
+  // under the base.
   return inTransaction(ctx, async (tx) => {
+    const prep = await preparePaycheck(tx, input);
     // 1) Insert paycheck header.
     const [paycheck] = await tx.db
       .insert(paychecks)
@@ -1498,14 +1524,6 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
     throw validation('This is a payroll adjustment, not a paycheck. Edit it from the adjustments list.');
   }
 
-  // Recalculate at the check's OWN pay frequency (a monthly check must not be re-withheld as if
-  // it were biweekly) unless the edit names a new one.
-  const prep = await preparePaycheck(
-    ctx,
-    { ...input, employeeId: existing.employeeId, payRunId: existing.payRunId },
-    { excludePaycheckId: paycheckId, allowInactive: true, storedPeriodsPerYear: existing.periodsPerYear },
-  );
-
   return inTransaction(ctx, async (tx) => {
     const [pc] = await tx.db
       .select()
@@ -1513,6 +1531,15 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
       .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, tx.companyId)));
     if (!pc) throw notFound('Paycheck');
     if (pc.voidedAt) throw new ServiceError('CONFLICT', 'A voided paycheck cannot be edited.');
+
+    // Recalculate at the check's OWN pay frequency (a monthly check must not be re-withheld as if
+    // it were biweekly) unless the edit names a new one — inside the transaction, so the YTD
+    // wages under the wage bases are the ones this edit commits against.
+    const prep = await preparePaycheck(
+      tx,
+      { ...input, employeeId: pc.employeeId, payRunId: pc.payRunId },
+      { excludePaycheckId: paycheckId, allowInactive: true, storedPeriodsPerYear: pc.periodsPerYear },
+    );
 
     const oldLines = await tx.db
       .select()

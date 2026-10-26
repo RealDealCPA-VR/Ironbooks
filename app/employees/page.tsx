@@ -25,6 +25,8 @@ import {
   toast,
 } from '@/components/ui';
 import { quickReportHref } from '@/lib/shortcuts';
+import { usePreferences } from '@/lib/usePreferences';
+import { PAY_PERIODS_PER_YEAR } from '@/lib/preferences';
 import { api, ApiError } from '@/lib/client';
 import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 import { formatCurrency } from '@/lib/money';
@@ -1042,6 +1044,10 @@ function TaxPreviewSection({
 // ---------------------------------------------------------------------------
 
 export default function EmployeesPage() {
+  // Preferences > Payroll & Employees: the company pay period is the paycheck's default frequency
+  // (the same default a pay run uses), not always "every two weeks".
+  const prefs = usePreferences();
+  const defaultPeriodsPerYear = String(PAY_PERIODS_PER_YEAR[prefs.company.payrollPayPeriod] ?? 26);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [paychecks, setPaychecks] = useState<Paycheck[]>([]);
   const [payrollItems, setPayrollItems] = useState<PayrollItem[]>([]);
@@ -1386,6 +1392,7 @@ export default function EmployeesPage() {
       ...EMPTY_PAYROLL_FORM,
       employeeId: target?.id ?? '',
       payDate: todayISO(),
+      periodsPerYear: defaultPeriodsPerYear,
       earnings: defaultEarningsFor(target),
     });
     setPayrollOpen(true);

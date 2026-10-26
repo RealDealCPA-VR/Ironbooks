@@ -1,6 +1,6 @@
 /** POST /api/portal/login — employee self-service login. Body: { email, password } */
 import { NextRequest, NextResponse } from 'next/server';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { companies, employees } from '@/lib/db/schema';
 import { verifyPassword, createPortalToken, isArchivedSettings, PORTAL_COOKIE } from '@/lib/auth';
@@ -27,11 +27,13 @@ export async function POST(req: NextRequest) {
   }
   try {
     const db = await getDb();
+    // Email addresses are case-insensitive, and the employee record keeps the email as typed
+    // ("Jane.Doe@Example.com"): compare both sides lower-cased, or such an employee can never sign in.
     const rows = await db
       .select({ emp: employees, companySettings: companies.settings })
       .from(employees)
       .innerJoin(companies, eq(companies.id, employees.companyId))
-      .where(eq(employees.email, email.trim().toLowerCase()));
+      .where(sql`lower(trim(${employees.email})) = ${email.trim().toLowerCase()}`);
     // Employees of an archived (soft-deleted) company can no longer sign in to the portal.
     const matches = rows.filter((r) => !isArchivedSettings(r.companySettings)).map((r) => r.emp);
     for (const emp of matches) {
