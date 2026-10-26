@@ -399,7 +399,9 @@ describe('Users & Roles — re-test round 3', () => {
       const res = await bankAccountsPOST(
         req('/api/bank-accounts', {
           method: 'POST', json: true,
-          body: JSON.stringify({ accountId: glBank, bankName: 'Real Bank', accountNumber: '777766665555' }),
+          // A GL account not linked yet: a second link of the same one is refused (one bank link per
+          // GL account, banking review 5).
+          body: JSON.stringify({ accountId: (await db.select().from(accounts).where(and(eq(accounts.companyId, companyA), eq(accounts.subtype, 'savings'))))[0].id, bankName: 'Real Bank', accountNumber: '777766665555' }),
         }),
       );
       expect(res.status).toBe(201);

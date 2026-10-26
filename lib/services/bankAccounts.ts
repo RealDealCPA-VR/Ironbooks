@@ -7,6 +7,7 @@ import { accounts, bankAccounts } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { maskForContext } from './access';
 import { isMaskedValue } from '@/lib/permissions/mask';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 
 // Account numbers leave this service masked (last 4 only) unless the caller's roles grant
 // "view full bank / account numbers" (Users & Roles); see maskForContext.
@@ -67,6 +68,15 @@ export async function createBankAccount(
     if (gl.type !== 'asset' && gl.type !== 'liability') {
       throw validation('A bank account must map to an asset or liability GL account.');
     }
+    // Lines imported for the link are added to the GL account itself: on Undeposited Funds or an
+    // inventory asset account they moved a balance Make Deposits / the inventory valuation keep;
+    // on A/R or A/P every line would need a customer or vendor (and could never be added).
+    const reason =
+      subledgerAccountReason(gl) ??
+      (gl.subtype === 'accounts_receivable' || gl.subtype === 'accounts_payable'
+        ? `"${gl.name}" is ${gl.subtype === 'accounts_receivable' ? 'Accounts Receivable' : 'Accounts Payable'}: its amounts belong to customers or vendors.`
+        : null);
+    if (reason) throw validation(`${reason} Link a bank, credit card or other balance-sheet account instead.`);
     // One link per GL account (QB: one register, one reconciliation history per account). A
     // second link — e.g. a double-clicked "Add Account" — gave the same register two separate
     // reconciliation histories, opening balances and in-progress sessions. Checked inside the

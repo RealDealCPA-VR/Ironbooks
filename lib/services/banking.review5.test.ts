@@ -1056,3 +1056,16 @@ describe('reconcile service charge and loan escrow accounts', () => {
     expect(ok.escrowAccountId).toBe(acct['1250']);
   });
 });
+
+describe('linking a bank account to the right kind of GL account', () => {
+  it('Undeposited Funds, Inventory Asset, A/R and A/P cannot be linked (their imported lines broke their lists)', async () => {
+    const { createBankAccount } = await import('./bankAccounts');
+    for (const code of ['1050', '1300', '1200', '2000']) {
+      await expectCode(createBankAccount(ctx, { accountId: acct[code], bankName: 'X', accountNumber: '1' }), 'VALIDATION');
+    }
+    const card = await createBankAccount(ctx, { accountId: acct['2100'], bankName: 'Card', accountNumber: '4417' });
+    expect(card.accountId).toBe(acct['2100']);
+    const loan = await createBankAccount(ctx, { accountId: acct['2300'], bankName: 'Payroll clearing', accountNumber: '9' });
+    expect(loan.accountId).toBe(acct['2300']);
+  });
+});
