@@ -565,6 +565,23 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect(err).toBeInstanceOf(ServiceError);
   });
 
+  it('O: landed cost from a freight bill dated before the goods arrived posts when the goods are in stock', async () => {
+    const { createItemReceipt } = await import('./itemReceipts');
+    const { allocateLandedCost } = await import('./landedCost');
+    const v = await newVendor();
+    const x = await fifoItem('Crates');
+    const freightAcct = (await createAccount(ctx, { code: '6070', name: 'Freight In O', type: 'expense' as never, subtype: 'operating_expenses' })).id;
+    // The freight forwarder bills on Dec 1; the goods arrive (item receipt) on Dec 10.
+    const freight = await createBill(ctx, { vendorId: v.id, date: d('2026-12-01'), lines: [{ accountId: freightAcct, amount: '40.00' }] });
+    const receipt = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-12-10'), lines: [{ itemId: x.item.id, quantity: 8, unitCost: '10.00' }] });
+    const [fl] = await db.query.billLines.findMany({ where: (bl, { eq: e }) => e(bl.billId, freight.id) });
+    const alloc = await allocateLandedCost(ctx, { billId: freight.id, billLineId: fl.id, method: 'quantity', itemReceiptIds: [receipt.id] });
+    // Before: dated Dec 1 — inventory worth $40 more on days the crates were not in stock yet.
+    expect(new Date(alloc.date).toISOString().slice(0, 10)).toBe('2026-12-10');
+    const [entry] = await db.select().from(journalEntries).where(eq(journalEntries.id, alloc.lines[0].entryId!));
+    expect(entry.date.toISOString().slice(0, 10)).toBe('2026-12-10');
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();

@@ -67,7 +67,7 @@ export interface AllocateLandedCostInput {
   method: LandedCostMethod;
   /** Item receipts whose inventory lines share the charge. */
   itemReceiptIds: string[];
-  /** Posting date; defaults to the bill date. */
+  /** Posting date; defaults to the bill date, or the latest item receipt's date when that is later. */
   date?: Date | null;
   memo?: string | null;
 }
@@ -396,6 +396,8 @@ interface TargetLine {
 
 interface ComputedAllocation {
   bill: typeof bills.$inferSelect;
+  /** The latest date of the selected item receipts (the goods are in stock from then on). */
+  latestReceiptDate: Date;
   billLine: typeof billLines.$inferSelect;
   amount: Dec;
   targets: TargetLine[];
@@ -513,7 +515,8 @@ async function computeAllocation(ctx: ServiceContext, input: AllocateLandedCostI
   if (!totalBasis.greaterThan(0)) throw validation('The allocation basis of the selected lines is zero.');
 
   const amounts = allocate(amount, bases);
-  return { bill, billLine, amount, targets, bases, amounts };
+  const latestReceiptDate = receipts.reduce((m, r) => (r.date > m ? r.date : m), receipts[0].date);
+  return { bill, billLine, amount, targets, bases, amounts, latestReceiptDate };
 }
 
 /**
@@ -615,7 +618,10 @@ export async function previewLandedCost(
 export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLandedCostInput) {
   return inTransaction(ctx, async (tx) => {
     const c = await computeAllocation(tx, input);
-    const date = input.date ?? c.bill.date;
+    // Default: the bill's date, or the day the last of the goods arrived when the charge was billed
+    // first (freight forwarders bill before delivery) — capitalizing it earlier put value on the
+    // inventory account for days the stock was not there yet.
+    const date = input.date ?? (c.latestReceiptDate > c.bill.date ? c.latestReceiptDate : c.bill.date);
     const cogsAccountId = await accountIdByCode(tx, '5000');
     let defaultInventoryId: string | null = null;
 
