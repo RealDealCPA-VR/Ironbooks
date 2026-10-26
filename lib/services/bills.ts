@@ -767,9 +767,12 @@ function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId
 export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
   const prep = await prepareBill(ctx, input);
   const { resolvedLines, totalStr } = prep;
-  await assertBillNumberAvailable(ctx, input);
 
   return inTransaction(ctx, async (tx) => {
+    // Duplicate vendor-reference check INSIDE the transaction: PGlite serializes transactions, so
+    // a double-clicked Save (or two users entering the same bill) sees the first bill instead of
+    // both passing the check and saving the bill twice.
+    await assertBillNumberAvailable(tx, input);
     // --- Insert the bill header ---
     const [bill] = await tx.db
       .insert(bills)
@@ -914,9 +917,10 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
 
   // Validate + resolve the new document (read-only).
   const prep = await prepareBill(ctx, input);
-  await assertBillNumberAvailable(ctx, input, id);
 
   return inTransaction(ctx, async (tx) => {
+    // Duplicate vendor-reference check in the same transaction as the save (see createBill).
+    await assertBillNumberAvailable(tx, input, id);
     // Re-load inside the transaction to close the read-then-write race.
     const [bill] = await tx.db
       .select()

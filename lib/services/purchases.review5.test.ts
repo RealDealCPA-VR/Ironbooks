@@ -526,6 +526,24 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
     expect(seqScans).toEqual([]);
   });
 
+  it('S: a double-submitted bill with a vendor reference number is caught as a duplicate', async () => {
+    const v = await newVendor();
+    const input = {
+      vendorId: v.id,
+      billNumber: 'DUP-77',
+      date: d('2026-09-01'),
+      checkDuplicateNumber: true,
+      lines: [{ accountId: acct['6300'], amount: '42.00' }],
+    };
+    const res = await Promise.allSettled([createBill(ctx, input), createBill(ctx, input), createBill(ctx, input), createBill(ctx, input)]);
+    expect(res.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = res.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    expect(rejected.reason).toBeInstanceOf(ServiceError);
+    expect((rejected.reason as ServiceError).details).toMatchObject({ duplicateNumber: true });
+    const rows = await db.select().from(bills).where(and(eq(bills.companyId, ctx.companyId), eq(bills.vendorId, v.id)));
+    expect(rows).toHaveLength(1);
+  });
+
   it('J: text longer than its column is refused with a plain message', async () => {
     const v = await newVendor();
     await expectCode(
