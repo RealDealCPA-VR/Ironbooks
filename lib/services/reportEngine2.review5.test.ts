@@ -78,3 +78,27 @@ describe('bank-feed transactions on reports', () => {
     void bankLines;
   });
 });
+
+/**
+ * The Num column showed internal ids: a paycheck not yet printed carries its id's first eight
+ * characters as the entry reference ("3f2a9c1d" — it looks like a check number), and other
+ * postings carry codes such as "landed-cost:<id>". QuickBooks shows the check number, or nothing.
+ */
+describe('Num column never shows internal ids', () => {
+  it('an unprinted paycheck has no number; a printed one shows its check number', async () => {
+    const { createEmployee, runPaycheck } = await import('./payroll');
+    const { markPaycheckPrinted, queuePaychecks } = await import('./printQueue');
+    const emp = await createEmployee(ctx, { firstName: 'Pat', lastName: 'Payee', payType: 'salary', payRate: 52000 } as never);
+    const unprinted = await runPaycheck(ctx, { employeeId: emp.id, payDate: d('2026-06-05'), grossPay: '500.00', taxes: [], employerTaxes: [] } as never);
+    const printed = await runPaycheck(ctx, { employeeId: emp.id, payDate: d('2026-06-06'), grossPay: '600.00', taxes: [], employerTaxes: [] } as never);
+    await queuePaychecks(ctx, [printed.id]);
+    await markPaycheckPrinted(ctx, { paycheckId: printed.id, checkNumber: '2001' });
+    const r = await runStandardReport(ctx, 'transaction-detail-by-account', { accountId: A['1000'], from: '2026-06-01', to: '2026-06-30' });
+    const nums = r.rows.filter((x) => x.entryId).map((x) => [x.cells.type, x.cells.num, x.cells.amount]);
+    expect(nums).toEqual([
+      ['Paycheck', '', '-500.00'],
+      ['Paycheck', '2001', '-600.00'],
+    ]);
+    expect(JSON.stringify(nums)).not.toContain(unprinted.id.slice(0, 8));
+  });
+});

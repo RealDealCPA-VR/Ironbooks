@@ -863,6 +863,7 @@ export interface ResolvedName {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ANY_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 /** Customer full names ("Parent:Job") for the company. */
 export async function customerNames(ctx: ServiceContext): Promise<Map<string, { name: string; parentId: string | null }>> {
@@ -990,10 +991,11 @@ export async function resolveEntryNames(
   const pcIds = ids('paycheck');
   if (pcIds.length) {
     const rows = await ctx.db
-      .select({ id: paychecks.id, nameId: paychecks.employeeId })
+      .select({ id: paychecks.id, nameId: paychecks.employeeId, checkNumber: paychecks.checkNumber })
       .from(paychecks)
       .where(and(eq(paychecks.companyId, c), inArray(paychecks.id, pcIds)));
-    for (const r of rows) docs.set(`pc:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: null });
+    // The printed check number, or nothing (the entry's reference is then the paycheck id's prefix).
+    for (const r of rows) docs.set(`pc:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: r.checkNumber?.trim() ?? '' });
   }
   const erIds = ids('expense_report');
   if (erIds.length) {
@@ -1001,7 +1003,7 @@ export async function resolveEntryNames(
       .select({ id: expenseReports.id, nameId: expenseReports.employeeId })
       .from(expenseReports)
       .where(and(eq(expenseReports.companyId, c), inArray(expenseReports.id, erIds)));
-    for (const r of rows) docs.set(`er:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: null });
+    for (const r of rows) docs.set(`er:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: '' });
   }
   const irIds = ids('item_receipt', 'item_receipt_void');
   if (irIds.length) {
@@ -1079,9 +1081,17 @@ export async function resolveEntryNames(
     return '';
   };
 
+  // The Num column never shows an internal code: references made of an id (a paycheck's id prefix,
+  // "landed-cost:<id>", "fix-line:<id>") are not document numbers.
+  const shownRef = (ref: string | null, sourceRef: string | null): string | null => {
+    if (!ref) return ref;
+    if (ANY_UUID_RE.test(ref)) return '';
+    const docId = sourceRef?.split(':')[1] ?? '';
+    return UUID_RE.test(docId) && ref === docId.slice(0, 8) ? '' : ref;
+  };
   const out = new Map<string, ResolvedName>();
   for (const e of entries) {
-    let res: ResolvedName = { nameType: null, nameId: null, name: '', num: e.reference };
+    let res: ResolvedName = { nameType: null, nameId: null, name: '', num: shownRef(e.reference, e.sourceRef) };
     if (e.sourceRef) {
       const [prefix, id] = e.sourceRef.split(':');
       const pick = (...keys: string[]) => keys.map((k) => docs.get(`${k}:${id}`)).find(Boolean);
@@ -1145,7 +1155,7 @@ export async function resolveEntryNames(
           nameType: d.nameType,
           nameId: d.nameId,
           name: nameOf(d.nameType, d.nameId) || d.payee || '',
-          num: d.num ?? e.reference,
+          num: d.num ?? shownRef(e.reference, e.sourceRef),
         };
       }
     }
