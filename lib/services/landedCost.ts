@@ -214,13 +214,20 @@ async function billLineHomeAmounts(
   const out = new Map<string, Dec>();
   const foreign = billRows.filter((b) => (b.currency ?? '').trim() !== '');
   if (foreign.length === 0) return out;
-  const lines = await ctx.db
-    .select({ id: billLines.id, billId: billLines.billId, amount: billLines.amount })
-    .from(billLines)
-    .where(inArray(billLines.billId, foreign.map((b) => b.id)))
-    .orderBy(asc(billLines.billId), asc(billLines.lineOrder));
+  const byBill = new Map<string, Array<{ id: string; billId: string; amount: string }>>();
+  for (const ids of chunked(foreign.map((b) => b.id))) {
+    for (const l of await ctx.db
+      .select({ id: billLines.id, billId: billLines.billId, amount: billLines.amount })
+      .from(billLines)
+      .where(inArray(billLines.billId, ids))
+      .orderBy(asc(billLines.billId), asc(billLines.lineOrder))) {
+      const list = byBill.get(l.billId) ?? [];
+      list.push(l);
+      byBill.set(l.billId, list);
+    }
+  }
   for (const b of foreign) {
-    const own = lines.filter((l) => l.billId === b.id);
+    const own = byBill.get(b.id) ?? [];
     const home = homeAmounts(
       own.map((l) => l.amount),
       b.exchangeRate ?? 1,
@@ -230,9 +237,24 @@ async function billLineHomeAmounts(
   return out;
 }
 
+/**
+ * Ids per IN (...) list: one query binding every bill line / bill of a large company file went past
+ * Postgres' 65,535 bind parameters ("bind message has N parameter formats") and the Landed Cost
+ * screen failed to load.
+ */
+const IN_CHUNK = 2000;
+function chunked<T>(xs: T[]): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += IN_CHUNK) out.push(xs.slice(i, i + IN_CHUNK));
+  return out;
+}
+
 /** Sum of active (non-void) allocations per bill line. */
 async function allocatedByBillLine(ctx: ServiceContext, billLineIds: string[]): Promise<Map<string, Dec>> {
-  if (billLineIds.length === 0) return new Map();
+  const out = new Map<string, Dec>();
+  if (billLineIds.length === 0) return out;
+  const wanted = billLineIds.length > IN_CHUNK ? new Set(billLineIds) : null;
+  // Many lines: every posted allocation of the company (a short list) instead of an IN list.
   const rows = await ctx.db
     .select({
       billLineId: landedCostAllocations.billLineId,
@@ -243,11 +265,12 @@ async function allocatedByBillLine(ctx: ServiceContext, billLineIds: string[]): 
       and(
         eq(landedCostAllocations.companyId, ctx.companyId),
         eq(landedCostAllocations.status, 'posted'),
-        inArray(landedCostAllocations.billLineId, billLineIds),
+        ...(wanted ? [] : [inArray(landedCostAllocations.billLineId, billLineIds)]),
       ),
     )
     .groupBy(landedCostAllocations.billLineId);
-  return new Map(rows.map((r) => [r.billLineId, Money.of(r.total)]));
+  for (const r of rows) if (!wanted || wanted.has(r.billLineId)) out.set(r.billLineId, Money.of(r.total));
+  return out;
 }
 
 /**

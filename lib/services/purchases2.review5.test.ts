@@ -588,6 +588,20 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect(entry.date.toISOString().slice(0, 10)).toBe('2026-12-10');
   });
 
+  it('P: the landed cost charge list loads on a large company file (more lines than one query can bind)', async () => {
+    const { listLandedCostSources } = await import('./landedCost');
+    const { sql: rawSql } = await import('drizzle-orm');
+    const v = await newVendor();
+    const big = await createBill(ctx, { vendorId: v.id, date: d('2026-01-15'), lines: [{ accountId: acct['6300'], amount: '1.00' }] });
+    // 70,000 more expense lines (years of bills): past Postgres' 65,535 bind parameters per query.
+    await db.execute(rawSql`
+      INSERT INTO bill_lines (bill_id, account_id, description, quantity, amount, line_order)
+      SELECT ${big.id}::uuid, ${acct['6300']}::uuid, 'Bulk line ' || g, 1, 1.00, g FROM generate_series(1, 70000) AS g`);
+    const sources = await listLandedCostSources(ctx, {});
+    expect(sources.filter((s) => s.billId === big.id).length).toBe(70001);
+    await db.execute(rawSql`DELETE FROM bill_lines WHERE bill_id = ${big.id}::uuid AND description LIKE 'Bulk line %'`);
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
