@@ -17,7 +17,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   accounts,
@@ -468,6 +468,62 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
     expect(err.code).toBe('CONFLICT');
     expect(err.message).toMatch(/refund/i);
     expect(err.message).not.toMatch(/applied to a bill/i);
+  });
+
+  it('Q: an item receipt costed beyond 4 decimals posts what its stored cost values (GL == stock, void clears)', async () => {
+    const { receiveStock } = await import('./fifo');
+    const v = await newVendor();
+    const invAcct = (await createAccount(ctx, { code: '1350', name: 'Inv Q', type: 'asset' as never, subtype: 'inventory' })).id;
+    const fifo = await createItem(ctx, { name: `Fifo Q ${++seq}`, type: 'inventory', assetAccountId: invAcct, cogsAccountId: acct['5000'] } as never);
+    await receiveStock(ctx, { itemId: fifo.id, quantity: 1, unitCost: '1.00', date: d('2026-08-20') });
+    const avg = await createItem(ctx, { name: `Avg Q ${++seq}`, type: 'inventory', assetAccountId: invAcct, cogsAccountId: acct['5000'] } as never);
+    const before = await glBalance(invAcct);
+    const receipt = await createItemReceipt(ctx, {
+      vendorId: v.id,
+      date: d('2026-08-21'),
+      lines: [
+        { itemId: fifo.id, quantity: 1000, unitCost: '0.33333' },
+        { itemId: avg.id, quantity: 3000, unitCost: '0.333333' },
+      ],
+    });
+    const layers = await db.select().from(inventoryLayers).where(eq(inventoryLayers.sourceRef, `item_receipt:${receipt.id}`));
+    const layerValue = layers.reduce((s, l) => s + Math.round(Number(l.quantityRemaining) * Number(l.unitCost) * 100), 0) / 100;
+    const [avgRow] = await db.select().from(items).where(eq(items.id, avg.id));
+    const avgValue = Math.round(Number(avgRow.quantityOnHand) * Number(avgRow.averageCost) * 100) / 100 + Number(avgRow.valueRemainder ?? 0);
+    const gained = Number(await glBalance(invAcct)) - Number(before);
+    expect(gained.toFixed(2)).toBe((layerValue + avgValue).toFixed(2));
+    // The receipt line shows the cost it was valued at.
+    expect(receipt.lines[0].unitCost).toBe('0.3333');
+    expect(receipt.lines[0].amount).toBe('333.30');
+    const { voidItemReceipt } = await import('./itemReceipts');
+    await voidItemReceipt(ctx, receipt.id);
+    expect(await glBalance(invAcct)).toBe(before);
+  });
+
+  it('R: purchase documents are looked up by index, not by scanning every line in the file', async () => {
+    const id = '00000000-0000-4000-8000-000000000000';
+    const lookups: Array<[string, ReturnType<typeof sql>]> = [
+      ['bill_lines.bill_id', sql`SELECT * FROM bill_lines WHERE bill_id = ${id}`],
+      ['bill_payment_applications.bill_id', sql`SELECT * FROM bill_payment_applications WHERE bill_id = ${id}`],
+      ['bill_payment_applications.bill_payment_id', sql`SELECT * FROM bill_payment_applications WHERE bill_payment_id = ${id}`],
+      ['bills(company, vendor)', sql`SELECT * FROM bills WHERE company_id = ${id} AND vendor_id = ${id}`],
+      ['bill_payments(company, account)', sql`SELECT * FROM bill_payments WHERE company_id = ${id} AND payment_account_id = ${id}`],
+      ['expense_lines.expense_id', sql`SELECT * FROM expense_lines WHERE expense_id = ${id}`],
+      ['expenses(company, account)', sql`SELECT * FROM expenses WHERE company_id = ${id} AND payment_account_id = ${id}`],
+      ['vendor_credit_lines.vendor_credit_id', sql`SELECT * FROM vendor_credit_lines WHERE vendor_credit_id = ${id}`],
+      ['item_receipt_lines.item_receipt_id', sql`SELECT * FROM item_receipt_lines WHERE item_receipt_id = ${id}`],
+      ['purchase_order_lines.purchase_order_id', sql`SELECT * FROM purchase_order_lines WHERE purchase_order_id = ${id}`],
+    ];
+    const seqScans: string[] = [];
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL enable_seqscan = off`);
+      for (const [label, q] of lookups) {
+        const res = (await tx.execute(sql`EXPLAIN ${q}`)) as unknown as { rows: Array<Record<string, string>> };
+        const plan = res.rows.map((r) => Object.values(r).join(' ')).join('\n');
+        if (/Seq Scan/.test(plan)) seqScans.push(label);
+      }
+    });
+    expect(seqScans).toEqual([]);
   });
 
   it('J: text longer than its column is refused with a plain message', async () => {

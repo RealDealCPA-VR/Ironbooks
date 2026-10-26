@@ -444,11 +444,24 @@ async function saveItemReceipt(
 
   for (const [i, line] of input.lines.entries()) {
     const item = itemMap.get(line.itemId)!;
-    const qty = Money.of(line.quantity);
+    // Quantity and unit cost are stored at 4 places (item_receipt_lines, FIFO layers); the amount
+    // is worked out from the stored values (as purchase orders do). A cost typed past 4 decimals
+    // (0.33333 x 1000) used to post 333.33 while the stored cost / FIFO layer valued 333.30, so
+    // the inventory GL drifted from the stock valuation and a void left the cents behind.
+    let qty: Dec;
+    let unitCost: Dec;
+    try {
+      qty = Money.of(Money.of(line.quantity).toFixed(4));
+      unitCost = Money.of(Money.of(line.unitCost).toFixed(4));
+    } catch {
+      throw validation(`Line ${i + 1}: enter the quantity and unit cost as numbers.`);
+    }
+    if (!qty.isFinite() || !unitCost.isFinite()) {
+      throw validation(`Line ${i + 1}: enter the quantity and unit cost as numbers.`);
+    }
     if (qty.lessThanOrEqualTo(0)) {
       throw validation(`Line ${i + 1}: quantity must be greater than zero.`);
     }
-    const unitCost = Money.of(line.unitCost);
     if (unitCost.isNegative()) {
       throw validation(`Line ${i + 1}: unit cost cannot be negative.`);
     }
