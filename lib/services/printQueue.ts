@@ -446,7 +446,7 @@ async function billPaymentCashByBill(
   const fromAudit = apps.map((a) => cashOf.get(a.billId));
   if (
     fromAudit.every((c, i) => c != null && !c.greaterThan(Money.of(apps[i].amountApplied))) &&
-    Money.round2(fromAudit.reduce((s, c) => s.plus(c ?? 0), Money.zero())).equals(billsCash)
+    Money.round2(fromAudit.reduce<ReturnType<typeof Money.zero>>((s, c) => s.plus(c ?? 0), Money.zero())).equals(billsCash)
   ) {
     return fromAudit as Array<ReturnType<typeof Money.zero>>;
   }

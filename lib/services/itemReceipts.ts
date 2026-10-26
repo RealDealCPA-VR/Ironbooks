@@ -41,6 +41,7 @@ import {
   itemReceiptLines,
   itemReceipts,
   items,
+  journalEntries,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -53,10 +54,12 @@ import {
 import {
   type InventoryLineDetail,
   attachInventoryDetails,
+  loadDocumentInventoryDetails,
   postDocumentInventory,
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertNoActiveLandedCost } from './landedCost';
+import { assertClosedPeriodEdit, retitleEntry } from './postedEdit';
 import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
 import { valueRemainderAfter } from './inventory';
 import {
@@ -378,6 +381,117 @@ export async function createItemReceipt(ctx: ServiceContext, input: CreateItemRe
  * stock pulled back out, site movements reversed, PO quantities released) and the new version
  * is posted on the SAME receipt (same id, so FIFO layers / landed-cost links keep pointing at it).
  */
+/** Inventory detail of a line as the comparison key (null/undefined/empty treated alike). */
+function receiptDetailKey(d: Partial<InventoryLineDetail> | null | undefined): string {
+  const serials = [...(d?.serialNumbers ?? [])].map((s) => String(s).trim()).filter(Boolean).sort();
+  const exp = d?.lotExpiration ? new Date(d.lotExpiration).toISOString().slice(0, 10) : '';
+  return [d?.siteId ?? '', d?.binId ?? '', serials.join(','), (d?.lotNumber ?? '').trim(), exp].join('|');
+}
+
+/**
+ * A reference / memo / line-description edit of a saved receipt changes nothing in the ledger or
+ * the stock (same vendor, date, PO link, items, quantities, costs and receiving site / bin /
+ * serials / lot). QB allows it on any receipt, also once its items were sold or it was billed, so
+ * it must not go through the void + repost path, which refuses when the received units are gone.
+ */
+async function isLedgerNeutralReceiptEdit(
+  ctx: ServiceContext,
+  receipt: typeof itemReceipts.$inferSelect,
+  input: CreateItemReceiptInput,
+): Promise<boolean> {
+  if (!receipt.postedEntryId || receipt.vendorId !== input.vendorId) return false;
+  if ((receipt.purchaseOrderId ?? null) !== (input.purchaseOrderId ?? null)) return false;
+  if (new Date(receipt.date).toISOString().slice(0, 10) !== new Date(input.date).toISOString().slice(0, 10)) return false;
+  const oldLines = await ctx.db
+    .select()
+    .from(itemReceiptLines)
+    .where(eq(itemReceiptLines.itemReceiptId, receipt.id))
+    .orderBy(asc(itemReceiptLines.lineOrder));
+  if (!input.lines || oldLines.length !== input.lines.length) return false;
+  const details = await loadDocumentInventoryDetails(ctx, 'item_receipt', receipt.id);
+  for (const [i, n] of input.lines.entries()) {
+    const o = oldLines[i];
+    let qty: Dec;
+    let cost: Dec;
+    try {
+      qty = Money.of(Money.of(n.quantity).toFixed(4));
+      cost = Money.of(Money.of(n.unitCost).toFixed(4));
+    } catch {
+      return false;
+    }
+    if (o.itemId !== n.itemId || !qty.equals(Money.of(o.quantity)) || !cost.equals(Money.of(o.unitCost))) return false;
+    const given =
+      n.siteId !== undefined ||
+      n.binId !== undefined ||
+      n.serialNumbers !== undefined ||
+      n.lotNumber !== undefined ||
+      n.lotExpiration !== undefined;
+    if (given && receiptDetailKey(n) !== receiptDetailKey(details.get(o.lineOrder))) return false;
+  }
+  const [entry] = await ctx.db
+    .select({ status: journalEntries.status })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.id, receipt.postedEntryId), eq(journalEntries.companyId, ctx.companyId)));
+  return entry?.status === 'posted';
+}
+
+/** Ledger-neutral receipt edit (see isLedgerNeutralReceiptEdit): reference, memo, descriptions. */
+async function updateReceiptHeaderInTx(tx: ServiceContext, id: string, input: CreateItemReceiptInput) {
+  const [cur] = await tx.db.select().from(itemReceipts).where(and(eq(itemReceipts.id, id), eq(itemReceipts.companyId, tx.companyId)));
+  if (!cur || cur.status === 'void' || !(await isLedgerNeutralReceiptEdit(tx, cur, input))) {
+    throw new ServiceError('CONFLICT', 'This item receipt was changed by someone else while you edited it. Reload it and try again.');
+  }
+  // Closing date: even a memo change to a closed-period receipt needs the password.
+  await assertClosedPeriodEdit(tx, { entryId: cur.postedEntryId, what: 'item receipt', date: cur.date });
+  const [vendor] = await tx.db.select({ name: vendors.displayName }).from(vendors).where(eq(vendors.id, cur.vendorId));
+  const [updated] = await tx.db
+    .update(itemReceipts)
+    .set({ reference: input.reference ?? null, memo: input.memo ?? null })
+    .where(eq(itemReceipts.id, id))
+    .returning();
+  const oldLines = await tx.db
+    .select()
+    .from(itemReceiptLines)
+    .where(eq(itemReceiptLines.itemReceiptId, id))
+    .orderBy(asc(itemReceiptLines.lineOrder));
+  const names = new Map(
+    (
+      await tx.db
+        .select({ id: items.id, name: items.name })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), inArray(items.id, oldLines.map((l) => l.itemId))))
+    ).map((r) => [r.id, r.name] as const),
+  );
+  for (const [i, o] of oldLines.entries()) {
+    await tx.db
+      .update(itemReceiptLines)
+      .set({ description: input.lines[i].description ?? names.get(o.itemId) ?? null })
+      .where(eq(itemReceiptLines.id, o.id));
+  }
+  await retitleEntry(tx, cur.postedEntryId, {
+    description: `Item receipt ${input.reference ? `#${input.reference}` : id} - ${vendor?.name ?? ''}`.trim(),
+    reference: input.reference ?? null,
+  });
+  await writeAudit(tx, {
+    action: 'update',
+    entityType: 'item_receipt',
+    entityId: id,
+    oldValues: { reference: cur.reference, memo: cur.memo, lines: oldLines.map((l) => ({ description: l.description })) },
+    newValues: {
+      reference: input.reference ?? null,
+      memo: input.memo ?? null,
+      ledger: 'unchanged',
+      lines: input.lines.map((l) => ({ description: l.description ?? null })),
+    },
+  });
+  const lines = await tx.db
+    .select()
+    .from(itemReceiptLines)
+    .where(eq(itemReceiptLines.itemReceiptId, id))
+    .orderBy(asc(itemReceiptLines.lineOrder));
+  return { ...updated, lines };
+}
+
 export async function updateItemReceipt(ctx: ServiceContext, id: string, input: CreateItemReceiptInput) {
   const [receipt] = await ctx.db
     .select()
@@ -385,6 +499,12 @@ export async function updateItemReceipt(ctx: ServiceContext, id: string, input: 
     .where(and(eq(itemReceipts.id, id), eq(itemReceipts.companyId, ctx.companyId)));
   if (!receipt) throw notFound('Item receipt');
   if (receipt.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided item receipt.');
+  // Reference / memo / description only: allowed on any receipt and never reposts (see above) —
+  // except while landed cost is allocated onto it (locked until the allocation is voided).
+  if (await isLedgerNeutralReceiptEdit(ctx, receipt, input)) {
+    await assertNoActiveLandedCost(ctx, { itemReceiptId: id });
+    return inTransaction(ctx, (tx) => updateReceiptHeaderInTx(tx, id, input));
+  }
   if (receipt.status !== 'open') {
     throw new ServiceError(
       'CONFLICT',

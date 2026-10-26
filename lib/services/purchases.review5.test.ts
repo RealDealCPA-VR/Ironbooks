@@ -37,14 +37,16 @@ import { ServiceError, type ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createAccount } from './accounts';
 import { createItem } from './items';
-import { createBill } from './bills';
+import { createBill, getBill, updateBill } from './bills';
+import { createCustomer } from './customers';
+import { createInvoice } from './invoices';
 import { payBills, updateBillPayment } from './billPayments';
 import { createVendor } from './vendors';
 import { createPurchaseOrder, convertToBill, updateStatus } from './purchaseOrders';
 import { checkPrintData } from './printQueue';
 import { generate1099NecFile } from './form1099Xml';
 import { createExpense } from './expenses';
-import { createItemReceipt } from './itemReceipts';
+import { createItemReceipt, updateItemReceipt } from './itemReceipts';
 import { enterBillForReceivedItems } from './receiving';
 import { allocateLandedCost } from './landedCost';
 import { upsertCurrency, setBaseCurrency } from './currencies';
@@ -542,6 +544,78 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
     expect((rejected.reason as ServiceError).details).toMatchObject({ duplicateNumber: true });
     const rows = await db.select().from(bills).where(and(eq(bills.companyId, ctx.companyId), eq(bills.vendorId, v.id)));
     expect(rows).toHaveLength(1);
+  });
+
+  it('T: a memo / number edit of a bill keeps its entry and stock, even when paid or its items were sold', async () => {
+    const v = await newVendor({ terms: 'net_30' });
+    const item = await newInventoryItem('Memo T');
+    const bill = await createBill(ctx, {
+      vendorId: v.id,
+      billNumber: 'T-1',
+      date: d('2026-09-10'),
+      memo: 'first',
+      lines: [
+        { itemId: item.id, quantity: 10, unitCost: '4.00' },
+        { accountId: acct['6300'], amount: '20.00', description: 'Shipping' },
+      ],
+    });
+    const cust = (await createCustomer(ctx, { displayName: `T cust ${++seq}` })).id;
+    await createInvoice(ctx, { customerId: cust, date: d('2026-09-11'), lines: [{ itemId: item.id, quantity: 3, rate: '9.00' }] } as never);
+    await payBills(ctx, { vendorId: v.id, date: d('2026-09-12'), method: 'ach', paymentAccountId: acct['1000'], applications: [{ billId: bill.id, amountApplied: '25.00' }] });
+    const entriesBefore = (await db.select({ id: journalEntries.id }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))).length;
+    const sameLines = [
+      { itemId: item.id, quantity: 10, unitCost: '4.00' },
+      { accountId: acct['6300'], amount: '20.00', description: 'Freight (fixed typo)' },
+    ];
+    const edited = await updateBill(ctx, bill.id, { vendorId: v.id, billNumber: 'T-1A', date: d('2026-09-10'), memo: 'second', lines: sameLines });
+    expect(edited.postedEntryId).toBe(bill.postedEntryId);
+    expect(edited.memo).toBe('second');
+    expect(edited.billNumber).toBe('T-1A');
+    expect(edited.amountPaid).toBe('25.00');
+    const [entry] = await db.select().from(journalEntries).where(eq(journalEntries.id, bill.postedEntryId!));
+    expect(entry.status).toBe('posted');
+    expect(entry.reference).toBe('T-1A');
+    const got = await getBill(ctx, bill.id);
+    expect(got.lines[1].description).toBe('Freight (fixed typo)');
+    const [itemRow] = await db.select().from(items).where(eq(items.id, item.id));
+    expect(Number(itemRow.quantityOnHand)).toBe(7);
+    // Re-saving it unchanged again is a no-op for the ledger.
+    await updateBill(ctx, bill.id, { vendorId: v.id, billNumber: 'T-1A', date: d('2026-09-10'), memo: 'second', lines: sameLines });
+    const entriesAfter = (await db.select({ id: journalEntries.id }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId))).length;
+    expect(entriesAfter).toBe(entriesBefore);
+    // Changing an amount on the paid bill is still refused.
+    await expectCode(
+      updateBill(ctx, bill.id, { vendorId: v.id, billNumber: 'T-1A', date: d('2026-09-10'), lines: [sameLines[0], { ...sameLines[1], amount: '21.00' }] }),
+      'CONFLICT',
+    );
+  });
+
+  it('U: a reference / memo edit of an item receipt whose items were sold keeps its entry and stock', async () => {
+    const v = await newVendor();
+    const item = await newInventoryItem('Memo U');
+    const receipt = await createItemReceipt(ctx, {
+      vendorId: v.id,
+      date: d('2026-09-15'),
+      reference: 'PS-1',
+      lines: [{ itemId: item.id, quantity: 10, unitCost: '3.00', description: 'Widgets' }],
+    });
+    const cust = (await createCustomer(ctx, { displayName: `U cust ${++seq}` })).id;
+    await createInvoice(ctx, { customerId: cust, date: d('2026-09-16'), lines: [{ itemId: item.id, quantity: 4, rate: '9.00' }] } as never);
+    const edited = await updateItemReceipt(ctx, receipt.id, {
+      vendorId: v.id,
+      date: d('2026-09-15'),
+      reference: 'PS-1B',
+      memo: 'packing slip corrected',
+      lines: [{ itemId: item.id, quantity: 10, unitCost: '3.00', description: 'Blue widgets' }],
+    });
+    expect(edited.postedEntryId).toBe(receipt.postedEntryId);
+    expect(edited.reference).toBe('PS-1B');
+    expect(edited.lines[0].description).toBe('Blue widgets');
+    const [itemRow] = await db.select().from(items).where(eq(items.id, item.id));
+    expect(Number(itemRow.quantityOnHand)).toBe(6);
+    const [entry] = await db.select().from(journalEntries).where(eq(journalEntries.id, receipt.postedEntryId!));
+    expect(entry.status).toBe('posted');
+    expect(entry.reference).toBe('PS-1B');
   });
 
   it('J: text longer than its column is refused with a plain message', async () => {

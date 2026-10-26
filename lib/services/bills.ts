@@ -29,7 +29,20 @@
  */
 import { and, asc, desc, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
-import { accounts, bills, billLines, classes, customers, inventoryLayers, items, jobs, loanPayments, vendors } from '@/lib/db/schema';
+import {
+  accounts,
+  bills,
+  billLines,
+  classes,
+  customers,
+  inventoryLayers,
+  items,
+  jobs,
+  journalEntries,
+  journalEntryLines,
+  loanPayments,
+  vendors,
+} from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type DiscountInfo, discountFor, dueDateFromTerms } from './billTerms';
 import { computeDiscount, computeDueDate, dueDateFromTermsList, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
@@ -37,10 +50,12 @@ import { duplicateNumberFixes } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
+import { assertClosedPeriodEdit, retitleEntry, sameLedgerLines } from './postedEdit';
 import {
   type DocumentInventoryLine,
   type InventoryLineDetail,
   attachInventoryDetails,
+  loadDocumentInventoryDetails,
   postDocumentInventory,
   reverseDocumentInventory,
 } from './inventorySites';
@@ -883,6 +898,156 @@ async function assertNotLoanBill(ctx: ServiceContext, billId: string) {
   }
 }
 
+/** Inventory detail of a line as the comparison key (null/undefined/empty treated alike). */
+function detailKey(d: Partial<InventoryLineDetail> | null | undefined): string {
+  const serials = [...(d?.serialNumbers ?? [])].map((s) => String(s).trim()).filter(Boolean).sort();
+  const exp = d?.lotExpiration ? new Date(d.lotExpiration).toISOString().slice(0, 10) : '';
+  return [d?.siteId ?? '', d?.binId ?? '', serials.join(','), (d?.lotNumber ?? '').trim(), exp].join('|');
+}
+
+/**
+ * QB lets you fix the memo, the vendor's reference number, the terms / due date, a line's
+ * description or its billable Customer:Job on ANY saved bill: paid, credited, received against
+ * item receipts, or whose items were sold since. Such an edit changes nothing in the ledger, so the
+ * posted entry, the stock and every application stay as they are. True when `input` is that kind
+ * of edit of `bill`: same vendor, date, currency / rate, and the same lines (account, item,
+ * quantity, amount, class, inventory site / bin / serials / lot) posting the same entry.
+ */
+async function isLedgerNeutralBillEdit(
+  ctx: ServiceContext,
+  bill: typeof bills.$inferSelect,
+  input: CreateBillInput,
+  prep: PreparedBill,
+): Promise<boolean> {
+  if (!bill.postedEntryId || bill.vendorId !== input.vendorId) return false;
+  if (new Date(bill.date).toISOString().slice(0, 10) !== new Date(input.date).toISOString().slice(0, 10)) return false;
+  if ((bill.currency ?? null) !== (prep.currency ?? null)) return false;
+  if (prep.currency && !Money.of(bill.exchangeRate ?? 0).equals(prep.rate)) return false;
+  const oldLines = await ctx.db
+    .select()
+    .from(billLines)
+    .where(eq(billLines.billId, bill.id))
+    .orderBy(asc(billLines.lineOrder));
+  if (oldLines.length !== prep.resolvedLines.length) return false;
+  const details = await loadDocumentInventoryDetails(ctx, 'bill', bill.id);
+  for (const [i, n] of prep.resolvedLines.entries()) {
+    const o = oldLines[i];
+    if (
+      o.accountId !== n.accountId ||
+      (o.itemId ?? null) !== (n.itemId ?? null) ||
+      !Money.eq(o.quantity ?? 0, n.quantity) ||
+      !Money.eq(o.amount, n.amount) ||
+      (o.classId ?? null) !== (n.classId ?? null)
+    ) {
+      return false;
+    }
+    if (n.isInventory) {
+      const src = input.lines[i] ?? {};
+      const given =
+        src.siteId !== undefined ||
+        src.binId !== undefined ||
+        src.serialNumbers !== undefined ||
+        src.lotNumber !== undefined ||
+        src.lotExpiration !== undefined;
+      // Details not sent keep the saved ones; sent ones must match them.
+      if (given && detailKey(src) !== detailKey(details.get(o.lineOrder))) return false;
+    }
+  }
+  // The entry itself must be the one this bill would post (a bill entered against item receipts
+  // posts aggregated accrual / variance lines and is never ledger-neutral here).
+  const [entry] = await ctx.db
+    .select({ id: journalEntries.id, status: journalEntries.status })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.id, bill.postedEntryId), eq(journalEntries.companyId, ctx.companyId)));
+  if (!entry || entry.status !== 'posted') return false;
+  const posted = await ctx.db
+    .select()
+    .from(journalEntryLines)
+    .where(eq(journalEntryLines.journalEntryId, entry.id));
+  return sameLedgerLines(
+    posted.map((l) => ({
+      accountId: l.accountId,
+      debit: l.debit,
+      credit: l.credit,
+      classId: l.classId,
+      entityType: (l.entityType ?? null) as never,
+      entityId: l.entityId ?? null,
+    })),
+    buildPostingLines(prep, input.billNumber ?? null, bill.id),
+  );
+}
+
+/** Ledger-neutral bill edit (see isLedgerNeutralBillEdit): header and line text only. */
+async function updateBillHeaderInTx(tx: ServiceContext, id: string, input: CreateBillInput, prep: PreparedBill) {
+  const [bill] = await tx.db
+    .select()
+    .from(bills)
+    .where(and(eq(bills.id, id), eq(bills.companyId, tx.companyId)));
+  if (!bill) throw notFound('Bill');
+  if (bill.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided bill.');
+  // Closing date: even a memo change to a closed-period bill needs the password (QB), and is
+  // recorded on the Closing Date Exception report.
+  await assertClosedPeriodEdit(tx, { entryId: bill.postedEntryId, what: 'bill', date: bill.date });
+  await assertBillNumberAvailable(tx, input, id);
+  const oldLines = await tx.db
+    .select()
+    .from(billLines)
+    .where(eq(billLines.billId, id))
+    .orderBy(asc(billLines.lineOrder));
+  const [updated] = await tx.db
+    .update(bills)
+    .set({
+      billNumber: input.billNumber ?? null,
+      dueDate: prep.dueDate,
+      terms: prep.terms,
+      memo: input.memo ?? null,
+      classId: input.classId ?? null,
+      updatedAt: new Date(),
+    })
+    .where(eq(bills.id, id))
+    .returning();
+  for (const [i, o] of oldLines.entries()) {
+    const n = prep.resolvedLines[i];
+    await tx.db
+      .update(billLines)
+      .set({
+        description: n.description,
+        // A line already billed to a customer keeps the Customer:Job it was billed to.
+        customerId: o.billedInvoiceId ? o.customerId : n.customerId,
+        jobId: o.billedInvoiceId ? o.jobId : n.jobId,
+      })
+      .where(eq(billLines.id, o.id));
+  }
+  await retitleEntry(tx, bill.postedEntryId, {
+    description: `Bill ${input.billNumber ? `#${input.billNumber}` : id}`,
+    reference: input.billNumber ?? null,
+  });
+  await writeAudit(tx, {
+    action: 'update',
+    entityType: 'bill',
+    entityId: id,
+    oldValues: {
+      billNumber: bill.billNumber,
+      dueDate: bill.dueDate,
+      terms: bill.terms,
+      memo: bill.memo,
+      classId: bill.classId,
+      lines: oldLines.map((l) => ({ description: l.description, customerId: l.customerId, jobId: l.jobId })),
+    },
+    newValues: {
+      billNumber: input.billNumber ?? null,
+      dueDate: prep.dueDate,
+      terms: prep.terms,
+      memo: input.memo ?? null,
+      classId: input.classId ?? null,
+      ledger: 'unchanged',
+      postedEntryId: bill.postedEntryId,
+      lines: prep.resolvedLines.map((l) => ({ description: l.description, customerId: l.customerId, jobId: l.jobId })),
+    },
+  });
+  return updated;
+}
+
 export async function updateBill(ctx: ServiceContext, id: string, input: CreateBillInput) {
   // Pre-check outside the transaction for a fast, friendly error.
   const [existing] = await ctx.db
@@ -892,6 +1057,29 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
   if (!existing) throw notFound('Bill');
   if (existing.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot edit a voided bill.');
+  }
+  // Loan Manager bills stay locked to the loan schedule (void and set the payment up again), and a
+  // bill with landed cost allocated from it stays locked until the allocation is voided.
+  await assertNotLoanBill(ctx, id);
+  await assertNoActiveLandedCost(ctx, { billId: id });
+  // A memo / number / terms / description edit never touches the ledger: allowed on any bill
+  // (paid, credited, received, items sold since), and re-saving an unchanged bill is a no-op for
+  // the books instead of a void + repost (which a sold-out stock line refused).
+  {
+    // An input the full edit would refuse anyway (e.g. the negative variance lines of a bill for
+    // received items) falls through to it, so its own checks give the usual message.
+    const neutralPrep = await prepareBill(ctx, input).catch(() => null);
+    if (neutralPrep && (await isLedgerNeutralBillEdit(ctx, existing, input, neutralPrep))) {
+      return inTransaction(ctx, async (tx) => {
+        const [cur] = await tx.db.select().from(bills).where(and(eq(bills.id, id), eq(bills.companyId, tx.companyId)));
+        if (!cur) throw notFound('Bill');
+        // Re-check inside the transaction (a concurrent edit may have changed the ledger side).
+        if (!(await isLedgerNeutralBillEdit(tx, cur, input, neutralPrep))) {
+          throw new ServiceError('CONFLICT', 'This bill was changed by someone else while you edited it. Reload it and try again.');
+        }
+        return updateBillHeaderInTx(tx, id, input, neutralPrep);
+      });
+    }
   }
   if (existing.amountPaid && Money.gt(existing.amountPaid, 0)) {
     throw new ServiceError(
