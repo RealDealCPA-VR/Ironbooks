@@ -166,3 +166,18 @@ describe('a capped report says so', () => {
     }
   });
 });
+
+describe('Balance Sheet Detail with a name filter', () => {
+  it("does not mix every name's beginning balance into one vendor's transactions", async () => {
+    // Euro Parts' bill is dated Feb 2: before the range, so it is part of the A/P beginning balance.
+    const r = await runStandardReport(ctx, 'balance-sheet-detail', { from: '2026-02-03', to: '2026-12-31', vendorId: S.local });
+    const apGroup = r.rows.find((x) => x.kind === 'section' && x.cells.label === 'Accounts Payable');
+    const apRows = r.rows.filter((x) => x.parentId === apGroup?.id);
+    // No beginning balance carrying the other vendor's (or Local Supply's own earlier) A/P.
+    expect(apRows.some((x) => x.cells.label === 'Beginning balance')).toBe(false);
+    // Only Local Supply's A/P lines in the range: the credit (-10) and the payment (-5).
+    const total = r.rows.find((x) => x.id === `${apGroup?.id}:total`);
+    expect(total?.cells.amount).toBe('-15.00');
+    expect((r.notes ?? []).join(' ')).toMatch(/Beginning balances are left out/);
+  });
+});

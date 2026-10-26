@@ -784,7 +784,11 @@ export async function balanceSheetDetail(ctx: ServiceContext, p: ReportParams): 
   const f = glFilterFromParams(meta, p, { from, to });
   f.sections = f.sections ? f.sections.filter((s) => !isPLSection(s)) : [...BS_SECTIONS];
   const { lines, truncated } = await fetchGlLines(ctx, meta, f);
-  const before = await activityByAccount(ctx, { to: new Date(from.getTime() - 1), accountIds: f.accountIds, basis: f.basis });
+  // Beginning balances are whole-account balances: with a line filter on (a name, class, type,
+  // amount …) they would add every other name's balance to the filtered lines, so — as on the
+  // General Ledger — they are left out then.
+  const lineFiltered = hasLineFilter(p);
+  const before = lineFiltered ? [] : await activityByAccount(ctx, { to: new Date(from.getTime() - 1), accountIds: f.accountIds, basis: f.basis });
   const opening = new Map<string, Decimal>();
   for (const r of before) {
     const a = meta.get(r.accountId);
@@ -816,9 +820,15 @@ export async function balanceSheetDetail(ctx: ServiceContext, p: ReportParams): 
     truncated,
     notes: [
       ...detailNotes(truncated),
+      ...(lineFiltered ? ['Beginning balances are left out because a filter is on.'] : []),
       'Retained Earnings and Net Income are calculated lines; see the Balance Sheet for them.',
     ],
   };
+}
+
+/** A filter that picks individual lines (so whole-account beginning balances no longer apply). */
+function hasLineFilter(p: ReportParams): boolean {
+  return !!(p.customerId || p.vendorId || p.employeeId || p.nameId || p.txnType || p.amountMin || p.amountMax || p.memo || p.number || (p.cleared && p.cleared !== 'any') || p.classId);
 }
 
 /**
@@ -836,7 +846,7 @@ export async function generalLedgerReport(ctx: ServiceContext, p: ReportParams):
   const dayBefore = new Date(from.getTime() - 1);
   const fyStart = fiscalWindowFor(from, await companyFiscalYearEnd(ctx)).start;
   // Opening balances only make sense when no line-level filter (name, type, amount…) is on.
-  const lineFiltered = !!(p.customerId || p.vendorId || p.employeeId || p.nameId || p.txnType || p.amountMin || p.amountMax || p.memo || p.number || (p.cleared && p.cleared !== 'any') || p.classId);
+  const lineFiltered = hasLineFilter(p);
   const opening = new Map<string, Decimal>();
   if (!lineFiltered) {
     const [bsBefore, plBefore] = await Promise.all([
