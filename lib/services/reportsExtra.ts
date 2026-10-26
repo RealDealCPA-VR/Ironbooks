@@ -8,7 +8,6 @@ import {
   accounts,
   auditLogs,
   bouncedChecks,
-  billLines,
   billPaymentApplications,
   billPayments,
   bills,
@@ -2297,52 +2296,55 @@ export interface PurchasesByItemReport {
 }
 
 /**
- * Purchases by Item (summary) — quantity and cost per item across vendor bills
- * in the period (voided bills excluded). Only item-coded bill lines count.
+ * Purchases by Item (summary) — quantity and cost per item across every purchase in the period:
+ * bills, checks and credit-card charges with item lines, and vendor credits (returns) as
+ * negatives; void documents excluded; home currency (the same lines as the standard Purchases
+ * reports, reportsLists.ts purchaseLines).
  */
 export async function purchasesByItem(
   ctx: ServiceContext,
   range?: { from?: Date; to?: Date },
 ): Promise<PurchasesByItemReport> {
-  const conds = [
-    eq(bills.companyId, ctx.companyId),
-    ne(bills.status, 'void'),
-    isNotNull(billLines.itemId),
-  ];
-  if (range?.from) conds.push(gte(bills.date, range.from));
-  if (range?.to) conds.push(lte(bills.date, range.to));
-
-  const agg = await ctx.db
-    .select({
-      itemId: billLines.itemId,
-      itemName: items.name,
-      sku: items.sku,
-      quantity: sql<string>`COALESCE(SUM(CAST(${billLines.quantity} AS NUMERIC)), 0)`,
-      cost: sql<string>`COALESCE(SUM(CAST(${billLines.amount} AS NUMERIC)), 0)`,
-    })
-    .from(billLines)
-    .innerJoin(bills, eq(billLines.billId, bills.id))
-    .innerJoin(items, eq(billLines.itemId, items.id))
-    .where(and(...conds))
-    .groupBy(billLines.itemId, items.name, items.sku)
-    .orderBy(sql`SUM(CAST(${billLines.amount} AS NUMERIC)) DESC`);
+  // Loaded on demand: reportsLists imports this module.
+  const { purchaseLines } = await import('./reportsLists');
+  const lines = await purchaseLines(
+    ctx,
+    {},
+    range?.from ?? new Date(Date.UTC(1900, 0, 1)),
+    range?.to ?? new Date(Date.UTC(9999, 11, 31, 23, 59, 59, 999)),
+  );
+  const acc = new Map<string, { name: string; qty: ReturnType<typeof Money.zero>; cost: ReturnType<typeof Money.zero> }>();
+  for (const l of lines) {
+    const cur = acc.get(l.itemId) ?? { name: l.item ?? '', qty: Money.zero(), cost: Money.zero() };
+    cur.qty = cur.qty.plus(l.qty);
+    cur.cost = cur.cost.plus(l.amount);
+    acc.set(l.itemId, cur);
+  }
+  const skus = new Map<string, string | null>();
+  const ids = [...acc.keys()];
+  if (ids.length) {
+    for (const r of await ctx.db
+      .select({ id: items.id, sku: items.sku })
+      .from(items)
+      .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, ids)))) {
+      skus.set(r.id, r.sku);
+    }
+  }
 
   let totQty = Money.zero();
   let totCost = Money.zero();
-  const rows: PurchasesByItemRow[] = agg
-    .filter((r) => r.itemId !== null)
-    .map((r) => {
-      const qty = Money.of(r.quantity);
-      const cost = Money.of(r.cost);
-      totQty = totQty.plus(qty);
-      totCost = totCost.plus(cost);
+  const rows: PurchasesByItemRow[] = [...acc.entries()]
+    .sort((a, b) => b[1].cost.comparedTo(a[1].cost))
+    .map(([itemId, r]) => {
+      totQty = totQty.plus(r.qty);
+      totCost = totCost.plus(r.cost);
       return {
-        itemId: r.itemId!,
-        itemName: r.itemName,
-        sku: r.sku,
-        quantity: qty.toString(),
-        cost: toAmountString(cost),
-        avgUnitCost: qty.isZero() ? null : cost.dividedBy(qty).toFixed(2),
+        itemId,
+        itemName: r.name,
+        sku: skus.get(itemId) ?? null,
+        quantity: r.qty.toString(),
+        cost: toAmountString(r.cost),
+        avgUnitCost: r.qty.isZero() ? null : r.cost.dividedBy(r.qty).toFixed(2),
       };
     });
 

@@ -388,20 +388,21 @@ export async function unbilledCostsByJob(ctx: ServiceContext, p: ReportParams): 
   const out: U[] = [];
   const toCond = (col: Parameters<typeof lte>[0]) => (to ? [lte(col, to)] : []);
   for (const r of await ctx.db
-    .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, memo: billLines.description, amount: billLines.amount })
+    .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, memo: billLines.description, amount: billLines.amount, fx: bills.exchangeRate })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
     .where(and(eq(bills.companyId, c), ne(bills.status, 'void'), isNotNull(billLines.customerId), isNull(billLines.billedInvoiceId), ...toCond(bills.date)))) {
     const k = keyOf(r.jobId, r.customerId)!;
-    out.push({ jobKey: k, date: r.date, type: 'Bill', num: r.num ?? '', memo: r.memo ?? '', amount: Money.of(r.amount), sourceRef: `bill:${r.id}` });
+    // Home currency, like Job Profitability (a EUR bill line is never added as dollars).
+    out.push({ jobKey: k, date: r.date, type: 'Bill', num: r.num ?? '', memo: r.memo ?? '', amount: homeOf(r.amount, r.fx), sourceRef: `bill:${r.id}` });
   }
   for (const r of await ctx.db
-    .select({ id: expenses.id, num: expenses.reference, date: expenses.date, customerId: expenseLines.customerId, jobId: expenseLines.jobId, memo: expenseLines.description, amount: expenseLines.amount })
+    .select({ id: expenses.id, num: expenses.reference, date: expenses.date, customerId: expenseLines.customerId, jobId: expenseLines.jobId, memo: expenseLines.description, amount: expenseLines.amount, fx: expenses.exchangeRate })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
     .where(and(eq(expenses.companyId, c), isNull(expenses.voidedAt), isNotNull(expenseLines.customerId), isNull(expenseLines.billedInvoiceId), ...toCond(expenses.date)))) {
     const k = keyOf(r.jobId, r.customerId)!;
-    out.push({ jobKey: k, date: r.date, type: 'Check', num: r.num ?? '', memo: r.memo ?? '', amount: Money.of(r.amount), sourceRef: `expense:${r.id}` });
+    out.push({ jobKey: k, date: r.date, type: 'Check', num: r.num ?? '', memo: r.memo ?? '', amount: homeOf(r.amount, r.fx), sourceRef: `expense:${r.id}` });
   }
   for (const r of await ctx.db
     .select({ id: timeEntries.id, date: timeEntries.date, customerId: timeEntries.customerId, jobId: timeEntries.jobId, hours: timeEntries.hours, rate: timeEntries.rate, memo: timeEntries.description })
