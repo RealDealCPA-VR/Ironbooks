@@ -270,6 +270,7 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
         currency: bills.currency,
         exchangeRate: bills.exchangeRate,
         date: bills.date,
+        billNumber: bills.billNumber,
       })
       .from(bills)
       .where(and(eq(bills.id, app.billId), eq(bills.companyId, ctx.companyId)));
@@ -285,6 +286,15 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
     }
     if (bill.status === 'paid') {
       throw new ServiceError('CONFLICT', `Bill ${app.billId} is already fully paid.`);
+    }
+    // A bill can't be paid before it exists (as a vendor credit can't be applied before it does):
+    // the payment's A/P debit would sit on dates the bill is not on, so A/P aging as of those dates
+    // no longer matched the A/P account.
+    if (new Date(input.date).toISOString().slice(0, 10) < new Date(bill.date).toISOString().slice(0, 10)) {
+      throw validation(
+        `A bill can't be paid before its date. Date the payment on or after ${new Date(bill.date).toISOString().slice(0, 10)}, the date of bill ${bill.billNumber ?? app.billId}.`,
+        { billId: app.billId, billDate: new Date(bill.date).toISOString().slice(0, 10) },
+      );
     }
     const balance = Money.of(bill.balanceDue);
     const settled = applied.plus(discount);
@@ -839,6 +849,8 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       await rollbackApplications(tx, id);
       await reverseJournalApplicationsForBillPayment(tx, id);
+      // The closing date on the NEW date is reported before anything about the bills.
+      await assertPeriodOpen(tx, input.date);
       const prep = await preparePayment(tx, input);
       const entry = await postJournalEntry(tx, {
         date: input.date,

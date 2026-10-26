@@ -670,6 +670,23 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
     expect(wr?.nec1 ?? 'omitted').toBe('700.00');
   });
 
+  it('X: a bill cannot be paid before its date (A/P aging as of that day must match the A/P account)', async () => {
+    const v = await newVendor();
+    const bill = await createBill(ctx, { vendorId: v.id, billNumber: 'X-1', date: d('2026-10-10'), lines: [{ accountId: acct['6300'], amount: '100.00' }] });
+    await expectCode(
+      payBills(ctx, { vendorId: v.id, date: d('2026-10-05'), method: 'ach', paymentAccountId: acct['1000'], applications: [{ billId: bill.id, amountApplied: '100.00' }] }),
+      'VALIDATION',
+    );
+    // Same day is fine; an edit cannot move it before the bill either.
+    const pay = await payBills(ctx, { vendorId: v.id, date: d('2026-10-10'), method: 'ach', paymentAccountId: acct['1000'], applications: [{ billId: bill.id, amountApplied: '40.00' }] });
+    await expectCode(
+      updateBillPayment(ctx, pay.id, { vendorId: v.id, date: d('2026-10-01'), method: 'ach', paymentAccountId: acct['1000'], applications: [{ billId: bill.id, amountApplied: '40.00' }] }),
+      'VALIDATION',
+    );
+    const [row] = await db.select().from(bills).where(eq(bills.id, bill.id));
+    expect(row.balanceDue).toBe('60.00');
+  });
+
   it('J: text longer than its column is refused with a plain message', async () => {
     const v = await newVendor();
     await expectCode(
