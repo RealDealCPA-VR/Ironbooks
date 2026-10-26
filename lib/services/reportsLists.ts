@@ -219,8 +219,29 @@ export async function unpaidBillsDetail(ctx: ServiceContext, p: ReportParams): P
   const docs = aging.rows.filter(
     (r) => (!p.vendorId || r.entityId === p.vendorId) && (overDays === null || r.daysPastDue > overDays),
   );
-  const refs = docs.map((r) => `${r.docType === 'bill' ? 'bill' : 'vendor_credit'}:${r.docId}`);
-  const entryIds = await entryIdsForSourceRefs(ctx, refs);
+  // QuickZoom: a bill / credit opens its posted entry; a named General Journal A/P line IS its
+  // entry (it used to be looked up as a "vendor_credit:" document, so it never opened, and was
+  // labelled "Bill Credit").
+  const refOf = (r: (typeof docs)[number]) => (r.docType === 'bill' ? `bill:${r.docId}` : r.docType === 'vendor_credit' ? `vendor_credit:${r.docId}` : '');
+  const entryIds = await entryIdsForSourceRefs(ctx, docs.map(refOf));
+  const creditIds = docs.filter((r) => r.docType === 'vendor_credit').map((r) => r.docId);
+  const creditRefs = new Map<string, string | null>();
+  for (let i = 0; i < creditIds.length; i += 2000) {
+    for (const c of await ctx.db
+      .select({ id: vendorCredits.id, ref: vendorCredits.refNumber })
+      .from(vendorCredits)
+      .where(and(eq(vendorCredits.companyId, ctx.companyId), inArray(vendorCredits.id, creditIds.slice(i, i + 2000))))) {
+      creditRefs.set(c.id, c.ref);
+    }
+  }
+  const TYPE: Record<string, string> = { bill: 'Bill', vendor_credit: 'Credit', journal_entry: 'General Journal' };
+  /** The Num column: the document's own number (QB), never "Bill …" / "Vendor Credit". */
+  const numOf = (r: (typeof docs)[number]) =>
+    r.docType === 'bill'
+      ? r.docNumber.replace(/^Bill ?/, '')
+      : r.docType === 'vendor_credit'
+        ? (creditRefs.get(r.docId) ?? '')
+        : r.docNumber.replace(/^General Journal /, '');
   const byVendor = new Map<string, typeof docs>();
   for (const r of docs) byVendor.set(r.entityId, [...(byVendor.get(r.entityId) ?? []), r]);
   const rows: StdRow[] = [];
@@ -230,23 +251,24 @@ export async function unpaidBillsDetail(ctx: ServiceContext, p: ReportParams): P
     let sub = Money.zero();
     const header: StdRow = { id: hid, depth: 0, kind: 'section', collapseKind: 'group', cells: { label: list[0].entityName } };
     rows.push(header);
-    for (const r of list.sort((a, b) => (a.dueDate ?? a.date).localeCompare(b.dueDate ?? b.date))) {
+    for (const [i, r] of list.sort((a, b) => (a.dueDate ?? a.date).localeCompare(b.dueDate ?? b.date)).entries()) {
       sub = sub.plus(Money.of(r.openBalance));
       rows.push({
-        id: `ub:d:${r.docId}`,
+        // A General Journal entry can name the vendor on several A/P lines: keep row ids unique.
+        id: `ub:d:${r.docType}:${r.docId}:${i}`,
         parentId: hid,
         depth: 1,
         kind: 'data',
         cells: {
           label: '',
-          type: r.docType === 'bill' ? 'Bill' : 'Bill Credit',
+          type: TYPE[r.docType] ?? 'General Journal',
           date: r.date.slice(0, 10),
-          num: r.docNumber,
+          num: numOf(r),
           due: r.dueDate ? r.dueDate.slice(0, 10) : '',
           aging: r.daysPastDue > 0 ? r.daysPastDue : null,
           open: r.openBalance,
         },
-        entryId: entryIds.get(refs[docs.indexOf(r)]) ?? null,
+        entryId: r.docType === 'journal_entry' ? r.docId : (entryIds.get(refOf(r)) ?? null),
       });
     }
     total = total.plus(sub);

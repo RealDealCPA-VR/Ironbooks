@@ -181,3 +181,25 @@ describe('Balance Sheet Detail with a name filter', () => {
     expect((r.notes ?? []).join(' ')).toMatch(/Beginning balances are left out/);
   });
 });
+
+describe('Unpaid Bills Detail', () => {
+  it('a named General Journal A/P line is a General Journal item that opens its entry; Num shows the number only', async () => {
+    const { postJournalEntry } = await import('./posting');
+    const je = await postJournalEntry(ctx, {
+      date: d('2026-03-01'),
+      description: 'Opening A/P',
+      lines: [
+        { accountId: A['6300'], debit: '40.00' },
+        { accountId: A['2000'], credit: '40.00', entityType: 'vendor', entityId: S.local },
+      ],
+    });
+    const r = await runStandardReport(ctx, 'unpaid-bills-detail', { asOf: '2026-12-31', vendorId: S.local });
+    const rows = r.rows.filter((x) => x.kind === 'data');
+    const gj = rows.find((x) => x.cells.type === 'General Journal');
+    expect(gj, JSON.stringify(rows.map((x) => x.cells))).toBeTruthy();
+    expect(gj!.entryId).toBe(je.id);
+    expect(gj!.cells.open).toBe('40.00');
+    const bill = rows.find((x) => x.cells.type === 'Bill');
+    expect(bill?.cells.num).toBe('L-1');
+  });
+});
