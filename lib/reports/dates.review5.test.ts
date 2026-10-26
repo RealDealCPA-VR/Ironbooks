@@ -59,3 +59,20 @@ describe('audit timestamps on report pages', () => {
     }
   });
 });
+
+/**
+ * The Memorize dialog said "Relative dates are saved as the exact dates shown", but a memorized
+ * report keeps a relative Dates choice (This month, Last month …) relative — as QuickBooks does —
+ * and only custom dates are fixed. The note now says what will happen for the report on screen.
+ */
+describe('memorizeDatesNote', () => {
+  it('relative, custom and default dates are each described as they will run', async () => {
+    const { memorizeDatesNote } = await import('./dates');
+    const choices: [string, string][] = [['this_month', 'This month'], ['last_month', 'Last month']];
+    expect(memorizeDatesNote({ dates: 'last_month' }, choices)).toMatch(/Last month.*each time/i);
+    expect(memorizeDatesNote({ dates: 'last_month' }, choices)).not.toMatch(/exact dates/i);
+    expect(memorizeDatesNote({ from: '2026-01-01', to: '2026-03-31' }, choices)).toMatch(/01\/01\/2026 – 03\/31\/2026/);
+    expect(memorizeDatesNote({ asOf: '2026-03-31' }, choices)).toMatch(/03\/31\/2026/);
+    expect(memorizeDatesNote({}, choices)).toMatch(/default/i);
+  });
+});
