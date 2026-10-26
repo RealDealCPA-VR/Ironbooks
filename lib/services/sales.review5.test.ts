@@ -53,7 +53,7 @@ import { commissionReport, createSalesRep, updateSalesRep } from './salesReps';
 import { convertToInvoice as convertEstimate, createEstimate, createProgressInvoice, getEstimate } from './estimates';
 import { collectionsCenter, incomeTracker } from './incomeTracker';
 import { listExpiringEstimates } from './estimateExpiry';
-import { openItemStatement } from './statements';
+import { customerArLedgerBalance, customerStatement, openItemStatement } from './statements';
 import { buildLinkedTree } from './linkedTransactions';
 import { applyToInvoice, createCreditMemo, listCreditApplications, unapplyCreditApplication } from './creditMemos';
 import { listRecipients } from './letters';
@@ -812,5 +812,27 @@ describe('22. Printed estimate', () => {
     estPdfCalls.length = 0;
     await buildEstimatePdf(ctx, est.id);
     expect((estPdfCalls[0]?.shipTo as Record<string, string> | null)?.line1).toBe('5 Site Ln');
+  });
+});
+
+describe('23. Statement after a bounced check that had taken a discount', () => {
+  it('still shows the discount credit, so the statement ties to the customer’s A/R', async () => {
+    const cust = await newCustomer('Discount bounce');
+    const inv = await plainInvoice(cust, '100.00', '2026-03-01');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      reference: '77',
+      amount: '98.00',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '98.00', discountAmount: '2.00' }],
+    });
+    await recordBouncedCheck(ctx, { paymentId: payment.id, date: d('2026-03-12') });
+    const gl = await customerArLedgerBalance(ctx, cust);
+    expect(gl).toBe('100.00');
+    expect((await customerStatement(ctx, cust)).closingBalance).toBe(gl);
+    const ranged = await customerStatement(ctx, cust, { from: d('2026-03-10'), to: d('2026-03-31') });
+    expect(ranged.closingBalance).toBe(gl);
   });
 });
