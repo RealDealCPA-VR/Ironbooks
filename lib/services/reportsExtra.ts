@@ -2250,12 +2250,54 @@ export async function depositDetail(
         .leftJoin(customers, eq(paymentsReceived.customerId, customers.id))
         .where(inArray(depositLines.depositId, depIds))
     : [];
+  // Lines that are not a received payment carry the deposit service's own codes in their
+  // description ('salesReceipt:<id>', 'invoicePayment:<id>', 'cashback:<account id>') — they were
+  // printed as is. Show what they are instead: the sales receipt / invoice and its customer, or
+  // the account the cash back went to.
+  const { RECEIPT_LINE_PREFIX, INVOICE_PAYMENT_LINE_PREFIX, CASHBACK_LINE_PREFIX } = await import('./deposits');
+  const codeIds = (prefix: string) =>
+    [...new Set(lineRows.map((l) => l.description ?? '').filter((s) => s.startsWith(prefix)).map((s) => s.slice(prefix.length)))].filter((id) =>
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id),
+    );
+  const receiptIds = codeIds(RECEIPT_LINE_PREFIX);
+  const invoiceIds = codeIds(INVOICE_PAYMENT_LINE_PREFIX);
+  const cashBackIds = codeIds(CASHBACK_LINE_PREFIX);
+  const docOf = new Map<string, { label: string; customerName: string | null }>();
+  if (receiptIds.length) {
+    for (const r of await ctx.db
+      .select({ id: salesReceipts.id, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber, customerName: customers.displayName })
+      .from(salesReceipts)
+      .leftJoin(customers, eq(salesReceipts.customerId, customers.id))
+      .where(and(eq(salesReceipts.companyId, ctx.companyId), inArray(salesReceipts.id, receiptIds)))) {
+      docOf.set(`${RECEIPT_LINE_PREFIX}${r.id}`, { label: `Sales Receipt #${docRef(r.ref, r.num)}`, customerName: r.customerName });
+    }
+  }
+  if (invoiceIds.length) {
+    for (const r of await ctx.db
+      .select({ id: invoices.id, num: invoices.invoiceNumber, ref: invoices.refNumber, customerName: customers.displayName })
+      .from(invoices)
+      .innerJoin(customers, eq(invoices.customerId, customers.id))
+      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)))) {
+      docOf.set(`${INVOICE_PAYMENT_LINE_PREFIX}${r.id}`, { label: `Payment on Invoice #${docRef(r.ref, r.num)}`, customerName: r.customerName });
+    }
+  }
+  if (cashBackIds.length) {
+    for (const a of await ctx.db
+      .select({ id: accounts.id, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, cashBackIds)))) {
+      docOf.set(`${CASHBACK_LINE_PREFIX}${a.id}`, { label: `Cash back to ${a.name}`, customerName: null });
+    }
+  }
   const linesById = new Map<string, DepositDetailLine[]>();
   for (const l of lineRows) {
     if (!linesById.has(l.depositId)) linesById.set(l.depositId, []);
+    const code = l.description ?? '';
+    const doc = docOf.get(code);
+    const coded = [RECEIPT_LINE_PREFIX, INVOICE_PAYMENT_LINE_PREFIX, CASHBACK_LINE_PREFIX].some((p) => code.startsWith(p));
     linesById.get(l.depositId)!.push({
-      description: l.description,
-      customerName: l.customerName,
+      description: doc ? doc.label : coded ? null : l.description,
+      customerName: l.customerName ?? doc?.customerName ?? null,
       amount: toAmountString(l.amount),
     });
   }

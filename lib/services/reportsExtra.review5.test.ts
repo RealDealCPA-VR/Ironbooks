@@ -162,3 +162,34 @@ describe('legacy collections API: totals in home currency', () => {
     expect(r.totalDue).toBe('170.00');
   });
 });
+
+/**
+ * Deposit Detail printed the deposit service's internal line codes: a deposited sales receipt
+ * showed as "Other receipt — salesReceipt:3f2a…" (a database id), an invoice's payment-item line
+ * as "invoicePayment:…" and cash back as "cashback:<account id>". QuickBooks shows the customer
+ * and the transaction (Sales Receipt / Payment) and the cash back account.
+ */
+describe('Deposit Detail lines read as transactions, not ids', () => {
+  it('a sales receipt shows its customer and number; cash back its account', async () => {
+    const { createCustomer } = await import('./customers');
+    const { createItem } = await import('./items');
+    const { createSalesReceipt } = await import('./salesReceipts');
+    const { createDeposit } = await import('./deposits');
+    const { depositDetail } = await import('./reportsExtra');
+    const cust = await createCustomer(ctx, { displayName: 'Walk-in Wanda' } as never);
+    const item = await createItem(ctx, { name: 'Consult', type: 'service', salesPrice: 80, incomeAccountId: A['4000'] } as never);
+    const sr = await createSalesReceipt(ctx, { customerId: cust.id, date: d('2026-09-01'), lines: [{ itemId: item.id, quantity: 1, rate: 80 }] } as never);
+    await createDeposit(ctx, { depositAccountId: A['1000'], date: d('2026-09-02'), salesReceiptIds: [sr.id], cashBack: { accountId: A['6000'], amount: '10.00' } });
+    const r = await depositDetail(ctx, { from: d('2026-09-01'), to: d('2026-09-30') });
+    const dep = r.rows.find((x) => x.total === '70.00')!;
+    expect(dep).toBeTruthy();
+    const text = JSON.stringify(dep.lines);
+    expect(text).not.toMatch(/salesReceipt:|invoicePayment:|cashback:/);
+    expect(text).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-/);
+    const receipt = dep.lines.find((l) => l.amount === '80.00')!;
+    expect(receipt.customerName).toBe('Walk-in Wanda');
+    expect(receipt.description).toMatch(/^Sales Receipt #/);
+    const cashBack = dep.lines.find((l) => l.amount === '-10.00')!;
+    expect(cashBack.description).toMatch(/Cash back/i);
+  });
+});
