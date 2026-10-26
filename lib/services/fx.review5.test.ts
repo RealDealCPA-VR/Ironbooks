@@ -196,6 +196,27 @@ describe('review5 fx', () => {
     expect(await homeOf()).toBe('1200.00');
   });
 
+  it('editing a foreign transfer or deposit without retyping the rate keeps its booked rate (the forms send none)', async () => {
+    const { createTransfer, updateTransfer } = await import('./transfers');
+    const { createDeposit, updateDeposit } = await import('./deposits');
+    acct['1025'] = (await createAccount(ctx, { code: '1025', name: 'Euro Savings', type: 'asset' as never, subtype: 'savings' })).id;
+    await setAccountCurrency(ctx, acct['1025'], 'EUR');
+    const tIn = { date: d('2026-03-02'), fromAccountId: acct['1020'], toAccountId: acct['1025'], amount: '100.00', exchangeRate: '1.20' };
+    const t = await createTransfer(ctx, tIn);
+    const dIn = { depositAccountId: acct['1020'], date: d('2026-03-03'), extraLines: [{ accountId: acct['3000'], amount: '100.00' }] };
+    const dep = await createDeposit(ctx, { ...dIn, exchangeRate: '1.20' });
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.30' });
+    // Memo-only edits, as the Transfer Funds / Make Deposits forms send them (no rate field).
+    const t2 = await updateTransfer(ctx, t.id, { ...tIn, exchangeRate: undefined, memo: 'memo only' });
+    expect(t2.homeAmount).toBe('120.00');
+    expect(t2.postedEntryId).toBe(t.postedEntryId);
+    const dep2 = await updateDeposit(ctx, dep.id, { ...dIn, memo: 'memo only' });
+    expect(dep2.homeTotal).toBe('120.00');
+    expect(dep2.postedEntryId).toBe(dep.postedEntryId);
+    const [bank] = await db.select().from(accounts).where(eq(accounts.id, acct['1020']));
+    expect(Money.of(bank.balance).toFixed(2)).toBe('0.00'); // +120 deposit, -120 transfer
+  });
+
   it('Home Currency Adjustment as of a date revalues everything dated that day (whole as-of day)', async () => {
     const c = await createCustomer(ctx, { displayName: `EUR customer ${seq}` } as never);
     // Dated 3/31 at noon; the adjustment as of 3/31 (date picker: midnight) must include it, as

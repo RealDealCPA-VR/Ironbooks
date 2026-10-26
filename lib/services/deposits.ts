@@ -915,6 +915,16 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
     .where(and(eq(deposits.id, id), eq(deposits.companyId, ctx.companyId)));
   if (!existing) throw notFound('Deposit');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This deposit is void and cannot be edited.');
+  // review5 fx: Make Deposits re-sends no exchange rate on an edit. A foreign deposit kept in the
+  // same bank keeps its booked rate (today's list rate re-posted it at another home value).
+  if (
+    (input.exchangeRate === undefined || input.exchangeRate === null || String(input.exchangeRate).trim() === '') &&
+    existing.currency &&
+    existing.exchangeRate &&
+    input.depositAccountId === existing.depositAccountId
+  ) {
+    input = { ...input, exchangeRate: existing.exchangeRate };
+  }
 
   return inTransaction(ctx, async (tx) => {
     const prep = await prepareDeposit(tx, input, id);

@@ -127,13 +127,30 @@ function parseHomeAmount(v: string | number | null | undefined): Decimal | null 
   return Money.round2(r);
 }
 
-/** Resolve currencies and the home / to amounts of a transfer (see the header). */
-async function resolveTransferFx(ctx: ServiceContext, input: CreateTransferInput, amountStr: string): Promise<TransferFx> {
+/**
+ * Resolve currencies and the home / to amounts of a transfer (see the header). `saved` (edits):
+ * the transfer as booked — with no rate and no home amount typed, a foreign FROM side keeps its
+ * booked home rate instead of today's list rate (review5 fx: Transfer Funds re-sends no rate, so
+ * a memo edit re-posted the transfer at the new list rate).
+ */
+async function resolveTransferFx(
+  ctx: ServiceContext,
+  input: CreateTransferInput,
+  amountStr: string,
+  saved?: { currency: string | null; exchangeRate: string | null; amount: string; homeAmount: string | null },
+): Promise<TransferFx> {
   const home = await homeCode(ctx);
   const fromCurrency = await currencyOfAccount(ctx, input.fromAccountId, home);
   const toCurrency = await currencyOfAccount(ctx, input.toAccountId, home);
   const amount = Money.of(amountStr);
-  const homeOverride = parseHomeAmount(input.homeAmount);
+  const blank = (v: unknown) => v === undefined || v === null || String(v).trim() === '';
+  const keep =
+    !!saved && !!fromCurrency && foreignCode(saved.currency, home) === fromCurrency && saved.exchangeRate != null &&
+    blank(input.homeAmount) && (fromCurrency === toCurrency ? blank(input.exchangeRate) : true);
+  const savedHome =
+    keep && saved!.homeAmount != null && Money.eq(saved!.amount, amount) ? saved!.homeAmount : null;
+  const homeOverride = parseHomeAmount(input.homeAmount) ?? (savedHome != null && fromCurrency === toCurrency ? Money.round2(savedHome) : null);
+  const savedRate = keep ? saved!.exchangeRate : null;
   const homeLabel = home ?? 'home currency';
 
   if (!fromCurrency && !toCurrency) {
@@ -144,7 +161,7 @@ async function resolveTransferFx(ctx: ServiceContext, input: CreateTransferInput
   let homeAmt: Decimal;
   if (fromCurrency === toCurrency) {
     // Same foreign currency on both sides.
-    const fx = await currencyRate(ctx, fromCurrency, input.exchangeRate);
+    const fx = await currencyRate(ctx, fromCurrency, blank(input.exchangeRate) ? savedRate : input.exchangeRate);
     toAmount = amount;
     homeAmt = homeOverride ? Money.round2(homeOverride) : toHome(amount, fx.rate);
   } else {
@@ -160,7 +177,7 @@ async function resolveTransferFx(ctx: ServiceContext, input: CreateTransferInput
     if (homeOverride) homeAmt = Money.round2(homeOverride);
     else if (!fromCurrency) homeAmt = amount; // home -> foreign: the home side is the home value
     else if (!toCurrency) homeAmt = toAmount; // foreign -> home: what arrived is the home value
-    else homeAmt = toHome(amount, (await currencyRate(ctx, fromCurrency)).rate);
+    else homeAmt = savedHome != null ? Money.round2(savedHome) : toHome(amount, (await currencyRate(ctx, fromCurrency, savedRate)).rate);
   }
   if (!homeAmt.greaterThan(0)) throw validation('The transfer is too small to convert to your home currency.');
   const rate = fromCurrency ? homeAmt.dividedBy(amount) : Money.of(1);
@@ -255,13 +272,18 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
 export async function updateTransfer(ctx: ServiceContext, id: string, input: CreateTransferInput) {
   const amountStr = validateTransfer(input);
   await assertAccountsOwned(ctx, input);
-  const fx = await resolveTransferFx(ctx, input, amountStr);
   const [existing] = await ctx.db
     .select()
     .from(transfers)
     .where(and(eq(transfers.companyId, ctx.companyId), eq(transfers.id, id)));
   if (!existing) throw notFound('Transfer');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This transfer is void and cannot be edited.');
+  const fx = await resolveTransferFx(
+    ctx,
+    input,
+    amountStr,
+    existing.fromAccountId === input.fromAccountId && existing.toAccountId === input.toAccountId ? existing : undefined,
+  );
 
   return inTransaction(ctx, async (tx) => {
     const lines = transferLines(input, fx);
