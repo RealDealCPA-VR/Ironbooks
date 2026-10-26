@@ -48,6 +48,7 @@ export async function POST(req: NextRequest) {
         netIncome: result.netIncome,
         totalRevenue: result.totalRevenue,
         totalExpenses: result.totalExpenses,
+        retainedEarnings: result.retainedEarnings,
       },
       { status: 201 },
     );

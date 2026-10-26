@@ -105,6 +105,8 @@ export interface YearEndCloseResult {
   netIncome: string;
   totalRevenue: string;
   totalExpenses: string;
+  /** The account the net income was closed into (shown to the user: it is not always 3900). */
+  retainedEarnings: { code: string; name: string };
 }
 
 /**
@@ -322,5 +324,6 @@ async function yearEndCloseInTx(ctx: ServiceContext, fiscalYear: number): Promis
     netIncome: toAmountString(netIncome),
     totalRevenue: toAmountString(totalRevenue),
     totalExpenses: toAmountString(totalExpenses),
+    retainedEarnings: { code: reAccount.code, name: reAccount.name },
   };
 }

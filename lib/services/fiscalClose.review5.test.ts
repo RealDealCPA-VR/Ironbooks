@@ -5,8 +5,11 @@
  *     account had number 3900 — in a chart without a 3900 Retained Earnings that is the
  *     "Opening Balance Equity" account the app creates at 3900 for the first opening balance,
  *     so the year's profit landed in Opening Balance Equity.
+ *  B. The Year-End Close window names the account the profit went to (it always said
+ *     "Retained Earnings (3900)", also when that was another account).
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { NextRequest } from 'next/server';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
@@ -19,6 +22,8 @@ import { yearEndClose } from './fiscalClose';
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-fiscal-close');
 let db: DB;
 let ctx: ServiceContext;
+vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => ctx) }));
+import { POST as yearEndPOST } from '@/app/api/year-end-close/route';
 
 describe('year-end close (review round 5)', () => {
   beforeAll(async () => {
@@ -67,5 +72,29 @@ describe('year-end close (review round 5)', () => {
     expect((await getAccount(ctx, re.id)).balance).toBe('300.00');
     // Opening Balance Equity still holds only the opening balance.
     expect((await getAccount(ctx, obe.id)).balance).toBe('500.00');
+  });
+
+  it('B: the close reports which account took the net income', async () => {
+    const [bank] = (await db.query.accounts.findMany({ where: (a, { and, eq }) => and(eq(a.companyId, ctx.companyId), eq(a.code, '1000')) }));
+    const [sales] = (await db.query.accounts.findMany({ where: (a, { and, eq }) => and(eq(a.companyId, ctx.companyId), eq(a.code, '4000')) }));
+    await postJournalEntry(ctx, {
+      date: new Date('2025-03-01T00:00:00Z'),
+      description: 'Cash sale',
+      lines: [
+        { accountId: bank.id, debit: '40.00' },
+        { accountId: sales.id, credit: '40.00' },
+      ],
+    });
+    const res = await yearEndPOST(
+      new NextRequest('http://localhost/api/year-end-close', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ fiscalYear: 2025 }),
+      }),
+    );
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { netIncome: string; retainedEarnings?: { code: string; name: string } };
+    expect(body.netIncome).toBe('40.00');
+    expect(body.retainedEarnings).toEqual({ code: '3200', name: 'Retained Earnings' });
   });
 });
