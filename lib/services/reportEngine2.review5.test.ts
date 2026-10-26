@@ -1,0 +1,80 @@
+/**
+ * Review round 5 — transactions added from the bank feed or an imported statement.
+ *
+ * Categorizing a downloaded / imported bank line (Bank Feeds "Add", bank rules, the statement
+ * PDF / Excel import of v1.4) posts an entry whose source is the bank line. Every report showed
+ * those as Type "Other" with no Name — in QuickBooks a withdrawal added from the feed is a Check
+ * and a deposit a Deposit, with the payee as the Name — and the Transaction type filter could not
+ * find them as checks or deposits.
+ */
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { eq } from 'drizzle-orm';
+import { closeDb, getDb, type DB } from '@/lib/db';
+import { accounts, bankTransactions, users } from '@/lib/db/schema';
+import type { ServiceContext } from './_base';
+import { createCompany } from './company';
+import { createBankAccount } from './bankAccounts';
+import { categorize } from './bankCategorize';
+import { runStandardReport } from './reportRegistry';
+
+const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-bank-feed-reports');
+let db: DB;
+let ctx: ServiceContext;
+const A: Record<string, string> = {};
+const d = (s: string) => new Date(`${s}T00:00:00.000Z`);
+
+beforeAll(async () => {
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  db = await getDb(TEST_DIR);
+  const [user] = await db.insert(users).values({ email: 'r5-feed@test.local', name: 'R5 Feed', passwordHash: 'x' }).returning();
+  const company = await createCompany(db, { name: 'Feed Co', ownerId: user.id });
+  ctx = { db, companyId: company.id, userId: user.id };
+  for (const a of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) A[a.code] = a.id;
+  const ba = await createBankAccount(ctx, { accountId: A['1000'], bankName: 'Main', accountNumber: '000123' } as never);
+  const line = async (date: string, amount: string, payee: string | null, description: string) => {
+    const [t] = await db
+      .insert(bankTransactions)
+      .values({ companyId: company.id, bankAccountId: ba.id, date: d(date), amount, payee, description })
+      .returning();
+    return t.id;
+  };
+  await categorize(ctx, { bankTransactionId: await line('2026-05-03', '-45.00', null, 'SHELL OIL 1234'), accountId: A['6000'], payee: 'Shell' });
+  await categorize(ctx, { bankTransactionId: await line('2026-05-04', '100.00', 'Square', 'SQUARE DEP'), accountId: A['4000'] });
+});
+
+afterAll(async () => {
+  await closeDb(TEST_DIR);
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+});
+
+const bankLines = (r: { rows: { cells: Record<string, unknown>; entryId?: string | null }[] }) =>
+  r.rows.filter((x) => x.entryId && x.cells.account !== undefined);
+
+describe('bank-feed transactions on reports', () => {
+  it('a withdrawal is a Check and a deposit a Deposit, with the payee as the Name', async () => {
+    const r = await runStandardReport(ctx, 'transaction-detail-by-account', { accountId: A['1000'], from: '2026-05-01', to: '2026-05-31' });
+    const rows = r.rows.filter((x) => x.entryId).map((x) => [x.cells.type, x.cells.name, x.cells.amount]);
+    expect(rows).toEqual([
+      ['Check', 'Shell', '-45.00'],
+      ['Deposit', 'Square', '100.00'],
+    ]);
+  });
+
+  it('the Transaction type filter finds them as checks / deposits, not as Other', async () => {
+    const base = { from: '2026-05-01', to: '2026-05-31' };
+    const checks = await runStandardReport(ctx, 'transaction-detail-by-account', { ...base, txnType: 'check' });
+    expect(checks.rows.filter((x) => x.entryId).map((x) => x.cells.name)).toEqual(['Shell', 'Shell']);
+    const deposits = await runStandardReport(ctx, 'transaction-detail-by-account', { ...base, txnType: 'deposit' });
+    expect(deposits.rows.filter((x) => x.entryId).map((x) => x.cells.name)).toEqual(['Square', 'Square']);
+    const other = await runStandardReport(ctx, 'transaction-detail-by-account', { ...base, txnType: 'other' });
+    expect(other.rows.filter((x) => x.entryId)).toHaveLength(0);
+  });
+
+  it('Expenses by Vendor Detail groups the check under its payee', async () => {
+    const r = await runStandardReport(ctx, 'expenses-by-vendor-detail', { from: '2026-05-01', to: '2026-05-31', basis: 'accrual' });
+    expect(r.rows.filter((x) => x.kind === 'section').map((x) => x.cells.label)).toEqual(['Shell']);
+    void bankLines;
+  });
+});

@@ -20,6 +20,7 @@ import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-or
 import type Decimal from 'decimal.js';
 import {
   accounts,
+  bankTransactions,
   billLines,
   bills,
   classes,
@@ -824,19 +825,28 @@ export function txnTypeOf(sourceRef: string | null | undefined): TxnTypeKey {
 const transferEntryIds = (companyId: string) =>
   sql`SELECT ${transfers.postedEntryId} FROM ${transfers} WHERE ${transfers.companyId} = ${companyId} AND ${transfers.postedEntryId} IS NOT NULL`;
 
+/**
+ * Entries posted from a bank-feed / imported-statement line (sourceRef 'bank_transaction:<id>'):
+ * money out of the account ('out') shows as a Check, money in as a Deposit (resolveEntryNames).
+ */
+const bankFeedEntries = (companyId: string, dir: 'out' | 'in') =>
+  sql`(${journalEntries.sourceRef} LIKE 'bank_transaction:%' AND EXISTS (SELECT 1 FROM ${bankTransactions} WHERE ${bankTransactions.companyId} = ${companyId} AND ${bankTransactions.id}::text = split_part(${journalEntries.sourceRef}, ':', 2) AND ${bankTransactions.amount} ${dir === 'out' ? sql`< 0` : sql`> 0`}))`;
+
 function txnTypeCondition(t: TxnTypeKey, companyId: string): SQL {
   const prefixes = TXN_PREFIXES[t];
   const parts = prefixes.map((p) => sql`${journalEntries.sourceRef} LIKE ${p + ':%'}`);
   parts.push(...prefixes.map((p) => sql`${journalEntries.sourceRef} = ${p}`));
   if (t === 'transfer') parts.push(sql`${journalEntries.id} IN (${transferEntryIds(companyId)})`);
+  if (t === 'check') parts.push(bankFeedEntries(companyId, 'out'));
+  if (t === 'deposit') parts.push(bankFeedEntries(companyId, 'in'));
   if (t === 'journal') {
     parts.push(sql`${journalEntries.sourceRef} IS NULL`);
     return sql`((${sql.join(parts, sql` OR `)}) AND ${journalEntries.id} NOT IN (${transferEntryIds(companyId)}))`;
   }
   if (t === 'other') {
-    // Anything whose prefix is not a known type.
+    // Anything whose prefix is not a known type (bank-feed lines are Checks / Deposits).
     const known = [...PREFIX_TO_TYPE.keys()].filter((p) => !TXN_PREFIXES.other.includes(p));
-    return sql`(${journalEntries.sourceRef} IS NOT NULL AND split_part(${journalEntries.sourceRef}, ':', 1) NOT IN (${sql.join(known.map((k) => sql`${k}`), sql`, `)}))`;
+    return sql`(${journalEntries.sourceRef} IS NOT NULL AND split_part(${journalEntries.sourceRef}, ':', 1) NOT IN (${sql.join(known.map((k) => sql`${k}`), sql`, `)}) AND NOT ${bankFeedEntries(companyId, 'out')} AND NOT ${bankFeedEntries(companyId, 'in')})`;
   }
   return sql`(${sql.join(parts, sql` OR `)})`;
 }
@@ -848,6 +858,8 @@ export interface ResolvedName {
   nameId: string | null;
   name: string;
   num: string | null;
+  /** The QB transaction type when the source alone does not tell (a bank-feed line: Check / Deposit). */
+  txnType?: TxnTypeKey;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -999,6 +1011,18 @@ export async function resolveEntryNames(
       .where(and(eq(itemReceipts.companyId, c), inArray(itemReceipts.id, irIds)));
     for (const r of rows) docs.set(`ir:${r.id}`, { nameType: 'vendor', nameId: r.nameId, num: null });
   }
+  // Bank-feed / imported-statement lines added to the register (bankCategorize.ts): the payee is
+  // the Name, and money out is a Check, money in a Deposit (QB "Add" from Bank Feeds).
+  const feed = new Map<string, { payee: string | null; out: boolean }>();
+  const btIds = ids('bank_transaction');
+  for (let i = 0; i < btIds.length; i += 2000) {
+    for (const r of await ctx.db
+      .select({ id: bankTransactions.id, payee: bankTransactions.payee, amount: bankTransactions.amount })
+      .from(bankTransactions)
+      .where(and(eq(bankTransactions.companyId, c), inArray(bankTransactions.id, btIds.slice(i, i + 2000))))) {
+      feed.set(r.id, { payee: r.payee, out: Money.of(r.amount).isNegative() });
+    }
+  }
   const taIds = ids('tax_agency');
   const agencyNames = new Map<string, string>();
   if (taIds.length) {
@@ -1110,6 +1134,11 @@ export async function resolveEntryNames(
         case 'tax_agency':
           if (id) res = { nameType: 'other', nameId: id, name: agencyNames.get(id) ?? '', num: e.reference };
           break;
+        case 'bank_transaction': {
+          const f = id ? feed.get(id) : undefined;
+          if (f) res = { nameType: null, nameId: null, name: f.payee?.trim() ?? '', num: e.reference, txnType: f.out ? 'check' : 'deposit' };
+          break;
+        }
       }
       if (d) {
         res = {
@@ -1367,7 +1396,7 @@ export async function fetchGlLines(
             num: docName.num,
           }
         : docName;
-    const txnType: TxnTypeKey = !r.sourceRef && transferIds.has(r.entryId) ? 'transfer' : txnTypeOf(r.sourceRef);
+    const txnType: TxnTypeKey = !r.sourceRef && transferIds.has(r.entryId) ? 'transfer' : (docName.txnType ?? txnTypeOf(r.sourceRef));
     return {
       lineId: r.lineId,
       entryId: r.entryId,
