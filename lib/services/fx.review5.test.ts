@@ -262,6 +262,72 @@ describe('review5 fx', () => {
     expect(tb.balanced).toBe(true);
   });
 
+  it('a foreign invoice with a payment-item line is open only for what A/R carries (HCA, foreign columns)', async () => {
+    const { createItem } = await import('./items');
+    const { foreignOpenReceivables, foreignAmountsByEntry } = await import('./fxSubledger');
+    const pay = await createItem(ctx, { name: `Deposit received ${seq}`, type: 'payment' } as never);
+    const c = await createCustomer(ctx, { displayName: `EUR deposit customer ${seq}` } as never);
+    // EUR 1,000 invoice, EUR 400 received on the invoice itself: A/R carries EUR 600 (USD 720).
+    const inv = await createInvoice(ctx, {
+      customerId: c.id,
+      date: d('2026-03-01'),
+      currency: 'EUR',
+      exchangeRate: '1.20',
+      lines: [
+        { accountId: acct['4000'], quantity: 1, rate: '1000.00' },
+        { itemId: pay.id, quantity: 1, rate: '400.00' },
+      ],
+    } as never);
+    expect(inv.balanceDue).toBe('600.00');
+    const item = (await foreignOpenReceivables(ctx, d('2026-03-31'))).find((i) => i.id === inv.id);
+    expect(item?.foreignOpen.toFixed(2)).toBe('600.00');
+    expect(item?.homeOpen.toFixed(2)).toBe('720.00');
+    const p = await previewHomeCurrencyAdjustment(ctx, { date: d('2026-03-31'), rates: { EUR: '1.25' } });
+    expect(p.lines.find((l) => l.kind === 'customer')?.adjustment).toBe('30.00');
+    // Customer Balance Detail's foreign column: the invoice moved EUR 600 onto A/R.
+    expect((await foreignAmountsByEntry(ctx, [inv.postedEntryId!])).get(inv.postedEntryId!)?.amount.toFixed(2)).toBe('600.00');
+    // Paid in full on the invoice: nothing left to revalue.
+    const paid = await createInvoice(ctx, {
+      customerId: c.id,
+      date: d('2026-03-02'),
+      currency: 'EUR',
+      exchangeRate: '1.20',
+      lines: [
+        { accountId: acct['4000'], quantity: 1, rate: '500.00' },
+        { itemId: pay.id, quantity: 1, rate: '500.00' },
+      ],
+    } as never);
+    expect((await foreignOpenReceivables(ctx, d('2026-03-31'))).find((i) => i.id === paid.id)).toBeUndefined();
+  });
+
+  it('names and accounts in different currencies cannot be merged (the account-currency ledger would mix)', async () => {
+    const { mergeAccounts, mergeVendors } = await import('./merge');
+    await postJournalEntry(ctx, {
+      date: d('2026-01-02'),
+      description: 'Opening EUR',
+      currency: 'EUR',
+      exchangeRate: '1.20',
+      lines: [
+        { accountId: acct['1020'], debit: '1200.00', foreignAmount: '1000.00' },
+        { accountId: acct['3000'], credit: '1200.00' },
+      ],
+    });
+    acct['1030'] = (await createAccount(ctx, { code: '1030', name: 'Pound Bank', type: 'asset' as never, subtype: 'checking' })).id;
+    await upsertCurrency(ctx, { code: 'GBP', name: 'Pound', rateToBase: '1.50' });
+    await setAccountCurrency(ctx, acct['1030'], 'GBP');
+    await expect(mergeAccounts(ctx, { fromId: acct['1020'], toId: acct['1030'] })).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(mergeAccounts(ctx, { fromId: acct['1020'], toId: acct['1000'] })).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(mergeAccounts(ctx, { fromId: acct['1000'], toId: acct['1020'] })).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect(await foreignBalance(acct['1020'])).toBe('1000.00');
+    const eur = await eurVendor('EUR maker');
+    await createBill(ctx, { vendorId: eur.id, date: d('2026-02-01'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['6000'], amount: '100.00' }] } as never);
+    const usd = await createVendor(ctx, { displayName: `USD maker ${seq}` } as never);
+    await expect(mergeVendors(ctx, { fromId: eur.id, toId: usd.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // Same currency still merges.
+    const eur2 = await eurVendor('EUR maker two');
+    await expect(mergeVendors(ctx, { fromId: eur2.id, toId: eur.id })).resolves.toBeTruthy();
+  });
+
   it('home-currency documents refuse a foreign-currency bank (sales receipt, credit memo refund, payment refund)', async () => {
     const { createSalesReceipt } = await import('./salesReceipts');
     const { createCreditMemo, refundCreditMemo } = await import('./creditMemos');

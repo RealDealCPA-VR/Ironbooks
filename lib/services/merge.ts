@@ -67,6 +67,7 @@ import { repointForeignKeys } from './lists/references';
 import { moveNotesAndTodos } from './lists/notes';
 import { repointBankRuleAccount } from './bankRules';
 import { assertListDeleteAllowed } from './accountantCopy/guard';
+import { foreignCode, homeCode } from './fxLines';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -77,6 +78,23 @@ export interface MergeCustomersInput {
   fromId: string;
   /** The master record to keep. */
   toId: string;
+}
+
+/** review5 fx: refuse merging two names / accounts that use different currencies. */
+async function assertSameCurrency(
+  ctx: ServiceContext,
+  a: string | null | undefined,
+  b: string | null | undefined,
+  what: string,
+): Promise<void> {
+  const home = await homeCode(ctx);
+  const ca = foreignCode(a ?? null, home);
+  const cb = foreignCode(b ?? null, home);
+  if (ca !== cb) {
+    throw validation(
+      `${what} use different currencies (${ca ?? home ?? 'home currency'} and ${cb ?? home ?? 'home currency'}), so they can't be merged. Only names and accounts in the same currency can be merged.`,
+    );
+  }
 }
 
 export interface MergeVendorsInput {
@@ -351,16 +369,19 @@ export async function mergeVendors(
   }
 
   const [fromRow] = await ctx.db
-    .select({ id: vendors.id, displayName: vendors.displayName, isActive: vendors.isActive })
+    .select({ id: vendors.id, displayName: vendors.displayName, isActive: vendors.isActive, currency: vendors.currency })
     .from(vendors)
     .where(and(eq(vendors.id, fromId), eq(vendors.companyId, ctx.companyId)));
   if (!fromRow) throw notFound(`Vendor ${fromId}`);
 
   const [toRow] = await ctx.db
-    .select({ id: vendors.id, displayName: vendors.displayName })
+    .select({ id: vendors.id, displayName: vendors.displayName, currency: vendors.currency })
     .from(vendors)
     .where(and(eq(vendors.id, toId), eq(vendors.companyId, ctx.companyId)));
   if (!toRow) throw notFound(`Vendor ${toId}`);
+  // review5 fx: a vendor's transactions are in the vendor's currency (QB merges names in the same
+  // currency only); merged, a home vendor would own foreign bills and credits it can't settle.
+  await assertSameCurrency(ctx, fromRow.currency, toRow.currency, `"${fromRow.displayName}" and "${toRow.displayName}"`);
 
   return inTransaction(ctx, async (tx) => {
     const billRows = await tx.db
@@ -545,6 +566,10 @@ export async function mergeAccounts(
   if (fromRow.subtype === 'non_posting' || toRow.subtype === 'non_posting') {
     throw validation('Non-posting accounts (estimates, purchase orders) cannot be merged.');
   }
+  // review5 fx: a foreign-currency account's lines carry amounts in ITS currency (register,
+  // reconciliation, Home Currency Adjustment read them); QB only merges accounts in the same
+  // currency.
+  await assertSameCurrency(ctx, fromRow.currency, toRow.currency, `"${fromRow.name}" and "${toRow.name}"`);
 
   return inTransaction(ctx, async (tx) => {
     const reassigned: Record<string, number> = {};
