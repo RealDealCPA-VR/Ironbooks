@@ -464,6 +464,12 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     await voidBill(ctx, bill.id);
     const [after] = await db.select().from(items).where(eq(items.id, free.item.id));
     expect(Number(after.quantityOnHand)).toBe(1);
+    // The Enter Bills / Receive Items forms accept a 0 cost too (else such a bill could not even get a memo edit).
+    const billsPage = fs.readFileSync(path.resolve(process.cwd(), 'app', 'bills', 'page.tsx'), 'utf8');
+    expect(billsPage.includes('Number(line.unitCost) >= 0')).toBe(true);
+    expect(billsPage.includes('Number(line.unitCost) > 0 ?')).toBe(false);
+    const receiptsPage = fs.readFileSync(path.resolve(process.cwd(), 'app', 'item-receipts', 'page.tsx'), 'utf8');
+    expect(receiptsPage).not.toMatch(/line amount must be greater than zero/);
     // A bill of nothing but $0 lines is still refused.
     const err = await createBill(ctx, { vendorId: v.id, date: d('2026-10-05'), lines: [{ itemId: free.item.id, quantity: 1, unitCost: '0' }] }).catch((e) => e);
     expect(err).toBeInstanceOf(ServiceError);

@@ -619,11 +619,13 @@ export default function BillsPage() {
       if (line.mode === 'item') {
         entries[`line-${i}-item`] = requiredMessage(line.itemId, `Line ${n}: choose an item.`);
         entries[`line-${i}-qty`] = Number(line.quantity) > 0 ? null : `Line ${n}: the quantity must be more than zero.`;
-        entries[`line-${i}-cost`] = Number(line.unitCost) > 0 ? null : `Line ${n}: enter what each one cost.`;
+        // 0 is a cost too (items received at no charge, e.g. a no-charge line of a purchase order).
+        entries[`line-${i}-cost`] =
+          String(line.unitCost ?? '').trim() !== '' && Number(line.unitCost) >= 0 ? null : `Line ${n}: enter what each one cost (0 for no charge).`;
         return;
       }
       entries[`line-${i}-account`] = requiredMessage(line.accountId, `Line ${n}: choose an account.`);
-      entries[`line-${i}-amount`] = amountMessage(line.amount, { label: `Line ${n} amount`, required: true });
+      entries[`line-${i}-amount`] = amountMessage(line.amount, { label: `Line ${n} amount`, required: true, allowZero: true });
     });
     const errors = collectErrors(entries);
     return { errors, blocking: Object.keys(errors).some((k) => !/^line-\d+-account$/.test(k)) };
