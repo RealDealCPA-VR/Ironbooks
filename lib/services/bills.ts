@@ -400,8 +400,11 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
         line.amount != null
           ? Money.round2(line.amount)
           : Money.round2(qty.times(Money.of(line.unitCost!)));
-      if (!amount.greaterThan(0)) {
-        throw validation(`Line ${i + 1}: amount must be greater than zero.`);
+      // A $0 item line is allowed (QB: items received at no charge — a no-charge line of a
+      // purchase order): the units are stocked at $0 and the line posts nothing. The bill's total
+      // must still be more than zero (below).
+      if (amount.isNegative()) {
+        throw validation(`Line ${i + 1}: amount cannot be negative.`);
       }
       const unitCost = purchaseUnitCost(qty, line.unitCost, amount);
       if (unitCost.isNegative() || (line.unitCost != null && Money.of(line.unitCost).isNegative())) {
@@ -446,8 +449,10 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
       if (!line.accountId) {
         throw validation(`Line ${i + 1}: select an account or an item.`);
       }
-      const amt = Money.of(line.amount ?? 0);
-      if (!amt.greaterThan(0)) {
+      const amt = Money.round2(line.amount ?? 0);
+      // An explicit $0 account line (a no-charge line of a purchase order) is kept as a memo line
+      // and posts nothing; a line with no amount at all is a mistake.
+      if (amt.isNegative() || (amt.isZero() && (line.amount == null || String(line.amount).trim() === ''))) {
         throw validation(`Line ${i + 1}: amount must be greater than zero.`);
       }
       resolvedLines.push({
@@ -467,6 +472,10 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
     }
   }
 
+  if (!total.greaterThan(0)) {
+    throw validation('The bill total must be more than zero.');
+  }
+
   // Home-currency amounts: one anchor (round2(total x rate)) penny-allocated across the lines,
   // so the entry balances exactly. Inventory cost is carried in home currency.
   const home = homeAmounts(
@@ -475,7 +484,7 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
   );
   if (fx.currency) {
     resolvedLines.forEach((l, i) => {
-      if (!home.lines[i].greaterThan(0)) {
+      if (Money.of(l.amount).greaterThan(0) && !home.lines[i].greaterThan(0)) {
         throw validation(`Line ${i + 1}: the amount is too small to convert to your home currency.`);
       }
       l.homeAmount = toAmountString(home.lines[i]);
@@ -801,13 +810,15 @@ function billInventoryLines(input: CreateBillInput, prep: PreparedBill): Documen
 /** Build the GL posting lines for a prepared bill: Dr per line, Cr A/P total. */
 function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId: string) {
   return [
-    // Debit lines (one per bill line)
-    ...prep.resolvedLines.map((line) => ({
-      accountId: line.accountId,
-      debit: line.homeAmount,
-      memo: line.description,
-      classId: line.classId,
-    })),
+    // Debit lines (one per bill line; a $0 no-charge line posts nothing)
+    ...prep.resolvedLines
+      .filter((line) => Money.of(line.homeAmount).greaterThan(0))
+      .map((line) => ({
+        accountId: line.accountId,
+        debit: line.homeAmount,
+        memo: line.description,
+        classId: line.classId,
+      })),
     // Credit line — Accounts Payable (home currency)
     {
       accountId: prep.apAccountId,

@@ -436,6 +436,40 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect(apply).toMatch(/date: applyDate/);
   });
 
+  it('K: a purchase order with a no-charge ($0) line can be received and billed', async () => {
+    const { convertToBill } = await import('./purchaseOrders');
+    const v = await newVendor();
+    const paid = await fifoItem('Toner');
+    const free = await fifoItem('Sample Toner');
+    const po = await createPurchaseOrder(ctx, {
+      vendorId: v.id,
+      date: d('2026-10-01'),
+      lines: [
+        { itemId: paid.item.id, quantity: 10, rate: '5.00' },
+        { itemId: free.item.id, quantity: 2, rate: '0' },
+        { accountId: acct['6300'], quantity: 1, rate: '0', description: 'Freight waived' },
+      ],
+    });
+    // Before: "Line 2: amount must be greater than zero." — the PO could never be billed.
+    const bill = await convertToBill(ctx, po.id, { date: d('2026-10-05') });
+    expect(bill.total).toBe('50.00');
+    const [freeRow] = await db.select().from(items).where(eq(items.id, free.item.id));
+    expect(Number(freeRow.quantityOnHand)).toBe(3); // 1 opening + 2 free
+    expect(await glBalance(free.invAcct)).toBe('1.00'); // no value added
+    expect(await layerValue(free.item.id)).toBe('1.00');
+    expect(await glBalance(paid.invAcct)).toBe('51.00');
+    const got = await getPurchaseOrder(ctx, po.id);
+    expect(got.status).toBe('closed');
+    // Void takes the free units back out too.
+    await voidBill(ctx, bill.id);
+    const [after] = await db.select().from(items).where(eq(items.id, free.item.id));
+    expect(Number(after.quantityOnHand)).toBe(1);
+    // A bill of nothing but $0 lines is still refused.
+    const err = await createBill(ctx, { vendorId: v.id, date: d('2026-10-05'), lines: [{ itemId: free.item.id, quantity: 1, unitCost: '0' }] }).catch((e) => e);
+    expect(err).toBeInstanceOf(ServiceError);
+    expect((err as ServiceError).code).toBe('VALIDATION');
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
