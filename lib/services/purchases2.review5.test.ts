@@ -545,6 +545,26 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     await updateCompany(ctx, { settings: { defaultPaycheckAccountId: null } } as never);
   });
 
+  it('N: YTD payroll summaries (mid-year setup) are not offered as paychecks to print', async () => {
+    const { createEmployee } = await import('./payroll');
+    const { createYtdAdjustment } = await import('./payrollAdjustments');
+    const { listUnprintedPaychecks, queuePaychecks } = await import('./printQueue');
+    const emp = await createEmployee(ctx, { firstName: 'Ytd', lastName: `Setup ${++seq}`, payType: 'salary', payRate: '60000.00' } as never);
+    const ytd = await createYtdAdjustment(ctx, {
+      employeeId: emp.id,
+      date: d('2026-06-30'),
+      lines: [
+        { kind: 'earning', name: 'Salary', amount: '30000.00' },
+        { kind: 'tax', name: 'Federal Withholding', amount: '4000.00' },
+      ],
+    });
+    const list = await listUnprintedPaychecks(ctx);
+    // Before: the $26,000 "net pay" of a year-to-date summary was listed under Add paychecks.
+    expect(list.some((p) => p.id === (ytd as { id: string }).id)).toBe(false);
+    const err = await queuePaychecks(ctx, [(ytd as { id: string }).id]).catch((e) => e);
+    expect(err).toBeInstanceOf(ServiceError);
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();

@@ -266,7 +266,7 @@ export async function listPrintQueue(
     .select({ p: paychecks, first: employees.firstName, last: employees.lastName })
     .from(paychecks)
     .innerJoin(employees, eq(paychecks.employeeId, employees.id))
-    .where(and(eq(paychecks.companyId, ctx.companyId), eq(paychecks.toPrint, true), isNull(paychecks.voidedAt)));
+    .where(and(eq(paychecks.companyId, ctx.companyId), eq(paychecks.toPrint, true), isNull(paychecks.voidedAt), eq(paychecks.entryType, 'paycheck')));
   const bankOf = await paycheckBankAccounts(
     ctx,
     pcRows.map((r) => r.p.postedEntryId).filter((x): x is string => Boolean(x)),
@@ -290,6 +290,15 @@ export async function listPrintQueue(
   return out.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 }
 
+/**
+ * Real paychecks with money to pay by check: not the YTD summaries entered at mid-year setup or
+ * the liability adjustments (paychecks rows with another entryType — a "net pay" of $26,000 for a
+ * year-to-date summary was offered as a check to print), and not a $0 net paycheck.
+ */
+function printablePaycheck() {
+  return and(eq(paychecks.entryType, 'paycheck'), sql`${paychecks.netPay} > 0`);
+}
+
 /** Paychecks that were never printed and are not queued (candidates for "Add paychecks"). */
 export async function listUnprintedPaychecks(ctx: ServiceContext) {
   const rows = await ctx.db
@@ -302,6 +311,7 @@ export async function listUnprintedPaychecks(ctx: ServiceContext) {
         isNull(paychecks.voidedAt),
         isNull(paychecks.checkNumber),
         eq(paychecks.toPrint, false),
+        printablePaycheck(),
       ),
     )
     .orderBy(asc(paychecks.payDate));
@@ -324,6 +334,10 @@ export async function queuePaychecks(ctx: ServiceContext, ids: string[]) {
     if (rows.length !== ids.length) throw notFound('One or more paychecks');
     for (const p of rows) {
       if (p.voidedAt) throw new ServiceError('CONFLICT', 'A voided paycheck cannot be printed.');
+      if (p.entryType !== 'paycheck') {
+        throw validation('A year-to-date summary or a liability adjustment is not a paycheck, so there is no check to print for it.');
+      }
+      if (!Money.of(p.netPay).greaterThan(0)) throw validation('This paycheck has no net pay to print a check for.');
       if (p.toPrint) continue;
       // Flagging a closed-period paycheck to print is a change to it: closing date password.
       await assertClosedPeriodEdit(tx, { entryId: p.postedEntryId, what: 'to-be-printed flag', date: p.payDate });
@@ -360,6 +374,7 @@ async function markPaycheckPrintedInTx(
   if (!pc) throw notFound('Paycheck');
   if (pc.voidedAt) throw new ServiceError('CONFLICT', 'This paycheck is void and cannot be printed.');
   if (!pc.toPrint) throw new ServiceError('CONFLICT', 'This paycheck is not in the print queue.');
+  if (pc.entryType !== 'paycheck') throw validation('A year-to-date summary or a liability adjustment is not a paycheck, so it cannot be printed.');
   // Numbered in the sequence of the bank account the paycheck was written on.
   const bank =
     (pc.postedEntryId ? (await paycheckBankAccounts(ctx, [pc.postedEntryId])).get(pc.postedEntryId) : undefined) ??
