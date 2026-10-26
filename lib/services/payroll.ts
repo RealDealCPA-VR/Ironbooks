@@ -681,26 +681,34 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
   const year = pc.payDate.getUTCFullYear();
   const yearStart = new Date(Date.UTC(year, 0, 1));
 
-  const ytdChecks = await ctx.db
-    .select({
-      id: paychecks.id,
-      grossPay: paychecks.grossPay,
-      totalTaxes: paychecks.totalTaxes,
-      totalDeductions: paychecks.totalDeductions,
-      netPay: paychecks.netPay,
-    })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(
-      and(
-        eq(paychecks.companyId, ctx.companyId),
-        eq(paychecks.employeeId, pc.employeeId),
-        // Live checks + historical YTD amounts entered at mid-year setup.
-        paycheckCountsCondition(),
-        gte(paychecks.payDate, yearStart),
-        lte(paychecks.payDate, pc.payDate),
-      ),
-    );
+  const ytdChecks = (
+    await ctx.db
+      .select({
+        id: paychecks.id,
+        grossPay: paychecks.grossPay,
+        totalTaxes: paychecks.totalTaxes,
+        totalDeductions: paychecks.totalDeductions,
+        netPay: paychecks.netPay,
+        payDate: paychecks.payDate,
+        createdAt: paychecks.createdAt,
+      })
+      .from(paychecks)
+      .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+      .where(
+        and(
+          eq(paychecks.companyId, ctx.companyId),
+          eq(paychecks.employeeId, pc.employeeId),
+          // Live checks + historical YTD amounts entered at mid-year setup.
+          paycheckCountsCondition(),
+          gte(paychecks.payDate, yearStart),
+          lte(paychecks.payDate, pc.payDate),
+        ),
+      )
+  ).filter(
+    // "Through this check": a check of the same day entered AFTER it (a bonus check) is not on
+    // this stub — the same order listPaychecks' YTD column uses.
+    (c) => c.payDate.getTime() < pc.payDate.getTime() || c.id === pc.id || c.createdAt.getTime() <= pc.createdAt.getTime(),
+  );
 
   const ytdIds = ytdChecks.map((c) => c.id);
   const ytdLines = ytdIds.length
@@ -722,7 +730,13 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
   // Sick/vacation balances (hours) — informational only; never block stub rendering.
   let accruals: PayStubData['accruals'] = null;
   try {
-    const [balanceRow] = await sickVacationBalances(ctx, { employeeId: pc.employeeId });
+    // As of THIS check (its pay date), not today: a March stub reprinted in October must show
+    // March's balance.
+    const [balanceRow] = await sickVacationBalances(ctx, {
+      employeeId: pc.employeeId,
+      through: pc.payDate,
+      throughPaycheck: { id: pc.id, createdAt: pc.createdAt },
+    });
     if (balanceRow?.hasPolicy) {
       accruals = {
         sickBalance: balanceRow.sick.balance,

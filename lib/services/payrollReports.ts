@@ -1714,7 +1714,12 @@ const fmtHours = (d: Dec) => d.toFixed(2);
  */
 export async function sickVacationBalances(
   ctx: ServiceContext,
-  opts?: { employeeId?: string },
+  /**
+   * `through`: only paychecks dated on or before this day accrue (a pay stub shows the balance as
+   * of its own pay date); `throughPaycheck` (with `through`) additionally leaves out checks of the
+   * same day created after that paycheck. Default: every paycheck (the balance today).
+   */
+  opts?: { employeeId?: string; through?: Date; throughPaycheck?: { id: string; createdAt: Date } },
 ): Promise<SickVacationBalanceRow[]> {
   const empConditions = [eq(employees.companyId, ctx.companyId)];
   if (opts?.employeeId) empConditions.push(eq(employees.id, opts.employeeId));
@@ -1734,11 +1739,20 @@ export async function sickVacationBalances(
   ];
   if (opts?.employeeId) checkConditions.push(eq(paychecks.employeeId, opts.employeeId));
 
-  const checks = await ctx.db
-    .select({ id: paychecks.id, employeeId: paychecks.employeeId, payDate: paychecks.payDate })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(and(...checkConditions));
+  if (opts?.through) checkConditions.push(lte(paychecks.payDate, opts.through));
+
+  const checks = (
+    await ctx.db
+      .select({ id: paychecks.id, employeeId: paychecks.employeeId, payDate: paychecks.payDate, createdAt: paychecks.createdAt })
+      .from(paychecks)
+      .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+      .where(and(...checkConditions))
+  ).filter((c) => {
+    // Same-day checks entered after the stub's own check are not on that stub.
+    const ref = opts?.throughPaycheck;
+    if (!ref || !opts?.through) return true;
+    return c.payDate.getTime() < opts.through.getTime() || c.id === ref.id || c.createdAt.getTime() <= ref.createdAt.getTime();
+  });
 
   // Hours per paycheck from earning line names (hourly accrual basis).
   const ids = checks.map((c) => c.id);

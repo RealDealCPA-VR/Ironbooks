@@ -48,6 +48,7 @@ import {
   createPayRun,
   editPaycheck,
   getPaycheck,
+  payStubData,
   runPaycheck,
   unpaidTimeForPayroll,
   updateEmployee,
@@ -58,7 +59,7 @@ import { approveAndReimburse, createReport, submitReport } from './expenseReport
 import { createWorkersCompCode, createYtdAdjustment, updateWorkersCompCode, upsertStateTaxSetting } from './payrollAdjustments';
 import { createPayrollItem, updatePayrollItem } from './payrollItems';
 import { deleteMileage, logMiles } from './mileage';
-import { w2Data, w3Data } from './payrollReports';
+import { setEmployeeAccrualPolicy, w2Data, w3Data } from './payrollReports';
 
 process.env.TZ = 'America/New_York';
 
@@ -263,6 +264,25 @@ describe('review5 payroll / time / mileage / expense reports', { timeout: 300_00
     // ...and so does the YTD entry.
     expect(ytdLines.find((l) => l.debit && Number(l.debit) === 3000)?.accountId).toBe(wages.id);
     expect(ytdLines.find((l) => l.credit && Number(l.credit) === 2700)?.accountId).toBe(savings.id);
+  });
+
+  it("a pay stub shows the sick / vacation balance as of its own pay date, not today's", async () => {
+    const ctx = await newCompany('R5 Stub Accruals As Of');
+    const e = await createEmployee(ctx, { firstName: 'Ac', lastName: 'Crue', payType: 'hourly', payRate: '20' });
+    await setEmployeeAccrualPolicy(ctx, e.id, { sickRateHrsPerHour: 0.05, vacRateHrsPerHour: 0.1, sickBalance: 0, vacBalance: 0 });
+    const march = await runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-03-06'), earnings: [{ kind: 'regular', hours: 80, rate: 20 }] });
+    await runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-03-20'), earnings: [{ kind: 'regular', hours: 80, rate: 20 }] });
+    const stub = await payStubData(ctx, march.id);
+    // 80 hours worked through Mar 6: sick 4.00, vacation 8.00 (the later check is not on this stub).
+    expect(stub.accruals).toEqual({ sickBalance: '4.00', vacationBalance: '8.00' });
+
+    // A second check the SAME day (a bonus check entered after it) is not in the first stub's
+    // YTD either — the same order the paycheck list's YTD column uses.
+    const bonus = await runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-03-06'), earnings: [{ kind: 'bonus', amount: '500.00' }] });
+    const first = await payStubData(ctx, march.id);
+    expect(first.ytd.gross).toBe('1600.00');
+    const second = await payStubData(ctx, bonus.id);
+    expect(second.ytd.gross).toBe('2100.00');
   });
 
   it('paychecks are paid from a home-currency bank account, never a foreign-currency one', async () => {
