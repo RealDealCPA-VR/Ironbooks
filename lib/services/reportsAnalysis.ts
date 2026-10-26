@@ -51,9 +51,11 @@ export async function findTransactions(ctx: ServiceContext, p: ReportParams): Pr
   const meta = await loadAccountMeta(ctx);
   const range: { from?: Date; to?: Date } = { from: parseDay(p.from), to: parseDay(p.to, true) };
   const f = glFilterFromParams(meta, { ...p, amountMin: undefined, amountMax: undefined }, range);
-  const { lines: hits, truncated } = await fetchGlLines(ctx, meta, { ...f, limit: 20000 });
+  // Newest first: a capped read keeps the most recent lines (it kept the OLDEST, so on a large
+  // file Find never reached this year's transactions while saying it showed the most recent).
+  const { lines: hits, truncated: scanCut } = await fetchGlLines(ctx, meta, { ...f, limit: 20000, newestFirst: true });
   const entryIds = [...new Set(hits.map((l) => l.entryId))];
-  const { lines } = await fetchGlLines(ctx, meta, { entryIds, limit: 50000 });
+  const { lines, truncated: entriesCut } = await fetchGlLines(ctx, meta, { entryIds, limit: 50000 });
   const byEntry = new Map<string, GlLine[]>();
   for (const l of lines) byEntry.set(l.entryId, [...(byEntry.get(l.entryId) ?? []), l]);
   const min = p.amountMin ? Money.of(p.amountMin) : null;
@@ -61,10 +63,13 @@ export async function findTransactions(ctx: ServiceContext, p: ReportParams): Pr
   const rows: StdRow[] = [];
   const entries = [...byEntry.values()].sort((a, b) => b[0].date.getTime() - a[0].date.getTime() || b[0].entryNumber - a[0].entryNumber);
   let total = Money.zero();
+  let matches = 0;
   for (const e of entries) {
     const amount = e.reduce((s, l) => s.plus(l.debit), Money.zero());
     if (min && amount.lessThan(min)) continue;
     if (max && amount.greaterThan(max)) continue;
+    matches++;
+    if (rows.length >= MAX_FIND_ROWS) continue;
     const main = e.find((l) => ['ar', 'ap', 'bank', 'credit_card'].includes(l.account.section)) ?? e[0];
     const memo = e.find((l) => p.memo && l.memo.toLowerCase().includes(p.memo.toLowerCase()))?.memo ?? main.memo;
     total = total.plus(amount);
@@ -83,9 +88,12 @@ export async function findTransactions(ctx: ServiceContext, p: ReportParams): Pr
       },
       entryId: main.entryId,
     });
-    if (rows.length >= 2000) break;
   }
-  rows.push({ id: 'find:total', depth: 0, kind: 'grand', cells: { label: `${rows.length} transaction${rows.length === 1 ? '' : 's'}`, amount: toAmountString(total) } });
+  const shown = rows.length;
+  rows.push({ id: 'find:total', depth: 0, kind: 'grand', cells: { label: `${shown} transaction${shown === 1 ? '' : 's'}`, amount: toAmountString(total) } });
+  const notes: string[] = [];
+  if (matches > MAX_FIND_ROWS) notes.push(`Showing the ${MAX_FIND_ROWS.toLocaleString('en-US')} most recent of ${matches.toLocaleString('en-US')} matches — add filters to narrow the search.`);
+  if (scanCut || entriesCut) notes.push('Only the most recent transactions were searched — add dates or filters to search everything.');
   return {
     key: 'find',
     title: 'Find Transactions',
@@ -100,10 +108,13 @@ export async function findTransactions(ctx: ServiceContext, p: ReportParams): Pr
       { key: 'amount', header: 'Amount', type: 'money' },
     ],
     rows,
-    truncated: truncated || rows.length > 2000,
-    notes: rows.length > 2000 ? ['Showing the 2,000 most recent matches — add filters to narrow the search.'] : [],
+    truncated: scanCut || entriesCut || matches > MAX_FIND_ROWS,
+    notes,
   };
 }
+
+/** Most transactions Find lists (the most recent ones). */
+const MAX_FIND_ROWS = 2000;
 
 // ===========================================================================
 // Pivot (Advanced Reporting-lite)
@@ -177,13 +188,17 @@ export async function pivotReport(ctx: ServiceContext, input: PivotInput): Promi
   }
   const { from, to } = await resolveRange(ctx, { from: input.from, to: input.to });
   const facts: Fact[] = [];
+  let truncated = false;
   if (input.source === 'gl') {
     const meta = await loadAccountMeta(ctx);
     const sections = input.section
       ? (input.section.split(',').filter((s) => s in SECTION_LABELS) as SectionKey[])
       : undefined;
     const plOnly = sections?.length && sections.every(isPLSection);
-    const { lines } = await fetchGlLines(ctx, meta, { from, to, sections, excludeClose: !!plOnly, limit: 50000 });
+    const got = await fetchGlLines(ctx, meta, { from, to, sections, excludeClose: !!plOnly, limit: 50000 });
+    // A read cut at its cap leaves lines out: the totals must say so (they were silently short).
+    truncated = got.truncated;
+    const lines = got.lines;
     for (const l of lines) {
       facts.push({
         dims: {
@@ -241,6 +256,7 @@ export async function pivotReport(ctx: ServiceContext, input: PivotInput): Promi
     [...m.entries()].sort((a, b) => a[1].sort.localeCompare(b[1].sort, undefined, { numeric: true }));
   let colList = sortVals(colVals);
   const notes: string[] = [];
+  if (truncated) notes.push('There are too many ledger lines in this period to include them all, so these totals are incomplete. Narrow the dates.');
   if (colList.length > 40) {
     notes.push(`Only the first 40 ${PIVOT_DIMENSION_LABELS[input.cols!].toLowerCase()} columns are shown (the TOTAL column includes all).`);
     colList = colList.slice(0, 40);
@@ -298,6 +314,7 @@ export async function pivotReport(ctx: ServiceContext, input: PivotInput): Promi
     columns,
     rows,
     notes,
+    truncated,
   };
 }
 

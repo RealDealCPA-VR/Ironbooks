@@ -16,7 +16,7 @@
  * Everything reads POSTED journal lines (the source of truth) — never cached balances — and
  * every amount is Decimal (lib/money.ts).
  */
-import { and, asc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import {
   accounts,
@@ -1167,6 +1167,11 @@ export interface GlLineFilter extends ActivityFilter {
   number?: string;
   entryIds?: string[];
   limit?: number;
+  /**
+   * When the read is capped, keep the NEWEST lines (Find): by default a capped read keeps the
+   * oldest, which suits running balances but left a search without this year's transactions.
+   */
+  newestFirst?: boolean;
 }
 
 /** Translate report params into a detail-line filter (account includes its sub-accounts). */
@@ -1318,7 +1323,11 @@ export async function fetchGlLines(
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
     .leftJoin(classes, eq(journalEntryLines.classId, classes.id))
     .where(and(...conds))
-    .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber), asc(journalEntryLines.createdAt), asc(journalEntryLines.id))
+    .orderBy(
+      ...(f.newestFirst
+        ? [desc(journalEntries.date), desc(journalEntries.entryNumber), desc(journalEntryLines.createdAt), desc(journalEntryLines.id)]
+        : [asc(journalEntries.date), asc(journalEntries.entryNumber), asc(journalEntryLines.createdAt), asc(journalEntryLines.id)]),
+    )
     .limit(fetchCap);
 
   const entryMap = new Map<string, { id: string; sourceRef: string | null; reference: string | null }>();
