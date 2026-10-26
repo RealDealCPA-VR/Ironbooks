@@ -261,6 +261,13 @@ type AcctLike = { type: string; subtype?: string | null };
 
 /** Bank accounts (checking / savings). These get check registers and can write checks. */
 export const BANK_SUBTYPES: readonly string[] = ['checking', 'savings'];
+/**
+ * Accounts QB offers as an inventory item's Asset Account: Other Current Asset accounts (an
+ * inventory asset or other current asset), never a bank, Undeposited Funds, A/R or a fixed asset.
+ */
+export function isInventoryAssetAccount(a: AcctLike): boolean {
+  return a.type === 'asset' && qbAccountTypeOf(a) === 'other_current_asset' && a.subtype !== 'undeposited_funds';
+}
 export function isBankAccount(a: AcctLike): boolean {
   return a.type === 'asset' && BANK_SUBTYPES.includes(a.subtype ?? '');
 }

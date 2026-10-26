@@ -477,6 +477,18 @@ describe('review5 inventory', () => {
     expect(sum.toFixed(4)).toBe((await itemRow(part.id)).quantityOnHand);
   });
 
+  // ---- item setup ----
+
+  it("items: an inventory item's asset account must be an Other Current Asset (not a bank or Undeposited Funds)", async () => {
+    for (const code of ['1000', '1050']) {
+      await expect(
+        createItem(ctx, { name: `Bad asset ${code}`, type: 'inventory', assetAccountId: acct[code], incomeAccountId: acct['4000'] } as never),
+      ).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+    const ok = await invItem('Good asset');
+    await expect(updateItem(ctx, ok.id, { assetAccountId: acct['1000'] })).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
   // ---- permissions ----
 
   it('Add/Edit Multiple: opening quantity on hand needs inventory rights (A/R clerk refused)', async () => {

@@ -15,6 +15,7 @@ import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, inventoryLayers, inventoryMovements, items } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { Money } from '@/lib/money';
+import { isInventoryAssetAccount, qbAccountTypeLabel } from '@/lib/accountTypes';
 import { assertItemTypeAllowed } from '@/lib/featureGate';
 import { assertNotControlLineAccount } from './posting';
 import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
@@ -129,6 +130,14 @@ async function requireAccount(
   if (expectedType && row.type !== expectedType) {
     throw validation(
       `${label} account must be a "${expectedType}" account (got "${row.type}").`,
+    );
+  }
+  // QB lists only Other Current Asset accounts as an item's Asset Account: stock value posted to a
+  // bank, Undeposited Funds or a fixed asset would land in that register / the deposit picker.
+  if (label === 'Asset' && !isInventoryAssetAccount(row)) {
+    throw validation(
+      `"${row.name}" is ${qbAccountTypeLabel(row) === 'Other Current Asset' ? 'Undeposited Funds' : `a ${qbAccountTypeLabel(row)} account`}. ` +
+        "An item's asset account must be an Other Current Asset account such as Inventory Asset.",
     );
   }
 }
