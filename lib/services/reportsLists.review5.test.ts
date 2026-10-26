@@ -257,3 +257,20 @@ describe('Budget vs. Actual by Customer:Job', () => {
     expect(rent?.cells.total_act).toBe('25.00'); // the check costed to the job
   });
 });
+
+describe('Job Profitability', () => {
+  it("a vendor credit costed to the job reduces the job's actual cost", async () => {
+    const { customers } = await import('@/lib/db/schema');
+    const [job] = await db.select().from(customers).where(eq(customers.displayName, 'Kitchen Job'));
+    const before = await runStandardReport(ctx, 'job-profitability-summary', { from: '2026-04-01', to: '2026-04-30' });
+    const row = (r: StdReport) => r.rows.find((x) => x.cells.label === 'Kitchen Job');
+    expect(row(before)?.cells.cost).toBe('95.00'); // 70 on the bill + 25 on the check
+    await createVendorCredit(ctx, { vendorId: S.local, date: d('2026-04-03'), lines: [{ accountId: A['6300'], amount: '20.00', customerId: job.id }] } as never);
+    const after = await runStandardReport(ctx, 'job-profitability-summary', { from: '2026-04-01', to: '2026-04-30' });
+    expect(row(after)?.cells.cost).toBe('75.00');
+    // ...and Profit & Loss by Job agrees.
+    const pl = await runStandardReport(ctx, 'profit-loss-by-job', { from: '2026-04-01', to: '2026-04-30' });
+    const col = pl.columns.find((c) => c.header === 'Kitchen Job')!;
+    expect(pl.rows.find((x) => x.id.endsWith(`:a:${A['6300']}`))?.cells[col.key]).toBe('50.00');
+  });
+});
