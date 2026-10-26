@@ -212,6 +212,11 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
   if (amt.isZero()) {
     throw validation('Cannot categorize a zero-amount transaction.');
   }
+  // The feed line keeps the payee (varchar 255); refuse a longer one plainly instead of failing
+  // in the database.
+  if (input.payee != null && typeof input.payee !== 'string') throw validation('Payee must be text.');
+  if (input.memo != null && typeof input.memo !== 'string') throw validation('Memo must be text.');
+  if (input.payee && input.payee.length > 255) throw validation('The payee is too long (max 255 characters).');
 
   // p1 fx: a foreign-currency bank / card account's feed is in the account's currency. Post the
   // home value at the stated rate (else the currency list's rate) and keep the feed amount on the
@@ -281,7 +286,9 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
     const entry = await postJournalEntry(tx, {
       date: new Date(Date.UTC(feedDay.getUTCFullYear(), feedDay.getUTCMonth(), feedDay.getUTCDate())),
       description,
-      reference: input.memo ?? undefined,
+      // journal_entries.reference is varchar(100); the full memo is on every line. A rule's memo
+      // (up to 255) or a long typed memo used to fail the post with a database error.
+      reference: input.memo ? input.memo.slice(0, 100) : undefined,
       sourceRef: `bank_transaction:${txn.id}`,
       lines,
       ...(fx ? { currency: fx.currency, exchangeRate: fx.rate.toFixed(8) } : {}),

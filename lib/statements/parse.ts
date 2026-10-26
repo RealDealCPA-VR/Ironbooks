@@ -365,8 +365,10 @@ export function parseStatementText(lines: StatementLine[], opts: { kind: Stateme
     if (amt.marker) {
       signed = amt.cents;
       signFrom = 'marker';
-      // A card statement's "-" / CR marks a payment or credit: money in for the card.
-      if (kind === 'card') signed = amt.cents < 0 ? cents : -cents;
+      // A card statement's "-" / "(…)" marks a payment or credit (the balance owed goes down):
+      // money in for the card. "CR" / "DR" already name the side of the account (CR = a credit
+      // to it = payment, DR = a charge) and parseMoney signs them that way for both kinds.
+      if (kind === 'card' && !/(?:CR|DR)$/i.test(amountTok.token.trim())) signed = amt.cents < 0 ? cents : -cents;
     } else if (bal && prevBalance !== null && Math.abs(bal.cents - prevBalance) === cents) {
       const up = bal.cents > prevBalance;
       // Bank balance up = money in; a card balance (owed) up = a purchase (money out).

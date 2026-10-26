@@ -386,6 +386,13 @@
       "when": 1781400062000,
       "tag": "0062_user_challenge",
       "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1781400066000,
+      "tag": "0066_r5_banking",
+      "breakpoints": true
     }
   ]
 }

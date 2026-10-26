@@ -209,15 +209,11 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
   const fx = await resolveTransferFx(ctx, input, amountStr);
 
   return inTransaction(ctx, async (tx) => {
-    // Post the journal entry: Dr toAccount, Cr fromAccount.
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: transferDescription(input),
-      lines: transferLines(input, fx),
-    });
-
-    // Insert the transfer record.
-    const [transfer] = await tx.db
+    // Insert the transfer record first, so its entry can carry `transfer:<id>` as its source:
+    // reports label it "Transfer", QuickZoom opens the transfer, and the Journal screen refuses
+    // to edit / void / reverse it on its own (which would leave the transfer row pointing at a
+    // void entry and a later edit of the transfer posting the money a second time).
+    const [inserted] = await tx.db
       .insert(transfers)
       .values({
         companyId: tx.companyId,
@@ -226,9 +222,21 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
         toAccountId: input.toAccountId,
         amount: amountStr,
         memo: input.memo ?? null,
-        postedEntryId: entry.id,
         ...fxColumns(fx),
       })
+      .returning();
+
+    // Post the journal entry: Dr toAccount, Cr fromAccount.
+    const entry = await postJournalEntry(tx, {
+      date: input.date,
+      description: transferDescription(input),
+      sourceRef: `transfer:${inserted.id}`,
+      lines: transferLines(input, fx),
+    });
+    const [transfer] = await tx.db
+      .update(transfers)
+      .set({ postedEntryId: entry.id })
+      .where(eq(transfers.id, inserted.id))
       .returning();
 
     await writeAudit(tx, {
@@ -281,6 +289,7 @@ export async function updateTransfer(ctx: ServiceContext, id: string, input: Cre
       const entry = await postJournalEntry(tx, {
         date: input.date,
         description: transferDescription(input),
+        sourceRef: `transfer:${id}`,
         lines,
       });
       entryId = entry.id;

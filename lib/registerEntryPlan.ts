@@ -60,6 +60,10 @@ const FORM_ONLY_SUBTYPES: Record<string, string> = {
   accounts_receivable: 'Enter invoices and customer payments on their own forms (Customers menu).',
   accounts_payable: 'Enter bills and bill payments on their own forms (Vendors menu).',
   inventory: 'Change inventory through purchases, sales or an inventory adjustment.',
+  // Make Deposits lists the payments, sales receipts and invoice payments waiting in Undeposited
+  // Funds — an amount typed into (or out of) it here would be a balance no deposit can ever clear.
+  undeposited_funds:
+    'Undeposited Funds holds customer payments waiting to be deposited. Record them with Receive Payments or Sales Receipts, and deposit them with Make Deposits.',
 };
 
 /** Why this register can't take typed entries, or null when it can. */

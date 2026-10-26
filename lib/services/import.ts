@@ -374,6 +374,31 @@ function parseLooseDate(rawDate: string): Date {
   return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
 }
 
+/**
+ * A CSV money cell as a Decimal (null when blank): "$1,234.56", "-45.00", "45.00-", "(45.00)"
+ * (accounting negative). Anything else — "N/A", "NaN", "12,5" … — is a VALIDATION error naming
+ * the row, so the import fails as a whole instead of staging a wrong or NaN amount.
+ */
+function csvAmount(cell: string, rowIndex: number) {
+  let s = cell.replace(/[\s ]/g, '');
+  if (!s) return null;
+  let neg = false;
+  if (/^\(.*\)$/.test(s)) {
+    neg = true;
+    s = s.slice(1, -1);
+  }
+  if (s.endsWith('-')) {
+    neg = !neg;
+    s = s.slice(0, -1);
+  }
+  s = s.replace(/^([+-]?)\$/, '$1').replace(/,(?=\d{3}(?:\D|$))/g, '');
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) {
+    throw new ServiceError('VALIDATION', `CSV row ${rowIndex + 1}: "${cell}" is not an amount.`);
+  }
+  const v = Money.of(s);
+  return neg ? v.negated() : v;
+}
+
 /** Drop the first `skipRows` physical lines (bank-export preamble before the header). */
 function applySkipRows(content: string, skipRows?: number): string {
   if (!skipRows || skipRows <= 0) return content;
@@ -415,16 +440,17 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
     // Amount: prefer separate debit/credit columns if specified.
     let amount: string;
     if (mapping.debitCol !== undefined && mapping.creditCol !== undefined) {
-      const debitRaw = col(mapping.debitCol).replace(/[,$]/g, '');
-      const creditRaw = col(mapping.creditCol).replace(/[,$]/g, '');
-      const debit = debitRaw ? parseFloat(debitRaw) : 0;
-      const credit = creditRaw ? parseFloat(creditRaw) : 0;
-      // Credit = money coming IN (positive); Debit = money going OUT (negative).
-      amount = toAmountString(credit - debit);
+      const debit = csvAmount(col(mapping.debitCol), i);
+      const credit = csvAmount(col(mapping.creditCol), i);
+      // Credit = money coming IN (positive); Debit = money going OUT (negative). The columns say
+      // the direction, so their sign does not: a bank that prints debits as "-45.00" (or
+      // "(45.00)") still means 45.00 out — it used to come in as a +45.00 deposit. Decimal math,
+      // never parseFloat (an unparseable cell used to be staged as NaN).
+      amount = toAmountString(Money.abs(credit ?? 0).minus(Money.abs(debit ?? 0)));
     } else {
-      const rawAmt = col(mapping.amountCol).replace(/[,$]/g, '');
-      if (!rawAmt) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing amount value.`);
-      amount = toAmountString(rawAmt);
+      const amt = csvAmount(col(mapping.amountCol), i);
+      if (amt === null) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing amount value.`);
+      amount = toAmountString(amt);
     }
 
     // Sign flip — for banks that export withdrawals as positive numbers.
@@ -576,15 +602,20 @@ export function parseRows(rows: ImportRowInput[]): ParsedTransaction[] {
   if (!Array.isArray(rows) || rows.length === 0) throw validation('There are no rows to import.');
   if (rows.length > 5000) throw validation('Import at most 5,000 rows at a time.');
   return rows.map((r, i) => {
-    const date = parseLooseDate(String(r?.date ?? ''));
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(r?.date ?? '')) || isNaN(date.getTime())) {
-      throw validation(`Row ${i + 1}: the date must look like 2026-01-31.`);
+    const raw = String(r?.date ?? '');
+    const date = parseLooseDate(raw);
+    // The day must exist: "2026-02-30" (an OCR misread) would otherwise roll over to March 2.
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== raw) {
+      throw validation(`Row ${i + 1}: the date must be a real day like 2026-01-31.`);
     }
     let amount: string;
     try {
-      amount = toAmountString(r.amount);
+      const v = typeof r.amount === 'string' || typeof r.amount === 'number' ? Money.of(r.amount) : null;
+      // "NaN" / "Infinity" are valid decimal.js input and Postgres numeric stores NaN — never stage them.
+      if (!v || !v.isFinite()) throw new Error('not finite');
+      amount = toAmountString(v);
     } catch {
-      throw validation(`Row ${i + 1}: "${r.amount}" is not an amount.`);
+      throw validation(`Row ${i + 1}: "${r?.amount}" is not an amount.`);
     }
     if (Money.isZero(amount)) throw validation(`Row ${i + 1}: the amount is zero.`);
     const description = String(r.description ?? '').trim().slice(0, 500) || 'Statement transaction';
