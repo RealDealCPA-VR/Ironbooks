@@ -7,6 +7,8 @@
 -- replica skipped it), a file where it had been dropped or disabled offline was neither reported
 -- by the ledger health check / Verify Data nor repaired when the file was opened. Same rule and
 -- message (BK002 -> CONFLICT); only the name, the enable mode and the maintenance change.
+--
+-- Plus an index for audit-trail lookups by record (see the end of the file).
 DROP TRIGGER IF EXISTS "bk_journal_item_applications_void_guard" ON "journal_entries";
 --> statement-breakpoint
 DROP FUNCTION IF EXISTS bk_guard_journal_item_applications();
@@ -34,3 +36,9 @@ CREATE TRIGGER bka_jia_void_guard
   FOR EACH ROW EXECUTE FUNCTION bka_guard_journal_item_applications();
 --> statement-breakpoint
 ALTER TABLE journal_entries ENABLE ALWAYS TRIGGER bka_jia_void_guard;
+--> statement-breakpoint
+-- Audit-trail lookups by record (Transaction History, Undo on every save, "changed by" on a
+-- record-lock conflict, cash-basis vendor-credit applications, voided refunds) filter by company +
+-- entity type (+ id). The only index was (company_id, created_at), so each one read the
+-- company's whole, ever-growing audit trail.
+CREATE INDEX IF NOT EXISTS "audit_logs_entity_idx" ON "audit_logs" ("company_id", "entity_type", "entity_id", "created_at");
