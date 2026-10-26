@@ -16,7 +16,7 @@ import {
 } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
-import { assertPeriodOpen } from './fiscalPeriods';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { type MovementRequest, getSite, normalizeSerials, recordMovements, reverseSourceMovements } from './inventorySites';
 
 export interface InventoryTransferLineInput {
@@ -51,7 +51,7 @@ export async function createInventoryTransfer(ctx: ServiceContext, input: Create
   return inTransaction(ctx, async (tx) => {
     // No GL, so posting.ts never checks the period — a transfer is still a dated transaction
     // the closing date locks (QB parity).
-    await assertPeriodOpen(tx, input.date);
+    const periodCheck = await assertPeriodOpen(tx, input.date);
     const from = await getSite(tx, input.fromSiteId);
     const to = await getSite(tx, input.toSiteId);
     if (!from.isActive || !to.isActive) throw validation('Transfers require active sites.');
@@ -135,6 +135,15 @@ export async function createInventoryTransfer(ctx: ServiceContext, input: Create
       })),
     ];
     await recordMovements(tx, requests);
+    // Entered with the closing-date password: on record for the Closing Date Exception report
+    // (posting.ts does this for documents with an entry; a transfer has none).
+    await recordClosingDateException(tx, periodCheck, {
+      entryId: header.id,
+      operation: 'post',
+      transactionDate: input.date,
+      description: memo,
+      sourceRef: `inventory_transfer:${header.id}`,
+    });
 
     await writeAudit(tx, {
       action: 'create',
@@ -208,7 +217,7 @@ export async function voidInventoryTransfer(ctx: ServiceContext, id: string) {
   return inTransaction(ctx, async (tx) => {
     const transfer = await getInventoryTransfer(tx, id);
     if (transfer.status === 'void') return transfer;
-    await assertPeriodOpen(tx, transfer.date, { movable: false });
+    const periodCheck = await assertPeriodOpen(tx, transfer.date, { movable: false });
     try {
       await reverseSourceMovements(tx, 'transfer', id);
     } catch (err) {
@@ -222,6 +231,13 @@ export async function voidInventoryTransfer(ctx: ServiceContext, id: string) {
       .set({ status: 'void', voidedAt: new Date() })
       .where(eq(inventoryTransfers.id, id))
       .returning();
+    await recordClosingDateException(tx, periodCheck, {
+      entryId: id,
+      operation: 'void',
+      transactionDate: transfer.date,
+      description: `Transfer #${transfer.transferNumber} voided`,
+      sourceRef: `inventory_transfer:${id}`,
+    });
     await writeAudit(tx, {
       action: 'void',
       entityType: 'inventory_transfer',

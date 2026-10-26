@@ -7,9 +7,12 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimalPositive, zLines, zMoneyPositive, zUuid } from './helpers';
+import { inventoryLineFields } from './inventorySites';
 
 export const vendorCreditLineSchema = z
   .object({
+    // Items tab: site / bin / serial numbers / lot of the units returned (Advanced Inventory).
+    ...inventoryLineFields,
     accountId: zUuid.nullish(),
     itemId: zUuid.nullish(),
     quantity: zDecimalPositive.nullish(),

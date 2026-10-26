@@ -9,7 +9,7 @@
  * if any row fails — or `dryRun` is set — the whole batch is rolled back and nothing is saved.
  */
 import { and, eq } from 'drizzle-orm';
-import { accounts, salesTaxCodes, vendors } from '@/lib/db/schema';
+import { accounts, items, salesTaxCodes, vendors } from '@/lib/db/schema';
 import { BULK_COLUMNS, type BulkList, ITEM_TYPES_FOR_BULK, parseAmount, parseBool, parseDateCell } from '@/lib/lists/bulk';
 import { type ServiceContext, ServiceError, inTransaction, validation } from '../_base';
 import { createCustomer, updateCustomer } from '../customers';
@@ -287,7 +287,17 @@ async function saveItem(ctx: ServiceContext, row: RawRow, lk: Lookups): Promise<
   let itemId: string;
   let created: boolean;
   if (editing) {
-    if (type) throw new FieldError('type', 'The type of an existing item cannot be changed here.');
+    // The grid loads every column of an existing item, Type included, and sends the whole row
+    // back when any cell changed: only a DIFFERENT type is a change of type.
+    if (type) {
+      const [current] = await ctx.db
+        .select({ type: items.type })
+        .from(items)
+        .where(and(eq(items.companyId, ctx.companyId), eq(items.id, id!)));
+      if (current && current.type !== type) {
+        throw new FieldError('type', 'The type of an existing item cannot be changed here.');
+      }
+    }
     const patch = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
     if (patch.name === '') throw new FieldError('name', 'Item name is required.');
     itemId = (await updateItem(ctx, id!, patch)).id;

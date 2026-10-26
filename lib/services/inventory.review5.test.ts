@@ -40,6 +40,15 @@ import { createEntry, listEntries } from './lists/simpleLists';
 import { createType, listTypes, updateType } from './typeLists';
 import { createUomSet, listUomSets, updateUomSet } from './lists/uom';
 import { createBillingRateLevel, listBillingRateLevels } from './lists/billingRates';
+import { auditLogs, companies } from '@/lib/db/schema';
+import { physicalCount } from './inventoryOps';
+import { inventoryCenterList } from './lists/inventoryCenter';
+import { bulkLoad, bulkSave } from './lists/bulk';
+import { createAccount } from './accounts';
+import { withVersionCheck } from './concurrency';
+import { createInventoryTransfer, voidInventoryTransfer } from './inventoryTransfers';
+import { listSites, siteQuantities } from './inventorySites';
+import { serialLotInStock, transactionsBySerialLot } from './inventorySiteReports';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-inventory-review5');
 let db: DB;
@@ -578,5 +587,168 @@ describe('review5 inventory', () => {
     expect(caught).toBeInstanceOf(ServiceError);
     expect((caught as ServiceError).code).toBe('FORBIDDEN');
     expect(await gl('1300')).toBe('0.00');
+  });
+
+  // ---- part 2 ----
+
+  async function setClosingDate(closingDate: string | null) {
+    const [co] = await db.select().from(companies).where(eq(companies.id, ctx.companyId));
+    await db
+      .update(companies)
+      .set({ settings: { ...((co.settings as Record<string, unknown>) ?? {}), closingDate } })
+      .where(eq(companies.id, ctx.companyId));
+  }
+  const closingExceptions = () =>
+    db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'closing_date_exception')));
+
+  it('physical count / opening stock that move no value still respect the closing date', async () => {
+    const a = await invItem('Count free sample');
+    await adjustInventory(ctx, { itemId: a.id, quantityChange: 5, unitCost: '0', date: d('2026-01-02') });
+    await setClosingDate('2026-03-31');
+    await expect(physicalCount(ctx, { itemId: a.id, countedQty: 3, date: d('2026-03-15') })).rejects.toMatchObject({ code: 'PERIOD_CLOSED' });
+    expect((await itemRow(a.id)).quantityOnHand).toBe('5.0000');
+    // With the closing-date password it goes through, and the override is on record.
+    const pw: ServiceContext = { ...ctx, closingDateOverride: true };
+    await physicalCount(pw, { itemId: a.id, countedQty: 3, date: d('2026-03-15') });
+    expect((await itemRow(a.id)).quantityOnHand).toBe('3.0000');
+    expect(await closingExceptions()).toHaveLength(1);
+    // A new item's opening quantity at $0, dated inside the closed period.
+    await expect(
+      createItemWithOpeningStock(ctx, {
+        name: 'Free opening stock',
+        type: 'inventory',
+        assetAccountId: acct['1300'],
+        incomeAccountId: acct['4000'],
+        openingQuantity: '4',
+        openingValue: '0',
+        openingAsOf: d('2026-02-01'),
+      } as never),
+    ).rejects.toMatchObject({ code: 'PERIOD_CLOSED' });
+  });
+
+  it('Add/Edit Multiple: an existing item edited in the grid saves (its Type column comes back unchanged)', async () => {
+    const a = await invItem('Grid widget', { purchaseCost: '2.00' });
+    const row = (await bulkLoad(ctx, 'items')).find((r) => r.id === a.id)!;
+    expect(row.type).toBe('inventory');
+    const res = await bulkSave(ctx, 'items', [{ ...row, salesPrice: '12.50' }]);
+    expect(res.errors).toEqual([]);
+    expect(res.saved).toBe(true);
+    expect((await itemRow(a.id)).salesPrice).toBe('12.50');
+    // Changing the type of an existing item is still refused.
+    const res2 = await bulkSave(ctx, 'items', [{ ...row, type: 'service' }]);
+    expect(res2.saved).toBe(false);
+    expect(res2.errors[0]).toMatchObject({ field: 'type' });
+  });
+
+  it('Inventory Center: an average-cost item is valued with its value remainder (ties to the valuation report)', async () => {
+    const a = await invItem('Center remainder');
+    await adjustInventory(ctx, { itemId: a.id, quantityChange: 3000, unitCost: '0.33333333', date: d('2026-01-02') });
+    const row = (await inventoryCenterList(ctx)).find((r) => r.id === a.id)!;
+    const val = (await inventoryValuation(ctx)).items.find((r) => r.id === a.id)!;
+    expect(val.totalValue).toBe('1000.00');
+    expect(row.value).toBe(val.totalValue);
+  });
+
+  it("COGS relief of an average-cost item posts to the item's own COGS account (as FIFO items do)", async () => {
+    const own = await createAccount(ctx, { code: '5010', name: 'COGS - Widgets', type: 'expense' as never, subtype: 'cost_of_goods_sold' });
+    const a = await invItem('Own COGS widget', { expenseAccountId: own.id });
+    await adjustInventory(ctx, { itemId: a.id, quantityChange: 10, unitCost: '2.00', date: d('2026-01-02') });
+    await adjustQuantityAtSite(ctx, { itemId: a.id, quantityChange: '-3', date: d('2026-01-03'), purpose: 'cogs' });
+    const f = await invItem('Own COGS FIFO widget', { expenseAccountId: own.id });
+    await adjustQuantityAtSite(ctx, { itemId: f.id, quantityChange: '10', unitCost: '1.00', date: d('2026-01-02'), costing: 'fifo' });
+    await adjustQuantityAtSite(ctx, { itemId: f.id, quantityChange: '-2', date: d('2026-01-03'), purpose: 'cogs' });
+    expect(await gl('5010')).toBe('8.00');
+    expect(await gl('5000')).toBe('0.00');
+  });
+
+  it('record locking: selling the item while its form is open does not make saving the form a conflict', async () => {
+    const a = await invItem('Locked widget');
+    await adjustInventory(ctx, { itemId: a.id, quantityChange: 10, unitCost: '2.00', date: d('2026-01-02') });
+    // The version the item form loaded (lib/client.ts versionOf: editedAt where the record has one).
+    const versionOf = (r: Record<string, unknown>) => (r.editedAt !== undefined ? r.editedAt : r.updatedAt) as Date;
+    const loaded = versionOf(await itemRow(a.id));
+    // Meanwhile another user sells two and adjusts one: stock moves, the item record is not edited.
+    const c = await createCustomer(ctx, { displayName: 'Lock buyer' } as never);
+    await createInvoice(ctx, { customerId: c.id, date: d('2026-01-03'), lines: [{ itemId: a.id, quantity: 2, rate: '5.00' }] } as never);
+    await adjustQuantityAtSite(ctx, { itemId: a.id, quantityChange: '-1', date: d('2026-01-04') });
+    const saved = await withVersionCheck(ctx, 'item', a.id, loaded, (c2) => updateItem(c2, a.id, { salesPrice: '11.00' }));
+    expect(saved.salesPrice).toBe('11.00');
+    expect((await itemRow(a.id)).quantityOnHand).toBe('7.0000');
+    // A real edit of the item by someone else in between still conflicts.
+    const mine = versionOf(saved as unknown as Record<string, unknown>);
+    await updateItem(ctx, a.id, { description: 'changed by another user' });
+    await expect(
+      withVersionCheck(ctx, 'item', a.id, mine, (c2) => updateItem(c2, a.id, { salesPrice: '12.00' })),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
+  it('transfers dated on or before the closing date record the password override (Closing Date Exception report)', async () => {
+    const def = (await listSites(ctx)).find((s) => s.isDefault)!; // "Main Warehouse"
+    const site = await createSite(ctx, { name: 'Transfer annex' });
+    const a = await invItem('Transfer widget');
+    await adjustInventory(ctx, { itemId: a.id, quantityChange: 5, unitCost: '1.00', date: d('2026-01-02') });
+    await setClosingDate('2026-03-31');
+    await expect(
+      createInventoryTransfer(ctx, { date: d('2026-03-10'), fromSiteId: def.id, toSiteId: site.id, lines: [{ itemId: a.id, quantity: '2' }] }),
+    ).rejects.toMatchObject({ code: 'PERIOD_CLOSED' });
+    const pw: ServiceContext = { ...ctx, closingDateOverride: true };
+    const t = await createInventoryTransfer(pw, { date: d('2026-03-10'), fromSiteId: def.id, toSiteId: site.id, lines: [{ itemId: a.id, quantity: '2' }] });
+    await voidInventoryTransfer(pw, t.id);
+    const ex = await closingExceptions();
+    expect(ex.map((e) => (e.newValues as { operation: string }).operation).sort()).toEqual(['post', 'void']);
+  });
+
+  it('vendor credit: serial- and lot-tracked items can be returned, from the site that holds them', async () => {
+    const v = await createVendor(ctx, { displayName: 'Serial supplier' } as never);
+    const s = await invItem('Serial router', { trackingMode: 'serial' });
+    await adjustQuantityAtSite(ctx, { itemId: s.id, quantityChange: '2', unitCost: '50.00', date: d('2026-01-02'), serialNumbers: ['SN-1', 'SN-2'] });
+    const vc = await createVendorCredit(ctx, {
+      vendorId: v.id,
+      date: d('2026-01-05'),
+      lines: [{ itemId: s.id, quantity: '1', amount: '50.00', serialNumbers: ['SN-1'] }],
+    } as never);
+    const inStock = async () => (await serialLotInStock(ctx, { itemId: s.id })).serials.map((x) => x.serialNumber).sort();
+    expect(await inStock()).toEqual(['SN-2']);
+    // Re-saving the credit unchanged (a form without the serial column) keeps the serial it returned.
+    await updateVendorCredit(ctx, vc.id, {
+      vendorId: v.id,
+      date: d('2026-01-06'),
+      lines: [{ itemId: s.id, quantity: '1', amount: '50.00' }],
+    } as never);
+    expect(await inStock()).toEqual(['SN-2']);
+    await voidVendorCredit(ctx, vc.id);
+    expect(await inStock()).toEqual(['SN-1', 'SN-2']);
+    // Lot-tracked.
+    const lot = await invItem('Lot paint', { trackingMode: 'lot' });
+    await adjustQuantityAtSite(ctx, { itemId: lot.id, quantityChange: '10', unitCost: '3.00', date: d('2026-01-02'), lotNumber: 'L-7' });
+    await createVendorCredit(ctx, { vendorId: v.id, date: d('2026-01-05'), lines: [{ itemId: lot.id, quantity: '4', amount: '12.00', lotNumber: 'L-7' }] } as never);
+    expect((await serialLotInStock(ctx, { itemId: lot.id })).lots.map((l) => [l.lotNumber, l.quantity])).toEqual([['L-7', '6.0000']]);
+    // Stock that sits at another site goes back to the vendor from that site.
+    const annex = await createSite(ctx, { name: 'Return annex' });
+    const p = await invItem('Annex part');
+    await adjustQuantityAtSite(ctx, { itemId: p.id, quantityChange: '3', unitCost: '1.00', date: d('2026-01-02'), siteId: annex.id });
+    await createVendorCredit(ctx, { vendorId: v.id, date: d('2026-01-05'), lines: [{ itemId: p.id, quantity: '2', amount: '2.00', siteId: annex.id }] } as never);
+    const q = await siteQuantities(ctx, [p.id]);
+    expect(q.get(p.id)?.get(annex.id)?.toFixed(4)).toBe('1.0000');
+    expect((await verifySiteInvariants(ctx)).allOk).toBe(true);
+  });
+
+  it('Transactions by Serial/Lot Number names checks and vendor credits (label and number)', async () => {
+    const v = await createVendor(ctx, { displayName: 'Lot supplier' } as never);
+    const lot = await invItem('Lot glue', { trackingMode: 'lot' });
+    const chk = await createExpense(ctx, {
+      vendorId: v.id,
+      date: d('2026-01-02'),
+      method: 'check',
+      reference: '1001',
+      paymentAccountId: acct['1000'],
+      lines: [{ itemId: lot.id, quantity: '5', unitCost: '2.00', lotNumber: 'G-1' }],
+    } as never);
+    expect(chk).toBeTruthy();
+    const rows = (await transactionsBySerialLot(ctx, { lotNumber: 'G-1' })).rows;
+    expect(rows.map((r) => [r.sourceLabel, r.sourceNumber])).toEqual([['Check', '1001']]);
   });
 });

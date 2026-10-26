@@ -51,7 +51,14 @@ import {
 import { receivePurchasedStock } from './bills';
 import { restoreLayerDraws, takeFromLayers } from './fifo';
 import { bookValueRelief, sellOutRelief } from './inventory';
-import { postDocumentInventory, reverseDocumentInventory } from './inventorySites';
+import {
+  type InventoryLineDetail,
+  attachInventoryDetails,
+  loadDocumentInventoryDetails,
+  pickLineDetail,
+  postDocumentInventory,
+  reverseDocumentInventory,
+} from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import {
@@ -79,7 +86,12 @@ import {
 // Input types
 // ---------------------------------------------------------------------------
 
-export interface VendorCreditLineInput {
+/**
+ * Items tab lines also take the Advanced Inventory detail of the units returned (site, bin,
+ * serial numbers, lot) — a serial- or lot-tracked item can only leave stock with them, and stock
+ * held at another site goes back to the vendor from that site.
+ */
+export interface VendorCreditLineInput extends InventoryLineDetail {
   /** Expenses tab: GL account to credit (expense or asset). Items tab: optional override for a
    * non-inventory item's account. */
   accountId?: string | null;
@@ -347,12 +359,18 @@ async function relieveReturnedStock(
   return cost;
 }
 
-/** Relieve stock for every inventory line; returns the cost per line index. */
+/**
+ * Relieve stock for every inventory line; returns the cost per line index. `inputLines` carry
+ * each line's site / bin / serials / lot; with `carryForward` (an edit) a line that carries none
+ * keeps the detail stored for it, so a form without those columns never changes them.
+ */
 async function relieveCreditStock(
   tx: ServiceContext,
   creditId: string,
   date: Date,
   prep: PreparedLine[],
+  inputLines: VendorCreditLineInput[] = [],
+  carryForward = false,
 ): Promise<Map<number, Decimal>> {
   const costs = new Map<number, Decimal>();
   for (const [i, l] of prep.entries()) {
@@ -365,15 +383,40 @@ async function relieveCreditStock(
       sourceId: creditId,
       date,
       direction: 'out',
-      lines: prep.map((l, idx) => ({
-        lineOrder: idx,
-        itemId: l.isInventory ? l.itemId : null,
-        quantity: l.quantity ? l.quantity.toFixed(4) : '0',
-      })),
+      lines: prep.map((l, idx) => {
+        const src = inputLines[idx];
+        return {
+          lineOrder: idx,
+          itemId: l.isInventory ? l.itemId : null,
+          quantity: l.quantity ? l.quantity.toFixed(4) : '0',
+          siteId: src?.siteId,
+          binId: src?.binId,
+          serialNumbers: src?.serialNumbers,
+          lotNumber: src?.lotNumber,
+          lotExpiration: src?.lotExpiration,
+        };
+      }),
       memo: 'Returned to vendor',
+      carryForward,
     });
   }
   return costs;
+}
+
+/** Does an edit give any line a site / bin / serial / lot other than the one stored for it? */
+async function lineDetailChanged(tx: ServiceContext, creditId: string, lines: VendorCreditLineInput[]): Promise<boolean> {
+  const stored = await loadDocumentInventoryDetails(tx, 'vendor_credit', creditId);
+  const key = (d: InventoryLineDetail | null | undefined) =>
+    JSON.stringify({
+      site: d?.siteId || null,
+      bin: d?.binId || null,
+      serials: (d?.serialNumbers ?? []).map((s) => String(s).trim()).filter(Boolean).sort(),
+      lot: d?.lotNumber?.trim() || null,
+    });
+  return lines.some((l, i) => {
+    const explicit = pickLineDetail(l);
+    return explicit !== undefined && key(explicit) !== key(stored.get(i));
+  });
 }
 
 /** Put the stock a saved credit returned back on hand at the cost it left with (void / edit). */
@@ -564,7 +607,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
       .returning();
 
     // 2) Returned items leave stock at their current cost.
-    const costs = await relieveCreditStock(tx, credit.id, input.date, prep);
+    const costs = await relieveCreditStock(tx, credit.id, input.date, prep, input.lines);
 
     // 3) Lines (amounts in the credit's currency).
     await tx.db.insert(vendorCreditLines).values(lineRowsFor(credit.id, prep, costs));
@@ -661,7 +704,9 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
       const same =
         cur.vendorId === input.vendorId &&
         new Date(cur.date).toISOString().slice(0, 10) === new Date(input.date).toISOString().slice(0, 10) &&
-        lineSignature(oldLines) === lineSignature(prep);
+        lineSignature(oldLines) === lineSignature(prep) &&
+        // Other serial numbers / lot / site for the returned units move stock: re-post.
+        !(await lineDetailChanged(tx, id, input.lines));
       plan = same ? 'unchanged' : 'repost';
     } else {
       plan = await planPostedEdit(tx, {
@@ -706,7 +751,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       await restoreCreditStock(tx, cur);
       await tx.db.delete(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, id));
-      const costs = await relieveCreditStock(tx, id, input.date, prep);
+      const costs = await relieveCreditStock(tx, id, input.date, prep, input.lines, true);
       await tx.db.insert(vendorCreditLines).values(lineRowsFor(id, prep, costs));
       const entry = await postJournalEntry(tx, {
         date: input.date,
@@ -804,7 +849,8 @@ export async function getVendorCredit(ctx: ServiceContext, id: string) {
     .where(eq(vendorCreditLines.vendorCreditId, id))
     .orderBy(asc(vendorCreditLines.lineOrder));
 
-  return { ...credit, lines };
+  // Site / bin / serials / lot of returned items, as the other stock documents show them.
+  return { ...credit, lines: await attachInventoryDetails(ctx, 'vendor_credit', id, lines) };
 }
 
 // ---------------------------------------------------------------------------

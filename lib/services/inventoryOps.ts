@@ -48,6 +48,7 @@ import {
   carriedValueRemainder,
   sellOutRelief,
   valueRemainderAfter,
+  zeroValueAdjustment,
 } from './inventory';
 import { postJournalEntry } from './posting';
 import { assertDefaultSiteQuantities } from './inventorySites';
@@ -372,12 +373,17 @@ async function physicalCountInTx(
           },
         ];
 
-    const entry = glAmount.isZero() ? null : await postJournalEntry(tx, {
-      date: input.date,
-      description: `Physical inventory count adjustment — ${item.name}`,
-      lines: postingLines,
-      sourceRef: `item:${input.itemId}`,
-    });
+    // A count difference worth $0 (stock with no cost) posts no entry, but its date is still
+    // checked against the closing date / closed periods (and a password override recorded), as
+    // for a posted count — otherwise a count dated in a closed period changed quantities there.
+    const entry = glAmount.isZero()
+      ? await zeroValueAdjustment(tx, input.date, input.itemId, `Physical inventory count adjustment — ${item.name}`)
+      : await postJournalEntry(tx, {
+          date: input.date,
+          description: `Physical inventory count adjustment — ${item.name}`,
+          lines: postingLines,
+          sourceRef: `item:${input.itemId}`,
+        });
 
     // Update the item's quantityOnHand to the counted qty
     await tx.db

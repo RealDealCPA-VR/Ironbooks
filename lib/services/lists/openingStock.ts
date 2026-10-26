@@ -30,7 +30,7 @@ import { type ServiceContext, inTransaction, notFound, validation, writeAudit } 
 import { findOrCreateOpeningBalanceEquity } from '../accounts';
 import { type CreateItemInput, createItem } from '../items';
 import { postJournalEntry } from '../posting';
-import { todayCalendarDay } from '../inventory';
+import { todayCalendarDay, zeroValueAdjustment } from '../inventory';
 import { assertAccountantMayEnterOpeningStock } from '../accountantCopy/guard';
 
 export interface OpeningStockInput {
@@ -147,6 +147,10 @@ export async function createItemWithOpeningStock(
         ],
       });
       entryId = entry.id;
+    } else if (postToLedger) {
+      // Opening stock worth $0 posts no entry; its as-of date still answers to the closing date
+      // and closed periods (with a password override recorded), like stock that has a value.
+      await zeroValueAdjustment(tx, plan.asOf, item.id, `Opening quantity on hand — ${item.name}`);
     }
     // Average cost (default): no layer — a layer would make the item FIFO-tracked, and Build
     // Assemblies / physical count / value adjustment would then refuse it.

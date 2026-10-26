@@ -11,10 +11,10 @@
  * 'adjustment', sourceId = the posted journal entry) is written in the same transaction.
  */
 import { and, eq, sql } from 'drizzle-orm';
-import { accounts, inventoryLayers, itemSiteSettings, items } from '@/lib/db/schema';
+import { inventoryLayers, itemSiteSettings, items } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
-import { type AdjustmentDimensions, adjustInventory, inventoryDate, inventoryNumber } from './inventory';
+import { type AdjustmentDimensions, adjustInventory, cogsAccountForItem, inventoryDate, inventoryNumber } from './inventory';
 import { consumeStock, receiveStock, seedOpeningLayer } from './fifo';
 import { type InventoryLineDetail, getSite, recordMovements } from './inventorySites';
 
@@ -67,13 +67,9 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
     const memo = input.memo ?? (qty.greaterThan(0) ? 'Inventory adjustment (add)' : 'Inventory adjustment (remove)');
     const isCogs = input.purpose === 'cogs' && qty.lessThan(0);
     let adjustmentAccountId = input.adjustmentAccountId ?? null;
-    if (isCogs && !adjustmentAccountId) {
-      const [cogs] = await tx.db
-        .select({ id: accounts.id })
-        .from(accounts)
-        .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.code, '5000')));
-      adjustmentAccountId = cogs?.id ?? null;
-    }
+    // COGS relief goes to the item's own COGS account (5000 when it has none) — the account every
+    // sale of the item posts to, and the one the FIFO path below uses.
+    if (isCogs && !adjustmentAccountId) adjustmentAccountId = await cogsAccountForItem(tx, item);
     const dims: AdjustmentDimensions = {
       adjustmentAccountId,
       classId: input.classId ?? null,

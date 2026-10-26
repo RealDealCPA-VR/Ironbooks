@@ -22,6 +22,7 @@ import {
   accounts,
   bills,
   creditMemos,
+  expenses,
   inventoryBins,
   inventoryLots,
   inventoryMovements,
@@ -37,6 +38,7 @@ import {
   salesOrderLines,
   salesOrders,
   salesReceipts,
+  vendorCredits,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
@@ -383,6 +385,9 @@ const SOURCE_LABELS: Record<string, string> = {
   sales_receipt: 'Sales Receipt',
   credit_memo: 'Credit Memo',
   bill: 'Bill',
+  // Write Checks / Enter Credit Card Charges with an Items tab (the method picks the label).
+  expense: 'Check',
+  vendor_credit: 'Vendor Credit',
   item_receipt: 'Item Receipt',
   adjustment: 'Inventory Adjustment',
   build: 'Assembly Build',
@@ -391,9 +396,16 @@ const SOURCE_LABELS: Record<string, string> = {
   site_rebalance: 'Default Site Change',
 };
 
-/** Human document numbers for movement sources (batched per source type). */
+/** The QB form name of a check / charge / cash expense by its payment method. */
+const EXPENSE_LABELS: Record<string, string> = { check: 'Check', credit_card: 'Credit Card Charge', cash: 'Cash Expense' };
+
+/**
+ * Human document numbers for movement sources (batched per source type), plus the form label of
+ * sources whose label depends on the document (a check vs a credit card charge).
+ */
 async function sourceNumbers(ctx: ServiceContext, refs: Array<{ type: string; id: string | null }>) {
   const out = new Map<string, string>();
+  const labels = new Map<string, string>();
   const idsOf = (t: string) => [...new Set(refs.filter((r) => r.type === t && r.id).map((r) => r.id!))];
   const put = (t: string, rows: Array<{ id: string; num: unknown }>) => {
     for (const r of rows) if (r.num != null && r.num !== '') out.set(`${t}:${r.id}`, String(r.num));
@@ -406,13 +418,32 @@ async function sourceNumbers(ctx: ServiceContext, refs: Array<{ type: string; id
   if (ids.length) put('credit_memo', await ctx.db.select({ id: creditMemos.id, num: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))` }).from(creditMemos).where(inArray(creditMemos.id, ids)));
   ids = idsOf('bill');
   if (ids.length) put('bill', await ctx.db.select({ id: bills.id, num: bills.billNumber }).from(bills).where(inArray(bills.id, ids)));
+  ids = idsOf('expense');
+  if (ids.length) {
+    const rows = await ctx.db
+      .select({ id: expenses.id, num: expenses.reference, method: expenses.method })
+      .from(expenses)
+      .where(and(eq(expenses.companyId, ctx.companyId), inArray(expenses.id, ids)));
+    put('expense', rows);
+    for (const r of rows) labels.set(`expense:${r.id}`, EXPENSE_LABELS[r.method] ?? 'Check');
+  }
+  ids = idsOf('vendor_credit');
+  if (ids.length) {
+    put(
+      'vendor_credit',
+      await ctx.db
+        .select({ id: vendorCredits.id, num: vendorCredits.refNumber })
+        .from(vendorCredits)
+        .where(and(eq(vendorCredits.companyId, ctx.companyId), inArray(vendorCredits.id, ids))),
+    );
+  }
   ids = idsOf('item_receipt');
   if (ids.length) put('item_receipt', await ctx.db.select({ id: itemReceipts.id, num: itemReceipts.reference }).from(itemReceipts).where(inArray(itemReceipts.id, ids)));
   ids = idsOf('transfer');
   if (ids.length) put('transfer', await ctx.db.select({ id: inventoryTransfers.id, num: inventoryTransfers.transferNumber }).from(inventoryTransfers).where(inArray(inventoryTransfers.id, ids)));
   ids = idsOf('adjustment');
   if (ids.length) put('adjustment', await ctx.db.select({ id: journalEntries.id, num: journalEntries.entryNumber }).from(journalEntries).where(inArray(journalEntries.id, ids)));
-  return out;
+  return { numbers: out, labels };
 }
 
 export interface SerialLotTransactionRow {
@@ -457,7 +488,7 @@ export async function transactionsBySerialLot(
     .orderBy(asc(inventoryMovements.date), asc(inventoryMovements.createdAt))
     .limit(5000);
 
-  const numbers = await sourceNumbers(ctx, rows.map((r) => ({ type: r.m.sourceType, id: r.m.sourceId })));
+  const { numbers, labels } = await sourceNumbers(ctx, rows.map((r) => ({ type: r.m.sourceType, id: r.m.sourceId })));
   return {
     rows: rows.map((r) => ({
       movementId: r.m.id,
@@ -471,7 +502,10 @@ export async function transactionsBySerialLot(
       binName: r.binName ?? null,
       quantity: Money.of(r.m.quantity).toFixed(4),
       sourceType: r.m.sourceType,
-      sourceLabel: SOURCE_LABELS[r.m.sourceType] ?? r.m.sourceType,
+      sourceLabel:
+        (r.m.sourceId ? labels.get(`${r.m.sourceType}:${r.m.sourceId}`) : undefined) ??
+        SOURCE_LABELS[r.m.sourceType] ??
+        r.m.sourceType,
       sourceId: r.m.sourceId,
       sourceNumber: r.m.sourceId ? (numbers.get(`${r.m.sourceType}:${r.m.sourceId}`) ?? null) : null,
       reversed: Boolean(r.m.reversedAt),

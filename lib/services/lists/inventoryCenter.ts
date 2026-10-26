@@ -33,7 +33,8 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { type ServiceContext, notFound } from '../_base';
-import { fifoLayerValueSql, stockStatus } from '../inventory';
+import { carriedValueRemainder, fifoLayerValueSql, stockStatus } from '../inventory';
+import { Money } from '@/lib/money';
 
 export interface InventoryCenterRow {
   id: string;
@@ -47,7 +48,10 @@ export interface InventoryCenterRow {
   onPO: string;
   reorderPoint: string | null;
   averageCost: string;
-  /** On-hand value: FIFO layers when the item is FIFO-costed, else quantity × average cost. */
+  /**
+   * On-hand value as the Inventory Valuation Summary shows it: FIFO layers when the item is
+   * FIFO-costed, else quantity × average cost plus the item's value remainder.
+   */
   value: string;
   costing: 'fifo' | 'average';
   salesPrice: string | null;
@@ -87,7 +91,10 @@ export async function inventoryCenterList(
     const qoh = new Decimal(item.quantityOnHand ?? 0);
     const avg = new Decimal(item.averageCost ?? 0);
     const f = fifo.get(item.id);
-    const value = f && Number(f.n) > 0 ? new Decimal(f.value) : qoh.times(avg);
+    // Average cost: the book value plus the value remainder the GL carries for the item (the
+    // cents a 4dp average cannot show), exactly as the Inventory Valuation Summary values it.
+    const value =
+      f && Number(f.n) > 0 ? new Decimal(f.value) : Money.round2(qoh.times(avg)).plus(carriedValueRemainder(item));
     const available = new Decimal(s?.available ?? qoh);
     const onPO = new Decimal(s?.onPO ?? 0);
     const rp = item.reorderPoint != null ? new Decimal(item.reorderPoint) : null;
