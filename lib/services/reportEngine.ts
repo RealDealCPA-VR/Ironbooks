@@ -20,12 +20,14 @@ import { and, asc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import {
   accounts,
+  billLines,
   bills,
   classes,
   companies,
   creditMemos,
   customers,
   employees,
+  expenseLines,
   expenseReports,
   expenses,
   invoices,
@@ -38,6 +40,7 @@ import {
   salesReceipts,
   taxAgencies,
   transfers,
+  vendorCreditLines,
   vendorCredits,
   vendors,
 } from '@/lib/db/schema';
@@ -52,6 +55,7 @@ import { notFiscalCloseEntry } from './reports';
 import { docRef } from './docNumbers';
 import { resolveEntityNames } from './journal';
 import { cashActivityRows, cashBasisLedger } from './cashBasisLedger';
+import { homeAmounts } from './currencies';
 
 // ===========================================================================
 // Sections
@@ -1418,6 +1422,114 @@ export async function fetchGlLines(
     }
   }
   return { lines, truncated };
+}
+
+/** Home amount of each line of the foreign-currency documents in `docs`, as the documents posted. */
+export async function homeAmountsByLine(
+  ctx: ServiceContext,
+  kind: 'bill' | 'expense' | 'vendor_credit',
+  docs: { id: string; rate: string | null }[],
+): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>();
+  const foreign = new Map<string, string>();
+  for (const d of docs) if (d.rate && !Money.eq(d.rate, 1)) foreign.set(d.id, d.rate);
+  const ids = [...foreign.keys()];
+  for (let i = 0; i < ids.length; i += 2000) {
+    const chunk = ids.slice(i, i + 2000);
+    const rows =
+      kind === 'bill'
+        ? await ctx.db
+            .select({ id: billLines.id, docId: billLines.billId, amount: billLines.amount, order: billLines.lineOrder })
+            .from(billLines)
+            .where(inArray(billLines.billId, chunk))
+        : kind === 'expense'
+          ? await ctx.db
+              .select({ id: expenseLines.id, docId: expenseLines.expenseId, amount: expenseLines.amount, order: expenseLines.lineOrder })
+              .from(expenseLines)
+              .where(inArray(expenseLines.expenseId, chunk))
+          : await ctx.db
+              .select({ id: vendorCreditLines.id, docId: vendorCreditLines.vendorCreditId, amount: vendorCreditLines.amount, order: vendorCreditLines.lineOrder })
+              .from(vendorCreditLines)
+              .where(inArray(vendorCreditLines.vendorCreditId, chunk));
+    const byDoc = new Map<string, typeof rows>();
+    for (const r of rows) byDoc.set(r.docId, [...(byDoc.get(r.docId) ?? []), r]);
+    for (const [docId, lines] of byDoc) {
+      lines.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+      // The posting converts the absolute line amounts (a credit-card credit is stored negative).
+      const home = homeAmounts(lines.map((l) => Money.of(l.amount).abs()), foreign.get(docId)!).lines;
+      lines.forEach((l, i) => out.set(l.id, Money.of(l.amount).isNegative() ? home[i].negated() : home[i]));
+    }
+  }
+  return out;
+}
+
+/**
+ * The customer:job each P&L line of a bill, check / credit-card charge or vendor credit is
+ * costed to (QB job costing: the line's Customer:Job column). The posted expense lines carry no
+ * name of their own (only A/R / A/P lines are named), so each one is matched to its document
+ * line — same account, same home amount — and gets that line's customer. Lines that already
+ * carry a customer, and document lines with no customer, are left out. lineId → customerId.
+ */
+export async function costLineCustomers(ctx: ServiceContext, lines: GlLine[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  type Kind = 'bill' | 'expense' | 'vendor_credit';
+  const groups = new Map<string, GlLine[]>();
+  const docs: Record<Kind, Set<string>> = { bill: new Set(), expense: new Set(), vendor_credit: new Set() };
+  for (const l of lines) {
+    if ((l.nameType === 'customer' && l.nameId) || !isPLSection(l.account.section)) continue;
+    const m = /^(bill|expense|vendor_credit):([0-9a-f-]{36})$/i.exec(l.sourceRef ?? '');
+    if (!m) continue;
+    docs[m[1] as Kind].add(m[2]);
+    const k = `${m[1]}:${m[2]}|${l.accountId}`;
+    const g = groups.get(k);
+    if (g) g.push(l);
+    else groups.set(k, [l]);
+  }
+  for (const kind of ['bill', 'expense', 'vendor_credit'] as const) {
+    const ids = [...docs[kind]];
+    for (let i = 0; i < ids.length; i += 2000) {
+      const chunk = ids.slice(i, i + 2000);
+      const rows =
+        kind === 'bill'
+          ? await ctx.db
+              .select({ id: billLines.id, docId: billLines.billId, accountId: billLines.accountId, customerId: billLines.customerId, amount: billLines.amount, rate: bills.exchangeRate })
+              .from(billLines)
+              .innerJoin(bills, eq(billLines.billId, bills.id))
+              .where(and(eq(bills.companyId, ctx.companyId), inArray(billLines.billId, chunk)))
+          : kind === 'expense'
+            ? await ctx.db
+                .select({ id: expenseLines.id, docId: expenseLines.expenseId, accountId: expenseLines.accountId, customerId: expenseLines.customerId, amount: expenseLines.amount, rate: expenses.exchangeRate })
+                .from(expenseLines)
+                .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
+                .where(and(eq(expenses.companyId, ctx.companyId), inArray(expenseLines.expenseId, chunk)))
+            : await ctx.db
+                .select({ id: vendorCreditLines.id, docId: vendorCreditLines.vendorCreditId, accountId: vendorCreditLines.accountId, customerId: vendorCreditLines.customerId, amount: vendorCreditLines.amount, rate: vendorCredits.exchangeRate })
+                .from(vendorCreditLines)
+                .innerJoin(vendorCredits, eq(vendorCreditLines.vendorCreditId, vendorCredits.id))
+                .where(and(eq(vendorCredits.companyId, ctx.companyId), inArray(vendorCreditLines.vendorCreditId, chunk)));
+      if (!rows.some((r) => r.customerId)) continue;
+      const rateOf = new Map(rows.map((r) => [r.docId, r.rate] as const));
+      const home = await homeAmountsByLine(ctx, kind, [...rateOf].map(([id, rate]) => ({ id, rate })));
+      const byDocAccount = new Map<string, { customerId: string | null; amount: Decimal; used: boolean }[]>();
+      for (const r of rows) {
+        const k = `${kind}:${r.docId}|${r.accountId}`;
+        const list = byDocAccount.get(k) ?? [];
+        list.push({ customerId: r.customerId, amount: (home.get(r.id) ?? Money.of(r.amount)).abs(), used: false });
+        byDocAccount.set(k, list);
+      }
+      for (const [k, candidates] of byDocAccount) {
+        if (!candidates.some((c) => c.customerId)) continue;
+        for (const l of groups.get(k) ?? []) {
+          const amount = l.natural.abs();
+          const hit = candidates.find((c) => !c.used && c.amount.equals(amount));
+          if (!hit) continue;
+          hit.used = true;
+          if (hit.customerId) out.set(l.lineId, hit.customerId);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 export interface NameTotal {

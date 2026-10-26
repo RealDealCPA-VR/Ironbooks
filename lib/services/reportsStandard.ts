@@ -39,6 +39,8 @@ import {
   buildAccountTree,
   buildPLRows,
   companyFiscalYearEnd,
+  costLineCustomers,
+  customerNames,
   dayStr,
   detailColumns,
   fetchGlLines,
@@ -333,11 +335,13 @@ export async function profitAndLossByJobReport(ctx: ServiceContext, p: ReportPar
   f.sections = [...PL_SECTIONS];
   f.excludeClose = true;
   const { lines, truncated } = await fetchGlLines(ctx, meta, { ...f, limit: 50000 });
+  const bucketOf = await jobBucketOf(ctx, lines);
+  const custNames = await customerNames(ctx);
   const act = new Map<string, { accountId: string; bucket: string; debit: Decimal; credit: Decimal }>();
   const names = new Map<string, string>();
   for (const l of lines) {
-    const bucket = l.nameType === 'customer' && l.nameId ? l.nameId : '';
-    if (bucket) names.set(bucket, l.name || '(unnamed)');
+    const bucket = bucketOf(l);
+    if (bucket) names.set(bucket, (l.nameType === 'customer' && l.nameId === bucket ? l.name : custNames.get(bucket)?.name) || '(unnamed)');
     const k = `${l.accountId}|${bucket}`;
     const cur = act.get(k) ?? { accountId: l.accountId, bucket, debit: Money.zero(), credit: Money.zero() };
     cur.debit = cur.debit.plus(l.debit);
@@ -376,6 +380,17 @@ export async function profitAndLossByJobReport(ctx: ServiceContext, p: ReportPar
     truncated,
     notes: truncated ? ['Only the first 50,000 lines were included. Choose a shorter date range.'] : undefined,
   };
+}
+
+/**
+ * The P&L by Job column of a ledger line: its customer (income named by the invoice / sales
+ * receipt, or a named line), or — for a cost on a bill, check or vendor credit — the
+ * Customer:Job its document line is costed to (costLineCustomers); '' = "No customer:job".
+ * Shared with the report explanations so a job column explains to exactly its amount.
+ */
+export async function jobBucketOf(ctx: ServiceContext, lines: GlLine[]): Promise<(l: GlLine) => string> {
+  const costed = await costLineCustomers(ctx, lines);
+  return (l) => (l.nameType === 'customer' && l.nameId ? l.nameId : (costed.get(l.lineId) ?? ''));
 }
 
 // ===========================================================================

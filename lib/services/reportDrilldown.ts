@@ -58,7 +58,7 @@ import {
   type PLSection,
   type SectionKey,
 } from './reportEngine';
-import { previousPeriod, shiftMonths, shiftYears } from './reportsStandard';
+import { jobBucketOf, previousPeriod, shiftMonths, shiftYears } from './reportsStandard';
 import { fiscalYearStartFor } from './reports';
 import { openItems, type OpenItem } from './reportsAging';
 import { salesLinesOnBasis } from './reportsLists';
@@ -214,7 +214,7 @@ interface Window {
 }
 
 /** The date windows (and column buckets) a P&L column covers. */
-async function plWindows(i: ResolveInput, filterLines: GlLine[] | null): Promise<Window[]> {
+async function plWindows(i: ResolveInput, filterLines: GlLine[] | null, jobOf?: (l: GlLine) => string): Promise<Window[]> {
   const { ctx, key, column } = i;
   let p = i.p;
   if (key === 'profit-loss-prev-year') p = { ...p, compare: p.compare ?? 'prev_year' };
@@ -228,13 +228,14 @@ async function plWindows(i: ResolveInput, filterLines: GlLine[] | null): Promise
     if (column === 'total') return [whole];
     const m = /^c(\d+)$/.exec(column);
     if (m) {
-      const keys = key === 'pl-by-class' ? await classColumnKeys(i) : jobColumnKeys(filterLines ?? []);
+      const bucket = jobOf ?? ((l: GlLine) => (l.nameType === 'customer' && l.nameId ? l.nameId : ''));
+      const keys = key === 'pl-by-class' ? await classColumnKeys(i) : await jobColumnKeys(i.ctx, filterLines ?? [], bucket);
       const k = keys[Number(m[1])];
       if (k !== undefined) {
         const keep =
           key === 'pl-by-class'
             ? (l: GlLine) => (l.classId ?? '') === k
-            : (l: GlLine) => (l.nameType === 'customer' && l.nameId ? l.nameId : '') === k;
+            : (l: GlLine) => bucket(l) === k;
         return [{ ...whole, keep }];
       }
     }
@@ -268,13 +269,14 @@ async function classColumnKeys(i: ResolveInput): Promise<string[]> {
   return keys;
 }
 
-/** profit-loss-by-job column order: customers:jobs by name, then "No customer:job". */
-function jobColumnKeys(all: GlLine[]): string[] {
+/** profit-loss-by-job column order (as profitAndLossByJobReport): customers:jobs by name, then "No customer:job". */
+async function jobColumnKeys(ctx: ServiceContext, all: GlLine[], bucket: (l: GlLine) => string): Promise<string[]> {
+  const custNames = await customerNames(ctx);
   const names = new Map<string, string>();
   let none = false;
   for (const l of all) {
-    const b = l.nameType === 'customer' && l.nameId ? l.nameId : '';
-    if (b) names.set(b, l.name || '(unnamed)');
+    const b = bucket(l);
+    if (b) names.set(b, (l.nameType === 'customer' && l.nameId === b ? l.name : custNames.get(b)?.name) || '(unnamed)');
     else none = true;
   }
   const keys = [...names.entries()].sort((a, b) => a[1].localeCompare(b[1])).map(([id]) => id);
@@ -299,6 +301,7 @@ const plFamily: Family = {
     const accountIds = [...meta.values()].filter((a) => isPLSection(a.section) && signs(a) !== 0).map((a) => a.id);
     // By Job needs the whole period's lines to rebuild its column order.
     let jobLines: GlLine[] | null = null;
+    let jobOf: ((l: GlLine) => string) | undefined;
     let incomplete = false;
     if (key === 'profit-loss-by-job') {
       const { from, to } = await resolveRange(ctx, p);
@@ -307,9 +310,11 @@ const plFamily: Family = {
       f.excludeClose = true;
       const all = await lines(ctx, meta, cap, f);
       jobLines = all.lines;
+      // The same column of each line the report used (costs on their document line's job).
+      jobOf = await jobBucketOf(ctx, all.lines);
       incomplete = all.truncated; // the column order itself may be off
     }
-    const windows = await plWindows(i, jobLines);
+    const windows = await plWindows(i, jobLines, jobOf);
     const items: DrillItem[] = [];
     for (const w of windows) {
       const got = await lines(ctx, meta, cap, { from: w.from, to: w.to, classId, excludeClose: true, basis, accountIds });

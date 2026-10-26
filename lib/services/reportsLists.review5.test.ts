@@ -203,3 +203,41 @@ describe('Unpaid Bills Detail', () => {
     expect(bill?.cells.num).toBe('L-1');
   });
 });
+
+describe('Profit & Loss by Job', () => {
+  it('costs billed to a customer:job (bill / check lines) sit in that job column, and explain to it', async () => {
+    const { drilldownCell } = await import('./reportDrilldown');
+    const job = (await createCustomer(ctx, { displayName: 'Kitchen Job' } as never)).id;
+    await createBill(ctx, {
+      vendorId: S.local,
+      billNumber: 'JOB-1',
+      date: d('2026-04-01'),
+      lines: [
+        { accountId: A['6300'], amount: '70.00', customerId: job },
+        { accountId: A['6300'], amount: '30.00' },
+      ],
+    } as never);
+    await createExpense(ctx, {
+      vendorId: S.local,
+      date: d('2026-04-02'),
+      method: 'check',
+      paymentAccountId: A['1000'],
+      lines: [{ accountId: A['6400'], amount: '25.00', customerId: job }],
+    });
+    const params = { from: '2026-04-01', to: '2026-04-30' };
+    const r = await runStandardReport(ctx, 'profit-loss-by-job', params);
+    const col = r.columns.find((c) => c.header === 'Kitchen Job');
+    expect(col, JSON.stringify(r.columns)).toBeTruthy();
+    const none = r.columns.find((c) => c.header === 'No customer:job')!;
+    const supplies = r.rows.find((x) => x.id.endsWith(`:a:${A['6300']}`))!;
+    expect(supplies.cells[col!.key]).toBe('70.00');
+    expect(supplies.cells[none.key]).toBe('30.00');
+    const rent = r.rows.find((x) => x.id.endsWith(`:a:${A['6400']}`))!;
+    expect(rent.cells[col!.key]).toBe('25.00');
+    const x = await drilldownCell(ctx, 'profit-loss-by-job', params, supplies.id, col!.key);
+    expect(x.total).toBe('70.00');
+    expect(x.ties).toBe(true);
+    const net = await drilldownCell(ctx, 'profit-loss-by-job', params, 'pl:net', col!.key);
+    expect(net.ties).toBe(true);
+  });
+});

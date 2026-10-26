@@ -55,6 +55,7 @@ import {
   fetchGlLines,
   fmtDay,
   glFilterFromParams,
+  homeAmountsByLine,
   isPLSection,
   layoutDetail,
   ledgerTotalsByName,
@@ -72,7 +73,6 @@ import {
 import { rangeLabel } from './reportsStandard';
 import { docRef } from './docNumbers';
 import { foreignAmountsByEntry } from './fxSubledger';
-import { homeAmounts } from './currencies';
 
 const amt = (v: Decimal) => toAmountString(v);
 
@@ -1432,45 +1432,6 @@ export interface PurchaseLine {
   memo: string;
   qty: Decimal;
   amount: Decimal;
-}
-
-/** Home amount of each line of the foreign-currency documents in `docs`, as the documents posted. */
-async function homeAmountsByLine(
-  ctx: ServiceContext,
-  kind: 'bill' | 'expense' | 'vendor_credit',
-  docs: { id: string; rate: string | null }[],
-): Promise<Map<string, Decimal>> {
-  const out = new Map<string, Decimal>();
-  const foreign = new Map<string, string>();
-  for (const d of docs) if (d.rate && !Money.eq(d.rate, 1)) foreign.set(d.id, d.rate);
-  const ids = [...foreign.keys()];
-  for (let i = 0; i < ids.length; i += 2000) {
-    const chunk = ids.slice(i, i + 2000);
-    const rows =
-      kind === 'bill'
-        ? await ctx.db
-            .select({ id: billLines.id, docId: billLines.billId, amount: billLines.amount, order: billLines.lineOrder })
-            .from(billLines)
-            .where(inArray(billLines.billId, chunk))
-        : kind === 'expense'
-          ? await ctx.db
-              .select({ id: expenseLines.id, docId: expenseLines.expenseId, amount: expenseLines.amount, order: expenseLines.lineOrder })
-              .from(expenseLines)
-              .where(inArray(expenseLines.expenseId, chunk))
-          : await ctx.db
-              .select({ id: vendorCreditLines.id, docId: vendorCreditLines.vendorCreditId, amount: vendorCreditLines.amount, order: vendorCreditLines.lineOrder })
-              .from(vendorCreditLines)
-              .where(inArray(vendorCreditLines.vendorCreditId, chunk));
-    const byDoc = new Map<string, typeof rows>();
-    for (const r of rows) byDoc.set(r.docId, [...(byDoc.get(r.docId) ?? []), r]);
-    for (const [docId, lines] of byDoc) {
-      lines.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
-      // The posting converts the absolute line amounts (a credit-card credit is stored negative).
-      const home = homeAmounts(lines.map((l) => Money.of(l.amount).abs()), foreign.get(docId)!).lines;
-      lines.forEach((l, i) => out.set(l.id, Money.of(l.amount).isNegative() ? home[i].negated() : home[i]));
-    }
-  }
-  return out;
 }
 
 /** Item purchases in [from, to] (void documents excluded), optionally for one item / vendor. */
