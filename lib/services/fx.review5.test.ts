@@ -248,6 +248,26 @@ describe('review5 fx', () => {
     expect(Money.of(fx[0].balance).toFixed(2)).toBe('10.00'); // USD 10 loss
   });
 
+  it('a reversed Home Currency Adjustment is not left behind as General Journal items to pay, apply or age', async () => {
+    const { listJournalOpenItems } = await import('./journalApplications');
+    const c = await createCustomer(ctx, { displayName: `EUR revalued ${seq}` } as never);
+    await createInvoice(ctx, { customerId: c.id, date: d('2026-03-01'), dueDate: d('2026-03-31'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['4000'], quantity: 1, rate: '1000.00' }] } as never);
+    await createHomeCurrencyAdjustment(ctx, { date: midnight('2026-03-31'), rates: { EUR: '1.25' } });
+    // On the adjustment's own day A/R carries the revaluation: the aging includes it.
+    expect(Money.of((await arAging(ctx, midnight('2026-03-31'))).totals.total).toFixed(2)).toBe('1250.00');
+    // From the reversal on, the adjustment and its reversal are one closed pair: nothing to pay or
+    // apply in Receive Payments, and no +50 / -50 split across aging buckets.
+    const open = await listJournalOpenItems(ctx, 'ar', c.id);
+    expect(open.charges).toHaveLength(0);
+    expect(open.credits).toHaveLength(0);
+    const may = await arAging(ctx, midnight('2026-05-01'));
+    const row = may.rows.find((r) => r.id === c.id)!;
+    // Due 3/31: 31 days past due on 5/1. (The +50 dated 3/31 and the -50 dated 4/1 used to land in
+    // 31-60 and 1-30.)
+    expect(Money.of(row.days31_60).toFixed(2)).toBe('1200.00');
+    expect(Money.of(row.days1_30).toFixed(2)).toBe('0.00');
+  });
+
   it('Home Currency Adjustment as of a date revalues everything dated that day (whole as-of day)', async () => {
     const c = await createCustomer(ctx, { displayName: `EUR customer ${seq}` } as never);
     // Dated 3/31 at noon; the adjustment as of 3/31 (date picker: midnight) must include it, as

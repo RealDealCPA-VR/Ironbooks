@@ -1422,17 +1422,42 @@ export async function journalOpenItems(
       entityId: journalEntryLines.entityId,
       debit: journalEntryLines.debit,
       credit: journalEntryLines.credit,
+      sourceRef: journalEntries.sourceRef,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
     .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
     .where(and(...conds))
     .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
-  const named = rows.filter((r) => r.entityId);
   const appliedByLine = await journalAppliedByLine(ctx, side, {
     asOf,
-    lineIds: opts.entityId ? named.map((r) => r.lineId) : undefined,
+    lineIds: opts.entityId ? rows.filter((r) => r.entityId).map((r) => r.lineId) : undefined,
   });
+  // review5 fx: a Home Currency Adjustment's named A/R / A/P lines and their next-day reversal
+  // are one closed pair once the reversal is in range: they are not General Journal charges to
+  // pay, credits to apply or items to age (they showed as +X / -X forever). Before the reversal
+  // date the adjustment line stays an open item, so the aging still ties to A/R that day.
+  const hcaKey = (r: (typeof rows)[number]) => {
+    const m = /^hca(-reversal)?:(.+)$/.exec(r.sourceRef ?? '');
+    return m ? `${m[2]}|${r.entityId}|${r.accountId}` : null;
+  };
+  const hcaPairs = new Map<string, { net: ReturnType<typeof Money.zero>; adj: boolean; rev: boolean; applied: boolean }>();
+  for (const r of rows) {
+    const k = hcaKey(r);
+    if (!k || !r.entityId) continue;
+    const p = hcaPairs.get(k) ?? { net: Money.zero(), adj: false, rev: false, applied: false };
+    p.net = p.net.plus(Money.of(r.debit)).minus(Money.of(r.credit));
+    if ((r.sourceRef ?? '').startsWith('hca-reversal:')) p.rev = true;
+    else p.adj = true;
+    if ((appliedByLine.get(r.lineId) ?? Money.zero()).greaterThan(0)) p.applied = true;
+    hcaPairs.set(k, p);
+  }
+  const closedHca = (r: (typeof rows)[number]) => {
+    const k = hcaKey(r);
+    const p = k ? hcaPairs.get(k) : undefined;
+    return !!p && p.adj && p.rev && !p.applied && p.net.isZero();
+  };
+  const named = rows.filter((r) => r.entityId && !closedHca(r));
   const out: JournalOpenItem[] = [];
   for (const r of named) {
     const dr = Money.of(r.debit);
