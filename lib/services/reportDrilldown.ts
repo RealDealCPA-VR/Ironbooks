@@ -426,7 +426,11 @@ const bsFamily: Family = {
       items.push(
         ...itemsFrom(got.lines, (l) => {
           if (isPL(l.account)) {
-            const wanted = l.date < fyStart ? sel.priorPL : sel.currentPL;
+            // A year-end closing entry is dated on the closed year's last day, but the balance
+            // sheet keeps that year's Net Income and books the close in prior years' earnings
+            // (reports.ts balanceSheet): it belongs to Retained Earnings, never to Net Income.
+            const closing = !!l.sourceRef?.startsWith('fiscal-close:');
+            const wanted = l.date < fyStart || closing ? sel.priorPL : sel.currentPL;
             // Earnings are credits − debits (they raise equity).
             return wanted ? l.credit.minus(l.debit).times(w.mult) : null;
           }
@@ -620,8 +624,10 @@ function salesFamily(by: 'customer' | 'item'): Family {
       const f: Record<string, string> = {
         pct: 'This item’s sales divided by total sales',
         avgPrice: 'Average price: the amount divided by the quantity sold',
-        cogs: 'Cost of goods sold: the quantity sold times the item’s average cost',
-        avgCogs: 'Average cost: COGS divided by the quantity sold',
+        // The report uses the COGS each sale posted (reportsLists.ts postedCogsBySalesLine), never
+        // today's average cost.
+        cogs: 'Cost of goods sold: the cost each sale took out of inventory when the sale was recorded',
+        avgCogs: 'Average COGS: COGS divided by the quantity sold',
         margin: 'Gross margin: the amount minus COGS',
         marginPct: 'Gross margin divided by the amount',
       };
