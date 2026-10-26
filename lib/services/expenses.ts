@@ -163,6 +163,8 @@ interface PreparedExpense {
   currency: string | null;
   rate: Decimal;
   lines: ResolvedExpenseLine[];
+  /** review5 fx: line accounts in the document's own foreign currency (exact foreign amount). */
+  sameCurrencyLineAccounts?: Set<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +408,10 @@ async function prepareExpense(
     lines.map((l) => Money.of(l.amount).abs()),
     fx.rate,
   );
+  // review5 fx: lines on a bank / card account in the document's own currency (a check from a CAD
+  // bank paying the CAD card) keep their typed amount as that account's amount — converting the
+  // home share back at the rate can be a cent off (CAD 100.02 at 0.73 = USD 73.01 = CAD 100.01).
+  const sameCurrencyLineAccounts = new Set<string>();
   if (fx.currency) {
     lines.forEach((l, i) => {
       if (!home.lines[i].greaterThan(0)) {
@@ -414,6 +420,13 @@ async function prepareExpense(
       l.homeAmount = toAmountString(home.lines[i]);
       if (l.isInventory) l.unitCostHome = home.lines[i].dividedBy(Money.of(l.quantity!));
     });
+    const lineAccountIds = [...new Set(lines.map((l) => l.accountId))];
+    for (const a of await ctx.db
+      .select({ id: accounts.id, currency: accounts.currency })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, lineAccountIds)))) {
+      if ((a.currency ?? '').trim().toUpperCase() === fx.currency) sameCurrencyLineAccounts.add(a.id);
+    }
   }
 
   return {
@@ -425,6 +438,7 @@ async function prepareExpense(
     currency: fx.currency,
     rate: fx.rate,
     lines,
+    sameCurrencyLineAccounts,
   };
 }
 
@@ -436,6 +450,9 @@ function buildGlLines(prep: PreparedExpense, method: ExpenseMethod, paymentAccou
     memo: l.description,
     classId: l.classId,
     ...(l.entity ?? {}),
+    ...(prep.currency && prep.sameCurrencyLineAccounts?.has(l.accountId)
+      ? { foreignAmount: toAmountString(Money.of(l.amount).abs()) }
+      : {}),
   }));
   gl.push({
     accountId: paymentAccountId,

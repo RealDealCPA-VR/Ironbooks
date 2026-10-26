@@ -13,7 +13,7 @@
  * IMPORTANT: GL writes happen ONLY through `postJournalEntry` (posting.ts).
  * All money arithmetic uses '@/lib/money'.
  */
-import { and, desc, eq, gte, isNotNull, lte, ne } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, lte, ne } from 'drizzle-orm';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -237,15 +237,34 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
     throw validation('Choose an account.');
   }
   if (input.classId) await assertRefInCompany(ctx, classes, input.classId, 'Class');
-  const offsets: { accountId: string; classId: string | null; amount: string }[] = splits
+  // review5 fx: the feed amount split the same way in the account's currency, for offsets on an
+  // account in that same currency (a CAD bank line paying the CAD card) — converting the home share
+  // back at the rate can be a cent off.
+  const foreignShares = fx ? (splits ? allocate(absAmt, splits.map((sp) => sp.percent)) : [Money.of(absAmt)]) : [];
+  const offsets: { accountId: string; classId: string | null; amount: string; foreign?: string }[] = splits
     ? allocate(homeAmt, splits.map((sp) => sp.percent))
         .map((a, i) => ({
           accountId: splits[i].accountId,
           classId: splits[i].classId ?? input.classId ?? null,
           amount: toAmountString(a),
+          ...(fx ? { foreign: toAmountString(foreignShares[i]) } : {}),
         }))
         .filter((o) => Money.gt(o.amount, 0))
-    : [{ accountId: input.accountId, classId: input.classId ?? null, amount: homeAmt }];
+    : [{ accountId: input.accountId, classId: input.classId ?? null, amount: homeAmt, ...(fx ? { foreign: absAmt } : {}) }];
+  if (fx) {
+    const sameCur = new Set(
+      (
+        await ctx.db
+          .select({ id: accounts.id, currency: accounts.currency })
+          .from(accounts)
+          .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, [...new Set(offsets.map((o) => o.accountId))])))
+      )
+        .filter((a) => (a.currency ?? '').trim().toUpperCase() === fx.currency)
+        .map((a) => a.id),
+    );
+    for (const o of offsets) if (!sameCur.has(o.accountId)) delete o.foreign;
+  }
+  const offsetFx = (o: { foreign?: string }) => (o.foreign != null ? { foreignAmount: o.foreign } : {});
   const mainAccountId = splits
     ? [...offsets].sort((a, b) => (Money.gt(b.amount, a.amount) ? 1 : Money.gt(a.amount, b.amount) ? -1 : 0))[0].accountId
     : input.accountId;
@@ -258,10 +277,10 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
     amt.greaterThan(0)
       ? [
           { accountId: bankGlAccountId, debit: homeAmt, memo, ...bankFx },
-          ...offsets.map((o) => ({ accountId: o.accountId, credit: o.amount, memo, classId: o.classId })),
+          ...offsets.map((o) => ({ accountId: o.accountId, credit: o.amount, memo, classId: o.classId, ...offsetFx(o) })),
         ]
       : [
-          ...offsets.map((o) => ({ accountId: o.accountId, debit: o.amount, memo, classId: o.classId })),
+          ...offsets.map((o) => ({ accountId: o.accountId, debit: o.amount, memo, classId: o.classId, ...offsetFx(o) })),
           { accountId: bankGlAccountId, credit: homeAmt, memo, ...bankFx },
         ];
 

@@ -328,6 +328,56 @@ describe('review5 fx', () => {
     await expect(mergeVendors(ctx, { fromId: eur2.id, toId: eur.id })).resolves.toBeTruthy();
   });
 
+  it('a check from a foreign bank paying a card in the same currency moves the card by the exact amount (no round trip)', async () => {
+    const { createExpense } = await import('./expenses');
+    await upsertCurrency(ctx, { code: 'CAD', name: 'Canadian Dollar', rateToBase: '0.73' });
+    acct['1040'] = (await createAccount(ctx, { code: '1040', name: 'CAD Bank', type: 'asset' as never, subtype: 'checking' })).id;
+    acct['2160'] = (await createAccount(ctx, { code: '2160', name: 'CAD Card', type: 'liability' as never, subtype: 'credit_card' })).id;
+    await setAccountCurrency(ctx, acct['1040'], 'CAD');
+    await setAccountCurrency(ctx, acct['2160'], 'CAD');
+    // CAD 100.02 at 0.73 = USD 73.01; converting back gives CAD 100.01.
+    await createExpense(ctx, { payeeName: 'Card Co', date: d('2026-03-10'), method: 'check', paymentAccountId: acct['1040'], currency: 'CAD', exchangeRate: '0.73', lines: [{ accountId: acct['2160'], amount: '100.02' }] } as never);
+    expect(await foreignBalance(acct['2160'])).toBe('-100.02');
+    expect(await foreignBalance(acct['1040'])).toBe('-100.02');
+    // The same payment downloaded on the CAD bank's feed and added against the CAD card.
+    const { categorize } = await import('./bankCategorize');
+    const { bankTransactions } = await import('@/lib/db/schema');
+    const ba = await createBankAccount(ctx, { accountId: acct['1040'], bankName: 'CAD Bank', accountNumber: '7788' } as never);
+    const [feed] = await db
+      .insert(bankTransactions)
+      .values({ companyId: ctx.companyId, bankAccountId: ba.id, date: d('2026-03-11'), description: 'CARD PAYMENT', amount: '-100.02', matched: false })
+      .returning();
+    await categorize(ctx, { bankTransactionId: feed.id, accountId: acct['2160'], exchangeRate: '0.73' });
+    expect(await foreignBalance(acct['2160'])).toBe('-200.04');
+    expect(await foreignBalance(acct['1040'])).toBe('-200.04');
+  });
+
+  it('a register entry is refused when the document would be written on an account in another currency', async () => {
+    const { enterRegisterTransaction } = await import('./registerEntry');
+    acct['2150'] = (await createAccount(ctx, { code: '2150', name: 'Euro Card', type: 'asset' as never, subtype: 'checking' })).id;
+    await db.update(accounts).set({ type: 'liability' as never, subtype: 'credit_card' as never }).where(eq(accounts.id, acct['2150']));
+    await setAccountCurrency(ctx, acct['2150'], 'EUR');
+    const v = await eurVendor('Register EUR');
+    // EUR 100 typed in the Euro Card register (paid down from home Checking) would be a USD 100 check.
+    await expect(
+      enterRegisterTransaction(ctx, acct['2150'], { date: d('2026-03-10'), payee: v.displayName, otherAccountId: acct['1000'], side: 'decrease', amount: '100.00' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    // 100 typed in the (home) expense register against the Euro Bank would be a EUR 100 check.
+    await expect(
+      enterRegisterTransaction(ctx, acct['6000'], { date: d('2026-03-10'), payee: v.displayName, otherAccountId: acct['1020'], side: 'increase', amount: '100.00' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    // 100 typed in the (home) income register against the Euro Bank would be a EUR 100 deposit.
+    await expect(
+      enterRegisterTransaction(ctx, acct['4000'], { date: d('2026-03-10'), payee: 'Sale', otherAccountId: acct['1020'], side: 'increase', amount: '100.00' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    const lines = await db.select({ id: journalEntryLines.id }).from(journalEntryLines).where(eq(journalEntryLines.accountId, acct['1020']));
+    expect(lines).toHaveLength(0);
+    // In the Euro Bank's own register the amount is in EUR: a EUR 100 check at the list rate.
+    const ok = await enterRegisterTransaction(ctx, acct['1020'], { date: d('2026-03-10'), payee: v.displayName, otherAccountId: acct['6000'], side: 'decrease', amount: '100.00' });
+    expect(ok.kind).toBe('check');
+    expect(await foreignBalance(acct['1020'])).toBe('-100.00');
+  });
+
   it('home-currency documents refuse a foreign-currency bank (sales receipt, credit memo refund, payment refund)', async () => {
     const { createSalesReceipt } = await import('./salesReceipts');
     const { createCreditMemo, refundCreditMemo } = await import('./creditMemos');
