@@ -600,8 +600,16 @@ export async function runDueSchedules(
         fs.writeFileSync(file, ok.length === 1 ? buildXlsx({ sheetName: ok[0].report!.title.slice(0, 28), title: ok[0].report!.title, subtitle: ok[0].report!.subtitle, ...reportToTable(ok[0].report!) }) : reportsToWorkbook(ok.map((p) => p.report!)));
         files.push(file);
       } else {
+        // One file per report, never two with the same name: reports named alike (or alike once
+        // made file-safe — "A/R" and "A:R") overwrote each other's export. Windows names are
+        // case-insensitive.
+        const used = new Set<string>();
         for (const p of ok) {
-          const file = path.join(dir, `${safeSegment(p.name, 'Report')} ${stamp}.csv`);
+          const base = `${safeSegment(p.name, 'Report')} ${stamp}`;
+          let name = base;
+          for (let i = 2; used.has(name.toLowerCase()); i++) name = `${base} (${i})`;
+          used.add(name.toLowerCase());
+          const file = path.join(dir, `${name}.csv`);
           fs.writeFileSync(file, '﻿' + reportToCsv(p.report!), 'utf8');
           files.push(file);
         }
