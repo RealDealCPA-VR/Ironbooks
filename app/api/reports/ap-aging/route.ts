@@ -11,19 +11,14 @@ import { getServerContext } from '@/lib/context';
 import { apAging } from '@/lib/services/reportsExtra';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateParam } from '../_lib';
 
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
 
-    const asOfParam = req.nextUrl.searchParams.get('asOf');
-    let asOf: Date | undefined;
-    if (asOfParam) {
-      asOf = new Date(asOfParam);
-      if (isNaN(asOf.getTime())) {
-        return NextResponse.json({ error: 'Invalid asOf date.' }, { status: 400 });
-      }
-    }
+    // Strict: a day that does not exist (2026-02-30) is a 400, never rolled over to March.
+    const asOf = parseDateParam(req.nextUrl.searchParams.get('asOf'), 'asOf');
 
     const report = await apAging(ctx, asOf);
     return NextResponse.json(report);

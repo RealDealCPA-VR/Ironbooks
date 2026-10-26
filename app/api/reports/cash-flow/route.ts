@@ -12,6 +12,7 @@
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { parseDateInput } from '@/lib/validation/helpers';
 import { cashFlow } from '@/lib/services/reportsExtra';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
@@ -27,14 +28,14 @@ export async function GET(req: NextRequest) {
     let to: Date | undefined;
 
     if (fromParam) {
-      from = new Date(fromParam);
-      if (isNaN(from.getTime())) {
+      from = parseDateInput(fromParam) ?? undefined; // a real calendar day (2026-02-30 is refused)
+      if (!from) {
         return NextResponse.json({ error: 'Invalid from date.' }, { status: 400 });
       }
     }
     if (toParam) {
-      to = new Date(toParam);
-      if (isNaN(to.getTime())) {
+      to = parseDateInput(toParam) ?? undefined; // a real calendar day (2026-02-30 is refused)
+      if (!to) {
         return NextResponse.json({ error: 'Invalid to date.' }, { status: 400 });
       }
     }

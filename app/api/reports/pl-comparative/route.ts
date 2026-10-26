@@ -11,6 +11,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { parseDateInput } from '@/lib/validation/helpers';
 import { ServiceError } from '@/lib/services/_base';
 import { profitAndLossComparative } from '@/lib/services/reportsComparative';
 import { serviceErrorStatus } from '@/lib/routeErrors';
@@ -43,12 +44,13 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const from      = new Date(fromStr);
-    const to        = new Date(toStr);
-    const priorFrom = new Date(priorFromStr);
-    const priorTo   = new Date(priorToStr);
+    // Real calendar days only: new Date('2026-02-30') silently rolled over to March 2.
+    const from      = parseDateInput(fromStr);
+    const to        = parseDateInput(toStr);
+    const priorFrom = parseDateInput(priorFromStr);
+    const priorTo   = parseDateInput(priorToStr);
 
-    if ([from, to, priorFrom, priorTo].some((d) => isNaN(d.getTime()))) {
+    if (!from || !to || !priorFrom || !priorTo) {
       return NextResponse.json(
         { error: 'One or more date params are not valid ISO date strings.' },
         { status: 400 },
