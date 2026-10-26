@@ -8,7 +8,8 @@
 -- by the ledger health check / Verify Data nor repaired when the file was opened. Same rule and
 -- message (BK002 -> CONFLICT); only the name, the enable mode and the maintenance change.
 --
--- Plus an index for audit-trail lookups by record (see the end of the file).
+-- Plus indexes for audit-trail lookups by record and for journal entry numbers and dates (see the
+-- end of the file).
 DROP TRIGGER IF EXISTS "bk_journal_item_applications_void_guard" ON "journal_entries";
 --> statement-breakpoint
 DROP FUNCTION IF EXISTS bk_guard_journal_item_applications();
@@ -42,3 +43,11 @@ ALTER TABLE journal_entries ENABLE ALWAYS TRIGGER bka_jia_void_guard;
 -- entity type (+ id). The only index was (company_id, created_at), so each one read the
 -- company's whole, ever-growing audit trail.
 CREATE INDEX IF NOT EXISTS "audit_logs_entity_idx" ON "audit_logs" ("company_id", "entity_type", "entity_id", "created_at");
+--> statement-breakpoint
+-- Every posting takes the next entry number with MAX(entry_number) per company (posting.ts
+-- nextEntryNumber), and the journal window / registers list entries by date. With only
+-- (company_id, status) both read the company's whole journal, on every posting — a QuickBooks
+-- conversion of a large file posts tens of thousands of entries, so it slowed down quadratically.
+CREATE INDEX IF NOT EXISTS "je_company_entry_number_idx" ON "journal_entries" ("company_id", "entry_number");
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "je_company_date_idx" ON "journal_entries" ("company_id", "date", "entry_number");
