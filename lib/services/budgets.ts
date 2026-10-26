@@ -13,7 +13,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { profitAndLoss } from '@/lib/services/reports';
 import { fiscalYearWindow } from './fiscalClose';
 import type { ServiceContext } from './_base';
-import { notFound, validation, writeAudit } from './_base';
+import { inTransaction, notFound, validation, writeAudit } from './_base';
 import type Decimal from 'decimal.js';
 import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
 import type { ReportParams } from '@/lib/validation/reports';
@@ -158,19 +158,22 @@ export async function createBudget(
     throw validation('fiscalYear must be a 4-digit year between 2000 and 2100');
   }
 
-  const [row] = await ctx.db
-    .insert(budgets)
-    .values({ companyId: ctx.companyId, name: name.trim(), fiscalYear, kind, isForecast: input.isForecast ?? false })
-    .returning();
+  // One transaction: a refused audit (view-only role, Accountant's Copy) leaves no budget behind.
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .insert(budgets)
+      .values({ companyId: tx.companyId, name: name.trim(), fiscalYear, kind, isForecast: input.isForecast ?? false })
+      .returning();
 
-  await writeAudit(ctx, {
-    action: 'create',
-    entityType: input.isForecast ? 'forecast' : 'budget',
-    entityId: row.id,
-    newValues: { name: row.name, fiscalYear: row.fiscalYear, kind, isForecast: row.isForecast },
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: input.isForecast ? 'forecast' : 'budget',
+      entityId: row.id,
+      newValues: { name: row.name, fiscalYear: row.fiscalYear, kind, isForecast: row.isForecast },
+    });
+
+    return row;
   });
-
-  return row;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +212,16 @@ export async function setBudgetLine(
     customerId?: string | null;
     classId?: string | null;
   },
+): Promise<BudgetLine> {
+  // One transaction for the whole read-modify-write: two saves of the same cell at once (double
+  // submit, two people) serialize instead of both inserting a line (which doubled the budget in
+  // Budget vs. Actual), and a refused audit leaves no line behind.
+  return inTransaction(ctx, (tx) => setBudgetLineInTx(tx, input));
+}
+
+async function setBudgetLineInTx(
+  ctx: ServiceContext,
+  input: Parameters<typeof setBudgetLine>[1],
 ): Promise<BudgetLine> {
   const { budgetId, accountId, month, amount } = input;
   const customerId = input.customerId ?? null;
