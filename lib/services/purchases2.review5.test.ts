@@ -348,6 +348,52 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect(full).toContain('<TaxId>123-45-6789</TaxId>');
   });
 
+  it('G: a price variance capitalized into FIFO layers by a bill for received items moves inventory GL and valuation alike', async () => {
+    const { createItemReceipt } = await import('./itemReceipts');
+    const { enterBillForReceivedItems } = await import('./receiving');
+    const v = await newVendor();
+    const x = await fifoItem('Rivets');
+    const receipt = await createItemReceipt(ctx, {
+      vendorId: v.id,
+      date: d('2026-09-01'),
+      lines: [{ itemId: x.item.id, quantity: 3000, unitCost: '1.00' }],
+    });
+    expect(await layerValue(x.item.id)).toBe(await glBalance(x.invAcct));
+    // The vendor bills 3001.00 (1.000333 each): 1.00 of price variance on stock still on hand.
+    const bill = await enterBillForReceivedItems(ctx, {
+      vendorId: v.id,
+      date: d('2026-09-05'),
+      lines: [{ receiptLineId: receipt.lines[0].id, quantity: 3000, unitCost: '1.000333' }],
+    });
+    expect(bill.total).toBe('3001.00');
+    expect(await layerValue(x.item.id)).toBe(await glBalance(x.invAcct));
+    // Partly billed line (split layer) too.
+    const y = await fifoItem('Pins');
+    const r2 = await createItemReceipt(ctx, {
+      vendorId: v.id,
+      date: d('2026-09-01'),
+      lines: [{ itemId: y.item.id, quantity: 7000, unitCost: '0.50' }],
+    });
+    await enterBillForReceivedItems(ctx, {
+      vendorId: v.id,
+      date: d('2026-09-05'),
+      lines: [{ receiptLineId: r2.lines[0].id, quantity: 3000, unitCost: '0.500333' }],
+    });
+    expect(await layerValue(y.item.id)).toBe(await glBalance(y.invAcct));
+    // The re-costed units are still the receipt's: landed cost onto it capitalizes freight on all
+    // 7000 units on hand (nothing to COGS as "already sold").
+    const { allocateLandedCost } = await import('./landedCost');
+    const freightAcct = (await createAccount(ctx, { code: '6060', name: 'Freight In G', type: 'expense' as never, subtype: 'operating_expenses' })).id;
+    const freight = await createBill(ctx, { vendorId: v.id, date: d('2026-09-06'), lines: [{ accountId: freightAcct, amount: '70.00' }] });
+    const [fl] = await db.query.billLines.findMany({ where: (bl, { eq: e }) => e(bl.billId, freight.id) });
+    const alloc = await allocateLandedCost(ctx, { billId: freight.id, billLineId: fl.id, method: 'quantity', itemReceiptIds: [r2.id] });
+    expect(alloc.lines[0].cogsAmount).toBe('0.00');
+    expect(await layerValue(y.item.id)).toBe(await glBalance(y.invAcct));
+    // Voiding the bill puts layers and GL back together.
+    await voidBill(ctx, bill.id);
+    expect(await layerValue(x.item.id)).toBe(await glBalance(x.invAcct));
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
