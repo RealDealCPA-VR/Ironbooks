@@ -141,5 +141,12 @@ describe('inventory routes: bad input answers 400, never 500', () => {
     expect400(await call(pendingPOST as Handler, 'POST', '/api/assemblies/pending', { assemblyItemId: kit, quantity: 'one', date: '2026-02-01' }));
     expect400(await call(buildPOST as Handler, 'POST', '/api/assemblies/build', { assemblyItemId: kit, quantity: 'one', action: 'build' }));
     expect400(await call(bomPUT as Handler, 'PUT', '/api/assemblies', { assemblyItemId: kit, components: [{ componentItemId: avgItem, quantity: 'two' }] }));
+    expect400(await call(bomPUT as Handler, 'PUT', '/api/assemblies', { assemblyItemId: kit, components: [null] }));
+    expect400(await call(bomPUT as Handler, 'PUT', '/api/assemblies', { assemblyItemId: kit, components: 'all' }));
+  });
+
+  it('malformed lists inside the body (null rows) answer 400', async () => {
+    expect400(await call(batchCountPOST as Handler, 'POST', '/api/inventory/batch-count', { date: '2026-02-01', counts: [null] }));
+    expect400(await call(batchCountPOST as Handler, 'POST', '/api/inventory/batch-count', { date: '2026-02-01', counts: [{ itemId: 7, countedQty: '1' }] }));
   });
 });

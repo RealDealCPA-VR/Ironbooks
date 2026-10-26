@@ -309,11 +309,14 @@ export async function takeFromLayers(
   itemId: string,
   qty: Decimal,
 ): Promise<{ cost: Decimal; layers: ConsumedLayer[] }> {
+  // Oldest first; layers written in one transaction share created_at (a bill's lines, the unit
+  // insertLayersWorth splits off), so the id settles their order — the same sale always draws
+  // the same units (a re-saved invoice costs the same).
   const layers = await tx.db
     .select()
     .from(inventoryLayers)
     .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, itemId)))
-    .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt));
+    .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt), asc(inventoryLayers.id));
   const available = layers.filter((l) => Money.of(l.quantityRemaining).greaterThan(0));
   const totalAvailable = available.reduce((sum, l) => sum.plus(Money.of(l.quantityRemaining)), Money.zero());
   if (qty.greaterThan(totalAvailable)) {

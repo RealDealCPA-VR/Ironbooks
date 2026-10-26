@@ -706,8 +706,13 @@ export async function batchPhysicalCount(
   ctx: ServiceContext,
   input: { date: Date; counts: BatchCountEntry[] } & AdjustmentDimensions,
 ): Promise<BatchCountResult> {
-  if (!input.counts || input.counts.length === 0) {
+  if (!Array.isArray(input.counts) || input.counts.length === 0) {
     throw validation('counts must contain at least one entry.');
+  }
+  for (const [i, c] of input.counts.entries()) {
+    if (!c || typeof c !== 'object' || typeof c.itemId !== 'string' || !c.itemId) {
+      throw validation(`Count ${i + 1}: an item id and a counted quantity are required.`);
+    }
   }
   // One date for the whole sheet: a bad one fails the batch up front (not every item as "skipped").
   input = { ...input, date: inventoryDate(input.date) };

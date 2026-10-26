@@ -230,6 +230,13 @@ export async function setBom(
   // Validate the assembly item belongs to this company
   await loadItem(ctx, assemblyItemId);
 
+  if (components != null && !Array.isArray(components)) throw validation('components must be a list.');
+  for (const [i, c] of (components ?? []).entries()) {
+    if (!c || typeof c !== 'object' || typeof c.componentItemId !== 'string' || !c.componentItemId) {
+      throw validation(`Component ${i + 1}: choose the component item.`);
+    }
+  }
+
   if (!components || components.length === 0) {
     // Empty BOM — clear it
     return inTransaction(ctx, async (tx) => {
