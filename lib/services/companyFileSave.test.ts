@@ -111,10 +111,12 @@ describe('saving the company file', () => {
     expect(await autosaveTick(t0)).toBe('waiting');
     expect(getCompanyFileSaveStatus().status).toBe('unsaved');
     expect(sessionMod.readState(workDir).unsavedSince).toBeTruthy(); // a crash now would be recovered
-    // (A save that just finished holds the next one back for a moment: 4x its duration.)
-    expect(await autosaveTick(t0 + SAVE_AFTER_QUIET_MS + 20_000)).toBe('saved');
+    // A save that just finished holds the next one back for 4x its (real) duration, and the
+    // previous test's save can take many seconds on a slow CI runner, so jump well past that.
+    const later = t0 + SAVE_AFTER_QUIET_MS + 10 * 60_000;
+    expect(await autosaveTick(later)).toBe('saved');
     expect(await rowsIn(FILE)).toEqual([1, 2]);
-    expect(await autosaveTick(t0 + SAVE_AFTER_QUIET_MS + 60_000)).toBe('idle');
+    expect(await autosaveTick(later + 60_000)).toBe('idle');
   }, 120_000);
 
   it('Save Copy As writes an independent company file', async () => {
