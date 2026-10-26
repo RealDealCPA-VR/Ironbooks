@@ -23,7 +23,7 @@ import { notFound, validation } from './_base';
 import { classes, journalEntries } from '@/lib/db/schema';
 import { and, eq, gte, lte } from 'drizzle-orm';
 import { LedgerIntegrityError, assertBalanceSheetBalanced, assertTrialBalanceBalanced } from './ledgerAssert';
-import { balanceSheet, trialBalance, type BalanceSheet } from './reports';
+import { balanceSheet, fiscalYearStartFor, trialBalance, type BalanceSheet } from './reports';
 import { cashBasisBalanceSheet } from './balanceSheetCashBasis';
 import { cashBasisLedger } from './cashBasisLedger';
 import { cashFlow as cashFlowData } from './reportsExtra';
@@ -75,7 +75,7 @@ import {
 export const rangeLabel = (from: Date, to: Date) => `${fmtDay(from)} – ${fmtDay(to)}`;
 
 /** QB "Report Basis": 'cash' runs the report on the cash basis (cashBasisLedger.ts). */
-type Basis = 'cash' | undefined;
+export type Basis = 'cash' | undefined;
 const basisOf = (p: Pick<ReportParams, 'basis'>): Basis => (p.basis === 'cash' ? 'cash' : undefined);
 const basisSuffix = (b: Basis) => (b === 'cash' ? ' · Cash Basis' : '');
 /** The balance sheet for one as-of date on the report's basis. */
@@ -640,37 +640,78 @@ export async function balanceSheetReport(
 // Trial Balance (with sub-account roll-up)
 // ===========================================================================
 
+/** The account Retained Earnings is reported on (the first equity account of that kind), if any. */
+export function retainedEarningsAccount(meta: Map<string, AccountMeta>): AccountMeta | undefined {
+  return [...meta.values()]
+    .filter((a) => a.section === 'equity' && /retained/.test(a.subtype))
+    .sort((a, b) => a.code.localeCompare(b.code))[0];
+}
+
+/**
+ * Trial balance amounts as QuickBooks shows them, as of a date on either basis: balance-sheet
+ * accounts at their balance; income and expense accounts at their FISCAL-YEAR-TO-DATE amount
+ * (year-end closing entries left out, as on the balance sheet); and the income of every earlier
+ * fiscal year rolled into Retained Earnings (QB closes the books implicitly at each fiscal year
+ * end — the trial balance never shows several years of income on the income accounts). The
+ * Retained Earnings roll-in is booked on the company's retained-earnings account, or returned
+ * separately (`retainedEarnings`) when there is none. Values are debit − credit.
+ */
+export async function trialBalanceAmounts(
+  ctx: ServiceContext,
+  meta: Map<string, AccountMeta>,
+  asOf: Date,
+  basis: Basis,
+): Promise<{ amounts: Map<string, Decimal>; retainedEarnings: Decimal; fyStart: Date; ledgerBalanced: boolean }> {
+  const [tb, sheet] = await Promise.all([trialBalance(ctx, asOf), sheetAsOf(ctx, asOf, basis)]);
+  const fyStart = sheet.fiscalYearStart ? new Date(sheet.fiscalYearStart) : await fiscalYearStartFor(ctx, asOf);
+  const amounts = new Map<string, Decimal>();
+  const add = (id: string, v: Decimal) => amounts.set(id, (amounts.get(id) ?? Money.zero()).plus(v));
+  const isPL = (id: string) => {
+    const a = meta.get(id);
+    return !!a && isPLSection(a.section);
+  };
+  // Balance-sheet accounts: the balance as of the date (closing entries included — they are part
+  // of Retained Earnings), plus the balanced cash-basis adjustments on the cash basis.
+  for (const r of tb.rows) if (!isPL(r.accountId)) add(r.accountId, Money.sub(r.debit, r.credit));
+  if (basis === 'cash') {
+    const { adjustments } = await cashBasisLedger(ctx, { to: asOf });
+    for (const a of adjustments) if (!isPL(a.accountId)) add(a.accountId, a.net);
+  }
+  // Income and expense accounts: this fiscal year only.
+  for (const r of await activityByAccount(ctx, { from: fyStart, to: asOf, excludeClose: true, basis })) {
+    if (isPL(r.accountId)) add(r.accountId, Money.sub(r.debit, r.credit));
+  }
+  // Earlier fiscal years' income (credit = positive earnings → a credit on Retained Earnings).
+  const prior = Money.of(sheet.priorYearsEarnings).negated();
+  const re = retainedEarningsAccount(meta);
+  let retainedEarnings = Money.zero();
+  if (re) add(re.id, prior);
+  else retainedEarnings = prior;
+  for (const [id, v] of amounts) if (v.isZero()) amounts.delete(id);
+  return { amounts, retainedEarnings, fyStart, ledgerBalanced: tb.balanced };
+}
+
 export async function trialBalanceReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
   const meta = await loadAccountMeta(ctx);
   const basis = basisOf(p);
-  const tb = await trialBalance(ctx, asOf);
+  const tbAmounts = await trialBalanceAmounts(ctx, meta, asOf, basis);
   const amounts = new Map<string, Amounts>();
-  for (const r of tb.rows) amounts.set(r.accountId, [Money.sub(r.debit, r.credit)]);
-  let totalDebit = Money.of(tb.totalDebit);
-  let totalCredit = Money.of(tb.totalCredit);
-  if (basis === 'cash') {
-    // Cash basis: layer the balanced cash-basis adjustments (cashBasisLedger.ts) on the ledger.
-    const { adjustments } = await cashBasisLedger(ctx, { to: asOf });
-    for (const a of adjustments) {
-      const v = amounts.get(a.accountId) ?? [Money.zero()];
-      v[0] = v[0].plus(a.net);
-      amounts.set(a.accountId, v);
-    }
-    totalDebit = Money.zero();
-    totalCredit = Money.zero();
-    for (const [id, v] of amounts) {
-      if (v[0].isZero()) amounts.delete(id);
-      else if (v[0].greaterThan(0)) totalDebit = totalDebit.plus(v[0]);
-      else totalCredit = totalCredit.minus(v[0]);
-    }
-    assertTrialBalanceBalanced('Cash-basis trial balance', totalDebit, totalCredit);
+  for (const [id, v] of tbAmounts.amounts) amounts.set(id, [v]);
+  let totalDebit = Money.zero();
+  let totalCredit = Money.zero();
+  for (const v of [...tbAmounts.amounts.values(), tbAmounts.retainedEarnings]) {
+    if (v.greaterThan(0)) totalDebit = totalDebit.plus(v);
+    else totalCredit = totalCredit.minus(v);
   }
+  // Unreachable while the ledger guards hold: the roll-in moves earnings, it never adds any.
+  assertTrialBalanceBalanced(basis === 'cash' ? 'Cash-basis trial balance' : 'Trial balance', totalDebit, totalCredit);
   const cells = (label: string, v: Amounts): Record<string, CellValue> => ({
     label,
     debit: v[0].greaterThan(0) ? toAmountString(v[0]) : null,
     credit: v[0].lessThan(0) ? toAmountString(v[0].negated()) : null,
   });
+  const fyFrom = dayStr(tbAmounts.fyStart);
   const tree = buildAccountTree({
     meta,
     amounts,
@@ -679,8 +720,19 @@ export async function trialBalanceReport(ctx: ServiceContext, p: ReportParams): 
     parentRowId: null,
     depth: 0,
     cells,
-    hrefFor: (a) => stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(asOf), basis }),
+    // QuickZoom: an income / expense account opens this fiscal year's transactions.
+    hrefFor: (a) =>
+      stdHref('transaction-detail-by-account', { accountId: a.id, from: isPLSection(a.section) ? fyFrom : undefined, to: dayStr(asOf), basis }),
   });
+  if (!tbAmounts.retainedEarnings.isZero()) {
+    tree.rows.push({
+      id: 'tb:re',
+      depth: 0,
+      kind: 'data',
+      cells: cells('Retained Earnings', [tbAmounts.retainedEarnings]),
+      href: stdHref('profit-loss', { from: '1900-01-01', to: dayStr(new Date(tbAmounts.fyStart.getTime() - 1)), basis }),
+    });
+  }
   tree.rows.push({
     id: 'tb:total',
     depth: 0,
@@ -697,7 +749,8 @@ export async function trialBalanceReport(ctx: ServiceContext, p: ReportParams): 
       { key: 'credit', header: 'Credit', type: 'money' },
     ],
     rows: tree.rows,
-    balanced: tb.balanced && Money.eq(totalDebit, totalCredit),
+    balanced: tbAmounts.ledgerBalanced && Money.eq(totalDebit, totalCredit),
+    notes: [`Income and expense accounts show this fiscal year (from ${fmtDay(tbAmounts.fyStart)}); earlier years’ net income is in Retained Earnings.`],
   };
 }
 

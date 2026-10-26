@@ -58,7 +58,7 @@ import {
   type PLSection,
   type SectionKey,
 } from './reportEngine';
-import { jobBucketOf, previousPeriod, shiftMonths, shiftYears } from './reportsStandard';
+import { jobBucketOf, previousPeriod, retainedEarningsAccount, shiftMonths, shiftYears } from './reportsStandard';
 import { fiscalYearStartFor } from './reports';
 import { openItems, type OpenItem } from './reportsAging';
 import { salesLinesOnBasis } from './reportsLists';
@@ -451,27 +451,45 @@ const bsFamily: Family = {
 // Trial balance
 // ===========================================================================
 
+/** Row id of the Retained Earnings line a trial balance shows when there is no such account. */
+const TB_RE_ROW = 'tb:re';
+
 const tbFamily: Family = {
   resolve: async ({ ctx, p, row, column, meta, cap }) => {
     if (column !== 'debit' && column !== 'credit') throw validation('That column has no amounts to explain.');
     const asOf = resolveAsOf(p);
     const basis = p.basis === 'cash' ? 'cash' : undefined;
     const sign = column === 'debit' ? 1 : -1;
+    // The trial balance line each ledger line lands on (reportsStandard.ts trialBalanceAmounts):
+    // income and expense of earlier fiscal years — and year-end closing entries — roll into
+    // Retained Earnings; this fiscal year's stay on their own account.
+    const fyStart = await fiscalYearStartFor(ctx, asOf);
+    const re = retainedEarningsAccount(meta);
+    const lineOf = (l: GlLine): string => {
+      if (!isPLSection(l.account.section)) return l.accountId;
+      const prior = l.date < fyStart || !!l.sourceRef?.startsWith('fiscal-close:');
+      return prior ? (re?.id ?? TB_RE_ROW) : l.accountId;
+    };
     if (row.id === 'tb:total') {
       const got = await lines(ctx, meta, cap, { to: asOf, basis });
       const bal = new Map<string, Decimal>();
-      for (const l of got.lines) bal.set(l.accountId, (bal.get(l.accountId) ?? Money.zero()).plus(l.amount));
-      // TOTAL Debit = every account with a debit balance; TOTAL Credit = every credit balance.
+      for (const l of got.lines) bal.set(lineOf(l), (bal.get(lineOf(l)) ?? Money.zero()).plus(l.amount));
+      // TOTAL Debit = every line with a debit balance; TOTAL Credit = every credit balance.
       const keep = (id: string) => {
         const b = bal.get(id) ?? Money.zero();
         return column === 'debit' ? b.greaterThan(0) : b.lessThan(0);
       };
-      return { items: itemsFrom(got.lines, (l) => (keep(l.accountId) ? l.amount.times(sign) : null)), incomplete: got.truncated };
+      return { items: itemsFrom(got.lines, (l) => (keep(lineOf(l)) ? l.amount.times(sign) : null)), incomplete: got.truncated };
     }
-    const members = accountRowMembers(row, meta);
+    const members: Set<string> | null = row.id === TB_RE_ROW ? new Set([TB_RE_ROW]) : accountRowMembers(row, meta);
     if (!members) throw validation('This line has no transactions behind it.');
-    const got = await lines(ctx, meta, cap, { to: asOf, basis, accountIds: [...members] });
-    return { items: itemsFrom(got.lines, (l) => l.amount.times(sign)), incomplete: got.truncated };
+    // Retained Earnings also gathers earlier years' income: read the P&L accounts too.
+    const withPL = members.has(TB_RE_ROW) || (!!re && members.has(re.id));
+    const accountIds = withPL
+      ? [...meta.values()].filter((a) => members.has(a.id) || isPLSection(a.section)).map((a) => a.id)
+      : [...members];
+    const got = await lines(ctx, meta, cap, { to: asOf, basis, accountIds });
+    return { items: itemsFrom(got.lines, (l) => (members.has(lineOf(l)) ? l.amount.times(sign) : null)), incomplete: got.truncated };
   },
 };
 
