@@ -6,6 +6,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
+import { validation } from './_base';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,24 +45,50 @@ export interface ReportResult {
 // Core runner
 // ---------------------------------------------------------------------------
 
+const GROUP_BY: readonly GroupBy[] = ['account', 'type', 'month'];
+const ACCOUNT_TYPES = ['asset', 'liability', 'equity', 'revenue', 'expense'] as const;
+
+/** A builder date ('YYYY-MM-DD' or an ISO timestamp) as a Date; a plain message when it isn't one. */
+function builderDate(v: unknown, label: string): Date {
+  const s = typeof v === 'string' ? v.trim() : '';
+  const day = /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : '';
+  const d = day ? new Date(`${day}T00:00:00.000Z`) : new Date(NaN);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== day) {
+    throw validation(`The "${label}" date is not a valid date (use YYYY-MM-DD).`);
+  }
+  return d;
+}
+
 export async function runReport(
   ctx: ServiceContext,
   config: ReportConfig,
 ): Promise<ReportResult> {
+  // The config comes straight from a request body or a saved memorized report: check its shape
+  // so bad options are a plain validation message, not a crash (an Invalid Date threw a
+  // RangeError, a string accountTypes a TypeError — both HTTP 500).
+  if (!config || typeof config !== 'object') throw validation('Choose the report options.');
+  // A saved config without a grouping ran by month (the last branch below); keep that.
+  if (config.groupBy !== undefined && !GROUP_BY.includes(config.groupBy)) {
+    throw validation(`Group by must be one of: ${GROUP_BY.join(', ')}.`);
+  }
+  if (config.accountTypes !== undefined && config.accountTypes !== null && !Array.isArray(config.accountTypes)) {
+    throw validation('Account types must be a list.');
+  }
   const conds = [
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
   ];
 
-  if (config.from) {
-    const fromDate = new Date(config.from);
+  const fromDate = config.from ? builderDate(config.from, 'From') : undefined;
+  const toDate = config.to ? builderDate(config.to, 'To') : undefined;
+  if (fromDate && toDate && fromDate > toDate) throw validation('The "From" date is after the "To" date.');
+  if (fromDate) {
     conds.push(sql`${journalEntries.date} >= ${fromDate}`);
   }
-  if (config.to) {
+  if (toDate) {
     // Include the whole to-day: the end of that UTC calendar day (stored dates are UTC; a
     // local-time setHours ended the day hours early west of UTC, dropping e.g. the 23:59:59Z
     // year-end closing entry).
-    const toDate = new Date(config.to);
     const toEnd = new Date(
       Date.UTC(toDate.getUTCFullYear(), toDate.getUTCMonth(), toDate.getUTCDate() + 1) - 1,
     );
@@ -69,7 +96,9 @@ export async function runReport(
   }
 
   // Filter by account types if specified
-  const validTypes = config.accountTypes?.filter(Boolean) ?? [];
+  const validTypes = (config.accountTypes ?? []).filter(Boolean);
+  const unknown = validTypes.filter((t) => !(ACCOUNT_TYPES as readonly unknown[]).includes(t));
+  if (unknown.length) throw validation(`Unknown account type: ${String(unknown[0]).slice(0, 40)}.`);
   if (validTypes.length > 0) {
     // Get account ids belonging to those types for this company
     // Cast to the enum literal union that Drizzle expects for this column
