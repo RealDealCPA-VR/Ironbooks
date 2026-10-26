@@ -274,3 +274,18 @@ describe('Job Profitability', () => {
     expect(pl.rows.find((x) => x.id.endsWith(`:a:${A['6300']}`))?.cells[col.key]).toBe('50.00');
   });
 });
+
+/**
+ * Bills & Applied Payments in home currency (round 5, second pass): a foreign bill's rows were in
+ * its own currency and the TOTAL added them to the dollar bills (EUR 350 counted as "350.00"
+ * dollars next to USD bills). Rows now show the home amounts the bill and its payments posted, so
+ * the TOTAL is still the sum of the rows and in one currency.
+ */
+describe('Bills & Applied Payments: foreign bills in home currency', () => {
+  it('EUR 350 at 1.10 is 385.00 on the bill row and in the TOTAL', async () => {
+    const r = await runStandardReport(ctx, 'bills-applied-payments', { ...range, vendorId: S.euro });
+    const bill = r.rows.find((x) => x.cells.type === 'Bill' && x.cells.num === 'E-1');
+    expect(bill?.cells.amount).toBe('385.00');
+    expect(r.rows.find((x) => x.id === 'bap:grand')?.cells.amount).toBe('385.00');
+  });
+});

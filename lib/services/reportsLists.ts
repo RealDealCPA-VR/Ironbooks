@@ -307,6 +307,7 @@ export async function billsAndAppliedPayments(ctx: ServiceContext, p: ReportPara
       total: bills.total,
       credited: bills.amountCredited,
       balanceDue: bills.balanceDue,
+      rate: bills.exchangeRate,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
@@ -322,46 +323,55 @@ export async function billsAndAppliedPayments(ctx: ServiceContext, p: ReportPara
           ref: billPayments.reference,
           method: billPayments.method,
           applied: billPaymentApplications.amountApplied,
+          appliedHome: billPaymentApplications.amountHome,
         })
         .from(billPaymentApplications)
         .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
         .where(and(inArray(billPaymentApplications.billId, ids), isNull(billPayments.voidedAt)))
     : [];
   const entryIds = await entryIdsForSourceRefs(ctx, ids.map((i) => `bill:${i}`));
+  const appsByBill = new Map<string, typeof apps>();
+  for (const a of apps) appsByBill.set(a.billId, [...(appsByBill.get(a.billId) ?? []), a]);
   const rows: StdRow[] = [];
   let tBill = Money.zero();
   let tPaid = Money.zero();
   let tCredited = Money.zero();
   for (const b of billRows) {
     const hid = `bap:${b.id}`;
-    tBill = tBill.plus(Money.of(b.total));
+    // Home currency, as the bill and its payments posted to A/P: a foreign bill's own amounts
+    // were added to the dollar bills' (EUR 350 counted as 350.00).
+    const home = (v: string) => homeOf(Money.of(v), b.rate);
+    const billHome = home(b.total);
+    tBill = tBill.plus(billHome);
     const header: StdRow = {
       id: hid,
       depth: 0,
       kind: 'data',
       collapseKind: 'group',
-      cells: { label: b.vendor, type: 'Bill', date: dayStr(b.date), num: b.num ?? '', amount: toAmountString(b.total), open: toAmountString(b.balanceDue) },
+      cells: { label: b.vendor, type: 'Bill', date: dayStr(b.date), num: b.num ?? '', amount: amt(billHome), open: amt(home(b.balanceDue)) },
       entryId: entryIds.get(`bill:${b.id}`) ?? null,
     };
     rows.push(header);
-    for (const a of apps.filter((x) => x.billId === b.id).sort((x, y) => x.date.getTime() - y.date.getTime())) {
-      tPaid = tPaid.plus(Money.of(a.applied));
+    for (const a of (appsByBill.get(b.id) ?? []).sort((x, y) => x.date.getTime() - y.date.getTime())) {
+      const paid = a.appliedHome != null ? Money.of(a.appliedHome) : home(a.applied);
+      tPaid = tPaid.plus(paid);
       rows.push({
         id: `bap:p:${b.id}:${a.paymentId}`,
         parentId: hid,
         depth: 1,
         kind: 'data',
-        cells: { label: '', type: 'Bill Pmt', date: dayStr(a.date), num: a.ref ?? '', memo: a.method, amount: toAmountString(Money.of(a.applied).negated()) },
+        cells: { label: '', type: 'Bill Pmt', date: dayStr(a.date), num: a.ref ?? '', memo: a.method, amount: amt(paid.negated()) },
       });
     }
     if (!Money.isZero(b.credited)) {
-      tCredited = tCredited.plus(Money.of(b.credited));
+      const credited = home(b.credited);
+      tCredited = tCredited.plus(credited);
       rows.push({
         id: `bap:c:${b.id}`,
         parentId: hid,
         depth: 1,
         kind: 'data',
-        cells: { label: '', type: 'Bill Credit', memo: 'Credits applied', amount: toAmountString(Money.of(b.credited).negated()) },
+        cells: { label: '', type: 'Bill Credit', memo: 'Credits applied', amount: amt(credited.negated()) },
       });
     }
   }
