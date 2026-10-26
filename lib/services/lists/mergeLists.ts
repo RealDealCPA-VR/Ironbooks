@@ -41,6 +41,7 @@ import { carriedValueRemainder, todayCalendarDay } from '../inventory';
 import { moveNotesAndTodos } from './notes';
 import { repointForeignKeys } from './references';
 import { assertListDeleteAllowed } from '../accountantCopy/guard';
+import { serialsInStock } from '../inventorySites';
 
 export interface ListMergeResult {
   reassigned: Record<string, number>;
@@ -135,6 +136,18 @@ async function mergeItemsInTx(ctx: ServiceContext, fromId: string, toId: string)
   }
   if (from.uomSetId && to.uomSetId && from.uomSetId !== to.uomSetId) {
     throw validation('These items count stock in different units of measure, so they cannot be merged.');
+  }
+  if (from.trackingMode === 'serial') {
+    // A serial number is one unit: the merged item would hold the same serial twice (the stock
+    // checks then refuse every later sale or transfer of it).
+    const inStock = await serialsInStock(ctx, { itemIds: [fromId, toId] });
+    const ofTo = new Set(inStock.filter((s) => s.itemId === toId).map((s) => s.serialNumber));
+    const both = [...new Set(inStock.filter((s) => s.itemId === fromId && ofTo.has(s.serialNumber)).map((s) => s.serialNumber))];
+    if (both.length > 0) {
+      throw validation(
+        `Both items have serial number${both.length > 1 ? 's' : ''} ${both.slice(0, 5).map((s) => `"${s}"`).join(', ')} in stock, so they cannot be merged. Correct the serial numbers first.`,
+      );
+    }
   }
   const fromQty = new Decimal(from.quantityOnHand ?? 0);
   const toQty = new Decimal(to.quantityOnHand ?? 0);

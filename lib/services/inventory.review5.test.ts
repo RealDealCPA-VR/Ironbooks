@@ -825,6 +825,21 @@ describe('review5 inventory', () => {
     expect(siteSum.toFixed(2)).toBe(val.grandTotal);
   });
 
+  it('merge: two serial-tracked items that both hold the same serial number in stock cannot be merged', async () => {
+    const a = await invItem('Serial dup A', { trackingMode: 'serial' });
+    const b = await invItem('Serial dup B', { trackingMode: 'serial' });
+    await adjustQuantityAtSite(ctx, { itemId: a.id, quantityChange: '2', unitCost: '5.00', date: d('2026-01-02'), serialNumbers: ['X-1', 'X-2'] });
+    await adjustQuantityAtSite(ctx, { itemId: b.id, quantityChange: '1', unitCost: '5.00', date: d('2026-01-02'), serialNumbers: ['X-2'] });
+    await expect(mergeItems(ctx, { fromId: a.id, toId: b.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect((await itemRow(a.id)).isActive).toBe(true);
+    expect((await verifySiteInvariants(ctx)).allOk).toBe(true);
+    // Distinct serials merge fine.
+    const c = await invItem('Serial dup C', { trackingMode: 'serial' });
+    await adjustQuantityAtSite(ctx, { itemId: c.id, quantityChange: '1', unitCost: '5.00', date: d('2026-01-02'), serialNumbers: ['X-9'] });
+    await mergeItems(ctx, { fromId: c.id, toId: b.id });
+    expect((await verifySiteInvariants(ctx)).allOk).toBe(true);
+  });
+
   it('Transactions by Serial/Lot Number names checks and vendor credits (label and number)', async () => {
     const v = await createVendor(ctx, { displayName: 'Lot supplier' } as never);
     const lot = await invItem('Lot glue', { trackingMode: 'lot' });
