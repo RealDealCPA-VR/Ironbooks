@@ -55,3 +55,33 @@ describe('scheduled group exports', () => {
     expect(new Set(res.files.map((f) => fs.readFileSync(f, 'utf8'))).size).toBe(4);
   });
 });
+
+/**
+ * Where scheduled exports go when a single company file (1.6) is open. The app server then runs
+ * on a working copy in %LOCALAPPDATA%\Ironbooks\Working\<name>-<hash>\data, and the export root
+ * was derived from that folder: exports landed inside the working-copy cache, in a folder called
+ * "data", which is deleted when the cache is cleaned up (45 days unopened) or replaced. They now
+ * go next to the company file itself.
+ */
+describe('scheduled export folder with a single company file', () => {
+  it('is next to the company file, not inside the working copy', async () => {
+    const { reportExportRoot } = await import('./memorizedReports');
+    const saved = { file: process.env.BKA_COMPANY_FILE, data: process.env.BKA_DATA_DIR, dir: process.env.BKA_REPORT_EXPORT_DIR };
+    try {
+      delete process.env.BKA_REPORT_EXPORT_DIR;
+      const books = path.resolve('Books');
+      process.env.BKA_COMPANY_FILE = path.join(books, 'Acme Ltd.ironbooks');
+      process.env.BKA_DATA_DIR = path.resolve('AppData', 'Ironbooks', 'Working', 'Acme Ltd-1a2b3c', 'data');
+      expect(reportExportRoot()).toBe(path.join(books, 'Report Exports', 'Acme Ltd'));
+      // A company kept as a folder (no single file) is unchanged: next to its data folder.
+      delete process.env.BKA_COMPANY_FILE;
+      process.env.BKA_DATA_DIR = path.join(books, 'Acme');
+      expect(reportExportRoot()).toBe(path.join(books, 'Report Exports', 'Acme'));
+    } finally {
+      for (const [k, v] of [['BKA_COMPANY_FILE', saved.file], ['BKA_DATA_DIR', saved.data], ['BKA_REPORT_EXPORT_DIR', saved.dir]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+});

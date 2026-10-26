@@ -399,6 +399,14 @@ export function nextRunAfter(from: Date, frequency: ScheduleFrequency, anchorDay
  */
 export function reportExportRoot(): string {
   if (process.env.BKA_REPORT_EXPORT_DIR) return path.resolve(process.env.BKA_REPORT_EXPORT_DIR);
+  // A single company file (1.6): the server runs on its private working copy under
+  // %LOCALAPPDATA%\Ironbooks\Working\…\data — a cache that is replaced and cleaned up — so the
+  // exports go next to the company file itself ("Report Exports/<file name>").
+  const companyFile = process.env.BKA_COMPANY_FILE?.trim();
+  if (companyFile) {
+    const file = path.resolve(companyFile);
+    return path.join(path.dirname(file), 'Report Exports', path.basename(file, path.extname(file)));
+  }
   const dataDir = resolveDataDir();
   return path.join(path.dirname(dataDir), 'Report Exports', path.basename(dataDir));
 }
