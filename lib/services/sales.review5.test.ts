@@ -61,6 +61,7 @@ import { convertToInvoice as convertSalesOrder, createSalesOrder, updateSalesOrd
 import { Money } from '@/lib/money';
 import { planShipments } from './fulfillment';
 import { packingSlipData } from '@/lib/fulfillmentPrint';
+import { buildEstimatePdf } from '@/lib/pdf/forms';
 import { renderSalesForm } from './salesForms';
 import { listUnbilled } from './billables';
 import { createBill } from './bills';
@@ -68,6 +69,14 @@ import { setBaseCurrency, upsertCurrency } from './currencies';
 
 let routeCtx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
+const estPdfCalls: Array<Record<string, unknown>> = [];
+vi.mock('@/lib/pdf/estimate', async (orig) => ({
+  ...(await orig<typeof import('@/lib/pdf/estimate')>()),
+  renderEstimatePdf: vi.fn(async (data: Record<string, unknown>) => {
+    estPdfCalls.push(data);
+    return new Uint8Array([37, 80, 68, 70]);
+  }),
+}));
 const soPdfCalls: Array<Record<string, unknown>> = [];
 vi.mock('@/lib/pdf/salesOrder', async (orig) => ({
   ...(await orig<typeof import('@/lib/pdf/salesOrder')>()),
@@ -88,6 +97,8 @@ import { GET as forSourceGET } from '@/app/api/journal-entries/for-source/route'
 import { POST as paymentPOST } from '@/app/api/payments/[id]/route';
 import { POST as creditMemoPOST } from '@/app/api/credit-memos/[id]/route';
 import { POST as estimatePOST } from '@/app/api/estimates/[id]/route';
+import { POST as paymentsPOST } from '@/app/api/payments/route';
+import { POST as customersPOST } from '@/app/api/customers/route';
 import { POST as expirePOST } from '@/app/api/estimates/expire/route';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-sales');
@@ -764,5 +775,42 @@ describe('20. Sales order PDF backorder note', () => {
     await renderSalesForm(ctx, 'sales_order', so.id);
     const lines = soPdfCalls[0]?.lines as Array<{ description: string }>;
     expect(lines[0].description).toBe('Rope (backordered: 0.2)');
+  });
+});
+
+describe('21. Text longer than its column is a 400', () => {
+  it('a payment reference / customer name too long for its field answers 400 with a plain message', async () => {
+    const cust = await newCustomer('Long ref');
+    const res = await paymentsPOST(
+      req('/api/payments', {
+        customerId: cust,
+        date: '2026-03-05',
+        method: 'check',
+        reference: 'R'.repeat(150),
+        amount: '10.00',
+        depositAccountId: acct['1000'],
+        applications: [],
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/too long/i);
+    const res2 = await customersPOST(req('/api/customers', { displayName: 'N'.repeat(300) }));
+    expect(res2.status).toBe(400);
+  });
+});
+
+describe('22. Printed estimate', () => {
+  it('prints the estimate’s ship-to address', async () => {
+    const cust = await newCustomer('Quote ship');
+    const est = await createEstimate(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      shipTo: { line1: '5 Site Ln', city: 'Troy', state: 'NY', zip: '12180' },
+      lines: [{ description: 'Deck', quantity: 1, rate: '900.00', taxable: false }],
+    });
+    estPdfCalls.length = 0;
+    await buildEstimatePdf(ctx, est.id);
+    expect((estPdfCalls[0]?.shipTo as Record<string, string> | null)?.line1).toBe('5 Site Ln');
   });
 });

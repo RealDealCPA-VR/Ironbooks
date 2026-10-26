@@ -12,6 +12,8 @@
  *    failed, so the transaction rolls back as before.
  *  - 22007 invalid_datetime_format / 22008 datetime_field_overflow / 22009 time zone
  *    displacement — a date Postgres cannot store (e.g. year 10000). VALIDATION.
+ *  - 22001 string_data_right_truncation — text longer than its column (a 150-character check
+ *    number in a varchar(100) reference, a 300-character customer name). VALIDATION.
  * Every other error passes through unchanged (ledger BK00x codes are translated in
  * lib/services/_base.ts inTransaction, where deferred checks surface at COMMIT).
  */
@@ -21,6 +23,15 @@ export function translatePgError(err: unknown): unknown {
   if (!err || typeof err !== 'object' || err instanceof ServiceError) return err;
   const code = (err as { code?: unknown }).code;
   const message = String((err as { message?: unknown }).message ?? '');
+  if (code === '22001') {
+    const max = /varying\((\d+)\)|character\((\d+)\)/i.exec(message);
+    const n = max ? (max[1] ?? max[2]) : null;
+    return new ServiceError(
+      'VALIDATION',
+      n ? `That text is too long: this field holds at most ${n} characters.` : 'That text is too long for its field.',
+      { sqlstate: code },
+    );
+  }
   if (code === '22P02') {
     if (/\buuid\b/i.test(message)) {
       return new ServiceError('NOT_FOUND', 'No record matches that id.', { sqlstate: code });
