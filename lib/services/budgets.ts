@@ -698,10 +698,19 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
   const fy = await budgetFiscalYear(ctx, year);
   const lastFm = fy.months[11];
   const fmOf = (month: number) => fy.months.find((m) => m.month === month) ?? lastFm;
+  // Columns: by month, by fiscal quarter (the toolbar offers it; it used to fall back to the
+  // year total silently), or the year. A balance-sheet budget compares balances, so a quarter
+  // (or the year) shows its LAST month's balance and budget, never their sum.
+  const quarter = (q: number): BvaPeriod => {
+    const ms = fy.months.slice(q * 3, q * 3 + 3);
+    return { key: `q${q + 1}`, months: isBs ? [ms[ms.length - 1].month] : ms.map((m) => m.month), label: `Q${q + 1}` };
+  };
   const periods: BvaPeriod[] =
     p.columns === 'month'
       ? fy.months.map((m) => ({ key: MONTH_KEYS[m.month - 1], months: [m.month], label: `${MONTH_LABELS[m.month - 1]} ${m.year}` }))
-      : [
+      : p.columns === 'quarter'
+        ? [0, 1, 2, 3].map(quarter)
+        : [
           {
             key: 'total',
             months: isBs ? [lastFm.month] : fy.months.map((m) => m.month),

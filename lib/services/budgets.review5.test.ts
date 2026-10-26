@@ -55,3 +55,20 @@ describe('setBudgetLine', () => {
     expect((await db.select().from(budgetLines).where(eq(budgetLines.budgetId, b.id))).length).toBe(0);
   });
 });
+
+describe('Budget vs. Actual by quarter', () => {
+  it('Columns = Quarter shows one Actual / Budget group per fiscal quarter (not the year total)', async () => {
+    const { runStandardReport } = await import('./reportRegistry');
+    const b = await createBudget(ctx, { name: 'Quarterly', fiscalYear: 2026 });
+    await setBudgetLine(ctx, { budgetId: b.id, accountId: A['6400'], month: 1, amount: '100.00' });
+    await setBudgetLine(ctx, { budgetId: b.id, accountId: A['6400'], month: 2, amount: '50.00' });
+    await setBudgetLine(ctx, { budgetId: b.id, accountId: A['6400'], month: 4, amount: '70.00' });
+    const r = await runStandardReport(ctx, 'budget-vs-actual-report', { budgetId: b.id, columns: 'quarter' });
+    const budCols = r.columns.filter((c) => c.key.endsWith('_bud'));
+    expect(budCols.map((c) => c.header)).toEqual(['Q1 Budget', 'Q2 Budget', 'Q3 Budget', 'Q4 Budget']);
+    const rent = r.rows.find((x) => x.id.endsWith(`:a:${A['6400']}`))!;
+    expect(rent.cells[budCols[0].key]).toBe('150.00');
+    expect(rent.cells[budCols[1].key]).toBe('70.00');
+    expect(rent.cells[budCols[2].key]).toBe('0.00');
+  });
+});
