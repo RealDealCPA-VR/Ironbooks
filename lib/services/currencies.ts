@@ -15,7 +15,7 @@
  *   Gain: Dr <asset/liability account>  /  Cr 4900 Other Income
  *   Loss: Dr 6100 Bank & Merchant Fees  /  Cr <asset/liability account>
  */
-import { and, eq, ne } from 'drizzle-orm';
+import { and, eq, ne, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import { currencies, accounts, journalEntryLines } from '@/lib/db/schema';
 import { Money, MoneyParseError, allocate, toAmountString } from '@/lib/money';
@@ -498,16 +498,47 @@ export function homeAmounts(
 
 /** Find-or-create the Exchange Gain/Loss account (code 6900) used for realized FX. */
 export async function getOrCreateExchangeGainLossAccount(ctx: ServiceContext): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
+  // review5 fx: the account is found by what it IS, not only by number. A converted QuickBooks
+  // file has QB's own "Exchange Gain or Loss" account (any number), and its 6900 can be anything
+  // (a bank, Telephone, ...) — realized gains / losses were posted to that account.
+  const candidates = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type, subtype: accounts.subtype, isActive: accounts.isActive })
     .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '6900')));
-  if (row) return row.id;
+    .where(
+      and(
+        eq(accounts.companyId, ctx.companyId),
+        sql`(${accounts.code} = '6900' OR lower(${accounts.name}) LIKE '%exchange gain%' OR lower(${accounts.name}) LIKE '%exchange loss%')`,
+      ),
+    );
+  const pl = (a: { type: string; subtype: string }) =>
+    (a.type === 'expense' || a.type === 'revenue') && a.subtype !== 'non_posting';
+  const named = (a: { name: string }) => /exchange\s+(gain|loss)/i.test(a.name);
+  const pick =
+    candidates.find((a) => pl(a) && named(a) && a.code === '6900') ??
+    candidates.find((a) => pl(a) && named(a) && a.isActive) ??
+    candidates.find((a) => pl(a) && named(a));
+  if (pick) return pick.id;
+  // Create it: 6900 when that number is free, else the first free 69xx number.
+  const used = new Set(
+    (
+      await ctx.db
+        .select({ code: accounts.code })
+        .from(accounts)
+        .where(and(eq(accounts.companyId, ctx.companyId), sql`${accounts.code} LIKE '69%'`))
+    ).map((r) => r.code),
+  );
+  let code = 'FX-GAIN-LOSS';
+  for (let n = 6900; n <= 6999; n += 1) {
+    if (!used.has(String(n))) {
+      code = String(n);
+      break;
+    }
+  }
   const [created] = await ctx.db
     .insert(accounts)
     .values({
       companyId: ctx.companyId,
-      code: '6900',
+      code,
       name: 'Exchange Gain/Loss',
       type: 'expense' as never,
       subtype: 'operating_expenses' as never,

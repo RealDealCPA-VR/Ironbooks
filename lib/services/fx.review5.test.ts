@@ -217,6 +217,37 @@ describe('review5 fx', () => {
     expect(Money.of(bank.balance).toFixed(2)).toBe('0.00'); // +120 deposit, -120 transfer
   });
 
+  it('realized gains / losses go to the Exchange Gain or Loss account, never to whatever account is numbered 6900', async () => {
+    // A converted QuickBooks file: 6900 is a bank account; the QB account is "Exchange Gain or Loss" (7100).
+    const bank6900 = (await createAccount(ctx, { code: '6900', name: 'Petty Cash Box', type: 'asset' as never, subtype: 'checking' })).id;
+    const fxQb = (await createAccount(ctx, { code: '7100', name: 'Exchange Gain or Loss', type: 'expense' as never, subtype: 'other_expense' })).id;
+    const c = await createCustomer(ctx, { displayName: `EUR gain ${seq}` } as never);
+    const inv = await createInvoice(ctx, { customerId: c.id, date: d('2026-03-01'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['4000'], quantity: 1, rate: '1000.00' }] } as never);
+    await receivePayment(ctx, { customerId: c.id, date: d('2026-03-05'), amount: '1000.00', method: 'ach', depositAccountId: acct['1020'], currency: 'EUR', exchangeRate: '1.25', applications: [{ invoiceId: inv.id, amountApplied: '1000.00' }] } as never);
+    const bal = async (id: string) => Money.of((await db.select().from(accounts).where(eq(accounts.id, id)))[0].balance).toFixed(2);
+    expect(await bal(bank6900)).toBe('0.00');
+    expect(await bal(fxQb)).toBe('-50.00'); // USD 50 gain (credit on an expense account)
+    // A bill paid at a lower rate: the gain lands there too (purchases path).
+    const v = await eurVendor('EUR gain supplier');
+    const { payBills } = await import('./billPayments');
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-03-01'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['6000'], amount: '100.00' }] } as never);
+    await payBills(ctx, { vendorId: v.id, date: d('2026-03-10'), method: 'ach', paymentAccountId: acct['1020'], exchangeRate: '1.10', applications: [{ billId: bill.id, amountApplied: '100.00' }] } as never);
+    expect(await bal(bank6900)).toBe('0.00');
+    expect(await bal(fxQb)).toBe('-60.00');
+  });
+
+  it('a 6900 account that is not Exchange Gain/Loss is left alone; a new Exchange Gain/Loss account is made', async () => {
+    const phone = (await createAccount(ctx, { code: '6900', name: 'Telephone', type: 'expense' as never, subtype: 'operating_expenses' })).id;
+    const c = await createCustomer(ctx, { displayName: `EUR loss ${seq}` } as never);
+    const inv = await createInvoice(ctx, { customerId: c.id, date: d('2026-03-01'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['4000'], quantity: 1, rate: '100.00' }] } as never);
+    await receivePayment(ctx, { customerId: c.id, date: d('2026-03-05'), amount: '100.00', method: 'ach', depositAccountId: acct['1020'], currency: 'EUR', exchangeRate: '1.10', applications: [{ invoiceId: inv.id, amountApplied: '100.00' }] } as never);
+    const [p] = await db.select().from(accounts).where(eq(accounts.id, phone));
+    expect(Money.of(p.balance).toFixed(2)).toBe('0.00');
+    const fx = (await db.select().from(accounts).where(eq(accounts.companyId, ctx.companyId))).filter((a) => /exchange gain/i.test(a.name));
+    expect(fx).toHaveLength(1);
+    expect(Money.of(fx[0].balance).toFixed(2)).toBe('10.00'); // USD 10 loss
+  });
+
   it('Home Currency Adjustment as of a date revalues everything dated that day (whole as-of day)', async () => {
     const c = await createCustomer(ctx, { displayName: `EUR customer ${seq}` } as never);
     // Dated 3/31 at noon; the adjustment as of 3/31 (date picker: midnight) must include it, as

@@ -55,7 +55,7 @@ import { docRef } from './docNumbers';
 import { removePaymentFromDeposit } from './deposits';
 import { assertForeignCurrencyAllowed } from './multiCurrency';
 import { computeDiscount, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
-import { getHomeCurrencyCode } from './currencies';
+import { getHomeCurrencyCode, getOrCreateExchangeGainLossAccount } from './currencies';
 import {
   type JournalCreditToInvoiceInput,
   type JournalItemPaymentInput,
@@ -225,11 +225,9 @@ async function getOrCreateAccount(
 
 /** Find or create the Exchange Gain/Loss expense account (code 6900) for realized FX. */
 async function getOrCreateExchangeGainLossId(ctx: ServiceContext): Promise<string> {
-  return getOrCreateAccount(ctx, '6900', {
-    name: 'Exchange Gain/Loss',
-    type: 'expense',
-    subtype: 'operating_expenses',
-  });
+  // review5 fx: one resolver for every module (QB's "Exchange Gain or Loss" account, never an
+  // unrelated account that happens to be numbered 6900).
+  return getOrCreateExchangeGainLossAccount(ctx);
 }
 
 /** Default early-payment discount account (contra income, QB "Discounts Given"). */
