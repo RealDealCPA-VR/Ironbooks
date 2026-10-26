@@ -483,7 +483,7 @@ const triggerNameCache = new Map<string, Set<string>>();
 
 /**
  * Every trigger any migration creates, as `table.trigger` pairs (bka_* guards and others, e.g.
- * bk_journal_item_applications_void_guard). Keyed by table as well as name: a trigger that
+ * the docnum_* triggers). Keyed by table as well as name: a trigger that
  * borrows a shipped trigger's name but sits on a different table is still an unexpected trigger.
  */
 export function migrationTriggerNames(migrationsFolder: string): Set<string> {

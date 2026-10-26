@@ -351,6 +351,8 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_je_non_posting: 'Non-posting accounts never carry posted amounts (post transitions)',
   bka_accounts_non_posting: 'Accounts with history cannot become non-posting',
   bka_transfers_no_ar_ap: 'Transfers never move money into or out of A/R or A/P',
+  // drizzle/0063_r5_ledger.sql (was 0037's bk_journal_item_applications_void_guard)
+  bka_jia_void_guard: 'Journal entries with payments or credits applied cannot be voided or edited',
   // drizzle/0046_p1_controls.sql — record locking versions
   ...Object.fromEntries(
     [
