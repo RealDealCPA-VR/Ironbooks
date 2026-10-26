@@ -44,6 +44,7 @@ import { taxIdFor } from './access';
 import { journalOpenItems } from './journal';
 import { generalJournalSourceSql } from './posting';
 import { docRef } from './docNumbers';
+import { companyToday } from './salesDates';
 
 // ---------------------------------------------------------------------------
 // Customer Statement
@@ -869,8 +870,11 @@ function bucketFor(daysPastDue: number): AgingBucket {
 export async function openItemStatement(
   ctx: ServiceContext,
   customerId: string,
-  asOf: Date = new Date(),
+  asOfInput?: Date,
 ): Promise<OpenItemStatement> {
+  // Default: today's calendar day in the company's time zone (the UTC day is tomorrow in a US
+  // evening — the statement was dated tomorrow and an invoice due today aged a day past due).
+  const asOf = asOfInput ?? (await companyToday(ctx));
   const [cust] = await ctx.db
     .select({
       id: customers.id,
@@ -1069,7 +1073,7 @@ export async function batchStatements(
   const out: BatchStatementEntry[] = [];
   for (const c of custRows) {
     if (opts.format === 'open_item') {
-      const stmt = await openItemStatement(ctx, c.id, opts.asOf ?? new Date());
+      const stmt = await openItemStatement(ctx, c.id, opts.asOf);
       if (stmt.lines.length === 0) continue;
       out.push({ customerId: c.id, displayName: c.displayName, format: 'open_item', statement: stmt });
     } else {

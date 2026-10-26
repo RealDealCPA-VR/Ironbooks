@@ -1474,7 +1474,16 @@ export async function voidPayment(ctx: ServiceContext, id: string) {
   await assertPaymentReversible(ctx, payment, 'voided');
 
   return inTransaction(ctx, async (tx) => {
-    const applications = await reversePaymentEffects(tx, payment);
+    // Re-read inside the transaction: an edit saved in between posted a new entry (the snapshot
+    // above names the old one), and a second void must not run the reversal again.
+    const [current] = await tx.db
+      .select()
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.id, id), eq(paymentsReceived.companyId, tx.companyId)));
+    if (!current) throw notFound('Payment');
+    if (current.voidedAt) return { ...current, applications: [] }; // idempotent
+    await assertPaymentReversible(tx, current, 'voided');
+    const applications = await reversePaymentEffects(tx, current);
 
     // Stamp the payment void.
     const [updated] = await tx.db
@@ -1515,7 +1524,7 @@ export async function voidPayment(ctx: ServiceContext, id: string) {
  * The audit trail / transaction log records old and new values.
  */
 export async function updatePayment(ctx: ServiceContext, id: string, input: ReceivePaymentInput) {
-  const [payment] = await ctx.db
+  let [payment] = await ctx.db
     .select()
     .from(paymentsReceived)
     .where(and(eq(paymentsReceived.id, id), eq(paymentsReceived.companyId, ctx.companyId)));
@@ -1534,6 +1543,19 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
   await assertPaymentReversible(ctx, payment, 'edited', { allowDeposited: !!deposit });
 
   return inTransaction(ctx, async (tx) => {
+    // Re-read inside the transaction: the version loaded above can be stale (a second save of the
+    // same edit, another user) — reversing it would leave the newer version's entry posted and
+    // post another one on top (A/R credited twice).
+    const [current] = await tx.db
+      .select()
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.id, id), eq(paymentsReceived.companyId, tx.companyId)));
+    if (!current) throw notFound('Payment');
+    if (current.voidedAt) throw new ServiceError('CONFLICT', 'Cannot edit a voided payment.');
+    if (current.bouncedAt) {
+      throw new ServiceError('CONFLICT', 'This payment was recorded as a bounced check, so it cannot be edited.');
+    }
+    payment = current;
     if (deposit && takeOut) await removePaymentFromDeposit(tx, deposit.id, id);
     const oldCredits = await tx.db
       .select({ creditMemoId: creditApplications.creditMemoId, invoiceId: creditApplications.invoiceId, amount: creditApplications.amount })

@@ -35,8 +35,10 @@ import {
   creditMemos,
   depositLines,
   deposits,
+  estimateLines,
   estimates,
   expenses,
+  invoiceLines,
   invoices,
   itemReceipts,
   journalEntries,
@@ -358,17 +360,40 @@ async function invoiceTree(ctx: ServiceContext, invoiceId: string): Promise<Link
 
   const children: LinkedTransaction[] = [];
 
-  // Source documents: estimate(s) and/or sales order(s) converted into this invoice.
+  // Source documents: estimate(s) and/or sales order(s) this invoice bills. A progress invoice
+  // bills estimate lines (invoice_lines.estimate_line_id) and a partial sales-order invoice
+  // records its claim in the order's audit trail (salesOrders.convertToInvoice); only the invoice
+  // that FINISHED the document is its convertedInvoiceId, so the earlier ones showed no source.
   const ests = await ctx.db
     .select({ id: estimates.id, number: sql<string>`COALESCE(NULLIF(${estimates.refNumber}, ''), CAST(${estimates.estimateNumber} AS TEXT))`, date: estimates.date, total: estimates.total })
     .from(estimates)
-    .where(and(eq(estimates.companyId, ctx.companyId), eq(estimates.convertedInvoiceId, invoiceId)));
+    .where(
+      and(
+        eq(estimates.companyId, ctx.companyId),
+        sql`(${estimates.convertedInvoiceId} = ${invoiceId} OR ${estimates.id} IN (
+          SELECT ${estimateLines.estimateId} FROM ${estimateLines}
+          JOIN ${invoiceLines} ON ${invoiceLines.estimateLineId} = ${estimateLines.id}
+          WHERE ${invoiceLines.invoiceId} = ${invoiceId}
+        ))`,
+      ),
+    );
   for (const e of ests) children.push(node('estimate', e.id, `Estimate #${e.number}`, e.date, e.total));
 
   const sos = await ctx.db
     .select({ id: salesOrders.id, number: sql<string>`COALESCE(NULLIF(${salesOrders.refNumber}, ''), CAST(${salesOrders.orderNumber} AS TEXT))`, date: salesOrders.date, total: salesOrders.total })
     .from(salesOrders)
-    .where(and(eq(salesOrders.companyId, ctx.companyId), eq(salesOrders.convertedInvoiceId, invoiceId)));
+    .where(
+      and(
+        eq(salesOrders.companyId, ctx.companyId),
+        sql`(${salesOrders.convertedInvoiceId} = ${invoiceId} OR ${salesOrders.id} IN (
+          SELECT ${auditLogs.entityId} FROM ${auditLogs}
+          WHERE ${auditLogs.companyId} = ${ctx.companyId}
+            AND ${auditLogs.entityType} = 'sales_order'
+            AND ${auditLogs.newValues}->>'invoiceId' = ${invoiceId}
+            AND ${auditLogs.newValues}->'invoicedQuantities' IS NOT NULL
+        ))`,
+      ),
+    );
   for (const s of sos) children.push(node('sales_order', s.id, `Sales Order #${s.number}`, s.date, s.total));
 
   children.push(...(await paymentsForInvoice(ctx, invoiceId)));

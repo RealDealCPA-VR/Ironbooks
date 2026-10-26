@@ -22,7 +22,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   accounts,
@@ -43,7 +43,7 @@ import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createCustomer, customerBalanceSummary } from './customers';
 import { createInvoice, getInvoice, updateInvoice, voidInvoice } from './invoices';
-import { receivePayment } from './payments';
+import { listBouncedChecks, receivePayment, recordBouncedCheck, updatePayment } from './payments';
 import { createSalesReceipt, getSalesReceipt, updateSalesReceipt } from './salesReceipts';
 import { adjustInventory } from './inventory';
 import { billRetainage, openRetainage } from './retainage';
@@ -52,6 +52,7 @@ import { commissionReport, createSalesRep, updateSalesRep } from './salesReps';
 import { convertToInvoice as convertEstimate, createEstimate, createProgressInvoice, getEstimate } from './estimates';
 import { collectionsCenter, incomeTracker } from './incomeTracker';
 import { listExpiringEstimates } from './estimateExpiry';
+import { openItemStatement } from './statements';
 import { buildLinkedTree } from './linkedTransactions';
 import { applyToInvoice, createCreditMemo, listCreditApplications, unapplyCreditApplication } from './creditMemos';
 import { listRecipients } from './letters';
@@ -389,6 +390,9 @@ describe('7. The server’s "today" is the company’s calendar day', () => {
     expect(center.asOf).toBe('2026-10-26');
     expect(center.overdue.find((c) => c.customerId === cust)).toBeUndefined();
     expect(center.almostDue.find((c) => c.customerId === cust)?.invoices[0].daysPastDue).toBe(0);
+    const stmt = await openItemStatement(ctx, cust);
+    expect(stmt.asOf).toBe('2026-10-26');
+    expect(stmt.lines.find((l) => l.docId === inv.id)?.daysPastDue).toBe(0);
   });
 
   it('an estimate that expires today is still listed as expiring, and is not expired yet', async () => {
@@ -578,3 +582,115 @@ void customers;
 void estimateLines;
 void salesReps;
 void getSalesReceipt;
+
+describe('16. Payment double submits', () => {
+  async function paidInvoice(label: string) {
+    const cust = await newCustomer(label);
+    const inv = await plainInvoice(cust, '200.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      reference: '1001',
+      amount: '200.00',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '200.00' }],
+    });
+    return { cust, inv, payment };
+  }
+  const arBalance = async () => {
+    const [a] = await db.select({ balance: accounts.balance }).from(accounts).where(eq(accounts.id, acct['1200']));
+    return a.balance;
+  };
+
+  it('recording the same bounced check twice at once reverses the payment once', async () => {
+    const { payment } = await paidInvoice('Bouncer');
+    const res = await Promise.allSettled([
+      recordBouncedCheck(ctx, { paymentId: payment.id, date: d('2026-03-10') }),
+      recordBouncedCheck(ctx, { paymentId: payment.id, date: d('2026-03-10') }),
+    ]);
+    expect(res.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(await listBouncedChecks(ctx)).toHaveLength(1);
+    expect(await arBalance()).toBe('200.00');
+  });
+
+  it('saving the same payment edit twice at once leaves one posted payment entry', async () => {
+    const { cust, inv, payment } = await paidInvoice('Editor');
+    const edit = {
+      customerId: cust,
+      date: d('2026-03-06'),
+      method: 'check' as const,
+      reference: '1001',
+      amount: '150.00',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '150.00' }],
+    };
+    await Promise.allSettled([updatePayment(ctx, payment.id, edit), updatePayment(ctx, payment.id, edit)]);
+    const live = await db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          eq(journalEntries.sourceRef, `customer:${cust}`),
+          eq(journalEntries.status, 'posted'),
+        ),
+      );
+    expect(live).toHaveLength(1);
+    expect(await arBalance()).toBe('50.00');
+    expect((await getInvoice(ctx, inv.id)).balanceDue).toBe('50.00');
+  });
+});
+
+describe('17. Transaction History of partial invoices shows their source document', () => {
+  it('a progress invoice lists its estimate and a partial sales-order invoice lists its order', async () => {
+    const cust = await newCustomer('Sources');
+    const svc = await serviceItem('Phase');
+    const est = await createEstimate(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      refNumber: 'Q-12',
+      taxRateId: null,
+      lines: [{ itemId: svc, quantity: 4, rate: '100.00', taxable: false }],
+    });
+    const progress = await createProgressInvoice(ctx, est.id, { percent: 25, date: d('2026-03-05') });
+    const pTree = await buildLinkedTree(ctx, 'invoice', progress.invoice.id);
+    expect((pTree.children ?? []).filter((c) => c.kind === 'estimate').map((c) => c.label)).toEqual(['Estimate #Q-12']);
+
+    const so = await createSalesOrder(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      refNumber: 'SO-7',
+      taxRateId: null,
+      lines: [{ itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
+    });
+    const [line] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    const part = await convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 3 }] });
+    const sTree = await buildLinkedTree(ctx, 'invoice', part.id);
+    expect((sTree.children ?? []).filter((c) => c.kind === 'sales_order').map((c) => c.label)).toEqual(['Sales Order #SO-7']);
+  });
+});
+
+describe('18. Indexes on A/R lines and applications (migration 0064)', () => {
+  it('a document’s lines, its applications and a customer’s invoices are looked up by index', async () => {
+    const rows = (await db.execute(sql`SELECT indexname FROM pg_indexes WHERE schemaname = 'public'`)) as unknown as {
+      rows: Array<{ indexname: string }>;
+    };
+    const names = new Set(rows.rows.map((r) => r.indexname));
+    for (const n of [
+      'invoice_lines_invoice_idx',
+      'invoices_company_customer_idx',
+      'payment_applications_payment_idx',
+      'payment_applications_invoice_idx',
+      'payments_received_company_customer_idx',
+      'credit_memos_company_customer_idx',
+      'credit_memo_lines_memo_idx',
+      'credit_applications_payment_idx',
+      'sales_receipt_lines_receipt_idx',
+      'estimate_lines_estimate_idx',
+      'sales_order_lines_order_idx',
+    ]) {
+      expect(names.has(n), n).toBe(true);
+    }
+  });
+});

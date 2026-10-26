@@ -55,7 +55,7 @@ export async function GET(req: NextRequest) {
     const output = searchParams.get('output') === 'zip' ? 'zip' : 'pdf';
     const from = parseDate(searchParams.get('from'), 'from');
     const to = parseDate(searchParams.get('to'), 'to');
-    const asOf = parseDate(searchParams.get('asOf'), 'asOf') ?? new Date();
+    const asOf = parseDate(searchParams.get('asOf'), 'asOf'); // omitted = today (company calendar day)
 
     const ctx = await getServerContext();
     const entries = await batchStatements(ctx, { format, from, to, asOf });
