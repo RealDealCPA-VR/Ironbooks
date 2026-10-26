@@ -44,7 +44,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { isSubledgerSource } from './posting';
-import { assertPeriodOpen } from './fiscalPeriods';
+import { assertPeriodOpen, ledgerToday } from './fiscalPeriods';
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { getHomeCurrencyCode } from './currencies';
 import { journalOpenItems, resolveEntityNames } from './journal';
@@ -699,7 +699,8 @@ export async function applyJournalCredit(
     date?: Date | null;
   },
 ) {
-  const date = input.date ?? new Date();
+  // No date given: today on this computer's calendar (a ledger date), never the current instant.
+  const date = input.date ?? ledgerToday();
   const targets = [input.invoiceId, input.billId, input.chargeLineId].filter(Boolean).length;
   if (targets !== 1) {
     throw validation('Pick the invoice, bill or General Journal charge to apply the credit to.');

@@ -14,6 +14,15 @@ import { type ServiceContext, ServiceError, notFound, writeAudit } from './_base
 import { assertWrite } from './rbac';
 import { activeCopy, assertDividingDateOpen, formatDividingDate } from './accountantCopy/guard';
 
+/**
+ * Today as a LEDGER date: this computer's calendar day at UTC midnight (the convention every
+ * posting date uses). The current instant is not a ledger date: in the evening west of UTC it is
+ * already tomorrow in UTC, so a posting stamped with it showed on the next day's reports.
+ */
+export function ledgerToday(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+}
+
 export async function listPeriods(ctx: ServiceContext) {
   return ctx.db
     .select()
