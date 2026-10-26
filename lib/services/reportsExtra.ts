@@ -1183,14 +1183,15 @@ export async function expensesByVendor(
     .select({
       vendorId: bills.vendorId,
       vendorName: vendors.displayName,
-      totalExpenses: sql<string>`COALESCE(SUM(CAST(${bills.total} AS NUMERIC)), 0)`,
+      // Home currency: a foreign bill counts at its own exchange rate (as salesByCustomer does).
+      totalExpenses: sql<string>`COALESCE(SUM(ROUND(CAST(${bills.total} AS NUMERIC) * COALESCE(${bills.exchangeRate}, 1), 2)), 0)`,
       billCount: sql<number>`COUNT(${bills.id})`,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
     .where(and(...conds))
     .groupBy(bills.vendorId, vendors.displayName)
-    .orderBy(sql`SUM(CAST(${bills.total} AS NUMERIC)) DESC`);
+    .orderBy(sql`SUM(ROUND(CAST(${bills.total} AS NUMERIC) * COALESCE(${bills.exchangeRate}, 1), 2)) DESC`);
 
   return rows.map((r) => ({
     vendorId: r.vendorId,
@@ -1691,6 +1692,7 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
       date: invoices.date,
       dueDate: invoices.dueDate,
       balanceDue: invoices.balanceDue,
+      exchangeRate: invoices.exchangeRate,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
@@ -1732,8 +1734,11 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
       daysOverdue,
       balanceDue: toAmountString(r.balanceDue),
     });
-    cust.totalDue = toAmountString(Money.of(cust.totalDue).plus(Money.of(r.balanceDue)));
-    totalDue = totalDue.plus(Money.of(r.balanceDue));
+    // Each invoice is listed in its own currency; the totals are home currency (a foreign balance at
+    // the invoice's booked rate, as openInvoices does), so currencies are never added together.
+    const home = homeValue(r.balanceDue, r.exchangeRate);
+    cust.totalDue = toAmountString(Money.of(cust.totalDue).plus(home));
+    totalDue = totalDue.plus(home);
   }
 
   return {

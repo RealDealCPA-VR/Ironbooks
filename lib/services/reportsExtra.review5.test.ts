@@ -135,3 +135,30 @@ describe('Check / Deposit Detail totals with a foreign-currency bank account', (
     expect(r.total).toBe('170.00');
   });
 });
+
+/**
+ * GET /api/reports/collections (collectionsReport) added a foreign invoice's balance to the dollar
+ * ones in the customer and grand totals (the Open Invoices API already converts its total).
+ */
+describe('legacy collections API: totals in home currency', () => {
+  it('EUR 100 at 1.20 overdue + USD 50 overdue = 170.00', async () => {
+    const { setBaseCurrency, upsertCurrency } = await import('./currencies');
+    const { createCustomer } = await import('./customers');
+    const { createInvoice } = await import('./invoices');
+    const { collectionsReport } = await import('./reportsExtra');
+    const [user] = await db.insert(users).values({ email: 'r5-coll-fx@test.local', name: 'R5 Coll', passwordHash: 'x' }).returning();
+    const company = await createCompany(db, { name: 'FX Collections Co', ownerId: user.id });
+    const cctx: ServiceContext = { db, companyId: company.id, userId: user.id };
+    const C: Record<string, string> = {};
+    for (const a of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) C[a.code] = a.id;
+    await setBaseCurrency(cctx, { code: 'USD', name: 'US Dollar' });
+    await upsertCurrency(cctx, { code: 'EUR', name: 'Euro', rateToBase: '1.20' });
+    const eur = await createCustomer(cctx, { displayName: 'Paris Client' } as never);
+    const usd = await createCustomer(cctx, { displayName: 'Local Client' } as never);
+    await createInvoice(cctx, { customerId: eur.id, date: d('2026-01-01'), dueDate: d('2026-01-31'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: C['4000'], quantity: 1, rate: '100.00' }] } as never);
+    await createInvoice(cctx, { customerId: usd.id, date: d('2026-01-01'), dueDate: d('2026-01-31'), lines: [{ accountId: C['4000'], quantity: 1, rate: '50.00' }] } as never);
+    const r = await collectionsReport(cctx, d('2026-08-31'));
+    expect(r.customers.find((c) => c.customerId === eur.id)?.totalDue).toBe('120.00');
+    expect(r.totalDue).toBe('170.00');
+  });
+});

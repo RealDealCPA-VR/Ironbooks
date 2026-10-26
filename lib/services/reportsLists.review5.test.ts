@@ -289,3 +289,15 @@ describe('Bills & Applied Payments: foreign bills in home currency', () => {
     expect(r.rows.find((x) => x.id === 'bap:grand')?.cells.amount).toBe('385.00');
   });
 });
+
+/**
+ * GET /api/reports/purchases-by-vendor (expensesByVendor) summed bill totals in their own
+ * currency: a EUR 350 bill counted as 350 "dollars" (Sales by Customer already converted).
+ */
+describe('legacy purchases-by-vendor API: home currency', () => {
+  it('a EUR 350 bill at 1.10 is 385.00', async () => {
+    const { expensesByVendor } = await import('./reportsExtra');
+    const rows = await expensesByVendor(ctx, { from: d('2026-01-01'), to: d('2026-12-31') });
+    expect(rows.find((r) => r.vendorId === S.euro)?.totalExpenses).toBe('385.00');
+  });
+});
