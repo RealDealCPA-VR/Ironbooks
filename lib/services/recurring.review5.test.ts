@@ -7,8 +7,11 @@
  *  B. With "Automatically assign general journal entry numbers" on (the default), each entry made
  *     from a memorized journal entry gets the NEXT number, as in QuickBooks, instead of repeating
  *     the number the entry had when it was memorized.
+ *  C. A memorized transaction saved without a next date starts TODAY on this computer's calendar
+ *     (a ledger date), not at the current instant — at 9:30 pm in New York that was tomorrow, and
+ *     every document it entered carried that time of day.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import { eq } from 'drizzle-orm';
@@ -20,6 +23,10 @@ import { createCustomer } from './customers';
 import { createManualEntry, getEntry } from './journal';
 import { createTemplate, runTemplateNow } from './recurring';
 import { journalPayloadLines } from '@/lib/journalBalance';
+import { NextRequest } from 'next/server';
+
+vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => ctx) }));
+import { POST as recurringPOST } from '@/app/api/recurring/route';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-recurring');
 let db: DB;
@@ -90,5 +97,33 @@ describe('memorized journal entries (review round 5)', () => {
     const refs = [memorizedRef, a.reference, b.reference];
     expect(new Set(refs).size).toBe(3);
     expect(Number(b.reference)).toBe(Number(a.reference) + 1);
+  });
+
+  it('C: a memorized transaction saved without a next date starts today (local calendar day)', async () => {
+    const realTz = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-27T01:30:00Z')); // Oct 26, 9:30 pm in New York
+    try {
+      const res = await recurringPOST(
+        new NextRequest('http://localhost/api/recurring', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name: 'Weekly sweep',
+            docType: 'journal_entry',
+            frequency: 'weekly',
+            mode: 'remind',
+            template: { description: 'Sweep', lines: [{ accountId: acct['6400'], debit: '1.00' }, { accountId: acct['1000'], credit: '1.00' }] },
+          }),
+        }),
+      );
+      expect(res.status).toBe(201);
+      expect(new Date((await res.json()).nextRunDate).toISOString()).toBe('2026-10-26T00:00:00.000Z');
+    } finally {
+      vi.useRealTimers();
+      if (realTz === undefined) delete process.env.TZ;
+      else process.env.TZ = realTz;
+    }
   });
 });
