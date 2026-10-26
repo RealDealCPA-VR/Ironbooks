@@ -405,6 +405,9 @@ async function restoreCreditStock(tx: ServiceContext, credit: typeof vendorCredi
       isInventory: true,
       quantity: Money.of(l.quantity!).toFixed(4),
       unitCost: Money.of(l.costAmount!).dividedBy(Money.of(l.quantity!)),
+      // The voided entry puts exactly the relieved cost back on the inventory account: the
+      // restored layers (or average) must be worth that much, not quantity x a rounded cost.
+      homeAmount: l.costAmount!,
     })),
     `vendor_credit_reversed:${credit.id}`,
   );

@@ -1,16 +1,16 @@
 /**
  * GET /api/reports/1099-pdf?vendorId=<uuid>&year=<number>
  *
- * Uses vendor1099Report to look up the total nonemployee compensation for the
- * given vendor and year, then renders a 1099-NEC PDF and returns it inline.
+ * Uses nec1099Recipients (the 1099 worksheet's NEC box 1, which follows the 1099 account
+ * mapping) to look up the vendor's nonemployee compensation for the year, then renders a
+ * 1099-NEC PDF and returns it inline.
  *
- * Returns 404 if the vendor has no payments in that year or does not appear in
- * the 1099 report (i.e. total < $600 or is_1099 is false).
+ * Returns 404 if the vendor gets no 1099-NEC that year (not a 1099 vendor, NEC box 1 below $600,
+ * or its payments map to 1099-MISC boxes).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { vendor1099Report } from '@/lib/services/statements';
-import { payer1099Info, recipient1099Addresses } from '@/lib/services/form1099Xml';
+import { nec1099Recipients, payer1099Info, recipient1099Addresses } from '@/lib/services/form1099Xml';
 import { ServiceError } from '@/lib/services/_base';
 import { render1099NecPdf } from '@/lib/pdf/form1099';
 import { serviceErrorStatus } from '@/lib/routeErrors';
@@ -50,16 +50,17 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid year value.' }, { status: 400 });
     }
 
-    // Fetch the full 1099 report for the year, then find this vendor.
-    const rows = await vendor1099Report(ctx, { year });
+    // The vendor's NEC box 1 for the year (1099 account mapping, as on the 1099 worksheet).
+    const rows = await nec1099Recipients(ctx, year);
     const vendorRow = rows.find((r) => r.vendorId === vendorId);
 
     if (!vendorRow) {
       return NextResponse.json(
         {
           error:
-            'Vendor not found in 1099 report for this year. ' +
-            'The vendor may not be flagged as is_1099, or total payments may be below $600.',
+            'This vendor has no 1099-NEC for this year. ' +
+            'The vendor may not be marked as a 1099 vendor, its nonemployee compensation (NEC box 1 in your 1099 account mapping) may be below $600, ' +
+            'or its payments map to a 1099-MISC box.',
           code: 'NOT_FOUND',
         },
         { status: 404 },

@@ -28,7 +28,7 @@
  * the NEW date), and re-receives stock — all inside one transaction.
  */
 import { and, asc, desc, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
-import type Decimal from 'decimal.js';
+import Decimal from 'decimal.js';
 import {
   accounts,
   bills,
@@ -216,6 +216,45 @@ export function purchaseUnitCost(
   }
   const typed = Money.of(typedUnitCost);
   return Money.round2(qty.times(typed)).equals(Money.round2(amount)) ? typed : amount.dividedBy(qty);
+}
+
+/**
+ * The FIFO cost layer(s) a purchase of `qty` units stocks so they are worth EXACTLY `posted`, the
+ * home amount the document debited to Inventory Asset. The valuation reports (and every sale)
+ * value a layer at round2(quantity x 4-decimal unit cost), so a single layer at the rounded cost
+ * drifts from the GL on bulk quantities: 1500 units for $50.00 is 1500 x 0.0333 = 49.95, and the
+ * 5 cents stayed on the inventory account after the last unit was sold. Such a line is split into
+ * two layers one hundredth of a cent apart (1000 @ 0.0333 + 500 @ 0.0334 = 50.00); when that
+ * cannot hit the cent, one unit carries the remainder (as landed cost does).
+ */
+export function purchaseLayers(
+  qty: Decimal,
+  unitCost: Decimal,
+  posted: Decimal,
+): Array<{ quantity: Decimal; unitCost: Decimal }> {
+  const target = Money.round2(posted);
+  const worth = (ls: Array<{ quantity: Decimal; unitCost: Decimal }>) =>
+    ls.reduce((s, l) => s.plus(Money.round2(l.quantity.times(l.unitCost))), Money.zero());
+  const one = [{ quantity: qty, unitCost: Money.of(unitCost.toFixed(4)) }];
+  if (!qty.greaterThan(1) || worth(one).equals(target) || target.isNegative()) return one;
+  const base = target.dividedBy(qty).toDecimalPlaces(4, Decimal.ROUND_DOWN);
+  if (qty.isInteger()) {
+    const up = target.minus(qty.times(base)).dividedBy('0.0001');
+    if (up.isInteger() && up.greaterThan(0) && up.lessThan(qty)) {
+      const two = [
+        { quantity: qty.minus(up), unitCost: base },
+        { quantity: up, unitCost: base.plus('0.0001') },
+      ];
+      if (worth(two).equals(target)) return two;
+    }
+  }
+  const rest = qty.minus(1);
+  const last = target.minus(Money.round2(rest.times(base)));
+  const split = [
+    { quantity: rest, unitCost: base },
+    { quantity: Money.of(1), unitCost: last },
+  ];
+  return !last.isNegative() && worth(split).equals(target) ? split : one;
 }
 
 /** True when the item has ever had FIFO cost layers (mirrors inventory.assertNotFifoTracked). */
@@ -502,16 +541,21 @@ export async function receivePurchasedStock(
     const qty = Money.of(line.quantity);
     const currentQty = Money.of(item.quantityOnHand ?? '0');
     const newQty = currentQty.plus(qty);
+    // The HOME amount the document debited to the inventory account for this line.
+    const posted = line.homeAmount != null ? Money.of(line.homeAmount) : Money.round2(qty.times(line.unitCost));
 
     if (await isFifoTracked(tx, line.itemId)) {
-      await tx.db.insert(inventoryLayers).values({
-        companyId: tx.companyId,
-        itemId: line.itemId,
-        date,
-        quantityRemaining: qty.toFixed(4),
-        unitCost: line.unitCost.toFixed(4),
-        sourceRef,
-      });
+      // Layers worth exactly what the entry posted (inventory GL == FIFO valuation to the cent).
+      await tx.db.insert(inventoryLayers).values(
+        purchaseLayers(qty, line.unitCost, posted).map((l) => ({
+          companyId: tx.companyId,
+          itemId: line.itemId!,
+          date,
+          quantityRemaining: l.quantity.toFixed(4),
+          unitCost: l.unitCost.toFixed(4),
+          sourceRef,
+        })),
+      );
       await tx.db
         .update(items)
         .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
@@ -522,7 +566,6 @@ export async function receivePurchasedStock(
         ? line.unitCost
         : currentQty.times(currentAvg).plus(qty.times(line.unitCost)).dividedBy(newQty);
       // The cents the 4dp average cannot represent stay on record and leave with the last unit.
-      const posted = line.homeAmount != null ? Money.of(line.homeAmount) : Money.round2(qty.times(line.unitCost));
       await tx.db
         .update(items)
         .set({

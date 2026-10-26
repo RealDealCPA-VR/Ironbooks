@@ -2,7 +2,8 @@
  * 1099-NEC e-file XML generation.
  *
  * generate1099NecFile — builds a well-formed XML document containing Form1099NEC records
- * for every is_1099 vendor with total payments >= $600 in the requested calendar year.
+ * for every is_1099 vendor with $600 or more of NEC box 1 (per the 1099 account mapping) in the
+ * requested calendar year.
  *
  * The XML is suitable for review and submission to the IRS FIRE (Filing Information
  * Returns Electronically) system, but transmission itself is out of scope for this
@@ -24,10 +25,35 @@
  */
 import { and, eq, inArray } from 'drizzle-orm';
 import { vendors as vendorsTable } from '@/lib/db/schema';
+import { Money } from '@/lib/money';
 import { getCompany } from '@/lib/services/company';
-import { vendor1099Report } from '@/lib/services/statements';
+import { vendor1099Worksheet } from '@/lib/services/statements';
 import type { ServiceContext } from './_base';
 import { ServiceError } from './_base';
+
+/** One 1099-NEC recipient: box 1 (nonemployee compensation) for the year. */
+export interface Nec1099Recipient {
+  vendorId: string;
+  vendorName: string;
+  taxId: string | null;
+  /** Box 1 — nonemployee compensation (2dp). */
+  total: string;
+}
+
+/**
+ * The vendors that get a 1099-NEC for `year`, with their box 1 amount: the 1099 worksheet's NEC
+ * box 1 (it follows the 1099 account mapping, as QB's 1099 wizard does — rent mapped to MISC box 1
+ * and payments on unmapped accounts are not nonemployee compensation), $600 or more. With no
+ * mapping every eligible payment counts toward box 1 (same as the worksheet). The e-file, the
+ * NEC PDF and the e-file page all use this list, so they agree with the 1099 worksheet.
+ */
+export async function nec1099Recipients(ctx: ServiceContext, year: number): Promise<Nec1099Recipient[]> {
+  const ws = await vendor1099Worksheet(ctx, { year });
+  return ws.rows
+    .filter((r) => r.necEligible)
+    .map((r) => ({ vendorId: r.vendorId, vendorName: r.vendorName, taxId: r.taxId, total: r.nec1 }))
+    .sort((a, b) => Money.of(b.total).comparedTo(Money.of(a.total)) || a.vendorName.localeCompare(b.vendorName));
+}
 
 /** Address jsonb ({ line1, line2, city, state, zip, … }) → printable lines (as lib/pdf/forms.ts). */
 function addressToLines(addr: unknown): string[] {
@@ -103,7 +129,7 @@ export interface Generate1099NecFileOptions {
 /**
  * Generate a 1099-NEC XML e-file string for all eligible vendors in the given year.
  *
- * Uses vendor1099Report to identify eligible payees (is_1099 = true, total >= $600).
+ * Uses nec1099Recipients (the 1099 worksheet's NEC box 1, $600 or more) to pick the payees.
  * Payer details are pulled from the active company record.
  *
  * Returns the XML as a UTF-8 string. To submit, upload this file to the IRS FIRE system
@@ -126,8 +152,8 @@ export async function generate1099NecFile(
     throw new ServiceError('NOT_FOUND', 'Company not found');
   }
 
-  // Pull eligible vendors via the shared 1099 report logic.
-  const vendors = await vendor1099Report(ctx, { year });
+  // NEC box 1 per the 1099 account mapping (the 1099 worksheet), $600 or more.
+  const vendors = await nec1099Recipients(ctx, year);
   const addresses = await recipient1099Addresses(ctx, vendors.map((v) => v.vendorId));
   const payerXml = (indent: string) => [
     `${indent}${tag('BusinessName', payer.name)}`,

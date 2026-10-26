@@ -56,7 +56,9 @@ export async function renderPurchaseOrderPdf(
         shipTo: [data.company.name, ...(data.shipToLines ?? data.company.addressLines ?? [])],
       },
       lines: data.lines.map((l) => ({
-        description: l.description || '—',
+        // An item line saved without a description prints the item (the Item column is off by
+        // default, so the vendor would otherwise see "—").
+        description: l.description?.trim() || l.item?.trim() || '—',
         account: l.accountCode ?? '',
         quantity: l.quantity,
         rate: l.rate,

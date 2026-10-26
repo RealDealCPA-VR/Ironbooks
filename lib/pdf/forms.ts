@@ -214,6 +214,17 @@ export async function buildPurchaseOrderPdf(
       .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, accountIds)));
     for (const a of rows) accountMap.set(a.id, a.code);
   }
+  // Item names for the Item column (and for item lines saved without a description).
+  const itemIds = [...new Set(po.lines.map((l) => l.itemId).filter(Boolean))] as string[];
+  const itemNames = new Map<string, string>();
+  if (itemIds.length > 0) {
+    for (const it of await ctx.db
+      .select({ id: items.id, name: items.name })
+      .from(items)
+      .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)))) {
+      itemNames.set(it.id, it.name);
+    }
+  }
   const [letterhead, template] = await Promise.all([
     companyLetterhead(ctx),
     resolveFormTemplate(ctx, 'purchase_order', templateId),
@@ -237,6 +248,7 @@ export async function buildPurchaseOrderPdf(
         quantity: l.quantity,
         rate: l.rate,
         amount: l.amount,
+        item: l.itemId ? (itemNames.get(l.itemId) ?? null) : null,
       })),
     },
     template,

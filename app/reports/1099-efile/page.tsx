@@ -61,7 +61,7 @@ export default function Form1099EfilePage() {
     setError(null);
     setRows(null);
     try {
-      const data = await api.get<Vendor1099Row[]>(`/api/reports/1099?year=${selectedYear}`);
+      const data = await api.get<Vendor1099Row[]>(`/api/reports/1099?year=${selectedYear}&nec=1`);
       setRows(data);
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'Failed to load 1099 vendor list.';
@@ -152,8 +152,9 @@ export default function Form1099EfilePage() {
         </div>
 
         <p className="mt-3 text-xs text-navy/50">
-          Lists 1099-eligible vendors (marked as 1099 in vendor settings) with total payments of
-          $600 or more in the selected calendar year. Sources: bill payments and direct expenses.
+          Lists 1099 vendors (marked as 1099 in vendor settings) with $600 or more of nonemployee
+          compensation (1099-NEC box 1, following your 1099 account mapping) in the selected calendar
+          year. Sources: bill payments, checks and General Journal amounts paid in Pay Bills.
         </p>
       </Card>
 
@@ -170,7 +171,7 @@ export default function Form1099EfilePage() {
                   : `${eligibleCount} eligible vendor${eligibleCount !== 1 ? 's' : ''} found for ${selectedYear}.`}
               </p>
               <p className="mt-0.5 text-xs text-navy/60">
-                Only vendors with total payments of $600 or more are included in the e-file.
+                Only vendors with $600 or more in NEC box 1 are included in the e-file.
               </p>
             </div>
             {eligibleCount > 0 && (

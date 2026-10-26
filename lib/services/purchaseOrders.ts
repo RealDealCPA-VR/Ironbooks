@@ -78,11 +78,14 @@ export interface CreatePurchaseOrderInput {
 // createPurchaseOrder
 // ---------------------------------------------------------------------------
 
-/** Every account / item referenced by PO lines must belong to the current company. */
+/**
+ * Every account / item referenced by PO lines must belong to the current company. Returns the
+ * text an item line's blank description defaults to (the item's description, else its name).
+ */
 async function assertPoLineRefsOwned(
   ctx: ServiceContext,
   lines: ReadonlyArray<{ accountId?: string | null; itemId?: string | null }>,
-) {
+): Promise<Map<string, string>> {
   const acctIds = [...new Set(lines.map((l) => l.accountId).filter((x): x is string => !!x))];
   const itemIds = [...new Set(lines.map((l) => l.itemId).filter((x): x is string => !!x))];
   if (acctIds.length) {
@@ -92,13 +95,30 @@ async function assertPoLineRefsOwned(
       .where(and(inArray(accounts.id, acctIds), eq(accounts.companyId, ctx.companyId)));
     if (found.length !== acctIds.length) throw validation('One of the lines uses an account that does not exist in this company.');
   }
+  const itemText = new Map<string, string>();
   if (itemIds.length) {
     const found = await ctx.db
-      .select({ id: items.id })
+      .select({ id: items.id, name: items.name, description: items.description })
       .from(items)
       .where(and(inArray(items.id, itemIds), eq(items.companyId, ctx.companyId)));
     if (found.length !== itemIds.length) throw validation('One of the lines uses an item that does not exist in this company.');
+    for (const it of found) itemText.set(it.id, it.description?.trim() || it.name);
   }
+  return itemText;
+}
+
+/**
+ * A PO line's description: the one typed, else (item lines) the item's description / name. QB
+ * fills it from the item's purchase description — the vendor reads the printed P.O., which used
+ * to show "—" for an item line left blank (the Item column is off by default).
+ */
+function poLineDescription(
+  line: { itemId?: string | null; description?: string | null },
+  itemText: Map<string, string>,
+): string | null {
+  const typed = line.description?.trim() ? line.description : null;
+  if (typed) return typed;
+  return line.itemId ? (itemText.get(line.itemId) ?? null) : (line.description ?? null);
 }
 
 export async function createPurchaseOrder(
@@ -119,7 +139,7 @@ export async function createPurchaseOrder(
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
-  await assertPoLineRefsOwned(ctx, input.lines);
+  const itemText = await assertPoLineRefsOwned(ctx, input.lines);
 
   // Compute per-line amounts using safe decimal math.
   type ComputedLine = {
@@ -153,7 +173,7 @@ export async function createPurchaseOrder(
     computedLines.push({
       itemId: l.itemId ?? null,
       accountId: l.accountId ?? null,
-      description: l.description ?? null,
+      description: poLineDescription(l, itemText),
       quantity: qty.toFixed(4),
       rate: rate.toFixed(4),
       amount: toAmountString(amount),
@@ -274,7 +294,7 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
-  await assertPoLineRefsOwned(ctx, input.lines);
+  const itemText = await assertPoLineRefsOwned(ctx, input.lines);
 
   return inTransaction(ctx, async (tx) => {
     const [po] = await tx.db
@@ -335,7 +355,7 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
         id: prev?.id ?? null,
         itemId: l.itemId ?? null,
         accountId: l.accountId ?? null,
-        description: l.description ?? null,
+        description: poLineDescription(l, itemText),
         quantity: qty.toFixed(4),
         rate: rate.toFixed(4),
         amount: toAmountString(amount),
