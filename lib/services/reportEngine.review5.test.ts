@@ -20,6 +20,8 @@ import { GL_LIMITS, endOfToday, resolveDateMacro } from './reportEngine';
 import { createCustomer } from './customers';
 import { createInvoice } from './invoices';
 import { createTransfer } from './transfers';
+import { createBankAccount } from './bankAccounts';
+import { completeReconciliation, startReconciliation, toggleCleared, undoLastReconciliation } from './reconcile';
 import { runStandardReport } from './reportRegistry';
 import { arAging, collectionsReport } from './reportsExtra';
 import { createReportSchedule, listReportSchedules, nextRunAfter, runDueSchedules, saveMemorizedReport } from './memorizedReports';
@@ -208,5 +210,35 @@ describe('transfers on the reports', () => {
     expect(filtered.rows.filter((x) => x.kind === 'data').length).toBe(2);
     const journal = await runStandardReport(ctx, 'transaction-detail-by-account', { from: '2026-05-05', to: '2026-05-05', txnType: 'journal', subtotalBy: 'none' });
     expect(journal.rows.filter((x) => x.kind === 'data').length).toBe(0);
+  });
+});
+
+describe('cleared status after Undo Last Reconciliation', () => {
+  it('lines of an undone reconciliation are no longer cleared on the reports', async () => {
+    vi.useRealTimers();
+    // A separate bank account with one deposit, reconciled and then undone.
+    const { createAccount } = await import('./accounts');
+    const bank = await createAccount(ctx, { code: '1020', name: 'Second Bank', type: 'asset' as never, subtype: 'checking' });
+    const je = await postJournalEntry(ctx, {
+      date: d('2026-06-10'),
+      description: 'deposit to second bank',
+      lines: [
+        { accountId: bank.id, debit: '80.00' },
+        { accountId: A['4000'], credit: '80.00' },
+      ],
+    });
+    const lineId = (await db.select().from((await import('@/lib/db/schema')).journalEntryLines).where(eq((await import('@/lib/db/schema')).journalEntryLines.journalEntryId, je.id))).find((l) => l.accountId === bank.id)!.id;
+    const ba = await createBankAccount(ctx, { accountId: bank.id, bankName: 'Second', accountNumber: '000999' } as never);
+    const rec = await startReconciliation(ctx, { bankAccountId: ba.id, statementDate: d('2026-06-30'), statementBalance: '80.00' } as never);
+    await toggleCleared(ctx, rec.id, lineId, true);
+    await completeReconciliation(ctx, rec.id);
+    const run = (cleared?: string) =>
+      runStandardReport(ctx, 'transaction-detail-by-account', { accountId: bank.id, from: '2026-06-01', to: '2026-06-30', subtotalBy: 'none', ...(cleared ? { cleared } : {}) });
+    expect((await run()).rows.find((x) => x.kind === 'data')?.cells.clr).toBe('✓');
+    await undoLastReconciliation(ctx, ba.id);
+    const after = (await run()).rows.find((x) => x.kind === 'data');
+    expect(after?.cells.clr).toBe('');
+    expect((await run('cleared')).rows.filter((x) => x.kind === 'data').length).toBe(0);
+    expect((await run('uncleared')).rows.filter((x) => x.kind === 'data').length).toBe(1);
   });
 });

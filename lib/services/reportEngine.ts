@@ -1275,7 +1275,10 @@ export async function fetchGlLines(
     const like = `%${f.memo.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
     conds.push(sql`(${journalEntryLines.memo} ILIKE ${like} OR ${journalEntries.description} ILIKE ${like})`);
   }
-  const clearedExpr = sql<boolean>`EXISTS (SELECT 1 FROM reconciliation_items ri WHERE ri.journal_entry_line_id = ${journalEntryLines.id} AND ri.is_cleared = true)`;
+  // Cleared = marked in a completed (or the open, in-progress) reconciliation. An undone
+  // reconciliation keeps its items for the history report, but they are not cleared any more
+  // (reconcile.ts undoLastReconciliation) — they used to keep their check mark on every report.
+  const clearedExpr = sql<boolean>`EXISTS (SELECT 1 FROM reconciliation_items ri JOIN reconciliations rc ON rc.id = ri.reconciliation_id WHERE ri.journal_entry_line_id = ${journalEntryLines.id} AND ri.is_cleared = true AND rc.status <> 'undone')`;
   if (f.cleared === 'cleared') conds.push(sql`${clearedExpr}`);
   if (f.cleared === 'uncleared') conds.push(sql`NOT ${clearedExpr}`);
   // A name filter narrows the read in SQL to the lines that can carry that name; the exact name
