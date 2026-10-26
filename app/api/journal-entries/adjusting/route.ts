@@ -6,22 +6,15 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { routeError } from '@/lib/routeErrors';
 import { getAdjustingEntries } from '@/lib/services/journal';
-
-function parseDate(v: string | null): Date | undefined | null {
-  if (!v) return undefined;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? null : d;
-}
+import { queryDate } from '@/lib/validation/helpers';
 
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const sp = req.nextUrl.searchParams;
-    const from = parseDate(sp.get('from'));
-    const to = parseDate(sp.get('to'));
-    if (from === null || to === null) {
-      return NextResponse.json({ error: 'from / to must be valid dates.' }, { status: 400 });
-    }
+    // Real calendar days only (VALIDATION -> 400): new Date('2026-02-30') rolled over to March 2.
+    const from = queryDate(sp, 'from');
+    const to = queryDate(sp, 'to');
     // An inclusive "to" date covers the whole day.
     const toEnd = to ? new Date(to.getTime() + 86_399_999) : undefined;
     return NextResponse.json(
