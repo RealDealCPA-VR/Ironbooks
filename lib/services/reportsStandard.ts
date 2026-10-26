@@ -43,6 +43,7 @@ import {
   customerNames,
   dayStr,
   detailColumns,
+  GL_LIMITS,
   fetchGlLines,
   fiscalWindowFor,
   fmtDay,
@@ -1119,10 +1120,13 @@ export async function transactionList(
   const meta = await loadAccountMeta(ctx);
   const f = glFilterFromParams(meta, p, { from, to });
   if (by === 'customer' || by === 'vendor') f.nameType = by;
-  const { lines: hits, truncated } = await fetchGlLines(ctx, meta, f);
+  const { lines: hits, truncated: hitsCut } = await fetchGlLines(ctx, meta, f);
   const wanted = by === 'date' ? hits : hits.filter((l) => l.nameType === by);
   const entryIds = [...new Set(wanted.map((l) => l.entryId))];
-  const { lines } = await fetchGlLines(ctx, meta, { entryIds });
+  // Every line of those transactions (their total and Split). This read is capped too: when it
+  // is cut, some totals are built from part of their lines, so the report must say so.
+  const { lines, truncated: linesCut } = await fetchGlLines(ctx, meta, { entryIds, limit: GL_LIMITS.maxLines });
+  const truncated = hitsCut || linesCut;
   const byEntry = new Map<string, GlLine[]>();
   for (const l of lines) byEntry.set(l.entryId, [...(byEntry.get(l.entryId) ?? []), l]);
   // One synthetic "line" per transaction for the shared detail layout.

@@ -126,3 +126,41 @@ describe('Trial Balance: fiscal year to date + Retained Earnings (QuickBooks)', 
     expect(total.ties).toBe(true);
   });
 });
+
+/**
+ * Transaction lists read the matching lines, then every line of those transactions (for the
+ * transaction total and the Split). That second read is capped too; when it was cut, a
+ * transaction's total was built from part of its lines and the report did not say so.
+ */
+describe('Transaction List by Date on a large file', () => {
+  it('flags the report when the transactions themselves could not all be read', async () => {
+    const { GL_LIMITS } = await import('./reportEngine');
+    const L: Record<string, string> = {};
+    const [user] = await db.insert(users).values({ email: 'r5-tl@test.local', name: 'R5 TL', passwordHash: 'x' }).returning();
+    const company = await createCompany(db, { name: 'TL Co', ownerId: user.id });
+    const lctx: ServiceContext = { db, companyId: company.id, userId: user.id };
+    for (const a of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) L[a.code] = a.id;
+    // Three deposits, each split over four income lines (5 lines per entry).
+    for (let i = 1; i <= 3; i++) {
+      await postJournalEntry(lctx, {
+        date: d(`2026-03-0${i}`),
+        description: `split ${i}`,
+        lines: [
+          { accountId: L['1000'], debit: '40.00' },
+          ...[1, 2, 3, 4].map(() => ({ accountId: L['4000'], credit: '10.00' })),
+        ],
+      });
+    }
+    const saved = GL_LIMITS.maxLines;
+    try {
+      GL_LIMITS.maxLines = 10; // the 3 bank lines fit; the 15 lines of their transactions do not
+      const r = await runStandardReport(lctx, 'transaction-list-by-date', { from: '2026-03-01', to: '2026-03-31', accountId: L['1000'] });
+      expect(r.truncated).toBe(true);
+    } finally {
+      GL_LIMITS.maxLines = saved;
+    }
+    const full = await runStandardReport(lctx, 'transaction-list-by-date', { from: '2026-03-01', to: '2026-03-31', accountId: L['1000'] });
+    expect(full.truncated).toBe(false);
+    expect(full.rows.filter((x) => x.kind === 'data').map((x) => x.cells.amount)).toEqual(['40.00', '40.00', '40.00']);
+  });
+});
