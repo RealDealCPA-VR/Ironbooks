@@ -34,7 +34,7 @@ process.env.BKA_AUTH_SECRET = 'review5-payroll-routes-secret';
 
 import { and, eq } from 'drizzle-orm';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, employees, users } from '@/lib/db/schema';
+import { accounts, auditLogs, employees, users } from '@/lib/db/schema';
 import { createPortalToken, createSessionToken, hashPassword, PORTAL_COOKIE, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
@@ -54,6 +54,9 @@ import { POST as workersCompPOST } from '@/app/api/payroll/workers-comp/route';
 import { POST as expenseReportsPOST } from '@/app/api/expense-reports/route';
 import { POST as payLiabPOST } from '@/app/api/pay-liabilities/route';
 import { POST as payByItemPOST } from '@/app/api/pay-liabilities/by-item/route';
+import { POST as portalPasswordPOST } from '@/app/api/employees/[id]/portal-password/route';
+import { GET as employeesGET } from '@/app/api/employees/route';
+import { GET as employeeGET, PATCH as employeePATCH } from '@/app/api/employees/[id]/route';
 
 let db: DB;
 let owner: string;
@@ -161,6 +164,44 @@ describe('employee portal', () => {
     h.cookies.set(PORTAL_COOKIE, createPortalToken(emp.id, hash));
     const ok = await paystubGET(req('GET', `/api/payroll/paystub?paycheckId=${live.id}`));
     expect(pdfTexts(new Uint8Array(await ok.arrayBuffer()))).not.toContain('VOID');
+  });
+});
+
+describe('portal password', () => {
+  it('the employee API never sends the portal password hash to the browser', async () => {
+    const emp = await createEmployee(ctx, { firstName: 'Ha', lastName: 'Sh', email: 'hash@example.com', payType: 'hourly', payRate: '20' });
+    await db.update(employees).set({ portalPasswordHash: await hashPassword('portal-pass-3') }).where(eq(employees.id, emp.id));
+    const list = await ownerCall(employeesGET as Handler, 'GET', '/api/employees', { query: '?includeInactive=true' });
+    const rows = (await list.json()) as Array<Record<string, unknown>>;
+    const row = rows.find((r) => r.id === emp.id)!;
+    expect(row).toBeTruthy();
+    expect('portalPasswordHash' in row).toBe(false);
+    expect(row.hasPortalAccess).toBe(true);
+    asOwner('GET', `/api/employees/${emp.id}`);
+    const one = (await (await employeeGET(req('GET', `/api/employees/${emp.id}`), { params: Promise.resolve({ id: emp.id }) })).json()) as Record<string, unknown>;
+    expect('portalPasswordHash' in one).toBe(false);
+    asOwner('PATCH', `/api/employees/${emp.id}`);
+    const patched = (await (await employeePATCH(req('PATCH', `/api/employees/${emp.id}`, { phone: '555-0100' }), { params: Promise.resolve({ id: emp.id }) })).json()) as Record<string, unknown>;
+    expect(patched.phone).toBe('555-0100');
+    expect('portalPasswordHash' in patched).toBe(false);
+  });
+
+  it('setting an employee portal password is recorded in the audit trail (without the hash)', async () => {
+    const emp = await createEmployee(ctx, { firstName: 'Au', lastName: 'Dit', email: 'audit@example.com', payType: 'hourly', payRate: '20' });
+    const route = '/api/employees/[id]/portal-password';
+    asOwner('POST', `/api/employees/${emp.id}/portal-password`);
+    const res = await portalPasswordPOST(req('POST', `/api/employees/${emp.id}/portal-password`, { password: 'portal-pass-9' }), {
+      params: Promise.resolve({ id: emp.id }),
+    });
+    expect(res.status, route).toBe(200);
+    const rows = await db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.companyId, companyId), eq(auditLogs.entityType, 'employee'), eq(auditLogs.entityId, emp.id)));
+    const set = rows.find((r) => r.action === 'update' && (r.newValues as Record<string, unknown> | null)?.portalPassword === 'set');
+    expect(set).toBeTruthy();
+    const [stored] = await db.select({ h: employees.portalPasswordHash }).from(employees).where(eq(employees.id, emp.id));
+    expect(JSON.stringify(set)).not.toContain(stored.h!);
   });
 });
 
