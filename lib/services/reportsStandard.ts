@@ -663,8 +663,11 @@ export async function trialBalanceAmounts(
   asOf: Date,
   basis: Basis,
 ): Promise<{ amounts: Map<string, Decimal>; retainedEarnings: Decimal; fyStart: Date; ledgerBalanced: boolean }> {
-  const [tb, sheet] = await Promise.all([trialBalance(ctx, asOf), sheetAsOf(ctx, asOf, basis)]);
+  const [tb, sheet] = await Promise.all([trialBalance(ctx, asOf), balanceSheet(ctx, asOf)]);
   const fyStart = sheet.fiscalYearStart ? new Date(sheet.fiscalYearStart) : await fiscalYearStartFor(ctx, asOf);
+  // Cash basis: the balanced cash-basis adjustments (cashBasisLedger.ts), computed ONCE and split
+  // here exactly as the cash-basis balance sheet splits them (balanceSheetCashBasis.ts).
+  const adjustments = basis === 'cash' ? (await cashBasisLedger(ctx, { to: asOf })).adjustments.filter((a) => a.date <= asOf) : [];
   const amounts = new Map<string, Decimal>();
   const add = (id: string, v: Decimal) => amounts.set(id, (amounts.get(id) ?? Money.zero()).plus(v));
   const isPL = (id: string) => {
@@ -672,18 +675,21 @@ export async function trialBalanceAmounts(
     return !!a && isPLSection(a.section);
   };
   // Balance-sheet accounts: the balance as of the date (closing entries included — they are part
-  // of Retained Earnings), plus the balanced cash-basis adjustments on the cash basis.
+  // of Retained Earnings), plus their cash-basis adjustments.
   for (const r of tb.rows) if (!isPL(r.accountId)) add(r.accountId, Money.sub(r.debit, r.credit));
-  if (basis === 'cash') {
-    const { adjustments } = await cashBasisLedger(ctx, { to: asOf });
-    for (const a of adjustments) if (!isPL(a.accountId)) add(a.accountId, a.net);
-  }
-  // Income and expense accounts: this fiscal year only.
-  for (const r of await activityByAccount(ctx, { from: fyStart, to: asOf, excludeClose: true, basis })) {
+  for (const a of adjustments) if (!isPL(a.accountId)) add(a.accountId, a.net);
+  // Income and expense accounts: this fiscal year only (and its cash-basis adjustments).
+  for (const r of await activityByAccount(ctx, { from: fyStart, to: asOf, excludeClose: true })) {
     if (isPL(r.accountId)) add(r.accountId, Money.sub(r.debit, r.credit));
   }
+  let priorAdj = Money.zero();
+  for (const a of adjustments) {
+    if (!isPL(a.accountId)) continue;
+    if (a.date >= fyStart) add(a.accountId, a.net);
+    else priorAdj = priorAdj.plus(a.net);
+  }
   // Earlier fiscal years' income (credit = positive earnings → a credit on Retained Earnings).
-  const prior = Money.of(sheet.priorYearsEarnings).negated();
+  const prior = Money.of(sheet.priorYearsEarnings).negated().plus(priorAdj);
   const re = retainedEarningsAccount(meta);
   let retainedEarnings = Money.zero();
   if (re) add(re.id, prior);
