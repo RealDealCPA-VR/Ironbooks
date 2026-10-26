@@ -584,6 +584,11 @@ function agingFamily(side: 'ar' | 'ap', kind: 'summary' | 'detail' | 'open-invoi
       const params = kind === 'open-invoices' || kind === 'collections-report' ? { ...p, agingFrom: 'due_date' as const } : p;
       let { items } = await openItems(ctx, side, params);
       if (kind === 'collections-report') items = items.filter((i) => i.aging !== null && i.aging > 0);
+      // The same "more than N days past due" filter the report applied (reportsAging.ts).
+      if ((kind === 'open-invoices' || kind === 'collections-report') && p.overDays !== undefined) {
+        const over = Number(p.overDays);
+        items = items.filter((i) => i.aging !== null && i.aging > over);
+      }
       let pick: (it: OpenItem) => boolean;
       if (kind === 'summary') {
         const cols = report.columns.filter((c) => c.type === 'money').map((c) => c.key);

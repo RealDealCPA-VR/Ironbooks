@@ -168,6 +168,9 @@ export const REPORT_PARAM_KEYS = [
   'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
   'classId', 'budgetId', 'txnType', 'amountMin', 'amountMax', 'cleared', 'memo', 'number', 'sortBy', 'sortDir',
   'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates', 'interval', 'through', 'agingFrom',
+  // Open Invoices / Collections "more than N days past due": without it an explanation re-ran
+  // the report unfiltered and explained a different number than the page showed.
+  'overDays',
 ] as const;
 
 /** Only the report options from a params object (drops row / col / back and anything unknown). */

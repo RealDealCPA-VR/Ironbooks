@@ -88,3 +88,26 @@ describe('Sales by Item Summary COGS explanation', () => {
     expect(x.formula).toMatch(/when (each|the) sale/i);
   });
 });
+
+describe('Open Invoices / Collections with "more than N days past due"', () => {
+  it('the explanation keeps the filter: it explains the filtered total, not every open invoice', async () => {
+    const { createCustomer } = await import('./customers');
+    const { createInvoice } = await import('./invoices');
+    const { reportOptions } = await import('@/lib/reports/drilldown');
+    const cust = await createCustomer(ctx, { displayName: 'Slow Payer' } as never);
+    await createInvoice(ctx, { customerId: cust.id, date: d('2026-01-01'), dueDate: d('2026-01-31'), lines: [{ accountId: A['4000'], quantity: 1, rate: '300.00', taxable: false }] } as never);
+    await createInvoice(ctx, { customerId: cust.id, date: d('2026-03-01'), dueDate: d('2026-03-26'), lines: [{ accountId: A['4000'], quantity: 1, rate: '45.00', taxable: false }] } as never);
+    // The options the report page sends with each amount's explanation keep the filter.
+    expect(reportOptions({ asOf: '2026-03-31', overDays: '30' })).toMatchObject({ overDays: '30' });
+    for (const key of ['open-invoices', 'collections-report']) {
+      const params = { asOf: '2026-03-31', overDays: '30' };
+      const report = await runStandardReport(ctx, key, params);
+      const grand = report.rows.find((x) => x.id === `${key}:grand`)!;
+      expect(grand.cells.open, key).toBe('300.00');
+      const x = await drilldownCell(ctx, key, params, `${key}:grand`, 'open');
+      expect(x.total, key).toBe('300.00');
+      expect(x.count, key).toBe(1);
+      expect(x.ties, key).toBe(true);
+    }
+  });
+});
