@@ -34,6 +34,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
+import { localDateISO } from '@/lib/dates';
 import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/services/reports';
 import type { ServiceContext } from './_base';
 import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
@@ -306,6 +307,15 @@ function endOfAsOfDay(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 1);
 }
 
+/**
+ * End of TODAY on this computer's calendar (23:59:59.999 UTC of the local day), the default as-of
+ * date. `new Date()` is a UTC moment: in US evenings its UTC day is already tomorrow, which aged
+ * every item a day early and counted documents dated tomorrow.
+ */
+function endOfLocalToday(now: Date = new Date()): Date {
+  return new Date(`${localDateISO(now)}T23:59:59.999Z`);
+}
+
 function ms_to_days(ms: number): number {
   return Math.floor(ms / (1000 * 60 * 60 * 24));
 }
@@ -401,7 +411,7 @@ function bouncedExcessCredits(amount: ReturnType<typeof Money.zero>, payers: Bou
  * creditMemoApplicationsAfter) and General Journal credits applied after it are added back.
  */
 export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   // Invoices dated on/before the cutoff. Do NOT exclude 'paid' — an invoice paid
@@ -735,7 +745,7 @@ async function vendorCreditsOpenAsOf(
 }
 
 export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -1271,7 +1281,7 @@ function buildAgingDetailReport(rows: AgingDetailRow[], cutoff: Date): AgingDeta
  * 'current' rows, mirroring QB's AR Aging Detail.
  */
 export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -1441,7 +1451,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
  * negative 'current' rows.
  */
 export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -1574,7 +1584,9 @@ export interface OpenInvoicesReport {
  * balance due, sorted by customer then date. QB parity: "Open Invoices" report.
  */
 export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesReport> {
-  const now = new Date();
+  // Days overdue count from the end of TODAY on this computer's calendar (as the aging does), not
+  // from the UTC moment (a day ahead in US evenings).
+  const now = endOfLocalToday();
   const rows = await ctx.db
     .select({
       invoiceId: invoices.id,
@@ -1665,7 +1677,7 @@ export interface CollectionsReport {
  * the invoice date) is strictly before the as-of date and it still has a balance.
  */
 export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promise<CollectionsReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const rows = await ctx.db
     .select({
       invoiceId: invoices.id,

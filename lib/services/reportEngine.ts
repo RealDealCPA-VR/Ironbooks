@@ -41,6 +41,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString, type MoneyInput } from '@/lib/money';
+import { localDateISO } from '@/lib/dates';
 import type { CellValue, StdColumn, StdRow } from '@/lib/reports/types';
 import type { ReportParams, TxnTypeKey } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
@@ -444,8 +445,19 @@ export async function resolveRange(
   return { from, to };
 }
 
-export function endOfToday(): Date {
-  return parseDay(dayStr(new Date()), true)!;
+/**
+ * Today's calendar day on this computer ('YYYY-MM-DD'): the desktop app's clock, the same day the
+ * report date fields default to (lib/dates.ts todayISO). The UTC day (`dayStr(new Date())`) is
+ * already tomorrow in US evenings, which ran "Today", "This Month" and the default as-of date a
+ * day ahead.
+ */
+export function localToday(now: Date = new Date()): string {
+  return localDateISO(now);
+}
+
+/** End of today (local calendar day) in the stored-date convention (23:59:59.999 UTC of that day). */
+export function endOfToday(now: Date = new Date()): Date {
+  return parseDay(localToday(now), true)!;
 }
 
 export function resolveAsOf(p: Pick<ReportParams, 'asOf' | 'to'>): Date {
@@ -1705,12 +1717,18 @@ export const DATE_MACROS = [
 ] as const;
 export type DateMacro = (typeof DATE_MACROS)[number];
 
-/** Resolve a relative date range to concrete 'YYYY-MM-DD' from / to (UTC calendar days). */
-export function resolveDateMacro(macro: DateMacro, now: Date, fye?: string | null): { from?: string; to: string } {
+/**
+ * Resolve a relative date range to concrete 'YYYY-MM-DD' from / to. "Today" is `today` when it
+ * is a 'YYYY-MM-DD' calendar day, else the LOCAL calendar day of the moment `now` (localToday):
+ * at 11 pm on Oct 31 in California it is already Nov 1 in UTC, but This Month is still October.
+ */
+export function resolveDateMacro(macro: DateMacro, now: Date | string, fye?: string | null): { from?: string; to: string } {
+  const today = typeof now === 'string' ? now.slice(0, 10) : localToday(now);
+  // Calendar arithmetic on the day itself (UTC midnight of it, the stored-date convention).
+  now = parseDay(today)!;
   const y = now.getUTCFullYear();
   const m = now.getUTCMonth();
   const day = (yy: number, mm: number, dd: number) => dayStr(new Date(Date.UTC(yy, mm, dd)));
-  const today = dayStr(now);
   const q = Math.floor(m / 3);
   switch (macro) {
     case 'today':

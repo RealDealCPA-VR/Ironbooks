@@ -13,6 +13,7 @@ import { and, asc, eq, inArray, lte } from 'drizzle-orm';
 import { memorizedReportGroups, memorizedReports, reportSchedules } from '@/lib/db/schema';
 import { resolveDataDir } from '@/lib/db';
 import { buildXlsx, buildXlsxWorkbook } from '@/lib/export/xlsx';
+import { localDateISO } from '@/lib/dates';
 import { reportToCsv, reportToTable, type StdReport } from '@/lib/reports/types';
 import { type ServiceContext, notFound, validation, writeAudit, inTransaction } from './_base';
 import { runStandardReport, standardReportEntry } from './reportRegistry';
@@ -197,11 +198,12 @@ export async function runMemorizedReport(ctx: ServiceContext, id: string): Promi
 async function runMemorizedRow(
   ctx: ServiceContext,
   row: { name: string; reportType: string; config: Record<string, unknown> },
+  opts: { now?: Date } = {},
 ): Promise<StdReport> {
   if (row.reportType === 'custom') return runCustomReport(ctx, row.name, row.config ?? {});
   const cfg = row.config ?? {};
   const params = (cfg.params && typeof cfg.params === 'object' ? cfg.params : cfg) as Record<string, unknown>;
-  const report = await runStandardReport(ctx, row.reportType, params);
+  const report = await runStandardReport(ctx, row.reportType, params, { now: opts.now });
   const display = (cfg.display ?? {}) as { title?: string; subtitle?: string };
   return { ...report, title: display.title?.trim() || row.name || report.title, subtitle: display.subtitle?.trim() || report.subtitle };
 }
@@ -317,6 +319,7 @@ export interface ProcessedReport {
 export async function processMultipleReports(
   ctx: ServiceContext,
   input: { groupId?: string; ids?: string[] },
+  opts: { now?: Date } = {},
 ): Promise<ProcessedReport[]> {
   requireAnyReportAccess(ctx);
   let rows;
@@ -339,7 +342,7 @@ export async function processMultipleReports(
   const out: ProcessedReport[] = [];
   for (const r of rows) {
     try {
-      out.push({ id: r.id, name: r.name, report: await runMemorizedRow(ctx, r) });
+      out.push({ id: r.id, name: r.name, report: await runMemorizedRow(ctx, r, opts) });
     } catch (err) {
       out.push({ id: r.id, name: r.name, error: err instanceof Error ? err.message : 'Report failed.' });
     }
@@ -373,15 +376,18 @@ export type ScheduleFrequency = 'daily' | 'weekly' | 'monthly';
  * one started Jan 31 runs Feb 28, then Mar 31 — the clamped day never becomes the new anchor.
  */
 export function nextRunAfter(from: Date, frequency: ScheduleFrequency, anchorDay?: number | null): Date {
+  // Calendar arithmetic on this computer's LOCAL calendar (the desktop timer's clock): a run stays
+  // at the same local time of day across daylight-saving changes and on its local calendar day,
+  // which is the day its relative dates ("Last month") are resolved on.
   const d = new Date(from);
-  if (frequency === 'daily') d.setUTCDate(d.getUTCDate() + 1);
-  else if (frequency === 'weekly') d.setUTCDate(d.getUTCDate() + 7);
+  if (frequency === 'daily') d.setDate(d.getDate() + 1);
+  else if (frequency === 'weekly') d.setDate(d.getDate() + 7);
   else {
-    const day = anchorDay && anchorDay >= 1 && anchorDay <= 31 ? anchorDay : d.getUTCDate();
-    d.setUTCDate(1);
-    d.setUTCMonth(d.getUTCMonth() + 1);
-    const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
-    d.setUTCDate(Math.min(day, last));
+    const day = anchorDay && anchorDay >= 1 && anchorDay <= 31 ? anchorDay : d.getDate();
+    d.setDate(1);
+    d.setMonth(d.getMonth() + 1);
+    const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+    d.setDate(Math.min(day, last));
   }
   return d;
 }
@@ -395,6 +401,15 @@ export function reportExportRoot(): string {
   if (process.env.BKA_REPORT_EXPORT_DIR) return path.resolve(process.env.BKA_REPORT_EXPORT_DIR);
   const dataDir = resolveDataDir();
   return path.join(path.dirname(dataDir), 'Report Exports', path.basename(dataDir));
+}
+
+/** Local midnight of a 'YYYY-MM-DD' calendar day (Invalid Date for anything else). */
+function localMidnight(day: string): Date {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!m) return new Date(NaN);
+  const d = new Date(2000, Number(m[2]) - 1, Number(m[3]));
+  d.setFullYear(Number(m[1])); // years below 100 are not 19xx
+  return d.getDate() === Number(m[3]) && d.getMonth() === Number(m[2]) - 1 ? d : new Date(NaN);
 }
 
 function safeSegment(s: string, fallback: string): string {
@@ -440,7 +455,10 @@ export async function createReportSchedule(
       if (area) requirePermission(ctx, area, 'view');
     }
   }
-  const start = input.startDate ? new Date(`${input.startDate}T06:00:00.000Z`) : new Date();
+  // The first run is at the start (local midnight) of the start date on this computer's calendar:
+  // 06:00 UTC was the previous evening west of UTC, so a schedule set to start on the 1st ran on
+  // the last day of the month before and its "Last month" exported the wrong month.
+  const start = input.startDate ? localMidnight(input.startDate) : new Date();
   if (Number.isNaN(start.getTime())) throw validation('Invalid start date.');
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
@@ -452,7 +470,7 @@ export async function createReportSchedule(
         groupId: input.groupId ?? null,
         frequency: input.frequency,
         nextRunAt: start,
-        anchorDay: start.getUTCDate(),
+        anchorDay: start.getDate(),
         format: input.format ?? 'csv',
         folder: input.folder?.trim() || null,
         isActive: input.isActive ?? true,
@@ -476,7 +494,7 @@ export async function updateReportSchedule(
   // otherwise derive it from the next scheduled run so a switch to monthly doesn't drift.
   const frequency = patch.frequency ?? before.frequency;
   const anchorDay =
-    frequency === before.frequency && before.anchorDay ? before.anchorDay : new Date(before.nextRunAt).getUTCDate();
+    frequency === before.frequency && before.anchorDay ? before.anchorDay : new Date(before.nextRunAt).getDate();
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
       .update(reportSchedules)
@@ -566,15 +584,17 @@ export async function runDueSchedules(
         if (!access) throw new Error('The person who set up this schedule no longer has access to this company.');
         runCtx = { ...ctx, access };
       }
+      // Relative dates resolve on the run's own moment (`now`), like the export's date stamp.
       const processed = s.groupId
-        ? await processMultipleReports(runCtx, { groupId: s.groupId })
-        : await processMultipleReports(runCtx, { ids: [s.memorizedReportId!] });
+        ? await processMultipleReports(runCtx, { groupId: s.groupId }, { now })
+        : await processMultipleReports(runCtx, { ids: [s.memorizedReportId!] }, { now });
       const ok = processed.filter((p) => p.report);
       const failed = processed.filter((p) => p.error);
       if (processed.length === 0) throw new Error('The memorized report or group no longer exists.');
       const dir = path.join(root, safeSegment(s.folder ?? '', 'Scheduled'));
       fs.mkdirSync(dir, { recursive: true });
-      const stamp = now.toISOString().slice(0, 10);
+      // The run's local calendar day (the UTC day is tomorrow in US evenings).
+      const stamp = localDateISO(now);
       if (s.format === 'xlsx' && ok.length) {
         const file = path.join(dir, `${safeSegment(s.name, 'Reports')} ${stamp}.xlsx`);
         fs.writeFileSync(file, ok.length === 1 ? buildXlsx({ sheetName: ok[0].report!.title.slice(0, 28), title: ok[0].report!.title, subtitle: ok[0].report!.subtitle, ...reportToTable(ok[0].report!) }) : reportsToWorkbook(ok.map((p) => p.report!)));

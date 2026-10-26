@@ -15,6 +15,7 @@ import {
   companyFiscalYearEnd,
   dayStr,
   fiscalWindowFor,
+  localToday,
   parseDay,
   resolveDateMacro,
   type AccountMeta,
@@ -330,7 +331,8 @@ export function clearReportRunMemo() {
  */
 async function resolvedRange(ctx: ServiceContext, p: ReportParams): Promise<StdReport['range']> {
   try {
-    const today = dayStr(new Date());
+    // Today on this computer's calendar, like the runners' defaults (reportEngine endOfToday).
+    const today = localToday();
     const to = p.to ?? today;
     const asOf = p.asOf ?? p.to ?? today;
     const from = p.from ?? dayStr(fiscalWindowFor(parseDay(to, true)!, await companyFiscalYearEnd(ctx)).start);

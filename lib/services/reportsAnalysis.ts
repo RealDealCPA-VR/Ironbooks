@@ -27,6 +27,7 @@ import {
   activityByAccount,
   customerNames,
   dayStr,
+  endOfToday,
   fetchGlLines,
   fmtDay,
   glFilterFromParams,
@@ -336,7 +337,7 @@ function topN(map: Map<string, { label: string; value: Decimal; href?: string }>
 
 export async function graphData(ctx: ServiceContext, kind: GraphKind, p: ReportParams): Promise<GraphData> {
   if (kind === 'ar' || kind === 'ap') {
-    const asOf = parseDay(p.asOf ?? p.to, true) ?? new Date();
+    const asOf = parseDay(p.asOf ?? p.to, true) ?? endOfToday();
     const aging = kind === 'ar' ? await arAging(ctx, asOf) : await apAging(ctx, asOf);
     const t = aging.totals;
     const labels = ['Current', '1-30', '31-60', '61-90', '> 90'];

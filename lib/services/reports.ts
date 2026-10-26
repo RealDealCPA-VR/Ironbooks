@@ -6,6 +6,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { onOrBeforeDay } from './journal';
 import { Money, toAmountString } from '@/lib/money';
+import { localDateISO } from '@/lib/dates';
 import type { ServiceContext } from './_base';
 import { fiscalYearWindow } from './fiscalClose';
 import { assertBalanceSheetBalanced, assertTrialBalanceBalanced } from './ledgerAssert';
@@ -239,7 +240,9 @@ export async function fiscalYearStartFor(ctx: ServiceContext, date: Date): Promi
  * Σ equity + net income identically; `assertBalanceSheetBalanced` guards that invariant loudly.
  */
 export async function balanceSheet(ctx: ServiceContext, asOf?: Date): Promise<BalanceSheet> {
-  const fyStart = await fiscalYearStartFor(ctx, asOf ?? new Date());
+  // No date: the fiscal year of TODAY on this computer's calendar (the UTC moment is already next
+  // year on a Dec 31 evening in the US, which moved the whole year's income into Retained Earnings).
+  const fyStart = await fiscalYearStartFor(ctx, asOf ?? new Date(`${localDateISO(new Date())}T23:59:59.999Z`));
   const activity = await accountActivity(ctx, asOf, fyStart);
   const assets: ReportLine[] = [];
   const liabilities: ReportLine[] = [];
