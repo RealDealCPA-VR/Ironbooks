@@ -7,7 +7,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq, like, sql } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, assemblyComponents, items as itemsTable, journalEntries, users } from '@/lib/db/schema';
+import { accountantCopies, accounts, assemblyComponents, items as itemsTable, journalEntries, users } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { ServiceError, type ServiceContext } from './_base';
 import { createCompany } from './company';
@@ -32,8 +32,8 @@ import { verifySiteInvariants } from './inventorySiteReports';
 import { handleBulkPost } from '@/lib/lists/bulkRoute';
 import { builtinRole, unionRoles } from '@/lib/permissions/model';
 import { createEntry, listEntries } from './lists/simpleLists';
-import { createType, listTypes } from './typeLists';
-import { createUomSet, listUomSets } from './lists/uom';
+import { createType, listTypes, updateType } from './typeLists';
+import { createUomSet, listUomSets, updateUomSet } from './lists/uom';
 import { createBillingRateLevel, listBillingRateLevels } from './lists/billingRates';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-inventory-review5');
@@ -487,6 +487,19 @@ describe('review5 inventory', () => {
     }
     const ok = await invItem('Good asset');
     await expect(updateItem(ctx, ok.id, { assetAccountId: acct['1000'] })).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
+  it("lists: while an Accountant's Copy is out, a customer type or U/M set can't be made inactive (like any list entry)", async () => {
+    const t = await createType(ctx, 'vendor', { name: 'Freight' });
+    const set = await createUomSet(ctx, { name: 'Dozen', baseUnitName: 'Each', baseUnitAbbrev: 'ea', units: [{ name: 'Dozen', abbrev: 'dz', factor: '12' }] });
+    await db.insert(accountantCopies).values({ companyId: ctx.companyId, side: 'client', status: 'outstanding', dividingDate: '2026-03-31', fileToken: 'r5-token' });
+    await expect(updateType(ctx, 'vendor', t.id, { name: 'Freight', isActive: false })).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(
+      updateUomSet(ctx, set.id, { name: 'Dozen', baseUnitName: 'Each', baseUnitAbbrev: 'ea', isActive: false, units: [{ name: 'Dozen', abbrev: 'dz', factor: '12' }] }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    // Renaming is still fine.
+    await expect(updateType(ctx, 'vendor', t.id, { name: 'Freight & Haulage' })).resolves.toBeTruthy();
+    expect((await listTypes(ctx, 'vendor')).find((x) => x.id === t.id)?.isActive).toBe(true);
   });
 
   // ---- permissions ----

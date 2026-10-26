@@ -86,6 +86,9 @@ export async function updateType(ctx: ServiceContext, kind: TypeListKind, id: st
   const t = tableFor(kind);
   return inTransaction(ctx, async (tx) => {
     const before = await loadType(tx, kind, id);
+    // Making a type inactive is deleting it from the list: refused while an Accountant's Copy is
+    // out (I1), like deleteType and every other list.
+    if (input.isActive === false && before.isActive) await assertListDeleteAllowed(tx, 'delete', 'list entries');
     const v = await validateInput(tx, kind, input, id);
     const [row] = await tx.db
       .update(t)

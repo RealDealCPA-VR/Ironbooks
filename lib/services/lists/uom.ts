@@ -137,6 +137,8 @@ export async function updateUomSet(ctx: ServiceContext, id: string, body: unknow
 async function updateUomSetInTx(ctx: ServiceContext, id: string, body: unknown) {
   const before = await getUomSet(ctx, id);
   const { header, units } = await validateSet(ctx, body, id);
+  // Making a set inactive is deleting it from the list: refused while an Accountant's Copy is out (I1).
+  if (header.isActive === false && before.isActive) await assertListDeleteAllowed(ctx, 'delete', 'unit of measure sets');
   const [used] = await ctx.db.select({ id: items.id }).from(items).where(eq(items.uomSetId, id)).limit(1);
   if (used && header.baseUnitName.toLowerCase() !== before.baseUnitName.toLowerCase()) {
     throw validation('Items already use this set, so its base unit cannot change. Create a new set instead.');
