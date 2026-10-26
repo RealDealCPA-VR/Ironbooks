@@ -65,7 +65,7 @@
  *    bounced-check row; the paid share stays recognized on the original payment date and is
  *    reversed on the bounce date (no past period changes).
  */
-import { and, eq, isNull, lte, sql, type SQL } from 'drizzle-orm';
+import { and, eq, inArray, isNull, lte, sql, type SQL } from 'drizzle-orm';
 import DecimalValue from 'decimal.js';
 type Decimal = DecimalValue;
 import {
@@ -80,6 +80,7 @@ import {
   invoices,
   journalEntries,
   journalEntryLines,
+  journalItemApplications,
   paymentApplications,
   paymentsReceived,
   vendorCredits,
@@ -514,6 +515,43 @@ export async function cashBasisLedger(ctx: ServiceContext, opts: { to?: Date } =
       }
     }
   }
+  // General Journal credits applied to invoices and General Journal vendor credits applied to
+  // bills (journalApplications.ts, kinds invoice_credit / bill_credit) settle the document on the
+  // day they were applied (never before the document — see the date floor below), like a credit
+  // memo or a vendor credit. They write no settlement row of their own on the invoice / bill
+  // (amountPaid / amountCredited only), so without them the share was recognized on the
+  // document's own date as an "undated remainder".
+  if (invIds.length || billIds.length) {
+    const apps = await ctx.db
+      .select({
+        kind: journalItemApplications.kind,
+        invoiceId: journalItemApplications.invoiceId,
+        billId: journalItemApplications.billId,
+        amount: journalItemApplications.amount,
+        date: journalItemApplications.date,
+        entryId: journalItemApplications.journalEntryId,
+        entryNumber: journalEntries.entryNumber,
+      })
+      .from(journalItemApplications)
+      .innerJoin(journalEntries, eq(journalEntries.id, journalItemApplications.journalEntryId))
+      .where(
+        and(
+          eq(journalItemApplications.companyId, ctx.companyId),
+          inArray(journalItemApplications.kind, ['invoice_credit', 'bill_credit']),
+        ),
+      );
+    for (const a of apps) {
+      const key = a.kind === 'invoice_credit' ? `invoice:${a.invoiceId}` : `bill:${a.billId}`;
+      docs.get(key)?.settlements.push({
+        date: a.date,
+        amount: Money.of(a.amount),
+        entryId: a.entryId,
+        txnType: 'journal',
+        num: String(a.entryNumber),
+      });
+    }
+  }
+
   // Refunds of credit memos / vendor credits (refunds of unapplied payments carry no P&L).
   for (const [id, list] of refunds) {
     const d = docs.get(`credit_memo:${id}`) ?? docs.get(`vendor_credit:${id}`);
