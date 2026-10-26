@@ -431,6 +431,9 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     const refund = src.slice(src.indexOf("action: 'refund'"), src.indexOf("action: 'refund'") + 200);
     expect(refund).toMatch(/date: refundDate/);
     expect(src).toMatch(/id="vc-refund-date"/);
+    // Apply to Bill too (the application date drives A/P aging as of a date).
+    const apply = src.slice(src.indexOf("action: 'apply'"), src.indexOf("action: 'apply'") + 200);
+    expect(apply).toMatch(/date: applyDate/);
   });
 
   it('Z: sanity — the helpers see the seeded accounts', async () => {

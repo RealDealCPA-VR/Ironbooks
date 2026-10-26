@@ -628,12 +628,16 @@ interface ApplyModalProps {
 function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps) {
   const [billId, setBillId] = useState('');
   const [amount, setAmount] = useState('');
+  // The day the credit is applied (A/P aging as of a date follows it): today in the user's
+  // calendar by default — without it the server dated it with its UTC clock.
+  const [applyDate, setApplyDate] = useState(() => todayISO());
   const [applying, setApplying] = useState(false);
 
   useEffect(() => {
     if (open) {
       setBillId('');
       setAmount('');
+      setApplyDate(todayISO());
     }
   }, [open]);
 
@@ -658,6 +662,7 @@ function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps
         action: 'apply',
         billId,
         amount,
+        date: applyDate || undefined,
       });
       toast('Credit applied to bill.', 'success');
       onApplied();
@@ -709,6 +714,11 @@ function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps
           {eligibleBills.length === 0 && (
             <p className="mt-1 text-xs text-navy/40">No open bills found for this vendor.</p>
           )}
+        </div>
+
+        <div>
+          <Label htmlFor="apply-date">Date *</Label>
+          <Input id="apply-date" type="date" value={applyDate} onChange={(e) => setApplyDate(e.target.value)} />
         </div>
 
         <div>
