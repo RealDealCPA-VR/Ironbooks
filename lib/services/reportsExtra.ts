@@ -16,6 +16,7 @@ import {
   customers,
   deposits,
   depositLines,
+  employees,
   expenseLines,
   expenses,
   invoiceLines,
@@ -25,6 +26,7 @@ import {
   paymentChecks,
   journalEntryLines,
   paymentApplications,
+  paychecks,
   paymentsReceived,
   salesReceiptLines,
   salesReceipts,
@@ -1819,9 +1821,17 @@ export async function missingChecks(ctx: ServiceContext, accountId?: string): Pr
       ),
     );
 
+  // Paychecks printed with a check number (Print Checks numbers them in the bank account's check
+  // sequence, checkNumbers.ts): left out, their numbers were reported as missing checks.
+  const payRows = (await paycheckChecks(ctx, { accountId, numberedOnly: true })).map((p) => ({
+    accountId: p.bankAccountId,
+    accountName: p.bankAccountName,
+    reference: p.checkNumber,
+  }));
+
   // Collect distinct numeric check numbers per account.
   const byAccount = new Map<string, { name: string; numbers: Set<number> }>();
-  for (const r of [...expRows, ...bpRows, ...pcRows]) {
+  for (const r of [...expRows, ...bpRows, ...pcRows, ...payRows]) {
     if (!r.accountId || !r.reference) continue;
     const trimmed = r.reference.trim();
     if (!/^\d+$/.test(trimmed)) continue;
@@ -1871,7 +1881,7 @@ export interface CheckDetailLine {
 }
 
 export interface CheckDetailRow {
-  source: 'expense' | 'bill_payment' | 'payment_check';
+  source: 'expense' | 'bill_payment' | 'payment_check' | 'paycheck';
   id: string;
   date: string;
   checkNumber: string | null;
@@ -2017,6 +2027,7 @@ export async function checkDetail(
       lines: bpLinesById.get(r.id) ?? [],
     })),
     ...(await paymentCheckDetailRows(ctx, range)),
+    ...(await paycheckDetailRows(ctx, range)),
   ];
   rows.sort(
     (a, b) => a.date.localeCompare(b.date) || (a.checkNumber ?? '').localeCompare(b.checkNumber ?? ''),
@@ -2031,6 +2042,89 @@ export async function checkDetail(
     rows,
     total: toAmountString(total),
   };
+}
+
+/**
+ * Paychecks as checks: each paycheck (not a YTD / liability adjustment) with the bank account its
+ * net pay was drawn on (the posted entry's credit to a checking / savings account). Voided
+ * paychecks stay (QB lists them; their number is used). `numberedOnly` keeps printed ones.
+ */
+async function paycheckChecks(
+  ctx: ServiceContext,
+  opts: { accountId?: string; range?: { from?: Date; to?: Date }; numberedOnly?: boolean },
+) {
+  const conds = [
+    eq(paychecks.companyId, ctx.companyId),
+    eq(paychecks.entryType, 'paycheck'),
+    sql`${journalEntryLines.credit} > 0`,
+    inArray(accounts.subtype, ['checking', 'savings']),
+  ];
+  if (opts.numberedOnly) conds.push(isNotNull(paychecks.checkNumber));
+  if (opts.accountId) conds.push(eq(journalEntryLines.accountId, opts.accountId));
+  if (opts.range?.from) conds.push(gte(paychecks.payDate, opts.range.from));
+  if (opts.range?.to) conds.push(lte(paychecks.payDate, opts.range.to));
+  const rows = await ctx.db
+    .select({
+      id: paychecks.id,
+      payDate: paychecks.payDate,
+      checkNumber: paychecks.checkNumber,
+      netPay: paychecks.netPay,
+      voidedAt: paychecks.voidedAt,
+      entryId: paychecks.postedEntryId,
+      first: employees.firstName,
+      last: employees.lastName,
+      bankAccountId: journalEntryLines.accountId,
+      bankAccountName: accounts.name,
+    })
+    .from(paychecks)
+    .innerJoin(employees, eq(paychecks.employeeId, employees.id))
+    .innerJoin(journalEntryLines, eq(journalEntryLines.journalEntryId, paychecks.postedEntryId))
+    .innerJoin(accounts, and(eq(journalEntryLines.accountId, accounts.id), eq(accounts.companyId, ctx.companyId)))
+    .where(and(...conds));
+  // One row per paycheck (a paycheck draws on one bank account).
+  const seen = new Set<string>();
+  return rows.filter((r) => (seen.has(r.id) ? false : (seen.add(r.id), true)));
+}
+
+/** Paychecks for Check Detail, with the paycheck's other lines (wages, withholdings) as the split. */
+async function paycheckDetailRows(ctx: ServiceContext, range?: { from?: Date; to?: Date }): Promise<CheckDetailRow[]> {
+  const pcs = await paycheckChecks(ctx, { range });
+  const entryIds = pcs.map((p) => p.entryId).filter((x): x is string => !!x);
+  const linesByEntry = new Map<string, (CheckDetailLine & { accountId: string })[]>();
+  for (let i = 0; i < entryIds.length; i += 2000) {
+    for (const l of await ctx.db
+      .select({
+        entryId: journalEntryLines.journalEntryId,
+        accountId: journalEntryLines.accountId,
+        accountName: accounts.name,
+        memo: journalEntryLines.memo,
+        debit: journalEntryLines.debit,
+        credit: journalEntryLines.credit,
+      })
+      .from(journalEntryLines)
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(inArray(journalEntryLines.journalEntryId, entryIds.slice(i, i + 2000)))
+      .orderBy(asc(journalEntryLines.createdAt), asc(journalEntryLines.id))) {
+      const list = linesByEntry.get(l.entryId) ?? [];
+      list.push({ description: l.memo, detail: l.accountName, amount: toAmountString(Money.sub(l.debit, l.credit)), accountId: l.accountId });
+      linesByEntry.set(l.entryId, list);
+    }
+  }
+  return pcs.map((p) => ({
+    source: 'paycheck' as const,
+    id: p.id,
+    date: p.payDate.toISOString(),
+    checkNumber: p.checkNumber,
+    payee: `${p.first} ${p.last}`.trim(),
+    bankAccountId: p.bankAccountId,
+    bankAccountName: p.bankAccountName,
+    amount: toAmountString(p.netPay),
+    voided: p.voidedAt !== null,
+    // Every line but the bank side; together they add up to the net pay.
+    lines: (linesByEntry.get(p.entryId ?? '') ?? [])
+      .filter((l) => l.accountId !== p.bankAccountId)
+      .map(({ description, detail, amount }) => ({ description, detail, amount })),
+  }));
 }
 
 /** p1 purchases: Sales Tax Payment, Liability and customer refund checks for Check Detail. */
