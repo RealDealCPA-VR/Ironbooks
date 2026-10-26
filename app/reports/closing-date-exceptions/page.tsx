@@ -6,15 +6,12 @@ import { getPageContext } from '@/lib/context';
 import { formatCurrency } from '@/lib/money';
 import { closingDateExceptionReport } from '@/lib/services/accountant/auditReports';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
+// The change's own day and time on this computer's calendar and clock (they were UTC).
+import { localDateTime, localDayRange } from '@/lib/reports/dates';
 
 export const dynamic = 'force-dynamic';
 
 const OP_LABEL: Record<string, string> = { post: 'Added', void: 'Voided', reclassify: 'Reclassified' };
-
-function day(v: string | undefined, end: boolean): Date | undefined {
-  if (!v || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return undefined;
-  return new Date(`${v}T${end ? '23:59:59.999' : '00:00:00.000'}Z`);
-}
 
 export default async function ClosingDateExceptionsPage({
   searchParams,
@@ -23,7 +20,7 @@ export default async function ClosingDateExceptionsPage({
 }) {
   const ctx = await getPageContext('/reports/closing-date-exceptions');
   const p = await searchParams;
-  const report = await closingDateExceptionReport(ctx, { from: day(p.from, false), to: day(p.to, true) });
+  const report = await closingDateExceptionReport(ctx, localDayRange(p.from, p.to));
 
   const exportTable: ExportTable = {
     filename: 'closing-date-exceptions',
@@ -39,7 +36,7 @@ export default async function ClosingDateExceptionsPage({
       { header: 'Amount', numeric: true },
     ],
     rows: report.rows.map((r) => [
-      r.at.slice(0, 16).replace('T', ' '),
+      localDateTime(r.at),
       r.user ?? '',
       r.source === 'override' ? OP_LABEL[r.operation] ?? r.operation : 'Entered after close',
       r.entryNumber ?? '',
@@ -96,7 +93,7 @@ export default async function ClosingDateExceptionsPage({
               )}
               {report.rows.map((r) => (
                 <Tr key={`${r.auditLogId ?? 'je'}-${r.entryId}`}>
-                  <Td className="whitespace-nowrap">{r.at.slice(0, 16).replace('T', ' ')}</Td>
+                  <Td className="whitespace-nowrap">{localDateTime(r.at)}</Td>
                   <Td>{r.user ?? '—'}</Td>
                   <Td>
                     {r.source === 'override' ? (
