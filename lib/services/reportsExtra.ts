@@ -1880,6 +1880,11 @@ export interface CheckDetailLine {
   amount: string;
 }
 
+/** Home-currency value of a document amount at its own exchange rate (none / 1 = home). */
+function homeValue(amount: string, rate: string | null | undefined) {
+  return rate && !Money.eq(rate, 1) ? Money.round2(Money.of(amount).times(Money.of(rate))) : Money.of(amount);
+}
+
 export interface CheckDetailRow {
   source: 'expense' | 'bill_payment' | 'payment_check' | 'paycheck';
   id: string;
@@ -1889,6 +1894,8 @@ export interface CheckDetailRow {
   bankAccountId: string;
   bankAccountName: string;
   amount: string;
+  /** Home-currency amount (a check on a foreign bank account is in its own currency). */
+  homeAmount?: string;
   voided: boolean;
   lines: CheckDetailLine[];
 }
@@ -1924,6 +1931,7 @@ export async function checkDetail(
       accountId: expenses.paymentAccountId,
       accountName: accounts.name,
       total: expenses.total,
+      rate: expenses.exchangeRate,
       voidedAt: expenses.voidedAt,
     })
     .from(expenses)
@@ -1972,6 +1980,7 @@ export async function checkDetail(
       accountId: billPayments.paymentAccountId,
       accountName: accounts.name,
       amount: billPayments.amount,
+      rate: billPayments.exchangeRate,
       voidedAt: billPayments.voidedAt,
     })
     .from(billPayments)
@@ -2011,6 +2020,7 @@ export async function checkDetail(
       bankAccountId: r.accountId,
       bankAccountName: r.accountName,
       amount: toAmountString(r.total),
+      homeAmount: toAmountString(homeValue(r.total, r.rate)),
       voided: r.voidedAt !== null,
       lines: expLinesById.get(r.id) ?? [],
     })),
@@ -2023,6 +2033,7 @@ export async function checkDetail(
       bankAccountId: r.accountId!,
       bankAccountName: r.accountName,
       amount: toAmountString(r.amount),
+      homeAmount: toAmountString(homeValue(r.amount, r.rate)),
       voided: r.voidedAt !== null,
       lines: bpLinesById.get(r.id) ?? [],
     })),
@@ -2033,8 +2044,9 @@ export async function checkDetail(
     (a, b) => a.date.localeCompare(b.date) || (a.checkNumber ?? '').localeCompare(b.checkNumber ?? ''),
   );
 
+  // Home currency: a foreign bank account's check counts at its own rate (its row keeps its currency).
   let total = Money.zero();
-  for (const r of rows) if (!r.voided) total = total.plus(Money.of(r.amount));
+  for (const r of rows) if (!r.voided) total = total.plus(Money.of(r.homeAmount ?? r.amount));
 
   return {
     from: range?.from?.toISOString(),
@@ -2210,6 +2222,8 @@ export async function depositDetail(
       accountName: accounts.name,
       memo: deposits.memo,
       total: deposits.total,
+      homeTotal: deposits.homeTotal,
+      rate: deposits.exchangeRate,
       voidedAt: deposits.voidedAt,
     })
     .from(deposits)
@@ -2244,7 +2258,8 @@ export async function depositDetail(
   let total = Money.zero();
   const rows: DepositDetailRow[] = depRows.map((r) => {
     const voided = r.voidedAt !== null;
-    if (!voided) total = total.plus(Money.of(r.total));
+    // Home currency: a deposit to a foreign bank account counts at the home value it posted.
+    if (!voided) total = total.plus(r.homeTotal != null ? Money.of(r.homeTotal) : homeValue(r.total, r.rate));
     return {
       id: r.id,
       date: r.date.toISOString(),

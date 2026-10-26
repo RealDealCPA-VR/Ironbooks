@@ -95,3 +95,43 @@ describe('paychecks are checks on the check reports', () => {
     expect(r.rows.filter((x) => x.source === 'paycheck').map((x) => x.checkNumber)).toEqual(['1004']);
   });
 });
+
+/**
+ * Check Detail and Deposit Detail totals are in home currency. A check or deposit on a foreign
+ * bank account keeps its own currency on its row, but the TOTAL added those amounts to the
+ * dollar ones as if they were dollars (EUR 100 + USD 50 = "150.00").
+ */
+describe('Check / Deposit Detail totals with a foreign-currency bank account', () => {
+  let fctx: ServiceContext;
+  const F: Record<string, string> = {};
+  beforeAll(async () => {
+    const { setBaseCurrency, upsertCurrency, setAccountCurrency } = await import('./currencies');
+    const { createAccount } = await import('./accounts');
+    const [user] = await db.insert(users).values({ email: 'r5-extra-fx@test.local', name: 'R5 FX', passwordHash: 'x' }).returning();
+    const company = await createCompany(db, { name: 'FX Checks Co', ownerId: user.id });
+    fctx = { db, companyId: company.id, userId: user.id };
+    for (const a of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) F[a.code] = a.id;
+    await setBaseCurrency(fctx, { code: 'USD', name: 'US Dollar' });
+    await upsertCurrency(fctx, { code: 'EUR', name: 'Euro', rateToBase: '1.20' });
+    F.eur = (await createAccount(fctx, { code: '1020', name: 'Euro Bank', type: 'asset' as never, subtype: 'checking' })).id;
+    await setAccountCurrency(fctx, F.eur, 'EUR');
+    await createExpense(fctx, { payeeName: 'Paris Supplier', date: d('2026-08-01'), method: 'check', reference: '501', paymentAccountId: F.eur, currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: F['6000'], amount: '100.00' }] } as never);
+    await createExpense(fctx, { payeeName: 'Local Supplier', date: d('2026-08-02'), method: 'check', reference: '1001', paymentAccountId: F['1000'], lines: [{ accountId: F['6000'], amount: '50.00' }] } as never);
+    const { createDeposit } = await import('./deposits');
+    await createDeposit(fctx, { depositAccountId: F.eur, date: d('2026-08-03'), exchangeRate: '1.20', extraLines: [{ accountId: F['3000'], amount: '100.00' }] });
+    await createDeposit(fctx, { depositAccountId: F['1000'], date: d('2026-08-04'), extraLines: [{ accountId: F['3000'], amount: '50.00' }] });
+  });
+
+  it('Check Detail: EUR 100 at 1.20 + USD 50 = 170.00', async () => {
+    const r = await checkDetail(fctx, { from: d('2026-08-01'), to: d('2026-08-31') });
+    expect(r.rows.map((x) => x.amount).sort()).toEqual(['100.00', '50.00']);
+    expect(r.total).toBe('170.00');
+  });
+
+  it('Deposit Detail: EUR 100 at 1.20 + USD 50 = 170.00', async () => {
+    const { depositDetail } = await import('./reportsExtra');
+    const r = await depositDetail(fctx, { from: d('2026-08-01'), to: d('2026-08-31') });
+    expect(r.rows.map((x) => x.total).sort()).toEqual(['100.00', '50.00']);
+    expect(r.total).toBe('170.00');
+  });
+});
