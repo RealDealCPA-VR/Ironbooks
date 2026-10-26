@@ -236,25 +236,66 @@ function parseOFXSgml(content: string): OFXNode {
   return root;
 }
 
+/** A value that may be one node or several (SGML repeats become arrays). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const many = (v: any): any[] => (Array.isArray(v) ? v : v ? [v] : []);
+
 /**
- * Navigate the parsed SGML tree to the BANKTRANLIST node.
- * Handles both bank (BANKMSGSRSV1) and credit-card (CREDITCARDMSGSRSV1) message sets.
+ * Every statement in the file: its account id (ACCTID) and its BANKTRANLIST. Handles bank
+ * (BANKMSGSRSV1) and credit-card (CREDITCARDMSGSRSV1) message sets, each with one or several
+ * statements — a bank's "download all accounts" Web Connect file holds one per account.
  */
-function findBankTranList(doc: OFXNode): OFXNode | null {
+function findStatements(doc: OFXNode): Array<{ acctId: string | null; tranList: OFXNode | null }> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const d = doc as any;
-  return (
-    d?.OFX?.BANKMSGSRSV1?.STMTTRNRS?.STMTRS?.BANKTRANLIST ??
-    d?.OFX?.CREDITCARDMSGSRSV1?.CCSTMTTRNRS?.CCSTMTRS?.BANKTRANLIST ??
-    null
+  const out: Array<{ acctId: string | null; tranList: OFXNode | null }> = [];
+  for (const rs of many(d?.OFX?.BANKMSGSRSV1?.STMTTRNRS)) {
+    for (const st of many(rs?.STMTRS)) {
+      out.push({ acctId: st?.BANKACCTFROM?.ACCTID != null ? String(st.BANKACCTFROM.ACCTID) : null, tranList: st?.BANKTRANLIST ?? null });
+    }
+  }
+  for (const rs of many(d?.OFX?.CREDITCARDMSGSRSV1?.CCSTMTTRNRS)) {
+    for (const st of many(rs?.CCSTMTRS)) {
+      out.push({ acctId: st?.CCACCTFROM?.ACCTID != null ? String(st.CCACCTFROM.ACCTID) : null, tranList: st?.BANKTRANLIST ?? null });
+    }
+  }
+  return out;
+}
+
+const digitsOf = (s: string | null | undefined) => String(s ?? '').replace(/\D/g, '');
+
+/**
+ * The statement to import. One statement: that one. Several (one per account): the one whose
+ * ACCTID is the bank account's number (or, failing that, the only one ending in the same last
+ * four digits). Several and no match: VALIDATION naming the accounts — the parser used to find
+ * no transaction list at all in such a file and "import" 0 rows without a word.
+ */
+function pickStatement(
+  statements: Array<{ acctId: string | null; tranList: OFXNode | null }>,
+  accountNumber: string | null | undefined,
+): OFXNode | null {
+  if (statements.length === 0) return null;
+  if (statements.length === 1) return statements[0].tranList;
+  const want = digitsOf(accountNumber);
+  if (want) {
+    const exact = statements.filter((st) => digitsOf(st.acctId) === want);
+    if (exact.length === 1) return exact[0].tranList;
+    const last4 = statements.filter((st) => want.length >= 4 && digitsOf(st.acctId).slice(-4) === want.slice(-4));
+    if (exact.length === 0 && last4.length === 1) return last4[0].tranList;
+  }
+  const ends = statements.map((st) => (st.acctId ? `…${digitsOf(st.acctId).slice(-4) || st.acctId}` : 'an unnamed account')).join(', ');
+  throw new ServiceError(
+    'VALIDATION',
+    `This file has statements for ${statements.length} accounts (${ends}), and none of them is this bank account's number. Download one account at a time, or enter this account's number on the bank account.`,
   );
 }
 
 /**
  * Parse an OFX or QBO file and return normalized transaction rows.
- * Handles SGML (unclosed tags) and arbitrary header lines before <OFX>.
+ * Handles SGML (unclosed tags) and arbitrary header lines before <OFX>. A file with statements
+ * for several accounts yields the statement of `accountNumber` (see pickStatement).
  */
-export function parseOFX(content: string): ParsedTransaction[] {
+export function parseOFX(content: string, accountNumber?: string | null): ParsedTransaction[] {
   let doc: OFXNode;
   try {
     doc = parseOFXSgml(content);
@@ -271,7 +312,7 @@ export function parseOFX(content: string): ParsedTransaction[] {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const stmtList = findBankTranList(doc) as any;
+  const stmtList = pickStatement(findStatements(doc), accountNumber) as any;
   if (!stmtList) return []; // valid OFX with no transactions
 
   // STMTTRN: single object (one txn) or array (multiple txns).
@@ -655,7 +696,7 @@ export async function importTransactions(
 ): Promise<ImportSummary> {
   // 1. Verify the bank account belongs to this company.
   const [bankAccount] = await ctx.db
-    .select({ id: bankAccounts.id, glAccountId: bankAccounts.accountId })
+    .select({ id: bankAccounts.id, glAccountId: bankAccounts.accountId, accountNumber: bankAccounts.accountNumber })
     .from(bankAccounts)
     .where(
       and(eq(bankAccounts.id, input.bankAccountId), eq(bankAccounts.companyId, ctx.companyId)),
@@ -708,7 +749,7 @@ export async function importTransactions(
       parsed = parseRows(input.rows ?? []);
     } else {
       // ofx and qbo use the same parser.
-      parsed = parseOFX(input.content);
+      parsed = parseOFX(input.content, bankAccount.accountNumber);
     }
   } catch (err) {
     parseError = err instanceof Error ? err.message : String(err);

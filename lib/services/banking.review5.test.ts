@@ -427,3 +427,68 @@ describe('Reconcile on a large file', () => {
     expect(lines.map((l) => l.journalEntryId)).toEqual([fresh.id]);
   }, 180_000);
 });
+
+// ---------------------------------------------------------------------------
+// Bank account links
+// ---------------------------------------------------------------------------
+
+describe('linking a bank account', () => {
+  it('a GL account can be linked once (a double-clicked Add Account made two reconcile histories)', async () => {
+    const { createBankAccount } = await import('./bankAccounts');
+    await createBankAccount(ctx, { accountId: acct['1000'], bankName: 'First Bank', accountNumber: '1234' });
+    await expectCode(createBankAccount(ctx, { accountId: acct['1000'], bankName: 'First Bank', accountNumber: '1234' }), 'CONFLICT', /already linked/i);
+    const rows = await db.select().from(bankAccounts).where(eq(bankAccounts.accountId, acct['1000']));
+    expect(rows).toHaveLength(1);
+  });
+
+  it('a bank name that is not text is a VALIDATION error, not a crash', async () => {
+    const { createBankAccount } = await import('./bankAccounts');
+    await expectCode(createBankAccount(ctx, { accountId: acct['1000'], bankName: 123 as never, accountNumber: '1234' }), 'VALIDATION');
+    await expectCode(createBankAccount(ctx, { accountId: acct['1000'], bankName: 'B'.repeat(300), accountNumber: '1234' }), 'VALIDATION');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Web Connect / OFX files with several accounts
+// ---------------------------------------------------------------------------
+
+describe('OFX file with several accounts', () => {
+  const stmt = (acctId: string, fit: string, amt: string) => `<STMTTRNRS>
+<TRNUID>1
+<STMTRS>
+<CURDEF>USD
+<BANKACCTFROM>
+<BANKID>021000021
+<ACCTID>${acctId}
+<ACCTTYPE>CHECKING
+</BANKACCTFROM>
+<BANKTRANLIST>
+<DTSTART>20260301
+<DTEND>20260331
+<STMTTRN>
+<TRNTYPE>DEBIT
+<DTPOSTED>20260305
+<TRNAMT>${amt}
+<FITID>${fit}
+<NAME>SHELL OIL
+</STMTTRN>
+</BANKTRANLIST>
+</STMTRS>
+</STMTTRNRS>`;
+  const file = (...parts: string[]) => `OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\n\n<OFX>\n<BANKMSGSRSV1>\n${parts.join('\n')}\n</BANKMSGSRSV1>\n</OFX>`;
+
+  it('imports the statement of the account being imported into (matched by account number)', async () => {
+    const ba = await linkBank('1000'); // account number 000123456789
+    const content = file(stmt('999988887777', 'A1', '-10.00'), stmt('000123456789', 'B1', '-45.00'));
+    const res = await importTransactions(ctx, { bankAccountId: ba, fileType: 'ofx', content });
+    expect(res.imported).toBe(1);
+    const staged = await db.select().from(bankTransactions).where(eq(bankTransactions.bankAccountId, ba));
+    expect(staged.map((s) => s.amount)).toEqual(['-45.00']);
+  });
+
+  it('refuses a file with several accounts when none matches, instead of importing nothing silently', async () => {
+    const ba = await linkBank('1000');
+    const content = file(stmt('999988887777', 'A1', '-10.00'), stmt('555544443333', 'B1', '-45.00'));
+    await expectCode(importTransactions(ctx, { bankAccountId: ba, fileType: 'ofx', content }), 'VALIDATION', /7777.*3333|accounts/);
+  });
+});
