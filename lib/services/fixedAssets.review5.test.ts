@@ -7,6 +7,9 @@
  *     both count: the asset's accumulated depreciation equals the Accumulated Depreciation
  *     account (it used to keep only one of them), and the default accounts are created once.
  *  C. Concurrent posts never depreciate past cost - salvage.
+ *  D. Depreciation goes to a Depreciation Expense / Accumulated Depreciation account, never to
+ *     whatever happens to be numbered 6800 / 1590 in a chart converted from QuickBooks (a bank
+ *     account at 1590 was credited with the depreciation, a Telephone expense at 6800 debited).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
@@ -109,5 +112,60 @@ describe('fixed assets (review round 5)', () => {
     expect(after.accumulatedDepreciation).toBe('300.00');
     const posted = after.depreciationEntries.reduce((s, e) => s + Number(e.amount), 0);
     expect(posted).toBe(300);
+  });
+
+  it('D: a converted chart with other accounts at 1590 / 6800 keeps them out of depreciation', async () => {
+    const [user] = await db.insert(users).values({ email: 'r5d@fa.test', name: 'Dee', passwordHash: 'x' }).returning();
+    const [company] = await db.insert(companies).values({ name: 'Review5 FA converted', ownerId: user.id }).returning();
+    const c: ServiceContext = { db, companyId: company.id, userId: user.id };
+    const petty = await createAccount(c, { code: '1590', name: 'Petty Cash', type: 'asset', subtype: 'checking' });
+    const phone = await createAccount(c, { code: '6800', name: 'Telephone', type: 'expense', subtype: 'operating_expenses' });
+    // The converted chart's own Accumulated Depreciation, under another number.
+    const accum = await createAccount(c, { code: '1750', name: 'Accumulated Depreciation', qbType: 'fixed_asset' });
+
+    const asset = await createAsset(c, {
+      name: 'Forklift',
+      cost: '1200.00',
+      usefulLifeMonths: 12,
+      placedInService: new Date('2026-01-01T00:00:00Z'),
+    });
+    const res = await postDepreciation(c, { assetId: asset.id, date: new Date('2026-01-31T00:00:00Z') });
+    expect(res.periodAmount).toBe('100.00');
+
+    // Nothing landed on Petty Cash or Telephone.
+    expect((await getAccount(c, petty.id)).balance).toBe('0.00');
+    expect((await getAccount(c, phone.id)).balance).toBe('0.00');
+    // The chart's Accumulated Depreciation took the credit; a Depreciation Expense account was made.
+    expect((await getAccount(c, accum.id)).balance).toBe('-100.00');
+    const all = await db.select().from(accounts).where(eq(accounts.companyId, company.id));
+    const expense = all.filter((a) => a.name === 'Depreciation Expense');
+    expect(expense).toHaveLength(1);
+    expect(expense[0].type).toBe('expense');
+    expect(expense[0].code).not.toBe('6800');
+    expect((await getAccount(c, expense[0].id)).balance).toBe('100.00');
+    // A second period reuses the same accounts.
+    await postDepreciation(c, { assetId: asset.id, date: new Date('2026-02-28T00:00:00Z') });
+    expect((await getAccount(c, accum.id)).balance).toBe('-200.00');
+    expect((await db.select().from(accounts).where(eq(accounts.companyId, company.id))).length).toBe(all.length);
+
+    // An asset that names its own accounts must name the right kind (not a bank account).
+    await expect(
+      createAsset(c, {
+        name: 'Van',
+        cost: '600.00',
+        usefulLifeMonths: 6,
+        placedInService: new Date('2026-01-01T00:00:00Z'),
+        accumulatedDepreciationAccountId: petty.id,
+      }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(
+      createAsset(c, {
+        name: 'Van',
+        cost: '600.00',
+        usefulLifeMonths: 6,
+        placedInService: new Date('2026-01-01T00:00:00Z'),
+        depreciationExpenseAccountId: accum.id,
+      }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
   });
 });
