@@ -36,11 +36,11 @@ import { verifySiteInvariants } from './inventorySiteReports';
 import { createBin, createSite, listBins, updateBin } from './inventorySites';
 import { handleBulkPost } from '@/lib/lists/bulkRoute';
 import { builtinRole, unionRoles } from '@/lib/permissions/model';
-import { createEntry, listEntries } from './lists/simpleLists';
+import { createEntry, listEntries, updateEntry } from './lists/simpleLists';
 import { createType, listTypes, updateType } from './typeLists';
 import { createUomSet, listUomSets, updateUomSet } from './lists/uom';
 import { createBillingRateLevel, listBillingRateLevels } from './lists/billingRates';
-import { auditLogs, companies } from '@/lib/db/schema';
+import { auditLogs, companies, customers as customersTable } from '@/lib/db/schema';
 import { physicalCount } from './inventoryOps';
 import { inventoryCenterList } from './lists/inventoryCenter';
 import { bulkLoad, bulkSave } from './lists/bulk';
@@ -786,6 +786,17 @@ describe('review5 inventory', () => {
     await expectOneCreated(
       await Promise.allSettled([updateItem(ctx, a.id, { barcode: '0042' }), updateItem(ctx, b.id, { barcode: '0042' })]),
     );
+  });
+
+  it("lists: changing a sales tax code's taxable flag updates the items and customers that use the code", async () => {
+    const code = await createEntry(ctx, 'sales-tax-codes', { code: 'Res', description: 'Resale', taxable: true });
+    const it0 = await createItem(ctx, { name: 'Coded widget', type: 'service', salesTaxCodeId: code.id, incomeAccountId: acct['4000'] } as never);
+    const cust = await createCustomer(ctx, { displayName: 'Coded customer', salesTaxCodeId: code.id } as never);
+    expect(it0.taxable).toBe(true);
+    await updateEntry(ctx, 'sales-tax-codes', code.id, { taxable: false });
+    expect((await itemRow(it0.id)).taxable).toBe(false);
+    const [c] = await db.select().from(customersTable).where(eq(customersTable.id, cust.id));
+    expect(c.taxable).toBe(false);
   });
 
   it('Transactions by Serial/Lot Number names checks and vendor credits (label and number)', async () => {

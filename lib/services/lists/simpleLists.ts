@@ -17,6 +17,8 @@ import type { z } from 'zod';
 import {
   billingRateLevels,
   customerMessages,
+  customers,
+  items,
   jobTypes,
   listSeeds,
   otherNames,
@@ -412,7 +414,31 @@ async function updateEntryInTx(ctx: ServiceContext, key: SimpleListKey, id: stri
     const set: Record<string, unknown> = { ...data };
     if ('updatedAt' in t) set.updatedAt = new Date();
     const [row] = await tx.db.update(t).set(set).where(and(eq(t.id, id), eq(t.companyId, tx.companyId))).returning();
-    await writeAudit(tx, { action: 'update', entityType: def.entityType, entityId: id, oldValues: before, newValues: row });
+    // Items and customers keep a `taxable` flag that mirrors their Sales Tax Code (lists/fields.ts)
+    // and decides the default taxability of every new sales line: a code that becomes taxable /
+    // non-taxable takes the records that use it along.
+    let mirrored: { items: number; customers: number } | undefined;
+    if (key === 'sales-tax-codes' && Boolean(before.taxable) !== Boolean((row as Row).taxable)) {
+      const taxable = Boolean((row as Row).taxable);
+      const itemRows = await tx.db
+        .update(items)
+        .set({ taxable, updatedAt: new Date() })
+        .where(and(eq(items.companyId, tx.companyId), eq(items.salesTaxCodeId, id)))
+        .returning({ id: items.id });
+      const customerRows = await tx.db
+        .update(customers)
+        .set({ taxable, updatedAt: new Date() })
+        .where(and(eq(customers.companyId, tx.companyId), eq(customers.salesTaxCodeId, id)))
+        .returning({ id: customers.id });
+      mirrored = { items: itemRows.length, customers: customerRows.length };
+    }
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: def.entityType,
+      entityId: id,
+      oldValues: before,
+      newValues: mirrored ? { ...row, taxableMirroredTo: mirrored } : row,
+    });
     return row as Row;
   });
 }
