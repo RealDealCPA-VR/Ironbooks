@@ -557,3 +557,33 @@ describe('editing a foreign-currency deposit or transfer keeps its rate', () => 
     expect(edited.postedEntryId).toBe(t.postedEntryId);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Statement PDFs longer than the page limit
+// ---------------------------------------------------------------------------
+
+describe('statement PDF longer than the pages read', () => {
+  it('says that pages were left out instead of silently reading only the first ones', async () => {
+    const { PDFDocument, StandardFonts } = await import('pdf-lib');
+    const { extractBankFile } = await import('./statementImport');
+    const ba = await linkBank('1000');
+    const pdf = await PDFDocument.create();
+    const font = await pdf.embedFont(StandardFonts.Helvetica);
+    const N = 42;
+    for (let p = 1; p <= N; p++) {
+      const page = pdf.addPage([612, 792]);
+      const lines =
+        p === 1
+          ? ['First Community Bank', 'Statement Period: 01/01/2026 through 01/31/2026', 'Beginning Balance $1,000.00', '01/02 SHELL OIL 10.00 990.00']
+          : p === N
+            ? ['01/30 SHELL OIL 10.00 580.00', 'Ending Balance $580.00']
+            : [`01/${String(2 + (p % 27)).padStart(2, '0')} SHELL OIL 10.00 ${(1000 - p * 10).toFixed(2)}`];
+      lines.forEach((t, i) => page.drawText(t, { x: 40, y: 740 - i * 18, size: 10, font }));
+    }
+    const r = await extractBankFile(ctx, { bankAccountId: ba, filename: 'long.pdf', bytes: await pdf.save() }, { ocr: null, routerOpts: {} });
+    expect(r.kind).toBe('statement');
+    if (r.kind !== 'statement') return;
+    expect(r.pages).toBe(N);
+    expect(r.warnings.join(' ')).toMatch(/first 40 of 42 pages/);
+  }, 60_000);
+});
