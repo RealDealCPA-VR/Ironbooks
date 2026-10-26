@@ -1751,6 +1751,13 @@ export interface DetailLayoutOptions {
   headers?: boolean;
   /** Column holding the group label (defaults to the first column). */
   hrefForGroup?: (key: string) => string | undefined;
+  /**
+   * Total by account: order the account groups by statement section first (this order), then by
+   * account number — QB's P&L Detail lists Income, COGS, Expense, Other Income, Other Expense
+   * whatever the accounts are numbered (an Other Income account numbered 4950 is not listed
+   * between Income and Cost of Goods Sold).
+   */
+  sectionOrder?: SectionKey[];
 }
 
 /**
@@ -1832,8 +1839,13 @@ export function layoutDetail(
   const dir = o.sortDir === 'desc' ? -1 : 1;
   const prefix = o.idPrefix ?? 'd';
   const groups = new Map<string, { key: string; label: string; sort: string; lines: GlLine[] }>();
+  const rank = (s: SectionKey) => {
+    const i = o.sectionOrder!.indexOf(s);
+    return String(i < 0 ? o.sectionOrder!.length : i).padStart(3, '0');
+  };
   for (const l of lines) {
     const g = groupKeyOf(l, o.groupBy);
+    if (o.groupBy === 'account' && o.sectionOrder) g.sort = `${rank(l.account.section)}|${g.sort}`;
     if (!groups.has(g.key)) groups.set(g.key, { ...g, lines: [] });
     groups.get(g.key)!.lines.push(l);
   }

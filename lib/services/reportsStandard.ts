@@ -760,9 +760,6 @@ export async function profitAndLossDetail(ctx: ServiceContext, p: ReportParams):
   f.excludeClose = true;
   f.sections = f.sections ? f.sections.filter(isPLSection) : [...PL_SECTIONS];
   const { lines, truncated } = await fetchGlLines(ctx, meta, f);
-  // Order account groups in statement order (Income, COGS, Expense, Other Income, Other Expense).
-  const order = (l: GlLine) => PL_SECTIONS.indexOf(l.account.section as PLSection);
-  lines.sort((a, b) => order(a) - order(b));
   const laid = layoutDetail(lines, {
     columns: detailColumns(DEFAULT_DETAIL_KEYS),
     groupBy: (p.subtotalBy as GroupKey) ?? 'account',
@@ -771,8 +768,10 @@ export async function profitAndLossDetail(ctx: ServiceContext, p: ReportParams):
     natural: true,
     running: (p.subtotalBy ?? 'account') === 'account',
     idPrefix: 'pld',
+    // Account groups in statement order (Income, COGS, Expense, Other Income, Other Expense), then
+    // by number — never by number alone.
+    sectionOrder: PL_SECTIONS,
   });
-  // Re-order account groups into statement order (layoutDetail sorts by code).
   const rows = laid.rows;
   // Net income line: income-type naturals minus expense-type naturals.
   let net = Money.zero();
