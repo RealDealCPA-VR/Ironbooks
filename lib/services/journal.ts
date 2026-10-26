@@ -626,6 +626,20 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
   const isAdjusting = input.isAdjusting ?? before.isAdjusting;
 
   return inTransaction(ctx, async (tx) => {
+    // The checks above ran before this transaction: another edit or void of the same entry (a
+    // double-clicked Save, a second user) may have committed since. voidJournalEntry treats an
+    // already-void entry as done, so without this re-check BOTH edits would post a replacement.
+    const [current] = await tx.db
+      .select({ status: journalEntries.status })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.id, id), eq(journalEntries.companyId, tx.companyId)))
+      .for('update');
+    if (!current || current.status !== 'posted') {
+      throw new ServiceError(
+        'CONFLICT',
+        'This journal entry was just changed or voided (by you in another window or by another user). Reload it to see the latest version.',
+      );
+    }
     // 1. Void the original (reverses cached balances; guards reconciled lines).
     await voidJournalEntry(tx, id);
 

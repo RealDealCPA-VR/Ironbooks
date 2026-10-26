@@ -26,6 +26,8 @@ import {
   expenseLines,
   customers,
   items,
+  salesReceipts,
+  salesReceiptLines,
 } from '@/lib/db/schema';
 import { toAmountString, Money } from '@/lib/money';
 import {
@@ -222,31 +224,47 @@ export async function deactivateJob(ctx: ServiceContext, id: string) {
 // Profitability
 // ---------------------------------------------------------------------------
 
+
 /*
- * Which documents count toward job revenue / cost — the same rules as the Job reports
- * (lib/services/reportsJobsTime.ts): void and draft invoices, void bills and voided checks are
- * not revenue or cost, and subtotal / payment / sales-tax item lines are not revenue. Needs
- * `items` left-joined on the invoice line.
+ * Which documents count toward job revenue / cost — the same rules as the Job Profitability
+ * reports (lib/services/reportsJobsTime.ts jobFacts), so the Jobs page and the reports always
+ * show the same numbers for a job:
+ *  - void and draft invoices, void bills and voided checks are not revenue or cost;
+ *  - subtotal / payment / sales-tax item lines are not revenue (needs `items` left-joined);
+ *  - an invoice line without its own job counts for the invoice's job;
+ *  - an invoice's header discount reduces the revenue of the invoice's job;
+ *  - amounts are in HOME currency (a foreign-currency document's amount x its exchange rate).
  */
 const REVENUE_LINE_ONLY = sql`COALESCE(${items.type}::text, '') NOT IN ('subtotal', 'payment', 'sales_tax')`;
 const LIVE_INVOICE = notInArray(invoices.status, ['void', 'draft']);
 const LIVE_BILL = ne(bills.status, 'void');
 const LIVE_EXPENSE = isNull(expenses.voidedAt);
 
-/**
- * Compute per-job revenue (from invoiceLines), cost (from billLines + expenseLines),
- * and profit for a specific job. Returns a full line-item breakdown.
- */
-export async function jobProfitability(ctx: ServiceContext, jobId: string): Promise<JobProfitability> {
-  const job = await getJob(ctx, jobId);
+/** Home-currency value of a document amount (same rounding as the Job reports). */
+function homeOf(amount: string, rate: string | null | undefined) {
+  return rate && !Money.eq(rate, 1) ? Money.round2(Money.of(amount).times(Money.of(rate))) : Money.of(amount);
+}
 
-  // -- Revenue: all invoiceLines tagged to this job --
-  // Join to invoices to ensure company scoping (invoiceLines doesn't store companyId directly).
+interface JobFact {
+  jobId: string;
+  kind: 'revenue' | 'cost';
+  line: JobProfitabilityLineItem;
+}
+
+/** Every revenue / cost amount (home currency) tagged to the given jobs. */
+async function jobFacts(ctx: ServiceContext, jobIds: string[]): Promise<JobFact[]> {
+  if (jobIds.length === 0) return [];
+  const out: JobFact[] = [];
+  const lineJob = sql<string | null>`COALESCE(${invoiceLines.jobId}, ${invoices.jobId})`;
+
+  // Revenue: invoice lines tagged to the job (or untagged lines on an invoice for the job).
   const revLines = await ctx.db
     .select({
       id: invoiceLines.id,
+      jobId: lineJob,
       description: invoiceLines.description,
       amount: invoiceLines.amount,
+      fx: invoices.exchangeRate,
     })
     .from(invoiceLines)
     .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
@@ -254,77 +272,140 @@ export async function jobProfitability(ctx: ServiceContext, jobId: string): Prom
     .where(
       and(
         eq(invoices.companyId, ctx.companyId),
-        eq(invoiceLines.jobId, jobId),
+        sql`${lineJob} IN (${sql.join(jobIds.map((id) => sql`${id}::uuid`), sql`, `)})`,
         LIVE_INVOICE,
         REVENUE_LINE_ONLY,
       ),
     );
+  for (const l of revLines) {
+    if (!l.jobId) continue;
+    out.push({
+      jobId: l.jobId,
+      kind: 'revenue',
+      line: { source: 'invoice_line', id: l.id, description: l.description, amount: toAmountString(homeOf(l.amount, l.fx)) },
+    });
+  }
 
-  // -- Cost (bills): all billLines tagged to this job --
+  // Invoice header discounts reduce the revenue of the invoice's job (posted as a debit to income).
+  const discounts = await ctx.db
+    .select({ id: invoices.id, jobId: invoices.jobId, discount: invoices.discount, fx: invoices.exchangeRate })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.companyId, ctx.companyId),
+        inArray(invoices.jobId, jobIds),
+        LIVE_INVOICE,
+        sql`${invoices.discount} <> 0`,
+      ),
+    );
+  for (const r of discounts) {
+    if (!r.jobId) continue;
+    out.push({
+      jobId: r.jobId,
+      kind: 'revenue',
+      line: {
+        source: 'invoice_line',
+        id: `discount:${r.id}`,
+        description: 'Invoice discount',
+        amount: toAmountString(homeOf(r.discount, r.fx).negated()),
+      },
+    });
+  }
+
+  // Sales receipt lines tagged to the job are revenue too.
+  const receiptLines = await ctx.db
+    .select({
+      id: salesReceiptLines.id,
+      jobId: salesReceiptLines.jobId,
+      description: salesReceiptLines.description,
+      amount: salesReceiptLines.amount,
+    })
+    .from(salesReceiptLines)
+    .innerJoin(salesReceipts, eq(salesReceiptLines.salesReceiptId, salesReceipts.id))
+    .leftJoin(items, and(eq(salesReceiptLines.itemId, items.id), eq(items.companyId, ctx.companyId)))
+    .where(
+      and(
+        eq(salesReceipts.companyId, ctx.companyId),
+        inArray(salesReceiptLines.jobId, jobIds),
+        ne(salesReceipts.status, 'void'),
+        REVENUE_LINE_ONLY,
+      ),
+    );
+  for (const l of receiptLines) {
+    if (!l.jobId) continue;
+    out.push({
+      jobId: l.jobId,
+      kind: 'revenue',
+      line: { source: 'invoice_line', id: l.id, description: l.description, amount: toAmountString(l.amount) },
+    });
+  }
+
+  // Cost: bill lines and check / expense lines tagged to the job.
   const billCostLines = await ctx.db
     .select({
       id: billLines.id,
+      jobId: billLines.jobId,
       description: billLines.description,
       amount: billLines.amount,
+      fx: bills.exchangeRate,
     })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
-    .where(
-      and(
-        eq(bills.companyId, ctx.companyId),
-        eq(billLines.jobId, jobId),
-        LIVE_BILL,
-      ),
-    );
+    .where(and(eq(bills.companyId, ctx.companyId), inArray(billLines.jobId, jobIds), LIVE_BILL));
+  for (const l of billCostLines) {
+    if (!l.jobId) continue;
+    out.push({
+      jobId: l.jobId,
+      kind: 'cost',
+      line: { source: 'bill_line', id: l.id, description: l.description, amount: toAmountString(homeOf(l.amount, l.fx)) },
+    });
+  }
 
-  // -- Cost (direct expenses): all expenseLines tagged to this job --
   const expCostLines = await ctx.db
     .select({
       id: expenseLines.id,
+      jobId: expenseLines.jobId,
       description: expenseLines.description,
       amount: expenseLines.amount,
+      fx: expenses.exchangeRate,
     })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
-    .where(
-      and(
-        eq(expenses.companyId, ctx.companyId),
-        eq(expenseLines.jobId, jobId),
-        LIVE_EXPENSE,
-      ),
-    );
+    .where(and(eq(expenses.companyId, ctx.companyId), inArray(expenseLines.jobId, jobIds), LIVE_EXPENSE));
+  for (const l of expCostLines) {
+    if (!l.jobId) continue;
+    out.push({
+      jobId: l.jobId,
+      kind: 'cost',
+      line: { source: 'expense_line', id: l.id, description: l.description, amount: toAmountString(homeOf(l.amount, l.fx)) },
+    });
+  }
+  return out;
+}
 
-  // -- Aggregate --
+function totalsOf(facts: JobFact[]) {
   let revenue = Money.zero();
-  for (const l of revLines) revenue = revenue.plus(Money.of(l.amount));
-
   let cost = Money.zero();
-  for (const l of billCostLines) cost = cost.plus(Money.of(l.amount));
-  for (const l of expCostLines) cost = cost.plus(Money.of(l.amount));
+  for (const f of facts) {
+    if (f.kind === 'revenue') revenue = revenue.plus(Money.of(f.line.amount));
+    else cost = cost.plus(Money.of(f.line.amount));
+  }
+  return { revenue, cost, profit: revenue.minus(cost) };
+}
 
-  const profit = revenue.minus(cost);
+/**
+ * Compute per-job revenue (invoices, net of their discounts), cost (bills + checks / expenses)
+ * and profit for a specific job, in home currency. Returns a full line-item breakdown.
+ */
+export async function jobProfitability(ctx: ServiceContext, jobId: string): Promise<JobProfitability> {
+  const job = await getJob(ctx, jobId);
+  const facts = await jobFacts(ctx, [jobId]);
+  const { revenue, cost, profit } = totalsOf(facts);
   const budgetVariance = job.budget != null ? profit.minus(Money.of(job.budget)) : null;
 
-  const lines: JobProfitabilityLineItem[] = [
-    ...revLines.map((l) => ({
-      source: 'invoice_line' as const,
-      id: l.id,
-      description: l.description,
-      amount: toAmountString(l.amount),
-    })),
-    ...billCostLines.map((l) => ({
-      source: 'bill_line' as const,
-      id: l.id,
-      description: l.description,
-      amount: toAmountString(l.amount),
-    })),
-    ...expCostLines.map((l) => ({
-      source: 'expense_line' as const,
-      id: l.id,
-      description: l.description,
-      amount: toAmountString(l.amount),
-    })),
-  ];
+  // Revenue lines first, then bill costs, then direct expenses (as before).
+  const order = { invoice_line: 0, bill_line: 1, expense_line: 2 } as const;
+  const lines = facts.map((f) => f.line).sort((a, b) => order[a.source] - order[b.source]);
 
   return {
     jobId,
@@ -339,8 +420,8 @@ export async function jobProfitability(ctx: ServiceContext, jobId: string): Prom
 }
 
 /**
- * Summary of all active jobs for the company — revenue, cost, profit in one query set.
- * Uses per-row sub-aggregations so all active jobs are returned in one pass.
+ * Summary of all active jobs for the company — revenue, cost, profit (home currency) in one
+ * query set, using the same rules as jobProfitability and the Job Profitability reports.
  */
 export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]> {
   // Fetch all active jobs with optional customer name
@@ -367,70 +448,12 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
 
   if (activeJobs.length === 0) return [];
 
-  const jobIds = activeJobs.map((j) => j.id);
-
-  // Aggregate revenue per job (invoiceLines → invoices for company scoping)
-  const revRows = await ctx.db
-    .select({
-      jobId: invoiceLines.jobId,
-      total: sql<string>`COALESCE(SUM(${invoiceLines.amount}), 0)`,
-    })
-    .from(invoiceLines)
-    .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
-    .leftJoin(items, and(eq(invoiceLines.itemId, items.id), eq(items.companyId, ctx.companyId)))
-    .where(
-      and(
-        eq(invoices.companyId, ctx.companyId),
-        inArray(invoiceLines.jobId, jobIds),
-        LIVE_INVOICE,
-        REVENUE_LINE_ONLY,
-      ),
-    )
-    .groupBy(invoiceLines.jobId);
-
-  // Aggregate cost from bills per job (billLines → bills for company scoping)
-  const billCostRows = await ctx.db
-    .select({
-      jobId: billLines.jobId,
-      total: sql<string>`COALESCE(SUM(${billLines.amount}), 0)`,
-    })
-    .from(billLines)
-    .innerJoin(bills, eq(billLines.billId, bills.id))
-    .where(
-      and(
-        eq(bills.companyId, ctx.companyId),
-        inArray(billLines.jobId, jobIds),
-        LIVE_BILL,
-      ),
-    )
-    .groupBy(billLines.jobId);
-
-  // Aggregate cost from direct expenses per job (expenseLines → expenses for company scoping)
-  const expCostRows = await ctx.db
-    .select({
-      jobId: expenseLines.jobId,
-      total: sql<string>`COALESCE(SUM(${expenseLines.amount}), 0)`,
-    })
-    .from(expenseLines)
-    .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
-    .where(
-      and(
-        eq(expenses.companyId, ctx.companyId),
-        inArray(expenseLines.jobId, jobIds),
-        LIVE_EXPENSE,
-      ),
-    )
-    .groupBy(expenseLines.jobId);
-
-  // Build lookup maps
-  const revMap = new Map(revRows.map((r) => [r.jobId, r.total]));
-  const billCostMap = new Map(billCostRows.map((r) => [r.jobId, r.total]));
-  const expCostMap = new Map(expCostRows.map((r) => [r.jobId, r.total]));
+  const facts = await jobFacts(ctx, activeJobs.map((j) => j.id));
+  const byJob = new Map<string, JobFact[]>();
+  for (const f of facts) byJob.set(f.jobId, [...(byJob.get(f.jobId) ?? []), f]);
 
   return activeJobs.map((j) => {
-    const revenue = Money.of(revMap.get(j.id) ?? 0);
-    const cost = Money.of(billCostMap.get(j.id) ?? 0).plus(Money.of(expCostMap.get(j.id) ?? 0));
-    const profit = revenue.minus(cost);
+    const { revenue, cost, profit } = totalsOf(byJob.get(j.id) ?? []);
     return {
       id: j.id,
       name: j.name,

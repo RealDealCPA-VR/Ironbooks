@@ -72,6 +72,33 @@ export function fiscalYearWindow(
   return { yearStart, yearEnd, closingDate };
 }
 
+/**
+ * The company's Retained Earnings account: the equity account whose detail type is Retained
+ * Earnings (code 3900 first when there are several, then the lowest number). Number 3900 alone
+ * is not enough — in a chart without a 3900 Retained Earnings, 3900 is where the first opening
+ * balance creates "Opening Balance Equity" (accounts.ts findOrCreateOpeningBalanceEquity). Legacy
+ * charts with no Retained Earnings detail type fall back to an equity account numbered 3900 or
+ * named "Retained Earnings", never Opening Balance Equity.
+ */
+async function findRetainedEarningsAccount(
+  ctx: ServiceContext,
+): Promise<{ id: string; code: string; name: string } | null> {
+  const rows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, subtype: accounts.subtype, isActive: accounts.isActive })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.type, 'equity')));
+  const byCode = (a: { code: string }, b: { code: string }) =>
+    a.code === '3900' ? -1 : b.code === '3900' ? 1 : a.code.localeCompare(b.code, undefined, { numeric: true });
+  const pick = (list: typeof rows) =>
+    [...list].sort((a, b) => Number(b.isActive) - Number(a.isActive) || byCode(a, b))[0] ?? null;
+  const typed = rows.filter((r) => r.subtype === 'retained_earnings');
+  if (typed.length) return pick(typed);
+  const legacy = rows.filter(
+    (r) => (r.code === '3900' || /^retained earnings$/i.test(r.name.trim())) && !/opening balance equity/i.test(r.name),
+  );
+  return pick(legacy);
+}
+
 export interface YearEndCloseResult {
   /** The posted closing journal entry. */
   entry: Awaited<ReturnType<typeof postJournalEntry>>;
@@ -204,22 +231,12 @@ async function yearEndCloseInTx(ctx: ServiceContext, fiscalYear: number): Promis
     );
   }
 
-  // 3. Find the Retained Earnings account (code 3900) for this company.
-  const [reAccount] = await ctx.db
-    .select({ id: accounts.id, code: accounts.code, name: accounts.name })
-    .from(accounts)
-    .where(
-      and(
-        eq(accounts.companyId, ctx.companyId),
-        eq(accounts.code, '3900'),
-      ),
-    )
-    .limit(1);
-
+  // 3. Find the company's Retained Earnings account.
+  const reAccount = await findRetainedEarningsAccount(ctx);
   if (!reAccount) {
     throw new ServiceError(
       'NOT_FOUND',
-      'Retained Earnings account (code 3900) not found. Please create it before running year-end close.',
+      'Retained Earnings account not found. Create an equity account of type Retained Earnings before running year-end close.',
     );
   }
 

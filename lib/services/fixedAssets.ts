@@ -96,7 +96,31 @@ async function getOrCreateAccount(
       subtype: def.subtype as never,
     })
     .returning();
+  await writeAudit(ctx, { action: 'create', entityType: 'account', entityId: created.id, newValues: created });
   return created.id;
+}
+
+/**
+ * `months` calendar months after `date` on the UTC calendar (ledger dates are calendar days at
+ * UTC midnight), keeping the day of the month and clamping it to the target month's last day:
+ * Jan 31 + 1 = Feb 28 / 29, + 2 = Mar 31. A local-time setMonth overflowed (Jan 31 -> Mar 3, so
+ * February had no period and March two) and shifted a day in time zones west of UTC.
+ */
+function addMonthsClampedUtc(date: Date, months: number): Date {
+  const y = date.getUTCFullYear();
+  const m = date.getUTCMonth() + months;
+  const lastDay = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+  return new Date(
+    Date.UTC(
+      y,
+      m,
+      Math.min(date.getUTCDate(), lastDay),
+      date.getUTCHours(),
+      date.getUTCMinutes(),
+      date.getUTCSeconds(),
+      date.getUTCMilliseconds(),
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +256,8 @@ export function depreciationSchedule(asset: {
 
     accumulated = accumulated.plus(periodAmount);
 
-    // Compute the date for this period: placedInService + p months.
-    const d = new Date(asset.placedInService);
-    d.setMonth(d.getMonth() + p);
+    // The date for this period: placedInService + p months.
+    const d = addMonthsClampedUtc(new Date(asset.placedInService), p);
 
     schedule.push({
       period: p,
@@ -275,60 +298,67 @@ export interface PostDepreciationInput {
 export async function postDepreciation(ctx: ServiceContext, input: PostDepreciationInput) {
   const { assetId, date } = input;
 
-  const [asset] = await ctx.db
-    .select()
-    .from(fixedAssets)
-    .where(and(eq(fixedAssets.companyId, ctx.companyId), eq(fixedAssets.id, assetId)));
-  if (!asset) throw notFound('Fixed asset');
-
-  const cost = Money.of(asset.cost);
-  const salvage = Money.of(asset.salvageValue);
-  const depreciableBase = cost.minus(salvage);
-  const alreadyAccumulated = Money.of(asset.accumulatedDepreciation);
-
-  // Guard: already fully depreciated.
-  if (alreadyAccumulated.greaterThanOrEqualTo(depreciableBase)) {
-    throw new ServiceError(
-      'VALIDATION',
-      `Asset "${asset.name}" is already fully depreciated (accumulated ${toAmountString(alreadyAccumulated)} of ${toAmountString(depreciableBase)}).`,
-    );
-  }
-
-  // Standard monthly amount.
-  const monthlyAmount = Money.round2(depreciableBase.dividedBy(asset.usefulLifeMonths));
-
-  // Clamp to remaining depreciable amount to avoid over-depreciation.
-  const remaining = depreciableBase.minus(alreadyAccumulated);
-  // The asset's last useful-life period takes whatever remains (as depreciationSchedule does), so
-  // a rounded-down monthly amount never leaves a cent to depreciate after the useful life ends.
-  const postedPeriods = (
-    await ctx.db
-      .select({ id: depreciationEntries.id })
-      .from(depreciationEntries)
-      .where(and(eq(depreciationEntries.companyId, ctx.companyId), eq(depreciationEntries.fixedAssetId, assetId)))
-  ).length;
-  const isLastPeriod = postedPeriods + 1 >= asset.usefulLifeMonths;
-  const periodAmount =
-    isLastPeriod || monthlyAmount.greaterThan(remaining) ? Money.round2(remaining) : monthlyAmount;
-
-  // Resolve GL accounts (use overrides if the asset has them; otherwise get-or-create defaults).
-  const depExpenseAccountId =
-    asset.depreciationExpenseAccountId ??
-    (await getOrCreateAccount(ctx, '6800', {
-      name: 'Depreciation Expense',
-      type: 'expense',
-      subtype: 'operating_expenses',
-    }));
-
-  const accumDepAccountId =
-    asset.accumulatedDepreciationAccountId ??
-    (await getOrCreateAccount(ctx, '1590', {
-      name: 'Accumulated Depreciation',
-      type: 'asset',
-      subtype: 'fixed_assets',
-    }));
-
+  // Everything — reading the asset's accumulated depreciation, the clamp to what is left, the
+  // posting and the write-back — happens in ONE transaction with the asset row locked. Reading
+  // the asset first and writing `accumulated + amount` later let two posts at once (two months,
+  // two users) both start from the same total: the asset kept only one of them while the ledger
+  // had both, and the last period could be depreciated twice past cost - salvage.
   return inTransaction(ctx, async (tx) => {
+    const [asset] = await tx.db
+      .select()
+      .from(fixedAssets)
+      .where(and(eq(fixedAssets.companyId, tx.companyId), eq(fixedAssets.id, assetId)))
+      .for('update');
+    if (!asset) throw notFound('Fixed asset');
+
+    const cost = Money.of(asset.cost);
+    const salvage = Money.of(asset.salvageValue);
+    const depreciableBase = cost.minus(salvage);
+    const alreadyAccumulated = Money.of(asset.accumulatedDepreciation);
+
+    // Guard: already fully depreciated.
+    if (alreadyAccumulated.greaterThanOrEqualTo(depreciableBase)) {
+      throw new ServiceError(
+        'VALIDATION',
+        `Asset "${asset.name}" is already fully depreciated (accumulated ${toAmountString(alreadyAccumulated)} of ${toAmountString(depreciableBase)}).`,
+      );
+    }
+
+    // Standard monthly amount.
+    const monthlyAmount = Money.round2(depreciableBase.dividedBy(asset.usefulLifeMonths));
+
+    // Clamp to remaining depreciable amount to avoid over-depreciation.
+    const remaining = depreciableBase.minus(alreadyAccumulated);
+    // The asset's last useful-life period takes whatever remains (as depreciationSchedule does), so
+    // a rounded-down monthly amount never leaves a cent to depreciate after the useful life ends.
+    const postedPeriods = (
+      await tx.db
+        .select({ id: depreciationEntries.id })
+        .from(depreciationEntries)
+        .where(and(eq(depreciationEntries.companyId, tx.companyId), eq(depreciationEntries.fixedAssetId, assetId)))
+    ).length;
+    const isLastPeriod = postedPeriods + 1 >= asset.usefulLifeMonths;
+    const periodAmount =
+      isLastPeriod || monthlyAmount.greaterThan(remaining) ? Money.round2(remaining) : monthlyAmount;
+
+    // Resolve GL accounts (use overrides if the asset has them; otherwise get-or-create defaults,
+    // inside this transaction so two first posts never create the default accounts twice).
+    const depExpenseAccountId =
+      asset.depreciationExpenseAccountId ??
+      (await getOrCreateAccount(tx, '6800', {
+        name: 'Depreciation Expense',
+        type: 'expense',
+        subtype: 'operating_expenses',
+      }));
+
+    const accumDepAccountId =
+      asset.accumulatedDepreciationAccountId ??
+      (await getOrCreateAccount(tx, '1590', {
+        name: 'Accumulated Depreciation',
+        type: 'asset',
+        subtype: 'fixed_assets',
+      }));
+
     // Idempotency guard: refuse to post the same asset's depreciation twice for the same
     // date (e.g. a double-clicked "Run depreciation" or a re-run monthly job). Checked inside
     // the transaction so concurrent posts can't both pass.

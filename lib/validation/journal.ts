@@ -25,3 +25,10 @@ export const createJournalEntrySchema = z.object({
   isAdjusting: z.boolean().optional(),
 });
 export type CreateJournalEntryBody = z.infer<typeof createJournalEntrySchema>;
+
+/**
+ * PATCH /api/journal-entries/:id — the same body as a new entry (the edit re-posts it). An
+ * omitted `reference` keeps the entry's number; `null` clears it.
+ */
+export const updateJournalEntrySchema = createJournalEntrySchema;
+export type UpdateJournalEntryBody = z.infer<typeof updateJournalEntrySchema>;

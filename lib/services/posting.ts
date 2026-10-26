@@ -18,6 +18,7 @@ import { MAX_LEDGER_AMOUNT, Money, MoneyParseError, toAmountString } from '@/lib
 import {
   accounts,
   auditLogs,
+  classes,
   creditMemos,
   journalEntries,
   journalEntryLines,
@@ -368,6 +369,24 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       throw validation(
         `"${np.name}" is a non-posting account (used for estimates and purchase orders) and cannot be used in a transaction.`,
       );
+    }
+  }
+  // Classes are company records too: a class id from another company in the same file (the
+  // foreign key only checks that the row exists) would put that company's class on this ledger.
+  const classIds = [...new Set(input.lines.map((l) => l.classId).filter((c): c is string => Boolean(c)))];
+  if (classIds.length) {
+    const badFormat = classIds.find((c) => typeof c !== 'string' || !UUID_RE.test(c));
+    const found = badFormat
+      ? []
+      : await ctx.db
+          .select({ id: classes.id })
+          .from(classes)
+          .where(and(eq(classes.companyId, ctx.companyId), inArray(classes.id, classIds)));
+    const known = new Set(found.map((c) => c.id));
+    const missing = badFormat ?? classIds.find((c) => !known.has(c));
+    if (missing) {
+      const line = input.lines.findIndex((l) => l.classId === missing) + 1;
+      throw validation(`Line ${line}: that class does not exist in this company.`);
     }
   }
   for (const [i, l] of input.lines.entries()) {
