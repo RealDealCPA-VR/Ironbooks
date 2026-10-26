@@ -587,3 +587,18 @@ describe('statement PDF longer than the pages read', () => {
     expect(r.warnings.join(' ')).toMatch(/first 40 of 42 pages/);
   }, 60_000);
 });
+
+// ---------------------------------------------------------------------------
+// Legacy categorization rules (Banking page "Add rule")
+// ---------------------------------------------------------------------------
+
+describe('legacy rules', () => {
+  it('over-long rule text is a VALIDATION error, not a database error', async () => {
+    const { createRule } = await import('./rules');
+    const base = { name: 'Fuel', matchField: 'description' as const, matchOperator: 'contains' as const, matchValue: 'SHELL', setAccountId: acct['6300'] };
+    await expectCode(createRule(ctx, { ...base, name: 'N'.repeat(300) }), 'VALIDATION');
+    await expectCode(createRule(ctx, { ...base, matchValue: 'V'.repeat(300) }), 'VALIDATION');
+    await expectCode(createRule(ctx, { ...base, setPayee: 'P'.repeat(300) }), 'VALIDATION');
+    await expectCode(createRule(ctx, { ...base, priority: 1.5 }), 'VALIDATION');
+  });
+});
