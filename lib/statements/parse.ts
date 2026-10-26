@@ -309,7 +309,9 @@ export function parseStatementText(lines: StatementLine[], opts: { kind: Stateme
 
     // Checks Paid tables: "1234 01/05 150.00" (possibly several per line).
     if (section === 'checks') {
-      const re = /(\d{3,6})\s*\*?\s+(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\s+(\$?\d{1,3}(?:,\d{3})*\.\d{2})/g;
+      // "*" (a gap in the check sequence) or "^" (an image of the check is available) may follow
+      // the number; rows marked "^" used to be dropped, so such a statement never tied out.
+      const re = /(\d{3,6})\s*[*^]?\s+(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\s+(\$?\d{1,3}(?:,\d{3})*\.\d{2})/g;
       let any = false;
       for (const g of t.matchAll(re)) {
         const d = leadingDate(g[2]);

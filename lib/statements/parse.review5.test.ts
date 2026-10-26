@@ -27,3 +27,23 @@ New Balance 325.00`;
     expect(tieOut(p.rows, p.openingBalance, p.closingBalance, 'card').ok).toBe(true);
   });
 });
+
+describe('Checks Paid tables that mark imaged checks with "^"', () => {
+  // Chase-style: "^" after the check number means an image of the check is available.
+  const text = `Statement period 03/01/2026 through 03/31/2026
+Beginning Balance $1,000.00
+CHECKS PAID
+CHECK NO. DATE PAID AMOUNT
+1003 ^ 03/07 150.00 1004 ^ 03/09 $1,200.00
+Total Checks Paid $1,350.00
+Ending Balance -$350.00`;
+
+  it('reads each check (they were dropped, so the statement could not tie out)', () => {
+    const p = parseStatementText(lines(text), { kind: 'bank' });
+    expect(p.rows.map((r) => [r.date, r.description, r.amount])).toEqual([
+      ['2026-03-07', 'Check #1003', '-150.00'],
+      ['2026-03-09', 'Check #1004', '-1200.00'],
+    ]);
+    expect(tieOut(p.rows, p.openingBalance, p.closingBalance, 'bank').ok).toBe(true);
+  });
+});
