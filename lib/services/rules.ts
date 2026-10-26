@@ -13,6 +13,7 @@ import { and, asc, desc, eq } from 'drizzle-orm';
 import { accounts, bankTransactions, transactionRules } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { pickRule } from '@/lib/bankRules/core';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -97,10 +98,13 @@ export async function createRule(ctx: ServiceContext, input: CreateRuleInput) {
 
   // Verify the target account belongs to this company.
   const [acct] = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, name: accounts.name, type: accounts.type, subtype: accounts.subtype })
     .from(accounts)
     .where(and(eq(accounts.id, input.setAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!acct) throw notFound(`Account ${input.setAccountId}`);
+  // Bank-feed lines can't be added to Undeposited Funds / an inventory asset account.
+  const reason = subledgerAccountReason(acct);
+  if (reason) throw validation(`${reason} A bank rule can't put transactions there.`);
 
   const [row] = await ctx.db
     .insert(transactionRules)

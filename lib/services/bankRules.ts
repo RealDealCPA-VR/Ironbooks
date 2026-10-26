@@ -55,6 +55,7 @@ import {
   type RuleOperator,
   type RuleSplit,
 } from '@/lib/bankRules/core';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 
 export type BankRule = typeof transactionRules.$inferSelect;
 
@@ -148,7 +149,7 @@ type RuleValues = Omit<typeof transactionRules.$inferInsert, 'id' | 'companyId' 
 async function validateInput(
   ctx: ServiceContext,
   input: BankRuleInput,
-  opts: { conditionsOnly?: boolean } = {},
+  opts: { conditionsOnly?: boolean; keepAccountIds?: ReadonlySet<string> } = {},
 ): Promise<RuleValues> {
   const name = (input.name ?? '').trim() || (opts.conditionsOnly ? 'Draft rule' : '');
   if (!name) throw validation('Give the rule a name.');
@@ -197,6 +198,19 @@ async function validateInput(
     throw validation('Choose the account this rule puts transactions in.');
   }
   if (setAccountId) await assertRefInCompany(ctx, accounts, setAccountId, 'Account');
+  // A bank-feed line can't be added to Undeposited Funds or an inventory asset account
+  // (bankCategorize.categorize refuses it), so a rule pointing there could never post a line —
+  // an "Add automatically" rule skipped every line it matched. Rules saved before keep theirs.
+  const targets = [...(setAccountId ? [setAccountId] : []), ...(splits ?? []).map((s) => s.accountId)];
+  for (const id of new Set(targets)) {
+    if (opts.conditionsOnly || opts.keepAccountIds?.has(id)) continue;
+    const [a] = await ctx.db
+      .select({ name: accounts.name, type: accounts.type, subtype: accounts.subtype })
+      .from(accounts)
+      .where(and(eq(accounts.id, id), eq(accounts.companyId, ctx.companyId)));
+    const reason = a ? subledgerAccountReason(a) : null;
+    if (reason) throw validation(`${reason} A bank rule can't put transactions there.`);
+  }
   const setClassId = input.setClassId || null;
   if (setClassId) await assertRefInCompany(ctx, classes, setClassId, 'Class');
 
@@ -276,7 +290,8 @@ export async function updateBankRule(
     enabled: input.enabled ?? before.enabled,
     learned: before.learned,
   };
-  const values = await validateInput(ctx, merged);
+  const keepAccountIds = new Set([...(before.setAccountId ? [before.setAccountId] : []), ...(before.splits ?? []).map((s) => s.accountId)]);
+  const values = await validateInput(ctx, merged, { keepAccountIds });
   return inTransaction(ctx, async (tx) => {
     const conds = [eq(transactionRules.id, id), eq(transactionRules.companyId, tx.companyId), eq(transactionRules.isActive, true)];
     // Lock the row, then compare versions at millisecond precision (what JSON round-trips).

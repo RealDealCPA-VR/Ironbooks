@@ -919,3 +919,38 @@ describe('editing only the memo of a transfer or a deposit line', () => {
     expect(lines.find((l) => l.accountId === acct['3000'])?.memo).toBe('Owner loan repayment');
   });
 });
+
+describe('bank rules cannot point at Undeposited Funds or Inventory Asset', () => {
+  it('a new rule (or a legacy Add rule) that would put lines there is refused; an existing one can still be switched off', async () => {
+    const { createRule } = await import('./rules');
+    const { updateBankRule } = await import('./bankRules');
+    const { transactionRules } = await import('@/lib/db/schema');
+    await expectCode(
+      createBankRule(ctx, { name: 'Deposits', matchField: 'description', matchOperator: 'contains', matchValue: 'DEPOSIT', setAccountId: acct['1050'], mode: 'auto' }),
+      'VALIDATION',
+      /Undeposited Funds/,
+    );
+    await expectCode(
+      createBankRule(ctx, {
+        name: 'Split',
+        matchValue: 'WIDGET',
+        splits: [
+          { accountId: acct['6300'], percent: '50' },
+          { accountId: acct['1300'], percent: '50' },
+        ],
+      }),
+      'VALIDATION',
+      /inventory/i,
+    );
+    await expectCode(
+      createRule(ctx, { name: 'Legacy', matchField: 'description', matchOperator: 'contains', matchValue: 'DEPOSIT', setAccountId: acct['1050'] }),
+      'VALIDATION',
+      /Undeposited Funds/,
+    );
+    // A rule saved before keeps working with its account: it can be switched off / renamed.
+    const ok = await createBankRule(ctx, { name: 'Fuel', matchValue: 'SHELL', setAccountId: acct['6300'] });
+    await db.update(transactionRules).set({ setAccountId: acct['1050'] }).where(eq(transactionRules.id, ok.id));
+    const off = await updateBankRule(ctx, ok.id, { enabled: false });
+    expect(off.enabled).toBe(false);
+  });
+});
