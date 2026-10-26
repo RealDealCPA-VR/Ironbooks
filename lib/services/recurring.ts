@@ -592,14 +592,17 @@ async function generateFromTemplate(
     );
   }
 
+  // review5 fx: a memorized foreign-currency invoice / bill is entered at the exchange rate of the
+  // day it is entered (the currency list's), as QB does — not the rate memorized months ago.
+  const fresh = { exchangeRate: undefined };
   switch (template.docType as DocType) {
     case 'invoice': {
-      const input = { ...(payload as unknown as CreateInvoiceInput), date: runDate, dueDate: shiftedDate(payload, 'dueDate', runDate) };
+      const input = { ...(payload as unknown as CreateInvoiceInput), ...fresh, date: runDate, dueDate: shiftedDate(payload, 'dueDate', runDate) };
       docId = (await createInvoice(ctx, input)).id;
       break;
     }
     case 'bill': {
-      const input = { ...(payload as unknown as CreateBillInput), date: runDate, dueDate: shiftedDate(payload, 'dueDate', runDate) };
+      const input = { ...(payload as unknown as CreateBillInput), ...fresh, date: runDate, dueDate: shiftedDate(payload, 'dueDate', runDate) };
       docId = (await createBill(ctx, input)).id;
       break;
     }
@@ -609,7 +612,7 @@ async function generateFromTemplate(
       break;
     }
     case 'expense': {
-      const input = { ...(payload as unknown as CreateExpenseInput), date: runDate };
+      const input = { ...(payload as unknown as CreateExpenseInput), ...fresh, date: runDate };
       docId = (await createExpense(ctx, input)).id;
       break;
     }
@@ -618,6 +621,7 @@ async function generateFromTemplate(
       // reused — the next number comes from the check sequence (or Print Checks).
       const input = {
         ...(payload as unknown as CreateExpenseInput),
+        ...fresh,
         method: 'check' as const,
         reference: null,
         date: runDate,

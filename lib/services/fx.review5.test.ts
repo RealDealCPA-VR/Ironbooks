@@ -498,6 +498,35 @@ describe('review5 fx', () => {
     expect(await foreignBalance(acct['1020'])).toBe('-100.00');
   });
 
+  it('a memorized foreign invoice / bill is entered at the rate on the day it is entered, not the memorized one', async () => {
+    const { createTemplate, runTemplateNow } = await import('./recurring');
+    const { getInvoice } = await import('./invoices');
+    const { getBill } = await import('./bills');
+    const c = await createCustomer(ctx, { displayName: `EUR retainer ${seq}` } as never);
+    const v = await eurVendor('EUR rent');
+    const invT = await createTemplate(ctx, {
+      name: `EUR retainer ${seq}`,
+      docType: 'invoice',
+      frequency: 'monthly' as never,
+      nextRunDate: '2026-04-01',
+      mode: 'remind' as never,
+      template: { customerId: c.id, currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['4000'], quantity: 1, rate: '1000.00' }] },
+    });
+    const billT = await createTemplate(ctx, {
+      name: `EUR rent ${seq}`,
+      docType: 'bill',
+      frequency: 'monthly' as never,
+      nextRunDate: '2026-04-01',
+      mode: 'remind' as never,
+      template: { vendorId: v.id, currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['6400'], amount: '500.00' }] },
+    });
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.30' });
+    const inv = await runTemplateNow(ctx, invT.id, d('2026-04-01'));
+    const bill = await runTemplateNow(ctx, billT.id, d('2026-04-01'));
+    expect(Money.of((await getInvoice(ctx, inv.docId)).exchangeRate!).toFixed(4)).toBe('1.3000');
+    expect(Money.of((await getBill(ctx, bill.docId)).exchangeRate!).toFixed(4)).toBe('1.3000');
+  });
+
   it('home-currency documents refuse a foreign-currency bank (sales receipt, credit memo refund, payment refund)', async () => {
     const { createSalesReceipt } = await import('./salesReceipts');
     const { createCreditMemo, refundCreditMemo } = await import('./creditMemos');
