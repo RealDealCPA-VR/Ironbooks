@@ -3,7 +3,8 @@
 import { useEffect, useState } from 'react';
 // wave2 prefs: Accounting > "Use account numbers" shows/hides the number column.
 import { usePreferences } from '@/lib/usePreferences';
-import { BookOpen, Plus, Trash2, Pencil, ChevronDown, ChevronRight, CornerDownRight, Download } from 'lucide-react';
+import { BookOpen, Plus, ChevronDown, ChevronRight, CornerDownRight, Download } from 'lucide-react';
+import AccountRowActions from './_components/AccountRowActions';
 import {
   Button,
   Card,
@@ -258,10 +259,12 @@ interface AccountRowProps {
   node: AccountNode;
   depth: number;
   onDeactivate: (account: Account) => void;
+  /** QB "Make Account Active" for an inactive account. */
+  onReactivate: (account: Account) => void;
   onEdit: (account: AccountNode) => void;
 }
 
-function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
+function AccountRow({ node, depth, onDeactivate, onReactivate, onEdit }: AccountRowProps) {
   const hasChildren = node.children.length > 0;
   const rolledUp = subtotal(node);
   const showNumbers = usePreferences().company.accountNumbersEnabled;
@@ -321,22 +324,13 @@ function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
           )}
         </Td>
         <Td className="text-center whitespace-nowrap">
-          <button
-            className="p-1.5 rounded-lg text-navy/40 hover:text-electric hover:bg-electric/10 transition-colors"
-            title="Edit account"
-            onClick={() => onEdit(node)}
-          >
-            <Pencil className="h-4 w-4" />
-          </button>
-          {node.isActive && (
-            <button
-              className="p-1.5 rounded-lg text-red-400 hover:text-red-600 hover:bg-red-50 transition-colors"
-              title="Deactivate account"
-              onClick={() => onDeactivate(node)}
-            >
-              <Trash2 className="h-4 w-4" />
-            </button>
-          )}
+          <AccountRowActions
+            name={node.name}
+            isActive={node.isActive}
+            onEdit={() => onEdit(node)}
+            onDeactivate={() => onDeactivate(node)}
+            onReactivate={() => onReactivate(node)}
+          />
         </Td>
       </Tr>
       {node.children.map((child) => (
@@ -345,6 +339,7 @@ function AccountRow({ node, depth, onDeactivate, onEdit }: AccountRowProps) {
           node={child}
           depth={depth + 1}
           onDeactivate={onDeactivate}
+          onReactivate={onReactivate}
           onEdit={onEdit}
         />
       ))}
@@ -358,10 +353,11 @@ interface AccountGroupProps {
   type: QbAccountType;
   roots: AccountNode[];
   onDeactivate: (account: Account) => void;
+  onReactivate: (account: Account) => void;
   onEdit: (account: AccountNode) => void;
 }
 
-function AccountGroup({ type, roots, onDeactivate, onEdit }: AccountGroupProps) {
+function AccountGroup({ type, roots, onDeactivate, onReactivate, onEdit }: AccountGroupProps) {
   const [collapsed, setCollapsed] = useState(false);
   const info = getQbAccountTypeInfo(type)!;
   const label = info.label;
@@ -423,6 +419,7 @@ function AccountGroup({ type, roots, onDeactivate, onEdit }: AccountGroupProps) 
                   node={node}
                   depth={0}
                   onDeactivate={onDeactivate}
+                  onReactivate={onReactivate}
                   onEdit={onEdit}
                 />
               ))
@@ -472,6 +469,17 @@ export default function AccountsPage() {
       toast(err instanceof ApiError ? err.message : 'Failed to deactivate account.', 'danger');
     } finally {
       setDeactivating(false);
+    }
+  }
+
+  /** QB "Make Account Active": an inactive account comes back to every account list. */
+  async function handleReactivate(account: Account) {
+    try {
+      await api.patch(`/api/accounts/${account.id}`, { isActive: true });
+      toast(`"${account.name}" is active again.`, 'success');
+      fetchAccounts();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to make the account active.', 'danger');
     }
   }
 
@@ -537,6 +545,7 @@ export default function AccountsPage() {
                 type={type}
                 roots={roots}
                 onDeactivate={setDeactivateTarget}
+                onReactivate={handleReactivate}
                 onEdit={setEditTarget}
               />
             ))}
