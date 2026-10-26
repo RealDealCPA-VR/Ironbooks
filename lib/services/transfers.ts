@@ -260,16 +260,44 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
 // updateTransfer / voidTransfer (D1)
 // ---------------------------------------------------------------------------
 
+/**
+ * p1 fx: an edit that states no rate keeps the transfer's OWN rate (QB keeps a transaction's
+ * exchange rate when it is edited). The Transfer Funds form opens with the rate box blank, so a
+ * memo-only edit used to re-price a foreign transfer at today's list rate: a new home value, a
+ * re-post, and a refusal on a reconciled transfer although nothing was changed. Applies only while
+ * both accounts keep their currencies; a stated rate / home amount always wins.
+ */
+async function withSavedRate(
+  ctx: ServiceContext,
+  input: CreateTransferInput,
+  existing: typeof transfers.$inferSelect,
+): Promise<CreateTransferInput> {
+  const stated = (v: unknown) => v !== undefined && v !== null && String(v).trim() !== '';
+  if (stated(input.exchangeRate) || stated(input.homeAmount) || !existing.exchangeRate) return input;
+  const home = await homeCode(ctx);
+  const fromCurrency = await currencyOfAccount(ctx, input.fromAccountId, home);
+  const toCurrency = await currencyOfAccount(ctx, input.toAccountId, home);
+  if (fromCurrency !== (existing.currency ?? null) || toCurrency !== (existing.toCurrency ?? null)) return input;
+  // A home-currency side fixes the home value by itself (what left or arrived there).
+  if (!fromCurrency || !toCurrency) return input;
+  // Same amount: exactly the home value it was saved with (re-deriving it from the 8-decimal
+  // rate could land a cent off and re-post).
+  if (existing.homeAmount && Money.eq(input.amount, existing.amount)) return { ...input, homeAmount: existing.homeAmount };
+  if (fromCurrency === toCurrency) return { ...input, exchangeRate: existing.exchangeRate };
+  // Foreign to another foreign currency: the home value came from the FROM currency's rate.
+  return { ...input, homeAmount: toAmountString(toHome(Money.of(input.amount), existing.exchangeRate)) };
+}
+
 export async function updateTransfer(ctx: ServiceContext, id: string, input: CreateTransferInput) {
   const amountStr = validateTransfer(input);
   await assertAccountsOwned(ctx, input);
-  const fx = await resolveTransferFx(ctx, input, amountStr);
   const [existing] = await ctx.db
     .select()
     .from(transfers)
     .where(and(eq(transfers.companyId, ctx.companyId), eq(transfers.id, id)));
   if (!existing) throw notFound('Transfer');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This transfer is void and cannot be edited.');
+  const fx = await resolveTransferFx(ctx, await withSavedRate(ctx, input, existing), amountStr);
 
   return inTransaction(ctx, async (tx) => {
     const lines = transferLines(input, fx);

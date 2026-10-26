@@ -492,3 +492,48 @@ describe('OFX file with several accounts', () => {
     await expectCode(importTransactions(ctx, { bankAccountId: ba, fileType: 'ofx', content }), 'VALIDATION', /7777.*3333|accounts/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Editing a foreign-currency deposit / transfer keeps its exchange rate
+// ---------------------------------------------------------------------------
+
+describe('editing a foreign-currency deposit or transfer keeps its rate', () => {
+  async function eurSetup() {
+    const { setAccountCurrency, setBaseCurrency, upsertCurrency } = await import('./currencies');
+    const { createAccount } = await import('./accounts');
+    await setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' });
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.10' });
+    const eurBank = (await createAccount(ctx, { code: '1020', name: 'Euro Bank', type: 'asset' as never, subtype: 'checking' })).id;
+    const eurSave = (await createAccount(ctx, { code: '1021', name: 'Euro Savings', type: 'asset' as never, subtype: 'savings' })).id;
+    await setAccountCurrency(ctx, eurBank, 'EUR');
+    await setAccountCurrency(ctx, eurSave, 'EUR');
+    return { eurBank, eurSave, upsertCurrency };
+  }
+
+  it('a memo-only edit of a EUR deposit (the form sends no rate) keeps its home value and its entry', async () => {
+    const { eurBank, upsertCurrency } = await eurSetup();
+    const { createDeposit, updateDeposit } = await import('./deposits');
+    const dep = await createDeposit(ctx, { depositAccountId: eurBank, date: d('2026-03-02'), extraLines: [{ accountId: acct['3000'], amount: '100.00' }] });
+    expect(dep.homeTotal).toBe('110.00');
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.25' }); // the list rate moved since
+    const edited = await updateDeposit(ctx, dep.id, {
+      depositAccountId: eurBank,
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['3000'], amount: '100.00' }],
+      memo: 'March owner money',
+    });
+    expect(edited.homeTotal).toBe('110.00');
+    expect(edited.postedEntryId).toBe(dep.postedEntryId);
+    expect(await gl('1020')).toBe('110.00');
+  });
+
+  it('a memo-only edit of a EUR to EUR transfer keeps its home value and its entry', async () => {
+    const { eurBank, eurSave, upsertCurrency } = await eurSetup();
+    const t = await createTransfer(ctx, { date: d('2026-03-02'), fromAccountId: eurBank, toAccountId: eurSave, amount: '100.00' });
+    expect(t.homeAmount).toBe('110.00');
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.25' });
+    const edited = await updateTransfer(ctx, t.id, { date: d('2026-03-02'), fromAccountId: eurBank, toAccountId: eurSave, amount: '100.00', memo: 'Sweep' });
+    expect(edited.homeAmount).toBe('110.00');
+    expect(edited.postedEntryId).toBe(t.postedEntryId);
+  });
+});
