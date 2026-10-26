@@ -63,7 +63,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { allocateCheckNumber, assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { allocateCheckNumber, assertCheckNumberAvailable } from './checkNumbers';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { purchaseUnitCost, receivePurchasedStock, reversePurchasedStock } from './bills';
 import {
@@ -656,24 +656,31 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
   // An inactive Other Names payee already on this check may stay on it.
   const prep = await prepareExpense(ctx, input, { keepOtherNameId: existing.otherNameId });
 
-  // Check number: keep the saved one unless the user typed another; print-later clears it.
   const toPrint = Boolean(input.toPrint) && input.method === 'check';
-  let reference = input.reference?.trim() || null;
-  if (input.method === 'check') {
-    if (toPrint) reference = null;
-    else if (!reference) reference = existing.reference ?? (await nextCheckNumber(ctx, input.paymentAccountId));
-    if (reference && input.checkDuplicateNumber && reference !== (existing.reference ?? '').trim()) {
-      await assertCheckNumberAvailable(ctx, {
-        paymentAccountId: input.paymentAccountId,
-        number: reference,
-        exclude: { source: 'expense', id },
-      });
-    }
-  }
 
   return inTransaction(ctx, async (tx) => {
     const [cur] = await tx.db.select().from(expenses).where(eq(expenses.id, id));
     if (!cur || cur.voidedAt) throw new ServiceError('CONFLICT', 'This transaction is void and cannot be edited.');
+    // Check number: keep the saved one unless the user typed another; print-later clears it; a
+    // check taken out of the print queue gets the account's next number. Numbered and
+    // duplicate-checked inside the transaction (as createExpense does), so a check written at the
+    // same moment can't take the same next number.
+    let reference = input.reference?.trim() || null;
+    if (input.method === 'check') {
+      if (toPrint) reference = null;
+      else if (!reference) {
+        reference =
+          (cur.method === 'check' ? cur.reference?.trim() : null) ||
+          (await allocateCheckNumber(tx, { paymentAccountId: input.paymentAccountId, exclude: { source: 'expense', id }, allowDuplicate: true }));
+      }
+      if (reference && input.checkDuplicateNumber && reference !== (cur.reference ?? '').trim()) {
+        await assertCheckNumberAvailable(tx, {
+          paymentAccountId: input.paymentAccountId,
+          number: reference,
+          exclude: { source: 'expense', id },
+        });
+      }
+    }
     const oldLines = await tx.db
       .select()
       .from(expenseLines)

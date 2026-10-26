@@ -50,7 +50,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { allocateCheckNumber, assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { allocateCheckNumber, assertCheckNumberAvailable } from './checkNumbers';
 import {
   getHomeCurrencyCode,
   getOrCreateExchangeGainLossAccount,
@@ -764,30 +764,26 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
   }
 
   const { reference: typed, toPrint } = referenceFor(input);
-  // A check keeps its number when the edit leaves it blank (as Write Checks does); a check
-  // that never had one gets the account's next number.
-  const reference =
-    typed ??
-    (input.method === 'check' && !toPrint && (await isBankPayFrom(ctx, input.paymentAccountId))
-      ? (existing.method === 'check' && existing.reference?.trim()) ||
-        (await nextCheckNumber(ctx, input.paymentAccountId))
-      : null);
-  if (
-    reference &&
-    input.method === 'check' &&
-    input.checkDuplicateNumber &&
-    reference !== (existing.reference ?? '').trim()
-  ) {
-    await assertCheckNumberAvailable(ctx, {
-      paymentAccountId: input.paymentAccountId,
-      number: reference,
-      exclude: { source: 'bill_payment', id },
-    });
-  }
 
   return inTransaction(ctx, async (tx) => {
     const [cur] = await tx.db.select().from(billPayments).where(eq(billPayments.id, id));
     if (!cur || cur.voidedAt) throw new ServiceError('CONFLICT', 'This payment is void and cannot be edited.');
+    // A check keeps its number when the edit leaves it blank (as Write Checks does); a check that
+    // never had one (taken out of the print queue) gets the account's next number. Numbered and
+    // duplicate-checked INSIDE the transaction, like a new check: PGlite serializes transactions,
+    // so a check written at the same moment can't take the same next number.
+    const keep = cur.method === 'check' ? cur.reference?.trim() || null : null;
+    let reference = typed;
+    if (!reference && input.method === 'check' && !toPrint && (await isBankPayFrom(tx, input.paymentAccountId))) {
+      reference = keep ?? (await allocateCheckNumber(tx, { paymentAccountId: input.paymentAccountId, exclude: { source: 'bill_payment', id }, allowDuplicate: true }));
+    }
+    if (reference && input.method === 'check' && input.checkDuplicateNumber && reference !== (cur.reference ?? '').trim()) {
+      await assertCheckNumberAvailable(tx, {
+        paymentAccountId: input.paymentAccountId,
+        number: reference,
+        exclude: { source: 'bill_payment', id },
+      });
+    }
     const oldApps = await tx.db
       .select()
       .from(billPaymentApplications)

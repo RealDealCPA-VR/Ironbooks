@@ -260,6 +260,53 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect(rows.find((r) => !r.itemId)?.description).toBeNull();
   });
 
+  it('D: a check taken out of the print queue by an edit never shares its number with a check written at the same time', async () => {
+    const { updateExpense } = await import('./expenses');
+    const { updateBillPayment } = await import('./billPayments');
+    const bank = (await createAccount(ctx, { code: '1090', name: 'Race Checking', type: 'asset' as never, subtype: 'checking' })).id;
+    const v = await newVendor();
+    const line = [{ accountId: acct['6300'], amount: '10.00' }];
+    await createExpense(ctx, { vendorId: v.id, date: d('2026-06-01'), method: 'check', reference: '5000', paymentAccountId: bank, lines: line });
+    for (let i = 0; i < 3; i++) {
+      // A check waiting in Print Checks (no number yet) …
+      const queued = await createExpense(ctx, { vendorId: v.id, date: d('2026-06-02'), method: 'check', toPrint: true, paymentAccountId: bank, lines: line });
+      expect(queued.reference).toBeNull();
+      // … is edited to "not to be printed" (it takes the next number) while another check is written.
+      const [edited, fresh] = await Promise.all([
+        updateExpense(ctx, queued.id, { vendorId: v.id, date: d('2026-06-02'), method: 'check', toPrint: false, paymentAccountId: bank, lines: line }),
+        createExpense(ctx, { vendorId: v.id, date: d('2026-06-02'), method: 'check', paymentAccountId: bank, lines: line }),
+      ]);
+      expect(edited.reference).toBeTruthy();
+      expect(fresh.reference).toBeTruthy();
+      expect(edited.reference).not.toBe(fresh.reference);
+    }
+    // Same for a queued bill payment check taken out of the queue by an edit.
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-06-01'), lines: [{ accountId: acct['6300'], amount: '500.00' }] });
+    for (let i = 0; i < 3; i++) {
+      const queued = await payBills(ctx, {
+        vendorId: v.id,
+        date: d('2026-06-03'),
+        method: 'check',
+        toPrint: true,
+        paymentAccountId: bank,
+        applications: [{ billId: bill.id, amountApplied: '5.00' }],
+      });
+      const [edited, fresh] = await Promise.all([
+        updateBillPayment(ctx, queued.id, {
+          vendorId: v.id,
+          date: d('2026-06-03'),
+          method: 'check',
+          toPrint: false,
+          paymentAccountId: bank,
+          applications: [{ billId: bill.id, amountApplied: '5.00' }],
+        }),
+        createExpense(ctx, { vendorId: v.id, date: d('2026-06-03'), method: 'check', paymentAccountId: bank, lines: line }),
+      ]);
+      expect(edited.reference).toBeTruthy();
+      expect(edited.reference).not.toBe(fresh.reference);
+    }
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
