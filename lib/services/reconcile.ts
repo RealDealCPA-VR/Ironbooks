@@ -1451,6 +1451,16 @@ export async function payCreditCardBalance(
   if (recon.status !== 'completed') {
     throw validation('Pay Credit Card is only available after the reconciliation is completed.');
   }
+  // Typed input from the "write a check for the balance" form: a non-number amount or an
+  // unparseable date used to escape as MoneyParseError / RangeError → HTTP 500.
+  if (typeof input.paymentAccountId !== 'string' || !input.paymentAccountId) throw validation('Choose the account to pay from.');
+  if (input.amount !== undefined && input.amount !== null && String(input.amount).trim() !== '') {
+    input = { ...input, amount: statementAmount(input.amount, 'The payment amount') };
+  } else {
+    input = { ...input, amount: undefined };
+  }
+  if (input.date !== undefined && input.date !== null) input = { ...input, date: statementDay(input.date, 'The payment date') };
+  if (input.memo != null && typeof input.memo !== 'string') throw validation('The memo must be text.');
 
   const [gl] = await ctx.db
     .select({ type: accounts.type, name: accounts.name })
