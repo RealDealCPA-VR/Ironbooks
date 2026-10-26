@@ -162,6 +162,16 @@ export interface GLOptions {
  */
 async function autoJournalNumber(ctx: ServiceContext): Promise<string | null> {
   if (!(await getPreferences(ctx)).autoAssignJeNumbers) return null;
+  return nextManualJournalNumber(ctx);
+}
+
+/**
+ * The next General Journal Entry No.: after the highest number on a journal entry (sourceRef
+ * 'manual': the journal window, the API, memorized entries). Other postings carry their own
+ * document's number as their reference (invoice, vendor bill and check numbers), which the
+ * journal's numbering never follows. The New Journal Entry window pre-fills it from here.
+ */
+export async function nextManualJournalNumber(ctx: ServiceContext): Promise<string> {
   const rows = await ctx.db
     .select({ reference: journalEntries.reference })
     .from(journalEntries)

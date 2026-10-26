@@ -7,12 +7,14 @@
  *   to      ISO date string — inclusive end date filter.
  *   limit   number (default 100, max 500).
  *   offset  number (default 0).
+ *   nextNumber=1  also return `nextNumber`, the next General Journal Entry No. (journal entries
+ *                 only — never a check, bill or invoice number; see nextManualJournalNumber).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
-import { createManualEntry, listEntries } from '@/lib/services/journal';
+import { createManualEntry, listEntries, nextManualJournalNumber } from '@/lib/services/journal';
 import { queryDate, queryInt, zodErrorBody } from '@/lib/validation/helpers';
 import { createJournalEntrySchema } from '@/lib/validation/journal';
 
@@ -27,6 +29,9 @@ export async function GET(req: NextRequest) {
     const offset = queryInt(sp, 'offset', 0);
 
     const entries = await listEntries(ctx, { from, to, limit, offset });
+    if (sp.get('nextNumber') === '1') {
+      return NextResponse.json({ entries, nextNumber: await nextManualJournalNumber(ctx) });
+    }
     return NextResponse.json({ entries });
   } catch (err) {
     return mapError(err);

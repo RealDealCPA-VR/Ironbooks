@@ -24,6 +24,7 @@ let ctx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => ctx) }));
 import { PATCH as entryPATCH } from '@/app/api/journal-entries/[id]/route';
 import { POST as reversePOST } from '@/app/api/journal-entries/[id]/reverse/route';
+import { GET as entriesGET } from '@/app/api/journal-entries/route';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-journal');
 let db: DB;
@@ -276,5 +277,41 @@ describe('journal entries (review round 5)', () => {
       ],
     });
     expect((await getEntry(ctx, ok.id)).lines[0].className).toBe('East');
+  });
+  it("F: the New Journal Entry window's next Entry No. follows journal entries only, not check / bill numbers", async () => {
+    const outer = ctx;
+    const [company] = await db.insert(companies).values({ name: 'Review5 Journal numbers', ownerId: outer.userId! }).returning();
+    ctx = { db, companyId: company.id, userId: outer.userId };
+    try {
+      const rent = (await createAccount(ctx, { code: '6400', name: 'Rent', type: 'expense', subtype: 'operating_expenses' })).id;
+      const bank = (await createAccount(ctx, { code: '1000', name: 'Checking', type: 'asset', subtype: 'checking' })).id;
+      // A journal entry numbered 7, then a check (its entry carries check number 5001 as reference).
+      await createManualEntry(ctx, {
+        date: d('2026-04-01'),
+        description: 'Numbered',
+        reference: '7',
+        lines: [
+          { accountId: rent, debit: '1.00' },
+          { accountId: bank, credit: '1.00' },
+        ],
+      });
+      await postJournalEntry(ctx, {
+        date: d('2026-04-02'),
+        description: 'Check 5001',
+        reference: '5001',
+        sourceRef: `expense:${crypto.randomUUID()}`,
+        lines: [
+          { accountId: rent, debit: '2.00' },
+          { accountId: bank, credit: '2.00' },
+        ],
+      });
+      const res = await entriesGET(new NextRequest('http://localhost/api/journal-entries?nextNumber=1&limit=1'));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { nextNumber?: string };
+      // The window used to work it out from the newest 100 entries of every kind: 5002.
+      expect(body.nextNumber).toBe('8');
+    } finally {
+      ctx = outer;
+    }
   });
 });
