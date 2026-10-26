@@ -46,11 +46,38 @@ function cellText(value: PdfCell): string {
   return String(value);
 }
 
+/** Look-alikes for characters the standard (WinAnsi) fonts cannot draw. */
+const PDF_STAND_INS: Record<string, string> = { '✓': 'X', '✔': 'X', '✗': 'x', '✘': 'x', '−': '-', '\u2009': ' ', '\u202F': ' ' };
+
+const charsets = new WeakMap<PDFFont, Set<number>>();
+
+/**
+ * Text the font can draw: every character of its character set is kept (for Helvetica that is
+ * WinAnsi: accented letters, en / em dashes, curly quotes, the euro sign, …), line breaks and
+ * tabs become spaces, a check mark becomes X, anything else '?'. pdf-lib throws on a character
+ * outside the font's encoding; keeping only Latin-1 instead turned every report's
+ * "01/01/2026 – 03/31/2026" subtitle into "01/01/2026 ? 03/31/2026".
+ */
+export function pdfSafeText(text: string, font: PDFFont): string {
+  let set = charsets.get(font);
+  if (!set) {
+    set = new Set(font.getCharacterSet());
+    charsets.set(font, set);
+  }
+  let out = '';
+  for (const ch of text) {
+    if (ch === '\n' || ch === '\r' || ch === '\t') out += ' ';
+    else if (set.has(ch.codePointAt(0)!)) out += ch;
+    else out += PDF_STAND_INS[ch] ?? '?';
+  }
+  return out;
+}
+
 /** Truncate text (with ellipsis) so it fits in maxWidth at the given size. */
 function fitText(text: string, font: PDFFont, size: number, maxWidth: number): string {
-  // pdf-lib's WinAnsi encoder throws on characters outside the codepage —
-  // strip them rather than fail the whole export.
-  let t = text.replace(/[^\x20-\x7E -ÿ]/g, '?');
+  // pdf-lib's WinAnsi encoder throws on characters outside the codepage — replace them rather
+  // than fail the whole export.
+  let t = pdfSafeText(text, font);
   if (font.widthOfTextAtSize(t, size) <= maxWidth) return t;
   while (t.length > 1 && font.widthOfTextAtSize(`${t}…`, size) > maxWidth) {
     t = t.slice(0, -1);
@@ -70,12 +97,11 @@ function computeColumnWidths(
 ): number[] {
   const sample = rows.slice(0, 200);
   const weights = columns.map((col, i) => {
-    let max = font.widthOfTextAtSize(col.header, HEADER_FONT_SIZE);
+    let max = font.widthOfTextAtSize(pdfSafeText(col.header, font), HEADER_FONT_SIZE);
     for (const row of sample) {
       const text = cellText(row[i]);
       if (!text) continue;
-      // Approximate (avoids re-encoding exotic chars during measuring).
-      const w = font.widthOfTextAtSize(text.replace(/[^\x20-\x7E]/g, '?'), BODY_FONT_SIZE);
+      const w = font.widthOfTextAtSize(pdfSafeText(text, font), BODY_FONT_SIZE);
       if (w > max) max = w;
     }
     return Math.min(max + 10, available); // padding; cap runaway columns
