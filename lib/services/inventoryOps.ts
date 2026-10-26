@@ -42,6 +42,8 @@ import {
   assertNotFifoTracked,
   bookValueRelief,
   fifoLayerValue,
+  inventoryDate,
+  inventoryNumber,
   resolveAdjustmentAccount,
   carriedValueRemainder,
   sellOutRelief,
@@ -278,7 +280,8 @@ async function physicalCountInTx(
   ctx: ServiceContext,
   input: PhysicalCountInput,
 ): Promise<PhysicalCountResult> {
-  const counted = Money.of(input.countedQty);
+  const counted = inventoryNumber(input.countedQty, 'Counted quantity');
+  input = { ...input, date: inventoryDate(input.date) };
   if (counted.isNegative()) {
     throw validation('countedQty cannot be negative.');
   }
@@ -478,6 +481,9 @@ async function adjustInventoryValueInTx(
   if (hasTotal === hasUnit) {
     throw validation('Provide exactly one of newTotalValue or newUnitCost.');
   }
+  if (hasTotal) inventoryNumber(input.newTotalValue, 'New total value');
+  if (hasUnit) inventoryNumber(input.newUnitCost, 'New unit cost');
+  input = { ...input, date: inventoryDate(input.date) };
 
   const item = await loadInventoryItem(ctx, input.itemId);
   if (item.type !== 'inventory') {
@@ -703,6 +709,8 @@ export async function batchPhysicalCount(
   if (!input.counts || input.counts.length === 0) {
     throw validation('counts must contain at least one entry.');
   }
+  // One date for the whole sheet: a bad one fails the batch up front (not every item as "skipped").
+  input = { ...input, date: inventoryDate(input.date) };
   const seen = new Set<string>();
   for (const c of input.counts) {
     if (seen.has(c.itemId)) throw validation('Duplicate itemId in counts.');

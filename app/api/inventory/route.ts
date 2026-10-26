@@ -13,7 +13,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { inventoryValuation } from '@/lib/services/inventory';
+import { inventoryDate, inventoryValuation } from '@/lib/services/inventory';
 import { adjustQuantityAtSite } from '@/lib/services/inventorySiteOps';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
@@ -32,7 +32,7 @@ function siteFields(body: Record<string, unknown>) {
     binId: typeof body.binId === 'string' ? body.binId : null,
     serialNumbers: Array.isArray(body.serialNumbers) ? body.serialNumbers.map(String) : null,
     lotNumber: typeof body.lotNumber === 'string' ? body.lotNumber : null,
-    lotExpiration: typeof body.lotExpiration === 'string' ? new Date(body.lotExpiration) : null,
+    lotExpiration: typeof body.lotExpiration === 'string' && body.lotExpiration ? inventoryDate(body.lotExpiration, 'lotExpiration') : null,
     // p1 purchases: QB Adjustment Account, Class and Customer:Job.
     adjustmentAccountId: typeof body.adjustmentAccountId === 'string' && body.adjustmentAccountId ? body.adjustmentAccountId : null,
     classId: typeof body.classId === 'string' && body.classId ? body.classId : null,
@@ -97,7 +97,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         itemId,
         quantityChange,
         unitCost: unitCost ?? null,
-        date: new Date(date),
+        date: inventoryDate(date),
         memo: memo ?? null,
       });
 
@@ -130,7 +130,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         ...siteFields(body),
         itemId,
         quantityChange: `-${String(quantity).replace(/^-/, '')}`,
-        date: new Date(date),
+        date: inventoryDate(date),
         memo: memo ?? 'Cost of goods sold',
         purpose: 'cogs',
       });

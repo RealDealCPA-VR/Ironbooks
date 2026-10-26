@@ -33,7 +33,15 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry } from './posting';
-import { type AdjustmentDimensions, adjustmentPostingFields, cogsAccountForItem, fifoLayerValue, resolveAdjustmentAccount } from './inventory';
+import {
+  type AdjustmentDimensions,
+  adjustmentPostingFields,
+  cogsAccountForItem,
+  fifoLayerValue,
+  inventoryDate,
+  inventoryNumber,
+  resolveAdjustmentAccount,
+} from './inventory';
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -138,11 +146,12 @@ export async function receiveStock(
   ctx: ServiceContext,
   input: ReceiveStockInput,
 ): Promise<ReceiveStockResult> {
-  const qty = Money.of(input.quantity);
+  const qty = inventoryNumber(input.quantity, 'Quantity');
   if (qty.lessThanOrEqualTo(0)) throw validation('quantity must be positive.');
 
-  const unitCost = Money.of(input.unitCost);
+  const unitCost = inventoryNumber(input.unitCost, 'Unit cost');
   if (unitCost.isNegative()) throw validation('unitCost cannot be negative.');
+  input = { ...input, date: inventoryDate(input.date) };
 
   // Validate item exists in company scope
   const item = await loadItem(ctx, input.itemId);
@@ -448,8 +457,9 @@ export async function consumeStock(
   ctx: ServiceContext,
   input: ConsumeStockInput,
 ): Promise<ConsumeStockResult> {
-  const needQty = Money.of(input.quantity);
+  const needQty = inventoryNumber(input.quantity, 'Quantity');
   if (needQty.lessThanOrEqualTo(0)) throw validation('quantity must be positive.');
+  input = { ...input, date: inventoryDate(input.date) };
 
   // Validate item exists
   const item = await loadItem(ctx, input.itemId);

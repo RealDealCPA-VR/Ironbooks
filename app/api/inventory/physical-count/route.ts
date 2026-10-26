@@ -12,7 +12,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { physicalCount } from '@/lib/services/inventoryOps';
-import { assertPhysicalCountable } from '@/lib/services/inventory';
+import { assertPhysicalCountable, inventoryDate } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
@@ -57,7 +57,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const result = await physicalCount(ctx, {
       itemId,
       countedQty,
-      date: new Date(date),
+      date: inventoryDate(date),
       adjustmentAccountId: adjustmentAccountId ?? null,
       classId: classId ?? null,
       customerId: customerId ?? null,

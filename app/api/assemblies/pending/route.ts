@@ -7,6 +7,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createPendingBuild, listPendingBuilds } from '@/lib/services/assemblies';
+import { inventoryDate } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
@@ -54,7 +55,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const build = await createPendingBuild(ctx, {
       assemblyItemId: body.assemblyItemId,
       quantity: body.quantity,
-      date: new Date(body.date),
+      date: inventoryDate(body.date),
       memo: body.memo ?? null,
     });
 

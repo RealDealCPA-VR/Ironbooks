@@ -18,6 +18,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { adjustInventoryValue } from '@/lib/services/inventoryOps';
+import { inventoryDate } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
@@ -52,7 +53,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       itemId: body.itemId,
       newTotalValue: body.newTotalValue ?? null,
       newUnitCost: body.newUnitCost ?? null,
-      date: new Date(body.date),
+      date: inventoryDate(body.date),
       reason: body.reason ?? null,
       adjustmentAccountId: body.adjustmentAccountId ?? null,
       classId: body.classId ?? null,

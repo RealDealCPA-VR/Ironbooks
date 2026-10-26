@@ -14,7 +14,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { accounts, inventoryLayers, itemSiteSettings, items } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
-import { type AdjustmentDimensions, adjustInventory } from './inventory';
+import { type AdjustmentDimensions, adjustInventory, inventoryDate, inventoryNumber } from './inventory';
 import { consumeStock, receiveStock, seedOpeningLayer } from './fifo';
 import { type InventoryLineDetail, getSite, recordMovements } from './inventorySites';
 
@@ -39,8 +39,14 @@ export interface SiteAdjustmentInput extends InventoryLineDetail, AdjustmentDime
 }
 
 export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjustmentInput) {
-  const qty = Money.of(input.quantityChange);
+  const qty = inventoryNumber(input.quantityChange, 'Quantity');
   if (qty.isZero()) throw validation('quantityChange cannot be zero.');
+  if (input.unitCost != null && input.unitCost !== '') inventoryNumber(input.unitCost, 'Unit cost');
+  input = {
+    ...input,
+    date: inventoryDate(input.date),
+    lotExpiration: input.lotExpiration == null ? input.lotExpiration : inventoryDate(input.lotExpiration, 'Lot expiration'),
+  };
 
   return inTransaction(ctx, async (tx) => {
     const [item] = await tx.db

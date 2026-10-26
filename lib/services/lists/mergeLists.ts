@@ -27,6 +27,7 @@ import {
   inventoryLots,
   items,
   itemSiteSettings,
+  journalEntries,
   journalEntryLines,
   otherNames,
   paychecks,
@@ -36,6 +37,7 @@ import {
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { Money, toAmountString } from '@/lib/money';
 import { allowLedgerRewrite, postJournalEntry } from '../posting';
+import { carriedValueRemainder, todayCalendarDay } from '../inventory';
 import { moveNotesAndTodos } from './notes';
 import { repointForeignKeys } from './references';
 import { assertListDeleteAllowed } from '../accountantCopy/guard';
@@ -89,6 +91,35 @@ async function hasLayers(ctx: ServiceContext, itemId: string): Promise<boolean> 
 export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId: string; toId: string }): Promise<ListMergeResult> {
   await assertListDeleteAllowed(ctx, 'merge', 'items'); // Accountant's Copy (I1)
   if (fromId === toId) throw validation('Cannot merge an item with itself.');
+  // Load + validate in the SAME transaction as the write: the merged quantity / average are
+  // written from these reads, so a sale or adjustment committed in between must not be lost.
+  return inTransaction(ctx, (tx) => mergeItemsInTx(tx, fromId, toId));
+}
+
+/**
+ * Would `assemblyId`'s bill of materials reach itself (directly or through sub-assemblies)?
+ * Run after the merge re-pointed the BOM rows, inside its transaction.
+ */
+async function bomHasCycle(tx: ServiceContext, assemblyId: string): Promise<boolean> {
+  const edges = await tx.db
+    .select({ a: assemblyComponents.assemblyItemId, c: assemblyComponents.componentItemId })
+    .from(assemblyComponents)
+    .where(eq(assemblyComponents.companyId, tx.companyId));
+  const next = new Map<string, string[]>();
+  for (const e of edges) next.set(e.a, [...(next.get(e.a) ?? []), e.c]);
+  const seen = new Set<string>();
+  const stack = [...(next.get(assemblyId) ?? [])];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    if (cur === assemblyId) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    stack.push(...(next.get(cur) ?? []));
+  }
+  return false;
+}
+
+async function mergeItemsInTx(ctx: ServiceContext, fromId: string, toId: string): Promise<ListMergeResult> {
   const load = async (id: string) => {
     const [row] = await ctx.db.select().from(items).where(and(eq(items.id, id), eq(items.companyId, ctx.companyId)));
     if (!row) throw notFound(`Item ${id}`);
@@ -139,8 +170,23 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
     .limit(1);
   if (selfBom.length) throw validation('One of these items is a component of the other, so they cannot be merged.');
 
-  return inTransaction(ctx, async (tx) => {
+  const tx = ctx;
+  {
     const reassigned: Record<string, number> = {};
+    // Both items are assemblies: the survivor keeps its own bill of materials (re-pointing the
+    // duplicate's rows would give it two lines for a shared component, which builds count twice).
+    const toBomRows = await tx.db
+      .select({ id: assemblyComponents.id })
+      .from(assemblyComponents)
+      .where(and(eq(assemblyComponents.companyId, tx.companyId), eq(assemblyComponents.assemblyItemId, toId)))
+      .limit(1);
+    if (toBomRows.length) {
+      const dropped = await tx.db
+        .delete(assemblyComponents)
+        .where(and(eq(assemblyComponents.companyId, tx.companyId), eq(assemblyComponents.assemblyItemId, fromId)))
+        .returning({ id: assemblyComponents.id });
+      if (dropped.length) reassigned['assemblyComponents.duplicateBomDropped'] = dropped.length;
+    }
     // Rows that would collide on a unique key: the survivor's own setting wins.
     const toLevels = (await tx.db.select({ v: priceLevelItems.priceLevelId }).from(priceLevelItems).where(eq(priceLevelItems.itemId, toId))).map((r) => r.v);
     if (toLevels.length) {
@@ -180,9 +226,32 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
     }
 
     Object.assign(reassigned, await repointForeignKeys(tx, 'items', fromId, toId));
+    if (await bomHasCycle(tx, toId)) {
+      throw validation(
+        `Merging "${from.name}" into "${to.name}" would make "${to.name}" a component of its own assembly. Change the bills of materials first.`,
+      );
+    }
     reassigned.recurringTemplates = await rewriteTemplates(tx, fromId, toId);
     const moved = await moveNotesAndTodos(tx, 'item', fromId, toId);
     reassigned.todos = moved.todos;
+    // The duplicate's own postings (quantity / value adjustments, physical counts, opening stock,
+    // FIFO receipts, assembly value moves) name it in their source link: move them to the
+    // survivor so the valuation reports (as of a date, detail) and the Inventory Center keep
+    // attributing that history to the item that now holds the stock. Only the link changes —
+    // accounts, amounts and dates are untouched.
+    const relinked = await tx.db
+      .update(journalEntries)
+      .set({ sourceRef: sql`replace(${journalEntries.sourceRef}, ${fromId}, ${toId})` })
+      .where(
+        and(
+          eq(journalEntries.companyId, tx.companyId),
+          sql`(${journalEntries.sourceRef} = ${`item:${fromId}`}
+            OR ((${journalEntries.sourceRef} LIKE 'assembly\\_build:%' OR ${journalEntries.sourceRef} LIKE 'assembly\\_unbuild:%')
+                AND position(${fromId} in ${journalEntries.sourceRef}) > 0))`,
+        ),
+      )
+      .returning({ id: journalEntries.id });
+    if (relinked.length) reassigned['journalEntries.sourceRef'] = relinked.length;
 
     // Stock: the survivor now holds both quantities; average cost is the value-weighted mean.
     const newQty = fromQty.plus(toQty);
@@ -198,7 +267,13 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
       // differ from the two items' combined value by a few cents (100 @ 2.00 + 200 @ 1.00 = 400.00,
       // but 300 x 1.3333 = 399.99). Post that difference so the inventory asset account keeps
       // matching the inventory subledger (inventory valuation) exactly.
-      const before = Money.round2(fromQty.times(fromAvg)).plus(Money.round2(toQty.times(toAvg)));
+      // What the GL carries for the two items: their book values plus the value remainders (0061)
+      // a 4dp average cannot show. The entry lands the account on the survivor's new book value,
+      // so both remainders are settled here (cleared below).
+      const before = Money.round2(fromQty.times(fromAvg))
+        .plus(carriedValueRemainder(from))
+        .plus(Money.round2(toQty.times(toAvg)))
+        .plus(carriedValueRemainder(to));
       const after = Money.round2(newQty.times(newAvg));
       const diff = after.minus(before);
       if (!diff.isZero()) {
@@ -213,7 +288,8 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
         const amount = toAmountString(diff.abs());
         const memo = `Rounding from merging item "${from.name}" into "${to.name}"`;
         const entry = await postJournalEntry(tx, {
-          date: new Date(),
+          // Today's calendar day (the convention stored dates use), not the current UTC instant.
+          date: todayCalendarDay(),
           description: memo,
           sourceRef: `item:${toId}`,
           lines: diff.isPositive()
@@ -234,12 +310,14 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
       .set({
         quantityOnHand: newQty.toFixed(4),
         averageCost: from.type === 'inventory' ? newAvg.toFixed(4) : to.averageCost,
+        // Average cost: the rounding entry above settled both items' remainders.
+        ...(averageCosted ? { valueRemainder: '0.00', valueRemainderAvg: newAvg.toFixed(4) } : {}),
         updatedAt: new Date(),
       })
       .where(eq(items.id, toId));
     await tx.db
       .update(items)
-      .set({ quantityOnHand: '0', isActive: false, barcode: null, updatedAt: new Date() })
+      .set({ quantityOnHand: '0', isActive: false, barcode: null, valueRemainder: '0.00', valueRemainderAvg: null, updatedAt: new Date() })
       .where(eq(items.id, fromId));
 
     await writeAudit(tx, {
@@ -257,7 +335,7 @@ export async function mergeItems(ctx: ServiceContext, { fromId, toId }: { fromId
       newValues: { mergedFrom: fromId, quantityOnHand: newQty.toFixed(4), averageCost: newAvg.toFixed(4), reassigned, roundingEntryId },
     });
     return { reassigned, deactivatedId: fromId };
-  });
+  }
 }
 
 // ---------------------------------------------------------------------------
