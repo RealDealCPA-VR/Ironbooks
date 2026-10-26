@@ -2107,6 +2107,22 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     }
     const externalPaid = await externalPaidAmount(tx, invoice);
     assertEditKeepsApplications(invoice, input, prep, externalPaid);
+    // Same deposit rule as the pre-check, again inside the transaction: a deposit of the
+    // payment-item lines saved in between (another user, no version header) took exactly their
+    // stored amount out of Undeposited Funds, so the edit may not change it.
+    if (await invoicePaymentDepositOf(tx, id)) {
+      const oldPayments = await storedPaymentLineTotal(tx, id);
+      if (
+        !Money.round2(oldPayments).equals(Money.round2(prep.paymentTotal)) ||
+        (input.currency ?? null) !== (invoice.currency ?? null) ||
+        !Money.eq(prep.exchangeRate, Money.of(invoice.exchangeRate ?? 1))
+      ) {
+        throw new ServiceError(
+          'CONFLICT',
+          'The payment recorded on this invoice is part of a bank deposit, so its amount, currency and exchange rate cannot change. Remove it from the deposit (or void the deposit) first.',
+        );
+      }
+    }
     // QB lets the user change the number on a saved invoice (duplicate → warn + confirm).
     const renum = await renumberDoc(
       tx, 'invoice', id, { refNumber: invoice.refNumber, number: invoice.invoiceNumber },
@@ -2402,14 +2418,17 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
 
     // Retainage held on this invoice that has already been billed (retainage.ts billRetainage):
     // voiding would take more out of Retainage Receivable than is left there for the customer.
-    if (Money.of(invoice.retainageAmount ?? '0').greaterThan(0) && invoice.status !== 'draft') {
+    // Everything below works from `current` (read inside this transaction), never the snapshot
+    // read before it: an edit saved in between voids the entry the snapshot names and posts a new
+    // one, and reversing the snapshot's entry would leave the edit's entry posted on a void invoice.
+    if (Money.of(current.retainageAmount ?? '0').greaterThan(0) && current.status !== 'draft') {
       // Same lock as billRetainage, so a release and this void cannot interleave.
       await tx.db.execute(
-        sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${invoice.customerId}`}))`,
+        sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${current.customerId}`}))`,
       );
       // Imported lazily: retainage.ts imports this module (createInvoice).
       const { retainageReport } = await import('./retainage');
-      const rep = await retainageReport(tx, { customerId: invoice.customerId });
+      const rep = await retainageReport(tx, { customerId: current.customerId });
       const row = rep.rows[0];
       const held = row?.documents.find((d) => d.kind === 'held' && d.invoiceId === id);
       if (row && held && Money.of(row.open).minus(Money.of(held.amount)).lessThan(0)) {
@@ -2421,13 +2440,13 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
     }
 
     // Reverse the GL entry.
-    if (invoice.postedEntryId) {
-      await voidJournalEntry(tx, invoice.postedEntryId);
+    if (current.postedEntryId) {
+      await voidJournalEntry(tx, current.postedEntryId);
     }
 
     // Reverse perpetual-inventory effects: void each COGS entry created by
     // createInvoice and put the relieved stock back on hand (and at its site).
-    await reverseInvoiceCOGS(tx, { id, date: invoice.date });
+    await reverseInvoiceCOGS(tx, { id, date: current.date });
     await reverseDocumentInventory(tx, 'invoice', id);
 
     // Invoices made from a sales order give the order back the quantities they invoiced.
@@ -2459,7 +2478,7 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
       action: 'void',
       entityType: 'invoice',
       entityId: id,
-      oldValues: { status: invoice.status },
+      oldValues: { status: current.status },
       newValues: { status: 'void' },
     });
 

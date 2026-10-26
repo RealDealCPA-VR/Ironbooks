@@ -1536,7 +1536,9 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
   const takeOut = !!deposit && input.removeFromDeposit === true;
   // A deposited foreign payment keeps its stored rate unless one is typed (the list rate may have
   // moved since, which would change the home amount the deposit took out of Undeposited Funds).
-  if (deposit && !takeOut && (input.exchangeRate === undefined || input.exchangeRate === null || String(input.exchangeRate).trim() === '')) {
+  const typedInput = input;
+  const rateTyped = !(input.exchangeRate === undefined || input.exchangeRate === null || String(input.exchangeRate).trim() === '');
+  if (deposit && !takeOut && !rateTyped) {
     input = { ...input, exchangeRate: payment.exchangeRate };
   }
   if (deposit && !takeOut) await assertDepositedEditAllowed(ctx, payment, deposit, input);
@@ -1556,7 +1558,15 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
       throw new ServiceError('CONFLICT', 'This payment was recorded as a bounced check, so it cannot be edited.');
     }
     payment = current;
-    if (deposit && takeOut) await removePaymentFromDeposit(tx, deposit.id, id);
+    // The deposit / refund checks above ran outside the transaction: a deposit (or refund) saved
+    // in between would let the edit change an amount the deposit already took out of Undeposited
+    // Funds. Re-run them against the state this transaction sees.
+    const depositNow = await paymentDepositOf(tx, id);
+    const takeOutNow = !!depositNow && input.removeFromDeposit === true;
+    input = depositNow && !takeOutNow && !rateTyped ? { ...typedInput, exchangeRate: current.exchangeRate } : typedInput;
+    if (depositNow && !takeOutNow) await assertDepositedEditAllowed(tx, current, depositNow, input);
+    await assertPaymentReversible(tx, current, 'edited', { allowDeposited: !!depositNow });
+    if (depositNow && takeOutNow) await removePaymentFromDeposit(tx, depositNow.id, id);
     const oldCredits = await tx.db
       .select({ creditMemoId: creditApplications.creditMemoId, invoiceId: creditApplications.invoiceId, amount: creditApplications.amount })
       .from(creditApplications)
@@ -1579,9 +1589,9 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
         postedEntryId: payment.postedEntryId,
         applications: oldApps.map((a) => ({ invoiceId: a.invoiceId, amountApplied: a.amountApplied, discountAmount: a.discountAmount })),
         credits: oldCredits,
-        depositId: deposit?.id ?? null,
+        depositId: depositNow?.id ?? null,
       },
-      newValues: { action: 'edit', ...(deposit ? { deposit: takeOut ? 'removed' : 'kept' } : {}) },
+      newValues: { action: 'edit', ...(depositNow ? { deposit: takeOutNow ? 'removed' : 'kept' } : {}) },
     });
     // C4: earlier unapplied payments picked while editing are applied too (they used to be
     // dropped silently). They are applied from their own payment, exactly as on a new payment.

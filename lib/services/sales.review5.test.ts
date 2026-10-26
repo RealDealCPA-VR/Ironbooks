@@ -18,6 +18,9 @@
  * 13. Billable costs from a foreign-currency bill are billed at their home amount.
  * 14. Customer balance summary: unapplied credit memos and foreign invoices at home value.
  * 15. Voiding the same invoice twice at once gives its sales order the quantities back only once.
+ * 24. A save that lands between an action's checks and its transaction (no version header): the
+ *     void of an invoice reverses the edited entry; a deposit in between keeps the deposited
+ *     amount of a payment / of an invoice's payment lines.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
 import path from 'node:path';
@@ -33,6 +36,7 @@ import {
   items,
   journalEntryLines,
   journalEntries,
+  paymentsReceived,
   salesOrderLines,
   salesOrders,
   salesReps,
@@ -66,6 +70,8 @@ import { renderSalesForm } from './salesForms';
 import { listUnbilled } from './billables';
 import { createBill } from './bills';
 import { setBaseCurrency, upsertCurrency } from './currencies';
+import { postJournalEntry } from './posting';
+import { createDeposit } from './deposits';
 
 let routeCtx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
@@ -159,6 +165,31 @@ async function plainInvoice(customerId: string, amount: string, date = '2026-03-
   } as never);
 }
 
+/**
+ * A ctx for the action under test whose FIRST transaction runs `before` (another user's save,
+ * through the plain ctx) just before it begins — i.e. after the action's own pre-checks read the
+ * record. Makes a "saved in between" race deterministic (no version header on the request).
+ */
+function ctxWithSaveBefore(before: () => Promise<unknown>): ServiceContext {
+  let pending = true;
+  const proxied = new Proxy(db, {
+    get(target, prop) {
+      if (prop === 'transaction') {
+        return async (...args: unknown[]) => {
+          if (pending) {
+            pending = false;
+            await before();
+          }
+          return (target.transaction as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      const v = Reflect.get(target, prop, target);
+      return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+  return { ...ctx, db: proxied as DB };
+}
+
 beforeAll(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   db = await getDb(TEST_DIR);
@@ -216,6 +247,19 @@ describe('1. Journal / history lookup for a payment and a sales receipt', () => 
         { itemId: widget, quantity: 2, rate: '10.00', taxable: false },
       ],
     });
+    // Another posted entry under the receipt's sourceRef, written after it (a later cost entry):
+    // the newest-by-sourceRef search would answer this one instead of the receipt's own entry.
+    await new Promise((r) => setTimeout(r, 5));
+    const later = await postJournalEntry(ctx, {
+      date: d('2026-03-02'),
+      description: 'Later cost entry',
+      sourceRef: `salesreceipt:${sr.id}`,
+      lines: [
+        { accountId: acct['5000'], debit: '1.00', credit: '0' },
+        { accountId: acct['1000'], debit: '0', credit: '1.00' },
+      ],
+    });
+    expect(later.id).not.toBe(sr.postedEntryId);
     const res = await forSourceGET(req(`/api/journal-entries/for-source?ref=salesreceipt:${sr.id}`));
     expect(res.status).toBe(200);
     expect((await res.json()).entryId).toBe(sr.postedEntryId);
@@ -743,19 +787,20 @@ describe('19. Sales order edits racing a conversion', () => {
 
   it('an edit saved while the order is being invoiced keeps the invoiced quantity', async () => {
     const { cust, svc, so, line } = await order('Edit race');
-    await Promise.allSettled([
-      updateSalesOrder(ctx, so.id, {
-        customerId: cust,
-        date: d('2026-03-01'),
-        taxRateId: null,
-        memo: 'Rush',
-        lines: [{ id: line.id, itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
-      }),
-      convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 4 }] }),
-    ]);
+    // Fixed order: the conversion (4 units) commits after the edit read the order and just before
+    // the edit's transaction begins.
+    const ectx = ctxWithSaveBefore(() => convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 4 }] }));
+    await updateSalesOrder(ectx, so.id, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      memo: 'Rush',
+      lines: [{ id: line.id, itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
+    });
     const [after] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
     const invoiced = await db.select().from(invoices).where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.customerId, cust)));
-    expect(after.quantityInvoiced).toBe(invoiced.length === 1 ? '4.0000' : '0.0000');
+    expect(invoiced).toHaveLength(1);
+    expect(after.quantityInvoiced).toBe('4.0000');
   });
 });
 
@@ -834,5 +879,105 @@ describe('23. Statement after a bounced check that had taken a discount', () => 
     expect((await customerStatement(ctx, cust)).closingBalance).toBe(gl);
     const ranged = await customerStatement(ctx, cust, { from: d('2026-03-10'), to: d('2026-03-31') });
     expect(ranged.closingBalance).toBe(gl);
+  });
+});
+
+describe('24. Saves that land between a check and its transaction (no version header)', () => {
+  const balanceOf = async (code: string) => {
+    const [a] = await db.select({ balance: accounts.balance }).from(accounts).where(eq(accounts.id, acct[code]));
+    return a.balance;
+  };
+  const postedFor = (ref: string) =>
+    db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, ref), eq(journalEntries.status, 'posted')));
+
+  it('voiding an invoice that someone else just edited reverses the edited entry', async () => {
+    const cust = await newCustomer('Void after edit');
+    const inv = await plainInvoice(cust, '100.00');
+    const vctx = ctxWithSaveBefore(() =>
+      updateInvoice(ctx, inv.id, {
+        customerId: cust,
+        date: d('2026-03-01'),
+        taxRateId: null,
+        lines: [{ accountId: acct['4000'], description: 'Work', quantity: 1, rate: '150.00', taxable: false }],
+      } as never),
+    );
+    const voided = await voidInvoice(vctx, inv.id);
+    expect(voided.status).toBe('void');
+    expect(voided.total).toBe('150.00'); // the edit did land before the void's transaction
+    expect(await postedFor(`invoice:${inv.id}`)).toHaveLength(0);
+    expect(await balanceOf('1200')).toBe('0.00');
+    expect(await balanceOf('4000')).toBe('0.00');
+  });
+
+  async function undepositedPayment(label: string) {
+    expect(acct['1050']).toBeDefined();
+    const cust = await newCustomer(label);
+    const inv = await plainInvoice(cust, '200.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      reference: '501',
+      amount: '200.00',
+      depositAccountId: acct['1050'],
+      applications: [{ invoiceId: inv.id, amountApplied: '200.00' }],
+    });
+    const edit = (amount: string, extra: Record<string, unknown> = {}) => ({
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check' as const,
+      reference: '501',
+      amount,
+      depositAccountId: acct['1050'],
+      applications: [{ invoiceId: inv.id, amountApplied: amount }],
+      ...extra,
+    });
+    const depositIt = () => createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-06'), paymentIds: [payment.id] });
+    return { cust, inv, payment, edit, depositIt };
+  }
+
+  it('a payment deposited while it is being edited keeps the amount the deposit took', async () => {
+    const { payment, edit, depositIt } = await undepositedPayment('Deposit race');
+    const pctx = ctxWithSaveBefore(depositIt);
+    await expect(updatePayment(pctx, payment.id, edit('150.00'))).rejects.toMatchObject({ code: 'CONFLICT' });
+    const [p] = await db.select().from(paymentsReceived).where(eq(paymentsReceived.id, payment.id));
+    expect(p.amount).toBe('200.00');
+    expect(await balanceOf('1050')).toBe('0.00');
+    expect(await balanceOf('1000')).toBe('200.00');
+  });
+
+  it('an edit that keeps the amount is still saved when the payment was deposited in between', async () => {
+    const { payment, edit, depositIt } = await undepositedPayment('Deposit race ok');
+    const pctx = ctxWithSaveBefore(depositIt);
+    await updatePayment(pctx, payment.id, edit('200.00', { reference: '502', memo: 'Re-dated' }));
+    const [p] = await db.select().from(paymentsReceived).where(eq(paymentsReceived.id, payment.id));
+    expect(p.reference).toBe('502');
+    expect(await balanceOf('1050')).toBe('0.00');
+    expect(await balanceOf('1000')).toBe('200.00');
+  });
+
+  it('an invoice whose payment line is deposited while it is being edited keeps that amount', async () => {
+    const cust = await newCustomer('Invoice deposit race');
+    const [payItem] = await db
+      .insert(items)
+      .values({ companyId: ctx.companyId, name: `Paid at counter ${seq}`, type: 'payment' as never, salesPrice: '0', incomeAccountId: acct['4000'] })
+      .returning();
+    const lines = (paid: string) => [
+      { accountId: acct['4000'], description: 'Work', quantity: 1, rate: '100.00', taxable: false },
+      { itemId: payItem.id, description: 'Paid at counter', quantity: 1, rate: paid, taxable: false },
+    ];
+    const inv = await createInvoice(ctx, { customerId: cust, date: d('2026-03-01'), taxRateId: null, lines: lines('80.00') } as never);
+    const ictx = ctxWithSaveBefore(() =>
+      createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-02'), invoicePaymentIds: [inv.id] }),
+    );
+    await expect(
+      updateInvoice(ictx, inv.id, { customerId: cust, date: d('2026-03-01'), taxRateId: null, lines: lines('50.00') } as never),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await balanceOf('1050')).toBe('0.00');
+    expect(await balanceOf('1000')).toBe('80.00');
+    expect((await getInvoice(ctx, inv.id)).balanceDue).toBe('20.00');
   });
 });
