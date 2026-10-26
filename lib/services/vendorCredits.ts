@@ -776,7 +776,64 @@ export async function getVendorCredit(ctx: ServiceContext, id: string) {
     .where(eq(vendorCreditLines.vendorCreditId, id))
     .orderBy(asc(vendorCreditLines.lineOrder));
 
-  return { ...credit, lines };
+  return { ...credit, lines, applications: await listVendorCreditApplications(ctx, id) };
+}
+
+/** One bill a vendor credit is (still) applied to, with the net amount applied. */
+export interface VendorCreditApplicationRow {
+  billId: string;
+  billNumber: string | null;
+  billDate: Date;
+  amount: string;
+}
+
+/**
+ * The bills this credit is applied to now (applications minus unapplications per bill, from the
+ * audit trail applyToBill / unapplyFromBill write — home and foreign alike, as netAppliedToBill).
+ * The Vendor Credits screen lists them with an Unapply button: without one, a credit applied to
+ * the wrong bill could not be voided, edited or moved ("Unapply first" had no way to do it), and
+ * neither could the bill.
+ */
+export async function listVendorCreditApplications(
+  ctx: ServiceContext,
+  vendorCreditId: string,
+): Promise<VendorCreditApplicationRow[]> {
+  const rows = await ctx.db
+    .select({ newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'vendor_credit'),
+        eq(auditLogs.entityId, vendorCreditId),
+        sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
+      ),
+    );
+  const net = new Map<string, Decimal>();
+  for (const r of rows) {
+    const nv = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
+    if (!nv.billId) continue;
+    let a: Decimal;
+    try {
+      a = Money.of(nv.amount ?? '0');
+    } catch {
+      continue;
+    }
+    net.set(nv.billId, (net.get(nv.billId) ?? Money.zero()).plus(nv.action === 'applied_to_bill' ? a : a.negated()));
+  }
+  const billIds = [...net.entries()].filter(([, v]) => Money.round2(v).greaterThan(0)).map(([k]) => k);
+  if (billIds.length === 0) return [];
+  const billRows = await ctx.db
+    .select({ id: bills.id, billNumber: bills.billNumber, date: bills.date })
+    .from(bills)
+    .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.id, billIds)))
+    .orderBy(asc(bills.date));
+  return billRows.map((b) => ({
+    billId: b.id,
+    billNumber: b.billNumber,
+    billDate: b.date,
+    amount: toAmountString(Money.round2(net.get(b.id)!)),
+  }));
 }
 
 // ---------------------------------------------------------------------------

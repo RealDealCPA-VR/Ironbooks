@@ -602,6 +602,30 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     await db.execute(rawSql`DELETE FROM bill_lines WHERE bill_id = ${big.id}::uuid AND description LIKE 'Bulk line %'`);
   });
 
+  it('Q: a vendor credit applied to the wrong bill can be unapplied from the Vendor Credits screen', async () => {
+    const { applyToBill, getVendorCredit, unapplyFromBill } = await import('./vendorCredits');
+    const v = await newVendor();
+    const credit = await createVendorCredit(ctx, { vendorId: v.id, date: d('2026-05-01'), lines: [{ accountId: acct['6300'], amount: '60.00' }] });
+    const b1 = await createBill(ctx, { vendorId: v.id, billNumber: 'Q-1', date: d('2026-05-02'), lines: [{ accountId: acct['6300'], amount: '100.00' }] });
+    const b2 = await createBill(ctx, { vendorId: v.id, billNumber: 'Q-2', date: d('2026-05-03'), lines: [{ accountId: acct['6300'], amount: '100.00' }] });
+    await applyToBill(ctx, { vendorCreditId: credit.id, billId: b1.id, amount: '40.00' });
+    await applyToBill(ctx, { vendorCreditId: credit.id, billId: b2.id, amount: '20.00' });
+    await unapplyFromBill(ctx, { vendorCreditId: credit.id, billId: b2.id, amount: '5.00' });
+    // The credit's detail lists where it is applied (what the screen shows with an Unapply button).
+    const detail = await getVendorCredit(ctx, credit.id);
+    expect(detail.applications.map((a) => [a.billNumber, a.amount])).toEqual([
+      ['Q-1', '40.00'],
+      ['Q-2', '15.00'],
+    ]);
+    // Unapplying everything lets the credit be voided again.
+    for (const a of detail.applications) await unapplyFromBill(ctx, { vendorCreditId: credit.id, billId: a.billId, amount: a.amount });
+    expect((await getVendorCredit(ctx, credit.id)).applications).toEqual([]);
+    await voidVendorCredit(ctx, credit.id);
+    // The screen offers it (before: "Unapply first" with no way to unapply).
+    const src = fs.readFileSync(path.resolve(process.cwd(), 'app', 'vendor-credits', 'page.tsx'), 'utf8');
+    expect(src).toContain("action: 'unapply'");
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
