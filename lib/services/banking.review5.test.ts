@@ -1021,3 +1021,38 @@ describe('bank feed suggestions never offer an account the line cannot be added 
     expect(s.accountId).not.toBe(acct['1050']);
   });
 });
+
+describe('reconcile service charge and loan escrow accounts', () => {
+  it('a statement service charge / interest line cannot go to Undeposited Funds or Inventory Asset', async () => {
+    const ba = await linkBank('1000');
+    const recon = await startReconciliation(ctx, { bankAccountId: ba, statementDate: d('2026-03-31'), statementBalance: '0.00' });
+    await expectCode(addStatementAdjustments(ctx, recon.id, { serviceCharge: { amount: '12.00', accountId: acct['1050'] } }), 'VALIDATION', /Undeposited Funds/);
+    await expectCode(addStatementAdjustments(ctx, recon.id, { interestEarned: { amount: '3.00', accountId: acct['1300'] } }), 'VALIDATION', /inventory/i);
+    expect(await gl('1050')).toBe('0.00');
+    expect(await gl('1300')).toBe('0.00');
+  });
+
+  it('a loan escrow account cannot be Undeposited Funds, Inventory Asset or A/R', async () => {
+    const { createLoan } = await import('./loans');
+    const { createAccount } = await import('./accounts');
+    const note = (await createAccount(ctx, { code: '2600', name: 'Truck Loan', type: 'liability' as never, subtype: 'other_current_liability' })).id;
+    const interest = (await createAccount(ctx, { code: '6800', name: 'Interest Expense', type: 'expense' as never, subtype: 'operating_expenses' })).id;
+    const base = {
+      name: 'Truck',
+      liabilityAccountId: note,
+      interestAccountId: interest,
+      paymentAccountId: acct['1000'],
+      originalAmount: '20000.00',
+      annualRate: '6',
+      termMonths: 48,
+      originDate: d('2026-01-01'),
+      firstPaymentDate: d('2026-02-01'),
+      escrowAmount: '50.00',
+    };
+    for (const code of ['1050', '1300', '1200']) {
+      await expectCode(createLoan(ctx, { ...base, escrowAccountId: acct[code] }), 'VALIDATION', /escrow/i);
+    }
+    const ok = await createLoan(ctx, { ...base, escrowAccountId: acct['1250'] });
+    expect(ok.escrowAccountId).toBe(acct['1250']);
+  });
+});

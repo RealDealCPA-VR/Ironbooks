@@ -27,6 +27,7 @@ import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
 import { canFinishReconciliation } from '@/lib/reconcileRules';
 import { MAX_DATE_YEAR, MIN_DATE_YEAR, parseDateInput } from '@/lib/validation/helpers';
 import { todayISO } from '@/lib/dates';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 import {
   type ServiceContext,
   ServiceError,
@@ -1005,6 +1006,15 @@ export async function addStatementAdjustments(
       if (a?.accountId === recon.glAccountId) {
         throw validation('Choose an expense or income account, not the account you are reconciling.');
       }
+      if (!a) continue;
+      // Undeposited Funds / Inventory Asset are kept by their own lists (Make Deposits, the
+      // inventory valuation): a service charge "to" them moved those balances for good.
+      const [acc] = await tx.db
+        .select({ name: accounts.name, type: accounts.type, subtype: accounts.subtype })
+        .from(accounts)
+        .where(and(eq(accounts.id, a.accountId), eq(accounts.companyId, tx.companyId)));
+      const reason = acc ? subledgerAccountReason(acc) : null;
+      if (reason) throw validation(`${reason} Choose an expense or income account.`);
     }
     // p1 fx: on a foreign-currency account the statement amounts are in the account's currency;
     // post their home value at the stated rate (else the currency list's rate).
