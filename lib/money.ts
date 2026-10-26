@@ -6,6 +6,7 @@
  * decimal.js here. UI formatting also lives here so currency rendering is consistent.
  */
 import Decimal from 'decimal.js';
+import { ServiceError } from '@/lib/services/errors';
 
 // Banker-friendly config: 2dp results, round-half-up (standard for accounting display),
 // enough precision headroom for intermediate calc (e.g. tax, multi-line allocation).
@@ -38,10 +39,15 @@ export function toDecimal(value: MoneyInput): Decimal {
   }
 }
 
-/** An amount that is not a decimal number. Callers translate it into a VALIDATION error. */
-export class MoneyParseError extends Error {
+/**
+ * An amount that is not a decimal number. It IS a ServiceError (VALIDATION): every API route
+ * answers it with a 400 and the message, even where no caller translated it — an action body with
+ * `amount: "abc"` (payments apply / refund, credit memo apply, progress percent) used to surface as
+ * a 500.
+ */
+export class MoneyParseError extends ServiceError {
   constructor(public readonly input: string) {
-    super(`"${input}" is not a valid amount.`);
+    super('VALIDATION', `"${input}" is not a valid amount.`, { input });
     this.name = 'MoneyParseError';
   }
 }

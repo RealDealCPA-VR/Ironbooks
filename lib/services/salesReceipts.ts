@@ -745,7 +745,10 @@ async function reverseSalesReceiptPostings(
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
     } else {
       // Average cost: weight the restored COGS back into averageCost (the GL gets the original
-      // COGS back, which differs from qty x today's average once the average has moved).
+      // COGS back, which differs from qty x today's average once the average has moved). The base
+      // is the item's BOOK value round2(qty x average) — what the sale's relief was taken from
+      // (inventory.ts bookValueRelief), as invoices.ts reverseInvoiceCOGS does: the unrounded
+      // product moved the average (and the next relief by a cent) on every unchanged re-save.
       const [cur] = await tx.db
         .select({
           qty: items.quantityOnHand,
@@ -758,7 +761,7 @@ async function reverseSalesReceiptPostings(
       const curQty = Money.of(cur?.qty ?? '0');
       const curAvg = Money.of(cur?.avg ?? '0');
       const newQty = curQty.plus(qty);
-      const newAvg = newQty.isZero() ? curAvg : curQty.times(curAvg).plus(cogs).dividedBy(newQty);
+      const newAvg = newQty.isZero() ? curAvg : Money.round2(curQty.times(curAvg)).plus(cogs).dividedBy(newQty);
       await tx.db
         .update(items)
         .set({
@@ -818,7 +821,21 @@ export async function voidSalesReceipt(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
-    await reverseSalesReceiptPostings(tx, receipt);
+    // Re-checked inside the transaction: a second void at the same moment must not reverse again.
+    const [current] = await tx.db
+      .select()
+      .from(salesReceipts)
+      .where(and(eq(salesReceipts.companyId, tx.companyId), eq(salesReceipts.id, id)));
+    if (!current || current.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Sales receipt is already voided.');
+    }
+    if (await isDeposited(tx, id)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'This sales receipt has been included in a deposit, so it cannot be voided. Remove it from the deposit (or void the deposit) first.',
+      );
+    }
+    await reverseSalesReceiptPostings(tx, current);
 
     // Mark the receipt void.
     const [updated] = await tx.db

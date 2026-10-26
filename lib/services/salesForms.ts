@@ -32,13 +32,12 @@ import { customerStatement } from './statements';
 import { getCompany } from './company';
 import { docRef } from './docNumbers';
 import { isConfigured, sendMail } from './email';
-import { renderInvoicePdf } from '@/lib/pdf/invoice';
 import { renderEstimatePdf } from '@/lib/pdf/estimate';
 import { renderSalesReceiptPdf } from '@/lib/pdf/salesReceipt';
 import { renderCreditMemoPdf } from '@/lib/pdf/creditMemo';
 import { renderSalesOrderPdf } from '@/lib/pdf/salesOrder';
 import type { SalesShippingInfo } from '@/lib/pdf/salesForm';
-import { addressToLines, buildStatementPdf, companyLetterhead } from '@/lib/pdf/forms';
+import { addressToLines, buildInvoicePdf, buildStatementPdf, companyLetterhead } from '@/lib/pdf/forms';
 import { resolveFormTemplate } from './formTemplates';
 
 export const SALES_FORM_KINDS = ['invoice', 'estimate', 'sales_receipt', 'credit_memo', 'sales_order'] as const;
@@ -139,26 +138,10 @@ export async function renderSalesForm(
     case 'invoice': {
       const inv = await getInvoice(ctx, id);
       const cust = await customerInfo(ctx, inv.customerId);
-      const bytes = await renderInvoicePdf({
-        company: letterhead,
-        billToLines: cust.billToLines,
-        customerName: cust.name,
-        invoice: {
-          number: docRef(inv.refNumber, inv.invoiceNumber),
-          date: iso(inv.date),
-          dueDate: inv.dueDate ? iso(inv.dueDate) : null,
-          subtotal: inv.subtotal,
-          discount: inv.discount,
-          tax: inv.taxAmount,
-          total: inv.total,
-          balanceDue: inv.balanceDue,
-        },
-        lines: inv.lines.map((l) => ({
-          ...lineOf(l),
-          description: l.unitOfMeasure ? `${l.description ?? ''} (${l.unitOfMeasure})`.trim() : (l.description ?? ''),
-        })),
-        shipping: shippingOf(inv),
-      }, template);
+      // The same invoice PDF as Print / the invoice PDF route (lib/pdf/forms.ts): the invoice's
+      // currency, terms, memo, item names and "don't print zero-amount items" — this path used to
+      // build its own copy that printed a foreign-currency invoice in dollars.
+      const { bytes } = await buildInvoicePdf(ctx, id, templateId);
       const title = `${inv.isStatementCharge ? 'Statement Charge' : 'Invoice'} #${docRef(inv.refNumber, inv.invoiceNumber)}`;
       return {
         bytes,

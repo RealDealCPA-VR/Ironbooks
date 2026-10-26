@@ -14,7 +14,7 @@
  *  - Deactivation is soft-delete (isActive = false); hard delete is not exposed.
  */
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
-import { customers, invoices, priceLevels, taxRates } from '@/lib/db/schema';
+import { creditMemos, customers, invoices, priceLevels, taxRates } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, assertRefInCompany, inTransaction, notFound, validation, writeAudit } from './_base';
 import { requirePriceLevelChangeAccess } from './pricing';
@@ -475,7 +475,9 @@ export async function customerBalanceSummary(
     .select({
       customerId: invoices.customerId,
       displayName: customers.displayName,
-      totalBalanceDue: sql<string>`COALESCE(SUM(${invoices.balanceDue}), 0)`,
+      // Home currency: a foreign invoice's balance is in its own currency (booked rate here,
+      // as the credit-limit check and the A/R reports value it).
+      totalBalanceDue: sql<string>`COALESCE(SUM(ROUND(CAST(${invoices.balanceDue} AS NUMERIC) * COALESCE(CAST(${invoices.exchangeRate} AS NUMERIC), 1), 2)), 0)`,
       openInvoiceCount: sql<number>`COUNT(${invoices.id})`,
     })
     .from(invoices)
@@ -498,10 +500,28 @@ export async function customerBalanceSummary(
   }));
 
   // Named General Journal lines on A/R are part of the customer's balance (QB parity), and
-  // unapplied payments are credits against it (the whole payment was credited to A/R).
+  // unapplied payments and unapplied credit memos are credits against it (both credited A/R in
+  // full when they were saved).
   const journal = await journalBalancesByEntity(ctx, 'ar');
   for (const [id, credit] of await unappliedPaymentsByCustomer(ctx)) {
     journal.set(id, toAmountString(Money.of(journal.get(id) ?? '0').minus(Money.of(credit))));
+  }
+  const memoCredits = await ctx.db
+    .select({
+      customerId: creditMemos.customerId,
+      unapplied: sql<string>`COALESCE(SUM(CAST(${creditMemos.unapplied} AS NUMERIC)), 0)`,
+    })
+    .from(creditMemos)
+    .where(
+      and(
+        eq(creditMemos.companyId, ctx.companyId),
+        sql`${creditMemos.status} <> 'void'`,
+        sql`CAST(${creditMemos.unapplied} AS NUMERIC) > 0`,
+      ),
+    )
+    .groupBy(creditMemos.customerId);
+  for (const m of memoCredits) {
+    journal.set(m.customerId, toAmountString(Money.of(journal.get(m.customerId) ?? '0').minus(Money.of(m.unapplied))));
   }
   if (journal.size > 0) {
     const byId = new Map(result.map((r) => [r.customerId, r]));

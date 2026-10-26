@@ -305,8 +305,12 @@ describe('financeCharges service (integration)', () => {
     expect(larry.overdueInvoices).toHaveLength(1);
     expect(larry.overdueInvoices[0].invoiceNumber).toBe(100);
     expect(larry.alreadyAssessed).toBe(false); // new period
-    // 1000 × 0.18/365 × 90 = 44.38
-    expect(larry.charge).toBe('44.38');
+    // 90 days past due, but the 60 days up to the March 2 assessment were already charged:
+    // only Mar 2 -> Apr 1 is new (round 5; QB counts from the last finance charge date).
+    // 1000 × 0.18/365 × 30 = 14.79
+    expect(larry.overdueInvoices[0].daysOverdue).toBe(90);
+    expect(larry.overdueInvoices[0].daysCharged).toBe(30);
+    expect(larry.charge).toBe('14.79');
   });
 
   it('respects the customerIds subset filter', async () => {

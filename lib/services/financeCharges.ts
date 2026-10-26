@@ -4,7 +4,8 @@
  * Settings (annual interest rate %, minimum charge, grace days) live in
  * companies.settings.financeCharges (jsonb). Assessment walks every overdue
  * open invoice as of a date, computes simple interest per invoice
- * (balanceDue × annualRate/100 × daysOverdue/365), applies the minimum charge
+ * (balanceDue × annualRate/100 × days/365, the days counted from the due date or from the
+ * customer's last finance charge, whichever is later — as QB does), applies the minimum charge
  * per customer, and creates ONE finance-charge invoice per customer posted to
  * a "Finance Charge Income" account (code 4400, find-or-create).
  *
@@ -138,6 +139,11 @@ export interface FinanceChargeInvoiceDetail {
   dueDate: string;
   balanceDue: string;
   daysOverdue: number;
+  /**
+   * Days the interest is charged for: from the due date, or from the customer's last finance
+   * charge when that is later (QB never charges the same overdue days twice).
+   */
+  daysCharged: number;
   charge: string;
 }
 
@@ -234,6 +240,23 @@ export async function previewFinanceCharges(
     );
   const assessedSet = new Set(assessedRows.map((r) => r.customerId));
 
+  // Each customer's last finance charge on or before the assessment date (non-void marker
+  // invoice). Interest already charged up to that day is not charged again: QB calculates a new
+  // finance charge from the due date or the last finance charge date, whichever is later.
+  const lastChargeRows = await ctx.db
+    .select({ customerId: invoices.customerId, last: sql<Date>`MAX(${invoices.date})`.mapWith(invoices.date) })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.companyId, ctx.companyId),
+        ne(invoices.status, 'void'),
+        like(invoices.memo, '%[FC:%'),
+        lt(invoices.date, new Date(asOf.getTime() + DAY_MS)),
+      ),
+    )
+    .groupBy(invoices.customerId);
+  const lastChargeBy = new Map(lastChargeRows.map((r) => [r.customerId, new Date(r.last)]));
+
   const dailyRate = Money.div(Money.div(settings.annualRate, 100), 365);
   const minCharge = Money.of(settings.minCharge);
 
@@ -244,11 +267,18 @@ export async function previewFinanceCharges(
     // Chargeable only once past the grace period; interest accrues from the due date.
     if (daysOverdue <= settings.graceDays) continue;
 
+    // Interest runs from the due date, or from the last finance charge when that is later.
+    const lastCharge = lastChargeBy.get(r.customerId);
+    const from = lastCharge && lastCharge.getTime() > effDue.getTime() ? lastCharge : effDue;
+    const daysCharged = Math.max(0, Math.floor((asOf.getTime() - from.getTime()) / DAY_MS));
+    // A customer already assessed for this period stays listed (as "already assessed").
+    const assessedThisPeriod = assessedSet.has(r.customerId);
+
     // balanceDue is in the invoice's own currency; the finance-charge invoice is in home
     // currency, so the interest is charged on the balance's home value (balance x booked rate).
     const homeBalance = Money.round2(Money.mul(Money.of(r.balanceDue), Money.of(r.exchangeRate ?? 1)));
-    const charge = Money.round2(Money.mul(Money.mul(homeBalance, dailyRate), daysOverdue));
-    if (charge.lessThanOrEqualTo(0)) continue;
+    const charge = Money.round2(Money.mul(Money.mul(homeBalance, dailyRate), daysCharged));
+    if (charge.lessThanOrEqualTo(0) && !assessedThisPeriod) continue;
 
     let entry = byCustomer.get(r.customerId);
     if (!entry) {
@@ -270,6 +300,7 @@ export async function previewFinanceCharges(
       dueDate: effDue.toISOString().slice(0, 10),
       balanceDue: toAmountString(homeBalance), // home currency, the base the charge is on
       daysOverdue,
+      daysCharged,
       charge: toAmountString(charge),
     });
   }

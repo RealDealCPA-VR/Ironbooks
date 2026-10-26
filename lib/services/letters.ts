@@ -33,6 +33,7 @@ import { addressToLines, companyLetterhead } from '@/lib/pdf/forms';
 import { renderEnvelopesPdf, renderLabelsPdf, renderLettersPdf } from '@/lib/pdf/letters';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { getPreferences } from './company';
+import { docRef } from './docNumbers';
 import { assertWrite } from './rbac';
 
 export const RECIPIENT_TYPES = ['customer', 'vendor', 'employee', 'lead'] as const;
@@ -264,6 +265,7 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
       .select({
         customerId: invoices.customerId,
         n: invoices.invoiceNumber,
+        ref: invoices.refNumber,
         date: invoices.date,
         due: invoices.dueDate,
         balance: invoices.balanceDue,
@@ -324,7 +326,8 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
             maxDays = Math.max(maxDays, days);
           }
           lines.push(
-            `  Invoice ${i.n}  dated ${dayOf(i.date)}${i.due ? `, due ${dayOf(i.due)}` : ''}: ${formatCurrency(i.balance)}${days > 0 ? ` (${days} days overdue)` : ''}`,
+            // The number printed on the invoice (typed / alphanumeric), not the internal sequence.
+            `  Invoice ${docRef(i.ref, i.n)}  dated ${dayOf(i.date)}${i.due ? `, due ${dayOf(i.due)}` : ''}: ${formatCurrency(i.balance)}${days > 0 ? ` (${days} days overdue)` : ''}`,
           );
         }
         const credits = credit.get(r.id) ?? Money.zero();

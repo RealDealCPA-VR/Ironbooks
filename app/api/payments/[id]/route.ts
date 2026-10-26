@@ -25,7 +25,7 @@ import {
   recordBouncedCheck,
 } from '@/lib/services/payments';
 import { ServiceError } from '@/lib/services/_base';
-import { zodErrorBody } from '@/lib/validation/helpers';
+import { parseDateInput, zodErrorBody } from '@/lib/validation/helpers';
 import { bouncedCheckSchema, receivePaymentSchema } from '@/lib/validation/payments';
 
 // Map ServiceError codes to HTTP status codes.
@@ -101,11 +101,16 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
             { status: 400 },
           );
         }
+        // An unreadable date is a 400 (new Date('garbage') reached the service as Invalid Date → 500).
+        const date = body.date ? (typeof body.date === 'string' ? parseDateInput(body.date) : null) : null;
+        if (body.date && !date) {
+          return NextResponse.json({ error: `date: "${body.date}" is not a valid date`, code: 'VALIDATION' }, { status: 400 });
+        }
         const result = await refundPayment(ctx, {
           paymentId: id,
           bankAccountId: body.bankAccountId,
           amount: body.amount,
-          date: body.date ? new Date(body.date) : null,
+          date,
           memo: body.memo ?? null,
         });
         return NextResponse.json(result);

@@ -10,6 +10,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { expireOverdueEstimates } from '@/lib/services/estimateExpiry';
+import { companyToday } from '@/lib/services/salesDates';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
@@ -32,7 +33,9 @@ export async function POST(req: NextRequest) {
     // An empty body is fine (asOf defaults to today); malformed JSON or a non-object body is a 400.
     const body: { asOf?: string } = await requireJsonObject(req, { optional: true });
 
-    const asOf = body.asOf ? new Date(body.asOf) : new Date();
+    // Default: today's calendar day (company time zone). An estimate stays valid through its
+    // expiration date: compared with this instant it was expired on that very day.
+    const asOf = body.asOf ? new Date(body.asOf) : await companyToday(ctx);
 
     if (isNaN(asOf.getTime())) {
       return NextResponse.json(

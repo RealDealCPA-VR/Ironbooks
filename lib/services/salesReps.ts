@@ -11,7 +11,7 @@
  *  - Deactivation is soft-delete (isActive = false).
  *  - commissionRate is stored as a decimal fraction, e.g. 0.05 = 5%.
  */
-import { and, asc, eq, gte, isNotNull, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, isNotNull, lt, sql } from 'drizzle-orm';
 import { invoices, salesReps } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
@@ -64,6 +64,14 @@ function assertValidEmail(email: string) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw validation(`"${email}" is not a valid email address.`);
   }
+}
+
+/**
+ * The stored rate: the column keeps 4 decimals (numeric(6,4)) so 2.5% (0.025) or 1.25% (0.0125)
+ * stay exact — it used to go through the 2-decimal money formatter, which saved 0.025 as 0.03.
+ */
+function commissionRateString(rate: string | number): string {
+  return Money.of(rate).toDecimalPlaces(4).toFixed(4);
 }
 
 function validateCreateInput(input: CreateSalesRepInput) {
@@ -120,7 +128,7 @@ export async function createSalesRep(ctx: ServiceContext, input: CreateSalesRepI
       companyId: ctx.companyId,
       name: input.name.trim(),
       email: input.email?.trim() ?? null,
-      commissionRate: toAmountString(input.commissionRate),
+      commissionRate: commissionRateString(input.commissionRate),
     })
     .returning();
 
@@ -162,7 +170,7 @@ export async function updateSalesRep(
   if (input.name !== undefined) patch.name = input.name.trim();
   if ('email' in input) patch.email = input.email?.trim() ?? null;
   if (input.commissionRate !== undefined)
-    patch.commissionRate = toAmountString(input.commissionRate);
+    patch.commissionRate = commissionRateString(input.commissionRate);
 
   if (Object.keys(patch).length === 0) return existing;
 
@@ -265,7 +273,9 @@ export async function commissionReport(
   ctx: ServiceContext,
   range?: DateRange,
 ): Promise<CommissionReport> {
-  // Aggregate invoice totals per rep for invoices that have a salesRepId set.
+  // Aggregate each rep's SALES for invoices that have a salesRepId set: the invoice's net sales
+  // (subtotal after its discounts) in home currency. Sales tax is not a sale — it is owed to the
+  // tax agency — so it never earns commission; a foreign invoice counts at its booked rate.
   const conds = [
     eq(invoices.companyId, ctx.companyId),
     isNotNull(invoices.salesRepId),
@@ -273,12 +283,13 @@ export async function commissionReport(
     sql`${invoices.status} NOT IN ('void', 'draft')`,
   ];
   if (range?.from) conds.push(gte(invoices.date, range.from));
-  if (range?.to) conds.push(lte(invoices.date, range.to));
+  // The whole `to` day counts (a document dated later that day is still in the range).
+  if (range?.to) conds.push(lt(invoices.date, new Date(range.to.getTime() + 86_400_000)));
 
   const rows = await ctx.db
     .select({
       repId: invoices.salesRepId,
-      salesTotal: sql<string>`COALESCE(SUM(${invoices.total}), 0)`,
+      salesTotal: sql<string>`COALESCE(SUM(ROUND((CAST(${invoices.subtotal} AS NUMERIC) - CAST(COALESCE(${invoices.discount}, '0') AS NUMERIC)) * COALESCE(CAST(${invoices.exchangeRate} AS NUMERIC), 1), 2)), 0)`,
     })
     .from(invoices)
     .where(and(...conds))

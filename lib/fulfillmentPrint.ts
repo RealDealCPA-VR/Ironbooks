@@ -5,7 +5,7 @@
  */
 import { and, eq, inArray } from 'drizzle-orm';
 import { z } from 'zod';
-import { customers } from '@/lib/db/schema';
+import { customers, salesOrders } from '@/lib/db/schema';
 import type { ServiceContext } from '@/lib/services/_base';
 import { validation } from '@/lib/services/_base';
 import { planShipments, type Shipment } from '@/lib/services/fulfillment';
@@ -58,7 +58,11 @@ function addressLines(addr: Record<string, string> | null | undefined): string[]
   return out;
 }
 
-/** One packing slip per sales order, ship-to from the customer (shipping, else billing). */
+/**
+ * One packing slip per sales order. Ship to: the sales order's own ship-to address (QB
+ * Enterprise: the order can go to any of the customer's ship-to addresses), else the customer's
+ * shipping address, else the billing address.
+ */
 export async function packingSlipData(
   ctx: ServiceContext,
   companyName: string,
@@ -73,10 +77,18 @@ export async function packingSlipData(
         .where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, ids)))
     : [];
   const addr = new Map(rows.map((r) => [r.id, addressLines(r.shippingAddress ?? r.billingAddress)]));
+  const orderIds = [...new Set(shipments.map((s) => s.salesOrderId))];
+  const orders = orderIds.length
+    ? await ctx.db
+        .select({ id: salesOrders.id, shipTo: salesOrders.shipTo })
+        .from(salesOrders)
+        .where(and(eq(salesOrders.companyId, ctx.companyId), inArray(salesOrders.id, orderIds)))
+    : [];
+  const orderShipTo = new Map(orders.map((o) => [o.id, addressLines(o.shipTo as Record<string, string> | null)]));
   return shipments.map((s) => ({
     company: { name: companyName },
     customerName: s.customerName,
-    shipToLines: addr.get(s.customerId) ?? [],
+    shipToLines: orderShipTo.get(s.salesOrderId)?.length ? orderShipTo.get(s.salesOrderId)! : (addr.get(s.customerId) ?? []),
     slip: { invoiceNumber: '', label: `Sales Order #${s.refNumber || s.orderNumber}`, date, orderNumber: null },
     lines: s.lines.map((l) => ({ itemName: l.itemName, description: l.description ?? '', quantity: l.quantity })),
   }));

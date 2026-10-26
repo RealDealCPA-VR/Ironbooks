@@ -421,6 +421,55 @@ async function invoicePaymentDepositOf(ctx: ServiceContext, invoiceId: string) {
   return row ?? null;
 }
 
+/**
+ * Retainage Receivable (1250) can never go below zero for a customer: what was billed out of it
+ * (invoice lines on the account) cannot exceed what their invoices hold. billRetainage and
+ * voidInvoice check this before they act; an edit (taking the retainage off a held invoice,
+ * raising a retainage billing) or a hand-typed line on 1250 is checked here, after the change is
+ * written, inside the same transaction — so a refused change rolls back. Only runs when the
+ * document touches retainage (`held` amounts or a line on 1250, before or after the change).
+ * Call it BEFORE the change (it records each customer's open retainage) and run the returned
+ * check AFTER it: a change that leaves the open amount below zero, and lower than it was, is
+ * refused (a file already below zero from older data can still be edited back up).
+ */
+async function retainageGuard(
+  tx: ServiceContext,
+  customerIds: string[],
+  touched: { held: Array<string | null | undefined>; lineAccountIds: Array<string | null | undefined> },
+): Promise<() => Promise<void>> {
+  const none = async () => {};
+  const [ret] = await tx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.code, '1250')));
+  if (!ret) return none;
+  const holds = touched.held.some((h) => h != null && Money.of(h).greaterThan(0));
+  if (!holds && !touched.lineAccountIds.some((id) => id === ret.id)) return none;
+  // Imported lazily: retainage.ts imports this module (createInvoice).
+  const { retainageReport } = await import('./retainage');
+  const ids = [...new Set(customerIds)];
+  const openOf = async (customerId: string) =>
+    Money.of((await retainageReport(tx, { customerId })).rows[0]?.open ?? '0');
+  const before = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const customerId of ids) {
+    // Same lock as billRetainage / voidInvoice, so a release and this change cannot interleave.
+    await tx.db.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${customerId}`}))`);
+    before.set(customerId, await openOf(customerId));
+  }
+  return async () => {
+    for (const customerId of ids) {
+      const open = await openOf(customerId);
+      if (open.lessThan(0) && open.lessThan(before.get(customerId)!)) {
+        throw new ServiceError(
+          'CONFLICT',
+          `This would bill ${toAmountString(open.negated())} more retainage than this customer's invoices still hold, which would leave Retainage Receivable below zero. Reduce or void the retainage billing invoice first.`,
+          { retainageOpen: toAmountString(open) },
+        );
+      }
+    }
+  };
+}
+
 /** True when the invoice has payments applied beyond its own payment-item lines. */
 async function hasExternalPayments(
   ctx: ServiceContext,
@@ -1485,6 +1534,10 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
     if (!isDraft) {
       await checkEstimateOverBilling(tx, prep.computedLines, { allowOverBilling: input.allowOverBilling });
     }
+    // A hand-typed line on Retainage Receivable bills retainage: no more than is held.
+    const checkRetainage = isDraft
+      ? async () => {}
+      : await retainageGuard(tx, [input.customerId], { held: [], lineAccountIds: prep.computedLines.map((l) => l.accountId) });
 
     const { refNumber, number: invoiceNumber } = await allocateDocNumber(tx, 'invoice', input.refNumber, {
       allowDuplicate: input.allowDuplicateNumber === true,
@@ -1600,6 +1653,8 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       memo: `Invoice #${docRef(refNumber, invoiceNumber)}`,
     });
 
+    await checkRetainage();
+
     // 6) Audit trail.
     await writeAudit(tx, {
       action: 'create',
@@ -1706,6 +1761,10 @@ export async function postDraftInvoice(
       excludeInvoiceId: id,
       allowOverBilling: opts?.allowOverBilling,
     });
+    const checkRetainage = await retainageGuard(tx, [invoice.customerId], {
+      held: [],
+      lineAccountIds: prep.computedLines.map((l) => l.accountId),
+    });
 
     // 1) Post the GL entry (assertPeriodOpen runs here, on the invoice date).
     const entry = await postInvoiceGL(tx, prep, id, docRef(invoice.refNumber, invoice.invoiceNumber), invoice.date);
@@ -1741,6 +1800,7 @@ export async function postDraftInvoice(
       memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
       carryForward: true,
     });
+    await checkRetainage();
 
     // 4) Audit trail.
     await writeAudit(tx, {
@@ -1824,6 +1884,50 @@ function keepEstimateLinks(
   }
 }
 
+/**
+ * Progress invoices: a line that bills an estimate line can carry an exact pro-rated amount that
+ * differs from quantity × rate by rounding (createProgressInvoice: the line that finishes an
+ * estimate line bills exactly what is left). The invoice form sends quantity and rate only, so an
+ * edit that leaves such a line unchanged — same estimate line, item, quantity and rate — keeps its
+ * stored amount; otherwise re-saving would move the total by a cent and reopen the estimate.
+ * Each stored line is used once. prepareInvoice still checks the amount against quantity × rate.
+ */
+function keepExactProgressAmounts(
+  lines: InvoiceLineInput[],
+  oldLines: Array<{
+    itemId: string | null;
+    description: string | null;
+    quantity: string;
+    rate: string;
+    amount: string;
+    estimateLineId: string | null;
+  }>,
+): InvoiceLineInput[] {
+  const q4 = (v: unknown) => Money.of(v as string).toDecimalPlaces(4);
+  const pool = oldLines.filter(
+    (o) =>
+      o.estimateLineId &&
+      Money.gt(o.amount, 0) &&
+      !Money.round2(Money.mul(q4(o.quantity), q4(o.rate))).equals(Money.of(o.amount)),
+  );
+  if (pool.length === 0) return lines;
+  return lines.map((l) => {
+    if (l.amount != null || l.rate == null || l.rate === '') return l;
+    const at = pool.findIndex(
+      (o) =>
+        (l.estimateLineId === undefined
+          ? (o.description ?? '').trim() === (l.description ?? '').trim()
+          : l.estimateLineId === o.estimateLineId) &&
+        (o.itemId ?? null) === (l.itemId ?? null) &&
+        q4(o.quantity).equals(q4(l.quantity)) &&
+        q4(o.rate).equals(q4(l.rate)),
+    );
+    if (at < 0) return l;
+    const [o] = pool.splice(at, 1);
+    return { ...l, amount: o.amount };
+  });
+}
+
 export async function updateInvoice(ctx: ServiceContext, id: string, input: CreateInvoiceInput) {
   input = await applyCustomerTaxDefaults(ctx, input);
   input = await applyTermsDueDate(ctx, input);
@@ -1835,6 +1939,21 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   if (!existing) throw notFound('Invoice');
   if (existing.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
+  }
+  if (input.lines?.length) {
+    const stored = await ctx.db
+      .select({
+        itemId: invoiceLines.itemId,
+        description: invoiceLines.description,
+        quantity: invoiceLines.quantity,
+        rate: invoiceLines.rate,
+        amount: invoiceLines.amount,
+        estimateLineId: invoiceLines.estimateLineId,
+      })
+      .from(invoiceLines)
+      .where(eq(invoiceLines.invoiceId, id))
+      .orderBy(invoiceLines.lineOrder);
+    input = { ...input, lines: keepExactProgressAmounts(input.lines, stored) };
   }
   // Payments/credits already applied stay applied (QB lets you edit a paid invoice) as long as
   // the edit keeps them valid; see assertEditKeepsApplications.
@@ -2010,6 +2129,11 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       allowOverBilling: input.allowOverBilling,
     });
     const estimatesBefore = await estimatesBilledByInvoice(tx, id);
+    // Retainage held on (or billed by) this invoice: the edit may not release more than is held.
+    const checkRetainage = await retainageGuard(tx, [invoice.customerId, input.customerId], {
+      held: [invoice.retainageAmount],
+      lineAccountIds: [...oldLines.map((l) => l.accountId), ...prep.computedLines.map((l) => l.accountId)],
+    });
 
     // 1) Void the original A/R journal entry (assertPeriodOpen runs on its date).
     if (invoice.postedEntryId) {
@@ -2100,6 +2224,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       memo: `Invoice #${shownRef}`,
       carryForward: true,
     });
+    await checkRetainage();
 
     // 6) Audit trail with old + new values.
     await writeAudit(tx, {
@@ -2250,6 +2375,31 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
+    // Re-check inside the transaction (the checks above ran outside it): a second void of the same
+    // invoice (double click, two users) would otherwise run every reversal again — giving its
+    // sales order the invoiced quantities back twice — and a payment applied in between would be
+    // left on a void invoice.
+    const [current] = await tx.db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.companyId, tx.companyId), eq(invoices.id, id)));
+    if (!current) throw notFound('Invoice');
+    if (current.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Invoice is already voided.');
+    }
+    if (await hasExternalPayments(tx, current)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'Cannot void an invoice that has payments applied. Unapply payments first.',
+      );
+    }
+    if (await invoicePaymentDepositOf(tx, id)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'The payment recorded on this invoice has been included in a deposit, so the invoice cannot be voided. Remove it from the deposit (or void the deposit) first.',
+      );
+    }
+
     // Retainage held on this invoice that has already been billed (retainage.ts billRetainage):
     // voiding would take more out of Retainage Receivable than is left there for the customer.
     if (Money.of(invoice.retainageAmount ?? '0').greaterThan(0) && invoice.status !== 'draft') {

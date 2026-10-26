@@ -29,6 +29,7 @@ import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { SalesLineTotals, salesLineKind } from './salesLineKinds';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
+import { companyToday } from './salesDates';
 import {
   estimateLineProgress,
   overBilledLine,
@@ -486,7 +487,8 @@ export async function convertToInvoice(
     // savepoint on this transaction (same pattern as timeTracking.billTimeToInvoice).
     const invoice = await createInvoice(tx, {
       customerId: estimate.customerId,
-      date: new Date(),
+      // Today's calendar day in the company's time zone (not the UTC day of this instant).
+      date: await companyToday(tx),
       lines: invoiceLines,
       memo: estimate.memo ?? undefined,
       // wave2 sales: carry the quoted tax rate (stored since 0027) so the invoice total matches.
@@ -716,7 +718,7 @@ export async function createProgressInvoice(
     const estRef = docRef(estimate.refNumber, estimate.estimateNumber);
     const invoice = await createInvoice(tx, {
       customerId: estimate.customerId,
-      date: input.date ?? new Date(),
+      date: input.date ?? (await companyToday(tx)),
       memo: `Progress billing (${progressLabel}) for Estimate #${estRef}`,
       // Sales tax is charged on the invoice itself, at the estimate's rate, on taxable lines.
       taxRateId: estimate.taxRateId ?? null,

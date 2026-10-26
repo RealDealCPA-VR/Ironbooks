@@ -20,9 +20,10 @@
  *  - payment_applications / bill_payment_applications (first-class tables).
  *  - estimates/salesOrders.convertedInvoiceId, purchaseOrders/itemReceipts.convertedBillId.
  *  - deposit_lines.paymentId.
- *  - credit-memo and vendor-credit applications are only recorded in audit_logs
- *    (creditMemos.applyToInvoice / vendorCredits.applyToBill write no link rows),
- *    so those edges are read from audit_logs jsonb.
+ *  - credit-memo applications: credit_applications rows (an undone application deletes its row),
+ *    plus pre-wave2 applications recorded only in audit_logs jsonb.
+ *  - vendor-credit applications are only recorded in audit_logs
+ *    (vendorCredits.applyToBill writes no link row), so those edges are read from audit_logs jsonb.
  */
 import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
 import {
@@ -30,6 +31,7 @@ import {
   billPaymentApplications,
   billPayments,
   bills,
+  creditApplications,
   creditMemos,
   depositLines,
   deposits,
@@ -50,6 +52,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { notFound, type ServiceContext } from './_base';
+import { docRef } from './docNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -227,32 +230,70 @@ async function paymentsForInvoice(
 }
 
 /**
- * Credit memos applied to an invoice. applyToInvoice writes no link row — only
- * an audit_logs entry with newValues.appliedToInvoice / amountApplied — so we
- * read the edges from the audit trail and aggregate per memo.
+ * Credit applications still in place, as (memo, invoice, amount) edges: the credit_applications
+ * rows (wave2 sales — an undone application deletes its row), plus applications recorded before
+ * that table existed, which live only in the audit trail (an apply row without a
+ * creditApplicationId). Reading every audit apply row listed credits that were unapplied since,
+ * e.g. by voiding the payment they were applied with.
  */
-async function creditMemosForInvoice(
+async function creditApplicationEdges(
   ctx: ServiceContext,
-  invoiceId: string,
-): Promise<LinkedTransaction[]> {
+  by: { invoiceId?: string; creditMemoId?: string },
+): Promise<Array<{ memoId: string; invoiceId: string; amount: ReturnType<typeof Money.zero> }>> {
+  const out: Array<{ memoId: string; invoiceId: string; amount: ReturnType<typeof Money.zero> }> = [];
   const rows = await ctx.db
+    .select({
+      memoId: creditApplications.creditMemoId,
+      invoiceId: creditApplications.invoiceId,
+      amount: sql<string>`COALESCE(SUM(CAST(${creditApplications.amount} AS NUMERIC)), 0)`,
+    })
+    .from(creditApplications)
+    .where(
+      and(
+        eq(creditApplications.companyId, ctx.companyId),
+        by.invoiceId ? eq(creditApplications.invoiceId, by.invoiceId) : undefined,
+        by.creditMemoId ? eq(creditApplications.creditMemoId, by.creditMemoId) : undefined,
+      ),
+    )
+    .groupBy(creditApplications.creditMemoId, creditApplications.invoiceId);
+  for (const r of rows) out.push({ memoId: r.memoId, invoiceId: r.invoiceId, amount: Money.of(r.amount) });
+
+  const legacy = await ctx.db
     .select({ entityId: auditLogs.entityId, newValues: auditLogs.newValues })
     .from(auditLogs)
     .where(
       and(
         eq(auditLogs.companyId, ctx.companyId),
         eq(auditLogs.entityType, 'credit_memo'),
-        sql`${auditLogs.newValues}->>'appliedToInvoice' = ${invoiceId}`,
+        by.creditMemoId ? eq(auditLogs.entityId, by.creditMemoId) : undefined,
+        by.invoiceId
+          ? sql`${auditLogs.newValues}->>'appliedToInvoice' = ${by.invoiceId}`
+          : sql`${auditLogs.newValues}->>'appliedToInvoice' IS NOT NULL`,
+        sql`${auditLogs.newValues}->>'creditApplicationId' IS NULL`,
       ),
     );
-  if (rows.length === 0) return [];
+  for (const r of legacy) {
+    const nv = (r.newValues ?? {}) as { appliedToInvoice?: string; amountApplied?: string };
+    if (!nv.appliedToInvoice) continue;
+    const same = out.find((e) => e.memoId === r.entityId && e.invoiceId === nv.appliedToInvoice);
+    if (same) same.amount = same.amount.plus(Money.of(nv.amountApplied ?? '0'));
+    else out.push({ memoId: r.entityId, invoiceId: nv.appliedToInvoice, amount: Money.of(nv.amountApplied ?? '0') });
+  }
+  return out.filter((e) => e.amount.greaterThan(0));
+}
+
+/** Credit memos applied to an invoice (applications still in place), aggregated per memo. */
+async function creditMemosForInvoice(
+  ctx: ServiceContext,
+  invoiceId: string,
+): Promise<LinkedTransaction[]> {
+  const edges = await creditApplicationEdges(ctx, { invoiceId });
+  if (edges.length === 0) return [];
 
   // Aggregate applied amounts per memo.
   const appliedByMemo = new Map<string, ReturnType<typeof Money.zero>>();
-  for (const r of rows) {
-    const nv = (r.newValues ?? {}) as { amountApplied?: string };
-    const prev = appliedByMemo.get(r.entityId) ?? Money.zero();
-    appliedByMemo.set(r.entityId, prev.plus(Money.of(nv.amountApplied ?? '0')));
+  for (const e of edges) {
+    appliedByMemo.set(e.memoId, (appliedByMemo.get(e.memoId) ?? Money.zero()).plus(e.amount));
   }
 
   const out: LinkedTransaction[] = [];
@@ -348,7 +389,7 @@ async function invoiceTree(ctx: ServiceContext, invoiceId: string): Promise<Link
     children.push(node('cogs', c.id, `COGS Entry #${c.number}`, c.date, await entryTotal(ctx, c.id)));
   }
 
-  return node('invoice', inv.id, `Invoice #${inv.invoiceNumber}`, inv.date, inv.total, children);
+  return node('invoice', inv.id, `Invoice #${docRef(inv.refNumber, inv.invoiceNumber)}`, inv.date, inv.total, children);
 }
 
 async function billTree(ctx: ServiceContext, billId: string): Promise<LinkedTransaction> {
@@ -480,31 +521,20 @@ async function creditMemoTree(ctx: ServiceContext, memoId: string): Promise<Link
     .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.id, memoId)));
   if (!memo) throw notFound('Credit memo');
 
-  // Invoices this memo was applied to (audit edges).
-  const rows = await ctx.db
-    .select({ newValues: auditLogs.newValues })
-    .from(auditLogs)
-    .where(
-      and(
-        eq(auditLogs.companyId, ctx.companyId),
-        eq(auditLogs.entityType, 'credit_memo'),
-        eq(auditLogs.entityId, memoId),
-        sql`${auditLogs.newValues}->>'appliedToInvoice' IS NOT NULL`,
-      ),
-    );
+  // Invoices this memo is applied to (applications still in place), with the amount applied.
   const children: LinkedTransaction[] = [];
-  const seen = new Set<string>();
-  for (const r of rows) {
-    const nv = (r.newValues ?? {}) as { appliedToInvoice?: string; amountApplied?: string };
-    if (!nv.appliedToInvoice || seen.has(nv.appliedToInvoice)) continue;
-    seen.add(nv.appliedToInvoice);
+  const byInvoice = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const e of await creditApplicationEdges(ctx, { creditMemoId: memoId })) {
+    byInvoice.set(e.invoiceId, (byInvoice.get(e.invoiceId) ?? Money.zero()).plus(e.amount));
+  }
+  for (const [invoiceId, applied] of byInvoice) {
     const [inv] = await ctx.db
       .select({ id: invoices.id, number: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`, date: invoices.date })
       .from(invoices)
-      .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.id, nv.appliedToInvoice)));
-    if (inv) children.push(node('invoice', inv.id, `Invoice #${inv.number}`, inv.date, nv.amountApplied ?? '0'));
+      .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.id, invoiceId)));
+    if (inv) children.push(node('invoice', inv.id, `Invoice #${inv.number}`, inv.date, toAmountString(applied)));
   }
-  return node('credit_memo', memo.id, `Credit Memo #${memo.memoNumber}`, memo.date, memo.total, children);
+  return node('credit_memo', memo.id, `Credit Memo #${docRef(memo.refNumber, memo.memoNumber)}`, memo.date, memo.total, children);
 }
 
 async function vendorCreditTree(ctx: ServiceContext, creditId: string): Promise<LinkedTransaction> {
@@ -582,7 +612,7 @@ async function salesReceiptTree(ctx: ServiceContext, receiptId: string): Promise
     .from(salesReceipts)
     .where(and(eq(salesReceipts.companyId, ctx.companyId), eq(salesReceipts.id, receiptId)));
   if (!rec) throw notFound('Sales receipt');
-  return node('sales_receipt', rec.id, `Sales Receipt #${rec.receiptNumber}`, rec.date, rec.total);
+  return node('sales_receipt', rec.id, `Sales Receipt #${docRef(rec.refNumber, rec.receiptNumber)}`, rec.date, rec.total);
 }
 
 async function itemReceiptTree(ctx: ServiceContext, receiptId: string): Promise<LinkedTransaction> {
