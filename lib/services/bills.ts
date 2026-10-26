@@ -184,6 +184,25 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
   return row.id;
 }
 
+/**
+ * Per-unit cost an item line stocks its units at. QB recalculates the cost from the amount when
+ * the amount is typed over qty x cost, so a line whose amount differs from round2(qty x unit
+ * cost) is costed at amount / qty — the value its entry debits to the inventory account (the FIFO
+ * layer / average cost then equal the GL, and a void takes out exactly what the line added).
+ * A consistent line keeps the cost typed (more precise than amount / qty).
+ */
+export function purchaseUnitCost(
+  qty: Decimal,
+  typedUnitCost: string | number | null | undefined,
+  amount: Decimal,
+): Decimal {
+  if (typedUnitCost == null || (typeof typedUnitCost === 'string' && typedUnitCost.trim() === '')) {
+    return amount.dividedBy(qty);
+  }
+  const typed = Money.of(typedUnitCost);
+  return Money.round2(qty.times(typed)).equals(Money.round2(amount)) ? typed : amount.dividedBy(qty);
+}
+
 /** True when the item has ever had FIFO cost layers (mirrors inventory.assertNotFifoTracked). */
 async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boolean> {
   const [row] = await ctx.db
@@ -330,9 +349,8 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
       if (!amount.greaterThan(0)) {
         throw validation(`Line ${i + 1}: amount must be greater than zero.`);
       }
-      const unitCost =
-        line.unitCost != null ? Money.of(line.unitCost) : amount.dividedBy(qty);
-      if (unitCost.isNegative()) {
+      const unitCost = purchaseUnitCost(qty, line.unitCost, amount);
+      if (unitCost.isNegative() || (line.unitCost != null && Money.of(line.unitCost).isNegative())) {
         throw validation(`Line ${i + 1}: unit cost cannot be negative.`);
       }
 

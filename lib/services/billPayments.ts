@@ -50,7 +50,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { allocateCheckNumber, assertCheckNumberAvailable } from './checkNumbers';
+import { allocateCheckNumber, assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
 import {
   getHomeCurrencyCode,
   getOrCreateExchangeGainLossAccount,
@@ -558,12 +558,20 @@ function referenceFor(input: PayBillsInput): { reference: string | null; toPrint
  *  4. Write audit log.
  */
 export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
-  const { reference, toPrint } = referenceFor(input);
+  const { reference: typed, toPrint } = referenceFor(input);
 
   return inTransaction(ctx, async (tx) => {
-    // Duplicate-number check inside the transaction (two payments at once see each other).
-    if (reference && input.method === 'check' && input.checkDuplicateNumber) {
-      await assertCheckNumberAvailable(tx, { paymentAccountId: input.paymentAccountId, number: reference });
+    // A check that is not "To be printed" gets a number like Write Checks does: the one typed
+    // (duplicate-checked inside the transaction, so two payments at once see each other), else
+    // the account's next check number (QB "Let QuickBooks assign check numbers"). Without it the
+    // check had no number in the register, Missing Checks or the next-number sequence.
+    let reference = typed;
+    if (input.method === 'check' && !toPrint && input.paymentAccountId) {
+      reference = await allocateCheckNumber(tx, {
+        paymentAccountId: input.paymentAccountId,
+        number: typed,
+        allowDuplicate: !typed || !input.checkDuplicateNumber,
+      });
     }
     const prep = await preparePayment(tx, input);
     const entry = await postJournalEntry(tx, {
@@ -735,7 +743,15 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
     throw validation('A bill payment cannot be moved to another vendor. Void it and pay the other vendor’s bills instead.');
   }
 
-  const { reference, toPrint } = referenceFor(input);
+  const { reference: typed, toPrint } = referenceFor(input);
+  // A check keeps its number when the edit leaves it blank (as Write Checks does); a check
+  // that never had one gets the account's next number.
+  const reference =
+    typed ??
+    (input.method === 'check' && !toPrint && input.paymentAccountId
+      ? (existing.method === 'check' && existing.reference?.trim()) ||
+        (await nextCheckNumber(ctx, input.paymentAccountId))
+      : null);
   if (
     reference &&
     input.method === 'check' &&

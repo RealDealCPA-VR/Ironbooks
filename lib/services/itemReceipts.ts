@@ -488,10 +488,11 @@ async function saveItemReceipt(
   }
   const totalStr = toAmountString(total);
 
-  // Find-or-create the accrual account before opening the transaction.
-  const accrualAccountId = await getOrCreateAccrualAccount(ctx);
-
   return inTransaction(ctx, async (tx) => {
+    // Find-or-create the accrual account INSIDE the transaction: PGlite serializes transactions,
+    // so two first receipts saved at once find one 2050 account instead of each creating one.
+    const accrualAccountId = await getOrCreateAccrualAccount(tx);
+
     // --- Edit: unwind the saved version first (mirrors voidItemReceipt, minus the status flip) ---
     let oldLines: Array<typeof itemReceiptLines.$inferSelect> = [];
     if (existing) {
@@ -727,9 +728,8 @@ export async function convertToBill(
     .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)));
   const nameById = new Map(itemRows.map((r) => [r.id, r.name]));
 
-  const accrualAccountId = await getOrCreateAccrualAccount(ctx);
-
   return inTransaction(ctx, async (tx) => {
+    const accrualAccountId = await getOrCreateAccrualAccount(tx);
     // Claim the receipt first (guarded conditional UPDATE) so a concurrent
     // conversion can never post a second bill against the same accrual.
     const claimed = await tx.db

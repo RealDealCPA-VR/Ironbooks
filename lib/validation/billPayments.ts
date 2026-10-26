@@ -51,7 +51,7 @@ export const payBillsSchema = z.object({
   vendorId: zUuid,
   date: zDate,
   method: paymentMethodSchema,
-  reference: z.string().nullish(),
+  reference: z.string().max(100, 'can be at most 100 characters').nullish(),
   /** Required when money is paid; a Pay Bills save that only applies credits may leave it out. */
   paymentAccountId: zUuid.nullish(),
   /** Required by the service when any application takes a discount. */

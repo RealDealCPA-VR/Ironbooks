@@ -147,6 +147,22 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
   return row.id;
 }
 
+/**
+ * An apply / unapply / refund amount (2dp). Text that is not a number ('abc', an object) used to
+ * escape as a MoneyParseError (HTTP 500 from POST /api/vendor-credits/:id); NaN / Infinity are
+ * refused too.
+ */
+function parseCreditAmount(value: unknown, what: string): Decimal {
+  let amt: Decimal;
+  try {
+    amt = Money.round2(value as string | number);
+  } catch {
+    throw validation(`${what} must be a number.`);
+  }
+  if (!amt.isFinite()) throw validation(`${what} must be a number.`);
+  return amt;
+}
+
 /** One validated vendor-credit line. */
 interface PreparedLine {
   /** Account credited: the item's inventory asset for inventory returns. */
@@ -778,7 +794,7 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
 }
 
 async function applyToBillInTx(ctx: ServiceContext, input: ApplyToBillInput) {
-  const applyAmount = Money.round2(input.amount);
+  const applyAmount = parseCreditAmount(input.amount, 'Apply amount');
 
   if (!applyAmount.greaterThan(0)) {
     throw validation('Apply amount must be greater than zero.');
@@ -952,7 +968,7 @@ export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBil
 }
 
 async function unapplyFromBillInTx(ctx: ServiceContext, input: UnapplyFromBillInput) {
-  const unapplyAmount = Money.round2(input.amount);
+  const unapplyAmount = parseCreditAmount(input.amount, 'Unapply amount');
 
   if (!unapplyAmount.greaterThan(0)) {
     throw validation('Unapply amount must be greater than zero.');
@@ -1116,7 +1132,7 @@ async function refundVendorCreditInTx(ctx: ServiceContext, input: RefundVendorCr
     throw new ServiceError('CONFLICT', 'Cannot refund a voided vendor credit.');
   }
 
-  const amount = Money.round2(input.amount);
+  const amount = parseCreditAmount(input.amount, 'Refund amount');
   if (!amount.greaterThan(0)) throw validation('Refund amount must be greater than zero.');
   const unapplied = Money.of(credit.unapplied);
   if (amount.greaterThan(unapplied)) {

@@ -177,6 +177,28 @@ type PaymentCheckRow = typeof paymentChecks.$inferSelect;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * A payment amount typed on these forms: a plain-language VALIDATION for text that is not a number
+ * ('abc', NaN, Infinity) instead of a MoneyParseError the routes answered with HTTP 500.
+ */
+function parsePaymentAmount(value: unknown, what = 'Enter a valid amount to pay.') {
+  let amt;
+  try {
+    amt = Money.of(value as string | number);
+  } catch {
+    throw validation(what);
+  }
+  if (!amt.isFinite()) throw validation(what);
+  return amt;
+}
+
+/** The check date must be a real date (an unparseable one surfaced as a RangeError -> HTTP 500). */
+function assertPaymentDate(date: unknown): asserts date is Date {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    throw validation('Enter a valid date for the payment (for example 2026-07-15).');
+  }
+}
+
 /** QB writes Sales Tax Payment and Liability checks from a Bank account only (home currency). */
 async function assertPayFromBank(ctx: ServiceContext, accountId: string, what: string) {
   const [acct] = await ctx.db
@@ -330,17 +352,13 @@ export async function paySalesTaxAgencies(
   input: PaySalesTaxAgenciesInput,
 ): Promise<SalesTaxPaymentResult> {
   if (!input.payments?.length) throw validation('Pick at least one tax agency to pay.');
+  assertPaymentDate(input.date);
   const seen = new Set<string>();
   for (const p of input.payments) {
     if (!p.agencyId || !UUID_RE.test(p.agencyId)) throw validation('Pick the tax agency to pay.');
     if (seen.has(p.agencyId)) throw validation('Each tax agency can only be paid once per payment run.');
     seen.add(p.agencyId);
-    let amt;
-    try {
-      amt = Money.of(p.amount);
-    } catch {
-      throw validation('Enter a valid amount to pay.');
-    }
+    const amt = parsePaymentAmount(p.amount);
     if (!amt.greaterThan(0)) throw validation('Payment amount must be greater than zero.');
   }
   await assertPayFromBank(ctx, input.paymentAccountId, 'Sales tax');
@@ -428,7 +446,8 @@ export interface PaySalesTaxInput {
  * "Sales Tax" (the amount shows as unattributed in the sales tax liability views).
  */
 export async function paySalesTax(ctx: ServiceContext, input: PaySalesTaxInput) {
-  const amt = Money.of(input.amount);
+  const amt = parsePaymentAmount(input.amount);
+  assertPaymentDate(input.date);
   if (!amt.greaterThan(0)) {
     throw validation('Payment amount must be greater than zero.');
   }
@@ -846,6 +865,7 @@ export async function payPayrollLiabilities(
 ) {
   // Relieve the account(s) the paychecks credited (Preferences account / item accounts), not
   // always 2300 — otherwise the real liability never clears and 2300 goes negative.
+  assertPaymentDate(input.date);
   const payrollAccountId = await defaultPayrollLiabilityAccountId(ctx);
   const items = input.items ?? [];
 
@@ -861,12 +881,7 @@ export async function payPayrollLiabilities(
         throw validation(`Duplicate liability item "${name}" — combine into one line.`);
       }
       seen.add(name);
-      let amt;
-      try {
-        amt = Money.of(item.amount);
-      } catch {
-        throw validation(`Liability item "${name}": amount is not a valid number.`);
-      }
+      const amt = parsePaymentAmount(item.amount, `Liability item "${name}": amount is not a valid number.`);
       if (!amt.greaterThan(0)) {
         throw validation(`Liability item "${name}": amount must be greater than zero.`);
       }
@@ -878,7 +893,7 @@ export async function payPayrollLiabilities(
       });
     }
 
-    if (input.amount != null && input.amount !== '' && !Money.eq(input.amount, total)) {
+    if (input.amount != null && input.amount !== '' && !parsePaymentAmount(input.amount).equals(total)) {
       throw validation(
         `amount (${toAmountString(Money.of(input.amount))}) does not match the sum of the item amounts (${toAmountString(total)}).`,
       );
@@ -903,7 +918,7 @@ export async function payPayrollLiabilities(
   if (input.amount == null || input.amount === '') {
     throw validation('Provide amount or at least one liability item.');
   }
-  const amt = Money.of(input.amount);
+  const amt = parsePaymentAmount(input.amount);
   if (!amt.greaterThan(0)) {
     throw validation('Payment amount must be greater than zero.');
   }
@@ -950,7 +965,8 @@ export interface PayCreditCardInput {
  *   Cr <paymentAccountId>     <amount>   — drains the bank account
  */
 export async function payCreditCard(ctx: ServiceContext, input: PayCreditCardInput) {
-  const amt = Money.of(input.amount);
+  const amt = parsePaymentAmount(input.amount);
+  assertPaymentDate(input.date);
   if (!amt.greaterThan(0)) {
     throw validation('Payment amount must be greater than zero.');
   }
@@ -975,36 +991,39 @@ export async function payCreditCard(ctx: ServiceContext, input: PayCreditCardInp
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.paymentAccountId)));
   if (!pay) throw notFound('Payment account');
 
-  // Duplicate guard: one payment per reconciliation.
   const sourceRef = input.reconciliationId ? `cc-payment:${input.reconciliationId}` : undefined;
-  if (sourceRef) {
-    const [existing] = await ctx.db
-      .select({ id: journalEntries.id })
-      .from(journalEntries)
-      .where(
-        and(
-          eq(journalEntries.companyId, ctx.companyId),
-          eq(journalEntries.sourceRef, sourceRef),
-          eq(journalEntries.status, 'posted'),
-        ),
-      );
-    if (existing) {
-      throw new ServiceError(
-        'CONFLICT',
-        'A credit card payment for this reconciliation has already been recorded.',
-      );
-    }
-  }
-
   const amtStr = toAmountString(amt);
-  return postJournalEntry(ctx, {
-    date: input.date,
-    description: input.memo?.trim() ? input.memo.trim() : 'Credit card payment',
-    sourceRef,
-    lines: [
-      { accountId: input.creditCardAccountId, debit: amtStr },
-      { accountId: input.paymentAccountId, credit: amtStr },
-    ],
+  // Duplicate guard (one payment per reconciliation) in the SAME transaction as the posting:
+  // PGlite serializes transactions, so a double-clicked "Write a check for the balance" sees the
+  // first payment instead of both passing the check and posting twice.
+  return inTransaction(ctx, async (tx) => {
+    if (sourceRef) {
+      const [existing] = await tx.db
+        .select({ id: journalEntries.id })
+        .from(journalEntries)
+        .where(
+          and(
+            eq(journalEntries.companyId, tx.companyId),
+            eq(journalEntries.sourceRef, sourceRef),
+            eq(journalEntries.status, 'posted'),
+          ),
+        );
+      if (existing) {
+        throw new ServiceError(
+          'CONFLICT',
+          'A credit card payment for this reconciliation has already been recorded.',
+        );
+      }
+    }
+    return postJournalEntry(tx, {
+      date: input.date,
+      description: input.memo?.trim() ? input.memo.trim() : 'Credit card payment',
+      sourceRef,
+      lines: [
+        { accountId: input.creditCardAccountId, debit: amtStr },
+        { accountId: input.paymentAccountId, credit: amtStr },
+      ],
+    });
   });
 }
 

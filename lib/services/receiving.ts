@@ -46,6 +46,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { valueRemainderAfter } from './inventory';
+import { dueDateFromTermsList } from './lists/terms';
 import { ITEM_RECEIPT_ACCRUAL_CODE, getOrCreateAccrualAccount } from './itemReceipts';
 import {
   type ReceivingSettings,
@@ -388,7 +389,7 @@ async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boole
 /** Validate the request and compute every amount (read-only when `dryRun`). */
 async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput, dryRun = false) {
   const [vendor] = await ctx.db
-    .select({ id: vendors.id, name: vendors.displayName })
+    .select({ id: vendors.id, name: vendors.displayName, terms: vendors.terms })
     .from(vendors)
     .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.id, input.vendorId)));
   if (!vendor) throw notFound('Vendor');
@@ -680,6 +681,10 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
   return inTransaction(ctx, async (tx) => {
     // Plan INSIDE the transaction so quantities/costs/layers cannot shift underneath us.
     const { vendor, planned, preview, accrualAccountId, apAccountId } = await planReceiptBill(tx, input);
+    // QB fills the bill's terms and due date from the vendor (as Enter Bills does): without them
+    // A/P aging aged the bill from its own date and Pay Bills' "due on or before" ignored it.
+    const terms = vendor.terms?.trim() || null;
+    const dueDate = input.dueDate ?? (await dueDateFromTermsList(tx, terms, input.date));
 
     const [bill] = await tx.db
       .insert(bills)
@@ -688,7 +693,8 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
         vendorId: input.vendorId,
         billNumber: input.billNumber ?? null,
         date: input.date,
-        dueDate: input.dueDate ?? null,
+        dueDate,
+        terms,
         memo:
           input.memo ??
           (Money.isZero(preview.billTotal)

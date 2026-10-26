@@ -7,6 +7,8 @@
  *  - 22P02 invalid_text_representation — e.g. a malformed id ("garbage") compared with a uuid
  *    column. For uuid input no row can match, so it is NOT_FOUND (404); any other malformed
  *    value is VALIDATION (400).
+ *  - 22001 string_data_right_truncation — text longer than its varchar column (a long bill
+ *    number or name). VALIDATION naming the limit.
  *  - 22003 numeric_value_out_of_range — e.g. a posting that would push a cached account
  *    balance past numeric(15,2). VALIDATION with a friendly "too large" message. The statement
  *    failed, so the transaction rolls back as before.
@@ -33,6 +35,16 @@ export function translatePgError(err: unknown): unknown {
     return new ServiceError(
       'VALIDATION',
       'That date is not valid: use a real calendar day in years 1900-9999.',
+      { sqlstate: code },
+    );
+  }
+  if (code === '22001') {
+    // string_data_right_truncation — text longer than its column (a 150-character bill number,
+    // a 300-character name). VALIDATION with the limit Postgres reports, e.g. "varying(100)".
+    const limit = /\((\d+)\)/.exec(message)?.[1];
+    return new ServiceError(
+      'VALIDATION',
+      `That text is too long${limit ? ` (at most ${limit} characters)` : ''}. Shorten it and try again.`,
       { sqlstate: code },
     );
   }

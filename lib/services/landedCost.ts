@@ -54,6 +54,7 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { valueRemainderAfter } from './inventory';
+import { homeAmounts } from './currencies';
 
 export type LandedCostMethod = 'quantity' | 'value' | 'weight';
 
@@ -200,6 +201,35 @@ function signedLine(accountId: string, amount: Dec, memo: string) {
     : { accountId, debit: toAmountString(amount), memo };
 }
 
+/**
+ * The HOME amount each line of these bills posted to its account. A foreign-currency bill stores
+ * its line amounts in the bill's currency and posts one anchor round2(total x rate) penny-allocated
+ * over the lines (bills.ts prepareBill); landed cost moves that home amount out of the charge
+ * account, never the foreign figure. Home bills: the stored amount.
+ */
+async function billLineHomeAmounts(
+  ctx: ServiceContext,
+  billRows: ReadonlyArray<{ id: string; currency: string | null; exchangeRate: string | null }>,
+): Promise<Map<string, Dec>> {
+  const out = new Map<string, Dec>();
+  const foreign = billRows.filter((b) => (b.currency ?? '').trim() !== '');
+  if (foreign.length === 0) return out;
+  const lines = await ctx.db
+    .select({ id: billLines.id, billId: billLines.billId, amount: billLines.amount })
+    .from(billLines)
+    .where(inArray(billLines.billId, foreign.map((b) => b.id)))
+    .orderBy(asc(billLines.billId), asc(billLines.lineOrder));
+  for (const b of foreign) {
+    const own = lines.filter((l) => l.billId === b.id);
+    const home = homeAmounts(
+      own.map((l) => l.amount),
+      b.exchangeRate ?? 1,
+    );
+    own.forEach((l, i) => out.set(l.id, home.lines[i]));
+  }
+  return out;
+}
+
 /** Sum of active (non-void) allocations per bill line. */
 async function allocatedByBillLine(ctx: ServiceContext, billLineIds: string[]): Promise<Map<string, Dec>> {
   if (billLineIds.length === 0) return new Map();
@@ -302,6 +332,8 @@ export async function listLandedCostSources(
       billId: bills.id,
       billNumber: bills.billNumber,
       billDate: bills.date,
+      billCurrency: bills.currency,
+      billRate: bills.exchangeRate,
       vendorName: vendors.displayName,
       billLineId: billLines.id,
       description: billLines.description,
@@ -320,10 +352,14 @@ export async function listLandedCostSources(
 
   const eligible = rows.filter((r) => r.itemType !== 'inventory');
   const allocated = await allocatedByBillLine(ctx, eligible.map((r) => r.billLineId));
+  const billsById = new Map(eligible.map((r) => [r.billId, { id: r.billId, currency: r.billCurrency, exchangeRate: r.billRate }]));
+  const homeByLine = await billLineHomeAmounts(ctx, [...billsById.values()]);
   return eligible
     .map((r) => {
       const done = allocated.get(r.billLineId) ?? Money.zero();
-      const remaining = Money.of(r.amount).minus(done);
+      // Allocations are in home currency (what the charge line posted).
+      const lineHome = homeByLine.get(r.billLineId) ?? Money.of(r.amount);
+      const remaining = lineHome.minus(done);
       return {
         billId: r.billId,
         billNumber: r.billNumber,
@@ -333,7 +369,7 @@ export async function listLandedCostSources(
         description: r.description,
         accountId: r.accountId,
         accountName: r.accountName,
-        amount: toAmountString(r.amount),
+        amount: toAmountString(lineHome),
         allocated: toAmountString(done),
         remaining: toAmountString(remaining),
       };
@@ -398,7 +434,9 @@ async function computeAllocation(ctx: ServiceContext, input: AllocateLandedCostI
   }
 
   const already = (await allocatedByBillLine(ctx, [billLine.id])).get(billLine.id) ?? Money.zero();
-  const remaining = Money.of(billLine.amount).minus(already);
+  // p1 fx: the charge account carries the line's HOME amount (a foreign bill stores its currency).
+  const lineHome = (await billLineHomeAmounts(ctx, [bill])).get(billLine.id) ?? Money.of(billLine.amount);
+  const remaining = lineHome.minus(already);
   let amount = remaining;
   if (input.amount != null && input.amount !== '') {
     try {
