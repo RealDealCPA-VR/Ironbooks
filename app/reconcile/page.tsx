@@ -23,7 +23,7 @@ import {
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
-import { canFinishReconciliation } from '@/lib/reconcileRules';
+import { canFinishReconciliation, statementLineAmount } from '@/lib/reconcileRules';
 import { formatDate as fmtDate, todayISO } from '@/lib/dates';
 // cmdbar: "reconcile checking" opens this page with the account picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
@@ -127,11 +127,9 @@ function statusLabel(status: string): string {
   return status;
 }
 
-function lineAmount(line: ClearableLine): string {
-  // For display: show debit as positive inflow, credit as outflow (negative).
-  if (line.debit) return line.debit;
-  if (line.credit) return `-${line.credit}`;
-  return '0.00';
+/** The amount as the statement shows it (a card's charges +, its payments −). */
+function lineAmount(line: ClearableLine, isCreditCard: boolean): string {
+  return statementLineAmount(line, isCreditCard);
 }
 
 function differenceClose(difference: string): boolean {
@@ -871,17 +869,14 @@ function ReconcileSession({
                   <Td className="max-w-xs truncate">{line.description}</Td>
                   <Td className="text-navy/60">{line.memo ?? '—'}</Td>
                   <Td numeric>
-                    <span
-                      className={
-                        line.debit
-                          ? 'text-navy'
-                          : line.credit
-                            ? 'text-red-500'
-                            : 'text-navy/40'
-                      }
-                    >
-                      {fmt(lineAmount(line))}
-                    </span>
+                    {(() => {
+                      const amount = lineAmount(line, !!info?.isCreditCard);
+                      return (
+                        <span className={Money.isZero(amount) ? 'text-navy/40' : Money.isNegative(amount) ? 'text-red-500' : 'text-navy'}>
+                          {fmt(amount)}
+                        </span>
+                      );
+                    })()}
                   </Td>
                 </Tr>
               ))}

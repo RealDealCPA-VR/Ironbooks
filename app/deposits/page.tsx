@@ -38,6 +38,7 @@ import { amountMessage, collectErrors, dateMessage, hasErrors, requiredMessage, 
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
 import {
+  depositListHomeTotal,
   depositToEdit,
   emptyExtraLine,
   itemsForDepositCurrency,
@@ -884,12 +885,8 @@ function DepositsPageContent() {
           <span>
             Total deposited:{' '}
             <span className="font-semibold text-navy/70">
-              {formatCurrency(
-                deposits
-                  .filter((d) => !d.voidedAt)
-                  .reduce((s, d) => s + Number(d.total), 0)
-                  .toFixed(2),
-              )}
+              {/* In home currency: a foreign deposit counts at its home value (not its EUR amount). */}
+              {formatCurrency(depositListHomeTotal(deposits))}
             </span>
           </span>
         </div>

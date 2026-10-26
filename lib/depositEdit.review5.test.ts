@@ -2,7 +2,7 @@
  * Review round 5 (team banking) — editing a saved deposit in the Make Deposits window.
  */
 import { describe, it, expect } from 'vitest';
-import { depositToEdit, itemsForDepositCurrency, type Deposit } from './depositEdit';
+import { depositListHomeTotal, depositToEdit, itemsForDepositCurrency, type Deposit } from './depositEdit';
 
 const dep = (currency: string | null): Deposit => ({
   id: 'd1',
@@ -33,5 +33,19 @@ describe('editing a saved deposit', () => {
     const edit = depositToEdit(dep(null));
     expect(itemsForDepositCurrency(edit.items, null).map((i) => i.id)).toEqual(['p1', 'inv1']);
     expect(edit.extraLines).toEqual([{ accountId: 'equity', amount: '10.00', description: 'Owner money' }]);
+  });
+});
+
+describe('depositListHomeTotal', () => {
+  it('adds deposits in home currency (a EUR deposit at its home value) and leaves voided ones out', () => {
+    expect(
+      depositListHomeTotal([
+        { total: '500.00', homeTotal: null, currency: null, voidedAt: null },
+        { total: '1000.00', homeTotal: '1100.00', currency: 'EUR', voidedAt: null },
+        { total: '250.00', homeTotal: null, currency: null, voidedAt: '2026-03-02T00:00:00.000Z' },
+        { total: '0.10', homeTotal: null, currency: null, voidedAt: null },
+        { total: '0.20', homeTotal: null, currency: null, voidedAt: null },
+      ]),
+    ).toBe('1600.30');
   });
 });

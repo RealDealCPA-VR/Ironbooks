@@ -2,6 +2,8 @@
  * Make Deposits window (app/deposits/page.tsx): the shapes the page works with and how a saved
  * deposit is loaded back into the form for editing. Pure (no React, no I/O) so it is unit-tested.
  */
+import { Money, toAmountString } from '@/lib/money';
+
 export interface UndepositedItem {
   id: string;
   /** invoice_payment = payment-item lines recorded on an invoice (id = the invoice). */
@@ -144,4 +146,22 @@ export function depositToEdit(dep: Deposit): DepositEdit {
  */
 export function itemsForDepositCurrency(items: UndepositedItem[], depositCurrency: string | null): UndepositedItem[] {
   return items.filter((p) => (p.currency || null) === (depositCurrency || null));
+}
+
+/**
+ * "Total deposited" under the deposit list, in HOME currency: voided deposits left out, a
+ * foreign-currency deposit counted at its home value. The footer used to add each deposit's own
+ * amount, so EUR 1,000 + USD 500 showed as "$1,500.00".
+ */
+export function depositListHomeTotal(deposits: ReadonlyArray<Pick<Deposit, 'total' | 'homeTotal' | 'currency' | 'voidedAt'>>): string {
+  let sum = Money.zero();
+  for (const d of deposits) {
+    if (d.voidedAt) continue;
+    try {
+      sum = sum.plus(Money.of(d.currency && d.homeTotal != null ? d.homeTotal : d.total));
+    } catch {
+      /* a malformed amount is left out of the footer */
+    }
+  }
+  return toAmountString(sum);
 }
