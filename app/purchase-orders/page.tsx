@@ -545,6 +545,10 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
   const [billing, setBilling] = useState(false);
   /** lineId → quantity-to-bill input value */
   const [qtyInputs, setQtyInputs] = useState<Record<string, string>>({});
+  // The bill's own date and vendor reference number (QB: the bill is dated when the goods and
+  // the vendor's bill arrive — today by default — not on the day the PO was written).
+  const [billDate, setBillDate] = useState(() => todayISO());
+  const [billNumber, setBillNumber] = useState('');
 
   const accountMap = Object.fromEntries(accounts.map((a) => [a.id, `${a.code} — ${a.name}`]));
   const itemMap = Object.fromEntries(items.map((it) => [it.id, it.name]));
@@ -558,6 +562,8 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
     }
     let cancelled = false;
     setLoading(true);
+    setBillDate(todayISO());
+    setBillNumber('');
     api
       .get<PoDetail>(`/api/purchase-orders/${po.id}`)
       .then((d) => {
@@ -617,9 +623,16 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
 
     setBilling(true);
     try {
+      if (!billDate) {
+        toast('Enter the bill date.', 'danger');
+        return;
+      }
       await api.post(`/api/purchase-orders/${po.id}`, {
         action: 'convert',
         lines: billLines,
+        // Without a date the bill (and the stock it receives) was dated on the PO's date.
+        date: billDate,
+        billNumber: billNumber.trim() || null,
       });
       toast(`Bill created from PO #${docNo(po.refNumber, po.poNumber)}.`, 'success');
       onBilled();
@@ -660,6 +673,23 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
             as <strong>Partially Billed</strong>; billing every remaining quantity closes it.
             Inventory items are received into stock when the bill posts.
           </p>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="po-bill-date">Bill Date *</Label>
+              <Input id="po-bill-date" type="date" value={billDate} onChange={(e) => setBillDate(e.target.value)} />
+            </div>
+            <div>
+              <Label htmlFor="po-bill-ref">Ref. No.</Label>
+              <Input
+                id="po-bill-ref"
+                placeholder="Vendor invoice #"
+                maxLength={100}
+                value={billNumber}
+                onChange={(e) => setBillNumber(e.target.value)}
+              />
+            </div>
+          </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden">
             <div className="grid grid-cols-[1.4fr_70px_70px_80px_90px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">

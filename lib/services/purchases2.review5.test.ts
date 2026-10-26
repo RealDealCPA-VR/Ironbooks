@@ -407,6 +407,23 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     }
   });
 
+  it('I: Receive & Bill from a purchase order sends the bill date (today by default), not the PO date', async () => {
+    // The service bills on the PO date when no date is given (API default); the PO screen's
+    // Receive & Bill dialog had no date field, so every bill from a PO was dated when it was ordered.
+    const src = fs.readFileSync(path.resolve(process.cwd(), 'app', 'purchase-orders', 'page.tsx'), 'utf8');
+    const convert = src.slice(src.indexOf("action: 'convert'"), src.indexOf("action: 'convert'") + 400);
+    expect(convert).toMatch(/date: billDate/);
+    expect(convert).toMatch(/billNumber:/);
+    expect(src).toMatch(/useState\(\(\) => todayISO\(\)\);\s*const \[billNumber/);
+    // And the service honours it.
+    const v = await newVendor();
+    const po = await createPurchaseOrder(ctx, { vendorId: v.id, date: d('2026-03-01'), lines: [{ accountId: acct['6300'], quantity: 1, rate: '20.00' }] });
+    const { convertToBill } = await import('./purchaseOrders');
+    const bill = await convertToBill(ctx, po.id, { date: d('2026-04-15'), billNumber: 'INV-9' });
+    expect(bill.date.toISOString().slice(0, 10)).toBe('2026-04-15');
+    expect(bill.billNumber).toBe('INV-9');
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
