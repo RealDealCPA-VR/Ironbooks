@@ -64,6 +64,11 @@ export interface ForeignOpenItem {
    * (older data; refused since the payments P1 round). Already taken off foreignOpen.
    */
   memoApplied?: Decimal;
+  /**
+   * Invoices only (review5 fx): payment-item lines received on the invoice itself (they went to
+   * Undeposited Funds, never to A/R). Already taken off foreignOpen.
+   */
+  paymentLines?: Decimal;
 }
 
 const r2 = (v: Decimal | string | number) => Money.round2(v);
@@ -138,8 +143,8 @@ async function invoiceOpenAmounts(
   ctx: ServiceContext,
   rows: InvoiceOpenRow[],
   asOf?: Date,
-): Promise<Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal }>> {
-  const out = new Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal }>();
+): Promise<Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal; paymentLines: Decimal }>> {
+  const out = new Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal; paymentLines: Decimal }>();
   if (rows.length === 0) return out;
   if (rows.length > CHUNK) {
     // Each invoice's amounts depend only on its own rows: compute them chunk by chunk.
@@ -242,7 +247,7 @@ async function invoiceOpenAmounts(
         homeOpen = homeOpen.minus(legacyApplicationHome(a, rate));
       }
     }
-    out.set(i.id, { foreign, homeOpen, memoApplied });
+    out.set(i.id, { foreign, homeOpen, memoApplied, paymentLines: paymentLines.get(i.id) ?? Money.zero() });
   }
   return out;
 }
@@ -455,7 +460,7 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
     const open = await invoiceOpenAmounts(ctx, foreignInv, asOf);
     for (const i of foreignInv) {
       const rate = Money.of(i.rate ?? 1);
-      const { foreign, homeOpen, memoApplied } = open.get(i.id)!;
+      const { foreign, homeOpen, memoApplied, paymentLines } = open.get(i.id)!;
       if (foreign.isZero() && homeOpen.isZero()) continue;
       out.push({
         kind: 'invoice',
@@ -468,6 +473,7 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
         foreignOpen: r2(foreign),
         homeOpen: r2(homeOpen),
         memoApplied,
+        paymentLines,
       });
     }
   }
@@ -691,12 +697,15 @@ export async function foreignOpenPayables(ctx: ServiceContext, asOf: Date): Prom
 export async function foreignInvoiceHomeOpen(
   ctx: ServiceContext,
   asOf: Date,
-): Promise<Map<string, { foreignOpen: Decimal; homeOpen: Decimal; currency: string; memoApplied: Decimal }>> {
+): Promise<Map<string, { foreignOpen: Decimal; homeOpen: Decimal; currency: string; memoApplied: Decimal; paymentLines: Decimal }>> {
   const items = await foreignOpenReceivables(ctx, asOf);
   return new Map(
     items
       .filter((i) => i.kind === 'invoice')
-      .map((i) => [i.id, { foreignOpen: i.foreignOpen, homeOpen: i.homeOpen, currency: i.currency, memoApplied: i.memoApplied ?? Money.zero() }]),
+      .map((i) => [
+        i.id,
+        { foreignOpen: i.foreignOpen, homeOpen: i.homeOpen, currency: i.currency, memoApplied: i.memoApplied ?? Money.zero(), paymentLines: i.paymentLines ?? Money.zero() },
+      ]),
   );
 }
 

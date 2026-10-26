@@ -397,6 +397,27 @@ describe('review5 fx', () => {
       ],
     } as never);
     expect((await foreignOpenReceivables(ctx, d('2026-03-31'))).find((i) => i.id === paid.id)).toBeUndefined();
+    // Mostly received on the invoice (EUR 900 of 1,000): A/R carries EUR 100 = USD 120, and the
+    // A/R aging (summary and detail) still lists it at that home amount.
+    const { arAgingDetail } = await import('./reportsExtra');
+    const big = await createInvoice(ctx, {
+      customerId: c.id,
+      date: d('2026-03-03'),
+      currency: 'EUR',
+      exchangeRate: '1.20',
+      lines: [
+        { accountId: acct['4000'], quantity: 1, rate: '1000.00' },
+        { itemId: pay.id, quantity: 1, rate: '900.00' },
+      ],
+    } as never);
+    const tb = await trialBalance(ctx, d('2026-03-31'));
+    const ar = tb.rows.find((r: { accountId: string }) => r.accountId === acct['1200']) as { debit: string };
+    expect(ar.debit).toBe('840.00'); // 720 + 0 + 120
+    expect(Money.of((await arAging(ctx, d('2026-03-31'))).totals.total).toFixed(2)).toBe('840.00');
+    const detail = await arAgingDetail(ctx, d('2026-03-31'));
+    const bigRow = detail.rows.find((r) => r.docId === big.id);
+    expect(bigRow?.openBalance).toBe('120.00');
+    expect(bigRow?.foreignOpenBalance).toBe('100.00');
   });
 
   it('names and accounts in different currencies cannot be merged (the account-currency ledger would mix)', async () => {

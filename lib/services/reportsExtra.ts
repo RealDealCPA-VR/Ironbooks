@@ -488,8 +488,9 @@ export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingRe
     // amount, after later unapplies, as home currency).
     if (!fo && foreignCode(row.currency, homeCur)) continue;
     // Legacy home memos on a foreign invoice are already off its foreign open amount.
-    if (fo && fo.memoApplied.greaterThan(0)) {
-      creditResidual = creditResidual.minus(fo.memoApplied);
+    // review5 fx: so are the payment-item lines received on the invoice (amountPaid counts them).
+    if (fo && fo.memoApplied.plus(fo.paymentLines).greaterThan(0)) {
+      creditResidual = creditResidual.minus(fo.memoApplied).minus(fo.paymentLines);
       if (creditResidual.lessThan(0)) creditResidual = Money.zero();
     }
     let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
@@ -1347,8 +1348,9 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
     // Settled as of the cutoff (not in the FX subledger): never through the home-currency path.
     if (!fo && foreignCode(row.currency, homeCur)) continue;
     // Legacy home memos on a foreign invoice are already off its foreign open amount.
-    if (fo && fo.memoApplied.greaterThan(0)) {
-      creditResidual = creditResidual.minus(fo.memoApplied);
+    // review5 fx: so are the payment-item lines received on the invoice (amountPaid counts them).
+    if (fo && fo.memoApplied.plus(fo.paymentLines).greaterThan(0)) {
+      creditResidual = creditResidual.minus(fo.memoApplied).minus(fo.paymentLines);
       if (creditResidual.lessThan(0)) creditResidual = Money.zero();
     }
     let amount = (fo ? fo.foreignOpen : billedBase.minus(cashAsOf)).minus(creditResidual);
