@@ -136,10 +136,10 @@ describe('quoted case-twins on every ledger table', () => {
       twins.push(`${tbl}.${upper}`);
     }
     expect(twins.length).toBeGreaterThanOrEqual(3);
-    // A shipped non-bka trigger (e.g. the application void guard) gets a mixed-case twin too.
+    // A shipped non-bka trigger gets a mixed-case twin too. (Since 0063 every trigger on the ledger
+    // tables is a bka_ guard — the application void guard was renamed — so this may find none.)
     const nonBka = LEDGER_TABLES.flatMap((tbl) => originals[tbl].filter((n) => !n.startsWith('bka_')).map((n) => ({ tbl, n })));
-    expect(nonBka.length).toBeGreaterThan(0);
-    {
+    if (nonBka.length) {
       const { tbl, n } = nonBka[0];
       const mixed = n[0].toUpperCase() + n.slice(1);
       await addTrigger(qi(mixed), tbl);

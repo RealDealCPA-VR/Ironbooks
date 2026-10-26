@@ -93,7 +93,7 @@ const GUARANTEES: Array<{ title: string; body: string }> = [
 /** Which rebuild action repairs which failed check (best match). */
 const CHECK_TO_ACTION: Record<string, RebuildAction> = {
   'Cached account balances match GL': 'account_balances',
-  'A/R control account (1200) matches open invoices': 'document_balances',
+  'A/R control account matches open invoices': 'document_balances',
 };
 
 // ---------------------------------------------------------------------------
