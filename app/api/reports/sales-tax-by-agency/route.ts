@@ -12,6 +12,7 @@ import { getServerContext } from '@/lib/context';
 import { salesTaxByAgency } from '@/lib/services/combinedTax';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateParam } from '../_lib';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -29,21 +30,12 @@ export async function GET(req: NextRequest) {
     const fromStr = searchParams.get('from');
     const toStr = searchParams.get('to');
 
+    // Real calendar days only (400 otherwise): new Date('2026-02-30') rolled over to March 2.
     const range: { from?: Date; to?: Date } = {};
-    if (fromStr) {
-      const d = new Date(fromStr);
-      if (isNaN(d.getTime())) {
-        return NextResponse.json({ error: 'Invalid `from` date', code: 'VALIDATION' }, { status: 400 });
-      }
-      range.from = d;
-    }
-    if (toStr) {
-      const d = new Date(toStr);
-      if (isNaN(d.getTime())) {
-        return NextResponse.json({ error: 'Invalid `to` date', code: 'VALIDATION' }, { status: 400 });
-      }
-      range.to = d;
-    }
+    const from = parseDateParam(fromStr, 'from');
+    const to = parseDateParam(toStr, 'to');
+    if (from) range.from = from;
+    if (to) range.to = to;
 
     return NextResponse.json(await salesTaxByAgency(ctx, range));
   } catch (err) {
