@@ -18,9 +18,10 @@
  * a check PDF needs: "print on check as" name, vendor account number on the memo line, voucher
  * detail (expense lines / bills paid / paycheck lines).
  */
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import {
   accounts,
+  auditLogs,
   billPaymentApplications,
   billPayments,
   bills,
@@ -32,6 +33,7 @@ import {
   items,
   journalEntries,
   journalEntryLines,
+  journalItemApplications,
   otherNames,
   paycheckLines,
   paychecks,
@@ -39,7 +41,7 @@ import {
   taxAgencies,
   vendors,
 } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   CHECK_STOCKS,
   CHECK_STYLES,
@@ -400,6 +402,57 @@ export interface CheckPrintData {
   payeeAddress: string[];
 }
 
+/**
+ * The cash a bill payment paid on each of its applications (same order), i.e. the settlement
+ * minus the early-payment discount taken on that bill. The per-bill split is on the payment's
+ * latest audit row (create / edit record each application's cash and discount); when that row
+ * does not match the payment any more, the bills' cash (payment amount minus General Journal
+ * items paid) is spread over the settlements, penny-exact.
+ */
+async function billPaymentCashByBill(
+  ctx: ServiceContext,
+  payment: { id: string; amount: string },
+  apps: Array<{ billId: string; amountApplied: string }>,
+  journalTotal: ReturnType<typeof Money.zero>,
+): Promise<Array<ReturnType<typeof Money.zero>>> {
+  if (apps.length === 0) return [];
+  const billsCash = Money.round2(Money.of(payment.amount).minus(journalTotal));
+  const settled = apps.reduce((s, a) => s.plus(Money.of(a.amountApplied)), Money.zero());
+  if (Money.round2(settled).equals(billsCash)) return apps.map((a) => Money.of(a.amountApplied));
+  const [audit] = await ctx.db
+    .select({ newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'bill_payment'),
+        eq(auditLogs.entityId, payment.id),
+        sql`jsonb_typeof(${auditLogs.newValues}->'applications') = 'array'`,
+      ),
+    )
+    .orderBy(desc(auditLogs.createdAt))
+    .limit(1);
+  const recorded = ((audit?.newValues as { applications?: Array<{ billId?: string; amountApplied?: string | number }> } | null)
+    ?.applications ?? []) as Array<{ billId?: string; amountApplied?: string | number }>;
+  const cashOf = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const r of recorded) {
+    if (!r.billId) continue;
+    try {
+      cashOf.set(r.billId, Money.round2(r.amountApplied ?? 0));
+    } catch {
+      /* malformed history: fall back below */
+    }
+  }
+  const fromAudit = apps.map((a) => cashOf.get(a.billId));
+  if (
+    fromAudit.every((c, i) => c != null && !c.greaterThan(Money.of(apps[i].amountApplied))) &&
+    Money.round2(fromAudit.reduce((s, c) => s.plus(c ?? 0), Money.zero())).equals(billsCash)
+  ) {
+    return fromAudit as Array<ReturnType<typeof Money.zero>>;
+  }
+  return billsCash.isNegative() ? apps.map((a) => Money.of(a.amountApplied)) : allocate(billsCash, apps.map((a) => a.amountApplied));
+}
+
 /** Address jsonb ({ line1, line2, city, state, zip, … }) → printable lines. */
 function addressLines(addr: unknown): string[] {
   if (!addr || typeof addr !== 'object' || Array.isArray(addr)) return [];
@@ -463,6 +516,23 @@ export async function checkPrintData(
       .from(billPaymentApplications)
       .innerJoin(bills, eq(billPaymentApplications.billId, bills.id))
       .where(eq(billPaymentApplications.billPaymentId, id));
+    // General Journal amounts owed that this check also paid (QB I11 — Pay Bills lists them).
+    const journalPaid = await ctx.db
+      .select({ amount: journalItemApplications.amount, entryNumber: journalEntries.entryNumber, date: journalEntries.date })
+      .from(journalItemApplications)
+      .innerJoin(journalEntries, eq(journalItemApplications.journalEntryId, journalEntries.id))
+      .where(
+        and(
+          eq(journalItemApplications.companyId, ctx.companyId),
+          eq(journalItemApplications.billPaymentId, id),
+          eq(journalItemApplications.kind, 'bill_payment'),
+        ),
+      );
+    // An application stores the bill's whole settlement (cash + early-payment discount); the stub
+    // shows what this check pays on each bill, and the discount separately, so it adds up to the
+    // check amount (QB voucher: Payment / Discount columns).
+    const journalTotal = journalPaid.reduce((s, j) => s.plus(Money.of(j.amount)), Money.zero());
+    const cashByBill = await billPaymentCashByBill(ctx, row.p, apps.map((r) => r.a), journalTotal);
     return {
       payee: vendorCheckName(row.v, 'Vendor'),
       amount: toAmountString(row.p.amount),
@@ -470,11 +540,23 @@ export async function checkPrintData(
       memo: row.v?.accountNumber ? `Acct # ${row.v.accountNumber}` : null,
       checkNumber: row.p.reference,
       payeeAddress: addressLines(row.v?.address),
-      voucher: apps.map((r) => ({
-        account: `Bill ${r.billNumber ?? ''}`.trim(),
-        description: new Date(r.billDate).toISOString().slice(0, 10),
-        amount: toAmountString(r.a.amountApplied),
-      })),
+      voucher: [
+        ...apps.map((r, i) => {
+          const cash = cashByBill[i];
+          const discount = Money.round2(Money.of(r.a.amountApplied).minus(cash));
+          const day = new Date(r.billDate).toISOString().slice(0, 10);
+          return {
+            account: `Bill ${r.billNumber ?? ''}`.trim(),
+            description: discount.greaterThan(0) ? `${day} — discount ${toAmountString(discount)}` : day,
+            amount: toAmountString(cash),
+          };
+        }),
+        ...journalPaid.map((j) => ({
+          account: `General Journal #${j.entryNumber}`,
+          description: new Date(j.date).toISOString().slice(0, 10),
+          amount: toAmountString(j.amount),
+        })),
+      ],
     };
   }
   if (source === 'payment_check') {

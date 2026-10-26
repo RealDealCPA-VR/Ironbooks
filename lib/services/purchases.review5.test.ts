@@ -22,10 +22,13 @@ import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   accounts,
   bills,
+  companies,
   inventoryLayers,
   items,
   journalEntries,
   journalEntryLines,
+  purchaseOrderLines,
+  purchaseOrders,
   taxRates,
   users,
   vendors,
@@ -37,15 +40,18 @@ import { createItem } from './items';
 import { createBill } from './bills';
 import { payBills, updateBillPayment } from './billPayments';
 import { createVendor } from './vendors';
+import { createPurchaseOrder, convertToBill, updateStatus } from './purchaseOrders';
+import { checkPrintData } from './printQueue';
+import { generate1099NecFile } from './form1099Xml';
 import { createExpense } from './expenses';
 import { createItemReceipt } from './itemReceipts';
 import { enterBillForReceivedItems } from './receiving';
 import { allocateLandedCost } from './landedCost';
 import { upsertCurrency, setBaseCurrency } from './currencies';
-import { payCreditCard, payPayrollLiabilities, paySalesTax } from './liabilityPayments';
+import { payCreditCard, payPayrollLiabilities, paySalesTax, paySalesTaxScreen } from './liabilityPayments';
 import { createTaxRate, updateTaxRate } from './salesTax';
 import { setComponents } from './combinedTax';
-import { createVendorCredit, applyToBill, unapplyFromBill, refundVendorCredit } from './vendorCredits';
+import { createVendorCredit, applyToBill, unapplyFromBill, refundVendorCredit, voidVendorCredit } from './vendorCredits';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-purchases');
 let db: DB;
@@ -362,6 +368,106 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
       .from(accounts)
       .where(and(eq(accounts.companyId, company.id), eq(accounts.code, '2050')));
     expect(accruals).toHaveLength(1);
+  });
+
+  it('K: voiding a purchase order while it is being converted to a bill never leaves a void PO with a bill', async () => {
+    const v = await newVendor();
+    for (let i = 0; i < 3; i++) {
+      const po = await createPurchaseOrder(ctx, {
+        vendorId: v.id,
+        date: d('2026-07-01'),
+        lines: [{ accountId: acct['6300'], quantity: 2, rate: '10.00' }],
+      });
+      const [conv, vd] = await Promise.allSettled([convertToBill(ctx, po.id), updateStatus(ctx, po.id, 'void')]);
+      const [row] = await db.select().from(purchaseOrders).where(eq(purchaseOrders.id, po.id));
+      const [line] = await db.select().from(purchaseOrderLines).where(eq(purchaseOrderLines.purchaseOrderId, po.id));
+      if (conv.status === 'fulfilled') {
+        // The bill exists: the PO must not be void (its quantities are billed).
+        expect(row.status).not.toBe('void');
+        expect(vd.status).toBe('rejected');
+      } else {
+        expect(Number(line.quantityBilled)).toBe(0);
+      }
+    }
+  });
+
+  it('L: a bill payment check stub shows what the check pays on each bill (discounts apart)', async () => {
+    const v = await newVendor();
+    const b1 = await createBill(ctx, { vendorId: v.id, billNumber: 'L-1', date: d('2026-07-05'), lines: [{ accountId: acct['6300'], amount: '1000.00' }] });
+    const b2 = await createBill(ctx, { vendorId: v.id, billNumber: 'L-2', date: d('2026-07-05'), lines: [{ accountId: acct['6300'], amount: '300.00' }] });
+    const pay = await payBills(ctx, {
+      vendorId: v.id,
+      date: d('2026-07-08'),
+      method: 'check',
+      toPrint: true,
+      paymentAccountId: acct['1000'],
+      discountAccountId: acct['6300'],
+      applications: [
+        { billId: b1.id, amountApplied: '980.00', discountTaken: '20.00' },
+        { billId: b2.id, amountApplied: '300.00' },
+      ],
+    });
+    const data = await checkPrintData(ctx, 'bill_payment', pay.id);
+    expect(data.amount).toBe('1280.00');
+    const byBill = Object.fromEntries(data.voucher.map((l) => [l.account, l]));
+    expect(byBill['Bill L-1'].amount).toBe('980.00');
+    expect(byBill['Bill L-1'].description).toContain('discount 20.00');
+    expect(byBill['Bill L-2'].amount).toBe('300.00');
+    const total = data.voucher.reduce((s, l) => s + Math.round(Number(l.amount) * 100), 0) / 100;
+    expect(total.toFixed(2)).toBe(data.amount);
+  });
+
+  it('N: the 1099-NEC e-file carries the payer TIN and address and the recipient address', async () => {
+    const [co] = await db.select().from(companies).where(eq(companies.id, ctx.companyId));
+    await db
+      .update(companies)
+      .set({
+        settings: {
+          ...((co.settings ?? {}) as Record<string, unknown>),
+          legalName: 'R5 Purchases Company LLC',
+          ein: '98-7654321',
+          addressLine1: '10 Payer Way',
+          city: 'Springfield',
+          state: 'IL',
+          zip: '62701',
+          phone: '217-555-0100',
+        },
+      })
+      .where(eq(companies.id, ctx.companyId));
+    const v = await newVendor({ is1099: true, taxId: '12-3456789', address: { line1: '5 Contractor Rd', city: 'Peoria', state: 'IL', zip: '61602' } });
+    await createExpense(ctx, {
+      vendorId: v.id,
+      date: d('2026-08-01'),
+      method: 'check',
+      paymentAccountId: acct['1000'],
+      lines: [{ accountId: acct['6300'], amount: '2500.00' }],
+    });
+    const xml = await generate1099NecFile(ctx, { year: 2026 });
+    const payer = xml.slice(xml.indexOf('<Payer>'), xml.indexOf('</Payer>'));
+    expect(payer).toContain('<BusinessName>R5 Purchases Company LLC</BusinessName>');
+    expect(payer).toContain('<TIN>98-7654321</TIN>');
+    expect(payer).toContain('<AddressLine>10 Payer Way</AddressLine>');
+    expect(payer).toContain('<AddressLine>Springfield, IL 62701</AddressLine>');
+    const rec = xml.slice(xml.indexOf(`<Name>${v.displayName}</Name>`));
+    expect(rec.slice(0, rec.indexOf('</PayeeInfo>'))).toContain('<AddressLine>5 Contractor Rd</AddressLine>');
+  });
+
+  it('O: Pay Sales Tax "due through" that is not a real day is a 400', async () => {
+    await expectCode(paySalesTaxScreen(ctx, { dueThrough: '2026-13-01' }), 'VALIDATION');
+    await expectCode(paySalesTaxScreen(ctx, { dueThrough: '2026-02-30' }), 'VALIDATION');
+    const ok = await paySalesTaxScreen(ctx, { dueThrough: '2026-06-30' });
+    expect(ok.dueThrough).toBe('2026-06-30');
+  });
+
+  it('P: voiding a refunded vendor credit says to void the refund (it was never applied)', async () => {
+    const v = await newVendor();
+    const credit = await createVendorCredit(ctx, { vendorId: v.id, date: d('2026-08-10'), lines: [{ accountId: acct['6300'], amount: '15.00' }] });
+    await refundVendorCredit(ctx, { vendorCreditId: credit.id, bankAccountId: acct['1000'], amount: '15.00', date: d('2026-08-11') });
+    const err = (await voidVendorCredit(ctx, credit.id).catch((e) => e)) as ServiceError;
+    expect(err).toBeInstanceOf(ServiceError);
+    expect(err.code).toBe('CONFLICT');
+    expect(err.message).toMatch(/refund/i);
+    expect(err.message).not.toMatch(/applied to a bill/i);
   });
 
   it('J: text longer than its column is refused with a plain message', async () => {

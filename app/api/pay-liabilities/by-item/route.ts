@@ -20,6 +20,7 @@ import { payPayrollLiabilities } from '@/lib/services/liabilityPayments';
 import { payrollLiabilityBalances } from '@/lib/services/payrollReports';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 function errorStatus(code: string): number {
   return serviceErrorStatus(code);
@@ -84,8 +85,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const payDate = parseDateInput(body.date);
+    if (!payDate) {
+      return NextResponse.json({ error: 'date must be a real calendar day (YYYY-MM-DD).', code: 'VALIDATION' }, { status: 400 });
+    }
+
     const entry = await payPayrollLiabilities(ctx, {
-      date: new Date(body.date),
+      date: payDate,
       paymentAccountId: body.paymentAccountId,
       memo: body.memo ?? null,
       items: body.items.map((i) => ({ name: i.name ?? '', amount: i.amount ?? '' })),

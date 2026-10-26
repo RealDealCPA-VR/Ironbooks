@@ -1251,9 +1251,17 @@ async function voidVendorCreditInTx(ctx: ServiceContext, id: string) {
     return credit;
   }
 
-  // Block voiding if the credit has been partially or fully applied.
-  const appliedAmount = Money.of(credit.total).minus(Money.of(credit.unapplied));
-  if (appliedAmount.greaterThan(0)) {
+  // Block voiding if the credit has been partially or fully applied — or refunded: the vendor's
+  // refund deposit is a separate entry (sourceRef refund:<id>) that must be voided first.
+  const usedAmount = Money.of(credit.total).minus(Money.of(credit.unapplied));
+  const refunded = Money.of(credit.refundedAmount ?? '0');
+  if (usedAmount.greaterThan(0)) {
+    if (refunded.greaterThan(0) && !usedAmount.greaterThan(refunded)) {
+      throw new ServiceError(
+        'CONFLICT',
+        `This vendor credit was refunded to you (${toAmountString(refunded)} deposited). Void that refund deposit first, then the credit.`,
+      );
+    }
     throw new ServiceError(
       'CONFLICT',
       'Cannot void a vendor credit that has been applied to a bill. Unapply first.',

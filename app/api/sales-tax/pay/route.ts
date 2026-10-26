@@ -15,6 +15,7 @@ import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import { paySalesTaxAgencies, paySalesTaxScreen } from '@/lib/services/liabilityPayments';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -36,7 +37,9 @@ export async function POST(req: NextRequest) {
     const ctx = await getServerContext();
     const body = (await requireJsonObject(req, { optional: true })) as Record<string, unknown>;
     const bad = (error: string) => NextResponse.json({ error, code: 'VALIDATION' }, { status: 400 });
-    if (typeof body.date !== 'string' || Number.isNaN(new Date(body.date).getTime())) return bad('Enter the check date.');
+    // A real calendar day (2026-02-30 is refused, not rolled over to March 2).
+    const checkDate = typeof body.date === 'string' ? parseDateInput(body.date) : null;
+    if (!checkDate) return bad('Enter the check date.');
     if (typeof body.paymentAccountId !== 'string' || !body.paymentAccountId) return bad('Pick the bank account to pay from.');
     if (!Array.isArray(body.payments) || body.payments.length === 0) return bad('Pick at least one tax agency to pay.');
     const payments = (body.payments as Array<Record<string, unknown>>).map((p) => ({
@@ -45,7 +48,7 @@ export async function POST(req: NextRequest) {
     }));
     const str = (v: unknown) => (typeof v === 'string' ? v : null);
     const res = await paySalesTaxAgencies(ctx, {
-      date: new Date(body.date),
+      date: checkDate,
       paymentAccountId: body.paymentAccountId,
       payments,
       memo: str(body.memo),

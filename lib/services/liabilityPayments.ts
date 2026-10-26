@@ -34,6 +34,7 @@ import { allocateCheckNumber } from './checkNumbers';
 import { assertClosedPeriodEdit } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import { getPreferences } from './company';
+import { parseDateInput } from '@/lib/validation/helpers';
 import { accountFitsKind } from './prefAccounts';
 import {
   type SalesTaxBasis,
@@ -1148,8 +1149,15 @@ export async function paySalesTaxScreen(
   const basis: SalesTaxBasis = prefs.salesTaxBasis === 'cash' ? 'cash' : 'accrual';
   const frequency = prefs.salesTaxFrequency as SalesTaxFrequency;
   const defaultDueThrough = lastFilingPeriod(frequency, opts.today ?? new Date()).to;
-  const dueThrough =
-    opts.dueThrough && /^\d{4}-\d{2}-\d{2}/.test(opts.dueThrough) ? opts.dueThrough.slice(0, 10) : defaultDueThrough;
+  let dueThrough = defaultDueThrough;
+  if (opts.dueThrough && /^\d{4}-\d{2}-\d{2}/.test(opts.dueThrough)) {
+    dueThrough = opts.dueThrough.slice(0, 10);
+    // "2026-13-01" failed deep in the ledger query (RangeError → HTTP 500); "2026-02-30" silently
+    // rolled over to March 2. Only a real calendar day is accepted.
+    if (!parseDateInput(dueThrough)) {
+      throw validation(`"${dueThrough}" is not a valid date. Show sales tax due through a real day (YYYY-MM-DD).`);
+    }
+  }
   const due = await salesTaxDueThrough(ctx, { dueThrough, basis });
   const agencyRows = await ctx.db
     .select({ id: taxAgencies.id, name: taxAgencies.name, vendorId: vendors.id, displayName: vendors.displayName, printOnCheckAs: vendors.printOnCheckAs })

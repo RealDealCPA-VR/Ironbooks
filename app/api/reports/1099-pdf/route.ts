@@ -10,7 +10,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { vendor1099Report } from '@/lib/services/statements';
-import { getCompany } from '@/lib/services/company';
+import { payer1099Info, recipient1099Addresses } from '@/lib/services/form1099Xml';
 import { ServiceError } from '@/lib/services/_base';
 import { render1099NecPdf } from '@/lib/pdf/form1099';
 import { serviceErrorStatus } from '@/lib/routeErrors';
@@ -66,16 +66,18 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Load company for the letterhead.
-    const company = await getCompany(ctx);
-    if (!company) {
+    // Payer block from Company Information (legal name, EIN, address) — a 1099 needs the payer's
+    // TIN and address; the recipient's mailing address comes from the vendor.
+    const payer = await payer1099Info(ctx);
+    if (!payer) {
       return NextResponse.json({ error: 'Company not found.', code: 'NOT_FOUND' }, { status: 404 });
     }
+    const recipientAddress = (await recipient1099Addresses(ctx, [vendorRow.vendorId])).get(vendorRow.vendorId) ?? [];
 
     // Render the 1099-NEC PDF.
     const pdfBytes = await render1099NecPdf({
-      company: { name: company.name, address: null },
-      vendor:  { name: vendorRow.vendorName, taxId: vendorRow.taxId },
+      company: { name: payer.name, addressLines: payer.addressLines, tin: payer.tin, phone: payer.phone },
+      vendor:  { name: vendorRow.vendorName, taxId: vendorRow.taxId, addressLines: recipientAddress },
       year,
       nonemployeeComp: vendorRow.total,
     });

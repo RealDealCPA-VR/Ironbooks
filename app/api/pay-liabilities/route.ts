@@ -29,6 +29,7 @@ import { getServerContext } from '@/lib/context';
 import { payrollLiabilitiesDue, payPayrollLiabilities } from '@/lib/services/liabilityPayments';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 function errorStatus(code: string): number {
   return serviceErrorStatus(code);
@@ -90,7 +91,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'paymentAccountId is required.' }, { status: 400 });
     }
 
-    const parsedDate = new Date(date);
+    const parsedDate = parseDateInput(date);
+    if (!parsedDate) {
+      return NextResponse.json({ error: 'date must be a real calendar day (YYYY-MM-DD).', code: 'VALIDATION' }, { status: 400 });
+    }
 
     const str = (v: unknown) => (typeof v === 'string' ? v : null);
     const entry = await payPayrollLiabilities(ctx, {

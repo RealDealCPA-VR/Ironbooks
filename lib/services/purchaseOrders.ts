@@ -430,6 +430,12 @@ export async function updateStatus(
   id: string,
   status: 'open' | 'closed' | 'void',
 ) {
+  // Read + write in ONE transaction: a void racing Convert to Bill must see the quantities the
+  // conversion billed (and be refused) instead of voiding a PO that now has a bill.
+  return inTransaction(ctx, (tx) => updateStatusInTx(tx, id, status));
+}
+
+async function updateStatusInTx(ctx: ServiceContext, id: string, status: 'open' | 'closed' | 'void') {
   const [po] = await ctx.db
     .select()
     .from(purchaseOrders)
@@ -456,6 +462,21 @@ export async function updateStatus(
       'CONFLICT',
       'Cannot void a partially billed purchase order. Close it instead to stop further billing.',
     );
+  }
+  if (status === 'void' && po.status !== 'void') {
+    // The status can lag the lines (manual status, receipts): never void a PO with billed or
+    // received quantities.
+    const [used] = await ctx.db
+      .select({ id: purchaseOrderLines.id })
+      .from(purchaseOrderLines)
+      .where(and(eq(purchaseOrderLines.purchaseOrderId, id), sql`${purchaseOrderLines.quantityBilled} > 0`))
+      .limit(1);
+    if (used) {
+      throw new ServiceError(
+        'CONFLICT',
+        'Items on this purchase order were already received or billed, so it cannot be voided. Close it instead to stop further billing.',
+      );
+    }
   }
 
   const [updated] = await ctx.db
@@ -623,6 +644,18 @@ export async function convertToBill(
   });
 
   return inTransaction(ctx, async (tx) => {
+    // Re-check the status inside the transaction: the PO may have been voided or closed since it
+    // was read (a void racing this conversion), and a void PO must never get a bill.
+    const [cur] = await tx.db
+      .select({ status: purchaseOrders.status })
+      .from(purchaseOrders)
+      .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, tx.companyId)));
+    if (!cur || cur.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Cannot convert a voided purchase order.');
+    }
+    if (cur.status === 'closed') {
+      throw new ServiceError('CONFLICT', 'Purchase order has already been fully billed.');
+    }
     // Claim each line's quantity with a guarded conditional UPDATE. If a
     // concurrent conversion already consumed the quantity, zero rows come back
     // and we bail without posting anything.

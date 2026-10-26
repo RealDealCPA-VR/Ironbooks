@@ -27,7 +27,7 @@
  */
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { overAppliedFixes } from '@/lib/errorFixes';
-import { isPaymentSourceAccount } from '@/lib/accountTypes';
+import { isBankAccount, isPaymentSourceAccount } from '@/lib/accountTypes';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import { Money, toAmountString } from '@/lib/money';
@@ -537,6 +537,16 @@ async function applyJournalRows(tx: ServiceContext, paymentId: string, input: Pa
   });
 }
 
+/** Checks are numbered only on a bank account (a card account has no check sequence). */
+async function isBankPayFrom(ctx: ServiceContext, paymentAccountId: string | null | undefined): Promise<boolean> {
+  if (!paymentAccountId) return false;
+  const [acct] = await ctx.db
+    .select({ type: accounts.type, subtype: accounts.subtype })
+    .from(accounts)
+    .where(and(eq(accounts.id, paymentAccountId), eq(accounts.companyId, ctx.companyId)));
+  return Boolean(acct && isBankAccount(acct));
+}
+
 function referenceFor(input: PayBillsInput): { reference: string | null; toPrint: boolean } {
   const toPrint = Boolean(input.toPrint) && input.method === 'check';
   return { reference: toPrint ? null : input.reference?.trim() || null, toPrint };
@@ -566,7 +576,7 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
     // the account's next check number (QB "Let QuickBooks assign check numbers"). Without it the
     // check had no number in the register, Missing Checks or the next-number sequence.
     let reference = typed;
-    if (input.method === 'check' && !toPrint && input.paymentAccountId) {
+    if (input.method === 'check' && !toPrint && (await isBankPayFrom(tx, input.paymentAccountId))) {
       reference = await allocateCheckNumber(tx, {
         paymentAccountId: input.paymentAccountId,
         number: typed,
@@ -748,7 +758,7 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
   // that never had one gets the account's next number.
   const reference =
     typed ??
-    (input.method === 'check' && !toPrint && input.paymentAccountId
+    (input.method === 'check' && !toPrint && (await isBankPayFrom(ctx, input.paymentAccountId))
       ? (existing.method === 'check' && existing.reference?.trim()) ||
         (await nextCheckNumber(ctx, input.paymentAccountId))
       : null);

@@ -47,6 +47,7 @@
 
 import { PDFDocument, StandardFonts, rgb, PageSizes, type PDFFont, type PDFPage } from 'pdf-lib';
 import { stampSandbox } from './sandboxStamp';
+import { pdfSafe } from './template';
 import { Money } from '@/lib/money';
 import {
   CHECKS_PER_STANDARD_SHEET,
@@ -62,6 +63,29 @@ import {
   type CheckPageSize,
   type CheckPosition,
 } from './checkLayout';
+
+/** Letters with no WinAnsi form and no accent to strip (NFD leaves them whole). */
+const FOLD: Record<string, string> = { Ł: 'L', ł: 'l', Đ: 'D', đ: 'd', Ħ: 'H', ħ: 'h', ı: 'i', Ŧ: 'T', ŧ: 't', Ŀ: 'L', ŀ: 'l' };
+
+/**
+ * Text the standard PDF fonts (WinAnsi) can draw. pdf-lib throws "WinAnsi cannot encode" for
+ * anything else, which failed the whole check / 1099 print (HTTP 500) for a payee such as
+ * "Łódź Supplies" or "Nguyễn Văn Ánh". Accented letters fold to their base letter (ễ → e, Ł → L);
+ * what has no Latin form (CJK, emoji) becomes "?".
+ */
+export function pdfText(s: string | null | undefined): string {
+  if (!s) return '';
+  let out = '';
+  for (const ch of s) {
+    if (pdfSafe(ch) === ch) {
+      out += ch;
+      continue;
+    }
+    const folded = FOLD[ch] ?? ch.normalize('NFD').replace(/\p{M}+/gu, '');
+    out += folded && pdfSafe(folded) === folded ? folded : '?';
+  }
+  return out;
+}
 
 /** "1234.5" -> "1,234.50" using Decimal (no float drift); null when not a number. */
 function fmtAmount(v: string): string | null {
@@ -366,6 +390,7 @@ function drawCheck(a: DrawArgs) {
     opts: { size?: number; font?: PDFFont; color?: typeof C_BLACK; rightAlign?: boolean } = {},
   ) {
     const { size = 10, font = regular, color = C_BLACK, rightAlign = false } = opts;
+    s = pdfText(s);
     if (!s) return;
     const drawX = rightAlign ? x - font.widthOfTextAtSize(s, size) : x;
     page.drawText(s, { x: drawX, y, font, size, color });
@@ -375,7 +400,7 @@ function drawCheck(a: DrawArgs) {
     page.drawLine({ start: { x: x1, y }, end: { x: x2, y }, thickness, color });
   }
   function fit(s: string, font: PDFFont, size: number, maxW: number) {
-    let v = s;
+    let v = pdfText(s);
     while (v.length > 0 && font.widthOfTextAtSize(v, size) > maxW) v = v.slice(0, -1);
     return v;
   }
@@ -438,7 +463,7 @@ function drawCheck(a: DrawArgs) {
     }
   }
 
-  const words = data.amountWords ?? numberToWords(data.amountNumeric);
+  const words = pdfText(data.amountWords ?? numberToWords(data.amountNumeric));
   const amount = fmtAmount(data.amountNumeric) ?? data.amountNumeric;
   const payeeAddress = (data.payeeAddress ?? []).filter((l) => l && l.trim());
   const companyAddress = (data.company.addressLines ?? []).filter((l) => l && l.trim());
@@ -512,7 +537,7 @@ function drawCheck(a: DrawArgs) {
     size: L.company.size + 2,
   });
   if (hasNumber(data.checkNumber)) {
-    const s = `Check #${data.checkNumber}`;
+    const s = pdfText(`Check #${data.checkNumber}`);
     const x = Math.min(px(L.checkNumber.x), right - 0.2 * IN - bold.widthOfTextAtSize(s, L.checkNumber.size));
     text(s, x, py(L.checkNumber.y), { font: bold, size: L.checkNumber.size, color: C_NAVY });
   }
