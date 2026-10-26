@@ -18,7 +18,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money, toAmountString } from '@/lib/money';
-import { csvQuoted } from '@/lib/csv';
+import { csvQuoted, withCsvBom } from '@/lib/csv';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -99,7 +99,7 @@ function downloadCsv(rows: WorksheetRow[], year: number) {
   ];
 
   const csv = lines.join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const blob = new Blob([withCsvBom(csv)], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
