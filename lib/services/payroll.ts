@@ -71,6 +71,7 @@ import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll, releaseTimeEntriesFromP
 import { getPreferences } from './preferences';
 import { type PrefAccountKind, assertPreferenceAccount } from './prefAccounts';
 import { PAY_PERIODS_PER_YEAR } from '@/lib/preferences';
+import { getHomeCurrencyCode } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -266,14 +267,30 @@ async function preferredAccountId(
   kind: PrefAccountKind,
   label: string,
 ): Promise<string> {
+  let id: string | null = null;
   if (preferredId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(preferredId)) {
     const [row] = await ctx.db
       .select({ id: accounts.id, isActive: accounts.isActive })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, preferredId)));
-    if (row?.isActive) return (await assertPreferenceAccount(ctx, row.id, kind, label)).id;
+    if (row?.isActive) id = (await assertPreferenceAccount(ctx, row.id, kind, label)).id;
   }
-  return accountIdByCode(ctx, fallbackCode);
+  id ??= await accountIdByCode(ctx, fallbackCode);
+  // Payroll is paid in the home currency (QB: paychecks and payroll liabilities only from a
+  // home-currency account). A foreign-currency account would be credited the home amount
+  // converted at the list rate — the books would show a euro balance paid in dollars.
+  const [acct] = await ctx.db
+    .select({ name: accounts.name, currency: accounts.currency })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
+  const cur = (acct?.currency ?? '').trim().toUpperCase();
+  if (cur) {
+    const home = (await getHomeCurrencyCode(ctx))?.toUpperCase() ?? null;
+    if (home && cur !== home) {
+      throw validation(`${label} "${acct!.name}" is a ${cur} account. Payroll is paid in ${home}: choose a ${home} account in Preferences > Payroll & Employees / Checking.`);
+    }
+  }
+  return id;
 }
 
 /**

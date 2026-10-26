@@ -34,12 +34,14 @@ import {
   users,
   workersCompCodes,
   accounts,
+  auditLogs,
 } from '@/lib/db/schema';
 import { MoneyParseError } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { createCompany, updateCompany } from './company';
 import { createCustomer } from './customers';
 import { createAccount } from './accounts';
+import { setBaseCurrency, upsertCurrency } from './currencies';
 import { createJob } from './jobs';
 import {
   createEmployee,
@@ -55,7 +57,7 @@ import { billTimeToInvoice, createTimeEntry, deleteTimeEntry, updateTimeEntry } 
 import { approveAndReimburse, createReport, submitReport } from './expenseReports';
 import { createWorkersCompCode, createYtdAdjustment, updateWorkersCompCode, upsertStateTaxSetting } from './payrollAdjustments';
 import { createPayrollItem, updatePayrollItem } from './payrollItems';
-import { logMiles } from './mileage';
+import { deleteMileage, logMiles } from './mileage';
 import { w2Data, w3Data } from './payrollReports';
 
 process.env.TZ = 'America/New_York';
@@ -263,6 +265,23 @@ describe('review5 payroll / time / mileage / expense reports', { timeout: 300_00
     expect(ytdLines.find((l) => l.credit && Number(l.credit) === 2700)?.accountId).toBe(savings.id);
   });
 
+  it('paychecks are paid from a home-currency bank account, never a foreign-currency one', async () => {
+    const ctx = await newCompany('R5 Foreign Paycheck Bank');
+    await setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' });
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.10' });
+    const [eurBank] = await ctx.db
+      .insert(accounts)
+      .values({ companyId: ctx.companyId, code: '1030', name: 'Euro Checking', type: 'asset', subtype: 'checking', currency: 'EUR' } as never)
+      .returning();
+    await updateCompany(ctx, { settings: { defaultPaycheckAccountId: eurBank.id } });
+    const e = await createEmployee(ctx, { firstName: 'Eu', lastName: 'Ro', payType: 'salary', payRate: '50000' });
+    await expect(
+      runPaycheck(ctx, { employeeId: e.id, payDate: d('2026-06-05'), grossPay: '1000.00', taxes: [], employerTaxes: [] }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    const [after] = await ctx.db.select().from(accounts).where(eq(accounts.id, eurBank.id));
+    expect(after.balance).toBe('0.00');
+  });
+
   // -------------------------------------------------------------------------
   // Concurrency: the wage bases are read in the same transaction that posts the check
   // -------------------------------------------------------------------------
@@ -406,6 +425,15 @@ describe('review5 payroll / time / mileage / expense reports', { timeout: 300_00
     const y2026 = await logMiles(ctx, { date: d('2026-06-01'), miles: 10 });
     expect(y2026.ratePerMile).toBe('0.7250');
     expect(y2026.amount).toBe('7.25');
+
+    // Deleting a trip keeps what was deleted in the audit trail (not just its id).
+    await deleteMileage(ctx, y2026.id);
+    const [audit] = await ctx.db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'mileage_log'), eq(auditLogs.action, 'delete')));
+    expect((audit.oldValues as Record<string, unknown>).miles).toBe('10.00');
+    expect((audit.oldValues as Record<string, unknown>).ratePerMile).toBe('0.7250');
   });
 
   // -------------------------------------------------------------------------

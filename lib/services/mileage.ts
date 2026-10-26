@@ -20,6 +20,7 @@ import {
   type ServiceContext,
   ServiceError,
   assertRefInCompany,
+  inTransaction,
   notFound,
   validation,
   writeAudit,
@@ -246,23 +247,25 @@ export async function logMiles(ctx: ServiceContext, input: LogMilesInput): Promi
 // ---------------------------------------------------------------------------
 
 export async function deleteMileage(ctx: ServiceContext, id: string): Promise<{ deleted: boolean }> {
-  // Verify ownership before delete.
+  // Verify ownership before delete; the audit trail keeps what was deleted (date, miles, rate,
+  // customer…), not just the id.
   const [existing] = await ctx.db
-    .select({ id: mileageLogs.id })
+    .select()
     .from(mileageLogs)
     .where(and(eq(mileageLogs.id, id), eq(mileageLogs.companyId, ctx.companyId)));
 
   if (!existing) throw notFound('Mileage log');
 
-  await ctx.db
-    .delete(mileageLogs)
-    .where(and(eq(mileageLogs.id, id), eq(mileageLogs.companyId, ctx.companyId)));
-
-  await writeAudit(ctx, {
-    action: 'delete',
-    entityType: 'mileage_log',
-    entityId: id,
-    oldValues: { id },
+  await inTransaction(ctx, async (tx) => {
+    await tx.db
+      .delete(mileageLogs)
+      .where(and(eq(mileageLogs.id, id), eq(mileageLogs.companyId, tx.companyId)));
+    await writeAudit(tx, {
+      action: 'delete',
+      entityType: 'mileage_log',
+      entityId: id,
+      oldValues: existing,
+    });
   });
 
   return { deleted: true };
