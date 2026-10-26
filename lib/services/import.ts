@@ -728,7 +728,11 @@ export async function importTransactions(
     .insert(fileImports)
     .values({
       companyId: ctx.companyId,
-      filename: input.filename ?? `import.${input.fileType}`,
+      // file_imports.filename is varchar(255): keep the end (the extension) of a longer name.
+      filename: (() => {
+        const name = (typeof input.filename === 'string' && input.filename.trim()) || `import.${input.fileType}`;
+        return name.length > 255 ? `…${name.slice(-254)}` : name;
+      })(),
       fileType: fileTypeForDb as never,
       status: 'processing',
       uploadedBy: ctx.userId ?? '00000000-0000-0000-0000-000000000000',
@@ -771,6 +775,8 @@ export async function importTransactions(
   //     fitId cell with the formula-guard apostrophe still on. The same line's legacy key counts
   //     as a duplicate too, so re-importing an old file adds nothing. Legacy occurrence numbers
   //     are counted over every row's legacy tuple, exactly as those versions counted them.
+  // fit_id is varchar(255): compare and store the same (shortened) key, so a re-import dedupes.
+  for (const t of parsed) if (t.fitId && t.fitId.length > 255) t.fitId = t.fitId.slice(0, 255);
   const tupleCounts = new Map<string, number>();
   const legacyTupleCounts = new Map<string, number>();
   const legacyKeys = new Map<ParsedTransaction, string>();
@@ -845,10 +851,12 @@ export async function importTransactions(
         companyId: ctx.companyId,
         bankAccountId: input.bankAccountId,
         fileImportId: importRow.id,
+        // payee is varchar(255): a longer cell used to fail the row (logged as an error and left
+        // out of the import). Keep it, shortened.
         fitId: txn.fitId ?? null,
         date: txn.date,
         description: txn.description,
-        payee: match?.setPayee ?? txn.payee ?? null,
+        payee: (match?.setPayee ?? txn.payee)?.slice(0, 255) ?? null,
         amount: txn.amount,
         matched: false,
         suggestedAccountId: match?.setAccountId ?? null,

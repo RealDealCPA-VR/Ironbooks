@@ -267,6 +267,35 @@ describe('statement and CSV import', () => {
     expect(staged).toHaveLength(0);
   });
 
+  it('a file name longer than the 255-character column is shortened, not a database error', async () => {
+    const ba = await linkBank('1000');
+    const res = await importTransactions(ctx, {
+      bankAccountId: ba,
+      fileType: 'rows',
+      content: '',
+      rows: [{ date: '2026-03-02', description: 'x', amount: '-5.00' }],
+      filename: `${'Statement '.repeat(40)}.pdf`,
+    });
+    expect(res.imported).toBe(1);
+  });
+
+  it('a CSV payee longer than 255 characters is kept (shortened) instead of dropping the row', async () => {
+    const ba = await linkBank('1000');
+    const long = 'ACME '.repeat(60);
+    const csv = `Date,Description,Amount,Payee
+2026-03-02,Fuel,-45.00,${long}
+`;
+    const res = await importTransactions(ctx, {
+      bankAccountId: ba,
+      fileType: 'csv',
+      content: csv,
+      csvMapping: { dateCol: 'Date', descriptionCol: 'Description', amountCol: 'Amount', payeeCol: 'Payee' },
+    });
+    expect(res).toMatchObject({ imported: 1, errors: 0 });
+    const [row] = await db.select().from(bankTransactions).where(eq(bankTransactions.bankAccountId, ba));
+    expect(row.payee?.length).toBeLessThanOrEqual(255);
+  });
+
   it('CSV debit / credit columns accept accounting-style (12.50) and 1,234.56 amounts', () => {
     const csv = 'Date,Description,Debit,Credit\n2026-03-02,Fuel,(12.50),\n2026-03-03,Deposit,,"1,234.56"\n';
     const rows = parseCSV(csv, { dateCol: 'Date', descriptionCol: 'Description', amountCol: 'Debit', debitCol: 'Debit', creditCol: 'Credit' });
