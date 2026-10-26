@@ -21,6 +21,9 @@ import { createCustomer } from './customers';
 import { createInvoice, updateInvoice, voidInvoice } from './invoices';
 import { createSalesReceipt, updateSalesReceipt, voidSalesReceipt } from './salesReceipts';
 import { createBill, voidBill } from './bills';
+import { createExpense } from './expenses';
+import { createVendorCredit } from './vendorCredits';
+import { inventoryItemDetail } from './lists/inventoryCenter';
 import { createVendor } from './vendors';
 import { createItemReceipt, voidItemReceipt } from './itemReceipts';
 import { createCreditMemo, voidCreditMemo } from './creditMemos';
@@ -28,6 +31,10 @@ import { trialBalance } from './reports';
 import { verifySiteInvariants } from './inventorySiteReports';
 import { handleBulkPost } from '@/lib/lists/bulkRoute';
 import { builtinRole, unionRoles } from '@/lib/permissions/model';
+import { createEntry, listEntries } from './lists/simpleLists';
+import { createType, listTypes } from './typeLists';
+import { createUomSet, listUomSets } from './lists/uom';
+import { createBillingRateLevel, listBillingRateLevels } from './lists/billingRates';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-inventory-review5');
 let db: DB;
@@ -338,6 +345,15 @@ describe('review5 inventory', () => {
     expect(await gl('1300')).toBe('0.00');
   });
 
+  it('FIFO: a consumption without a memo names the item in the journal, not its database id', async () => {
+    const item = await invItem('Named gadget');
+    await receiveStock(ctx, { itemId: item.id, quantity: 2, unitCost: '3.00', date: d('2026-01-01') });
+    const res = await consumeStock(ctx, { itemId: item.id, quantity: 1, date: d('2026-01-02') });
+    const [je] = await db.select().from(journalEntries).where(eq(journalEntries.id, res.entryId));
+    expect(je.description).toContain('Named gadget');
+    expect(je.description).not.toContain(item.id);
+  });
+
   // ---- valuation includes inactive items that still hold stock ----
 
   it('valuation: an inactive item that still holds stock is valued (ties to the GL)', async () => {
@@ -356,6 +372,65 @@ describe('review5 inventory', () => {
     const res = await verifySiteInvariants(ctx);
     const glCheck = res.checks.find((c) => c.name.startsWith('Inventory asset GL'));
     expect(glCheck?.ok, glCheck?.detail).toBe(true);
+  });
+
+  // ---- lists: double-submitted creates ----
+
+  async function expectOneCreated(results: PromiseSettledResult<unknown>[]) {
+    const ok = results.filter((r) => r.status === 'fulfilled');
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(ok).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect(failed[0].reason).toBeInstanceOf(ServiceError);
+    expect((failed[0].reason as ServiceError).code).toBe('VALIDATION');
+  }
+
+  it('lists: a double-submitted new list entry makes one entry and a plain duplicate-name error', async () => {
+    await listEntries(ctx, 'ship-via'); // seeded
+    await expectOneCreated(await Promise.allSettled([
+      createEntry(ctx, 'ship-via', { name: 'Courier Twice' }),
+      createEntry(ctx, 'ship-via', { name: 'Courier Twice' }),
+    ]));
+    expect((await listEntries(ctx, 'ship-via')).filter((e) => e.name === 'Courier Twice')).toHaveLength(1);
+  });
+
+  it('lists: double-submitted customer type, U/M set and billing rate level make one record each', async () => {
+    await expectOneCreated(await Promise.allSettled([
+      createType(ctx, 'customer', { name: 'Wholesale' }),
+      createType(ctx, 'customer', { name: 'Wholesale' }),
+    ]));
+    expect((await listTypes(ctx, 'customer')).filter((t) => t.name === 'Wholesale')).toHaveLength(1);
+    const set = { name: 'Case of 12', baseUnitName: 'Each', baseUnitAbbrev: 'ea', units: [{ name: 'Case', abbrev: 'cs', factor: '12' }] };
+    await expectOneCreated(await Promise.allSettled([createUomSet(ctx, set), createUomSet(ctx, set)]));
+    expect((await listUomSets(ctx)).filter((u) => u.name === 'Case of 12')).toHaveLength(1);
+    const level = { name: 'Senior rate', type: 'fixed_rate', fixedRate: '150' };
+    await expectOneCreated(await Promise.allSettled([createBillingRateLevel(ctx, level), createBillingRateLevel(ctx, level)]));
+    expect((await listBillingRateLevels(ctx)).filter((l) => l.name === 'Senior rate')).toHaveLength(1);
+  });
+
+  // ---- Inventory Center ----
+
+  it("Inventory Center: an item's transactions include checks, vendor credits and builds, with the quantity each moved", async () => {
+    const part = await invItem('Center part');
+    await adjustInventory(ctx, { itemId: part.id, quantityChange: 20, unitCost: '1.00', date: d('2026-01-01') });
+    const kit = await invItem('Center kit');
+    await setBom(ctx, kit.id, [{ componentItemId: part.id, quantity: '2' }]);
+    const v = await createVendor(ctx, { displayName: 'Center supplier' } as never);
+    await createExpense(ctx, { payeeName: 'Hardware Store', date: d('2026-01-02'), method: 'check', paymentAccountId: acct['1000'], lines: [{ itemId: part.id, quantity: '5', unitCost: '1.00' }] } as never);
+    await createVendorCredit(ctx, { vendorId: v.id, date: d('2026-01-03'), lines: [{ itemId: part.id, quantity: '3', amount: '3.00' }] } as never);
+    await buildAssembly(ctx, { assemblyItemId: kit.id, quantity: 4, date: d('2026-01-04') });
+    const c = await createCustomer(ctx, { displayName: 'Center buyer' } as never);
+    await createCreditMemo(ctx, { customerId: c.id, date: d('2026-01-05'), lines: [{ itemId: part.id, quantity: 2, rate: '1.00', restock: false }] } as never);
+    const detail = await inventoryItemDetail(ctx, part.id);
+    const byType = (t: string) => detail.transactions.filter((x) => x.type === t).map((x) => x.quantity);
+    expect(byType('Check')).toEqual(['5.0000']);
+    expect(byType('Vendor Credit')).toEqual(['-3.0000']);
+    expect(byType('Build Assembly')).toEqual(['-8.0000']);
+    expect(byType('Credit Memo')).toEqual(['0.0000']); // not restocked: no stock came back
+    expect(byType('Inventory Adjustment')).toEqual(['20.0000']);
+    // The quantities shown add up to the quantity on hand (20 + 5 - 3 - 8).
+    const sum = detail.transactions.reduce((acc, x) => acc.plus(Money.of(x.quantity)), Money.zero());
+    expect(sum.toFixed(4)).toBe((await itemRow(part.id)).quantityOnHand);
   });
 
   // ---- permissions ----

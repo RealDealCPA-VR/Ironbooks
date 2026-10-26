@@ -5,12 +5,16 @@
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
+  auditLogs,
   billLines,
   bills,
   creditMemoLines,
   creditMemos,
   customers,
+  expenseLines,
+  expenses,
   inventoryLayers,
+  inventoryMovements,
   invoiceLines,
   invoices,
   itemReceiptLines,
@@ -24,6 +28,8 @@ import {
   salesReceiptLines,
   salesReceipts,
   uomSets,
+  vendorCreditLines,
+  vendorCredits,
   vendors,
 } from '@/lib/db/schema';
 import { type ServiceContext, notFound } from '../_base';
@@ -150,12 +156,13 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
     tx.push({ type: 'Sales Receipt', path: 'sales-receipts', id: r.id, number: String(r.number), date: r.date, name: r.name, quantity: r.status === 'void' ? '0.0000' : neg(r.qty), amount: r.amount, status: r.status });
   }
   for (const r of await ctx.db
-    .select({ id: creditMemos.id, number: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))`, date: creditMemos.date, name: customers.displayName, qty: creditMemoLines.quantity, amount: creditMemoLines.amount, status: creditMemos.status })
+    .select({ id: creditMemos.id, number: sql<string>`COALESCE(NULLIF(${creditMemos.refNumber}, ''), CAST(${creditMemos.memoNumber} AS TEXT))`, date: creditMemos.date, name: customers.displayName, qty: creditMemoLines.quantity, restock: creditMemoLines.restock, amount: creditMemoLines.amount, status: creditMemos.status })
     .from(creditMemoLines)
     .innerJoin(creditMemos, eq(creditMemos.id, creditMemoLines.creditMemoId))
     .leftJoin(customers, eq(customers.id, creditMemos.customerId))
     .where(and(eq(creditMemos.companyId, c), eq(creditMemoLines.itemId, itemId)))) {
-    tx.push({ type: 'Credit Memo', path: 'credit-memos', id: r.id, number: String(r.number), date: r.date, name: r.name, quantity: r.status === 'void' ? '0.0000' : pos(r.qty), amount: r.amount, status: r.status });
+    // A line not marked "restock" (damaged goods) puts nothing back on hand.
+    tx.push({ type: 'Credit Memo', path: 'credit-memos', id: r.id, number: String(r.number), date: r.date, name: r.name, quantity: r.status === 'void' || !r.restock ? '0.0000' : pos(r.qty), amount: r.amount, status: r.status });
   }
   for (const r of await ctx.db
     .select({ id: bills.id, number: bills.billNumber, date: bills.date, name: vendors.displayName, qty: billLines.quantity, amount: billLines.amount, status: bills.status })
@@ -164,6 +171,25 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
     .leftJoin(vendors, eq(vendors.id, bills.vendorId))
     .where(and(eq(bills.companyId, c), eq(billLines.itemId, itemId)))) {
     tx.push({ type: 'Bill', path: 'bills', id: r.id, number: r.number, date: r.date, name: r.name, quantity: r.status === 'void' ? '0.0000' : pos(r.qty), amount: r.amount, status: r.status });
+  }
+  // Checks / credit-card charges with an Items tab (Write Checks, Enter Credit Card Charges).
+  for (const r of await ctx.db
+    .select({ id: expenses.id, number: expenses.reference, date: expenses.date, method: expenses.method, payee: expenses.payeeName, vendor: vendors.displayName, qty: expenseLines.quantity, amount: expenseLines.amount, voidedAt: expenses.voidedAt })
+    .from(expenseLines)
+    .innerJoin(expenses, eq(expenses.id, expenseLines.expenseId))
+    .leftJoin(vendors, eq(vendors.id, expenses.vendorId))
+    .where(and(eq(expenses.companyId, c), eq(expenseLines.itemId, itemId)))) {
+    const type = r.method === 'credit_card' ? 'Credit Card Charge' : r.method === 'cash' ? 'Cash Expense' : 'Check';
+    tx.push({ type, path: 'expenses', id: r.id, number: r.number, date: r.date, name: r.vendor ?? r.payee, quantity: r.voidedAt || r.qty == null ? '0.0000' : pos(r.qty), amount: r.amount, status: r.voidedAt ? 'void' : null });
+  }
+  // Vendor credits returning the item (Items tab).
+  for (const r of await ctx.db
+    .select({ id: vendorCredits.id, number: vendorCredits.refNumber, date: vendorCredits.date, name: vendors.displayName, qty: vendorCreditLines.quantity, amount: vendorCreditLines.amount, status: vendorCredits.status })
+    .from(vendorCreditLines)
+    .innerJoin(vendorCredits, eq(vendorCredits.id, vendorCreditLines.vendorCreditId))
+    .leftJoin(vendors, eq(vendors.id, vendorCredits.vendorId))
+    .where(and(eq(vendorCredits.companyId, c), eq(vendorCreditLines.itemId, itemId)))) {
+    tx.push({ type: 'Vendor Credit', path: 'vendor-credits', id: r.id, number: r.number, date: r.date, name: r.name, quantity: r.status === 'void' || r.qty == null ? '0.0000' : neg(r.qty), amount: r.amount, status: r.status });
   }
   for (const r of await ctx.db
     .select({ id: itemReceipts.id, number: itemReceipts.reference, date: itemReceipts.date, name: vendors.displayName, qty: itemReceiptLines.quantity, amount: itemReceiptLines.amount, status: itemReceipts.status })
@@ -189,13 +215,72 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
     .where(and(eq(salesOrders.companyId, c), eq(salesOrderLines.itemId, itemId)))) {
     tx.push({ type: 'Sales Order', path: 'sales-orders', id: r.id, number: String(r.number), date: r.date, name: r.name, quantity: '0.0000', amount: r.amount, status: r.status });
   }
-  // Adjustments, opening stock, physical counts and FIFO receipts post with sourceRef item:<id>.
+  // Build / unbuild assemblies (the item as a component or as the assembly): its site movements.
   for (const r of await ctx.db
+    .select({
+      id: inventoryMovements.sourceId,
+      sourceType: inventoryMovements.sourceType,
+      date: sql<Date>`MIN(${inventoryMovements.date})`,
+      qty: sql<string>`COALESCE(SUM(${inventoryMovements.quantity}), 0)`,
+    })
+    .from(inventoryMovements)
+    .where(
+      and(
+        eq(inventoryMovements.companyId, c),
+        eq(inventoryMovements.itemId, itemId),
+        inArray(inventoryMovements.sourceType, ['build', 'unbuild']),
+      ),
+    )
+    .groupBy(inventoryMovements.sourceId, inventoryMovements.sourceType)) {
+    if (!r.id) continue;
+    tx.push({ type: r.sourceType === 'build' ? 'Build Assembly' : 'Unbuild Assembly', path: null, id: r.id, number: null, date: new Date(r.date), name: null, quantity: new Decimal(r.qty).toFixed(4), amount: null, status: null });
+  }
+  // Adjustments, opening stock, physical counts and FIFO receipts post with sourceRef item:<id>.
+  // The quantity each moved: its site movement (Adjust Quantity), else what its audit row records
+  // (physical count, opening stock, FIFO consumption); value-only entries move none.
+  const adjustmentEntries = await ctx.db
     .select({ id: journalEntries.id, number: journalEntries.entryNumber, date: journalEntries.date, description: journalEntries.description, status: journalEntries.status })
     .from(journalEntries)
     .where(and(eq(journalEntries.companyId, c), eq(journalEntries.sourceRef, `item:${itemId}`)))
-    .orderBy(desc(journalEntries.date))) {
-    tx.push({ type: 'Inventory Adjustment', path: 'journal', id: r.id, number: String(r.number), date: r.date, name: r.description, quantity: '0.0000', amount: null, status: r.status });
+    .orderBy(desc(journalEntries.date));
+  const movedBy = new Map<string, Decimal>();
+  if (adjustmentEntries.length > 0) {
+    for (const m of await ctx.db
+      .select({ sourceId: inventoryMovements.sourceId, qty: sql<string>`COALESCE(SUM(${inventoryMovements.quantity}), 0)` })
+      .from(inventoryMovements)
+      .where(
+        and(
+          eq(inventoryMovements.companyId, c),
+          eq(inventoryMovements.itemId, itemId),
+          eq(inventoryMovements.sourceType, 'adjustment'),
+          sql`${inventoryMovements.reversalOfId} IS NULL`,
+        ),
+      )
+      .groupBy(inventoryMovements.sourceId)) {
+      if (m.sourceId) movedBy.set(m.sourceId, new Decimal(m.qty));
+    }
+    const num = (v: unknown) => (typeof v === 'string' || typeof v === 'number' ? new Decimal(v) : null);
+    for (const a of await ctx.db
+      .select({ oldValues: auditLogs.oldValues, newValues: auditLogs.newValues })
+      .from(auditLogs)
+      .where(and(eq(auditLogs.companyId, c), eq(auditLogs.entityType, 'item'), eq(auditLogs.entityId, itemId)))) {
+      const nv = (a.newValues ?? {}) as Record<string, unknown>;
+      const ov = (a.oldValues ?? {}) as Record<string, unknown>;
+      const opening = nv.openingStock as Record<string, unknown> | undefined;
+      const newQty = num(nv.quantityOnHand);
+      const oldQty = num(ov.quantityOnHand);
+      if (typeof nv.postedEntryId === 'string' && newQty && oldQty) {
+        if (!movedBy.has(nv.postedEntryId)) movedBy.set(nv.postedEntryId, newQty.minus(oldQty));
+      } else if (typeof nv.entryId === 'string' && num(nv.quantityConsumed)) {
+        if (!movedBy.has(nv.entryId)) movedBy.set(nv.entryId, num(nv.quantityConsumed)!.negated());
+      } else if (opening && typeof opening.entryId === 'string' && num(opening.quantity)) {
+        if (!movedBy.has(opening.entryId)) movedBy.set(opening.entryId, num(opening.quantity)!);
+      }
+    }
+  }
+  for (const r of adjustmentEntries) {
+    const moved = r.status === 'posted' ? movedBy.get(r.id) : undefined;
+    tx.push({ type: 'Inventory Adjustment', path: 'journal', id: r.id, number: String(r.number), date: r.date, name: r.description, quantity: moved ? moved.toFixed(4) : '0.0000', amount: null, status: r.status });
   }
 
   tx.sort((a, b) => b.date.getTime() - a.date.getTime());

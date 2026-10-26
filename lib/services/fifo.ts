@@ -639,7 +639,7 @@ export async function consumeStock(
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: input.memo ?? (isAdjustment ? `Inventory adjustment — ${item.name}` : `FIFO COGS — item ${input.itemId}`),
+      description: input.memo ?? (isAdjustment ? `Inventory adjustment — ${item.name}` : `Cost of goods sold — ${item.name}`),
       lines: [
         {
           accountId: cogsAccountId,

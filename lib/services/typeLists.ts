@@ -68,9 +68,11 @@ async function validateInput(ctx: ServiceContext, kind: TypeListKind, input: Typ
 }
 
 export async function createType(ctx: ServiceContext, kind: TypeListKind, input: TypeListInput) {
-  const v = await validateInput(ctx, kind, input);
   const t = tableFor(kind);
+  // The duplicate-name check runs in the same transaction as the insert (a double-submitted
+  // "New" must not add the type twice — the table has no unique index to stop it).
   return inTransaction(ctx, async (tx) => {
+    const v = await validateInput(tx, kind, input);
     const [row] = await tx.db
       .insert(t)
       .values({ companyId: tx.companyId, ...v, isActive: input.isActive ?? true })
@@ -81,10 +83,10 @@ export async function createType(ctx: ServiceContext, kind: TypeListKind, input:
 }
 
 export async function updateType(ctx: ServiceContext, kind: TypeListKind, id: string, input: TypeListInput) {
-  const before = await loadType(ctx, kind, id);
-  const v = await validateInput(ctx, kind, input, id);
   const t = tableFor(kind);
   return inTransaction(ctx, async (tx) => {
+    const before = await loadType(tx, kind, id);
+    const v = await validateInput(tx, kind, input, id);
     const [row] = await tx.db
       .update(t)
       .set({ ...v, isActive: input.isActive ?? before.isActive })

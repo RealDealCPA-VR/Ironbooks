@@ -372,9 +372,11 @@ export async function createEntry(ctx: ServiceContext, key: SimpleListKey, body:
   await ensureSeeded(ctx, key);
   const def = DEFS[key];
   let data = parse(def, body, false);
-  if (def.finalize) data = await def.finalize(ctx, data);
-  await assertUniqueName(ctx, def, String(data[def.nameField]));
+  // The duplicate-name check runs in the same transaction as the insert: a double-submitted
+  // "New" must get the plain "already on the list" message, not the unique index's raw error.
   return inTransaction(ctx, async (tx) => {
+    if (def.finalize) data = await def.finalize(tx, data);
+    await assertUniqueName(tx, def, String(data[def.nameField]));
     const inserted = (await tx.db
       .insert(def.table)
       .values({ ...data, companyId: tx.companyId, isActive: data.isActive ?? true })
@@ -386,6 +388,11 @@ export async function createEntry(ctx: ServiceContext, key: SimpleListKey, body:
 }
 
 export async function updateEntry(ctx: ServiceContext, key: SimpleListKey, id: string, body: unknown): Promise<Row> {
+  // Read, check and write in one transaction (a rename racing another save of the list).
+  return inTransaction(ctx, (tx) => updateEntryInTx(tx, key, id, body));
+}
+
+async function updateEntryInTx(ctx: ServiceContext, key: SimpleListKey, id: string, body: unknown): Promise<Row> {
   const def = DEFS[key];
   const before = await getEntry(ctx, key, id);
   const patch = parse(def, body, true);
