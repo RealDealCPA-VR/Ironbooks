@@ -30,6 +30,8 @@ import {
   customers,
   jobs,
   inventoryLayers,
+  inventorySites,
+  itemSiteSettings,
   salesOrders,
   salesOrderLines,
   purchaseOrders,
@@ -307,21 +309,35 @@ export async function setReorderPoint(
     stored = value.toFixed(4);
   }
 
-  const [row] = await ctx.db
-    .update(items)
-    .set({ reorderPoint: stored, updatedAt: new Date() })
-    .where(and(eq(items.companyId, ctx.companyId), eq(items.id, itemId)))
-    .returning();
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .update(items)
+      .set({ reorderPoint: stored, updatedAt: new Date() })
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, itemId)))
+      .returning();
+    // The item's reorder point is the default site's (Inventory Sites › Reorder Points): keep a
+    // default-site settings row, when there is one, showing the same value.
+    await tx.db
+      .update(itemSiteSettings)
+      .set({ reorderPoint: stored, updatedAt: new Date() })
+      .where(
+        and(
+          eq(itemSiteSettings.companyId, tx.companyId),
+          eq(itemSiteSettings.itemId, itemId),
+          sql`${itemSiteSettings.siteId} IN (SELECT ${inventorySites.id} FROM ${inventorySites} WHERE ${inventorySites.companyId} = ${tx.companyId} AND ${inventorySites.isDefault})`,
+        ),
+      );
 
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'item',
-    entityId: itemId,
-    oldValues: { reorderPoint: before.reorderPoint },
-    newValues: { reorderPoint: stored },
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'item',
+      entityId: itemId,
+      oldValues: { reorderPoint: before.reorderPoint },
+      newValues: { reorderPoint: stored },
+    });
+
+    return row;
   });
-
-  return row;
 }
 
 // ---------------------------------------------------------------------------

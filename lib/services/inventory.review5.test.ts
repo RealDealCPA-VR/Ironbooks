@@ -41,14 +41,15 @@ import { createType, listTypes, updateType } from './typeLists';
 import { createUomSet, listUomSets, updateUomSet } from './lists/uom';
 import { createBillingRateLevel, listBillingRateLevels } from './lists/billingRates';
 import { auditLogs, companies, customers as customersTable } from '@/lib/db/schema';
-import { physicalCount } from './inventoryOps';
 import { inventoryCenterList } from './lists/inventoryCenter';
 import { bulkLoad, bulkSave } from './lists/bulk';
 import { createAccount } from './accounts';
 import { withVersionCheck } from './concurrency';
 import { createInventoryTransfer, voidInventoryTransfer } from './inventoryTransfers';
 import { listSites, siteQuantities } from './inventorySites';
-import { quantityOnHandBySite, serialLotInStock, transactionsBySerialLot } from './inventorySiteReports';
+import { quantityOnHandBySite, reorderBySite, serialLotInStock, transactionsBySerialLot } from './inventorySiteReports';
+import { listSiteReorderPoints, setSiteReorderPoint } from './inventorySiteOps';
+import { physicalCount, reorderReport } from './inventoryOps';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-inventory-review5');
 let db: DB;
@@ -857,6 +858,26 @@ describe('review5 inventory', () => {
     expect((await itemRow(a.id)).quantityOnHand).toBe('6.0000');
     expect(await gl('1300')).toBe('12.00');
     expect((await inventoryValuation(ctx)).grandTotal).toBe('12.00');
+  });
+
+  it("sites: the default site's reorder point IS the item's reorder point (both screens, both reorder reports agree)", async () => {
+    const def = (await listSites(ctx)).find((s) => s.isDefault)!;
+    const a = await invItem('Reorder sync widget');
+    await adjustInventory(ctx, { itemId: a.id, quantityChange: 10, unitCost: '1.00', date: d('2026-01-02') });
+    await setReorderPoint(ctx, a.id, 5); // Edit Item
+    // Inventory Sites › Reorder Points shows that reorder point on the default site...
+    const shown = await listSiteReorderPoints(ctx, { itemId: a.id });
+    expect(shown.find((r) => r.siteId === def.id)?.reorderPoint).toBe('5.0000');
+    // ...and a reorder point typed there for the default site is the item's reorder point.
+    await setSiteReorderPoint(ctx, { itemId: a.id, siteId: def.id, reorderPoint: '20', maxQuantity: '40' });
+    expect((await itemRow(a.id)).reorderPoint).toBe('20.0000');
+    expect((await reorderReport(ctx)).rows.map((r) => r.id)).toContain(a.id);
+    expect((await reorderBySite(ctx)).rows.map((r) => r.itemId)).toContain(a.id);
+    // Edit Item changes it back for both.
+    await setReorderPoint(ctx, a.id, 2);
+    expect((await listSiteReorderPoints(ctx, { itemId: a.id })).find((r) => r.siteId === def.id)?.reorderPoint).toBe('2.0000');
+    expect((await reorderReport(ctx)).rows.map((r) => r.id)).not.toContain(a.id);
+    expect((await reorderBySite(ctx)).rows.map((r) => r.itemId)).not.toContain(a.id);
   });
 
   it('Transactions by Serial/Lot Number names checks and vendor credits (label and number)', async () => {

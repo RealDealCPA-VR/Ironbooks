@@ -573,7 +573,8 @@ function ReorderTab({ items, sites }: { items: Item[]; sites: Site[] }) {
       <p className="mb-4 text-sm text-navy/60">
         Each site can have its own reorder point. When a site&apos;s available stock falls to its reorder
         point it appears on the <Link className="text-electric underline" href="/reports/inventory-sites">Reorder by Site</Link>{' '}
-        report, with a suggested order up to the max level (or twice the reorder point).
+        report, with a suggested order up to the max level (or twice the reorder point). The default
+        site&apos;s reorder point is the item&apos;s own reorder point (Edit Item, the reorder list).
       </p>
       <div className="mb-4 w-80">
         <Label htmlFor="rp-item">Item</Label>

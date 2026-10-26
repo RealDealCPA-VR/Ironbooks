@@ -230,9 +230,10 @@ export async function stockStatusBySite(
     for (const it of itemRows) {
       const onHand = qty.get(it.id)?.get(site.id) ?? Money.zero();
       const setting = settingFor.get(`${it.id}|${site.id}`);
-      // The default site falls back to the item-level reorder point when it has no site setting.
-      const reorderRaw = setting?.reorderPoint ?? (site.id === defaultSite.id ? it.reorderPoint : null);
       const isDefault = site.id === defaultSite.id;
+      // The default site's reorder point IS the item's reorder point (the reorder list and Create
+      // Purchase Orders use it; inventorySiteOps keeps both screens on it); other sites have their own.
+      const reorderRaw = isDefault ? it.reorderPoint : (setting?.reorderPoint ?? null);
       const committed = isDefault ? (committedBy.get(it.id) ?? Money.zero()) : Money.zero();
       const onPO = isDefault ? (onPoBy.get(it.id) ?? Money.zero()) : Money.zero();
       if (onHand.isZero() && !reorderRaw && committed.isZero() && onPO.isZero()) continue;
