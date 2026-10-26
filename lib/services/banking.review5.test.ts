@@ -1069,3 +1069,13 @@ describe('linking a bank account to the right kind of GL account', () => {
     expect(loan.accountId).toBe(acct['2300']);
   });
 });
+
+describe('CSV import: a day that does not exist', () => {
+  it('is refused instead of being rolled into the next month (with or without a date format)', () => {
+    const csv = 'Date,Description,Amount\n02/30/2026,Coffee,-4.50\n';
+    expect(() => parseCSV(csv, { dateCol: 'Date', descriptionCol: 'Description', amountCol: 'Amount' })).toThrow(/cannot parse date/);
+    expect(() => parseCSV('Date,Description,Amount\n31/02/2026,Coffee,-4.50\n', { dateCol: 'Date', descriptionCol: 'Description', amountCol: 'Amount', dateFormat: 'DD/MM/YYYY' })).toThrow(/cannot parse date/);
+    const ok = parseCSV('Date,Description,Amount\n02/28/2026,Coffee,-4.50\n', { dateCol: 'Date', descriptionCol: 'Description', amountCol: 'Amount' });
+    expect(ok[0].date.toISOString().slice(0, 10)).toBe('2026-02-28');
+  });
+});

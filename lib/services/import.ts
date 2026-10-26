@@ -406,7 +406,20 @@ function parseWithFormat(rawDate: string, format: string): Date {
     else if (t.startsWith('Y')) year = raw.length === 2 ? 2000 + v : v;
   }
   if (month < 1 || month > 12 || day < 1 || day > 31) return new Date(NaN);
-  return new Date(Date.UTC(year, month - 1, day));
+  const out = new Date(Date.UTC(year, month - 1, day));
+  // A day the month doesn't have (31/02/2026) used to roll over into the next month.
+  return out.getUTCMonth() === month - 1 ? out : new Date(NaN);
+}
+
+/** `d` unless the M/D/Y or Y-M-D digits printed in `raw` name a day that does not exist. */
+function realDayOrInvalid(raw: string, d: Date): Date {
+  const s = raw.trim();
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)/.exec(s);
+  const us = /^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})(?!\d)/.exec(s);
+  const [y, m, day] = iso ? [Number(iso[1]), Number(iso[2]), Number(iso[3])] : us ? [Number(us[3]), Number(us[1]), Number(us[2])] : [0, 0, 0];
+  if (!m) return d;
+  const check = new Date(Date.UTC(y < 100 ? 2000 + y : y, m - 1, day));
+  return check.getUTCMonth() === m - 1 && check.getUTCDate() === day ? d : new Date(NaN);
 }
 
 /**
@@ -492,7 +505,8 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
     // are not silently misread by the engine's locale-dependent Date parser.
     const rawDate = col(mapping.dateCol);
     if (!rawDate) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing date value.`);
-    const date = mapping.dateFormat ? parseWithFormat(rawDate, mapping.dateFormat) : parseLooseDate(rawDate);
+    // An impossible day ("02/30/2026") is refused: the engine rolled it over to March 2.
+    const date = mapping.dateFormat ? parseWithFormat(rawDate, mapping.dateFormat) : realDayOrInvalid(rawDate, parseLooseDate(rawDate));
     if (isNaN(date.getTime())) {
       throw new ServiceError('VALIDATION', `CSV row ${i + 1}: cannot parse date "${rawDate}".`);
     }
