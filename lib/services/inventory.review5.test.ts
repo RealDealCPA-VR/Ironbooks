@@ -423,7 +423,7 @@ describe('review5 inventory', () => {
     try {
       vi.setSystemTime(new Date('2027-01-01T03:00:00.000Z')); // 10 pm on Dec 31 in New York
       const res = await createPurchaseOrdersFromReorder(ctx, {});
-      poId = (res.purchaseOrders[0] as { purchaseOrderId: string }).purchaseOrderId;
+      poId = (res.purchaseOrders[0] as unknown as { purchaseOrderId: string }).purchaseOrderId;
     } finally {
       vi.useRealTimers();
       process.env.TZ = prevTz;
@@ -734,6 +734,58 @@ describe('review5 inventory', () => {
     const q = await siteQuantities(ctx, [p.id]);
     expect(q.get(p.id)?.get(annex.id)?.toFixed(4)).toBe('1.0000');
     expect((await verifySiteInvariants(ctx)).allOk).toBe(true);
+  });
+
+  it('selling average-cost stock that carries no cost is refused with a plain message on every sales form', async () => {
+    const a = await invItem('Free giveaway');
+    await adjustInventory(ctx, { itemId: a.id, quantityChange: 5, unitCost: '0', date: d('2026-01-02') });
+    const c = await createCustomer(ctx, { displayName: 'Giveaway buyer' } as never);
+    const sale = { customerId: c.id, date: d('2026-01-05'), depositAccountId: acct['1000'], lines: [{ itemId: a.id, quantity: 1, rate: '5.00' }] };
+    await expect(createSalesReceipt(ctx, sale as never)).rejects.toThrow(/has no (average )?cost/);
+    // An average so small that one unit is worth less than a cent: the same plain message.
+    const b = await invItem('Tiny washer');
+    await adjustInventory(ctx, { itemId: b.id, quantityChange: 1, unitCost: '0.0001', date: d('2026-01-02') });
+    await expect(
+      createInvoice(ctx, { customerId: c.id, date: d('2026-01-05'), lines: [{ itemId: b.id, quantity: 1, rate: '1.00' }] } as never),
+    ).rejects.toThrow(/has no (average )?cost/);
+    expect((await itemRow(a.id)).quantityOnHand).toBe('5.0000');
+  });
+
+  it('Build Assemblies window: the build is dated by its Date field (back-dated builds), as in QB', () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), 'app/assemblies/page.tsx'), 'utf8');
+    expect(src).toMatch(/id="build-date"[\s\S]{0,200}type="date"|type="date"[\s\S]{0,200}id="build-date"/);
+    const call = (url: string) => {
+      const at = src.indexOf(`api.post${url.includes('pending') ? '<{ build: PendingBuild }>' : ''}('${url}'`);
+      expect(at, url).toBeGreaterThan(0);
+      return src.slice(at, src.indexOf('});', at));
+    };
+    expect(call('/api/assemblies/build')).toMatch(/date: buildDate/);
+    expect(call('/api/assemblies/pending')).toMatch(/date: buildDate/);
+  });
+
+  it('Vendor Credit window: the Items tab lists the items and carries site / serial / lot detail', () => {
+    // GET /api/items answers { items: [...] } (app/api/items/route.ts), not a bare array.
+    const route = fs.readFileSync(path.resolve(process.cwd(), 'app/api/items/route.ts'), 'utf8');
+    expect(route).toMatch(/NextResponse\.json\(\{ items: rows \}\)/);
+    const src = fs.readFileSync(path.resolve(process.cwd(), 'app/vendor-credits/page.tsx'), 'utf8');
+    expect(src).not.toMatch(/api\.get<Named\[\]>\('\/api\/items'\)/);
+    expect(src).toMatch(/api\.get<\{ items: Named\[\] \}>\('\/api\/items'\)/);
+    // Returned units of serial / lot items and of other sites: the line's Advanced Inventory fields.
+    expect(src).toMatch(/<InventoryLineFields[\s\S]{0,300}direction="out"/);
+    expect(src).toMatch(/\.\.\.inventoryLinePayload\(l\.inv\)/);
+    expect(src).toMatch(/inv: invFromLine\(l\)/);
+  });
+
+  it('items: two saves at once cannot give two items the same name or barcode (checked in the save transaction)', async () => {
+    const a = await invItem('Twin A');
+    const b = await invItem('Twin B');
+    await expectOneCreated(await Promise.allSettled([updateItem(ctx, a.id, { name: 'Twin' }), updateItem(ctx, b.id, { name: 'Twin' })]));
+    const named = (await db.select().from(itemsTable).where(eq(itemsTable.companyId, ctx.companyId))).filter((i) => i.name === 'Twin');
+    expect(named).toHaveLength(1);
+    // Barcodes have a unique index: the loser got the raw index error (HTTP 500), not the plain message.
+    await expectOneCreated(
+      await Promise.allSettled([updateItem(ctx, a.id, { barcode: '0042' }), updateItem(ctx, b.id, { barcode: '0042' })]),
+    );
   });
 
   it('Transactions by Serial/Lot Number names checks and vendor credits (label and number)', async () => {

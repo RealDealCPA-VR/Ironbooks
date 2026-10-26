@@ -273,6 +273,9 @@ export default function AssembliesPage() {
   // Build/unbuild
   const [buildQty, setBuildQty] = useState('1');
   const [buildAction, setBuildAction] = useState<'build' | 'unbuild'>('build');
+  // QB Build Assemblies has a Date: builds entered after the fact are dated when they happened
+  // (the inventory valuation as of month-end depends on it). Default: today's local date.
+  const [buildDate, setBuildDate] = useState(() => todayISO());
   const [building, setBuilding] = useState(false);
   // Advanced Inventory: build site (+ bin / serials / lot of the finished assemblies).
   const adv = useAdvancedInventory(true);
@@ -402,6 +405,7 @@ export default function AssembliesPage() {
         assemblyItemId: selectedAssemblyId,
         quantity: buildQty,
         action: buildAction,
+        date: buildDate || undefined,
         ...inventoryLinePayload(buildInv),
       });
       const verb = buildAction === 'build' ? 'Built' : 'Unbuilt';
@@ -432,7 +436,7 @@ export default function AssembliesPage() {
       const data = await api.post<{ build: PendingBuild }>('/api/assemblies/pending', {
         assemblyItemId: selectedAssemblyId,
         quantity: buildQty,
-        date: todayISO(),
+        date: buildDate || todayISO(),
       });
       setPendingRefresh((n) => n + 1);
       toast(
@@ -645,6 +649,16 @@ export default function AssembliesPage() {
                   <option value="build">Build</option>
                   <option value="unbuild">Unbuild</option>
                 </Select>
+              </div>
+
+              <div className="w-44">
+                <Label htmlFor="build-date">Date</Label>
+                <Input
+                  id="build-date"
+                  type="date"
+                  value={buildDate}
+                  onChange={(e) => setBuildDate(e.target.value)}
+                />
               </div>
 
               <div className="w-40">

@@ -28,6 +28,13 @@ import { todayISO } from '@/lib/dates';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import {
+  type InvDetail,
+  InventoryLineFields,
+  invFromLine,
+  inventoryLinePayload,
+  useAdvancedInventory,
+} from '@/components/inventory/AdvancedInventory';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -89,6 +96,8 @@ interface ItemLine {
   classId: string;
   customerId: string;
   jobId: string;
+  /** Advanced Inventory: site / bin / serial numbers / lot of the units returned. */
+  inv?: InvDetail;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +151,7 @@ interface Named {
   name?: string;
   displayName?: string;
   type?: string;
+  trackingMode?: string | null;
   customerId?: string | null;
   purchaseCost?: string | null;
   averageCost?: string | null;
@@ -157,6 +167,11 @@ interface SavedLine {
   classId: string | null;
   customerId: string | null;
   jobId: string | null;
+  siteId?: string | null;
+  binId?: string | null;
+  serialNumbers?: string[] | null;
+  lotNumber?: string | null;
+  lotExpiration?: string | null;
 }
 
 /** QB Enter Bills (Credit): Expenses and Items tabs, Ref. No., Class and Customer:Job per line. */
@@ -178,18 +193,22 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
   const [classList, setClassList] = useState<Named[]>([]);
   const [customerList, setCustomerList] = useState<Named[]>([]);
   const [jobList, setJobList] = useState<Named[]>([]);
+  // Advanced Inventory: sites / bins for the Items tab (serial / lot / site of returned units).
+  const adv = useAdvancedInventory(open);
 
   // Lists for the Items tab and the Class / Customer:Job columns.
   useEffect(() => {
     if (!open) return;
     const soft = <T,>(p: Promise<T>, fb: T) => p.catch(() => fb);
     Promise.all([
-      soft(api.get<Named[]>('/api/items'), []),
+      // GET /api/items answers { items: [...] } (a bare array was expected: the Items tab was empty).
+      soft(api.get<{ items: Named[] }>('/api/items'), { items: [] as Named[] }),
       soft(api.get<Named[]>('/api/classes'), []),
       soft(api.get<Named[]>('/api/customers'), []),
       soft(api.get<Named[]>('/api/jobs'), []),
     ]).then(([it, cl, cu, jb]) => {
-      setItemList(Array.isArray(it) ? it.filter((i) => !['subtotal', 'discount', 'payment', 'sales_tax', 'group'].includes(i.type ?? '')) : []);
+      const itemRows = Array.isArray(it?.items) ? it.items : [];
+      setItemList(itemRows.filter((i) => !['subtotal', 'discount', 'payment', 'sales_tax', 'group'].includes(i.type ?? '')));
       setClassList(Array.isArray(cl) ? cl : []);
       setCustomerList(Array.isArray(cu) ? cu : []);
       setJobList(Array.isArray(jb) ? jb : []);
@@ -245,6 +264,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
                 unitCost: l.unitCost ? String(Number(l.unitCost)) : '',
                 amount: l.amount,
                 ...dims(l),
+                inv: invFromLine(l),
               }))
             : [{ ...EMPTY_ITEM_LINE }],
         );
@@ -283,6 +303,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
         if (i !== idx) return l;
         const next: ItemLine = { ...l, [field]: value, ...(field === 'customerId' ? { jobId: '' } : {}) };
         if (field === 'itemId') {
+          next.inv = undefined; // site / serials / lot belong to the item that was picked
           const it = itemList.find((x) => x.id === value);
           next.unitCost = it?.purchaseCost ? String(Number(it.purchaseCost)) : next.unitCost;
           if (!next.description) next.description = it?.name ?? '';
@@ -347,6 +368,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
             amount: l.amount || null,
             description: l.description || null,
             ...dims(l),
+            ...inventoryLinePayload(l.inv),
           })),
         ],
         ...(vendorCur && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
@@ -575,6 +597,16 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
                   >
                     <MinusCircle className="h-4 w-4" />
                   </button>
+                  {/* Returned units: the site they leave from, and their serial numbers / lot. */}
+                  <InventoryLineFields
+                    className="col-span-full"
+                    adv={adv}
+                    item={itemList.find((it) => it.id === line.itemId)}
+                    quantity={line.quantity}
+                    direction="out"
+                    value={line.inv}
+                    onChange={(inv) => setItemLines((p) => p.map((l, i) => (i === idx ? { ...l, inv } : l)))}
+                  />
                 </div>
               ))}
               <p className="px-3 py-2 text-xs text-navy/50">

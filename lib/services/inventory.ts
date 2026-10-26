@@ -671,6 +671,14 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
   // Selling the last units also relieves the value remainder (the GL then holds exactly $0).
   const sellOut = sellOutRelief(item, newQty, atAverage);
   const cogsAmount = accountantCost ? Money.round2(accountantCost) : sellOut.relief;
+  if (!cogsAmount.greaterThan(0)) {
+    // A sale is reversed through its COGS entry (void / edit put the units back from it), and a $0
+    // entry cannot be posted: refuse plainly (every sales form), as fifo.ts does for FIFO units —
+    // not with the ledger's "a line must have a debit or a credit".
+    throw validation(
+      `Inventory item "${item.name}" has no cost in the units it would sell. Receive stock with a unit cost (bill or inventory adjustment) before selling it.`,
+    );
+  }
   const newAvgCost =
     accountantCost && !cogsAmount.equals(atAverage)
       ? averageAfter(currentQty, avgCost, newQty, cogsAmount.negated())

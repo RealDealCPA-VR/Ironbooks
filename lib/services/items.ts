@@ -418,6 +418,13 @@ async function assertAssetAccountChangeAllowed(
  * uniqueness (if being changed) and account-link types.
  */
 export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateItemInput) {
+  // Read, check and write in ONE transaction (as createItem does): two saves at once must not
+  // both pass the unique-name / barcode checks (two items named alike, or the barcode index's raw
+  // error), and the change and its audit row are written together.
+  return inTransaction(ctx, (tx) => updateItemInTx(tx, id, patch));
+}
+
+async function updateItemInTx(ctx: ServiceContext, id: string, patch: UpdateItemInput) {
   const before = await getItem(ctx, id);
   await assertAccountantListEdit(ctx, 'item', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
   // Making an item inactive (PATCH isActive: false) is deleting it: refused like deactivateItem
