@@ -585,10 +585,9 @@ async function saveItemReceipt(
     if (unitCost.isNegative()) {
       throw validation(`Line ${i + 1}: unit cost cannot be negative.`);
     }
+    // A $0 line (items received at no charge — a no-charge line of a purchase order) stocks the
+    // units at $0 and posts nothing; the receipt's total must still be more than zero (below).
     const amount = Money.round2(qty.times(unitCost));
-    if (!amount.greaterThan(0)) {
-      throw validation(`Line ${i + 1}: line amount (quantity x unit cost) must be greater than zero.`);
-    }
 
     const isInventory = item.type === 'inventory';
     let accountId: string;
@@ -618,6 +617,9 @@ async function saveItemReceipt(
       isInventory,
     });
     total = total.plus(amount);
+  }
+  if (!total.greaterThan(0)) {
+    throw validation('The item receipt total must be more than zero (quantity x unit cost on at least one line).');
   }
   const totalStr = toAmountString(total);
 
@@ -708,11 +710,14 @@ async function saveItemReceipt(
       reference: input.reference ?? null,
       sourceRef: `item_receipt:${receipt.id}`,
       lines: [
-        ...resolved.map((l) => ({
-          accountId: l.accountId,
-          debit: l.amount,
-          memo: l.description,
-        })),
+        // A $0 no-charge line posts nothing.
+        ...resolved
+          .filter((l) => Money.gt(l.amount, 0))
+          .map((l) => ({
+            accountId: l.accountId,
+            debit: l.amount,
+            memo: l.description,
+          })),
         {
           accountId: accrualAccountId,
           credit: totalStr,
