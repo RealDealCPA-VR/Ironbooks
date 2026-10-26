@@ -72,3 +72,40 @@ describe('Budget vs. Actual by quarter', () => {
     expect(rent.cells[budCols[2].key]).toBe('0.00');
   });
 });
+
+/**
+ * Budget vs. Actual by Customer:Job reads the year's ledger lines up to a 50,000-line cap; past it
+ * the job's actuals were silently short (no truncated flag, so no note on the page).
+ */
+describe('Budget vs. Actual by Customer:Job on a large file', () => {
+  it('says its actuals are incomplete when the ledger read hits its cap', async () => {
+    const { runStandardReport } = await import('./reportRegistry');
+    const { GL_LIMITS } = await import('./reportEngine');
+    const { createCustomer } = await import('./customers');
+    const { postJournalEntry } = await import('./posting');
+    const cust = await createCustomer(ctx, { displayName: 'Big Job' } as never);
+    for (let i = 1; i <= 3; i++) {
+      await postJournalEntry(ctx, {
+        date: new Date(`2026-0${i}-10T00:00:00.000Z`),
+        description: `job sale ${i}`,
+        lines: [
+          { accountId: A['1200'], debit: '10.00', entityType: 'customer', entityId: cust.id },
+          { accountId: A['4000'], credit: '10.00', entityType: 'customer', entityId: cust.id },
+        ],
+      } as never);
+    }
+    const b = await createBudget(ctx, { name: 'By job', fiscalYear: 2026 });
+    await setBudgetLine(ctx, { budgetId: b.id, accountId: A['4000'], month: 1, amount: '100.00', customerId: cust.id });
+    const saved = GL_LIMITS.maxLines;
+    try {
+      GL_LIMITS.maxLines = 2;
+      const r = await runStandardReport(ctx, 'budget-vs-actual-report', { budgetId: b.id, customerId: cust.id });
+      expect(r.truncated).toBe(true);
+      expect((r.notes ?? []).join(' ')).toMatch(/incomplete/i);
+    } finally {
+      GL_LIMITS.maxLines = saved;
+    }
+    const full = await runStandardReport(ctx, 'budget-vs-actual-report', { budgetId: b.id, customerId: cust.id });
+    expect(full.truncated ?? false).toBe(false);
+  });
+});

@@ -738,6 +738,8 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
   // Actual amounts (even slots).
   const yearFrom = fy.from;
   const yearTo = fy.to;
+  // A ledger read that hit its cap leaves the actuals short: the report must say so.
+  let truncated = false;
   if (isBs) {
     for (let i = 0; i < periods.length; i++) {
       const lastMonth = periods[i].months[periods[i].months.length - 1];
@@ -751,7 +753,7 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
     // The Customer:Job's income AND its job costs: an expense on a bill / check / vendor credit
     // is costed to the job on its document line (the posted line is named after the vendor), so
     // the lines are read unfiltered and given their job column like Profit & Loss by Job.
-    const { lines: gl } = await fetchGlLines(ctx, meta, {
+    const { lines: gl, truncated: cut } = await fetchGlLines(ctx, meta, {
       from: yearFrom,
       to: yearTo,
       sections: [...PL_SECTIONS],
@@ -759,6 +761,7 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
       classId: p.classId,
       limit: 50000,
     });
+    truncated = cut;
     const jobOf = await jobBucketOf(ctx, gl);
     for (const l of gl) if (jobOf(l) === p.customerId) addForMonth(l.accountId, l.date.getUTCMonth() + 1, 0, l.natural);
   } else {
@@ -805,5 +808,6 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
     subtitle: `${budget.name} · FY${year}`,
     columns,
     rows,
+    truncated,
   };
 }
