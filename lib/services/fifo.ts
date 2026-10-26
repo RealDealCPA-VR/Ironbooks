@@ -523,13 +523,7 @@ export interface ConsumptionRestore {
  * Writes the layers only; the caller voids the entry and puts the quantity back on hand.
  */
 export async function restoreConsumedStock(tx: ServiceContext, input: ConsumptionRestore): Promise<void> {
-  const qty = input.qty;
-  const value = Money.round2(input.value);
-  if (!qty.greaterThan(0)) return;
-  const fallback = async () => {
-    await insertLayersWorth(tx, { itemId: input.itemId, date: input.date, qty, value });
-  };
-
+  if (!input.qty.greaterThan(0)) return;
   const [audit] = await tx.db
     .select({ newValues: auditLogs.newValues })
     .from(auditLogs)
@@ -542,7 +536,26 @@ export async function restoreConsumedStock(tx: ServiceContext, input: Consumptio
       ),
     )
     .limit(1);
-  const recorded = (audit?.newValues as { layers?: unknown } | null | undefined)?.layers;
+  await restoreLayerDraws(tx, { ...input, recorded: (audit?.newValues as { layers?: unknown } | null | undefined)?.layers });
+}
+
+/**
+ * The core of restoreConsumedStock: put `qty` units worth `value` back into the layers a draw
+ * took them from (`recorded`: the ConsumedLayer list takeFromLayers returned, as stored in the
+ * audit trail), or — when the record is missing / no longer matches — into a new layer worth
+ * exactly `value`. Used by sales (consumeStock) and vendor-credit returns.
+ */
+export async function restoreLayerDraws(
+  tx: ServiceContext,
+  input: Omit<ConsumptionRestore, 'entryId'> & { recorded: unknown },
+): Promise<void> {
+  const qty = input.qty;
+  const value = Money.round2(input.value);
+  if (!qty.greaterThan(0)) return;
+  const fallback = async () => {
+    await insertLayersWorth(tx, { itemId: input.itemId, date: input.date, qty, value });
+  };
+  const recorded = input.recorded;
   if (!Array.isArray(recorded) || recorded.length === 0) return fallback();
   const draws: Array<{ layerId: string; take: Decimal; unitCost: Decimal }> = [];
   for (const r of recorded) {

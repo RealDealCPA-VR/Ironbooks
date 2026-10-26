@@ -22,7 +22,7 @@ import { createInvoice, updateInvoice, voidInvoice } from './invoices';
 import { createSalesReceipt, updateSalesReceipt, voidSalesReceipt } from './salesReceipts';
 import { createBill, voidBill } from './bills';
 import { createExpense } from './expenses';
-import { createVendorCredit } from './vendorCredits';
+import { createVendorCredit, updateVendorCredit, voidVendorCredit } from './vendorCredits';
 import { inventoryItemDetail } from './lists/inventoryCenter';
 import { createVendor } from './vendors';
 import { createItemReceipt, voidItemReceipt } from './itemReceipts';
@@ -285,6 +285,26 @@ describe('review5 inventory', () => {
     await voidInvoice(ctx, inv.id);
     const next = await consumeStock(ctx, { itemId: item, quantity: 12, date: d('2026-02-03') });
     expect(next.totalCOGS).toBe('14.00'); // 10 @ 1 + 2 @ 2
+  });
+
+  it('FIFO: re-saving an unchanged vendor credit keeps the cost it returned (units go back to their own layer)', async () => {
+    const item = await fifoItemWithTwoLayers('FIFO return');
+    const v = await createVendor(ctx, { displayName: 'Return supplier' } as never);
+    const input = { vendorId: v.id, date: d('2026-02-01'), lines: [{ itemId: item, quantity: '10', amount: '10.00' }] };
+    const vc = await createVendorCredit(ctx, input as never);
+    const cost = async () => {
+      const [row] = await db.execute(sql`SELECT cost_amount FROM vendor_credit_lines WHERE vendor_credit_id = ${vc.id}::uuid`).then(
+        (r) => ((r as unknown as { rows?: Array<{ cost_amount: string }> }).rows ?? []) as Array<{ cost_amount: string }>,
+      );
+      return row?.cost_amount;
+    };
+    expect(await cost()).toBe('10.00'); // the 10 @ 1.00 layer
+    await updateVendorCredit(ctx, vc.id, { ...input, memo: 'edited' } as never);
+    expect(await cost()).toBe('10.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+    await voidVendorCredit(ctx, vc.id);
+    const next = await consumeStock(ctx, { itemId: item, quantity: 10, date: d('2026-02-03') });
+    expect(next.totalCOGS).toBe('10.00');
   });
 
   // ---- FIFO: a layer is worth exactly what its document posted ----

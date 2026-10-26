@@ -49,7 +49,7 @@ import {
   voidJournalEntry,
 } from '@/lib/services/posting';
 import { receivePurchasedStock } from './bills';
-import { takeFromLayers } from './fifo';
+import { restoreLayerDraws, takeFromLayers } from './fifo';
 import { bookValueRelief, sellOutRelief } from './inventory';
 import { postDocumentInventory, reverseDocumentInventory } from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
@@ -299,6 +299,8 @@ async function relieveReturnedStock(
   itemId: string,
   qty: Decimal,
   reason: string,
+  /** The credit line's lineOrder: its FIFO draw is recorded with it, so a void / edit can put the units back. */
+  lineOrder?: number,
 ): Promise<Decimal> {
   const [item] = await tx.db
     .select()
@@ -321,7 +323,8 @@ async function relieveReturnedStock(
   const avgRelief = layer
     ? null
     : sellOutRelief(item, onHand.minus(qty), bookValueRelief(onHand, onHand.minus(qty), Money.of(item.averageCost ?? '0')));
-  const cost = layer ? (await takeFromLayers(tx, itemId, qty)).cost : avgRelief!.relief;
+  const taken = layer ? await takeFromLayers(tx, itemId, qty) : null;
+  const cost = taken ? taken.cost : avgRelief!.relief;
   const newQty = onHand.minus(qty);
   await tx.db
     .update(items)
@@ -338,7 +341,8 @@ async function relieveReturnedStock(
     entityType: 'item',
     entityId: itemId,
     oldValues: { quantityOnHand: item.quantityOnHand },
-    newValues: { quantityOnHand: newQty.toFixed(4), returnedCost: toAmountString(cost), reason },
+    // FIFO: the layers drawn, so restoreCreditStock puts the units back where they came from.
+    newValues: { quantityOnHand: newQty.toFixed(4), returnedCost: toAmountString(cost), reason, ...(taken ? { lineOrder: lineOrder ?? null, layers: taken.layers } : {}) },
   });
   return cost;
 }
@@ -353,7 +357,7 @@ async function relieveCreditStock(
   const costs = new Map<number, Decimal>();
   for (const [i, l] of prep.entries()) {
     if (!l.isInventory || !l.itemId || !l.quantity) continue;
-    costs.set(i, await relieveReturnedStock(tx, l.itemId, l.quantity, `vendor_credit:${creditId}`));
+    costs.set(i, await relieveReturnedStock(tx, l.itemId, l.quantity, `vendor_credit:${creditId}`, i));
   }
   if (costs.size > 0) {
     await postDocumentInventory(tx, {
@@ -380,11 +384,54 @@ async function restoreCreditStock(tx: ServiceContext, credit: typeof vendorCredi
     .where(eq(vendorCreditLines.vendorCreditId, credit.id));
   const inv = saved.filter((l) => l.itemId && l.costAmount != null && l.quantity != null && Money.gt(l.quantity, 0));
   if (inv.length === 0) return;
-  await receivePurchasedStock(
+  // FIFO returns go back into the layers they were taken from (their draw is on record): a new
+  // layer dated the credit would put them behind every receipt in between, so re-saving an
+  // unchanged credit returned other, dearer units (fifo.ts restoreLayerDraws).
+  const rest: typeof inv = [];
+  for (const l of inv) {
+    const [audit] = await tx.db
+      .select({ newValues: auditLogs.newValues })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, tx.companyId),
+          eq(auditLogs.entityType, 'item'),
+          eq(auditLogs.entityId, l.itemId!),
+          sql`${auditLogs.newValues}->>'reason' = ${`vendor_credit:${credit.id}`}`,
+          sql`${auditLogs.newValues}->>'lineOrder' = ${String(l.lineOrder)}`,
+        ),
+      )
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(1);
+    const recorded = (audit?.newValues as { layers?: unknown } | null | undefined)?.layers;
+    if (!Array.isArray(recorded)) {
+      rest.push(l);
+      continue;
+    }
+    const [item] = await tx.db
+      .select({ name: items.name, quantityOnHand: items.quantityOnHand })
+      .from(items)
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, l.itemId!)));
+    const qty = Money.of(l.quantity!);
+    await restoreLayerDraws(tx, {
+      itemId: l.itemId!,
+      itemName: item?.name ?? 'item',
+      qty,
+      value: Money.of(l.costAmount!),
+      date: credit.date,
+      action: 'vendor credit reversed',
+      recorded,
+    });
+    await tx.db
+      .update(items)
+      .set({ quantityOnHand: Money.of(item?.quantityOnHand ?? '0').plus(qty).toFixed(4), updatedAt: new Date() })
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, l.itemId!)));
+  }
+  if (rest.length > 0) await receivePurchasedStock(
     tx,
     `vendor_credit:${credit.id}`,
     credit.date,
-    inv.map((l) => ({
+    rest.map((l) => ({
       itemId: l.itemId,
       isInventory: true,
       quantity: Money.of(l.quantity!).toFixed(4),
