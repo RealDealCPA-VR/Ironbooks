@@ -30,6 +30,7 @@ import { getCompany } from '@/lib/services/company';
 import { vendor1099Worksheet } from '@/lib/services/statements';
 import type { ServiceContext } from './_base';
 import { ServiceError } from './_base';
+import { hasFlag } from './access';
 
 /** One 1099-NEC recipient: box 1 (nonemployee compensation) for the year. */
 export interface Nec1099Recipient {
@@ -144,6 +145,14 @@ export async function generate1099NecFile(
 ): Promise<string> {
   if (!Number.isInteger(year) || year < 1900 || year > 2100) {
     throw new ServiceError('VALIDATION', `Invalid year: ${year}`);
+  }
+  // The e-file is the IRS copy: every recipient's FULL tax ID. A user whose role hides SSNs / tax
+  // IDs got a file with "***-**-6789" in it — a filing the IRS rejects. Refuse instead.
+  if (!hasFlag(ctx, 'sensitivePayroll')) {
+    throw new ServiceError(
+      'FORBIDDEN',
+      "Creating the 1099-NEC e-file needs the \"View sensitive payroll data (full SSNs)\" permission: the file must carry each recipient's full tax ID. Ask your administrator to create it, or to add that permission to your role.",
+    );
   }
 
   // Resolve payer info from the company record.

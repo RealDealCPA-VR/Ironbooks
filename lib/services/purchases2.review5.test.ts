@@ -325,6 +325,29 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     await expectValidation(payCreditCard(ctx, { ...base, creditCardAccountId: acct['2100'], amount: '5.00', memo: [] as never }));
   });
 
+  it('F: the 1099-NEC e-file is never written with masked tax IDs (a Purchasing user is refused)', async () => {
+    const { BUILTIN_ROLES, unionRoles } = await import('@/lib/permissions/model');
+    const v = await newVendor({ is1099: true, taxId: '123-45-6789' });
+    await createExpense(ctx, {
+      vendorId: v.id,
+      date: d('2026-08-01'),
+      method: 'check',
+      paymentAccountId: acct['1000'],
+      lines: [{ accountId: acct['6300'], amount: '800.00' }],
+    });
+    const purchasing: ServiceContext = { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === 'purchasing')) };
+    const err = await generate1099NecFile(purchasing, { year: 2026 }).then(
+      (xml) => xml,
+      (e: unknown) => e,
+    );
+    // Before: the file carried "***-**-6789" as the TIN — a filing the IRS rejects.
+    expect(err).toBeInstanceOf(ServiceError);
+    expect((err as ServiceError).code).toBe('FORBIDDEN');
+    // A user who may see tax IDs gets the full TIN.
+    const full = await generate1099NecFile(ctx, { year: 2026 });
+    expect(full).toContain('<TaxId>123-45-6789</TaxId>');
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();
