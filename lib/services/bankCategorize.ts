@@ -13,10 +13,11 @@
  * IMPORTANT: GL writes happen ONLY through `postJournalEntry` (posting.ts).
  * All money arithmetic uses '@/lib/money'.
  */
-import { and, desc, eq, gte, isNotNull, lte, ne } from 'drizzle-orm';
+import { and, desc, eq, gte, isNotNull, lte, ne, or, sql } from 'drizzle-orm';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
+  auditLogs,
   bankAccounts,
   bankCategorizationHistory,
   bankTransactions,
@@ -804,6 +805,130 @@ export async function restoreExcluded(ctx: ServiceContext, bankTransactionId: st
 
     return updated;
   });
+}
+
+// ---------------------------------------------------------------------------
+// Matched lines follow their transaction (void / edit)
+// ---------------------------------------------------------------------------
+
+/**
+ * The posted entry that replaced `entryId` when its document was edited (void + re-post): the
+ * document's audit row names the old and new postedEntryId, a journal entry edit names
+ * `replacedBy`. Follows a few edits in a row; null when the entry was simply voided.
+ */
+async function replacementEntry(ctx: ServiceContext, entryId: string): Promise<string | null> {
+  let cur = entryId;
+  for (let hop = 0; hop < 10; hop++) {
+    const [row] = await ctx.db
+      .select({ next: sql<string | null>`COALESCE(${auditLogs.newValues}->>'replacedBy', ${auditLogs.newValues}->>'postedEntryId')` })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, ctx.companyId),
+          eq(auditLogs.action, 'update'),
+          or(
+            and(eq(auditLogs.entityType, 'journal_entry'), eq(auditLogs.entityId, cur), sql`${auditLogs.newValues}->>'replacedBy' IS NOT NULL`),
+            and(
+              sql`${auditLogs.oldValues}->>'postedEntryId' = ${cur}`,
+              sql`${auditLogs.newValues}->>'postedEntryId' IS NOT NULL`,
+              sql`${auditLogs.newValues}->>'postedEntryId' <> ${cur}`,
+            ),
+          ),
+        ),
+      )
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(1);
+    const next = row?.next;
+    if (!next || !/^[0-9a-f-]{36}$/i.test(next)) return null;
+    const [entry] = await ctx.db
+      .select({ status: journalEntries.status })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.id, next), eq(journalEntries.companyId, ctx.companyId)));
+    if (!entry) return null;
+    if (entry.status === 'posted') return next;
+    cur = next;
+  }
+  return null;
+}
+
+/**
+ * QB: deleting or voiding a transaction a downloaded bank line was matched to puts the line back
+ * in "For Review"; editing it keeps the match. Bank-feed lines matched to an entry that has since
+ * been voided used to stay "added" for good — the bank showed money the books no longer had and
+ * the line never came back to review. For every such line of the account: when the transaction
+ * was edited (re-posted) and its new entry still moves the feed amount on this bank account, the
+ * match follows it; otherwise the line returns to review. Runs when the bank feed is opened
+ * (runAutoRules). Returns how many lines were re-pointed / returned.
+ */
+export async function resyncFeedMatches(
+  ctx: ServiceContext,
+  bankAccountId?: string,
+): Promise<{ repointed: number; returned: number }> {
+  const out = { repointed: 0, returned: 0 };
+  const stale = await ctx.db
+    .select({
+      id: bankTransactions.id,
+      bankAccountId: bankTransactions.bankAccountId,
+      amount: bankTransactions.amount,
+      matchedEntryId: bankTransactions.matchedEntryId,
+    })
+    .from(bankTransactions)
+    .innerJoin(journalEntries, eq(journalEntries.id, bankTransactions.matchedEntryId))
+    .where(
+      and(
+        eq(bankTransactions.companyId, ctx.companyId),
+        eq(bankTransactions.matched, true),
+        ne(journalEntries.status, 'posted'),
+        ...(bankAccountId ? [eq(bankTransactions.bankAccountId, bankAccountId)] : []),
+      ),
+    );
+  for (const s of stale) {
+    if (!s.matchedEntryId) continue;
+    await inTransaction(ctx, async (tx) => {
+      const ba = await loadBankAccount(tx, s.bankAccountId);
+      const foreign = !!(await foreignCurrencyOfAccount(tx, ba.accountId));
+      let next = await replacementEntry(tx, s.matchedEntryId!);
+      if (next) {
+        const lines = await tx.db
+          .select({ debit: journalEntryLines.debit, credit: journalEntryLines.credit, foreignAmount: journalEntryLines.foreignAmount })
+          .from(journalEntryLines)
+          .where(and(eq(journalEntryLines.journalEntryId, next), eq(journalEntryLines.accountId, ba.accountId)));
+        let net = Money.zero();
+        for (const l of lines) net = net.plus(accountSigned(l, foreign));
+        const [taken] = await tx.db
+          .select({ id: bankTransactions.id })
+          .from(bankTransactions)
+          .where(
+            and(
+              eq(bankTransactions.companyId, tx.companyId),
+              eq(bankTransactions.bankAccountId, s.bankAccountId),
+              eq(bankTransactions.matchedEntryId, next),
+              ne(bankTransactions.id, s.id),
+            ),
+          )
+          .limit(1);
+        if (lines.length === 0 || !Money.eq(net, s.amount) || taken) next = null;
+      }
+      const [updated] = await tx.db
+        .update(bankTransactions)
+        .set(next ? { matchedEntryId: next } : { matched: false, matchedEntryId: null })
+        .where(and(eq(bankTransactions.id, s.id), eq(bankTransactions.matchedEntryId, s.matchedEntryId!)))
+        .returning({ id: bankTransactions.id });
+      if (!updated) return;
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'bank_transaction',
+        entityId: s.id,
+        oldValues: { matched: true, matchedEntryId: s.matchedEntryId },
+        newValues: next
+          ? { matched: true, matchedEntryId: next, matchType: 'followed_edit' }
+          : { matched: false, matchedEntryId: null, matchType: 'returned_to_review', reason: 'matched transaction was voided' },
+      });
+      if (next) out.repointed += 1;
+      else out.returned += 1;
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

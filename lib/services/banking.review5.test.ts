@@ -602,3 +602,68 @@ describe('legacy rules', () => {
     await expectCode(createRule(ctx, { ...base, priority: 1.5 }), 'VALIDATION');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Bank feed matches follow the transaction they were matched to
+// ---------------------------------------------------------------------------
+
+describe('a matched feed line whose transaction is voided or edited', () => {
+  async function matchedCheck() {
+    const { createExpense } = await import('./expenses');
+    const { matchTransaction } = await import('./bankCategorize');
+    const ba = await linkBank('1000');
+    const exp = await createExpense(ctx, {
+      payeeName: 'Shell',
+      date: d('2026-03-09'),
+      method: 'check',
+      reference: '1043',
+      paymentAccountId: acct['1000'],
+      lines: [{ accountId: acct['6300'], amount: '45.00' }],
+    });
+    const line = await feedLine(ba, '-45.00', 'CHECK 1043', '2026-03-10');
+    await matchTransaction(ctx, line.id, exp.postedEntryId!);
+    return { ba, exp, line };
+  }
+
+  it('voiding the check returns the bank line to review (it used to stay "added" with nothing in the books)', async () => {
+    const { voidExpense } = await import('./expenses');
+    const { resyncFeedMatches, listStaged } = await import('./bankCategorize');
+    const { ba, exp, line } = await matchedCheck();
+    await voidExpense(ctx, exp.id);
+    await resyncFeedMatches(ctx, ba);
+    const [row] = await db.select().from(bankTransactions).where(eq(bankTransactions.id, line.id));
+    expect(row).toMatchObject({ matched: false, matchedEntryId: null });
+    expect((await listStaged(ctx, ba, { filter: 'unreviewed' })).map((r) => r.id)).toEqual([line.id]);
+  });
+
+  it('editing the check (re-posted) keeps the bank line matched to the check', async () => {
+    const { updateExpense, getExpense } = await import('./expenses');
+    const { resyncFeedMatches } = await import('./bankCategorize');
+    const { ba, exp, line } = await matchedCheck();
+    await updateExpense(ctx, exp.id, {
+      payeeName: 'Shell',
+      date: d('2026-03-09'),
+      method: 'check',
+      reference: '1043',
+      paymentAccountId: acct['1000'],
+      lines: [
+        { accountId: acct['6300'], amount: '30.00' },
+        { accountId: acct['6100'], amount: '15.00' },
+      ],
+    });
+    const now = await getExpense(ctx, exp.id);
+    expect(now.postedEntryId).not.toBe(exp.postedEntryId);
+    await resyncFeedMatches(ctx, ba);
+    const [row] = await db.select().from(bankTransactions).where(eq(bankTransactions.id, line.id));
+    expect(row).toMatchObject({ matched: true, matchedEntryId: now.postedEntryId });
+  });
+
+  it('runs when the bank feed is opened (with the automatic rules)', async () => {
+    const { voidExpense } = await import('./expenses');
+    const { ba, exp, line } = await matchedCheck();
+    await voidExpense(ctx, exp.id);
+    await runAutoRules(ctx, ba);
+    const [row] = await db.select().from(bankTransactions).where(eq(bankTransactions.id, line.id));
+    expect(row.matched).toBe(false);
+  });
+});

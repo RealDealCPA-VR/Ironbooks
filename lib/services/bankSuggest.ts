@@ -21,7 +21,7 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import { accounts, bankAccounts, bankTransactions } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
-import { categorize } from './bankCategorize';
+import { categorize, resyncFeedMatches } from './bankCategorize';
 import { activeBankRules, loadHistory, noteRuleApplied, ruleOffers, type BankRule, type RuleOffer } from './bankRules';
 import {
   HIGH_CONFIDENCE,
@@ -410,6 +410,9 @@ export interface AutoRulesResult {
  */
 export async function runAutoRules(ctx: ServiceContext, bankAccountId: string): Promise<AutoRulesResult> {
   await loadBankAccount(ctx, bankAccountId);
+  // Lines matched to a transaction voided / edited since follow it first (back to review, or
+  // the edited transaction's new entry) — bankCategorize.resyncFeedMatches.
+  await resyncFeedMatches(ctx, bankAccountId);
   const rules = await activeBankRules(ctx);
   const result: AutoRulesResult = { applied: [], skipped: [] };
   if (!rules.some((r) => r.mode === 'auto')) return result;
