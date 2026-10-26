@@ -424,6 +424,15 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect(bill.billNumber).toBe('INV-9');
   });
 
+  it('J: Record Vendor Refund sends the deposit date the user sees (not the server clock)', async () => {
+    // Without a date the service dates the refund "now" (a UTC instant: tomorrow, in the evening
+    // in the Americas), and a refund received last month could not be dated at all.
+    const src = fs.readFileSync(path.resolve(process.cwd(), 'app', 'vendor-credits', 'page.tsx'), 'utf8');
+    const refund = src.slice(src.indexOf("action: 'refund'"), src.indexOf("action: 'refund'") + 200);
+    expect(refund).toMatch(/date: refundDate/);
+    expect(src).toMatch(/id="vc-refund-date"/);
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();

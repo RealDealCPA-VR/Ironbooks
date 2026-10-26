@@ -749,12 +749,16 @@ interface RefundModalProps {
 function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModalProps) {
   const [bankAccountId, setBankAccountId] = useState('');
   const [amount, setAmount] = useState('');
+  // The deposit's date (today in YOUR calendar by default; the server's "now" is a UTC instant,
+  // which in the evening in the Americas is already tomorrow).
+  const [refundDate, setRefundDate] = useState(() => todayISO());
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (open && credit) {
       setBankAccountId('');
       setAmount(Number(credit.unapplied).toFixed(2));
+      setRefundDate(todayISO());
     }
   }, [open, credit]);
 
@@ -773,6 +777,7 @@ function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModa
         action: 'refund',
         bankAccountId,
         amount,
+        date: refundDate || undefined,
       });
       toast('Vendor refund recorded.', 'success');
       onRefunded();
@@ -824,6 +829,11 @@ function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModa
               </option>
             ))}
           </Select>
+        </div>
+
+        <div>
+          <Label htmlFor="vc-refund-date">Deposit Date *</Label>
+          <Input id="vc-refund-date" type="date" value={refundDate} onChange={(e) => setRefundDate(e.target.value)} />
         </div>
 
         <div>
