@@ -241,3 +241,19 @@ describe('Profit & Loss by Job', () => {
     expect(net.ties).toBe(true);
   });
 });
+
+describe('Budget vs. Actual by Customer:Job', () => {
+  it("counts the job's costs entered on bills and checks", async () => {
+    const { customers } = await import('@/lib/db/schema');
+    const { createBudget, setBudgetLine } = await import('./budgets');
+    const [job] = await db.select().from(customers).where(eq(customers.displayName, 'Kitchen Job'));
+    const b = await createBudget(ctx, { name: 'Kitchen budget', fiscalYear: 2026 });
+    await setBudgetLine(ctx, { budgetId: b.id, accountId: A['6300'], month: 4, amount: '100.00', customerId: job.id });
+    const r = await runStandardReport(ctx, 'budget-vs-actual-report', { budgetId: b.id, customerId: job.id });
+    const supplies = r.rows.find((x) => x.id.endsWith(`:a:${A['6300']}`))!;
+    expect(supplies.cells.total_bud).toBe('100.00');
+    expect(supplies.cells.total_act).toBe('70.00'); // the job's part of bill JOB-1
+    const rent = r.rows.find((x) => x.id.endsWith(`:a:${A['6400']}`));
+    expect(rent?.cells.total_act).toBe('25.00'); // the check costed to the job
+  });
+});

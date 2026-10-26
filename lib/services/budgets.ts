@@ -11,6 +11,7 @@ import { and, eq, isNotNull, isNull } from 'drizzle-orm';
 import { accounts, budgetLines, budgets, classes, customers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { profitAndLoss } from '@/lib/services/reports';
+import { jobBucketOf } from './reportsStandard';
 import { fiscalYearWindow } from './fiscalClose';
 import type { ServiceContext } from './_base';
 import { inTransaction, notFound, validation, writeAudit } from './_base';
@@ -738,16 +739,19 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
       }
     }
   } else if (p.customerId) {
+    // The Customer:Job's income AND its job costs: an expense on a bill / check / vendor credit
+    // is costed to the job on its document line (the posted line is named after the vendor), so
+    // the lines are read unfiltered and given their job column like Profit & Loss by Job.
     const { lines: gl } = await fetchGlLines(ctx, meta, {
       from: yearFrom,
       to: yearTo,
       sections: [...PL_SECTIONS],
       excludeClose: true,
-      nameId: p.customerId,
-      nameType: 'customer',
+      classId: p.classId,
       limit: 50000,
     });
-    for (const l of gl) addForMonth(l.accountId, l.date.getUTCMonth() + 1, 0, l.natural);
+    const jobOf = await jobBucketOf(ctx, gl);
+    for (const l of gl) if (jobOf(l) === p.customerId) addForMonth(l.accountId, l.date.getUTCMonth() + 1, 0, l.natural);
   } else {
     const act = await activityByAccount(ctx, { from: yearFrom, to: yearTo, classId: p.classId, excludeClose: true }, 'month');
     for (const r of act) {
