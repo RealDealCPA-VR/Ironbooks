@@ -37,6 +37,7 @@ import {
   paymentsReceived,
   salesReceipts,
   taxAgencies,
+  transfers,
   vendorCredits,
   vendors,
 } from '@/lib/db/schema';
@@ -811,11 +812,23 @@ export function txnTypeOf(sourceRef: string | null | undefined): TxnTypeKey {
   return PREFIX_TO_TYPE.get(prefix) ?? 'other';
 }
 
-function txnTypeCondition(t: TxnTypeKey): SQL {
+/**
+ * Journal entries posted by Transfer Funds. A transfer's entry carries no sourceRef (the transfer
+ * row points at it), so without this it showed as a General Journal entry and the "Transfer"
+ * transaction-type filter matched nothing.
+ */
+const transferEntryIds = (companyId: string) =>
+  sql`SELECT ${transfers.postedEntryId} FROM ${transfers} WHERE ${transfers.companyId} = ${companyId} AND ${transfers.postedEntryId} IS NOT NULL`;
+
+function txnTypeCondition(t: TxnTypeKey, companyId: string): SQL {
   const prefixes = TXN_PREFIXES[t];
   const parts = prefixes.map((p) => sql`${journalEntries.sourceRef} LIKE ${p + ':%'}`);
   parts.push(...prefixes.map((p) => sql`${journalEntries.sourceRef} = ${p}`));
-  if (t === 'journal') parts.push(sql`${journalEntries.sourceRef} IS NULL`);
+  if (t === 'transfer') parts.push(sql`${journalEntries.id} IN (${transferEntryIds(companyId)})`);
+  if (t === 'journal') {
+    parts.push(sql`${journalEntries.sourceRef} IS NULL`);
+    return sql`((${sql.join(parts, sql` OR `)}) AND ${journalEntries.id} NOT IN (${transferEntryIds(companyId)}))`;
+  }
   if (t === 'other') {
     // Anything whose prefix is not a known type.
     const known = [...PREFIX_TO_TYPE.keys()].filter((p) => !TXN_PREFIXES.other.includes(p));
@@ -1254,7 +1267,7 @@ export async function fetchGlLines(
     if (f.entryIds.length === 0) return { lines: [], truncated: false };
     conds.push(inArray(journalEntries.id, f.entryIds));
   }
-  if (f.txnType) conds.push(txnTypeCondition(f.txnType));
+  if (f.txnType) conds.push(txnTypeCondition(f.txnType, ctx.companyId));
   const lineAmt = sql`GREATEST(COALESCE(${journalEntryLines.debit}, 0), COALESCE(${journalEntryLines.credit}, 0))`;
   if (f.amountMin) conds.push(sql`${lineAmt} >= ${f.amountMin}::numeric`);
   if (f.amountMax) conds.push(sql`${lineAmt} <= ${f.amountMax}::numeric`);
@@ -1304,6 +1317,17 @@ export async function fetchGlLines(
   const entryMap = new Map<string, { id: string; sourceRef: string | null; reference: string | null }>();
   for (const r of raw) entryMap.set(r.entryId, { id: r.entryId, sourceRef: r.sourceRef, reference: r.reference });
   const names = await resolveEntryNames(ctx, [...entryMap.values()]);
+  // Transfers post entries without a sourceRef: find them so they show as "Transfer".
+  const transferIds = new Set<string>();
+  const plain = [...entryMap.values()].filter((e) => !e.sourceRef).map((e) => e.id);
+  for (let i = 0; i < plain.length; i += 5000) {
+    for (const t of await ctx.db
+      .select({ id: transfers.postedEntryId })
+      .from(transfers)
+      .where(and(eq(transfers.companyId, ctx.companyId), inArray(transfers.postedEntryId, plain.slice(i, i + 5000))))) {
+      if (t.id) transferIds.add(t.id);
+    }
+  }
   // QB "Name" on the line itself (wave2 foundation: named journal-entry lines, e.g. a General
   // Journal line on A/R for a customer) wins over the entry's document-level name.
   const named = raw.filter((r) => r.entityType && r.entityId);
@@ -1327,7 +1351,7 @@ export async function fetchGlLines(
             num: docName.num,
           }
         : docName;
-    const txnType = txnTypeOf(r.sourceRef);
+    const txnType: TxnTypeKey = !r.sourceRef && transferIds.has(r.entryId) ? 'transfer' : txnTypeOf(r.sourceRef);
     return {
       lineId: r.lineId,
       entryId: r.entryId,

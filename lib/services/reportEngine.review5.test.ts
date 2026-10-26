@@ -19,6 +19,7 @@ import { postJournalEntry } from './posting';
 import { GL_LIMITS, endOfToday, resolveDateMacro } from './reportEngine';
 import { createCustomer } from './customers';
 import { createInvoice } from './invoices';
+import { createTransfer } from './transfers';
 import { runStandardReport } from './reportRegistry';
 import { arAging, collectionsReport } from './reportsExtra';
 import { createReportSchedule, listReportSchedules, nextRunAfter, runDueSchedules, saveMemorizedReport } from './memorizedReports';
@@ -192,5 +193,20 @@ describe('name-filtered detail reports on a large file', () => {
     } finally {
       GL_LIMITS.postFilterScan = cap;
     }
+  });
+});
+
+describe('transfers on the reports', () => {
+  it('show as Transfer and the Transaction type filter finds them', async () => {
+    vi.useRealTimers();
+    await createTransfer(ctx, { date: d('2026-05-05'), fromAccountId: A['1000'], toAccountId: A['1010'], amount: '40.00', memo: 'to savings' });
+    const all = await runStandardReport(ctx, 'transaction-detail-by-account', { from: '2026-05-05', to: '2026-05-05', subtotalBy: 'none' });
+    const lines = all.rows.filter((x) => x.kind === 'data');
+    expect(lines.length).toBe(2);
+    expect(lines.every((x) => x.cells.type === 'Transfer')).toBe(true);
+    const filtered = await runStandardReport(ctx, 'transaction-detail-by-account', { from: '2026-01-01', to: '2026-12-31', txnType: 'transfer', subtotalBy: 'none' });
+    expect(filtered.rows.filter((x) => x.kind === 'data').length).toBe(2);
+    const journal = await runStandardReport(ctx, 'transaction-detail-by-account', { from: '2026-05-05', to: '2026-05-05', txnType: 'journal', subtotalBy: 'none' });
+    expect(journal.rows.filter((x) => x.kind === 'data').length).toBe(0);
   });
 });
