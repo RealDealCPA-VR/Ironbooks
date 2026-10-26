@@ -62,3 +62,21 @@ describe('receipt capture (review 5)', () => {
     expect((await getReceipt(t.ctx, r.id)).id).toBe(r.id);
   });
 });
+
+describe('reading a receipt whose text has an impossible amount', () => {
+  it('an amount too large for the books (an OCR misread) is left blank instead of failing the read for good', async () => {
+    const { extractReceipt } = await import('./receipts');
+    const { setOcrEngineForTests } = await import('@/lib/receipts/ocr');
+    setOcrEngineForTests({ recognize: async () => 'CORNER STORE\n03/14/2026\nTOTAL 123456789012345.67\nVISA ****4417' });
+    try {
+      const r = await uploadReceipt(t.ctx, { filename: 'c.jpg', bytes: jpegBytes() });
+      const read = await extractReceipt(t.ctx, r.id);
+      expect(read.status).toBe('ready');
+      expect(read.total).toBeNull();
+      expect(read.date).toBe('2026-03-14');
+      expect(read.cardLast4).toBe('4417');
+    } finally {
+      setOcrEngineForTests(undefined);
+    }
+  });
+});

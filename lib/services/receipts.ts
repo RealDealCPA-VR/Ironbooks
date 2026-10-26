@@ -43,7 +43,7 @@ import {
   receiptUploadTokens,
   vendors,
 } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
 import { AiRouter } from '@/lib/ai/router';
 import type { ChatMessage, StoredProviderConfig } from '@/lib/ai/types';
 import { localityOf } from '@/lib/ai/providers';
@@ -530,6 +530,20 @@ export async function extractReceipt(
     parsed = result.text.trim() ? parseReceiptText(result.text, { dateOrder: settings.dateOrder }) : null;
   } catch (err) {
     result = { text: '', method: 'none', message: `The receipt could not be read (${err instanceof Error ? err.message : String(err)}). Type the details below.` };
+  }
+  // An amount the books can't hold (numeric(15,2): an OCR misread of a long number) failed this
+  // update in the database — the read errored, the receipt stayed "being read", and every retry
+  // failed the same way. Leave such an amount blank for the person to type.
+  if (parsed) {
+    const fits = (v: string | null) => {
+      if (v == null) return null;
+      try {
+        return Money.of(v).abs().lte(MAX_LEDGER_AMOUNT) ? v : null;
+      } catch {
+        return null;
+      }
+    };
+    parsed = { ...parsed, total: fits(parsed.total), subtotal: fits(parsed.subtotal), tax: fits(parsed.tax) };
   }
   const nothing = !parsed || (!parsed.total && !parsed.vendorName && !parsed.date);
   await ctx.db

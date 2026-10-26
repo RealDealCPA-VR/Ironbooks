@@ -1004,3 +1004,20 @@ describe('bank review: match candidates for every line in one pass', () => {
     expect(Object.keys(all)).not.toContain(taken.id);
   });
 });
+
+describe('bank feed suggestions never offer an account the line cannot be added to', () => {
+  it('an older choice of Undeposited Funds in the history is not suggested (accepting it would fail)', async () => {
+    const { suggestForAccount } = await import('./bankSuggest');
+    const { bankCategorizationHistory } = await import('@/lib/db/schema');
+    const ba = await linkBank('1000');
+    for (const day of ['2026-02-02', '2026-02-09']) {
+      const l = await feedLine(ba, '300.00', 'MOBILE DEPOSIT', day);
+      await categorize(ctx, { bankTransactionId: l.id, accountId: acct['4000'] });
+    }
+    // Files from before the rule: those choices went to Undeposited Funds.
+    await db.update(bankCategorizationHistory).set({ accountId: acct['1050'] }).where(eq(bankCategorizationHistory.bankAccountId, ba));
+    const waiting = await feedLine(ba, '300.00', 'MOBILE DEPOSIT', '2026-02-16');
+    const [s] = await suggestForAccount(ctx, ba, { localModel: false, bankTransactionIds: [waiting.id] });
+    expect(s.accountId).not.toBe(acct['1050']);
+  });
+});
